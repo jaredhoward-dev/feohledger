@@ -3903,6 +3903,12 @@ export const messages = {
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's
 	// "what happens next" steps and the login panel line.
 	'auth.shell.tagline': 'Von der Rechnung bis zur Zahlung – jede Rechnung abgeglichen.',
+	'auth.login.proof1Title': 'Gelesen, nicht abgetippt',
+	'auth.login.proof1Body': 'Rechnungen kommen per E-Mail oder Upload und kehren kontiert zurück.',
+	'auth.login.proof2Title': 'Geprüft, bevor gezahlt wird',
+	'auth.login.proof2Body': 'Bestellung, Wareneingang und Prüfung — gegen jede Position abgeglichen.',
+	'auth.login.proof3Title': 'Jede Freigabe dokumentiert',
+	'auth.login.proof3Body': 'Wer freigegeben hat, über welchen Betrag und wann — revisionssicher.',
 	'auth.login.panelBody': 'Erfassung, Freigaben, Abgleich und Zahlungen – an einem Ort.',
 	'auth.signup.nextHeading': 'So geht es weiter',
 	'auth.signup.step1Title': 'Erzählen Sie uns von Ihrem Unternehmen',

@@ -2,7 +2,6 @@
 	import type { Snippet } from 'svelte';
 	import { asset } from '$app/paths';
 	import Atmosphere from '#lib/components/marketing/Atmosphere.svelte';
-	import BrandMark from '#lib/components/ui/BrandMark.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
 	/**
@@ -66,11 +65,9 @@
 	<aside class="panel" aria-labelledby={panelHeadingId}>
 		<Atmosphere dense still />
 		<div class="panel-inner">
-			<div class="panel-brand">
-				<BrandMark size={30} />
-				<span class="panel-brand-name">FeohLedger</span>
-			</div>
-
+			<!-- No brand mark here. The form column already renders one beside its
+			     heading, and two marks on one screen read as a template rather
+			     than a product. The tagline carries the name's job instead. -->
 			<h2 id={panelHeadingId} class="tagline">{m('auth.shell.tagline')}</h2>
 
 			{#if panel}
@@ -130,20 +127,11 @@
 		flex-direction: column;
 		padding: 44px 48px 36px;
 	}
-	.panel-brand {
-		display: inline-flex;
-		align-items: center;
-		gap: 10px;
-		margin-bottom: auto;
-	}
-	.panel-brand-name {
-		font-weight: 700;
-		font-size: 1.02rem;
-		letter-spacing: -0.01em;
-		color: var(--text);
-	}
 	.tagline {
-		margin: 48px 0 18px;
+		/* `margin-top: auto` replaces the removed brand block's `margin-bottom:
+		   auto` — without it the tagline sprang to the top of the column and
+		   left a void where the mark had been. */
+		margin: auto 0 18px;
 		max-width: 20ch;
 		font-size: clamp(1.8rem, 2.6vw, 2.5rem);
 		line-height: 1.12;
