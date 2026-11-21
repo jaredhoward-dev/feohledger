@@ -911,6 +911,97 @@ async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_o
     assert index == 1
 
 
+async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
+    """A provider page overlap repeats a record two vendors hold: it is one
+    record, so one ``duplicate_link`` conflict, and the endpoint's message
+    counts it once ("1 not updated"), not once per sighting."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        await s.execute(text("DROP INDEX uq_vendors_erp_link"))
+        s.add_all(
+            [
+                _linked(org_id, "Echo Supply", "ERP-ECHO", None),
+                _linked(org_id, "Echo Supply Ltd", "ERP-ECHO", None),
+            ]
+        )
+        await s.flush()
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-ECHO", "name": "Echo Supply"},
+                {"erp_vendor_id": "ERP-ECHO", "name": "Echo Supply"},
+            ],
+        )
+        await s.rollback()
+    assert result["conflicts"] == [
+        {"name": "Echo Supply", "reason": "duplicate_link", "erp_vendor_ids": ["ERP-ECHO"]}
+    ]
+
+
+async def test_two_no_realm_syncs_creating_one_record_serialize(realdb):
+    """Two no-realm pulls of one new record (decisions §485): the second
+    waits on the link lock the first holds and, once the first commits, finds
+    the vendor it created instead of inserting a second holder and failing
+    ``uq_vendors_erp_link`` at flush."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    pull = [{"erp_vendor_id": "ERP-RACE", "name": f"Race Co {uuid.uuid4().hex[:6]}"}]
+    async with mk() as first, mk() as second:
+        created = await sync_vendors_from_erp(first, org_id, pull)
+        assert created["created"] == 1  # not yet committed
+        second_pid = await _pid(second)
+        racing = asyncio.create_task(sync_vendors_from_erp(second, org_id, pull))
+        try:
+            assert await _blocked_on_a_lock(mk, second_pid), "the second sync did not wait"
+            assert not racing.done()
+            await first.commit()
+            result = await asyncio.wait_for(racing, timeout=30)
+            await second.commit()
+        finally:
+            if not racing.done():
+                racing.cancel()
+    assert (result["created"], result["unchanged"], result["conflicts"]) == (0, 1, [])
+    async with mk() as s:
+        assert (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id == "ERP-RACE")
+            )
+        ).scalar_one() == 1
+
+
+async def test_sync_erp_endpoint_counts_each_conflict_reason_on_its_own(realdb, monkeypatch):
+    """The message names a duplicate link apart from an ambiguous name: they
+    ask the operator for different fixes (link by hand vs merge / unlink)."""
+    import app.api.vendors as vendors_api
+
+    async def canned(*_args, **_kwargs):
+        return {
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "conflicts": [
+                {"name": "Acme", "reason": "ambiguous_name", "erp_vendor_ids": ["1", "2"]},
+                {"name": "Beta", "reason": "ambiguous_name", "erp_vendor_ids": ["3"]},
+                {"name": "Twin", "reason": "duplicate_link", "erp_vendor_ids": ["4"]},
+            ],
+            **_QUIET,
+        }
+
+    monkeypatch.setattr(vendors_api, "sync_vendors_from_erp", canned)
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post("/api/vendors/sync-erp")
+    assert resp.status_code == 200
+    assert resp.json()["message"] == (
+        "Synced 0 new, 0 updated, 0 unchanged"
+        "; 2 not linked (the name matches more than one vendor)"
+        "; 1 not updated (more than one vendor is linked to it:"
+        " merge them or unlink the stale one)"
+    )
+
+
 async def test_a_pull_listing_one_record_twice_still_makes_one_vendor(realdb):
     """A provider page overlap repeats a record: the second sighting finds the
     vendor the first created, so the index is never reached."""
