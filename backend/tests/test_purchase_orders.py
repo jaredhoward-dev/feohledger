@@ -1339,10 +1339,14 @@ def test_an_adapter_that_never_skips_reports_nothing_skipped():
 
 
 async def test_sync_erp_links_only_a_vendor_in_the_synced_entity(realdb, monkeypatch):
-    """Two subsidiaries each connected to their own ERP company can both hold
-    supplier id "v-9". The id map was built over the whole org, so the vendor
-    read last won and a PO synced into this entity could link to the other
-    subsidiary's vendor."""
+    """Two subsidiaries each kept in their own ERP company can both hold
+    supplier id "v-9" — a Sage Intacct entity is its own realm (decisions
+    §412). One company's "v-9" is one supplier (``uq_vendors_erp_link``,
+    §482), so the pair differs by realm. The mock sync names no realm and
+    reads every link (``erp_link_realm.link_is_live``), so only the entity
+    scope keeps them apart: the id map was built over the whole org, so the
+    vendor read last won and a PO synced into this entity could link to the
+    other subsidiary's vendor."""
     from app.models.entity import Entity
     from app.services.erp_adapters.base import PoPayload
 
@@ -1355,13 +1359,21 @@ async def test_sync_erp_links_only_a_vendor_in_the_synced_entity(realdb, monkeyp
         s.add(other)
         await s.flush()
         ours = Vendor(
-            name="Ours", erp_vendor_id="v-9", organization_id=org_id, entity_id=default_entity.id
+            name="Ours",
+            erp_vendor_id="v-9",
+            erp_link_realm="sage_intacct:co|loc-a",
+            organization_id=org_id,
+            entity_id=default_entity.id,
         )
         s.add(ours)
         await s.flush()
         # Created after ours, so it is the one a last-wins map would pick.
         theirs = Vendor(
-            name="Theirs", erp_vendor_id="v-9", organization_id=org_id, entity_id=other.id
+            name="Theirs",
+            erp_vendor_id="v-9",
+            erp_link_realm="sage_intacct:co|loc-b",
+            organization_id=org_id,
+            entity_id=other.id,
         )
         s.add(theirs)
         await s.commit()
@@ -1377,7 +1389,13 @@ async def test_sync_erp_links_only_a_vendor_in_the_synced_entity(realdb, monkeyp
 
 async def test_sync_erp_leaves_a_po_unlinked_when_its_erp_id_is_ambiguous(realdb, monkeypatch):
     """Two vendors in scope hold the same ERP id: neither is linked, and the
-    name does not break the tie — the ERP named an id, not a name."""
+    name does not break the tie — the ERP named an id, not a name.
+
+    One company's id has one holder (``uq_vendors_erp_link``, §482), so the
+    pair is two companies' "v-dup": a pre-0115 link with no realm and one made
+    under a named company. A sync that names no realm (the mock here; an OAuth
+    ERP before its consent) reads every link (``erp_link_realm.link_is_live``),
+    so both are in play and neither may be guessed."""
     from app.services.erp_adapters.base import PoPayload
 
     org_id = realdb.info("a").org_id
@@ -1385,7 +1403,12 @@ async def test_sync_erp_leaves_a_po_unlinked_when_its_erp_id_is_ambiguous(realdb
         s.add_all(
             [
                 Vendor(name="Dup One", erp_vendor_id="v-dup", organization_id=org_id),
-                Vendor(name="Dup Two", erp_vendor_id="v-dup", organization_id=org_id),
+                Vendor(
+                    name="Dup Two",
+                    erp_vendor_id="v-dup",
+                    erp_link_realm="netsuite:tstdrv1",
+                    organization_id=org_id,
+                ),
             ]
         )
         await s.commit()
