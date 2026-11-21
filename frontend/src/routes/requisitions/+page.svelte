@@ -89,6 +89,8 @@
 	let confirmDeleteId = $state<string | null>(null);
 	let reopenArmedId = $state<string | null>(null);
 	let busyId = $state<string | null>(null);
+	/** The row whose Delete is in flight: that button is `busy`, not `disabled`. */
+	let deletingId = $state<string | null>(null);
 	let glAccounts = $state<GlAccountOption[]>([]);
 
 	// Chip statuses = the reachable subset ∪ whatever is ACTIVE. The subset omits
@@ -417,6 +419,12 @@
 	}
 
 	async function doDelete(id: string) {
+		// The Delete button that sent this is `busy` (it keeps focus and ignores
+		// a second click); the row's other actions are `disabled` until it
+		// settles — the /experiments arrangement.
+		if (busyId) return;
+		busyId = id;
+		deletingId = id;
 		try {
 			await apiDelete(id);
 			fetchSequence.supersedeInFlight();
@@ -428,6 +436,8 @@
 			toast(err instanceof Error ? err.message : m('requisitions.toast.deleteFailed'), 'error');
 		} finally {
 			confirmDeleteId = null;
+			deletingId = null;
+			busyId = null;
 		}
 	}
 
@@ -538,6 +548,12 @@
 							<RowAction
 								variant="danger"
 								armed={confirmDeleteId === r.id}
+								busy={deletingId === r.id}
+								disabled={busyId === r.id && deletingId !== r.id}
+								ariaLabel={m('common.rowActionAria', {
+									action: confirmDeleteId === r.id ? m('requisitions.row.confirm') : m('requisitions.row.delete'),
+									name: r.requisition_number
+								})}
 								onclick={(e) => {
 									e.stopPropagation();
 									if (confirmDeleteId === r.id) doDelete(r.id);

@@ -99,7 +99,8 @@ const CONTROLS = [
 	/^Convert to PO$/,
 	/^Reopen/,
 	/^Cancel$/,
-	/^Delete$/
+	// Delete names its row ("Delete for REQ-…"), the /experiments arrangement.
+	/^Delete for REQ-/
 ] as const;
 
 test.describe('/requisitions — controls follow the server verdict', () => {
