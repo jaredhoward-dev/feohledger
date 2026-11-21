@@ -46,6 +46,7 @@ from app.services.billing_adapters.base import (
     CreateSubscriptionRequest,
     ProviderSubscription,
 )
+from app.tenant import lock_organization
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,7 @@ async def claim_plan_change_lease(
     provider call. An expired lease — a request that died mid-change — is
     simply taken over.
     """
-    locked = await _lock_org(control_db, org.id)
+    locked = await lock_organization(control_db, org)
     settings_dict = dict(locked.settings or {})
     billing = dict(settings_dict.get("billing") or {})
     lease = billing.get(LEASE_KEY)
@@ -176,7 +177,15 @@ async def release_plan_change_lease(control_db: AsyncSession, organization_id, t
     """Drop the lease if it is still ours. Best-effort: a failure here only
     means the lease runs out on its own after `LEASE_TTL`."""
     try:
-        locked = await _lock_org(control_db, organization_id)
+        # The org row lock, by id: `org` is expired after the caller's rollback.
+        locked = (
+            await control_db.execute(
+                select(Organization)
+                .where(Organization.id == organization_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
         settings_dict = dict(locked.settings or {})
         billing = dict(settings_dict.get("billing") or {})
         lease = billing.get(LEASE_KEY)
