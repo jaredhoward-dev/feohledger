@@ -47,15 +47,14 @@
 
 	// Intake is broad-access — anyone in the org can raise / read / delete.
 	// Whether a row offers Submit / Approve / Reject / Convert / Reopen /
-	// Cancel is NOT decided here: each row carries the server's verdict
-	// (`i.actions`, built from the gates the endpoints raise from — backend
-	// `api/intake.intake_action_refusals`), read through `isAllowed`. Every
-	// refusal those gates give is about the row's status or the reader's role,
-	// so a refused control is hidden rather than explained
-	// (`frontend/docs/ui-patterns.md` § Whether to offer an action).
-	// Creating a request and deleting a draft are not verdict-driven yet
-	// (docs/followups.md § Other pages still restate server predicates), so
-	// they keep the create roles `POST /api/intake` is gated on.
+	// Cancel / Delete is NOT decided here: each row carries the server's
+	// verdict (`i.actions`, built from the gates the endpoints raise from —
+	// backend `api/intake.intake_action_refusals`), read through `isAllowed`.
+	// Every refusal those gates give is about the row's status (or, for Delete,
+	// a conversion it produced) or the reader's role, so a refused control is
+	// hidden rather than explained (`frontend/docs/ui-patterns.md` § Whether to
+	// offer an action). Creating a request is not a row action, so the header
+	// button keeps the create roles `POST /api/intake` is gated on.
 	const canCreate = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk', 'cfo'));
 
 	let items = $state<IntakeRequest[]>([]);
@@ -485,7 +484,7 @@
 						{#if isAllowed(i.actions?.cancel)}
 							<RowAction variant="default" disabled={busyId === i.id} onclick={() => onCancel(i)}>{m('intake.row.cancel')}</RowAction>
 						{/if}
-						{#if canCreate}
+						{#if isAllowed(i.actions?.delete)}
 							<RowAction
 								variant="danger"
 								armed={confirmDeleteId === i.id}

@@ -61,6 +61,7 @@ from app.services.audit_dispatch import dispatch_audit
 from app.services.procurement_controls import (
     requisition_approve_refusal,
     requisition_convert_refusal,
+    requisition_delete_refusal,
     requisition_transition_refusal,
 )
 from app.services.requisition_service import (
@@ -103,8 +104,10 @@ REQUISITION_DECIDE_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
 REQUISITION_CONVERT_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
 
 
-def requisition_action_refusals(req: PurchaseRequisition, user: User) -> RequisitionActions:
-    """What submit, approve, reject, convert, cancel and reopen would answer
+def requisition_action_refusals(
+    req: PurchaseRequisition, user: User, *, from_intake: bool
+) -> RequisitionActions:
+    """What submit, approve, reject, convert, cancel, reopen and delete would answer
     ``user`` for this requisition — each a coded refusal or ``None`` (issue
     #575). Each is the endpoint's role predicate (``holds_any_role``) followed
     by the gate it raises from (``services/procurement_controls``), so
@@ -133,6 +136,10 @@ def requisition_action_refusals(req: PurchaseRequisition, user: User) -> Requisi
         ),
         cancel=verdict(REQUISITION_AUTHOR_ROLES, move(RequisitionStatus.cancelled)),
         reopen=verdict(REQUISITION_AUTHOR_ROLES, move(RequisitionStatus.draft)),
+        delete=verdict(
+            REQUISITION_AUTHOR_ROLES,
+            lambda: requisition_delete_refusal(req, from_intake=from_intake),
+        ),
     )
 
 
@@ -161,9 +168,31 @@ def _line_to_response(li) -> RequisitionLineItemResponse:
     )
 
 
-def _to_response(r: PurchaseRequisition, user: User) -> RequisitionResponse:
+async def _intake_sourced_ids(db: AsyncSession, ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of ``ids`` an intake request was converted into
+    (``IntakeRequest.converted_requisition_id``) — the link the delete gate
+    refuses on, read in one query for a whole list page. Not entity-scoped,
+    the same as the delete route's own lookup: the FK is what refuses."""
+    if not ids:
+        return set()
+    rows = await db.execute(
+        select(IntakeRequest.converted_requisition_id).where(
+            IntakeRequest.converted_requisition_id.in_(ids)
+        )
+    )
+    return {rid for (rid,) in rows.all()}
+
+
+async def _respond(db: AsyncSession, r: PurchaseRequisition, user: User) -> RequisitionResponse:
+    """One row's response, with the intake link its delete verdict needs."""
+    sourced = await _intake_sourced_ids(db, [r.id])
+    return _to_response(r, user, from_intake=r.id in sourced)
+
+
+def _to_response(r: PurchaseRequisition, user: User, *, from_intake: bool) -> RequisitionResponse:
     """A row with the caller's verdicts — on every response, mutations
-    included, so a row the page replaces keeps them."""
+    included, so a row the page replaces keeps them. ``from_intake`` is
+    required (no default): a link nobody looked up would read as "deletable"."""
     return RequisitionResponse(
         id=str(r.id),
         requisition_number=r.requisition_number,
@@ -189,7 +218,7 @@ def _to_response(r: PurchaseRequisition, user: User) -> RequisitionResponse:
         ],
         created_at=r.created_at.isoformat() if r.created_at else "",
         updated_at=r.updated_at.isoformat() if r.updated_at else "",
-        actions=requisition_action_refusals(r, user),
+        actions=requisition_action_refusals(r, user, from_intake=from_intake),
     )
 
 
@@ -299,8 +328,9 @@ async def list_requisitions(
         .limit(pagination.limit)
     )
     rows = (await db.execute(paged)).scalars().all()
+    sourced = await _intake_sourced_ids(db, [r.id for r in rows])
     return RequisitionListResponse(
-        items=[_to_response(r, user) for r in rows],
+        items=[_to_response(r, user, from_intake=r.id in sourced) for r in rows],
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
@@ -433,7 +463,7 @@ async def create_requisition(
     )
     await db.commit()
     fresh = await _get_or_404(db, req.id, entity_id)
-    return _to_response(fresh, user)
+    return await _respond(db, fresh, user)
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +478,7 @@ async def get_requisition(
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    return _to_response(await _get_or_404(db, req_id, entity_id), user)
+    return await _respond(db, await _get_or_404(db, req_id, entity_id), user)
 
 
 @router.patch("/{req_id}", response_model=RequisitionResponse)
@@ -540,14 +570,14 @@ async def update_requisition(
         )
     await db.commit()
     fresh = await _get_or_404(db, req.id, entity_id)
-    return _to_response(fresh, user)
+    return await _respond(db, fresh, user)
 
 
 @router.delete("/{req_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_requisition(
     req_id: uuid.UUID,
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK)),
+    user: User = Depends(require_roles(*REQUISITION_AUTHOR_ROLES)),
     org_id: uuid.UUID = Depends(get_org_id),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
@@ -569,23 +599,8 @@ async def delete_requisition(
     #     requisition, re-convert the intake, and one ask has bought twice.
     #     Guarding it here closes that at the application layer instead of
     #     relying on the FK's ON DELETE mode never changing.
-    if req.converted_po_id is not None or req.status == RequisitionStatus.converted:
-        raise HTTPException(
-            status_code=409,
-            detail="Requisition has been converted to a PO; it cannot be deleted.",
-        )
-    linked_intake = (
-        await db.execute(
-            select(func.count())
-            .select_from(IntakeRequest)
-            .where(IntakeRequest.converted_requisition_id == req.id)
-        )
-    ).scalar() or 0
-    if linked_intake:
-        raise HTTPException(
-            status_code=409,
-            detail="Requisition was converted from an intake request; cancel it instead.",
-        )
+    sourced = await _intake_sourced_ids(db, [req.id])
+    _raise_if(requisition_delete_refusal(req, from_intake=req.id in sourced))
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -627,7 +642,7 @@ async def submit_requisition(
     req.submitted_at = datetime.now(UTC)
     await _audit_transition(db, req, org_id, user.id, "requisition.submitted")
     await db.commit()
-    return _to_response(await _get_or_404(db, req.id, entity_id), user)
+    return await _respond(db, await _get_or_404(db, req.id, entity_id), user)
 
 
 @router.post("/{req_id}/approve", response_model=RequisitionResponse)
@@ -656,7 +671,7 @@ async def approve_requisition(
     req.approved_by = user.id
     await _audit_transition(db, req, org_id, user.id, "requisition.approved")
     await db.commit()
-    return _to_response(await _get_or_404(db, req.id, entity_id), user)
+    return await _respond(db, await _get_or_404(db, req.id, entity_id), user)
 
 
 @router.post("/{req_id}/reject", response_model=RequisitionResponse)
@@ -682,7 +697,7 @@ async def reject_requisition(
         extra={"reason": body.reason} if body and body.reason else None,
     )
     await db.commit()
-    return _to_response(await _get_or_404(db, req.id, entity_id), user)
+    return await _respond(db, await _get_or_404(db, req.id, entity_id), user)
 
 
 @router.post("/{req_id}/cancel", response_model=RequisitionResponse)
@@ -708,7 +723,7 @@ async def cancel_requisition(
         extra={"reason": body.reason} if body and body.reason else None,
     )
     await db.commit()
-    return _to_response(await _get_or_404(db, req.id, entity_id), user)
+    return await _respond(db, await _get_or_404(db, req.id, entity_id), user)
 
 
 @router.post("/{req_id}/reopen", response_model=RequisitionResponse)
@@ -741,7 +756,7 @@ async def reopen_requisition(
     req.submitted_at = None
     await _audit_transition(db, req, org_id, user.id, "requisition.reopened")
     await db.commit()
-    return _to_response(await _get_or_404(db, req.id, entity_id), user)
+    return await _respond(db, await _get_or_404(db, req.id, entity_id), user)
 
 
 # ---------------------------------------------------------------------------

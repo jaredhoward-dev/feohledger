@@ -104,12 +104,97 @@ def start_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
     return None
 
 
+#: Stop refused: only a `running` experiment can be stopped (409).
+EXPERIMENT_NOT_STOPPABLE = "experiment_not_stoppable"
+#: Conclude refused in the verdict only: a `concluded` experiment's repeat POST
+#: is an idempotent no-op answering the unchanged row, not an action to offer.
+EXPERIMENT_ALREADY_CONCLUDED = "experiment_already_concluded"
+#: Delete refused: only a `draft` experiment can be deleted (409).
+EXPERIMENT_NOT_DELETABLE = "experiment_not_deletable"
+#: Delete refused: a draft that has assigned invoices (a stopped one) — its
+#: assignment record is the only evidence of which invoice ran which arm (409).
+EXPERIMENT_HAS_ASSIGNMENTS = "experiment_has_assignments"
+
+
+def stop_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
+    """Why ``POST /{id}/stop`` would refuse, or ``None`` — the gate the
+    endpoint raises from and the row's ``actions.stop`` verdict."""
+    if exp.status != "running":
+        return ActionRefusal(
+            EXPERIMENT_NOT_STOPPABLE,
+            "Only a running experiment can be stopped.",
+            409,
+            params={"status": exp.status},
+        )
+    return None
+
+
+def conclude_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
+    """Why the row's ``actions.conclude`` verdict refuses, or ``None``. The
+    endpoint asks the same gate and, on a refusal, answers the idempotent
+    repeat with the unchanged row: conclude never fails, a concluded row just
+    has nothing to offer."""
+    if exp.status == "concluded":
+        return ActionRefusal(
+            EXPERIMENT_ALREADY_CONCLUDED,
+            "This experiment is already concluded.",
+            409,
+            params={"status": exp.status},
+        )
+    return None
+
+
+def delete_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
+    """Why ``DELETE /{id}`` would refuse, or ``None`` — the gate the endpoint
+    raises from and the row's ``actions.delete`` verdict.
+
+    Draft only — and ``stop`` is the documented way to leave ``running``, which
+    puts the row back in ``draft`` WITH its assignments intact, so the status
+    check alone was bypassed by the very action its message cites:
+    stop-then-delete destroyed the measurement history it exists to preserve.
+    ``assignments`` is the only record of which invoice ran which arm —
+    ``GET /results`` derives everything from it, the invoices' frozen snapshots
+    outlive the row, and the ``invoice.experiment_assigned`` audit rows would
+    be left naming an experiment id that no longer resolves."""
+    if exp.status != "draft":
+        return ActionRefusal(
+            EXPERIMENT_NOT_DELETABLE,
+            "Only a draft experiment can be deleted (stop/conclude a "
+            "running one to preserve its measurement history).",
+            409,
+            params={"status": exp.status},
+        )
+    if exp.assignments:
+        count = len(exp.assignments)
+        return ActionRefusal(
+            EXPERIMENT_HAS_ASSIGNMENTS,
+            f"Cannot delete an experiment that has assigned {count} "
+            "invoice(s) — its assignment record is the only evidence of which "
+            "invoice ran which arm. Conclude it instead.",
+            409,
+            params={"count": count},
+        )
+    return None
+
+
+_ACTION_GATES = {
+    "start": start_refusal,
+    "stop": stop_refusal,
+    "conclude": conclude_refusal,
+    "delete": delete_refusal,
+}
+
+
 def _experiment_actions(exp: WorkflowExperiment, user: User) -> dict:
-    """The caller's verdict on each row action — ``start`` today."""
+    """The caller's verdict on each row action — start / stop / conclude /
+    delete, each the endpoint's role predicate then the gate it raises from."""
     if not holds_any_role(user, _WRITE_ROLES):
-        return {"start": role_not_permitted()}
-    refusal = start_refusal(exp)
-    return {"start": refusal.verdict() if refusal else None}
+        return {name: role_not_permitted() for name in _ACTION_GATES}
+    verdicts = {}
+    for name, gate in _ACTION_GATES.items():
+        refusal = gate(exp)
+        verdicts[name] = refusal.verdict() if refusal else None
+    return verdicts
 
 
 def _experiment_response(
@@ -388,8 +473,9 @@ async def stop_experiment(
         db, WorkflowExperiment, experiment_id, entity_id, detail="Experiment not found."
     )
     exp = await _get_experiment(db, experiment_id, organization_id=user.organization_id)
-    if exp.status != "running":
-        raise HTTPException(status_code=409, detail="Only a running experiment can be stopped.")
+    refusal = stop_refusal(exp)
+    if refusal is not None:
+        raise refusal.http()
     exp.status = "draft"
     exp.started_at = None
     await db.flush()
@@ -424,7 +510,8 @@ async def conclude_experiment(
         db, WorkflowExperiment, experiment_id, entity_id, detail="Experiment not found."
     )
     exp = await _get_experiment(db, experiment_id, organization_id=user.organization_id)
-    if exp.status == "concluded":
+    if conclude_refusal(exp) is not None:
+        # Idempotent — already concluded.
         names = await _definition_names(db, {exp.workflow_definition_id})
         return _experiment_response(
             exp, user=user, definition_name=names.get(exp.workflow_definition_id)
@@ -466,29 +553,9 @@ async def delete_experiment(
         db, WorkflowExperiment, experiment_id, entity_id, detail="Experiment not found."
     )
     exp = await _get_experiment(db, experiment_id, organization_id=user.organization_id)
-    if exp.status != "draft":
-        raise HTTPException(
-            status_code=409,
-            detail="Only a draft experiment can be deleted (stop/conclude a "
-            "running one to preserve its measurement history).",
-        )
-    # ...and `stop` is the documented way to leave `running`, which puts the row
-    # back in `draft` WITH its assignments intact. So the status check above was
-    # bypassed by the very action whose message it cites: stop-then-delete
-    # destroyed the measurement history it exists to preserve. `assignments` is
-    # the only record of which invoice ran which arm — `GET /results` derives
-    # everything from it, the invoices' frozen snapshots outlive the row, and the
-    # `invoice.experiment_assigned` audit rows would be left naming an
-    # experiment id that no longer resolves.
-    if exp.assignments:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cannot delete an experiment that has assigned {len(exp.assignments)} "
-                "invoice(s) — its assignment record is the only evidence of which "
-                "invoice ran which arm. Conclude it instead."
-            ),
-        )
+    refusal = delete_refusal(exp)
+    if refusal is not None:
+        raise refusal.http()
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),

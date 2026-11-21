@@ -48,10 +48,10 @@
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 
-	// Raise / edit / delete a draft: the create set.
+	// Raise a requisition: the create set (the header button — not a row action).
 	const canCreate = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk'));
 	// Whether a row offers Submit / Approve / Reject / Convert / Reopen /
-	// Cancel is NOT decided here: each row carries the server's verdict
+	// Cancel / Delete is NOT decided here: each row carries the server's verdict
 	// (`r.actions`, built from the gates the endpoints raise from — backend
 	// `api/requisitions.requisition_action_refusals`), read through
 	// `actionVerdicts.ts`. The page used to restate three role sets, a status
@@ -534,7 +534,7 @@
 						{#if isAllowed(r.actions?.cancel)}
 							<RowAction variant="default" onclick={() => doCancel(r)} disabled={busyId === r.id}>{m('requisitions.row.cancel')}</RowAction>
 						{/if}
-						{#if canCreate && r.status === 'draft'}
+						{#if isAllowed(r.actions?.delete)}
 							<RowAction
 								variant="danger"
 								armed={confirmDeleteId === r.id}

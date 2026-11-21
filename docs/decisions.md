@@ -24364,3 +24364,38 @@ other code paths run). The lookup by id now reads every holder; with more than
 one it reports the record as a `duplicate_link` conflict, touches neither
 vendor, and syncs the rest of the pull. Choosing a holder there would be the
 same guess the migration declines.
+
+## 483. Delete on /intake, /requisitions and /experiments follows the endpoint's verdict, including where the old page rule was narrower (round 2026-11-21)
+
+The last web controls the §305 follow-up tracked as restating a server rule —
+intake and requisition Delete, experiment Stop / Conclude / Delete — now raise
+from one gate each (`services/procurement_controls.{intake,requisition}_delete_refusal`,
+`api/workflow_experiments.{stop,conclude,delete}_refusal`) and ship as each
+row's `actions`, pinned by the parity tests per role × row state.
+
+The verdict says what the endpoint does, and in two places that differs from
+what the page used to show:
+
+- **Requisition Delete** was offered only on `draft`. The endpoint has always
+  deleted any requisition that owns no PO and was not converted from an
+  intake, whatever its status (`backend/docs/procurement-requisitions.md`), so
+  the page now offers it on rejected, cancelled, submitted, pending and
+  approved rows too, and no longer offers it on a draft an intake was
+  converted into (which 409'd). Narrowing the endpoint to drafts would be a
+  separate policy change to who may discard a submitted request; this change
+  does not make it, because the rule is to stop the page and the endpoint from
+  disagreeing, not to pick a new rule while doing so.
+- **Experiment Conclude** was offered only on `running`. The endpoint also
+  concludes a `draft` (no assignments are taken after it), so a draft now
+  offers it, armed two-click like Delete because it is terminal. A
+  stopped draft that kept its assignments no longer offers the Delete that
+  409s (`experiment_has_assignments`).
+
+Conclude never refuses: a concluded row's repeat POST is an idempotent no-op
+answering the unchanged row. Its verdict is `experiment_already_concluded`
+anyway, the same shape as Start on a running experiment (nothing to offer),
+and the endpoint asks the same gate to decide the replay. The procurement
+delete 409s became coded (`intake_delete_converted`,
+`requisition_delete_converted`, `requisition_delete_from_intake`), the module's
+convention; the experiment ones stay plain strings with codes in the verdict,
+as `start_refusal` already did.

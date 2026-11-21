@@ -147,6 +147,7 @@ export interface IntakeActions {
 	convert: ActionRefusal;
 	cancel: ActionRefusal;
 	reopen: ActionRefusal;
+	delete: ActionRefusal;
 }
 
 export interface IntakeListResponse {
