@@ -24280,6 +24280,7 @@ on the next deepmerge release, to protect a build-time merge of our own
 config files. §352's method (a patch, a guard, then an ID-scoped ignore) still
 holds for the next advisory with no fixed release; `frontend/CLAUDE.md` keeps
 it as the rule.
+
 ## 481. The overdue and due-soon population is one select every counting surface joins (closes a `docs/followups.md` entry, round 2026-11-21)
 
 §471 put the population (outflow statuses), the effective due date (latest
