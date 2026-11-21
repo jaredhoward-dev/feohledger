@@ -620,8 +620,9 @@ experiments `DataTable` with clickable rows opening a **results readout** modal
 (winner / not-enough-data banner + the per-variant metric table, primary metric
 row highlighted), a create `Modal` (pick a definition — seeds both configs from
 its live `steps_config` — set split %, primary metric, min sample, edit the two
-JSON configs), and per-row start / stop / conclude / delete actions gated by
-status + role. Over `#lib/api/experiments.ts` (types in
+JSON configs), and per-row start / stop / conclude / delete actions offered by the row's
+`actions` verdicts (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`,
+the gates the endpoints raise from). Over `#lib/api/experiments.ts` (types in
 `#lib/types/experiments.ts`).
 
 ### Frontend — `/adaptive`

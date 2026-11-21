@@ -96,7 +96,11 @@ If the linked requisition was deleted, the dangling link is rebuilt.
 `converted_requisition_id` / `converted_po_id`, or sits in `converted` — the
 shape `DELETE /api/recurring/{id}` uses once a template has generated invoices.
 `DELETE /api/requisitions/{id}` refuses symmetrically when an intake points at
-it (that FK RESTRICTs, so the attempt used to surface as a `500`).
+it (that FK RESTRICTs, so the attempt used to surface as a `500`). Both answer a
+coded detail — `intake_delete_converted`, `requisition_delete_from_intake` —
+from the one gate in `services/procurement_controls.py` that also builds each
+row's `actions.delete`, so /intake and /requisitions offer Delete exactly where
+it succeeds.
 
 The pair is what keeps the idempotency above **real**. The dangling-link
 rebuild exists for a requisition that genuinely vanished; while the requisition
