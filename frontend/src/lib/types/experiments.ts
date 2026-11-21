@@ -82,9 +82,17 @@ export interface Experiment {
 	entity_id: string | null;
 	created_at: string | null;
 	updated_at: string | null;
-	/** The caller's verdict on Start (`api/workflow_experiments.start_refusal`):
+	/** The caller's verdict on each row action
+	 *  (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`):
 	 *  `null` offers it. Absent means not known yet (fail closed). */
-	actions?: { start: ActionRefusal };
+	actions?: ExperimentActions;
+}
+
+export interface ExperimentActions {
+	start: ActionRefusal;
+	stop: ActionRefusal;
+	conclude: ActionRefusal;
+	delete: ActionRefusal;
 }
 
 export interface ExperimentListResponse {
