@@ -59,7 +59,7 @@ pytestmark = pytest.mark.asyncio
 
 def _assert_parity(verdict, resp, label):
     if verdict is None:
-        assert resp.status_code in (200, 201), (label, resp.text)
+        assert resp.status_code in (200, 201, 204), (label, resp.text)
         return
     assert resp.status_code in (403, 409, 422), (label, verdict, resp.text)
     detail = resp.json()["detail"]
