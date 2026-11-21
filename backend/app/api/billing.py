@@ -56,6 +56,7 @@ from app.services.billing_adapters import get_billing_adapter
 from app.services.billing_adapters.base import (
     BillingNotConfigured,
     BillingPaymentDeclined,
+    BillingProviderError,
     SetupIntentRejected,
 )
 from app.tenant import get_tenant, get_tenant_db, lock_organization
@@ -108,11 +109,18 @@ def _billing_refusal(code: str) -> HTTPException:
 
 
 def _provider_unavailable(op: str, exc: Exception) -> HTTPException:
-    """Log a failed billing-provider read by exception CLASS only and build its 502.
+    """Log a failed billing-provider call and build its 502.
 
-    Never the message: a provider error can carry customer detail.
+    Logged by exception CLASS, never the message (a provider error can carry
+    customer detail), plus a ``BillingProviderError``'s ``diagnostic``: the
+    provider's validated machine identifiers (error code / param, request id),
+    without which a provider 400 cannot be diagnosed from our own logs.
     """
-    logger.warning("billing %s failed: %s", op, type(exc).__name__)
+    diagnostic = getattr(exc, "diagnostic", "") if isinstance(exc, BillingProviderError) else ""
+    if diagnostic:
+        logger.warning("billing %s failed: %s (%s)", op, type(exc).__name__, diagnostic)
+    else:
+        logger.warning("billing %s failed: %s", op, type(exc).__name__)
     return HTTPException(
         status_code=status.HTTP_502_BAD_GATEWAY, detail=BILLING_PROVIDER_UNAVAILABLE_DETAIL
     )
