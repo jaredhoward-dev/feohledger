@@ -376,9 +376,17 @@ refuse an id another vendor holds in that company.
 Before this index, two holders of one id made the sync's lookup by id raise
 and abort the whole pull. The sync now reports such a record instead
 (`conflicts`, reason `duplicate_link`, and "not updated" in the response
-message), leaves both vendors untouched, and syncs the rest. On a migrated
-tenant the index makes that unreachable; the check is for a tenant still
-before 0140.
+message), leaves both vendors untouched, and syncs the rest. A record the
+pull lists twice is reported once (deduplicated on its ERP id), so the message
+counts records, not sightings. On a migrated tenant the index makes that
+unreachable; the check is for a tenant still before 0140.
+
+Every sync takes the link lock (`vendor_erp_manual_link.link_lock`, §415)
+before it reads a link, a no-realm sync included (under a key no named
+company can produce). Two no-realm pulls of one new record would otherwise
+both find no holder and both create a vendor, and the second would fail the
+index at flush with a 500; with the lock the second waits, then finds the
+first one's vendor and leaves it unchanged (decisions §485).
 
 #### Duplicate ERP links
 

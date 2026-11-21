@@ -194,6 +194,52 @@ async def test_delete_unconverted_intake_still_works(realdb):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Who may delete: intake is every system role, a requisition is not the CFO
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["admin", "ap_manager", "ap_clerk", "cfo"])
+async def test_every_system_role_may_delete_an_unconverted_intake(realdb, role):
+    """Intake is the non-PO spend ask, so anyone who may raise one may withdraw
+    it. The tuple is pinned too: there is no system role outside it today, so
+    the set itself is what a fifth role would have to be judged against."""
+    from app.api.intake import INTAKE_AUTHOR_ROLES
+
+    assert set(INTAKE_AUTHOR_ROLES) == {"admin", "ap_manager", "ap_clerk", "cfo"}
+    async with realdb.client(key=TENANT, role=role) as c:
+        iid = (await c.post("/api/intake", json=_intake_payload())).json()["id"]
+        assert (await c.delete(f"/api/intake/{iid}")).status_code == 204
+
+
+async def test_an_unauthenticated_intake_delete_is_refused(realdb):
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        iid = (await c.post("/api/intake", json=_intake_payload())).json()["id"]
+    async with realdb.client(key=TENANT, role=None) as c:
+        assert (await c.delete(f"/api/intake/{iid}")).status_code == 401
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        assert (await c.get(f"/api/intake/{iid}")).status_code == 200
+
+
+@pytest.mark.parametrize("role", ["admin", "ap_manager", "ap_clerk"])
+async def test_requisition_authors_may_delete_a_draft(realdb, role):
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        rid = (await c.post("/api/requisitions", json=_req_payload())).json()["id"]
+    async with realdb.client(key=TENANT, role=role) as c:
+        assert (await c.delete(f"/api/requisitions/{rid}")).status_code == 204
+
+
+async def test_the_cfo_may_not_delete_a_requisition(realdb):
+    """The CFO decides requisitions; deleting one is the author's door, and a
+    decider who could delete could remove what they were asked to judge."""
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        rid = (await c.post("/api/requisitions", json=_req_payload())).json()["id"]
+    async with realdb.client(key=TENANT, role="cfo") as c:
+        assert (await c.delete(f"/api/requisitions/{rid}")).status_code == 403
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        assert (await c.get(f"/api/requisitions/{rid}")).status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # 3. Intake vendor_id — existence + entity scope, on create AND update
 # ---------------------------------------------------------------------------
 

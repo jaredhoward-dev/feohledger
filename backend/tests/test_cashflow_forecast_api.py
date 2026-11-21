@@ -279,6 +279,39 @@ async def test_forecast_carries_overdue_ap_into_the_first_period(realdb):
     assert totals["count"] == 2
 
 
+async def test_commitment_rows_keeps_past_due_and_drops_past_horizon_and_untimeable(realdb):
+    """`ap_commitments.commitment_rows` directly: a past-due row is kept and
+    flagged `overdue` with its real due date; a row due the day after the
+    horizon and a row with no due date at all (neither invoice nor schedule)
+    are left out; the horizon's last day is kept."""
+    from app.services.ap_commitments import commitment_rows
+    from app.utils.dates import utc_today
+
+    today = utc_today()
+    horizon = 30
+    approved = InvoiceStatus.approved.value
+    past_due = await _add_invoice(
+        realdb, "a", amount="100", status=approved, due_date=today - timedelta(days=3)
+    )
+    last_day = await _add_invoice(
+        realdb, "a", amount="200", status=approved, due_date=today + timedelta(days=horizon)
+    )
+    await _add_invoice(
+        realdb, "a", amount="300", status=approved, due_date=today + timedelta(days=horizon + 1)
+    )
+    await _add_invoice(realdb, "a", amount="400", status=approved, due_date=None)
+
+    async with realdb.sessionmaker("a")() as s:
+        rows = await commitment_rows(
+            s, today=today, horizon_days=horizon, include_pending=True, reporting_currency="USD"
+        )
+    by_id = {r["invoice_id"]: r for r in rows}
+    assert set(by_id) == {str(past_due), str(last_day)}
+    assert by_id[str(past_due)]["overdue"] is True
+    assert by_id[str(past_due)]["due_date"] == today - timedelta(days=3)
+    assert by_id[str(last_day)]["overdue"] is False
+
+
 async def test_forecast_overdue_follows_the_payment_schedule_due_date(realdb):
     """The schedule's due date is authoritative: an invoice whose own due date
     is past but whose schedule moved it into the future is NOT overdue, and the

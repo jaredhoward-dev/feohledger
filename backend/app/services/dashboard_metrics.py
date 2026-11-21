@@ -422,11 +422,13 @@ async def monthly_trend(s: DashboardScope) -> list[dict]:
 
 
 async def upcoming_payments(s: DashboardScope) -> dict:
-    """Upcoming payments (due within 7 days + overdue), capped at ten rows,
+    """Upcoming payments (due within `DUE_SOON_DAYS` + overdue), capped at ten rows,
     with their totals: `upcoming_payments`, `upcoming_total_amount`,
     `upcoming_total_amount_reporting`, `upcoming_unconverted_count`."""
     today = s.today
-    week_ahead = today + timedelta(days=7)
+    # The due-soon window's far edge, so this list and `due_soon_count`
+    # (`overdue_and_due_soon`) cannot drift apart.
+    week_ahead = today + timedelta(days=DUE_SOON_DAYS)
     paid_ids = select(Payment.invoice_id).where(Payment.status == "completed").scalar_subquery()
     upcoming_rows = await s.db.execute(
         s.inv(
