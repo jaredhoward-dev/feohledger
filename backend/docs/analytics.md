@@ -1091,7 +1091,10 @@ AP the business was already late paying. Probed: USD 1,000 due yesterday + USD
 The rule now:
 
 - `commitment_rows` keeps the row, flags it `overdue: True` and leaves its real
-  `due_date` alone. The SQL bound is on the future edge only.
+  `due_date` alone. The SQL bound is on the future edge only. The row set, its
+  effective due date and the flag come from `services/open_ap_due`
+  (`open_ap_due_population`, `is_overdue`), the select the dashboard's
+  `overdue_*` and `GET /api/invoices?overdue=true` join too.
 - `services/analytics.bucket_outflows` times a flagged row on **today** — it
   cannot leave in the past — so it lands in the period containing today, the
   forecast's first. It counts in `scheduled_amount` and `count` and on its own

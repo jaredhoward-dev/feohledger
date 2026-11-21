@@ -1507,19 +1507,29 @@ user-visible halves still open.
 
 ### Surfaced by the round-32 money-path review (2026-11-20, PR #738)
 
-- [ ] **(c) The dashboard's overdue count restates the predicate the invoice
-      list's `overdue` filter imports.** `GET /api/invoices?overdue=true` filters
-      on `services/open_ap_due.overdue_invoice_ids`, but
-      `dashboard_metrics.overdue_and_due_soon` still builds its own population
-      (`OUTFLOW_STATUSES`, the latest schedule, `is_overdue`). The two agree row
-      for row today, and `tests/test_dashboard_aggregates.py` pins that parity
-      (list total == dashboard `overdue_count`, consolidated and per entity), so
-      drift would fail CI. But the rule is written twice, so `open_ap_due`'s
-      "stated once" claim is not yet true. **Durable fix:** have
-      `overdue_and_due_soon` aggregate over `Invoice.id IN
-      (overdue_invoice_ids(today))` for the overdue leg, or move the population
-      into one shared select both read. **Trigger:** the next change to the
-      overdue or due-soon rule, or to the dashboard aggregates.
+- [ ] **(c) Three per-row "overdue" readings still time an invoice on its own
+      due date, not `open_ap_due`'s effective one.** The counted surfaces now
+      share one select (`open_ap_due.open_ap_due_population`, decisions §480),
+      but three readers outside it still compare `Invoice.due_date` with today:
+      the web dashboard's ten-row `upcoming_payments` list
+      (`dashboard_metrics.upcoming_payments`: its population is "no completed
+      `Payment`", any status, and its `is_overdue` flag), the payment queue's
+      per-row `is_overdue` (`api/payments.py`, which joins the latest schedule
+      for discount terms but shows and flags the invoice's own date), and the
+      aging bands (`dashboard_metrics.aging`, `ap_commitments.aging_snapshot_buckets`).
+      A rescheduled invoice can therefore be flagged overdue in a list while
+      the overdue count leaves it out, or the reverse. Not changed in §480
+      because each needs a product call the count did not: the upcoming list
+      deliberately drops an invoice whose payment completed but whose
+      `payment_scheduled → paid` sync-back has not run, which the outflow
+      population keeps; the queue row's flag must agree with the date it
+      prints; and aging is reconciled to the AP balance (F-4) by date as well
+      as population. **Durable fix:** decide whether an invoice with a
+      completed payment is still owed (and, if not, put that in the population
+      once), then have the three read `effective_due` from
+      `open_ap_due_population` and show it. **Trigger:** the next change to
+      any of the three, or a customer report of a rescheduled invoice shown as
+      overdue.
 
 ## (a) Blocked on external credentials, accounts, or hardware
 

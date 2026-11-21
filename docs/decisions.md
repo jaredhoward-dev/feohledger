@@ -24245,3 +24245,43 @@ A re-sent accept stays a 409 (`discount_offer_not_open`) rather than becoming a
 effect to suppress, and a 200 for "same tier" would need the endpoint to
 distinguish a retry from a second person choosing the same tier.
 `backend/docs/dynamic-discounting.md` § Concurrency.
+
+## 480. The overdue and due-soon population is one select every counting surface joins (closes a `docs/followups.md` entry, round 2026-11-21)
+
+§471 put the population (outflow statuses), the effective due date (latest
+payment schedule, else the invoice's own) and "overdue" in
+`services/open_ap_due`, but as parts. The dashboard's `overdue_and_due_soon`
+and the forecast's `commitment_rows` each assembled their own copy from
+them, and `overdue_invoice_ids` (behind `GET /api/invoices?overdue=true`) a
+third. The copies agreed only because they were written the same way.
+
+`open_ap_due_population(statuses)` is now the one select: a derived table of
+`invoice_id`, `effective_due` and the latest schedule's discount terms over
+the given statuses (default: the whole outflow population). The dashboard
+joins it and adds only its two windows (`is_overdue`, `is_due_soon`, the
+latter now named in the module with `DUE_SOON_DAYS`) and the entity scope;
+`overdue_invoice_ids` is it filtered by `is_overdue`; `commitment_rows`
+joins it with `COMMITTED_STATUSES` alone when `include_pending=false`.
+Entity scope still lands on the outer `Invoice`, amounts are still the
+invoice's `Numeric` columns, and nothing is loaded into Python: the cost is
+one join back to `invoices` on its primary key (no plan was measured).
+
+Chosen over aggregating the dashboard over `Invoice.id IN
+(overdue_invoice_ids(today))`, because due soon is the same population with
+another window: an `IN` set for each window would have left the population
+stated once for overdue and again for due soon.
+
+`backend/tests/test_open_ap_due_single_statement.py` fails any module under
+`app/` other than `open_ap_due` that names `OUTFLOW_STATUSES`,
+`latest_schedule_subquery` or `effective_due_date`, and any of the three
+counting surfaces that stops reading the shared select;
+`tests/test_dashboard_aggregates.py` still pins the list total, the dashboard
+count and the forecast count equal against Postgres.
+
+Left alone, and tracked in `docs/followups.md`: the web dashboard's ten-row
+`upcoming_payments` list, the payment queue's per-row `is_overdue` and the
+aging bands still time an invoice on its own `due_date`. Each needs a product
+call the count did not (an invoice whose payment completed before its
+`paid` sync-back; a row flag that must match the date it prints; aging's
+reconciliation with the AP balance). The exception SLA `is_overdue` is a
+different rule (an exception's `due_at`) and is not AP timing.
