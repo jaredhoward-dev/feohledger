@@ -265,6 +265,56 @@ export interface BillingPlansResponse {
 	plans: BillingPlan[];
 }
 
+/** What one plan in the picker adds, read off the catalog's own entitlements. */
+export interface PlanHighlights {
+	/** The next-cheaper plan this one grants everything of — "Everything in
+	 *  {builtOn}" — or null when there is none (the first plan, a predecessor
+	 *  that grants nothing, or a plan that drops a feature the one before it
+	 *  grants). */
+	builtOn: string | null;
+	/** Granted feature keys beyond `builtOn` (every granted key when it is
+	 *  null), in `order` with keys outside it last. */
+	added: string[];
+}
+
+/**
+ * Per-plan differentiators for the plan-change picker, keyed by plan code.
+ *
+ * `GET /api/billing/plans` returns feature entitlements only (`usage_components`
+ * — the AI-read allowance — and seats are not on the payload), so this says
+ * what each plan adds over the one before it and nothing else: the claim
+ * "Everything in X" is made only when X's granted set really is a subset, so a
+ * negotiated plan that drops a feature lists its own grants instead of
+ * inheriting a promise it does not keep. `plans` arrive cheapest first.
+ */
+export function planHighlights(
+	plans: readonly Pick<BillingPlan, 'code' | 'name' | 'entitlements'>[],
+	order: readonly string[] = []
+): Map<string, PlanHighlights> {
+	const rank = (k: string) => {
+		const i = order.indexOf(k);
+		return i === -1 ? order.length : i;
+	};
+	const granted = (p: Pick<BillingPlan, 'entitlements'>) =>
+		Object.entries(p.entitlements ?? {})
+			.filter(([, v]) => v === true)
+			.map(([k]) => k);
+	const out = new Map<string, PlanHighlights>();
+	let prev: { name: string; keys: Set<string> } | null = null;
+	for (const p of plans) {
+		const keys = granted(p);
+		const own = new Set(keys);
+		// An empty predecessor makes "Everything in X" true but says nothing.
+		const builds = prev !== null && prev.keys.size > 0 && [...prev.keys].every((k) => own.has(k));
+		const added = keys
+			.filter((k) => !(builds && prev!.keys.has(k)))
+			.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+		out.set(p.code, { builtOn: builds ? prev!.name : null, added });
+		prev = { name: p.name, keys: own };
+	}
+	return out;
+}
+
 /**
  * Mid-period proration for a plan change — an exact decimal STRING. Positive =
  * extra charge (upgrade), negative = credit (downgrade), `"0.00"` = no change /

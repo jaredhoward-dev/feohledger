@@ -82,6 +82,33 @@ _ENDED_STATUSES = frozenset({"canceled", "incomplete_expired"})
 _SETUP_INTENT_ID = re.compile(r"seti_[A-Za-z0-9]{1,250}")
 
 
+_STRIPE_ERROR_FIELD = re.compile(r"[A-Za-z0-9_.\[\]-]{1,100}")
+
+
+def _stripe_error_fields(resp: httpx.Response) -> str:
+    """Stripe's fixed machine identifiers for a failed request, PII-free.
+
+    ``error.type`` / ``error.code`` / ``error.param`` and the ``Request-Id``
+    header, each kept only if it matches a plain identifier shape, so nothing
+    free-text (the ``message``, a ``param`` echoing a value) can ride along.
+    """
+    fields: list[str] = []
+    try:
+        err = (resp.json() or {}).get("error") or {}
+    except ValueError:
+        err = {}
+    if not isinstance(err, dict):
+        err = {}
+    for key in ("type", "code", "param"):
+        value = err.get(key)
+        if isinstance(value, str) and _STRIPE_ERROR_FIELD.fullmatch(value):
+            fields.append(f"{key}={value}")
+    request_id = resp.headers.get("Request-Id", "")
+    if _STRIPE_ERROR_FIELD.fullmatch(request_id):
+        fields.append(f"request_id={request_id}")
+    return ", ".join(fields)
+
+
 def _ts(value) -> datetime | None:
     """A Stripe Unix timestamp → aware UTC datetime (None when absent)."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -706,9 +733,13 @@ class StripeBillingAdapter(BillingAdapter):
         self._require_key()
         if not customer_id:
             return None
+        # Card-only, via ``allowed_payment_method_types``: the pinned API version
+        # (endive) rejects the old ``payment_method_types`` with a 400
+        # ``payment_method_types_no_longer_supported``. Cards are all
+        # ``list_payment_methods`` reads back and all a subscription charges.
         form = {
             "customer": str(customer_id),
-            "payment_method_types[]": "card",
+            "allowed_payment_method_types[]": "card",
             "usage": "off_session",
         }
         async with self._client() as client:
@@ -764,9 +795,14 @@ class StripeBillingAdapter(BillingAdapter):
             # made no change, and the remedy is the customer's card.
             raise BillingPaymentDeclined(f"Stripe {op} declined: HTTP 402")
         if resp.status_code >= 400:
-            # PII-free: status code + op only — never echo the body (it can
-            # contain customer detail).
-            raise BillingProviderError(f"Stripe {op} failed: HTTP {resp.status_code}")
+            # PII-free: never echo the body (it can carry customer detail).
+            # Stripe's machine fields — error ``type`` / ``code`` / ``param`` and
+            # the ``Request-Id`` header — ride separately as ``diagnostic``:
+            # without them a 400 is undiagnosable from our own logs.
+            raise BillingProviderError(
+                f"Stripe {op} failed: HTTP {resp.status_code}",
+                diagnostic=_stripe_error_fields(resp),
+            )
         try:
             return resp.json()
         except ValueError as exc:

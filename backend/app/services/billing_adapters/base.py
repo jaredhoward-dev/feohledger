@@ -163,7 +163,18 @@ class BillingNotConfigured(RuntimeError):
 
 class BillingProviderError(RuntimeError):
     """The provider answered a configured request with an error (PII-free text:
-    the operation and the HTTP status, never the response body)."""
+    the operation and the HTTP status, never the response body).
+
+    ``diagnostic`` carries the provider's fixed machine identifiers for the
+    failure (Stripe: error type / code / param and the request id), each
+    validated as a plain identifier by the adapter. It is the only part the
+    billing routes log — the message itself never reaches a log line, so a
+    future raise site cannot leak through it.
+    """
+
+    def __init__(self, message: str = "", *, diagnostic: str = "") -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class BillingPaymentDeclined(BillingProviderError):

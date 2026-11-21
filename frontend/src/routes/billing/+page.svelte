@@ -49,7 +49,7 @@
 		BillingPlanChangeResponse,
 		BillingSubscriptionResponse
 	} from '#lib/types/billing.ts';
-	import { planChangeCardAction, rebateMeterGroups } from '#lib/types/billing.ts';
+	import { planChangeCardAction, planHighlights, rebateMeterGroups } from '#lib/types/billing.ts';
 	import { formatDate, formatMonth } from '#lib/utils/time.ts';
 	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { PLAN_FEATURES, isPlanFeature, planFeatureLabelKey } from '#lib/types/planFeatures.ts';
@@ -299,6 +299,41 @@
 		if (availablePlans.length === 0) await loadAvailablePlans();
 		await confirmPlanChange();
 	}
+
+	/** How many differentiators a picker card shows before "+N more" — enough
+	 *  to tell the plans apart without turning each row into a pricing table. */
+	const PLAN_HIGHLIGHT_LIMIT = 3;
+
+	/**
+	 * One short line per picker card: what the plan adds over the next-cheaper
+	 * one, from the catalog's own entitlements (`planHighlights`). Joined into a
+	 * single string so it is also the radio's accessible description, read as
+	 * one phrase rather than run-together spans.
+	 */
+	const planHighlightLines = $derived.by(() => {
+		const byCode = planHighlights(availablePlans, PLAN_FEATURES);
+		const lines = new Map<string, string>();
+		for (const [code, h] of byCode) {
+			const parts: string[] = [];
+			if (h.builtOn) parts.push(m('billing.plan.changeModal.everythingIn', { plan: h.builtOn }));
+			const labels = h.added.map((k) =>
+				isPlanFeature(k) ? m(planFeatureLabelKey(k)) : k.replace(/_/g, ' ')
+			);
+			const room = PLAN_HIGHLIGHT_LIMIT - parts.length;
+			if (labels.length > room) {
+				parts.push(...labels.slice(0, room - 1));
+				parts.push(
+					m('billing.plan.changeModal.moreFeatures', { count: labels.length - (room - 1) })
+				);
+			} else {
+				parts.push(...labels);
+			}
+			// A no-break space before the dot keeps it at the end of a wrapped line
+			// rather than opening the next one.
+			if (parts.length) lines.set(code, parts.join('\u00a0· '));
+		}
+		return lines;
+	});
 
 	/** Display name for a plan code the picker already fetched, falling back to
 	 *  the bare code if the list has since moved on (defensive, not expected). */
@@ -800,11 +835,26 @@
 			{:else if availablePlans.length === 0}
 				<p class="state">{m('billing.plan.changeModal.empty')}</p>
 			{:else}
-				<fieldset class="plan-options">
-					<legend>{m('billing.plan.changeModal.legend')}</legend>
+				<fieldset class="plan-options" data-testid="billing-plan-options">
+					<!-- The dialog's own heading ("Choose a plan") already says what
+					     this is, so the legend names the group for assistive tech
+					     without printing a second caption under it. -->
+					<legend class="visually-hidden">{m('billing.plan.changeModal.legend')}</legend>
+					<!-- Native radios in a fieldset: Tab enters the group, the arrow
+					     keys move and select, and "2 of 3" comes from the browser.
+					     The whole card is the radio's <label>, so any click on it
+					     selects. The radio's name stays short ("Select the Growth
+					     plan"); price, highlights and the current-plan marker are its
+					     description. -->
 					{#each availablePlans as p (p.code)}
 						{@const isCurrent = plan?.code === p.code}
-						<label class="plan-option" class:selected={selectedPlanCode === p.code}>
+						{@const highlights = planHighlightLines.get(p.code)}
+						{@const idBase = `plan-option-${p.code}`}
+						<label
+							class="plan-option"
+							class:selected={selectedPlanCode === p.code}
+							data-testid="billing-plan-option"
+						>
 							<input
 								type="radio"
 								name="plan-code"
@@ -813,15 +863,29 @@
 								disabled={isCurrent}
 								onchange={() => (selectedPlanCode = p.code)}
 								aria-label={m('billing.plan.changeModal.selectAria', { name: p.name })}
+								aria-describedby={[
+									isCurrent ? `${idBase}-current` : null,
+									`${idBase}-price`,
+									highlights ? `${idBase}-features` : null
+								]
+									.filter(Boolean)
+									.join(' ')}
 							/>
-							<span class="plan-option-name">
-								{p.name}
-								{#if isCurrent}
-									<span class="current-pill">{m('billing.plan.changeModal.currentBadge')}</span>
+							<span class="plan-option-body">
+								<span class="plan-option-head">
+									<span class="plan-option-name">{p.name}</span>
+									{#if isCurrent}
+										<span class="current-pill" id="{idBase}-current">
+											{m('billing.plan.changeModal.currentBadge')}
+										</span>
+									{/if}
+								</span>
+								{#if highlights}
+									<span class="plan-option-features" id="{idBase}-features">{highlights}</span>
 								{/if}
 							</span>
-							<span class="plan-option-price">
-								<Money amount={p.monthly_price} currency={p.currency} mono />
+							<span class="plan-option-price" id="{idBase}-price">
+								<Money amount={p.monthly_price} currency={p.currency} />
 								<span class="per">{m('billing.plan.perMonth')}</span>
 							</span>
 						</label>
@@ -1212,28 +1276,31 @@
 		gap: 0.5rem;
 	}
 
-	.plan-options legend {
-		font-size: 0.75rem;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--text-muted);
-		padding: 0 0 0.5rem;
-	}
-
+	/* A radio card. `.modal label` (app.css) is the stacked field recipe —
+	   column flex, and every direct-child span set as a small uppercase muted
+	   caption — so each rule below states the direction and type it means
+	   rather than inheriting a form label's. */
 	.plan-option {
 		display: flex;
+		flex-direction: row;
 		align-items: center;
 		gap: 0.75rem;
 		border: 1px solid var(--border);
 		border-radius: var(--radius-sm);
-		padding: 0.75rem 0.9rem;
+		padding: 0.7rem 0.9rem;
 		cursor: pointer;
 		transition: border-color 0.15s var(--ease-out);
 	}
 
 	.plan-option:hover:not(:has(input:disabled)) {
 		border-color: var(--border-strong);
+	}
+
+	/* The ring goes on the card, not the 16px dot: the card is the target the
+	   reader sees (same move as SegmentedControl's segment). */
+	.plan-option:has(input:focus-visible) {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
 	}
 
 	/* The plan you already have: de-emphasised with the muted colour token,
@@ -1243,24 +1310,60 @@
 		color: var(--text-muted);
 	}
 
+	/* Border + ring, no tinted fill: muted highlight text on --accent-tint
+	   over --surface is ~4.3:1 in the dark theme, under the 4.5:1 floor. */
 	.plan-option.selected {
 		border-color: var(--accent);
 		box-shadow: 0 0 0 1px var(--accent);
 	}
 
-	.plan-option-name {
+	.plan-option-body,
+	.plan-option-price {
+		text-transform: none;
+		letter-spacing: normal;
+		font-size: 0.9rem;
+		color: inherit;
+	}
+
+	.plan-option-body {
 		flex: 1;
 		min-width: 0;
-		font-weight: 600;
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		font-weight: 400;
+	}
+
+	.plan-option-head {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.5rem;
 	}
 
-	.plan-option-price {
-		white-space: nowrap;
+	.plan-option-name {
 		font-weight: 600;
+		font-size: 0.95rem;
+	}
+
+	.plan-option-features {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+
+	.plan-option-price {
+		margin-left: auto;
+		text-align: right;
+		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
+		font-weight: 600;
+	}
+
+	.plan-option-price .per {
+		font-weight: 400;
+		font-size: 0.8rem;
+		color: var(--text-muted);
 	}
 
 	/* Not `<Badge>`: a "this is the one you already have" marker inside a
