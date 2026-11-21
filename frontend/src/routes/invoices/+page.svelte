@@ -1166,6 +1166,7 @@
 			testId="invoices-load-error"
 		/>
 	{:else}
+	<div class="inv-table">
 	<DataTable
 		isEmpty={invoiceStore.all.length === 0}
 		loading={invoiceStore.loading}
@@ -1286,6 +1287,7 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 	{/if}
 
 	<LoadMoreFooter
@@ -1421,15 +1423,26 @@
 
 	/* Fixed column widths pair with DataTable's `fixed`/`stickyHeader` props.
 	   These <th> widths apply because the header row is rendered from this
-	   page's snippet (page CSS scope). */
+	   page's snippet (page CSS scope). The predictable columns are sized to
+	   their widest content in the six locales: a header to its longest word
+	   plus the sort arrow (de "RECHNUNGS-NR.", "FÄLLIGKEITSDATUM"), the status
+	   column to its longest badge (fr "COMPTABILISÉE DANS L'ERP"), the actions
+	   column to de "Bestätigen". Vendor and Description carry no width and
+	   share the rest; past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). Ten columns, so the cells
+	   run 10px of horizontal padding instead of the global 14px (the
+	   /exceptions arrangement): that is what keeps the row inside the 1388px
+	   region a 1666px window gives (tests-e2e/a11y/wide-layout.spec.ts). */
+	.inv-table { min-width: 0; }
+	.inv-table :global(table) { min-width: 1380px; }
+	th, td { padding-left: 10px; padding-right: 10px; }
 	th:nth-child(1) { width: 40px; }
-	th:nth-child(2) { width: 11%; }
-	th:nth-child(3) { width: 15%; }
-	th:nth-child(5) { width: 8%; }
-	th:nth-child(6) { width: 9%; }
-	th:nth-child(7) { width: 9%; }
-	th:nth-child(8) { width: 13%; }
-	th:nth-child(9) { width: 11%; }
+	th:nth-child(2) { width: 150px; }
+	th:nth-child(5) { width: 110px; }
+	th:nth-child(6) { width: 132px; }
+	th:nth-child(7) { width: 170px; }
+	th:nth-child(8) { width: 230px; }
+	th:nth-child(10) { width: 120px; }
 
 	.assignee {
 		overflow: hidden;
@@ -1437,7 +1450,7 @@
 		white-space: nowrap;
 		color: var(--text-muted);
 	}
-	th:nth-child(9) { width: 170px; }
+	th:nth-child(9) { width: 140px; }
 
 	td {
 		white-space: nowrap;

@@ -241,13 +241,18 @@ const LIST_PAGES: ListPage[] = [
 ];
 
 /**
- * The fixed tables whose widths are sized to the longest locale (round 32's
- * and round 33's conversions; frontend/docs/ui-patterns.md § Data tables). The six earlier
- * fixed tables (/invoices, /payments, /exceptions, /vendors, /purchase-orders,
- * /gl-accounts) were sized to English and are not yet held to it —
- * docs/followups.md § "Six fixed list tables are sized to English".
+ * The fixed tables whose widths are sized to the longest locale
+ * (frontend/docs/ui-patterns.md § Data tables). /payments' queue is not yet
+ * held to it: its fixed columns, sized to fr/de, do not fit the 1388px region
+ * a 1666px window gives — docs/followups.md § "The payment queue is sized to
+ * English".
  */
 const LOCALE_SIZED = new Set([
+	'/invoices',
+	'/exceptions',
+	'/vendors',
+	'/purchase-orders',
+	'/gl-accounts',
 	'/vendors/screening',
 	'/vendors/change-requests',
 	'/requisitions',

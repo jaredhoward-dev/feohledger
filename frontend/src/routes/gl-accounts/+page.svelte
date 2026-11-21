@@ -573,7 +573,9 @@
 	   cells were sized against the one "Loading…" row, then re-sized against
 	   the real rows, so every column slid sideways as the data landed. Fixed
 	   widths come from the header alone and hold from first paint. The
-	   predictable columns get widths sized to their widest content; the text
+	   predictable columns get widths sized to their widest content in the six
+	   locales (the headers de "KONTONUMMER", "ÜBERGEORDNET", "GELTUNGSBEREICH";
+	   the badges pt-BR "COMPARTILHADA", "PRECISA DE UMA DECISÃO"); the text
 	   column carries none and takes the rest. The `min-width` keeps it
 	   readable: past it the table scrolls inside its region, which is what a
 	   phone gets (frontend/docs/ui-patterns.md § Data tables). DataTable
@@ -582,15 +584,17 @@
 	.gl-table {
 		min-width: 0;
 	}
-	.gl-table :global(table) { min-width: 1330px; }
-	.gl-table :global(th.col-code) { width: 120px; }
+	.gl-table :global(table) { min-width: 1380px; }
+	.gl-table :global(th.col-code) { width: 140px; }
 	.gl-table :global(th.col-type) { width: 140px; }
-	.gl-table :global(th.col-parent) { width: 120px; }
-	.gl-table :global(th.col-scope) { width: 160px; }
-	.gl-table :global(th.col-erp) { width: 170px; }
+	.gl-table :global(th.col-parent) { width: 150px; }
+	.gl-table :global(th.col-scope) { width: 170px; }
+	.gl-table :global(th.col-erp) { width: 230px; }
 	.gl-table :global(th.col-status) { width: 120px; }
-	/* Up to three actions (link to the ERP, Edit, Retire) on one line. */
-	.gl-table :global(th.actions-col) { width: 300px; }
+	/* Edit + Retire on one line; a row that also offers the ERP link wraps
+	   its third button onto a second line (td.actions wraps in a fixed table).
+	   The longest single button, pt-BR "Escolher conta do ERP", fits. */
+	.gl-table :global(th.actions-col) { width: 260px; }
 
 	.filter-row {
 		display: flex;

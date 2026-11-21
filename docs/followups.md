@@ -1410,20 +1410,23 @@ user-visible halves still open.
       reserve the late panels' space on /discounts and /tax; then move each
       into `LIST_PAGES`. **Trigger:** the next polish pass on any of those
       pages.
-- [ ] **(c) Six fixed list tables are sized to English.** Round 32 sized the
-      ten newer `fixed` tables (screening, bank changes, /requisitions,
-      /intake, /catalogs, /budgets, /recurring, /vendor-statements,
-      /positive-pay, /experiments) to their longest locale, and
-      `layout-stability.spec.ts` (`LOCALE_SIZED`) fails under `de` and `es` if
-      a header, badge or action cell there overflows its column. /invoices,
-      /payments, /exceptions, /vendors, /purchase-orders and /gl-accounts got
-      the same wrapping headers and action cells (DataTable's `fixed` styles)
-      but their badge and code columns were never measured against the other
-      locales, so a status badge such as "BEREIT ZUR PRÜFUNG" may still
-      overprint the next column. **Durable fix:** measure each of their
-      fixed widths against all six catalogues, re-size, and add the six hrefs
-      to `LOCALE_SIZED`. **Trigger:** the next change to any of those six
-      tables, or a locale overflow reported on one.
+- [ ] **(c) The payment queue is sized to English.** /invoices,
+      /exceptions, /vendors, /purchase-orders and /gl-accounts are now sized
+      to their longest locale and held to it by `layout-stability.spec.ts`
+      (`LOCALE_SIZED`); /payments is not. Measured against the six
+      catalogues, its queue needs Due date 160px (de "FÄLLIGKEITSDATUM"),
+      Discount 130px, Terms 120px (de "KONDITIONEN") and Status 230px (the
+      fr badge "COMPTABILISÉE DANS L'ERP", ~222px with its padding), so
+      today's 120 / 120 / 100 / 190 overprint in de and fr. Sized that way
+      the fixed columns sum to ~1,365px, which leaves Vendor about 20px inside
+      the 1,388px region a 1666px window gives (the bar
+      `tests-e2e/a11y/wide-layout.spec.ts` holds), so widening alone is not a
+      fix. The history, runs, rebates and cards tabs were not measured at all.
+      **Durable fix:** fold "Compare routes" into the queue's actions cell
+      (it wraps in a fixed table), which frees its 180px column, then size
+      the four columns above, measure the other four tabs the same way, and
+      add `/payments` to `LOCALE_SIZED`. **Trigger:** the next change to the
+      payment queue's columns, or a locale overflow reported on /payments.
 - [ ] **(c) No scripted "first customer" release rehearsal.** The 2026-10-22
       walkthrough — sign up, connect QuickBooks, sync the chart and vendors,
       enter an invoice, approve it, push it, pay the bill in QuickBooks, watch
