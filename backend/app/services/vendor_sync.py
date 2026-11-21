@@ -171,6 +171,7 @@ async def sync_vendors_from_erp(
     # One entry per pulled record two local vendors already hold (see the
     # lookup by id below).
     duplicate_links: list[dict] = []
+    duplicate_ids: set[str] = set()
     unlinked: list[str] = []
     too_long: list[dict] = []
     deactivated = 0
@@ -196,10 +197,12 @@ async def sync_vendors_from_erp(
         return _summary(realm=realm)
     # -- links kept from an earlier connection to this company --------------
     restored = 0
+    # The lock a hand-made link takes (decisions §415): a person linking a
+    # record while this pull adopts it by name cannot both win. Taken with no
+    # realm too (§485): two no-realm pulls would otherwise both create a vendor
+    # for one new record, and the second would fail `uq_vendors_erp_link`.
+    await link_lock(db, organization_id, realm)
     if realm is not None:
-        # The lock a hand-made link takes (decisions §415): a person linking a
-        # record while this pull adopts it by name cannot both win.
-        await link_lock(db, organization_id, realm)
         restored = await _restore_kept_links(db, organization_id, realm, audited, unlinked)
 
     linked = (
@@ -319,6 +322,10 @@ async def sync_vendors_from_erp(
             .all()
         )
         if len(holders) > 1:
+            if str(erp_id) in duplicate_ids:
+                # The pull listed this record twice: one record, one report.
+                continue
+            duplicate_ids.add(str(erp_id))
             # Two vendors holding one record in one company: which one is the
             # supplier is a person's call (merge, or unlink the stale one), so
             # neither is touched and the run goes on. `uq_vendors_erp_link`

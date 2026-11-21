@@ -24399,3 +24399,21 @@ delete 409s became coded (`intake_delete_converted`,
 `requisition_delete_converted`, `requisition_delete_from_intake`), the module's
 convention; the experiment ones stay plain strings with codes in the verdict,
 as `start_refusal` already did.
+
+## 485. A no-realm vendor sync takes the link lock too, rather than catching the unique violation (round 2026-11-21)
+
+§482's unique index made a second holder of one ERP record impossible, which
+turned a race that used to make a silent duplicate into a 500: two no-realm
+syncs (no `link_lock` was taken without a realm, §415) could both find no
+holder for a new record, both create a vendor, and the second failed
+`uq_vendors_erp_link` at flush. Two fixes were weighed. Catching that one
+index's violation and answering a coded 409 would tell the operator to retry
+a pull that did nothing wrong. Taking the same advisory lock for the no-realm
+company (key `vendor-erp-link:<org>:`, which no named realm can produce since
+`connection_realm` never returns an empty one) removes the race: the second
+pull waits, then sees the first one's committed vendor and reports it
+unchanged. Only the sync writes NULL-realm links (a hand-made link always
+names its company), so the lock serializes exactly the writers that can
+collide. The cost is that two no-realm pulls of one tenant run one after the
+other, which is what the named-realm case already does. Pinned in
+`tests/test_vendor_sync.py::test_two_no_realm_syncs_creating_one_record_serialize`.
