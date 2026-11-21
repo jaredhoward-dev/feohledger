@@ -36,7 +36,7 @@
 		theme you picked and nothing else. Everything else the app keeps in your browser is <strong
 			>Web Storage</strong
 		>
-		— <code>localStorage</code> or <code>sessionStorage</code> — not a cookie. There are seven
+		— <code>localStorage</code> or <code>sessionStorage</code> — not a cookie. There are eight
 		items in total, listed in full in the table below. Five of them exist only to keep you signed
 		in or to remember a choice you made (your language, your colour theme, which legal entity you're
 		viewing); none of
@@ -194,6 +194,21 @@
 					<td>
 						Removed as soon as you return from the sign-on provider, whether or not sign-in
 						succeeded; <code>sessionStorage</code> also clears itself when the browser tab closes.
+					</td>
+				</tr>
+				<tr>
+					<td><code>billing_pending_plan</code></td>
+					<td>sessionStorage</td>
+					<td>
+						Remembers which plan you were moving to, and the card setup it belongs to, while
+						your card is confirmed with the payment provider — so if the provider sends you away
+						to approve the card and back again, the plan change you asked for still happens. It
+						holds a plan name and a card-setup reference, never card details.
+					</td>
+					<td>Strictly necessary</td>
+					<td>
+						Removed as soon as you return from the payment provider, whether or not the card was
+						confirmed; <code>sessionStorage</code> also clears itself when the browser tab closes.
 					</td>
 				</tr>
 				<tr>

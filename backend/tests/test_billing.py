@@ -19,6 +19,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -361,6 +362,67 @@ async def test_stripe_list_payment_methods_fails_closed_without_key():
 
 
 @pytest.mark.asyncio
+async def test_stripe_error_carries_machine_fields_never_the_message():
+    """A Stripe 4xx raises with its type / code / param and Request-Id, so a
+    production 400 is diagnosable from our logs, and never the human message
+    (which can echo customer detail) or a free-text field."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"Request-Id": "req_ZFcnCWMdujvGhb"},
+            json={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "payment_method_types_no_longer_supported",
+                    "param": "payment_method_types",
+                    "message": "customer jane@example.com is not allowed",
+                    "doc_url": "https://stripe.com/docs",
+                }
+            },
+        )
+
+    adapter = StripeBillingAdapter({"stripe_api_key": "sk_live", "stripe_webhook_secret": "whsec"})
+    transport = httpx.MockTransport(handler)
+    adapter._client = lambda: httpx.AsyncClient(  # type: ignore[method-assign]
+        base_url="https://api.stripe.test", auth=(adapter._api_key, ""), transport=transport
+    )
+    with pytest.raises(BillingProviderError) as info:
+        await adapter.create_setup_intent("cus_42")
+    assert str(info.value) == "Stripe create_setup_intent failed: HTTP 400"
+    assert info.value.diagnostic == (
+        "type=invalid_request_error, code=payment_method_types_no_longer_supported, "
+        "param=payment_method_types, request_id=req_ZFcnCWMdujvGhb"
+    )
+    assert "jane@example.com" not in info.value.diagnostic
+
+
+def test_stripe_error_fields_drop_free_text():
+    """A field that is not a plain identifier (a param echoing a value, a body
+    that is not JSON) is dropped rather than logged."""
+    from app.services.billing_adapters.stripe_billing import _stripe_error_fields
+
+    resp = httpx.Response(400, json={"error": {"code": "x y", "param": "email jane@x.io"}})
+    assert _stripe_error_fields(resp) == ""
+    assert _stripe_error_fields(httpx.Response(502, text="<html>bad gateway</html>")) == ""
+
+
+def test_provider_unavailable_logs_the_diagnostic_never_the_message(caplog):
+    """The route logs a BillingProviderError's validated diagnostic, never any
+    exception's message."""
+    from app.api.billing import _provider_unavailable
+
+    with caplog.at_level("WARNING", logger="app.api.billing"):
+        _provider_unavailable(
+            "op_a", BillingProviderError("jane@example.com", diagnostic="code=c, request_id=req_1")
+        )
+        _provider_unavailable("op_b", ValueError("jane@example.com"))
+    assert "op_a failed: BillingProviderError (code=c, request_id=req_1)" in caplog.text
+    assert "op_b failed: ValueError" in caplog.text
+    assert "jane@example.com" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_stripe_setup_intent_maps_shape():
     """Stripe /v1/setup_intents POST → normalized ProviderSetupIntent, against a
     mocked transport (no network). No-customer short-circuits to None."""
@@ -368,6 +430,7 @@ async def test_stripe_setup_intent_maps_shape():
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["path"] = request.url.path
+        captured["form"] = parse_qs(request.content.decode())
         return httpx.Response(
             200,
             json={
@@ -385,6 +448,12 @@ async def test_stripe_setup_intent_maps_shape():
 
     intent = await adapter.create_setup_intent("cus_42")
     assert captured["path"] == "/v1/setup_intents"
+    # Card-only through the parameter the pinned API version accepts: endive
+    # answers 400 payment_method_types_no_longer_supported to the old one.
+    assert captured["form"]["allowed_payment_method_types[]"] == ["card"]
+    assert "payment_method_types[]" not in captured["form"]
+    assert captured["form"]["customer"] == ["cus_42"]
+    assert captured["form"]["usage"] == ["off_session"]
     assert intent is not None
     assert intent.external_setup_intent_id == "seti_123"
     assert intent.client_secret == "seti_123_secret_abc"
@@ -402,6 +471,12 @@ async def test_stripe_list_payment_methods_maps_shape_pii_safe():
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/customers/cus_42":
+            # The customer's default card — the one the list marks is_default.
+            return httpx.Response(
+                200,
+                json={"id": "cus_42", "invoice_settings": {"default_payment_method": "pm_2"}},
+            )
         captured["path"] = request.url.path
         captured["query"] = dict(request.url.params)
         return httpx.Response(
@@ -447,6 +522,8 @@ async def test_stripe_list_payment_methods_maps_shape_pii_safe():
     assert methods[0].exp_month == 12
     assert methods[0].exp_year == 2030
     assert methods[1].brand == "mastercard"
+    # The customer's invoice default is the one marked, and only it.
+    assert [m.is_default for m in methods] == [False, True]
 
     captured.clear()
     assert await adapter.list_payment_methods(None) == []

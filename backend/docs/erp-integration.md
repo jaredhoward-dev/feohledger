@@ -3071,7 +3071,7 @@ complete its consent flow. A ZA Sage adapter is separate work.
 | Method | Sage call | Notes |
 |---|---|---|
 | `test_connection` | `GET business_settings` | passes on every plan, Accounting Start included (see below) |
-| `list_vendors` | `GET contacts?contact_type_id=VENDOR` | 200/page, up to `SYNC_LISTING_MAX_ROWS` (else `ErpListingIncomplete`); system contacts skipped; a `gdpr_obfuscated` (or `deleted_at`) contact → `active=False` |
+| `list_vendors` | `GET contacts?contact_type_id=VENDOR` | 200/page, up to `SYNC_LISTING_MAX_ROWS` (else `ErpListingIncomplete`); system contacts skipped; a contact with `is_active: false` (Account Status → Inactive in Sage), `gdpr_obfuscated` or `deleted_at` → `active=False` (an absent `is_active` is never read as inactive); the name is stripped of leading / trailing whitespace (decisions §481) |
 | `list_gl_accounts` | `GET ledger_accounts`, once with `show_included_in_chart=true` and once `=false`, joined by id | `nominal_code` → code; `ledger_account_type` → account_type; out-of-chart and control (`is_control_account`) ledgers emitted `active=False`, never dropped (§284; the filter's default is undocumented) |
 | `list_pos` | — | base default `[]`: the v3.1 Accounting API has no purchase-order resource at all, on any plan |
 | `post_invoice` | `POST purchase_invoices` | below |
@@ -3126,9 +3126,13 @@ alone settled the bill) under §386's amount and currency rule (decisions §390)
   Swagger documents: an invoice date on or before
   `financial_settings.year_end_lockdown_date` → `period_closed`; a foreign
   currency with `multi_currency_enabled: false` → `currency_not_enabled`; the
-  contact gone, `deleted_at` or `gdpr_obfuscated` → `vendor_inactive`; a
-  ledger gone or `included_in_chart: false` → `account_inactive` (naming our
-  codes); otherwise `bill_refused`. Sage's `$dataCode` / `$message` are never
+  contact gone, `is_active: false`, `deleted_at` or `gdpr_obfuscated` →
+  `vendor_inactive`; a ledger gone or `included_in_chart: false` →
+  `account_inactive` (naming our codes); otherwise `bill_refused`.
+  Before the create, the contact itself is read (`is_active,deleted_at,
+  gdpr_obfuscated`): one positively inactive is refused `vendor_inactive`
+  with no POST, since Sage answers that create 422 (seen live, decisions
+  §481); a 404 or unreadable answer lets the create go ahead. Sage's `$dataCode` / `$message` are never
   read (undocumented; the message echoes the payload). The message ends
   `(HTTP <status>)`.
 - 5xx, 401 and 429 stay plain, retryable failures that may have posted

@@ -35,12 +35,16 @@ vendored in https://github.com/nook-io/python-sage/blob/HEAD/openapi.json):
   (docs/decisions.md §303).
 * **Refused creates.** A 4xx a re-send cannot change is classified from what
   the API documents (``financial_settings.year_end_lockdown_date``, the
-  contact's ``deleted_at`` / ``gdpr_obfuscated``, the ledger's
+  contact's ``is_active`` / ``deleted_at`` / ``gdpr_obfuscated``, the ledger's
   ``included_in_chart``) into ``period_closed`` / ``vendor_inactive`` /
   ``account_inactive`` / ``purchases_not_permitted`` / ``bill_refused``, all
   non-retryable and marked as having created nothing. Sage's own ``$dataCode``
   values are undocumented and its ``$message`` echoes submitted fields, so
   neither is read.
+* **Inactive supplier.** Before the create, the contact is read; one with
+  ``is_active: false`` (Account Status → Inactive), ``deleted_at`` or
+  ``gdpr_obfuscated`` is refused ``vendor_inactive`` without a POST, since
+  Sage answers that create with a 422 (docs/decisions.md §481).
 
 **Region coverage.** v3.1 serves Canada, Germany, Spain, France, the UK and
 Ireland (the "Endpoint Availability" list on every operation in the Swagger
@@ -114,6 +118,8 @@ PERIOD_CLOSED = "period_closed"
 VENDOR_INACTIVE = "vendor_inactive"
 ACCOUNT_INACTIVE = "account_inactive"
 BILL_REFUSED = "bill_refused"
+#: The contact fields `_contact_inactive` reads.
+_CONTACT_STATE_ATTRIBUTES = "is_active,deleted_at,gdpr_obfuscated"
 CURRENCY_NOT_ENABLED = "currency_not_enabled"
 
 SAGE_ACCOUNTING_OAUTH = register_oauth_provider(
@@ -433,6 +439,16 @@ class SageAccountingAdapter(OAuthErpAdapter):
                     )
                 return _refused(DUPLICATE_DOCUMENT_NUMBER)
 
+            # A supplier set Inactive in Sage is refused before the create:
+            # Sage answers that create with a 422 (seen live, decisions
+            # §481). Only a positive read counts; a 404 or an unreadable answer
+            # lets the create go ahead and its refusal, if any, be explained.
+            status, contact = await self._read_for_refusal(
+                client, headers, f"contacts/{payload.vendor_erp_id}", _CONTACT_STATE_ATTRIBUTES
+            )
+            if status == 200 and _contact_inactive(contact):
+                return _refused(VENDOR_INACTIVE)
+
             tax_rates: dict[str, str] = {}
             if allocation.has_tax:
                 account_ids = {line.account_erp_id for line in allocation.lines}
@@ -543,9 +559,9 @@ class SageAccountingAdapter(OAuthErpAdapter):
         In order: the invoice is dated on or before the business's year-end
         lockdown date (``period_closed``); it is in a currency other than the
         base currency of a business without multi-currency
-        (``currency_not_enabled``); its contact is gone, deleted or
-        GDPR-obfuscated (``vendor_inactive``); a ledger it posts to is gone or
-        out of the chart (``account_inactive``, naming OUR codes). Anything
+        (``currency_not_enabled``); its contact is gone, deleted, set Inactive
+        or GDPR-obfuscated (``vendor_inactive``); a ledger it posts to is gone
+        or out of the chart (``account_inactive``, naming OUR codes). Anything
         else is ``bill_refused``. Only a positive answer counts; an unreadable
         one is "don't know".
         """
@@ -577,11 +593,9 @@ class SageAccountingAdapter(OAuthErpAdapter):
                 return CURRENCY_NOT_ENABLED, {}
 
         status, contact = await self._read_for_refusal(
-            client, headers, f"contacts/{payload.vendor_erp_id}", "deleted_at,gdpr_obfuscated"
+            client, headers, f"contacts/{payload.vendor_erp_id}", _CONTACT_STATE_ATTRIBUTES
         )
-        if status == 404 or (
-            status == 200 and (contact.get("deleted_at") or contact.get("gdpr_obfuscated"))
-        ):
+        if status == 404 or (status == 200 and _contact_inactive(contact)):
             return VENDOR_INACTIVE, {}
 
         codes = _our_account_codes(payload)
@@ -690,7 +704,7 @@ class SageAccountingAdapter(OAuthErpAdapter):
                 "contact_type_id": "VENDOR",
                 "attributes": (
                     "name,reference,email,tax_number,main_address,credit_days,system,"
-                    "gdpr_obfuscated,deleted_at"
+                    "is_active,gdpr_obfuscated,deleted_at"
                 ),
             },
         )
@@ -751,6 +765,21 @@ def _our_account_codes(payload: InvoicePayload) -> dict[str, str]:
     return codes
 
 
+def _contact_inactive(raw: dict) -> bool:
+    """Whether a contact is no payee anyone can pay.
+
+    ``is_active: false`` is Sage's Account Status → Inactive (verified against
+    a live UK business, decisions §481). Only an explicit ``false`` counts: an
+    absent field is "don't know", never "inactive". A GDPR-obfuscated contact,
+    or one still read back with ``deleted_at``, is no payee either.
+    """
+    return (
+        raw.get("is_active") is False
+        or bool(raw.get("gdpr_obfuscated"))
+        or bool(raw.get("deleted_at"))
+    )
+
+
 def _contact_to_vendor(raw: dict) -> VendorPayload:
     address = None
     main = raw.get("main_address") or {}
@@ -768,14 +797,18 @@ def _contact_to_vendor(raw: dict) -> VendorPayload:
     credit_days = raw.get("credit_days")
     return VendorPayload(
         erp_vendor_id=str(raw["id"]),
-        name=raw.get("name") or raw.get("displayed_as") or str(raw["id"]),
+        # Sage cuts a long name at its 100-character limit and can keep a
+        # trailing space, so the name is stripped before it is stored.
+        name=(raw.get("name") or "").strip()
+        or (raw.get("displayed_as") or "").strip()
+        or str(raw["id"]),
         code=raw.get("reference") or None,
         email=raw.get("email") or None,
         address=address,
         tax_id=raw.get("tax_number") or None,
         payment_terms=f"Net {credit_days}" if credit_days is not None else None,
-        # Sage has no archive flag. A deleted contact normally leaves the pull
-        # (a dead link); one GDPR-obfuscated (or still listed as deleted) is no
-        # payee anyone can pay.
-        active=not raw.get("gdpr_obfuscated") and not raw.get("deleted_at"),
+        # A deleted contact normally leaves the pull (a dead link); one set
+        # Inactive in Sage, GDPR-obfuscated or still listed as deleted is
+        # synced inactive.
+        active=not _contact_inactive(raw),
     )

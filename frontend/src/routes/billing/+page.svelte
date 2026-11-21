@@ -1,5 +1,11 @@
 <script lang="ts">
+	import { tick, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page as appPage } from '$app/state';
+	import { ApiError } from '#lib/api.ts';
+	import { toast } from '#lib/components/ui/Toast.svelte';
+	import CardSetupPanel from '#lib/components/billing/CardSetupPanel.svelte';
+	import { takePendingPlan } from '#lib/utils/pendingPlanChange.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
@@ -17,7 +23,7 @@
 		getBillingPaymentMethods,
 		getBillingPlans,
 		getBillingSubscription,
-		startBillingSetupIntent
+		setDefaultBillingPaymentMethod
 	} from '#lib/api/billing.ts';
 	import { formatMoney } from '#lib/utils/money.ts';
 	import { formatCount } from '#lib/utils/count.ts';
@@ -38,11 +44,12 @@
 		BillingInvoice,
 		BillingInvoiceStatus,
 		BillingPaymentMethod,
+		BillingPaymentMethodsResponse,
 		BillingPlan,
 		BillingPlanChangeResponse,
 		BillingSubscriptionResponse
 	} from '#lib/types/billing.ts';
-	import { rebateMeterGroups } from '#lib/types/billing.ts';
+	import { planChangeCardAction, planHighlights, rebateMeterGroups } from '#lib/types/billing.ts';
 	import { formatDate, formatMonth } from '#lib/utils/time.ts';
 	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { PLAN_FEATURES, isPlanFeature, planFeatureLabelKey } from '#lib/types/planFeatures.ts';
@@ -105,16 +112,12 @@
 	let pmLoading = $state(true);
 	let pmError = $state<string | null>(null);
 
-	// Add / replace card flow. The deployed flow confirms `client_secret` against
-	// the provider's JS SDK (Stripe Elements); the local-first stack has no real
-	// Stripe and the frontend must not call secret-bearing services directly, so
-	// the secret is surfaced as a clearly-marked "next step" seam, never used to
-	// charge or to mount real Elements here.
-	let addingCard = $state(false);
-	let cardSetup = $state<{
-		state: 'idle' | 'starting' | 'ready' | 'not_configured' | 'error';
-		message: string | null;
-	}>({ state: 'idle', message: null });
+	// Add / replace card flow — `components/billing/CardSetupPanel.svelte`
+	// (Stripe Elements when the backend runs Stripe and the build has a
+	// publishable key; a "save test card" step on the local mock provider).
+	// Keyed by `cardFlowNonce`, so every attempt is a fresh SetupIntent.
+	let cardFlowOpen = $state(false);
+	let cardFlowNonce = $state(0);
 
 	async function loadPaymentMethods() {
 		pmLoading = true;
@@ -128,41 +131,85 @@
 		}
 	}
 
-	async function startAddCard() {
-		addingCard = true;
-		cardSetup = { state: 'starting', message: null };
-		try {
-			const res = await startBillingSetupIntent();
-			if (!res.configured || !res.client_secret) {
-				// Org never provisioned with the provider, or the provider isn't
-				// configured (the live adapter fails closed without a key). Not an
-				// error — a clear "billing not configured" affordance.
-				cardSetup = {
-					state: 'not_configured',
-					message: m('billing.card.notConfigured')
-				};
-				return;
-			}
-			// A real SetupIntent secret came back. Mounting the provider's card form
-			// (Stripe Elements) is a deployed-only piece — see the placeholder below.
-			// Re-list cards so a card attached out-of-band shows up.
-			cardSetup = {
-				state: 'ready',
-				message: m('billing.card.ready')
-			};
-			await loadPaymentMethods();
-		} catch (e) {
-			cardSetup = {
-				state: 'error',
-				message: errorMessage(e, m('billing.card.startError'))
-			};
-		} finally {
-			addingCard = false;
-		}
+	function startAddCard() {
+		cardFlowNonce += 1;
+		cardFlowOpen = true;
+	}
+
+	// The section's "Add or replace card" button: where focus goes back to
+	// when the card panel closes (WCAG 2.4.3) — unless the plan dialog reopens
+	// for the retry, which takes focus itself.
+	let addCardButton = $state<HTMLButtonElement | undefined>();
+
+	async function returnFocusToAddCard() {
+		// The button is disabled while the panel is open; it is enabled (and
+		// focusable) only once the close has rendered.
+		await tick();
+		addCardButton?.focus();
 	}
 
 	function closeAddCard() {
-		cardSetup = { state: 'idle', message: null };
+		cardFlowOpen = false;
+		// Walking away from the card form abandons the upgrade it was for.
+		pendingPlanCode = null;
+		pendingPlanName = null;
+		returnFocusToAddCard();
+	}
+
+	async function onCardSaved(res: BillingPaymentMethodsResponse) {
+		paymentMethods = res.payment_methods;
+		pmError = null;
+		cardFlowOpen = false;
+		toast(m('billing.card.saved'), 'success');
+		const pending = pendingPlanCode;
+		pendingPlanCode = null;
+		pendingPlanName = null;
+		if (pending) await retryPlanChange(pending);
+		else await returnFocusToAddCard();
+	}
+
+	/**
+	 * Finish a SetupIntent Stripe confirmed through a REDIRECT. A card confirms
+	 * in place (`redirect: 'if_required'`), so this only runs for a
+	 * redirect-based method: Stripe returns to `/billing?setup_intent=…&
+	 * redirect_status=…&setup_intent_client_secret=…`. The query is dropped
+	 * first, so the single-use secret does not linger in the address bar or
+	 * history, and a reload cannot repeat the call. (Should the session have
+	 * expired meanwhile, the auth wall's `next` drops the secret too —
+	 * `utils/postLoginRedirect.ts::SECRET_QUERY_PARAMS`.)
+	 *
+	 * Resolves to the plan code a card-refused upgrade stashed for THIS intent
+	 * before leaving (`utils/pendingPlanChange.ts`), once the card is saved —
+	 * the caller retries that change — else `null`.
+	 */
+	async function finishRedirectedSetup(): Promise<string | null> {
+		const { id, status } = untrack(() => {
+			const params = appPage.url.searchParams;
+			return { id: params.get('setup_intent'), status: params.get('redirect_status') };
+		});
+		if (!id) return null;
+		// A shallow replace: drops the query without a navigation or a history entry.
+		const path = untrack(() => appPage.url.pathname);
+		await goto(path, { state: {}, shallow: true, replace: true });
+		// Read and clear in every outcome, so no later return can pick it up.
+		const pending = takePendingPlan(id);
+		if (status === 'processing') {
+			// Not a failure: the bank has not settled it yet.
+			toast(m('billing.card.redirectProcessing'), 'info');
+			return null;
+		}
+		if (status !== 'succeeded') {
+			toast(m('billing.card.confirmFailed'), 'error');
+			return null;
+		}
+		try {
+			await setDefaultBillingPaymentMethod(id);
+			toast(m('billing.card.saved'), 'success');
+			return pending;
+		} catch (e) {
+			toast(errorMessage(e, m('billing.card.saveFailed')), 'error');
+			return null;
+		}
 	}
 
 	// Plan-change flow. `POST /api/billing/change-plan` APPLIES the change on
@@ -178,6 +225,13 @@
 	let selectedPlanCode = $state<string | null>(null);
 	let changingPlan = $state(false);
 	let changeError = $state<string | null>(null);
+	// What the dialog offers beside a refusal: add a card (none on file) or
+	// update it (the upgrade charge was declined). Keyed on the refusal code.
+	let changeErrorAction = $state<'add_card' | 'update_card' | null>(null);
+	// The plan a card-refused upgrade is waiting on: once a card is saved the
+	// change is retried for the reader, and the dialog reopens on its result.
+	let pendingPlanCode = $state<string | null>(null);
+	let pendingPlanName = $state<string | null>(null);
 	let changeResult = $state<BillingPlanChangeResponse | null>(null);
 
 	async function loadAvailablePlans() {
@@ -196,6 +250,7 @@
 		showChangePlan = true;
 		selectedPlanCode = null;
 		changeError = null;
+		changeErrorAction = null;
 		changeResult = null;
 		loadAvailablePlans();
 	}
@@ -208,6 +263,7 @@
 		if (!selectedPlanCode) return;
 		changingPlan = true;
 		changeError = null;
+		changeErrorAction = null;
 		try {
 			changeResult = await changeBillingPlan(selectedPlanCode);
 			// Refresh the plan/usage surface behind the modal so it reflects the
@@ -215,10 +271,69 @@
 			await load();
 		} catch (e) {
 			changeError = errorMessage(e, m('billing.plan.changeModal.changeFailed'));
+			changeErrorAction = planChangeCardAction(e instanceof ApiError ? e.code : null);
 		} finally {
 			changingPlan = false;
 		}
 	}
+
+	/** "Add a card" / "Update card" from the dialog: remember the chosen plan,
+	 *  close the dialog and open the card form in the payment-methods section
+	 *  (the panel takes focus and scrolls itself into view). */
+	function addCardForPlan() {
+		if (!selectedPlanCode) return;
+		pendingPlanCode = selectedPlanCode;
+		pendingPlanName = planName(selectedPlanCode);
+		showChangePlan = false;
+		startAddCard();
+	}
+
+	/** Re-run the refused change once a card is on file, in the reopened dialog
+	 *  — so the reader sees its result (or its next refusal) where they left it. */
+	async function retryPlanChange(code: string) {
+		selectedPlanCode = code;
+		changeResult = null;
+		changeError = null;
+		changeErrorAction = null;
+		showChangePlan = true;
+		if (availablePlans.length === 0) await loadAvailablePlans();
+		await confirmPlanChange();
+	}
+
+	/** How many differentiators a picker card shows before "+N more" — enough
+	 *  to tell the plans apart without turning each row into a pricing table. */
+	const PLAN_HIGHLIGHT_LIMIT = 3;
+
+	/**
+	 * One short line per picker card: what the plan adds over the next-cheaper
+	 * one, from the catalog's own entitlements (`planHighlights`). Joined into a
+	 * single string so it is also the radio's accessible description, read as
+	 * one phrase rather than run-together spans.
+	 */
+	const planHighlightLines = $derived.by(() => {
+		const byCode = planHighlights(availablePlans, PLAN_FEATURES);
+		const lines = new Map<string, string>();
+		for (const [code, h] of byCode) {
+			const parts: string[] = [];
+			if (h.builtOn) parts.push(m('billing.plan.changeModal.everythingIn', { plan: h.builtOn }));
+			const labels = h.added.map((k) =>
+				isPlanFeature(k) ? m(planFeatureLabelKey(k)) : k.replace(/_/g, ' ')
+			);
+			const room = PLAN_HIGHLIGHT_LIMIT - parts.length;
+			if (labels.length > room) {
+				parts.push(...labels.slice(0, room - 1));
+				parts.push(
+					m('billing.plan.changeModal.moreFeatures', { count: labels.length - (room - 1) })
+				);
+			} else {
+				parts.push(...labels);
+			}
+			// A no-break space before the dot keeps it at the end of a wrapped line
+			// rather than opening the next one.
+			if (parts.length) lines.set(code, parts.join('\u00a0· '));
+		}
+		return lines;
+	});
 
 	/** Display name for a plan code the picker already fetched, falling back to
 	 *  the bare code if the list has since moved on (defensive, not expected). */
@@ -232,7 +347,13 @@
 		if (userLoaded && allowed) {
 			load();
 			loadInvoices();
-			loadPaymentMethods();
+			// A Stripe redirect return is finished before the list loads, so
+			// the list it shows already holds the new default card.
+			// A pending upgrade the redirect interrupted is retried after that.
+			finishRedirectedSetup().then(async (pending) => {
+				await loadPaymentMethods();
+				if (pending) await retryPlanChange(pending);
+			});
 		}
 	});
 
@@ -553,48 +674,18 @@
 					type="button"
 					class="btn-cancel"
 					onclick={startAddCard}
-					disabled={addingCard}
+					disabled={cardFlowOpen}
+					bind:this={addCardButton}
 					data-testid="billing-add-card"
 				>
-					{addingCard ? m('billing.pm.starting') : m('billing.pm.addReplace')}
+					{m('billing.pm.addReplace')}
 				</button>
 			</div>
 
-			{#if cardSetup.state !== 'idle'}
-				<!-- Add-card flow affordance. The real card-collection form (the
-				     provider's Stripe Elements) is a deployed-only piece — it can't run
-				     in the local-first stack and the frontend must never call a
-				     secret-bearing service directly. So we surface the right next-step
-				     state here and leave a clearly-marked seam for Elements. -->
-				<div
-					class="card-setup state-{cardSetup.state}"
-					data-testid="billing-card-setup"
-					role={cardSetup.state === 'error' ? 'alert' : 'status'}
-				>
-					{#if cardSetup.state === 'starting'}
-						<p>{m('billing.card.starting')}</p>
-					{:else if cardSetup.state === 'not_configured'}
-						<p>{cardSetup.message}</p>
-						<!-- The payment provider is not configured — an operational
-						     fault on our side, not a purchase question, so: support. -->
-						<a class="link" href="mailto:{CONTACT.support}">{m('billing.card.contactUs')}</a>
-					{:else if cardSetup.state === 'error'}
-						<p>{cardSetup.message}</p>
-						<button type="button" class="btn-cancel" onclick={startAddCard}>{m('common.retry')}</button>
-					{:else if cardSetup.state === 'ready'}
-						<p>{cardSetup.message}</p>
-						<!-- DEPLOYED-ONLY SEAM: mount the provider's card form (Stripe
-						     Elements) here, confirm the SetupIntent client_secret against
-						     it, then re-list cards. No Stripe keys are hardcoded in the
-						     static frontend; the secret never leaves this boundary. -->
-						<p class="card-setup-placeholder" data-testid="billing-card-elements-placeholder">
-							{m('billing.card.elementsPlaceholder')}
-						</p>
-					{/if}
-					<button type="button" class="link card-setup-dismiss" onclick={closeAddCard}>
-						{m('billing.card.dismiss')}
-					</button>
-				</div>
+			{#if cardFlowOpen}
+				{#key cardFlowNonce}
+					<CardSetupPanel {pendingPlanName} {pendingPlanCode} onsaved={onCardSaved} onclose={closeAddCard} />
+				{/key}
 			{/if}
 
 			{#if pmLoading}
@@ -744,11 +835,26 @@
 			{:else if availablePlans.length === 0}
 				<p class="state">{m('billing.plan.changeModal.empty')}</p>
 			{:else}
-				<fieldset class="plan-options">
-					<legend>{m('billing.plan.changeModal.legend')}</legend>
+				<fieldset class="plan-options" data-testid="billing-plan-options">
+					<!-- The dialog's own heading ("Choose a plan") already says what
+					     this is, so the legend names the group for assistive tech
+					     without printing a second caption under it. -->
+					<legend class="visually-hidden">{m('billing.plan.changeModal.legend')}</legend>
+					<!-- Native radios in a fieldset: Tab enters the group, the arrow
+					     keys move and select, and "2 of 3" comes from the browser.
+					     The whole card is the radio's <label>, so any click on it
+					     selects. The radio's name stays short ("Select the Growth
+					     plan"); price, highlights and the current-plan marker are its
+					     description. -->
 					{#each availablePlans as p (p.code)}
 						{@const isCurrent = plan?.code === p.code}
-						<label class="plan-option" class:selected={selectedPlanCode === p.code}>
+						{@const highlights = planHighlightLines.get(p.code)}
+						{@const idBase = `plan-option-${p.code}`}
+						<label
+							class="plan-option"
+							class:selected={selectedPlanCode === p.code}
+							data-testid="billing-plan-option"
+						>
 							<input
 								type="radio"
 								name="plan-code"
@@ -757,15 +863,29 @@
 								disabled={isCurrent}
 								onchange={() => (selectedPlanCode = p.code)}
 								aria-label={m('billing.plan.changeModal.selectAria', { name: p.name })}
+								aria-describedby={[
+									isCurrent ? `${idBase}-current` : null,
+									`${idBase}-price`,
+									highlights ? `${idBase}-features` : null
+								]
+									.filter(Boolean)
+									.join(' ')}
 							/>
-							<span class="plan-option-name">
-								{p.name}
-								{#if isCurrent}
-									<span class="current-pill">{m('billing.plan.changeModal.currentBadge')}</span>
+							<span class="plan-option-body">
+								<span class="plan-option-head">
+									<span class="plan-option-name">{p.name}</span>
+									{#if isCurrent}
+										<span class="current-pill" id="{idBase}-current">
+											{m('billing.plan.changeModal.currentBadge')}
+										</span>
+									{/if}
+								</span>
+								{#if highlights}
+									<span class="plan-option-features" id="{idBase}-features">{highlights}</span>
 								{/if}
 							</span>
-							<span class="plan-option-price">
-								<Money amount={p.monthly_price} currency={p.currency} mono />
+							<span class="plan-option-price" id="{idBase}-price">
+								<Money amount={p.monthly_price} currency={p.currency} />
 								<span class="per">{m('billing.plan.perMonth')}</span>
 							</span>
 						</label>
@@ -773,7 +893,23 @@
 				</fieldset>
 
 				{#if changeError}
-					<div class="state error" role="alert">{changeError}</div>
+					<div class="state error change-error" role="alert" data-testid="billing-plan-change-error">
+						<p>{changeError}</p>
+						{#if changeErrorAction}
+							<!-- No card on file / the card was declined: go straight to
+							     the card form; the change is retried once it is saved. -->
+							<button
+								type="button"
+								class="btn-primary"
+								onclick={addCardForPlan}
+								data-testid="billing-plan-change-add-card"
+							>
+								{changeErrorAction === 'add_card'
+									? m('billing.plan.changeModal.addCard')
+									: m('billing.plan.changeModal.updateCard')}
+							</button>
+						{/if}
+					</div>
 				{/if}
 
 				<p class="apply-notice">{m('billing.plan.changeModal.applyNotice')}</p>
@@ -799,14 +935,14 @@
 </Modal>
 
 <style>
-	/* One reading column. A local cap, not a breakpoint: below 64rem the
-	   column is simply the workspace width, so 390px gets no new rule. */
+	/* The page body fills the shared workspace frame like every other
+	   Settings tab: no width cap of its own (frontend/docs/ui-patterns.md
+	   § Page layout; guarded by src/lib/settingsTabWidth.test.ts). */
 	.billing {
 		display: flex;
 		flex-direction: column;
 		gap: 2rem;
 		width: 100%;
-		max-width: 64rem;
 		min-width: 0;
 	}
 
@@ -853,6 +989,18 @@
 
 	.state.error {
 		color: var(--danger);
+	}
+
+	.change-error {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.75rem;
+	}
+
+	.change-error p {
+		margin: 0;
+		flex: 1 1 16rem;
 	}
 
 	/* --- Status callout (past due) --- */
@@ -1082,46 +1230,6 @@
 	}
 
 	/* --- Payment methods --- */
-	.card-setup {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.75rem;
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		padding: 0.75rem 1rem;
-		font-size: 0.9rem;
-	}
-
-	.card-setup p {
-		margin: 0;
-		color: var(--text);
-	}
-
-	.card-setup.state-error {
-		border-color: var(--danger);
-	}
-
-	.card-setup.state-error p {
-		color: var(--danger);
-	}
-
-	.card-setup-placeholder {
-		color: var(--text-muted) !important;
-		font-style: italic;
-		flex-basis: 100%;
-	}
-
-	.card-setup-dismiss {
-		margin-left: auto;
-		background: none;
-		border: none;
-		cursor: pointer;
-		padding: 0;
-		min-height: 24px;
-	}
-
 	.card-label {
 		font-weight: 600;
 		font-variant-numeric: tabular-nums;
@@ -1168,28 +1276,31 @@
 		gap: 0.5rem;
 	}
 
-	.plan-options legend {
-		font-size: 0.75rem;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--text-muted);
-		padding: 0 0 0.5rem;
-	}
-
+	/* A radio card. `.modal label` (app.css) is the stacked field recipe —
+	   column flex, and every direct-child span set as a small uppercase muted
+	   caption — so each rule below states the direction and type it means
+	   rather than inheriting a form label's. */
 	.plan-option {
 		display: flex;
+		flex-direction: row;
 		align-items: center;
 		gap: 0.75rem;
 		border: 1px solid var(--border);
 		border-radius: var(--radius-sm);
-		padding: 0.75rem 0.9rem;
+		padding: 0.7rem 0.9rem;
 		cursor: pointer;
 		transition: border-color 0.15s var(--ease-out);
 	}
 
 	.plan-option:hover:not(:has(input:disabled)) {
 		border-color: var(--border-strong);
+	}
+
+	/* The ring goes on the card, not the 16px dot: the card is the target the
+	   reader sees (same move as SegmentedControl's segment). */
+	.plan-option:has(input:focus-visible) {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
 	}
 
 	/* The plan you already have: de-emphasised with the muted colour token,
@@ -1199,24 +1310,60 @@
 		color: var(--text-muted);
 	}
 
+	/* Border + ring, no tinted fill: muted highlight text on --accent-tint
+	   over --surface is ~4.3:1 in the dark theme, under the 4.5:1 floor. */
 	.plan-option.selected {
 		border-color: var(--accent);
 		box-shadow: 0 0 0 1px var(--accent);
 	}
 
-	.plan-option-name {
+	.plan-option-body,
+	.plan-option-price {
+		text-transform: none;
+		letter-spacing: normal;
+		font-size: 0.9rem;
+		color: inherit;
+	}
+
+	.plan-option-body {
 		flex: 1;
 		min-width: 0;
-		font-weight: 600;
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		font-weight: 400;
+	}
+
+	.plan-option-head {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.5rem;
 	}
 
-	.plan-option-price {
-		white-space: nowrap;
+	.plan-option-name {
 		font-weight: 600;
+		font-size: 0.95rem;
+	}
+
+	.plan-option-features {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+
+	.plan-option-price {
+		margin-left: auto;
+		text-align: right;
+		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
+		font-weight: 600;
+	}
+
+	.plan-option-price .per {
+		font-weight: 400;
+		font-size: 0.8rem;
+		color: var(--text-muted);
 	}
 
 	/* Not `<Badge>`: a "this is the one you already have" marker inside a

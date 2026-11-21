@@ -89,10 +89,21 @@ def _client(cm):
     return cm.return_value.__aenter__.return_value
 
 
-def _router(*, lookup: httpx.Response, ledger: httpx.Response | None = None):
+def _active_contact() -> httpx.Response:
+    return _resp(200, {"id": VENDOR, "is_active": True})
+
+
+def _router(
+    *,
+    lookup: httpx.Response,
+    ledger: httpx.Response | None = None,
+    contact: httpx.Response | None = None,
+):
     async def get(url, params=None, headers=None):
         if url.endswith("/purchase_invoices"):
             return lookup
+        if url.endswith(f"/contacts/{VENDOR}"):
+            return contact or _active_contact()
         if "/ledger_accounts/" in url:
             assert ledger is not None, "unexpected ledger lookup"
             return ledger
@@ -294,6 +305,8 @@ def test_a_total_sage_changed_voids_the_invoice_and_is_not_retried(token):
     async def get(url, params=None, headers=None):
         if url.endswith("/purchase_invoices"):
             return _resp(200, _page([]))
+        if url.endswith(f"/contacts/{VENDOR}"):
+            return _active_contact()
         if "/ledger_accounts/" in url:
             return _resp(200, _ledger())
         if url.endswith("/purchase_invoices/pi-9"):
@@ -394,7 +407,9 @@ def _refusal_router(
             "multi_currency_enabled": False,
         },
     )
-    contact = contact or _resp(200, {"id": VENDOR, "deleted_at": None})
+    # The contact is read twice: before the create, then to explain its
+    # refusal. A list answers each read in turn.
+    contacts = list(contact) if isinstance(contact, list) else [contact or _active_contact()]
     ledger_chart = ledger_chart or _resp(200, {"id": LEDGER, "included_in_chart": True})
 
     async def get(url, params=None, headers=None):
@@ -403,7 +418,8 @@ def _refusal_router(
         if url.endswith("/financial_settings"):
             return financial
         if url.endswith(f"/contacts/{VENDOR}"):
-            return contact
+            assert params == {"attributes": "is_active,deleted_at,gdpr_obfuscated"}
+            return contacts.pop(0) if len(contacts) > 1 else contacts[0]
         if url.endswith(f"/ledger_accounts/{LEDGER}"):
             if (params or {}).get("attributes") == "tax_rate":
                 return _resp(200, _ledger())
@@ -451,16 +467,46 @@ def test_a_foreign_currency_without_multi_currency_is_currency_not_enabled(token
     assert result.not_posted is True
 
 
-@pytest.mark.parametrize(
-    "contact",
-    [
-        _resp(404, {}),
-        _resp(200, {"id": VENDOR, "deleted_at": "2026-09-02T00:00:00Z"}),
-        _resp(200, {"id": VENDOR, "gdpr_obfuscated": True}),
-    ],
-)
+_INACTIVE_CONTACTS = [
+    # Account Status → Inactive in Sage's UI, as the live API returned it.
+    _resp(200, {"id": VENDOR, "is_active": False, "system": False}),
+    _resp(200, {"id": VENDOR, "deleted_at": "2026-09-02T00:00:00Z"}),
+    _resp(200, {"id": VENDOR, "gdpr_obfuscated": True}),
+]
+
+
+@pytest.mark.parametrize("contact", _INACTIVE_CONTACTS)
+def test_an_inactive_contact_is_refused_before_the_create(token, contact):
+    """Sage answers a create naming an inactive supplier with a 422 (seen live,
+    decisions §481), so the contact is read first and the bill never POSTed."""
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _refusal_router(contact=contact)
+        client.post = AsyncMock(side_effect=AssertionError("must not post"))
+        result = _run(_adapter().post_invoice(_payload()))
+    assert result.message == "Sage Accounting post refused: vendor_inactive"
+    assert (result.refusal_code, result.retryable) == ("vendor_inactive", False)
+
+
+@pytest.mark.parametrize("contact", [{"id": VENDOR}, {"id": VENDOR, "is_active": None}])
+def test_a_contact_without_is_active_is_not_refused_up_front(token, contact):
+    """An absent ``is_active`` is "don't know", never "inactive"."""
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _router(
+            lookup=_resp(200, _page([])), ledger=_resp(200, _ledger()), contact=_resp(200, contact)
+        )
+        client.post = AsyncMock(return_value=_resp(201, {"id": "pi-1", "total_amount": 1200.0}))
+        _run(_adapter().post_invoice(_payload()))
+    client.post.assert_awaited_once()
+
+
+@pytest.mark.parametrize("contact", [_resp(404, {}), *_INACTIVE_CONTACTS])
 def test_a_create_naming_a_gone_contact_is_vendor_inactive(token, contact):
-    result = _post_refused(422, _refusal_router(contact=contact))
+    """The up-front read could not tell (a 404, or unreadable then), so the
+    create goes ahead; its 422 is explained by the contact read back."""
+    first = contact if contact.status_code == 404 else _resp(503, {})
+    result = _post_refused(422, _refusal_router(contact=[first, contact]))
     assert result.refusal_code == "vendor_inactive"
     assert result.not_posted is True
 
@@ -690,6 +736,40 @@ def test_list_gl_accounts_past_the_sync_bound_raises(token):
             _run(_adapter().list_gl_accounts())
     assert exc.value.gap is ListingGap.truncated
     assert client.get.await_count == -(-SYNC_LISTING_MAX_ROWS // 200)
+
+
+def test_list_vendors_reads_is_active_false_as_inactive_and_absent_as_active(token):
+    """A supplier set Inactive in Sage reads back ``is_active: false`` with no
+    ``deleted_at`` (verified live, decisions §481); it used to sync active."""
+    rows = [
+        {"id": "c1", "name": "Live Ltd", "is_active": True},
+        {"id": "c2", "name": "Inactive Ltd", "is_active": False, "system": False},
+        {"id": "c3", "name": "Unknown Ltd"},
+    ]
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=_resp(200, _page(rows)))
+        vendors = _run(_adapter().list_vendors())
+    assert [(v.erp_vendor_id, v.active) for v in vendors] == [
+        ("c1", True),
+        ("c2", False),
+        ("c3", True),
+    ]
+    assert "is_active" in client.get.await_args.kwargs["params"]["attributes"].split(",")
+
+
+def test_list_vendors_strips_the_name(token):
+    """Sage cut a 108-character name at 100 and kept the trailing space."""
+    rows = [
+        {"id": "c1", "name": "  Acme Supplies London "},
+        {"id": "c2", "name": "   ", "displayed_as": " Shown As (SA01) "},
+        {"id": "c3", "name": " "},
+    ]
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=_resp(200, _page(rows)))
+        vendors = _run(_adapter().list_vendors())
+    assert [v.name for v in vendors] == ["Acme Supplies London", "Shown As (SA01)", "c3"]
 
 
 def test_list_vendors_reads_a_gdpr_obfuscated_contact_as_inactive(token):

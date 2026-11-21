@@ -45,6 +45,12 @@ is wide enough for grid pages on 1920–2560px monitors without leaving
 half the viewport empty; on a 13″ laptop the natural body width
 constrains it before the cap kicks in.
 
+The same goes for the page body: a route never wraps its body in a
+`max-width` of its own. Tabs that share one tab bar must be the same width,
+or switching tabs moves the page (Subscription once capped itself at 64rem
+beside a full-width Organization). `src/lib/settingsTabWidth.test.ts` checks
+every Settings tab; cap a prose line's length, never the page.
+
 **Data that lands after first paint must not move what is already drawn.**
 A page mounts, draws its shell, and fills in from responses that arrive a
 round trip later. Anything those responses *add above the table* drops the
@@ -801,6 +807,19 @@ centred dialog with backdrop-click + Esc to close:
   `<svelte:window>` listener a dialog needs stays in the caller.
 - Cancel sits left of the primary action. Required-field markers use
   `<em class="required">*</em>`.
+- **A `<label>` in a dialog is a stacked field by default.** `app.css`'s
+  `.modal label` is column flex and styles every direct-child `<span>` as a
+  small uppercase muted caption — right for "Vendor name" over an input, wrong
+  for a radio card. A choice list drawn as cards (one native radio per
+  `<label>`, inside a `<fieldset>` with a `<legend>`) sets `flex-direction:
+  row` on the card and resets `text-transform` / `letter-spacing` /
+  `font-size` / `color` on its own child spans, or it renders as a centred
+  stack of shouting captions (the `/billing` plan picker did, in production).
+  Put the focus ring on the card (`:has(input:focus-visible)`, as
+  `SegmentedControl` does) and mark the selection with border + ring, not an
+  `--accent-tint` fill: muted text on that fill drops under 4.5:1 in the dark
+  theme. Reference: `routes/billing/+page.svelte` (`.plan-option`); guard:
+  `tests-e2e/billing/billing.spec.ts` ("the picker is one radio group").
 - **A long dialog keeps its decisions out of the scroll.** When a dialog's body
   runs past one screen (the invoice dialog's right pane: summary, fields, line
   items, activity, chat, e-invoice), split the `<form>` into a scrolling region
