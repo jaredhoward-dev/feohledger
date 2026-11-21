@@ -377,10 +377,12 @@ bearer plus a non-empty `X-Business`. Collections use Sage's
 - `GET /business_settings` (the connection test); `GET /financial_settings`
   (`year_end_lockdown_date`, `base_currency` GBP, `multi_currency_enabled`).
 - `GET /contacts?contact_type_id=VENDOR` — `sage-contact-1` *Fake Sage
-  Supplier Ltd* and the GDPR-obfuscated `sage-contact-3` (the customer
-  `sage-contact-2` is filtered out, and the deleted `sage-contact-4` leaves
-  the listing); `GET /contacts/{id}` answers for all four, `sage-contact-4`
-  with `deleted_at`.
+  Supplier Ltd*, the GDPR-obfuscated `sage-contact-3` and the inactive
+  `sage-contact-5` (`is_active: false`, Sage's Account Status → Inactive; every
+  other contact carries `is_active: true`). The customer `sage-contact-2` is
+  filtered out, and the deleted `sage-contact-4` leaves the listing;
+  `GET /contacts/{id}` answers for all five, `sage-contact-4` with
+  `deleted_at`.
 - `GET /ledger_accounts`, `GET /ledger_accounts/{id}` — `sage-ledger-5000`,
   `sage-ledger-7500` (default tax rate `GB_STANDARD`), `sage-ledger-7600` (no
   default rate: a taxed invoice is refused unless the org sets
@@ -390,7 +392,9 @@ bearer plus a non-empty `X-Business`. Collections use Sage's
 - `GET /purchase_invoices` with `contact_id` / `from_date` / `to_date` (the
   pre-create idempotency lookup); `POST /purchase_invoices` creates
   `sage-pi-<n>` as `UNPAID`, and answers Sage's 422 error array on an unknown
-  or deleted contact, an unknown or out-of-chart ledger, a date on or before the
+  or deleted contact, an inactive contact (real Sage answers 422, seen live;
+  its error body was not captured, so the fake's code and message are
+  assumed), an unknown or out-of-chart ledger, a date on or before the
   lockdown date, a foreign currency without multi-currency, a taxed line with no
   `tax_rate_id`, or net + tax that does not equal the total; on the `start`
   plan every purchase-invoice write is a 403 (Accounting Start has none);
@@ -411,7 +415,9 @@ bearer plus a non-empty `X-Business`. Collections use Sage's
   "outstanding_amount"?, "payments_allocations"?}` (a credit-note settlement is
   `PAID` with a `contact_allocation` entry and no `contact_payment`) and
   `POST /sage/v3.1/__set-business {"plan"?, "year_end_lockdown_date"?,
-  "multi_currency_enabled"?}`. `POST /__reset` clears this state too.
+  "multi_currency_enabled"?}` and `POST /sage/v3.1/__set-contact {"id",
+  "is_active"}` (deactivate or reactivate a contact). `POST /__reset` clears
+  this state too.
 
 ## Blackbaud Financial Edge NXT — SKY API (`/blackbaud`)
 

@@ -2881,12 +2881,16 @@ app.include_router(xero)
 #   allocation with `contact_allocation` and no `contact_payment`, as Sage's;
 # POST /sage/v3.1/__set-business {"plan"?, "year_end_lockdown_date"?,
 #   "multi_currency_enabled"?} — "start" refuses every purchase-invoice write
-#   with 403 (the v3.1 Swagger's Endpoint Availability: Plus / Standard only).
+#   with 403 (the v3.1 Swagger's Endpoint Availability: Plus / Standard only);
+# POST /sage/v3.1/__set-contact {"id", "is_active"} — sets a contact's
+#   Account Status (`is_active`, the boolean the real API returns; a supplier
+#   set Inactive in Sage's UI reads back `false`, decisions §481).
 #
 # What the real API does and the fake does too (the v3.1 Swagger,
 # github.com/nook-io/python-sage openapi.json): a create dated on or before
 # `financial_settings.year_end_lockdown_date`, or naming a deleted contact or an
-# out-of-chart ledger, is a 422 error array; `payments_allocations` comes back
+# out-of-chart ledger, is a 422 error array; so is one naming an inactive
+# contact (seen live; its error body is assumed); `payments_allocations` comes back
 # only with `show_payments_allocations=true`; `ledger_accounts` honours
 # `show_included_in_chart` (its default is undocumented — the fake leaves
 # out-of-chart ledgers out unless asked, the conservative reading).
@@ -2905,12 +2909,14 @@ SAGE_CONTACTS = [
         "credit_days": 30,
         "contact_types": [{"id": "VENDOR"}],
         "system": False,
+        "is_active": True,
     },
     {
         "id": "sage-contact-2",
         "name": "Fake Sage Customer Ltd",
         "contact_types": [{"id": "CUSTOMER"}],
         "system": False,
+        "is_active": True,
     },
     # A supplier whose personal data was erased under GDPR: still listed, no
     # longer a payee (synced inactive).
@@ -2919,6 +2925,7 @@ SAGE_CONTACTS = [
         "name": "Obfuscated",
         "contact_types": [{"id": "VENDOR"}],
         "system": False,
+        "is_active": True,
         "gdpr_obfuscated": True,
     },
     # A supplier deleted in Sage after it was synced: a create naming it is
@@ -2928,7 +2935,17 @@ SAGE_CONTACTS = [
         "name": "Fake Sage Deleted Supplier Ltd",
         "contact_types": [{"id": "VENDOR"}],
         "system": False,
+        "is_active": True,
         "deleted_at": "2026-09-01T00:00:00Z",
+    },
+    # A supplier set to Account Status → Inactive in Sage: still listed, read
+    # back with `is_active: false` (synced inactive).
+    {
+        "id": "sage-contact-5",
+        "name": "Fake Sage Inactive Supplier Ltd",
+        "contact_types": [{"id": "VENDOR"}],
+        "system": False,
+        "is_active": False,
     },
 ]
 SAGE_LEDGERS = [
@@ -2985,6 +3002,9 @@ def _sage_state() -> dict[str, Any]:
         {
             "invoices": {},
             "counter": 0,
+            # contact id → is_active set by __set-contact (the fixtures stay
+            # fixed, so POST /__reset restores them).
+            "contact_active": {},
             "business": {
                 "plan": "plus",
                 "year_end_lockdown_date": None,
@@ -2993,6 +3013,18 @@ def _sage_state() -> dict[str, Any]:
             },
         },
     )
+
+
+def _sage_contacts() -> list[dict[str, Any]]:
+    """The contact fixtures with any ``__set-contact`` override applied."""
+    overrides = _sage_state()["contact_active"]
+    out = []
+    for contact in SAGE_CONTACTS:
+        row = copy.deepcopy(contact)
+        if row["id"] in overrides:
+            row["is_active"] = overrides[row["id"]]
+        out.append(row)
+    return out
 
 
 def _sage_error(status: int, code: str, message: str) -> ProviderError:
@@ -3028,7 +3060,7 @@ async def sage_contacts(request: Request, page: int = 1) -> JSONResponse:
     # `deleted_since`); GET /contacts/{key} still answers for it.
     rows = [
         c
-        for c in SAGE_CONTACTS
+        for c in _sage_contacts()
         if (not type_id or any(t["id"] == type_id for t in c.get("contact_types", [])))
         and not c.get("deleted_at")
     ]
@@ -3038,9 +3070,9 @@ async def sage_contacts(request: Request, page: int = 1) -> JSONResponse:
 @sage.get("/contacts/{key}")
 async def sage_contact(request: Request, key: str) -> JSONResponse:
     _require_sage_auth(request)
-    for contact in SAGE_CONTACTS:
+    for contact in _sage_contacts():
         if contact["id"] == key:
-            return JSONResponse(copy.deepcopy(contact))
+            return JSONResponse(contact)
     raise _sage_error(404, "RecordNotFound", "Contact not found")
 
 
@@ -3112,10 +3144,16 @@ async def sage_create_purchase_invoice(request: Request) -> JSONResponse:
         and not business["multi_currency_enabled"]
     ):
         raise _sage_error(422, "RecordInvalid", "currency is not enabled")
-    contacts = {c["id"]: c for c in SAGE_CONTACTS}
+    contacts = {c["id"]: c for c in _sage_contacts()}
     contact = contacts.get(inv["contact_id"])
     if contact is None or contact.get("deleted_at"):
         raise _sage_error(422, "RecordInvalid", "contact not found")
+    if contact.get("is_active") is False:
+        # Real Sage answered a create naming an inactive supplier with 422
+        # (seen live 2026-11-21, decisions §481). Its body was not captured:
+        # the code and message here are ASSUMED, and the adapter never reads
+        # them.
+        raise _sage_error(422, "RecordInvalid", "contact is inactive")
     ledgers = {ledger["id"]: ledger for ledger in SAGE_LEDGERS}
     total = _XeroDecimal(0)
     for line in inv["invoice_lines"]:
@@ -3199,6 +3237,17 @@ async def sage_set_status(body: dict) -> dict:
         record["outstanding_amount"] = _XeroDecimal(str(body["outstanding_amount"]))
     if isinstance(body.get("payments_allocations"), list):
         record["payments_allocations"] = body["payments_allocations"]
+    return {"status": "ok"}
+
+
+@sage.post("/__set-contact")
+async def sage_set_contact(body: dict) -> dict:
+    key = str(body.get("id", ""))
+    if not any(c["id"] == key for c in SAGE_CONTACTS) or not isinstance(
+        body.get("is_active"), bool
+    ):
+        raise ProviderError(404, {"detail": "unknown id or is_active not a boolean"})
+    _sage_state()["contact_active"][key] = body["is_active"]
     return {"status": "ok"}
 
 
