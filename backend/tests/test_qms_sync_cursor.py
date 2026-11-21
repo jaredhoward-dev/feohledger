@@ -255,7 +255,8 @@ async def _audit_rows(mk, org_id):
         return (
             (
                 await db.execute(
-                    select(AuditLog).where(
+                    select(AuditLog)
+                    .where(
                         AuditLog.organization_id == org_id,
                         AuditLog.action == "quality_inspection.synced",
                     )
