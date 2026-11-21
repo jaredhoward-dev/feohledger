@@ -30,7 +30,7 @@
 	import { currentLocale, m } from '#lib/i18n/store.svelte.ts';
 	import { theme } from '#lib/stores/theme.svelte.ts';
 	import { CONTACT } from '#lib/legal/operator.ts';
-	import { rememberPendingPlan } from '#lib/utils/pendingPlanChange.ts';
+	import { rememberPendingPlan, takePendingPlan } from '#lib/utils/pendingPlanChange.ts';
 
 	interface Props {
 		/** Display name of the plan a refused upgrade is waiting on, or null for
@@ -167,6 +167,10 @@
 					// return (`/billing?setup_intent=…&redirect_status=succeeded`).
 					confirmParams: { return_url: `${window.location.origin}/billing` }
 				});
+				// Back in place (no redirect happened): this page still holds the
+				// pending plan, so the stash has done its job — drop it now, as the
+				// Cookie Notice promises, whatever the outcome.
+				takePendingPlan(null);
 				if (result.error) {
 					// Stripe localizes its card and validation messages (the
 					// `locale` above) and documents them as safe to show; anything
