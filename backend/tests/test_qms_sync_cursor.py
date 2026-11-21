@@ -239,6 +239,14 @@ async def _sync(mk, org_id, records, *, since=None):
 
 
 async def _audit_rows(mk, org_id):
+    """Every ``quality_inspection.synced`` row for the org, oldest first.
+
+    The ORDER BY is load-bearing. Without one Postgres returns heap order, and
+    the realdb reset empties tables with DELETE (not TRUNCATE), so dead tuples
+    sit on earlier pages; when autovacuum reclaims them between two syncs, the
+    later row is placed BEFORE the earlier one and a bare ``rows[-1]`` reads
+    the first sync's row (the intermittent ``'created' == 'updated'`` in CI).
+    """
     from sqlalchemy import select
 
     from app.models.workflow import AuditLog
@@ -251,6 +259,7 @@ async def _audit_rows(mk, org_id):
                         AuditLog.organization_id == org_id,
                         AuditLog.action == "quality_inspection.synced",
                     )
+                    .order_by(AuditLog.created_at, AuditLog.id)
                 )
             )
             .scalars()
@@ -308,12 +317,15 @@ async def test_a_real_update_still_writes_its_audit_row(realdb):
 
     assert (summary["created"], summary["updated"], summary["unchanged"]) == (0, 1, 0)
     rows = await _audit_rows(mk, org_id)
-    assert len(rows) == 2
-    assert rows[-1].details["change"] == "updated"
-    assert rows[-1].details["result"] == "fail"
+    # Select the rows by what they say, not by position: two syncs in two
+    # transactions are ordered by `created_at`, but the assertion should not
+    # lean on two clock reads differing.
+    assert sorted(r.details["change"] for r in rows) == ["created", "updated"]
+    (update_row,) = [r for r in rows if r.details["change"] == "updated"]
+    assert update_row.details["result"] == "fail"
     # PII discipline is unchanged: no quantities-as-values, no inspector.
-    assert "accepted_quantity" not in rows[-1].details
-    assert "inspector" not in rows[-1].details
+    assert "accepted_quantity" not in update_row.details
+    assert "inspector" not in update_row.details
 
     async with mk() as db:
         stored = (
