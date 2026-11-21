@@ -914,6 +914,75 @@ test.describe('/billing (admin)', () => {
 			// $49 current plan sorts before the $99 target plan.
 			expect(currentIdx).toBeLessThan(targetIdx);
 		});
+
+		test('the picker is one radio group: a card click selects, arrows move, each card says its price and what it adds', async ({
+			page
+		}) => {
+			// A known catalog, so the order and the differentiators are fixed (the
+			// real one carries whatever else is seeded). The first plan keeps the
+			// seeded current code, so its radio is the disabled, marked one.
+			const plan = (code: string, name: string, price: string, keys: string[]) => ({
+				code,
+				name,
+				monthly_price: price,
+				currency: 'USD',
+				entitlements: Object.fromEntries(keys.map((k) => [k, true])),
+				trial_days: 0
+			});
+			await page.route(isApi('/api/billing/plans'), (route) =>
+				route.fulfill(
+					json({
+						plans: [
+							plan(currentCode, 'E2E Current', '49.00', ['erp_integrations']),
+							plan('e2e_mid', 'E2E Mid', '99.00', ['erp_integrations', 'public_api', 'sso']),
+							plan('e2e_top', 'E2E Top', '199.00', [
+								'erp_integrations',
+								'public_api',
+								'sso',
+								'scim',
+								'multi_entity',
+								'audit_siem_export'
+							])
+						]
+					})
+				)
+			);
+
+			await page.getByTestId('billing-change-plan').click();
+			const modal = page.getByRole('dialog', { name: 'Change plan' });
+			// The fieldset's legend names the group even though it is not printed.
+			const group = modal.getByRole('group', { name: 'Available plans' });
+			const current = group.getByRole('radio', { name: 'Select the E2E Current plan' });
+			const mid = group.getByRole('radio', { name: 'Select the E2E Mid plan' });
+			const top = group.getByRole('radio', { name: 'Select the E2E Top plan' });
+			await expect(current).toBeDisabled();
+
+			// Each radio's description is what the card shows beside its name:
+			// the current-plan marker, the price, and what the plan adds over the
+			// one before it — capped, with the rest counted.
+			await expect(current).toHaveAccessibleDescription('Current plan $49.00 / month ERP integrations');
+			await expect(mid).toHaveAccessibleDescription(
+				'$99.00 / month Everything in E2E Current\u00a0· Public API and webhooks\u00a0· Single sign-on (OIDC / SAML)'
+			);
+			await expect(top).toHaveAccessibleDescription(
+				'$199.00 / month Everything in E2E Mid\u00a0· SCIM user provisioning\u00a0· +2 more'
+			);
+
+			// The whole card is the target: clicking its price selects the plan.
+			await group.getByTestId('billing-plan-option').filter({ hasText: 'E2E Mid' }).getByText('$99.00').click();
+			await expect(mid).toBeChecked();
+			await expect(page.getByTestId('billing-change-plan-confirm')).toBeEnabled();
+
+			// Native radio-group keys: an arrow moves AND selects, and the
+			// disabled current plan is skipped on the wrap.
+			await mid.focus();
+			await page.keyboard.press('ArrowDown');
+			await expect(top).toBeChecked();
+			await expect(top).toBeFocused();
+			await page.keyboard.press('ArrowDown');
+			await expect(mid).toBeChecked();
+			await expect(current).not.toBeChecked();
+		});
 	});
 });
 

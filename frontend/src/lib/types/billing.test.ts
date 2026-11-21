@@ -6,6 +6,7 @@ import {
 	cardFormMode,
 	parseSpendCapInput,
 	planChangeCardAction,
+	planHighlights,
 	rebateMeterGroups,
 	type BillingAiUsage,
 	type BillingUsage
@@ -189,5 +190,56 @@ describe('planChangeCardAction', () => {
 		expect(planChangeCardAction('plan_feature_required')).toBeNull();
 		expect(planChangeCardAction(null)).toBeNull();
 		expect(planChangeCardAction(undefined)).toBeNull();
+	});
+});
+
+describe('planHighlights', () => {
+	const order = ['public_api', 'erp_integrations', 'sso', 'scim', 'multi_entity'];
+	const plan = (code: string, name: string, ents: Record<string, unknown>) => ({
+		code,
+		name,
+		entitlements: ents
+	});
+
+	it('lists the first plan\'s own grants and each next plan\'s additions over it', () => {
+		const h = planHighlights(
+			[
+				plan('free', 'Free', { erp_integrations: true }),
+				plan('growth', 'Growth', { erp_integrations: true, sso: true, public_api: true }),
+				plan('scale', 'Scale', {
+					erp_integrations: true,
+					sso: true,
+					public_api: true,
+					multi_entity: true,
+					scim: true
+				})
+			],
+			order
+		);
+		expect(h.get('free')).toEqual({ builtOn: null, added: ['erp_integrations'] });
+		// Catalogue order, not insertion order.
+		expect(h.get('growth')).toEqual({ builtOn: 'Free', added: ['public_api', 'sso'] });
+		expect(h.get('scale')).toEqual({ builtOn: 'Growth', added: ['scim', 'multi_entity'] });
+	});
+
+	it('never claims "everything in" a plan whose grant it drops', () => {
+		const h = planHighlights(
+			[plan('a', 'A', { sso: true, scim: true }), plan('b', 'B', { sso: true, public_api: true })],
+			order
+		);
+		expect(h.get('b')).toEqual({ builtOn: null, added: ['public_api', 'sso'] });
+	});
+
+	it('skips an empty predecessor and ignores non-true flags', () => {
+		const h = planHighlights(
+			[
+				plan('a', 'A', {}),
+				plan('b', 'B', { sso: true, max_seats: 25, scim: false, custom_grant: true })
+			],
+			order
+		);
+		expect(h.get('a')).toEqual({ builtOn: null, added: [] });
+		// An unknown key sorts after the known ones rather than vanishing.
+		expect(h.get('b')).toEqual({ builtOn: null, added: ['sso', 'custom_grant'] });
 	});
 });
