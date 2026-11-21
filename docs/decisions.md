@@ -16269,6 +16269,9 @@ release or vite-plugin-svelte stops depending on it. The patch is keyed to
 4.3.1, so a resolved version that moves off it leaves the copy unpatched and
 the guard red, which is the prompt to re-check.
 
+*Amended by §480:* GitHub withdrew the advisory on 2026-11-16, so the patch,
+both ignores and the guard were removed.
+
 ## 353. An ERP name too long for its column is stored shortened and marked; vendor names are matched case and spacing aside (2026-11-12)
 
 **Found** while closing two §287 / §284 follow-ups. `vendors.name` and
@@ -24245,3 +24248,35 @@ A re-sent accept stays a 409 (`discount_offer_not_open`) rather than becoming a
 effect to suppress, and a 200 for "same tier" would need the endpoint to
 distinguish a retry from a second person choosing the same tier.
 `backend/docs/dynamic-discounting.md` § Concurrency.
+
+## 480. A withdrawn advisory takes its ignores, its patch and its guard with it (amends §352; round 2026-11-21)
+
+**Found.** GitHub withdrew GHSA-gcqx-w48m-w2h4 (CVE-2026-93753, deepmerge
+`mergeObject()` prototype poisoning) as not describing a security
+vulnerability. `gh api /advisories/GHSA-gcqx-w48m-w2h4`, read 2026-11-21,
+returns `withdrawn_at: 2026-11-16T18:55:38Z` and the summary "Withdrawn
+Advisory: …". §352's drop condition (a fixed deepmerge release, or
+vite-plugin-svelte no longer depending on it) did not foresee a withdrawal,
+so all four pieces outlived it.
+
+**Decision.** Remove all four: `frontend/patches/deepmerge@4.3.1.patch` with
+its `pnpm.patchedDependencies` entry (the lockfile loses the `patch_hash`
+and nothing else), `pnpm.auditConfig.ignoreGhsas`, the `osv-scanner.toml`
+entry (its only one, so the file goes; `supply-chain-scan.yml` passes
+`--config` only when the file exists) and
+`frontend/src/lib/deepmergePatch.security.test.ts`. An ignore for a
+withdrawn ID suppresses nothing and only reads as an open exception. The
+patch was the remaining question, and it guards no real input here:
+vite-plugin-svelte 7.3.1 calls deepmerge only in `mergeConfigs`
+(`src/utils/options.js`), merging its defaults, `svelte.config.js` and the
+inline options from `vite.config.ts`, all repo-authored and read at build
+time. No request, upload or tenant value reaches it, and deepmerge is not in
+the shipped bundle. With the advisory gone, `pnpm audit` reports nothing
+without any ignore.
+
+**Rejected:** keeping the patch as hardening without the ignores. It would
+leave a local fork of a dependency, and a guard keyed to 4.3.1 that turns red
+on the next deepmerge release, to protect a build-time merge of our own
+config files. §352's method (a patch, a guard, then an ID-scoped ignore) still
+holds for the next advisory with no fixed release; `frontend/CLAUDE.md` keeps
+it as the rule.

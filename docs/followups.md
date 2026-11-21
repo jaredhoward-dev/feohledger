@@ -778,23 +778,6 @@ or is a sibling of a fix that needs its own pass.
       **Trigger:** the next change that touches more than one panel of
       `frontend/src/routes/organization/+page.svelte`.
 
-### Surfaced by the dependency-audit issue #728 (round 27, 2026-11-19)
-
-- [ ] **(c) The deepmerge patch, its two scanner ignores and its guard outlive
-      their advisory.** GitHub withdrew GHSA-gcqx-w48m-w2h4 on 2026-11-16 as
-      "does not describe a security vulnerability", and the npm audit endpoint
-      no longer reports it, but `frontend/patches/deepmerge@4.3.1.patch`,
-      `pnpm.auditConfig.ignoreGhsas` in `frontend/package.json`, the
-      `osv-scanner.toml` entry (expires 2027-02-10) and
-      `frontend/src/lib/deepmergePatch.security.test.ts` are still in place.
-      §352's drop condition (a fixed deepmerge release, or vite-plugin-svelte
-      no longer depending on it) did not foresee a withdrawal. The patch is
-      harmless, so nothing is broken. **Durable fix:** a decisions entry
-      amending §352 that either keeps the patch as hardening, minus the two
-      ignores for a withdrawn ID, or drops all four together. **Trigger:** the
-      `osv-scanner.toml` expiry, or the next change to the frontend's pnpm
-      config, whichever is first.
-
 ### Surfaced by the approval recall (2026-11-13, decisions §374)
 
 - [ ] **(c) A recalled invoice's PEPPOL transmission and inter-company mirror
