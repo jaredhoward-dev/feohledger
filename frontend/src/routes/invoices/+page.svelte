@@ -1431,7 +1431,8 @@
 	   sized to their widest content in the six locales: a header to its
 	   longest word
 	   plus the sort arrow (de "RECHNUNGS-NR.", "FÄLLIGKEITSDATUM"), the status
-	   column to its longest badge (fr "COMPTABILISÉE DANS L'ERP"), the actions
+	   column to its longest badge (fr "COMPTABILISÉE DANS L'ERP", which CI's
+	   font renders at 254px, so 270px rather than a local measurement), the actions
 	   column to de "Bestätigen". Vendor and Description carry no width and
 	   share the rest (a long vendor name wraps, `td.vendor-cell`); past the
 	   `min-width` the table scrolls inside its region
@@ -1448,7 +1449,7 @@
 	.inv-table :global(th:nth-child(5)) { width: 110px; }
 	.inv-table :global(th:nth-child(6)) { width: 132px; }
 	.inv-table :global(th:nth-child(7)) { width: 170px; }
-	.inv-table :global(th:nth-child(8)) { width: 230px; }
+	.inv-table :global(th:nth-child(8)) { width: 270px; }
 	.inv-table :global(th:nth-child(9)) { width: 140px; }
 	.inv-table :global(th:nth-child(10)) { width: 120px; }
 
