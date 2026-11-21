@@ -46,6 +46,7 @@ from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.organization import BrandConfig
 from app.services.audit_dispatch import dispatch_auth_audit
+from app.services.billing.entitlements import live_plan_codes
 from app.services.partner_link_token import build_link_code, verify_link_code
 from app.services.tenant_provisioning import provision_tenant
 from app.tenant import get_tenant, lock_organization
@@ -130,14 +131,22 @@ async def _resolve_child(
     return child
 
 
-def _child_summary(child: Organization) -> ChildTenantSummary:
+def _child_summary(child: Organization, *, plan: str) -> ChildTenantSummary:
+    """``plan`` is the child's LIVE subscription plan code
+    (`entitlements.live_plan_codes`) — never the legacy ``Organization.plan``
+    string, which no plan change updates (decisions §482)."""
     return ChildTenantSummary(
         id=child.id,
         name=child.name,
         slug=child.slug,
-        plan=child.plan,
+        plan=plan,
         product_name=_resolve_brand(child).product_name,
     )
+
+
+async def _one_child_summary(db: AsyncSession, child: Organization) -> ChildTenantSummary:
+    plans = await live_plan_codes(db, [child.id])
+    return _child_summary(child, plan=plans[child.id])
 
 
 @router.get("", response_model=PartnerOverview)
@@ -164,11 +173,13 @@ async def get_partner_overview(
         .scalars()
         .all()
     )
+    # One query for every child's live plan, not one per row.
+    plans = await live_plan_codes(db, [c.id for c in children])
     return PartnerOverview(
         organization_id=org.id,
         name=org.name,
         is_partner=len(children) > 0,
-        children=[_child_summary(c) for c in children],
+        children=[_child_summary(c, plan=plans[c.id]) for c in children],
     )
 
 
@@ -338,6 +349,9 @@ class ProvisionChildRequest(BaseModel):
     slug: str = Field(min_length=1, max_length=63)
     admin_email: str = Field(min_length=3, max_length=320)
     admin_name: str | None = Field(default=None, max_length=200)
+    # Legacy, kept so existing callers do not 422: stored on the legacy
+    # `Organization.plan` label only. Every new tenant starts on the real Free
+    # subscription, and the summary reports that live plan (decisions §482).
     plan: str = Field(default="free", max_length=50)
 
 
@@ -486,7 +500,7 @@ async def provision_child(
         details={"partner_org_id": str(org.id), "via": "provision"},
     )
 
-    summary = _child_summary(child)
+    summary = await _one_child_summary(db, child)
     return ProvisionChildResponse(
         **summary.model_dump(),
         admin_email=body.admin_email,
@@ -584,7 +598,7 @@ async def attach_child(
     # Re-parent guard. Idempotent if already OUR child; refuse if someone else's.
     if child.parent_org_id is not None:
         if child.parent_org_id == org.id:
-            return _child_summary(child)
+            return await _one_child_summary(db, child)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="That tenant is already linked to a partner.",
@@ -610,7 +624,7 @@ async def attach_child(
         entity_id=child.id,
         details={"partner_org_id": str(org.id)},
     )
-    return _child_summary(child)
+    return await _one_child_summary(db, child)
 
 
 @router.delete("/children/{child_id}", status_code=status.HTTP_204_NO_CONTENT)
