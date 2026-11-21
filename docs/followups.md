@@ -1203,20 +1203,18 @@ scope (§260) — do not fold them into any of these.
       (Merge.dev's half — account `status` and the GL parent id — landed
       2026-10-26 with the Contacts vendor fix; Sage Accounting UK's
       out-of-chart ledgers are emitted inactive since decisions §390.)
-- [ ] **(c) Vendor linking has three gaps of its own.** (1)
-      `vendors.erp_vendor_id` has no unique index, so two rows sharing an id
-      make `scalar_one_or_none` in `services/vendor_sync` raise and abort the
-      sync. (2) CSV import resolves vendors by `Vendor.code`
-      (`services/csv_import`), which an ERP-written code can collide with.
-      (3) Sage Intacct, SYSPRO and Blackbaud FE NXT link GL accounts by the
-      business account number, not a surrogate key, so a renumbering in the
-      ERP follows the number. **Durable fix:** a partial unique index on
-      `(erp_link_realm, erp_vendor_id)` with a migration that reports existing
-      duplicates first; CSV import resolving by a code namespace that ERP
-      codes cannot enter; and each of the three adapters keyed by the ERP's
-      own record id where its API exposes one. **Trigger:** the next migration
-      touching `vendors`, the next change to `csv_import`'s vendor resolution,
-      or the next change to one of those three adapters' chart listings.
+- [ ] **(c) Vendor linking has two gaps of its own.** (The third, two
+      vendors sharing one `erp_vendor_id`, is closed by `uq_vendors_erp_link`,
+      migration 0140, decisions §480.) (1) CSV import resolves vendors by
+      `Vendor.code` (`services/csv_import`), which an ERP-written code can
+      collide with. (2) Sage Intacct, SYSPRO and Blackbaud FE NXT link GL
+      accounts by the business account number, not a surrogate key, so a
+      renumbering in the ERP follows the number. **Durable fix:** CSV import
+      resolving by a code namespace that ERP codes cannot enter; and each of
+      the three adapters keyed by the ERP's own record id where its API
+      exposes one. **Trigger:** the next change to `csv_import`'s vendor
+      resolution, or the next change to one of those three adapters' chart
+      listings.
 - [ ] **(c) A mock sync still treats pre-0115 links as its own.** A no-realm
       pull (`mock`, or an OAuth ERP with no consent) leaves rows tied to a
       named realm alone (decisions §287), but a pre-0115 link is NULL-realm,

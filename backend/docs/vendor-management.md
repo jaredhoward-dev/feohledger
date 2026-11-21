@@ -224,6 +224,7 @@ The system can pull the vendor master list from the connected ERP. This ensures 
 |---|---|
 | ERP vendor not in local DB | Create new vendor with `source=erp_sync`, `status=active` |
 | ERP vendor matches by `erp_vendor_id` | Update fields if changed, update `erp_synced_at` |
+| Two local vendors hold that `erp_vendor_id` in this company (only before migration 0140) | Neither is touched; reported as a `duplicate_link` conflict (§ One vendor per ERP record per company) |
 | ERP vendor matches by name (no `erp_vendor_id` yet) | Link existing vendor to ERP, update fields |
 | Unverified vendor matches an ERP vendor by name | Auto-verify → set `status=active`, `source=erp_sync` |
 
@@ -357,6 +358,55 @@ else in the modal un-arms it. The table pans inside a named, focusable region
 (`role="region"`, `tabindex="0"`) rather than scrolling a 320px page sideways;
 `tests-e2e/vendors/erp-unlink.spec.ts` runs axe on it at desktop width and at
 320px.
+
+### One vendor per ERP record per company
+
+`uq_vendors_erp_link` (migration 0140, decisions §480) is a partial unique
+index on `vendors (organization_id, erp_link_realm, erp_vendor_id) NULLS NOT
+DISTINCT WHERE erp_vendor_id IS NOT NULL`: no two vendors hold one ERP record's
+id in one company. A NULL realm (a link from before migration 0115, or one a
+no-realm sync made) counts as one company, because the no-realm sync looks
+those links up as `erp_link_realm IS NULL`. The same id under two named
+companies, or under a named company and NULL, is allowed: QuickBooks numbers
+vendors per company, so those may be two records, and a sync under the named
+company re-judges the NULL link by evidence. Kept links (`vendor_erp_links`)
+are outside the index; the sync's restore and the hand-made link already
+refuse an id another vendor holds in that company.
+
+Before this index, two holders of one id made the sync's lookup by id raise
+and abort the whole pull. The sync now reports such a record instead
+(`conflicts`, reason `duplicate_link`, and "not updated" in the response
+message), leaves both vendors untouched, and syncs the rest. On a migrated
+tenant the index makes that unreachable; the check is for a tenant still
+before 0140.
+
+#### Duplicate ERP links
+
+Migration 0140 **refuses** (`DuplicateErpVendorLink`, nothing changed) on a
+tenant where two or more vendors already share a link in one company, naming
+the database, the counts and at most ten vendor row ids, never a vendor name or
+the ERP company. `scripts/migrate_all_tenants.py` then exits non-zero and the
+deploy stops. To list every group in that tenant database:
+
+```sql
+SELECT erp_link_realm, erp_vendor_id, array_agg(id ORDER BY id) AS vendor_ids
+FROM vendors
+WHERE erp_vendor_id IS NOT NULL
+GROUP BY organization_id, erp_link_realm, erp_vendor_id
+HAVING count(*) > 1;
+```
+
+For each group, choose in the app which vendor keeps the link:
+
+- **One supplier, several vendor rows**: merge them (`POST
+  /api/enrichment/vendors/consolidation/merge`). The same id in the same
+  company is *released* from each duplicate, so the merge clears the group.
+- **Different suppliers**: unlink the stale record from every vendor but the
+  right one (`POST /api/vendors/{id}/erp-links/unlink`, `realm` as listed, or
+  `null` for a NULL realm).
+
+Then re-run the migration. It never chooses for you: which vendor the ERP's
+bills post to is the call a merge or an unlink records in the audit trail.
 
 ### Every changed vendor writes an audit row
 
