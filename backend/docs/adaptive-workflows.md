@@ -622,7 +622,7 @@ row highlighted), a create `Modal` (pick a definition — seeds both configs fro
 its live `steps_config` — set split %, primary metric, min sample, edit the two
 JSON configs), and per-row start / stop / conclude / delete actions offered by the row's
 `actions` verdicts (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`,
-the gates the endpoints raise from). Over `#lib/api/experiments.ts` (types in
+the gates the endpoints raise from; decisions §483). Over `#lib/api/experiments.ts` (types in
 `#lib/types/experiments.ts`).
 
 ### Frontend — `/adaptive`

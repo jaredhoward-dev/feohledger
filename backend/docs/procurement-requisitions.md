@@ -167,7 +167,7 @@ narrow by design. Both refusals are coded (`requisition_delete_converted`,
 `requisition_delete_from_intake`) and come from
 `services/procurement_controls.requisition_delete_refusal`, the gate each row's
 `actions.delete` is built from, so /requisitions offers Delete exactly where it
-succeeds (it used to restate `status === 'draft'`).
+succeeds (it used to restate `status === 'draft'`; decisions §483).
 
 ## Endpoints
 
