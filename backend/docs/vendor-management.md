@@ -361,7 +361,7 @@ else in the modal un-arms it. The table pans inside a named, focusable region
 
 ### One vendor per ERP record per company
 
-`uq_vendors_erp_link` (migration 0140, decisions §482) is a partial unique
+`uq_vendors_erp_link` (migration 0140, decisions §484) is a partial unique
 index on `vendors (organization_id, erp_link_realm, erp_vendor_id) NULLS NOT
 DISTINCT WHERE erp_vendor_id IS NOT NULL`: no two vendors hold one ERP record's
 id in one company. A NULL realm (a link from before migration 0115, or one a
@@ -386,7 +386,7 @@ before it reads a link, a no-realm sync included (under a key no named
 company can produce). Two no-realm pulls of one new record would otherwise
 both find no holder and both create a vendor, and the second would fail the
 index at flush with a 500; with the lock the second waits, then finds the
-first one's vendor and leaves it unchanged (decisions §485).
+first one's vendor and leaves it unchanged (decisions §487).
 
 #### Duplicate ERP links
 

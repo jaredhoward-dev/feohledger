@@ -199,7 +199,7 @@ async def sync_vendors_from_erp(
     restored = 0
     # The lock a hand-made link takes (decisions §415): a person linking a
     # record while this pull adopts it by name cannot both win. Taken with no
-    # realm too (§485): two no-realm pulls would otherwise both create a vendor
+    # realm too (§487): two no-realm pulls would otherwise both create a vendor
     # for one new record, and the second would fail `uq_vendors_erp_link`.
     await link_lock(db, organization_id, realm)
     if realm is not None:
@@ -330,7 +330,7 @@ async def sync_vendors_from_erp(
             # supplier is a person's call (merge, or unlink the stale one), so
             # neither is touched and the run goes on. `uq_vendors_erp_link`
             # (migration 0140) makes this unreachable on a migrated tenant;
-            # 0140 refuses to build it over such a pair (decisions §482).
+            # 0140 refuses to build it over such a pair (decisions §484).
             duplicate_links.append(
                 {
                     "name": erp_v.get("name") or "",

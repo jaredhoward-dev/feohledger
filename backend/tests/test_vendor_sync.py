@@ -941,7 +941,7 @@ async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
 
 
 async def test_two_no_realm_syncs_creating_one_record_serialize(realdb):
-    """Two no-realm pulls of one new record (decisions §485): the second
+    """Two no-realm pulls of one new record (decisions §487): the second
     waits on the link lock the first holds and, once the first commits, finds
     the vendor it created instead of inserting a second holder and failing
     ``uq_vendors_erp_link`` at flush."""

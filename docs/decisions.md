@@ -16269,7 +16269,7 @@ release or vite-plugin-svelte stops depending on it. The patch is keyed to
 4.3.1, so a resolved version that moves off it leaves the copy unpatched and
 the guard red, which is the prompt to re-check.
 
-*Amended by §480:* GitHub withdrew the advisory on 2026-11-16, so the patch,
+*Amended by §482:* GitHub withdrew the advisory on 2026-11-16, so the patch,
 both ignores and the guard were removed.
 
 ## 353. An ERP name too long for its column is stored shortened and marked; vendor names are matched case and spacing aside (2026-11-12)
@@ -24249,7 +24249,7 @@ effect to suppress, and a 200 for "same tier" would need the endpoint to
 distinguish a retry from a second person choosing the same tier.
 `backend/docs/dynamic-discounting.md` § Concurrency.
 
-## 480. A withdrawn advisory takes its ignores, its patch and its guard with it (amends §352; round 2026-11-21)
+## 482. A withdrawn advisory takes its ignores, its patch and its guard with it (amends §352; round 2026-11-21)
 
 **Found.** GitHub withdrew GHSA-gcqx-w48m-w2h4 (CVE-2026-93753, deepmerge
 `mergeObject()` prototype poisoning) as not describing a security
@@ -24281,7 +24281,7 @@ config files. §352's method (a patch, a guard, then an ID-scoped ignore) still
 holds for the next advisory with no fixed release; `frontend/CLAUDE.md` keeps
 it as the rule.
 
-## 481. The overdue and due-soon population is one select every counting surface joins (closes a `docs/followups.md` entry, round 2026-11-21)
+## 483. The overdue and due-soon population is one select every counting surface joins (closes a `docs/followups.md` entry, round 2026-11-21)
 
 §471 put the population (outflow statuses), the effective due date (latest
 payment schedule, else the invoice's own) and "overdue" in
@@ -24321,7 +24321,7 @@ call the count did not (an invoice whose payment completed before its
 reconciliation with the AP balance). The exception SLA `is_overdue` is a
 different rule (an exception's `due_at`) and is not AP timing.
 
-## 482. One vendor per ERP record per company, enforced by a unique index; the migration refuses an existing pair (round 2026-11-21)
+## 484. One vendor per ERP record per company, enforced by a unique index; the migration refuses an existing pair (round 2026-11-21)
 
 `vendors.erp_vendor_id` had no unique index. Two vendors holding one record's
 id in one company made the vendor sync's lookup by id (`scalar_one_or_none` in
@@ -24365,7 +24365,7 @@ one it reports the record as a `duplicate_link` conflict, touches neither
 vendor, and syncs the rest of the pull. Choosing a holder there would be the
 same guess the migration declines.
 
-## 483. Delete on /intake, /requisitions and /experiments follows the endpoint's verdict, including where the old page rule was narrower (round 2026-11-21)
+## 485. Delete on /intake, /requisitions and /experiments follows the endpoint's verdict, including where the old page rule was narrower (round 2026-11-21)
 
 The last web controls the §305 follow-up tracked as restating a server rule —
 intake and requisition Delete, experiment Stop / Conclude / Delete — now raise
@@ -24400,9 +24400,9 @@ delete 409s became coded (`intake_delete_converted`,
 convention; the experiment ones stay plain strings with codes in the verdict,
 as `start_refusal` already did.
 
-## 484. Conclude refuses a draft that never ran; Delete is its exit (round 2026-11-21)
+## 486. Conclude refuses a draft that never ran; Delete is its exit (round 2026-11-21)
 
-§483 offered Conclude on any draft, because the endpoint concluded one. A
+§485 offered Conclude on any draft, because the endpoint concluded one. A
 fresh draft that never assigned an invoice therefore showed Start, Delete and
 Conclude together, and Conclude filed an experiment with no measurements as a
 finished result, permanently, beside the Delete that discards it.
@@ -24414,12 +24414,12 @@ deleted and not concluded, a stopped draft that kept its assignments can be
 concluded and not deleted, so each draft has exactly one exit. A running
 experiment with no assignments yet still concludes: it was live, and
 concluding it is how an operator ends a test that drew nothing. The message is
-a plain string like the module's other experiment refusals (§483), so no
+a plain string like the module's other experiment refusals (§485), so no
 browser catalogue entry was added; the page hides a refused Conclude.
 
-## 485. A no-realm vendor sync takes the link lock too, rather than catching the unique violation (round 2026-11-21)
+## 487. A no-realm vendor sync takes the link lock too, rather than catching the unique violation (round 2026-11-21)
 
-§482's unique index made a second holder of one ERP record impossible, which
+§484's unique index made a second holder of one ERP record impossible, which
 turned a race that used to make a silent duplicate into a 500: two no-realm
 syncs (no `link_lock` was taken without a realm, §415) could both find no
 holder for a new record, both create a vendor, and the second failed
