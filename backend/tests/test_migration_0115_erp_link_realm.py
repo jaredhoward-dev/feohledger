@@ -171,6 +171,42 @@ async def _columns(engine) -> set[tuple[str, str]]:
         return {(t, c) for t, c in rows} & _TENANT_COLUMNS
 
 
+def _head_indexes():
+    """The model's indexes on the tables 0115 alters."""
+    from app.models.gl_account import GLAccount
+    from app.models.vendor import Vendor
+
+    return [i for t in (GLAccount.__table__, Vendor.__table__) for i in t.indexes]
+
+
+async def _missing_head_indexes(engine) -> set[str]:
+    async with engine.connect() as conn:
+        present = set(
+            (await conn.execute(text("SELECT indexname FROM pg_indexes"))).scalars().all()
+        )
+    return {i.name for i in _head_indexes()} - present
+
+
+async def _restore_head_indexes(engine) -> None:
+    """Put back what the downgrade's ``DROP COLUMN`` took with it.
+
+    Dropping ``vendors.erp_link_realm`` drops every index on it, among them one a
+    LATER revision builds (``uq_vendors_erp_link``, 0140), and re-running 0115
+    adds the column but not that index. Left so, tenant "a" stays below head for
+    the rest of the session: 0140's own test then finds no index, and every
+    test after this one runs without the constraint the app relies on. The
+    model is the head schema ``create_all`` built, so its indexes are what to
+    restore.
+    """
+    async with engine.begin() as conn:
+
+        def _create(sync_conn):
+            for index in _head_indexes():
+                index.create(sync_conn, checkfirst=True)
+
+        await conn.run_sync(_create)
+
+
 async def _erp(engine, org_id) -> dict:
     async with engine.connect() as conn:
         erp = (
@@ -206,8 +242,11 @@ async def test_0115_downgrades_upgrades_and_reruns_on_a_tenant(realdb):
         await _run(engine, mig.upgrade)
         await _run(engine, mig.upgrade)  # idempotent: ADD COLUMN IF NOT EXISTS
         assert await _columns(engine) == _TENANT_COLUMNS
+        await _restore_head_indexes(engine)
+        assert await _missing_head_indexes(engine) == set()
     finally:
         await _run(engine, mig.upgrade)
+        await _restore_head_indexes(engine)
         await engine.dispose()
 
 
