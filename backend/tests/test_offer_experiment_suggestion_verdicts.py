@@ -42,7 +42,12 @@ from app.api.discounts import (
 from app.api.workflow_experiments import (
     EXPERIMENT_ALREADY_CONCLUDED,
     EXPERIMENT_HAS_ASSIGNMENTS,
+    EXPERIMENT_NEVER_RAN,
     EXPERIMENT_NOT_STARTABLE,
+    conclude_refusal,
+    delete_refusal,
+    start_refusal,
+    stop_refusal,
 )
 from app.models.adaptive_suggestion import WorkflowSuggestion
 from app.models.discount import DiscountOffer
@@ -250,9 +255,31 @@ async def test_the_experiment_verdict_matches_start(realdb, role):
             assert verdict["params"] == {"status": state}
 
 
+def test_a_fresh_draft_offers_start_and_delete_but_not_conclude():
+    """A draft that never assigned an invoice has no result to conclude:
+    concluding it filed an empty experiment as finished, beside the Delete that
+    is its real exit. Start and Delete are offered; Conclude and Stop are not
+    (decisions §484)."""
+    fresh = WorkflowExperiment(status="draft", assignments={})
+    assert start_refusal(fresh) is None
+    assert delete_refusal(fresh) is None
+    assert stop_refusal(fresh) is not None
+    refusal = conclude_refusal(fresh)
+    assert refusal is not None
+    assert refusal.code == EXPERIMENT_NEVER_RAN
+    assert refusal.http_status == 409
+
+    # Once it has assigned an invoice (a stopped draft), Conclude is its exit
+    # and Delete is refused — exactly one of the two, never both or neither.
+    stopped = WorkflowExperiment(status="draft", assignments={str(uuid.uuid4()): "A"})
+    assert conclude_refusal(stopped) is None
+    assert delete_refusal(stopped) is not None
+
+
 #: Row states for the stop / conclude / delete verdicts: the three statuses,
 #: plus a `draft` that was stopped after assigning invoices (its assignments
-#: kept), which delete refuses.
+#: kept), which delete refuses and conclude accepts. A fresh `draft` is the
+#: reverse: delete accepts it and conclude refuses (`experiment_never_ran`).
 EXPERIMENT_ROW_STATES = ("draft", "stopped_with_assignments", "running", "concluded")
 
 
@@ -296,7 +323,7 @@ async def test_the_experiment_verdicts_match_stop_conclude_and_delete(realdb, ro
     if role == "admin":
         expected = {
             "stop": {"experiment_not_stoppable"},
-            "conclude": {EXPERIMENT_ALREADY_CONCLUDED},
+            "conclude": {EXPERIMENT_ALREADY_CONCLUDED, EXPERIMENT_NEVER_RAN},
             "delete": {"experiment_not_deletable", EXPERIMENT_HAS_ASSIGNMENTS},
         }[action]
         assert expected <= seen, seen

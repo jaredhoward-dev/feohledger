@@ -109,6 +109,10 @@ EXPERIMENT_NOT_STOPPABLE = "experiment_not_stoppable"
 #: Conclude refused in the verdict only: a `concluded` experiment's repeat POST
 #: is an idempotent no-op answering the unchanged row, not an action to offer.
 EXPERIMENT_ALREADY_CONCLUDED = "experiment_already_concluded"
+#: Conclude refused: a `draft` with no assignments never measured anything, so
+#: concluding it would file an empty result as a finished experiment — delete
+#: it instead (409; decisions §484). It is exactly the row delete accepts.
+EXPERIMENT_NEVER_RAN = "experiment_never_ran"
 #: Delete refused: only a `draft` experiment can be deleted (409).
 EXPERIMENT_NOT_DELETABLE = "experiment_not_deletable"
 #: Delete refused: a draft that has assigned invoices (a stopped one) — its
@@ -130,16 +134,25 @@ def stop_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
 
 
 def conclude_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
-    """Why the row's ``actions.conclude`` verdict refuses, or ``None``. The
-    endpoint asks the same gate and, on a refusal, answers the idempotent
-    repeat with the unchanged row: conclude never fails, a concluded row just
-    has nothing to offer."""
+    """Why ``POST /{id}/conclude`` would refuse, or ``None`` — the gate the
+    endpoint asks and the row's ``actions.conclude`` verdict. A concluded
+    row's repeat is the idempotent no-op (the endpoint answers it with the
+    unchanged row, so only the verdict sees that refusal); a draft that never
+    assigned an invoice is refused with 409 ``experiment_never_ran`` — it has
+    no result to conclude, and Delete is its exit (decisions §484)."""
     if exp.status == "concluded":
         return ActionRefusal(
             EXPERIMENT_ALREADY_CONCLUDED,
             "This experiment is already concluded.",
             409,
             params={"status": exp.status},
+        )
+    if exp.status == "draft" and not exp.assignments:
+        return ActionRefusal(
+            EXPERIMENT_NEVER_RAN,
+            "This experiment never assigned an invoice, so there is nothing "
+            "to conclude. Delete it instead.",
+            409,
         )
     return None
 
@@ -510,12 +523,15 @@ async def conclude_experiment(
         db, WorkflowExperiment, experiment_id, entity_id, detail="Experiment not found."
     )
     exp = await _get_experiment(db, experiment_id, organization_id=user.organization_id)
-    if conclude_refusal(exp) is not None:
+    refusal = conclude_refusal(exp)
+    if refusal is not None and refusal.code == EXPERIMENT_ALREADY_CONCLUDED:
         # Idempotent — already concluded.
         names = await _definition_names(db, {exp.workflow_definition_id})
         return _experiment_response(
             exp, user=user, definition_name=names.get(exp.workflow_definition_id)
         )
+    if refusal is not None:
+        raise refusal.http()
     exp.status = "concluded"
     exp.ended_at = datetime.now(UTC)
     await db.flush()
