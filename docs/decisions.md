@@ -24320,3 +24320,47 @@ call the count did not (an invoice whose payment completed before its
 `paid` sync-back; a row flag that must match the date it prints; aging's
 reconciliation with the AP balance). The exception SLA `is_overdue` is a
 different rule (an exception's `due_at`) and is not AP timing.
+
+## 482. One vendor per ERP record per company, enforced by a unique index; the migration refuses an existing pair (round 2026-11-21)
+
+`vendors.erp_vendor_id` had no unique index. Two vendors holding one record's
+id in one company made the vendor sync's lookup by id (`scalar_one_or_none` in
+`services/vendor_sync`) raise and abort every pull the tenant ran, and the push
+would post two payees' bills to one ERP supplier. The sync, the restore of kept
+links (§356), the hand-made link (§415) and the merge (§373) each already
+avoid making a second holder, but nothing below them held the line.
+
+Migration 0140 adds `uq_vendors_erp_link` on `vendors (organization_id,
+erp_link_realm, erp_vendor_id) NULLS NOT DISTINCT WHERE erp_vendor_id IS NOT
+NULL`, and the model declares it so `create_all` builds the same on a fresh
+tenant. `organization_id` leads because every lookup is scoped by it; in a
+database-per-tenant deployment it is constant, so it costs nothing.
+
+**A NULL realm is one company.** A no-realm sync looks a record up as
+`erp_link_realm IS NULL`, so two NULL-realm holders break it exactly as two
+named ones do; with plain NULL semantics the pre-0115 links would be the one
+place a duplicate survives. `NULLS NOT DISTINCT` (PostgreSQL 15+; compose, CI
+and RDS are all 16) says that directly. Rejected: a `COALESCE(erp_link_realm,
+'')` expression index, which needs a sentinel the realm format must never
+produce, and which the sync's `IS NULL` predicate cannot use. A NULL-realm link
+and a named one may share an id: they may be two companies' records, and a sync
+under the named one re-judges the NULL link by evidence (§284).
+
+**The migration refuses rather than de-links**, as 0138 did for email case
+collisions (§475). Which vendor keeps the link decides whose bills post to that
+ERP supplier; de-linking every holder would drop a link that is right for one
+of them and silently stop its pushes (`vendor_not_linked`), and keeping one by
+age or id is a guess. Both existing tools record the choice in the audit trail:
+a merge releases the same id held twice in one company (§373), and the unlink
+clears the stale holder (§375). The refusal names the database, the counts and
+at most ten vendor row ids, never a vendor name or the realm (which can carry an
+ERP base URL); `backend/docs/vendor-management.md` § Duplicate ERP links has
+the query that lists every group. `scripts/migrate_all_tenants.py` exits
+non-zero on it, so the deploy stops before new code serves that tenant.
+
+**The sync no longer aborts on a pair.** Code can still meet one on a tenant
+before 0140 (a local database, or a fan-out that stopped on the refusal while
+other code paths run). The lookup by id now reads every holder; with more than
+one it reports the record as a `duplicate_link` conflict, touches neither
+vendor, and syncs the rest of the pull. Choosing a holder there would be the
+same guess the migration declines.
