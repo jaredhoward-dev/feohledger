@@ -36,9 +36,8 @@ from app.services.currency_conversion import (
 from app.services.open_ap_due import (
     COMMITTED_STATUSES,
     PENDING_STATUSES,
-    effective_due_date,
     is_overdue,
-    latest_schedule_subquery,
+    open_ap_due_population,
 )
 from app.tenant import apply_entity_scope
 from app.utils.currency_code import iso_currency_or_none
@@ -104,17 +103,17 @@ async def commitment_rows(
         statuses += list(PENDING_STATUSES)
     horizon_end = today + timedelta(days=horizon_days)
 
-    # ONE schedule row per invoice, and the effective due date the loop below
-    # times each row on — both from `services/open_ap_due`, the module the
-    # dashboard's overdue figure reads too, so the /cfo "Overdue (owed now)"
-    # card (§449) and the dashboard count the same rows. Bounded here at the
-    # future edge only — no lower bound, because a past-due row is an overdue
-    # outflow, not one to drop — so a horizon's worth of open AP is what
-    # crosses the wire rather than every open invoice with a far-future date.
-    # A NULL effective due date fails `<=` and is excluded: it cannot be timed
-    # into any period.
-    latest_schedule = latest_schedule_subquery()
-    effective_due = effective_due_date(latest_schedule)
+    # The open-AP population and its effective due date (one schedule row per
+    # invoice) are `services/open_ap_due.open_ap_due_population`, the select
+    # the dashboard's overdue figure and `GET /api/invoices?overdue=true` read
+    # too, so the /cfo "Overdue (owed now)" card (§449) and the dashboard count
+    # the same rows. Bounded here at the future edge only — no lower bound,
+    # because a past-due row is an overdue outflow, not one to drop — so a
+    # horizon's worth of open AP is what crosses the wire rather than every
+    # open invoice with a far-future date. A NULL effective due date fails
+    # `<=` and is excluded: it cannot be timed into any period.
+    population = open_ap_due_population(statuses)
+    effective_due = population.c.effective_due
 
     result = await db.execute(
         apply_entity_scope(
@@ -122,17 +121,15 @@ async def commitment_rows(
                 Invoice.id,
                 Invoice.amount,
                 Invoice.status,
-                Invoice.due_date,
-                latest_schedule.c.sched_due,
-                latest_schedule.c.discount_date,
-                latest_schedule.c.discount_percent,
+                effective_due,
+                population.c.discount_date,
+                population.c.discount_percent,
                 Invoice.currency,
                 Invoice.reporting_amount,
                 Invoice.reporting_currency,
                 is_overdue(effective_due, today).label("overdue"),
             )
-            .outerjoin(latest_schedule, latest_schedule.c.invoice_id == Invoice.id)
-            .where(Invoice.status.in_(statuses))
+            .join(population, population.c.invoice_id == Invoice.id)
             .where(effective_due <= horizon_end),
             Invoice,
             entity_id,
@@ -147,8 +144,7 @@ async def commitment_rows(
         inv_id,
         amount,
         status,
-        inv_due,
-        sched_due,
+        due,
         discount_date,
         discount_percent,
         inv_currency,
@@ -156,7 +152,6 @@ async def commitment_rows(
         rep_currency,
         overdue,
     ) in result.all():
-        due = sched_due or inv_due
         # The SQL bound above already excludes these; kept so the loop's own
         # contract does not depend on the query's (a NULL due date cannot be
         # timed, a date past the horizon is out of scope).

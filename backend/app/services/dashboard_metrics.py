@@ -46,10 +46,10 @@ from app.services.currency_conversion import (
     rollup_from_grouped_rows,
 )
 from app.services.open_ap_due import (
-    OUTFLOW_STATUSES,
-    effective_due_date,
+    DUE_SOON_DAYS,
+    is_due_soon,
     is_overdue,
-    latest_schedule_subquery,
+    open_ap_due_population,
 )
 from app.services.payment_adapters.base import PENDING_PAYMENT_STATUSES
 from app.services.touchless import touchless_counts_select
@@ -508,13 +508,16 @@ async def overdue_and_due_soon(s: DashboardScope) -> dict:
     Counted in SQL over the whole book — not folded from `upcoming_payments`,
     which is capped at ten rows (and, sorted by due date, fills with overdue
     rows first), so a count derived from it stops at ten and a due-soon count
-    read off it can reach zero while invoices fall due this week. The
-    population, the effective due date (latest payment schedule, else the
-    invoice's own) and "overdue" are `services/open_ap_due`'s, the same
-    statement the cash-flow forecast reads — so `overdue_count` here and the
-    /cfo "Overdue (owed now)" card count the same invoices (decisions §449).
-    Due soon is today through seven days out, the window `upcoming_payments`
-    uses on its future side.
+    read off it can reach zero while invoices fall due this week.
+
+    Aggregated over `open_ap_due.open_ap_due_population`, the ONE select that
+    states the population and its effective due date (latest payment
+    schedule, else the invoice's own). This function adds only the two windows
+    (`is_overdue`, `is_due_soon`) and the entity scope, so `overdue_count` here,
+    `GET /api/invoices?overdue=true` (`overdue_invoice_ids`, the same select)
+    and the /cfo "Overdue (owed now)" card count the same invoices (decisions
+    §449, §471). Due soon is today through `DUE_SOON_DAYS` out, the window
+    `upcoming_payments` uses on its future side.
 
     Per currency, at FACE value, grouped on the invoice's own code: a count of
     invoices owed now has no business depending on whether each one has a
@@ -523,11 +526,10 @@ async def overdue_and_due_soon(s: DashboardScope) -> dict:
     `null`, which a client renders without a symbol rather than guessing one.
     """
     today = s.today
-    week_ahead = today + timedelta(days=7)
-    due_latest = latest_schedule_subquery()
-    due = effective_due_date(due_latest)
+    population = open_ap_due_population()
+    due = population.c.effective_due
     overdue = is_overdue(due, today)
-    due_soon = and_(due >= today, due <= week_ahead)
+    due_soon = is_due_soon(due, today)
     due_ccy = func.nullif(func.upper(func.trim(Invoice.currency)), "")
     due_rows = await s.db.execute(
         s.inv(
@@ -538,8 +540,10 @@ async def overdue_and_due_soon(s: DashboardScope) -> dict:
                 func.count(case((due_soon, Invoice.id))),
                 func.coalesce(func.sum(case((due_soon, Invoice.amount))), 0),
             )
-            .outerjoin(due_latest, due_latest.c.invoice_id == Invoice.id)
-            .where(Invoice.status.in_(OUTFLOW_STATUSES), due.isnot(None), due <= week_ahead)
+            .join(population, population.c.invoice_id == Invoice.id)
+            # Both windows end at the due-soon edge; bounding the join there
+            # keeps the far-future book out of the aggregate. NULL fails `<=`.
+            .where(due <= today + timedelta(days=DUE_SOON_DAYS))
             .group_by(due_ccy)
             .order_by(due_ccy.asc().nulls_last())
         )

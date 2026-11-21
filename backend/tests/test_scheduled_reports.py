@@ -629,8 +629,7 @@ async def test_cashflow_forecast_dispatches_to_the_commitment_query_not_aging():
     feed a bucket dict into the cashflow exporter and crash)."""
     from app.services.scheduled_reports import _materialise_rows
 
-    # Shape consumed by `commitment_rows`:
-    # (amount, status, invoice due_date, sched_due, discount_date, discount_percent)
+    # No open AP: `commitment_rows` gets no rows and the forecast is empty.
     result = MagicMock()
     result.all = MagicMock(return_value=[])
     db = AsyncMock()
