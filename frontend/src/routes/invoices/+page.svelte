@@ -1237,7 +1237,7 @@
 						{/if}
 						</span>
 					</td>
-					<td>
+					<td class="vendor-cell">
 						{invoice.vendor || '—'}
 						{#if invoice.priors_summary && (invoice.priors_summary.cache > 0 || invoice.priors_summary.rag > 0)}
 							<span
@@ -1422,27 +1422,35 @@
 	}
 
 	/* Fixed column widths pair with DataTable's `fixed`/`stickyHeader` props.
-	   These <th> widths apply because the header row is rendered from this
-	   page's snippet (page CSS scope). The predictable columns are sized to
-	   their widest content in the six locales: a header to its longest word
+	   They sit under `.inv-table` and `:global` because five of the headers
+	   (Invoice #, Vendor, Amount, Due date, Status) are `SortableHeader`s,
+	   whose `<th>` is rendered by that component and so never carries this
+	   page's scope class: a bare `th:nth-child(n)` here matched only the
+	   page's own `<th>`s and left those columns at an equal share (the
+	   /vendors and /exceptions arrangement). The predictable columns are
+	   sized to their widest content in the six locales: a header to its
+	   longest word
 	   plus the sort arrow (de "RECHNUNGS-NR.", "FÄLLIGKEITSDATUM"), the status
 	   column to its longest badge (fr "COMPTABILISÉE DANS L'ERP"), the actions
 	   column to de "Bestätigen". Vendor and Description carry no width and
-	   share the rest; past the `min-width` the table scrolls inside its region
+	   share the rest (a long vendor name wraps, `td.vendor-cell`); past the
+	   `min-width` the table scrolls inside its region
 	   (frontend/docs/ui-patterns.md § Data tables). Ten columns, so the cells
 	   run 10px of horizontal padding instead of the global 14px (the
 	   /exceptions arrangement): that is what keeps the row inside the 1388px
 	   region a 1666px window gives (tests-e2e/a11y/wide-layout.spec.ts). */
 	.inv-table { min-width: 0; }
 	.inv-table :global(table) { min-width: 1380px; }
-	th, td { padding-left: 10px; padding-right: 10px; }
-	th:nth-child(1) { width: 40px; }
-	th:nth-child(2) { width: 150px; }
-	th:nth-child(5) { width: 110px; }
-	th:nth-child(6) { width: 132px; }
-	th:nth-child(7) { width: 170px; }
-	th:nth-child(8) { width: 230px; }
-	th:nth-child(10) { width: 120px; }
+	.inv-table :global(th),
+	.inv-table :global(td) { padding-left: 10px; padding-right: 10px; }
+	.inv-table :global(th:nth-child(1)) { width: 40px; }
+	.inv-table :global(th:nth-child(2)) { width: 150px; }
+	.inv-table :global(th:nth-child(5)) { width: 110px; }
+	.inv-table :global(th:nth-child(6)) { width: 132px; }
+	.inv-table :global(th:nth-child(7)) { width: 170px; }
+	.inv-table :global(th:nth-child(8)) { width: 230px; }
+	.inv-table :global(th:nth-child(9)) { width: 140px; }
+	.inv-table :global(th:nth-child(10)) { width: 120px; }
 
 	.assignee {
 		overflow: hidden;
@@ -1450,13 +1458,21 @@
 		white-space: nowrap;
 		color: var(--text-muted);
 	}
-	th:nth-child(9) { width: 140px; }
 
 	td {
 		white-space: nowrap;
 		vertical-align: middle;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	/* The vendor name wraps (the /vendors `.vendor-name` arrangement) instead
+	   of clipping: a clipped name kept its tail only in a `title`, which a
+	   keyboard or touch reader never sees. One unbroken run still breaks
+	   inside the column. */
+	td.vendor-cell {
+		white-space: normal;
+		overflow-wrap: anywhere;
 	}
 
 	tr:last-child td {

@@ -270,8 +270,13 @@ const LOCALE_SIZED = new Set([
 	'/admin/access-review'
 ]);
 
-/** The locales whose strings run longest against the English widths. */
-const OVERFLOW_LOCALES = ['de', 'es'] as const;
+/**
+ * The locales whose strings run longest against the English widths: de and es
+ * for most headers and buttons, and the ones the widest badges come from
+ * (fr "COMPTABILISÉE DANS L'ERP"; pt-BR "PARCIALMENTE RECEBIDO", "PRECISA DE
+ * UMA DECISÃO", "COMPARTILHADA"; ja "エスカレーション済み").
+ */
+const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
@@ -486,6 +491,71 @@ async function overflowingCells(table: Locator): Promise<string[]> {
 	});
 }
 
+/**
+ * The row each page's widest badge needs, which the shard's tenant need not
+ * hold: the page's real list response, with its first row turned into that
+ * row. Patching a real row keeps the response's shape the backend's own.
+ * `badge` is the badge that must then be on screen, so a tenant with no row
+ * to patch fails here instead of passing without measuring anything.
+ */
+type Row = Record<string, unknown>;
+const WIDEST_ROW: Record<string, { pathname: string; patch: (row: Row) => Row; badge: string }> = {
+	'/invoices': {
+		pathname: '/api/invoices',
+		patch: (row) => ({ ...row, status: 'posted_in_erp' }),
+		badge: '.badge.posted_in_erp'
+	},
+	'/exceptions': {
+		pathname: '/api/exceptions',
+		patch: (row) => ({ ...row, status: 'escalated' }),
+		badge: '.badge.badge-escalated'
+	},
+	'/vendors': {
+		pathname: '/api/vendors',
+		patch: (row) => ({ ...row, status: 'unverified', screening_status: 'review', source: 'erp_sync' }),
+		badge: '.badge.unverified'
+	},
+	'/purchase-orders': {
+		pathname: '/api/purchase-orders',
+		patch: (row) => ({
+			...row,
+			status: 'partially_received',
+			total: null,
+			total_unverifiable_reason: 'unpriceable'
+		}),
+		badge: '.badge.partially_received'
+	},
+	'/gl-accounts': {
+		pathname: '/api/gl-accounts',
+		patch: (row) => ({
+			...row,
+			entity_id: null,
+			erp_account_id: null,
+			erp_link_candidates: {
+				reason: 'duplicate_code',
+				accounts: [{ erp_account_id: 'erp-layout-1', code: '6000', name: 'Layout fixture' }]
+			}
+		}),
+		badge: '.badge.needs-decision'
+	}
+};
+
+/** Answer `pathname` with the backend's own list, its first row patched. */
+async function patchFirstRow(page: Page, pathname: string, patch: (row: Row) => Row) {
+	await page.route(
+		(url) => url.pathname === pathname,
+		async (route) => {
+			if (route.request().method() !== 'GET') return route.fallback();
+			const response = await route.fetch();
+			const body = await response.json();
+			// /api/gl-accounts is a bare array; every other list is `{ items }`.
+			const rows: Row[] = Array.isArray(body) ? body : body.items;
+			if (rows.length > 0) rows[0] = patch(rows[0]);
+			await route.fulfill({ response, json: body });
+		}
+	);
+}
+
 /** One pending bank change the caller may not approve: the row that carries
  *  the separation-of-duties note above its buttons. */
 const REFUSED_CHANGE_REQUEST = {
@@ -525,6 +595,8 @@ test.describe('fixed list tables fit their longest locale', () => {
 							})
 					);
 				}
+				const widest = WIDEST_ROW[href];
+				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
 				await page.goto(href);
 				await expect(page.locator('html')).toHaveAttribute('lang', locale);
@@ -537,6 +609,7 @@ test.describe('fixed list tables fit their longest locale', () => {
 				if (href === '/vendors/change-requests') {
 					await expect(table.locator('.refusal-note')).toBeVisible();
 				}
+				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
 				await nextFrames(page);
 
 				expect(await overflowingCells(table), `cells wider than their column on ${href}`).toEqual([]);

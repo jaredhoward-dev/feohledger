@@ -219,9 +219,11 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   A note in an actions cell (the bank-change queue's separation-of-duties
   refusal) is `display: block; white-space: normal`, above the buttons.
   Guard: `tests-e2e/reactivity/layout-stability.spec.ts` opens each page in
-  its `LOCALE_SIZED` set under `de` and `es` and fails if a header, a
-  badge's cell or an action cell has `scrollWidth > clientWidth`; a new
-  fixed table joins that set. A `SortableHeader` needs 14px more than its
+  its `LOCALE_SIZED` set under `de`, `es`, `fr`, `pt-BR` and `ja` and fails if
+  a header, a badge's cell or an action cell has `scrollWidth > clientWidth`;
+  a new fixed table joins that set. A page whose widest badge needs a row the
+  tenant may not hold (an escalated exception, a partially received PO) gets
+  a `WIDEST_ROW` entry there, which patches the first real row into it. A `SortableHeader` needs 14px more than its
   word (the arrow and its gap), a `HelpTip` about 22px. **Measure, don't
   guess:** render each candidate string in a browser with the cell's own font
   metrics (`th`: 0.72rem/600, uppercase, 0.06em; `<Badge>`: 0.75rem/600,

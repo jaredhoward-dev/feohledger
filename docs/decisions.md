@@ -24400,6 +24400,23 @@ delete 409s became coded (`intake_delete_converted`,
 convention; the experiment ones stay plain strings with codes in the verdict,
 as `start_refusal` already did.
 
+## 484. Conclude refuses a draft that never ran; Delete is its exit (round 2026-11-21)
+
+§483 offered Conclude on any draft, because the endpoint concluded one. A
+fresh draft that never assigned an invoice therefore showed Start, Delete and
+Conclude together, and Conclude filed an experiment with no measurements as a
+finished result, permanently, beside the Delete that discards it.
+`conclude_refusal` now refuses that row with 409 `experiment_never_ran` ("delete
+it instead"), and the endpoint raises from the same gate; a concluded row's
+repeat stays the idempotent no-op. The rule is the complement of
+`delete_refusal`'s assignment check: a draft with no assignments can be
+deleted and not concluded, a stopped draft that kept its assignments can be
+concluded and not deleted, so each draft has exactly one exit. A running
+experiment with no assignments yet still concludes: it was live, and
+concluding it is how an operator ends a test that drew nothing. The message is
+a plain string like the module's other experiment refusals (§483), so no
+browser catalogue entry was added; the page hides a refused Conclude.
+
 ## 485. A no-realm vendor sync takes the link lock too, rather than catching the unique violation (round 2026-11-21)
 
 §482's unique index made a second holder of one ERP record impossible, which

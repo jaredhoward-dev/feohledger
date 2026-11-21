@@ -89,7 +89,7 @@ export const messages = {
 	'refusal.intakeStatusRefused': "Não é possível enquanto este recebimento estiver com status {status}.",
 	'refusal.requisitionStatusRefused': "Não é possível enquanto esta requisição estiver com status {status}.",
 	'refusal.requisitionApprovalSegregation': "Segregação de funções: um usuário que solicitou ou editou esta requisição não pode também aprová-la.",
-	'refusal.intakeDeleteConverted': "Este recebimento já foi convertido; cancele a requisição gerada a partir dela.",
+	'refusal.intakeDeleteConverted': "Este recebimento já foi convertido; cancele a requisição gerada a partir dele.",
 	'refusal.requisitionDeleteConverted': "A requisição foi convertida em pedido de compra; ela não pode ser excluída.",
 	'refusal.requisitionDeleteFromIntake': "A requisição foi gerada a partir de um recebimento; cancele-a em vez disso.",
 	'refusal.expenseReportLocked': "O total deste relatório está bloqueado enquanto seu status for {status}, então suas linhas não podem ser alteradas.",

@@ -602,7 +602,7 @@ agreement by `tests/test_dashboard_aggregates.py`
 | `/api/experiments/{id}` | PATCH | **admin only** | Edit — **draft only** (409 otherwise) |
 | `/api/experiments/{id}/start` | POST | **admin only** | draft → running; idempotent (already-running is a no-op); 409 if concluded |
 | `/api/experiments/{id}/stop` | POST | **admin only** | running → draft (stops *new* assignments; in-flight keep their frozen variant); 409 if not running |
-| `/api/experiments/{id}/conclude` | POST | **admin only** | → concluded (terminal; results stay readable); idempotent |
+| `/api/experiments/{id}/conclude` | POST | **admin only** | → concluded (terminal; results stay readable); idempotent; 409 `experiment_never_ran` on a draft that never assigned an invoice (nothing to conclude — delete it) |
 | `/api/experiments/{id}` | DELETE | **admin only** | **draft only** (409 — stop/conclude a running one to preserve its measurement history) |
 | `/api/experiments/{id}/results` | GET | admin / ap_manager / cfo | Per-variant metrics + winner / not-enough-data over the recorded assignments |
 
@@ -622,7 +622,9 @@ row highlighted), a create `Modal` (pick a definition — seeds both configs fro
 its live `steps_config` — set split %, primary metric, min sample, edit the two
 JSON configs), and per-row start / stop / conclude / delete actions offered by the row's
 `actions` verdicts (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`,
-the gates the endpoints raise from; decisions §483). Over `#lib/api/experiments.ts` (types in
+the gates the endpoints raise from; decisions §483, §484). A draft offers
+exactly one way out: Delete while it has never assigned an invoice, Conclude
+once it has (a stopped draft keeps its assignments). Over `#lib/api/experiments.ts` (types in
 `#lib/types/experiments.ts`).
 
 ### Frontend — `/adaptive`
