@@ -601,6 +601,9 @@ const BUILDERS: Record<string, Builder> = {
 	billing_payment_declined: fixed('refusal.billingPaymentDeclined'),
 	billing_not_configured: fixed('refusal.billingNotConfigured'),
 	plan_change_in_progress: fixed('refusal.planChangeInProgress'),
+	// The confirmed preview is out of date (decisions §482); the dialog fetches
+	// a fresh one so the reader can confirm the new figure.
+	plan_change_preview_stale: fixed('refusal.planChangePreviewStale'),
 	// `api/billing.py` — `POST /payment-method/default` for a SetupIntent that
 	// is not this org's (404) or has not succeeded yet (409).
 	setup_intent_not_found: fixed('refusal.setupIntentNotFound'),

@@ -68,6 +68,12 @@ const sources = Object.entries(RAW)
  * once every candidate in it is either retyped or judged here.
  */
 const JUDGED_NOT_MONEY: Record<string, Record<string, string>> = {
+	'lib/types/billing.ts': {
+		// The instant a plan-change preview was priced at (decisions §482), in
+		// Unix seconds — a timestamp the confirm hands back, not an amount.
+		'BillingPlanChangePreview.proration_date': 'a Unix timestamp, not money',
+		'BillingPlanChangeRequest.proration_date': 'a Unix timestamp, not money'
+	},
 	'lib/types/auditVerification.ts': {
 		// Caps the signature sweep's findings list (backend default 100, max 1000).
 		'VerifySignaturesParams.limit': 'a cap on returned findings, not a spend limit'

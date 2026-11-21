@@ -3,9 +3,11 @@
 // `#lib/types/billing` for the response contracts and `backend/docs/billing.md`
 // for the backend slice this consumes.
 import { api } from '#lib/api.ts';
+import { planChangeRequestFrom } from '#lib/types/billing.ts';
 import type {
 	BillingInvoicesResponse,
 	BillingPaymentMethodsResponse,
+	BillingPlanChangePreview,
 	BillingPlanChangeResponse,
 	BillingPlansResponse,
 	BillingSetDefaultPaymentMethodRequest,
@@ -58,16 +60,26 @@ export function getBillingPlans(): Promise<BillingPlansResponse> {
 	return api.get<BillingPlansResponse>('/api/billing/plans');
 }
 
-/** Move the org's live subscription to `planCode`, prorated mid-period.
- *  admin/cfo only. This APPLIES the change immediately — there is no preview —
- *  and is idempotent: changing to the plan the org is already on succeeds with
- *  `changed: false` and a zero proration rather than an error. Coded refusals
- *  the page branches on (`types/billing.ts::planChangeCardAction`): 409
- *  `payment_method_required` (no saved card for a paid plan), 402
- *  `billing_payment_declined` (the upgrade charge was declined; nothing
- *  changed); also 409 `billing_not_configured` / `plan_change_in_progress`. */
-export function changeBillingPlan(planCode: string): Promise<BillingPlanChangeResponse> {
-	return api.post<BillingPlanChangeResponse>('/api/billing/change-plan', { plan_code: planCode });
+/** What moving to `planCode` would charge — the provider's own figures, and
+ *  nothing is charged or changed. admin/cfo only. A missing card is reported
+ *  as `payment_method_required: true`, not refused. Refusals: 404 (unknown
+ *  plan / no subscription), 409 `billing_not_configured`, 502. */
+export function previewBillingPlanChange(planCode: string): Promise<BillingPlanChangePreview> {
+	return api.post<BillingPlanChangePreview>('/api/billing/change-plan/preview', {
+		plan_code: planCode
+	});
+}
+
+/** Confirm the change `preview` priced: this CHARGES what it showed (or less;
+ *  AI-read overage accrued up to the change is invoiced with it on top —
+ *  decisions §482). admin/cfo only. Idempotent: a change to the plan the org is
+ *  already on succeeds with `changed: false`. Coded refusals the dialog
+ *  branches on (`types/billing.ts::planChangeCardAction`): 409
+ *  `payment_method_required`, 402 `billing_payment_declined` (nothing
+ *  changed), 409 `plan_change_preview_stale` (re-preview and confirm again);
+ *  also 409 `billing_not_configured` / `plan_change_in_progress`. */
+export function changeBillingPlan(preview: BillingPlanChangePreview): Promise<BillingPlanChangeResponse> {
+	return api.post<BillingPlanChangeResponse>('/api/billing/change-plan', planChangeRequestFrom(preview));
 }
 
 /** Make the card a confirmed SetupIntent saved the org's DEFAULT — the one the

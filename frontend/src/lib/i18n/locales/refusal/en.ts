@@ -72,6 +72,7 @@ export const enRefusal = {
 	'refusal.billingPaymentDeclined': "Your card was declined, so your plan was not changed. Update your card and try again.",
 	'refusal.billingNotConfigured': "Paid plans are not available yet because billing is not set up for this deployment. Contact our team.",
 	'refusal.planChangeInProgress': "Another plan change is already in progress. Try again in a moment.",
+	'refusal.planChangePreviewStale': "The price you confirmed is out of date, so nothing was charged. Review the new amount and confirm again.",
 	'refusal.setupIntentNotFound': "That card setup could not be found. Start adding the card again.",
 	'refusal.setupIntentIncomplete': "Card setup is not complete yet. Finish entering your card details and try again.",
 	'refusal.creditMemoInvoiceSettled': "The invoice is {status}: no payment will be made against it any more, so a credit applied to it would reduce nothing. Leave the credit memo open and apply it to the vendor's next invoice.",

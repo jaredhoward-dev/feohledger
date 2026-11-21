@@ -327,9 +327,58 @@ export interface BillingPlanChangeProration {
 }
 
 /**
- * Result of `POST /api/billing/change-plan`. This call APPLIES the change —
- * there is no preview-only mode on the backend — so `changed` distinguishes a
- * real mutation from the idempotent no-op of "changing" to the plan the org is
+ * `POST /api/billing/change-plan/preview` — what a plan change would charge,
+ * priced by the billing provider and charging nothing (decisions §482). Every
+ * amount is the server's exact decimal STRING; the page renders them, never
+ * computes them. The confirm sends `proration_date`, `amount_due` and
+ * `currency` back ({@link BillingPlanChangeRequest}).
+ */
+export interface BillingPlanChangePreview {
+	plan_code: string;
+	/** Already on this plan: confirming changes nothing. */
+	already_on_plan: boolean;
+	currency: string;
+	/** Charged when the change is confirmed (never negative). */
+	amount_due: string;
+	/** Credited to the account balance instead (a downgrade), else `"0.00"`. */
+	credit: string;
+	/** What recurs after the change, and from when; null when nothing recurs. */
+	next_amount: string | null;
+	next_date: string | null;
+	/** Unix seconds the figures were priced at. */
+	proration_date: number;
+	/** After this the confirm is refused `plan_change_preview_stale`. */
+	expires_at: string;
+	/** A paid plan and no card on file: the dialog asks for one first. */
+	payment_method_required: boolean;
+}
+
+/** Body of `POST /api/billing/change-plan`: the target plan and the preview
+ *  the reader confirmed. The server refuses a quote that is stale or below
+ *  what the provider would now charge (decisions §482 names the limits:
+ *  AI-read overage accrued up to the change is billed on top). */
+export interface BillingPlanChangeRequest {
+	plan_code: string;
+	proration_date: number;
+	expected_amount_due: string;
+	currency: string;
+}
+
+/** Build the confirm body from the preview the reader saw — the amounts are
+ *  passed through as the server's strings, never re-derived. */
+export function planChangeRequestFrom(preview: BillingPlanChangePreview): BillingPlanChangeRequest {
+	return {
+		plan_code: preview.plan_code,
+		proration_date: preview.proration_date,
+		expected_amount_due: preview.amount_due,
+		currency: preview.currency
+	};
+}
+
+/**
+ * Result of `POST /api/billing/change-plan`. This call APPLIES the change the
+ * reader confirmed from its preview, so `changed` distinguishes a real
+ * mutation from the idempotent no-op of "changing" to the plan the org is
  * already on (no mutation, zero proration).
  */
 export interface BillingPlanChangeResponse {
@@ -385,6 +434,9 @@ export function cardFormMode(
 export const PAYMENT_METHOD_REQUIRED = 'payment_method_required';
 /** `POST /api/billing/change-plan` refused because the provider declined the upgrade charge. */
 export const BILLING_PAYMENT_DECLINED = 'billing_payment_declined';
+/** `POST /api/billing/change-plan` refused because the confirmed preview is out of
+ *  date (too old, another month, or the provider would now charge more). */
+export const PLAN_CHANGE_PREVIEW_STALE = 'plan_change_preview_stale';
 
 /**
  * What the plan-change dialog offers beside a refusal: `add_card` when the org

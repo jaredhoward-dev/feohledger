@@ -6,9 +6,11 @@ import {
 	cardFormMode,
 	parseSpendCapInput,
 	planChangeCardAction,
+	planChangeRequestFrom,
 	planHighlights,
 	rebateMeterGroups,
 	type BillingAiUsage,
+	type BillingPlanChangePreview,
 	type BillingUsage
 } from './billing';
 
@@ -241,5 +243,29 @@ describe('planHighlights', () => {
 		expect(h.get('a')).toEqual({ builtOn: null, added: [] });
 		// An unknown key sorts after the known ones rather than vanishing.
 		expect(h.get('b')).toEqual({ builtOn: null, added: ['sso', 'custom_grant'] });
+	});
+});
+
+describe('planChangeRequestFrom', () => {
+	it('confirms exactly the figures the preview showed, as the server sent them', () => {
+		const preview: BillingPlanChangePreview = {
+			plan_code: 'growth',
+			already_on_plan: false,
+			currency: 'USD',
+			amount_due: '14.80',
+			credit: '0.00',
+			next_amount: '49.00',
+			next_date: '2026-12-01T00:00:00Z',
+			proration_date: 1795000000,
+			expires_at: '2026-11-21T12:10:00Z',
+			payment_method_required: false
+		};
+		expect(planChangeRequestFrom(preview)).toEqual({
+			plan_code: 'growth',
+			proration_date: 1795000000,
+			// The string itself — never parsed, rounded or re-derived.
+			expected_amount_due: '14.80',
+			currency: 'USD'
+		});
 	});
 });
