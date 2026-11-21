@@ -260,6 +260,16 @@ async def test_exception_list_is_constant(realdb):
                     exception_type="po_mismatch",
                     severity="warning",
                     status="open",
+                    # A distinct timestamp per row, so the list's default
+                    # `created_at DESC` puts row 0 (invoice-less) then row 1
+                    # (linked) on the small page every run. Left to the server
+                    # default, all 24 share one transaction's `now()`, the
+                    # order falls to the random-UUID tie-break, and ~4% of runs
+                    # drew a small page of two invoice-less rows: the page's
+                    # one batched `workflow_instances` read is (correctly)
+                    # skipped when no row needs a chain, so 5 statements vs 6
+                    # read as an N+1 that is not there.
+                    created_at=datetime.now(UTC) - timedelta(minutes=i),
                 )
             )
         await s.commit()
