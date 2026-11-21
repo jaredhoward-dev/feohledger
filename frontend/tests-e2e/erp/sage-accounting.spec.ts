@@ -98,6 +98,14 @@ async function revocations(request: APIRequestContext): Promise<number> {
 	return (await resp.json()).revocations;
 }
 
+/** Set a fake contact's Account Status (`is_active`) through the fake's hook. */
+async function setSageContactActive(request: APIRequestContext, id: string, isActive: boolean) {
+	const resp = await request.post(`${FAKE_ERP_BASE}/sage/v3.1/__set-contact`, {
+		data: { id, is_active: isActive }
+	});
+	expect(resp.ok(), await resp.text()).toBe(true);
+}
+
 /** A purchase invoice straight from the fake, as Sage holds it. */
 async function sageInvoice(request: APIRequestContext, id: string) {
 	const resp = await request.get(`${FAKE_ERP_BASE}/sage/v3.1/purchase_invoices/${id}`, {
@@ -265,6 +273,37 @@ test.describe('/erp sage_accounting adapter against fake-erp', () => {
 			);
 		} finally {
 			await setSageBusiness(request, { year_end_lockdown_date: null });
+			await deleteInvoice(page, inv.id);
+		}
+	});
+
+	test('a supplier set Inactive in Sage is refused vendor_inactive before any create', async ({
+		page,
+		request
+	}) => {
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-SAGE-INACTIVE',
+			invoiceDate: '2026-10-01',
+			dueDate: '2026-10-31',
+			amount: '1260.00',
+			taxAmount: '210.00',
+			currency: 'GBP',
+			vendor: SUPPLIER,
+			glAccount: '7500'
+		});
+		try {
+			// Deactivated in Sage after the sync: the contact reads back
+			// `is_active: false` and the adapter refuses without a POST (no
+			// "(HTTP 422)"; decisions §481).
+			await setSageContactActive(request, 'sage-contact-1', false);
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('failed');
+			expect(await erpFailureFromAudit(page, inv.id)).toBe(
+				'Sage Accounting post refused: vendor_inactive'
+			);
+		} finally {
+			await setSageContactActive(request, 'sage-contact-1', true);
 			await deleteInvoice(page, inv.id);
 		}
 	});

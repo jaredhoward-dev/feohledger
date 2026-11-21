@@ -24350,3 +24350,47 @@ accrued at the old price or bills the whole period at the new one at its end.
 Either way the reported units are right; only which price they meet differs.
 `backend/docs/billing.md` § The provider leg, § What the operator configures in
 Stripe; `backend/tests/test_billing_stripe_subscriptions.py`.
+
+## 481. A Sage Business Cloud Accounting supplier set Inactive syncs inactive: `is_active` is read, and only an explicit `false` counts (issue #743, 2026-11-21)
+
+The v3.1 adapter read a contact's activity from `gdpr_obfuscated` and
+`deleted_at` alone, on the belief that Sage has no archive flag. A live pass
+against a real UK business showed otherwise: a supplier whose Account Status
+was set to Inactive in Sage's UI came back with `"is_active": false` (and no
+`deleted_at`), and FeohLedger synced it as an active payee. The same read
+explained a refused create, so a bill to that supplier was not coded
+`vendor_inactive` either.
+
+Both reads now request `is_active`, and one helper,
+`sage_accounting._contact_inactive`, decides for the vendor sync and the
+refusal alike: `is_active is False`, `gdpr_obfuscated` or `deleted_at` is
+inactive. An absent `is_active` is "don't know" and keeps the contact active,
+the rule every refusal read in this adapter follows (an unreadable answer is
+never "inactive"); inferring inactive from a missing field would deactivate
+every supplier of a business whose response omits it.
+
+The same pass showed Sage cutting a 108-character name at its 100-character
+limit and keeping the trailing space, so a contact's name (and its
+`displayed_as` fallback) is stripped before it is stored.
+
+A second live push, to the inactive supplier, showed what the push did: the
+idempotency lookup, the ledger read, a `POST /purchase_invoices` Sage answered
+422, then the post-mortem reads, which asked the contact only for `deleted_at`
+and `gdpr_obfuscated` and so recorded `bill_refused`. Two changes follow. The
+contact is now read before the create, and one `_contact_inactive` calls
+inactive is refused `vendor_inactive` with no POST: a refusal Sage will make
+anyway is cheaper and clearer stated up front, and it does not depend on a 422
+body nobody has captured. That read decides only on a positive answer; a 404
+or an unreadable one lets the create go ahead, and the post-mortem (which now
+reads `is_active` too) explains its refusal, so a contact deactivated between
+the two reads still comes back `vendor_inactive (HTTP 422)`. The up-front
+refusal is the plain `erp_refusal`, not `not_posted`, like the adapter's other
+refusals made after its first request.
+
+fake-erp's Sage double carries `is_active` on every contact (default `true`),
+lists an inactive supplier (`sage-contact-5`), takes `POST
+/sage/v3.1/__set-contact {"id", "is_active"}` so a test can deactivate one,
+and answers a create naming an inactive contact with 422. The status is what
+real Sage returned; its error code and message are assumed, and the adapter
+never reads them. `backend/docs/erp-integration.md` § Sage
+Business Cloud Accounting; `backend/tests/test_erp_sage_accounting_adapter.py`.
