@@ -5,6 +5,7 @@ import dataclasses
 import io
 import logging
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -2214,9 +2215,15 @@ async def sync_vendors_from_erp_endpoint(
         f"{result['updated']} updated, "
         f"{result['unchanged']} unchanged"
     )
-    if result["conflicts"]:
+    reasons = Counter(c["reason"] for c in result["conflicts"])
+    if reasons["ambiguous_name"]:
         message += (
-            f"; {len(result['conflicts'])} not linked (the name matches more than one vendor)"
+            f"; {reasons['ambiguous_name']} not linked (the name matches more than one vendor)"
+        )
+    if reasons["duplicate_link"]:
+        message += (
+            f"; {reasons['duplicate_link']} not updated (more than one vendor is linked to it:"
+            " merge them or unlink the stale one)"
         )
     if result["unlinked"]:
         message += f"; {len(result['unlinked'])} unlinked (linked under another ERP company)"

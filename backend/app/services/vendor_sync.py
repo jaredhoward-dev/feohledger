@@ -137,7 +137,10 @@ async def sync_vendors_from_erp(
     that value was never our identifier for the vendor.
 
     Returns summary: {created, updated, unchanged: int, conflicts: list of
-    {"name", "reason", "erp_vendor_ids"}, unlinked: names whose link this run
+    {"name", "reason", "erp_vendor_ids"} (``reason`` ``ambiguous_name``: the
+    name matched more than one way, so nothing was linked; ``duplicate_link``:
+    two local vendors already hold that record in this company, so neither was
+    updated — only on a tenant not yet at migration 0140), unlinked: names whose link this run
     dropped, deactivated / codes_cleared / realm_adopted / restored: int,
     values_too_long: {"name", "erp_vendor_id", "fields"} per record with a
     field too long to store (:data:`_BOUNDED_FIELDS`; field NAMES only),
@@ -165,6 +168,9 @@ async def sync_vendors_from_erp(
     rescreen: list[Vendor] = []
     # normalised name -> (the first spelling seen, the ERP ids refused under it)
     conflicts: dict[str, tuple[str, set[str]]] = {}
+    # One entry per pulled record two local vendors already hold (see the
+    # lookup by id below).
+    duplicate_links: list[dict] = []
     unlinked: list[str] = []
     too_long: list[dict] = []
     deactivated = 0
@@ -297,16 +303,36 @@ async def sync_vendors_from_erp(
         # Check if vendor already exists by ERP ID — in this realm only. Under
         # a named realm the pass above left no link from another one; under
         # none, a vendor linked to a named company's "57" is not this "57".
-        result = await db.execute(
-            select(Vendor).where(
-                Vendor.erp_vendor_id == erp_id,
-                Vendor.organization_id == organization_id,
-                Vendor.erp_link_realm.is_(None)
-                if realm is None
-                else Vendor.erp_link_realm == realm,
+        holders = (
+            (
+                await db.execute(
+                    select(Vendor).where(
+                        Vendor.erp_vendor_id == erp_id,
+                        Vendor.organization_id == organization_id,
+                        Vendor.erp_link_realm.is_(None)
+                        if realm is None
+                        else Vendor.erp_link_realm == realm,
+                    )
+                )
             )
+            .scalars()
+            .all()
         )
-        existing = result.scalar_one_or_none()
+        if len(holders) > 1:
+            # Two vendors holding one record in one company: which one is the
+            # supplier is a person's call (merge, or unlink the stale one), so
+            # neither is touched and the run goes on. `uq_vendors_erp_link`
+            # (migration 0140) makes this unreachable on a migrated tenant;
+            # 0140 refuses to build it over such a pair (decisions §480).
+            duplicate_links.append(
+                {
+                    "name": erp_v.get("name") or "",
+                    "reason": "duplicate_link",
+                    "erp_vendor_ids": [str(erp_id)],
+                }
+            )
+            continue
+        existing = holders[0] if holders else None
 
         if existing:
             # Update fields if changed
@@ -433,10 +459,13 @@ async def sync_vendors_from_erp(
         unchanged=unchanged,
         # One entry per normalised name, under the first spelling the pull used.
         conflicts=sorted(
-            (
-                {"name": name, "reason": "ambiguous_name", "erp_vendor_ids": sorted(ids)}
-                for name, ids in conflicts.values()
-            ),
+            [
+                *(
+                    {"name": name, "reason": "ambiguous_name", "erp_vendor_ids": sorted(ids)}
+                    for name, ids in conflicts.values()
+                ),
+                *duplicate_links,
+            ],
             key=lambda c: (c["name"], c["erp_vendor_ids"]),
         ),
         unlinked=sorted(unlinked),

@@ -799,3 +799,137 @@ async def test_a_hand_made_link_waits_for_a_sync_and_is_then_refused(realdb):
 
     assert refused.value.code == ERP_VENDOR_ALREADY_LINKED
     assert await _holders(mk, org_id, realm, "ERP-LOCK") == [name_match]
+
+
+# ---------------------------------------------------------------------------
+# One holder per (company, ERP record) — uq_vendors_erp_link, migration 0140
+# ---------------------------------------------------------------------------
+
+
+def _linked(org_id, name: str, erp_id: str, realm: str | None) -> Vendor:
+    return Vendor(
+        name=name,
+        organization_id=org_id,
+        status="active",
+        source="erp_sync",
+        erp_vendor_id=erp_id,
+        erp_link_realm=realm,
+    )
+
+
+@pytest.mark.parametrize("realm", [None, "xero:dup-company"])
+async def test_the_database_refuses_a_second_holder_of_one_record_in_one_company(realdb, realm):
+    """A NULL realm is one company too (NULLS NOT DISTINCT): the no-realm sync
+    looks those links up as ``erp_link_realm IS NULL``."""
+    from sqlalchemy.exc import IntegrityError
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add(_linked(org_id, "First Holder", "ERP-DUP", realm))
+        await s.flush()
+        s.add(_linked(org_id, "Second Holder", "ERP-DUP", realm))
+        with pytest.raises(IntegrityError) as exc:
+            await s.flush()
+        assert "uq_vendors_erp_link" in str(exc.value)
+        await s.rollback()
+
+
+async def test_one_record_id_may_be_held_once_per_company(realdb):
+    """The same id under two named companies, or a named one and none, is two
+    records (QuickBooks numbers vendors per company), and unlinked vendors hold
+    nothing."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add_all(
+            [
+                _linked(org_id, "Sandbox Co", "57", "quickbooks_online:sandbox"),
+                _linked(org_id, "Production Co", "57", "quickbooks_online:production"),
+                _linked(org_id, "Legacy Co", "57", None),
+                Vendor(name="Unlinked A", organization_id=org_id, status="active"),
+                Vendor(name="Unlinked B", organization_id=org_id, status="active"),
+            ]
+        )
+        await s.commit()
+    async with mk() as s:
+        assert (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id == "57")
+            )
+        ).scalar_one() == 3
+
+
+@pytest.mark.parametrize("realm", [None, "xero:dup-company"])
+async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_on(realdb, realm):
+    """A tenant not yet at 0140 can still hold such a pair (0140 refuses to
+    build its index over one). The lookup by id used to raise
+    ``MultipleResultsFound`` and abort the whole pull; now it reports the
+    record as a ``duplicate_link`` conflict, touches neither holder, and syncs
+    the rest. The index is dropped inside the test's own transaction, which is
+    rolled back, so the shared tenant keeps it."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        await s.execute(text("DROP INDEX uq_vendors_erp_link"))
+        first = _linked(org_id, "Twin Supply", "ERP-TWIN", realm)
+        second = _linked(org_id, "Twin Supply Ltd", "ERP-TWIN", realm)
+        s.add_all([first, second])
+        await s.flush()
+
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-TWIN", "name": "Twin Supply Renamed", "code": "TW"},
+                {"erp_vendor_id": "ERP-NEW", "name": "Fresh Co"},
+            ],
+            realm=realm,
+        )
+
+        assert result["conflicts"] == [
+            {
+                "name": "Twin Supply Renamed",
+                "reason": "duplicate_link",
+                "erp_vendor_ids": ["ERP-TWIN"],
+            }
+        ]
+        assert (result["created"], result["updated"], result["unchanged"]) == (1, 0, 0)
+        # Neither holder was touched: which one is the supplier is a person's call.
+        for vendor, name in ((first, "Twin Supply"), (second, "Twin Supply Ltd")):
+            await s.refresh(vendor)
+            assert (vendor.name, vendor.code, vendor.erp_synced_at) == (name, None, None)
+            assert (vendor.erp_vendor_id, vendor.erp_link_realm) == ("ERP-TWIN", realm)
+        await s.rollback()
+
+    async with mk() as s:
+        index = (
+            await s.execute(
+                text("SELECT 1 FROM pg_indexes WHERE indexname = 'uq_vendors_erp_link'")
+            )
+        ).scalar_one_or_none()
+    assert index == 1
+
+
+async def test_a_pull_listing_one_record_twice_still_makes_one_vendor(realdb):
+    """A provider page overlap repeats a record: the second sighting finds the
+    vendor the first created, so the index is never reached."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-REPEAT", "name": "Repeat Co"},
+                {"erp_vendor_id": "ERP-REPEAT", "name": "Repeat Co"},
+            ],
+        )
+        await s.commit()
+    assert (result["created"], result["conflicts"]) == (1, [])
+    async with mk() as s:
+        assert (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id == "ERP-REPEAT")
+            )
+        ).scalar_one() == 1
