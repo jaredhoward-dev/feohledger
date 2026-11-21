@@ -116,7 +116,7 @@ async def test_delete_converted_requisition_is_409_not_a_stranded_po(realdb):
 
         resp = await c.delete(f"/api/requisitions/{rid}")
     assert resp.status_code == 409, resp.text
-    assert "converted" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "requisition_delete_converted"
 
     async with mk() as s:
         still_there = (
@@ -151,7 +151,7 @@ async def test_delete_requisition_converted_from_an_intake_is_409_not_500(realdb
         assert (await c.get(f"/api/requisitions/{rid}")).json()["status"] == "draft"
         resp = await c.delete(f"/api/requisitions/{rid}")
     assert resp.status_code == 409, resp.text
-    assert "intake" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "requisition_delete_from_intake"
 
 
 async def test_delete_unconverted_requisition_still_works(realdb):
@@ -177,7 +177,7 @@ async def test_delete_converted_intake_is_409(realdb):
 
         resp = await c.delete(f"/api/intake/{iid}")
     assert resp.status_code == 409, resp.text
-    assert "converted" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "intake_delete_converted"
 
     async with mk() as s:
         row = (

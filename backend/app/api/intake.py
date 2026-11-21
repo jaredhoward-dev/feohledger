@@ -52,6 +52,7 @@ from app.services.intake_service import (
 )
 from app.services.procurement_controls import (
     intake_convert_refusal,
+    intake_delete_refusal,
     intake_transition_refusal,
 )
 from app.services.vendor_matching import get_vendor_in_scope
@@ -87,7 +88,7 @@ INTAKE_REVIEW_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
 
 
 def intake_action_refusals(intake: IntakeRequest, user: User) -> IntakeActions:
-    """What submit, approve, reject, convert, cancel and reopen would answer
+    """What submit, approve, reject, convert, cancel, reopen and delete would answer
     ``user`` for this intake — each a coded refusal or ``None`` (issue #575).
     Each is the endpoint's role predicate (``holds_any_role``, what
     ``require_roles`` enforces) followed by the gate it raises from
@@ -110,6 +111,7 @@ def intake_action_refusals(intake: IntakeRequest, user: User) -> IntakeActions:
         convert=verdict(INTAKE_REVIEW_ROLES, lambda: intake_convert_refusal(intake)),
         cancel=verdict(INTAKE_AUTHOR_ROLES, move(IntakeStatus.cancelled)),
         reopen=verdict(INTAKE_AUTHOR_ROLES, move(IntakeStatus.open)),
+        delete=verdict(INTAKE_AUTHOR_ROLES, lambda: intake_delete_refusal(intake)),
     )
 
 
@@ -455,7 +457,7 @@ async def update_intake(
 async def delete_intake(
     intake_id: uuid.UUID,
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)),
+    user: User = Depends(require_roles(*INTAKE_AUTHOR_ROLES)),
     org_id: uuid.UUID = Depends(get_org_id),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
@@ -464,23 +466,15 @@ async def delete_intake(
     # `PurchaseRequisition` (and, through it, a `PurchaseOrder`). Deleting it
     # destroys the only link between the ask and the commitment it produced,
     # and the FK it holds means the attempt lands as a 500 or leaves the
-    # requisition orphaned rather than saying so. Refuse it the way
+    # requisition orphaned rather than saying so. Refused the way
     # `DELETE /api/recurring/{id}` refuses a template that has already
-    # generated invoices: 409, naming the terminal state instead.
+    # generated invoices: 409 (`procurement_controls.intake_delete_refusal`).
     #
     # This is also what keeps the conversion route's idempotency real. Its
     # "dangling link — fall through and rebuild" branch exists for a
     # requisition that vanished; with delete refused at both ends, an intake
     # can never be re-converted into a SECOND requisition for the same ask.
-    if (
-        intake.status == IntakeStatus.converted
-        or intake.converted_requisition_id is not None
-        or intake.converted_po_id is not None
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Intake has been converted; cancel the downstream requisition instead.",
-        )
+    _raise_if(intake_delete_refusal(intake))
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),

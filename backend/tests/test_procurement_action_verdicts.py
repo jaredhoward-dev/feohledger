@@ -2,12 +2,15 @@
 action, and it says exactly what the endpoint answers (issue #575 § One rule,
 one place).
 
-* intake — `actions.{submit,approve,reject,convert,cancel,reopen}`. The page
-  restated them as a status list plus `auth.isManager`;
-* requisitions — the same six. The page restated a status list, three role
+* intake — `actions.{submit,approve,reject,convert,cancel,reopen,delete}`. The
+  page restated them as a status list plus `auth.isManager`; Delete was
+  `canCreate` alone, so a converted intake offered a Delete that 409s;
+* requisitions — the same seven. The page restated a status list, three role
   sets and `requester_user_id !== me`: that hid a Reject the endpoint accepts
   from the requester, and offered an Approve that 403s to a material editor
-  of someone else's draft.
+  of someone else's draft. Delete was `canCreate && status === 'draft'`, which
+  offered it on a draft an intake was converted into (409) and hid it on the
+  rejected / cancelled rows the endpoint deletes.
 
 The parity property, per role × row state × whose row: verdict `None` exactly
 when the mutation succeeds, otherwise exactly the coded detail it answers with
@@ -30,13 +33,13 @@ from app.models.procurement import IntakeRequest, PurchaseRequisition
 
 TENANT = "a"
 ROLES = ("admin", "ap_manager", "ap_clerk", "cfo")
-ACTIONS = ("submit", "approve", "reject", "convert", "cancel", "reopen")
+ACTIONS = ("submit", "approve", "reject", "convert", "cancel", "reopen", "delete")
 pytestmark = pytest.mark.asyncio
 
 
 def _assert_parity(verdict, resp, label):
     if verdict is None:
-        assert resp.status_code in (200, 201), (label, resp.text)
+        assert resp.status_code in (200, 201, 204), (label, resp.text)
         return
     assert resp.status_code in (403, 409, 422), (label, verdict, resp.text)
     detail = resp.json()["detail"]
@@ -83,6 +86,8 @@ async def _intake(realdb, *, requester: uuid.UUID, status: str) -> uuid.UUID:
 
 async def _post_intake(c, intake_id, action):
     base = f"/api/intake/{intake_id}"
+    if action == "delete":
+        return await c.delete(base)
     if action == "convert":
         return await c.post(f"{base}/convert-to-requisition")
     if action in ("approve", "reject", "cancel"):
@@ -111,7 +116,7 @@ async def test_the_intake_verdicts_match_every_lifecycle_endpoint(realdb, role):
                 _assert_parity(verdict, resp, (role, state, whose, action))
                 if verdict is not None:
                     seen.add(verdict["code"])
-                elif action != "convert":
+                elif action not in ("convert", "delete"):
                     # A mutation response carries the verdicts too, so a row
                     # the page upserts from it keeps its controls.
                     assert set(resp.json()["actions"]) == set(ACTIONS)
@@ -119,6 +124,8 @@ async def test_the_intake_verdicts_match_every_lifecycle_endpoint(realdb, role):
         assert "intake_status_refused" in seen
     else:
         assert "role_not_permitted" in seen
+    # Every role may delete; a `converted` row is refused for each of them.
+    assert "intake_delete_converted" in seen
 
 
 async def test_a_converted_intake_replays_its_requisition_and_says_so(realdb):
@@ -174,6 +181,8 @@ async def _requisition(
 
 async def _post_requisition(c, req_id, action):
     base = f"/api/requisitions/{req_id}"
+    if action == "delete":
+        return await c.delete(base)
     if action == "convert":
         return await c.post(f"{base}/convert-to-po")
     if action in ("reject", "cancel"):
@@ -211,7 +220,7 @@ async def test_the_requisition_verdicts_match_every_lifecycle_endpoint(realdb, r
                 _assert_parity(verdict, resp, (role, state, whose, action))
                 if verdict is not None:
                     seen.add(verdict["code"])
-                elif action != "convert":
+                elif action not in ("convert", "delete"):
                     assert set(resp.json()["actions"]) == set(ACTIONS)
     if role in ("admin", "ap_manager", "cfo"):
         # The requester and a material editor are both refused approve.
@@ -219,6 +228,8 @@ async def test_the_requisition_verdicts_match_every_lifecycle_endpoint(realdb, r
         assert "requisition_status_refused" in seen
     else:
         assert "role_not_permitted" in seen
+    if role != "cfo":
+        assert "requisition_delete_converted" in seen
 
 
 async def test_the_requester_may_reject_their_own_requisition(realdb):
@@ -248,3 +259,44 @@ async def test_a_converted_requisition_replays_its_po(realdb):
         assert row["actions"]["convert"] is None
         again = await c.post(f"/api/requisitions/{req_id}/convert-to-po")
         assert again.status_code == 200 and again.json()["created"] is False
+
+
+@pytest.mark.parametrize("role", ("ap_clerk", "cfo"))
+async def test_a_requisition_an_intake_was_converted_into_is_not_deletable(realdb, role):
+    """The one delete refusal the row's own columns do not show: an intake
+    names this requisition (`converted_requisition_id`). The list reads that
+    link in one query per page; the verdict and the DELETE agree on it (the
+    CFO cannot delete at all, so it sees `role_not_permitted` there)."""
+    other = _other_user(realdb, role)
+    req_id = await _requisition(realdb, requester=other, status="draft")
+    await _intake_converted_into(realdb, req_id)
+    async with realdb.client(key=TENANT, role=role) as c:
+        listed = await c.get("/api/requisitions", params={"page_size": 100})
+        row = {i["id"]: i for i in listed.json()["items"]}[str(req_id)]
+        detail = await c.get(f"/api/requisitions/{req_id}")
+        assert row["actions"] == detail.json()["actions"]
+        verdict = row["actions"]["delete"]
+        resp = await c.delete(f"/api/requisitions/{req_id}")
+    expected = "role_not_permitted" if role == "cfo" else "requisition_delete_from_intake"
+    assert verdict["code"] == expected
+    _assert_parity(verdict, resp, (role, "from_intake"))
+
+
+async def _intake_converted_into(realdb, req_id: uuid.UUID) -> None:
+    intake_id = uuid.uuid4()
+    async with realdb.sessionmaker(TENANT)() as s:
+        s.add(
+            IntakeRequest(
+                id=intake_id,
+                request_number=f"INTK-L-{intake_id.hex[:8]}",
+                title="Linked intake",
+                requester_user_id=_other_user(realdb, "admin"),
+                estimated_amount=Decimal("120.00"),
+                currency="USD",
+                status="converted",
+                converted_requisition_id=req_id,
+                organization_id=realdb.info(TENANT).org_id,
+                entity_id=await _default_entity(realdb),
+            )
+        )
+        await s.commit()
