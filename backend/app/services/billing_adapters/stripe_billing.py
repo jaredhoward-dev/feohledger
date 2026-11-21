@@ -49,6 +49,7 @@ from app.services.billing_adapters.base import (
 )
 from app.services.billing_adapters.dispatcher import register_billing_adapter
 from app.services.webhook_security import extract_signature_header
+from app.utils.currency_code import iso_currency_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -607,10 +608,9 @@ class StripeBillingAdapter(BillingAdapter):
 
         # A preview without a currency is refused like one without an amount:
         # never filled in with the plan's (decisions §160 / §200).
-        currency = invoice.get("currency")
-        if not isinstance(currency, str) or not currency.strip():
+        currency = iso_currency_or_none(invoice.get("currency"))
+        if currency is None:
             raise BillingProviderError("Stripe preview_invoice returned no currency")
-        currency = currency.strip().upper()
         return ProviderPlanChangePreview(
             amount_due=_minor_to_decimal(invoice.get("amount_due"), "preview_invoice"),
             total=_minor_to_decimal(invoice.get("total"), "preview_invoice"),
