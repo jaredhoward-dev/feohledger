@@ -1635,9 +1635,11 @@
 	   `DataTable fixed`: the columns are sized from these header widths, never
 	   from the longest value in some row. The predictable columns are sized to
 	   their widest content in the six locales (fr "AVERTISSEMENT", a
-	   seven-figure amount, "Résoudre" + "Facture"). Invoice and Vendor take a
-	   share of the width, so they gain room on a wide window; Type carries no
-	   width and takes the rest — it is the column with the most to say.
+	   seven-figure amount, "Résoudre" + "Facture"; es "RESPONSABLE" and
+	   "ANTIGÜEDAD", pt-BR "VENCIMENTO" with the sort arrow; the badge ja
+	   "エスカレーション済み"). Invoice and Vendor clip with their full value in
+	   `title`; Type carries no width and takes the rest — it is the column
+	   with the most to say.
 
 	   Eleven columns is one more than any other list here, so this table runs
 	   10px of horizontal cell padding instead of the global 14px: that 88px is
@@ -1662,13 +1664,13 @@
 	}
 	.exc-table :global(th.checkbox-col) { width: 40px; }
 	.exc-table :global(th.col-sev) { width: 116px; }
-	.exc-table :global(th.col-invoice) { width: 10%; }
-	.exc-table :global(th.col-vendor) { width: 11%; }
+	.exc-table :global(th.col-invoice) { width: 110px; }
+	.exc-table :global(th.col-vendor) { width: 120px; }
 	.exc-table :global(th.col-amount) { width: 132px; }
-	.exc-table :global(th.col-assignee) { width: 116px; }
-	.exc-table :global(th.col-age) { width: 104px; }
-	.exc-table :global(th.col-due) { width: 100px; }
-	.exc-table :global(th.col-status) { width: 120px; }
+	.exc-table :global(th.col-assignee) { width: 130px; }
+	.exc-table :global(th.col-age) { width: 130px; }
+	.exc-table :global(th.col-due) { width: 130px; }
+	.exc-table :global(th.col-status) { width: 170px; }
 	.exc-table :global(th.actions-col) { width: 184px; }
 
 	/* A status longer than its column (ja "エスカレーション済み") wraps inside

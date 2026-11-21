@@ -221,7 +221,18 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   Guard: `tests-e2e/reactivity/layout-stability.spec.ts` opens each page in
   its `LOCALE_SIZED` set under `de` and `es` and fails if a header, a
   badge's cell or an action cell has `scrollWidth > clientWidth`; a new
-  fixed table joins that set.
+  fixed table joins that set. A `SortableHeader` needs 14px more than its
+  word (the arrow and its gap), a `HelpTip` about 22px. **Measure, don't
+  guess:** render each candidate string in a browser with the cell's own font
+  metrics (`th`: 0.72rem/600, uppercase, 0.06em; `<Badge>`: 0.75rem/600,
+  uppercase, 0.03em, plus its 20px padding; `RowAction`: 0.8rem plus 26px of
+  chrome) and take the widest across the six catalogues, then round up to the
+  next 10px with at least 5px to spare. When the widths that gives no longer
+  leave the text columns room inside the 1388px region a 1666px window gives
+  (`tests-e2e/a11y/wide-layout.spec.ts`), a dense table runs 10px of
+  horizontal cell padding instead of 14px (/exceptions, /invoices,
+  /vendors) before anything else gives way. /payments' queue does not fit
+  even then and is tracked in `docs/followups.md`.
 - **A list page's table is `fixed`.** Under `table-layout: auto` the columns
   are sized against the "Loading…" row and then re-sized against the real
   rows, so every column slides sideways as the data lands. /invoices,

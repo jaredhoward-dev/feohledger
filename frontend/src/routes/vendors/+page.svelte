@@ -1174,12 +1174,15 @@
 	/* Column widths. The table is `table-layout: fixed`, so with no widths every
 	   column got an equal share: the checkbox column was as wide as Email, and
 	   a long address spilled into Status. The predictable columns get fixed
-	   widths sized to their widest content (the "UNVERIFIED" badge, "Unscreened",
-	   "AI Extracted", four action buttons); Vendor and Email share the rest. The
+	   widths sized to their widest content in the six locales (the de badge
+	   "NICHT VERIFIZIERT", de "Prüfung erforderlich", es "Sincronización ERP",
+	   the header de "RECHNUNGEN", four action buttons wrapping); Vendor and
+	   Email share the rest. Nine columns, so the cells run 10px of horizontal
+	   padding instead of the global 14px (the /exceptions arrangement). The
 	   min-width keeps those two readable, so on a narrow window the table
 	   scrolls inside its region rather than crushing them. */
 	.vendor-table :global(table) {
-		/* The fixed columns total ~1,030px; this leaves Vendor and Email ~175px
+		/* The fixed columns total ~1,120px; this leaves Vendor and Email ~130px
 		   each before the table scrolls inside its region. Sized to the 1,388px
 		   region a 1666px window gives with the sidebar open — the bar #574 set
 		   for the exceptions queue. At 1460px it overflowed that region by 72px,
@@ -1189,12 +1192,17 @@
 		   share loses nothing. */
 		min-width: 1380px;
 	}
+	.vendor-table :global(th),
+	.vendor-table :global(td) {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
 	.vendor-table :global(th.checkbox-col) { width: 44px; }
 	.vendor-table :global(th.col-code) { width: 96px; }
-	.vendor-table :global(th.col-status) { width: 140px; }
-	.vendor-table :global(th.col-screening) { width: 140px; }
-	.vendor-table :global(th.col-source) { width: 130px; }
-	.vendor-table :global(th.col-invoices) { width: 100px; }
+	.vendor-table :global(th.col-status) { width: 170px; }
+	.vendor-table :global(th.col-screening) { width: 160px; }
+	.vendor-table :global(th.col-source) { width: 150px; }
+	.vendor-table :global(th.col-invoices) { width: 120px; }
 	.vendor-table :global(th.col-erp) { width: 76px; }
 	.vendor-table :global(th.actions-col) { width: 300px; }
 	/* Vendor and Email carry no width: they share what is left equally. */
