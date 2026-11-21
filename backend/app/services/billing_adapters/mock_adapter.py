@@ -20,8 +20,10 @@ from app.services.billing_adapters.base import (
     BillingWebhookEvent,
     CreateSubscriptionRequest,
     MeterEvent,
+    PlanChangePreviewRequest,
     ProviderInvoice,
     ProviderPaymentMethod,
+    ProviderPlanChangePreview,
     ProviderSetupIntent,
     ProviderSubscription,
     SetupIntentRejected,
@@ -82,9 +84,40 @@ class MockBillingAdapter(BillingAdapter):
         overage_price_id: str | None,
         plan_code: str,
         idempotency_key: str,
+        proration_date: datetime | None = None,
     ) -> ProviderSubscription:
         return ProviderSubscription(
             external_subscription_id=external_subscription_id, status="active", plan_code=plan_code
+        )
+
+    async def preview_plan_change(
+        self, request: PlanChangePreviewRequest
+    ) -> ProviderPlanChangePreview:
+        """Deterministic figures, so the local confirm step has real numbers.
+
+        The day-granular proration `change_plan` records (`compute_proration`)
+        over the window the service passes, priced at ``proration_date`` — the
+        same inputs give the same figures at preview and at confirm. A credit
+        (a downgrade) is a negative ``total`` with nothing due; what recurs is
+        the new plan's monthly price from the window's end, or nothing on a
+        free plan. No money moves locally.
+        """
+        # Local import: `services.billing` imports this package at load time.
+        from app.services.billing.proration import compute_proration
+
+        total = compute_proration(
+            old_monthly=request.old_monthly_price,
+            new_monthly=request.new_monthly_price,
+            period_start=request.period_start,
+            period_end=request.period_end,
+            change_at=request.proration_date,
+        ).amount
+        return ProviderPlanChangePreview(
+            amount_due=max(total, Decimal("0.00")),
+            total=total,
+            currency=request.currency,
+            next_amount=request.new_monthly_price if request.to_paid else None,
+            next_date=request.period_end if request.to_paid else None,
         )
 
     async def cancel_subscription(self, external_subscription_id: str) -> ProviderSubscription:

@@ -71,6 +71,14 @@ from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.billing.entitlements import get_active_subscription
 from app.services.billing.period import current_period
 from app.services.billing.plan_catalog import clear_stale_canceled_subscription
+from app.services.billing.plan_preview import (
+    STALE_QUOTE,
+    PlanChangeQuote,
+    price_change,
+    pricing_window,
+    quote_is_current,
+    quote_matches,
+)
 from app.services.billing.proration import ProrationResult, compute_proration
 from app.services.billing.provider_sync import (
     ProviderChange,
@@ -170,8 +178,17 @@ async def change_plan(
     new_plan_code: str,
     actor_id,
     change_at: datetime | None = None,
+    quote: PlanChangeQuote | None = None,
 ) -> PlanChangeResult:
     """Move the org's live subscription to ``new_plan_code``, prorated.
+
+    ``quote`` is the preview the customer confirmed (`plan_preview`, decisions
+    §482). With a live provider it is REQUIRED: it must still be current and
+    the provider, asked again under the lease, must not want more than it
+    showed — else ``plan_change_preview_stale`` and nothing is charged. A
+    paid → paid change is then prorated as of the quote's ``proration_date``.
+    With ``mock`` (no money moves) a quote is checked the same way when one is
+    given; the API always gives one.
 
     Raises :class:`PlanChangeError` (the API maps to 4xx) when the org has no
     live subscription or the target plan code is unknown/inactive, and
@@ -232,6 +249,13 @@ async def change_plan(
     change_key = (
         f"{peek_subscription.id}-{int(updated_at.timestamp()) if updated_at else 0}-{new_plan.code}"
     )
+    if quote is not None:
+        # The confirmed preview is part of the change's identity at the
+        # provider: a retry of the same confirmation replays, while a fresh
+        # preview's confirmation (different `proration_date`, so different
+        # parameters) is a new request rather than an idempotency conflict.
+        change_key = f"{change_key}-{int(quote.proration_date.timestamp())}"
+    peek_old_price = peek_plan.monthly_price
 
     adapter = billing_adapter_for(org)
     live = is_live_provider(adapter)
@@ -244,6 +268,16 @@ async def change_plan(
         # setting): repointing the row would leave Stripe charging for a plan
         # the org has left. Nothing here can cancel it, so refuse.
         raise ProviderLegRefused("billing_not_configured")
+    if (live or quote is not None) and not quote_is_current(quote, now=now, live=live):
+        # Nothing is charged on a figure nobody saw (decisions §482): no
+        # quote, one past PREVIEW_TTL, or one from another calendar month.
+        raise ProviderLegRefused(STALE_QUOTE)
+    # Read before provisioning: its commit expires the loaded row.
+    window = (
+        pricing_window(peek_subscription, live=live, at=quote.proration_date)
+        if quote is not None
+        else None
+    )
 
     # Resolve-or-create the provider customer + the NEW plan's price so the live
     # adapter has what create/update needs. Fails closed (BillingNotConfigured)
@@ -257,6 +291,23 @@ async def change_plan(
             # One live change per org at a time: its provider calls happen
             # outside the row lock, so the lock alone cannot serialise them.
             lease = await claim_plan_change_lease(control_db, org, now=now)
+        if quote is not None and window is not None:
+            # Under the lease, so no other change of this org can move the
+            # figure between this check and the charge.
+            fresh = await price_change(
+                adapter,
+                live=live,
+                ids=ids,
+                external_subscription_id=peek_external_id,
+                old_monthly_price=peek_old_price,
+                new_plan=new_plan,
+                window=window,
+                at=quote.proration_date,
+                include_recurring=False,
+            )
+            if not quote_matches(quote, fresh):
+                raise ProviderLegRefused(STALE_QUOTE)
+        if live:
             if peek_external_id is not None and not plan_is_paid(new_plan):
                 # Reserve before the cancel: detach the provider id from our row
                 # FIRST, so the cancel's own `customer.subscription.deleted`
@@ -275,6 +326,7 @@ async def change_plan(
                 ids=ids,
                 change_key=change_key,
                 now=now,
+                proration_date=quote.proration_date if quote is not None else None,
             )
 
         result = await _record_change(
@@ -287,6 +339,8 @@ async def change_plan(
             provider=adapter.provider_name,
             provider_change=provider_change,
             expected_plan_id=peek_plan_id if live else None,
+            priced_at=quote.proration_date if quote is not None else now,
+            quote=quote,
         )
     except BaseException:
         await control_db.rollback()
@@ -330,6 +384,8 @@ async def _record_change(
     new_plan: Plan,
     actor_id,
     now: datetime,
+    priced_at: datetime,
+    quote: PlanChangeQuote | None,
     provider: str,
     provider_change: ProviderChange | None,
     expected_plan_id,
@@ -391,7 +447,10 @@ async def _record_change(
         new_monthly=new_plan.monthly_price,
         period_start=start,
         period_end=end,
-        change_at=now,
+        # At the confirmed preview's instant. Still our day-granular estimate:
+        # what the customer confirmed (the provider's figure) is recorded
+        # beside it below (decisions §482).
+        change_at=priced_at,
     )
 
     previous_status = subscription.status
@@ -434,6 +493,12 @@ async def _record_change(
         "period_days": proration.period_days,
         "provider": provider,
     }
+    if quote is not None:
+        # What the customer saw and confirmed — the provider's own figure, the
+        # ceiling the charge was held to (decisions §482) — as exact strings.
+        details["confirmed_amount_due"] = str(quote.amount_due)
+        details["confirmed_currency"] = quote.currency
+        details["quote_proration_date"] = quote.proration_date.isoformat()
     if provider_change is not None:
         # With a live provider the figure above is our day-granular estimate;
         # the provider's invoice (second-granular) is the charge of record.

@@ -226,6 +226,7 @@ async def apply_plan_at_provider(
     ids: ProvisionedIds,
     change_key: str,
     now: datetime,
+    proration_date: datetime | None = None,
 ) -> ProviderChange:
     """Make the live provider's subscription match ``new_plan``.
 
@@ -234,6 +235,9 @@ async def apply_plan_at_provider(
     of the same change with the same card reuses the same ``Idempotency-Key``s,
     while a later change of the row, or a retry with a new card after a
     decline, does not.
+    ``proration_date`` is the instant the customer's confirmed preview was
+    priced at (`plan_preview`); an amended subscription is prorated as of it,
+    so the invoice equals the preview.
     Raises :class:`ProviderLegRefused` (``payment_method_required``) and lets
     the adapter's `BillingPaymentDeclined` / `BillingProviderError` propagate.
     """
@@ -306,6 +310,7 @@ async def apply_plan_at_provider(
         overage_price_id=ids.overage_price_id,
         plan_code=new_plan.code,
         idempotency_key=f"feohledger-sub-update-{change_key}",
+        proration_date=proration_date,
     )
     return ProviderChange(
         action=action,
