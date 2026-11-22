@@ -127,6 +127,7 @@ class FakeStripe:
             "customer": sub["customer"],
             "metadata": sub["metadata"],
             "items": {"data": items},
+            "cancel_at_period_end": sub.get("cancel_at_period_end", False),
         }
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -236,9 +237,17 @@ class FakeStripe:
                     return httpx.Response(400, json={"error": {}})
                 sub["status"] = "canceled"
                 return httpx.Response(200, json=self._sub_json(sub))
+            form = self.form(request)
+            if sub["status"] == "canceled":
+                # Stripe: a canceled subscription can't be updated (bar metadata).
+                return httpx.Response(400, json={"error": {"type": "invalid_request_error"}})
+            if "cancel_at_period_end" in form:
+                sub["cancel_at_period_end"] = form["cancel_at_period_end"] == "true"
+            if not any(k.startswith("items[") for k in form):
+                # Only the scheduled end moved: nothing to charge.
+                return httpx.Response(200, json=self._sub_json(sub))
             if self.decline:
                 return httpx.Response(402, json={"error": {"type": "card_error"}})
-            form = self.form(request)
             by_id = {i["id"]: i for i in sub["items"]}
             for n in range(4):
                 item_id = form.get(f"items[{n}][id]")
@@ -548,12 +557,15 @@ async def test_preview_of_an_amendment_prices_the_swap_as_of_its_proration_date(
         **swap,
         "subscription_details[proration_behavior]": "always_invoice",
         "subscription_details[proration_date]": str(int(CHANGE_AT.timestamp())),
+        # A paid target keeps renewing: priced as the amend sends it (§483).
+        "subscription_details[cancel_at_period_end]": "false",
     }
     assert FakeStripe.form(recurring) == {
         "subscription": "sub_live",
         **swap,
         "subscription_details[proration_behavior]": "none",
         "preview_mode": "recurring",
+        "subscription_details[cancel_at_period_end]": "false",
     }
     assert preview.amount_due == Decimal("75.00")
     assert preview.next_amount == Decimal("49.00")
@@ -836,14 +848,14 @@ async def _post_change(c, code: str):
     )
 
 
-async def _audit_details(realdb, sub_id) -> list[dict]:
+async def _audit_details(realdb, sub_id, *, action="billing.plan_changed") -> list[dict]:
     async with realdb.sessionmaker("a")() as s:
         rows = (
             (
                 await s.execute(
-                    select(AuditLog.details).where(
-                        AuditLog.action == "billing.plan_changed", AuditLog.entity_id == sub_id
-                    )
+                    select(AuditLog.details)
+                    .where(AuditLog.action == action, AuditLog.entity_id == sub_id)
+                    .order_by(AuditLog.created_at)
                 )
             )
             .scalars()
@@ -920,12 +932,12 @@ async def test_free_to_paid_creates_the_stripe_subscription(
 
 
 @pytest.mark.asyncio
-async def test_paid_to_paid_updates_items_and_paid_to_free_cancels(
+async def test_paid_to_paid_updates_items_and_paid_to_free_schedules_the_end(
     realdb, fake_stripe, org_a, _audit_engine_on_loop
 ):
-    await _plan(realdb, "free", "0.00", overage=False)
+    free = await _plan(realdb, "free", "0.00", overage=False)
     growth = await _plan(realdb, "growth", "49.00")
-    await _plan(realdb, "scale", "199.00")
+    scale = await _plan(realdb, "scale", "199.00")
     sub_id = await _sub(realdb, org_a, growth)
     await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
     fake_stripe.add_card("cus_org")
@@ -952,18 +964,40 @@ async def test_paid_to_paid_updates_items_and_paid_to_free_cancels(
     assert FakeStripe.form(update)["items[0][id]"] == "si_b"
     # Prorated as of the instant the confirmed preview was priced at.
     assert FakeStripe.form(update)["proration_date"] == str(int(CHANGE_AT.timestamp()))
+    # Every paid amend says "keep renewing" — a no-op when nothing is set to
+    # end, and the fix when Stripe is set to end it and our row does not know.
+    assert FakeStripe.form(update)["cancel_at_period_end"] == "false"
     assert (await _row(realdb, sub_id)).external_subscription_id == "sub_live"
 
+    # Paid → free keeps the paid period (decisions §483): the end is scheduled
+    # at Stripe, nothing is canceled, prorated or credited now.
     down = await _change(realdb, org_a, "free", at=CHANGE_AT + timedelta(days=1))
     assert down.changed is True
-    assert fake_stripe.subscriptions["sub_live"]["status"] == "canceled"
+    assert down.scheduled is True
+    assert down.effective_at == datetime(2026, 7, 1, tzinfo=UTC)
+    assert down.proration.amount == Decimal("0.00")
+    assert fake_stripe.calls("DELETE", "/v1/subscriptions/sub_live") == []
+    schedule = fake_stripe.calls("POST", "/v1/subscriptions/sub_live")[1]
+    assert FakeStripe.form(schedule) == {
+        "cancel_at_period_end": "true",
+        "proration_behavior": "none",
+    }
+    assert schedule.headers["Idempotency-Key"].startswith("feohledger-sub-schedule-free-")
+    assert fake_stripe.subscriptions["sub_live"]["status"] == "active"
     row = await _row(realdb, sub_id)
-    # The canceled subscription's id is dropped, so its `deleted` webhook can't
-    # cancel the org's now-free row.
-    assert row.external_subscription_id is None
-    assert row.status == "active"
+    # Still on the paid plan, entitled and billed by the same subscription.
+    assert row.plan_id == scale and row.status == "active"
+    assert row.external_subscription_id == "sub_live"
+    assert row.pending_plan_id == free
+    assert row.pending_plan_effective_at == datetime(2026, 7, 1, tzinfo=UTC)
     actions = [d["provider_action"] for d in await _audit_details(realdb, sub_id)]
-    assert sorted(actions) == ["canceled", "updated"]
+    assert actions == ["updated"]
+    (scheduled,) = await _audit_details(realdb, sub_id, action="billing.plan_change_scheduled")
+    assert scheduled["from_plan"] == f"{PREFIX}scale"
+    assert scheduled["to_plan"] == f"{PREFIX}free"
+    assert scheduled["effective_at"] == "2026-07-01T00:00:00+00:00"
+    assert scheduled["proration_amount"] == "0.00"
+    assert scheduled["provider_action"] == "cancel_at_period_end"
 
 
 @pytest.mark.asyncio
@@ -1080,13 +1114,15 @@ async def test_deployed_with_mock_refuses_a_paid_plan_but_not_the_way_down(
     # Nothing was provisioned for a change that was refused.
     assert "stripe_customer_id" not in await _org_billing(realdb, org_a)
 
-    # An org somehow already on a paid tier can always leave it.
+    # An org somehow already on a paid tier can always leave it — at the end
+    # of its period, like every move to Free (decisions §483).
     async with realdb.control_sessionmaker()() as s:
         row = (await s.execute(select(Subscription).where(Subscription.id == sub_id))).scalar_one()
         row.plan_id = growth
         await s.commit()
     result = await _change(realdb, org_a, "free")
-    assert result.changed is True
+    assert result.changed is True and result.scheduled is True
+    assert (await _row(realdb, sub_id)).pending_plan_id == free
 
 
 @pytest.mark.asyncio
@@ -1303,12 +1339,16 @@ async def test_a_failed_cancel_leaves_the_row_paid_and_detached_and_the_retry_he
     """The provider id is detached BEFORE the cancel (so the cancel's own
     `deleted` webhook can never land on the row). If the cancel then fails, the
     row stays on its paid plan — still what Stripe bills — and the retry finds
-    the subscription by customer."""
+    the subscription by customer.
+
+    The immediate cancel is now only for a move that cannot wait for the period
+    end (decisions §483) — here a ``past_due`` subscription, which has not paid
+    for the period it would be kept in."""
     free = await _plan(realdb, "free", "0.00", overage=False)
     growth = await _plan(realdb, "growth", "49.00")
-    sub_id = await _sub(realdb, org_a, growth, external_id="sub_keep")
+    sub_id = await _sub(realdb, org_a, growth, external_id="sub_keep", status="past_due")
     await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
-    _live_sub(fake_stripe, "sub_keep")
+    _live_sub(fake_stripe, "sub_keep", status="past_due")
 
     real_cancel = StripeBillingAdapter.cancel_subscription
 
@@ -1322,13 +1362,16 @@ async def test_a_failed_cancel_leaves_the_row_paid_and_detached_and_the_retry_he
         await _change(realdb, org_a, "free")
     row = await _row(realdb, sub_id)
     assert row.plan_id == growth and row.external_subscription_id is None
-    assert fake_stripe.subscriptions["sub_keep"]["status"] == "active"
+    assert fake_stripe.subscriptions["sub_keep"]["status"] == "past_due"  # not canceled
     assert LEASE_KEY not in await _org_billing(realdb, org_a)
 
     monkeypatch.setattr(StripeBillingAdapter, "cancel_subscription", real_cancel)
-    await _change(realdb, org_a, "free", at=CHANGE_AT + timedelta(minutes=1))
+    result = await _change(realdb, org_a, "free", at=CHANGE_AT + timedelta(minutes=1))
+    assert result.scheduled is False
     assert fake_stripe.subscriptions["sub_keep"]["status"] == "canceled"
-    assert (await _row(realdb, sub_id)).plan_id == free
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == free and row.status == "active"
+    assert row.pending_plan_id is None
 
 
 @pytest.mark.asyncio
@@ -1618,3 +1661,548 @@ async def test_a_confirmation_replays_and_a_fresh_quote_is_a_new_provider_reques
     assert again.changed is False
     assert len(fake_stripe.calls("POST", "/v1/subscriptions")) == len(creates)
     assert (await _row(realdb, sub_id)).external_subscription_id in fake_stripe.subscriptions
+
+
+# ---------------------------------------------------------------------------
+# A move to Free waits for the end of the paid period (decisions §483).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schedule_and_resume_send_only_the_scheduled_end_without_proration(fake_stripe):
+    _live_sub(fake_stripe, "sub_s")
+    adapter = _adapter(fake_stripe)
+
+    scheduled = await adapter.cancel_subscription_at_period_end("sub_s", idempotency_key="ks")
+    resumed = await adapter.resume_subscription("sub_s", idempotency_key="kr")
+
+    schedule, resume = fake_stripe.calls("POST", "/v1/subscriptions/sub_s")
+    # The exact forms: the scheduled end and an explicit "no proration" —
+    # nothing is credited or refunded, and no item changes.
+    assert FakeStripe.form(schedule) == {
+        "cancel_at_period_end": "true",
+        "proration_behavior": "none",
+    }
+    assert FakeStripe.form(resume) == {
+        "cancel_at_period_end": "false",
+        "proration_behavior": "none",
+    }
+    assert schedule.headers["Idempotency-Key"] == "ks"
+    assert resume.headers["Idempotency-Key"] == "kr"
+    assert schedule.headers["Stripe-Version"] == "2026-11-18.endive"
+    assert fake_stripe.calls("DELETE", "/v1/subscriptions/sub_s") == []
+    assert scheduled.cancel_at_period_end is True
+    assert scheduled.status == "active"
+    assert scheduled.current_period_end == datetime(2026, 7, 1, tzinfo=UTC)
+    assert resumed.cancel_at_period_end is False
+
+
+@pytest.mark.asyncio
+async def test_a_paid_change_while_an_end_is_scheduled_also_clears_it(fake_stripe):
+    _live_sub(fake_stripe, "sub_r")
+    fake_stripe.subscriptions["sub_r"]["cancel_at_period_end"] = True
+    adapter = _adapter(fake_stripe)
+
+    await adapter.preview_plan_change(_preview_request(external_subscription_id="sub_r"))
+    first, recurring = fake_stripe.calls("POST", "/v1/invoices/create_preview")
+    assert FakeStripe.form(first)["subscription_details[cancel_at_period_end]"] == "false"
+    assert FakeStripe.form(recurring)["subscription_details[cancel_at_period_end]"] == "false"
+
+    await adapter.change_subscription_plan(
+        "sub_r",
+        price_id="price_scale",
+        overage_price_id=None,
+        plan_code="scale",
+        idempotency_key="k",
+    )
+    (update,) = fake_stripe.calls("POST", "/v1/subscriptions/sub_r")
+    assert FakeStripe.form(update)["cancel_at_period_end"] == "false"
+    assert fake_stripe.subscriptions["sub_r"]["cancel_at_period_end"] is False
+
+
+async def _growth_billed_by_stripe(realdb, fake_stripe, org_id, sid="sub_live", *, month=None):
+    """A Growth row billed by a live Stripe subscription — in June 2026 (the
+    service tests' clock, `CHANGE_AT`), or in ``month`` for a test that goes
+    through the HTTP routes, which run on the real clock."""
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    growth = await _plan(realdb, "growth", "49.00")
+    await _plan(realdb, "scale", "199.00")
+    sub_id = await _sub(realdb, org_id, growth, external_id=sid)
+    await _set_billing(realdb, org_id, stripe_customer_id="cus_org")
+    fake_stripe.add_card("cus_org")
+    _live_sub(fake_stripe, sid)
+    if month is not None:
+        start, end = month
+        fake_stripe.subscriptions[sid]["period"] = (int(start.timestamp()), int(end.timestamp()))
+        async with realdb.control_sessionmaker()() as s:
+            row = (
+                await s.execute(select(Subscription).where(Subscription.id == sub_id))
+            ).scalar_one()
+            row.current_period_start, row.current_period_end = start, end
+            await s.commit()
+    return free, growth, sub_id
+
+
+def _this_month() -> tuple[datetime, datetime]:
+    """The real UTC calendar month — the window an HTTP-route test's live
+    subscription is in, since the routes read the real clock."""
+    from app.services.billing.provider_sync import calendar_month
+
+    return calendar_month(datetime.now(UTC))
+
+
+@pytest.mark.asyncio
+async def test_the_preview_of_a_move_to_free_keeps_the_plan_until_the_period_ends(
+    realdb, fake_stripe, org_a
+):
+    month = _this_month()
+    await _growth_billed_by_stripe(realdb, fake_stripe, org_a, month=month)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post("/api/billing/change-plan/preview", json={"plan_code": f"{PREFIX}free"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Nothing charged, nothing credited, nothing recurring — and the date the
+    # move takes effect, from the subscription's own period end.
+    assert body["amount_due"] == "0.00"
+    assert body["credit"] == "0.00"
+    assert body["next_amount"] is None and body["next_date"] is None
+    assert body["effective_at"] == month[1].isoformat().replace("+00:00", "Z")
+    assert body["clears_scheduled_change"] is False
+    assert body["currency"] == "USD"
+    # No cancel was priced: there is no credit to ask Stripe about.
+    assert fake_stripe.calls("POST", "/v1/invoices/create_preview") == []
+
+
+@pytest.mark.asyncio
+async def test_the_end_of_period_webhook_moves_the_org_to_free_once(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    await _change(realdb, org_a, "free")
+
+    # Mid-period nothing moves: the subscription is live and paid for.
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == growth and row.pending_plan_id == free
+
+    deleted = BillingWebhookEvent(
+        event_id="evt_period_end",
+        event_type="customer.subscription.deleted",
+        external_subscription_id="sub_live",
+        status="canceled",
+    )
+    result = await _apply(realdb, deleted)
+    assert result.applied is True and result.reason == "scheduled_plan_applied"
+    row = await _row(realdb, sub_id)
+    # The shape the immediate cancel always left: Free, live, no provider id.
+    assert row.plan_id == free and row.status == "active"
+    assert row.external_subscription_id is None
+    assert row.pending_plan_id is None and row.pending_plan_effective_at is None
+    assert row.current_period_start == datetime(2026, 7, 1, tzinfo=UTC)
+    assert row.current_period_end == datetime(2026, 8, 1, tzinfo=UTC)
+    (applied,) = await _audit_details(realdb, sub_id)
+    assert applied["scheduled"] is True
+    assert applied["from_plan"] == f"{PREFIX}growth" and applied["to_plan"] == f"{PREFIX}free"
+    assert applied["event_id"] == "evt_period_end"
+    assert applied["provider_action"] == "ended_at_period_end"
+    assert applied["ended_external_subscription_id"] == "sub_live"
+
+    # A redelivery finds no row by that provider id: nothing happens twice.
+    again = await _apply(realdb, deleted)
+    assert again.applied is False and again.reason == "unknown_subscription"
+    assert len(await _audit_details(realdb, sub_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_retried_move_to_free_is_a_no_op(realdb, fake_stripe, org_a, _audit_engine_on_loop):
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    await _change(realdb, org_a, "free")
+    again = await _change(realdb, org_a, "free", at=CHANGE_AT + timedelta(minutes=2))
+    assert again.changed is False and again.reason == "already_scheduled"
+    assert again.effective_at == datetime(2026, 7, 1, tzinfo=UTC)
+    assert len(fake_stripe.calls("POST", "/v1/subscriptions/sub_live")) == 1
+    assert len(await _audit_details(realdb, sub_id, action="billing.plan_change_scheduled")) == 1
+
+
+@pytest.mark.asyncio
+async def test_keep_clears_the_scheduled_end_at_stripe_and_on_the_row(
+    realdb, fake_stripe, org_a, monkeypatch, _audit_engine_on_loop
+):
+    month = _this_month()
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a, month=month)
+    async with realdb.client(key="a", role="admin") as c:
+        scheduled = await _post_change(c, f"{PREFIX}free")
+    assert scheduled.status_code == 200, scheduled.text
+    assert scheduled.json()["scheduled"] is True
+    assert scheduled.json()["effective_at"] == month[1].isoformat().replace("+00:00", "Z")
+    assert fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] is True
+
+    # Keep is admin / cfo only, like every plan change.
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        clerk = await c.post("/api/billing/scheduled-change/cancel")
+    assert clerk.status_code == 403
+    async with realdb.client(key="a", role="ap_manager") as c:
+        manager = await c.post("/api/billing/scheduled-change/cancel")
+    assert manager.status_code == 403
+
+    async with realdb.client(key="a", role="cfo") as c:
+        resp = await c.post("/api/billing/scheduled-change/cancel")
+        summary = await c.get("/api/billing/subscription")
+        again = await c.post("/api/billing/scheduled-change/cancel")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"cleared": True, "plan_code": f"{PREFIX}growth"}
+    # Schedule, then resume — the idempotent second Keep made no call.
+    schedule, resume = fake_stripe.calls("POST", "/v1/subscriptions/sub_live")
+    assert FakeStripe.form(schedule)["cancel_at_period_end"] == "true"
+    assert FakeStripe.form(resume) == {
+        "cancel_at_period_end": "false",
+        "proration_behavior": "none",
+    }
+    assert fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] is False
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == growth and row.pending_plan_id is None
+    assert row.pending_plan_effective_at is None and row.external_subscription_id == "sub_live"
+    assert summary.json()["subscription"]["scheduled_change"] is None
+    # Idempotent: nothing pending is a clean no-op, no second provider call.
+    assert again.status_code == 200 and again.json()["cleared"] is False
+    (kept,) = await _audit_details(realdb, sub_id, action="billing.scheduled_change_canceled")
+    assert kept["canceled_to_plan"] == f"{PREFIX}free"
+    assert kept["provider_action"] == "resumed"
+    assert kept["reason"] == "kept_by_customer"
+    assert LEASE_KEY not in await _org_billing(realdb, org_a)
+
+
+@pytest.mark.asyncio
+async def test_the_summary_shows_the_pending_move_and_keep_refuses_once_it_is_due(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    from app.services.billing.scheduled_downgrade import keep_current_plan
+
+    month = _this_month()
+    await _growth_billed_by_stripe(realdb, fake_stripe, org_a, month=month)
+    async with realdb.client(key="a", role="admin") as c:
+        await _post_change(c, f"{PREFIX}free")
+        summary = (await c.get("/api/billing/subscription")).json()
+    assert summary["plan"]["code"] == f"{PREFIX}growth"
+    assert summary["subscription"]["status"] == "active"
+    assert summary["subscription"]["scheduled_change"] == {
+        "plan_code": f"{PREFIX}free",
+        "plan_name": "Free",
+        "effective_at": month[1].isoformat().replace("+00:00", "Z"),
+    }
+
+    async with realdb.control_sessionmaker()() as s:
+        org = (await s.execute(select(Organization).where(Organization.id == org_a))).scalar_one()
+        with pytest.raises(ProviderLegRefused) as exc:
+            await keep_current_plan(s, org=org, actor_id=None, now=month[1] + timedelta(minutes=5))
+    assert exc.value.code == "scheduled_change_already_due"
+    assert fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] is True
+
+
+@pytest.mark.asyncio
+async def test_choosing_a_paid_plan_while_a_move_is_pending_takes_it_back(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    await _change(realdb, org_a, "free")
+
+    preview = await _preview(realdb, org_a, "scale", at=CHANGE_AT + timedelta(minutes=1))
+    assert preview.clears_scheduled_change is True and preview.effective_at is None
+    swap_preview = fake_stripe.calls("POST", "/v1/invoices/create_preview")[0]
+    assert FakeStripe.form(swap_preview)["subscription_details[cancel_at_period_end]"] == "false"
+
+    up = await _change(realdb, org_a, "scale", at=CHANGE_AT + timedelta(minutes=1))
+    assert up.changed is True and up.scheduled is False
+    update = fake_stripe.calls("POST", "/v1/subscriptions/sub_live")[-1]
+    form = FakeStripe.form(update)
+    # One request: the swap, prorated as before, and the scheduled end cleared.
+    assert form["cancel_at_period_end"] == "false"
+    assert form["proration_behavior"] == "always_invoice"
+    assert fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] is False
+    row = await _row(realdb, sub_id)
+    assert row.pending_plan_id is None and row.pending_plan_effective_at is None
+    details = (await _audit_details(realdb, sub_id))[-1]
+    assert details["cleared_pending_plan_id"] == str(free)
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_applies_a_move_whose_end_webhook_was_lost(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    from app.services.billing.dunning_sweep import run_dunning_once
+
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    await _change(realdb, org_a, "free")
+    after = datetime(2026, 7, 1, 2, 0, tzinfo=UTC)
+
+    # Before the date: untouched.
+    async with realdb.control_sessionmaker()() as s:
+        early = await run_dunning_once(s, now=datetime(2026, 6, 30, tzinfo=UTC))
+    assert early.downgrades_applied == 0
+    # Past the date but Stripe has not ended it yet (still set to end): wait.
+    async with realdb.control_sessionmaker()() as s:
+        waiting = await run_dunning_once(s, now=after)
+    assert waiting.downgrades_applied == 0 and waiting.downgrades_dropped == 0
+    assert (await _row(realdb, sub_id)).plan_id == growth
+
+    fake_stripe.subscriptions["sub_live"]["status"] = "canceled"  # ended; webhook lost
+    async with realdb.control_sessionmaker()() as s:
+        applied = await run_dunning_once(s, now=after)
+    assert applied.downgrades_applied == 1 and applied.downgrade_failures == 0
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == free and row.status == "active"
+    assert row.external_subscription_id is None and row.pending_plan_id is None
+    (details,) = await _audit_details(realdb, sub_id)
+    assert details["scheduled"] is True
+    assert details["reason"] == "provider_ended_webhook_missed"
+
+    # Idempotent: the next tick finds nothing due.
+    async with realdb.control_sessionmaker()() as s:
+        again = await run_dunning_once(s, now=after)
+    assert again.downgrades_applied == 0
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_drops_a_pending_move_the_provider_renewed(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    from app.services.billing.dunning_sweep import run_dunning_once
+
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    await _change(realdb, org_a, "free")
+    # Resumed in Stripe's dashboard (or a Keep whose write was lost): it renews.
+    fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] = False
+    async with realdb.control_sessionmaker()() as s:
+        result = await run_dunning_once(s, now=datetime(2026, 7, 1, 2, 0, tzinfo=UTC))
+    assert result.downgrades_dropped == 1 and result.downgrades_applied == 0
+    row = await _row(realdb, sub_id)
+    # Still billed for Growth, so still on Growth.
+    assert row.plan_id == growth and row.pending_plan_id is None
+    (dropped,) = await _audit_details(realdb, sub_id, action="billing.scheduled_change_canceled")
+    assert dropped["reason"] == "provider_renewed"
+
+
+@pytest.mark.asyncio
+async def test_with_mock_the_move_waits_and_the_sweep_makes_it(
+    realdb, org_a, monkeypatch, _audit_engine_on_loop
+):
+    """Local dev / CI: no provider, the row is the whole state; the sweep moves
+    the org once the period it keeps is over."""
+    from app.services.billing.dunning_sweep import run_dunning_once
+
+    monkeypatch.setattr(settings, "billing_provider", "mock")
+    monkeypatch.setattr(settings, "environment", "development")
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    growth = await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, growth)
+
+    preview = await _preview(realdb, org_a, "free")
+    assert preview.effective_at == datetime(2026, 7, 1, tzinfo=UTC)
+    assert preview.credit == Decimal("0.00") and preview.amount_due == Decimal("0.00")
+    result = await _change(realdb, org_a, "free")
+    assert result.scheduled is True and result.effective_at == datetime(2026, 7, 1, tzinfo=UTC)
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == growth and row.pending_plan_id == free
+    assert LEASE_KEY not in await _org_billing(realdb, org_a)  # no lease for mock
+
+    async with realdb.control_sessionmaker()() as s:
+        swept = await run_dunning_once(s, now=datetime(2026, 7, 1, 0, 1, tzinfo=UTC))
+    assert swept.downgrades_applied == 1
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == free and row.pending_plan_id is None and row.status == "active"
+    (details,) = await _audit_details(realdb, sub_id)
+    assert details["reason"] == "period_ended"
+
+
+@pytest.mark.asyncio
+async def test_a_past_due_subscription_still_moves_to_free_at_once(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    """It has not paid for the period it would be kept in (decisions §483)."""
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    growth = await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, growth, external_id="sub_pd", status="past_due")
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
+    _live_sub(fake_stripe, "sub_pd", status="past_due")
+
+    preview = await _preview(realdb, org_a, "free")
+    assert preview.effective_at is None
+    result = await _change(realdb, org_a, "free")
+    assert result.scheduled is False
+    assert fake_stripe.subscriptions["sub_pd"]["status"] == "canceled"
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == free and row.pending_plan_id is None
+
+
+@pytest.mark.asyncio
+async def test_keep_racing_the_end_of_period_webhook_is_refused_cleanly(
+    realdb, fake_stripe, org_a, monkeypatch, _audit_engine_on_loop
+):
+    """The webhook makes the move between Keep's peek and its locked write:
+    Keep answers ``scheduled_change_already_due`` (a coded 409), not a crash
+    reading rows its own rollback expired."""
+    from app.services.billing.scheduled_downgrade import keep_current_plan
+
+    month = _this_month()
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a, month=month)
+    async with realdb.client(key="a", role="admin") as c:
+        await _post_change(c, f"{PREFIX}free")
+
+    real_resume = StripeBillingAdapter.resume_subscription
+
+    async def resume_then_webhook(self, external_subscription_id, *, idempotency_key):
+        answer = await real_resume(self, external_subscription_id, idempotency_key=idempotency_key)
+        await _apply(
+            realdb,
+            BillingWebhookEvent(
+                event_id="evt_race",
+                event_type="customer.subscription.deleted",
+                external_subscription_id=external_subscription_id,
+                status="canceled",
+            ),
+        )
+        return answer
+
+    monkeypatch.setattr(StripeBillingAdapter, "resume_subscription", resume_then_webhook)
+    async with realdb.control_sessionmaker()() as s:
+        org = (await s.execute(select(Organization).where(Organization.id == org_a))).scalar_one()
+        with pytest.raises(ProviderLegRefused) as exc:
+            await keep_current_plan(s, org=org, actor_id=None)
+    assert exc.value.code == "scheduled_change_already_due"
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == free and row.pending_plan_id is None
+    assert await _audit_details(realdb, sub_id, action="billing.scheduled_change_canceled") == []
+    assert LEASE_KEY not in await _org_billing(realdb, org_a)
+
+
+@pytest.mark.asyncio
+async def test_a_paid_change_takes_back_an_end_stripe_has_and_our_row_lost(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    """A schedule reached Stripe but its record failed (or raced this change):
+    Stripe will end the subscription, our row shows nothing pending. The next
+    paid change must still tell Stripe to keep renewing, or the org — having
+    just paid for the upgrade — would be left on no subscription at the
+    period end."""
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] = True
+    assert (await _row(realdb, sub_id)).pending_plan_id is None
+
+    await _change(realdb, org_a, "scale")
+
+    (update,) = fake_stripe.calls("POST", "/v1/subscriptions/sub_live")
+    assert FakeStripe.form(update)["cancel_at_period_end"] == "false"
+    assert fake_stripe.subscriptions["sub_live"]["cancel_at_period_end"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_schedule_whose_row_moved_before_the_lease_tells_stripe_nothing(
+    realdb, fake_stripe, org_a, monkeypatch, _audit_engine_on_loop
+):
+    """Another change commits between the schedule's peek and its lease: the
+    re-read under the lease refuses before any Stripe call, so Stripe is never
+    told to end a subscription our row says continues."""
+    import app.services.billing.scheduled_downgrade as sd
+
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    async with realdb.control_sessionmaker()() as s:
+        scale_id = (
+            await s.execute(select(Plan.id).where(Plan.code == f"{PREFIX}scale"))
+        ).scalar_one()
+    real_claim = sd.claim_plan_change_lease
+
+    async def claim_after_a_racer(control_db, org, *, now):
+        async with realdb.control_sessionmaker()() as s:
+            row = (
+                await s.execute(select(Subscription).where(Subscription.id == sub_id))
+            ).scalar_one()
+            row.plan_id = scale_id  # the racing upgrade committed first
+            await s.commit()
+        return await real_claim(control_db, org, now=now)
+
+    monkeypatch.setattr(sd, "claim_plan_change_lease", claim_after_a_racer)
+    with pytest.raises(ProviderLegRefused) as exc:
+        await _change(realdb, org_a, "free")
+    assert exc.value.code == "plan_change_in_progress"
+    assert fake_stripe.calls("POST", "/v1/subscriptions/sub_live") == []
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == scale_id and row.pending_plan_id is None
+    assert LEASE_KEY not in await _org_billing(realdb, org_a)
+
+
+@pytest.mark.asyncio
+async def test_a_double_submitted_schedule_is_recorded_once(
+    realdb, fake_stripe, org_a, monkeypatch, _audit_engine_on_loop
+):
+    """The second of two submits peeked before the first recorded the move:
+    under the lease it finds the move already scheduled and answers the no-op —
+    no second Stripe call, no second audit row."""
+    import app.services.billing.scheduled_downgrade as sd
+
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a)
+    first = await _change(realdb, org_a, "free")
+    # Replay the second submit's stale peek: clear the pending state on the
+    # session it peeks with, then let the lease re-read find the real row.
+    async with realdb.control_sessionmaker()() as s:
+        row = (await s.execute(select(Subscription).where(Subscription.id == sub_id))).scalar_one()
+        org = (await s.execute(select(Organization).where(Organization.id == org_a))).scalar_one()
+        growth_plan = (await s.execute(select(Plan).where(Plan.id == growth))).scalar_one()
+        free_plan = (await s.execute(select(Plan).where(Plan.id == free))).scalar_one()
+        # What the stale peek saw — on a detached copy, so nothing flushes it.
+        s.expunge(row)
+        row.pending_plan_id = None
+        again = await sd.schedule_move_to_free(
+            s,
+            org=org,
+            adapter=sd.billing_adapter_for(org),
+            subscription=row,
+            current_plan=growth_plan,
+            new_plan=free_plan,
+            actor_id=None,
+            now=CHANGE_AT,
+            quote_proration_date=None,
+        )
+    assert first.scheduled is True
+    assert again.changed is False and again.reason == "already_scheduled"
+    assert again.effective_at == datetime(2026, 7, 1, tzinfo=UTC)
+    assert len(fake_stripe.calls("POST", "/v1/subscriptions/sub_live")) == 1
+    assert len(await _audit_details(realdb, sub_id, action="billing.plan_change_scheduled")) == 1
+
+
+@pytest.mark.asyncio
+async def test_keep_after_a_paid_change_took_the_move_back_is_a_no_op(
+    realdb, fake_stripe, org_a, monkeypatch, _audit_engine_on_loop
+):
+    """A paid change clears the pending move between Keep's peek and its
+    lease: Keep answers ``cleared: false`` — not "already taken effect", which
+    would be false — and asks Stripe nothing."""
+    import app.services.billing.scheduled_downgrade as sd
+
+    month = _this_month()
+    free, growth, sub_id = await _growth_billed_by_stripe(realdb, fake_stripe, org_a, month=month)
+    async with realdb.client(key="a", role="admin") as c:
+        await _post_change(c, f"{PREFIX}free")
+    async with realdb.control_sessionmaker()() as s:
+        scale_id = (
+            await s.execute(select(Plan.id).where(Plan.code == f"{PREFIX}scale"))
+        ).scalar_one()
+    real_claim = sd.claim_plan_change_lease
+
+    async def claim_after_a_paid_change(control_db, org, *, now):
+        async with realdb.control_sessionmaker()() as s:
+            row = (
+                await s.execute(select(Subscription).where(Subscription.id == sub_id))
+            ).scalar_one()
+            row.plan_id = scale_id
+            row.pending_plan_id = None
+            row.pending_plan_effective_at = None
+            await s.commit()
+        return await real_claim(control_db, org, now=now)
+
+    monkeypatch.setattr(sd, "claim_plan_change_lease", claim_after_a_paid_change)
+    calls_before = len(fake_stripe.calls("POST", "/v1/subscriptions/sub_live"))
+    async with realdb.control_sessionmaker()() as s:
+        org = (await s.execute(select(Organization).where(Organization.id == org_a))).scalar_one()
+        result = await sd.keep_current_plan(s, org=org, actor_id=None)
+    assert result.cleared is False and result.plan_code == f"{PREFIX}scale"
+    assert len(fake_stripe.calls("POST", "/v1/subscriptions/sub_live")) == calls_before
+    assert LEASE_KEY not in await _org_billing(realdb, org_a)

@@ -93,6 +93,12 @@ from app.services.billing.provider_sync import (
     release_plan_change_lease,
 )
 from app.services.billing.provisioning import billing_adapter_for, provision_org_billing
+from app.services.billing.scheduled_downgrade import (
+    clear_pending,
+    schedule_move_to_free,
+    waits_for_period_end,
+)
+from app.services.billing_adapters.base import ProviderPlanChangePreview
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +175,10 @@ class PlanChangeResult:
     new_plan_code: str
     proration: ProrationResult
     reason: str | None = None
+    #: The move waits for the end of the paid period (paid → free, decisions
+    #: §483): the org stays on ``old_plan_code`` until ``effective_at``.
+    scheduled: bool = False
+    effective_at: datetime | None = None
 
 
 async def change_plan(
@@ -241,6 +251,18 @@ async def change_plan(
             proration=_zero_proration(peek_plan.monthly_price, new_plan.monthly_price),
             reason="already_on_plan",
         )
+    if peek_subscription.pending_plan_id == new_plan.id:
+        # This exact move is already scheduled: a retry, so no provider call,
+        # no second audit row (decisions §483).
+        return PlanChangeResult(
+            changed=False,
+            old_plan_code=peek_plan.code,
+            new_plan_code=new_plan.code,
+            proration=_zero_proration(peek_plan.monthly_price, new_plan.monthly_price),
+            reason="already_scheduled",
+            scheduled=True,
+            effective_at=peek_subscription.pending_plan_effective_at,
+        )
     # Plain values: the provisioning commit below expires every loaded instance.
     peek_plan_id = peek_plan.id
     peek_subscription_id = peek_subscription.id
@@ -272,6 +294,26 @@ async def change_plan(
         # Nothing is charged on a figure nobody saw (decisions §482): no
         # quote, one past PREVIEW_TTL, or one from another calendar month.
         raise ProviderLegRefused(STALE_QUOTE)
+    if waits_for_period_end(peek_subscription, peek_plan, new_plan, live=live):
+        # Paid → free keeps the paid period (decisions §483): nothing is
+        # charged or credited, so there is nothing to re-price — only the
+        # quote's currency and "nothing due" to hold it to.
+        nothing_due = ProviderPlanChangePreview(
+            amount_due=Decimal("0.00"), total=Decimal("0.00"), currency=peek_plan.currency
+        )
+        if quote is not None and not quote_matches(quote, nothing_due):
+            raise ProviderLegRefused(STALE_QUOTE)
+        return await schedule_move_to_free(
+            control_db,
+            org=org,
+            adapter=adapter,
+            subscription=peek_subscription,
+            current_plan=peek_plan,
+            new_plan=new_plan,
+            actor_id=actor_id,
+            now=now,
+            quote_proration_date=quote.proration_date if quote is not None else None,
+        )
     # Read before provisioning: its commit expires the loaded row.
     window = (
         pricing_window(peek_subscription, live=live, at=quote.proration_date)
@@ -477,6 +519,11 @@ async def _record_change(
 
     previous_plan_code = current_plan.code
     subscription.plan_id = new_plan.id
+    cleared_pending = subscription.pending_plan_id
+    if cleared_pending is not None:
+        # The org chose a plan while a move to Free was pending: that move is
+        # off (the provider was told in the same call — decisions §483).
+        clear_pending(subscription)
 
     # Append-only audit (SOX): plan change is a regulated control-plane mutation.
     # PII-free — org, old/new plan code, proration as an exact decimal STRING,
@@ -505,6 +552,8 @@ async def _record_change(
         details["proration_is_estimate"] = True
         details["provider_action"] = provider_change.action
         details["external_subscription_id"] = provider_change.external_subscription_id
+    if cleared_pending is not None:
+        details["cleared_pending_plan_id"] = str(cleared_pending)
     if subscription.status != previous_status:
         # The provider's answer moved the lifecycle status too (a past_due row
         # back to active, say): a status change on a regulated record is on

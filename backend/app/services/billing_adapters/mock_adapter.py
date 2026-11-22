@@ -125,6 +125,25 @@ class MockBillingAdapter(BillingAdapter):
             external_subscription_id=external_subscription_id, status="canceled", plan_code=""
         )
 
+    async def cancel_subscription_at_period_end(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        # Locally the scheduled move lives on our row alone
+        # (`scheduled_downgrade`): the sweep applies it at the period end.
+        return ProviderSubscription(
+            external_subscription_id=external_subscription_id,
+            status="active",
+            plan_code="",
+            cancel_at_period_end=True,
+        )
+
+    async def resume_subscription(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        return ProviderSubscription(
+            external_subscription_id=external_subscription_id, status="active", plan_code=""
+        )
+
     async def ensure_default_payment_method(self, customer_id: str | None) -> str | None:
         # The mock's one synthetic card (see `list_payment_methods`) is the default.
         return f"mock_pm_{customer_id}" if customer_id else None

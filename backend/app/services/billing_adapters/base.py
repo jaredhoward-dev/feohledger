@@ -29,6 +29,10 @@ class ProviderSubscription:
     #: (`services/billing/period.py`), so the caller persists these.
     current_period_start: datetime | None = None
     current_period_end: datetime | None = None
+    #: The provider will end the subscription at ``current_period_end``
+    #: (Stripe's ``cancel_at_period_end``) — a move to Free scheduled for the
+    #: end of the paid period (decisions §483).
+    cancel_at_period_end: bool = False
 
 
 @dataclass(frozen=True)
@@ -299,7 +303,9 @@ class BillingAdapter:
         """Swap the subscription's base price (and metered overage price) for a
         new plan's, prorated and invoiced at once — prorated as of
         ``proration_date`` when given (the instant the customer's preview was
-        priced at, so the charge equals what they confirmed). Raises
+        priced at, so the charge equals what they confirmed). A move onto a paid
+        plan always means "keep renewing", so the same request clears any
+        scheduled end-of-period cancel (decisions §483). Raises
         :class:`BillingPaymentDeclined` when the charge fails — the change is
         then NOT applied at the provider."""
         raise NotImplementedError
@@ -320,6 +326,22 @@ class BillingAdapter:
         """Cancel immediately, crediting unused time and invoicing un-invoiced
         metered usage now (decisions §480). Idempotent: an already-canceled
         subscription is returned as canceled."""
+        raise NotImplementedError
+
+    async def cancel_subscription_at_period_end(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Schedule the subscription to end when its current period ends
+        (decisions §483): nothing is prorated, credited or refunded now, the
+        customer keeps what they paid for until then, and the period's metered
+        usage is billed on the final invoice when it ends. Idempotent."""
+        raise NotImplementedError
+
+    async def resume_subscription(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Clear a scheduled end-of-period cancel: the subscription renews as
+        before. Nothing is charged now. Idempotent."""
         raise NotImplementedError
 
     async def ensure_default_payment_method(self, customer_id: str | None) -> str | None:

@@ -21,13 +21,14 @@ accounts-payable money path the app manages for customers.
 > **and the frontend invoices/receipts + payment-method UI** (the saved-cards
 > list + the add/replace-card SetupIntent flow, with a clearly-marked
 > Stripe Elements card form), **and the plan catalog endpoint (`GET
-> /api/billing/plans`) + the live plan-change UI** (a `Modal` picker → an
-> "applies immediately" notice → `POST /api/billing/change-plan` on confirm →
-> the real returned proration, or a clean no-op message), **and the live
+> /api/billing/plans`) + the live plan-change UI** (a `Modal` picker → the
+> provider's price for the change → `POST /api/billing/change-plan` on confirm
+> → a result view, or a clean no-op message; § Customer-facing UI), **and the live
 > Stripe subscription behind a plan change** (decisions §480): a move onto a
 > paid plan needs a saved card and creates the customer's Stripe subscription
 > (base + metered overage price, anchored on the 1st UTC), paid → paid amends
-> it, paid → free cancels it; the webhook keeps our row's status and window in
+> it, paid → free ends it at the end of the paid period (decisions §483; a
+`past_due` one is canceled at once); the webhook keeps our row's status and window in
 > sync; real Stripe Elements card entry; and a deployed environment without a
 > live provider refuses paid plans, **and the confirmed price** (decisions
 > §482): `POST /api/billing/change-plan/preview` prices a change with the
@@ -677,6 +678,11 @@ accepted.
   the next `customer.subscription.updated` corrects a reordered one.);
 - **idempotent**: if the target status already equals the current status it's a
   no-op and writes **no** audit row (mirrors `transition_invoice`'s no-op rule);
+- **a scheduled move to Free** (decisions §483): an event moving a row with a
+  pending plan to `canceled` (`customer.subscription.deleted` at the period
+  end) applies the move instead — the row goes onto the free plan, `active`,
+  with no provider id, and a `billing.plan_changed` row (`scheduled: true`).
+  The redelivery finds no row by that id;
 - otherwise sets the new status, commits, and writes an **append-only**
   `billing.subscription_<status>` audit row via the shared `dispatch_auth_audit`
   (PII-free: org + from/to status + event id/type; `actor_id=None` — provider-
@@ -704,6 +710,21 @@ adapter, the sweep asks the provider first (outside the row lock): canceled
 there → the row is canceled now, whatever the grace window (the backstop for a
 lost `customer.subscription.deleted`); anything else → the row is left alone
 for Stripe's own retries and "cancel after retries fail" setting to decide.
+
+**Scheduled moves to Free** (decisions §483) are the same tick's second job:
+a live row whose `pending_plan_effective_at` has passed is moved onto its
+pending plan (`billing.plan_changed`, `scheduled: true`) when the provider says
+the subscription is canceled (`reason: provider_ended_webhook_missed`), or at
+once when no live provider bills it (`mock`, `reason: period_ended`). A
+provider subscription still set to end is left for the provider; one that is
+live and no longer set to end (renewed from the dashboard, or a Keep whose
+write was lost) drops the stale pending state
+(`billing.scheduled_change_canceled`, `reason: provider_renewed`) — the org is
+billed for its paid plan, so it stays on it. A row carrying a provider id whose
+org no longer resolves to a live provider is left alone (ending only our row
+could leave Stripe billing). Counted as `downgrades_applied` /
+`downgrades_dropped` / `downgrade_failures` (the last feeds the health
+registry). A `past_due` row the sweep cancels has its pending move cleared.
 
 **Money-path boundary:** the sweep ONLY changes a `Subscription` status — it
 never charges, refunds, or creates any payment-side row. (A canceled subscription
@@ -894,14 +915,18 @@ provisioning and before the locked write, outside the row lock:
 |---|---|---|
 | onto a paid plan, no provider subscription | require a default card (`ensure_default_payment_method`), else refuse `payment_method_required`; adopt a live subscription a dead attempt left (`find_live_subscription`), else **create** one: base + metered overage price, `billing_cycle_anchor` = 1st of next month 00:00 UTC, `error_if_incomplete`, no trial | `external_subscription_id` set, status + window from Stripe |
 | paid → paid | require a default card; **amend** the items, `always_invoice` + `error_if_incomplete` | status + window from Stripe |
-| paid → free | **cancel now**, `invoice_now` + `prorate` | `external_subscription_id` cleared, status `active` |
+| paid → free (`active` / `trialing`) | **not here** — scheduled for the period end, `cancel_at_period_end=true` (§ A move to Free waits for the end of the paid period) | still on the paid plan, `pending_plan_id` + `pending_plan_effective_at` set |
+| paid → free (`past_due`, or a row that lost its provider id) | **cancel now**, `invoice_now` + `prorate` | `external_subscription_id` cleared, status `active` |
 | free → free | nothing | — |
 
 - **"Paid"** is `monthly_price > 0` or a plan that bills AI-read overage
   (`provider_sync.plan_is_paid`).
-- **Downgrade timing: immediate.** A plan change has always applied at once
-  and prorated (the picker says so), and entitlements drop at once on our side;
-  canceling at period end would keep charging for features already gone.
+- **Downgrade timing.** Paid → paid applies at once and prorates (the picker
+  says so; the credit or charge lands on the next invoice the org pays). A move
+  to Free from an `active` or `trialing` subscription waits for the end of the
+  paid period (decisions §483, next section). What still cancels **now** is the
+  move that cannot wait — a `past_due` subscription, which has not paid for the
+  period it would keep, or a row whose provider id was lost. For it,
   `prorate=true` credits the unused part of the period to the customer's Stripe
   **balance** (applied to a future invoice — a cash refund is an operator action
   in the dashboard), and `invoice_now=true` bills the period's metered overage
@@ -962,6 +987,83 @@ provisioning and before the locked write, outside the row lock:
   (`created` / `adopted` / `updated` / `canceled` / `none`), the provider
   subscription id, `proration_is_estimate: true`, and `from_status` /
   `to_status` when the provider's answer moved the lifecycle status.
+
+### A move to Free waits for the end of the paid period (`services/billing/scheduled_downgrade.py`, decisions §483)
+
+Cancelling at once credited the unused part of the period to a Stripe balance a
+free workspace has no future invoice to spend (production test mode, 21 Nov:
+"$14.66 … will be credited"). Now paid → free on an `active` or `trialing`
+subscription (`waits_for_period_end` — one predicate for the preview and the
+change) is **scheduled**:
+
+- **At Stripe:** `POST /v1/subscriptions/{id}` with exactly
+  `cancel_at_period_end=true` and `proration_behavior=none`
+  (`cancel_subscription_at_period_end`), under the lease, with
+  `Idempotency-Key: feohledger-sub-schedule-free-<row id>-<row updated_at>-<plan>`.
+  No proration, no credit, no refund: the customer keeps the period they paid
+  for. **AI-read overage accrued this period is still billed** — Stripe's
+  usage-based billing guide: "for subscriptions that cancel at the end of the
+  period, the final invoice at the end of the period includes metered usage
+  from the last billing period". `cancel_at_period_end` is current in the
+  pinned `2026-11-18.endive` reference beside the newer `cancel_at` enum
+  (`max_period_end` / `min_period_end`); the boolean was kept because it is
+  what "end at the period end" means and is the documented undo
+  (`cancel_at_period_end=false`).
+- **On our row:** it stays `active` on the paid plan, entitlements intact;
+  `pending_plan_id` (the free plan) and `pending_plan_effective_at` (Stripe's
+  reported `current_period_end`; with `mock`, the row's own period end) are set
+  (migration 0140), with a `billing.plan_change_scheduled` audit row
+  (`from_plan`, `to_plan`, `effective_at`, `proration_amount: "0.00"`,
+  `provider_action: cancel_at_period_end`). A retry of the same move is a no-op
+  (`reason: already_scheduled`, no provider call, no second row).
+- **The move itself** (`apply_scheduled_downgrade`): Stripe ends the
+  subscription and sends `customer.subscription.deleted`; the webhook, finding
+  a pending plan on the row, repoints it onto the free plan, `active`, no
+  provider id, a fresh month from the effective date — the shape the immediate
+  cancel always left — with a `billing.plan_changed` row (`scheduled: true`,
+  `provider_action: ended_at_period_end`, the event id). A redelivery finds no
+  row with that provider id and does nothing. If the webhook is lost, the
+  dunning sweep applies it (§ Dunning).
+- **Undo — Keep.** `POST /api/billing/scheduled-change/cancel` (admin, cfo):
+  `cancel_at_period_end=false` at Stripe (same form, `proration_behavior=none`,
+  nothing charged), pending columns cleared, `billing.scheduled_change_canceled`
+  audit row (`reason: kept_by_customer`). Idempotent (`cleared: false` when
+  nothing is pending); 409 `scheduled_change_already_due` once
+  `pending_plan_effective_at` has passed.
+- **Another paid plan while a move is pending** clears it in the same request:
+  the preview prices the swap with `subscription_details[cancel_at_period_end]=false`
+  and says `clears_scheduled_change: true` (the review adds "This also cancels
+  your move to Free on …"); the confirm sends the swap with
+  `cancel_at_period_end=false`, prorated and invoiced as any paid → paid change;
+  the `billing.plan_changed` row carries `cleared_pending_plan_id`. The picker
+  does not offer the pending free plan again (its radio is disabled and marked
+  "Scheduled").
+- **Choosing the current plan while a move is pending** is the ordinary
+  `already_on_plan` no-op and leaves the move in place; Keep is the undo (the
+  picker disables the current plan, so only a direct API caller sees this).
+- **Preview** for a scheduled move answers without asking Stripe (there is no
+  credit to price): `amount_due` and `credit` `"0.00"`, `next_amount` /
+  `next_date` `null`, and `effective_at` — the review reads "You keep Growth
+  until 1 December 2026, then move to Free." The confirm checks the quote is
+  current and says nothing is due; the button stays "Confirm". The change
+  answers `scheduled: true` with `effective_at`.
+- **What this does not cover** (as with the immediate cancel before it): if
+  the final invoice's charge fails after the move is applied, its
+  `invoice.payment_failed` names a subscription no row holds and is dropped —
+  Stripe's own retries and dashboard collect it; and overage units reported
+  after Stripe has ended the subscription (a read in the last minutes of the
+  period reported late by the reconcile sweep) have no subscription to land on
+  and are not billed.
+- **Every paid amend sends `cancel_at_period_end=false`** (and every swap
+  preview `subscription_details[cancel_at_period_end]=false`), not only when our
+  row shows a pending move: a paid target always means "keep renewing", and our
+  row can be out of step with Stripe (a schedule racing the change, or one whose
+  record failed). The schedule and the Keep re-read the row under the lease
+  before calling Stripe and refuse `plan_change_in_progress` if it moved; a
+  double submit is the `already_scheduled` no-op.
+- **`mock`** (local, CI): nothing is told to a provider; the row is the whole
+  state, and the dunning sweep makes the move once the date passes (enable
+  `FEOH_BILLING_DUNNING_ENABLED` to see it happen locally).
 
 ### Paid plans need a live provider in a deployed environment
 
@@ -1035,8 +1137,11 @@ Nothing is charged for a plan change the customer has not seen priced.
 Endpoint `POST /api/billing/change-plan` (JWT + `require_roles(admin, cfo)` —
 matches the read endpoint) takes `{"plan_code": "...", "proration_date": <int>,
 "expected_amount_due": "...", "currency": "USD"}` (the confirmed preview) and returns
-`{changed, old_plan_code, new_plan_code, proration: {amount, unused_days, period_days}}`
-with `amount` an exact decimal string. Refusals (coded `{code, message,
+`{changed, old_plan_code, new_plan_code, proration: {amount, unused_days, period_days},
+scheduled, effective_at}` with `amount` an exact decimal string; `scheduled: true`
+means the org stays on `old_plan_code` until `effective_at` (a move to Free,
+decisions §483). The preview adds `effective_at` (null = on confirm) and
+`clears_scheduled_change`. Refusals (coded `{code, message,
 params}`, localized by the SPA): 404 unknown plan / no live subscription
 (uncoded, no enumeration); 409 `payment_method_required` (the dialog shows its
 card step, then a fresh review); 402 `billing_payment_declined` (Update card →
@@ -1169,7 +1274,8 @@ period:
            "currency": "USD", "entitlements": {"public_api": true}, "trial_days": 14},
   "subscription": {"status": "active", "current_period_start": "...",
                    "current_period_end": "...", "trial_end": null,
-                   "externally_managed": false},
+                   "externally_managed": false,
+                   "scheduled_change": null},
   "period": "2026-06",
   "usage": {"extractions": "12", "extractions_platform": "10", "ai_invoices": "9",
             "card_rebate_total.USD": "18.40", "card_rebate_total.EUR": "3.10"},
@@ -1188,6 +1294,11 @@ the plan pauses instead of billing, `overage_*` are clamped to the cap,
 count projection, exact money), and `paused` says whether the NEXT new read
 would be refused. It is present for an org with no subscription too (the Free
 allowance).
+
+`subscription.scheduled_change` is a pending move to a free plan —
+`{"plan_code": "free", "plan_name": "Free", "effective_at": "2026-12-01T00:00:00Z"}`
+— or `null` (decisions §483); `POST /api/billing/scheduled-change/cancel`
+undoes it (§ A move to Free waits for the end of the paid period).
 
 `plan`/`subscription` are `null` when the org has no live subscription. Money is
 an exact decimal **string** (this is a billing surface — exactness is the point).
@@ -1354,6 +1465,26 @@ dashboard and never sees the tab.
   `utils/pendingPlanChange.ts`) reopens the dialog at that plan's review on
   return — nothing is applied without the Confirm click. A "contact us" link
   stays alongside for anything outside the self-serve catalog.
+
+  **A move to Free** (decisions §483) reviews as "You keep Growth until
+  1 December 2026, then move to Free." with "Nothing is charged today." and no
+  credit line (the overage note, when the plan bills overage, says it lands on
+  the plan's last invoice); the result is titled "Change scheduled" ("You'll
+  move to the Free plan on 1 December 2026. You keep Growth until then."). The
+  plan card then shows a notice — "Moving to Free on 1 December 2026." / "You
+  keep Growth and everything in it until then." — with a **Keep Growth** button
+  (`keepCurrentBillingPlan` → `POST /scheduled-change/cancel`), which refreshes
+  the card and returns focus to Change plan. While a move is pending the picker
+  disables that plan, marked "Scheduled", and a review for another paid plan
+  adds "This also cancels your move to Free on …". Dates are UTC period
+  boundaries, rendered in UTC.
+- **The card-saved toast** says what is true (`types/billing.ts::cardSavedMessageKey`):
+  "Card saved. Your subscription is now charged to this card." only when a live
+  provider subscription bills the org (`externally_managed`); otherwise — a
+  Free workspace adding a card on the way to an upgrade, or the local mock —
+  just "Card saved.". A card confirmed through a Stripe redirect is announced
+  once the subscription has loaded, so the answer is never read off an empty
+  page.
 - **AI-read invoices** (`#lib/components/billing/AiUsagePanel.svelte`, from
   `ai_usage`): a `role="meter"` bar of used / included (amber from 80%, red at
   the limit or while paused), the plan's overage price or "pauses at the
@@ -1400,7 +1531,7 @@ dashboard and never sees the tab.
 | `PUBLIC_STRIPE_PUBLISHABLE_KEY` (frontend build) | (empty) | Stripe publishable key (`pk_…`, not secret) the `/billing` card form mounts Stripe Elements with. Deployed from the GitHub repository variable `STRIPE_PUBLISHABLE_KEY`. Empty → the page says card entry is not configured. |
 | `FEOH_BILLING_STRIPE_API_BASE` | `https://api.stripe.com` | Stripe REST API base URL — overridable so a sandbox / test can point the adapter elsewhere. The adapter still fails closed without an API key regardless. |
 | `FEOH_BILLING_WEBHOOK_ENABLED` | `false` | Master switch for the inbound billing webhook route (`POST /api/billing/webhook/{provider}`). OFF in local dev (no outbound billing integration); flip ON in deployed envs. The route is HMAC-gated regardless; off → silent 204. **Boot guard**: refuses to start when this is `true` and `FEOH_BILLING_PROVIDER` is `mock` **or names no registered adapter** (the mock adapter's `parse_webhook` does no signature verification, and an unregistered name silently falls back to it) — pair with a real, correctly-spelled provider in deployed envs. |
-| `FEOH_BILLING_DUNNING_ENABLED` | `false` | Master switch for the dunning / past-due automation sweep. OFF by default; flip ON in deployed envs. The sweep only cancels subscriptions overdue past the grace window — it NEVER moves money. |
+| `FEOH_BILLING_DUNNING_ENABLED` | `false` | Master switch for the dunning / past-due automation sweep. OFF by default; flip ON in deployed envs — it is required wherever a live billing provider is (boot warns otherwise), as the backstop for a lost end-of-period webhook. The sweep cancels subscriptions overdue past the grace window and applies or drops scheduled moves to Free (decisions §483) — it NEVER moves money. |
 | `FEOH_BILLING_DUNNING_INTERVAL_SECONDS` | `3600` | Dunning sweep tick interval. |
 | `FEOH_BILLING_AI_OVERAGE_SWEEP_ENABLED` | `false` | Master switch for the AI-read overage reconciliation sweep (`ai_overage.run_ai_overage_reconcile_loop`). The primary report runs after each billable read; this is the backstop, and it re-checks the usage notices. Reports usage only — never charges. Flip ON in deployed envs with a live billing provider. |
 | `FEOH_BILLING_AI_OVERAGE_SWEEP_INTERVAL_SECONDS` | `3600` | Its tick. Keep it well under 24 h — Stripe's idempotency window, inside which a re-sent event replays as the original. |
@@ -1477,8 +1608,8 @@ shape (anchor on the 1st, metered item, `error_if_incomplete`, pinned
 adoption refusing a foreign / unfinished intent, webhook parsing (an invoice's
 subscription from `parent`, the window from the item); then `change_plan` on the
 real-Postgres harness for every path — no card refused with nothing written,
-free → paid created, paid → paid amended, paid → free canceled with the id
-cleared, a decline changing nothing, adoption instead of a duplicate, the lease,
+free → paid created, paid → paid amended, paid → free scheduled for the
+period end (a `past_due` one canceled at once with the id cleared), a decline changing nothing, adoption instead of a duplicate, the lease,
 deployed + `mock` (and a typo'd provider) refused while the downgrade and local
 dev still work — the invoice-event edges, window sync, `canceled` terminal, and
 the default-card endpoint; and the preview (§482): the exact `create_preview`
@@ -1487,7 +1618,16 @@ Free, the recurring second call, an amount-less answer refused, the real update
 carrying the confirmed `proration_date`, the preview endpoint's figures and
 `payment_method_required`, a live change refused without a quote / with one
 the provider now prices higher / from last month / past its lifetime, and
-saving a card never changing the plan.
+saving a card never changing the plan; and the scheduled move to Free (§483):
+the exact `cancel_at_period_end` forms (schedule, resume, and the swap that
+clears it), the preview's nothing-due / no-credit / `effective_at` answer, the
+end-of-period webhook moving the row once (a redelivery is a no-op), a retried
+schedule being a no-op, Keep (admin/cfo only, idempotent, refused once due),
+a paid plan chosen while a move is pending, and the sweep applying a move whose
+webhook was lost, dropping one the provider renewed, and making it on `mock`.
+`backend/tests/test_migration_0140_subscription_pending_plan.py` — 0140 down /
+up / up again on a real control plane equals `create_all`, and is a no-op on a
+tenant.
 
 `backend/tests/test_billing_proration.py` — the proration math (upgrade →
 positive, downgrade → negative, same-price → `0.00`, `ROUND_HALF_UP` 2-dp

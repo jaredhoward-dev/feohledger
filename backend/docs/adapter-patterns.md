@@ -525,7 +525,9 @@ review of the provider's own price from `POST /api/billing/change-plan/preview`
 or cancels the customer's Stripe subscription (`services/billing/provider_sync.py`,
 the adapter's `find_live_subscription` / `change_subscription_plan` /
 `cancel_subscription` / `ensure_default_payment_method` / `adopt_setup_intent`;
-decisions §480). See `docs/billing.md`.
+decisions §480); a move to a free plan is scheduled for the period end instead
+(`cancel_subscription_at_period_end`, undone by `resume_subscription`;
+`services/billing/scheduled_downgrade.py`, decisions §483). See `docs/billing.md`.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
