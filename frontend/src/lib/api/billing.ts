@@ -6,6 +6,7 @@ import { api } from '#lib/api.ts';
 import { planChangeRequestFrom } from '#lib/types/billing.ts';
 import type {
 	BillingInvoicesResponse,
+	BillingKeepPlanResponse,
 	BillingPaymentMethodsResponse,
 	BillingPlanChangePreview,
 	BillingPlanChangeResponse,
@@ -80,6 +81,14 @@ export function previewBillingPlanChange(planCode: string): Promise<BillingPlanC
  *  also 409 `billing_not_configured` / `plan_change_in_progress`. */
 export function changeBillingPlan(preview: BillingPlanChangePreview): Promise<BillingPlanChangeResponse> {
 	return api.post<BillingPlanChangeResponse>('/api/billing/change-plan', planChangeRequestFrom(preview));
+}
+
+/** Keep the current plan: cancel a move to a free plan that is waiting for the
+ *  end of the paid period (decisions §483). Nothing is charged. admin/cfo
+ *  only. Idempotent (`cleared: false` when nothing was pending); 409
+ *  `scheduled_change_already_due` once the period has ended. */
+export function keepCurrentBillingPlan(): Promise<BillingKeepPlanResponse> {
+	return api.post<BillingKeepPlanResponse>('/api/billing/scheduled-change/cancel', {});
 }
 
 /** Make the card a confirmed SetupIntent saved the org's DEFAULT — the one the

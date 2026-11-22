@@ -37,6 +37,18 @@ export interface BillingSubscription {
 	trial_end: string | null;
 	/** True when a live provider (Stripe) owns the subscription. */
 	externally_managed: boolean;
+	/** A move to a free plan waiting for the end of the paid period
+	 *  (decisions §483); null when nothing is scheduled. */
+	scheduled_change: BillingScheduledChange | null;
+}
+
+/** A plan move that takes effect at the end of the paid period: the org keeps
+ *  its current plan, and everything in it, until `effective_at`. */
+export interface BillingScheduledChange {
+	plan_code: string;
+	plan_name: string;
+	/** ISO timestamp the move takes effect (a UTC period boundary). */
+	effective_at: string;
 }
 
 /** Usage-to-date for the current period. All values are exact strings.
@@ -351,6 +363,12 @@ export interface BillingPlanChangePreview {
 	expires_at: string;
 	/** A paid plan and no card on file: the dialog asks for one first. */
 	payment_method_required: boolean;
+	/** When the move takes effect, if not on confirm: a move to a free plan
+	 *  keeps the current plan until its period ends (decisions §483). Null =
+	 *  on confirm. */
+	effective_at: string | null;
+	/** Confirming also cancels the org's pending move to a free plan. */
+	clears_scheduled_change: boolean;
 }
 
 /** Body of `POST /api/billing/change-plan`: the target plan and the preview
@@ -386,6 +404,17 @@ export interface BillingPlanChangeResponse {
 	old_plan_code: string;
 	new_plan_code: string;
 	proration: BillingPlanChangeProration;
+	/** The move waits for the end of the paid period (paid → free): the org
+	 *  stays on `old_plan_code` until `effective_at`. */
+	scheduled: boolean;
+	effective_at: string | null;
+}
+
+/** Result of `POST /api/billing/scheduled-change/cancel` ("Keep {plan}"). */
+export interface BillingKeepPlanResponse {
+	/** False when nothing was pending (an idempotent retry). */
+	cleared: boolean;
+	plan_code: string;
 }
 
 /** Body of `POST /api/billing/payment-method/default`: the SetupIntent whose
@@ -428,6 +457,19 @@ export function cardFormMode(
 		return publishableKey && publishableKey.trim() ? 'stripe' : 'stripe_key_missing';
 	}
 	return 'not_configured';
+}
+
+/**
+ * The toast after a card is saved. Saving a card only charges anything through
+ * a live provider subscription (`externally_managed`, which only a paid plan
+ * has): with one, the subscription is now charged to this card; without one —
+ * a Free workspace adding a card on the way to an upgrade, or the local mock —
+ * the card is simply saved and nothing is charged yet.
+ */
+export function cardSavedMessageKey(
+	subscription: Pick<BillingSubscription, 'externally_managed'> | null | undefined
+): 'billing.card.saved' | 'billing.card.savedOnly' {
+	return subscription?.externally_managed ? 'billing.card.saved' : 'billing.card.savedOnly';
 }
 
 /** `POST /api/billing/change-plan` refused because the org has no saved card. */

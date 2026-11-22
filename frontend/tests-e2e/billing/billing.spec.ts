@@ -521,6 +521,60 @@ test.describe('/billing (admin)', () => {
 		await expect(page.getByTestId('billing-add-card')).toBeFocused();
 		await expect(section.getByText('Visa ····4242')).toBeVisible();
 		await expect(section.getByText('Default', { exact: true })).toBeVisible();
+		// The worker's org is on Free with the mock provider: nothing bills
+		// this card yet, so the toast does not claim a subscription is charged.
+		await expect(page.getByText('Card saved.', { exact: true })).toBeVisible();
+		await expect(page.getByText('Your subscription is now charged to this card.')).toHaveCount(0);
+	});
+
+	test('a card saved while a live provider bills the plan says the subscription is charged to it', async ({
+		page
+	}) => {
+		await page.route(isApi('/api/billing/subscription'), (route) =>
+			route.fulfill(
+				json({
+					provider: 'stripe_billing',
+					plan: {
+						code: 'growth',
+						name: 'Growth',
+						monthly_price: '49.00',
+						currency: 'USD',
+						entitlements: {},
+						trial_days: 0
+					},
+					subscription: {
+						status: 'active',
+						current_period_start: '2026-11-01T00:00:00Z',
+						current_period_end: '2026-12-01T00:00:00Z',
+						trial_end: null,
+						externally_managed: true,
+						scheduled_change: null
+					},
+					period: '2026-11',
+					usage: { extractions: '0', extractions_platform: '0' },
+					ai_usage: {
+						period: '2026-11',
+						used: 0,
+						included: 500,
+						overage_unit_price: '0.10',
+						currency: 'USD',
+						overage_units: 0,
+						overage_amount: '0.00',
+						projected_overage_amount: '0.00',
+						spend_cap: null,
+						paused: false,
+						pause_reason: null
+					}
+				})
+			)
+		);
+		await stubMockSetupIntent(page);
+		await stubSetDefault(page);
+
+		await page.goto('/billing');
+		await expect(page.getByTestId('billing-plan').getByRole('heading', { name: 'Growth' })).toBeVisible();
+		await page.getByTestId('billing-add-card').click();
+		await page.getByTestId('billing-card-setup').getByTestId('billing-card-save-test').click();
 		await expect(
 			page.getByText('Card saved. Your subscription is now charged to this card.')
 		).toBeVisible();
@@ -573,9 +627,8 @@ test.describe('/billing (admin)', () => {
 		const saved = await stubSetDefault(page);
 		await page.goto(`${STRIPE_RETURN}succeeded&setup_intent_client_secret=seti_x_secret_y`);
 
-		await expect(
-			page.getByText('Card saved. Your subscription is now charged to this card.')
-		).toBeVisible();
+		// The worker's org is on Free (mock): no subscription is charged yet.
+		await expect(page.getByText('Card saved.', { exact: true })).toBeVisible();
 		expect(saved.bodies).toEqual([{ setup_intent_id: 'seti_x' }]);
 		await expect(page).not.toHaveURL(/setup_intent/);
 		await expect(page).toHaveURL(/\/billing$/);
@@ -708,6 +761,8 @@ test.describe('/billing (admin)', () => {
 				proration_date: 1_795_000_000,
 				expires_at: '2026-11-21T12:10:00Z',
 				payment_method_required: false,
+				effective_at: null,
+				clears_scheduled_change: false,
 				...overrides
 			};
 		}
@@ -741,7 +796,9 @@ test.describe('/billing (admin)', () => {
 				changed: true,
 				old_plan_code: currentCode,
 				new_plan_code: targetCode,
-				proration: { amount: '41.67', unused_days: 25, period_days: 30 }
+				proration: { amount: '41.67', unused_days: 25, period_days: 30 },
+				scheduled: false,
+				effective_at: null
 			});
 
 		async function pickTarget(page: Page) {
@@ -913,6 +970,84 @@ test.describe('/billing (admin)', () => {
 			);
 			await expect(review.getByRole('button', { name: 'Confirm', exact: true })).toBeVisible();
 			await expect(review.getByRole('button', { name: 'Confirm and pay' })).toHaveCount(0);
+		});
+
+		test('a move to Free waits for the period end: the card says when, Free is not offered again, and Keep takes it back', async ({
+			page
+		}) => {
+			// The real mock backend end to end (decisions §483): nothing is
+			// charged or credited, the org keeps the paid plan until the period
+			// ends, and the undo is on the plan card.
+			const freeCode = `e2e_pc_free_${Date.now().toString(36)}`;
+			const freeId = controlPsql(
+				`INSERT INTO plans (id, code, name, monthly_price, currency, seat_component, ` +
+					`usage_components, entitlements, trial_days, is_active, created_at, updated_at) ` +
+					`VALUES (gen_random_uuid(), '${freeCode}', 'E2E Free', 0.00, 'USD', '{}'::jsonb, ` +
+					`'{}'::jsonb, '{}'::jsonb, 0, true, now(), now()) RETURNING id`
+			);
+			try {
+				await page.getByTestId('billing-change-plan').click();
+				const modal = page.getByRole('dialog', { name: 'Change plan' });
+				await modal.getByRole('radio', { name: 'Select the E2E Free plan' }).check();
+				await page.getByTestId('billing-change-plan-continue').click();
+
+				const review = modal.getByTestId('billing-plan-review');
+				await expect(review.getByTestId('billing-plan-review-scheduled')).toHaveText(
+					/^You keep E2E Current until .+\d{4}, then move to E2E Free\.$/
+				);
+				await expect(review.getByTestId('billing-plan-review-scheduled')).toBeFocused();
+				await expect(review.getByTestId('billing-plan-review-today')).toHaveText(
+					'Nothing is charged today.'
+				);
+				// No credit: a free workspace has no future invoice to spend it on.
+				await expect(review.getByTestId('billing-plan-review-credit')).toHaveCount(0);
+				await expect(review.getByTestId('billing-plan-review-recurring')).toHaveText(
+					'The E2E Free plan has no monthly charge.'
+				);
+				await expectNoA11yViolations(page);
+				await review.getByRole('button', { name: 'Confirm', exact: true }).click();
+
+				const result = page.getByTestId('billing-plan-change-result');
+				await expect(modal.getByRole('heading', { name: 'Change scheduled' })).toBeVisible();
+				await expect(result.getByTestId('billing-plan-change-scheduled')).toHaveText(
+					/^You'll move to the E2E Free plan on .+\d{4}\. You keep E2E Current until then\.$/
+				);
+				await result.getByRole('button', { name: 'Done' }).click();
+				await expect(modal).toBeHidden();
+
+				// Still on the paid plan, with the move said plainly on the card.
+				const card = page.getByTestId('billing-plan');
+				await expect(card.getByRole('heading', { name: 'E2E Current' })).toBeVisible();
+				const notice = card.getByTestId('billing-scheduled-change');
+				await expect(notice).toContainText(/Moving to E2E Free on .+\d{4}\./);
+				await expect(notice).toContainText('You keep E2E Current and everything in it until then.');
+				await expectNoA11yViolations(page);
+
+				// The dialog does not offer the pending plan again.
+				await page.getByTestId('billing-change-plan').click();
+				await expect(modal.getByRole('radio', { name: 'Select the E2E Free plan' })).toBeDisabled();
+				await expect(modal.getByText('Scheduled', { exact: true })).toBeVisible();
+				await modal.getByRole('button', { name: 'Cancel' }).click();
+				await expect(modal).toBeHidden();
+
+				await notice.getByRole('button', { name: 'Keep E2E Current' }).click();
+				await expect(page.getByText("You're staying on the E2E Current plan.")).toBeVisible();
+				await expect(card.getByTestId('billing-scheduled-change')).toHaveCount(0);
+				// Focus lands on the card's own action, not the top of the page.
+				await expect(page.getByTestId('billing-change-plan')).toBeFocused();
+				expect(
+					controlPsql(
+						`SELECT count(*) FROM subscriptions WHERE organization_id='${orgId}' ` +
+							`AND pending_plan_id IS NOT NULL`
+					)
+				).toBe('0');
+			} finally {
+				controlPsql(
+					`UPDATE subscriptions SET pending_plan_id = NULL, pending_plan_effective_at = NULL ` +
+						`WHERE pending_plan_id = '${freeId}'`
+				);
+				controlPsql(`DELETE FROM plans WHERE id = '${freeId}'`);
+			}
 		});
 
 		test('a declined charge (402 billing_payment_declined) states its own message and offers Update card', async ({
