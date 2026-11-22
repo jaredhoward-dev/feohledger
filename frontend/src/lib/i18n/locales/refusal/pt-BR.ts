@@ -76,6 +76,7 @@ export const messages = {
 	'refusal.billingNotConfigured': "Os planos pagos ainda não estão disponíveis porque o faturamento não está configurado nesta instalação. Fale com nossa equipe.",
 	'refusal.planChangeInProgress': "Já há outra mudança de plano em andamento. Tente novamente em instantes.",
 	'refusal.planChangePreviewStale': "O preço que você confirmou está desatualizado, então nada foi cobrado. Revise o novo valor e confirme novamente.",
+	'refusal.scheduledChangeAlreadyDue': "Sua mudança para o novo plano já entrou em vigor, então não pode mais ser desfeita.",
 	'refusal.setupIntentNotFound': "Essa configuração de cartão não foi encontrada. Comece a adicionar o cartão novamente.",
 	'refusal.setupIntentIncomplete': "A configuração do cartão ainda não foi concluída. Termine de informar os dados do cartão e tente novamente.",
 	'refusal.creditMemoInvoiceSettled': "A fatura está com status {status}: nenhum pagamento será mais feito contra ela, então um crédito aplicado não reduziria nada. Deixe a nota de crédito em aberto e aplique-a à próxima fatura do fornecedor.",

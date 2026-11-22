@@ -23,6 +23,7 @@
 		getBillingPaymentMethods,
 		getBillingPlans,
 		getBillingSubscription,
+		keepCurrentBillingPlan,
 		previewBillingPlanChange,
 		setDefaultBillingPaymentMethod
 	} from '#lib/api/billing.ts';
@@ -53,6 +54,7 @@
 	} from '#lib/types/billing.ts';
 	import {
 		PLAN_CHANGE_PREVIEW_STALE,
+		cardSavedMessageKey,
 		planChangeCardAction,
 		planHighlights,
 		rebateMeterGroups
@@ -86,6 +88,11 @@
 	let invoices = $state<BillingInvoice[]>([]);
 	let invoicesLoading = $state(true);
 	let invoicesError = $state<string | null>(null);
+
+	// The first subscription read, so a card saved through a Stripe redirect
+	// is announced against the loaded subscription (`cardSavedMessageKey`),
+	// not against a page that has not read it yet.
+	let firstLoad: Promise<void> | null = null;
 
 	async function load() {
 		loading = true;
@@ -165,7 +172,7 @@
 		paymentMethods = res.payment_methods;
 		pmError = null;
 		cardFlowOpen = false;
-		toast(m('billing.card.saved'), 'success');
+		toast(m(cardSavedMessageKey(data?.subscription)), 'success');
 		await returnFocusToAddCard();
 	}
 
@@ -206,7 +213,8 @@
 		}
 		try {
 			await setDefaultBillingPaymentMethod(id);
-			toast(m('billing.card.saved'), 'success');
+			await firstLoad;
+			toast(m(cardSavedMessageKey(data?.subscription)), 'success');
 			return pending;
 		} catch (e) {
 			toast(errorMessage(e, m('billing.card.saveFailed')), 'error');
@@ -339,7 +347,7 @@
 	async function onCardStepSaved(res: BillingPaymentMethodsResponse) {
 		paymentMethods = res.payment_methods;
 		pmError = null;
-		toast(m('billing.card.saved'), 'success');
+		toast(m(cardSavedMessageKey(data?.subscription)), 'success');
 		changeError = null;
 		changeErrorAction = null;
 		if (selectedPlanCode) await loadPreview(selectedPlanCode);
@@ -411,7 +419,9 @@
 			pick: m('billing.plan.changeModal.selectHeading'),
 			card: m('billing.plan.changeModal.cardTitle'),
 			review: m('billing.plan.changeModal.reviewTitle'),
-			result: m('billing.plan.changeModal.successHeading')
+			result: changeResult?.scheduled
+				? m('billing.plan.changeModal.scheduledHeading')
+				: m('billing.plan.changeModal.successHeading')
 		}[planStep]
 	);
 
@@ -460,7 +470,7 @@
 		// Only fetch once we know the role is allowed (avoids a guaranteed 403
 		// for the clerk/manager before the redirect fires).
 		if (userLoaded && allowed) {
-			load();
+			firstLoad = load();
 			loadInvoices();
 			// A Stripe redirect return is finished before the list loads, so
 			// the list it shows already holds the new default card. A plan the
@@ -497,6 +507,34 @@
 	const plan = $derived(data?.plan ?? null);
 	const subscription = $derived(data?.subscription ?? null);
 	const hasSubscription = $derived(plan !== null && subscription !== null);
+	// A move to a free plan waiting for the end of the paid period (§483).
+	const scheduledChange = $derived(subscription?.scheduled_change ?? null);
+
+	// "Keep {plan}": cancel the scheduled move. Nothing is charged.
+	let keeping = $state(false);
+	let changePlanButton = $state<HTMLButtonElement | undefined>();
+
+	async function keepPlan() {
+		if (keeping || !plan) return;
+		const kept = plan.name;
+		keeping = true;
+		try {
+			await keepCurrentBillingPlan();
+			toast(m('billing.plan.scheduled.kept', { plan: kept }), 'success');
+			await load();
+			// The Keep button is gone with the notice: focus goes to the plan
+			// card's own action rather than to the top of the page (WCAG 2.4.3).
+			await tick();
+			changePlanButton?.focus();
+		} catch (e) {
+			toast(errorMessage(e, m('billing.plan.scheduled.keepFailed')), 'error');
+			// The move may have taken effect meanwhile (409
+			// `scheduled_change_already_due`): show what is true now.
+			await load();
+		} finally {
+			keeping = false;
+		}
+	}
 
 	/** Whole-number usage counter rendered defensively (the API sends strings). */
 	function asCount(n: string | undefined): string {
@@ -658,6 +696,32 @@
 						</div>
 					</dl>
 
+					{#if scheduledChange}
+						<!-- A move to a free plan at the end of the paid period
+						     (decisions §483): said plainly on the card, with the undo
+						     beside it. Nothing is charged by either. -->
+						<div class="callout tone-info scheduled-change" data-testid="billing-scheduled-change">
+							<strong>
+								{m('billing.plan.scheduled.notice', {
+									plan: scheduledChange.plan_name,
+									date: reviewDate(scheduledChange.effective_at)
+								})}
+							</strong>
+							<p>{m('billing.plan.scheduled.detail', { plan: plan.name })}</p>
+							<button
+								type="button"
+								class="btn-cancel"
+								onclick={keepPlan}
+								disabled={keeping}
+								data-testid="billing-keep-plan"
+							>
+								{keeping
+									? m('billing.plan.scheduled.keeping')
+									: m('billing.plan.scheduled.keep', { plan: plan.name })}
+							</button>
+						</div>
+					{/if}
+
 					{#if entitlementLabels.length > 0}
 						<div class="entitlements">
 							<h3 class="meta-label">{m('billing.plan.included')}</h3>
@@ -679,6 +743,7 @@
 							type="button"
 							class="btn-primary"
 							onclick={openChangePlan}
+							bind:this={changePlanButton}
 							data-testid="billing-change-plan"
 						>
 							{m('billing.plan.changePlan')}
@@ -892,7 +957,17 @@
 >
 	{#if planStep === 'result' && changeResult}
 		<div class="change-result" data-testid="billing-plan-change-result">
-			{#if changeResult.changed}
+			<!-- A scheduled move (or a retry of one, `changed: false`) reads the
+			     same: when it happens, and what the org keeps until then. -->
+			{#if changeResult.scheduled}
+				<p tabindex="-1" bind:this={resultFocus} data-testid="billing-plan-change-scheduled">
+					{m('billing.plan.changeModal.scheduledResult', {
+						to: planName(changeResult.new_plan_code),
+						from: planName(changeResult.old_plan_code),
+						date: reviewDate(changeResult.effective_at)
+					})}
+				</p>
+			{:else if changeResult.changed}
 				<p tabindex="-1" bind:this={resultFocus}>
 					{m('billing.plan.changeModal.successChanged', {
 						plan: planName(changeResult.new_plan_code)
@@ -985,11 +1060,22 @@
 						</button>
 					</div>
 				{:else}
-					<p class="review-summary" tabindex="-1" bind:this={reviewFocus}>
-						{m('billing.plan.review.summary', {
-							from: plan?.name ?? '—',
-							to: planName(preview.plan_code)
-						})}
+					<p
+						class="review-summary"
+						tabindex="-1"
+						bind:this={reviewFocus}
+						data-testid={preview.effective_at ? 'billing-plan-review-scheduled' : undefined}
+					>
+						{preview.effective_at
+							? m('billing.plan.review.keepUntil', {
+									from: plan?.name ?? '—',
+									to: planName(preview.plan_code),
+									date: reviewDate(preview.effective_at)
+								})
+							: m('billing.plan.review.summary', {
+									from: plan?.name ?? '—',
+									to: planName(preview.plan_code)
+								})}
 					</p>
 					<!-- The provider's figures, as the server sent them. -->
 					<ul class="review-figures" data-testid="billing-plan-review-figures">
@@ -1016,11 +1102,23 @@
 								: m('billing.plan.review.noMonthly', { plan: planName(preview.plan_code) })}
 						</li>
 					</ul>
+					{#if preview.clears_scheduled_change && scheduledChange}
+						<p class="hint" data-testid="billing-plan-review-clears-scheduled">
+							{m('billing.plan.review.clearsScheduled', {
+								plan: scheduledChange.plan_name,
+								date: reviewDate(scheduledChange.effective_at)
+							})}
+						</p>
+					{/if}
 					{#if data?.ai_usage?.overage_unit_price}
 						<!-- The current plan bills AI-read overage: what accrues up to the
-						     change is invoiced with it, beyond the figure above (§482). -->
+						     change is invoiced with it, beyond the figure above (§482) —
+						     or, for a move kept until the period ends, on that period's
+						     last invoice (§483). -->
 						<p class="hint" data-testid="billing-plan-review-overage">
-							{m('billing.plan.review.overageNote')}
+							{preview.effective_at
+								? m('billing.plan.review.overageNoteScheduled', { plan: plan?.name ?? '—' })
+								: m('billing.plan.review.overageNote')}
 						</p>
 					{/if}
 
@@ -1077,6 +1175,8 @@
 					     description. -->
 					{#each availablePlans as p (p.code)}
 						{@const isCurrent = plan?.code === p.code}
+						<!-- Already where the scheduled move goes: not offered again. -->
+						{@const isScheduled = scheduledChange?.plan_code === p.code}
 						{@const highlights = planHighlightLines.get(p.code)}
 						{@const idBase = `plan-option-${p.code}`}
 						<label
@@ -1089,11 +1189,12 @@
 								name="plan-code"
 								value={p.code}
 								checked={selectedPlanCode === p.code}
-								disabled={isCurrent}
+								disabled={isCurrent || isScheduled}
 								onchange={() => (selectedPlanCode = p.code)}
 								aria-label={m('billing.plan.changeModal.selectAria', { name: p.name })}
 								aria-describedby={[
 									isCurrent ? `${idBase}-current` : null,
+									isScheduled ? `${idBase}-scheduled` : null,
 									`${idBase}-price`,
 									highlights ? `${idBase}-features` : null
 								]
@@ -1106,6 +1207,10 @@
 									{#if isCurrent}
 										<span class="current-pill" id="{idBase}-current">
 											{m('billing.plan.changeModal.currentBadge')}
+										</span>
+									{:else if isScheduled}
+										<span class="current-pill" id="{idBase}-scheduled">
+											{m('billing.plan.changeModal.scheduledBadge')}
 										</span>
 									{/if}
 								</span>
@@ -1224,6 +1329,19 @@
 
 	.callout.tone-danger {
 		border-left-color: var(--danger);
+	}
+
+	.callout.tone-info {
+		border-left-color: var(--accent);
+	}
+
+	.scheduled-change {
+		margin-top: 1.25rem;
+	}
+
+	.scheduled-change button {
+		align-self: flex-start;
+		margin-top: 0.5rem;
 	}
 
 	.callout p {

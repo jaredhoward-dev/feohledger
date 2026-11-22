@@ -22,6 +22,11 @@ its first invoice is the prorated stretch to the 1st as of the create — never
 more than the preview, which priced a longer stretch, and the confirm-time
 check refuses outright if it would be.
 
+A move from a paid plan to a free one is not priced at the provider at all:
+it is scheduled for the end of the paid period (`scheduled_downgrade`,
+decisions §483), so the preview answers nothing due, no credit and the
+``effective_at`` it takes effect.
+
 The preview is read-only at the provider (``create_preview`` creates nothing)
 apart from the provisioning it shares with the change: the org's provider
 customer and the plan's prices are resolved-or-created first, because a
@@ -54,6 +59,10 @@ from app.services.billing.provisioning import (
     ProvisionedIds,
     billing_adapter_for,
     provision_org_billing,
+)
+from app.services.billing.scheduled_downgrade import (
+    estimated_effective_at,
+    waits_for_period_end,
 )
 from app.services.billing_adapters.base import (
     BillingAdapter,
@@ -107,6 +116,11 @@ class PlanChangePreview:
     #: A paid target and no card on file: the change will be refused until one
     #: is saved. The figures are still shown; the SPA asks for the card first.
     payment_method_required: bool
+    #: When the move takes effect, if not on confirm: a move to a free plan
+    #: keeps the paid plan until its period ends (decisions §483). None = now.
+    effective_at: datetime | None = None
+    #: Confirming cancels the org's pending move to a free plan.
+    clears_scheduled_change: bool = False
 
 
 def _seconds(dt: datetime) -> datetime:
@@ -237,6 +251,28 @@ async def preview_plan_change(
     external_id = subscription.external_subscription_id
     if not live and external_id is not None:
         raise ProviderLegRefused("billing_not_configured")
+    if waits_for_period_end(subscription, current, new_plan, live=live):
+        # Kept until the period ends, then Free: nothing is charged today and
+        # nothing is credited — no provider call is needed to say so.
+        return PlanChangePreview(
+            plan_code=new_plan.code,
+            already_on_plan=False,
+            currency=current.currency,
+            amount_due=ZERO,
+            credit=ZERO,
+            next_amount=None,
+            next_date=None,
+            proration_date=at,
+            expires_at=at + PREVIEW_TTL,
+            payment_method_required=False,
+            effective_at=(
+                subscription.pending_plan_effective_at
+                if subscription.pending_plan_id == new_plan.id
+                and subscription.pending_plan_effective_at is not None
+                else estimated_effective_at(subscription, live=live, now=at)
+            ),
+        )
+    clears_pending = subscription.pending_plan_id is not None
     window = pricing_window(subscription, live=live, at=at)
     old_price = current.monthly_price
 
@@ -268,6 +304,7 @@ async def preview_plan_change(
         proration_date=at,
         expires_at=at + PREVIEW_TTL,
         payment_method_required=card_needed,
+        clears_scheduled_change=clears_pending,
     )
 
 

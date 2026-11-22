@@ -604,6 +604,8 @@ const BUILDERS: Record<string, Builder> = {
 	// The confirmed preview is out of date (decisions §482); the dialog fetches
 	// a fresh one so the reader can confirm the new figure.
 	plan_change_preview_stale: fixed('refusal.planChangePreviewStale'),
+	// "Keep my plan" after the scheduled move to Free took effect (decisions §483).
+	scheduled_change_already_due: fixed('refusal.scheduledChangeAlreadyDue'),
 	// `api/billing.py` — `POST /payment-method/default` for a SetupIntent that
 	// is not this org's (404) or has not succeeded yet (409).
 	setup_intent_not_found: fixed('refusal.setupIntentNotFound'),

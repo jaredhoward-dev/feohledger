@@ -234,11 +234,14 @@
 	<h3>5.5 Changing plan mid-period</h3>
 	<p>
 		An administrator or CFO user can change the Customer's plan in the application. A
-		change takes effect immediately. The difference between the plans is apportioned
-		across the days remaining in the current period — charged on an upgrade, credited on
-		a downgrade — computed exactly and rounded to two decimal places, and recorded in the
-		Customer's audit trail. Changing to the plan the Customer is already on has no effect
-		and is not charged.
+		change to another paid plan takes effect immediately. The difference between the
+		plans is apportioned across the days remaining in the current period — charged on an
+		upgrade, credited on a downgrade — computed exactly and rounded to two decimal places,
+		and recorded in the Customer's audit trail. A change to a no-charge plan takes effect
+		at the end of the then-current period, as a cancellation does under clause 5.8: the
+		Customer keeps the paid plan until then, nothing is credited or refunded, and it can
+		keep the paid plan by undoing the change in the application before the period ends.
+		Changing to the plan the Customer is already on has no effect and is not charged.
 	</p>
 
 	<h3>5.6 Usage metering</h3>

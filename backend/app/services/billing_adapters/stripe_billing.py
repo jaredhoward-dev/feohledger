@@ -144,6 +144,7 @@ def _subscription_of(payload: dict, *, plan_code: str = "") -> ProviderSubscript
         plan_code=plan_code or str((payload.get("metadata") or {}).get("plan_code") or ""),
         current_period_start=start,
         current_period_end=end,
+        cancel_at_period_end=payload.get("cancel_at_period_end") is True,
     )
 
 
@@ -485,6 +486,12 @@ class StripeBillingAdapter(BillingAdapter):
         the subscription untouched if that charge fails (402 →
         :class:`BillingPaymentDeclined`). ``proration_date`` is the instant the
         customer's preview was priced at, so the invoice equals the preview.
+        ``cancel_at_period_end=false`` is sent on every amend: a paid target
+        always means "keep renewing", so a move to Free scheduled for the
+        period end is taken back in the same request (decisions §483). Sent
+        unconditionally rather than from our row's pending state, which a
+        racing schedule or a schedule whose record failed can leave out of
+        step with Stripe; on a subscription not set to end it is a no-op.
         """
         self._require_key()
         async with self._client() as client:
@@ -500,6 +507,7 @@ class StripeBillingAdapter(BillingAdapter):
                 # The instant the customer's preview was priced at: Stripe
                 # prorates exactly as it previewed (decisions §482).
                 form["proration_date"] = str(int(proration_date.timestamp()))
+            form["cancel_at_period_end"] = "false"
             resp = await client.post(
                 f"/v1/subscriptions/{external_subscription_id}",
                 data=form,
@@ -574,6 +582,11 @@ class StripeBillingAdapter(BillingAdapter):
                     "subscription_details[proration_behavior]": "none",
                     "preview_mode": "recurring",
                 }
+                # The swap clears any scheduled end (decisions §483), as the
+                # amend does: price it — and what recurs — as a subscription
+                # that renews, not one ending at the period end.
+                form["subscription_details[cancel_at_period_end]"] = "false"
+                recurring_form["subscription_details[cancel_at_period_end]"] = "false"
                 next_date = _period_of(current)[1]
             else:
                 if not request.price_id:
@@ -638,6 +651,52 @@ class StripeBillingAdapter(BillingAdapter):
                     if existing.get("status") in _ENDED_STATUSES:
                         return _subscription_of(existing)
             payload = self._json_or_raise(resp, "cancel_subscription")
+        return _subscription_of(payload)
+
+    async def cancel_subscription_at_period_end(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Schedule the end: ``POST /v1/subscriptions/{id}`` with
+        ``cancel_at_period_end=true`` (decisions §483).
+
+        Stripe ends the subscription at ``current_period_end`` and sends
+        ``customer.subscription.deleted`` then. Scheduling creates no proration
+        and no credit — the customer keeps the period they paid for — and
+        ``proration_behavior=none`` says so explicitly rather than lean on the
+        default. Metered usage reported for the period is still billed: "for
+        subscriptions that cancel at the end of the period, the final invoice
+        at the end of the period includes metered usage from the last billing
+        period" (Stripe, usage-based billing § Cancel usage-based
+        subscriptions). Setting the flag again is a no-op at Stripe.
+        """
+        return await self._set_cancel_at_period_end(
+            external_subscription_id, True, idempotency_key, "schedule_cancel"
+        )
+
+    async def resume_subscription(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Undo the scheduled end: ``cancel_at_period_end=false``. Nothing is
+        charged now; the subscription renews at its period end as before."""
+        return await self._set_cancel_at_period_end(
+            external_subscription_id, False, idempotency_key, "resume_subscription"
+        )
+
+    async def _set_cancel_at_period_end(
+        self, external_subscription_id: str, value: bool, idempotency_key: str, op: str
+    ) -> ProviderSubscription:
+        self._require_key()
+        form = {
+            "cancel_at_period_end": "true" if value else "false",
+            "proration_behavior": "none",
+        }
+        async with self._client() as client:
+            resp = await client.post(
+                f"/v1/subscriptions/{external_subscription_id}",
+                data=form,
+                headers={"Idempotency-Key": idempotency_key},
+            )
+            payload = self._json_or_raise(resp, op)
         return _subscription_of(payload)
 
     async def _customer_default_pm(self, client: httpx.AsyncClient, customer_id: str) -> str | None:

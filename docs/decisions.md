@@ -24506,3 +24506,101 @@ other plan code as is.
 `backend/tests/test_billing_stripe_subscriptions.py`,
 `backend/tests/test_billing_proration.py`, `backend/tests/test_partner_admin.py`,
 `frontend/tests-e2e/billing/billing.spec.ts`.
+
+## 483. A move to Free keeps the paid plan until the end of the period it was paid for, with no credit; paid → paid stays immediate (supersedes §480 choice 2 for paid → free; issue #746, 2026-11-21)
+
+In production test mode an org on Growth (paid $14.80 for 21 November – 1
+December) reviewed a move to Free and was told "$14.66 for the unused part of
+your current plan will be credited to your account and taken off future
+invoices." A Free workspace has no future invoices, so that credit could never
+be spent: §480 choice 2's immediate, prorated cancel stranded it. The operator
+chose the common SaaS rule — **the workspace keeps the paid plan until the
+period ends, then becomes Free; no credit, no refund** — and kept paid → paid
+immediate and prorated, because that credit (or charge) lands on the next
+invoice the org will pay. Choices, each with the one it beat:
+
+1. **Stripe ends the subscription; we do not.** The change sets
+   `cancel_at_period_end=true` (with `proration_behavior=none`, stated rather
+   than left to the default) and Stripe ends it at `current_period_end`,
+   sending `customer.subscription.deleted`. Stripe's docs say what that bills:
+   no proration or credit, and "for subscriptions that cancel at the end of the
+   period, the final invoice at the end of the period includes metered usage
+   from the last billing period" — so AI-read overage accrued before the end is
+   still invoiced (on the period's last invoice, where `invoice_now` used to put
+   it). The `cancel_at` enum (`max_period_end`) is the newer spelling in the
+   pinned `2026-11-18.endive` reference; the boolean was kept because it is
+   still current there, means exactly "at the period end", and is undone by
+   setting it back to `false`. A subscription schedule (phase to a free price,
+   then cancel) was the heavier alternative: two objects to keep in sync for a
+   move that is one flag.
+2. **Our row records the move; entitlements do not change until it happens.**
+   `subscriptions.pending_plan_id` + `pending_plan_effective_at` (migration
+   0140, control plane only) — the "pending-plan state our row does not model"
+   §480 named as the reason not to do this. The row stays `active` on the paid
+   plan, so every entitlement check, the meter and the summary keep reading the
+   plan the org paid for. A separate scheduled-changes table was rejected: one
+   live subscription has at most one pending move, and two columns beside the
+   row are what every reader already loads. Audited
+   `billing.plan_change_scheduled`.
+3. **The move is applied by whoever learns the period ended first, by one
+   function.** `scheduled_downgrade.apply_scheduled_downgrade` repoints the row
+   onto the free plan, live, without a provider id — the shape the immediate
+   cancel always left, so nothing downstream learns a new state. The webhook
+   calls it when an event would cancel a row that has a pending plan (instead
+   of canceling it, which would leave the org on no subscription); the dunning
+   sweep — already the owner of "a terminal webhook never came" — calls it when
+   the date has passed and Stripe says the subscription is canceled, or at once
+   for a row no live provider bills (`mock`). A separate sweep was rejected: it
+   would need its own enable flag, health entry and loop for a handful of rows a
+   month, and dunning already asks the provider before it touches a live row.
+   The sweep also drops a pending move the provider has renewed
+   (`cancel_at_period_end` false again) rather than move an org Stripe is still
+   billing for the paid plan.
+4. **Which moves wait.** Paid → free on an `active` or `trialing`
+   subscription. A `past_due` one moves at once (it has not paid for the period
+   it would keep), as does a live-provider row whose provider id was lost
+   (there is nothing to end later; `provider_sync` finds and cancels any stray,
+   §480). One predicate, `waits_for_period_end`, serves the preview and the
+   change, so the review never describes a different move than the confirm
+   makes.
+5. **Undo is first-class.** "Keep Growth" (`POST
+   /api/billing/scheduled-change/cancel`, admin/cfo) sets
+   `cancel_at_period_end=false` and clears the row, audited
+   `billing.scheduled_change_canceled`; idempotent, refused
+   `scheduled_change_already_due` once the date has passed. Choosing another
+   **paid** plan while a move is pending also clears it — in the same Stripe
+   request as the item swap (`cancel_at_period_end=false` beside
+   `always_invoice`), previewed with `subscription_details[cancel_at_period_end]=false`
+   and announced in the review ("This also cancels your move to Free on …").
+   Requiring Keep first and then a separate change was rejected as two
+   confirmations for one intent. The picker does not offer the pending free
+   plan again; re-confirming it is a no-op (`already_scheduled`) in any case.
+6. **The preview of a scheduled move asks Stripe nothing.** There is no
+   charge and no credit to price, so it answers `"0.00"` / `"0.00"`, nothing
+   recurring, and `effective_at` (Stripe's period end as last copied onto the
+   row; the row's own period on `mock`); the change records Stripe's answer to
+   the schedule call. The confirm still requires a current quote and holds it
+   to "nothing due". The review reads "You keep Growth until 1 December 2026,
+   then move to Free."; the button stays "Confirm".
+
+**Audit writes follow their caller's existing rule**, deliberately: the
+schedule, the Keep and the webhook's move use `dispatch_auth_audit` (fail-soft,
+written before the commit), as `change_plan` and every other webhook status
+change already do — a webhook that raised on an audit blip would 500, Stripe
+would redeliver, and the move would be retried against a row that already
+moved. The dunning sweep's move uses its raising `_record_audit`, as its
+cancellations do (§ the sweep's docstring): a failed audit there rolls the move
+back and the next tick retries it. Making the webhook's audit raising too is a
+change to the whole webhook path, not to this feature.
+
+The Terms (clause 5.5) now say the same: a change to a no-charge plan takes
+effect at the end of the period, as a cancellation already did under 5.8.
+Also in this change: the card-saved toast no longer says "Your subscription is
+now charged to this card." when no live provider subscription exists (a Free
+workspace adding a card on its way to an upgrade); it says "Card saved." there
+(`types/billing.ts::cardSavedMessageKey`).
+
+`backend/docs/billing.md` § A move to Free waits for the end of the paid
+period; `backend/tests/test_billing_stripe_subscriptions.py`,
+`backend/tests/test_migration_0140_subscription_pending_plan.py`,
+`frontend/tests-e2e/billing/billing.spec.ts`.

@@ -57,6 +57,11 @@ from app.services.billing.plan_preview import (
     preview_plan_change,
 )
 from app.services.billing.provider_sync import ProviderLegRefused
+from app.services.billing.scheduled_downgrade import (
+    ALREADY_DUE,
+    keep_current_plan,
+    pending_plan_view,
+)
 from app.services.billing_adapters import get_billing_adapter
 from app.services.billing_adapters.base import (
     BillingNotConfigured,
@@ -99,6 +104,10 @@ BILLING_REFUSALS: dict[str, tuple[int, str]] = {
     "plan_change_in_progress": (
         status.HTTP_409_CONFLICT,
         "Another plan change is in progress. Try again in a minute.",
+    ),
+    ALREADY_DUE: (
+        status.HTTP_409_CONFLICT,
+        "Your move to the new plan has already taken effect, so it can no longer be undone.",
     ),
     STALE_QUOTE: (
         status.HTTP_409_CONFLICT,
@@ -149,6 +158,15 @@ class PlanView(BaseModel):
     trial_days: int
 
 
+class ScheduledChangeView(BaseModel):
+    """A move to another plan that waits for the end of the paid period
+    (decisions §483): the org keeps its current plan until ``effective_at``."""
+
+    plan_code: str
+    plan_name: str
+    effective_at: datetime
+
+
 class SubscriptionView(BaseModel):
     status: str
     current_period_start: datetime | None
@@ -156,6 +174,8 @@ class SubscriptionView(BaseModel):
     trial_end: datetime | None
     # Whether a live provider subscription backs this (always False on mock).
     externally_managed: bool
+    # A pending move to a free plan at the period end, else null.
+    scheduled_change: ScheduledChangeView | None = None
 
 
 class AiUsageView(BaseModel):
@@ -259,12 +279,21 @@ async def get_subscription(
         # those told the customer their billing period was unknown while the
         # plan-change screen quietly prorated `0.00` off the same absence.
         window = current_period(subscription, now=datetime.now(UTC))
+        scheduled: ScheduledChangeView | None = None
+        pending = await pending_plan_view(control_db, subscription)
+        if pending is not None and subscription.pending_plan_effective_at is not None:
+            scheduled = ScheduledChangeView(
+                plan_code=pending.code,
+                plan_name=pending.name,
+                effective_at=subscription.pending_plan_effective_at,
+            )
         sub_view = SubscriptionView(
             status=subscription.status,
             current_period_start=window.start,
             current_period_end=window.end,
             trial_end=subscription.trial_end,
             externally_managed=subscription.external_subscription_id is not None,
+            scheduled_change=scheduled,
         )
 
     usage = await rollup_usage(tenant_db, organization_id=org.id, period=period)
@@ -432,6 +461,11 @@ class PlanChangePreviewResponse(BaseModel):
     expires_at: datetime
     # A paid target with no card on file: add one before confirming.
     payment_method_required: bool
+    # When the move takes effect, if not on confirm: a move to a free plan
+    # keeps the current plan until its period ends (decisions §483). Null = now.
+    effective_at: datetime | None = None
+    # Confirming cancels the org's pending move to a free plan.
+    clears_scheduled_change: bool = False
 
 
 @router.post("/change-plan/preview", response_model=PlanChangePreviewResponse)
@@ -477,6 +511,8 @@ async def preview_subscription_plan_change(
         proration_date=int(preview.proration_date.timestamp()),
         expires_at=preview.expires_at,
         payment_method_required=preview.payment_method_required,
+        effective_at=preview.effective_at,
+        clears_scheduled_change=preview.clears_scheduled_change,
     )
 
 
@@ -507,6 +543,10 @@ class PlanChangeResponse(BaseModel):
     old_plan_code: str
     new_plan_code: str
     proration: ProrationView
+    # The move waits for the end of the paid period (paid → free, decisions
+    # §483): the org stays on `old_plan_code` until `effective_at`.
+    scheduled: bool = False
+    effective_at: datetime | None = None
 
 
 @router.post("/change-plan", response_model=PlanChangeResponse)
@@ -526,8 +566,11 @@ async def change_subscription_plan(
     the org is already on is a successful no-op (``changed=false``, zero
     proration) — a retry can't double-charge. 404 when the org has no live
     subscription or the target plan is unknown/inactive. Every applied change
-    writes an append-only ``billing.plan_changed`` audit row. Money in the
-    response is an exact decimal string.
+    writes an append-only ``billing.plan_changed`` audit row. A move from a paid
+    plan to a free one is scheduled for the end of the paid period instead
+    (``scheduled: true`` + ``effective_at``, audited
+    ``billing.plan_change_scheduled``; decisions §483) — nothing is charged or
+    credited. Money in the response is an exact decimal string.
     """
     quote = PlanChangeQuote(
         proration_date=datetime.fromtimestamp(body.proration_date, tz=UTC),
@@ -565,7 +608,46 @@ async def change_subscription_plan(
             unused_days=result.proration.unused_days,
             period_days=result.proration.period_days,
         ),
+        scheduled=result.scheduled,
+        effective_at=result.effective_at,
     )
+
+
+class KeepPlanResponse(BaseModel):
+    # False when nothing was pending (an idempotent retry).
+    cleared: bool
+    plan_code: str
+
+
+@router.post("/scheduled-change/cancel", response_model=KeepPlanResponse)
+async def cancel_scheduled_plan_change(
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_CFO)),
+    control_db: AsyncSession = Depends(get_control_db),
+) -> KeepPlanResponse:
+    """Keep the current plan: cancel a move to a free plan that is waiting for
+    the end of the paid period (decisions §483).
+
+    admin/cfo (the same gate as ``change-plan``). With a live provider the
+    subscription's scheduled end is cleared at the provider first; nothing is
+    charged. Writes a ``billing.scheduled_change_canceled`` audit row.
+    Idempotent: with nothing pending it answers ``cleared: false``. 404 when
+    the org has no live subscription; 409 ``scheduled_change_already_due``
+    once the period has ended, and the other coded refusals of ``change-plan``.
+    """
+    try:
+        result = await keep_current_plan(control_db, org=org, actor_id=user.id)
+    except PlanChangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan change not available."
+        ) from exc
+    except ProviderLegRefused as exc:
+        raise _billing_refusal(exc.code) from exc
+    except BillingNotConfigured as exc:
+        raise _billing_refusal("billing_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("keep_current_plan", exc) from exc
+    return KeepPlanResponse(cleared=result.cleared, plan_code=result.plan_code)
 
 
 class BillingInvoiceView(BaseModel):
