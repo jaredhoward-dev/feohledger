@@ -23,9 +23,10 @@
 		getBillingPaymentMethods,
 		getBillingPlans,
 		getBillingSubscription,
+		previewBillingPlanChange,
 		setDefaultBillingPaymentMethod
 	} from '#lib/api/billing.ts';
-	import { formatMoney } from '#lib/utils/money.ts';
+	import { formatMoney, isPositiveAmount } from '#lib/utils/money.ts';
 	import { formatCount } from '#lib/utils/count.ts';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -46,10 +47,16 @@
 		BillingPaymentMethod,
 		BillingPaymentMethodsResponse,
 		BillingPlan,
+		BillingPlanChangePreview,
 		BillingPlanChangeResponse,
 		BillingSubscriptionResponse
 	} from '#lib/types/billing.ts';
-	import { planChangeCardAction, planHighlights, rebateMeterGroups } from '#lib/types/billing.ts';
+	import {
+		PLAN_CHANGE_PREVIEW_STALE,
+		planChangeCardAction,
+		planHighlights,
+		rebateMeterGroups
+	} from '#lib/types/billing.ts';
 	import { formatDate, formatMonth } from '#lib/utils/time.ts';
 	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { PLAN_FEATURES, isPlanFeature, planFeatureLabelKey } from '#lib/types/planFeatures.ts';
@@ -137,8 +144,7 @@
 	}
 
 	// The section's "Add or replace card" button: where focus goes back to
-	// when the card panel closes (WCAG 2.4.3) — unless the plan dialog reopens
-	// for the retry, which takes focus itself.
+	// when the card panel closes (WCAG 2.4.3).
 	let addCardButton = $state<HTMLButtonElement | undefined>();
 
 	async function returnFocusToAddCard() {
@@ -150,22 +156,17 @@
 
 	function closeAddCard() {
 		cardFlowOpen = false;
-		// Walking away from the card form abandons the upgrade it was for.
-		pendingPlanCode = null;
-		pendingPlanName = null;
 		returnFocusToAddCard();
 	}
 
+	/** A card saved from the payment-methods section. Saving a card only
+	 *  saves the card — it never changes the plan (decisions §482). */
 	async function onCardSaved(res: BillingPaymentMethodsResponse) {
 		paymentMethods = res.payment_methods;
 		pmError = null;
 		cardFlowOpen = false;
 		toast(m('billing.card.saved'), 'success');
-		const pending = pendingPlanCode;
-		pendingPlanCode = null;
-		pendingPlanName = null;
-		if (pending) await retryPlanChange(pending);
-		else await returnFocusToAddCard();
+		await returnFocusToAddCard();
 	}
 
 	/**
@@ -178,9 +179,10 @@
 	 * expired meanwhile, the auth wall's `next` drops the secret too —
 	 * `utils/postLoginRedirect.ts::SECRET_QUERY_PARAMS`.)
 	 *
-	 * Resolves to the plan code a card-refused upgrade stashed for THIS intent
-	 * before leaving (`utils/pendingPlanChange.ts`), once the card is saved —
-	 * the caller retries that change — else `null`.
+	 * Resolves to the plan code the plan dialog's card step stashed for THIS
+	 * intent before leaving (`utils/pendingPlanChange.ts`), once the card is
+	 * saved — the caller reopens the dialog at that plan's price review, and
+	 * nothing is charged until the reader confirms there — else `null`.
 	 */
 	async function finishRedirectedSetup(): Promise<string | null> {
 		const { id, status } = untrack(() => {
@@ -212,27 +214,42 @@
 		}
 	}
 
-	// Plan-change flow. `POST /api/billing/change-plan` APPLIES the change on
-	// the spot — there is no preview-only mode on the backend — so the modal
-	// says so before the confirm click, then shows the real proration the
-	// response returns. Idempotent: re-"changing" to the current plan comes
-	// back `changed: false` with a zero proration, rendered as a clean no-op
-	// rather than an error.
+	// Plan-change flow — one guided dialog (decisions §482):
+	//   pick a plan → (no card on file for a paid plan: add one, in the
+	//   dialog) → review what is charged today and what recurs, priced by the
+	//   provider (`POST /change-plan/preview`) → "Confirm and pay" →
+	//   result. Nothing is charged before that click: the confirm carries the
+	//   preview's figures, and the server refuses a stale one
+	//   (`plan_change_preview_stale`), after which a fresh preview is shown.
+	type PlanStep = 'pick' | 'card' | 'review' | 'result';
 	let showChangePlan = $state(false);
+	let planStep = $state<PlanStep>('pick');
 	let availablePlans = $state<BillingPlan[]>([]);
 	let plansLoading = $state(false);
 	let plansError = $state<string | null>(null);
 	let selectedPlanCode = $state<string | null>(null);
-	let changingPlan = $state(false);
+	let preview = $state<BillingPlanChangePreview | null>(null);
+	let previewLoading = $state(false);
+	let previewError = $state<string | null>(null);
+	let confirming = $state(false);
 	let changeError = $state<string | null>(null);
-	// What the dialog offers beside a refusal: add a card (none on file) or
-	// update it (the upgrade charge was declined). Keyed on the refusal code.
+	// What the review offers beside a refusal: add a card (none on file) or
+	// update it (the charge was declined). Keyed on the refusal code.
 	let changeErrorAction = $state<'add_card' | 'update_card' | null>(null);
-	// The plan a card-refused upgrade is waiting on: once a card is saved the
-	// change is retried for the reader, and the dialog reopens on its result.
-	let pendingPlanCode = $state<string | null>(null);
-	let pendingPlanName = $state<string | null>(null);
 	let changeResult = $state<BillingPlanChangeResponse | null>(null);
+	// The preview the reader confirmed, for the result view's wording.
+	let confirmedPreview = $state<BillingPlanChangePreview | null>(null);
+	// Keys the in-dialog card form, so every visit is a fresh SetupIntent.
+	let cardStepNonce = $state(0);
+	// Where focus lands when a step replaces the one it was on (WCAG 2.4.3).
+	let reviewContainer = $state<HTMLElement | undefined>();
+	let reviewFocus = $state<HTMLElement | undefined>();
+	let reviewAlert = $state<HTMLElement | undefined>();
+	let resultFocus = $state<HTMLElement | undefined>();
+	let pickForm = $state<HTMLFormElement | undefined>();
+	// Each preview request's ticket: an answer that arrives after the dialog
+	// was closed, reset or re-priced is dropped rather than steering it.
+	let previewSeq = 0;
 
 	async function loadAvailablePlans() {
 		plansLoading = true;
@@ -246,59 +263,157 @@
 		}
 	}
 
-	function openChangePlan() {
-		showChangePlan = true;
-		selectedPlanCode = null;
+	function resetChangeFlow() {
+		previewSeq += 1;
+		planStep = 'pick';
+		preview = null;
+		previewError = null;
 		changeError = null;
 		changeErrorAction = null;
 		changeResult = null;
+		confirmedPreview = null;
+	}
+
+	function openChangePlan() {
+		showChangePlan = true;
+		selectedPlanCode = null;
+		resetChangeFlow();
 		loadAvailablePlans();
 	}
 
 	function closeChangePlan() {
+		previewSeq += 1;
 		showChangePlan = false;
 	}
 
-	async function confirmPlanChange() {
+	/**
+	 * Price the selected plan and show the review — or, when the plan needs a
+	 * card and none is on file, the card step first. Charges nothing.
+	 * `focusAlert` keeps focus on the refusal the reader is being told about
+	 * (a stale price) instead of moving it to the new figures.
+	 */
+	async function loadPreview(code: string, { focusAlert = false } = {}) {
+		const ticket = ++previewSeq;
+		planStep = 'review';
+		previewLoading = true;
+		previewError = null;
+		preview = null;
+		// The picker's button is gone: hold focus on the step while it loads.
+		await tick();
+		if (!focusAlert) reviewContainer?.focus();
+		let priced: BillingPlanChangePreview | null = null;
+		let failure: string | null = null;
+		try {
+			priced = await previewBillingPlanChange(code);
+		} catch (e) {
+			failure = errorMessage(e, m('billing.plan.review.loadError'));
+		}
+		if (ticket !== previewSeq) return; // closed, reset or re-priced meanwhile
+		previewLoading = false;
+		if (priced?.payment_method_required) {
+			openCardStep();
+			return;
+		}
+		preview = priced;
+		previewError = failure;
+		await tick();
+		if (focusAlert && reviewAlert) reviewAlert.focus();
+		else if (preview) reviewFocus?.focus();
+		else reviewContainer?.focus();
+	}
+
+	function continueToReview() {
 		if (!selectedPlanCode) return;
-		changingPlan = true;
+		changeError = null;
+		changeErrorAction = null;
+		loadPreview(selectedPlanCode);
+	}
+
+	function openCardStep() {
+		cardStepNonce += 1;
+		planStep = 'card';
+	}
+
+	/** The card step's card is saved: refresh the list and price the change
+	 *  again (the review is the next step — saving never applies the plan). */
+	async function onCardStepSaved(res: BillingPaymentMethodsResponse) {
+		paymentMethods = res.payment_methods;
+		pmError = null;
+		toast(m('billing.card.saved'), 'success');
+		changeError = null;
+		changeErrorAction = null;
+		if (selectedPlanCode) await loadPreview(selectedPlanCode);
+	}
+
+	async function backToPick() {
+		previewSeq += 1;
+		changeError = null;
+		changeErrorAction = null;
+		planStep = 'pick';
+		// Back on the plan the reader had chosen (or the group's first radio).
+		await tick();
+		const radios = pickForm?.querySelectorAll<HTMLInputElement>('input[name="plan-code"]:not(:disabled)');
+		const chosen = [...(radios ?? [])].find((r) => r.checked) ?? radios?.[0];
+		chosen?.focus();
+	}
+
+	/** The reader's "Confirm and pay": the only call that changes the plan. */
+	async function confirmPlanChange() {
+		if (!preview || confirming) return;
+		const confirmed = preview;
+		confirming = true;
 		changeError = null;
 		changeErrorAction = null;
 		try {
-			changeResult = await changeBillingPlan(selectedPlanCode);
-			// Refresh the plan/usage surface behind the modal so it reflects the
-			// new plan by the time the user closes the dialog.
-			await load();
+			changeResult = await changeBillingPlan(confirmed);
+			confirmedPreview = confirmed;
+			planStep = 'result';
+			// Refresh the surface behind the dialog so it shows the new plan
+			// (and the new receipt) by the time the reader closes it.
+			await Promise.all([load(), loadInvoices()]);
+			await tick();
+			resultFocus?.focus();
 		} catch (e) {
+			const code = e instanceof ApiError ? e.code : null;
 			changeError = errorMessage(e, m('billing.plan.changeModal.changeFailed'));
-			changeErrorAction = planChangeCardAction(e instanceof ApiError ? e.code : null);
+			changeErrorAction = planChangeCardAction(code);
+			// The figure moved on: show the current one, to confirm again.
+			if (code === PLAN_CHANGE_PREVIEW_STALE && selectedPlanCode) {
+				await loadPreview(selectedPlanCode, { focusAlert: true });
+			}
 		} finally {
-			changingPlan = false;
+			confirming = false;
 		}
 	}
 
-	/** "Add a card" / "Update card" from the dialog: remember the chosen plan,
-	 *  close the dialog and open the card form in the payment-methods section
-	 *  (the panel takes focus and scrolls itself into view). */
-	function addCardForPlan() {
-		if (!selectedPlanCode) return;
-		pendingPlanCode = selectedPlanCode;
-		pendingPlanName = planName(selectedPlanCode);
-		showChangePlan = false;
-		startAddCard();
-	}
-
-	/** Re-run the refused change once a card is on file, in the reopened dialog
-	 *  — so the reader sees its result (or its next refusal) where they left it. */
-	async function retryPlanChange(code: string) {
+	/** A card added inside the dialog from a redirect-based method came back:
+	 *  reopen the dialog at that plan's price review — never apply it. */
+	async function resumeReview(code: string) {
 		selectedPlanCode = code;
-		changeResult = null;
-		changeError = null;
-		changeErrorAction = null;
+		resetChangeFlow();
 		showChangePlan = true;
 		if (availablePlans.length === 0) await loadAvailablePlans();
-		await confirmPlanChange();
+		await loadPreview(code);
 	}
+
+	/** Money in a review sentence, from the server's exact string. */
+	function reviewMoney(amount: string, currency: string): string {
+		return formatMoney(amount, { currency });
+	}
+
+	/** The first day the new monthly price applies, as a reader says it. */
+	function reviewDate(iso: string | null): string {
+		return formatDate(iso, '—', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+	}
+
+	const planModalTitle = $derived(
+		{
+			pick: m('billing.plan.changeModal.selectHeading'),
+			card: m('billing.plan.changeModal.cardTitle'),
+			review: m('billing.plan.changeModal.reviewTitle'),
+			result: m('billing.plan.changeModal.successHeading')
+		}[planStep]
+	);
 
 	/** How many differentiators a picker card shows before "+N more" — enough
 	 *  to tell the plans apart without turning each row into a pricing table. */
@@ -348,11 +463,12 @@
 			load();
 			loadInvoices();
 			// A Stripe redirect return is finished before the list loads, so
-			// the list it shows already holds the new default card.
-			// A pending upgrade the redirect interrupted is retried after that.
+			// the list it shows already holds the new default card. A plan the
+			// card was being added for reopens at its price review — nothing
+			// is charged until the reader confirms there.
 			finishRedirectedSetup().then(async (pending) => {
 				await loadPaymentMethods();
-				if (pending) await retryPlanChange(pending);
+				if (pending) await resumeReview(pending);
 			});
 		}
 	});
@@ -381,15 +497,6 @@
 	const plan = $derived(data?.plan ?? null);
 	const subscription = $derived(data?.subscription ?? null);
 	const hasSubscription = $derived(plan !== null && subscription !== null);
-
-	/** Currency for the proration figure — the target plan's own currency,
-	 *  falling back to the (now-current) plan's currency defensively. */
-	const changedPlanCurrency = $derived(
-		changeResult
-			? (availablePlans.find((p) => p.code === changeResult!.new_plan_code)?.currency ??
-					plan?.currency)
-			: undefined
-	);
 
 	/** Whole-number usage counter rendered defensively (the API sends strings). */
 	function asCount(n: string | undefined): string {
@@ -684,7 +791,7 @@
 
 			{#if cardFlowOpen}
 				{#key cardFlowNonce}
-					<CardSetupPanel {pendingPlanName} {pendingPlanCode} onsaved={onCardSaved} onclose={closeAddCard} />
+					<CardSetupPanel onsaved={onCardSaved} onclose={closeAddCard} />
 				{/key}
 			{/if}
 
@@ -773,39 +880,31 @@
 	</div>
 </PageHeader>
 
-<!-- Plan-change dialog. `POST /api/billing/change-plan` applies the move on the
-     spot (no preview mode on the backend), so the confirm step says so plainly;
-     the result state then renders the REAL proration the response returned
-     (or a clean no-op message when `changed` is false). -->
+<!-- Plan-change dialog — one guided flow (decisions §482): pick → card (only
+     when a paid plan needs one) → review → result. The review shows the
+     provider's own figures for today and what recurs; "Confirm and pay" is the
+     only control that changes the plan or charges anything. -->
 <Modal
 	open={showChangePlan}
 	ariaLabel={m('billing.plan.changeModal.aria')}
-	title={changeResult
-		? m('billing.plan.changeModal.successHeading')
-		: m('billing.plan.changeModal.selectHeading')}
+	title={planModalTitle}
 	onclose={closeChangePlan}
 >
-	{#if changeResult}
+	{#if planStep === 'result' && changeResult}
 		<div class="change-result" data-testid="billing-plan-change-result">
 			{#if changeResult.changed}
-				<p>
+				<p tabindex="-1" bind:this={resultFocus}>
 					{m('billing.plan.changeModal.successChanged', {
 						plan: planName(changeResult.new_plan_code)
 					})}
 				</p>
-				<dl class="proration">
-					<dt>{m('billing.plan.changeModal.prorationLabel')}</dt>
-					<dd>
-						<Money
-							amount={changeResult.proration.amount}
-							currency={changedPlanCurrency}
-							accounting
-						/>
-					</dd>
-				</dl>
-				<p class="hint">{m('billing.plan.changeModal.prorationHint')}</p>
+				{#if confirmedPreview && isPositiveAmount(confirmedPreview.amount_due)}
+					<p class="hint">{m('billing.plan.changeModal.paidResult')}</p>
+				{:else if confirmedPreview && isPositiveAmount(confirmedPreview.credit)}
+					<p class="hint">{m('billing.plan.changeModal.creditResult')}</p>
+				{/if}
 			{:else}
-				<p data-testid="billing-plan-change-noop">
+				<p data-testid="billing-plan-change-noop" tabindex="-1" bind:this={resultFocus}>
 					{m('billing.plan.changeModal.successNoop', {
 						plan: planName(changeResult.new_plan_code)
 					})}
@@ -817,11 +916,141 @@
 				</button>
 			</div>
 		</div>
+	{:else if planStep === 'card'}
+		<!-- Keyed: each visit starts a fresh SetupIntent. Saving the card moves on
+		     to the review; it never changes the plan. -->
+		{#key cardStepNonce}
+			<CardSetupPanel
+				pendingPlanName={selectedPlanCode ? planName(selectedPlanCode) : null}
+				pendingPlanCode={selectedPlanCode}
+				onsaved={onCardStepSaved}
+				onclose={backToPick}
+			/>
+		{/key}
+	{:else if planStep === 'review'}
+		<div class="review" data-testid="billing-plan-review" tabindex="-1" bind:this={reviewContainer}>
+			{#if changeError}
+				<!-- Outside the figures, so a refusal stays put (and keeps focus)
+				     while a stale price is re-fetched beneath it. -->
+				<div
+					class="state error change-error"
+					role="alert"
+					tabindex="-1"
+					bind:this={reviewAlert}
+					data-testid="billing-plan-change-error"
+				>
+					<p>{changeError}</p>
+					{#if changeErrorAction}
+						<!-- No card on file / the card was declined: the card step,
+						     then this review again with a fresh price. -->
+						<button
+							type="button"
+							class="btn-primary"
+							onclick={openCardStep}
+							data-testid="billing-plan-change-add-card"
+						>
+							{changeErrorAction === 'add_card'
+								? m('billing.plan.changeModal.addCard')
+								: m('billing.plan.changeModal.updateCard')}
+						</button>
+					{/if}
+				</div>
+			{/if}
+			{#if previewLoading}
+				<LoadingState label={m('billing.plan.review.loading')} />
+				<div class="modal-footer">
+					<button type="button" class="btn-cancel" onclick={backToPick}>
+						{m('billing.plan.review.back')}
+					</button>
+				</div>
+			{:else if previewError}
+				<LoadError
+					message={previewError}
+					onretry={() => selectedPlanCode && loadPreview(selectedPlanCode)}
+					testId="billing-plan-review-error"
+				/>
+				<div class="modal-footer">
+					<button type="button" class="btn-cancel" onclick={backToPick}>
+						{m('billing.plan.review.back')}
+					</button>
+				</div>
+			{:else if preview}
+				{#if preview.already_on_plan}
+					<p data-testid="billing-plan-change-noop" tabindex="-1" bind:this={reviewFocus}>
+						{m('billing.plan.changeModal.successNoop', { plan: planName(preview.plan_code) })}
+					</p>
+					<div class="modal-footer">
+						<button type="button" class="btn-primary" onclick={closeChangePlan}>
+							{m('billing.plan.changeModal.done')}
+						</button>
+					</div>
+				{:else}
+					<p class="review-summary" tabindex="-1" bind:this={reviewFocus}>
+						{m('billing.plan.review.summary', {
+							from: plan?.name ?? '—',
+							to: planName(preview.plan_code)
+						})}
+					</p>
+					<!-- The provider's figures, as the server sent them. -->
+					<ul class="review-figures" data-testid="billing-plan-review-figures">
+						<li data-testid="billing-plan-review-today">
+							{isPositiveAmount(preview.amount_due)
+								? m('billing.plan.review.payToday', {
+										amount: reviewMoney(preview.amount_due, preview.currency)
+									})
+								: m('billing.plan.review.nothingToday')}
+						</li>
+						{#if isPositiveAmount(preview.credit)}
+							<li data-testid="billing-plan-review-credit">
+								{m('billing.plan.review.credit', {
+									amount: reviewMoney(preview.credit, preview.currency)
+								})}
+							</li>
+						{/if}
+						<li data-testid="billing-plan-review-recurring">
+							{preview.next_amount !== null && preview.next_date
+								? m('billing.plan.review.thenMonthly', {
+										amount: reviewMoney(preview.next_amount, preview.currency),
+										date: reviewDate(preview.next_date)
+									})
+								: m('billing.plan.review.noMonthly', { plan: planName(preview.plan_code) })}
+						</li>
+					</ul>
+					{#if data?.ai_usage?.overage_unit_price}
+						<!-- The current plan bills AI-read overage: what accrues up to the
+						     change is invoiced with it, beyond the figure above (§482). -->
+						<p class="hint" data-testid="billing-plan-review-overage">
+							{m('billing.plan.review.overageNote')}
+						</p>
+					{/if}
+
+					<div class="modal-footer">
+						<button type="button" class="btn-cancel" onclick={backToPick} disabled={confirming}>
+							{m('billing.plan.review.back')}
+						</button>
+						<button
+							type="button"
+							class="btn-primary"
+							onclick={confirmPlanChange}
+							disabled={confirming}
+							data-testid="billing-plan-confirm"
+						>
+							{confirming
+								? m('billing.plan.review.confirming')
+								: isPositiveAmount(preview.amount_due)
+									? m('billing.plan.review.confirmPay')
+									: m('billing.plan.review.confirm')}
+						</button>
+					</div>
+				{/if}
+			{/if}
+		</div>
 	{:else}
 		<form
+			bind:this={pickForm}
 			onsubmit={(e) => {
 				e.preventDefault();
-				confirmPlanChange();
+				continueToReview();
 			}}
 		>
 			{#if plansLoading}
@@ -892,27 +1121,7 @@
 					{/each}
 				</fieldset>
 
-				{#if changeError}
-					<div class="state error change-error" role="alert" data-testid="billing-plan-change-error">
-						<p>{changeError}</p>
-						{#if changeErrorAction}
-							<!-- No card on file / the card was declined: go straight to
-							     the card form; the change is retried once it is saved. -->
-							<button
-								type="button"
-								class="btn-primary"
-								onclick={addCardForPlan}
-								data-testid="billing-plan-change-add-card"
-							>
-								{changeErrorAction === 'add_card'
-									? m('billing.plan.changeModal.addCard')
-									: m('billing.plan.changeModal.updateCard')}
-							</button>
-						{/if}
-					</div>
-				{/if}
-
-				<p class="apply-notice">{m('billing.plan.changeModal.applyNotice')}</p>
+				<p class="apply-notice">{m('billing.plan.changeModal.pickNotice')}</p>
 
 				<div class="modal-footer">
 					<button type="button" class="btn-cancel" onclick={closeChangePlan}>
@@ -921,12 +1130,10 @@
 					<button
 						type="submit"
 						class="btn-primary"
-						disabled={!selectedPlanCode || changingPlan}
-						data-testid="billing-change-plan-confirm"
+						disabled={!selectedPlanCode}
+						data-testid="billing-change-plan-continue"
 					>
-						{changingPlan
-							? m('billing.plan.changeModal.changing')
-							: m('billing.plan.changeModal.changeButton')}
+						{m('billing.plan.changeModal.continue')}
 					</button>
 				</div>
 			{/if}
@@ -1386,29 +1593,35 @@
 		margin: 0 0 1rem;
 	}
 
-	.change-result .proration {
+	.review {
 		display: flex;
-		align-items: baseline;
-		justify-content: space-between;
-		gap: 1rem;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.review .hint {
+		margin: 0;
+		font-size: 0.85rem;
+		color: var(--text-muted);
+	}
+
+	.review-summary {
+		margin: 0;
+		font-weight: 600;
+	}
+
+	/* The figures the reader is confirming. Muted text on --surface-2 is
+	   4.34:1, so this panel uses --text (1.4.3). */
+	.review-figures {
+		margin: 0;
+		padding: 0.75rem 1rem 0.75rem 2rem;
 		background: var(--surface-2);
 		border: 1px solid var(--border);
 		border-radius: var(--radius-sm);
-		padding: 0.75rem 1rem;
-		margin: 0.75rem 0;
-	}
-
-	.change-result .proration dt {
-		/* Muted text on --surface-2 is 4.34:1; only --text clears 4.5:1 there.
-		   /billing was not in the axe route list, so this one was latent. */
 		color: var(--text);
-		font-size: 0.85rem;
-	}
-
-	.change-result .proration dd {
-		margin: 0;
-		font-weight: 600;
-		font-size: 1.1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
 	}
 
 	.change-result .hint {

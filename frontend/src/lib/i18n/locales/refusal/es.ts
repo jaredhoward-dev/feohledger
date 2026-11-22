@@ -75,6 +75,7 @@ export const messages = {
 	'refusal.billingPaymentDeclined': "Su tarjeta fue rechazada, así que su plan no ha cambiado. Actualice su tarjeta e inténtelo de nuevo.",
 	'refusal.billingNotConfigured': "Los planes de pago aún no están disponibles porque la facturación no está configurada en esta instalación. Contacte con nuestro equipo.",
 	'refusal.planChangeInProgress': "Ya hay otro cambio de plan en curso. Inténtelo de nuevo en un momento.",
+	'refusal.planChangePreviewStale': "El precio que confirmó ya no está actualizado, así que no se cobró nada. Revise el nuevo importe y vuelva a confirmar.",
 	'refusal.setupIntentNotFound': "No se encontró esa configuración de tarjeta. Vuelva a empezar a añadir la tarjeta.",
 	'refusal.setupIntentIncomplete': "La configuración de la tarjeta aún no está completa. Termine de introducir los datos de su tarjeta e inténtelo de nuevo.",
 	'refusal.creditMemoInvoiceSettled': "La factura está en estado {status}: ya no se realizará ningún pago contra ella, por lo que un crédito aplicado no reduciría nada. Deje la nota de crédito abierta y aplíquela a la próxima factura del proveedor.",

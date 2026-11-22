@@ -38,6 +38,7 @@ from app.models.billing import Plan, Subscription
 from app.models.organization import Organization
 from app.models.workflow import AuditLog
 from app.services.billing.plan_change import change_plan
+from app.services.billing.plan_preview import PlanChangeQuote, preview_plan_change
 from app.services.billing.provider_sync import (
     LEASE_KEY,
     ProviderLegRefused,
@@ -46,8 +47,10 @@ from app.services.billing.provider_sync import (
 from app.services.billing.webhook_processing import apply_billing_event
 from app.services.billing_adapters.base import (
     BillingPaymentDeclined,
+    BillingProviderError,
     BillingWebhookEvent,
     CreateSubscriptionRequest,
+    PlanChangePreviewRequest,
     SetupIntentRejected,
 )
 from app.services.billing_adapters.stripe_billing import StripeBillingAdapter
@@ -72,6 +75,12 @@ class FakeStripe:
         self.prices: dict[str, str] = {}  # lookup_key -> price id
         self.replies: dict[str, tuple[int, dict]] = {}  # Idempotency-Key -> answer
         self.decline = False
+        # What `POST /v1/invoices/create_preview` answers, in minor units, per
+        # kind of change previewed (a test moves one to make a quote stale).
+        self.preview_due = {"create": 1480, "update": 7500, "cancel": 0}
+        self.preview_total = {"create": 1480, "update": 7500, "cancel": -1500}
+        self.recurring_total = 4900
+        self.preview_currency: str | None = "usd"
         self._n = 0
 
     def _id(self, prefix: str) -> str:
@@ -159,6 +168,27 @@ class FakeStripe:
             if method == "GET":
                 return httpx.Response(200, json={"data": []})
             return httpx.Response(200, json={"id": "mtr_1"})
+        if method == "POST" and path == "/v1/invoices/create_preview":
+            form = self.form(request)
+            if form.get("preview_mode") == "recurring":
+                due = total = self.recurring_total
+            else:
+                if form.get("subscription_details[cancel_now]") == "true":
+                    kind = "cancel"
+                elif "subscription" in form:
+                    kind = "update"
+                else:
+                    kind = "create"
+                due, total = self.preview_due[kind], self.preview_total[kind]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "upcoming_in_1",
+                    "amount_due": due,
+                    "total": total,
+                    "currency": self.preview_currency,
+                },
+            )
         if method == "GET" and path == "/v1/payment_methods":
             cid = request.url.params["customer"]
             data = [
@@ -438,6 +468,156 @@ async def test_setup_intent_adoption_refuses_foreign_and_unfinished(fake_stripe)
     assert fake_stripe.customer("cus_me")["invoice_settings"]["default_payment_method"] == "pm_new"
 
 
+# ---------------------------------------------------------------------------
+# Preview — POST /v1/invoices/create_preview (decisions §482).
+# ---------------------------------------------------------------------------
+
+
+def _preview_request(**overrides) -> PlanChangePreviewRequest:
+    base = {
+        "new_plan_code": "growth",
+        "to_paid": True,
+        "old_monthly_price": Decimal("0.00"),
+        "new_monthly_price": Decimal("49.00"),
+        "currency": "USD",
+        "proration_date": CHANGE_AT,
+        "period_start": datetime(2026, 6, 1, tzinfo=UTC),
+        "period_end": datetime(2026, 7, 1, tzinfo=UTC),
+        "customer_id": "cus_org",
+        "price_id": "price_base",
+        "overage_price_id": "price_over_1",
+    }
+    return PlanChangePreviewRequest(**{**base, **overrides})
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_new_subscription_prices_the_create_it_will_make(fake_stripe):
+    adapter = _adapter(fake_stripe)
+    anchor = next_month_start(CHANGE_AT)
+    preview = await adapter.preview_plan_change(_preview_request(billing_cycle_anchor=anchor))
+
+    first, recurring = fake_stripe.calls("POST", "/v1/invoices/create_preview")
+    # The same items, proration and anchor the create sends — the anchor in the
+    # endive preview's object form.
+    assert FakeStripe.form(first) == {
+        "customer": "cus_org",
+        "subscription_details[items][0][price]": "price_base",
+        "subscription_details[items][1][price]": "price_over_1",
+        "subscription_details[proration_behavior]": "create_prorations",
+        "subscription_details[billing_cycle_anchor][type]": "timestamp",
+        "subscription_details[billing_cycle_anchor][timestamp]": str(int(anchor.timestamp())),
+    }
+    assert FakeStripe.form(recurring) == {
+        "customer": "cus_org",
+        "subscription_details[items][0][price]": "price_base",
+        "subscription_details[items][1][price]": "price_over_1",
+        "preview_mode": "recurring",
+    }
+    assert first.headers["Stripe-Version"] == "2026-11-18.endive"
+    # Nothing created: a preview is never a charge.
+    assert fake_stripe.calls("POST", "/v1/subscriptions") == []
+    assert preview.amount_due == Decimal("14.80")
+    assert preview.currency == "USD"
+    assert preview.next_amount == Decimal("49.00")
+    assert preview.next_date == anchor
+
+
+@pytest.mark.asyncio
+async def test_preview_of_an_amendment_prices_the_swap_as_of_its_proration_date(fake_stripe):
+    _live_sub(fake_stripe, "sub_live")
+    fake_stripe.subscriptions["sub_live"]["items"].append({"id": "si_m", "price": "price_over_0"})
+    adapter = _adapter(fake_stripe)
+    preview = await adapter.preview_plan_change(
+        _preview_request(
+            external_subscription_id="sub_live",
+            old_monthly_price=Decimal("49.00"),
+            new_monthly_price=Decimal("199.00"),
+            price_id="price_scale",
+            overage_price_id="price_over_2",
+        )
+    )
+    first, recurring = fake_stripe.calls("POST", "/v1/invoices/create_preview")
+    swap = {
+        "subscription_details[items][0][id]": "si_sub_live",
+        "subscription_details[items][0][price]": "price_scale",
+        "subscription_details[items][1][id]": "si_m",
+        "subscription_details[items][1][price]": "price_over_2",
+    }
+    assert FakeStripe.form(first) == {
+        "subscription": "sub_live",
+        **swap,
+        "subscription_details[proration_behavior]": "always_invoice",
+        "subscription_details[proration_date]": str(int(CHANGE_AT.timestamp())),
+    }
+    assert FakeStripe.form(recurring) == {
+        "subscription": "sub_live",
+        **swap,
+        "subscription_details[proration_behavior]": "none",
+        "preview_mode": "recurring",
+    }
+    assert preview.amount_due == Decimal("75.00")
+    assert preview.next_amount == Decimal("49.00")
+    # From the subscription item's own window, not ours.
+    assert preview.next_date == datetime(2026, 7, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_move_to_free_prices_the_cancel_and_its_credit(fake_stripe):
+    _live_sub(fake_stripe, "sub_live")
+    adapter = _adapter(fake_stripe)
+    preview = await adapter.preview_plan_change(
+        _preview_request(
+            to_paid=False,
+            external_subscription_id="sub_live",
+            new_monthly_price=Decimal("0.00"),
+            price_id="price_free",
+            overage_price_id=None,
+        )
+    )
+    (only,) = fake_stripe.calls("POST", "/v1/invoices/create_preview")
+    assert FakeStripe.form(only) == {
+        "subscription": "sub_live",
+        "subscription_details[cancel_now]": "true",
+        "subscription_details[proration_behavior]": "create_prorations",
+    }
+    assert preview.amount_due == Decimal("0.00")
+    assert preview.total == Decimal("-15.00")  # unused time credited
+    assert preview.next_amount is None and preview.next_date is None
+    assert fake_stripe.subscriptions["sub_live"]["status"] == "active"  # not canceled
+
+
+@pytest.mark.asyncio
+async def test_a_preview_answer_without_an_amount_is_an_error_not_zero(fake_stripe):
+    fake_stripe.preview_due["create"] = None
+    adapter = _adapter(fake_stripe)
+    with pytest.raises(BillingProviderError):
+        await adapter.preview_plan_change(_preview_request())
+
+
+@pytest.mark.asyncio
+async def test_a_preview_answer_without_a_currency_is_an_error_not_the_plans(fake_stripe):
+    fake_stripe.preview_currency = None
+    adapter = _adapter(fake_stripe)
+    with pytest.raises(BillingProviderError):
+        await adapter.preview_plan_change(_preview_request())
+
+
+@pytest.mark.asyncio
+async def test_the_amendment_is_prorated_as_of_the_confirmed_instant(fake_stripe):
+    _live_sub(fake_stripe, "sub_live")
+    adapter = _adapter(fake_stripe)
+    await adapter.change_subscription_plan(
+        "sub_live",
+        price_id="price_scale",
+        overage_price_id=None,
+        plan_code="scale",
+        idempotency_key="k",
+        proration_date=CHANGE_AT,
+    )
+    (update,) = fake_stripe.calls("POST", "/v1/subscriptions/sub_live")
+    assert FakeStripe.form(update)["proration_date"] == str(int(CHANGE_AT.timestamp()))
+
+
 def _signed(adapter: StripeBillingAdapter, payload: dict) -> tuple[dict, bytes]:
     import hashlib
     import hmac
@@ -612,12 +792,48 @@ async def _org_billing(realdb, org_id) -> dict:
         return dict((org.settings or {}).get("billing") or {})
 
 
-async def _change(realdb, org_id, code, *, at=CHANGE_AT):
+async def _preview(realdb, org_id, code, *, at=CHANGE_AT):
+    async with realdb.control_sessionmaker()() as s:
+        org = (await s.execute(select(Organization).where(Organization.id == org_id))).scalar_one()
+        return await preview_plan_change(s, org=org, new_plan_code=f"{PREFIX}{code}", now=at)
+
+
+def _quote_of(preview) -> PlanChangeQuote:
+    return PlanChangeQuote(
+        proration_date=preview.proration_date,
+        amount_due=preview.amount_due,
+        currency=preview.currency,
+    )
+
+
+async def _change(realdb, org_id, code, *, at=CHANGE_AT, quote=None):
+    """Preview, then confirm what the preview showed — the only way a live
+    change is accepted (decisions §482). ``quote`` overrides what is confirmed."""
+    if quote is None:
+        quote = _quote_of(await _preview(realdb, org_id, code, at=at))
     async with realdb.control_sessionmaker()() as s:
         org = (await s.execute(select(Organization).where(Organization.id == org_id))).scalar_one()
         return await change_plan(
-            s, org=org, new_plan_code=f"{PREFIX}{code}", actor_id=None, change_at=at
+            s, org=org, new_plan_code=f"{PREFIX}{code}", actor_id=None, change_at=at, quote=quote
         )
+
+
+async def _post_change(c, code: str):
+    """The SPA's two calls: preview, then confirm with the figures it showed.
+    A refused preview is answered as is — the SPA never gets to confirm."""
+    preview = await c.post("/api/billing/change-plan/preview", json={"plan_code": code})
+    if preview.status_code != 200:
+        return preview
+    body = preview.json()
+    return await c.post(
+        "/api/billing/change-plan",
+        json={
+            "plan_code": code,
+            "proration_date": body["proration_date"],
+            "expected_amount_due": body["amount_due"],
+            "currency": body["currency"],
+        },
+    )
 
 
 async def _audit_details(realdb, sub_id) -> list[dict]:
@@ -660,7 +876,7 @@ async def test_endpoint_answers_payment_method_required_as_a_coded_409(realdb, f
     await _plan(realdb, "growth", "49.00")
     await _sub(realdb, org_a, free)
     async with realdb.client(key="a", role="admin") as c:
-        resp = await c.post("/api/billing/change-plan", json={"plan_code": f"{PREFIX}growth"})
+        resp = await _post_change(c, f"{PREFIX}growth")
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "payment_method_required"
 
@@ -697,6 +913,10 @@ async def test_free_to_paid_creates_the_stripe_subscription(
     assert details["provider"] == "stripe_billing"
     assert details["provider_action"] == "created"
     assert details["external_subscription_id"] == row.external_subscription_id
+    # What the customer confirmed is on the trail beside our estimate.
+    assert details["confirmed_amount_due"] == "14.80"
+    assert details["confirmed_currency"] == "USD"
+    assert details["quote_proration_date"] == CHANGE_AT.isoformat()
 
 
 @pytest.mark.asyncio
@@ -730,6 +950,8 @@ async def test_paid_to_paid_updates_items_and_paid_to_free_cancels(
     assert fake_stripe.calls("POST", "/v1/subscriptions") == []  # amended, not created
     (update,) = fake_stripe.calls("POST", "/v1/subscriptions/sub_live")
     assert FakeStripe.form(update)["items[0][id]"] == "si_b"
+    # Prorated as of the instant the confirmed preview was priced at.
+    assert FakeStripe.form(update)["proration_date"] == str(int(CHANGE_AT.timestamp()))
     assert (await _row(realdb, sub_id)).external_subscription_id == "sub_live"
 
     down = await _change(realdb, org_a, "free", at=CHANGE_AT + timedelta(days=1))
@@ -754,7 +976,7 @@ async def test_a_declined_upgrade_changes_nothing(realdb, fake_stripe, org_a):
     fake_stripe.decline = True
 
     async with realdb.client(key="a", role="admin") as c:
-        resp = await c.post("/api/billing/change-plan", json={"plan_code": f"{PREFIX}growth"})
+        resp = await _post_change(c, f"{PREFIX}growth")
     assert resp.status_code == 402, resp.text
     assert resp.json()["detail"]["code"] == "billing_payment_declined"
     row = await _row(realdb, sub_id)
@@ -851,7 +1073,7 @@ async def test_deployed_with_mock_refuses_a_paid_plan_but_not_the_way_down(
     sub_id = await _sub(realdb, org_a, free)
 
     async with realdb.client(key="a", role="admin") as c:
-        resp = await c.post("/api/billing/change-plan", json={"plan_code": f"{PREFIX}growth"})
+        resp = await _post_change(c, f"{PREFIX}growth")
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "billing_not_configured"
     assert (await _row(realdb, sub_id)).plan_id == free
@@ -1234,3 +1456,165 @@ async def test_dunning_leaves_a_live_row_to_the_provider_until_it_cancels(
         result = await run_dunning_once(s, now=far_future)
     assert result.canceled == 1
     assert (await _row(realdb, sub_id)).status == "canceled"
+
+
+# ---------------------------------------------------------------------------
+# Real-DB: nothing is charged without a confirmed, current preview (§482).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preview_endpoint_shows_the_providers_figures_and_asks_for_a_card(
+    realdb, fake_stripe, org_a
+):
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, free)
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")  # no card yet
+
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post(
+            "/api/billing/change-plan/preview", json={"plan_code": f"{PREFIX}growth"}
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["amount_due"] == "14.80"
+    assert body["credit"] == "0.00"
+    assert body["next_amount"] == "49.00"
+    assert body["currency"] == "USD"
+    assert body["payment_method_required"] is True
+    assert datetime.fromisoformat(body["next_date"]) == next_month_start(
+        datetime.fromtimestamp(body["proration_date"], tz=UTC)
+    )
+    # A preview charges and creates nothing, and moves no row.
+    assert fake_stripe.calls("POST", "/v1/subscriptions") == []
+    assert (await _row(realdb, sub_id)).plan_id == free
+
+
+@pytest.mark.asyncio
+async def test_a_live_change_without_a_confirmed_preview_is_refused(realdb, fake_stripe, org_a):
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, free)
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
+    fake_stripe.add_card("cus_org")
+    async with realdb.control_sessionmaker()() as s:
+        org = (await s.execute(select(Organization).where(Organization.id == org_a))).scalar_one()
+        with pytest.raises(ProviderLegRefused) as exc:
+            await change_plan(
+                s, org=org, new_plan_code=f"{PREFIX}growth", actor_id=None, change_at=CHANGE_AT
+            )
+    assert exc.value.code == "plan_change_preview_stale"
+    assert fake_stripe.calls("POST", "/v1/subscriptions") == []
+    assert (await _row(realdb, sub_id)).plan_id == free
+
+
+@pytest.mark.asyncio
+async def test_a_quote_the_provider_now_prices_higher_charges_nothing(realdb, fake_stripe, org_a):
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, free)
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
+    fake_stripe.add_card("cus_org")
+    preview = await _preview(realdb, org_a, "growth")
+    assert preview.amount_due == Decimal("14.80")
+
+    fake_stripe.preview_due["create"] = 1481  # Stripe would now charge a cent more
+    with pytest.raises(ProviderLegRefused) as exc:
+        await _change(realdb, org_a, "growth", quote=_quote_of(preview))
+    assert exc.value.code == "plan_change_preview_stale"
+    assert fake_stripe.calls("POST", "/v1/subscriptions") == []
+    assert (await _row(realdb, sub_id)).plan_id == free
+    assert LEASE_KEY not in await _org_billing(realdb, org_a)  # released
+
+
+@pytest.mark.asyncio
+async def test_a_quote_from_last_month_or_past_its_lifetime_is_refused(realdb, fake_stripe, org_a):
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    await _plan(realdb, "growth", "49.00")
+    await _sub(realdb, org_a, free)
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
+    fake_stripe.add_card("cus_org")
+
+    # Priced five minutes before midnight UTC on the 30th; confirmed two minutes
+    # after: inside the lifetime, but the anchor (and period) moved on.
+    before = datetime(2026, 6, 30, 23, 55, tzinfo=UTC)
+    quote = _quote_of(await _preview(realdb, org_a, "growth", at=before))
+    with pytest.raises(ProviderLegRefused) as exc:
+        await _change(
+            realdb, org_a, "growth", at=datetime(2026, 7, 1, 0, 2, tzinfo=UTC), quote=quote
+        )
+    assert exc.value.code == "plan_change_preview_stale"
+
+    quote = _quote_of(await _preview(realdb, org_a, "growth"))
+    with pytest.raises(ProviderLegRefused) as exc:
+        await _change(realdb, org_a, "growth", at=CHANGE_AT + timedelta(minutes=11), quote=quote)
+    assert exc.value.code == "plan_change_preview_stale"
+    assert fake_stripe.calls("POST", "/v1/subscriptions") == []
+
+
+@pytest.mark.asyncio
+async def test_saving_a_card_never_changes_the_plan(realdb, fake_stripe, org_a):
+    """The production report: saving a card used to retry the refused upgrade
+    and Stripe charged a prorated amount nobody had confirmed. Adopting a card
+    now does exactly that and nothing more."""
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, free)
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
+    fake_stripe.setup_intents["seti_new"] = {
+        "id": "seti_new",
+        "customer": "cus_org",
+        "status": "succeeded",
+        "payment_method": "pm_new",
+    }
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post(
+            "/api/billing/payment-method/default", json={"setup_intent_id": "seti_new"}
+        )
+    assert resp.status_code == 200, resp.text
+    assert fake_stripe.customer("cus_org")["invoice_settings"]["default_payment_method"] == "pm_new"
+    assert fake_stripe.calls("POST", "/v1/subscriptions") == []
+    assert [r for r in fake_stripe.requests if r.url.path.startswith("/v1/invoices")] == []
+    row = await _row(realdb, sub_id)
+    assert row.plan_id == free and row.external_subscription_id is None
+    assert await _audit_details(realdb, sub_id) == []
+
+
+@pytest.mark.asyncio
+async def test_a_confirmation_replays_and_a_fresh_quote_is_a_new_provider_request(
+    realdb, fake_stripe, org_a, _audit_engine_on_loop
+):
+    """The quote's instant is part of the provider Idempotency-Key: the same
+    confirmation sent twice is one request at Stripe (its stored answer is
+    replayed), and confirming a fresh preview after a decline is a NEW request
+    — not the same key with different parameters, which Stripe refuses."""
+    free = await _plan(realdb, "free", "0.00", overage=False)
+    await _plan(realdb, "growth", "49.00")
+    sub_id = await _sub(realdb, org_a, free)
+    await _set_billing(realdb, org_a, stripe_customer_id="cus_org")
+    fake_stripe.add_card("cus_org")
+    fake_stripe.decline = True
+
+    first = _quote_of(await _preview(realdb, org_a, "growth"))
+    for _ in range(2):
+        with pytest.raises(BillingPaymentDeclined):
+            await _change(realdb, org_a, "growth", quote=first)
+    keys = [r.headers["Idempotency-Key"] for r in fake_stripe.calls("POST", "/v1/subscriptions")]
+    assert len(keys) == 2 and keys[0] == keys[1]  # the replayed decline
+    assert str(int(first.proration_date.timestamp())) in keys[0]
+
+    fake_stripe.decline = False
+    later = CHANGE_AT + timedelta(minutes=1)
+    fresh = _quote_of(await _preview(realdb, org_a, "growth", at=later))
+    result = await _change(realdb, org_a, "growth", at=later, quote=fresh)
+    assert result.changed is True
+    creates = fake_stripe.calls("POST", "/v1/subscriptions")
+    assert creates[-1].headers["Idempotency-Key"] != keys[0]
+    assert len(fake_stripe.subscriptions) == 1  # charged once
+
+    # Confirming the same quote again is the already-on-plan no-op: no provider call.
+    again = await _change(realdb, org_a, "growth", at=later, quote=fresh)
+    assert again.changed is False
+    assert len(fake_stripe.calls("POST", "/v1/subscriptions")) == len(creates)
+    assert (await _row(realdb, sub_id)).external_subscription_id in fake_stripe.subscriptions

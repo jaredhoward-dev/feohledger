@@ -517,12 +517,11 @@ admin/cfo, PII-safe card metadata only, graceful not-configured / empty on
 no-customer / unconfigured) are shipped; the invoices/receipts + payment-method
 UI ships on `/billing` (`frontend/src/routes/billing/` — saved-cards list +
 add/replace-card flow, Stripe Elements when a publishable key is configured),
-and so does the **live plan-change UI** — a `Modal` picker over `GET
-/api/billing/plans` → an "applies immediately, prorates the current period"
-notice (there is no preview-only mode on the backend) → `POST
-/api/billing/change-plan` on confirm → the result view renders the real
-returned proration via `<Money>` (or a clean no-op message when `changed`
-comes back `false`). With a live provider a plan change also creates, amends
+and so does the **live plan-change UI** — one guided `Modal`: pick a plan
+over `GET /api/billing/plans` → a card step when a paid plan needs one → a
+review of the provider's own price from `POST /api/billing/change-plan/preview`
+(the adapter's `preview_plan_change`) → `POST /api/billing/change-plan` on
+"Confirm and pay", held to that price (decisions §482) → a result view. With a live provider a plan change also creates, amends
 or cancels the customer's Stripe subscription (`services/billing/provider_sync.py`,
 the adapter's `find_live_subscription` / `change_subscription_plan` /
 `cancel_subscription` / `ensure_default_payment_method` / `adopt_setup_intent`;

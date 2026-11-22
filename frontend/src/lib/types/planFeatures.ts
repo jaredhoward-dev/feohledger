@@ -77,6 +77,23 @@ export function planFeatureLabelKey(feature: PlanFeature): MessageKey {
 	return FEATURE_LABEL_KEYS[feature];
 }
 
+/**
+ * The label for a plan CODE an API reports (`/api/organization`'s and the
+ * partner overview's `plan` — the org's live subscription, decisions §482):
+ * a catalog tier's name, or `null` for a negotiated plan the client does not
+ * know (the caller shows the code itself).
+ */
+export function planCodeLabelKey(code: string | null | undefined): MessageKey | null {
+	return code && code in TIER_LABEL_KEYS ? TIER_LABEL_KEYS[code as CatalogTier] : null;
+}
+
+/** A plan code as a reader names it: the tier's name through `t` (the
+ *  page's `m`), else the code itself. */
+export function planCodeLabel(code: string, t: (key: MessageKey) => string): string {
+	const key = planCodeLabelKey(code);
+	return key ? t(key) : code;
+}
+
 export function planTierLabelKey(feature: PlanFeature): MessageKey {
 	return TIER_LABEL_KEYS[FEATURE_MIN_TIER[feature]];
 }

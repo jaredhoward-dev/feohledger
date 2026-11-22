@@ -24394,3 +24394,115 @@ and answers a create naming an inactive contact with 422. The status is what
 real Sage returned; its error code and message are assumed, and the adapter
 never reads them. `backend/docs/erp-integration.md` § Sage
 Business Cloud Accounting; `backend/tests/test_erp_sage_accounting_adapter.py`.
+
+## 482. Nothing is charged for a plan change until the customer confirms the provider's own price, and the org's plan is read from its live subscription (issue #746, 2026-11-21)
+
+In test mode the operator picked Growth with no card on file; the change was
+refused 409 `payment_method_required` and shown as a red error panel, and
+once the card was saved the page retried the change by itself and Stripe
+charged a prorated $14.80 the operator had never seen. Two defects: the SPA
+treated "save a card" as consent to the charge, and nothing anywhere showed
+the amount before it was taken. The fix makes the plan dialog one flow —
+pick → add a card (only when a paid plan needs one, as a step, not an error) →
+review → confirm → result — and makes the server refuse any charge the
+customer did not see. Choices, each with the one it beat:
+
+1. **The figures are the provider's, asked for in advance.** `POST
+   /api/billing/change-plan/preview` (same `admin, cfo` gate as the change)
+   answers what is due today, any credit, what recurs and from when, as exact
+   decimal strings. The live adapter prices the exact call the change will make
+   with `POST /v1/invoices/create_preview`: a new subscription with its
+   items, `create_prorations` and the same anchor on the 1st (the endive
+   preview takes `billing_cycle_anchor` as `{type: timestamp, timestamp}`); a
+   paid → paid swap with the same item form (one builder,
+   `stripe_billing._item_swap_form`), `always_invoice` and a
+   `proration_date`; a move to Free as `cancel_now` with
+   `create_prorations`. What recurs is a second preview in
+   `preview_mode=recurring` (Stripe prices no prorations in that mode). Our
+   own day-granular `compute_proration` was the alternative: it is an
+   estimate (§480) and it disagreed with Stripe's second-granular invoice, so
+   showing it would have shown the wrong number. The `mock` adapter prices
+   with it deterministically, which is honest there because the mock moves no
+   money. An adapter that cannot preview (the base default) cannot have a
+   change confirmed at all (`billing_not_configured`).
+2. **The confirm carries the quote, and the server holds the charge to it.**
+   `POST /change-plan` now requires `proration_date` (the preview's pricing
+   instant, Unix seconds), `expected_amount_due` (a decimal string; a JSON
+   number is a 422) and `currency`. With a live provider `change_plan` refuses
+   409 `plan_change_preview_stale` — before anything is charged — when the
+   quote is missing, older than **ten minutes** (`plan_preview.PREVIEW_TTL`),
+   stamped more than 30 s in the future, or from another UTC calendar month,
+   and, after taking the org's lease, re-asks the provider at the same
+   instant and refuses if it now wants **more** than the customer confirmed or
+   a different currency. The SPA then shows a fresh preview to confirm. Ten
+   minutes is long enough to read and press Confirm — the card form comes
+   before the review, and the SPA re-previews after it — and short enough that
+   the figure is still the provider's; the month rule exists because the
+   month decides a new subscription's anchor and the period a
+   `proration_date` must fall in. A signed, server-issued quote token was the
+   alternative; re-asking the provider proves the same thing (the figure is
+   still true) without a secret to manage, and it also catches a changed
+   balance or price.
+3. **Paid → paid charges exactly the preview.** The confirmed
+   `proration_date` is passed to the real `POST /v1/subscriptions/{id}`
+   (Stripe documents it for precisely this), so the invoice equals the
+   preview to the cent. A new subscription has no `proration_date` on create:
+   it is created "now", so its first invoice prorates a slightly shorter
+   stretch than the preview did — never more, and the confirm-time check
+   refuses outright if it would be. `backdate_start_date` was considered to
+   make the create exact and rejected: its proration rules differ by billing
+   mode and could not be verified against the preview's without a live test.
+   The `billing.plan_changed` audit row records what the customer confirmed
+   (`confirmed_amount_due`, `confirmed_currency`, `quote_proration_date`)
+   beside our day-granular estimate, which is now computed at the quote's
+   instant; the estimate is still not the provider's figure (it ignores the
+   customer's balance and is day-granular), which is why both are kept.
+   **What "never more" does not cover**, stated rather than implied: AI-read
+   overage accrued on the current plan is invoiced with the change (the
+   cancel's `invoice_now`, the swap's metered item), and meter events that land
+   after the confirm-time check, or that Stripe has not aggregated yet, add to
+   that invoice — the review says so whenever the current plan bills overage;
+   the customer's Stripe balance can move between the check and the charge;
+   and a downgrade's credit is not part of the quote (nothing is charged, so a
+   smaller credit at confirm is accepted). The quote is the client's statement
+   of what it showed: an admin calling the API directly can confirm any figure
+   at or above the price, which is consent rather than an attack, and is the
+   cost of choice 2's tokenless design.
+4. **Saving a card never changes the plan.** The auto-retry after a card is
+   saved is gone. The pending-plan stash (`utils/pendingPlanChange.ts`) is
+   kept only so a redirect-based card confirmation reopens the dialog at the
+   review step; the change still needs the Confirm click. The quote's
+   `proration_date` is part of the provider `Idempotency-Key`, so confirming
+   a fresh preview after a stale or declined one is a new request rather than
+   an idempotency conflict at Stripe, while a retry of the same confirmation
+   still replays.
+5. **The preview provisions, and only provisions.** Stripe can only price
+   items that exist, so the preview resolves-or-creates the customer and the
+   plan's prices (`provision_org_billing`, the same call the change makes) and
+   reports a missing card as `payment_method_required: true` instead of
+   refusing, so the SPA can ask for one. It creates no subscription and
+   charges nothing. The live preview needs the restricted key's **Invoices:
+   Write** permission (`create_preview` is a POST, which an Invoices: Read grant
+   is not expected to cover; to be confirmed in the key's request log on the
+   first test-mode preview) —
+   `backend/docs/billing.md` § What the operator configures in Stripe.
+
+**`organizations.plan` stops being read.** It is a free-text label set once at
+provisioning (callers passed values like "pro"), never written by a plan
+change, so a Growth org's `/api/organization` and its partner's child list
+still said "free". Keeping it in sync on every plan change was the
+alternative: the plan moves through `change_plan`, the webhook's
+cancellations, the dunning sweep and the seed's repair, and a fifth writer
+would have to remember a column nothing enforces. Reading the live
+subscription instead (`entitlements.live_plan_codes`, one query for a whole
+child list, Free when there is none — the reading `get_entitlements` already
+gives) leaves one source of truth. The column stays (dropping it is a
+migration for no reader) with a model comment saying it is not read;
+`ProvisionChildRequest.plan` is still accepted so no caller 422s. The web
+names a catalog tier through the existing `planTier.*` keys and shows any
+other plan code as is.
+
+`backend/docs/billing.md` § Plan change → The preview;
+`backend/tests/test_billing_stripe_subscriptions.py`,
+`backend/tests/test_billing_proration.py`, `backend/tests/test_partner_admin.py`,
+`frontend/tests-e2e/billing/billing.spec.ts`.

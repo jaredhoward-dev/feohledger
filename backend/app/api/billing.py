@@ -34,7 +34,7 @@ from app.database import get_control_db
 from app.models.billing import Plan
 from app.models.organization import Organization
 from app.models.user import User
-from app.schemas.money import OptionalExactMoneyInput
+from app.schemas.money import ExactMoneyInput, OptionalExactMoneyInput
 from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.billing import (
     PlanChangeError,
@@ -50,6 +50,11 @@ from app.services.billing.ai_invoice_meter import (
     allowance_for_plan,
     parse_spend_cap,
     summarize,
+)
+from app.services.billing.plan_preview import (
+    STALE_QUOTE,
+    PlanChangeQuote,
+    preview_plan_change,
 )
 from app.services.billing.provider_sync import ProviderLegRefused
 from app.services.billing_adapters import get_billing_adapter
@@ -94,6 +99,11 @@ BILLING_REFUSALS: dict[str, tuple[int, str]] = {
     "plan_change_in_progress": (
         status.HTTP_409_CONFLICT,
         "Another plan change is in progress. Try again in a minute.",
+    ),
+    STALE_QUOTE: (
+        status.HTTP_409_CONFLICT,
+        "The price you confirmed is out of date, so nothing was charged. "
+        "Review the new amount and confirm again.",
     ),
     "setup_intent_not_found": (status.HTTP_404_NOT_FOUND, "That card setup was not found."),
     "setup_intent_incomplete": (
@@ -399,9 +409,88 @@ async def list_plans(
     )
 
 
+class PlanChangePreviewRequest(BaseModel):
+    # Target plan's stable machine code (Plan.code).
+    plan_code: str = Field(min_length=1, max_length=50)
+
+
+class PlanChangePreviewResponse(BaseModel):
+    plan_code: str
+    # Already on this plan: confirming changes nothing and charges nothing.
+    already_on_plan: bool
+    currency: str
+    # Exact decimal STRINGS, the provider's own figures (never float, never
+    # computed by the browser). `amount_due` is charged on confirm;
+    # `credit` goes to the customer's balance instead (a downgrade).
+    amount_due: str
+    credit: str
+    # What recurs after the change and from when; null when nothing recurs.
+    next_amount: str | None
+    next_date: datetime | None
+    # Unix seconds the figures were priced at; the confirm sends it back.
+    proration_date: int
+    expires_at: datetime
+    # A paid target with no card on file: add one before confirming.
+    payment_method_required: bool
+
+
+@router.post("/change-plan/preview", response_model=PlanChangePreviewResponse)
+async def preview_subscription_plan_change(
+    body: PlanChangePreviewRequest,
+    org: Organization = Depends(get_tenant),
+    _user: User = Depends(require_roles(ROLE_ADMIN, ROLE_CFO)),
+    control_db: AsyncSession = Depends(get_control_db),
+) -> PlanChangePreviewResponse:
+    """What moving to ``plan_code`` would charge, without charging anything.
+
+    admin/cfo (the same gate as ``change-plan``). The figures are the billing
+    provider's (`POST /v1/invoices/create_preview` on Stripe; deterministic on
+    ``mock``): what is due today or credited, what recurs and from when. The
+    customer confirms by sending ``proration_date`` and ``amount_due`` back to
+    ``change-plan`` within the preview's lifetime (decisions §482). Same
+    refusals as ``change-plan`` up to the charge; a missing card is reported
+    as ``payment_method_required: true``, not refused. Not read-only: it
+    provisions the org's provider customer and the plan's prices first (as the
+    change does), since the provider can only price items that exist; it never
+    creates a subscription or charges.
+    """
+    try:
+        preview = await preview_plan_change(control_db, org=org, new_plan_code=body.plan_code)
+    except PlanChangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan change not available."
+        ) from exc
+    except ProviderLegRefused as exc:
+        raise _billing_refusal(exc.code) from exc
+    except BillingNotConfigured as exc:
+        raise _billing_refusal("billing_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("preview_plan_change", exc) from exc
+    return PlanChangePreviewResponse(
+        plan_code=preview.plan_code,
+        already_on_plan=preview.already_on_plan,
+        currency=preview.currency,
+        amount_due=str(preview.amount_due),
+        credit=str(preview.credit),
+        next_amount=str(preview.next_amount) if preview.next_amount is not None else None,
+        next_date=preview.next_date,
+        proration_date=int(preview.proration_date.timestamp()),
+        expires_at=preview.expires_at,
+        payment_method_required=preview.payment_method_required,
+    )
+
+
 class PlanChangeRequest(BaseModel):
     # Target plan's stable machine code (Plan.code).
     plan_code: str = Field(min_length=1, max_length=50)
+    # The confirmed preview (decisions §482): its pricing instant (Unix
+    # seconds), and the amount due it showed as an exact decimal STRING in its
+    # currency. Required — nothing is charged without a figure the customer saw.
+    # Bounded to datetimes Python can represent (≤ 9999-12-31T23:59:59Z), so
+    # an absurd value is a 422, never a 500.
+    proration_date: int = Field(ge=0, le=253402300799)
+    expected_amount_due: ExactMoneyInput = Field(ge=0, max_digits=14, decimal_places=2)
+    currency: str = Field(min_length=3, max_length=3)
 
 
 class ProrationView(BaseModel):
@@ -429,16 +518,25 @@ async def change_subscription_plan(
 ) -> PlanChangeResponse:
     """Move the org's live subscription to another plan, prorated mid-period.
 
-    admin/cfo only (matches the read endpoint). Idempotent: changing to the plan
+    admin/cfo only (matches the read endpoint). Carries the preview the
+    customer confirmed (``POST /change-plan/preview``): a quote that is too
+    old, from another month, or below what the provider would now charge is
+    refused 409 ``plan_change_preview_stale`` and nothing is charged
+    (decisions §482). Idempotent: changing to the plan
     the org is already on is a successful no-op (``changed=false``, zero
     proration) — a retry can't double-charge. 404 when the org has no live
     subscription or the target plan is unknown/inactive. Every applied change
     writes an append-only ``billing.plan_changed`` audit row. Money in the
     response is an exact decimal string.
     """
+    quote = PlanChangeQuote(
+        proration_date=datetime.fromtimestamp(body.proration_date, tz=UTC),
+        amount_due=body.expected_amount_due,
+        currency=body.currency.upper(),
+    )
     try:
         result = await change_plan(
-            control_db, org=org, new_plan_code=body.plan_code, actor_id=user.id
+            control_db, org=org, new_plan_code=body.plan_code, actor_id=user.id, quote=quote
         )
     except PlanChangeError as exc:
         # 404 (not 400): don't enumerate which plan codes / subscriptions exist.

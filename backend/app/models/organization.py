@@ -41,6 +41,10 @@ class Organization(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     settings: Mapped[dict | None] = mapped_column(JSONB, default=dict)
+    # LEGACY free-text label set at provisioning and never by a plan change —
+    # not what the org is on. Every surface that names an org's plan reads its
+    # live `Subscription` (`services/billing/entitlements.live_plan_codes`,
+    # decisions §482); nothing displays this column any more.
     plan: Mapped[str] = mapped_column(String(50), default="free")
     db_name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     # sha256(hex) digest of the per-tenant SCIM bearer token. The plaintext

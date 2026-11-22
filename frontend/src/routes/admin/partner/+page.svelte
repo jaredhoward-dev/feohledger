@@ -11,6 +11,7 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { planCodeLabel } from '#lib/types/planFeatures.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { formatDate } from '#lib/utils/time.ts';
@@ -389,7 +390,8 @@
 							</RowLink>
 						</td>
 						<td class="mono">{child.slug}</td>
-						<td>{child.plan}</td>
+						<!-- The child's live subscription plan (decisions §482). -->
+						<td>{planCodeLabel(child.plan, m)}</td>
 						<td>{child.product_name || '—'}</td>
 						<td class="actions">
 							<RowAction
