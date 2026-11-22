@@ -17,6 +17,9 @@ Pure read; never mutates. Used by the ``require_entitlement`` dependency in
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Iterable
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,6 +58,43 @@ async def get_active_subscription(
     if row is None:
         return None
     return row[0], row[1]
+
+
+#: The plan an org with no live subscription is on, for display: the same
+#: reading `get_entitlements` gives it.
+NO_PLAN_CODE = "free"
+
+
+async def live_plan_codes(
+    db: AsyncSession, organization_ids: Iterable[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """``{organization_id: plan code}`` of each org's LIVE subscription, in one
+    query — what an org is actually on, for every surface that names its plan.
+
+    ``Organization.plan`` is a free-text string set once at provisioning and
+    never by a plan change, so a Growth org still read "free" there (decisions
+    §482). An org with no live subscription reads :data:`NO_PLAN_CODE`, as its
+    entitlements do. Newest live row wins, as in `get_active_subscription`.
+    """
+    ids = list(organization_ids)
+    codes = {org_id: NO_PLAN_CODE for org_id in ids}
+    if not ids:
+        return codes
+    rows = (
+        await db.execute(
+            select(Subscription.organization_id, Plan.code)
+            .join(Plan, Plan.id == Subscription.plan_id)
+            .where(
+                Subscription.organization_id.in_(ids),
+                Subscription.status != "canceled",
+            )
+            .order_by(Subscription.created_at.asc())
+        )
+    ).all()
+    # Ascending, so the newest row for an org is the last one written.
+    for org_id, code in rows:
+        codes[org_id] = code
+    return codes
 
 
 async def get_entitlements(db: AsyncSession, organization_id) -> dict:

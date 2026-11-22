@@ -164,8 +164,17 @@ def test_failures_reach_sweep_health_and_degrade_the_sweep(monkeypatch):
     report a partial failure at all.
     """
     counts = extract_counts(DunningResult(subscriptions_scanned=3, canceled=2, failures=1))
-    assert counts == {"subscriptions_scanned": 3, "canceled": 2, "failures": 1}
+    assert counts == {
+        "subscriptions_scanned": 3,
+        "canceled": 2,
+        "failures": 1,
+        "downgrades_applied": 0,
+        "downgrades_dropped": 0,
+        "downgrade_failures": 0,
+    }
     assert failure_count(counts) == 1
+    # A failed scheduled move to Free (decisions §483) counts as a failure too.
+    assert failure_count(extract_counts(DunningResult(downgrade_failures=2))) == 2
 
     monkeypatch.setattr(settings, "billing_dunning_enabled", True)
     sweep_health.reset()

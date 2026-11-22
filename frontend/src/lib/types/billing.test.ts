@@ -4,11 +4,14 @@ import {
 	aiUsagePercent,
 	aiUsageTone,
 	cardFormMode,
+	cardSavedMessageKey,
 	parseSpendCapInput,
 	planChangeCardAction,
+	planChangeRequestFrom,
 	planHighlights,
 	rebateMeterGroups,
 	type BillingAiUsage,
+	type BillingPlanChangePreview,
 	type BillingUsage
 } from './billing';
 
@@ -241,5 +244,43 @@ describe('planHighlights', () => {
 		expect(h.get('a')).toEqual({ builtOn: null, added: [] });
 		// An unknown key sorts after the known ones rather than vanishing.
 		expect(h.get('b')).toEqual({ builtOn: null, added: ['sso', 'custom_grant'] });
+	});
+});
+
+describe('planChangeRequestFrom', () => {
+	it('confirms exactly the figures the preview showed, as the server sent them', () => {
+		const preview: BillingPlanChangePreview = {
+			plan_code: 'growth',
+			already_on_plan: false,
+			currency: 'USD',
+			amount_due: '14.80',
+			credit: '0.00',
+			next_amount: '49.00',
+			next_date: '2026-12-01T00:00:00Z',
+			proration_date: 1795000000,
+			expires_at: '2026-11-21T12:10:00Z',
+			payment_method_required: false,
+			effective_at: null,
+			clears_scheduled_change: false
+		};
+		expect(planChangeRequestFrom(preview)).toEqual({
+			plan_code: 'growth',
+			proration_date: 1795000000,
+			// The string itself — never parsed, rounded or re-derived.
+			expected_amount_due: '14.80',
+			currency: 'USD'
+		});
+	});
+});
+
+describe('cardSavedMessageKey', () => {
+	it('says the subscription is charged to the card only when a live provider bills one', () => {
+		expect(cardSavedMessageKey({ externally_managed: true })).toBe('billing.card.saved');
+	});
+
+	it('says only "Card saved." when nothing is billed yet (Free mid-upgrade, the mock, no plan)', () => {
+		expect(cardSavedMessageKey({ externally_managed: false })).toBe('billing.card.savedOnly');
+		expect(cardSavedMessageKey(null)).toBe('billing.card.savedOnly');
+		expect(cardSavedMessageKey(undefined)).toBe('billing.card.savedOnly');
 	});
 });

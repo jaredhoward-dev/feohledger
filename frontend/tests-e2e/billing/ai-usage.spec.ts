@@ -77,7 +77,8 @@ function paidSubscription(
 			current_period_start: '2026-10-01T00:00:00Z',
 			current_period_end: '2026-11-01T00:00:00Z',
 			trial_end: null,
-			externally_managed: false
+			externally_managed: false,
+			scheduled_change: null
 		},
 		period: '2026-10',
 		usage: { extractions: '530', extractions_platform: '530', ai_invoices: '530' },

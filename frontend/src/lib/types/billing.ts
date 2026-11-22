@@ -37,6 +37,18 @@ export interface BillingSubscription {
 	trial_end: string | null;
 	/** True when a live provider (Stripe) owns the subscription. */
 	externally_managed: boolean;
+	/** A move to a free plan waiting for the end of the paid period
+	 *  (decisions §483); null when nothing is scheduled. */
+	scheduled_change: BillingScheduledChange | null;
+}
+
+/** A plan move that takes effect at the end of the paid period: the org keeps
+ *  its current plan, and everything in it, until `effective_at`. */
+export interface BillingScheduledChange {
+	plan_code: string;
+	plan_name: string;
+	/** ISO timestamp the move takes effect (a UTC period boundary). */
+	effective_at: string;
 }
 
 /** Usage-to-date for the current period. All values are exact strings.
@@ -327,9 +339,64 @@ export interface BillingPlanChangeProration {
 }
 
 /**
- * Result of `POST /api/billing/change-plan`. This call APPLIES the change —
- * there is no preview-only mode on the backend — so `changed` distinguishes a
- * real mutation from the idempotent no-op of "changing" to the plan the org is
+ * `POST /api/billing/change-plan/preview` — what a plan change would charge,
+ * priced by the billing provider and charging nothing (decisions §482). Every
+ * amount is the server's exact decimal STRING; the page renders them, never
+ * computes them. The confirm sends `proration_date`, `amount_due` and
+ * `currency` back ({@link BillingPlanChangeRequest}).
+ */
+export interface BillingPlanChangePreview {
+	plan_code: string;
+	/** Already on this plan: confirming changes nothing. */
+	already_on_plan: boolean;
+	currency: string;
+	/** Charged when the change is confirmed (never negative). */
+	amount_due: string;
+	/** Credited to the account balance instead (a downgrade), else `"0.00"`. */
+	credit: string;
+	/** What recurs after the change, and from when; null when nothing recurs. */
+	next_amount: string | null;
+	next_date: string | null;
+	/** Unix seconds the figures were priced at. */
+	proration_date: number;
+	/** After this the confirm is refused `plan_change_preview_stale`. */
+	expires_at: string;
+	/** A paid plan and no card on file: the dialog asks for one first. */
+	payment_method_required: boolean;
+	/** When the move takes effect, if not on confirm: a move to a free plan
+	 *  keeps the current plan until its period ends (decisions §483). Null =
+	 *  on confirm. */
+	effective_at: string | null;
+	/** Confirming also cancels the org's pending move to a free plan. */
+	clears_scheduled_change: boolean;
+}
+
+/** Body of `POST /api/billing/change-plan`: the target plan and the preview
+ *  the reader confirmed. The server refuses a quote that is stale or below
+ *  what the provider would now charge (decisions §482 names the limits:
+ *  AI-read overage accrued up to the change is billed on top). */
+export interface BillingPlanChangeRequest {
+	plan_code: string;
+	proration_date: number;
+	expected_amount_due: string;
+	currency: string;
+}
+
+/** Build the confirm body from the preview the reader saw — the amounts are
+ *  passed through as the server's strings, never re-derived. */
+export function planChangeRequestFrom(preview: BillingPlanChangePreview): BillingPlanChangeRequest {
+	return {
+		plan_code: preview.plan_code,
+		proration_date: preview.proration_date,
+		expected_amount_due: preview.amount_due,
+		currency: preview.currency
+	};
+}
+
+/**
+ * Result of `POST /api/billing/change-plan`. This call APPLIES the change the
+ * reader confirmed from its preview, so `changed` distinguishes a real
+ * mutation from the idempotent no-op of "changing" to the plan the org is
  * already on (no mutation, zero proration).
  */
 export interface BillingPlanChangeResponse {
@@ -337,6 +404,17 @@ export interface BillingPlanChangeResponse {
 	old_plan_code: string;
 	new_plan_code: string;
 	proration: BillingPlanChangeProration;
+	/** The move waits for the end of the paid period (paid → free): the org
+	 *  stays on `old_plan_code` until `effective_at`. */
+	scheduled: boolean;
+	effective_at: string | null;
+}
+
+/** Result of `POST /api/billing/scheduled-change/cancel` ("Keep {plan}"). */
+export interface BillingKeepPlanResponse {
+	/** False when nothing was pending (an idempotent retry). */
+	cleared: boolean;
+	plan_code: string;
 }
 
 /** Body of `POST /api/billing/payment-method/default`: the SetupIntent whose
@@ -381,10 +459,26 @@ export function cardFormMode(
 	return 'not_configured';
 }
 
+/**
+ * The toast after a card is saved. Saving a card only charges anything through
+ * a live provider subscription (`externally_managed`, which only a paid plan
+ * has): with one, the subscription is now charged to this card; without one —
+ * a Free workspace adding a card on the way to an upgrade, or the local mock —
+ * the card is simply saved and nothing is charged yet.
+ */
+export function cardSavedMessageKey(
+	subscription: Pick<BillingSubscription, 'externally_managed'> | null | undefined
+): 'billing.card.saved' | 'billing.card.savedOnly' {
+	return subscription?.externally_managed ? 'billing.card.saved' : 'billing.card.savedOnly';
+}
+
 /** `POST /api/billing/change-plan` refused because the org has no saved card. */
 export const PAYMENT_METHOD_REQUIRED = 'payment_method_required';
 /** `POST /api/billing/change-plan` refused because the provider declined the upgrade charge. */
 export const BILLING_PAYMENT_DECLINED = 'billing_payment_declined';
+/** `POST /api/billing/change-plan` refused because the confirmed preview is out of
+ *  date (too old, another month, or the provider would now charge more). */
+export const PLAN_CHANGE_PREVIEW_STALE = 'plan_change_preview_stale';
 
 /**
  * What the plan-change dialog offers beside a refusal: `add_card` when the org

@@ -22,6 +22,7 @@
 	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
 	import { normalizeCurrencyCode, currencyCodeProblem } from '#lib/utils/currencyCode.ts';
 	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
+	import { planCodeLabel } from '#lib/types/planFeatures.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
@@ -1126,12 +1127,9 @@
 		}
 	}
 
-	const planLabel = (plan: string): string =>
-		({
-			free: m('org.plan.free'),
-			pro: m('org.plan.pro'),
-			enterprise: m('org.plan.enterprise'),
-		})[plan] ?? plan;
+	// `org.plan` is the live subscription's plan code (decisions §482); a
+	// negotiated plan the client has no name for shows its code.
+	const planLabel = (plan: string): string => planCodeLabel(plan, m);
 
 	// ── White-label branding ────────────────────────────────────────────
 	import { brand } from '#lib/stores/brand.svelte.ts';

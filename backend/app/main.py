@@ -311,10 +311,18 @@ async def lifespan(app: FastAPI):
     if settings.webhooks_enabled:
         webhooks_task = start_sweep(run_webhook_delivery_loop(), name="webhook-delivery")
     # Billing dunning / past-due automation sweep. Disabled by default; flip
-    # FEOH_BILLING_DUNNING_ENABLED on in deployed envs. Only cancels subscriptions
-    # overdue past the grace window — never moves money (see dunning_sweep).
+    # FEOH_BILLING_DUNNING_ENABLED on in deployed envs. Cancels subscriptions
+    # overdue past the grace window and applies (or drops) a move to Free whose
+    # end-of-period webhook was lost — never moves money (see dunning_sweep).
     if settings.billing_dunning_enabled:
         dunning_task = start_sweep(run_dunning_loop(), name="billing-dunning")
+    elif settings.billing_provider != "mock":
+        # Without it a lost `customer.subscription.deleted` leaves an org on its
+        # paid plan, entitled, after Stripe has stopped billing (decisions §483).
+        logging.getLogger(__name__).warning(
+            "FEOH_BILLING_DUNNING_ENABLED is off with a live billing provider: a lost "
+            "end-of-period webhook will not be backstopped"
+        )
     # Scheduled-report runner. Disabled by default so local dev / tests never
     # email reports; flip FEOH_SCHEDULED_REPORTS_ENABLED on in deployed envs.
     if settings.scheduled_reports_enabled:

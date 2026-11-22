@@ -1,20 +1,22 @@
 /**
- * The plan change a card-refused upgrade is waiting on, kept across a Stripe
- * REDIRECT confirmation of the card.
+ * The plan a card is being added for, kept across a Stripe REDIRECT
+ * confirmation of the card.
  *
- * The billing page remembers the refused plan in component state and retries
- * it once the card is saved. A card confirms in place, so that is the whole
- * story — except for a redirect-based method, where Stripe navigates away and
- * back to `/billing?setup_intent=…&redirect_status=…` and every piece of state
- * is gone. The card panel promised "once your card is saved, we will move you
- * to the X plan", so the plan code is stashed in `sessionStorage` right before
- * `confirmSetup` and taken back on the return.
+ * The plan dialog asks for a card when the chosen paid plan needs one, then
+ * moves on to the price review — saving a card NEVER changes the plan or
+ * charges anything; only the reader's "Confirm" does (decisions §482). A card
+ * confirms in place, so that is the whole story — except for a redirect-based
+ * method, where Stripe navigates away and back to
+ * `/billing?setup_intent=…&redirect_status=…` and every piece of state is
+ * gone. So the plan code is stashed in `sessionStorage` right before
+ * `confirmSetup` and taken back on the return, where the page reopens the
+ * dialog at the review step for it.
  *
  * The stash names the SetupIntent it belongs to and is honoured only for that
- * one: a stale entry (an abandoned attempt in this tab) can never retry a plan
- * change on some later, unrelated return. It holds a plan code and an intent
+ * one: a stale entry (an abandoned attempt in this tab) can never reopen a
+ * review on some later, unrelated return. It holds a plan code and an intent
  * id — neither is a secret. Pure apart from the injected storage, so vitest's
- * node environment reaches all of it; blocked storage only costs the retry.
+ * node environment reaches all of it; blocked storage only costs the resume.
  */
 
 export const PENDING_PLAN_KEY = 'billing_pending_plan';
@@ -47,7 +49,7 @@ export function rememberPendingPlan(
 			storage.removeItem(PENDING_PLAN_KEY);
 		}
 	} catch {
-		// Quota / blocked storage: the card still saves, the retry is lost.
+		// Quota / blocked storage: the card still saves, the resume is lost.
 	}
 }
 

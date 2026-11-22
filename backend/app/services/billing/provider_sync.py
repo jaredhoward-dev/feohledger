@@ -8,8 +8,11 @@ org is on is also the plan it is charged for (decisions §480):
   then create the subscription (base price + the metered AI-overage price),
   its billing cycle anchored on the 1st of next month, UTC;
 * **paid → paid** — swap the subscription's items, prorated and invoiced now;
-* **paid → free** — cancel immediately, crediting unused time and invoicing the
-  period's metered overage on a final invoice;
+* **paid → free** — normally NOT here: it waits for the end of the paid period
+  (`scheduled_downgrade`, decisions §483). What still reaches this module is
+  the move that cannot wait — a ``past_due`` subscription, or a row whose
+  provider id was lost — and that cancels immediately, crediting unused time
+  and invoicing the period's metered overage on a final invoice;
 * **free → free** — nothing.
 
 Every call here is a network round trip, so `change_plan` runs this OUTSIDE its
@@ -226,6 +229,7 @@ async def apply_plan_at_provider(
     ids: ProvisionedIds,
     change_key: str,
     now: datetime,
+    proration_date: datetime | None = None,
 ) -> ProviderChange:
     """Make the live provider's subscription match ``new_plan``.
 
@@ -234,6 +238,11 @@ async def apply_plan_at_provider(
     of the same change with the same card reuses the same ``Idempotency-Key``s,
     while a later change of the row, or a retry with a new card after a
     decline, does not.
+    ``proration_date`` is the instant the customer's confirmed preview was
+    priced at (`plan_preview`); an amended subscription is prorated as of it,
+    so the invoice equals the preview.
+    An amendment also clears any scheduled end-of-period cancel (a pending
+    move to Free, decisions §483) — the adapter sends that on every amend.
     Raises :class:`ProviderLegRefused` (``payment_method_required``) and lets
     the adapter's `BillingPaymentDeclined` / `BillingProviderError` propagate.
     """
@@ -306,6 +315,7 @@ async def apply_plan_at_provider(
         overage_price_id=ids.overage_price_id,
         plan_code=new_plan.code,
         idempotency_key=f"feohledger-sub-update-{change_key}",
+        proration_date=proration_date,
     )
     return ProviderChange(
         action=action,

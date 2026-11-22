@@ -232,3 +232,59 @@ async def test_push_child_branding_admin_only(realdb):
         assert resp.status_code == 403
     finally:
         await _set_parent(realdb, child_key="b", parent_key=None)
+
+
+@pytest.mark.asyncio
+async def test_a_childs_plan_is_its_live_subscription_not_the_legacy_label(realdb):
+    """`Organization.plan` is a free-text label no plan change writes; a Growth
+    child still read "free" there. The overview, and the child's own
+    `/api/organization`, report the plan its live subscription is on
+    (decisions §482) — and Free when it has none, as its entitlements do."""
+    import uuid
+    from decimal import Decimal
+
+    from app.models.billing import Plan, Subscription
+
+    child_id = realdb.info("b").org_id
+    await realdb.purge_plans("ptest_", org_ids=[child_id])
+    await _set_parent(realdb, child_key="b", parent_key="a")
+    try:
+        async with realdb.client(key="a", role="admin") as c:
+            before = await c.get("/api/partner")
+        (child,) = [x for x in before.json()["children"] if x["slug"] == realdb.info("b").slug]
+        assert child["plan"] == "free"  # no live subscription reads as Free
+
+        async with realdb.control_sessionmaker()() as s:
+            plan = Plan(
+                id=uuid.uuid4(),
+                code="ptest_growth",
+                name="Growth",
+                monthly_price=Decimal("49.00"),
+                currency="USD",
+                entitlements={},
+            )
+            s.add(plan)
+            await s.flush()
+            s.add(
+                Subscription(
+                    id=uuid.uuid4(), organization_id=child_id, plan_id=plan.id, status="active"
+                )
+            )
+            org = (
+                await s.execute(select(Organization).where(Organization.id == child_id))
+            ).scalar_one()
+            legacy = org.plan
+            await s.commit()
+
+        async with realdb.client(key="a", role="admin") as c:
+            overview = await c.get("/api/partner")
+        async with realdb.client(key="b", role="ap_clerk") as c:
+            own = await c.get("/api/organization")
+        (child,) = [x for x in overview.json()["children"] if x["slug"] == realdb.info("b").slug]
+        assert child["plan"] == "ptest_growth"
+        assert own.status_code == 200, own.text
+        assert own.json()["plan"] == "ptest_growth"
+        assert legacy != "ptest_growth"  # the label never followed — and is not read
+    finally:
+        await realdb.purge_plans("ptest_", org_ids=[child_id])
+        await _set_parent(realdb, child_key="b", parent_key=None)

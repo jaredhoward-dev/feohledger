@@ -29,6 +29,7 @@ from app.schemas.organization import (
     UpdateOrganizationRequest,
 )
 from app.services.audit_dispatch import dispatch_auth_audit, record_auth_audit_or_raise
+from app.services.billing.entitlements import live_plan_codes
 from app.services.billing.plan_catalog import FEATURE_SCIM
 from app.services.credential_crypto import CredentialCryptoError
 from app.services.currency_conversion import resolve_reporting_currency
@@ -107,7 +108,7 @@ def _is_admin(user: User) -> bool:
     return ROLE_ADMIN in {r.name for r in (user.roles or [])}
 
 
-def _org_response(org: Organization, *, is_admin: bool) -> OrganizationResponse:
+def _org_response(org: Organization, *, is_admin: bool, plan: str) -> OrganizationResponse:
     """Serialize the org, projecting `settings` to what this caller may see.
 
     `is_admin` is REQUIRED, not defaulted: this response carries the tenant's
@@ -140,7 +141,9 @@ def _org_response(org: Organization, *, is_admin: bool) -> OrganizationResponse:
         id=str(org.id),
         name=org.name,
         slug=org.slug,
-        plan=org.plan,
+        # The live subscription's plan code (`entitlements.live_plan_codes`),
+        # not the legacy `Organization.plan` string no plan change updates.
+        plan=plan,
         settings=raw,
         created_at=org.created_at.isoformat() if org.created_at else "",
         # Computed from the RAW settings, not `raw` above: the three rungs it
@@ -157,6 +160,7 @@ def _org_response(org: Organization, *, is_admin: bool) -> OrganizationResponse:
 async def get_organization(
     org: Organization = Depends(get_tenant),
     user: User = Depends(get_current_user),
+    control_db: AsyncSession = Depends(get_control_db),
 ):
     """Return the org + the settings this caller's role may read.
 
@@ -174,7 +178,8 @@ async def get_organization(
     three-rung resolution stays only as a fallback for an older cached
     response.
     """
-    return _org_response(org, is_admin=_is_admin(user))
+    plan = (await live_plan_codes(control_db, [org.id]))[org.id]
+    return _org_response(org, is_admin=_is_admin(user), plan=plan)
 
 
 @router.get("/fraud-rules/defaults")
@@ -683,7 +688,8 @@ async def update_organization(
                 raise
     await db.commit()
     # Admin-only endpoint, so the response is the admin projection.
-    return _org_response(org, is_admin=True)
+    plan = (await live_plan_codes(db, [org.id]))[org.id]
+    return _org_response(org, is_admin=True, plan=plan)
 
 
 def _residency_response(org: Organization, region: str) -> DataResidencyResponse:

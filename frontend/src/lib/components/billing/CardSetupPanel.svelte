@@ -33,12 +33,14 @@
 	import { rememberPendingPlan, takePendingPlan } from '#lib/utils/pendingPlanChange.ts';
 
 	interface Props {
-		/** Display name of the plan a refused upgrade is waiting on, or null for
-		 *  a plain add / replace. Shown so the reader knows saving continues it. */
+		/** Display name of the plan the change dialog is adding this card for,
+		 *  or null for a plain add / replace. Shown so the reader knows saving
+		 *  only leads to the price review — saving a card never changes the
+		 *  plan or charges anything (decisions §482). */
 		pendingPlanName?: string | null;
 		/** That plan's code — stashed for the SetupIntent right before a Stripe
-		 *  confirmation, so a redirect-based method's return can still retry it
-		 *  (`utils/pendingPlanChange.ts`). */
+		 *  confirmation, so a redirect-based method's return can reopen the
+		 *  dialog at the review step (`utils/pendingPlanChange.ts`). */
 		pendingPlanCode?: string | null;
 		/** The card is saved and is now the default; `res` is the refreshed list. */
 		onsaved: (res: BillingPaymentMethodsResponse) => void | Promise<void>;
@@ -157,7 +159,7 @@
 		try {
 			if (!confirmedIntentId) {
 				// A redirect-based method leaves this page; the stash lets the
-				// return still finish the plan change the panel promised.
+				// return reopen the plan dialog at its price review.
 				rememberPendingPlan(pendingPlanCode, setupIntentId);
 				const result = await stripe.confirmSetup({
 					elements,
@@ -217,7 +219,7 @@
 
 	onMount(() => {
 		// Move focus to the panel the reader just opened (from the section's
-		// button or from the plan dialog's "Add a card"), and bring it into view.
+		// button or as the plan dialog's card step), and bring it into view.
 		heading?.scrollIntoView({ block: 'nearest' });
 		heading?.focus();
 		start();
@@ -242,7 +244,7 @@
 
 	{#if pendingPlanName}
 		<p class="pending" data-testid="billing-card-pending-plan">
-			{m('billing.card.pendingPlan', { plan: pendingPlanName })}
+			{m('billing.card.reviewNext', { plan: pendingPlanName })}
 		</p>
 	{/if}
 

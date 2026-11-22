@@ -75,6 +75,8 @@ export const messages = {
 	'refusal.billingPaymentDeclined': "カードが拒否されたため、プランは変更されませんでした。カードを更新して、もう一度お試しください。",
 	'refusal.billingNotConfigured': "この環境では請求が設定されていないため、有料プランはまだご利用いただけません。当社チームにお問い合わせください。",
 	'refusal.planChangeInProgress': "別のプラン変更がすでに処理中です。しばらくしてからもう一度お試しください。",
+	'refusal.planChangePreviewStale': "確認した金額が最新ではないため、請求は行われていません。新しい金額を確認して、もう一度確定してください。",
+	'refusal.scheduledChangeAlreadyDue': "新しいプランへの変更はすでに適用されているため、取り消すことはできません。",
 	'refusal.setupIntentNotFound': "このカード設定が見つかりませんでした。もう一度カードの追加からやり直してください。",
 	'refusal.setupIntentIncomplete': "カード設定はまだ完了していません。カード情報の入力を完了して、もう一度お試しください。",
 	'refusal.creditMemoInvoiceSettled': "請求書のステータスは {status} です。今後この請求書への支払いは行われないため、クレジットを適用しても何も減りません。クレジットメモは未適用のままにして、仕入先の次の請求書に適用してください。",
