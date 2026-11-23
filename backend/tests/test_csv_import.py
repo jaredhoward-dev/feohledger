@@ -42,6 +42,8 @@ def _result(value):
     result = MagicMock()
     result.scalar_one_or_none = MagicMock(return_value=value)
     result.scalars.return_value.first.return_value = value
+    # The by-code lookup reads up to two holders, to refuse an ambiguous code.
+    result.scalars.return_value.all.return_value = [] if value is None else [value]
     return result
 
 
@@ -1464,6 +1466,161 @@ async def test_import_resolves_vendors_within_the_import_entity(realdb):
     assert rows["SCOPE-4"].vendor_id == ids["both_a"]
     assert all(inv.entity_id == entity_a for inv in rows.values())
     assert {inv.uploaded_by_id for inv in rows.values()} == {actor_id}
+
+
+async def test_import_never_resolves_a_vendor_code_by_an_erp_number(realdb):
+    """Decisions §490. The vendor sync used to write each ERP record's number
+    into ``Vendor.code``, so a CSV row whose ``vendor_code`` came from a person
+    or an older system's export attached to whichever ERP supplier shared it:
+    a payable on the wrong payee. The ERP's number now lives in
+    ``erp_vendor_code``, which resolution never reads:
+
+    * a code that is OUR code on one vendor and the ERP's number on another
+      resolves to ours;
+    * a code only an ERP number carries is refused, never resolved by it, by
+      name, or minted as a stub sharing the number;
+    * a code two vendors both hold at the same precedence is refused;
+    * a unique code still resolves (the non-colliding regression)."""
+    from sqlalchemy import func, select
+
+    from app.models.vendor import Vendor
+
+    org_id, entity_a, _ = await _two_entities(realdb)
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        ours = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="Person Supplier",
+            code="V100",
+            status="active",
+            source="manual",
+        )
+        erp_twin = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="ERP Supplier",
+            erp_vendor_id="E-1",
+            erp_vendor_code="V100",
+            status="active",
+            source="erp_sync",
+        )
+        erp_only = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="ERP Only Ltd",
+            erp_vendor_id="E-2",
+            erp_vendor_code="BC-7",
+            status="active",
+            source="erp_sync",
+        )
+        dup_1 = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="Dup One",
+            code="DUP",
+            status="active",
+        )
+        dup_2 = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="Dup Two",
+            code="DUP",
+            status="active",
+        )
+        unique = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="Unique Co",
+            code="U-1",
+            status="active",
+        )
+        s.add_all([ours, erp_twin, erp_only, dup_1, dup_2, unique])
+        await s.commit()
+        ids = {"ours": ours.id, "unique": unique.id}
+
+    async with mk() as s:
+        vendors_before = (await s.execute(select(func.count()).select_from(Vendor))).scalar_one()
+        res = await import_invoices_csv(
+            s,
+            org_id,
+            "invoice_number,vendor_name,vendor_code,amount,currency,status\n"
+            "NS-1,,V100,10.00,USD,new\n"
+            "NS-2,Legacy Name,BC-7,20.00,USD,new\n"
+            "NS-3,,DUP,30.00,USD,new\n"
+            "NS-4,,U-1,40.00,USD,new\n",
+            entity_id=entity_a,
+            actor_id=realdb.info("a").users["ap_manager"],
+        )
+        await s.commit()
+
+    assert res.imported == 2, res.to_dict()
+    assert [(e.row, e.structured) for e in res.errors] == [
+        (3, {"code": "csv_vendor_code_is_erp_number", "params": {"value": "BC-7"}}),
+        (4, {"code": "csv_vendor_code_ambiguous", "params": {"value": "DUP"}}),
+    ]
+    async with mk() as s:
+        rows = {
+            inv.invoice_number: inv
+            for inv in (
+                await s.execute(select(Invoice).where(Invoice.invoice_number.like("NS-%")))
+            ).scalars()
+        }
+        vendors_after = (await s.execute(select(func.count()).select_from(Vendor))).scalar_one()
+    assert set(rows) == {"NS-1", "NS-4"}
+    assert rows["NS-1"].vendor_id == ids["ours"]
+    assert rows["NS-4"].vendor_id == ids["unique"]
+    # The refused rows minted no stub payee.
+    assert vendors_after == vendors_before
+
+
+async def test_vendor_import_dedups_by_our_code_not_an_erp_number(realdb):
+    """A vendor file row whose ``code`` equals a linked record's ERP number is
+    not that vendor (decisions §490): it is created with its own code. Our own
+    code still dedups."""
+    from sqlalchemy import select
+
+    from app.models.vendor import Vendor
+
+    org_id, entity_a, _ = await _two_entities(realdb)
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        s.add_all(
+            [
+                Vendor(
+                    organization_id=org_id,
+                    entity_id=entity_a,
+                    name="ERP Supplier",
+                    erp_vendor_id="E-1",
+                    erp_vendor_code="V200",
+                    status="active",
+                    source="erp_sync",
+                ),
+                Vendor(
+                    organization_id=org_id,
+                    entity_id=entity_a,
+                    name="Known Co",
+                    code="K-1",
+                    status="active",
+                ),
+            ]
+        )
+        await s.commit()
+
+    async with mk() as s:
+        res = await import_vendors_csv(
+            s,
+            org_id,
+            "name,code\nLegacy Supplier,V200\nKnown Again,K-1\n",
+            entity_id=entity_a,
+        )
+        await s.commit()
+    assert (res.imported, res.skipped, res.errors) == (1, 1, [])
+    async with mk() as s:
+        created = (
+            await s.execute(select(Vendor).where(Vendor.name == "Legacy Supplier"))
+        ).scalar_one()
+    assert (created.code, created.erp_vendor_code) == ("V200", None)
 
 
 async def test_vendor_import_dedups_within_the_import_entity(realdb):
