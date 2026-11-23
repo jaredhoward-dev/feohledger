@@ -225,7 +225,7 @@ The system can pull the vendor master list from the connected ERP. This ensures 
 | ERP vendor not in local DB | Create new vendor with `source=erp_sync`, `status=active` |
 | ERP vendor matches by `erp_vendor_id` | Update fields if changed, update `erp_synced_at` |
 | Two local vendors hold that `erp_vendor_id` in this company (only before migration 0141) | Neither is touched; reported as a `duplicate_link` conflict (§ One vendor per ERP record per company) |
-| ERP vendor matches by name (no `erp_vendor_id` yet) | Link existing vendor to ERP, update fields (never its `code`) |
+| ERP vendor matches by name (no `erp_vendor_id` yet) | Link existing vendor to ERP, update fields |
 | Unverified vendor matches an ERP vendor by name | Auto-verify → set `status=active`, `source=erp_sync` |
 
 ### Sync Endpoint
@@ -237,16 +237,6 @@ Each synced vendor stores:
 - `erp_link_realm` — the ERP company that ID was issued in; the vendor's links
   in other companies are kept in `vendor_erp_links` (decisions §284, §356)
 - `erp_synced_at` — timestamp of last sync
-- `erp_vendor_code` — the ERP's display number for the record (BC No.,
-  NetSuite `entityid`, Intacct `VENDORID`, SYSPRO `Supplier`, ...). The sync
-  writes it here and **never** into `code`, which is ours and is what CSV
-  import resolves a row's vendor by, so an ERP number cannot collide with a
-  code a person chose (migration 0142, decisions §490). The migration moved the
-  number out of `code` on the rows the sync created; on a person's vendor the
-  old sync linked by name, the first pull after it moves `code` only when it
-  equals the ERP's number and `erp_vendor_code` is still empty
-  (`codes_rehomed` in the summary, `code_rehomed` on the audit row), and never
-  again after that, so a code a person later types is kept.
 
 **Merging vendors moves their ERP links.** `POST
 /api/enrichment/vendors/consolidation/merge` hands each duplicate's links (the
@@ -450,9 +440,8 @@ A record the pull leaves byte-identical (`unchanged`) writes **nothing** — an
 audit row for a state change that did not happen is unbounded growth describing
 nothing.
 
-`details` carries `change`, `erp_vendor_id`, `name`, `code` and
-`erp_vendor_code` — the two vendor fields `vendor.created` records, plus the
-ERP's own number for the record. The ERP payload also carries `tax_id`,
+`details` carries `change`, `erp_vendor_id`, `name` and `code` — the same two
+vendor fields `vendor.created` records. The ERP payload also carries `tax_id`,
 `email`, `phone` and `address`, and the sync writes all four onto the vendor
 row; **none of them reach the trail**, which is append-only, undeletable
 (migration 0022) and shipped to a WORM store.
@@ -466,7 +455,7 @@ for its unaudited neighbours, so three vendor-touching paths ran without one.
 
 | Path | Action | `details` |
 |---|---|---|
-| `POST /api/vendors/sync-erp` | `vendor.synced_from_erp` | `change`, `erp_vendor_id`, `name`, `code`, `erp_vendor_code` |
+| `POST /api/vendors/sync-erp` | `vendor.synced_from_erp` | `change`, `erp_vendor_id`, `name`, `code` |
 | `POST /api/vendors/import-csv` | `vendor.imported_csv` | `name`, `code`, `source` |
 | `POST /api/vendors/{id}/portal-users` | `vendor_user.invited` | `vendor_user_id` |
 
@@ -500,8 +489,7 @@ dual control.
 | Field | Type | Description |
 |---|---|---|
 | name | String | Vendor display name |
-| code | String | Our short code (e.g., "OSC"); never written by the ERP sync |
-| erp_vendor_code | String | The ERP's number for the linked record; written only by the sync, never resolved by |
+| code | String | Short code (e.g., "OSC") |
 | email | String | Contact email |
 | phone | String | Contact phone |
 | address | String | Full address |

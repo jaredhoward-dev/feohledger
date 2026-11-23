@@ -40,7 +40,7 @@ export from the customer's existing system.
 | Column | Required | Notes |
 |---|---|---|
 | `name` | yes | Vendor display name |
-| `code` | no | Your vendor code. Used for dedup first, against vendors' own codes only: a linked ERP record's number (`erp_vendor_code`) is a separate namespace, so a row sharing one is a new vendor unless its name matches (§ Vendor codes are never ERP numbers). |
+| `code` | no | Internal vendor code / ERP ID. Used for dedup first. |
 | `email` | no | AP contact email |
 | `phone` | no | |
 | `address` | no | |
@@ -65,7 +65,7 @@ should review them on the Vendors page before paying any invoices.
 |---|---|---|
 | `invoice_number` | yes | |
 | `vendor_name` | either | Resolved case-insensitive against the import entity's vendors (and unstamped ones) |
-| `vendor_code` | either | Tried first, against vendors' own codes only; falls back to name. Same scope. A code two vendors hold, or one only an ERP number carries, refuses the row (§ Vendor codes are never ERP numbers) |
+| `vendor_code` | either | Tried first; falls back to name. Same scope |
 | `amount` | yes | Accepts `1234.56`, `"$1,234.56"`, `"1,000"` (quote if it contains commas!) |
 | `currency` | yes | Three-letter ISO 4217 code (`USD`, `eur`, ` GBP ` — case and spaces are normalized). **No default**: a blank cell, or no `currency` column, refuses the row (§ A blank currency refuses the row). |
 | `invoice_date` | no | `YYYY-MM-DD`, `MM/DD/YYYY`, `DD/MM/YYYY`, `YYYY/MM/DD` |
@@ -189,32 +189,6 @@ matching). The entity's own row wins over an unstamped one of the same name.
   once the same supplier existed under two entities; the scoped lookup takes
   the first row of a deterministic order instead.
 
-## Vendor codes are never ERP numbers
-
-`vendor_code` (and a vendor file's `code`) is matched against `Vendor.code`,
-the code a person or an import gave the supplier. The ERP vendor sync never
-writes that column: it keeps the ERP's own number for a linked record in
-`erp_vendor_code`, which no import resolves by (migration 0142,
-`docs/decisions.md` §490). Before that, the sync wrote the ERP number into
-`code`, so a code from a person or an older system's export could attach an
-invoice row to whichever ERP supplier happened to share it: a payable on the
-wrong payee.
-
-On an invoice row:
-
-- a code exactly one vendor holds (at the top of the entity order, § Vendors
-  resolve within the import's entity) resolves to it, even if another vendor's
-  ERP number is the same string;
-- a code two vendors hold at the same precedence is refused,
-  `csv_vendor_code_ambiguous`: give each a distinct code, or merge them;
-- a code no vendor holds but a linked ERP record's number is refused,
-  `csv_vendor_code_is_erp_number`, rather than resolved by it, by name, or
-  minted as a stub sharing the number. If it does mean that supplier, set it as
-  the vendor's code and import again;
-- otherwise the row falls back to `vendor_name`, then a stub, as before.
-
-A refused row leaves nothing behind, no stub vendor included.
-
 ## Every row error is coded
 
 Each row error carries a stable `code` and the `params` its sentence needs, and
@@ -229,8 +203,6 @@ the web import modal (`ImportCsvModal.svelte`, shared by `/vendors` and
 | `csv_vendor_name_required` | vendors | — | `name` is blank. |
 | `csv_invoice_number_required` | invoices | — | `invoice_number` is blank. |
 | `csv_vendor_required` | invoices | — | Both `vendor_name` and `vendor_code` are blank. |
-| `csv_vendor_code_ambiguous` | invoices | `value` | Two vendors hold `vendor_code` at the same precedence (§ Vendor codes are never ERP numbers). |
-| `csv_vendor_code_is_erp_number` | invoices | `value` | `vendor_code` is only a linked ERP record's number (same section). |
 | `csv_amount_invalid` | invoices | `value` | `amount` is blank, unparseable, negative or too wide (§ Amount range). |
 | `csv_currency_required` | invoices, card feed | — | `currency` is blank or missing. |
 | `csv_currency_invalid` | invoices, card feed | `value` | `currency` is not a three-letter code. |

@@ -1197,16 +1197,18 @@ scope (§260) — do not fold them into any of these.
       (Merge.dev's half — account `status` and the GL parent id — landed
       2026-10-26 with the Contacts vendor fix; Sage Accounting UK's
       out-of-chart ledgers are emitted inactive since decisions §390.)
-- [ ] **(c) Three adapters link GL accounts by the business number.** (The
-      other vendor-linking gaps are closed: two vendors sharing one
-      `erp_vendor_id` by `uq_vendors_erp_link`, migration 0141, decisions
-      §486; CSV import resolving vendors by an ERP-written code by
-      `erp_vendor_code`, migration 0142, §490.) Sage Intacct, SYSPRO and
-      Blackbaud FE NXT link GL accounts by the business account number, not a
-      surrogate key, so a renumbering in the ERP follows the number.
-      **Durable fix:** each of the three adapters keyed by the ERP's own
-      record id where its API exposes one. **Trigger:** the next change to one
-      of those three adapters' chart listings.
+- [ ] **(c) Vendor linking has two gaps of its own.** (The third, two
+      vendors sharing one `erp_vendor_id`, is closed by `uq_vendors_erp_link`,
+      migration 0141, decisions §486.) (1) CSV import resolves vendors by
+      `Vendor.code` (`services/csv_import`), which an ERP-written code can
+      collide with. (2) Sage Intacct, SYSPRO and Blackbaud FE NXT link GL
+      accounts by the business account number, not a surrogate key, so a
+      renumbering in the ERP follows the number. **Durable fix:** CSV import
+      resolving by a code namespace that ERP codes cannot enter; and each of
+      the three adapters keyed by the ERP's own record id where its API
+      exposes one. **Trigger:** the next change to `csv_import`'s vendor
+      resolution, or the next change to one of those three adapters' chart
+      listings.
 - [ ] **(c) A mock sync still treats pre-0115 links as its own.** A no-realm
       pull (`mock`, or an OAuth ERP with no consent) leaves rows tied to a
       named realm alone (decisions §287), but a pre-0115 link is NULL-realm,

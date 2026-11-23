@@ -54,11 +54,6 @@ class Vendor(Base, EntityMixin, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    #: OUR code for the supplier: typed by a person or a CSV import, and what
-    #: CSV import resolves a row's vendor by. The ERP sync never writes it; the
-    #: ERP's own number for the record is :attr:`erp_vendor_code` (migration
-    #: 0142, decisions §490), so an ERP number cannot collide with a code a
-    #: person chose and attach a CSV row to the wrong payee.
     code: Mapped[str | None] = mapped_column(String(50))
     email: Mapped[str | None] = mapped_column(String(320))
     phone: Mapped[str | None] = mapped_column(String(50))
@@ -96,10 +91,6 @@ class Vendor(Base, EntityMixin, TimestampMixin):
     # ERP sync
     erp_vendor_id: Mapped[str | None] = mapped_column(String(255))  # vendor ID in the external ERP
     erp_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    #: The ERP's display number for the linked record (BC No., NetSuite
-    #: ``entityid``, Intacct ``VENDORID``, ...), written only by the vendor sync
-    #: and never read to resolve a vendor: :attr:`code` is ours (decisions §490).
-    erp_vendor_code: Mapped[str | None] = mapped_column(String(50))
     #: The ERP company ``erp_vendor_id`` was linked under
     #: (``services/erp_link_realm``) — QuickBooks numbers vendors per company,
     #: so a link from another realm is never posted to. NULL: linked before

@@ -535,8 +535,6 @@ async def test_the_live_vendor_sync_replays_exactly(realdb, sandbox):
         "unlinked": [],
         "deactivated": 1,
         "codes_cleared": 0,
-        # QuickBooks sends no vendor number, so nothing re-homes (§490).
-        "codes_rehomed": 0,
         "realm_adopted": ADOPTED_VENDOR_LINKS,
         # No link was kept from an earlier connection (decisions §356).
         "restored": 0,

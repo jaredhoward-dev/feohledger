@@ -226,17 +226,6 @@ CSV_VENDOR_NAME_REQUIRED = "csv_vendor_name_required"
 CSV_INVOICE_NUMBER_REQUIRED = "csv_invoice_number_required"
 #: An invoice row naming neither `vendor_name` nor `vendor_code`. No params.
 CSV_VENDOR_REQUIRED = "csv_vendor_required"
-#: An invoice row whose `vendor_code` two vendors in scope both hold as their
-#: code, at the same precedence (both the entity's own, or both shared). Which
-#: supplier the row means is a guess, so it is refused (decisions §490).
-#: Params: `value`.
-CSV_VENDOR_CODE_AMBIGUOUS = "csv_vendor_code_ambiguous"
-#: An invoice row whose `vendor_code` no vendor holds as its code, but which is
-#: a linked ERP record's number (`Vendor.erp_vendor_code`). The two namespaces
-#: are kept apart so an ERP number never attaches a row to the wrong payee;
-#: the row is refused rather than resolved by it, or by name, or minted as a
-#: new stub that shares the number (decisions §490). Params: `value`.
-CSV_VENDOR_CODE_IS_ERP_NUMBER = "csv_vendor_code_is_erp_number"
 #: An `amount` that is blank, unparseable, negative or wider than
 #: `Numeric(15, 2)`. Params: `value`.
 CSV_AMOUNT_INVALID = "csv_amount_invalid"
@@ -444,9 +433,6 @@ async def import_vendors_csv(
     actor_id: uuid.UUID | None = None,
 ) -> ImportResult:
     """Upsert vendors from CSV. Dedup priority: code > case-insensitive name.
-    ``code`` is our code only, never a linked ERP record's number
-    (``erp_vendor_code``, decisions §490): a file row sharing an ERP number is
-    a separate code, and name dedup still catches the same supplier.
 
     ``entity_id`` (multi-entity Phase 2) is the entity new vendors land under —
     the selected entity or the tenant default, resolved at the endpoint. Dedup
@@ -717,7 +703,7 @@ async def import_invoices_csv(
             result.skipped += 1
             continue
 
-        vendor, vendor_refusal = await _resolve_or_create_vendor(
+        vendor = await _resolve_or_create_vendor(
             db,
             organization_id=organization_id,
             vendor_name=vendor_name,
@@ -725,11 +711,6 @@ async def import_invoices_csv(
             entity_id=entity_id,
             actor_id=actor_id,
         )
-        if vendor_refusal is not None:
-            vendor_refusal.row = i
-            result.errors.append(vendor_refusal)
-            result.skipped += 1
-            continue
 
         # Dedup on (vendor_id, invoice_number) — the natural AP uniqueness key.
         # An unstamped vendor is shared by every entity, so several entities
@@ -906,61 +887,18 @@ async def _resolve_or_create_vendor(
     vendor_code: str | None,
     entity_id: uuid.UUID | None = None,
     actor_id: uuid.UUID | None = None,
-) -> tuple[Vendor | None, ImportRowError | None]:
-    """The payee an invoice row names: by our ``Vendor.code``, else by name,
-    else a new ``unverified`` stub. Returns ``(vendor, None)`` or
-    ``(None, error)``; the error's ``row`` is 0 and the caller sets it.
-
-    ``vendor_code`` is matched against OUR code only, never the ERP's number
-    for a record (``erp_vendor_code``), which the sync writes and a person did
-    not choose (decisions §490). A code two vendors hold at the same precedence
-    is refused, and so is a code only an ERP number carries: either way the
-    payee would be a guess, and a wrong vendor on a payable is a payee error.
-    """
+) -> Vendor:
     if vendor_code:
-        holders = (
-            (
-                await db.execute(
-                    scope_vendor_candidates(
-                        select(Vendor).where(
-                            Vendor.organization_id == organization_id,
-                            Vendor.code == vendor_code,
-                        ),
-                        entity_id,
-                    ).limit(2)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if len(holders) == 2 and (holders[0].entity_id is None) == (holders[1].entity_id is None):
-            return None, _coded(
-                0,
-                CSV_VENDOR_CODE_AMBIGUOUS,
-                f"vendor_code {vendor_code!r} is held by more than one vendor; "
-                "give each a distinct code, or merge them if they are one supplier",
-                value=vendor_code,
-            )
-        if holders:
-            return holders[0], None
-        erp_holder = await _find_vendor(
-            db, organization_id, entity_id, Vendor.erp_vendor_code == vendor_code
-        )
-        if erp_holder is not None:
-            return None, _coded(
-                0,
-                CSV_VENDOR_CODE_IS_ERP_NUMBER,
-                f"vendor_code {vendor_code!r} is an ERP vendor number, not a vendor code; "
-                "set it as the vendor's code if it means that supplier",
-                value=vendor_code,
-            )
+        vendor = await _find_vendor(db, organization_id, entity_id, Vendor.code == vendor_code)
+        if vendor is not None:
+            return vendor
 
     if vendor_name:
         vendor = await _find_vendor(
             db, organization_id, entity_id, func.lower(Vendor.name) == vendor_name.lower()
         )
         if vendor is not None:
-            return vendor, None
+            return vendor
 
     vendor = Vendor(
         organization_id=organization_id,
@@ -979,7 +917,7 @@ async def _resolve_or_create_vendor(
     await _audit_vendor_imported(
         db, vendor=vendor, organization_id=organization_id, actor_id=actor_id
     )
-    return vendor, None
+    return vendor
 
 
 # ---------------------------------------------------------------------------

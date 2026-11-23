@@ -260,8 +260,6 @@ class VendorResponse(BaseModel):
     verified_by: str | None
     verified_at: str | None
     erp_vendor_id: str | None
-    #: The ERP's number for the linked record; `code` is ours (decisions §490).
-    erp_vendor_code: str | None = None
     erp_synced_at: str | None
     invoice_count: int = 0
     created_at: str
@@ -319,7 +317,6 @@ class VendorResponse(BaseModel):
             verified_by=v.verified_by,
             verified_at=v.verified_at.isoformat() if v.verified_at else None,
             erp_vendor_id=v.erp_vendor_id,
-            erp_vendor_code=v.erp_vendor_code,
             erp_synced_at=v.erp_synced_at.isoformat() if v.erp_synced_at else None,
             invoice_count=invoice_count,
             created_at=v.created_at.isoformat() if v.created_at else "",

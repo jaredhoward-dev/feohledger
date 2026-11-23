@@ -141,9 +141,7 @@ async def sync_vendors_from_erp(
     name matched more than one way, so nothing was linked; ``duplicate_link``:
     two local vendors already hold that record in this company, so neither was
     updated — only on a tenant not yet at migration 0141), unlinked: names whose link this run
-    dropped, deactivated / codes_cleared / codes_rehomed / realm_adopted / restored: int
-    (``codes_rehomed``: rows whose ``code`` held the ERP's number and moved to
-    ``erp_vendor_code``, decisions §490),
+    dropped, deactivated / codes_cleared / realm_adopted / restored: int,
     values_too_long: {"name", "erp_vendor_id", "fields"} per record with a
     field too long to store (:data:`_BOUNDED_FIELDS`; field NAMES only),
     names_shortened: {"name", "erp_vendor_id"} per record whose name did not
@@ -178,7 +176,6 @@ async def sync_vendors_from_erp(
     too_long: list[dict] = []
     deactivated = 0
     codes_cleared = 0
-    codes_rehomed = 0
     realm_adopted = 0
     # Every name from here on is the form ``vendors.name`` can hold: what a
     # local row can carry, so what every comparison below compares against.
@@ -305,10 +302,6 @@ async def sync_vendors_from_erp(
             )
 
         active = erp_v.get("active", True) is not False
-        # The record's ``code`` is the ERP's number for it. It lands in
-        # ``erp_vendor_code``, never in our ``Vendor.code``, which CSV import
-        # resolves vendors by (decisions §490).
-        erp_code = erp_v.get("code")
 
         # Check if vendor already exists by ERP ID — in this realm only. Under
         # a named realm the pass above left no link from another one; under
@@ -352,30 +345,12 @@ async def sync_vendors_from_erp(
             # Update fields if changed
             changed = False
             identity_changed = False
-            extra: dict = dict(dropped)
-            if (
-                erp_code is not None
-                and existing.erp_vendor_code is None
-                and existing.code == erp_code
-            ):
-                # The first pull since migration 0142 on a row it left alone:
-                # a ``code`` equal to the ERP's number is the one the old sync
-                # wrote there, so it moves out of the namespace CSV import
-                # resolves by. Once ``erp_vendor_code`` is set this never runs
-                # again, so a person who later types the number in keeps it.
-                existing.code = None
-                codes_rehomed += 1
-                extra["code_rehomed"] = True
-                changed = True
-            for field in ("name", "email", "phone", "address", "payment_terms"):
+            for field in ("name", "code", "email", "phone", "address", "payment_terms"):
                 new_val = erp_v.get(field)
                 if new_val is not None and getattr(existing, field) != new_val:
                     setattr(existing, field, new_val)
                     changed = True
                     identity_changed = identity_changed or field == "name"
-            if erp_code is not None and existing.erp_vendor_code != erp_code:
-                existing.erp_vendor_code = erp_code
-                changed = True
             # Through the shared writer: an ERP-side TIN change voids the old
             # IRS-match stamp rather than inheriting it.
             new_tax_id = erp_v.get("tax_id")
@@ -384,22 +359,14 @@ async def sync_vendors_from_erp(
                 identity_changed = True
             if identity_changed:
                 rescreen.append(existing)
+            extra: dict = dict(dropped)
             legacy_code = erp_v.get("legacy_code")
-            if existing.source == "erp_sync" and legacy_code:
-                # The old QuickBooks mapping's AcctNum; never our code, nor the
-                # ERP's number for the vendor. Migration 0142 moved it out of
-                # ``code`` on the rows the sync created, so it may sit in either.
-                cleared = False
-                if existing.code == legacy_code:
-                    existing.code = None
-                    cleared = True
-                if existing.erp_vendor_code == legacy_code:
-                    existing.erp_vendor_code = None
-                    cleared = True
-                if cleared:
-                    codes_cleared += 1
-                    extra["code_cleared"] = True
-                    changed = True
+            if existing.source == "erp_sync" and legacy_code and existing.code == legacy_code:
+                # The old QuickBooks mapping's AcctNum; never our code.
+                existing.code = None
+                codes_cleared += 1
+                extra["code_cleared"] = True
+                changed = True
             if not active and existing.status == "active":
                 existing.status = "inactive"
                 deactivated += 1
@@ -431,9 +398,7 @@ async def sync_vendors_from_erp(
                     name_match.erp_vendor_id = erp_id
                     name_match.erp_link_realm = realm
                     name_match.erp_synced_at = now
-                    # ``code`` stays the person's; the ERP's number is its own.
-                    name_match.erp_vendor_code = erp_code
-                    for field in ("email", "phone", "address", "payment_terms"):
+                    for field in ("code", "email", "phone", "address", "payment_terms"):
                         new_val = erp_v.get(field)
                         if new_val is not None:
                             setattr(name_match, field, new_val)
@@ -451,7 +416,7 @@ async def sync_vendors_from_erp(
             # Create new vendor
             vendor = Vendor(
                 name=name or f"ERP Vendor {erp_id}",
-                erp_vendor_code=erp_code,
+                code=erp_v.get("code"),
                 email=erp_v.get("email"),
                 phone=erp_v.get("phone"),
                 address=erp_v.get("address"),
@@ -513,7 +478,6 @@ async def sync_vendors_from_erp(
         unlinked=sorted(unlinked),
         deactivated=deactivated,
         codes_cleared=codes_cleared,
-        codes_rehomed=codes_rehomed,
         realm_adopted=realm_adopted,
         restored=restored,
         values_too_long=too_long,
@@ -670,7 +634,6 @@ def _summary(
     unlinked: list[str] | None = None,
     deactivated: int = 0,
     codes_cleared: int = 0,
-    codes_rehomed: int = 0,
     realm_adopted: int = 0,
     restored: int = 0,
     values_too_long: list[dict] | None = None,
@@ -684,7 +647,6 @@ def _summary(
         "unlinked": unlinked or [],
         "deactivated": deactivated,
         "codes_cleared": codes_cleared,
-        "codes_rehomed": codes_rehomed,
         "realm_adopted": realm_adopted,
         "restored": restored,
         "values_too_long": values_too_long or [],
@@ -745,7 +707,7 @@ async def _audit_synced(
     (a link kept from an earlier connection to this company put back). ``extra``
     carries the realms involved, which name ERP companies, not people.
 
-    PII-free: the vendor's name, code and the ERP's number for it — the same two fields the
+    PII-free: the vendor's name and code — the same two fields the
     ``vendor.created`` row already records — plus the ERP's own identifier.
     Never ``tax_id``, ``address``, ``email`` or ``phone``, all of which the ERP
     payload carries and this sync writes onto the row.
@@ -763,7 +725,6 @@ async def _audit_synced(
             "erp_vendor_id": erp_vendor_id,
             "name": vendor.name,
             "code": vendor.code,
-            "erp_vendor_code": vendor.erp_vendor_code,
             **(extra or {}),
         },
     )
