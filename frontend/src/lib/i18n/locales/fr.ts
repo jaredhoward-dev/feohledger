@@ -825,7 +825,6 @@ export const messages = {
 	'payments.col.discount': 'Remise',
 	'payments.col.terms': 'Conditions',
 	'payments.col.status': 'Statut',
-	'payments.col.routes': 'Routes',
 	'payments.status.pending': 'En attente',
 	'payments.status.pendingCompliance': 'Blocage conformité',
 	'payments.status.submitted': 'Soumis',

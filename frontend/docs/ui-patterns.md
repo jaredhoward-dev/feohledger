@@ -222,6 +222,10 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   the widest status's button set — they flow onto a second line rather than
   out of the table. Size the actions column for the common case in English
   and let the rest wrap; never widen it to the worst locale's full button row.
+  A single `RowAction` does not wrap inside itself, though, so the column is
+  never narrower than the widest *one* button in any locale. That is also why
+  two row actions share one actions cell rather than each taking a column
+  (the /payments queue's Compare routes and Record as paid).
   A note in an actions cell (the bank-change queue's separation-of-duties
   refusal) is `display: block; white-space: normal`, above the buttons.
   Guard: `tests-e2e/reactivity/layout-stability.spec.ts` opens each page in
@@ -235,12 +239,16 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   metrics (`th`: 0.72rem/600, uppercase, 0.06em; `<Badge>`: 0.75rem/600,
   uppercase, 0.03em, plus its 20px padding; `RowAction`: 0.8rem plus 26px of
   chrome) and take the widest across the six catalogues, then round up to the
-  next 10px with at least 5px to spare. When the widths that gives no longer
+  next 10px with at least 5px to spare. CI's fallback font renders wider than
+  a developer laptop's (the fr badge "COMPTABILISÉE DANS L'ERP" ≈191px
+  locally, ≈234px in CI), so a local measurement gets roughly a quarter more
+  on top, which is how /payments is sized. When the widths that gives no longer
   leave the text columns room inside the 1388px region a 1666px window gives
   (`tests-e2e/a11y/wide-layout.spec.ts`), a dense table runs 10px of
   horizontal cell padding instead of 14px (/exceptions, /invoices,
-  /vendors) before anything else gives way. /payments' queue does not fit
-  even then and is tracked in `docs/followups.md`.
+  /vendors, /payments) before anything else gives way. A page's other tabs
+  join the guard through its `LOCALE_SIZED_VIEWS` list (/payments' history,
+  runs, rebates and cards tables).
 - **A list page's table is `fixed`.** Under `table-layout: auto` the columns
   are sized against the "Loading…" row and then re-sized against the real
   rows, so every column slides sideways as the data lands. /invoices,
