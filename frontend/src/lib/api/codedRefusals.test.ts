@@ -174,6 +174,8 @@ describe('codedRefusalText', () => {
 		['billing_payment_declined', 'refusal.billingPaymentDeclined'],
 		['billing_not_configured', 'refusal.billingNotConfigured'],
 		['plan_change_in_progress', 'refusal.planChangeInProgress'],
+		['plan_change_preview_stale', 'refusal.planChangePreviewStale'],
+		['scheduled_change_already_due', 'refusal.scheduledChangeAlreadyDue'],
 		['setup_intent_not_found', 'refusal.setupIntentNotFound'],
 		['setup_intent_incomplete', 'refusal.setupIntentIncomplete']
 	] as [string, RefusalTestKey][])('%s is the fixed sentence %s', (code, key) => {

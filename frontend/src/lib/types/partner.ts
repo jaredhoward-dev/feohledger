@@ -7,6 +7,8 @@ export interface ChildTenant {
 	id: string;
 	name: string;
 	slug: string;
+	/** The plan code of the child's LIVE subscription (`free` when it has
+	 *  none) — not the legacy `organizations.plan` label (decisions §482). */
 	plan: string;
 	/** The child's resolved white-label product name ("" = platform default). */
 	product_name: string;

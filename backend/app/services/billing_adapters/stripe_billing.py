@@ -38,8 +38,10 @@ from app.services.billing_adapters.base import (
     BillingWebhookEvent,
     CreateSubscriptionRequest,
     MeterEvent,
+    PlanChangePreviewRequest,
     ProviderInvoice,
     ProviderPaymentMethod,
+    ProviderPlanChangePreview,
     ProviderSetupIntent,
     ProviderSubscription,
     SetupIntentRejected,
@@ -47,6 +49,7 @@ from app.services.billing_adapters.base import (
 )
 from app.services.billing_adapters.dispatcher import register_billing_adapter
 from app.services.webhook_security import extract_signature_header
+from app.utils.currency_code import iso_currency_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +144,7 @@ def _subscription_of(payload: dict, *, plan_code: str = "") -> ProviderSubscript
         plan_code=plan_code or str((payload.get("metadata") or {}).get("plan_code") or ""),
         current_period_start=start,
         current_period_end=end,
+        cancel_at_period_end=payload.get("cancel_at_period_end") is True,
     )
 
 
@@ -197,6 +201,57 @@ def _from_minor_units(amount_minor: int) -> str:
     """
     value = (Decimal(amount_minor) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return str(value)
+
+
+def _minor_to_decimal(value, op: str) -> Decimal:
+    """An invoice amount (integer minor units, may be negative) → exact Decimal.
+
+    A missing or non-integer amount is a provider error, never a zero: a
+    preview that silently read as "nothing due" is the one wrong answer the
+    confirm step exists to rule out."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BillingProviderError(f"Stripe {op} returned no amount")
+    return Decimal(_from_minor_units(value))
+
+
+def _item_swap_form(
+    current: dict, price_id: str, overage_price_id: str | None, *, prefix: str
+) -> dict[str, str]:
+    """The item changes that move ``current`` onto a new plan's prices.
+
+    One builder for the real update (``prefix="items"``) and its preview
+    (``prefix="subscription_details[items]"``), so the preview prices exactly
+    the swap the change sends. The items are told apart by the price's
+    ``recurring.usage_type``: the base price is ``licensed``, the AI-read
+    overage price ``metered``; the metered item is swapped, added or removed to
+    match the new plan.
+    """
+    base_item: str | None = None
+    metered_item: str | None = None
+    for item in (current.get("items") or {}).get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        recurring = (item.get("price") or {}).get("recurring") or {}
+        if recurring.get("usage_type") == "metered":
+            metered_item = metered_item or str(item.get("id"))
+        else:
+            base_item = base_item or str(item.get("id"))
+
+    form: dict[str, str] = {}
+    index = 0
+    if base_item:
+        form[f"{prefix}[{index}][id]"] = base_item
+    form[f"{prefix}[{index}][price]"] = str(price_id)
+    index += 1
+    if metered_item and overage_price_id:
+        form[f"{prefix}[{index}][id]"] = metered_item
+        form[f"{prefix}[{index}][price]"] = str(overage_price_id)
+    elif metered_item:
+        form[f"{prefix}[{index}][id]"] = metered_item
+        form[f"{prefix}[{index}][deleted]"] = "true"
+    elif overage_price_id:
+        form[f"{prefix}[{index}][price]"] = str(overage_price_id)
+    return form
 
 
 @register_billing_adapter("stripe_billing")
@@ -418,6 +473,7 @@ class StripeBillingAdapter(BillingAdapter):
         overage_price_id: str | None,
         plan_code: str,
         idempotency_key: str,
+        proration_date: datetime | None = None,
     ) -> ProviderSubscription:
         """Move the subscription's items onto a new plan's prices.
 
@@ -428,41 +484,30 @@ class StripeBillingAdapter(BillingAdapter):
         bills the prorated difference now (the change "applies immediately",
         as the plan picker says) and ``error_if_incomplete`` makes Stripe leave
         the subscription untouched if that charge fails (402 →
-        :class:`BillingPaymentDeclined`).
+        :class:`BillingPaymentDeclined`). ``proration_date`` is the instant the
+        customer's preview was priced at, so the invoice equals the preview.
+        ``cancel_at_period_end=false`` is sent on every amend: a paid target
+        always means "keep renewing", so a move to Free scheduled for the
+        period end is taken back in the same request (decisions §483). Sent
+        unconditionally rather than from our row's pending state, which a
+        racing schedule or a schedule whose record failed can leave out of
+        step with Stripe; on a subscription not set to end it is a no-op.
         """
         self._require_key()
         async with self._client() as client:
             resp = await client.get(f"/v1/subscriptions/{external_subscription_id}")
             current = self._json_or_raise(resp, "get_subscription")
-            base_item: str | None = None
-            metered_item: str | None = None
-            for item in (current.get("items") or {}).get("data") or []:
-                if not isinstance(item, dict):
-                    continue
-                recurring = (item.get("price") or {}).get("recurring") or {}
-                if recurring.get("usage_type") == "metered":
-                    metered_item = metered_item or str(item.get("id"))
-                else:
-                    base_item = base_item or str(item.get("id"))
-
             form: dict[str, str] = {
                 "proration_behavior": "always_invoice",
                 "payment_behavior": "error_if_incomplete",
                 "metadata[plan_code]": plan_code,
+                **_item_swap_form(current, price_id, overage_price_id, prefix="items"),
             }
-            index = 0
-            if base_item:
-                form[f"items[{index}][id]"] = base_item
-            form[f"items[{index}][price]"] = str(price_id)
-            index += 1
-            if metered_item and overage_price_id:
-                form[f"items[{index}][id]"] = metered_item
-                form[f"items[{index}][price]"] = str(overage_price_id)
-            elif metered_item:
-                form[f"items[{index}][id]"] = metered_item
-                form[f"items[{index}][deleted]"] = "true"
-            elif overage_price_id:
-                form[f"items[{index}][price]"] = str(overage_price_id)
+            if proration_date is not None:
+                # The instant the customer's preview was priced at: Stripe
+                # prorates exactly as it previewed (decisions §482).
+                form["proration_date"] = str(int(proration_date.timestamp()))
+            form["cancel_at_period_end"] = "false"
             resp = await client.post(
                 f"/v1/subscriptions/{external_subscription_id}",
                 data=form,
@@ -470,6 +515,122 @@ class StripeBillingAdapter(BillingAdapter):
             )
             payload = self._json_or_raise(resp, "update_subscription")
         return _subscription_of(payload, plan_code=plan_code)
+
+    async def preview_plan_change(
+        self, request: PlanChangePreviewRequest
+    ) -> ProviderPlanChangePreview:
+        """Price a plan change with ``POST /v1/invoices/create_preview``.
+
+        Nothing is created or charged. Each preview mirrors the real call the
+        change would make (decisions §482):
+
+        * **onto a paid plan, no subscription** — ``customer`` + the plan's
+          items, ``create_prorations`` and the same ``billing_cycle_anchor``
+          (the endive preview takes it as ``{type: timestamp, timestamp}``):
+          the first invoice, prorated now → the anchor;
+        * **paid → paid** — ``subscription`` + the same item swap
+          `change_subscription_plan` sends, ``always_invoice`` and
+          ``proration_date``: the invoice the swap raises at once;
+        * **to a free plan** — ``subscription`` + ``cancel_now`` with
+          ``create_prorations``: the final invoice the cancel raises (its
+          total is negative when unused time is credited).
+
+        What recurs afterwards is a second preview in ``preview_mode=recurring``
+        (items only — Stripe prices no prorations in that mode). Amounts are
+        integer minor units in, exact ``Decimal`` out.
+        """
+        self._require_key()
+        if not request.customer_id and not request.external_subscription_id:
+            raise BillingNotConfigured("Stripe preview requires a customer or a subscription")
+        recurring_form: dict[str, str] | None = None
+        next_date: datetime | None = None
+        async with self._client() as client:
+            sub_id = request.external_subscription_id
+            if not request.to_paid:
+                if sub_id is None:
+                    # Nothing billed now and nothing to cancel: nothing to price.
+                    return ProviderPlanChangePreview(
+                        amount_due=Decimal("0.00"), total=Decimal("0.00"), currency=request.currency
+                    )
+                form = {
+                    "subscription": sub_id,
+                    "subscription_details[cancel_now]": "true",
+                    "subscription_details[proration_behavior]": "create_prorations",
+                }
+            elif sub_id is not None:
+                if not request.price_id:
+                    raise BillingNotConfigured("Stripe preview requires the plan's price id")
+                resp = await client.get(f"/v1/subscriptions/{sub_id}")
+                current = self._json_or_raise(resp, "get_subscription")
+                swap = _item_swap_form(
+                    current,
+                    request.price_id,
+                    request.overage_price_id,
+                    prefix="subscription_details[items]",
+                )
+                form = {
+                    "subscription": sub_id,
+                    **swap,
+                    "subscription_details[proration_behavior]": "always_invoice",
+                    "subscription_details[proration_date]": str(
+                        int(request.proration_date.timestamp())
+                    ),
+                }
+                recurring_form = {
+                    "subscription": sub_id,
+                    **swap,
+                    "subscription_details[proration_behavior]": "none",
+                    "preview_mode": "recurring",
+                }
+                # The swap clears any scheduled end (decisions §483), as the
+                # amend does: price it — and what recurs — as a subscription
+                # that renews, not one ending at the period end.
+                form["subscription_details[cancel_at_period_end]"] = "false"
+                recurring_form["subscription_details[cancel_at_period_end]"] = "false"
+                next_date = _period_of(current)[1]
+            else:
+                if not request.price_id:
+                    raise BillingNotConfigured("Stripe preview requires the plan's price id")
+                items = {"subscription_details[items][0][price]": str(request.price_id)}
+                if request.overage_price_id:
+                    items["subscription_details[items][1][price]"] = str(request.overage_price_id)
+                form = {
+                    "customer": str(request.customer_id),
+                    **items,
+                    "subscription_details[proration_behavior]": "create_prorations",
+                }
+                if request.billing_cycle_anchor is not None:
+                    form["subscription_details[billing_cycle_anchor][type]"] = "timestamp"
+                    form["subscription_details[billing_cycle_anchor][timestamp]"] = str(
+                        int(request.billing_cycle_anchor.timestamp())
+                    )
+                    next_date = request.billing_cycle_anchor
+                recurring_form = {
+                    "customer": str(request.customer_id),
+                    **items,
+                    "preview_mode": "recurring",
+                }
+
+            resp = await client.post("/v1/invoices/create_preview", data=form)
+            invoice = self._json_or_raise(resp, "preview_invoice")
+            next_amount: Decimal | None = None
+            if recurring_form is not None and request.include_recurring:
+                resp = await client.post("/v1/invoices/create_preview", data=recurring_form)
+                recurring = self._json_or_raise(resp, "preview_recurring_invoice")
+                next_amount = _minor_to_decimal(recurring.get("total"), "preview_recurring_invoice")
+
+        # A preview without a currency is refused like one without an amount:
+        # never filled in with the plan's (decisions §160 / §200).
+        currency = iso_currency_or_none(invoice.get("currency"))
+        if currency is None:
+            raise BillingProviderError("Stripe preview_invoice returned no currency")
+        return ProviderPlanChangePreview(
+            amount_due=_minor_to_decimal(invoice.get("amount_due"), "preview_invoice"),
+            total=_minor_to_decimal(invoice.get("total"), "preview_invoice"),
+            currency=currency,
+            next_amount=next_amount,
+            next_date=next_date if request.to_paid else None,
+        )
 
     async def cancel_subscription(self, external_subscription_id: str) -> ProviderSubscription:
         """Cancel now: ``prorate`` credits the unused part of the period to the
@@ -490,6 +651,52 @@ class StripeBillingAdapter(BillingAdapter):
                     if existing.get("status") in _ENDED_STATUSES:
                         return _subscription_of(existing)
             payload = self._json_or_raise(resp, "cancel_subscription")
+        return _subscription_of(payload)
+
+    async def cancel_subscription_at_period_end(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Schedule the end: ``POST /v1/subscriptions/{id}`` with
+        ``cancel_at_period_end=true`` (decisions §483).
+
+        Stripe ends the subscription at ``current_period_end`` and sends
+        ``customer.subscription.deleted`` then. Scheduling creates no proration
+        and no credit — the customer keeps the period they paid for — and
+        ``proration_behavior=none`` says so explicitly rather than lean on the
+        default. Metered usage reported for the period is still billed: "for
+        subscriptions that cancel at the end of the period, the final invoice
+        at the end of the period includes metered usage from the last billing
+        period" (Stripe, usage-based billing § Cancel usage-based
+        subscriptions). Setting the flag again is a no-op at Stripe.
+        """
+        return await self._set_cancel_at_period_end(
+            external_subscription_id, True, idempotency_key, "schedule_cancel"
+        )
+
+    async def resume_subscription(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Undo the scheduled end: ``cancel_at_period_end=false``. Nothing is
+        charged now; the subscription renews at its period end as before."""
+        return await self._set_cancel_at_period_end(
+            external_subscription_id, False, idempotency_key, "resume_subscription"
+        )
+
+    async def _set_cancel_at_period_end(
+        self, external_subscription_id: str, value: bool, idempotency_key: str, op: str
+    ) -> ProviderSubscription:
+        self._require_key()
+        form = {
+            "cancel_at_period_end": "true" if value else "false",
+            "proration_behavior": "none",
+        }
+        async with self._client() as client:
+            resp = await client.post(
+                f"/v1/subscriptions/{external_subscription_id}",
+                data=form,
+                headers={"Idempotency-Key": idempotency_key},
+            )
+            payload = self._json_or_raise(resp, op)
         return _subscription_of(payload)
 
     async def _customer_default_pm(self, client: httpx.AsyncClient, customer_id: str) -> str | None:

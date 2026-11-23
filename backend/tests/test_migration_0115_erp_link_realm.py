@@ -191,9 +191,9 @@ async def _restore_head_indexes(engine) -> None:
     """Put back what the downgrade's ``DROP COLUMN`` took with it.
 
     Dropping ``vendors.erp_link_realm`` drops every index on it, among them one a
-    LATER revision builds (``uq_vendors_erp_link``, 0140), and re-running 0115
+    LATER revision builds (``uq_vendors_erp_link``, 0141), and re-running 0115
     adds the column but not that index. Left so, tenant "a" stays below head for
-    the rest of the session: 0140's own test then finds no index, and every
+    the rest of the session: 0141's own test then finds no index, and every
     test after this one runs without the constraint the app relies on. The
     model is the head schema ``create_all`` built, so its indexes are what to
     restore.

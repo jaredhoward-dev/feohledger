@@ -144,8 +144,11 @@ a key is gated too, since a key the plan cannot use would only 402 on every
 call (decisions §258). The refusal path
 stays exercisable locally instead of being something only a paying customer
 could ever hit. Move a tenant across the gate with
-`POST /api/billing/change-plan {"plan_code": "growth"}` (the `mock` billing
-adapter handles it with no Stripe key).
+`/billing` → Change plan → Growth → Confirm (the `mock` billing adapter handles
+it with no Stripe key; over the API it is `POST /api/billing/change-plan/preview
+{"plan_code": "growth"}`, then `POST /api/billing/change-plan` with that
+preview's `proration_date`, `amount_due` as `expected_amount_due`, and
+`currency` — decisions §482).
 
 Every `e2e<N>` Playwright worker tenant is on `scale` — see
 `docs/billing.md` § Which plan the seed lands each tenant on.

@@ -14,6 +14,8 @@ import {
 	PLAN_FEATURES,
 	isPlanFeature,
 	planFeatureLabelKey,
+	planCodeLabel,
+	planCodeLabelKey,
 	planTierLabelKey
 } from './planFeatures';
 
@@ -82,5 +84,22 @@ describe('plan features', () => {
 		expect(isPlanFeature('sso')).toBe(true);
 		expect(isPlanFeature('max_seats')).toBe(false);
 		expect(isPlanFeature(undefined)).toBe(false);
+	});
+});
+
+describe('planCodeLabelKey', () => {
+	it('names the catalog tiers and leaves any other plan code to the caller', () => {
+		expect(planCodeLabelKey('free')).toBe('planTier.free');
+		expect(planCodeLabelKey('growth')).toBe('planTier.growth');
+		expect(planCodeLabelKey('scale')).toBe('planTier.scale');
+		expect(planCodeLabelKey('enterprise_acme')).toBeNull();
+		expect(planCodeLabelKey('')).toBeNull();
+		expect(planCodeLabelKey(null)).toBeNull();
+	});
+
+	it('labels a code through the given translator, falling back to the code', () => {
+		const t = (key: string) => `<${key}>`;
+		expect(planCodeLabel('growth', t)).toBe('<planTier.growth>');
+		expect(planCodeLabel('enterprise_acme', t)).toBe('enterprise_acme');
 	});
 });

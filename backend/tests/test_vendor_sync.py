@@ -802,7 +802,7 @@ async def test_a_hand_made_link_waits_for_a_sync_and_is_then_refused(realdb):
 
 
 # ---------------------------------------------------------------------------
-# One holder per (company, ERP record) — uq_vendors_erp_link, migration 0140
+# One holder per (company, ERP record) — uq_vendors_erp_link, migration 0141
 # ---------------------------------------------------------------------------
 
 
@@ -862,7 +862,7 @@ async def test_one_record_id_may_be_held_once_per_company(realdb):
 
 @pytest.mark.parametrize("realm", [None, "xero:dup-company"])
 async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_on(realdb, realm):
-    """A tenant not yet at 0140 can still hold such a pair (0140 refuses to
+    """A tenant not yet at 0141 can still hold such a pair (0141 refuses to
     build its index over one). The lookup by id used to raise
     ``MultipleResultsFound`` and abort the whole pull; now it reports the
     record as a ``duplicate_link`` conflict, touches neither holder, and syncs

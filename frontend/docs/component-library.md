@@ -265,7 +265,10 @@ The visual styling for all of the above lives **globally in `src/app.css`** (cla
   `billing-ai-paused`, `billing-ai-cap-input`, `-save`, `-remove`.
 - `CardSetupPanel.svelte` — the add / replace-card flow. `<CardSetupPanel
   pendingPlanName={…} onsaved={(list) => …} onclose={…} />`, mounted inside a
-  `{#key}` so each attempt is a fresh SetupIntent. On mount it focuses its own
+  `{#key}` so each attempt is a fresh SetupIntent — in the payment-methods
+  section, and as the plan dialog's card step (with `pendingPlanName`, which
+  says the price review comes next). Saving a card only saves the card; it
+  never changes the plan (decisions §482). On mount it focuses its own
   heading, starts `POST /payment-method/setup-intent`, and picks its form with
   `types/billing.ts::cardFormMode`: the Stripe Payment Element (Stripe.js
   dynamically imported from `@stripe/stripe-js/pure` with
@@ -279,7 +282,7 @@ The visual styling for all of the above lives **globally in `src/app.css`** (cla
   `confirmSetup` again; a `processing` intent shows a neutral notice
   (`billing-card-save-notice`). `pendingPlanCode` is stashed for the intent
   just before `confirmSetup` (`utils/pendingPlanChange.ts`) so a redirect
-  return can still retry the upgrade. Testids:
+  return reopens the plan dialog at that plan's price review. Testids:
   `billing-card-setup` (`data-mode`), `billing-card-mock`,
   `billing-card-save-test`, `billing-card-element`, `billing-card-save`,
   `billing-card-not-configured`, `billing-card-pending-plan`.

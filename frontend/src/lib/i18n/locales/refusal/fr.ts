@@ -75,6 +75,8 @@ export const messages = {
 	'refusal.billingPaymentDeclined': "Votre carte a été refusée, votre formule n'a donc pas été modifiée. Mettez à jour votre carte et réessayez.",
 	'refusal.billingNotConfigured': "Les formules payantes ne sont pas encore disponibles, car la facturation n'est pas configurée pour ce déploiement. Contactez notre équipe.",
 	'refusal.planChangeInProgress': "Un autre changement de formule est déjà en cours. Réessayez dans un instant.",
+	'refusal.planChangePreviewStale': "Le prix que vous avez confirmé n'est plus à jour : rien n'a été facturé. Vérifiez le nouveau montant et confirmez à nouveau.",
+	'refusal.scheduledChangeAlreadyDue': "Votre passage à la nouvelle formule a déjà pris effet : il ne peut plus être annulé.",
 	'refusal.setupIntentNotFound': "Cette configuration de carte est introuvable. Recommencez l'ajout de la carte.",
 	'refusal.setupIntentIncomplete': "La configuration de la carte n'est pas encore terminée. Terminez la saisie de vos informations de carte et réessayez.",
 	'refusal.creditMemoInvoiceSettled': "La facture est au statut {status} : plus aucun paiement ne sera effectué sur elle, un avoir appliqué ne réduirait donc rien. Laissez l'avoir ouvert et appliquez-le à la prochaine facture du fournisseur.",

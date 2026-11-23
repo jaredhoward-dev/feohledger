@@ -75,6 +75,8 @@ export const messages = {
 	'refusal.billingPaymentDeclined': "Ihre Karte wurde abgelehnt, daher wurde Ihr Tarif nicht geändert. Aktualisieren Sie Ihre Karte und versuchen Sie es erneut.",
 	'refusal.billingNotConfigured': "Kostenpflichtige Tarife sind noch nicht verfügbar, weil die Abrechnung für diese Installation nicht eingerichtet ist. Kontaktieren Sie unser Team.",
 	'refusal.planChangeInProgress': "Es läuft bereits ein anderer Tarifwechsel. Versuchen Sie es gleich noch einmal.",
+	'refusal.planChangePreviewStale': "Der bestätigte Preis ist nicht mehr aktuell, daher wurde nichts berechnet. Prüfen Sie den neuen Betrag und bestätigen Sie erneut.",
+	'refusal.scheduledChangeAlreadyDue': "Ihr Wechsel zum neuen Tarif ist bereits wirksam und kann nicht mehr rückgängig gemacht werden.",
 	'refusal.setupIntentNotFound': "Diese Karteneinrichtung wurde nicht gefunden. Beginnen Sie erneut mit dem Hinzufügen der Karte.",
 	'refusal.setupIntentIncomplete': "Die Karteneinrichtung ist noch nicht abgeschlossen. Geben Sie Ihre Kartendaten vollständig ein und versuchen Sie es erneut.",
 	'refusal.creditMemoInvoiceSettled': "Die Rechnung hat den Status {status}: Es wird keine Zahlung mehr darauf geleistet, eine angewendete Gutschrift würde also nichts mindern. Lassen Sie die Gutschrift offen und wenden Sie sie auf die nächste Rechnung des Lieferanten an.",

@@ -140,7 +140,7 @@ async def sync_vendors_from_erp(
     {"name", "reason", "erp_vendor_ids"} (``reason`` ``ambiguous_name``: the
     name matched more than one way, so nothing was linked; ``duplicate_link``:
     two local vendors already hold that record in this company, so neither was
-    updated — only on a tenant not yet at migration 0140), unlinked: names whose link this run
+    updated — only on a tenant not yet at migration 0141), unlinked: names whose link this run
     dropped, deactivated / codes_cleared / realm_adopted / restored: int,
     values_too_long: {"name", "erp_vendor_id", "fields"} per record with a
     field too long to store (:data:`_BOUNDED_FIELDS`; field NAMES only),
@@ -329,8 +329,8 @@ async def sync_vendors_from_erp(
             # Two vendors holding one record in one company: which one is the
             # supplier is a person's call (merge, or unlink the stale one), so
             # neither is touched and the run goes on. `uq_vendors_erp_link`
-            # (migration 0140) makes this unreachable on a migrated tenant;
-            # 0140 refuses to build it over such a pair (decisions §486).
+            # (migration 0141) makes this unreachable on a migrated tenant;
+            # 0141 refuses to build it over such a pair (decisions §486).
             duplicate_links.append(
                 {
                     "name": erp_v.get("name") or "",

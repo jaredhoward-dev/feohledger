@@ -45,8 +45,8 @@ Idempotent: the check finds nothing once the index exists, and the index is
 transaction and blocks writes to ``vendors`` while it builds — instant at
 today's sizes. Downgrade drops the index.
 
-Revision ID: 0140_vendor_erp_link_unique
-Revises: 0139_sanctions_false_positive
+Revision ID: 0141_vendor_erp_link_unique
+Revises: 0140_subscription_pending_plan
 Create Date: 2026-11-21
 
 27 characters (``alembic_version.version_num`` is ``VARCHAR(32)``); the filename
@@ -57,8 +57,8 @@ from sqlalchemy import text
 
 from alembic import op
 
-revision = "0140_vendor_erp_link_unique"
-down_revision = "0139_sanctions_false_positive"
+revision = "0141_vendor_erp_link_unique"
+down_revision = "0140_subscription_pending_plan"
 branch_labels = None
 depends_on = None
 
@@ -121,7 +121,7 @@ def _refuse_duplicates() -> None:
         named += f" and {rows - NAMED_IDS} more"
     database = bind.execute(text("SELECT current_database()")).scalar()
     raise DuplicateErpVendorLink(
-        f"0140: the vendors table in database {database} holds {len(groups)} ERP vendor link(s) "
+        f"0141: the vendors table in database {database} holds {len(groups)} ERP vendor link(s) "
         f"shared by {rows} vendors in the same ERP company (vendor ids: {named}). For each "
         "group, merge the vendors if they are one supplier, or unlink the stale record from "
         "the others, then re-run the migration. List every group with the query in "

@@ -12,6 +12,7 @@ import {
 	test
 } from '../fixtures/helpers';
 import type { Page } from '@playwright/test';
+import { expectNoA11yViolations } from '../a11y/axe-helper';
 
 /**
  * /billing — Platform Billing & Metering (read/display surface).
@@ -520,6 +521,60 @@ test.describe('/billing (admin)', () => {
 		await expect(page.getByTestId('billing-add-card')).toBeFocused();
 		await expect(section.getByText('Visa ····4242')).toBeVisible();
 		await expect(section.getByText('Default', { exact: true })).toBeVisible();
+		// The worker's org is on Free with the mock provider: nothing bills
+		// this card yet, so the toast does not claim a subscription is charged.
+		await expect(page.getByText('Card saved.', { exact: true })).toBeVisible();
+		await expect(page.getByText('Your subscription is now charged to this card.')).toHaveCount(0);
+	});
+
+	test('a card saved while a live provider bills the plan says the subscription is charged to it', async ({
+		page
+	}) => {
+		await page.route(isApi('/api/billing/subscription'), (route) =>
+			route.fulfill(
+				json({
+					provider: 'stripe_billing',
+					plan: {
+						code: 'growth',
+						name: 'Growth',
+						monthly_price: '49.00',
+						currency: 'USD',
+						entitlements: {},
+						trial_days: 0
+					},
+					subscription: {
+						status: 'active',
+						current_period_start: '2026-11-01T00:00:00Z',
+						current_period_end: '2026-12-01T00:00:00Z',
+						trial_end: null,
+						externally_managed: true,
+						scheduled_change: null
+					},
+					period: '2026-11',
+					usage: { extractions: '0', extractions_platform: '0' },
+					ai_usage: {
+						period: '2026-11',
+						used: 0,
+						included: 500,
+						overage_unit_price: '0.10',
+						currency: 'USD',
+						overage_units: 0,
+						overage_amount: '0.00',
+						projected_overage_amount: '0.00',
+						spend_cap: null,
+						paused: false,
+						pause_reason: null
+					}
+				})
+			)
+		);
+		await stubMockSetupIntent(page);
+		await stubSetDefault(page);
+
+		await page.goto('/billing');
+		await expect(page.getByTestId('billing-plan').getByRole('heading', { name: 'Growth' })).toBeVisible();
+		await page.getByTestId('billing-add-card').click();
+		await page.getByTestId('billing-card-setup').getByTestId('billing-card-save-test').click();
 		await expect(
 			page.getByText('Card saved. Your subscription is now charged to this card.')
 		).toBeVisible();
@@ -572,9 +627,8 @@ test.describe('/billing (admin)', () => {
 		const saved = await stubSetDefault(page);
 		await page.goto(`${STRIPE_RETURN}succeeded&setup_intent_client_secret=seti_x_secret_y`);
 
-		await expect(
-			page.getByText('Card saved. Your subscription is now charged to this card.')
-		).toBeVisible();
+		// The worker's org is on Free (mock): no subscription is charged yet.
+		await expect(page.getByText('Card saved.', { exact: true })).toBeVisible();
 		expect(saved.bodies).toEqual([{ setup_intent_id: 'seti_x' }]);
 		await expect(page).not.toHaveURL(/setup_intent/);
 		await expect(page).toHaveURL(/\/billing$/);
@@ -694,9 +748,79 @@ test.describe('/billing (admin)', () => {
 			parked = [];
 		});
 
-		test('changes plan and shows the real returned proration', async ({ page }) => {
-			await page.getByTestId('billing-change-plan').click();
+		/** A preview as `POST /change-plan/preview` answers it (decisions §482). */
+		function previewBody(overrides: Record<string, unknown> = {}) {
+			return {
+				plan_code: targetCode,
+				already_on_plan: false,
+				currency: 'USD',
+				amount_due: '14.80',
+				credit: '0.00',
+				next_amount: '99.00',
+				next_date: '2026-12-01T00:00:00Z',
+				proration_date: 1_795_000_000,
+				expires_at: '2026-11-21T12:10:00Z',
+				payment_method_required: false,
+				effective_at: null,
+				clears_scheduled_change: false,
+				...overrides
+			};
+		}
 
+		/** Stub the preview, answering `bodies` in turn (the last repeats). */
+		async function stubPreview(page: Page, ...bodies: Record<string, unknown>[]) {
+			const seen = { count: 0 };
+			await page.route(isApi('/api/billing/change-plan/preview'), (route) => {
+				const body = bodies[Math.min(seen.count, bodies.length - 1)];
+				seen.count += 1;
+				return route.fulfill(json(body));
+			});
+			return seen;
+		}
+
+		/** Stub the confirm, recording each body; `answer` decides the reply. */
+		async function stubChangePlan(
+			page: Page,
+			answer: (n: number) => ReturnType<typeof json>
+		): Promise<unknown[]> {
+			const bodies: unknown[] = [];
+			await page.route(isApi('/api/billing/change-plan'), (route) => {
+				bodies.push(route.request().postDataJSON());
+				return route.fulfill(answer(bodies.length));
+			});
+			return bodies;
+		}
+
+		const CHANGED = () =>
+			json({
+				changed: true,
+				old_plan_code: currentCode,
+				new_plan_code: targetCode,
+				proration: { amount: '41.67', unused_days: 25, period_days: 30 },
+				scheduled: false,
+				effective_at: null
+			});
+
+		async function pickTarget(page: Page) {
+			await page.getByTestId('billing-change-plan').click();
+			const modal = page.getByRole('dialog', { name: 'Change plan' });
+			await modal.getByRole('radio', { name: 'Select the E2E Target plan' }).check();
+			await page.getByTestId('billing-change-plan-continue').click();
+			return modal;
+		}
+
+		test('shows the price first and charges nothing until Confirm and pay', async ({ page }) => {
+			// The real mock backend end to end: preview, then confirm with the
+			// preview's own figures. Every change-plan request is counted, so a
+			// call before the Confirm click fails the test.
+			const changePlanCalls: unknown[] = [];
+			page.on('request', (req) => {
+				if (new URL(req.url()).pathname === '/api/billing/change-plan') {
+					changePlanCalls.push(req.postDataJSON());
+				}
+			});
+
+			await page.getByTestId('billing-change-plan').click();
 			const modal = page.getByRole('dialog', { name: 'Change plan' });
 			await expect(modal).toBeVisible();
 
@@ -705,156 +829,297 @@ test.describe('/billing (admin)', () => {
 			const currentRadio = modal.getByRole('radio', { name: 'Select the E2E Current plan' });
 			await expect(currentRadio).toBeDisabled();
 			await expect(modal.getByText('Current plan')).toBeVisible();
+			await expect(
+				modal.getByText("You'll see exactly what you will pay before anything is charged.")
+			).toBeVisible();
 
-			const targetRadio = modal.getByRole('radio', { name: 'Select the E2E Target plan' });
-			await targetRadio.check();
+			await modal.getByRole('radio', { name: 'Select the E2E Target plan' }).check();
+			const previewed = page.waitForResponse(
+				(r) => new URL(r.url()).pathname === '/api/billing/change-plan/preview'
+			);
+			await page.getByTestId('billing-change-plan-continue').click();
+			const priced = await (await previewed).json();
 
-			const confirm = page.getByTestId('billing-change-plan-confirm');
-			await expect(confirm).toBeEnabled();
-			await confirm.click();
+			// The review states the provider's figures: what is due today and what
+			// recurs, the monthly price being the target plan's $99.00.
+			const review = modal.getByTestId('billing-plan-review');
+			await expect(review.getByText('Moving from E2E Current to E2E Target.')).toBeFocused();
+			await expect(review.getByTestId('billing-plan-review-today')).toHaveText(
+				/^You'll pay \$\d+\.\d{2} today for the rest of the current billing period\.$/
+			);
+			await expect(review.getByTestId('billing-plan-review-recurring')).toHaveText(
+				/^Then \$99\.00 a month from \d{1,2} \w+ \d{4}\.$|^Then \$99\.00 a month from \w+ \d{1,2}, \d{4}\.$/
+			);
+			expect(changePlanCalls).toEqual([]);
+			// The review step meets WCAG 2.2 AA as rendered.
+			await expectNoA11yViolations(page);
 
-			// Real POST /api/billing/change-plan applied the move; the result view
-			// renders the ACTUAL proration the response returned (an upgrade from
-			// $49 to $99 is a positive mid-period charge), never a fabricated one.
+			await review.getByRole('button', { name: 'Confirm and pay' }).click();
+
 			const result = page.getByTestId('billing-plan-change-result');
-			await expect(result).toBeVisible({ timeout: 10_000 });
 			await expect(result.getByText("You're now on the E2E Target plan.")).toBeVisible();
-			await expect(result.getByText('Prorated adjustment')).toBeVisible();
+			await expect(
+				result.getByText('Your card on file has been charged. The receipt will appear under Invoices.')
+			).toBeVisible();
+			// One confirm, carrying exactly the figures the reader saw.
+			expect(changePlanCalls).toEqual([
+				{
+					plan_code: targetCode,
+					proration_date: priced.proration_date,
+					expected_amount_due: priced.amount_due,
+					currency: priced.currency
+				}
+			]);
 
 			await result.getByRole('button', { name: 'Done' }).click();
 			await expect(modal).toBeHidden();
-
-			// The plan card behind the modal reflects the change without a manual
-			// reload (confirmPlanChange re-fetches the subscription on success).
+			// The plan card behind the modal reflects the change without a reload.
 			await expect(page.getByTestId('billing-plan').getByRole('heading', { name: 'E2E Target' })).toBeVisible();
 		});
 
 		test('an idempotent no-op change ("changed": false) renders as a clean success, not an error', async ({
 			page
 		}) => {
-			// Stub only the POST — the backend's own idempotent-no-op case is the
-			// org already being on the target plan, which this UI's disabled
-			// current-plan radio prevents reaching directly. The response shape is
-			// still the API's contract, so the UI must honour a `changed: false`
-			// reply regardless of which plan triggered it.
-			await page.route('**/api/billing/change-plan', async (route) => {
-				await route.fulfill({
-					status: 200,
-					contentType: 'application/json',
-					body: JSON.stringify({
-						changed: false,
-						old_plan_code: currentCode,
-						new_plan_code: currentCode,
-						proration: { amount: '0.00', unused_days: 0, period_days: 0 }
-					})
-				});
-			});
+			// The backend's own no-op is the org already being on the target plan,
+			// which the disabled current-plan radio prevents reaching directly. The
+			// response shape is still the API's contract, so the UI must honour it.
+			await stubPreview(page, previewBody());
+			await stubChangePlan(page, () =>
+				json({
+					changed: false,
+					old_plan_code: currentCode,
+					new_plan_code: currentCode,
+					proration: { amount: '0.00', unused_days: 0, period_days: 0 }
+				})
+			);
 
-			await page.getByTestId('billing-change-plan').click();
-			const modal = page.getByRole('dialog', { name: 'Change plan' });
-			await modal.getByRole('radio', { name: 'Select the E2E Target plan' }).check();
-			await page.getByTestId('billing-change-plan-confirm').click();
+			const modal = await pickTarget(page);
+			await modal.getByRole('button', { name: 'Confirm and pay' }).click();
 
 			const noop = page.getByTestId('billing-plan-change-noop');
-			await expect(noop).toBeVisible({ timeout: 10_000 });
+			await expect(noop).toBeVisible();
 			await expect(noop).toHaveText("You're already on the E2E Current plan — nothing changed.");
-			// No proration panel on the no-op path.
-			await expect(page.getByText('Prorated adjustment')).toHaveCount(0);
 		});
 
-		test('a change refused for no saved card offers Add a card, then retries itself once one is saved', async ({
+		test('with no card on file the dialog asks for one, then shows the price — saving the card charges nothing', async ({
 			page
 		}) => {
-			// First POST: 409 payment_method_required (the org has no card).
-			// Second POST — the automatic retry after the card is saved — applies.
-			const planCodes: unknown[] = [];
-			await page.route(isApi('/api/billing/change-plan'), (route) => {
-				planCodes.push(route.request().postDataJSON()?.plan_code);
-				if (planCodes.length === 1) {
-					return route.fulfill(
-						refusal(
-							'payment_method_required',
-							'Add a payment method before moving to a paid plan.',
-							409
-						)
-					);
-				}
-				return route.fulfill(
-					json({
-						changed: true,
-						old_plan_code: currentCode,
-						new_plan_code: targetCode,
-						proration: { amount: '41.67', unused_days: 25, period_days: 30 }
-					})
-				);
-			});
+			// The production report: the card used to be saved and the plan
+			// changed in one go, at an amount nobody had seen.
+			const previews = await stubPreview(
+				page,
+				previewBody({ payment_method_required: true }),
+				previewBody({ proration_date: 1_795_000_100 })
+			);
+			const confirmed = await stubChangePlan(page, CHANGED);
 			await stubMockSetupIntent(page);
 			const saved = await stubSetDefault(page);
 
-			await page.getByTestId('billing-change-plan').click();
-			const modal = page.getByRole('dialog', { name: 'Change plan' });
-			await modal.getByRole('radio', { name: 'Select the E2E Target plan' }).check();
-			await page.getByTestId('billing-change-plan-confirm').click();
+			const modal = await pickTarget(page);
 
-			const refused = modal.getByTestId('billing-plan-change-error');
-			await expect(refused).toContainText('Add a card before moving to a paid plan.');
-			await refused.getByRole('button', { name: 'Add a card' }).click();
-
-			// The dialog gives way to the card form, which says what saving will do.
-			await expect(modal).toBeHidden();
-			const setup = page.getByTestId('billing-card-setup');
+			// The card step is part of the dialog, not an error.
+			await expect(modal.getByTestId('billing-plan-change-error')).toHaveCount(0);
+			const setup = modal.getByTestId('billing-card-setup');
 			await expect(setup.getByRole('heading', { name: 'Add a card' })).toBeFocused();
 			await expect(setup.getByTestId('billing-card-pending-plan')).toHaveText(
-				'Once your card is saved, we will move you to the E2E Target plan.'
+				"Save a card to continue to the E2E Target plan. You'll review the price before anything is charged."
 			);
+			await expectNoA11yViolations(page);
 
 			await setup.getByTestId('billing-card-save-test').click();
 
-			// Saved, then retried for the reader: the dialog reopens on the result.
-			const result = page.getByTestId('billing-plan-change-result');
-			await expect(result.getByText("You're now on the E2E Target plan.")).toBeVisible({
-				timeout: 10_000
-			});
+			// Saved — and the dialog moves to the review, priced again.
+			const review = modal.getByTestId('billing-plan-review');
+			await expect(review.getByTestId('billing-plan-review-today')).toHaveText(
+				"You'll pay $14.80 today for the rest of the current billing period."
+			);
+			await expect(review.getByTestId('billing-plan-review-recurring')).toHaveText(
+				/^Then \$99\.00 a month from /
+			);
 			expect(saved.bodies).toEqual([{ setup_intent_id: MOCK_SETUP_INTENT_ID }]);
-			expect(planCodes).toEqual([targetCode, targetCode]);
+			expect(previews.count).toBe(2);
+			expect(confirmed).toEqual([]); // nothing charged by saving the card
 			await expect(page.getByTestId('billing-payment-methods').getByText('Visa ····4242')).toBeVisible();
+
+			await review.getByRole('button', { name: 'Confirm and pay' }).click();
+			await expect(
+				page.getByTestId('billing-plan-change-result').getByText("You're now on the E2E Target plan.")
+			).toBeVisible();
+			expect(confirmed).toEqual([
+				{
+					plan_code: targetCode,
+					proration_date: 1_795_000_100,
+					expected_amount_due: '14.80',
+					currency: 'USD'
+				}
+			]);
 		});
 
-		test('a declined upgrade charge (402 billing_payment_declined) states its own message and offers Update card', async ({
+		test('a downgrade shows its credit and a plain Confirm, nothing due today', async ({ page }) => {
+			await stubPreview(
+				page,
+				previewBody({ amount_due: '0.00', credit: '20.00', next_amount: '49.00' })
+			);
+			const modal = await pickTarget(page);
+			const review = modal.getByTestId('billing-plan-review');
+			await expect(review.getByTestId('billing-plan-review-today')).toHaveText(
+				'Nothing is charged today.'
+			);
+			await expect(review.getByTestId('billing-plan-review-credit')).toHaveText(
+				'$20.00 for the unused part of your current plan will be credited to your account and taken off future invoices.'
+			);
+			await expect(review.getByRole('button', { name: 'Confirm', exact: true })).toBeVisible();
+			await expect(review.getByRole('button', { name: 'Confirm and pay' })).toHaveCount(0);
+		});
+
+		test('a move to Free waits for the period end: the card says when, Free is not offered again, and Keep takes it back', async ({
 			page
 		}) => {
-			await page.route(isApi('/api/billing/change-plan'), (route) =>
-				route.fulfill(refusal('billing_payment_declined', 'Your card was declined.', 402))
+			// The real mock backend end to end (decisions §483): nothing is
+			// charged or credited, the org keeps the paid plan until the period
+			// ends, and the undo is on the plan card.
+			const freeCode = `e2e_pc_free_${Date.now().toString(36)}`;
+			const freeId = controlPsql(
+				`INSERT INTO plans (id, code, name, monthly_price, currency, seat_component, ` +
+					`usage_components, entitlements, trial_days, is_active, created_at, updated_at) ` +
+					`VALUES (gen_random_uuid(), '${freeCode}', 'E2E Free', 0.00, 'USD', '{}'::jsonb, ` +
+					`'{}'::jsonb, '{}'::jsonb, 0, true, now(), now()) RETURNING id`
+			);
+			try {
+				await page.getByTestId('billing-change-plan').click();
+				const modal = page.getByRole('dialog', { name: 'Change plan' });
+				await modal.getByRole('radio', { name: 'Select the E2E Free plan' }).check();
+				await page.getByTestId('billing-change-plan-continue').click();
+
+				const review = modal.getByTestId('billing-plan-review');
+				await expect(review.getByTestId('billing-plan-review-scheduled')).toHaveText(
+					/^You keep E2E Current until .+\d{4}, then move to E2E Free\.$/
+				);
+				await expect(review.getByTestId('billing-plan-review-scheduled')).toBeFocused();
+				await expect(review.getByTestId('billing-plan-review-today')).toHaveText(
+					'Nothing is charged today.'
+				);
+				// No credit: a free workspace has no future invoice to spend it on.
+				await expect(review.getByTestId('billing-plan-review-credit')).toHaveCount(0);
+				await expect(review.getByTestId('billing-plan-review-recurring')).toHaveText(
+					'The E2E Free plan has no monthly charge.'
+				);
+				await expectNoA11yViolations(page);
+				await review.getByRole('button', { name: 'Confirm', exact: true }).click();
+
+				const result = page.getByTestId('billing-plan-change-result');
+				await expect(modal.getByRole('heading', { name: 'Change scheduled' })).toBeVisible();
+				await expect(result.getByTestId('billing-plan-change-scheduled')).toHaveText(
+					/^You'll move to the E2E Free plan on .+\d{4}\. You keep E2E Current until then\.$/
+				);
+				await result.getByRole('button', { name: 'Done' }).click();
+				await expect(modal).toBeHidden();
+
+				// Still on the paid plan, with the move said plainly on the card.
+				const card = page.getByTestId('billing-plan');
+				await expect(card.getByRole('heading', { name: 'E2E Current' })).toBeVisible();
+				const notice = card.getByTestId('billing-scheduled-change');
+				await expect(notice).toContainText(/Moving to E2E Free on .+\d{4}\./);
+				await expect(notice).toContainText('You keep E2E Current and everything in it until then.');
+				await expectNoA11yViolations(page);
+
+				// The dialog does not offer the pending plan again.
+				await page.getByTestId('billing-change-plan').click();
+				await expect(modal.getByRole('radio', { name: 'Select the E2E Free plan' })).toBeDisabled();
+				await expect(modal.getByText('Scheduled', { exact: true })).toBeVisible();
+				await modal.getByRole('button', { name: 'Cancel' }).click();
+				await expect(modal).toBeHidden();
+
+				await notice.getByRole('button', { name: 'Keep E2E Current' }).click();
+				await expect(page.getByText("You're staying on the E2E Current plan.")).toBeVisible();
+				await expect(card.getByTestId('billing-scheduled-change')).toHaveCount(0);
+				// Focus lands on the card's own action, not the top of the page.
+				await expect(page.getByTestId('billing-change-plan')).toBeFocused();
+				expect(
+					controlPsql(
+						`SELECT count(*) FROM subscriptions WHERE organization_id='${orgId}' ` +
+							`AND pending_plan_id IS NOT NULL`
+					)
+				).toBe('0');
+			} finally {
+				controlPsql(
+					`UPDATE subscriptions SET pending_plan_id = NULL, pending_plan_effective_at = NULL ` +
+						`WHERE pending_plan_id = '${freeId}'`
+				);
+				controlPsql(`DELETE FROM plans WHERE id = '${freeId}'`);
+			}
+		});
+
+		test('a declined charge (402 billing_payment_declined) states its own message and offers Update card', async ({
+			page
+		}) => {
+			await stubPreview(page, previewBody());
+			await stubChangePlan(page, () =>
+				refusal('billing_payment_declined', 'Your card was declined.', 402)
 			);
 
-			await page.getByTestId('billing-change-plan').click();
-			const modal = page.getByRole('dialog', { name: 'Change plan' });
-			await modal.getByRole('radio', { name: 'Select the E2E Target plan' }).check();
-			await page.getByTestId('billing-change-plan-confirm').click();
+			const modal = await pickTarget(page);
+			await modal.getByRole('button', { name: 'Confirm and pay' }).click();
 
 			const refused = modal.getByTestId('billing-plan-change-error');
 			// The localized decline sentence — not the server's English, and not
 			// the plan-feature gate's 402 ("…is included in the … plan").
-			await expect(refused.getByText(
-				'Your card was declined, so your plan was not changed. Update your card and try again.',
-				{ exact: true }
-			)).toBeVisible();
-			await expect(refused.getByRole('button', { name: 'Update card' })).toBeVisible();
-			// Nothing changed: the result view never appears.
+			await expect(
+				refused.getByText(
+					'Your card was declined, so your plan was not changed. Update your card and try again.',
+					{ exact: true }
+				)
+			).toBeVisible();
 			await expect(page.getByTestId('billing-plan-change-result')).toHaveCount(0);
+			// Update card is the dialog's card step.
+			await stubMockSetupIntent(page);
+			await refused.getByRole('button', { name: 'Update card' }).click();
+			await expect(modal.getByTestId('billing-card-setup')).toBeVisible();
+		});
+
+		test('a stale quote charges nothing and shows the current price to confirm again', async ({
+			page
+		}) => {
+			const previews = await stubPreview(
+				page,
+				previewBody(),
+				previewBody({ amount_due: '14.20', proration_date: 1_795_000_700 })
+			);
+			const confirmed = await stubChangePlan(page, (n) =>
+				n === 1
+					? refusal('plan_change_preview_stale', 'The price you confirmed is out of date.', 409)
+					: CHANGED()
+			);
+
+			const modal = await pickTarget(page);
+			await modal.getByRole('button', { name: 'Confirm and pay' }).click();
+
+			await expect(modal.getByTestId('billing-plan-change-error')).toHaveText(
+				'The price you confirmed is out of date, so nothing was charged. Review the new amount and confirm again.'
+			);
+			await expect(modal.getByTestId('billing-plan-review-today')).toHaveText(
+				"You'll pay $14.20 today for the rest of the current billing period."
+			);
+			expect(previews.count).toBe(2);
+
+			await modal.getByRole('button', { name: 'Confirm and pay' }).click();
+			await expect(page.getByTestId('billing-plan-change-result')).toBeVisible();
+			expect(confirmed).toEqual([
+				{ plan_code: targetCode, proration_date: 1_795_000_000, expected_amount_due: '14.80', currency: 'USD' },
+				{ plan_code: targetCode, proration_date: 1_795_000_700, expected_amount_due: '14.20', currency: 'USD' }
+			]);
 		});
 
 		test('a refusal with no card fix (plan_change_in_progress) shows only its message', async ({
 			page
 		}) => {
-			await page.route(isApi('/api/billing/change-plan'), (route) =>
-				route.fulfill(refusal('plan_change_in_progress', 'Another plan change is running.', 409))
+			await stubPreview(page, previewBody());
+			await stubChangePlan(page, () =>
+				refusal('plan_change_in_progress', 'Another plan change is running.', 409)
 			);
 
-			await page.getByTestId('billing-change-plan').click();
-			const modal = page.getByRole('dialog', { name: 'Change plan' });
-			await modal.getByRole('radio', { name: 'Select the E2E Target plan' }).check();
-			await page.getByTestId('billing-change-plan-confirm').click();
+			const modal = await pickTarget(page);
+			await modal.getByRole('button', { name: 'Confirm and pay' }).click();
 
 			const refused = modal.getByTestId('billing-plan-change-error');
 			await expect(refused).toHaveText(
@@ -863,34 +1128,28 @@ test.describe('/billing (admin)', () => {
 			await expect(refused.getByRole('button')).toHaveCount(0);
 		});
 
-		test('an upgrade interrupted by a Stripe redirect is retried on the return', async ({ page }) => {
-			// The card panel stashes the refused plan for its SetupIntent right
-			// before confirmSetup; a redirect-based method then leaves the page.
-			// Seed that stash as the panel writes it, and come back as Stripe does.
+		test('a card confirmed through a Stripe redirect reopens the price review, and charges nothing', async ({
+			page
+		}) => {
+			// The card step stashes the plan for its SetupIntent right before
+			// confirmSetup; a redirect-based method then leaves the page. Seed that
+			// stash as the panel writes it, and come back as Stripe does.
 			await page.evaluate(
 				([key, value]) => sessionStorage.setItem(key, value),
 				['billing_pending_plan', JSON.stringify({ planCode: targetCode, setupIntentId: 'seti_x' })]
 			);
-			const planCodes: unknown[] = [];
-			await page.route(isApi('/api/billing/change-plan'), (route) => {
-				planCodes.push(route.request().postDataJSON()?.plan_code);
-				return route.fulfill(
-					json({
-						changed: true,
-						old_plan_code: currentCode,
-						new_plan_code: targetCode,
-						proration: { amount: '41.67', unused_days: 25, period_days: 30 }
-					})
-				);
-			});
+			await stubPreview(page, previewBody());
+			const confirmed = await stubChangePlan(page, CHANGED);
 			const saved = await stubSetDefault(page);
 
 			await page.goto(`${STRIPE_RETURN}succeeded&setup_intent_client_secret=seti_x_secret_y`);
 
-			const result = page.getByTestId('billing-plan-change-result');
-			await expect(result.getByText("You're now on the E2E Target plan.")).toBeVisible();
+			const review = page.getByRole('dialog', { name: 'Change plan' }).getByTestId('billing-plan-review');
+			await expect(review.getByTestId('billing-plan-review-today')).toHaveText(
+				"You'll pay $14.80 today for the rest of the current billing period."
+			);
 			expect(saved.bodies).toEqual([{ setup_intent_id: 'seti_x' }]);
-			expect(planCodes).toEqual([targetCode]);
+			expect(confirmed).toEqual([]);
 			// Taken, not left for a later return.
 			expect(await page.evaluate(() => sessionStorage.getItem('billing_pending_plan'))).toBeNull();
 		});
@@ -971,7 +1230,7 @@ test.describe('/billing (admin)', () => {
 			// The whole card is the target: clicking its price selects the plan.
 			await group.getByTestId('billing-plan-option').filter({ hasText: 'E2E Mid' }).getByText('$99.00').click();
 			await expect(mid).toBeChecked();
-			await expect(page.getByTestId('billing-change-plan-confirm')).toBeEnabled();
+			await expect(page.getByTestId('billing-change-plan-continue')).toBeEnabled();
 
 			// Native radio-group keys: an arrow moves AND selects, and the
 			// disabled current plan is skipped on the wrap.

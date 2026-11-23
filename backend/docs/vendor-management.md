@@ -224,7 +224,7 @@ The system can pull the vendor master list from the connected ERP. This ensures 
 |---|---|
 | ERP vendor not in local DB | Create new vendor with `source=erp_sync`, `status=active` |
 | ERP vendor matches by `erp_vendor_id` | Update fields if changed, update `erp_synced_at` |
-| Two local vendors hold that `erp_vendor_id` in this company (only before migration 0140) | Neither is touched; reported as a `duplicate_link` conflict (§ One vendor per ERP record per company) |
+| Two local vendors hold that `erp_vendor_id` in this company (only before migration 0141) | Neither is touched; reported as a `duplicate_link` conflict (§ One vendor per ERP record per company) |
 | ERP vendor matches by name (no `erp_vendor_id` yet) | Link existing vendor to ERP, update fields |
 | Unverified vendor matches an ERP vendor by name | Auto-verify → set `status=active`, `source=erp_sync` |
 
@@ -361,7 +361,7 @@ else in the modal un-arms it. The table pans inside a named, focusable region
 
 ### One vendor per ERP record per company
 
-`uq_vendors_erp_link` (migration 0140, decisions §486) is a partial unique
+`uq_vendors_erp_link` (migration 0141, decisions §486) is a partial unique
 index on `vendors (organization_id, erp_link_realm, erp_vendor_id) NULLS NOT
 DISTINCT WHERE erp_vendor_id IS NOT NULL`: no two vendors hold one ERP record's
 id in one company. A NULL realm (a link from before migration 0115, or one a
@@ -379,7 +379,7 @@ and abort the whole pull. The sync now reports such a record instead
 message), leaves both vendors untouched, and syncs the rest. A record the
 pull lists twice is reported once (deduplicated on its ERP id), so the message
 counts records, not sightings. On a migrated tenant the index makes that
-unreachable; the check is for a tenant still before 0140.
+unreachable; the check is for a tenant still before 0141.
 
 Every sync takes the link lock (`vendor_erp_manual_link.link_lock`, §415)
 before it reads a link, a no-realm sync included (under a key no named
@@ -390,7 +390,7 @@ first one's vendor and leaves it unchanged (decisions §489).
 
 #### Duplicate ERP links
 
-Migration 0140 **refuses** (`DuplicateErpVendorLink`, nothing changed) on a
+Migration 0141 **refuses** (`DuplicateErpVendorLink`, nothing changed) on a
 tenant where two or more vendors already share a link in one company, naming
 the database, the counts and at most ten vendor row ids, never a vendor name or
 the ERP company. `scripts/migrate_all_tenants.py` then exits non-zero and the

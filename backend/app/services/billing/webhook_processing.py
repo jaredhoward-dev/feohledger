@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.billing import SUBSCRIPTION_STATUSES, Subscription
 from app.services.audit_dispatch import dispatch_auth_audit
+from app.services.billing.scheduled_downgrade import apply_scheduled_downgrade
 from app.services.billing_adapters.base import BillingWebhookEvent
 
 logger = logging.getLogger(__name__)
@@ -112,6 +114,14 @@ async def apply_billing_event(
         # a non-change (mirrors transition_invoice's "no-op writes no row").
         return WebhookApplyResult(applied=False, reason="already_in_status", new_status=target)
 
+    if target == "canceled" and subscription.pending_plan_id is not None:
+        # The provider ended a subscription we had scheduled to end: the
+        # paid period is over and the org moves onto the free plan it chose
+        # (decisions §483) — not to `canceled`, which would leave it on no
+        # subscription at all. Idempotent: the row now names no provider id,
+        # so a redelivery finds nothing (`unknown_subscription`).
+        return await _apply_scheduled_move(control_db, subscription, event)
+
     previous = subscription.status
     subscription.status = target
 
@@ -136,6 +146,25 @@ async def apply_billing_event(
     await control_db.commit()
 
     return WebhookApplyResult(applied=True, new_status=target)
+
+
+async def _apply_scheduled_move(
+    control_db: AsyncSession, subscription: Subscription, event: BillingWebhookEvent
+) -> WebhookApplyResult:
+    details = await apply_scheduled_downgrade(control_db, subscription, now=datetime.now(UTC))
+    details["event_id"] = event.event_id
+    details["event_type"] = event.event_type
+    details["provider_action"] = "ended_at_period_end"
+    # Append-only, before the commit, like every status change here.
+    await dispatch_auth_audit(
+        organization_id=subscription.organization_id,
+        actor_id=None,  # provider-driven: the period ended
+        action="billing.plan_changed",
+        entity_id=subscription.id,
+        details=details,
+    )
+    await control_db.commit()
+    return WebhookApplyResult(applied=True, reason="scheduled_plan_applied", new_status="active")
 
 
 #: Invoice events, by type: the statuses each may move a subscription FROM, and

@@ -35,7 +35,7 @@ class Vendor(Base, EntityMixin, TimestampMixin):
             "payments_blocked",
             postgresql_where=text("payments_blocked"),
         ),
-        # One vendor per ERP record per company (migration 0140, decisions
+        # One vendor per ERP record per company (migration 0141, decisions
         # §486): two rows holding one id made the vendor sync's lookup by id
         # raise and abort the whole pull. NULLS NOT DISTINCT so a NULL realm
         # (a pre-0115 link, or one a no-realm sync made) is one company too —

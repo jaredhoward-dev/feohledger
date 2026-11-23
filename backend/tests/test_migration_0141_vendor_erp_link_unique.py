@@ -1,4 +1,4 @@
-"""Migration 0140 — one vendor per ERP record per company (decisions §486).
+"""Migration 0141 — one vendor per ERP record per company (decisions §486).
 
 The realdb harness builds every tenant with ``create_all``, so
 ``uq_vendors_erp_link`` exists there without the revision running: the
@@ -27,20 +27,20 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.vendor import Vendor
 
-REVISION = Path(__file__).resolve().parents[1] / "alembic/versions/0140_vendor_erp_link_unique.py"
+REVISION = Path(__file__).resolve().parents[1] / "alembic/versions/0141_vendor_erp_link_unique.py"
 TENANT = "a"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig_0140", REVISION)
+    spec = importlib.util.spec_from_file_location("_mig_0141", REVISION)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def test_revision_chains_after_0139_and_fits_the_version_column():
+def test_revision_chains_after_0140_and_fits_the_version_column():
     mig = _load()
-    assert mig.down_revision == "0139_sanctions_false_positive"
+    assert mig.down_revision == "0140_subscription_pending_plan"
     assert len(mig.revision) <= 32
     assert REVISION.stem == mig.revision
 
@@ -98,7 +98,7 @@ async def _insert(engine, org_id, rows: list[tuple[uuid.UUID, str, str | None]])
         await s.commit()
 
 
-async def test_0140_refuses_a_shared_link_then_builds_the_create_all_index(realdb):
+async def test_0141_refuses_a_shared_link_then_builds_the_create_all_index(realdb):
     from app.database import _make_tenant_url
 
     mig = _load()
@@ -163,7 +163,7 @@ async def test_0140_refuses_a_shared_link_then_builds_the_create_all_index(reald
         await engine.dispose()
 
 
-async def test_0140_names_at_most_ten_vendors(realdb):
+async def test_0141_names_at_most_ten_vendors(realdb):
     from app.database import _make_tenant_url
 
     mig = _load()
@@ -186,7 +186,7 @@ async def test_0140_names_at_most_ten_vendors(realdb):
         await engine.dispose()
 
 
-async def test_0140_is_a_no_op_on_the_control_plane(realdb):
+async def test_0141_is_a_no_op_on_the_control_plane(realdb):
     mig = _load()
     engine = create_async_engine(realdb.control_db_url())
     try:
