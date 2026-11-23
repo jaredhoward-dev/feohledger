@@ -79,10 +79,11 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.database import _make_tenant_url, control_session_factory
+from app.db_engine import create_async_engine
 from app.models.discount import (
     OFFER_STATUS_ACCEPTED,
     OFFER_STATUS_OFFERED,
@@ -90,7 +91,6 @@ from app.models.discount import (
 )
 from app.models.invoice import Invoice
 from app.models.organization import Organization
-from app.models.payment import PaymentSchedule
 from app.services.audit_dispatch import dispatch_audit
 from app.services.discount_offers import (
     best_tier_for_date,
@@ -101,6 +101,7 @@ from app.services.discount_offers import (
     tier_deadline,
 )
 from app.services.discount_roi import compute_roi, days_between
+from app.services.payment_schedules import latest_schedule
 from app.services.sweep_health import SWEEP_DISCOUNT_AUTO_TRIGGER, run_sweep_loop
 from app.utils.dates import utc_today
 
@@ -179,16 +180,9 @@ async def _resolve_due_date(db: AsyncSession, offer: DiscountOffer) -> date | No
     """
     if offer.invoice_id is None:
         return None
-    due = (
-        await db.execute(
-            select(PaymentSchedule.due_date)
-            .where(PaymentSchedule.invoice_id == offer.invoice_id)
-            .order_by(PaymentSchedule.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if due is not None:
-        return due
+    schedule = await latest_schedule(db, offer.invoice_id)
+    if schedule is not None and schedule.due_date is not None:
+        return schedule.due_date
     return (
         await db.execute(select(Invoice.due_date).where(Invoice.id == offer.invoice_id))
     ).scalar_one_or_none()
@@ -204,14 +198,34 @@ async def settled_invoice_status(db: AsyncSession, offer: DiscountOffer) -> str 
     ``paid`` / ``done`` (``discount_offers.invoice_awaits_payment``). A
     vendor-scoped bulk offer has no single invoice and is never refused here.
     """
-    if offer.invoice_id is None:
-        return None
-    status = (
-        await db.execute(select(Invoice.status).where(Invoice.id == offer.invoice_id))
-    ).scalar_one_or_none()
-    if status is None or invoice_awaits_payment(status):
-        return None
-    return status.value if hasattr(status, "value") else str(status)
+    return (await settled_invoice_statuses(db, [offer])).get(offer.id)
+
+
+async def settled_invoice_statuses(
+    db: AsyncSession, offers: list[DiscountOffer]
+) -> dict[uuid.UUID, str | None]:
+    """:func:`settled_invoice_status` for many offers in one query — what the
+    offer list's accept verdicts read (``api/discounts.accept_refusal``), so a
+    page of offers costs one invoice read, not one per row. The single-offer
+    form delegates here, so there is one rule."""
+    invoice_ids = {o.invoice_id for o in offers if o.invoice_id is not None}
+    statuses: dict = {}
+    if invoice_ids:
+        statuses = dict(
+            (
+                await db.execute(
+                    select(Invoice.id, Invoice.status).where(Invoice.id.in_(invoice_ids))
+                )
+            ).all()
+        )
+    out: dict[uuid.UUID, str | None] = {}
+    for offer in offers:
+        status = statuses.get(offer.invoice_id) if offer.invoice_id is not None else None
+        if status is None or invoice_awaits_payment(status):
+            out[offer.id] = None
+        else:
+            out[offer.id] = status.value if hasattr(status, "value") else str(status)
+    return out
 
 
 async def _resolve_cost_of_capital(organization_id: uuid.UUID) -> Decimal:

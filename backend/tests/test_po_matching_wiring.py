@@ -63,10 +63,17 @@ def _no_reconcile():
     session; closing rows a refresh no longer finds is its own step, proven
     against real rows in `test_po_match_exception_reconciliation.py`. Patched
     here so a bare `AsyncMock` db is never asked for a result set, and exposed
-    so a test can assert which types the refresh reported as still found."""
+    so a test can assert which types the refresh reported as still found.
+
+    The cumulative over-billing check reads the OTHER invoices citing the PO,
+    so it is patched out for the same reason and proven against real rows in
+    `test_po_matching_critical_path.py`."""
     from app.services import invoice_warnings
 
-    with patch.object(invoice_warnings, "_reconcile_po_exceptions", AsyncMock()) as close:
+    with (
+        patch.object(invoice_warnings, "_reconcile_po_exceptions", AsyncMock()) as close,
+        patch.object(invoice_warnings, "_refresh_po_overbilling", AsyncMock()),
+    ):
         yield close
 
 
@@ -158,6 +165,43 @@ async def test_refresh_po_match_creates_exception_on_amount_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_refresh_po_match_unissued_po_warns_and_blocks():
+    """A PO the ERP has not approved or issued yet (decisions §394): the finding
+    is `po_not_issued` and a payment-blocking `po_mismatch`, at the cancelled
+    PO's severity, with no variance stated."""
+    from app.services import invoice_warnings
+    from app.services.po_matching import MatchResult
+
+    inv = _fake_invoice(amount=Decimal("100.00"))
+    warnings: list[dict] = []
+    fake_match = MatchResult(
+        match_type="2-way",
+        status="mismatch",
+        po_number="PO-001",
+        po_total=Decimal("100.00"),
+        currency_check="same",
+        po_not_issued=True,
+        amount_variance=None,
+        amount_variance_pct=None,
+        within_tolerance=False,
+    )
+
+    with (
+        patch.object(invoice_warnings, "match_invoice_to_po", AsyncMock(return_value=fake_match)),
+        patch.object(invoice_warnings, "_ensure_exception", AsyncMock()) as ensure,
+    ):
+        await invoice_warnings._refresh_po_match(db=AsyncMock(), invoice=inv, warnings=warnings)
+
+    assert [w["code"] for w in warnings] == ["po_not_issued"]
+    assert warnings[0]["params"] == {"poNumber": "PO-001"}
+    assert warnings[0]["severity"] == "warning"
+    ensure.assert_awaited_once()
+    assert ensure.await_args.args[2:4] == ("po_mismatch", "warning")
+    assert inv.po_match["po_not_issued"] is True
+    assert inv.po_match["amount_variance"] is None
+
+
+@pytest.mark.asyncio
 async def test_refresh_po_match_currency_mismatch_names_both_codes_and_no_variance():
     """Invoice and PO in different currencies: the finding is the codes, not a
     variance — `po_amount_variance` would print a percentage between EUR and USD
@@ -197,6 +241,55 @@ async def test_refresh_po_match_currency_mismatch_names_both_codes_and_no_varian
     assert ensure.await_args.args[2:4] == ("po_mismatch", "warning")
     assert inv.po_match["currency_check"] == "different"
     assert inv.po_match["amount_variance"] is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_po_match_split_currency_mismatch_with_a_malformed_invoice_code():
+    """A split whose legs disagree with each other while the invoice's own code
+    is malformed (decisions §445) used to read "Invoice is in  but PO … is in
+    EUR": a blank, and one leg's code standing for every leg. Its own code
+    names every leg code instead, and it holds exactly as the other does."""
+    from app.services import invoice_warnings
+    from app.services.po_matching import MatchResult
+
+    inv = _fake_invoice(amount=Decimal("1000.00"), currency="1X")
+    warnings: list[dict] = []
+    fake_match = MatchResult(
+        match_type="2-way",
+        status="mismatch",
+        po_number="PO-A,PO-B",
+        po_ids=["a", "b"],
+        po_total=None,
+        po_currency="EUR",
+        currency_check="different",
+        amount_variance=None,
+        amount_variance_pct=None,
+        within_tolerance=False,
+        details={
+            "legs": [
+                {"po_number": "PO-A", "po_currency": "USD"},
+                {"po_number": "PO-B", "po_currency": "EUR"},
+                {"po_number": "PO-C", "po_currency": None},
+                {"po_number": "PO-D", "po_currency": "USD"},
+            ]
+        },
+    )
+
+    with (
+        patch.object(invoice_warnings, "match_invoice_to_po", AsyncMock(return_value=fake_match)),
+        patch.object(invoice_warnings, "_ensure_exception", AsyncMock()) as ensure,
+    ):
+        await invoice_warnings._refresh_po_match(db=AsyncMock(), invoice=inv, warnings=warnings)
+
+    assert [w["code"] for w in warnings] == ["po_currency_mismatch_invoice_currency_unknown"]
+    assert warnings[0]["params"] == {"poNumber": "PO-A,PO-B", "poCurrencies": "USD, EUR"}
+    assert warnings[0]["message"] == (
+        "The invoice records no valid currency and the POs behind PO-A,PO-B are in "
+        "different currencies (USD, EUR) — the amounts were not compared"
+    )
+    assert warnings[0]["severity"] == "warning"
+    ensure.assert_awaited_once()
+    assert ensure.await_args.args[2:4] == ("po_mismatch", "warning")
 
 
 @pytest.mark.asyncio
@@ -626,13 +719,16 @@ async def test_refresh_warnings_clears_po_match_when_po_number_removed():
         # (`.scalar()`), its normalized-number fallback (`.all()` — the pass that
         # catches `INV-001` vs `INV-1`, reached only when the exact check misses,
         # which it does here), and the line-total reconciliation sum
-        # (`.scalar_one_or_none()` — None means "no line totals to reconcile").
+        # (`.scalar_one_or_none()` — None means "no line totals to reconcile"),
+        # and the stale-stamp read over open duplicate / fraud rows
+        # (`.scalars().all()`, none; decisions §286).
         # Each is a SYNC method on a real `Result`, so it must be a plain lambda:
         # left as an AsyncMock child, `.all()` returns a coroutine.
         db = AsyncMock()
         db.execute.return_value.scalar = lambda: 0
         db.execute.return_value.all = lambda: []
         db.execute.return_value.scalar_one_or_none = lambda: None
+        db.execute.return_value.scalars = lambda: SimpleNamespace(all=lambda: [])
         await invoice_warnings.refresh_warnings(db, inv)
 
     match.assert_not_awaited()
@@ -692,9 +788,24 @@ def test_status_str_handles_simplenamespace_mock():
     "fields",
     [
         {"status": "no_po"},
+        # The PO's total is one its ERP no longer vouches for (decisions §323).
+        {
+            "status": "mismatch",
+            "currency_check": "same",
+            "po_total_unverifiable_reason": "unpriceable",
+            "amount_variance": None,
+            "amount_variance_pct": None,
+        },
         {
             "status": "mismatch",
             "currency_check": "different",
+            "amount_variance": None,
+            "amount_variance_pct": None,
+        },
+        {
+            "status": "mismatch",
+            "currency_check": "same",
+            "po_not_issued": True,
             "amount_variance": None,
             "amount_variance_pct": None,
         },

@@ -8,6 +8,13 @@ subscription that has sat ``past_due`` longer than the grace window
 (``FEOH_BILLING_DUNNING_GRACE_DAYS``) is flagged ``canceled`` with an append-only
 audit row.
 
+A row a live provider bills (decisions §480)
+--------------------------------------------
+A ``past_due`` row carrying a provider subscription id, with a live adapter, is
+canceled only once the provider says it is canceled (asked before the row
+lock): canceling our row alone would revoke the plan while Stripe's retries
+kept charging for it. Until then Stripe's own retry schedule decides.
+
 Money-path boundary (important)
 -------------------------------
 This sweep ONLY changes a ``Subscription`` lifecycle status (``past_due`` →
@@ -54,6 +61,22 @@ it. The audit row is committed first, so a crash between the two leaves an audit
 row for a cancellation that then re-runs — a duplicate trail entry, which is
 recoverable, rather than a silent one, which is not.
 
+Scheduled moves to Free (decisions §483)
+-----------------------------------------
+The same tick is the backstop for a move to a free plan scheduled for the end
+of the paid period (`scheduled_downgrade`): a live row whose
+``pending_plan_effective_at`` has passed is moved onto its pending plan
+(``billing.plan_changed``, ``scheduled: true``) when the provider says the
+subscription has ended — the case of a lost ``customer.subscription.deleted``
+— or at once when no live provider bills the row (``mock``, where the row is
+the whole state). A provider subscription that is still live and no longer
+set to end (renewed from the provider's dashboard, or a Keep whose write was
+lost) drops the stale pending state instead
+(``billing.scheduled_change_canceled``, ``reason: provider_renewed``); one
+still set to end is left for the provider, which ends it at its period end.
+Counted apart (``downgrades_applied`` / ``downgrades_dropped`` /
+``downgrade_failures``) so the health registry sees a failing move.
+
 Mirrors the other sweeps: long-lived asyncio task started in ``main.lifespan``,
 one row's failure logged but never halts the sweep. Disabled by default
 (``FEOH_BILLING_DUNNING_ENABLED``). See ``backend/docs/billing.md``.
@@ -74,6 +97,7 @@ from app.database import control_session_factory
 from app.models.billing import Subscription
 from app.models.organization import Organization
 from app.services.audit_dispatch import dispatch_audit
+from app.services.billing.scheduled_downgrade import apply_scheduled_downgrade, clear_pending
 from app.services.sweep_health import SWEEP_BILLING_DUNNING, run_sweep_loop
 
 logger = logging.getLogger(__name__)
@@ -92,12 +116,32 @@ class DunningResult:
     subscriptions_scanned: int = 0
     canceled: int = 0
     failures: int = 0
+    downgrades_applied: int = 0
+    downgrades_dropped: int = 0
+    downgrade_failures: int = 0
 
 
 async def _record_cancellation_audit(
     control_db: AsyncSession, *, subscription: Subscription, previous: str
 ) -> None:
-    """Write the ``billing.subscription_canceled`` row into the org's trail.
+    """The dunning cancellation's audit row — see :func:`_record_audit`."""
+    await _record_audit(
+        control_db,
+        subscription=subscription,
+        action="billing.subscription_canceled",
+        details={
+            "from_status": previous,
+            "to_status": "canceled",
+            "reason": "dunning_grace_expired",
+            "grace_days": settings.billing_dunning_grace_days,
+        },
+    )
+
+
+async def _record_audit(
+    control_db: AsyncSession, *, subscription: Subscription, action: str, details: dict
+) -> None:
+    """Write one of this sweep's audit rows into the org's trail.
 
     Deliberately NOT ``dispatch_auth_audit``: that helper catches and logs every
     exception so an audit blip can never fail a login, which is right there and
@@ -132,16 +176,11 @@ async def _record_cancellation_audit(
             tenant_db,
             correlation_id=uuid.uuid4(),
             organization_id=subscription.organization_id,
-            actor_id=None,  # dunning automation, no human actor
-            action="billing.subscription_canceled",
+            actor_id=None,  # sweep automation, no human actor
+            action=action,
             entity_type="auth",
             entity_id=subscription.id,
-            details={
-                "from_status": previous,
-                "to_status": "canceled",
-                "reason": "dunning_grace_expired",
-                "grace_days": settings.billing_dunning_grace_days,
-            },
+            details=details,
         )
         await tenant_db.commit()
 
@@ -196,6 +235,17 @@ async def run_dunning_once(
     for sub_id in due_ids:
         result.subscriptions_scanned += 1
         try:
+            # A row a live provider bills is the provider's to cancel (decisions
+            # §480): canceling only our row would drop the org to Free while
+            # Stripe's retries go on charging it for the plan. So such a row is
+            # canceled here only once the provider says it IS canceled — the
+            # backstop for a lost `customer.subscription.deleted`. Asked before
+            # the row lock, so no provider round trip is held under it.
+            provider_canceled_id = await _provider_canceled_id(control_db, sub_id)
+            if provider_canceled_id is False:
+                await control_db.rollback()
+                continue
+
             # `with_for_update` bypasses the identity map, so this is a real
             # `SELECT ... FOR UPDATE` on exactly one row — a webhook canceling
             # the same subscription concurrently can't be double-applied.
@@ -206,17 +256,25 @@ async def run_dunning_once(
                 await control_db.rollback()
                 continue
 
-            period_end = sub.current_period_end
-            # A period end in the future means the grace clock hasn't started;
-            # only cancel when overdue past the window (or when no period end is
-            # known — a stuck row with nothing to anchor the clock to is overdue
-            # by default).
-            if period_end is not None and period_end > cutoff:
-                await control_db.rollback()
-                continue
+            if provider_canceled_id is not None:
+                if sub.external_subscription_id != provider_canceled_id:
+                    # The row was repointed while the provider was asked.
+                    await control_db.rollback()
+                    continue
+            else:
+                period_end = sub.current_period_end
+                # A period end in the future means the grace clock hasn't
+                # started; only cancel when overdue past the window (or when no
+                # period end is known — a stuck row with nothing to anchor the
+                # clock to is overdue by default).
+                if period_end is not None and period_end > cutoff:
+                    await control_db.rollback()
+                    continue
 
             previous = sub.status
             sub.status = "canceled"
+            # A canceled row moves nowhere at its period end.
+            clear_pending(sub)
             # Audit BEFORE the control commit (mirrors transition_invoice) so
             # the cancellation is never durably persisted without its audit row.
             # This one RAISES on failure — see the module docstring.
@@ -235,7 +293,157 @@ async def run_dunning_once(
             await control_db.rollback()
             result.failures += 1
 
+    await _apply_due_scheduled_moves(control_db, now=now, result=result)
     return result
+
+
+async def _apply_due_scheduled_moves(
+    control_db: AsyncSession, *, now: datetime, result: DunningResult
+) -> None:
+    """Apply (or drop) every scheduled move to Free whose date has passed —
+    the backstop described in the module docstring. Per-row legs, like the
+    cancellations above: ids first, each row re-read ``FOR UPDATE``, its own
+    commit, a failure counted and rolled back."""
+    due_ids = (
+        (
+            await control_db.execute(
+                select(Subscription.id)
+                .where(
+                    Subscription.pending_plan_id.is_not(None),
+                    Subscription.pending_plan_effective_at <= now,
+                    Subscription.status != "canceled",
+                )
+                .order_by(Subscription.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for sub_id in due_ids:
+        try:
+            # Asked before the row lock, as above: no provider round trip is
+            # held under it. None = no live provider bills the row.
+            provider = await _live_provider_subscription(control_db, sub_id)
+            if provider is not None and provider[1].status != "canceled":
+                if provider[1].cancel_at_period_end:
+                    # Still set to end; the provider ends it at its period end.
+                    await control_db.rollback()
+                    continue
+            sub = await control_db.get(Subscription, sub_id, with_for_update=True)
+            if (
+                sub is None
+                or sub.status == "canceled"
+                or sub.pending_plan_id is None
+                or sub.pending_plan_effective_at is None
+                or sub.pending_plan_effective_at > now
+                or (provider is not None and sub.external_subscription_id != provider[0])
+                # A provider id with no live provider to ask (the org now
+                # resolves to `mock`): ending our row could leave Stripe billing.
+                or (provider is None and sub.external_subscription_id is not None)
+            ):
+                # Moved on between the id read and the lock, or not ours to move.
+                stranded = (
+                    sub is not None
+                    and provider is None
+                    and sub.external_subscription_id is not None
+                    and sub.pending_plan_id is not None
+                )
+                await control_db.rollback()
+                if stranded:
+                    # Visible, not silent: an operator must restore the org's
+                    # live provider (or end the Stripe subscription by hand).
+                    logger.warning(
+                        "[billing-dunning] subscription=%s has a due move to Free and a "
+                        "provider id, but its org resolves to no live provider; left alone",
+                        sub_id,
+                    )
+                continue
+            if provider is not None and provider[1].status != "canceled":
+                # The provider renews it: the scheduled move no longer holds,
+                # and the org stays on (and is billed for) its paid plan.
+                details = {
+                    "canceled_to_plan_id": str(sub.pending_plan_id),
+                    "canceled_effective_at": sub.pending_plan_effective_at.isoformat(),
+                    "reason": "provider_renewed",
+                }
+                clear_pending(sub)
+                await _record_audit(
+                    control_db,
+                    subscription=sub,
+                    action="billing.scheduled_change_canceled",
+                    details=details,
+                )
+                await control_db.commit()
+                result.downgrades_dropped += 1
+                continue
+            details = await apply_scheduled_downgrade(control_db, sub, now=now)
+            details["reason"] = (
+                "provider_ended_webhook_missed" if provider is not None else "period_ended"
+            )
+            await _record_audit(
+                control_db, subscription=sub, action="billing.plan_changed", details=details
+            )
+            await control_db.commit()
+            result.downgrades_applied += 1
+        except Exception as exc:  # noqa: BLE001 — one row must not halt the tick
+            logger.warning(
+                "[billing-dunning] subscription=%s scheduled move failed: %s",
+                sub_id,
+                exc.__class__.__name__,
+            )
+            await control_db.rollback()
+            result.downgrade_failures += 1
+
+
+async def _live_provider_subscription(control_db: AsyncSession, sub_id):
+    """``(provider id, provider subscription)`` for a row a LIVE provider
+    bills, else ``None``."""
+    from app.services.billing.provider_sync import is_live_provider
+    from app.services.billing.provisioning import billing_adapter_for
+
+    row = (
+        await control_db.execute(
+            select(Subscription.external_subscription_id, Subscription.organization_id).where(
+                Subscription.id == sub_id
+            )
+        )
+    ).one_or_none()
+    if row is None or row.external_subscription_id is None:
+        return None
+    org = await control_db.get(Organization, row.organization_id)
+    if org is None:
+        return None
+    adapter = billing_adapter_for(org)
+    if not is_live_provider(adapter):
+        return None
+    provider = await adapter.get_subscription(row.external_subscription_id)
+    return row.external_subscription_id, provider
+
+
+async def _provider_canceled_id(control_db: AsyncSession, sub_id) -> str | bool | None:
+    """For a row a LIVE provider bills: its provider id if the provider has
+    canceled it, ``False`` if not (leave the row alone). ``None`` for a row no
+    live provider bills — the grace-window rule applies to it as before."""
+    from app.services.billing.provider_sync import is_live_provider
+    from app.services.billing.provisioning import billing_adapter_for
+
+    row = (
+        await control_db.execute(
+            select(Subscription.external_subscription_id, Subscription.organization_id).where(
+                Subscription.id == sub_id
+            )
+        )
+    ).one_or_none()
+    if row is None or row.external_subscription_id is None:
+        return None
+    org = await control_db.get(Organization, row.organization_id)
+    if org is None:
+        return None
+    adapter = billing_adapter_for(org)
+    if not is_live_provider(adapter):
+        return None
+    provider = await adapter.get_subscription(row.external_subscription_id)
+    return row.external_subscription_id if provider.status == "canceled" else False
 
 
 async def _dunning_tick() -> DunningResult:
@@ -250,6 +458,13 @@ async def _dunning_tick() -> DunningResult:
             "billing dunning sweep canceled %d past-due subscription(s); failed=%d",
             result.canceled,
             result.failures,
+        )
+    if result.downgrades_applied or result.downgrades_dropped or result.downgrade_failures:
+        logger.info(
+            "billing dunning sweep applied %d scheduled move(s), dropped %d; failed=%d",
+            result.downgrades_applied,
+            result.downgrades_dropped,
+            result.downgrade_failures,
         )
     return result
 

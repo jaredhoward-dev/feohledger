@@ -49,6 +49,7 @@ from app.api import (
     invoices,
     notifications,
     organization,
+    organization_close,
     organization_credentials,
     organization_sso,
     partner,
@@ -221,12 +222,16 @@ async def lifespan(app: FastAPI):
     from app.services.commerce_sync import run_commerce_sync_loop
     from app.services.contract_renewal import run_renewal_loop
     from app.services.discount_auto_trigger import run_discount_optimization_loop
+    from app.services.erp_auto_send_sweep import run_auto_send_sweep_loop
+    from app.services.erp_connection_health import run_connection_health_loop
+    from app.services.erp_status_sync import run_status_sync_loop
     from app.services.extraction_reaper import run_reaper_loop
     from app.services.payment_reconciler import run_reconciler_loop
     from app.services.qms_sync import run_qms_sync_loop
     from app.services.recurring_invoices import run_recurring_invoices_loop
     from app.services.retention_sweep import run_retention_loop
     from app.services.scheduled_reports import run_scheduled_reports_loop
+    from app.services.subprocessor_notices import run_subprocessor_notices_loop
     from app.services.sweep_health import supervise_task
     from app.services.vendor_rescreen import run_vendor_rescreen_loop
     from app.services.webhooks.delivery import run_webhook_delivery_loop
@@ -306,10 +311,18 @@ async def lifespan(app: FastAPI):
     if settings.webhooks_enabled:
         webhooks_task = start_sweep(run_webhook_delivery_loop(), name="webhook-delivery")
     # Billing dunning / past-due automation sweep. Disabled by default; flip
-    # FEOH_BILLING_DUNNING_ENABLED on in deployed envs. Only cancels subscriptions
-    # overdue past the grace window — never moves money (see dunning_sweep).
+    # FEOH_BILLING_DUNNING_ENABLED on in deployed envs. Cancels subscriptions
+    # overdue past the grace window and applies (or drops) a move to Free whose
+    # end-of-period webhook was lost — never moves money (see dunning_sweep).
     if settings.billing_dunning_enabled:
         dunning_task = start_sweep(run_dunning_loop(), name="billing-dunning")
+    elif settings.billing_provider != "mock":
+        # Without it a lost `customer.subscription.deleted` leaves an org on its
+        # paid plan, entitled, after Stripe has stopped billing (decisions §483).
+        logging.getLogger(__name__).warning(
+            "FEOH_BILLING_DUNNING_ENABLED is off with a live billing provider: a lost "
+            "end-of-period webhook will not be backstopped"
+        )
     # Scheduled-report runner. Disabled by default so local dev / tests never
     # email reports; flip FEOH_SCHEDULED_REPORTS_ENABLED on in deployed envs.
     if settings.scheduled_reports_enabled:
@@ -334,6 +347,37 @@ async def lifespan(app: FastAPI):
     commerce_task: asyncio.Task | None = None
     if settings.commerce_sync_enabled:
         commerce_task = start_sweep(run_commerce_sync_loop(), name="commerce-sync")
+    # QuickBooks status sync-back (decisions §295). Disabled by default; the
+    # same flag makes a QuickBooks push leave the invoice payable at
+    # `posted_in_erp`, so the change-data-capture backstop runs whenever that
+    # can happen. Records what the ERP did — never moves money.
+    status_sync_task: asyncio.Task | None = None
+    if settings.erp_status_sync_enabled:
+        status_sync_task = start_sweep(run_status_sync_loop(), name="erp-status-sync")
+    # OAuth ERP connection health (decisions §295): keeps a quiet connection's
+    # refresh token alive and tells admins before it expires. Disabled by default.
+    connection_health_task: asyncio.Task | None = None
+    if settings.erp_connection_health_enabled:
+        connection_health_task = start_sweep(
+            run_connection_health_loop(), name="erp-connection-health"
+        )
+
+    # Sub-processor change notices (issue #427, decisions §321). Disabled by
+    # default; MUST be on in a deployment with customers — the published DPA
+    # says each notice is emailed. Sends email only, never moves money.
+    subprocessor_notices_task: asyncio.Task | None = None
+    if settings.subprocessor_notices_enabled:
+        subprocessor_notices_task = start_sweep(
+            run_subprocessor_notices_loop(), name="subprocessor-notices"
+        )
+
+    # Auto-send recovery (decisions §411): an approval whose "send to the ERP on
+    # approval" job never ran (a deploy or crash between the approval's commit
+    # and the post-commit push) is pushed through the approval's own path.
+    # Disabled by default. Books a bill in the ERP — never moves money.
+    auto_send_task: asyncio.Task | None = None
+    if settings.erp_auto_send_sweep_enabled:
+        auto_send_task = start_sweep(run_auto_send_sweep_loop(), name="erp-auto-send")
 
     try:
         yield
@@ -355,6 +399,10 @@ async def lifespan(app: FastAPI):
             shortfall_alerts_task,
             ai_overage_task,
             commerce_task,
+            status_sync_task,
+            connection_health_task,
+            subprocessor_notices_task,
+            auto_send_task,
         ):
             if task is not None:
                 task.cancel()
@@ -379,7 +427,11 @@ async def lifespan(app: FastAPI):
             AUTH_AUDIT_DRAIN_TIMEOUT_SECONDS,
             drain_auth_audits,
         )
+        from app.utils.detached_tasks import DETACHED_DRAIN_TIMEOUT_SECONDS, drain_detached
 
+        # The forgot-password routes' detached mint / send / audit first: they
+        # can still queue work that needs the engines below.
+        await drain_detached(timeout=DETACHED_DRAIN_TIMEOUT_SECONDS)
         await drain_auth_audits(timeout=AUTH_AUDIT_DRAIN_TIMEOUT_SECONDS)
 
         from app.database import dispose_all_engines
@@ -435,29 +487,85 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 app.add_middleware(SecurityHeadersMiddleware)
 
 
-def _build_cors_origin_regex() -> str:
+def _is_loopback_origin(origin: str) -> bool:
+    """``http(s)://localhost``, ``*.localhost`` or a loopback IP literal, any port."""
+    from urllib.parse import urlparse
+
+    from app.services.erp_oauth import is_loopback_host
+
+    try:
+        return is_loopback_host(urlparse(origin).hostname)
+    except ValueError:
+        return False
+
+
+def _build_cors_origin_regex(*, deployed: bool | None = None) -> str | None:
     """Compose the allow_origin_regex from settings.
 
-    Local dev always gets ``localhost`` (any subdomain + port). Production
-    domains come from ``FEOH_CORS_PRODUCTION_DOMAIN`` (comma-separated for
-    multi-domain deploys). Empty domain → only localhost matches, which
-    is the right default for local boot.
+    Outside a deployed environment ``localhost`` (any subdomain + port) is
+    admitted: the dev frontend, every worktree's ``E2E_WEB_ORIGIN`` port and the
+    tenant subdomains under them. A deployed ``FEOH_ENVIRONMENT`` admits no
+    loopback origin by pattern: the middleware sends ``Allow-Credentials`` and
+    the ERP ``/authorize`` call is a credentialed fetch (decisions §336), so a
+    page served from a visitor's own machine must not be a trusted origin there.
+    Production domains come from ``FEOH_CORS_PRODUCTION_DOMAIN``
+    (comma-separated for multi-domain deploys). ``None`` when nothing is
+    admitted by pattern (a deployed environment with no domain configured).
     """
     import re as _re
 
-    parts = [r"localhost(:\d+)?"]
+    if deployed is None:
+        deployed = settings.is_deployed
+    parts = [] if deployed else [r"localhost(:\d+)?"]
     raw = (settings.cors_production_domain or "").strip()
     for domain in (d.strip() for d in raw.split(",") if d.strip()):
         parts.append(_re.escape(domain))
+    if not parts:
+        return None
     return r"https?://([\w-]+\.)?(" + "|".join(parts) + ")"
 
 
-# CORS — `cors_origins` is the exact-match allowlist (the dev frontend);
-# the regex below covers tenant subdomains under localhost + any configured
-# production domain.
+def _cors_allow_origins(
+    *,
+    deployed: bool | None = None,
+    origins: list[str] | None = None,
+    explicit: bool | None = None,
+) -> list[str]:
+    """The exact-match origin allowlist.
+
+    ``FEOH_CORS_ORIGINS``' shipped default is the loopback dev frontend, a
+    convenience for local boot. A deployed environment drops loopback entries
+    from that DEFAULT, for the reason ``_build_cors_origin_regex`` gives. A list
+    the operator set explicitly is used as written, loopback included: operator
+    configuration is trusted, as it is for the SSRF overrides (decisions §334).
+    That is how the day-one rehearsal (``scripts/day-one/stack.sh``) runs a
+    production-shaped API behind a ``*.localhost`` browser. It logs a warning at
+    boot, since a real deployment never wants it.
+    """
+    if deployed is None:
+        deployed = settings.is_deployed
+    if origins is None:
+        origins = list(settings.cors_origins)
+    if explicit is None:
+        explicit = "cors_origins" in settings.model_fields_set
+    if not deployed:
+        return list(origins)
+    if explicit:
+        if any(_is_loopback_origin(o) for o in origins):
+            logging.getLogger(__name__).warning(
+                "FEOH_CORS_ORIGINS names a loopback origin in a deployed environment; "
+                "admitting it because it was set explicitly"
+            )
+        return list(origins)
+    return [o for o in origins if not _is_loopback_origin(o)]
+
+
+# CORS — `_cors_allow_origins()` is the exact-match allowlist (the dev frontend,
+# outside a deployed environment); the regex covers tenant subdomains under
+# localhost (outside a deployed environment) + any configured production domain.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=_cors_allow_origins(),
     allow_origin_regex=_build_cors_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
@@ -532,6 +640,9 @@ app.include_router(organization_sso.router, prefix="/api")
 # Hangs off /api/organization/credentials — the one audited writer of the sealed
 # ERP / payment / card secrets (services/provider_credentials).
 app.include_router(organization_credentials.router, prefix="/api")
+# Hangs off /api/organization/close — an administrator closing an unused
+# workspace (services/workspace_closure, decisions §306).
+app.include_router(organization_close.router, prefix="/api")
 app.include_router(partner.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(signup.router, prefix="/api")

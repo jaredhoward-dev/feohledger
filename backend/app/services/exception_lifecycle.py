@@ -4,7 +4,7 @@ append-only audit rows.
 An AP ``Exception`` is a *control*, not a note. Six of the types the queue
 carries — ``duplicate``, ``fraud_flag``, ``line_total_mismatch``,
 ``payment_reconciliation``, ``quality_hold`` and ``po_mismatch`` — block a
-payment run outright (``api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES``), and
+payment run outright (``services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES``), and
 invoice approval gates on none of them. Clearing one is therefore the human
 sign-off that lets money move, and it has to leave a trace an auditor can trust.
 
@@ -39,13 +39,15 @@ early-return branches rather than needing an exemption — the compliance-hold
 release and the supplier resubmission). A per-route check would be written four
 times and missing from the fifth.
 :func:`segregation_refusal` is the rule; :func:`record_decision` raises on it.
-The two axes are the actor recorded as having *raised* the flag
+The axes are the actor recorded as having *raised* the flag
 (``exceptions.raised_by_user_id``, migration 0098) and the actors implicated in
 the *payable* it blocks (``Invoice.uploaded_by_id`` ∪
 ``Invoice.segregation_actor_ids``, read through
 ``approval_chain.violates_segregation`` so the queue and the approval path agree
-on who is implicated). Both are NULL-permissive, and only the payment-blocking
-types are in scope — see that function.
+on who is implicated), plus, on a ``po_mismatch`` or ``quality_hold`` only, the
+invoice's *approvers* (``approval_chain.approver_ids``, decisions §420). All
+are NULL-permissive, and only the payment-blocking types are in scope — see
+that function.
 
 ``details`` stays lean and free of regulated values: ids, the type, the
 severity, the status delta, and the ``payment_blocking`` flag that tells an
@@ -61,7 +63,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -74,6 +76,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.refusals import coded_refusal
 from app.models.exception import Exception as APException
 from app.models.invoice import Invoice
+from app.models.workflow import WorkflowInstance
 from app.services.audit_dispatch import dispatch_audit
 
 logger = logging.getLogger(__name__)
@@ -108,6 +111,29 @@ EXCEPTION_TYPES: tuple[str, ...] = (
     "payment_compliance_hold",
     "payment_reconciliation",
 )
+
+#: Friendly label per ``Exception.exception_type`` for the queue UI. Must cover
+#: ``EXCEPTION_TYPES`` exactly — a missing entry silently
+#: renders the raw snake_case key, and two of these types are the ones that block
+#: a payment run, so the queue must not label them like debug output.
+#: ``tests/test_exception_type_labels`` is the guard.
+EXCEPTION_TYPE_LABELS = {
+    "duplicate": "Duplicate Invoice",
+    "po_mismatch": "PO Mismatch",
+    "fraud_flag": "Fraud Flag",
+    "extraction_failed": "Extraction Failed",
+    "unverified_vendor": "Unverified Vendor",
+    "review_rejected": "Rejected",
+    "amount_exceeded": "Amount Exceeded",
+    "missing_data": "Missing Data",
+    "quality_hold": "Quality Hold",
+    "price_variance": "Price Variance",
+    "contract_noncompliant": "Contract Non-Compliant",
+    "erp_reconciliation": "ERP Reconciliation",
+    "line_total_mismatch": "Line Total Mismatch",
+    "payment_compliance_hold": "Compliance Hold",
+    "payment_reconciliation": "Payment Reconciliation",
+}
 
 #: Types on the roster that NOTHING in ``app/`` raises any more. They stay on the
 #: roster — and keep their queue label — because historical ``exceptions`` rows
@@ -163,10 +189,19 @@ ACTIONABLE_STATUSES = ("open", "escalated")
 #: with no way out but a role change.
 CLEARING_ACTIONS: frozenset[str] = frozenset({"resolve", "dismiss"})
 
-#: Why a clearing verb was refused. Two axes, one per recordable actor; the
-#: strings are the stable machine codes ``POST /bulk/resolve`` returns per row.
+#: Why a clearing verb was refused. Three axes; the strings are the stable
+#: machine codes ``POST /bulk/resolve`` returns per row.
 REFUSAL_RAISER = "segregation_raiser"
 REFUSAL_IMPLICATED = "segregation_implicated"
+REFUSAL_APPROVER = "segregation_approver"
+
+#: The holds a goods receipt or a quality inspection evidences. An approver's
+#: own receipt (decisions §389) or passing inspection (§401) does not lift them,
+#: so an approver's own word in the queue must not either: these types also
+#: refuse the invoice's approvers (``approval_chain.approver_ids``), decisions
+#: §420. Both are members of ``PAYMENT_BLOCKING_EXCEPTION_TYPES``, so the scope
+#: half (:func:`segregation_applies`) already covers them.
+APPROVER_SEGREGATED_TYPES: frozenset[str] = frozenset({"po_mismatch", "quality_hold"})
 
 #: Refusal code → the sentence the caller is shown. Both are about the CALLER,
 #: so neither leaks a third party: an implicated actor already learns they are
@@ -183,6 +218,11 @@ REFUSAL_MESSAGES: dict[str, str] = {
         "Segregation of duties: a user involved in creating this invoice cannot "
         "also clear an exception that blocks its payment. Escalate it, or ask a "
         "different user to decide."
+    ),
+    REFUSAL_APPROVER: (
+        "Segregation of duties: a user who approved this invoice cannot also "
+        "clear its receipt or inspection hold. Escalate it, or ask a different "
+        "user to decide."
     ),
 }
 
@@ -257,11 +297,11 @@ def mark_refound(exception_id: uuid.UUID) -> None:
 def is_payment_blocking(exception_type: str) -> bool:
     """True when an unresolved exception of this type stops a payment run.
 
-    Reads ``api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`` (the one definition;
+    Reads ``services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`` (the one definition;
     ``services/payment_runs`` imports it the same lazy way) so the audit row's
     ``payment_blocking`` flag can never drift from the gate it describes.
     """
-    from app.api.payments import PAYMENT_BLOCKING_EXCEPTION_TYPES
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
 
     return exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES
 
@@ -301,6 +341,21 @@ def exception_segregation_enabled(org_settings: dict | None) -> bool:
     ) is not False
 
 
+def segregation_applies(exception: APException, *, action: str, org_settings: dict | None) -> bool:
+    """Is segregation of duties in force for ``action`` on this row at all?
+
+    The scope half of :func:`segregation_refusal`, split out so
+    :func:`clearance_stands` reads the same scope rather than restating it: a
+    clearing verb, on a payment-blocking type, in an org that has not opted out.
+    Outside it nobody can be refused, so who decided does not matter.
+    """
+    return (
+        action in CLEARING_ACTIONS
+        and exception_segregation_enabled(org_settings)
+        and is_payment_blocking(exception.exception_type)
+    )
+
+
 def segregation_refusal(
     exception: APException,
     invoice: Invoice | None,
@@ -308,6 +363,8 @@ def segregation_refusal(
     *,
     action: str,
     org_settings: dict | None,
+    instance: WorkflowInstance | None = None,
+    approvers: Collection[str] | None = None,
 ) -> str | None:
     """The refusal code for clearing ``exception`` as ``actor_id``, or ``None``.
 
@@ -316,7 +373,7 @@ def segregation_refusal(
     ONE definition of the rule. Mirrors ``approval_chain.violates_segregation`` /
     ``check_segregation``, which split the same way for the same reason.
 
-    Refuses on two axes, either of which is enough:
+    Refuses on three axes, any of which is enough:
 
     * **the raiser** — ``exception.raised_by_user_id``: the actor whose own act
       the flag exists to have a second person look at. NULL at almost every
@@ -331,6 +388,19 @@ def segregation_refusal(
       own contents, so the person with a motive to clear it is whoever created
       or shaped it — and that person is already refused the *approval* of the
       same invoice. Leaving them the exception was the asymmetry.
+    * **the invoice's approvers**, on a ``po_mismatch`` or ``quality_hold``
+      only (:data:`APPROVER_SEGREGATED_TYPES`) — ``approval_chain.approver_ids``:
+      the approval of record (``Invoice.approved_by_user_id``, on the row) ∪
+      every level approval on ``instance``'s chain. Those holds wait for
+      independent evidence, a receipt or an inspection, and since §389 / §401
+      the approver's own does not lift them; resolving the row by hand would be
+      the approver's own word in its place (decisions §420). ``instance`` is
+      the invoice's workflow instance; ``None`` reads the approval of record
+      alone, so a caller that has the chain passes it
+      (:func:`workflow_instances_for` batches it) and :func:`record_decision`
+      loads it itself. ``approvers``, when given, is that set already read;
+      only the agent coordinator passes it, to judge its own post-apply
+      decision against who had approved before the run (see there).
 
     Returns ``None`` — no refusal — when:
 
@@ -352,11 +422,7 @@ def segregation_refusal(
       would make every sweep-raised and system-ingested exception permanently
       unclearable, an outage on the queue rather than a control.
     """
-    if action not in CLEARING_ACTIONS:
-        return None
-    if not exception_segregation_enabled(org_settings):
-        return None
-    if not is_payment_blocking(exception.exception_type):
+    if not segregation_applies(exception, action=action, org_settings=org_settings):
         return None
     if actor_id is None:
         return None
@@ -376,7 +442,122 @@ def segregation_refusal(
         # which is a second decision nobody made.
         if violates_segregation(invoice, actor_id, {}):
             return REFUSAL_IMPLICATED
+
+        if exception.exception_type in APPROVER_SEGREGATED_TYPES:
+            from app.services.approval_chain import approver_ids
+
+            # The queue's own opt-out (read above) governs, not the approval
+            # step's `require_segregation`, for the reason given at the
+            # implicated axis.
+            if approvers is None:
+                approvers = approver_ids(invoice, instance)
+            if str(actor_id) in {str(a) for a in approvers}:
+                return REFUSAL_APPROVER
     return None
+
+
+def needs_approval_chain(exception: APException, invoice: Invoice | None) -> bool:
+    """Does :func:`segregation_refusal` read ``invoice``'s workflow chain for
+    this row? Only the approver axis does, so a caller loads the instance for
+    these rows and no others."""
+    return invoice is not None and exception.exception_type in APPROVER_SEGREGATED_TYPES
+
+
+async def workflow_instances_for(
+    db: AsyncSession, invoices: Iterable[Invoice | None]
+) -> dict[uuid.UUID, WorkflowInstance]:
+    """``{invoice_id: WorkflowInstance}`` for ``invoices``, in ONE query.
+
+    The chain half of the approver axis (:func:`segregation_refusal`), batched
+    for the callers that judge a page of rows at once — the queue list, bulk
+    resolve, the payments queue. Callers pass only the invoices whose
+    exceptions :func:`needs_approval_chain`, so a page with no hold pays
+    nothing."""
+    ids = {inv.id for inv in invoices if inv is not None}
+    if not ids:
+        return {}
+    rows = (
+        (await db.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id.in_(ids))))
+        .scalars()
+        .all()
+    )
+    return {row.invoice_id: row for row in rows}
+
+
+async def workflow_instance_for(
+    db: AsyncSession, exception: APException, invoice: Invoice | None
+) -> WorkflowInstance | None:
+    """The single-row form of :func:`workflow_instances_for`: the invoice's
+    workflow instance when :func:`needs_approval_chain`, else ``None`` with no
+    query."""
+    if not needs_approval_chain(exception, invoice):
+        return None
+    return (await workflow_instances_for(db, [invoice])).get(invoice.id)  # type: ignore[union-attr]
+
+
+#: Closed status → the clearing verb that produced it.
+_CLEARING_VERB_FOR_STATUS: dict[str, str] = {
+    RESOLUTION_STATUSES[verb]: verb for verb in CLEARING_ACTIONS
+}
+
+
+def clearance_stands(
+    exception: APException,
+    invoice: Invoice | None,
+    *,
+    org_settings: dict | None,
+    instance: WorkflowInstance | None = None,
+    approvers: Collection[str] | None = None,
+) -> bool:
+    """Would :func:`record_decision` accept this closed row's decision TODAY?
+
+    A person's resolve or dismiss suppresses the detector re-raising its
+    finding (``invoice_warnings._finding_cleared_by_a_person``, decisions
+    §286 / §366). That honoured the verdict whoever gave it, and never asked
+    again, so a decider who is implicated NOW kept their own clearance live:
+    the importer who dismissed a duplicate while the uploader was NULL, before
+    migration 0126 named them (§367), and the recaller of an approval who had
+    cleared a hold before the recall stamped them (§374). The check is the
+    same :func:`segregation_refusal` the decision itself met, re-asked with
+    the recorded decider (``decided_by_user_id``) against the invoice as it is
+    now; a decider nobody implicates, which is every independent reviewer,
+    still stands. That includes the approver axis (§420): a ``po_mismatch`` /
+    ``quality_hold`` its decider has since approved is re-raised for someone
+    independent. ``instance`` is the invoice's workflow instance, for the
+    level approvers. ``approvers``, when given, replaces the approver set read
+    from the invoice and ``instance``: an unattended approval asks whether a
+    clearance would still stand once its approver is stamped, before stamping
+    (``invoice_warnings.po_match_hold_refusal``, decisions §425).
+
+    Outside segregation's scope (:func:`segregation_applies`) the decider does
+    not matter and the clearance stands. Inside it, an unknown decider (NULL:
+    closed before the column, with no single person's decision row for the
+    migration to copy) does NOT stand. It fails closed, as an unknown recorder
+    does for a typed inspection (migration 0105): the cost is one more review
+    of a finding whose clearer cannot be shown to be independent. The audit
+    log is not read here, because under ``FEOH_AUDIT_MODE=lambda`` the
+    decision's row is not yet local when the next refresh runs.
+    """
+    action = _CLEARING_VERB_FOR_STATUS.get(exception.status)
+    if action is None:
+        return False
+    if not segregation_applies(exception, action=action, org_settings=org_settings):
+        return True
+    decider = exception.decided_by_user_id
+    if decider is None:
+        return False
+    return (
+        segregation_refusal(
+            exception,
+            invoice,
+            decider,
+            action=action,
+            org_settings=org_settings,
+            instance=instance,
+            approvers=approvers,
+        )
+        is None
+    )
 
 
 def refusal_message(code: str) -> str:
@@ -540,6 +721,49 @@ async def record_raised(
     )
 
 
+async def _bind_fingerprint_to_decision(
+    db: AsyncSession, exception: APException, invoice: Invoice | None, *, person: bool
+) -> None:
+    """Keep the row's ``finding_fingerprint`` only for a verdict on exactly it.
+
+    A closed detector row whose fingerprint matches the invoice stops the
+    detector raising that finding again
+    (``invoice_warnings._finding_cleared_by_a_person``, decisions §286; every
+    type ``_ensure_exception`` raises since §366). So the fingerprint survives
+    a clearing decision only when:
+
+    * a PERSON made it: a detector's auto-close (no ``actor_id``) or an agent
+      (``via``) carries no verdict to honour; and
+    * the invoice still hashes as it did when the finding was raised, by the
+      type's own facts (``invoice_warnings.current_finding_fingerprint``: the
+      line totals, the PO match, the priced lines …). The stamp is never
+      refreshed while the row is open, so a change made after it, while the
+      reviewer was reading the queue, or by a writer that skips
+      ``refresh_warnings``, leaves the two unequal. The verdict then binds
+      nothing, and the next refresh raises the finding for a person to see.
+
+    Escalation never reaches here: it is not a clearing decision, and the row
+    stays open with its stamp.
+    """
+    from app.services.invoice_warnings import current_finding_fingerprint
+
+    if (
+        person
+        and invoice is not None
+        and exception.description_code
+        and await current_finding_fingerprint(
+            db,
+            invoice,
+            exception.exception_type,
+            exception.description_code,
+            exception.description_params,
+        )
+        == exception.finding_fingerprint
+    ):
+        return
+    exception.finding_fingerprint = None
+
+
 async def record_decision(
     db: AsyncSession,
     *,
@@ -552,6 +776,8 @@ async def record_decision(
     via: str | None = None,
     correlation_id: uuid.UUID | None = None,
     org_settings: dict | None = None,
+    instance: WorkflowInstance | None = None,
+    approvers: Collection[str] | None = None,
 ) -> str:
     """Apply a queue decision AND write its append-only audit row.
 
@@ -594,14 +820,33 @@ async def record_decision(
     real callers pass it (the bulk route batches them through
     :func:`invoices_for`), so the fallback is a safety net, not a hot path — and
     it replaces the narrower ``correlation_id`` lookup that ran here anyway.
+
+    ``instance`` (the invoice's workflow instance, for the approver axis's
+    level approvers) is loaded here for the same reason when the decision is
+    in segregation's scope, the row's type reads it
+    (:func:`needs_approval_chain`) and the caller did not pass one.
+    ``approvers`` overrides the set read from them (:func:`segregation_refusal`);
+    omitted, it is read from the row as it is now.
     """
     if invoice is None and exception.invoice_id is not None:
         invoice = (
             await db.execute(select(Invoice).where(Invoice.id == exception.invoice_id))
         ).scalar_one_or_none()
+    if (
+        instance is None
+        and approvers is None
+        and segregation_applies(exception, action=action, org_settings=org_settings)
+    ):
+        instance = await workflow_instance_for(db, exception, invoice)
 
     refusal = segregation_refusal(
-        exception, invoice, actor_id, action=action, org_settings=org_settings
+        exception,
+        invoice,
+        actor_id,
+        action=action,
+        org_settings=org_settings,
+        instance=instance,
+        approvers=approvers,
     )
     if refusal is not None:
         # ids only — no names, no vendor, no amount. The refusal itself is not
@@ -628,6 +873,14 @@ async def record_decision(
 
     old_status = exception.status
     new_status = apply_resolution(exception, action, resolution, actor_name)
+    person = actor_id is not None and not via
+    if action in CLEARING_ACTIONS:
+        # Who decided, on the row itself: `clearance_stands` re-asks the
+        # segregation question of this person whenever the closed row would
+        # suppress a re-raise. An agent's or a detector's close names nobody.
+        exception.decided_by_user_id = actor_id if person else None
+    if new_status in ("resolved", "dismissed") and exception.finding_fingerprint:
+        await _bind_fingerprint_to_decision(db, exception, invoice, person=person)
 
     details = _base_details(exception)
     details["old_status"] = old_status
@@ -648,6 +901,24 @@ async def record_decision(
         details=details,
         correlation_id=correlation_id,
     )
+
+    if (
+        action in CLEARING_ACTIONS
+        and exception.invoice_id is not None
+        and is_payment_blocking(exception.exception_type)
+    ):
+        # A blocker just cleared. If it was what stopped FeohLedger recording a
+        # payment the ERP reported, record it now, through the same gates — in
+        # this transaction, so the decision and the record commit or roll back
+        # together (decisions §319).
+        from app.services.erp_status_sync import is_erp_paid_report, retry_erp_reported_payments
+
+        if not is_erp_paid_report(exception):
+            await retry_erp_reported_payments(
+                db,
+                invoice_id=exception.invoice_id,
+                organization_id=exception.organization_id,
+            )
     return new_status
 
 

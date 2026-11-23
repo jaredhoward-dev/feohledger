@@ -3,6 +3,7 @@ import {
 	authToken,
 	authedTenantHeaders,
 	expect,
+	TECHFLOW_ADMIN,
 	test
 } from '../fixtures/helpers';
 
@@ -80,10 +81,14 @@ test.describe('/admin user lifecycle', () => {
 			createdId = body.id;
 			expect(body.email).toBe(email);
 
-			// "User Created" credentials modal appears after successful create.
-			const credModal = page.locator('div.modal[role="dialog"][aria-label="User created"]');
-			await expect(credModal).toBeVisible();
-			await credModal.getByRole('button', { name: /^Done$/ }).click();
+			// The invite emails a set-password link (decisions §443): the
+			// confirmation names the address and never shows a credential.
+			expect(body).not.toHaveProperty('temporary_password');
+			const sentModal = page.locator('div.modal[role="dialog"][aria-label="Invitation sent"]');
+			await expect(sentModal).toBeVisible();
+			await expect(sentModal).toContainText(`We emailed ${email} a link to set their password.`);
+			await expect(sentModal.locator('code, input')).toHaveCount(0);
+			await sentModal.getByRole('button', { name: /^Done$/ }).click();
 
 			// Table grew by one row, and the new email appears.
 			await expect(page.locator('table tbody tr')).toHaveCount(before + 1);
@@ -93,6 +98,41 @@ test.describe('/admin user lifecycle', () => {
 		} finally {
 			if (createdId) await deleteUser(page, createdId);
 		}
+	});
+
+	test('inviting an address another workspace holds says so, and creates nobody', async ({
+		page
+	}) => {
+		// One address is one account in one workspace (decisions §291). The
+		// techflow seed admin's address is held in techflow, never in this
+		// worker's tenant, so the invite is refused with a sentence that says
+		// what to do — not the old bare "Email already in use".
+		await page.getByRole('button', { name: '+ Invite User' }).click();
+		const modal = page.locator('div.modal[role="dialog"][aria-label="Invite user"]');
+		await expect(modal).toBeVisible();
+		await modal.locator('input[type="text"]').fill('Someone Elsewhere');
+		await modal.locator('input[type="email"]').fill(TECHFLOW_ADMIN.email);
+		await modal.locator('.check-label', { hasText: 'AP Clerk' }).locator('input').check();
+
+		const refused = page.waitForResponse(
+			(r) =>
+				new URL(r.url()).pathname === '/api/admin/users' && r.request().method() === 'POST'
+		);
+		await modal.getByRole('button', { name: /Create User/ }).click();
+		const resp = await refused;
+		expect(resp.status()).toBe(409);
+		expect(((await resp.json()) as { detail: { code: string } }).detail.code).toBe(
+			'email_in_other_workspace'
+		);
+
+		await expect(
+			page.locator('.toast.error .toast-text', {
+				hasText: 'This email address already has an account in another workspace.'
+			})
+		).toBeVisible();
+		await expect(
+			page.locator('div.modal[role="dialog"][aria-label="User created"]')
+		).toHaveCount(0);
 	});
 
 	test('Edit modal pre-fills the row and persists name change', async ({ page }) => {
@@ -235,6 +275,55 @@ test.describe('/admin user lifecycle', () => {
 		}
 	});
 
+	test('Sign out everywhere asks to confirm, calls revoke-sessions and toasts', async ({
+		page
+	}) => {
+		const headers = await authedTenantHeaders(page);
+		const email = `e2e-revoke-${Date.now()}@test.local`;
+		const createResp = await page.request.post(`${API_BASE}/api/admin/users`, {
+			headers,
+			data: { full_name: 'Revoke Me', email, role_names: ['ap_clerk'] }
+		});
+		const created = (await createResp.json()) as { id: string };
+
+		try {
+			await page.reload();
+			const row = page.locator('table tbody tr', { hasText: email });
+			await expect(row).toBeVisible();
+
+			let revokeCalls = 0;
+			page.on('request', (r) => {
+				if (r.url().includes(`/api/admin/users/${created.id}/revoke-sessions`)) revokeCalls++;
+			});
+
+			// First click only arms the action — no request yet.
+			await row.getByRole('button', { name: 'Sign out everywhere', exact: true }).click();
+			const armed = row.locator('button.row-action.variant-danger.armed');
+			await expect(armed).toHaveText('Confirm');
+			expect(revokeCalls).toBe(0);
+
+			const revoked = page.waitForResponse(
+				(r) =>
+					r.url().includes(`/api/admin/users/${created.id}/revoke-sessions`) &&
+					r.request().method() === 'POST'
+			);
+			await armed.click();
+			const resp = await revoked;
+			expect(resp.status()).toBe(200);
+			// The invited user has never signed in, so nothing was live to end.
+			expect(await resp.json()).toEqual({ revoked: 0 });
+
+			await expect(
+				page.locator('.toast .toast-text', { hasText: 'Revoke Me was not signed in anywhere' })
+			).toBeVisible();
+			// The account itself is untouched.
+			await expect(row.locator('.status-dot')).toContainText('Active');
+			await expect(row.getByRole('button', { name: 'Sign out everywhere', exact: true })).toBeVisible();
+		} finally {
+			await deleteUser(page, created.id);
+		}
+	});
+
 	test('Delete requires a confirm click (two-step armed pattern)', async ({ page }) => {
 		const headers = await authedTenantHeaders(page);
 		const email = `e2e-delete-${Date.now()}@test.local`;
@@ -250,9 +339,10 @@ test.describe('/admin user lifecycle', () => {
 			const row = page.locator('table tbody tr', { hasText: email });
 			await expect(row).toBeVisible();
 
-			// First click arms (no DELETE issued yet).
-			await row.locator('button.row-action.variant-danger').click();
-			await expect(row.locator('button.row-action.variant-danger.armed')).toBeVisible();
+			// First click arms (no DELETE issued yet). By name: an active row
+			// carries a second danger action, "Sign out everywhere".
+			await row.getByRole('button', { name: 'Delete', exact: true }).click();
+			await expect(row.locator('button.row-action.variant-danger.armed')).toHaveText('Confirm');
 
 			// Second click commits.
 			const deleted = page.waitForResponse(
@@ -260,7 +350,7 @@ test.describe('/admin user lifecycle', () => {
 					r.url().includes(`/api/admin/users/${created.id}`) &&
 					r.request().method() === 'DELETE'
 			);
-			await row.locator('button.row-action.variant-danger').click();
+			await row.getByRole('button', { name: 'Confirm', exact: true }).click();
 			const resp = await deleted;
 			expect(resp.status()).toBe(204);
 			didDelete = true;

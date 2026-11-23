@@ -1,5 +1,6 @@
 <script lang="ts">
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import type {
 		Invoice,
 		InvoiceStatus,
@@ -10,7 +11,7 @@
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
-	import { api } from '#lib/api.ts';
+	import { api, ApiError } from '#lib/api.ts';
 	import StatusBadge from '#lib/components/ui/StatusBadge.svelte';
 	import InvoiceModal from '#lib/components/modals/InvoiceModal.svelte';
 	import CreateInvoiceModal from '#lib/components/modals/CreateInvoiceModal.svelte';
@@ -19,21 +20,29 @@
 	import ImportCsvModal from '#lib/components/modals/ImportCsvModal.svelte';
 	import type { ImportResult } from '#lib/types/csvImport.ts';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
+	import BulkDeleteButton from '#lib/components/ui/BulkDeleteButton.svelte';
+	import BulkBar from '#lib/components/ui/BulkBar.svelte';
+	import MenuButton from '#lib/components/ui/MenuButton.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { INVOICE_FILE_ACCEPT } from '#lib/utils/invoiceFiles.ts';
 	import { formatList } from '#lib/utils/list.ts';
+	import { formatDate } from '#lib/utils/time.ts';
 	import { invoiceWarningText } from '#lib/api/invoiceWarnings.ts';
+	import { localizeApiDetail } from '#lib/api/codedRefusals.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { workflowStore } from '#lib/stores/workflows.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import { page } from '$app/state';
 	import { afterNavigate, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
@@ -156,7 +165,10 @@
 
 		for (let i = 0; i < total; i += BATCH) {
 			const batch = Array.from(files).slice(i, i + BATCH);
-			uploadProgress = total > 1 ? `Uploading ${Math.min(i + BATCH, total)} of ${total}...` : 'Uploading...';
+			uploadProgress =
+				total > 1
+					? m('invoices.action.uploadingProgress', { done: formatCount(Math.min(i + BATCH, total)), total: formatCount(total) })
+					: m('invoices.action.uploading');
 			const results = await Promise.allSettled(
 				batch.map((file) => api.upload<{ id: string; status: string }>('/api/invoices/upload', file))
 			);
@@ -168,7 +180,12 @@
 				} else {
 					failed++;
 					const reason = (results[j] as PromiseRejectedResult).reason;
-					toast(`Failed to upload ${batch[j].name}: ${reason instanceof Error ? reason.message : 'Unknown error'}`, 'error');
+					toast(
+						reason instanceof Error
+							? m('invoices.toast.uploadFailed', { name: batch[j].name, reason: reason.message })
+							: m('invoices.toast.uploadFailedUnknown', { name: batch[j].name }),
+						'error'
+					);
 				}
 			}
 		}
@@ -183,16 +200,21 @@
 			await invoiceStore.fetchCounts(buildParams());
 
 			if (total === 1 && succeeded === 1) {
-				toast('Invoice uploaded successfully', 'success');
+				toast(m('invoices.toast.uploaded'), 'success');
 			} else if (total > 1) {
-				toast(`Uploaded ${succeeded} of ${total} invoice${total > 1 ? 's' : ''}${failed ? ` (${failed} failed)` : ''}`, succeeded > 0 ? 'success' : 'error');
+				toast(
+					failed
+						? m('invoices.toast.uploadedBatchPartial', { succeeded, total, failed })
+						: m('invoices.toast.uploadedBatch', { succeeded, total }),
+					succeeded > 0 ? 'success' : 'error'
+				);
 			}
 		} catch (err) {
 			// The upload itself succeeded — say so, and say the list is stale.
 			toast(
 				err instanceof Error
-					? `Uploaded, but the list could not be refreshed: ${err.message}`
-					: 'Uploaded, but the list could not be refreshed',
+					? m('invoices.toast.uploadedRefreshFailed', { error: err.message })
+					: m('invoices.toast.uploadedRefreshFailedPlain'),
 				'error'
 			);
 		} finally {
@@ -415,9 +437,22 @@
 		invoiceStore.fetchCounts(buildParams()).catch(() => {});
 	});
 
-	// Re-fetch on search input (debounced)
+	// Re-fetch on search input (debounced).
+	//
+	// `searchEffectRan` skips this effect's own mount-time run, the guard
+	// /contracts, /budgets and /gl-accounts already carry: a `$effect` always
+	// runs once at mount, and the filter effect above has already loaded the
+	// list and the chip counts by then, so the unguarded run issued the same
+	// two requests again 300ms later on every visit, flipping
+	// `invoiceStore.loading` (the "Load more" button read "Loading…") a second
+	// time while the page sat still. `effectTimerCleanup.test.ts` guards it.
+	let searchEffectRan = false;
 	$effect(() => {
 		search;
+		if (!searchEffectRan) {
+			searchEffectRan = true;
+			return;
+		}
 		// Same reasoning as the status/advanced-filter effect above — a
 		// changed search term invalidates whatever "select all matching" had
 		// resolved against the OLD term.
@@ -444,6 +479,38 @@
 	// the handler cleared itself could be re-read before the scrub landed, and
 	// re-open the modal the user had just closed).
 	let deepLinkLoaded = $state<string | null>(null);
+	// The deep-linked invoice that could not be fetched for a reason OTHER
+	// than "it does not exist" (a 500, a timeout, offline). Only a 404 may say
+	// "not found": telling a user whose network blipped that the invoice is
+	// gone sends them hunting for a row that is still there. Anything else is
+	// stated in place with a Retry (`ui/LoadError`), since it is a failed load.
+	let deepLinkFailedId = $state<string | null>(null);
+
+	function openDeepLink(id: string) {
+		deepLinkFailedId = null;
+		api
+			.get<Invoice>(`/api/invoices/${id}`)
+			.then((inv) => {
+				// The user may have navigated to another `?id=` (or off it)
+				// while this was in flight; don't open a modal they left.
+				if (deepLinkId === id) editing = inv;
+			})
+			.catch((err) => {
+				if (deepLinkId !== id) return;
+				if (err instanceof ApiError && err.status === 404) {
+					toast(m('invoices.toast.notFound'), 'error');
+					// Nothing will ever open for this id, so drop it from the URL:
+					// left there, Back or a reload re-runs the lookup and re-toasts.
+					// `deepLinkLoaded` keeps the id, as on close, so the effect
+					// does not retry it off the unchanged `page.url`.
+					deepLinkId = null;
+					syncUrl();
+				} else {
+					deepLinkFailedId = id;
+				}
+			});
+	}
+
 	$effect(() => {
 		const id = page.url.searchParams.get('id');
 		// State reads AND writes are untracked: this effect depends on the
@@ -453,6 +520,7 @@
 			untrack(() => {
 				deepLinkId = null;
 				deepLinkLoaded = null;
+				deepLinkFailedId = null;
 			});
 			return;
 		}
@@ -460,11 +528,8 @@
 		untrack(() => {
 			deepLinkId = id;
 			deepLinkLoaded = id;
+			openDeepLink(id);
 		});
-		api
-			.get<Invoice>(`/api/invoices/${id}`)
-			.then((inv) => (editing = inv))
-			.catch(() => toast('Invoice not found', 'error'));
 	});
 
 	/**
@@ -479,6 +544,15 @@
 	async function refreshInvoiceList() {
 		await invoiceStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method, routes through api client
 		await invoiceStore.fetchCounts(buildParams());
+	}
+
+	// A failed Load-more keeps the rows already shown, so a toast is enough
+	// (the sibling lists do the same). The store never rejects here — it
+	// records the outcome in `loadMoreErrored`, which is false when a newer
+	// load superseded this one, so a filter change mid-page raises no toast.
+	async function loadMoreInvoices() {
+		await invoiceStore.loadMore();
+		if (invoiceStore.loadMoreErrored) toast(m('invoices.toast.loadMoreFailed'), 'error');
 	}
 
 	function closeInvoiceModal() {
@@ -501,16 +575,22 @@
 		void refreshInvoiceList().catch(() => {});
 	}
 
-	let hasAdvancedFilters = $derived(
-		advancedFilters.vendor !== '' ||
-		advancedFilters.invoice_number !== '' ||
-		advancedFilters.po_number !== '' ||
-		advancedFilters.description !== '' ||
-		advancedFilters.amount_min !== '' ||
-		advancedFilters.amount_max !== '' ||
-		advancedFilters.due_date_from !== '' ||
-		advancedFilters.due_date_to !== ''
+	// How many advanced-search fields are set (statuses are the chips', not
+	// counted here). The dot shows it; the button's description says it,
+	// since a dot announces nothing to a screen reader.
+	let advancedFilterCount = $derived(
+		[
+			advancedFilters.vendor,
+			advancedFilters.invoice_number,
+			advancedFilters.po_number,
+			advancedFilters.description,
+			advancedFilters.amount_min,
+			advancedFilters.amount_max,
+			advancedFilters.due_date_from,
+			advancedFilters.due_date_to
+		].filter((v) => v !== '').length
 	);
+	let hasAdvancedFilters = $derived(advancedFilterCount > 0);
 
 	let totalCount = $derived(
 		Object.values(invoiceStore.statusCounts).reduce((a, b) => a + b, 0)
@@ -559,15 +639,6 @@
 			!invoiceStore.loading &&
 			!invoiceStore.errored &&
 			noActiveFilters
-	);
-	let emptyMessage = $derived(
-		invoiceStore.loading
-			? m('common.loading')
-			: invoiceStore.errored
-				? m('invoices.empty.errored')
-				: noActiveFilters
-					? m('invoices.empty.fresh')
-					: m('invoices.empty')
 	);
 
 	function statusCount(status: InvoiceStatus): number {
@@ -692,14 +763,14 @@
 			selectedAllMatching = true;
 			if (res.truncated) {
 				toast(
-					`Selected the first ${res.ids.length} of ${res.total} matching — narrow your filters to select the rest.`,
+					m('invoices.toast.selectedTruncated', { shown: formatCount(res.ids.length), total: formatCount(res.total) }),
 					'error'
 				);
 			} else {
-				toast(`Selected all ${res.ids.length} matching invoice(s)`, 'success');
+				toast(m('invoices.toast.selectedAllMatching', { n: res.ids.length }), 'success');
 			}
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Failed to select all matching', 'error');
+			toast(err instanceof Error ? err.message : m('invoices.toast.selectAllFailed'), 'error');
 		} finally {
 			selectingAllMatching = false;
 		}
@@ -714,11 +785,11 @@
 			selected = new Set();
 			selectedAllMatching = false;
 			const msg = res.skipped?.length
-				? `Deleted ${res.deleted}, skipped ${res.skipped.length} (immutable)`
-				: `Deleted ${res.deleted} invoice(s)`;
+				? m('invoices.toast.deletedSkipped', { deleted: res.deleted, skipped: res.skipped.length })
+				: m('invoices.toast.deleted', { n: res.deleted });
 			toast(msg, 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk delete failed', 'error');
+			toast(err instanceof Error ? err.message : m('invoices.toast.bulkDeleteFailed'), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -745,7 +816,10 @@
 				status: bulkStatusValue,
 				...(bulkNeedsReason ? { reason: bulkRejectReason.trim() } : {}),
 				...(bulkStatusValue === 'approved' ? { expected_updated_at: selectedVersions() } : {}),
-			})) as { updated: number; skipped: { id: string; reason: string }[] };
+			})) as {
+				updated: number;
+				skipped: { id: string; reason: string; code?: string | null; params?: Record<string, unknown> }[];
+			};
 			await invoiceStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method, routes through api client
 			await invoiceStore.fetchCounts(buildParams());
 			selected = new Set();
@@ -759,22 +833,39 @@
 			// non-immutable skip.
 			let msg: string;
 			if (res.skipped?.length) {
-				const uniqueReasons = [...new Set(res.skipped.map((s) => s.reason))];
+				// A coded skip (`BulkStatusSkip.code`) is stated in the reader's
+				// language; any other keeps the server's sentence.
+				const uniqueReasons = [
+					...new Set(res.skipped.map((s) => localizeApiDetail(s, m) ?? s.reason))
+				];
 				const reasonText =
-					uniqueReasons.length === 1 ? uniqueReasons[0] : `${uniqueReasons.length} different reasons`;
-				msg = `Updated ${res.updated}, skipped ${res.skipped.length} (${reasonText})`;
+					uniqueReasons.length === 1
+						? uniqueReasons[0]
+						: m('invoices.toast.differentReasons', { n: uniqueReasons.length });
+				msg = m('invoices.toast.updatedSkipped', {
+					updated: res.updated,
+					skipped: res.skipped.length,
+					reason: reasonText
+				});
 			} else {
-				msg = `Updated ${res.updated} invoice(s)`;
+				msg = m('invoices.toast.updated', { n: res.updated });
 			}
 			toast(msg, 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk status change failed', 'error');
+			toast(err instanceof Error ? err.message : m('invoices.toast.bulkStatusFailed'), 'error');
 		} finally {
 			bulkBusy = false;
 		}
 	}
 
-	async function bulkExport(format: string) {
+	// Format names, not prose: they read the same in every locale.
+	const BULK_EXPORT_FORMATS = [
+		{ value: 'csv', label: 'CSV' },
+		{ value: 'json', label: 'JSON' },
+		{ value: 'xml', label: 'XML' }
+	] as const;
+
+	async function bulkExport(format: (typeof BULK_EXPORT_FORMATS)[number]['value']) {
 		bulkBusy = true;
 		try {
 			// Through the shared client (`api.downloadBlobPost`), not a hand-rolled
@@ -799,9 +890,9 @@
 			} else {
 				triggerDownload(blob, `invoices-export.${format}`);
 			}
-			toast(`Exported ${selected.size} invoice(s)`, 'success');
+			toast(m('invoices.toast.exported', { n: selected.size }), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk export failed', 'error');
+			toast(err instanceof Error ? err.message : m('invoices.toast.bulkExportFailed'), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -818,17 +909,17 @@
 
 	let deletingId = $state<string | null>(null);
 	let confirmDeleteId = $state<string | null>(null);
-	let confirmBulkDelete = $state(false);
 
 	async function deleteInvoice(id: string) {
+		if (deletingId) return;
 		deletingId = id;
 		try {
 			await api.delete(`/api/invoices/${id}`);
 			await invoiceStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method, routes through api client
 			await invoiceStore.fetchCounts(buildParams());
-			toast('Invoice deleted', 'success');
+			toast(m('invoices.toast.deletedOne'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Delete failed', 'error');
+			toast(errorMessage(err, m('invoices.toast.deleteFailed')), 'error');
 		} finally {
 			deletingId = null;
 			confirmDeleteId = null;
@@ -837,11 +928,8 @@
 
 	function handleWindowClick(e: MouseEvent) {
 		const target = e.target as HTMLElement;
-		if (confirmDeleteId && !target.closest('.row-action')) {
+		if (confirmDeleteId && !deletingId && !target.closest('.row-action')) {
 			confirmDeleteId = null;
-		}
-		if (confirmBulkDelete && !target.closest('.bulk-delete-btn')) {
-			confirmBulkDelete = false;
 		}
 		if (showBulkStatusSelect && !target.closest('.bulk-status-wrapper')) {
 			showBulkStatusSelect = false;
@@ -855,11 +943,6 @@
 <PageHeader title={m('invoices.title')}>
 	{#snippet actions()}
 		<input type="file" accept={INVOICE_FILE_ACCEPT} multiple bind:this={fileInput} onchange={handleUpload} hidden />
-		{#if auth.isAdmin}
-			<button class="btn-secondary" onclick={() => (showBulkRecode = true)}>
-				{m('invoices.action.bulkRecode')}
-			</button>
-		{/if}
 		{#if canEnterInvoices}
 			<button class="btn-secondary" onclick={() => (showCreate = true)}>
 				{m('invoices.action.create')}
@@ -869,7 +952,7 @@
 		     create an invoice, and `POST /api/invoices/upload` takes the same
 		     entry roles as `POST /api/invoices` (`api/invoice_entry.py`). -->
 		{#if canEnterInvoices}
-			<button class="btn-upload" disabled={uploading} onclick={() => fileInput.click()}>
+			<button class="btn-primary btn-upload upload-action" disabled={uploading} onclick={() => fileInput.click()}>
 				{uploading ? uploadProgress || m('invoices.action.uploading') : m('invoices.action.upload')}
 			</button>
 		{/if}
@@ -883,6 +966,15 @@
 				{m('invoices.action.importCsv')}
 			</button>
 		{/if}
+		<!-- Last: re-coding is maintenance, so it does not lead the bar ahead of
+		     the ways to add an invoice (#635). Not hidden on an empty list — that
+		     list is scoped to the selected entity, and the tool rewrites cached
+		     vendor GL codes, which matter whether or not this entity has invoices. -->
+		{#if auth.isAdmin}
+			<button class="btn-secondary" onclick={() => (showBulkRecode = true)}>
+				{m('invoices.action.bulkRecode')}
+			</button>
+		{/if}
 	{/snippet}
 
 	<div class="filter-row">
@@ -893,10 +985,10 @@
 				ariaLabel={m('invoices.search.aria')}
 			/>
 			<button
-				class="advanced-btn"
-				class:has-filters={hasAdvancedFilters}
+				class="btn-icon advanced-btn advanced-toggle"
 				onclick={() => { advancedFilters = { ...advancedFilters, statuses: [...activeStatuses] }; showAdvancedSearch = true; }}
 				aria-label={m('invoices.search.advanced')}
+				aria-describedby={hasAdvancedFilters ? 'advanced-filters-set' : undefined}
 			>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
 					<line x1="4" y1="6" x2="20" y2="6" />
@@ -905,9 +997,14 @@
 					<circle cx="6" cy="12" r="2" /><circle cx="10" cy="18" r="2" /><circle cx="8" cy="6" r="2" />
 				</svg>
 				{#if hasAdvancedFilters}
-					<span class="dot"></span>
+					<span class="dot" aria-hidden="true"></span>
 				{/if}
 			</button>
+			{#if hasAdvancedFilters}
+				<span id="advanced-filters-set" class="visually-hidden" data-testid="advanced-filters-set">
+					{m('invoices.search.filtersSet', { n: advancedFilterCount })}
+				</span>
+			{/if}
 		</div>
 		<div class="assignee-group">
 			<button
@@ -940,7 +1037,7 @@
 				aria-pressed={activeStatuses.length === 0}
 				onclick={() => (activeStatuses = [])}
 			>
-				{m('common.all')} <span class="count">{totalCount}</span>
+				{m('common.all')} <span class="count">{formatCount(totalCount)}</span>
 			</button>
 			{#each chipStatuses as s}
 				<button
@@ -956,11 +1053,14 @@
 		</nav>
 	</div>
 
-	{#if selected.size > 0}
-		<div class="bulk-bar">
-			<span class="bulk-count">{m('invoices.bulk.selected', { n: selected.size })}</span>
+	<BulkBar
+		count={selected.size}
+		countLabel={m('invoices.bulk.selected', { n: selected.size })}
+		onclear={() => { selected = new Set(); selectedAllMatching = false; }}
+	>
+		{#snippet lead()}
 			{#if allSelected && !selectedAllMatching && invoiceStore.total > selectableInvoices.length}
-				<button class="bulk-select-all-matching" disabled={selectingAllMatching} onclick={selectAllMatching}>
+				<button type="button" class="btn-secondary bulk-select-all-matching" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
 						: m('common.selectAllMatching', { total: invoiceStore.total })}
@@ -968,33 +1068,17 @@
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 			{/if}
-			<button class="bulk-clear" onclick={() => { selected = new Set(); selectedAllMatching = false; }}>{m('common.clear')}</button>
-			<div class="bulk-divider"></div>
-
+		{/snippet}
+		{#snippet actions()}
 			{#if canManageInvoices}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<span class="bulk-btn-wrap" title={hasImmutableSelected ? m('invoices.bulk.cannotDelete') : ''}>
-					<button
-						class="bulk-delete-btn"
-						class:armed={confirmBulkDelete}
+					<BulkDeleteButton
+						onconfirm={bulkDelete}
 						disabled={bulkBusy || hasImmutableSelected}
-						onclick={(e) => {
-							e.stopPropagation();
-							if (confirmBulkDelete) {
-								bulkDelete();
-							} else {
-								confirmBulkDelete = true;
-							}
-						}}
-					>
-						{#if confirmBulkDelete}
-							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-							{m('invoices.bulk.confirmDelete')}
-						{:else}
-							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-							{m('invoices.bulk.delete')}
-						{/if}
-					</button>
+						label={m('invoices.bulk.delete')}
+						confirmLabel={m('invoices.bulk.confirmDelete')}
+					/>
 				</span>
 			{/if}
 
@@ -1003,7 +1087,7 @@
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span class="bulk-btn-wrap" title={validBulkTransitions.length === 0 ? m('invoices.bulk.noTransitions') : ''}>
 						<button
-							class="bulk-action-btn"
+							class="btn-secondary"
 							disabled={bulkBusy || validBulkTransitions.length === 0}
 							onclick={(e) => { e.stopPropagation(); showBulkStatusSelect = !showBulkStatusSelect; }}
 						>
@@ -1029,7 +1113,7 @@
 								/>
 							{/if}
 							<button
-								class="bulk-apply-btn"
+								class="btn-primary bulk-apply"
 								disabled={bulkBusy || (bulkNeedsReason && !bulkRejectReason.trim())}
 								onclick={bulkStatusChange}
 							>{m('common.apply')}</button>
@@ -1040,10 +1124,24 @@
 
 			<div class="bulk-divider"></div>
 
-			<button class="bulk-action-btn" disabled={bulkBusy} onclick={() => bulkExport('csv')}>CSV</button>
-			<button class="bulk-action-btn" disabled={bulkBusy} onclick={() => bulkExport('json')}>JSON</button>
-			<button class="bulk-action-btn" disabled={bulkBusy} onclick={() => bulkExport('xml')}>XML</button>
-		</div>
+			<!-- One trigger, not three buttons: the three formats on their own
+			     wrapped the bar to three rows at 375px. -->
+			<MenuButton
+				label={m('invoices.bulk.export')}
+				items={BULK_EXPORT_FORMATS}
+				busy={bulkBusy}
+				onselect={(format) => bulkExport(format)}
+				testId="invoices-bulk-export"
+			/>
+		{/snippet}
+	</BulkBar>
+
+	{#if deepLinkFailedId}
+		<LoadError
+			message={m('invoices.deepLink.loadFailed')}
+			onretry={() => deepLinkFailedId && openDeepLink(deepLinkFailedId)}
+			testId="invoices-deeplink-error"
+		/>
 	{/if}
 
 	{#if showOnboarding}
@@ -1057,8 +1155,30 @@
 			onaction={() => fileInput.click()}
 			testId="invoices-empty-state"
 		/>
+	{:else if invoiceStore.errored && !invoiceStore.loading}
+		<!-- A failed list load replaces the table (ui-patterns.md § LoadError).
+		     The empty-line message alone was not enough: when a filter change
+		     failed, the PREVIOUS filter's rows stayed on screen under the new
+		     chip with nothing saying they were stale, and no way to retry. -->
+		<LoadError
+			message={m('invoices.empty.errored')}
+			onretry={() => void refreshInvoiceList().catch(() => {})}
+			testId="invoices-load-error"
+		/>
 	{:else}
-	<DataTable isEmpty={invoiceStore.all.length === 0} empty={emptyMessage} colspan={10} fixed stickyHeader>
+	<div class="inv-table">
+	<DataTable
+		isEmpty={invoiceStore.all.length === 0}
+		loading={invoiceStore.loading}
+		errored={invoiceStore.errored}
+		emptyErrored={m('invoices.empty.errored')}
+		filtered={!noActiveFilters}
+		emptyFiltered={m('invoices.empty')}
+		empty={m('invoices.empty.fresh')}
+		colspan={10}
+		fixed
+		stickyHeader
+	>
 		{#snippet header()}
 			<tr>
 				<th class="checkbox-col"><input type="checkbox" aria-label={m('invoices.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} /></th>
@@ -1117,7 +1237,7 @@
 						{/if}
 						</span>
 					</td>
-					<td>
+					<td class="vendor-cell">
 						{invoice.vendor || '—'}
 						{#if invoice.priors_summary && (invoice.priors_summary.cache > 0 || invoice.priors_summary.rag > 0)}
 							<span
@@ -1134,7 +1254,7 @@
 					<td class="description" title={invoice.description}>{invoice.description}</td>
 					<td class="mono">{invoice.po_number}</td>
 					<td class="right mono"><Money amount={invoice.amount} currency={invoice.currency} /></td>
-					<td>{invoice.due_date}</td>
+					<td>{formatDate(invoice.due_date)}</td>
 					<td><StatusBadge status={invoice.status} /></td>
 					<td class="assignee">{invoice.assigned_to || '—'}</td>
 					<td class="actions">
@@ -1142,9 +1262,11 @@
 							<RowAction
 								variant="danger"
 								armed={confirmDeleteId === invoice.id}
-								disabled={deletingId === invoice.id}
+								busy={deletingId === invoice.id}
+								disabled={deletingId !== null && deletingId !== invoice.id}
 								onclick={(e) => {
 									e.stopPropagation();
+									if (deletingId) return;
 									if (confirmDeleteId === invoice.id) {
 										deleteInvoice(invoice.id);
 									} else {
@@ -1152,11 +1274,12 @@
 									}
 								}}
 							>
-								{deletingId === invoice.id
-									? '…'
-									: confirmDeleteId === invoice.id
-										? m('invoices.row.confirm')
-										: m('invoices.row.delete')}
+								<!-- Stays "Confirm" while the request runs: `busy` carries
+								     the in-flight state, and a "…" label left the button
+								     with no accessible name. -->
+								{confirmDeleteId === invoice.id
+									? m('invoices.row.confirm')
+									: m('invoices.row.delete')}
 							</RowAction>
 						{/if}
 					</td>
@@ -1164,19 +1287,19 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 	{/if}
 
-	{#if invoiceStore.hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={() => invoiceStore.loadMore()} disabled={invoiceStore.loading}>
-				{invoiceStore.loading ? m('common.loading') : m('invoices.loadMore', { shown: invoiceStore.all.length, total: invoiceStore.total })}
-			</button>
-		</div>
-	{:else if invoiceStore.total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('invoices.showingAll', { total: invoiceStore.total })}</span>
-		</div>
-	{/if}
+	<LoadMoreFooter
+		shown={invoiceStore.all.length}
+		total={invoiceStore.total}
+		hasMore={invoiceStore.hasMore}
+		loading={invoiceStore.loading}
+		errored={invoiceStore.errored}
+		onloadmore={loadMoreInvoices}
+		moreKey="invoices.loadMore"
+		allKey="invoices.showingAll"
+	/>
 </PageHeader>
 
 {#if editing}
@@ -1249,32 +1372,15 @@
 		gap: 6px;
 	}
 
-	.advanced-btn {
-		position: relative;
-		display: grid;
-		place-items: center;
+	/* Size only: the shared `.btn-icon` paints it and positions the dot's
+	   anchor. `.advanced-btn` stays on the button as the e2e hook, no CSS. */
+	.advanced-toggle {
 		width: 34px;
 		height: 34px;
-		border-radius: 50%;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		cursor: pointer;
-		transition: all 0.15s;
-		flex-shrink: 0;
 	}
 
-	.advanced-btn:hover {
-		border-color: var(--accent);
-		color: var(--text);
-	}
-
-	.advanced-btn.has-filters {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.advanced-btn .dot {
+	/* The dot says advanced filters are set. */
+	.advanced-toggle .dot {
 		position: absolute;
 		top: 4px;
 		right: 4px;
@@ -1295,22 +1401,57 @@
 		white-space: nowrap;
 	}
 
+	/* A fixed width, not a min/max range: a <select> sizes itself to its widest
+	   option, and the reviewer options arrive after first paint, so a range let
+	   the control grow once they landed and push the row onto another line. */
 	.assignee-select {
-		min-width: 160px;
-		max-width: 220px;
+		width: 200px;
+		max-width: 100%;
+	}
+
+	/* The status chips take a line of their own. Their number depends on the
+	   active workflow (the approval stages only exist with an approval step) and
+	   their width on the tallies, and both arrive after first paint — inline
+	   beside the search box, the row fitted on one line with the three chips
+	   drawn at mount and wrapped onto a second once the rest landed, dropping
+	   the whole table ~44px under the reader on every fresh visit. A row of its
+	   own holds the same height either way. Guarded by
+	   tests-e2e/reactivity/layout-stability.spec.ts. */
+	.filter-row > .filters {
+		flex-basis: 100%;
 	}
 
 	/* Fixed column widths pair with DataTable's `fixed`/`stickyHeader` props.
-	   These <th> widths apply because the header row is rendered from this
-	   page's snippet (page CSS scope). */
-	th:nth-child(1) { width: 40px; }
-	th:nth-child(2) { width: 11%; }
-	th:nth-child(3) { width: 15%; }
-	th:nth-child(5) { width: 8%; }
-	th:nth-child(6) { width: 9%; }
-	th:nth-child(7) { width: 9%; }
-	th:nth-child(8) { width: 13%; }
-	th:nth-child(9) { width: 11%; }
+	   They sit under `.inv-table` and `:global` because five of the headers
+	   (Invoice #, Vendor, Amount, Due date, Status) are `SortableHeader`s,
+	   whose `<th>` is rendered by that component and so never carries this
+	   page's scope class: a bare `th:nth-child(n)` here matched only the
+	   page's own `<th>`s and left those columns at an equal share (the
+	   /vendors and /exceptions arrangement). The predictable columns are
+	   sized to their widest content in the six locales: a header to its
+	   longest word
+	   plus the sort arrow (de "RECHNUNGS-NR.", "FÄLLIGKEITSDATUM"), the status
+	   column to its longest badge (fr "COMPTABILISÉE DANS L'ERP", which CI's
+	   font renders at 254px, so 270px rather than a local measurement), the actions
+	   column to de "Bestätigen". Vendor and Description carry no width and
+	   share the rest (a long vendor name wraps, `td.vendor-cell`); past the
+	   `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). Ten columns, so the cells
+	   run 10px of horizontal padding instead of the global 14px (the
+	   /exceptions arrangement): that is what keeps the row inside the 1388px
+	   region a 1666px window gives (tests-e2e/a11y/wide-layout.spec.ts). */
+	.inv-table { min-width: 0; }
+	.inv-table :global(table) { min-width: 1380px; }
+	.inv-table :global(th),
+	.inv-table :global(td) { padding-left: 10px; padding-right: 10px; }
+	.inv-table :global(th:nth-child(1)) { width: 40px; }
+	.inv-table :global(th:nth-child(2)) { width: 150px; }
+	.inv-table :global(th:nth-child(5)) { width: 110px; }
+	.inv-table :global(th:nth-child(6)) { width: 132px; }
+	.inv-table :global(th:nth-child(7)) { width: 170px; }
+	.inv-table :global(th:nth-child(8)) { width: 270px; }
+	.inv-table :global(th:nth-child(9)) { width: 140px; }
+	.inv-table :global(th:nth-child(10)) { width: 120px; }
 
 	.assignee {
 		overflow: hidden;
@@ -1318,13 +1459,21 @@
 		white-space: nowrap;
 		color: var(--text-muted);
 	}
-	th:nth-child(9) { width: 170px; }
 
 	td {
 		white-space: nowrap;
 		vertical-align: middle;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	/* The vendor name wraps (the /vendors `.vendor-name` arrangement) instead
+	   of clipping: a clipped name kept its tail only in a `title`, which a
+	   keyboard or touch reader never sees. One unbroken run still breaks
+	   inside the column. */
+	td.vendor-cell {
+		white-space: normal;
+		overflow-wrap: anywhere;
 	}
 
 	tr:last-child td {
@@ -1346,7 +1495,7 @@
 		display: inline-flex;
 		vertical-align: middle;
 		margin-left: 4px;
-		color: #d4940a;
+		color: var(--warning);
 		cursor: help;
 	}
 
@@ -1372,47 +1521,12 @@
 		cursor: help;
 	}
 
-	.btn-upload {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: none;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		transition: opacity 0.15s;
+	/* Colour, hover and disabled come from the shared `.btn-primary`; this
+	   only keeps the label on one line in the header's action row.
+	   (`.btn-upload` stays on the button as the e2e hook, with no CSS.) */
+	.upload-action {
 		white-space: nowrap;
 		flex-shrink: 0;
-	}
-
-	.btn-upload:hover {
-		opacity: 0.85;
-	}
-
-	.btn-upload:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn-secondary {
-		padding: 8px 16px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-		flex-shrink: 0;
-	}
-
-	.btn-secondary:hover {
-		border-color: var(--accent);
-		color: var(--accent);
 	}
 
 	/* --- Checkbox column --- */
@@ -1431,73 +1545,7 @@
 
 	/* --- Bulk action bar --- */
 
-	/* Floats above the page so selecting rows doesn't shove the table down.
-	   Bottom-centered so it lands in the natural eye line for an "I'm
-	   acting on the selection" affordance. */
-	.bulk-bar {
-		position: fixed;
-		left: 50%;
-		bottom: 24px;
-		transform: translateX(-50%);
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		padding: 10px 16px;
-		background: var(--surface);
-		border: 1px solid var(--accent);
-		border-radius: 8px;
-		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-		flex-wrap: wrap;
-		z-index: 50;
-		max-width: calc(100vw - 48px);
-	}
-
-	.bulk-count {
-		font-size: 0.85rem;
-		font-weight: 600;
-		color: var(--accent);
-		white-space: nowrap;
-	}
-
-	.bulk-clear {
-		padding: 4px 10px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.8rem;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.bulk-clear:hover {
-		color: var(--text);
-		background: var(--bg);
-	}
-
-	.bulk-select-all-matching {
-		padding: 4px 10px;
-		border-radius: 4px;
-		border: 1px solid var(--accent);
-		background: transparent;
-		color: var(--accent);
-		font-size: 0.8rem;
-		font-weight: 600;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.bulk-select-all-matching:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-
-	.bulk-select-all-matching:not(:disabled):hover {
-		background: var(--accent);
-		color: var(--surface);
-	}
-
+	/* The bar itself is the shared <BulkBar>; these place what it holds. */
 	.bulk-all-matching-note {
 		font-size: 0.8rem;
 		color: var(--text-muted);
@@ -1514,62 +1562,6 @@
 		background: var(--border);
 	}
 
-	.bulk-action-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		padding: 5px 12px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.8rem;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.bulk-action-btn:hover {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.bulk-action-btn:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
-	}
-
-	.bulk-delete-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		padding: 5px 12px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.8rem;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-		transition: all 0.15s;
-	}
-
-	.bulk-delete-btn:hover {
-		border-color: var(--danger);
-		color: var(--danger);
-	}
-
-	.bulk-delete-btn.armed {
-		border-color: var(--danger);
-		background: rgba(224, 64, 64, 0.1);
-		color: var(--danger);
-	}
-
-	.bulk-delete-btn:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
-	}
 
 	/* --- Bulk status dropdown --- */
 
@@ -1605,24 +1597,9 @@
 		min-width: 220px;
 	}
 
-	.bulk-apply-btn {
+	/* Everything but the padding is the shared `.btn-primary`'s; the
+	   padding shrinks so it sits beside the dropdown's compact select. */
+	.bulk-apply {
 		padding: 5px 12px;
-		border-radius: 4px;
-		border: none;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.8rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.bulk-apply-btn:hover:not(:disabled) {
-		opacity: 0.9;
-	}
-
-	.bulk-apply-btn:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
 	}
 </style>

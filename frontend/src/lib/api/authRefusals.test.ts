@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { en } from '#lib/i18n/locales/en.ts';
+import { EN_ALL } from '#lib/i18n/allMessages.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import { interpolate } from '#lib/i18n/interpolate.ts';
 import { AUTH_REFUSAL_CODES, authErrorMessage, authRefusalText } from './authRefusals.ts';
@@ -17,14 +17,14 @@ function recorder() {
 	const calls: { key: MessageKey; params?: Record<string, string | number> }[] = [];
 	const t = (key: MessageKey, params?: Record<string, string | number>) => {
 		calls.push({ key, params });
-		return interpolate(en[key], params, 'en');
+		return interpolate(EN_ALL[key], params, 'en');
 	};
 	return { t, calls };
 }
 
 /** Shaped like the `ApiError` `api.ts` throws for a coded `detail`. */
 function apiError(code: unknown, params: unknown, message: string): Error {
-	return Object.assign(new Error(message), { status: 400, code, params });
+	return Object.assign(new Error(message), { status: 400, code, params, detail: { code, message, params } });
 }
 
 describe('authRefusalText', () => {
@@ -58,7 +58,7 @@ describe('authRefusalText', () => {
 		const { t, calls } = recorder();
 		const out = authRefusalText({ code, params: {}, message: 'server English' }, t);
 		expect(calls.map((c) => c.key)).toEqual([key]);
-		expect(out).toBe(en[key]);
+		expect(out).toBe(EN_ALL[key]);
 	});
 
 	it('never offers the password as a second factor for a sensitive action', () => {
@@ -68,12 +68,12 @@ describe('authRefusalText', () => {
 			'authRefusal.sensitiveStepUpRequired',
 			'authRefusal.sensitiveStepUpFailed'
 		] as const) {
-			expect(en[key].toLowerCase()).not.toContain('password');
+			expect(EN_ALL[key].toLowerCase()).not.toContain('password');
 		}
 	});
 
 	it('never offers a supplier the passkey their portal account cannot hold', () => {
-		expect(en['authRefusal.portalStepUpFailed'].toLowerCase()).not.toContain('passkey');
+		expect(EN_ALL['authRefusal.portalStepUpFailed'].toLowerCase()).not.toContain('passkey');
 	});
 
 	it('fills the wrong-host sentence from params, joining the hosts itself', () => {
@@ -119,7 +119,7 @@ describe('authErrorMessage', () => {
 		const { t } = recorder();
 		const err = apiError('step_up_sso_only', {}, 'server English');
 		expect(authErrorMessage(err, t, 'profile.mfa.disableFailed')).toBe(
-			en['authRefusal.stepUpSsoOnly']
+			EN_ALL['authRefusal.stepUpSsoOnly']
 		);
 	});
 
@@ -133,24 +133,38 @@ describe('authErrorMessage', () => {
 
 	it('renders an uncoded error by its message', () => {
 		const { t } = recorder();
-		expect(authErrorMessage(apiError(null, {}, 'MFA is disabled'), t, 'profile.mfa.disableFailed')).toBe(
-			'MFA is disabled'
+		const err = Object.assign(new Error('MFA is disabled'), {
+			status: 400,
+			code: null,
+			params: {},
+			detail: 'MFA is disabled'
+		});
+		expect(authErrorMessage(err, t, 'profile.mfa.disableFailed')).toBe('MFA is disabled');
+	});
+
+	it("never shows a cancelled browser prompt's own English (a DOMException is not an API error)", () => {
+		const { t } = recorder();
+		const cancelled = Object.assign(new Error('The operation was aborted.'), { code: 20 });
+		expect(authErrorMessage(cancelled, t, 'profile.passkeys.addFailed')).toBe(
+			EN_ALL['profile.passkeys.addFailed']
 		);
 	});
 
-	it('leaves a cancelled browser prompt (a numeric DOMException code) to its own message', () => {
-		const { t, calls } = recorder();
-		const cancelled = Object.assign(new Error('The operation was aborted.'), { code: 20 });
-		expect(authErrorMessage(cancelled, t, 'profile.passkeys.addFailed')).toBe(
-			'The operation was aborted.'
+	it('uses the localized fallback for a network failure and a bodyless 5xx', () => {
+		const { t } = recorder();
+		expect(authErrorMessage(new TypeError('Failed to fetch'), t, 'profile.passkeys.addFailed')).toBe(
+			EN_ALL['profile.passkeys.addFailed']
 		);
-		expect(calls).toEqual([]);
+		const bodyless = Object.assign(new Error('API error 502'), { status: 502, code: null, params: {} });
+		expect(authErrorMessage(bodyless, t, 'profile.passkeys.addFailed')).toBe(
+			EN_ALL['profile.passkeys.addFailed']
+		);
 	});
 
 	it('uses the localized fallback for a non-Error throw', () => {
 		const { t } = recorder();
 		expect(authErrorMessage('boom', t, 'profile.passkeys.addFailed')).toBe(
-			en['profile.passkeys.addFailed']
+			EN_ALL['profile.passkeys.addFailed']
 		);
 	});
 });

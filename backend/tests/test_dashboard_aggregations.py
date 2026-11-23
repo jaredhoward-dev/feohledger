@@ -66,8 +66,9 @@ def _mk_db(*results):
 
 
 # The dashboard makes queries in this order — pinning here so the
-# test layout stays sane. Don't change the order without updating the
-# endpoint AND the comments below.
+# test layout stays sane. The queries live in `services/dashboard_metrics`, one
+# function per section, and `api/dashboard.get_dashboard` awaits the sections in
+# this order. Don't change the order without updating both AND the list below.
 #
 # Aging bands, the monthly-trend buckets, the currency rollup and the top-vendor
 # tile are now aggregated in SQL (GROUP BY), so those result rows are already
@@ -82,6 +83,9 @@ def _mk_db(*results):
 #   5.  aging rows (bucket, sum, sum_rep) — SQL-bucketed → .all()
 #   6.  trend rows (month, count, sum, sum_rep) — SQL group → .all()
 #   7.  upcoming payment rows (+ currency/reporting cols)  → .all()
+#   7b. overdue / due-soon per currency   → .all() → (ccy, n_overdue, sum, n_soon, sum)
+#       (`services/open_ap_due`'s predicate — pinned against Postgres in
+#       `test_dashboard_aggregates.py` § 5)
 #   7a. touchless counts                  → .one() → (touchless, decided)
 #       (`services/touchless.touchless_counts_select` — the per-invoice
 #       classification is SQL over the audit trail, so it is pinned against
@@ -98,6 +102,12 @@ def _mk_db(*results):
 #  17.  pending approval steps            → .all() → (assigned_to, created_at)
 #  18.  discount-capture buckets          → .all() → (bucket, n, amt, amt_rep, unconv)
 #
+# Two more run only conditionally, and every call here avoids both by passing
+# `entity_id=None` and a non-admin user: the org-wide "any invoice at all?"
+# probe (only with an entity selected that has none) and the setup-checklist
+# reads (only for an admin on a workspace with no invoices). Both are pinned
+# against Postgres in `test_dashboard_onboarding.py`.
+#
 # None of these sit inside a swallowing `try` any more (decisions §218), so a
 # fixture that runs out of results fails loudly instead of reading zeros.
 
@@ -111,6 +121,7 @@ def _full_results(
     aging=(),
     trend=(),
     upcoming=(),
+    due=(),
     touchless=(0, 0),
     paid=Decimal("0"),
     pending=Decimal("0"),
@@ -130,6 +141,7 @@ def _full_results(
         _r(all_=list(aging)),
         _r(all_=list(trend)),
         _r(all_=list(upcoming)),
+        _r(all_=list(due)),
         _r(one=touchless),
         _r(scalar=paid),
         _r(scalar=pending),
@@ -175,7 +187,7 @@ async def test_touchless_rate_divides_touchless_by_decided():
     card is a different figure (every invoice, by status) and is untouched."""
     pipeline_rows = [(InvoiceStatus.approved, 80), (InvoiceStatus.rejected, 20)]
     db = _mk_db(*_full_results(pipeline=pipeline_rows, touchless=(20, 100)))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert result["touchless_rate"] == 20.0
     assert isinstance(result["touchless_rate"], float)
     assert result["pipeline"]["rejected"] == 20
@@ -186,14 +198,14 @@ async def test_touchless_rate_never_goes_negative_with_many_rejections():
     """BUG 9: the old formula `(1 - 50) / 1 * 100` returned -4900%. One touchless
     invoice out of 51 decided is ≈ 2.0% — small, never negative."""
     db = _mk_db(*_full_results(touchless=(1, 51)))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert result["touchless_rate"] == 2.0
 
 
 @pytest.mark.asyncio
 async def test_touchless_rate_is_100_when_everything_went_straight_through():
     db = _mk_db(*_full_results(touchless=(10, 10)))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert result["touchless_rate"] == 100.0
 
 
@@ -201,7 +213,7 @@ async def test_touchless_rate_is_100_when_everything_went_straight_through():
 async def test_touchless_rate_is_zero_when_no_invoices_decided():
     """Nothing decided yet — 0, not a ZeroDivisionError."""
     db = _mk_db(*_full_results(pipeline=[(InvoiceStatus.new, 5)], touchless=(0, 0)))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert result["touchless_rate"] == 0
 
 
@@ -260,7 +272,7 @@ async def test_upcoming_payments_flag_overdue_only_when_due_date_before_today():
         ),  # future
     ]
     db = _mk_db(*_full_results(upcoming=upcoming_rows))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     flags = {row["invoice_number"]: row["is_overdue"] for row in result["upcoming_payments"]}
     assert flags == {"INV-1": True, "INV-2": False, "INV-3": False}
 
@@ -283,7 +295,7 @@ async def test_upcoming_payment_rows_carry_their_own_invoice_currency():
         (uuid.uuid4(), "INV-EU", "Bravo", Decimal("200"), today, "EUR", None, None),
     ]
     db = _mk_db(*_full_results(upcoming=upcoming_rows))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     by_number = {row["invoice_number"]: row["currency"] for row in result["upcoming_payments"]}
     assert by_number == {"INV-US": "USD", "INV-EU": "EUR"}
 
@@ -311,7 +323,7 @@ async def test_upcoming_total_amount_sums_in_decimal_not_accumulated_float():
         (uuid.uuid4(), "INV-3", "Charlie", Decimal("30.30"), today, "USD", None, None),
     ]
     db = _mk_db(*_full_results(upcoming=upcoming_rows))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert isinstance(result["upcoming_total_amount"], Decimal)
     # Exact to the cent, in Decimal — no binary-float accumulation artifact
     # like 60.599999999999994.
@@ -321,7 +333,7 @@ async def test_upcoming_total_amount_sums_in_decimal_not_accumulated_float():
 @pytest.mark.asyncio
 async def test_upcoming_total_amount_is_zero_when_no_upcoming_invoices():
     db = _mk_db(*_full_results())
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert result["upcoming_total_amount"] == Decimal("0")
 
 
@@ -350,7 +362,7 @@ async def test_payment_totals_stay_decimal():
             rebates=(Decimal("123.45"), 0),
         )
     )
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert isinstance(result["total_paid"], Decimal)
     assert isinstance(result["total_pending"], Decimal)
     assert isinstance(result["total_rebates"], Decimal)
@@ -369,7 +381,7 @@ async def test_totals_default_to_zero_when_db_returns_zero_rows():
     dashboard returns a fully-shaped response with zeros, not nulls
     (the frontend would crash on a null in the KPI tile)."""
     db = _mk_db(*_full_results())
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     assert result["total_invoices"] == 0
     assert result["total_amount"] == Decimal("0")
     assert result["total_paid"] == Decimal("0")
@@ -407,7 +419,7 @@ async def test_reporting_rollup_collapses_mixed_currencies_into_one_total():
     ]
     db = _mk_db(*_full_results(totals=(2, Decimal("2000.00")), reporting_rows=reporting_rows))
     org = _org(settings={"reporting_currency": "USD"})
-    result = await get_dashboard(db=db, org=org, user=_user())
+    result = await get_dashboard(db=db, org=org, user=_user(), entity_id=None)
 
     assert result["total_amount"] == Decimal("2000.00")  # legacy naive SUM unchanged
     rep = result["reporting"]
@@ -433,7 +445,7 @@ async def test_reporting_rollup_flags_foreign_rows_without_a_rate_lock():
         ("GBP", Decimal("300.00"), Decimal("300.00"), 1, 1),
     ]
     db = _mk_db(*_full_results(totals=(2, Decimal("800.00")), reporting_rows=reporting_rows))
-    result = await get_dashboard(db=db, org=_org(), user=_user())
+    result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
     rep = result["reporting"]
     assert rep["unconverted_count"] == 1
     assert rep["total_amount"] == Decimal("800.00")  # GBP falls through at face value

@@ -9,7 +9,9 @@
 	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 	import { getSweepHealth, type SweepHealth, type SweepHealthReport } from '#lib/api/sweepHealth.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 
 	// RBAC parity with the backend: `GET /api/health/sweeps` is
 	// `require_roles(ROLE_ADMIN)`. Wait for `auth.user` to resolve before
@@ -185,12 +187,9 @@
 	</div>
 
 	{#if loading && report === null}
-		<p class="state" data-testid="sweep-health-loading">{m('common.loading')}</p>
+		<LoadingState testId="sweep-health-loading" />
 	{:else if error}
-		<div class="state error" data-testid="sweep-health-error" role="alert">
-			<p>{error}</p>
-			<button type="button" class="btn-cancel" onclick={load}>{m('sweepHealth.retry')}</button>
-		</div>
+		<LoadError message={error} onretry={load} testId="sweep-health-error" />
 	{:else if report}
 		<DataTable columns={COLUMNS} isEmpty={sweeps.length === 0} empty={m('sweepHealth.empty')}>
 			{#snippet body()}
@@ -248,15 +247,6 @@
 		color: var(--text-muted);
 		font-size: 0.85rem;
 		max-width: 900px;
-	}
-
-	.state {
-		color: var(--text-muted);
-		padding: 0.75rem 0;
-	}
-
-	.state.error {
-		color: var(--danger);
 	}
 
 	.kpi-row {

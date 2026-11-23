@@ -92,6 +92,7 @@ async def test_build_rationale_no_key_returns_template_offline():
     template = "Adjusted invoice amount from 100.00 to 100.50 and approved."
     out = await build_rationale(
         {"extraction": {"program_type": "platform", "api_key": ""}},
+        organization_id=uuid.uuid4(),
         template=template,
         facts={"old_amount": "100.00", "new_amount": "100.50"},
         http_post=_boom,
@@ -100,7 +101,7 @@ async def test_build_rationale_no_key_returns_template_offline():
     assert called is False
 
 
-async def test_build_rationale_byok_empty_key_returns_template():
+async def test_build_rationale_byok_empty_key_returns_template(provider_store_from_settings):
     """A BYOK org with an empty api_key still degrades to the template — the
     no-key path is keyed off the resolved key being falsy, not the program."""
     called = False
@@ -113,6 +114,7 @@ async def test_build_rationale_byok_empty_key_returns_template():
     template = "deterministic rationale"
     out = await build_rationale(
         {"extraction": {"program_type": "byok", "api_key": ""}},
+        organization_id=uuid.uuid4(),
         template=template,
         facts={},
         http_post=_boom,
@@ -121,7 +123,9 @@ async def test_build_rationale_byok_empty_key_returns_template():
     assert called is False
 
 
-async def test_build_rationale_request_leaves_room_for_thinking(monkeypatch):
+async def test_build_rationale_request_leaves_room_for_thinking(
+    monkeypatch, provider_store_from_settings
+):
     """Current models think by default and thinking counts toward max_tokens —
     the old 300 could end the turn before the sentence and silently fall back
     to the template."""
@@ -148,6 +152,7 @@ async def test_build_rationale_request_leaves_room_for_thinking(monkeypatch):
                 "model": "claude-sonnet-5-5",
             }
         },
+        organization_id=uuid.uuid4(),
         template="draft",
         facts={},
         http_post=_post,
@@ -232,6 +237,7 @@ async def _seed_po_mismatch(
             invoice_number=number,
             vendor_name="Acme Hosting",
             amount=invoice_amount,
+            currency="USD",
             status=InvoiceStatus.ready_for_review,
             po_number=po_number,
             po_match={"status": "matched", "po_total": str(po_total)},
@@ -610,6 +616,7 @@ async def _seed_agent_decision(
             invoice_number=number,
             vendor_name="Acme",
             amount=Decimal("1.00"),
+            currency="USD",
             entity_id=entity_id,
         )
         s.add(inv)
@@ -717,3 +724,71 @@ async def test_agent_stats_scopes_by_entity(realdb):
 
         stats_all = (await c.get("/api/exceptions/agent-stats")).json()
         assert stats_all["total_decisions"] == 4
+
+
+@pytest.mark.parametrize(
+    ("status", "warned", "refused"),
+    [
+        (InvoiceStatus.approved, True, True),
+        (InvoiceStatus.approved, False, False),
+        (InvoiceStatus.ready_for_review, True, False),
+    ],
+)
+def test_an_agent_approval_past_a_po_over_billing_warning_unwinds(status, warned, refused):
+    """An agent's approval is no person reading the cumulative over-billing
+    warning (decisions §469): the coordinator unwinds an apply that approved an
+    invoice carrying it, and escalates."""
+    from types import SimpleNamespace
+
+    from app.services.exception_agents.coordinator import _approved_past_po_overbilling
+    from app.services.invoice_warning_catalog import warning
+
+    warnings = (
+        [
+            warning(
+                "po_billed_beyond_total",
+                "warning",
+                billedAmount=Decimal("500.00"),
+                poNumber="PO-469",
+                poTotal=Decimal("500.00"),
+                currency="USD",
+            )
+        ]
+        if warned
+        else None
+    )
+    invoice = SimpleNamespace(status=status, warnings=warnings)
+    assert _approved_past_po_overbilling(invoice) is refused
+
+
+@pytest.mark.parametrize(
+    ("status", "severity", "refused"),
+    [
+        (InvoiceStatus.approved, "error", True),
+        (InvoiceStatus.approved, "warning", False),
+        (InvoiceStatus.ready_for_review, "error", False),
+    ],
+)
+def test_an_agent_approval_past_a_not_to_exceed_contract_cap_unwinds(status, severity, refused):
+    """A not-to-exceed contract whose limit the invoice cannot be measured
+    against (another currency) is an `error` finding that no unattended door
+    approves past (decisions §472); an agent's approval is no person
+    reading it either. A plain contract's `warning` does not unwind."""
+    from types import SimpleNamespace
+
+    from app.services.exception_agents.coordinator import _approved_past_contract_cap
+    from app.services.invoice_warning_catalog import warning
+
+    invoice = SimpleNamespace(
+        status=status,
+        warnings=[
+            warning(
+                "contract_currency_mismatch",
+                severity,
+                invoiceCurrency="EUR",
+                contractNumber="MSA-1",
+                contractCurrency="USD",
+            )
+        ],
+    )
+    assert _approved_past_contract_cap(invoice) is refused

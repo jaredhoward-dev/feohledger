@@ -10,7 +10,11 @@
 #   - network.tf  : the workload VPC (public subnets for the VM, private for RDS)
 #   - compute.tf  : the app VM, its instance role, Elastic IP and DNS records
 #   - database.tf : RDS Postgres 16
-#   - monitoring.tf : alarms
+#   - monitoring.tf : alarms, the alerts (email) and pager (SMS) topics
+#   - uptime.tf   : external Route 53 HTTPS checks on the apex, a tenant host
+#                   and the API, their paging alarms, and certificate expiry
+#   - canary.tf   : hourly Synthetics canary validating the certificate Caddy
+#                   serves on api.<domain>, paging under 14 days to expiry
 #   - deploy.tf   : release deploys — the SSM document that runs deploy.sh on
 #                   the VM, and the deploy role's grant to run only that
 #   - frontend.tf : the SPA on S3 + CloudFront, and the deploy role's grant to
@@ -29,6 +33,11 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 6.44"
+    }
+    # Zips the certificate canary's script (canary.tf).
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.8"
     }
   }
 
@@ -71,7 +80,9 @@ provider "aws" {
 }
 
 # CloudFront only accepts ACM certificates issued in us-east-1, so the platform
-# certificate (acm.tf) is pinned there regardless of var.aws_region.
+# certificate (acm.tf) is pinned there regardless of var.aws_region. Route 53
+# health-check metrics exist only there too, so the uptime alarms and the pager
+# topic they notify (uptime.tf, monitoring.tf) use this alias as well.
 provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"

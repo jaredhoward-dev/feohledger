@@ -59,7 +59,7 @@ async def _add_invoice(
     due_date,
     discount_date=None,
     discount_percent=None,
-    currency=None,
+    currency="USD",
 ) -> uuid.UUID:
     """Insert one Invoice (+ optional PaymentSchedule) into the tenant DB.
 
@@ -75,7 +75,7 @@ async def _add_invoice(
             status=status,
             invoice_date=_TODAY - timedelta(days=5),
             due_date=due_date,
-            **({"currency": currency} if currency else {}),
+            currency=currency,
         )
         s.add(inv)
         await s.flush()
@@ -216,6 +216,198 @@ async def test_forecast_include_pending_false_drops_pipeline(realdb):
         resp = await c.get("/api/analytics/cashflow_forecast?include_pending=false")
     assert resp.status_code == 200
     assert _money(resp.json()["totals"]["scheduled_amount"]) == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# Overdue AP — carried into the first period, never dropped
+# ---------------------------------------------------------------------------
+
+
+async def _seed_overdue_probe(realdb) -> date:
+    """The followups probe: an approved USD 1,000 invoice due YESTERDAY and an
+    approved USD 200 invoice due in five days. Returns the server's `today`
+    (UTC — the clock `commitment_rows` runs on), so the dates cannot straddle
+    a local midnight."""
+    from app.utils.dates import utc_today
+
+    today = utc_today()
+    await _add_invoice(
+        realdb,
+        "a",
+        amount="1000",
+        status=InvoiceStatus.approved.value,
+        due_date=today - timedelta(days=1),
+        currency="USD",
+    )
+    await _add_invoice(
+        realdb,
+        "a",
+        amount="200",
+        status=InvoiceStatus.approved.value,
+        due_date=today + timedelta(days=5),
+        currency="USD",
+    )
+    return today
+
+
+async def test_forecast_carries_overdue_ap_into_the_first_period(realdb):
+    """Before: `totals.committed_amount == "200.00"`, `count == 1` — the
+    overdue thousand was in no period, so every cash surface overstated cash by
+    exactly the AP the business is already late paying. Now it is the first
+    period's `overdue_amount`, outside `committed_amount` (which keeps meaning
+    "falling due on schedule") and inside `scheduled_amount`."""
+    today = await _seed_overdue_probe(realdb)
+    async with realdb.client(key="a", role="cfo") as c:
+        resp = await c.get("/api/analytics/cashflow_forecast?granularity=day&horizon_days=30")
+    assert resp.status_code == 200
+    body = resp.json()
+    first, second = body["periods"]
+    assert first["period"] == today.isoformat()
+    assert _money(first["overdue_amount"]) == Decimal("1000")
+    assert first["overdue_count"] == 1
+    assert _money(first["committed_amount"]) == Decimal("0")
+    assert _money(first["scheduled_amount"]) == Decimal("1000")
+    assert second["period"] == (today + timedelta(days=5)).isoformat()
+    assert _money(second["committed_amount"]) == Decimal("200")
+    assert _money(second["overdue_amount"]) == Decimal("0")
+
+    totals = body["totals"]
+    assert _money(totals["overdue_amount"]) == Decimal("1000")
+    assert totals["overdue_count"] == 1
+    assert _money(totals["committed_amount"]) == Decimal("200")
+    assert _money(totals["scheduled_amount"]) == Decimal("1200")
+    assert totals["count"] == 2
+
+
+async def test_commitment_rows_keeps_past_due_and_drops_past_horizon_and_untimeable(realdb):
+    """`ap_commitments.commitment_rows` directly: a past-due row is kept and
+    flagged `overdue` with its real due date; a row due the day after the
+    horizon and a row with no due date at all (neither invoice nor schedule)
+    are left out; the horizon's last day is kept."""
+    from app.services.ap_commitments import commitment_rows
+    from app.utils.dates import utc_today
+
+    today = utc_today()
+    horizon = 30
+    approved = InvoiceStatus.approved.value
+    past_due = await _add_invoice(
+        realdb, "a", amount="100", status=approved, due_date=today - timedelta(days=3)
+    )
+    last_day = await _add_invoice(
+        realdb, "a", amount="200", status=approved, due_date=today + timedelta(days=horizon)
+    )
+    await _add_invoice(
+        realdb, "a", amount="300", status=approved, due_date=today + timedelta(days=horizon + 1)
+    )
+    await _add_invoice(realdb, "a", amount="400", status=approved, due_date=None)
+
+    async with realdb.sessionmaker("a")() as s:
+        rows = await commitment_rows(
+            s, today=today, horizon_days=horizon, include_pending=True, reporting_currency="USD"
+        )
+    by_id = {r["invoice_id"]: r for r in rows}
+    assert set(by_id) == {str(past_due), str(last_day)}
+    assert by_id[str(past_due)]["overdue"] is True
+    assert by_id[str(past_due)]["due_date"] == today - timedelta(days=3)
+    assert by_id[str(last_day)]["overdue"] is False
+
+
+async def test_forecast_overdue_follows_the_payment_schedule_due_date(realdb):
+    """The schedule's due date is authoritative: an invoice whose own due date
+    is past but whose schedule moved it into the future is NOT overdue, and the
+    future-edge SQL bound reads the same effective date (a schedule past the
+    horizon drops the row even when the invoice's own date is inside it)."""
+    from app.utils.dates import utc_today
+
+    today = utc_today()
+    inv_id = await _add_invoice(
+        realdb,
+        "a",
+        amount="300",
+        status=InvoiceStatus.approved.value,
+        due_date=today - timedelta(days=4),
+        currency="USD",
+    )
+    far_id = await _add_invoice(
+        realdb,
+        "a",
+        amount="900",
+        status=InvoiceStatus.approved.value,
+        due_date=today + timedelta(days=3),
+        currency="USD",
+    )
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        s.add(PaymentSchedule(invoice_id=inv_id, due_date=today + timedelta(days=6)))
+        s.add(PaymentSchedule(invoice_id=far_id, due_date=today + timedelta(days=200)))
+        await s.commit()
+    async with realdb.client(key="a", role="cfo") as c:
+        resp = await c.get("/api/analytics/cashflow_forecast?granularity=day&horizon_days=30")
+    totals = resp.json()["totals"]
+    assert _money(totals["overdue_amount"]) == Decimal("0")
+    assert totals["overdue_count"] == 0
+    assert _money(totals["committed_amount"]) == Decimal("300")
+    assert totals["count"] == 1
+
+
+async def test_forecast_include_pending_false_drops_an_overdue_pipeline_invoice(realdb):
+    """A past-due invoice still in review is overdue AP too (it is carried into
+    `overdue_amount` with the pipeline included) — and `include_pending=false`
+    drops it with the rest of the pipeline, so the firm view stays firm."""
+    from app.utils.dates import utc_today
+
+    today = utc_today()
+    await _add_invoice(
+        realdb,
+        "a",
+        amount="70",
+        status=InvoiceStatus.ready_for_review.value,
+        due_date=today - timedelta(days=2),
+        currency="USD",
+    )
+    async with realdb.client(key="a", role="cfo") as c:
+        with_pipeline = (await c.get("/api/analytics/cashflow_forecast")).json()["totals"]
+        firm = (await c.get("/api/analytics/cashflow_forecast?include_pending=false")).json()[
+            "totals"
+        ]
+    assert _money(with_pipeline["overdue_amount"]) == Decimal("70")
+    assert _money(with_pipeline["pending_amount"]) == Decimal("0")
+    assert _money(firm["overdue_amount"]) == Decimal("0")
+    assert _money(firm["scheduled_amount"]) == Decimal("0")
+
+
+async def test_cash_position_subtracts_overdue_ap_in_the_first_period(realdb):
+    today = await _seed_overdue_probe(realdb)
+    async with realdb.client(key="a", role="cfo") as c:
+        resp = await c.get(
+            "/api/analytics/cash_position"
+            "?granularity=day&horizon_days=30&opening_balance=1100&min_balance_threshold=0"
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert _money(body["overdue_amount"]) == Decimal("1000")
+    assert body["overdue_count"] == 1
+    first, second = body["periods"]
+    assert first["period"] == today.isoformat()
+    assert _money(first["outflow"]) == Decimal("1000")
+    assert _money(first["overdue_amount"]) == Decimal("1000")
+    assert _money(first["closing"]) == Decimal("100")
+    # Before the fix this closed at 900 — a shortfall the CFO never saw.
+    assert _money(second["closing"]) == Decimal("-100")
+    assert [b["period"] for b in body["breaches"]] == [second["period"]]
+
+
+async def test_whatif_includes_overdue_ap_in_every_scenario(realdb):
+    await _seed_overdue_probe(realdb)
+    async with realdb.client(key="a", role="cfo") as c:
+        resp = await c.get("/api/analytics/cashflow_whatif?granularity=day&horizon_days=30")
+    assert resp.status_code == 200
+    for name, scenario in resp.json()["scenarios"].items():
+        assert _money(scenario["total_outflow"]) == Decimal("1200"), name
+        assert _money(scenario["overdue_amount"]) == Decimal("1000"), name
+        assert scenario["overdue_count"] == 1, name
+        # Nothing is ever timed before today.
+        assert scenario["weighted_avg_pay_date_days"] >= 0, name
 
 
 async def test_forecast_bad_granularity_422(realdb):
@@ -720,7 +912,7 @@ async def test_forecast_outflows_are_in_the_reporting_currency(realdb):
     """A foreign-currency invoice must contribute its REPORTING amount, not
     its raw face value.
 
-    `_commitment_rows` used to select `Invoice.amount` — the invoice's own
+    `commitment_rows` used to select `Invoice.amount` — the invoice's own
     currency — with no conversion, while every consumer subtracts those rows
     from an opening balance that `cashflow.resolve_opening_balance` guarantees
     is in the reporting currency (it REFUSES a provider balance in any other,
@@ -781,7 +973,7 @@ async def test_forecast_outflows_are_in_the_reporting_currency(realdb):
 
 
 async def test_two_payment_schedules_do_not_double_count_the_invoice(realdb):
-    """`_commitment_rows` fanned an invoice out to one row per `PaymentSchedule`.
+    """`commitment_rows` fanned an invoice out to one row per `PaymentSchedule`.
 
     The bare `outerjoin(PaymentSchedule)` returned a row per schedule and the
     loop appended a commitment row for each, so a two-schedule invoice was

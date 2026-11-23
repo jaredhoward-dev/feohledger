@@ -139,6 +139,14 @@ test.describe('/organization ERP connection', () => {
 			await expect(select.locator('optgroup[label="Popular in South Africa"]')).toHaveCount(1);
 
 			await select.selectOption('netsuite');
+			// A new NetSuite connection starts on OAuth 2.0 (TBA is closed to new
+			// integrations from 2027.1, decisions §320); this walk exercises TBA's
+			// two stored secrets, so it picks that method first.
+			// By name: the select sits inside its label, so its accessible name
+			// carries the chosen option's text too.
+			const authMethod = card.locator('select[name="auth_method"]');
+			await expect(authMethod).toHaveValue('oauth2_m2m');
+			await authMethod.selectOption('tba');
 			await expect(card.getByLabel('Account ID', { exact: true })).toBeVisible();
 			await card.getByLabel('Account ID', { exact: true }).fill('1234567');
 			await card.getByLabel('Consumer Key', { exact: true }).fill('ck-e2e');
@@ -305,7 +313,9 @@ test.describe('/organization ERP connection', () => {
 			(url) => url.pathname === '/api/organization/erp/oauth/disconnect',
 			(route) => {
 				current = oauthStatus();
-				return route.fulfill({ json: { disconnected: true, revoked: true } });
+				return route.fulfill({
+					json: { disconnected: true, revoked: true, revocation: 'revoked' }
+				});
 			}
 		);
 
@@ -374,6 +384,49 @@ test.describe('/organization ERP connection', () => {
 			await expect(card.getByTestId('erp-oauth-state')).toHaveText(
 				'Not connected to QuickBooks Online yet.'
 			);
+		} finally {
+			await resetErp(page);
+		}
+	});
+
+	test('connect from a custom domain says where to connect instead, as a named link', async ({
+		page
+	}) => {
+		// The backend refuses `/authorize` on a host whose cookies its OAuth
+		// callback never sees (a white-label domain proxying `/api`): the
+		// browser-binding cookie could not be set (backend/app/api/erp_oauth.py).
+		await stubStatus(page, () => oauthStatus());
+		const platformUrl = 'https://acme.feohledger.test/organization?section=erp';
+		await page.route(
+			(url) => url.pathname === '/api/organization/erp/oauth/quickbooks_online/authorize',
+			(route) =>
+				route.fulfill({
+					status: 409,
+					json: {
+						detail: {
+							code: 'erp_connect_platform_host',
+							message: 'server English, never shown',
+							params: { url: platformUrl }
+						}
+					}
+				})
+		);
+
+		await page.goto('/organization?section=erp');
+		const card = panel(page);
+		try {
+			await card.getByTestId('erp-provider-select').selectOption('quickbooks_online');
+			await card.getByRole('button', { name: 'Connect to QuickBooks Online' }).click();
+			await expect(card.getByTestId('erp-status')).toHaveText(
+				'Connecting QuickBooks Online has to start from your FeohLedger address, not a custom domain. Open this page there and connect again:'
+			);
+			const link = card.getByRole('link', {
+				name: 'Open Organization → ERP at your FeohLedger address'
+			});
+			await expect(link).toHaveAttribute('href', platformUrl);
+			// Still on this page: nothing navigated to a consent screen.
+			await expect(page).toHaveURL(/section=erp/);
+			await expect(card.getByRole('button', { name: 'Connect to QuickBooks Online' })).toBeEnabled();
 		} finally {
 			await resetErp(page);
 		}
@@ -475,6 +528,33 @@ test.describe('/organization ERP connection', () => {
 			// Phone width: the open section, the URI and the action row still pass.
 			await page.setViewportSize({ width: 320, height: 800 });
 			await expect(card.getByTestId('erp-redirect-uri')).toBeVisible();
+			await expectNoA11yViolations(page);
+		} finally {
+			await resetErp(page);
+		}
+	});
+
+	test('a connection made before the payments scope says what it limits and offers Reconnect', async ({
+		page
+	}) => {
+		// decisions §415: the status sync recorded `payments_scope_missing` on a
+		// Xero consent from before `accounting.payments`.
+		await stubStatus(page, () =>
+			oauthStatus({
+				provider: 'xero',
+				connected: true,
+				external_tenant_id: 'xt-1',
+				scope_gaps: ['payments_scope_missing']
+			})
+		);
+		await page.goto('/organization?section=erp');
+		const card = panel(page);
+		try {
+			await card.getByTestId('erp-provider-select').selectOption('xero');
+			await expect(card.getByTestId('erp-oauth-scope-gap')).toHaveText(
+				'This connection to Xero was made before FeohLedger asked for permission to read and record payments. Until you reconnect to grant it, payments made in Xero are picked up only when the bill itself changes, and payments made through FeohLedger aren\'t recorded in Xero. Reconnect soon, or FeohLedger could miss a bill paid in Xero.'
+			);
+			await expect(card.getByTestId('erp-oauth-reconnect')).toHaveText('Reconnect to Xero');
 			await expectNoA11yViolations(page);
 		} finally {
 			await resetErp(page);

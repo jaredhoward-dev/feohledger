@@ -31,8 +31,16 @@ export interface CashflowForecastPeriod {
 	scheduled_amount: MoneyString;
 	committed_amount: MoneyString;
 	pending_amount: MoneyString;
+	/**
+	 * AP already past due, carried into the FIRST period (it is owed now).
+	 * Inside `scheduled_amount`, outside `committed_amount` / `pending_amount`:
+	 * `scheduled = committed + pending + overdue`.
+	 */
+	overdue_amount: MoneyString;
 	discount_eligible_amount: MoneyString;
 	count: number;
+	/** A count, not money: how many of `count` are already past due. */
+	overdue_count: number;
 	/**
 	 * A COUNT, not money: invoices included at face value because no exchange
 	 * rate into the reporting currency could be established. Non-zero means the
@@ -51,8 +59,10 @@ export interface CashflowForecast {
 		scheduled_amount: MoneyString;
 		committed_amount: MoneyString;
 		pending_amount: MoneyString;
+		overdue_amount: MoneyString;
 		discount_eligible_amount: MoneyString;
 		count: number;
+		overdue_count: number;
 		unconverted_count: number;
 	};
 }
@@ -65,11 +75,15 @@ export interface WhatIfScenario {
 	weighted_avg_pay_date_days: number;
 	/** A count, not money — see `CashflowForecastPeriod.unconverted_count`. */
 	unconverted_count: number;
+	/** The slice of `total_outflow` already past due — the same in every scenario. */
+	overdue_amount: MoneyString;
+	overdue_count: number;
 	periods: Array<{
 		period: string;
 		period_start: string;
 		period_end: string;
 		scheduled_amount: MoneyString;
+		overdue_amount: MoneyString;
 		unconverted_count: number;
 	}>;
 }
@@ -94,6 +108,8 @@ export interface CashPositionPeriod {
 	inflow: MoneyString;
 	closing: MoneyString;
 	below_threshold: boolean;
+	/** The part of `outflow` that is AP already past due (first period only). */
+	overdue_amount: MoneyString;
 	unconverted_count: number;
 }
 
@@ -130,6 +146,9 @@ export interface CashPosition {
 	 * carries forward, so one such row poisons the tail.
 	 */
 	unconverted_count: number;
+	/** AP already past due, inside the first period's `outflow` (owed now). */
+	overdue_amount: MoneyString;
+	overdue_count: number;
 	/** `null` means no threshold is set — deliberately not `"0"`. */
 	threshold: MoneyString | null;
 	periods: CashPositionPeriod[];
@@ -167,6 +186,12 @@ export interface CfoAccruals {
 	received_amount: MoneyString;
 	unposted_invoice_amount: MoneyString;
 	total_accrual: MoneyString;
+	/**
+	 * A COUNT: POs left out of the open-PO and received legs because the ERP
+	 * could not confirm their total at its last sync (decisions §323).
+	 * Non-zero means every leg is a floor — say so beside them.
+	 */
+	unverifiable_po_count: number;
 	/** Ordered by code, the unknown-currency row last. */
 	by_currency: CfoAccrualsByCurrency[];
 }
@@ -251,7 +276,8 @@ export interface CfoUnrealizedFx {
 }
 
 export interface CfoReportingSpendByCurrency {
-	currency: string;
+	/** `null` groups the invoices that record no currency; all of them are unconverted (decisions §473). */
+	currency: string | null;
 	original_amount: MoneyString;
 	reporting_amount: MoneyString;
 	count: number;
@@ -325,6 +351,8 @@ export interface EntityMetrics {
 	 * Render each in its own code, the `null` one bare (decisions §197).
 	 */
 	open_po_by_currency: CurrencyFigure[];
+	/** A COUNT: open POs left out of `open_po_by_currency` for an unverifiable total (decisions §323). */
+	open_po_unverifiable_count: number;
 }
 
 export interface EntityRollupRow extends EntityMetrics {
@@ -427,8 +455,49 @@ export interface ReportingAgingBuckets extends AgingBuckets {
 	unconverted_count: number;
 }
 
+/**
+ * First-run setup facts (`GET /api/dashboard`'s `onboarding`, and
+ * `GET /api/dashboard/onboarding`). Each is derived on read from data another
+ * feature owns — never a stored tick — so a step is done only when the setting
+ * it names is. Field meanings: `backend/app/services/onboarding.py`
+ * (`docs/decisions.md` §315).
+ */
+export interface OnboardingProgress {
+	company: boolean;
+	users: boolean;
+	security: boolean;
+	erp: boolean;
+	vendors: boolean;
+	workflow: boolean;
+	email_intake: boolean;
+}
+
+/** `GET /api/dashboard/onboarding` — admin-only. */
+export interface OnboardingResponse extends OnboardingProgress {
+	organization_has_invoices: boolean;
+}
+
+/**
+ * One currency's share of the dashboard's `overdue_total` / `due_soon_total`:
+ * the FACE sum in `currency`, never converted. `currency` is `null` for
+ * invoices recording no code, rendered without a symbol.
+ */
+export interface DashboardDueByCurrency {
+	currency: string | null;
+	amount: MoneyAmount;
+	count: number;
+}
+
 export interface DashboardData {
 	total_invoices: number;
+	/**
+	 * Whether the ORGANIZATION has any invoice, ignoring the selected entity.
+	 * `total_invoices` is entity-scoped, so it cannot tell a brand-new workspace
+	 * from a brand-new subsidiary of an established one (#635).
+	 */
+	organization_has_invoices: boolean;
+	/** Setup progress — only for an admin on a workspace with no invoices; `null` otherwise. */
+	onboarding: OnboardingProgress | null;
 	total_amount: MoneyAmount;
 	/**
 	 * Currency-aware rollup of the whole invoice book into ONE reporting
@@ -506,6 +575,18 @@ export interface DashboardData {
 		due_date: string | null;
 		is_overdue: boolean;
 	}>;
+	/**
+	 * Open AP (approved and still owed, plus the in-review pipeline) past its
+	 * effective due date, counted over the whole book by the backend's
+	 * `services/open_ap_due` — never derived from `upcoming_payments`, which
+	 * stops at ten rows. The same set `GET /api/invoices?overdue=true` lists.
+	 */
+	overdue_count: number;
+	/** Per currency at FACE value, never summed across currencies. */
+	overdue_total: DashboardDueByCurrency[];
+	/** The same population, due today through seven days out. */
+	due_soon_count: number;
+	due_soon_total: DashboardDueByCurrency[];
 	/**
 	 * Early-payment discount capture — a three-way captured / missed / PENDING
 	 * fold with its own reporting currency and its own `unconverted_count`.

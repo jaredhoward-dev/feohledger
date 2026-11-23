@@ -50,14 +50,13 @@ import base64
 import hashlib
 import hmac
 import re
-import secrets
-import string
 
 import bcrypt
 
-# Minimum constraints for a user-chosen password. The auto-generated
-# temporary password (generate_temp_password) is constructed to satisfy
-# these deterministically — see that function.
+# Minimum constraints for a password. Every password on the platform is
+# chosen by its owner — no flow generates a temporary one any more; invites
+# and admin resets send a set-password link (`api/set_password_links.py`,
+# `docs/decisions.md` §283).
 MIN_LENGTH = 12
 
 #: bcrypt cost for newly written hashes. 12 is what passlib defaulted to and
@@ -325,42 +324,32 @@ async def dummy_verify() -> None:
 
 
 class PasswordError(ValueError):
-    """Raised when a user-supplied password doesn't meet complexity rules."""
+    """Raised when a user-supplied password doesn't meet complexity rules.
 
-
-def generate_temp_password() -> str:
-    """Generate a 16-char temporary password for a new admin user.
-
-    Sent in the welcome email and must be changed on first login (see
-    User.must_change_password). Constructed to ALWAYS satisfy
-    validate_password_complexity — at least one uppercase letter, one lowercase
-    letter, and one digit, length 16 (>= MIN_LENGTH) — so a new user's first
-    login is never bounced by the complexity gate. (The previous
-    `secrets.token_urlsafe(12)` relied on random-byte distribution and could
-    emit a password with no digit or no case mix.) The alphabet is alphanumeric,
-    a subset of the URL-safe set, so the password stays safe in the welcome URL.
+    Carries the rule it broke as a stable ``code`` (plus ``params``) so the
+    routers answer with ``api/refusals.password_refusal`` — a coded refusal
+    the client localizes — rather than this English sentence.
     """
-    alphabet = string.ascii_letters + string.digits
-    # Seed one character of each required class so complexity is guaranteed,
-    # fill the rest from the full alphanumeric alphabet, then shuffle so the
-    # seeded positions aren't predictable.
-    chars = [
-        secrets.choice(string.ascii_uppercase),
-        secrets.choice(string.ascii_lowercase),
-        secrets.choice(string.digits),
-        *(secrets.choice(alphabet) for _ in range(13)),
-    ]
-    secrets.SystemRandom().shuffle(chars)
-    return "".join(chars)
+
+    def __init__(self, code: str, message: str, **params: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
 
 
 def validate_password_complexity(password: str) -> None:
     """Enforce minimum complexity for user-chosen passwords. Raises PasswordError."""
     if len(password) < MIN_LENGTH:
-        raise PasswordError(f"Password must be at least {MIN_LENGTH} characters.")
+        raise PasswordError(
+            "password_too_short",
+            f"Password must be at least {MIN_LENGTH} characters.",
+            min_length=MIN_LENGTH,
+        )
     if not _UPPER.search(password):
-        raise PasswordError("Password must contain an uppercase letter.")
+        raise PasswordError(
+            "password_needs_uppercase", "Password must contain an uppercase letter."
+        )
     if not _LOWER.search(password):
-        raise PasswordError("Password must contain a lowercase letter.")
+        raise PasswordError("password_needs_lowercase", "Password must contain a lowercase letter.")
     if not _DIGIT.search(password):
-        raise PasswordError("Password must contain a digit.")
+        raise PasswordError("password_needs_digit", "Password must contain a digit.")

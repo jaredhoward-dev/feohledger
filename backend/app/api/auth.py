@@ -1,11 +1,11 @@
 """Auth endpoints — login (with optional MFA challenge), MFA enroll/verify, logout, profile."""
 
-import asyncio
 import json
 import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, NoReturn
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
@@ -18,9 +18,16 @@ from app.api.deps import (
     get_current_user,
 )
 from app.api.permissions import effective_permissions
-from app.api.refusals import MFA_CODE_INVALID_DETAIL, coded_refusal
+from app.api.refusals import (
+    MFA_CHALLENGE_INVALID_DETAIL,
+    MFA_CODE_INVALID_DETAIL,
+    MFA_EMAIL_CODE_INVALID_DETAIL,
+    PASSKEY_REGISTRATION_FAILED_DETAIL,
+    coded_refusal,
+    password_refusal,
+)
 from app.config import settings
-from app.database import get_control_db
+from app.database import control_session_factory, get_control_db
 from app.models.organization import Organization
 from app.models.user import User
 from app.models.webauthn_credential import WebAuthnCredential
@@ -87,6 +94,8 @@ from app.services.session_management import (
 )
 from app.services.sso import is_sso_only, sso_only_requested
 from app.services.sso_plan import plan_scoped_settings
+from app.tenant import resolve_tenant_slug_by_custom_domain
+from app.utils.detached_tasks import spawn_detached
 from app.utils.emails import email_matches, exact_email_first, normalize_email
 from app.utils.passwords import (
     PasswordError,
@@ -95,32 +104,11 @@ from app.utils.passwords import (
     validate_password_complexity,
     verify_password,
 )
-from app.utils.tenant_urls import password_reset_url
+from app.utils.tenant_urls import password_reset_url, sign_in_url
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-# Strong references to in-flight background tasks (the forgot-password email
-# send) — without this the only reference is the local in `_spawn_background`,
-# and the event loop's own registry is weak, so the task could be
-# garbage-collected mid-send. Mirrors `services/post_commit.py`'s `_tasks`.
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_background(coro) -> None:
-    """Fire-and-forget a coroutine, keeping a strong ref until it completes.
-
-    Used for the forgot-password email so the HTTP response returns before
-    the send completes — awaiting it inline would make a match's response
-    measurably slower than a non-match's (DB lookup + Redis write + an
-    outbound send vs. just a DB lookup), which is exactly the enumeration
-    side-channel the equalized response body is trying to close.
-    """
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -346,6 +334,17 @@ async def _send_email_otp(user: User, code: str) -> None:
     await adapter.send(msg)
 
 
+def _challenge_refused(exc: ValueError) -> HTTPException:
+    """The 401 for an MFA challenge token that cannot be redeemed.
+
+    One coded refusal whatever ``mfa.decode_challenge_token`` objected to
+    (expired, spent, malformed, wrong type): the next step is the same — sign in
+    again — and the reason stays in the server log, by exception class.
+    """
+    logger.info("MFA challenge refused: %s", type(exc).__name__)
+    return HTTPException(status_code=401, detail=MFA_CHALLENGE_INVALID_DETAIL)
+
+
 def _client_ip(request: Request | None) -> str | None:
     # Shared resolver so audit rows agree with the rate limiter about who
     # the client is behind a trusted proxy (Caddy / ALB) — raw
@@ -406,6 +405,87 @@ async def _reject_login(
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
 
+#: Signing in on one workspace's page with an account that belongs to another.
+WRONG_WORKSPACE = "wrong_workspace"
+
+#: Cap on the `attempted_workspace` the wrong-workspace audit row stores. A real
+#: slug is at most 30 characters (`utils/slug.SLUG_PATTERN`) and a custom domain
+#: resolves to one; the cap only stops an arbitrary `X-Tenant-Slug` header from
+#: bloating the row.
+_ATTEMPTED_WORKSPACE_MAX = 63
+
+
+async def _refuse_other_workspace(
+    db: AsyncSession,
+    org,
+    *,
+    x_tenant_slug: str | None,
+    host: str | None,
+    email: str,
+    ip: str | None,
+) -> None:
+    """403 when the page the sign-in came from belongs to another workspace.
+
+    An email names one account in one organization, and login used to mint that
+    organization's token whichever workspace's page the form was on. The SPA
+    then sent this page's `X-Tenant-Slug` with a token for another org, and
+    `tenant.get_tenant` refused every call — a signed-in screen where nothing
+    loads (seen in production, 2026-10-20: a test-workspace account signed in
+    on `sandbox.feohledger.com`). The page names its workspace by the header,
+    or on a vanity domain by its Host, exactly as `get_tenant_slug` reads it; a
+    request naming none (an API client) is unaffected.
+
+    Checked only after the password verified, so the account's own sign-in
+    link it returns tells nobody anything they could not already learn by
+    signing in.
+    """
+    if org is None:
+        return
+    requested = x_tenant_slug or await resolve_tenant_slug_by_custom_domain(db, host)
+    if not requested or requested == org.slug:
+        return
+    # Audited in the ACCOUNT's workspace only, and with what an auditor needs to
+    # tell a confused user from a stuffer who already holds the password: which
+    # workspace's page it was, and that the password DID verify (a wrong one
+    # never reaches here — it is the ordinary `bad_password` row). The email is
+    # the same field every `auth.login.failure` row already carries.
+    #
+    # The attempted workspace gets no row of its own (decisions §291): it holds
+    # no account here, the event is the account's, and an unknown address
+    # leaves no row anywhere — so a row there ONLY when the password was right
+    # would turn that workspace's audit log into an oracle for "this address
+    # has an account, and someone typed its password on our page".
+    await dispatch_auth_audit(
+        organization_id=org.id,
+        actor_id=None,
+        action="auth.login.failure",
+        details={
+            "email": email,
+            "ip": ip,
+            "reason": WRONG_WORKSPACE,
+            # Header- or Host-derived, so bounded rather than trusted verbatim.
+            "attempted_workspace": requested[:_ATTEMPTED_WORKSPACE_MAX],
+            "password_verified": True,
+        },
+    )
+    url = sign_in_url(org.slug, org.settings, email=email, prefer_custom_domain=True)
+    # The sentence names the workspace by host only: the URL carries the
+    # address as a percent-encoded `?email=`, which is unreadable in prose and
+    # is the link's job (`params.sign_in_url`), not the message's.
+    workspace = urlsplit(url).netloc if url else ""
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=coded_refusal(
+            WRONG_WORKSPACE,
+            f"This account belongs to another workspace, {workspace}. Sign in there instead."
+            if workspace
+            else "This account belongs to a different workspace."
+            " Sign in on that workspace's own page.",
+            sign_in_url=url,
+        ),
+    )
+
+
 @router.post("/login")
 async def login(
     body: LoginRequest,
@@ -417,6 +497,9 @@ async def login(
     # inserted before `db` silently rebinds it. FastAPI ignores order. The same
     # rule applies to every other `host` parameter in this file.
     host: Annotated[str | None, Header()] = None,
+    # The workspace the sign-in page is on (`_refuse_other_workspace`). Last
+    # for the same positional-call reason as `host`.
+    x_tenant_slug: Annotated[str | None, Header()] = None,
 ):
     """Password login. Returns either a final access token or — if MFA is in
     play — a short-lived challenge token the browser trades for one."""
@@ -478,6 +561,9 @@ async def login(
     await clear_auth_failures("auth_login", identity)
 
     org = await _load_user_org(db, user.organization_id)
+    await _refuse_other_workspace(
+        db, org, x_tenant_slug=x_tenant_slug, host=host, email=normalize_email(body.email), ip=ip
+    )
 
     # SSO-only enforcement. When the tenant requires SSO, password login is
     # closed even for users who still carry a password hash — checked after the
@@ -612,14 +698,14 @@ def _password_reset_url(org: Organization, token: str) -> str | None:
     return password_reset_url(org.slug, org.settings, token)
 
 
-async def _send_password_reset_email(user: User, reset_url: str) -> None:
-    """Best-effort — exceptions are swallowed here (this runs detached via
-    `_spawn_background`, so nothing is left to propagate to)."""
-    msg = EmailMessage(
-        to=user.email,
+def _password_reset_message(*, to: str, full_name: str, reset_url: str) -> EmailMessage:
+    """The forgot-password email: the link is declared, so it renders as the
+    button, and the preheader never carries it."""
+    return EmailMessage(
+        to=to,
         subject="Reset your FeohLedger password",
         body_text=(
-            f"Hi {user.full_name},\n\n"
+            f"Hi {full_name},\n\n"
             "We received a request to reset your FeohLedger password. If you "
             "made this request, click the link below to choose a new one:\n\n"
             f"  {reset_url}\n\n"
@@ -631,10 +717,51 @@ async def _send_password_reset_email(user: User, reset_url: str) -> None:
         links=(reset_url,),
         preheader="Use the link in this email to choose a new password.",
     )
+
+
+async def _issue_and_send_reset(
+    *, user_id: uuid.UUID, org_id: uuid.UUID, to: str, full_name: str, ip: str | None
+) -> None:
+    """Mint, mail and audit one account's forgot-password link — detached.
+
+    Everything only a MATCHING address does lives here, off the response path
+    (the supplier route's shape, `docs/decisions.md` §451): the org lookup, the
+    token mint (a Redis write), the send and the audit row. Awaiting any of
+    them in the route would make a known address measurably slower than an
+    unknown one. Plain values, not the ORM row, and its own control-plane
+    session: the request's session is closed by the time this runs. Failures
+    are logged by user id only — never the address or the link.
+    """
+    async with control_session_factory() as db:
+        org = await _load_user_org(db, org_id)
+    if org is None:
+        return
     try:
-        await get_email_adapter().send(msg)
+        token = await password_reset.issue_reset_token(user_id)
     except Exception:  # noqa: BLE001
-        logger.exception("Password reset email failed for user %s", user.id)
+        logger.exception("Forgot-password token not minted (user=%s)", user_id)
+        return
+    reset_url = _password_reset_url(org, token)
+    if reset_url is None:
+        logger.warning(
+            "Password reset requested but no tenant base URL is configured "
+            "(org=%s) — no email sent",
+            org.id,
+        )
+    else:
+        msg = _password_reset_message(to=to, full_name=full_name, reset_url=reset_url)
+        try:
+            await get_email_adapter().send(msg)
+        except Exception as exc:  # noqa: BLE001
+            # The class only: an SMTP refusal's message can quote the recipient.
+            logger.error("Password reset email failed (user=%s): %s", user_id, type(exc).__name__)
+    await dispatch_auth_audit(
+        organization_id=org_id,
+        actor_id=None,
+        action="auth.password_reset.requested",
+        entity_id=user_id,
+        details={"ip": ip},
+    )
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)
@@ -651,9 +778,10 @@ async def forgot_password(
     what picks the tenant subdomain the reset link points at.
 
     Always returns the same generic response regardless of whether `email`
-    matched a real account, and the outbound email (the only place a match is
-    observable) is dispatched on a detached background task rather than
-    awaited — an enumeration oracle here is exactly the class of leak
+    matched a real account, and every step only a match takes (org lookup,
+    token mint, send, audit) runs on a detached task rather than being
+    awaited, so neither the body nor the response time says whether the
+    address exists — an enumeration oracle here is exactly the class of leak
     `docs/authentication.md`'s brute-force section already guards against on
     `/auth/login` and `/auth/mfa/verify`.
     """
@@ -676,24 +804,16 @@ async def forgot_password(
     user = await _user_by_email(db, body.email)
 
     if user is not None and user.is_active:
-        org = await _load_user_org(db, user.organization_id)
-        if org is not None:
-            reset_url = _password_reset_url(org, await password_reset.issue_reset_token(user.id))
-            if reset_url is not None:
-                _spawn_background(_send_password_reset_email(user, reset_url))
-            else:
-                logger.warning(
-                    "Password reset requested but no tenant base URL is configured "
-                    "(org=%s) — no email sent",
-                    org.id,
-                )
-            await dispatch_auth_audit(
-                organization_id=user.organization_id,
-                actor_id=None,
-                action="auth.password_reset.requested",
-                entity_id=user.id,
-                details={"ip": _client_ip(request)},
-            )
+        spawn_detached(
+            _issue_and_send_reset(
+                user_id=user.id,
+                org_id=user.organization_id,
+                to=user.email,
+                full_name=user.full_name,
+                ip=_client_ip(request),
+            ),
+            name="auth.forgot_password",
+        )
 
     return ForgotPasswordResponse()
 
@@ -746,7 +866,7 @@ async def reset_password(
     try:
         validate_password_complexity(body.new_password)
     except PasswordError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=password_refusal(exc)) from exc
 
     user_id = await password_reset.consume_reset_token(body.token)
     if user_id is None:
@@ -794,7 +914,7 @@ async def request_email_otp(
     try:
         claims = await mfa.decode_challenge_token(body.challenge_token)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise _challenge_refused(exc) from exc
 
     user = (await db.execute(select(User).where(User.id == claims.subject_id))).scalar_one_or_none()
     if not user:
@@ -835,7 +955,7 @@ async def verify_mfa(
     try:
         claims = await mfa.decode_challenge_token(body.challenge_token)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise _challenge_refused(exc) from exc
 
     user = (await db.execute(select(User).where(User.id == claims.subject_id))).scalar_one_or_none()
     if not user or not user.is_active:
@@ -868,7 +988,7 @@ async def verify_mfa(
                 entity_id=user.id,
                 details={"method": "totp", "ip": ip},
             )
-            raise HTTPException(status_code=401, detail="Invalid code")
+            raise HTTPException(status_code=401, detail=MFA_CODE_INVALID_DETAIL)
     elif body.method == "email":
         if not await mfa.verify_email_otp(user.id, body.code):
             await record_auth_failure(
@@ -881,7 +1001,7 @@ async def verify_mfa(
                 entity_id=user.id,
                 details={"method": "email", "ip": ip},
             )
-            raise HTTPException(status_code=401, detail="Invalid or expired code")
+            raise HTTPException(status_code=401, detail=MFA_EMAIL_CODE_INVALID_DETAIL)
 
     await clear_auth_failures("auth_mfa", mfa_identity)
 
@@ -1496,7 +1616,8 @@ async def passkey_register_finish(
             rp=rp,
         )
     except webauthn.WebAuthnError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("Passkey registration refused: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail=PASSKEY_REGISTRATION_FAILED_DETAIL) from exc
 
     cred = WebAuthnCredential(
         user_id=user.id,
@@ -1629,7 +1750,7 @@ async def passkey_authenticate_start(
     try:
         claims = await mfa.decode_challenge_token(body.challenge_token)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise _challenge_refused(exc) from exc
 
     creds = await _user_passkeys(db, claims.subject_id)
     if not creds:
@@ -1726,7 +1847,7 @@ async def passkey_authenticate_finish(
     try:
         claims = await mfa.decode_challenge_token(body.challenge_token)
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise _challenge_refused(exc) from exc
 
     user = (await db.execute(select(User).where(User.id == claims.subject_id))).scalar_one_or_none()
     if not user or not user.is_active:
@@ -1945,7 +2066,7 @@ async def _apply_new_password(user: User, new_password: str) -> bool:
     try:
         validate_password_complexity(new_password)
     except PasswordError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=password_refusal(exc)) from exc
     was_forced = bool(user.must_change_password)
     user.hashed_password = await hash_password(new_password)
     user.must_change_password = False

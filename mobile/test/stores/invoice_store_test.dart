@@ -57,7 +57,7 @@ void main() {
       expect(store.invoices, hasLength(1));
       expect(store.invoices.first.id, '1');
       expect(store.fromCache, isFalse);
-      expect(store.error, isNull);
+      expect(store.loadError, isNull);
       expect(store.loading, isFalse);
     });
 
@@ -88,7 +88,7 @@ void main() {
 
       await store.fetch();
 
-      expect(store.error, isNotNull);
+      expect(store.loadError, isNotNull);
       expect(store.fromCache, isFalse);
     });
   });
@@ -236,6 +236,110 @@ void main() {
       expect(params.containsKey('vendor'), isFalse);
       expect(params.containsKey('amount_min'), isFalse);
       expect(params.containsKey('due_date_from'), isFalse);
+      // Overdue is opt-in: the plain list never sends it.
+      expect(params.containsKey('overdue'), isFalse);
+    });
+  });
+
+  group('overdue quick view', () {
+    /// Records every list request's query parameters, in order.
+    List<Map<String, String>> recordRequests() {
+      final sent = <Map<String, String>>[];
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          sent.add(req.url.queryParameters);
+          return _list([]);
+        }),
+      );
+      return sent;
+    }
+
+    test('showOverdue asks the server for the overdue set and clears every '
+        'other filter, so the list matches the dashboard figure', () async {
+      final sent = recordRequests();
+      store.setStatusFilter('approved');
+      store.setSearch('acme');
+      store.setFilters(const InvoiceSearchFilters(vendor: 'Acme'));
+      await _waitUntil(() => sent.length == 3);
+      final clearsBefore = store.searchClearedExternally;
+
+      store.showOverdue();
+      await _waitUntil(() => sent.length == 4);
+
+      expect(store.overdueOnly, isTrue);
+      expect(store.statusFilter, isNull);
+      expect(store.searchQuery, isNull);
+      expect(store.filters.isEmpty, isTrue);
+      expect(store.isFiltered, isTrue);
+      // The screen's search box clears once, on this signal.
+      expect(store.searchClearedExternally, clearsBefore + 1);
+      final params = sent.last;
+      expect(params['overdue'], 'true');
+      expect(params.containsKey('status'), isFalse);
+      expect(params.containsKey('search'), isFalse);
+      expect(params.containsKey('vendor'), isFalse);
+    });
+
+    test(
+      'the Overdue chip keeps the search; a status chip leaves the view',
+      () async {
+        final sent = recordRequests();
+        store.setSearch('acme');
+        await _waitUntil(() => sent.length == 1);
+        final clearsBefore = store.searchClearedExternally;
+
+        store.setOverdueOnly();
+        await _waitUntil(() => sent.length == 2);
+        expect(sent.last['overdue'], 'true');
+        expect(sent.last['search'], 'acme');
+        expect(store.searchClearedExternally, clearsBefore);
+
+        store.setStatusFilter('paid');
+        await _waitUntil(() => sent.length == 3);
+        expect(store.overdueOnly, isFalse);
+        expect(sent.last['status'], 'paid');
+        expect(sent.last.containsKey('overdue'), isFalse);
+      },
+    );
+
+    test('clearAllFilters and reset leave the overdue view', () async {
+      final sent = recordRequests();
+      store.showOverdue();
+      await _waitUntil(() => sent.length == 1);
+
+      store.clearAllFilters();
+      await _waitUntil(() => sent.length == 2);
+      expect(store.overdueOnly, isFalse);
+      expect(sent.last.containsKey('overdue'), isFalse);
+
+      store.showOverdue();
+      await _waitUntil(() => sent.length == 3);
+      store.reset();
+      expect(store.overdueOnly, isFalse);
+      expect(store.isFiltered, isFalse);
+    });
+
+    test('the overdue view caches apart from the unfiltered list', () async {
+      ApiClient().debugConfigure(
+        client: MockClient(
+          (req) async => req.url.queryParameters['overdue'] == 'true'
+              ? _list([_invoiceJson('late', status: 'approved')])
+              : _list([_invoiceJson('1'), _invoiceJson('2')]),
+        ),
+      );
+      await store.fetch();
+      store.showOverdue();
+      // Awaited, so the overdue page's cache write has landed.
+      await store.fetch();
+      expect(store.invoices.map((i) => i.id), ['late']);
+
+      // Offline: the overdue view must not fall back to the all-invoices page.
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => throw Exception('offline')),
+      );
+      await store.fetch();
+      expect(store.fromCache, isTrue);
+      expect(store.invoices.map((i) => i.id), ['late']);
     });
   });
 
@@ -273,7 +377,7 @@ void main() {
       final ok = await store.approve('1');
 
       expect(ok, isFalse);
-      expect(store.error, isNotNull);
+      expect(store.actionError, isNotNull);
     });
 
     test('approve sends the version the screen showed', () async {
@@ -400,7 +504,7 @@ void main() {
       final updated = await store.update('1', {'vendor': 'X'});
 
       expect(updated, isNull);
-      expect(store.error, isNotNull);
+      expect(store.actionError, isNotNull);
     });
 
     test('records the server\'s detail sentence, not the exception form',
@@ -420,7 +524,7 @@ void main() {
       final updated = await store.update('1', {'gl_account': '9999'});
 
       expect(updated, isNull);
-      expect(store.error, "GL account '9999' is retired");
+      expect(store.actionError, "GL account '9999' is retired");
     });
   });
 
@@ -551,7 +655,9 @@ void main() {
 
       expect(result, isNotNull);
       expect(result!.count, 2);
-      expect(result.skipped, ['3']);
+      expect(result.skipped.map((s) => s.id), ['3']);
+      expect(result.skipped.single.code, isNull,
+          reason: 'bulk delete answers bare ids');
       expect((sentBody!['ids'] as List).toSet(), {'1', '2'});
       expect(store.selectionMode, isFalse, reason: 'exits selection on success');
       expect(listCalls, 1, reason: 'success triggers a refetch');
@@ -584,6 +690,77 @@ void main() {
       expect(sentBody!['ids'], ['1']);
       expect(sentBody!.containsKey('reason'), isFalse,
           reason: 'no reason key unless one was given');
+    });
+
+    test('a bulk status skip keeps its code, params and reason', () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (req.method == 'POST' && req.url.path.endsWith('/bulk/status')) {
+            return http.Response(
+              jsonEncode({
+                'updated': 0,
+                'skipped': [
+                  {
+                    'id': '1',
+                    'reason': 'invoice is not awaiting review',
+                    'code': 'invoice_not_in_review',
+                    'params': {'status': 'new'},
+                  },
+                  {'id': '2', 'reason': 'transition was refused'},
+                ],
+              }),
+              200,
+              headers: {'content-type': 'application/json'},
+            );
+          }
+          return _list([]);
+        }),
+      );
+      store
+        ..reset()
+        ..enterSelectionMode('1')
+        ..toggleSelected('2');
+
+      final result = await store.bulkStatusSelected('rejected', reason: 'x');
+
+      final coded = result!.skipped.first;
+      expect(coded.id, '1');
+      expect(coded.code, 'invoice_not_in_review');
+      expect(coded.params, {'status': 'new'});
+      expect(coded.refusal, {
+        'code': 'invoice_not_in_review',
+        'message': 'invoice is not awaiting review',
+        'params': {'status': 'new'},
+      });
+      final plain = result.skipped.last;
+      expect(plain.id, '2');
+      expect(plain.code, isNull);
+      expect(plain.refusal, isNull);
+      expect(plain.reason, 'transition was refused');
+    });
+
+    test('selectionAwaitingReview holds only when every selected row is in '
+        'review', () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => _list([
+              _invoiceJson('1', status: 'ready_for_review'),
+              _invoiceJson('2', status: 'ready_for_review'),
+              _invoiceJson('3', status: 'new'),
+            ])),
+      );
+      store.reset();
+      await store.fetch();
+      expect(store.selectionAwaitingReview, isFalse, reason: 'nothing selected');
+      store
+        ..enterSelectionMode('1')
+        ..toggleSelected('2');
+      expect(store.selectionAwaitingReview, isTrue);
+      store.toggleSelected('3');
+      expect(store.selectionAwaitingReview, isFalse);
+      store
+        ..toggleSelected('3')
+        ..toggleSelected('9'); // not in the loaded list
+      expect(store.selectionAwaitingReview, isFalse);
     });
 
     test('a bulk approval binds each selected row to the version listed',
@@ -674,7 +851,7 @@ void main() {
       final result = await store.bulkDeleteSelected();
 
       expect(result, isNull);
-      expect(store.error, isNotNull);
+      expect(store.actionError, isNotNull);
       expect(store.selectionMode, isTrue,
           reason: 'a failed bulk op leaves the selection intact to retry');
     });
@@ -763,7 +940,7 @@ void main() {
       final result = await store.exportSelected('csv');
 
       expect(result, isNull);
-      expect(store.error, isNotNull);
+      expect(store.actionError, isNotNull);
     });
   });
 
@@ -787,7 +964,7 @@ void main() {
 
       expect(sentStatus, 'ready_for_review');
       expect(store.pending.map((i) => i.id), ['1']);
-      expect(store.pendingError, isNull);
+      expect(store.pendingLoadError, isNull);
       expect(store.pendingLoading, isFalse);
     });
 
@@ -835,7 +1012,7 @@ void main() {
 
       expect(store.pending.map((i) => i.id), ['1']);
       expect(store.pendingFromCache, isTrue);
-      expect(store.pendingError, isNull);
+      expect(store.pendingLoadError, isNull);
     });
 
     test('surfaces an error rather than an empty queue when nothing is cached',
@@ -847,7 +1024,7 @@ void main() {
       await store.fetchPending();
 
       // An empty approvals list and an unreachable one must not look alike.
-      expect(store.pendingError, isNotNull);
+      expect(store.pendingLoadError, isNotNull);
       expect(store.pending, isEmpty);
     });
 
@@ -899,6 +1076,196 @@ void main() {
       await slow;
 
       expect(store.pending.map((i) => i.id), ['2']);
+    });
+  });
+
+  // Every list endpoint pages (20 rows by default). The store used to keep the
+  // first response and drop `total`, so 57 waiting invoices read as 20 and
+  // the other 37 could not be reached.
+  group('paging', () {
+    http.Response page(int number, int total, {int size = 20}) {
+      final first = (number - 1) * 20;
+      final count = (total - first).clamp(0, size).toInt();
+      return http.Response(
+        jsonEncode({
+          'items': [
+            for (var i = first; i < first + count; i++)
+              _invoiceJson('$i', status: 'ready_for_review'),
+          ],
+          'total': total,
+          'page': number,
+          'page_size': 20,
+        }),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    }
+
+    int pageOf(http.BaseRequest req) =>
+        int.parse(req.url.queryParameters['page'] ?? '1');
+
+    test('two pages load 40 rows and keep the server total', () async {
+      final asked = <int>[];
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          asked.add(pageOf(req));
+          return page(pageOf(req), 57);
+        }),
+      );
+
+      await store.fetch();
+      expect(store.invoices, hasLength(20));
+      expect(store.total, 57);
+      expect(store.hasMore, isTrue);
+
+      await store.loadMore();
+
+      expect(asked, [1, 2]);
+      expect(store.invoices, hasLength(40));
+      expect(store.invoices.map((i) => i.id).toSet(), hasLength(40));
+      expect(store.invoices.last.id, '39');
+      expect(store.total, 57);
+      expect(store.page, 2);
+      expect(store.hasMore, isTrue);
+    });
+
+    test('stops offering a next page once every row is loaded', () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => page(pageOf(req), 25)),
+      );
+
+      await store.fetch();
+      await store.loadMore();
+
+      expect(store.invoices, hasLength(25));
+      expect(store.hasMore, isFalse);
+
+      // A further call is a no-op, not a request for an empty page 3.
+      var calls = 0;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          calls++;
+          return page(pageOf(req), 25);
+        }),
+      );
+      await store.loadMore();
+      expect(calls, 0);
+    });
+
+    test('a row repeated by a later page is not listed twice', () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (pageOf(req) == 1) return page(1, 30);
+          // Another user's action shifted the list: page 2 starts one row
+          // early and repeats row 19.
+          return http.Response(
+            jsonEncode({
+              'items': [
+                for (var i = 19; i < 30; i++)
+                  _invoiceJson('$i', status: 'ready_for_review'),
+              ],
+              'total': 30,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }),
+      );
+
+      await store.fetch();
+      await store.loadMore();
+
+      expect(store.invoices, hasLength(30));
+      expect(store.invoices.where((i) => i.id == '19'), hasLength(1));
+    });
+
+    test('a failed next page keeps the rows live: loadMoreError, not loadError',
+        () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (pageOf(req) == 2) return http.Response('boom', 500);
+          return page(1, 57);
+        }),
+      );
+
+      await store.fetch();
+      await store.loadMore();
+
+      expect(store.invoices, hasLength(20));
+      expect(store.loadMoreError, isNotNull);
+      expect(store.loadError, isNull);
+      expect(store.hasMore, isTrue, reason: 'Load more retries the page');
+      expect(store.loadingMore, isFalse);
+    });
+
+    test('a refetch discards a next page still in flight', () async {
+      final gate = Completer<http.Response>();
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (pageOf(req) == 2) return gate.future;
+          return page(1, 57);
+        }),
+      );
+
+      await store.fetch();
+      final more = store.loadMore();
+      await store.fetch(); // e.g. pull-to-refresh while page 2 loads
+      gate.complete(page(2, 57));
+      await more;
+
+      expect(store.invoices, hasLength(20));
+      expect(store.page, 1);
+      expect(store.loadingMore, isFalse);
+    });
+
+    test('the next page carries the same filters as the first', () async {
+      final statuses = <String?>[];
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          statuses.add(req.url.queryParameters['status']);
+          return page(pageOf(req), 57);
+        }),
+      );
+
+      store.setStatusFilter('ready_for_review');
+      await _waitUntil(() => store.invoices.isNotEmpty && !store.loading);
+      await store.loadMore();
+
+      expect(statuses, ['ready_for_review', 'ready_for_review']);
+    });
+
+    test('the approvals queue counts the server total and pages to 40',
+        () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => page(pageOf(req), 57)),
+      );
+
+      await store.fetchPending();
+      expect(store.pending, hasLength(20));
+      expect(store.pendingTotal, 57);
+      expect(store.pendingHasMore, isTrue);
+
+      await store.loadMorePending();
+
+      expect(store.pending, hasLength(40));
+      expect(store.pendingTotal, 57);
+      expect(store.pendingHasMore, isTrue);
+    });
+
+    test('cached rows are not paged', () async {
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => page(pageOf(req), 57)),
+      );
+      await store.fetch();
+
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => throw Exception('offline')),
+      );
+      await store.fetch();
+
+      expect(store.fromCache, isTrue);
+      expect(store.invoices, hasLength(20));
+      expect(store.hasMore, isFalse);
     });
   });
 }

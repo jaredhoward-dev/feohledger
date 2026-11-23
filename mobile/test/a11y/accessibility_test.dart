@@ -1,18 +1,22 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart' show SemanticsAction;
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
+import 'package:feohledger_mobile/l10n/enum_labels.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/models/audit_entry.dart';
 import 'package:feohledger_mobile/models/exception.dart';
 import 'package:feohledger_mobile/models/inspection.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/models/notification.dart';
+import 'package:feohledger_mobile/models/payment_queue.dart';
 import 'package:feohledger_mobile/models/vendor.dart';
 import 'package:feohledger_mobile/screens/adaptive_screen.dart';
 import 'package:feohledger_mobile/screens/admin_users_screen.dart';
@@ -24,6 +28,7 @@ import 'package:feohledger_mobile/screens/exception_detail_screen.dart';
 import 'package:feohledger_mobile/screens/exceptions_screen.dart';
 import 'package:feohledger_mobile/screens/inspection_detail_screen.dart';
 import 'package:feohledger_mobile/screens/inspections_screen.dart';
+import 'package:feohledger_mobile/screens/invoice_detail_screen.dart';
 import 'package:feohledger_mobile/screens/invoices_screen.dart';
 import 'package:feohledger_mobile/screens/login_screen.dart';
 import 'package:feohledger_mobile/screens/notifications_screen.dart';
@@ -55,9 +60,12 @@ import 'package:feohledger_mobile/widgets/kpi_card.dart';
 import 'package:feohledger_mobile/widgets/notification_bell.dart';
 import 'package:feohledger_mobile/widgets/notification_list_tile.dart';
 import 'package:feohledger_mobile/widgets/partial_conversion_note.dart';
+import 'package:feohledger_mobile/widgets/record_payment_dialog.dart';
 import 'package:feohledger_mobile/widgets/status_badge.dart';
 import 'package:feohledger_mobile/widgets/vendor_list_tile.dart';
 import 'package:feohledger_mobile/widgets/vendor_status_badge.dart';
+
+final _en = lookupAppLocalizations(const Locale('en'));
 
 // Regression guard mirroring the web axe pass: every key surface must clear
 // Flutter's built-in accessibility guidelines — minimum tap-target size
@@ -65,7 +73,7 @@ import 'package:feohledger_mobile/widgets/vendor_status_badge.dart';
 // (WCAG 1.4.3). Run with `flutter test test/a11y/`.
 
 Widget _host(Widget child) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: Scaffold(body: child),
     );
@@ -74,7 +82,7 @@ Widget _host(Widget child) => MaterialApp(
 /// Scaffold), for full screens that bring their own. Carries the localization
 /// delegates so a localized screen's `AppLocalizations.of(context)` resolves.
 Widget _screenHost(Widget screen) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: screen,
     );
@@ -271,6 +279,46 @@ void main() {
       expect(find.bySemanticsLabel('For Review: 7, 3 overdue'), findsOneWidget);
       handle.dispose();
     });
+
+    testWidgets('two cards side by side are two announcements, not one',
+        (tester) async {
+      // The dashboard lays KPI cards out in Rows inside a ListView. A
+      // label-only `Semantics` is not a node boundary, so the two siblings
+      // merged into the list item's node, labelled with both cards joined by
+      // a newline: a screen reader read "For Review: 7 / Upcoming: 2, $2K" as
+      // one item. Outside a list item the bug does not show, hence the
+      // ListView.
+      final handle = tester.ensureSemantics();
+      await tester.pumpWidget(_host(
+        ListView(
+          children: const [
+            Row(
+          children: [
+            Expanded(
+              child: KpiCard(
+                title: 'For Review',
+                value: '7',
+                icon: Icons.rate_review,
+              ),
+            ),
+            Expanded(
+              child: KpiCard(
+                title: 'Upcoming',
+                value: '2',
+                subtitle: r'$2K',
+                icon: Icons.schedule,
+              ),
+            ),
+          ],
+            ),
+          ],
+        ),
+      ));
+
+      expect(find.bySemanticsLabel('For Review: 7'), findsOneWidget);
+      expect(find.bySemanticsLabel(r'Upcoming: 2, $2K'), findsOneWidget);
+      handle.dispose();
+    });
   });
 
   group('PartialConversionNote', () {
@@ -362,7 +410,9 @@ void main() {
         await tester.pumpWidget(_host(VendorStatusBadge(status: status)));
         await expectLater(tester, meetsGuideline(textContrastGuideline));
         expect(
-          find.bySemanticsLabel('Status: ${status.label}'),
+          find.bySemanticsLabel(
+            'Status: ${vendorStatusLabel(_en, status)}',
+          ),
           findsOneWidget,
         );
         handle.dispose();
@@ -418,6 +468,7 @@ void main() {
           currency: 'USD',
           status: InvoiceStatus.readyForReview,
           createdAt: DateTime(2026, 1, 1),
+          financiallyLocked: false,
         );
 
     testWidgets('meets tap-target, label and contrast guidelines',
@@ -447,6 +498,7 @@ void main() {
           currency: 'USD',
           status: InvoiceStatus.approved,
           createdAt: DateTime(2026, 1, 1),
+          financiallyLocked: true,
         ),
       )));
       await tester.pump();
@@ -527,6 +579,171 @@ void main() {
       await expectLater(tester, meetsGuideline(textContrastGuideline));
       handle.dispose();
     });
+  });
+
+  // "Recall approval" on the detail screen (backend decisions §374): the
+  // bottom-bar action an approved invoice offers from the server's
+  // `recall_approval` verdict, enabled, and disabled beside its refusal.
+  group('InvoiceDetailScreen recall action', () {
+    setUpAll(() async {
+      OfflineStore.instance.debugUseMemory();
+    });
+
+    setUp(() async {
+      InvoiceStore.instance.reset();
+      FlutterSecureStorage.setMockInitialValues({});
+      await OfflineStore.instance.clear();
+      ApiClient().debugConfigure();
+    });
+
+    http.Response json(Object body) => http.Response(jsonEncode(body), 200,
+        headers: {'content-type': 'application/json'});
+
+    for (final (name, verdict) in [
+      ('allowed', null),
+      (
+        'refused with its reason',
+        {
+          'code': 'invoice_recall_claimed',
+          'message': 'server english',
+          'params': {'claim': 'payment'},
+        },
+      ),
+    ]) {
+      testWidgets('meets tap-target, label and contrast guidelines ($name)',
+          (tester) async {
+        tester.view.physicalSize = const Size(1200, 2400);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        final handle = tester.ensureSemantics();
+        ApiClient().debugConfigure(
+          client: MockClient((req) async {
+            final path = req.url.path;
+            if (path == '/api/auth/login') {
+              return json({'access_token': 'tok'});
+            }
+            if (path.endsWith('/auth/me')) {
+              return json({
+                'id': 'u1',
+                'email': 'demo@acme.com',
+                'full_name': 'Demo User',
+                'organization_id': 'org1',
+                'roles': ['ap_manager'],
+              });
+            }
+            if (path.endsWith('/review-actions')) {
+              return json({'recall_approval': verdict});
+            }
+            if (path.endsWith('/audit-log')) return json(<Object>[]);
+            if (path == '/api/invoices/1') {
+              return json({
+                ..._invoiceJson('1'),
+                'status': 'approved',
+                'approved_by': 'Some Approver',
+              });
+            }
+            return http.Response('not found', 404);
+          }),
+        );
+        await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
+
+        await tester.pumpWidget(
+          _screenHost(const InvoiceDetailScreen(invoiceId: '1')),
+        );
+        await _pumpUntil(tester, find.text('Recall approval'));
+        expect(find.text('Recall approval'), findsOneWidget);
+
+        await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(textContrastGuideline));
+        handle.dispose();
+      });
+    }
+  });
+
+  group('InvoiceDetailScreen review actions', () {
+    setUpAll(() async {
+      OfflineStore.instance.debugUseMemory();
+    });
+
+    setUp(() async {
+      InvoiceStore.instance.reset();
+      FlutterSecureStorage.setMockInitialValues({});
+      await OfflineStore.instance.clear();
+      ApiClient().debugConfigure();
+    });
+
+    http.Response json(Object body) => http.Response(jsonEncode(body), 200,
+        headers: {'content-type': 'application/json'});
+
+    // An invoice in review, Approve allowed (the filled green button with its
+    // white label) and Approve refused (disabled, its reason beside it, and
+    // Reject still offered). Both clear contrast: the full-saturation green
+    // was 2.78:1 under the white label.
+    for (final (name, approve) in [
+      ('allowed', null),
+      (
+        'refused with its reason',
+        {
+          'code': 'approval_segregation',
+          'message': 'server english',
+          'params': <String, dynamic>{},
+        },
+      ),
+    ]) {
+      testWidgets('meets tap-target, label and contrast guidelines ($name)',
+          (tester) async {
+        tester.view.physicalSize = const Size(1200, 2400);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        final handle = tester.ensureSemantics();
+        ApiClient().debugConfigure(
+          client: MockClient((req) async {
+            final path = req.url.path;
+            if (path == '/api/auth/login') {
+              return json({'access_token': 'tok'});
+            }
+            if (path.endsWith('/auth/me')) {
+              return json({
+                'id': 'u1',
+                'email': 'demo@acme.com',
+                'full_name': 'Demo User',
+                'organization_id': 'org1',
+                'roles': ['ap_manager'],
+              });
+            }
+            if (path.endsWith('/review-actions')) {
+              return json({'approve': approve, 'reject': null});
+            }
+            if (path.endsWith('/audit-log')) return json(<Object>[]);
+            if (path == '/api/invoices/1') return json(_invoiceJson('1'));
+            return http.Response('not found', 404);
+          }),
+        );
+        await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
+
+        await tester.pumpWidget(
+          _screenHost(const InvoiceDetailScreen(invoiceId: '1')),
+        );
+        await _pumpUntil(tester, find.text('Approve'));
+        expect(find.text('Approve'), findsOneWidget);
+        expect(find.text('Reject'), findsOneWidget);
+        if (approve != null) {
+          expect(find.byKey(const ValueKey('review-refusal')), findsOneWidget);
+        }
+
+        await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(textContrastGuideline));
+        handle.dispose();
+      });
+    }
   });
 
   group('AdvancedSearchSheet', () {
@@ -624,7 +841,7 @@ void main() {
       await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
 
       await tester.pumpWidget(MaterialApp(
-        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        localizationsDelegates: appLocalizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
         home: const InvoicesScreen(),
       ));
@@ -650,15 +867,52 @@ void main() {
     testWidgets('approve/reject affordances meet tap-target + label guidelines',
         (tester) async {
       final handle = tester.ensureSemantics();
+      // One row the caller may approve, one refused with its reason beside
+      // it — the verdicts the queue's list read carries.
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => _list([
+              {
+                ..._invoiceJson('1'),
+                'review_actions': {'approve': null, 'reject': null},
+              },
+              {
+                ..._invoiceJson('2'),
+                'review_actions': {
+                  'approve': {
+                    'code': 'approval_segregation',
+                    'message': 'server english',
+                    'params': <String, dynamic>{},
+                  },
+                  'reject': null,
+                },
+              },
+            ])),
+      );
+
+      await tester.pumpWidget(_screenHost(const ApprovalsScreen()));
+      await _pumpUntil(tester, find.byKey(const ValueKey('approve-refusal-2')));
+      expect(find.byKey(const ValueKey('approve-refusal-1')), findsNothing);
+
+      await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(textContrastGuideline));
+      handle.dispose();
+    });
+
+    testWidgets('the could-not-check notice clears contrast', (tester) async {
+      final handle = tester.ensureSemantics();
+      // No `review_actions`: what a cached queue looks like.
       ApiClient().debugConfigure(
         client: MockClient((req) async => _list([_invoiceJson('1')])),
       );
 
       await tester.pumpWidget(_screenHost(const ApprovalsScreen()));
-      await _pumpUntil(tester, find.byType(InvoiceListTile));
+      await _pumpUntil(
+          tester, find.byKey(const ValueKey('review-verdicts-unavailable')));
+      expect(find.byKey(const ValueKey('review-verdicts-unavailable')),
+          findsOneWidget);
 
-      await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
-      await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
       await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
       await expectLater(tester, meetsGuideline(textContrastGuideline));
       handle.dispose();
@@ -705,8 +959,10 @@ void main() {
         final handle = tester.ensureSemantics();
         await tester.pumpWidget(_host(ExceptionStatusBadge(status: status)));
         await expectLater(tester, meetsGuideline(textContrastGuideline));
-        expect(find.bySemanticsLabel('Status: ${status.label}'),
-            findsOneWidget);
+        expect(
+          find.bySemanticsLabel('Status: ${exceptionStatusLabel(_en, status)}'),
+          findsOneWidget,
+        );
         handle.dispose();
       });
     }
@@ -803,6 +1059,73 @@ void main() {
       await expectLater(tester, meetsGuideline(textContrastGuideline));
       handle.dispose();
     });
+
+    // The ERP report panels: the payment the ERP reported and FeohLedger
+    // could not record (`paid_not_recorded`), and a write-back the ERP refused
+    // with a coded reason, each rendered under its own key.
+    for (final (name, report, key) in [
+      (
+        'an ERP-reported payment',
+        <String, dynamic>{
+          'kind': 'paid_not_recorded',
+          'erp_type': 'xero',
+          'amount': '240.50',
+          'amount_currency': 'EUR',
+          'reference': 'xero:bill-9',
+          'paid_on': '2026-10-30',
+          'paid_on_reported': true,
+        },
+        'exception-erp-payment',
+      ),
+      (
+        'a coded write-back refusal',
+        <String, dynamic>{
+          'kind': 'payment_writeback_failed',
+          'erp_type': 'xero',
+          'refusal': {
+            'code': 'payments_scope_missing',
+            'params': {'provider': 'Xero'},
+          },
+        },
+        'exception-erp-refusal',
+      ),
+    ]) {
+      testWidgets('$name meets tap-target + label + contrast',
+          (tester) async {
+        tester.view.physicalSize = const Size(1200, 2400);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        final handle = tester.ensureSemantics();
+        ApiClient().debugConfigure(
+          client: MockClient(
+            (req) async => http.Response(
+              jsonEncode({
+                ..._exceptionJson('1'),
+                'exception_type': 'payment_reconciliation',
+                'type_label': 'Payment Reconciliation',
+                'erp_name': 'Xero',
+                'erp_report': report,
+              }),
+              200,
+              headers: {'content-type': 'application/json'},
+            ),
+          ),
+        );
+
+        await tester.pumpWidget(
+          _host(const ExceptionDetailScreen(exceptionId: '1')),
+        );
+        await _pumpUntil(tester, find.byKey(Key(key)));
+        expect(find.byKey(Key(key)), findsOneWidget);
+
+        await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+        await expectLater(tester, meetsGuideline(textContrastGuideline));
+        handle.dispose();
+      });
+    }
   });
 
   group('NotificationListTile', () {
@@ -1112,6 +1435,259 @@ void main() {
         find.bySemanticsLabel(RegExp('Pay by Virtual Card')),
         findsOneWidget,
       );
+      handle.dispose();
+    });
+
+    testWidgets(
+        'record-only: the banner, a recordable row and a refused one meet '
+        'tap-target + label + contrast', (tester) async {
+      final handle = tester.ensureSemantics();
+      // Tall enough that both rows and their record actions are on screen —
+      // an off-screen node is not in the semantics tree the guidelines walk.
+      await tester.binding.setSurfaceSize(const Size(800, 1400));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      http.Response j(Object body) => http.Response(jsonEncode(body), 200,
+          headers: {'content-type': 'application/json'});
+      Map<String, dynamic> row(String id, String vendor, String? refusal) => {
+            'id': id,
+            'invoice_number': 'INV-$id',
+            'vendor_name': vendor,
+            'amount': 900.0,
+            'currency': 'USD',
+            'due_date': '2026-02-05',
+            'status': 'approved',
+            'is_overdue': false,
+            'discount_eligible': false,
+            'blocked': false,
+            'blocked_reason': null,
+            'required_method': null,
+            'record_outside_refusal': refusal,
+          };
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          final path = req.url.path;
+          if (path == '/api/auth/login') return j({'access_token': 'tok'});
+          if (path.endsWith('/auth/me')) {
+            return j({
+              'id': 'u1',
+              'email': 'demo@acme.com',
+              'full_name': 'Demo User',
+              'organization_id': 'org1',
+              'roles': ['ap_manager'],
+              'permissions': ['payment.record_external'],
+            });
+          }
+          if (path.endsWith('/payments/execution-mode')) {
+            return j({'mode': 'record_only', 'reason': 'configured'});
+          }
+          if (path.endsWith('/payments/queue')) {
+            return j({
+              'items': [
+                row('1', 'Acme Supplies', null),
+                row('2', 'Beta Ltd', 'external_payment_card_live'),
+              ],
+              'total': 2,
+            });
+          }
+          if (path.endsWith('/payments/summary')) {
+            return j({
+              'total_paid': 1000.0,
+              'total_pending': 200.0,
+              'payment_count': 5,
+              'total_rebates': 12.0,
+              'queue_count': 2,
+            });
+          }
+          return j({'items': [], 'total': 0});
+        }),
+      );
+      await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
+
+      await tester.pumpWidget(_screenHost(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Acme Supplies'));
+
+      await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(textContrastGuideline));
+
+      // The action names its invoice, so two "Record as paid" buttons are
+      // told apart by a screen reader.
+      expect(find.bySemanticsLabel('Record as paid — invoice INV-1'),
+          findsOneWidget);
+      expect(find.bySemanticsLabel('Record as paid — invoice INV-2'),
+          findsOneWidget);
+      handle.dispose();
+    });
+    testWidgets(
+        'a run row keeps its "Run actions" menu reachable beside its merged '
+        'announcement', (tester) async {
+      final handle = tester.ensureSemantics();
+      http.Response j(Object body) => http.Response(jsonEncode(body), 200,
+          headers: {'content-type': 'application/json'});
+      final run = {
+        'id': 'run1',
+        'status': 'draft',
+        'total_amount': '5000.00',
+        'currency': 'USD',
+        'initiated_by': 'u1',
+        'executed_at': null,
+        'created_at': '2026-01-10T12:00:00',
+        'payment_count': 2,
+        'payments_completed': 0,
+        'payments_failed': 0,
+        'payments_in_flight': 0,
+        'payments_pending': 2,
+        'requires_cfo_approval': false,
+        'cfo_approved_at': null,
+      };
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          final path = req.url.path;
+          if (path == '/api/auth/login') return j({'access_token': 'tok'});
+          if (path.endsWith('/auth/me')) {
+            return j({
+              'id': 'u1',
+              'email': 'demo@acme.com',
+              'full_name': 'Demo User',
+              'organization_id': 'org1',
+              'roles': ['ap_manager'],
+            });
+          }
+          if (path.endsWith('/payments/execution-mode')) {
+            return j({'mode': 'processor', 'reason': 'configured'});
+          }
+          // The run detail: Execute and Cancel accepted, so the menu holds
+          // items and renders.
+          if (path.endsWith('/payments/runs/run1')) {
+            return j({
+              ...run,
+              'actions': {'execute': null, 'cancel': null},
+            });
+          }
+          if (path.endsWith('/payments/queue')) {
+            return j({'items': [], 'total': 0});
+          }
+          if (path.endsWith('/payments/summary')) {
+            return j({
+              'total_paid': 0.0,
+              'total_pending': 0.0,
+              'payment_count': 0,
+              'total_rebates': 0.0,
+              'queue_count': 0,
+            });
+          }
+          if (path.contains('/payments/runs')) {
+            return j({
+              'items': [run],
+              'total': 1,
+            });
+          }
+          return j({'items': [], 'total': 0});
+        }),
+      );
+      await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
+
+      await tester.pumpWidget(_screenHost(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Runs'));
+      await tester.tap(find.text('Runs'));
+      await tester.pump();
+      await _pumpUntil(tester, find.byType(PopupMenuButton<String>));
+      // Let the tab slide in: mid-transition the Runs pane is still off
+      // screen, its nodes are hidden and carry no actions.
+      await tester.pumpAndSettle();
+
+      // The row still reads as one phrase, and only its own phrase: a
+      // non-boundary `Semantics(label:)` on the menu leaked "Run actions"
+      // into the row's node instead of labelling the button.
+      expect(find.bySemanticsLabel(RegExp(r'^Run .*Draft')), findsOneWidget);
+      expect(find.bySemanticsLabel(RegExp(r'Draft.*Run actions', dotAll: true)),
+          findsNothing);
+      // …and the trailing menu is its own node a screen reader can reach,
+      // carrying the tap that opens it. Wrapping the whole ListTile in
+      // `excludeSemantics` dropped it.
+      final menu = find.bySemanticsLabel(RegExp(r'^Run actions$'));
+      expect(menu, findsOneWidget);
+      final menuData = tester.getSemantics(menu).getSemanticsData();
+      expect(menuData.hasAction(SemanticsAction.tap), isTrue);
+      expect(menuData.flagsCollection.isButton, isTrue);
+      await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+      handle.dispose();
+    });
+  });
+
+  group('Record-as-paid dialog', () {
+    setUp(() {
+      PaymentQueueStore.instance.reset();
+      FlutterSecureStorage.setMockInitialValues({});
+    });
+
+    testWidgets(
+        'a refusal is announced exactly once, and the line is not also a '
+        'live region (WCAG 4.1.3 without the echo)', (tester) async {
+      final handle = tester.ensureSemantics();
+      await tester.binding.setSurfaceSize(const Size(800, 1400));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => http.Response(
+              jsonEncode({
+                'detail': {
+                  'code': 'external_payment_segregation',
+                  'message': 'server english',
+                  'params': null,
+                },
+              }),
+              403,
+              headers: {'content-type': 'application/json'},
+            )),
+      );
+      final item = PaymentQueueItem.fromJson({
+        'id': 'inv1',
+        'invoice_number': 'INV-1',
+        'vendor_name': 'Acme Supplies',
+        'amount': '100.00',
+        'currency': 'USD',
+        'status': 'approved',
+      });
+      await tester.pumpWidget(_host(Builder(
+        builder: (context) => TextButton(
+          onPressed: () => showRecordInvoicePaymentDialog(context, item),
+          child: const Text('open'),
+        ),
+      )));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+          find.byKey(const Key('record-reference')), 'CHK-1');
+      await tester.pump();
+      tester.takeAnnouncements(); // anything before the submit is not ours
+      await tester.tap(find.byKey(const Key('record-submit')));
+      await tester.pumpAndSettle();
+
+      const refusal = 'Segregation of duties: you created or shaped this '
+          'invoice, so a different user must record its payment.';
+      expect(find.text(refusal), findsOneWidget);
+      final spoken = tester
+          .takeAnnouncements()
+          .where((a) => a.message == refusal)
+          .toList();
+      expect(spoken, hasLength(1));
+      // The second voice was a `Semantics(liveRegion: true)` around the line:
+      // nothing wrapping or inside the refusal line is a live region. Scoped
+      // to the line, not the whole dialog: the framework's own TextField
+      // counter (`maxLength`) is a live region while the field has focus.
+      bool isLive(Widget w) => w is Semantics && w.properties.liveRegion == true;
+      final line = find.byKey(const Key('record-error'));
+      expect(line, findsOneWidget);
+      expect(
+        find.ancestor(of: line, matching: find.byWidgetPredicate(isLive)),
+        findsNothing,
+      );
+      expect(
+        find.descendant(of: line, matching: find.byWidgetPredicate(isLive)),
+        findsNothing,
+      );
+      await expectLater(tester, meetsGuideline(textContrastGuideline));
       handle.dispose();
     });
   });
@@ -1607,6 +2183,7 @@ void main() {
                 'status': 'open',
                 'created_at': '2026-03-01T10:00:00',
                 'dismissed_at': null,
+                'actions': {'dismiss': null},
               },
             ],
           });

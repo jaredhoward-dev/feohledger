@@ -17,7 +17,8 @@ Connection metadata lives in ``settings.erp.oauth``::
         "expires_at": "<ISO-8601 UTC>",
         "external_tenant_id": "...",  # QBO realmId / Xero tenantId / Sage business id
         # plus org_id, connection_id, client_source, connected_at,
-        # refresh_token_expires_at, needs_reconnect: see services/erp_oauth
+        # refresh_token_expires_at, needs_reconnect, scope_gaps: see
+        # services/erp_oauth
     }
 
 The tokens are sealed in ``provider_credentials`` and never reach an adapter's
@@ -58,9 +59,22 @@ class OAuthProviderSpec:
     #: Extra query parameters on the authorize redirect (e.g. Sage's
     #: ``filter=apiv3.1``). Never secrets.
     extra_authorize_params: dict[str, str] = field(default_factory=dict)
-    #: The provider's token-revocation endpoint, or None when it has none.
-    #: Disconnect calls it best-effort before clearing local state.
+    #: The provider's token-revocation endpoint. Disconnect and tenant deletion
+    #: call it best-effort (``erp_oauth.revoke_grant``). None ONLY together with
+    #: ``no_revoke_endpoint_reason``: a provider with no way to revoke is
+    #: stated, never assumed (``__post_init__``; decisions §371).
     revoke_url: str | None = None
+    #: Why ``revoke_url`` is None: the provider documents no revocation
+    #: endpoint, so the grant ends only when the customer removes the app on
+    #: the provider's side. Disconnect then answers ``revocation:
+    #: "unsupported"`` and the settings page tells the admin to do that.
+    #: Never set beside a ``revoke_url``. Not shown to users (English only).
+    no_revoke_endpoint_reason: str | None = None
+    #: How the revoke endpoint takes the token: a form body (``token=…``,
+    #: RFC 7009 — Xero, Sage) or, when True, a JSON object
+    #: (``{"token": …}``), which is what Intuit documents. A provider sent the
+    #: wrong one can answer 4xx, and Disconnect then leaves the grant live.
+    revoke_json: bool = False
     #: How the token endpoint takes the client credentials: ``"basic"`` (HTTP
     #: Basic auth — Intuit, Xero) or ``"body"`` (form fields — Sage).
     token_auth: str = "basic"
@@ -86,6 +100,64 @@ class OAuthProviderSpec:
     authorize_url_setting: str | None = None
     token_url_setting: str | None = None
     revoke_url_setting: str | None = None
+
+    def __post_init__(self) -> None:
+        # Exactly one of the two: a spec with neither would make Disconnect
+        # silently forget our copy of the tokens while the grant stays live at
+        # the provider, which is the gap decisions §371 closed.
+        if bool(self.revoke_url) == bool(self.no_revoke_endpoint_reason):
+            raise ValueError(
+                f"OAuth provider {self.key!r} must set exactly one of revoke_url "
+                "and no_revoke_endpoint_reason"
+            )
+
+
+#: Bounds on what a provider's company list may put in front of the admin and
+#: into the pending connect (``services/erp_oauth.park_pending_connect``). A
+#: provider id longer than this, or one carrying a control character, is not a
+#: company we can address and is dropped rather than truncated.
+_COMPANY_ID_MAX = 128
+_COMPANY_NAME_MAX = 200
+#: More companies than this in one consent is not a list an admin picks from
+#: on a settings page; the connect is refused (``no_external_tenant``).
+COMPANY_LIST_MAX = 100
+
+
+@dataclass(frozen=True)
+class ExternalCompany:
+    """One provider-side company a fresh consent can reach.
+
+    ``id`` is what ``settings.erp.oauth.external_tenant_id`` stores (Xero
+    ``tenantId``, Sage business id, QuickBooks ``realmId``); ``name`` is the
+    provider's display name, shown in the company picker only (decisions §355).
+    """
+
+    id: str
+    name: str
+
+
+def clean_companies(rows: list[tuple[object, object]]) -> list[ExternalCompany]:
+    """Provider ``(id, name)`` pairs → the companies a picker may offer.
+
+    **Fails closed:** any row with an empty, over-long or control-character id
+    makes the whole list empty (``no_external_tenant``). Dropping it instead
+    could leave one company out of several, which the callback would then link
+    without asking — choosing a ledger for the customer (decisions §355). A
+    repeat of an id already listed is dropped; a missing name falls back to
+    the id. Order is the provider's.
+    """
+    out: list[ExternalCompany] = []
+    seen: set[str] = set()
+    for raw_id, raw_name in rows:
+        cid = str(raw_id or "").strip()
+        if not cid or len(cid) > _COMPANY_ID_MAX or not cid.isprintable():
+            return []
+        if cid in seen:
+            continue
+        seen.add(cid)
+        name = " ".join(str(raw_name or "").split())[:_COMPANY_NAME_MAX] or cid
+        out.append(ExternalCompany(id=cid, name=name))
+    return out
 
 
 class RefreshOnUnauthorized(httpx.Auth):
@@ -162,7 +234,12 @@ class OAuthErpAdapter(ErpAdapter):
 
     @classmethod
     async def resolve_external_tenant_id(
-        cls, *, access_token: str, token_response: dict, callback_params: dict[str, str]
+        cls,
+        *,
+        access_token: str,
+        token_response: dict,
+        callback_params: dict[str, str],
+        erp_settings: dict | None = None,
     ) -> str | None:
         """The provider-side company id for a fresh consent, or None.
 
@@ -172,8 +249,15 @@ class OAuthErpAdapter(ErpAdapter):
         then the token-response field ``external_tenant_id_token_field``
         (Blackbaud's ``environment_id``).
         A provider that only reveals it through an API call (Xero's
-        ``GET /connections``, Sage's ``/businesses``) overrides this. None
-        refuses the connection (``erp_error=no_external_tenant``).
+        ``GET /connections``, Sage's ``/businesses``) overrides this, and so
+        does one whose callback parameter is unsigned and must be confirmed
+        under the new token (QuickBooks). None refuses the connection
+        (``erp_error=no_external_tenant``). The callback reads it through
+        :meth:`list_external_tenants`, which a provider whose consent can
+        reach several companies overrides instead.
+
+        ``erp_settings`` is the org's resolved ``settings.erp`` as saved before
+        the consent (QuickBooks reads its ``environment`` to pick the API host).
         """
         spec = cls.oauth_provider
         if spec.external_tenant_id_param:
@@ -185,6 +269,42 @@ class OAuthErpAdapter(ErpAdapter):
             if value:
                 return value
         return None
+
+    @classmethod
+    async def list_external_tenants(
+        cls,
+        *,
+        access_token: str,
+        token_response: dict,
+        callback_params: dict[str, str],
+        erp_settings: dict | None = None,
+    ) -> list[ExternalCompany]:
+        """Every company a fresh consent reached — what the callback reads.
+
+        One → it is linked at once; several → the admin picks one
+        (decisions §355, ``api/erp_oauth`` § company picker); none → the
+        connect is refused (``no_external_tenant``). The default wraps
+        :meth:`resolve_external_tenant_id`, so a provider whose consent names
+        exactly one company (QuickBooks, with its realm confirmed under the new
+        token — §337; Blackbaud) keeps its own resolution unchanged. A provider
+        whose consent can cover several (Xero, Sage) overrides this.
+        """
+        value = await cls.resolve_external_tenant_id(
+            access_token=access_token,
+            token_response=token_response,
+            callback_params=callback_params,
+            erp_settings=erp_settings,
+        )
+        return clean_companies([(value, value)]) if value else []
+
+    def scope_gaps(self) -> frozenset[str]:
+        """The coded permissions this connection's consent was found not to
+        cover (``settings.erp.oauth.scope_gaps``, decisions §415). An adapter
+        skips a call it knows the consent refuses, and refuses a write it
+        cannot make, rather than spending a request on a certain 401/403."""
+        from app.services import erp_oauth
+
+        return frozenset(erp_oauth.scope_gaps(self.config.get("oauth")))
 
     def external_tenant_id(self) -> str:
         """The provider-side company id captured at consent (QBO ``realmId`` etc.)."""

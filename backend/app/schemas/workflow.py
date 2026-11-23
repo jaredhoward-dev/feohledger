@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.pagination import PageMeta
 
@@ -76,7 +76,10 @@ class ApprovalStepConfig(BaseModel):
 
 class ErpExportStepConfig(BaseModel):
     export_format: str = "json"  # "json", "xml", "csv", "cxml", "edi"
-    auto_send_on_approval: bool = True  # send to ERP immediately after approval
+    # Off unless set: every save runs a step through this model and stores the
+    # dump, so a True default would arm the push for anyone who saved a
+    # workflow the builder showed with the switch off (decisions §304).
+    auto_send_on_approval: bool = False
     include_line_items: bool = True  # include line item details in the payload
     include_attachments: bool = False  # include PDF file URL in the payload
 
@@ -383,6 +386,22 @@ class ApproveRequest(BaseModel):
 
 class RejectRequest(BaseModel):
     reason: str = Field(..., min_length=1, max_length=2000)
+
+
+class RecallApprovalRequest(BaseModel):
+    """`POST /api/invoices/{id}/recall-approval`. The reason is required: it is
+    what the next approver reads, on the `invoice.approval_recalled` audit row,
+    about why signed-off figures came back (decisions §374)."""
+
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("A reason is required to recall an approval.")
+        return stripped
 
 
 # ---------- response schemas ----------

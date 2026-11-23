@@ -42,7 +42,7 @@ services:
     # backend/docker-compose.yml, which is what CI starts — dev, CI and
     # production run one image, and backend/tests/test_container_supply_chain.py
     # fails if a bump moves one file without the other.
-    image: pgvector/pgvector:0.8.7-pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    image: pgvector/pgvector:0.8.7-pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
     # Local-database mode only: deploy/lib.sh activates `localdb` when the sops
     # env leaves FEOH_DATABASE_URL unset. With an external database (RDS) this
     # container never starts — no wasted RAM, no second database to confuse.
@@ -76,7 +76,7 @@ services:
       retries: 12
 
   redis:
-    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     restart: unless-stopped
     logging: *default-logging
     # AOF persistence: losing the blocklist would resurrect logged-out JWTs
@@ -109,6 +109,13 @@ services:
       # warning on every compose call (compose v2 expands it even when unused);
       # decrypt-env.sh is what refuses it empty in container mode.
       FEOH_DATABASE_URL: ${FEOH_DATABASE_URL:-postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-}@postgres:5432/feohledger}
+      # RDS IAM auth (docs/decisions.md §310): on, the URL above names the app
+      # role with NO password and the app mints a 15-minute token per new
+      # connection from the instance profile. Interpolated here rather than left
+      # to env_file so the shell overrides it exactly as it overrides the URL —
+      # deploy/lib.sh reads both with that same precedence, and the two must
+      # never disagree about how the stack signs in.
+      FEOH_DATABASE_IAM_AUTH: ${FEOH_DATABASE_IAM_AUTH:-false}
       FEOH_REDIS_URL: ${FEOH_REDIS_URL:-redis://redis:6379}
       # Database TLS, read by asyncpg for every connection the app opens —
       # engines, tenant engines, the raw CREATE/DROP DATABASE connection — as
@@ -131,7 +138,8 @@ services:
       # Same override seam as the URLs above (e.g. an external LB in front).
       FEOH_TRUSTED_PROXY_CIDRS: ${FEOH_TRUSTED_PROXY_CIDRS:-172.28.0.0/16}
     depends_on:
-      # `required: false` (compose >= 2.20; bootstrap-vm.sh pins 2.32.4): in
+      # `required: false` (compose >= 2.20; bootstrap-vm.sh's COMPOSE_VERSION
+      # must stay at or above it — tests/test_deploy_db_mode.py): in
       # local mode the `localdb` profile is active and the api waits for a
       # healthy database exactly as before; with an external database the
       # service is not in the project and the dependency is skipped.
@@ -152,7 +160,7 @@ services:
     # entrypoint — main.py with dotenv is local-dev only).
 
   caddy:
-    image: caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     restart: unless-stopped
     logging: *default-logging
     ports:
@@ -169,16 +177,14 @@ services:
       # recreated. deploy/lib.sh::feoh_caddy_reload checks for exactly that and
       # recreates instead of reloading a stale copy.
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # Per-VM tenant host list (gitignored; deploy.sh seeds it from the
-      # committed .example). Add a block per tenant subdomain + reload.
+      # Per-VM vanity host list (gitignored; deploy.sh seeds it from the
+      # committed .example). One `import vanity` block per customer domain.
+      # The SPA itself is not here: since docs/decisions.md §364 the VM serves
+      # only the API, and the SPA is S3 + CloudFront (§278). Nothing mounts
+      # ../frontend/build, which a rebuild deletes and recreates under a live
+      # bind mount (#579, §277); deploy/lib.sh refuses to deploy a commit whose
+      # compose file does.
       - ./tenants.caddy:/etc/caddy/tenants.caddy:ro
-      # The static SPA: deploy/www/ (gitignored), whose `current` symlink
-      # deploy.sh swaps to each newly published release; the Caddyfile serves
-      # /srv/current. NEVER mount ../frontend/build here: the build deletes and
-      # recreates that directory, a bind mount pins the old inode, and Caddy is
-      # left serving an orphaned empty directory — every page 404 and `exec`
-      # refused (#579, docs/decisions.md §277). www/ itself is never replaced.
-      - ./www:/srv:ro
       # Certificates + ACME account state — must persist across restarts or
       # Let's Encrypt rate limits will bite.
       - caddy_data:/data
@@ -204,7 +210,7 @@ services:
     # and an anchor between the key and the ref would hide the postgres line
     # from it. It bumps both declarations together; tests/test_deploy_db_mode.py
     # fails if they ever differ.
-    image: pgvector/pgvector:0.8.7-pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    image: pgvector/pgvector:0.8.7-pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
     profiles: [tools]
     logging: *default-logging
     environment:
@@ -213,44 +219,11 @@ services:
     volumes:
       - ../backend/certs/rds-global-bundle.pem:/certs/rds-global-bundle.pem:ro
 
-  # The one-shot production frontend build: deploy.sh runs it as
-  # `docker compose run --rm frontend-build`, and the `build` profile keeps
-  # `up` from ever starting it. It is a service rather than a `docker run` in
-  # deploy.sh so that its Node image sits where the `docker-compose` Dependabot
-  # entry reads it — a ref in a shell variable has no reader and rots
-  # (docs/decisions.md §203). The Node MAJOR moves only with CI's `setup-node`
-  # (Dependabot ignores node majors, and backend/tests/
-  # test_container_supply_chain.py fails when the two part): production must
-  # build on the runtime CI tests. No Node or pnpm is installed on the VM.
-  frontend-build:
-    image: node:24.22.0-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
-    profiles: [build]
-    working_dir: /repo/frontend
-    volumes:
-      - ..:/repo
-      - pnpm-store:/pnpm-store
-    # deploy.sh passes PNPM_SPEC (read from frontend/package.json's
-    # `packageManager`), PUBLIC_API_URL and PUBLIC_SITE_URL with `run -e`; `$$`
-    # leaves the expansion to the container's shell.
-    environment:
-      npm_config_store_dir: /pnpm-store
-    command:
-      - sh
-      - -ec
-      - 'npm i -g "$$PNPM_SPEC" >/dev/null 2>&1 && pnpm install --frozen-lockfile && pnpm build'
-
 volumes:
   pgdata:
   redisdata:
   caddy_data:
   caddy_config:
-  # Caches the pnpm store across deploys so a rebuild does not re-download the
-  # world. Compose-managed (`feoh-prod_pnpm-store`), not the
-  # `feoh-prod-pnpm-store` deploy.sh's old `docker run -v` made: adopting that
-  # one by name draws a "not created by Docker Compose" warning on every deploy.
-  # A cache costs one cold build to replace; deploy/README.md says how to drop
-  # the old volume.
-  pnpm-store:
 
 networks:
   # Pinned so FEOH_TRUSTED_PROXY_CIDRS (api service above) can name the

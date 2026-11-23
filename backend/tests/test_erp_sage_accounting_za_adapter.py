@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
@@ -20,10 +21,16 @@ import httpx
 import pytest
 
 from app.config import settings
+from app.models.procurement import UNISSUED_PO_STATUS
 from app.services.erp_adapters.base import (
+    SYNC_LISTING_MAX_ROWS,
     ErpInvoiceStatus,
+    ErpListingIncomplete,
     InvoicePayload,
     LineItemPayload,
+    ListingGap,
+    PoSkipReason,
+    SkippedPo,
     erp_failure_message,
 )
 from app.services.erp_adapters.dispatcher import get_erp_adapter
@@ -106,40 +113,68 @@ class FakeSage:
         self.save_total_override: str | None = None
         self.save_drops_total = False
         self.save_raises: Exception | None = None
+        self.save_status: int | None = None
         self.save_body = None
+        self.save_params: dict = {}
 
-    def _paged(self, rows):
+    def _paged(self, rows, request: httpx.Request | None = None):
+        """Sage's envelope over the page ``$skip`` / ``$top`` ask for (max 100),
+        ordered by ``$orderby`` when it names ``ID``. A test's own handler that
+        answers before ``handler`` runs passes its ``request``."""
+        params = (request or self._request).url.params
+        if params.get("$orderby", "").startswith("ID"):
+            rows = sorted(rows, key=lambda r: r.get("ID", 0), reverse="desc" in params["$orderby"])
+        skip = int(params.get("$skip") or 0)
+        top = min(int(params.get("$top") or 100), 100)
+        page = rows[skip : skip + top]
         return httpx.Response(
-            200, json={"TotalResults": len(rows), "ReturnedResults": len(rows), "Results": rows}
+            200,
+            content=_dumps(
+                {"TotalResults": len(rows), "ReturnedResults": len(page), "Results": page}
+            ),
         )
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        self._request = request
         path = request.url.path.split("/api/2.0.0/", 1)[-1]
         resource = path.split("/", 1)[0]
         if resource in self.status:
             return httpx.Response(self.status[resource], text='{"Message": "' + PII[1] + '"}')
         flt = request.url.params.get("$filter", "")
+        if "eq '" in flt:
+            # "Filter and Orderby will not work for string values of any kind"
+            # (DeveloperProgram.aspx): a string literal is never honoured.
+            return httpx.Response(400, json={"Message": "Invalid filter."})
         if path == "SupplierInvoice/Get":
-            return self._paged(
-                [
-                    i
-                    for i in self.invoices
-                    if f"'{i['Reference']}'" in flt or f"'{i['DocumentNumber']}'" in flt
-                ]
-            )
+            supplier = re.search(r"SupplierId eq (\d+)", flt)
+            start = re.search(r"Date ge datetime'(\d{4}-\d{2}-\d{2})", flt)
+            end = re.search(r"Date lt datetime'(\d{4}-\d{2}-\d{2})", flt)
+            rows = [
+                i
+                for i in self.invoices
+                if (not supplier or str(i.get("SupplierId")) == supplier.group(1))
+                and (not start or str(i.get("Date", ""))[:10] >= start.group(1))
+                and (not end or str(i.get("Date", ""))[:10] < end.group(1))
+            ]
+            return self._paged(rows)
         if path.startswith("SupplierInvoice/Get/"):
             doc = next((i for i in self.invoices if str(i["ID"]) == path.rsplit("/", 1)[1]), None)
             return httpx.Response(200, content=_dumps(doc)) if doc else httpx.Response(404)
-        if path.startswith("SupplierInvoice/Delete/"):
-            self.invoices = [i for i in self.invoices if str(i["ID"]) != path.rsplit("/", 1)[1]]
-            return httpx.Response(200)
         if path == "SupplierInvoice/Save":
             if self.save_raises:
                 raise self.save_raises
+            if self.save_status:
+                return httpx.Response(
+                    self.save_status, json={"Message": PII[1], "ModelState": {"x": [PII[0]]}}
+                )
             self.save_body = request.content.decode()
+            self.save_params = dict(request.url.params)
             body = json.loads(request.content, parse_float=Decimal)
             saved = {**body, "ID": 9001}
+            if request.url.params.get("useSystemDocumentNumber", "true").lower() != "false":
+                # Sage's default: its own sequence replaces the number sent.
+                saved["DocumentNumber"] = "SI00001"
             if self.save_total_override:
                 saved["Total"] = self.save_total_override
             if self.save_drops_total:
@@ -150,12 +185,17 @@ class FakeSage:
         if path == "Account/Get":
             ids = {int(p.split(" eq ")[1]) for p in flt.split(" or ")} if flt else None
             return self._paged([a for a in self.accounts if ids is None or a["ID"] in ids])
+        if path.startswith("Account/Get/"):
+            acct = next((a for a in self.accounts if str(a["ID"]) == path.rsplit("/", 1)[1]), None)
+            return httpx.Response(200, json=acct) if acct else httpx.Response(404)
         if path == "TaxType/Get":
             return self._paged(self.tax_types)
         if path.startswith("Supplier/Get/"):
             return httpx.Response(200, json=self.supplier)
         if path == "Supplier/Get":
-            return self._paged([self.supplier, {"ID": 13, "Name": "Beta", "Email": "b@x.co.za"}])
+            return self._paged(
+                [self.supplier, {"ID": 13, "Name": "Beta", "Email": "b@x.co.za", "Active": False}]
+            )
         if path.startswith("Company/Get/"):
             return httpx.Response(200, json=self.company)
         if path == "Company/Get":
@@ -165,6 +205,7 @@ class FakeSage:
                 [
                     {
                         "DocumentNumber": "PO0001",
+                        "SupplierId": 12,
                         "SupplierName": "Acme",
                         "Total": 1150.00,
                         "Status": "Unprocessed",
@@ -260,7 +301,13 @@ def test_split_inclusive_always_adds_back_to_the_gross(gross, pct, exclusive, ta
     [
         ({"Total": 115, "AmountDue": 115}, ErpInvoiceStatus.open),
         ({"Total": 115, "AmountDue": 15}, ErpInvoiceStatus.partially_paid),
-        ({"Total": 115, "AmountDue": 0}, ErpInvoiceStatus.paid),
+        # Paid only on Sage's own Paid flag, and never for a zero total
+        # (decisions §303); nothing due without it is not a payment.
+        ({"Total": 115, "AmountDue": 0, "Paid": True}, ErpInvoiceStatus.paid),
+        ({"Total": 115, "AmountDue": 0}, ErpInvoiceStatus.settled_no_payment),
+        ({"Total": 115, "AmountDue": 0, "Paid": False}, ErpInvoiceStatus.settled_no_payment),
+        ({"Total": 0, "AmountDue": 0, "Paid": True}, ErpInvoiceStatus.settled_no_payment),
+        ({"Total": 115, "AmountDue": 15, "Paid": True}, ErpInvoiceStatus.partially_paid),
         ({"Total": 115}, ErpInvoiceStatus.unknown),
     ],
 )
@@ -304,6 +351,9 @@ def test_post_body_shape_with_vat_from_the_accounts_tax_type():
         "TaxType/Get",
         "SupplierInvoice/Save",
     ]
+    # Without it Sage would replace the supplier's number with its own sequence.
+    assert fake.save_params["useSystemDocumentNumber"] == "false"
+    assert result.erp_document_number == "INV-1"
     body = json.loads(fake.save_body, parse_float=Decimal)
     assert body["SupplierId"] == 12
     assert body["DocumentNumber"] == "INV-1" and body["Reference"] == CORR
@@ -370,19 +420,29 @@ def test_vat_disagreeing_with_the_approved_invoice_is_refused():
     assert "SupplierInvoice/Save" not in fake.paths()
 
 
+def _invoice(**fields) -> dict:
+    """A supplier invoice of supplier 12 dated on the payload's invoice date."""
+    return {"SupplierId": 12, "Date": "2026-01-01T00:00:00", **fields}
+
+
 def test_existing_invoice_with_our_reference_and_total_is_adopted():
     fake = FakeSage()
-    fake.invoices = [{"ID": 77, "Reference": CORR, "DocumentNumber": "INV-1", "Total": 115.0}]
+    fake.invoices = [_invoice(ID=77, Reference=CORR, DocumentNumber="INV-1", Total=115.0)]
     result = _post(fake)
     assert result.success and result.erp_document_id == "77"
     assert fake.paths() == ["SupplierInvoice/Get"]
-    flt = fake.requests[0].url.params["$filter"]
-    assert flt == f"SupplierId eq 12 and (Reference eq '{CORR}' or DocumentNumber eq 'INV-1')"
+    params = fake.requests[0].url.params
+    # Integers and dates only: Sage's OData cannot filter or order on strings.
+    assert params["$filter"] == (
+        "SupplierId eq 12 and Date ge datetime'2026-01-01T00:00:00'"
+        " and Date lt datetime'2026-01-02T00:00:00'"
+    )
+    assert params["$orderby"] == "ID desc"
 
 
 def test_existing_invoice_with_our_reference_but_another_total_is_refused():
     fake = FakeSage()
-    fake.invoices = [{"ID": 77, "Reference": CORR, "DocumentNumber": "INV-1", "Total": 99}]
+    fake.invoices = [_invoice(ID=77, Reference=CORR, DocumentNumber="INV-1", Total=99)]
     result = _post(fake)
     assert not result.success and not result.retryable
     assert result.message.endswith("correlation_total_mismatch")
@@ -390,17 +450,72 @@ def test_existing_invoice_with_our_reference_but_another_total_is_refused():
 
 def test_same_invoice_number_under_another_reference_is_refused():
     fake = FakeSage()
-    fake.invoices = [{"ID": 78, "Reference": "manual", "DocumentNumber": "INV-1", "Total": 115}]
+    fake.invoices = [_invoice(ID=78, Reference="manual", DocumentNumber="INV-1", Total=115)]
     result = _post(fake)
     assert not result.success and result.message.endswith("duplicate_invoice_number")
     assert "SupplierInvoice/Save" not in fake.paths()
 
 
-def test_odata_literal_quotes_are_escaped():
+def test_other_invoices_of_the_supplier_that_day_are_not_a_duplicate():
+    """The window returns every invoice of the day; only a matching Reference or
+    DocumentNumber counts. (The old string filter matched them in Sage, which
+    Sage cannot do; read here, an unrelated invoice was a 'duplicate'.)"""
     fake = FakeSage()
-    _post(fake, _payload(invoice_number="O'Brien' or 1 eq 1"))
-    flt = fake.requests[0].url.params["$filter"]
-    assert "DocumentNumber eq 'O''Brien'' or 1 eq 1'" in flt
+    fake.invoices = [_invoice(ID=70, Reference="other", DocumentNumber="INV-0", Total=5)]
+    assert _post(fake).success
+
+
+def test_no_string_literal_ever_reaches_the_filter():
+    fake = FakeSage()
+    assert _post(fake, _payload(invoice_number="O'Brien' or 1 eq 1")).success
+    for request in fake.requests:
+        assert "'O" not in request.url.params.get("$filter", "")
+
+
+def test_our_first_attempt_is_found_past_the_first_page():
+    """A supplier with more than 100 invoices on the day: our own earlier save
+    is on page 2, and a page-1-only lookup would post it a second time."""
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=1000 + i, Reference=f"r{i}", DocumentNumber=f"X{i}", Total=1)
+        for i in range(100)
+    ] + [_invoice(ID=77, Reference=CORR, DocumentNumber="INV-1", Total=115.0)]
+    result = _post(fake)
+    assert result.success and result.erp_document_id == "77"
+    assert "SupplierInvoice/Save" not in fake.paths()
+    assert [r.url.params["$skip"] for r in fake.requests] == ["0", "100"]
+
+
+def test_a_lookup_window_too_long_to_read_fails_closed():
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=1000 + i, Reference=f"r{i}", DocumentNumber=f"X{i}", Total=1)
+        for i in range(1001)
+    ]
+    result = _post(fake)
+    assert not result.success and not result.retryable
+    assert result.refusal_code == "idempotency_lookup_incomplete"
+    assert "SupplierInvoice/Save" not in fake.paths()
+
+
+def test_a_later_lookup_page_failing_is_not_a_miss():
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=1000 + i, Reference=f"r{i}", DocumentNumber=f"X{i}", Total=1)
+        for i in range(150)
+    ]
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/SupplierInvoice/Get") and request.url.params["$skip"] != "0":
+            fake.requests.append(request)
+            return httpx.Response(503)
+        return _orig(request)
+
+    fake.handler = handler
+    result = _post(fake)
+    assert not result.success and result.retryable
+    assert "idempotency lookup unavailable" in result.message
+    assert "SupplierInvoice/Save" not in fake.paths()
 
 
 def test_failed_lookup_is_not_read_as_a_miss():
@@ -417,12 +532,14 @@ def test_sage_recalculating_another_total_is_a_non_retryable_failure():
     fake.save_total_override = "115.01"
     result = _post(fake)
     assert not result.success and not result.retryable
+    # API 2.0.0 has no SupplierInvoice/Delete, so the message says truthfully
+    # that the invoice is still in Sage, and nothing tried to delete it.
     assert result.message == (
-        "Sage Accounting (ZA) post failed: posted_total_mismatch (the bill was voided)"
+        "Sage Accounting (ZA) post failed: posted_total_mismatch "
+        "(the bill could not be voided in Sage Accounting (ZA))"
     )
-    # The invoice it saved with the wrong total is deleted, not left in Sage.
-    assert "SupplierInvoice/Delete/9001" in fake.paths()
-    assert fake.invoices == []
+    assert not any("Delete" in p for p in fake.paths())
+    assert [i["ID"] for i in fake.invoices] == [9001]
 
 
 def test_a_save_that_reports_no_total_is_unconfirmed_not_success():
@@ -464,6 +581,7 @@ def test_refuses_without_a_numeric_supplier_id_before_any_http(vendor_erp_id):
     result = _post(fake, _payload(vendor_erp_id=vendor_erp_id))
     assert not result.success and not result.retryable
     assert result.message.endswith("vendor_not_linked")
+    assert result.not_posted is True
     assert fake.requests == []
 
 
@@ -475,12 +593,42 @@ def test_refuses_without_a_numeric_account_id_before_any_http(gl):
     assert fake.requests == []
 
 
-def test_refuses_an_inactive_or_unknown_account():
-    for gl in ("6400", "9999"):
+def test_refuses_an_unknown_account_as_not_linked_and_an_inactive_one_as_inactive():
+    fake = FakeSage()
+    result = _post(fake, _payload(gl_account_erp_id="9999"))
+    assert not result.success and result.refusal_code == "account_not_linked"
+    assert "SupplierInvoice/Save" not in fake.paths()
+    # 6400 IS linked; Sage reports it inactive. The refusal says so and names
+    # our code for it, which the browser states.
+    fake = FakeSage()
+    result = _post(fake, _payload(gl_account_erp_id="6400", gl_account="6400-OLD"))
+    assert not result.success and not result.retryable
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6400-OLD"]}
+    assert "SupplierInvoice/Save" not in fake.paths()
+
+
+def test_refuses_an_inactive_supplier_before_the_save():
+    fake = FakeSage()
+    fake.supplier = {**fake.supplier, "Active": False}
+    result = _post(fake)
+    assert not result.success and result.refusal_code == "vendor_inactive"
+    assert "SupplierInvoice/Save" not in fake.paths()
+
+
+def test_refuses_missing_dates_before_any_http():
+    for overrides in ({"invoice_date": None}, {"due_date": None}):
         fake = FakeSage()
-        result = _post(fake, _payload(gl_account_erp_id=gl))
-        assert not result.success and result.message.endswith("account_not_linked")
-        assert "SupplierInvoice/Save" not in fake.paths()
+        result = _post(fake, _payload(**overrides))
+        assert result.refusal_code == "missing_dates" and result.not_posted is True
+        assert fake.requests == []
+
+
+def test_refuses_an_invoice_number_longer_than_sage_stores():
+    fake = FakeSage()
+    result = _post(fake, _payload(invoice_number="N" * 101))
+    assert result.refusal_code == "doc_number_too_long" and fake.requests == []
+    assert _post(FakeSage(), _payload(invoice_number="N" * 100)).success
 
 
 def test_refuses_a_non_home_currency_before_any_http():
@@ -505,20 +653,104 @@ def test_refuses_a_foreign_currency_supplier():
 # ---------------------------------------------------------------------------
 
 
-def test_http_failure_on_save_uses_the_shared_message_without_the_body():
+def test_a_refused_save_is_coded_not_posted_and_never_echoes_the_body():
+    """A 400 from the save created nothing (decisions §285's shape): coded,
+    non-retryable, ``not_posted`` — never the "possibly posted" generic failure."""
     fake = FakeSage()
+    fake.save_status = 400
+    result = _post(fake)
+    assert not result.success and not result.retryable and result.not_posted is True
+    assert result.refusal_code == "bill_refused"
+    assert result.message == "Sage Accounting (ZA) post refused: bill_refused"
+    for secret in (*PII, API_KEY):
+        assert secret not in result.message
 
-    # The lookup is the same resource; let it through and fail only the save.
+
+def test_a_refused_save_in_a_locked_period_is_period_closed():
+    fake = FakeSage()
+    fake.company = {**fake.company, "LockProcessing": True, "LockProcessingDate": "2026-01-31"}
+    fake.save_status = 400
+    result = _post(fake)
+    assert result.refusal_code == "period_closed" and result.not_posted is True
+    # A lock date before the invoice date does not explain the refusal.
+    fake = FakeSage()
+    fake.company = {**fake.company, "LockProcessing": True, "LockProcessingDate": "2025-12-31"}
+    fake.save_status = 400
+    assert _post(fake).refusal_code == "bill_refused"
+
+
+def test_a_refused_save_names_an_account_made_inactive_in_the_meantime():
+    fake = FakeSage()
+    fake.save_status = 400
+
     def handler(request, _orig=fake.handler):
-        if request.url.path.endswith("/Save"):
+        # Active at the pre-save lookup, inactive by the time Sage refused.
+        if request.url.path.endswith("/Account/Get/6100"):
             fake.requests.append(request)
-            return httpx.Response(400, text=f'{{"Message": "{PII[1]} {API_KEY}"}}')
+            return httpx.Response(200, json={**fake.accounts[0], "Active": False})
         return _orig(request)
 
     fake.handler = handler
+    result = _post(fake, _payload(gl_account="6100-OS"))
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6100-OS"]}
+
+
+def test_a_refused_save_for_a_supplier_made_inactive_is_vendor_inactive():
+    fake = FakeSage()
+    fake.save_status = 400
+    calls = {"n": 0}
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/Supplier/Get/12"):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                fake.requests.append(request)
+                return httpx.Response(200, json={**fake.supplier, "Active": False})
+        return _orig(request)
+
+    fake.handler = handler
+    assert _post(fake).refusal_code == "vendor_inactive"
+
+
+def test_an_expired_registration_is_company_subscription_inactive():
+    fake = FakeSage()
+    fake.save_status = 402
     result = _post(fake)
-    assert result.message == erp_failure_message("Sage Accounting (ZA)", 400)
-    assert PII[1] not in result.message and API_KEY not in result.message
+    assert result.refusal_code == "company_subscription_inactive"
+    assert result.not_posted is True and not result.retryable
+
+
+@pytest.mark.parametrize("status", [503, 500, 409, 408])
+def test_a_save_answer_that_can_change_stays_retryable_and_possibly_posted(status):
+    fake = FakeSage()
+    fake.save_status = status
+    result = _post(fake)
+    assert result.message == erp_failure_message("Sage Accounting (ZA)", status)
+    assert result.retryable and result.not_posted is False and result.refusal_code is None
+
+
+def test_rate_limited_save_is_not_retried_automatically():
+    """Sage blocks the company for an hour on a 429 and warns that further
+    requests extend it, so the backoff must not re-send."""
+    fake = FakeSage()
+    fake.save_status = 429
+    result = _post(fake)
+    assert not result.retryable and result.not_posted is True
+    assert "rate_limited" in result.message
+
+
+@pytest.mark.parametrize("resource", ["SupplierInvoice", "Supplier", "Account"])
+def test_a_401_anywhere_stops_the_push_as_not_connected(resource):
+    """Never retried: 20 failed logins in an hour block the Sage user for 24 h."""
+    fake = FakeSage()
+    fake.status[resource] = 401
+    result = _post(fake)
+    assert not result.success and not result.retryable
+    assert result.refusal_code == "not_connected" and result.not_posted is True
+    assert "SupplierInvoice/Save" not in fake.paths()
+    # The push stopped at the first 401 — no further call was made.
+    assert fake.paths()[-1].startswith(resource)
 
 
 def test_transport_error_never_leaks_the_url_or_credentials():
@@ -632,7 +864,14 @@ def test_operator_override_skips_the_guard(monkeypatch):
 def test_get_invoice_status_reads_amount_due():
     fake = FakeSage()
     fake.invoices = [
-        {"ID": 77, "Reference": CORR, "DocumentNumber": "INV-1", "Total": 115, "AmountDue": 0}
+        {
+            "ID": 77,
+            "Reference": CORR,
+            "DocumentNumber": "INV-1",
+            "Total": 115,
+            "AmountDue": 0,
+            "Paid": True,
+        }
     ]
     adapter = SageAccountingZaAdapter(CONFIG)
     assert _run(fake, lambda: adapter.get_invoice_status("77")) is ErpInvoiceStatus.paid
@@ -642,38 +881,40 @@ def test_get_invoice_status_reads_amount_due():
     assert len(fake.requests) == before
 
 
-@pytest.mark.parametrize(
-    ("record", "deleted"),
-    [
-        ({"Total": 115, "AmountDue": 115}, True),
-        ({"Total": 115, "AmountDue": 15}, False),
-        ({"Total": 115, "AmountDue": 115, "Locked": True}, False),
-        ({"Total": 115, "AmountDue": 0, "Paid": True}, False),
-    ],
-)
-def test_void_deletes_only_an_untouched_invoice(record, deleted):
+def test_void_is_refused_without_a_call_because_the_api_has_no_delete():
+    """API 2.0.0 has no SupplierInvoice/Delete; a reversal is a SupplierReturn,
+    an accountant's call (decisions §303). Even an untouched invoice."""
     fake = FakeSage()
-    fake.invoices = [{"ID": 77, "Reference": CORR, "DocumentNumber": "INV-1", **record}]
+    fake.invoices = [
+        _invoice(ID=77, Reference=CORR, DocumentNumber="INV-1", Total=115, AmountDue=115)
+    ]
     adapter = SageAccountingZaAdapter(CONFIG)
-    assert _run(fake, lambda: adapter.void_invoice("77")) is deleted
-    assert ("SupplierInvoice/Delete/77" in fake.paths()) is deleted
+    assert _run(fake, lambda: adapter.void_invoice("77")) is False
+    assert fake.requests == []
 
 
 def test_list_vendors_gl_accounts_and_pos():
     fake = FakeSage()
     adapter = SageAccountingZaAdapter(CONFIG)
     vendors = _run(fake, adapter.list_vendors)
-    assert [(v.erp_vendor_id, v.name) for v in vendors] == [
-        ("12", "Acme (Pty) Ltd"),
-        ("13", "Beta"),
+    # An inactive supplier is emitted inactive, not dropped and not a live payee.
+    assert [(v.erp_vendor_id, v.name, v.active) for v in vendors] == [
+        ("12", "Acme (Pty) Ltd", True),
+        ("13", "Beta", False),
     ]
     assert fake.requests[0].url.params["$top"] == "100"
+    # Paging is stable only under an explicit order (Sage: "you will need to
+    # provide one"), and only on a non-string field.
+    assert all(r.url.params.get("$orderby") == "ID" for r in fake.requests)
     accounts = _run(fake, adapter.list_gl_accounts)
-    assert [(a.erp_account_id, a.account_type) for a in accounts] == [
-        ("6100", "expense"),
-        ("6200", "expense"),
-        ("6300", "expense"),
-    ]  # 6400 is inactive
+    # 6400 is inactive: emitted as such, not dropped — it still exists, so a
+    # row linked to it is not a dead link (§284), and the sync creates none.
+    assert [(a.erp_account_id, a.account_type, a.active) for a in accounts] == [
+        ("6100", "expense", True),
+        ("6200", "expense", True),
+        ("6300", "expense", True),
+        ("6400", "expense", False),
+    ]
     pos = _run(fake, adapter.list_pos)
     assert [(p.po_number, p.total, p.status, p.currency) for p in pos] == [
         ("PO0001", Decimal("1150.00"), "open", None),
@@ -681,6 +922,57 @@ def test_list_vendors_gl_accounts_and_pos():
     ]
     assert pos[0].expected_delivery_date == date(2026, 11, 1)
     assert pos[1].expected_delivery_date is None
+    assert [p.vendor_erp_id for p in pos] == ["12", None]
+
+
+def test_list_pos_carries_the_supplier_id_list_vendors_reports():
+    """A PO names its supplier by the ``ID`` ``list_vendors`` stamps as
+    ``erp_vendor_id``, so the sync links it by id: a supplier renamed since the
+    PO was raised and a second supplier with the same name both resolve to the
+    right one. A missing or non-numeric id is no id."""
+    fake = FakeSage()
+    suppliers = [{"ID": 21, "Name": "Acme"}, {"ID": 22, "Name": "Acme"}, {"ID": 23, "Name": "Bolt"}]
+    orders = [
+        {"DocumentNumber": "PO-1", "SupplierId": 22, "SupplierName": "Acme", "Total": 1},
+        {"DocumentNumber": "PO-2", "SupplierId": 23, "SupplierName": "Bolt Old", "Total": 1},
+        {"DocumentNumber": "PO-3", "SupplierName": "Acme", "Total": 1},
+        {"DocumentNumber": "PO-4", "SupplierId": 0, "SupplierName": "Acme", "Total": 1},
+    ]
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/Supplier/Get"):
+            return fake._paged(suppliers, request)
+        if request.url.path.endswith("/PurchaseOrder/Get"):
+            return fake._paged(orders, request)
+        return _orig(request)
+
+    fake.handler = handler
+    adapter = SageAccountingZaAdapter(CONFIG)
+    vendor_ids = {v.erp_vendor_id for v in _run(fake, adapter.list_vendors)}
+    by_number = {p.po_number: p.vendor_erp_id for p in _run(fake, adapter.list_pos)}
+    assert by_number == {"PO-1": "22", "PO-2": "23", "PO-3": None, "PO-4": None}
+    assert {"22", "23"} <= vendor_ids
+
+
+def test_a_po_with_no_total_is_reported_skipped():
+    """Left out, never synced at 0, and named so a total an earlier sync stored
+    for the number is marked unverifiable (decisions §323)."""
+    fake = FakeSage()
+    orders = [
+        {"DocumentNumber": "PO-1", "Total": 10},
+        {"DocumentNumber": "PO-NO-TOTAL", "Total": None},
+        {"Total": 5},
+    ]
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/PurchaseOrder/Get"):
+            return fake._paged(orders, request)
+        return _orig(request)
+
+    fake.handler = handler
+    listing = _run(fake, SageAccountingZaAdapter(CONFIG).list_pos_report)
+    assert [p.po_number for p in listing.pos] == ["PO-1"]
+    assert listing.skipped == [SkippedPo("PO-NO-TOTAL", PoSkipReason.unpriceable)]
 
 
 def test_list_paging_walks_skip_until_the_total():
@@ -701,14 +993,97 @@ def test_list_paging_walks_skip_until_the_total():
     assert [r.url.params["$skip"] for r in fake.requests] == ["0", "100", "200"]
 
 
-def test_syncs_degrade_to_empty_on_failure():
+def test_every_sync_listing_raises_on_failure_the_po_list_included():
+    """The chart and vendor syncs read absence as evidence, so a failed listing
+    raises instead of returning [] (§284). The PO listing raises too: an empty
+    answer would hide every PO it would have reported skipped, leaving a stored
+    total trusted after the ERP stopped pricing it (§323)."""
     fake = FakeSage()
     for resource in ("Supplier", "Account", "PurchaseOrder"):
         fake.status[resource] = 500
     adapter = SageAccountingZaAdapter(CONFIG)
-    assert _run(fake, adapter.list_vendors) == []
-    assert _run(fake, adapter.list_gl_accounts) == []
-    assert _run(fake, adapter.list_pos) == []
+    for listing in (adapter.list_vendors, adapter.list_gl_accounts, adapter.list_pos_report):
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(fake, listing)
+        assert exc.value.gap is ListingGap.fetch_failed
+    with pytest.raises(ErpListingIncomplete):
+        _run(fake, adapter.list_pos)
+
+
+def test_a_po_listing_is_read_whole_or_raises():
+    """A later page failing, a transport error, or more POs than
+    ``SYNC_LISTING_MAX_ROWS`` raises; the POs read so far are never returned."""
+    fake = FakeSage()
+    mode = {"fail_from": None, "transport": False, "rows": 250}
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/PurchaseOrder/Get"):
+            skip, top = int(request.url.params["$skip"]), int(request.url.params["$top"])
+            if mode["transport"]:
+                raise httpx.ConnectError("refused")
+            if mode["fail_from"] is not None and skip >= mode["fail_from"]:
+                return httpx.Response(503, json={})
+            page = [
+                {"DocumentNumber": f"PO-{i}", "Total": 1}
+                for i in range(skip, min(skip + top, mode["rows"]))
+            ]
+            return httpx.Response(200, json={"TotalResults": mode["rows"], "Results": page})
+        return _orig(request)
+
+    fake.handler = handler
+    adapter = SageAccountingZaAdapter(CONFIG)
+    assert len(_run(fake, adapter.list_pos_report).pos) == 250
+
+    mode["fail_from"] = 100
+    with pytest.raises(ErpListingIncomplete) as exc:
+        _run(fake, adapter.list_pos_report)
+    assert exc.value.gap is ListingGap.fetch_failed
+
+    mode.update(fail_from=None, transport=True)
+    with pytest.raises(ErpListingIncomplete) as exc:
+        _run(fake, adapter.list_pos_report)
+    assert exc.value.gap is ListingGap.fetch_failed
+
+    mode.update(transport=False, rows=SYNC_LISTING_MAX_ROWS + 1)
+    with pytest.raises(ErpListingIncomplete) as exc:
+        _run(fake, adapter.list_pos_report)
+    assert exc.value.gap is ListingGap.truncated
+
+
+def test_a_later_page_failing_raises_never_returns_the_first_pages():
+    fake = FakeSage()
+    many = [{"ID": i, "Name": f"S{i}"} for i in range(1, 251)]
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/Supplier/Get"):
+            skip, top = int(request.url.params["$skip"]), int(request.url.params["$top"])
+            if skip >= 100:
+                return httpx.Response(503, json={})
+            return httpx.Response(
+                200, json={"TotalResults": 250, "Results": many[skip : skip + top]}
+            )
+        return _orig(request)
+
+    fake.handler = handler
+    with pytest.raises(ErpListingIncomplete) as exc:
+        _run(fake, SageAccountingZaAdapter(CONFIG).list_vendors)
+    assert exc.value.gap is ListingGap.fetch_failed
+
+
+def test_a_listing_past_the_sync_bound_raises_truncated():
+    fake = FakeSage()
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/Account/Get"):
+            skip = int(request.url.params["$skip"])
+            page = [{"ID": skip + i + 1, "Name": "A"} for i in range(100)]
+            return httpx.Response(200, json={"TotalResults": 10**6, "Results": page})
+        return _orig(request)
+
+    fake.handler = handler
+    with pytest.raises(ErpListingIncomplete) as exc:
+        _run(fake, SageAccountingZaAdapter(CONFIG).list_gl_accounts)
+    assert exc.value.gap is ListingGap.truncated
 
 
 def test_test_connection_requires_the_configured_company():
@@ -720,3 +1095,59 @@ def test_test_connection_requires_the_configured_company():
     fake = FakeSage()
     fake.status["Company"] = 401
     assert _run(fake, SageAccountingZaAdapter(CONFIG).test_connection) is False
+
+
+def test_a_transport_error_on_any_sync_listing_is_an_incomplete_listing():
+    """A refused connection is a coded incomplete listing on the chart, vendor
+    and PO listings alike, never ``SageZaError`` (an uncoded 502)."""
+    fake = FakeSage()
+
+    def handler(request, _orig=fake.handler):
+        if request.url.path.endswith("/Get"):
+            raise httpx.ConnectError("refused")
+        return _orig(request)
+
+    fake.handler = handler
+    adapter = SageAccountingZaAdapter(CONFIG)
+    for listing in (adapter.list_vendors, adapter.list_gl_accounts, adapter.list_pos_report):
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(fake, listing)
+        assert exc.value.gap is ListingGap.fetch_failed
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        # Sage SA's real PO strings are unconfirmed (#654): words, not exact
+        # values. A draft or one awaiting approval is never matched against
+        # (decisions §394).
+        ("Draft", UNISSUED_PO_STATUS),
+        ("Pending Approval", UNISSUED_PO_STATUS),
+        ("Approved", "open"),
+        ("Cancelled", "cancelled"),
+        ("Complete", "closed"),
+        ("Unknown", "open"),
+    ],
+)
+def test_po_status_maps_an_unapproved_po_to_unissued(status, expected):
+    from app.services.erp_adapters.sage_accounting_za import _po_status
+
+    assert _po_status(status) == expected
+
+
+# ---------------------------------------------------------------------------
+# Revocation at tenant deletion (decisions §400)
+# ---------------------------------------------------------------------------
+
+
+def test_revoke_is_unsupported_and_calls_no_one():
+    """Every call carries the Sage user's own login; no token is ever issued,
+    so there is nothing to revoke and the customer changes that password."""
+    from app.services.erp_oauth import REVOKE_UNSUPPORTED
+
+    fake = FakeSage()
+    outcome = _run(fake, SageAccountingZaAdapter(CONFIG).revoke_stored_access)
+    assert outcome == REVOKE_UNSUPPORTED
+    assert fake.requests == []
+    assert SageAccountingZaAdapter.revokes_stored_access is False
+    assert "password" in SageAccountingZaAdapter.provider_side_disconnect

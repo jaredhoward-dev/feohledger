@@ -23,23 +23,34 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import PaginationParams, pagination_params
 from app.api.portal_deps import get_current_vendor_user
+from app.api.refusals import ActionRefusal
 from app.database import get_control_db
 from app.models.discount import OFFER_STATUS_OFFERED, DiscountOffer
 from app.models.exception import Exception as APException
 from app.models.invoice import Invoice, InvoiceLineItem, InvoiceStatus
+from app.models.invoice_status import was_ever_approved
 from app.models.organization import Organization
 from app.models.payment import Payment
-from app.models.procurement import POLineItem, PurchaseOrder
+from app.models.procurement import (
+    DEAD_PO_STATUSES,
+    UNISSUED_PO_STATUS,
+    POLineItem,
+    PurchaseOrder,
+    po_currency_code,
+    po_vouched_money,
+)
 from app.models.supplier_chat import ChatAuthorRole, ChatThreadStatus, SupplierChatMessage
 from app.models.vendor import Vendor
 from app.models.vendor_change_request import VendorChangeRequest
 from app.models.vendor_user import VendorUser
+from app.schemas.action_verdict import CodedRefusal
 from app.schemas.money import json_money
 from app.schemas.organization import BrandConfig
 from app.schemas.portal import (
@@ -80,7 +91,6 @@ from app.services.exception_lifecycle import record_decision
 from app.services.extraction_dispatch import dispatch_extraction
 from app.services.invoice_warnings import refresh_warnings
 from app.services.storage import (
-    delete_file,
     get_file,
     tax_form_type_from_key,
     upload_chat_file,
@@ -564,7 +574,8 @@ async def submit_invoice(
         vendor_id=vendor.id,
         description="",
         amount=Decimal("0"),
-        currency="USD",
+        # Unknown until extraction reads the document (§473).
+        currency=None,
         status=InvoiceStatus.new,
         organization_id=vendor.organization_id,
         # The supplier portal has no entity selector — a vendor's invoice lands
@@ -704,7 +715,11 @@ async def resubmit_invoice(
 
     old_file_key = inv.file_key
     try:
-        file_key, file_url = await upload_invoice_file(vendor.organization_id, inv.id, file)
+        # Versioned: the rejected document is KEPT (decisions §363), so the
+        # corrected one must not land on its key when the filenames match.
+        file_key, file_url = await upload_invoice_file(
+            vendor.organization_id, inv.id, file, versioned=True
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     inv.file_key = file_key
@@ -718,6 +733,9 @@ async def resubmit_invoice(
         "filename": file.filename,
         "content_type": file.content_type,
     }
+    if old_file_key:
+        # The version AP rejected, kept: this audit row is its reference.
+        source_details["previous_file_key"] = old_file_key
 
     # Resolve the open rejection exception(s) — the vendor has responded.
     rejection_excs = (
@@ -754,7 +772,11 @@ async def resubmit_invoice(
         db, vendor.organization_id, "extraction", invoice_id=inv.id
     )
 
-    if extraction_enabled:
+    # An invoice AP approved once (and then recalled and rejected, decisions
+    # §374) is not re-read: extraction would rewrite figures that were signed
+    # off, and the engine refuses `→ pending` for it. The corrected document
+    # goes straight to the reviewer, who keys any correction by hand.
+    if extraction_enabled and not was_ever_approved(inv):
         await transition_invoice(
             db,
             inv,
@@ -802,14 +824,6 @@ async def resubmit_invoice(
         await db.commit()
         await db.refresh(inv)
         message = "Invoice resubmitted. Awaiting AP review."
-
-    # Best-effort: drop the superseded file object if the new one has a
-    # different key (same filename overwrites in place).
-    if old_file_key and old_file_key != file_key:
-        try:
-            await delete_file(old_file_key)
-        except Exception:
-            logger.warning("could not delete superseded invoice file on resubmit")
 
     return {
         "id": str(inv.id),
@@ -891,7 +905,9 @@ async def list_my_payments(
                 invoice_id=str(p.invoice_id),
                 invoice_number=inv_num or "",
                 amount=p.amount,
-                currency=inv_currency or "USD",
+                # NULL when the paid invoice records no currency (decisions
+                # §473): the portal renders the figure bare, never as dollars.
+                currency=inv_currency,
                 method=p.method,
                 status=p.status,
                 reference=p.reference,
@@ -908,6 +924,153 @@ async def list_my_payments(
 
 # ---------- Purchase orders + PO flip ----------
 
+#: A PO the ERP has not approved or issued yet (decisions §394) has not been
+#: sent to the supplier, so the portal neither lists, shows nor flips it: to
+#: the supplier it does not exist until the ERP issues it.
+_SUPPLIER_VISIBLE_PO = PurchaseOrder.status != UNISSUED_PO_STATUS
+
+#: The flip's refusal for a PO that no longer represents a live commitment.
+PO_NOT_INVOICEABLE = "po_not_invoiceable"
+#: The flip's refusal for a PO this vendor has already invoiced (decisions
+#: §468).
+PO_ALREADY_INVOICED = "po_already_invoiced"
+#: The flip's refusal for a PO whose total the ERP's last sync could not vouch
+#: for (decisions §323).
+PO_TOTAL_UNVERIFIABLE = "po_total_unverifiable"
+
+
+def po_flip_refusal(po: PurchaseOrder, *, already_invoiced: bool) -> ActionRefusal | None:
+    """Why the flip would refuse to mint a NEW invoice from ``po``, or ``None``.
+
+    The one gate the flip raises from and the list / detail ship as
+    ``flip_verdict``, so the portal offers "Create invoice" exactly where the
+    endpoint accepts it (issue #575). The caller has already scoped ``po`` to
+    the signed-in vendor, so the ``status`` param names only their own order.
+
+    - **A dead order** (``models/procurement.DEAD_PO_STATUSES``: cancelled,
+      voided, closed — and unissued, which the portal already hides) commits
+      no spend, so there is nothing left to bill. This is deliberately the
+      wider set, not the matcher's ``UNMATCHABLE_PO_STATUSES``: the matcher
+      lets a ``closed`` PO match because the invoice it is matching may itself
+      be what closed it (fully billed), whereas a flip bills the PO's WHOLE
+      total again as a new invoice — on a closed order that is a second bill.
+    - **An order already invoiced** (``already_invoiced``, from
+      :func:`_pos_already_invoiced`): an open PO the vendor has billed through
+      a normal submit (or AP keyed) before the ERP closes it. The flip would
+      bill the whole total a second time, under an empty invoice number the
+      duplicate detector cannot match (decisions §468). No params: the
+      caller learns only about its own invoices, and not which one.
+    - **An unvouched total** (decisions §323): the flip bills ``po.total``, and
+      an invoice minted at a figure nobody vouches for would be a payable at an
+      unconfirmed amount. Kept as the plain-string 409 it always answered.
+    """
+    if po.status in DEAD_PO_STATUSES:
+        return ActionRefusal(
+            code=PO_NOT_INVOICEABLE,
+            message=f"This purchase order is {po.status} and can no longer be invoiced.",
+            http_status=status.HTTP_409_CONFLICT,
+            params={"status": po.status},
+            coded=True,
+        )
+    if already_invoiced:
+        return ActionRefusal(
+            code=PO_ALREADY_INVOICED,
+            message="You have already invoiced this purchase order. "
+            "Submit an invoice for any remaining amount instead.",
+            http_status=status.HTTP_409_CONFLICT,
+            coded=True,
+        )
+    if po.total_unverifiable_reason:
+        return ActionRefusal(
+            code=PO_TOTAL_UNVERIFIABLE,
+            message="This purchase order's total could not be confirmed. "
+            "Submit your invoice instead.",
+            http_status=status.HTTP_409_CONFLICT,
+        )
+    return None
+
+
+async def _pos_already_invoiced(
+    db: AsyncSession, vendor_id: uuid.UUID, pos: list[PurchaseOrder]
+) -> set[uuid.UUID]:
+    """The ids of ``pos`` that a live invoice of ``vendor_id`` already cites.
+
+    "Cites" is what the matcher resolves an invoice to its PO by
+    (``services/po_matching``): the PO's number on ``Invoice.po_number`` within
+    the invoice's entity (an invoice or PO with no entity spans them), or the
+    PO's id among a multi-PO split's recorded legs (``split_po_ids``). "Live"
+    is every status but ``rejected``: from ``new`` to ``done`` the invoice is,
+    or can still become, a payable, and ``failed`` is either a stalled
+    extraction or an approved bill whose ERP push is retried. A rejected
+    invoice bills nothing while it stays rejected, and the supplier who is
+    told to re-bill needs a way to (decisions §468).
+
+    Except the PO's OWN rejected flip (``reference_number`` is its
+    ``po-flip:<po_id>`` marker), which still counts (decisions §469), and for
+    that PO only.
+    The marker is unique in every status (migration 0024), so a second flip
+    could never mint an invoice anyway: the endpoint replays the rejected one.
+    And a rejected flip is reopened, not replaced (``rejected → new`` by AP, or
+    the supplier's ``/resubmit``), so a second live flip beside it would be a
+    double bill the moment it reopens. Offering "Create invoice" there would
+    promise a creation the endpoint never performs.
+
+    Scoped to the caller's own vendor, so the verdict says nothing about any
+    other supplier's invoices.
+    """
+    if not pos:
+        return set()
+    numbers = {po.po_number for po in pos if po.po_number}
+    ids = [str(po.id) for po in pos]
+    cites = Invoice.split_po_ids.has_any(array(ids))
+    if numbers:
+        cites = or_(Invoice.po_number.in_(numbers), cites)
+    own_flips = [f"po-flip:{po.id}" for po in pos]
+    rows = (
+        await db.execute(
+            select(
+                Invoice.po_number,
+                Invoice.entity_id,
+                Invoice.split_po_ids,
+                Invoice.status,
+                Invoice.reference_number,
+            ).where(
+                Invoice.vendor_id == vendor_id,
+                or_(
+                    Invoice.status != InvoiceStatus.rejected,
+                    Invoice.reference_number.in_(own_flips),
+                ),
+                cites,
+            )
+        )
+    ).all()
+    invoiced: set[uuid.UUID] = set()
+    for po in pos:
+        for number, entity_id, split, inv_status, reference in rows:
+            if inv_status == InvoiceStatus.rejected and reference != f"po-flip:{po.id}":
+                # A rejected flip counts for its OWN PO only, so a flip whose
+                # PO number was edited cannot mark another order invoiced.
+                continue
+            same_entity = entity_id is None or po.entity_id is None or entity_id == po.entity_id
+            by_number = number == po.po_number and same_entity
+            by_leg = isinstance(split, list) and str(po.id) in split
+            if by_number or by_leg:
+                invoiced.add(po.id)
+                break
+    return invoiced
+
+
+async def _po_flip_verdicts(
+    db: AsyncSession, vendor_id: uuid.UUID, pos: list[PurchaseOrder]
+) -> dict[uuid.UUID, CodedRefusal | None]:
+    """``flip_verdict`` for each of ``pos``, in one query for the whole page."""
+    invoiced = await _pos_already_invoiced(db, vendor_id, pos)
+    verdicts: dict[uuid.UUID, CodedRefusal | None] = {}
+    for po in pos:
+        refusal = po_flip_refusal(po, already_invoiced=po.id in invoiced)
+        verdicts[po.id] = CodedRefusal(**refusal.verdict()) if refusal else None
+    return verdicts
+
 
 @router.get("/purchase-orders", response_model=PortalPOListResponse)
 async def list_my_purchase_orders(
@@ -915,22 +1078,22 @@ async def list_my_purchase_orders(
     db: AsyncSession = Depends(get_tenant_db),
     vu: VendorUser = Depends(get_current_vendor_user),
 ):
-    """POs owned by the caller's vendor. The only filter is
-    `PurchaseOrder.vendor_id == vu.vendor_id` — same vendor-scoping
-    discipline as the invoice list."""
+    """POs owned by the caller's vendor: `PurchaseOrder.vendor_id ==
+    vu.vendor_id` — same vendor-scoping discipline as the invoice list — less
+    any the ERP has not issued yet (`_SUPPLIER_VISIBLE_PO`)."""
     line_count = (
         select(POLineItem.po_id, func.count().label("n")).group_by(POLineItem.po_id).subquery()
     )
     query = (
         select(PurchaseOrder, func.coalesce(line_count.c.n, 0))
         .outerjoin(line_count, line_count.c.po_id == PurchaseOrder.id)
-        .where(PurchaseOrder.vendor_id == vu.vendor_id)
+        .where(PurchaseOrder.vendor_id == vu.vendor_id, _SUPPLIER_VISIBLE_PO)
     )
     total = (
         await db.execute(
             select(func.count())
             .select_from(PurchaseOrder)
-            .where(PurchaseOrder.vendor_id == vu.vendor_id)
+            .where(PurchaseOrder.vendor_id == vu.vendor_id, _SUPPLIER_VISIBLE_PO)
         )
     ).scalar() or 0
 
@@ -940,6 +1103,7 @@ async def list_my_purchase_orders(
         .limit(pagination.limit)
     )
     rows = (await db.execute(query)).all()
+    verdicts = await _po_flip_verdicts(db, vu.vendor_id, [po for po, _ in rows])
 
     return PortalPOListResponse(
         items=[
@@ -947,10 +1111,12 @@ async def list_my_purchase_orders(
                 id=str(po.id),
                 po_number=po.po_number,
                 status=po.status,
-                total=po.total,
+                total=po_vouched_money(po, po.total),
+                total_unverifiable=bool(po.total_unverifiable_reason),
                 currency=po.currency,
                 line_item_count=n,
                 created_at=po.created_at,
+                flip_verdict=verdicts[po.id],
             )
             for po, n in rows
         ],
@@ -969,7 +1135,9 @@ async def get_my_purchase_order(
     po = (
         await db.execute(
             select(PurchaseOrder).where(
-                PurchaseOrder.id == po_id, PurchaseOrder.vendor_id == vu.vendor_id
+                PurchaseOrder.id == po_id,
+                PurchaseOrder.vendor_id == vu.vendor_id,
+                _SUPPLIER_VISIBLE_PO,
             )
         )
     ).scalar_one_or_none()
@@ -978,20 +1146,23 @@ async def get_my_purchase_order(
         raise HTTPException(status_code=404, detail="Purchase order not found")
 
     lines = (await db.execute(select(POLineItem).where(POLineItem.po_id == po.id))).scalars().all()
+    verdicts = await _po_flip_verdicts(db, vu.vendor_id, [po])
 
     return PortalPODetail(
         id=str(po.id),
         po_number=po.po_number,
         status=po.status,
-        total=po.total,
+        total=po_vouched_money(po, po.total),
+        total_unverifiable=bool(po.total_unverifiable_reason),
         currency=po.currency,
         created_at=po.created_at,
+        flip_verdict=verdicts[po.id],
         line_items=[
             PortalPOLineItem(
                 description=li.description,
                 quantity=li.quantity,
-                unit_price=li.unit_price,
-                total=li.total,
+                unit_price=po_vouched_money(po, li.unit_price),
+                total=po_vouched_money(po, li.total),
             )
             for li in lines
         ],
@@ -1019,7 +1190,9 @@ async def flip_purchase_order(
     po = (
         await db.execute(
             select(PurchaseOrder).where(
-                PurchaseOrder.id == po_id, PurchaseOrder.vendor_id == vu.vendor_id
+                PurchaseOrder.id == po_id,
+                PurchaseOrder.vendor_id == vu.vendor_id,
+                _SUPPLIER_VISIBLE_PO,
             )
         )
     ).scalar_one_or_none()
@@ -1059,6 +1232,15 @@ async def flip_purchase_order(
             message="Invoice already created from this PO.",
         )
 
+    # A dead order, one this vendor has already invoiced, or an unvouched total
+    # mints nothing — after the replay short-circuit above, so a retry of a
+    # flip that went through (and may itself have closed the PO, and whose
+    # invoice now cites it) still gets its invoice back.
+    already_invoiced = po.id in await _pos_already_invoiced(db, vendor_id_scope, [po])
+    refusal = po_flip_refusal(po, already_invoiced=already_invoiced)
+    if refusal:
+        raise refusal.http()
+
     po_lines = (
         (await db.execute(select(POLineItem).where(POLineItem.po_id == po.id))).scalars().all()
     )
@@ -1071,11 +1253,11 @@ async def flip_purchase_order(
         amount=po.total,
         # The invoice bills the PO's own total, so it is in the PO's currency.
         # A PO that records none (created before migration 0099 with no
-        # requisition behind it) falls back to the column's historical "USD":
-        # `invoices.currency` is NOT NULL and cannot say "unknown". That pairing
-        # is never mistaken for proof — `po_matching` reads the PO's NULL, not
-        # this placeholder, and reports the currency leg as unverified.
-        currency=po.currency or "USD",
+        # requisition behind it) yields an invoice that records none either:
+        # NULL is "unknown" (decisions §473), so a run refuses it as
+        # `currency_unknown` until someone states the code, rather than paying
+        # it in a guessed USD.
+        currency=po_currency_code(po.currency),
         status=InvoiceStatus.new,
         po_number=po.po_number,
         # Stable per-PO marker — drives the idempotency guard above.
@@ -1788,17 +1970,21 @@ def _vendor_offer_filter(vu: VendorUser):
 
 
 async def _portal_offer_or_404(
-    db: AsyncSession, offer_id: uuid.UUID, vu: VendorUser
+    db: AsyncSession, offer_id: uuid.UUID, vu: VendorUser, *, for_update: bool = False
 ) -> DiscountOffer:
-    """Fetch an offer the calling vendor owns, else 404 (never 403)."""
-    offer = (
-        await db.execute(
-            select(DiscountOffer).where(
-                DiscountOffer.id == offer_id,
-                _vendor_offer_filter(vu),
-            )
-        )
-    ).scalar_one_or_none()
+    """Fetch an offer the calling vendor owns, else 404 (never 403).
+
+    ``for_update=True`` (accept / decline) locks the row before the status
+    check, the same lock the AP side takes (``discount_offers.lock_offer``), so
+    a supplier and an AP user deciding at once serialize: the second sees the
+    first's decision and gets the 409."""
+    q = select(DiscountOffer).where(
+        DiscountOffer.id == offer_id,
+        _vendor_offer_filter(vu),
+    )
+    if for_update:
+        q = offers_svc.lock_offer(q)
+    offer = (await db.execute(q)).scalar_one_or_none()
     if offer is None:
         raise HTTPException(status_code=404, detail="Discount offer not found")
     return offer
@@ -1876,7 +2062,7 @@ async def accept_my_discount_offer(
     payment run still funds the early payment. Idempotency: re-accepting a
     non-`offered` offer raises `409` (the status guard is the dedupe), so a
     double-click can't double-count savings."""
-    offer = await _portal_offer_or_404(db, offer_id, vu)
+    offer = await _portal_offer_or_404(db, offer_id, vu, for_update=True)
     today = utc_today()
 
     # Same gate as the AP accept: an invoice already paid / done has no payment
@@ -1955,7 +2141,7 @@ async def decline_my_discount_offer(
     `discount_offers.decline_offer`; `409` if the offer is no longer `offered`
     — including when its window has already closed, which the supplier now sees
     as `expired` rather than as a live offer with a Decline button."""
-    offer = await _portal_offer_or_404(db, offer_id, vu)
+    offer = await _portal_offer_or_404(db, offer_id, vu, for_update=True)
     today = utc_today()
     try:
         offers_svc.decline_offer(offer, now=datetime.now(UTC), as_of=today)

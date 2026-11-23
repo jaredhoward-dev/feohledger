@@ -2,7 +2,13 @@ import { getApiBase, getTenantSlug } from '#lib/tenant.ts';
 import { getSelectedEntityId } from '#lib/entity.ts';
 import { apiErrorCode, formatApiDetail } from '#lib/utils/apiError.ts';
 import { localizeApiDetail } from '#lib/api/codedRefusals.ts';
-import { m } from '#lib/i18n/store.svelte.ts';
+import { AssistantBudgetError, assistantBudgetError } from '#lib/api/assistantBudget.ts';
+import {
+	loginPathFor,
+	revokeRejectedSession,
+	sessionRejection
+} from '#lib/api/sessionRejection.ts';
+import { localeReady, m } from '#lib/i18n/store.svelte.ts';
 
 // Re-exported so callers that already import from `#lib/api` (e.g. the
 // hand-rolled fetch in `api/expenses.ts`) don't need a second import path.
@@ -72,6 +78,23 @@ export function apiErrorFromBody(
 	return new ApiError(message, status, code, params, body.detail);
 }
 
+/**
+ * {@link apiErrorFromBody}, once the preloaded refusal catalogue has landed.
+ * The message is baked into the error when it is built, so a refusal answered
+ * before that slice arrived (a page whose very first request is refused, such
+ * as `/verify`'s completion) would otherwise keep the server's English
+ * sentence for good. Only the error path waits; a successful response never
+ * does, and the wait is already resolved after startup.
+ */
+export async function localizedApiError(
+	body: { detail?: unknown },
+	fallback: string,
+	status: number
+): Promise<ApiError> {
+	await localeReady();
+	return apiErrorFromBody(body, fallback, status);
+}
+
 function getToken(): string | null {
 	if (typeof window === 'undefined') return null;
 	return localStorage.getItem('auth_token');
@@ -87,6 +110,34 @@ export function clearToken() {
 
 export function hasToken(): boolean {
 	return !!getToken();
+}
+
+/**
+ * End the signed-in session when a refused response says it is over: a 401,
+ * or a 403 coded `token_tenant_mismatch` (a token for another workspace than
+ * this page's — `api/sessionRejection.ts`). Clears the token and sends the user
+ * to this host's `/login`, with the reason in the URL for the second — whose
+ * token is also revoked on the server first, best-effort, since it is still
+ * live in its own workspace (`revokeRejectedSession`). Returns
+ * whether it did. Every client of the backend calls this on a refused response
+ * — `request()`, the blob downloads, the SSE stream and `api/expenses.ts`'s
+ * hand-rolled submit — so none of them can leave a dead session behind a
+ * screen where every call fails.
+ */
+export function endSessionIfRejected(status: number, detail: unknown): boolean {
+	const rejection = sessionRejection(status, apiErrorCode(detail).code);
+	if (!rejection) return false;
+	// A token for another workspace is still live there — revoke it on the
+	// server too, best-effort, before forgetting it here.
+	revokeRejectedSession(rejection, getToken(), getApiBase(), (url, init) => fetch(url, init));
+	clearToken();
+	// `next` brings the user back to the page they were on once they sign in
+	// again (`#lib/utils/postLoginRedirect.ts` validates it on both ends).
+	window.location.href = loginPathFor(
+		rejection,
+		window.location.pathname + window.location.search
+	);
+	return true;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -111,23 +162,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 	const res = await fetch(`${getApiBase()}${path}`, { ...init, headers });
 
-	if (res.status === 401) {
-		// Auto-redirect only fires when an existing session went stale.
-		// For anonymous requests (e.g. /api/auth/login itself), 401
-		// means "wrong credentials" — let the caller's catch handle it
-		// so forms can render error banners instead of being torn down
-		// mid-render by a navigation.
-		if (token) {
-			clearToken();
-			window.location.href = '/login';
-		}
-		const body = await res.json().catch(() => ({}));
-		throw apiErrorFromBody(body, 'Unauthorized', res.status);
-	}
-
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
-		throw apiErrorFromBody(body, `API error ${res.status}`, res.status);
+		// Auto-redirect only fires when an existing session is over (expired,
+		// or minted for another workspace). For anonymous requests (e.g.
+		// /api/auth/login itself), a 401 means "wrong credentials" — let the
+		// caller's catch handle it so forms can render error banners instead
+		// of being torn down mid-render by a navigation.
+		if (token) endSessionIfRejected(res.status, body.detail);
+		throw await localizedApiError(
+			body,
+			res.status === 401 ? 'Unauthorized' : `API error ${res.status}`,
+			res.status
+		);
 	}
 
 	if (res.status === 204) return undefined as T;
@@ -142,18 +189,17 @@ async function fetchBlob(path: string): Promise<string> {
 	return URL.createObjectURL(blob);
 }
 
-/** Shared tail of every blob download: the 401 clear-and-bounce `request()`
- *  performs, the backend's own `detail` when it sent one, then the body as a
- *  Blob. One owner so the GET and POST helpers can't drift on either. */
+/** Shared tail of every blob download: the session-ending clear-and-bounce
+ *  `request()` performs (`endSessionIfRejected`), the backend's own `detail`
+ *  when it sent one, then the body as a Blob. One owner so the GET and POST
+ *  helpers can't drift on either. */
 async function blobFromResponse(res: Response): Promise<Blob> {
-	if (res.status === 401) {
-		clearToken();
-		window.location.href = '/login';
-		throw new ApiError('Unauthorized', 401);
-	}
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
-		throw apiErrorFromBody(body, `Failed to load file: ${res.status}`, res.status);
+		if (endSessionIfRejected(res.status, body.detail) && res.status === 401) {
+			throw new ApiError('Unauthorized', 401);
+		}
+		throw await localizedApiError(body, `Failed to load file: ${res.status}`, res.status);
 	}
 	return res.blob();
 }
@@ -206,21 +252,19 @@ function authHeaders(): Record<string, string> {
 	return headers;
 }
 
-/** Raised by `streamAssistantChat` (and surfaced to callers) when the backend
- *  rejects the turn for exceeding the monthly AI token budget — HTTP 429 with
- *  `code: "assistant_budget_exceeded"`. Carries the budget figures so the page
- *  can render a friendly notice. */
-export class AssistantBudgetError extends Error {
-	used: number;
-	budget: number;
-	period: string;
-	constructor(detail: string, used: number, budget: number, period: string) {
-		super(detail);
-		this.name = 'AssistantBudgetError';
-		this.used = used;
-		this.budget = budget;
-		this.period = period;
-	}
+// The budget refusal and its recogniser live in a pure module (vitest reaches
+// it); re-exported so the chat pages keep importing from `#lib/api`.
+export { AssistantBudgetError, assistantBudgetError };
+
+/** The budget refusal an error from either chat path carries, or `null`: the
+ *  stream throws `AssistantBudgetError` itself, while the non-streaming
+ *  fallback goes through `request()` and so arrives as an `ApiError` whose raw
+ *  `detail` holds the budget. Branches on the structure, never the message
+ *  (which is localized). */
+export function budgetErrorOf(err: unknown): AssistantBudgetError | null {
+	if (err instanceof AssistantBudgetError) return err;
+	if (err instanceof ApiError && err.status === 429) return assistantBudgetError(err.detail);
+	return null;
 }
 
 export interface StreamCallbacks {
@@ -237,9 +281,12 @@ export interface StreamCallbacks {
  * the Authorization / tenant / entity headers). Parses SSE frames
  * (`event: <name>\ndata: <json>\n\n`) and dispatches to the callbacks.
  *
- * Throws `AssistantBudgetError` on a pre-stream HTTP 429, or a plain `Error`
- * on any other non-OK status / network failure / missing-body — the caller is
- * expected to fall back to the non-streaming `/chat` endpoint in that case.
+ * Throws `AssistantBudgetError` on a pre-stream HTTP 429 whose body carries
+ * the AI budget, an `ApiError` (localized, `code` set) on any other 429 — the
+ * shared limiter's `rate_limited` — and a plain `Error` on any other non-OK
+ * status / network failure / missing-body. Only the plain `Error` means the
+ * stream is unavailable; the caller falls back to the non-streaming `/chat`
+ * endpoint for that one, not for a refusal `/chat` would repeat.
  * Resolves once the stream ends (after a `done` or `error` frame).
  */
 export async function streamAssistantChat(
@@ -255,9 +302,10 @@ export async function streamAssistantChat(
  *
  * The copilot rides the SAME orchestrator + SSE contract as the assistant
  * (`tool`/`delta`/`done`/`error` frames), so it reuses the exact SSE parser and
- * header logic below — only the endpoint path differs. Throws `AssistantBudgetError`
- * on a pre-stream HTTP 429, or a plain `Error` on any other non-OK / network
- * failure — the `/cash-flow` page falls back to the non-streaming `/copilot`.
+ * header logic below — only the endpoint path differs. Throws exactly what
+ * `streamAssistantChat` throws (budget 429, other 429 as `ApiError`, plain
+ * `Error`) — the `/cash-flow` page falls back to the non-streaming `/copilot`
+ * on the plain `Error` only.
  */
 export async function streamCashFlowCopilot(
 	body: { message: string; conversation_id?: string },
@@ -292,18 +340,23 @@ async function streamChatTurn(
 	});
 
 	if (res.status === 401) {
-		clearToken();
-		window.location.href = '/login';
+		endSessionIfRejected(res.status, undefined);
 		throw new Error('Unauthorized');
 	}
+	if (res.status === 403) {
+		// A token for another workspace ends the session here too; any other
+		// 403 falls through to the plain stream error below.
+		const j = (await res.json().catch(() => ({}))) as { detail?: unknown };
+		if (endSessionIfRejected(res.status, j.detail)) throw new Error('Unauthorized');
+	}
 	if (res.status === 429) {
-		const j = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-		throw new AssistantBudgetError(
-			(j.detail as string) || 'Monthly AI budget reached',
-			Number(j.used ?? 0),
-			Number(j.budget ?? 0),
-			String(j.period ?? '')
-		);
+		// Two different refusals share this status: the AI token budget (a
+		// detail carrying `budget`) and the shared rate limiter's coded
+		// `rate_limited`. Only the first is a budget error; the second goes
+		// through `apiErrorFromBody` so it is localized like every other
+		// coded refusal (`api/codedRefusals.ts`).
+		const j = (await res.json().catch(() => ({}))) as { detail?: unknown };
+		throw assistantBudgetError(j.detail) ?? (await localizedApiError(j, m('assistant.error.generic'), 429));
 	}
 	if (!res.ok || !res.body) {
 		throw new Error(`Stream error ${res.status}`);
@@ -364,20 +417,33 @@ async function streamChatTurn(
 }
 
 export const api = {
-	get: <T>(path: string) => request<T>(path),
+	// `init.credentials`: send and accept cookies on the API host. Every other
+	// request is bearer-only, so this stays opt-in per call.
+	get: <T>(path: string, init?: Pick<RequestInit, 'credentials'>) => request<T>(path, init),
 	// `headers` is for the few writes that carry a per-request header of their
 	// own — today the `Idempotency-Key` on recording a goods receipt.
-	post: <T>(path: string, body: unknown, headers?: Record<string, string>) =>
-		request<T>(path, { method: 'POST', body: JSON.stringify(body), ...(headers ? { headers } : {}) }),
+	post: <T>(
+		path: string,
+		body: unknown,
+		headers?: Record<string, string>,
+		init?: Pick<RequestInit, 'credentials'>
+	) =>
+		request<T>(path, {
+			method: 'POST',
+			body: JSON.stringify(body),
+			...(headers ? { headers } : {}),
+			...init
+		}),
 	patch: <T>(path: string, body: unknown) => request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
 	put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
 	// `body` is optional — most DELETEs don't carry one, but a few need
 	// credentials in the body rather than the URL (e.g. the passkey-delete
 	// step-up password, which must never land in a query string / access log).
-	delete: (path: string, body?: unknown) =>
-		request<void>(path, {
+	delete: <T = void>(path: string, body?: unknown, init?: Pick<RequestInit, 'credentials'>) =>
+		request<T>(path, {
 			method: 'DELETE',
-			...(body === undefined ? {} : { body: JSON.stringify(body) })
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+			...init
 		}),
 	upload: <T>(
 		path: string,

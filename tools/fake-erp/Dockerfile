@@ -4,7 +4,7 @@
 # whose Python version drifts under it stops being a deterministic
 # fixture. Dependabot's docker ecosystem watches this directory and
 # bumps the tag + digest together.
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 WORKDIR /srv
 
@@ -21,7 +21,8 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
-COPY app.py .
+COPY app.py netsuite_oauth2.py qbo_records.py qbo_sandbox.py xero_webhooks.py .
+COPY fixtures fixtures
 
 EXPOSE 8080
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

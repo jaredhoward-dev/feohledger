@@ -8,7 +8,7 @@ JWT rejected outside the portal, an employee JWT rejected inside it.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +17,12 @@ from app.models.base import Base, TimestampMixin
 
 class VendorUser(Base, TimestampMixin):
     __tablename__ = "vendor_users"
+
+    # One portal login per address WITHOUT regard to case, as `users`
+    # (`uq_users_email_lower`, §475): `email_matches` compares `lower(email)`,
+    # which this index serves. Migration 0138's; declared here so `create_all`
+    # builds it for a fresh tenant.
+    __table_args__ = (Index("uq_vendor_users_email_lower", text("lower(email)"), unique=True),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     vendor_id: Mapped[uuid.UUID] = mapped_column(
@@ -37,17 +43,20 @@ class VendorUser(Base, TimestampMixin):
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
     )
-    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True)
+    # Unique via `uq_vendor_users_email_lower` above, never a plain UNIQUE.
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    # The control-plane `User.id` who last handed out a working password for
-    # this credential — stamped by `POST /api/vendors/{id}/portal-users` and
-    # re-stamped by `.../reset-password`, the ONLY two routes that mint a
-    # supplier password an AP actor gets to see.
+    # The control-plane `User.id` who last steered this credential — stamped by
+    # `POST /api/vendors/{id}/portal-users` and re-stamped by
+    # `.../reset-password`, the ONLY two routes that put a supplier credential
+    # in motion on an AP actor's say-so. Neither hands out a password any more
+    # (each mails a set-password link, decisions §283), but the invite's link
+    # goes to an address the AP actor chose, so the actor may hold it.
     #
     # This is a segregation-of-duties record, not a bookkeeping nicety. Without
     # it one `ap_manager` could complete a BEC bank redirect alone: provision a
@@ -63,10 +72,11 @@ class VendorUser(Base, TimestampMixin):
     # correctly permissive, because an AP actor cannot sign in as that identity
     # without going through invite or reset, both of which stamp the column.
     #
-    # Deliberately NOT cleared when the supplier changes their own password
-    # (`POST /api/portal/auth/change-password`): the attacker holds the temp
-    # password, so clearing on self-change would be a one-request bypass of the
-    # very control this column exists to enforce. The stamp is durable
+    # Deliberately NOT cleared when the supplier changes or sets their own
+    # password (`POST /api/portal/auth/change-password`, `.../reset-password`):
+    # an attacker who chose the invited address holds the link and then the
+    # password, so clearing there would be a one-request bypass of the very
+    # control this column exists to enforce. The stamp is durable
     # provenance, not a "who knows the password right now" flag.
     provisioned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True

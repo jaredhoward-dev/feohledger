@@ -1,4 +1,9 @@
 version: 2
+# Every entry waits out a 7-day `cooldown` before proposing a new version, the
+# same "at least seven days old" rule the hand-made pins follow (docs/
+# decisions.md §349, §350): a release pulled or found malicious in its first
+# week never reaches a PR. Cooldown applies to version updates only; a
+# security update still opens at once.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -6,6 +11,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns:
@@ -17,6 +24,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
     groups:
       # `patterns` was NOT the operative difference — that hypothesis is
       # refuted. It was added on 2026-09-05; the next scheduled run
@@ -63,6 +72,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
     groups:
       frontend-minor-patch:
         update-types:
@@ -79,6 +90,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       mobile-minor-patch:
         update-types:
@@ -91,6 +104,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
 
   # Both Dockerfiles pin their base image by digest so Scorecard's
   # PinnedDependencies check passes and a re-tagged python:3.14-slim can't
@@ -103,6 +118,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
 
   # tools/fake-commerce pins the same base the same way (decisions §273).
   - package-ecosystem: docker
@@ -111,6 +128,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
 
   # Every `image:` in the two compose files is pinned `repo:tag@sha256:…`, and
   # the `docker` entries above do NOT read compose files — they read
@@ -122,23 +141,21 @@ updates:
   # No ecosystem reads a workflow's `services:` images or a ref in a shell
   # script (`github-actions` reads only `uses:`), so nothing else writes one:
   # CI's pgvector / redis / minio come from backend/docker-compose.yml through
-  # the `compose-images` job in ci.yml and sso-e2e.yml, and the production
-  # frontend build's Node image is the `frontend-build` service in
-  # deploy/compose.prod.yml (docs/decisions.md §203). So a PR from this entry
+  # the `compose-images` job in ci.yml and sso-e2e.yml (docs/decisions.md
+  # §203). (The production SPA builds in CI on `setup-node` since §364, so no
+  # compose file carries a Node image any more.) So a PR from this entry
   # is tested by its own CI run on the images it bumps, which is what makes
   # `dependabot-auto-merge.yml` merging a green one safe.
   # backend/tests/test_container_supply_chain.py fails if a ref is restated.
   #
-  # Majors are ignored for the stateful stores, for LocalStack and for Node. A
+  # Majors are ignored for the stateful stores and for LocalStack. A
   # Postgres or Redis major is a data-directory / persistence upgrade to plan,
   # not a dependency bump to merge — pgvector's `-pg16` tag suffix already
   # keeps it on 16, and this keeps `postgres` (Authentik's DB) and `redis`
   # there too. LocalStack's next "major" is the calendar-versioned 2026.x line,
   # which refuses to start without a LOCALSTACK_AUTH_TOKEN; local-first (guard
   # rail 7) and CI's service-e2e job both run it with no account, so 3.x is
-  # held. The Node major moves with every `setup-node` in the workflows at once
-  # (frontend/CLAUDE.md § The Node floor) — a lone image major would build
-  # production on a runtime CI never ran, and the supply-chain test fails it.
+  # held.
   - package-ecosystem: docker-compose
     directories:
       - /backend
@@ -147,19 +164,26 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    # One group, `patterns: ["*"]`, NOT `update-types: [minor, patch]`. A
+    # digest-only refresh (same tag, new sha256) carries no semver update type,
+    # so the old filter let it fall out of the group and Dependabot opened one
+    # PR per directory — #662 (backend) and #665 (deploy) for the same redis
+    # digest. Each half alone fails test_production_runs_the_images_ci_tests,
+    # which is right: prod must run the digest CI tested. Grouping on `*` keeps
+    # both directories in one PR; the `ignore:` list below still holds back the
+    # majors that need planning (the same fix the backend pip group needed).
     groups:
-      compose-minor-patch:
-        update-types:
-          - minor
-          - patch
+      compose-images:
+        patterns:
+          - "*"
     ignore:
       - dependency-name: postgres
         update-types: ["version-update:semver-major"]
       - dependency-name: redis
         update-types: ["version-update:semver-major"]
       - dependency-name: localstack/localstack
-        update-types: ["version-update:semver-major"]
-      - dependency-name: node
         update-types: ["version-update:semver-major"]
 
   # fake-erp's Python deps. Dependabot's pip-compile support pairs
@@ -174,6 +198,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       fake-erp:
         patterns:
@@ -186,6 +212,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       fake-commerce:
         patterns:
@@ -197,6 +225,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       terraform-minor-patch:
         update-types:

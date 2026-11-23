@@ -45,14 +45,13 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.analytics import _commitment_rows
 from app.api.deps import (
     ROLE_ADMIN,
     ROLE_AP_MANAGER,
     ROLE_CFO,
     require_roles,
 )
-from app.api.payments import PAYABLE_INVOICE_STATUSES
+from app.api.refusals import coded_refusal
 from app.config import settings
 from app.database import get_control_db
 from app.models.cash_plan import CashPlan
@@ -77,6 +76,7 @@ from app.schemas.cash_flow import (
     CashFlowPlanReplay,
     CashFlowPlanSaveRequest,
     DraftRunResponse,
+    DraftRunSkip,
     PlanVariancePeriod,
     PlanVarianceResponse,
     SaveCashPlanResponse,
@@ -86,6 +86,7 @@ from app.schemas.cash_flow import (
 )
 from app.services import discount_offers as offers_svc
 from app.services.analytics import bucket_outflows
+from app.services.ap_commitments import commitment_rows
 from app.services.assistant import usage as usage_service
 from app.services.assistant.orchestrator import run_turn, run_turn_streaming
 from app.services.assistant.tools.cashflow import _horizon, propose_payment_plan
@@ -105,6 +106,7 @@ from app.services.currency_conversion import (
     resolve_reporting_currency,
 )
 from app.services.discount_auto_trigger import settled_invoice_status
+from app.services.payment_gates import PAYABLE_INVOICE_STATUSES
 from app.services.payment_runs import PaymentRunItemInput, create_payment_run_for_invoices
 from app.tenant import (
     apply_entity_scope,
@@ -356,6 +358,14 @@ async def _resolve_and_verify_plan(
     )
 
 
+#: `/draft-run`'s per-invoice skip codes (`DraftRunSkip.code`) and its coded
+#: 409 when nothing in the plan can be staged into a run in the reporting
+#: currency. The web client states each (`api/codedRefusals.ts`, `PlanCard`).
+DRAFT_RUN_SKIP_CURRENCY_UNKNOWN = "currency_unknown"
+DRAFT_RUN_SKIP_NOT_RUN_CURRENCY = "currency_not_run_currency"
+DRAFT_RUN_NO_RUN_CURRENCY = "draft_run_no_run_currency"
+
+
 @router.post("/plans/{plan_id}/draft-run", response_model=DraftRunResponse)
 async def draft_run_from_plan(
     plan_id: str,
@@ -371,7 +381,7 @@ async def draft_run_from_plan(
     currently-payable invoice the plan's horizon says is due.
 
     Re-derives the SAME commitment rows ``propose_payment_plan`` used
-    (``_commitment_rows`` — same params), narrows them to invoices that are
+    (``ap_commitments.commitment_rows`` — same params), narrows them to invoices that are
     ACTUALLY payable right now (``PAYABLE_INVOICE_STATUSES`` — a plan's
     horizon includes pre-approval pipeline invoices too, which can't be
     staged), and hands that set to the exact same
@@ -404,7 +414,7 @@ async def draft_run_from_plan(
     )
     scope_entity_id = resolved.scope_entity_id
 
-    rows = await _commitment_rows(
+    rows = await commitment_rows(
         tenant_db,
         today=today,
         horizon_days=resolved.horizon_days,
@@ -451,23 +461,56 @@ async def draft_run_from_plan(
     # from the normal queue. When the plan's horizon holds nothing in the
     # reporting currency the 409 names the currencies that ARE there, which is
     # the actionable version of the old 422.
+    #
+    # An invoice whose currency is NOT RECORDED (the PATCH's legacy blank
+    # `""`) is neither: it is not read as the run's currency (decisions §160 /
+    # §196 / §200 — a missing currency never becomes the default, and here the
+    # default would have been paid in it) and it is not "another currency".
+    # It is skipped under its own code so the client can say what to fix.
     run_currency = resolve_reporting_currency(org.settings)
-    payable_ids = [
-        iid for iid, cur in payable_rows if (cur or run_currency).upper() == run_currency
-    ]
-    excluded = [
-        (cur or run_currency).upper()
-        for _iid, cur in payable_rows
-        if (cur or run_currency).upper() != run_currency
-    ]
+    payable_ids: list[uuid.UUID] = []
+    skipped: list[DraftRunSkip] = []
+    excluded: list[str] = []
+    unknown_count = 0
+    for iid, cur in payable_rows:
+        code = (cur or "").strip().upper()
+        if not code:
+            unknown_count += 1
+            skipped.append(DraftRunSkip(invoice_id=iid, code=DRAFT_RUN_SKIP_CURRENCY_UNKNOWN))
+        elif code == run_currency:
+            payable_ids.append(iid)
+        else:
+            excluded.append(code)
+            skipped.append(
+                DraftRunSkip(
+                    invoice_id=iid,
+                    code=DRAFT_RUN_SKIP_NOT_RUN_CURRENCY,
+                    params={"currency": code},
+                )
+            )
     if not payable_ids:
+        found = sorted(set(excluded))
+        message = (
+            f"A payment run is single-currency and none of this plan's payable "
+            f"commitments are in {run_currency}"
+        )
+        if found:
+            message += f" (found: {', '.join(found)}). Stage them from the payments queue instead."
+        else:
+            message += "."
+        if unknown_count:
+            message += (
+                f" {unknown_count} have no recorded currency; set it on each invoice "
+                f"before it can be paid."
+            )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"A payment run is single-currency and none of this plan's payable "
-                f"commitments are in {run_currency} "
-                f"(found: {', '.join(sorted(set(excluded)))}). Stage them from the "
-                f"payments queue instead."
+            detail=coded_refusal(
+                DRAFT_RUN_NO_RUN_CURRENCY,
+                message,
+                run_currency=run_currency,
+                currencies=found,
+                unknown_count=unknown_count,
             ),
         )
 
@@ -486,7 +529,7 @@ async def draft_run_from_plan(
         org=org,
         org_id=org.id,
         entity_id=run_entity_id,
-        # The scope the PLAN was built under, the same one `_commitment_rows`
+        # The scope the PLAN was built under, the same one `commitment_rows`
         # above used — so the run can only ever stage invoices the plan itself
         # included. `None` (consolidated) leaves the lookup unrestricted, which
         # is what every other consolidated read does.
@@ -510,6 +553,7 @@ async def draft_run_from_plan(
         requires_cfo_approval=result.run.requires_cfo_approval,
         run_currency=run_currency,
         excluded_currency_count=len(excluded),
+        skipped=skipped,
     )
 
 

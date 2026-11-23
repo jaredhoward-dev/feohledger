@@ -150,8 +150,8 @@ async def test_payment_blocking_flag_tracks_the_real_gate():
     `payment_blocking` has to follow automatically — a second hardcoded list
     would silently under-report which decisions unblocked money.
     """
-    from app.api.payments import PAYMENT_BLOCKING_EXCEPTION_TYPES
     from app.services.exception_lifecycle import is_payment_blocking
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
 
     for exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES:
         assert is_payment_blocking(exception_type) is True
@@ -377,6 +377,7 @@ async def _seed_agent_po_mismatch(mk, org_id, *, invoice_amount, po_total, numbe
             invoice_number=number,
             vendor_name="Acme Hosting",
             amount=invoice_amount,
+            currency="USD",
             status=InvoiceStatus.ready_for_review,
             po_number=po_number,
             po_match={"status": "matched", "po_total": str(po_total)},

@@ -42,9 +42,11 @@ from app.api.deps import (
     get_org_id,
     require_roles,
 )
+from app.api.refusals import statement_currency
 from app.config import settings
 from app.database import get_control_db
-from app.models.invoice import Invoice, InvoiceStatus
+from app.models.invoice import Invoice
+from app.models.invoice_status import SETTLED_STATUSES
 from app.models.organization import Organization
 from app.models.user import User
 from app.models.vendor import Vendor
@@ -99,7 +101,7 @@ _WRITE_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
 
 # Ledger candidates exclude invoices that are already settled — a paid/done
 # invoice can't be on a supplier's open-items statement.
-_LEDGER_EXCLUDED_STATUSES = (InvoiceStatus.paid, InvoiceStatus.done)
+_LEDGER_EXCLUDED_STATUSES = SETTLED_STATUSES
 
 # The two line classes that are "actionable" — a clerk must clear them before
 # the run is `resolved` and they're what `close-readiness` sums.
@@ -230,7 +232,7 @@ async def _create_run(
     vendor_id: uuid.UUID,
     statement_date: date,
     statement_reference: str | None,
-    currency: str,
+    currency: str | None,
     notes: str | None,
     source_format: str,
     statement_lines: list[recon.StatementLine],
@@ -243,8 +245,13 @@ async def _create_run(
     currency**, runs the pure reconciliation engine, and persists the run + its
     per-line results. Does NOT commit — the caller owns the transaction
     boundary.
+
+    Both doors already require the currency, but this is where it becomes the
+    ledger filter, so it is checked again here rather than defaulted: a run with
+    no currency is refused (`statement_currency`'s coded 422) before anything
+    is read, never reconciled against dollars (decisions §402).
     """
-    run_currency = (currency or "USD").upper()
+    run_currency = statement_currency(currency)
     vendor = (
         await db.execute(
             apply_entity_scope(select(Vendor).where(Vendor.id == vendor_id), Vendor, entity_id)
@@ -474,7 +481,8 @@ async def upload_reconciliation(
     vendor_id: str = Form(...),
     statement_date: date = Form(...),
     statement_reference: str | None = Form(None),
-    currency: str = Form("USD"),
+    # No default (decisions §377): see `refusals.statement_currency`.
+    currency: str | None = Form(None),
     db: AsyncSession = Depends(get_tenant_db),
     ctrl_db: AsyncSession = Depends(get_control_db),
     user: User = Depends(require_roles(*_WRITE_ROLES)),
@@ -501,6 +509,7 @@ async def upload_reconciliation(
     # unconditional post-read length check below stays regardless, since
     # `.size` is Optional and this must not depend on the framework populating
     # it.
+    statement_ccy = statement_currency(currency)
     if file.size is not None and file.size > storage.MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail=_TOO_LARGE)
     raw = await file.read()
@@ -522,6 +531,7 @@ async def upload_reconciliation(
         try:
             statement_lines, extraction_meta = await extraction.extract_statement_lines(
                 org_settings=org.settings or {},
+                organization_id=org.id,
                 file_bytes=raw,
                 file_key=file.filename or "",
                 mime_type="application/pdf",
@@ -547,7 +557,7 @@ async def upload_reconciliation(
         vendor_id=uuid.UUID(vendor_id),
         statement_date=statement_date,
         statement_reference=statement_reference,
-        currency=currency,
+        currency=statement_ccy,
         notes=None,
         source_format=source_format,
         statement_lines=statement_lines,

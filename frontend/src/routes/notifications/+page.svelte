@@ -1,18 +1,47 @@
 <script lang="ts">
 	import { notificationStore } from '#lib/stores/notifications.svelte.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
+	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
-	import { goto } from '$app/navigation';
-	import { timeAgo } from '#lib/utils/time.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
+	import { tick, untrack } from 'svelte';
+	import { page as pageStore } from '$app/state';
+	import { afterNavigate, goto, replaceState } from '$app/navigation';
+	import { formatDate, timeAgo } from '#lib/utils/time.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
-	import { EVENT_LABELS } from '#lib/types/notification.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import { EVENT_LABEL_KEYS } from '#lib/types/notification.ts';
+	import { notificationHref } from '#lib/utils/notificationHref.ts';
 	import type { Notification } from '#lib/types/notification.ts';
 
-	let filter = $state<'all' | 'unread'>('all');
+	// The relative "When" cell carries the exact instant in its title, in the
+	// active locale — never the raw ISO string.
+	const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
+		month: 'short',
+		day: 'numeric',
+		year: 'numeric',
+		hour: 'numeric',
+		minute: '2-digit'
+	};
+
+	type Filter = 'all' | 'unread';
+
+	/**
+	 * The one READER of `?filter=` (the counterpart of `syncUrl()`), clamped to
+	 * the chips' own keys so a hand-edited value cannot leave no chip pressed.
+	 * Used at mount and by `afterNavigate` for a navigation that reuses this
+	 * page (Back/Forward between two filtered views).
+	 */
+	function readUrlFilter(params: Pick<URLSearchParams, 'get'>): Filter {
+		return params.get('filter') === 'unread' ? 'unread' : 'all';
+	}
+
+	let filter = $state<Filter>(readUrlFilter(pageStore.url.searchParams));
 	let errored = $state(false);
 	let initialLoaded = $state(false);
 
@@ -28,10 +57,33 @@
 	let loading = $derived(notificationStore.loading);
 	let hasMore = $derived(notificationStore.hasMore);
 
+	/** The one WRITER of this route's query string. Untracked: it is called from
+	 *  the filter effect and must never become one of its dependencies. It
+	 *  edits only `filter` on the current URL, so any other parameter survives,
+	 *  and writes only on a real change — the effect runs at mount and on every
+	 *  Back/Forward too, and an unchanged replaceState is a wasted history call
+	 *  that counts toward Safari's per-30-second cap. */
+	function syncUrl() {
+		untrack(() => {
+			const url = new URL(pageStore.url.href);
+			if (filter === 'unread') url.searchParams.set('filter', 'unread');
+			else url.searchParams.delete('filter');
+			if (url.search !== pageStore.url.search) replaceState(`${url.pathname}${url.search}`, {});
+		});
+	}
+
 	$effect(() => {
-		// Re-fetch whenever the filter changes.
+		// Re-fetch whenever the filter changes, and keep the address bar on the
+		// view so reload / Back / a shared link land on the same filter.
 		filter;
+		syncUrl();
 		void reload();
+	});
+
+	afterNavigate(({ from, to, type }) => {
+		if (type === 'enter' || !from || !to || from.route.id !== to.route.id) return;
+		const next = readUrlFilter(to.url.searchParams);
+		if (next !== filter) filter = next;
 	});
 
 	async function reload() {
@@ -53,15 +105,33 @@
 		}
 	}
 
-	async function open(n: Notification) {
-		// Mark read first so the badge + row update, then navigate to the invoice.
+	async function open(n: Notification, href: string) {
+		// Mark read first so the badge + row update, then navigate to the record.
 		try {
 			if (!n.read_at) await notificationStore.markRead(n.id);
 		} catch {
 			/* navigation should still happen even if mark-read failed */
 		}
-		if (n.entity_type === 'invoice' && n.entity_id) {
-			goto(`/invoices?id=${n.entity_id}`);
+		goto(href);
+	}
+
+	// A row with nowhere to go has no open click to mark it read, so it gets
+	// its own control; without one, "Mark all read" was the only way to clear it.
+	let marking = $state<string | null>(null);
+
+	async function markOne(n: Notification) {
+		if (marking) return;
+		marking = n.id;
+		try {
+			await notificationStore.markRead(n.id);
+			// The button unmounts with the unread state; land focus on the
+			// row's text rather than letting it fall to <body>.
+			await tick();
+			document.querySelector<HTMLElement>(`[data-notif-text="${n.id}"]`)?.focus();
+		} catch {
+			toast(m('notifications.markReadFailed'), 'error');
+		} finally {
+			marking = null;
 		}
 	}
 
@@ -90,11 +160,7 @@
 	]);
 
 	let emptyMessage = $derived(
-		errored
-			? m('notifications.empty.errored')
-			: filter === 'unread'
-				? m('notifications.empty.unread')
-				: m('notifications.empty.all')
+		filter === 'unread' ? m('notifications.empty.unread') : m('notifications.empty.all')
 	);
 </script>
 
@@ -107,48 +173,67 @@
 
 	<FilterChips {chips} bind:active={filter} />
 
-	{#if !initialLoaded && loading}
-		<p class="state-msg">{m('common.loading')}</p>
+	{#if errored}
+		<!-- A failed load is not an empty inbox: say so in place, with a way back. -->
+		<LoadError message={m('notifications.empty.errored')} onretry={reload} testId="notifications-error" />
+	{:else if !initialLoaded && loading}
+		<LoadingState />
 	{:else}
 		<DataTable columns={COLUMNS} isEmpty={items.length === 0} empty={emptyMessage} colspan={2}>
 			{#snippet body()}
 				{#each items as n (n.id)}
+					{@const href = notificationHref(n)}
+					<!-- A row with nowhere to go is plain text: no `.clickable`,
+					     no RowLink, nothing that looks openable. -->
 					<tr
-						class="clickable"
+						class:clickable={href !== null}
 						class:unread-row={!n.read_at}
-						onclick={(e) => { if (isRowOpenClick(e)) open(n); }}
+						onclick={(e) => { if (href && isRowOpenClick(e)) open(n, href); }}
 					>
 						<td>
 							<div class="notif-cell">
 								<span class="notif-dot" class:on={!n.read_at} aria-hidden="true"></span>
-								<div class="notif-text">
-									<RowLink onclick={() => open(n)} ariaLabel={m('notifications.open', { title: n.title })}>
+								<div class="notif-text" data-notif-text={n.id} tabindex="-1">
+									{#if href}
+										<RowLink onclick={() => open(n, href)} ariaLabel={m('notifications.open', { title: n.title })}>
+											<span class="notif-title">{n.title}</span>
+										</RowLink>
+									{:else}
 										<span class="notif-title">{n.title}</span>
-									</RowLink>
+									{/if}
 									{#if n.body}<span class="notif-body">{n.body}</span>{/if}
-									<span class="notif-event">{EVENT_LABELS[n.event_type] ?? n.event_type}</span>
+									<span class="notif-event">
+										{EVENT_LABEL_KEYS[n.event_type] ? m(EVENT_LABEL_KEYS[n.event_type]) : n.event_type}
+									</span>
 								</div>
+								{#if !href && !n.read_at}
+									<span class="notif-mark">
+										<RowAction
+											busy={marking === n.id}
+											ariaLabel={m('notifications.markReadAria', { title: n.title })}
+											onclick={() => markOne(n)}
+										>
+											{m('notifications.markRead')}
+										</RowAction>
+									</span>
+								{/if}
 							</div>
 						</td>
-						<td class="muted-cell" title={n.created_at}>{timeAgo(n.created_at)}</td>
+						<td class="muted-cell" title={formatDate(n.created_at, '', DATETIME_OPTS)}>{timeAgo(n.created_at)}</td>
 					</tr>
 				{/each}
 			{/snippet}
 		</DataTable>
 
-		{#if hasMore}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={loadMore} disabled={loading}>
-					{loading
-						? m('common.loading')
-						: m('notifications.loadMore', { shown: items.length, total: filteredTotal })}
-				</button>
-			</div>
-		{:else if filteredTotal > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('notifications.showingAll', { total: filteredTotal })}</span>
-			</div>
-		{/if}
+		<LoadMoreFooter
+			shown={items.length}
+			total={filteredTotal}
+			{hasMore}
+			{loading}
+			onloadmore={loadMore}
+			moreKey="notifications.loadMore"
+			allKey="notifications.showingAll"
+		/>
 	{/if}
 </PageHeader>
 
@@ -174,13 +259,8 @@
 		cursor: not-allowed;
 	}
 
-	.state-msg {
-		color: var(--text-muted);
-		padding: 12px 4px;
-	}
-
 	tbody tr.unread-row td {
-		background: rgba(99, 140, 255, 0.05);
+		background: color-mix(in srgb, var(--accent) 5%, transparent);
 	}
 
 	.notif-cell {
@@ -203,9 +283,15 @@
 	}
 
 	.notif-text {
+		flex: 1;
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
+	}
+
+	.notif-mark {
+		flex-shrink: 0;
 	}
 
 	.notif-title {

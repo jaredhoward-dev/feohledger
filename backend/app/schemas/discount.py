@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.currency import OptionalCurrencyCode
 from app.schemas.money import MoneyAmount, OptionalExactMoneyInput, OptionalMoneyAmount
 from app.schemas.percent import OptionalPercentNumber, PercentNumber
 
@@ -28,14 +29,6 @@ class OfferSource(StrEnum):
     supplier = "supplier"
     system = "system"
     financing = "financing"
-
-
-class OfferStatus(StrEnum):
-    offered = "offered"
-    accepted = "accepted"
-    captured = "captured"
-    declined = "declined"
-    expired = "expired"
 
 
 class DiscountTier(BaseModel):
@@ -92,7 +85,7 @@ class DiscountOfferCreate(BaseModel):
     tiers: list[DiscountTier] = Field(..., min_length=1)
     # Digits match `discount_offers.base_amount` Numeric(15, 2).
     base_amount: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
-    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    currency: OptionalCurrencyCode = None
     valid_from: date | None = None
     valid_until: date | None = None
     notes: str | None = Field(default=None, max_length=500)
@@ -127,6 +120,14 @@ class DiscountOfferResponse(BaseModel):
     # Joined / derived (best-effort, set by the router when context is loaded).
     vendor_name: str | None = None
     invoice_number: str | None = None
+    # The caller's verdict on each decision — `{"accept", "decline"}`, each a
+    # coded refusal or `None` — built by the endpoints' own gates
+    # (`api/discounts.accept_refusal` / `decline_refusal`, issue #575). The page
+    # offers Accept / Decline by these and never restates status or role.
+    actions: dict | None = None
+    # The tiers `POST /accept` would take by name today (`tier_days`); the
+    # accept dialog offers only these. Empty when Accept is refused.
+    capturable_tier_days: list[int] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -179,13 +180,6 @@ class DiscountOfferResponse(BaseModel):
         )
 
 
-class DiscountOfferListResponse(BaseModel):
-    items: list[DiscountOfferResponse]
-    total: int
-    page: int
-    page_size: int
-
-
 class DiscountROIResponse(BaseModel):
     """Annualized-return analysis for one early-payment opportunity.
 
@@ -233,8 +227,9 @@ class OptimizerRecommendation(BaseModel):
     # offer's own `base_amount`, so it is the OFFER's currency, not the
     # response-level `currency` the totals are summed in. Stated per row
     # because the two differ exactly when `unconvertible` is set, and a client
-    # that cannot name a figure's currency has to render it bare.
-    currency: str = "USD"
+    # that cannot name a figure's currency has to render it bare. `None` when
+    # the offer's own code is missing or malformed (always `unconvertible`).
+    currency: str | None = None
     selected: bool  # True if it fits within the cash budget
     cumulative_outlay: MoneyAmount  # running cash committed through this rank
     # This offer's money is in a currency the totals are NOT in, so it is

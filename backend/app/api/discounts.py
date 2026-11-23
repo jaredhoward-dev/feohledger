@@ -27,9 +27,11 @@ from app.api.deps import (
     ROLE_AP_MANAGER,
     ROLE_CFO,
     get_org_id,
+    holds_any_role,
     require_roles,
 )
 from app.api.pagination import PaginationParams, paginated, pagination_params
+from app.api.refusals import ActionRefusal, coded_refusal, role_not_permitted
 from app.models.discount import (
     OFFER_SCOPE_INVOICE,
     OFFER_SCOPE_VENDOR,
@@ -40,8 +42,8 @@ from app.models.discount import (
     DiscountOffer,
 )
 from app.models.invoice import Invoice
+from app.models.invoice_status import OPEN_AP_STATUSES
 from app.models.organization import Organization
-from app.models.payment import PaymentSchedule
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.schemas.discount import (
@@ -59,12 +61,14 @@ from app.services import discount_offers as offers_svc
 from app.services.audit_dispatch import dispatch_audit
 from app.services.currency_conversion import resolve_reporting_currency
 from app.services.discount_auto_trigger import (
-    _resolve_due_date,
     _tier_deadline,
-    settled_invoice_status,
+    settled_invoice_statuses,
 )
-from app.services.discount_optimizer import OfferOpportunity, optimize
+from app.services.discount_opportunities import build_opportunity, name_maps
+from app.services.discount_optimizer import optimize
 from app.services.discount_roi import compute_roi, days_between
+from app.services.payment_runs import payable_currency_code
+from app.services.payment_schedules import latest_schedule
 from app.tenant import (
     apply_entity_scope,
     get_entity_id,
@@ -73,6 +77,14 @@ from app.tenant import (
     get_write_entity_id,
 )
 from app.utils.dates import utc_today
+
+#: An invoice-scoped offer on an invoice that records no usable currency (NULL,
+#: blank or malformed — `payment_runs.payable_currency_code`, the predicate the
+#: run builder and the credit-memo guard read), whether or not the body names
+#: one. The offer prices a payable in no stated currency, and an accepted offer
+#: in a caller-named code would later all but decide the invoice's currency for
+#: it — the same reasoning as `credit_memo_invoice_currency_unknown` (§473).
+DISCOUNT_OFFER_INVOICE_CURRENCY_UNKNOWN = "discount_offer_invoice_currency_unknown"
 
 router = APIRouter(prefix="/discounts", tags=["discounts"])
 
@@ -84,14 +96,9 @@ _WRITE_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
 _ACCEPT_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
 
 # Invoice statuses where payment is still pending — the set a vendor-wide bulk
-# discount can still be captured against.
-_OPEN_FOR_DISCOUNT = (
-    "approved",
-    "sending_to_erp",
-    "sent_to_erp",
-    "posted_in_erp",
-    "payment_scheduled",
-)
+# discount can still be captured against. That is the open-AP set, named rather
+# than re-listed (`models/invoice_status`, issue #575).
+_OPEN_FOR_DISCOUNT = OPEN_AP_STATUSES
 
 
 # --------------------------------------------------------------------------- #
@@ -126,27 +133,6 @@ def _cost_of_capital(org: Organization) -> Decimal:
     return Decimal(str(raw))
 
 
-async def _name_maps(
-    db: AsyncSession, offers: list[DiscountOffer]
-) -> tuple[dict[uuid.UUID, str], dict[uuid.UUID, tuple[str, str | None]]]:
-    """Batch-resolve vendor names + invoice (number, vendor_name) for a page."""
-    vendor_ids = {o.vendor_id for o in offers if o.vendor_id}
-    invoice_ids = {o.invoice_id for o in offers if o.invoice_id}
-    vmap: dict[uuid.UUID, str] = {}
-    imap: dict[uuid.UUID, tuple[str, str | None]] = {}
-    if vendor_ids:
-        rows = await db.execute(select(Vendor.id, Vendor.name).where(Vendor.id.in_(vendor_ids)))
-        vmap = {vid: name for vid, name in rows.all()}
-    if invoice_ids:
-        rows = await db.execute(
-            select(Invoice.id, Invoice.invoice_number, Invoice.vendor_name).where(
-                Invoice.id.in_(invoice_ids)
-            )
-        )
-        imap = {iid: (num, vname) for iid, num, vname in rows.all()}
-    return vmap, imap
-
-
 def _response(
     offer: DiscountOffer,
     vmap: dict[uuid.UUID, str],
@@ -173,56 +159,6 @@ def _response(
     )
 
 
-async def _build_opportunity(
-    db: AsyncSession, offer: DiscountOffer, *, today: date
-) -> OfferOpportunity | None:
-    """Turn an open offer into a ranked optimizer opportunity (best tier today).
-
-    Returns ``None`` when no tier is still achievable, or the offer's invoice is
-    already paid / done. Reuses the sweep's
-    deadline / due-date economics so router and background sweep agree.
-    """
-    tier = offers_svc.best_tier_for_date(
-        offer.tiers or [],
-        today,
-        offer.valid_until,
-        reference_date=offers_svc.offer_reference_date(offer),
-    )
-    if tier is None:
-        return None
-    # An offer whose invoice is already paid / done can never be taken, so it is
-    # not an opportunity: ranking it inflated `/optimize`'s totals, the
-    # dashboard's `projected_savings` and the copilot's plan by savings nobody
-    # can realize — the same gate every accept path refuses on.
-    if await settled_invoice_status(db, offer) is not None:
-        return None
-    pay_by = _tier_deadline(offer, tier, today)
-    # `pay_by` is deliberately NOT the last fallback. It used to be, and it made
-    # `days_accelerated` exactly 0 for any offer with no schedule/invoice due
-    # date and no `valid_until` — every bulk negotiation — producing an ROI that
-    # contradicted itself: a 0.00 % APR and `worthwhile: false` beside a
-    # positive `net_benefit`, so the offer was permanently unrecommendable.
-    # `None` means "no horizon"; the optimizer reports it as unrankable rather
-    # than ranking it at zero.
-    due_date = await _resolve_due_date(db, offer) or offer.valid_until
-    return OfferOpportunity(
-        offer_id=str(offer.id),
-        invoice_id=str(offer.invoice_id) if offer.invoice_id else None,
-        vendor_id=str(offer.vendor_id) if offer.vendor_id else None,
-        vendor_name=None,
-        invoice_number=None,
-        base_amount=offer.base_amount,
-        # `base_amount`'s own currency. The optimizer's totals are sums, and a
-        # sum across currencies is not a number — see `optimize`'s
-        # `reporting_currency` guard.
-        currency=(offer.currency or "USD").upper(),
-        tier_days=int(tier["days"]),
-        discount_percent=offers_svc.tier_percent(tier),
-        pay_by=pay_by,
-        due_date=due_date,
-    )
-
-
 def _roi_response(roi) -> DiscountROIResponse:
     return DiscountROIResponse(
         base_amount=roi.base_amount,
@@ -238,24 +174,170 @@ def _roi_response(roi) -> DiscountROIResponse:
     )
 
 
-async def _refuse_settled_invoice(db: AsyncSession, offer: DiscountOffer) -> None:
-    """409 when the offer's invoice is already paid / done — accepting would
-    record a deduction no payment can ever take
-    (``discount_auto_trigger.settled_invoice_status``)."""
-    settled = await settled_invoice_status(db, offer)
-    if settled is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"The invoice is already {settled}; there is no payment left to discount",
+# --------------------------------------------------------------------------- #
+# Accept / decline gates — what the endpoints raise from AND what each offer
+# row's `actions` verdict is built from (issue #575 § One rule, one place)
+# --------------------------------------------------------------------------- #
+
+#: Accept refused: the offer's invoice is already `paid` / `done`, so accepting
+#: would record a deduction no payment can ever take
+#: (``discount_auto_trigger.settled_invoice_status``). ``params.status``.
+DISCOUNT_OFFER_INVOICE_SETTLED = "discount_offer_invoice_settled"
+#: Accept refused: no tier's window is still open today (or the offer's own
+#: ``valid_until`` has passed).
+DISCOUNT_OFFER_NO_CAPTURABLE_TIER = "discount_offer_no_capturable_tier"
+#: Accept refused: the tier the caller named does not exist on the offer, or
+#: its window has closed. Only an explicit ``tier_days`` can reach it.
+DISCOUNT_OFFER_TIER_UNAVAILABLE = "discount_offer_tier_unavailable"
+#: Accept or decline refused: the offer is no longer ``offered``
+#: (``params.status``).
+DISCOUNT_OFFER_NOT_OPEN = "discount_offer_not_open"
+#: Decline refused: the offer lapsed more than ``DECLINE_GRACE_DAYS`` ago, so a
+#: decline would record a refusal nobody made (``decline_window_closed``).
+DISCOUNT_OFFER_DECLINE_WINDOW_CLOSED = "discount_offer_decline_window_closed"
+
+
+def _accept_tier(offer: DiscountOffer, *, today: date, tier_days: int | None) -> dict | None:
+    """The tier an accept would record: the named one while its window is
+    open, else the best one still capturable today."""
+    if tier_days is not None:
+        return offers_svc.select_tier_for_date(
+            offer.tiers or [],
+            tier_days,
+            today,
+            offer.valid_until,
+            reference_date=offers_svc.offer_reference_date(offer),
         )
+    return offers_svc.best_tier_for_date(
+        offer.tiers or [],
+        today,
+        offer.valid_until,
+        reference_date=offers_svc.offer_reference_date(offer),
+    )
+
+
+def capturable_tier_days(offer: DiscountOffer, *, today: date) -> list[int]:
+    """Every tier ``POST /accept`` would take by name today — the accept
+    dialog offers these and no others (``_accept_tier``)."""
+    return [
+        int(t["days"])
+        for t in (offer.tiers or [])
+        if _accept_tier(offer, today=today, tier_days=int(t["days"])) is not None
+    ]
+
+
+def accept_refusal(
+    offer: DiscountOffer,
+    *,
+    settled_status: str | None,
+    today: date,
+    tier_days: int | None = None,
+) -> ActionRefusal | None:
+    """Why ``POST /offers/{id}/accept`` would refuse, or ``None``.
+
+    Every refusal the endpoint answers past its role dependency and the 404,
+    in its order: a settled invoice, no tier to take, an offer no longer
+    ``offered``. ``settled_status`` is ``settled_invoice_status`` for this
+    offer, resolved by the caller (one query for a whole list page). Plain
+    string details at the endpoint, as before; the verdict carries the code.
+    """
+    if settled_status is not None:
+        return ActionRefusal(
+            DISCOUNT_OFFER_INVOICE_SETTLED,
+            f"The invoice is already {settled_status}; there is no payment left to discount",
+            status.HTTP_409_CONFLICT,
+            params={"status": settled_status},
+        )
+    if _accept_tier(offer, today=today, tier_days=tier_days) is None:
+        if tier_days is not None:
+            return ActionRefusal(
+                DISCOUNT_OFFER_TIER_UNAVAILABLE,
+                "No tier matches the requested days, or its window has closed",
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        return ActionRefusal(
+            DISCOUNT_OFFER_NO_CAPTURABLE_TIER,
+            "Offer has no capturable tier today",
+            status.HTTP_409_CONFLICT,
+        )
+    return _not_open_refusal(offer, verb="accept")
+
+
+def _not_open_refusal(offer: DiscountOffer, *, verb: str) -> ActionRefusal | None:
+    if offer.status != OFFER_STATUS_OFFERED:
+        return ActionRefusal(
+            DISCOUNT_OFFER_NOT_OPEN,
+            f"cannot {verb} an offer in status {offer.status!r} (must be 'offered')",
+            status.HTTP_409_CONFLICT,
+            params={"status": offer.status},
+        )
+    return None
+
+
+def decline_refusal(offer: DiscountOffer, *, today: date) -> ActionRefusal | None:
+    """Why ``POST /offers/{id}/decline`` would refuse, or ``None`` — the same
+    two checks, in the same order, as ``discount_offers.decline_offer``, which
+    still raises on them as a backstop for its other callers."""
+    if offers_svc.decline_window_closed(offer, as_of=today):
+        return ActionRefusal(
+            DISCOUNT_OFFER_DECLINE_WINDOW_CLOSED,
+            "cannot decline an offer whose validity window has closed (expired)",
+            status.HTTP_409_CONFLICT,
+        )
+    return _not_open_refusal(offer, verb="decline")
+
+
+async def _offer_responses(
+    db: AsyncSession, offers: list[DiscountOffer], user: User, *, today: date
+) -> list[DiscountOfferResponse]:
+    """The wire rows, each with the caller's verdict on Accept / Decline
+    (``actions``) and the tiers Accept would take (``capturable_tier_days``)."""
+    vmap, imap = await name_maps(db, offers)
+    may_decide = holds_any_role(user, _ACCEPT_ROLES)
+    settled = await settled_invoice_statuses(db, offers) if may_decide else {}
+    out: list[DiscountOfferResponse] = []
+    for offer in offers:
+        resp = _response(offer, vmap, imap, today=today)
+        if may_decide:
+            accept = accept_refusal(offer, settled_status=settled.get(offer.id), today=today)
+            decline = decline_refusal(offer, today=today)
+            resp.actions = {
+                "accept": accept.verdict() if accept else None,
+                "decline": decline.verdict() if decline else None,
+            }
+            resp.capturable_tier_days = (
+                capturable_tier_days(offer, today=today) if accept is None else []
+            )
+        else:
+            resp.actions = {"accept": role_not_permitted(), "decline": role_not_permitted()}
+            resp.capturable_tier_days = []
+        out.append(resp)
+    return out
 
 
 async def _get_offer_scoped(
-    db: AsyncSession, offer_id: uuid.UUID, entity_id: uuid.UUID | None
+    db: AsyncSession,
+    offer_id: uuid.UUID,
+    entity_id: uuid.UUID | None,
+    *,
+    for_update: bool = False,
 ) -> DiscountOffer:
+    """The offer in the caller's entity scope, else 404.
+
+    ``for_update=True`` is for the status writers (accept / decline): the row is
+    locked BEFORE the refusal check reads its status, so of two racing
+    decisions the second waits, re-reads the first's committed result
+    (``populate_existing``) and answers the refusal's 409 instead of passing
+    the same check, overwriting the first and writing a second audit row. Every
+    other writer of an offer's status takes the same lock
+    (``offers_svc.lock_offer``; ``backend/docs/dynamic-discounting.md``
+    § Concurrency).
+    """
     q = apply_entity_scope(
         select(DiscountOffer).where(DiscountOffer.id == offer_id), DiscountOffer, entity_id
     )
+    if for_update:
+        q = offers_svc.lock_offer(q)
     offer = (await db.execute(q)).scalar_one_or_none()
     if offer is None:
         raise HTTPException(status_code=404, detail="Discount offer not found")
@@ -307,8 +389,7 @@ async def list_offers(
         .limit(pagination.limit)
     )
     rows = list((await db.execute(query)).scalars().all())
-    vmap, imap = await _name_maps(db, rows)
-    items = [_response(o, vmap, imap, today=today) for o in rows]
+    items = await _offer_responses(db, rows, user, today=today)
     return paginated(items, total, pagination)
 
 
@@ -364,7 +445,21 @@ async def create_offer(
                 status_code=422, detail="vendor_id does not match the invoice's vendor"
             )
         base_amount = base_amount if base_amount is not None else invoice.amount
-        currency = currency or invoice.currency
+        invoice_currency = payable_currency_code(invoice.currency)
+        if invoice_currency is None:
+            # Refused even when the caller names a currency: a EUR offer on a
+            # balance in no stated currency cannot be proved to price it, and
+            # the run builder refuses the invoice as `currency_unknown` until
+            # someone sets its code anyway (decisions §473).
+            raise HTTPException(
+                status_code=409,
+                detail=coded_refusal(
+                    DISCOUNT_OFFER_INVOICE_CURRENCY_UNKNOWN,
+                    "The invoice records no currency, so no discount can be offered "
+                    "against it. Set the invoice's currency first.",
+                ),
+            )
+        currency = currency or invoice_currency
     elif body.scope == OFFER_SCOPE_VENDOR:
         if not body.vendor_id:
             raise HTTPException(status_code=422, detail="vendor_id required for vendor scope")
@@ -407,7 +502,7 @@ async def create_offer(
     )
     await db.commit()
     await db.refresh(offer)
-    vmap, imap = await _name_maps(db, [offer])
+    vmap, imap = await name_maps(db, [offer])
     return _response(offer, vmap, imap)
 
 
@@ -419,8 +514,7 @@ async def get_offer(
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     offer = await _get_offer_scoped(db, offer_id, entity_id)
-    vmap, imap = await _name_maps(db, [offer])
-    return _response(offer, vmap, imap)
+    return (await _offer_responses(db, [offer], user, today=utc_today()))[0]
 
 
 @router.post("/offers/{offer_id}/accept", response_model=DiscountOfferResponse)
@@ -432,31 +526,18 @@ async def accept_offer(
     user: User = Depends(require_roles(*_ACCEPT_ROLES)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    offer = await _get_offer_scoped(db, offer_id, entity_id)
+    offer = await _get_offer_scoped(db, offer_id, entity_id, for_update=True)
     today = utc_today()
-    await _refuse_settled_invoice(db, offer)
-    if body.tier_days is not None:
-        tier = offers_svc.select_tier_for_date(
-            offer.tiers or [],
-            body.tier_days,
-            today,
-            offer.valid_until,
-            reference_date=offers_svc.offer_reference_date(offer),
-        )
-        if tier is None:
-            raise HTTPException(
-                status_code=422,
-                detail="No tier matches the requested days, or its window has closed",
-            )
-    else:
-        tier = offers_svc.best_tier_for_date(
-            offer.tiers or [],
-            today,
-            offer.valid_until,
-            reference_date=offers_svc.offer_reference_date(offer),
-        )
-        if tier is None:
-            raise HTTPException(status_code=409, detail="Offer has no capturable tier today")
+    # One gate, shared with the row's `actions.accept` verdict. It reads the
+    # LOCKED row, so a concurrent accept or decline that committed first is
+    # seen here and refused (`discount_offer_not_open`, 409). That status guard
+    # is also the replay story: a re-sent accept — same tier or another — finds
+    # the offer `accepted` and is refused, with no second write or audit row.
+    settled = (await settled_invoice_statuses(db, [offer])).get(offer.id)
+    refusal = accept_refusal(offer, settled_status=settled, today=today, tier_days=body.tier_days)
+    if refusal is not None:
+        raise refusal.http()
+    tier = _accept_tier(offer, today=today, tier_days=body.tier_days)
     try:
         offers_svc.accept_offer(offer, tier=tier, actor_id=user.id, now=datetime.now(UTC))
     except ValueError as exc:
@@ -473,8 +554,7 @@ async def accept_offer(
     )
     await db.commit()
     await db.refresh(offer)
-    vmap, imap = await _name_maps(db, [offer])
-    return _response(offer, vmap, imap)
+    return (await _offer_responses(db, [offer], user, today=today))[0]
 
 
 @router.post("/offers/{offer_id}/decline", response_model=DiscountOfferResponse)
@@ -490,8 +570,13 @@ async def decline_offer(
     user: User = Depends(require_roles(*_ACCEPT_ROLES)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    offer = await _get_offer_scoped(db, offer_id, entity_id)
+    offer = await _get_offer_scoped(db, offer_id, entity_id, for_update=True)
     today = utc_today()
+    # One gate, shared with the row's `actions.decline` verdict, read under the
+    # row lock (see `accept_offer`).
+    refusal = decline_refusal(offer, today=today)
+    if refusal is not None:
+        raise refusal.http()
     try:
         # `as_of` is what refuses a LAPSED offer. Accept already refuses one
         # (no tier is capturable past `valid_until`); without this, decline was
@@ -513,8 +598,7 @@ async def decline_offer(
     )
     await db.commit()
     await db.refresh(offer)
-    vmap, imap = await _name_maps(db, [offer])
-    return _response(offer, vmap, imap, today=today)
+    return (await _offer_responses(db, [offer], user, today=today))[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -539,14 +623,7 @@ async def invoice_roi(
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     # Net due date: payment schedule wins, else the invoice's own due_date.
-    sched = (
-        await db.execute(
-            select(PaymentSchedule)
-            .where(PaymentSchedule.invoice_id == invoice_id)
-            .order_by(PaymentSchedule.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    sched = await latest_schedule(db, invoice_id)
     due_date = (sched.due_date if sched else None) or invoice.due_date
     if due_date is None:
         raise HTTPException(
@@ -646,11 +723,11 @@ async def optimize_discounts(
     offer_by_id = {str(o.id): o for o in rows}
     opportunities = []
     for offer in rows:
-        opp = await _build_opportunity(db, offer, today=today)
+        opp = await build_opportunity(db, offer, today=today)
         if opp is not None:
             opportunities.append(opp)
 
-    vmap, imap = await _name_maps(db, rows)
+    vmap, imap = await name_maps(db, rows)
     result = optimize(
         opportunities,
         cash_budget=cash_budget,
@@ -811,7 +888,7 @@ async def bulk_negotiate(
     )
     await db.commit()
     await db.refresh(offer)
-    vmap, imap = await _name_maps(db, [offer])
+    vmap, imap = await name_maps(db, [offer])
     return _response(offer, vmap, imap)
 
 
@@ -933,7 +1010,7 @@ async def dashboard(
     )
     opportunities = []
     for offer in open_offers:
-        opp = await _build_opportunity(db, offer, today=today)
+        opp = await build_opportunity(db, offer, today=today)
         if opp is not None:
             opportunities.append(opp)
     result = optimize(

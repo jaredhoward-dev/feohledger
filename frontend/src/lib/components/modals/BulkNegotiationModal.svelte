@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { formatPercent } from '#lib/utils/percent.ts';
 	/**
 	 * Propose a vendor-wide early-payment discount —
 	 * `POST /api/discounts/bulk-negotiate`.
@@ -185,7 +186,7 @@
 				<ul class="bulk-tier-list">
 					{#each [...created.tiers].sort((a, b) => a.days - b.days) as tier (tier.days)}
 						<li>
-							<span>{m('discounts.modal.tierOption', { percent: tier.percent, days: tier.days })}</span>
+							<span>{m('discounts.modal.tierOptionFormatted', { percent: formatPercent(tier.percent), days: tier.days })}</span>
 							<span class="bulk-tier-save">
 								{m('discounts.modal.save')}
 								<Money amount={tierSaving(created, tier.percent)} currency={created.currency} />
@@ -494,22 +495,15 @@
 		gap: 3px;
 		margin-top: 14px;
 		padding: 10px 12px;
-		border: 1px solid rgba(224, 64, 64, 0.4);
+		border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
 		border-radius: 6px;
-		background: rgba(224, 64, 64, 0.08);
+		background: color-mix(in srgb, var(--danger) 8%, transparent);
 		font-size: 0.82rem;
 		color: var(--text);
 	}
 	.bulk-error strong {
 		color: var(--danger);
 		font-size: 0.8rem;
-	}
-
-	/* Armed confirm — the same red "one more click commits this" cue
-	   `RowAction armed` and `BulkDeleteButton` use. */
-	.btn-primary.armed {
-		background: var(--danger);
-		border-color: var(--danger);
 	}
 
 	.bulk-result {

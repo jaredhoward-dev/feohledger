@@ -38,9 +38,18 @@ def _invoice():
 
 def _capture_db():
     """An AsyncMock session that captures `db.add(...)` calls so tests
-    can inspect what got persisted."""
+    can inspect what got persisted.
+
+    Answers both read shapes `_ensure_exception` makes: a count (no open or
+    person-cleared row) and, for a `duplicate` / `fraud_flag`, the open rows
+    themselves (none) — decisions §286."""
     db = AsyncMock()
-    db.execute = AsyncMock(return_value=MagicMock(scalar=MagicMock(return_value=0)))
+    no_rows = MagicMock(all=MagicMock(return_value=[]))
+    db.execute = AsyncMock(
+        return_value=MagicMock(
+            scalar=MagicMock(return_value=0), scalars=MagicMock(return_value=no_rows)
+        )
+    )
     db.add = MagicMock()
     return db
 
@@ -266,6 +275,7 @@ def test_exception_dict_marks_overdue_when_past_due_at():
         description="x",
         description_code=None,
         description_params=None,
+        erp_report=None,
         status="open",
         resolution=None,
         resolved_by=None,
@@ -294,6 +304,7 @@ def test_exception_dict_does_not_mark_terminal_states_overdue():
         description="x",
         description_code=None,
         description_params=None,
+        erp_report=None,
         status="resolved",
         resolution="x",
         resolved_by="Demo",
@@ -322,6 +333,7 @@ def test_exception_dict_carries_assignee_uuid():
         description="x",
         description_code=None,
         description_params=None,
+        erp_report=None,
         status="open",
         resolution=None,
         resolved_by=None,
@@ -349,6 +361,7 @@ def test_exception_dict_carries_the_description_code_and_params():
         description="Round amount: 5000.00 ZAR",
         description_code="round_amount",
         description_params={"amount": "5000.00", "currency": "ZAR"},
+        erp_report=None,
         status="open",
         resolution=None,
         resolved_by=None,
@@ -381,6 +394,7 @@ def test_get_exception_returns_full_dict_for_found_row():
         description="amount off",
         description_code=None,
         description_params=None,
+        erp_report=None,
         status="open",
         resolution=None,
         resolved_by=None,
@@ -394,15 +408,31 @@ def test_get_exception_returns_full_dict_for_found_row():
     # `currency` too: a real `Invoice` always carries one, and it is what the
     # queue formats the amount against.
     inv = SimpleNamespace(
-        invoice_number="INV-100", vendor_name="Acme", amount=Decimal("250.00"), currency="USD"
+        id=exc.invoice_id,
+        invoice_number="INV-100",
+        vendor_name="Acme",
+        amount=Decimal("250.00"),
+        currency="USD",
+        uploaded_by_id=None,
+        segregation_actor_ids=None,
     )
 
     db = AsyncMock()
     db.execute = AsyncMock(return_value=MagicMock(first=MagicMock(return_value=(exc, inv))))
-    user = SimpleNamespace(full_name="Demo Admin", organization_id=uuid.uuid4())
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        full_name="Demo Admin",
+        organization_id=uuid.uuid4(),
+        roles=[SimpleNamespace(name="admin")],
+    )
+    org = SimpleNamespace(settings={})
 
-    body = asyncio.run(get_exception(exc.id, db=db, user=user, entity_id=None))
+    body = asyncio.run(get_exception(exc.id, db=db, org=org, user=user, entity_id=None))
 
+    # The caller's verdicts ride the detail too, like a list row, so a deep
+    # link (`/exceptions?id=`) offers exactly what the server would accept.
+    assert body["decision_refusals"] == {"resolve": None, "dismiss": None, "escalate": None}
+    assert "record_erp_payment_refusal" not in body  # no ERP-reported payment here
     assert body["id"] == str(exc.id)
     assert body["invoice_number"] == "INV-100"
     assert body["vendor_name"] == "Acme"
@@ -440,6 +470,7 @@ def _exc_row():
         description="x",
         description_code=None,
         description_params=None,
+        erp_report=None,
         status="open",
         resolution=None,
         resolved_by=None,

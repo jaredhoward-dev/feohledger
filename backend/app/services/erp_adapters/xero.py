@@ -10,10 +10,41 @@ References (checked 2026-10-08):
 * Accounting API, invoices: https://developer.xero.com/documentation/api/accounting/invoices
 * OpenAPI (field names, ``Idempotency-Key`` header, 128 chars max):
   https://github.com/XeroAPI/Xero-OpenAPI/blob/master/xero_accounting.yaml
-* Rate limits (60 calls/minute and 5,000/day per tenant; HTTP 429 with
-  ``Retry-After``): https://developer.xero.com/documentation/guides/oauth2/limits/
+* Rate limits (60 calls/minute per tenant; HTTP 429 with ``Retry-After``):
+  https://developer.xero.com/documentation/guides/oauth2/limits/ . The daily
+  cap depends on the app's pricing tier: 1,000 calls per organisation per day
+  on Starter (the default, at most 5 connections), 5,000 on Core and above:
+  https://developer.xero.com/pricing
 * Granular scopes, mandatory for apps created on or after 2026-03-02:
   https://devblog.xero.com/upcoming-changes-to-xero-accounting-api-scopes-705c5a9621a0
+* Payments (apply / read / delete, scope ``accounting.payments``):
+  https://developer.xero.com/documentation/api/accounting/payments
+* Paging up to 1,000 rows (``pageSize``):
+  https://devblog.xero.com/conquer-data-overload-mastering-paging-in-the-xero-api-03ceacfeb184
+* Contacts search (checked 2026-11-14 in the OpenAPI above; the developer site
+  refuses automated reads): ``searchTerm`` is "a case-insensitive text search
+  across the Name, FirstName, LastName, ContactNumber and EmailAddress
+  fields"; ``where`` filters by any element (``TaxNumber``), and
+  ``GET Contacts/{ContactID}`` reads one record. Scope ``accounting.contacts.read``.
+
+**A connection consented before ``accounting.payments``** (decisions §415)
+cannot list or write payments. The status sync records that on the connection
+(``settings.erp.oauth.scope_gaps``: ``payments_scope_missing``) the first time
+Xero refuses the ``Payments`` change listing, and from then on
+:meth:`XeroAdapter.changed_bills` reads only the incremental ``Invoices``
+listing and the write-back refuses before any call, until an admin reconnects.
+
+**Status sync-back and payment write-back** (decisions §295, extended to Xero in
+§386; ``supports_status_sync``). A bill's ``AmountPaid`` is the sum of the
+payments on it and ``AmountCredited`` the credit notes, overpayments and
+prepayments applied to it, so "paid" is read from the payments Xero lists on
+the bill, never from ``Status == PAID`` alone (§303). A payment FeohLedger
+writes carries ``Reference: "FeohLedger payment <id>"``, which is how
+:func:`report_from_bill` tells our write-back from a person's payment. Xero
+bills carry no marker of ours (``Reference`` is ACCREC-only), so a report names
+its bill by ``InvoiceID`` alone (``ErpBillReport.match_by_reference``): an
+InvoiceID is a GUID, never reused, so within the connected organisation it
+names exactly the bill the push created.
 
 ``settings.erp`` keys read here (besides the ``oauth`` block ``erp_oauth`` owns):
 
@@ -32,25 +63,49 @@ checking, or reporting as posted, a bill that is no longer live.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-from datetime import date
-from decimal import Decimal
+import logging
+import re
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
 from app.config import settings
+from app.services import erp_oauth
 from app.services.erp_adapters.base import (
+    BILL_NOT_IN_ERP,
+    BILL_PAYMENT_VOIDED,
+    NOT_CONNECTED,
+    PAYMENT_ACCOUNT_NOT_MAPPED,
+    PAYMENT_EXCEEDS_BALANCE,
+    PAYMENTS_SCOPE_MISSING,
+    SYNC_LISTING_MAX_ROWS,
     VENDOR_NOT_LINKED,
+    ErpBillReport,
+    ErpBillState,
     ErpInvoiceStatus,
+    ErpListingIncomplete,
     ErpPostResult,
+    ErpScopeMissing,
     GLAccountPayload,
     InvoicePayload,
+    ListingGap,
+    PaymentPayload,
     PoLinePayload,
+    PoListing,
     PoPayload,
+    PoSkipReason,
+    SkippedPo,
     VendorPayload,
-    erp_failure_message,
+    VendorSearchResult,
+    erp_http_failure,
+    erp_preflight_refusal,
     erp_refusal,
+    erp_status_retryable,
+    sync_listing_pages,
 )
 from app.services.erp_adapters.bill_allocation import (
     DUPLICATE_DOCUMENT_NUMBER,
@@ -61,7 +116,13 @@ from app.services.erp_adapters.bill_allocation import (
     allocate_bill_lines,
 )
 from app.services.erp_adapters.dispatcher import register_adapter
-from app.services.erp_adapters.oauth_base import OAuthErpAdapter, OAuthProviderSpec
+from app.services.erp_adapters.log_redaction import redact_query_strings_containing
+from app.services.erp_adapters.oauth_base import (
+    ExternalCompany,
+    OAuthErpAdapter,
+    OAuthProviderSpec,
+    clean_companies,
+)
 from app.services.erp_adapters.posted_total import (
     MAX_CREATE_ATTEMPTS,
     VoidOutcome,
@@ -70,7 +131,11 @@ from app.services.erp_adapters.posted_total import (
     previous_bill_removed,
 )
 from app.services.erp_oauth import register_oauth_provider
+from app.services.payment_methods import RailPart
+from app.utils.currency_code import iso_currency_or_none
 from app.utils.json_money import dumps_exact_json
+
+logger = logging.getLogger(__name__)
 
 PROVIDER = "Xero"
 XERO_API_BASE = "https://api.xero.com/api.xro/2.0"
@@ -78,6 +143,31 @@ XERO_API_BASE = "https://api.xero.com/api.xro/2.0"
 IDEMPOTENCY_KEY_MAX = 128
 #: Statuses in which Xero keeps a bill readable but no longer live.
 _GONE_STATUSES = frozenset({"DELETED", "VOIDED"})
+#: A payment in another currency than the bill's (``post_payment``).
+CURRENCY_MISMATCH = "currency_mismatch"
+#: A bill create Xero refused, coded from facts read back (``_create_refusal``).
+#: The same codes QuickBooks uses for the same refusals (§285).
+PERIOD_CLOSED = "period_closed"
+VENDOR_INACTIVE = "vendor_inactive"
+ACCOUNT_INACTIVE = "account_inactive"
+#: A vendor-link search by tax number puts the number in the query string
+#: (``where=TaxNumber==...``), and httpx logs every request URL at INFO: the
+#: query of any logged URL naming the field is redacted (a tax id never
+#: reaches a log, project invariant).
+redact_query_strings_containing("taxnumber")
+#: Contacts one vendor-link search reads per term (one page); more matches
+#: than that answer ``truncated`` and the person narrows the search.
+_SEARCH_PAGE_SIZE = 50
+#: The shape a ``ContactID`` may take before it goes into a request path (a
+#: GUID at Xero; letters, digits and hyphens bound it without assuming more,
+#: so nothing else — a slash, a dot — ever reaches the path).
+_CONTACT_ID = re.compile(r"^[0-9A-Za-z-]{1,64}$")
+#: Rows a change listing asks for per page (Xero's ceiling), and the page size
+#: Xero answered with before it allowed larger ones. A page shorter than the
+#: floor is the last; a longer one may be the last or may be Xero still paging
+#: by 100, so the next page is read to find out (an empty page ends it).
+_CHANGE_PAGE_SIZE = 1000
+_PAGE_FLOOR = 100
 
 XERO_OAUTH = register_oauth_provider(
     OAuthProviderSpec(
@@ -85,6 +175,9 @@ XERO_OAUTH = register_oauth_provider(
         display_name="Xero",
         authorize_url="https://login.xero.com/identity/connect/authorize",
         token_url="https://identity.xero.com/connect/token",
+        # Revoking the refresh token also removes every connection it holds,
+        # so Disconnect leaves no live grant at Xero. Form body + Basic auth.
+        revoke_url="https://identity.xero.com/connect/revocation",
         # Granular scopes: `accounting.invoices` covers invoices (bills) and
         # purchase orders; `accounting.settings.read` covers Organisation,
         # Accounts and TaxRates. `offline_access` yields the refresh token.
@@ -92,6 +185,11 @@ XERO_OAUTH = register_oauth_provider(
             "openid",
             "offline_access",
             "accounting.invoices",
+            # Payments: read bills' payments for the status sync, and write
+            # FeohLedger's own payment of a bill back (§386). Added after the
+            # first connections: one consented before it lacks the scope until
+            # an admin reconnects (backend/docs/erp-integration.md § Xero).
+            "accounting.payments",
             "accounting.contacts.read",
             "accounting.settings.read",
         ),
@@ -99,6 +197,7 @@ XERO_OAUTH = register_oauth_provider(
         client_secret_setting="erp_xero_client_secret",
         authorize_url_setting="erp_xero_authorize_url",
         token_url_setting="erp_xero_token_url",
+        revoke_url_setting="erp_xero_revoke_url",
     )
 )
 
@@ -113,9 +212,36 @@ _STATUS_MAP = {
     "DELETED": ErpInvoiceStatus.cancelled,
 }
 
+#: PO statuses before a bill exists. A contact on one of these may not be
+#: ``IsSupplier`` yet, so ``list_vendors`` reads them too.
+_UNBILLED_PO_STATUSES = ("DRAFT", "SUBMITTED", "AUTHORISED")
+#: ContactIDs per ``GET Contacts?IDs=`` request, to keep the URL short.
+_CONTACT_ID_BATCH = 50
+
+
+def map_bill_status(bill: dict) -> ErpInvoiceStatus:
+    """A bill's status from Xero's own ``Status`` and the payments on it.
+
+    Xero marks a bill ``PAID`` once nothing is owing, which a fully allocated
+    credit note achieves as well as a payment. So ``PAID`` is ``paid`` only
+    when the bill records money paid against it (``AmountPaid > 0``); a bill
+    settled wholly by credit is ``settled_no_payment`` (docs/decisions.md §303).
+    """
+    status = str(bill.get("Status") or "").upper()
+    amount_paid = _decimal(bill.get("AmountPaid")) or 0
+    if status == "AUTHORISED" and amount_paid > 0:
+        return ErpInvoiceStatus.partially_paid
+    if status == "PAID" and amount_paid <= 0:
+        return ErpInvoiceStatus.settled_no_payment
+    return _STATUS_MAP.get(status, ErpInvoiceStatus.unknown)
+
+
+#: Xero's ``PurchaseOrder.Status`` → ours. ``DRAFT`` and ``SUBMITTED``
+#: (awaiting approval) are orders nobody has approved, so they sync as
+#: ``unissued`` and nothing matches against them (decisions §394).
 _PO_STATUS_MAP = {
-    "DRAFT": "open",
-    "SUBMITTED": "open",
+    "DRAFT": "unissued",
+    "SUBMITTED": "unissued",
     "AUTHORISED": "open",
     "BILLED": "closed",
     "DELETED": "cancelled",
@@ -129,8 +255,6 @@ _ACCOUNT_CLASS_MAP = {
     "REVENUE": "revenue",
     "EXPENSE": "expense",
 }
-
-_PAGE_CAP = 10
 
 
 def _connections_url() -> str:
@@ -184,11 +308,7 @@ def _failure(resp) -> ErpPostResult:
         # Xero's per-tenant limits. Report `rate_limited` and let the caller's
         # retry backoff decide when to try again; never sleep-loop here.
         raw = {"retry_after": resp.headers.get("Retry-After")}
-    return ErpPostResult(
-        success=False,
-        message=erp_failure_message(PROVIDER, resp.status_code),
-        raw_response=raw or None,
-    )
+    return erp_http_failure(PROVIDER, resp.status_code, raw_response=raw or None)
 
 
 @register_adapter("xero")
@@ -197,17 +317,33 @@ class XeroAdapter(OAuthErpAdapter):
 
     erp_type = "xero"
     oauth_provider = XERO_OAUTH
+    #: Bills' payment status flows back (``bill_report`` / ``changed_bills``)
+    #: and our payments are written back (``post_payment``), so a confirmed
+    #: push lands payable at ``posted_in_erp`` while status sync is on (§386).
+    supports_status_sync = True
+    #: A Xero bill carries no marker of ours; its never-reused InvoiceID is
+    #: matched by reference (``report_from_bill``).
+    bills_match_by_reference = True
+    #: The vendor page can find any contact by name or tax number and link it
+    #: by hand (``search_vendors`` / ``get_vendor``, decisions §415).
+    supports_vendor_search = True
 
     @classmethod
-    async def resolve_external_tenant_id(
-        cls, *, access_token: str, token_response: dict, callback_params: dict[str, str]
-    ) -> str | None:
-        """The Xero organisation this consent connected (``GET /connections``).
+    async def list_external_tenants(
+        cls,
+        *,
+        access_token: str,
+        token_response: dict,
+        callback_params: dict[str, str],
+        erp_settings: dict | None = None,
+    ) -> list[ExternalCompany]:
+        """The Xero organisations this consent connected (``GET /connections``).
 
         A user may have connected several organisations over time; only the
-        ones authorised by THIS consent (matching ``authEventId``) count. More
-        than one organisation left → None (``no_external_tenant``): we never
-        pick one of a customer's ledgers for them.
+        ones authorised by THIS consent (matching ``authEventId``) count. One
+        consent may still authorise several, and then the admin picks which
+        (decisions §355) — we never pick one of a customer's ledgers for them.
+        A failed lookup is an empty list (``no_external_tenant``).
         """
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -215,17 +351,15 @@ class XeroAdapter(OAuthErpAdapter):
                 headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
             )
         if resp.status_code != 200:
-            return None
+            return []
         rows = resp.json()
         if not isinstance(rows, list):
-            return None
+            return []
         orgs = [r for r in rows if isinstance(r, dict) and r.get("tenantType") == "ORGANISATION"]
         event = _auth_event_id(access_token)
         if event:
             orgs = [r for r in orgs if r.get("authEventId") == event] or orgs
-        if len(orgs) != 1 or not orgs[0].get("tenantId"):
-            return None
-        return str(orgs[0]["tenantId"])
+        return clean_companies([(r.get("tenantId"), r.get("tenantName")) for r in orgs])
 
     async def _headers(self, *, json_body: bool = False) -> dict[str, str]:
         headers = {
@@ -305,14 +439,52 @@ class XeroAdapter(OAuthErpAdapter):
         return items
 
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
+        """Post the bill; a confirmed one also carries the organisation's
+        ``ShortCode``, so its deep link opens in this organisation
+        (``deep_links``, decisions §354)."""
+        result = await self._post_invoice(payload)
+        if result.success and result.erp_document_id:
+            result.erp_company_code = await self.organisation_short_code()
+        return result
+
+    async def organisation_short_code(self) -> str | None:
+        """The connected organisation's ``ShortCode`` (``GET /Organisation``),
+        or None when it cannot be read.
+
+        Best effort by design: it runs after the bill is confirmed, so a failed
+        read must not turn a posted bill into a failed push. The link then
+        falls back to the page in the user's currently selected organisation.
+        Read at each push rather than stored on the connection, so a connection
+        made before this existed needs no backfill or reconnect.
+        """
+        try:
+            headers = await self._headers()
+            async with self.oauth_client(timeout=10) as client:
+                resp = await client.get(f"{_api_base()}/Organisation", headers=headers)
+            if resp.status_code != 200:
+                logger.warning(
+                    "xero: Organisation read for the deep link returned %s", resp.status_code
+                )
+                return None
+            orgs = _json(resp).get("Organisations") or []
+            code = orgs[0].get("ShortCode") if orgs and isinstance(orgs[0], dict) else None
+        except Exception as exc:  # noqa: BLE001 — the bill is posted; only the link degrades
+            logger.warning(
+                "xero: Organisation read for the deep link failed (%s)", type(exc).__name__
+            )
+            return None
+        code = str(code or "").strip()
+        return code or None
+
+    async def _post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         if not payload.vendor_erp_id:
-            return erp_refusal(PROVIDER, VENDOR_NOT_LINKED)
+            return erp_preflight_refusal(PROVIDER, VENDOR_NOT_LINKED)
         if payload.invoice_date is None or payload.due_date is None:
-            return erp_refusal(PROVIDER, MISSING_DATES)
+            return erp_preflight_refusal(PROVIDER, MISSING_DATES)
         try:
             allocation = allocate_bill_lines(payload)
         except BillRefusal as refusal:
-            return erp_refusal(PROVIDER, refusal.reason)
+            return erp_preflight_refusal(PROVIDER, refusal.reason)
 
         status = str(self.config.get("bill_status") or "AUTHORISED").upper()
         if status not in _BILL_STATUSES:
@@ -397,7 +569,7 @@ class XeroAdapter(OAuthErpAdapter):
                 },
             )
             if resp.status_code not in (200, 201):
-                return _failure(resp)
+                return await self._create_refusal(client, headers, resp, payload, body)
             created = (_json(resp).get("Invoices") or [{}])[0]
             document_id = created.get("InvoiceID")
             document_number = created.get("InvoiceNumber") or payload.invoice_number
@@ -441,6 +613,100 @@ class XeroAdapter(OAuthErpAdapter):
             )
         return previous_bill_removed(PROVIDER)
 
+    async def _create_refusal(
+        self, client, headers, resp, payload: InvoicePayload, body: dict
+    ) -> ErpPostResult:
+        """Why Xero refused the bill create (decisions §285's rule, §386).
+
+        Xero answers a failed validation with HTTP 400 and ``Type:
+        ValidationException``, and creates nothing. Its one code for every rule
+        is ``ErrorNumber: 10``, and its ``Message`` quotes the bill's own data,
+        so the reason is not read from the text: it is established from facts
+        read back, in the order Xero checks them:
+
+        * the supplier contact is not ``ACTIVE`` (archived, or erased on a
+          GDPR request) → ``vendor_inactive``;
+        * an account a line names is not ``ACTIVE`` → ``account_inactive``,
+          naming our GL codes;
+        * the bill is dated on or before the organisation's period or
+          end-of-year lock date → ``period_closed``.
+
+        Each is coded and non-retryable with ``not_posted``. A validation
+        failure none of them explains is the plain HTTP failure, still
+        ``not_posted``: Xero's answer says nothing was created, so the push is
+        not left "possibly posted". A read that fails is "don't know", never
+        a reason. Anything but a ValidationException (5xx, 429, 401, a 400
+        without that body) is the plain failure as before.
+        """
+        if resp.status_code != 400 or not _is_validation_exception(resp):
+            return _failure(resp)
+        if await self._contact_inactive(client, headers, str(payload.vendor_erp_id)):
+            return _nothing_posted(erp_refusal(PROVIDER, VENDOR_INACTIVE))
+        inactive = await self._inactive_accounts(client, headers, payload, body)
+        if inactive:
+            refused = _nothing_posted(erp_refusal(PROVIDER, ACCOUNT_INACTIVE))
+            refused.refusal_params = {"accounts": inactive}
+            return refused
+        if await self._in_locked_period(client, headers, payload.invoice_date):
+            return _nothing_posted(erp_refusal(PROVIDER, PERIOD_CLOSED))
+        failed = _failure(resp)
+        failed.not_posted = True
+        return failed
+
+    async def _contact_inactive(self, client, headers, contact_id: str) -> bool:
+        try:
+            resp = await client.get(f"{_api_base()}/Contacts/{contact_id}", headers=headers)
+        except httpx.HTTPError:
+            return False
+        if resp.status_code != 200:
+            return False
+        rows = _json(resp).get("Contacts") or []
+        if not rows or not isinstance(rows[0], dict):
+            return False
+        # No status stated is not evidence the contact is inactive.
+        return str(rows[0].get("ContactStatus") or "ACTIVE").upper() != "ACTIVE"
+
+    async def _inactive_accounts(self, client, headers, payload: InvoicePayload, body: dict):
+        """Our GL codes for the accounts this bill named that Xero no longer
+        holds ``ACTIVE`` (archived or deleted), sorted; empty when unknown."""
+        sent = {
+            str(li.get("AccountID"))
+            for inv in body.get("Invoices") or []
+            for li in inv.get("LineItems") or []
+            if li.get("AccountID")
+        }
+        try:
+            resp = await client.get(f"{_api_base()}/Accounts", headers=headers)
+        except httpx.HTTPError:
+            return []
+        if resp.status_code != 200:
+            return []
+        # An account listed with no status is not evidence of either (as in
+        # `list_gl_accounts`); one missing from the chart was deleted.
+        status = {
+            str(a.get("AccountID")): str(a.get("Status") or "ACTIVE").upper()
+            for a in _json(resp).get("Accounts") or []
+            if isinstance(a, dict)
+        }
+        ours = {str(erp): code for erp, code in _account_codes(payload).items()}
+        # An account missing from the chart altogether was deleted.
+        gone = {a for a in sent if status.get(a, "DELETED") != "ACTIVE"}
+        return sorted({ours.get(a, a) for a in gone})
+
+    async def _in_locked_period(self, client, headers, bill_date: date | None) -> bool:
+        if bill_date is None:
+            return False
+        try:
+            resp = await client.get(f"{_api_base()}/Organisation", headers=headers)
+        except httpx.HTTPError:
+            return False
+        if resp.status_code != 200:
+            return False
+        orgs = _json(resp).get("Organisations") or []
+        org = orgs[0] if orgs and isinstance(orgs[0], dict) else {}
+        locks = [_xero_date(org.get(k)) for k in ("PeriodLockDate", "EndOfYearLockDate")]
+        return any(lock is not None and bill_date <= lock for lock in locks)
+
     # -- status / void -----------------------------------------------------
 
     async def _get_bill(self, client, headers, erp_document_id: str) -> dict | None:
@@ -456,10 +722,7 @@ class XeroAdapter(OAuthErpAdapter):
             bill = await self._get_bill(client, headers, erp_document_id)
         if bill is None:
             return ErpInvoiceStatus.unknown
-        status = str(bill.get("Status") or "").upper()
-        if status == "AUTHORISED" and (_decimal(bill.get("AmountPaid")) or 0) > 0:
-            return ErpInvoiceStatus.partially_paid
-        return _STATUS_MAP.get(status, ErpInvoiceStatus.unknown)
+        return map_bill_status(bill)
 
     async def _live_bill(self, client, headers, erp_document_id: str) -> dict | None:
         """The bill when it is live; None only when Xero POSITIVELY reports it
@@ -515,6 +778,414 @@ class XeroAdapter(OAuthErpAdapter):
         that already was (a void is idempotent)."""
         return await self._void_outcome(erp_document_id) is not VoidOutcome.NOT_VOIDED
 
+    # -- status sync-back + payment write-back (decisions §295, §386) -------
+
+    async def _read_bill(self, client, headers, bill_id: str) -> dict:
+        """The bill as Xero holds it, whatever its status. Raises
+        :class:`XeroRequestError` on anything but one readable bill: Xero keeps
+        a deleted or voided bill readable, so "can't read it" is never "gone"."""
+        resp = await _status_get(client, f"{_api_base()}/Invoices/{bill_id}", headers=headers)
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        bills = _json(resp).get("Invoices") or []
+        if not bills or not isinstance(bills[0], dict):
+            raise XeroRequestError(resp.status_code)
+        return bills[0]
+
+    async def bill_report(self, bill_id: str) -> ErpBillReport:
+        """Where the bill stands in Xero (:func:`report_from_bill`). Raises on
+        any failure to read it; a failure never reads as gone or as open."""
+        headers = await self._headers()
+        async with self.oauth_client(timeout=15) as client:
+            bill = await self._read_bill(client, headers, str(bill_id))
+            report = report_from_bill(bill, str(bill_id))
+            cash = _cash_payments([p for p in bill.get("Payments") or [] if isinstance(p, dict)])
+            # Only a bill paid in full outside us is ever recorded, so only its
+            # rails are read: a part-paid bill's would cost reads for nothing.
+            if (
+                report.state is ErpBillState.paid
+                and report.reduced_outside
+                and not report.settled_by_credit
+                and cash
+            ):
+                parts = await self._payment_rails(client, headers, cash)
+                # `card` only when EVERY cash payment came off a card account: a
+                # bank payment beside a card one is not all card (§396). The
+                # split itself rides `payment_parts`, stated with the cash
+                # figure it breaks down.
+                report.payment_method = "card" if all(p.method == "card" for p in parts) else None
+                if report.paid_amount is not None:
+                    report.payment_parts = parts
+        return report
+
+    async def _payment_rails(self, client, headers, cash: list[dict]) -> tuple[RailPart, ...]:
+        """Each cash payment's rail and amount (decisions §396): ``card`` when a
+        person paid from a Xero credit-card account (so that part stays off the
+        1099, like QuickBooks' ``CreditCard``), else None ("not stated"). A Xero
+        payment names the account it came from, not a rail, and the bill's own
+        list of payments omits even that, so each payment and then its account
+        are read, an account once per bill.
+
+        Best effort, per payment: a read that fails for any reason (no payments
+        scope, a 429, an outage) leaves THAT payment's rail not stated, never a
+        failed report. The bill's state is already known by then, and failing
+        here would turn a bill known to be paid outside into one we cannot vouch
+        for, at dispatch and on every sweep tick at the same bill. These reads
+        do NOT wait out a 429 (plain ``client.get``, not :func:`_status_get`): a
+        bill with many payments would otherwise sleep once per read, under the
+        invoice lock the read-back holds and past the dispatch check's bound. A
+        rate-limited read leaves that payment not stated, so the cost of
+        pressure is an over-report, never an under-report. The amounts are the
+        bill's own ``Amount`` per payment, the figures ``paid_amount`` sums, so
+        the parts add up to it whatever the reads answer."""
+        kinds: dict[str, str | None] = {}
+        out: list[RailPart] = []
+        for payment in cash:
+            account_id = await self._payment_account(client, headers, payment)
+            if account_id is not None and account_id not in kinds:
+                kinds[account_id] = await self._account_type(client, headers, account_id)
+            kind = kinds.get(account_id) if account_id is not None else None
+            out.append(
+                RailPart(
+                    "card" if kind == "CREDITCARD" else None,
+                    _decimal(payment.get("Amount")) or Decimal(0),
+                )
+            )
+        return tuple(out)
+
+    async def _payment_account(self, client, headers, payment: dict) -> str | None:
+        payment_id = payment.get("PaymentID")
+        if not payment_id:
+            return None
+        try:
+            resp = await client.get(f"{_api_base()}/Payments/{payment_id}", headers=headers)
+            if resp.status_code != 200:
+                return None
+            rows = _json(resp).get("Payments") or []
+        except (httpx.HTTPError, ValueError):
+            return None
+        first = rows[0] if rows and isinstance(rows[0], dict) else {}
+        account_id = (first.get("Account") or {}).get("AccountID")
+        return str(account_id) if account_id else None
+
+    async def _account_type(self, client, headers, account_id: str) -> str | None:
+        try:
+            resp = await client.get(f"{_api_base()}/Accounts/{account_id}", headers=headers)
+            if resp.status_code != 200:
+                return None
+            accounts = _json(resp).get("Accounts") or []
+        except (httpx.HTTPError, ValueError):
+            return None
+        first = accounts[0] if accounts and isinstance(accounts[0], dict) else {}
+        return str(first.get("Type") or "").upper() or None
+
+    async def bills_for_payment(self, payment_id: str) -> list[str]:
+        headers = await self._headers()
+        async with self.oauth_client(timeout=15) as client:
+            resp = await _status_get(
+                client, f"{_api_base()}/Payments/{payment_id}", headers=headers
+            )
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        out = []
+        for record in _json(resp).get("Payments") or []:
+            bill = (record.get("Invoice") or {}) if isinstance(record, dict) else {}
+            if bill.get("InvoiceID"):
+                out.append(str(bill["InvoiceID"]))
+        return list(dict.fromkeys(out))
+
+    async def _modified_since(
+        self,
+        client,
+        headers: dict,
+        path: str,
+        params: dict,
+        key: str,
+        bill_ids,
+        *,
+        scope_refusal_raises: bool = False,
+    ) -> list[str]:
+        """Every record of ``path`` changed since ``headers['If-Modified-Since']``,
+        reduced to bill ids by ``bill_ids``. The whole listing or a raise: past
+        :data:`SYNC_LISTING_MAX_ROWS` it is :class:`ErpListingIncomplete`
+        (truncated), and the sweep then reads back every payable bill instead.
+
+        A page Xero refuses raises :class:`XeroRequestError`, so the pass fails
+        and its high-water mark stays put. The exception, with
+        ``scope_refusal_raises``, is a 403: a connection consented
+        before ``accounting.payments`` was asked for cannot read payments at
+        all and no retry changes that, so it raises :class:`_ScopeRefused`
+        for :meth:`changed_bills` to report as the connection's scope gap
+        (decisions §415)."""
+        out: list[str] = []
+        seen = 0
+        for page in range(1, sync_listing_pages(_PAGE_FLOOR) + 1):
+            resp = await _status_get(
+                client,
+                f"{_api_base()}/{path}",
+                params={**params, "page": page, "pageSize": _CHANGE_PAGE_SIZE},
+                headers=headers,
+            )
+            if resp.status_code == 403 and scope_refusal_raises:
+                raise _ScopeRefused
+            if resp.status_code != 200:
+                raise XeroRequestError(resp.status_code)
+            rows = [r for r in _json(resp).get(key) or [] if isinstance(r, dict)]
+            # Counted in rows, not pages: Xero may answer 1,000 rows a page,
+            # and the cap is a row count either way.
+            seen += len(rows)
+            if seen > SYNC_LISTING_MAX_ROWS:
+                break
+            for row in rows:
+                out.extend(str(b) for b in bill_ids(row) if b)
+            if len(rows) < _PAGE_FLOOR:
+                return out
+        raise ErpListingIncomplete(PROVIDER, path, ListingGap.truncated)
+
+    async def changed_bills(self, since: datetime) -> list[str]:
+        """Bills changed since ``since``: every ACCPAY invoice Xero reports
+        modified (``If-Modified-Since``), plus the bill every ACCPAY payment
+        modified since then pays, so a payment applied or deleted is read as a
+        change of its bill whether or not the bill's own timestamp moved. The
+        bills themselves are read back by :meth:`bill_report`.
+
+        **A consent without ``accounting.payments``** (decisions §415). The
+        ``Invoices`` listing is read first, so when Xero then refuses the
+        ``Payments`` listing 403 (forbidden, not unauthenticated) the token
+        has just been honoured for this organisation, and the refusal is the
+        missing scope. A 401 is not: it has already been through
+        ``RefreshOnUnauthorized``'s replay, so it means the token itself was
+        not accepted, and the pass fails with its mark unmoved like any other
+        refused read — a sticky gap recorded from it would stop the payments
+        listing and the write-back for a reason that is not the scope. That raises
+        :class:`ErpScopeMissing` carrying the bills the ``Invoices`` listing
+        found; the status sync records ``payments_scope_missing`` on the
+        connection, and every later pass, seeing it recorded
+        (:meth:`scope_gaps`), reads the ``Invoices`` listing alone: no
+        request a certain refusal answers, and no fall-back to reading every
+        payable bill on every tick, which spent the organisation's daily
+        allowance (1,000 calls on Starter) and told nobody why. A bill a
+        payment changes still shows up there as long as Xero moves the bill's
+        ``UpdatedDateUTC`` when its ``AmountPaid`` / ``Status`` change, which
+        is what the ``INVOICE`` webhook (§392) relies on too."""
+        # Xero documents the header as a UTC timestamp `yyyy-mm-ddThh:mm:ss`,
+        # with no offset; a form it does not parse would be ignored or refused.
+        stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        headers = {**await self._headers(), "If-Modified-Since": stamp}
+        async with self.oauth_client(timeout=30) as client:
+            bills = await self._modified_since(
+                client,
+                headers,
+                "Invoices",
+                {"where": 'Type=="ACCPAY"'},
+                "Invoices",
+                lambda row: [row.get("InvoiceID")],
+            )
+            if PAYMENTS_SCOPE_MISSING in self.scope_gaps():
+                return list(dict.fromkeys(bills))
+            try:
+                bills += await self._modified_since(
+                    client,
+                    headers,
+                    "Payments",
+                    {"where": 'PaymentType=="ACCPAYPAYMENT"'},
+                    "Payments",
+                    lambda row: [(row.get("Invoice") or {}).get("InvoiceID")],
+                    scope_refusal_raises=True,
+                )
+            except _ScopeRefused:
+                raise ErpScopeMissing(
+                    PROVIDER, PAYMENTS_SCOPE_MISSING, list(dict.fromkeys(bills))
+                ) from None
+        return list(dict.fromkeys(bills))
+
+    async def _our_payments(self, client, headers, payment_id: str, bill_id: str) -> list[dict]:
+        """Every Xero payment of ``bill_id`` carrying our marker for
+        ``payment_id``, deleted ones included. The bill lists only its live
+        payments, so a write-back someone deleted in Xero is found only here."""
+        resp = await _status_get(
+            client,
+            f"{_api_base()}/Payments",
+            params={"where": f'Reference=="{_payment_reference(payment_id)}"'},
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        return [
+            record
+            for record in _json(resp).get("Payments") or []
+            if isinstance(record, dict)
+            and _payment_marker(record) == str(payment_id).lower()
+            and str((record.get("Invoice") or {}).get("InvoiceID") or "") == str(bill_id)
+        ]
+
+    async def post_payment(self, payload: PaymentPayload) -> ErpPostResult:
+        """Apply a FeohLedger payment to its bill as a Xero payment.
+
+        Idempotent on ``payload.payment_id`` in two layers, like the bill push:
+        our earlier payment is looked up by its marker (``Reference:
+        "FeohLedger payment <id>"``) before anything is created, and the create
+        carries ``Idempotency-Key`` so Xero replays its original answer to a
+        retry. A payment of ours that someone has since deleted in Xero is
+        refused (``bill_payment_voided``) rather than posted again over their
+        decision. The created payment is read back for the same reason, since
+        a replay answers with what was true when it was first sent.
+
+        Refused before any write: no mapped pay-from account
+        (``payment_account_not_mapped``), a bill gone from Xero
+        (``bill_not_in_erp``), another currency than the bill's, or either
+        side stating none (``currency_mismatch``), or more than the bill still has due
+        (``payment_exceeds_balance``). The amount posted is what reached the
+        supplier. A Xero payment carries no discount, so an early-payment
+        discount taken here leaves the bill partly due there, and the
+        write-back flags that for the bookkeeper (``bill_balance_after``).
+        """
+        if not payload.bill_id:
+            return erp_preflight_refusal(PROVIDER, BILL_NOT_IN_ERP)
+        if PAYMENTS_SCOPE_MISSING in self.scope_gaps():
+            # The consent cannot write payments (decisions §415): said, not a
+            # certain 401/403 spent and read as an HTTP failure.
+            return erp_preflight_refusal(PROVIDER, PAYMENTS_SCOPE_MISSING)
+        if not payload.pay_from_account_erp_id:
+            return erp_preflight_refusal(PROVIDER, PAYMENT_ACCOUNT_NOT_MAPPED)
+        try:
+            headers = await self._headers()
+            async with self.oauth_client(timeout=30) as client:
+                bill = await self._read_bill(client, headers, payload.bill_id)
+                if str(bill.get("Status") or "").upper() in _GONE_STATUSES:
+                    return _nothing_posted(erp_refusal(PROVIDER, BILL_NOT_IN_ERP))
+                ours = await self._our_payments(
+                    client, headers, payload.payment_id, payload.bill_id
+                )
+                live = [p for p in ours if not _payment_deleted(p)]
+                if live:
+                    return ErpPostResult(
+                        success=True,
+                        erp_document_id=str(live[0].get("PaymentID")),
+                        message="Already in Xero (idempotent: found by payment reference)",
+                        bill_balance_after=_decimal(bill.get("AmountDue")),
+                    )
+                if ours:
+                    return erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
+                # Fail closed: a bill or a payment that states no currency is
+                # not known to be in the same one, so the figure is not posted.
+                bill_currency = iso_currency_or_none(bill.get("CurrencyCode"))
+                if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):
+                    return _nothing_posted(erp_refusal(PROVIDER, CURRENCY_MISMATCH))
+                due = _decimal(bill.get("AmountDue"))
+                if due is None or payload.amount <= 0 or payload.amount > due:
+                    return _nothing_posted(erp_refusal(PROVIDER, PAYMENT_EXCEEDS_BALANCE))
+                body = {
+                    "Payments": [
+                        {
+                            "Invoice": {"InvoiceID": str(payload.bill_id)},
+                            "Account": {"AccountID": str(payload.pay_from_account_erp_id)},
+                            "Date": payload.paid_on.isoformat(),
+                            "Amount": payload.amount,
+                            "Reference": _payment_reference(payload.payment_id),
+                        }
+                    ]
+                }
+                resp = await client.put(
+                    f"{_api_base()}/Payments",
+                    content=dumps_exact_json(body),
+                    headers={
+                        **headers,
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": create_attempt_key(
+                            str(payload.payment_id), 1, IDEMPOTENCY_KEY_MAX
+                        ),
+                    },
+                )
+                if resp.status_code not in (200, 201):
+                    refused = _failure(resp)
+                    # A deterministic refusal (a 4xx naming why) created nothing.
+                    refused.not_posted = not erp_status_retryable(resp.status_code)
+                    return refused
+                created = (_json(resp).get("Payments") or [{}])[0]
+                payment_erp_id = created.get("PaymentID") if isinstance(created, dict) else None
+                if not payment_erp_id:
+                    return ErpPostResult(
+                        success=False, message=f"{PROVIDER} post failed: bill_payment_unconfirmed"
+                    )
+                record = await _status_get(
+                    client, f"{_api_base()}/Payments/{payment_erp_id}", headers=headers
+                )
+                if record.status_code != 200:
+                    raise XeroRequestError(record.status_code)
+                rows = _json(record).get("Payments") or []
+                if not rows or not isinstance(rows[0], dict) or _payment_deleted(rows[0]):
+                    return erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
+                after = await self._read_bill(client, headers, payload.bill_id)
+            return ErpPostResult(
+                success=True,
+                erp_document_id=str(payment_erp_id),
+                message="Bill payment posted to Xero",
+                bill_balance_after=_decimal(after.get("AmountDue")),
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except XeroRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+
+    async def void_payment(self, payload: PaymentPayload) -> ErpPostResult:
+        """Delete the Xero payment :meth:`post_payment` wrote for this payment
+        (Xero deletes a payment; it has no void). "Ours" is the definition
+        ``post_payment`` uses: the payments ``GET Payments`` finds by our
+        ``Reference`` on this bill (``_our_payments``), never only those the
+        bill's own ``Payments`` array happens to list. Only live ones are
+        deleted, so a payment never written, one already deleted, or a bill
+        already gone is a success with nothing to do. Xero refuses to delete a
+        reconciled payment; that refusal is returned, and the caller flags it
+        for a person."""
+        try:
+            if not payload.bill_id:
+                return ErpPostResult(success=True, message="No bill in Xero")
+            if PAYMENTS_SCOPE_MISSING in self.scope_gaps():
+                # A consent without `accounting.payments` (decisions §415)
+                # could not have written a payment, nor can it find or delete
+                # one: refused, so the caller flags it for a person.
+                return erp_preflight_refusal(PROVIDER, PAYMENTS_SCOPE_MISSING)
+            headers = await self._headers()
+            async with self.oauth_client(timeout=30) as client:
+                bill = await self._read_bill(client, headers, payload.bill_id)
+                if str(bill.get("Status") or "").upper() in _GONE_STATUSES:
+                    return ErpPostResult(success=True, message="No bill in Xero")
+                live = [
+                    p
+                    for p in await self._our_payments(
+                        client, headers, payload.payment_id, payload.bill_id
+                    )
+                    if not _payment_deleted(p) and p.get("PaymentID")
+                ]
+                if not live:
+                    return ErpPostResult(success=True, message="No bill payment of ours to void")
+                payment_erp_id = str(live[0].get("PaymentID"))
+                resp = await client.post(
+                    f"{_api_base()}/Payments/{payment_erp_id}",
+                    content=dumps_exact_json({"Status": "DELETED"}),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+            if resp.status_code not in (200, 201):
+                return _failure(resp)
+            return ErpPostResult(
+                success=True,
+                erp_document_id=payment_erp_id,
+                message="Bill payment deleted in Xero",
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except XeroRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
+
     # -- reads -------------------------------------------------------------
 
     async def test_connection(self) -> bool:
@@ -526,46 +1197,154 @@ class XeroAdapter(OAuthErpAdapter):
         except Exception:
             return False
 
-    async def _paged(self, path: str, params: dict, key: str) -> list[dict]:
-        """Best-effort paged GET (house style: an error ends the walk, never raises)."""
-        try:
-            headers = await self._headers()
-        except Exception:
-            return []
+    async def _paged_complete(self, path: str, params: dict, key: str) -> list[dict]:
+        """Every row of a paged collection, or :class:`ErpListingIncomplete`.
+
+        A failed page (a 429 included), a transport error or an unreadable body
+        raises instead of ending the walk with what was read: the vendor sync
+        reads absence as evidence (base), and the PO sync reads the listing's
+        skips, which a partial read would silently shorten (decisions §329).
+        """
+        headers = await self._headers()
         out: list[dict] = []
         async with self.oauth_client(timeout=30) as client:
-            for page in range(1, _PAGE_CAP + 1):
+            for page in range(1, sync_listing_pages(100) + 1):
                 try:
                     resp = await client.get(
                         f"{_api_base()}/{path}", params={**params, "page": page}, headers=headers
                     )
                 except httpx.HTTPError:
-                    break
+                    raise ErpListingIncomplete(PROVIDER, path, ListingGap.fetch_failed) from None
                 if resp.status_code != 200:
-                    break
-                rows = _json(resp).get(key) or []
+                    raise ErpListingIncomplete(PROVIDER, path, ListingGap.fetch_failed)
+                try:
+                    rows = _json(resp).get(key) or []
+                except ValueError:
+                    raise ErpListingIncomplete(PROVIDER, path, ListingGap.fetch_failed) from None
                 out.extend(rows)
                 if len(rows) < 100:
-                    break
-        return out
+                    return out
+        raise ErpListingIncomplete(PROVIDER, path, ListingGap.truncated)
 
     async def list_vendors(self) -> list[VendorPayload]:
-        rows = await self._paged("Contacts", {"where": "IsSupplier==true"}, "Contacts")
+        """Every supplier contact, archived ones included (``active=False``).
+
+        Xero leaves ARCHIVED contacts out unless ``includeArchived`` asks for
+        them, and a vendor linked to one would then look like a dead link.
+
+        Xero sets ``IsSupplier`` only once a contact has a bill ("automatically
+        set when an accounts payable invoice is generated", and it cannot be set
+        through the API), so a supplier with no bill yet is not one. Reading
+        only ``IsSupplier`` left every new supplier unsynced, and its first
+        bill from FeohLedger refused ``vendor_not_linked`` for good, since only
+        a bill could ever flag it (§386). So the walk reads every contact that
+        is a supplier OR is not a customer: a contact created as a supplier
+        carries neither flag until its first bill. Customer-only contacts,
+        which can number in the thousands, stay out. A contact that is already
+        a customer and is about to become a supplier with no PO is the one case
+        the walk cannot see; a person links it by hand from the vendor page
+        (:meth:`search_vendors`, decisions §415). The contacts on every unbilled PO
+        are added too, which also covers a customer sent a PO. Like the
+        contact walk, that read is complete or raises: the vendor sync reads
+        absence as evidence.
+        """
+        rows = await self._paged_complete(
+            "Contacts",
+            {"where": "IsSupplier==true OR IsCustomer==false", "includeArchived": "true"},
+            "Contacts",
+        )
+        seen = {raw.get("ContactID") for raw in rows}
+        ordered_from: list[str] = []
+        for status in _UNBILLED_PO_STATUSES:
+            pos = await self._paged_complete("PurchaseOrders", {"Status": status}, "PurchaseOrders")
+            for po in pos:
+                contact_id = (po.get("Contact") or {}).get("ContactID")
+                if contact_id and contact_id not in seen:
+                    seen.add(contact_id)
+                    ordered_from.append(contact_id)
+        for i in range(0, len(ordered_from), _CONTACT_ID_BATCH):
+            batch = ",".join(ordered_from[i : i + _CONTACT_ID_BATCH])
+            rows += await self._paged_complete(
+                "Contacts", {"IDs": batch, "includeArchived": "true"}, "Contacts"
+            )
         return [_contact_to_vendor(raw) for raw in rows if raw.get("ContactID")]
 
-    async def list_gl_accounts(self) -> list[GLAccountPayload]:
-        try:
-            headers = await self._headers()
-            async with self.oauth_client(timeout=30) as client:
-                resp = await client.get(f"{_api_base()}/Accounts", headers=headers)
-        except Exception:
-            return []
+    async def search_vendors(self, *, name: str | None, tax_id: str | None) -> VendorSearchResult:
+        """Contacts matching ``name`` (Xero's ``searchTerm``) or exactly
+        ``tax_id`` (``where TaxNumber==``), customers included, archived ones
+        too (``active=False``) — the record a person links a vendor to by
+        hand when the vendor walk cannot see it yet: a customer with no bill
+        and no PO from us carries neither flag :meth:`list_vendors` reads
+        (decisions §415). One page per term; more than that is ``truncated``.
+        A tax number carrying a quote or a backslash is not searched for (it
+        could not be quoted into the filter safely, and no real one has
+        either). Raises :class:`XeroRequestError` on a refused read.
+        """
+        headers = await self._headers()
+        terms: list[dict] = []
+        if name and name.strip():
+            terms.append({"searchTerm": name.strip()})
+        tax = (tax_id or "").strip()
+        if tax and '"' not in tax and "\\" not in tax:
+            terms.append({"where": f'TaxNumber=="{tax}"'})
+        found: dict[str, dict] = {}
+        truncated = False
+        async with self.oauth_client(timeout=15) as client:
+            for term in terms:
+                resp = await client.get(
+                    f"{_api_base()}/Contacts",
+                    params={
+                        **term,
+                        "includeArchived": "true",
+                        "page": 1,
+                        "pageSize": _SEARCH_PAGE_SIZE,
+                    },
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    raise XeroRequestError(resp.status_code)
+                rows = [r for r in _json(resp).get("Contacts") or [] if isinstance(r, dict)]
+                truncated = truncated or len(rows) >= _SEARCH_PAGE_SIZE
+                for raw in rows:
+                    if raw.get("ContactID"):
+                        found.setdefault(str(raw["ContactID"]), raw)
+        return VendorSearchResult(
+            vendors=[_contact_to_vendor(raw) for raw in found.values()], truncated=truncated
+        )
+
+    async def get_vendor(self, erp_vendor_id: str) -> VendorPayload | None:
+        """The contact ``erp_vendor_id`` names, read now; None when Xero
+        answers 404 or the id is not shaped like a ContactID (never put in a
+        path).
+        Raises :class:`XeroRequestError` on any other refusal."""
+        if not _CONTACT_ID.match(str(erp_vendor_id or "")):
+            return None
+        headers = await self._headers()
+        async with self.oauth_client(timeout=15) as client:
+            resp = await client.get(f"{_api_base()}/Contacts/{erp_vendor_id}", headers=headers)
+        if resp.status_code == 404:
+            return None
         if resp.status_code != 200:
-            return []
+            raise XeroRequestError(resp.status_code)
+        rows = [r for r in _json(resp).get("Contacts") or [] if isinstance(r, dict)]
+        match = [r for r in rows if str(r.get("ContactID") or "").lower() == erp_vendor_id.lower()]
+        return _contact_to_vendor(match[0]) if match else None
+
+    async def list_gl_accounts(self) -> list[GLAccountPayload]:
+        """The whole chart (Xero returns it unpaged), or :class:`ErpListingIncomplete`.
+
+        An ARCHIVED account is emitted ``active=False``, not dropped: it still
+        exists, so a row linked to it is not a dead link (§284).
+        """
+        headers = await self._headers()
+        async with self.oauth_client(timeout=30) as client:
+            resp = await client.get(f"{_api_base()}/Accounts", headers=headers)
+        if resp.status_code != 200:
+            raise ErpListingIncomplete(PROVIDER, "Accounts", ListingGap.fetch_failed)
         out = []
         for raw in _json(resp).get("Accounts") or []:
             code = raw.get("Code")
-            if not code or raw.get("Status") == "ARCHIVED":
+            if not code:
                 continue
             out.append(
                 GLAccountPayload(
@@ -573,13 +1352,270 @@ class XeroAdapter(OAuthErpAdapter):
                     name=raw.get("Name") or str(code),
                     account_type=_ACCOUNT_CLASS_MAP.get(str(raw.get("Class") or "").upper()),
                     erp_account_id=raw.get("AccountID"),
+                    # ACTIVE, ARCHIVED or DELETED: only ACTIVE takes a posting (an
+                    # absent status is not evidence of either).
+                    active=str(raw.get("Status") or "ACTIVE").upper() == "ACTIVE",
                 )
             )
         return out
 
     async def list_pos(self) -> list[PoPayload]:
-        rows = await self._paged("PurchaseOrders", {}, "PurchaseOrders")
-        return [_xero_po_to_payload(raw) for raw in rows if raw.get("PurchaseOrderNumber")]
+        return (await self.list_pos_report()).pos
+
+    async def list_pos_report(self) -> PoListing:
+        """Every purchase order, and the ones left out for want of a total, or
+        :class:`ErpListingIncomplete`.
+
+        A PO with no ``PurchaseOrderNumber`` is dropped. One with a number but
+        no usable ``Total`` is skipped, never synced at 0, and named in
+        ``skipped`` as ``unpriceable``: at 0 every invoice against it read as
+        over-billed, and a total an earlier sync stored for it must stop being
+        matched against (decisions §323, §325). The total is never summed from
+        ``LineItems`` (§325's rule): lines omit what the header carries beyond
+        them, and Xero's line amounts may be tax-exclusive.
+
+        Read whole or not at all (:meth:`_paged_complete`): it used to end at a
+        failed page with what it had (nothing, on the first) and stop silently
+        at 10 pages, which the PO sync read as the whole list (decisions §329).
+        """
+        rows = await self._paged_complete("PurchaseOrders", {}, "PurchaseOrders")
+        pos: list[PoPayload] = []
+        skipped: list[SkippedPo] = []
+        for raw in rows:
+            number = raw.get("PurchaseOrderNumber")
+            if not number:
+                continue
+            po = _xero_po_to_payload(raw)
+            if po is None:
+                skipped.append(SkippedPo(str(number), PoSkipReason.unpriceable))
+            else:
+                pos.append(po)
+        return PoListing(pos=pos, skipped=skipped)
+
+
+#: The longest ``Retry-After`` a status-sync read waits out: Xero's per-minute
+#: limit (60 calls per organisation). A longer one is the daily cap, and the
+#: read fails instead, so the pass fails and its high-water mark stays put.
+_MINUTE_LIMIT_WAIT_SECONDS = 60
+#: ``X-Rate-Limit-Problem`` values naming a per-minute limit (the
+#: organisation's, or the app's across every organisation).
+_MINUTE_LIMIT_PROBLEMS = frozenset({"minute", "appminute"})
+
+
+async def _status_get(client, url: str, **kwargs) -> httpx.Response:
+    """A status-sync GET that waits out Xero's per-minute limit, once.
+
+    Xero allows 60 calls a minute per organisation, and a full reconciliation
+    reads one per bill (plus the rail reads of a bill paid outside us, which
+    do not wait: ``XeroAdapter._payment_rails``), so a tenant with more than a few dozen payable
+    bills meets a 429 on every pass. Failing there would fail every pass at the
+    same bill and never read the rest. So a 429 whose ``Retry-After`` is within
+    the minute is waited out and the read is made again, once: Xero's own
+    pacing instruction, not a retry of an unknown failure. Any other answer,
+    or a second 429, is returned as it is. Reads only; never a write. At the
+    dispatch check the read's 10-second bound cuts a long wait short, and the
+    payment is held, as for any read that cannot vouch for the bill (§296).
+    """
+    resp = await client.get(url, **kwargs)
+    if resp.status_code != 429:
+        return resp
+    # Xero names the limit it hit; only a per-minute one passes in a minute.
+    # A daily cap (or the concurrent-call limit) can carry a short
+    # Retry-After too, near midnight, so the header decides first.
+    problem = (resp.headers.get("x-rate-limit-problem") or "").strip().lower()
+    if problem and problem not in _MINUTE_LIMIT_PROBLEMS:
+        return resp
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if not raw.isdigit() or int(raw) > _MINUTE_LIMIT_WAIT_SECONDS:
+        return resp
+    await asyncio.sleep(int(raw))
+    return await client.get(url, **kwargs)
+
+
+class _ScopeRefused(Exception):
+    """A change listing Xero refused 401 / 403 for want of a scope
+    (:meth:`XeroAdapter._modified_since`); internal to :meth:`changed_bills`."""
+
+
+class XeroRequestError(RuntimeError):
+    """A Xero call answered something other than what the caller needs.
+    PII-free: the HTTP status alone, never the body."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"{PROVIDER} request failed: HTTP {status_code}")
+
+
+#: ``post_payment``'s mark on the Xero payment it writes, in its ``Reference``.
+_PAYMENT_MARKER = re.compile(r"FeohLedger payment ([0-9a-fA-F-]{36})(?:\s|$)")
+#: Xero's JSON date: ``/Date(<milliseconds since the epoch>[+-HHMM])/``.
+_MS_DATE = re.compile(r"^/Date\((-?\d+)(?:[+-]\d{4})?\)/$")
+
+
+def _payment_reference(payment_id: str) -> str:
+    return f"FeohLedger payment {payment_id}"
+
+
+def _payment_marker(record: dict) -> str | None:
+    """Our payment id, when this Xero payment is one ``post_payment`` wrote."""
+    match = _PAYMENT_MARKER.search(str(record.get("Reference") or ""))
+    return match.group(1).lower() if match else None
+
+
+def _payment_deleted(record: dict) -> bool:
+    return str(record.get("Status") or "").upper() == "DELETED"
+
+
+def _is_validation_exception(resp) -> bool:
+    """Is this Xero's ``ValidationException`` body (nothing was created)?
+    Only ``Type`` / ``ErrorNumber`` are read; the messages quote the bill."""
+    try:
+        body = _json(resp)
+    except ValueError:
+        return False
+    return isinstance(body, dict) and (
+        body.get("Type") == "ValidationException" or body.get("ErrorNumber") == 10
+    )
+
+
+def _account_codes(payload: InvoicePayload) -> dict[str, str]:
+    """Our GL code for each Xero account id the payload references."""
+    pairs = [(payload.gl_account_erp_id, payload.gl_account)]
+    pairs += [(li.gl_account_erp_id, li.gl_account) for li in payload.line_items]
+    return {str(erp_id): code for erp_id, code in pairs if erp_id and code}
+
+
+def _nothing_posted(result: ErpPostResult) -> ErpPostResult:
+    """A refusal decided on reads alone: nothing was written to Xero."""
+    result.not_posted = True
+    return result
+
+
+def _xero_date(value) -> date | None:
+    """A Xero date: ``/Date(1552953600000+0000)/`` or ISO ``2019-03-19[T…]``."""
+    if not value:
+        return None
+    text = str(value).strip()
+    match = _MS_DATE.match(text)
+    if match:
+        # The milliseconds are absolute (UTC); the offset only annotates them.
+        moment = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=int(match.group(1)))
+        return moment.date()
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _cash_payments(payments: list[dict]) -> list[dict]:
+    """Payments a person made in Xero that moved money: positive, and not one
+    of ours. (Credit notes, overpayments and prepayments are not listed among
+    a bill's payments; Xero counts them in ``AmountCredited``.)"""
+    return [
+        p
+        for p in payments
+        if _payment_marker(p) is None and (_decimal(p.get("Amount")) or Decimal(0)) > 0
+    ]
+
+
+def _latest_cash_payment(bill: dict) -> dict | None:
+    payments = [p for p in bill.get("Payments") or [] if isinstance(p, dict)]
+    return max(
+        _cash_payments(payments), key=lambda p: _xero_date(p.get("Date")) or date.min, default=None
+    )
+
+
+def report_from_bill(bill: dict, bill_id: str) -> ErpBillReport:
+    """One Xero bill as the status sync reads it (decisions §295, §303, §386).
+
+    * ``deleted``: Xero reports it ``DELETED`` or ``VOIDED`` (it keeps both
+      readable).
+    * ``paid``: ``Status == PAID`` with nothing due. ``partially_paid``:
+      something due, but less than the total. ``open``: the whole total due.
+    * ``unknown``: anything we cannot vouch for. Not a bill (``ACCPAY``), no
+      total, or payments listed on the bill that do not add up to its
+      ``AmountPaid``. The dispatch-time check refuses on it; the sweep leaves
+      the invoice alone.
+
+    "Outside FeohLedger" is judged from what was taken off the bill
+    (``Total - AmountDue``) beyond our own marked payments, so a credit note,
+    an overpayment or a prepayment applied there counts as well as a person's
+    payment. Cash is only a positive payment Xero lists on the bill. Anything
+    in ``AmountCredited``, or an outside reduction the cash does not cover, is
+    ``settled_by_credit``, never booked as money that moved.
+    """
+    found = str(bill.get("InvoiceID") or bill_id)
+
+    def report(state: ErpBillState, **kw) -> ErpBillReport:
+        return ErpBillReport(
+            bill_id=found,
+            state=state,
+            match_by_reference=XeroAdapter.bills_match_by_reference,
+            **kw,
+        )
+
+    if str(bill.get("Type") or "").upper() != "ACCPAY":
+        return report(ErpBillState.unknown)
+    status = str(bill.get("Status") or "").upper()
+    if status in _GONE_STATUSES:
+        return report(ErpBillState.deleted)
+    total = _decimal(bill.get("Total"))
+    due = _decimal(bill.get("AmountDue"))
+    paid = _decimal(bill.get("AmountPaid")) or Decimal(0)
+    credited = _decimal(bill.get("AmountCredited")) or Decimal(0)
+    payments = [p for p in bill.get("Payments") or [] if isinstance(p, dict)]
+    amounts = [_decimal(p.get("Amount")) for p in payments]
+    if (
+        total is None
+        or due is None
+        or total <= 0
+        or due < 0
+        or due > total
+        # What came off the bill must be what was paid plus what was credited:
+        # anything else is a shape we cannot vouch for.
+        or total - due != paid + credited
+        or any(a is None for a in amounts)
+        or sum(amounts, Decimal(0)) != paid
+    ):
+        return report(ErpBillState.unknown)
+    if due == 0:
+        state = ErpBillState.paid if status == "PAID" else ErpBillState.unknown
+    elif due < total:
+        state = ErpBillState.partially_paid
+    else:
+        state = ErpBillState.open
+    ours = [p for p in payments if _payment_marker(p) is not None]
+    external = [p for p in payments if _payment_marker(p) is None]
+    ours_applied = sum((_decimal(p.get("Amount")) for p in ours), Decimal(0))
+    reduced_outside = (total - due) > ours_applied
+    outside = (total - due - ours_applied) if reduced_outside else Decimal(0)
+    cash = _cash_payments(payments)
+    cash_applied = sum((_decimal(p.get("Amount")) for p in cash), Decimal(0))
+    latest = _latest_cash_payment(bill)
+    settled_by_credit = reduced_outside and (credited > 0 or cash_applied < outside)
+    return report(
+        state,
+        paid_on=_xero_date(latest.get("Date")) if latest else None,
+        # Filled in by `XeroAdapter.bill_report` from the paying account.
+        payment_method=None,
+        external_payment_ids=tuple(str(p["PaymentID"]) for p in external if p.get("PaymentID")),
+        paid_only_by_us=bool(ours) and not reduced_outside,
+        reduced_outside=reduced_outside,
+        settled_by_credit=settled_by_credit,
+        our_payment_applied=bool(ours),
+        reduced_outside_amount=outside,
+        # The cash a person applied in Xero, exact, so the payment is recorded
+        # at what left and never at what FeohLedger reckons was owed (§386).
+        # Stated only for a bill paid wholly in cash by others: a credit-settled
+        # bill is never booked as cash, a part-paid one is never recorded, and
+        # one we part-paid ourselves is not one payment a record could state.
+        paid_amount=(
+            cash_applied
+            if state is ErpBillState.paid and reduced_outside and not settled_by_credit and not ours
+            else None
+        ),
+        paid_currency=str(bill.get("CurrencyCode") or "").upper() or None,
+    )
 
 
 class _HttpFailure(Exception):
@@ -617,10 +1653,33 @@ def _contact_to_vendor(raw: dict) -> VendorPayload:
         address=address,
         tax_id=raw.get("TaxNumber") or None,
         payment_terms=terms,
+        # ACTIVE, ARCHIVED or GDPRREQUEST (erased on request): only an
+        # ACTIVE contact can be billed.
+        active=str(raw.get("ContactStatus") or "ACTIVE").upper() == "ACTIVE",
     )
 
 
-def _xero_po_to_payload(raw: dict) -> PoPayload:
+def _po_total(value: object) -> Decimal | None:
+    """A PO ``Total`` stated as an exact, finite number, else None.
+
+    Unlike :func:`_decimal` this never raises: an unreadable total on one PO
+    is that PO's problem (reported ``unpriceable``), not the whole listing's.
+    A stated ``0`` is a figure and is returned as one."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        total = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return total if total.is_finite() else None
+
+
+def _xero_po_to_payload(raw: dict) -> PoPayload | None:
+    """A Xero PurchaseOrder as a PoPayload, or None when it states no usable
+    ``Total`` (``list_pos_report`` names it ``unpriceable``)."""
+    total = _po_total(raw.get("Total"))
+    if total is None:
+        return None
     delivery = None
     delivery_str = raw.get("DeliveryDateString")
     if delivery_str:
@@ -631,7 +1690,8 @@ def _xero_po_to_payload(raw: dict) -> PoPayload:
     return PoPayload(
         po_number=str(raw["PurchaseOrderNumber"]),
         vendor_name=(raw.get("Contact") or {}).get("Name"),
-        total=_decimal(raw.get("Total")) or Decimal("0"),
+        vendor_erp_id=(raw.get("Contact") or {}).get("ContactID") or None,
+        total=total,
         status=_PO_STATUS_MAP.get(str(raw.get("Status") or "").upper(), "open"),
         expected_delivery_date=delivery,
         currency=raw.get("CurrencyCode") or None,

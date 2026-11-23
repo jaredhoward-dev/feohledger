@@ -5,7 +5,13 @@
 /// backend ORM model does the same dodge (`Exception as APException`).
 library;
 
+import 'package:feohledger_mobile/models/action_verdict.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
+
+/// The `decision_refusals` codes that hide a control rather than explain it:
+/// a terminal row (`exception_not_actionable`) is nothing the reader can act
+/// on, like a role refusal ([ActionVerdict.isOffered] hides that one).
+const kExceptionHiddenRefusals = {'exception_not_actionable'};
 
 enum ApExceptionStatus {
   open('open'),
@@ -23,15 +29,10 @@ enum ApExceptionStatus {
     );
   }
 
-  String get label => switch (this) {
-    ApExceptionStatus.open => 'Open',
-    ApExceptionStatus.escalated => 'Escalated',
-    ApExceptionStatus.resolved => 'Resolved',
-    ApExceptionStatus.dismissed => 'Dismissed',
-  };
-
-  /// Only open / escalated exceptions can be acted on — resolved and dismissed
-  /// are terminal (the backend 409s a resolve from any other status).
+  /// Open or escalated — resolved and dismissed are terminal. Read for the
+  /// SLA countdown and the assignee picker only; whether THIS reader may
+  /// resolve / dismiss / escalate is the row's `decision_refusals`
+  /// ([ApException.resolveVerdict] …), never this.
   bool get isActionable =>
       this == ApExceptionStatus.open || this == ApExceptionStatus.escalated;
 }
@@ -52,11 +53,6 @@ enum ApExceptionSeverity {
     );
   }
 
-  String get label => switch (this) {
-    ApExceptionSeverity.error => 'Error',
-    ApExceptionSeverity.warning => 'Warning',
-    ApExceptionSeverity.info => 'Info',
-  };
 }
 
 class ApException {
@@ -117,6 +113,50 @@ class ApException {
   final DateTime? dueAt;
   final double? timeToResolutionHours;
 
+  /// The ERP's product name for [poRematch] (`erp_name`), or null when the
+  /// adapter has none — the screen then says "your ERP" itself.
+  final String? erpName;
+
+  /// Set when an ERP PO sync's re-check no longer finds this hold (decisions
+  /// §323, amended): the sync never clears a hold, so this is what tells the
+  /// reviewer the PO changed and they may now clear it.
+  final PoRematchClears? poRematch;
+
+  /// `erp_report.kind`, or null when the row carries no ERP report.
+  final String? erpReportKind;
+
+  /// `erp_report.refusal`: on the payment write-back rows, the ERP's coded
+  /// refusal as `{code, params}`, kept raw for `erpRefusalNote`
+  /// (`lib/l10n/erp_refusal_messages.dart`). Null otherwise.
+  final Map<String, dynamic>? erpRefusal;
+
+  /// The payment the ERP reported and FeohLedger could not record
+  /// (`erp_report.kind == "paid_not_recorded"`, decisions §319). Null otherwise.
+  final ErpReportedPayment? erpPayment;
+
+  /// `decision_refusals` as served on the list and the detail
+  /// (`api/exceptions.py::decision_refusals` — the role dependency, the
+  /// status gate, then `exception_lifecycle.segregation_refusal`, the gates
+  /// `POST /{id}/resolve` raises from): `{resolve, dismiss, escalate}`, each
+  /// `null` (accepted) or a coded refusal. Kept raw so the offline cache
+  /// round-trips it; read through [resolveVerdict] / [dismissVerdict] /
+  /// [escalateVerdict]. `null` on a read that carries none, which offers
+  /// nothing.
+  final Map<String, dynamic>? decisionRefusals;
+
+  ActionVerdict _decision(String action) => decisionRefusals == null
+      ? ActionVerdict.unanswered
+      : ActionVerdict.fromVerdicts(decisionRefusals!, action);
+
+  /// The caller's verdict on resolving this exception.
+  ActionVerdict get resolveVerdict => _decision('resolve');
+
+  /// The caller's verdict on dismissing this exception.
+  ActionVerdict get dismissVerdict => _decision('dismiss');
+
+  /// The caller's verdict on escalating this exception.
+  ActionVerdict get escalateVerdict => _decision('escalate');
+
   ApException({
     required this.id,
     this.invoiceId,
@@ -141,6 +181,12 @@ class ApException {
     this.resolvedAt,
     this.dueAt,
     this.timeToResolutionHours,
+    this.erpName,
+    this.poRematch,
+    this.erpReportKind,
+    this.erpRefusal,
+    this.erpPayment,
+    this.decisionRefusals,
   });
 
   static DateTime? _parseDate(Object? raw) {
@@ -180,6 +226,115 @@ class ApException {
       dueAt: _parseDate(json['due_at']),
       timeToResolutionHours:
           (json['time_to_resolution_hours'] as num?)?.toDouble(),
+      erpName: json['erp_name'] as String?,
+      poRematch: PoRematchClears.fromErpReport(json['erp_report']),
+      erpReportKind: _erpReportKind(json['erp_report']),
+      erpRefusal: _erpRefusal(json['erp_report']),
+      erpPayment: ErpReportedPayment.fromErpReport(json['erp_report']),
+      decisionRefusals: json['decision_refusals'] is Map
+          ? Map<String, dynamic>.from(json['decision_refusals'] as Map)
+          : null,
+    );
+  }
+
+  static String? _erpReportKind(Object? report) {
+    if (report is! Map) return null;
+    final kind = report['kind'];
+    return kind is String ? kind : null;
+  }
+
+  static Map<String, dynamic>? _erpRefusal(Object? report) {
+    if (report is! Map) return null;
+    final refusal = report['refusal'];
+    return refusal is Map ? Map<String, dynamic>.from(refusal) : null;
+  }
+}
+
+/// `erp_report` with `kind == "paid_not_recorded"`: what the ERP said was paid
+/// on a bill FeohLedger could not record the payment for (decisions §319).
+/// Display only — the record itself is web-only. Every field may be absent.
+class ErpReportedPayment {
+  static const kind = 'paid_not_recorded';
+
+  /// The cash the ERP states was paid, as the exact decimal string the server
+  /// keeps (never parsed through a double), and the ISO 4217 code it stated it
+  /// in (decisions §386, §413). Null when the ERP stated no figure.
+  final String? amount;
+  final String? amountCurrency;
+
+  /// The reference the payment would be recorded under.
+  final String? reference;
+
+  /// The ERP's own payment date — a calendar day. Null when the ERP stated
+  /// none (`paid_on_reported` false: the stored day is when the report
+  /// arrived, which is not a fact the ERP gave).
+  final DateTime? paidOn;
+
+  const ErpReportedPayment({
+    this.amount,
+    this.amountCurrency,
+    this.reference,
+    this.paidOn,
+  });
+
+  static final _isoDay = RegExp(r'^\d{4}-\d{2}-\d{2}$');
+  static final _exactDecimal = RegExp(r'^-?\d+(\.\d+)?$');
+  static final _currencyCode = RegExp(r'^[A-Za-z]{3}$');
+
+  /// Null for any other report, or none.
+  static ErpReportedPayment? fromErpReport(Object? raw) {
+    if (raw is! Map || raw['kind'] != kind) return null;
+    final rawAmount = raw['amount'];
+    final currency = raw['amount_currency'];
+    final reference = raw['reference'];
+    final day = raw['paid_on'];
+    final trimmed = rawAmount is String ? rawAmount.trim() : '';
+    final amount = _exactDecimal.hasMatch(trimmed) ? trimmed : null;
+    return ErpReportedPayment(
+      amount: amount,
+      // A currency belongs to its figure: never shown without one.
+      amountCurrency: amount != null &&
+              currency is String &&
+              _currencyCode.hasMatch(currency)
+          ? currency.toUpperCase()
+          : null,
+      reference: reference is String && reference.trim().isNotEmpty
+          ? reference.trim()
+          : null,
+      paidOn: raw['paid_on_reported'] == true &&
+              day is String &&
+              _isoDay.hasMatch(day)
+          ? DateTime.tryParse(day)
+          : null,
+    );
+  }
+}
+
+/// `erp_report` with `kind == "po_rematch_clears"` (backend
+/// `invoice_warnings.ERP_REPORT_PO_REMATCH_CLEARS`): the PO number the
+/// re-check matched and the UTC day it was seen. Either may be absent.
+class PoRematchClears {
+  static const kind = 'po_rematch_clears';
+
+  final String? poNumber;
+
+  /// A calendar day, not an instant — render it without a time-zone shift.
+  final DateTime? observedOn;
+
+  const PoRematchClears({this.poNumber, this.observedOn});
+
+  static final _isoDay = RegExp(r'^\d{4}-\d{2}-\d{2}$');
+
+  /// Null for any other report, or none.
+  static PoRematchClears? fromErpReport(Object? raw) {
+    if (raw is! Map || raw['kind'] != kind) return null;
+    final po = raw['po_number'];
+    final day = raw['observed_on'];
+    return PoRematchClears(
+      poNumber: po is String && po.trim().isNotEmpty ? po.trim() : null,
+      observedOn: day is String && _isoDay.hasMatch(day)
+          ? DateTime.tryParse(day)
+          : null,
     );
   }
 }

@@ -278,6 +278,17 @@ PUBLIC_BY_DESIGN: tuple[PublicProbe, ...] = (
         needs_db=True,
     ),
     PublicProbe(
+        "POST",
+        "/portal/auth/forgot-password",
+        "/api/portal/auth/forgot-password",
+        "Supplier self-service password recovery — reachable by a supplier who "
+        "cannot sign in. Tenant-scoped by X-Tenant-Slug; answers identically for "
+        "a known and an unknown address. The RESET is gated by the single-use "
+        "emailed portal token (see ALTERNATE_AUTH).",
+        body={"email": _UNKNOWN_EMAIL},
+        needs_db=True,
+    ),
+    PublicProbe(
         "GET",
         "/portal/branding",
         "/api/portal/branding",
@@ -389,6 +400,21 @@ ALTERNATE_AUTH: dict[tuple[str, str], AlternateGate] = {
         "refused outright); dedupe is on the processor event id.",
         symbols=("parse_webhook", "is_event_already_processed"),
     ),
+    ("POST", "/erp/webhook/quickbooks"): AlternateGate(
+        "The Intuit app's verifier token (base64 HMAC over the raw body), then "
+        "event-id dedupe; the company in each event picks the tenant.",
+        symbols=("verify_hmac_sha256_base64", "claim_qbo_events"),
+    ),
+    ("POST", "/erp/webhook/xero"): AlternateGate(
+        "The Xero app's webhook key (base64 HMAC over the raw body), then "
+        "dedupe on each event's identity; the organisation in each event picks the tenant.",
+        symbols=("verify_hmac_sha256_base64", "claim_xero_events"),
+    ),
+    ("POST", "/erp/webhook/merge_dev/{tenant_slug}"): AlternateGate(
+        "The tenant's own Merge webhook signature key (base64url HMAC over the "
+        "raw body) — the URL picks whose key — then dedupe on the bill + modified_at.",
+        symbols=("verify_hmac_sha256_base64url", "is_event_already_processed"),
+    ),
     ("POST", "/erp/webhook/{erp_type}"): AlternateGate(
         "Per-tenant ERP webhook signing secret, then event-id dedupe.",
         symbols=("verify_hmac_sha256", "is_event_already_processed"),
@@ -398,7 +424,7 @@ ALTERNATE_AUTH: dict[tuple[str, str], AlternateGate] = {
         "the opaque per-tenant token embedded in the recipient address.",
         symbols=("verify_signature",),
     ),
-    ("POST", "/peppol/inbound/{tenant_slug}"): AlternateGate(
+    ("POST", "/peppol/inbound/{organization_id}"): AlternateGate(
         "Access Point HMAC over the raw body; dedupe is the DB uq_peppol_message_id index.",
         symbols=("verify_inbound_signature",),
     ),
@@ -449,6 +475,16 @@ ALTERNATE_AUTH: dict[tuple[str, str], AlternateGate] = {
         "The VendorUser's password, through the same shared pwd_context + "
         "dummy_verify timing equalisation as employee login.",
         symbols=("verify_password", "dummy_verify"),
+    ),
+    ("POST", "/portal/auth/reset-password"): AlternateGate(
+        "The single-use emailed portal set-password token IS the credential, "
+        "bound to its tenant; consume_portal_reset_token GETDELs it atomically.",
+        symbols=("consume_portal_reset_token",),
+    ),
+    ("POST", "/portal/auth/reset-password/check"): AlternateGate(
+        "The same portal token, read without consuming it; the 400 the "
+        "redemption would answer for any token it would refuse.",
+        symbols=("peek_portal_reset_token",),
     ),
     ("POST", "/portal/auth/logout"): AlternateGate(
         "Bearer token read off the header and validated by decode_token.",

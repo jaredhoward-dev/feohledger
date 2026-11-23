@@ -12,9 +12,12 @@ Money invariant: monthly price + every per-seat / usage component is
 component pricing live in JSONB so adding a tier feature or a metered component
 needs no migration. See ``backend/docs/billing.md``.
 
-FIRST SLICE — real Stripe wiring, dunning, proration, and the customer billing
-UI are later slices. ``Subscription.external_subscription_id`` is the (nullable)
-hook the live provider will populate.
+``Subscription.external_subscription_id`` is the live provider's subscription
+id: set when a plan change creates or adopts it, cleared when a move to a free
+plan cancels it (decisions §480). Always NULL with the ``mock`` provider.
+
+``Subscription.pending_plan_id`` / ``pending_plan_effective_at`` hold a move to
+a free plan scheduled for the end of the paid period (decisions §483).
 """
 
 import uuid
@@ -105,6 +108,18 @@ class Subscription(Base, TimestampMixin):
     current_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     trial_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Set by the live billing provider (Stripe subscription id) once wired.
-    # Nullable: the mock provider + local dev never populate it.
+    # The live provider's (Stripe) subscription id, set by `change_plan` when
+    # it creates/adopts one and cleared when it cancels one. Nullable: the mock
+    # provider + local dev never populate it.
     external_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # A move the subscription makes at the end of its paid period (decisions
+    # §483): paid → free keeps the paid plan, and its entitlements, until
+    # ``pending_plan_effective_at``, then repoints the row onto
+    # ``pending_plan_id``. Both NULL when nothing is scheduled; set and cleared
+    # together, only by `services/billing/scheduled_downgrade.py`.
+    pending_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True
+    )
+    pending_plan_effective_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

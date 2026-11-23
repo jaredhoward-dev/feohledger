@@ -12,6 +12,7 @@ import {
 import { SERVICES, skipUnlessReachable } from '../fixtures/services';
 import {
 	FAKE_ERP_BASE,
+	connectOAuthThroughPanel,
 	createApprovedInvoice,
 	deleteInvoice,
 	erpFailureFromAudit,
@@ -40,11 +41,20 @@ import {
  *      connection test passes on the stored token.
  *   2. Full send — a GBP invoice stating 20% VAT posts; the purchase invoice
  *      read back FROM THE FAKE carries the exact gross, the synced contact,
- *      our invoice number and dates, and the VAT split 1000.00 + 200.00 at
+ *      our invoice number and dates, and the VAT split 1050.00 + 210.00 at
  *      the ledger's own GB_STANDARD rate.
+ *   2b. Connect in the browser — Organization → ERP → Connect: the page's
+ *      consent redirect, the callback, the panel naming the business, then
+ *      the same send (`connectOAuthThroughPanel`).
  *   3. Fail closed — an unlinked vendor, and a taxed invoice on a ledger
  *      with no default tax rate, are refused before anything is posted.
- *   4. Disconnect — clears the connection.
+ *   4. Refused creates — a create Sage refuses (a date inside the year-end
+ *      lockdown, a business on Accounting Start) is recorded with its coded
+ *      reason and as having created nothing (decisions §285), never as an
+ *      uncoded HTTP failure that may have posted.
+ *   5. Disconnect — clears the connection AND revokes the grant at the fake's
+ *      `POST /sage/oauth2/revoke` (form `token`, the client as form fields;
+ *      decisions §371), so it does not stay live at Sage.
  */
 
 const PROVIDER = 'sage_accounting';
@@ -81,6 +91,21 @@ async function oauthStatus(page: Page) {
 	return resp.json();
 }
 
+/** How many well-formed revoke requests the fake Sage identity server has had. */
+async function revocations(request: APIRequestContext): Promise<number> {
+	const resp = await request.get(`${FAKE_ERP_BASE}/__oauth/sage/stats`);
+	expect(resp.ok(), await resp.text()).toBe(true);
+	return (await resp.json()).revocations;
+}
+
+/** Set a fake contact's Account Status (`is_active`) through the fake's hook. */
+async function setSageContactActive(request: APIRequestContext, id: string, isActive: boolean) {
+	const resp = await request.post(`${FAKE_ERP_BASE}/sage/v3.1/__set-contact`, {
+		data: { id, is_active: isActive }
+	});
+	expect(resp.ok(), await resp.text()).toBe(true);
+}
+
 /** A purchase invoice straight from the fake, as Sage holds it. */
 async function sageInvoice(request: APIRequestContext, id: string) {
 	const resp = await request.get(`${FAKE_ERP_BASE}/sage/v3.1/purchase_invoices/${id}`, {
@@ -88,6 +113,49 @@ async function sageInvoice(request: APIRequestContext, id: string) {
 	});
 	expect(resp.ok(), await resp.text()).toBe(true);
 	return resp.json();
+}
+
+/** Change the fake business (its plan, lockdown date) through the fake's hook. */
+async function setSageBusiness(
+	request: APIRequestContext,
+	data: { plan?: string; year_end_lockdown_date?: string | null }
+) {
+	const resp = await request.post(`${FAKE_ERP_BASE}/sage/v3.1/__set-business`, { data });
+	expect(resp.ok(), await resp.text()).toBe(true);
+}
+
+/** Sync the contacts and ledger accounts, post an approved purchase invoice
+ *  and read it back FROM THE FAKE: the exact gross, dates and VAT split. */
+async function sendBillAndReadBack(page: Page, request: APIRequestContext): Promise<void> {
+	await syncErpVendors(page);
+	await syncErpGlAccounts(page);
+	const inv = await createApprovedInvoice(page, {
+		prefix: 'E2E-SAGE',
+		invoiceDate: '2026-10-01',
+		dueDate: '2026-10-31',
+		amount: '1260.00',
+		taxAmount: '210.00',
+		currency: 'GBP',
+		vendor: SUPPLIER,
+		glAccount: '7500'
+	});
+	try {
+		expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('done');
+		const posted = await sageInvoice(request, await erpReferenceFromAudit(page, inv.id));
+		expect(posted.contact.id).toBe('sage-contact-1');
+		expect(posted.vendor_reference ?? posted.reference).toBe(inv.invoice_number);
+		expect(Number(posted.total_amount)).toBe(1260);
+		expect(posted.currency.id).toBe('GBP');
+		expect([posted.date, posted.due_date]).toEqual(['2026-10-01', '2026-10-31']);
+		// The VAT split: 1050.00 net + 210.00 at the ledger's own 20% rate.
+		type Line = { net_amount: string; tax_amount: string; tax_rate_id?: string };
+		const lines: Line[] = posted.invoice_lines;
+		expect(lines.reduce((sum, l) => sum + Number(l.net_amount), 0)).toBe(1050);
+		expect(lines.reduce((sum, l) => sum + Number(l.tax_amount), 0)).toBe(210);
+		expect(lines.map((l) => l.tax_rate_id)).toEqual(['GB_STANDARD']);
+	} finally {
+		await deleteInvoice(page, inv.id);
+	}
 }
 
 test.describe('/erp sage_accounting adapter against fake-erp', () => {
@@ -123,35 +191,20 @@ test.describe('/erp sage_accounting adapter against fake-erp', () => {
 		page,
 		request
 	}) => {
-		await syncErpVendors(page);
-		await syncErpGlAccounts(page);
-		const inv = await createApprovedInvoice(page, {
-			prefix: 'E2E-SAGE',
-			invoiceDate: '2026-10-01',
-			dueDate: '2026-10-31',
-			amount: '1200.00',
-			taxAmount: '200.00',
-			currency: 'GBP',
-			vendor: SUPPLIER,
-			glAccount: '7500'
+		await sendBillAndReadBack(page, request);
+	});
+
+	test('connect through the Organization page, then a purchase invoice posts', async ({
+		page,
+		request
+	}) => {
+		await connectOAuthThroughPanel(page, {
+			provider: PROVIDER,
+			label: 'Sage Business Cloud Accounting',
+			consentPath: '/sage/oauth2/auth/central',
+			company: TENANT
 		});
-		try {
-			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('done');
-			const posted = await sageInvoice(request, await erpReferenceFromAudit(page, inv.id));
-			expect(posted.contact.id).toBe('sage-contact-1');
-			expect(posted.vendor_reference ?? posted.reference).toBe(inv.invoice_number);
-			expect(Number(posted.total_amount)).toBe(1200);
-			expect(posted.currency.id).toBe('GBP');
-			expect([posted.date, posted.due_date]).toEqual(['2026-10-01', '2026-10-31']);
-			// The VAT split: 1000.00 net + 200.00 at the ledger's own 20% rate.
-			type Line = { net_amount: string; tax_amount: string; tax_rate_id?: string };
-			const lines: Line[] = posted.invoice_lines;
-			expect(lines.reduce((sum, l) => sum + Number(l.net_amount), 0)).toBe(1000);
-			expect(lines.reduce((sum, l) => sum + Number(l.tax_amount), 0)).toBe(200);
-			expect(lines.map((l) => l.tax_rate_id)).toEqual(['GB_STANDARD']);
-		} finally {
-			await deleteInvoice(page, inv.id);
-		}
+		await sendBillAndReadBack(page, request);
 	});
 
 	test('an invoice whose vendor never synced is refused, not posted', async ({ page }) => {
@@ -177,8 +230,8 @@ test.describe('/erp sage_accounting adapter against fake-erp', () => {
 			prefix: 'E2E-SAGE-NORATE',
 			invoiceDate: '2026-10-01',
 			dueDate: '2026-10-31',
-			amount: '1200.00',
-			taxAmount: '200.00',
+			amount: '1260.00',
+			taxAmount: '210.00',
 			currency: 'GBP',
 			vendor: SUPPLIER,
 			// sage-ledger-7600 carries no default tax rate and the org sets none.
@@ -194,12 +247,114 @@ test.describe('/erp sage_accounting adapter against fake-erp', () => {
 		}
 	});
 
-	test('disconnect clears the connection', async ({ page }) => {
+	test('a create dated inside the lockdown is refused period_closed, nothing posted', async ({
+		page,
+		request
+	}) => {
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-SAGE-LOCKED',
+			invoiceDate: '2026-10-01',
+			dueDate: '2026-10-31',
+			amount: '1260.00',
+			taxAmount: '210.00',
+			currency: 'GBP',
+			vendor: SUPPLIER,
+			glAccount: '7500'
+		});
+		try {
+			// Sage answers the create 422 with an undocumented $dataCode; the
+			// adapter reads the lockdown date back to say why.
+			await setSageBusiness(request, { year_end_lockdown_date: '2026-12-31' });
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('failed');
+			expect(await erpFailureFromAudit(page, inv.id)).toBe(
+				'Sage Accounting post refused: period_closed (HTTP 422)'
+			);
+		} finally {
+			await setSageBusiness(request, { year_end_lockdown_date: null });
+			await deleteInvoice(page, inv.id);
+		}
+	});
+
+	test('a supplier set Inactive in Sage is refused vendor_inactive before any create', async ({
+		page,
+		request
+	}) => {
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-SAGE-INACTIVE',
+			invoiceDate: '2026-10-01',
+			dueDate: '2026-10-31',
+			amount: '1260.00',
+			taxAmount: '210.00',
+			currency: 'GBP',
+			vendor: SUPPLIER,
+			glAccount: '7500'
+		});
+		try {
+			// Deactivated in Sage after the sync: the contact reads back
+			// `is_active: false` and the adapter refuses without a POST (no
+			// "(HTTP 422)"; decisions §481).
+			await setSageContactActive(request, 'sage-contact-1', false);
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('failed');
+			expect(await erpFailureFromAudit(page, inv.id)).toBe(
+				'Sage Accounting post refused: vendor_inactive'
+			);
+		} finally {
+			await setSageContactActive(request, 'sage-contact-1', true);
+			await deleteInvoice(page, inv.id);
+		}
+	});
+
+	test('a business on Accounting Start is refused purchases_not_permitted', async ({
+		page,
+		request
+	}) => {
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-SAGE-START',
+			invoiceDate: '2026-10-01',
+			dueDate: '2026-10-31',
+			amount: '1260.00',
+			taxAmount: '210.00',
+			currency: 'GBP',
+			vendor: SUPPLIER,
+			glAccount: '7500'
+		});
+		try {
+			await setSageBusiness(request, { plan: 'start' });
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('failed');
+			expect(await erpFailureFromAudit(page, inv.id)).toBe(
+				'Sage Accounting post refused: purchases_not_permitted (HTTP 403)'
+			);
+		} finally {
+			await setSageBusiness(request, { plan: 'plus' });
+			await deleteInvoice(page, inv.id);
+		}
+	});
+
+	test('disconnect clears the connection and revokes the grant at Sage', async ({
+		page,
+		request
+	}) => {
 		const headers = await authedTenantHeaders(page);
+		const before = await revocations(request);
 		const resp = await page.request.post(`${API_BASE}/api/organization/erp/oauth/disconnect`, {
 			headers
 		});
-		expect((await resp.json()).disconnected).toBe(true);
+		// The fake answers 200 only to a form body carrying `token` with the
+		// client as form fields (a Basic header is refused), so `revoked` proves
+		// the backend sent Sage's shape.
+		expect(await resp.json()).toEqual({
+			disconnected: true,
+			revoked: true,
+			revocation: 'revoked'
+		});
+		// At least ours: another worker's Disconnect may land in between.
+		expect(await revocations(request)).toBeGreaterThan(before);
 		const status = await oauthStatus(page);
 		expect(status.connected).toBe(false);
 	});

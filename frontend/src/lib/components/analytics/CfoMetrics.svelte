@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { formatPercent } from '#lib/utils/percent.ts';
 	import { api } from '#lib/api.ts';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
@@ -8,8 +9,10 @@
 	import { formatMoney, isNegativeAmount } from '#lib/utils/money.ts';
 	import type { MoneyAmount } from '#lib/utils/money.ts';
 	import { formatPeriod } from '#lib/utils/time.ts';
+	import { formatDays } from '#lib/utils/duration.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import type { CfoAccrualsByCurrency, CfoAnalytics } from '#lib/types/analytics.ts';
 
@@ -25,6 +28,9 @@
 	}
 
 	let { periodDays = 365 }: Props = $props();
+
+	/** Day figures keep the one decimal they always showed ("12.0d"), in the reader's notation. */
+	const DAYS_1DP = { minimumFractionDigits: 1, maximumFractionDigits: 1 } as const;
 
 	let data = $state<CfoAnalytics | null>(null);
 	let loading = $state(false);
@@ -122,7 +128,7 @@
 	     draws pending and unavailable identically. -->
 	<div class="kpi-row">
 		<KpiCard
-			value={data ? `${data.dpo_current.toFixed(1)}d` : null}
+			value={data ? formatDays(data.dpo_current, DAYS_1DP) : null}
 			label={m('cfoMetrics.kpi.dpo')}
 			pending={loading}
 		/>
@@ -132,7 +138,7 @@
 		     that a figure exists. -->
 		<KpiCard
 			value={data && data.cash_conversion_cycle !== null
-				? `${data.cash_conversion_cycle.toFixed(1)}d`
+				? formatDays(data.cash_conversion_cycle, DAYS_1DP)
 				: null}
 			label={m('cfoMetrics.kpi.ccc')}
 			sub={data && data.cash_conversion_cycle === null
@@ -151,7 +157,7 @@
 			pending={loading}
 		/>
 		<KpiCard
-			value={data ? `${data.rebate_yield.yield_pct.toFixed(2)}%` : null}
+			value={data ? formatPercent(data.rebate_yield.yield_pct, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : null}
 			label={m('cfoMetrics.kpi.rebateYield')}
 			highlight={data && data.rebate_yield.yield_pct > 0 ? 'green' : null}
 			pending={loading}
@@ -161,7 +167,7 @@
 	{#if error}
 		<p class="cfm-error" role="alert">{error}</p>
 	{:else if loading && !data}
-		<p class="empty">{m('cfoMetrics.loading')}</p>
+		<LoadingState />
 	{:else if data}
 		{#if data.reporting_accounts_payable_balance.unconverted_count > 0}
 			<p class="cfm-skipped" data-testid="unconverted-ap-balance">
@@ -185,10 +191,10 @@
 					{#each data.dpo_trend as r (r.month)}
 						<div class="cf-bar-row">
 							<span class="cf-bar-label">{formatPeriod(r.month)}</span>
-							<div class="cf-bar-bg" role="img" aria-label={`${r.dpo.toFixed(1)} days`}>
+							<div class="cf-bar-bg" role="img" aria-label={formatDays(r.dpo, { ...DAYS_1DP, unitDisplay: 'long' })}>
 								<div class="cf-bar committed" style="width:{(r.dpo / maxDpo) * 100}%"></div>
 							</div>
-							<span class="cf-bar-amount">{r.dpo.toFixed(1)}d</span>
+							<span class="cf-bar-amount">{formatDays(r.dpo, DAYS_1DP)}</span>
 						</div>
 					{/each}
 				</div>
@@ -224,6 +230,14 @@
 			{#if accrualsHaveUnlabelledPos}
 				<p class="cfm-note" data-testid="accruals-no-currency">{m('cfoMetrics.accruals.noCurrency')}</p>
 			{/if}
+			<!-- POs whose total the ERP could not confirm at its last sync are
+			     left out of the open-PO and received legs (decisions §323) —
+			     counted here so a floor never reads as the whole book. -->
+			{#if data.accruals.unverifiable_po_count > 0}
+				<p class="cfm-skipped" role="alert" data-testid="accruals-unverifiable-pos">
+					{m('cfoMetrics.accruals.unverifiablePos', { n: data.accruals.unverifiable_po_count })}
+				</p>
+			{/if}
 		</div>
 
 		<div class="cfm-subsection">
@@ -232,18 +246,20 @@
 				<p class="cfm-flag" role="alert">
 					{m('cfoMetrics.concentration.flagged', {
 						vendor: data.supplier_concentration.largest_vendor ?? '—',
-						pct: data.supplier_concentration.largest_vendor_share_pct.toFixed(1)
+						pct: formatPercent(data.supplier_concentration.largest_vendor_share_pct, {
+							minimumFractionDigits: 1
+						})
 					})}
 				</p>
 			{/if}
 			<div class="cfm-stat-grid">
 				<div class="cfm-stat">
 					<span class="cfm-stat-label">{m('cfoMetrics.concentration.top10')}</span>
-					<span class="cfm-stat-value">{data.supplier_concentration.top_10_share_pct.toFixed(1)}%</span>
+					<span class="cfm-stat-value">{formatPercent(data.supplier_concentration.top_10_share_pct, { minimumFractionDigits: 1 })}</span>
 				</div>
 				<div class="cfm-stat">
 					<span class="cfm-stat-label">{m('cfoMetrics.concentration.top50')}</span>
-					<span class="cfm-stat-value">{data.supplier_concentration.top_50_share_pct.toFixed(1)}%</span>
+					<span class="cfm-stat-value">{formatPercent(data.supplier_concentration.top_50_share_pct, { minimumFractionDigits: 1 })}</span>
 				</div>
 				<div class="cfm-stat">
 					<span class="cfm-stat-label">{m('cfoMetrics.concentration.largest')}</span>
@@ -283,7 +299,7 @@
 								role="img"
 								aria-label={unknown
 									? m('cfoMetrics.fraudTrend.noInvoices')
-									: `${(r.rate_pct ?? 0).toFixed(1)}%`}
+									: formatPercent(r.rate_pct ?? 0, { minimumFractionDigits: 1 })}
 							>
 								{#if !unknown}
 									<div
@@ -295,7 +311,7 @@
 							{#if unknown}
 								<span class="cf-bar-amount cfm-unknown" data-testid="fraud-rate-unknown">—</span>
 							{:else}
-								<span class="cf-bar-amount">{(r.rate_pct ?? 0).toFixed(1)}%</span>
+								<span class="cf-bar-amount">{formatPercent(r.rate_pct ?? 0, { minimumFractionDigits: 1 })}</span>
 							{/if}
 						</div>
 					{/each}
@@ -371,8 +387,8 @@
 </div>
 
 <style>
-	/* This component is mounted standalone (not via <slot>), so it needs its
-	   own copy of the .chart-card / .cf-bar* / .empty recipe rather than
+	/* This component is mounted standalone (not as a layout's routed children), so it needs its
+	   own copy of the .chart-card / .cf-bar* recipe rather than
 	   relying on the parent route's scoped <style> — Svelte scoped CSS never
 	   reaches into a child component's own template. Kept in sync with
 	   routes/cfo/+page.svelte's identical block by inspection. */
@@ -418,23 +434,17 @@
 	}
 
 	.cf-bar.committed {
-		background: #638cff;
+		background: var(--accent);
 	}
 
 	.cf-bar.pending {
-		background: #b7c5f5;
+		background: color-mix(in srgb, var(--accent) 45%, var(--text));
 	}
 
 	.cf-bar-amount {
 		font-size: 0.82rem;
 		text-align: right;
 		font-variant-numeric: tabular-nums;
-	}
-
-	.empty {
-		color: var(--text-muted);
-		text-align: center;
-		padding: 20px;
 	}
 
 	.cfm-error {
@@ -510,7 +520,7 @@
 	   cover every open foreign invoice. Same treatment as `/cfo`'s
 	   `.cf-skipped`, which carries the sibling outflow-side caveat. */
 	.cfm-skipped {
-		color: #d4940a;
+		color: var(--warning);
 		font-size: 0.85rem;
 		font-weight: 600;
 		margin: 0 0 12px;

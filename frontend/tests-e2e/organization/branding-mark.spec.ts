@@ -128,7 +128,7 @@ test.describe('sidebar brand mark', () => {
 test.describe('sign-in brand mark', () => {
 	test.use({ storageState: { cookies: [], origins: [] } });
 
-	test('the sign-in card pairs the mark with the product name', async ({ page }) => {
+	test('the sign-in card carries the mark beside its heading', async ({ page }) => {
 		await page.goto('/login');
 
 		// Scoped to the FORM, not the page: the split-screen shell draws a second
@@ -137,7 +137,9 @@ test.describe('sign-in brand mark', () => {
 		// hidden.
 		const mark = page.locator('form.login-form img.brand-mark');
 		await expect(mark).toBeVisible();
-		await expect(page.getByRole('heading', { level: 1, name: 'FeohLedger' })).toBeVisible();
+		// The heading names the task (WCAG 2.4.6); the product is named by the
+		// tab title and the brand panel (issue #635 finding 34).
+		await expect(page.getByRole('heading', { level: 1, name: 'Sign in' })).toBeVisible();
 		await expect.poll(() => naturalWidth(page, 'form.login-form img.brand-mark')).toBeGreaterThan(0);
 	});
 
@@ -212,5 +214,60 @@ test.describe('supplier portal brand mark', () => {
 		const card = page.locator('.login-card');
 		await expect(card.locator('img.brand-logo')).toHaveAttribute('src', LOGO);
 		await expect(card.locator('img.brand-mark')).toHaveCount(0);
+	});
+});
+
+/**
+ * A branded tenant's accent before the branding read lands
+ * (docs/decisions.md §463). The first load caches the fetched accent per
+ * workspace; on the reload the read is held open, and the accent must already
+ * be on <html> — painted by app.html's accent-boot script, not the store.
+ */
+test.describe('white-label accent before first paint', () => {
+	test('a reload paints the cached tenant accent while the branding read is in flight', async ({
+		page
+	}) => {
+		const ACCENT = '#c0392b';
+		const STRONG = '#7b1d14';
+		await stubJson(page, BRANDING, { accent_color: ACCENT, accent_strong_color: STRONG });
+		await page.goto('/');
+		// #c0392b already reads as text on the light palette, so its light-theme
+		// accent is the colour itself (the dark one is a lightened shade, §478).
+		const accentOnRoot = () =>
+			page.evaluate(() =>
+				document.documentElement.style.getPropertyValue('--brand-accent-light')
+			);
+		await expect.poll(accentOnRoot).toBe(ACCENT);
+
+		await page.unroute(`**${BRANDING}*`);
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => (release = resolve));
+		let requested!: () => void;
+		const seen = new Promise<void>((resolve) => (requested = resolve));
+		await page.route(`**${BRANDING}*`, async (route: Route) => {
+			if (new URL(route.request().url()).pathname !== BRANDING) {
+				await route.continue();
+				return;
+			}
+			requested();
+			await held;
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({ accent_color: ACCENT, accent_strong_color: STRONG })
+			});
+		});
+
+		await page.reload();
+		await seen;
+		// The read is still held: only the cache can have put these here.
+		expect(await accentOnRoot()).toBe(ACCENT);
+		expect(
+			await page.evaluate(() =>
+				document.documentElement.style.getPropertyValue('--accent-strong')
+			)
+		).toBe(STRONG);
+		release();
+		await expect.poll(accentOnRoot).toBe(ACCENT);
 	});
 });

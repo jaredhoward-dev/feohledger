@@ -1,6 +1,6 @@
 # Authentication
 
-JWT-based authentication using `python-jose` for token handling and `bcrypt_sha256` for password hashing. Tokens are server-side revocable via a Redis blocklist.
+JWT-based authentication using `joserfc` for token handling (`backend/app/utils/jwt_hs256.py`) and `bcrypt_sha256` for password hashing. Tokens are server-side revocable via a Redis blocklist.
 
 **Hash and verify through the awaitable wrappers, never `pwd_context` directly.**
 `backend/app/utils/passwords.py` exposes `verify_password` / `hash_password` /
@@ -138,9 +138,45 @@ What is worth knowing about it:
 Covered by `backend/tests/test_password_hash_upgrade.py` (real Postgres, both
 surfaces, through the HTTP login route).
 
+### Tokens — HS256 under `FEOH_SECRET_KEY`, signed and verified in one module
+
+Every token the backend issues for itself — the employee access token
+(`typ=user`), the supplier-portal access token (`typ=vendor`) and both MFA
+challenge tokens (`typ=mfa_challenge` / `vendor_mfa_challenge`) — is signed and
+verified by `backend/app/utils/jwt_hs256.py`, over `joserfc`. `deps.py` and
+`services/mfa.py` call its `encode` / `decode`; nothing else in `app/` decodes a
+JWT except `services/sso.py`, which verifies an IdP's ID token against its JWKS
+with asymmetric algorithms only (`.claude/hooks/security-patterns.sh` rule
+`bypass-decode-token`).
+
+- **Algorithm:** exactly `["HS256"]`. `alg: none`, `HS384` / `HS512`, `RS256`
+  and anything else are refused before a key is used. The key is a joserfc
+  `OctKey`, which refuses an asymmetric public key as HMAC material outright.
+- **Claims:** `exp`, `nbf` and `iat` are checked when present, with no leeway;
+  `exp` is not required (every token we mint carries one), and a non-finite
+  value (`NaN`, `Infinity`) is refused. An `aud` claim is refused, and `sub` /
+  `jti` must be strings. The payload must be a JSON
+  object. These are python-jose's rules, kept; a future `iat` and a
+  numeric-string `exp` are now refused as well.
+- **Failure:** anything wrong is one `InvalidTokenError`. `decode_token` maps it
+  to `401 {"detail": "Invalid token"}`; the MFA decoders to `ValueError("Invalid
+  or expired MFA challenge token")`, which the routes turn into their 401. A
+  malformed token can never surface as a 500.
+- **Wire format:** header `{"alg":"HS256","typ":"JWT"}` in that key order, compact
+  JSON payload, `datetime` time claims as integer seconds — byte-identical to
+  what python-jose wrote before the switch (`docs/decisions.md` §351), so tokens
+  minted before it kept verifying after it. `backend/tests/test_jwt_hs256.py`
+  pins that against python-jose-generated literals; do not regenerate them.
+
 ## Auth Flow
 
-1. User visits a tenant subdomain (e.g., `acme.localhost:7777`)
+1. User visits a tenant subdomain (e.g., `acme.localhost:7777`). Someone who
+   starts at the apex instead (its **Sign in** links, or an apex `/login`)
+   lands on `/find-workspace`, which takes the **workspace address** and
+   redirects to that workspace's `/login`. It deliberately does no email
+   lookup: mapping an address to a workspace would tell anyone whether that
+   person is a customer, and where. Details: `docs/multi-tenancy.md` § Signing
+   in from the apex.
 2. Frontend extracts the tenant slug from the subdomain
 3. User submits email/password at `/login`
 4. Frontend POSTs `{ email, password }` to `/api/auth/login`
@@ -150,13 +186,81 @@ surfaces, through the HTTP login route).
 8. All subsequent requests include both:
    - `Authorization: Bearer <token>` header
    - `X-Tenant-Slug: <slug>` header
-9. On 401 responses, the token is cleared and the user is redirected to `/login`
+9. On a 401, or a 403 coded `token_tenant_mismatch` (a token for another
+   workspace than the page's), the token is cleared and the user is redirected
+   to `/login` — with `?reason=other_workspace` for the second, which the page
+   states (§ Signing in on another workspace's page is refused) — and with
+   `?next=` naming the page they were on (§ Sign-in returns to the page asked for)
 
 ## Backend Implementation
 
 ### Login endpoint
 
 `POST /api/auth/login` — accepts email and password, verifies against the hashed password in the **control-plane database**. Returns either a signed JWT (`{access_token, ...}`) or, when MFA is in play, a short-lived challenge token (`{mfa_required: true, mfa_challenge_token, methods, must_enroll}`). See the **MFA** section below for the full flow. This endpoint uses `get_control_db` (not the tenant DB).
+
+### Signing in on another workspace's page is refused
+
+An email names one account in one organization, so login used to mint that
+organization's token whatever workspace page the form was on. The SPA then sent
+that page's `X-Tenant-Slug` with a token for a different org, `tenant.get_tenant`
+refused every tenant-scoped call with `403` (now coded `token_tenant_mismatch`),
+and the user sat on a signed-in screen stuck on "Loading…" (seen in
+production on 2026-10-20: an account from another workspace signed in on
+`sandbox.feohledger.com`).
+
+`POST /api/auth/login` now refuses that sign-in: when the request names a
+workspace — the `X-Tenant-Slug` header, or a registered custom domain in `Host`
+(`tenant.resolve_tenant_slug_by_custom_domain`, as `get_tenant_slug` reads it) —
+and it is not the account's own, the answer is `403` with the coded refusal
+`wrong_workspace` (`api/auth._refuse_other_workspace`), whose
+`params.sign_in_url` is the account's own sign-in page (`tenant_urls.sign_in_url`
+with `prefer_custom_domain=True`: the org's own `tenant_url_template` when set,
+else its first registered custom domain, else the platform `<slug>` URL — a
+vanity-host tenant signs in on its vanity origin, where its stored token and its
+passkeys live), plus an `auth.login.failure` / `reason=wrong_workspace` audit
+row in the **account's** workspace carrying `attempted_workspace` (the slug the
+page named, capped at 63 characters) and `password_verified: true`, so an
+auditor can tell a confused user from someone who already holds the password
+and is trying it on another host. The attempted workspace gets **no** row: it
+holds no account, and since an unknown address leaves no row anywhere, a row
+there only when the password was right would make its audit log an oracle for
+"this address has an account" ([decisions.md](decisions.md) §291). No token is
+issued. The check runs **after** the password verifies, so a wrong password
+there is still the plain `401` and the link reveals nothing the caller could not
+learn by signing in. A request naming no workspace (an API client) is
+unaffected. The login page localizes the refusal (`refusal.wrongWorkspace`,
+which names the account's workspace by its **host** only, or
+`refusal.wrongWorkspaceNoLink` when there is no usable URL) and puts the link to
+the account's own sign-in page on its own line under the sentence. The sentence
+never repeats the URL: it carries the address as a percent-encoded `?email=`,
+which is unreadable in prose; the server's English fallback follows the same
+rule. Reasoning: [decisions.md](decisions.md) §288. Test:
+`backend/tests/test_email_identity_case.py::test_signing_in_on_another_workspaces_page_is_refused`.
+
+**Recovery for a token that is already there.** A token for another workspace
+can still reach a page some other way (one issued before this refusal, a renamed
+workspace). `get_tenant`'s refusal is coded — `403` `token_tenant_mismatch`
+(`api/refusals.TOKEN_TENANT_MISMATCH_DETAIL`) — and the SPA treats it like an
+expired session: `api.ts::endSessionIfRejected` (shared by `request()`, the blob
+downloads, the assistant stream and `api/expenses.ts`'s submit) clears the token
+and sends the user to `/login?reason=other_workspace`, which says "You were
+signed out because your session belonged to a different workspace. Sign in
+here, or on your own workspace's page." — worded so it never claims this page is
+theirs, and shown as a neutral notice (AuthShell's `.info`, in a polite
+`role="status"` region) rather than the red error alert. It keys on the code,
+never the English (`api/sessionRejection.ts`). Before clearing it, the SPA also
+**revokes** that token on the server, best-effort
+(`sessionRejection.revokeRejectedSession`): the token is still a live session in
+its own workspace until it expires, and clearing it from this origin's storage
+alone left a usable credential behind on a shared machine. `POST /api/auth/logout`
+needs no workspace — it reads the token's own `jti`/`sub`/`org`, blocklists it and
+audits `auth.logout` in the token's own workspace — so the call carries the token
+and deliberately not this page's `X-Tenant-Slug`, with `keepalive` because the
+page navigates away immediately, and every failure swallowed. An expired session
+(`401`) is not revoked; the server already refuses it. Tests:
+`frontend/src/lib/api/sessionRejection.test.ts`, and the journey end to end in
+`frontend/tests-e2e/auth/tenant-isolation.spec.ts` § signing in on another
+workspace's page.
 
 ### An email address is matched without regard to case
 
@@ -176,13 +280,28 @@ The rule now lives in `app/utils/emails.py`: every write stores
 password login, forgot-password, the admin and SCIM uniqueness checks, SCIM's
 `userName eq` / `emails eq` filter, the SSO JIT email-link branch, and the
 portal login and invite — matches with `email_matches`, which compares
-`lower(email)` so rows written before normalization still match. A single-row
-lookup orders an exact match first (`exact_email_first`), so a pre-existing
-pair of case variants resolves deterministically instead of 500ing. The
-database constraint is still the case-sensitive `UNIQUE(email)`; replacing it
-with a unique index on `lower(email)` needs a data migration with an operator
-decision in it and is tracked in `docs/followups.md`.
-`tests/test_email_identity_case.py` pins each path against a mixed-case row.
+`lower(email)`.
+
+**The database enforces it too** (migration 0138, `docs/decisions.md` §475):
+the plain `UNIQUE(email)` on both tables is gone, replaced by unique indexes on
+`lower(email)` — `uq_users_email_lower` on the control plane,
+`uq_vendor_users_email_lower` in every tenant, declared on the models so
+`create_all` builds them for a fresh database. That index is exactly the
+expression `email_matches` compares, so login, forgot-password, SSO JIT and
+SCIM look an address up by index probe rather than a table scan. The migration
+lower-cased every stored address, and it refuses to run while two rows share
+one normalized address (it reports counts, never the addresses, and leaves the
+choice of which account keeps it to the operator —
+`backend/docs/database.md` § Email case collisions). A create that passes the
+app's pre-check and then loses the race to a concurrent one hits the index, and
+admin create, SCIM create and the portal invite each answer with the same 409
+the pre-check gives, never a 500. So does a rename onto a taken address that
+loses the same race: admin `PATCH /api/admin/users/{id}` and SCIM `PUT` /
+`PATCH /Users/{id}` flush the change inside a savepoint too. A single-row lookup still orders an exact
+match first (`exact_email_first`); with the index in place that decides
+nothing, and is kept only so a second match can never 500 a login.
+`tests/test_email_identity_case.py` pins each path against a mixed-case row and
+the lost race; `tests/test_migration_0138_email_lower_unique.py` the migration.
 
 ### Logout endpoint
 
@@ -353,6 +472,15 @@ Four properties make this safe to put in front of a login form:
 - **Tenant-scoped on the portal.** A vendor address is unique only *within* a
   tenant DB; keying on the address alone would let one tenant's traffic throttle
   another tenant's supplier.
+- **One answer for both axes.** Every 429 either axis raises is the same
+  `RateLimitExceeded`: the `Retry-After` header plus the coded refusal
+  `{code: "rate_limited", message, params: {retry_after_seconds}}`, where the
+  param is the header's own figure. Nothing in it says which bucket tripped, its
+  limit or its count, so the body cannot tell an identity budget from an IP cap
+  (or a known account from an unknown one) any more than the old English
+  sentence could. The web client states the wait in the reader's language
+  (`frontend/src/lib/api/codedRefusals.ts`); a client that reads `detail` as
+  text keeps the English `message`.
 
 **Accepted trade-off:** because the bucket is keyed on the identity, someone who
 knows an address can burn that account's *password* budget and delay a
@@ -384,10 +512,15 @@ Action names:
 | Logout | `auth.logout` |
 | Self-service session revoke (one, or everywhere else) | `auth.session.revoked` — PII-free, records only `{scope: "single"\|"others", revoked: <count>}` |
 | Admin force-logout of another user | `user.sessions_revoked` — PII-free, records only the revoked count |
-| Admin reset of another user's password (`POST /api/admin/users/{id}/reset-password`) | `user.password_reset` — PII-free, records `{changed_fields: ["password"], must_change_password: true, sessions_revoked: <count>}` (`null` when the forced logout failed — the reset still returns its temp, with `sessions_revoked: false` on the response); never the temp |
-| Admin edit of a user (`PATCH /api/admin/users/{id}`) | `user.updated` — `changed_fields` names only fields whose value actually changed (the Edit form resends every field; a resent unchanged value is neither applied nor named — #566). No values except `role_names` / `is_active` when those changed |
-| Self-service password change (`POST /auth/change-password`, incl. the forced first-login change; `PATCH /auth/me` with `password`) | `auth.password.changed` — PII-free, records `{via: "change_password" \| "profile", forced: <bool>}`; `forced` is true when it replaced an admin-issued temp (signup issues none — decisions §283). Written before the `auth.session.revoked` row the same change's forced logout writes, which is a side effect and not the event |
-| Supplier-portal password change (`POST /portal/auth/change-password`, incl. the forced first sign-in change) | `portal.password.changed` — the portal twin of `auth.password.changed`: PII-free, records `{via: "change_password", forced: <bool>}` (`forced` = it replaced the temp the AP team issued), identifies the account by `actor_id`/`entity_id`, never by address. Written before the `portal.session.revoked` side-effect row |
+| Admin reset of another user's password (`POST /api/admin/users/{id}/reset-password`) | `user.password_reset` — PII-free, records `{changed_fields: ["password"], delivery: "set_password_link", sessions_revoked: <count>}` (`null` when the forced logout failed — the reset still answers 200, with `sessions_revoked: false` on the response); never the link or token. The link's redemption writes the ordinary `auth.password_reset.completed` |
+| Admin edit of a user (`PATCH /api/admin/users/{id}`) | `user.updated` — `changed_fields` names only fields whose value actually changed (the Edit form resends every field; a resent unchanged value is neither applied nor named — #566). Each changed field is recorded **before and after**: `previous_role_names` / `role_names`, `previous_is_active` / `is_active`, `previous_email` / `email` (the address, like the `auth.*` rows record it). `full_name` is named but its value never recorded. Built by `services/user_audit.user_updated_details`, shared with SCIM |
+| Admin delete of a user (`DELETE /api/admin/users/{id}`, `POST /api/admin/users/bulk-delete`) | `user.deleted` — `{email, role_names, was_active}` captured before the row goes, since afterwards nothing else says who the id was. Written **before** the delete commits with `record_auth_audit_or_raise`: a failed write refuses the delete (`503` on the single route; `audit_unavailable` for that row of a bulk delete, inside a savepoint, the rest of the batch still landing) |
+| Admin invite (`POST /api/admin/users`) | `user.created` — `{role_names}` |
+| SCIM create / rename / deactivate (`POST`, `PUT`, `PATCH`, `DELETE /api/scim/v2/Users…`) | `user.created` / `user.updated` with `via: "scim"` and a null `actor_id` (the IdP's bearer token is not a user). Same shapes as the admin rows, plus `operation` (`put` \| `patch` \| `delete`), `previous_external_id` / `external_id` when that changed, and on a deactivation `sessions_revoked` (`null` when the forced logout failed — the deprovision still answers 2xx). An unchanged write records nothing |
+| SCIM deprovision of the org's last active admin, refused | `user.deactivation_refused` — `{via: "scim", operation, reason: "last_active_admin"}` |
+| SCIM group change that would strip `admin` from the last active admin, refused | `auth.scim.role_revoke_refused` — `{role: "admin", source: "scim_group", reason: "last_active_admin"}`, `entity_type: "organization"` |
+| Self-service password change (`POST /auth/change-password`, incl. the forced first-login change; `PATCH /auth/me` with `password`) | `auth.password.changed` — PII-free, records `{via: "change_password" \| "profile", forced: <bool>}`; `forced` is true when it replaced a temporary password — no flow issues one any more (decisions §283), so only an account still holding a pre-§283 temp, or a CLI-provisioned tenant admin, can be forced. Written before the `auth.session.revoked` row the same change's forced logout writes, which is a side effect and not the event |
+| Supplier-portal password change (`POST /portal/auth/change-password`, incl. the forced first sign-in change) | `portal.password.changed` — the portal twin of `auth.password.changed`: PII-free, records `{via: "change_password", forced: <bool>}` (`forced` = it replaced a temp the AP team issued before the set-password links; a link redemption writes `{via: "set_password_link", forced: false}`), identifies the account by `actor_id`/`entity_id`, never by address. Written before the `portal.session.revoked` side-effect row |
 | Forgot-password link requested / redeemed (`POST /auth/forgot-password`, `POST /auth/reset-password`) | `auth.password_reset.requested` (`actor_id` null — the requester is unauthenticated) · `auth.password_reset.completed` (`actor_id` = the account) — both PII-free, recording only `{ip}`; never the token or the new password. `requested` is written only for an existing, active account with a tenant to route to |
 | MFA challenge issued during login | `auth.mfa.challenge_issued` |
 | Successful MFA verify | `auth.mfa.verify.success` |
@@ -397,13 +530,14 @@ Action names:
 | TOTP turned off (`/mfa/disable`) | `auth.mfa.disabled` (employee) · `portal.mfa.disabled` (supplier portal) — PII-free, records `{factor: "totp"}` |
 | Passkey registered (`/mfa/passkey/register/verify`) | `auth.mfa.passkey.registered` — PII-free, records `{factor: "passkey", credential, name, rp_id}`. `credential` is the API-visible passkey id (`webauthn_credentials.id`), never the authenticator's credential handle or its public key |
 | Passkey removed (`DELETE /mfa/passkey/{id}`) | `auth.mfa.passkey.removed` — same shape, so the removal row joins to the registration row on `credential` |
+| Supplier-portal reset link requested (`POST /portal/auth/forgot-password`) | `portal.password_reset.requested` — the portal twin of `auth.password_reset.requested`: `actor_id` null, `{ip}` only, `entity_id` the vendor user; written only for an existing, active account in the requesting tenant. The redemption is the existing `portal.password.changed` `{via: "set_password_link"}` |
 | Failed supplier-portal password login | `portal.login.failure` — records `{ip, reason}` (`bad_password` \| `no_password` \| `inactive`) and identifies the account by `entity_id`, never by address (a supplier contact's email is third-party PII we don't restate on every guess). Queued off the response path, like its employee twin |
 | Successful supplier-portal password login | `portal.login.success` — PII-free, records `{ip, method: "password"}` and identifies the account by `actor_id`/`entity_id`, never by address (same rule as the failure row). **Awaited**, unlike the failure row: the account provably exists by then, so the tenant-DB round trip cannot become the account-existence oracle `queue_auth_audit` avoids. Written on BOTH sign-in paths: the password-only one, and `/portal/auth/mfa/challenge` once a second factor is enrolled (as `password+mfa:{factor}`, beside that stage's own `portal.mfa.verify.success`). One action is therefore the whole population — an earlier version wrote it only on the password path, which made the action a biased sample rather than a gap, silently omitting exactly the best-protected accounts. Mirrors the employee twin, which writes `auth.login.success` alongside `auth.mfa.verify.success` |
 | Supplier-portal second factor verified / rejected (`/portal/auth/mfa/challenge`) | `portal.mfa.verify.success` · `portal.mfa.verify.failure` — PII-free, records `{method, ip}` where `method` is `totp` \| `email`. The portal twin of `auth.mfa.verify.*`; see [the note below](#the-supplier-portals-second-factor-stage-is-on-the-trail-issuing-a-backup-code-is-not) for why issuing an email backup code has no row of its own |
 | Successful SSO login | `auth.sso.login.success` |
 | Failed SSO login (code exchange / ID token / domain blocked) | `auth.sso.login.failure` |
 | Successful SAML login | `auth.saml.login.success` |
-| Failed SAML login (assertion invalid / issuer / unsolicited / replay / domain blocked) | `auth.saml.login.failure` |
+| Failed SAML login (assertion invalid / issuer / unsolicited / replay / missing or unsafe email / domain blocked / inactive / address in another workspace) | `auth.saml.login.failure` |
 
 Login-failure rows for unknown emails are dropped — without an `organization_id` there is no tenant DB to route to. Failures for known users carry the email, IP (when the client is reachable), and a machine-readable `reason`. (The supplier-portal twin, `portal.login.failure`, deliberately omits the address — see the action table above.)
 
@@ -528,6 +662,13 @@ alone is **not** trusted to decide which tenant's data is read.
 
 For employee tokens (`typ` is anything other than `"vendor"`), the
 guard requires `payload["org"] == organization.id`. Mismatch → 403.
+A token with **no** `org` claim → the same 403 (`token_tenant_mismatch`):
+`get_current_user` resolves the account by `sub` alone and never
+compares its organization with the tenant, so a claim-less token would
+otherwise open whichever tenant the header named. Every access token
+the app mints carries `org`; the MFA challenge types
+(`mfa_challenge`, `vendor_mfa_challenge`) are not access tokens and
+stay exempt.
 Vendor-portal tokens (`typ="vendor"`) are exempt because `VendorUser`
 rows live in the per-tenant DB and a cross-tenant attempt fails
 naturally on the user-lookup query in
@@ -537,8 +678,13 @@ requests pass through to the downstream auth dep (which 401s).
 Without this guard, an authenticated user from tenant A could read
 or mutate tenant B's data simply by sending
 `X-Tenant-Slug: <other-tenant>` on the request. The guard is pinned
-by `backend/tests/test_tenant_isolation.py` (unit) and
-`frontend/tests-e2e/auth/tenant-isolation.spec.ts` (e2e).
+by `backend/tests/test_tenant_isolation.py` (unit),
+`backend/tests/test_tenant_auth_sweep.py` (every employee route that
+resolves a tenant, with a foreign token and a claim-less one, on the
+production dependency chain; plus the `/api/v1` key-only tenant rule)
+and `frontend/tests-e2e/auth/tenant-isolation.spec.ts` (e2e). The
+supplier portal's per-vendor scoping is swept over every by-id route in
+`backend/tests/test_portal_cross_vendor.py`.
 
 ## SAML SSO
 
@@ -579,10 +725,36 @@ pinned to an explicit hardened posture (the library defaults are unsafe):
 - All IdP XML parsed with python3-saml's DTD/entity-hardened parser (no raw lxml
   → no XXE).
 
-Every rejection fails closed to one generic error + a PII-safe
-`auth.saml.login.failure` audit row (reason code only — the email is **omitted**,
-tighter than the OIDC `domain_blocked` precedent). The IdP owns MFA, so the app's
-MFA challenge is skipped (same as OIDC).
+Every rejection writes a PII-safe `auth.saml.login.failure` audit row (reason
+code only — the email is **omitted**, tighter than the OIDC `domain_blocked`
+precedent). The IdP owns MFA, so the app's MFA challenge is skipped (same as OIDC).
+
+**Every refusal lands on the SPA bridge, coded (decisions §359).** Once the
+RelayState has named the tenant, the ACS never answers a refusal as JSON at the
+API origin: it parks the refusal's code behind a one-time handoff code
+(`sso.create_saml_refusal_handoff` — same Redis prefix, TTL and `GETDEL`
+single use as a token handoff, and the record holds only the code and the
+slug), 303s to `/login/saml-callback?code=<once>`, and `/auth/saml/exchange`
+answers that code with the coded refusal and no token. The callback page states
+it in the reader's language (`api/codedRefusals.ts`) with "Back to sign in".
+
+| Audit `reason` | Coded refusal on the bridge | Status |
+|---|---|---|
+| `assertion_invalid`, `issuer_mismatch`, `unsolicited`, `replay`, `missing_email` | `saml_login_unverified` — "SAML login could not be verified." | 400 |
+| *(no row)* state without an AuthnRequest binding | `saml_login_unverified` | 400 |
+| *(no row)* SAML switched off / plan lost `sso` since `/login` | `saml_not_configured` | 400 |
+| `unsafe_email` | `sso_email_unusable` | 403 |
+| `domain_blocked` | `sso_email_domain_blocked` | 403 |
+| `inactive` | `sso_account_inactive` | 403 |
+| `sso_email_in_other_workspace` | `sso_email_in_other_workspace` (§291) | 403 |
+
+Every verification failure is **one** code, status and sentence, exactly as
+indistinguishable as the ACS's single JSON error was; only the audit row tells
+them apart. The identity refusals use the same codes and English the OIDC
+callback answers with (`api/refusals.py`), so the two protocols state them
+alike. A POST with no recoverable tenant — a malformed form, an unknown or
+spent RelayState, a tenant gone since `/login` — still answers 400 at the ACS:
+there is no workspace origin to send the browser to, and no row to scope.
 
 **Provider-discriminated matching.** JIT match is `(sso_provider,
 sso_provider_id)` then `(org, email)`. SAML uses `provider="saml"`,
@@ -629,6 +801,15 @@ own issuer netloc — OIDC Discovery requires the document to be served under it
 own `issuer`, and this mirrors the check `api/auth_sso.py` already applied to
 `authorization_endpoint`, so a compromised or mis-served document cannot
 redirect either fetch off-host.
+
+The three fetches themselves go through `sso._sso_http_client`, a
+`url_safety.pinned_async_client`. Without it the check above resolves the host
+once and `httpx` resolves it again at connect, so a DNS-rebinding record could
+pass the check and still receive the token `POST`. The pinned client re-vets
+the host inside the connect and dials the vetted IP (the `Host` header, SNI and
+certificate verification still name the hostname); a refusal raises the
+caller's `SSOConfigError` / `SSOValidationError`. Outside a deployed
+environment it allows loopback, as the check does, so local Keycloak works.
 
 **Local-first carve-out** (guard rail 7): the documented local IdP is Keycloak
 on `http://localhost:8088`, and a loopback address is exactly what the guard
@@ -750,9 +931,11 @@ access token does not carry it. An action whose *output* is the asset asks for
 more: `api/auth.require_sensitive_step_up` accepts only a current authenticator
 code or a passkey assertion (minted by `POST /auth/mfa/step-up/passkey` for that
 action's own operation), in every tenant — so the SSO-only case needs no special
-sentence, because the password is a proof here for nobody. Its one caller today
-is the unmasked-banking DSAR export (`POST /api/privacy/dsar` with
-`include_banking`, operation `dsar_unmasked_export`). Four coded refusals:
+sentence, because the password is a proof here for nobody. Its callers are the
+unmasked-banking DSAR export (`POST /api/privacy/dsar` with `include_banking`,
+operation `dsar_unmasked_export`) and closing a workspace (`POST
+/api/organization/close`, operation `workspace_close`, decisions §306). Four
+coded refusals:
 `sensitive_step_up_required` (`403`, no factor proof sent — the SPA's cue to
 collect one and resend; not throttled, not audited as a failure),
 `sensitive_step_up_failed` (`400`, a proof did not verify — throttled per account
@@ -774,8 +957,46 @@ web clients read a 401 on a call that carried a token as an expired session —
 they clear it and bounce to the login page — so a mistyped code signed the user
 out. They now answer `400` with `detail = coded_refusal("mfa_code_invalid",
 "Invalid code")` (`api/refusals.MFA_CODE_INVALID_DETAIL`), exactly as specific as
-the sentence it replaced. The login challenge's own `/mfa/verify` "Invalid code"
-stays a `401`: there is no session yet, so nobody is signed out by it.
+the sentence it replaced. The login challenge's own wrong TOTP code on
+`POST /api/auth/mfa/verify` (and the portal's `POST /api/portal/auth/mfa/challenge`)
+carries the same coded detail but stays a `401`: there is no session yet, so
+nobody is signed out by it — neither web client bounces a 401 on a call that
+carried no token, mobile ends a session on a 401 only when it presented one, and
+the per-account MFA failure budget counts the miss whatever the status
+(`docs/decisions.md` §461). The emailed one-time code's miss is coded too, as
+`mfa_email_code_invalid` ("Invalid or expired code",
+`api/refusals.MFA_EMAIL_CODE_INVALID_DETAIL`) — its own code because its
+sentence also covers an expired code — and is a `401` for the same reason
+(§465).
+
+**No auth refusal sends an exception's own text.** The auth routers
+(`api/auth.py`, `api/portal_auth.py`, `api/auth_sso.py`, `api/auth_saml.py`)
+used to answer several failures with `detail=str(exc)` — the validator's,
+decoder's or SSO service's English, which no client could translate. Each is a
+coded refusal now (`api/refusals.py` § auth refusals), status unchanged, with
+the exception class logged server-side instead:
+
+| Code | Status | Where |
+|------|--------|-------|
+| `password_too_short` (`min_length`), `password_needs_uppercase`, `password_needs_lowercase`, `password_needs_digit` | 422 | reset / change / set password, employee and portal (`PasswordError.code`) |
+| `mfa_challenge_invalid` | 401 | every route that redeems a login MFA challenge token, employee and portal — expired, spent, malformed and wrong-type fold into one |
+| `passkey_registration_failed` | 400 | `POST /api/auth/mfa/passkey/register/verify` |
+| `sso_session_expired` | 400 | OIDC callback state, SAML ACS RelayState |
+| `sso_login_rejected` | 400 | OIDC code exchange |
+| `sso_token_invalid` | 400 | OIDC ID-token validation (signature, claims, nonce) |
+| `sso_link_expired` | 400 | SAML bridge `/exchange` handoff code |
+
+Each code folds every case its raising function distinguishes, so none can tell
+a caller more than the step it failed at. `tests/test_no_exception_text_in_detail.py`
+keeps the auth routers clean and ratchets the remaining sites elsewhere in
+`app/api` (a per-file count that may only shrink).
+
+The password request schemas (`ChangePasswordRequest`, `ResetPasswordRequest`,
+`UpdateProfileRequest`) carry only a `max_length`: a schema `min_length`
+answered a short password with pydantic's English error list before the
+handler ran, so `password_too_short` was unreachable on the employee routes.
+The length rule is `utils/passwords.MIN_LENGTH`, applied by
+`validate_password_complexity` on every route (`tests/test_password_security.py`).
 
 **The profile page learns the rule from `/auth/me`.** `GET /api/auth/me`
 carries `password_sign_in_closed`, filled from
@@ -850,11 +1071,23 @@ went, with no audit row.
 The PUT states the whole IdP configuration, and a key it leaves out is removed,
 with three exceptions:
 
-- **The client secret is write-only.** Omitted or blank keeps the stored one;
-  `clear_client_secret: true` removes it. No response carries it —
-  `GET /api/organization` drops `sso.client_secret` for every role
-  (`services/org_settings_view.ALWAYS_REDACTED`), and the SSO view reports
-  `client_secret_configured` only.
+- **The client secret is write-only and sealed.** Omitted or blank keeps the
+  stored one; `clear_client_secret: true` removes it. It is not in the JSONB:
+  the save seals it in `provider_credentials` (block `sso`, envelope-encrypted
+  under the app KMS key, the store the ERP / payment / card secrets use) and
+  writes only a `client_secret_configured: true` marker into `settings.sso`,
+  in the same transaction. The sign-in completeness check reads the marker, so
+  it stays local and never unseals; the OIDC callback opens the sealed value
+  (`services/sso.load_client_secret`) only after consuming its single-use
+  `state`, and refuses before contacting the IdP when none is stored (400,
+  audit reason `client_secret_missing`) or the store cannot open it (503,
+  `credentials_unavailable`). A rotation behind an unchanged marker still
+  audits `client_secret` in `changed`, and a store that cannot seal answers
+  503 with nothing saved. No response carries the value —
+  `GET /api/organization` still drops a stray `sso.client_secret` for every
+  role (`services/org_settings_view.ALWAYS_REDACTED`), and the SSO view
+  reports `client_secret_configured` only. Migration `0135_seal_extraction_sso`
+  moved every existing plaintext value and wrote the marker.
 - **The SCIM state is carried.** `scim_bearer_hash` and `scim_groups` belong to
   the SCIM machinery and survive every save; `scim_group_role_map` survives
   unless the request names one, and a named map must reference roles the org
@@ -912,7 +1145,19 @@ admin_password=None)`), with no temporary password and `must_change_password`
 false: they choose their first password through a single-use **set-password
 link**, which is a forgot-password reset token with a longer life
 (`FEOH_SIGNUP_SET_PASSWORD_TTL_HOURS`, default 72) redeemed by the ordinary
-`/login/reset-password` page and `POST /api/auth/reset-password`. Until then no
+`/login/reset-password` page and `POST /api/auth/reset-password`. So does every
+other account nobody chose a password for: an admin-invited user
+(`POST /api/admin/users`), a partner-provisioned child admin
+(`POST /api/partner/children/provision`), an operator-provisioned first admin
+(`deploy/add-tenant.sh` → `scripts/create_tenant.py`, which prints only the
+address and has no option to print the link, since its output is often retained
+by SSM; its `--resend-link` re-sends to a first admin who has no password yet,
+superseding every earlier link),
+and an admin-reset user, whose
+password the reset clears (`POST /api/admin/users/{id}/reset-password`) — each
+emailed the same link, with its own lifetime `FEOH_SET_PASSWORD_LINK_TTL_HOURS`
+(default 72). The link is never returned to the admin or partner who triggered
+it (`api/set_password_links.py`). Until then no
 password signs in to the account, so it never reaches `/profile` in that state.
 The reset page reads its token first with `POST /api/auth/reset-password/check`,
 which never consumes it — a mail scanner prefetching the link, or a reload,
@@ -943,12 +1188,83 @@ contract, defaulting to `true` so a stale caller fails open rather than hiding
 the card for an ordinary member). `frontend/tests-e2e/auth/profile-no-password.spec.ts`
 pins the page, beside `profile-sso-only-step-up.spec.ts` for the org-level case.
 
+## ERP OAuth connections are bound to the browser that started them
+
+Connecting QuickBooks Online, Xero, Sage Accounting or Blackbaud is an OAuth
+authorization-code flow whose callback is public, so it is authenticated by a
+signed single-use `state` — and, since the login-CSRF fix, by the browser too:
+`GET /api/organization/erp/oauth/{provider}/authorize` is a credentialed fetch
+that sets an HttpOnly nonce cookie on the API host, the state carries its
+hash, and the callback refuses (`erp_error=browser_mismatch`) a browser without
+it. A consent link handed to someone else therefore links nothing. The app and
+the API must be same-site, and a custom-domain tenant connects from its
+`<slug>.<app domain>` address. QuickBooks' unsigned `realmId` is confirmed with
+one API call under the new token before it is linked. A consent that reached
+several companies (Xero, Sage) is held server-side until the admin picks one;
+the picker routes need the same admin's bearer AND the same browser's cookie,
+and a pick is single-use (decisions §355). Full reference:
+`backend/docs/erp-integration.md` § Connecting an OAuth ERP.
+
 ## Frontend Implementation
 
 - Auth state is managed in `src/lib/stores/auth.svelte.ts` (Svelte 5 runes)
 - Tenant slug is extracted by `src/lib/tenant.ts` from the subdomain
 - API client (`src/lib/api.ts`) automatically attaches both the Bearer token and the `X-Tenant-Slug` header to every request
-- The root `+layout.svelte` guards all routes — unauthenticated users are redirected to `/login`
+- The root `+layout.svelte` guards all routes — unauthenticated users are redirected to `/login?next=<the page>`
+
+### Sign-in returns to the page asked for
+
+A link into the app — a notification email's `/invoices/{id}`, a bookmarked
+filtered list — used to cost the reader their destination: the auth wall sent
+them to a bare `/login` and every sign-in path ended in `goto('/')`. Now the
+path and query they were opening travel as `?next=`:
+
+- **Set by** the root layout's auth wall, and by `api.ts::endSessionIfRejected`
+  (`sessionRejection.loginPathFor(rejection, next)`), beside `?reason=other_workspace`
+  when that applies (decisions §288 is unchanged — the reason and the notice it
+  drives are independent of `next`). A deliberate Log out does not carry one.
+- **Carried by** each step a sign-in can take: `/login` → `/login/mfa?next=` →
+  the forced `/change-password?next=` (the layout adds it when it redirects a
+  `must_change_password` account), whose submit then lands there. The OIDC /
+  SAML round trip cannot carry a parameter of ours, so `/login` stashes it in
+  `sessionStorage['auth_next']` before leaving for the IdP; the callback page
+  takes and clears it on arrival, success or failure, and a new SSO attempt
+  always overwrites or clears it, so an abandoned one cannot steer a later one.
+  An MFA enrolment the org forces (`must_enroll`) still goes to `/profile`.
+- **Honoured only as a same-origin relative path.** `next` comes from the URL,
+  so anyone can craft one; `frontend/src/lib/utils/postLoginRedirect.ts::safeNextPath`
+  is the one gate every reader and writer goes through. It accepts a string
+  starting with exactly one `/`, with no scheme, no backslash and no control
+  character, that resolves to the origin it was resolved against and whose
+  resolved path does not begin `//` (dot segments can collapse to one). It
+  refuses anything under `/login` (a loop) and `/` itself (the default). Refused
+  values are dropped, never rewritten — the user lands on the dashboard. The
+  value read back from `sessionStorage` is re-validated. It also strips the
+  Stripe redirect secrets (`SECRET_QUERY_PARAMS`: `setup_intent_client_secret`,
+  `payment_intent_client_secret`) from an accepted path, so a card setup that
+  returns to `/billing` on an expired session does not carry its secret through
+  the login URL and history (decisions §480). Tests:
+  `postLoginRedirect.test.ts` (every refused shape), `sessionRejection.test.ts`,
+  and end to end `tests-e2e/auth/post-login-redirect.spec.ts`.
+
+### When the account cannot be loaded
+
+The app shell needs the signed-in account (`GET /api/auth/me` — its roles drive
+the nav), so it renders only once that has answered. `auth.userStatus`
+(`idle` → `loading` → `ready` | `error`) says where the load stands, and the
+layout draws `layout/AccountLoadState.svelte` in the shell's place until it is
+`ready`: a polite "Loading your workspace…" status while `/me` is in flight
+(faded in after a beat, so a fast answer never flashes it), and on a failure
+that is not the session ending — a 5xx, a timeout, the network — a panel with
+**Try again** and **Log out**, focus moved to its heading. Before this, such a
+failure left `loggedIn` true and `user` null and the page was blank with no way
+out. The layout starts one load from `idle` and never retries on its own; Retry
+is the user's. A refresh that fails while an account is already loaded (after a
+factor change, say) keeps that account rather than tearing the app down. A 401
+or a token for another workspace is still `api.ts`'s to handle — the store sees
+its token gone, stays on the loading state, and lets that navigation to
+`/login` happen. Only the most recent `/me` request's answer is applied. Test:
+`tests-e2e/auth/account-load-error.spec.ts`.
 - If no tenant subdomain is detected, a "no tenant" page is shown instead
 - The login page has its own layout without the sidebar
 
@@ -997,7 +1313,8 @@ exactly as before.
 - **Catalog** — a small, deliberately-scoped set of *splittable* permission
   constants (dotted strings): `invoice.approve`, `payment_run.approve`,
   `payment.execute`, `payment.void`, `payment.record_external`,
-  `vendor.bank_change.approve`, `vendor.block`, `vendor.manage`, `user.manage`.
+  `vendor.bank_change.approve`, `vendor.block`, `vendor.manage`,
+  `vendor.sanctions.adjudicate`, `user.manage`.
   `GET /api/admin/permissions`
   returns the catalog (key + label) for the role editor — gated `user.manage`
   (see below), same as its sibling reads. Everything not in the catalog stays
@@ -1013,6 +1330,12 @@ exactly as before.
   page's reads beside execute/void. Its own permission rather than
   `payment.execute` because recording moves no money: an org can keep sending
   payments with a few people and let others book what they paid.
+  `vendor.sanctions.adjudicate` (record a sanctions screen result as a false
+  positive, decisions §477) is also new: `admin` and `cfo` hold it, `ap_manager`
+  does not — that role already onboards vendors, approves their bank details and
+  executes runs, so clearing the sanctions hold too would put the whole payee
+  path in one role — and `ap_clerk` never does. The endpoint also refuses the
+  vendor's onboarder and the people behind its current bank details.
 - **Custom-role permissions** — a control-plane JSONB column `roles.permissions`
   (migration `0062_role_permissions`, control-plane-only — `roles` is
   control-plane). System roles leave it NULL (they resolve via the default map);
@@ -1053,11 +1376,16 @@ exactly as before.
   it isn't the fraud-sensitive action the permission exists to gate — see
   "Approve and reject are not always the same role set" below), and user
   create/update/delete/bulk-delete (`user.manage`). The vendor list/detail/
-  counts reads and the change-request queue's own `GET /vendors/change-requests`
-  stay on `require_roles` too — broader than any one splittable permission
-  (cfo can read vendor detail without holding `vendor.manage`), matching the
-  same "reads stay coarse, only the specific action splits" pattern payments.py
-  uses for `GET /payments/queue` etc. Role/permission CRUD itself stays
+  counts/ids reads (`GET /vendors`, `/vendors/{id}`, `/vendors/counts`,
+  `/vendors/ids`) are `require_role_or_permission`: the three roles they always
+  admitted (admin, ap_manager, cfo) **or** `vendor.manage` / `vendor.block`. A
+  plain `require_permission` was not possible — cfo reads vendors without
+  holding any vendor permission — but role-only left a custom role holding
+  just one of those permissions with a 403 on the very list its permission acts
+  on, while the nav (which ORs `permissions`) showed it the page. The
+  change-request queue's own `GET /vendors/change-requests` stays on
+  `require_roles`, matching the "reads stay coarse, only the specific action
+  splits" pattern payments.py uses for `GET /payments/queue` etc. Role/permission CRUD itself stays
   admin-only on `require_roles` (managing the catalog must not be a grantable
   permission — that would be a privilege-escalation path).
   - **One migration deliberately does NOT reproduce the prior matrix.**
@@ -1103,11 +1431,11 @@ exactly as before.
     subset of the caller's own effective permissions. Otherwise a custom role
     scoped to only `user.manage` could assign itself `admin` and take over the
     org.
-  - **An admin never sets another user's password.** The reset is
-    `POST /api/admin/users/{id}/reset-password`: a temp from the shared
-    generator (so it satisfies `validate_password_complexity`),
-    `must_change_password=True`, every target session revoked, returned once
-    and emailed best-effort, audited `user.password_reset`. The earlier
+  - **An admin never sets — or sees — another user's password.** The reset is
+    `POST /api/admin/users/{id}/reset-password`: the password is cleared,
+    every target session revoked, and a single-use set-password link emailed
+    to the user's own address (never returned; a failed send is a `502` that
+    changes nothing), audited `user.password_reset` (decisions §283). The earlier
     admin-typed `password` on `PATCH /api/admin/users/{id}` let the admin keep
     knowing the value with no forced change, and the Edit form's password input
     took the admin's OWN password from browser autofill, so saving a rename
@@ -1140,10 +1468,21 @@ exactly as before.
     closes it: before any field is mutated, if the target is currently an
     active admin and the update would make them not one (role removal,
     deactivation, or both), the request is refused (409) unless another
-    active admin already exists in the org to undo it. Applies to self and
-    third-party targets alike, though for a third party it's a no-op — acting
-    on an admin already required the caller to be one themselves, so the org
-    never actually reaches zero admins in that case.
+    active admin already exists in the org to undo it. The single and bulk
+    deletes apply it too (a bulk row it stops fails as `last_admin`).
+    **The check is serialized.** It used to count and then act with nothing
+    held, so two admins demoting or deleting each other at the same moment
+    each saw the other still standing and both passed. The rule now lives in
+    `services/admin_lockout`, which locks the organization row (`FOR NO KEY
+    UPDATE`, held to the commit) before it counts whenever the write would
+    remove an active admin — the second request waits, then counts what the
+    first left (`tests/test_admin_lockout.py` drives the race against
+    Postgres). **SCIM applies the same guard**: a deprovision (`PATCH
+    active:false`, `PUT active:false`, `DELETE`) of the last active admin is
+    refused `400` `scimType: "mutability"` and audited, and so is a group
+    change that would revoke an IdP-managed `admin` role from the last one —
+    see [SCIM 2.0](#scim-20-user-provisioning-from-okta--entra).
+    `docs/decisions.md` §293.
 - **Frontend** — `auth.can(perm)` mirrors `require_permission`; the gated
   controls converted so far are payment Execute, payment Void, vendor
   Block/Unblock (`VendorModal.svelte`), vendor create/edit + the consolidation
@@ -1243,9 +1582,10 @@ The approve path now refuses on **both** axes an AP actor can be the proposer:
 | `vendor_change_requests.requester_provisioned_by_user_id` | frozen at staging from `vendor_users.provisioned_by_user_id` | approver == the AP actor who minted that portal identity's password |
 
 `vendor_users.provisioned_by_user_id` is stamped by invite AND by
-`POST .../reset-password` — the only two routes that hand an AP actor a working
-supplier credential — and is deliberately NOT cleared when the supplier changes
-their own password (that route needs the *current* password, which the
+`POST .../reset-password` — the only two routes through which an AP actor can
+steer a supplier credential (neither hands out a password any more, but the
+invite's set-password link goes to an address the AP actor chose) — and is
+deliberately NOT cleared when the supplier changes or sets their own password (that route needs the *current* password, which the
 provisioner has, so clearing there would be a one-request bypass). NULL means
 no AP actor has ever held this credential, which is correctly permissive: a
 self-managed supplier's request approves normally. Migration `0095`, tenant DBs.
@@ -1262,9 +1602,9 @@ still receives the email. The approval refusal is what closes the chain.
 ### Segregation of duties on the exception queue
 
 Clearing a payment-**blocking** exception is a money-path authorisation, not
-queue hygiene. `api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES` — `duplicate`,
-`fraud_flag`, `line_total_mismatch`, `payment_reconciliation` — stops a payment
-run while the row is `open` **or** `escalated`, and invoice approval gates on
+queue hygiene. `services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES` — `duplicate`,
+`fraud_flag`, `line_total_mismatch`, `payment_reconciliation`, `quality_hold`,
+`po_mismatch` — stops a payment run while the row is `open` **or** `escalated`, and invoice approval gates on
 none of them. So resolving or dismissing one is the human sign-off that lets a
 flagged payable be paid, and `POST /api/exceptions/{id}/resolve` and
 `/bulk/resolve` used to gate on `require_roles(ADMIN, AP_MANAGER)` and nothing
@@ -1273,12 +1613,38 @@ else.
 The check lives in `services/exception_lifecycle.segregation_refusal`, enforced
 by `record_decision` — the one chokepoint the single-row route, `/bulk/resolve`
 **and** the agent coordinator all pass through, so the three doors cannot drift.
-It refuses on **two** axes, either of which is enough:
+It refuses on **three** axes, any of which is enough:
 
 | Axis | Read from | Refuses |
 |---|---|---|
 | the payable's implicated actors | `Invoice.uploaded_by_id` ∪ `Invoice.segregation_actor_ids`, through `approval_chain.violates_segregation` | anyone the same invoice's **approval** already refuses |
 | the raiser | `exceptions.raised_by_user_id` (migration `0098`, tenant DBs) | the actor whose own act the flag exists to have a second person review |
+| the invoice's approvers — **`po_mismatch` and `quality_hold` only** | `approval_chain.approver_ids`: `Invoice.approved_by_user_id` (the approval of record, migration `0129`) ∪ every level approval on the invoice's workflow chain | anyone who approved the invoice the hold is on |
+
+The third axis widens the original two at the operator's call
+([decisions.md](decisions.md) §420). Those two holds wait for independent
+evidence — a goods receipt, a quality inspection — and since §389 / §401 an
+approver's own receipt or passing inspection does not lift them. Resolving the
+held row by hand in the queue would be the approver's own word standing in for
+that evidence, so the queue refuses it too. It is scoped to those two types
+(`exception_lifecycle.APPROVER_SEGREGATED_TYPES`): a `duplicate` or
+`fraud_flag` is not lifted by a receipt or an inspection, so approving such an
+invoice is not the conflict the axis exists for. The approval of record is on
+the invoice row, so the pure predicate reads it with no I/O; the chain's level
+approvers come from the invoice's `WorkflowInstance`, which every door loads
+(batched for the list, bulk resolve and the payments queue; `record_decision`
+loads it itself when a caller did not pass one).
+
+The axis binds in both orders. A manager who resolves the hold before they
+approve is not refused at the queue, since they are not yet an approver, but
+their approval re-judges the invoice's cleared `po_mismatch` / `quality_hold`
+rows in the same transaction and raises again any whose clearance no longer
+stands (`invoice_warnings.reraise_holds_cleared_by_an_approver`). Every site
+that stamps an approver calls it: each chain level and the final approval in
+`review.approve_invoice`, `/complete`'s amount floor and extraction's
+auto-approve. The hold is therefore open before a payment run can stage the
+invoice. A colleague's clearance is independent and survives
+([decisions.md](decisions.md) §422).
 
 The first axis is the one that binds in volume, and it is the one the
 [followups](followups.md) entry did not anticipate. A flag is a *detector's*
@@ -1291,6 +1657,9 @@ The second axis exists because the first cannot reach the BEC chain above: the
 approver of a vendor bank-detail change is not the uploader of the invoices that
 change re-points. `api/vendors._flag_payable_invoices_for_bank_change` is
 therefore the **one** raise site that records an actor, and it records the
+approver. The same helper raises the void's re-payment flag
+(`services/payee_stamp`, decisions §383), recording whoever re-pointed the payee
+since the voided payment: the vendor merge's actor, or the bank change's
 approver.
 
 Everything else records NULL, deliberately and with a stated reason. Nine of
@@ -1313,15 +1682,15 @@ its reason — the same enforcement, for the same reason, as the uploader stamp.
   the control wants. Refusing it would trap the row with no way out but a role
   change. Only `resolve` and `dismiss` are in scope
   (`exception_lifecycle.CLEARING_ACTIONS`).
-- **Non-blocking types.** Clearing a `po_mismatch`, `missing_data`,
-  `quality_hold`, `price_variance`, `contract_noncompliant`,
+- **Non-blocking types.** Clearing a `missing_data`,
+  `price_variance`, `contract_noncompliant`,
   `payment_compliance_hold`, `erp_reconciliation`, `review_rejected`,
   `unverified_vendor` or `extraction_failed` releases nothing, so a refusal
   there would be friction with no control behind it. Scope is
   `is_payment_blocking`, which reads the payment-run gate's own tuple — so
   adding a type to that tuple extends this control automatically and there is no
   second classification to keep in step.
-- **A NULL actor on both axes.** This reads as "no employee is implicated", and
+- **A NULL actor on every axis.** This reads as "no employee is implicated", and
   it is fail-open for the same reason [the NULL uploader](#the-other-way-sod-can-be-silently-off-a-null-uploader)
   is: failing closed would make every sweep-raised and system-ingested exception
   permanently unclearable — an outage on the queue, not a control. Nothing
@@ -1365,17 +1734,29 @@ escalate-only stubs and the other two blocking types have no resolver — which 
 exactly why it is tested with one registered
 (`backend/tests/test_exception_agent_queue_segregation.py`).
 
+`po_mismatch` does have auto-resolving resolvers (amount, missing PO, multi-PO
+split), and each approves the invoice on the triggering human's behalf before
+the row is resolved. The approver axis is therefore judged against who had
+approved **before** the run: the coordinator reads `approver_ids` ahead of the
+apply and hands the same set to `record_decision`. A human who had already
+approved the invoice escalates; the approval the run itself gives does not
+refuse its own resolve, because that resolve rests on the re-match no longer
+finding the mismatch and on no implicated receipt lifting the hold
+(`_receipts_implicated`, §389), not on the human's word (§420).
+
 #### What the refusal says, and what is audited
 
-Both messages are about the **caller**, so neither leaks a third party: an
+Every message is about the **caller**, so none leaks a third party: an
 implicated actor already learns they are in the set from the identical refusal
-on the approval path, and a raiser is being told about their own act. Neither
-names the other actors, the uploader, the vendor, or the amount.
+on the approval path, a raiser is being told about their own act, and an
+approver about their own approval. None names the other actors, the uploader,
+the vendor, or the amount.
 
 | Axis | Single-row 403 `detail.message` | `detail.code` = `/bulk/resolve` per-row `reason` |
 |---|---|---|
 | raiser | "Segregation of duties: the user whose action raised this exception cannot also clear it. Escalate it, or ask a different user to decide." | `segregation_raiser` |
 | implicated | "Segregation of duties: a user involved in creating this invoice cannot also clear an exception that blocks its payment. Escalate it, or ask a different user to decide." | `segregation_implicated` |
+| approver | "Segregation of duties: a user who approved this invoice cannot also clear its receipt or inspection hold. Escalate it, or ask a different user to decide." | `segregation_approver` |
 
 The single-row 403 is a coded refusal (`api/refusals.coded_refusal`,
 `{code, message, params}`) whose `code` is the SAME string the bulk route reports
@@ -1395,13 +1776,14 @@ an auditor needs is stronger than a refusal row anyway: every **successful**
 `exception.resolved` / `exception.dismissed` row names its `actor_id` and its
 `invoice_id`, and the invoice carries the implicated set, so the control's
 *outcome* can be re-derived for every historical decision rather than only for
-the ones that tripped. See [decisions.md](decisions.md) §169.
+the ones that tripped. See [decisions.md](decisions.md) §169 and §420.
 
 ### Segregation of duties on a workflow's approval step
 
 **The approval path's refusals carry a code.** `check_segregation`'s 403 is
 `coded_refusal("approval_segregation", …)`; its siblings are
 `approval_segregation_receiver` (receiving ≠ approving, below),
+`approval_segregation_inspector` (inspecting ≠ approving, below),
 `approval_not_named_approver` (`check_level_approver`), `approval_level_reuse`
 (one approver on two chain levels), and the money gates in
 `services/review._enforce_approval_thresholds` — `approval_cfo_required`,
@@ -1420,7 +1802,9 @@ invoice's PO cannot approve it: `review.approve_invoice` reads
 `approval_chain.receipt_recorders` (live = status outside
 `CANCELLED_GR_STATUSES`; `source = manual` with a named recorder; the POs the
 invoice's `po_number` names under the matcher's entity/vendor scope, plus the
-stored match's `po_id` / `po_ids`; receipts in the invoice's own entity) and
+stored match's `po_id` and every PO a multi-PO split linked,
+`invoices.split_po_ids`, which no warning refresh rewrites (decisions §433);
+receipts in the invoice's own entity) and
 `check_receiving_segregation` refuses with 403 `approval_segregation_receiver`.
 It runs after any corrections, so a `po_number` correction cannot slip past it,
 and on every door because every door calls `approve_invoice`; bulk approve
@@ -1431,6 +1815,40 @@ in `implicated_actors`: that set is also what `receipts_clear_hold` measures a
 receipt's recorder against, so folding them in would make every typed receipt
 implicate its own recorder. They are not refused clearing exceptions either.
 See [decisions.md](decisions.md) §267.
+
+**Inspecting ≠ approving.** The fourth leg's copy of the same rule: whoever
+hand-recorded a quality inspection of the goods the invoice is billed against
+cannot approve it. `approval_chain.inspection_recorders` reads the same POs as
+`receipt_recorders` and, on them, every `source = manual` inspection with a
+named recorder in the invoice's own entity that the 4-way leg could read — a
+PO-level row (no `gr_id`) or one on a live receipt of those POs, whatever its
+verdict. `check_inspection_segregation` refuses with 403
+`approval_segregation_inspector`, after any corrections, on every door; bulk
+approve resolves it for the batch up front, the `/complete` amount floor lands
+such an invoice at review, the escalation sweep never targets an inspector,
+and `require_segregation: false` lifts it. Like receivers, inspectors are not
+in `implicated_actors`. The other order (an approver's later `pass` does not
+lift the hold) is `invoice_warnings._inspection_clears_hold`. See
+[decisions.md](decisions.md) §401, §404.
+
+**The reverse order: approving first, receiving second.** The same person may
+not approve an invoice and then hand-record the receipt that lifts its "billed
+beyond receipt" hold. Every final approval stamps who gave it by id
+(`invoices.approved_by_user_id`, `approval_chain.stamp_approver`, migration
+0129), a chain records each level's approver in its state, and the PO-match
+auto-close (`invoice_warnings.receipts_clear_hold`) leaves the hold for a
+person while `approval_chain.receiving_conflicts` finds anyone in both the
+invoice's approvers (`approver_ids`) and `receipt_recorders`, the set the
+approval door reads. The exception agents read the same check. The receipt is
+not refused: it is recorded and lifts the holds of every other invoice on the
+PO; an independent person releases this one. The approval step's
+`require_segregation: false` lifts it, and so does the queue's
+`settings.exceptions.require_segregation: false`, which turns off the
+auto-close's segregation limits altogether. Receipt entry's re-match locks the
+invoices on the PO, which the approval doors lock too, so approving and
+receiving at once cannot slip past both orders. Every final approval writes its
+fields through `approval_chain.record_final_approval`. See
+[decisions.md](decisions.md) §389.
 
 `check_segregation` is driven by the approval step's own
 `require_segregation` flag, and **the default is ON everywhere**:
@@ -1521,6 +1939,19 @@ it, but the `Invoice(...)` constructor never passed it, so the importer could
 approve what they had just imported while the same person doing the same thing
 through `POST /api/invoices` got a 403.
 
+**Invoices those two paths created before §131 were backfilled from their audit
+rows.** CSV import and `generate-now` both wrote the acting employee into
+`actor_id` on an audit row keyed to the invoice (`invoice.imported_csv`;
+`invoice.created` with `details.source = "recurring_template"`). Migration
+`0126_uploader_audit_backfill` copies that employee into `uploaded_by_id` on every
+such invoice still short of `done`, and only when every creation record on the
+invoice names the same employee and the record matches the invoice's own import
+marker or template id. Conflicting records, a missing actor (the sweep), the
+system sentinel and other channels' records all leave it NULL. Each change gets
+an `invoice.segregation_backfilled` audit row with no actor. An import older than
+the audit row (before 2026-09-08) has nothing naming its importer and keeps the
+legacy reading ([decisions.md](decisions.md) §367).
+
 Making the NULL case fail CLOSED was considered and rejected — it would render
 every email-intake, PEPPOL and portal-submitted invoice permanently
 unapprovable, an outage across three ingestion channels rather than a control.
@@ -1602,13 +2033,16 @@ whose requester is the intake's), so migration 0102 added
 `purchase_requisitions.material_editor_ids`, appended on a real change to a
 field in `models/procurement.REQUISITION_MATERIAL_EDIT_FIELDS`, and `approve`
 refuses requester ∪ editors (`backend/docs/procurement-requisitions.md` § Who
-an approval refuses). Expense reports and pre-approvals pass `None`, for
-different reasons. A **report** has no second actor because nobody but its owner
-can author one: composing it, editing or deleting its lines, replacing their
-receipts, changing its fields and submitting it are all refused to anyone else
-(403 `expense_report_not_owner`, `backend/docs/expense-management.md` § Report
-ownership), so the owner is the complete author set without a column. A
-**pre-approval** records no editor and has no edit endpoint.
+an approval refuses). A **report** passes the recorded creators of its lines
+other than its owner (`expenses.created_by_user_id`, migration 0134, decisions
+§434). Nobody but its owner can author a report: composing it, editing or
+deleting its lines, replacing their receipts, changing its fields and submitting
+it are all refused to anyone else (403 `expense_report_not_owner`), and only a
+line its owner created may be attached (403 `expense_report_foreign_line`), so
+that set is empty in practice; it is read so the rule does not depend on those
+gates having held (`backend/docs/expense-management.md` § Report ownership,
+§ Line ownership). A **pre-approval** passes `None`: it records no editor and
+has no edit endpoint.
 
 The inter-company mirror (`POST /api/invoices/{id}/route-intercompany`)
 deliberately does **not** inherit the source invoice's set. Its segregation
@@ -1633,9 +2067,11 @@ wrong for one of them. The live example is expense reports
 The `/expenses` Reports tab gated BOTH buttons on one manager-only predicate,
 so an over-threshold report 403'd for the `ap_manager` **and** showed the CFO no
 Approve button at all — the exact person the threshold escalates to could not
-act from the UI. The page now derives `canApproveReport` (the wider set) and
-`canDecideReport` (reject) separately; both keep the same SoD self-check, since
-the decider must never be the submitting employee. When adding a decision pair,
+act from the UI. The page no longer derives either: it reads the server's
+`actions.approve` / `actions.reject` verdicts on the report
+(`services/expense_controls`, decisions §305), so the two role sets, the CFO
+gate and the segregation check (the decider is never the submitting employee —
+the reject endpoint now enforces that too) each have one definition. When adding a decision pair,
 check the two backends' `require_roles` independently rather than assuming they
 match. Guarded by `frontend/tests-e2e/expenses/cfo-report-approval.spec.ts`.
 
@@ -1691,7 +2127,7 @@ A single OIDC flow supports both Okta and Entra because they're both OIDC-compli
     "provider": "okta",
     "discovery_url": "https://acme.okta.com/.well-known/openid-configuration",
     "client_id": "...",
-    "client_secret": "...",
+    "client_secret_configured": true,
     "scim_bearer_hash": "<sha256 hex>",
     "allowed_email_domains": ["acme.com"]
   }
@@ -1700,7 +2136,7 @@ A single OIDC flow supports both Okta and Entra because they're both OIDC-compli
 
 ### Flow
 
-1. User clicks **Sign in with Okta/Microsoft** on `/login` (button renders only when `GET /api/auth/sso/config?slug=<tenant>` returns `enabled: true`). `slug` is optional — on a vanity host it is omitted and the tenant comes from the request `Host` (see *SSO on a white-label vanity host* below).
+1. User clicks **Sign in with Okta/Microsoft** on `/login` (button renders only when `GET /api/auth/sso/config?slug=<tenant>` returns `enabled: true`). `slug` is optional — on a vanity host it is omitted and the tenant comes from the request `Host` (see *SSO on a white-label vanity host* below). The page asks for the OIDC and SAML configs **in parallel** and shows a short loading state until both have answered (either way), so an SSO-only workspace never draws the password form and then pulls it away; a failed call still leaves password sign-in (issue #635 finding 33). Its heading is "Sign in", its tab title is localized (`login/+layout.svelte`, which `/login/mfa` inherits), and on a workspace host it names the workspace by that host — nothing a public endpoint would have to disclose.
 2. Browser navigates to `GET /api/auth/sso/authorize?slug=<tenant>` on the backend (same optional-`slug` rule).
 3. Backend fetches the discovery doc (cached in Redis for 24h), mints a one-shot `state` + `nonce` into Redis (keyed to the tenant slug), and **302-redirects** to the IdP's `authorization_endpoint` with `redirect_uri` pointing to the *tenant's own subdomain* (built from `FEOH_TENANT_URL_TEMPLATE`).
 4. User authenticates on the IdP.
@@ -1714,6 +2150,8 @@ A single OIDC flow supports both Okta and Entra because they're both OIDC-compli
    - JIT-provisions the user (match order: `(sso_provider, sso_provider_id)` → `(organization_id, email)` → new user with least-privilege `ap_clerk` role, or `admin` if it's the first user in the org).
    - Mints our own JWT and returns `{access_token, must_change_password, tenant_slug}`.
 8. Frontend stores the JWT, fetches `/api/auth/me`, and routes to `/change-password` if flagged or `/` otherwise.
+
+An IdP that refuses or abandons the sign-in redirects back with `?error=<code>` instead (RFC 6749 §4.1.2.1). The OIDC callback and the SAML bridge (`/login/saml-callback`) are one component, `components/auth/AuthCallback.svelte`, rendered inside `AuthShell` like every other sign-in screen; it states the refusal in words from `utils/idpCallbackError.ts` — `access_denied`, `login_required`, `consent_required`, `interaction_required`, `temporarily_unavailable` and `server_error` each have a sentence, anything else a generic one — and shows the raw code only as small support detail, and only when it is a short identifier: the value comes from the URL, so text someone wrote into a link is never echoed (issue #635 finding 36). The `?next=` destination stashed before the round trip is taken on arrival either way, and the "Back to sign in" link carries it.
 
 ### Why callback URLs are per-tenant
 
@@ -1810,6 +2248,45 @@ First SSO login provisions the user. Three match paths:
 
 New users get `ap_clerk` role by default (least privilege). The first user ever in an org gets `admin`.
 
+**An address that already has an account in another workspace is refused, not
+created.** The first two matches search only this org, and `users.email` is
+globally unique — one address is one account in one workspace — so "create new"
+used to trip the UNIQUE constraint at flush and both callbacks answered a bare
+`500` with no audit row. `jit_provision` now asks
+`identity_provisioning.email_holder_org_id` (platform-wide, case-insensitive)
+first and raises `EmailInOtherWorkspace`; the insert also runs in a savepoint, so
+an address taken by a concurrent writer between the check and the flush is the
+same refusal. The callbacks turn it into:
+
+- **OIDC** — `POST /api/auth/sso/callback` answers `403` coded
+  `sso_email_in_other_workspace` (`api/refusals.SSO_EMAIL_IN_OTHER_WORKSPACE_DETAIL`)
+  and writes `auth.sso.login.failure` / `reason=sso_email_in_other_workspace`
+  (with the email, as OIDC failure rows do) in **this** workspace.
+- **SAML** — the ACS writes `auth.saml.login.failure` with the same reason and the
+  usual PII-free details, then 303s to the SPA bridge with a one-time code
+  (`sso.create_saml_refusal_handoff`, same store, TTL and single use as a token
+  handoff), and `POST /api/auth/saml/exchange` answers that code with the same
+  coded `403` and no token — so the browser lands on the callback page rather
+  than on raw JSON at the ACS. Every other ACS refusal now takes the same route
+  (see [SAML SSO](#saml-sso), decisions §359).
+
+Both callback pages state it in the reader's language
+(`refusal.ssoEmailInOtherWorkspace`, through `api/codedRefusals.ts`): the
+address belongs to another workspace, sign in on your own workspace's page or
+ask this workspace's admin to have the IdP send a different address. It carries
+**no link** to the account's own sign-in page, unlike the password path's
+`wrong_workspace`. That link is safe there because only someone who proved the
+password sees it; here the proof is an assertion from this workspace's IdP,
+which this workspace's admin controls and can make say any address — a link
+would name another tenant's workspace for any address they typed. The bare
+"this address is taken" it does reveal is what `POST /api/admin/users` already
+tells the same admin. Nothing is written to the other workspace's audit log,
+which this IdP's admin must not be able to write into. Reasoning:
+[decisions.md](decisions.md) §291. Tests:
+`backend/tests/test_email_identity_case.py` (JIT, the race, the OIDC callback)
+and `backend/tests/test_saml_acs_integration.py` (the ACS → bridge → exchange
+round trip).
+
 A match that lands on a **deactivated** account (`users.is_active = false`) raises
 `DeactivatedAccount` instead of returning the row, so neither SSO callback can
 mint a session for someone who has been offboarded — see
@@ -1820,8 +2297,8 @@ either.
 
 The asserted address is normalised (lower-cased, stripped) and then checked for
 **control characters** before anything is stored — `utils/emails.is_header_safe`,
-raising `UnsafeEmailAddress`, which both callbacks turn into their existing
-generic refusal (SAML `unsafe_email`, OIDC a 403 + a PII-free audit reason).
+raising `UnsafeEmailAddress`, which both callbacks turn into the coded 403
+`sso_email_unusable` with a PII-free audit reason `unsafe_email`.
 `strip()` already removed a trailing newline, but an interior one survived it,
 and `User.email` is both a login and the destination of every notification the
 app sends that person — a newline reaching an SMTP header is the
@@ -2034,7 +2511,7 @@ A "live factor" here means an enabled TOTP secret **or** at least one registered
 
 Neither field is required for a **first** enrollment: an account with no factor has nothing to protect, so onboarding stays frictionless. A missing or wrong step-up is a `400` with a generic message that reveals nothing about the account (in an SSO-only tenant the message names only the code and passkey proofs, which reveals nothing `/auth/{sso,saml}/config` does not already publish).
 
-An SSO-only account — no password, no TOTP secret — has no *stateless* credential to be challenged on, and is still never **exempted**: exempting it would let a stolen JWT plant an attacker-controlled passkey on an account the attacker never proved control of. Instead, if it holds a registered passkey, that passkey **is** the challenge: `POST /api/auth/mfa/step-up/passkey` mints an assertion challenge bound to the operation, and the signed response goes back as `assertion`. That is what makes a passwordless SSO deployment able to enroll, rotate and remove its own factors at all; before it, such an account was locked out of factor management and recovered only via an admin password reset (which cannot help in an SSO-only tenant, where the password is no step-up proof) — `POST /api/admin/users/{user_id}/reset-password`, a generated temp the user must change (`app/api/admin.py`; still the fallback for an account with *no* factor of any kind, which genuinely has nothing to prove). The password / TOTP checks stay pure in `services/mfa.step_up_verified`; the assertion path is `api/auth._step_up_satisfied` because it needs the DB and Redis.
+An SSO-only account — no password, no TOTP secret — has no *stateless* credential to be challenged on, and is still never **exempted**: exempting it would let a stolen JWT plant an attacker-controlled passkey on an account the attacker never proved control of. Instead, if it holds a registered passkey, that passkey **is** the challenge: `POST /api/auth/mfa/step-up/passkey` mints an assertion challenge bound to the operation, and the signed response goes back as `assertion`. That is what makes a passwordless SSO deployment able to enroll, rotate and remove its own factors at all; before it, such an account was locked out of factor management and recovered only via an admin password reset (which cannot help in an SSO-only tenant, where the password is no step-up proof) — `POST /api/admin/users/{user_id}/reset-password`, which emails the user a set-password link (`app/api/admin.py`; still the fallback for an account with *no* factor of any kind, which genuinely has nothing to prove). The password / TOTP checks stay pure in `services/mfa.step_up_verified`; the assertion path is `api/auth._step_up_satisfied` because it needs the DB and Redis.
 
 Every step-up check is **throttled and audited**: 5 attempts per minute keyed on the *account* (not the client IP — the attacker already holds the victim's token and can rotate IPs), and a failure writes a PII-free `auth.mfa.step_up.failure` / `portal.mfa.step_up.failure` audit row carrying only the operation name. Without that, a credential-management endpoint that checks a password is an unlimited, silent password oracle. The same throttle + audit covers `/mfa/disable` on both surfaces.
 
@@ -2205,7 +2682,7 @@ Every SCIM request Authorization-headers a bearer token; the backend SHA-256s it
 | `POST` | `/Users` | Create. Returns 409 `uniqueness` on duplicate userName. |
 | `PUT` | `/Users/{id}` | **Full-resource replace.** Authentik (and RFC 7644 §3.5.1) update users via PUT, not PATCH. Returns 409 `uniqueness` if the new userName collides with another user. |
 | `PATCH` | `/Users/{id}` | Partial update. Supports the ops Okta + Entra send (active toggle, userName/externalId/name replace, root-object replace). A `userName` op returns 409 `uniqueness` on a collision. |
-| `DELETE` | `/Users/{id}` | **Soft delete** — sets `is_active=false`. Preserves audit trail. |
+| `DELETE` | `/Users/{id}` | **Soft delete** — sets `is_active=false`. Preserves audit trail. The same deactivation as a `PATCH active:false` (see below). |
 | `GET` | `/Groups` | List + paginate; `displayName eq` filter. |
 | `GET` | `/Groups/{id}` | Fetch one group. |
 | `POST` | `/Groups` | Create. 409 `uniqueness` on duplicate displayName. |
@@ -2236,6 +2713,31 @@ non-empty string, so Entra's deprovision left the account active and answered
 case, on both the `path: "active"` op and a path-less replace, and answers any
 other value with a 400 `invalidValue` rather than guessing a lifecycle state
 (`tests/test_scim_active_patch.py`).
+
+**Every user write is audited, and a deprovision ends the user's sessions.**
+Create writes `user.created`; a rename, a name or `externalId` change, and
+every deactivation (`PATCH active:false`, `PUT active:false`, `DELETE`) write
+`user.updated` with each changed field before and after — `via: "scim"`, a
+null `actor_id`, and the `operation` that did it. A deactivation commits, then
+revokes every session the account holds (`revoke_user_sessions`, as the admin
+PATCH does) and records the count; a revoke that fails is recorded as
+`sessions_revoked: null` and the IdP still gets its 2xx, since the
+deactivation itself stands and a 5xx would only make it retry. Before this an
+IdP-driven leaver was shut out with nothing on the trail to say who or when.
+Shapes: [Auth event audit logging](#auth-event-audit-logging).
+
+**SCIM cannot remove the org's last active admin.** A deprovision of the only
+active admin — every spelling above — and a `/Groups` write that would revoke
+an IdP-managed `admin` role from the last one are refused **before anything
+changes**, with `400` and `scimType: "mutability"`, and audited
+(`user.deactivation_refused` / `auth.scim.role_revoke_refused`). RFC 7644
+§3.12 defines `mutability` as a modification "not compatible with the target
+attribute's … current state", and IdPs show a 400 to their admin instead of
+retrying it; a 409 was rejected because the RFC reserves it for uniqueness and
+version conflicts. The guard, and the organization-row lock that serializes it,
+are the admin API's own (`services/admin_lockout`). To deprovision that person,
+make someone else an admin in FeohLedger first (`tests/test_scim_user_lifecycle_audit.py`,
+`docs/decisions.md` §293).
 
 ### Filter syntax
 
@@ -2329,7 +2831,7 @@ It describes the **endpoints**, and in two places the nav is deliberately narrow
 | `/invoices` entry (create / `upload` / `{id}/file` / patch / line-items / `extract` / `reset-extraction` / `resubmit` / `complete` / `bulk/status`) | any-authenticated (read) | admin · ap_manager · cfo · ap_clerk (clerk: until submitted, and only the entry transitions — `api/invoice_entry.py`) |
 | `/invoices/import-csv` | — | admin · ap_manager · ap_clerk (clerk: open AP rows only; historical `done` / `paid` rows are admin · ap_manager) |
 | `/invoices` delete / `bulk/delete` | — | admin · ap_manager · cfo |
-| `/invoices/{id}/approve`, `/reject` | — | `invoice.approve` (admin · ap_manager · cfo by default) |
+| `/invoices/{id}/approve`, `/reject`, `/recall-approval` | — | `invoice.approve` (admin · ap_manager · cfo by default) |
 | `/invoices/{id}/send-to-erp`, `/retry-erp` | — | admin · ap_manager · cfo |
 | `/payments/*` (incl. runs create + execute) | admin · ap_manager · cfo | admin · ap_manager · cfo |
 | `/cards` (list / dashboard / generate / cancel / details / rebates) | admin · ap_manager · cfo | admin · ap_manager · cfo |
@@ -2366,7 +2868,8 @@ parked here.
 | `GET /auth/sso/authorize`, `GET /auth/saml/login` | Entry legs of the OIDC / SAML dance — they 302 the browser to the IdP. There is no session yet, by definition. |
 | `GET /auth/saml/metadata` | SP `EntityDescriptor` XML an IdP admin registers. No secrets — only the public SP cert when AuthnRequest signing is on. |
 | `GET /signup/slug-check`, `POST /signup/start` | Self-service tenant signup: there is no account to authenticate yet. Abuse is bounded by the per-IP / per-email rate limits and the captcha, not by a credential. |
-| `POST /auth/forgot-password` | **Self-service password recovery.** It has to be reachable by a user who — by definition — cannot log in; requiring a credential to ask for a password reset would be circular. It is not an unguarded surface: it answers *identically* for a known and an unknown address (the email is dispatched on a detached task, so response time can't enumerate accounts either), and it is throttled on two axes — per IP (5/hour) and per submitted address (3/hour), so an attacker rotating IPs still can't email-bomb one victim's inbox with reset links. The state-changing half of the flow is **not** public: `POST /auth/reset-password` is gated by the single-use emailed token (see below). |
+| `POST /auth/forgot-password` | **Self-service password recovery.** It has to be reachable by a user who — by definition — cannot log in; requiring a credential to ask for a password reset would be circular. It is not an unguarded surface: it answers *identically* for a known and an unknown address, and everything only a known address does (the org lookup, the token mint, the send and the `auth.password_reset.requested` audit row) runs on a detached task (`app/utils/detached_tasks.py`, shared with the portal twin), so response time can't enumerate accounts either, and it is throttled on two axes — per IP (5/hour) and per submitted address (3/hour), so an attacker rotating IPs still can't email-bomb one victim's inbox with reset links. The state-changing half of the flow is **not** public: `POST /auth/reset-password` is gated by the single-use emailed token (see below). |
+| `POST /portal/auth/forgot-password` | **The supplier-portal twin**, tenant-scoped by `X-Tenant-Slug` / Host. The same identical answer, with the mint, send and audit detached the same way; budgets per IP (5/hour) and per (tenant, address) (3/hour, tenant-scoped like the portal login's failure budget so one tenant's traffic never throttles another's supplier). It changes nothing on the account; the reset itself is gated by the single-use portal token (below). |
 | `GET /portal/branding` | White-label brand read for the **unauthenticated** supplier-portal login page. Tenant resolved by the `get_tenant` chokepoint; returns only the whitelisted `BrandConfig` fields. See `white-label.md`. |
 
 #### `ALTERNATE_AUTH` — gated by something other than the JWT
@@ -2394,13 +2897,14 @@ behavioural suites cover (`test_slack_approvals`, `test_webhook_security`,
 | `POST /portal/auth/mfa/challenge[/email]` | The portal's own `typ=vendor_mfa_challenge` token — distinct from the employee one so neither crosses the AP/vendor boundary. |
 | `POST /auth/reset-password` | The single-use emailed reset token IS the credential; `consume_reset_token` GETDELs it atomically, so a replay 400s exactly like an expiry. |
 | `POST /auth/reset-password/check` | The same token, read without consuming it (`peek_reset_token`): the same opaque 400 for any token the reset would refuse, otherwise the account email the link already resets. Its own per-IP budget (20/min), so loading the page never spends the submit's. |
+| `POST /portal/auth/reset-password`, `POST /portal/auth/reset-password/check` | The supplier-portal twin (its link comes from the AP team's invite / reset, or the supplier's own `POST /portal/auth/forgot-password`): the single-use set-password token the AP team's portal invite / reset emails (`portal:pwreset:` prefix, so neither family redeems the other's), bound to the tenant that minted it — presented on another tenant's host it is the same opaque 400 and is **not** spent. Same per-IP budgets (10/min, 20/min). Redemption ends every portal session of the supplier. |
 | `POST /auth/sso/callback` | Server-minted single-use `state`, then the IdP's signed, nonce-bound ID token. |
 | `POST /auth/saml/acs`, `POST /auth/saml/exchange` | Server-minted single-use RelayState + python3-saml's signed-assertion verification; the exchange leg consumes a one-time handoff code. |
 | `POST /signup/complete` | The emailed `EmailVerification` token, taken `FOR UPDATE` and consumed so two calls can't double-provision a tenant. |
 | `POST /cards/webhook/{provider}`, `POST /erp/webhook/{erp_type}` | Per-tenant webhook signing secret (HMAC over the raw body) + Redis dedupe on the provider event id. |
 | `POST /payments/webhook/{tenant_slug}/{provider}`, `POST /billing/webhook/{provider}` | The adapter's `parse_webhook` verifies the processor HMAC, then event-id dedupe. |
 | `POST /email-intake/inbound/{provider}` | Process-level HMAC over the raw body plus the opaque per-tenant token in the recipient address. |
-| `POST /peppol/inbound/{tenant_slug}` | Access Point HMAC; dedupe is the DB `uq_peppol_message_id` index. |
+| `POST /peppol/inbound/{organization_id}` | Access Point HMAC; dedupe is the DB `uq_peppol_message_id` index. |
 | `POST /catalogs/punchout/return/{tenant_slug}` | Supplier shared-secret HMAC over the cart body, BuyerCookie-correlated to a pending session. |
 | `GET /invoices/email-action/{token}`, `POST .../confirm` | The signed single-action token in the URL IS the credential (re-verified on the acting request, never trusted from the confirm page). |
 | `POST /approvals/slack/interactivity`, `POST /approvals/teams/interactivity` | The provider request signature **and** the signed single-use action token in the button / card action. |

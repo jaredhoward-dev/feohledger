@@ -17,7 +17,7 @@ real-DB test cleans up in a ``finally`` keyed to its org.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -29,7 +29,9 @@ from app.models.billing import Plan, Subscription
 from app.models.organization import Organization
 from app.models.workflow import AuditLog
 from app.services.billing.plan_change import PlanChangeError, change_plan
+from app.services.billing.plan_preview import PlanChangeQuote, preview_plan_change
 from app.services.billing.proration import compute_proration
+from app.services.billing.provider_sync import ProviderLegRefused
 from app.services.billing.provisioning import provision_org_billing
 from app.services.billing_adapters.base import CreateSubscriptionRequest
 from app.services.billing_adapters.mock_adapter import MockBillingAdapter
@@ -205,6 +207,10 @@ async def test_stripe_ensure_price_sends_minor_units_recurring():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            # The account-wide lookup by key finds nothing yet.
+            captured["lookup"] = request.url.params["lookup_keys[]"]
+            return httpx.Response(200, json={"data": []})
         captured["body"] = request.content.decode()
         captured["idem"] = request.headers.get("Idempotency-Key")
         return httpx.Response(200, json={"id": "price_new"})
@@ -217,6 +223,11 @@ async def test_stripe_ensure_price_sends_minor_units_recurring():
     assert "unit_amount=4900" in captured["body"]  # 49.00 → 4900 cents, exact
     assert "recurring%5Binterval%5D=month" in captured["body"]
     assert captured["idem"] == "ap-price-growth-4900-usd"
+    # Shared across orgs: one price per plan + amount, found again by this key.
+    assert captured["lookup"] == "feohledger_plan_growth_4900_usd"
+    assert "lookup_key=feohledger_plan_growth_4900_usd" in captured["body"]
+    # An archived price still holding the key must not make the create fail.
+    assert "transfer_lookup_key=true" in captured["body"]
 
 
 @pytest.mark.asyncio
@@ -573,6 +584,25 @@ async def test_plan_change_unknown_plan_raises(realdb):
         await _cleanup(realdb, org_id)
 
 
+async def _preview(c, code: str) -> dict:
+    resp = await c.post("/api/billing/change-plan/preview", json={"plan_code": code})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _confirm(c, code: str, preview: dict | None = None, **overrides):
+    """Confirm a change the way the SPA does: with the preview it showed."""
+    preview = preview or await _preview(c, code)
+    body = {
+        "plan_code": code,
+        "proration_date": preview["proration_date"],
+        "expected_amount_due": preview["amount_due"],
+        "currency": preview["currency"],
+        **overrides,
+    }
+    return await c.post("/api/billing/change-plan", json=body)
+
+
 @pytest.mark.asyncio
 async def test_change_plan_endpoint_happy_path(realdb, _audit_engine_on_loop):
     org_id = realdb.info("a").org_id
@@ -581,7 +611,7 @@ async def test_change_plan_endpoint_happy_path(realdb, _audit_engine_on_loop):
         await _seed_plan(realdb, code="prtest_e_scale", price="99.00")
         await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
         async with realdb.client(key="a", role="admin") as c:
-            resp = await c.post("/api/billing/change-plan", json={"plan_code": "prtest_e_scale"})
+            resp = await _confirm(c, "prtest_e_scale")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["changed"] is True
@@ -602,8 +632,9 @@ async def test_change_plan_endpoint_idempotent_retry(realdb, _audit_engine_on_lo
         await _seed_plan(realdb, code="prtest_r_scale", price="99.00")
         await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
         async with realdb.client(key="a", role="admin") as c:
-            r1 = await c.post("/api/billing/change-plan", json={"plan_code": "prtest_r_scale"})
-            r2 = await c.post("/api/billing/change-plan", json={"plan_code": "prtest_r_scale"})
+            preview = await _preview(c, "prtest_r_scale")
+            r1 = await _confirm(c, "prtest_r_scale", preview)
+            r2 = await _confirm(c, "prtest_r_scale", preview)
         assert r1.status_code == r2.status_code == 200
         assert r1.json()["changed"] is True
         assert r2.json()["changed"] is False  # already on the plan now
@@ -619,7 +650,194 @@ async def test_change_plan_endpoint_rbac_403_for_clerk(realdb):
         await _seed_plan(realdb, code="prtest_rb_scale", price="99.00")
         await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
         async with realdb.client(key="a", role="ap_clerk") as c:
-            resp = await c.post("/api/billing/change-plan", json={"plan_code": "prtest_rb_scale"})
+            resp = await c.post(
+                "/api/billing/change-plan",
+                json={
+                    "plan_code": "prtest_rb_scale",
+                    "proration_date": 0,
+                    "expected_amount_due": "0.00",
+                    "currency": "USD",
+                },
+            )
+            preview = await c.post(
+                "/api/billing/change-plan/preview", json={"plan_code": "prtest_rb_scale"}
+            )
         assert resp.status_code == 403
+        # The preview is gated exactly like the change it prices.
+        assert preview.status_code == 403
+    finally:
+        await _cleanup(realdb, org_id)
+
+
+# ---------------------------------------------------------------------------
+# Preview → confirm (decisions §482) on the mock provider.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preview_prices_the_change_and_changes_nothing(realdb, _audit_engine_on_loop):
+    org_id = realdb.info("a").org_id
+    try:
+        old_id = await _seed_plan(realdb, code="prtest_pv_basic", price="49.00")
+        await _seed_plan(realdb, code="prtest_pv_scale", price="99.00")
+        sub_id = await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
+        async with realdb.client(key="a", role="cfo") as c:
+            preview = await _preview(c, "prtest_pv_scale")
+        assert preview["already_on_plan"] is False
+        assert preview["currency"] == "USD"
+        # Exact decimal strings, the adapter's own figures.
+        assert isinstance(preview["amount_due"], str)
+        assert Decimal(preview["amount_due"]) >= 0
+        assert preview["credit"] == "0.00"
+        assert preview["next_amount"] == "99.00"
+        assert preview["next_date"] is not None
+        assert preview["payment_method_required"] is False
+        assert isinstance(preview["proration_date"], int)
+        # Nothing moved: same plan, no audit row.
+        async with realdb.control_sessionmaker()() as s:
+            row = (
+                await s.execute(select(Subscription).where(Subscription.id == sub_id))
+            ).scalar_one()
+        assert row.plan_id == old_id
+        assert "billing.plan_changed" not in await _audit_actions(realdb, sub_id)
+    finally:
+        await _cleanup(realdb, org_id)
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_downgrade_shows_a_credit_and_nothing_due(realdb):
+    org_id = realdb.info("a").org_id
+    try:
+        old_id = await _seed_plan(realdb, code="prtest_pd_scale", price="99.00")
+        await _seed_plan(realdb, code="prtest_pd_basic", price="49.00")
+        await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
+        async with realdb.client(key="a", role="admin") as c:
+            preview = await _preview(c, "prtest_pd_basic")
+        assert preview["amount_due"] == "0.00"
+        assert Decimal(preview["credit"]) >= 0
+    finally:
+        await _cleanup(realdb, org_id)
+
+
+@pytest.mark.asyncio
+async def test_preview_of_the_current_plan_is_a_no_op(realdb):
+    org_id = realdb.info("a").org_id
+    try:
+        old_id = await _seed_plan(realdb, code="prtest_pn_basic", price="49.00")
+        await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
+        async with realdb.client(key="a", role="admin") as c:
+            preview = await _preview(c, "prtest_pn_basic")
+            unknown = await c.post(
+                "/api/billing/change-plan/preview", json={"plan_code": "prtest_pn_nope"}
+            )
+        assert preview["already_on_plan"] is True
+        assert preview["amount_due"] == "0.00"
+        assert unknown.status_code == 404
+    finally:
+        await _cleanup(realdb, org_id)
+
+
+@pytest.mark.asyncio
+async def test_change_plan_requires_the_confirmed_preview(realdb):
+    """No quote, no charge: the body must carry what the customer saw."""
+    org_id = realdb.info("a").org_id
+    try:
+        old_id = await _seed_plan(realdb, code="prtest_q_basic", price="49.00")
+        await _seed_plan(realdb, code="prtest_q_scale", price="99.00")
+        await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
+        async with realdb.client(key="a", role="admin") as c:
+            bare = await c.post("/api/billing/change-plan", json={"plan_code": "prtest_q_scale"})
+            as_float = await _confirm(c, "prtest_q_scale", expected_amount_due=12.5)
+            absurd = await _confirm(c, "prtest_q_scale", proration_date=2**40)
+        assert bare.status_code == 422
+        assert as_float.status_code == 422  # money is a decimal STRING, never a float
+        assert absurd.status_code == 422  # an unrepresentable instant, not a 500
+    finally:
+        await _cleanup(realdb, org_id)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_or_understated_quote_is_refused_and_changes_nothing(realdb):
+    org_id = realdb.info("a").org_id
+    try:
+        old_id = await _seed_plan(realdb, code="prtest_s_basic", price="49.00")
+        await _seed_plan(realdb, code="prtest_s_scale", price="99.00")
+        sub_id = await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
+        async with realdb.client(key="a", role="admin") as c:
+            preview = await _preview(c, "prtest_s_scale")
+            too_old = await _confirm(
+                c, "prtest_s_scale", preview, proration_date=preview["proration_date"] - 11 * 60
+            )
+            future = await _confirm(
+                c, "prtest_s_scale", preview, proration_date=preview["proration_date"] + 3600
+            )
+            other_currency = await _confirm(c, "prtest_s_scale", preview, currency="EUR")
+        for resp in (too_old, future, other_currency):
+            assert resp.status_code == 409, resp.text
+            assert resp.json()["detail"]["code"] == "plan_change_preview_stale"
+        async with realdb.control_sessionmaker()() as s:
+            row = (
+                await s.execute(select(Subscription).where(Subscription.id == sub_id))
+            ).scalar_one()
+        assert row.plan_id == old_id
+    finally:
+        await _cleanup(realdb, org_id)
+
+
+@pytest.mark.asyncio
+async def test_a_quote_below_what_would_be_charged_is_refused(realdb, _audit_engine_on_loop):
+    """The provider, asked again at the quote's instant, wants more than the
+    customer confirmed: refused, nothing changed. The exact figure confirms."""
+    org_id = realdb.info("a").org_id
+    at = datetime(2026, 6, 16, tzinfo=UTC)
+    try:
+        old_id = await _seed_plan(realdb, code="prtest_u_basic", price="49.00")
+        await _seed_plan(realdb, code="prtest_u_scale", price="99.00")
+        sub_id = await _seed_sub(realdb, org_id=org_id, plan_id=old_id)
+        async with realdb.control_sessionmaker()() as s:
+            org = (
+                await s.execute(select(Organization).where(Organization.id == org_id))
+            ).scalar_one()
+            preview = await preview_plan_change(s, org=org, new_plan_code="prtest_u_scale", now=at)
+        # (99 - 49) * 15/30, priced by the mock exactly as `change_plan` records it.
+        assert preview.amount_due == Decimal("25.00")
+        assert preview.next_amount == Decimal("99.00")
+        assert preview.next_date == datetime(2026, 7, 1, tzinfo=UTC)
+
+        def quote(amount: str) -> PlanChangeQuote:
+            return PlanChangeQuote(
+                proration_date=preview.proration_date, amount_due=Decimal(amount), currency="USD"
+            )
+
+        async with realdb.control_sessionmaker()() as s:
+            org = (
+                await s.execute(select(Organization).where(Organization.id == org_id))
+            ).scalar_one()
+            with pytest.raises(ProviderLegRefused) as exc:
+                await change_plan(
+                    s,
+                    org=org,
+                    new_plan_code="prtest_u_scale",
+                    actor_id=None,
+                    change_at=at,
+                    quote=quote("24.99"),
+                )
+        assert exc.value.code == "plan_change_preview_stale"
+        assert "billing.plan_changed" not in await _audit_actions(realdb, sub_id)
+
+        async with realdb.control_sessionmaker()() as s:
+            org = (
+                await s.execute(select(Organization).where(Organization.id == org_id))
+            ).scalar_one()
+            result = await change_plan(
+                s,
+                org=org,
+                new_plan_code="prtest_u_scale",
+                actor_id=None,
+                change_at=at + timedelta(minutes=9),
+                quote=quote("25.00"),
+            )
+        assert result.changed is True
+        assert result.proration.amount == Decimal("25.00")
     finally:
         await _cleanup(realdb, org_id)

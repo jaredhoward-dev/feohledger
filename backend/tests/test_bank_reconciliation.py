@@ -103,6 +103,7 @@ def test_parse_simple_iso_dates_and_signed_amount_column():
         account_identifier="****1234",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert stmt.transaction_count == 2
     assert txs[0].direction == "debit"
@@ -141,6 +142,7 @@ def test_parse_uses_the_leftmost_matching_date_column():
         account_identifier="****1234",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert len(txs) == 1
     assert txs[0].transaction_date == date(2026, 5, 1)
@@ -160,6 +162,7 @@ def test_parse_separate_debit_and_credit_columns():
         account_identifier="****1234",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert len(txs) == 2
     assert txs[0].direction == "debit"
@@ -180,6 +183,7 @@ def test_parse_handles_parenthesized_negative_amounts():
         account_identifier="x",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert txs[0].direction == "debit"
     assert txs[0].amount == Decimal("1234.56")
@@ -196,6 +200,7 @@ def test_parse_handles_comma_thousands_and_dollar_signs():
         account_identifier="x",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert txs[0].amount == Decimal("1234.56")
 
@@ -214,6 +219,7 @@ def test_parse_carries_reference_and_counterparty_columns():
         account_identifier="x",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert txs[0].counterparty_name == "Acme Corp"
     assert txs[0].reference == "REF-9999"
@@ -241,6 +247,7 @@ def test_parse_skips_bad_rows_silently_keeps_good_ones():
         account_identifier="x",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert len(txs) == 2  # the bad row was skipped
 
@@ -258,6 +265,7 @@ def test_parse_empty_csv_raises():
             account_identifier="x",
             period_start=date(2026, 5, 1),
             period_end=date(2026, 5, 31),
+            currency="USD",
         )
 
 
@@ -272,6 +280,7 @@ def test_parse_header_only_raises():
             account_identifier="x",
             period_start=date(2026, 5, 1),
             period_end=date(2026, 5, 31),
+            currency="USD",
         )
 
 
@@ -284,6 +293,7 @@ def test_parse_header_without_date_column_raises():
             account_identifier="x",
             period_start=date(2026, 5, 1),
             period_end=date(2026, 5, 31),
+            currency="USD",
         )
 
 
@@ -296,6 +306,7 @@ def test_parse_header_without_amount_or_debit_credit_raises():
             account_identifier="x",
             period_start=date(2026, 5, 1),
             period_end=date(2026, 5, 31),
+            currency="USD",
         )
 
 
@@ -314,6 +325,7 @@ def test_parse_all_rows_unparseable_raises():
             account_identifier="x",
             period_start=date(2026, 5, 1),
             period_end=date(2026, 5, 31),
+            currency="USD",
         )
 
 
@@ -326,6 +338,7 @@ def test_parse_falls_back_to_latin1_for_non_utf8_input():
         account_identifier="x",
         period_start=date(2026, 5, 1),
         period_end=date(2026, 5, 31),
+        currency="USD",
     )
     assert len(txs) == 1
 
@@ -767,6 +780,17 @@ def test_settlement_pair_is_the_amount_that_left_the_account():
 
     # No invoice row to read → currency unknown, never guessed.
     assert settlement_amount_and_currency(domestic, None) == (Decimal("1000.00"), "")
+
+    # A whitespace-only FX stamp is no currency: the leg is not read as an
+    # unknown-currency source amount (which skipped the currency check), it
+    # falls back to the invoice-currency figure, which a home-currency bank
+    # line then fails to match (fail closed).
+    blank_stamp = _payment(
+        amount=Decimal("1000.00"),
+        source_amount=Decimal("1086.96"),
+        source_currency="   ",
+    )
+    assert settlement_amount_and_currency(blank_stamp, "EUR") == (Decimal("1000.00"), "EUR")
 
 
 def test_classify_discrepancy_precedence_and_clean_case():

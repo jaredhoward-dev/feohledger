@@ -48,6 +48,16 @@ against `Budget.currency` as a **column** rather than a Python literal — that 
 what lets one query answer for many budgets while staying literally the same
 predicate a single-budget query applies.
 
+**A PO whose total the ERP no longer vouches for is not committed spend.** The
+PO leg leaves out a converted PO marked `total_unverifiable_reason` (the ERP
+could not price it at its last sync) and counts it on `unverifiable_po_count`
+— on `/spend`, `/check` and `/rollup`, per currency and whole-set. It is a
+separate count from `excluded_row_count` because the fix differs (the ERP has to
+price the PO; nobody can re-denominate it), and a PO both marked and in another
+currency is counted once, as unverifiable. The `/cfo` budget card and the budget
+modal print it beside `committed`; non-zero means `committed` is a floor and
+`/check`'s `remaining` may overstate the headroom (decisions §323).
+
 The correlated join conditions (entity scope, the period window, the dimension
 match) are each restated once more as **set-level narrowing** predicates
 (`_invoice_scan_narrowing`) — logically redundant, provably implied, and load
@@ -62,7 +72,7 @@ submit. Because they are derived from the budget set, the SAME code emits
 |------|-----------|
 | **allocated** | `budget.amount` — the cap for this dimension/period. |
 | **committed** | Earmarked but not yet invoiced. Two legs, summed: (1) `PurchaseRequisition.total` for requisitions linked to the budget (`budget_id == budget.id`) in an **open-commitment** status — `submitted`, `pending_approval`, `approved` (live demand not yet a PO); (2) `PurchaseOrder.total` for the POs those budget-linked requisitions converted into (`converted` reqs joined via `converted_po_id`), excluding cancelled/closed/voided POs. Each PO counts only its **uninvoiced remainder** — `PO.total` minus the realised invoices billed against it (attributed the way `po_matching` does it: same `po_number`, the invoice's entity, the invoice's vendor when it names one, and of those the **newest** PO only — `po_number` is not unique, so an invoice relieves one PO, never every PO carrying its number) that this budget's **actual** leg already counts, floored at `0`. Nothing changes a PO's status when it is invoiced, so without that relief an invoiced PO was counted twice: once here, once in actual. Only invoices actual sums relieve — one still in review, coded to another dimension value, in another currency or in a sibling subsidiary leaves the PO committed in full. A converted req is counted via its PO (leg 2), **not** the req (leg 1) — `converted` is deliberately omitted from leg 1 so the two never double-count. |
-| **actual** | Realised invoice spend matched to the dimension. Invoices have no `budget_id`, so they're attributed by column — one per dimension, all four covered: `cost_center` → `Invoice.cost_center`, `gl_account` → `Invoice.gl_account`, `department` → `Invoice.department`, `project` → `Invoice.project`. Only invoices in a realised status count — `approved`, `sent_to_erp`, `posted_in_erp`, `payment_scheduled`, `paid`, `done` — so a new/rejected invoice never inflates actual. When the budget sets both `period_start`/`period_end`, actual is further bounded to invoices dated inside that window (so a Q1 and a Q2 budget on the same dimension don't both report all-time spend). |
+| **actual** | Realised invoice spend matched to the dimension. Invoices have no `budget_id`, so they're attributed by column — one per dimension, all four covered: `cost_center` → `Invoice.cost_center`, `gl_account` → `Invoice.gl_account`, `department` → `Invoice.department`, `project` → `Invoice.project`. Only invoices in a realised status count — `models/invoice_status.APPROVED_OR_BEYOND_STATUSES`: `approved`, `sending_to_erp`, `sent_to_erp`, `posted_in_erp`, `payment_scheduled`, `paid`, `done` — so a new/rejected invoice never inflates actual. (`sending_to_erp` was missing from a hand-listed copy until issue #575, so an invoice dropped out of actual while its ERP push was in flight or stuck.) `failed` counts too, **only with** `Invoice.approval_date` set — an approved invoice whose ERP push failed is still signed-off spend, while an unstamped `failed` is a failed extraction nobody reviewed (`budget_service.realised_invoice_clause`, the same evidence rule as analytics' touchless rate; `docs/decisions.md` §308). When the budget sets both `period_start`/`period_end`, actual is further bounded to invoices dated inside that window (so a Q1 and a Q2 budget on the same dimension don't both report all-time spend). |
 | **remaining** | `allocated - committed - actual` (negative = overspend). |
 | **utilization_pct** | `(committed + actual) / allocated * 100`, 2 dp. `0` when allocated is 0. |
 
@@ -178,7 +188,7 @@ Every list/read is entity-scoped (`X-Entity-ID`) and tenant-isolated
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/budgets` | Paginated, entity-scoped list. Filters: `dimension`, `period`; `search` (ILIKE on name + dimension_value). |
+| GET | `/budgets` | Paginated, entity-scoped list. Filters: `dimension`, `period`, `currency` (case-insensitive ISO code — the requisition form's budget picker asks for exactly the budgets its currency may link); `search` (ILIKE on name + dimension_value). `/summary` takes the same filters. |
 | GET | `/budgets/summary` | Whole-set KPI rollup — count + per-currency allocation totals (exact decimal strings, never a cross-currency SUM, never FX-converted). Shares `_budget_list_filters` with the list so the `/budgets` "Total allocated" card can't describe a different set than the table. Groups are ordered by currency code, and each page headlines the first one with the rest on a sub-line — so which currency headlines is alphabetical, never largest-total. |
 | POST | `/budgets` | Create. Audited `budget.created`. |
 | GET | `/budgets/rollup` | **Org-wide budget vs actual** — whole-set allocated / committed / actual / remaining, grouped by currency, computed on read. Shares `_budget_list_filters` + the entity scope with the list. Money is exact decimal strings; never summed across currencies, never FX-converted on a read. Rendered on `/cfo`. |
@@ -187,6 +197,14 @@ Every list/read is entity-scoped (`X-Entity-ID`) and tenant-isolated
 | GET | `/budgets/{id}/spend` | Computed allocated / committed / actual / remaining / utilization rollup. |
 | PATCH | `/budgets/{id}` | Update changed fields. Audited `budget.updated`. Changing `currency` is a **422** while any non-cancelled linked requisition is in another currency — the mirror of the requisition-side link guard, since the legs never convert and those requisitions would silently drop out of `committed`. |
 | DELETE | `/budgets/{id}` | Delete. Audited `budget.deleted`. **409** while any requisition (any status) still links to it — the FK would otherwise surface as a 500, and the link is the record of what the spend was raised against. |
+
+**The PO-relief join.** The relief leg of `committed`
+(`_invoice_po_attribution`) matches invoices to the budgets' converted POs on
+`po_number` and narrows the invoice side with `po_number IN (<those POs'
+numbers>)`. That column is indexed since `0137_invoice_po_number_index`
+(`ix_invoices_po_number`); `tests/test_invoice_po_number_index.py` shows the
+relief predicate is an `Index Cond` on it. Unlike 0090, nothing was timed for
+0137: the 40k-invoice before/after for the relief leg has not been taken.
 
 ### `GET /budgets/rollup` contract
 
@@ -282,6 +300,20 @@ GET /api/budgets/check?budget_id=<uuid>&amount=1500.00
 decides whether to warn or hard-stop. All math is `Decimal`; an unknown
 `budget_id` is a 404.
 
+The requisition form (`RequisitionModal`) calls it — through
+`lib/api/budgets.ts::checkBudget` — while a draft is being edited, debounced
+300 ms behind the chosen budget and the line total, with the total sent as an
+exact decimal string (`utils/money.ts::sumMoneyExact`, never the display
+float). It warns and does not block: an overspend renders as a `FieldWarning`
+and the save still goes through. Only a draft is checked, since a draft is not
+yet in `committed` and a submitted requisition already is. The check takes no
+currency, so the form never reads its answer across currencies: the picker
+lists only budgets in the requisition's currency (`?currency=`), and if the
+currency field later moves off the linked budget's, or the check answers in
+another currency, the form says so and refuses to save (the backend would
+422) rather than comparing the two at face value
+(`utils/budgetPicker.ts::budgetCheckView`).
+
 ## Frontend
 
 **`/cfo` — org-wide budget vs actual.** A `Budget vs actual` card over
@@ -302,3 +334,11 @@ budgets. Clicking a row opens `BudgetModal`, which loads the per-budget spend
 rollup (`GET /{id}/spend`) and renders it as KPI cards + a utilization bar
 (green < 80% / amber ≥ 80% / red ≥ 100%) over the allocated/committed/actual/
 remaining breakdown. Create/edit/delete are gated to admin/cfo.
+
+**`/requisitions` — linking a requisition to a budget.** The requisition form
+carries a `ui/BudgetPicker` (a `SearchPicker` over `GET /budgets?currency=`)
+and the overspend pre-check above. It is offered to admin / ap_manager / cfo,
+the roles that may read budgets; an `ap_clerk` gets no picker, and their save
+never sends `budget_id`, so a link a manager made survives a clerk's edit. On
+an edit, `budget_id` is sent only when the picker changed it. e2e:
+`tests-e2e/requisitions/budget-link.spec.ts`.

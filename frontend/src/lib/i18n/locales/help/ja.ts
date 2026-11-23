@@ -4,7 +4,7 @@ import type { HelpMessages } from '../../messages';
 // diagram labels under `help.*` — all of them but `help.pageLink` and
 // `help.tip.*`, which every page's chrome reads and so stay in the main
 // catalogue. Split out because it is ~9 KB gzipped per locale that only the
-// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureHelpCatalogue()` in store.svelte.ts;
+// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureSlices('help')` in store.svelte.ts;
 // `satisfies HelpMessages` makes a missing or extra key a compile error.
 export const messages = {
 	'help.title': 'ヘルプセンター',
@@ -63,7 +63,6 @@ export const messages = {
 	'help.note.role': '実行できるロール',
 	'help.glossary.title': '用語集',
 	'help.glossary.intro': '{product} で使われる買掛金業務の用語と、ここでの意味。',
-	'help.glossary.topic': 'トピック',
 	'help.glossary.allTopics': 'すべてのトピック',
 	'help.glossary.aliases': '別名:',
 	'help.glossary.related': '関連項目:',
@@ -103,7 +102,7 @@ export const messages = {
 	'help.term.credit-memo': '貸方票',
 	'help.term.credit-memo.short': '支払額を減らす取引先発行の書類。同じ取引先の未払請求書に適用します。',
 	'help.term.duplicate-invoice': '重複請求書',
-	'help.term.duplicate-invoice.short': '二重に登録された請求書。FeohLedgerは重複の疑いを検知し、解決まで支払いを止めます。',
+	'help.term.duplicate-invoice.short': '二重に登録された請求書。FeohLedgerは重複の疑いを検知し、解決まで支払いと ERP への送信を止めます。',
 	'help.term.purchase-order': '発注書',
 	'help.term.purchase-order.short': '取引先への正式な注文。品目、数量、価格を記載します。',
 	'help.term.goods-receipt': '入荷',
@@ -328,7 +327,7 @@ export const messages = {
 	'help.term.line-total-mismatch': '明細合計の不一致',
 	'help.term.line-total-mismatch.short': '請求書の明細の合計が請求額と一致しない状態です。解決されるまで支払いが止まります。',
 	'help.term.fraud-flag': '不正の疑い',
-	'help.term.fraud-flag.short': '請求書や支払いに不正の兆候があるときに作成される例外です。解決されるまで支払いが止まります。',
+	'help.term.fraud-flag.short': '請求書や支払いに不正の兆候があるときに作成される例外です。解決されるまで支払いと ERP への送信が止まります。',
 	'help.term.expense-policy': '経費ポリシー',
 	'help.term.expense-policy.short': '上限、領収書、事前承認など、従業員が申請できる内容のルールです。すべての経費で確認されます。',
 	'help.term.spend-preapproval': '支出の事前承認',

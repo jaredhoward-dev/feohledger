@@ -28,16 +28,18 @@
 
 <LegalPage
 	title="Cookie Notice"
-	intro="{OPERATOR.serviceName} does not set cookies. This notice explains what the app stores in your browser instead, why that storage is still covered by the same law that governs cookies, and how to control the one category of it that is optional."
+	intro="{OPERATOR.serviceName} sets one cookie, and only to remember your colour theme. This notice explains what else the app stores in your browser, why that storage is covered by the same law that governs cookies, and how to control the one category of it that is optional."
 >
 	<h2 id="summary">1. In short</h2>
 	<p>
-		{OPERATOR.serviceName} sets no cookies. Everything the app keeps in your browser is <strong
+		{OPERATOR.serviceName} sets a single cookie, <code>feoh_theme</code>, which holds the colour
+		theme you picked and nothing else. Everything else the app keeps in your browser is <strong
 			>Web Storage</strong
 		>
-		— <code>localStorage</code> or <code>sessionStorage</code> — never an HTTP cookie. There are six
-		such items in total, listed in full in the table below. Four of them exist only to keep you signed
-		in or to remember a choice you made (your language, which legal entity you're viewing); none of
+		— <code>localStorage</code> or <code>sessionStorage</code> — not a cookie. There are eight
+		items in total, listed in full in the table below. Five of them exist only to keep you signed
+		in or to remember a choice you made (your language, your colour theme, which legal entity you're
+		viewing); none of
 		them exist for advertising, and none of them exist for analytics or tracking, because {OPERATOR.serviceName}
 		does not run any analytics or tracking code anywhere in the app today. The consent banner you may
 		see offers a category reserved for that kind of storage in case it is ever added — nothing is loaded
@@ -49,7 +51,7 @@
 		>.
 	</p>
 
-	<h2 id="scope">2. Why this notice exists even though there are no cookies</h2>
+	<h2 id="scope">2. Why this notice covers more than cookies</h2>
 	<p>
 		The EU ePrivacy Directive (2002/58/EC, Article 5(3), implemented in national law such as the
 		UK's Privacy and Electronic Communications Regulations) is not written around cookies
@@ -69,7 +71,8 @@
 	<p>
 		This is the complete list. Nothing else is written to <code>localStorage</code> or
 		<code>sessionStorage</code>
-		by the {OPERATOR.serviceName} application, and the application sets no cookies at all.
+		by the {OPERATOR.serviceName} application, and the only cookie it sets is
+		<code>feoh_theme</code>.
 	</p>
 	<div class="table-scroll" tabindex="0" role="region" aria-labelledby="inventory">
 		<table>
@@ -132,6 +135,24 @@
 					<td>Until you change your language again. No automatic expiry.</td>
 				</tr>
 				<tr>
+					<td><code>feoh_theme</code></td>
+					<td>Cookie (first-party), or localStorage where a cookie cannot be shared</td>
+					<td>
+						Remembers the colour theme you picked for the interface: System (follow your
+						device's setting), Light or Dark. On the {OPERATOR.serviceName} domain it is a cookie
+						set on the whole domain, so the choice you make on one workspace, or on the signup
+						page, also applies on your other workspaces. It holds only that one word and is not
+						used to identify you. On a company's own custom domain, or where your browser refuses
+						the cookie, it is kept in localStorage for that site alone, and choosing System removes
+						it.
+					</td>
+					<td>Functional / necessary for the feature it supports</td>
+					<td>
+						The cookie: one year from the last time you chose a theme. The localStorage entry:
+						until you change your theme again, with no automatic expiry.
+					</td>
+				</tr>
+				<tr>
 					<td><code>feoh_consent_choice</code></td>
 					<td>localStorage</td>
 					<td>
@@ -159,6 +180,49 @@
 						Removed as soon as you complete or cancel the second factor; <code
 							>sessionStorage</code
 						> also clears itself the moment the browser tab closes, whether or not that happens.
+					</td>
+				</tr>
+				<tr>
+					<td><code>auth_next</code></td>
+					<td>sessionStorage</td>
+					<td>
+						Remembers the page inside the app you were opening (a path such as an invoice link)
+						while you sign in through your organization's single sign-on provider, so you land
+						back on it afterwards.
+					</td>
+					<td>Strictly necessary</td>
+					<td>
+						Removed as soon as you return from the sign-on provider, whether or not sign-in
+						succeeded; <code>sessionStorage</code> also clears itself when the browser tab closes.
+					</td>
+				</tr>
+				<tr>
+					<td><code>billing_pending_plan</code></td>
+					<td>sessionStorage</td>
+					<td>
+						Remembers which plan you were moving to, and the card setup it belongs to, while
+						your card is confirmed with the payment provider — so if the provider sends you away
+						to approve the card and back again, the plan change you asked for still happens. It
+						holds a plan name and a card-setup reference, never card details.
+					</td>
+					<td>Strictly necessary</td>
+					<td>
+						Removed as soon as you return from the payment provider, whether or not the card was
+						confirmed; <code>sessionStorage</code> also clears itself when the browser tab closes.
+					</td>
+				</tr>
+				<tr>
+					<td><code>verifyToken</code></td>
+					<td>sessionStorage (page history state)</td>
+					<td>
+						Holds the one-time verification token from your sign-up email for that browser tab,
+						after it is removed from the address bar, so reloading the verification page still
+						works.
+					</td>
+					<td>Strictly necessary</td>
+					<td>
+						Kept with that tab's history entry for the verification page only;
+						<code>sessionStorage</code> clears itself when the browser tab closes.
 					</td>
 				</tr>
 			</tbody>
@@ -252,7 +316,8 @@
 	<p>
 		The supplier portal — the separate sign-in your vendors use to submit and track their own
 		invoices — runs on the same static frontend and uses the identical storage model described
-		here: a JWT in localStorage (<code>portal_auth_token</code>), no cookies, no analytics.
+		here: a JWT in localStorage (<code>portal_auth_token</code>), no cookie but the theme one, no
+		analytics.
 		Everything in this notice applies to it too.
 	</p>
 	<p>

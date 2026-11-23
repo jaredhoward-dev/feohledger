@@ -5,7 +5,9 @@ the admin password reset (`POST /api/admin/users/{id}/reset-password`).
 Regression coverage for issue #158: a `user.manage`-only actor must not be able
 to (a) grant a role carrying more authority than they hold — most importantly
 the system `admin` role — or (b) set an account's password at all: since #566
-the reset only ever issues a generated temp the owner must change. The pure
+the reset never takes a typed value, and since the set-password links
+(decisions §283) it clears the password and emails the owner a single-use link
+— the admin never holds a credential. The pure
 guard tests take lightweight stand-ins for the caller (`.roles` /
 `.effective_permissions`) and Role rows; the endpoint tests run on `realdb`.
 """
@@ -109,8 +111,9 @@ def test_grant_guard_falls_back_when_effective_permissions_missing():
 
 
 # --------------------------------------------------------------------------
-# Issue #566 — the admin password reset is a dedicated action that issues a
-# GENERATED temp the user must change, never an admin-typed value via PATCH.
+# Issue #566 — the admin password reset is a dedicated action, never an
+# admin-typed value via PATCH. Since decisions §283 it clears the password and
+# emails the owner a single-use set-password link instead of a generated temp.
 # The typed path let the admin permanently know the password, never forced a
 # change, and — because the Edit form carried the field — let a browser
 # autofill the admin's own saved password into it, so saving an unrelated edit
@@ -185,12 +188,38 @@ def test_update_user_request_schema_no_longer_publishes_password():
     assert "password" not in UpdateUserRequest.model_json_schema()["properties"]
 
 
+async def _give_password(realdb, user_id, password: str) -> None:
+    from app.models.user import User
+    from app.utils.passwords import hash_password
+
+    async with realdb.control_sessionmaker()() as s:
+        row = (await s.execute(select(User).where(User.id == uuid.UUID(str(user_id))))).scalar_one()
+        row.hashed_password = await hash_password(password)
+        await s.commit()
+
+
+async def _reset_rows(realdb, target_id):
+    async with realdb.sessionmaker("a")() as s:
+        return (
+            (
+                await s.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "user.password_reset",
+                        AuditLog.entity_id == uuid.UUID(str(target_id)),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
 @pytest.mark.asyncio
-async def test_admin_reset_issues_forced_change_temp_and_revokes_sessions(realdb, monkeypatch):
-    """The whole contract: a generated temp that satisfies the platform policy,
-    `must_change_password` set, every session of the target revoked, the temp
-    actually authenticating, and a PII-free audit row."""
-    from app.utils.passwords import validate_password_complexity, verify_password
+async def test_admin_reset_clears_the_password_mails_a_link_and_revokes(realdb, monkeypatch):
+    """The whole contract: the old password dies at once, no credential is on
+    the response, the owner is mailed a single-use link to the plain reset page,
+    every session of the target is revoked, and a PII-free audit row."""
+    from tests.set_password_mail import capture_outbox, link_mode, link_token
 
     calls: list = []
 
@@ -203,53 +232,46 @@ async def test_admin_reset_issues_forced_change_temp_and_revokes_sessions(realdb
     async with realdb.client(key="a", role="admin") as c:
         target_id = await _throwaway_clerk(c)
         try:
-            # Simulate the user having already replaced their invite temp.
-            from app.models.user import User
-
-            async with realdb.control_sessionmaker()() as s:
-                row = (
-                    await s.execute(select(User).where(User.id == uuid.UUID(target_id)))
-                ).scalar_one()
-                row.must_change_password = False
-                await s.commit()
+            await _give_password(realdb, target_id, "Previously-Set9")
+            sent = capture_outbox(monkeypatch)
 
             resp = await c.post(f"/api/admin/users/{target_id}/reset-password")
             assert resp.status_code == 200, resp.text
             body = resp.json()
-            temp = body["temporary_password"]
             assert body["id"] == target_id
-            validate_password_complexity(temp)  # same policy as every password
+            assert "temporary_password" not in body
+            assert body["set_password_link_expires_at"]
+            assert body["sessions_revoked"] is True
 
             stored = await _stored_user(realdb, target_id)
-            assert stored.must_change_password is True
-            assert await verify_password(temp, stored.hashed_password)
+            assert stored.hashed_password is None
+            assert stored.must_change_password is False
             assert calls == [uuid.UUID(target_id)]
 
-            async with realdb.sessionmaker("a")() as s:
-                row = (
-                    await s.execute(
-                        select(AuditLog).where(
-                            AuditLog.action == "user.password_reset",
-                            AuditLog.entity_id == uuid.UUID(target_id),
-                        )
-                    )
-                ).scalar_one()
+            assert len(sent) == 1
+            assert sent[0].to == stored.email
+            token = link_token(sent[0])
+            assert link_mode(sent[0]) is None  # "set a new password" copy
+            assert token not in resp.text
+
+            (row,) = await _reset_rows(realdb, target_id)
             assert row.actor_id == realdb.info("a").users["admin"]
             assert row.details == {
                 "changed_fields": ["password"],
-                "must_change_password": True,
+                "delivery": "set_password_link",
                 "sessions_revoked": 1,
             }
-            assert temp not in str(row.details)
+            assert token not in str(row.details)
         finally:
             await c.delete(f"/api/admin/users/{target_id}")
 
 
 @pytest.mark.asyncio
-async def test_admin_reset_temp_signs_in_and_is_forced_to_change(realdb, monkeypatch):
-    """End to end through the real login: the temp authenticates, the session
-    says the password must change, `/change-password` replaces it, and the temp
-    is dead afterwards."""
+async def test_admin_reset_link_sets_a_new_password_and_the_old_one_is_dead(realdb, monkeypatch):
+    """End to end through the real login: the old password stops working at
+    the reset, the link sets the owner's own password once, and they sign in
+    with no forced change."""
+    from tests.set_password_mail import capture_outbox, link_token
     from tests.test_session_management import FakeRedis
 
     fake = FakeRedis()
@@ -261,44 +283,82 @@ async def test_admin_reset_temp_signs_in_and_is_forced_to_change(realdb, monkeyp
 
     async with realdb.client(key="a", role="admin") as c:
         target_id = await _throwaway_clerk(c)
+        await _give_password(realdb, target_id, "Previously-Set9")
         email = (await _stored_user(realdb, target_id)).email
+        sent = capture_outbox(monkeypatch)
         reset = await c.post(f"/api/admin/users/{target_id}/reset-password")
         assert reset.status_code == 200, reset.text
-        temp = reset.json()["temporary_password"]
+    token = link_token(sent[0])
 
     try:
         async with realdb.client(key="a", role=None) as anon:
-            login = await anon.post("/api/auth/login", json={"email": email, "password": temp})
-            assert login.status_code == 200, login.text
-            token = login.json()["access_token"]
-            auth = {"Authorization": f"Bearer {token}"}
-            me = await anon.get("/api/auth/me", headers=auth)
-            assert me.json()["must_change_password"] is True
-
-            changed = await anon.post(
-                "/api/auth/change-password",
-                json={"current_password": temp, "new_password": "OwnerChosen-Pass9"},
-                headers=auth,
+            stale = await anon.post(
+                "/api/auth/login", json={"email": email, "password": "Previously-Set9"}
             )
-            assert changed.status_code == 200, changed.text
-            assert changed.json()["must_change_password"] is False
-
-            stale = await anon.post("/api/auth/login", json={"email": email, "password": temp})
             assert stale.status_code == 401
+
+            done = await anon.post(
+                "/api/auth/reset-password",
+                json={"token": token, "new_password": "OwnerChosen-Pass9"},
+            )
+            assert done.status_code == 200, done.text
+            replay = await anon.post(
+                "/api/auth/reset-password",
+                json={"token": token, "new_password": "Another-Chosen9"},
+            )
+            assert replay.status_code == 400
+
             fresh = await anon.post(
                 "/api/auth/login", json={"email": email, "password": "OwnerChosen-Pass9"}
             )
             assert fresh.status_code == 200, fresh.text
+            assert fresh.json()["must_change_password"] is False
     finally:
         async with realdb.client(key="a", role="admin") as c:
             await c.delete(f"/api/admin/users/{target_id}")
 
 
 @pytest.mark.asyncio
+async def test_admin_reset_supersedes_earlier_links_and_a_redemption_kills_siblings(
+    realdb, monkeypatch
+):
+    """No link outlives the password it was for: a reset kills the unused
+    invite link, and redeeming one link kills every other outstanding one."""
+    from app.services import password_reset
+    from tests.set_password_mail import capture_outbox, link_token
+
+    sent = capture_outbox(monkeypatch)
+    async with realdb.client(key="a", role="admin") as c:
+        target_id = await _throwaway_clerk(c)
+        try:
+            invite_token = link_token(sent[0])
+            reset = await c.post(f"/api/admin/users/{target_id}/reset-password")
+            assert reset.status_code == 200, reset.text
+            reset_token = link_token(sent[1])
+            sibling = await password_reset.issue_reset_token(uuid.UUID(target_id))
+
+            async with realdb.client(key="a", role=None) as anon:
+                stale = await anon.post(
+                    "/api/auth/reset-password",
+                    json={"token": invite_token, "new_password": "Stale-Link-Pass9"},
+                )
+                assert stale.status_code == 400
+                done = await anon.post(
+                    "/api/auth/reset-password",
+                    json={"token": reset_token, "new_password": "Fresh-Link-Pass9"},
+                )
+                assert done.status_code == 200, done.text
+                gone = await anon.post("/api/auth/reset-password/check", json={"token": sibling})
+                assert gone.status_code == 400
+        finally:
+            await c.delete(f"/api/admin/users/{target_id}")
+
+
+@pytest.mark.asyncio
 async def test_admin_reset_survives_a_failed_session_revoke(realdb, monkeypatch):
-    """The temp is shown only on this response, and the password is already
-    replaced when the revoke runs — so a Redis failure there must not become a
-    500 that locks the user out with no audit row. It is reported instead."""
+    """The password is already cleared and the link already mailed when the
+    revoke runs — so a Redis failure there must not become a 500 that hides a
+    reset that happened. It is reported instead."""
 
     async def _broken_revoke(user_id):
         raise ConnectionError("redis unreachable")
@@ -310,18 +370,9 @@ async def test_admin_reset_survives_a_failed_session_revoke(realdb, monkeypatch)
         try:
             resp = await c.post(f"/api/admin/users/{target_id}/reset-password")
             assert resp.status_code == 200, resp.text
-            assert resp.json()["temporary_password"]
             assert resp.json()["sessions_revoked"] is False
 
-            async with realdb.sessionmaker("a")() as s:
-                row = (
-                    await s.execute(
-                        select(AuditLog).where(
-                            AuditLog.action == "user.password_reset",
-                            AuditLog.entity_id == uuid.UUID(target_id),
-                        )
-                    )
-                ).scalar_one()
+            (row,) = await _reset_rows(realdb, target_id)
             assert row.details["sessions_revoked"] is None
         finally:
             # DELETE revokes sessions too — give cleanup a working one. (Not
@@ -330,6 +381,61 @@ async def test_admin_reset_survives_a_failed_session_revoke(realdb, monkeypatch)
                 return []
 
             monkeypatch.setattr("app.api.admin.revoke_user_sessions", _ok_revoke)
+            await c.delete(f"/api/admin/users/{target_id}")
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_email_failure_changes_nothing(realdb, monkeypatch):
+    """The email is the link's only channel: a failed send is a 502, the old
+    password keeps working, no session is revoked and nothing is audited."""
+    from app.utils.passwords import verify_password
+    from tests.set_password_mail import capture_outbox
+
+    calls: list = []
+
+    async def _fake_revoke(user_id):
+        calls.append(user_id)
+        return []
+
+    monkeypatch.setattr("app.api.admin.revoke_user_sessions", _fake_revoke)
+
+    async with realdb.client(key="a", role="admin") as c:
+        target_id = await _throwaway_clerk(c)
+        try:
+            await _give_password(realdb, target_id, "Previously-Set9")
+            capture_outbox(monkeypatch, fail=True)
+            resp = await c.post(f"/api/admin/users/{target_id}/reset-password")
+            assert resp.status_code == 502, resp.text
+            assert resp.json()["detail"]["code"] == "set_password_email_failed"
+
+            stored = await _stored_user(realdb, target_id)
+            assert await verify_password("Previously-Set9", stored.hashed_password)
+            assert calls == []
+            assert await _reset_rows(realdb, target_id) == []
+        finally:
+            capture_outbox(monkeypatch)
+            await c.delete(f"/api/admin/users/{target_id}")
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_without_a_tenant_url_changes_nothing(realdb, monkeypatch):
+    from app.config import settings as cfg
+    from app.utils.passwords import verify_password
+    from tests.set_password_mail import capture_outbox
+
+    async with realdb.client(key="a", role="admin") as c:
+        target_id = await _throwaway_clerk(c)
+        try:
+            await _give_password(realdb, target_id, "Previously-Set9")
+            sent = capture_outbox(monkeypatch)
+            monkeypatch.setattr(cfg, "tenant_url_template", "", raising=True)
+            resp = await c.post(f"/api/admin/users/{target_id}/reset-password")
+            assert resp.status_code == 503, resp.text
+            assert resp.json()["detail"]["code"] == "set_password_link_unavailable"
+            assert sent == []
+            stored = await _stored_user(realdb, target_id)
+            assert await verify_password("Previously-Set9", stored.hashed_password)
+        finally:
             await c.delete(f"/api/admin/users/{target_id}")
 
 
@@ -864,9 +970,8 @@ async def _make_user_manage_principal(client, org_id):
 
 @pytest.mark.asyncio
 async def test_user_manage_only_caller_cannot_reset_an_admins_password(realdb):
-    """The headline takeover: reset the org admin's password and receive the
-    temp, then sign in as them. Must be 403, and the admin's stored hash must
-    be untouched."""
+    """The headline takeover: reset the org admin's password, then steer the
+    account. Must be 403, and the admin's stored hash must be untouched."""
     from app.models.user import User
 
     info = realdb.info("a")
@@ -887,7 +992,6 @@ async def test_user_manage_only_caller_cannot_reset_an_admins_password(realdb):
                 headers={"Authorization": f"Bearer {token}"},
             )
             assert resp.status_code == 403, resp.text
-            assert "temporary_password" not in resp.text
 
             async with ctrl() as s:
                 after = (
@@ -968,7 +1072,7 @@ async def test_user_manage_only_caller_may_still_manage_a_lesser_user(realdb):
         try:
             resp = await c.post(f"/api/admin/users/{clerk_id}/reset-password", headers=auth)
             assert resp.status_code == 200, resp.text
-            assert resp.json()["temporary_password"]
+            assert resp.json()["set_password_link_expires_at"]
         finally:
             await c.delete(f"/api/admin/users/{clerk_id}")
             await c.delete(f"/api/admin/users/{actor_id}")
@@ -1175,4 +1279,190 @@ async def test_admin_can_self_demote_when_another_active_admin_exists(realdb):
                 headers=second_auth,
             )
             assert restore.status_code == 200, restore.text
-            await c.delete(f"/api/admin/users/{second_id}", headers=second_auth)
+            # As the restored original admin: the second admin deleting
+            # itself is "Cannot delete yourself" (409), which this cleanup
+            # used to send unchecked — leaking an active admin into org A and
+            # silently defeating every later sole-admin test in the session.
+            cleanup = await c.delete(f"/api/admin/users/{second_id}")
+            assert cleanup.status_code == 204, cleanup.text
+
+
+# --------------------------------------------------------------------------
+# Persona-admin finding: who was deleted, and what a change was FROM. The
+# `user.deleted` row used to carry only the bare id of a row that no longer
+# exists, the bulk path wrote it after the commit (a failed write lost it while
+# the delete stood), and `user.updated` recorded only the new role list.
+# --------------------------------------------------------------------------
+
+
+async def _audit_rows(realdb, action, entity_id):
+    async with realdb.sessionmaker("a")() as s:
+        return (
+            (
+                await s.execute(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.action == action,
+                        AuditLog.entity_id == uuid.UUID(str(entity_id)),
+                    )
+                    .order_by(AuditLog.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _user_exists(realdb, user_id) -> bool:
+    from app.models.user import User
+
+    async with realdb.control_sessionmaker()() as s:
+        return await s.get(User, uuid.UUID(str(user_id))) is not None
+
+
+async def _invite(c, *, roles):
+    email = f"audit-{uuid.uuid4().hex[:8]}@acme.test"
+    resp = await c.post(
+        "/api/admin/users", json={"email": email, "full_name": "Audit Subject", "role_names": roles}
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"], email
+
+
+@pytest.mark.asyncio
+async def test_user_deleted_row_says_who_the_account_was(realdb):
+    async with realdb.client(key="a", role="admin") as c:
+        target_id, email = await _invite(c, roles=["ap_clerk"])
+        assert (await c.delete(f"/api/admin/users/{target_id}")).status_code == 204
+
+    (row,) = await _audit_rows(realdb, "user.deleted", target_id)
+    assert row.details == {"email": email, "role_names": ["ap_clerk"], "was_active": True}
+
+
+@pytest.mark.asyncio
+async def test_a_delete_the_trail_cannot_record_is_not_made(realdb):
+    """The record is written before the delete commits; a failed write refuses it."""
+
+    async def _down(**_kwargs):
+        raise RuntimeError("tenant DB unavailable")
+
+    async with realdb.client(key="a", role="admin") as c:
+        target_id, _ = await _invite(c, roles=[])
+        # Scoped patches, never `monkeypatch.undo()`: that would also undo the
+        # autouse Redis stub, and the next request would reach a real client.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("app.api.admin.record_auth_audit_or_raise", _down)
+            resp = await c.delete(f"/api/admin/users/{target_id}")
+        assert resp.status_code == 503, resp.text
+        assert await _user_exists(realdb, target_id)
+        assert await _audit_rows(realdb, "user.deleted", target_id) == []
+        assert (await c.delete(f"/api/admin/users/{target_id}")).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_records_each_row_with_its_identity(realdb):
+    async with realdb.client(key="a", role="admin") as c:
+        first_id, first_email = await _invite(c, roles=["ap_clerk"])
+        second_id, second_email = await _invite(c, roles=[])
+        resp = await c.post(
+            "/api/admin/users/bulk-delete", json={"user_ids": [first_id, second_id]}
+        )
+    assert resp.status_code == 200, resp.text
+    assert sorted(resp.json()["deleted"]) == sorted([first_id, second_id])
+
+    (first,) = await _audit_rows(realdb, "user.deleted", first_id)
+    (second,) = await _audit_rows(realdb, "user.deleted", second_id)
+    assert first.details == {"email": first_email, "role_names": ["ap_clerk"], "was_active": True}
+    assert second.details == {"email": second_email, "role_names": [], "was_active": True}
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_keeps_a_row_whose_record_cannot_be_written(realdb):
+    """Each row's delete and its record stand or fall together: a failed write
+    undoes only that row's delete, and the rest of the batch still lands."""
+    from app.services import audit_dispatch
+
+    real_write = audit_dispatch.record_auth_audit_or_raise
+
+    async with realdb.client(key="a", role="admin") as c:
+        kept_id, _ = await _invite(c, roles=[])
+        gone_id, _ = await _invite(c, roles=[])
+
+        async def _fail_for_kept(**kwargs):
+            if str(kwargs["entity_id"]) == kept_id:
+                raise RuntimeError("tenant DB unavailable")
+            await real_write(**kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("app.api.admin.record_auth_audit_or_raise", _fail_for_kept)
+            resp = await c.post(
+                "/api/admin/users/bulk-delete", json={"user_ids": [kept_id, gone_id]}
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["deleted"] == [gone_id]
+        assert body["failed"] == [
+            {"user_id": kept_id, "reason": "audit_unavailable", "references": None}
+        ]
+        assert await _user_exists(realdb, kept_id)
+        assert not await _user_exists(realdb, gone_id)
+        assert (await c.delete(f"/api/admin/users/{kept_id}")).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_user_updated_records_roles_active_and_email_before_and_after(realdb, monkeypatch):
+    async def _fake_revoke(_user_id):
+        return []
+
+    monkeypatch.setattr("app.api.admin.revoke_user_sessions", _fake_revoke)
+    async with realdb.client(key="a", role="admin") as c:
+        target_id, email = await _invite(c, roles=["ap_clerk"])
+        new_email = f"renamed-{uuid.uuid4().hex[:8]}@acme.test"
+        resp = await c.patch(
+            f"/api/admin/users/{target_id}",
+            json={"role_names": ["ap_manager"], "is_active": False, "email": new_email},
+        )
+        assert resp.status_code == 200, resp.text
+        await c.delete(f"/api/admin/users/{target_id}")
+
+    (row,) = await _audit_rows(realdb, "user.updated", target_id)
+    details = row.details
+    assert sorted(details["changed_fields"]) == ["email", "is_active", "role_names"]
+    assert details["previous_role_names"] == ["ap_clerk"]
+    assert details["role_names"] == ["ap_manager"]
+    assert details["previous_is_active"] is True
+    assert details["is_active"] is False
+    assert details["previous_email"] == email
+    assert details["email"] == new_email
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_reports_a_last_admin_refusal_per_row(realdb):
+    """Through HTTP a bulk delete can only hit the last-admin guard under
+    concurrency (the caller is an admin and is never deleted), which
+    `tests/test_admin_lockout.py` drives for real. Here the guard's verdict is
+    forced so the per-row mapping is pinned: that row fails as `last_admin`,
+    is not deleted, and the rest of the batch still lands."""
+    from app.services.admin_lockout import LastAdminLockout
+
+    async with realdb.client(key="a", role="admin") as c:
+        refused_id, _ = await _invite(c, roles=["admin"])
+        gone_id, _ = await _invite(c, roles=[])
+
+        async def _refuse_one(_db, *, target_id, **_kwargs):
+            if str(target_id) == refused_id:
+                raise LastAdminLockout()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("app.api.admin.guard_against_last_admin_lockout", _refuse_one)
+            resp = await c.post(
+                "/api/admin/users/bulk-delete", json={"user_ids": [refused_id, gone_id]}
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["deleted"] == [gone_id]
+        assert body["failed"] == [
+            {"user_id": refused_id, "reason": "last_admin", "references": None}
+        ]
+        assert await _user_exists(realdb, refused_id)
+        assert (await c.delete(f"/api/admin/users/{refused_id}")).status_code == 204

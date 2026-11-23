@@ -1,4 +1,6 @@
-import { expect, test } from '../fixtures/helpers';
+import type { VendorChangeRequest } from '#lib/types/vendor.ts';
+import type { Page } from '@playwright/test';
+import { expect, NO_TENANT_BASE, test } from '../fixtures/helpers';
 
 /**
  * Screen-reader navigability guard (the automatable leg of the manual AT pass).
@@ -121,15 +123,18 @@ test.describe('screen-reader navigability — core flow', () => {
 			change_type: 'bank_details',
 			status: 'pending',
 			proposed_value: { bank_name: 'Focus Bank', account_last4: '1234' },
-			// A portal-submitted request, so the admin is not the proposer and
-			// the segregation-of-duties gate leaves Approve enabled.
+			// A portal-submitted request, so the admin is not the proposer…
 			requested_by_vendor_user_id: '00000000-0000-4000-b002-0000000000f1',
 			requested_by_user_id: null,
 			reviewed_by_user_id: null,
 			reviewed_at: null,
 			review_note: null,
-			created_at: '2026-01-01T00:00:00Z'
-		};
+			created_at: '2026-01-01T00:00:00Z',
+			// …and the server's verdict on approving it is "accepted". The page
+			// offers Approve from this field alone (issue #575), so a row without
+			// it renders no Approve at all.
+			approve_refusal: null
+		} satisfies VendorChangeRequest;
 		let approved = false;
 		await page.route(
 			(url) =>
@@ -174,4 +179,44 @@ test.describe('screen-reader navigability — core flow', () => {
 
 		await expect(page.locator('main#main-content')).toBeFocused();
 	});
+});
+
+/**
+ * The pre-auth pages render inside `auth/AuthShell`, which owns their one
+ * `<main>` (1.3.1 / 2.4.1). The root layout's public branch renders them bare,
+ * so before the shell carried it they had no main landmark at all — and
+ * `ui/LoadError`'s Retry, which parks focus on `closest('main')`, had nowhere
+ * to land. Exactly one: a page that also wrapped itself would nest two.
+ */
+const AUTH_SHELL_PAGES_ON_TENANT = ['/login', '/login/forgot-password', '/verify'];
+const AUTH_SHELL_PAGES_ON_APEX = ['/signup', '/find-workspace'];
+
+async function expectOneAuthMain(page: Page) {
+	await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+	await expect(page.getByRole('main')).toHaveCount(1);
+	const main = page.locator('main#main-content');
+	await expect(main).toHaveAttribute('tabindex', '-1');
+	// The form and its heading are the main content; the brand panel is not.
+	await expect(main.getByRole('heading', { level: 1 })).toHaveCount(1);
+	await expect(main.locator('aside')).toHaveCount(0);
+}
+
+test.describe('auth shell landmark — workspace host', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+	for (const path of AUTH_SHELL_PAGES_ON_TENANT) {
+		test(`${path} has exactly one <main> (1.3.1)`, async ({ page }) => {
+			await page.goto(path);
+			await expectOneAuthMain(page);
+		});
+	}
+});
+
+test.describe('auth shell landmark — platform apex', () => {
+	test.use({ storageState: { cookies: [], origins: [] }, baseURL: NO_TENANT_BASE });
+	for (const path of AUTH_SHELL_PAGES_ON_APEX) {
+		test(`${path} has exactly one <main> (1.3.1)`, async ({ page }) => {
+			await page.goto(path);
+			await expectOneAuthMain(page);
+		});
+	}
 });

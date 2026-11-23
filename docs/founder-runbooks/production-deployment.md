@@ -82,7 +82,7 @@ AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml
 
 Required values for prod:
 - `FEOH_SECRET_KEY` — generate with `openssl rand -hex 32`
-- `FEOH_DATABASE_URL` — RDS endpoint from Terraform outputs
+- `FEOH_DATABASE_URL` — RDS endpoint from Terraform outputs, as the `feoh_app` role with no password, plus `FEOH_DATABASE_IAM_AUTH: "true"` (the master password stays in `infra-secrets` only — `deploy/README.md` § Database role)
 - `FEOH_REDIS_URL` — ElastiCache endpoint
 - `FEOH_S3_BUCKET` — Terraform-provisioned invoice bucket
 - `FEOH_ANTHROPIC_API_KEY` — your Claude Vision key
@@ -102,8 +102,10 @@ Required values for prod:
 cd infra
 # backend.config names the state bucket — see infra/README.md § Applying
 AWS_PROFILE=feohledger terraform init -backend-config=backend.config
-AWS_PROFILE=feohledger terraform plan -var-file=../../infra-secrets/feohledger/prod.tfvars -out=tfplan   # read this carefully
+# prod.tfvars.sops is sops-encrypted; exec-file decrypts it to a temp file for the plan only
+AWS_PROFILE=feohledger sops exec-file --no-fifo --filename prod.tfvars ../../infra-secrets/feohledger/prod.tfvars.sops 'terraform plan -var-file={} -out=tfplan'   # read this carefully
 AWS_PROFILE=feohledger terraform apply tfplan
+rm tfplan   # the saved plan holds the variable values in plaintext
 ```
 
 Expect errors on the first run. Common ones:

@@ -1,12 +1,13 @@
 <script lang="ts">
 	import { api } from '#lib/api.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import type { MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
 	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	// Aliased: this page already has a local `page` variable for the loaded
 	// vendor-list page number (below) — `$app/state`'s page is the URL/route
 	// store, unrelated, and the two names would otherwise collide.
@@ -28,12 +29,16 @@
 	import ImportCsvModal from '#lib/components/modals/ImportCsvModal.svelte';
 	import CreateVendorModal from '#lib/components/modals/CreateVendorModal.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
+	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
 	import InviteVendorPortalUserModal from '#lib/components/modals/InviteVendorPortalUserModal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import { isAllowed } from '#lib/api/actionVerdicts.ts';
 	import { PERM_VENDOR_MANAGE } from '#lib/types/admin.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import { importVendorsCsv, type PortalInviteResult } from '#lib/api/vendors.ts';
 	import {
 		VENDOR_STATUS_TONES,
@@ -49,7 +54,10 @@
 		exportVendorsCsv,
 		rejectVendor as rejectVendorRequest
 	} from '#lib/api/vendors.ts';
+	import { vendorSyncReportLines, type VendorSyncReport } from '#lib/utils/erpSyncReport.ts';
 	import { toastCardRevocations } from '#lib/utils/cardRevocationToast.ts';
+	import { vendorErpSyncOffer, type VendorErpSyncOffer } from '#lib/utils/vendorErpSync.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	type BankDetails = VendorBankDetails;
 
@@ -60,10 +68,9 @@
 	// granular permission, not a role check (mirrors the backend gate).
 	let showConsolidation = $state(false);
 	// Day-0 CSV import — `POST /api/vendors/import-csv` is
-	// `require_roles(ADMIN, AP_MANAGER)`, the same plain-role gate as the ERP
-	// sync button above, so this reuses `auth.isManager` rather than the
-	// granular `vendor.manage` permission (which could diverge under a
-	// custom role split).
+	// `require_permission(vendor.manage)`, like the ERP sync, so both are gated
+	// on `canManageVendors`, not the role list (which diverges under a custom
+	// role split).
 	let showImportCsv = $state(false);
 	const canManageVendors = $derived(auth.can(PERM_VENDOR_MANAGE));
 	// "+ New Vendor" — `POST /api/vendors` is `require_permission(vendor.manage)`,
@@ -74,8 +81,8 @@
 	// CSV import), hence `auth.isManager` not the granular permission.
 	let inviteVendor = $state<Vendor | null>(null);
 	// Confirmation of a sent invite. Deliberately NOT a credential: the backend
-	// no longer returns the temp password (it is emailed to the supplier), so
-	// there is nothing here to reveal-once, copy, or leave in the DOM.
+	// emails the supplier a set-password link and never returns it, so there is
+	// nothing here to reveal-once, copy, or leave in the DOM.
 	let inviteResult = $state<PortalInviteResult | null>(null);
 	let bankEditing = $state<Vendor | null>(null);
 	let bankForm = $state<BankDetails>({
@@ -132,8 +139,7 @@
 			toast(m('vendors.bank.toast.submitted'), 'success');
 			bankEditing = null;
 		} catch (err) {
-			const e = err as { detail?: string; message?: string } | null;
-			toast(e?.detail ?? e?.message ?? m('vendors.bank.toast.submitFailed'), 'error');
+			toast(errorMessage(err, m('vendors.bank.toast.submitFailed')), 'error');
 		} finally {
 			savingBank = false;
 		}
@@ -151,9 +157,41 @@
 		// reappearing, a fresh screening verdict going back to stale). Retire
 		// every pre-edit request before applying.
 		fetchSequence.supersedeInFlight();
-		vendors = vendors.map((v) => (v.id === updated.id ? updated : v));
+		// The mutation responses are plain `VendorResponse`s, without the list
+		// row's `status_actions` verdict. Keep the row's verdict while the
+		// vendor's status is unchanged (the reader and the row the server judged
+		// are the same); on a status change drop it, so Verify / Reject stay
+		// withheld (fail closed) until the next list read re-asks the server.
+		vendors = vendors.map((v) =>
+			v.id === updated.id
+				? {
+						...updated,
+						status_actions:
+							updated.status_actions ??
+							(updated.status === v.status ? v.status_actions : undefined)
+					}
+				: v
+		);
 		if (detailVendor && detailVendor.id === updated.id) detailVendor = updated;
 	}
+	// A create ends on the new vendor's detail (decisions §416). The list is
+	// name-ordered and paged, so a new vendor whose name sorts past the loaded
+	// page would otherwise vanish with no sign it was saved. The detail is a
+	// dialog over the list, so the list's URL-backed search / status / sort
+	// stay exactly as they were for when it closes.
+	//
+	// The create dialog is closed and allowed to finish unmounting first (its
+	// focus restore runs in a microtask queued during that flush, which settles
+	// before `tick()` resolves). Only then does the detail open, so it records
+	// the "+ New Vendor" trigger as where focus returns on close, rather than a
+	// control inside a dialog that is about to be removed (WCAG 2.4.3).
+	async function openCreatedVendor(created: Vendor) {
+		showCreateVendor = false;
+		await tick();
+		detailVendor = created;
+		fetchVendors();
+	}
+
 	// Search + status filter are URL-backed (`?search=&status=`) alongside sort
 	// (below) so a reload / back-button / shared link reproduces the same view —
 	// mirrors `/contracts` + `/expenses`. See `syncUrl()`.
@@ -173,6 +211,11 @@
 	// First fetch landed (success or error) — gates the onboarding empty state
 	// so "Add your first vendor" doesn't flash during the initial load.
 	let loaded = $state(false);
+	// A list (not load-more) fetch is in flight. Starts true: the first fetch
+	// fires from the status effect on mount.
+	let loading = $state(true);
+	// The latest list fetch failed. The table is replaced by `LoadError` with a
+	// Retry rather than reading "No vendors yet" over a failure (#635).
 	let loadErrored = $state(false);
 	let hasMore = $derived(vendors.length < total);
 
@@ -262,9 +305,16 @@
 		fetchVendors();
 	});
 
-	// Re-fetch on search input (debounced).
+	// Re-fetch on search input (debounced). `searchEffectRan` skips the mount
+	// run: the effect above has already loaded the list, and the unguarded run
+	// fetched it a second time 300ms later on every visit.
+	let searchEffectRan = false;
 	$effect(() => {
 		search;
+		if (!searchEffectRan) {
+			searchEffectRan = true;
+			return;
+		}
 		debouncedFetch();
 		// Cancel a pending debounce on teardown: without it the timer fires
 		// after the page is gone and lands a stale list into the shared store.
@@ -283,6 +333,10 @@
 
 	async function fetchVendors(opts: { append?: boolean; nextPage?: number } = {}) {
 		const token = fetchSequence.start();
+		if (!opts.append) {
+			loading = true;
+			loadErrored = false;
+		}
 		try {
 			const nextPage = opts.nextPage ?? 1;
 			const params = new URLSearchParams({
@@ -323,11 +377,17 @@
 			// local edit still failed, and no newer request is coming to report
 			// it — only a newer *fetch* makes this one's outcome irrelevant.
 			if (fetchSequence.isCurrentRequest(token)) {
-				toast('Failed to load vendors', 'error');
-				loadErrored = true;
+				// A failed Load-more keeps the rows already shown, so a toast
+				// is enough; a failed list load has nothing true to show, so
+				// the page states it in place (`LoadError` below).
+				if (opts.append) toast(m('vendors.toast.loadMoreFailed'), 'error');
+				else loadErrored = true;
 			}
 		} finally {
-			if (fetchSequence.isCurrentRequest(token)) loaded = true;
+			if (fetchSequence.isCurrentRequest(token)) {
+				loaded = true;
+				if (!opts.append) loading = false;
+			}
 		}
 	}
 
@@ -398,14 +458,14 @@
 			selectedAllMatching = true;
 			if (res.truncated) {
 				toast(
-					`Selected the first ${res.ids.length} of ${res.total} matching — narrow your filters to select the rest.`,
+					m('vendors.toast.selectAllTruncated', { shown: formatCount(res.ids.length), total: formatCount(res.total) }),
 					'error'
 				);
 			} else {
-				toast(`Selected all ${res.ids.length} matching vendor(s)`, 'success');
+				toast(m('vendors.toast.selectedAllMatching', { n: res.ids.length }), 'success');
 			}
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Failed to select all matching', 'error');
+			toast(errorMessage(err, m('vendors.toast.selectAllFailed')), 'error');
 		} finally {
 			selectingAllMatching = false;
 		}
@@ -414,6 +474,7 @@
 	function clearSelection() {
 		selected = new Set();
 		selectedAllMatching = false;
+		if (armed?.action === 'bulkReject') armed = null;
 	}
 
 	async function bulkVerify() {
@@ -423,11 +484,11 @@
 			await fetchVendors();
 			clearSelection();
 			const msg = res.skipped.length
-				? m('vendors.bulk.verified', { n: res.updated }) + m('vendors.bulk.skipped', { n: res.skipped.length })
+				? m('vendors.bulk.verifiedSkipped', { n: res.updated, skipped: res.skipped.length })
 				: m('vendors.bulk.verified', { n: res.updated });
 			toast(msg, res.updated > 0 ? 'success' : 'error');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk verify failed', 'error');
+			toast(errorMessage(err, m('vendors.bulk.verifyFailed')), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -440,12 +501,12 @@
 			await fetchVendors();
 			clearSelection();
 			const msg = res.skipped.length
-				? m('vendors.bulk.rejected', { n: res.updated }) + m('vendors.bulk.skipped', { n: res.skipped.length })
+				? m('vendors.bulk.rejectedSkipped', { n: res.updated, skipped: res.skipped.length })
 				: m('vendors.bulk.rejected', { n: res.updated });
 			toast(msg, res.updated > 0 ? 'success' : 'error');
 			toastCardRevocations(res.card_revocations);
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk reject failed', 'error');
+			toast(errorMessage(err, m('vendors.bulk.rejectFailed')), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -458,12 +519,12 @@
 			await fetchVendors();
 			clearSelection();
 			const msg = res.skipped.length
-				? m('vendors.bulk.screened', { n: res.screened }) + m('vendors.bulk.skipped', { n: res.skipped.length })
+				? m('vendors.bulk.screenedSkipped', { n: res.screened, skipped: res.skipped.length })
 				: m('vendors.bulk.screened', { n: res.screened });
 			toast(msg, res.screened > 0 ? 'success' : 'error');
 			toastCardRevocations(res.card_revocations);
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk screen failed', 'error');
+			toast(errorMessage(err, m('vendors.bulk.screenFailed')), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -476,7 +537,7 @@
 			await exportVendorsCsv(ids);
 			toast(m('vendors.bulk.exported', { n: ids.length }), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk export failed', 'error');
+			toast(errorMessage(err, m('vendors.bulk.exportFailed')), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -510,31 +571,46 @@
 		try {
 			await api.post(`/api/vendors/${id}/verify`, {});
 			await fetchVendors();
-			toast('Vendor verified', 'success');
+			toast(m('vendors.toast.verified'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Verify failed', 'error');
+			toast(errorMessage(err, m('vendors.toast.verifyFailed')), 'error');
 		}
 	}
+
+	// The one armed (one click from committing) Reject on the page: a row's, or
+	// the bulk bar's. The bulk Reject does to every selected vendor what the row
+	// Reject does to one — stops their payments and revokes their live cards —
+	// so it must not commit on a single click either. A single slot means arming
+	// one disarms the other; two separate flags let a row and the bulk bar sit
+	// armed together. Any click outside a `.row-action` (a checkbox included, so
+	// the selection can't change under an armed confirm) un-arms it.
+	let armed = $state<{ action: 'reject'; id: string } | { action: 'bulkReject' } | null>(null);
+	const rejectArmedFor = (id: string) => armed?.action === 'reject' && armed.id === id;
+	const bulkRejectArmed = $derived(armed?.action === 'bulkReject');
 
 	async function rejectVendor(id: string) {
 		try {
 			const rejected = await rejectVendorRequest(id);
 			await fetchVendors();
-			toast('Vendor rejected', 'success');
+			toast(m('vendors.toast.rejected'), 'success');
 			toastCardRevocations([rejected.card_revocation]);
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Reject failed', 'error');
+			toast(errorMessage(err, m('vendors.toast.rejectFailed')), 'error');
 		}
 	}
 
 	async function syncFromErp() {
 		syncing = true;
 		try {
-			const result = await api.post<{ message: string }>('/api/vendors/sync-erp', {});
+			const result = await api.post<VendorSyncReport>('/api/vendors/sync-erp', {});
 			await fetchVendors();
-			toast(result.message, 'success');
+			// A name that matches more than one vendor is never linked on a
+			// guess; say which, so they can be linked by hand.
+			for (const line of vendorSyncReportLines(result, m)) {
+				toast(line.text, line.tone, line.tone === 'warning' ? 12_000 : undefined);
+			}
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Sync failed', 'error');
+			toast(errorMessage(err, m('vendors.toast.syncFailed')), 'error');
 		} finally {
 			syncing = false;
 		}
@@ -556,29 +632,60 @@
 			alert: true
 		},
 		{ key: 'active', label: m('vendors.filter.active') },
+		// `?status=inactive` was accepted from the URL (and honoured by the
+		// backend list) with no chip to show it, so a deactivated-only view
+		// looked unfiltered and could not be cleared from a chip.
+		{ key: 'inactive', label: m('vendors.filter.inactive') },
 		{ key: 'rejected', label: m('vendors.filter.rejected') }
 	]);
-	// Only the true "this tenant has zero vendors" state points at the CSV
-	// import CTA — a search/status filter that matches nothing gets the plain
-	// message, since "import a CSV" would be a non-sequitur when the tenant
-	// already has vendors and the filter is just narrow.
-	let emptyMessage = $derived(
-		vendors.length === 0 && !search.trim() && statusFilter === 'all'
-			? m('vendors.empty.fresh')
-			: m('vendors.empty')
-	);
+	// The table's empty line, chosen by state — the invoices page's shape. A
+	// failed load never reaches it (`LoadError` replaces the table), and the
+	// genuinely fresh, unfiltered tenant gets the onboarding `EmptyState`
+	// instead; this covers the moment between (loading) and a filter that
+	// matched nothing. Only the unfiltered case points at the CSV import — "import
+	// a CSV" is a non-sequitur when the filter is just narrow.
+	let noActiveFilters = $derived(!search.trim() && statusFilter === 'all');
 	// A brand-new tenant with zero vendors and no active filter gets the rich
 	// onboarding CTA (mirrors the dashboard / `/invoices` EmptyState) instead of
 	// the bare "no vendors" cell — gated on `loaded` (not mid-load) and no error.
 	let showOnboarding = $derived(
-		loaded &&
-			!loadErrored &&
-			vendors.length === 0 &&
-			total === 0 &&
-			!search.trim() &&
-			statusFilter === 'all'
+		loaded && !loading && !loadErrored && vendors.length === 0 && total === 0 && noActiveFilters
 	);
+
+	// "Sync from ERP" is offered only where it can work: an ERP is configured
+	// and its route is on the plan (`utils/vendorErpSync.ts`). Read from
+	// `settings.erp` on `GET /api/organization` — the field the Organization →
+	// ERP panel reads. Only a `vendor.manage` holder (the sync endpoint's gate)
+	// sees any of it, so only they fetch. `null` while unknown: nothing renders
+	// rather than a button that may vanish. A failed read offers the button —
+	// the endpoint is the authority, and hiding a working sync over a transient
+	// read error would be the worse failure.
+	let erpOffer = $state<VendorErpSyncOffer | null>(null);
+	$effect(() => {
+		if (!canManageVendors || erpOffer) return;
+		let cancelled = false;
+		api
+			.get<{ settings?: { erp?: Record<string, unknown> | null } }>('/api/organization')
+			.then((org) => {
+				if (!cancelled) erpOffer = vendorErpSyncOffer(org.settings?.erp, (f) => auth.hasFeature(f));
+			})
+			.catch(() => {
+				if (!cancelled) erpOffer = { kind: 'sync' };
+			});
+		return () => {
+			cancelled = true;
+		};
+	});
 </script>
+
+<svelte:window
+	onclick={(e) => {
+		// Outside-click un-arms a pending Reject confirmation.
+		if (!(e.target as HTMLElement)?.closest?.('.row-action')) {
+			if (armed) armed = null;
+		}
+	}}
+/>
 
 <PageHeader title={m('vendors.title')}>
 	{#snippet actions()}
@@ -590,27 +697,40 @@
 		{#if auth.isManager}
 			<!-- The dual-control queue a staged bank/tax change waits in. Role-gated
 			     to match `GET /api/vendors/change-requests` (admin | ap_manager). -->
-			<a class="btn-outline" href="/vendors/change-requests">
+			<a class="btn-secondary" href="/vendors/change-requests">
 				{m('vendors.action.changeApprovals')}
 			</a>
 		{/if}
 		{#if canManageVendors}
-			<button class="btn-outline" onclick={() => (showConsolidation = true)}>
-				Merge duplicates
+			<button class="btn-secondary" onclick={() => (showConsolidation = true)}>
+				{m('vendors.mergeDuplicates')}
 			</button>
 		{/if}
-		{#if auth.isManager}
-			<!-- `POST /api/vendors/sync-erp` is require_roles(ADMIN, AP_MANAGER).
+		{#if canManageVendors && erpOffer?.kind === 'sync'}
+			<!-- `POST /api/vendors/sync-erp` is require_permission(vendor.manage).
 			     A CFO reaches this page (nav.ts admits them for the read) but
-			     holds neither role, so the button only ever 403'd. -->
-			<button class="btn-outline" disabled={syncing} onclick={syncFromErp}>
+			     doesn't hold it, so the button only ever 403'd. -->
+			<button class="btn-secondary" disabled={syncing} onclick={syncFromErp}>
 				{syncing ? m('vendors.action.syncing') : m('vendors.action.syncErp')}
 			</button>
+		{:else if canManageVendors && erpOffer === null}
+			<!-- Unknown yet: hold the slot in the Sync button's shape so its
+			     arrival does not re-wrap the toolbar and shift the filter row
+			     and table down (layout-stability.spec.ts). Hidden from sight
+			     and from assistive tech; never interactive. -->
+			<span class="btn-secondary erp-slot-reserve" aria-hidden="true" inert>
+				{m('vendors.action.syncErp')}
+			</span>
+		{:else if auth.isAdmin && erpOffer?.kind === 'connect'}
+			<!-- No ERP yet: the way to one, for the role that can set it up. -->
+			<a class="btn-secondary" href="/organization?section=erp" data-testid="vendors-connect-erp">
+				{m('vendors.action.connectErp')}
+			</a>
 		{/if}
-		{#if auth.isManager}
+		{#if canManageVendors}
 			<!-- Day-0 bulk load — `POST /api/vendors/import-csv`, same gate as
 			     the sync button above. See backend/docs/csv-import.md. -->
-			<button class="btn-outline" onclick={() => (showImportCsv = true)}>
+			<button class="btn-secondary" onclick={() => (showImportCsv = true)}>
 				{m('vendors.action.importCsv')}
 			</button>
 		{/if}
@@ -621,18 +741,40 @@
 		<FilterChips chips={statusChips} bind:active={statusFilter} />
 	</div>
 
+	{#if canManageVendors && erpOffer?.kind === 'upgrade'}
+		<!-- An ERP is configured but its route isn't on the plan (Merge.dev
+		     needs Scale): say so instead of a Sync that answers 402. -->
+		<PlanUpgradeNotice feature={erpOffer.feature} testId="vendors-erp-upgrade" />
+	{/if}
+
 	{#if showOnboarding}
 		<EmptyState
 			icon="🏢"
 			testId="vendors-empty-state"
 			heading={m('vendors.onboarding.heading')}
-			description={m('vendors.onboarding.description')}
+			description={erpOffer?.kind === 'sync'
+				? m('vendors.onboarding.descriptionErp')
+				: m('vendors.onboarding.description')}
 			actionLabel={canManageVendors ? m('vendors.action.newVendor') : undefined}
 			onaction={canManageVendors ? () => (showCreateVendor = true) : undefined}
 		/>
+	{:else if loadErrored}
+		<LoadError
+			message={m('vendors.empty.errored')}
+			onretry={() => fetchVendors()}
+			testId="vendors-load-error"
+		/>
 	{:else}
 	<div class="vendor-table">
-	<DataTable isEmpty={vendors.length === 0} empty={emptyMessage} colspan={10} fixed>
+	<DataTable
+		isEmpty={vendors.length === 0}
+		{loading}
+		filtered={!noActiveFilters}
+		emptyFiltered={m('vendors.empty')}
+		empty={m('vendors.empty.fresh')}
+		colspan={10}
+		fixed
+	>
 		{#snippet header()}
 			<tr>
 				<th class="checkbox-col">
@@ -666,11 +808,11 @@
 								checked={selected.has(v.id)}
 								onclick={(e) => e.stopPropagation()}
 								onchange={() => toggleSelect(v.id)}
-								aria-label={`Select ${v.name}`}
+								aria-label={m('vendors.selectRowAria', { vendor: v.name })}
 							/>
 						</td>
 						<td class="vendor-name">
-							<RowLink onclick={() => (detailVendor = v)} ariaLabel={`Open vendor ${v.name}`}>
+							<RowLink onclick={() => (detailVendor = v)} ariaLabel={m('vendors.row.openAria', { vendor: v.name })}>
 								{v.name}
 							</RowLink>
 						</td>
@@ -696,14 +838,14 @@
 					<td>
 						<span class="source-badge">{sourceLabel(v.source)}</span>
 					</td>
-					<td class="mono">{v.invoice_count}</td>
+					<td class="mono">{formatCount(v.invoice_count)}</td>
 					<td>
 						{#if v.erp_vendor_id}
 							<span
 								class="erp-linked"
 								role="img"
-								aria-label={`Linked to ERP: ${v.erp_vendor_id}`}
-								title="Linked to ERP: {v.erp_vendor_id}"
+								aria-label={m('vendors.erpLinked', { id: v.erp_vendor_id })}
+								title={m('vendors.erpLinked', { id: v.erp_vendor_id })}
 							>
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
 							</span>
@@ -721,9 +863,34 @@
 					     it works too. -->
 					<td class="actions">
 						{#if canManageVendors}
-							{#if v.status === 'unverified'}
+							<!-- Offered exactly when the server's verdict allows it
+							     (`status_actions`, from the table `/verify`, `/reject`
+							     and bulk status share) — Reject used to be hidden on an
+							     `active` vendor every one of them accepts (issue #575). -->
+							{#if isAllowed(v.status_actions?.verify)}
 								<RowAction variant="success" onclick={() => verifyVendor(v.id)}>{m('vendors.row.verify')}</RowAction>
-								<RowAction variant="danger" onclick={() => rejectVendor(v.id)}>{m('vendors.row.reject')}</RowAction>
+							{/if}
+							{#if isAllowed(v.status_actions?.reject)}
+								<!-- Armed two-click: rejecting an ACTIVE vendor stops its
+								     payments and revokes its live cards, so the first click
+								     only arms (the shape the change-request queue uses). -->
+								<RowAction
+									variant="danger"
+									armed={rejectArmedFor(v.id)}
+									ariaLabel={m('common.rowActionAria', {
+										action: rejectArmedFor(v.id) ? m('vendors.row.confirmReject') : m('vendors.row.reject'),
+										name: v.name
+									})}
+									onclick={(e) => {
+										e.stopPropagation();
+										if (rejectArmedFor(v.id)) {
+											armed = null;
+											rejectVendor(v.id);
+										} else armed = { action: 'reject', id: v.id };
+									}}
+								>
+									{rejectArmedFor(v.id) ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
+								</RowAction>
 							{/if}
 							<RowAction onclick={() => openBankEditor(v)}>
 								{v.bank_details?.counterparty_id ? m('vendors.row.bankSet') : m('vendors.row.bank')}
@@ -739,24 +906,22 @@
 	</DataTable>
 	</div>
 
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={loadMoreVendors} disabled={loadingMore}>
-				{loadingMore ? m('common.loading') : m('vendors.loadMore', { shown: vendors.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('vendors.showingAll', { total })}</span>
-		</div>
-	{/if}
+	<LoadMoreFooter
+		shown={vendors.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		onloadmore={loadMoreVendors}
+		moreKey="vendors.loadMore"
+		allKey="vendors.showingAll"
+	/>
 	{/if}
 
 	{#if canManageVendors}
 		<BulkBar count={selected.size} onclear={clearSelection}>
 			{#snippet actions()}
 				{#if allSelected && !selectedAllMatching && total > vendors.length}
-					<button class="bulk-action-btn secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
+					<button class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 						{selectingAllMatching
 							? m('common.loading')
 							: m('common.selectAllMatching', { total })}
@@ -765,7 +930,19 @@
 					<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 				{/if}
 				<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
-				<RowAction variant="danger" disabled={bulkBusy} onclick={bulkReject}>{m('vendors.row.reject')}</RowAction>
+				<RowAction
+					variant="danger"
+					armed={bulkRejectArmed}
+					disabled={bulkBusy}
+					onclick={() => {
+						if (bulkRejectArmed) {
+							armed = null;
+							bulkReject();
+						} else armed = { action: 'bulkReject' };
+					}}
+				>
+					{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
+				</RowAction>
 				<div class="bulk-divider"></div>
 				<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
 				<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
@@ -792,7 +969,7 @@
 {#if showCreateVendor}
 	<CreateVendorModal
 		onclose={() => (showCreateVendor = false)}
-		onsaved={() => fetchVendors()}
+		onsaved={openCreatedVendor}
 	/>
 {/if}
 
@@ -857,7 +1034,7 @@
 
 <Modal
 	open={bankEditing !== null}
-	ariaLabel="Vendor bank counterparty"
+	ariaLabel={m('vendors.bank.dialogAria')}
 	onclose={() => (bankEditing = null)}
 >
 	{#if bankEditing}
@@ -865,11 +1042,7 @@
 			<h2>{m('vendors.bank.title', { vendor: bankEditing.name })}</h2>
 			<HelpTip term="bank-change-request" />
 		</div>
-		<p class="modal-hint">
-			These values bridge to your payment processor (e.g. Modern Treasury). The
-			<code>counterparty_id</code> is the processor's identifier; the last4s are stored
-			here for display only — full account / routing numbers belong with the processor.
-		</p>
+		<p class="modal-hint">{m('vendors.bank.processorHint')}</p>
 		<p class="dual-control-hint">
 			{m('vendors.bank.dualControlHint')}
 			{#if auth.isManager}
@@ -966,25 +1139,11 @@
 </Modal>
 
 <style>
-	/* Page-specific styling; shared design-system CSS lives in app.css. */
-	/* Shared by the Merge-duplicates <button> and the change-approvals <a>, so
-	   the two toolbar controls read as one row. */
-	.btn-outline {
-		display: inline-flex;
-		align-items: center;
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-		text-decoration: none;
+	.erp-slot-reserve {
+		visibility: hidden;
 	}
 
+	/* Page-specific styling; shared design-system CSS lives in app.css. */
 	/* The dual-control explainer in the bank-details dialog: saving here stages
 	   a request, it does not change where money goes. */
 	.dual-control-hint {
@@ -996,21 +1155,13 @@
 	.dual-control-hint a {
 		color: var(--accent);
 	}
-	.btn-outline:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-outline:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
 
 	/* Row emphasis + bespoke cell badges */
 	tr:last-child td {
 		border-bottom: none;
 	}
 	.unverified {
-		background: rgba(212, 148, 10, 0.04);
+		background: color-mix(in srgb, var(--warning) 4%, transparent);
 	}
 
 	/* De-emphasize rejected rows with a subtle tint rather than a blanket
@@ -1018,17 +1169,20 @@
 	   1.4.3 4.5:1 contrast floor). The red "Rejected" status badge carries
 	   the state signal. */
 	.rejected td {
-		background: rgba(224, 64, 64, 0.04);
+		background: color-mix(in srgb, var(--danger) 4%, transparent);
 	}
 	/* Column widths. The table is `table-layout: fixed`, so with no widths every
 	   column got an equal share: the checkbox column was as wide as Email, and
 	   a long address spilled into Status. The predictable columns get fixed
-	   widths sized to their widest content (the "UNVERIFIED" badge, "Unscreened",
-	   "AI Extracted", four action buttons); Vendor and Email share the rest. The
+	   widths sized to their widest content in the six locales (the de badge
+	   "NICHT VERIFIZIERT", de "Prüfung erforderlich", es "Sincronización ERP",
+	   the header de "RECHNUNGEN", four action buttons wrapping); Vendor and
+	   Email share the rest. Nine columns, so the cells run 10px of horizontal
+	   padding instead of the global 14px (the /exceptions arrangement). The
 	   min-width keeps those two readable, so on a narrow window the table
 	   scrolls inside its region rather than crushing them. */
 	.vendor-table :global(table) {
-		/* The fixed columns total ~1,030px; this leaves Vendor and Email ~175px
+		/* The fixed columns total ~1,120px; this leaves Vendor and Email ~130px
 		   each before the table scrolls inside its region. Sized to the 1,388px
 		   region a 1666px window gives with the sidebar open — the bar #574 set
 		   for the exceptions queue. At 1460px it overflowed that region by 72px,
@@ -1038,12 +1192,17 @@
 		   share loses nothing. */
 		min-width: 1380px;
 	}
+	.vendor-table :global(th),
+	.vendor-table :global(td) {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
 	.vendor-table :global(th.checkbox-col) { width: 44px; }
 	.vendor-table :global(th.col-code) { width: 96px; }
-	.vendor-table :global(th.col-status) { width: 140px; }
-	.vendor-table :global(th.col-screening) { width: 140px; }
-	.vendor-table :global(th.col-source) { width: 130px; }
-	.vendor-table :global(th.col-invoices) { width: 100px; }
+	.vendor-table :global(th.col-status) { width: 170px; }
+	.vendor-table :global(th.col-screening) { width: 160px; }
+	.vendor-table :global(th.col-source) { width: 150px; }
+	.vendor-table :global(th.col-invoices) { width: 120px; }
 	.vendor-table :global(th.col-erp) { width: 76px; }
 	.vendor-table :global(th.actions-col) { width: 300px; }
 	/* Vendor and Email carry no width: they share what is left equally. */
@@ -1073,24 +1232,22 @@
 	}
 
 	.erp-linked {
-		color: #1fa86a;
+		color: var(--success);
 		display: inline-flex;
 	}
 
 	/* Bank-counterparty modal extras */
-	.modal-hint code {
-		font-family: 'SF Mono', 'Cascadia Code', monospace;
-		font-size: 0.78rem;
-		color: var(--text);
-	}
 	.modal input:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
+	/* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track never shrinks below its
+	   input's intrinsic width, so at 320px the bank dialog's paired fields
+	   overflowed it and the form scrolled sideways (WCAG 1.4.10). */
 	.form-row {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 12px;
 	}
 
@@ -1101,31 +1258,6 @@
 	}
 
 	/* Bulk-bar "select all N matching" affordance — mirrors /expenses. */
-	.bulk-action-btn {
-		padding: 6px 14px;
-		border-radius: 6px;
-		border: 1px solid var(--accent-strong);
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.82rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.bulk-action-btn:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-	.bulk-action-btn:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.bulk-action-btn.secondary {
-		background: transparent;
-		color: var(--accent-strong);
-	}
-
 	.bulk-all-matching-note {
 		font-size: 0.82rem;
 		color: var(--text-muted);

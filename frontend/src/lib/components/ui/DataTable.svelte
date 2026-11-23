@@ -25,9 +25,27 @@
 		header?: Snippet;
 		/** Renders the `<tr>` rows inside `<tbody>`. */
 		body: Snippet;
-		/** Shown as a single centred row when `isEmpty` is true. */
+		/**
+		 * The genuinely-empty message, shown as a single centred row when
+		 * `isEmpty` is true and the list is neither loading, errored nor
+		 * filtered. Defaults to `common.empty`.
+		 */
 		empty?: string;
 		isEmpty?: boolean;
+		/**
+		 * The fetch is in flight: the empty row reads `common.loading` and is
+		 * announced (`role="status"`), instead of claiming the list is empty
+		 * before anything established that.
+		 */
+		loading?: boolean;
+		/** The last fetch failed: the row reads `emptyErrored` (default `common.loadFailed`). */
+		errored?: boolean;
+		/** A search or filter is narrowing the list: the row reads `emptyFiltered`. */
+		filtered?: boolean;
+		/** Message for `filtered`; defaults to `common.emptyFiltered`. */
+		emptyFiltered?: string;
+		/** Message for `errored`; defaults to `common.loadFailed`. */
+		emptyErrored?: string;
 		/** colspan for the empty row; defaults to the column count. */
 		colspan?: number;
 		/** `table-layout: fixed` — pair with explicit `<th>` widths in the page. */
@@ -46,8 +64,13 @@
 		columns,
 		header,
 		body,
-		empty = 'No items.',
+		empty,
 		isEmpty = false,
+		loading = false,
+		errored = false,
+		filtered = false,
+		emptyFiltered,
+		emptyErrored,
 		colspan,
 		fixed = false,
 		stickyHeader = false,
@@ -55,6 +78,19 @@
 	}: Props = $props();
 
 	const emptySpan = $derived(colspan ?? columns?.length ?? 1);
+
+	// Loading wins over errored (a retry is in flight), errored over filtered
+	// (a failed load matched nothing because it loaded nothing), and filtered
+	// over the plain empty copy (which is a claim about the whole list).
+	const emptyMessage = $derived(
+		loading
+			? m('common.loading')
+			: errored
+				? (emptyErrored ?? m('common.loadFailed'))
+				: filtered
+					? (emptyFiltered ?? m('common.emptyFiltered'))
+					: (empty ?? m('common.empty'))
+	);
 </script>
 
 <!-- The container scrolls sideways once the table is wider than the card
@@ -94,8 +130,16 @@
 				<!-- `data-testid` is a real API, not scaffolding: it is the one
 				     deterministic handle a test has on "the table is asserting
 				     something about an empty result set" (loading / errored /
-				     genuinely empty are distinguished by the message text). -->
-				<tr><td class="empty" colspan={emptySpan} data-testid="table-empty">{empty}</td></tr>
+				     genuinely empty are distinguished by the message text, which
+				     this component picks from `loading` / `errored` / `filtered`).
+				     Only the loading row is a live region: an always-on
+				     `role="status"` per table would collide with the page's own
+				     status messages. -->
+				<tr
+					><td class="empty" colspan={emptySpan} data-testid="table-empty"
+						>{#if loading}<span role="status">{emptyMessage}</span>{:else}{emptyMessage}{/if}</td
+					></tr
+				>
 			{:else}
 				{@render body()}
 			{/if}
@@ -107,6 +151,24 @@
 	/* Opt-in layout refinements; the base table styling is global (app.css). */
 	table.fixed {
 		table-layout: fixed;
+	}
+	/* A fixed column cannot grow to fit its content, and the global
+	   `.grid-container th` / `td.actions` are `nowrap`, so a header or a row's
+	   buttons wider than the column overprinted the next one — in English the
+	   widths fit, in es/fr/de/pt-BR they did not. In a fixed table a header
+	   wraps onto a second line and the row's buttons onto a second row
+	   instead; the page sizes each width so the longest single word or badge
+	   in any locale still fits (frontend/docs/ui-patterns.md § Data tables;
+	   guard: tests-e2e/reactivity/layout-stability.spec.ts). */
+	table.fixed :global(th) {
+		white-space: normal;
+		vertical-align: bottom;
+	}
+	table.fixed :global(td.actions) {
+		white-space: normal;
+	}
+	table.fixed :global(td.actions > *) {
+		margin-block: 2px;
 	}
 	table.sticky-header thead {
 		position: sticky;

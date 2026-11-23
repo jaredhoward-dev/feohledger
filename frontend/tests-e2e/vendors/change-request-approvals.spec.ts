@@ -137,6 +137,28 @@ test.describe('/vendors/change-requests — dual-control bank-change approvals',
 		).toBeVisible();
 	});
 
+	test('the status filter round-trips through the URL', async ({ page }) => {
+		// A reload or a link shared with a second approver must land on the
+		// same filter, like every other list page's `?status=`.
+		await page.goto('/vendors/change-requests?status=rejected');
+		await expect(page.getByRole('button', { name: /^Rejected/ })).toHaveAttribute(
+			'aria-pressed',
+			'true'
+		);
+
+		await page.getByRole('button', { name: /^Approved/ }).click();
+		await expect(page).toHaveURL(/[?&]status=approved\b/);
+		await page.reload();
+		await expect(page.getByRole('button', { name: /^Approved/ })).toHaveAttribute(
+			'aria-pressed',
+			'true'
+		);
+
+		// The default (Pending) is left out of the URL.
+		await page.getByRole('button', { name: /^Pending/ }).click();
+		await expect(page).not.toHaveURL(/[?&]status=/);
+	});
+
 	test('a staged bank change only applies after a SECOND approver signs it off', async ({
 		page,
 		tenantManager
@@ -179,9 +201,10 @@ test.describe('/vendors/change-requests — dual-control bank-change approvals',
 			// account number.
 			await expect(queueRow).toContainText('8888');
 			await expect(queueRow).toContainText('Pending');
-			// Segregation of duties, said on the row rather than as a button that
-			// can only fail.
-			await expect(queueRow).toContainText('You requested this');
+			// Segregation of duties, said on the row — in the server's own words, from
+			// the row's `approve_refusal` verdict — rather than as a button that can
+			// only fail.
+			await expect(queueRow).toContainText('You cannot approve a bank-detail change you requested.');
 			await expect(queueRow.getByRole('button', { name: 'Approve', exact: true })).toBeDisabled();
 
 			// …and the server refuses the proposer regardless — the UI is not the
@@ -217,11 +240,20 @@ test.describe('/vendors/change-requests — dual-control bank-change approvals',
 
 			const approve = mgrRow.getByRole('button', { name: 'Approve', exact: true });
 			await expect(approve).toBeEnabled();
+			// Only one commit is ever armed: arm Reject, then one click on
+			// Approve must retract Reject as it arms itself, or a row would
+			// hold two armed red buttons side by side.
+			await mgrRow.getByRole('button', { name: 'Reject', exact: true }).click();
+			await expect(mgrRow.getByRole('button', { name: 'Confirm reject' })).toBeVisible();
+
 			// Armed two-click confirm — this is the click that redirects where
 			// money goes, so one stray click must not commit it.
 			await approve.click();
 			const confirm = mgrRow.getByRole('button', { name: 'Confirm approve' });
 			await expect(confirm).toBeVisible();
+			await expect(mgrRow.getByRole('button', { name: 'Confirm reject' })).toHaveCount(0);
+			await expect(mgrRow.getByRole('button', { name: 'Reject', exact: true })).toBeVisible();
+			await expect(mgrRow.locator('button.armed')).toHaveCount(1);
 			await confirm.click();
 
 			await expect(page.locator('.toast', { hasText: 'Change approved' })).toBeVisible();

@@ -25,53 +25,79 @@
 	 * opens by itself when the platform has no app for that ERP
 	 * (`GET /api/organization/erp/oauth/status` → `providers[].available`).
 	 *
+	 * A consent that reached several companies (Xero, Sage) comes back with
+	 * `?erp_choose_company=`: the server holds the token and the panel shows
+	 * `ErpCompanyPicker` with the list it offers (decisions §355).
+	 *
 	 * The plan gate and the admin-only read-only state are decided by the
 	 * page (the same props every panel there uses) and rendered here.
 	 */
 	import { onMount, tick, untrack } from 'svelte';
 	import { replaceState } from '$app/navigation';
 	import { page } from '$app/state';
-	import { api } from '#lib/api.ts';
+	import { api, ApiError } from '#lib/api.ts';
+	import { CREDENTIAL_BLOCK_UNOPENABLE } from '#lib/api/codedRefusals.ts';
+	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
 	import { getProviderCredentials, updateProviderCredentials } from '#lib/api/providerCredentials.ts';
 	import {
 		disconnectErpOAuth,
+		discardErpPendingConnect,
 		getErpCatalog,
 		getErpOAuthStatus,
+		getErpPendingConnect,
+		selectErpCompany,
 		startErpOAuth,
+		startErpStatusSync,
 		testErpConnection
 	} from '#lib/api/erpConnection.ts';
+	import ErpCompanyPicker from '#lib/components/organization/ErpCompanyPicker.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import SecretField from '#lib/components/ui/SecretField.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { FEATURE_ERP_INTEGRATIONS, FEATURE_ERP_MERGE } from '#lib/types/planFeatures.ts';
 	import {
 		BYO_APP_FIELDS,
+		CONNECT_FROM_PLATFORM_HOST,
 		MERGE_DEV_PROVIDER,
 		buildErpPayload,
 		buildErpSecretUpdate,
 		buildErpTestPayload,
+		callUsageLines,
+		disconnectMessage,
+		erpTestResultText,
 		byoAppRequired,
+		fieldApplies,
 		groupProviders,
 		initialValues,
 		missingRequired,
 		OAUTH_ERROR_KEYS,
+		oauthAttentionKey,
 		oauthConnectionState,
+		oauthScopeGapKeys,
 		optionLabelKey,
+		pickRefusalKey,
+		platformConnectUrl,
 		readOAuthReturn,
 		secretIsSaved,
 		selectedProviderKey,
+		statusSyncNowOffered,
+		statusSyncStartedKey,
 		withoutOAuthReturn,
 		type ErpCatalog,
 		type ErpOAuthStatus,
+		type ErpPendingConnect,
 		type ErpProvider,
 		type ErpProviderField,
 		type OAuthReturn,
 		type StoredErpConfig
 	} from '#lib/types/erpConnection.ts';
 	import { formatList } from '#lib/utils/list.ts';
+	import { formatCount } from '#lib/utils/count.ts';
+	import { formatDate } from '#lib/utils/time.ts';
 
 	let {
 		stored,
@@ -107,6 +133,9 @@
 	 *  present from the start: Svelte 5 refuses `bind:` of `undefined` to a prop
 	 *  that declares a fallback. */
 	let clear = $state<Record<string, boolean>>({});
+	// The stored `erp` row can no longer be opened, so every save answers 503
+	// `credential_block_unopenable` until it is cleared (decisions §464).
+	let unopenable = $state(false);
 	/** Which ERP secrets the server holds — names only, never a value. */
 	let storedNames = $state<string[]>([]);
 	/** Required fields a save or connect found empty (`aria-invalid`). */
@@ -115,6 +144,7 @@
 	let testing = $state(false);
 	let connecting = $state(false);
 	let disconnecting = $state(false);
+	let checkingPayments = $state(false);
 	let confirmDisconnect = $state(false);
 	let oauthStatus = $state<ErpOAuthStatus | null>(null);
 	let oauthStatusFailed = $state(false);
@@ -123,18 +153,43 @@
 	/** The one live region's text: test results, validation, connect errors. */
 	let statusMessage = $state('');
 	let statusTone = $state<'success' | 'failure' | null>(null);
+	/** Where to connect from instead, when this host cannot (a custom domain):
+	 *  the refusal's platform address, shown as a link after the status. */
+	let connectElsewhereUrl = $state<string | null>(null);
 	/** The OAuth callback's `?erp_connected=` / `?erp_error=`, read ONCE on
 	 *  mount and shown until the admin does something else. */
 	let oauthReturn = $state<OAuthReturn>(null);
+	/** A consent waiting for the admin to pick its company, and its state. */
+	let pending = $state<ErpPendingConnect | null>(null);
+	let pendingLoading = $state(false);
+	let picking = $state(false);
+	/** Whether a parked consent should be looked for: set on EVERY mount, not
+	 *  only when the callback's `?erp_choose_company=` is present. The panel
+	 *  strips that parameter on mount, so a reload, or coming back to the page
+	 *  while the consent is still parked, would otherwise lose the picker the
+	 *  server is still holding. Read once the user is known to be an admin (a
+	 *  non-admin's read would only 403). */
+	let pickRequested = $state(false);
+	/** The callback itself asked for the pick: a consent that is gone by now
+	 *  is worth saying so. On a plain mount, nothing parked is the normal case
+	 *  and says nothing. */
+	let pickExplicit = false;
+	let statusEl = $state<HTMLParagraphElement | null>(null);
 
 	const groups = $derived(catalog ? groupProviders(catalog.providers) : []);
 	const provider = $derived<ErpProvider | null>(
 		catalog?.providers.find((p) => p.key === selectedKey) ?? null
 	);
 	const isOAuth = $derived(provider?.auth === 'oauth');
-	/** The ERP's own fields, and (OAuth only) the bring-your-own-app pair. */
+	/** The ERP's own fields that apply to the current choice (NetSuite's
+	 *  sign-in method picks its credentials), and (OAuth only) the
+	 *  bring-your-own-app pair. */
 	const mainFields = $derived(
-		provider ? provider.fields.filter((f) => !isOAuth || !BYO_APP_FIELDS.includes(f.name)) : []
+		provider
+			? provider.fields.filter(
+					(f) => (!isOAuth || !BYO_APP_FIELDS.includes(f.name)) && fieldApplies(f, values)
+				)
+			: []
 	);
 	const byoFields = $derived(
 		provider && isOAuth ? provider.fields.filter((f) => BYO_APP_FIELDS.includes(f.name)) : []
@@ -143,10 +198,43 @@
 	const connection = $derived(
 		provider ? oauthConnectionState(provider.key, oauthStatus) : 'not_connected'
 	);
+	// Why it must be reconnected, or that it expires soon (decisions §295).
+	const attentionKey = $derived(provider ? oauthAttentionKey(provider.key, oauthStatus) : null);
+	const expiresSoon = $derived(attentionKey === 'org.erp.oauth.expiresSoon');
+	// A consent that lacks a permission FeohLedger now asks for (decisions
+	// §415): what is limited, and Reconnect, which grants it.
+	const scopeGapKeys = $derived(provider ? oauthScopeGapKeys(provider.key, oauthStatus) : []);
+	const offerReconnect = $derived(expiresSoon || scopeGapKeys.length > 0);
+	// "Check payments now" (decisions §392): offered only while the server says
+	// an on-request status-sync pass would run (`status_sync_available`).
+	const paymentCheckOffered = $derived(
+		provider ? statusSyncNowOffered(provider.key, oauthStatus) : false
+	);
+	// Today's API calls on a shared-quota ERP (Blackbaud SKY, decisions §324):
+	// the count, its limit, and while calls are refused, until when. Nothing
+	// when the status carries none (another ERP, or the counts were unreadable).
+	const callUsage = $derived(
+		provider && connection !== 'not_connected' ? (oauthStatus?.call_usage ?? null) : null
+	);
+	const callUsageText = $derived(
+		provider
+			? callUsageLines(callUsage, providerLabel(provider), m, {
+					count: (n) => formatCount(n),
+					time: (iso) =>
+						formatDate(iso, '—', {
+							month: 'short',
+							day: 'numeric',
+							hour: 'numeric',
+							minute: '2-digit'
+						})
+				})
+			: []
+	);
 
 	function setStatus(text: string, tone: 'success' | 'failure' | null) {
 		statusMessage = text;
 		statusTone = tone;
+		connectElsewhereUrl = null;
 		// Anything the admin does next replaces the OAuth return message.
 		oauthReturn = null;
 	}
@@ -276,14 +364,130 @@
 	// put the message back after the admin had moved on.
 	onMount(() => {
 		const url = untrack(() => page.url);
-		oauthReturn = readOAuthReturn(url.searchParams);
+		const ret = readOAuthReturn(url.searchParams);
 		const next = withoutOAuthReturn(url);
 		if (next) stripOAuthReturn(next);
+		if (ret?.kind === 'choose') {
+			pickExplicit = true;
+		} else {
+			oauthReturn = ret;
+		}
+		pickRequested = true;
 	});
+
+	$effect(() => {
+		if (!pickRequested || !userLoaded) return;
+		pickRequested = false;
+		if (!readOnly) void loadPending(pickExplicit);
+	});
+
+	/** The picker is gone: move focus to the sentence saying what happened, so
+	 *  it does not fall to the page body (WCAG 2.4.3). */
+	function focusStatus() {
+		void tick().then(() => statusEl?.focus());
+	}
+
+	/** The name the picker and its messages use for the pending ERP. */
+	function pendingErpName(p: ErpPendingConnect): string {
+		const known = catalog?.providers.find((x) => x.key === p.provider);
+		return known ? providerLabel(known) : p.display_name;
+	}
+
+	/** A pick refusal as a sentence: this build's, else the server's. */
+	function pickFailure(err: unknown, erp: string): string {
+		const key = err instanceof ApiError ? pickRefusalKey(err.code) : null;
+		if (key) return m(key, { erp });
+		return err instanceof Error ? err.message : m('org.toast.saveFailed');
+	}
+
+	/** Nothing is parked: the server answers 409 `erp_pick_expired` (it folds
+	 *  "none", "lapsed" and "not this browser" together), and a 404 means the
+	 *  same. */
+	function isNothingPending(err: unknown): boolean {
+		return (
+			err instanceof ApiError &&
+			(err.status === 404 || (err.status === 409 && err.code === 'erp_pick_expired'))
+		);
+	}
+
+	async function loadPending(explicit: boolean) {
+		pendingLoading = true;
+		try {
+			pending = await getErpPendingConnect();
+		} catch (err) {
+			// On a plain mount nothing parked is the normal case, not a failure.
+			if (explicit || !isNothingPending(err)) {
+				setStatus(pickFailure(err, m('org.erp.oauth.yourErp')), 'failure');
+			}
+		} finally {
+			pendingLoading = false;
+		}
+	}
+
+	async function pickCompany(companyId: string) {
+		if (!pending) return;
+		const erp = pendingErpName(pending);
+		picking = true;
+		try {
+			await selectErpCompany(companyId);
+			pending = null;
+			await loadOAuthStatus();
+			setStatus(m('org.erp.oauth.returnConnected', { erp }), 'success');
+			focusStatus();
+		} catch (err) {
+			setStatus(pickFailure(err, erp), 'failure');
+			// Only `erp_pick_expired` says the pending connect is gone. Every
+			// other refusal the admin can act on leaves it parked (decisions §355,
+			// amended): a company the consent did not offer and a lost plan are
+			// refused before anything is spent, and `already_linked` and the two
+			// 503s put it back, so the admin picks again (another company, or the
+			// same one once the cause clears) without a second consent. A refusal
+			// can still have spent it (a token that could not be opened, a put-back
+			// that failed), so the server's own answer decides: re-read it, keep
+			// the picker while it offers something, close it when it does not.
+			if (isNothingPending(err)) {
+				pending = null;
+			} else if (err instanceof ApiError) {
+				await rereadPending();
+			}
+			// Anything else (the network) may have left it waiting: keep the
+			// picker for a retry.
+			if (!pending) focusStatus();
+		} finally {
+			picking = false;
+		}
+	}
+
+	/** After a refused pick: what the server still holds for this browser. A
+	 *  read that fails for any other reason keeps the list already shown. */
+	async function rereadPending() {
+		try {
+			pending = await getErpPendingConnect();
+		} catch (err) {
+			if (isNothingPending(err)) pending = null;
+		}
+	}
+
+	async function cancelPick() {
+		if (!pending) return;
+		const erp = pendingErpName(pending);
+		picking = true;
+		try {
+			await discardErpPendingConnect();
+		} catch {
+			// Nothing was linked either way, and the server lets it lapse.
+		} finally {
+			pending = null;
+			picking = false;
+			setStatus(m('org.erp.oauth.pick.cancelled', { erp }), null);
+			focusStatus();
+		}
+	}
 
 	const returnMessage = $derived.by(() => {
 		const ret = oauthReturn;
-		if (!ret) return '';
+		// `choose` never lands here: it opens the picker instead (onMount).
+		if (!ret || ret.kind === 'choose') return '';
 		if (ret.kind === 'connected') {
 			const p = catalog?.providers.find((x) => x.key === ret.provider);
 			const name =
@@ -354,7 +558,15 @@
 			toast(m('org.toast.sectionSaved', { section: m('org.section.erpSaved') }), 'success');
 			// Saving or removing an own app changes which app a connect uses.
 			if (p.auth === 'oauth') await loadOAuthStatus();
+			unopenable = false;
 		} catch (err) {
+			if (
+				err instanceof ApiError &&
+				err.code === CREDENTIAL_BLOCK_UNOPENABLE &&
+				err.params.block === 'erp'
+			) {
+				unopenable = true;
+			}
 			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
 		} finally {
 			saving = false;
@@ -363,13 +575,12 @@
 
 	async function test() {
 		if (!provider) return;
+		const p = provider;
 		testing = true;
 		setStatus('', null);
 		try {
-			const result = await testErpConnection(
-				buildErpTestPayload(provider, values, mergeErpType, stored)
-			);
-			setStatus(result.message, result.success ? 'success' : 'failure');
+			const result = await testErpConnection(buildErpTestPayload(p, values, mergeErpType, stored));
+			setStatus(erpTestResultText(result, p, providerLabel, m), result.success ? 'success' : 'failure');
 		} catch (err) {
 			setStatus(err instanceof Error ? err.message : m('org.toast.testFailed'), 'failure');
 		} finally {
@@ -390,7 +601,43 @@
 			window.location.href = authorize_url;
 		} catch (err) {
 			connecting = false;
+			if (err instanceof ApiError && err.code === CONNECT_FROM_PLATFORM_HOST) {
+				// The browser-binding cookie cannot be set from this host (a
+				// custom domain); say where the connect does work.
+				const url = platformConnectUrl(err.params);
+				const erp = providerLabel(p);
+				setStatus(
+					m(url ? 'org.erp.oauth.connectFromPlatform' : 'org.erp.oauth.connectUnavailableHere', {
+						erp
+					}),
+					'failure'
+				);
+				connectElsewhereUrl = url;
+				return;
+			}
 			setStatus(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'failure');
+		}
+	}
+
+	/** Run the status-sync pass for this tenant now (`POST …/status-sync`):
+	 *  202 says it started (or one already runs) and the invoices it moves
+	 *  update as it reads them. A refusal is stated in the reader's language by
+	 *  its code: the 429 with how long to wait, a 409 with why no pass can run,
+	 *  after which the status is read again so the button follows the server's
+	 *  new verdict. */
+	async function checkPayments() {
+		if (!provider) return;
+		const p = provider;
+		checkingPayments = true;
+		setStatus('', null);
+		try {
+			const { started } = await startErpStatusSync();
+			setStatus(m(statusSyncStartedKey(started), { erp: providerLabel(p) }), 'success');
+		} catch (err) {
+			setStatus(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'failure');
+			if (err instanceof ApiError && err.status === 409) await loadOAuthStatus();
+		} finally {
+			checkingPayments = false;
 		}
 	}
 
@@ -406,9 +653,12 @@
 		confirmDisconnect = false;
 		disconnecting = true;
 		try {
-			await disconnectErpOAuth();
+			const result = await disconnectErpOAuth();
 			await loadOAuthStatus();
-			setStatus(m('org.erp.oauth.disconnected', { erp: providerLabel(p) }), 'success');
+			// Our copy is gone either way; only a confirmed revocation means the
+			// grant is gone at the provider too (decisions §371).
+			const done = disconnectMessage(result);
+			setStatus(m(done.key, { erp: providerLabel(p) }), done.tone);
 		} catch (err) {
 			setStatus(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'failure');
 		} finally {
@@ -493,8 +743,32 @@
 	</div>
 	<p class="card-hint">{m('org.erp.hint')}</p>
 
+	{#if unopenable && !readOnly}
+		<!-- Clearing also removes the OAuth tokens sealed in the same row, so the
+		     connection then reads as "reconnect". -->
+		<CredentialResetPrompt
+			block="erp"
+			oncleared={(status) => {
+				unopenable = false;
+				storedNames = status.erp;
+				clear = freshClear(provider ?? undefined);
+				void loadOAuthStatus();
+			}}
+		/>
+	{/if}
+
 	{#if readOnly}
 		<p class="card-hint" data-testid="erp-admin-only">{m('org.readOnly.sectionAdminOnly')}</p>
+	{:else if pending}
+		<ErpCompanyPicker
+			erp={pendingErpName(pending)}
+			{pending}
+			submitting={picking}
+			onconnect={pickCompany}
+			oncancel={cancelPick}
+		/>
+	{:else if pendingLoading}
+		<LoadingState label={m('org.erp.oauth.pick.loading', { erp: m('org.erp.oauth.yourErp') })} />
 	{:else if userLoaded && !entitled}
 		<!-- Every catalogue entry is a live ERP; the local-first `mock` ERP
 		     needs no configuration. -->
@@ -505,7 +779,7 @@
 			<button type="button" class="btn-test" onclick={loadCatalog}>{m('common.tryAgain')}</button>
 		</div>
 	{:else if !catalog}
-		<p class="card-hint" aria-busy="true">{m('org.erp.loading')}</p>
+		<LoadingState label={m('org.erp.loading')} />
 	{:else}
 		<div class="form-grid">
 			<label class="full-width">
@@ -624,13 +898,41 @@
 										})
 									: m('org.erp.oauth.connected', { erp: providerLabel(provider) })}
 							{:else if connection === 'needs_reconnect'}
-								{m('org.erp.oauth.needsReconnect', { erp: providerLabel(provider) })}
+								{m(attentionKey ?? 'org.erp.oauth.needsReconnect', { erp: providerLabel(provider) })}
 							{:else}
 								{m('org.erp.oauth.notConnected', { erp: providerLabel(provider) })}
 							{/if}
 						</p>
+						{#if expiresSoon}
+							<p class="oauth-state failure-text" data-testid="erp-oauth-expiring">
+								{m('org.erp.oauth.expiresSoon', {
+									erp: providerLabel(provider),
+									date: formatDate(oauthStatus?.refresh_token_expires_at)
+								})}
+							</p>
+						{/if}
+						{#each scopeGapKeys as key (key)}
+							<p class="oauth-state failure-text" data-testid="erp-oauth-scope-gap">
+								{m(key, { erp: providerLabel(provider) })}
+							</p>
+						{/each}
+						{#if callUsageText.length}
+							<div class="call-usage" data-testid="erp-call-usage">
+								<p class="oauth-state">{callUsageText[0]}</p>
+								{#if callUsageText[1]}
+									<p class="oauth-state failure-text" data-testid="erp-call-usage-paused">
+										{callUsageText[1]}
+									</p>
+								{/if}
+							</div>
+						{/if}
 						{#if oauthStatusFailed}
 							<p class="oauth-state failure-text">{m('org.erp.oauth.statusFailed')}</p>
+						{/if}
+						{#if paymentCheckOffered}
+							<p class="oauth-state" id="{uid}-check-payments-hint">
+								{m('org.erp.oauth.checkPaymentsHint', { erp: providerLabel(provider) })}
+							</p>
 						{/if}
 						<div class="action-buttons">
 							{#if connection === 'connected'}
@@ -641,6 +943,44 @@
 								>
 									{saving ? m('org.common.saving') : m('org.erp.save')}
 								</button>
+								<!-- Same handler and live region as a credentials ERP: the
+								     backend tests the saved connection with its stored
+								     tokens (`config_for_connection_test`). -->
+								<button
+									class="btn-test"
+									data-testid="erp-oauth-test"
+									disabled={testing || !provider.available}
+									onclick={test}
+								>
+									{testing ? m('org.common.testing') : m('org.common.testConnection')}
+								</button>
+								{#if paymentCheckOffered}
+									<!-- Its result lands in the shared live region below. -->
+									<button
+										class="btn-test"
+										data-testid="erp-check-payments"
+										disabled={checkingPayments || !provider.available}
+										aria-describedby="{uid}-check-payments-hint"
+										onclick={checkPayments}
+									>
+										{checkingPayments
+											? m('org.erp.oauth.checkingPayments')
+											: m('org.erp.oauth.checkPayments')}
+									</button>
+								{/if}
+								{#if offerReconnect}
+									<!-- A fresh consent replaces the expiring or narrower one
+									     in place (the callback writes a new connection, which
+									     asks for every scope). -->
+									<button
+										class="btn-test"
+										data-testid="erp-oauth-reconnect"
+										disabled={connecting || !provider.available}
+										onclick={connect}
+									>
+										{m('org.erp.oauth.reconnect', { erp: providerLabel(provider) })}
+									</button>
+								{/if}
 							{:else}
 								<button
 									class="btn-save-section"
@@ -693,12 +1033,24 @@
 	<p
 		class="test-result"
 		role="status"
+		tabindex="-1"
+		bind:this={statusEl}
 		data-testid="erp-status"
 		class:success={shownTone === 'success'}
 		class:failure={shownTone === 'failure' && !!shownMessage}
 	>
 		{shownMessage}
 	</p>
+	{#if connectElsewhereUrl && statusMessage}
+		<!-- Outside the live region: the sentence above is what is announced;
+		     the link is a named control, never a URL read out character by
+		     character. -->
+		<p class="connect-elsewhere">
+			<a href={connectElsewhereUrl} data-testid="erp-connect-elsewhere"
+				>{m('org.erp.oauth.connectFromPlatformLink')}</a
+			>
+		</p>
+	{/if}
 </section>
 
 <style>
@@ -872,6 +1224,12 @@
 		color: var(--text-muted);
 	}
 
+	.call-usage {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
 	.oauth-state.connected {
 		color: var(--text);
 		font-weight: 500;
@@ -923,6 +1281,11 @@
 
 	.test-result:empty {
 		margin: 0;
+	}
+
+	.connect-elsewhere {
+		font-size: 0.85rem;
+		margin: 4px 0 0;
 	}
 
 	.test-result.success {

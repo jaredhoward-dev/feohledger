@@ -1,7 +1,29 @@
 import type { Page } from '@playwright/test';
 
-import { API_BASE, expect, NO_TENANT_BASE, TENANT_ROOT_URL, tenantBase, test } from '../fixtures/helpers';
+import {
+	ACME_ADMIN,
+	API_BASE,
+	expect,
+	NO_TENANT_BASE,
+	TENANT_ROOT_URL,
+	tenantBase,
+	test
+} from '../fixtures/helpers';
 import { SERVICES, skipUnlessReachable } from '../fixtures/services';
+import { captchaEvent, stubCaptcha } from './captchaStub';
+
+/**
+ * The palette the page is actually showing, read the way the app resolves it
+ * (`src/lib/theme.ts::resolveTheme`): an explicit `data-theme` wins, and
+ * System follows `prefers-color-scheme: light`, else dark.
+ */
+async function resolvedPageTheme(page: Page): Promise<'light' | 'dark'> {
+	return page.evaluate(() => {
+		const choice = document.documentElement.dataset.theme;
+		if (choice === 'light' || choice === 'dark') return choice;
+		return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+	});
+}
 
 /**
  * Self-service signup — the full new-user journey, driven through the UI.
@@ -61,6 +83,40 @@ async function waitForEmail(page: Page, email: string, subjectPrefix: string): P
 		.not.toBeNull();
 	return messageText(page, id!);
 }
+
+/**
+ * Like {@link waitForEmail}, but for an address other specs also mail (a seeded
+ * login): the message must also mention `needle`, so an older one with the same
+ * subject is never mistaken for this run's.
+ */
+async function waitForEmailMentioning(
+	page: Page,
+	email: string,
+	subjectPrefix: string,
+	needle: string
+): Promise<string> {
+	let text: string | null = null;
+	await expect
+		.poll(
+			async () => {
+				for (const msg of await messagesTo(page, email)) {
+					if (!msg.Subject.startsWith(subjectPrefix)) continue;
+					const body = await messageText(page, msg.ID);
+					if (body.includes(needle)) {
+						text = body;
+						break;
+					}
+				}
+				return text;
+			},
+			{ timeout: 15_000 }
+		)
+		.not.toBeNull();
+	return text!;
+}
+
+// The captcha stub (sitekey, endpoints, a fake explicit-render hCaptcha) is
+// shared with captcha.spec.ts and form-rules.spec.ts: ./captchaStub.ts.
 
 test.use({ storageState: { cookies: [], origins: [] } });
 
@@ -159,52 +215,24 @@ test.describe('/signup — form', () => {
 		await expect(emailField).toBeFocused();
 	});
 
-	test('with captcha enabled, "try again" re-renders the widget and demands a fresh token', async ({
+	// Run under each OS colour scheme: the page follows the system by default
+	// (docs/decisions.md §289), so the widget must take whichever palette the
+	// page resolved to — pinned per run rather than left to the runner's default.
+	for (const scheme of ['dark', 'light'] as const) test(`with captcha enabled, "try again" re-renders the widget and demands a fresh token (${scheme} OS)`, async ({
 		page
 	}) => {
-		// Local dev and CI run with no hCaptcha sitekey (local-first default), so
-		// this path is otherwise never exercised. Everything external is stubbed:
-		// the sitekey, the submit endpoint (so the test can read what each
-		// attempt sent), and hCaptcha's script — faked with the one behaviour
-		// that matters here, IMPLICIT rendering: it draws a widget into each
-		// `.h-captcha` present when it loads, and nothing added later. It also
-		// records the theme each widget got: implicit mode reads `data-theme`,
-		// an explicit render reads `opts.theme`.
-		const submissions: Array<{ captcha_token: string | null }> = [];
-		await page.route('**/api/public-config', (route) =>
-			route.fulfill({
-				json: { hcaptcha_sitekey: 'e2e-sitekey', tenant_url_template: tenantBase('{slug}') }
-			})
-		);
-		await page.route('**/api/signup/slug-check**', (route) =>
-			route.fulfill({ json: { slug: 'x', available: true, reason: null } })
-		);
-		await page.route('**/api/signup/start', async (route) => {
-			submissions.push(route.request().postDataJSON());
-			await route.fulfill({ json: { status: 'pending', message: 'We sent a verification link.' } });
-		});
-		await page.route('https://hcaptcha.com/1/api.js', (route) =>
-			route.fulfill({
-				contentType: 'application/javascript',
-				body: `(() => {
-					let widgets = 0;
-					window.hcaptcha = {
-						render(el, opts) {
-							el.dataset.widget = String(++widgets);
-							el.dataset.renderedTheme = (opts && opts.theme) || el.dataset.theme || 'light';
-							window.__solveCaptcha = opts && opts.callback;
-						}
-					};
-					document.querySelectorAll('.h-captcha').forEach((el) => window.hcaptcha.render(el, {}));
-				})();`
-			})
-		);
+		await page.emulateMedia({ colorScheme: scheme });
+		const { submissions } = await stubCaptcha(page);
 
 		await page.goto('/signup');
 		const widget = page.locator('.h-captcha');
 		await expect(widget).toHaveAttribute('data-widget', '1');
-		// The app is dark-only, so a light widget is a white box on the form.
-		await expect(widget).toHaveAttribute('data-rendered-theme', 'dark');
+		// The widget is an iframe and cannot see our palette: it must be told the
+		// one the page is showing, or it is a white box on a dark form (or the
+		// reverse). No stored choice, so the page is on System → the OS scheme.
+		await expect(page.locator('html')).toHaveAttribute('data-theme', 'system');
+		expect(await resolvedPageTheme(page)).toBe(scheme);
+		await expect(widget).toHaveAttribute('data-rendered-theme', scheme);
 
 		await fillForm(page, {
 			company: 'Captcha Co',
@@ -213,18 +241,19 @@ test.describe('/signup — form', () => {
 			email: 'captcha@example.com'
 		});
 		await expect(page.locator('small.hint.ok')).toBeVisible();
-		// Implicit mode reports a solve through the named global callback.
-		await page.evaluate(() => (window as unknown as { hcaptchaCallback: (t: string) => void }).hcaptchaCallback('token-1'));
+		await captchaEvent(page, 'solve', 'token-1');
 		await page.getByRole('button', { name: 'Send verification email' }).click();
 		await expect(page.getByRole('heading', { name: 'Check your email' })).toBeFocused();
 		expect(submissions.map((b) => b.captcha_token)).toEqual(['token-1']);
 
 		await page.getByRole('button', { name: 'try again' }).click();
 
-		// A NEW container was mounted, long after the script loaded: only an
-		// explicit render puts a widget in it.
+		// A NEW container was mounted, long after the script loaded, and gets a
+		// widget of its own; the old one, whose container left with the form, is
+		// removed.
 		await expect(widget).toHaveAttribute('data-widget', '2');
-		await expect(widget).toHaveAttribute('data-rendered-theme', 'dark');
+		expect(await page.evaluate(() => (window as unknown as { __removedWidgets: string[] }).__removedWidgets)).toEqual(['w1']);
+		await expect(widget).toHaveAttribute('data-rendered-theme', scheme);
 
 		// The spent token must not ride along: submitting unsolved is refused
 		// client-side and never reaches the endpoint.
@@ -233,10 +262,69 @@ test.describe('/signup — form', () => {
 		expect(submissions).toHaveLength(1);
 
 		// Solving the re-rendered widget is what the retry then carries.
-		await page.evaluate(() => (window as unknown as { __solveCaptcha: (t: string) => void }).__solveCaptcha('token-2'));
+		await captchaEvent(page, 'solve', 'token-2');
 		await page.getByRole('button', { name: 'Send verification email' }).click();
 		await expect(page.getByRole('heading', { name: 'Check your email' })).toBeVisible();
 		expect(submissions.map((b) => b.captcha_token)).toEqual(['token-1', 'token-2']);
+	});
+
+	// The widget follows the theme AFTER first render too (docs/decisions.md
+	// §290): it was read once at render, so a theme picked on the shell — or the
+	// OS switching while on System — left a dark captcha on a light form. A
+	// solved widget is the exception: redrawing it would throw away the token.
+	test('with captcha enabled, the widget follows a theme change, but never at the cost of a solved token', async ({
+		page
+	}) => {
+		await page.emulateMedia({ colorScheme: 'dark' });
+		const { submissions } = await stubCaptcha(page);
+		await page.goto('/signup');
+		const widget = page.locator('.h-captcha');
+		await expect(widget).toHaveAttribute('data-widget', '1');
+		await expect(widget).toHaveAttribute('data-rendered-theme', 'dark');
+
+		// Picked on the auth shell's own theme control: redrawn in light.
+		const picker = page.getByRole('group', { name: 'Theme' });
+		await picker.getByRole('radio', { name: 'Light' }).check();
+		await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+		await expect(widget).toHaveAttribute('data-widget', '2');
+		await expect(widget).toHaveAttribute('data-rendered-theme', 'light');
+
+		// Back to System while the OS is dark, then the OS turns light: the
+		// widget follows the OS with no click at all.
+		await picker.getByRole('radio', { name: 'System' }).check();
+		await expect(widget).toHaveAttribute('data-rendered-theme', 'dark');
+		await page.emulateMedia({ colorScheme: 'light' });
+		await expect(widget).toHaveAttribute('data-rendered-theme', 'light');
+		await expect(widget).toHaveAttribute('data-widget', '4');
+		expect(
+			await page.evaluate(() => (window as unknown as { __removedWidgets: string[] }).__removedWidgets)
+		).toEqual(['w1', 'w2', 'w3']);
+
+		// Solved, then the theme changes: the widget — and its token — stay.
+		await fillForm(page, {
+			company: 'Theme Co',
+			slug: 'themeco',
+			name: 'Theme Admin',
+			email: 'theme@example.com'
+		});
+		await captchaEvent(page, 'solve', 'token-kept');
+		await picker.getByRole('radio', { name: 'Dark' }).check();
+		await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+		await expect(widget).toHaveAttribute('data-widget', '4');
+		await expect(widget).toHaveAttribute('data-rendered-theme', 'light');
+
+		// Once the token expires it is worth nothing, so the widget is redrawn in
+		// the palette now showing...
+		await captchaEvent(page, 'expire');
+		await expect(widget).toHaveAttribute('data-widget', '5');
+		await expect(widget).toHaveAttribute('data-rendered-theme', 'dark');
+
+		// ...and a token solved before a theme change is the one submitted.
+		await captchaEvent(page, 'solve', 'token-final');
+		await picker.getByRole('radio', { name: 'Light' }).check();
+		await page.getByRole('button', { name: 'Send verification email' }).click();
+		await expect(page.getByRole('heading', { name: 'Check your email' })).toBeVisible();
+		expect(submissions.map((b) => b.captcha_token)).toEqual(['token-final']);
 	});
 
 	test('a taken slug blocks submission with an inline reason', async ({ page }) => {
@@ -328,13 +416,208 @@ test.describe('/verify — outcomes', () => {
 		await expect(page.getByRole('link', { name: 'Set your password' })).toHaveCount(0);
 	});
 
-	test('an invalid/expired token surfaces the uniform error', async ({ page }) => {
+	test('a transient failure offers Try again, which completes the same link', async ({ page }) => {
+		// Completion is idempotent, so a 5xx is retried in place rather than
+		// sending the visitor back through a whole new signup.
+		let calls = 0;
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) => {
+				calls += 1;
+				if (calls === 1) return route.fulfill({ status: 503, json: { detail: 'Service unavailable' } });
+				return route.fulfill({
+					json: {
+						status: 'provisioned',
+						slug: 'stubco',
+						tenant_url: '',
+						admin_email: 'admin@stubco.example',
+						set_password_url: null
+					}
+				});
+			}
+		);
 		await page.goto('/verify?token=' + 'x'.repeat(40));
-		await expect(page.getByRole('heading', { name: 'Something went wrong' })).toBeVisible({
+		await expect(page.getByRole('heading', { name: 'Something went wrong' })).toBeVisible();
+		await page.getByRole('button', { name: 'Try again' }).click();
+		await expect(page.getByRole('heading', { name: 'Your workspace is ready' })).toBeVisible();
+		expect(calls).toBe(2);
+	});
+
+	test('a refused link offers no Try again', async ({ page }) => {
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) => route.fulfill({ status: 400, json: { detail: 'Invalid verification token' } })
+		);
+		await page.goto('/verify?token=' + 'x'.repeat(40));
+		await expect(page.getByRole('heading', { name: 'Something went wrong' })).toBeVisible();
+		await expect(page.getByRole('link', { name: 'Start over' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Try again' })).toHaveCount(0);
+	});
+
+	test('a re-opened link shows the workspace and a way to sign in, with nothing re-issued', async ({
+		page
+	}) => {
+		// decisions §292: a reload or a second tab used to get "invalid, sign up
+		// again". The server now re-answers a spent link with its workspace.
+		const signInUrl = `${tenantBase('stubco')}/login?email=admin%40stubco.example`;
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) =>
+				route.fulfill({
+					json: {
+						status: 'provisioned',
+						slug: 'stubco',
+						tenant_url: tenantBase('stubco'),
+						admin_email: 'admin@stubco.example',
+						set_password_url: null,
+						sign_in_url: signInUrl,
+						already_verified: true
+					}
+				})
+		);
+		await page.goto('/verify?token=' + 'x'.repeat(40));
+		await expect(page.getByRole('heading', { name: 'Your workspace is ready' })).toBeVisible();
+		await expect(page.getByText(/you already confirmed this email/i)).toBeVisible();
+		await expect(page.getByRole('link', { name: 'Go to sign in' })).toHaveAttribute(
+			'href',
+			signInUrl
+		);
+		await expect(page.getByRole('link', { name: 'Set your password' })).toHaveCount(0);
+	});
+
+	test('an address that already has a workspace is pointed at it', async ({ page }) => {
+		const signInUrl = `${tenantBase('stubco')}/login?email=admin%40stubco.example`;
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) =>
+				route.fulfill({
+					status: 409,
+					json: {
+						detail: {
+							code: 'signup_email_has_workspace',
+							message: 'server English',
+							params: { sign_in_url: signInUrl }
+						}
+					}
+				})
+		);
+		await page.goto('/verify?token=' + 'x'.repeat(40));
+		await expect(
+			page.getByRole('heading', { name: 'You already have a workspace' })
+		).toBeVisible();
+		// The localized sentence, not the server's English.
+		await expect(
+			page.getByText('This email address already has a FeohLedger workspace.', { exact: false })
+		).toBeVisible();
+		await expect(
+			page.getByRole('link', { name: "Go to your workspace's sign-in page" })
+		).toHaveAttribute('href', signInUrl);
+		await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
+	});
+
+	test('an invalid/expired token says the link expired, in the reader\'s language', async ({
+		page
+	}) => {
+		// The real backend: the uniform 410 for a token that never existed.
+		await page.goto('/verify?token=' + 'x'.repeat(40));
+		await expect(page.getByRole('heading', { name: 'This link has expired' })).toBeVisible({
 			timeout: 10_000
 		});
-		// Backend returns the uniform 410 message (no 404-vs-410 enumeration).
-		await expect(page.getByText(/invalid or has expired/i)).toBeVisible();
+		await expect(page.getByText(/verification links work once and last 24 hours/i)).toBeVisible();
+		// Both ways on: a fresh link, or the workspace someone already made.
+		await expect(page.getByRole('link', { name: 'Start over' })).toHaveAttribute(
+			'href',
+			'/signup'
+		);
+		await expect(page.getByText(/already set up your workspace\?/i)).toBeVisible();
+		// Neither the generic failure nor the server's English sentence.
+		await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
+		await expect(page.getByText(/please sign up again/i)).toHaveCount(0);
+	});
+
+	test('the 410 is read by its status, never by the server\'s wording', async ({ page }) => {
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) => route.fulfill({ status: 410, json: { detail: 'any wording at all' } })
+		);
+		await page.goto('/verify?token=' + 'x'.repeat(40));
+		await expect(page.getByRole('heading', { name: 'This link has expired' })).toBeVisible();
+		await expect(page.getByText('any wording at all')).toHaveCount(0);
+	});
+
+	test('the token leaves the address bar once the link has been answered', async ({ page }) => {
+		// Left in place it stays in history, a copied URL and a screenshot.
+		const requested: string[] = [];
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) => {
+				requested.push(route.request().postDataJSON().token);
+				return route.fulfill({
+					json: {
+						status: 'provisioned',
+						slug: 'stubco',
+						tenant_url: tenantBase('stubco'),
+						admin_email: 'admin@stubco.example',
+						set_password_url: null
+					}
+				});
+			}
+		);
+		const token = 'y'.repeat(40);
+		await page.goto(`/verify?token=${token}&utm_source=email`);
+		await expect(page.getByRole('heading', { name: 'Your workspace is ready' })).toBeVisible();
+		await expect(page).toHaveURL(/\/verify\?utm_source=email$/);
+		expect(page.url()).not.toContain(token);
+		// The request itself still carried it.
+		expect(requested).toEqual([token]);
+	});
+
+	test('a reload after the strip still re-sends the token, from the tab\'s own history entry', async ({
+		page
+	}) => {
+		// The token left the address bar, but a reload must still reach the
+		// backend's re-answer for a spent link (decisions §292), not "no token".
+		const signInUrl = `${tenantBase('stubco')}/login?email=admin%40stubco.example`;
+		const sent: string[] = [];
+		await page.route(
+			(url) => url.pathname === '/api/signup/complete',
+			(route) => {
+				sent.push(route.request().postDataJSON().token);
+				return route.fulfill({
+					json: {
+						status: 'provisioned',
+						slug: 'stubco',
+						tenant_url: tenantBase('stubco'),
+						admin_email: 'admin@stubco.example',
+						set_password_url: null,
+						sign_in_url: signInUrl,
+						already_verified: sent.length > 1
+					}
+				});
+			}
+		);
+		const token = 'r'.repeat(40);
+		await page.goto(`/verify?token=${token}`);
+		await expect(page.getByRole('heading', { name: 'Your workspace is ready' })).toBeVisible();
+		await expect(page).toHaveURL(/\/verify$/);
+
+		await page.reload();
+		await expect(page.getByText(/you already confirmed this email/i)).toBeVisible();
+		await expect(page.getByRole('link', { name: 'Go to sign in' })).toHaveAttribute(
+			'href',
+			signInUrl
+		);
+		await expect(page).toHaveURL(/\/verify$/);
+		expect(sent).toEqual([token, token]);
+	});
+
+	test('the token is stripped from a refused link too', async ({ page }) => {
+		const token = 'z'.repeat(40);
+		await page.goto(`/verify?token=${token}`);
+		await expect(page.getByRole('heading', { name: 'This link has expired' })).toBeVisible({
+			timeout: 10_000
+		});
+		await expect(page).toHaveURL(/\/verify$/);
 	});
 });
 
@@ -385,6 +668,22 @@ test.describe('signup happy path (UI + Mailpit)', () => {
 		const setPassword = page.getByRole('link', { name: 'Set your password' });
 		await expect(setPassword).toHaveAttribute('href', emailed![0]);
 
+		// 3b. Opening the same link again — a second tab here — is re-answered
+		//     with the workspace, not "invalid, sign up again", and issues no
+		//     second set-password link (decisions §292).
+		const secondTab = await page.context().newPage();
+		await secondTab.goto(verifyLink![0]);
+		await expect(
+			secondTab.getByRole('heading', { name: 'Your workspace is ready' })
+		).toBeVisible({ timeout: 20_000 });
+		await expect(secondTab.getByText(/you already confirmed this email/i)).toBeVisible();
+		await expect(secondTab.getByRole('link', { name: 'Set your password' })).toHaveCount(0);
+		await expect(secondTab.getByRole('link', { name: 'Go to sign in' })).toHaveAttribute(
+			'href',
+			`${tenantBase(slug)}/login?email=${encodeURIComponent(email)}`
+		);
+		await secondTab.close();
+
 		// 4. "Set your password" goes straight to the tenant's set-password page.
 		await setPassword.click();
 		await expect(page).toHaveURL(new RegExp(`^${tenantBase(slug)}/login/reset-password\\?`));
@@ -415,5 +714,51 @@ test.describe('signup happy path (UI + Mailpit)', () => {
 			data: { token }
 		});
 		expect(spent.status()).toBe(400);
+	});
+
+	test('an address that already has a workspace: verify link → pointed at that workspace', async ({
+		page
+	}) => {
+		// `users.email` is unique across workspaces, so this used to end in a 500
+		// "contact support" on every open of the link (decisions §292). /start
+		// still answers it like any other address — it is public.
+		const slug = `e2edup${Date.now().toString().slice(-9)}`;
+		const email = ACME_ADMIN.email;
+
+		await page.goto('/signup');
+		await page.getByLabel('Company name').fill('Duplicate Co');
+		await page.getByPlaceholder('acme').fill(slug);
+		await page.getByLabel('Your name').fill('Duplicate Admin');
+		await page.getByLabel('Email').fill(email);
+		await expect(page.locator('small.hint.ok')).toBeVisible({ timeout: 5_000 });
+		await page.getByRole('button', { name: 'Send verification email' }).click();
+		await expect(page.getByRole('heading', { name: 'Check your email' })).toBeVisible({
+			timeout: 10_000
+		});
+
+		// The seeded login is mailed by other specs too: pick this run's message.
+		const verifyBody = await waitForEmailMentioning(page, email, 'Verify your FeohLedger', slug);
+		const verifyLink = verifyBody.match(/\/verify\?token=[A-Za-z0-9_-]+/);
+		expect(verifyLink, 'verify link in email').toBeTruthy();
+
+		const ownSignIn = `${tenantBase('acme')}/login?email=${encodeURIComponent(email)}`;
+		for (const open of ['first open', 'reload']) {
+			if (open === 'first open') await page.goto(verifyLink![0]);
+			else await page.reload();
+			await expect(
+				page.getByRole('heading', { name: 'You already have a workspace' }),
+				open
+			).toBeVisible({ timeout: 20_000 });
+			await expect(
+				page.getByRole('link', { name: "Go to your workspace's sign-in page" }),
+				open
+			).toHaveAttribute('href', ownSignIn);
+		}
+
+		// Nothing was created under the requested name.
+		const check = await page.request.get(`${API_BASE}/api/signup/slug-check`, {
+			params: { slug }
+		});
+		expect(((await check.json()) as { available: boolean }).available).toBe(true);
 	});
 });

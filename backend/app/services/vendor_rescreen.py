@@ -50,10 +50,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import settings
 from app.database import _make_tenant_url, control_session_factory
+from app.db_engine import create_async_engine
 from app.models.organization import Organization
 from app.models.vendor import Vendor
 from app.services.sweep_health import SWEEP_VENDOR_RESCREEN, run_sweep_loop
@@ -240,7 +241,12 @@ async def _sweep_tenant(
                     vendor_failures += 1
                     continue
 
-                if not was_flagged and outcome.screening_status in _FLAGGED_STATUSES:
+                if (
+                    not was_flagged
+                    and outcome.screening_status in _FLAGGED_STATUSES
+                    # An adjudicated false positive (decisions §477) is not news.
+                    and outcome.adjudication_id is None
+                ):
                     new_flags += 1
                     # No notification event-type exists for vendor screening
                     # (see module docstring); log so the AP team can monitor.

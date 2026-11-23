@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -49,11 +50,12 @@ import httpx
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.exceptions import EXCEPTION_TYPE_LABELS
 from app.config import settings
 from app.models.invoice import Invoice, InvoiceExtractionResult
 from app.models.user import User
 from app.models.workflow import AuditLog
+from app.services import provider_credentials
+from app.services.exception_lifecycle import EXCEPTION_TYPE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +152,13 @@ Respond with a single JSON object, no surrounding prose:
 """
 
 
+def _invoice_currency(invoice) -> str | None:
+    """The invoice's own code, or None when it records none."""
+    from app.services.payment_runs import payable_currency_code
+
+    return payable_currency_code(getattr(invoice, "currency", None))
+
+
 def _invoice_payload(invoice) -> dict:
     """Non-PII invoice fields for the prompt. Amount is stringified only into
     this throwaway prompt — never stored as float-for-currency."""
@@ -157,7 +166,9 @@ def _invoice_payload(invoice) -> dict:
         "invoice_number": invoice.invoice_number or "",
         "vendor_name": invoice.vendor_name or "",
         "amount": str(invoice.amount) if invoice.amount is not None else None,
-        "currency": invoice.currency or "USD",
+        # None (JSON null) when the invoice records no currency — never a
+        # guessed "USD" the model would then repeat as fact (decisions §466).
+        "currency": _invoice_currency(invoice),
         "status": str(invoice.status.value if hasattr(invoice.status, "value") else invoice.status),
     }
 
@@ -291,6 +302,9 @@ _ACTION_PHRASES: dict[str, tuple[str, bool]] = {
     "invoice.erp_retried": ("resubmitted to ERP", _PASSIVE),
     "invoice.erp_confirmed": ("accepted by the ERP", _PASSIVE),
     "invoice.erp_failed": ("failed to post to the ERP", _ACTIVE),
+    # Approval was configured to start the push and a gate refused it; the
+    # invoice stayed `approved` (decisions §304).
+    "invoice.erp_auto_send_refused": ("held back from the automatic ERP send", _PASSIVE),
     "invoice.peppol_sent": ("sent over PEPPOL", _PASSIVE),
     "invoice.peppol_send_failed": ("failed to send over PEPPOL", _ACTIVE),
     "invoice.payment_scheduled": ("scheduled for payment", _PASSIVE),
@@ -379,11 +393,12 @@ def build_template_summary(
     inv_no = invoice.invoice_number or "this invoice"
     vendor = invoice.vendor_name or "an unknown vendor"
     amount = str(invoice.amount) if invoice.amount is not None else None
-    currency = invoice.currency or "USD"
+    currency = _invoice_currency(invoice)
 
     head = f"Invoice {inv_no} from {vendor}"
     if amount is not None:
-        head += f" for {amount} {currency}"
+        # A code-less figure is stated bare, never as dollars (decisions §466).
+        head += f" for {amount} {currency}" if currency else f" for {amount}"
 
     phrases: list[tuple[str, bool]] = []
     for e in events:
@@ -437,19 +452,19 @@ def build_template_summary(
 # ---------- Config resolution (mirrors extraction) -------------------------
 
 
-def _resolve_summary_config(org_settings: dict | None) -> dict:
+async def _resolve_summary_config(org_settings: dict | None, *, organization_id: uuid.UUID) -> dict:
     """Resolve the LLM config for summarization. Platform mode uses the
-    app-level Anthropic key + model; BYOK uses the org's extraction settings.
+    app-level Anthropic key + model; BYOK uses the org's extraction settings,
+    its sealed key opened through `provider_credentials.byok_extraction_config`.
     Returns `{"api_key", "model"}` — empty `api_key` selects the template path.
     """
     if not settings.audit_summary_enabled:
         return {"api_key": "", "model": ""}
 
-    extraction = (org_settings or {}).get("extraction", {})
-    program_type = extraction.get("program_type", "platform")
     model = settings.audit_summary_model or settings.extraction_model
+    extraction = await provider_credentials.byok_extraction_config(organization_id, org_settings)
 
-    if program_type == "byok":
+    if extraction is not None:
         # Only a `claude_vision` org's key is an Anthropic key. Any other BYOK
         # provider's secret must never be posted to api.anthropic.com, and the
         # platform key is no fallback (it would engage Anthropic for an org that
@@ -635,7 +650,7 @@ async def get_or_build_summary(
 
     events = await _load_events(db, control_db, invoice.correlation_id)
     extraction_meta = await _load_extraction_meta(db, invoice)
-    config = _resolve_summary_config(org_settings)
+    config = await _resolve_summary_config(org_settings, organization_id=invoice.organization_id)
     result = await summarize(invoice, events, extraction_meta, config=config, http_post=http_post)
 
     generated_at = datetime.now(UTC).isoformat()

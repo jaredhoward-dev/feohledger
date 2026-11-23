@@ -25,15 +25,30 @@ draft ─submit─▶ pending_approval ─approve─▶ approved ─convert─�
 
 Authoritative transition table:
 `backend/app/services/requisition_service.py::VALID_TRANSITIONS`. An invalid
-source → target move is a **422** (never a silent no-op), enforced by
-`guard_transition`. `converted` and `cancelled` are terminal; `rejected` can be
-re-opened back to `draft`.
+source → target move is a **422** (never a silent no-op) with the coded detail
+`requisition_status_refused` (`params.status`, `params.target`), raised from
+`services/procurement_controls.requisition_transition_refusal`. `converted` and
+`cancelled` are terminal; `rejected` can be re-opened back to `draft`.
+
+**Action verdicts.** Every `/api/requisitions` response row carries the
+caller's `actions.{submit,approve,reject,convert,cancel,reopen}` — `null` when
+that route would accept the caller, else its coded refusal — built by
+`api/requisitions.requisition_action_refusals` from the route's role tuple and
+the gate it raises from (`procurement_controls.requisition_transition_refusal`,
+`.requisition_approve_refusal` — status, then the segregation 403 below —
+and `.requisition_convert_refusal`). The /requisitions page reads them instead
+of restating the rules; the requester sees Reject (the route never refused
+them — segregation guards approval, not withdrawal) and a material editor
+sees Approve disabled beside the segregation sentence. Parity:
+`tests/test_procurement_action_verdicts.py`.
 
 - **submit** (`draft → pending_approval`) — stamps `submitted_at`.
 - **approve** (`pending_approval → approved`) — stamps `approved_by` /
   `approved_at`. Enforces **segregation of duties**: the approver must be
-  neither `requester_user_id` nor anyone in `material_editor_ids` (reuses
-  `approval_chain.check_segregation` via an attribute shim → **403**). See
+  neither `requester_user_id` nor anyone in `material_editor_ids` (the shared
+  `approval_chain.violates_segregation` rule via an attribute shim → **403**
+  `requisition_approval_segregation`, its own code and sentence: the invoice
+  `approval_segregation` one says "this invoice"). See
   [Who an approval refuses](#who-an-approval-refuses) below.
 - **reject** (`pending_approval → rejected`) — records `rejection_reason`.
 - **cancel** (`draft` / `submitted` / `pending_approval` / `approved →
@@ -147,8 +162,12 @@ traceability. The conversion is audited (`requisition.converted_to_po`).
   bought twice. Guarding it here closes that at the application layer instead
   of relying on the FK's `ON DELETE` mode never changing.
 
-An ordinary `draft` (or rejected / cancelled) requisition still deletes
-normally — the guard is narrow by design.
+Every other requisition still deletes, whatever its status — the guard is
+narrow by design. Both refusals are coded (`requisition_delete_converted`,
+`requisition_delete_from_intake`) and come from
+`services/procurement_controls.requisition_delete_refusal`, the gate each row's
+`actions.delete` is built from, so /requisitions offers Delete exactly where it
+succeeds (it used to restate `status === 'draft'`; decisions §487).
 
 ## Endpoints
 
@@ -192,6 +211,21 @@ rollup, so `GET /budgets/{id}/spend` reported `committed: 0` and
 `/budgets/check` answered `would_overspend: false` for headroom already spoken
 for. The pair is re-checked on `PATCH` when `currency` changes alone, so a
 currency edit can't orphan an existing link either.
+
+The form links a budget through `ui/BudgetPicker`, which lists only budgets in
+the requisition's currency, and runs `GET /budgets/check` on the draft's total
+before save — an overspend is a warning, a currency mismatch blocks the save.
+While a fresh check runs, the last settled verdict stays in its live region
+marked `aria-busy`, so a screen reader hears only settled results.
+See `backend/docs/procurement-budgets.md` § `GET /budgets/check` contract.
+
+Once submitted (`submitted` / `pending_approval` / `approved` — the statuses
+the spend legs count), the same modal shows the approver a read-only headroom
+line from `GET /budgets/{id}/spend`, whose `committed` already includes this
+requisition: over or within by the sign of the backend's `remaining`, plus the
+unverifiable-PO and other-currency disclosures. It never re-asks
+`/budgets/check` with the requisition's total, which would count it twice
+(`utils/budgetPicker.ts::budgetHeadroomView`).
 
 Existence was checked; **the entity boundary was not**. All three targets carry
 `EntityMixin`, and the org-scoped-only lookup accepted a sibling subsidiary's
@@ -243,8 +277,10 @@ delete / submit / cancel): `admin` / `ap_manager` / `ap_clerk`. Approve / reject
   may reject a requisition and may **not** reopen one, so the button is absent
   for them rather than a control that can only 403.
 - `frontend/src/lib/components/modals/RequisitionModal.svelte` — create / detail
-  / edit dialog over the shared `Modal`, with an editable line-item grid and a
-  live computed total.
+  / edit dialog over the shared `Modal`, with an editable line-item grid, a
+  live computed total, and (admin | ap_manager | cfo — the budget readers) a
+  `ui/BudgetPicker` with the debounced `GET /budgets/check` overspend warning
+  under it (`utils/budgetPicker.ts`; e2e `tests-e2e/requisitions/budget-link.spec.ts`).
 - `frontend/src/lib/api/requisitions.ts` + `frontend/src/lib/types/requisition.ts`
   — typed API helpers + types.
 

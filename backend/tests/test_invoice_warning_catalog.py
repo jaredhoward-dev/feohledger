@@ -180,11 +180,149 @@ def test_every_code_has_a_call_site():
     """
     sources = "\n".join(
         (_BACKEND / rel).read_text(encoding="utf-8")
-        for rel in (*PRODUCER_MODULES, "app/services/po_matching.py")
+        for rel in (
+            *PRODUCER_MODULES,
+            "app/services/po_matching.py",
+            *ERP_PRODUCER_MODULES,
+            *DIRECT_EXCEPTION_PRODUCER_MODULES,
+        )
     )
+    erp_built = {s.code for s in cat.ERP_RECONCILIATION_SPECS}
     for code in codes():
         name = code.split(".")[-1]
+        if code in erp_built:
+            # Built by `erp_finding` (which adds the `_unnamed` twin) or from a
+            # computed suffix; `test_every_erp_code_is_reachable` drives those.
+            continue
         assert f'"{name}"' in sources or f"'{name}'" in sources, f"{code} has no call site"
+
+
+#: The modules that open ERP reconciliation exceptions (decisions §319).
+ERP_PRODUCER_MODULES = (
+    "app/services/erp_status_sync.py",
+    "app/api/erp_webhook.py",
+    "app/services/erp_payment_writeback.py",
+    "app/services/payment_erp_sync.py",
+)
+
+
+#: The modules that build a `DIRECT_EXCEPTION_SPECS` finding (decisions §358):
+#: the direct `create_exception` callers, and the two helpers that compose
+#: findings for them (compliance hold reasons, settlement discrepancies).
+DIRECT_EXCEPTION_PRODUCER_MODULES = (
+    "app/api/positive_pay.py",
+    # The payee-change flag, raised for an approved bank change (moved out of
+    # `api/vendors`) and for the void's re-payment.
+    "app/services/vendor_bank_change.py",
+    "app/api/payments.py",
+    "app/services/compliance.py",
+    "app/services/sanctions_categories.py",
+    "app/services/payment_reconciler.py",
+    "app/services/payment_settlement.py",
+    # The void's payee comparison (decisions §383).
+    "app/services/payee_stamp.py",
+)
+
+#: Direct `create_exception` callers whose description is a PERSON's words, so
+#: it has no code by nature. Each entry says why; nothing else may be listed.
+HUMAN_AUTHORED_EXCEPTION_SITES = {
+    # The reviewer's own rejection reason.
+    "app/services/review.py",
+}
+
+
+def test_every_create_exception_call_passes_a_code():
+    """Every exception `app/` opens directly carries a `description_code`.
+
+    `_ensure_exception` refuses prose at runtime; a direct
+    `exception_service.create_exception` caller has no such check, which is how
+    six sites kept writing server English after §240 (decisions §358). A call
+    with no `description_code=` keyword is a description the queue can only
+    ever render in English.
+    """
+    offenders: list[str] = []
+    for path in sorted((_BACKEND / "app").rglob("*.py")):
+        rel = path.relative_to(_BACKEND).as_posix()
+        if rel in HUMAN_AUTHORED_EXCEPTION_SITES or rel == "app/services/exception_service.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name != "create_exception":
+                continue
+            if not any(kw.arg == "description_code" for kw in node.keywords):
+                offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, "create_exception with no description_code: " + ", ".join(offenders)
+
+
+def test_the_human_authored_exemption_is_still_needed():
+    """An exempt module that stops calling `create_exception` leaves a hole
+    the next caller there could walk through unseen."""
+    for rel in HUMAN_AUTHORED_EXCEPTION_SITES:
+        assert "create_exception(" in (_BACKEND / rel).read_text(encoding="utf-8"), rel
+
+
+def test_a_compliance_hold_frames_even_a_single_reason():
+    """Each hold reason is a lower-case clause written to follow its frame, so
+    `frame_single` keeps the frame where a lone price-variance finding would
+    be stored as itself (decisions §358)."""
+    reason = cat.exception_finding("compliance_no_screenable_vendor")
+    out = cat.exception_findings("compliance_hold_findings", [reason], frame_single=True)
+    assert out["code"] == "exception.compliance_hold_findings"
+    assert out["params"]["count"] == 1
+    assert out["params"][cat.FINDINGS_PARAM] == [reason]
+    assert out["message"] == (
+        "Payment held for compliance review (1 reason): no screenable vendor on invoice"
+    )
+    # Without it, the default single-finding behaviour is unchanged.
+    assert cat.exception_findings("compliance_hold_findings", [reason]) == reason
+
+
+def test_every_erp_code_is_reachable():
+    """Every `exception.erp_*` code is produced by something.
+
+    The paid-not-recorded family is chosen by refusal code and the named /
+    `_unnamed` pick by the ERP's product name, so a literal scan cannot see
+    them; drive the builders instead. Everything else is a literal bare name
+    (or a literal stem plus a computed suffix) in an ERP producer module.
+    """
+    from app.services.erp_status_sync import erp_finding, unrecorded_payment_finding
+
+    produced: set[str] = set()
+    for reason in cat.ERP_UNRECORDED_REASONS:
+        code = f"external_payment_{reason}" if reason != "other" else "something_new"
+        produced.add(unrecorded_payment_finding("xero", code)["code"])
+        produced.add(unrecorded_payment_finding("merge_dev", code)["code"])
+
+    sources = "\n".join(
+        (_BACKEND / rel).read_text(encoding="utf-8") for rel in ERP_PRODUCER_MODULES
+    )
+    # `"erp_x"`, `f"erp_x_{…}"` and `"erp_x_" + …` all name a stem.
+    stems = set(re.findall(r'"(erp_[a-z_]*[a-z])_?(?=["{])', sources))
+    for spec in cat.ERP_RECONCILIATION_SPECS:
+        name = spec.code.removeprefix(cat.EXCEPTION_PREFIX)
+        if spec.code in produced:
+            continue
+        base = name.removesuffix(cat.ERP_UNNAMED_SUFFIX)
+        if "erp" in spec.params or name.endswith(cat.ERP_UNNAMED_SUFFIX):
+            # A named sentence: `erp_finding("<base>", …)` yields both twins.
+            assert base in stems, f"{spec.code}: no erp_finding({base!r}) call site"
+            # The params a twin carries besides `erp` (a money figure, say).
+            extra = {
+                k: {"money": "1.00", "currency": "USD"}.get(kind, "x")
+                for k, kind in spec.params.items()
+                if k != "erp"
+            }
+            assert erp_finding(base, "xero", **extra)["code"] == cat.EXCEPTION_PREFIX + base
+            unnamed = erp_finding(base, None, **extra)["code"]
+            assert unnamed == cat.EXCEPTION_PREFIX + base + cat.ERP_UNNAMED_SUFFIX
+            continue
+        assert name in stems or any(name.startswith(s + "_") for s in stems), (
+            f"{spec.code} has no call site"
+        )
 
 
 def test_every_ensure_exception_call_passes_a_finding_not_prose():
@@ -276,10 +414,15 @@ def test_money_keeps_exact_digits_and_never_narrows_below_two_places():
     assert out["params"]["currency"] == "USD"
 
 
-def test_a_missing_currency_falls_back_rather_than_emitting_none():
-    out = warning("round_amount", "info", amount=Decimal("5000.00"), currency=None)
-    assert out["params"]["currency"] == cat.DEFAULT_CURRENCY
-    assert out["message"] == "Round amount: 5000.00 USD"
+@pytest.mark.parametrize("currency", [None, "", "   ", "US", "1$X"])
+def test_an_unknown_currency_is_carried_as_unknown_never_as_usd(currency):
+    """An invoice that records no currency (decisions §473) yields a blank
+    `currency` param, which both clients render as bare digits — never a
+    borrowed USD."""
+    out = warning("round_amount", "info", amount=Decimal("5000.00"), currency=currency)
+    assert out["params"]["currency"] == cat.UNKNOWN_CURRENCY == ""
+    assert "USD" not in out["message"]
+    assert out["message"].startswith("Round amount: 5000.00")
 
 
 def test_dates_are_iso_so_the_client_can_reformat_them():

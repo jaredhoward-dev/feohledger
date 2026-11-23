@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -24,16 +25,18 @@ from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from sqlalchemy import case, func, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.deps import ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO, require_roles
 from app.database import get_control_db
+from app.models.exception import Exception as APException
 from app.models.expense import Expense, ExpenseReport
 from app.models.gl_account import GLAccount
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
-from app.models.payment import Payment, PaymentSchedule
-from app.models.procurement import po_currency_code
+from app.models.payment import Payment
+from app.models.procurement import GoodsReceipt, PurchaseOrder, po_currency_code
 from app.models.user import User
 from app.models.virtual_card import CardRebate, VirtualCard
 from app.services.analytics import (
@@ -55,6 +58,7 @@ from app.services.analytics import (
     detect_threshold_breaches,
     value_received_goods,
 )
+from app.services.ap_commitments import aging_snapshot_buckets, commitment_rows
 from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.cashflow import (
     CashThresholds,
@@ -68,7 +72,6 @@ from app.services.currency_conversion import (
     invoice_currency_rollup_select,
     invoice_reporting_amount_sql,
     payment_reporting_amount_sql,
-    reporting_amount_for_row,
     resolve_reporting_currency,
     rollup_from_grouped_rows,
     vendor_rollup_from_grouped_rows,
@@ -99,8 +102,8 @@ _CFO_ROLES = (ROLE_ADMIN, ROLE_CFO)
 # (`api/cash_flow.COPILOT_ROLES`) and by the `cashflow_forecast` CSV export
 # below, so refusing them here only made the REST read disagree with the
 # copilot about who may see the org's cash position. Not imported from
-# `cash_flow` (that module imports this one through the assistant tools); kept
-# equal to it by `tests/test_cash_flow_alerts.py`'s drift guard instead.
+# `cash_flow` (one router importing another for a constant); kept equal to it
+# by `tests/test_cash_flow_alerts.py`'s drift guard instead.
 CASH_FORECAST_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
 
 
@@ -108,226 +111,9 @@ CASH_FORECAST_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
 # Predictive cash-flow forecasting
 # ---------------------------------------------------------------------------
 #
-# Committed = firm AP commitment (approved → payment_scheduled). Pending =
-# still-in-flight pipeline (new / pending / ready_for_review) — projected,
-# lower-certainty outflow. Everything else (rejected / paid / done /
-# failed) is excluded: terminal, already-paid, or never going to pay.
-_COMMITTED_STATUSES = (
-    InvoiceStatus.approved.value,
-    InvoiceStatus.sending_to_erp.value,
-    InvoiceStatus.sent_to_erp.value,
-    InvoiceStatus.posted_in_erp.value,
-    InvoiceStatus.payment_scheduled.value,
-)
-_PENDING_STATUSES = (
-    InvoiceStatus.new.value,
-    InvoiceStatus.pending.value,
-    InvoiceStatus.ready_for_review.value,
-)
-
-
-async def _commitment_rows(
-    db: AsyncSession,
-    *,
-    today: date,
-    horizon_days: int,
-    include_pending: bool,
-    entity_id: uuid.UUID | None = None,
-    reporting_currency: str | None = None,
-) -> list[dict]:
-    """Pull open invoices that represent future AP outflows and shape them
-    into the commitment-row dicts the pure-math layer consumes.
-
-    Outflow timing comes from the `PaymentSchedule` row when present
-    (`due_date` / `discount_date` / `discount_percent`); otherwise we fall
-    back to `Invoice.due_date` with no discount. Rows are bounded to
-    `[today, today + horizon_days]` on the effective due date so the query
-    doesn't scan the whole back-catalogue.
-
-    **Every `amount` is expressed in the org's REPORTING currency**, via the
-    rate locked on the invoice (`Invoice.reporting_amount`) — never the raw
-    `Invoice.amount`, which is in the invoice's own currency. The consumers
-    all subtract these rows from an opening balance that
-    `cashflow.resolve_opening_balance` guarantees is in the reporting
-    currency (it REFUSES a provider balance in any other, on exactly this
-    ground). Subtracting a raw ¥10,000,000 invoice from a $250,000 opening
-    balance projected a −$9.75M shortfall that does not exist — and the
-    shortfall sweep emails finance leaders about it, the copilot re-times
-    payments around it, and a draft payment run gets staged off that plan.
-    A foreign invoice with no usable lock is counted at its face value and
-    flagged, so "we could not convert this" is visible rather than silent.
-
-    Scoped to ``entity_id`` (the invoice's subsidiary) when set; ``None`` is
-    the consolidated view (multi-entity Phase 2b)."""
-    statuses = list(_COMMITTED_STATUSES)
-    if include_pending:
-        statuses += list(_PENDING_STATUSES)
-    horizon_end = today + timedelta(days=horizon_days)
-
-    # ONE schedule row per invoice, newest first. A bare
-    # `outerjoin(PaymentSchedule)` fans an invoice out to one row per schedule,
-    # and the loop below appends a commitment row per result — so an invoice
-    # with two schedules was counted TWICE at its FULL amount: in the forecast,
-    # the cash-position curve, the what-if, every copilot planning tool and the
-    # `plan_id` hash, all at once, with nothing on any surface to show it.
-    # Unreachable today only because nothing but `scripts/seed.py` constructs a
-    # `PaymentSchedule` — an accident of the current feature set, not a
-    # guarantee, and this query is the single source every cash projection reads.
-    #
-    # `DISTINCT ON` mirrors `discount_auto_trigger._resolve_due_date`, which
-    # already takes the same precaution (`ORDER BY created_at DESC LIMIT 1`) on
-    # the same table — so the discount engine's idea of an invoice's due date
-    # and the cash forecast's cannot diverge. `id` is the tiebreak, so two rows
-    # written in one transaction (identical `created_at`) still resolve
-    # deterministically rather than letting the plan hash flap between reads.
-    latest_schedule = (
-        select(
-            PaymentSchedule.invoice_id.label("invoice_id"),
-            PaymentSchedule.due_date.label("sched_due"),
-            PaymentSchedule.discount_date.label("discount_date"),
-            PaymentSchedule.discount_percent.label("discount_percent"),
-        )
-        .distinct(PaymentSchedule.invoice_id)
-        .order_by(
-            PaymentSchedule.invoice_id,
-            PaymentSchedule.created_at.desc(),
-            PaymentSchedule.id.desc(),
-        )
-        .subquery()
-    )
-
-    result = await db.execute(
-        apply_entity_scope(
-            select(
-                Invoice.id,
-                Invoice.amount,
-                Invoice.status,
-                Invoice.due_date,
-                latest_schedule.c.sched_due,
-                latest_schedule.c.discount_date,
-                latest_schedule.c.discount_percent,
-                Invoice.currency,
-                Invoice.reporting_amount,
-                Invoice.reporting_currency,
-            )
-            .outerjoin(latest_schedule, latest_schedule.c.invoice_id == Invoice.id)
-            .where(Invoice.status.in_(statuses)),
-            Invoice,
-            entity_id,
-        )
-    )
-    committed_set = set(_COMMITTED_STATUSES)
-    # `resolve_reporting_currency(None)` is the canonical platform fallback —
-    # never a literal, so the default lives in one place.
-    target_currency = (reporting_currency or resolve_reporting_currency(None)).upper()
-    rows: list[dict] = []
-    for (
-        inv_id,
-        amount,
-        status,
-        inv_due,
-        sched_due,
-        discount_date,
-        discount_percent,
-        inv_currency,
-        rep_amount,
-        rep_currency,
-    ) in result.all():
-        due = sched_due or inv_due
-        if due is None or due < today or due > horizon_end:
-            continue
-        status_value = status.value if hasattr(status, "value") else status
-        # Same helper every sibling rollup in this module uses, so a cash
-        # projection and a spend report can't disagree about what an invoice
-        # is worth. No FX call on a read: the rate was locked when the invoice
-        # was booked, which is also what keeps the curve deterministic.
-        converted, unconverted = reporting_amount_for_row(
-            amount=Decimal(str(amount or 0)),
-            currency=inv_currency,
-            reporting_currency=target_currency,
-            persisted_reporting_currency=rep_currency,
-            persisted_reporting_amount=rep_amount,
-        )
-        rows.append(
-            {
-                "invoice_id": str(inv_id),
-                "due_date": due,
-                "amount": converted,
-                "currency": target_currency,
-                "unconverted": unconverted,
-                "committed": status_value in committed_set,
-                "discount_date": discount_date,
-                "discount_percent": discount_percent,
-            }
-        )
-    return rows
-
-
-_AGING_BANDS = ("current", "days_30", "days_60", "days_90", "days_90_plus")
-
-
-async def _aging_snapshot_buckets(
-    db: AsyncSession,
-    *,
-    today: date,
-    reporting_currency: str,
-    entity_id: uuid.UUID | None = None,
-) -> dict:
-    """The aging snapshot's five bands, in the org's REPORTING currency — the
-    one builder behind `GET /api/analytics/export/aging_snapshot` and the
-    emailed `aging_snapshot` scheduled report.
-
-    Both used to sum the raw `Invoice.amount` across currencies into columns
-    that name no currency at all, so a ¥1,000,000 open invoice landed in a band
-    as "1000000.00" beside dollars — while the dashboard's `aging_reporting`
-    and the AP-balance rollup this snapshot reconciles with (F-4) both
-    converted. Each row now goes through `invoice_reporting_amount_sql`, the
-    rule every sibling reporting figure uses: the rate locked on the invoice,
-    else face value — and those face-value fallbacks are COUNTED on
-    `unconverted_count`, so a band that is part-converted says so.
-
-    Population and band edges are the dashboard's exactly: `OPEN_AP_STATUSES`
-    with no `due_date` filter (a NULL due date is `current` — unknowable, so
-    not overdue), days past due computed by Postgres `date - date` against the
-    caller's `today`, and 0 / 30 / 60 / 90 as inclusive upper edges.
-    """
-    rep = invoice_reporting_amount_sql(
-        reporting_currency=reporting_currency,
-        amount=Invoice.amount,
-        currency=Invoice.currency,
-        persisted_reporting_amount=Invoice.reporting_amount,
-        persisted_reporting_currency=Invoice.reporting_currency,
-    )
-    days_past = today - Invoice.due_date
-    band = case(
-        (Invoice.due_date.is_(None), "current"),
-        (days_past <= 0, "current"),
-        (days_past <= 30, "days_30"),
-        (days_past <= 60, "days_60"),
-        (days_past <= 90, "days_90"),
-        else_="days_90_plus",
-    )
-    result = await db.execute(
-        apply_entity_scope(
-            select(
-                band.label("band"),
-                func.coalesce(func.sum(rep.amount), 0),
-                func.coalesce(func.sum(rep.unconverted), 0),
-            )
-            .where(Invoice.status.in_(OPEN_AP_STATUSES))
-            .group_by(band),
-            Invoice,
-            entity_id,
-        )
-    )
-    buckets: dict = {name: Decimal("0") for name in _AGING_BANDS}
-    unconverted = 0
-    for name, total, unconv in result.all():
-        buckets[name] = Decimal(str(total))
-        unconverted += int(unconv or 0)
-    buckets["reporting_currency"] = reporting_currency.strip().upper()
-    buckets["unconverted_count"] = unconverted
-    return buckets
+# The commitment rows and the aging snapshot are built by
+# `services/ap_commitments` (`commitment_rows`, `aging_snapshot_buckets`), which
+# the copilot, the shortfall sweep and the scheduled reports share.
 
 
 def _money(value: Decimal | int | None) -> str | None:
@@ -385,9 +171,11 @@ async def get_cashflow_forecast(
     over the next `horizon_days`. Each period splits the scheduled total
     into firm `committed_amount` and lower-certainty `pending_amount`
     (the in-flight approval pipeline; drop it with `include_pending=false`)
-    and reports the discount-eligible slice."""
+    and reports the discount-eligible slice. AP already past due is carried
+    into the FIRST period on its own `overdue_amount` / `overdue_count`
+    (`scheduled = committed + pending + overdue`) — see `ap_commitments.commitment_rows`."""
     today = utc_today()
-    rows = await _commitment_rows(
+    rows = await commitment_rows(
         db,
         today=today,
         horizon_days=horizon_days,
@@ -400,12 +188,14 @@ async def get_cashflow_forecast(
         "scheduled_amount": _money(sum((p["scheduled_amount"] for p in periods), Decimal("0"))),
         "committed_amount": _money(sum((p["committed_amount"] for p in periods), Decimal("0"))),
         "pending_amount": _money(sum((p["pending_amount"] for p in periods), Decimal("0"))),
+        "overdue_amount": _money(sum((p["overdue_amount"] for p in periods), Decimal("0"))),
         "discount_eligible_amount": _money(
             sum((p["discount_eligible_amount"] for p in periods), Decimal("0"))
         ),
         "count": sum(p["count"] for p in periods),
+        "overdue_count": sum(p["overdue_count"] for p in periods),
         # Rows counted at FACE VALUE because their reporting-currency figure
-        # could not be established (see `_commitment_rows`). A count, not
+        # could not be established (see `ap_commitments.commitment_rows`). A count, not
         # money. Non-zero means the totals above mix currencies.
         "unconverted_count": sum(p["unconverted_count"] for p in periods),
     }
@@ -422,8 +212,10 @@ async def get_cashflow_forecast(
                 "scheduled_amount": _money(p["scheduled_amount"]),
                 "committed_amount": _money(p["committed_amount"]),
                 "pending_amount": _money(p["pending_amount"]),
+                "overdue_amount": _money(p["overdue_amount"]),
                 "discount_eligible_amount": _money(p["discount_eligible_amount"]),
                 "count": p["count"],
+                "overdue_count": p["overdue_count"],
                 "unconverted_count": p["unconverted_count"],
             }
             for p in periods
@@ -449,7 +241,7 @@ async def get_cashflow_whatif(
     discount captured, amount-weighted average days-to-pay, and the
     bucketed period breakdown."""
     today = utc_today()
-    rows = await _commitment_rows(
+    rows = await commitment_rows(
         db,
         today=today,
         horizon_days=horizon_days,
@@ -469,12 +261,17 @@ async def get_cashflow_whatif(
             # reporting-currency figure could not be established. Comparing
             # two scenarios' outflows only means something at 0.
             "unconverted_count": result["unconverted_count"],
+            # The slice of `total_outflow` already past due — identical across
+            # the three scenarios, which can re-time it but never un-late it.
+            "overdue_amount": _money(result["overdue_amount"]),
+            "overdue_count": result["overdue_count"],
             "periods": [
                 {
                     "period": p["period"],
                     "period_start": p["period_start"].isoformat(),
                     "period_end": p["period_end"].isoformat(),
                     "scheduled_amount": _money(p["scheduled_amount"]),
+                    "overdue_amount": _money(p["overdue_amount"]),
                     "unconverted_count": p["unconverted_count"],
                 }
                 for p in result["periods"]
@@ -543,9 +340,12 @@ async def get_cash_position(
     The alert threshold is the `min_balance_threshold` query param when supplied,
     else the org's persisted `settings.cashflow.min_balance_threshold` (managed
     via `GET/PUT /api/analytics/cash-position-settings`). Inflows (receivables)
-    aren't modelled — `closing = opening - outflow`."""
+    aren't modelled — `closing = opening - outflow`. AP already past due is
+    part of the first period's `outflow` (and named on its `overdue_amount`
+    and the top-level `overdue_amount` / `overdue_count`), so the curve
+    starts from the cash actually left once the late bills are paid."""
     today = utc_today()
-    rows = await _commitment_rows(
+    rows = await commitment_rows(
         db,
         today=today,
         horizon_days=horizon_days,
@@ -592,6 +392,10 @@ async def get_cash_position(
         # every `closing` below is a mixed-currency number — the curve carries
         # the balance forward, so one unconvertible row poisons the tail.
         "unconverted_count": sum(p["unconverted_count"] for p in position),
+        # AP already past due, folded into the first period's `outflow` (it is
+        # owed now). Read off the buckets, not the position rows — same total.
+        "overdue_amount": _money(sum((p["overdue_amount"] for p in periods), Decimal("0"))),
+        "overdue_count": sum(p["overdue_count"] for p in periods),
         # `None` stays JSON null — "no threshold set" is not zero.
         "threshold": _money(threshold),
         "periods": [
@@ -604,6 +408,7 @@ async def get_cash_position(
                 "inflow": _money(p["inflow"]),
                 "closing": _money(p["closing"]),
                 "below_threshold": p["below_threshold"],
+                "overdue_amount": _money(p["overdue_amount"]),
                 "unconverted_count": p["unconverted_count"],
             }
             for p in position
@@ -922,7 +727,7 @@ async def get_cfo_analytics(
     # currency (it carries no locked rate). `accruals.by_currency` is the figure
     # to render; the flat fields beside it are the legacy naive sums, kept for
     # back-compat exactly like `total_spend` (decisions §197).
-    open_po_by_currency = await _open_po_amounts_by_currency(db, entity_id)
+    open_po_by_currency, open_po_unverifiable = await _open_po_amounts_by_currency(db, entity_id)
 
     # Unposted invoices: approved + sending_to_erp + sent_to_erp
     unposted_code = func.upper(Invoice.currency)
@@ -944,7 +749,12 @@ async def get_cfo_analytics(
     unposted_by_currency = _amounts_by_code(unposted_rows.all())
     # GR-received-but-not-invoiced: fan the 3-way match out per-PO and
     # value the received fraction of each receipted PO, per PO currency.
-    received_amount, received_by_currency = await _received_amounts(db, entity_id)
+    received_amount, received_by_currency, received_unverifiable = await _received_amounts(
+        db, entity_id
+    )
+    # Distinct POs either leg left out for an unverifiable total (decisions
+    # §323) — one PO open AND receipted is one PO, not two.
+    accrual_unverifiable_po_count = len(open_po_unverifiable | received_unverifiable)
     accruals = compute_accruals(
         open_po_amount=sum(open_po_by_currency.values(), Decimal("0")),
         received_amount=received_amount,
@@ -1072,24 +882,22 @@ async def get_cfo_analytics(
                 )
             )
         )
-        exc_count = 0
-        try:
-            from app.models.exception import Exception as APException
-
-            exc_count_q = await db.execute(
-                _exc(
-                    select(func.count(APException.id)).where(
-                        APException.created_at
-                        >= datetime.combine(month_start, datetime.min.time()).replace(tzinfo=UTC),
-                        APException.created_at
-                        <= datetime.combine(month_end, datetime.max.time()).replace(tzinfo=UTC),
-                    ),
-                    APException,
-                )
+        # No `except` here: a failed count used to report 0 exceptions, which
+        # the trend then stated as a 0% fraud rate — a confident claim, not a
+        # safe default. It fails loudly like every sibling figure (the rebate
+        # yield below says the same).
+        exc_count_q = await db.execute(
+            _exc(
+                select(func.count(APException.id)).where(
+                    APException.created_at
+                    >= datetime.combine(month_start, datetime.min.time()).replace(tzinfo=UTC),
+                    APException.created_at
+                    <= datetime.combine(month_end, datetime.max.time()).replace(tzinfo=UTC),
+                ),
+                APException,
             )
-            exc_count = int(exc_count_q.scalar() or 0)
-        except Exception:  # noqa: BLE001
-            exc_count = 0
+        )
+        exc_count = int(exc_count_q.scalar() or 0)
         fraud_rows.append(
             {
                 "month": month_start.strftime("%Y-%m"),
@@ -1296,6 +1104,10 @@ async def get_cfo_analytics(
             "received_amount": _money(accruals.received_amount),
             "unposted_invoice_amount": _money(accruals.unposted_invoice_amount),
             "total_accrual": _money(accruals.total_accrual),
+            # POs left out of the open-PO and received legs because the ERP
+            # could not confirm their total at its last sync (decisions §323).
+            # A count, not money: non-zero means every leg below is a floor.
+            "unverifiable_po_count": accrual_unverifiable_po_count,
             # One row per currency, each leg in it and `total_accrual` netted
             # within it. `currency: null` is the slice nobody recorded a
             # currency for (POs only) — render it bare, never merged.
@@ -1372,7 +1184,7 @@ def _amounts_by_code(rows) -> dict[str | None, Decimal]:
 
 async def _open_po_amounts_by_currency(
     db: AsyncSession, entity_id: uuid.UUID | None
-) -> dict[str | None, Decimal]:
+) -> tuple[dict[str | None, Decimal], set[uuid.UUID]]:
     """Open-PO commitments summed per PO currency, entity-scoped when a
     subsidiary is selected — `/cfo`'s accruals leg and every by-entity row.
 
@@ -1385,104 +1197,122 @@ async def _open_po_amounts_by_currency(
     summed every PO the tenant had ever raised — a cancelled order counted as a
     live commitment forever. The exclusion list is the model's
     `DEAD_PO_STATUSES`, shared with the budget-commitment leg so the two cannot
-    disagree about what is still committed."""
-    from app.models.procurement import DEAD_PO_STATUSES, PurchaseOrder
+    disagree about what is still committed.
+
+    **A total the ERP no longer vouches for is not summed.** An open PO whose
+    last sync could not be priced (`total_unverifiable_reason`, decisions §323)
+    is left out and returned by id, so the caller counts it beside the figure —
+    the excluded-and-counted rule of §35, never a stale total in the sum."""
+    from app.models.procurement import DEAD_PO_STATUSES, PO_TOTAL_VOUCHED, PurchaseOrder
 
     rows = await db.execute(
         apply_entity_scope(
             select(PurchaseOrder.currency, func.coalesce(func.sum(PurchaseOrder.total), 0))
             .select_from(PurchaseOrder)
-            .where(PurchaseOrder.status.notin_(DEAD_PO_STATUSES))
+            .where(PurchaseOrder.status.notin_(DEAD_PO_STATUSES), PO_TOTAL_VOUCHED)
             .group_by(PurchaseOrder.currency),
             PurchaseOrder,
             entity_id,
         )
     )
-    return _amounts_by_code(rows.all())
+    marked = await db.execute(
+        apply_entity_scope(
+            select(PurchaseOrder.id).where(
+                PurchaseOrder.status.notin_(DEAD_PO_STATUSES),
+                PurchaseOrder.total_unverifiable_reason.is_not(None),
+            ),
+            PurchaseOrder,
+            entity_id,
+        )
+    )
+    return _amounts_by_code(rows.all()), set(marked.scalars().all())
 
 
 async def _received_amounts(
     db: AsyncSession, entity_id: uuid.UUID | None
-) -> tuple[Decimal, dict[str | None, Decimal]]:
+) -> tuple[Decimal, dict[str | None, Decimal], set[uuid.UUID]]:
     """Value goods received but not yet invoiced (the GR/IR accrual leg).
+
+    The third element is the ids of receipted POs left unvalued because their
+    total is marked unverifiable (decisions §323).
 
     Loads every `received` goods receipt (entity-scoped) with its line
     items, aggregates received quantity per PO, then values the received
     fraction of each PO via `value_received_goods`. Returns the whole-book
     figure (the legacy flat `received_amount`) and the same valuation grouped
     by each PO's own currency — a receipt is worth its PO's money, in the PO's
-    currency. Lazily imports the procurement models so a tenant without those
-    tables falls back to 0 rather than 500-ing. Receipts with no PO link can't
-    be priced and are excluded.
+    currency. Receipts with no PO link can't be priced and are excluded.
+
+    A failed read raises: the GR/IR leg is reported or the request fails,
+    never answered as a confident zero (decisions §34).
     """
-    try:
-        from collections import defaultdict
-
-        from sqlalchemy.orm import selectinload
-
-        from app.models.procurement import GoodsReceipt, PurchaseOrder
-
-        gr_rows = (
-            (
-                await db.execute(
-                    apply_entity_scope(
-                        select(GoodsReceipt)
-                        .where(GoodsReceipt.status == "received")
-                        .options(selectinload(GoodsReceipt.line_items)),
-                        GoodsReceipt,
-                        entity_id,
-                    )
+    gr_rows = (
+        (
+            await db.execute(
+                apply_entity_scope(
+                    select(GoodsReceipt)
+                    .where(GoodsReceipt.status == "received")
+                    .options(selectinload(GoodsReceipt.line_items)),
+                    GoodsReceipt,
+                    entity_id,
                 )
             )
-            .scalars()
-            .all()
         )
+        .scalars()
+        .all()
+    )
 
-        gr_qty_by_po: dict[uuid.UUID, Decimal] = defaultdict(lambda: Decimal("0"))
-        for gr in gr_rows:
-            if not gr.po_id:
-                continue
-            gr_qty_by_po[gr.po_id] += sum(
-                (li.quantity_received or Decimal("0") for li in gr.line_items), Decimal("0")
-            )
-        if not gr_qty_by_po:
-            return Decimal("0"), {}
-
-        # Entity scope is carried transitively: the PO ids come only from the
-        # entity-scoped GR query above, so this fetch is already confined to the
-        # selected subsidiary. Keep the GR query's `apply_entity_scope` if you
-        # touch this — dropping it would silently widen this fetch too.
-        po_rows = (
-            (
-                await db.execute(
-                    select(PurchaseOrder)
-                    .where(PurchaseOrder.id.in_(gr_qty_by_po.keys()))
-                    .options(selectinload(PurchaseOrder.line_items))
-                )
-            )
-            .scalars()
-            .all()
+    gr_qty_by_po: dict[uuid.UUID, Decimal] = defaultdict(lambda: Decimal("0"))
+    for gr in gr_rows:
+        if not gr.po_id:
+            continue
+        gr_qty_by_po[gr.po_id] += sum(
+            (li.quantity_received or Decimal("0") for li in gr.line_items), Decimal("0")
         )
+    if not gr_qty_by_po:
+        return Decimal("0"), {}, set()
 
-        receipts_by_code: dict[str | None, list[ReceivedPO]] = defaultdict(list)
-        for po in po_rows:
-            receipts_by_code[po_currency_code(po.currency)].append(
-                ReceivedPO(
-                    po_total=po.total or Decimal("0"),
-                    po_qty_total=sum(
-                        (li.quantity or Decimal("0") for li in po.line_items), Decimal("0")
-                    ),
-                    gr_qty_total=gr_qty_by_po[po.id],
-                )
+    # Entity scope is carried transitively: the PO ids come only from the
+    # entity-scoped GR query above, so this fetch is already confined to the
+    # selected subsidiary. Keep the GR query's `apply_entity_scope` if you
+    # touch this — dropping it would silently widen this fetch too.
+    po_rows = (
+        (
+            await db.execute(
+                select(PurchaseOrder)
+                .where(PurchaseOrder.id.in_(gr_qty_by_po.keys()))
+                .options(selectinload(PurchaseOrder.line_items))
             )
-        # The flat figure keeps its single quantize over the whole book, so it
-        # does not move by a rounding cent against what it always reported.
-        everything = [r for group in receipts_by_code.values() for r in group]
-        return value_received_goods(everything), {
-            code: value_received_goods(group) for code, group in receipts_by_code.items()
-        }
-    except Exception:  # noqa: BLE001
-        return Decimal("0"), {}
+        )
+        .scalars()
+        .all()
+    )
+
+    receipts_by_code: dict[str | None, list[ReceivedPO]] = defaultdict(list)
+    unverifiable: set[uuid.UUID] = set()
+    for po in po_rows:
+        # Valuing a receipt scales the PO's total; a total the ERP no longer
+        # vouches for (decisions §323) values nothing — counted instead.
+        if po.total_unverifiable_reason:
+            unverifiable.add(po.id)
+            continue
+        receipts_by_code[po_currency_code(po.currency)].append(
+            ReceivedPO(
+                po_total=po.total or Decimal("0"),
+                po_qty_total=sum(
+                    (li.quantity or Decimal("0") for li in po.line_items), Decimal("0")
+                ),
+                gr_qty_total=gr_qty_by_po[po.id],
+            )
+        )
+    # The flat figure keeps its single quantize over the whole book, so it
+    # does not move by a rounding cent against what it always reported.
+    everything = [r for group in receipts_by_code.values() for r in group]
+    return (
+        value_received_goods(everything),
+        {code: value_received_goods(group) for code, group in receipts_by_code.items()},
+        unverifiable,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1590,25 +1420,21 @@ async def _entity_metrics(
         reporting_currency=reporting_currency,
     )
 
-    # Open-exceptions count (entity-scoped) — fails soft to 0.
-    open_exceptions = 0
-    try:
-        from app.models.exception import Exception as APException
-
-        exc_q = await db.execute(
-            apply_entity_scope(
-                select(func.count(APException.id)).where(APException.status == "open"),
-                APException,
-                entity_id,
-            )
+    # Open-exceptions count (entity-scoped). Fails loudly like the figures
+    # beside it: the soft-fail to 0 it once had told a CFO an entity had no open
+    # exceptions when the count had merely not been taken.
+    exc_q = await db.execute(
+        apply_entity_scope(
+            select(func.count(APException.id)).where(APException.status == "open"),
+            APException,
+            entity_id,
         )
-        open_exceptions = int(exc_q.scalar() or 0)
-    except Exception:  # noqa: BLE001
-        open_exceptions = 0
+    )
+    open_exceptions = int(exc_q.scalar() or 0)
 
     # Open-PO accrual — the same per-currency grouping `/cfo`'s accruals card
     # renders (entity-scoped), so the consolidated row and that card agree.
-    open_po_by_currency = await _open_po_amounts_by_currency(db, entity_id)
+    open_po_by_currency, open_po_unverifiable = await _open_po_amounts_by_currency(db, entity_id)
 
     return {
         # Naive cross-currency SUM, kept for API back-compat; the figure to
@@ -1637,6 +1463,9 @@ async def _entity_metrics(
             {"currency": code, "amount": _money(open_po_by_currency[code])}
             for code in sorted(open_po_by_currency, key=lambda c: (c is None, c or ""))
         ],
+        # Open POs left out of `open_po_by_currency` because their total is one
+        # the ERP no longer vouches for (decisions §323). A count, not money.
+        "open_po_unverifiable_count": len(open_po_unverifiable),
     }
 
 
@@ -1883,7 +1712,7 @@ async def export_report(
 
     if report == "cashflow_forecast":
         today = utc_today()
-        rows = await _commitment_rows(
+        rows = await commitment_rows(
             db,
             today=today,
             horizon_days=horizon_days,
@@ -1952,8 +1781,8 @@ async def export_report(
         today = utc_today()
         # Same open-payable population as the AP balance, so the bands sum to
         # its reporting rollup (F-4), and in the same currency — see
-        # `_aging_snapshot_buckets`, shared with the scheduled report.
-        buckets = await _aging_snapshot_buckets(
+        # `ap_commitments.aging_snapshot_buckets`, shared with the scheduled report.
+        buckets = await aging_snapshot_buckets(
             db,
             today=today,
             reporting_currency=resolve_reporting_currency(org.settings if org else None),

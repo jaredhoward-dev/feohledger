@@ -182,7 +182,8 @@ def export_invoice_register(invoices: Iterable) -> str:
                 getattr(inv, "invoice_number", "") or "",
                 getattr(inv, "vendor_name", "") or "",
                 _fmt_money(getattr(inv, "amount", None)),
-                getattr(inv, "currency", "") or "USD",
+                # Blank when the invoice records no currency: never a guessed USD.
+                getattr(inv, "currency", "") or "",
                 status or "",
                 _fmt_date(getattr(inv, "invoice_date", None)),
                 _fmt_date(getattr(inv, "due_date", None)),
@@ -324,7 +325,7 @@ def export_aging_snapshot(aging_buckets: dict, *, snapshot_date: date | None = N
     Header matches the dashboard `aging` dict keys.
 
     `reporting_currency` and `unconverted_count` close the row. Both callers
-    (`api/analytics._aging_snapshot_buckets`) hand over bands already converted
+    (`ap_commitments.aging_snapshot_buckets`) hand over bands already converted
     into the org's reporting currency, and a CSV has no page to carry the
     caveat a foreign invoice with no locked rate needs — it is summed at FACE
     value, exactly like `export_vendor_spend`'s rows, so the count is what tells
@@ -375,7 +376,14 @@ def export_cashflow_forecast(period_rows: Iterable) -> str:
     `analytics.bucket_outflows` — period key, start/end bounds, the
     scheduled total, the committed-vs-pending split, the
     discount-eligible amount, and the invoice count. The CFO drops this
-    straight into their FP&A model."""
+    straight into their FP&A model.
+
+    ``overdue_amount`` / ``overdue_count`` are the AP already past due, which
+    ``bucket_outflows`` carries into the first period (inside
+    ``scheduled_amount``, outside ``committed_amount`` / ``pending_amount``).
+    They are APPENDED, so a consumer reading by position keeps the eight
+    columns it knew; a row from a caller that reports no overdue figure
+    exports them blank rather than ``0``, which would claim nothing is late."""
     buf, w = _writer(
         [
             "period",
@@ -386,6 +394,8 @@ def export_cashflow_forecast(period_rows: Iterable) -> str:
             "pending_amount",
             "discount_eligible_amount",
             "count",
+            "overdue_amount",
+            "overdue_count",
         ]
     )
     for p in period_rows:
@@ -399,6 +409,8 @@ def export_cashflow_forecast(period_rows: Iterable) -> str:
                 _fmt_money(p.get("pending_amount")),
                 _fmt_money(p.get("discount_eligible_amount")),
                 int(p.get("count", 0) or 0),
+                _fmt_money(p.get("overdue_amount")),
+                "" if p.get("overdue_count") is None else int(p["overdue_count"]),
             ]
         )
     return buf.getvalue()

@@ -163,6 +163,9 @@ async def _candidate_pos(
                 select(PurchaseOrder).where(
                     PurchaseOrder.vendor_id == vendor_id,
                     PurchaseOrder.status == "open",
+                    # A total the ERP no longer vouches for cannot be the
+                    # evidence an invoice is linked on (decisions §323).
+                    PurchaseOrder.total_unverifiable_reason.is_(None),
                 )
             )
         )
@@ -257,6 +260,7 @@ class MissingPOResolver(ExceptionResolver):
         changes = {"po_number": {"old": str(invoice.po_number or ""), "new": str(po.po_number)}}
         rationale = await build_rationale(
             org_settings,
+            organization_id=invoice.organization_id,
             template=(
                 f"Linked invoice to purchase order {po.po_number} "
                 f"(matched on vendor + amount {invoice.amount}"
@@ -288,6 +292,9 @@ class MissingPOResolver(ExceptionResolver):
         # Import here to reuse the dispatcher's escalate-on-NotApprovable contract.
         from app.services.exception_agents.resolvers.amount_mismatch import (
             NotApprovable as _NotApprovable,
+        )
+        from app.services.exception_agents.resolvers.amount_mismatch import (
+            refuse_payee_change_after_approval,
         )
         from app.services.invoice_warnings import refresh_warnings
         from app.services.po_matching import match_invoice_under_org_rules
@@ -352,6 +359,12 @@ class MissingPOResolver(ExceptionResolver):
             cfo_threshold, gate_amount
         ):
             raise _NotApprovable(locked.status)
+
+        # The payee of an invoice approved once (a recalled one, back in
+        # review) is a person's to choose, never the agent's (decisions §379).
+        # Asked before any mutation, like the gates above.
+        if locked.vendor_id is None:
+            refuse_payee_change_after_approval(locked, po.vendor_id)
 
         # Link by po_number (+ align vendor_id so the matcher's vendor leg holds).
         locked.po_number = po.po_number

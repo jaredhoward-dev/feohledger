@@ -1,11 +1,13 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { api, streamAssistantChat, AssistantBudgetError } from '#lib/api.ts';
+	import { api, streamAssistantChat, ApiError, budgetErrorOf, type AssistantBudgetError } from '#lib/api.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import ChatMessage from '#lib/components/assistant/ChatMessage.svelte';
 	import ExamplePrompts from '#lib/components/assistant/ExamplePrompts.svelte';
 	import UsageMeter from '#lib/components/assistant/UsageMeter.svelte';
+	import ChatLayout from '#lib/components/assistant/ChatLayout.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import type {
 		ChatResponse,
 		ConversationDetail,
@@ -143,6 +145,15 @@
 		applyFinal(payload, assistantId);
 	}
 
+	/** The over-budget notice, in place of the empty in-progress bubble. */
+	function showBudgetNotice(err: AssistantBudgetError, assistantId: string) {
+		budgetNotice = m('assistant.budget.reached', {
+			used: formatCount(err.used),
+			budget: formatCount(err.budget)
+		});
+		dropMessage(assistantId);
+	}
+
 	async function send() {
 		const message = input.trim();
 		if (!message || busy) return;
@@ -202,33 +213,35 @@
 				}
 			);
 		} catch (err) {
-			if (err instanceof AssistantBudgetError) {
-				budgetNotice = m('assistant.budget.reached', {
-					used: err.used.toLocaleString(),
-					budget: err.budget.toLocaleString()
-				});
-				// Drop the empty in-progress assistant bubble.
-				dropMessage(assistantId);
+			const budgetErr = budgetErrorOf(err);
+			if (budgetErr) {
+				showBudgetNotice(budgetErr, assistantId);
+			} else if (err instanceof ApiError) {
+				// A refusal from the stream endpoint itself — the shared rate
+				// limiter's `rate_limited`, already localized. `/chat` would
+				// refuse the same turn, so state it instead of falling back.
+				const msg = assistantMessage(assistantId);
+				if (msg) {
+					msg.error = err.message;
+					msg.streaming = false;
+				}
 			} else if (!sawContent) {
 				// Stream unavailable / failed before any content → non-streaming
 				// fallback so the page works against `/chat` alone.
 				try {
 					await fallbackChat(message, assistantId);
 				} catch (fallbackErr) {
-					if (fallbackErr instanceof AssistantBudgetError) {
-						budgetNotice = m('assistant.budget.reached', {
-								used: fallbackErr.used.toLocaleString(),
-								budget: fallbackErr.budget.toLocaleString()
-							});
-						dropMessage(assistantId);
+					const fallbackBudget = budgetErrorOf(fallbackErr);
+					if (fallbackBudget) {
+						showBudgetNotice(fallbackBudget, assistantId);
 					} else {
 						const msg = assistantMessage(assistantId);
 						const detail =
-							fallbackErr instanceof Error ? fallbackErr.message : m('assistant.error.somethingWrong');
+							fallbackErr instanceof Error
+								? fallbackErr.message
+								: m('assistant.error.somethingWrong');
 						if (msg) {
-							msg.error = detail.includes('budget')
-								? detail
-								: m('assistant.error.couldNotAnswer', { detail });
+							msg.error = m('assistant.error.couldNotAnswer', { detail });
 							msg.streaming = false;
 						}
 					}
@@ -258,8 +271,8 @@
 		<button type="button" class="btn-secondary" onclick={newChat} disabled={busy}>{m('assistant.newChat')}</button>
 	{/snippet}
 
-	<div class="assistant-layout">
-		<aside class="convo-rail">
+	<ChatLayout railLabel={m('assistant.rail.toggle')} railId="assistant-rail" {busy} bind:scrollEl>
+		{#snippet rail()}
 			<UsageMeter {usage} />
 			<div class="convo-head">{m('assistant.recent')}</div>
 			{#if conversations.length === 0}
@@ -283,27 +296,21 @@
 					{/each}
 				</ul>
 			{/if}
-		</aside>
+		{/snippet}
 
-		<section class="chat-pane">
-			<div
-				class="chat-scroll"
-				bind:this={scrollEl}
-				role="log"
-				aria-live="polite"
-				aria-busy={busy}
-			>
-				{#if isEmpty}
-					<ExamplePrompts onpick={pickPrompt} />
-				{:else}
-					<div class="msg-stream">
-						{#each messages as message (message.id)}
-							<ChatMessage {message} />
-						{/each}
-					</div>
-				{/if}
-			</div>
+		{#snippet log()}
+			{#if isEmpty}
+				<ExamplePrompts onpick={pickPrompt} />
+			{:else}
+				<div class="msg-stream">
+					{#each messages as message (message.id)}
+						<ChatMessage {message} />
+					{/each}
+				</div>
+			{/if}
+		{/snippet}
 
+		{#snippet footer()}
 			{#if budgetNotice}
 				<div class="budget-notice" role="alert">{budgetNotice}</div>
 			{/if}
@@ -327,30 +334,11 @@
 					{busy ? m('assistant.thinking') : m('assistant.send')}
 				</button>
 			</form>
-		</section>
-	</div>
+		{/snippet}
+	</ChatLayout>
 </PageHeader>
 
 <style>
-	.assistant-layout {
-		display: grid;
-		grid-template-columns: 240px 1fr;
-		gap: 16px;
-		flex: 1 1 auto;
-		min-height: 0;
-	}
-	.convo-rail {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		padding: 14px;
-		border: 1px solid var(--border);
-		border-radius: 12px;
-		background: var(--surface);
-		height: fit-content;
-		max-height: calc(100vh - 140px);
-		overflow-y: auto;
-	}
 	.convo-head {
 		font-size: 0.7rem;
 		font-weight: 600;
@@ -388,11 +376,11 @@
 		font-family: inherit;
 	}
 	.convo-item:hover {
-		background: rgba(99, 140, 255, 0.08);
+		background: color-mix(in srgb, var(--accent) 8%, transparent);
 	}
 	.convo-item.active {
 		border-color: var(--accent);
-		background: rgba(99, 140, 255, 0.1);
+		background: color-mix(in srgb, var(--accent) 10%, transparent);
 	}
 	.convo-title {
 		font-size: 0.84rem;
@@ -405,23 +393,6 @@
 		font-size: 0.72rem;
 		color: var(--text-muted);
 	}
-	.chat-pane {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		min-height: 0;
-		border: 1px solid var(--border);
-		border-radius: 12px;
-		background: var(--bg);
-		overflow: hidden;
-	}
-	.chat-scroll {
-		flex: 1 1 auto;
-		min-height: 420px;
-		max-height: calc(100vh - 220px);
-		overflow-y: auto;
-		padding: 20px;
-	}
 	.msg-stream {
 		display: flex;
 		flex-direction: column;
@@ -431,8 +402,8 @@
 		margin: 0 16px;
 		padding: 10px 14px;
 		border-radius: 8px;
-		background: rgba(240, 70, 70, 0.1);
-		border: 1px solid rgba(240, 70, 70, 0.3);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		color: var(--danger);
 		font-size: 0.85rem;
 	}
@@ -461,37 +432,9 @@
 		outline: none;
 		border-color: var(--accent);
 	}
-	.btn-secondary {
-		padding: 8px 14px;
-		border-radius: 8px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-family: inherit;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-	}
-	.btn-secondary:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-secondary:disabled,
-	.composer .btn-primary:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
 	.composer .btn-primary {
 		align-self: stretch;
 		padding: 0 22px;
 	}
 
-	@media (max-width: 720px) {
-		.assistant-layout {
-			grid-template-columns: 1fr;
-		}
-		.convo-rail {
-			max-height: none;
-		}
-	}
 </style>

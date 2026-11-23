@@ -4,7 +4,7 @@ import type { HelpMessages } from '../../messages';
 // diagram labels under `help.*` — all of them but `help.pageLink` and
 // `help.tip.*`, which every page's chrome reads and so stay in the main
 // catalogue. Split out because it is ~9 KB gzipped per locale that only the
-// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureHelpCatalogue()` in store.svelte.ts;
+// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureSlices('help')` in store.svelte.ts;
 // `satisfies HelpMessages` makes a missing or extra key a compile error.
 export const messages = {
 	'help.title': 'Central de ajuda',
@@ -63,7 +63,6 @@ export const messages = {
 	'help.note.role': 'Quem pode fazer isso',
 	'help.glossary.title': 'Glossário',
 	'help.glossary.intro': 'Os termos de contas a pagar usados no {product} e o que cada um significa aqui.',
-	'help.glossary.topic': 'Tema',
 	'help.glossary.allTopics': 'Todos os temas',
 	'help.glossary.aliases': 'Também chamado de:',
 	'help.glossary.related': 'Veja também:',
@@ -103,7 +102,7 @@ export const messages = {
 	'help.term.credit-memo': 'Nota de crédito',
 	'help.term.credit-memo.short': 'Um documento do fornecedor que reduz o valor devido, aplicado a uma fatura em aberto do mesmo fornecedor.',
 	'help.term.duplicate-invoice': 'Fatura duplicada',
-	'help.term.duplicate-invoice.short': 'Uma fatura lançada duas vezes. O FeohLedger sinaliza prováveis duplicatas e bloqueia o pagamento.',
+	'help.term.duplicate-invoice.short': 'Uma fatura lançada duas vezes. O FeohLedger sinaliza prováveis duplicatas e bloqueia o pagamento e o envio ao ERP até que sejam resolvidas.',
 	'help.term.purchase-order': 'Pedido de compra',
 	'help.term.purchase-order.short': 'Seu pedido formal a um fornecedor: o que está comprando, em que quantidade e por qual preço.',
 	'help.term.goods-receipt': 'Recebimento de mercadorias',
@@ -328,7 +327,7 @@ export const messages = {
 	'help.term.line-total-mismatch': 'Divergência no total das linhas',
 	'help.term.line-total-mismatch.short': 'As linhas de uma fatura não somam o seu total. O pagamento fica bloqueado até alguém resolver.',
 	'help.term.fraud-flag': 'Indício de fraude',
-	'help.term.fraud-flag.short': 'Uma exceção gerada quando uma fatura ou um pagamento parece fraude. O pagamento fica bloqueado até ser resolvida.',
+	'help.term.fraud-flag.short': 'Uma exceção gerada quando uma fatura ou um pagamento parece fraude. O pagamento e o envio ao ERP ficam bloqueados até ser resolvida.',
 	'help.term.expense-policy': 'Política de despesas',
 	'help.term.expense-policy.short': 'Suas regras sobre o que os funcionários podem solicitar (limites, recibos, pré-aprovações), verificadas em cada despesa.',
 	'help.term.spend-preapproval': 'Pré-aprovação de gasto',

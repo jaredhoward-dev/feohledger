@@ -5,16 +5,9 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.schemas.action_verdict import CodedRefusal
 from app.schemas.money import MoneyAmount, OptionalExactMoneyInput, OptionalMoneyAmount
 from app.services.card_issuance import CardCancelDisposition
-
-
-class PaymentStatus(StrEnum):
-    pending = "pending"
-    processing = "processing"
-    completed = "completed"
-    failed = "failed"
-    cancelled = "cancelled"
 
 
 class PaymentMethod(StrEnum):
@@ -32,6 +25,17 @@ class PaymentMethod(StrEnum):
     bacs = "bacs"
     faster_payments = "faster_payments"
     chaps = "chaps"
+    # A payment card used OUTSIDE FeohLedger's own card programme — a company
+    # credit card paying a bill in the ERP (QuickBooks `PayType: CreditCard`)
+    # or recorded as paid outside. Card rails are reported on a 1099-K by the
+    # settlement entity, so it is excluded from the 1099 like `virtual_card`
+    # (decisions §295). Recorded only — nothing dispatches on it.
+    card = "card"
+
+
+#: Rails that only ever describe a payment made OUTSIDE FeohLedger: no
+#: processor dispatches them, so a payment FeohLedger books never names one.
+RECORD_ONLY_PAYMENT_METHODS = frozenset({PaymentMethod.card})
 
 
 class PaymentRunStatus(StrEnum):
@@ -49,7 +53,9 @@ class PaymentRunStatus(StrEnum):
     # A record-only tenant's run whose NACHA file has been handed to the
     # customer (`GET /runs/{id}/nacha`). A claim: the money may be moving at
     # the customer's bank, so nothing may execute, cancel or re-stage it. Exits
-    # are `/record-outside` (paid) and `/nacha/void` (the bank rejected it).
+    # are `/record-outside` (paid), `/nacha/void` (the bank rejected it; on a
+    # record-only tenant only, decisions §362), and `/nacha/verify` cancelling
+    # it when every bill in the file was paid in the ERP since the export.
     exported = "exported"
     executing = "executing"
     submitted = "submitted"
@@ -60,7 +66,6 @@ class PaymentRunStatus(StrEnum):
     cancelled = "cancelled"
 
 
-PAYMENT_STATUSES = [s.value for s in PaymentStatus]
 PAYMENT_RUN_STATUSES = [s.value for s in PaymentRunStatus]
 
 
@@ -75,6 +80,14 @@ class PaymentCreate(BaseModel):
     amount: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
     method: PaymentMethod | None = None
     reference: str | None = Field(default=None, max_length=255)
+
+    @field_validator("method")
+    @classmethod
+    def _dispatchable(cls, v: PaymentMethod | None) -> PaymentMethod | None:
+        if v in RECORD_ONLY_PAYMENT_METHODS:
+            raise ValueError("card records a payment made outside FeohLedger; record it instead")
+        return v
+
     # No `payment_run_id`. It used to be accepted here and written straight to
     # the FK with no validation at all — the run was never checked to exist, to
     # be `draft`, or to belong to the caller's entity, and `run.total_amount` /
@@ -94,18 +107,23 @@ class PaymentCreate(BaseModel):
     # key, so a stray one is simply not honoured rather than 422-ing.
 
 
-class RecordPaymentOutsideRequest(BaseModel):
-    """`POST /api/payments/record-outside` — an invoice the customer paid themselves.
+class RecordErpReportedPaymentRequest(BaseModel):
+    """`POST /api/exceptions/{id}/record-erp-payment` — the payment an ERP
+    reported, as the person confirms it (pre-filled from the exception's
+    `erp_report`, decisions §319). Also the body `record-outside` extends.
 
     `services/external_payment.py` owns the rules; see it for why each gate is
     (or deliberately is not) applied.
     """
 
-    invoice_id: uuid.UUID
     # How the customer paid — it decides 1099 treatment (`payment_methods`).
     # `virtual_card` is FeohLedger's own card program, never a way to pay
-    # outside it.
-    method: PaymentMethod
+    # outside it. Optional HERE only: a kept ERP breakdown over several rails
+    # is the record whatever one rail a person names (decisions §396), so the
+    # dialog asks for none there and the endpoint refuses an omitted rail
+    # anywhere else (`api/exceptions.py::ERP_PAYMENT_METHOD_REQUIRED`, §413).
+    # `RecordPaymentOutsideRequest` requires it again.
+    method: PaymentMethod | None = None
     # The cheque number / bank-portal confirmation. Required: it is what bank
     # reconciliation matches the statement line on, and the only evidence the
     # record carries.
@@ -118,7 +136,7 @@ class RecordPaymentOutsideRequest(BaseModel):
 
     @field_validator("method")
     @classmethod
-    def _not_card(cls, v: PaymentMethod) -> PaymentMethod:
+    def _not_card(cls, v: PaymentMethod | None) -> PaymentMethod | None:
         if v == PaymentMethod.virtual_card:
             raise ValueError("virtual_card is not a way to pay outside FeohLedger")
         return v
@@ -130,6 +148,15 @@ class RecordPaymentOutsideRequest(BaseModel):
         if not v:
             raise ValueError("reference must not be blank")
         return v
+
+
+class RecordPaymentOutsideRequest(RecordErpReportedPaymentRequest):
+    """`POST /api/payments/record-outside` — an invoice the customer paid themselves."""
+
+    invoice_id: uuid.UUID
+    # Required: no ERP breakdown stands behind this record, so the rail the
+    # person names is the only one there is.
+    method: PaymentMethod
 
 
 class RecordRunOutsideRequest(BaseModel):
@@ -146,6 +173,16 @@ class RecordRunOutsideRequest(BaseModel):
         if not v:
             raise ValueError("reference must not be blank")
         return v
+
+
+class PaymentRailPart(BaseModel):
+    """One cash payment behind a recorded payment, as the ERP stated it
+    (`payments.rail_breakdown`, migration 0130, decisions §396): its rail
+    (`None` = not stated, which is 1099-reportable) and the exact amount it
+    paid, in the payment's own currency. No account data."""
+
+    method: str | None
+    amount: MoneyAmount
 
 
 class PaymentResponse(BaseModel):
@@ -245,6 +282,13 @@ class PaymentResponse(BaseModel):
     card_provider: str | None = None
     card_id: str | None = None
 
+    # Which rails paid how much, when the ERP stated a breakdown that stands
+    # (decisions §396): what explains `method: null` on a payment made on two
+    # rails, and what the 1099 splits it by. `None` when no breakdown is kept
+    # (one rail, a breakdown that did not reconcile, or a payment recorded
+    # before migration 0130), never an empty list standing in for "unknown".
+    rail_breakdown: list[PaymentRailPart] | None = None
+
     model_config = {"from_attributes": True}
 
     @classmethod
@@ -279,11 +323,49 @@ class PaymentResponse(BaseModel):
             card_last_four=card.last_four if card else None,
             card_provider=card.card_provider if card else None,
             card_id=str(card.id) if card else None,
+            rail_breakdown=_rail_breakdown(getattr(p, "rail_breakdown", None)),
         )
 
 
+def _rail_breakdown(value: object) -> list[PaymentRailPart] | None:
+    """The stored breakdown for the read surface, through the one parser
+    (`payment_methods.rail_parts_from_json`): a malformed array reads as none,
+    never as a partial list that would look like the whole."""
+    from app.services.payment_methods import rail_parts_from_json
+
+    parts = rail_parts_from_json(value)
+    if not parts:
+        return None
+    return [PaymentRailPart(method=part.method, amount=part.amount) for part in parts]
+
+
+class PaymentListItem(PaymentResponse):
+    """A History-tab row: the payment plus the caller's verdict on its actions.
+
+    Each ``*_refusal`` is the coded refusal (``{code, message, params}``) the
+    endpoint would answer the caller with, or ``None`` when it would accept —
+    computed by ``api/payments.payment_row_verdicts`` from each endpoint's own
+    permission and gate, so the page offers a control exactly when its field is
+    ``None`` (issue #575):
+
+    * ``void_refusal`` — ``POST /api/payments/{id}/void``;
+    * ``release_refusal`` / ``dismiss_refusal`` — ``POST
+      /api/payments/{id}/compliance/release`` / ``dismiss``;
+    * ``accept_settlement_refusal`` — ``POST
+      /api/payments/{id}/settlement/accept``.
+
+    Required, not defaulted: a ``None`` nobody computed would read as
+    "allowed".
+    """
+
+    void_refusal: CodedRefusal | None
+    release_refusal: CodedRefusal | None
+    dismiss_refusal: CodedRefusal | None
+    accept_settlement_refusal: CodedRefusal | None
+
+
 class PaymentListResponse(BaseModel):
-    items: list[PaymentResponse]
+    items: list[PaymentListItem]
     total: int
     page: int
     page_size: int
@@ -371,8 +453,26 @@ class PaymentRunResponse(BaseModel):
         )
 
 
+class PaymentRunRowActions(BaseModel):
+    """A Runs-tab row's verdict on its own row action, for the caller — the
+    coded refusal ``POST /runs/{id}/sync-erp`` would answer with, or ``None``
+    when it would accept (``payment_controls.run_sync_erp_refusal`` after the
+    endpoint's ``payment.execute``). Required: a ``None`` nobody computed
+    would read as "allowed"."""
+
+    sync_erp: CodedRefusal | None
+
+
+class PaymentRunListItem(PaymentRunResponse):
+    """A Runs-tab row: the run plus the caller's verdict on its row action
+    (issue #575). The run dialog's decisions ride ``GET /runs/{id}``'s
+    ``actions`` instead."""
+
+    actions: PaymentRunRowActions
+
+
 class PaymentRunListResponse(BaseModel):
-    items: list[PaymentRunResponse]
+    items: list[PaymentRunListItem]
     total: int
     page: int
     page_size: int

@@ -6,12 +6,25 @@ and we hold a rotating refresh token afterwards. This module is that flow, once,
 for every such adapter (``erp_adapters/oauth_base.OAuthErpAdapter``):
 
 * :func:`build_authorize_url` / :func:`consume_state` — the signed, single-use
-  ``state`` that carries org + user + provider across the provider's redirect;
+  ``state`` that carries org + user + provider across the provider's redirect,
+  bound to the starting browser by :data:`BROWSER_COOKIE` (below);
 * :func:`exchange_code` — the callback's code → token exchange;
 * :func:`get_access_token` — what adapters call; refreshes and persists;
-* :func:`revoke` — best-effort revocation on disconnect.
+* :func:`revoke` / :func:`revoke_grant` — best-effort revocation on disconnect
+  and on tenant deletion.
 
 The routes live in ``app/api/erp_oauth.py``.
+
+Bound to the browser that started it (login-CSRF)
+-------------------------------------------------
+The callback is public, so a signed state alone let a rogue tenant admin start
+a connect and have someone else consent, linking that person's books to the
+admin's tenant. ``/authorize`` therefore sets :data:`BROWSER_COOKIE` (random,
+HttpOnly, host-only on the API host — :func:`browser_cookie_attributes`) in
+the bearer-authenticated response, the state carries its SHA-256
+(:func:`browser_binding`), and the callback compares the two
+(:func:`browser_matches`, constant time). Only the admin's own browser can
+make that bearer request, so only it holds the cookie.
 
 Stored state — two halves, written together
 -------------------------------------------
@@ -26,6 +39,7 @@ The consent METADATA lives in ``Organization.settings.erp.oauth``::
         "client_source": "tenant" | "platform",
         "connected_at": "<ISO-8601 UTC>",
         "needs_reconnect": true | absent,
+        "scope_gaps": ["payments_scope_missing"] | absent,
     }
 
 The TOKENS are sealed in ``provider_credentials`` with the block's other
@@ -100,8 +114,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -110,16 +126,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from sqlalchemy import select
 
 from app import redis as app_redis
 from app.config import settings
-from app.services import provider_credentials
+from app.services import credential_crypto, provider_credentials
 from app.services.credential_crypto import CredentialCryptoError
-from app.services.erp_adapters.oauth_base import OAuthProviderSpec
+from app.services.erp_adapters.oauth_base import ExternalCompany, OAuthProviderSpec
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +147,15 @@ OAUTH_PROVIDERS: dict[str, OAuthProviderSpec] = {}
 #: The one redirect URI every provider app registers (path under
 #: ``FEOH_API_PUBLIC_URL``). The tenant comes back in ``state``, not the URL.
 CALLBACK_PATH = "/api/erp/oauth/callback"
+
+#: The HttpOnly cookie that binds a connect to the browser that started it
+#: (:func:`browser_cookie_attributes`). Set by the ``/authorize`` response on the
+#: API host; its hash rides in ``state``; the callback compares and clears it.
+#: The ``__Host-`` prefix makes the browser refuse any version of it that is not
+#: ``Secure``, ``Path=/`` and host-only, so a sibling subdomain of the same site
+#: cannot toss in a value of its own choosing (the weakness of a plain
+#: double-submit cookie).
+BROWSER_COOKIE = "__Host-feoh_erp_oauth_nonce"
 
 #: Refresh when the access token has less than this left. Covers clock skew and
 #: a request that starts just before expiry.
@@ -144,6 +169,7 @@ TOKEN_PATHS: tuple[str, ...] = (ACCESS_TOKEN_PATH, REFRESH_TOKEN_PATH)
 _STATE_PREFIX = "erp:oauth:state:"
 _LOCK_PREFIX = "erp:oauth:refresh-lock:"
 _REALM_LOCK_PREFIX = "erp:oauth:realm-claim:"
+_PENDING_PREFIX = "erp:oauth:pending:"
 _LOCK_TTL_SECONDS = 30
 _LOCK_WAIT_SECONDS = 20.0
 _LOCK_POLL_SECONDS = 0.1
@@ -311,15 +337,119 @@ def _state_ttl() -> int:
     return int(settings.erp_oauth_state_ttl_seconds)
 
 
+def new_browser_nonce() -> str:
+    """A fresh value for the :data:`BROWSER_COOKIE` nonce cookie."""
+    return secrets.token_urlsafe(32)
+
+
+def browser_binding(cookie_value: str) -> str:
+    """What ``state`` carries for a browser nonce: its SHA-256, never the value.
+
+    The state travels through the provider and the address bar; the cookie is
+    HttpOnly. Only the hash crosses into the URL, so the state alone cannot be
+    turned into a matching cookie.
+    """
+    return hashlib.sha256(cookie_value.encode()).hexdigest()
+
+
+def browser_matches(cookie_value: str | None, binding: str) -> bool:
+    """Does the callback's cookie belong to the browser that started the connect?
+
+    Constant-time, and false for a missing cookie or a state minted without a
+    binding (there is no such state after this change, but an absent field
+    must never read as a match).
+    """
+    if not cookie_value or not binding:
+        return False
+    return hmac.compare_digest(browser_binding(cookie_value), binding)
+
+
+_BROWSER_NONCE_SHAPE = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def verified_browser_nonce(cookie_value: str | None, binding: str) -> str | None:
+    """The callback's cookie value when it is the nonce this state was bound to.
+
+    Returns the value only when it has :func:`new_browser_nonce`'s shape and
+    hashes to ``binding`` (:func:`browser_matches`); otherwise None. A caller
+    that sets the cookie again (the company pick renews it) writes this
+    verified value, never the raw request cookie.
+    """
+    if not cookie_value or not _BROWSER_NONCE_SHAPE.fullmatch(cookie_value):
+        return None
+    return cookie_value if browser_matches(cookie_value, binding) else None
+
+
+def browser_cookie_attributes() -> dict[str, Any]:
+    """``Response.set_cookie`` keyword arguments for :data:`BROWSER_COOKIE`.
+
+    Host-only on the API's public host (no ``Domain``), ``Path=/`` (which the
+    ``__Host-`` prefix requires), HttpOnly, and alive as long as the ``state``
+    it pairs with. Only credentialed requests and top-level navigations to the
+    API host carry it, and the SPA makes exactly one credentialed request.
+
+    ``SameSite=Lax`` + ``Secure`` everywhere a real deployment runs: the app
+    (``<slug>.<domain>``) and the API (``api.<domain>``) are same-site, so the
+    credentialed ``/authorize`` fetch may set it, and the provider's top-level
+    GET redirect to the callback carries it.
+
+    A loopback API (local dev) is the one exception, and it is NOT "Secure off":
+    ``acme.localhost`` and ``localhost`` are different sites, and a browser
+    refuses a ``SameSite=Lax`` cookie set by a cross-site fetch (measured in
+    Chromium). ``SameSite=None`` is the only value that crosses, and it
+    requires ``Secure`` — which browsers accept from ``http://localhost``,
+    a potentially trustworthy origin. Gated on the configured API URL being a
+    loopback host AND the environment not being a deployed one, so a
+    misconfigured deployment keeps ``Lax`` (and its connects fail closed at the
+    callback) rather than silently loosening the cookie.
+    """
+    loopback = not settings.is_deployed and is_loopback_host(
+        urlsplit(settings.api_public_url).hostname
+    )
+    return {
+        "max_age": _state_ttl(),
+        "path": "/",
+        "httponly": True,
+        "secure": True,
+        "samesite": "none" if loopback else "lax",
+    }
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """``localhost``, ``*.localhost`` or a loopback IP literal."""
+    h = (host or "").strip().lower().rstrip(".")
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
 async def create_state(
-    *, org_id: uuid.UUID, org_slug: str, user_id: uuid.UUID, provider: str, client_source: str
+    *,
+    org_id: uuid.UUID,
+    org_slug: str,
+    user_id: uuid.UUID,
+    provider: str,
+    client_source: str,
+    browser_nonce: str,
 ) -> str:
     """Mint a signed ``state`` and record its nonce in Redis (single use).
 
     The signature stops forgery (the callback is public); the Redis nonce makes
     it single-use and is what an expired or replayed state fails on. Both carry
     the same binding, so neither alone is enough.
+
+    ``browser_nonce`` is the value of the :data:`BROWSER_COOKIE` the
+    ``/authorize`` response sets in the admin's browser; the state carries its
+    hash (``b``), and the callback refuses a browser without the matching
+    cookie (login-CSRF: a consent link handed to someone else links nothing).
     """
+    if not browser_nonce:
+        raise ValueError("a browser nonce is required")
     nonce = secrets.token_urlsafe(24)
     payload = {
         "n": nonce,
@@ -328,6 +458,7 @@ async def create_state(
         "u": str(user_id),
         "p": provider,
         "c": client_source,
+        "b": browser_binding(browser_nonce),
         "e": int(time.time()) + _state_ttl(),
     }
     body = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
@@ -339,7 +470,7 @@ async def create_state(
 
 async def consume_state(state: str) -> dict[str, str]:
     """Verify and burn ``state``. Returns ``{org_id, org_slug, user_id, provider,
-    client_source}``; raises :class:`OAuthStateError` otherwise."""
+    client_source, browser_binding}``; raises :class:`OAuthStateError` otherwise."""
     if not isinstance(state, str) or state.count(".") != 1 or len(state) > 2048:
         raise OAuthStateError("invalid_state")
     body, mac = state.split(".")
@@ -368,6 +499,7 @@ async def consume_state(state: str) -> dict[str, str]:
         "user_id": str(payload["u"]),
         "provider": str(payload["p"]),
         "client_source": str(payload.get("c") or ""),
+        "browser_binding": str(payload.get("b") or ""),
     }
 
 
@@ -550,6 +682,10 @@ async def revoke(spec: OAuthProviderSpec, erp_settings: dict, oauth: dict) -> bo
 
     ``erp_settings`` is the resolved block and ``oauth`` carries the tokens
     (:func:`resolved_erp`), both read before the disconnect cleared them.
+
+    The client authenticates the way the provider's token endpoint takes it
+    (``spec.token_auth``): HTTP Basic for Intuit and Xero, ``client_id`` /
+    ``client_secret`` form fields for Sage (decisions §371).
     """
     url = revoke_endpoint(spec)
     token = oauth.get("refresh_token") or oauth.get("access_token")
@@ -559,17 +695,54 @@ async def revoke(spec: OAuthProviderSpec, erp_settings: dict, oauth: dict) -> bo
     headers = token_headers(spec, erp_settings)
     if creds is None:
         return False
+    body = {"token": str(token)}
+    auth = None
+    if spec.token_auth == "body":
+        body["client_id"] = creds.client_id
+        body["client_secret"] = creds.client_secret
+    else:
+        auth = httpx.BasicAuth(creds.client_id, creds.client_secret)
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             resp = await client.post(
                 url,
-                data={"token": str(token)},
+                **({"json": body} if spec.revoke_json else {"data": body}),
                 headers=headers,
-                auth=httpx.BasicAuth(creds.client_id, creds.client_secret),
+                auth=auth,
             )
         return resp.status_code in (200, 204)
     except httpx.HTTPError:
         return False
+
+
+#: :func:`revoke_grant`'s answers, which Disconnect returns as ``revocation``
+#: and tenant deletion reports. ``unsupported``: the provider documents no
+#: revocation endpoint (``OAuthProviderSpec.no_revoke_endpoint_reason``), so the
+#: customer must remove the app on the provider's side. ``failed``: it has one
+#: and did not confirm (refused, unreachable, no usable app or token, or a
+#: provider key this build does not know).
+REVOKED = "revoked"
+REVOKE_FAILED = "failed"
+REVOKE_UNSUPPORTED = "unsupported"
+
+
+async def revoke_grant(spec: OAuthProviderSpec | None, erp_settings: dict, oauth: dict) -> str:
+    """:func:`revoke`, stated as :data:`REVOKED` / :data:`REVOKE_FAILED` /
+    :data:`REVOKE_UNSUPPORTED`.
+
+    Never raises: both callers (Disconnect, tenant deletion) have already
+    decided to forget the grant, and a provider that cannot be told must not
+    undo that. Never logs a token: the warning names the provider only.
+    """
+    if spec is None:
+        return REVOKE_FAILED
+    if not revoke_endpoint(spec):
+        return REVOKE_UNSUPPORTED if spec.no_revoke_endpoint_reason else REVOKE_FAILED
+    try:
+        return REVOKED if await revoke(spec, erp_settings, oauth) else REVOKE_FAILED
+    except Exception as exc:  # noqa: BLE001 — best-effort by contract; the outcome says so
+        logger.warning("erp_oauth: %s revocation raised %s", spec.key, exc.__class__.__name__)
+        return REVOKE_FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +758,11 @@ def _parse_dt(value: Any) -> datetime | None:
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+#: Public name for reading a stored ISO-8601 timestamp of the OAuth block
+#: (``expires_at``, ``refresh_token_expires_at``) as an aware datetime.
+parse_timestamp = _parse_dt
 
 
 def _is_fresh(oauth: dict, *, rejected_token: str | None = None) -> bool:
@@ -772,8 +950,374 @@ async def realm_claim(provider: str, external_tenant_id: str) -> AsyncIterator[b
         await _release_lock(key, token)
 
 
+# ---------------------------------------------------------------------------
+# A consent that reached several companies: held until the admin picks one
+# ---------------------------------------------------------------------------
+#
+# Xero (several organisations in one consent) and Sage (a login with several
+# businesses) can answer a consent with more than one company. We never pick a
+# customer's ledger for them (decisions §355), so the callback parks the
+# exchanged token HERE — server-side, sealed, never in a URL or the browser —
+# and the settings page offers the list.
+#
+# The pending connect is keyed on the org AND the hash of the browser-binding
+# cookie that already matched at the callback (§336), so only that browser can
+# reach it, and it also names the admin who started it. Reading it back needs a
+# bearer-authenticated, credentialed request from that admin in that browser —
+# the same two proofs ``/authorize`` and the callback rest on, so the picker
+# adds no new way in. Single use (GETDEL), alive only as long as a ``state``
+# (``FEOH_ERP_OAUTH_STATE_TTL_SECONDS``), and anything stale, mismatched or
+# unreadable reads as "no pending connect".
+
+
+@dataclass(frozen=True)
+class PendingConnect:
+    """A parked consent. ``token_response`` is set only by
+    :func:`take_pending_connect`; :func:`peek_pending_connect` never opens it."""
+
+    org_id: uuid.UUID
+    user_id: uuid.UUID
+    provider: str
+    client_source: str
+    companies: tuple[ExternalCompany, ...]
+    expires_at: datetime
+    token_response: dict | None = None
+
+
+def pending_ttl() -> int:
+    """How long a parked consent waits for the admin's pick — one ``state``'s
+    lifetime, the window the whole connect already has."""
+    return _state_ttl()
+
+
+def _pending_key(org_id: uuid.UUID, binding: str) -> str:
+    return f"{_PENDING_PREFIX}{org_id}:{binding}"
+
+
+def _pending_context(org_id: uuid.UUID, provider: str, binding: str) -> dict[str, str]:
+    """The seal's AAD: the token opens only for this org, provider and browser."""
+    return {
+        "purpose": "erp_oauth_pending",
+        "org": str(org_id),
+        "provider": provider,
+        "binding": binding,
+    }
+
+
+async def park_pending_connect(
+    *,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    provider: str,
+    client_source: str,
+    browser_binding: str,
+    token_response: dict,
+    companies: list[ExternalCompany],
+) -> datetime:
+    """Hold a consent for the admin's pick; returns when it lapses.
+
+    The token response is sealed (``credential_crypto``) before it reaches
+    Redis. A second park from the same browser replaces the first — the
+    browser's cookie names one connect at a time (§336). Raises
+    ``CredentialCryptoError`` when it cannot be sealed.
+    """
+    issued = int(time.time())
+    expiry = issued + pending_ttl()
+    await _store_pending(
+        org_id=org_id,
+        user_id=user_id,
+        provider=provider,
+        client_source=client_source,
+        browser_binding=browser_binding,
+        token_response=token_response,
+        companies=companies,
+        issued=issued,
+        expiry=expiry,
+        only_if_absent=False,
+    )
+    return datetime.fromtimestamp(expiry, UTC)
+
+
+async def _store_pending(
+    *,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    provider: str,
+    client_source: str,
+    browser_binding: str,
+    token_response: dict,
+    companies: list[ExternalCompany],
+    issued: int,
+    expiry: int,
+    only_if_absent: bool,
+) -> bool:
+    """Seal and store one pending record; False when ``only_if_absent`` found
+    another already there. ``issued`` is when ``token_response``'s lifetimes
+    were last true (``_aged`` counts from it); ``expiry`` ends the window."""
+    if not browser_binding:
+        raise ValueError("a browser binding is required")
+    ttl = expiry - issued
+    if ttl <= 0:
+        raise ValueError("the pending connect has lapsed")
+    envelope = await credential_crypto.seal(
+        json.dumps(token_response, separators=(",", ":"), default=str).encode(),
+        _pending_context(org_id, provider, browser_binding),
+    )
+    record = {
+        "u": str(user_id),
+        "p": provider,
+        "c": client_source,
+        "i": issued,
+        "e": expiry,
+        "companies": [[c.id, c.name] for c in companies],
+        "ct": _b64(envelope.ciphertext),
+        "wk": _b64(envelope.wrapped_key),
+        "kp": envelope.key_provider,
+        "kid": envelope.key_id,
+    }
+    r = await app_redis.get_redis()
+    key, value = _pending_key(org_id, browser_binding), json.dumps(record)
+    if only_if_absent:
+        return bool(await r.set(key, value, ex=ttl, nx=True))
+    await r.setex(key, ttl, value)
+    return True
+
+
+def _parse_pending(raw: Any, user_id: uuid.UUID) -> dict | None:
+    """The stored record, or None when it is absent, malformed, lapsed, or
+    another admin's (a different user signed in to the starting browser)."""
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+        if int(record["e"]) < int(time.time()) or str(record["u"]) != str(user_id):
+            return None
+        companies = tuple(ExternalCompany(id=str(i), name=str(n)) for i, n in record["companies"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not companies:
+        return None
+    return {**record, "companies": companies}
+
+
+def _pending_from(org_id: uuid.UUID, record: dict, token_response: dict | None) -> PendingConnect:
+    return PendingConnect(
+        org_id=org_id,
+        user_id=uuid.UUID(str(record["u"])),
+        provider=str(record["p"]),
+        client_source=str(record.get("c") or ""),
+        companies=record["companies"],
+        expires_at=datetime.fromtimestamp(int(record["e"]), UTC),
+        token_response=token_response,
+    )
+
+
+async def peek_pending_connect(
+    org_id: uuid.UUID, user_id: uuid.UUID, cookie_value: str | None
+) -> PendingConnect | None:
+    """The parked consent this browser and admin may pick for, without its
+    token and without spending it. None for anything else."""
+    if not cookie_value:
+        return None
+    r = await app_redis.get_redis()
+    record = _parse_pending(
+        await r.get(_pending_key(org_id, browser_binding(cookie_value))), user_id
+    )
+    return _pending_from(org_id, record, None) if record else None
+
+
+def _aged(token_response: dict, elapsed: int) -> dict:
+    """The token response as if issued now: its lifetimes less the time it
+    waited, so the stored expiry is not later than the provider's."""
+    out = dict(token_response)
+    for key in ("expires_in", "x_refresh_token_expires_in", "refresh_token_expires_in"):
+        try:
+            if out.get(key):
+                out[key] = max(int(out[key]) - elapsed, 0)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+async def take_pending_connect(
+    org_id: uuid.UUID, user_id: uuid.UUID, cookie_value: str | None
+) -> PendingConnect | None:
+    """Spend the parked consent (GETDEL: two picks cannot both get it) and
+    open its token. None when there is none for this browser and admin — a
+    record found for another admin is spent all the same. Raises
+    ``CredentialCryptoError`` when the token cannot be opened (also spent)."""
+    if not cookie_value:
+        return None
+    binding = browser_binding(cookie_value)
+    r = await app_redis.get_redis()
+    record = _parse_pending(await r.getdel(_pending_key(org_id, binding)), user_id)
+    if record is None:
+        return None
+    envelope = credential_crypto.Envelope(
+        ciphertext=_unb64(str(record["ct"])),
+        wrapped_key=_unb64(str(record["wk"])),
+        key_provider=str(record["kp"]),
+        key_id=str(record.get("kid") or ""),
+    )
+    plaintext = await credential_crypto.open_envelope(
+        envelope, _pending_context(org_id, str(record["p"]), binding)
+    )
+    try:
+        token_response = json.loads(plaintext)
+    except ValueError:
+        raise CredentialCryptoError("A pending ERP connection could not be read.") from None
+    if not isinstance(token_response, dict) or not token_response.get("access_token"):
+        raise CredentialCryptoError("A pending ERP connection could not be read.")
+    elapsed = max(int(time.time()) - int(record.get("i") or 0), 0)
+    return _pending_from(org_id, record, _aged(token_response, elapsed))
+
+
+async def restore_pending_connect(pending: PendingConnect, cookie_value: str | None) -> bool:
+    """Put back a consent :func:`take_pending_connect` spent, after the pick it
+    was taken for was refused at a step that needs the opened token (the
+    company linked elsewhere, the sealed store or the audit trail down), so
+    the admin can pick again without a new consent (decisions §355).
+
+    Same browser, admin, provider, companies and expiry. The token goes back
+    as it was taken, already aged, and is sealed afresh with ``issued`` = now,
+    so a later take ages it only by the time it waits from here. Never
+    replaces a newer connect this browser parked meanwhile (SET NX).
+    Best-effort, never raises: False when nothing was put back (no cookie, no
+    token, the window has closed, sealing or Redis failed, or a newer one is
+    there), and the pick is then spent, as it was before.
+    """
+    if not cookie_value or pending.token_response is None:
+        return False
+    issued, expiry = int(time.time()), int(pending.expires_at.timestamp())
+    if expiry <= issued:
+        return False
+    try:
+        return await _store_pending(
+            org_id=pending.org_id,
+            user_id=pending.user_id,
+            provider=pending.provider,
+            client_source=pending.client_source,
+            browser_binding=browser_binding(cookie_value),
+            token_response=pending.token_response,
+            companies=list(pending.companies),
+            issued=issued,
+            expiry=expiry,
+            only_if_absent=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort by contract; the pick stays spent
+        logger.warning(
+            "erp_oauth: %s pending connect not restored for org %s (%s)",
+            pending.provider,
+            pending.org_id,
+            exc.__class__.__name__,
+        )
+        return False
+
+
+async def discard_pending_connect(org_id: uuid.UUID, cookie_value: str | None) -> bool:
+    """Drop this browser's parked consent, if any. True when one was dropped."""
+    if not cookie_value:
+        return False
+    r = await app_redis.get_redis()
+    return bool(await r.delete(_pending_key(org_id, browser_binding(cookie_value))))
+
+
+#: Why a connection needs the admin's consent again (``settings.erp.oauth.
+#: reconnect_reason``), recorded when the provider refuses the refresh token:
+#: past the expiry it last reported, or refused before it (revoked at the
+#: provider, or a lifetime cap it never reported).
+RECONNECT_EXPIRED = "refresh_token_expired"
+RECONNECT_REVOKED = "refresh_token_revoked"
+
+
+#: ``settings.erp.oauth.scope_gaps``: the coded permissions this consent was
+#: found not to cover (``erp_adapters.base.PAYMENTS_SCOPE_MISSING``, decisions
+#: §415), recorded by the status sync through
+#: :func:`update_connection_metadata`. Keyed to the connection like every other
+#: metadata key, so a reconnect (a new block, minted by :func:`new_connection`)
+#: starts with none: a fresh consent asks for every scope the spec lists.
+SCOPE_GAPS_KEY = "scope_gaps"
+
+
+def scope_gaps(oauth: Any) -> list[str]:
+    """The coded scope gaps recorded on a connection, in stored order."""
+    raw = oauth.get(SCOPE_GAPS_KEY) if isinstance(oauth, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [str(code) for code in raw if isinstance(code, str) and code]
+
+
+def reconnect_reason(oauth: dict, *, now: datetime | None = None) -> str:
+    """:data:`RECONNECT_EXPIRED` when the stored refresh-token expiry has
+    passed, else :data:`RECONNECT_REVOKED`."""
+    expires = _parse_dt(oauth.get("refresh_token_expires_at"))
+    moment = now or datetime.now(UTC)
+    return RECONNECT_EXPIRED if expires is not None and expires <= moment else RECONNECT_REVOKED
+
+
+async def update_connection_metadata(
+    spec_key: str, org_id: uuid.UUID, connection_id: str, updates: dict[str, Any]
+) -> bool:
+    """Merge NON-secret ``updates`` into ``settings.erp.oauth`` — only while
+    the stored connection is still ``connection_id`` for ``spec_key``. Under
+    the org row lock, like every settings writer. Returns whether it wrote.
+
+    For bookkeeping the connection-health sweep keeps (which expiry notice was
+    sent); never a token, and never a key the refresher or the connect flow
+    owns.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.database import control_session_factory
+    from app.models.organization import Organization
+
+    forbidden = set(updates) & {
+        "provider",
+        "connection_id",
+        "org_id",
+        "external_tenant_id",
+        "access_token",
+        "refresh_token",
+        "expires_at",
+        "refresh_token_expires_at",
+        "client_source",
+        "needs_reconnect",
+    }
+    if forbidden:
+        raise ValueError(f"not connection metadata this writer may set: {sorted(forbidden)}")
+    async with control_session_factory() as session:
+        org = (
+            await session.execute(
+                select(Organization).where(Organization.id == org_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        current = dict((org.settings if org else None) or {})
+        erp = dict(current.get("erp") or {})
+        oauth = erp.get("oauth")
+        if (
+            org is None
+            or not isinstance(oauth, dict)
+            or oauth.get("provider") != spec_key
+            or not hmac.compare_digest(str(oauth.get("connection_id") or ""), connection_id)
+        ):
+            await session.rollback()
+            return False
+        erp["oauth"] = {**oauth, **updates}
+        current["erp"] = erp
+        org.settings = current
+        flag_modified(org, "settings")
+        await session.commit()
+        return True
+
+
 async def get_access_token(
-    spec: OAuthProviderSpec, erp_config: dict, *, rejected_token: str | None = None
+    spec: OAuthProviderSpec,
+    erp_config: dict,
+    *,
+    rejected_token: str | None = None,
+    force_refresh: bool = False,
 ) -> str:
     """Return a valid access token for ``erp_config``'s connection to ``spec``.
 
@@ -791,6 +1335,13 @@ async def get_access_token(
 
     org_id, connection_id = _identity(spec, erp_config)
     _, oauth = await _read_stored(spec, org_id, connection_id)
+    if force_refresh:
+        # Refresh now even though the access token is fresh — the
+        # connection-health sweep keeping a quiet connection's refresh token
+        # alive (§295). Treating the stored access token as the rejected one
+        # reuses the lock and compare-and-swap below unchanged: a refresh a
+        # concurrent caller already landed satisfies this one too.
+        rejected_token = str(oauth.get("access_token") or "") or None
     if _is_fresh(oauth, rejected_token=rejected_token):
         return str(oauth["access_token"])
 
@@ -807,6 +1358,47 @@ async def get_access_token(
         if _is_fresh(oauth, rejected_token=rejected_token):
             return str(oauth["access_token"])
 
+    # From here — the provider's rotation and its persistence — runs as ONE
+    # shielded task. Intuit rotates the refresh token on every use, so a caller
+    # cancelled by its own timeout (the dispatch-time bill check, decisions
+    # §296) after Intuit answered but before the new token was stored would
+    # strand the connection. Shielded, the refresh completes and persists, and
+    # releases its lock, whatever happens to the caller.
+    return await _shielded(
+        _refresh_holding_lock(spec, org_id, connection_id, rejected_token, lock_key, lock)
+    )
+
+
+#: Strong references to in-flight shielded refreshes (asyncio holds only a
+#: weak one), each retrieving its own exception so a refresh whose caller gave
+#: up never logs "Task exception was never retrieved".
+_refresh_tasks: set = set()
+
+
+async def _shielded(coro):
+    import asyncio
+
+    task = asyncio.ensure_future(coro)
+    _refresh_tasks.add(task)
+
+    def _done(t) -> None:
+        _refresh_tasks.discard(t)
+        if not t.cancelled():
+            t.exception()
+
+    task.add_done_callback(_done)
+    return await asyncio.shield(task)
+
+
+async def _refresh_holding_lock(
+    spec: OAuthProviderSpec,
+    org_id: uuid.UUID,
+    connection_id: str,
+    rejected_token: str | None,
+    lock_key: str,
+    lock: str,
+) -> str:
+    """The refresh :func:`get_access_token` runs once it holds the lock."""
     try:
         # Re-read under the lock: the previous holder may have just refreshed.
         erp, oauth = await _read_stored(spec, org_id, connection_id)
@@ -828,8 +1420,13 @@ async def get_access_token(
             if exc.invalid_grant:
                 # Revoked at the provider, or past its lifetime. Surface it as
                 # "reconnect required" instead of retrying a dead token forever.
+                reason = reconnect_reason(oauth)
                 await _compare_and_swap(
-                    spec, org_id, connection_id, spent, {"needs_reconnect": True}
+                    spec,
+                    org_id,
+                    connection_id,
+                    spent,
+                    {"needs_reconnect": True, "reconnect_reason": reason},
                 )
                 # Rotation is routine and unaudited; a connection going down is
                 # not. Best-effort, after the commit.
@@ -841,7 +1438,7 @@ async def get_access_token(
                     action="organization.erp_reconnect_required",
                     entity_id=org_id,
                     entity_type="organization",
-                    details={"provider": spec.key},
+                    details={"provider": spec.key, "reason": reason},
                 )
                 logger.warning("erp_oauth: %s refresh refused for org %s", spec.key, org_id)
                 raise ErpNotConnectedError(spec.key) from None

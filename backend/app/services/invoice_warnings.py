@@ -7,14 +7,22 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
+from typing import NamedTuple
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.exception import Exception as APException
 from app.models.invoice import Invoice, InvoiceStatus
-from app.models.procurement import po_currency_code
+from app.models.invoice_status import (
+    APPROVED_OR_BEYOND_STATUSES,
+    IN_REVIEW_STATUSES,
+    PRE_APPROVAL_STATUSES,
+    SETTLED_STATUSES,
+)
+from app.models.procurement import PurchaseOrder, po_currency_code
 from app.services.invoice_warning_catalog import (
     exception_finding,
     exception_findings,
@@ -23,6 +31,7 @@ from app.services.invoice_warning_catalog import (
 from app.services.matching_rules import resolve_match_rule, strictest_rule_for_any_commodity
 from app.services.po_matching import (
     CURRENCY_DIFFERENT,
+    CURRENCY_SAME,
     CURRENCY_UNKNOWN,
     format_quantity,
     match_invoice_to_po,
@@ -87,8 +96,9 @@ DEFAULT_FRAUD_RULES: dict = {
 
 
 # Warning categories appended directly onto `invoice.warnings` by callers
-# OTHER than this module — currently all in `services/extraction.py`, before
-# it calls `refresh_warnings` as the last step of `run_extraction`.
+# OTHER than this module — `services/extraction.py`, before it calls
+# `refresh_warnings` as the last step of `run_extraction`, and
+# `services/recurring_invoices.generate_one` (`gl_account_invalid`).
 # `refresh_warnings` rebuilds every category IT owns from scratch on every
 # call (that's the point — a fully fresh re-derivation), but it must not
 # blind-overwrite `invoice.warnings` and silently drop these, since it never
@@ -205,7 +215,12 @@ def invoice_number_letter_skeleton(value: str | None) -> str:
 
 
 async def refresh_warnings(
-    db: AsyncSession, invoice: Invoice, *, org_settings: dict | None = None
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org_settings: dict | None = None,
+    erp_po_sync: dict | None = None,
+    match_po_on_new: bool = False,
 ) -> list[dict]:
     """Recompute warnings for a single invoice and persist them on the row.
 
@@ -214,6 +229,18 @@ async def refresh_warnings(
     `org_settings` drives the configurable fraud rules. When omitted (the
     common case from existing call sites that haven't threaded it
     through), the defaults in `DEFAULT_FRAUD_RULES` are used.
+
+    `erp_po_sync` marks a refresh an ERP PO sync triggered (decisions §323,
+    amended): it may RAISE a PO-match hold but never clear one. A row whose
+    finding it no longer reports stays open and is annotated instead
+    (:func:`_reconcile_po_exceptions`). The dict is the PII-free context the
+    annotation records (``erp_type``).
+
+    ``match_po_on_new`` runs the PO match on a ``new`` invoice too, which a
+    refresh otherwise skips as an unentered draft. ``POST /complete`` passes it
+    when it is about to take the invoice out of ``new`` through approval, so the
+    amount floor decides on a matched invoice and the reviewer sees the match
+    (decisions §425).
 
     Every category this function computes is rebuilt from scratch below —
     but `invoice.warnings` can already carry entries this function doesn't
@@ -228,6 +255,7 @@ async def refresh_warnings(
         w for w in (invoice.warnings or []) if w.get("type") in UPSTREAM_WARNING_TYPES
     ]
     cfg = _fraud_config(org_settings)
+    await _void_stale_finding_stamps(db, invoice)
 
     # Missing required fields
     if not invoice.vendor_name or not invoice.vendor_name.strip():
@@ -325,7 +353,7 @@ async def refresh_warnings(
     if (
         invoice.due_date
         and invoice.due_date < utc_today()
-        and _status_str(invoice.status) in ("new", "pending", "ready_for_review")
+        and _status_str(invoice.status) in IN_REVIEW_STATUSES
     ):
         warnings.append(warning("past_due", "warning"))
 
@@ -391,14 +419,7 @@ async def refresh_warnings(
                     .where(
                         Invoice.vendor_id == invoice.vendor_id,
                         Invoice.id != invoice.id,
-                        Invoice.status.in_(
-                            [
-                                InvoiceStatus.approved.value,
-                                InvoiceStatus.posted_in_erp.value,
-                                InvoiceStatus.payment_scheduled.value,
-                                InvoiceStatus.paid.value,
-                            ]
-                        ),
+                        Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
                         Invoice.remit_to_address.isnot(None),
                     )
                     .order_by(Invoice.created_at.desc())
@@ -420,22 +441,20 @@ async def refresh_warnings(
             # currencies into one mean/stdev would both misfire (a normal
             # foreign-currency invoice reads as a huge outlier) and mask
             # real anomalies (a mixed-currency history inflates stdev).
-            if cfg["stat_anomaly_enabled"] and invoice.amount:
+            # An invoice that records no currency has no comparable history:
+            # reading it as USD would score it against USD invoices (§473).
+            from app.services.payment_runs import payable_currency_code
+
+            anomaly_currency = payable_currency_code(invoice.currency)
+            if cfg["stat_anomaly_enabled"] and invoice.amount and anomaly_currency is not None:
                 hist_q = await db.execute(
                     select(Invoice.amount)
                     .where(
                         Invoice.vendor_id == invoice.vendor_id,
                         Invoice.id != invoice.id,
-                        Invoice.status.in_(
-                            [
-                                InvoiceStatus.approved.value,
-                                InvoiceStatus.posted_in_erp.value,
-                                InvoiceStatus.payment_scheduled.value,
-                                InvoiceStatus.paid.value,
-                            ]
-                        ),
+                        Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
                         Invoice.amount.isnot(None),
-                        Invoice.currency == (invoice.currency or "USD"),
+                        func.upper(Invoice.currency) == anomaly_currency,
                     )
                     .order_by(Invoice.created_at.desc())
                     .limit(20)
@@ -484,9 +503,10 @@ async def refresh_warnings(
     # service handles 2-way (invoice vs PO) and 3-way (with goods receipt).
     # Result is persisted on `invoice.po_match` so the modal can render it
     # without re-running. Mismatches and missing POs raise exceptions for
-    # the queue. Skip on draft `new` invoices that haven't been extracted yet.
-    if invoice.po_number and _status_str(invoice.status) != "new":
-        await _refresh_po_match(db, invoice, warnings, org_settings)
+    # the queue. Skip on draft `new` invoices that haven't been extracted yet,
+    # unless the caller is submitting it now (`match_po_on_new`, §425).
+    if invoice.po_number and (match_po_on_new or _status_str(invoice.status) != "new"):
+        await _refresh_po_match(db, invoice, warnings, org_settings, erp_po_sync=erp_po_sync)
     else:
         invoice.po_match = None
 
@@ -533,6 +553,44 @@ async def refresh_warnings(
     await _refresh_reporting_amount(invoice, org_settings)
 
     # Persist
+    invoice.warnings = warnings or None
+    return warnings
+
+
+async def refresh_po_match_only(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org_settings: dict | None = None,
+    erp_po_sync: dict | None = None,
+) -> list[dict]:
+    """Re-run the PO match, and only it, on one invoice.
+
+    For a caller whose change can move nothing but the PO side of the match — a
+    PO's own fields stamped in bulk (`scripts/backfill_po_currency.py`). The
+    full :func:`refresh_warnings` would also re-run duplicate detection, the
+    vendor-history fraud rules and, where an org opts in, an LLM call per
+    invoice; none of their inputs moved, so each would be cost with no new
+    answer.
+
+    Same contract as the PO-match step of :func:`refresh_warnings`: the
+    ``po_mismatch`` / ``quality_hold`` warnings (`PO_MATCH_EXCEPTION_TYPES`, the
+    catalogue's types for exactly the codes :func:`_refresh_po_match` writes)
+    are rebuilt, the holds they warrant are raised, and a hold the match no
+    longer finds is closed (or, with ``erp_po_sync``, only annotated). Every
+    other entry on ``invoice.warnings`` is kept as it is. A ``new`` draft gets
+    no match, as in the full refresh.
+    """
+    warnings: list[dict] = [
+        w
+        for w in (invoice.warnings or [])
+        if w.get("type") not in PO_MATCH_EXCEPTION_TYPES and w.get("type") != PO_OVERBILLED_TYPE
+    ]
+    await _void_stale_finding_stamps(db, invoice)
+    if invoice.po_number and _status_str(invoice.status) != "new":
+        await _refresh_po_match(db, invoice, warnings, org_settings, erp_po_sync=erp_po_sync)
+    else:
+        invoice.po_match = None
     invoice.warnings = warnings or None
     return warnings
 
@@ -718,23 +776,12 @@ async def _refresh_line_total_reconciliation(
     must never break saving an invoice. Mutates ``warnings`` in place.
     """
     try:
-        from app.models.invoice import InvoiceLineItem
-
-        # Sum in the DB so a large invoice doesn't materialise every row. NULL
-        # totals are excluded by SUM; a set of lines with no totals at all
-        # yields NULL and is treated as "nothing to reconcile against".
-        line_total = (
-            await db.execute(
-                select(func.sum(InvoiceLineItem.total)).where(
-                    InvoiceLineItem.invoice_id == invoice.id,
-                    InvoiceLineItem.total.isnot(None),
-                )
-            )
-        ).scalar_one_or_none()
+        # A set of lines with no totals at all is "nothing to reconcile against".
+        line_total = await _line_items_total(db, invoice)
         if line_total is None:
             return
 
-        mismatch = reconcile_line_totals(invoice, _dec(line_total))
+        mismatch = reconcile_line_totals(invoice, line_total)
         if mismatch is None:
             return
 
@@ -753,6 +800,7 @@ async def _refresh_line_total_reconciliation(
             "error",
             flag,
             org_settings=org_settings,
+            fingerprint=line_total_fingerprint(invoice, line_total),
         )
     except Exception:  # noqa: BLE001 — best-effort; never break the save path
         logger.warning("line-total reconciliation failed for invoice; skipped")
@@ -787,22 +835,8 @@ async def _refresh_price_variance(
         # Draft (this invoice's) line items, in line order. The draft's own
         # currency tags every line so it's compared only against same-currency
         # history (matches the enrichment endpoint).
-        draft_q = (
-            select(
-                InvoiceLineItem.item_code,
-                InvoiceLineItem.description,
-                InvoiceLineItem.unit_price,
-            )
-            .where(InvoiceLineItem.invoice_id == invoice.id)
-            .order_by(
-                InvoiceLineItem.line_number.asc().nulls_last(),
-                InvoiceLineItem.id.asc(),
-            )
-        )
-        draft_lines = [
-            {**dict(r._mapping), "currency": invoice.currency}
-            for r in (await db.execute(draft_q)).all()
-        ]
+        priced_lines = await _draft_price_lines(db, invoice)
+        draft_lines = [{**line, "currency": invoice.currency} for line in priced_lines]
         if not draft_lines:
             return
 
@@ -819,17 +853,7 @@ async def _refresh_price_variance(
             .where(
                 Invoice.vendor_id == invoice.vendor_id,
                 Invoice.id != invoice.id,
-                Invoice.status.in_(
-                    [
-                        InvoiceStatus.approved.value,
-                        InvoiceStatus.sending_to_erp.value,
-                        InvoiceStatus.sent_to_erp.value,
-                        InvoiceStatus.posted_in_erp.value,
-                        InvoiceStatus.payment_scheduled.value,
-                        InvoiceStatus.paid.value,
-                        InvoiceStatus.done.value,
-                    ]
-                ),
+                Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
                 InvoiceLineItem.unit_price.isnot(None),
             )
             .order_by(Invoice.created_at.desc())
@@ -879,6 +903,7 @@ async def _refresh_price_variance(
             worst,
             exception_findings("price_variance_findings", line_flags),
             org_settings=org_settings,
+            fingerprint=price_variance_fingerprint(invoice, priced_lines),
         )
     except Exception:  # noqa: BLE001 — best-effort; never break the save path
         logger.warning("price-variance check failed for invoice; skipped")
@@ -919,7 +944,12 @@ async def refresh_invoices_citing_pos(
     org_settings: dict | None,
     caller: str,
     best_effort: bool = False,
-) -> None:
+    erp_po_sync: dict | None = None,
+    entity_id=None,
+    lock_invoices: bool = False,
+    skip_settled: bool = False,
+    matching_only: bool = False,
+) -> int:
     """Re-run warnings (and so PO matching) on every invoice citing a PO number.
 
     The receiving side — a goods receipt, a quality inspection — links to a PO,
@@ -936,30 +966,61 @@ async def refresh_invoices_citing_pos(
     SAVEPOINT and a failure is logged, not raised. A single interactive write
     (recording or cancelling a receipt) leaves it off, so the write and the
     holds it raises or lifts land together or not at all.
+
+    ``erp_po_sync`` is for the ERP PO sync, and makes every refresh hold-only:
+    a PO total the ERP changed may raise a ``po_mismatch`` / ``quality_hold``
+    but never clear one (decisions §323, amended). See
+    :func:`_reconcile_po_exceptions`. It also narrows the refresh: ``entity_id``
+    (the entity the sync wrote into) limits it to that entity's invoices plus
+    unstamped ones, so another subsidiary's invoice citing the same number gets
+    no note about a PO it does not match against; and ``paid`` / ``done``
+    invoices are left alone, since a hold on money already paid stops nothing.
+
+    ``lock_invoices`` takes each invoice ``FOR UPDATE`` (in id order) before
+    re-reading it. Goods-receipt entry sets it, so a receipt and an approval of
+    an invoice on its PO serialise on the invoice row, which the approval doors
+    already lock (single and bulk approve, the email / Slack / Teams links,
+    ``/complete``): whichever commits second sees the other, and one person
+    cannot approve and receive concurrently past both orders of the receiving
+    rule (decisions §267, §389). The receipt holds its PO lock and then takes
+    the invoices; the approval holds the invoice and reads receipts unlocked,
+    so the two never wait on each other in a cycle.
+
+    ``skip_settled`` leaves ``paid`` / ``done`` invoices alone without the
+    rest of ``erp_po_sync``'s narrowing (the PO currency backfill).
+    ``matching_only`` re-runs only the PO match (:func:`refresh_po_match_only`)
+    instead of every warning check — for a caller whose write moved nothing
+    else an invoice's warnings read. Returns how many invoices were refreshed.
     """
     po_numbers = {n for n in po_numbers if n}
     if not po_numbers:
-        return
+        return 0
+    refreshed = 0
 
     async def _run() -> None:
-        invoices = (
-            (
-                await db.execute(
-                    select(Invoice).where(
-                        Invoice.organization_id == org_id,
-                        Invoice.po_number.in_(po_numbers),
-                    )
-                )
-            )
-            .scalars()
-            .all()
+        nonlocal refreshed
+        query = await invoices_citing_pos(
+            db, org_id, po_numbers, skip_settled=skip_settled or erp_po_sync is not None
         )
+        if erp_po_sync is not None:
+            from app.tenant import apply_entity_scope
+
+            query = apply_entity_scope(query, Invoice, entity_id, include_shared=True)
+        if lock_invoices:
+            query = (
+                query.order_by(Invoice.id)
+                .with_for_update(of=Invoice)
+                .execution_options(populate_existing=True)
+            )
+        invoices = (await db.execute(query)).scalars().all()
+        refresh = refresh_po_match_only if matching_only else refresh_warnings
         for inv in invoices:
-            await refresh_warnings(db, inv, org_settings=org_settings)
+            await refresh(db, inv, org_settings=org_settings, erp_po_sync=erp_po_sync)
+        refreshed = len(invoices)
 
     if not best_effort:
         await _run()
-        return
+        return refreshed
     try:
         async with db.begin_nested():
             await _run()
@@ -970,10 +1031,46 @@ async def refresh_invoices_citing_pos(
             org_id,
             exc.__class__.__name__,
         )
+        return 0
+    return refreshed
+
+
+async def invoices_citing_pos(
+    db: AsyncSession, org_id, po_numbers: set[str], *, skip_settled: bool = False
+):
+    """``SELECT Invoice`` for every invoice citing one of ``po_numbers`` — the
+    set :func:`refresh_invoices_citing_pos` re-matches, so a caller counting
+    it ahead of time (a dry run) counts the same rows.
+
+    A multi-PO split cites its legs by a combined reference ("PO-A,PO-B") that
+    equals none of these numbers, so it is found by the legs it recorded
+    instead (`Invoice.split_po_ids`, decisions §433): a receipt, inspection or
+    currency stamp on one leg re-matches the split, as it would one PO's.
+    ``skip_settled`` drops ``paid`` / ``done`` invoices: a hold on money
+    already paid stops nothing.
+    """
+    leg_ids = [
+        str(i)
+        for i in (
+            await db.execute(
+                select(PurchaseOrder.id).where(
+                    PurchaseOrder.organization_id == org_id,
+                    PurchaseOrder.po_number.in_(po_numbers),
+                )
+            )
+        ).scalars()
+    ]
+    citing = Invoice.po_number.in_(po_numbers)
+    if leg_ids:
+        citing = or_(citing, Invoice.split_po_ids.has_any(array(leg_ids)))
+    query = select(Invoice).where(Invoice.organization_id == org_id, citing)
+    if skip_settled:
+        query = query.where(Invoice.status.not_in(_ERP_SYNC_SKIPPED_STATUSES))
+    return query
 
 
 #: The exception types `_refresh_po_match` owns. Both block payment
-#: (`api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`), so an open row whose
+#: (`services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`), so an open row whose
 #: finding a refresh no longer reports is closed again by
 #: `_close_cleared_po_exceptions` — otherwise a partial receipt that later
 #: completes, or a failed inspection that is re-run and passes, would hold the
@@ -987,7 +1084,21 @@ PO_MATCH_EXCEPTION_TYPES: tuple[str, ...] = ("po_mismatch", "quality_hold")
 #: invoice at another PO is no longer re-reviewed by anyone, so letting it
 #: clear the hold would let the person who changed the reference also release
 #: the payment — the open row stays for a human (`segregation_refusal`).
-_PRE_APPROVAL_STATUSES = frozenset({"new", "pending", "ready_for_review", "rejected"})
+_PRE_APPROVAL_STATUSES = PRE_APPROVAL_STATUSES
+
+#: Invoices the ERP PO sync's re-match (and any ``skip_settled`` one) leaves
+#: alone: the money has gone, so a hold would stop nothing
+#: (``invoices_citing_pos``).
+_ERP_SYNC_SKIPPED_STATUSES = tuple(s.value for s in SETTLED_STATUSES)
+
+#: ``Exception.erp_report["kind"]`` of an open PO-match row that an ERP PO
+#: sync's re-match no longer finds (decisions §323, amended). The sync never
+#: clears a hold, so the row stays open and this records, as data, that the
+#: re-check after the ERP changed the PO now finds nothing to hold for —
+#: the reason a person may now clear it. PII-free: the ERP type, the PO number
+#: matched and the (UTC) day it was observed. Removed again by any later
+#: refresh that finds the finding back.
+ERP_REPORT_PO_REMATCH_CLEARS = "po_rematch_clears"
 
 #: The resolution text and actor an auto-close writes. Not a person — a
 #: detector observing that its own finding is gone — so the audit row carries
@@ -1003,6 +1114,8 @@ async def _refresh_po_match(
     invoice: Invoice,
     warnings: list[dict],
     org_settings: dict | None = None,
+    *,
+    erp_po_sync: dict | None = None,
 ) -> None:
     """Run PO matching and append to warnings + exceptions on issues.
 
@@ -1023,7 +1136,8 @@ async def _refresh_po_match(
 
     Every open row of the two types this refresh no longer finds is then
     closed (`_close_cleared_po_exceptions`), so the hold lifts the moment the
-    evidence catches up.
+    evidence catches up — except on a refresh an ERP PO sync triggered
+    (``erp_po_sync``), which never clears a hold (decisions §323, amended).
     """
     rule = resolve_match_rule(
         org_settings, vendor_id=invoice.vendor_id, gl_account=invoice.gl_account
@@ -1054,19 +1168,56 @@ async def _refresh_po_match(
         flag = warning("po_not_found", "error", poNumber=invoice.po_number)
         warnings.append(flag)
         await _raise("po_mismatch", "error", flag)
+    elif match.status == "mismatch" and match.po_cancelled:
+        # The PO was called off: it authorizes nothing, so the invoice is held
+        # for a person whatever its amount (`procurement.CANCELLED_PO_STATUSES`).
+        flag = warning("po_cancelled", "warning", poNumber=match.po_number)
+        warnings.append(flag)
+        await _raise("po_mismatch", "warning", flag)
+    elif match.status == "mismatch" and match.po_not_issued:
+        # The ERP has not approved or issued the PO yet (decisions §394): it
+        # authorizes nothing, so the invoice is held like a cancelled PO's.
+        flag = warning("po_not_issued", "warning", poNumber=match.po_number)
+        warnings.append(flag)
+        await _raise("po_mismatch", "warning", flag)
+    elif match.status == "mismatch" and match.po_total_unverifiable_reason:
+        # The PO's last ERP sync could not state its total exactly (decisions
+        # §323): the matcher compared nothing, because the total on the row is
+        # one the ERP no longer vouches for. Blocks like the currency guard —
+        # with no trustworthy figure there is no way to show the invoice is not
+        # over-billing — until a person checks the PO in the ERP or the next
+        # sync prices it again.
+        flag = warning("po_total_unverifiable", "warning", poNumber=match.po_number)
+        warnings.append(flag)
+        await _raise("po_mismatch", "warning", flag)
     elif match.status == "mismatch" and match.currency_check == CURRENCY_DIFFERENT:
         # The currency guard tripped: the two are in different currencies, so
         # the matcher compared nothing and there is no variance to state. Same
         # severity and exception type as an out-of-tolerance amount — it is the
         # same control failing, on the unit instead of the figure, and with no
         # figure there is no way to show the invoice is not over-billing.
-        flag = warning(
-            "po_currency_mismatch",
-            "warning",
-            invoiceCurrency=po_currency_code(invoice.currency) or "",
-            poNumber=match.po_number,
-            poCurrency=match.po_currency or "",
-        )
+        #
+        # A `different` match with no valid invoice code is a split whose legs
+        # disagree with each other (decisions §445). That sentence cannot say
+        # "Invoice is in …", so it is its own code and names the legs' codes.
+        # Otherwise both codes are known: a `different` match always records
+        # the PO code that differs (`po_matching.compare_currencies`).
+        invoice_code = po_currency_code(invoice.currency)
+        if invoice_code is None:
+            flag = warning(
+                "po_currency_mismatch_invoice_currency_unknown",
+                "warning",
+                poNumber=match.po_number,
+                poCurrencies=", ".join(match.po_currency_codes()),
+            )
+        else:
+            flag = warning(
+                "po_currency_mismatch",
+                "warning",
+                invoiceCurrency=invoice_code,
+                poNumber=match.po_number,
+                poCurrency=match.po_currency,
+            )
         warnings.append(flag)
         await _raise("po_mismatch", "warning", flag)
     elif (
@@ -1124,6 +1275,40 @@ async def _refresh_po_match(
             poNumber=match.po_number,
         )
         warnings.append(partial_receipt_flag)
+
+    # Cumulative billing: this invoice plus the others already citing the PO
+    # take it past its total (decisions §469), or past the received slice of
+    # it (§470). Independent of the amount and receipt legs, which
+    # compare this invoice alone with the PO.
+    beyond_receipt_flag = await _refresh_po_overbilling(
+        db, invoice, warnings, match, rule.tolerance_pct
+    )
+    # Past approval the cumulative receipt finding is a HOLD (decisions §470,
+    # amended). Before approval a person reads the warning and no unattended
+    # door approves past it; once approved nobody reads it again, and a
+    # receipt cancelled after the bills were signed off (§262 allows it)
+    # reaches them only through this refresh. So it raises the same
+    # payment-blocking `po_mismatch` the per-invoice receipt leg raises: the
+    # run builder and every dispatch refuse it, clearing it is the SoD-gated
+    # sign-off (§169–§170, §420), and the next refresh that no longer finds
+    # it closes it through `_close_cleared_po_exceptions`, which keeps it
+    # open while an implicated or approving recorder's receipt is what
+    # covered the bills (`receipts_clear_hold`, §262, §389).
+    #
+    # Only a finding the approval did not already see: one that reads the
+    # same as, or better than, the warning the invoice carried into this
+    # refresh was in front of whoever approved it, and holding it would make
+    # their sign-off need a second one. Once raised, the hold stays raised
+    # while the finding stands.
+    if (
+        beyond_receipt_flag is not None
+        and _status_str(invoice.status) not in _PRE_APPROVAL_STATUSES
+        and (
+            _beyond_receipt_worsened(invoice.warnings, beyond_receipt_flag)
+            or await _open_po_mismatch_hold(db, invoice)
+        )
+    ):
+        await _raise("po_mismatch", "warning", beyond_receipt_flag)
 
     # 3-way: the invoice bills beyond what has been received. Independent of
     # the amount leg above, because an invoice can be under the PO total and
@@ -1223,11 +1408,244 @@ async def _refresh_po_match(
         invoice,
         found=found,
         po_ref=po_ref,
-        inspection_id=match.inspection_id,
-        po_id=match.po_id,
+        inspection_ids=match.inspection_ids,
+        po_ids=match.matched_po_ids(),
         org_settings=org_settings,
         rule=rule,
+        erp_po_sync=erp_po_sync,
     )
+
+
+#: The warning type of the cumulative over-billing findings (past the PO's
+#: total, or past what has been received of it). Its own type,
+#: not ``po_mismatch``: the invoice modal shows ``po_mismatch`` warnings through
+#: the PO-match panel's own ``issues``, which this cross-invoice finding is not
+#: one of, and it raises no hold (decisions §469).
+PO_OVERBILLED_TYPE = "po_overbilled"
+
+
+async def _refresh_po_overbilling(
+    db: AsyncSession, invoice: Invoice, warnings: list[dict], match, tolerance_pct
+) -> dict | None:
+    """Warn when this invoice and the others citing its PO bill past its total,
+    or past what has been received of it.
+
+    PO matching compares ONE invoice with the whole PO, so two invoices that
+    each fit (a supplier's PO flip, then the same supplier's own invoice for
+    that order, or AP keying a copy) pass both legs, and a flipped invoice has
+    no number for duplicate detection to match (decisions §468). This sums the
+    other live invoices citing the same PO.
+
+    - **Which PO.** Only a single-PO match whose total is trustworthy and in the
+      invoice's own currency (``CURRENCY_SAME``). A split's legs share one amount
+      that cannot be attributed to any one of them, and a cancelled, unissued,
+      unvouched or other-currency PO already raises its own finding.
+    - **Which others.** Every other invoice billing this PO, in every status
+      but ``rejected`` (which bills nothing while it stays rejected), in the
+      PO's currency: one whose last match resolved to this PO
+      (``po_match->>'po_id'``); one a multi-PO split linked to it
+      (``split_po_ids``), counted at its whole amount because a split's amount
+      cannot be attributed to one leg, and overcounting is the safe direction;
+      and one not yet matched to any PO (a ``new`` invoice, or one reopened to
+      it) that cites the PO's number within the PO's entity (either side
+      unstamped spans entities) and names the PO's vendor or no vendor. Another
+      vendor's invoice citing the same number is another vendor's PO.
+    - **The limit.** The match rule's own tolerance over the PO total, as the
+      amount leg uses (``po_billed_beyond_total``). Within that, on a short
+      receipt, the same tolerance over the received slice of the PO
+      (``MatchResult.received_value``, the figure the per-invoice receipt leg
+      measures against) raises ``po_billed_beyond_receipt``: two invoices of
+      400.00 against 400.00 received each fit on their own (decisions
+      §470). Skipped when this invoice alone bills beyond receipt,
+      which the matcher already holds. One finding at most: past the total,
+      no receipt could cure it, so only that sentence is written.
+
+    Before approval, a warning and not a hold: credit memos, corrective
+    re-bills and a sibling rejected after this refresh all move the sum
+    without re-running it here, so a payment-blocking row would go stale in
+    both directions. The reviewer reads it at approval, beside the duplicate
+    and amount findings, and no unattended approval is given while it stands
+    (:func:`po_match_hold_refusal`, ``UNATTENDED_APPROVAL_PO_OVERBILLED``).
+
+    Returns the ``po_billed_beyond_receipt`` finding when it raised one, so
+    the caller can hold an invoice already PAST approval on it: a receipt
+    cancelled after both bills were signed off reaches them only through
+    this refresh, and no reviewer will read the warning again (decisions
+    §470, amended).
+    """
+    if (
+        _status_str(invoice.status) == InvoiceStatus.rejected.value
+        or invoice.amount is None
+        or not match.po_id
+        or match.po_ids
+        or match.po_total is None
+        or match.currency_check != CURRENCY_SAME
+        or match.po_cancelled
+        or match.po_not_issued
+        or match.po_total_unverifiable_reason
+    ):
+        return None
+    po = (
+        await db.execute(
+            select(
+                PurchaseOrder.id,
+                PurchaseOrder.po_number,
+                PurchaseOrder.entity_id,
+                PurchaseOrder.vendor_id,
+            ).where(PurchaseOrder.id == uuid.UUID(str(match.po_id)))
+        )
+    ).one_or_none()
+    if po is None or not po.po_number:
+        return None
+    code = po_currency_code(invoice.currency)
+    if code is None:
+        return None
+    po_id = str(po.id)
+    matched_po_id = Invoice.po_match["po_id"].astext
+    cites = or_(
+        matched_po_id == po_id,
+        Invoice.split_po_ids.has_any(array([po_id])),
+    )
+    # Not yet matched to any PO: the number it cites, from the PO's vendor or
+    # from no vendor yet. Entity is checked below, as the matcher does.
+    vendor_ok = Invoice.vendor_id.is_(None)
+    if po.vendor_id is not None:
+        vendor_ok = or_(vendor_ok, Invoice.vendor_id == po.vendor_id)
+    cites = or_(
+        cites,
+        and_(
+            Invoice.po_number == po.po_number,
+            # NULL for a NULL column and a JSON null alike.
+            matched_po_id.is_(None),
+            vendor_ok,
+        ),
+    )
+    rows = (
+        await db.execute(
+            select(
+                Invoice.amount,
+                Invoice.entity_id,
+                Invoice.currency,
+                matched_po_id,
+                Invoice.split_po_ids,
+            ).where(
+                Invoice.organization_id == invoice.organization_id,
+                Invoice.id != invoice.id,
+                Invoice.status != InvoiceStatus.rejected,
+                Invoice.amount.isnot(None),
+                cites,
+            )
+        )
+    ).all()
+    billed = Decimal("0")
+    for amount, entity_id, currency, row_po_id, split in rows:
+        # A row matched to this PO, or a split leg of it, is this PO's by id;
+        # a number-only citation must also sit in the PO's entity.
+        same_entity = (
+            row_po_id == po_id
+            or (isinstance(split, list) and po_id in split)
+            or entity_id is None
+            or po.entity_id is None
+            or entity_id == po.entity_id
+        )
+        if same_entity and po_currency_code(currency) == code:
+            billed += Decimal(str(amount))
+    if billed <= 0:
+        return None
+    po_total = Decimal(str(match.po_total))
+    tolerance = Decimal(str(tolerance_pct))
+    total_billed = billed + Decimal(str(invoice.amount))
+    limit = po_total + po_total * tolerance / Decimal("100")
+    if total_billed > limit:
+        warnings.append(
+            warning(
+                "po_billed_beyond_total",
+                "warning",
+                billedAmount=billed,
+                poNumber=po.po_number,
+                poTotal=po_total,
+                currency=code,
+            )
+        )
+        # Past the whole PO: no receipt can cure that, so the receipt
+        # sentence below would only repeat it with a smaller figure.
+        return None
+    # The receipt leg (decisions §470): the same siblings measured
+    # against the received slice of the PO instead of its total. Only on a
+    # SHORT receipt (`received_value` is set only then; a full one is the PO
+    # total, which the check above already measured), and only when this
+    # invoice alone fits what arrived: if it does not, the matcher's own
+    # `billed_beyond_receipt` has already raised the payment-blocking hold.
+    if match.received_value is None or match.billed_beyond_receipt:
+        return None
+    received_value = Decimal(str(match.received_value))
+    receipt_limit = received_value + received_value * tolerance / Decimal("100")
+    if total_billed <= receipt_limit:
+        return None
+    flag = warning(
+        "po_billed_beyond_receipt",
+        "warning",
+        # Every live bill on the PO, this one included.
+        totalBilled=total_billed,
+        poNumber=po.po_number,
+        # Display only: the comparison above used the exact share,
+        # which `po_total × received / ordered` can make non-terminating.
+        receivedValue=received_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        currency=code,
+    )
+    warnings.append(flag)
+    return flag
+
+
+def _beyond_receipt_worsened(previous: list | None, flag: dict) -> bool:
+    """Whether the cumulative receipt finding ``flag`` is worse than any the
+    invoice carried into this refresh (``previous``, its warnings before the
+    rebuild): none before, a smaller received value, a larger billed total,
+    another PO or currency, or a figure that cannot be read (a row written
+    before ``totalBilled`` existed). Unreadable counts as worse: holding is
+    the safe error."""
+    params = flag.get("params") or {}
+    for w in previous or []:
+        if not isinstance(w, dict) or w.get("code") != "po_billed_beyond_receipt":
+            continue
+        before = w.get("params") or {}
+        if before.get("poNumber") != params.get("poNumber") or before.get("currency") != params.get(
+            "currency"
+        ):
+            continue
+        try:
+            received_before = Decimal(str(before["receivedValue"]))
+            billed_before = Decimal(str(before["totalBilled"]))
+            received_now = Decimal(str(params["receivedValue"]))
+            billed_now = Decimal(str(params["totalBilled"]))
+        except (KeyError, ArithmeticError, ValueError):
+            continue
+        if received_now >= received_before and billed_now <= billed_before:
+            return False
+    return True
+
+
+async def _open_po_mismatch_hold(db: AsyncSession, invoice: Invoice) -> bool:
+    """Whether an open or escalated ``po_mismatch`` is live on ``invoice``,
+    which the standing cumulative receipt finding then keeps found, so the
+    refresh after the one that raised it does not close it again. Any such
+    row, not only one whose sentence is this finding: ``_ensure_exception``
+    folds a finding into the row already open, so a hold raised while
+    another ``po_mismatch`` stood carries the other's sentence."""
+    if invoice.id is None:
+        return False
+    row = (
+        await db.execute(
+            select(APException.id)
+            .where(
+                APException.invoice_id == invoice.id,
+                APException.exception_type == "po_mismatch",
+                APException.status.in_(["open", "escalated"]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
 
 
 def blocking_finding_types(match) -> set[str]:
@@ -1237,6 +1655,12 @@ def blocking_finding_types(match) -> set[str]:
     two against each other)."""
     found: set[str] = set()
     if match.status == "no_po":
+        found.add("po_mismatch")
+    elif match.status == "mismatch" and match.po_cancelled:
+        found.add("po_mismatch")
+    elif match.status == "mismatch" and match.po_not_issued:
+        found.add("po_mismatch")
+    elif match.status == "mismatch" and match.po_total_unverifiable_reason:
         found.add("po_mismatch")
     elif match.status == "mismatch" and match.currency_check == CURRENCY_DIFFERENT:
         found.add("po_mismatch")
@@ -1263,14 +1687,15 @@ async def _reconcile_po_exceptions(
     *,
     found: set[str],
     po_ref: str,
-    inspection_id: str | None,
-    po_id: str | None = None,
+    inspection_ids: list[str],
+    po_ids: list[str] | None = None,
     org_settings: dict | None,
     rule=None,
+    erp_po_sync: dict | None = None,
 ) -> None:
     """Square the invoice's open PO-match rows with what this refresh found.
 
-    Two jobs, over one read of the open/escalated ``po_mismatch`` /
+    Three jobs, over one read of the open/escalated ``po_mismatch`` /
     ``quality_hold`` rows:
 
     * a row of a type this refresh still FINDS, which an agent is mid-way
@@ -1279,7 +1704,19 @@ async def _reconcile_po_exceptions(
       per-type de-dupe, and the coordinator must escalate rather than resolve
       a row that now carries a finding the agent never evaluated;
     * a row of a type it no longer finds is closed
-      (:func:`_close_cleared_po_exceptions`).
+      (:func:`_close_cleared_po_exceptions`) — **unless an ERP PO sync
+      triggered this refresh** (``erp_po_sync``). A sync may raise a hold but
+      never clear one: whoever can edit a PO in the ERP is outside the
+      invoice's implicated set, so letting the sync close a ``po_mismatch``
+      would let an ERP-side total increase release an over-billing hold with no
+      FeohLedger sign-off (decisions §323, amended — a product-owner call
+      pending CISO review). The row stays open and blocking, and is annotated
+      in ``erp_report`` (kind :data:`ERP_REPORT_PO_REMATCH_CLEARS`) so the
+      person reviewing it sees why it now reads as clearable; they clear it
+      through ``exception_lifecycle.record_decision`` and its segregation
+      checks;
+    * an annotation that no longer holds — the finding is back — is removed,
+      whoever triggered the refresh.
     """
     rows = (
         (
@@ -1302,16 +1739,31 @@ async def _reconcile_po_exceptions(
     for row in rows:
         if row.exception_type in found and is_being_decided(row.id):
             mark_refound(row.id)
+        if (
+            row.exception_type in found
+            and (row.erp_report or {}).get("kind") == ERP_REPORT_PO_REMATCH_CLEARS
+        ):
+            # The finding is back: "now matches" is no longer true.
+            row.erp_report = None
 
     cleared_rows = [r for r in rows if r.exception_type not in found]
+    if cleared_rows and erp_po_sync is not None:
+        for row in cleared_rows:
+            row.erp_report = {
+                "kind": ERP_REPORT_PO_REMATCH_CLEARS,
+                "erp_type": erp_po_sync.get("erp_type"),
+                "po_number": po_ref or None,
+                "observed_on": utc_today().isoformat(),
+            }
+        return
     if cleared_rows:
         await _close_cleared_po_exceptions(
             db,
             invoice,
             rows=cleared_rows,
             po_ref=po_ref,
-            inspection_id=inspection_id,
-            po_id=po_id,
+            inspection_ids=inspection_ids,
+            po_ids=po_ids,
             org_settings=org_settings,
             rule=rule,
         )
@@ -1323,8 +1775,8 @@ async def _close_cleared_po_exceptions(
     *,
     rows: list,
     po_ref: str,
-    inspection_id: str | None,
-    po_id: str | None = None,
+    inspection_ids: list[str],
+    po_ids: list[str] | None = None,
     org_settings: dict | None,
     rule=None,
 ) -> None:
@@ -1357,8 +1809,9 @@ async def _close_cleared_po_exceptions(
       release the payment. A row with no recorded PO counts as a different one.
     * **A hand-recorded pass.** An inspection can be typed in
       (``POST /api/inspections``). A ``quality_hold`` cleared by a manual
-      inspection whose recorder is unknown, or is implicated in the invoice
-      (``approval_chain.violates_segregation``), stays open. A QMS-synced
+      inspection whose recorder is unknown, is implicated in the invoice
+      (``approval_chain.violates_segregation``), or approved it (§401), stays
+      open. A QMS-synced
       inspection carries the QMS's verdict; an inspection predating the source
       column is unknown and stays held.
     * **A hand-recorded receipt.** A receipt can be typed in too
@@ -1366,7 +1819,10 @@ async def _close_cleared_po_exceptions(
       "billed beyond receipt" ``po_mismatch``. While any live manual receipt on
       the matched PO was recorded by someone implicated in the invoice — or by
       nobody it can name — a ``po_mismatch`` row stays for a human
-      (``receipts_clear_hold``; decisions §262). Deliberately coarse: it does
+      (``receipts_clear_hold``; decisions §262). So it does while anyone who
+      approved the invoice recorded a live manual receipt it is billed against:
+      approving first and receiving second is still one person doing both
+      (§389). Deliberately coarse: it does
       not try to work out which finding the receipt cleared, because leaving a
       row for a person is the safe error. Receipts with no ``source`` predate
       receipt entry, when no app user could type one in, and are trusted as
@@ -1394,8 +1850,12 @@ async def _close_cleared_po_exceptions(
 
     segregation = exception_segregation_enabled(org_settings)
     relink_allowed = not segregation or await _pre_approval_with_segregation(db, invoice)
-    inspection_ok = not segregation or await _inspection_clears_hold(db, invoice, inspection_id)
-    receipts_ok = not segregation or await receipts_clear_hold(db, invoice, po_id)
+    inspection_ok = not segregation or await _inspection_clears_hold(db, invoice, inspection_ids)
+    receipts_ok = (
+        not segregation
+        or not any(row.exception_type == "po_mismatch" for row in rows)
+        or await receipts_clear_hold(db, invoice, po_ids)
+    )
     still_found: set[str] = set()
     if segregation and _status_str(invoice.status) not in _PRE_APPROVAL_STATUSES:
         strict = strictest_rule_for_any_commodity(org_settings, vendor_id=invoice.vendor_id)
@@ -1451,13 +1911,23 @@ async def _pre_approval_with_segregation(db: AsyncSession, invoice: Invoice) -> 
 
 
 async def _inspection_clears_hold(
-    db: AsyncSession, invoice: Invoice, inspection_id: str | None
+    db: AsyncSession, invoice: Invoice, inspection_ids: list[str]
 ) -> bool:
-    """Whether the inspection the matcher now reads may lift a quality hold —
-    see ``_close_cleared_po_exceptions``. No inspection at all (the rule stopped
-    requiring one) is an admin's configuration act, not evidence anyone typed
-    in, and does not hold the close back."""
-    if not inspection_id:
+    """Whether the inspections the matcher now reads may lift a quality hold —
+    see ``_close_cleared_po_exceptions``. Every one of them must (a multi-PO
+    split reads one per inspected leg, ``MatchResult.inspection_ids``). No
+    inspection at all (the rule stopped requiring one) is an admin's
+    configuration act, not evidence anyone typed in, and does not hold the
+    close back.
+
+    A hand-recorded verdict may not, while its recorder is unknown, is
+    implicated in the invoice (decisions §262's rule, as for receipts), or
+    approved it — the approval of record or any level of its chain
+    (decisions §401, §389's reverse order applied to the fourth leg): one
+    person passing the goods after signing the invoice off is still one person
+    doing both. The approval step's ``require_segregation: false`` lifts the
+    approver half, as it lifts §389."""
+    if not inspection_ids:
         return True
     import uuid as _uuid
 
@@ -1465,49 +1935,75 @@ async def _inspection_clears_hold(
     from app.services.approval_chain import violates_segregation
 
     try:
-        key = _uuid.UUID(str(inspection_id))
+        keys = {_uuid.UUID(str(i)) for i in inspection_ids}
     except ValueError:
         return False
-    row = (
+    rows = (
         await db.execute(
             select(QualityInspection.source, QualityInspection.recorded_by_user_id).where(
-                QualityInspection.id == key
+                QualityInspection.id.in_(keys)
             )
         )
-    ).one_or_none()
-    if row is None:
+    ).all()
+    if len(rows) != len(keys):
         return False
-    source, recorder = row
-    if source == INSPECTION_SOURCE_QMS:
+    manual_recorders = [recorder for source, recorder in rows if source != INSPECTION_SOURCE_QMS]
+    if not manual_recorders:
         return True
-    if recorder is None:
+    if any(
+        recorder is None or violates_segregation(invoice, recorder, {})
+        for recorder in manual_recorders
+    ):
         return False
-    return not violates_segregation(invoice, recorder, {})
+    from app.services.approval_chain import approvers_in_force
+    from app.services.review import resolve_approval_config
+    from app.services.workflow_engine import get_workflow_instance
+
+    instance = await get_workflow_instance(db, invoice.id)
+    approval_config = await resolve_approval_config(db, invoice, instance)
+    approvers = await approvers_in_force(db, invoice, approval_config or {}, instance=instance)
+    return not any(str(recorder) in approvers for recorder in manual_recorders)
 
 
-async def receipts_clear_hold(db: AsyncSession, invoice: Invoice, po_id: str | None) -> bool:
-    """Whether the receipts the matcher counts on ``po_id`` may lift a
-    ``po_mismatch`` — False while any live hand-entered receipt on it has an
-    unknown recorder or one implicated in the invoice (decisions §262). Read by
-    ``_close_cleared_po_exceptions`` and by the exception-agent coordinator, so
-    an agent cannot do what the auto-close refuses. No matched PO means no
-    receipt evidence was read at all."""
-    if not po_id:
+async def receipts_clear_hold(
+    db: AsyncSession, invoice: Invoice, po_ids: str | list[str] | None
+) -> bool:
+    """Whether the receipts the matcher counts on ``po_ids`` — the matched PO,
+    or every leg of a multi-PO split (``MatchResult.matched_po_ids``) — may
+    lift a ``po_mismatch``. False while either holds:
+
+    * any live hand-entered receipt on it has an unknown recorder or one
+      implicated in the invoice (decisions §262);
+    * anyone who approved the invoice — the approval of record or any level of
+      its chain — hand-recorded a live receipt it is billed against
+      (``approval_chain.receiving_conflict_on``, decisions §389). This is §267's
+      receiving rule in the other order: the approval door refuses a receiver,
+      and here the receipt an approver typed in afterwards is not evidence that
+      releases their own invoice. The receipt set is the approval door's own
+      (``receipt_recorders``, every PO the invoice names), and the approval
+      step's ``require_segregation: false`` lifts it as it lifts §267.
+
+    Read by ``_close_cleared_po_exceptions`` and by the exception-agent
+    coordinator, so an agent cannot do what the auto-close refuses. No matched
+    PO means no receipt evidence was read at all."""
+    if isinstance(po_ids, str):
+        po_ids = [po_ids]
+    if not po_ids:
         return True
     from app.models.procurement import GR_SOURCE_MANUAL, GoodsReceipt
     from app.services.approval_chain import violates_segregation
     from app.services.po_matching import CANCELLED_GR_STATUSES
     from app.tenant import apply_entity_scope
 
-    # The same receipt set the matcher sums: live receipts on this PO, in the
-    # invoice's own entity.
+    # The same receipt set the matcher sums: live receipts on these POs, in
+    # the invoice's own entity.
     live = func.lower(func.coalesce(GoodsReceipt.status, "")).notin_(CANCELLED_GR_STATUSES)
     recorders = (
         (
             await db.execute(
                 apply_entity_scope(
                     select(GoodsReceipt.recorded_by_user_id).where(
-                        GoodsReceipt.po_id == uuid.UUID(po_id),
+                        GoodsReceipt.po_id.in_([uuid.UUID(str(p)) for p in po_ids]),
                         GoodsReceipt.source == GR_SOURCE_MANUAL,
                         live,
                     ),
@@ -1519,10 +2015,18 @@ async def receipts_clear_hold(db: AsyncSession, invoice: Invoice, po_id: str | N
         .scalars()
         .all()
     )
-    return all(
+    if not all(
         recorder is not None and not violates_segregation(invoice, recorder, {})
         for recorder in recorders
-    )
+    ):
+        return False
+    from app.services.approval_chain import receiving_conflict_on
+    from app.services.review import resolve_approval_config
+    from app.services.workflow_engine import get_workflow_instance
+
+    instance = await get_workflow_instance(db, invoice.id)
+    approval_config = await resolve_approval_config(db, invoice, instance)
+    return not await receiving_conflict_on(db, invoice, approval_config or {}, instance=instance)
 
 
 async def _refresh_contract_compliance(
@@ -1550,6 +2054,7 @@ async def _refresh_contract_compliance(
         worst,
         exception_findings("contract_noncompliant_findings", findings),
         org_settings=org_settings,
+        fingerprint=contract_fingerprint(invoice, findings),
     )
 
 
@@ -1574,22 +2079,723 @@ async def _has_normalized_duplicate(db: AsyncSession, invoice: Invoice, vendor_m
     testable place. No unbounded scan, and no expression index (hence no
     migration) is required.
     """
-    target = normalize_invoice_number(invoice.invoice_number)
+    match = await find_normalized_number_match(
+        db, invoice.invoice_number, vendor_match, exclude_id=invoice.id
+    )
+    return match is not None
+
+
+class NormalizedNumberMatch(NamedTuple):
+    """An invoice whose number normalizes equal to the one looked up."""
+
+    id: uuid.UUID
+    invoice_number: str
+    entity_id: uuid.UUID | None
+
+
+async def find_normalized_number_match(
+    db: AsyncSession,
+    invoice_number: str | None,
+    vendor_match,
+    *,
+    exclude_id: uuid.UUID | None = None,
+) -> NormalizedNumberMatch | None:
+    """The newest invoice in ``vendor_match`` whose number normalizes equal to
+    ``invoice_number`` — its id, its number as stored and its entity — or None.
+    The entity is returned so a caller showing the match to a user can apply
+    the cross-entity rule (decisions §40: existence only, never the id or the
+    number of another entity's invoice).
+
+    The one implementation of the normalized duplicate lookup: the warning
+    gate above (``_has_normalized_duplicate``) and the CSV importer's
+    near-duplicate refusal (``services/csv_import``) both call it, so the two
+    can never disagree about which numbers are the same payable. Bounded the
+    way that docstring describes (letter skeleton in SQL, newest
+    ``MAX_DUPLICATE_CANDIDATES``, the pure ``normalize_invoice_number`` in
+    Python). ``vendor_match`` is the caller's scope; this never widens it.
+    """
+    target = normalize_invoice_number(invoice_number)
     if target is None:
-        return False
-    skeleton = invoice_number_letter_skeleton(invoice.invoice_number)
+        return None
+    skeleton = invoice_number_letter_skeleton(invoice_number)
+    conditions = [
+        vendor_match,
+        Invoice.invoice_number.is_not(None),
+        func.regexp_replace(func.lower(Invoice.invoice_number), "[^a-z]", "", "g") == skeleton,
+    ]
+    if exclude_id is not None:
+        conditions.append(Invoice.id != exclude_id)
     rows = await db.execute(
-        select(Invoice.invoice_number)
-        .where(
-            vendor_match,
-            Invoice.id != invoice.id,
-            Invoice.invoice_number.is_not(None),
-            func.regexp_replace(func.lower(Invoice.invoice_number), "[^a-z]", "", "g") == skeleton,
-        )
+        select(Invoice.id, Invoice.invoice_number, Invoice.entity_id)
+        .where(*conditions)
         .order_by(Invoice.created_at.desc())
         .limit(MAX_DUPLICATE_CANDIDATES)
     )
-    return any(normalize_invoice_number(number) == target for (number,) in rows.all())
+    for inv_id, number, entity_id in rows.all():
+        if normalize_invoice_number(number) == target:
+            return NormalizedNumberMatch(inv_id, number, entity_id)
+    return None
+
+
+#: The invoice fields the `duplicate` and `fraud_flag` rules read: the header
+#: checks in :func:`refresh_warnings` and the LLM rule's candidate
+#: (`llm_fraud_detection.invoice_to_candidate`), plus the entity the duplicate
+#: scope follows. Over-inclusion only re-raises a finding a person then clears
+#: again; leaving one out would let an edit to it pass unseen.
+_FINDING_INPUT_FIELDS = (
+    "vendor_id",
+    "vendor_name",
+    "invoice_number",
+    "amount",
+    "currency",
+    "subtotal",
+    "tax_amount",
+    "invoice_date",
+    "due_date",
+    "remit_to_address",
+    "description",
+    "payment_method",
+    "po_number",
+    "entity_id",
+)
+
+
+#: Inputs a rule reads from OUTSIDE the invoice row, taken from the finding's
+#: own params. `personal_email_domain` reads the vendor's email: a change from
+#: one free-mail domain to another moves no invoice field. Every other
+#: duplicate / fraud param is either derived from the fields above (a round
+#: amount, rush days from the two dates) or drifts with no edit at all (a new
+#: vendor's age in days, a vendor mean and sigma, an LLM's wording), and a
+#: drifting input would re-raise what nobody changed.
+_EXTERNAL_FINDING_PARAMS: dict[str, tuple[str, ...]] = {
+    "personal_email_domain": ("domain",),
+}
+
+
+def finding_fingerprint(invoice: Invoice, code: str, params: dict | None = None) -> str:
+    """What a person judges when they clear a header-level finding.
+
+    The facts of a ``duplicate`` / ``fraud_flag`` (decisions §286), and of the
+    ``missing_data`` row (decisions §366). A SHA-256 of the finding's code and
+    :data:`_FINDING_INPUT_FIELDS`. Not the
+    finding's display params: three findings have none
+    (``duplicate_invoice_number``, ``remit_to_changed``, ``future_invoice_date``),
+    so matching on them exempted the invoice from the same finding after an
+    edit re-pointed it at another bill; and others drift with no edit at all
+    (a vendor's age in days, a vendor mean, an LLM's wording), so matching on
+    them re-raised what nobody had changed. Hashed, so the stored value carries
+    no address or vendor detail.
+
+    The payload is unchanged since migration 0116, so stamps written before
+    §366 still compare equal.
+    """
+
+    def _plain(value: object) -> object:
+        # `Decimal("1234.5")` from a PATCH and `Decimal("1234.50")` from the
+        # column are one amount.
+        return format(value.normalize(), "f") if isinstance(value, Decimal) else value
+
+    payload = {
+        "code": code,
+        **{f: _plain(getattr(invoice, f, None)) for f in _FINDING_INPUT_FIELDS},
+    }
+    for name in _EXTERNAL_FINDING_PARAMS.get(code, ()):
+        payload[f"param:{name}"] = (params or {}).get(name)
+    return _digest(payload)
+
+
+def _digest(payload: dict) -> str:
+    import hashlib
+    import json
+
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _canonical(value: object) -> object:
+    """One spelling per fact, so a value read back from a column hashes as it
+    did in memory: every number (a ``Decimal`` from ``Numeric``, a float from
+    the ``po_match`` JSONB) as its normalized plain decimal, so ``1234.5``,
+    ``1234.50`` and ``Decimal("1234.5")`` are one amount; ids and dates as text."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, (Decimal, int, float)):
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+        return format(number.normalize(), "f") if number.is_finite() else str(number)
+    if isinstance(value, dict):
+        return {str(k): _canonical(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    return str(value)
+
+
+def _typed_fingerprint(exception_type: str, facts: dict) -> str:
+    """A fingerprint over one exception TYPE's facts (decisions §366).
+
+    Keyed on the type, not on the finding's code: these rows are one per type
+    and invoice, and their code names only the first finding raised (the
+    composite frame, or the first of several PO-match findings that folded into
+    the open row). The person cleared the row, with every finding it held, so a
+    second finding that was already there is not news and must not re-raise.
+    """
+    return _digest({"type": exception_type, **_canonical(facts)})
+
+
+#: Header money a line-total reconciliation reads (``line_total_reconciles``).
+_LINE_TOTAL_HEADER_FIELDS = (
+    "amount",
+    "subtotal",
+    "tax_amount",
+    "shipping_amount",
+    "discount_amount",
+    "currency",
+)
+
+#: Invoice fields the PO match reads beside the match result itself: the PO it
+#: cites, the figure and unit compared, the vendor and GL code that select the
+#: match rule (``resolve_match_rule``) and the entity the PO lookup is scoped to.
+_PO_MATCH_INVOICE_FIELDS = (
+    "po_number",
+    "vendor_id",
+    "amount",
+    "currency",
+    "gl_account",
+    "entity_id",
+)
+
+#: Invoice fields ``contract_compliance.evaluate_contract_compliance`` reads.
+_CONTRACT_INVOICE_FIELDS = (
+    "contract_id",
+    "vendor_id",
+    "amount",
+    "currency",
+    "invoice_date",
+    "gl_account",
+)
+
+
+def line_total_fingerprint(invoice: Invoice, line_total: Decimal | None) -> str:
+    """``line_total_mismatch``: the header money and the summed line totals —
+    the two sides the person accepted as disagreeing. Editing a line, or any
+    header money field, re-raises it."""
+    return _typed_fingerprint(
+        "line_total_mismatch",
+        {
+            **{f: getattr(invoice, f, None) for f in _LINE_TOTAL_HEADER_FIELDS},
+            "line_items_total": line_total,
+        },
+    )
+
+
+#: The ``invoice.po_match`` fields that state what the matcher found: the PO,
+#: the comparison, the receipt leg and the inspection leg. Named rather than
+#: hashing the whole dict, so a field added to ``MatchResult`` or a reworded
+#: issue sentence (``issues[].message``) does not re-raise every cleared hold
+#: on the first refresh after a deploy, with nothing changed.
+_PO_MATCH_FACT_FIELDS = (
+    "match_type",
+    "status",
+    "po_id",
+    "po_number",
+    "po_total",
+    "po_currency",
+    "currency_check",
+    "po_total_unverifiable_reason",
+    "po_cancelled",
+    # Not `po_not_issued` (decisions §394): a match stored before it existed
+    # lacks the key, so naming it would move every fingerprint on the first
+    # refresh after a deploy. The `po_match.issue.po_not_issued` issue code
+    # below already carries the same fact.
+    "gr_id",
+    "amount_variance",
+    "amount_variance_pct",
+    "within_tolerance",
+    "inspection_id",
+    "inspection_result",
+    "inspection_accepted_quantity",
+    "inspection_required",
+    "over_receipt",
+    "ordered_quantity",
+    "received_quantity",
+    "received_value",
+    "billed_beyond_receipt",
+)
+
+
+def _po_match_facts(po_match: dict | None) -> dict | None:
+    if not isinstance(po_match, dict):
+        return None
+    issues = po_match.get("issues") or []
+    return {
+        **{f: po_match.get(f) for f in _PO_MATCH_FACT_FIELDS},
+        "tolerance_pct": (po_match.get("details") or {}).get("tolerance_pct"),
+        # A pre-catalogue match holds bare strings; they are their own code.
+        "issues": [
+            [i.get("code"), i.get("params")] if isinstance(i, dict) else [i, None] for i in issues
+        ],
+    }
+
+
+def po_match_fingerprint(invoice: Invoice, exception_type: str) -> str:
+    """``po_mismatch`` / ``quality_hold``: the invoice's PO-match inputs and what
+    the persisted match result (``invoice.po_match``) found: the PO's total,
+    currency and status, the receipt quantities, the inspection's id and
+    verdict, the tolerance the rule applied, and each issue by code and params.
+    A new receipt, an inspection, a PO edit (an ERP sync included) or a rule
+    change moves it."""
+    return _typed_fingerprint(
+        exception_type,
+        {
+            **{f: getattr(invoice, f, None) for f in _PO_MATCH_INVOICE_FIELDS},
+            "po_match": _po_match_facts(getattr(invoice, "po_match", None)),
+        },
+    )
+
+
+def price_variance_fingerprint(invoice: Invoice, draft_lines: list[dict]) -> str:
+    """``price_variance``: this invoice's priced lines, in line order, with the
+    vendor and currency that pick the history they are compared against. Not
+    the history's medians, which move as other invoices are approved: the
+    person accepted these prices, and nothing they judged has changed."""
+    return _typed_fingerprint(
+        "price_variance",
+        {
+            "vendor_id": getattr(invoice, "vendor_id", None),
+            "currency": getattr(invoice, "currency", None),
+            "lines": [
+                [ln.get("item_code"), ln.get("description"), ln.get("unit_price")]
+                for ln in draft_lines
+            ],
+        },
+    )
+
+
+def contract_fingerprint(invoice: Invoice, findings: list[dict]) -> str:
+    """``contract_noncompliant``: the invoice fields the compliance check reads
+    and WHICH terms it breaches. A newly breached term (the contract terminated
+    after the person accepted an overrun) re-raises; the running spend figure,
+    which grows with every other invoice on the contract, does not."""
+    return _typed_fingerprint(
+        "contract_noncompliant",
+        {
+            **{f: getattr(invoice, f, None) for f in _CONTRACT_INVOICE_FIELDS},
+            "codes": sorted({f.get("code") or "" for f in findings}),
+        },
+    )
+
+
+def vendor_fingerprint(invoice: Invoice) -> str:
+    """``unverified_vendor``: the vendor the invoice is linked to. Re-linking
+    it to another unverified vendor re-raises; an amount edit does not."""
+    return _typed_fingerprint(
+        "unverified_vendor", {"vendor_id": getattr(invoice, "vendor_id", None)}
+    )
+
+
+async def _line_items_total(db: AsyncSession, invoice: Invoice) -> Decimal | None:
+    """The summed line totals, or None when no line carries one. Summed in the
+    DB so a large invoice doesn't materialise every row; SUM skips NULL."""
+    from app.models.invoice import InvoiceLineItem
+
+    total = (
+        await db.execute(
+            select(func.sum(InvoiceLineItem.total)).where(
+                InvoiceLineItem.invoice_id == invoice.id,
+                InvoiceLineItem.total.isnot(None),
+            )
+        )
+    ).scalar_one_or_none()
+    return None if total is None else _dec(total)
+
+
+async def _draft_price_lines(db: AsyncSession, invoice: Invoice) -> list[dict]:
+    """This invoice's lines as the price-variance check reads them, in line
+    order: ``item_code``, ``description``, ``unit_price``."""
+    from app.models.invoice import InvoiceLineItem
+
+    rows = await db.execute(
+        select(
+            InvoiceLineItem.item_code,
+            InvoiceLineItem.description,
+            InvoiceLineItem.unit_price,
+        )
+        .where(InvoiceLineItem.invoice_id == invoice.id)
+        .order_by(
+            InvoiceLineItem.line_number.asc().nulls_last(),
+            InvoiceLineItem.id.asc(),
+        )
+    )
+    return [dict(r._mapping) for r in rows.all()]
+
+
+async def current_finding_fingerprint(
+    db: AsyncSession,
+    invoice: Invoice,
+    exception_type: str,
+    code: str,
+    params: dict | None = None,
+) -> str:
+    """The fingerprint the invoice has NOW for an exception of this type
+    (decisions §366): THE one rule for what "the facts changed" means, read by
+    the raise (``_ensure_exception``), the stale-stamp check
+    (``_void_stale_finding_stamps``) and a person's decision
+    (``exception_lifecycle._bind_fingerprint_to_decision``), so the three can
+    never disagree.
+
+    Each type hashes what its own rule reads. A type not listed falls back to
+    the header fingerprint, which over-includes: an unrelated edit re-raises
+    the finding for a person to clear again, never the reverse.
+    """
+    if exception_type == "line_total_mismatch":
+        return line_total_fingerprint(invoice, await _line_items_total(db, invoice))
+    if exception_type in PO_MATCH_EXCEPTION_TYPES:
+        return po_match_fingerprint(invoice, exception_type)
+    if exception_type == "price_variance":
+        return price_variance_fingerprint(invoice, await _draft_price_lines(db, invoice))
+    if exception_type == "contract_noncompliant":
+        from app.services.contract_compliance import evaluate_contract_compliance
+
+        return contract_fingerprint(invoice, await evaluate_contract_compliance(db, invoice))
+    if exception_type == "unverified_vendor":
+        return vendor_fingerprint(invoice)
+    return finding_fingerprint(invoice, code, params)
+
+
+async def _void_stale_finding_stamps(db: AsyncSession, invoice: Invoice) -> None:
+    """Void the stamp of an open row whose invoice has moved since it was raised.
+
+    The stamp is the invoice as the finding was raised, and
+    ``exception_lifecycle._bind_fingerprint_to_decision`` keeps it only if the
+    invoice still hashes the same when a person clears the row. That alone let
+    an edit be reverted in time: raised at S1 (a real duplicate), edited to a
+    clean-looking S2 while the reviewer reads the queue, reverted to S1 just
+    before they dismiss, and the verdict on S2 would suppress S1 for good. So
+    once any refresh sees the invoice differ from a row's stamp, the stamp is
+    voided and that row's verdict can never bind; the next refresh after it is
+    closed raises a fresh row for a person to judge. Checked whether or not the
+    rule still fires, since a clean-looking S2 is exactly when it does not.
+
+    Every stamped type (decisions §366). A PO-match row compares against the
+    match the PREVIOUS refresh persisted, since this runs before the match is
+    recomputed; a match that moved and moved back is still seen, one refresh
+    later, and a decision in between compares against the moved match.
+    """
+    if invoice.id is None:
+        return
+    rows = (
+        (
+            await db.execute(
+                select(APException).where(
+                    APException.invoice_id == invoice.id,
+                    APException.status.in_(["open", "escalated"]),
+                    APException.finding_fingerprint.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        current = await current_finding_fingerprint(
+            db, invoice, row.exception_type, row.description_code or "", row.description_params
+        )
+        if current != row.finding_fingerprint:
+            row.finding_fingerprint = None
+
+
+async def _finding_cleared_by_a_person(
+    db: AsyncSession,
+    invoice: Invoice,
+    exception_type: str,
+    fingerprint: str,
+    *,
+    org_settings: dict | None,
+    approvers: set[str] | None = None,
+) -> bool:
+    """Has a person already resolved or dismissed THIS finding on this invoice,
+    as it stands now, and could they still? (decisions §286, §366, §367)
+
+    Re-opening a row a reviewer had judged undid their verdict on the next
+    refresh: ``POST /complete`` refreshes on every "Send to ERP", so a
+    legitimate invoice that shares a vendor's number could never be posted, and
+    an accepted line variance or PO hold came back to block the payment run. A
+    closed row suppresses only while the invoice still hashes as it did when
+    the person decided (``current_finding_fingerprint``); a change to any fact
+    the type's rule reads re-raises it. ``exception_lifecycle.record_decision``
+    clears the fingerprint on a decision no person made (a detector, an agent),
+    and a row closed before its type was stamped has none, so neither ever
+    suppresses.
+
+    A matching verdict also has to be one segregation would accept from its
+    decider TODAY (``exception_lifecycle.clearance_stands``, the same
+    ``segregation_refusal`` the decision met). Someone implicated after they
+    decided, an uploader migration 0126 named (§367) or an approval's
+    recaller (§374), or the approver of a ``po_mismatch`` / ``quality_hold``
+    they had cleared (§420), no longer keeps their own clearance live; the
+    finding is raised again for someone independent. A clearance by anyone
+    the invoice does not implicate still suppresses. ``org_settings`` carries the queue's
+    opt-out; omitted, segregation is enforced, so the error is an extra
+    review, never a bypass. ``approvers`` replaces the approver set read from
+    the invoice, for :func:`po_match_hold_refusal`'s question before a stamp.
+    """
+    from app.services.exception_lifecycle import clearance_stands, workflow_instance_for
+
+    rows = (
+        (
+            await db.execute(
+                select(APException).where(
+                    APException.invoice_id == invoice.id,
+                    APException.exception_type == exception_type,
+                    APException.status.in_(["resolved", "dismissed"]),
+                    APException.finding_fingerprint == fingerprint,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return False
+    # The approver axis (decisions §420) reads the chain's level approvers on a
+    # `po_mismatch` / `quality_hold`; one query, only when such a row is closed.
+    instance = await workflow_instance_for(db, rows[0], invoice)
+    return any(
+        clearance_stands(
+            row, invoice, org_settings=org_settings, instance=instance, approvers=approvers
+        )
+        for row in rows
+    )
+
+
+async def reraise_holds_cleared_by_an_approver(
+    db: AsyncSession, invoice: Invoice, *, org_settings: dict | None
+) -> None:
+    """Re-judge the invoice's cleared ``po_mismatch`` / ``quality_hold`` rows
+    now that an approval has been stamped, and raise again any whose clearance
+    no longer stands (decisions §422, amending §420).
+
+    §420 refuses an approver clearing those holds, but a person can clear one
+    first and approve second. Approval checks no blocking exception and the
+    payment run reads only open rows, so the cleared hold stayed cleared and
+    the invoice was paid on its approver's own word. Every site that stamps an
+    approver (``review.approve_invoice`` at each chain level and at the final
+    approval, ``/complete``'s amount floor, extraction's auto-approve) calls
+    this in the same transaction, after the stamp, so the hold is back before
+    anything can stage a payment.
+
+    The question is the one the detector's suppression already asks
+    (:func:`_finding_cleared_by_a_person`): does a person's clearance still
+    suppress this finding as the invoice stands now? So only a closed row whose
+    stamp still equals the invoice's current fingerprint is a candidate (a
+    stale stamp suppresses nothing, and the next refresh judges the new facts),
+    and :func:`_ensure_exception` re-raises it with the row's own finding. That
+    keeps both of its checks: an open row of the type already holds the
+    invoice, and a clearance by someone the invoice does not implicate, an
+    independent colleague, still stands.
+
+    No detector runs here. Re-matching inside an approval would re-run the PO
+    match against an agent resolver's own settled outcome (the multi-PO split
+    writes its match by hand) and mark the row it is deciding ``refound``,
+    undoing a resolve the coordinator legitimately judged against the
+    approvers from before its run (§420). A row an agent or a detector closed
+    carries no fingerprint, so it is never a candidate.
+    """
+    for row, current in await _cleared_holds_still_fingerprinted(db, invoice):
+        await _ensure_exception(
+            db,
+            invoice,
+            row.exception_type,
+            row.severity or "warning",
+            {
+                "code": row.description_code,
+                "params": row.description_params or {},
+                "message": row.description or "",
+            },
+            org_settings=org_settings,
+            fingerprint=current,
+        )
+
+
+async def _cleared_holds_still_fingerprinted(
+    db: AsyncSession, invoice: Invoice
+) -> list[tuple[APException, str]]:
+    """The closed ``po_mismatch`` / ``quality_hold`` rows a person's clearance
+    could still suppress, one per finding, each with the invoice's current
+    fingerprint for it: the candidates :func:`reraise_holds_cleared_by_an_approver`
+    re-judges and :func:`po_match_hold_refusal` asks about before a stamp."""
+    from app.services.exception_lifecycle import APPROVER_SEGREGATED_TYPES
+
+    if invoice.id is None:
+        return []
+    rows = (
+        (
+            await db.execute(
+                select(APException)
+                .where(
+                    APException.invoice_id == invoice.id,
+                    APException.exception_type.in_(APPROVER_SEGREGATED_TYPES),
+                    APException.status.in_(["resolved", "dismissed"]),
+                    APException.finding_fingerprint.is_not(None),
+                )
+                .order_by(APException.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[tuple[APException, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        key = (row.exception_type, row.finding_fingerprint)
+        if key in seen or not row.description_code:
+            continue
+        seen.add(key)
+        current = await current_finding_fingerprint(
+            db, invoice, row.exception_type, row.description_code, row.description_params
+        )
+        if current == row.finding_fingerprint:
+            out.append((row, current))
+    return out
+
+
+#: Why an unattended approval (``/complete``'s amount floor, extraction's
+#: auto-approve) stood aside for a PO-match hold (decisions §425) or the PO
+#: over-billing warning (§469). Recorded on
+#: the audit row's ``auto_approve_suppressed``.
+UNATTENDED_APPROVAL_PO_HOLD_OPEN = "po_match_hold"
+UNATTENDED_APPROVAL_PO_HOLD_WOULD_REOPEN = "po_match_hold_cleared_by_approver"
+#: The invoice carries the cumulative over-billing warning (decisions §469):
+#: no hold, but no unattended door may approve past it.
+UNATTENDED_APPROVAL_PO_OVERBILLED = "po_overbilled"
+#: A live hand-entered receipt on the matched PO was recorded by someone
+#: implicated in the invoice, or by nobody known (decisions §262, §470
+#: amended): the receipt evidence every receipt finding is measured against
+#: may be the typist's own, so no unattended door approves on it.
+UNATTENDED_APPROVAL_PO_RECEIPT_IMPLICATED = "po_receipt_implicated"
+#: The invoice carries an ``error`` contract finding: a not-to-exceed contract's
+#: limit is passed, or cannot be measured because the invoice is in another
+#: currency or none (decisions §472). Like §469's warning it raises
+#: no hold, so no unattended door approves past it.
+UNATTENDED_APPROVAL_CONTRACT_CAP = "contract_cap"
+
+
+def _matched_po_ids(po_match: dict | None) -> list[str]:
+    """The PO ids the last persisted match read receipts on — its split legs,
+    else its single PO (``MatchResult.matched_po_ids`` on the stored JSON)."""
+    if not isinstance(po_match, dict):
+        return []
+    legs = po_match.get("po_ids")
+    if isinstance(legs, list) and legs:
+        return [str(p) for p in legs]
+    return [str(po_match["po_id"])] if po_match.get("po_id") else []
+
+
+def has_po_overbilling_warning(invoice: Invoice) -> bool:
+    """Whether the last refresh left a cumulative over-billing warning
+    (``po_billed_beyond_total`` or ``po_billed_beyond_receipt``, both of type
+    ``po_overbilled``) on ``invoice``.
+
+    Read from ``invoice.warnings``, so asked after the refresh that ran the
+    match, as :func:`po_match_hold_refusal` is."""
+    return any(
+        isinstance(w, dict) and w.get("type") == PO_OVERBILLED_TYPE
+        for w in (invoice.warnings or [])
+    )
+
+
+def has_contract_cap_warning(invoice: Invoice) -> bool:
+    """Whether the last refresh left an ``error`` contract-compliance finding
+    on ``invoice``. Only a ``not_to_exceed`` contract's spend-limit findings
+    carry that severity (``contract_spend_limit_exceeded_not_to_exceed``,
+    ``contract_currency_mismatch`` and its unknown-currency twin), so this is
+    "a hard cap is passed or could not be measured" (decisions §472).
+    Read from ``invoice.warnings``, so asked after the refresh."""
+    return any(
+        isinstance(w, dict)
+        and w.get("type") == "contract_noncompliant"
+        and w.get("severity") == "error"
+        for w in (invoice.warnings or [])
+    )
+
+
+async def po_match_hold_refusal(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    approver_id: uuid.UUID | None,
+    org_settings: dict | None,
+) -> str | None:
+    """Why an unattended approval of ``invoice`` must not be given, on the
+    PO-match axis, or ``None`` (decisions §425).
+
+    Asked after the refresh that ran the match and BEFORE the approval is
+    stamped, so no unattended door ever leaves an invoice ``approved`` with a
+    ``po_mismatch`` / ``quality_hold`` open:
+
+    * an open or escalated row of either type: the match failed, the PO cannot
+      be found, or the goods have not passed. The invoice goes to review.
+    * a person's clearance of one that would stop standing once
+      ``approver_id`` is the approver of record: the §422 re-judge would raise
+      it again straight after the stamp, so the floor or the auto-approve would
+      approve an invoice the next statement re-holds. Asked with the would-be
+      approver added to the approver set, the question
+      :func:`_finding_cleared_by_a_person` asks after the stamp.
+    * a cumulative over-billing warning (decisions §469, §470): this
+      invoice and the others billing its PO pass the PO's total, or what has
+      been received of it. It raises no hold, so only a person reading it may
+      approve.
+    * an ``error`` contract finding (:func:`has_contract_cap_warning`,
+      decisions §472): a not-to-exceed contract's limit is passed,
+      or the invoice's currency is not the contract's (or is missing) so the
+      limit was not measured. Not a PO-match finding, but every unattended
+      door already asks this function, so it answers here rather than adding a
+      second question at each.
+    * a live hand-entered receipt on the matched PO whose recorder is
+      implicated in the invoice or unknown (``receipts_clear_hold``, decisions
+      §262, §470 amended). The receipt findings, per-invoice and cumulative,
+      are measured against what was received, so a receipt the uploader typed
+      in can make either vanish; the auto-close refuses to release a hold on
+      that evidence, and an unattended approval is a release too. The org's
+      ``settings.exceptions.require_segregation: false`` lifts it, as it
+      lifts the auto-close's.
+    """
+    from app.services.exception_lifecycle import exception_segregation_enabled
+    from app.services.payment_runs import blocking_exception_types
+
+    if invoice.id is None:
+        return None
+    if await blocking_exception_types(db, [invoice.id], types=PO_MATCH_EXCEPTION_TYPES):
+        return UNATTENDED_APPROVAL_PO_HOLD_OPEN
+    if has_po_overbilling_warning(invoice):
+        return UNATTENDED_APPROVAL_PO_OVERBILLED
+    if has_contract_cap_warning(invoice):
+        return UNATTENDED_APPROVAL_CONTRACT_CAP
+    if exception_segregation_enabled(org_settings) and not await receipts_clear_hold(
+        db, invoice, _matched_po_ids(invoice.po_match)
+    ):
+        return UNATTENDED_APPROVAL_PO_RECEIPT_IMPLICATED
+    if approver_id is None:
+        # The stamp names nobody, so no clearance changes standing.
+        return None
+    candidates = await _cleared_holds_still_fingerprinted(db, invoice)
+    if not candidates:
+        return None
+    from app.services.approval_chain import approver_ids
+    from app.services.exception_lifecycle import workflow_instance_for
+
+    instance = await workflow_instance_for(db, candidates[0][0], invoice)
+    approvers = set(approver_ids(invoice, instance)) | {str(approver_id)}
+    for row, current in candidates:
+        if not await _finding_cleared_by_a_person(
+            db,
+            invoice,
+            row.exception_type,
+            current,
+            org_settings=org_settings,
+            approvers=approvers,
+        ):
+            return UNATTENDED_APPROVAL_PO_HOLD_WOULD_REOPEN
+    return None
 
 
 async def _ensure_exception(
@@ -1600,8 +2806,10 @@ async def _ensure_exception(
     finding: dict,
     *,
     org_settings: dict | None = None,
+    fingerprint: str | None = None,
 ) -> None:
-    """Create an exception if one doesn't already exist for this invoice + type.
+    """Create an exception if one doesn't already exist for this invoice + type,
+    and no person has already cleared it while the facts stand as they do now.
 
     ``finding`` is a catalogue dict — the warning raised beside it
     (`invoice_warning_catalog.warning`), an exception-only sentence
@@ -1616,15 +2824,38 @@ async def _ensure_exception(
         # A programming error at a literal call site, not a data condition —
         # raising beats persisting an unkeyed description nobody can localize.
         raise TypeError("_ensure_exception needs a catalogue finding, not composed prose")
-    existing = await db.execute(
-        select(func.count()).where(
-            APException.invoice_id == invoice.id,
-            APException.exception_type == exception_type,
-            APException.status.in_(["open", "escalated"]),
+
+    # Every type is stamped (decisions §366), so a person's resolve or dismiss
+    # holds until the facts its rule reads change. A caller that already holds
+    # those facts (the summed line totals, the priced lines, the compliance
+    # findings) passes the fingerprint rather than paying a second read.
+    if fingerprint is None:
+        fingerprint = await current_finding_fingerprint(
+            db, invoice, exception_type, finding["code"], finding.get("params")
         )
+    open_rows = (
+        (
+            await db.execute(
+                select(APException).where(
+                    APException.invoice_id == invoice.id,
+                    APException.exception_type == exception_type,
+                    APException.status.in_(["open", "escalated"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
     )
-    if (existing.scalar() or 0) > 0:
+    if open_rows:
+        # Never restamped. The stamp is the invoice as the finding was
+        # raised; `record_decision` keeps it only if the invoice still
+        # hashes the same when a person clears the row, so an edit made
+        # while someone was deciding cannot ride their verdict.
         return  # already exists
+    if await _finding_cleared_by_a_person(
+        db, invoice, exception_type, fingerprint, org_settings=org_settings
+    ):
+        return
 
     # Auto-routing: org settings can map exception_type → user UUID
     # (and a default-SLA-hours per type). Both are optional — when
@@ -1654,7 +2885,7 @@ async def _ensure_exception(
 
     from app.services.exception_service import create_exception
 
-    await create_exception(
+    raised = await create_exception(
         db,
         exception_type=exception_type,
         severity=severity,
@@ -1677,6 +2908,7 @@ async def _ensure_exception(
         # `uploaded_by_id` / `segregation_actor_ids` is the axis that binds here.
         raised_by_user_id=None,
     )
+    raised.finding_fingerprint = fingerprint
 
 
 async def _llm_anomaly_check(
@@ -1702,24 +2934,20 @@ async def _llm_anomaly_check(
     )
 
     # Platform key, or a BYOK org's own key only when it IS an Anthropic key.
-    api_key, model = resolve_anomaly_llm_config(org_settings)
+    api_key, model = await resolve_anomaly_llm_config(
+        org_settings, organization_id=invoice.organization_id
+    )
     if not api_key:
         return
 
-    # Pull approved history (same set the stat-anomaly rule uses).
+    # Pull approved history (same set the stat-anomaly rule uses:
+    # `APPROVED_OR_BEYOND_STATUSES`, the one "human-accepted" population).
     hist_q = await db.execute(
         select(Invoice)
         .where(
             Invoice.vendor_id == vendor.id,
             Invoice.id != invoice.id,
-            Invoice.status.in_(
-                [
-                    InvoiceStatus.approved.value,
-                    InvoiceStatus.posted_in_erp.value,
-                    InvoiceStatus.payment_scheduled.value,
-                    InvoiceStatus.paid.value,
-                ]
-            ),
+            Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
         )
         .order_by(Invoice.created_at.desc())
         .limit(HISTORY_SIZE)

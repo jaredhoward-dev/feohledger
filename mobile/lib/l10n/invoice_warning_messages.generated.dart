@@ -92,6 +92,18 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
     'poTotal': 'money',
     'currency': 'currency',
   },
+  'po_billed_beyond_total': {
+    'billedAmount': 'money',
+    'poNumber': 'text',
+    'poTotal': 'money',
+    'currency': 'currency',
+  },
+  'po_billed_beyond_receipt': {
+    'totalBilled': 'money',
+    'poNumber': 'text',
+    'receivedValue': 'money',
+    'currency': 'currency',
+  },
   'po_amount_variance_po_currency_unknown': {
     'variancePct': 'percent',
     'poNumber': 'text',
@@ -104,6 +116,13 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
     'poNumber': 'text',
     'poCurrency': 'text',
   },
+  'po_currency_mismatch_invoice_currency_unknown': {
+    'poNumber': 'text',
+    'poCurrencies': 'text',
+  },
+  'po_cancelled': {'poNumber': 'text'},
+  'po_not_issued': {'poNumber': 'text'},
+  'po_total_unverifiable': {'poNumber': 'text'},
   'po_partial_receipt': {'matchType': 'text', 'poNumber': 'text'},
   'po_over_receipt': {
     'receivedQuantity': 'number',
@@ -159,6 +178,15 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
     'spendLimit': 'money',
     'currency': 'currency',
   },
+  'contract_currency_mismatch': {
+    'invoiceCurrency': 'text',
+    'contractNumber': 'text',
+    'contractCurrency': 'text',
+  },
+  'contract_currency_mismatch_invoice_currency_unknown': {
+    'contractNumber': 'text',
+    'contractCurrency': 'text',
+  },
   'contract_gl_not_allowed': {'glAccount': 'text', 'contractNumber': 'text'},
   'self_correction_total_reconciliation': {
     'subtotal': 'number',
@@ -173,6 +201,11 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
     'lineItemsTotal': 'number',
     'amount': 'number',
   },
+  'self_correction_currency_conflict': {
+    'printedCurrency': 'text',
+    'fieldCurrency': 'text',
+  },
+  'self_correction_currency_mixed': {'printedCurrencies': 'text'},
   'self_correction_line_item_math': {
     'lineNumber': 'count',
     'quantity': 'number',
@@ -187,6 +220,12 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
     'invoiceCurrency': 'text',
     'poCurrency': 'text',
   },
+  'po_match.issue.currency_mismatch_invoice_currency_unknown': {
+    'poCurrencies': 'text',
+  },
+  'po_match.issue.po_cancelled': {},
+  'po_match.issue.po_not_issued': {},
+  'po_match.issue.po_total_unverifiable': {},
   'po_match.issue.amount_mismatch': {
     'invoiceAmount': 'money',
     'poTotal': 'money',
@@ -218,6 +257,123 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.missing_data_after_extraction': {},
   'exception.price_variance_findings': {'count': 'count'},
   'exception.contract_noncompliant_findings': {'count': 'count'},
+  'exception.erp_paid_unrecorded_blocking_exception': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_blocking_exception_unnamed': {},
+  'exception.erp_paid_unrecorded_in_run': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_in_run_unnamed': {},
+  'exception.erp_paid_unrecorded_payment_live': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_payment_live_unnamed': {},
+  'exception.erp_paid_unrecorded_card_live': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_card_live_unnamed': {},
+  'exception.erp_paid_unrecorded_credit_conflict': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_credit_conflict_unnamed': {},
+  'exception.erp_paid_unrecorded_nothing_to_pay': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_nothing_to_pay_unnamed': {},
+  'exception.erp_paid_unrecorded_not_payable': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_not_payable_unnamed': {},
+  'exception.erp_paid_unrecorded_amount_mismatch': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_amount_mismatch_unnamed': {},
+  'exception.erp_paid_unrecorded_other': {'erp': 'text'},
+  'exception.erp_paid_unrecorded_other_unnamed': {},
+  'exception.erp_paid_withdrawn': {'erp': 'text'},
+  'exception.erp_paid_withdrawn_unnamed': {},
+  'exception.erp_paid_retry_failed': {'erp': 'text'},
+  'exception.erp_paid_retry_failed_unnamed': {},
+  'exception.erp_settled_short': {'erp': 'text'},
+  'exception.erp_settled_short_unnamed': {},
+  'exception.erp_voided_after_post': {'erp': 'text'},
+  'exception.erp_voided_after_post_unnamed': {},
+  'exception.erp_payment_writeback_failed': {'erp': 'text'},
+  'exception.erp_payment_writeback_failed_unnamed': {},
+  'exception.erp_payment_writeback_balance_open': {
+    'erp': 'text',
+    'amount': 'money',
+    'currency': 'currency',
+  },
+  'exception.erp_payment_writeback_balance_open_unnamed': {
+    'amount': 'money',
+    'currency': 'currency',
+  },
+  'exception.erp_payment_void_writeback_failed': {'erp': 'text'},
+  'exception.erp_payment_void_writeback_failed_unnamed': {},
+  'exception.erp_credit_settlement': {},
+  'exception.erp_paid_while_scheduled': {},
+  'exception.erp_paid_twice': {},
+  'exception.erp_partly_paid_outside': {},
+  'exception.erp_recorded_payment_withdrawn': {},
+  'exception.erp_bill_deleted_blocking': {},
+  'exception.erp_bill_deleted': {},
+  'exception.erp_bill_unlinked_no_document': {},
+  'exception.erp_bill_unlinked_no_company': {},
+  'exception.erp_bill_unlinked_other_company': {},
+  'exception.erp_dispatch_stopped_paid': {},
+  'exception.erp_dispatch_stopped_partially_paid': {},
+  'exception.erp_dispatch_stopped_deleted': {},
+  'exception.erp_dispatch_stopped_unconfirmed': {},
+  'exception.erp_reported_payment_voided': {},
+  'exception.erp_sync_back_failed': {},
+  'exception.extraction_failed': {'errorClass': 'text'},
+  'exception.positive_pay_altered_amount': {'checkNumber': 'text'},
+  'exception.positive_pay_not_on_file': {'checkNumber': 'text'},
+  'exception.vendor_bank_changed': {},
+  'exception.payee_changed_since_paid': {},
+  'exception.payee_unrecorded_after_merge': {},
+  'exception.compliance_hold_findings': {'count': 'count'},
+  'exception.compliance_no_screenable_vendor': {},
+  'exception.compliance_provider_unavailable': {'provider': 'text'},
+  'exception.compliance_review_required': {
+    'matchedList': 'text',
+    'provider': 'text',
+  },
+  'exception.compliance_review_required_unlisted': {'provider': 'text'},
+  'exception.compliance_unrecognised_result': {
+    'result': 'text',
+    'provider': 'text',
+  },
+  'exception.compliance_adverse_media': {'provider': 'text'},
+  'exception.compliance_adverse_media_unnamed_provider': {},
+  'exception.compliance_aml_spend': {
+    'projected': 'money',
+    'threshold': 'money',
+    'currency': 'currency',
+  },
+  'exception.compliance_aml_spend_partial': {
+    'projected': 'money',
+    'threshold': 'money',
+    'currency': 'currency',
+    'excluded': 'count',
+  },
+  'exception.payment_aged_out': {
+    'paymentId': 'text',
+    'hours': 'number',
+    'invoiceStatus': 'text',
+  },
+  'exception.payment_dispatch_in_doubt': {
+    'paymentId': 'text',
+    'failureCode': 'text',
+  },
+  'exception.payment_dispatch_interrupted_failed': {'paymentId': 'text'},
+  'exception.payment_dispatch_interrupted_cancelled': {'paymentId': 'text'},
+  'exception.settlement_currency_mismatch': {
+    'settledAmount': 'number',
+    'settledCurrency': 'text',
+    'authorizedAmount': 'number',
+    'authorizedCurrency': 'text',
+  },
+  'exception.settlement_amount_over': {
+    'settledAmount': 'number',
+    'settledCurrency': 'text',
+    'authorizedAmount': 'number',
+    'authorizedCurrency': 'text',
+    'variance': 'number',
+  },
+  'exception.settlement_amount_under': {
+    'settledAmount': 'number',
+    'settledCurrency': 'text',
+    'authorizedAmount': 'number',
+    'authorizedCurrency': 'text',
+    'variance': 'number',
+  },
 };
 
 /// The localized sentence for [warningCode], or `null` when this build does
@@ -315,12 +471,12 @@ String? _localizeWarningCode(
     // Invoice is past due
     case 'past_due':
       return l.invoiceWarningPastDue;
-    // AI reading is paused: this month's {included, plural, one {# AI-read invoice is} other {# AI-read invoices are}} used. Enter the details manually, or upgrade your plan on the Billing page.
+    // AI reading is paused: this month's {included, plural, one {# AI-read invoice is} other {# AI-read invoices are}} used. Enter the details manually, or upgrade your plan under Settings → Subscription.
     case 'ai_allowance_reached':
       final included = _count(p['included']);
       if (included == null) return null;
       return l.invoiceWarningAiAllowanceReached(included);
-    // AI reading is paused: this month's AI spending cap is reached. Enter the details manually, or raise the cap on the Billing page.
+    // AI reading is paused: this month's AI spending cap is reached. Enter the details manually, or raise the cap under Settings → Subscription.
     case 'ai_spend_cap_reached':
       return l.invoiceWarningAiSpendCapReached;
     // Vendor is unverified
@@ -415,6 +571,32 @@ String? _localizeWarningCode(
         invoiceAmount,
         poTotal,
       );
+    // Other invoices already bill {billedAmount} {currency} against PO {poNumber}, whose total is {poTotal} {currency} — this invoice takes it past that total
+    case 'po_billed_beyond_total':
+      final billedAmount = _money(p['billedAmount'], currency);
+      if (billedAmount == null) return null;
+      final poNumber = _text(p['poNumber'], currency);
+      if (poNumber == null) return null;
+      final poTotal = _money(p['poTotal'], currency);
+      if (poTotal == null) return null;
+      return l.invoiceWarningPoBilledBeyondTotal(
+        billedAmount,
+        poNumber,
+        poTotal,
+      );
+    // Invoices on PO {poNumber} bill {totalBilled} {currency}, this one included; goods worth {receivedValue} {currency} have been received
+    case 'po_billed_beyond_receipt':
+      final totalBilled = _money(p['totalBilled'], currency);
+      if (totalBilled == null) return null;
+      final poNumber = _text(p['poNumber'], currency);
+      if (poNumber == null) return null;
+      final receivedValue = _money(p['receivedValue'], currency);
+      if (receivedValue == null) return null;
+      return l.invoiceWarningPoBilledBeyondReceipt(
+        totalBilled,
+        poNumber,
+        receivedValue,
+      );
     // Amount variance {variancePct}% vs PO {poNumber}, which records no currency (invoice {invoiceAmount} {currency} vs PO {poTotal})
     case 'po_amount_variance_po_currency_unknown':
       final variancePct = _percent(p['variancePct'], currency);
@@ -444,6 +626,31 @@ String? _localizeWarningCode(
         poNumber,
         poCurrency,
       );
+    // The invoice records no valid currency and the POs behind {poNumber} are in different currencies ({poCurrencies}) — the amounts were not compared
+    case 'po_currency_mismatch_invoice_currency_unknown':
+      final poNumber = _text(p['poNumber'], currency);
+      if (poNumber == null) return null;
+      final poCurrencies = _text(p['poCurrencies'], currency);
+      if (poCurrencies == null) return null;
+      return l.invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown(
+        poNumber,
+        poCurrencies,
+      );
+    // PO {poNumber} is cancelled — the invoice was not matched against it
+    case 'po_cancelled':
+      final poNumber = _text(p['poNumber'], currency);
+      if (poNumber == null) return null;
+      return l.invoiceWarningPoCancelled(poNumber);
+    // PO {poNumber} is not approved in the ERP yet — the invoice was not matched against it
+    case 'po_not_issued':
+      final poNumber = _text(p['poNumber'], currency);
+      if (poNumber == null) return null;
+      return l.invoiceWarningPoNotIssued(poNumber);
+    // The total of PO {poNumber} could not be confirmed from the ERP on its last sync — the amounts were not compared
+    case 'po_total_unverifiable':
+      final poNumber = _text(p['poNumber'], currency);
+      if (poNumber == null) return null;
+      return l.invoiceWarningPoTotalUnverifiable(poNumber);
     // Partial 3-way match — {matchType} match against PO {poNumber}, but only part of the ordered quantity has been received
     case 'po_partial_receipt':
       final matchType = _text(p['matchType'], currency);
@@ -603,6 +810,29 @@ String? _localizeWarningCode(
         contractNumber,
         spendLimit,
       );
+    // Invoice is in {invoiceCurrency} but contract {contractNumber} is in {contractCurrency} — its spend limit was not checked
+    case 'contract_currency_mismatch':
+      final invoiceCurrency = _text(p['invoiceCurrency'], currency);
+      if (invoiceCurrency == null) return null;
+      final contractNumber = _text(p['contractNumber'], currency);
+      if (contractNumber == null) return null;
+      final contractCurrency = _text(p['contractCurrency'], currency);
+      if (contractCurrency == null) return null;
+      return l.invoiceWarningContractCurrencyMismatch(
+        invoiceCurrency,
+        contractNumber,
+        contractCurrency,
+      );
+    // The invoice records no valid currency, so the spend limit in {contractCurrency} of contract {contractNumber} was not checked
+    case 'contract_currency_mismatch_invoice_currency_unknown':
+      final contractNumber = _text(p['contractNumber'], currency);
+      if (contractNumber == null) return null;
+      final contractCurrency = _text(p['contractCurrency'], currency);
+      if (contractCurrency == null) return null;
+      return l.invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown(
+        contractNumber,
+        contractCurrency,
+      );
     // GL account {glAccount} is outside contract {contractNumber} allowed accounts
     case 'contract_gl_not_allowed':
       final glAccount = _text(p['glAccount'], currency);
@@ -646,6 +876,21 @@ String? _localizeWarningCode(
       final amount = _number(p['amount'], currency);
       if (amount == null) return null;
       return l.invoiceWarningSelfCorrectionLineItemsSum(lineItemsTotal, amount);
+    // Amounts are printed in {printedCurrency}, but the invoice currency reads {fieldCurrency}. The amounts were left blank — enter them from the document.
+    case 'self_correction_currency_conflict':
+      final printedCurrency = _text(p['printedCurrency'], currency);
+      if (printedCurrency == null) return null;
+      final fieldCurrency = _text(p['fieldCurrency'], currency);
+      if (fieldCurrency == null) return null;
+      return l.invoiceWarningSelfCorrectionCurrencyConflict(
+        printedCurrency,
+        fieldCurrency,
+      );
+    // Amounts are printed in more than one currency ({printedCurrencies}). The amounts were left blank — enter them from the document.
+    case 'self_correction_currency_mixed':
+      final printedCurrencies = _text(p['printedCurrencies'], currency);
+      if (printedCurrencies == null) return null;
+      return l.invoiceWarningSelfCorrectionCurrencyMixed(printedCurrencies);
     // Line {lineNumber}: {quantity} × {unitPrice} = {expected}, but total is {total}.
     case 'self_correction_line_item_math':
       final lineNumber = _text(p['lineNumber'], currency);
@@ -665,7 +910,7 @@ String? _localizeWarningCode(
         expected,
         total,
       );
-    // AI suggested GL code(s) not in active chart: {codes}
+    // GL code(s) not in the active chart of accounts, left uncoded: {codes}
     case 'gl_codes_not_in_chart':
       final codes = _text(p['codes'], currency);
       if (codes == null) return null;
@@ -687,6 +932,22 @@ String? _localizeWarningCode(
       final poCurrency = _text(p['poCurrency'], currency);
       if (poCurrency == null) return null;
       return l.invoicePoMatchIssueCurrencyMismatch(invoiceCurrency, poCurrency);
+    // Currency mismatch: invoice records no valid currency, POs in {poCurrencies} — amounts not compared
+    case 'po_match.issue.currency_mismatch_invoice_currency_unknown':
+      final poCurrencies = _text(p['poCurrencies'], currency);
+      if (poCurrencies == null) return null;
+      return l.invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown(
+        poCurrencies,
+      );
+    // PO is cancelled — amounts not compared
+    case 'po_match.issue.po_cancelled':
+      return l.invoicePoMatchIssuePoCancelled;
+    // PO not approved in the ERP yet — amounts not compared
+    case 'po_match.issue.po_not_issued':
+      return l.invoicePoMatchIssuePoNotIssued;
+    // PO total not confirmed by the ERP on its last sync — amounts not compared
+    case 'po_match.issue.po_total_unverifiable':
+      return l.invoicePoMatchIssuePoTotalUnverifiable;
     // Amount mismatch: invoice {invoiceAmount} {currency} vs PO {poTotal} {currency} ({variancePct}%)
     case 'po_match.issue.amount_mismatch':
       final invoiceAmount = _money(p['invoiceAmount'], currency);
@@ -776,6 +1037,367 @@ String? _localizeWarningCode(
       final count = _count(p['count']);
       if (count == null) return null;
       return l.exceptionDescriptionContractNoncompliantFindings(count);
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.
+    case 'exception.erp_paid_unrecorded_blocking_exception':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedBlockingException(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.
+    case 'exception.erp_paid_unrecorded_blocking_exception_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedBlockingExceptionUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_in_run':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedInRun(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_in_run_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedInRunUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP's payment is the real one, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_payment_live':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedPaymentLive(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP's payment is the real one, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_payment_live_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedPaymentLiveUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_card_live':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedCardLive(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_card_live_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedCardLiveUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because an applied credit memo no longer matches this invoice's supplier or currency, so the amount owed can't be stated. Correct the credit memo, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_credit_conflict':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedCreditConflict(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because an applied credit memo no longer matches this invoice's supplier or currency, so the amount owed can't be stated. Correct the credit memo, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_unrecorded_credit_conflict_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedCreditConflictUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.
+    case 'exception.erp_paid_unrecorded_nothing_to_pay':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedNothingToPay(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.
+    case 'exception.erp_paid_unrecorded_nothing_to_pay_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedNothingToPayUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP's payment from this exception or resolve it.
+    case 'exception.erp_paid_unrecorded_not_payable':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedNotPayable(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP's payment from this exception or resolve it.
+    case 'exception.erp_paid_unrecorded_not_payable_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedNotPayableUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP's payment from this exception or resolve it.
+    case 'exception.erp_paid_unrecorded_amount_mismatch':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedAmountMismatch(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP's payment from this exception or resolve it.
+    case 'exception.erp_paid_unrecorded_amount_mismatch_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedAmountMismatchUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP's payment from this exception or resolve it.
+    case 'exception.erp_paid_unrecorded_other':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidUnrecordedOther(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP's payment from this exception or resolve it.
+    case 'exception.erp_paid_unrecorded_other_unnamed':
+      return l.exceptionDescriptionErpPaidUnrecordedOtherUnnamed;
+    // {erp} reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.
+    case 'exception.erp_paid_withdrawn':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidWithdrawn(erp);
+    // Your ERP reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.
+    case 'exception.erp_paid_withdrawn_unnamed':
+      return l.exceptionDescriptionErpPaidWithdrawnUnnamed;
+    // {erp} reports this bill paid, but FeohLedger couldn't record that payment automatically. Check the details, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_retry_failed':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaidRetryFailed(erp);
+    // Your ERP reports this bill paid, but FeohLedger couldn't record that payment automatically. Check the details, then record the ERP's payment from this exception.
+    case 'exception.erp_paid_retry_failed_unnamed':
+      return l.exceptionDescriptionErpPaidRetryFailedUnnamed;
+    // {erp} reports this bill paid, but FeohLedger's own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.
+    case 'exception.erp_settled_short':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpSettledShort(erp);
+    // Your ERP reports this bill paid, but FeohLedger's own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.
+    case 'exception.erp_settled_short_unnamed':
+      return l.exceptionDescriptionErpSettledShortUnnamed;
+    // {erp} reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.
+    case 'exception.erp_voided_after_post':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpVoidedAfterPost(erp);
+    // Your ERP reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.
+    case 'exception.erp_voided_after_post_unnamed':
+      return l.exceptionDescriptionErpVoidedAfterPostUnnamed;
+    // {erp} did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.
+    case 'exception.erp_payment_writeback_failed':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackFailed(erp);
+    // Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.
+    case 'exception.erp_payment_writeback_failed_unnamed':
+      return l.exceptionDescriptionErpPaymentWritebackFailedUnnamed;
+    // {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
+    case 'exception.erp_payment_writeback_balance_open':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      final amount = _money(p['amount'], currency);
+      if (amount == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackBalanceOpen(erp, amount);
+    // Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
+    case 'exception.erp_payment_writeback_balance_open_unnamed':
+      final amount = _money(p['amount'], currency);
+      if (amount == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed(
+        amount,
+      );
+    // {erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
+    case 'exception.erp_payment_void_writeback_failed':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpPaymentVoidWritebackFailed(erp);
+    // Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
+    case 'exception.erp_payment_void_writeback_failed_unnamed':
+      return l.exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed;
+    // The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
+    case 'exception.erp_credit_settlement':
+      return l.exceptionDescriptionErpCreditSettlement;
+    // The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
+    case 'exception.erp_paid_while_scheduled':
+      return l.exceptionDescriptionErpPaidWhileScheduled;
+    // FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.
+    case 'exception.erp_paid_twice':
+      return l.exceptionDescriptionErpPaidTwice;
+    // The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger payment for the full amount would overpay it. Reconcile what is still owed before paying.
+    case 'exception.erp_partly_paid_outside':
+      return l.exceptionDescriptionErpPartlyPaidOutside;
+    // The ERP reported this bill paid, and FeohLedger recorded that payment, but the ERP no longer shows it paid (the payment was deleted or voided there). Confirm whether it is still owed.
+    case 'exception.erp_recorded_payment_withdrawn':
+      return l.exceptionDescriptionErpRecordedPaymentWithdrawn;
+    // The bill this invoice was posted as has been deleted or voided in the ERP; FeohLedger will not pay it until someone confirms it is still owed.
+    case 'exception.erp_bill_deleted_blocking':
+      return l.exceptionDescriptionErpBillDeletedBlocking;
+    // The bill this invoice was posted as has been deleted or voided in the ERP. Confirm the books still agree.
+    case 'exception.erp_bill_deleted':
+      return l.exceptionDescriptionErpBillDeleted;
+    // FeohLedger cannot check this invoice's bill in the ERP, because the ERP did not say which bill it created when the invoice was posted, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.
+    case 'exception.erp_bill_unlinked_no_document':
+      return l.exceptionDescriptionErpBillUnlinkedNoDocument;
+    // FeohLedger cannot check this invoice's bill in the ERP, because the posting did not record which ERP company it went to, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.
+    case 'exception.erp_bill_unlinked_no_company':
+      return l.exceptionDescriptionErpBillUnlinkedNoCompany;
+    // FeohLedger cannot check this invoice's bill in the ERP, because it was posted to a different ERP company than the one now connected, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.
+    case 'exception.erp_bill_unlinked_other_company':
+      return l.exceptionDescriptionErpBillUnlinkedOtherCompany;
+    // FeohLedger was about to pay this invoice, but the ERP shows its bill already paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.
+    case 'exception.erp_dispatch_stopped_paid':
+      return l.exceptionDescriptionErpDispatchStoppedPaid;
+    // FeohLedger was about to pay this invoice, but the ERP shows its bill partly paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.
+    case 'exception.erp_dispatch_stopped_partially_paid':
+      return l.exceptionDescriptionErpDispatchStoppedPartiallyPaid;
+    // FeohLedger was about to pay this invoice, but the ERP shows its bill deleted or voided. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.
+    case 'exception.erp_dispatch_stopped_deleted':
+      return l.exceptionDescriptionErpDispatchStoppedDeleted;
+    // FeohLedger was about to pay this invoice, but the ERP could not confirm its bill is still open and unpaid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.
+    case 'exception.erp_dispatch_stopped_unconfirmed':
+      return l.exceptionDescriptionErpDispatchStoppedUnconfirmed;
+    // A payment the ERP reported was voided in FeohLedger, but the ERP may still show the bill paid. FeohLedger will not pay it again until someone confirms the ERP's payment is undone.
+    case 'exception.erp_reported_payment_voided':
+      return l.exceptionDescriptionErpReportedPaymentVoided;
+    // This invoice's payment settled, but FeohLedger could not finish recording it, so the invoice has not moved to Paid although the money has gone. Nothing retries this automatically: use Retry ERP sync on the payment's run in Payments.
+    case 'exception.erp_sync_back_failed':
+      return l.exceptionDescriptionErpSyncBackFailed;
+    // Extraction failed: {errorClass}
+    case 'exception.extraction_failed':
+      final errorClass = _text(p['errorClass'], currency);
+      if (errorClass == null) return null;
+      return l.exceptionDescriptionExtractionFailed(errorClass);
+    // Positive Pay return: check {checkNumber} altered amount
+    case 'exception.positive_pay_altered_amount':
+      final checkNumber = _text(p['checkNumber'], currency);
+      if (checkNumber == null) return null;
+      return l.exceptionDescriptionPositivePayAlteredAmount(checkNumber);
+    // Positive Pay return: check {checkNumber} not on issued file
+    case 'exception.positive_pay_not_on_file':
+      final checkNumber = _text(p['checkNumber'], currency);
+      if (checkNumber == null) return null;
+      return l.exceptionDescriptionPositivePayNotOnFile(checkNumber);
+    // Vendor bank details changed; verify before payment.
+    case 'exception.vendor_bank_changed':
+      return l.exceptionDescriptionVendorBankChanged;
+    // Payee changed since this invoice was last paid; verify before paying again.
+    case 'exception.payee_changed_since_paid':
+      return l.exceptionDescriptionPayeeChangedSincePaid;
+    // Vendor merged since this invoice was last paid, and that payment recorded no payee; verify before paying again.
+    case 'exception.payee_unrecorded_after_merge':
+      return l.exceptionDescriptionPayeeUnrecordedAfterMerge;
+    // Payment held for compliance review ({count, plural, one {# reason} other {# reasons}})
+    case 'exception.compliance_hold_findings':
+      final count = _count(p['count']);
+      if (count == null) return null;
+      return l.exceptionDescriptionComplianceHoldFindings(count);
+    // no screenable vendor on invoice
+    case 'exception.compliance_no_screenable_vendor':
+      return l.exceptionDescriptionComplianceNoScreenableVendor;
+    // sanctions screening could not run: no adapter for configured provider '{provider}'
+    case 'exception.compliance_provider_unavailable':
+      final provider = _text(p['provider'], currency);
+      if (provider == null) return null;
+      return l.exceptionDescriptionComplianceProviderUnavailable(provider);
+    // vendor screening returned review_required ({matchedList}) via {provider}
+    case 'exception.compliance_review_required':
+      final provider = _text(p['provider'], currency);
+      if (provider == null) return null;
+      final matchedList = _text(p['matchedList'], currency);
+      if (matchedList == null) return null;
+      return l.exceptionDescriptionComplianceReviewRequired(
+        provider,
+        matchedList,
+      );
+    // vendor screening returned review_required (see audit row) via {provider}
+    case 'exception.compliance_review_required_unlisted':
+      final provider = _text(p['provider'], currency);
+      if (provider == null) return null;
+      return l.exceptionDescriptionComplianceReviewRequiredUnlisted(provider);
+    // vendor screening returned an unrecognised result '{result}' via {provider}; treating as review_required
+    case 'exception.compliance_unrecognised_result':
+      final provider = _text(p['provider'], currency);
+      if (provider == null) return null;
+      final result = _text(p['result'], currency);
+      if (result == null) return null;
+      return l.exceptionDescriptionComplianceUnrecognisedResult(
+        provider,
+        result,
+      );
+    // vendor screening returned an adverse-media (negative news) hit via {provider}; AP review required
+    case 'exception.compliance_adverse_media':
+      final provider = _text(p['provider'], currency);
+      if (provider == null) return null;
+      return l.exceptionDescriptionComplianceAdverseMedia(provider);
+    // vendor screening returned an adverse-media (negative news) hit via the configured provider; AP review required
+    case 'exception.compliance_adverse_media_unnamed_provider':
+      return l.exceptionDescriptionComplianceAdverseMediaUnnamedProvider;
+    // trailing 12-month spend with vendor would reach {projected} {currency} (threshold {threshold} {currency}); AP review required
+    case 'exception.compliance_aml_spend':
+      final projected = _money(p['projected'], currency);
+      if (projected == null) return null;
+      final threshold = _money(p['threshold'], currency);
+      if (threshold == null) return null;
+      return l.exceptionDescriptionComplianceAmlSpend(projected, threshold);
+    // trailing 12-month spend with vendor would reach {projected} {currency} (threshold {threshold} {currency}); AP review required — at least, on {excluded, plural, one {# payment} other {# payments}} excluded for having no figure in the home currency, so the real total is higher
+    case 'exception.compliance_aml_spend_partial':
+      final projected = _money(p['projected'], currency);
+      if (projected == null) return null;
+      final threshold = _money(p['threshold'], currency);
+      if (threshold == null) return null;
+      final excluded = _count(p['excluded']);
+      if (excluded == null) return null;
+      return l.exceptionDescriptionComplianceAmlSpendPartial(
+        projected,
+        threshold,
+        excluded,
+      );
+    // Payment {paymentId} was still in flight after {hours}h and the reconciler marked it failed; the rail never confirmed, so the money may or may not have moved. The invoice is '{invoiceStatus}'. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.payment_aged_out':
+      final paymentId = _text(p['paymentId'], currency);
+      if (paymentId == null) return null;
+      final hours = _number(p['hours'], currency);
+      if (hours == null) return null;
+      final invoiceStatus = _text(p['invoiceStatus'], currency);
+      if (invoiceStatus == null) return null;
+      return l.exceptionDescriptionPaymentAgedOut(
+        paymentId,
+        hours,
+        invoiceStatus,
+      );
+    // Payment {paymentId} failed during dispatch ({failureCode}) after the processor may already have accepted it, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.payment_dispatch_in_doubt':
+      final paymentId = _text(p['paymentId'], currency);
+      if (paymentId == null) return null;
+      final failureCode = _text(p['failureCode'], currency);
+      if (failureCode == null) return null;
+      return l.exceptionDescriptionPaymentDispatchInDoubt(
+        paymentId,
+        failureCode,
+      );
+    // Payment {paymentId} failed, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.payment_dispatch_interrupted_failed':
+      final paymentId = _text(p['paymentId'], currency);
+      if (paymentId == null) return null;
+      return l.exceptionDescriptionPaymentDispatchInterruptedFailed(paymentId);
+    // Payment {paymentId} was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.payment_dispatch_interrupted_cancelled':
+      final paymentId = _text(p['paymentId'], currency);
+      if (paymentId == null) return null;
+      return l.exceptionDescriptionPaymentDispatchInterruptedCancelled(
+        paymentId,
+      );
+    // Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
+    case 'exception.settlement_currency_mismatch':
+      final settledAmount = _number(p['settledAmount'], currency);
+      if (settledAmount == null) return null;
+      final settledCurrency = _text(p['settledCurrency'], currency);
+      if (settledCurrency == null) return null;
+      final authorizedAmount = _number(p['authorizedAmount'], currency);
+      if (authorizedAmount == null) return null;
+      final authorizedCurrency = _text(p['authorizedCurrency'], currency);
+      if (authorizedCurrency == null) return null;
+      return l.exceptionDescriptionSettlementCurrencyMismatch(
+        settledAmount,
+        settledCurrency,
+        authorizedAmount,
+        authorizedCurrency,
+      );
+    // Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, MORE than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.
+    case 'exception.settlement_amount_over':
+      final settledAmount = _number(p['settledAmount'], currency);
+      if (settledAmount == null) return null;
+      final settledCurrency = _text(p['settledCurrency'], currency);
+      if (settledCurrency == null) return null;
+      final authorizedAmount = _number(p['authorizedAmount'], currency);
+      if (authorizedAmount == null) return null;
+      final authorizedCurrency = _text(p['authorizedCurrency'], currency);
+      if (authorizedCurrency == null) return null;
+      final variance = _number(p['variance'], currency);
+      if (variance == null) return null;
+      return l.exceptionDescriptionSettlementAmountOver(
+        settledAmount,
+        settledCurrency,
+        authorizedAmount,
+        authorizedCurrency,
+        variance,
+      );
+    // Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, LESS than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.
+    case 'exception.settlement_amount_under':
+      final settledAmount = _number(p['settledAmount'], currency);
+      if (settledAmount == null) return null;
+      final settledCurrency = _text(p['settledCurrency'], currency);
+      if (settledCurrency == null) return null;
+      final authorizedAmount = _number(p['authorizedAmount'], currency);
+      if (authorizedAmount == null) return null;
+      final authorizedCurrency = _text(p['authorizedCurrency'], currency);
+      if (authorizedCurrency == null) return null;
+      final variance = _number(p['variance'], currency);
+      if (variance == null) return null;
+      return l.exceptionDescriptionSettlementAmountUnder(
+        settledAmount,
+        settledCurrency,
+        authorizedAmount,
+        authorizedCurrency,
+        variance,
+      );
   }
   return null;
 }

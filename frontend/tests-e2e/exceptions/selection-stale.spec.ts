@@ -35,7 +35,10 @@ function exceptionRow(n: number) {
 		due_at: null,
 		is_overdue: false,
 		time_to_resolution_hours: null,
-		created_at: '2026-01-01T00:00:00Z'
+		created_at: '2026-01-01T00:00:00Z',
+		// The caller's verdict per decision (`decision_refusals`) — all open, so
+		// the row offers Resolve and is selectable.
+		decision_refusals: { resolve: null, dismiss: null, escalate: null }
 	};
 }
 
@@ -94,8 +97,10 @@ test.describe('/exceptions — stale selection', () => {
 		failList = true;
 		await page.getByRole('button', { name: /^Escalated/ }).click();
 
-		// The table is empty (error state) …
-		await expect(page.getByTestId('table-empty')).toBeVisible();
+		// The failed fresh load drops its rows and states the failure in place
+		// (LoadError with a Retry replaces the table) …
+		await expect(page.getByTestId('exceptions-load-error')).toBeVisible();
+		await expect(page.locator('table tbody tr')).toHaveCount(0);
 		// … so nothing may still be selected.
 		await expect(bulkBar).toHaveCount(0);
 	});

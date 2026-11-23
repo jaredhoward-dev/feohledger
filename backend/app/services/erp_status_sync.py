@@ -1,0 +1,2263 @@
+"""What the ERP says about a bill, brought back into FeohLedger (decisions §295).
+
+Two directions of the same fact meet here:
+
+* **The ERP reports a payment status.** The generic ERP webhook
+  (``api/erp_webhook``) has always handled a ``Paid`` report;
+  :func:`record_erp_reported_payment` is that path — the ERP paying an invoice
+  FeohLedger never paid is booked as a payment made outside FeohLedger, with
+  the ERP's own payment date and rail when it states them, and a refusal is
+  never silent.
+* **QuickBooks Online status sync-back.** QuickBooks sends webhooks that name
+  only an entity id, so the bill is read back
+  (``ErpAdapter.bill_report``) and :func:`apply_bill_report` decides what it
+  means for the invoice it was posted from. The same function runs for a
+  webhook (``api/erp_webhook.quickbooks_webhook`` → :func:`process_qbo_events`)
+  and for the change-data-capture sweep (:func:`run_status_sync_once`), which
+  is the backstop: Intuit does not guarantee delivery.
+* **Xero status sync-back** (decisions §386). Xero has no webhook here, so the
+  sweep is its only automatic channel (``changed_bills`` reads
+  ``If-Modified-Since`` listings), and an admin can run the same pass for one
+  tenant on request (:func:`dispatch_sync_org_now`, ``POST
+  /api/organization/erp/oauth/status-sync``). Its bills carry no marker of
+  ours, so a report is matched by its never-reused id within the recorded
+  realm (``ErpBillReport.match_by_reference``).
+
+**The cash the ERP shows is what is recorded.** Both QuickBooks and Xero state
+the cash a person applied to a bill paid wholly in cash outside FeohLedger
+(``ErpBillReport.paid_amount`` / ``paid_currency``, decisions §386, §393), and
+:func:`record_erp_reported_payment` books it only when it is what the invoice
+owes here; any other figure, or currency, is refused ``amount_mismatch`` and
+kept on a payment-blocking row for a person. One path for every ERP: no
+adapter's figure is special-cased here.
+
+**What closes the double-payment risk.** With status sync on
+(``FEOH_ERP_STATUS_SYNC_ENABLED``, :func:`status_sync_active`) a confirmed
+QuickBooks push leaves the invoice payable at ``posted_in_erp`` instead of
+closing it at ``done`` (``services/erp.send_to_erp_internal``). A bill then
+paid in QuickBooks reaches the ERP-paid path and the invoice moves to ``paid``,
+so it leaves our payment queue; a bill paid there while FeohLedger also holds
+a payment on it, partly paid there, or deleted there, opens the
+payment-blocking ``payment_reconciliation`` exception, which the run builder
+and every dispatch refuse on. Without status sync the push still closes the
+invoice at ``done`` — nothing would guarantee a QuickBooks payment ever reached
+us, so leaving the invoice payable would invite the double payment.
+
+**A bill paid only by our own write-back is not news.** ``post_payment``
+marks each BillPayment it writes, and ``bill_report`` separates those from
+payments a person made in QuickBooks (``paid_only_by_us``).
+
+Everything this module writes is PII-free: ERP ids, statuses, codes. Never a
+vendor, a memo, or the ERP's error text.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.config import settings
+from app.database import control_session_factory, get_tenant_engine
+from app.models.exception import Exception as APException
+from app.models.invoice import Invoice, InvoiceStatus
+from app.models.invoice_status import PAYABLE_STATUSES
+from app.models.organization import Organization
+from app.models.payment import Payment
+from app.models.workflow import WorkflowInstance
+from app.services.erp_adapters.base import ErpAdapter, ErpBillReport, ErpBillState
+from app.services.exception_service import create_exception
+from app.services.invoice_warning_catalog import (
+    ERP_UNNAMED_SUFFIX,
+    ERP_UNRECORDED_REASONS,
+    exception_finding,
+)
+from app.services.payment_methods import RailPart, rail_breakdown_json, rail_parts_from_json
+from app.services.workflow_engine import get_invoice_for_update, transition_invoice
+from app.utils.dates import utc_today
+
+logger = logging.getLogger(__name__)
+
+#: The roster type for "the ERP and our ledger disagree; a person reconciles"
+#: (not payment-blocking).
+ERP_RECONCILIATION_EXCEPTION_TYPE = "erp_reconciliation"
+#: The payment-blocking type, for a disagreement that would let FeohLedger pay
+#: a bill the ERP has already paid, part-paid or removed.
+PAYMENT_RECONCILIATION_EXCEPTION_TYPE = "payment_reconciliation"
+
+#: Invoice statuses from which an ERP `Paid` report is RECORDED as a payment
+#: made outside FeohLedger rather than dropped. `payment_scheduled` is absent on
+#: purpose: it already has a FeohLedger payment behind it, and the legal
+#: `payment_scheduled → paid` edge (with its settlement-coverage hold) handles it.
+ERP_PAID_RECORDABLE = frozenset(
+    {InvoiceStatus.approved, InvoiceStatus.sent_to_erp, InvoiceStatus.posted_in_erp}
+)
+
+#: Statuses at which FeohLedger may still pay the invoice — where a bill paid,
+#: part-paid or removed in the ERP must stop our payment runs.
+PAYABLE_HERE = frozenset(PAYABLE_STATUSES)
+
+#: Refusals meaning FeohLedger still holds its own claim on paying the invoice
+#: (`services/external_payment`). Raised as the BLOCKING `payment_reconciliation`
+#: type, because that claim proceeding after the ERP paid is a double payment.
+#:
+#: `amount_mismatch` is one too (decisions §386). It arises only when the ERP
+#: stated the cash it paid in full and that is not what the invoice owes here,
+#: so the bill IS paid there and paying it here is the double payment. It is
+#: also how an undispatched booking of ours surfaces (`record_invoice_paid_
+#: outside` completes that one in place, and its figure is what disagrees), and
+#: no automatic re-attempt can clear it without a person correcting one side.
+DOUBLE_PAY_REFUSALS = frozenset(
+    {
+        "external_payment_in_run",
+        "external_payment_payment_live",
+        "external_payment_card_live",
+        "external_payment_amount_mismatch",
+    }
+)
+
+#: QuickBooks Online: the adapter whose CloudEvents webhook this module serves.
+QBO_PROVIDER = "quickbooks_online"
+
+
+# ---------------------------------------------------------------------------
+# The ERP-paid path (shared with the generic ERP webhook)
+# ---------------------------------------------------------------------------
+
+
+def reported_paid_on(value: object) -> date | None:
+    """An ERP-stated payment date, validated: an ISO date that is not in the
+    future (nothing is paid tomorrow). One day of grace past the UTC date,
+    because the ERP dates a payment in the COMPANY's time zone (Auckland is
+    already "tomorrow" for much of the UTC day). Anything else is None, and the
+    caller falls back to the day the report arrived."""
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed <= utc_today() + timedelta(days=1) else None
+
+
+def reported_payment_method(value: object) -> str | None:
+    """An ERP-stated rail, validated against the rails a payment made outside
+    FeohLedger can be recorded on (``schemas/payment.PaymentMethod`` minus
+    ``virtual_card``, which is FeohLedger's own card programme). Anything else
+    is None — NULL, which counts as 1099-reportable."""
+    from app.schemas.payment import PaymentMethod
+
+    if not isinstance(value, str):
+        return None
+    try:
+        method = PaymentMethod(value.strip().lower())
+    except ValueError:
+        return None
+    return None if method == PaymentMethod.virtual_card else method.value
+
+
+def reported_payment_parts(parts: Sequence[RailPart]) -> tuple[RailPart, ...]:
+    """An ERP-stated breakdown (``ErpBillReport.payment_parts``) with each
+    part's rail validated as :func:`reported_payment_method` validates the
+    whole payment's: a rail that cannot be recorded is a part with no rail
+    (reportable). The amounts are left exactly as stated; whether they add up
+    to what is recorded is ``payment_methods.split_by_rail``'s call."""
+    return tuple(RailPart(reported_payment_method(p.method), p.amount) for p in parts)
+
+
+#: ``Exception.erp_report["kind"]`` values — what the ERP reported that a
+#: person now has to reconcile (decisions §319).
+#:
+#: * ``paid_not_recorded`` — the ERP reported the bill paid and FeohLedger could
+#:   not record that payment. The row keeps the payment's facts, which is what
+#:   :func:`retry_erp_reported_payments` and the queue's one-click record read.
+#: * ``settled_short`` — the ERP reported paid while FeohLedger's own payment
+#:   settled short of what AP authorized.
+#: * ``voided_after_post`` — the ERP voided a bill FeohLedger had already
+#:   moved past the point a void can be applied.
+ERP_REPORT_PAID_NOT_RECORDED = "paid_not_recorded"
+ERP_REPORT_SETTLED_SHORT = "settled_short"
+ERP_REPORT_VOIDED_AFTER_POST = "voided_after_post"
+
+#: How each ERP adapter is named to an AP user. An adapter missing here reads
+#: as "your ERP" — never its raw registry key.
+_ERP_DISPLAY_NAMES = {
+    "quickbooks_online": "QuickBooks Online",
+    "netsuite": "NetSuite",
+    "xero": "Xero",
+    "dynamics_365_bc": "Dynamics 365 Business Central",
+    "sage_intacct": "Sage Intacct",
+}
+
+
+def erp_product_name(erp_type: str | None) -> str | None:
+    """The ERP's product name (a proper noun, never translated), or None for an
+    adapter with none — a client then says "your ERP" in its own language."""
+    return _ERP_DISPLAY_NAMES.get((erp_type or "").strip().lower())
+
+
+def erp_finding(name: str, erp_type: str | None, /, **params: object) -> dict:
+    """A catalogue finding for an ERP sentence that opens with the ERP's name.
+
+    ``name`` is the bare catalogue name (``"erp_settled_short"``). With a product
+    name the ``{erp}`` code is used; without one its ``_unnamed`` twin, which
+    says "Your ERP" — a word, so a code of its own, never a spliced param
+    (``invoice_warning_catalog.ERP_UNNAMED_SUFFIX``).
+    """
+    product = erp_product_name(erp_type)
+    if product is None:
+        return exception_finding(name + ERP_UNNAMED_SUFFIX, **params)
+    return exception_finding(name, erp=product, **params)
+
+
+_REFUSAL_PREFIX = "external_payment_"
+
+
+def unrecorded_payment_finding(erp_type: str | None, refusal_code: str) -> dict:
+    """The sentence an AP user reads on a ``paid_not_recorded`` exception.
+
+    What happened and what to do — no API path, no ids, no refusal code: those
+    are machine detail and live in ``Exception.erp_report``. One catalogue code
+    per refusal (``ERP_UNRECORDED_REASONS``); an unlisted refusal reads the
+    generic ``other`` clause.
+    """
+    reason = refusal_code.removeprefix(_REFUSAL_PREFIX)
+    if not refusal_code.startswith(_REFUSAL_PREFIX) or reason not in ERP_UNRECORDED_REASONS:
+        reason = "other"
+    return erp_finding(f"erp_paid_unrecorded_{reason}", erp_type)
+
+
+def _set_finding(row: APException, finding: dict) -> None:
+    """Restate a live row in ``finding``'s words: the English fallback and the
+    code + params a client localizes on move together, never one without the
+    other."""
+    row.description = finding["message"]
+    row.description_code = finding.get("code")
+    row.description_params = finding.get("params")
+
+
+async def open_erp_reconciliation_exception(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org_id,
+    finding: dict,
+    exception_type: str = ERP_RECONCILIATION_EXCEPTION_TYPE,
+    erp_report: dict | None = None,
+) -> bool:
+    """Open ONE reconciliation exception for human review, PII-free.
+
+    **Idempotent**: skipped when an open or escalated exception of the same type
+    already exists for the invoice, so distinct ERP events (or a webhook and the
+    sweep reporting the same change) never pile up duplicates. Returns whether
+    one was opened.
+
+    A ``paid_not_recorded`` report goes through :func:`_keep_erp_paid_report`
+    instead, which keeps at most ONE live such row per invoice and refreshes it.
+
+    ``finding`` is the sentence for a person, as an ``invoice_warning_catalog``
+    finding (``erp_finding`` / ``exception_finding``): its English is stored as
+    ``description`` and its code + params let each client render it in the
+    reader's language. It carries nothing from the ERP's payload, which may
+    include vendor bank / tax / address fields. ``erp_report`` is the PII-free
+    machine detail, as data (decisions §319). Every caller passes a catalogue
+    finding, the QuickBooks write-back's included (``erp_payment_writeback``).
+    """
+    if (erp_report or {}).get("kind") == ERP_REPORT_PAID_NOT_RECORDED:
+        return await _keep_erp_paid_report(
+            db,
+            invoice,
+            org_id=org_id,
+            finding=finding,
+            exception_type=exception_type,
+            erp_report=erp_report,
+        )
+    if await _live_of_type(db, invoice.id, exception_type):
+        return False
+    await _create_reconciliation(
+        db,
+        invoice,
+        org_id=org_id,
+        finding=finding,
+        exception_type=exception_type,
+        erp_report=erp_report,
+    )
+    return True
+
+
+async def _live_of_type(db: AsyncSession, invoice_id: uuid.UUID, exception_type: str) -> bool:
+    existing = await db.execute(
+        select(func.count()).where(
+            APException.invoice_id == invoice_id,
+            APException.exception_type == exception_type,
+            APException.status.in_(("open", "escalated")),
+        )
+    )
+    return (existing.scalar() or 0) > 0
+
+
+def _merged_report(old: dict | None, new: dict, *, keep_refusal: bool) -> dict:
+    """A later report folded into the facts a live row already holds.
+
+    The payment is the one the ERP first reported, unless the ERP now says more:
+    a stated date replaces a stand-in one but an undated report never replaces
+    a date; a document id replaces an event-derived reference but an id-less
+    report never replaces a reference (the event id changes per delivery, and
+    the reference is the replay key `_same_record` reads). ``first_reported_at``
+    keeps the age of the claim.
+    """
+    merged = dict(new)
+    old = old or {}
+    if not new.get("paid_on_reported") and old.get("paid_on"):
+        merged["paid_on"] = old["paid_on"]
+        merged["paid_on_reported"] = bool(old.get("paid_on_reported"))
+    if not new.get("erp_document_id") and old.get("reference"):
+        merged["reference"] = old["reference"]
+        merged["erp_document_id"] = old.get("erp_document_id")
+    if new.get("amount") is None and old.get("amount") is not None:
+        # A report that states no amount never erases one the ERP stated, nor
+        # the breakdown of that amount by rail (§396).
+        merged["amount"] = old["amount"]
+        merged["amount_currency"] = old.get("amount_currency")
+        merged["payment_parts"] = old.get("payment_parts")
+    merged["first_reported_at"] = old.get("first_reported_at") or old.get("reported_at")
+    if keep_refusal and old.get("refusal_code"):
+        merged["refusal_code"] = old["refusal_code"]
+    return merged
+
+
+async def _keep_erp_paid_report(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org_id,
+    finding: dict,
+    exception_type: str,
+    erp_report: dict,
+) -> bool:
+    """Keep ONE live ``paid_not_recorded`` row per invoice, whatever its type.
+
+    * A live BLOCKING row (a double-pay refusal) stays the row. A later report
+      is refused BY it (its own type blocks the record), which says nothing new
+      about why, so its refusal and sentence stand unless the new refusal is
+      itself a double-pay one; its payment facts are refreshed.
+    * A new double-pay refusal over a live non-blocking row opens the blocking
+      row — the run must stop — and closes the non-blocking one as superseded.
+      If an older blocker of that type with no ERP facts is already open, the
+      run is stopped anyway: the non-blocking row is refreshed instead.
+    * Otherwise the live non-blocking row is refreshed, or a row is opened.
+
+    Two live rows would each offer to record the same payment, and a stale one
+    would be re-attempted against a decision made on the other.
+    """
+    from app.services.exception_lifecycle import is_payment_blocking
+
+    live = await live_erp_paid_reports(db, [invoice.id])
+    blocking = [r for r in live if is_payment_blocking(r.exception_type)]
+    others = [r for r in live if not is_payment_blocking(r.exception_type)]
+    new_blocking = is_payment_blocking(exception_type)
+
+    if blocking:
+        row = blocking[0]
+        row.erp_report = _merged_report(row.erp_report, erp_report, keep_refusal=not new_blocking)
+        if new_blocking:
+            _set_finding(row, finding)
+        await _supersede(db, invoice, others)
+        return False
+    if new_blocking and not await _live_of_type(db, invoice.id, exception_type):
+        await _supersede(db, invoice, others)
+        await _create_reconciliation(
+            db,
+            invoice,
+            org_id=org_id,
+            finding=finding,
+            exception_type=exception_type,
+            erp_report=erp_report,
+        )
+        return True
+    if others:
+        row = others[0]
+        row.erp_report = _merged_report(row.erp_report, erp_report, keep_refusal=False)
+        _set_finding(row, finding)
+        await _supersede(db, invoice, others[1:])
+        return False
+    # The facts ride a row of their own, never swallowed by the per-type dedupe
+    # other ERP rows use. Non-blocking even for a double-pay refusal here: we
+    # only reach this with one when a blocker of that type is already open,
+    # which stops the run on its own.
+    await _create_reconciliation(
+        db,
+        invoice,
+        org_id=org_id,
+        finding=finding,
+        exception_type=ERP_RECONCILIATION_EXCEPTION_TYPE,
+        erp_report=erp_report,
+    )
+    return True
+
+
+_SUPERSEDED = "Closed automatically: a later report from the ERP replaced this one."
+
+
+async def _supersede(db: AsyncSession, invoice: Invoice, rows: list[APException]) -> None:
+    """Close NON-blocking ``paid_not_recorded`` rows a newer row replaces —
+    through ``record_decision``, so each close is audited. Never a blocking
+    row: closing one would be a machine clearing a payment block."""
+    from app.services.exception_lifecycle import record_decision
+
+    for row in rows:
+        await record_decision(
+            db,
+            exception=row,
+            action="resolve",
+            resolution=_SUPERSEDED,
+            actor_id=None,
+            actor_name=ERP_REPORT_CLOSER,
+            invoice=invoice,
+            via="erp_superseded",
+        )
+
+
+async def _create_reconciliation(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org_id,
+    finding: dict,
+    exception_type: str,
+    erp_report: dict | None,
+) -> None:
+    await create_exception(
+        db,
+        exception_type=exception_type,
+        severity="error",
+        description=finding["message"],
+        description_code=finding.get("code"),
+        description_params=finding.get("params"),
+        status="open",
+        organization_id=org_id,
+        invoice=invoice,
+        # Raised from what the tenant's ERP reported, not by a control-plane user.
+        raised_by_user_id=None,
+        erp_report=erp_report,
+    )
+
+
+async def record_erp_reported_payment(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org: Organization,
+    erp_type: str,
+    erp_document_id: str | None,
+    event_id: str | None,
+    paid_on: date | None = None,
+    method: str | None = None,
+    paid_on_reported: bool | None = None,
+    amount: Decimal | None = None,
+    amount_currency: str | None = None,
+    payment_parts: Sequence[RailPart] = (),
+) -> bool:
+    """Book the ERP's `Paid` as a payment made outside FeohLedger.
+
+    Through `services/external_payment.record_invoice_paid_outside` — the same
+    gates a user's record goes through, minus segregation of duties (no human
+    actor). ``paid_on`` / ``method`` are the ERP's own payment date and rail
+    when it states them (already validated: :func:`reported_paid_on`,
+    :func:`reported_payment_method`); absent, the payment is dated the day the
+    report arrived and its rail is NULL (1099-reportable). A refusal (an open
+    payment-blocking exception, a live FeohLedger payment or card that would
+    make this a double payment, a credit we can't net) is never silent: it
+    opens a reconciliation exception that says, in an AP user's words, what
+    stopped it — and keeps the payment's facts in ``erp_report`` so it can be
+    recorded later without anyone re-keying them (decisions §319). Returns
+    whether the payment was recorded. Never commits.
+
+    ``paid_on_reported`` says whether ``paid_on`` came from the ERP. A
+    re-attempt (:func:`retry_erp_reported_payments`) passes the stored flag,
+    since by then ``paid_on`` is always set.
+
+    ``amount`` is the cash the ERP says was paid, when it states it exactly
+    (``ErpBillReport.paid_amount``). It is recorded only when it is what the
+    invoice owes here; anything else is refused ``amount_mismatch`` and kept
+    for a person, never booked at FeohLedger's own figure (decisions §386).
+    ``amount_currency`` is the currency the ERP states it in; with an amount,
+    a missing or different one from the invoice's is refused the same way.
+    None records what is owed here.
+
+    ``payment_parts`` is how the ERP says ``amount`` was paid, rail by rail
+    (``ErpBillReport.payment_parts``). The record keeps it on the payment, and
+    the 1099 splits by it, only when the parts sum exactly to what is booked
+    (decisions §396). A refused record keeps it beside the amount, so the
+    re-attempt and the one-click book the same split.
+    """
+    from app.services.external_payment import (
+        ExternalPaymentRefused,
+        record_invoice_paid_outside,
+    )
+
+    payment_parts = reported_payment_parts(payment_parts)
+
+    if invoice.status == InvoiceStatus.sent_to_erp:
+        # The ERP can only have paid a bill it holds: the `posted_in_erp` report
+        # was lost or arrived out of order. Apply it first so the trail reads in
+        # the order things happened.
+        await transition_invoice(
+            db,
+            invoice,
+            InvoiceStatus.posted_in_erp,
+            action_name="invoice.erp_status_posted_in_erp",
+            details={
+                "erp_type": erp_type,
+                "erp_status": "implied_by_paid",
+                "erp_document_id": erp_document_id,
+                "event_id": event_id,
+            },
+        )
+
+    if paid_on_reported is None:
+        paid_on_reported = paid_on is not None
+    # Fixed at the first report, never at a later re-attempt: the payment is
+    # dated the day the ERP said, or the day it reported, never the day a
+    # blocker happened to clear.
+    paid_on = paid_on or utc_today()
+    reference = erp_paid_reference(erp_type, erp_document_id, event_id)
+    try:
+        # The currency is judged by the record itself, beside the amount and
+        # AFTER its live-claim refusals: a payment in another currency on an
+        # invoice FeohLedger is also paying is first a double payment (§309).
+        await record_invoice_paid_outside(
+            db,
+            org=org,
+            invoice=invoice,
+            method=method,
+            reference=reference,
+            paid_on=paid_on,
+            actor_id=None,
+            source="erp",
+            amount=amount,
+            amount_currency=amount_currency,
+            rail_parts=payment_parts,
+        )
+    except ExternalPaymentRefused as exc:
+        # When FeohLedger itself still has a claim on paying this invoice — a
+        # live payment, a draft/exported run, a live card — the ERP has just
+        # paid it, so letting that claim proceed pays the supplier TWICE.
+        # `erp_reconciliation` is not payment-blocking, so for those refusals
+        # the flag is the blocking `payment_reconciliation`, which the run
+        # builder and every dispatch (`dispatch_preflight`) refuse on. Any other
+        # refusal is a question for a human, not a double-pay risk.
+        double_pay = exc.refusal.code in DOUBLE_PAY_REFUSALS
+        await open_erp_reconciliation_exception(
+            db,
+            invoice,
+            org_id=org.id,
+            exception_type=(
+                PAYMENT_RECONCILIATION_EXCEPTION_TYPE
+                if double_pay
+                else ERP_RECONCILIATION_EXCEPTION_TYPE
+            ),
+            finding=unrecorded_payment_finding(erp_type, exc.refusal.code),
+            erp_report={
+                "kind": ERP_REPORT_PAID_NOT_RECORDED,
+                "erp_type": erp_type,
+                "erp_document_id": erp_document_id,
+                "event_id": str(event_id) if event_id else None,
+                "method": method,
+                "reference": reference,
+                "paid_on": paid_on.isoformat(),
+                "paid_on_reported": paid_on_reported,
+                "amount": str(amount) if amount is not None else None,
+                "amount_currency": amount_currency if amount is not None else None,
+                "payment_parts": (
+                    rail_breakdown_json(payment_parts)
+                    if amount is not None and payment_parts
+                    else None
+                ),
+                "refusal_code": exc.refusal.code,
+                "reported_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        return False
+    return True
+
+
+def erp_paid_reference(erp_type: str, erp_document_id: str | None, event_id: str | None) -> str:
+    """The reference an ERP-reported payment is recorded under: the ERP's own
+    document id, else the event, else the ERP's name. Stable for one report,
+    which is what makes a re-attempt an idempotent replay."""
+    return (erp_document_id or (f"erp-event:{event_id}" if event_id else None) or erp_type)[:255]
+
+
+def is_erp_paid_report(exception: APException) -> bool:
+    """Does this row carry an ERP-reported payment FeohLedger could not record?"""
+    report = getattr(exception, "erp_report", None)
+    return isinstance(report, dict) and report.get("kind") == ERP_REPORT_PAID_NOT_RECORDED
+
+
+def kept_split_stands(report: dict | None) -> bool | None:
+    """Whether a ``paid_not_recorded`` row's kept breakdown would be booked
+    whatever one rail a person names (``external_payment.
+    split_stands_over_any_rail``), judged against the cash the row states, the
+    figure the one-click books. ``None`` when the row states no figure or no
+    breakdown: the record then reads the bill again (§393) or books the rail
+    the person names, and the dialog keeps its picker.
+
+    The ONE reading of a kept split, for every surface that asks: the
+    exception row's ``erp_payment_split_stands`` (§413), the payment queue's
+    ``erp_reported_payment.split_stands`` and ``POST /api/payments/
+    record-outside``'s refusal to book a payment the split describes with one
+    rail (§426). Server-side because it is an exact sum the client may not do
+    (`frontend/docs/money-formatting.md`)."""
+    from decimal import InvalidOperation
+
+    from app.services.external_payment import split_stands_over_any_rail
+
+    if not isinstance(report, dict) or report.get("kind") != ERP_REPORT_PAID_NOT_RECORDED:
+        return None
+    stated = report.get("amount")
+    parts = rail_parts_from_json(report.get("payment_parts"))
+    if not stated or not parts:
+        return None
+    try:
+        amount = Decimal(str(stated))
+    except (InvalidOperation, ValueError):
+        return None
+    return split_stands_over_any_rail(reported_payment_parts(parts), amount)
+
+
+async def live_erp_paid_reports(
+    db: AsyncSession, invoice_ids: list[uuid.UUID], *, fresh: bool = False
+) -> list[APException]:
+    """The open / escalated ``paid_not_recorded`` rows on these invoices, newest first.
+
+    ``fresh`` re-reads loaded rows from the database instead of serving the
+    identity map's copy — for a caller that acts on the facts under a lock.
+    """
+    if not invoice_ids:
+        return []
+    query = (
+        select(APException)
+        .where(
+            APException.invoice_id.in_(invoice_ids),
+            APException.status.in_(("open", "escalated")),
+            APException.erp_report["kind"].astext == ERP_REPORT_PAID_NOT_RECORDED,
+        )
+        .order_by(APException.created_at.desc(), APException.id.desc())
+    )
+    if fresh:
+        query = query.execution_options(populate_existing=True)
+    return list((await db.execute(query)).scalars().all())
+
+
+#: ``resolved_by`` on a row FeohLedger closed itself because the payment it was
+#: about has been recorded. The audit row's ``actor_id`` still names the person
+#: whose act recorded it, when a person's did.
+ERP_REPORT_CLOSER = "FeohLedger"
+_CLOSED_BY_RECORD = "Closed automatically: the payment the ERP reported has been recorded."
+
+
+async def close_erp_paid_reports(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    actor_id: uuid.UUID | None,
+    actor_name: str | None = None,
+    org_settings: dict | None = None,
+) -> int:
+    """Resolve every live ``paid_not_recorded`` row on ``invoice``.
+
+    Called once the invoice HAS been recorded as paid outside FeohLedger
+    (``external_payment._complete``), by whichever door: the automatic
+    re-attempt, the queue's one-click record, a user's own "Record as paid", a
+    run recorded outside. The question the row asked is answered, and leaving
+    it open would only invite a second record.
+
+    Through ``exception_lifecycle.record_decision``, so each close writes its
+    ``exception.resolved`` audit row, as ``actor_name`` when a person recorded
+    it. A payment-blocking row is live here only on the one-click path, which
+    has already applied its clearing rules to that caller under lock; the same
+    rule runs again here with the org's own settings.
+    Returns how many were closed.
+    """
+    from app.services.exception_lifecycle import record_decision
+
+    rows = await live_erp_paid_reports(db, [invoice.id])
+    for row in rows:
+        await record_decision(
+            db,
+            exception=row,
+            action="resolve",
+            resolution=_CLOSED_BY_RECORD,
+            actor_id=actor_id,
+            actor_name=actor_name or ERP_REPORT_CLOSER,
+            invoice=invoice,
+            via="payment_recorded",
+            org_settings=org_settings,
+        )
+    return len(rows)
+
+
+#: ``erp_report["kind"]`` of a ``paid_not_recorded`` row whose payment the ERP
+#: has since withdrawn — the bill reads open, part-paid, deleted or voided.
+ERP_REPORT_PAID_WITHDRAWN = "paid_withdrawn"
+
+
+async def withdraw_erp_paid_reports(
+    db: AsyncSession, invoice: Invoice, *, erp_type: str, erp_state: str
+) -> int:
+    """The ERP no longer shows the bill paid: retire the payment it reported.
+
+    Every live ``paid_not_recorded`` row on the invoice stops being one — its
+    kind becomes ``paid_withdrawn``, so nothing re-attempts the record and no
+    one-click offers it. The row itself stays OPEN for a person, with a
+    sentence saying so: a blocking row in particular is never cleared by a
+    machine. Without this, a payment the ERP had since voided would be booked
+    the moment someone cleared an unrelated blocker, and an invoice still owed
+    would read paid (decisions §319). Returns how many were withdrawn.
+    """
+    rows = await live_erp_paid_reports(db, [invoice.id])
+    for row in rows:
+        row.erp_report = {
+            **(row.erp_report or {}),
+            "kind": ERP_REPORT_PAID_WITHDRAWN,
+            "withdrawn_as": erp_state,
+            "withdrawn_at": datetime.now(UTC).isoformat(),
+        }
+        _set_finding(row, erp_finding("erp_paid_withdrawn", erp_type))
+    return len(rows)
+
+
+async def retry_erp_reported_payments(
+    db: AsyncSession, *, invoice_id: uuid.UUID, organization_id: uuid.UUID
+) -> bool:
+    """Re-attempt recording the ERP's payment once a blocker on the invoice clears.
+
+    Called by ``exception_lifecycle.record_decision`` when a payment-blocking
+    exception on ``invoice_id`` is resolved or dismissed. If the invoice has a
+    live, NON-blocking ``paid_not_recorded`` row, its stored facts go back
+    through :func:`record_erp_reported_payment` — the very gates the first
+    attempt ran, so nothing is bypassed: another open blocker, a FeohLedger
+    payment or card that would pay twice, a credit we can't net all still
+    refuse, and a refusal refreshes the row with the new reason. On success
+    ``external_payment._complete`` closes the row.
+
+    A BLOCKING ``paid_not_recorded`` row (the double-pay refusals) is never
+    retried here: it refuses the record itself, by design, until a person who
+    may clear it decides the ERP's payment is the one that stands — which is the
+    queue's one-click record (``POST /api/exceptions/{id}/record-erp-payment``).
+
+    A row that states no cash figure, from an ERP whose bills read back (a
+    QuickBooks row kept before §393), is never recorded at FeohLedger's own
+    figure: the bill is read again under the invoice lock
+    (:func:`read_back_unstated_figure`), the figure it states now goes through
+    the record's amount and currency checks, and a read that confirms none
+    re-raises the row as payment-blocking for a person
+    (:func:`hold_unconfirmed_erp_payment`).
+
+    Same transaction as the decision that triggered it; never commits.
+    Idempotent: nothing is live once it succeeds. Returns whether a payment
+    was recorded.
+    """
+    from app.services.exception_lifecycle import is_payment_blocking
+
+    def _candidates(rows: list[APException]) -> list[APException]:
+        return [row for row in rows if not is_payment_blocking(row.exception_type)]
+
+    # A cheap look first, so the common case (nothing kept) costs one query and
+    # takes no lock. NOT what is acted on: see below.
+    if not _candidates(await live_erp_paid_reports(db, [invoice_id])):
+        return False
+    try:
+        async with control_session_factory() as ctrl:
+            org = await ctrl.get(Organization, organization_id)
+    except Exception:  # noqa: BLE001 — isolated follow-on, like the attempt below
+        logger.exception("ERP-reported payment re-attempt: org unreadable: org=%s", organization_id)
+        return False
+    if org is None:
+        return False
+    # In a SAVEPOINT: this is a follow-on to the decision that triggered it. A
+    # failure of ours here (a lock timeout, a bug) must not undo a person's
+    # clearing of a duplicate or fraud flag. It rolls back only this attempt —
+    # and `post_commit` drops whatever the attempt queued. A REFUSAL is not a
+    # failure: `record_erp_reported_payment` turns it into the refreshed row.
+    try:
+        async with db.begin_nested():
+            invoice = (
+                await db.execute(
+                    select(Invoice)
+                    .where(Invoice.id == invoice_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if invoice is None or invoice.status not in ERP_PAID_RECORDABLE:
+                # Paid some other way, voided back, or not posted yet: no longer
+                # the question the row asked, so a person reads it as it stands.
+                return False
+            # Which payment, chosen only NOW, under the invoice lock every ERP
+            # writer takes before touching these rows, and re-read rather than
+            # served from the identity map — so a withdrawal the sweep committed
+            # while this transaction waited is seen, and never recorded.
+            fresh = _candidates(await live_erp_paid_reports(db, [invoice_id], fresh=True))
+            if not fresh:
+                return False
+            facts = fresh[0].erp_report or {}
+            try:
+                paid_on = date.fromisoformat(str(facts.get("paid_on")))
+                amount = Decimal(str(facts["amount"])) if facts.get("amount") else None
+            except (ValueError, ArithmeticError):
+                return False
+            currency = facts.get("amount_currency")
+            parts = rail_parts_from_json(facts.get("payment_parts")) if amount is not None else ()
+            if amount is None:
+                # No figure stated (a QuickBooks row kept before §393): never
+                # booked at FeohLedger's own figure. The bill is read again
+                # under this lock, and a figure it cannot confirm goes to a
+                # person, blocking.
+                figure = await read_back_unstated_figure(db, invoice=invoice, org=org, facts=facts)
+                if figure.needed:
+                    if figure.amount is None:
+                        await hold_unconfirmed_erp_payment(db, invoice, org=org, facts=facts)
+                        return False
+                    amount, currency, parts = figure.amount, figure.currency, figure.parts
+            return await record_erp_reported_payment(
+                db,
+                invoice,
+                org=org,
+                erp_type=str(facts.get("erp_type") or ""),
+                erp_document_id=facts.get("erp_document_id"),
+                event_id=facts.get("event_id"),
+                paid_on=paid_on,
+                method=reported_payment_method(facts.get("method")),
+                paid_on_reported=bool(facts.get("paid_on_reported")),
+                amount=amount,
+                amount_currency=currency,
+                payment_parts=parts,
+            )
+    except Exception:  # noqa: BLE001 — isolated follow-on; logged with its traceback
+        # ids only — no vendor, no amount, no reference.
+        logger.exception(
+            "ERP-reported payment re-attempt failed: invoice=%s org=%s", invoice_id, organization_id
+        )
+        await _mark_retry_failed(db, invoice_id)
+        return False
+
+
+async def _mark_retry_failed(db: AsyncSession, invoice_id: uuid.UUID) -> None:
+    """After a re-attempt failed on OUR side, stop the kept rows promising an
+    automatic record that will not come: stamp the failure, and point the
+    reader at the one-click record instead. Best-effort — the failure is
+    already logged, and this must not fail the decision either."""
+    try:
+        for row in await live_erp_paid_reports(db, [invoice_id], fresh=True):
+            row.erp_report = {
+                **(row.erp_report or {}),
+                "retry_failed_at": datetime.now(UTC).isoformat(),
+            }
+            _set_finding(
+                row,
+                erp_finding("erp_paid_retry_failed", (row.erp_report or {}).get("erp_type")),
+            )
+    except Exception:  # noqa: BLE001 — best-effort annotation of an already-logged failure
+        logger.exception(
+            "ERP-reported payment: could not mark retry failure: invoice=%s", invoice_id
+        )
+
+
+#: ``erp_report["refusal_code"]`` of a kept ERP payment that states no cash
+#: figure, from an ERP whose bills can be read back, when the read back could
+#: not confirm one: it failed, the bill is no longer under this connection, or
+#: it no longer reads as paid wholly in cash. The row is then payment-blocking
+#: and a person decides (decisions §393).
+ERP_PAID_AMOUNT_UNCONFIRMED = "erp_paid_amount_unconfirmed"
+
+
+@dataclass(frozen=True)
+class ReadBackFigure:
+    """What :func:`read_back_unstated_figure` learned about a kept payment."""
+
+    #: False when the row's ERP never reads its bills back (the generic ERP
+    #: webhook's adapters, which state no figure on any report): the payment is
+    #: recorded at what is owed here, the rule that channel's first report
+    #: already applies. True means the figure must come from the ERP.
+    needed: bool
+    #: The cash the bill states now, and its currency; ``amount`` None (with
+    #: ``needed``) means the read back could not confirm one.
+    amount: Decimal | None = None
+    currency: str | None = None
+    #: The bill's breakdown of ``amount`` by rail, as read now (§396).
+    parts: tuple[RailPart, ...] = ()
+
+
+async def read_back_unstated_figure(
+    db: AsyncSession, *, invoice: Invoice, org: Organization, facts: dict
+) -> ReadBackFigure:
+    """The cash figure for a kept ERP payment that states none, read from the bill.
+
+    A QuickBooks row kept before §393 carries ``amount: None``, because the
+    adapter stated no figure then. Recording it as it stands books what the
+    invoice owes HERE, which is not what left whenever a credit memo or an
+    early-payment discount applies only here (owed 240.00, the bill shows
+    250.00 paid by cheque, 240.00 booked). So the bill is read again, by the
+    caller, under the invoice lock it already holds, and only a figure the
+    bill states now is recorded: the record's own amount and currency checks
+    then decide, the way they do for a fresh report.
+
+    Read through the same connection checks the dispatch-time read uses
+    (:func:`_bill_to_read`'s company rules, :func:`_read_bill`'s bound and
+    org-wide unreachable hold): the row's ERP must be the one connected now,
+    the invoice must name its bill and the company it was posted to, and that
+    company must be the connected one. Anything short of a bill paid wholly in
+    cash, read now, is ``amount`` None. Never writes.
+    """
+    from app.services.erp_adapters.dispatcher import (
+        resolve_adapter_key,
+        status_sync_adapter_keys,
+    )
+    from app.services.erp_link_realm import connection_realm
+
+    erp_type = str(facts.get("erp_type") or "")
+    if erp_type not in status_sync_adapter_keys():
+        return ReadBackFigure(needed=False)
+    unconfirmed = ReadBackFigure(needed=True)
+    erp_config = (org.settings or {}).get("erp")
+    if not isinstance(erp_config, dict) or resolve_adapter_key(erp_config) != erp_type:
+        return unconfirmed  # another ERP is connected now: this bill cannot be read
+    state = (
+        await db.execute(
+            select(WorkflowInstance.state_data).where(WorkflowInstance.invoice_id == invoice.id)
+        )
+    ).scalar_one_or_none() or {}
+    bill_id = str(state.get("erp_reference") or "")
+    reported = str(facts.get("erp_document_id") or "")
+    realm = state.get("erp_realm")
+    if (
+        not bill_id
+        or bill_id == "UNKNOWN"
+        or (reported and reported != bill_id)
+        or not realm
+        or realm != connection_realm(erp_config)
+    ):
+        return unconfirmed
+    adapter = _adapter_or_none(erp_config)
+    if adapter is None:
+        return unconfirmed
+    report = await _read_bill(
+        _BillRead(
+            invoice=invoice,
+            payment=None,
+            adapter=adapter,
+            erp_config=erp_config,
+            bill_id=bill_id,
+            state=state,
+        ),
+        org.id,
+    )
+    if report is None or report.state is not ErpBillState.paid or report.paid_amount is None:
+        return unconfirmed
+    return ReadBackFigure(
+        needed=True,
+        amount=report.paid_amount,
+        currency=report.paid_currency,
+        parts=tuple(report.payment_parts),
+    )
+
+
+async def hold_unconfirmed_erp_payment(
+    db: AsyncSession, invoice: Invoice, *, org: Organization, facts: dict
+) -> None:
+    """Re-raise a kept ERP payment whose figure could not be confirmed as a
+    payment-BLOCKING row for a person. Never commits.
+
+    The bill was reported paid in the ERP, so a run here would pay it twice;
+    and nothing may book it at FeohLedger's own figure. Through
+    :func:`open_erp_reconciliation_exception`, so a live non-blocking row is
+    closed as superseded and its facts ride the blocking one (or, when an
+    older blocker of that type is already open, it is refreshed in place).
+    The sentence says the record did not happen automatically and points at
+    the one-click record, which reads the bill again.
+    """
+    erp_type = facts.get("erp_type")
+    await open_erp_reconciliation_exception(
+        db,
+        invoice,
+        org_id=org.id,
+        exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        finding=erp_finding("erp_paid_retry_failed", erp_type),
+        erp_report={
+            **facts,
+            "kind": ERP_REPORT_PAID_NOT_RECORDED,
+            "refusal_code": ERP_PAID_AMOUNT_UNCONFIRMED,
+            "reported_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Status sync-back (QuickBooks Online, Xero)
+# ---------------------------------------------------------------------------
+
+
+def status_sync_active(erp_config: dict | None) -> bool:
+    """Does a confirmed push to ``erp_config``'s ERP leave the invoice payable
+    at ``posted_in_erp``? Only when the operator has status sync on AND the
+    adapter reports its bills' payments back (``supports_status_sync``)."""
+    if not settings.erp_status_sync_enabled or not isinstance(erp_config, dict):
+        return False
+    adapter = _adapter_or_none(erp_config)
+    return bool(adapter is not None and adapter.supports_status_sync)
+
+
+def _adapter_or_none(erp_config: dict) -> ErpAdapter | None:
+    from app.services.erp_adapters import get_erp_adapter
+
+    try:
+        return get_erp_adapter(erp_config)
+    except Exception:  # noqa: BLE001 — an unknown adapter has no status sync
+        return None
+
+
+@dataclass(frozen=True)
+class SyncOutcome:
+    """What :func:`apply_bill_report` did with one report (for counting/tests)."""
+
+    action: str
+    invoice_id: uuid.UUID | None = None
+
+
+async def _matching_invoice_id(
+    db: AsyncSession, report: ErpBillReport, realm: str | None
+) -> uuid.UUID | None:
+    """The invoice this bill was posted from, or None.
+
+    A bill that still carries our marker names its invoice by correlation id,
+    and the invoice must record the same bill as its ERP reference — a bill
+    keyed in the ERP by hand, or copied, matches nothing. A deleted bill can no
+    longer be read, so it is matched by the reference alone, and only within
+    the connection realm the push recorded (QuickBooks numbers bills per
+    company, so a sandbox bill id names something else in production). An ERP
+    that writes no marker onto its bills but never reuses a bill id (Xero,
+    ``ErpBillReport.match_by_reference``) is matched the same way in every
+    state (§386). Either way exactly one invoice must name the bill.
+    """
+    bill_id = str(report.bill_id)
+    if report.correlation_id:
+        try:
+            correlation = uuid.UUID(report.correlation_id)
+        except ValueError:
+            return None
+        row = (
+            await db.execute(
+                select(Invoice.id, WorkflowInstance.state_data)
+                .join(WorkflowInstance, WorkflowInstance.invoice_id == Invoice.id, isouter=True)
+                .where(Invoice.correlation_id == correlation)
+            )
+        ).first()
+        if row is None:
+            return None
+        invoice_id, state = row
+        if str((state or {}).get("erp_reference") or "") != bill_id:
+            return None
+        recorded = (state or {}).get("erp_realm")
+        if recorded and realm and recorded != realm:
+            return None
+        return invoice_id
+    by_reference = report.state is ErpBillState.deleted or report.match_by_reference
+    if not by_reference or not realm:
+        return None
+    rows = (
+        await db.execute(
+            select(WorkflowInstance.invoice_id).where(
+                WorkflowInstance.state_data["erp_reference"].astext == bill_id,
+                WorkflowInstance.state_data["erp_realm"].astext == realm,
+            )
+        )
+    ).all()
+    # More than one invoice naming the same bill in one company is not a match
+    # we can act on; nothing is guessed.
+    return rows[0][0] if len(rows) == 1 else None
+
+
+#: ``erp_report["kind"]`` of a row status sync-back opened from a bill report
+#: (``apply_bill_report``), of one the pre-dispatch check opened
+#: (``check_erp_bill_before_dispatch``), of one for a bill this connection
+#: cannot read, and of one a void of an ERP-reported payment opened. Machine
+#: detail only — what the row asks is in its description.
+ERP_REPORT_BILL_STATE = "bill_state"
+ERP_REPORT_DISPATCH_STOPPED = "dispatch_stopped"
+ERP_REPORT_BILL_UNLINKED = "bill_unlinked"
+ERP_REPORT_PAYMENT_VOIDED = "erp_payment_voided"
+
+
+def _bill_report_detail(report: ErpBillReport, provider: str, event_id: str | None) -> dict:
+    """What used to ride the sentence as ``(provider=…, bill=…, event=…)``, as
+    data. ``event_id`` None means the reconciliation sweep read it."""
+    return {
+        "kind": ERP_REPORT_BILL_STATE,
+        "erp_type": provider,
+        "erp_document_id": report.bill_id,
+        "event_id": str(event_id) if event_id else None,
+        "source": "webhook" if event_id else "reconciliation_sweep",
+        "bill_state": report.state.value,
+    }
+
+
+async def apply_bill_report(
+    db: AsyncSession,
+    *,
+    org: Organization,
+    report: ErpBillReport,
+    realm: str | None,
+    erp_type: str = QBO_PROVIDER,
+    event_id: str | None = None,
+) -> SyncOutcome:
+    """Bring one bill's ERP state into the invoice it was posted from. Commits.
+
+    =================== ============================ ================================
+    Bill in the ERP     Invoice here                 What happens
+    =================== ============================ ================================
+    paid outside us     payable here, or sent;       blocking payment_reconciliation:
+    (vendor credit)     partly or wholly by a credit settled without money leaving
+    paid outside us     approved / sent / posted     recorded as paid outside, with
+    (cash)                                           the ERP's date, rail and cash
+                                                     figure; a figure that is not
+                                                     what is owed here is refused
+                                                     and kept, blocking
+    paid outside us     approved / sent / posted,    blocking payment_reconciliation:
+    beside our live     (voided here, not there)     no one payment states what left
+    write-back
+    paid outside us     payment_scheduled            blocking payment_reconciliation:
+                                                     FeohLedger is paying it too
+    paid outside us     paid by a FeohLedger rail    erp_reconciliation: the
+                                                     supplier was paid twice
+    paid (only by us)   any                          nothing — our own write-back
+    partially paid      payable here                 blocking payment_reconciliation:
+    (outside us)                                     our run would pay it in full
+    open                paid by an ERP report        erp_reconciliation: the ERP no
+                                                     longer shows it paid
+    deleted             payable here                 blocking payment_reconciliation
+    deleted             sent / paid / done / failed  erp_reconciliation
+    =================== ============================ ================================
+
+    "Outside us" is judged from the BALANCE (``ErpBillReport.reduced_outside``):
+    anything that took the bill down beyond our own write-backs. Every other
+    combination is already consistent and changes nothing. The invoice is
+    row-locked before it is judged, like every status change.
+    """
+    invoice_id = await _matching_invoice_id(db, report, realm)
+    if invoice_id is None:
+        await db.rollback()
+        return SyncOutcome("unmatched")
+    invoice = await get_invoice_for_update(db, invoice_id)
+    status = invoice.status
+    detail = _bill_report_detail(report, erp_type, event_id)
+    action = "unchanged"
+
+    if report.state in (ErpBillState.open, ErpBillState.partially_paid, ErpBillState.deleted):
+        # Whatever else this report means, it is no longer a bill paid in full:
+        # a payment the ERP reported earlier, which FeohLedger could not record,
+        # must never be recorded now (decisions §319).
+        if await withdraw_erp_paid_reports(
+            db, invoice, erp_type=erp_type, erp_state=report.state.value
+        ):
+            action = "erp_payment_withdrawn"
+
+    if report.state is ErpBillState.paid and report.reduced_outside:
+        if report.settled_by_credit and status in PAYABLE_HERE | ERP_PAID_RECORDABLE:
+            # Settled in the ERP by a vendor credit (in whole or part), not by
+            # money leaving: never booked as a cash payment, but never payable
+            # here either until a person says what is owed. `sent_to_erp` is
+            # recordable but not payable, and must not fall through to the
+            # cash branch below (decisions §303, §399).
+            opened = await open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org.id,
+                exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+                finding=exception_finding("erp_credit_settlement"),
+                erp_report=detail,
+            )
+            action = "credit_settlement_flagged" if opened else action
+        elif (
+            status in ERP_PAID_RECORDABLE
+            and report.our_payment_applied
+            and report.paid_amount is None
+        ):
+            # Our own write-back is still on the bill while the invoice is
+            # payable here (voided here, and the ERP void did not land), and
+            # someone paid the rest outside us. No one payment states what
+            # left, so nothing is booked at FeohLedger's figure: a person
+            # reconciles it, and no run pays it meanwhile (§393).
+            opened = await open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org.id,
+                exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+                finding=exception_finding("erp_partly_paid_outside"),
+                erp_report=detail,
+            )
+            action = "partial_payment_flagged" if opened else action
+        elif status in ERP_PAID_RECORDABLE:
+            await record_erp_reported_payment(
+                db,
+                invoice,
+                org=org,
+                erp_type=erp_type,
+                erp_document_id=report.bill_id,
+                event_id=event_id,
+                paid_on=reported_paid_on(report.paid_on),
+                method=reported_payment_method(report.payment_method),
+                amount=report.paid_amount,
+                amount_currency=report.paid_currency,
+                payment_parts=report.payment_parts,
+            )
+            action = "paid_recorded"
+        elif status == InvoiceStatus.payment_scheduled:
+            opened = await open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org.id,
+                exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+                finding=exception_finding("erp_paid_while_scheduled"),
+                erp_report=detail,
+            )
+            action = "double_payment_flagged" if opened else action
+        elif (
+            status == InvoiceStatus.paid
+            and await _paid_through_feohledger(db, invoice.id)
+            and not await _credit_records_our_open_discount(db, invoice.id, report)
+        ):
+            # FeohLedger's own rail paid it (its write-back missing or
+            # refused) and a person settled it in the ERP too, by a payment or
+            # by a credit beyond the discount our write-back left open: the
+            # bill has been settled twice. A payment recorded as made OUTSIDE FeohLedger is
+            # most likely that same QuickBooks payment, so it is not flagged.
+            opened = await open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org.id,
+                finding=exception_finding("erp_paid_twice"),
+                erp_report=detail,
+            )
+            action = "double_payment_flagged" if opened else action
+    elif report.state is ErpBillState.partially_paid and report.reduced_outside:
+        if status in PAYABLE_HERE:
+            opened = await open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org.id,
+                exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+                finding=exception_finding("erp_partly_paid_outside"),
+                erp_report=detail,
+            )
+            action = "partial_payment_flagged" if opened else action
+    elif report.state is ErpBillState.open and status == InvoiceStatus.paid:
+        if await _paid_by_erp_report(db, invoice.id, report.bill_id):
+            opened = await open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org.id,
+                finding=exception_finding("erp_recorded_payment_withdrawn"),
+                erp_report=detail,
+            )
+            action = "unpaid_flagged" if opened else action
+    elif report.state is ErpBillState.deleted:
+        blocking = status in PAYABLE_HERE
+        opened = await open_erp_reconciliation_exception(
+            db,
+            invoice,
+            org_id=org.id,
+            exception_type=(
+                PAYMENT_RECONCILIATION_EXCEPTION_TYPE
+                if blocking
+                else ERP_RECONCILIATION_EXCEPTION_TYPE
+            ),
+            finding=exception_finding(
+                "erp_bill_deleted_blocking" if blocking else "erp_bill_deleted"
+            ),
+            erp_report=detail,
+        )
+        action = "deleted_flagged" if opened else action
+
+    await db.commit()
+    return SyncOutcome(action, invoice_id)
+
+
+async def _credit_records_our_open_discount(
+    db: AsyncSession, invoice_id: uuid.UUID, report: ErpBillReport
+) -> bool:
+    """Is the credit on this paid bill the discount our own write-back left open?
+
+    A Xero payment carries no discount, so a write-back of a discounted payment
+    leaves the discount due on the bill and flags it for the bookkeeper, who
+    records it there as a credit (§386). That credit moved no money twice, so
+    it is not "paid twice", but only when every fact says so:
+
+    * the bill was settled by credit, and nobody else's payment is on it;
+    * OUR write-back is on the bill (``our_payment_applied``). Without it, our
+      rail paid and the bill still showed the whole amount due, so a credit
+      for that amount is a second settlement of the same bill;
+    * what came off beyond our write-back (``reduced_outside_amount``) is no
+      more than the discount FeohLedger's own completed payments took, so the
+      credit can cover only the discount that was left open.
+
+    An adapter that does not state ``reduced_outside_amount`` never qualifies.
+    QuickBooks states ``our_payment_applied`` (§393) but never that amount (it
+    lists a credit as a $0 BillPayment anyway), so its rule is unchanged.
+    """
+    from app.services.external_payment import EXTERNAL_PAYMENT_PROVIDER
+
+    outside = report.reduced_outside_amount
+    if (
+        not report.settled_by_credit
+        or report.external_payment_ids
+        or not report.our_payment_applied
+        or outside is None
+    ):
+        return False
+    discount = (
+        await db.execute(
+            select(func.coalesce(func.sum(Payment.discount_amount), 0)).where(
+                Payment.invoice_id == invoice_id,
+                Payment.status == "completed",
+                Payment.provider.is_distinct_from(EXTERNAL_PAYMENT_PROVIDER),
+            )
+        )
+    ).scalar_one()
+    return outside <= Decimal(discount)
+
+
+async def _paid_through_feohledger(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
+    """Did a FeohLedger rail (not a payment recorded as made outside) pay it?"""
+    from app.services.external_payment import EXTERNAL_PAYMENT_PROVIDER
+
+    found = await db.execute(
+        select(func.count()).where(
+            Payment.invoice_id == invoice_id,
+            Payment.status == "completed",
+            Payment.provider.is_distinct_from(EXTERNAL_PAYMENT_PROVIDER),
+        )
+    )
+    return (found.scalar() or 0) > 0
+
+
+#: Dispatch refusals of :func:`erp_bill_dispatch_refusal` (decisions §296).
+#: All are made before any rail is called, so all are retry-safe
+#: (`payment_runs._RETRY_SAFE_FAILURE_PREFIXES`).
+ERP_BILL_NOT_OPEN = "erp_bill_not_open"
+ERP_BILL_UNVERIFIED = "erp_bill_unverified"
+#: The bill reads paid only by OUR OWN write-back, whose QuickBooks void is
+#: still pending after a FeohLedger void: nothing outside us paid it, so no
+#: person needs to clear anything — hold until the void lands.
+ERP_BILL_VOID_PENDING = "erp_bill_void_pending"
+#: The bill can never be read under this connection — the push named no
+#: document, recorded no company, or the company is not the one connected now
+#: (a sandbox → production switch). Held like the others, but a retry cannot
+#: clear it, so a non-blocking ``erp_reconciliation`` gives it an owner.
+ERP_BILL_UNLINKED = "erp_bill_unlinked"
+
+#: After a read fails for an org, its further dispatch checks hold without
+#: reading for this long: a degraded QuickBooks would otherwise cost every
+#: item of a long run the full timeout, with its invoice row locked each time.
+_UNREACHABLE_HOLD_SECONDS = 60.0
+_unreachable_until: dict[uuid.UUID, float] = {}
+
+
+def _org_unreachable(org_id: uuid.UUID) -> bool:
+    import time
+
+    until = _unreachable_until.get(org_id)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        _unreachable_until.pop(org_id, None)
+        return False
+    return True
+
+
+def _mark_unreachable(org_id: uuid.UUID) -> None:
+    import time
+
+    _unreachable_until[org_id] = time.monotonic() + _UNREACHABLE_HOLD_SECONDS
+
+
+async def _bounded_bill_report(adapter: ErpAdapter, bill_id: str) -> ErpBillReport:
+    """The bill, read within ``FEOH_ERP_DISPATCH_CHECK_TIMEOUT_SECONDS`` as a
+    whole (the bill and its payments together). A token refresh inside it is
+    safe to cut short: ``erp_oauth.get_access_token`` runs the rotation and
+    its persistence as one shielded task."""
+    bound = max(1.0, float(settings.erp_dispatch_check_timeout_seconds))
+    return await asyncio.wait_for(adapter.bill_report(bill_id), timeout=bound)
+
+
+def _connection_level(exc: BaseException) -> bool:
+    """Does this failure say QuickBooks (or our connection to it) is down, as
+    opposed to something about this one bill? Only those trip the org-wide
+    hold; a 400 on one bill must not hold every other item of the run."""
+    import httpx
+
+    from app.services import erp_oauth
+
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TransportError)):
+        return True
+    if isinstance(exc, (erp_oauth.ErpNotConnectedError, erp_oauth.ErpTokenRefreshError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and (status >= 500 or status in (401, 408, 429))
+
+
+async def erp_bill_dispatch_refusal(
+    db: AsyncSession,
+    *,
+    invoice: Invoice,
+    org: Organization,
+    payment: Payment | None = None,
+) -> str | None:
+    """Why money must not move for ``invoice`` now because of its ERP bill —
+    or None. Decisions §296.
+
+    Called immediately before money moves, with the invoice row locked:
+    ``api/payments._execute_single_payment`` after ``dispatch_preflight`` and
+    before the rail adapter (every rail dispatch: execute, resume,
+    retry-failed, a standalone payment, compliance release, the virtual-card
+    leg), the NACHA export, and ``POST /api/cards/generate`` before it mints.
+    ``dispatch_preflight`` already re-confirmed the LOCAL facts in that lock.
+    This adds the one fact no local row can know: whether the bill is still
+    unpaid IN QUICKBOOKS right now. A bill paid there seconds ago — after the
+    run was approved, or between two items of one run — has not reached us yet
+    by webhook or sweep, and paying it here pays it twice.
+
+    Only for an ERP whose bills sync back (``status_sync_active``) and an
+    invoice posted there. Then a live ``bill_report``, bounded overall by
+    ``FEOH_ERP_DISPATCH_CHECK_TIMEOUT_SECONDS``:
+
+    * **open** (nothing taken off it, by anyone) → None: pay.
+    * **taken down outside FeohLedger** (paid, part-paid, credited) or
+      **deleted**, or a state we cannot classify → ``erp_bill_not_open:<state>``,
+      and the payment-BLOCKING ``payment_reconciliation`` is opened in the
+      caller's transaction, so no later run or ``/retry-failed`` pays it until
+      a person clears it.
+    * **paid only by our own write-back** (a FeohLedger void whose QuickBooks
+      void is still pending) → ``erp_bill_void_pending``: held, no exception —
+      the pending-void sweep resolves it, and nothing outside us paid it.
+    * **unverifiable right now** — the read failed or timed out (and, after a
+      connection-level failure, every check of that org for a minute without
+      reading) → ``erp_bill_unverified``: HELD, never paid blind. No
+      exception: nothing is known to be wrong, and ``/retry-failed`` re-checks.
+    * **unreadable for good** under this connection — the push named no
+      document, recorded no company, or the bill is in a company other than
+      the one connected now → ``erp_bill_unlinked:<why>``: held, with a
+      non-blocking ``erp_reconciliation`` so the way out (record it as paid
+      outside, or re-post) has an owner.
+
+    Idempotent: a read, plus a de-duplicated exception. Never commits.
+    :func:`erp_bill_dispatch_refusals` is the same check over many invoices
+    with the reads made concurrently.
+    """
+    pending = await _bill_to_read(db, invoice=invoice, org=org, payment=payment)
+    if not isinstance(pending, _BillRead):
+        return pending
+    report = await _read_bill(pending, org.id)
+    return await _verdict_from_report(db, pending, report, org_id=org.id)
+
+
+async def erp_bill_dispatch_refusals(
+    db: AsyncSession,
+    items: Sequence[tuple[Invoice, Payment | None]],
+    *,
+    org: Organization,
+    concurrency: int | None = None,
+) -> list[str | None]:
+    """:func:`erp_bill_dispatch_refusal` for each ``(invoice, payment)`` of
+    ``items``, in order — the verdicts are the same; only the reads overlap.
+
+    For a caller holding MANY invoice locks at once (the NACHA export and its
+    verify step, decisions §362): read one after another, a file of 200 bills
+    held the run and every invoice lock for minutes. The database work — what
+    to read, and the exception a verdict opens — stays sequential on the one
+    session (an ``AsyncSession`` is not safe to share between tasks); only the
+    ERP reads run together, at most ``concurrency`` at a time
+    (``FEOH_ERP_DISPATCH_CHECK_CONCURRENCY``), each still bounded by
+    ``FEOH_ERP_DISPATCH_CHECK_TIMEOUT_SECONDS``. The org-wide "unreachable"
+    hold is checked as each read starts, so a connection-level failure stops
+    the reads not yet started; the ones already in flight finish or time out.
+    """
+    bound = max(1, int(concurrency or settings.erp_dispatch_check_concurrency))
+    staged = [
+        await _bill_to_read(db, invoice=invoice, org=org, payment=payment)
+        for invoice, payment in items
+    ]
+    gate = asyncio.Semaphore(bound)
+
+    async def _one(item: _BillRead) -> ErpBillReport | None:
+        async with gate:
+            return await _read_bill(item, org.id)
+
+    reads = [_one(x) for x in staged if isinstance(x, _BillRead)]
+    reports = iter(await asyncio.gather(*reads))
+    verdicts: list[str | None] = []
+    for x in staged:
+        if isinstance(x, _BillRead):
+            verdicts.append(await _verdict_from_report(db, x, next(reports), org_id=org.id))
+        else:
+            verdicts.append(x)
+    return verdicts
+
+
+@dataclass
+class _BillRead:
+    """A bill :func:`_bill_to_read` decided must be read live."""
+
+    invoice: Invoice
+    payment: Payment | None
+    adapter: ErpAdapter
+    erp_config: dict
+    bill_id: str
+    state: dict
+
+
+async def _bill_to_read(
+    db: AsyncSession,
+    *,
+    invoice: Invoice,
+    org: Organization,
+    payment: Payment | None,
+) -> _BillRead | str | None:
+    """The database half before the read: no bill to check (``None``), a
+    verdict reached without reading (a refusal string — opening the unlinked
+    exception here), or the :class:`_BillRead` to read."""
+    from app.services.erp_link_realm import connection_realm
+
+    erp_config = (org.settings or {}).get("erp")
+    if not status_sync_active(erp_config):
+        return None
+    state = (
+        await db.execute(
+            select(WorkflowInstance.state_data).where(WorkflowInstance.invoice_id == invoice.id)
+        )
+    ).scalar_one_or_none() or {}
+    bill_id = str(state.get("erp_reference") or "")
+    if not bill_id:
+        return None  # never posted to the ERP: no bill there to pay twice
+    recorded_realm = state.get("erp_realm")
+    unlinked = None
+    if bill_id == "UNKNOWN":
+        unlinked = "no_document"  # the push confirmed without naming its bill
+    elif not recorded_realm:
+        unlinked = "no_company"  # the push recorded no company
+    elif recorded_realm != connection_realm(erp_config):
+        unlinked = "other_company"  # e.g. pushed to the sandbox, now on production
+    if unlinked is not None:
+        # A bill may exist that we cannot find or read under this connection,
+        # and no retry changes that: hold, and give it an owner.
+        await open_erp_reconciliation_exception(
+            db,
+            invoice,
+            org_id=org.id,
+            finding=exception_finding(f"erp_bill_unlinked_{unlinked}"),
+            erp_report={
+                "kind": ERP_REPORT_BILL_UNLINKED,
+                "erp_type": erp_config.get("type"),
+                "erp_document_id": bill_id,
+                "unlinked": unlinked,
+            },
+        )
+        return f"{ERP_BILL_UNLINKED}:{unlinked}"
+    adapter = _adapter_or_none(erp_config)
+    if adapter is None:
+        return ERP_BILL_UNVERIFIED
+    return _BillRead(
+        invoice=invoice,
+        payment=payment,
+        adapter=adapter,
+        erp_config=erp_config,
+        bill_id=bill_id,
+        state=state,
+    )
+
+
+async def _read_bill(item: _BillRead, org_id: uuid.UUID) -> ErpBillReport | None:
+    """The live read, with no database access (so several can run at once);
+    ``None`` when the bill cannot be vouched for right now."""
+    if _org_unreachable(org_id):
+        return None
+    subject = item.payment.id if item.payment is not None else item.invoice.id
+    try:
+        return await _bounded_bill_report(item.adapter, item.bill_id)
+    except Exception as exc:  # noqa: BLE001 — any failure to read is "unknown", never "open"
+        if _connection_level(exc):
+            _mark_unreachable(org_id)
+        logger.warning(
+            "[erp-dispatch-check] bill for %s unverified: %s", subject, exc.__class__.__name__
+        )
+        return None
+
+
+async def _verdict_from_report(
+    db: AsyncSession,
+    item: _BillRead,
+    report: ErpBillReport | None,
+    *,
+    org_id: uuid.UUID,
+) -> str | None:
+    """The database half after the read: the verdict, opening the blocking
+    ``payment_reconciliation`` for a bill no longer open."""
+    if report is None:
+        return ERP_BILL_UNVERIFIED
+    if report.state is ErpBillState.open and not report.reduced_outside:
+        return None
+    if (
+        report.state in (ErpBillState.paid, ErpBillState.partially_paid)
+        and not report.reduced_outside
+        and item.state.get("erp_payment_voids_pending")
+    ):
+        # Paid only by our own write-back, whose void a FeohLedger void has
+        # recorded and the sweep has not yet finished: nothing outside us paid
+        # it. Without a pending void, "paid only by us" is unexplained and
+        # falls through to the blocking flag below.
+        return ERP_BILL_VOID_PENDING
+    await open_erp_reconciliation_exception(
+        db,
+        item.invoice,
+        org_id=org_id,
+        exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        finding=exception_finding(
+            "erp_dispatch_stopped_"
+            + (
+                report.state.value
+                if report.state
+                in (ErpBillState.paid, ErpBillState.partially_paid, ErpBillState.deleted)
+                else "unconfirmed"
+            )
+        ),
+        erp_report={
+            "kind": ERP_REPORT_DISPATCH_STOPPED,
+            "erp_type": item.erp_config.get("type"),
+            "erp_document_id": item.bill_id,
+            "bill_state": report.state.value,
+            "payment_id": str(item.payment.id) if item.payment is not None else None,
+        },
+    )
+    return f"{ERP_BILL_NOT_OPEN}:{report.state.value}"
+
+
+async def flag_void_of_erp_reported_payment(
+    db: AsyncSession, *, invoice: Invoice, payment: Payment, org_id: uuid.UUID
+) -> bool:
+    """Called by ``POST /api/payments/{id}/void`` in its own transaction.
+
+    Voiding a payment the ERP REPORTED (``provider = external``, its reference
+    the bill the invoice was posted as) sends the invoice back to ``approved``
+    and payable — while the ERP still shows the bill paid, and nothing about
+    the bill changes, so no webhook or sweep would ever say so again. The next
+    run would pay it a second time. So the void opens the payment-blocking
+    ``payment_reconciliation`` with it: a person confirms the ERP's payment is
+    really undone before FeohLedger pays. Returns whether one was opened.
+    """
+    from app.services.external_payment import EXTERNAL_PAYMENT_PROVIDER
+
+    if payment.provider != EXTERNAL_PAYMENT_PROVIDER:
+        return False
+    state = (
+        await db.execute(
+            select(WorkflowInstance.state_data).where(WorkflowInstance.invoice_id == invoice.id)
+        )
+    ).scalar_one_or_none()
+    bill_id = str((state or {}).get("erp_reference") or "")
+    if not bill_id or (payment.reference or "") != bill_id[:255]:
+        return False
+    return await open_erp_reconciliation_exception(
+        db,
+        invoice,
+        org_id=org_id,
+        exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        finding=exception_finding("erp_reported_payment_voided"),
+        erp_report={
+            "kind": ERP_REPORT_PAYMENT_VOIDED,
+            "erp_document_id": bill_id,
+            "payment_id": str(payment.id),
+        },
+    )
+
+
+async def _paid_by_erp_report(db: AsyncSession, invoice_id: uuid.UUID, bill_id: str) -> bool:
+    """Did an ERP report (not a FeohLedger payment) pay this invoice?"""
+    from app.services.external_payment import EXTERNAL_PAYMENT_PROVIDER
+
+    found = await db.execute(
+        select(func.count()).where(
+            Payment.invoice_id == invoice_id,
+            Payment.status == "completed",
+            Payment.provider == EXTERNAL_PAYMENT_PROVIDER,
+            Payment.reference == str(bill_id)[:255],
+        )
+    )
+    return (found.scalar() or 0) > 0
+
+
+async def org_for_company(provider: str, company_id: str) -> Organization | None:
+    """The tenant connected to ``provider``'s company ``company_id``.
+
+    Served by the control-plane unique index on the OAuth block's
+    ``(provider, external_tenant_id)`` (migration 0117), which is also what
+    guarantees at most one tenant per company. The org must still be on that
+    ERP: the OAuth block survives a switch of ERP type, and a tenant that has
+    moved to another ERP is not synced.
+    """
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key
+
+    oauth = Organization.settings["erp"]["oauth"]
+    async with control_session_factory() as ctrl:
+        org = (
+            await ctrl.execute(
+                select(Organization).where(
+                    oauth["provider"].astext == provider,
+                    oauth["external_tenant_id"].astext == str(company_id),
+                )
+            )
+        ).scalar_one_or_none()
+    if org is None:
+        return None
+    erp = (org.settings or {}).get("erp")
+    if not isinstance(erp, dict) or resolve_adapter_key(erp) != provider:
+        return None
+    return org
+
+
+async def _resolved_erp(org: Organization) -> dict | None:
+    from app.services.provider_credentials import provider_config
+
+    async with control_session_factory() as ctrl:
+        return await provider_config(org, "erp", db=ctrl) or None
+
+
+async def _bills_we_posted(
+    factory, bill_ids: list[str], realm: str | None, *, by_reference: bool = False
+) -> list[str]:
+    """The bills of ``bill_ids`` some invoice here was pushed as, under
+    ``realm`` (or before realms were recorded), in their order.
+
+    ``by_reference`` is for an adapter whose bills are matched by their id
+    within the recorded realm (``ErpAdapter.bills_match_by_reference``, Xero):
+    there a push that recorded no realm, or a pass with none, can never match
+    (`_matching_invoice_id`), so such a bill is not read either.
+
+    A change feed lists every bill the company changed, most of them keyed in
+    the ERP by hand. Reading those back spends the ERP's API allowance (Xero
+    meters a day's calls per organisation) on bills ``apply_bill_report``
+    could only answer "unmatched" for, so they are not read at all: a bill no
+    invoice names as its ``erp_reference`` matches nothing whatever its state.
+    """
+    if not bill_ids:
+        return []
+    reference = WorkflowInstance.state_data["erp_reference"].astext
+    recorded = WorkflowInstance.state_data["erp_realm"].astext
+    query = select(reference).where(reference.in_(bill_ids))
+    if by_reference:
+        if not realm:
+            return []
+        query = query.where(recorded == realm)
+    elif realm:
+        query = query.where(or_(recorded == realm, recorded.is_(None)))
+    async with factory() as db:
+        ours = {str(r) for r in (await db.execute(query)).scalars() if r}
+    return [b for b in bill_ids if b in ours]
+
+
+async def sync_bills(org: Organization, bill_ids: list[str], *, event_id: str | None) -> int:
+    """Read each bill back and apply it to the tenant. Returns how many changed
+    something. Raises on a failed read (the caller decides what that means)."""
+    from app.services.erp_link_realm import connection_realm
+
+    erp_config = await _resolved_erp(org)
+    adapter = _adapter_or_none(erp_config or {})
+    if adapter is None or not adapter.supports_status_sync:
+        return 0
+    realm = connection_realm(erp_config)
+    factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
+    changed = 0
+    for bill_id in await _bills_we_posted(
+        factory,
+        list(dict.fromkeys(bill_ids)),
+        realm,
+        by_reference=adapter.bills_match_by_reference,
+    ):
+        report = await adapter.bill_report(bill_id)
+        async with factory() as db:
+            outcome = await apply_bill_report(
+                db,
+                org=org,
+                report=report,
+                realm=realm,
+                erp_type=adapter.erp_type,
+                event_id=event_id,
+            )
+        if outcome.action not in ("unmatched", "unchanged"):
+            changed += 1
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# QuickBooks CloudEvents webhooks
+# ---------------------------------------------------------------------------
+
+#: ``qbo.<entity>.<operation>.v<n>`` — the CloudEvents ``type`` Intuit sends.
+_QBO_EVENT_TYPE = re.compile(r"^qbo\.([a-z]+)\.([a-z]+)\.v\d+$")
+_QBO_DEDUP_PROVIDER = "erp:quickbooks_online"
+
+
+@dataclass(frozen=True)
+class QboEvent:
+    event_id: str
+    company_id: str
+    entity: str
+    entity_id: str
+
+
+def parse_qbo_events(body: object) -> list[QboEvent]:
+    """The bill and bill-payment events in an Intuit CloudEvents delivery.
+
+    The body is a JSON array of CloudEvents (one object is accepted too). An
+    event with no id, company (``intuitaccountid``) or entity id
+    (``intuitentityid``), or about another entity, is dropped. Nothing else is
+    read from the event: its ``data`` is never trusted, the bill is read back.
+    """
+    events = body if isinstance(body, list) else [body]
+    out: list[QboEvent] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        match = _QBO_EVENT_TYPE.match(str(event.get("type") or "").lower())
+        if not match or match.group(1) not in ("bill", "billpayment"):
+            continue
+        event_id = str(event.get("id") or "").strip()
+        company = str(event.get("intuitaccountid") or "").strip()
+        entity_id = str(event.get("intuitentityid") or "").strip()
+        if not (event_id and company and entity_id) or max(map(len, (event_id, company))) > 128:
+            continue
+        out.append(QboEvent(event_id, company, match.group(1), entity_id[:64]))
+    return out
+
+
+async def process_qbo_event(event: QboEvent) -> None:
+    """Apply one event. Raises on our own failure (the caller releases its
+    dedup claim; Intuit already has its 204, so the CDC sweep is what
+    reprocesses the change).
+
+    Every refusal is a decision, not a failure, and does nothing: a company no
+    tenant is connected to (or whose tenant has moved to another ERP), and a
+    tenant the sweep itself would skip (status sync off, a connection that
+    needs reconnecting): :func:`status_sync_now_refusal`, the one rule the
+    sweep, the on-request pass and both ERP webhooks share (§392). With status
+    sync off a confirmed push closes the invoice at ``done``, and nothing may
+    then act on its bill."""
+    org = await org_for_company(QBO_PROVIDER, event.company_id)
+    if org is None:
+        return
+    if await status_sync_now_refusal(org) is not None:
+        # A decision, so the claim stands: the sweep reads the change when the
+        # tenant is synced again (its mark has not moved past it).
+        return
+    if event.entity == "billpayment":
+        adapter = _adapter_or_none(await _resolved_erp(org) or {})
+        if adapter is None:
+            return
+        bill_ids = await adapter.bills_for_payment(event.entity_id)
+    else:
+        bill_ids = [event.entity_id]
+    if bill_ids:
+        await sync_bills(org, bill_ids, event_id=event.event_id)
+
+
+async def claim_qbo_events(events: list[QboEvent]) -> list[QboEvent]:
+    """The events not seen before, each claimed by its event id
+    (``is_event_already_processed``, dedupe per the webhook invariant). Called
+    by the route BEFORE it answers, so a Redis failure raises there and becomes
+    a 503 that makes Intuit redeliver, instead of a 2xx for unclaimed work."""
+    from app.services.webhook_security import is_event_already_processed, release_event_claim
+
+    fresh: list[QboEvent] = []
+    try:
+        for event in events:
+            if not await is_event_already_processed(_QBO_DEDUP_PROVIDER, event.event_id):
+                fresh.append(event)
+    except Exception:
+        # The route answers 503 and dispatches nothing, so the claims already
+        # made here guard no work: released, Intuit's redelivery is not deduped
+        # away (best effort; the CDC sweep is the backstop if a release fails).
+        for event in fresh:
+            await release_event_claim(_QBO_DEDUP_PROVIDER, event.event_id)
+        raise
+    return fresh
+
+
+async def process_qbo_events(events: list[QboEvent]) -> int:
+    """Apply each claimed event. Returns how many failed; a failed event's
+    claim is released (Intuit already has its 204: the CDC sweep is what picks
+    the change up again). Never raises."""
+    from app.services.webhook_security import release_event_claim
+
+    failures = 0
+    for event in events:
+        try:
+            await process_qbo_event(event)
+        except Exception as exc:  # noqa: BLE001 — one event never stops the rest
+            failures += 1
+            await release_event_claim(_QBO_DEDUP_PROVIDER, event.event_id)
+            logger.warning(
+                "[qbo-webhook] event for company %s failed: %s",
+                event.company_id,
+                exc.__class__.__name__,
+            )
+    return failures
+
+
+#: Strong references to in-flight webhook tasks (asyncio holds only a weak one).
+_webhook_tasks: set[asyncio.Task] = set()
+
+
+def dispatch_qbo_events(events: list[QboEvent]) -> None:
+    """Process a verified delivery after the response has gone back.
+
+    Intuit expects its webhook answered within seconds, and each event costs
+    one to three reads of the company, so the work runs as a task on the
+    request's own loop (the ``payment_erp_sync`` shape — pure-await I/O). A
+    failure releases its dedup claim; the change-data-capture sweep is what
+    guarantees the change still arrives.
+    """
+    if not events:
+        return
+    task = asyncio.create_task(process_qbo_events(events), name="qbo-webhook")
+    _webhook_tasks.add(task)
+    task.add_done_callback(_webhook_tasks.discard)
+
+
+# ---------------------------------------------------------------------------
+# The change-data-capture sweep (the backstop)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StatusSyncResult:
+    orgs_scanned: int = 0
+    bills_read: int = 0
+    invoices_changed: int = 0
+    #: Passes that read back every payable bill (no mark, a gap past CDC's
+    #: reach, or a CDC answer too full to trust).
+    full_reconciliations: int = 0
+    #: Payment voids still waiting to be voided in the ERP after this pass.
+    voids_pending: int = 0
+    failures: int = 0
+
+
+#: ``settings.erp.oauth`` key: the start of this connection's last COMPLETE
+#: sweep pass. The next pass reads changes from there (or the lookback window,
+#: whichever is earlier), so a sweep that was off, failing or skipped for days
+#: still sees every change it missed — CDC's 30 days permitting.
+SYNCED_THROUGH_KEY = "status_sync_through"
+#: Intuit's change-data-capture answers changes up to 30 days old; a day of
+#: margin keeps a window from starting past its reach.
+_CDC_REACH = timedelta(days=29)
+
+
+async def _open_bill_ids(org: Organization, realm: str | None) -> list[str]:
+    """Every bill still payable here that was posted to ``realm``: what a full
+    reconciliation reads back when CDC cannot prove it saw every change."""
+    if not realm:
+        return []
+    factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
+    async with factory() as db:
+        rows = await db.execute(
+            select(WorkflowInstance.state_data["erp_reference"].astext)
+            .join(Invoice, Invoice.id == WorkflowInstance.invoice_id)
+            .where(
+                Invoice.status.in_(tuple(PAYABLE_HERE)),
+                WorkflowInstance.state_data["erp_realm"].astext == realm,
+                WorkflowInstance.state_data["erp_reference"].astext.isnot(None),
+            )
+        )
+        return [str(r) for r in rows.scalars() if r]
+
+
+async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult) -> None:
+    """One connected company's pass. Raises on our own failure; the high-water
+    mark moves only when the whole pass went through."""
+    from app.services.erp_adapters.base import ErpListingIncomplete, ErpScopeMissing
+    from app.services.erp_link_realm import connection_realm
+    from app.services.erp_oauth import (
+        SCOPE_GAPS_KEY,
+        parse_timestamp,
+        scope_gaps,
+        update_connection_metadata,
+    )
+    from app.services.erp_payment_writeback import resume_pending_voids
+
+    oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
+    erp_config = await _resolved_erp(org)
+    adapter = _adapter_or_none(erp_config or {})
+    if adapter is None or not adapter.supports_status_sync:
+        return
+    hours = max(1, min(int(settings.erp_status_sync_lookback_hours), 24 * 30))
+    since = now - timedelta(hours=hours)
+    mark = parse_timestamp(oauth_meta.get(SYNCED_THROUGH_KEY))
+    # No mark (a first pass, or a new connection after a reconnect), or one
+    # older than CDC can reach: CDC alone cannot prove nothing was missed.
+    full = mark is None or mark < now - _CDC_REACH
+    if mark is not None:
+        since = min(since, mark)
+    since = max(since, now - _CDC_REACH)
+    provider = str(oauth_meta.get("provider") or adapter.erp_type)
+    connection_id = str(oauth_meta.get("connection_id") or "")
+    try:
+        bill_ids = await adapter.changed_bills(since)
+    except ErpListingIncomplete:
+        bill_ids, full = [], True  # more changes than one CDC answer holds
+    except ErpScopeMissing as exc:
+        # The consent does not cover one of the change listings (a Xero
+        # connection made before `accounting.payments`, decisions §415).
+        # Recorded on the connection, where `/status` and the ERP panel show
+        # it and the adapter reads it to stop asking; a reconnect mints a new
+        # block without it. This one pass still reads every payable bill, as
+        # every pass before the gap was recorded did, so nothing the missing
+        # listing would have named since the mark is lost in the switch.
+        await update_connection_metadata(
+            provider,
+            org.id,
+            connection_id,
+            {SCOPE_GAPS_KEY: sorted({*scope_gaps(oauth_meta), exc.code})},
+        )
+        bill_ids, full = exc.bill_ids, True
+    if full:
+        result.full_reconciliations += 1
+        bill_ids = [*bill_ids, *await _open_bill_ids(org, connection_realm(erp_config))]
+    result.bills_read += len(set(bill_ids))
+    if bill_ids:
+        result.invoices_changed += await sync_bills(org, bill_ids, event_id=None)
+    result.voids_pending += await resume_pending_voids(org)
+    await update_connection_metadata(
+        provider, org.id, connection_id, {SYNCED_THROUGH_KEY: now.isoformat()}
+    )
+
+
+async def run_status_sync_once(*, now: datetime | None = None) -> StatusSyncResult:
+    """One pass over every tenant connected to an ERP whose bills sync back
+    (QuickBooks Online, Xero — ``status_sync_adapter_keys``): ask its company
+    for the bills and bill payments changed since its last complete pass (at
+    least the lookback window) and apply each bill; read back every
+    still-payable bill when the change feed cannot vouch for the gap.
+    Re-applying a report changes nothing. One tenant's failure never stops the
+    others."""
+    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+
+    result = StatusSyncResult()
+    if not settings.erp_status_sync_enabled:
+        return result
+    moment = now or datetime.now(UTC)
+    oauth = Organization.settings["erp"]["oauth"]
+    async with control_session_factory() as ctrl:
+        orgs = (
+            (
+                await ctrl.execute(
+                    select(Organization).where(
+                        oauth["provider"].astext.in_(status_sync_adapter_keys())
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for org in orgs:
+        oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
+        if oauth_meta.get("needs_reconnect"):
+            # Nothing to read with; the connection-health notice tells the
+            # admins, and the reconnect starts a new connection with no mark,
+            # so its first pass reads back every payable bill.
+            continue
+        result.orgs_scanned += 1
+        try:
+            await sync_org(org, now=moment, result=result)
+        except Exception as exc:  # noqa: BLE001 — one tenant must not halt the sweep
+            result.failures += 1
+            logger.warning("[erp-status-sync] org %s failed: %s", org.id, exc.__class__.__name__)
+    if result.invoices_changed or result.failures:
+        logger.info(
+            "[erp-status-sync] %d org(s), %d bill(s) read, %d invoice(s) changed, %d failed",
+            result.orgs_scanned,
+            result.bills_read,
+            result.invoices_changed,
+            result.failures,
+        )
+    return result
+
+
+#: Why an admin's on-request pass cannot run (``POST
+#: /api/organization/erp/oauth/status-sync`` answers 409 with the code).
+STATUS_SYNC_OFF = "status_sync_off"
+STATUS_SYNC_UNSUPPORTED = "status_sync_unsupported"
+STATUS_SYNC_NEEDS_RECONNECT = "status_sync_needs_reconnect"
+
+
+async def status_sync_now_refusal(org: Organization) -> str | None:
+    """Why this tenant cannot run a status-sync pass on request, or None.
+
+    The same conditions the sweep skips a tenant on: status sync off, an ERP
+    whose bills do not report back (or a tenant that has switched away from
+    the one it connected), a connection that needs reconnecting."""
+    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+
+    if not settings.erp_status_sync_enabled:
+        return STATUS_SYNC_OFF
+    oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
+    if oauth_meta.get("provider") not in status_sync_adapter_keys():
+        return STATUS_SYNC_UNSUPPORTED
+    if oauth_meta.get("needs_reconnect"):
+        return STATUS_SYNC_NEEDS_RECONNECT
+    adapter = _adapter_or_none(await _resolved_erp(org) or {})
+    if adapter is None or not adapter.supports_status_sync:
+        return STATUS_SYNC_UNSUPPORTED
+    return None
+
+
+async def sync_org_now(org: Organization, *, now: datetime | None = None) -> StatusSyncResult:
+    """The sweep's pass for ONE tenant ("a bill was just paid in the ERP;
+    bring it in now" rather than at the next tick).
+
+    Exactly :func:`sync_org`, so it is as safe beside the sweep as two sweep
+    ticks are: every report is applied under the invoice row lock and
+    re-applying one changes nothing, and each pass moves the high-water mark
+    only to its own start, after it completed (a slower pass finishing later
+    can only move it back, which re-reads more, never less). Raises on a
+    failed read; the caller checks :func:`status_sync_now_refusal` first."""
+    result = StatusSyncResult(orgs_scanned=1)
+    await sync_org(org, now=now or datetime.now(UTC), result=result)
+    return result
+
+
+#: Orgs with an on-request pass running in this process, and the tasks
+#: themselves (asyncio holds only a weak reference to a task).
+_now_running: set[uuid.UUID] = set()
+_now_tasks: set[asyncio.Task] = set()
+#: The cross-worker claim on a tenant's on-request pass (Redis), and how long
+#: it holds if the process dies mid-pass without releasing it.
+_NOW_LOCK_PREFIX = "erpstatussync:now:"
+_NOW_LOCK_SECONDS = 15 * 60
+
+
+async def _release_now_lock(org_id: uuid.UUID) -> None:
+    from app.redis import get_redis
+
+    try:
+        await (await get_redis()).delete(f"{_NOW_LOCK_PREFIX}{org_id}")
+    except Exception as exc:  # noqa: BLE001 — the claim expires on its own
+        logger.warning("[erp-status-sync] could not release the claim: %s", type(exc).__name__)
+
+
+async def _sync_org_now_task(org_id: uuid.UUID, actor_id: uuid.UUID | None) -> None:
+    """Run :func:`sync_org_now` for an admin's request, after the response.
+    Never raises: every outcome is audited (``organization.erp_status_synced``)
+    and logged, and the sweep's next tick reads the same changes again after a
+    failed pass (its mark has not moved)."""
+    from app.services.audit_dispatch import dispatch_auth_audit
+
+    details: dict[str, object] = {}
+    try:
+        async with control_session_factory() as ctrl:
+            org = await ctrl.get(Organization, org_id)
+        if org is None:
+            details["outcome"] = "refused"
+        else:
+            details["provider"] = (((org.settings or {}).get("erp") or {}).get("oauth") or {}).get(
+                "provider"
+            )
+            refused = await status_sync_now_refusal(org)
+            if refused is not None:
+                # Changed between the request and the task: nothing to read with.
+                details.update(outcome="refused", refusal=refused)
+            else:
+                result = await sync_org_now(org)
+                details.update(
+                    outcome="completed",
+                    bills_read=result.bills_read,
+                    invoices_changed=result.invoices_changed,
+                    full_reconciliation=bool(result.full_reconciliations),
+                )
+    except Exception as exc:  # noqa: BLE001 — a failed read is the ERP's answer
+        details.update(outcome="failed", error=exc.__class__.__name__)
+        logger.warning(
+            "[erp-status-sync] on-request pass for org %s failed: %s",
+            org_id,
+            exc.__class__.__name__,
+        )
+    finally:
+        _now_running.discard(org_id)
+        await _release_now_lock(org_id)
+    try:
+        await dispatch_auth_audit(
+            organization_id=org_id,
+            actor_id=actor_id,
+            action="organization.erp_status_synced",
+            entity_id=org_id,
+            entity_type="organization",
+            details=details,
+        )
+    except Exception as exc:  # noqa: BLE001 — the request itself was audited first
+        logger.warning(
+            "[erp-status-sync] outcome audit for org %s failed: %s", org_id, exc.__class__.__name__
+        )
+
+
+async def dispatch_sync_org_now(org_id: uuid.UUID, *, actor_id: uuid.UUID | None) -> bool:
+    """Start an on-request pass for one tenant, off the request (the
+    ``dispatch_qbo_events`` shape): a full reconciliation reads every payable
+    bill, which at Xero's 60 calls a minute outlasts any HTTP timeout.
+
+    False when one is already running for this tenant, on this worker or (by a
+    Redis claim) on any other: a second pass would read the same changes and
+    spend the ERP's API allowance twice. A Redis that cannot be reached falls
+    back to this worker's own check; a second pass is then only as costly as
+    two sweep ticks, never unsafe."""
+    from app.redis import get_redis
+
+    if org_id in _now_running:
+        return False
+    try:
+        claimed = await (await get_redis()).set(
+            f"{_NOW_LOCK_PREFIX}{org_id}", "1", nx=True, ex=_NOW_LOCK_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        logger.warning("[erp-status-sync] claim unavailable: %s", type(exc).__name__)
+        claimed = True
+    if not claimed:
+        return False
+    _now_running.add(org_id)
+    task = asyncio.create_task(_sync_org_now_task(org_id, actor_id), name="erp-status-sync-now")
+    _now_tasks.add(task)
+    task.add_done_callback(_now_tasks.discard)
+    return True
+
+
+async def run_status_sync_loop() -> None:
+    """Long-lived loop started in ``main.lifespan``; body is the shared runner."""
+    from app.services.sweep_health import SWEEP_ERP_STATUS_SYNC, run_sweep_loop
+
+    await run_sweep_loop(
+        SWEEP_ERP_STATUS_SYNC,
+        lambda: run_status_sync_once(),
+        interval_seconds=settings.erp_status_sync_interval_seconds,
+        log=logger,
+        log_prefix="[erp-status-sync]",
+    )

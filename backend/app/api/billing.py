@@ -17,6 +17,7 @@ surface where exactness is the point. See ``backend/docs/billing.md``.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -27,12 +28,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.deps import ROLE_ADMIN, ROLE_CFO, require_roles
+from app.api.refusals import coded_refusal
 from app.config import settings
 from app.database import get_control_db
 from app.models.billing import Plan
 from app.models.organization import Organization
 from app.models.user import User
-from app.schemas.money import OptionalExactMoneyInput
+from app.schemas.money import ExactMoneyInput, OptionalExactMoneyInput
 from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.billing import (
     PlanChangeError,
@@ -49,8 +51,99 @@ from app.services.billing.ai_invoice_meter import (
     parse_spend_cap,
     summarize,
 )
+from app.services.billing.plan_preview import (
+    STALE_QUOTE,
+    PlanChangeQuote,
+    preview_plan_change,
+)
+from app.services.billing.provider_sync import ProviderLegRefused
+from app.services.billing.scheduled_downgrade import (
+    ALREADY_DUE,
+    keep_current_plan,
+    pending_plan_view,
+)
 from app.services.billing_adapters import get_billing_adapter
+from app.services.billing_adapters.base import (
+    BillingNotConfigured,
+    BillingPaymentDeclined,
+    BillingProviderError,
+    SetupIntentRejected,
+)
 from app.tenant import get_tenant, get_tenant_db, lock_organization
+
+logger = logging.getLogger(__name__)
+
+#: The 502 a billing read answers when the provider is configured but the call
+#: failed. Distinct from "not configured", which is the empty / `configured=false`
+#: shape: an outage reported as "no saved cards" or "no receipts" is a wrong
+#: answer an admin acts on (adds a second card), not a safe default.
+BILLING_PROVIDER_UNAVAILABLE = "billing_provider_unavailable"
+BILLING_PROVIDER_UNAVAILABLE_DETAIL = coded_refusal(
+    BILLING_PROVIDER_UNAVAILABLE, "Billing provider is unavailable; please retry."
+)
+
+
+#: Coded refusals of the live plan change and card adoption (decisions §480),
+#: by code: (HTTP status, English fallback). The SPA localizes each by its code
+#: (`frontend/src/lib/api/codedRefusals.ts`) and acts on two of them — it sends
+#: `payment_method_required` and `billing_payment_declined` to the add-card flow.
+BILLING_REFUSALS: dict[str, tuple[int, str]] = {
+    "payment_method_required": (
+        status.HTTP_409_CONFLICT,
+        "Add a card before moving to a paid plan.",
+    ),
+    "billing_payment_declined": (
+        status.HTTP_402_PAYMENT_REQUIRED,
+        "The card on file was declined, so the plan was not changed. "
+        "Update the card and try again.",
+    ),
+    "billing_not_configured": (
+        status.HTTP_409_CONFLICT,
+        "Paid plans are not available yet: billing is not configured.",
+    ),
+    "plan_change_in_progress": (
+        status.HTTP_409_CONFLICT,
+        "Another plan change is in progress. Try again in a minute.",
+    ),
+    ALREADY_DUE: (
+        status.HTTP_409_CONFLICT,
+        "Your move to the new plan has already taken effect, so it can no longer be undone.",
+    ),
+    STALE_QUOTE: (
+        status.HTTP_409_CONFLICT,
+        "The price you confirmed is out of date, so nothing was charged. "
+        "Review the new amount and confirm again.",
+    ),
+    "setup_intent_not_found": (status.HTTP_404_NOT_FOUND, "That card setup was not found."),
+    "setup_intent_incomplete": (
+        status.HTTP_409_CONFLICT,
+        "The card has not been confirmed yet.",
+    ),
+}
+
+
+def _billing_refusal(code: str) -> HTTPException:
+    http_status, message = BILLING_REFUSALS[code]
+    return HTTPException(status_code=http_status, detail=coded_refusal(code, message))
+
+
+def _provider_unavailable(op: str, exc: Exception) -> HTTPException:
+    """Log a failed billing-provider call and build its 502.
+
+    Logged by exception CLASS, never the message (a provider error can carry
+    customer detail), plus a ``BillingProviderError``'s ``diagnostic``: the
+    provider's validated machine identifiers (error code / param, request id),
+    without which a provider 400 cannot be diagnosed from our own logs.
+    """
+    diagnostic = getattr(exc, "diagnostic", "") if isinstance(exc, BillingProviderError) else ""
+    if diagnostic:
+        logger.warning("billing %s failed: %s (%s)", op, type(exc).__name__, diagnostic)
+    else:
+        logger.warning("billing %s failed: %s", op, type(exc).__name__)
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY, detail=BILLING_PROVIDER_UNAVAILABLE_DETAIL
+    )
+
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -65,6 +158,15 @@ class PlanView(BaseModel):
     trial_days: int
 
 
+class ScheduledChangeView(BaseModel):
+    """A move to another plan that waits for the end of the paid period
+    (decisions §483): the org keeps its current plan until ``effective_at``."""
+
+    plan_code: str
+    plan_name: str
+    effective_at: datetime
+
+
 class SubscriptionView(BaseModel):
     status: str
     current_period_start: datetime | None
@@ -72,6 +174,8 @@ class SubscriptionView(BaseModel):
     trial_end: datetime | None
     # Whether a live provider subscription backs this (always False on mock).
     externally_managed: bool
+    # A pending move to a free plan at the period end, else null.
+    scheduled_change: ScheduledChangeView | None = None
 
 
 class AiUsageView(BaseModel):
@@ -175,12 +279,21 @@ async def get_subscription(
         # those told the customer their billing period was unknown while the
         # plan-change screen quietly prorated `0.00` off the same absence.
         window = current_period(subscription, now=datetime.now(UTC))
+        scheduled: ScheduledChangeView | None = None
+        pending = await pending_plan_view(control_db, subscription)
+        if pending is not None and subscription.pending_plan_effective_at is not None:
+            scheduled = ScheduledChangeView(
+                plan_code=pending.code,
+                plan_name=pending.name,
+                effective_at=subscription.pending_plan_effective_at,
+            )
         sub_view = SubscriptionView(
             status=subscription.status,
             current_period_start=window.start,
             current_period_end=window.end,
             trial_end=subscription.trial_end,
             externally_managed=subscription.external_subscription_id is not None,
+            scheduled_change=scheduled,
         )
 
     usage = await rollup_usage(tenant_db, organization_id=org.id, period=period)
@@ -325,9 +438,95 @@ async def list_plans(
     )
 
 
+class PlanChangePreviewRequest(BaseModel):
+    # Target plan's stable machine code (Plan.code).
+    plan_code: str = Field(min_length=1, max_length=50)
+
+
+class PlanChangePreviewResponse(BaseModel):
+    plan_code: str
+    # Already on this plan: confirming changes nothing and charges nothing.
+    already_on_plan: bool
+    currency: str
+    # Exact decimal STRINGS, the provider's own figures (never float, never
+    # computed by the browser). `amount_due` is charged on confirm;
+    # `credit` goes to the customer's balance instead (a downgrade).
+    amount_due: str
+    credit: str
+    # What recurs after the change and from when; null when nothing recurs.
+    next_amount: str | None
+    next_date: datetime | None
+    # Unix seconds the figures were priced at; the confirm sends it back.
+    proration_date: int
+    expires_at: datetime
+    # A paid target with no card on file: add one before confirming.
+    payment_method_required: bool
+    # When the move takes effect, if not on confirm: a move to a free plan
+    # keeps the current plan until its period ends (decisions §483). Null = now.
+    effective_at: datetime | None = None
+    # Confirming cancels the org's pending move to a free plan.
+    clears_scheduled_change: bool = False
+
+
+@router.post("/change-plan/preview", response_model=PlanChangePreviewResponse)
+async def preview_subscription_plan_change(
+    body: PlanChangePreviewRequest,
+    org: Organization = Depends(get_tenant),
+    _user: User = Depends(require_roles(ROLE_ADMIN, ROLE_CFO)),
+    control_db: AsyncSession = Depends(get_control_db),
+) -> PlanChangePreviewResponse:
+    """What moving to ``plan_code`` would charge, without charging anything.
+
+    admin/cfo (the same gate as ``change-plan``). The figures are the billing
+    provider's (`POST /v1/invoices/create_preview` on Stripe; deterministic on
+    ``mock``): what is due today or credited, what recurs and from when. The
+    customer confirms by sending ``proration_date`` and ``amount_due`` back to
+    ``change-plan`` within the preview's lifetime (decisions §482). Same
+    refusals as ``change-plan`` up to the charge; a missing card is reported
+    as ``payment_method_required: true``, not refused. Not read-only: it
+    provisions the org's provider customer and the plan's prices first (as the
+    change does), since the provider can only price items that exist; it never
+    creates a subscription or charges.
+    """
+    try:
+        preview = await preview_plan_change(control_db, org=org, new_plan_code=body.plan_code)
+    except PlanChangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan change not available."
+        ) from exc
+    except ProviderLegRefused as exc:
+        raise _billing_refusal(exc.code) from exc
+    except BillingNotConfigured as exc:
+        raise _billing_refusal("billing_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("preview_plan_change", exc) from exc
+    return PlanChangePreviewResponse(
+        plan_code=preview.plan_code,
+        already_on_plan=preview.already_on_plan,
+        currency=preview.currency,
+        amount_due=str(preview.amount_due),
+        credit=str(preview.credit),
+        next_amount=str(preview.next_amount) if preview.next_amount is not None else None,
+        next_date=preview.next_date,
+        proration_date=int(preview.proration_date.timestamp()),
+        expires_at=preview.expires_at,
+        payment_method_required=preview.payment_method_required,
+        effective_at=preview.effective_at,
+        clears_scheduled_change=preview.clears_scheduled_change,
+    )
+
+
 class PlanChangeRequest(BaseModel):
     # Target plan's stable machine code (Plan.code).
     plan_code: str = Field(min_length=1, max_length=50)
+    # The confirmed preview (decisions §482): its pricing instant (Unix
+    # seconds), and the amount due it showed as an exact decimal STRING in its
+    # currency. Required — nothing is charged without a figure the customer saw.
+    # Bounded to datetimes Python can represent (≤ 9999-12-31T23:59:59Z), so
+    # an absurd value is a 422, never a 500.
+    proration_date: int = Field(ge=0, le=253402300799)
+    expected_amount_due: ExactMoneyInput = Field(ge=0, max_digits=14, decimal_places=2)
+    currency: str = Field(min_length=3, max_length=3)
 
 
 class ProrationView(BaseModel):
@@ -344,6 +543,10 @@ class PlanChangeResponse(BaseModel):
     old_plan_code: str
     new_plan_code: str
     proration: ProrationView
+    # The move waits for the end of the paid period (paid → free, decisions
+    # §483): the org stays on `old_plan_code` until `effective_at`.
+    scheduled: bool = False
+    effective_at: datetime | None = None
 
 
 @router.post("/change-plan", response_model=PlanChangeResponse)
@@ -355,22 +558,46 @@ async def change_subscription_plan(
 ) -> PlanChangeResponse:
     """Move the org's live subscription to another plan, prorated mid-period.
 
-    admin/cfo only (matches the read endpoint). Idempotent: changing to the plan
+    admin/cfo only (matches the read endpoint). Carries the preview the
+    customer confirmed (``POST /change-plan/preview``): a quote that is too
+    old, from another month, or below what the provider would now charge is
+    refused 409 ``plan_change_preview_stale`` and nothing is charged
+    (decisions §482). Idempotent: changing to the plan
     the org is already on is a successful no-op (``changed=false``, zero
     proration) — a retry can't double-charge. 404 when the org has no live
     subscription or the target plan is unknown/inactive. Every applied change
-    writes an append-only ``billing.plan_changed`` audit row. Money in the
-    response is an exact decimal string.
+    writes an append-only ``billing.plan_changed`` audit row. A move from a paid
+    plan to a free one is scheduled for the end of the paid period instead
+    (``scheduled: true`` + ``effective_at``, audited
+    ``billing.plan_change_scheduled``; decisions §483) — nothing is charged or
+    credited. Money in the response is an exact decimal string.
     """
+    quote = PlanChangeQuote(
+        proration_date=datetime.fromtimestamp(body.proration_date, tz=UTC),
+        amount_due=body.expected_amount_due,
+        currency=body.currency.upper(),
+    )
     try:
         result = await change_plan(
-            control_db, org=org, new_plan_code=body.plan_code, actor_id=user.id
+            control_db, org=org, new_plan_code=body.plan_code, actor_id=user.id, quote=quote
         )
     except PlanChangeError as exc:
         # 404 (not 400): don't enumerate which plan codes / subscriptions exist.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Plan change not available."
         ) from exc
+    except ProviderLegRefused as exc:
+        raise _billing_refusal(exc.code) from exc
+    except BillingPaymentDeclined as exc:
+        # Before BillingProviderError (its base): a decline is the customer's
+        # card, not an outage, and the provider made no change.
+        raise _billing_refusal("billing_payment_declined") from exc
+    except BillingNotConfigured as exc:
+        # The live adapter fails closed without its key: the same answer as a
+        # deployed environment still on `mock` — paid plans are unavailable.
+        raise _billing_refusal("billing_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("change_plan", exc) from exc
 
     return PlanChangeResponse(
         changed=result.changed,
@@ -381,7 +608,46 @@ async def change_subscription_plan(
             unused_days=result.proration.unused_days,
             period_days=result.proration.period_days,
         ),
+        scheduled=result.scheduled,
+        effective_at=result.effective_at,
     )
+
+
+class KeepPlanResponse(BaseModel):
+    # False when nothing was pending (an idempotent retry).
+    cleared: bool
+    plan_code: str
+
+
+@router.post("/scheduled-change/cancel", response_model=KeepPlanResponse)
+async def cancel_scheduled_plan_change(
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_CFO)),
+    control_db: AsyncSession = Depends(get_control_db),
+) -> KeepPlanResponse:
+    """Keep the current plan: cancel a move to a free plan that is waiting for
+    the end of the paid period (decisions §483).
+
+    admin/cfo (the same gate as ``change-plan``). With a live provider the
+    subscription's scheduled end is cleared at the provider first; nothing is
+    charged. Writes a ``billing.scheduled_change_canceled`` audit row.
+    Idempotent: with nothing pending it answers ``cleared: false``. 404 when
+    the org has no live subscription; 409 ``scheduled_change_already_due``
+    once the period has ended, and the other coded refusals of ``change-plan``.
+    """
+    try:
+        result = await keep_current_plan(control_db, org=org, actor_id=user.id)
+    except PlanChangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Plan change not available."
+        ) from exc
+    except ProviderLegRefused as exc:
+        raise _billing_refusal(exc.code) from exc
+    except BillingNotConfigured as exc:
+        raise _billing_refusal("billing_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("keep_current_plan", exc) from exc
+    return KeepPlanResponse(cleared=result.cleared, plan_code=result.plan_code)
 
 
 class BillingInvoiceView(BaseModel):
@@ -421,8 +687,9 @@ async def list_billing_invoices(
     admin/cfo only (matches `GET /subscription`). Sourced through the org's
     billing adapter (`mock` locally → deterministic synthetic receipts;
     `stripe_billing` → the org's Stripe invoices). Graceful degradation: an org
-    never provisioned with the provider (no customer id) — or an unconfigured /
-    unavailable provider — yields an empty list, never a 500. Money is an exact
+    never provisioned with the provider (no customer id) or an unconfigured
+    provider yields an empty list; a configured provider that fails is a logged
+    502, never an empty list. Money is an exact
     decimal string (this is a billing surface — exactness is the point).
     """
     provider = _resolve_provider(org)
@@ -430,10 +697,11 @@ async def list_billing_invoices(
     customer_id = _resolve_customer_id(org)
     try:
         provider_invoices = await adapter.list_invoices(customer_id=customer_id)
-    except Exception:  # noqa: BLE001
-        # The live provider fails closed (no key) or is unreachable — surface an
-        # empty list rather than a 500. PII-free: no provider detail is echoed.
+    except BillingNotConfigured:
+        # The live provider fails closed without a key: nothing to list.
         provider_invoices = []
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("list_invoices", exc) from exc
 
     return BillingInvoicesResponse(
         provider=provider,
@@ -475,19 +743,20 @@ async def create_payment_method_setup_intent(
     admin/cfo only (matches the other billing routes). Returns the provider's
     single-use `client_secret`; the frontend confirms the card against it with
     the provider's JS SDK — no charge, no PAN ever touches our backend. Graceful
-    degradation: an org never provisioned with the provider (no customer id) — or
-    an unconfigured / unavailable provider — yields `configured=false` with a
-    null `client_secret`, never a 500.
+    degradation: an org never provisioned with the provider (no customer id) or an
+    unconfigured provider yields `configured=false` with a null `client_secret`;
+    a configured provider that fails is a logged 502.
     """
     provider = _resolve_provider(org)
     adapter = get_billing_adapter(provider)
     customer_id = _resolve_customer_id(org)
     try:
         intent = await adapter.create_setup_intent(customer_id)
-    except Exception:  # noqa: BLE001
-        # The live provider fails closed (no key) or is unreachable — surface a
-        # not-configured shape rather than a 500. PII-free: no provider detail.
+    except BillingNotConfigured:
+        # The live provider fails closed without a key: the not-configured shape.
         intent = None
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("create_setup_intent", exc) from exc
 
     return SetupIntentResponse(
         provider=provider,
@@ -520,16 +789,79 @@ async def list_payment_methods(
     """The org's saved cards — PII-safe metadata only (brand / last4 / expiry).
 
     admin/cfo only. NEVER returns or logs a full card number. Graceful
-    degradation: an org never provisioned with the provider (no customer id) — or
-    an unconfigured / unavailable provider — yields an empty list, never a 500.
+    degradation: an org never provisioned with the provider (no customer id) or an
+    unconfigured provider yields an empty list; a configured provider that fails
+    is a logged 502, never "no saved cards".
     """
     provider = _resolve_provider(org)
     adapter = get_billing_adapter(provider)
     customer_id = _resolve_customer_id(org)
     try:
         methods = await adapter.list_payment_methods(customer_id)
-    except Exception:  # noqa: BLE001
+    except BillingNotConfigured:
+        # The live provider fails closed without a key: no cards to list.
         methods = []
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("list_payment_methods", exc) from exc
+
+    return PaymentMethodsResponse(
+        provider=provider,
+        payment_methods=[
+            PaymentMethodView(
+                id=pm.external_payment_method_id,
+                brand=pm.brand,
+                last4=pm.last4,
+                exp_month=pm.exp_month,
+                exp_year=pm.exp_year,
+                is_default=pm.is_default,
+            )
+            for pm in methods
+        ],
+    )
+
+
+class DefaultPaymentMethodRequest(BaseModel):
+    # The SetupIntent the browser just confirmed with the provider's JS SDK.
+    setup_intent_id: str = Field(min_length=1, max_length=255)
+
+
+@router.post("/payment-method/default", response_model=PaymentMethodsResponse)
+async def set_default_payment_method(
+    body: DefaultPaymentMethodRequest,
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_CFO)),
+) -> PaymentMethodsResponse:
+    """Adopt the card a confirmed SetupIntent saved as the org's default.
+
+    The browser confirms the card with the provider (no PAN reaches us) and
+    posts the SetupIntent id here. The adapter verifies the intent belongs to
+    THIS org's provider customer and succeeded before making its card the one
+    subscription invoices charge; an unknown or foreign id is a 404, an
+    unfinished one a 409. Answers with the refreshed saved-card list. Writes a
+    PII-free ``billing.payment_method_updated`` audit row (no card data).
+    """
+    provider = _resolve_provider(org)
+    adapter = get_billing_adapter(provider)
+    customer_id = _resolve_customer_id(org)
+    try:
+        await adapter.adopt_setup_intent(customer_id, body.setup_intent_id)
+        methods = await adapter.list_payment_methods(customer_id)
+    except SetupIntentRejected as exc:
+        code = "setup_intent_incomplete" if exc.reason == "incomplete" else "setup_intent_not_found"
+        raise _billing_refusal(code) from exc
+    except BillingNotConfigured as exc:
+        raise _billing_refusal("billing_not_configured") from exc
+    except Exception as exc:  # noqa: BLE001 — any other provider failure is a logged 502
+        raise _provider_unavailable("adopt_setup_intent", exc) from exc
+
+    await dispatch_auth_audit(
+        organization_id=org.id,
+        actor_id=user.id,
+        action="billing.payment_method_updated",
+        entity_id=org.id,
+        entity_type="organization",
+        details={"provider": provider},
+    )
 
     return PaymentMethodsResponse(
         provider=provider,

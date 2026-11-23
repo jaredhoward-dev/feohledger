@@ -35,7 +35,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 # Anchor THIS checkout's `backend/` on sys.path before `app` is imported below.
 # Run as a script, sys.path[0] is `scripts/`, so `app` is not on sys.path at
@@ -53,6 +53,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(1, str(Path(__file__).resolve().parent.parent))
 
 from app.database import _make_tenant_url, control_session_factory
+from app.db_engine import create_async_engine
 from app.models.contract import Contract, ContractLineItem, ContractStatus, ContractType
 from app.models.credit_memo import CreditMemo
 from app.models.discount import (
@@ -540,6 +541,8 @@ async def seed_extras(session, org_id: uuid.UUID) -> dict[str, int]:
                     Expense(
                         organization_id=org_id,
                         report_id=report.id,
+                        # A report's lines are its owner's (decisions §434).
+                        created_by_user_id=report.employee_user_id,
                         expense_date=today - timedelta(days=30 - line_no),
                         merchant=merchants[line_no % len(merchants)],
                         category=cat,
@@ -565,6 +568,7 @@ async def seed_extras(session, org_id: uuid.UUID) -> dict[str, int]:
             _ent(
                 Expense(
                     organization_id=org_id,
+                    created_by_user_id=actor_id,
                     expense_date=today - timedelta(days=n + 1),
                     merchant=merchants[n % len(merchants)],
                     category=cat,

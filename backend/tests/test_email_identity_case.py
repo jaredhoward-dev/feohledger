@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import uuid
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 import pytest_asyncio
@@ -35,7 +36,7 @@ from app.api.scim import _apply_filter, create_user
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.schemas.scim import SCIMUserCreate
-from app.services.identity_provisioning import jit_provision
+from app.services.identity_provisioning import EmailInOtherWorkspace, jit_provision
 from app.utils.emails import normalize_email
 from app.utils.passwords import pwd_context
 
@@ -197,3 +198,551 @@ async def test_admin_create_stores_normalized_and_refuses_a_case_variant(realdb)
             assert dup.status_code == 409
         finally:
             await c.delete(f"/api/admin/users/{new_id}")
+
+
+async def test_signing_in_on_another_workspaces_page_is_refused(
+    realdb, mixed_case_user, session_redis
+):
+    """Production, 2026-10-20: an account of one workspace signed in on
+    another's page, got its own org's token, and then every call on that page
+    was refused (403 ``token_tenant_mismatch``) behind a
+    signed-in screen. The sign-in itself is refused instead, after the password
+    verifies, with the account's own sign-in link; on its own page it works."""
+    _user_id, email = await mixed_case_user()
+
+    async with realdb.client(key="b", role=None) as c:
+        resp = await c.post("/api/auth/login", json={"email": email, "password": _PASSWORD})
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "wrong_workspace"
+    assert "access_token" not in resp.json()
+    url = detail["params"]["sign_in_url"]
+    assert url is None or f"{realdb.info('a').slug}" in url
+    # The English fallback names the workspace by host, never the raw link with
+    # its percent-encoded `?email=` — that is the link's job, not the sentence's.
+    assert "?email=" not in detail["message"]
+    assert "%40" not in detail["message"]
+    if url:
+        assert urlsplit(url).netloc in detail["message"]
+
+    # A wrong password on the other page is the ordinary 401: the workspace is
+    # named only to someone who proved the password.
+    async with realdb.client(key="b", role=None) as c:
+        wrong = await c.post(
+            "/api/auth/login", json={"email": email, "password": f"{_PASSWORD}-wrong"}
+        )
+    assert wrong.status_code == 401
+
+    async with realdb.client(key="a", role=None) as c:
+        ok = await c.post("/api/auth/login", json={"email": email, "password": _PASSWORD})
+    assert ok.status_code == 200, ok.text
+
+
+# ---------------------------------------------------------------------------
+# One address, one account, one workspace — the cross-workspace collisions
+# (decisions §291). `users.email` is globally unique, so every path that would
+# create or rename an account onto an address held in ANOTHER workspace must
+# refuse in words, never trip the UNIQUE constraint into a 500.
+# ---------------------------------------------------------------------------
+
+
+async def _org_b(realdb) -> Organization:
+    async with realdb.control_sessionmaker()() as s:
+        return (
+            await s.execute(select(Organization).where(Organization.id == realdb.info("b").org_id))
+        ).scalar_one()
+
+
+async def test_sso_jit_refuses_an_address_held_in_another_workspace(realdb, mixed_case_user):
+    """Workspace B's IdP asserts an address workspace A's account holds. Before,
+    the lookup was B-only and the insert hit the global UNIQUE at flush: a 500.
+    Now a stated refusal, and nothing is written in either workspace."""
+    user_id, email = await mixed_case_user()
+    org_b = await _org_b(realdb)
+
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(EmailInOtherWorkspace):
+            await jit_provision(s, org_b, email.lower(), "sub-elsewhere", "oidc", {})
+        await s.rollback()
+
+    assert await _accounts_for(realdb, email) == [user_id]
+
+
+async def test_sso_jit_parallel_first_sign_in_in_the_same_workspace_uses_that_row(
+    realdb, monkeypatch
+):
+    """Two tabs, one person, one workspace: the other tab's insert lands between
+    the pre-check and this flush. That is the same account, not a 500 and not
+    an "other workspace" refusal."""
+    from app.services import identity_provisioning
+
+    org_a = await _org_a(realdb)
+    email = f"tabs.{uuid.uuid4().hex[:10]}@example.test"
+    other_tab_id = uuid.uuid4()
+    real_lookup = identity_provisioning.email_holder_org_id
+    calls = {"n": 0}
+
+    async def _other_tab_wins(db, address, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            async with realdb.control_sessionmaker()() as other:
+                other.add(
+                    User(
+                        id=other_tab_id,
+                        email=email,
+                        full_name="Other Tab",
+                        sso_provider="oidc",
+                        sso_provider_id="sub-tabs",
+                        organization_id=org_a.id,
+                        is_active=True,
+                        must_change_password=False,
+                    )
+                )
+                await other.commit()
+            return None  # the pre-check ran before that commit
+        return await real_lookup(db, address, **kw)
+
+    monkeypatch.setattr(identity_provisioning, "email_holder_org_id", _other_tab_wins)
+    try:
+        async with realdb.control_sessionmaker()() as s:
+            user = await jit_provision(s, org_a, email, "sub-tabs", "oidc", {})
+            await s.commit()
+        assert user.id == other_tab_id
+        assert await _accounts_for(realdb, email) == [other_tab_id]
+    finally:
+        async with realdb.control_sessionmaker()() as s:
+            await s.execute(delete(UserRole).where(UserRole.user_id == other_tab_id))
+            await s.execute(delete(User).where(User.id == other_tab_id))
+            await s.commit()
+
+
+async def test_sso_jit_concurrent_insert_is_still_a_refusal(realdb, mixed_case_user, monkeypatch):
+    """The pre-check lost a race: another workspace took the address between
+    it and the flush. The savepoint turns the IntegrityError into the same
+    refusal instead of a 500."""
+    from app.services import identity_provisioning
+
+    user_id, email = await mixed_case_user()
+    org_b = await _org_b(realdb)
+
+    real_lookup = identity_provisioning.email_holder_org_id
+    calls = {"n": 0}
+
+    async def _first_says_free(db, address, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # the pre-check, before the other writer committed
+        return await real_lookup(db, address, **kw)
+
+    monkeypatch.setattr(identity_provisioning, "email_holder_org_id", _first_says_free)
+
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(EmailInOtherWorkspace):
+            # `uq_users_email_lower` trips on the insert (any case, since 0138).
+            await jit_provision(s, org_b, email, "sub-race", "oidc", {})
+        await s.rollback()
+
+    assert calls["n"] == 2
+    assert await _accounts_for(realdb, email) == [user_id]
+
+
+async def test_oidc_callback_refuses_and_audits_in_the_idp_workspace(
+    realdb, mixed_case_user, monkeypatch
+):
+    """End to end through `sso_callback` with the IdP legs stubbed and the real
+    `jit_provision` against Postgres: a coded 403 (no link — §291), one
+    `auth.sso.login.failure` row in workspace B, none in A, no account."""
+    from app.api import auth_sso
+
+    _user_id, email = await mixed_case_user()
+    org_b = await _org_b(realdb)
+    slug_b = realdb.info("b").slug
+    # The OIDC client secret is sealed; the callback opens it before the exchange.
+    await realdb.store_provider_secrets("b", "sso", {"client_secret": "not-a-real-secret"})
+
+    async def _consume_state(state):
+        return {"tenant": slug_b, "nonce": "n"}
+
+    async def _fetch_org(slug, db):
+        return org_b
+
+    async def _sign_in_settings(db, org):
+        return {
+            "sso": {
+                "enabled": True,
+                "provider": "okta",
+                "discovery_url": "https://idp.example.test/.well-known/openid-configuration",
+                "client_id": "cid",
+                "client_secret_configured": True,
+            }
+        }
+
+    async def _discovery(url):
+        return {}
+
+    async def _exchange(*a, **kw):
+        return {"id_token": "stub"}
+
+    async def _validate(*a, **kw):
+        return {"email": email.lower(), "sub": "sub-b"}
+
+    audits: list[dict] = []
+
+    async def _audit(**kw):
+        audits.append(kw)
+
+    monkeypatch.setattr(auth_sso, "consume_state", _consume_state)
+    monkeypatch.setattr(auth_sso, "_fetch_org_by_slug", _fetch_org)
+    monkeypatch.setattr(auth_sso, "sign_in_settings", _sign_in_settings)
+    monkeypatch.setattr(auth_sso, "fetch_discovery", _discovery)
+    monkeypatch.setattr(auth_sso, "exchange_code_for_tokens", _exchange)
+    monkeypatch.setattr(auth_sso, "validate_id_token", _validate)
+    monkeypatch.setattr(auth_sso, "dispatch_auth_audit", _audit)
+
+    request = SimpleNamespace(client=SimpleNamespace(host="203.0.113.7"), headers={})
+    body = auth_sso.SSOCallbackRequest(code="c", state="s")
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(HTTPException) as exc:
+            await auth_sso.sso_callback(body, request, db=s)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "sso_email_in_other_workspace"
+    assert exc.value.detail["params"] == {}
+    assert realdb.info("a").slug not in exc.value.detail["message"]
+
+    assert len(audits) == 1
+    row = audits[0]
+    assert row["organization_id"] == org_b.id
+    assert row["action"] == "auth.sso.login.failure"
+    assert row["details"]["reason"] == "sso_email_in_other_workspace"
+    assert row["details"]["tenant"] == slug_b
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+async def test_admin_create_says_which_workspace_holds_the_address(realdb, mixed_case_user):
+    """Same workspace and other workspace are different refusals, each coded
+    and stated — never the bare "Email already in use" — and neither names
+    the other workspace."""
+    _user_id, email = await mixed_case_user()  # held in A
+
+    async with realdb.client(key="a", role="admin") as c:
+        same = await c.post(
+            "/api/admin/users",
+            json={"email": email.lower(), "full_name": "Again", "role_names": ["ap_clerk"]},
+        )
+    assert same.status_code == 409
+    assert same.json()["detail"]["code"] == "email_in_this_workspace"
+
+    async with realdb.client(key="b", role="admin") as c:
+        other = await c.post(
+            "/api/admin/users",
+            json={"email": email.lower(), "full_name": "Elsewhere", "role_names": ["ap_clerk"]},
+        )
+    assert other.status_code == 409
+    detail = other.json()["detail"]
+    assert detail["code"] == "email_in_other_workspace"
+    assert detail["params"] == {}
+    assert realdb.info("a").slug not in detail["message"]
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+async def test_admin_rename_onto_another_workspaces_address_is_coded(realdb, mixed_case_user):
+    _user_id, email = await mixed_case_user()  # held in A
+    fresh = f"rename.{uuid.uuid4().hex[:8]}@example.test"
+
+    async with realdb.client(key="b", role="admin") as c:
+        made = await c.post(
+            "/api/admin/users",
+            json={"email": fresh, "full_name": "Renamer", "role_names": ["ap_clerk"]},
+        )
+        assert made.status_code == 201, made.text
+        target = made.json()["id"]
+        try:
+            resp = await c.patch(f"/api/admin/users/{target}", json={"email": email.lower()})
+            assert resp.status_code == 409
+            assert resp.json()["detail"]["code"] == "email_in_other_workspace"
+        finally:
+            await c.delete(f"/api/admin/users/{target}")
+
+
+async def test_other_workspace_refusals_are_budgeted_per_workspace(
+    realdb, mixed_case_user, session_redis, monkeypatch
+):
+    """The other-workspace refusal is an unavoidable existence signal while an
+    address is global; a per-workspace budget bounds sweeping it. Once spent,
+    even a free address is throttled — the 429 comes before the lookup, so a
+    throttled caller learns nothing."""
+    from app.api import admin as admin_api
+    from app.config import settings as app_settings
+
+    _user_id, email = await mixed_case_user()  # held in A
+    monkeypatch.setattr(app_settings, "rate_limit_enabled", True)
+    monkeypatch.setattr(admin_api, "EMAIL_COLLISION_LIMIT", 2)
+
+    body = {"email": email.lower(), "full_name": "Sweep", "role_names": ["ap_clerk"]}
+    async with realdb.client(key="b", role="admin") as c:
+        first = await c.post("/api/admin/users", json=body)
+        second = await c.post("/api/admin/users", json=body)
+        third = await c.post("/api/admin/users", json=body)
+        fourth = await c.post(
+            "/api/admin/users",
+            json={**body, "email": f"free.{uuid.uuid4().hex[:8]}@example.test"},
+        )
+    assert [first.status_code, second.status_code] == [409, 409]
+    assert third.status_code == 429
+    assert fourth.status_code == 429
+    # Stated, so an admin onboarding people knows why and that it lifts.
+    assert fourth.json()["detail"]["code"] == "email_check_throttled"
+    assert fourth.headers.get("retry-after")
+
+
+@pytest.mark.plan("scale")
+async def test_scim_create_says_the_address_is_in_another_workspace(realdb, mixed_case_user):
+    _user_id, email = await mixed_case_user()  # held in A
+    org_b = await _org_b(realdb)
+
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(HTTPException) as exc:
+            await create_user(SCIMUserCreate(userName=email.lower()), _REQUEST, org_b, s)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["scimType"] == "uniqueness"
+    assert "another workspace" in exc.value.detail["detail"]
+    assert realdb.info("a").slug not in exc.value.detail["detail"]
+
+
+async def test_wrong_workspace_audit_names_the_page_and_the_verified_password(
+    realdb, mixed_case_user, session_redis, monkeypatch
+):
+    """The account's workspace gets the row, with the workspace whose page it
+    was and the fact that the password verified; the attempted workspace gets
+    nothing (§291)."""
+    from app.api import auth as auth_api
+
+    _user_id, email = await mixed_case_user()  # held in A
+    audits: list[dict] = []
+
+    async def _audit(**kw):
+        audits.append(kw)
+
+    monkeypatch.setattr(auth_api, "dispatch_auth_audit", _audit)
+
+    async with realdb.client(key="b", role=None) as c:
+        resp = await c.post("/api/auth/login", json={"email": email, "password": _PASSWORD})
+    assert resp.status_code == 403, resp.text
+
+    rows = [a for a in audits if a["details"].get("reason") == "wrong_workspace"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["organization_id"] == realdb.info("a").org_id
+    assert row["details"]["attempted_workspace"] == realdb.info("b").slug
+    assert row["details"]["password_verified"] is True
+    assert row["details"]["email"] == email.lower()
+    assert not [a for a in audits if a["organization_id"] == realdb.info("b").org_id]
+
+
+# ---------------------------------------------------------------------------
+# The database refuses a case variant (migration 0138, decisions §475)
+# ---------------------------------------------------------------------------
+#
+# The app checks before it writes, so these tests make the check lose the race:
+# it says "free" (a concurrent writer had not committed yet) and the row is
+# already there. Under the old case-sensitive UNIQUE(email) a lower-cased
+# insert beside a mixed-case row succeeded and minted a duplicate; under
+# `uq_users_email_lower` it is refused, and each create maps that to its 409.
+
+
+async def test_the_index_refuses_a_case_variant_insert(realdb, mixed_case_user):
+    from sqlalchemy.exc import IntegrityError
+
+    _user_id, email = await mixed_case_user()
+    async with realdb.control_sessionmaker()() as s:
+        s.add(
+            User(
+                id=uuid.uuid4(),
+                email=email.upper(),
+                full_name="Variant",
+                organization_id=realdb.info("b").org_id,
+                is_active=True,
+                must_change_password=False,
+            )
+        )
+        with pytest.raises(IntegrityError, match="uq_users_email_lower"):
+            await s.flush()
+        await s.rollback()
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+async def test_admin_create_that_loses_the_race_is_the_coded_409(
+    realdb, mixed_case_user, monkeypatch
+):
+    from app.api import admin
+
+    _user_id, email = await mixed_case_user()  # held in A, stored mixed-case
+
+    async def _check_passed(*_a, **_kw):
+        return None  # the pre-check ran before the other writer committed
+
+    monkeypatch.setattr(admin, "_refuse_taken_email", _check_passed)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post(
+            "/api/admin/users",
+            json={"email": email.lower(), "full_name": "Racer", "role_names": ["ap_clerk"]},
+        )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "email_in_this_workspace"
+    assert email not in resp.text and email.lower() not in resp.text
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+@pytest.mark.plan("scale")
+async def test_scim_create_that_loses_the_race_is_a_409(realdb, mixed_case_user, monkeypatch):
+    from app.api import scim
+
+    _user_id, email = await mixed_case_user()
+    org = await _org_a(realdb)
+    real_check = scim._refuse_taken_username
+    calls = {"n": 0}
+
+    async def _first_says_free(db, org_, address, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_check(db, org_, address, **kw)
+
+    monkeypatch.setattr(scim, "_refuse_taken_username", _first_says_free)
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(HTTPException) as exc:
+            await create_user(SCIMUserCreate(userName=email.lower()), _REQUEST, org, s)
+        await s.rollback()
+
+    assert calls["n"] == 2
+    assert exc.value.status_code == 409
+    assert exc.value.detail["scimType"] == "uniqueness"
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+async def test_admin_rename_that_loses_the_race_is_the_coded_409(
+    realdb, mixed_case_user, monkeypatch
+):
+    from app.api import admin
+
+    _held_id, email = await mixed_case_user()  # held in A
+    target_id, _target_email = await mixed_case_user()  # renamed onto it
+
+    async def _check_passed(*_a, **_kw):
+        return None  # the pre-check ran before the other writer committed
+
+    monkeypatch.setattr(admin, "_refuse_taken_email", _check_passed)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.patch(f"/api/admin/users/{target_id}", json={"email": email.lower()})
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "email_in_this_workspace"
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+@pytest.mark.plan("scale")
+@pytest.mark.parametrize("operation", ["put", "patch"])
+async def test_scim_rename_that_loses_the_race_is_a_409(
+    realdb, mixed_case_user, monkeypatch, operation
+):
+    from app.api import scim
+    from app.api.scim import patch_user, replace_user
+    from app.schemas.scim import SCIMPatchOp, SCIMPatchRequest
+
+    _held_id, email = await mixed_case_user()
+    target_id, _target_email = await mixed_case_user()
+    org = await _org_a(realdb)
+    real_check = scim._refuse_taken_username
+    calls = {"n": 0}
+
+    async def _first_says_free(db, org_, address, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_check(db, org_, address, **kw)
+
+    monkeypatch.setattr(scim, "_refuse_taken_username", _first_says_free)
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(HTTPException) as exc:
+            if operation == "put":
+                await replace_user(
+                    target_id, SCIMUserCreate(userName=email.lower()), _REQUEST, org, s
+                )
+            else:
+                body = SCIMPatchRequest(
+                    Operations=[SCIMPatchOp(op="replace", path="userName", value=email.lower())]
+                )
+                await patch_user(target_id, body, _REQUEST, org, s)
+        await s.rollback()
+
+    assert calls["n"] == 2
+    assert exc.value.status_code == 409
+    assert exc.value.detail["scimType"] == "uniqueness"
+    assert len(await _accounts_for(realdb, email)) == 1
+
+
+async def test_portal_invite_that_loses_the_race_is_a_409(realdb, monkeypatch):
+    """`vendor_users` carries the same index per tenant. The race: the
+    invite's existence check reads before a concurrent invite commits."""
+    from app.api import vendors as vendors_api
+    from app.config import settings as cfg
+    from app.models.vendor import Vendor
+    from app.models.vendor_user import VendorUser
+
+    monkeypatch.setattr(cfg, "tenant_url_template", "https://{slug}.feohledger.test", raising=True)
+    org_id = realdb.info("a").org_id
+    vendor_id = uuid.uuid4()
+    stored = f"Portal.{vendor_id.hex[:10]}@Supplier.Test"
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        s.add(
+            Vendor(
+                id=vendor_id,
+                name="Race Supply",
+                organization_id=org_id,
+                status="active",
+                source="manual",
+            )
+        )
+        s.add(
+            VendorUser(
+                vendor_id=vendor_id,
+                organization_id=org_id,
+                email=stored,  # as a pre-normalization row is stored
+                full_name="Existing",
+                is_active=True,
+            )
+        )
+        await s.commit()
+
+    real_matches = vendors_api.email_matches
+    calls = {"n": 0}
+
+    def _first_misses(column, address):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return column == "__nobody__"  # the check read before the commit
+        return real_matches(column, address)
+
+    monkeypatch.setattr(vendors_api, "email_matches", _first_misses)
+    try:
+        async with realdb.client(key="a", role="admin") as c:
+            resp = await c.post(
+                f"/api/vendors/{vendor_id}/portal-users",
+                json={"email": stored.lower(), "full_name": "Racer"},
+            )
+        assert resp.status_code == 409, resp.text
+        assert stored.lower() not in resp.text
+        async with mk() as s:
+            rows = (
+                await s.execute(
+                    select(VendorUser.id).where(func.lower(VendorUser.email) == stored.lower())
+                )
+            ).all()
+        assert len(rows) == 1
+    finally:
+        async with mk() as s:
+            await s.execute(delete(VendorUser).where(VendorUser.vendor_id == vendor_id))
+            await s.execute(delete(Vendor).where(Vendor.id == vendor_id))
+            await s.commit()

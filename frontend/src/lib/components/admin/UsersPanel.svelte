@@ -1,5 +1,6 @@
 <script lang="ts">
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import type { AdminUser } from '#lib/types/admin.ts';
 	import { roleLabelKey } from '#lib/types/admin.ts';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
@@ -20,15 +21,30 @@
 
 	let showCreateModal = $state(false);
 	let editingUser = $state<AdminUser | null>(null);
-	// The one-time credential dialog serves both an invite and a password reset:
-	// the same shape (a generated temp the user must change at first sign-in),
-	// only the heading and the instruction differ.
-	let createdCredentials = $state<{
+	// The confirmation after an invite or a password reset: both email the user
+	// a single-use set-password link (decisions §283), so there is no credential
+	// to show or copy — only where the link went and when it stops working.
+	let linkSent = $state<{
 		kind: 'created' | 'reset';
 		email: string;
-		password: string;
+		expiresAt: string;
 	} | null>(null);
+	const LINK_EXPIRY_OPTS: Intl.DateTimeFormatOptions = {
+		month: 'short',
+		day: 'numeric',
+		hour: 'numeric',
+		minute: '2-digit'
+	};
 	let confirmDeleteId = $state<string | null>(null);
+	// Same two-click arm as Delete: signing someone out everywhere is harmless to
+	// the account but interrupts whatever they are doing, so a stray click must
+	// not do it.
+	let confirmRevokeId = $state<string | null>(null);
+	let revokingId = $state<string | null>(null);
+	// The user whose delete is in flight: its armed Confirm goes `busy`, so a
+	// third click cannot send a second DELETE (which would 404 and toast a
+	// failure over the success).
+	let deletingId = $state<string | null>(null);
 
 	// Bulk-select state
 	let selectedIds = $state<Set<string>>(new Set());
@@ -164,6 +180,8 @@
 	function describeBulkFailure(f: { reason: string; references: { open_invoice_assignments: number; pending_approval_steps: number; active_workflow_approver_in: number } | null }): string {
 		if (f.reason === 'self') return m('admin.users.fail.self');
 		if (f.reason === 'not_found') return m('admin.users.fail.notFound');
+		if (f.reason === 'last_admin') return m('admin.users.fail.lastAdmin');
+		if (f.reason === 'audit_unavailable') return m('admin.users.fail.auditUnavailable');
 		if (f.reason === 'blocked' && f.references) {
 			const parts: string[] = [];
 			if (f.references.open_invoice_assignments) parts.push(m('admin.users.fail.openInvoices', { n: f.references.open_invoice_assignments }));
@@ -201,10 +219,10 @@
 				role_names: newRoles,
 			});
 			showCreateModal = false;
-			createdCredentials = {
+			linkSent = {
 				kind: 'created',
 				email: result.email,
-				password: result.temporary_password,
+				expiresAt: result.set_password_link_expires_at,
 			};
 		} catch (err) {
 			toast(err instanceof Error ? err.message : m('admin.users.toast.createFailed'), 'error');
@@ -254,10 +272,10 @@
 			const result = await adminStore.resetUserPassword(editingUser.id);
 			editingUser = null;
 			confirmReset = false;
-			createdCredentials = {
+			linkSent = {
 				kind: 'reset',
 				email: result.email,
-				password: result.temporary_password,
+				expiresAt: result.set_password_link_expires_at,
 			};
 			if (result.sessions_revoked === false) {
 				toast(m('admin.users.toast.resetSessionsNotRevoked'), 'error');
@@ -279,12 +297,30 @@
 	}
 
 	async function handleDelete(id: string) {
+		if (deletingId) return;
+		deletingId = id;
 		try {
 			await adminStore.deleteUser(id);
 			toast(m('admin.users.toast.singleDeleted'), 'success');
 			confirmDeleteId = null;
 		} catch (err) {
 			toast(err instanceof Error ? err.message : m('admin.users.toast.deleteFailed'), 'error');
+		} finally {
+			deletingId = null;
+		}
+	}
+
+	async function handleRevokeSessions(user: AdminUser) {
+		if (revokingId) return;
+		revokingId = user.id;
+		try {
+			const { revoked } = await adminStore.revokeUserSessions(user.id);
+			toast(m('admin.users.toast.sessionsRevoked', { n: revoked, name: user.full_name }), 'success');
+			confirmRevokeId = null;
+		} catch (err) {
+			toast(err instanceof Error ? err.message : m('admin.users.toast.revokeFailed'), 'error');
+		} finally {
+			revokingId = null;
 		}
 	}
 
@@ -306,8 +342,9 @@
 	}
 
 	function handleWindowClick(e: MouseEvent) {
-		if (confirmDeleteId && !(e.target as HTMLElement).closest('.row-action')) {
+		if (!(e.target as HTMLElement).closest('.row-action')) {
 			confirmDeleteId = null;
+			confirmRevokeId = null;
 		}
 	}
 
@@ -339,14 +376,14 @@
      have until now), so a 500 or an offline backend used to leave the user
      directory asserting "No users found." with no toast, no banner and no
      retry, on the page an admin opens precisely when access is misbehaving. -->
+<div class="users-table">
 <DataTable
 	isEmpty={adminStore.users.length === 0}
-	empty={adminStore.loading
-		? m('common.loading')
-		: adminStore.errored
-			? m('common.loadFailed')
-			: m('admin.users.empty')}
+	loading={adminStore.loading}
+	errored={adminStore.errored}
+	empty={m('admin.users.empty')}
 	colspan={7}
+	fixed
 >
 	{#snippet header()}
 		<tr>
@@ -360,10 +397,10 @@
 			</th>
 			<th>{m('admin.users.col.name')}</th>
 			<th>{m('admin.users.col.email')}</th>
-			<th>{m('admin.users.col.roles')} <HelpTip term="role" /></th>
-			<th>{m('admin.users.col.status')}</th>
-			<th>{m('admin.users.col.created')}</th>
-			<th></th>
+			<th class="col-roles">{m('admin.users.col.roles')} <HelpTip term="role" /></th>
+			<th class="col-status">{m('admin.users.col.status')}</th>
+			<th class="col-created">{m('admin.users.col.created')}</th>
+			<th class="col-actions"></th>
 		</tr>
 	{/snippet}
 	{#snippet body()}
@@ -395,7 +432,7 @@
 						<span class="you-badge">{m('admin.users.you')}</span>
 					{/if}
 				</td>
-				<td class="email-cell">{user.email}</td>
+				<td class="email-cell" title={user.email}>{user.email}</td>
 				<td>
 					<div class="role-badges">
 						{#each user.roles as role}
@@ -415,15 +452,40 @@
 					<RowAction onclick={() => toggleActive(user)}>
 						{user.is_active ? m('admin.users.row.deactivate') : m('admin.users.row.activate')}
 					</RowAction>
+					<!-- Not on yourself (that is Sign out) nor on an inactive account
+					     (deactivating already ended its sessions). The panel only
+					     mounts for `user.manage`, the route's own permission. -->
+					{#if !isSelf(user.id) && user.is_active}
+						<RowAction
+							variant="danger"
+							armed={confirmRevokeId === user.id}
+							busy={revokingId === user.id}
+							disabled={revokingId !== null && revokingId !== user.id}
+							onclick={(e) => {
+								e.stopPropagation();
+								if (confirmRevokeId === user.id) {
+									handleRevokeSessions(user);
+								} else {
+									confirmDeleteId = null;
+									confirmRevokeId = user.id;
+								}
+							}}
+						>
+							{confirmRevokeId === user.id ? m('admin.users.row.confirm') : m('admin.users.row.revokeSessions')}
+						</RowAction>
+					{/if}
 					{#if !isSelf(user.id)}
 						<RowAction
 							variant="danger"
 							armed={confirmDeleteId === user.id}
+							busy={deletingId === user.id}
+							disabled={deletingId !== null && deletingId !== user.id}
 							onclick={(e) => {
 								e.stopPropagation();
 								if (confirmDeleteId === user.id) {
 									handleDelete(user.id);
 								} else {
+									confirmRevokeId = null;
 									confirmDeleteId = user.id;
 								}
 							}}
@@ -436,18 +498,17 @@
 		{/each}
 	{/snippet}
 </DataTable>
+</div>
 
-{#if adminStore.hasMore}
-	<div class="load-more-row">
-		<button class="btn-load-more" onclick={loadMore} disabled={adminStore.loading}>
-			{adminStore.loading ? m('common.loading') : m('admin.users.loadMore', { shown: adminStore.users.length, total: adminStore.total })}
-		</button>
-	</div>
-{:else if adminStore.total > 0}
-	<div class="load-more-row">
-		<span class="load-more-end">{m('admin.users.showingAll', { total: adminStore.total })}</span>
-	</div>
-{/if}
+<LoadMoreFooter
+	shown={adminStore.users.length}
+	total={adminStore.total}
+	hasMore={adminStore.hasMore}
+	loading={adminStore.loading}
+	onloadmore={loadMore}
+	moreKey="admin.users.loadMore"
+	allKey="admin.users.showingAll"
+/>
 
 <!-- Invite User Modal -->
 <Modal open={showCreateModal} ariaLabel={m('admin.users.modal.invite.aria')} width="sm" onclose={() => (showCreateModal = false)}>
@@ -487,32 +548,18 @@
 	</form>
 </Modal>
 
-<!-- Created Credentials Modal -->
-<Modal open={createdCredentials !== null} ariaLabel={createdCredentials?.kind === 'reset' ? m('admin.users.modal.reset.aria') : m('admin.users.modal.created.aria')} width="sm" onclose={() => (createdCredentials = null)}>
-	{#if createdCredentials}
-		{#if createdCredentials.kind === 'reset'}
-			<h2>{m('admin.users.modal.reset.heading')}</h2>
-			<p class="modal-hint">{m('admin.users.modal.reset.hint')}</p>
-		{:else}
-			<h2>{m('admin.users.modal.created.heading')}</h2>
-			<p class="modal-hint">{m('admin.users.modal.created.hint')}</p>
-		{/if}
-		<div class="credentials-box">
-			<div class="credential-row">
-				<span class="credential-label">{m('admin.users.modal.created.email')}</span>
-				<code class="credential-value">{createdCredentials.email}</code>
-			</div>
-			<div class="credential-row">
-				<span class="credential-label">{m('admin.users.modal.created.tempPassword')}</span>
-				<code class="credential-value password">{createdCredentials.password}</code>
-			</div>
-		</div>
+<!-- Set-password link sent (invite or reset) — never a credential -->
+<Modal open={linkSent !== null} ariaLabel={linkSent?.kind === 'reset' ? m('admin.users.modal.reset.aria') : m('admin.users.modal.created.aria')} width="sm" onclose={() => (linkSent = null)}>
+	{#if linkSent}
+		<h2>{linkSent.kind === 'reset' ? m('admin.users.modal.reset.heading') : m('admin.users.modal.created.heading')}</h2>
+		<p class="modal-hint">
+			{m(linkSent.kind === 'reset' ? 'admin.users.modal.reset.hint' : 'admin.users.modal.created.hint', {
+				email: linkSent.email,
+				expires: formatDate(linkSent.expiresAt, '—', LINK_EXPIRY_OPTS)
+			})}
+		</p>
 		<div class="modal-footer">
-			<button class="btn-primary" onclick={() => {
-				navigator.clipboard.writeText(`Email: ${createdCredentials?.email}\nPassword: ${createdCredentials?.password}`);
-				toast(m('admin.users.toast.copied'), 'success');
-			}}>{m('admin.users.modal.created.copy')}</button>
-			<button class="btn-cancel" onclick={() => (createdCredentials = null)}>{m('admin.users.modal.created.done')}</button>
+			<button class="btn-primary" onclick={() => (linkSent = null)}>{m('admin.users.modal.created.done')}</button>
 		</div>
 	{/if}
 </Modal>
@@ -533,8 +580,8 @@
 			<!-- No password input here, deliberately (#566). A typed password was
 			     one the admin kept knowing, and a password field in this form got
 			     the ADMIN's own saved password autofilled into it, so saving a
-			     rename silently reset the user's credential. The reset issues a
-			     generated temp the user must change at next sign-in. Not offered
+			     rename silently reset the user's credential. The reset clears the
+			     password and emails the user a set-password link. Not offered
 			     on your own account — that is /profile's change-password. -->
 			{#if !isSelf(editingUser.id)}
 				<fieldset class="reset-password">
@@ -595,6 +642,31 @@
 	.checkbox-col input[type='checkbox'] {
 		cursor: pointer;
 		accent-color: var(--accent);
+	}
+
+	/* --- Column widths ---
+	   The directory is `table-layout: fixed` (DataTable's `fixed`): under
+	   `auto` the columns were sized against the "Loading…" row and re-sized
+	   against the real rows, sliding every column sideways as the users
+	   landed. The predictable columns get widths sized to their widest
+	   content in the longest locale (Roles to two badges, actions to es
+	   "Desactivar" + "Cerrar todas las sesiones" + "Eliminar" on one line);
+	   Name and Email share the rest, and the table's
+	   `min-width` keeps them readable — past it the table scrolls inside its
+	   region (frontend/docs/ui-patterns.md § Data tables). */
+	.users-table {
+		min-width: 0;
+	}
+	.users-table :global(table) { min-width: 1280px; }
+	.col-roles { width: 220px; }
+	.col-status { width: 110px; }
+	.col-created { width: 130px; }
+	.col-actions { width: 420px; }
+
+	.email-cell {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	/* --- Table cells --- */
@@ -688,11 +760,11 @@
 	}
 
 	.status-dot.active::before {
-		background: #1fa86a;
+		background: var(--success);
 	}
 
 	.status-dot.deactivated::before {
-		background: #e04040;
+		background: var(--danger);
 	}
 
 	/* --- Modal extras --- */
@@ -700,7 +772,7 @@
 	.modal input:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	fieldset {
@@ -745,48 +817,5 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 8px;
-	}
-
-	/* --- Credentials display --- */
-
-	.credentials-box {
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		padding: 14px;
-		margin-bottom: 16px;
-		display: flex;
-		flex-direction: column;
-		gap: 10px;
-	}
-
-	.credential-row {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-
-	.credential-label {
-		font-size: 0.72rem;
-		font-weight: 500;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-	}
-
-	.credential-value {
-		font-size: 0.9rem;
-		color: var(--text);
-		font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-		background: var(--surface);
-		padding: 4px 8px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		user-select: all;
-	}
-
-	.credential-value.password {
-		color: var(--accent);
-		font-weight: 600;
 	}
 </style>

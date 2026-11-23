@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { formatDate, formatPeriod, timeAgo } from './time';
+import { formatDate, formatDueIn, formatMonth, formatPeriod, timeAgo } from './time';
 import { setActiveFormatLocale } from '#lib/i18n/formatLocale.ts';
 
 // The date helpers drive their locale off the active in-app i18n locale
@@ -196,5 +196,50 @@ describe('timeAgo', () => {
 		expect(timeAgo('not-a-date')).toBe('—');
 		expect(timeAgo('')).toBe('—');
 		expect(timeAgo('not-a-date', 'n/a')).toBe('n/a');
+	});
+});
+
+describe('formatMonth', () => {
+	it('renders the full year so a month never reads as a day', () => {
+		setActiveFormatLocale('en-US');
+		expect(formatMonth('2026-11')).toBe('Nov 2026');
+		expect(formatMonth('2026-11', 'long')).toBe('November 2026');
+	});
+
+	it('follows the active locale', () => {
+		setActiveFormatLocale('de-DE');
+		expect(formatMonth('2026-03', 'long')).toBe('März 2026');
+	});
+
+	it('returns anything that is not a YYYY-MM key unchanged', () => {
+		expect(formatMonth('2026-11-05')).toBe('2026-11-05');
+		expect(formatMonth('garbage')).toBe('garbage');
+	});
+});
+
+describe('formatDueIn', () => {
+	const fromNow = (ms: number) => new Date(Date.now() + ms).toISOString();
+	const HOUR = 3_600_000;
+
+	it('returns the placeholder for null/empty/invalid', () => {
+		expect(formatDueIn(null)).toBe('—');
+		expect(formatDueIn('')).toBe('—');
+		expect(formatDueIn('not-a-date')).toBe('—');
+		expect(formatDueIn(undefined, 'n/a')).toBe('n/a');
+	});
+
+	it('uses hours under a day and whole days after, in both directions', () => {
+		setActiveFormatLocale('en-US');
+		expect(formatDueIn(fromNow(3 * HOUR + 60_000))).toBe('in 3 hr.');
+		expect(formatDueIn(fromNow(-3 * HOUR - 60_000))).toBe('3 hr. ago');
+		expect(formatDueIn(fromNow(50 * HOUR))).toBe('in 2 days');
+		expect(formatDueIn(fromNow(-50 * HOUR))).toBe('2 days ago');
+	});
+
+	it('follows the active locale', () => {
+		setActiveFormatLocale('de-DE');
+		expect(formatDueIn(fromNow(3 * HOUR + 60_000))).toBe('in 3 Std.');
+		setActiveFormatLocale('ja');
+		expect(formatDueIn(fromNow(3 * HOUR + 60_000))).toBe('3 時間後');
 	});
 });

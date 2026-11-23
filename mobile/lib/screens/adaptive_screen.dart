@@ -1,13 +1,13 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/models/adaptive.dart';
 import 'package:feohledger_mobile/stores/adaptive_store.dart';
-import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/org_currency_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/money.dart';
+import 'package:feohledger_mobile/widgets/load_error_state.dart';
 
 /// Adaptive AI workflows — advisory suggestions, approval patterns and baseline
 /// anomalies, over `/api/adaptive`.
@@ -40,8 +40,6 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
 
   /// True while a dismiss POST is in flight — guards against a double-tap.
   bool _submitting = false;
-
-  bool get _canDismiss => AuthStore.instance.canDismissSuggestion;
 
   @override
   void initState() {
@@ -103,7 +101,7 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
           return const Center(child: CircularProgressIndicator());
         }
         if (store.suggestionsError != null && store.suggestions.isEmpty) {
-          return _ErrorState(
+          return LoadErrorState(
             message: l.adaptiveSuggestionsError,
             onRetry: store.fetchSuggestions,
           );
@@ -217,9 +215,14 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
                 ],
               ),
             ),
-            // Dismiss is offered only on an open row and only to the roles the
-            // backend `_WRITE_ROLES` admits — a CFO reads and is not offered it.
-            if (_canDismiss && s.isOpen)
+            // Dismiss is offered only when the row's own `actions.dismiss`
+            // verdict says the server would accept it now: its role gate and
+            // its status gate are both computed server-side, so a CFO, or a
+            // row already dismissed or applied, is offered nothing — and so is
+            // a row served without a verdict (fail closed). Both refusals are
+            // ones the reader cannot act on, so they hide the control rather
+            // than explain it.
+            if (s.dismissVerdict.allowed)
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton.icon(
@@ -264,9 +267,8 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
         : l.adaptiveSuggestionsDismissFailed(
             AdaptiveStore.instance.suggestionsError ?? '',
           );
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
     A11y.announce(context, message);
   }
 
@@ -276,9 +278,10 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
       // Both stores: the reporting currency is a separate request and can land
       // after the patterns do, at which point the bare figures must pick up
       // their symbol instead of staying bare for the life of the screen.
-      listenable: Listenable.merge(
-        [AdaptiveStore.instance, OrgCurrencyStore.instance],
-      ),
+      listenable: Listenable.merge([
+        AdaptiveStore.instance,
+        OrgCurrencyStore.instance,
+      ]),
       builder: (context, _) {
         final l = AppLocalizations.of(context);
         final store = AdaptiveStore.instance;
@@ -289,7 +292,7 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
           return const Center(child: CircularProgressIndicator());
         }
         if (store.patternsError != null && data == null) {
-          return _ErrorState(
+          return LoadErrorState(
             message: l.adaptivePatternsError,
             onRetry: store.fetchPatterns,
           );
@@ -324,8 +327,7 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
               // what they are in — so it renders exactly when it is load-
               // bearing, rather than permanently apologising for a `\$` that
               // is no longer there.
-              if (currency == null)
-                _emptyLine(l.adaptivePatternsCurrencyNote),
+              if (currency == null) _emptyLine(l.adaptivePatternsCurrencyNote),
               if (data.vendors.isEmpty)
                 _emptyLine(l.adaptivePatternsEmptyVendors)
               else
@@ -388,7 +390,13 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
         ? l.adaptivePatternsUnconverted(v.unconvertedCount)
         : null;
     return Semantics(
-      label: [v.vendorName, summary, consistency, money, ?unconverted].join(', '),
+      label: [
+        v.vendorName,
+        summary,
+        consistency,
+        money,
+        ?unconverted,
+      ].join(', '),
       excludeSemantics: true,
       child: ListTile(
         contentPadding: EdgeInsets.zero,
@@ -433,7 +441,7 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
           return const Center(child: CircularProgressIndicator());
         }
         if (store.anomaliesError != null && batch == null) {
-          return _ErrorState(
+          return LoadErrorState(
             message: l.adaptiveAnomaliesError,
             onRetry: store.fetchAnomalies,
           );
@@ -652,33 +660,6 @@ class _SuggestionStatusBadge extends StatelessWidget {
             fontSize: 12,
             fontWeight: FontWeight.w600,
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _ErrorState extends StatelessWidget {
-  final String message;
-  final Future<void> Function() onRetry;
-
-  const _ErrorState({required this.message, required this.onRetry});
-
-  @override
-  Widget build(BuildContext context) {
-    final l = AppLocalizations.of(context);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.error_outline, size: 48, color: Colors.red.shade700),
-            const SizedBox(height: 12),
-            Text(message, textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            FilledButton(onPressed: onRetry, child: Text(l.commonRetry)),
-          ],
         ),
       ),
     );

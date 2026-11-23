@@ -13,7 +13,7 @@ forecast variance). Both are computed by pure functions in
 | Layer | File | Purpose |
 |---|---|---|
 | Compute | `app/services/analytics.py` | Pure functions — DPO, processing time, supplier concentration, ... |
-| Operational dashboard | `app/api/dashboard.py` | Pipeline / aging / processing time / approval bottleneck / discount capture (AP clerk + manager + CFO) |
+| Operational dashboard | `app/api/dashboard.py` (route) + `app/services/dashboard_metrics.py` (one function per section) | Pipeline / aging / processing time / approval bottleneck / discount capture (AP clerk + manager + CFO) |
 | CFO dashboard | `app/api/analytics.py::get_cfo_analytics` | DPO + trend, CCC, accruals, working-capital impact, supplier concentration, fraud-rate trend, rebate yield (admin + CFO only) |
 | Drill-through | `/api/analytics/drill/*` | Per-metric "show me the rows" endpoints (spend_concentration, dpo) |
 | Cash-flow forecasting | `/api/analytics/{cashflow_forecast,cashflow_whatif,cash_position}` | Predictive AP outflow buckets, payment-timing what-if, running cash position with bank-balance auto-sync (admin + CFO only). Web dashboard at `/cfo`. |
@@ -112,8 +112,9 @@ Existing fields stay: `pipeline`, `vendor_spend`, `aging`,
   was a partial slice of a month — sometimes a seventh, stub bucket of a
   fortnight's data — that reads as a spend collapse and shifts every single day
   as the window slides.
-- `upcoming_payments` — the (at most ten) unpaid invoices due within seven days
-  or overdue. Each row's `amount` is the invoice's **face** amount, in the
+- `upcoming_payments` — the (at most ten) unpaid invoices due within
+  `open_ap_due.DUE_SOON_DAYS` (seven) days or overdue, the same constant
+  `due_soon_count` reads, so the two windows cannot drift. Each row's `amount` is the invoice's **face** amount, in the
   row's own `currency` (the invoice's) — not a reporting figure. Label each row
   with that code, never with `reporting.reporting_currency` or the org's: the
   row carried no code until `docs/decisions.md` §200, so the web dashboard
@@ -229,7 +230,7 @@ SELECT vendor_name, coalesce(sum(<rep_expr>), 0) AS total
 `aging_reporting` buckets and the `monthly_trend` reporting column use — the
 row's persisted `reporting_amount` when it is locked *for the org's reporting
 currency*, else face `amount`. There is one expression, built once in
-`api/dashboard.py`, so the tile cannot drift from the rollup beside it.
+`services/dashboard_metrics.DashboardScope`, so the tile cannot drift from the rollup beside it.
 
 It used to `SELECT` five columns of **every** non-rejected invoice — all time,
 no `LIMIT` — and fold them in Python through
@@ -320,7 +321,7 @@ SELECT bucket,
            END AS bucket,
            …                              -- the per-row figures, below
       FROM invoices
-      JOIN payment_schedules ON …
+      JOIN <latest_schedules()> ON …     -- one schedule per invoice
       LEFT JOIN payments ON … AND payments.status = 'completed'
      WHERE discount_percent IS NOT NULL AND <entity scope>
      GROUP BY invoices.id, …, discount_percent, discount_date
@@ -350,8 +351,13 @@ Three details are load-bearing:
   TimeZone, so a payment at 23:30 UTC on the deadline would miss its own
   discount window on any server configured east of UTC — the same class of bug
   `utils/dates.utc_today` exists to prevent.
-- **The inner `GROUP BY` is the fold's, unchanged.** An invoice carrying two
-  payment schedules on different terms was two rows before and is two rows now.
+- **One row per invoice, on its current schedule.** The join is to
+  `services/payment_schedules.latest_schedules()` (a `DISTINCT ON` over
+  `LATEST_SCHEDULE_ORDER`), not the table. The port first kept the fold's
+  per-schedule grouping, so an invoice carrying a superseded schedule on
+  different terms was two eligible rows and its discount counted twice; an
+  invoice is one discount, on the terms the cash forecast and the discount
+  engine read for it too. Pinned in `tests/test_payment_schedule_latest.py`.
 
 What stays in Python is what was never per-row: the three-bucket vocabulary,
 the `captured / (captured + missed)` rate, and the `insufficient_data` state.
@@ -615,6 +621,27 @@ every one of those rows carries the approval stamp.
 If a dashboard delta needs explaining, the honest sentence is: *the metric
 stopped counting invoices that never went through approval.*
 
+### First-run fields — `organization_has_invoices` and `onboarding`
+
+Two fields describe the WORKSPACE rather than the figures (`docs/decisions.md`
+§315):
+
+- `organization_has_invoices` — whether the organization has any invoice,
+  **ignoring `X-Entity-ID`**. Every other figure here is entity-scoped, so
+  `total_invoices == 0` on a new subsidiary says nothing about whether the
+  workspace is new. Consolidated, the scoped count already answers it; with an
+  entity selected and nothing in it, one `LIMIT 1` probe does.
+- `onboarding` — the setup checklist's facts (`company`, `users`, `security`,
+  `erp`, `vendors`, `workflow`, `email_intake`), sent **only to an admin on a
+  workspace with no invoices** and `null` to everyone else, who pay for none of
+  its queries. Each flag is derived on read from data another feature owns —
+  no tracking table, no write — by `services/onboarding.compute_onboarding`; the
+  module docstring says exactly which fact each flag reads.
+
+`GET /api/dashboard/onboarding` (admin-only) serves the same derivation, plus
+`organization_has_invoices`, to `/organization`'s Getting started panel without
+computing a dashboard. Tests: `tests/test_dashboard_onboarding.py`.
+
 ## CFO metrics (`GET /api/analytics/cfo`)
 
 Query params: `period_days` (default 365, range 30–730).
@@ -649,19 +676,23 @@ Response:
   total_accrual}` fields beside it stay the **naive sums across currencies**,
   kept for API back-compat like `total_spend` — a EUR purchase order added to a
   USD one is denominated in nothing (`docs/decisions.md` §197).
+- `accruals.unverifiable_po_count` — a COUNT of distinct POs left out of the
+  open-PO and received legs because their total is one the ERP no longer
+  vouches for (`purchase_orders.total_unverifiable_reason`, decisions §323).
+  Excluded and counted (§35); the card prints it beside the legs as a floor.
 - `accruals.{open_po_amount, received_amount, unposted_invoice_amount, total_accrual}`
   (`received_amount` values goods physically received but not yet
   invoiced — the GR/IR accrual leg. The 3-way match is fanned out per
   PO: each receipted PO contributes `po_total × min(1, gr_qty/po_qty)`,
   the same received-fraction the PO matcher computes. The open-PO leg counts
   only POs that are still live — `models/procurement.DEAD_PO_STATUSES`
-  (`cancelled` / `closed` / `voided`) are excluded, the same roster the budget
+  (`cancelled` / `closed` / `voided`, and `unissued`, an order the ERP has not issued yet — decisions §394) are excluded, the same roster the budget
   commitment leg uses; it used to sum every PO the tenant had ever raised, so a
   cancelled order stayed a commitment forever. POs with no
   quantified lines but a booked receipt count as fully received;
   receipts with no PO link can't be priced and are excluded. Pure math
   in `analytics.value_received_goods`; SQL fan-out in
-  `api/analytics._received_amounts`, which returns the whole-book figure and the same valuation grouped by each PO's currency.)
+  `api/analytics._received_amounts`, which returns the whole-book figure and the same valuation grouped by each PO's currency. A failed read there fails the request, which `/cfo` shows as a load error; it is never reported as nothing received.)
 - `working_capital_impact_5_days` — `avg_daily_outflow × 5`
 - `supplier_concentration.{top_10_share_pct, top_50_share_pct, largest_vendor, largest_vendor_share_pct, flagged}` — `flagged=true` iff the largest vendor **reaches or** exceeds 25% (configurable; the boundary is inclusive on purpose — a risk flag that stays dark at exactly the configured limit is the wrong direction to be wrong in). **Every share is computed against the whole period's spend**, never a top-N subtotal: `compute_supplier_concentration` derives its denominator from the list it is handed and takes its own `[:10]`/`[:50]` cuts, so the caller must pass the full vendor set and slice only for display. Passing a pre-sliced top-50 made `total_spend` the top-50 subtotal, inflated `top_10_share_pct` / `largest_vendor_share_pct` (and with them `flagged`), and pinned `top_50_share_pct` at exactly `100.0` on any tenant with 50+ vendors. The same rule governs `/drill/spend_concentration`, whose `total_spend` and `share_pct` are computed before `?limit=` is applied — otherwise `limit` silently rebased both and the drill disagreed with the tile it was opened from. Excludes `rejected` invoices (never real spend) — the SAME population its drill-through and the `vendor_spend` export/scheduled report use, so clicking from the tile into either agrees with the number the CFO started from. Also the SAME reporting-currency rollup as the dashboard's `vendor_spend` (see above) — a vendor's multi-currency invoices are converted before summing, never naively added across currencies
 - `supplier_concentration.unconverted_count` — invoices folded into `total_spend`, and therefore into every share above and into `flagged`, at **face value** because no locked exchange rate bridged them into the reporting currency. A count, not money; `0` on a single-currency tenant. See § Per-vendor spend is one query below
@@ -705,7 +736,7 @@ Five surfaces answer "what did we spend, by vendor":
 | its drill-through | `GET /api/analytics/drill/spend_concentration` | not `rejected` |
 | CSV export | `GET /api/analytics/export/vendor_spend` | not `rejected` |
 | emailed scheduled report | `services/scheduled_reports.py` | not `rejected` |
-| assistant `get_vendor_spend` tool | `services/assistant/tools/vendor_spend.py` | `_COMMITTED_STATUSES` |
+| assistant `get_vendor_spend` tool | `services/assistant/tools/vendor_spend.py` | `open_ap_due.COMMITTED_STATUSES` |
 
 The four AP surfaces run **one** builder,
 `currency_conversion.vendor_spend_grouped_select`, and reduce its output with
@@ -793,7 +824,7 @@ fails on both shapes:
    either spelling (`totals[k] += x` or `totals[k] = totals.get(k, 0) + x`).
 
 A **projection** — one output row per input row — is deliberately not matched,
-because three legitimate call sites are projections: `_commitment_rows`' cash
+because three legitimate call sites are projections: `commitment_rows`' cash
 commitments, the dashboard's ten upcoming payments, and its per-row discount
 economics all need the converted value on each row, not a total. Neither is a
 bounded scalar `total += x`. The detector is itself tested against synthetic
@@ -1005,7 +1036,8 @@ returns a coherent one-row breakdown whose row equals the consolidated block.
 | `reporting_total_spend`, `reporting_outstanding_amount` | `reporting_currency` (the org's, same on every row). A foreign invoice with no locked rate is counted at **face value**, and the matching `*_unconverted_count` says how many. The consolidated spend figure is the same population and rollup as `/cfo`'s `reporting_spend`, so the two cannot disagree. |
 | `total_spend`, `outstanding_amount` | **Nothing** — naive `SUM`s across currencies, kept for API back-compat. Never render them. |
 | `open_po_amount` | **Nothing** — a naive `SUM` across the PO currencies, kept for back-compat. Never render it: `open_po_by_currency` is the figure. |
-| `open_po_by_currency[]` | Each `{currency, amount}` in its OWN `currency` — the PO's `purchase_orders.currency` (migration 0099). `currency: null` is the entry for POs that record none; it renders bare and is never merged into another. Ordered by code with that entry last, the same order `/cfo`'s `accruals.by_currency` uses, and the consolidated row equals the sum of the entity rows per currency. |
+| `open_po_by_currency[]` | Each `{currency, amount}` in its OWN `currency` — the PO's `purchase_orders.currency` (migration 0099). `currency: null` is the entry for POs that record none; it renders bare and is never merged into another. Ordered by code with that entry last, the same order `/cfo`'s `accruals.by_currency` uses, and the consolidated row equals the sum of the entity rows per currency. A PO marked `total_unverifiable_reason` is left out (decisions §323). |
+| `open_po_unverifiable_count` | A COUNT: open POs left out of `open_po_by_currency` because the ERP could not confirm their total at its last sync. The by-entity card prints the consolidated row's count under the table. |
 | `currency` (entity row) | Not a denomination: the entity's configured currency, `NULL` meaning "the org's reporting currency". It labels no figure. |
 
 The web surface is the `By entity` table on `/cfo`
@@ -1025,7 +1057,10 @@ once Open POs went bare, to show one unlabelled sum across PO currencies (§197)
 Read-only, admin + CFO only. All three resolve the tenant DB through
 `get_tenant_db`. Source rows: open invoices `LEFT JOIN payment_schedules`
 on `invoice_id`, timed on the schedule's `due_date` (falling back to
-`Invoice.due_date`), bounded to `[today, today + horizon_days]`. Money is
+`Invoice.due_date`), bounded in SQL at the **future** edge only
+(`due <= today + horizon_days`; a row with no due date cannot be timed and is
+left out). AP already **past due** is kept — see
+[Overdue AP is carried into the first period](#overdue-ap-is-carried-into-the-first-period). Money is
 `Decimal` end-to-end and serialises as an **exact decimal string** (see
 [Money serialisation](#money-serialisation)). No writes, no audit rows, no new
 migration — pure aggregate math, like `forecast_variance`.
@@ -1040,12 +1075,66 @@ migration — pure aggregate math, like `forecast_variance`.
 
 `GET /cashflow_forecast?granularity=day|week|month&horizon_days=N&include_pending=bool`
 — per-period `{scheduled_amount, committed_amount, pending_amount,
-discount_eligible_amount, count, unconverted_count}` plus a `totals` rollup.
-Weeks are Monday-anchored. Default `granularity=week`, `horizon_days=90`.
+overdue_amount, discount_eligible_amount, count, overdue_count,
+unconverted_count}` plus a `totals` rollup. Weeks are Monday-anchored. Default
+`granularity=week`, `horizon_days=90`.
+
+### Overdue AP is carried into the first period
+
+An open invoice whose effective due date is already **before today** is the
+most certain outflow the business has: it is owed now. `commitment_rows` used
+to drop it (`due < today → continue`), so the forecast, `/cash_position`'s
+curve, the what-if, every copilot planning tool, the `get_payment_forecast`
+assistant tool and the shortfall-alert sweep all overstated cash by exactly the
+AP the business was already late paying. Probed: USD 1,000 due yesterday + USD
+200 due in five days reported `committed_amount: "200.00"`, `count: 1`.
+
+The rule now:
+
+- `commitment_rows` keeps the row, flags it `overdue: True` and leaves its real
+  `due_date` alone. The SQL bound is on the future edge only. The row set, its
+  effective due date and the flag come from `services/open_ap_due`
+  (`open_ap_due_population`, `is_overdue`), the select the dashboard's
+  `overdue_*` and `GET /api/invoices?overdue=true` join too.
+- `services/analytics.bucket_outflows` times a flagged row on **today** — it
+  cannot leave in the past — so it lands in the period containing today, the
+  forecast's first. It counts in `scheduled_amount` and `count` and on its own
+  `overdue_amount` / `overdue_count`, **instead of** `committed_amount` /
+  `pending_amount`. So `scheduled = committed + pending + overdue`, and
+  `committed_amount` keeps meaning "firm AP falling due in this period": a late
+  thousand is named as late, not folded into a figure that implies it is on
+  schedule. Both committed and in-review invoices can be overdue;
+  `include_pending=false` drops the in-review ones with the rest of the
+  pipeline.
+- The flag is explicit rather than inferred from `due_date < today` because
+  the same function buckets **settled payments** by completion date for a
+  saved plan's variance (`api/cash_flow`), which must stay where they happened.
+- `/cash_position` subtracts it in the first period's `outflow` (and reports
+  `overdue_amount` per period and `overdue_amount` / `overdue_count` at the top),
+  so the curve starts from the cash left once the late bills are paid. The
+  shortfall sweep reads the same curve and can now alert on overdue AP alone.
+- `/cashflow_whatif` never times an overdue row before today: `on_time` and
+  `early` (whose window closed by the due date) pay it today; `late` pays it at
+  `max(due + grace_days, today)`. Each scenario reports the same
+  `overdue_amount` / `overdue_count`, since re-timing cannot make it on time.
+- The `cashflow_forecast` CSV appends `overdue_amount`, `overdue_count` after
+  `count` (positional readers keep the first eight columns).
+- `/cfo` shows it everywhere a total includes it, so the visible parts always
+  sum: an "Overdue (owed now)" KPI card beside Committed and Pipeline (only
+  when `overdue_count > 0`), a note under the first cash-position row's
+  outflow, and an "incl. … already overdue" line on each what-if card. In the
+  bar chart the overdue segment is hatched and every adjacent pair of segments
+  is split by a 2px `--surface` rule, because `--danger` against `--accent` is
+  only 1.13:1 dark / 1.02:1 light (each segment is >= 5.5:1 against the rule).
+
+Guards: `tests/test_cashflow_forecast_api.py` (the probe, across the three
+endpoints), `tests/test_analytics.py` (pure bucketing / what-if / position),
+`tests/test_cash_flow_copilot.py`, `tests/test_cash_flow_alerts.py`,
+`tests/test_assistant.py`.
 
 ### One commitment row per invoice, whatever its schedule count
 
-`_commitment_rows` outer-joins `payment_schedules` for the authoritative due
+`commitment_rows` outer-joins `payment_schedules` for the authoritative due
 date + early-pay discount terms. That join was **un-deduped**: it returns one
 row per schedule, and the loop appends a commitment row for each — so an invoice
 carrying two `PaymentSchedule` rows was counted **twice, at its full amount**.
@@ -1058,10 +1147,13 @@ It is unreachable today only because nothing but `scripts/seed.py` constructs a
 `PaymentSchedule` — an accident of the current feature set, not a guarantee.
 
 The query now takes `DISTINCT ON (invoice_id) … ORDER BY invoice_id,
-created_at DESC, id DESC` — the LATEST schedule, mirroring
-`discount_auto_trigger._resolve_due_date`'s existing `ORDER BY created_at DESC
-LIMIT 1` on the same table, so the discount engine and the cash forecast cannot
-disagree about an invoice's due date. `created_at` defaults to
+created_at DESC, id DESC` — the LATEST schedule, by
+`services/payment_schedules.LATEST_SCHEDULE_ORDER`, the one rule the discount
+engine's `latest_schedule` (auto-capture sweep and per-invoice ROI) reads too,
+so the discount engine and the cash forecast cannot disagree about an invoice's
+due date. (Until issue #575 those two ordered by `created_at` alone and could
+pick the other row of a same-transaction tie;
+`tests/test_payment_schedule_latest.py` pins all three to one answer.) `created_at` defaults to
 `transaction_timestamp()`, so rows written in one commit share a timestamp and
 "latest" is genuinely undefined between them; the `id` tiebreak only makes that
 case **deterministic** (a copilot `plan_id` must not flap between reads), it
@@ -1071,7 +1163,7 @@ does not invent an ordering. Guard:
 ### `unconverted_count` — the outflow-side currency caveat
 
 Every commitment row is expressed in the org's **reporting** currency via the
-rate locked on the invoice (`_commitment_rows` → `reporting_amount_for_row`).
+rate locked on the invoice (`commitment_rows` → `reporting_amount_for_row`).
 A foreign invoice with no usable lock is included at **face value** — dropping
 it would understate the outflow — and flagged. That flag is now surfaced as
 `unconverted_count`: per period on `/cashflow_forecast` and `/cash_position`,
@@ -1179,8 +1271,8 @@ returning "no threshold" rather than raising.
 | `invoice_register` | invoice_id, invoice_number, vendor_name, amount, currency, status, invoice_date, due_date, created_at, po_number |
 | `vendor_spend` | vendor_name, invoice_count, total_amount, currencies, unconverted_count |
 | `payment_register` | payment_id, invoice_id, invoice_number, vendor_name, amount, currency, method, status, provider, reference, submitted_at, completed_at |
-| `aging_snapshot` | as_of_date, current, days_30, days_60, days_90, days_90_plus, total, reporting_currency, unconverted_count. The bands are in the org's **reporting currency** — the rate locked on each invoice, else face value, with those face-value rows counted on `unconverted_count` (the dashboard `aging_reporting` rule, and the figure the CFO `reporting_accounts_payable_balance` they reconcile with uses). Both the export route and the emailed report call ONE builder, `api/analytics._aging_snapshot_buckets`; they used to be two hand-copied loops that summed raw `Invoice.amount` across currencies, so a ¥1,000,000 invoice sat in a band as "1000000.00" beside dollars in a file that names no currency. `as_of_date` defaults to `utc_today()` — neither caller passes `snapshot_date`, and both bucket against a UTC `today`, so a local-time default labelled the file with one date while the buckets were computed as of another |
-| `cashflow_forecast` | period, period_start, period_end, scheduled_amount, committed_amount, pending_amount, discount_eligible_amount, count |
+| `aging_snapshot` | as_of_date, current, days_30, days_60, days_90, days_90_plus, total, reporting_currency, unconverted_count. The bands are in the org's **reporting currency** — the rate locked on each invoice, else face value, with those face-value rows counted on `unconverted_count` (the dashboard `aging_reporting` rule, and the figure the CFO `reporting_accounts_payable_balance` they reconcile with uses). Both the export route and the emailed report call ONE builder, `ap_commitments.aging_snapshot_buckets`; they used to be two hand-copied loops that summed raw `Invoice.amount` across currencies, so a ¥1,000,000 invoice sat in a band as "1000000.00" beside dollars in a file that names no currency. `as_of_date` defaults to `utc_today()` — neither caller passes `snapshot_date`, and both bucket against a UTC `today`, so a local-time default labelled the file with one date while the buckets were computed as of another |
+| `cashflow_forecast` | period, period_start, period_end, scheduled_amount, committed_amount, pending_amount, discount_eligible_amount, count, overdue_amount, overdue_count. The last two are the AP already past due, carried into the first period (inside `scheduled_amount`, outside committed / pending — see [Overdue AP](#overdue-ap-is-carried-into-the-first-period)); a caller reporting no overdue figure exports them blank, not `0` |
 | `expense_register` | date, merchant, category, amount, currency, gl_code, payment_method, status, report_number |
 
 `cashflow_forecast` is forward-looking — it takes `granularity` +

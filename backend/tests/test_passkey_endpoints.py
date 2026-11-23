@@ -25,6 +25,10 @@ from fastapi import HTTPException
 
 from tests.test_webauthn import RP_ID, SoftAuthenticator, _challenge_from_options
 
+# Mock-DB tests: a refused step-up writes an audit row through its own control-plane/tenant
+# sessions (tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("no_auth_audit_write")
+
 
 def _fake_user(*, mfa_enabled: bool = False):
     return SimpleNamespace(
@@ -302,7 +306,7 @@ async def test_passkey_register_start_refused_without_step_up_when_totp_is_live(
     from app.api import auth as auth_mod
 
     user = _fake_user(mfa_enabled=True)
-    user.mfa_secret = "JBSWY3DPEHPK3PXP"
+    user.mfa_secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     db = _RegDB(existing=[])
 
     with patch("app.api.auth.settings.mfa_enabled", True):

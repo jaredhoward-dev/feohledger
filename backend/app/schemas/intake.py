@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field
 
 from app.api.pagination import PageMeta
 from app.models.procurement import IntakeStatus, IntakeType
+from app.schemas.action_verdict import CodedRefusal
+from app.schemas.currency import CurrencyCode, OptionalCurrencyCode
 from app.schemas.money import OptionalMoneyAmount
 
 # ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ class IntakeRequestBase(BaseModel):
     description: str | None = None
     # Digits match `intake_requests.estimated_amount` Numeric(15, 2).
     estimated_amount: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
-    currency: str = Field(default="USD", max_length=3)
+    currency: CurrencyCode = "USD"
     vendor_name: str | None = Field(default=None, max_length=255)
     vendor_id: str | None = None
     # Flexible intake questionnaire answers (advisory; no PII).
@@ -63,12 +65,29 @@ class IntakeRequestUpdate(BaseModel):
     description: str | None = None
     # Digits match `intake_requests.estimated_amount` Numeric(15, 2).
     estimated_amount: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
-    currency: str | None = Field(default=None, max_length=3)
+    currency: OptionalCurrencyCode = None
     vendor_name: str | None = Field(default=None, max_length=255)
     vendor_id: str | None = None
     form_data: dict | None = None
     needed_by: date | None = None
     justification: str | None = None
+
+
+class IntakeActions(BaseModel):
+    """The caller's verdict on an intake row's lifecycle actions, each the
+    coded refusal the endpoint would answer with or ``None`` — computed by the
+    endpoints' own gates (``api/intake.intake_action_refusals``, issue #575).
+    Required, not defaulted: a ``None`` nobody computed would read as
+    "allowed". Every intake response carries it, mutations included, so a row
+    the page upserts from a mutation keeps its verdicts."""
+
+    submit: CodedRefusal | None
+    approve: CodedRefusal | None
+    reject: CodedRefusal | None
+    convert: CodedRefusal | None
+    cancel: CodedRefusal | None
+    reopen: CodedRefusal | None
+    delete: CodedRefusal | None
 
 
 class IntakeRequestResponse(BaseModel):
@@ -90,6 +109,7 @@ class IntakeRequestResponse(BaseModel):
     converted_po_id: str | None
     created_at: str
     updated_at: str
+    actions: IntakeActions
 
 
 class IntakeRequestListResponse(PageMeta):

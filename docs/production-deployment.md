@@ -116,13 +116,26 @@ named tenant DB. Deployed by the `lambdas` job in `aws-deploy.yml`.
 | MinIO container | S3 |
 | localhost | Route 53 + CloudFront + ALB |
 
+**TLS certificate monitoring.** On this architecture every public certificate
+is ACM's (CloudFront and the ALB), renewed by ACM and watched by the
+`DaysToExpiry` alarm in `infra/uptime.tf`. The single-VM stack that runs today
+(`docs/minimal-deployment.md`) also serves `api.<domain>` on a Let's Encrypt
+certificate Caddy renews on the VM, which no AWS metric sees; `infra/canary.tf`
+watches it with an hourly CloudWatch Synthetics canary that validates the
+certificate and pages under 14 days to expiry (`infra/README.md` § Certificate
+canary). Moving the API behind the ALB retires that canary along with Caddy's
+certificate.
+
 ## Environment Configuration
 
 The FastAPI app uses `pydantic-settings` (`backend/app/config.py`) with the `FEOH_` prefix. **Every variable below MUST be prefixed with `FEOH_`** — pydantic-settings ignores unprefixed names and silently falls back to defaults.
 
 ```env
 # Database
-FEOH_DATABASE_URL=postgresql+asyncpg://user:pass@rds-host:5432/feohledger
+# The app role with no password: IAM auth mints a token per connection
+# (docs/decisions.md §310). The task role needs rds-db:connect on feoh_app.
+FEOH_DATABASE_URL=postgresql+asyncpg://feoh_app@rds-host:5432/feohledger
+FEOH_DATABASE_IAM_AUTH=true
 FEOH_TENANT_DB_PREFIX=feoh_
 # Database TLS — unprefixed, read by asyncpg and libpq alike. The image already
 # sets PGSSLROOTCERT to the RDS CA bundle (backend/Dockerfile); every task and
@@ -173,6 +186,25 @@ FEOH_HCAPTCHA_SITEKEY=<from hCaptcha dashboard>
 
 See `docs/environment.md` for the full var list including extraction, ERP, and card platform keys.
 
+**The API and the tenant app must be same-site, and `FEOH_CORS_PRODUCTION_DOMAIN`
+must name the domain they share** (`api.feohledger.com` beside
+`<slug>.feohledger.com`, with `FEOH_CORS_PRODUCTION_DOMAIN=feohledger.com`). The
+ERP OAuth connect binds itself to the admin's browser with an HttpOnly
+`SameSite=Lax` cookie the credentialed `/authorize` fetch sets on the API host,
+and a browser refuses that cookie from a cross-site response. A deployment that
+puts the API on another registrable domain cannot connect an OAuth ERP at all:
+`/authorize` answers a coded 409 rather than fail after the consent screen.
+White-label tenants on a custom domain connect from their `<slug>.<domain>`
+address. See `backend/docs/erp-integration.md` § Connecting an OAuth ERP.
+
+**`FEOH_CORS_PRODUCTION_DOMAIN` is the only source of allowed origins in a
+deployed environment.** With `FEOH_ENVIRONMENT` set to a deployed value, the API
+admits no `localhost` / loopback origin: the dev pattern is off and the loopback
+entries of `FEOH_CORS_ORIGINS`' default are dropped, since a credentialed CORS
+response to a page on the visitor's own machine is not something production
+needs. Leave `FEOH_CORS_ORIGINS` unset; an explicit list is used as written and
+logs a warning at boot if it names a loopback origin.
+
 ## Network Architecture
 
 - **VPC** with public and private subnets across 2+ AZs
@@ -203,6 +235,7 @@ backend moves to ECS, that publish step moves with it.
 |---|---|---|
 | `backend` | ECS / Fargate | `docker build backend` → push to ECR (commit-SHA tag) → register a new task-definition revision with that image → **run DB migrations** (one-off Fargate task) → `update-service` → wait for stable |
 | `lambdas` | Lambda (extraction / ERP / audit) | `needs: backend` → point every function in `LAMBDA_FUNCTIONS` at the **same** image the backend job just pushed (`update-function-code --image-uri`) → wait for update |
+| `smoke` | the deployed stack, through public DNS | `needs: [backend, lambdas]`, the last job, no environment (no AWS call, no secret, no second approval) → `deploy/smoke.sh`, the script `deploy.sh` also ends with: the apex, `api/health`, `SMOKE_TENANT_HOST` over a valid certificate, and `/api/public-config` reporting `SIGNUP_ENABLED` (plus a captcha site key while signup is on). Any failure, or an unset variable, fails the run |
 
 `.github/workflows/mobile-release.yml` builds the mobile artifacts on a `mobile-v*`
 tag (`git tag mobile-v1.0.0 && git push origin mobile-v1.0.0`) or a manual run —
@@ -244,6 +277,17 @@ rolling the service, so new code never serves against an un-migrated schema and
 the revision fans out to **every tenant DB** (not just the control plane). A
 non-zero exit fails the job and the service is never rolled. This needs the
 task's network placement — `ECS_SUBNETS` + `ECS_SECURITY_GROUPS` below.
+
+A revision can refuse on data only an operator can resolve, and then the
+deploy stops before rolling anything. **0138** (email addresses unique without
+regard to case, decisions §475) is one: it stops with `EmailCaseCollision` when
+two `users` rows (control plane), or two `vendor_users` rows in one tenant,
+hold the same address apart from case. The message names the table, database
+and counts, never an address. Before deploying a release that carries 0138, run
+the two id-only queries in `backend/docs/database.md` § Email case collisions;
+if either returns a row, resolve each pair with the workspace's administrator
+first. The same applies to the VM path (`deploy/deploy.sh` migrates before
+rolling too).
 
 ### Lambda workers (extraction / ERP / audit)
 
@@ -300,7 +344,10 @@ least-privilege policy lands with the workload stack it has to name — tracked 
 | `ECS_SUBNETS` | variable | environment | Comma-separated private subnet IDs for the one-off migration task (e.g. `subnet-a,subnet-b`). |
 | `ECS_SECURITY_GROUPS` | variable | environment | Comma-separated security-group IDs for the migration task (needs DB egress). |
 | `LAMBDA_FUNCTIONS` | variable | environment | Comma/space-separated Lambda function names for the async workers (extraction / ERP / audit). Each is updated to the new image. |
-| `PUBLIC_API_URL` | variable | **repository** | API base URL — the backend job's deploy URL. Also baked into the SPA build in `vm-deploy.yml`'s ungated `build-frontend` job, which is why it is repository-scoped. |
+| `PUBLIC_API_URL` | variable | **repository** | API base URL — the backend job's deploy URL. Also baked into the SPA build in `vm-deploy.yml`'s ungated `build-frontend` job, which is why it is repository-scoped. The `smoke` job checks its `/api/health` and `/api/public-config`; it strips only an `https://` prefix, so set an https origin with no path (`https://api.feohledger.com`). |
+| `APP_URL` | variable | **repository** | The public site origin (`https://feohledger.com`); shared with `vm-deploy.yml`. The `smoke` job checks its apex; an https origin with no path or trailing slash. |
+| `SMOKE_TENANT_HOST` | variable | **repository** | A tenant host the `smoke` job fetches to prove tenant TLS (e.g. `sandbox.feohledger.com`). |
+| `SIGNUP_ENABLED` | variable | **repository** | `true` / `false` — what `FEOH_SIGNUP_ENABLED` is in the deployed env, which `public-config` must report. Repository-scoped because the `smoke` job has no environment. **Shared with `vm-deploy.yml`**, whose `smoke` job runs the same check after every VM release (with `APP_URL`, `PUBLIC_API_URL` and the synthetic tenant host `smoke-check.<apex>`); unset, that job fails the release. |
 
 The SPA publish's own settings (`APP_URL`, `FRONTEND_PUBLISH_ENABLED`,
 `FRONTEND_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`) belong to `vm-deploy.yml` and
@@ -321,10 +368,11 @@ a release won't turn it red before the infrastructure exists. To go live:
    The RIC is already bundled in the image, so nothing else is needed here.
 3. Attach the deploy role's least-privilege policy (the role itself already
    exists — see *Credentials*) and store `AWS_DEPLOY_ROLE_ARN`.
-4. Set the environment variables above on the `production` environment and the
+4. Set the repository variables above (`PUBLIC_API_URL`, `APP_URL`,
+   `SMOKE_TENANT_HOST`, `SIGNUP_ENABLED`), the environment variables above on the `production` environment, and the
    protection rules (reviewer / wait timer).
 5. Set the repository variable `AWS_DEPLOY_ENABLED=true`.
 
-Until step 5, the AWS jobs (`backend`, `lambdas`) skip via the kill switch —
-`backend` on its `if:` guard, `lambdas` because it `needs: backend`. (`mobile-release.yml` does not run on a release at all — it
+Until step 5, the AWS jobs (`backend`, `lambdas`, `smoke`) skip via the kill
+switch — `backend` on its `if:` guard, the other two because they `needs:` it. (`mobile-release.yml` does not run on a release at all — it
 builds on a `mobile-v*` tag or by hand, gated by the `production` reviewer.)

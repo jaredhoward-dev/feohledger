@@ -80,6 +80,7 @@ async def _mk_invoice(
     dimension_value=None,
     invoice_date=None,
     status="paid",
+    approval_date=None,
 ):
     """One realised invoice, attributed on whichever dimension column is asked
     for — the rollup batches by dimension, so all four need exercising."""
@@ -97,6 +98,7 @@ async def _mk_invoice(
                 currency=currency,
                 entity_id=entity_id,
                 invoice_date=invoice_date,
+                approval_date=approval_date,
                 organization_id=org_id,
                 **{dimension: value},
             )
@@ -104,8 +106,13 @@ async def _mk_invoice(
         await s.commit()
 
 
-async def _mk_converted_requisition(realdb, key="a", *, budget_id, po_total, currency="USD"):
-    """A `converted` requisition plus the PO it became — leg 2 of `committed`."""
+async def _mk_converted_requisition(
+    realdb, key="a", *, budget_id, po_total, currency="USD", unverifiable_reason=None
+):
+    """A `converted` requisition plus the PO it became — leg 2 of `committed`.
+
+    ``unverifiable_reason`` marks the PO as one whose total the ERP's last sync
+    could not price (decisions §323)."""
     mk = realdb.sessionmaker(key)
     org_id = realdb.info(key).org_id
     po_id = uuid.uuid4()
@@ -118,6 +125,7 @@ async def _mk_converted_requisition(realdb, key="a", *, budget_id, po_total, cur
                 # Conversion stamps the requisition's code onto the PO.
                 currency=currency,
                 status="open",
+                total_unverifiable_reason=unverifiable_reason,
                 organization_id=org_id,
             )
         )
@@ -290,6 +298,47 @@ async def test_rollup_discloses_currency_excluded_rows(realdb):
     # The per-budget rollup carries the same disclosure.
     assert spend["actual"] == 300.0
     assert spend["excluded_row_count"] == 2
+
+
+async def test_a_po_whose_total_is_unverifiable_is_left_out_of_committed_and_counted(realdb):
+    """A converted PO the ERP could not price at its last sync (decisions §323)
+    keeps a total nobody vouches for. `committed` leaves it out and every spend
+    surface — rollup, `/spend`, `/check` — counts it, apart from the currency
+    disclosure, so a figure that is a floor says so."""
+    bid, _cc = await _mk_budget(realdb, amount="10000.00", currency="USD")
+    await _mk_converted_requisition(realdb, budget_id=bid, po_total="1200.00")
+    await _mk_converted_requisition(
+        realdb, budget_id=bid, po_total="4000.00", unverifiable_reason="unpriceable"
+    )
+    # Marked AND in another currency: counted once, as unverifiable.
+    await _mk_converted_requisition(
+        realdb,
+        budget_id=bid,
+        po_total="50.00",
+        currency="EUR",
+        unverifiable_reason="lines_unread",
+    )
+
+    async with realdb.client(key="a", role="cfo") as c:
+        body = (await c.get("/api/budgets/rollup")).json()
+        spend = (await c.get(f"/api/budgets/{bid}/spend")).json()
+        check = (
+            await c.get("/api/budgets/check", params={"budget_id": str(bid), "amount": "0"})
+        ).json()
+
+    usd = _by_ccy(body)["USD"]
+    assert usd["committed"] == "1200.00"
+    assert usd["unverifiable_po_count"] == 2
+    assert usd["excluded_row_count"] == 0
+    assert body["unverifiable_po_count"] == 2
+    assert body["excluded_row_count"] == 0
+
+    assert spend["committed"] == 1200.0
+    assert spend["unverifiable_po_count"] == 2
+    assert spend["excluded_row_count"] == 0
+
+    assert check["committed"] == 1200.0
+    assert check["unverifiable_po_count"] == 2
 
 
 async def test_rollup_excluded_count_is_zero_on_a_clean_set(realdb):
@@ -654,3 +703,34 @@ async def test_check_endpoint_reads_the_same_spend_as_the_rollup(realdb):
     assert Decimal(str(check["actual"])) == Decimal(usd["actual"])
     assert check["remaining_after"] == 600.0
     assert check["would_overspend"] is False
+
+
+async def test_actual_counts_an_invoice_mid_erp_push(realdb):
+    """Issue #575: the realised set was a hand-listed copy of "approved or
+    beyond" that left out `sending_to_erp`, so an approved invoice vanished
+    from `actual` while its ERP push was in flight (or stuck there) and
+    reappeared once it landed. Every approved-or-beyond status counts, and the
+    set IS the shared one rather than a copy of it."""
+    from app.models.invoice_status import APPROVED_OR_BEYOND_STATUSES
+    from app.services.budget_service import REALISED_INVOICE_STATUSES
+
+    assert set(REALISED_INVOICE_STATUSES) == {s.value for s in APPROVED_OR_BEYOND_STATUSES}
+
+    bid, cc = await _mk_budget(realdb, amount="1000.00")
+    await _mk_invoice(realdb, amount="120.00", cost_center=cc, status="sending_to_erp")
+    await _mk_invoice(realdb, amount="30.00", cost_center=cc, status="sent_to_erp")
+    # Approved, then the ERP push failed: still spend a human signed off. The
+    # approval stamp is the evidence (decisions §73 / §308).
+    await _mk_invoice(
+        realdb, amount="7.00", cost_center=cc, status="failed", approval_date=date(2026, 9, 1)
+    )
+    # `failed` with no approval stamp is a failed EXTRACTION — never reviewed.
+    await _mk_invoice(realdb, amount="500.00", cost_center=cc, status="failed")
+    # Not yet accepted — never realised spend.
+    await _mk_invoice(realdb, amount="999.00", cost_center=cc, status="ready_for_review")
+    async with realdb.client(key="a", role="cfo") as c:
+        spend = (await c.get(f"/api/budgets/{bid}/spend")).json()
+        rollup = (await c.get("/api/budgets/rollup")).json()
+    assert spend["actual"] == 157.0
+    # The rollup reads the same predicate, so it cannot disagree with /spend.
+    assert Decimal(_by_ccy(rollup)["USD"]["actual"]) == Decimal("157.00")

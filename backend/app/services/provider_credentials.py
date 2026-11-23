@@ -1,8 +1,9 @@
 """Tenant provider credentials: the one accessor, the one writer, the catalogue.
 
-The ERP, payment-rail and card-issuer blocks of `Organization.settings` each
-mix configuration (which provider, base URL, sandbox flag) with secrets (API
-keys, OAuth client secrets, account tokens, webhook signing secrets). The
+The ERP, payment-rail, card-issuer, commerce and BYOK-extraction blocks of
+`Organization.settings` each mix configuration (which provider, base URL,
+sandbox flag) with secrets (API keys, OAuth client secrets, account tokens,
+webhook signing secrets). The
 configuration stays in the JSONB. The secrets live sealed in
 `provider_credentials` (`models/provider_credential.py`, envelope-encrypted by
 `services/credential_crypto`) and are:
@@ -11,9 +12,12 @@ configuration stays in the JSONB. The secrets live sealed in
   exactly as the adapters always received it, secrets merged back in. Any
   secret-named key still sitting in the JSONB is ignored, so a stray plaintext
   value can never be what an adapter authenticates with.
-* **written through one writer** — :func:`update_secrets`, called only by the
-  audited `PUT /api/organization/credentials/{block}`. `PATCH
-  /api/organization` refuses a non-blank secret in these blocks.
+* **written through one writer** — :func:`update_secrets`, called by the
+  audited `PUT /api/organization/credentials/{block}` for
+  :data:`CREDENTIAL_BLOCKS` (`PATCH /api/organization` refuses a non-blank
+  secret in these blocks), and by a block's own audited endpoint for
+  :data:`DEDICATED_WRITER_BLOCKS` — the OIDC client secret, whose only writer
+  is `PUT /api/organization/sso`.
 * **never read back** — :func:`credential_status` reports which paths are set,
   by name, and nothing else.
 
@@ -40,8 +44,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.provider_credential import ProviderCredential
 from app.services import credential_crypto
 
-# The settings blocks whose secrets live here (`commerce`: decisions §273).
-CREDENTIAL_BLOCKS: tuple[str, ...] = ("erp", "payments", "cards", "commerce")
+# The settings blocks whose secrets live here and are written through the
+# generic `PUT /api/organization/credentials/{block}` (`commerce`: decisions
+# §273; `extraction`: the BYOK keys).
+CREDENTIAL_BLOCKS: tuple[str, ...] = ("erp", "payments", "cards", "commerce", "extraction")
+
+# Sealed here too, but NOT reachable through the generic credentials endpoint
+# or reported by its status: the block has its own audited writer that owns the
+# rest of the block's shape. `sso`: `PUT /api/organization/sso` (`client_secret`;
+# `GET /api/organization/sso` reports `client_secret_configured`).
+DEDICATED_WRITER_BLOCKS: tuple[str, ...] = ("sso",)
 
 # Per block: the keys that are secrets. Everything else in the block is
 # configuration and stays in the JSONB. Identifiers that are not secret on their
@@ -58,6 +70,7 @@ SECRET_FIELDS: dict[str, frozenset[str]] = {
             "client_secret",  # Business Central / Intacct / a bring-your-own OAuth app
             "consumer_secret",  # NetSuite TBA
             "token_secret",  # NetSuite TBA
+            "private_key",  # NetSuite OAuth 2.0 certificate key (JWT client assertion)
             "password",  # Sage Accounting (ZA) login
             "subscription_key",  # Blackbaud SKY API subscription key
             "operator_password",  # SYSPRO operator
@@ -80,6 +93,19 @@ SECRET_FIELDS: dict[str, frozenset[str]] = {
             "webhook_signing_secret",  # inbound card webhook HMAC key
         }
     ),
+    # A bring-your-own-key extraction org's provider secret. `aws_access_key_id`
+    # is an identifier and stays configuration, like an OAuth client id. Read
+    # by `services/extraction` (and the three side features that may reuse a
+    # `claude_vision` key) through :func:`byok_extraction_config`.
+    "extraction": frozenset(
+        {
+            "api_key",  # claude_vision (Anthropic) / openai_vision (OpenAI)
+            "aws_secret_access_key",  # aws_textract
+        }
+    ),
+    # The OIDC client secret (`services/sso`). Written only by
+    # `PUT /api/organization/sso`, read only by the OIDC callback.
+    "sso": frozenset({"client_secret"}),
     # Every field a commerce provider's spec marks `secret`
     # (`commerce_adapters/<key>.py`, decisions §273); `tests/test_commerce_adapters.py`
     # fails when a registered provider's secret is missing here. A new provider
@@ -124,6 +150,18 @@ CREDENTIALS_UNAVAILABLE_DETAIL = (
 
 class CredentialPathError(ValueError):
     """A path names no secret slot of the block. The message names the path."""
+
+
+class StoredCredentialUnopenableError(credential_crypto.CredentialCryptoError):
+    """:func:`update_secrets` could not open the block's STORED row to merge into it.
+
+    A subclass, so every existing ``except CredentialCryptoError`` still catches
+    it. The writers tell it apart from a seal failure because the two have
+    different ways out: a seal failure (KMS unreachable) is retried later, while
+    a row that will not open (its KMS key disabled, a changed dev
+    `FEOH_SECRET_KEY`) keeps every save of the block failing until it is cleared
+    with :func:`reset_block` (decisions §464).
+    """
 
 
 def _context(org_id: uuid.UUID, block: str) -> dict[str, str]:
@@ -370,12 +408,116 @@ async def config_for_connection_test(
 
         public = commerce_catalog.merge_commerce_update(saved, public)
         same = commerce_catalog.same_connection(saved, public)
+    elif block == "extraction":
+        # The form posts its whole panel — every provider's fields, never
+        # `program_type` — so the generic comparison would never match and a
+        # saved key could not be tested. What decides where an extraction key
+        # is sent is the provider alone (no adapter takes a key to a
+        # configurable host), so the stored key joins only for the saved one.
+        same = _extraction_provider(saved) is not None and _extraction_provider(
+            saved
+        ) == _extraction_provider(public)
     else:
         same = _comparable(block, request_cfg) == _comparable(block, saved)
     if same:
         stored = await load_secrets(org.id, block, db=db)
         return inject_secrets(block, public, {**stored, **own})
     return inject_secrets(block, public, own)
+
+
+def _extraction_provider(cfg: object) -> str | None:
+    """The block's ``provider``, stripped, or ``None`` when it names none."""
+    if not isinstance(cfg, Mapping):
+        return None
+    value = cfg.get("provider")
+    return (value.strip() or None) if isinstance(value, str) else None
+
+
+def extraction_secrets_to_drop(before: object, after: object) -> bool:
+    """Does a save of ``settings.extraction`` leave the stored key with a new provider?
+
+    ``claude_vision`` and ``openai_vision`` share the one ``api_key`` slot, so a
+    save that switches provider and keeps the stored key would post an OpenAI
+    secret to Anthropic (or the reverse) on the next extraction. `PATCH
+    /api/organization` drops the block's sealed secrets in the same
+    transaction when this is true; the admin types the new provider's key.
+    """
+    return _extraction_provider(before) != _extraction_provider(after)
+
+
+# Where a payment-rail or card-issuer secret is SENT: the provider, and the
+# sandbox flag that picks the host (`payment_adapters/{column,increase,dwolla,
+# checkeeper}.py`, `card_adapters/{lithic,nium}.py`), read with the default the
+# adapters apply when it is absent. A card block with no provider resolves
+# through its region (`card_adapters/dispatcher.get_card_adapter`), so the region
+# is part of the identity only then.
+_RAIL_SANDBOX_DEFAULT: dict[str, bool] = {"payments": True, "cards": False}
+
+
+def _rail_identity(block: str, cfg: object) -> tuple[str | None, str | None, bool]:
+    cfg = cfg if isinstance(cfg, Mapping) else {}
+    provider = _extraction_provider(cfg)
+    region = None
+    if block == "cards" and provider is None:
+        raw_region = cfg.get("region")
+        region = (raw_region.strip() if isinstance(raw_region, str) else "") or "US"
+    return provider, region, bool(cfg.get("sandbox", _RAIL_SANDBOX_DEFAULT[block]))
+
+
+def rail_secrets_to_drop(block: str, before: object, after: object) -> frozenset[str]:
+    """The sealed paths a save of ``settings.payments`` / ``settings.cards`` strands.
+
+    A key is typed for one provider in one environment. The block's own
+    secrets (``api_key``, ``client_secret``, the webhook key) go when the save
+    changes the provider or its sandbox flag (for cards with no provider, the
+    region that picks one) — kept, the next call would send them to the new
+    provider's host. A multi-route entry's secrets
+    (``providers.<provider>.<field>``) are already keyed by its provider, so
+    they go when that entry is removed or its own sandbox flag changes.
+    `PATCH /api/organization` clears the returned paths that are actually
+    stored, in the save's transaction, audited (decisions §271's shape for the
+    ERP block). Pure: no I/O.
+    """
+    if block not in _RAIL_SANDBOX_DEFAULT:
+        raise CredentialPathError(f"{block} is not a payment or card block.")
+    fields = SECRET_FIELDS[block]
+    drop: set[str] = set()
+    if _rail_identity(block, before) != _rail_identity(block, after):
+        drop |= fields
+    list_key = _PROVIDER_LISTS.get(block)
+    if list_key:
+
+        def _entries(cfg: object) -> dict[str, Mapping]:
+            raw = cfg.get(list_key) if isinstance(cfg, Mapping) else None
+            out: dict[str, Mapping] = {}
+            for entry in raw if isinstance(raw, list) else []:
+                if isinstance(entry, Mapping) and entry.get("provider"):
+                    out.setdefault(str(entry["provider"]), entry)
+            return out
+
+        old, new = _entries(before), _entries(after)
+        for name, entry in old.items():
+            if name not in new or _rail_identity(block, entry) != _rail_identity(block, new[name]):
+                drop |= {f"{list_key}.{name}.{f}" for f in fields}
+    return frozenset(drop)
+
+
+async def byok_extraction_config(
+    org_id: uuid.UUID, settings: Mapping | None, *, db: AsyncSession | None = None
+) -> dict | None:
+    """The BYOK extraction block with its sealed secrets, or ``None`` when not BYOK.
+
+    THE read path for a tenant's own extraction key: `services/extraction`
+    (adapter config) and the side features that may reuse a `claude_vision` key
+    (`audit_summary`, `llm_fraud_detection`, the exception-agent rationale).
+    A platform-mode org needs no tenant secret, so it costs no control-plane
+    read and no unseal. A secret-named key left in the JSONB is ignored, as in
+    :func:`resolve_block`.
+    """
+    extraction = (settings or {}).get("extraction")
+    if not isinstance(extraction, Mapping) or extraction.get("program_type") != "byok":
+        return None
+    return await resolve_block(org_id, settings, "extraction", db=db) or {}
 
 
 async def settings_with_secrets(org, *blocks: str, db: AsyncSession | None = None) -> dict:
@@ -389,6 +531,24 @@ async def settings_with_secrets(org, *blocks: str, db: AsyncSession | None = Non
         if resolved is not None:
             out[block] = resolved
     return out
+
+
+async def stored_secret_paths(org, block: str, *, db: AsyncSession) -> frozenset[str]:
+    """The secret paths sealed in ``org``'s ``block`` row — names only, no decrypt.
+
+    For a caller that must decide whether opening the row is worth it before
+    it opens it: the per-tenant ERP webhook routes check that a signing key is
+    stored at all before an unauthenticated request can make them unseal
+    (decisions §408). An org with no row has nothing stored.
+    """
+    fields = (
+        await db.execute(
+            select(ProviderCredential.secret_fields).where(
+                ProviderCredential.organization_id == org.id, ProviderCredential.block == block
+            )
+        )
+    ).scalar_one_or_none()
+    return frozenset(fields or ())
 
 
 async def credential_status(db: AsyncSession, org_id: uuid.UUID) -> dict[str, list[str]]:
@@ -413,6 +573,36 @@ async def credential_status(db: AsyncSession, org_id: uuid.UUID) -> dict[str, li
 
 
 # ── the writer ───────────────────────────────────────────────────────────────
+
+
+async def reset_block(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    block: str,
+    *,
+    before_write: Callable[[list[str]], Awaitable[None]],
+) -> list[str]:
+    """Remove every sealed secret of ``block`` WITHOUT opening the row.
+
+    The recovery for a row that can no longer be opened (its KMS key disabled,
+    or in dev a changed `FEOH_SECRET_KEY`): :func:`update_secrets` opens the
+    row to merge into it, so every save of such a block fails. This deletes the
+    row instead, naming what was stored from ``secret_fields`` (names, never
+    values) — service-only paths included, so an ERP OAuth connection reads
+    as "reconnect". ``before_write`` (the audit row) runs before the delete and
+    aborts it by raising. Returns ``[]``, without calling ``before_write``,
+    when nothing is stored. Never commits; the caller holds the org row lock.
+    """
+    if block not in SECRET_FIELDS:
+        raise CredentialPathError(f"{block} has no stored credentials.")
+    row = await _row(db, org_id, block, for_update=True)
+    if row is None:
+        return []
+    names = sorted(row.secret_fields or [])
+    await before_write(names)
+    await db.execute(delete(ProviderCredential).where(ProviderCredential.id == row.id))
+    await db.flush()
+    return names
 
 
 def validate_update(
@@ -458,12 +648,19 @@ async def update_secrets(
     """Apply a validated write and return the changed path NAMES.
 
     The caller has validated (:func:`validate_update`) and taken the org row
-    lock; it commits. Every caller takes that lock first, so one holding it may
-    read the current values (:func:`load_secrets`) and decide on them — the ERP
-    token refresher's compare-and-swap does. The callers: the audited endpoint,
-    `PATCH /api/organization` dropping an ERP's secrets when the save points
-    them at a new destination, and `services/erp_oauth` (consent, refresh,
-    disconnect) — the only writer of :data:`SERVICE_SECRET_FIELDS`.
+    lock. This function never commits: it writes and flushes inside the
+    caller's transaction, and the CALLER commits — or rolls back, which is how
+    `PUT /api/organization/sso` undoes a secret it could not audit. Every
+    caller takes that lock first, so one holding it may read the current values
+    (:func:`load_secrets`) and decide on them — the ERP token refresher's
+    compare-and-swap does. The callers: the audited endpoint,
+    `PATCH /api/organization` dropping an ERP's, a payment rail's, a card
+    issuer's or a BYOK extraction provider's secrets when the save points them
+    somewhere new,
+    `PUT /api/organization/sso` (the OIDC client secret, which audits after
+    this returns and rolls the write back if it cannot), and
+    `services/erp_oauth` (consent, refresh, disconnect) — the only writer of
+    :data:`SERVICE_SECRET_FIELDS`.
 
     ``before_write`` receives the changed names once they are known and the new
     value is sealed, and before anything is persisted — every person-driven
@@ -476,7 +673,10 @@ async def update_secrets(
     for path in [*to_set, *to_clear]:
         validate_path(block, path, service=True)
     row = await _row(db, org_id, block, for_update=True)
-    current = await _open_row(row) if row is not None else {}
+    try:
+        current = await _open_row(row) if row is not None else {}
+    except credential_crypto.CredentialCryptoError as exc:
+        raise StoredCredentialUnopenableError(str(exc)) from None
     merged = dict(current)
     changed: set[str] = set()
     for path, value in to_set.items():

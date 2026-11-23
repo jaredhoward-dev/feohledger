@@ -14,6 +14,7 @@
 	import { formatMoney, isPositiveAmount, sumMoney } from '#lib/utils/money.ts';
 	import { get1099Report, file1099Batch } from '#lib/api/tax.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import type {
@@ -23,6 +24,10 @@
 		Vendor1099Row
 	} from '#lib/types/tax.ts';
 	import { formatDate } from '#lib/utils/time.ts';
+	import { page } from '$app/state';
+	import { replaceState } from '$app/navigation';
+	import { untrack } from 'svelte';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	// `POST /api/tax/vendors/{id}/{w9,tin-verify}` and `POST /api/tax/1099/file`
 	// are all `require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)` — a CFO can read this
@@ -35,16 +40,61 @@
 	const currentYear = new Date().getFullYear();
 	const YEARS = Array.from({ length: 6 }, (_, i) => currentYear - i);
 
-	let year = $state(currentYear);
+	// Year, chip and search round-trip through the URL (`?year=&filter=&search=`)
+	// like every sibling list, so "2025 · Missing W-9" survives a reload, the
+	// back button and a link sent to whoever chases the forms. An unknown value
+	// falls back to the default rather than an empty table.
+	const ROW_FILTERS = [
+		'all',
+		'reportable',
+		'missing_w9',
+		'tin_unverified',
+		'over_threshold',
+		'card_excluded',
+		'unmapped'
+	];
+	const urlYear = Number(page.url.searchParams.get('year'));
+	let year = $state(YEARS.includes(urlYear) ? urlYear : currentYear);
 	let report = $state<Report1099 | null>(null);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 
-	let search = $state('');
+	let search = $state(page.url.searchParams.get('search') ?? '');
 	// Chip keys: 'all' | 'reportable' | 'missing_w9' | 'over_threshold' |
 	// 'tin_unverified' | 'card_excluded' | 'unmapped'. Typed as string to match
 	// FilterChips' bindable `active`.
-	let rowFilter = $state('all');
+	const urlFilter = page.url.searchParams.get('filter') ?? 'all';
+	let rowFilter = $state(ROW_FILTERS.includes(urlFilter) ? urlFilter : 'all');
+
+	// The search term as the URL carries it. Filtering is client-side and stays
+	// instant, but the address bar follows the term only once typing pauses:
+	// writing it per keystroke spent a replaceState per character, and Safari
+	// throws once a page passes 100 of those in 30 seconds.
+	let urlSearch = $state((page.url.searchParams.get('search') ?? '').trim());
+	$effect(() => {
+		const q = search.trim();
+		if (q === untrack(() => urlSearch)) return;
+		const timer = setTimeout(() => (urlSearch = q), 300);
+		return () => clearTimeout(timer);
+	});
+
+	// A WRITER, never a dependency source: the URL read is untracked so this
+	// effect does not re-fire on its own replaceState.
+	$effect(() => {
+		const y = year;
+		const f = rowFilter;
+		const q = urlSearch;
+		untrack(() => {
+			const url = new URL(page.url.href);
+			if (y !== currentYear) url.searchParams.set('year', String(y));
+			else url.searchParams.delete('year');
+			if (f !== 'all') url.searchParams.set('filter', f);
+			else url.searchParams.delete('filter');
+			if (q) url.searchParams.set('search', q);
+			else url.searchParams.delete('search');
+			if (url.search !== page.url.search) replaceState(`${url.pathname}${url.search}`, {});
+		});
+	});
 
 	// Row-level "manage this vendor's tax bookkeeping" modal (W-9 upload/edit,
 	// TIN verify, PDF download) — admin/ap_manager only.
@@ -267,8 +317,9 @@
 			);
 			await load();
 		} catch (err) {
+			// Stated in the dialog (role="alert"), and only there: one error, one
+			// signal (`docs/ui-patterns.md` § Toast).
 			fileError = err instanceof Error ? err.message : m('tax.fileModal.toast.failed');
-			toast(fileError, 'error');
 		} finally {
 			filing = false;
 		}
@@ -287,7 +338,7 @@
 		</label>
 		{#if canManage}
 			<button
-				class="btn-secondary"
+				class="btn-cancel"
 				disabled={!report || report.vendor_count_eligible_over_threshold === 0}
 				onclick={openFileModal}
 			>
@@ -343,10 +394,7 @@
 	</div>
 
 	{#if error}
-		<div class="state-card error" role="alert">
-			<p>{error}</p>
-			<button class="btn-primary" onclick={load}>{m('tax.retry')}</button>
-		</div>
+		<LoadError message={error} onretry={load} testId="tax-load-error" />
 	{:else if loading && !report}
 		<div class="state-card" aria-busy="true">{m('tax.loadingReport', { year })}</div>
 	{:else if report}
@@ -441,9 +489,9 @@
 		<DataTable
 			columns={COLUMNS}
 			isEmpty={filteredRows.length === 0}
-			empty={report.rows.length === 0
-				? m('tax.empty.noVendors')
-				: m('tax.empty.noMatch')}
+			filtered={report.rows.length > 0}
+			emptyFiltered={m('tax.empty.noMatch')}
+			empty={m('tax.empty.noVendors')}
 		>
 			{#snippet body()}
 				{#each filteredRows as r (r.vendor_id)}
@@ -475,7 +523,7 @@
 								<Badge tone="danger" variant="chip-warn">{m('tax.chip.missing')}</Badge>
 							{/if}
 						</td>
-						<td class="right mono">{r.payment_count}</td>
+						<td class="right mono">{formatCount(r.payment_count)}</td>
 						<td class="right mono ytd-reportable">
 							<span class:over={r.over_threshold}>
 								<Money amount={r.ytd_paid} currency={reportCurrency} />
@@ -757,14 +805,6 @@
 		border-radius: 8px;
 	}
 
-	.state-card.error {
-		color: var(--danger);
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 12px;
-	}
-
 	.toolbar-row {
 		display: flex;
 		align-items: center;
@@ -786,7 +826,7 @@
 	}
 
 	.row-flag {
-		background: rgba(240, 70, 70, 0.04);
+		background: color-mix(in srgb, var(--danger) 4%, transparent);
 	}
 
 	.over {
@@ -810,7 +850,7 @@
 	}
 
 	.threshold-flag {
-		color: #d4940a;
+		color: var(--warning);
 		margin-left: 4px;
 		font-size: 0.7rem;
 	}
@@ -830,27 +870,8 @@
 		font-family: var(--font-mono);
 	}
 
-	.btn-secondary {
-		padding: 8px 16px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
 
-	.btn-secondary:hover:not(:disabled) {
-		background: var(--bg);
-	}
 
-	.btn-secondary:disabled {
-		opacity: 0.55;
-		cursor: not-allowed;
-	}
 
 	/* --- File-1099s confirm modal --- */
 
@@ -859,41 +880,12 @@
 		color: var(--text);
 		margin: 0 0 14px;
 		padding: 10px 12px;
-		background: rgba(224, 64, 64, 0.08);
-		border: 1px solid rgba(224, 64, 64, 0.3);
+		background: color-mix(in srgb, var(--danger) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		border-radius: 4px;
 	}
 
 	.modal-warn.armed {
 		font-weight: 600;
-	}
-
-	.btn-danger {
-		padding: 8px 18px;
-		border-radius: 4px;
-		border: 1px solid var(--danger-strong);
-		background: transparent;
-		color: var(--danger-strong);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	/* Armed = the second, committing click — filled instead of outlined, the
-	   same "unarmed vs armed" visual escalation `RunDetailModal`'s
-	   `.btn-execute.armed` uses. */
-	.btn-danger.armed {
-		background: var(--danger-strong);
-		color: #fff;
-	}
-
-	.btn-danger:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-
-	.btn-danger:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
 	}
 </style>

@@ -1,5 +1,8 @@
+// ignore_for_file: deprecated_member_use
+
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
+
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -52,6 +55,10 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get commonRetry => 'Erneut versuchen';
+
+  @override
+  String get commonLoadErrorConnection =>
+      'FeohLedger ist nicht erreichbar. Prüfen Sie Ihre Verbindung und tippen Sie auf „Erneut versuchen“.';
 
   @override
   String get commonAll => 'Alle';
@@ -113,6 +120,12 @@ class AppLocalizationsDe extends AppLocalizations {
   String get dashboardForReview => 'Zur Prüfung';
 
   @override
+  String get dashboardOverdue => 'Überfällig';
+
+  @override
+  String get dashboardOverdueOpen => 'Zeigt die überfälligen Rechnungen';
+
+  @override
   String get dashboardApproved => 'Freigegeben';
 
   @override
@@ -138,9 +151,25 @@ class AppLocalizationsDe extends AppLocalizations {
       'Zwischengespeicherte Daten — Server nicht erreichbar';
 
   @override
-  String dashboardErrorPrefix(String error) {
-    return 'Fehler: $error';
-  }
+  String get dashboardLoadError =>
+      'Das Dashboard konnte nicht geladen werden. Prüfen Sie Ihre Verbindung und tippen Sie auf „Erneut versuchen“.';
+
+  @override
+  String get dashboardRefreshFailed =>
+      'Aktualisierung fehlgeschlagen – dies sind die zuletzt geladenen Zahlen. Tippen Sie auf „Erneut versuchen“.';
+
+  @override
+  String get dashboardNeedsAttention => 'Ihre Aufmerksamkeit erforderlich';
+
+  @override
+  String get dashboardOverview => 'Übersicht';
+
+  @override
+  String get dashboardEmpty =>
+      'Noch keine Rechnungen. Erfasste und hochgeladene Rechnungen erscheinen hier.';
+
+  @override
+  String get dashboardTopVendorsEmpty => 'Noch keine Lieferantenausgaben.';
 
   @override
   String dashboardInvoiceCount(int count) {
@@ -246,6 +275,9 @@ class AppLocalizationsDe extends AppLocalizations {
   String get invoicesFilterPaid => 'Bezahlt';
 
   @override
+  String get invoicesFilterOverdue => 'Überfällig';
+
+  @override
   String get invoicesColInvoiceNumber => 'Rechnungs-Nr.';
 
   @override
@@ -288,14 +320,12 @@ class AppLocalizationsDe extends AppLocalizations {
   String get notificationsEmpty => 'Keine Benachrichtigungen';
 
   @override
-  String get notificationsCaughtUp => 'Sie sind auf dem neuesten Stand';
-
-  @override
   String get notificationsNothingYet => 'Hier ist noch nichts';
 
   @override
-  String get notificationsLoadError =>
-      'Benachrichtigungen konnten nicht geladen werden';
+  String notificationsLoadErrorPrefix(String error) {
+    return 'Benachrichtigungen konnten nicht geladen werden: $error';
+  }
 
   @override
   String get vendorsTitle => 'Lieferanten';
@@ -325,7 +355,9 @@ class AppLocalizationsDe extends AppLocalizations {
   String get vendorsEmpty => 'Keine Lieferanten gefunden';
 
   @override
-  String get vendorsLoadError => 'Lieferanten konnten nicht geladen werden';
+  String vendorsLoadErrorPrefix(String error) {
+    return 'Lieferanten konnten nicht geladen werden: $error';
+  }
 
   @override
   String get vendorActionVerify => 'Bestätigen';
@@ -347,6 +379,16 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get vendorRejected => 'Lieferant abgelehnt';
+
+  @override
+  String vendorRejectConfirmTitle(String name) {
+    return '$name ablehnen?';
+  }
+
+  @override
+  String vendorRejectConfirmBody(String name) {
+    return '$name wird als abgelehnt markiert. Alle aktiven virtuellen Karten dieses Lieferanten werden storniert.';
+  }
 
   @override
   String vendorCardsNotClosed(int count) {
@@ -431,8 +473,8 @@ class AppLocalizationsDe extends AppLocalizations {
   String get paymentsEmpty => 'Keine Zahlungen';
 
   @override
-  String paymentsErrorPrefix(String error) {
-    return 'Fehler: $error';
+  String paymentsLoadErrorPrefix(String error) {
+    return 'Zahlungen konnten nicht geladen werden: $error';
   }
 
   @override
@@ -458,10 +500,6 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get approvalsNoneWaiting => 'Keine Rechnungen warten auf Freigabe';
-
-  @override
-  String get approvalsLoadError =>
-      'Ausstehende Freigaben konnten nicht geladen werden';
 
   @override
   String approvalsPendingCount(int count) {
@@ -677,6 +715,10 @@ class AppLocalizationsDe extends AppLocalizations {
       'Funktionstrennung: Wer einen Wareneingang zu dieser Rechnung erfasst hat, darf sie nicht auch freigeben.';
 
   @override
+  String get codedRefusalApprovalSegregationInspector =>
+      'Funktionstrennung: Wer eine Qualitätsprüfung der Ware zu dieser Rechnung erfasst hat, darf sie nicht auch freigeben.';
+
+  @override
   String get codedRefusalInvoiceStaleApproval =>
       'Diese Rechnung wurde geändert, nachdem Sie sie geladen haben. Laden Sie sie neu und prüfen Sie die aktuelle Fassung, bevor Sie sie genehmigen.';
 
@@ -741,6 +783,10 @@ class AppLocalizationsDe extends AppLocalizations {
       'Funktionstrennung: Wer an der Erstellung dieser Rechnung beteiligt war, darf keine Ausnahme auflösen, die ihre Zahlung blockiert. Eskalieren Sie sie oder bitten Sie eine andere Person um die Entscheidung.';
 
   @override
+  String get codedRefusalExceptionSegregationApprover =>
+      'Funktionstrennung: Wer diese Rechnung genehmigt hat, darf ihre Wareneingangs- oder Prüfsperre nicht auch auflösen. Eskalieren Sie sie oder bitten Sie eine andere Person um die Entscheidung.';
+
+  @override
   String get invoiceDetailApproved => 'Rechnung freigegeben';
 
   @override
@@ -762,6 +808,43 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get invoiceDetailReject => 'Ablehnen';
+
+  @override
+  String get invoiceDetailRecall => 'Genehmigung zurücknehmen';
+
+  @override
+  String get invoiceDetailRecallTitle => 'Diese Genehmigung zurücknehmen?';
+
+  @override
+  String get invoiceDetailRecallBody =>
+      'Die Rechnung geht zurück in die Prüfung, damit ihre Beträge korrigiert werden können, und braucht danach eine neue Genehmigung über die gesamte Genehmigungskette. Die Funktionstrennung zählt Sie dann, wie den Einreicher, zu den an dieser Rechnung Beteiligten. Die ursprüngliche Genehmigung bleibt im Prüfprotokoll erhalten.';
+
+  @override
+  String get invoiceDetailRecallReason => 'Warum nehmen Sie sie zurück?';
+
+  @override
+  String get invoiceDetailRecalled =>
+      'Genehmigung zurückgenommen. Die Rechnung ist wieder in der Prüfung.';
+
+  @override
+  String get invoiceDetailRecallFailed =>
+      'Die Genehmigung konnte nicht zurückgenommen werden – bitte erneut versuchen';
+
+  @override
+  String get codedRefusalInvoiceNotRecallable =>
+      'Nur bei einer genehmigten Rechnung oder einer, deren ERP-Übertragung nach der Genehmigung fehlgeschlagen ist, kann die Genehmigung zurückgenommen werden.';
+
+  @override
+  String get codedRefusalInvoiceRecallInErp =>
+      'Im ERP liegt möglicherweise bereits eine Rechnung zu diesem Beleg vor, und sie kann dort bezahlt werden. Korrigieren oder stornieren Sie sie im ERP; die Genehmigung kann in FeohLedger nicht zurückgenommen werden.';
+
+  @override
+  String get codedRefusalPaymentBlocksRecall =>
+      'FeohLedger bezahlt diese Rechnung bereits: Es gibt eine aktive Zahlung. Brechen Sie den Zahlungslauf ab oder stornieren Sie die Zahlung, bevor Sie die Genehmigung zurücknehmen.';
+
+  @override
+  String get codedRefusalCardBlocksRecall =>
+      'Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Genehmigung zurücknehmen.';
 
   @override
   String invoicesBulkRejectTitle(int count) {
@@ -1041,7 +1124,11 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get invoiceEditLockedNotice =>
-      'Genehmigt — Zahlungsempfänger und Betrag sind gesperrt. Zum Ändern die Rechnung ablehnen, korrigieren und erneut genehmigen.';
+      'Genehmigt — Zahlungsempfänger und Betrag sind gesperrt.';
+
+  @override
+  String get invoiceEditLockedNoticeRecall =>
+      'Genehmigt — Zahlungsempfänger und Betrag sind gesperrt. Zum Ändern die Genehmigung zurücknehmen, die Rechnung korrigieren und erneut genehmigen lassen.';
 
   @override
   String get invoiceEditLockedHelper => 'Nach der Genehmigung gesperrt';
@@ -1095,7 +1182,18 @@ class AppLocalizationsDe extends AppLocalizations {
   String get erpStatusLastUpdate => 'Letzte Aktualisierung';
 
   @override
+  String erpStatusActionBy(String action, String actor) {
+    return '$action von $actor';
+  }
+
+  @override
   String get erpStatusStatus => 'Status';
+
+  @override
+  String get erpStatusOpensInErp => 'öffnet die Rechnung im ERP';
+
+  @override
+  String get externalLinkOpenFailed => 'Der Link konnte nicht geöffnet werden';
 
   @override
   String get fileViewerPdfTitle => 'Rechnungs-PDF';
@@ -1151,11 +1249,14 @@ class AppLocalizationsDe extends AppLocalizations {
   String get payQueueEmpty => 'Keine Rechnungen zur Zahlung';
 
   @override
-  String get payQueueError =>
-      'Zahlungswarteschlange konnte nicht geladen werden';
+  String payQueueLoadErrorPrefix(String error) {
+    return 'Zahlungswarteschlange konnte nicht geladen werden: $error';
+  }
 
   @override
-  String get payQueueRetry => 'Erneut versuchen';
+  String payRunsLoadErrorPrefix(String error) {
+    return 'Zahlungsläufe konnten nicht geladen werden: $error';
+  }
 
   @override
   String payQueueDue(String date) {
@@ -1201,6 +1302,10 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String get payQueueBlockedVendorNotActive =>
       'Lieferant nicht verifiziert oder nicht aktiv — zuerst den Lieferanten verifizieren';
+
+  @override
+  String get payQueueBlockedCurrencyUnknown =>
+      'Für diese Rechnung ist keine Währung erfasst — zuerst die Währung festlegen';
 
   @override
   String get payQueueBlockedAppliedCreditMismatch =>
@@ -1548,21 +1653,13 @@ class AppLocalizationsDe extends AppLocalizations {
   String get adminUsersCreating => 'Wird erstellt…';
 
   @override
-  String adminUsersCreated(String name) {
-    return '$name erstellt';
+  String adminUsersInvited(String name, String email) {
+    return '$name eingeladen. Wir haben $email einen Link zum Festlegen des Passworts gesendet.';
   }
 
   @override
   String adminUsersCreateFailed(String error) {
     return 'Benutzer konnte nicht erstellt werden: $error';
-  }
-
-  @override
-  String get adminUsersTempPasswordTitle => 'Benutzer erstellt';
-
-  @override
-  String adminUsersTempPasswordBody(String name) {
-    return 'Teilen Sie dieses Einmalpasswort mit $name. Bei der ersten Anmeldung wird es geändert. Es wird nicht erneut angezeigt.';
   }
 
   @override
@@ -1693,7 +1790,9 @@ class AppLocalizationsDe extends AppLocalizations {
   String get workflowDetailFallbackTitle => 'Workflow';
 
   @override
-  String get workflowDetailLoadError => 'Workflow konnte nicht geladen werden';
+  String workflowDetailErrorPrefix(String error) {
+    return 'Workflow konnte nicht geladen werden: $error';
+  }
 
   @override
   String get workflowDetailNoSteps => 'Dieser Workflow hat keine Schritte.';
@@ -1827,6 +1926,27 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String cashFlowPendingAmount(String amount) {
     return 'ausstehend $amount';
+  }
+
+  @override
+  String cashFlowOverdueAmount(String amount) {
+    return 'überfällig $amount';
+  }
+
+  @override
+  String cashFlowOverdueSuffix(String amount) {
+    return ', davon $amount bereits überfällig';
+  }
+
+  @override
+  String cashFlowForecastOverdue(int count, String amount) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count Rechnungen',
+      one: '$count Rechnung',
+    );
+    return '$amount aus $_temp0 ist bereits überfällig. Jetzt geschuldet, daher in der ersten Periode berücksichtigt.';
   }
 
   @override
@@ -2088,13 +2208,415 @@ class AppLocalizationsDe extends AppLocalizations {
   String get exceptionDetailTitle => 'Ausnahme';
 
   @override
-  String get exceptionDetailNotFound => 'Ausnahme nicht gefunden';
+  String exceptionDetailErrorPrefix(String error) {
+    return 'Ausnahme konnte nicht geladen werden: $error';
+  }
 
   @override
   String get exceptionDetailOverdue => 'Überfällig';
 
   @override
   String get exceptionDetailSectionDescription => 'Beschreibung';
+
+  @override
+  String exceptionDetailPoRematch(String po, String erp, String date) {
+    return 'Bestellung $po wurde am $date in $erp geändert; eine erneute Prüfung stimmt jetzt überein. Prüfen Sie sie, um die Sperre aufzuheben.';
+  }
+
+  @override
+  String exceptionDetailPoRematchNoDate(String po, String erp) {
+    return 'Bestellung $po wurde in $erp geändert; eine erneute Prüfung stimmt jetzt überein. Prüfen Sie sie, um die Sperre aufzuheben.';
+  }
+
+  @override
+  String exceptionDetailPoRematchNoPo(String erp) {
+    return 'Die Bestellung wurde in $erp geändert; eine erneute Prüfung stimmt jetzt überein. Prüfen Sie sie, um die Sperre aufzuheben.';
+  }
+
+  @override
+  String erpRefusalVendorNotLinked(String provider) {
+    return 'Dieser Lieferant ist noch nicht in $provider. Synchronisieren Sie die Lieferanten aus $provider oder legen Sie den Lieferanten dort an und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalAccountNotLinked(String provider, String accounts) {
+    return 'Nicht mit einem Konto in $provider verknüpft: $accounts. Synchronisieren Sie den Kontenplan aus $provider oder kontieren Sie die Rechnung auf ein verknüpftes Konto um und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalAccountNotLinkedUncoded(String provider) {
+    return 'Eine Position hat kein Sachkonto, und die Rechnung hat keines, auf das zurückgegriffen werden kann. Kontieren Sie sie auf ein mit $provider verknüpftes Konto und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String get erpRefusalNotConnected =>
+      'Das ERP ist nicht verbunden oder die Verbindung ist abgelaufen. Ein Administrator kann es unter Organisation neu verbinden; versuchen Sie es dann erneut.';
+
+  @override
+  String get erpRefusalInvoiceDueBeforeDate =>
+      'Diese Rechnung ist vor ihrem Rechnungsdatum fällig, was das ERP ablehnt. Korrigieren Sie die Daten und versuchen Sie es erneut.';
+
+  @override
+  String erpRefusalAmountMismatch(String provider) {
+    return 'Die Positionsbeträge ergeben nicht den genehmigten Betrag, daher wurde die Rechnung nicht an $provider gesendet. Korrigieren Sie die Positionen oder die Steuer und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String get erpRefusalLineAmountMissing =>
+      'Eine Position hat keinen Betrag – weder eine Summe noch Menge und Einzelpreis, aus denen er sich berechnen ließe. Ergänzen Sie ihn und versuchen Sie es dann erneut.';
+
+  @override
+  String erpRefusalPostedTotalMismatch(String provider) {
+    return '$provider hat einen anderen Gesamtbetrag als den genehmigten berechnet (oft wegen eines Standardsteuercodes), daher wurde die Rechnung nicht übernommen. Prüfen Sie die Steuereinstellungen des Lieferanten und der Konten in $provider und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalPostedTotalUnconfirmed(String provider) {
+    return 'Die Rechnung wurde in $provider angelegt, aber $provider hat ihren Gesamtbetrag nicht gemeldet, daher kann sie nicht bestätigt werden. Prüfen Sie die Rechnung in $provider, bevor Sie es erneut versuchen.';
+  }
+
+  @override
+  String erpRefusalPreviousBillRemoved(String provider) {
+    return 'Jede für diese Rechnung gesendete Buchung wurde in $provider gelöscht oder storniert, daher wird sie nicht automatisch erneut gesendet. Prüfen Sie $provider und fragen Sie dann einen Administrator, wie es weitergeht.';
+  }
+
+  @override
+  String erpRefusalTaxNotItemised(String provider) {
+    return '$provider benötigt die Steuer je Position, diese Rechnung weist sie aber nur insgesamt aus. Erfassen Sie die Steuer je Position und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalTaxRateUnresolved(String provider) {
+    return '$provider hat keinen Steuersatz, der zur Steuer dieser Rechnung passt. Legen Sie den Satz in $provider an oder korrigieren Sie die Steuer und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalMissingDates(String provider) {
+    return '$provider benötigt ein Rechnungsdatum und ein Fälligkeitsdatum. Ergänzen Sie beide und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalBillRefused(String provider) {
+    return '$provider hat diese Rechnung abgelehnt und nicht angelegt. Gleichen Sie Lieferant, Konten, Daten und Beträge der Rechnung mit $provider ab, korrigieren Sie sie, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalDuplicateNumber(String provider) {
+    return '$provider enthält bereits eine Rechnung mit dieser Rechnungsnummer. Prüfen Sie $provider auf ein Duplikat, bevor Sie es erneut versuchen.';
+  }
+
+  @override
+  String erpRefusalDocNumberTooLong(String provider) {
+    return 'Die Rechnungsnummer ist länger, als $provider zulässt. Kürzen Sie sie und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCurrencyUnknown(String provider) {
+    return '$provider meldet keine Hauswährung, daher kann die Währung der Rechnung nicht geprüft werden. Legen Sie die Hauswährung in $provider fest und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotEnabled(String provider) {
+    return 'Diese Rechnung ist nicht in der Hauswährung von $provider, und Fremdwährungen sind dort deaktiviert. Aktivieren Sie Fremdwährungen in $provider oder korrigieren Sie die Währung und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalIdempotencyLookupIncomplete(String provider) {
+    return '$provider konnte nicht bestätigen, ob diese Rechnung bereits gesendet wurde, daher wurde sie nicht erneut gesendet. Versuchen Sie es in einigen Minuten erneut.';
+  }
+
+  @override
+  String erpRefusalPurchasesNotPermitted(String provider) {
+    return '$provider hat das Anlegen dieser Rechnung nicht erlaubt. Mit dem Tarif Accounting Start können keine Eingangsrechnungen angelegt werden, oder dem verbundenen Sage-Benutzer fehlt der Zugriff auf Einkäufe. Wechseln Sie den Tarif oder geben Sie diesem Benutzer in $provider Zugriff auf Einkäufe, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalExistingInvoiceNotOpen(String provider) {
+    return '$provider enthält diese Rechnung bereits, und sie ist kein Entwurf mehr, daher kann sie von hier aus nicht geändert werden. Prüfen Sie sie in $provider.';
+  }
+
+  @override
+  String erpRefusalLineAmountPrecision(String provider) {
+    return 'Ein Positionsbetrag hat mehr Nachkommastellen, als diese Währung in $provider zulässt. Runden Sie ihn und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalPayToVendorDiffers(String provider) {
+    return 'In $provider ist für diese Rechnung ein anderer Zahlungsempfänger als der genehmigte Lieferant eingetragen (Zahlung an Kreditor), daher wurde sie nicht als diese Rechnung gebucht. Prüfen Sie den Zahlungsempfänger auf der Rechnung und auf der Kreditorenkarte in $provider und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalBillNotPosted(String provider) {
+    return '$provider enthält diese Rechnung, zeigt sie aber noch nicht als gebucht an, meist weil sie dort auf Genehmigung wartet. Genehmigen Sie sie in $provider und versuchen Sie es dann erneut. Sie wird nicht doppelt angelegt.';
+  }
+
+  @override
+  String erpRefusalBillRejected(String provider) {
+    return '$provider enthält diese Rechnung, sie wurde dort aber abgelehnt oder storniert und wird daher nie gebucht. Löschen Sie sie in $provider oder erfassen Sie sie neu, bevor Sie es erneut versuchen, und schließen Sie diese Rechnung nicht ab: Niemand würde sie bezahlen.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotSetUp(String provider) {
+    return '$provider hat keine aktive Währung mit dem Währungscode dieser Rechnung. Legen Sie die Währung in $provider an oder aktivieren Sie sie wieder (für eine Fremdwährung müssen mehrere Währungen aktiviert sein), oder korrigieren Sie die Währung der Rechnung, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotSupported(String provider) {
+    return '$provider nimmt Rechnungen nur in der eigenen Währung des Unternehmens an. Korrigieren Sie die Währung oder erfassen Sie die Rechnung direkt in $provider.';
+  }
+
+  @override
+  String erpRefusalForeignCurrencySupplier(String provider) {
+    return 'Dieser Lieferant ist in $provider für eine Fremdwährung eingerichtet, auf die von hier aus nicht gebucht werden kann. Erfassen Sie die Rechnung direkt in $provider.';
+  }
+
+  @override
+  String erpRefusalCorrelationTotalMismatch(String provider) {
+    return '$provider enthält bereits eine Rechnung aus einem früheren Versuch mit einem anderen Gesamtbetrag. Prüfen Sie diese Rechnung in $provider, bevor Sie es erneut versuchen.';
+  }
+
+  @override
+  String erpRefusalTaxTypeNotResolved(String provider) {
+    return 'Der Steuertyp eines Kontos in $provider ist kein fester Satz, daher kann die Steuer nicht herausgerechnet werden. Weisen Sie dem Konto in $provider einen Steuertyp zu und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalTaxMismatch(String provider) {
+    return 'Die Steuer, die $provider buchen würde, weicht von der Steuer auf der Rechnung ab. Prüfen Sie die Steuertypen der Konten in $provider oder korrigieren Sie die Steuer und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalTaxNotStated(String provider) {
+    return 'Die Rechnung weist keine Steuer aus, ihre Konten sind in $provider aber steuerpflichtig. Erfassen Sie die Steuer der Rechnung und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalSubscriptionKeyMissing(String provider) {
+    return 'Der Abonnementschlüssel für $provider fehlt. Ein Administrator kann ihn unter Organisation hinzufügen; versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalApAccountNotConfigured(String provider) {
+    return 'Für $provider ist kein Kreditorenkonto festgelegt. Ein Administrator kann es unter Organisation festlegen; versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotConfigured(String provider) {
+    return 'Für $provider ist keine Buchungswährung festgelegt. Ein Administrator kann sie unter Organisation festlegen; versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCurrencyMismatch(String provider) {
+    return 'Die Währung der Rechnung ist nicht die Buchungswährung von $provider. Korrigieren Sie die Währung und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalInvoiceDateMissing(String provider) {
+    return '$provider benötigt ein Rechnungsdatum. Ergänzen Sie es und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalDueDateMissing(String provider) {
+    return '$provider benötigt ein Fälligkeitsdatum. Ergänzen Sie es und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalAmountNotPositive(String provider) {
+    return '$provider nimmt nur Rechnungen über einen Betrag größer als null an. Korrigieren Sie den Betrag oder erfassen Sie stattdessen eine Gutschrift.';
+  }
+
+  @override
+  String erpRefusalJobUnconfirmed(String provider) {
+    return '$provider hat die Rechnung angenommen, aber noch nicht bestätigt, dass sie angelegt wurde. Versuchen Sie es erneut, um nachzusehen – sie wird nicht doppelt gesendet.';
+  }
+
+  @override
+  String erpRefusalJobFailed(String provider) {
+    return '$provider hat die Rechnung angenommen, aber der Hintergrundauftrag ist fehlgeschlagen und hat nichts angelegt. Prüfen Sie Lieferant, Konten, Transaktionscodes und Buchungszeitraum in $provider, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCallBudgetTenant(String provider) {
+    return 'Dieser Arbeitsbereich hat seinen Anteil an den heutigen $provider-API-Aufrufen verbraucht, daher hat FeohLedger keinen Aufruf gesendet. Das Kontingent wird um Mitternacht UTC zurückgesetzt – versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCallBudgetQuota(String provider) {
+    return '$provider hat die API-Aufrufe für das von FeohLedger genutzte Abonnement pausiert (das Tageskontingent ist verbraucht), daher hat FeohLedger keinen Aufruf gesendet. Es wird um Mitternacht UTC zurückgesetzt – versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCallBudgetRateLimited(String provider) {
+    return '$provider hat FeohLedger gebeten, langsamer zu werden, daher wurde kein Aufruf gesendet. Versuchen Sie es in einer Minute erneut.';
+  }
+
+  @override
+  String erpRefusalBillLeftUnposted(String provider) {
+    return '$provider führt diese Rechnung als Entwurf oder zur Genehmigung, nicht gebucht, daher steht dort noch nichts in der Kreditorenbuchhaltung. Buchen oder genehmigen Sie sie in $provider, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalMergeSyncPending(String provider) {
+    return '$provider hat die Rechnungen seit einem früheren Sendeversuch mit unbekanntem Ausgang noch nicht synchronisiert, daher könnte die Rechnung dort bereits vorhanden sein. Es wurde nichts gesendet. Versuchen Sie es nach der nächsten Rechnungssynchronisierung in $provider erneut: Ist die Rechnung dann vorhanden, wird sie verknüpft statt ein zweites Mal angelegt.';
+  }
+
+  @override
+  String get erpRefusalCredentialsUnavailable =>
+      'Die ERP-Zugangsdaten konnten gerade nicht geöffnet werden. Versuchen Sie es in einigen Minuten erneut; wenn es weiterhin fehlschlägt, wenden Sie sich an einen Administrator.';
+
+  @override
+  String erpRefusalPeriodClosed(String provider) {
+    return '$provider hat diese Rechnung abgelehnt, weil ihr Datum in einem abgeschlossenen Zeitraum liegt (die Bücher sind geschlossen). Ändern Sie das Rechnungsdatum oder öffnen Sie den Zeitraum in $provider wieder, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalVendorInactive(String provider) {
+    return '$provider hat diese Rechnung abgelehnt, weil der Lieferant dort inaktiv oder gelöscht ist. Aktivieren Sie den Lieferanten in $provider, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalAccountInactive(String provider, String accounts) {
+    return '$provider hat diese Rechnung abgelehnt, weil $accounts dort inaktiv oder gelöscht ist. Aktivieren Sie das Konto in $provider oder kontieren Sie die Rechnung auf ein aktives Konto um, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalReferenceInvalid(String provider, String code) {
+    return '$provider hat diese Rechnung abgelehnt, weil sie auf einen Lieferanten oder ein Konto verweist, das dort nicht akzeptiert wird (Intuit-Fehler $code). Prüfen Sie, ob der Lieferant und jedes Konto der Rechnung in $provider existieren und aktiv sind, synchronisieren Sie sie erneut, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalCompanySubscriptionInactive(String provider) {
+    return '$provider hat diese Rechnung abgelehnt, weil das Abonnement des Unternehmens abgelaufen, gekündigt oder von einem Zahlungsproblem betroffen ist. Klären Sie das in $provider, und versuchen Sie es dann erneut.';
+  }
+
+  @override
+  String erpRefusalIntuitFault(String provider, String code) {
+    return '$provider hat diese Rechnung abgelehnt (Intuit-Fehler $code). Gleichen Sie die Angaben der Rechnung mit $provider ab und korrigieren Sie sie, und versuchen Sie es dann erneut. Wenn es weiterhin fehlschlägt, nennen Sie einem Administrator den Fehlercode.';
+  }
+
+  @override
+  String erpRefusalPaymentAccountNotMapped(String provider) {
+    return '$provider wurde über diese Zahlung nicht informiert: Es ist kein Konto festgelegt, von dem sie verbucht wird. Wählen Sie das Konto für Rechnungszahlungen unter Organisation → ERP-Integration und wiederholen Sie dann den Zahlungsabgleich.';
+  }
+
+  @override
+  String erpRefusalBillNotInErp(String provider) {
+    return 'Die Rechnung, für die diese Zahlung bestimmt war, ist in $provider nicht mehr vorhanden (sie wurde dort gelöscht), daher wurde die Zahlung dort nicht verbucht. Prüfen Sie die Rechnung in $provider.';
+  }
+
+  @override
+  String erpRefusalPaymentExceedsBalance(String provider) {
+    return '$provider zeigt für diese Rechnung einen geringeren offenen Betrag als diese Zahlung; eine Verbuchung würde die Rechnung überzahlen. Prüfen Sie, was in $provider bereits bezahlt wurde.';
+  }
+
+  @override
+  String erpRefusalBillPaymentVoided(String provider) {
+    return 'Diese Zahlung wurde in $provider verbucht und dort anschließend storniert, daher wird sie nicht erneut verbucht. Entscheiden Sie in $provider, ob die Rechnung bezahlt ist.';
+  }
+
+  @override
+  String erpRefusalPaymentsScopeMissing(String provider) {
+    return '$provider wurde verbunden, bevor FeohLedger die Berechtigung zum Verbuchen von Zahlungen angefordert hat, daher wird diese Zahlung dort nicht verbucht. Verbinden Sie $provider in den Organisationseinstellungen neu, um sie zu erteilen, und verbuchen Sie die Zahlung dann in $provider oder versuchen Sie es erneut.';
+  }
+
+  @override
+  String erpRefusalExceptionBlocksExport(String type) {
+    return 'Diese Rechnung hat eine offene Ausnahme ($type). Lösen oder verwerfen Sie sie unter Ausnahmen und senden Sie die Rechnung dann an das ERP.';
+  }
+
+  @override
+  String erpRefusalExceptionBlocksExportPossiblyPosted(String type) {
+    return 'Diese Rechnung hat eine offene Ausnahme ($type), und ein früherer Versuch hat die Rechnung möglicherweise bereits im ERP angelegt. Prüfen Sie das ERP, bevor jemand sie bezahlt, und lösen oder verwerfen Sie die Ausnahme dann unter Ausnahmen.';
+  }
+
+  @override
+  String get erpRefusalPaymentBlocksExport =>
+      'FeohLedger bezahlt diese Rechnung bereits: Es gibt eine aktive Zahlung dafür. Brechen Sie ihren Zahlungslauf ab oder stornieren Sie die Zahlung, bevor Sie die Rechnung an das ERP senden.';
+
+  @override
+  String get erpRefusalPaymentBlocksExportPossiblyPosted =>
+      'FeohLedger bezahlt diese Rechnung bereits, und ein früherer Versuch hat die Rechnung möglicherweise bereits im ERP angelegt. Prüfen Sie das ERP und stellen Sie sicher, dass niemand die Rechnung dort zusätzlich bezahlt.';
+
+  @override
+  String get erpRefusalVendorBlocked =>
+      'Der Lieferant dieser Rechnung ist für Zahlungen gesperrt. Heben Sie die Sperre auf, bevor Sie die Rechnung an das ERP senden.';
+
+  @override
+  String get erpRefusalVendorSanctionsMatch =>
+      'Der Lieferant dieser Rechnung wurde auf einer Sanktionsliste gefunden. Prüfen Sie das Screening des Lieferanten, bevor Sie die Rechnung an das ERP senden.';
+
+  @override
+  String get erpRefusalVendorSanctionsReview =>
+      'Der Lieferant dieser Rechnung wartet auf die Prüfung seines Sanktions-Screenings. Prüfen Sie den Lieferanten nach Abschluss der Prüfung erneut und senden Sie die Rechnung dann an das ERP.';
+
+  @override
+  String get erpRefusalVendorRejected =>
+      'Der Lieferant dieser Rechnung wurde abgelehnt. Ordnen Sie die Rechnung dem richtigen Lieferanten zu, bevor Sie sie an das ERP senden.';
+
+  @override
+  String get erpRefusalVendorStatusUnknown =>
+      'Der Lieferant dieser Rechnung hat einen Status, mit dem sie nicht an das ERP gesendet werden kann. Setzen Sie den Lieferanten auf aktiv, bevor Sie die Rechnung an das ERP senden.';
+
+  @override
+  String get erpRefusalVendorHoldPossiblyPosted =>
+      'Ein früherer Versuch hat die Rechnung möglicherweise bereits im ERP angelegt; prüfen Sie dort, bevor jemand sie bezahlt.';
+
+  @override
+  String get erpRefusalCurrencyBlocksExport =>
+      'Diese Rechnung hat keine gültige Währung. Legen Sie ihre Währung fest, bevor Sie sie an das ERP senden.';
+
+  @override
+  String get erpRefusalRetriesExhausted =>
+      'Für diese Übertragung waren keine Versuche mehr übrig, daher wurde diesmal kein Versuch unternommen. Versuchen Sie es erneut, um sie mit neuen Versuchen zu senden.';
+
+  @override
+  String get erpRefusalPushInterrupted =>
+      'Diese Übertragung wurde unterbrochen und nie abgeschlossen. Sie ist zu alt (oder älter als die aktuelle ERP-Verbindung), um sie ungeprüft erneut zu senden. Stellen Sie sicher, dass die Rechnung nicht schon im ERP ist, und versuchen Sie es dann erneut.';
+
+  @override
+  String get erpRefusalCardBlocksExport =>
+      'Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Rechnung an das ERP senden.';
+
+  @override
+  String get erpRefusalCardBlocksExportPossiblyPosted =>
+      'Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt, und ein früherer Versuch hat die Rechnung möglicherweise bereits im ERP angelegt. Prüfen Sie das ERP und stellen Sie sicher, dass niemand die Rechnung dort zusätzlich bezahlt.';
+
+  @override
+  String get erpRefusalTypeDuplicate => 'Doppelte Rechnung';
+
+  @override
+  String get erpRefusalTypeFraudFlag => 'Betrugshinweis';
+
+  @override
+  String exceptionDetailErpPaymentTitle(String erp) {
+    return 'Von $erp gemeldete Zahlung';
+  }
+
+  @override
+  String exceptionDetailErpPaymentAmount(String erp) {
+    return 'Laut $erp gezahlter Betrag';
+  }
+
+  @override
+  String get exceptionDetailErpPaymentPaidOn => 'Bezahlt am';
+
+  @override
+  String get exceptionDetailErpPaymentReference => 'Referenz';
+
+  @override
+  String erpRefusalUnknown(String erp) {
+    return 'Dies wurde in $erp aus einem Grund abgelehnt, den diese App-Version nicht beschreiben kann. Aktualisieren Sie die App oder prüfen Sie den Vorgang in $erp.';
+  }
+
+  @override
+  String get exceptionDetailErpPaymentNotStated => 'Nicht angegeben';
+
+  @override
+  String get exceptionDetailErpPaymentRecordOnWeb =>
+      'Erfassen Sie diese Zahlung unter „Ausnahmen“ in der Web-App: Damit wird die Ausnahme gelöst und die Rechnung als bezahlt markiert.';
+
+  @override
+  String get exceptionDetailYourErp => 'Ihrem ERP';
 
   @override
   String get exceptionDetailSectionInvoice => 'Rechnung';
@@ -2261,7 +2783,9 @@ class AppLocalizationsDe extends AppLocalizations {
   String get inspectionsEmptyFiltered => 'Keine Prüfungen mit diesem Ergebnis.';
 
   @override
-  String get inspectionsLoadError => 'Prüfungen konnten nicht geladen werden';
+  String inspectionsLoadErrorPrefix(String error) {
+    return 'Prüfungen konnten nicht geladen werden: $error';
+  }
 
   @override
   String get inspectionsResultPass => 'Bestanden';
@@ -2712,12 +3236,12 @@ class AppLocalizationsDe extends AppLocalizations {
       other: '$included KI-gelesenen Rechnungen',
       one: '$included KI-gelesenen Rechnung',
     );
-    return 'KI-Erfassung pausiert: Das Monatskontingent von $_temp0 ist aufgebraucht. Erfassen Sie die Angaben manuell oder wechseln Sie auf der Seite „Abrechnung“ in einen höheren Tarif.';
+    return 'KI-Erfassung pausiert: Das Monatskontingent von $_temp0 ist aufgebraucht. Erfassen Sie die Angaben manuell oder wechseln Sie unter Einstellungen → Abonnement in einen höheren Tarif.';
   }
 
   @override
   String get invoiceWarningAiSpendCapReached =>
-      'KI-Erfassung pausiert: Das KI-Ausgabenlimit für diesen Monat ist erreicht. Erfassen Sie die Angaben manuell oder erhöhen Sie das Limit auf der Seite „Abrechnung“.';
+      'KI-Erfassung pausiert: Das KI-Ausgabenlimit für diesen Monat ist erreicht. Erfassen Sie die Angaben manuell oder erhöhen Sie das Limit unter Einstellungen → Abonnement.';
 
   @override
   String get invoiceWarningUnverifiedVendor =>
@@ -2801,6 +3325,24 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String invoiceWarningPoBilledBeyondTotal(
+    String billedAmount,
+    String poNumber,
+    String poTotal,
+  ) {
+    return 'Andere Rechnungen stellen bereits $billedAmount gegen Bestellung $poNumber mit einer Gesamtsumme von $poTotal in Rechnung — diese Rechnung überschreitet diese Summe';
+  }
+
+  @override
+  String invoiceWarningPoBilledBeyondReceipt(
+    String totalBilled,
+    String poNumber,
+    String receivedValue,
+  ) {
+    return 'Rechnungen zu Bestellung $poNumber belaufen sich einschließlich dieser auf $totalBilled; eingegangen sind Waren im Wert von $receivedValue';
+  }
+
+  @override
   String invoiceWarningPoAmountVariancePoCurrencyUnknown(
     String variancePct,
     String poNumber,
@@ -2817,6 +3359,29 @@ class AppLocalizationsDe extends AppLocalizations {
     String poCurrency,
   ) {
     return 'Die Rechnung lautet auf $invoiceCurrency, Bestellung $poNumber jedoch auf $poCurrency — die Beträge wurden nicht verglichen';
+  }
+
+  @override
+  String invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown(
+    String poNumber,
+    String poCurrencies,
+  ) {
+    return 'Die Rechnung enthält keine gültige Währung, und die Bestellungen hinter $poNumber lauten auf unterschiedliche Währungen ($poCurrencies) — die Beträge wurden nicht verglichen';
+  }
+
+  @override
+  String invoiceWarningPoCancelled(String poNumber) {
+    return 'Bestellung $poNumber ist storniert — die Rechnung wurde nicht mit ihr abgeglichen';
+  }
+
+  @override
+  String invoiceWarningPoNotIssued(String poNumber) {
+    return 'Bestellung $poNumber ist im ERP noch nicht freigegeben — die Rechnung wurde nicht mit ihr abgeglichen';
+  }
+
+  @override
+  String invoiceWarningPoTotalUnverifiable(String poNumber) {
+    return 'Die Summe der Bestellung $poNumber konnte bei der letzten Synchronisierung nicht vom ERP bestätigt werden — die Beträge wurden nicht verglichen';
   }
 
   @override
@@ -2942,6 +3507,23 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String invoiceWarningContractCurrencyMismatch(
+    String invoiceCurrency,
+    String contractNumber,
+    String contractCurrency,
+  ) {
+    return 'Die Rechnung lautet auf $invoiceCurrency, Vertrag $contractNumber jedoch auf $contractCurrency — sein Ausgabenlimit wurde nicht geprüft';
+  }
+
+  @override
+  String invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown(
+    String contractNumber,
+    String contractCurrency,
+  ) {
+    return 'Die Rechnung enthält keine gültige Währung, daher wurde das Ausgabenlimit von Vertrag $contractNumber in $contractCurrency nicht geprüft';
+  }
+
+  @override
   String invoiceWarningContractGlNotAllowed(
     String glAccount,
     String contractNumber,
@@ -2978,6 +3560,19 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String invoiceWarningSelfCorrectionCurrencyConflict(
+    String printedCurrency,
+    String fieldCurrency,
+  ) {
+    return 'Die Beträge sind in $printedCurrency angegeben, die Rechnungswährung lautet jedoch $fieldCurrency. Die Beträge wurden leer gelassen – bitte aus dem Dokument übernehmen.';
+  }
+
+  @override
+  String invoiceWarningSelfCorrectionCurrencyMixed(String printedCurrencies) {
+    return 'Die Beträge sind in mehr als einer Währung angegeben ($printedCurrencies). Die Beträge wurden leer gelassen – bitte aus dem Dokument übernehmen.';
+  }
+
+  @override
   String invoiceWarningSelfCorrectionLineItemMath(
     String lineNumber,
     String quantity,
@@ -2990,7 +3585,7 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String invoiceWarningGlCodesNotInChart(String codes) {
-    return 'Von der KI vorgeschlagene Sachkonten fehlen im aktiven Kontenplan: $codes';
+    return 'Sachkonten nicht im aktiven Kontenplan, nicht kontiert: $codes';
   }
 
   @override
@@ -3010,6 +3605,25 @@ class AppLocalizationsDe extends AppLocalizations {
   ) {
     return 'Währungsabweichung: Rechnung in $invoiceCurrency, Bestellung in $poCurrency — Beträge nicht verglichen';
   }
+
+  @override
+  String invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown(
+    String poCurrencies,
+  ) {
+    return 'Währungsabweichung: Rechnung ohne gültige Währung, Bestellungen in $poCurrencies — Beträge nicht verglichen';
+  }
+
+  @override
+  String get invoicePoMatchIssuePoCancelled =>
+      'Bestellung storniert — Beträge nicht verglichen';
+
+  @override
+  String get invoicePoMatchIssuePoNotIssued =>
+      'Bestellung im ERP noch nicht freigegeben — Beträge nicht verglichen';
+
+  @override
+  String get invoicePoMatchIssuePoTotalUnverifiable =>
+      'Bestellsumme bei der letzten Synchronisierung nicht vom ERP bestätigt — Beträge nicht verglichen';
 
   @override
   String invoicePoMatchIssueAmountMismatch(
@@ -3101,6 +3715,383 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpPaidUnrecordedBlockingException(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Eine andere Ausnahme zu dieser Rechnung blockiert die Zahlung. Lösen Sie diese Ausnahme, dann erfasst FeohLedger die Zahlung automatisch.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedBlockingExceptionUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Eine andere Ausnahme zu dieser Rechnung blockiert die Zahlung. Lösen Sie diese Ausnahme, dann erfasst FeohLedger die Zahlung automatisch.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedInRun(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Die Rechnung ist auch in einem FeohLedger-Zahlungslauf, sodass der Lieferant doppelt bezahlt werden könnte. Nehmen Sie sie aus dem Lauf oder brechen Sie den Lauf ab, und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedInRunUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Die Rechnung ist auch in einem FeohLedger-Zahlungslauf, sodass der Lieferant doppelt bezahlt werden könnte. Nehmen Sie sie aus dem Lauf oder brechen Sie den Lauf ab, und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedPaymentLive(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: FeohLedger hat für diese Rechnung eine eigene Zahlung in Bearbeitung, sodass der Lieferant doppelt bezahlt werden könnte. Stornieren Sie diese Zahlung, wenn die Zahlung aus dem ERP die tatsächliche ist, und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedPaymentLiveUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: FeohLedger hat für diese Rechnung eine eigene Zahlung in Bearbeitung, sodass der Lieferant doppelt bezahlt werden könnte. Stornieren Sie diese Zahlung, wenn die Zahlung aus dem ERP die tatsächliche ist, und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedCardLive(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Für diese Rechnung ist noch eine virtuelle Karte aktiv, sodass der Lieferant doppelt bezahlt werden könnte. Sperren Sie die Karte und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedCardLiveUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Für diese Rechnung ist noch eine virtuelle Karte aktiv, sodass der Lieferant doppelt bezahlt werden könnte. Sperren Sie die Karte und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedCreditConflict(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Eine angewendete Gutschrift passt nicht mehr zu Lieferant oder Währung dieser Rechnung, daher lässt sich der offene Betrag nicht bestimmen. Korrigieren Sie die Gutschrift und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedCreditConflictUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Eine angewendete Gutschrift passt nicht mehr zu Lieferant oder Währung dieser Rechnung, daher lässt sich der offene Betrag nicht bestimmen. Korrigieren Sie die Gutschrift und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedNothingToPay(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Gutschriften decken bereits die gesamte Rechnung ab, es gibt also keine Zahlung zu erfassen. Prüfen Sie die Rechnung im ERP und lösen Sie dann diese Ausnahme.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedNothingToPayUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Gutschriften decken bereits die gesamte Rechnung ab, es gibt also keine Zahlung zu erfassen. Prüfen Sie die Rechnung im ERP und lösen Sie dann diese Ausnahme.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedNotPayable(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Die Rechnung hat keinen Status, in dem sie als bezahlt markiert werden kann. Prüfen Sie die Rechnung und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme oder lösen Sie sie.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedNotPayableUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Die Rechnung hat keinen Status, in dem sie als bezahlt markiert werden kann. Prüfen Sie die Rechnung und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme oder lösen Sie sie.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedAmountMismatch(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Der dort als bezahlt ausgewiesene Betrag entspricht nicht dem, was diese Rechnung in FeohLedger nach Gutschriften und einem etwaigen Skonto schuldet. Prüfen Sie die Rechnung im ERP und in FeohLedger, korrigieren Sie die fehlerhafte und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme oder lösen Sie sie.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedAmountMismatchUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: Der dort als bezahlt ausgewiesene Betrag entspricht nicht dem, was diese Rechnung in FeohLedger nach Gutschriften und einem etwaigen Skonto schuldet. Prüfen Sie die Rechnung im ERP und in FeohLedger, korrigieren Sie die fehlerhafte und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme oder lösen Sie sie.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedOther(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: FeohLedger hat die Erfassung abgelehnt. Prüfen Sie die Rechnung und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme oder lösen Sie sie.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedOtherUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht erfassen: FeohLedger hat die Erfassung abgelehnt. Prüfen Sie die Rechnung und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme oder lösen Sie sie.';
+
+  @override
+  String exceptionDescriptionErpPaidWithdrawn(String erp) {
+    return '$erp hat diese Rechnung als bezahlt gemeldet, zeigt sie aber nicht mehr als bezahlt an. FeohLedger hat diese Zahlung nicht erfasst. Prüfen Sie die Rechnung im ERP: Ist sie noch offen, lösen Sie diese Ausnahme und bezahlen Sie sie wie gewohnt.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidWithdrawnUnnamed =>
+      'Ihr ERP hat diese Rechnung als bezahlt gemeldet, zeigt sie aber nicht mehr als bezahlt an. FeohLedger hat diese Zahlung nicht erfasst. Prüfen Sie die Rechnung im ERP: Ist sie noch offen, lösen Sie diese Ausnahme und bezahlen Sie sie wie gewohnt.';
+
+  @override
+  String exceptionDescriptionErpPaidRetryFailed(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht automatisch erfassen. Prüfen Sie die Angaben und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidRetryFailedUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber FeohLedger konnte diese Zahlung nicht automatisch erfassen. Prüfen Sie die Angaben und erfassen Sie dann die Zahlung aus dem ERP über diese Ausnahme.';
+
+  @override
+  String exceptionDescriptionErpSettledShort(String erp) {
+    return '$erp meldet diese Rechnung als bezahlt, aber die eigene Zahlung von FeohLedger wurde über weniger als den von der Kreditorenbuchhaltung freigegebenen Betrag abgewickelt, daher bleibt die Rechnung im Status „Zahlung geplant“. Öffnen Sie die Zahlung und akzeptieren Sie entweder den abgewickelten Betrag oder stornieren Sie die Zahlung.';
+  }
+
+  @override
+  String get exceptionDescriptionErpSettledShortUnnamed =>
+      'Ihr ERP meldet diese Rechnung als bezahlt, aber die eigene Zahlung von FeohLedger wurde über weniger als den von der Kreditorenbuchhaltung freigegebenen Betrag abgewickelt, daher bleibt die Rechnung im Status „Zahlung geplant“. Öffnen Sie die Zahlung und akzeptieren Sie entweder den abgewickelten Betrag oder stornieren Sie die Zahlung.';
+
+  @override
+  String exceptionDescriptionErpVoidedAfterPost(String erp) {
+    return '$erp meldet diese Rechnung als storniert oder annulliert, aber FeohLedger hatte sie bereits zur Zahlung weitergegeben, daher wurde sie hier nicht storniert. Prüfen Sie, ob eine Zahlung an den Lieferanten unterwegs ist, und stoppen oder holen Sie sie zurück, wenn die Rechnung wirklich ungültig ist.';
+  }
+
+  @override
+  String get exceptionDescriptionErpVoidedAfterPostUnnamed =>
+      'Ihr ERP meldet diese Rechnung als storniert oder annulliert, aber FeohLedger hatte sie bereits zur Zahlung weitergegeben, daher wurde sie hier nicht storniert. Prüfen Sie, ob eine Zahlung an den Lieferanten unterwegs ist, und stoppen oder holen Sie sie zurück, wenn die Rechnung wirklich ungültig ist.';
+
+  @override
+  String get exceptionDescriptionErpCreditSettlement =>
+      'Laut ERP ist diese Rechnung zumindest teilweise durch eine dort angewendete Lieferantengutschrift beglichen. FeohLedger bezahlt sie erst, wenn jemand bestätigt, was noch offen ist.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhileScheduled =>
+      'Laut ERP wurde diese Rechnung durch eine Zahlung beglichen, die nicht von FeohLedger stammt, während in FeohLedger eine Zahlung dafür geplant ist. Stoppen oder stornieren Sie eine der beiden, bevor beide beim Lieferanten ankommen.';
+
+  @override
+  String get exceptionDescriptionErpPaidTwice =>
+      'FeohLedger hat diese Rechnung bezahlt, und laut ERP wurde sie zusätzlich durch eine Zahlung beglichen, die nicht von FeohLedger stammt – der Lieferant wurde möglicherweise doppelt bezahlt. Holen Sie eine der Zahlungen zurück.';
+
+  @override
+  String get exceptionDescriptionErpPartlyPaidOutside =>
+      'Laut ERP wurde ein Teil dieser Rechnung außerhalb von FeohLedger bezahlt oder gutgeschrieben; eine FeohLedger-Zahlung über den vollen Betrag würde sie überzahlen. Klären Sie vor der Zahlung, was noch offen ist.';
+
+  @override
+  String get exceptionDescriptionErpRecordedPaymentWithdrawn =>
+      'Das ERP hat diese Rechnung als bezahlt gemeldet und FeohLedger hat diese Zahlung erfasst, aber das ERP zeigt sie nicht mehr als bezahlt an (die Zahlung wurde dort gelöscht oder storniert). Bestätigen Sie, ob sie noch offen ist.';
+
+  @override
+  String get exceptionDescriptionErpBillDeletedBlocking =>
+      'Der Beleg, als der diese Rechnung im ERP gebucht wurde, wurde dort gelöscht oder storniert; FeohLedger bezahlt sie erst, wenn jemand bestätigt, dass sie noch offen ist.';
+
+  @override
+  String get exceptionDescriptionErpBillDeleted =>
+      'Der Beleg, als der diese Rechnung im ERP gebucht wurde, wurde dort gelöscht oder storniert. Bestätigen Sie, dass die Bücher noch übereinstimmen.';
+
+  @override
+  String get exceptionDescriptionErpBillUnlinkedNoDocument =>
+      'FeohLedger kann den Beleg dieser Rechnung im ERP nicht prüfen, weil das ERP beim Buchen nicht angegeben hat, welchen Beleg es angelegt hat, daher bezahlt FeohLedger sie nicht. Prüfen Sie im ERP, ob sie noch offen ist, und erfassen Sie sie dann als außerhalb von FeohLedger bezahlt oder buchen Sie sie erneut.';
+
+  @override
+  String get exceptionDescriptionErpBillUnlinkedNoCompany =>
+      'FeohLedger kann den Beleg dieser Rechnung im ERP nicht prüfen, weil bei der Buchung nicht festgehalten wurde, an welches ERP-Unternehmen sie ging, daher bezahlt FeohLedger sie nicht. Prüfen Sie im ERP, ob sie noch offen ist, und erfassen Sie sie dann als außerhalb von FeohLedger bezahlt oder buchen Sie sie erneut.';
+
+  @override
+  String get exceptionDescriptionErpBillUnlinkedOtherCompany =>
+      'FeohLedger kann den Beleg dieser Rechnung im ERP nicht prüfen, weil sie an ein anderes ERP-Unternehmen gebucht wurde als das jetzt verbundene, daher bezahlt FeohLedger sie nicht. Prüfen Sie im ERP, ob sie noch offen ist, und erfassen Sie sie dann als außerhalb von FeohLedger bezahlt oder buchen Sie sie erneut.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedPaid =>
+      'FeohLedger war im Begriff, diese Rechnung zu bezahlen, aber laut ERP ist ihr Beleg bereits bezahlt. Die Zahlung wurde gestoppt, bevor Geld bewegt wurde. Bestätigen Sie vor der Zahlung, was noch offen ist; wurde für diese Rechnung bereits eine virtuelle Karte ausgegeben, sperren Sie sie.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedPartiallyPaid =>
+      'FeohLedger war im Begriff, diese Rechnung zu bezahlen, aber laut ERP ist ihr Beleg teilweise bezahlt. Die Zahlung wurde gestoppt, bevor Geld bewegt wurde. Bestätigen Sie vor der Zahlung, was noch offen ist; wurde für diese Rechnung bereits eine virtuelle Karte ausgegeben, sperren Sie sie.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedDeleted =>
+      'FeohLedger war im Begriff, diese Rechnung zu bezahlen, aber laut ERP ist ihr Beleg gelöscht oder storniert. Die Zahlung wurde gestoppt, bevor Geld bewegt wurde. Bestätigen Sie vor der Zahlung, was noch offen ist; wurde für diese Rechnung bereits eine virtuelle Karte ausgegeben, sperren Sie sie.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedUnconfirmed =>
+      'FeohLedger war im Begriff, diese Rechnung zu bezahlen, aber das ERP konnte nicht bestätigen, dass ihr Beleg noch offen und unbezahlt ist. Die Zahlung wurde gestoppt, bevor Geld bewegt wurde. Bestätigen Sie vor der Zahlung, was noch offen ist; wurde für diese Rechnung bereits eine virtuelle Karte ausgegeben, sperren Sie sie.';
+
+  @override
+  String get exceptionDescriptionErpReportedPaymentVoided =>
+      'Eine vom ERP gemeldete Zahlung wurde in FeohLedger storniert, aber das ERP zeigt die Rechnung möglicherweise noch als bezahlt an. FeohLedger bezahlt sie erst wieder, wenn jemand bestätigt, dass die Zahlung im ERP rückgängig gemacht ist.';
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackFailed(String erp) {
+    return '$erp hat die Zahlung dieser Rechnung nicht erfasst, daher wird die Rechnung dort weiterhin als unbezahlt angezeigt, obwohl das Geld gezahlt wurde. Beheben Sie die Ursache und verwenden Sie dann „ERP-Abgleich wiederholen“ beim Zahlungslauf dieser Zahlung unter Zahlungen.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaymentWritebackFailedUnnamed =>
+      'Ihr ERP hat die Zahlung dieser Rechnung nicht erfasst, daher wird die Rechnung dort weiterhin als unbezahlt angezeigt, obwohl das Geld gezahlt wurde. Beheben Sie die Ursache und verwenden Sie dann „ERP-Abgleich wiederholen“ beim Zahlungslauf dieser Zahlung unter Zahlungen.';
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackBalanceOpen(
+    String erp,
+    String amount,
+  ) {
+    return '$erp hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen (ein in FeohLedger abgezogenes Skonto oder eine Gutschrift). Gleichen Sie die Differenz im ERP aus.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed(
+    String amount,
+  ) {
+    return 'Ihr ERP hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen (ein in FeohLedger abgezogenes Skonto oder eine Gutschrift). Gleichen Sie die Differenz im ERP aus.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
+    return '$erp zeigt diese Rechnung weiterhin als bezahlt an – durch eine Zahlung, die in FeohLedger storniert wurde, deren Stornierung im ERP aber fehlgeschlagen ist. Stornieren Sie diese Zahlung im ERP, damit die Bücher übereinstimmen.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
+      'Ihr ERP zeigt diese Rechnung weiterhin als bezahlt an – durch eine Zahlung, die in FeohLedger storniert wurde, deren Stornierung im ERP aber fehlgeschlagen ist. Stornieren Sie diese Zahlung im ERP, damit die Bücher übereinstimmen.';
+
+  @override
+  String get exceptionDescriptionErpSyncBackFailed =>
+      'Die Zahlung dieser Rechnung wurde abgewickelt, aber FeohLedger konnte die Erfassung nicht abschließen, daher steht die Rechnung noch nicht auf „Bezahlt“, obwohl das Geld geflossen ist. Nichts wiederholt dies automatisch: Verwenden Sie „ERP-Abgleich wiederholen“ beim Zahlungslauf dieser Zahlung unter Zahlungen.';
+
+  @override
+  String exceptionDescriptionExtractionFailed(String errorClass) {
+    return 'Extraktion fehlgeschlagen: $errorClass';
+  }
+
+  @override
+  String exceptionDescriptionPositivePayAlteredAmount(String checkNumber) {
+    return 'Positive-Pay-Rückmeldung: Scheck $checkNumber mit verändertem Betrag';
+  }
+
+  @override
+  String exceptionDescriptionPositivePayNotOnFile(String checkNumber) {
+    return 'Positive-Pay-Rückmeldung: Scheck $checkNumber nicht in der Ausstellungsdatei';
+  }
+
+  @override
+  String get exceptionDescriptionVendorBankChanged =>
+      'Bankverbindung des Lieferanten geändert; vor der Zahlung prüfen.';
+
+  @override
+  String get exceptionDescriptionPayeeChangedSincePaid =>
+      'Zahlungsempfänger seit der letzten Zahlung dieser Rechnung geändert; vor erneuter Zahlung prüfen.';
+
+  @override
+  String get exceptionDescriptionPayeeUnrecordedAfterMerge =>
+      'Lieferant seit der letzten Zahlung dieser Rechnung zusammengeführt, und diese Zahlung hat keinen Zahlungsempfänger erfasst; vor erneuter Zahlung prüfen.';
+
+  @override
+  String exceptionDescriptionComplianceHoldFindings(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count Gründe',
+      one: '$count Grund',
+    );
+    return 'Zahlung zur Compliance-Prüfung angehalten ($_temp0)';
+  }
+
+  @override
+  String get exceptionDescriptionComplianceNoScreenableVendor =>
+      'Kein prüfbarer Lieferant auf der Rechnung';
+
+  @override
+  String exceptionDescriptionComplianceProviderUnavailable(String provider) {
+    return 'Sanktionsprüfung konnte nicht ausgeführt werden: kein Adapter für den konfigurierten Anbieter „$provider“';
+  }
+
+  @override
+  String exceptionDescriptionComplianceReviewRequired(
+    String provider,
+    String matchedList,
+  ) {
+    return 'Lieferantenprüfung über $provider erfordert eine Überprüfung ($matchedList)';
+  }
+
+  @override
+  String exceptionDescriptionComplianceReviewRequiredUnlisted(String provider) {
+    return 'Lieferantenprüfung über $provider erfordert eine Überprüfung (siehe Prüfprotokoll)';
+  }
+
+  @override
+  String exceptionDescriptionComplianceUnrecognisedResult(
+    String provider,
+    String result,
+  ) {
+    return 'Lieferantenprüfung über $provider lieferte ein unbekanntes Ergebnis „$result“; wird als prüfungsbedürftig behandelt';
+  }
+
+  @override
+  String exceptionDescriptionComplianceAdverseMedia(String provider) {
+    return 'Lieferantenprüfung über $provider ergab negative Medienberichte; Prüfung durch die Kreditorenbuchhaltung erforderlich';
+  }
+
+  @override
+  String get exceptionDescriptionComplianceAdverseMediaUnnamedProvider =>
+      'Lieferantenprüfung ergab negative Medienberichte; Prüfung durch die Kreditorenbuchhaltung erforderlich';
+
+  @override
+  String exceptionDescriptionComplianceAmlSpend(
+    String projected,
+    String threshold,
+  ) {
+    return 'Die Ausgaben bei diesem Lieferanten in den letzten 12 Monaten würden $projected erreichen (Schwellenwert $threshold); Prüfung durch die Kreditorenbuchhaltung erforderlich';
+  }
+
+  @override
+  String exceptionDescriptionComplianceAmlSpendPartial(
+    String projected,
+    String threshold,
+    int excluded,
+  ) {
+    String _temp0 = intl.Intl.pluralLogic(
+      excluded,
+      locale: localeName,
+      other: '$excluded Zahlungen wurden',
+      one: '$excluded Zahlung wurde',
+    );
+    return 'Die Ausgaben bei diesem Lieferanten in den letzten 12 Monaten würden mindestens $projected erreichen (Schwellenwert $threshold); Prüfung durch die Kreditorenbuchhaltung erforderlich. $_temp0 ohne Betrag in der Heimatwährung nicht berücksichtigt, die tatsächliche Summe ist also höher';
+  }
+
+  @override
+  String exceptionDescriptionPaymentAgedOut(
+    String paymentId,
+    String hours,
+    String invoiceStatus,
+  ) {
+    return 'Die Zahlung $paymentId war nach $hours h noch unterwegs und wurde vom Abgleich als fehlgeschlagen markiert; der Zahlungsweg hat nie bestätigt, das Geld kann also geflossen sein oder nicht. Die Rechnung steht auf „$invoiceStatus“. Klären Sie es mit dem Zahlungsdienstleister und stornieren Sie oder zahlen Sie erneut – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionPaymentDispatchInDoubt(
+    String paymentId,
+    String failureCode,
+  ) {
+    return 'Die Zahlung $paymentId ist beim Versand fehlgeschlagen ($failureCode), nachdem der Zahlungsdienstleister sie möglicherweise schon angenommen hatte; das Geld kann also geflossen sein oder nicht. Klären Sie es mit dem Zahlungsdienstleister und stornieren Sie oder zahlen Sie erneut – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionPaymentDispatchInterruptedFailed(
+    String paymentId,
+  ) {
+    return 'Die Zahlung $paymentId ist fehlgeschlagen, aber ein früherer Sendeversuch wurde unterbrochen, nachdem sie den Zahlungsdienstleister möglicherweise schon erreicht hatte; das Geld kann also geflossen sein oder nicht. Klären Sie es mit dem Zahlungsdienstleister und stornieren Sie oder zahlen Sie erneut – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionPaymentDispatchInterruptedCancelled(
+    String paymentId,
+  ) {
+    return 'Die Zahlung $paymentId wurde abgebrochen, aber ein früherer Sendeversuch wurde unterbrochen, nachdem sie den Zahlungsdienstleister möglicherweise schon erreicht hatte; das Geld kann also geflossen sein oder nicht. Klären Sie es mit dem Zahlungsdienstleister und stornieren Sie oder zahlen Sie erneut – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionSettlementCurrencyMismatch(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+  ) {
+    return 'Abweichende Abrechnungswährung: Der Zahlungsdienstleister meldete $settledAmount $settledCurrency, diese Zahlung genehmigt aber $authorizedAmount $authorizedCurrency. Geld wurde in einer nicht genehmigten Währung bewegt – gleichen Sie es mit dem Zahlungsdienstleister ab, bevor Sie diese Rechnung freigeben.';
+  }
+
+  @override
+  String exceptionDescriptionSettlementAmountOver(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+    String variance,
+  ) {
+    return 'Abweichender Abrechnungsbetrag: Der Zahlungsdienstleister meldete $settledAmount $settledCurrency, MEHR als die genehmigten $authorizedAmount $authorizedCurrency (Abweichung $variance). Geld wurde in nicht genehmigter Höhe bewegt – gleichen Sie es mit dem Zahlungsdienstleister ab, bevor Sie diese Rechnung freigeben.';
+  }
+
+  @override
+  String exceptionDescriptionSettlementAmountUnder(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+    String variance,
+  ) {
+    return 'Abweichender Abrechnungsbetrag: Der Zahlungsdienstleister meldete $settledAmount $settledCurrency, WENIGER als die genehmigten $authorizedAmount $authorizedCurrency (Abweichung $variance). Geld wurde in nicht genehmigter Höhe bewegt – gleichen Sie es mit dem Zahlungsdienstleister ab, bevor Sie diese Rechnung freigeben.';
+  }
+
+  @override
   String get warningsPoMatchStatusMatched => 'Abgeglichen';
 
   @override
@@ -3115,5 +4106,955 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String warningsPoMatchAnnouncement(String summary) {
     return 'Bestellabgleich: $summary';
+  }
+
+  @override
+  String get codedRefusalInvoiceNotInReview =>
+      'Diese Rechnung wartet nicht auf Prüfung und kann daher weder genehmigt noch abgelehnt werden.';
+
+  @override
+  String get codedRefusalInvoiceBulkNotFound =>
+      'Diese Rechnung wurde in der ausgewählten Einheit nicht gefunden.';
+
+  @override
+  String codedRefusalInvoiceStatusImmutable(String status) {
+    return 'Diese Rechnung hat den Status $status und kann nicht mehr geändert werden.';
+  }
+
+  @override
+  String get codedRefusalInvoiceRecallOneAtATime =>
+      'Eine Genehmigung wird je Rechnung einzeln und mit Begründung zurückgenommen: Verwenden Sie „Genehmigung zurücknehmen“ an der Rechnung.';
+
+  @override
+  String codedRefusalInvoiceBulkRefused(String status) {
+    return 'Diese Rechnung konnte nicht auf $status gesetzt werden.';
+  }
+
+  @override
+  String codedRefusalInvoiceRequiredFieldsMissing(String fields) {
+    return 'Pflichtfelder fehlen: $fields';
+  }
+
+  @override
+  String codedRefusalInvoiceTransitionInvalid(String from, String to) {
+    return 'Diese Rechnung kann nicht von $from zu $to wechseln.';
+  }
+
+  @override
+  String codedRefusalInvoiceTransitionRecallOnly(String from, String to) {
+    return 'Diese Rechnung kann nur durch Zurücknehmen ihrer Genehmigung von $from zu $to wechseln, eine Rechnung nach der anderen: Verwenden Sie „Genehmigung zurücknehmen“ an der Rechnung.';
+  }
+
+  @override
+  String get codedRefusalInvoiceOnceApprovedNotReread =>
+      'Diese Rechnung wurde bereits genehmigt, daher kann ihr Beleg nicht erneut ausgelesen werden. Nehmen Sie stattdessen ihre Genehmigung zurück und korrigieren Sie sie.';
+
+  @override
+  String get invoicesBulkSkipNoReason => 'Kein Grund angegeben';
+
+  @override
+  String get invoicesBulkSkipNoNumber => 'Rechnung (ohne Nummer)';
+
+  @override
+  String get reviewVerdictsUnavailable =>
+      'Es konnte nicht geprüft werden, was Sie hier tun dürfen – zum Wiederholen nach unten ziehen';
+
+  @override
+  String get reviewVerdictsChecking =>
+      'Es wird geprüft, was Sie hier tun dürfen …';
+
+  @override
+  String get payRecordOnlyBanner =>
+      'FeohLedger erfasst Zahlungen, versendet sie aber nie: Zahlen Sie über Ihre Bank oder Ihr ERP und erfassen Sie jede Zahlung hier (die Bankdatei eines Laufs finden Sie in der Web-App).';
+
+  @override
+  String payRecordPrefilledFromErp(String erp) {
+    return 'Aus der von $erp gemeldeten Zahlung übernommen. Prüfen Sie die Angaben, bevor Sie sie erfassen.';
+  }
+
+  @override
+  String payRecordErpAmount(String erp) {
+    return 'Laut $erp gezahlter Betrag';
+  }
+
+  @override
+  String payRecordSplitTitle(String erp) {
+    return 'So wurde laut $erp gezahlt';
+  }
+
+  @override
+  String get payRecordRailNotStated => 'Zahlungsart nicht angegeben';
+
+  @override
+  String get payRecordSplitMethod =>
+      'Aufgeteilt auf die oben genannten Zahlungsarten';
+
+  @override
+  String get payRecordSplitStands =>
+      'Diese Zahlung erfolgte mit mehr als einer Zahlungsart und wird deshalb mit dieser Aufteilung erfasst. Eine einzelne Zahlungsart kann sie nicht beschreiben.';
+
+  @override
+  String get payRecordSplitDropped =>
+      'Diese Teilbeträge ergeben nicht den gezahlten Betrag, daher wird die Aufteilung nicht übernommen. Die gewählte Zahlungsart wird für die gesamte Zahlung erfasst.';
+
+  @override
+  String get payRecordSplitUnjudged =>
+      'Ob diese Aufteilung übernommen wird, wird beim Erfassen der Zahlung entschieden. Wird sie nicht übernommen, wird die gewählte Zahlungsart für die gesamte Zahlung erfasst.';
+
+  @override
+  String get payRecordAction => 'Als bezahlt erfassen';
+
+  @override
+  String payRecordActionLabel(String invoice) {
+    return 'Als bezahlt erfassen — Rechnung $invoice';
+  }
+
+  @override
+  String get payRecordTitle =>
+      'Außerhalb von FeohLedger geleistete Zahlung erfassen';
+
+  @override
+  String get payRecordIntro =>
+      'Verwenden Sie dies, wenn Sie den Lieferanten bereits über Ihre eigene Bank oder Ihr ERP bezahlt haben. FeohLedger erfasst die Zahlung und markiert die Rechnung als bezahlt. Es wird kein Geld versendet.';
+
+  @override
+  String get payRecordAmountOwed => 'Offener Betrag';
+
+  @override
+  String get payRecordAmountHint =>
+      'Erfasst wird der volle offene Betrag, abzüglich angewendeter Gutschriften und eines angenommenen Skontos, das am Zahlungsdatum noch gilt. Teilzahlungen können nicht erfasst werden.';
+
+  @override
+  String get payRecordMethod => 'Zahlungsart';
+
+  @override
+  String get payRecordReference => 'Referenz';
+
+  @override
+  String get payRecordReferenceHint =>
+      'Die Schecknummer oder die Bestätigungsnummer Ihrer Bank. Der Bankabgleich ordnet darüber zu.';
+
+  @override
+  String get payRecordPaidOn => 'Bezahlt am';
+
+  @override
+  String get payRecordSubmit => 'Als bezahlt erfassen';
+
+  @override
+  String get payRecordSubmitting => 'Wird erfasst…';
+
+  @override
+  String payRecordRecorded(String invoice) {
+    return 'Rechnung $invoice als bezahlt erfasst';
+  }
+
+  @override
+  String get payRecordFailed => 'Die Zahlung konnte nicht erfasst werden';
+
+  @override
+  String get payRecordUnavailable =>
+      'Diese Rechnung kann noch nicht als bezahlt erfasst werden.';
+
+  @override
+  String get payMethodBacs => 'BACS';
+
+  @override
+  String get payMethodFasterPayments => 'Faster Payments';
+
+  @override
+  String get payMethodChaps => 'CHAPS';
+
+  @override
+  String get payMethodCardOutside => 'Karte (außerhalb von FeohLedger)';
+
+  @override
+  String get payRunActionRecord => 'Lauf als bezahlt erfassen…';
+
+  @override
+  String get payRunRecordTitle => 'Lauf als bezahlt erfassen';
+
+  @override
+  String get payRunRecordIntro =>
+      'Sobald Ihre Bank die Zahlungen angenommen hat, erfassen Sie sie hier. Jede Zahlung des Laufs wird als abgeschlossen und ihre Rechnung als bezahlt markiert. Es wird nichts versendet.';
+
+  @override
+  String get payRunRecordReference => 'Referenz des Bankauftrags';
+
+  @override
+  String get payRunRecordReferenceHint =>
+      'Die Bestätigungsnummer, die Ihre Bank für den Auftrag vergeben hat. Der Bankabgleich ordnet darüber zu.';
+
+  @override
+  String payRunRecordSubmit(String amount) {
+    return 'Als bezahlt erfassen · $amount';
+  }
+
+  @override
+  String payRunRecordRecorded(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count Zahlungen als bezahlt erfasst',
+      one: '$count Zahlung als bezahlt erfasst',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get payRunRecordFailed => 'Der Lauf konnte nicht erfasst werden';
+
+  @override
+  String get payRunRecordLoadFailed =>
+      'Zahlungslauf konnte nicht geladen werden';
+
+  @override
+  String get payRunStatusExported => 'Exportiert';
+
+  @override
+  String get codedRefusalPaymentsRecordOnly =>
+      'FeohLedger versendet für diese Organisation keine Zahlungen. Bezahlen Sie den Lieferanten über Ihre Bank oder Ihr ERP und erfassen Sie die Zahlung dann als außerhalb von FeohLedger bezahlt.';
+
+  @override
+  String codedRefusalExternalPaymentForInvoice(String invoice, String reason) {
+    return 'Rechnung $invoice: $reason';
+  }
+
+  @override
+  String codedRefusalExternalPaymentNotPayable(String status) {
+    return 'Nur eine freigegebene, noch nicht bezahlte Rechnung kann als bezahlt erfasst werden (diese hat den Status $status).';
+  }
+
+  @override
+  String get codedRefusalExternalPaymentSegregation =>
+      'Funktionstrennung: Sie haben diese Rechnung erstellt oder mitgestaltet, daher muss ein anderer Benutzer ihre Zahlung erfassen.';
+
+  @override
+  String get codedRefusalExternalPaymentCardLive =>
+      'Für diese Rechnung ist eine aktive virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie eine anders geleistete Zahlung erfassen.';
+
+  @override
+  String get codedRefusalExternalPaymentCreditConflict =>
+      'Eine angewendete Gutschrift passt nicht mehr zum Lieferanten oder zur Währung dieser Rechnung, daher lässt sich der offene Betrag nicht bestimmen. Korrigieren Sie zuerst die Rechnung.';
+
+  @override
+  String get codedRefusalExternalPaymentNothingToPay =>
+      'Diese Rechnung ist vollständig durch angewendete Gutschriften gedeckt, es gibt also nichts als bezahlt zu erfassen.';
+
+  @override
+  String codedRefusalExternalPaymentPaymentLive(String status) {
+    return 'Für diese Rechnung läuft bereits eine Zahlung oder sie ist abgeschlossen ($status). Stornieren Sie sie, bevor Sie eine anders geleistete Zahlung erfassen.';
+  }
+
+  @override
+  String codedRefusalExternalPaymentInRun(String run) {
+    return 'Diese Rechnung ist Teil des Zahlungslaufs $run. Erfassen Sie den ganzen Lauf als außerhalb von FeohLedger bezahlt oder stornieren Sie den Lauf zuerst.';
+  }
+
+  @override
+  String codedRefusalExternalPaymentAmountMismatch(String amount) {
+    return 'Der Betrag muss dem offenen Betrag der Rechnung entsprechen ($amount), abzüglich angewendeter Gutschriften und eines angenommenen Skontos. Teilzahlungen können nicht erfasst werden.';
+  }
+
+  @override
+  String codedRefusalExternalPaymentAmountChanged(
+    String staged,
+    String amount,
+  ) {
+    return 'Der offene Betrag dieser Rechnung hat sich seit dem Anlegen des Laufs geändert ($staged im Lauf, jetzt $amount offen), wegen einer Gutschrift oder eines Skontos. Klären Sie die Differenz mit dem Lieferanten und erfassen Sie die Rechnung dann einzeln.';
+  }
+
+  @override
+  String get codedRefusalExternalPaymentErpSplit =>
+      'Laut ERP wurde diese Rechnung mit mehr als einer Zahlungsart bezahlt. Erfassen Sie sie über ihre Ausnahme, die die Aufteilung der Zahlung beibehält.';
+
+  @override
+  String codedRefusalExternalPaymentErpSplitInRun(String run) {
+    return 'Diese Rechnung ist Teil des Zahlungslaufs $run, und laut ERP wurde sie mit mehr als einer Zahlungsart bezahlt, was nur ihre Ausnahme erfassen kann. Stornieren Sie zuerst den Lauf und erfassen Sie die Rechnung dann über ihre Ausnahme.';
+  }
+
+  @override
+  String get codedRefusalExternalPaymentPaidOnFuture =>
+      'Das Zahlungsdatum darf nicht in der Zukunft liegen.';
+
+  @override
+  String get codedRefusalPaymentRunSegregation =>
+      'Funktionstrennung: Wer diesen Zahlungslauf erstellt hat, darf ihn nicht auch genehmigen oder ausführen. Das muss eine andere Person tun.';
+
+  @override
+  String get codedRefusalPaymentRunSegregationRecord =>
+      'Funktionstrennung: Wer diesen Zahlungslauf erstellt hat, darf ihn nicht auch als bezahlt erfassen. Das muss eine andere Person tun.';
+
+  @override
+  String get codedRefusalPaymentRunSegregationExport =>
+      'Funktionstrennung: Wer diesen Zahlungslauf erstellt hat, darf nicht auch seine Bankdatei exportieren. Das muss eine andere Person tun.';
+
+  @override
+  String get codedRefusalPaymentRunAwaitingCfo =>
+      'Dieser Lauf überschreitet die CFO-Freigabeschwelle der Organisation und wartet auf die Freigabe durch einen Benutzer mit der CFO-Rolle.';
+
+  @override
+  String get codedRefusalMfaCodeInvalid =>
+      'Dieser Code ist ungültig. Prüfen Sie Ihre Authenticator-App und versuchen Sie es erneut.';
+
+  @override
+  String get codedRefusalMfaEmailCodeInvalid =>
+      'Dieser Code ist ungültig oder abgelaufen. Fordern Sie einen neuen Code an und versuchen Sie es erneut.';
+
+  @override
+  String get codedRefusalPaymentRunNotRecordable =>
+      'Nur ein Lauf im Entwurf oder einer, dessen Bankdatei exportiert wurde, kann als bezahlt erfasst werden.';
+
+  @override
+  String get codedRefusalPaymentRunNothingToRecord =>
+      'Dieser Lauf hat keine Zahlungen mehr, die erfasst werden könnten.';
+
+  @override
+  String get codedRefusalExternalPaymentBlockingException =>
+      'Für diese Rechnung besteht eine ungelöste Ausnahme, die die Zahlung sperrt. Lösen Sie sie, bevor Sie die Rechnung als bezahlt erfassen.';
+
+  @override
+  String get grRecordTitle => 'Wareneingang erfassen';
+
+  @override
+  String get grRecordIntro =>
+      'Erfassen Sie, was zu einer Bestellung geliefert wurde. Rechnungen, die diese Bestellung angeben, werden beim Speichern sofort neu abgeglichen.';
+
+  @override
+  String get grRecordSearchPo => 'Bestellung suchen';
+
+  @override
+  String get grRecordSearchPlaceholder => 'Bestellnummer';
+
+  @override
+  String get grRecordPo => 'Bestellung';
+
+  @override
+  String get grRecordNoPos => 'Keine passenden Bestellungen';
+
+  @override
+  String get grRecordLoadPosFailed =>
+      'Bestellungen konnten nicht geladen werden';
+
+  @override
+  String get grRecordLoadPoFailed =>
+      'Die Bestellung konnte nicht geladen werden';
+
+  @override
+  String grRecordPoCancelled(String number) {
+    return 'Bestellung $number ist storniert, daher kann dazu nichts erfasst werden.';
+  }
+
+  @override
+  String get grRecordOrdered => 'Bestellt';
+
+  @override
+  String get grRecordAlreadyReceived => 'Bisher erhalten';
+
+  @override
+  String get grRecordOutstanding => 'Offen';
+
+  @override
+  String get grRecordThisDelivery => 'Diese Lieferung';
+
+  @override
+  String grRecordQuantityFor(String line) {
+    return 'Erhaltene Menge für $line';
+  }
+
+  @override
+  String get grRecordOverReceipt =>
+      'Mehr als offen ist. Der Abgleich markiert dies als Mehrlieferung.';
+
+  @override
+  String get grRecordLinesHint =>
+      'Lassen Sie eine Position leer, wenn sie nicht Teil dieser Lieferung war. Geben Sie 0 ein, wenn sie erwartet, aber nicht geliefert wurde.';
+
+  @override
+  String get grRecordNoPoLines =>
+      'Diese Bestellung hat keine Positionen. Beschreiben Sie daher, was geliefert wurde.';
+
+  @override
+  String get grRecordAddLine => 'Position hinzufügen';
+
+  @override
+  String grRecordRemoveLine(int n) {
+    return 'Position $n entfernen';
+  }
+
+  @override
+  String grRecordLineDescription(int n) {
+    return 'Beschreibung, Position $n';
+  }
+
+  @override
+  String grRecordLineQuantity(int n) {
+    return 'Erhaltene Menge, Position $n';
+  }
+
+  @override
+  String get grRecordReceivedDate => 'Erhalten am';
+
+  @override
+  String get grRecordNumber => 'Lieferscheinnummer';
+
+  @override
+  String get grRecordNumberHint =>
+      'Optional. Die Lieferschein- oder Packzettelnummer des Lieferanten.';
+
+  @override
+  String grRecordNumberPlaceholder(String po) {
+    return 'Leer: GR-$po-n';
+  }
+
+  @override
+  String get grRecordSaving => 'Wird erfasst…';
+
+  @override
+  String get grRecordSubmit => 'Wareneingang erfassen';
+
+  @override
+  String grRecordRecorded(String number) {
+    return 'Wareneingang $number erfasst';
+  }
+
+  @override
+  String get grRecordFailed => 'Wareneingang konnte nicht erfasst werden';
+
+  @override
+  String get settingsGoodsReceipt => 'Wareneingang erfassen';
+
+  @override
+  String codedRefusalGoodsReceiptPoCancelled(String poNumber) {
+    return 'Bestellung $poNumber ist storniert; dazu kann nichts erfasst werden.';
+  }
+
+  @override
+  String codedRefusalGoodsReceiptNumberTaken(String grNumber) {
+    return 'Ein Wareneingang mit der Nummer $grNumber existiert bereits.';
+  }
+
+  @override
+  String get codedRefusalGoodsReceiptLineNotOnPo =>
+      'Jede erhaltene Position muss eine Position dieser Bestellung sein.';
+
+  @override
+  String get codedRefusalGoodsReceiptLineDuplicated =>
+      'Eine Bestellposition darf auf einem Wareneingang nur einmal vorkommen.';
+
+  @override
+  String get codedRefusalGoodsReceiptLineRequired =>
+      'Beschreiben Sie für jede Position, was geliefert wurde.';
+
+  @override
+  String get codedRefusalGoodsReceiptNothingReceived =>
+      'Ein Wareneingang muss mindestens eine erhaltene Einheit erfassen.';
+
+  @override
+  String get codedRefusalGoodsReceiptIdempotencyReused =>
+      'Diese Anfrage wurde bereits für eine andere Bestellung verwendet. Öffnen Sie das Formular erneut und versuchen Sie es noch einmal.';
+
+  @override
+  String get settingsGoodsReceiptHint =>
+      'Eine Lieferung zu einer Bestellung erfassen';
+
+  @override
+  String get grRecordSegregationNote =>
+      'Funktionstrennung: Sobald Sie diesen Wareneingang erfassen, können Sie keine Rechnung zu dieser Bestellung freigeben, und ein Wareneingang, den Sie nach einer Freigabe erfassen, gibt diese Rechnung nicht frei.';
+
+  @override
+  String get grRecordReceiveLines =>
+      'Geben Sie für mindestens eine Position eine Menge ein';
+
+  @override
+  String get listShowingSavedCopy =>
+      'Gespeicherte Kopie wird angezeigt — Server nicht erreichbar. Tippen Sie auf „Erneut versuchen“.';
+
+  @override
+  String get listRefreshFailed =>
+      'Aktualisierung fehlgeschlagen — die zuletzt geladene Liste wird angezeigt. Tippen Sie auf „Erneut versuchen“.';
+
+  @override
+  String exceptionsLoadErrorPrefix(String error) {
+    return 'Ausnahmen konnten nicht geladen werden: $error';
+  }
+
+  @override
+  String contractsLoadErrorPrefix(String error) {
+    return 'Verträge konnten nicht geladen werden: $error';
+  }
+
+  @override
+  String get errorNetworkUnreachable =>
+      'Der Server ist nicht erreichbar. Prüfen Sie Ihre Verbindung und versuchen Sie es erneut.';
+
+  @override
+  String errorRequestFailed(int status) {
+    return 'Der Server konnte die Anfrage nicht abschließen (HTTP $status).';
+  }
+
+  @override
+  String get errorUnexpected =>
+      'Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.';
+
+  @override
+  String payRunCreated(int count, String amount, String cfo) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          'Zahlungslauf mit $count Zahlungen über $amount erstellt. Vor der Ausführung ist eine CFO-Freigabe erforderlich.',
+      one:
+          'Zahlungslauf mit $count Zahlung über $amount erstellt. Vor der Ausführung ist eine CFO-Freigabe erforderlich.',
+    );
+    String _temp1 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Zahlungslauf mit $count Zahlungen über $amount erstellt.',
+      one: 'Zahlungslauf mit $count Zahlung über $amount erstellt.',
+    );
+    String _temp2 = intl.Intl.selectLogic(cfo, {
+      'required': '$_temp0',
+      'other': '$_temp1',
+    });
+    return '$_temp2';
+  }
+
+  @override
+  String payRunCreatedPlain(String cfo) {
+    String _temp0 = intl.Intl.selectLogic(cfo, {
+      'required': 'Zahlungslauf erstellt. Vor der Ausführung ist eine CFO-Freigabe erforderlich.',
+      'other': 'Zahlungslauf erstellt.',
+    });
+    return '$_temp0';
+  }
+
+  @override
+  String get payRunApproved => 'Lauf vom CFO freigegeben';
+
+  @override
+  String payRunExecuted(
+    String provider,
+    int completed,
+    int inFlight,
+    int failed,
+  ) {
+    String _temp0 = intl.Intl.pluralLogic(
+      completed,
+      locale: localeName,
+      other: '$completed abgeschlossen',
+      one: '$completed abgeschlossen',
+    );
+    String _temp1 = intl.Intl.pluralLogic(
+      inFlight,
+      locale: localeName,
+      other: '$inFlight in Bearbeitung',
+      one: '$inFlight in Bearbeitung',
+    );
+    String _temp2 = intl.Intl.pluralLogic(
+      failed,
+      locale: localeName,
+      other: '$failed fehlgeschlagen',
+      one: '$failed fehlgeschlagen',
+    );
+    return 'Zahlungslauf über $provider ausgeführt: $_temp0, $_temp1, $_temp2.';
+  }
+
+  @override
+  String get payRunExecutedPlain => 'Zahlungslauf ausgeführt.';
+
+  @override
+  String payRunExecutedCards(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count virtuelle Karten ausgestellt.',
+      one: '$count virtuelle Karte ausgestellt.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String payRunCancelled(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          'Entwurfslauf storniert; $count Rechnungen zurück in der Warteschlange.',
+      one:
+          'Entwurfslauf storniert; $count Rechnung zurück in der Warteschlange.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get payRunCancelledPlain => 'Zahlungslauf storniert.';
+
+  @override
+  String vendorSyncSummary(int created, int updated, int unchanged) {
+    String _temp0 = intl.Intl.pluralLogic(
+      created,
+      locale: localeName,
+      other: '$created neu',
+      one: '$created neu',
+    );
+    String _temp1 = intl.Intl.pluralLogic(
+      updated,
+      locale: localeName,
+      other: '$updated aktualisiert',
+      one: '$updated aktualisiert',
+    );
+    String _temp2 = intl.Intl.pluralLogic(
+      unchanged,
+      locale: localeName,
+      other: '$unchanged unverändert',
+      one: '$unchanged unverändert',
+    );
+    return 'Synchronisiert: $_temp0, $_temp1, $_temp2.';
+  }
+
+  @override
+  String get vendorSyncComplete => 'ERP-Synchronisierung abgeschlossen.';
+
+  @override
+  String vendorSyncNotLinked(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          '$count nicht verknüpft (der Name passt zu mehr als einem Lieferanten).',
+      one:
+          '$count nicht verknüpft (der Name passt zu mehr als einem Lieferanten).',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String vendorSyncUnlinked(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          '$count Verknüpfungen aufgehoben (unter einem anderen ERP-Unternehmen verknüpft).',
+      one:
+          '$count Verknüpfung aufgehoben (unter einem anderen ERP-Unternehmen verknüpft).',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String vendorSyncRelinked(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          '$count neu verknüpft (verknüpft, als dieses ERP-Unternehmen zuvor verbunden war).',
+      one:
+          '$count neu verknüpft (verknüpft, als dieses ERP-Unternehmen zuvor verbunden war).',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get authInvalidCredentials => 'Ungültige Anmeldedaten';
+
+  @override
+  String get authInvalidCode =>
+      'Ungültiger oder abgelaufener Code. Bitte versuchen Sie es erneut.';
+
+  @override
+  String get authVerifyCodeFailed =>
+      'Der Code konnte nicht überprüft werden. Bitte versuchen Sie es erneut.';
+
+  @override
+  String get authEmailCodeFailed =>
+      'Der E-Mail-Code konnte nicht gesendet werden. Bitte versuchen Sie es erneut.';
+
+  @override
+  String exceptionsFilteredEmpty(String status) {
+    String _temp0 = intl.Intl.selectLogic(status, {
+      'open': 'Keine offenen Ausnahmen',
+      'escalated': 'Keine eskalierten Ausnahmen',
+      'resolved': 'Keine gelösten Ausnahmen',
+      'dismissed': 'Keine verworfenen Ausnahmen',
+      'other': 'Keine passenden Ausnahmen',
+    });
+    return '$_temp0';
+  }
+
+  @override
+  String get contractsFilteredEmpty =>
+      'Keine Verträge passen zu Ihrer Suche oder Ihrem Filter.';
+
+  @override
+  String get vendorsFilteredEmpty =>
+      'Keine Lieferanten passen zu Ihrer Suche oder Ihrem Filter.';
+
+  @override
+  String get commonShowAll => 'Alle anzeigen';
+
+  @override
+  String get listLoadMore => 'Mehr laden';
+
+  @override
+  String listShowingCount(int shown, int total) {
+    return '$shown von $total angezeigt';
+  }
+
+  @override
+  String listShowingAll(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Alle $count angezeigt',
+      one: 'Der einzige Eintrag wird angezeigt',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get listLoadMoreFailed =>
+      'Weitere Einträge konnten nicht geladen werden.';
+
+  @override
+  String invoicesLoadErrorPrefix(String error) {
+    return 'Rechnungen konnten nicht geladen werden: $error';
+  }
+
+  @override
+  String approvalsLoadErrorPrefix(String error) {
+    return 'Ausstehende Freigaben konnten nicht geladen werden: $error';
+  }
+
+  @override
+  String get invoicesFilteredEmpty =>
+      'Keine Rechnungen entsprechen diesen Filtern';
+
+  @override
+  String statusPillAnnounce(String label) {
+    return 'Status: $label';
+  }
+
+  @override
+  String get vendorStatusActive => 'Aktiv';
+
+  @override
+  String get vendorStatusUnverified => 'Nicht verifiziert';
+
+  @override
+  String get vendorStatusInactive => 'Inaktiv';
+
+  @override
+  String get vendorStatusRejected => 'Abgelehnt';
+
+  @override
+  String get contractStatusDraft => 'Entwurf';
+
+  @override
+  String get contractStatusActive => 'Aktiv';
+
+  @override
+  String get contractStatusExpired => 'Abgelaufen';
+
+  @override
+  String get contractStatusTerminated => 'Gekündigt';
+
+  @override
+  String get contractStatusCancelled => 'Storniert';
+
+  @override
+  String get contractTypePurchase => 'Einkauf';
+
+  @override
+  String get contractTypeService => 'Dienstleistung';
+
+  @override
+  String get contractTypeSubscription => 'Abonnement';
+
+  @override
+  String get contractTypeLease => 'Leasing';
+
+  @override
+  String get contractTypeSla => 'SLA';
+
+  @override
+  String get contractTypeMsa => 'Rahmenvertrag';
+
+  @override
+  String get contractTypeSow => 'Leistungsbeschreibung';
+
+  @override
+  String get contractTypeOther => 'Sonstige';
+
+  @override
+  String get exceptionStatusOpen => 'Offen';
+
+  @override
+  String get exceptionStatusEscalated => 'Eskaliert';
+
+  @override
+  String get exceptionStatusResolved => 'Gelöst';
+
+  @override
+  String get exceptionStatusDismissed => 'Verworfen';
+
+  @override
+  String get exceptionSeverityError => 'Fehler';
+
+  @override
+  String get exceptionSeverityWarning => 'Warnung';
+
+  @override
+  String get exceptionSeverityInfo => 'Info';
+
+  @override
+  String get vendorSourceErp => 'ERP';
+
+  @override
+  String get vendorSourceAi => 'KI';
+
+  @override
+  String get vendorSourceManual => 'Manuell';
+
+  @override
+  String get vendorSourceOther => 'Andere Quelle';
+
+  @override
+  String get notificationEventInvoiceAssigned => 'Rechnung zugewiesen';
+
+  @override
+  String get notificationEventInvoiceApproved => 'Rechnung genehmigt';
+
+  @override
+  String get notificationEventInvoiceRejected => 'Rechnung abgelehnt';
+
+  @override
+  String get notificationEventInvoicePaid => 'Rechnung bezahlt';
+
+  @override
+  String get notificationEventContractRenewalDue =>
+      'Vertragsverlängerung fällig';
+
+  @override
+  String get notificationEventChatMessage => 'Neue Nachricht';
+
+  @override
+  String get notificationEventOther => 'Benachrichtigung';
+
+  @override
+  String get notificationUnread => 'Ungelesen';
+
+  @override
+  String get relativeTimeJustNow => 'gerade eben';
+
+  @override
+  String relativeTimeMinutesAgo(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'vor $count Minuten',
+      one: 'vor $count Minute',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String relativeTimeHoursAgo(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'vor $count Stunden',
+      one: 'vor $count Stunde',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String relativeTimeDaysAgo(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'vor $count Tagen',
+      one: 'vor $count Tag',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String notificationBellUnread(int count) {
+    return 'Benachrichtigungen, $count ungelesen';
+  }
+
+  @override
+  String get cashFlowButtonLabel => 'Liquiditätsprognose';
+
+  @override
+  String get listRowSelected => 'Ausgewählt';
+
+  @override
+  String get listRowNotSelected => 'Nicht ausgewählt';
+
+  @override
+  String listRowInvoiceNumber(String number) {
+    return 'Rechnung $number';
+  }
+
+  @override
+  String listRowDue(String date) {
+    return 'fällig am $date';
+  }
+
+  @override
+  String listRowPastDue(String date) {
+    return 'überfällig seit $date';
+  }
+
+  @override
+  String listRowSeverity(String severity) {
+    return 'Schweregrad $severity';
+  }
+
+  @override
+  String get listRowOverdue => 'Überfällig';
+
+  @override
+  String listRowContractNumber(String number) {
+    return 'Vertrag $number';
+  }
+
+  @override
+  String listRowEnds(String date) {
+    return 'endet am $date';
+  }
+
+  @override
+  String listRowVendorCode(String code) {
+    return 'Code $code';
+  }
+
+  @override
+  String listRowVendorSource(String source) {
+    return 'Quelle $source';
+  }
+
+  @override
+  String listRowInvoiceCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count Rechnungen',
+      one: '$count Rechnung',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String listRowInvoiceCountShort(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count Rg.',
+      one: '$count Rg.',
+    );
+    return '$_temp0';
   }
 }

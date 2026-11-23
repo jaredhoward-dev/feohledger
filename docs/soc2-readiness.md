@@ -98,15 +98,17 @@ Things an auditor expects to see *in code or config*, not just in a policy doc. 
 | **Centralized + WORM-compliant audit log shipping** | Done | `backend/app/services/audit_log_shipper.py` + `services/audit_shipping/` adapters — background loop ships tenant `audit_log` rows to CloudWatch Logs + S3 Object Lock. See `backend/docs/audit-log-shipping.md`. |
 | Centralized application logs (stderr) | Done in prod | ECS → CloudWatch Logs |
 | Alerting on 5xx + RBAC-denial spikes | Pending | CloudWatch Alarms or Datadog |
-| Uptime monitoring | Pending | UptimeRobot, Pingdom, or Better Stack |
+| Uptime monitoring | Built, not yet applied | `infra/uptime.tf`: Route 53 HTTPS checks on the apex, a tenant host and `api./api/health` from three regions, alarming to SMS + email (`docs/decisions.md` §311); `infra/canary.tf`: an hourly Synthetics canary validating the Let's Encrypt certificate Caddy serves on `api.`, paging under 14 days to expiry (built, not yet applied). A public status page is still a vendor decision (`founder-runbooks/support-and-status.md`) |
 
 ### Vulnerability + dependency management
 
 | Control | Status | Where it lives |
 |---|---|---|
 | Dependabot for Python, npm, Dart/Flutter (pub), Docker, GitHub Actions, Terraform | Done | `.github/dependabot.yml` |
-| SAST in CI | Done | `.github/workflows/security.yml` (CodeQL — Python + JS) |
-| Container image scanning | Done | `.github/workflows/security.yml` (Trivy on backend Dockerfile) |
+| SAST in CI | Done | `.github/workflows/security.yml` (CodeQL — Python, TypeScript/JavaScript, GitHub Actions), called from `ci.yml` on every PR and push to `main`, so a red scan fails `CI gate` and blocks the merge; plus a weekly scheduled run |
+| Container image scanning | Done | `.github/workflows/security.yml` (Trivy on backend Dockerfile; same `CI gate` wiring as SAST) |
+| Workflow security scanning | In progress (advisory) | `.github/workflows/supply-chain-scan.yml` (zizmor), on every PR, push to `main` and weekly; SARIF to code scanning. Baseline fixed: no findings at any severity (decisions §350, §365). Outside the merge gate until blocking is signed off and `zizmor` joins the Code scanning gate ruleset (decisions §349) |
+| Dependency vulnerability scanning, every lockfile | In progress (advisory) | `.github/workflows/supply-chain-scan.yml` (osv-scanner, offline database) over the pnpm, pub and pip lockfiles, the backend's `requirements*.lock` included; same advisory wiring. No open finding and no ignore in force: the one advisory that had needed one (deepmerge, GHSA-gcqx-w48m-w2h4) was withdrawn upstream, and its local patch, guard and both ignores were removed with it. A future advisory with no patched release gets a reviewed, expiring ignore by ID in a root `osv-scanner.toml` and `frontend/package.json` `pnpm.auditConfig.ignoreGhsas`, behind a local patch (decisions §349, §350, §352, §484) |
 | Secret scanning in repo | Done | GitHub native (free for public + paid tiers) |
 | Penetration test (annual) | Pending | One-time engagement, ~$8–15K |
 
@@ -135,9 +137,9 @@ Things an auditor expects to see *in code or config*, not just in a policy doc. 
 | Control | Status | Where it lives |
 |---|---|---|
 | All changes via PR + review | Done | GitHub branch protection on `main`: PR required and enforced on admins (no direct pushes, incl. the owner), linear history, no force-push/deletions, conversation resolution required. 0 required approvals — a green CI is the merge gate, not a human sign-off. |
-| CI gate (lint + tests) before merge | Done | `.github/workflows/ci.yml` — the "CI gate" aggregator job (`needs:` every CI job) is the **single required status check** on `main`, so a red CI blocks the merge. |
+| CI gate (lint + tests) before merge | Done | `.github/workflows/ci.yml` — the "CI gate" aggregator job (`needs:` every CI job) is the **single required status check** on `main`, so a red CI blocks the merge. Checks kept in other workflow files are gated by being called from `ci.yml` (`workflow_call`): `security.yml` (CodeQL + Trivy) and `web-bundle-budget.yml`. A workflow that is not called this way does not block a merge. |
 | Production deploy from `main` only | **Not yet evidenced** | Corrected 2026-09-06: the cited `.github/workflows/deploy.yml` **does not exist**. The real workflow is `.github/workflows/aws-deploy.yml`, which triggers on `release: [published]` — not `push: main` — and every job is gated on the repo variable `AWS_DEPLOY_ENABLED`, unset today, so **nothing deploys at all**. Branch protection (row 1) does enforce that `main` is the only source a release tag can come from, which is the control's substance; but there is no running deploy pipeline to evidence, so this cannot be claimed as Done until the AWS estate exists and the variable is set. Re-evidence at that point against `aws-deploy.yml` and its release trigger. |
-| Documented incident-response runbook | Pending | Vendor template + customise; needs on-call rotation |
+| Documented incident-response runbook | Pending | Vendor template + customise; needs on-call rotation. The breach-specific leg already exists: [`founder-runbooks/breach-notification.md`](founder-runbooks/breach-notification.md) carries every notification clock (GDPR 72 h, controllers without undue delay, and the 24 h connected-platform reports in its § 3a); the operational one is `founder-runbooks/support-and-status.md` § Incident communication runbook. The vendor template should link both rather than restate their clocks |
 
 ---
 
@@ -181,7 +183,8 @@ Renewals (Type II + pen test annually) are around **$25–40K/yr** thereafter.
 - `docs/backup-disaster-recovery.md` — backup + DR runbook with RTO/RPO
 - `docs/secrets-rotation.md` — secrets rotation procedure
 - `backend/scripts/access_review.py` — quarterly access-review CSV export
-- `.github/workflows/security.yml` — CodeQL (SAST) + Trivy (container scan), weekly + on push
+- `.github/workflows/security.yml` — CodeQL (SAST) + Trivy (container scan), on every PR and push to `main` via `ci.yml` (gating merges through `CI gate`) + weekly
+- `.github/workflows/supply-chain-scan.yml` — zizmor (workflow security) + osv-scanner (dependency vulnerabilities, every lockfile), advisory, on every PR and push to `main` + weekly
 - Concurrent session limit (Redis sorted set per user, configurable cap)
 - Forced logout on role change + account deactivation
 - Auth event audit logging (login/logout/MFA/SSO → tenant `audit_log`)

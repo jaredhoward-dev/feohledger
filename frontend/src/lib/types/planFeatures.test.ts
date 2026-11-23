@@ -8,12 +8,14 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { en } from '#lib/i18n/locales/en.ts';
+import { EN_ALL } from '#lib/i18n/allMessages.ts';
 import {
 	FEATURE_MIN_TIER,
 	PLAN_FEATURES,
 	isPlanFeature,
 	planFeatureLabelKey,
+	planCodeLabel,
+	planCodeLabelKey,
 	planTierLabelKey
 } from './planFeatures';
 
@@ -73,8 +75,8 @@ describe('plan features', () => {
 
 	it('labels every feature and tier from the catalogue', () => {
 		for (const feature of PLAN_FEATURES) {
-			expect(en[planFeatureLabelKey(feature)]?.trim()).toBeTruthy();
-			expect(en[planTierLabelKey(feature)]?.trim()).toBeTruthy();
+			expect(EN_ALL[planFeatureLabelKey(feature)]?.trim()).toBeTruthy();
+			expect(EN_ALL[planTierLabelKey(feature)]?.trim()).toBeTruthy();
 		}
 	});
 
@@ -82,5 +84,22 @@ describe('plan features', () => {
 		expect(isPlanFeature('sso')).toBe(true);
 		expect(isPlanFeature('max_seats')).toBe(false);
 		expect(isPlanFeature(undefined)).toBe(false);
+	});
+});
+
+describe('planCodeLabelKey', () => {
+	it('names the catalog tiers and leaves any other plan code to the caller', () => {
+		expect(planCodeLabelKey('free')).toBe('planTier.free');
+		expect(planCodeLabelKey('growth')).toBe('planTier.growth');
+		expect(planCodeLabelKey('scale')).toBe('planTier.scale');
+		expect(planCodeLabelKey('enterprise_acme')).toBeNull();
+		expect(planCodeLabelKey('')).toBeNull();
+		expect(planCodeLabelKey(null)).toBeNull();
+	});
+
+	it('labels a code through the given translator, falling back to the code', () => {
+		const t = (key: string) => `<${key}>`;
+		expect(planCodeLabel('growth', t)).toBe('<planTier.growth>');
+		expect(planCodeLabel('enterprise_acme', t)).toBe('enterprise_acme');
 	});
 });

@@ -36,6 +36,7 @@ from app.api.permissions import (
     PERM_VENDOR_BANK_CHANGE_APPROVE,
     PERM_VENDOR_BLOCK,
     PERM_VENDOR_MANAGE,
+    PERM_VENDOR_SANCTIONS_ADJUDICATE,
     ROLE_DEFAULT_PERMISSIONS,
     effective_permissions,
     permissions_for_role,
@@ -89,6 +90,7 @@ def test_cfo_default_matches_prior_role_matrix():
             PERM_PAYMENT_EXECUTE,
             PERM_PAYMENT_VOID,
             PERM_PAYMENT_RECORD_EXTERNAL,
+            PERM_VENDOR_SANCTIONS_ADJUDICATE,
         }
     )
     assert PERM_VENDOR_BANK_CHANGE_APPROVE not in ROLE_DEFAULT_PERMISSIONS[ROLE_CFO]
@@ -103,6 +105,17 @@ def test_ap_clerk_default_is_empty():
 def test_user_manage_default_is_admin_only():
     holders = {r for r, perms in ROLE_DEFAULT_PERMISSIONS.items() if PERM_USER_MANAGE in perms}
     assert holders == {ROLE_ADMIN}
+
+
+def test_sanctions_adjudicate_default_is_admin_and_cfo_only():
+    """Not ap_manager — who onboards vendors, approves their bank details and
+    executes runs — and never the clerk (decisions §477)."""
+    holders = {
+        r
+        for r, perms in ROLE_DEFAULT_PERMISSIONS.items()
+        if PERM_VENDOR_SANCTIONS_ADJUDICATE in perms
+    }
+    assert holders == {ROLE_ADMIN, ROLE_CFO}
 
 
 def test_payment_void_default_is_admin_and_cfo_only():
@@ -403,3 +416,52 @@ async def test_custom_role_with_only_payment_execute_reaches_the_runs_list_and_d
         with pytest.raises(HTTPException) as exc:
             await checker(request=_fake_request(), user=non_holder)
         assert exc.value.status_code == 403
+
+
+def _role_only_user(*role_names: str) -> MagicMock:
+    user = MagicMock(spec=["id", "organization_id", "roles", "effective_permissions"])
+    user.id = uuid.uuid4()
+    user.organization_id = uuid.uuid4()
+    user.roles = [SimpleNamespace(name=name) for name in role_names]
+    user.effective_permissions = frozenset()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_vendor_permission_holders_reach_the_vendor_reads():
+    """`GET /api/vendors` (+ `/ids`, `/counts`, `/{id}`) were role-only, so a
+    custom role holding only `vendor.manage` or `vendor.block` — no system role —
+    got a 403 on the list its own permission acts on. The reads now admit either
+    permission OR the three roles they always admitted; `cfo` holds no vendor
+    permission, which is why this is not a plain `require_permission`."""
+    from app.api.vendors import get_vendor, list_vendor_ids, list_vendors, vendor_status_counts
+
+    for route in (list_vendors, list_vendor_ids, vendor_status_counts, get_vendor):
+        checker = _checker_for(route)
+        for perm in (PERM_VENDOR_MANAGE, PERM_VENDOR_BLOCK):
+            holder = _permission_only_user(perm)
+            assert (await checker(request=_fake_request(), user=holder)) is holder
+
+        for role in (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO):
+            by_role = _role_only_user(role)
+            assert (await checker(request=_fake_request(), user=by_role)) is by_role
+
+        neither = _permission_only_user(PERM_PAYMENT_EXECUTE)
+        with pytest.raises(HTTPException) as exc:
+            await checker(request=_fake_request(), user=neither)
+        assert exc.value.status_code == 403
+
+        clerk = _role_only_user(ROLE_AP_CLERK)
+        with pytest.raises(HTTPException):
+            await checker(request=_fake_request(), user=clerk)
+
+
+def test_require_role_or_permission_rejects_typos_at_import_time():
+    from app.api.deps import require_role_or_permission
+
+    with pytest.raises(ValueError):
+        require_role_or_permission(roles=("admn",), permissions=(PERM_VENDOR_MANAGE,))
+    with pytest.raises(ValueError):
+        require_role_or_permission(roles=(ROLE_ADMIN,), permissions=("vendor.mange",))
+    with pytest.raises(ValueError):
+        require_role_or_permission(roles=(), permissions=(PERM_VENDOR_MANAGE,))

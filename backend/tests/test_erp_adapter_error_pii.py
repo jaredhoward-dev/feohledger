@@ -107,7 +107,7 @@ def _payload(**overrides) -> InvoicePayload:
         vendor_address="17 Bank Street, Springfield IL 62704",
         remit_to_address="PO Box 9001, Springfield IL 62704",
         bill_to_address="1 Corporate Plaza, Chicago IL 60601",
-        vendor_erp_id="ERP-V-1",
+        vendor_erp_id="00000000-0000-0000-0000-0000000000a1",
         gl_account_erp_id="ERP-6000",
     )
     base.update(overrides)
@@ -172,24 +172,72 @@ def test_netsuite_failure_message_is_pii_free():
     )
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
-        # The pre-create externalId lookup must miss so we reach the create POST.
-        client.get = AsyncMock(return_value=_ok_response({"count": 0, "items": []}))
-        client.post = AsyncMock(return_value=_error_response(422))
+        # The pre-create `eid:` lookup must miss so we reach the create POST.
+        miss = _error_response(404)
+        miss.json = MagicMock(return_value={"o:errorDetails": [{"o:errorCode": "NONEXISTENT_ID"}]})
+        client.get = AsyncMock(return_value=miss)
+        # The currency read, then the refused create; every read made to
+        # explain the refusal answers the same PII-echoing body.
+        client.post = AsyncMock(
+            side_effect=[
+                _ok_response({"items": [{"id": "1", "symbol": "USD"}], "hasMore": False}),
+                _error_response(422),
+                _error_response(422),
+                _error_response(422),
+            ]
+        )
         result = _run(adapter.post_invoice(_payload()))
 
     assert result.success is False
     _assert_pii_free(result.message, status=422, provider_hint="NetSuite")
+    assert result.refusal_code == "bill_refused"
 
 
 def test_merge_dev_failure_message_is_pii_free():
     adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok"})
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_ok_response({"next": None, "results": []}))
         client.post = AsyncMock(return_value=_error_response(400))
         result = _run(adapter.post_invoice(_payload()))
 
     assert result.success is False
     _assert_pii_free(result.message, status=400, provider_hint="Merge.dev")
+
+
+def test_merge_dev_coded_refusal_reads_only_the_problem_type():
+    """Merge's `errors[]` carry the integration's own `detail` / `title` /
+    `raw_error`, which echo what was submitted. Only `problem_type` (an enum
+    value) is read; free text in its place is not echoed either."""
+    import json
+
+    adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok"})
+    leaky = json.dumps(_PII_BODY)
+    body = {
+        "model": None,
+        "errors": [
+            {
+                "problem_type": "MISSING_REQUIRED_FIELD",
+                "title": leaky,
+                "detail": leaky,
+                "raw_error": leaky,
+                "source": {"pointer": leaky},
+            },
+            {"problem_type": f"Bank Street {leaky}"},
+        ],
+    }
+    refused = _error_response(400)
+    refused.json = MagicMock(return_value=body)
+    with patch("httpx.AsyncClient") as cm:
+        client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_ok_response({"next": None, "results": []}))
+        client.post = AsyncMock(return_value=refused)
+        result = _run(adapter.post_invoice(_payload()))
+
+    assert result.refusal_code == "bill_refused" and result.not_posted
+    assert result.refusal_params == {"merge_problem": "MISSING_REQUIRED_FIELD"}
+    for token in _PII_TOKENS:
+        assert token not in result.message
 
 
 def test_business_central_failure_message_is_pii_free():
@@ -199,7 +247,7 @@ def test_business_central_failure_message_is_pii_free():
             "client_id": "c",
             "client_secret": "s",
             "environment": "sandbox",
-            "company_id": "co",
+            "company_id": "1b2c3d4e-0000-0000-0000-00000000c001",
             "base_url": "https://api.businesscentral.dynamics.com/v2.0",
         }
     )
@@ -208,7 +256,7 @@ def test_business_central_failure_message_is_pii_free():
         patch("httpx.AsyncClient") as cm,
     ):
         client = cm.return_value.__aenter__.return_value
-        # The pre-create externalDocumentNumber lookup must miss.
+        # The pre-create vendor + vendorInvoiceNumber lookup must miss.
         client.get = AsyncMock(return_value=_ok_response({"value": []}))
         client.post = AsyncMock(return_value=_error_response(409))
         result = _run(adapter.post_invoice(_payload()))
@@ -267,6 +315,7 @@ def test_unlinked_vendor_is_refused_before_any_http_call(adapter, provider):
     assert result.success is False
     assert result.message == f"{provider} post refused: vendor_not_linked"
     assert "Acme" not in result.message
+    assert result.not_posted is True
     cm.assert_not_called()
 
 
@@ -337,6 +386,7 @@ def test_unlinked_account_is_refused_before_any_http_call(adapter, provider, pay
 
     assert result.success is False
     assert result.message == f"{provider} post refused: account_not_linked"
+    assert result.not_posted is True
     cm.assert_not_called()
 
 

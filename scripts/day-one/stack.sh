@@ -86,7 +86,9 @@ wait_for() {
 # deploy/prod.sops.yaml.example sets it, pointed at the local stand-ins —
 # LocalStack for KMS, MinIO for S3, Mailpit for SMTP (a deployed environment
 # refuses the `console` email adapter). Keys are generated per run, so nothing
-# here is a committed secret.
+# here is a committed secret. FEOH_CORS_ORIGINS names the browser's origins
+# explicitly: a deployed environment admits no loopback origin by default
+# (backend/app/main.py::_cors_allow_origins), and only an explicit list keeps one.
 write_env() {
 	mkdir -p "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
@@ -101,6 +103,7 @@ FEOH_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:${PG_PORT}/fe
 FEOH_REDIS_URL=redis://127.0.0.1:${REDIS_PORT}
 FEOH_SECRET_KEY=$(openssl rand -hex 32)
 FEOH_APPROVAL_SIGNING_KEY=$(openssl rand -hex 32)
+FEOH_PAYEE_FINGERPRINT_KEY=$(openssl rand -hex 32)
 FEOH_CREDENTIAL_KMS_KEY_ID=${KMS_ALIAS}
 FEOH_AWS_ENDPOINT_URL=http://127.0.0.1:${AWS_PORT}
 AWS_ACCESS_KEY_ID=test
@@ -113,6 +116,7 @@ FEOH_S3_BUCKET=invoices
 FEOH_PUBLIC_URL=http://localhost:${WEB_PORT}
 FEOH_API_PUBLIC_URL=http://localhost:${API_PORT}
 FEOH_TENANT_URL_TEMPLATE=http://{slug}.localhost:${WEB_PORT}
+FEOH_CORS_ORIGINS=["http://${SLUG}.localhost:${WEB_PORT}","http://localhost:${WEB_PORT}"]
 FEOH_MFA_ENABLED=true
 FEOH_HSTS_ENABLED=true
 FEOH_SIGNUP_ENABLED=false
@@ -121,6 +125,7 @@ FEOH_EMAIL_PROVIDER=smtp
 FEOH_SMTP_HOST=127.0.0.1
 FEOH_SMTP_PORT=${SMTP_PORT}
 FEOH_EMAIL_FROM=no-reply@localhost
+FEOH_SUBPROCESSOR_NOTICES_ENABLED=true
 EOF
 	)
 }
@@ -218,17 +223,15 @@ cmd_provision() {
 	write_env
 	# shellcheck source=deploy/lib.sh
 	. deploy/lib.sh
-	# No --admin-password: the operator's path in #566, a generated temporary
-	# password whose change is forced at first login.
-	feoh_tenant_argv "$SLUG" "$TENANT_NAME" "$ADMIN_EMAIL" "" || die "could not build the provisioning command."
+	# add-tenant's default path: the admin gets no password, and the
+	# set-password link goes by email to Mailpit, where the journey reads it.
+	feoh_tenant_argv "$SLUG" "$TENANT_NAME" "$ADMIN_EMAIL"
 	docker exec "$API_CONTAINER" "${FEOH_TENANT_ARGV[@]}"
-	[ "$FEOH_TENANT_FORCED" = 1 ] || die "add-tenant's default path should force a password change."
 	(
 		umask 077
 		jq -n --arg slug "$SLUG" --arg name "$TENANT_NAME" --arg email "$ADMIN_EMAIL" \
-			--arg password "$FEOH_TENANT_PASSWORD" \
 			--arg mailpit "http://127.0.0.1:${MAILPIT_PORT}" \
-			'{slug: $slug, name: $name, admin_email: $email, admin_temp_password: $password, mailpit_url: $mailpit}' \
+			'{slug: $slug, name: $name, admin_email: $email, mailpit_url: $mailpit}' \
 			>"$STATE_DIR/tenant.json"
 	)
 	echo "==> tenant '${SLUG}' provisioned; admin login written to ${STATE_DIR}/tenant.json"

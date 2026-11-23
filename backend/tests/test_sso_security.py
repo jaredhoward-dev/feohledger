@@ -501,7 +501,7 @@ def test_resolve_sso_config_rejects_a_non_http_discovery_url(bad):
             "enabled": True,
             "discovery_url": bad,
             "client_id": "cid",
-            "client_secret": "sec",
+            "client_secret_configured": True,
         }
     }
     with pytest.raises(SSOConfigError):
@@ -550,6 +550,64 @@ async def test_internal_sso_url_is_allowed_outside_a_deployed_environment():
         what="discovery_url",
         error=sso.SSOConfigError,
     )
+
+
+class _Dialled(Exception):
+    """Raised by the stub socket layer, carrying the address it was asked for."""
+
+
+def _stub_socket_layer(monkeypatch, answer: str):
+    """Script the pinned client's one lookup and record (by raising) the dial."""
+    import httpcore
+
+    from app.utils import url_safety
+
+    class _Backend(httpcore.AsyncNetworkBackend):
+        async def connect_tcp(self, host, port, **_kw):
+            raise _Dialled(host)
+
+        async def connect_unix_socket(self, *_a, **_kw):
+            raise AssertionError("never a unix socket")
+
+        async def sleep(self, seconds):
+            pass
+
+    async def lookup(host, port):
+        return [answer]
+
+    monkeypatch.setattr(url_safety.httpcore, "AnyIOBackend", _Backend)
+    monkeypatch.setattr(url_safety, "_lookup_async", lookup)
+
+
+@pytest.mark.asyncio
+async def test_idp_fetch_refuses_a_rebound_address_at_connect_when_deployed(deployed, monkeypatch):
+    """DNS rebinding: `_assert_sso_url_public` saw a public answer, the connect's
+    own lookup gets the metadata address. The pinned client refuses with the
+    caller's error type and dials nothing (this POST carries the client secret
+    and the authorization code)."""
+    from app.services import sso
+
+    _stub_socket_layer(monkeypatch, "169.254.169.254")
+    async with sso._sso_http_client(
+        what="token_endpoint", error=sso.SSOValidationError, timeout=5
+    ) as client:
+        with pytest.raises(sso.SSOValidationError):
+            await client.post("https://idp.example/oauth2/token")
+
+
+@pytest.mark.asyncio
+async def test_idp_fetch_reaches_a_local_idp_outside_a_deployed_environment(monkeypatch):
+    """Local Keycloak still works (guard rail 7), and through the pin: the dial
+    is the address the one lookup returned."""
+    from app.services import sso
+
+    _stub_socket_layer(monkeypatch, "127.0.0.1")
+    async with sso._sso_http_client(
+        what="discovery_url", error=sso.SSOConfigError, timeout=5
+    ) as client:
+        with pytest.raises(_Dialled) as dialled:
+            await client.get("http://keycloak.localhost:8088/realms/x")
+    assert dialled.value.args == ("127.0.0.1",)
 
 
 def test_pinned_endpoint_accepts_an_endpoint_on_the_issuer_host():
@@ -635,7 +693,7 @@ def _broken_oidc_org(slug: str = "acme"):
                 "enabled": True,
                 "discovery_url": "https://idp.example/.well-known/openid-configuration",
                 "client_id": "client-123",
-                # client_secret deliberately omitted -> SSOConfigError
+                # no client_secret_configured marker -> SSOConfigError
             }
         },
     )
@@ -677,6 +735,75 @@ async def test_sso_authorize_broken_config_is_400_not_500(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "code"),
+    [
+        ("state", "sso_session_expired"),
+        ("exchange", "sso_login_rejected"),
+        ("id_token", "sso_token_invalid"),
+    ],
+)
+async def test_sso_callback_failures_are_coded_not_exception_text(monkeypatch, stage, code):
+    """Each OIDC callback leg that used to send ``str(exc)`` answers a coded
+    400 instead: one code per leg, whatever the SSO service objected to, and
+    none of its wording."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from app.api import auth_sso
+    from app.services import sso
+
+    secret_text = "internal wording that must not reach the client"
+
+    async def _boom(*_a, **_k):
+        raise sso.SSOValidationError(secret_text)
+
+    async def _consume_state(state):
+        return {"tenant": "acme", "nonce": "nonce-y"}
+
+    async def _fetch_org(slug, db):
+        return SimpleNamespace(id=uuid.uuid4(), slug="acme", settings={})
+
+    async def _discovery(url):
+        return {"issuer": "https://idp.example.com"}
+
+    async def _tokens(*_a, **_k):
+        return {"id_token": "a.b.c"}
+
+    async def _noop(*_a, **_k):
+        return None
+
+    config = SimpleNamespace(discovery_url="https://idp.example.com", client_id="cid")
+    monkeypatch.setattr(auth_sso, "consume_state", _boom if stage == "state" else _consume_state)
+    monkeypatch.setattr(auth_sso, "_fetch_org_by_slug", _fetch_org)
+
+    async def _settings(db, org):
+        return {}
+
+    async def _secret(*_a, **_k):
+        return "s3cret"
+
+    monkeypatch.setattr(auth_sso, "sign_in_settings", _settings)
+    monkeypatch.setattr(auth_sso, "_resolve_sso_or_none", lambda s: config)
+    monkeypatch.setattr(auth_sso, "load_client_secret", _secret)
+    monkeypatch.setattr(auth_sso, "fetch_discovery", _discovery)
+    monkeypatch.setattr(
+        auth_sso, "exchange_code_for_tokens", _boom if stage == "exchange" else _tokens
+    )
+    monkeypatch.setattr(auth_sso, "validate_id_token", _boom)
+    monkeypatch.setattr(auth_sso, "dispatch_auth_audit", _noop)
+
+    fake_request = SimpleNamespace(client=SimpleNamespace(host="1.2.3.4"), headers={})
+    body = auth_sso.SSOCallbackRequest(code="the-code", state="the-state")
+    with pytest.raises(HTTPException) as exc:
+        await auth_sso.sso_callback(body, fake_request, db=None)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == code
+    assert secret_text not in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_sso_callback_broken_config_is_400_not_500(monkeypatch):
     from types import SimpleNamespace
 
@@ -701,3 +828,224 @@ async def test_sso_callback_broken_config_is_400_not_500(monkeypatch):
     assert exc.value.status_code == 400
     assert exc.value.detail == "SSO is not configured for this tenant."
     assert "client_secret" not in exc.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raised", "reason", "code", "message"),
+    [
+        (
+            "DeactivatedAccount",
+            "inactive",
+            "sso_account_inactive",
+            "This account has been deactivated. Contact your administrator.",
+        ),
+        (
+            "EmailDomainNotAllowed",
+            "domain_blocked",
+            "sso_email_domain_blocked",
+            "Your email domain isn't allowed to sign in to this workspace.",
+        ),
+        (
+            "UnsafeEmailAddress",
+            "unsafe_email",
+            "sso_email_unusable",
+            "The identity provider supplied an unusable email address.",
+        ),
+    ],
+)
+async def test_sso_callback_identity_refusals_are_coded(monkeypatch, raised, reason, code, message):
+    """The OIDC callback's identity refusals are coded refusals in the English
+    they always had, so the callback page localizes them — and the SAML bridge
+    states the same codes (`api/refusals.py`, decisions §359). The audit reason
+    is unchanged."""
+    import uuid
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    import app.services.identity_provisioning as ip
+    from app.api import auth_sso
+
+    exc_type = getattr(ip, raised)
+
+    def _make():
+        return exc_type(uuid.uuid4()) if raised == "DeactivatedAccount" else exc_type("u@acme.com")
+
+    async def _consume_state(state):
+        return {"tenant": "acme", "nonce": "nonce-y"}
+
+    async def _fetch_org(slug, db):
+        return SimpleNamespace(id=uuid.uuid4(), slug="acme", settings={})
+
+    async def _sign_in_settings(db, org):
+        return {}
+
+    config = SimpleNamespace(
+        discovery_url="https://idp.test/.well-known/openid-configuration",
+        client_id="cid",
+        allowed_email_domains=[],
+        provider="okta",
+    )
+
+    async def _secret(org_id, *, db=None):
+        return "not-a-real-secret"
+
+    async def _discovery(url):
+        return {}
+
+    async def _exchange(*a, **kw):
+        return {"id_token": "stub"}
+
+    async def _validate(*a, **kw):
+        return {"email": "u@acme.com", "sub": "sub-1"}
+
+    def _check(email, allowed):
+        if raised == "DeactivatedAccount":
+            return email
+        raise _make()
+
+    async def _jit(*a, **kw):
+        raise _make()
+
+    audits: list[dict] = []
+
+    async def _audit(**kw):
+        audits.append(kw)
+
+    monkeypatch.setattr(auth_sso, "consume_state", _consume_state)
+    monkeypatch.setattr(auth_sso, "_fetch_org_by_slug", _fetch_org)
+    monkeypatch.setattr(auth_sso, "sign_in_settings", _sign_in_settings)
+    monkeypatch.setattr(auth_sso, "_resolve_sso_or_none", lambda settings: config)
+    monkeypatch.setattr(auth_sso, "load_client_secret", _secret)
+    monkeypatch.setattr(auth_sso, "fetch_discovery", _discovery)
+    monkeypatch.setattr(auth_sso, "exchange_code_for_tokens", _exchange)
+    monkeypatch.setattr(auth_sso, "validate_id_token", _validate)
+    monkeypatch.setattr(auth_sso, "extract_and_check_email", _check)
+    monkeypatch.setattr(auth_sso, "jit_provision", _jit)
+    monkeypatch.setattr(auth_sso, "dispatch_auth_audit", _audit)
+
+    request = SimpleNamespace(client=SimpleNamespace(host="203.0.113.7"), headers={})
+    body = auth_sso.SSOCallbackRequest(code="c", state="s")
+    with pytest.raises(HTTPException) as exc:
+        await auth_sso.sso_callback(body, request, db=None)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == {"code": code, "message": message, "params": {}}
+    assert [a["details"]["reason"] for a in audits] == [reason]
+
+
+# ---------- the sealed client secret reaches only the code exchange ----------
+
+
+def _sealed_callback_harness(monkeypatch, secret_loader):
+    """Drive `sso_callback` up to the code exchange with every IdP leg stubbed.
+
+    Returns ``(exchanged, audits, org)``: what the exchange was handed, the
+    audit rows written, and the org the callback resolved.
+    """
+    from types import SimpleNamespace
+
+    from app.api import auth_sso
+
+    org = SimpleNamespace(id=uuid.uuid4(), slug="acme", settings={})
+    exchanged: list[tuple] = []
+    audits: list[dict] = []
+
+    async def _consume_state(state):
+        return {"tenant": "acme", "nonce": "nonce-y"}
+
+    async def _fetch_org(slug, db):
+        return org
+
+    async def _sign_in_settings(db, o):
+        return {
+            "sso": {
+                "enabled": True,
+                "discovery_url": "https://idp.test/.well-known/openid-configuration",
+                "client_id": "cid",
+                "client_secret_configured": True,
+                # A stray plaintext value must never be what is sent.
+                "client_secret": "stray-plaintext",
+            }
+        }
+
+    async def _discovery(url):
+        return {}
+
+    async def _exchange(discovery, client_id, client_secret, *rest, **kw):
+        exchanged.append((client_id, client_secret))
+        return {}  # no id_token: the callback stops right after the exchange
+
+    async def _audit(**kw):
+        audits.append(kw)
+
+    monkeypatch.setattr(auth_sso, "consume_state", _consume_state)
+    monkeypatch.setattr(auth_sso, "_fetch_org_by_slug", _fetch_org)
+    monkeypatch.setattr(auth_sso, "sign_in_settings", _sign_in_settings)
+    monkeypatch.setattr(auth_sso, "load_client_secret", secret_loader)
+    monkeypatch.setattr(auth_sso, "fetch_discovery", _discovery)
+    monkeypatch.setattr(auth_sso, "exchange_code_for_tokens", _exchange)
+    monkeypatch.setattr(auth_sso, "dispatch_auth_audit", _audit)
+    return exchanged, audits, org
+
+
+async def _run_callback():
+    from types import SimpleNamespace
+
+    from app.api import auth_sso
+
+    request = SimpleNamespace(client=SimpleNamespace(host="203.0.113.7"), headers={})
+    body = auth_sso.SSOCallbackRequest(code="c", state="s")
+    return await auth_sso.sso_callback(body, request, db=None)
+
+
+@pytest.mark.asyncio
+async def test_sso_callback_sends_the_sealed_secret_not_the_jsonb(monkeypatch):
+    from fastapi import HTTPException
+
+    loaded: list = []
+
+    async def _secret(org_id, *, db=None):
+        loaded.append(org_id)
+        return "sealed-test-secret"
+
+    exchanged, _audits, org = _sealed_callback_harness(monkeypatch, _secret)
+    with pytest.raises(HTTPException):  # stops at "no ID token", after the exchange
+        await _run_callback()
+    assert loaded == [org.id]
+    assert exchanged == [("cid", "sealed-test-secret")]
+
+
+@pytest.mark.asyncio
+async def test_sso_callback_with_no_sealed_secret_is_refused_before_the_idp(monkeypatch):
+    from fastapi import HTTPException
+
+    async def _none(org_id, *, db=None):
+        return None
+
+    exchanged, audits, _org = _sealed_callback_harness(monkeypatch, _none)
+    with pytest.raises(HTTPException) as exc:
+        await _run_callback()
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "SSO is not configured for this tenant."
+    assert exchanged == []
+    assert [a["details"]["reason"] for a in audits] == ["client_secret_missing"]
+
+
+@pytest.mark.asyncio
+async def test_sso_callback_fails_closed_when_the_store_cannot_open(monkeypatch):
+    from fastapi import HTTPException
+
+    from app.services.credential_crypto import CredentialCryptoError
+
+    async def _broken(org_id, *, db=None):
+        raise CredentialCryptoError("credential store unavailable")
+
+    exchanged, audits, _org = _sealed_callback_harness(monkeypatch, _broken)
+    with pytest.raises(HTTPException) as exc:
+        await _run_callback()
+    assert exc.value.status_code == 503
+    assert "secret" not in str(exc.value.detail).lower()
+    assert exchanged == []
+    assert [a["details"]["reason"] for a in audits] == ["credentials_unavailable"]

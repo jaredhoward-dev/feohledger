@@ -35,12 +35,24 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import create_access_token_with_jti
+from app.api.refusals import (
+    SSO_ACCOUNT_INACTIVE_DETAIL,
+    SSO_EMAIL_DOMAIN_BLOCKED_DETAIL,
+    SSO_EMAIL_IN_OTHER_WORKSPACE,
+    SSO_EMAIL_IN_OTHER_WORKSPACE_DETAIL,
+    SSO_EMAIL_UNUSABLE_DETAIL,
+    SSO_LOGIN_REJECTED_DETAIL,
+    SSO_SESSION_EXPIRED_DETAIL,
+    SSO_TOKEN_INVALID_DETAIL,
+)
 from app.database import get_control_db
 from app.models.organization import Organization
 from app.services.audit_dispatch import dispatch_auth_audit
+from app.services.credential_crypto import CredentialCryptoError
 from app.services.identity_provisioning import (
     DeactivatedAccount,
     EmailDomainNotAllowed,
+    EmailInOtherWorkspace,
     UnsafeEmailAddress,
     extract_and_check_email,
     jit_provision,
@@ -56,6 +68,7 @@ from app.services.sso import (
     exchange_code_for_tokens,
     fetch_discovery,
     is_sso_only,
+    load_client_secret,
     redirect_uri,
     resolve_sso_config,
     resolve_sso_tenant_slug,
@@ -249,7 +262,8 @@ async def sso_callback(
     try:
         bound = await consume_state(body.state)
     except SSOValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("OIDC callback state refused: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail=SSO_SESSION_EXPIRED_DETAIL) from exc
 
     tenant_slug = bound["tenant"]
     expected_nonce = bound["nonce"]
@@ -261,13 +275,40 @@ async def sso_callback(
     if config is None:
         raise HTTPException(status_code=400, detail="SSO is not configured for this tenant.")
 
+    # The client secret is sealed (`services/sso.load_client_secret`) and
+    # opened only here, after the single-use state above was consumed. A
+    # marker with no stored secret, or a store that cannot open it, fails the
+    # sign-in closed before anything is sent to the IdP. The reason codes name
+    # no value.
+    try:
+        client_secret = await load_client_secret(org.id, db=db)
+    except CredentialCryptoError:
+        await dispatch_auth_audit(
+            organization_id=org.id,
+            actor_id=None,
+            action="auth.sso.login.failure",
+            details={"tenant": tenant_slug, "ip": ip, "reason": "credentials_unavailable"},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Single sign-on is temporarily unavailable. Try again shortly.",
+        ) from None
+    if client_secret is None:
+        await dispatch_auth_audit(
+            organization_id=org.id,
+            actor_id=None,
+            action="auth.sso.login.failure",
+            details={"tenant": tenant_slug, "ip": ip, "reason": "client_secret_missing"},
+        )
+        raise HTTPException(status_code=400, detail="SSO is not configured for this tenant.")
+
     discovery = await fetch_discovery(config.discovery_url)
 
     try:
         tokens = await exchange_code_for_tokens(
             discovery,
             config.client_id,
-            config.client_secret,
+            client_secret,
             body.code,
             tenant_slug,
             org.settings,
@@ -279,7 +320,8 @@ async def sso_callback(
             action="auth.sso.login.failure",
             details={"tenant": tenant_slug, "ip": ip, "reason": "code_exchange_failed"},
         )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("OIDC code exchange refused: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail=SSO_LOGIN_REJECTED_DETAIL) from exc
 
     id_token = tokens.get("id_token")
     if not id_token:
@@ -300,7 +342,8 @@ async def sso_callback(
             action="auth.sso.login.failure",
             details={"tenant": tenant_slug, "ip": ip, "reason": "id_token_invalid"},
         )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("OIDC ID token refused: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail=SSO_TOKEN_INVALID_DETAIL) from exc
 
     # Entra sometimes uses `upn` (user principal name) instead of `email`
     email = claims.get("email") or claims.get("preferred_username") or claims.get("upn")
@@ -326,10 +369,7 @@ async def sso_callback(
             action="auth.sso.login.failure",
             details={"tenant": tenant_slug, "ip": ip, "reason": "unsafe_email"},
         )
-        raise HTTPException(
-            status_code=403,
-            detail="The identity provider supplied an unusable email address.",
-        ) from exc
+        raise HTTPException(status_code=403, detail=SSO_EMAIL_UNUSABLE_DETAIL) from exc
     except EmailDomainNotAllowed as exc:
         await dispatch_auth_audit(
             organization_id=org.id,
@@ -342,10 +382,7 @@ async def sso_callback(
                 "reason": "domain_blocked",
             },
         )
-        raise HTTPException(
-            status_code=403,
-            detail="Your email domain isn't allowed to sign in to this workspace.",
-        ) from exc
+        raise HTTPException(status_code=403, detail=SSO_EMAIL_DOMAIN_BLOCKED_DETAIL) from exc
 
     try:
         user = await jit_provision(db, org, email, sub, config.provider, claims)
@@ -361,10 +398,26 @@ async def sso_callback(
             entity_id=exc.user_id,
             details={"tenant": tenant_slug, "ip": ip, "reason": "inactive"},
         )
-        raise HTTPException(
-            status_code=403,
-            detail="This account has been deactivated. Contact your administrator.",
-        ) from exc
+        raise HTTPException(status_code=403, detail=SSO_ACCOUNT_INACTIVE_DETAIL) from exc
+    except EmailInOtherWorkspace as exc:
+        # The address names an account in another workspace, and one address is
+        # one account. Audited HERE, in the workspace whose IdP asserted it —
+        # its admin is the one who can act (have the IdP send another address)
+        # — and never in the other workspace's log, which this IdP's admin must
+        # not be able to write into by typing addresses (decisions §291). The
+        # email rides along as on `domain_blocked`, the OIDC rows' convention.
+        await dispatch_auth_audit(
+            organization_id=org.id,
+            actor_id=None,
+            action="auth.sso.login.failure",
+            details={
+                "tenant": tenant_slug,
+                "ip": ip,
+                "email": email,
+                "reason": SSO_EMAIL_IN_OTHER_WORKSPACE,
+            },
+        )
+        raise HTTPException(status_code=403, detail=SSO_EMAIL_IN_OTHER_WORKSPACE_DETAIL) from exc
 
     token, jti = create_access_token_with_jti(user.id, user.organization_id)
     await register_session(

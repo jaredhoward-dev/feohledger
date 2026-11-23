@@ -91,7 +91,7 @@ def _payload(**overrides) -> InvoicePayload:
         tax_amount=Decimal("0.10"),
         discount_amount=Decimal("5.50"),
         gl_account="6000",
-        vendor_erp_id="ERP-V-1",
+        vendor_erp_id="00000000-0000-0000-0000-0000000000a1",
         gl_account_erp_id="ERP-6000",
         line_items=[
             LineItemPayload(
@@ -220,36 +220,66 @@ def test_loads_exact_json_reads_money_without_a_float_hop():
 # ---------------------------------------------------------------------------
 
 
+_MERGE_EMPTY = {"next": None, "results": []}
+
+
+def _merge_client(cm, posted_total=LOSSY_AMOUNT):
+    client = cm.return_value.__aenter__.return_value
+    client.get = AsyncMock(return_value=_mock_response(200, _MERGE_EMPTY))
+    client.post = AsyncMock(
+        return_value=_mock_response(201, {"model": {"id": "m1", "total_amount": posted_total}})
+    )
+    return client
+
+
 def test_merge_dev_posts_exact_decimal_amounts():
     adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok"})
     with patch("httpx.AsyncClient") as cm:
-        client = cm.return_value.__aenter__.return_value
-        client.post = AsyncMock(return_value=_mock_response(201, {"model": {"id": "m1"}}))
+        client = _merge_client(cm)
         result = _run(adapter.post_invoice(_payload()))
 
     assert result.success
     body = _posted_body_text(client)
-    _assert_exact(body, "total_amount", "sub_total", "total_line_amount", "unit_price")
-    assert '"quantity":3.5000' in body
+    _assert_exact(body, "total_amount")
+    # A line's amount is Merge's `total_amount` (decisions §399), exact; the
+    # PO-line field `total_line_amount` is never sent on an invoice line.
+    line = json.loads(body, parse_float=Decimal)["model"]["line_items"][0]
+    assert line["total_amount"] == LOSSY_AMOUNT
+    assert "total_line_amount" not in body
     assert '"total_tax_amount":0.10' in body
-    assert '"total_discount":5.50' in body
     # Still a JSON object the far end can parse, with the header it advertises.
     assert json.loads(body)["model"]["number"] == "INV-1"
     assert client.post.await_args.kwargs["headers"]["Content-Type"] == "application/json"
 
 
-def test_merge_dev_omits_absent_optional_money_unchanged():
-    """The `if x else None` shape around every optional amount is behaviour the
-    fix had to preserve, not change — a zero subtotal still sends null."""
+def test_merge_dev_reads_the_posted_total_back_exactly():
+    """The total Merge reports is parsed without a float hop: read through a
+    float, an exact 99999999999999.99 came back …98 and failed as a mismatch."""
     adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok"})
     with patch("httpx.AsyncClient") as cm:
-        client = cm.return_value.__aenter__.return_value
-        client.post = AsyncMock(return_value=_mock_response(201, {"model": {"id": "m1"}}))
+        client = _merge_client(cm)
+        resp = client.post.return_value
+        # What httpx does with the body: `json.loads(content, **kwargs)`.
+        wire = f'{{"model": {{"id": "m1", "total_amount": {LOSSY_AMOUNT}}}}}'
+        resp.json = MagicMock(side_effect=lambda **kw: json.loads(wire, **kw))
+        result = _run(adapter.post_invoice(_payload()))
+
+    assert result.success, result.message
+
+
+def test_merge_dev_omits_absent_optional_money_unchanged():
+    """A zero tax still sends null, and the totals Merge would read as a
+    second statement of the bill (`sub_total`, `total_discount`) are not sent
+    against gross lines (decisions §399)."""
+    adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok"})
+    with patch("httpx.AsyncClient") as cm:
+        client = _merge_client(cm)
         _run(adapter.post_invoice(_payload(subtotal=None, tax_amount=Decimal("0.00"))))
 
     parsed = json.loads(_posted_body_text(client))
-    assert parsed["model"]["sub_total"] is None
+    assert "sub_total" not in parsed["model"] and "total_discount" not in parsed["model"]
     assert parsed["model"]["total_tax_amount"] is None
+    assert parsed["model"]["inclusive_of_tax"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +302,18 @@ def _netsuite_adapter() -> NetSuiteAdapter:
 def _netsuite_bill_readback(total_literal: str) -> MagicMock:
     """``GET /vendorBill/{id}`` with ``total`` as a raw JSON number literal."""
     resp = _mock_response(200, {})
-    resp.content = f'{{"id": "42", "total": {total_literal}}}'.encode()
+    resp.content = (
+        f'{{"id": "42", "total": {total_literal}, '
+        '"currency": {"id": "1"}, "status": {"id": "open"}}'
+    ).encode()
     return resp
+
+
+#: The pre-create `eid:` lookup's miss, and the SuiteQL currency read.
+_NETSUITE_MISS = _mock_response(404, {"o:errorDetails": [{"o:errorCode": "NONEXISTENT_ID"}]})
+_NETSUITE_USD = _mock_response(200, {})
+# SuiteQL bodies are parsed from the raw bytes (`loads_exact_json`).
+_NETSUITE_USD.content = b'{"items": [{"id": "1", "symbol": "USD"}], "hasMore": false}'
 
 
 def _netsuite_post(payload) -> str:
@@ -282,18 +322,22 @@ def _netsuite_post(payload) -> str:
         client = cm.return_value.__aenter__.return_value
         client.get = AsyncMock(
             side_effect=[
-                _mock_response(200, {"items": [], "count": 0}),
+                _NETSUITE_MISS,
                 # NetSuite booked exactly what was approved.
                 _netsuite_bill_readback(exact_number_literal(payload.amount)),
             ]
         )
         client.post = AsyncMock(
-            return_value=_mock_response(204, None, headers={"Location": "https://x/vendorBill/42"})
+            side_effect=[
+                _NETSUITE_USD,
+                _mock_response(204, None, headers={"Location": "https://x/vendorBill/42"}),
+            ]
         )
         result = _run(adapter.post_invoice(payload))
     assert result.success, result.message
     assert client.post.await_args.kwargs["headers"]["Content-Type"] == "application/json"
-    return _posted_body_text(client)
+    # The second POST is the create (the first is the currency read).
+    return _posted_body_text(client, call_index=1)
 
 
 def test_netsuite_reads_the_booked_total_back_exactly():
@@ -305,15 +349,16 @@ def test_netsuite_reads_the_booked_total_back_exactly():
             client = cm.return_value.__aenter__.return_value
             client.get = AsyncMock(
                 side_effect=[
-                    _mock_response(200, {"items": [], "count": 0}),
+                    _NETSUITE_MISS,
                     _netsuite_bill_readback(literal),
                     _mock_response(200, {"status": {"id": "open"}}),
                 ]
             )
             client.post = AsyncMock(
-                return_value=_mock_response(
-                    204, None, headers={"Location": "https://x/vendorBill/42"}
-                )
+                side_effect=[
+                    _NETSUITE_USD,
+                    _mock_response(204, None, headers={"Location": "https://x/vendorBill/42"}),
+                ]
             )
             client.delete = AsyncMock()
             result = _run(_netsuite_adapter().post_invoice(_payload()))
@@ -363,17 +408,18 @@ def _bc_adapter() -> BusinessCentralAdapter:
             "client_id": "cid",
             "client_secret": "sec",
             "environment": "sandbox",
-            "company_id": "c-1",
+            "company_id": "1b2c3d4e-0000-0000-0000-00000000c001",
             "base_url": "https://api.businesscentral.dynamics.com/v2.0",
         }
     )
 
 
-def _bc_draft(doc_id: str, total: Decimal) -> MagicMock:
-    """The fresh read of a created draft: BC's own total, on the wire exactly."""
+def _bc_draft(doc_id: str, total: Decimal, status: str = "Draft") -> MagicMock:
+    """A fresh read of a purchaseInvoice: BC's own total, on the wire exactly.
+    ``status="Open"`` is the read after ``Microsoft.NAV.post``."""
     resp = _mock_response(200, {})
     resp.content = dumps_exact_json(
-        {"id": doc_id, "status": "Draft", "totalAmountIncludingTax": total}
+        {"id": doc_id, "status": status, "totalAmountIncludingTax": total}
     ).encode()
     return resp
 
@@ -388,7 +434,11 @@ def test_d365_compares_the_drafts_total_exactly(monkeypatch):
         with patch("httpx.AsyncClient") as cm:
             client = cm.return_value.__aenter__.return_value
             client.get = AsyncMock(
-                side_effect=[_mock_response(200, {"value": []}), _bc_draft("bc-9", total)]
+                side_effect=[
+                    _mock_response(200, {"value": []}),
+                    _bc_draft("bc-9", total),
+                    _bc_draft("bc-9", total, "Open"),
+                ]
             )
             client.delete = AsyncMock(return_value=_mock_response(204, None))
             client.post = AsyncMock(
@@ -412,7 +462,11 @@ def test_d365_posts_exact_decimal_unit_costs(monkeypatch):
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
         client.get = AsyncMock(
-            side_effect=[_mock_response(200, {"value": []}), _bc_draft("bc-1", LOSSY_AMOUNT)]
+            side_effect=[
+                _mock_response(200, {"value": []}),
+                _bc_draft("bc-1", LOSSY_AMOUNT),
+                _bc_draft("bc-1", LOSSY_AMOUNT, "Open"),
+            ]
         )
         client.post = AsyncMock(
             side_effect=[
@@ -456,6 +510,7 @@ def test_d365_sends_the_line_gross_at_the_currency_scale(monkeypatch):
             side_effect=[
                 _mock_response(200, {"value": []}),
                 _bc_draft("bc-3", Decimal("4375.00")),
+                _bc_draft("bc-3", Decimal("4375.00"), "Open"),
             ]
         )
         client.post = AsyncMock(
@@ -481,7 +536,11 @@ def test_d365_header_only_invoice_posts_the_exact_amount(monkeypatch):
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
         client.get = AsyncMock(
-            side_effect=[_mock_response(200, {"value": []}), _bc_draft("bc-2", LOSSY_AMOUNT)]
+            side_effect=[
+                _mock_response(200, {"value": []}),
+                _bc_draft("bc-2", LOSSY_AMOUNT),
+                _bc_draft("bc-2", LOSSY_AMOUNT, "Open"),
+            ]
         )
         client.post = AsyncMock(
             side_effect=[

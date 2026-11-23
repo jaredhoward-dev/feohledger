@@ -49,6 +49,7 @@ from app.api.deps import (
     get_org_id,
     require_roles,
 )
+from app.api.refusals import statement_currency
 from app.models.bank_reconciliation import BankStatement, BankTransaction
 from app.models.invoice import Invoice
 from app.models.organization import Organization
@@ -77,6 +78,7 @@ from app.services.bank_reconciliation import (
     match_statement_transactions,
     match_variance,
     parse_csv_statement,
+    reconciliation_currency,
     settlement_amount_and_currency,
     settlement_amount_sql,
 )
@@ -166,7 +168,7 @@ def _comparable_variance(
 ) -> Decimal | None:
     """The signed gap, or ``None`` when the two sides aren't in the same
     currency. Subtracting €1,000 from $1,000 produces a number, not a fact."""
-    bank_ccy = (bank_currency or "").strip().upper()
+    bank_ccy = reconciliation_currency(bank_currency)
     if bank_ccy and ctx.currency and bank_ccy != ctx.currency:
         return None
     return match_variance(bank_amount, ctx.amount)
@@ -343,7 +345,9 @@ async def upload_statement(
     account_identifier: str = Form(...),
     period_start: date = Form(...),
     period_end: date = Form(...),
-    currency: str = Form("USD"),
+    # No default: a statement's currency is not knowable from the file, and
+    # `USD` labelled a GBP statement in dollars (decisions §377).
+    currency: str | None = Form(None),
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(*_WRITE_ROLES)),
     org_id: uuid.UUID = Depends(get_org_id),
@@ -360,6 +364,7 @@ async def upload_statement(
     ``uq_bank_statements_org_account_hash`` (migration 0080), the same shape
     Positive Pay uses for its per-(run, format) slot.
     """
+    statement_ccy = statement_currency(currency)
     raw = await _read_capped(file, MAX_CSV_IMPORT_SIZE)
     content_hash = hashlib.sha256(raw).hexdigest()
 
@@ -384,7 +389,7 @@ async def upload_statement(
                 account_identifier=account_identifier,
                 period_start=period_start,
                 period_end=period_end,
-                currency=currency,
+                currency=statement_ccy,
                 imported_by=user.id,
                 # Raw-file storage (the uploaded statement → S3) is deferred,
                 # same as vendor-statement-recon's CSV intake; keep file_key

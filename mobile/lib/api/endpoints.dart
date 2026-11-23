@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/models/action_verdict.dart';
 import 'package:feohledger_mobile/models/adaptive.dart';
 import 'package:feohledger_mobile/models/admin_user.dart';
 import 'package:feohledger_mobile/models/audit_entry.dart';
@@ -81,7 +82,10 @@ class AuthApi {
 class InvoiceApi {
   static final _api = ApiClient();
 
-  static Future<List<Invoice>> list({
+  /// One page of invoices with the server's `total` for the whole filter — a
+  /// screen pages through it (`PagedFetch`) rather than stopping at the first
+  /// [pageSize] rows.
+  static Future<PagedResult<Invoice>> list({
     String? status,
     String? search,
     String? vendor,
@@ -90,6 +94,8 @@ class InvoiceApi {
     double? amountMax,
     DateTime? dueDateFrom,
     DateTime? dueDateTo,
+    bool overdue = false,
+    bool includeReviewActions = false,
     int page = 1,
     int pageSize = 20,
   }) async {
@@ -115,11 +121,17 @@ class InvoiceApi {
       params['due_date_from'] = _isoDate(dueDateFrom);
     }
     if (dueDateTo != null) params['due_date_to'] = _isoDate(dueDateTo);
+    // Owed and past due, by the predicate the dashboard's `overdue_count`
+    // counts (`services/open_ap_due`): the list the Overdue card opens.
+    if (overdue) params['overdue'] = 'true';
+    // Each row's `approve` / `reject` verdict, in this one response
+    // ([Invoice.reviewActions]) — the approvals queue's, instead of one
+    // `review-actions` read per row. Opt-in: the server runs the approval
+    // gates for the page only when asked.
+    if (includeReviewActions) params['include'] = 'review_actions';
 
-    final items = await _api.getList('/invoices', params);
-    return items
-        .map((e) => Invoice.fromJson(e as Map<String, dynamic>))
-        .toList();
+    final result = await _api.getPage('/invoices', params);
+    return result.map((e) => Invoice.fromJson(e as Map<String, dynamic>));
   }
 
   /// `YYYY-MM-DD` — the backend parses these into `date` (FastAPI `date`
@@ -147,6 +159,28 @@ class InvoiceApi {
 
   static Future<Invoice> reject(String id, String reason) async {
     final data = await _api.post('/invoices/$id/reject', {
+      'reason': reason,
+    });
+    return Invoice.fromJson(data);
+  }
+
+  /// `GET /api/invoices/{id}/review-actions`: the server's verdict on each
+  /// workflow action for the signed-in user, keyed by action — `approve` /
+  /// `reject` (`services/review.review_refusals`) and `recall_approval`
+  /// (`services/review.recall_refusal`, backend decisions §374), among others.
+  /// Read one with [ActionVerdict.fromVerdicts]; the app offers Approve,
+  /// Reject and Recall from these and never restates the gates.
+  static Future<Map<String, dynamic>> reviewActions(String id) async {
+    return await _api.get('/invoices/$id/review-actions');
+  }
+
+  /// `POST /api/invoices/{id}/recall-approval`: take back the approval of an
+  /// approved invoice, or of one whose ERP push failed after approval, and
+  /// return it to review so its frozen figures can be corrected and approved
+  /// again through the whole chain. [reason] is required; it lands on the
+  /// `invoice.approval_recalled` audit row.
+  static Future<Invoice> recallApproval(String id, String reason) async {
+    final data = await _api.post('/invoices/$id/recall-approval', {
       'reason': reason,
     });
     return Invoice.fromJson(data);
@@ -228,12 +262,56 @@ class InvoiceApi {
   }
 }
 
+/// One row a bulk invoice mutation did not change, and why.
+///
+/// `POST /bulk/status` answers each skip as `{id, reason, code?, params?}`
+/// (`schemas/invoice.BulkStatusSkip`): a coded refusal keeps its [code] and
+/// [params] so the list states it in the reader's language through
+/// `coded_refusal_messages.dart`, and [reason] is the server's English for a
+/// code this build does not know. `POST /bulk/delete` answers bare ids, which
+/// parse with neither.
+class BulkSkip {
+  final String id;
+  final String? code;
+  final Map<String, dynamic> params;
+  final String? reason;
+
+  const BulkSkip({
+    required this.id,
+    this.code,
+    this.params = const {},
+    this.reason,
+  });
+
+  factory BulkSkip.fromJson(Object? json) {
+    if (json is Map) {
+      final code = json['code'];
+      final params = json['params'];
+      final reason = json['reason'];
+      return BulkSkip(
+        id: json['id']?.toString() ?? '',
+        code: code is String ? code : null,
+        params: params is Map ? Map<String, dynamic>.from(params) : const {},
+        reason: reason is String && reason.isNotEmpty ? reason : null,
+      );
+    }
+    return BulkSkip(id: json.toString());
+  }
+
+  /// The skip as a coded refusal `detail` (`{code, message, params}`), the
+  /// shape `localizeCodedRefusal` reads; `null` for an uncoded skip.
+  Map<String, dynamic>? get refusal => code == null
+      ? null
+      : {'code': code, 'message': reason, 'params': params};
+}
+
 /// Result of a bulk invoice mutation (`{deleted|updated, skipped}`). [count] is
-/// the number actually mutated; [skipped] lists ids the backend refused
-/// (immutable status). Reused for both bulk-delete and bulk-status.
+/// the number actually mutated; [skipped] lists the rows the backend refused,
+/// each with its reason where the endpoint gives one. Reused for both
+/// bulk-delete and bulk-status.
 class BulkResult {
   final int count;
-  final List<String> skipped;
+  final List<BulkSkip> skipped;
 
   const BulkResult({required this.count, required this.skipped});
 
@@ -245,7 +323,7 @@ class BulkResult {
     return BulkResult(
       count: (json[countKey] as num?)?.toInt() ?? 0,
       skipped: skipped is List
-          ? skipped.map((e) => e.toString()).toList()
+          ? skipped.map(BulkSkip.fromJson).toList()
           : const [],
     );
   }
@@ -318,6 +396,23 @@ class ExceptionApi {
     return items
         .map((e) => ApException.fromJson(e as Map<String, dynamic>))
         .toList();
+  }
+
+  /// Record the payment an ERP reported, from the `paid_not_recorded`
+  /// exception that holds it — `POST /api/exceptions/{id}/record-erp-payment`
+  /// (`payment.record_external`). The payment queue's record dialog uses it
+  /// only where the ERP's split stands, so it names no rail: the split is the
+  /// record. Idempotent on reference + date (a replay answers 200); refusals
+  /// arrive coded (`external_payment_*`).
+  static Future<Map<String, dynamic>> recordErpPayment(
+    String id, {
+    required String reference,
+    required String paidOn,
+  }) async {
+    return _api.post('/exceptions/$id/record-erp-payment', {
+      'reference': reference,
+      'paid_on': paidOn,
+    });
   }
 
   /// `GET /api/exceptions/{id}` — single-exception detail (+ its invoice), for
@@ -594,6 +689,64 @@ class PaymentApi {
   static Future<Map<String, dynamic>> cancelRun(String id) async {
     return _api.post('/payments/runs/$id/cancel');
   }
+
+  // ── The no-rail pilot (issue #517, backend decisions §251) ──────────────
+  // A tenant's payments are either SENT by FeohLedger (`processor`) or only
+  // RECORDED here after the customer paid from its own bank or ERP
+  // (`record_only`). The same endpoints the web payments page calls; none of
+  // them moves money. Recording is `payment.record_external`; the mode read
+  // admits any of execute / void / record_external.
+
+  /// `GET /api/payments/execution-mode` → `{mode, reason}`.
+  static Future<Map<String, dynamic>> executionMode() async {
+    return _api.get('/payments/execution-mode');
+  }
+
+  /// Record one invoice as paid outside FeohLedger —
+  /// `POST /api/payments/record-outside`. Offered in BOTH modes (a processor
+  /// tenant can still pay one invoice by cheque). No `amount`: the server binds
+  /// it to what the invoice owes on [paidOn], net of credits and of an accepted
+  /// discount only while its pay-by date holds, so sending the queue's figure
+  /// would 422 a legitimate payment dated after the discount lapsed.
+  /// Idempotent on reference + date. Refusals arrive coded
+  /// (`external_payment_*`).
+  static Future<Map<String, dynamic>> recordOutside({
+    required String invoiceId,
+    required String method,
+    required String reference,
+    required String paidOn,
+  }) async {
+    return _api.post('/payments/record-outside', {
+      'invoice_id': invoiceId,
+      'method': method,
+      'reference': reference,
+      'paid_on': paidOn,
+    });
+  }
+
+  /// A run's detail, carrying the caller's `actions` verdicts —
+  /// `GET /api/payments/runs/{id}`.
+  static Future<PaymentRunRecordDetail> runDetail(String id) async {
+    final data = await _api.get('/payments/runs/$id');
+    return PaymentRunRecordDetail.fromJson(data);
+  }
+
+  /// Record a whole `draft` or `exported` run as paid by the customer's own
+  /// bank — `POST /api/payments/runs/{id}/record-outside` →
+  /// `{id, status, payment_count, total_amount}`. One refusal refuses the
+  /// whole run (nothing is recorded) and names the invoice in
+  /// `params.invoice_number`; maker-checker and CFO sign-off apply exactly as
+  /// they do to Execute.
+  static Future<Map<String, dynamic>> recordRunOutside(
+    String id, {
+    required String reference,
+    required String paidOn,
+  }) async {
+    return _api.post('/payments/runs/$id/record-outside', {
+      'reference': reference,
+      'paid_on': paidOn,
+    });
+  }
 }
 
 /// Admin user-management surface (`/api/admin/*`, admin-only on the backend).
@@ -647,10 +800,10 @@ class AdminApi {
   static Future<AdminUser> setActive(String id, bool active) =>
       updateUser(id, {'is_active': active});
 
-  /// `POST /api/admin/users` — create a user. The backend generates a
-  /// temporary password (the user is forced to change it on first login) and
-  /// returns it EXACTLY once in the response, so the result carries it for the
-  /// admin to hand over. 409 if the email is already in use.
+  /// `POST /api/admin/users` — create a user. The backend gives the user no
+  /// password and emails them a single-use set-password link (decisions §283);
+  /// the response carries only when that link expires, never a credential.
+  /// 409 if the email is already in use.
   static Future<CreateUserResult> createUser({
     required String email,
     required String fullName,
@@ -820,8 +973,8 @@ class InspectionApi {
 
 /// Goods receipts — `GET /api/goods-receipts` (auth-gated, role-open).
 ///
-/// Mobile reads them only to populate the record-inspection picker: an
-/// inspection has to name the delivery it covers.
+/// Mobile reads them to populate the record-inspection picker (an inspection
+/// has to name the delivery it covers), and records new ones.
 class GoodsReceiptApi {
   static final _api = ApiClient();
 
@@ -843,6 +996,44 @@ class GoodsReceiptApi {
         .map((e) => GoodsReceipt.fromJson(e as Map<String, dynamic>))
         .toList();
     return (items: items, total: (data['total'] as num?)?.toInt() ?? items.length);
+  }
+
+  /// `POST /api/goods-receipts` — record a delivery (admin / ap_manager /
+  /// ap_clerk, the backend `RECEIPT_ENTRY_ROLES`). [idempotencyKey] is minted
+  /// once per opened form, so a double tap or a retry after a lost response
+  /// replays the same receipt (the server answers 200 with it) instead of
+  /// booking the delivery twice. Returns the receipt's `gr_number`.
+  static Future<String> create(
+    GoodsReceiptDraft draft, {
+    required String idempotencyKey,
+  }) async {
+    final data = await _api.post('/goods-receipts', draft.toJson(), {
+      'Idempotency-Key': idempotencyKey,
+    });
+    return data['gr_number'] as String? ?? '';
+  }
+
+  /// Purchase orders whose number matches [search], for the record form's
+  /// picker — the same read and page size as the web form.
+  static Future<List<ReceivablePO>> searchPurchaseOrders(
+    String search, {
+    int pageSize = 50,
+  }) async {
+    final params = <String, String>{
+      'page': '1',
+      'page_size': pageSize.toString(),
+    };
+    if (search.trim().isNotEmpty) params['search'] = search.trim();
+    final items = await _api.getList('/purchase-orders', params);
+    return items
+        .map((e) => ReceivablePO.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// `GET /api/purchase-orders/{id}` — the PO's lines with what has arrived.
+  static Future<ReceivablePODetail> getPurchaseOrder(String id) async {
+    final data = await _api.get('/purchase-orders/$id');
+    return ReceivablePODetail.fromJson(data);
   }
 }
 

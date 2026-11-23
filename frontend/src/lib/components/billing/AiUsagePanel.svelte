@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { formatPercent } from '#lib/utils/percent.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	// This month's AI-read invoices against the plan allowance (decisions §253):
 	// the meter, the overage so far and its month-end projection, the spending
 	// cap (editable by an admin on a plan that bills overage), and the pause
@@ -9,7 +11,6 @@
 	import { setBillingSpendCap } from '#lib/api/billing.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { formatMoney } from '#lib/utils/money.ts';
-	import { getActiveFormatLocale } from '#lib/i18n/formatLocale.ts';
 	import {
 		aiUsagePercent,
 		aiUsageTone,
@@ -28,11 +29,6 @@
 	};
 
 	let { usage, pending = false, canEditCap = false, onUsageChange }: Props = $props();
-
-	/** A count in the reader's locale (1,234 / 1.234 / 1 234). */
-	function formatNumber(n: number): string {
-		return new Intl.NumberFormat(getActiveFormatLocale()).format(n);
-	}
 
 	const percent = $derived(aiUsagePercent(usage));
 	const tone = $derived(aiUsageTone(usage));
@@ -71,10 +67,10 @@
 </script>
 
 <section class="ai-usage" aria-labelledby="ai-usage-heading" data-testid="billing-ai-usage">
-	<h3 id="ai-usage-heading">
-		{m('billing.ai.heading')}
-		{#if usage}<span class="period">({usage.period})</span>{/if}
-	</h3>
+	<!-- No period suffix: the page's "Usage this period · November 2026"
+	     heading already names the month, and the raw `YYYY-MM` key here
+	     repeated it in a form no reader uses. -->
+	<h3 id="ai-usage-heading">{m('billing.ai.heading')}</h3>
 
 	{#if usage?.paused}
 		<div class="paused" role="status" data-testid="billing-ai-paused">
@@ -91,11 +87,11 @@
 		<div class="meter-head">
 			<span data-testid="billing-ai-used">
 				{m('billing.ai.usedOf', {
-					used: formatNumber(usage.used),
-					included: formatNumber(usage.included)
+					used: formatCount(usage.used),
+					included: formatCount(usage.included)
 				})}
 			</span>
-			<span class="pct">{percent}%</span>
+			<span class="pct">{formatPercent(percent)}</span>
 		</div>
 		<div
 			class="track tone-{tone}"
@@ -105,14 +101,14 @@
 			aria-valuemax={usage.included}
 			aria-valuenow={Math.min(usage.used, usage.included)}
 			aria-valuetext={m('billing.ai.usedOf', {
-				used: formatNumber(usage.used),
-				included: formatNumber(usage.included)
+				used: formatCount(usage.used),
+				included: formatCount(usage.included)
 			})}
 		>
 			<div class="fill" style="width:{percent ?? 0}%"></div>
 		</div>
 	{:else if usage}
-		<p class="note">{m('billing.ai.unmetered', { used: formatNumber(usage.used) })}</p>
+		<p class="note">{m('billing.ai.unmetered', { used: formatCount(usage.used) })}</p>
 	{/if}
 
 	{#if usage && usage.included !== null}
@@ -218,12 +214,6 @@
 
 	.ai-usage h3 {
 		margin: 0 0 0.75rem;
-	}
-
-	.period {
-		font-weight: 400;
-		color: var(--text-muted);
-		font-size: 0.9rem;
 	}
 
 	.paused {

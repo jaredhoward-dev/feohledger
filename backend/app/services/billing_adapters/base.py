@@ -13,6 +13,7 @@ talks to the provider and returns normalized DTOs; the caller persists.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 
 
@@ -23,6 +24,15 @@ class ProviderSubscription:
     external_subscription_id: str
     status: str  # trialing | active | past_due | canceled (provider-mapped)
     plan_code: str
+    #: The provider's current billing window, when it reports one. Once a live
+    #: provider bills the subscription its window is authoritative
+    #: (`services/billing/period.py`), so the caller persists these.
+    current_period_start: datetime | None = None
+    current_period_end: datetime | None = None
+    #: The provider will end the subscription at ``current_period_end``
+    #: (Stripe's ``cancel_at_period_end``) — a move to Free scheduled for the
+    #: end of the paid period (decisions §483).
+    cancel_at_period_end: bool = False
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,67 @@ class CreateSubscriptionRequest:
     # Stable idempotency key so a retried create never double-subscribes the org
     # at the provider (mirrors the payment-adapter idempotency discipline).
     idempotency_key: str = ""
+    #: When set, the first full billing period starts here (the 1st of next
+    #: month, UTC) and the provider prorates the stretch before it. Decisions
+    #: §255: anchoring on the 1st keeps each overage event on the invoice of the
+    #: calendar month it was counted in.
+    billing_cycle_anchor: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PlanChangePreviewRequest:
+    """What a plan change would do at the provider, asked before it is made.
+
+    The service builds one request for the preview the customer reads and an
+    identical one when they confirm, so the two figures come from the same
+    arithmetic (decisions §482). Money is exact ``Decimal``, never float.
+    """
+
+    new_plan_code: str
+    #: Whether the target plan costs money (`provider_sync.plan_is_paid`). A
+    #: move to a free plan cancels the provider subscription; nothing recurs.
+    to_paid: bool
+    old_monthly_price: Decimal
+    new_monthly_price: Decimal
+    currency: str
+    #: The instant the change is priced at. For an existing provider
+    #: subscription it is passed to the provider as its ``proration_date``,
+    #: both in the preview and in the real change, so the two prorate alike.
+    proration_date: datetime
+    #: The billing window the change prorates over (the mock prices with it;
+    #: the live provider knows its own).
+    period_start: datetime
+    period_end: datetime
+    customer_id: str | None = None
+    #: The org's live provider subscription, or None when the change would
+    #: create one.
+    external_subscription_id: str | None = None
+    price_id: str | None = None
+    overage_price_id: str | None = None
+    #: Where a NEW subscription's first full period starts (the 1st of next
+    #: month, UTC) — the same anchor `create_subscription` is sent.
+    billing_cycle_anchor: datetime | None = None
+    #: Ask for what recurs after the change too. The confirm-time check only
+    #: needs the amount due now, so it skips that second provider call.
+    include_recurring: bool = True
+
+
+@dataclass(frozen=True)
+class ProviderPlanChangePreview:
+    """The provider's own figures for a plan change, before it happens.
+
+    ``amount_due`` is what is charged when the change is made (never negative);
+    ``total`` is the same invoice's signed total — negative when the change
+    credits the customer's balance instead (a downgrade). ``next_amount`` /
+    ``next_date`` are what recurs afterwards and from when (None when nothing
+    recurs: a move to a free plan).
+    """
+
+    amount_due: Decimal
+    total: Decimal
+    currency: str
+    next_amount: Decimal | None = None
+    next_date: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +206,52 @@ class BillingWebhookEvent:
     external_subscription_id: str | None
     # Mapped lifecycle status when the event implies one, else None.
     status: str | None = None
+    #: The subscription's billing window as the provider reports it on a
+    #: ``customer.subscription.*`` event (None on every other event).
+    current_period_start: datetime | None = None
+    current_period_end: datetime | None = None
+
+
+class BillingNotConfigured(RuntimeError):
+    """Raised when a live billing provider is selected without its credential.
+
+    Every provider's fail-closed signal, so it lives on the interface rather
+    than in one provider's module: a caller (``api/billing``, the provisioning
+    and plan-change services) catches it without importing a provider.
+    """
+
+
+class BillingProviderError(RuntimeError):
+    """The provider answered a configured request with an error (PII-free text:
+    the operation and the HTTP status, never the response body).
+
+    ``diagnostic`` carries the provider's fixed machine identifiers for the
+    failure (Stripe: error type / code / param and the request id), each
+    validated as a plain identifier by the adapter. It is the only part the
+    billing routes log — the message itself never reaches a log line, so a
+    future raise site cannot leak through it.
+    """
+
+    def __init__(self, message: str = "", *, diagnostic: str = "") -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+class BillingPaymentDeclined(BillingProviderError):
+    """The provider refused to collect the charge a subscription change needed
+    (Stripe answers HTTP 402 under ``payment_behavior=error_if_incomplete``),
+    and so made NO change. The caller surfaces "update your card", not an
+    outage."""
+
+
+class SetupIntentRejected(RuntimeError):
+    """A SetupIntent cannot be adopted as the org's card: unknown, another
+    customer's (``reason="not_found"``), or not yet succeeded
+    (``reason="incomplete"``)."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class BillingAdapter:
@@ -165,6 +282,79 @@ class BillingAdapter:
         raise NotImplementedError
 
     async def get_subscription(self, external_subscription_id: str) -> ProviderSubscription:
+        raise NotImplementedError
+
+    async def find_live_subscription(self, customer_id: str) -> ProviderSubscription | None:
+        """The customer's live (not canceled) provider subscription, if one
+        exists. ``change_plan`` adopts it instead of creating a second one when
+        a previous attempt reached the provider but never reached our row."""
+        raise NotImplementedError
+
+    async def change_subscription_plan(
+        self,
+        external_subscription_id: str,
+        *,
+        price_id: str,
+        overage_price_id: str | None,
+        plan_code: str,
+        idempotency_key: str,
+        proration_date: datetime | None = None,
+    ) -> ProviderSubscription:
+        """Swap the subscription's base price (and metered overage price) for a
+        new plan's, prorated and invoiced at once — prorated as of
+        ``proration_date`` when given (the instant the customer's preview was
+        priced at, so the charge equals what they confirmed). A move onto a paid
+        plan always means "keep renewing", so the same request clears any
+        scheduled end-of-period cancel (decisions §483). Raises
+        :class:`BillingPaymentDeclined` when the charge fails — the change is
+        then NOT applied at the provider."""
+        raise NotImplementedError
+
+    async def preview_plan_change(
+        self, request: PlanChangePreviewRequest
+    ) -> ProviderPlanChangePreview | None:
+        """The provider's figures for a plan change, without making it.
+
+        Nothing is charged, created or changed at the provider. Safe default:
+        ``None`` — an adapter that cannot price a change ahead of time cannot
+        have one confirmed, and the plan-change service refuses it
+        (``billing_not_configured``) rather than charge an amount nobody saw.
+        """
+        return None
+
+    async def cancel_subscription(self, external_subscription_id: str) -> ProviderSubscription:
+        """Cancel immediately, crediting unused time and invoicing un-invoiced
+        metered usage now (decisions §480). Idempotent: an already-canceled
+        subscription is returned as canceled."""
+        raise NotImplementedError
+
+    async def cancel_subscription_at_period_end(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Schedule the subscription to end when its current period ends
+        (decisions §483): nothing is prorated, credited or refunded now, the
+        customer keeps what they paid for until then, and the period's metered
+        usage is billed on the final invoice when it ends. Idempotent."""
+        raise NotImplementedError
+
+    async def resume_subscription(
+        self, external_subscription_id: str, *, idempotency_key: str
+    ) -> ProviderSubscription:
+        """Clear a scheduled end-of-period cancel: the subscription renews as
+        before. Nothing is charged now. Idempotent."""
+        raise NotImplementedError
+
+    async def ensure_default_payment_method(self, customer_id: str | None) -> str | None:
+        """The payment method the customer's subscription invoices charge, or
+        ``None`` when the customer has no card at all. A customer with saved
+        cards but no default gets its newest card promoted, so a card saved
+        before the default was recorded still counts."""
+        raise NotImplementedError
+
+    async def adopt_setup_intent(self, customer_id: str | None, setup_intent_id: str) -> str:
+        """Make the card a succeeded SetupIntent saved the customer's default
+        and return its payment-method id. Raises :class:`SetupIntentRejected`
+        for an unknown / foreign / unfinished intent."""
         raise NotImplementedError
 
     async def list_invoices(

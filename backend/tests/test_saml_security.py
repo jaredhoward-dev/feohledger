@@ -420,6 +420,35 @@ async def test_handoff_single_use(fake_redis):
         await consume_saml_handoff(code)
 
 
+async def test_a_spent_handoff_code_is_a_coded_refusal(fake_redis):
+    """The bridge's exchange answers a spent code with a coded refusal the
+    sign-in page localizes, never the SSO service's own exception text."""
+    code = await create_saml_handoff("jwt-token", False, "acme")
+    await consume_saml_handoff(code)
+    with pytest.raises(HTTPException) as exc:
+        await auth_saml.saml_exchange(auth_saml.SAMLExchangeRequest(code=code))
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "sso_link_expired"
+    assert exc.value.detail["params"] == {}
+
+
+async def test_an_unknown_relay_state_at_the_acs_is_a_coded_refusal(fake_redis):
+    """The ACS refuses an unknown RelayState with the coded session-expired
+    refusal — one code whatever the SSO service objected to."""
+
+    class _Request:
+        client = SimpleNamespace(host="203.0.113.7")
+        headers: dict[str, str] = {}
+
+        async def form(self):
+            return {"SAMLResponse": "PHNhbWw+", "RelayState": "never-minted"}
+
+    with pytest.raises(HTTPException) as exc:
+        await auth_saml.saml_acs(_Request(), db=None)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "sso_session_expired"
+
+
 async def test_replay_dedup_per_tenant(fake_redis):
     from app.services.webhook_security import is_event_already_processed
 
@@ -503,21 +532,30 @@ async def test_saml_login_broken_config_is_400_not_500(monkeypatch):
 # No database: sign-in reads the org's plan (decisions §258), so stand in for a
 # plan that grants SSO — the broken block must reach the resolver to be tested.
 @pytest.mark.usefixtures("all_plan_features")
-async def test_saml_acs_broken_config_is_400_not_500(monkeypatch):
+async def test_saml_acs_broken_config_is_stated_on_the_bridge_not_500(monkeypatch):
     async def _consume_relay_state(state):
         return {"tenant": "acme", "request_id": REQUEST_ID}
 
     async def _fetch_org(slug, db):
         return _broken_saml_org()
 
+    parked: list[str] = []
+
+    async def _park(refusal, tenant_slug):
+        parked.append(refusal)
+        return "refusal-code"
+
     monkeypatch.setattr(auth_saml, "consume_saml_relay_state", _consume_relay_state)
     monkeypatch.setattr(auth_saml, "_fetch_org_by_slug", _fetch_org)
+    monkeypatch.setattr(auth_saml, "create_saml_refusal_handoff", _park)
 
-    with pytest.raises(HTTPException) as exc:
-        await auth_saml.saml_acs(_FakeSAMLPostRequest(), db=None)
-    assert exc.value.status_code == 400
-    assert exc.value.detail == "SAML SSO is not configured for this tenant."
-    assert "idp_x509_cert" not in exc.value.detail
+    # Answered on the SPA bridge (decisions §359), never a 500 and never the
+    # offending keys: the parked record is the code alone.
+    resp = await auth_saml.saml_acs(_FakeSAMLPostRequest(), db=None)
+    assert resp.status_code == 303
+    assert resp.headers["location"].endswith("/login/saml-callback?code=refusal-code")
+    assert "idp_x509_cert" not in resp.headers["location"]
+    assert parked == ["saml_not_configured"]
 
 
 # No database: sign-in reads the org's plan (decisions §258), so stand in for a

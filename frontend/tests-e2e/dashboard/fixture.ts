@@ -4,7 +4,11 @@
 // load under Playwright, which knows nothing of those. A `import type` is
 // erased before the runtime ever sees it, so this costs nothing at test time. Keep app *values* out of the e2e tree; app *types* are what make
 // these fixtures honest.
-import type { DashboardData, DashboardDiscountCapture } from '#lib/types/analytics.ts';
+import type {
+	DashboardData,
+	DashboardDiscountCapture,
+	OnboardingProgress
+} from '#lib/types/analytics.ts';
 
 /**
  * The one `GET /api/dashboard` stub the dashboard specs build on.
@@ -125,6 +129,10 @@ function base(patch: DashboardPatch): DashboardData {
 	const reportingCurrency = patch.reportingCurrency ?? REPORTING_CURRENCY;
 	return {
 		total_invoices: 6,
+		// An established workspace: the checklist is retired, and the server
+		// sends `onboarding` to nobody (`docs/decisions.md` §315).
+		organization_has_invoices: true,
+		onboarding: null,
 		total_amount: 6000,
 		reporting: {
 			reporting_currency: reportingCurrency,
@@ -160,6 +168,14 @@ function base(patch: DashboardPatch): DashboardData {
 		},
 		monthly_trend: [],
 		upcoming_payments: patch.upcomingPayments ?? [],
+		// The four past-due aging bands above, as `services/open_ap_due` counts
+		// them: four invoices, FACE sums per currency (never converted, so the
+		// code is the invoices' own, not the reporting currency). Nothing falls
+		// due in the next seven days.
+		overdue_count: 4,
+		overdue_total: [{ currency: REPORTING_CURRENCY, amount: 2000, count: 4 }],
+		due_soon_count: 0,
+		due_soon_total: [],
 		discount_capture: {
 			eligible_count: 0,
 			captured_count: 0,
@@ -190,13 +206,22 @@ function base(patch: DashboardPatch): DashboardData {
  * to stop. The state it represents is the only one the dashboard's onboarding
  * EmptyState answers (`docs/decisions.md` §154), so it ships whole.
  */
-export function emptyTenantDashboardResponse() {
+export function emptyTenantDashboardResponse(
+	/**
+	 * The setup facts the server sends ONLY to an admin on an empty workspace.
+	 * Omitted, this is what every other role reads (`null`); a spec signed in
+	 * as an admin that wants the checklist passes them.
+	 */
+	onboarding: OnboardingProgress | null = null
+) {
 	const payload = base({});
 	const zeroBands = { current: 0, days_30: 0, days_60: 0, days_90: 0, days_90_plus: 0 };
 	return {
 		...payload,
 		...NON_RENDERED_FIELDS,
 		total_invoices: 0,
+		organization_has_invoices: false,
+		onboarding,
 		total_amount: 0,
 		reporting: { ...payload.reporting, total_amount: 0, total_count: 0 },
 		total_paid: 0,
@@ -205,7 +230,25 @@ export function emptyTenantDashboardResponse() {
 		total_pending_reporting: 0,
 		pipeline: {},
 		aging: zeroBands,
-		aging_reporting: { ...zeroBands, unconverted_count: 0 }
+		aging_reporting: { ...zeroBands, unconverted_count: 0 },
+		overdue_count: 0,
+		overdue_total: [],
+		due_soon_count: 0,
+		due_soon_total: []
+	};
+}
+
+/** Setup progress with nothing done but the facts named in `done`. */
+export function onboardingProgress(done: Partial<OnboardingProgress> = {}): OnboardingProgress {
+	return {
+		company: false,
+		users: false,
+		security: false,
+		erp: false,
+		vendors: false,
+		workflow: false,
+		email_intake: false,
+		...done
 	};
 }
 

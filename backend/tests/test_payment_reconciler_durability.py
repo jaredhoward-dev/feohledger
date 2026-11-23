@@ -32,6 +32,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# Mock-DB tests: the reconciler reads each tenant's processor config through provider_credentials
+# (tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("provider_store_from_settings")
+
 
 def _payment(*, status="submitted", submitted_at=None, provider_payment_id="px_123"):
     return SimpleNamespace(
@@ -147,7 +151,7 @@ async def test_reconciler_aged_out_opens_a_payment_blocking_exception():
     """The aged-out row stops holding the invoice's live-payment slot, so the
     exception is the only thing standing between that invoice and a second
     payment for money that may already have moved."""
-    from app.api.payments import PAYMENT_BLOCKING_EXCEPTION_TYPES
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
     from app.services.payment_reconciler import AGED_OUT_EXCEPTION_TYPE, _reconcile_tenant
 
     assert AGED_OUT_EXCEPTION_TYPE in PAYMENT_BLOCKING_EXCEPTION_TYPES

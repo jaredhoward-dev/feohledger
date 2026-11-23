@@ -19,7 +19,7 @@ Deep-dive docs live in `backend/docs/`:
 | AI Cash-Flow Copilot (Phases 1–2 — read-only cash tools + proposed plans + `/api/cash-flow` façade) | `../docs/cash-flow-copilot.md` (repo-root `docs/`) |
 | ERP adapters (Merge.dev + direct) | `docs/erp-integration.md` |
 | Commerce / inventory platform adapters (receipt → shelf stock push) | `docs/commerce-integration.md` |
-| QuickBooks Online adapter (phases 3–5 open: webhooks, BillPayment) | `docs/quickbooks-online-adapter.md` |
+| QuickBooks Online adapter (status sync-back, BillPayment write-back, connection-expiry notice — decisions §295) | `docs/quickbooks-online-adapter.md` |
 | Workflow state machine | `docs/workflow-design.md` |
 | Workflow snapshot semantics | `docs/workflow-snapshots.md` |
 | Payment runs + ERP sync | `docs/payments.md` |
@@ -202,7 +202,7 @@ Two things to know before trusting it:
   cannot start a workflow run unattended (GitHub blocks that path to prevent
   loops — which is also what stops the workflow re-triggering itself). What it
   does instead is not "no run": the `synchronize` event still creates the CI /
-  Security / gitleaks runs against the new head and parks them in
+  Security / secret-scan runs against the new head and parks them in
   `action_required`, so the PR keeps reading red until a maintainer approves
   them. Approve the parked runs to get a verified green — the PR checks tab's
   "Approve and run", or `gh api -X POST
@@ -376,12 +376,36 @@ no normal pass/fail summary, matching the intended "diagnose, then die" shape.
 Most of the suite is mock-based. Tests that request the `realdb` fixture
 (`tests/conftest.py`) run against a live Postgres and a **pair of real tenant
 databases** — the only way to prove cross-tenant isolation, the SQL filters, and
-commit durability. Before each such test the harness truncates the tenant
+commit durability. Before each such test the harness empties the tenant
 business tables, restores the Default entity, resets the shared control-plane
 `Organization` row, and reaps every other backend on those databases.
 
+**The tenant reset DELETEs only the tables that hold a row; it does not
+TRUNCATE.** `_reset_tenant_tables` (`tests/conftest.py`) asks every tenant table
+`EXISTS (SELECT 1 …)` in one round trip and runs a plain `DELETE` on each
+non-empty one, inside a transaction-local `session_replication_role = replica`
+(FK triggers and the append-only `audit_log_no_delete` trigger off, so delete
+order doesn't matter and `audit_log` can be cleared; TRUNCATE never fired them
+either). It used to be one `TRUNCATE <all ~70 tenant tables> RESTART IDENTITY
+CASCADE`. That gives every table, index and TOAST table a new relfilenode, and
+Postgres fsyncs each freshly built empty index on the spot
+(`DataFileImmediateSync`), so the cost scaled with the schema, not with what the
+test wrote. The "before" profile (32 realdb tests, four files, dev laptop) showed the
+per-test reset dominating setup; the after-figures were not recorded before
+the round closed, so CI's shard times are the comparison. Rules that follow from it:
+
+- It needs the privilege to set `session_replication_role` (superuser, as the
+  Compose and CI `postgres` user is). Without it the reset falls back to the
+  old whole-schema TRUNCATE: slower, never wrong.
+- No tenant table may own a sequence: DELETE has no counterpart to RESTART
+  IDENTITY. If one is ever added, make the reset restart it;
+  `tests/test_realdb_reset.py` fails until then. The same file pins the
+  baseline (every tenant table empty but the one Default entity), that a write
+  to any table, `audit_log` included, is gone after a reset, and that every
+  physical table in a tenant DB is one the reset probes.
+
 **The tenant pair is exclusive to one pytest process.** Because the reset both
-TRUNCATEs and `pg_terminate_backend`s, two pytest runs sharing a pair delete each
+empties the tables and `pg_terminate_backend`s, two pytest runs sharing a pair delete each
 other's rows and kill each other's connections — which surfaces as
 `asyncpg.ConnectionDoesNotExistError` / `ConnectionResetError` in whatever
 unrelated file happened to be mid-query, i.e. as flakiness rather than as the
@@ -451,10 +475,12 @@ Consequences worth knowing:
   even though it's no longer shared with any other slot.
 
 The harness resets tenant tables plus `Organization.settings` / `parent_org_id`,
-and — **on teardown, not setup** — the control-plane billing rows: every
+the orgs' sealed provider credentials and the seeded users' second factors
+(TOTP fields and passkeys — a test that enrols one on the harness admin used to
+leave every later test facing an account that had a factor), and — **on teardown, not setup** — the control-plane billing rows: every
 `Subscription` its own orgs hold, and every `Plan` that is not one of
 `DEFAULT_PLAN_CATALOG`'s tiers (`_reset_control_billing`). Those two tables live
-in the slot's control-plane database, which the per-test TRUNCATE never reaches
+in the slot's control-plane database, which the per-test tenant reset never reaches
 and `_rebuild_pytest_schema` clears only once per session, so a throwaway plan
 stayed visible to every later test in the run — and `GET /api/billing/plans` is
 a catalogue listing, so that is observable rather than inert. Six billing files
@@ -498,6 +524,18 @@ local instance).
 
 `tests/test_realdb_harness.py` guards both properties.
 
+**A test without `realdb` cannot open a real database connection.** The autouse
+`_refuse_real_engine_in_mock_tests` (`tests/conftest.py`) makes every
+`Engine.raw_connection` raise `RealEngineInMockTestError` in such a test, and
+fails it at teardown if the code under test swallowed that. A mock test that
+reached `app.database`'s module-global engines used to pass alone and leave a
+pooled connection bound to its loop, which the next test in the process drew:
+`got Future … attached to a different loop`, reported in an unrelated file
+(`../docs/known-issues.md`). Trip it and the fix is to inject or patch what
+the test reaches (provider credentials: `provider_store_from_settings`; the
+control-plane-originated audit write: `no_auth_audit_write`). The
+`real_db_engine` marker exempts only a test that deliberately connects itself.
+
 ## Date-sensitive tests — run them under a skewed timezone
 
 The backend resolves "today" as `app/utils/dates.utc_today()`, never the
@@ -538,6 +576,7 @@ backend/
 │   ├── main.py              # FastAPI app, CORS, router includes, lifespan
 │   ├── config.py            # Pydantic Settings (FEOH_ prefix env vars)
 │   ├── database.py          # Control engine + per-tenant engine pool
+│   ├── db_engine.py         # THE engine / raw-connection factory (RDS IAM tokens; decisions §310)
 │   ├── redis.py             # Redis connection + token blocklist
 │   ├── tenant.py            # X-Tenant-Slug → tenant DB session
 │   ├── api/                 # FastAPI routers (one per domain) + deps.py
@@ -623,11 +662,11 @@ Step types: `extraction` → `approval` → `erp_export` → `done`
 
 **Snapshot pattern**: `WorkflowInstance.steps_config_snapshot` freezes the active definition at invoice creation. All runtime logic reads the snapshot, not the live definition.
 
-**Notification hook**: `transition_invoice()` is also the single chokepoint for invoice-event notifications — after the audit write it calls `notification_dispatch.notify_event()` keyed off the resulting status (`approved`/`rejected`/`paid`). The `invoice_assigned` event is fired separately from `review.assign_reviewer`. All best-effort (never breaks the transition). **The outbound legs — every email and the chat post — run AFTER the caller's transaction commits**, via `services/post_commit.enqueue_post_commit` and SQLAlchemy's `after_commit`; only the in-app `Notification` rows ride the caller's commit, because those are DB writes. Before this the fan-out was awaited inside the still-open transaction, so a hung chat webhook held `payment_erp_sync`'s / `review.approve_invoice`'s `FOR UPDATE` row lock on a live invoice for its full 10-second timeout, and N recipients multiplied the email leg linearly. A transaction that rolls back now sends nothing. See `docs/notifications.md` § The outbound legs run POST-COMMIT.
+**Notification hook**: `transition_invoice()` is also the single chokepoint for invoice-event notifications — after the audit write it calls `notification_dispatch.notify_event()` keyed off the resulting status (`approved`/`rejected`/`paid`). The `invoice_assigned` event is fired separately from `review.assign_reviewer`. All best-effort (never breaks the transition). **The outbound legs — every email and the chat post — run AFTER the caller's transaction commits**, via `services/post_commit.enqueue_post_commit` and SQLAlchemy's `after_commit`; only the in-app `Notification` rows ride the caller's commit, because those are DB writes. Before this the fan-out was awaited inside the still-open transaction, so a hung chat webhook held `payment_erp_sync`'s / `review.approve_invoice`'s `FOR UPDATE` row lock on a live invoice for its full 10-second timeout, and N recipients multiplied the email leg linearly. A transaction that rolls back now sends nothing. The outbound webhook emit from the same hook rides the same queue (the typed emitters take `db=`), so a rolled-back transition announces no event (decisions §427). See `docs/notifications.md` § The outbound legs run POST-COMMIT.
 
 ## Key background services
 
-Sixteen long-lived asyncio tasks start in `app/main.py`'s lifespan, each behind
+Twenty long-lived asyncio tasks start in `app/main.py`'s lifespan, each behind
 its own `FEOH_*_ENABLED` gate. **What each one does, plus the shared loop runner,
 health registry and locking rules: `backend/docs/background-sweeps.md`.**
 
@@ -704,14 +743,17 @@ Per-tenant secrets:
 | `/api/payments/webhook/...` | `payments.webhook_secret`, sealed in `provider_credentials` (verified inside the adapter's `parse_webhook`). The route rejects `provider == "mock"` outright before any tenant lookup — the `mock` adapter's `parse_webhook` does no signature verification and `mock` is the default provider for un-configured tenants, so serving it publicly would accept forged status transitions (mock never delivers real webhooks). Mirrors `cards.card_webhook`'s `lithic`/`nium` allowlist and the billing route's boot-time mock refusal. |
 | `/api/cards/webhook/{provider}` | `cards.webhook_signing_secret`, sealed in `provider_credentials` |
 | `/api/erp/webhook/{erp_type}` | `erp.webhook_signing_secret`, sealed in `provider_credentials` |
+| `/api/erp/webhook/quickbooks` | `FEOH_ERP_QBO_WEBHOOK_VERIFIER_TOKEN` (the Intuit app's ONE verifier token; base64 HMAC over the raw body in `intuit-signature`, `webhook_security.verify_hmac_sha256_base64`; empty = every delivery refused). The tenant is the one connected to the event's `intuitaccountid` (control-plane unique realm index, migration 0117). Dedupe by CloudEvents `id` before the answer; the work runs after it, and the CDC sweep is the backstop (decisions §295). |
 | `/api/email-intake/inbound/{provider}` | `FEOH_EMAIL_INTAKE_SIGNING_SECRET` (process-level HMAC key; verified in `email_intake.verify_signature`). Dedupe is `is_event_already_processed("email_intake", "<org_id>:<message_id>")` — per tenant, since one Message-ID can be addressed to several tenants (`email_intake.dedup_event_id`) — claimed right after tenant resolution and released via `release_event_claim` if invoice creation fails downstream (mirrors `api/cards.py`'s claim/release discipline) so a redelivery can retry. Recipient-token match uses `hmac.compare_digest`. |
-| `/api/peppol/inbound/{tenant_slug}` | `FEOH_PEPPOL_INBOUND_SIGNING_SECRET` (process-level HMAC key; verified by `peppol_receive.verify_inbound_signature`). Dedupe is the DB `uq_peppol_message_id` index, not Redis. |
+| `/api/peppol/inbound/{organization_id}` | `FEOH_PEPPOL_INBOUND_SIGNING_SECRET` (process-level HMAC key; verified by `peppol_receive.verify_inbound_signature`). Dedupe is the DB `uq_peppol_message_id` index, not Redis. |
 | `/api/catalogs/punchout/return/{tenant_slug}` | `FEOH_PUNCHOUT_RETURN_SIGNING_SECRET` (process-level HMAC key; verified in `catalogs._verify_return_signature`). Correlation is the BuyerCookie matched to a pending `PunchoutSession`. |
 | `/api/approvals/slack/interactivity` | `FEOH_SLACK_SIGNING_SECRET` (process-level HMAC key; verified in `slack_approvals._verify_slack_signature` over `v0:{X-Slack-Request-Timestamp}:{raw_body}`, with a `±FEOH_SLACK_REQUEST_MAX_AGE_SECONDS` replay window). Per-action dedupe is the single-use action-token `jti` in Redis (the email-approval mechanism), not `is_event_already_processed`. Returns an opaque 200 ack (Slack-friendly) on every path, not 204. See `docs/slack-approval.md`. |
 
 Every webhook handler returns **204 silently** on every rejection path (bad signature, unknown tenant, missing event id, unknown card / invoice / payment, disabled master switch, unparseable / malformed inbound document) — except the Slack interactivity webhook, which returns an opaque **200 ack** on every path (Slack requires 2xx to acknowledge a button click; the ack text is identical across success and rejection, so it doesn't enumerate), and the email-intake webhook, which is a hybrid: pre-signature rejections (unknown provider / bad signature / unparseable body — nothing sensitive resolved yet) still return 204, but every *decision* **after** the signature verifies (unknown/disabled intake token, duplicate delivery, no usable attachments, or genuine success) returns the SAME opaque 200 ack (`email_intake._ack()`) — because unlike the other handlers, a 204-vs-200-with-a-body split there would itself be the token-enumeration oracle (the platform-wide signing secret is shared across all tenants, so anyone who can sign a request can watch for the response to change once they guess a valid intake token). Distinct 4xx responses / differing response bodies would enumerate tenant slugs or card/intake tokens.
 
 **A *decision* is not the same as OUR OWN failure, and only the decision is acked.** A decision is a final answer about this message; a failure of ours (S3 unreachable, tenant DB down, Redis flapping, a concurrent transition racing the state-machine guard) is not an answer at all — the message is still unprocessed work. `email_intake` and `erp_webhook` both release their Redis dedup claim on those paths precisely so the provider's retry can reprocess, but both used to then ack success, so the retry never came: the release was preparing for something that could not happen, and the vendor's invoice / the ERP status update was dropped permanently behind a log line. Both now return a **bodyless 5xx** (`_retry_please()` in each module → `503`) on their own failures only, matching `api/billing_webhook.py`, which already re-raised to a 5xx for the same reason. This narrows the intake-token oracle to "while the platform is already broken" — a real but far smaller exposure than losing invoices on every blip — and the bodyless response still carries no detail, no stack trace, no tenant. Do NOT extend the 5xx to decision paths: an ERP retrying forever on an event we have correctly and permanently refused is the mirror-image failure.
+
+**A 5xx only ever follows a verified signature, and a per-tenant sealed key is opened last.** A webhook that verifies against a key sealed in the tenant's credentials (`erp_webhook`'s generic and Merge.dev routes) runs every check that needs no secret first — size, a signature header of the route's digest shape (`webhook_security.well_formed_*`), the tenant, its public configuration, a key stored (`provider_credentials.stored_secret_paths`, names only) — and opens the block only then (`erp_webhook._tenant_webhook_config`). A key that cannot be opened is the same silent 204 as a bad signature, never a 503: the delivery is unverified, and a 503 there answers a configured slug differently from every other (`../docs/decisions.md` §408).
 
 Tests: `backend/tests/test_webhook_security.py`, `tests/test_payment_webhook_security.py`, `tests/test_peppol_inbound.py`, `tests/test_slack_approvals.py`, `tests/test_email_intake.py`, `tests/test_email_intake_processing.py`, `tests/test_erp_webhook_retry_on_our_failure.py`.
 
@@ -720,6 +762,7 @@ Tests: `backend/tests/test_webhook_security.py`, `tests/test_payment_webhook_sec
 - **Passwords**: a single shared `pwd_context` in `app/utils/passwords.py` **implements** `bcrypt_sha256` (HMAC-SHA256 pre-hash → bcrypt) to side-step bcrypt's 72-byte truncation — directly against the `bcrypt` package, because passlib (last released 2020) cannot import against bcrypt 4.1+ and froze us on 4.0.1 (`../docs/decisions.md` §151). Every call site (auth, admin, portal, vendors, tenant_provisioning, scripts/seed) imports from there — never construct a second hash context and never `import bcrypt` anywhere else; `tests/test_password_hashing_offloaded.py` AST-scans `app/` for both. Stored `$bcrypt-sha256$` (v2 + legacy v1) and pre-upgrade plain `$2b$` hashes all still verify, pinned byte-for-byte against passlib-generated fixtures in `tests/test_bcrypt_sha256_compat.py`. Complexity rules in `validate_password_complexity` (min 12 chars, upper/lower/digit).
 - **Filename sanitiser**: `app/services/storage.py::_safe_filename` strips path separators, `..`, leading dots (no dotfiles), and control / non-printable characters. Used by `upload_invoice_file` before interpolating the filename into the S3 key. Without it, a vendor portal POST with filename `../../other-org/secret.pdf` could land under another tenant's prefix.
 - **File downloads resolve the row that owns the key**: the S3 proxies (`/api/invoices/file/…`, both chat-attachment routes, `/api/contracts/file/…`, `/api/expenses/receipt/…`) go through `app/api/file_proxy.serve_owned_file`, which parses the owner id out of the key, checks the org segment, loads the owner within the selected entity and (for single-file owners) requires the key to be its current file. Every refusal and a missing object are the same `404 "File not found"`. A new file proxy uses it — never an org-prefix check alone (`docs/decisions.md` §226).
+- **PDF text goes through `app/services/pdf_text.pdf_markup`** — the one escaper for ReportLab `Paragraph` markup. It also wraps every run Helvetica (WinAnsi) has no glyph for in a font that does (bundled DejaVu Sans; ReportLab's CID fonts for CJK / Hangul), so a non-ASCII vendor name no longer prints as boxes. A tenant- or vendor-supplied value in a `Table` cell must be a `Paragraph(pdf_markup(...))`, never a bare string: a bare cell string gets neither escaping nor fallback and never wraps. Guard: `tests/test_pdf_text.py`. `docs/decisions.md` §307.
 - **CSV formula-injection defense (CWE-1236)**: `app/services/report_export.py::csv_safe_cell` prefixes a leading `= + - @` / tab / CR (except a bare signed number) with a single quote so a spreadsheet renders the cell as text, not a formula. Attacker-controlled fields (AI-extracted `vendor_name`, `User.full_name`) reach CSVs a CFO/admin opens in Excel. Use `safe_csv_writer(buf)` (the sanitizing `csv.writer` stand-in) at **every** export writerow site; for `csv.DictWriter` sites sanitize the row values through `csv_safe_cell`. Covers the analytics/report exporters, audit export, ad-hoc report builder, invoice bulk export, and workflow export.
 
 ## Audit immutability + access auditing (SOX)
@@ -898,7 +941,7 @@ Stored in `Organization.settings`:
                "vat_registration_number", "companies_house_number" },
   "invoice_defaults": { "currency", "payment_terms", "number_prefix", "default_gl_account", "default_cost_center" },
   "erp": { "type", "integration_method", "base_url", "client_id", ... },   // secrets: see below
-  "extraction": { "program_type": "platform"|"byok", "provider", "api_key", "model" },
+  "extraction": { "program_type": "platform"|"byok", "provider", "aws_access_key_id", "model" },  // key: sealed
   "cards": { "enabled": true|false, "program_type": "platform"|"byok", "provider", "region": "US"|"EU"|...,
              "default_expiry_days": 30, ... },
   "payments": { "provider", "org_id", "originating_account_id", "cfo_approval_above": Decimal,
@@ -907,14 +950,15 @@ Stored in `Organization.settings`:
   "mfa": { "required": true|false },
   "chat_notifications": { "enabled": true|false, "provider": "slack"|"teams"|"mock",
                           "webhook_url": "...", "events": { "invoice_approved": true, ... } },
-  "sso": { ... },
+  "sso": { ..., "client_secret_configured": true },   // the secret itself: sealed
   "fraud_rules": { ... },
   "exception_agents": { "autonomy_level": "conservative"|"balanced"|"aggressive", "amount_tolerance_pct": 2.5 }
 }
 ```
 
 **Provider secrets are not in this JSONB.** The secret keys of `erp`, `payments`,
-`cards` and `commerce` (API keys, OAuth client secrets, account tokens and the three
+`cards`, `commerce` and `extraction` (API keys, OAuth client secrets, account tokens,
+a BYOK extraction key or AWS secret, and the three
 `webhook_*_secret` HMAC keys — catalogue `services/provider_credentials.SECRET_FIELDS`)
 are envelope-encrypted under the app KMS key in the control-plane
 `provider_credentials` table. Read them ONLY through
@@ -924,29 +968,43 @@ holds anything. Write them only through `PUT /api/organization/credentials/{bloc
 `PATCH /api/organization` refuses them. A mock-DB test opts into the
 `provider_store_from_settings` fixture; a realdb test seals what it needs with
 `realdb.store_provider_secrets`. See `docs/erp-integration.md` § Where the
-credentials live. `extraction.api_key` and `sso.client_secret` are still plain
-JSONB (write-only for SSO).
+credentials live. A BYOK extraction key is read ONLY through
+`provider_credentials.byok_extraction_config` (platform orgs never open the
+store), and a `PATCH` that switches `extraction.provider` drops the sealed key;
+one that switches `payments` / `cards` provider or `sandbox` drops theirs
+(`rail_secrets_to_drop`). `DELETE /api/organization/credentials/{block}` clears
+a block without opening it — the recovery for a row that no longer opens.
+The OIDC client secret is sealed too (block `sso`, migration 0135), but its only
+writer is `PUT /api/organization/sso` — the generic credentials door refuses
+the block (`DEDICATED_WRITER_BLOCKS`) — and its only reader is the OIDC
+callback (`services/sso.load_client_secret`). The block keeps a
+`client_secret_configured: true` marker, written in the same transaction, which
+is what the sync sign-in completeness check (`is_sso_only`) reads.
 
 ## Exception types
 
-Canonical roster: `services/exception_lifecycle.EXCEPTION_TYPES` — `duplicate`, `po_mismatch`, `fraud_flag`, `extraction_failed`, `unverified_vendor`, `review_rejected`, `amount_exceeded` (legacy — no longer raised, kept for historical rows), `missing_data`, `quality_hold`, `price_variance`, `contract_noncompliant`, `erp_reconciliation`, `line_total_mismatch`, `payment_compliance_hold`. The `exception_type` column is a plain `String(50)`, so that tuple — not a DB enum — is the source of truth; `api/exceptions.EXCEPTION_TYPE_LABELS` must cover it exactly, and `tests/test_exception_type_labels.py` AST-scans `app/` to fail when a type is raised without joining the roster and getting a label.
+Canonical roster: `services/exception_lifecycle.EXCEPTION_TYPES` — `duplicate`, `po_mismatch`, `fraud_flag`, `extraction_failed`, `unverified_vendor`, `review_rejected`, `amount_exceeded` (legacy — no longer raised, kept for historical rows), `missing_data`, `quality_hold`, `price_variance`, `contract_noncompliant`, `erp_reconciliation`, `line_total_mismatch`, `payment_compliance_hold`. The `exception_type` column is a plain `String(50)`, so that tuple — not a DB enum — is the source of truth; `services/exception_lifecycle.EXCEPTION_TYPE_LABELS` must cover it exactly, and `tests/test_exception_type_labels.py` AST-scans `app/` to fail when a type is raised without joining the roster and getting a label.
 
-**Every lifecycle event is audited, and `record_decision` also enforces segregation of duties.** `services/exception_lifecycle` is the single chokepoint: `create_exception` writes `exception.raised`, and the human queue (`api/exceptions`, single + bulk), the agent coordinator, the compliance-hold release/dismiss path (`api/payments.py::_resolve_compliance_hold_exception`) and the supplier-resubmission path (`api/portal.py`) all resolve/escalate/dismiss through `record_decision`, which writes `exception.resolved` / `.escalated` / `.dismissed` (+ `exception.assigned` on routing). It is also where the queue's SoD refusal lives (`segregation_refusal` — see the root `CLAUDE.md`), precisely *because* there are that many doors: the two non-queue ones early-return (neither type is payment-blocking, and the portal's actor is a `VendorUser` with no control-plane id), so a refusal can never strand a supplier resubmission or desynchronise the queue from a released hold. Rows are correlation-keyed to the **invoice**, so they land on its SOX trail; an invoice-less exception self-correlates on its own id. `details` is PII-lean and carries a `payment_blocking` flag derived from `api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES` itself — clearing any member of that tuple (`duplicate` / `fraud_flag` / `line_total_mismatch` / `payment_reconciliation` / `quality_hold` / `po_mismatch`) is the human sign-off that lets a payment run proceed, and the mutable `exceptions` row (single-valued, not WORM-shipped, no append-only trigger) can't be that record. Escalation records the note but never stamps `resolved_by` / `resolved_at`. Every `/api/exceptions` mutation is entity-scoped like the reads. See `docs/exception-lifecycle.md`.
+**Every lifecycle event is audited, and `record_decision` also enforces segregation of duties.** `services/exception_lifecycle` is the single chokepoint: `create_exception` writes `exception.raised`, and the human queue (`api/exceptions`, single + bulk), the agent coordinator, the compliance-hold release/dismiss path (`api/payments.py::_resolve_compliance_hold_exception`) and the supplier-resubmission path (`api/portal.py`) all resolve/escalate/dismiss through `record_decision`, which writes `exception.resolved` / `.escalated` / `.dismissed` (+ `exception.assigned` on routing). It is also where the queue's SoD refusal lives (`segregation_refusal` — see the root `CLAUDE.md`), precisely *because* there are that many doors: the two non-queue ones early-return (neither type is payment-blocking, and the portal's actor is a `VendorUser` with no control-plane id), so a refusal can never strand a supplier resubmission or desynchronise the queue from a released hold. Rows are correlation-keyed to the **invoice**, so they land on its SOX trail; an invoice-less exception self-correlates on its own id. `details` is PII-lean and carries a `payment_blocking` flag derived from `services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES` itself — clearing any member of that tuple (`duplicate` / `fraud_flag` / `line_total_mismatch` / `payment_reconciliation` / `quality_hold` / `po_mismatch`) is the human sign-off that lets a payment run proceed, and the mutable `exceptions` row (single-valued, not WORM-shipped, no append-only trigger) can't be that record. Escalation records the note but never stamps `resolved_by` / `resolved_at`. Every `/api/exceptions` mutation is entity-scoped like the reads. See `docs/exception-lifecycle.md`.
 
-Severity: `error`, `warning`, `info`. Auto-detected by `invoice_warnings.py`. `erp_reconciliation` is opened by the ERP webhook (`api/erp_webhook.py`) in two cases, both idempotent per open exception and PII-free: (1) the ERP reports an invoice VOIDED/CANCELLED that we already advanced past the point where `→ failed` is a legal transition (`sent_to_erp` / `posted_in_erp` / `payment_scheduled` / `paid`) — money may be in flight, so it is flagged for human reconciliation instead of auto-transitioned; (2) the ERP reports `Paid` for a `payment_scheduled` invoice whose `Payment.settled_amount` shows the rail settled SHORT of what AP authorized — the same `settlement_coverage` hold `payment_erp_sync` applies, so a validly-signed ERP `paid` can't walk a short-paid invoice to `paid` and strand `/settlement/accept`. It is also opened by `payment_erp_sync` on a failed sync leg. `payment_compliance_hold` is opened by `api/payments.py` whenever `_execute_single_payment` parks a payment at `pending_compliance` (no screenable vendor, or the sanctions/KYC adapter itself returns a `hold` verdict) — dedup'd per `(invoice_id, "payment_compliance_hold", "open")` so a retried execution never double-opens it, and resolved by `POST /api/payments/{id}/compliance/release` or `/dismiss`. See `backend/docs/payments.md` § Sanctions / compliance hold resolution.
+Severity: `error`, `warning`, `info`. Auto-detected by `invoice_warnings.py`. `erp_reconciliation` is opened by the ERP webhook (`api/erp_webhook.py`) in two cases, both idempotent per open exception and PII-free: (1) the ERP reports an invoice VOIDED/CANCELLED that we already advanced past the point where `→ failed` is a legal transition (`sent_to_erp` / `posted_in_erp` / `payment_scheduled` / `paid`) — money may be in flight, so it is flagged for human reconciliation instead of auto-transitioned; (2) the ERP reports `Paid` for a `payment_scheduled` invoice whose `Payment.settled_amount` shows the rail settled SHORT of what AP authorized — the same `settlement_coverage` hold `payment_erp_sync` applies, so a validly-signed ERP `paid` can't walk a short-paid invoice to `paid` and strand `/settlement/accept`. It is also opened by `payment_erp_sync` on a failed sync leg, and by the QuickBooks write-back (`services/erp_payment_writeback`) when a settled payment cannot be posted as a BillPayment or leaves the bill partly open. QuickBooks status sync-back (`services/erp_status_sync.apply_bill_report`, decisions §295) opens the payment-BLOCKING `payment_reconciliation` when a bill is paid in QuickBooks while FeohLedger also has a payment scheduled, part-paid there, or deleted there while still payable here, and `erp_reconciliation` for the non-blocking cases. **An ERP reconciliation row's `description` is for an AP user (what to do, never an API path or id); its machine detail is `exceptions.erp_report`** (migration 0121). A `paid_not_recorded` row keeps the payment the ERP reported; clearing the blocker re-attempts it from `record_decision`, and a blocking one is recorded in one click (`POST /api/exceptions/{id}/record-erp-payment`, decisions §319). `payment_compliance_hold` is opened by `api/payments.py` whenever `_execute_single_payment` parks a payment at `pending_compliance` (no screenable vendor, or the sanctions/KYC adapter itself returns a `hold` verdict) — dedup'd per `(invoice_id, "payment_compliance_hold", "open")` so a retried execution never double-opens it, and resolved by `POST /api/payments/{id}/compliance/release` or `/dismiss`. See `backend/docs/payments.md` § Sanctions / compliance hold resolution.
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
 | `scripts/seed.py` | Creates 2 tenants (acme, techflow) with full sample data (vendors, invoices, POs, payments, exceptions) + a `WorkflowInstance`/`WorkflowStep` per invoice (so the approval queue + assistant pending-approvals tool aren't empty — `ready_for_review` invoices get an active approval step assigned to the org admin) + calls `seed_extras` so contracts / credit memos / discount offers / expenses are populated too, then (full mode, acme only) `seed_automation` |
+| `scripts/seed_realistic.py` | Production-shaped rows (#575 § 2) from `scripts/fixtures/realistic_rows.json` — the ONE file the e2e layout specs and the day-one journey read too. The full seed ADDS them (long + non-ASCII vendor names, an unverified first-time supplier, ERP-length invoice numbers, a tax-exclusive invoice with net lines, a long assignee address); the lean seed RESHAPES its existing rows with them so no e2e count moves. Never spell one of those values anywhere else — `tests/test_seed_realistic.py` drives them through search, warnings, the payment queue and CSV export |
 | `scripts/seed_extras.py` | Additive, idempotent per-tenant seed for the contract (`/contracts`), credit-memo (`/credit-memos`), discounting (`/discounts`) and expense (`/expenses`) pages. `seed_extras(session, org_id)` is reused in-line by `seed_tenant`; the CLI (`--tenant feoh_acme`) tops up an already-seeded tenant without a wipe. Skips if the tenant already has contracts. |
 | `scripts/seed_automation.py` | Back-dated approval history (~100 invoices, signed approvals, auto-approvals, a void) + three A/B experiments (concluded / running / draft) so every `/adaptive` and `/experiments` panel clears its minimum sample. Acme only, never the e2e tenants. Additive; no-op once seeded; the CLI (`--tenant feoh_acme`) tops up an existing tenant. See `docs/adaptive-workflows.md` § Seed data. |
 | `scripts/seed_payable_invoices.py` | Tops up a tenant's payment queue with N approved invoices (`--tenant`, `--count`) — re-run after executing a payment run drains the queue. |
-| `scripts/create_tenant.py` | CLI wrapper around `services.tenant_provisioning.provision_tenant` — provisions a single tenant (org + admin user + DB + tables). Provisioning refuses (`ControlPlaneNotInitialised`) a control plane without the system `admin` role or the `free` plan instead of creating an admin with no role, and the CLI then exits non-zero. A failure after the control-plane rows commit (building the tenant tables) removes those rows as well as the database, so the slug is reusable. Exit 2 on an invalid slug; `--skip-existing` exits 0 without changes for a slug already provisioned |
-| `scripts/delete_tenant.py` | CLI wrapper around `services.tenant_deletion.delete_tenant` — deletes one tenant completely (object-storage prefix, tenant DB, control-plane rows), in that order. `--dry-run` inventories; otherwise it needs `--confirm <slug>` or `--yes`. Exits 4 when no organisation has the slug (the one failure `remove-tenant.sh` reads as already deleted), 2 on any other refusal, 3 without confirmation. Driven by `deploy/remove-tenant.sh`, which adds the Caddy and backup legs. The deletion `/legal/dpa` § 13 promises. |
+| `scripts/create_tenant.py` | CLI wrapper around `services.tenant_provisioning.provision_tenant` — provisions a single tenant (org + admin user + DB + tables). Provisioning refuses (`ControlPlaneNotInitialised`) a control plane without the system `admin` role or the `free` plan instead of creating an admin with no role, and the CLI then exits non-zero. A failure after the control-plane rows commit (building the tenant tables) removes those rows as well as the database, so the slug is reusable. Exit 2 on an invalid slug; `--skip-existing` exits 0 without changes for a slug already provisioned. `--resend-link --slug --admin-email` provisions nothing: it supersedes the existing admin's earlier set-password links and emails a fresh one (exit 2 if the tenant / admin is missing, not an active admin, or already has a password; 3 if not delivered), printing only a masked address |
+| `scripts/delete_tenant.py` | CLI wrapper around `services.tenant_deletion.delete_tenant` — deletes one tenant completely (tenant DB, object-storage prefix, control-plane rows), in that order (decisions §306). `--dry-run` inventories; otherwise it needs `--confirm <slug>` or `--yes`. Exits 4 when no organisation has the slug (the one failure `remove-tenant.sh` reads as already deleted), 2 on any other refusal, 3 without confirmation. Driven by `deploy/remove-tenant.sh`, which adds the Caddy and backup legs. The deletion `/legal/dpa` § 13 promises. |
+| `scripts/workspace_closures.py` | The operator's half of a self-service workspace closure (decisions §306): `list` prints completed closures whose backup dumps are still owed (the API cannot reach the backup bucket; the DPA promises 60 days), `list` also shows closures that began and never finished; `mark-cleared <organization-id> --operator <handle>` records who removed them and when (exit 4 when nothing was owed). The slug stays unavailable to every provisioning path until then AND for `utils/slug.CLOSED_SLUG_COOLDOWN` (90 days) from the closure. Procedure: `../docs/founder-runbooks/workspace-closure.md` |
 | `scripts/sso_break_glass.py` | CLI wrapper around `services.sso_break_glass.lift_sso_only` — clears `settings.sso.sso_only` (and nothing else) for one SSO-only tenant whose IdP has stopped working, after writing an `organization.sso_only_lifted` audit row; refuses to change anything if the row cannot be written. `--slug`, optional `--reason` (ticket ref, no PII). Procedure: `../docs/founder-runbooks/sso-break-glass.md` |
+| `scripts/backfill_po_currency.py` | Operator-asserted `purchase_orders.currency` for POs that record none (pre-0099, contract-spawned, an ERP that states no code): `--tenant`, `--currency` (a real ISO 4217 code), narrowed by `--entity` / `--po-prefix` / `--created-before`. Dry run by default; `--apply` stamps NULL rows only (compare-and-swap), re-matches the unpaid invoices citing them in the same transaction, and writes one PII-free `purchase_order.currency_backfilled` audit row (`--manifest` writes it to a file too). `docs/po-matching.md` § A PO that records no currency |
 | `scripts/init_control_plane.py` | Builds an EMPTY control-plane database — `CONTROL_TABLES` via `create_all`, the four system roles and Alembic's version row at head, in one transaction. On an initialised one it only restores any system role that has gone missing, since `provision_tenant` refuses to provision without the system `admin` role. Alembic's chain has no step that creates the control plane, so `deploy/deploy.sh` runs this before `alembic upgrade head`; it refuses (exit 2) a database Alembic stamped while empty. `services/control_plane_bootstrap.py` |
+| `scripts/record_qbo_contract_fixtures.py` | `pnpm gen:qbo-recordings` — records real QuickBooks payment shapes (bills paid by cheque / card / in part / by vendor credit / by our write-back, a void, a deleted bill, CDC, a webhook body) from a SANDBOX company connected to a local tenant, scrubbed by allowlist, into `tools/fake-erp/fixtures/qbo_recorded/` for `tests/test_qbo_recorded_replay.py`. Writes to that sandbox company and refuses any other; operator-run, never CI (`docs/quickbooks-online-adapter.md` § Recorded payment shapes, `../docs/decisions.md` §318) |
 | `scripts/migrate_all_tenants.py` | Runs `alembic upgrade head` on every tenant DB; exits non-zero if any tenant failed (every tenant is still attempted) |
 | `scripts/deploy_migrate.sh` | The deploy's whole database step — `init_control_plane.py`, `alembic upgrade head`, `migrate_all_tenants.py`, fail-fast. Every deploy runs this ONE file (`deploy/deploy.sh`, `aws-deploy.yml`'s Fargate task, CI's day-one job in `scripts/day-one/`); never restate the sequence, `tests/test_control_plane_bootstrap.py` fails on a copy |
 
@@ -958,7 +1016,7 @@ Two-step flow under `/api/signup`:
 |----------|---------|
 | `POST /api/signup/start` | Rate-limit check, captcha verify, slug-format check, slug-availability check. Creates an `EmailVerification` row (24h TTL) and sends a verification email. No tenant resources created yet. |
 | `GET /api/signup/slug-check?slug=…` | Cheap inline availability check for the signup form. |
-| `POST /api/signup/complete` | Consumes the token, re-checks slug availability, provisions the tenant via `services.tenant_provisioning.provision_tenant` with an admin who has **no password** (`admin_password=None` → `hashed_password` NULL, `must_change_password=False`), marks the verification consumed, mints a set-password link and returns it as `set_password_url` while also emailing it in the welcome message. |
+| `POST /api/signup/complete` | Consumes the token, re-checks slug availability, provisions the tenant via `services.tenant_provisioning.provision_tenant` with an admin who has **no password** (`admin_password=None` → `hashed_password` NULL, `must_change_password=False`), marks the verification consumed, mints a set-password link and returns it as `set_password_url` while also emailing it in the welcome message. An address that already has an account is refused here (409 `signup_email_has_workspace`, never at `/start`, which must not enumerate accounts), and a spent token whose workspace exists is re-answered with `already_verified: true` and nothing re-issued (`docs/decisions.md` §292). |
 | `POST /api/auth/reset-password/check` · `POST /api/auth/reset-password` | Public; the reset token is the credential. `check` reads it without consuming (`password_reset.peek_reset_token`) and returns the account email; only the reset submit spends it. |
 
 **No password is ever generated or emailed for signup** (`docs/decisions.md` §283). The set-password link IS a forgot-password reset token — `password_reset.issue_reset_token(user_id, ttl_seconds=FEOH_SIGNUP_SET_PASSWORD_TTL_HOURS*3600)`, same store and single-use semantics — built by `utils/tenant_urls.password_reset_url(..., set_password=True)`, the forgot-password email's own builder. Don't add a second token type or a signup-only redemption endpoint, and never put the link or token in a log line or a preheader. The welcome email's sign-in link comes from `tenant_urls.sign_in_url(..., email=…)`.
@@ -970,19 +1028,19 @@ Two-step flow under `/api/signup`:
 - `services/rate_limit.py` — Redis sliding-window limiter, keyed on `(endpoint, subject)` where `subject` defaults to client IP but can be an explicit value (e.g. email). Signup uses three limits: per-IP `/start` + `/complete` (`FEOH_SIGNUP_RATE_LIMIT_PER_HOUR`, default 5), per-email `/start` (`FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR`, default 3, anti email-bombing), and per-IP `/slug-check` (`FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR`, default 120, anti-enumeration).
 - `utils/slug.py` — regex + reserved-word blocklist + DB uniqueness check. `provision_tenant` runs `validate_slug_format` itself, before any DB work, so every provisioning path gets it — including `scripts/create_tenant.py` / `deploy/add-tenant.sh`, which pass an operator-typed slug straight through.
 - `utils/hcaptcha.py` — server-side siteverify. Skips when `FEOH_HCAPTCHA_SECRET` is empty (local dev).
-- `utils/passwords.py` — `generate_temp_password()` + `validate_password_complexity()` (min 12 chars, upper/lower/digit).
+- `utils/passwords.py` — `validate_password_complexity()` (min 12 chars, upper/lower/digit). There is no temporary-password generator: every invite and admin reset emails a single-use set-password link through `api/set_password_links.py` (`services/password_reset` tokens; decisions §283).
 
 The captcha sitekey is exposed to the frontend via `GET /api/public-config` so the SvelteKit build doesn't need to bake it in, alongside `signup_enabled`.
 
 `FEOH_SIGNUP_ENABLED` (default `true`) is the off switch: a router-level dependency makes every `/api/signup/*` route a bare 404 before validation, DB or rate limit, and the SPA renders "signup is closed" from `public-config` (`docs/self-service-signup.md` § Turning signup off).
 
-Relevant env vars: `FEOH_SIGNUP_ENABLED`, `FEOH_ENVIRONMENT` (deployed envs with signup on refuse to boot with an empty `FEOH_HCAPTCHA_SECRET`), `FEOH_EMAIL_PROVIDER`, `FEOH_EMAIL_FROM`, `FEOH_AWS_SES_REGION`, `FEOH_PUBLIC_URL`, `FEOH_TENANT_URL_TEMPLATE`, `FEOH_HCAPTCHA_SECRET`, `FEOH_HCAPTCHA_SITEKEY`, `FEOH_SIGNUP_RATE_LIMIT_PER_HOUR`, `FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR`, `FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR`.
+Relevant env vars: `FEOH_SIGNUP_ENABLED`, `FEOH_ENVIRONMENT` (deployed envs with signup on refuse to boot with an empty `FEOH_HCAPTCHA_SECRET` or `FEOH_HCAPTCHA_SITEKEY`), `FEOH_EMAIL_PROVIDER`, `FEOH_EMAIL_FROM`, `FEOH_AWS_SES_REGION`, `FEOH_PUBLIC_URL`, `FEOH_TENANT_URL_TEMPLATE`, `FEOH_HCAPTCHA_SECRET`, `FEOH_HCAPTCHA_SITEKEY`, `FEOH_SIGNUP_RATE_LIMIT_PER_HOUR`, `FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR`, `FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR`.
 
 ## Secrets management (SOPS + AWS KMS, in the private infra-secrets repo)
 
 Local dev needs no secret setup: `backend/.env.development` is **committed** with safe, no-risk local defaults and is loaded by `main.py` (the local-dev entrypoint) via `python-dotenv`, so a fresh clone runs immediately. A gitignored `backend/.env` holds personal overrides and wins over the committed defaults. The backend also runs straight off `app/config.py` defaults even with neither file present.
 
-Deployed-environment secrets are encrypted with [SOPS](https://github.com/getsops/sops) under the project's AWS KMS key — `alias/feohledger-sops`, created in the FeohLedger AWS account by the estate account bootstrap — and live in the **private** estate repo `Absence0760/infra-secrets`, under `feohledger/`. **Never in this repo, not even encrypted:** it is public, and ciphertext in public history is archived and scraped forever (`docs/decisions.md` §12, §165). The root `.gitignore` ignores `*.sops` / `*.sops.yaml`, and CI's `env-isolation.yml` fails on a tracked one. The estate pattern and onboarding are `~/github/project-mgmt/docs/secrets-management.md`.
+Deployed-environment secrets are encrypted with [SOPS](https://github.com/getsops/sops) under the project's AWS KMS key — `alias/feohledger-sops`, created in the FeohLedger AWS account by the estate account bootstrap — and live in the **private** estate repo `jaredhoward-dev/infra-secrets`, under `feohledger/`. **Never in this repo, not even encrypted:** it is public, and ciphertext in public history is archived and scraped forever (`docs/decisions.md` §12, §165). The root `.gitignore` ignores `*.sops` / `*.sops.yaml`, and CI's `env-isolation.yml` fails on a tracked one. The estate pattern and onboarding are `~/github/project-mgmt/docs/secrets-management.md`.
 
 **File layout:**
 

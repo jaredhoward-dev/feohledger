@@ -46,7 +46,7 @@ export const VENDOR_GUIDES: Guide[] = [
 					{
 						type: 'note',
 						tone: 'tip',
-						text: 'If the same supplier ends up on the list twice, **Merge duplicates** folds them into one record, so their spend and invoices aren\'t split across two.'
+						text: 'If the same supplier ends up on the list twice, {ui:vendors.mergeDuplicates} folds them into one record, so their spend and invoices aren\'t split across two.'
 					}
 				]
 			},
@@ -79,7 +79,7 @@ export const VENDOR_GUIDES: Guide[] = [
 						items: [
 							'On the vendor\'s row, select {ui:vendors.row.invite}.',
 							'Enter the supplier contact\'s {ui:vendors.invite.field.fullName} and {ui:vendors.invite.field.email}, then select {ui:vendors.invite.send}.',
-							'The supplier is emailed a temporary password. It is never shown to you, so no one in AP ever knows a supplier\'s password.'
+							'The supplier is emailed a link to choose their own password. It is never shown to you, so no one in AP ever knows a supplier\'s password. If the link expires, or they later forget their password, they can select {ui:auth.login.forgotPassword} on the portal sign-in page to be emailed a new link, or you can use Reset password to send one.'
 						]
 					},
 					{
@@ -152,7 +152,7 @@ export const VENDOR_GUIDES: Guide[] = [
 					{
 						type: 'note',
 						tone: 'caution',
-						text: 'You can\'t approve a change you requested yourself; your row shows {ui:vendors.changeRequests.row.youRequested}. You also can\'t approve a portal request from a supplier login that you invited or whose password you reset, because you could have made that request yourself. Another approver has to sign it off. This is deliberate: one person alone should never be able to redirect where money goes.'
+						text: 'You can\'t approve a change you requested yourself: {ui:vendors.changeRequests.row.approve} is disabled on that row, with the reason beside it. You also can\'t approve a portal request from a supplier login that you invited or whose password you reset, because you could have made that request yourself. Another approver has to sign it off. This is deliberate: one person alone should never be able to redirect where money goes.'
 					}
 				]
 			},
@@ -294,6 +294,7 @@ export const VENDOR_GUIDES: Guide[] = [
 						items: [
 							'Open [[page:/requisitions]] and select {ui:requisitions.action.new}.',
 							'Give it a title, then add {ui:requisitions.modal.lineItems} with quantities, unit prices and GL accounts. The total is always calculated from the lines. Select {ui:requisitions.modal.create}.',
+							'To count it against a [[budget]], choose one in {ui:requisitions.modal.field.budget} before you save. Only budgets in the requisition\'s currency are listed. If the total would take the budget past its allocation, the form warns you, but you can still save. The requisition counts toward the budget\'s {ui:budgets.modal.kpi.committed} figure once it is submitted. Admins, AP managers and CFOs can link a budget.',
 							'Select {ui:requisitions.row.submit}. The requisition moves to {ui:requisitions.status.pendingApproval} and is locked, so nobody can change the amount while it is being approved.',
 							'An approver selects {ui:requisitions.row.approve} or {ui:requisitions.row.reject}. If it is rejected, {ui:requisitions.row.reopen} takes it back to {ui:requisitions.status.draft} so you can rework it.',
 							'Once it is approved, an admin or AP manager selects {ui:requisitions.row.convertToPo}. The purchase order is numbered after the requisition, and the requisition moves to {ui:requisitions.status.converted}.'
@@ -584,7 +585,7 @@ export const VENDOR_GUIDES: Guide[] = [
 						type: 'steps',
 						items: [
 							'Open [[page:/budgets]] and select {ui:budgets.action.new}.',
-							'Give it a {ui:budgets.modal.field.name} and choose the {ui:budgets.modal.field.dimension} it tracks: **Department**, **Project**, **Cost Center** or **GL Account**.',
+							'Give it a {ui:budgets.modal.field.name} and choose the {ui:budgets.modal.field.dimension} it tracks: {ui:budgets.dimension.department}, {ui:budgets.dimension.project}, {ui:budgets.dimension.costCenter} or {ui:budgets.dimension.glAccount}.',
 							'Enter the {ui:budgets.modal.field.dimensionValue} exactly as it is coded on invoices, for example the department name or the GL account number.',
 							'Set the {ui:budgets.modal.field.period}, and a {ui:budgets.modal.field.periodStart} and {ui:budgets.modal.field.periodEnd} if spend should only count inside those dates. Then set the {ui:budgets.modal.field.amount} and {ui:budgets.modal.field.currency}, and select {ui:budgets.modal.create}.'
 						]

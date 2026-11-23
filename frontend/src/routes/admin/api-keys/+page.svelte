@@ -2,6 +2,7 @@
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { goto } from '$app/navigation';
 	import { formatDate } from '#lib/utils/time.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
@@ -13,7 +14,9 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import {
@@ -44,11 +47,11 @@
 	// $derived so the column headers re-render when the locale changes.
 	let COLUMNS = $derived([
 		{ label: m('admin.apiKeys.col.name') },
-		{ label: m('admin.apiKeys.col.keyPrefix') },
+		{ label: m('admin.apiKeys.col.keyPrefix'), class: 'col-prefix' },
 		{ label: m('admin.apiKeys.col.scopes') },
-		{ label: m('admin.apiKeys.col.created') },
-		{ label: m('admin.apiKeys.col.lastUsed') },
-		{ label: m('admin.apiKeys.col.status') },
+		{ label: m('admin.apiKeys.col.created'), class: 'col-date' },
+		{ label: m('admin.apiKeys.col.lastUsed'), class: 'col-last-used' },
+		{ label: m('admin.apiKeys.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -66,8 +69,12 @@
 	// long enough to render it and drops it on close.
 	let minted = $state<ApiKeyCreated | null>(null);
 
-	// Revoke confirm (armed two-click on the row action).
+	// Revoke confirm (armed two-click on the row action). `revokingId` holds the
+	// key whose revoke is in flight: its button goes `busy` (a third click on the
+	// still-armed button cannot send a second DELETE) and every other row's
+	// Revoke is disabled until it settles.
 	let confirmRevokeId = $state<string | null>(null);
+	let revokingId = $state<string | null>(null);
 
 	// Per-key usage view.
 	let usageKey = $state<ApiKey | null>(null);
@@ -130,6 +137,8 @@
 	}
 
 	async function handleRevoke(id: string) {
+		if (revokingId) return;
+		revokingId = id;
 		try {
 			await revokeApiKey(id);
 			toast(m('admin.apiKeys.toast.revoked'), 'success');
@@ -138,6 +147,7 @@
 			toast(e instanceof Error ? e.message : m('admin.apiKeys.toast.revokeFailed'), 'error');
 		} finally {
 			confirmRevokeId = null;
+			revokingId = null;
 		}
 	}
 
@@ -192,16 +202,19 @@
 		<PlanUpgradeNotice feature={FEATURE_PUBLIC_API} testId="api-keys-plan-upgrade" />
 	{/if}
 
-	{#if loading}
-		<p class="state" data-testid="api-keys-loading">{m('admin.apiKeys.loading')}</p>
-	{:else if error}
-		<div class="state error" data-testid="api-keys-error" role="alert">
-			<p>{error}</p>
-			<button type="button" class="btn-cancel" onclick={load}>{m('admin.apiKeys.retry')}</button>
-		</div>
+	<!-- The table is mounted from first paint with its own "Loading…" row: a
+	     separate loading block swapped for the table moved the page when the
+	     keys landed, and `fixed` plus the header widths below keep the columns
+	     from re-sizing against the real rows (frontend/docs/ui-patterns.md §
+	     Data tables; tests-e2e/reactivity/layout-stability.spec.ts). -->
+	{#if error}
+		<LoadError message={error} onretry={load} testId="api-keys-error" />
 	{:else}
+		<div class="keys-table">
 		<DataTable
 			columns={COLUMNS}
+			fixed
+			loading={loading}
 			isEmpty={keys.length === 0}
 			empty={m('admin.apiKeys.empty')}
 		>
@@ -235,6 +248,15 @@
 								<RowAction
 									variant="danger"
 									armed={confirmRevokeId === key.id}
+									busy={revokingId === key.id}
+									disabled={revokingId !== null && revokingId !== key.id}
+									ariaLabel={m('common.rowActionAria', {
+										action:
+											confirmRevokeId === key.id
+												? m('admin.apiKeys.row.confirm')
+												: m('admin.apiKeys.row.revoke'),
+										name: key.name
+									})}
 									onclick={(e) => {
 										e.stopPropagation();
 										if (confirmRevokeId === key.id) {
@@ -252,6 +274,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 	{/if}
 </PageHeader>
 
@@ -325,20 +348,21 @@
 		>
 			<h2>{m('admin.apiKeys.usage.heading', { name: usageKey.name })}</h2>
 			{#if usageLoading}
-				<p class="state" data-testid="usage-loading">{m('admin.apiKeys.usage.loading')}</p>
+				<LoadingState label={m('admin.apiKeys.usage.loading')} testId="usage-loading" />
 			{:else if usageError}
-				<div class="state error" role="alert">
-					<p>{usageError}</p>
-					<button type="button" class="btn-cancel" onclick={() => openUsage(usageKey!)}>{m('admin.apiKeys.retry')}</button>
-				</div>
+				<LoadError
+					message={usageError}
+					onretry={() => openUsage(usageKey!)}
+					testId="usage-error"
+				/>
 			{:else if usage}
 				<div class="usage-totals" data-testid="usage-totals">
 					<div class="usage-stat">
-						<span class="usage-num">{usage.total_requests.toLocaleString()}</span>
+						<span class="usage-num">{formatCount(usage.total_requests)}</span>
 						<span class="usage-lbl">{m('admin.apiKeys.usage.totalRequests')}</span>
 					</div>
 					<div class="usage-stat">
-						<span class="usage-num">{usage.window_requests.toLocaleString()}</span>
+						<span class="usage-num">{formatCount(usage.window_requests)}</span>
 						<span class="usage-lbl">{m('admin.apiKeys.usage.windowDays', { days: usage.window_days })}</span>
 					</div>
 					<div class="usage-stat">
@@ -360,7 +384,7 @@
 							{#each usageDays as day (day.usage_date)}
 								<tr>
 									<td>{formatDate(day.usage_date)}</td>
-									<td class="num-col">{day.request_count.toLocaleString()}</td>
+									<td class="num-col">{formatCount(day.request_count)}</td>
 								</tr>
 							{/each}
 						{/snippet}
@@ -375,6 +399,23 @@
 </Modal>
 
 <style>
+	/* Column widths for the `fixed` key table: the prefix, dates, status and
+	   the Revoke action are sized to their widest content in any locale (es "Prefijo de clave",
+	   fr "Dernière utilisation", de "Widerrufen"); Name and Scopes
+	   share the rest, and the `min-width` keeps them readable (past it the
+	   table scrolls inside its region). DataTable renders these `<th>` from
+	   `columns`, so the selectors go through `:global` under this page-owned
+	   wrapper (the /gl-accounts pattern). */
+	.keys-table {
+		min-width: 0;
+	}
+	.keys-table :global(table) { min-width: 1140px; }
+	.keys-table :global(th.col-prefix) { width: 170px; }
+	.keys-table :global(th.col-date) { width: 130px; }
+	.keys-table :global(th.col-last-used) { width: 200px; }
+	.keys-table :global(th.col-status) { width: 130px; }
+	.keys-table :global(th.actions-col) { width: 150px; }
+
 	.page-hint {
 		margin: 0;
 		color: var(--text-muted);
@@ -396,10 +437,6 @@
 	.state {
 		color: var(--text-muted);
 		padding: 0.75rem 0;
-	}
-
-	.state.error {
-		color: #f06464;
 	}
 
 	.mono {

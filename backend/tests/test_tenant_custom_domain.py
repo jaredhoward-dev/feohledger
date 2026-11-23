@@ -20,13 +20,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
-from jose import jwt
 
-from app.config import settings
+from app.utils import jwt_hs256
 
 
 def _mint(payload: dict) -> str:
-    return jwt.encode(payload, settings.secret_key, algorithm="HS256")
+    return jwt_hs256.encode(payload)
 
 
 def _fake_org(org_id: uuid.UUID, slug: str = "acme") -> SimpleNamespace:
@@ -182,7 +181,7 @@ async def test_custom_domain_path_still_enforces_jwt_org_cross_check():
             authorization=f"Bearer {token}",
         )
     assert exc.value.status_code == 403
-    assert "tenant" in exc.value.detail.lower()
+    assert exc.value.detail["code"] == "token_tenant_mismatch"
 
 
 @pytest.mark.asyncio

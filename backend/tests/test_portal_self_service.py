@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.deps import create_vendor_access_token
 from app.models.invoice import Invoice, InvoiceLineItem, InvoiceStatus
 from app.models.payment import Payment, PaymentRun
-from app.models.procurement import POLineItem, PurchaseOrder
+from app.models.procurement import UNISSUED_PO_STATUS, POLineItem, PurchaseOrder
 from app.models.vendor import Vendor
 from app.models.vendor_change_request import VendorChangeRequest
 from app.models.vendor_user import VendorUser
@@ -178,6 +178,40 @@ async def test_portal_pos_carry_their_own_currency_and_the_flip_inherits_it(real
 
 
 @pytest.mark.asyncio
+async def test_flipping_a_currency_less_po_books_an_unknown_currency_invoice(realdb):
+    """A PO that records no currency yields an invoice that records none
+    either — NULL, "unknown" (decisions §473) — never the old `"USD"`
+    placeholder, which billed a EUR order's figure as dollars."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    po_id = uuid.uuid4()
+    async with mk() as s:
+        s.add(
+            PurchaseOrder(
+                id=po_id,
+                po_number="PO-P-NOCUR",
+                vendor_id=vendor_id,
+                total=Decimal("300.00"),
+                currency=None,
+                status="open",
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        flipped = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+    assert flipped.status_code == 202, flipped.text
+    async with mk() as s:
+        inv = (
+            await s.execute(select(Invoice).where(Invoice.id == uuid.UUID(flipped.json()["id"])))
+        ).scalar_one()
+    assert inv.currency is None
+    assert inv.reporting_amount is None
+
+
+@pytest.mark.asyncio
 async def test_po_flip_is_idempotent(realdb):
     """Two flips of the same PO from the same vendor return the same invoice
     — a double-click can't mint two invoices that each seed the payment path."""
@@ -233,6 +267,7 @@ async def test_po_flip_marker_has_db_level_unique_guard(realdb):
                 vendor_name="Acme",
                 vendor_id=vendor_id,
                 amount=Decimal("10.00"),
+                currency="USD",
                 status=InvoiceStatus.new,
                 reference_number=marker,
                 organization_id=org_id,
@@ -250,6 +285,7 @@ async def test_po_flip_marker_has_db_level_unique_guard(realdb):
                     vendor_name="Acme",
                     vendor_id=vendor_id,
                     amount=Decimal("10.00"),
+                    currency="USD",
                     status=InvoiceStatus.new,
                     reference_number=marker,
                     organization_id=org_id,
@@ -266,6 +302,7 @@ async def test_po_flip_marker_has_db_level_unique_guard(realdb):
                 vendor_name="Acme",
                 vendor_id=vendor_id,
                 amount=Decimal("5.00"),
+                currency="USD",
                 status=InvoiceStatus.new,
                 reference_number="REF-NORMAL-001",
                 organization_id=org_id,
@@ -277,6 +314,7 @@ async def test_po_flip_marker_has_db_level_unique_guard(realdb):
                 vendor_name="Acme",
                 vendor_id=vendor_id,
                 amount=Decimal("6.00"),
+                currency="USD",
                 status=InvoiceStatus.new,
                 reference_number="REF-NORMAL-001",
                 organization_id=org_id,
@@ -357,6 +395,7 @@ async def test_po_flip_recovery_path_does_not_leak_foreign_invoice(realdb):
                 vendor_name="Foreign Co",
                 vendor_id=foreign_vendor_id,
                 amount=Decimal("100.00"),
+                currency="USD",
                 status=InvoiceStatus.new,
                 reference_number=marker,
                 organization_id=org_id,
@@ -782,3 +821,500 @@ async def test_portal_bank_change_validates_the_wire_routing_number_too(realdb):
     assert resp.status_code == 400, resp.text
     assert "wire_routing_number" in resp.text
     assert "987654321098" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_po_flip_refuses_a_po_whose_total_the_erp_no_longer_vouches_for(realdb):
+    """The flip bills `po.total`. A PO the ERP's last sync could not price
+    (decisions §323) carries a figure nobody vouches for, so no invoice is
+    minted at it — the supplier submits their own instead."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+
+    po_id = uuid.uuid4()
+    async with mk() as s:
+        s.add(
+            PurchaseOrder(
+                id=po_id,
+                po_number="PO-FLIP-UNV",
+                vendor_id=vendor_id,
+                total=Decimal("100.00"),
+                currency="USD",
+                status="open",
+                total_unverifiable_reason="unpriceable",
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        resp = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+    assert resp.status_code == 409, resp.text
+
+    async with mk() as s:
+        count = (
+            await s.execute(
+                select(func.count()).select_from(Invoice).where(Invoice.po_number == "PO-FLIP-UNV")
+            )
+        ).scalar_one()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_portal_hides_a_po_the_erp_has_not_issued(realdb):
+    """A draft or unapproved ERP order (decisions §394) has not been sent to
+    the supplier: the portal does not list, show or flip it, and the issued
+    PO beside it is unaffected."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+
+    draft_id, issued_id = uuid.uuid4(), uuid.uuid4()
+    async with mk() as s:
+        for po_id, number, status in (
+            (draft_id, "PO-PORTAL-DRAFT", UNISSUED_PO_STATUS),
+            (issued_id, "PO-PORTAL-ISSUED", "open"),
+        ):
+            s.add(
+                PurchaseOrder(
+                    id=po_id,
+                    po_number=number,
+                    vendor_id=vendor_id,
+                    total=Decimal("100.00"),
+                    currency="USD",
+                    status=status,
+                    organization_id=org_id,
+                )
+            )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        listing = (await client.get("/api/portal/purchase-orders")).json()
+        detail = await client.get(f"/api/portal/purchase-orders/{draft_id}")
+        flip = await client.post(f"/api/portal/purchase-orders/{draft_id}/flip")
+        issued = await client.get(f"/api/portal/purchase-orders/{issued_id}")
+
+    ids = {p["id"] for p in listing["items"]}
+    assert str(draft_id) not in ids and str(issued_id) in ids
+    assert listing["total"] == len(listing["items"])
+    assert detail.status_code == 404
+    assert flip.status_code == 404
+    assert issued.status_code == 200, issued.text
+    async with mk() as s:
+        count = (
+            await s.execute(
+                select(func.count())
+                .select_from(Invoice)
+                .where(Invoice.po_number == "PO-PORTAL-DRAFT")
+            )
+        ).scalar_one()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_portal_po_list_and_detail_withhold_a_total_the_erp_no_longer_vouches_for(realdb):
+    """The supplier saw a marked PO's stale total as its own (decisions §323).
+    List and detail now send `null` for the total and the line money, plus a
+    `total_unverifiable` flag — never the buyer's internal reason code."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+
+    po_id = uuid.uuid4()
+    async with mk() as s:
+        s.add(
+            PurchaseOrder(
+                id=po_id,
+                po_number="PO-PORTAL-UNV",
+                vendor_id=vendor_id,
+                total=Decimal("100.00"),
+                currency="USD",
+                status="open",
+                total_unverifiable_reason="unpriceable",
+                organization_id=org_id,
+            )
+        )
+        s.add(
+            POLineItem(
+                po_id=po_id,
+                description="Widget",
+                quantity=Decimal("2"),
+                unit_price=Decimal("50.00"),
+                total=Decimal("100.00"),
+            )
+        )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        listed = (await client.get("/api/portal/purchase-orders")).json()["items"]
+        detail = (await client.get(f"/api/portal/purchase-orders/{po_id}")).json()
+
+    row = next(p for p in listed if p["id"] == str(po_id))
+    for body in (row, detail):
+        assert body["total"] is None
+        assert body["total_unverifiable"] is True
+        assert "total_unverifiable_reason" not in body
+    line = detail["line_items"][0]
+    assert line["unit_price"] is None and line["total"] is None
+    assert Decimal(str(line["quantity"])) == Decimal("2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dead_status", ["cancelled", "voided", "closed"])
+async def test_po_flip_refuses_a_po_that_no_longer_commits_spend(realdb, dead_status):
+    """A cancelled, voided or closed PO was offered "Create invoice" and the
+    flip minted a payable from it. The flip now refuses with a coded 409, the
+    list and detail carry the same refusal as `flip_verdict` (one gate, issue
+    #575), and nothing is created. `closed` is refused although the matcher
+    accepts it: a flip bills the whole total again (decisions §467)."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+
+    dead_id, open_id = uuid.uuid4(), uuid.uuid4()
+    dead_number = f"PO-DEAD-{dead_status}-{dead_id.hex[:6]}"
+    async with mk() as s:
+        for po_id, number, po_status in (
+            (dead_id, dead_number, dead_status),
+            (open_id, f"PO-LIVE-{open_id.hex[:6]}", "open"),
+        ):
+            s.add(
+                PurchaseOrder(
+                    id=po_id,
+                    po_number=number,
+                    vendor_id=vendor_id,
+                    total=Decimal("100.00"),
+                    currency="USD",
+                    status=po_status,
+                    organization_id=org_id,
+                )
+            )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        listed = (await client.get("/api/portal/purchase-orders")).json()["items"]
+        detail = (await client.get(f"/api/portal/purchase-orders/{dead_id}")).json()
+        flip = await client.post(f"/api/portal/purchase-orders/{dead_id}/flip")
+
+    expected = {
+        "code": "po_not_invoiceable",
+        "message": f"This purchase order is {dead_status} and can no longer be invoiced.",
+        "params": {"status": dead_status},
+    }
+    assert flip.status_code == 409, flip.text
+    assert flip.json()["detail"] == expected
+    by_id = {p["id"]: p for p in listed}
+    assert by_id[str(dead_id)]["flip_verdict"] == expected
+    assert detail["flip_verdict"] == expected
+    assert by_id[str(open_id)]["flip_verdict"] is None
+
+    async with mk() as s:
+        count = (
+            await s.execute(
+                select(func.count()).select_from(Invoice).where(Invoice.po_number == dead_number)
+            )
+        ).scalar_one()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_po_flip_replay_after_the_po_closed_returns_the_flipped_invoice(realdb):
+    """The flip that billed a PO can be what closes it in the ERP. A retry of
+    that flip is a replay, not a new bill: it still gets its invoice back
+    rather than the dead-PO refusal."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+
+    po_id = uuid.uuid4()
+    async with mk() as s:
+        s.add(
+            PurchaseOrder(
+                id=po_id,
+                po_number=f"PO-REPLAY-{po_id.hex[:6]}",
+                vendor_id=vendor_id,
+                total=Decimal("75.00"),
+                currency="USD",
+                status="open",
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        first = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+        assert first.status_code == 202, first.text
+        async with mk() as s:
+            po = (
+                await s.execute(select(PurchaseOrder).where(PurchaseOrder.id == po_id))
+            ).scalar_one()
+            po.status = "closed"
+            await s.commit()
+        replay = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_portal_po_flip_verdict_states_an_unvouched_total(realdb):
+    """The unvouched-total 409 (decisions §323) is the same gate's second
+    refusal, so its row carries it as `flip_verdict` too."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+
+    po_id = uuid.uuid4()
+    async with mk() as s:
+        s.add(
+            PurchaseOrder(
+                id=po_id,
+                po_number=f"PO-UNV-V-{po_id.hex[:6]}",
+                vendor_id=vendor_id,
+                total=Decimal("100.00"),
+                currency="USD",
+                status="open",
+                total_unverifiable_reason="unpriceable",
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        listed = (await client.get("/api/portal/purchase-orders")).json()["items"]
+        flip = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    row = next(p for p in listed if p["id"] == str(po_id))
+    assert row["flip_verdict"]["code"] == "po_total_unverifiable"
+    assert flip.status_code == 409
+    # The endpoint's answer keeps its plain-string detail (clients read it as text).
+    assert flip.json()["detail"] == row["flip_verdict"]["message"]
+
+
+async def _seed_open_po(mk, org_id, vendor_id, *, prefix: str) -> tuple[uuid.UUID, str]:
+    po_id = uuid.uuid4()
+    number = f"{prefix}-{po_id.hex[:6]}"
+    async with mk() as s:
+        s.add(
+            PurchaseOrder(
+                id=po_id,
+                po_number=number,
+                vendor_id=vendor_id,
+                total=Decimal("500.00"),
+                currency="USD",
+                status="open",
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+    return po_id, number
+
+
+async def _seed_citing_invoice(
+    mk,
+    org_id,
+    vendor_id,
+    *,
+    po_number: str | None,
+    status: InvoiceStatus = InvoiceStatus.ready_for_review,
+    split_po_ids: list[str] | None = None,
+) -> None:
+    async with mk() as s:
+        s.add(
+            Invoice(
+                invoice_number=f"INV-{uuid.uuid4().hex[:8]}",
+                vendor_name="Acme",
+                vendor_id=vendor_id,
+                amount=Decimal("500.00"),
+                currency="USD",
+                status=status,
+                po_number=po_number,
+                split_po_ids=split_po_ids,
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+
+
+async def _invoices_citing(mk, number: str) -> int:
+    async with mk() as s:
+        return (
+            await s.execute(
+                select(func.count()).select_from(Invoice).where(Invoice.po_number == number)
+            )
+        ).scalar_one()
+
+
+_ALREADY_INVOICED = {
+    "code": "po_already_invoiced",
+    "message": "You have already invoiced this purchase order. "
+    "Submit an invoice for any remaining amount instead.",
+    "params": {},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "live_status",
+    [InvoiceStatus.ready_for_review, InvoiceStatus.approved, InvoiceStatus.paid],
+)
+async def test_po_flip_refuses_an_open_po_this_vendor_already_invoiced(realdb, live_status):
+    """An open PO the supplier billed through a normal submit (or AP keyed)
+    before the ERP closed it: the flip minted a SECOND invoice for the whole
+    total, under an empty number the duplicate detector cannot match. It now
+    refuses with a coded 409, the list and detail say so as `flip_verdict`,
+    and nothing is created (decisions §468)."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    po_id, number = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-BILLED")
+    await _seed_citing_invoice(mk, org_id, vendor_id, po_number=number, status=live_status)
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        listed = (await client.get("/api/portal/purchase-orders")).json()["items"]
+        detail = (await client.get(f"/api/portal/purchase-orders/{po_id}")).json()
+        flip = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    assert flip.status_code == 409, flip.text
+    assert flip.json()["detail"] == _ALREADY_INVOICED
+    row = next(p for p in listed if p["id"] == str(po_id))
+    assert row["flip_verdict"] == _ALREADY_INVOICED
+    assert detail["flip_verdict"] == _ALREADY_INVOICED
+    assert await _invoices_citing(mk, number) == 1
+
+
+@pytest.mark.asyncio
+async def test_po_flip_refuses_a_po_billed_as_a_split_leg(realdb):
+    """A multi-PO split cites its legs by id (`split_po_ids`), not by the
+    combined number, so a leg it billed is already invoiced too."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    po_id, number = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-LEG")
+    await _seed_citing_invoice(
+        mk,
+        org_id,
+        vendor_id,
+        po_number=f"{number},PO-OTHER",
+        split_po_ids=[str(po_id), str(uuid.uuid4())],
+    )
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        flip = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    assert flip.status_code == 409, flip.text
+    assert flip.json()["detail"]["code"] == "po_already_invoiced"
+    assert await _invoices_citing(mk, number) == 0
+
+
+@pytest.mark.asyncio
+async def test_po_flip_is_not_blocked_by_a_rejected_or_foreign_invoice(realdb):
+    """A rejected invoice bills nothing, so the supplier told to re-bill can
+    still flip. Another vendor's invoice citing the same number is not this
+    supplier's billing, and the verdict must reveal nothing about it."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    other_vendor_id, _ = await _seed_vendor_and_user(mk, org_id, name="Other Supply")
+    po_id, number = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-FREE")
+    await _seed_citing_invoice(
+        mk, org_id, vendor_id, po_number=number, status=InvoiceStatus.rejected
+    )
+    await _seed_citing_invoice(mk, org_id, other_vendor_id, po_number=number)
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        listed = (await client.get("/api/portal/purchase-orders")).json()["items"]
+        flip = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    row = next(p for p in listed if p["id"] == str(po_id))
+    assert row["flip_verdict"] is None
+    assert flip.status_code == 202, flip.text
+
+
+@pytest.mark.asyncio
+async def test_a_flipped_po_reads_as_invoiced_but_its_replay_returns_the_invoice(realdb):
+    """Once flipped, the PO's own invoice cites it: the row stops offering
+    "Create invoice", yet a retry of that flip is still a replay that gets its
+    invoice back rather than the already-invoiced refusal."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    po_id, number = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-SELF")
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        first = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+        assert first.status_code == 202, first.text
+        detail = (await client.get(f"/api/portal/purchase-orders/{po_id}")).json()
+        replay = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    assert detail["flip_verdict"] == _ALREADY_INVOICED
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert await _invoices_citing(mk, number) == 1
+
+
+async def _set_invoice_status(mk, invoice_id: str, status: InvoiceStatus) -> None:
+    async with mk() as s:
+        inv = await s.get(Invoice, uuid.UUID(invoice_id))
+        inv.status = status
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_flip_still_reads_as_invoiced_and_its_reopen_mints_nothing(realdb):
+    """The PO's own flip, once rejected, still counts as invoiced (decisions
+    §469). Its `po-flip:<po_id>` marker is unique in every status, so
+    the endpoint replays the rejected invoice rather than mint a second, and
+    the row must not offer a creation it never performs. A rejected flip is
+    reopened instead, after which it is the one live bill on the PO."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    po_id, number = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-REJ")
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        first = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+        assert first.status_code == 202, first.text
+        flipped_id = first.json()["id"]
+
+        await _set_invoice_status(mk, flipped_id, InvoiceStatus.rejected)
+        rejected_detail = (await client.get(f"/api/portal/purchase-orders/{po_id}")).json()
+        rejected_replay = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+        await _set_invoice_status(mk, flipped_id, InvoiceStatus.new)
+        reopened_detail = (await client.get(f"/api/portal/purchase-orders/{po_id}")).json()
+        reopened_replay = await client.post(f"/api/portal/purchase-orders/{po_id}/flip")
+
+    assert rejected_detail["flip_verdict"] == _ALREADY_INVOICED
+    assert rejected_replay.status_code == 202, rejected_replay.text
+    assert rejected_replay.json()["id"] == flipped_id
+    assert rejected_replay.json()["status"] == "rejected"
+    assert reopened_detail["flip_verdict"] == _ALREADY_INVOICED
+    assert reopened_replay.json()["id"] == flipped_id
+    assert await _invoices_citing(mk, number) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_flip_edited_to_cite_another_po_does_not_invoice_it(realdb):
+    """A rejected flip counts as invoiced for its OWN PO only (its
+    `po-flip:<po_id>` marker). Re-pointed at another PO's number while
+    rejected, it bills nothing there, so that PO can still be flipped."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, vu_id = await _seed_vendor_and_user(mk, org_id)
+    po_a, _ = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-EDA")
+    po_b, number_b = await _seed_open_po(mk, org_id, vendor_id, prefix="PO-EDB")
+
+    async with _portal_client(realdb, vu_id, vendor_id) as client:
+        first = await client.post(f"/api/portal/purchase-orders/{po_a}/flip")
+        assert first.status_code == 202, first.text
+        flipped_id = first.json()["id"]
+        async with mk() as s:
+            inv = await s.get(Invoice, uuid.UUID(flipped_id))
+            inv.po_number = number_b
+            inv.status = InvoiceStatus.rejected
+            await s.commit()
+        other_detail = (await client.get(f"/api/portal/purchase-orders/{po_b}")).json()
+
+    assert other_detail["flip_verdict"] is None

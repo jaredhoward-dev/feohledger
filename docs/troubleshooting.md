@@ -43,11 +43,11 @@ recreated — as the SvelteKit build does to `frontend/build` — the container 
 the orphaned, emptied original, so every file is missing, and runc refuses
 `docker exec` because the container's working directory (`/srv`) is outside the
 mount namespace. This was the v0.1.0 outage (#579), when Caddy mounted
-`frontend/build` directly; Caddy now mounts `deploy/www/`, which is never
-replaced, and serves the release its `current` symlink names
-(`deploy/README.md` § How the SPA is served, `docs/decisions.md` §277). Seeing it
-again means something replaced `deploy/www/` itself or Caddy is back on a
-directory that gets rebuilt.
+`frontend/build` directly. §277 moved Caddy onto a stable `deploy/www/`, and
+since `docs/decisions.md` §364 the VM serves no SPA at all: the pages are S3 +
+CloudFront, and Caddy mounts no site directory. On the VM this can only come
+back by rolling back to a pre-§364 commit; on CloudFront, see
+`deploy/README.md` § Frontend rollback.
 
 **Recovery** (on the VM; starting the container again re-resolves its bind
 mounts by path):
@@ -55,9 +55,6 @@ mounts by path):
 ```bash
 docker restart feoh-prod-caddy-1
 ```
-
-If `www/current` is missing or points at a bad build, roll the SPA back from
-`deploy/` first: `ln -sfn "$(readlink www/previous)" www/current.new && mv -T www/current.new www/current`.
 
 **A related, quieter case:** a Caddyfile or `tenants.caddy` change that "reloads
 fine" but changes nothing — a single-file mount keeps a file replaced by rename
@@ -175,6 +172,53 @@ docker compose up -d
 python scripts/seed.py
 ```
 
-If you see connection errors, wait a few seconds for PostgreSQL to finish starting, then retry.
+If you see connection errors, wait for Postgres to report healthy (`docker compose up -d --wait`, or `docker compose ps` showing `healthy`), then retry.
+
+### `the database system is shutting down` on a fresh volume
+
+The first boot after `down -v` (or a new CI runner) runs a temporary
+socket-only Postgres for initdb and `init-tenants.sql`, then restarts it. A
+healthcheck that runs `pg_isready` over the socket reports that temporary
+server as ready, and the first client lands on its shutdown. Every Postgres
+healthcheck in the repo therefore probes over TCP (`pg_isready -U postgres -h
+127.0.0.1`; `backend/docs/docker.md` § Health Checks). If you see this error,
+check that the healthcheck you are relying on still has `-h 127.0.0.1` — a copy
+without it fails `backend/tests/test_postgres_healthchecks.py`.
 
 The seed script creates tenant databases (`feoh_acme`, `feoh_techflow`) automatically if they don't exist. If Docker was reset with `down -v`, the init SQL re-creates them on startup as well.
+
+## A QuickBooks Online tenant still posts on its pre-0115 links (local dev)
+
+Since decisions §284, migration `0115_erp_link_realm` never writes
+`settings.erp.legacy_link_realm` for a QuickBooks Online org, so its pre-0115
+links are refused until the first chart and vendor sync re-judge them. An
+earlier version of 0115 on the `fix/erp-qbo-live-test` branch did write it, and
+a re-run never removes a key already present. A local database that ran that
+version keeps trusting those links. Either downgrade to `0114_gl_code_width`
+and upgrade again (this drops every link's realm stamp too, so re-sync after),
+or delete the key:
+
+```sql
+UPDATE organizations SET settings = settings #- '{erp,legacy_link_realm}'
+WHERE settings->'erp'->>'type' = 'quickbooks_online'
+  AND coalesce(settings->'erp'->>'integration_method', 'merge_dev') <> 'merge_dev';
+```
+
+## Invoices on a legacy PO say "the PO records no currency", and the agents escalate them
+
+The PO has a NULL `purchase_orders.currency` — it predates migration 0099 with
+no requisition behind it, came from a contract, or came from an ERP that states
+no code (decisions §197). The matcher compares it at face value and says so,
+and `amount_mismatch_v1` / `missing_po_v1` / `multi_po_split_v1` escalate
+rather than make a currency claim nobody recorded. No PO edit route exists, so
+if an ERP re-sync cannot supply the code, an operator who knows it asserts it:
+
+```bash
+cd backend
+python scripts/backfill_po_currency.py --tenant <slug> --currency USD            # dry run
+python scripts/backfill_po_currency.py --tenant <slug> --currency USD --apply
+```
+
+Narrow the set with `--entity`, `--po-prefix` or `--created-before`; only NULL
+rows are written, and the unpaid invoices citing them are re-matched in the same
+run. Details: `backend/docs/po-matching.md` § A PO that records no currency.

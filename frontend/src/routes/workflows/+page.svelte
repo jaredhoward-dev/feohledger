@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { WorkflowDefinition } from '#lib/types/workflow.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { STEP_TYPE_LABELS } from '#lib/types/workflow.ts';
 	import type { WorkflowStepType } from '#lib/types/workflow.ts';
 	import { workflowStore } from '#lib/stores/workflows.svelte.ts';
@@ -15,10 +16,12 @@
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
@@ -89,6 +92,16 @@
 		workflowStore.fetch().catch(() => {});
 	});
 
+	// The store re-throws; nothing else catches a Load more, so a failure was an
+	// unhandled rejection and the button simply re-enabled with no word said.
+	async function loadMore() {
+		try {
+			await workflowStore.loadMore();
+		} catch {
+			toast(m('workflows.list.loadMoreFailed'), 'error');
+		}
+	}
+
 	let selectableIds = $derived(
 		workflowStore.all.filter((w) => !w.is_default).map((w) => w.id)
 	);
@@ -145,7 +158,7 @@
 				);
 			}
 		} catch (e) {
-			toast(e instanceof Error ? e.message : m('workflows.list.bulkDeleteFailed'), 'error');
+			toast(errorMessage(e, m('workflows.list.bulkDeleteFailed')), 'error');
 		} finally {
 			bulkDeleting = false;
 		}
@@ -210,7 +223,7 @@
 			newDescription = '';
 			window.location.href = `/workflows/${created.id}`;
 		} catch (e: unknown) {
-			toast(e instanceof Error ? e.message : m('workflows.list.createFailed'), 'error');
+			toast(errorMessage(e, m('workflows.list.createFailed')), 'error');
 		} finally {
 			creating = false;
 		}
@@ -222,7 +235,7 @@
 			await workflowStore.remove(wf.id);
 			toast(m('workflows.list.deleted'), 'success');
 		} catch (e: unknown) {
-			toast(e instanceof Error ? e.message : m('workflows.list.deleteFailed'), 'error');
+			toast(errorMessage(e, m('workflows.list.deleteFailed')), 'error');
 		}
 	}
 </script>
@@ -253,19 +266,25 @@
 		{/snippet}
 	</BulkBar>
 
-	<!-- Three states, not two. The mount effect swallows the load rejection (the
-	     store's `errored` flag is what the UI renders — a flag the store did NOT
-	     have until now), so a 500 left this page asserting "No workflows
-	     configured." with no toast and no retry, on the screen that decides
-	     whether invoices get routed for approval at all. -->
+	<!-- Four states. The mount effect swallows the load rejection (the store's
+	     `errored` flag is what the UI renders), so a 500 once left this page
+	     asserting "No workflows configured." — on the screen that decides whether
+	     invoices get routed for approval at all. A failed FIRST page now says so
+	     in place with a Retry; a failed Load more keeps the rows it has and toasts. -->
+	{#if workflowStore.errored && workflowStore.all.length === 0 && !workflowStore.loading}
+		<LoadError
+			message={m('workflows.list.loadFailed')}
+			onretry={() => workflowStore.fetch().catch(() => {})}
+			testId="workflows-load-error"
+		/>
+	{:else}
+	<div class="wf-table">
 	<DataTable
 		isEmpty={workflowStore.all.length === 0}
-		empty={workflowStore.loading
-			? m('common.loading')
-			: workflowStore.errored
-				? m('common.loadFailed')
-				: m('workflows.list.empty')}
+		loading={workflowStore.loading}
+		empty={m('workflows.list.empty')}
 		colspan={6}
+		fixed
 	>
 		{#snippet header()}
 			<tr>
@@ -279,9 +298,9 @@
 				</th>
 				<th>{m('workflows.list.col.name')}</th>
 				<th>{m('workflows.list.col.steps')}</th>
-				<th>{m('workflows.list.col.status')}</th>
-				<th>{m('workflows.list.col.created')}</th>
-				<th></th>
+				<th class="col-status">{m('workflows.list.col.status')}</th>
+				<th class="col-created">{m('workflows.list.col.created')}</th>
+				<th class="col-actions"></th>
 			</tr>
 		{/snippet}
 		{#snippet body()}
@@ -338,23 +357,18 @@
 			{/each}
 		{/snippet}
 	</DataTable>
-
-	{#if workflowStore.hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={() => workflowStore.loadMore()} disabled={workflowStore.loading}>
-				{workflowStore.loading
-					? m('common.loading')
-					: m('workflows.list.loadMore', {
-							shown: workflowStore.all.length,
-							total: workflowStore.total,
-						})}
-			</button>
-		</div>
-	{:else if workflowStore.total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('workflows.list.showingAll', { n: workflowStore.total })}</span>
-		</div>
+	</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={workflowStore.all.length}
+		total={workflowStore.total}
+		hasMore={workflowStore.hasMore}
+		loading={workflowStore.loading}
+		onloadmore={loadMore}
+		moreKey="workflows.list.loadMore"
+		allKey="workflows.list.showingAll"
+	/>
 </PageHeader>
 
 <Modal
@@ -445,6 +459,22 @@
 		color: var(--accent);
 	}
 
+	/* Column widths for the `fixed` list: under `table-layout: auto` the
+	   columns were sized against the "Loading…" row and re-sized against the
+	   real rows, sliding sideways as the workflows landed. Status, Created and
+	   the four row actions get widths sized to their widest content in any
+	   locale (the actions to de "Versionen" + "Simulieren" + "Exportieren" +
+	   "Löschen", and ja, on one line); Name and Steps share the rest, and the
+	   `min-width` keeps them readable — past it the table scrolls inside its
+	   region (frontend/docs/ui-patterns.md § Data tables). */
+	.wf-table {
+		min-width: 0;
+	}
+	.wf-table :global(table) { min-width: 1160px; }
+	.col-status { width: 120px; }
+	.col-created { width: 130px; }
+	.col-actions { width: 430px; }
+
 	.checkbox-col {
 		width: 36px;
 		text-align: center;
@@ -503,19 +533,19 @@
 	}
 
 	.status-dot.active::before {
-		background: #1fa86a;
+		background: var(--success);
 	}
 
 	.status-dot.inactive::before {
-		background: #999;
+		background: var(--text-muted);
 	}
 
 	.status-dot.active {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	.status-dot.inactive {
-		color: #999;
+		color: var(--text-muted);
 	}
 
 	/* Create-workflow modal: custom h3 heading + labelled form fields. */
@@ -569,7 +599,7 @@
 	.form-group input:focus,
 	.form-group textarea:focus {
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	.form-group textarea {

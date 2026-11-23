@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { focusTrap } from '#lib/actions/focusTrap.ts';
 	import { api } from '#lib/api.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
+	import Modal from '#lib/components/ui/Modal.svelte';
+	import { m } from '#lib/i18n/store.svelte.ts';
 
 	interface Props {
 		onclose: () => void;
@@ -10,16 +11,6 @@
 	}
 
 	let { onclose, onapplied }: Props = $props();
-
-	// Freeze background page scroll while the dialog is open (restored on close),
-	// so a wheel event over the backdrop can't bleed through to the list behind it.
-	$effect(() => {
-		const prev = document.body.style.overflow;
-		document.body.style.overflow = 'hidden';
-		return () => {
-			document.body.style.overflow = prev;
-		};
-	});
 
 	interface RecodeChange {
 		invoice_id: string;
@@ -66,7 +57,7 @@
 			if (to_date) body.to_date = to_date;
 			preview = await api.post<RecodeReport>('/api/invoices/bulk-recode-gl', body);
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Preview failed', 'error');
+			toast(err instanceof Error ? err.message : m('invoices.bulkRecode.previewFailed'), 'error');
 		} finally {
 			busy = false;
 		}
@@ -76,12 +67,18 @@
 		const priorChanges = p.changes.length;
 		const aiCandidates = p.ai_candidates;
 		if (aiCandidates > 0 && priorChanges > 0) {
-			return `Apply ${priorChanges} + run AI on ${aiCandidates}`;
+			return m('invoices.bulkRecode.applyBoth', { changes: priorChanges, ai: aiCandidates });
 		}
 		if (aiCandidates > 0) {
-			return `Run AI on ${aiCandidates} invoice(s)`;
+			return m('invoices.bulkRecode.applyAi', { n: aiCandidates });
 		}
-		return `Apply ${priorChanges} change(s)`;
+		return m('invoices.bulkRecode.applyPriors', { n: priorChanges });
+	}
+
+	function sourceLabel(source: RecodeChange['source']): string {
+		return source === 'ai'
+			? m('invoices.bulkRecode.source.ai')
+			: m('invoices.bulkRecode.source.vendorPrior');
 	}
 
 	async function applyChanges() {
@@ -95,189 +92,149 @@
 			if (from_date) body.from_date = from_date;
 			if (to_date) body.to_date = to_date;
 			const report = await api.post<RecodeReport>('/api/invoices/bulk-recode-gl', body);
-			toast(`Re-coded ${report.applied ?? 0} invoice(s)`, 'success');
+			toast(m('invoices.bulkRecode.applied', { n: report.applied ?? 0 }), 'success');
 			onapplied?.();
 			onclose();
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Apply failed', 'error');
+			toast(err instanceof Error ? err.message : m('invoices.bulkRecode.applyFailed'), 'error');
 		} finally {
 			busy = false;
 		}
 	}
-
-	// Esc + focus trap/restore are handled by the shared `focusTrap` action.
 </script>
 
-<div
-	class="backdrop"
-	role="presentation"
-	onclick={(e) => {
-		if (e.target === e.currentTarget) onclose();
-	}}
->
-	<div use:focusTrap={{ onEscape: onclose }} class="modal" role="dialog" aria-label="Bulk re-code GL" tabindex="-1">
+<!-- The shell (backdrop, focus trap, Esc / backdrop-click close, page-scroll
+     lock, background inert) is the shared Modal's; this file owns the body. -->
+<Modal ariaLabel={m('invoices.bulkRecode.dialogLabel')} width="lg" {onclose}>
+	{#snippet header()}
 		<header class="modal-header">
 			<div class="help-row">
-				<h2>Bulk Re-code GL Codes</h2>
+				<h2>{m('invoices.bulkRecode.title')}</h2>
 				<HelpTip term="gl-coding" />
 			</div>
-			<button class="close-btn" onclick={onclose} aria-label="Close">&times;</button>
+			<button type="button" class="btn-icon" onclick={onclose} aria-label={m('invoices.bulkRecode.close')}>&times;</button>
 		</header>
+	{/snippet}
 
-		<div class="modal-body">
-			<p class="intro">
-				Re-applies cached vendor GL corrections to invoices in the selected scope.
-				Posted, paid, and in-flight invoices are skipped automatically.
-			</p>
+	<div class="modal-body">
+		<p class="intro">{m('invoices.bulkRecode.intro')}</p>
 
-			<div class="filters">
-				<label>
-					From
-					<input type="date" bind:value={from_date} disabled={busy} />
-				</label>
-				<label>
-					To
-					<input type="date" bind:value={to_date} disabled={busy} />
-				</label>
-			</div>
-
-			<label class="ai-toggle">
-				<input type="checkbox" bind:checked={include_ai_fallback} disabled={busy} />
-				Include AI fallback for invoices with no learned GL code
-				<span class="ai-warning">(billed per invoice)</span>
+		<div class="filters">
+			<label>
+				{m('invoices.bulkRecode.from')}
+				<input type="date" bind:value={from_date} disabled={busy} />
 			</label>
+			<label>
+				{m('invoices.bulkRecode.to')}
+				<input type="date" bind:value={to_date} disabled={busy} />
+			</label>
+		</div>
 
-			{#if !preview}
+		<label class="ai-toggle">
+			<input type="checkbox" bind:checked={include_ai_fallback} disabled={busy} />
+			{m('invoices.bulkRecode.aiToggle')}
+			<span class="ai-warning">{m('invoices.bulkRecode.aiBilled')}</span>
+		</label>
+
+		{#if !preview}
+			<div class="actions">
+				<button class="btn-cancel" onclick={onclose} disabled={busy}>{m('common.cancel')}</button>
+				<button class="btn-primary" onclick={runDryRun} disabled={busy}>
+					{busy ? m('invoices.bulkRecode.previewing') : m('invoices.bulkRecode.preview')}
+				</button>
+			</div>
+		{:else}
+			<div class="report">
+				<dl class="summary">
+					<dt>{m('invoices.bulkRecode.summary.matched')}</dt>
+					<dd>{preview.matched}</dd>
+					<dt>{m('invoices.bulkRecode.summary.wouldChange')}</dt>
+					<dd class="emph">{preview.would_change ?? preview.applied ?? 0}</dd>
+					<dt>{m('invoices.bulkRecode.summary.fromPriors')}</dt>
+					<dd>{preview.by_source.vendor_prior}</dd>
+					{#if include_ai_fallback}
+						<dt>{m('invoices.bulkRecode.summary.aiCandidates')}</dt>
+						<dd>
+							{preview.ai_candidates}
+							<span class="hint">{m('invoices.bulkRecode.summary.aiHint')}</span>
+						</dd>
+					{/if}
+					<dt>{m('invoices.bulkRecode.summary.skippedNoChange')}</dt>
+					<dd>{preview.skipped.no_change}</dd>
+					<dt>{m('invoices.bulkRecode.summary.skippedImmutable')}</dt>
+					<dd>{preview.skipped.immutable_status}</dd>
+					<dt>{m('invoices.bulkRecode.summary.skippedNoPrior')}</dt>
+					<dd>{preview.skipped.no_prior_no_ai}</dd>
+				</dl>
+
+				{#if preview.changes.length > 0}
+					<h3>{m('invoices.bulkRecode.changes', { n: preview.changes.length })}</h3>
+					<div class="changes">
+						<table>
+							<thead>
+								<tr>
+									<th>{m('invoices.bulkRecode.col.invoice')}</th>
+									<th>{m('invoices.bulkRecode.col.vendor')}</th>
+									<th>{m('invoices.bulkRecode.col.old')}</th>
+									<th>{m('invoices.bulkRecode.col.new')}</th>
+									<th>{m('invoices.bulkRecode.col.source')}</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each preview.changes.slice(0, 20) as c (c.invoice_id)}
+									<tr>
+										<td class="mono">{c.invoice_number}</td>
+										<td>{c.vendor_name}</td>
+										<td class="mono muted">{c.old_gl ?? '—'}</td>
+										<td class="mono">{c.new_gl}</td>
+										<td><span class="src src-{c.source}">{sourceLabel(c.source)}</span></td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+						{#if preview.changes.length > 20}
+							<div class="more">{m('invoices.bulkRecode.more', { n: preview.changes.length - 20 })}</div>
+						{/if}
+					</div>
+				{:else}
+					<div class="empty">{m('invoices.bulkRecode.empty')}</div>
+				{/if}
+
 				<div class="actions">
-					<button class="btn-cancel" onclick={onclose} disabled={busy}>Cancel</button>
-					<button class="btn-primary" onclick={runDryRun} disabled={busy}>
-						{busy ? 'Previewing…' : 'Preview Changes'}
+					<button class="btn-cancel" onclick={() => (preview = null)} disabled={busy}>
+						{m('invoices.bulkRecode.editFilters')}
+					</button>
+					<button
+						class="btn-primary"
+						onclick={applyChanges}
+						disabled={busy || (preview.changes.length === 0 && preview.ai_candidates === 0)}
+					>
+						{busy ? m('invoices.bulkRecode.applying') : applyButtonLabel(preview)}
 					</button>
 				</div>
-			{:else}
-				<div class="report">
-					<dl class="summary">
-						<dt>Matched</dt>
-						<dd>{preview.matched}</dd>
-						<dt>Would change</dt>
-						<dd class="emph">{preview.would_change ?? preview.applied ?? 0}</dd>
-						<dt>From cached priors</dt>
-						<dd>{preview.by_source.vendor_prior}</dd>
-						{#if include_ai_fallback}
-							<dt>AI candidates</dt>
-							<dd>
-								{preview.ai_candidates}
-								<span class="hint">(would re-extract on apply)</span>
-							</dd>
-						{/if}
-						<dt>Skipped (already coded)</dt>
-						<dd>{preview.skipped.no_change}</dd>
-						<dt>Skipped (immutable status)</dt>
-						<dd>{preview.skipped.immutable_status}</dd>
-						<dt>Skipped (no learned code)</dt>
-						<dd>{preview.skipped.no_prior_no_ai}</dd>
-					</dl>
-
-					{#if preview.changes.length > 0}
-						<h3>Changes ({preview.changes.length})</h3>
-						<div class="changes">
-							<table>
-								<thead>
-									<tr>
-										<th>Invoice</th>
-										<th>Vendor</th>
-										<th>Old</th>
-										<th>New</th>
-										<th>Source</th>
-									</tr>
-								</thead>
-								<tbody>
-									{#each preview.changes.slice(0, 20) as c (c.invoice_id)}
-										<tr>
-											<td class="mono">{c.invoice_number}</td>
-											<td>{c.vendor_name}</td>
-											<td class="mono muted">{c.old_gl ?? '—'}</td>
-											<td class="mono">{c.new_gl}</td>
-											<td><span class="src src-{c.source}">{c.source}</span></td>
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-							{#if preview.changes.length > 20}
-								<div class="more">…and {preview.changes.length - 20} more</div>
-							{/if}
-						</div>
-					{:else}
-						<div class="empty">No changes would land in this scope.</div>
-					{/if}
-
-					<div class="actions">
-						<button class="btn-cancel" onclick={() => (preview = null)} disabled={busy}>
-							Edit filters
-						</button>
-						<button
-							class="btn-primary"
-							onclick={applyChanges}
-							disabled={busy || (preview.changes.length === 0 && preview.ai_candidates === 0)}
-						>
-							{busy ? 'Applying…' : applyButtonLabel(preview)}
-						</button>
-					</div>
-				</div>
-			{/if}
-		</div>
+			</div>
+		{/if}
 	</div>
-</div>
+</Modal>
 
 <style>
-	.backdrop {
-		position: fixed;
-		inset: 0;
-		background: rgba(0, 0, 0, 0.5);
-		display: grid;
-		place-items: center;
-		z-index: 100;
-		backdrop-filter: blur(2px);
-	}
-
-	.modal {
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		width: min(720px, 95vw);
-		max-height: 90vh;
-		display: flex;
-		flex-direction: column;
-		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
-	}
-
 	.modal-header {
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
-		padding: 16px 20px;
+		gap: 12px;
+		padding-bottom: 16px;
 		border-bottom: 1px solid var(--border);
 	}
 
-	.modal h2 {
+	.help-row h2 {
 		margin: 0;
 		font-size: 1.1rem;
 		font-weight: 600;
 	}
-	.close-btn {
-		background: none;
-		border: none;
-		font-size: 1.5rem;
-		cursor: pointer;
-		color: var(--text-muted);
-		line-height: 1;
-		padding: 0 4px;
-	}
 
 	.modal-body {
-		padding: 20px;
-		overflow-y: auto;
-		flex: 1;
+		padding-top: 20px;
 		display: flex;
 		flex-direction: column;
 		gap: 16px;
@@ -332,32 +289,6 @@
 		margin-top: 8px;
 	}
 
-	.btn-cancel,
-	.btn-primary {
-		padding: 8px 16px;
-		border-radius: 6px;
-		font-family: inherit;
-		font-size: 0.85rem;
-		cursor: pointer;
-		border: 1px solid var(--border);
-	}
-
-	.btn-cancel {
-		background: var(--surface);
-		color: var(--text);
-	}
-
-	.btn-primary {
-		background: var(--accent-strong);
-		color: white;
-		border-color: var(--accent-strong);
-	}
-
-	.btn-primary:disabled,
-	.btn-cancel:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
 	.summary {
 		display: grid;
 		grid-template-columns: max-content 1fr;
@@ -451,8 +382,8 @@
 	}
 
 	.src-vendor_prior {
-		background: rgba(31, 168, 106, 0.15);
-		color: #1fa86a;
+		background: color-mix(in srgb, var(--success) 15%, transparent);
+		color: var(--success);
 	}
 
 	.src-ai {

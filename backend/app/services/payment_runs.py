@@ -16,6 +16,7 @@ It also never executes a run; every path here lands ``status="draft"``.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
@@ -32,7 +33,7 @@ from app.models.credit_memo import CreditMemo
 from app.models.exception import Exception as InvoiceException
 from app.models.invoice import Invoice
 from app.models.organization import Organization
-from app.models.payment import Payment, PaymentRun
+from app.models.payment import LIVE_PAYMENT_TERMINAL_STATUSES, Payment, PaymentRun
 from app.models.user import User
 from app.services.applied_credit_integrity import applied_credit_conflicts
 from app.services.currency_conversion import (
@@ -61,12 +62,12 @@ logger = logging.getLogger(__name__)
 # derivation: a `pending` payment is one nothing has attempted yet, which is
 # the normal state of a `draft` run and the resumable state of a crashed one.
 RUN_PAYMENT_COMPLETED_STATUSES = ("completed",)
-# `voided` belongs here too: it is a non-success TERMINAL state (grouped with
-# `failed` / `cancelled` in `api/payments.LIVE_PAYMENT_TERMINAL_STATUSES`), and
-# a payment a human reversed after the fact must pull the run off "completed"
+# `voided` belongs here too: it is a non-success TERMINAL state — this bucket IS
+# `models/payment.LIVE_PAYMENT_TERMINAL_STATUSES`, not a copy of it — and a
+# payment a human reversed after the fact must pull the run off "completed"
 # exactly as a `cancelled` one does. Leaving it out made a run of all-voided
 # payments fall through to `completed` with `payments_completed: 0`.
-RUN_PAYMENT_FAILED_STATUSES = ("failed", "cancelled", "voided")
+RUN_PAYMENT_FAILED_STATUSES = LIVE_PAYMENT_TERMINAL_STATUSES
 RUN_PAYMENT_IN_FLIGHT_STATUSES = ("submitted", "processing", "pending_compliance")
 RUN_PAYMENT_PENDING_STATUSES = ("pending",)
 
@@ -332,6 +333,10 @@ _RETRY_SAFE_FAILURE_PREFIXES = (
     # merged away) after the run was built — refused before the adapter call,
     # and `/retry-failed` re-checks it.
     "vendor_not_active:",
+    # The invoice's currency was blanked after the run was built
+    # (`dispatch_preflight`) — refused before the adapter call, and
+    # `/retry-failed` re-checks it.
+    "currency_unknown",
     # A live virtual card claimed the invoice after the run was built —
     # refused before the adapter call, and `/retry-failed` re-checks it.
     "invoice_has_live_card",
@@ -339,6 +344,18 @@ _RETRY_SAFE_FAILURE_PREFIXES = (
     # pays (`card_issuance.card_settlement_block`) — refused before anything
     # moved; a re-send after the card is cancelled mints one at the right figure.
     "card_limit_exceeds_payment",
+    # The live read of the invoice's ERP bill, immediately before the rail
+    # (decisions §296): the ERP shows it paid / part-paid / deleted
+    # (`erp_bill_not_open:<state>`, with a blocking exception that keeps
+    # `/retry-failed` skipping until a person clears it), or the read failed
+    # and the item was held rather than paid blind (`erp_bill_unverified`,
+    # which `/retry-failed` simply re-checks), or only our own write-back paid
+    # it and its QuickBooks void is still pending (`erp_bill_void_pending`).
+    # All before any rail call.
+    "erp_bill_not_open:",
+    "erp_bill_unverified",
+    "erp_bill_void_pending",
+    "erp_bill_unlinked:",
     # Another request held the invoice row lock past
     # `settings.payment_invoice_lock_timeout_ms`. `_lock_payment_invoice` is the
     # first thing dispatch does, so this is refused before any processor call.
@@ -357,7 +374,12 @@ _RETRY_SAFE_FAILURE_SUFFIXES = (
 )
 
 
-def classify_payment_failure(*, failure_reason: str | None, provider_payment_id: str | None) -> str:
+def classify_payment_failure(
+    *,
+    failure_reason: str | None,
+    provider_payment_id: str | None,
+    dispatch_attempted: bool = False,
+) -> str:
     """Is this failed payment safe to re-attempt under a fresh idempotency key?
 
     Returns ``RETRY_SAFE`` only when we can prove no order was created at the
@@ -367,8 +389,18 @@ def classify_payment_failure(*, failure_reason: str | None, provider_payment_id:
     adapter here returns a handle only from a create call that SUCCEEDED, so
     holding one means an order exists over there and its true outcome has to be
     reconciled (or the payment voided) by a human before any re-send.
+
+    ``dispatch_attempted`` (the row still carries `Payment.dispatch_attempted_at`)
+    outranks it too: an earlier dispatch pass may have called the processor and
+    crashed before recording what it heard back. The reason on the row is then
+    from a LATER pass — a `/resume` that refused before its own adapter call —
+    and says nothing about the order the crashed pass may have created. The
+    reason classes only the pass that wrote it; the marker covers the one that
+    could not (migration 0124; `backend/docs/payments.md` § A dispatch attempt
+    is marked, durably, before it starts).
+    Production callers go through `is_retry_safe`, which always passes it.
     """
-    if provider_payment_id:
+    if provider_payment_id or dispatch_attempted:
         return IN_DOUBT
     reason = (failure_reason or "").strip()
     if not reason:
@@ -386,15 +418,25 @@ def is_retry_safe(payment: Payment) -> bool:
         classify_payment_failure(
             failure_reason=payment.failure_reason,
             provider_payment_id=payment.provider_payment_id,
+            dispatch_attempted=payment.dispatch_attempted_at is not None,
         )
         == RETRY_SAFE
     )
 
 
 async def blocking_exception_types(
-    db: AsyncSession, invoice_ids: list[uuid.UUID]
+    db: AsyncSession,
+    invoice_ids: list[uuid.UUID],
+    *,
+    types: tuple[str, ...] | None = None,
+    exclude_exception_ids: frozenset[uuid.UUID] = frozenset(),
 ) -> dict[uuid.UUID, str]:
     """Map each blocked invoice id → the TYPE of exception blocking it.
+
+    ``types`` narrows the question to a subset — the ERP push passes
+    ``services/payment_gates.ERP_EXPORT_BLOCKING_EXCEPTION_TYPES`` (decisions §286) — so
+    "which flags are still live" stays one predicate however many gates ask it.
+    Precedence is the order of whichever tuple is in force.
 
     The single definition of "is this invoice payable right now", shared by
     `blocked_invoice_ids` (which only needs the ids) and by the payment queue
@@ -411,18 +453,23 @@ async def blocking_exception_types(
     rendered to an operator and travels through a JSON body, and a description
     can carry vendor / bank / amount detail.
     """
-    from app.api.payments import PAYMENT_BLOCKING_EXCEPTION_TYPES
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
 
     if not invoice_ids:
         return {}
-    rows = await db.execute(
-        select(InvoiceException.invoice_id, InvoiceException.exception_type).where(
-            InvoiceException.invoice_id.in_(invoice_ids),
-            InvoiceException.exception_type.in_(PAYMENT_BLOCKING_EXCEPTION_TYPES),
-            InvoiceException.status.notin_(("resolved", "dismissed")),
-        )
+    blocking = PAYMENT_BLOCKING_EXCEPTION_TYPES if types is None else types
+    query = select(InvoiceException.invoice_id, InvoiceException.exception_type).where(
+        InvoiceException.invoice_id.in_(invoice_ids),
+        InvoiceException.exception_type.in_(blocking),
+        InvoiceException.status.notin_(("resolved", "dismissed")),
     )
-    rank = {t: i for i, t in enumerate(PAYMENT_BLOCKING_EXCEPTION_TYPES)}
+    if exclude_exception_ids:
+        # The one caller that passes this is the exception queue's one-click
+        # record of an ERP-reported payment, which resolves exactly these rows
+        # in the same transaction once the record succeeds (decisions §319).
+        query = query.where(InvoiceException.id.notin_(exclude_exception_ids))
+    rows = await db.execute(query)
+    rank = {t: i for i, t in enumerate(blocking)}
     unranked = len(rank)
     out: dict[uuid.UUID, str] = {}
     for invoice_id, exception_type in rows.all():
@@ -456,6 +503,111 @@ async def blocked_invoice_ids(db: AsyncSession, invoice_ids: list[uuid.UUID]) ->
 #: someone decides otherwise (``backend/docs/vendor-management.md``).
 PAYABLE_VENDOR_STATUS = "active"
 
+#: The vendor's LAST STORED screen (``Vendor.screening_status``) that says a
+#: payment would be refused (``match``) or held for review (``review``: a
+#: ``review_required`` verdict, adverse media, or a provider that could not
+#: run). Dispatch does not read this column — ``compliance.check_payment_compliance``
+#: screens afresh and refuses / holds on the same verdicts — so it is the
+#: stored counterpart of that live check, for a gate that must not call the
+#: sanctions adapter (the ERP push). A re-screen (``POST /api/vendors/{id}/screen``,
+#: the periodic sweep) rewrites it. ``clear`` and ``unscreened`` are neither:
+#: the pre-payment screen is the backstop for a vendor never screened.
+SANCTIONS_HELD_SCREENING_STATUSES: frozenset[str] = frozenset({"match", "review"})
+
+#: :attr:`VendorPayability.sanctions_hold` values, PII-free fixed literals.
+HOLD_PAYMENTS_BLOCKED = "payments_blocked"
+HOLD_SANCTIONS_MATCH = "sanctions_match"
+HOLD_SANCTIONS_REVIEW = "sanctions_review"
+
+
+@dataclass(frozen=True)
+class VendorPayability:
+    """What the payment path reads off a vendor to decide whether it may be paid.
+
+    One read, two questions, so every gate that asks either one reads the same
+    columns the same way:
+
+    * :attr:`status_payable` — the lifecycle gate (``status == active``) the run
+      builder, the queue, ``POST /api/payments``, dispatch and ``/retry-failed``
+      enforce through :func:`inactive_vendor_statuses`;
+    * :attr:`sanctions_hold` — the screening gate: the sticky
+      ``payments_blocked`` flag ``check_payment_compliance`` refuses first (set
+      by a sanctions ``match`` or a manual block), then a last STORED screen of
+      ``match`` / ``review`` — the verdicts that live pre-payment screen
+      refuses or holds on, read here without calling the adapter.
+
+    The ERP push reads both (``services/erp_export_gate``, which decides per
+    status what may still be booked).
+    """
+
+    status: str
+    payments_blocked: bool
+    screening_status: str
+    #: The stored screen is covered by an active false-positive adjudication
+    #: (``vendors.screening_adjudication_id``, decisions §477). It lifts the
+    #: ``match`` / ``review`` hold only, never the sticky block.
+    screening_adjudicated: bool = False
+
+    @property
+    def status_payable(self) -> bool:
+        return self.status == PAYABLE_VENDOR_STATUS
+
+    @property
+    def sanctions_hold(self) -> str | None:
+        """Why the screening gate stops a payment to this vendor, or None.
+        The sticky block is named first: it is what refuses before any screen."""
+        if self.payments_blocked:
+            return HOLD_PAYMENTS_BLOCKED
+        if self.screening_adjudicated:
+            return None
+        if self.screening_status == "match":
+            return HOLD_SANCTIONS_MATCH
+        if self.screening_status in SANCTIONS_HELD_SCREENING_STATUSES:
+            return HOLD_SANCTIONS_REVIEW
+        return None
+
+
+async def vendor_payability(
+    db: AsyncSession, invoices: Iterable[Invoice]
+) -> dict[uuid.UUID, VendorPayability]:
+    """Map each invoice with a linked, existing vendor → that vendor's payability.
+
+    One query for the whole batch. An invoice with NO vendor (``vendor_id``
+    NULL, or the row deleted) is absent, for the reason
+    :func:`inactive_vendor_statuses` gives. A NULL status reads ``"unknown"``
+    (never payable) and a NULL screening status ``"unscreened"``.
+    """
+    from app.models.vendor import Vendor
+
+    rows = list(invoices)
+    vendor_ids = {inv.vendor_id for inv in rows if inv.vendor_id is not None}
+    if not vendor_ids:
+        return {}
+    by_vendor = {
+        vid: VendorPayability(
+            status=status or "unknown",
+            payments_blocked=bool(blocked),
+            screening_status=screening or "unscreened",
+            screening_adjudicated=adjudication_id is not None,
+        )
+        for vid, status, blocked, screening, adjudication_id in (
+            await db.execute(
+                select(
+                    Vendor.id,
+                    Vendor.status,
+                    Vendor.payments_blocked,
+                    Vendor.screening_status,
+                    Vendor.screening_adjudication_id,
+                ).where(Vendor.id.in_(vendor_ids))
+            )
+        ).all()
+    }
+    return {
+        inv.id: by_vendor[inv.vendor_id]
+        for inv in rows
+        if inv.vendor_id is not None and inv.vendor_id in by_vendor
+    }
+
 
 async def inactive_vendor_statuses(
     db: AsyncSession, invoices: Iterable[Invoice]
@@ -477,25 +629,14 @@ async def inactive_vendor_statuses(
     is the documented path for it and this gate does not second-guess it.
 
     The status string returned is a fixed, PII-free vocabulary — never the
-    vendor's name.
+    vendor's name. Read through :func:`vendor_payability`, the one read every
+    vendor-payability gate shares (the ERP push's included).
     """
-    from app.models.vendor import Vendor
-
-    rows = list(invoices)
-    vendor_ids = {inv.vendor_id for inv in rows if inv.vendor_id is not None}
-    if not vendor_ids:
-        return {}
-    statuses = dict(
-        (await db.execute(select(Vendor.id, Vendor.status).where(Vendor.id.in_(vendor_ids)))).all()
-    )
-    out: dict[uuid.UUID, str] = {}
-    for inv in rows:
-        if inv.vendor_id is None or inv.vendor_id not in statuses:
-            continue
-        status = statuses[inv.vendor_id]
-        if status != PAYABLE_VENDOR_STATUS:
-            out[inv.id] = status or "unknown"
-    return out
+    return {
+        inv_id: payability.status
+        for inv_id, payability in (await vendor_payability(db, invoices)).items()
+        if not payability.status_payable
+    }
 
 
 #: The only rail that can legitimately pay an invoice already holding a live
@@ -540,11 +681,11 @@ async def applied_credit_totals(
 ) -> dict[uuid.UUID, Decimal]:
     """Sum of the credit memos already APPLIED against each of ``invoice_ids``.
 
-    One grouped query for the whole batch. The single-invoice form below
-    delegates here so "what counts as applied credit" has exactly one
-    definition — the run builder needs this for a page of invoices at a time
-    and the payment queue for a page of ROWS, and neither should be issuing a
-    query per invoice to find out.
+    One grouped query for the whole batch, and the one definition of "what
+    counts as applied credit": a single invoice is asked for as a one-element
+    batch. The run builder needs this for a page of invoices at a time and the
+    payment queue for a page of ROWS, and neither should be issuing a query per
+    invoice to find out.
 
     Invoices with no applied memo are absent from the mapping (callers default
     to zero) rather than carrying a 0 row, so the result reflects what the
@@ -562,11 +703,6 @@ async def applied_credit_totals(
         .group_by(CreditMemo.invoice_id)
     )
     return {invoice_id: total for invoice_id, total in rows.all() if invoice_id is not None}
-
-
-async def applied_credit_total(db: AsyncSession, invoice_id: uuid.UUID) -> Decimal:
-    """Sum of the credit memos already APPLIED against an invoice."""
-    return (await applied_credit_totals(db, [invoice_id])).get(invoice_id, Decimal("0"))
 
 
 async def net_payable_amounts(
@@ -766,7 +902,6 @@ async def live_payment_invoices(
     Invoice NUMBER, not vendor or amount: it is the identifier the operator
     selected the row by, and it carries no PII.
     """
-    from app.api.payments import LIVE_PAYMENT_TERMINAL_STATUSES
 
     ids = list(invoice_ids)
     if not ids:
@@ -791,7 +926,7 @@ async def _live_payment_invoice_numbers(
 
 
 #: Stable, PII-free reason codes for the refusals that are not themselves an
-#: exception type. The members of ``api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES``
+#: exception type. The members of ``services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES``
 #: (``duplicate`` / ``fraud_flag`` / …) are already their own codes and are
 #: returned verbatim.
 #:
@@ -808,6 +943,38 @@ REFUSAL_LIVE_PAYMENT = "live_payment"
 #: The invoice's vendor is not ``active`` — unverified, inactive or rejected
 #: (:func:`inactive_vendor_statuses`). Refused on every rail.
 REFUSAL_VENDOR_NOT_ACTIVE = "vendor_not_active"
+#: The invoice records no currency (blank or whitespace: the invoice PATCH
+#: still keeps ``""`` as its legacy "no currency" value). Refused on every rail:
+#: paying it means choosing a currency nobody recorded, and reading the blank as
+#: USD is the substitution decisions §160/§196/§200/§453 removed elsewhere.
+REFUSAL_CURRENCY_UNKNOWN = "currency_unknown"
+
+#: The whitespace a stored code is trimmed of before it is judged: ASCII only,
+#: so the SQL twin in ``api/payments._queue_currency_unknown`` (``btrim`` with
+#: these characters) reads exactly the rows this module does. Python's bare
+#: ``str.strip()`` also strips NBSP and the Unicode spaces, which ``btrim`` does
+#: not, and that gap let the queue offer a row the builder then refused.
+CURRENCY_TRIM_CHARS = " \t\n\r\x0b\x0c"
+#: A payable code: three ASCII letters once trimmed. The SQL twin uses the same
+#: pattern with ``~``.
+CURRENCY_CODE_PATTERN = "^[A-Za-z]{3}$"
+_CURRENCY_CODE_RE = re.compile(CURRENCY_CODE_PATTERN)
+
+
+def payable_currency_code(value: str | None) -> str | None:
+    """The invoice's currency as a run may pay it, or ``None`` (refused as
+    ``currency_unknown``): NULL, blank, whitespace-only and malformed codes alike.
+
+    The single predicate every run-path check uses, mirrored in SQL by
+    ``api/payments._queue_currency_unknown`` so the queue never offers a row the
+    builder refuses."""
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip(CURRENCY_TRIM_CHARS)
+    if not _CURRENCY_CODE_RE.match(trimmed):
+        return None
+    return trimmed.upper()
+
 
 #: The single rail a card-claimed invoice CAN still be paid on, derived from
 #: ``CARD_CONVERGING_METHODS`` rather than restated, so the two cannot drift.
@@ -842,12 +1009,14 @@ class RunRefusal:
 #: rather than whichever predicate happened to run first.
 #:
 #: Blocking exception types come first (they are the human-sign-off gate),
-#: then a vendor that may not be paid (refused on EVERY rail, so it must
-#: outrank the rail-conditional card claim — otherwise the queue would offer a
-#: card-pinned row the builder then refuses), then the card claim, then a
+#: then a vendor that may not be paid and an invoice that records no currency
+#: (both refused on EVERY rail, so they must outrank the rail-conditional card
+#: claim — otherwise the queue would offer a card-pinned row the builder then
+#: refuses), then the card claim, then a
 #: fully-credited invoice, then the live-payment backstop.
 _REFUSAL_ORDER: tuple[str, ...] = (
     REFUSAL_VENDOR_NOT_ACTIVE,
+    REFUSAL_CURRENCY_UNKNOWN,
     REFUSAL_LIVE_VIRTUAL_CARD,
     REFUSAL_APPLIED_CREDIT_MISMATCH,
     REFUSAL_FULLY_CREDITED,
@@ -917,6 +1086,8 @@ async def run_refusal_reasons(
             out[inv.id] = RunRefusal(exception_type)
         elif inv.id in vendor_refused:
             out[inv.id] = RunRefusal(REFUSAL_VENDOR_NOT_ACTIVE)
+        elif payable_currency_code(inv.currency) is None:
+            out[inv.id] = RunRefusal(REFUSAL_CURRENCY_UNKNOWN)
         elif inv.id in card_refused:
             out[inv.id] = RunRefusal(REFUSAL_LIVE_VIRTUAL_CARD, only_method=CARD_CLAIM_ONLY_METHOD)
         elif inv.id in credit_conflicts:
@@ -968,6 +1139,10 @@ _REFUSAL_MESSAGES: dict[str, str] = {
         "Invoice(s) are from a vendor that is not active (unverified, inactive or "
         "rejected) — verify or reactivate the vendor before paying: {numbers}"
     ),
+    REFUSAL_CURRENCY_UNKNOWN: (
+        "currency_unknown: Invoice(s) record no currency — set the invoice's currency "
+        "before paying it: {numbers}"
+    ),
     REFUSAL_LIVE_VIRTUAL_CARD: (
         "Invoice(s) already have a live virtual card issued against them — "
         "pay them by card, or cancel the card first: {numbers}"
@@ -1008,7 +1183,7 @@ def _raise_refusal(
     refuses the run rather than falling through and staging it. A refusal the
     messages forgot must not become a payment.
     """
-    from app.api.payments import PAYMENT_BLOCKING_EXCEPTION_TYPES
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
 
     # All blocking exception types are ONE group: a batch holding a duplicate
     # and a fraud flag names both in a single message, as it always did. The
@@ -1045,6 +1220,71 @@ def _raise_refusal(
             + ", ".join(sorted(_invoice_label(invoices[i]) for i in refusals))
         ),
     )
+
+
+async def lock_run_invoices(
+    db: AsyncSession,
+    invoice_ids: Iterable[uuid.UUID],
+    *,
+    scope_entity_id: uuid.UUID | None,
+    timeout_ms: int,
+) -> list[Invoice]:
+    """Lock a run's invoices ``FOR NO KEY UPDATE`` in id order, re-read.
+
+    The run builder used to read its invoices with a plain SELECT, so nothing
+    serialised it with the other writers that decide on the same invoice. The
+    case that mattered (the decisions §309 follow-up): ``/send-to-erp`` holds
+    the invoice ``FOR UPDATE`` while its export gate asks whether FeohLedger is
+    already paying it, then moves it to ``sending_to_erp``. A run staged in that
+    window read the invoice as ``approved``, saw no live payment, and booked a
+    ``pending`` one; its FK insert's ``FOR KEY SHARE`` only waited for the
+    send's commit and then went ahead. The bill was then both pushed to the ERP
+    and in a FeohLedger run, which is the double payment §309 refuses.
+
+    With the lock the two serialise in either order:
+
+    - **send first.** The run waits for the send's commit, then its status check
+      (a fresh statement on the re-read row) sees ``sending_to_erp`` and 409s.
+    - **run first.** The send's ``FOR UPDATE`` waits for the run's commit, then
+      its export gate sees the run's live payment and 409s
+      ``payment_blocks_erp_export``.
+
+    The ERP side needs no extra check here: an in-flight or done push has moved
+    the invoice off ``PAYABLE_INVOICE_STATUSES`` (``sending_to_erp``,
+    ``sent_to_erp``, ``failed``) in the same transaction that passed its gate,
+    so the status check under the lock is that check.
+
+    Lock mode and order are the card mint's (``card_issuance.lock_invoices_for_mint``)
+    and dispatch's (``api/payments._lock_payment_invoice``): ``FOR NO KEY UPDATE``
+    conflicts with every status writer and with each other, so a second run, a
+    mint or a dispatch on the same invoice waits and then sees this run's
+    payment; it leaves the ``FOR KEY SHARE`` an FK insert takes alone. Id order
+    means two runs over overlapping invoices cannot deadlock each other, and the
+    run takes no vendor or payment lock, so there is no cycle with the mint
+    (vendor, then invoice) or with dispatch (payment, then invoice).
+
+    The wait is bounded by ``timeout_ms`` in a savepoint (``utils/db_locks``,
+    decisions §233) and raises ``LockWaitTimeout`` with the caller's
+    transaction intact; nothing has been booked at that point, so the refusal
+    is retry-safe. ``populate_existing`` so a row the session already holds is
+    refreshed rather than handed back stale.
+
+    Narrowed to ``scope_entity_id`` (``tenant.apply_entity_scope``); an
+    out-of-scope id is simply absent, which the caller reports as not found.
+    """
+    from app.utils.db_locks import bounded_lock_wait
+
+    ids = sorted(set(invoice_ids))
+    if not ids:
+        return []
+    async with bounded_lock_wait(db, timeout_ms):
+        rows = await db.execute(
+            apply_entity_scope(select(Invoice).where(Invoice.id.in_(ids)), Invoice, scope_entity_id)
+            .order_by(Invoice.id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        return list(rows.scalars().all())
 
 
 async def create_payment_run_for_invoices(
@@ -1097,7 +1337,7 @@ async def create_payment_run_for_invoices(
     # api/payments.py's shared status/exception-type constants). Mirrors the
     # existing lazy-import pattern api/cards.py already uses for the same
     # constant.
-    from app.api.payments import PAYABLE_INVOICE_STATUSES
+    from app.services.payment_gates import PAYABLE_INVOICE_STATUSES
 
     if not items:
         raise HTTPException(status_code=422, detail="At least one invoice is required")
@@ -1108,12 +1348,33 @@ async def create_payment_run_for_invoices(
             return existing_result
 
     invoice_ids = [item.invoice_id for item in items]
-    result = await db.execute(
-        apply_entity_scope(
-            select(Invoice).where(Invoice.id.in_(invoice_ids)), Invoice, scope_entity_id
+    # Lock before any check reads the invoice (decisions §309's follow-up):
+    # every gate below is a fresh statement that then sees what a concurrent
+    # `/send-to-erp`, card mint, dispatch or second run committed while this
+    # request waited. See `lock_run_invoices`.
+    from app.config import settings as app_settings
+    from app.services.payment_gates import INVOICE_LOCKED_DETAIL
+    from app.utils.db_locks import LockWaitTimeout
+
+    try:
+        locked = await lock_run_invoices(
+            db,
+            invoice_ids,
+            scope_entity_id=scope_entity_id,
+            timeout_ms=app_settings.payment_invoice_lock_timeout_ms,
         )
-    )
-    invoices = {inv.id: inv for inv in result.scalars().all()}
+    except LockWaitTimeout:
+        raise HTTPException(status_code=409, detail=INVOICE_LOCKED_DETAIL) from None
+    invoices = {inv.id: inv for inv in locked}
+
+    # A concurrent request for the same plan may have staged it while this one
+    # waited on the locks. Its payments are now live, so without this re-check
+    # the replay would 409 on the live-payment refusal instead of returning the
+    # run, and the copilot's enact would stop being safe to retry.
+    if plan_id is not None:
+        existing_result = await _existing_run_for_plan(db, plan_id)
+        if existing_result is not None:
+            return existing_result
 
     if len(invoices) != len(invoice_ids):
         raise HTTPException(status_code=404, detail="One or more invoices not found")
@@ -1127,7 +1388,16 @@ async def create_payment_run_for_invoices(
     # independently in its own invoice's currency at execution time
     # (`_execute_single_payment` reads `invoice.currency` per payment) — this
     # only constrains what one BATCH can report a single total for.
-    currencies = {invoices[iid].currency or "USD" for iid in invoice_ids}
+    #
+    # A blank currency is left out here rather than read as anything: it is not
+    # a second currency, it is no currency, and `run_refusal_reasons` refuses it
+    # below as `currency_unknown` (decisions §453 removed the same `or "USD"`
+    # from `/draft-run`).
+    currencies = {
+        code
+        for iid in invoice_ids
+        if (code := payable_currency_code(invoices[iid].currency)) is not None
+    }
     if len(currencies) > 1:
         raise HTTPException(
             status_code=422,
@@ -1379,14 +1649,14 @@ async def dispatch_preflight(
 
     Returns the failure reason in the dispatcher's vocabulary
     (``invoice_not_payable:<status>``, ``invoice_blocked:<type>``,
-    ``vendor_not_active:<status>``, ``invoice_has_live_card``,
+    ``vendor_not_active:<status>``, ``currency_unknown``, ``invoice_has_live_card``,
     ``applied_credit_mismatch:<why>``, ``discount_changed``,
     ``net_amount_changed``) — each a refusal made before any money moved, so
     each is retry-safe. The amount is never silently re-priced: a payment whose
     booked figure is no longer what the invoice owes on ``as_of`` is refused,
     and a fresh run re-derives it. The caller holds ``invoice`` FOR UPDATE.
     """
-    from app.api.payments import PAYABLE_INVOICE_STATUSES
+    from app.services.payment_gates import PAYABLE_INVOICE_STATUSES
 
     if invoice.status.value not in PAYABLE_INVOICE_STATUSES:
         return f"invoice_not_payable:{invoice.status.value}"
@@ -1396,6 +1666,11 @@ async def dispatch_preflight(
     vendor_refused = await inactive_vendor_statuses(db, [invoice])
     if invoice.id in vendor_refused:
         return f"vendor_not_active:{vendor_refused[invoice.id]}"
+    # The run builder refuses a blank currency, but the invoice PATCH can blank
+    # it while the run waits; the order must not then go out in a currency
+    # nobody recorded.
+    if payable_currency_code(invoice.currency) is None:
+        return REFUSAL_CURRENCY_UNKNOWN
     if await card_claimed_invoice_ids(db, [(invoice.id, payment.method)]):
         return "invoice_has_live_card"
     credit_conflict = (await applied_credit_conflicts(db, [invoice])).get(invoice.id)

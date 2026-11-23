@@ -1,23 +1,29 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { api, streamCashFlowCopilot, AssistantBudgetError } from '#lib/api.ts';
+	import { api, streamCashFlowCopilot, ApiError, budgetErrorOf, type AssistantBudgetError } from '#lib/api.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import UsageMeter from '#lib/components/assistant/UsageMeter.svelte';
+	import ChatLayout from '#lib/components/assistant/ChatLayout.svelte';
+	import ExamplePrompts from '#lib/components/assistant/ExamplePrompts.svelte';
 	import CopilotChatMessage from '#lib/components/cash-flow/CopilotChatMessage.svelte';
 	import SavedPlansPanel from '#lib/components/cash-flow/SavedPlansPanel.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import type { ChatResponse, ToolInvocation, UiMessage, UsageResponse } from '#lib/types/assistant.ts';
 
 	// Cash-flow copilot starter prompts. The first two route to `get_cash_position`
 	// (running-balance chart); the third exercises the discount optimizer; the
 	// fourth routes to the Phase 2 `propose_payment_plan` tool (plan card).
-	const EXAMPLES: readonly string[] = [
-		'When are we going to run low on cash?',
-		"What's our cash position over the next 90 days?",
-		'Which discounts should I capture to save the most?',
-		'Propose a payment plan for the next quarter'
-	] as const;
+	// Each is a button label AND the message it sends, so it follows the active
+	// locale like the rest of the page (they were English literals in every
+	// locale); the copilot answers in the language it is asked in.
+	const examples = $derived([
+		m('cashFlow.example.runLow'),
+		m('cashFlow.example.position'),
+		m('cashFlow.example.discounts'),
+		m('cashFlow.example.plan')
+	]);
 
 	let messages = $state<UiMessage[]>([]);
 	let input = $state('');
@@ -121,6 +127,15 @@
 		applyFinal(payload, assistantId);
 	}
 
+	/** The over-budget notice, in place of the empty in-progress bubble. */
+	function showBudgetNotice(err: AssistantBudgetError, assistantId: string) {
+		budgetNotice = m('assistant.budget.reached', {
+			used: formatCount(err.used),
+			budget: formatCount(err.budget)
+		});
+		dropMessage(assistantId);
+	}
+
 	async function send() {
 		const message = input.trim();
 		if (!message || busy) return;
@@ -182,24 +197,27 @@
 				{ consolidated }
 			);
 		} catch (err) {
-			if (err instanceof AssistantBudgetError) {
-				budgetNotice = m('assistant.budget.reached', {
-					used: err.used.toLocaleString(),
-					budget: err.budget.toLocaleString()
-				});
-				dropMessage(assistantId);
+			const budgetErr = budgetErrorOf(err);
+			if (budgetErr) {
+				showBudgetNotice(budgetErr, assistantId);
+			} else if (err instanceof ApiError) {
+				// A refusal from the stream endpoint itself — the shared rate
+				// limiter's `rate_limited`, already localized. `/copilot` would
+				// refuse the same turn, so state it instead of falling back.
+				const msg = assistantMessage(assistantId);
+				if (msg) {
+					msg.error = err.message;
+					msg.streaming = false;
+				}
 			} else if (!sawContent) {
 				// Stream unavailable / failed before any content → non-streaming
 				// fallback so the page works against `/copilot` alone.
 				try {
 					await fallbackChat(message, assistantId);
 				} catch (fallbackErr) {
-					if (fallbackErr instanceof AssistantBudgetError) {
-						budgetNotice = m('assistant.budget.reached', {
-							used: fallbackErr.used.toLocaleString(),
-							budget: fallbackErr.budget.toLocaleString()
-						});
-						dropMessage(assistantId);
+					const fallbackBudget = budgetErrorOf(fallbackErr);
+					if (fallbackBudget) {
+						showBudgetNotice(fallbackBudget, assistantId);
 					} else {
 						const msg = assistantMessage(assistantId);
 						const detail =
@@ -207,9 +225,7 @@
 								? fallbackErr.message
 								: m('assistant.error.somethingWrong');
 						if (msg) {
-							msg.error = detail.includes('budget')
-								? detail
-								: m('assistant.error.couldNotAnswer', { detail });
+							msg.error = m('assistant.error.couldNotAnswer', { detail });
 							msg.streaming = false;
 						}
 					}
@@ -240,8 +256,8 @@
 		>
 	{/snippet}
 
-	<div class="copilot-layout">
-		<aside class="side-rail">
+	<ChatLayout railLabel={m('cashFlow.rail.toggle')} railId="cash-flow-rail" {busy} bind:scrollEl>
+		{#snippet rail()}
 			<UsageMeter {usage} />
 
 			<div class="help-row">
@@ -257,34 +273,26 @@
 
 			<div class="rail-head">{m('cashFlow.tips.heading')}</div>
 			<p class="rail-hint">{m('cashFlow.tips.body')}</p>
-		</aside>
+		{/snippet}
 
-		<section class="chat-pane">
-			<div class="chat-scroll" bind:this={scrollEl} role="log" aria-live="polite" aria-busy={busy}>
-				{#if isEmpty}
-					<div class="empty-state">
-						<div class="help-row">
-							<h2>{m('cashFlow.empty.heading')}</h2>
-							<HelpTip term="ai-assistant" />
-						</div>
-						<p class="empty-sub">{m('cashFlow.empty.sub')}</p>
-						<div class="prompt-list">
-							{#each EXAMPLES as prompt (prompt)}
-								<button type="button" class="prompt-btn" onclick={() => pickPrompt(prompt)}>
-									{prompt}
-								</button>
-							{/each}
-						</div>
-					</div>
-				{:else}
-					<div class="msg-stream">
-						{#each messages as message (message.id)}
-							<CopilotChatMessage {message} />
-						{/each}
-					</div>
-				{/if}
-			</div>
+		{#snippet log()}
+			{#if isEmpty}
+				<ExamplePrompts
+					prompts={examples}
+					heading={m('cashFlow.empty.heading')}
+					sub={m('cashFlow.empty.sub')}
+					onpick={pickPrompt}
+				/>
+			{:else}
+				<div class="msg-stream">
+					{#each messages as message (message.id)}
+						<CopilotChatMessage {message} />
+					{/each}
+				</div>
+			{/if}
+		{/snippet}
 
+		{#snippet footer()}
 			{#if budgetNotice}
 				<div class="budget-notice" role="alert">{budgetNotice}</div>
 			{/if}
@@ -308,31 +316,12 @@
 					{busy ? m('cashFlow.thinking') : m('cashFlow.send')}
 				</button>
 			</form>
-		</section>
-	</div>
+		{/snippet}
+	</ChatLayout>
 </PageHeader>
 
 <style>
-	.copilot-layout {
-		display: grid;
-		grid-template-columns: 240px 1fr;
-		gap: 16px;
-		flex: 1 1 auto;
-		min-height: 0;
-	}
 
-	.side-rail {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		padding: 14px;
-		border: 1px solid var(--border);
-		border-radius: 12px;
-		background: var(--surface);
-		height: fit-content;
-		max-height: calc(100vh - 140px);
-		overflow-y: auto;
-	}
 
 	.rail-head {
 		font-size: 0.7rem;
@@ -363,24 +352,7 @@
 	.rail-toggle input:disabled {
 		cursor: not-allowed;
 	}
-	.chat-pane {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		min-height: 0;
-		border: 1px solid var(--border);
-		border-radius: 12px;
-		background: var(--bg);
-		overflow: hidden;
-	}
 
-	.chat-scroll {
-		flex: 1 1 auto;
-		min-height: 420px;
-		max-height: calc(100vh - 220px);
-		overflow-y: auto;
-		padding: 20px;
-	}
 
 	.msg-stream {
 		display: flex;
@@ -388,61 +360,12 @@
 		gap: 18px;
 	}
 
-	.empty-state {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		text-align: center;
-		gap: 10px;
-		padding: 48px 20px;
-		max-width: 560px;
-		margin: 0 auto;
-	}
-
-	.empty-state h2 {
-		margin: 0;
-		font-size: 1.3rem;
-	}
-	.empty-sub {
-		margin: 0;
-		color: var(--text-muted);
-		font-size: 0.9rem;
-		line-height: 1.5;
-	}
-
-	.prompt-list {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		width: 100%;
-		margin-top: 12px;
-	}
-
-	.prompt-btn {
-		width: 100%;
-		text-align: left;
-		padding: 12px 16px;
-		border-radius: 10px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-family: inherit;
-		font-size: 0.9rem;
-		cursor: pointer;
-		transition: all 0.12s;
-	}
-
-	.prompt-btn:hover {
-		border-color: var(--accent);
-		color: var(--accent);
-		background: rgba(99, 140, 255, 0.06);
-	}
 	.budget-notice {
 		margin: 0 16px;
 		padding: 10px 14px;
 		border-radius: 8px;
-		background: rgba(240, 70, 70, 0.1);
-		border: 1px solid rgba(240, 70, 70, 0.3);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		color: var(--danger);
 		font-size: 0.85rem;
 	}
@@ -473,40 +396,9 @@
 		outline: none;
 		border-color: var(--accent);
 	}
-	.btn-secondary {
-		padding: 8px 14px;
-		border-radius: 8px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-family: inherit;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-	}
-
-	.btn-secondary:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-secondary:disabled,
-	.composer .btn-primary:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
 	.composer .btn-primary {
 		align-self: stretch;
 		padding: 0 22px;
 	}
 
-	@media (max-width: 720px) {
-		.copilot-layout {
-			grid-template-columns: 1fr;
-		}
-
-		.side-rail {
-			max-height: none;
-		}
-
-	}
 </style>

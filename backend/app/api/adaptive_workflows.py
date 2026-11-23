@@ -39,10 +39,13 @@ from app.api.deps import (
     ROLE_AP_MANAGER,
     ROLE_CFO,
     get_control_db,
+    holds_any_role,
     require_roles,
 )
+from app.api.refusals import ActionRefusal, role_not_permitted
 from app.models.adaptive_suggestion import WorkflowSuggestion
 from app.models.invoice import Invoice, InvoiceStatus
+from app.models.invoice_status import APPROVED_OR_BEYOND_STATUSES, IN_REVIEW_STATUSES
 from app.models.organization import Organization
 from app.models.user import Role, User, UserRole
 from app.models.workflow import AuditLog, WorkflowDefinition
@@ -96,6 +99,7 @@ from app.tenant import (
     get_tenant,
     get_tenant_db,
 )
+from app.utils.currency_code import iso_currency_or_none
 
 router = APIRouter(prefix="/adaptive", tags=["adaptive-workflows"])
 
@@ -108,23 +112,6 @@ _APPROVAL_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
 # Minimum decided invoices an approver must have before the routing down-weight
 # penalises them on overturns — thin evidence (one bad call) never penalises.
 _ROUTING_OUTCOME_MIN_SAMPLE = 5
-
-# Approved-or-beyond — the "historically accepted" set used for the vendor
-# baseline (pending / rejected invoices are not part of the accepted norm).
-_APPROVED_STATUSES = (
-    InvoiceStatus.approved,
-    InvoiceStatus.sending_to_erp,
-    InvoiceStatus.sent_to_erp,
-    InvoiceStatus.posted_in_erp,
-    InvoiceStatus.payment_scheduled,
-    InvoiceStatus.paid,
-    InvoiceStatus.done,
-)
-_IN_REVIEW_STATUSES = (
-    InvoiceStatus.new,
-    InvoiceStatus.pending,
-    InvoiceStatus.ready_for_review,
-)
 
 
 def _adaptive_settings(org: Organization) -> dict:
@@ -530,7 +517,7 @@ async def _vendor_approved_rows(
         & (AuditLog.entity_type == "invoice")
         & (AuditLog.action == "invoice.approved"),
         isouter=True,
-    ).where(Invoice.status.in_(_APPROVED_STATUSES))
+    ).where(Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES))
     if vendor_id is not None:
         q = q.where(Invoice.vendor_id == vendor_id)
     else:
@@ -596,8 +583,8 @@ def _anomaly_amount_currency(
     never the one it could not be converted into.
     """
     if subject is not None:
-        return (reporting_currency or "").strip().upper()
-    return (inv.currency or "").strip().upper()
+        return iso_currency_or_none(reporting_currency) or ""
+    return iso_currency_or_none(inv.currency) or ""
 
 
 def _anomaly_dict(a: InvoiceAnomaly, *, amount_currency: str) -> dict:
@@ -730,7 +717,7 @@ async def anomalies(
     # baseline once.
     q = apply_entity_scope(
         select(Invoice)
-        .where(Invoice.status.in_(_IN_REVIEW_STATUSES))
+        .where(Invoice.status.in_(IN_REVIEW_STATUSES))
         .order_by(Invoice.created_at.desc())
         .limit(200),
         Invoice,
@@ -783,8 +770,40 @@ async def anomalies(
 # ---------------------------------------------------------------------------
 
 
-def _suggestion_dict(s: WorkflowSuggestion) -> dict:
+#: Dismiss refused: the suggestion is already dismissed (the repeat POST is an
+#: idempotent no-op, so the verdict does not offer it) or `applied` — an
+#: applied suggestion records a change that was made, and overwriting it with
+#: `dismissed` would erase that from the row. `open` and `stale` dismiss; a
+#: dismissed stale row stays down when its condition holds again.
+WORKFLOW_SUGGESTION_NOT_DISMISSABLE = "workflow_suggestion_not_dismissable"
+
+
+def dismiss_refusal(row: WorkflowSuggestion) -> ActionRefusal | None:
+    """Why ``POST /suggestions/{id}/dismiss`` would refuse, or ``None`` — the
+    gate the endpoint raises from and the row's ``actions.dismiss`` verdict
+    (issue #575). The endpoint answers an already-dismissed row with the
+    unchanged row before asking this, so only the verdict sees that case."""
+    if row.status not in ("open", "stale"):
+        return ActionRefusal(
+            WORKFLOW_SUGGESTION_NOT_DISMISSABLE,
+            f"A suggestion that is {row.status} cannot be dismissed.",
+            409,
+            params={"status": row.status},
+        )
+    return None
+
+
+def _suggestion_actions(row: WorkflowSuggestion, user: User) -> dict:
+    """The caller's verdict on each row action — ``dismiss`` today."""
+    if not holds_any_role(user, _WRITE_ROLES):
+        return {"dismiss": role_not_permitted()}
+    refusal = dismiss_refusal(row)
+    return {"dismiss": refusal.verdict() if refusal else None}
+
+
+def _suggestion_dict(s: WorkflowSuggestion, user: User) -> dict:
     return {
+        "actions": _suggestion_actions(s, user),
         "id": s.id,
         "kind": s.kind,
         "vendor_id": str(s.vendor_id) if s.vendor_id else None,
@@ -902,7 +921,7 @@ async def suggestions(
     if status != "all":
         q = q.where(WorkflowSuggestion.status == status)
     rows = (await db.execute(q)).scalars().all()
-    return SuggestionListResponse(suggestions=[_suggestion_dict(r) for r in rows])
+    return SuggestionListResponse(suggestions=[_suggestion_dict(r, user) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -933,11 +952,14 @@ async def dismiss_suggestion(
         raise HTTPException(status_code=404, detail="Suggestion not found")
     # Idempotent — dismissing an already-dismissed row is a no-op.
     if row.status != "dismissed":
+        refusal = dismiss_refusal(row)
+        if refusal is not None:
+            raise refusal.http()
         row.status = "dismissed"
         row.dismissed_by = user.id
         row.dismissed_at = datetime.now(UTC)
         await db.flush()
-    return SuggestionListResponse(suggestions=[_suggestion_dict(row)])
+    return SuggestionListResponse(suggestions=[_suggestion_dict(row, user)])
 
 
 # ---------------------------------------------------------------------------

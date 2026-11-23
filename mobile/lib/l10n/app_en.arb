@@ -1,5 +1,4 @@
 {
-  "@@locale": "en",
   "navDashboard": "Dashboard",
   "navInvoices": "Invoices",
   "navContracts": "Contracts",
@@ -9,20 +8,18 @@
   "navPay": "Pay",
   "navPayments": "Payments",
   "navSettings": "Settings",
-
   "shellAppName": "FeohLedger",
-
   "commonSave": "Save",
   "commonSaving": "Saving…",
   "commonCancel": "Cancel",
   "commonLoading": "Loading…",
   "commonRetry": "Retry",
+  "commonLoadErrorConnection": "Couldn't reach FeohLedger. Check your connection and tap Retry.",
   "commonAll": "All",
   "commonSearch": "Search",
   "commonClear": "Clear",
   "commonApply": "Apply",
   "commonClose": "Close",
-
   "settingsTitle": "Settings",
   "settingsTenant": "Tenant",
   "settingsTenantNotSet": "Not set",
@@ -33,11 +30,18 @@
   "settingsLanguage": "Language",
   "settingsLanguageHint": "Choose the language used across the app. Your choice is saved on this device.",
   "settingsLanguageSystem": "System default",
-
   "dashboardTitle": "Dashboard",
   "dashboardTotalInvoices": "Total Invoices",
   "dashboardUpcoming": "Upcoming",
   "dashboardForReview": "For Review",
+  "dashboardOverdue": "Overdue",
+  "@dashboardOverdue": {
+    "description": "Dashboard KPI title: open invoices past their due date, counted over the whole book."
+  },
+  "dashboardOverdueOpen": "Shows the overdue invoices",
+  "@dashboardOverdueOpen": {
+    "description": "Screen-reader hint on the dashboard Overdue card: tapping it opens the Invoices tab filtered to overdue invoices."
+  },
   "dashboardApproved": "Approved",
   "dashboardAging": "Invoice Aging",
   "dashboardTopVendors": "Top Vendors",
@@ -46,48 +50,65 @@
   "dashboardAgingDays60": "60 Days",
   "dashboardAgingDays90plus": "90+",
   "dashboardCachedBanner": "Showing cached data — couldn't reach the server",
-  "dashboardErrorPrefix": "Error: {error}",
-  "@dashboardErrorPrefix": {
-    "placeholders": {
-      "error": { "type": "String" }
-    }
-  },
+  "dashboardLoadError": "Couldn't load the dashboard. Check your connection and tap Retry.",
+  "dashboardRefreshFailed": "Couldn't refresh — these are the last figures loaded. Tap Retry to try again.",
+  "dashboardNeedsAttention": "Needs your attention",
+  "dashboardOverview": "Overview",
+  "dashboardEmpty": "No invoices yet. Captured and uploaded invoices will appear here.",
+  "dashboardTopVendorsEmpty": "No vendor spend yet.",
   "dashboardInvoiceCount": "{count, plural, one {{count} invoice} other {{count} invoices}}",
   "@dashboardInvoiceCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "partialConversionCurrencyFallback": "the reporting currency",
   "dashboardKpiUnconverted": "{label}: partial — {count, plural, one {{count} invoice} other {{count} invoices}} with no exchange rate into {currency}, counted at face value, so the total mixes currencies by that much.",
   "@dashboardKpiUnconverted": {
     "placeholders": {
-      "label": { "type": "String" },
-      "count": { "type": "int" },
-      "currency": { "type": "String" }
+      "label": {
+        "type": "String"
+      },
+      "count": {
+        "type": "int"
+      },
+      "currency": {
+        "type": "String"
+      }
     }
   },
   "dashboardAgingUnconverted": "Partial: {count, plural, one {{count} invoice} other {{count} invoices}} with no exchange rate into {currency}, counted at face value — the bands below mix currencies by that much.",
   "@dashboardAgingUnconverted": {
     "placeholders": {
-      "count": { "type": "int" },
-      "currency": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "currency": {
+        "type": "String"
+      }
     }
   },
   "dashboardTopVendorsUnconverted": "Partial: {count, plural, one {{count} invoice} other {{count} invoices}} with no exchange rate into {currency}, counted at face value — so these vendors are not all ranked in the same currency. Book the missing rate before acting on the order.",
   "@dashboardTopVendorsUnconverted": {
     "placeholders": {
-      "count": { "type": "int" },
-      "currency": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "currency": {
+        "type": "String"
+      }
     }
   },
   "dashboardVendorFaceValueCount": "{count, plural, one {{count} at face value} other {{count} at face value}}",
   "@dashboardVendorFaceValueCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
-
   "invoicesTitle": "Invoices",
   "invoicesSearchHint": "Search invoices...",
   "invoicesSearchAria": "Search invoices",
@@ -103,12 +124,15 @@
   "invoicesFilterApproved": "Approved",
   "invoicesFilterRejected": "Rejected",
   "invoicesFilterPaid": "Paid",
+  "invoicesFilterOverdue": "Overdue",
+  "@invoicesFilterOverdue": {
+    "description": "Invoices list quick-view chip: owed and past due, across statuses (the set the dashboard Overdue figure counts)."
+  },
   "invoicesColInvoiceNumber": "Invoice #",
   "invoicesColVendor": "Vendor",
   "invoicesColAmount": "Amount",
   "invoicesColDueDate": "Due Date",
   "invoicesColStatus": "Status",
-
   "notificationsTitle": "Notifications",
   "notificationsMarkAllRead": "Mark all read",
   "notificationsMarkAllReadLabel": "Mark all notifications read",
@@ -117,10 +141,16 @@
   "notificationsCouldNotMarkAll": "Could not mark all read",
   "notificationsEmptyUnread": "No unread notifications",
   "notificationsEmpty": "No notifications",
-  "notificationsCaughtUp": "You're all caught up",
   "notificationsNothingYet": "Nothing here yet",
-  "notificationsLoadError": "Couldn't load notifications",
-
+  "notificationsLoadErrorPrefix": "Couldn't load notifications: {error}",
+  "@notificationsLoadErrorPrefix": {
+    "description": "Notifications list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "vendorsTitle": "Vendors",
   "vendorsSyncErp": "Sync from ERP",
   "vendorsSyncErpLabel": "Sync vendors from ERP",
@@ -130,7 +160,15 @@
   "vendorsFilterInactive": "Inactive",
   "vendorsFilterRejected": "Rejected",
   "vendorsEmpty": "No vendors found",
-  "vendorsLoadError": "Could not load vendors",
+  "vendorsLoadErrorPrefix": "Couldn't load vendors: {error}",
+  "@vendorsLoadErrorPrefix": {
+    "description": "Vendors list first-load failure carrying the server's own reason (a 403 / 500 detail). A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "vendorActionVerify": "Verify",
   "vendorActionReject": "Reject",
   "vendorUnverifiedLabel": "Unverified vendor",
@@ -138,26 +176,48 @@
   "vendorRejectHint": "Mark as invalid / duplicate",
   "vendorVerified": "Vendor verified",
   "vendorRejected": "Vendor rejected",
+  "vendorRejectConfirmTitle": "Reject {name}?",
+  "@vendorRejectConfirmTitle": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "vendorRejectConfirmBody": "{name} will be marked rejected. Any live virtual cards issued to it will be cancelled.",
+  "@vendorRejectConfirmBody": {
+    "description": "Confirm dialog before rejecting a vendor. The server cancels the vendor's live virtual cards on reject.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
   "vendorCardsNotClosed": "{count, plural, one {{count} virtual card could not be cancelled at the card provider and is still live. Retry from the web app.} other {{count} virtual cards could not be cancelled at the card provider and are still live. Retry from the web app.}}",
   "@vendorCardsNotClosed": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "vendorCardsRequireVoid": "{count, plural, one {{count} virtual card backs a scheduled payment and is still live — void that payment to cancel it.} other {{count} virtual cards back scheduled payments and are still live — void those payments to cancel them.}}",
   "@vendorCardsRequireVoid": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "vendorActionFailed": "Action failed",
   "vendorSyncFailed": "ERP sync failed: {error}",
   "@vendorSyncFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
-
   "exceptionsTitle": "Exceptions",
   "exceptionsFilterOpen": "Open",
   "exceptionsFilterEscalated": "Escalated",
@@ -172,13 +232,15 @@
   "exceptionEscalated": "Exception escalated",
   "exceptionDismissed": "Exception dismissed",
   "exceptionActionFailed": "Action failed",
-
   "paymentsTitle": "Payments",
   "paymentsEmpty": "No payments",
-  "paymentsErrorPrefix": "Error: {error}",
-  "@paymentsErrorPrefix": {
+  "paymentsLoadErrorPrefix": "Couldn't load payments: {error}",
+  "@paymentsLoadErrorPrefix": {
+    "description": "Payments history first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "paymentStatusPending": "Pending",
@@ -186,21 +248,20 @@
   "paymentStatusCompleted": "Completed",
   "paymentStatusFailed": "Failed",
   "paymentStatusCancelled": "Cancelled",
-
   "approvalsTitle": "Pending Approvals",
   "approvalsAllCaughtUp": "All caught up!",
   "approvalsNoneWaiting": "No invoices waiting for approval",
-  "approvalsLoadError": "Could not load pending approvals",
   "approvalsPendingCount": "{count, plural, one {{count} invoice pending} other {{count} invoices pending}}",
   "@approvalsPendingCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "approvalActionApprove": "Approve",
   "approvalActionReject": "Reject",
   "approvalApproved": "Invoice approved",
-
   "captureTitle": "Capture Invoice",
   "captureChange": "Change",
   "captureUpload": "Upload",
@@ -214,24 +275,31 @@
   "captureUploadFailedStatus": "Upload failed ({status}): {message}",
   "@captureUploadFailedStatus": {
     "placeholders": {
-      "status": { "type": "int" },
-      "message": { "type": "String" }
+      "status": {
+        "type": "int"
+      },
+      "message": {
+        "type": "String"
+      }
     }
   },
   "captureUploadFailed": "Upload failed: {error}",
   "@captureUploadFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "captureSelectedDocument": "Selected document: {name}",
   "@captureSelectedDocument": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
   "capturePdfReady": "PDF document ready to upload",
-
   "advSearchTitle": "Advanced Search",
   "advSearchClose": "Close advanced search",
   "advSearchVendor": "Vendor",
@@ -246,17 +314,22 @@
   "advSearchClearField": "Clear {label}",
   "@advSearchClearField": {
     "placeholders": {
-      "label": { "type": "String" }
+      "label": {
+        "type": "String"
+      }
     }
   },
   "advSearchDateFieldHint": "{label}, currently {value}. Double tap to change.",
   "@advSearchDateFieldHint": {
     "placeholders": {
-      "label": { "type": "String" },
-      "value": { "type": "String" }
+      "label": {
+        "type": "String"
+      },
+      "value": {
+        "type": "String"
+      }
     }
   },
-
   "invoiceDetailTitle": "Invoice Detail",
   "invoiceDetailEdit": "Edit",
   "invoiceDetailEditLabel": "Edit invoice",
@@ -264,7 +337,9 @@
   "invoiceDetailErrorPrefix": "Error: {error}",
   "@invoiceDetailErrorPrefix": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "invoiceDetailNoChanges": "No changes to save",
@@ -272,29 +347,43 @@
   "invoiceDetailUpdateFailed": "Could not save changes: {error}",
   "@invoiceDetailUpdateFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "glChartRefusalForeign": "{count, plural, one {GL account} other {GL accounts}} {codes} {count, plural, one {belongs to} other {belong to}} another entity's chart of accounts, not this invoice's.",
   "@glChartRefusalForeign": {
     "description": "GL-chart refusal (lib/l10n/gl_chart_refusal_messages.dart): codes that belong to another entity's chart. {codes} is the quoted, comma-joined code list; {count} its length.",
     "placeholders": {
-      "count": { "type": "int" },
-      "codes": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "codes": {
+        "type": "String"
+      }
     }
   },
   "glChartRefusalRetired": "{count, plural, one {GL account} other {GL accounts}} {codes} {count, plural, one {is retired} other {are retired}} in this invoice's chart.",
   "@glChartRefusalRetired": {
     "placeholders": {
-      "count": { "type": "int" },
-      "codes": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "codes": {
+        "type": "String"
+      }
     }
   },
   "glChartRefusalUnknown": "{count, plural, one {GL account} other {GL accounts}} {codes} {count, plural, one {is not} other {are not}} in this invoice's chart of accounts.",
   "@glChartRefusalUnknown": {
     "placeholders": {
-      "count": { "type": "int" },
-      "codes": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "codes": {
+        "type": "String"
+      }
     }
   },
   "glChartRefusalPick": "Choose a code from the invoice's own chart — the shared accounts plus its entity's own.",
@@ -302,7 +391,9 @@
   "glChartRefusalOnLines": "Line items: {reasons}",
   "@glChartRefusalOnLines": {
     "placeholders": {
-      "reasons": { "type": "String" }
+      "reasons": {
+        "type": "String"
+      }
     }
   },
   "codedRefusalApprovalSegregation": "Segregation of duties: a user involved in creating this invoice cannot also approve it.",
@@ -312,6 +403,10 @@
   "codedRefusalApprovalSegregationReceiver": "Segregation of duties: a user who recorded a goods receipt this invoice is billed against cannot also approve it.",
   "@codedRefusalApprovalSegregationReceiver": {
     "description": "Coded refusal (lib/l10n/coded_refusal_messages.dart) `approval_segregation_receiver`: the approver recorded a goods receipt the invoice is billed against."
+  },
+  "codedRefusalApprovalSegregationInspector": "Segregation of duties: a user who recorded a quality inspection of the goods this invoice is billed against cannot also approve it.",
+  "@codedRefusalApprovalSegregationInspector": {
+    "description": "Coded refusal (lib/l10n/coded_refusal_messages.dart) `approval_segregation_inspector`: the approver recorded a quality inspection of the goods the invoice is billed against."
   },
   "codedRefusalInvoiceStaleApproval": "This invoice was changed after you loaded it. Reload it and review the current version before approving.",
   "@codedRefusalInvoiceStaleApproval": {
@@ -406,6 +501,10 @@
   "@codedRefusalExceptionSegregationImplicated": {
     "description": "Coded refusal `segregation_implicated` on resolving an exception."
   },
+  "codedRefusalExceptionSegregationApprover": "Segregation of duties: a user who approved this invoice cannot also clear its receipt or inspection hold. Escalate it, or ask a different user to decide.",
+  "@codedRefusalExceptionSegregationApprover": {
+    "description": "Coded refusal `segregation_approver` on resolving an exception (backend decisions §420)."
+  },
   "invoiceDetailApproved": "Invoice approved",
   "invoiceDetailApproveFailed": "Could not approve invoice — please try again",
   "invoiceDetailRejected": "Invoice rejected",
@@ -413,6 +512,46 @@
   "invoiceDetailRejectTitle": "Reject Invoice",
   "invoiceDetailRejectReason": "Reason",
   "invoiceDetailReject": "Reject",
+  "invoiceDetailRecall": "Recall approval",
+  "@invoiceDetailRecall": {
+    "description": "Button on an approved invoice that recalls its approval back to review (POST /recall-approval)."
+  },
+  "invoiceDetailRecallTitle": "Recall this approval?",
+  "@invoiceDetailRecallTitle": {
+    "description": "Title of the reason prompt shown before recalling an approval."
+  },
+  "invoiceDetailRecallBody": "The invoice goes back to review so its figures can be corrected, then needs a fresh approval through the full approval chain. Segregation of duties will count you as involved in this invoice, as it does its uploader. The original approval stays in the audit trail.",
+  "@invoiceDetailRecallBody": {
+    "description": "Explanation in the recall prompt: what a recall does and its segregation-of-duties consequence."
+  },
+  "invoiceDetailRecallReason": "Why are you recalling it?",
+  "@invoiceDetailRecallReason": {
+    "description": "Label of the reason field in the recall prompt."
+  },
+  "invoiceDetailRecalled": "Approval recalled. The invoice is back in review.",
+  "@invoiceDetailRecalled": {
+    "description": "Snackbar after an approval was recalled."
+  },
+  "invoiceDetailRecallFailed": "Could not recall the approval — please try again",
+  "@invoiceDetailRecallFailed": {
+    "description": "Snackbar when a recall failed for a reason the app cannot state from its code."
+  },
+  "codedRefusalInvoiceNotRecallable": "Only an approved invoice, or one whose ERP push failed after approval, can have its approval recalled.",
+  "@codedRefusalInvoiceNotRecallable": {
+    "description": "Coded refusal `invoice_not_recallable` on recalling an approval."
+  },
+  "codedRefusalInvoiceRecallInErp": "The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can't be recalled from FeohLedger.",
+  "@codedRefusalInvoiceRecallInErp": {
+    "description": "Coded refusal `invoice_recall_in_erp`: the ERP may hold the bill."
+  },
+  "codedRefusalPaymentBlocksRecall": "FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before recalling the approval.",
+  "@codedRefusalPaymentBlocksRecall": {
+    "description": "Coded refusal `invoice_recall_claimed` with claim `payment`."
+  },
+  "codedRefusalCardBlocksRecall": "A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.",
+  "@codedRefusalCardBlocksRecall": {
+    "description": "Coded refusal `invoice_recall_claimed` with claim `virtual_card`."
+  },
   "invoicesBulkRejectTitle": "Reject {count, plural, one {{count} invoice} other {{count} invoices}}",
   "@invoicesBulkRejectTitle": {
     "description": "Title of the reason prompt shown before bulk-rejecting the selected invoices.",
@@ -622,7 +761,6 @@
   "invoiceDetailFileLabel": "Invoice file. Double tap to view full screen.",
   "invoiceDetailTapToViewPdf": "Tap to view PDF",
   "invoiceDetailTapToViewFile": "Tap to view file",
-
   "invoiceEditTitle": "Edit Invoice",
   "invoiceEditClose": "Close edit form",
   "invoiceEditVendor": "Vendor",
@@ -635,15 +773,23 @@
   "invoiceEditNotSet": "Not set",
   "invoiceEditInvalidAmount": "Enter a valid amount (e.g. 1234.56)",
   "invoiceEditClearDueDate": "Clear due date",
-  "invoiceEditLockedNotice": "Approved — the payee and amount are frozen. To change them, reject the invoice, correct it, then approve it again.",
+  "invoiceEditLockedNotice": "Approved — the payee and amount are frozen.",
+  "@invoiceEditLockedNotice": {
+    "description": "Edit sheet notice on a financially locked invoice whose approval cannot be recalled from here (past the recall, or no recall verdict)."
+  },
+  "invoiceEditLockedNoticeRecall": "Approved — the payee and amount are frozen. To change them, recall the approval, correct the invoice, then have it approved again.",
+  "@invoiceEditLockedNoticeRecall": {
+    "description": "Edit sheet notice on a financially locked invoice when the server says this user may recall its approval (review-actions recall_approval allowed)."
+  },
   "invoiceEditLockedHelper": "Frozen after approval",
   "invoiceEditDueDateHint": "Due date, currently {value}. Double tap to change.",
   "@invoiceEditDueDateHint": {
     "placeholders": {
-      "value": { "type": "String" }
+      "value": {
+        "type": "String"
+      }
     }
   },
-
   "warningsSectionTitle": "Warnings & fraud flags",
   "warningsPoMatchTitle": "PO Match",
   "warningsSeverityError": "Error",
@@ -653,31 +799,45 @@
   "warningsMatchLabel": "{type} match",
   "@warningsMatchLabel": {
     "placeholders": {
-      "type": { "type": "String" }
+      "type": {
+        "type": "String"
+      }
     }
   },
   "warningsVarianceLabel": "{value}% variance",
   "@warningsVarianceLabel": {
     "placeholders": {
-      "value": { "type": "String" }
+      "value": {
+        "type": "String"
+      }
     }
   },
-
   "erpStatusTitle": "ERP Status",
   "erpStatusReference": "ERP Reference",
   "erpStatusDocumentId": "Document ID",
   "erpStatusError": "Error",
   "erpStatusLastUpdate": "Last update",
+  "erpStatusActionBy": "{action} by {actor}",
+  "@erpStatusActionBy": {
+    "description": "ERP panel last-update value: the audit action and who performed it.",
+    "placeholders": {
+      "action": {
+        "type": "String"
+      },
+      "actor": {
+        "type": "String"
+      }
+    }
+  },
   "erpStatusStatus": "Status",
-
+  "erpStatusOpensInErp": "opens the bill in the ERP",
+  "externalLinkOpenFailed": "Couldn't open the link",
   "fileViewerPdfTitle": "Invoice PDF",
   "fileViewerImageTitle": "Invoice Image",
   "fileViewerPdfError": "Unable to load PDF",
   "fileViewerImageError": "Unable to load image",
   "fileViewerRetry": "Retry",
-
   "timelineNoActivity": "No activity yet",
-
   "payTitle": "Pay",
   "payTabQueue": "Queue",
   "payTabRuns": "Runs",
@@ -688,23 +848,45 @@
   "paySummaryPaymentsSubtitle": "{count, plural, one {{count} payment} other {{count} payments}}",
   "@paySummaryPaymentsSubtitle": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "payQueueEmpty": "No invoices awaiting payment",
-  "payQueueError": "Could not load the payment queue",
-  "payQueueRetry": "Retry",
+  "payQueueLoadErrorPrefix": "Couldn't load the payment queue: {error}",
+  "@payQueueLoadErrorPrefix": {
+    "description": "Pay screen, Queue tab: first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "payRunsLoadErrorPrefix": "Couldn't load payment runs: {error}",
+  "@payRunsLoadErrorPrefix": {
+    "description": "Pay screen, Runs tab: first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "payQueueDue": "Due {date}",
   "@payQueueDue": {
     "placeholders": {
-      "date": { "type": "String" }
+      "date": {
+        "type": "String"
+      }
     }
   },
   "payQueueNoDueDate": "No due date",
   "payQueueDiscount": "discount {amount}",
   "@payQueueDiscount": {
     "placeholders": {
-      "amount": { "type": "String" }
+      "amount": {
+        "type": "String"
+      }
     }
   },
   "payQueueOverdue": "overdue",
@@ -716,6 +898,7 @@
   "payQueueBlockedQualityHold": "Quality hold — goods failed or await inspection",
   "payQueueBlockedPoMismatch": "Doesn’t match its purchase order — unresolved",
   "payQueueBlockedVendorNotActive": "Vendor not verified or not active — verify the vendor first",
+  "payQueueBlockedCurrencyUnknown": "No currency recorded on this invoice — set its currency first",
   "payQueueBlockedAppliedCreditMismatch": "An applied credit memo no longer matches this invoice's vendor or currency — correct the invoice first",
   "payQueueBlockedFullyCredited": "Fully covered by credit memos — nothing to pay",
   "payQueueBlockedLiveVirtualCard": "A live virtual card claims this invoice — pay it by card",
@@ -723,19 +906,25 @@
   "payQueueBlockedAnnounce": "can’t be paid: {reason}",
   "@payQueueBlockedAnnounce": {
     "placeholders": {
-      "reason": { "type": "String" }
+      "reason": {
+        "type": "String"
+      }
     }
   },
   "payQueuePinnedMethod": "Pay by {method}",
   "@payQueuePinnedMethod": {
     "placeholders": {
-      "method": { "type": "String" }
+      "method": {
+        "type": "String"
+      }
     }
   },
   "payMethodLabel": "Payment method for {invoiceNumber}",
   "@payMethodLabel": {
     "placeholders": {
-      "invoiceNumber": { "type": "String" }
+      "invoiceNumber": {
+        "type": "String"
+      }
     }
   },
   "payMethodAch": "ACH",
@@ -745,7 +934,9 @@
   "paySelectedCount": "{count, plural, one {{count} invoice selected} other {{count} invoices selected}}",
   "@paySelectedCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "payClear": "Clear",
@@ -753,24 +944,36 @@
   "payCreateRunFailed": "Failed to create run: {error}",
   "@payCreateRunFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "payRunsEmpty": "No payment runs",
   "payRunSubtitle": "{count, plural, one {{count} payment} other {{count} payments}} • {date}",
   "@payRunSubtitle": {
     "placeholders": {
-      "count": { "type": "int" },
-      "date": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "date": {
+        "type": "String"
+      }
     }
   },
   "payRunCfoRequiredSuffix": " • CFO approval required",
   "payRunAnnounce": "Run {amount}, {status}, {subtitle}",
   "@payRunAnnounce": {
     "placeholders": {
-      "amount": { "type": "String" },
-      "status": { "type": "String" },
-      "subtitle": { "type": "String" }
+      "amount": {
+        "type": "String"
+      },
+      "status": {
+        "type": "String"
+      },
+      "subtitle": {
+        "type": "String"
+      }
     }
   },
   "payRunActions": "Run actions",
@@ -781,16 +984,24 @@
   "payRunApproveBody": "Sign off the run created {date} — {count, plural, one {{count} payment} other {{count} payments}} totalling {amount}. This authorizes execution; it moves no money.",
   "@payRunApproveBody": {
     "placeholders": {
-      "date": { "type": "String" },
-      "count": { "type": "int" },
-      "amount": { "type": "String" }
+      "date": {
+        "type": "String"
+      },
+      "count": {
+        "type": "int"
+      },
+      "amount": {
+        "type": "String"
+      }
     }
   },
   "payRunApproveConfirm": "Approve",
   "payRunApproveFailed": "Failed to approve: {error}",
   "@payRunApproveFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "payRunCfoBlocked": "This run needs CFO approval before it can be executed.",
@@ -798,19 +1009,25 @@
   "payRunExecuteBody": "This sends {amount} via the configured payment processor.",
   "@payRunExecuteBody": {
     "placeholders": {
-      "amount": { "type": "String" }
+      "amount": {
+        "type": "String"
+      }
     }
   },
   "payRunExecuteFailed": "Failed to execute: {error}",
   "@payRunExecuteFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "payRunCancelFailed": "Failed to cancel: {error}",
   "@payRunCancelFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "payRunStatusDraft": "Draft",
@@ -821,7 +1038,6 @@
   "payRunStatusCancelled": "Cancelled",
   "payConfirmCancel": "Cancel",
   "payConfirmExecute": "Execute",
-
   "loginAppName": "FeohLedger",
   "loginTagline": "Accounts Payable, Made Simple",
   "loginTenant": "Tenant",
@@ -831,7 +1047,6 @@
   "loginHidePassword": "Hide password",
   "loginRequired": "Required",
   "loginSignIn": "Sign In",
-
   "mfaTitle": "Two-factor authentication",
   "mfaHeading": "Verify it's you",
   "mfaPromptEmail": "Enter the 6-digit code we emailed you.",
@@ -847,7 +1062,6 @@
   "mfaUseEmailInstead": "Use an email code instead",
   "mfaUseAuthenticatorInstead": "Use authenticator app instead",
   "mfaEmailedAnnounce": "A sign-in code was emailed to you.",
-
   "adminUsersTitle": "User Management",
   "adminUsersSearchHint": "Search by name or email",
   "adminUsersEmpty": "No users found",
@@ -865,32 +1079,44 @@
   "adminUsersRolesUpdated": "Updated roles for {name}",
   "@adminUsersRolesUpdated": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
   "adminUsersRolesUpdateFailed": "Failed to update roles: {error}",
   "@adminUsersRolesUpdateFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "adminUsersActivated": "Activated {name}",
   "@adminUsersActivated": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
   "adminUsersDeactivated": "Deactivated {name}",
   "@adminUsersDeactivated": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
   "adminUsersUpdateFailed": "Failed to update {name}: {error}",
   "@adminUsersUpdateFailed": {
     "placeholders": {
-      "name": { "type": "String" },
-      "error": { "type": "String" }
+      "name": {
+        "type": "String"
+      },
+      "error": {
+        "type": "String"
+      }
     }
   },
   "adminUsersCreateUser": "Create user",
@@ -903,23 +1129,23 @@
   "adminUsersValidationEmailInvalid": "Enter a valid email address",
   "adminUsersCreateSubmit": "Create",
   "adminUsersCreating": "Creating…",
-  "adminUsersCreated": "Created {name}",
-  "@adminUsersCreated": {
+  "adminUsersInvited": "Invited {name}. We emailed {email} a link to set their password.",
+  "@adminUsersInvited": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      },
+      "email": {
+        "type": "String"
+      }
     }
   },
   "adminUsersCreateFailed": "Failed to create user: {error}",
   "@adminUsersCreateFailed": {
     "placeholders": {
-      "error": { "type": "String" }
-    }
-  },
-  "adminUsersTempPasswordTitle": "User created",
-  "adminUsersTempPasswordBody": "Share this one-time password with {name}. They'll be asked to change it on first sign-in. It won't be shown again.",
-  "@adminUsersTempPasswordBody": {
-    "placeholders": {
-      "name": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "adminUsersDelete": "Delete user",
@@ -928,30 +1154,41 @@
   "adminUsersDeleteConfirmTitle": "Delete {name}?",
   "@adminUsersDeleteConfirmTitle": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
   "adminUsersDeleteConfirmBody": "This permanently removes {name} ({email}). This can't be undone.",
   "@adminUsersDeleteConfirmBody": {
     "placeholders": {
-      "name": { "type": "String" },
-      "email": { "type": "String" }
+      "name": {
+        "type": "String"
+      },
+      "email": {
+        "type": "String"
+      }
     }
   },
   "adminUsersDeleted": "Deleted {name}",
   "@adminUsersDeleted": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
   "adminUsersDeleteFailed": "Failed to delete {name}: {error}",
   "@adminUsersDeleteFailed": {
     "placeholders": {
-      "name": { "type": "String" },
-      "error": { "type": "String" }
+      "name": {
+        "type": "String"
+      },
+      "error": {
+        "type": "String"
+      }
     }
   },
-
   "orgSettingsTitle": "Organization Settings",
   "orgSettingsNoSettings": "No settings",
   "orgSettingsLoadError": "Could not load settings",
@@ -972,17 +1209,20 @@
   "orgSettingsFieldRequired": "{label} is required",
   "@orgSettingsFieldRequired": {
     "placeholders": {
-      "label": { "type": "String" }
+      "label": {
+        "type": "String"
+      }
     }
   },
   "orgSettingsSaved": "Organization settings saved",
   "orgSettingsSaveFailed": "Failed to save: {error}",
   "@orgSettingsSaveFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
-
   "workflowsTitle": "Workflows",
   "workflowsEmpty": "No workflows found",
   "workflowsLoadError": "Could not load workflows",
@@ -992,17 +1232,28 @@
   "workflowsStepCount": "{count, plural, one {{count} step} other {{count} steps}}",
   "@workflowsStepCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "workflowDetailFallbackTitle": "Workflow",
-  "workflowDetailLoadError": "Could not load workflow",
+  "workflowDetailErrorPrefix": "Could not load the workflow: {error}",
+  "@workflowDetailErrorPrefix": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "workflowDetailNoSteps": "This workflow has no steps.",
   "workflowDetailDefaultWorkflow": "Default workflow",
   "workflowDetailStepNumber": "Step {number}",
   "@workflowDetailStepNumber": {
     "placeholders": {
-      "number": { "type": "int" }
+      "number": {
+        "type": "int"
+      }
     }
   },
   "workflowDetailStepEnabled": "Enabled",
@@ -1010,50 +1261,71 @@
   "workflowDetailApproverCount": "{count, plural, one {{count} approver} other {{count} approvers}}",
   "@workflowDetailApproverCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "workflowDetailDelaySummary": "Delay {hours} h",
   "@workflowDetailDelaySummary": {
     "placeholders": {
-      "hours": { "type": "String" }
+      "hours": {
+        "type": "String"
+      }
     }
   },
   "workflowDetailConditionSummary": "On {field}",
   "@workflowDetailConditionSummary": {
     "placeholders": {
-      "field": { "type": "String" }
+      "field": {
+        "type": "String"
+      }
     }
   },
-
   "cashFlowTitle": "Cash Flow Forecast",
   "cashFlowErrorPrefix": "Error: {error}",
   "@cashFlowErrorPrefix": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "cashFlowHorizonDays": "{days} days",
   "@cashFlowHorizonDays": {
     "placeholders": {
-      "days": { "type": "int" }
+      "days": {
+        "type": "int"
+      }
     }
   },
   "cashFlowLowBalanceAlert": "Low balance alert",
   "cashFlowBreachSingle": "Projected to fall below the {threshold} balance in {period} (shortfall {shortfall}).",
   "@cashFlowBreachSingle": {
     "placeholders": {
-      "threshold": { "type": "String" },
-      "period": { "type": "String" },
-      "shortfall": { "type": "String" }
+      "threshold": {
+        "type": "String"
+      },
+      "period": {
+        "type": "String"
+      },
+      "shortfall": {
+        "type": "String"
+      }
     }
   },
   "cashFlowBreachMultiple": "{count} periods are projected to fall below the minimum balance. Worst: {period}, shortfall {shortfall}.",
   "@cashFlowBreachMultiple": {
     "placeholders": {
-      "count": { "type": "int" },
-      "period": { "type": "String" },
-      "shortfall": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "period": {
+        "type": "String"
+      },
+      "shortfall": {
+        "type": "String"
+      }
     }
   },
   "cashFlowMinimum": "minimum",
@@ -1062,7 +1334,9 @@
   "cashFlowProjectedEndSubtitle": "in {days} days",
   "@cashFlowProjectedEndSubtitle": {
     "placeholders": {
-      "days": { "type": "int" }
+      "days": {
+        "type": "int"
+      }
     }
   },
   "cashFlowCommittedOut": "Committed Out",
@@ -1078,19 +1352,53 @@
   "cashFlowInvoiceCount": "{count, plural, one {{count} invoice} other {{count} invoices}}",
   "@cashFlowInvoiceCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "cashFlowCommittedAmount": "committed {amount}",
   "@cashFlowCommittedAmount": {
     "placeholders": {
-      "amount": { "type": "String" }
+      "amount": {
+        "type": "String"
+      }
     }
   },
   "cashFlowPendingAmount": "pending {amount}",
   "@cashFlowPendingAmount": {
     "placeholders": {
-      "amount": { "type": "String" }
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "cashFlowOverdueAmount": "overdue {amount}",
+  "@cashFlowOverdueAmount": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "cashFlowOverdueSuffix": ", {amount} already past due",
+  "@cashFlowOverdueSuffix": {
+    "description": "Appended to a forecast row's screen-reader label when part of the period is already past due.",
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "cashFlowForecastOverdue": "{amount} across {count, plural, one {{count} invoice} other {{count} invoices}} is already past due. Owed now, so counted in the first period.",
+  "@cashFlowForecastOverdue": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "amount": {
+        "type": "String"
+      }
     }
   },
   "cashFlowPosition": "Cash Position",
@@ -1098,50 +1406,79 @@
   "cashFlowOutAmount": "out {amount}",
   "@cashFlowOutAmount": {
     "placeholders": {
-      "amount": { "type": "String" }
+      "amount": {
+        "type": "String"
+      }
     }
   },
   "cashFlowForecastRowLabel": "{period}: scheduled {scheduled}, committed {committed}, pending {pending}, {count} invoices",
   "@cashFlowForecastRowLabel": {
     "placeholders": {
-      "period": { "type": "String" },
-      "scheduled": { "type": "String" },
-      "committed": { "type": "String" },
-      "pending": { "type": "String" },
-      "count": { "type": "int" }
+      "period": {
+        "type": "String"
+      },
+      "scheduled": {
+        "type": "String"
+      },
+      "committed": {
+        "type": "String"
+      },
+      "pending": {
+        "type": "String"
+      },
+      "count": {
+        "type": "int"
+      }
     }
   },
   "cashFlowPositionRowLabel": "{period}: opening {opening}, outflow {outflow}, closing {closing}",
   "@cashFlowPositionRowLabel": {
     "placeholders": {
-      "period": { "type": "String" },
-      "opening": { "type": "String" },
-      "outflow": { "type": "String" },
-      "closing": { "type": "String" }
+      "period": {
+        "type": "String"
+      },
+      "opening": {
+        "type": "String"
+      },
+      "outflow": {
+        "type": "String"
+      },
+      "closing": {
+        "type": "String"
+      }
     }
   },
   "cashFlowBelowThresholdSuffix": ", below threshold",
   "cashFlowLowBalanceAlertLabel": "Low balance alert. {message}",
   "@cashFlowLowBalanceAlertLabel": {
     "placeholders": {
-      "message": { "type": "String" }
+      "message": {
+        "type": "String"
+      }
     }
   },
   "cashFlowForecastUnconverted": "Partial: {count, plural, one {{count} invoice} other {{count} invoices}} with no exchange rate into {currency}, counted at face value — these outflows, and the committed and pending totals above, mix currencies by that much.",
   "@cashFlowForecastUnconverted": {
     "placeholders": {
-      "count": { "type": "int" },
-      "currency": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "currency": {
+        "type": "String"
+      }
     }
   },
   "cashFlowPositionUnconverted": "Unconverted: {count, plural, one {{count} invoice} other {{count} invoices}} with no exchange rate into {currency}, counted at face value — so the running balance below, and the projected end balance above, mix currencies. Book the missing rate before acting on these figures.",
   "@cashFlowPositionUnconverted": {
     "placeholders": {
-      "count": { "type": "int" },
-      "currency": { "type": "String" }
+      "count": {
+        "type": "int"
+      },
+      "currency": {
+        "type": "String"
+      }
     }
   },
-
   "contractsTitle": "Contracts",
   "contractsSearchHint": "Search contracts...",
   "contractsEmpty": "No contracts found",
@@ -1150,12 +1487,13 @@
   "contractsFilterExpired": "Expired",
   "contractsFilterTerminated": "Terminated",
   "contractsFilterCancelled": "Cancelled",
-
   "contractDetailTitle": "Contract Detail",
   "contractDetailErrorPrefix": "Error: {error}",
   "@contractDetailErrorPrefix": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "contractDetailUntitled": "Untitled Contract",
@@ -1175,14 +1513,18 @@
   "contractDetailRenewalTermMonths": "{months} months",
   "@contractDetailRenewalTermMonths": {
     "placeholders": {
-      "months": { "type": "int" }
+      "months": {
+        "type": "int"
+      }
     }
   },
   "contractDetailFieldRenewalNotice": "Renewal Notice",
   "contractDetailRenewalNoticeDays": "{days} days",
   "@contractDetailRenewalNoticeDays": {
     "placeholders": {
-      "days": { "type": "int" }
+      "days": {
+        "type": "int"
+      }
     }
   },
   "contractDetailFieldPaymentTerms": "Payment Terms",
@@ -1194,7 +1536,9 @@
   "contractDetailSpendInvoiceCount": "{count, plural, one {{count} invoice} other {{count} invoices}}",
   "@contractDetailSpendInvoiceCount": {
     "placeholders": {
-      "count": { "type": "int" }
+      "count": {
+        "type": "int"
+      }
     }
   },
   "contractDetailSpendOverLimit": "Over Limit",
@@ -1202,7 +1546,9 @@
   "contractDetailSpendOfLimit": "of {limit}",
   "@contractDetailSpendOfLimit": {
     "placeholders": {
-      "limit": { "type": "String" }
+      "limit": {
+        "type": "String"
+      }
     }
   },
   "contractDetailSpendNoLimit": "no limit set",
@@ -1210,19 +1556,25 @@
   "contractDetailLineQty": "Qty {quantity}",
   "@contractDetailLineQty": {
     "placeholders": {
-      "quantity": { "type": "String" }
+      "quantity": {
+        "type": "String"
+      }
     }
   },
   "contractDetailLineUnitPrice": "@ {price}",
   "@contractDetailLineUnitPrice": {
     "placeholders": {
-      "price": { "type": "String" }
+      "price": {
+        "type": "String"
+      }
     }
   },
   "contractDetailLineGl": "GL {account}",
   "@contractDetailLineGl": {
     "placeholders": {
-      "account": { "type": "String" }
+      "account": {
+        "type": "String"
+      }
     }
   },
   "contractActivate": "Activate",
@@ -1238,11 +1590,568 @@
   "contractCancelBody": "This withdraws the contract — no further invoices can be matched against it. This cannot be undone. Continue?",
   "contractCancelled": "Contract cancelled",
   "contractCancelFailed": "Could not cancel contract — please try again",
-
   "exceptionDetailTitle": "Exception",
-  "exceptionDetailNotFound": "Exception not found",
+  "exceptionDetailErrorPrefix": "Could not load the exception: {error}",
+  "@exceptionDetailErrorPrefix": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "exceptionDetailOverdue": "Overdue",
   "exceptionDetailSectionDescription": "Description",
+  "exceptionDetailPoRematch": "PO {po} changed in {erp} on {date}, and a re-check now matches. Review it to clear the hold.",
+  "@exceptionDetailPoRematch": {
+    "description": "An ERP PO sync re-check no longer finds this hold (decisions §323); the sync never clears it, so a person may now.",
+    "placeholders": {
+      "po": {
+        "type": "String"
+      },
+      "erp": {
+        "type": "String"
+      },
+      "date": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDetailPoRematchNoDate": "PO {po} changed in {erp}, and a re-check now matches. Review it to clear the hold.",
+  "@exceptionDetailPoRematchNoDate": {
+    "placeholders": {
+      "po": {
+        "type": "String"
+      },
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDetailPoRematchNoPo": "The purchase order changed in {erp}, and a re-check now matches. Review it to clear the hold.",
+  "@exceptionDetailPoRematchNoPo": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalVendorNotLinked": "This vendor isn't in {provider} yet. Sync vendors from {provider}, or add the vendor there, then retry.",
+  "@erpRefusalVendorNotLinked": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalAccountNotLinked": "Not linked to an account in {provider}: {accounts}. Sync the chart of accounts from {provider}, or recode the invoice to a linked account, then retry.",
+  "@erpRefusalAccountNotLinked": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "accounts": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalAccountNotLinkedUncoded": "A line has no GL account, and the invoice has none to fall back on. Code it to an account linked to {provider}, then retry.",
+  "@erpRefusalAccountNotLinkedUncoded": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalNotConnected": "The ERP isn't connected, or its connection has expired. An administrator can reconnect it under Organization, then retry.",
+  "erpRefusalInvoiceDueBeforeDate": "This invoice is due before its invoice date, which the ERP rejects. Correct the dates, then retry.",
+  "erpRefusalAmountMismatch": "The line amounts don't add up to the approved amount, so the bill wasn't sent to {provider}. Correct the lines or the tax, then retry.",
+  "@erpRefusalAmountMismatch": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalLineAmountMissing": "A line has no amount — no total, and no quantity and unit price to work one out from. Fill it in, then retry.",
+  "erpRefusalPostedTotalMismatch": "{provider} worked out a different total from the approved amount (often a default tax code), so the bill wasn't kept. Check the vendor's and accounts' tax settings in {provider}, then retry.",
+  "@erpRefusalPostedTotalMismatch": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPostedTotalUnconfirmed": "The bill was created in {provider}, but {provider} didn't report its total, so it can't be confirmed. Check the bill in {provider} before you retry.",
+  "@erpRefusalPostedTotalUnconfirmed": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPreviousBillRemoved": "Every bill sent for this invoice was deleted or voided in {provider}, so it won't be sent again automatically. Check {provider}, then ask an administrator how to proceed.",
+  "@erpRefusalPreviousBillRemoved": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalTaxNotItemised": "{provider} needs the tax on each line, but this invoice states it only in total. Enter the tax per line, then retry.",
+  "@erpRefusalTaxNotItemised": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalTaxRateUnresolved": "{provider} has no tax rate that matches this invoice's tax. Set the rate up in {provider}, or correct the tax, then retry.",
+  "@erpRefusalTaxRateUnresolved": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalMissingDates": "{provider} needs both an invoice date and a due date. Add them, then retry.",
+  "@erpRefusalMissingDates": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalBillRefused": "{provider} refused this bill and did not create it. Check the bill's vendor, accounts, dates and amounts against {provider}, correct them, then retry.",
+  "@erpRefusalBillRefused": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalDuplicateNumber": "{provider} already has a bill with this invoice number. Check {provider} for a duplicate before you retry.",
+  "@erpRefusalDuplicateNumber": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalDocNumberTooLong": "The invoice number is longer than {provider} allows. Shorten it, then retry.",
+  "@erpRefusalDocNumberTooLong": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCurrencyUnknown": "{provider} reports no home currency, so the bill's currency can't be checked. Set the home currency in {provider}, then retry.",
+  "@erpRefusalCurrencyUnknown": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCurrencyNotEnabled": "This invoice isn't in {provider}'s home currency, and multicurrency is off there. Turn multicurrency on in {provider}, or correct the currency, then retry.",
+  "@erpRefusalCurrencyNotEnabled": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalIdempotencyLookupIncomplete": "{provider} couldn't confirm whether this invoice was already sent, so it wasn't sent again. Retry in a few minutes.",
+  "@erpRefusalIdempotencyLookupIncomplete": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPurchasesNotPermitted": "{provider} did not allow this bill to be created. Either the business is on Accounting Start, which cannot create purchase invoices, or the connected Sage user lacks Purchases access. Upgrade the plan or give that user Purchases access in {provider}, then retry.",
+  "@erpRefusalPurchasesNotPermitted": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalExistingInvoiceNotOpen": "{provider} already holds this invoice and it's no longer a draft, so it can't be changed from here. Review it in {provider}.",
+  "@erpRefusalExistingInvoiceNotOpen": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalLineAmountPrecision": "A line amount has more decimal places than this currency allows in {provider}. Round it, then retry.",
+  "@erpRefusalLineAmountPrecision": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPayToVendorDiffers": "{provider} has this bill set to pay a different vendor from the one approved (its pay-to vendor), so it wasn't posted as this bill. Check the pay-to vendor on the bill and on the vendor's card in {provider}, then retry.",
+  "@erpRefusalPayToVendorDiffers": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalBillNotPosted": "{provider} holds this bill but doesn't show it as posted yet, usually because it's waiting for approval there. Approve it in {provider}, then retry. It won't be created twice.",
+  "@erpRefusalBillNotPosted": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalBillRejected": "{provider} holds this bill, but it was rejected or cancelled there, so it will never post. Delete it or enter it again in {provider} before you retry, and don't mark this invoice done: nothing will pay it.",
+  "@erpRefusalBillRejected": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCurrencyNotSetUp": "{provider} has no active currency for this invoice's currency code. Add or reactivate that currency in {provider} (a foreign one needs Multiple Currencies turned on), or correct the invoice's currency, then retry.",
+  "@erpRefusalCurrencyNotSetUp": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCurrencyNotSupported": "{provider} takes bills only in the company's own currency. Correct the currency, or enter the bill in {provider} directly.",
+  "@erpRefusalCurrencyNotSupported": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalForeignCurrencySupplier": "This supplier is set up for a foreign currency in {provider}, which can't be posted to from here. Enter the bill in {provider} directly.",
+  "@erpRefusalForeignCurrencySupplier": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCorrelationTotalMismatch": "{provider} already holds a bill from an earlier attempt with a different total. Check that bill in {provider} before you retry.",
+  "@erpRefusalCorrelationTotalMismatch": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalTaxTypeNotResolved": "An account's tax type in {provider} isn't a fixed rate, so the tax can't be split out. Give the account a tax type in {provider}, then retry.",
+  "@erpRefusalTaxTypeNotResolved": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalTaxMismatch": "The tax {provider} would book differs from the tax on the invoice. Check the accounts' tax types in {provider}, or correct the tax, then retry.",
+  "@erpRefusalTaxMismatch": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalTaxNotStated": "The invoice states no tax, but its accounts carry tax in {provider}. Enter the invoice's tax, then retry.",
+  "@erpRefusalTaxNotStated": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalSubscriptionKeyMissing": "The {provider} subscription key is missing. An administrator can add it under Organization, then retry.",
+  "@erpRefusalSubscriptionKeyMissing": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalApAccountNotConfigured": "No accounts-payable account is set for {provider}. An administrator can set it under Organization, then retry.",
+  "@erpRefusalApAccountNotConfigured": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCurrencyNotConfigured": "No ledger currency is set for {provider}. An administrator can set it under Organization, then retry.",
+  "@erpRefusalCurrencyNotConfigured": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCurrencyMismatch": "The invoice's currency isn't the {provider} ledger currency. Correct the currency, then retry.",
+  "@erpRefusalCurrencyMismatch": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalInvoiceDateMissing": "{provider} needs an invoice date. Add it, then retry.",
+  "@erpRefusalInvoiceDateMissing": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalDueDateMissing": "{provider} needs a due date. Add it, then retry.",
+  "@erpRefusalDueDateMissing": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalAmountNotPositive": "{provider} takes only invoices for more than zero. Correct the amount, or record a credit memo instead.",
+  "@erpRefusalAmountNotPositive": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalJobUnconfirmed": "{provider} accepted the invoice but hasn't confirmed it was created. Retry to check again — it won't be sent twice.",
+  "@erpRefusalJobUnconfirmed": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalJobFailed": "{provider} accepted the invoice, but its background job failed and created nothing. Check the vendor, accounts, transaction codes and posting period in {provider}, then retry.",
+  "@erpRefusalJobFailed": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCallBudgetTenant": "This workspace has used its share of today's {provider} API calls, so FeohLedger made no call. The allowance resets at midnight UTC — retry then.",
+  "@erpRefusalCallBudgetTenant": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCallBudgetQuota": "{provider} has paused API calls for the subscription FeohLedger uses (its daily quota is used), so FeohLedger made no call. It resets at midnight UTC — retry then.",
+  "@erpRefusalCallBudgetQuota": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCallBudgetRateLimited": "{provider} asked FeohLedger to slow down, so no call was made. Retry in a minute.",
+  "@erpRefusalCallBudgetRateLimited": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalBillLeftUnposted": "{provider} holds this bill as a draft or awaiting approval, not posted, so nothing is in accounts payable there yet. Post or approve it in {provider}, then retry.",
+  "@erpRefusalBillLeftUnposted": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalMergeSyncPending": "{provider} has not finished syncing invoices since an earlier attempt to send this bill, whose outcome is unknown, so it may already hold the bill. Nothing was sent. Retry after {provider}'s next invoice sync: if the bill is there by then, the retry links to it instead of creating a second one.",
+  "@erpRefusalMergeSyncPending": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCredentialsUnavailable": "The ERP credentials couldn't be opened just now. Retry in a few minutes; if it keeps failing, tell an administrator.",
+  "erpRefusalPeriodClosed": "{provider} refused this bill because its date is in a closed period (the books are closed). Change the invoice date or reopen the period in {provider}, then retry.",
+  "@erpRefusalPeriodClosed": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalVendorInactive": "{provider} refused this bill because its vendor is inactive or deleted there. Make the vendor active in {provider}, then retry.",
+  "@erpRefusalVendorInactive": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalAccountInactive": "{provider} refused this bill because {accounts} is inactive or deleted there. Make the account active in {provider}, or recode the invoice to an active account, then retry.",
+  "@erpRefusalAccountInactive": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "accounts": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalReferenceInvalid": "{provider} refused this bill because it refers to a vendor or account it doesn't accept (Intuit error {code}). Check that the vendor and every account on the bill exist and are active in {provider}, sync them again, then retry.",
+  "@erpRefusalReferenceInvalid": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "code": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalCompanySubscriptionInactive": "{provider} refused this bill because the company's subscription has ended, was cancelled or has a billing problem. Resolve it in {provider}, then retry.",
+  "@erpRefusalCompanySubscriptionInactive": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalIntuitFault": "{provider} refused this bill (Intuit error {code}). Check the bill's details against {provider} and correct them, then retry. If it keeps failing, give an administrator the error code.",
+  "@erpRefusalIntuitFault": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "code": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPaymentAccountNotMapped": "{provider} was not told about this payment: no account to record it from is set. Choose the bill-payment account under Organization → ERP integration, then retry the payment sync.",
+  "@erpRefusalPaymentAccountNotMapped": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalBillNotInErp": "{provider} no longer has the bill this payment was for (it was deleted there), so the payment was not recorded there. Check the bill in {provider}.",
+  "@erpRefusalBillNotInErp": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPaymentExceedsBalance": "{provider} shows less still owed on this bill than this payment, so recording it would overpay the bill. Check what was already paid in {provider}.",
+  "@erpRefusalPaymentExceedsBalance": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalBillPaymentVoided": "This payment was recorded in {provider} and then voided there, so it is not recorded again. Decide in {provider} whether the bill is paid.",
+  "@erpRefusalBillPaymentVoided": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPaymentsScopeMissing": "{provider} was connected before FeohLedger asked for permission to record payments, so this payment isn't recorded there. Reconnect {provider} in Organization settings to grant it, then record the payment in {provider} or retry.",
+  "@erpRefusalPaymentsScopeMissing": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalExceptionBlocksExport": "This invoice has an open {type} exception. Resolve or dismiss it in Exceptions, then send it to the ERP.",
+  "@erpRefusalExceptionBlocksExport": {
+    "placeholders": {
+      "type": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalExceptionBlocksExportPossiblyPosted": "This invoice has an open {type} exception, and an earlier attempt may already have created the bill in the ERP. Check the ERP before anyone pays it, then resolve or dismiss the exception in Exceptions.",
+  "@erpRefusalExceptionBlocksExportPossiblyPosted": {
+    "placeholders": {
+      "type": {
+        "type": "String"
+      }
+    }
+  },
+  "erpRefusalPaymentBlocksExport": "FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before sending the invoice to the ERP.",
+  "erpRefusalPaymentBlocksExportPossiblyPosted": "FeohLedger is already paying this invoice, and an earlier attempt may already have created the bill in the ERP. Check the ERP and make sure nobody pays the bill there as well.",
+  "erpRefusalVendorBlocked": "This invoice's vendor is blocked from payment. Unblock the vendor before sending the invoice to the ERP.",
+  "erpRefusalVendorSanctionsMatch": "This invoice's vendor matched a sanctions list. Review the vendor's screening before sending the invoice to the ERP.",
+  "erpRefusalVendorSanctionsReview": "This invoice's vendor is held for sanctions screening review. Re-screen the vendor once the review is done, then send the invoice to the ERP.",
+  "erpRefusalVendorRejected": "This invoice's vendor has been rejected. Link the invoice to the correct vendor before sending it to the ERP.",
+  "erpRefusalVendorStatusUnknown": "This invoice's vendor has a status that cannot be sent to the ERP. Set the vendor to active before sending the invoice to the ERP.",
+  "erpRefusalVendorHoldPossiblyPosted": "An earlier attempt may already have created the bill in the ERP; check there before anyone pays it.",
+  "erpRefusalCurrencyBlocksExport": "This invoice has no valid currency. Set its currency before sending it to the ERP.",
+  "erpRefusalRetriesExhausted": "This push had no attempts left, so no attempt was made this time. Retry to send it with a fresh set of attempts.",
+  "erpRefusalPushInterrupted": "This push was interrupted and never finished. It is too old (or older than the current ERP connection) to send again without someone checking. Make sure the bill isn't already in the ERP, then retry.",
+  "erpRefusalCardBlocksExport": "A virtual card has been issued to pay this invoice. Cancel the card before sending the invoice to the ERP.",
+  "erpRefusalCardBlocksExportPossiblyPosted": "A virtual card has been issued to pay this invoice, and an earlier attempt may already have created the bill in the ERP. Check the ERP and make sure nobody pays the bill there as well.",
+  "erpRefusalTypeDuplicate": "Duplicate Invoice",
+  "@erpRefusalTypeDuplicate": {
+    "description": "The exception type named by the erpRefusalExceptionBlocksExport sentences."
+  },
+  "erpRefusalTypeFraudFlag": "Fraud Flag",
+  "exceptionDetailErpPaymentTitle": "Payment reported by {erp}",
+  "@exceptionDetailErpPaymentTitle": {
+    "description": "The card for a payment the ERP reported that FeohLedger could not record (erp_report kind paid_not_recorded, decisions §319).",
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDetailErpPaymentAmount": "Amount {erp} reports paid",
+  "@exceptionDetailErpPaymentAmount": {
+    "description": "The cash the ERP states was paid, in the currency it stated (decisions §386, §413).",
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDetailErpPaymentPaidOn": "Paid on",
+  "exceptionDetailErpPaymentReference": "Reference",
+  "erpRefusalUnknown": "This was refused in {erp} for a reason this version of the app can't describe. Update the app, or check the record in {erp}.",
+  "@erpRefusalUnknown": {
+    "description": "A coded ERP refusal this build has no sentence for (a newer backend). Never shows the raw code.",
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDetailErpPaymentNotStated": "Not stated",
+  "exceptionDetailErpPaymentRecordOnWeb": "Record this payment from Exceptions in the web app: that resolves the exception and marks the invoice paid.",
+  "@exceptionDetailErpPaymentRecordOnWeb": {
+    "description": "Recording the reported payment is web-only."
+  },
+  "exceptionDetailYourErp": "your ERP",
   "exceptionDetailSectionInvoice": "Invoice",
   "exceptionDetailNoLinkedInvoice": "No linked invoice",
   "exceptionDetailFieldNumber": "Number",
@@ -1259,7 +2168,9 @@
   "exceptionDetailResolvedInHours": "{hours} h",
   "@exceptionDetailResolvedInHours": {
     "placeholders": {
-      "hours": { "type": "String" }
+      "hours": {
+        "type": "String"
+      }
     }
   },
   "exceptionDetailSectionAssignee": "Assignee",
@@ -1281,7 +2192,9 @@
   "exceptionDetailLoadUsersFailed": "Could not load users: {error}",
   "@exceptionDetailLoadUsersFailed": {
     "placeholders": {
-      "error": { "type": "String" }
+      "error": {
+        "type": "String"
+      }
     }
   },
   "exceptionDetailAssigneeUpdateFailed": "Could not update the assignee",
@@ -1289,10 +2202,11 @@
   "exceptionDetailAssignedTo": "Assigned to {name}",
   "@exceptionDetailAssignedTo": {
     "placeholders": {
-      "name": { "type": "String" }
+      "name": {
+        "type": "String"
+      }
     }
   },
-
   "settingsProcurement": "Procurement",
   "settingsInspections": "Quality Inspections",
   "settingsInspectionsHint": "Record and review 4-way match inspections",
@@ -1309,7 +2223,15 @@
   "inspectionsRecord": "Record inspection",
   "inspectionsEmpty": "No quality inspections recorded.",
   "inspectionsEmptyFiltered": "No inspections with this outcome.",
-  "inspectionsLoadError": "Could not load inspections",
+  "inspectionsLoadErrorPrefix": "Couldn't load inspections: {error}",
+  "@inspectionsLoadErrorPrefix": {
+    "description": "Inspections list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "inspectionsResultPass": "Pass",
   "inspectionsResultFail": "Fail",
   "inspectionsResultPartial": "Partial acceptance",
@@ -1616,7 +2538,7 @@
     }
   },
   "invoiceWarningPastDue": "Invoice is past due",
-  "invoiceWarningAiAllowanceReached": "AI reading is paused: this month's {included, plural, one {{included} AI-read invoice is} other {{included} AI-read invoices are}} used. Enter the details manually, or upgrade your plan on the Billing page.",
+  "invoiceWarningAiAllowanceReached": "AI reading is paused: this month's {included, plural, one {{included} AI-read invoice is} other {{included} AI-read invoices are}} used. Enter the details manually, or upgrade your plan under Settings → Subscription.",
   "@invoiceWarningAiAllowanceReached": {
     "placeholders": {
       "included": {
@@ -1624,7 +2546,7 @@
       }
     }
   },
-  "invoiceWarningAiSpendCapReached": "AI reading is paused: this month's AI spending cap is reached. Enter the details manually, or raise the cap on the Billing page.",
+  "invoiceWarningAiSpendCapReached": "AI reading is paused: this month's AI spending cap is reached. Enter the details manually, or raise the cap under Settings → Subscription.",
   "invoiceWarningUnverifiedVendor": "Vendor is unverified",
   "invoiceWarningPersonalEmailDomain": "Vendor email uses personal domain: {domain}",
   "@invoiceWarningPersonalEmailDomain": {
@@ -1738,6 +2660,34 @@
       }
     }
   },
+  "invoiceWarningPoBilledBeyondTotal": "Other invoices already bill {billedAmount} against PO {poNumber}, whose total is {poTotal} — this invoice takes it past that total",
+  "@invoiceWarningPoBilledBeyondTotal": {
+    "placeholders": {
+      "billedAmount": {
+        "type": "String"
+      },
+      "poNumber": {
+        "type": "String"
+      },
+      "poTotal": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningPoBilledBeyondReceipt": "Invoices on PO {poNumber} bill {totalBilled}, this one included; goods worth {receivedValue} have been received",
+  "@invoiceWarningPoBilledBeyondReceipt": {
+    "placeholders": {
+      "totalBilled": {
+        "type": "String"
+      },
+      "poNumber": {
+        "type": "String"
+      },
+      "receivedValue": {
+        "type": "String"
+      }
+    }
+  },
   "invoiceWarningPoAmountVariancePoCurrencyUnknown": "Amount variance {variancePct} vs PO {poNumber}, which records no currency (invoice {invoiceAmount} vs PO {poTotal})",
   "@invoiceWarningPoAmountVariancePoCurrencyUnknown": {
     "placeholders": {
@@ -1765,6 +2715,41 @@
         "type": "String"
       },
       "poCurrency": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown": "The invoice records no valid currency and the POs behind {poNumber} are in different currencies ({poCurrencies}) — the amounts were not compared",
+  "@invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown": {
+    "placeholders": {
+      "poNumber": {
+        "type": "String"
+      },
+      "poCurrencies": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningPoCancelled": "PO {poNumber} is cancelled — the invoice was not matched against it",
+  "@invoiceWarningPoCancelled": {
+    "placeholders": {
+      "poNumber": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningPoNotIssued": "PO {poNumber} is not approved in the ERP yet — the invoice was not matched against it",
+  "@invoiceWarningPoNotIssued": {
+    "placeholders": {
+      "poNumber": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningPoTotalUnverifiable": "The total of PO {poNumber} could not be confirmed from the ERP on its last sync — the amounts were not compared",
+  "@invoiceWarningPoTotalUnverifiable": {
+    "placeholders": {
+      "poNumber": {
         "type": "String"
       }
     }
@@ -1965,6 +2950,31 @@
       }
     }
   },
+  "invoiceWarningContractCurrencyMismatch": "Invoice is in {invoiceCurrency} but contract {contractNumber} is in {contractCurrency} — its spend limit was not checked",
+  "@invoiceWarningContractCurrencyMismatch": {
+    "placeholders": {
+      "invoiceCurrency": {
+        "type": "String"
+      },
+      "contractNumber": {
+        "type": "String"
+      },
+      "contractCurrency": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown": "The invoice records no valid currency, so the spend limit in {contractCurrency} of contract {contractNumber} was not checked",
+  "@invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown": {
+    "placeholders": {
+      "contractNumber": {
+        "type": "String"
+      },
+      "contractCurrency": {
+        "type": "String"
+      }
+    }
+  },
   "invoiceWarningContractGlNotAllowed": "GL account {glAccount} is outside contract {contractNumber} allowed accounts",
   "@invoiceWarningContractGlNotAllowed": {
     "placeholders": {
@@ -2021,6 +3031,25 @@
       }
     }
   },
+  "invoiceWarningSelfCorrectionCurrencyConflict": "Amounts are printed in {printedCurrency}, but the invoice currency reads {fieldCurrency}. The amounts were left blank — enter them from the document.",
+  "@invoiceWarningSelfCorrectionCurrencyConflict": {
+    "placeholders": {
+      "printedCurrency": {
+        "type": "String"
+      },
+      "fieldCurrency": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceWarningSelfCorrectionCurrencyMixed": "Amounts are printed in more than one currency ({printedCurrencies}). The amounts were left blank — enter them from the document.",
+  "@invoiceWarningSelfCorrectionCurrencyMixed": {
+    "placeholders": {
+      "printedCurrencies": {
+        "type": "String"
+      }
+    }
+  },
   "invoiceWarningSelfCorrectionLineItemMath": "Line {lineNumber}: {quantity} × {unitPrice} = {expected}, but total is {total}.",
   "@invoiceWarningSelfCorrectionLineItemMath": {
     "placeholders": {
@@ -2041,7 +3070,7 @@
       }
     }
   },
-  "invoiceWarningGlCodesNotInChart": "AI suggested GL code(s) not in active chart: {codes}",
+  "invoiceWarningGlCodesNotInChart": "GL code(s) not in the active chart of accounts, left uncoded: {codes}",
   "@invoiceWarningGlCodesNotInChart": {
     "placeholders": {
       "codes": {
@@ -2076,6 +3105,17 @@
       }
     }
   },
+  "invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown": "Currency mismatch: invoice records no valid currency, POs in {poCurrencies} — amounts not compared",
+  "@invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown": {
+    "placeholders": {
+      "poCurrencies": {
+        "type": "String"
+      }
+    }
+  },
+  "invoicePoMatchIssuePoCancelled": "PO is cancelled — amounts not compared",
+  "invoicePoMatchIssuePoNotIssued": "PO not approved in the ERP yet — amounts not compared",
+  "invoicePoMatchIssuePoTotalUnverifiable": "PO total not confirmed by the ERP on its last sync — amounts not compared",
   "invoicePoMatchIssueAmountMismatch": "Amount mismatch: invoice {invoiceAmount} vs PO {poTotal} ({variancePct})",
   "@invoicePoMatchIssueAmountMismatch": {
     "placeholders": {
@@ -2176,6 +3216,382 @@
       }
     }
   },
+  "exceptionDescriptionErpPaidUnrecordedBlockingException": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.",
+  "@exceptionDescriptionErpPaidUnrecordedBlockingException": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedBlockingExceptionUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.",
+  "exceptionDescriptionErpPaidUnrecordedInRun": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP's payment from this exception.",
+  "@exceptionDescriptionErpPaidUnrecordedInRun": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedInRunUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP's payment from this exception.",
+  "exceptionDescriptionErpPaidUnrecordedPaymentLive": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP's payment is the real one, then record the ERP's payment from this exception.",
+  "@exceptionDescriptionErpPaidUnrecordedPaymentLive": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedPaymentLiveUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP's payment is the real one, then record the ERP's payment from this exception.",
+  "exceptionDescriptionErpPaidUnrecordedCardLive": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP's payment from this exception.",
+  "@exceptionDescriptionErpPaidUnrecordedCardLive": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedCardLiveUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP's payment from this exception.",
+  "exceptionDescriptionErpPaidUnrecordedCreditConflict": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because an applied credit memo no longer matches this invoice's supplier or currency, so the amount owed can't be stated. Correct the credit memo, then record the ERP's payment from this exception.",
+  "@exceptionDescriptionErpPaidUnrecordedCreditConflict": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedCreditConflictUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because an applied credit memo no longer matches this invoice's supplier or currency, so the amount owed can't be stated. Correct the credit memo, then record the ERP's payment from this exception.",
+  "exceptionDescriptionErpPaidUnrecordedNothingToPay": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.",
+  "@exceptionDescriptionErpPaidUnrecordedNothingToPay": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedNothingToPayUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.",
+  "exceptionDescriptionErpPaidUnrecordedNotPayable": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP's payment from this exception or resolve it.",
+  "@exceptionDescriptionErpPaidUnrecordedNotPayable": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedNotPayableUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP's payment from this exception or resolve it.",
+  "exceptionDescriptionErpPaidUnrecordedAmountMismatch": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP's payment from this exception or resolve it.",
+  "@exceptionDescriptionErpPaidUnrecordedAmountMismatch": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedAmountMismatchUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP's payment from this exception or resolve it.",
+  "exceptionDescriptionErpPaidUnrecordedOther": "{erp} reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP's payment from this exception or resolve it.",
+  "@exceptionDescriptionErpPaidUnrecordedOther": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidUnrecordedOtherUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP's payment from this exception or resolve it.",
+  "exceptionDescriptionErpPaidWithdrawn": "{erp} reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.",
+  "@exceptionDescriptionErpPaidWithdrawn": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidWithdrawnUnnamed": "Your ERP reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.",
+  "exceptionDescriptionErpPaidRetryFailed": "{erp} reports this bill paid, but FeohLedger couldn't record that payment automatically. Check the details, then record the ERP's payment from this exception.",
+  "@exceptionDescriptionErpPaidRetryFailed": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaidRetryFailedUnnamed": "Your ERP reports this bill paid, but FeohLedger couldn't record that payment automatically. Check the details, then record the ERP's payment from this exception.",
+  "exceptionDescriptionErpSettledShort": "{erp} reports this bill paid, but FeohLedger's own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.",
+  "@exceptionDescriptionErpSettledShort": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpSettledShortUnnamed": "Your ERP reports this bill paid, but FeohLedger's own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.",
+  "exceptionDescriptionErpVoidedAfterPost": "{erp} reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.",
+  "@exceptionDescriptionErpVoidedAfterPost": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpVoidedAfterPostUnnamed": "Your ERP reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.",
+  "exceptionDescriptionErpCreditSettlement": "The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.",
+  "exceptionDescriptionErpPaidWhileScheduled": "The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.",
+  "exceptionDescriptionErpPaidTwice": "FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.",
+  "exceptionDescriptionErpPartlyPaidOutside": "The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger payment for the full amount would overpay it. Reconcile what is still owed before paying.",
+  "exceptionDescriptionErpRecordedPaymentWithdrawn": "The ERP reported this bill paid, and FeohLedger recorded that payment, but the ERP no longer shows it paid (the payment was deleted or voided there). Confirm whether it is still owed.",
+  "exceptionDescriptionErpBillDeletedBlocking": "The bill this invoice was posted as has been deleted or voided in the ERP; FeohLedger will not pay it until someone confirms it is still owed.",
+  "exceptionDescriptionErpBillDeleted": "The bill this invoice was posted as has been deleted or voided in the ERP. Confirm the books still agree.",
+  "exceptionDescriptionErpBillUnlinkedNoDocument": "FeohLedger cannot check this invoice's bill in the ERP, because the ERP did not say which bill it created when the invoice was posted, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.",
+  "exceptionDescriptionErpBillUnlinkedNoCompany": "FeohLedger cannot check this invoice's bill in the ERP, because the posting did not record which ERP company it went to, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.",
+  "exceptionDescriptionErpBillUnlinkedOtherCompany": "FeohLedger cannot check this invoice's bill in the ERP, because it was posted to a different ERP company than the one now connected, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.",
+  "exceptionDescriptionErpDispatchStoppedPaid": "FeohLedger was about to pay this invoice, but the ERP shows its bill already paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.",
+  "exceptionDescriptionErpDispatchStoppedPartiallyPaid": "FeohLedger was about to pay this invoice, but the ERP shows its bill partly paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.",
+  "exceptionDescriptionErpDispatchStoppedDeleted": "FeohLedger was about to pay this invoice, but the ERP shows its bill deleted or voided. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.",
+  "exceptionDescriptionErpDispatchStoppedUnconfirmed": "FeohLedger was about to pay this invoice, but the ERP could not confirm its bill is still open and unpaid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.",
+  "exceptionDescriptionErpReportedPaymentVoided": "A payment the ERP reported was voided in FeohLedger, but the ERP may still show the bill paid. FeohLedger will not pay it again until someone confirms the ERP's payment is undone.",
+  "exceptionDescriptionErpPaymentWritebackFailed": "{erp} did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.",
+  "@exceptionDescriptionErpPaymentWritebackFailed": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaymentWritebackFailedUnnamed": "Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.",
+  "exceptionDescriptionErpPaymentWritebackBalanceOpen": "{erp} recorded this invoice's payment, but the bill still shows {amount} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.",
+  "@exceptionDescriptionErpPaymentWritebackBalanceOpen": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      },
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed": "Your ERP recorded this invoice's payment, but the bill still shows {amount} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.",
+  "@exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaymentVoidWritebackFailed": "{erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.",
+  "@exceptionDescriptionErpPaymentVoidWritebackFailed": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed": "Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.",
+  "exceptionDescriptionErpSyncBackFailed": "This invoice's payment settled, but FeohLedger could not finish recording it, so the invoice has not moved to Paid although the money has gone. Nothing retries this automatically: use Retry ERP sync on the payment's run in Payments.",
+  "exceptionDescriptionExtractionFailed": "Extraction failed: {errorClass}",
+  "@exceptionDescriptionExtractionFailed": {
+    "placeholders": {
+      "errorClass": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionPositivePayAlteredAmount": "Positive Pay return: check {checkNumber} altered amount",
+  "@exceptionDescriptionPositivePayAlteredAmount": {
+    "placeholders": {
+      "checkNumber": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionPositivePayNotOnFile": "Positive Pay return: check {checkNumber} not on issued file",
+  "@exceptionDescriptionPositivePayNotOnFile": {
+    "placeholders": {
+      "checkNumber": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionVendorBankChanged": "Vendor bank details changed; verify before payment.",
+  "exceptionDescriptionPayeeChangedSincePaid": "Payee changed since this invoice was last paid; verify before paying again.",
+  "exceptionDescriptionPayeeUnrecordedAfterMerge": "Vendor merged since this invoice was last paid, and that payment recorded no payee; verify before paying again.",
+  "exceptionDescriptionComplianceHoldFindings": "Payment held for compliance review ({count, plural, one {{count} reason} other {{count} reasons}})",
+  "@exceptionDescriptionComplianceHoldFindings": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceNoScreenableVendor": "No screenable vendor on the invoice",
+  "exceptionDescriptionComplianceProviderUnavailable": "Sanctions screening could not run: no adapter for the configured provider “{provider}”",
+  "@exceptionDescriptionComplianceProviderUnavailable": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceReviewRequired": "Vendor screening via {provider} requires review ({matchedList})",
+  "@exceptionDescriptionComplianceReviewRequired": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "matchedList": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceReviewRequiredUnlisted": "Vendor screening via {provider} requires review (see the screening record)",
+  "@exceptionDescriptionComplianceReviewRequiredUnlisted": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceUnrecognisedResult": "Vendor screening via {provider} returned an unrecognised result “{result}”; treated as requiring review",
+  "@exceptionDescriptionComplianceUnrecognisedResult": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "result": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceAdverseMedia": "Vendor screening via {provider} found adverse media (negative news); AP review required",
+  "@exceptionDescriptionComplianceAdverseMedia": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceAdverseMediaUnnamedProvider": "Vendor screening found adverse media (negative news); AP review required",
+  "exceptionDescriptionComplianceAmlSpend": "Trailing 12-month spend with this vendor would reach {projected} (threshold {threshold}); AP review required",
+  "@exceptionDescriptionComplianceAmlSpend": {
+    "placeholders": {
+      "projected": {
+        "type": "String"
+      },
+      "threshold": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionComplianceAmlSpendPartial": "Trailing 12-month spend with this vendor would reach at least {projected} (threshold {threshold}); AP review required. {excluded, plural, one {{excluded} payment was} other {{excluded} payments were}} left out for having no figure in the home currency, so the real total is higher",
+  "@exceptionDescriptionComplianceAmlSpendPartial": {
+    "placeholders": {
+      "projected": {
+        "type": "String"
+      },
+      "threshold": {
+        "type": "String"
+      },
+      "excluded": {
+        "type": "int"
+      }
+    }
+  },
+  "exceptionDescriptionPaymentAgedOut": "Payment {paymentId} was still in flight after {hours}h and the reconciler marked it failed; the rail never confirmed, so the money may or may not have moved. The invoice is “{invoiceStatus}”. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.",
+  "@exceptionDescriptionPaymentAgedOut": {
+    "placeholders": {
+      "paymentId": {
+        "type": "String"
+      },
+      "hours": {
+        "type": "String"
+      },
+      "invoiceStatus": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionPaymentDispatchInDoubt": "Payment {paymentId} failed during dispatch ({failureCode}) after the processor may already have accepted it, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.",
+  "@exceptionDescriptionPaymentDispatchInDoubt": {
+    "placeholders": {
+      "paymentId": {
+        "type": "String"
+      },
+      "failureCode": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionPaymentDispatchInterruptedFailed": "Payment {paymentId} failed, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.",
+  "@exceptionDescriptionPaymentDispatchInterruptedFailed": {
+    "placeholders": {
+      "paymentId": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionPaymentDispatchInterruptedCancelled": "Payment {paymentId} was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.",
+  "@exceptionDescriptionPaymentDispatchInterruptedCancelled": {
+    "placeholders": {
+      "paymentId": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionSettlementCurrencyMismatch": "Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved in a currency AP did not authorize — reconcile with the processor before releasing this invoice.",
+  "@exceptionDescriptionSettlementCurrencyMismatch": {
+    "placeholders": {
+      "settledAmount": {
+        "type": "String"
+      },
+      "settledCurrency": {
+        "type": "String"
+      },
+      "authorizedAmount": {
+        "type": "String"
+      },
+      "authorizedCurrency": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionSettlementAmountOver": "Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, MORE than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.",
+  "@exceptionDescriptionSettlementAmountOver": {
+    "placeholders": {
+      "settledAmount": {
+        "type": "String"
+      },
+      "settledCurrency": {
+        "type": "String"
+      },
+      "authorizedAmount": {
+        "type": "String"
+      },
+      "authorizedCurrency": {
+        "type": "String"
+      },
+      "variance": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionSettlementAmountUnder": "Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, LESS than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.",
+  "@exceptionDescriptionSettlementAmountUnder": {
+    "placeholders": {
+      "settledAmount": {
+        "type": "String"
+      },
+      "settledCurrency": {
+        "type": "String"
+      },
+      "authorizedAmount": {
+        "type": "String"
+      },
+      "authorizedCurrency": {
+        "type": "String"
+      },
+      "variance": {
+        "type": "String"
+      }
+    }
+  },
   "warningsPoMatchStatusMatched": "Matched",
   "warningsPoMatchStatusMismatch": "Mismatch",
   "warningsPoMatchStatusPartial": "Partial",
@@ -2185,6 +3601,945 @@
     "placeholders": {
       "summary": {
         "type": "String"
+      }
+    }
+  },
+  "codedRefusalInvoiceNotInReview": "This invoice is not awaiting review, so it cannot be approved or rejected.",
+  "@codedRefusalInvoiceNotInReview": {
+    "description": "Coded refusal `invoice_not_in_review` (services/review.refuse_unless_in_review): the approve / reject verdict on an invoice not in ready_for_review, and a bulk approve / reject skip."
+  },
+  "codedRefusalInvoiceBulkNotFound": "This invoice wasn't found in the selected entity.",
+  "@codedRefusalInvoiceBulkNotFound": {
+    "description": "Coded refusal `invoice_bulk_not_found`: a bulk status skip for an id not found in the selected entity."
+  },
+  "codedRefusalInvoiceStatusImmutable": "This invoice is {status}, so it can no longer be changed.",
+  "@codedRefusalInvoiceStatusImmutable": {
+    "description": "Coded refusal `invoice_status_immutable`: a bulk status skip for an invoice in an immutable status.",
+    "placeholders": {
+      "status": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalInvoiceRecallOneAtATime": "An approval is recalled one invoice at a time, with a reason: use Recall approval on the invoice.",
+  "@codedRefusalInvoiceRecallOneAtATime": {
+    "description": "Coded refusal `invoice_recall_one_at_a_time`: a bulk move to Ready for Review of an approved invoice, which only Recall approval may do. Names the invoiceDetailRecall button."
+  },
+  "codedRefusalInvoiceBulkRefused": "This invoice could not be changed to {status}.",
+  "@codedRefusalInvoiceBulkRefused": {
+    "description": "Coded refusal `invoice_bulk_refused`: a bulk status skip for a row refused without a code of its own; status is the target status label.",
+    "placeholders": {
+      "status": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalInvoiceRequiredFieldsMissing": "Required fields missing: {fields}",
+  "@codedRefusalInvoiceRequiredFieldsMissing": {
+    "description": "Coded refusal `invoice_required_fields_missing`: a bulk submit for review skipped for missing fields.",
+    "placeholders": {
+      "fields": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalInvoiceTransitionInvalid": "This invoice can't move from {from} to {to}.",
+  "@codedRefusalInvoiceTransitionInvalid": {
+    "description": "Coded refusal `invoice_transition_invalid`: the state machine refused the edge (a bulk status skip).",
+    "placeholders": {
+      "from": {
+        "type": "String"
+      },
+      "to": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalInvoiceTransitionRecallOnly": "This invoice can move from {from} to {to} only by recalling its approval, one invoice at a time: use Recall approval on the invoice.",
+  "@codedRefusalInvoiceTransitionRecallOnly": {
+    "description": "Coded refusal `invoice_transition_recall_only`: the edge exists only as a recall of the approval. Names the invoiceDetailRecall button.",
+    "placeholders": {
+      "from": {
+        "type": "String"
+      },
+      "to": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalInvoiceOnceApprovedNotReread": "This invoice has already been approved, so its document can't be read again. Recall its approval and correct it instead.",
+  "@codedRefusalInvoiceOnceApprovedNotReread": {
+    "description": "Coded refusal `invoice_once_approved_not_reread`: a once-approved invoice can't be sent back to extraction (a bulk move to Pending)."
+  },
+  "invoicesBulkSkipNoReason": "No reason given",
+  "@invoicesBulkSkipNoReason": {
+    "description": "Shown under a skipped invoice in the bulk status result dialog when the server gave no reason."
+  },
+  "invoicesBulkSkipNoNumber": "Invoice (no number)",
+  "@invoicesBulkSkipNoNumber": {
+    "description": "Names a skipped invoice that has no invoice number in the bulk status result dialog, instead of its internal id."
+  },
+  "reviewVerdictsUnavailable": "Couldn't check what you can do here — pull to retry",
+  "@reviewVerdictsUnavailable": {
+    "description": "One line shown (and announced) when the server's verdict on which review actions the user may take could not be read — offline, a cached approvals queue, or a failed request. Approve / Reject stay unavailable until a pull-to-refresh reads it."
+  },
+  "reviewVerdictsChecking": "Checking what you can do here…",
+  "@reviewVerdictsChecking": {
+    "description": "Placeholder in the invoice detail action bar while the server's verdict on Approve / Reject is loading."
+  },
+  "payRecordOnlyBanner": "FeohLedger records payments but never sends them: pay from your bank or ERP, then record each one here (a run's bank file is on the web app).",
+  "@payRecordOnlyBanner": {
+    "description": "Pay tab banner on a tenant whose payments FeohLedger records but never sends (GET /api/payments/execution-mode = record_only)."
+  },
+  "payRecordPrefilledFromErp": "Filled in from the payment {erp} reported. Check the details before you record it.",
+  "@payRecordPrefilledFromErp": {
+    "description": "Record-as-paid dialog note when the queue row's erp_reported_payment pre-filled the form.",
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "payRecordErpAmount": "Amount {erp} reports paid",
+  "@payRecordErpAmount": {
+    "description": "Label for the cash the ERP states was paid, beside the amount owed.",
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "payRecordSplitTitle": "How {erp} says it was paid",
+  "@payRecordSplitTitle": {
+    "description": "Heading over the ERP's rail-by-rail payment breakdown.",
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "payRecordRailNotStated": "Method not stated",
+  "@payRecordRailNotStated": {
+    "description": "A breakdown part whose rail the ERP did not state (or cannot be recorded outside FeohLedger)."
+  },
+  "payRecordSplitMethod": "Split across the methods above",
+  "@payRecordSplitMethod": {
+    "description": "Stands in for the method picker when the ERP's split is the record (split_stands true)."
+  },
+  "payRecordSplitStands": "This payment was made with more than one method, so it is recorded with this split. One method cannot describe it.",
+  "@payRecordSplitStands": {
+    "description": "Note under the split: the server judged it stands (decisions §413)."
+  },
+  "payRecordSplitDropped": "These parts do not add up to the amount paid, so the split is not kept. The method you choose is recorded for the whole payment.",
+  "@payRecordSplitDropped": {
+    "description": "Note under the split: judged and does not add up."
+  },
+  "payRecordSplitUnjudged": "Whether this split is kept is decided when the payment is recorded. If it is not kept, the method you choose is recorded for the whole payment.",
+  "@payRecordSplitUnjudged": {
+    "description": "Note under the split: not judged."
+  },
+  "payRecordAction": "Record as paid",
+  "@payRecordAction": {
+    "description": "Queue-row button: record this invoice as paid outside FeohLedger."
+  },
+  "payRecordActionLabel": "Record as paid — invoice {invoice}",
+  "@payRecordActionLabel": {
+    "description": "Screen-reader label of the queue-row Record as paid button.",
+    "placeholders": {
+      "invoice": {
+        "type": "String"
+      }
+    }
+  },
+  "payRecordTitle": "Record a payment made outside FeohLedger",
+  "payRecordIntro": "Use this when you have already paid the supplier from your own bank or ERP. FeohLedger records the payment and marks the invoice paid. It doesn't send any money.",
+  "payRecordAmountOwed": "Amount owed",
+  "payRecordAmountHint": "The full amount owed is recorded, net of applied credit memos and any accepted early-payment discount still open on the paid-on date. Partial payments can't be recorded.",
+  "payRecordMethod": "How you paid",
+  "payRecordReference": "Reference",
+  "payRecordReferenceHint": "The cheque number or your bank's confirmation number. Bank reconciliation matches on it.",
+  "payRecordPaidOn": "Paid on",
+  "payRecordSubmit": "Record as paid",
+  "payRecordSubmitting": "Recording…",
+  "payRecordRecorded": "Invoice {invoice} recorded as paid",
+  "@payRecordRecorded": {
+    "placeholders": {
+      "invoice": {
+        "type": "String"
+      }
+    }
+  },
+  "payRecordFailed": "Could not record the payment",
+  "payRecordUnavailable": "This invoice can't be recorded as paid yet.",
+  "@payRecordUnavailable": {
+    "description": "Fallback reason a queue row cannot be recorded as paid, when its refusal code is unknown to this build."
+  },
+  "payMethodBacs": "BACS",
+  "payMethodFasterPayments": "Faster Payments",
+  "payMethodChaps": "CHAPS",
+  "payMethodCardOutside": "Card (outside FeohLedger)",
+  "@payMethodCardOutside": {
+    "description": "A payment card used outside FeohLedger's own card programme."
+  },
+  "payRunActionRecord": "Record run as paid…",
+  "@payRunActionRecord": {
+    "description": "Run menu item: record the whole run as paid outside FeohLedger."
+  },
+  "payRunRecordTitle": "Record run as paid",
+  "payRunRecordIntro": "Once your bank has taken the payments, record them here. Every payment in the run is marked completed and its invoice paid. Nothing is sent.",
+  "payRunRecordReference": "Bank batch reference",
+  "payRunRecordReferenceHint": "The confirmation number your bank gave the batch. Bank reconciliation matches on it.",
+  "payRunRecordSubmit": "Record as paid · {amount}",
+  "@payRunRecordSubmit": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "payRunRecordRecorded": "{count, plural, one {{count} payment recorded as paid} other {{count} payments recorded as paid}}",
+  "@payRunRecordRecorded": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "payRunRecordFailed": "Could not record the run",
+  "payRunRecordLoadFailed": "Failed to load payment run",
+  "payRunStatusExported": "Exported",
+  "@payRunStatusExported": {
+    "description": "Payment-run status: its bank (NACHA) file was downloaded and it awaits recording."
+  },
+  "codedRefusalPaymentsRecordOnly": "FeohLedger does not send payments for this organization. Pay the supplier from your bank or ERP, then record the payment as paid outside FeohLedger.",
+  "codedRefusalExternalPaymentForInvoice": "Invoice {invoice}: {reason}",
+  "@codedRefusalExternalPaymentForInvoice": {
+    "placeholders": {
+      "invoice": {
+        "type": "String"
+      },
+      "reason": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentNotPayable": "Only an approved invoice that has not been paid can be recorded as paid (this one is {status}).",
+  "@codedRefusalExternalPaymentNotPayable": {
+    "placeholders": {
+      "status": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentSegregation": "Segregation of duties: you created or shaped this invoice, so a different user must record its payment.",
+  "codedRefusalExternalPaymentCardLive": "A live virtual card is issued against this invoice. Cancel the card before recording a payment made another way.",
+  "codedRefusalExternalPaymentCreditConflict": "An applied credit memo no longer matches this invoice's vendor or currency, so the amount owed can't be stated. Correct the invoice first.",
+  "codedRefusalExternalPaymentNothingToPay": "This invoice is fully covered by applied credit memos, so there is nothing to record as paid.",
+  "codedRefusalExternalPaymentPaymentLive": "A payment for this invoice is already in progress or settled ({status}). Void it before recording a payment made another way.",
+  "@codedRefusalExternalPaymentPaymentLive": {
+    "placeholders": {
+      "status": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentInRun": "This invoice is in payment run {run}. Record the whole run as paid outside FeohLedger, or cancel the run first.",
+  "@codedRefusalExternalPaymentInRun": {
+    "placeholders": {
+      "run": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentAmountMismatch": "The amount must equal what the invoice owes ({amount}), net of applied credit memos and any accepted early-payment discount. Partial payments can't be recorded.",
+  "@codedRefusalExternalPaymentAmountMismatch": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentAmountChanged": "What this invoice owes has changed since the run was staged ({staged} staged, {amount} owed now) because of a credit memo or an early-payment discount. Resolve the difference with the supplier, then record the invoice on its own.",
+  "@codedRefusalExternalPaymentAmountChanged": {
+    "placeholders": {
+      "staged": {
+        "type": "String"
+      },
+      "amount": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentErpSplit": "The ERP reports this invoice paid with more than one payment method. Record it from its exception, which keeps how the payment was split.",
+  "codedRefusalExternalPaymentErpSplitInRun": "This invoice is in payment run {run}, and the ERP reports it paid with more than one payment method, which only its exception can record. Cancel the run first, then record the invoice from its exception.",
+  "@codedRefusalExternalPaymentErpSplitInRun": {
+    "placeholders": {
+      "run": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalExternalPaymentPaidOnFuture": "The paid-on date can't be in the future.",
+  "codedRefusalPaymentRunSegregation": "Segregation of duties: the user who created this payment run cannot also approve or execute it. A different user must.",
+  "codedRefusalPaymentRunSegregationRecord": "Segregation of duties: the user who created this payment run cannot also record it as paid. A different user must.",
+  "codedRefusalPaymentRunSegregationExport": "Segregation of duties: the user who created this payment run cannot also export its bank file. A different user must.",
+  "codedRefusalPaymentRunAwaitingCfo": "This run exceeds the organization's CFO-approval threshold and is awaiting sign-off from a user with the CFO role.",
+  "codedRefusalMfaCodeInvalid": "That code is not valid. Check your authenticator app and try again.",
+  "codedRefusalMfaEmailCodeInvalid": "That code is not valid or has expired. Request a new code and try again.",
+  "codedRefusalPaymentRunNotRecordable": "Only a draft run, or one whose bank file was exported, can be recorded as paid.",
+  "codedRefusalPaymentRunNothingToRecord": "This run has no payments left to record.",
+  "codedRefusalExternalPaymentBlockingException": "This invoice has an unresolved payment-blocking exception. Resolve it before recording the invoice as paid.",
+  "@codedRefusalExternalPaymentBlockingException": {
+    "description": "The type is not named here: the queue row's blocked chip already names it."
+  },
+  "grRecordTitle": "Record goods receipt",
+  "@grRecordTitle": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.title`."
+  },
+  "grRecordIntro": "Record what arrived against a purchase order. Invoices that quote the PO are matched again as soon as you save.",
+  "@grRecordIntro": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.intro`."
+  },
+  "grRecordSearchPo": "Find PO",
+  "@grRecordSearchPo": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.searchPo`."
+  },
+  "grRecordSearchPlaceholder": "PO number",
+  "@grRecordSearchPlaceholder": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.searchPlaceholder`."
+  },
+  "grRecordPo": "Purchase order",
+  "@grRecordPo": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.po`."
+  },
+  "grRecordNoPos": "No matching purchase orders",
+  "@grRecordNoPos": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.noPos`."
+  },
+  "grRecordLoadPosFailed": "Failed to load purchase orders",
+  "@grRecordLoadPosFailed": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.loadPosFailed`."
+  },
+  "grRecordLoadPoFailed": "Failed to load the purchase order",
+  "@grRecordLoadPoFailed": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.loadPoFailed`."
+  },
+  "grRecordPoCancelled": "Purchase order {number} is cancelled, so nothing can be received against it.",
+  "@grRecordPoCancelled": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.poCancelled`.",
+    "placeholders": {
+      "number": {
+        "type": "String"
+      }
+    }
+  },
+  "grRecordOrdered": "Ordered",
+  "@grRecordOrdered": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.ordered`."
+  },
+  "grRecordAlreadyReceived": "Received so far",
+  "@grRecordAlreadyReceived": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.alreadyReceived`."
+  },
+  "grRecordOutstanding": "Outstanding",
+  "@grRecordOutstanding": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.outstanding`."
+  },
+  "grRecordThisDelivery": "This delivery",
+  "@grRecordThisDelivery": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.thisDelivery`."
+  },
+  "grRecordQuantityFor": "Quantity received for {line}",
+  "@grRecordQuantityFor": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.quantityFor`.",
+    "placeholders": {
+      "line": {
+        "type": "String"
+      }
+    }
+  },
+  "grRecordOverReceipt": "More than is outstanding. Matching will flag this as an over-receipt.",
+  "@grRecordOverReceipt": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.overReceipt`."
+  },
+  "grRecordLinesHint": "Leave a line blank if it wasn't part of this delivery. Enter 0 to record that it was expected but didn't arrive.",
+  "@grRecordLinesHint": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.linesHint`."
+  },
+  "grRecordNoPoLines": "This purchase order has no lines, so describe what arrived.",
+  "@grRecordNoPoLines": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.noPoLines`."
+  },
+  "grRecordAddLine": "Add line",
+  "@grRecordAddLine": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.addLine`."
+  },
+  "grRecordRemoveLine": "Remove line {n}",
+  "@grRecordRemoveLine": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.removeLine`.",
+    "placeholders": {
+      "n": {
+        "type": "int"
+      }
+    }
+  },
+  "grRecordLineDescription": "Description, line {n}",
+  "@grRecordLineDescription": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.lineDescription`.",
+    "placeholders": {
+      "n": {
+        "type": "int"
+      }
+    }
+  },
+  "grRecordLineQuantity": "Quantity received, line {n}",
+  "@grRecordLineQuantity": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.lineQuantity`.",
+    "placeholders": {
+      "n": {
+        "type": "int"
+      }
+    }
+  },
+  "grRecordReceivedDate": "Received on",
+  "@grRecordReceivedDate": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.receivedDate`."
+  },
+  "grRecordNumber": "Delivery note number",
+  "@grRecordNumber": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.number`."
+  },
+  "grRecordNumberHint": "Optional. The supplier's packing slip or delivery note number.",
+  "@grRecordNumberHint": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.numberHint`."
+  },
+  "grRecordNumberPlaceholder": "Blank: GR-{po}-n",
+  "@grRecordNumberPlaceholder": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.numberPlaceholder`.",
+    "placeholders": {
+      "po": {
+        "type": "String"
+      }
+    }
+  },
+  "grRecordSaving": "Recording…",
+  "@grRecordSaving": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.saving`."
+  },
+  "grRecordSubmit": "Record receipt",
+  "@grRecordSubmit": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.submit`."
+  },
+  "grRecordRecorded": "Recorded goods receipt {number}",
+  "@grRecordRecorded": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.toast.recorded`.",
+    "placeholders": {
+      "number": {
+        "type": "String"
+      }
+    }
+  },
+  "grRecordFailed": "Failed to record the goods receipt",
+  "@grRecordFailed": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.toast.recordFailed`."
+  },
+  "settingsGoodsReceipt": "Record receipt",
+  "@settingsGoodsReceipt": {
+    "description": "Goods-receipt record form; mirrors web `goodsReceipts.record.action`."
+  },
+  "codedRefusalGoodsReceiptPoCancelled": "Purchase order {poNumber} is cancelled; nothing can be received against it.",
+  "@codedRefusalGoodsReceiptPoCancelled": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptPoCancelled`.",
+    "placeholders": {
+      "poNumber": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalGoodsReceiptNumberTaken": "A goods receipt numbered {grNumber} already exists.",
+  "@codedRefusalGoodsReceiptNumberTaken": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptNumberTaken`.",
+    "placeholders": {
+      "grNumber": {
+        "type": "String"
+      }
+    }
+  },
+  "codedRefusalGoodsReceiptLineNotOnPo": "Every received line must be one of this purchase order's lines.",
+  "@codedRefusalGoodsReceiptLineNotOnPo": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptLineNotOnPo`."
+  },
+  "codedRefusalGoodsReceiptLineDuplicated": "A purchase-order line can appear only once on a receipt.",
+  "@codedRefusalGoodsReceiptLineDuplicated": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptLineDuplicated`."
+  },
+  "codedRefusalGoodsReceiptLineRequired": "Describe what was received on each line.",
+  "@codedRefusalGoodsReceiptLineRequired": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptLineRequired`."
+  },
+  "codedRefusalGoodsReceiptNothingReceived": "A receipt must record at least one unit received.",
+  "@codedRefusalGoodsReceiptNothingReceived": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptNothingReceived`."
+  },
+  "codedRefusalGoodsReceiptIdempotencyReused": "This request was already used for a different purchase order. Reopen the form and try again.",
+  "@codedRefusalGoodsReceiptIdempotencyReused": {
+    "description": "Goods-receipt record form; mirrors web `refusal.goodsReceiptIdempotencyReused`."
+  },
+  "settingsGoodsReceiptHint": "Count a delivery in against a purchase order",
+  "@settingsGoodsReceiptHint": {
+    "description": "Settings → Procurement: subtitle of the record-goods-receipt entry."
+  },
+  "grRecordSegregationNote": "Segregation of duties: once you record this receipt, you can't approve an invoice billed against this purchase order, and a receipt you record after approving one doesn't release it.",
+  "@grRecordSegregationNote": {
+    "description": "Note on the goods-receipt form: the receiver may not approve invoices on this PO (backend decisions §267, §389)."
+  },
+  "grRecordReceiveLines": "Enter a quantity on at least one line",
+  "@grRecordReceiveLines": {
+    "description": "Goods-receipt form: shown when submit is tried with no positive quantity on any line."
+  },
+  "listShowingSavedCopy": "Showing a saved copy — couldn't reach the server. Tap Retry to try again.",
+  "listRefreshFailed": "Couldn't refresh — showing the last list loaded. Tap Retry to try again.",
+  "exceptionsLoadErrorPrefix": "Couldn't load exceptions: {error}",
+  "@exceptionsLoadErrorPrefix": {
+    "description": "Exceptions list first-load failure carrying the server's own reason (a 403 / 500 detail). A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "contractsLoadErrorPrefix": "Couldn't load contracts: {error}",
+  "@contractsLoadErrorPrefix": {
+    "description": "Contracts list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "errorNetworkUnreachable": "Couldn't reach the server. Check your connection and try again.",
+  "@errorNetworkUnreachable": {
+    "description": "A store's error text when the request never reached the server (offline, DNS, timeout, TLS)."
+  },
+  "errorRequestFailed": "The server couldn't complete the request (HTTP {status}).",
+  "@errorRequestFailed": {
+    "description": "A store's error text when the server refused without a sentence of its own.",
+    "placeholders": {
+      "status": {
+        "type": "int"
+      }
+    }
+  },
+  "errorUnexpected": "Something went wrong. Please try again.",
+  "@errorUnexpected": {
+    "description": "A store's error text for a failure that is neither a server refusal nor a network fault (an unreadable reply)."
+  },
+  "payRunCreated": "{cfo, select, required{{count, plural, one{Payment run created with {count} payment totalling {amount}. CFO approval is required before it can be executed.} other{Payment run created with {count} payments totalling {amount}. CFO approval is required before it can be executed.}}} other{{count, plural, one{Payment run created with {count} payment totalling {amount}.} other{Payment run created with {count} payments totalling {amount}.}}}}",
+  "@payRunCreated": {
+    "description": "Run-created toast. `cfo` is `required` when the run trips the CFO approval threshold, else `none`.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "amount": {
+        "type": "String"
+      },
+      "cfo": {
+        "type": "String"
+      }
+    }
+  },
+  "payRunCreatedPlain": "{cfo, select, required{Payment run created. CFO approval is required before it can be executed.} other{Payment run created.}}",
+  "@payRunCreatedPlain": {
+    "description": "Run-created toast when the reply carries no count or total. `cfo` as in payRunCreated.",
+    "placeholders": {
+      "cfo": {
+        "type": "String"
+      }
+    }
+  },
+  "payRunApproved": "Run approved by CFO",
+  "payRunExecuted": "Payment run executed via {provider}: {completed, plural, one{{completed} completed} other{{completed} completed}}, {inFlight, plural, one{{inFlight} in flight} other{{inFlight} in flight}}, {failed, plural, one{{failed} failed} other{{failed} failed}}.",
+  "@payRunExecuted": {
+    "description": "Run-executed toast. `provider` is the payment adapter's name, as the server reports it.",
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      },
+      "completed": {
+        "type": "int"
+      },
+      "inFlight": {
+        "type": "int"
+      },
+      "failed": {
+        "type": "int"
+      }
+    }
+  },
+  "payRunExecutedPlain": "Payment run executed.",
+  "payRunExecutedCards": "{count, plural, one {{count} virtual card issued.} other {{count} virtual cards issued.}}",
+  "@payRunExecutedCards": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "payRunCancelled": "{count, plural, one {Draft run cancelled; {count} invoice returned to the queue.} other {Draft run cancelled; {count} invoices returned to the queue.}}",
+  "@payRunCancelled": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "payRunCancelledPlain": "Payment run cancelled.",
+  "vendorSyncSummary": "Synced {created, plural, one{{created} new} other{{created} new}}, {updated, plural, one{{updated} updated} other{{updated} updated}}, {unchanged, plural, one{{unchanged} unchanged} other{{unchanged} unchanged}}.",
+  "@vendorSyncSummary": {
+    "placeholders": {
+      "created": {
+        "type": "int"
+      },
+      "updated": {
+        "type": "int"
+      },
+      "unchanged": {
+        "type": "int"
+      }
+    }
+  },
+  "vendorSyncComplete": "ERP sync complete.",
+  "vendorSyncNotLinked": "{count, plural, one{{count} not linked (the name matches more than one vendor).} other{{count} not linked (the name matches more than one vendor).}}",
+  "@vendorSyncNotLinked": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "vendorSyncUnlinked": "{count, plural, one{{count} unlinked (linked under another ERP company).} other{{count} unlinked (linked under another ERP company).}}",
+  "@vendorSyncUnlinked": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "vendorSyncRelinked": "{count, plural, one{{count} relinked (linked when this ERP company was connected before).} other{{count} relinked (linked when this ERP company was connected before).}}",
+  "@vendorSyncRelinked": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "authInvalidCredentials": "Invalid credentials",
+  "authInvalidCode": "Invalid or expired code. Please try again.",
+  "authVerifyCodeFailed": "Could not verify the code. Please try again.",
+  "authEmailCodeFailed": "Could not send the email code. Please try again.",
+  "exceptionsFilteredEmpty": "{status, select, open{No open exceptions} escalated{No escalated exceptions} resolved{No resolved exceptions} dismissed{No dismissed exceptions} other{No matching exceptions}}",
+  "@exceptionsFilteredEmpty": {
+    "description": "Exceptions list: the status chip filters every row out. `status` is the chip's API value.",
+    "placeholders": {
+      "status": {
+        "type": "String"
+      }
+    }
+  },
+  "contractsFilteredEmpty": "No contracts match your search or filter.",
+  "@contractsFilteredEmpty": {
+    "description": "Contracts list: the search query or status chip filters every row out."
+  },
+  "vendorsFilteredEmpty": "No vendors match your search or filter.",
+  "@vendorsFilteredEmpty": {
+    "description": "Vendors list: the search query or status chip filters every row out."
+  },
+  "commonShowAll": "Show all",
+  "@commonShowAll": {
+    "description": "Action on a filtered-to-zero list that clears the filter / search."
+  },
+  "listLoadMore": "Load more",
+  "@listLoadMore": {
+    "description": "Button under a paged list that reads its next page."
+  },
+  "listShowingCount": "Showing {shown} of {total}",
+  "@listShowingCount": {
+    "description": "Footer of a paged list while more rows exist on the server: rows shown of the server's total. Announced as a live region.",
+    "placeholders": {
+      "shown": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "listShowingAll": "{count, plural, one {Showing the only item} other {Showing all {count}}}",
+  "@listShowingAll": {
+    "description": "Footer of a paged list once every row is loaded; count is the server's total.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "listLoadMoreFailed": "Couldn't load more.",
+  "@listLoadMoreFailed": {
+    "description": "Footer of a paged list when reading the next page failed; the rows shown are still live and Load more retries."
+  },
+  "invoicesLoadErrorPrefix": "Couldn't load invoices: {error}",
+  "@invoicesLoadErrorPrefix": {
+    "description": "Invoices list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "approvalsLoadErrorPrefix": "Could not load pending approvals: {error}",
+  "@approvalsLoadErrorPrefix": {
+    "description": "Approvals queue first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.",
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "invoicesFilteredEmpty": "No invoices match these filters",
+  "@invoicesFilteredEmpty": {
+    "description": "Invoices list: a status chip, search or advanced filter leaves no rows."
+  },
+  "statusPillAnnounce": "Status: {label}",
+  "@statusPillAnnounce": {
+    "description": "Screen-reader announcement for a status pill, e.g. 'Status: Approved'.",
+    "placeholders": {
+      "label": {
+        "type": "String"
+      }
+    }
+  },
+  "vendorStatusActive": "Active",
+  "@vendorStatusActive": {
+    "description": "Vendor lifecycle status."
+  },
+  "vendorStatusUnverified": "Unverified",
+  "vendorStatusInactive": "Inactive",
+  "vendorStatusRejected": "Rejected",
+  "contractStatusDraft": "Draft",
+  "@contractStatusDraft": {
+    "description": "Contract lifecycle status."
+  },
+  "contractStatusActive": "Active",
+  "contractStatusExpired": "Expired",
+  "contractStatusTerminated": "Terminated",
+  "contractStatusCancelled": "Cancelled",
+  "contractTypePurchase": "Purchase",
+  "@contractTypePurchase": {
+    "description": "Contract type."
+  },
+  "contractTypeService": "Service",
+  "contractTypeSubscription": "Subscription",
+  "contractTypeLease": "Lease",
+  "contractTypeSla": "SLA",
+  "@contractTypeSla": {
+    "description": "Service-level agreement; keep the acronym where the market uses it."
+  },
+  "contractTypeMsa": "MSA",
+  "@contractTypeMsa": {
+    "description": "Master services agreement."
+  },
+  "contractTypeSow": "SOW",
+  "@contractTypeSow": {
+    "description": "Statement of work."
+  },
+  "contractTypeOther": "Other",
+  "exceptionStatusOpen": "Open",
+  "@exceptionStatusOpen": {
+    "description": "Exception-queue status."
+  },
+  "exceptionStatusEscalated": "Escalated",
+  "exceptionStatusResolved": "Resolved",
+  "exceptionStatusDismissed": "Dismissed",
+  "exceptionSeverityError": "Error",
+  "@exceptionSeverityError": {
+    "description": "Exception severity."
+  },
+  "exceptionSeverityWarning": "Warning",
+  "exceptionSeverityInfo": "Info",
+  "vendorSourceErp": "ERP",
+  "@vendorSourceErp": {
+    "description": "Where a vendor record came from: synced from the ERP."
+  },
+  "vendorSourceAi": "AI",
+  "@vendorSourceAi": {
+    "description": "Vendor record created by AI extraction."
+  },
+  "vendorSourceManual": "Manual",
+  "@vendorSourceManual": {
+    "description": "Vendor record entered by hand."
+  },
+  "vendorSourceOther": "Other source",
+  "@vendorSourceOther": {
+    "description": "Vendor source the app does not recognise."
+  },
+  "notificationEventInvoiceAssigned": "Invoice assigned",
+  "@notificationEventInvoiceAssigned": {
+    "description": "Notification event type."
+  },
+  "notificationEventInvoiceApproved": "Invoice approved",
+  "notificationEventInvoiceRejected": "Invoice rejected",
+  "notificationEventInvoicePaid": "Invoice paid",
+  "notificationEventContractRenewalDue": "Contract renewal due",
+  "notificationEventChatMessage": "New message",
+  "notificationEventOther": "Notification",
+  "@notificationEventOther": {
+    "description": "An event type this app version does not know."
+  },
+  "notificationUnread": "Unread",
+  "@notificationUnread": {
+    "description": "Announced first on an unread notification row."
+  },
+  "relativeTimeJustNow": "just now",
+  "@relativeTimeJustNow": {
+    "description": "Notification age under a minute."
+  },
+  "relativeTimeMinutesAgo": "{count, plural, one {{count} minute ago} other {{count} minutes ago}}",
+  "@relativeTimeMinutesAgo": {
+    "description": "Notification age in minutes.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "relativeTimeHoursAgo": "{count, plural, one {{count} hour ago} other {{count} hours ago}}",
+  "@relativeTimeHoursAgo": {
+    "description": "Notification age in hours.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "relativeTimeDaysAgo": "{count, plural, one {{count} day ago} other {{count} days ago}}",
+  "@relativeTimeDaysAgo": {
+    "description": "Notification age in days (under a week).",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "notificationBellUnread": "Notifications, {count} unread",
+  "@notificationBellUnread": {
+    "description": "Bell button announcement carrying the live unread count.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "cashFlowButtonLabel": "Cash flow forecast",
+  "@cashFlowButtonLabel": {
+    "description": "App-bar action that opens the cash-flow forecast."
+  },
+  "listRowSelected": "Selected",
+  "@listRowSelected": {
+    "description": "Row announcement prefix in multi-select mode."
+  },
+  "listRowNotSelected": "Not selected",
+  "listRowInvoiceNumber": "invoice {number}",
+  "@listRowInvoiceNumber": {
+    "description": "Row announcement fragment naming an invoice number.",
+    "placeholders": {
+      "number": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowDue": "due {date}",
+  "@listRowDue": {
+    "description": "Row announcement fragment: due date not yet passed.",
+    "placeholders": {
+      "date": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowPastDue": "past due {date}",
+  "@listRowPastDue": {
+    "description": "Row announcement fragment: due date already passed.",
+    "placeholders": {
+      "date": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowSeverity": "{severity} severity",
+  "@listRowSeverity": {
+    "description": "Exception row announcement fragment, e.g. 'Error severity'.",
+    "placeholders": {
+      "severity": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowOverdue": "Overdue",
+  "@listRowOverdue": {
+    "description": "Exception row flag: past its SLA."
+  },
+  "listRowContractNumber": "contract {number}",
+  "@listRowContractNumber": {
+    "description": "Contract row announcement fragment.",
+    "placeholders": {
+      "number": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowEnds": "ends {date}",
+  "@listRowEnds": {
+    "description": "Contract row announcement fragment: end date.",
+    "placeholders": {
+      "date": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowVendorCode": "code {code}",
+  "@listRowVendorCode": {
+    "description": "Vendor row announcement fragment.",
+    "placeholders": {
+      "code": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowVendorSource": "source {source}",
+  "@listRowVendorSource": {
+    "description": "Vendor row announcement fragment: where the record came from.",
+    "placeholders": {
+      "source": {
+        "type": "String"
+      }
+    }
+  },
+  "listRowInvoiceCount": "{count, plural, one {{count} invoice} other {{count} invoices}}",
+  "@listRowInvoiceCount": {
+    "description": "Vendor row announcement: how many invoices it has.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "listRowInvoiceCountShort": "{count, plural, one {{count} inv} other {{count} inv}}",
+  "@listRowInvoiceCountShort": {
+    "description": "Compact invoice count shown on a vendor row.",
+    "placeholders": {
+      "count": {
+        "type": "int"
       }
     }
   }

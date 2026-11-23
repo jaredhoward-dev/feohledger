@@ -11,8 +11,18 @@ the local ``fake_redis`` fixture and override this one.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from fastapi import Request
+
+# The payee bank-fingerprint key (decisions §383). pytest does not load
+# backend/.env.development, and with no key every payment records no
+# fingerprint and every void of one flags a payee change, which is right for a
+# misconfigured deployment and wrong as the suite's baseline. Set before any test
+# module builds `app.config.settings`; a value already in the environment wins.
+# tests/test_payment_payee_stamp.py pins the empty-key behaviour on its own.
+os.environ.setdefault("FEOH_PAYEE_FINGERPRINT_KEY", "test-payee-fingerprint-key-not-a-secret")
 
 
 class _FakeSortedSet:
@@ -40,8 +50,9 @@ class _FakeSortedSet:
 
 
 class _FakePipeline:
-    def __init__(self, sset: _FakeSortedSet) -> None:
+    def __init__(self, sset: _FakeSortedSet, kv: dict[str, str] | None = None) -> None:
         self._sset = sset
+        self._kv = kv if kv is not None else {}
         self._calls: list = []
 
     async def __aenter__(self):
@@ -59,6 +70,9 @@ class _FakePipeline:
     def zcard(self, key) -> None:
         self._calls.append(("zcard", key))
 
+    def incr(self, key) -> None:
+        self._calls.append(("incr", key))
+
     def expire(self, key, ttl) -> None:
         self._calls.append(("expire", key, ttl))
 
@@ -74,6 +88,10 @@ class _FakePipeline:
                 results.append(None)
             elif op == "zcard":
                 results.append(self._sset.zcard(call[1]))
+            elif op == "incr":
+                value = int(self._kv.get(call[1]) or 0) + 1
+                self._kv[call[1]] = str(value)
+                results.append(value)
             elif op == "expire":
                 results.append(True)
         return results
@@ -88,7 +106,7 @@ class _FakeRedis:
         self._kv: dict[str, str] = {}
 
     def pipeline(self, transaction: bool = True):  # noqa: ARG002
-        return _FakePipeline(self.sset)
+        return _FakePipeline(self.sset, self._kv)
 
     async def zrange(self, key, start, stop, withscores=False):
         return self.sset.zrange(key, start, stop, withscores=withscores)
@@ -127,6 +145,15 @@ class _FakeRedis:
                 del self._kv[k]
                 count += 1
         return count
+
+    async def incr(self, key: str) -> int:
+        # The ERP call budget's counters (`services/erp_call_budget.py`).
+        value = int(self._kv.get(key) or 0) + 1
+        self._kv[key] = str(value)
+        return value
+
+    async def expire(self, key: str, ttl: int) -> bool:  # noqa: ARG002 - TTL not simulated
+        return key in self._kv
 
     async def getdel(self, key: str):
         # Password-reset token consumption (`services/password_reset.py`) is
@@ -177,6 +204,9 @@ def _autouse_fake_redis(monkeypatch):
     # the per-IP/per-account rate-limit buckets those routes also touch reset
     # between tests instead of accumulating for real across a whole suite run.
     monkeypatch.setattr("app.services.password_reset.get_redis", _get_redis)
+    # The ERP call budget counts every Blackbaud SKY call in Redis; stubbed so
+    # adapter tests count in memory, fresh per test.
+    monkeypatch.setattr("app.services.erp_call_budget.get_redis", _get_redis)
     return fake
 
 
@@ -251,7 +281,7 @@ def temp_payment_adapter():
 #
 # The tenant pair is claimed EXCLUSIVELY by this pytest process for the whole
 # session — see ``_claim_realdb_slot`` below. Sharing it between two concurrent
-# pytest processes is not survivable: the per-test reset TRUNCATEs the tenant
+# pytest processes is not survivable: the per-test reset empties the tenant
 # tables and terminates every other backend on them, so each process would be
 # deleting the other's rows and killing its connections mid-test.
 #
@@ -273,7 +303,7 @@ import pytest_asyncio  # noqa: E402
 # Per-process tenant slot
 #
 # `feoh_pytesta` / `feoh_pytestb` are process-EXCLUSIVE, not merely suite-exclusive:
-# the reset below TRUNCATEs their tables and reaps every other backend on them.
+# the reset below empties their tables and reaps every other backend on them.
 # Two pytest processes pointed at the same Postgres therefore corrupt each other
 # (deleted rows + `ConnectionDoesNotExistError` in unrelated files), which reads
 # as flakiness rather than as the collision it is.
@@ -413,6 +443,78 @@ _REAP_STALE_BACKENDS_SQL = (
     "WHERE datname = current_database() AND pid <> pg_backend_pid() "
     "AND state IS DISTINCT FROM 'active'"
 )
+
+
+# The per-test tenant reset (see the `realdb` fixture below).
+#
+# It used to be one `TRUNCATE <every tenant table> RESTART IDENTITY CASCADE`.
+# That is correct but slow in a way that has nothing to do with how much data a
+# test wrote: TRUNCATE gives every named table (and each of its indexes and its
+# TOAST table) a brand-new relfilenode, and Postgres builds each new, empty
+# btree by writing it outside shared buffers and fsyncing it at once
+# (`DataFileImmediateSync`). With ~70 tenant tables and two tenants that was
+# hundreds of fsyncs per test — measured at ~5.2 s of setup per test locally,
+# against a test body of well under a second. Before/after numbers:
+# backend/CLAUDE.md § Test databases.
+#
+# So the reset now touches only the tables that actually hold a row. One
+# round trip asks every tenant table whether it is non-empty (an `EXISTS` on an
+# empty heap reads no tuples), and each non-empty one gets a plain `DELETE`,
+# which rewrites no files and so syncs nothing but the commit's WAL.
+#
+# `session_replication_role = replica` (transaction-local) is what makes a
+# plain DELETE equivalent to the old TRUNCATE ... CASCADE: it switches off the
+# FK triggers, so the delete order across tables does not matter (every table
+# that holds a row is emptied in the same transaction, so nothing is left
+# dangling), and it switches off the append-only `audit_log_no_delete` trigger
+# (`services/audit_immutability`), which TRUNCATE never fired either. Setting
+# it needs superuser (or, on PG 15+, `GRANT SET`); the Compose and CI Postgres
+# both connect as the `postgres` superuser. Without that privilege the reset
+# falls back to the old whole-schema TRUNCATE rather than half-working.
+#
+# RESTART IDENTITY has no equivalent here because no tenant table owns a
+# sequence (every key is a UUID); `test_realdb_reset.py` fails the day one does,
+# which is the point at which this reset must also restart it.
+_TENANT_RESET_PRIVILEGE_SQL = "SELECT has_parameter_privilege('session_replication_role', 'SET')"
+
+
+async def _reset_tenant_tables(conn, tenant_tables: Sequence[str], org_id: uuid.UUID) -> list[str]:
+    """Empty every tenant table that holds a row, then restore the Default entity.
+
+    Runs inside the caller's transaction. Returns the tables it emptied (the
+    guard test reads it). See the comment above for why this is DELETE of the
+    non-empty tables rather than a TRUNCATE of all of them.
+    """
+    from sqlalchemy import text
+
+    can_replica = (await conn.exec_driver_sql(_TENANT_RESET_PRIVILEGE_SQL)).scalar()
+    if can_replica:
+        probe = " UNION ALL ".join(
+            f"SELECT '{n}' WHERE EXISTS (SELECT 1 FROM \"{n}\")" for n in tenant_tables
+        )
+        dirty = [row[0] for row in (await conn.exec_driver_sql(probe)).all()]
+        if dirty:
+            await conn.exec_driver_sql("SET LOCAL session_replication_role = replica")
+            for name in dirty:
+                await conn.exec_driver_sql(f'DELETE FROM "{name}"')
+            await conn.exec_driver_sql("SET LOCAL session_replication_role = origin")
+    else:
+        dirty = list(tenant_tables)
+        quoted = ", ".join(f'"{n}"' for n in tenant_tables)
+        await conn.exec_driver_sql(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE")
+    # Multi-entity (Phase 1): the reset empties `entities` too (it always holds
+    # the Default row, so it is always "dirty"), but every tenant is expected to
+    # always have its Default entity. Restore it so each test starts from the
+    # same single-entity baseline.
+    await conn.execute(
+        text(
+            "INSERT INTO entities "
+            "(id, organization_id, name, slug, is_default, is_active) "
+            "VALUES (:id, :org, 'Default', 'default', true, true)"
+        ),
+        {"id": uuid.uuid4(), "org": org_id},
+    )
+    return dirty
 
 
 # Tenant DBs whose physical schema has been rebuilt from the current
@@ -714,7 +816,7 @@ async def _ensure_test_tenants() -> dict:
 
     # Importing the app wires every router, which transitively imports every
     # model — so Base.metadata is COMPLETE before any create_all. Without this,
-    # only the models imported so far get tables, and later TRUNCATE/queries
+    # only the models imported so far get tables, and later resets/queries
     # reference tables that were never created.
     import app.main  # noqa: F401
     from app.api.deps import ALL_ROLES
@@ -880,7 +982,7 @@ async def _ensure_test_tenants() -> dict:
                 await s.commit()
             tenants[key] = TenantInfo(slug=slug, db_name=db_name, org_id=org_id, users=users)
 
-        # Control-plane reset — the counterpart of the tenant TRUNCATE below.
+        # Control-plane reset — the counterpart of the tenant reset below.
         # `Organization.settings` (branding, SSO, payments, …) and the partner
         # self-FK `parent_org_id` are shared mutable state on a row that
         # persists for the life of the database, so a test that writes them and
@@ -908,6 +1010,23 @@ async def _ensure_test_tenants() -> dict:
             await s.execute(
                 delete(ProviderCredential).where(ProviderCredential.organization_id.in_(org_ids))
             )
+            # The seeded users' second factors are the same kind of state: a
+            # test that enrols TOTP or a passkey on the harness admin (e.g.
+            # `test_mfa_enrollment_audit`) otherwise leaves every later test in
+            # the process facing an account that HAS a factor — which turned
+            # `test_privacy_unmasked_step_up`'s "no second factor" 403 into a
+            # 400 whenever the two shared a shard.
+            from app.models.webauthn_credential import WebAuthnCredential
+
+            seeded_user_ids = [uid for t in tenants.values() for uid in t.users.values()]
+            await s.execute(
+                update(User)
+                .where(User.id.in_(seeded_user_ids))
+                .values(mfa_secret=None, mfa_enabled=False, mfa_enrolled_at=None)
+            )
+            await s.execute(
+                delete(WebAuthnCredential).where(WebAuthnCredential.user_id.in_(seeded_user_ids))
+            )
             await s.commit()
         return tenants
     finally:
@@ -933,7 +1052,7 @@ _HARNESS_ENGINE_KW = {"poolclass": NullPool}
 # Control-plane billing rows: the per-test teardown and its seatbelt.
 #
 # `Plan` / `Subscription` live in this slot's CONTROL-plane database, which the
-# per-test reset never reaches — that TRUNCATE covers the tenant business tables
+# per-test reset never reaches — that reset covers the tenant business tables
 # only, and `_rebuild_pytest_schema` clears the control DB just once per pytest
 # SESSION. So a throwaway plan a test minted stayed visible to every later test
 # in the run, and `GET /api/billing/plans` is a catalogue listing, so the
@@ -974,7 +1093,7 @@ def _assert_purgeable_plan_prefix(prefix: str) -> None:
 async def _reset_control_billing(tenants: dict) -> None:
     """Per-test teardown: drop the billing rows a test left in the control plane.
 
-    The counterpart of the tenant TRUNCATE and of the `Organization.settings`
+    The counterpart of the tenant reset and of the `Organization.settings`
     baseline beside it. Two deletes, children first:
 
     * every ``Subscription`` held by one of THIS harness's orgs — a live one
@@ -1309,10 +1428,46 @@ def provider_store_from_settings(monkeypatch, request):
     async def _from_settings(org_id, settings, block, *, db=None):  # noqa: ARG001
         return (settings or {}).get(block)
 
+    # The names-only read the ERP webhooks gate on before they unseal (§408):
+    # the secrets inline in the fake org's settings are what "is stored".
+    async def _paths_from_settings(org, block, *, db=None):  # noqa: ARG001
+        cfg = (getattr(org, "settings", None) or {}).get(block)
+        return frozenset(provider_credentials.extract_secrets(block, cfg))
+
     monkeypatch.setattr(provider_credentials, "resolve_block", _from_settings)
+    monkeypatch.setattr(provider_credentials, "stored_secret_paths", _paths_from_settings)
+
+
+@pytest.fixture
+def no_auth_audit_write(monkeypatch, request):
+    """For a DB-FREE test of an endpoint that writes a control-plane-originated
+    audit row (`audit_dispatch.dispatch_auth_audit` / `queue_auth_audit` /
+    `record_auth_audit_or_raise`): stub the one writer behind all three.
+
+    That writer resolves the tenant through its own `control_session_factory()`
+    session and opens the tenant engine — neither of which a mocked request
+    session can stand in for — so without this a mock test reaches the real
+    database and the fire-and-forget wrappers swallow the outcome
+    (`_refuse_real_engine_in_mock_tests` fails the test instead). A test that
+    asserts on the audit row patches the wrapper it calls, which still wins.
+    Returns the stub so a test can inspect what would have been written. A
+    `realdb` test is left alone.
+    """
+    from unittest.mock import AsyncMock
+
+    stub = AsyncMock()
+    if "realdb" not in request.fixturenames:
+        monkeypatch.setattr("app.services.audit_dispatch._write_auth_audit", stub)
+    return stub
 
 
 def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "real_db_engine: a non-realdb test that deliberately opens its own real database "
+        "connection, exempt from _refuse_real_engine_in_mock_tests. Never the fix for a "
+        "mock test that reached an engine by accident.",
+    )
     config.addinivalue_line(
         "markers",
         "plan(code): bind both realdb harness orgs to this catalog plan for the test "
@@ -1329,7 +1484,6 @@ async def realdb(request):
     module) binds both harness orgs to that catalog plan first — the opt-in a
     test of a plan-gated surface uses (``RealDB.subscribe``)."""
     import asyncpg
-    from sqlalchemy import text
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -1352,8 +1506,7 @@ async def realdb(request):
             ) from exc
         pytest.skip(f"realdb fixture requires a live Postgres (pnpm db:up): {exc}")
 
-    tenant_tables = [f'"{n}"' for n in Base.metadata.tables if n not in CONTROL_TABLES]
-    truncate = f"TRUNCATE {', '.join(tenant_tables)} RESTART IDENTITY CASCADE"
+    tenant_tables = [n for n in Base.metadata.tables if n not in CONTROL_TABLES]
     for info in tenants.values():
         engine = create_async_engine(_make_tenant_url(info.db_name))
         try:
@@ -1364,7 +1517,7 @@ async def realdb(request):
                 # closed it) or `idle` but still pinning an old MVCC snapshot /
                 # AccessShareLock. `cleanup()` calls `engine.dispose()`, but
                 # Postgres doesn't always process the close before THIS test's
-                # TRUNCATE fires next — which then either deadlocks or, worse,
+                # reset fires next — which then either deadlocks or, worse,
                 # makes the freshly-inserted rows invisible to the request under
                 # test (an empty-result flake, ~1-in-3). Reaping every *other*
                 # backend on the DB before the reset makes per-test isolation
@@ -1378,18 +1531,7 @@ async def realdb(request):
                 # surfacing as `ConnectionDoesNotExistError` in whichever
                 # unrelated file happened to be mid-query.
                 await conn.exec_driver_sql(_REAP_STALE_BACKENDS_SQL)
-                await conn.exec_driver_sql(truncate)
-                # Multi-entity (Phase 1): TRUNCATE wipes `entities` too, but every
-                # tenant is expected to always have its Default entity. Restore it
-                # so each test starts from the same single-entity baseline.
-                await conn.execute(
-                    text(
-                        "INSERT INTO entities "
-                        "(id, organization_id, name, slug, is_default, is_active) "
-                        "VALUES (:id, :org, 'Default', 'default', true, true)"
-                    ),
-                    {"id": uuid.uuid4(), "org": info.org_id},
-                )
+                await _reset_tenant_tables(conn, tenant_tables, info.org_id)
         finally:
             await engine.dispose()
 
@@ -1428,3 +1570,115 @@ async def _dispose_module_global_engines() -> None:
     from app.database import dispose_all_engines
 
     await dispose_all_engines()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Keep the call-phase report on the item, so a teardown-time check can
+    tell a test that already failed (and reported why) from one that passed
+    over a swallowed error (`_refuse_real_engine_in_mock_tests`)."""
+    outcome = yield
+    if call.when == "call":
+        item._feoh_call_report = outcome.get_result()
+
+
+class RealEngineInMockTestError(Exception):
+    """A mock-DB test opened a real database connection. See
+    ``_refuse_real_engine_in_mock_tests``.
+
+    Deliberately not a ``RuntimeError``: a test asserting
+    ``pytest.raises(RuntimeError)`` around the code under test would otherwise
+    accept this as the failure it expected."""
+
+
+@pytest.fixture(autouse=True)
+def _refuse_real_engine_in_mock_tests(request, monkeypatch):
+    """A test that is not on the ``realdb`` harness must not open a real
+    database connection — fail it loudly, at the call that tried.
+
+    The module-global engines in ``app.database`` (``control_engine``, the
+    ``_tenant_engines`` cache) pool asyncpg connections bound to the event loop
+    of the first test that touches them. A mock-DB test that silently reaches
+    one (an accessor that opens its own ``control_session_factory()`` session
+    when no ``db`` is passed — ``provider_credentials.resolve_block`` was the
+    case that found this) passes on its own and then poisons whichever later
+    test draws the pooled connection on a new loop: ``got Future … attached to
+    a different loop`` / ``another operation is in progress``, raised far from
+    the cause and only when the files share a process (``docs/known-issues.md``).
+    It also means the "mock" test was reading the developer's real
+    ``feohledger`` control plane.
+
+    Every SQLAlchemy checkout — fresh or pooled, any engine, sync or async —
+    goes through ``Engine.raw_connection``, so that is the one place to refuse.
+    The hit is also recorded and re-raised at teardown, so an application path
+    that swallows the error (a best-effort side effect) still fails the test.
+
+    Exempt: any test requesting ``realdb`` (directly or via another fixture),
+    which brings its own engines and disposes the globals afterwards; and a
+    test marked ``@pytest.mark.real_db_engine`` that deliberately connects
+    itself (it owns disposing what it opened). The fix for a mock test that
+    trips this is to inject or patch what it reaches — e.g.
+    ``provider_store_from_settings`` for provider credentials — never the
+    marker.
+    """
+    if "realdb" in request.fixturenames or request.node.get_closest_marker("real_db_engine"):
+        yield
+        return
+
+    import traceback
+
+    import greenlet
+    from sqlalchemy.engine import Engine
+
+    hits: list[str] = []
+    # Exposed so the guard's own test can assert on, then clear, its hit.
+    request.node._feoh_real_engine_hits = hits
+
+    def _rel(path: str) -> str:
+        return path.rsplit("/backend/", 1)[-1]
+
+    def _refuse(self, *args, **kwargs):  # noqa: ARG001
+        url = self.url.render_as_string(hide_password=True)
+        # The app frames that led here — the only pointer to the culprit when
+        # the code under test swallows the error below.
+        # Under an AsyncEngine this runs in SQLAlchemy's worker greenlet, whose
+        # stack starts fresh; the awaiting coroutine chain is on its parent.
+        stack = traceback.extract_stack()
+        parent = getattr(greenlet.getcurrent(), "parent", None)
+        if parent is not None and parent.gr_frame is not None:
+            stack = traceback.extract_stack(parent.gr_frame) + stack
+        app_frames = [
+            _rel(f.filename) + f":{f.lineno} {f.name}"
+            for f in stack
+            if "/backend/app/" in f.filename
+        ]
+        hits.append(f"{url} via " + " -> ".join(app_frames[-4:]))
+        raise RealEngineInMockTestError(
+            f"{request.node.nodeid} is not a realdb test but opened a real database "
+            f"connection ({url}). A mock-DB test must inject or patch every database "
+            "access it reaches (provider credentials: the provider_store_from_settings "
+            "fixture). Use the realdb fixture to test against Postgres."
+        )
+
+    monkeypatch.setattr(Engine, "raw_connection", _refuse)
+    yield
+    call_report = getattr(request.node, "_feoh_call_report", None)
+    if hits and (call_report is None or call_report.passed):
+        pytest.fail(
+            f"Opened a real database connection from a mock-DB test ({hits[0]}); "
+            "the error was raised at the call site but swallowed by the code under "
+            "test. See _refuse_real_engine_in_mock_tests in tests/conftest.py.",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_erp_unreachable_hold():
+    """The dispatch-time ERP check's per-org "QuickBooks unreachable" hold
+    (decisions §296) is process state, and realdb org ids are stable within a
+    slot: one test's failed read must not hold the next test's payments."""
+    from app.services import erp_status_sync
+
+    erp_status_sync._unreachable_until.clear()
+    yield
+    erp_status_sync._unreachable_until.clear()

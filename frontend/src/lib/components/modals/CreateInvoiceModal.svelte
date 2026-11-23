@@ -1,4 +1,5 @@
 <script lang="ts">
+	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
 	import type { Invoice } from '#lib/types/invoice.ts';
 	import { api } from '#lib/api.ts';
 	import { listGlAccounts, listInvoiceChart } from '#lib/api/glAccounts.ts';
@@ -23,6 +24,8 @@
 	// `null` when nothing resolves, so the platform default is named here, where
 	// a form genuinely needs a value (decisions §200).
 	let currency = $state(orgCurrency.currency ?? DEFAULT_CURRENCY);
+	// Always a new record: the field follows the org currency until typed in.
+	let currencyTouched = $state(false);
 	let invoice_date = $state('');
 	let due_date = $state('');
 	let po_number = $state('');
@@ -55,7 +58,11 @@
 		})();
 	});
 
-	const canSubmit = $derived(vendor.trim() !== '' && invoice_number.trim() !== '' && !!amount && amount > 0);
+	// A cleared currency field blocks submit rather than posting a guessed
+	// default (decisions §473).
+	const canSubmit = $derived(
+		vendor.trim() !== '' && invoice_number.trim() !== '' && currency.trim() !== '' && !!amount && amount > 0
+	);
 
 	function handleFileChange(e: Event) {
 		const input = e.target as HTMLInputElement;
@@ -70,7 +77,7 @@
 				vendor: vendor.trim(),
 				invoice_number: invoice_number.trim(),
 				amount,
-				currency: currency.trim() || DEFAULT_CURRENCY,
+				currency: currency.trim(),
 				invoice_date: invoice_date || null,
 				due_date: due_date || null,
 				po_number: po_number.trim() || null,
@@ -140,8 +147,13 @@
 				/>
 			</label>
 			<label>
-				<span>{m('invoices.modal.field.currency')}</span>
-				<input type="text" bind:value={currency} maxlength="3" />
+				<!-- Required like its siblings: a blank currency keeps Create
+				     disabled, so the marker has to say so before the user finds
+				     out from a dead button. CurrencyInput carries `required`
+				     (hence aria-required), `aria-invalid` and the inline reason
+				     once the field is edited. -->
+				<span>{m('invoices.modal.field.currency')} <em class="required">*</em></span>
+				<CurrencyInput bind:value={currency} bind:touched={currencyTouched} preferred={orgCurrency.currency} testid="invoice-currency" />
 			</label>
 			<label>
 				<span>{m('invoices.modal.field.invoiceDate')}</span>

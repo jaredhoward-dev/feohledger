@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/approvals_screen.dart';
@@ -11,6 +11,7 @@ import 'package:feohledger_mobile/screens/payments_screen.dart';
 import 'package:feohledger_mobile/screens/settings_screen.dart';
 import 'package:feohledger_mobile/screens/vendors_screen.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
+import 'package:feohledger_mobile/stores/invoice_store.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -22,9 +23,17 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _currentIndex = 0;
 
+  /// The dashboard Overdue card's tap-through: the Invoices tab, on its
+  /// Overdue quick view.
+  void _showOverdueInvoices() {
+    InvoiceStore.instance.showOverdue();
+    setState(() => _currentIndex = 1);
+  }
+
   List<Widget> get _screens {
     final screens = <Widget>[
-      const DashboardScreen(),
+      // Invoices is always tab 1: the role-gated tabs come after it.
+      DashboardScreen(onShowOverdue: _showOverdueInvoices),
       const InvoicesScreen(),
       const ContractsScreen(),
     ];

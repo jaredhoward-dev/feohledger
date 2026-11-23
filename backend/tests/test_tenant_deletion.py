@@ -23,16 +23,20 @@ broken while the operator believed it kept:
 
 from __future__ import annotations
 
+import types
 import uuid
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
 
 from app.config import settings
-from app.services import tenant_deletion
+from app.services import erp_oauth, post_commit, tenant_deletion
+from app.services.credential_crypto import CredentialCryptoError
+from app.services.erp_adapters.sage_accounting import SAGE_ACCOUNTING_OAUTH
 from app.services.tenant_deletion import (
     CONTROL_DELETIONS,
     CONTROL_TABLES_EXEMPT,
@@ -119,7 +123,7 @@ class _FakePlan:
 
 
 @pytest.mark.asyncio
-async def test_documents_go_before_the_database_and_the_control_row():
+async def test_the_database_goes_first_then_documents_then_the_control_row():
     org_id = uuid.uuid4()
     plan = _FakePlan(
         organization_id=org_id,
@@ -134,7 +138,7 @@ async def test_documents_go_before_the_database_and_the_control_row():
     async def _sweep(prefix):
         assert prefix == f"{org_id}/"
         order.append("storage")
-        return 4
+        return 4 if order.count("storage") == 1 else 0
 
     async def _drop(db_name):
         assert db_name == "feoh_ordertest"
@@ -157,21 +161,106 @@ async def test_documents_go_before_the_database_and_the_control_row():
             result.rowcount = 1
             return result
 
+    async def _grant(_plan, _session):
+        order.append("grant")
+        return None
+
     with (
         patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
         patch.object(tenant_deletion.storage, "delete_prefix", _sweep),
         patch.object(tenant_deletion, "_drop_postgres_database", _drop),
+        patch.object(tenant_deletion, "_read_erp_grant", _grant),
         patch.object(tenant_deletion, "control_session_factory", lambda: _Session()),
     ):
         result = await delete_tenant("ordertest")
 
-    assert order == ["storage", "database", "control"], (
-        "the control-plane row is the only place the object-storage prefix (the org "
-        "id) is written down — deleting it before the sweep would make the documents "
-        "unfindable if the sweep then failed"
+    assert order == ["database", "storage", "storage", "grant", "control"], (
+        "the database goes first, so a drop that fails leaves a whole workspace "
+        "rather than one whose files are gone (decisions §306); the sweep runs twice "
+        "for an object PUT mid-listing; the ERP grant is revoked once the workspace "
+        "is unusable but while its sealed tokens can still be read (decisions §371); "
+        "and the control-plane row — the only place the object-storage prefix is "
+        "written down — goes last (decisions §179)"
     )
     assert result.objects_deleted == 4
     assert result.database_dropped is True
+
+
+@pytest.mark.asyncio
+async def test_a_drop_that_fails_leaves_the_documents_in_place():
+    org_id = uuid.uuid4()
+    plan = _FakePlan(
+        organization_id=org_id,
+        slug="dropfail",
+        name="Drop Fail",
+        db_name="feoh_dropfail",
+        database_exists=True,
+        control_rows={"users": 1},
+    )
+    sweep = AsyncMock(return_value=3)
+
+    async def _drop(db_name):
+        raise RuntimeError("database is being accessed by other users")
+
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", sweep),
+        patch.object(tenant_deletion, "_drop_postgres_database", _drop),
+        pytest.raises(RuntimeError),
+    ):
+        await delete_tenant("dropfail")
+    sweep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_object_put_after_the_first_listing_is_swept_by_the_second():
+    """An upload in flight when the database went may PUT its object after the
+    first listing; the second pass removes it, and nothing can commit after."""
+    org_id = uuid.uuid4()
+    plan = _FakePlan(
+        organization_id=org_id,
+        slug="latepu",
+        name="Late Put",
+        db_name="feoh_latepu",
+        database_exists=False,
+        control_rows={},
+    )
+    bucket = {f"{org_id}/a.pdf"}
+    passes = 0
+
+    async def _sweep(prefix):
+        nonlocal passes
+        passes += 1
+        found = {k for k in bucket if k.startswith(prefix)}
+        bucket.difference_update(found)
+        if passes == 1:
+            bucket.add(f"{org_id}/late.pdf")  # PUT lands after the listing
+        return len(found)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def begin(self):
+            return self
+
+        async def execute(self, *_args, **_kwargs):
+            result = AsyncMock()
+            result.rowcount = 0
+            return result
+
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", _sweep),
+        patch.object(tenant_deletion, "_read_erp_grant", AsyncMock(return_value=None)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: _Session()),
+    ):
+        result = await delete_tenant("latepu")
+    assert bucket == set()
+    assert result.objects_deleted == 2
 
 
 @pytest.mark.asyncio
@@ -197,6 +286,7 @@ async def test_dry_run_destroys_nothing():
     sweep.assert_not_awaited()
     drop.assert_not_awaited()
     assert result.dry_run is True
+    assert result.erp_grant_provider is None
     assert result.objects_deleted == 0
     assert result.database_dropped is False
     assert result.control_rows_deleted == {}
@@ -226,6 +316,902 @@ def test_the_written_confirmation_states_what_it_does_not_reach():
     assert "feoh_conf" in text_out
     assert "backup" in text_out.lower()
     assert "write-once" in text_out.lower()
+
+
+# ---------------------------------------------------------------------------
+# The ERP OAuth grant — revoked best-effort, reported, never blocking (§371)
+# ---------------------------------------------------------------------------
+
+_GRANT_TOKENS = {"access_token": "ACCESS-SECRET-9", "refresh_token": "REFRESH-SECRET-9"}
+
+
+def _grant_settings(provider: str) -> dict:
+    return {
+        "erp": {
+            "type": provider,
+            "integration_method": "direct",
+            "oauth": {"provider": provider, "client_source": "platform"},
+        }
+    }
+
+
+class _GrantSession:
+    """A control-plane session: the settings SELECT answers ``org_settings``,
+    every DELETE one row. Records whether the control-plane step ran."""
+
+    def __init__(self, org_settings: dict | None):
+        self.org_settings = org_settings
+        self.deletes = 0
+        self.savepoints = 0
+        self.info: dict = {}  # where `post_commit` queues its jobs
+
+    def in_nested_transaction(self) -> bool:
+        return False
+
+    async def commit(self):
+        """The closure's commit, as SQLAlchemy's `after_commit` sees it: the
+        queued post-commit jobs start, and the test awaits them."""
+        post_commit._on_after_commit(self)
+        await post_commit.drain_post_commit()
+
+    def rollback(self):
+        post_commit._on_after_rollback(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def begin(self):
+        return self
+
+    def begin_nested(self):
+        self.savepoints += 1
+        return self
+
+    async def execute(self, statement, *_args, **_kwargs):
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = self.org_settings
+        if str(statement).lstrip().upper().startswith("DELETE"):
+            self.deletes += 1
+            result.rowcount = 1
+        return result
+
+
+class _ScriptedRevoke:
+    """Stands in for the provider's revoke endpoint (``erp_oauth.httpx``)."""
+
+    def __init__(self, status: int = 200, error: Exception | None = None):
+        self.status, self.error = status, error
+        self.calls: list[dict] = []
+
+    def install(self, monkeypatch):
+        scripted = self
+
+        class _Client:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, data=None, headers=None, auth=None, json=None):
+                scripted.calls.append({"url": url, "data": dict(data or {}), "auth": auth})
+                if scripted.error is not None:
+                    raise scripted.error
+                response = MagicMock()
+                response.status_code = scripted.status
+                return response
+
+        monkeypatch.setattr(
+            erp_oauth,
+            "httpx",
+            types.SimpleNamespace(
+                AsyncClient=_Client, BasicAuth=httpx.BasicAuth, HTTPError=httpx.HTTPError
+            ),
+        )
+        return self
+
+
+@pytest.fixture
+def sage_platform_app(monkeypatch):
+    monkeypatch.setattr(settings, "erp_sage_accounting_client_id", "sage-platform-client")
+    monkeypatch.setattr(settings, "erp_sage_accounting_client_secret", "sage-platform-secret")
+    monkeypatch.setattr(settings, "erp_sage_accounting_revoke_url", "")
+
+
+async def _delete_with_grant(monkeypatch, provider: str | None, *, unreadable: bool = False):
+    """Run `delete_tenant` over a tenant whose org settings name ``provider``'s
+    consent and whose sealed store holds its tokens (None: no grant at all)."""
+    org_id = uuid.uuid4()
+    plan = _FakePlan(
+        organization_id=org_id,
+        slug="grant",
+        name="Grant Co",
+        db_name="feoh_grant",
+        database_exists=False,
+        control_rows={},
+    )
+    org_settings = _grant_settings(provider) if provider else {}
+    session = _GrantSession(org_settings)
+
+    async def _resolved(got_org_id, got_settings, _db):
+        assert got_org_id == org_id
+        if unreadable:
+            raise CredentialCryptoError("open failed (kms)")
+        erp = dict(got_settings.get("erp") or {})
+        oauth = dict(erp.pop("oauth", None) or {})
+        if provider:
+            oauth.update(_GRANT_TOKENS)
+        return erp, oauth
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: session),
+    ):
+        result = await delete_tenant("grant")
+    return result, session
+
+
+@pytest.mark.asyncio
+async def test_a_connected_erp_grant_is_revoked_before_the_control_plane_goes(
+    monkeypatch, sage_platform_app, caplog
+):
+    """Sage's refresh token goes to its revoke endpoint, the client as form
+    fields (its token endpoint's way), and the confirmation says it is gone."""
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+    caplog.set_level("DEBUG")
+
+    result, session = await _delete_with_grant(monkeypatch, "sage_accounting")
+
+    (call,) = revoke.calls
+    assert call["url"] == SAGE_ACCOUNTING_OAUTH.revoke_url
+    assert call["data"] == {
+        "token": "REFRESH-SECRET-9",
+        "client_id": "sage-platform-client",
+        "client_secret": "sage-platform-secret",
+    }
+    assert call["auth"] is None, "Sage takes the client as form fields, never HTTP Basic"
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "sage_accounting",
+        erp_oauth.REVOKED,
+    )
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert "sage_accounting — revoked at the provider" in format_confirmation(result)
+    for secret in (*_GRANT_TOKENS.values(), "sage-platform-secret"):
+        assert secret not in caplog.text, "a token or the client secret reached the log"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(400, None), (503, None), (None, httpx.ConnectError("down"))],
+    ids=["refused", "outage", "unreachable"],
+)
+async def test_a_revoke_that_fails_never_stops_the_deletion(
+    monkeypatch, sage_platform_app, caplog, status, error
+):
+    revoke = _ScriptedRevoke(status or 200, error).install(monkeypatch)
+    caplog.set_level("DEBUG")
+
+    result, session = await _delete_with_grant(monkeypatch, "sage_accounting")
+
+    assert len(revoke.calls) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_FAILED
+    assert session.deletes == len(CONTROL_DELETIONS), "the control plane must still go"
+    confirmation = format_confirmation(result)
+    assert "sage_accounting — NOT revoked" in confirmation
+    assert "connected apps" in confirmation
+    assert "REFRESH-SECRET-9" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_provider_with_no_revoke_endpoint_is_reported_not_called(monkeypatch):
+    """Blackbaud SKY has no revocation endpoint: nothing is sent, and the
+    confirmation tells the operator the customer must remove the app."""
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+
+    result, session = await _delete_with_grant(monkeypatch, "blackbaud_fe_nxt")
+
+    assert revoke.calls == []
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_UNSUPPORTED
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert "no revocation endpoint" in format_confirmation(result)
+
+
+@pytest.mark.asyncio
+async def test_an_unopenable_store_is_reported_and_the_deletion_proceeds(monkeypatch):
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+
+    result, session = await _delete_with_grant(monkeypatch, "xero", unreadable=True)
+
+    assert revoke.calls == []
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "xero",
+        tenant_deletion.GRANT_UNREADABLE,
+    )
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert "sealed credentials could not be opened" in format_confirmation(result)
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_without_an_erp_grant_calls_nobody(monkeypatch):
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+
+    result, _session = await _delete_with_grant(monkeypatch, None)
+
+    assert revoke.calls == []
+    assert result.erp_grant_provider is None
+    assert "ERP OAuth grant" not in format_confirmation(result)
+
+
+def _closing_plan() -> _FakePlan:
+    return _FakePlan(
+        organization_id=uuid.uuid4(),
+        slug="closing",
+        name="Closing Co",
+        db_name="feoh_closing",
+        database_exists=False,
+        control_rows={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_grant_is_read_on_the_closures_own_session(monkeypatch, sage_platform_app):
+    """A self-service closure holds the org row FOR UPDATE on its session; the
+    grant must be read there, not on a second session (decisions §306)."""
+    _ScriptedRevoke(200).install(monkeypatch)
+    plan = _closing_plan()
+    held = _GrantSession(_grant_settings("sage_accounting"))
+    seen: list[object] = []
+
+    async def _resolved(_org_id, got_settings, db):
+        seen.append(db)
+        erp = dict(got_settings["erp"])
+        oauth = dict(erp.pop("oauth"))
+        oauth.update(_GRANT_TOKENS)
+        return erp, oauth
+
+    other = _GrantSession(None)  # what a second session would read: no grant
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: other),
+    ):
+        result = await delete_tenant("closing", control_session=held)
+    assert seen == [held]
+    # Inside a savepoint, so a failed read cannot poison the closure's
+    # transaction before its control-plane delete.
+    assert held.savepoints == 1
+    assert held.deletes == len(CONTROL_DELETIONS) and other.deletes == 0
+    assert result.erp_grant_provider == "sage_accounting"
+    await held.commit()
+    assert result.erp_grant_revocation == erp_oauth.REVOKED
+
+
+@pytest.mark.asyncio
+async def test_a_closure_calls_the_provider_only_after_its_commit(
+    monkeypatch, sage_platform_app, caplog
+):
+    """The closure's transaction holds the org, user and subscription rows
+    FOR UPDATE until its caller commits. The provider is never called inside
+    it (root CLAUDE.md, `post_commit`): the tokens are read there, and the
+    revoke is queued for the commit. The outcome still reaches the result and
+    the log, provider and outcome only."""
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+    caplog.set_level("DEBUG")
+    plan = _closing_plan()
+    held = _GrantSession(_grant_settings("sage_accounting"))
+
+    async def _resolved(_org_id, got_settings, _db):
+        erp = dict(got_settings["erp"])
+        oauth = dict(erp.pop("oauth"))
+        oauth.update(_GRANT_TOKENS)
+        return erp, oauth
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: _GrantSession(None)),
+    ):
+        result = await delete_tenant("closing", control_session=held)
+
+    # Everything the closure's transaction does is done, and it is still open.
+    assert held.deletes == len(CONTROL_DELETIONS)
+    assert revoke.calls == [], "the provider was called while the closure held its locks"
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "sage_accounting",
+        tenant_deletion.GRANT_REVOKE_AFTER_COMMIT,
+    )
+    assert "NOT yet confirmed" in format_confirmation(result)
+
+    await held.commit()
+    (call,) = revoke.calls
+    assert call["data"]["token"] == "REFRESH-SECRET-9"
+    assert result.erp_grant_revocation == erp_oauth.REVOKED
+    assert "ERP OAuth grant (sage_accounting) revoked" in caplog.text
+    for secret in (*_GRANT_TOKENS.values(), "sage-platform-secret"):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_closure_whose_provider_refuses_after_commit_reports_failed(
+    monkeypatch, sage_platform_app, caplog
+):
+    """After the commit nothing can stop the deletion, and nothing should: a
+    refusal is logged as ``failed`` and lands on the result."""
+    revoke = _ScriptedRevoke(503).install(monkeypatch)
+    caplog.set_level("DEBUG")
+    held = _GrantSession(_grant_settings("sage_accounting"))
+
+    async def _resolved(_org_id, got_settings, _db):
+        erp = dict(got_settings["erp"])
+        oauth = dict(erp.pop("oauth"))
+        oauth.update(_GRANT_TOKENS)
+        return erp, oauth
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=_closing_plan())),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: _GrantSession(None)),
+    ):
+        result = await delete_tenant("closing", control_session=held)
+    assert revoke.calls == []
+    await held.commit()
+    assert len(revoke.calls) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_FAILED
+    assert "ERP OAuth grant (sage_accounting) failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_closure_that_rolls_back_revokes_nothing(monkeypatch, sage_platform_app):
+    """A rolled-back closure leaves the organisation and its sealed row; the
+    resumed closure reads and revokes again. Revoking now would cut a grant
+    whose workspace still says connected."""
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+    held = _GrantSession(_grant_settings("sage_accounting"))
+
+    async def _resolved(_org_id, got_settings, _db):
+        erp = dict(got_settings["erp"])
+        oauth = dict(erp.pop("oauth"))
+        oauth.update(_GRANT_TOKENS)
+        return erp, oauth
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=_closing_plan())),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: _GrantSession(None)),
+    ):
+        await delete_tenant("closing", control_session=held)
+    held.rollback()
+    await held.commit()  # a later commit on the session runs nothing queued before
+    assert revoke.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_closure_with_a_provider_without_an_endpoint_reports_it_at_once(monkeypatch):
+    """Nothing to call, so nothing to defer: Blackbaud reads ``unsupported``
+    on the result straight away, and the commit sends nothing."""
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+    held = _GrantSession(_grant_settings("blackbaud_fe_nxt"))
+
+    async def _resolved(_org_id, got_settings, _db):
+        erp = dict(got_settings["erp"])
+        oauth = dict(erp.pop("oauth"))
+        oauth.update(_GRANT_TOKENS)
+        return erp, oauth
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=_closing_plan())),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: _GrantSession(None)),
+    ):
+        result = await delete_tenant("closing", control_session=held)
+    await held.commit()
+    assert revoke.calls == []
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_UNSUPPORTED
+
+
+@pytest.mark.asyncio
+async def test_a_failed_grant_read_on_the_closures_session_still_deletes(monkeypatch):
+    """A lock timeout (or any SQL error) reading the grant is reported as
+    ``failed``; the read ran in a savepoint, so the closure's own transaction
+    still carries the control-plane delete."""
+    revoke = _ScriptedRevoke(200).install(monkeypatch)
+    plan = _FakePlan(
+        organization_id=uuid.uuid4(),
+        slug="closing",
+        name="Closing Co",
+        db_name="feoh_closing",
+        database_exists=False,
+        control_rows={},
+    )
+    held = _GrantSession(_grant_settings("xero"))
+
+    async def _timeout(*_a, **_k):
+        raise RuntimeError("canceling statement due to lock timeout")
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _timeout)
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: _GrantSession(None)),
+    ):
+        result = await delete_tenant("closing", control_session=held)
+    assert revoke.calls == []
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "xero",
+        erp_oauth.REVOKE_FAILED,
+    )
+    assert held.savepoints == 1
+    assert held.deletes == len(CONTROL_DELETIONS)
+
+
+def test_every_grant_outcome_has_its_confirmation_text():
+    plan = _FakePlan(
+        organization_id=uuid.uuid4(),
+        slug="conf",
+        name="Confirm Co",
+        db_name="feoh_conf",
+        database_exists=True,
+        control_rows={},
+    )
+    outcomes = (
+        erp_oauth.REVOKED,
+        erp_oauth.REVOKE_FAILED,
+        erp_oauth.REVOKE_UNSUPPORTED,
+        tenant_deletion.GRANT_UNREADABLE,
+        tenant_deletion.GRANT_REVOKE_AFTER_COMMIT,
+    )
+    for outcome in outcomes:
+        text_out = format_confirmation(
+            tenant_deletion.TenantDeletionResult(
+                plan=plan,
+                objects_deleted=0,
+                database_dropped=True,
+                erp_grant_provider="xero",
+                erp_grant_revocation=outcome,
+            )
+        )
+        line = next(ln for ln in text_out.splitlines() if "ERP OAuth grant" in ln)
+        if outcome == erp_oauth.REVOKED:
+            assert "revoked at the provider" in line
+        elif outcome == tenant_deletion.GRANT_REVOKE_AFTER_COMMIT:
+            assert "NOT yet confirmed" in line and "connected apps" in line
+        else:
+            assert "NOT revoked" in line and "connected apps" in line, outcome
+
+
+# ---------------------------------------------------------------------------
+# Stored-credential ERPs — ended where the provider allows it, named where it
+# does not (§400)
+# ---------------------------------------------------------------------------
+
+_INTACCT_SECRET = "intacct-client-secret-7"
+_SAGE_ZA_PASSWORD = "sage-za-password-7"
+_STORED = {
+    "sage_intacct": {
+        "client_id": "intacct-client",
+        "client_secret": _INTACCT_SECRET,
+        "company_id": "ACMECO",
+        "user_id": "ws_user",
+    },
+    "sage_accounting_za": {
+        "api_key": "za-api-key-7",
+        "username": "ap@example.co.za",
+        "password": _SAGE_ZA_PASSWORD,
+        "company_id": "4711",
+    },
+    "netsuite": {
+        "account_id": "123",
+        "consumer_key": "ns-ck",
+        "consumer_secret": "ns-consumer-secret-7",
+        "token_id": "ns-token-id",
+        "token_secret": "ns-token-secret-7",
+    },
+}
+
+
+class _ScriptedIntacct:
+    """Intacct's token and revoke endpoints, over ``httpx.MockTransport`` so
+    the request each test reads is what httpx would send."""
+
+    def __init__(self, revoke_status: int = 200):
+        self.revoke_status = revoke_status
+        self.requests: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.url.path.endswith("/oauth2/token"):
+            return httpx.Response(200, json={"access_token": "intacct-tok", "expires_in": 43200})
+        if request.url.path.endswith("/oauth2/revoke"):
+            return httpx.Response(self.revoke_status, json={"revoked": True})
+        return httpx.Response(599)
+
+    def install(self, monkeypatch):
+        real = httpx.AsyncClient
+
+        def factory(*args, **kwargs):
+            return real(*args, transport=httpx.MockTransport(self.handler), **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", factory)
+        monkeypatch.setattr(settings, "erp_intacct_api_base", "https://intacct.test/ia/api/v1")
+        from app.services.erp_adapters.sage_intacct import clear_token_cache
+
+        clear_token_cache()
+        return self
+
+    def revokes(self) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path.endswith("/oauth2/revoke")]
+
+
+def _stored_settings(erp_type: str) -> dict:
+    return {"erp": {"type": erp_type, "integration_method": "direct"}}
+
+
+def _stored_resolver(monkeypatch, erp_type: str) -> None:
+    async def _resolved(_org_id, got_settings, _db):
+        erp = dict(got_settings.get("erp") or {})
+        erp.update(_STORED.get(erp_type, {}))
+        return erp, {}  # no OAuth block: the access is the stored credentials
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _resolved)
+
+
+async def _delete_stored(monkeypatch, erp_type: str, *, control_session=None):
+    plan = _closing_plan()
+    _stored_resolver(monkeypatch, erp_type)
+    session = _GrantSession(_stored_settings(erp_type))
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=plan)),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: session),
+    ):
+        result = await delete_tenant(plan.slug, control_session=control_session)
+    return result, session
+
+
+@pytest.mark.asyncio
+async def test_intacct_tokens_are_revoked_and_the_customer_told_what_remains(monkeypatch, caplog):
+    """Intacct documents a revoke that ends every token for the user and
+    company; the authorization itself stays until the customer removes it."""
+    intacct = _ScriptedIntacct().install(monkeypatch)
+    caplog.set_level("DEBUG")
+
+    result, session = await _delete_stored(monkeypatch, "sage_intacct")
+
+    (call,) = intacct.revokes()
+    assert str(call.url) == "https://intacct.test/ia/api/v1/oauth2/revoke"
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "sage_intacct",
+        erp_oauth.REVOKED,
+    )
+    line = next(ln for ln in format_confirmation(result).splitlines() if "ERP credentials:" in ln)
+    assert "revoked at the provider" in line
+    assert "Authorized Client Applications" in line
+    assert "ERP credentials (sage_intacct) revoked" in caplog.text
+    for secret in (_INTACCT_SECRET, "intacct-tok"):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_intacct_revoke_that_fails_never_stops_the_deletion(monkeypatch):
+    intacct = _ScriptedIntacct(revoke_status=503).install(monkeypatch)
+
+    result, session = await _delete_stored(monkeypatch, "sage_intacct")
+
+    assert len(intacct.revokes()) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_FAILED
+    assert session.deletes == len(CONTROL_DELETIONS)
+    confirmation = format_confirmation(result)
+    assert "NOT revoked" in confirmation and "Authorized Client Applications" in confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_closure_revokes_intacct_only_after_its_commit(monkeypatch):
+    """The same rule as an OAuth revoke: no provider call while the closure
+    holds its row locks."""
+    intacct = _ScriptedIntacct().install(monkeypatch)
+    held = _GrantSession(_stored_settings("sage_intacct"))
+
+    result, _other = await _delete_stored(monkeypatch, "sage_intacct", control_session=held)
+
+    assert held.deletes == len(CONTROL_DELETIONS)
+    assert intacct.requests == [], "Intacct was called while the closure held its locks"
+    assert result.erp_grant_revocation == tenant_deletion.GRANT_REVOKE_AFTER_COMMIT
+    await held.commit()
+    assert len(intacct.revokes()) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKED
+
+
+@pytest.mark.asyncio
+async def test_sage_za_is_unsupported_at_once_and_names_the_password(monkeypatch, caplog):
+    """No token exists to revoke: decided at the read, so a closure defers
+    nothing, and the customer is told to change the Sage user's password."""
+    intacct = _ScriptedIntacct().install(monkeypatch)  # any HTTP call would land here
+    caplog.set_level("DEBUG")
+    held = _GrantSession(_stored_settings("sage_accounting_za"))
+
+    result, _other = await _delete_stored(monkeypatch, "sage_accounting_za", control_session=held)
+    await held.commit()
+
+    assert intacct.requests == []
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "sage_accounting_za",
+        erp_oauth.REVOKE_UNSUPPORTED,
+    )
+    line = next(ln for ln in format_confirmation(result).splitlines() if "ERP credentials:" in ln)
+    assert "NOT revoked" in line and "password" in line
+    assert _SAGE_ZA_PASSWORD not in caplog.text
+
+
+class _ScriptedNetSuite:
+    """NetSuite's TBA ``revoketoken`` and the record API, through the operator
+    override (a plain client) over ``httpx.MockTransport``. Once revoked, the
+    token is refused, as NetSuite does (§406)."""
+
+    def __init__(self, revoke_status: int = 200):
+        self.revoke_status = revoke_status
+        self.revoked = False
+        self.requests: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.url.path.endswith("/rest/revoketoken"):
+            self.revoked = self.revoke_status == 200
+            return httpx.Response(self.revoke_status, json={})
+        return httpx.Response(401 if self.revoked else 200, json={"items": []})
+
+    def install(self, monkeypatch):
+        real = httpx.AsyncClient
+
+        def factory(*args, **kwargs):
+            return real(*args, transport=httpx.MockTransport(self.handler), **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", factory)
+        monkeypatch.setattr(
+            settings, "erp_netsuite_api_base", "https://ns.test/services/rest/record/v1"
+        )
+        return self
+
+    def revokes(self) -> list[httpx.Request]:
+        return [r for r in self.requests if r.url.path.endswith("/rest/revoketoken")]
+
+
+@pytest.mark.asyncio
+async def test_a_netsuite_tba_token_is_revoked_and_the_step_still_named(monkeypatch, caplog):
+    """TBA: Oracle's revoke endpoint ends the token, proved by its next call
+    being refused; the confirmation still names the Access Tokens page."""
+    ns = _ScriptedNetSuite().install(monkeypatch)
+    caplog.set_level("DEBUG")
+
+    result, session = await _delete_stored(monkeypatch, "netsuite")
+
+    (call,) = ns.revokes()
+    assert str(call.url) == ("https://ns.test/rest/revoketoken?consumerKey=ns-ck&token=ns-token-id")
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "netsuite",
+        erp_oauth.REVOKED,
+    )
+    line = next(ln for ln in format_confirmation(result).splitlines() if "ERP credentials:" in ln)
+    assert "revoked at the provider" in line and "Access Tokens" in line
+    for secret in ("ns-consumer-secret-7", "ns-token-secret-7"):
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_closure_revokes_netsuite_only_after_its_commit(monkeypatch):
+    ns = _ScriptedNetSuite().install(monkeypatch)
+    held = _GrantSession(_stored_settings("netsuite"))
+
+    result, _other = await _delete_stored(monkeypatch, "netsuite", control_session=held)
+
+    assert ns.requests == [], "NetSuite was called while the closure held its locks"
+    assert result.erp_grant_revocation == tenant_deletion.GRANT_REVOKE_AFTER_COMMIT
+    await held.commit()
+    assert len(ns.revokes()) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKED
+
+
+@pytest.mark.asyncio
+async def test_a_refused_netsuite_revoke_never_stops_the_deletion(monkeypatch):
+    ns = _ScriptedNetSuite(revoke_status=403).install(monkeypatch)
+
+    result, session = await _delete_stored(monkeypatch, "netsuite")
+
+    assert len(ns.revokes()) == 1
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_FAILED
+    confirmation = format_confirmation(result)
+    assert "NOT revoked" in confirmation and "Access Tokens" in confirmation
+
+
+@pytest.mark.asyncio
+async def test_netsuite_client_credentials_are_unsupported_at_once(monkeypatch):
+    """OAuth 2.0 M2M: nothing we can revoke, so decided at the read with no
+    call, and the customer is told to revoke the certificate mapping."""
+    ns = _ScriptedNetSuite().install(monkeypatch)
+    monkeypatch.setitem(
+        _STORED,
+        "netsuite",
+        {
+            "account_id": "123",
+            "auth_method": "oauth2_m2m",
+            "client_id": "cid",
+            "certificate_id": "cert",
+            "private_key": "unused",
+        },
+    )
+    held = _GrantSession(_stored_settings("netsuite"))
+
+    result, _other = await _delete_stored(monkeypatch, "netsuite", control_session=held)
+    await held.commit()
+
+    assert ns.requests == []
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_UNSUPPORTED
+    line = next(ln for ln in format_confirmation(result).splitlines() if "ERP credentials:" in ln)
+    assert "NOT revoked" in line and "OAuth 2.0 Client Credentials (M2M) Setup" in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("erp_type", ["mock"])
+async def test_an_erp_with_no_stated_step_adds_nothing(monkeypatch, erp_type):
+    """An adapter that states no provider-side step (or the local mock) is
+    not reported: the confirmation never invents a step."""
+    intacct = _ScriptedIntacct().install(monkeypatch)
+
+    result, session = await _delete_stored(monkeypatch, erp_type)
+
+    assert intacct.requests == []
+    assert result.erp_grant_provider is None
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert "ERP credentials" not in format_confirmation(result)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_store_still_names_intacct_s_step(monkeypatch):
+    """The sealed client secret cannot be opened, so nothing is minted or
+    revoked; the public config still says Intacct, so the customer is told."""
+    intacct = _ScriptedIntacct().install(monkeypatch)
+
+    async def _unreadable(*_a, **_k):
+        raise CredentialCryptoError("open failed (kms)")
+
+    monkeypatch.setattr(erp_oauth, "resolved_erp", _unreadable)
+    session = _GrantSession(_stored_settings("sage_intacct"))
+    with (
+        patch.object(tenant_deletion, "_load_plan", AsyncMock(return_value=_closing_plan())),
+        patch.object(tenant_deletion.storage, "delete_prefix", AsyncMock(return_value=0)),
+        patch.object(tenant_deletion, "control_session_factory", lambda: session),
+    ):
+        result = await delete_tenant("closing")
+
+    assert intacct.requests == []
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "sage_intacct",
+        tenant_deletion.GRANT_UNREADABLE,
+    )
+    assert "Authorized Client Applications" in format_confirmation(result)
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_that_breaks_while_assessed_never_stops_the_deletion(monkeypatch):
+    """The deletion completes, and the confirmation still names the step: a
+    broken assessment reads ``failed``, never silence about live access."""
+    from app.services.erp_adapters.sage_accounting_za import SageAccountingZaAdapter
+
+    async def _boom(self):
+        raise RuntimeError("adapter bug")
+
+    monkeypatch.setattr(SageAccountingZaAdapter, "revoke_stored_access", _boom)
+
+    result, session = await _delete_stored(monkeypatch, "sage_accounting_za")
+
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "sage_accounting_za",
+        erp_oauth.REVOKE_FAILED,
+    )
+    assert "password" in format_confirmation(result)
+
+
+_BC_SECRET = "bc-client-secret-7"
+_SYSPRO_PASSWORD = "syspro-operator-password-7"
+_STORED_407 = {
+    "dynamics_365_bc": {
+        "tenant_id": "11111111-2222-3333-4444-555555555555",
+        "client_id": "bc-client",
+        "client_secret": _BC_SECRET,
+        "environment": "production",
+        "company_id": "66666666-7777-8888-9999-000000000000",
+    },
+    "syspro": {
+        "base_url": "https://syspro.example.co.za:20190",
+        "operator": "FEOHAP",
+        "operator_password": _SYSPRO_PASSWORD,
+        "company_id": "EDU1",
+        "company_password": "syspro-company-password-7",
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("erp_type", "step_words"),
+    [
+        # §407: Microsoft publishes no revocation for a client-credentials
+        # token; the customer disables the BC record and deletes the secret.
+        ("dynamics_365_bc", ("Microsoft Entra Applications", "client secret")),
+        # §407: e.net Logoff ends a session, not the operator login.
+        ("syspro", ("Operator locked out", "Operator Maintenance")),
+    ],
+)
+async def test_bc_and_syspro_are_unsupported_at_once_and_name_the_step(
+    monkeypatch, caplog, erp_type, step_words
+):
+    """Nothing is called (no token mint, no Logon/Logoff), the outcome is
+    decided at the read so a closure defers nothing, and the confirmation names
+    the provider's own control rather than the generic connected-apps line."""
+    trap = _ScriptedIntacct().install(monkeypatch)  # any HTTP call would land here
+    monkeypatch.setitem(_STORED, erp_type, _STORED_407[erp_type])
+    caplog.set_level("DEBUG")
+    held = _GrantSession(_stored_settings(erp_type))
+
+    result, _other = await _delete_stored(monkeypatch, erp_type, control_session=held)
+    await held.commit()
+
+    assert trap.requests == []
+    assert held.deletes == len(CONTROL_DELETIONS)
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        erp_type,
+        erp_oauth.REVOKE_UNSUPPORTED,
+    )
+    line = next(ln for ln in format_confirmation(result).splitlines() if "ERP credentials:" in ln)
+    assert "NOT revoked" in line
+    for words in step_words:
+        assert words in line
+    assert "connected apps" not in line
+    for secret in (_BC_SECRET, _SYSPRO_PASSWORD, "syspro-company-password-7"):
+        assert secret not in caplog.text
+        assert secret not in format_confirmation(result)
+
+
+def test_every_stored_credential_outcome_names_the_provider_side_step():
+    step = "remove FeohLedger's client ID under Authorized Client Applications"
+    for outcome in (
+        erp_oauth.REVOKED,
+        erp_oauth.REVOKE_FAILED,
+        erp_oauth.REVOKE_UNSUPPORTED,
+        tenant_deletion.GRANT_UNREADABLE,
+        tenant_deletion.GRANT_REVOKE_AFTER_COMMIT,
+    ):
+        text_out = format_confirmation(
+            tenant_deletion.TenantDeletionResult(
+                plan=_closing_plan(),
+                objects_deleted=0,
+                database_dropped=True,
+                erp_grant_provider="sage_intacct",
+                erp_grant_revocation=outcome,
+                erp_grant_provider_step=step,
+            )
+        )
+        line = next(ln for ln in text_out.splitlines() if "ERP credentials:" in ln)
+        assert step in line, outcome
+        assert "connected apps" not in line, "the generic OAuth step replaced the provider's"
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +1298,8 @@ async def test_delete_tenant_removes_every_trace_from_the_control_plane(
         with patch.object(tenant_deletion.storage, "delete_prefix", _sweep):
             result = await delete_tenant(slug)
 
-        assert swept == [f"{org_id}/"]
+        # Twice: the second pass catches an object PUT during the first listing.
+        assert swept == [f"{org_id}/", f"{org_id}/"]
         assert result.database_dropped is True
 
         async with mk() as s:
@@ -522,3 +1509,91 @@ async def test_the_cli_fails_when_the_deletion_itself_refuses(monkeypatch):
     monkeypatch.setattr("sys.argv", ["delete_tenant.py", "--slug", "x", "--yes"])
 
     assert await cli.main() == 2
+
+
+# ---------------------------------------------------------------------------
+# Merge.dev: the linked account is deleted at Merge, and the customer is told
+# to end the webhook, its signature key and the API key (decisions §405)
+# ---------------------------------------------------------------------------
+
+_MERGE_ACCOUNT_TOKEN = "merge-account-token-7"
+_MERGE_STORED = {
+    "api_key": "merge-api-key-7",
+    "account_token": _MERGE_ACCOUNT_TOKEN,
+    "webhook_signing_secret": "merge-webhook-key-7",
+}
+
+
+class _ScriptedMerge:
+    def __init__(self, status: int = 200):
+        self.status = status
+        self.requests: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(self.status)
+
+    def install(self, monkeypatch):
+        real = httpx.AsyncClient
+
+        def factory(*args, **kwargs):
+            return real(*args, transport=httpx.MockTransport(self.handler), **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", factory)
+        monkeypatch.setattr(settings, "erp_merge_api_base", "https://merge.test/api/accounting/v1")
+        monkeypatch.setitem(_STORED, "merge_dev", _MERGE_STORED)
+        return self
+
+
+@pytest.mark.asyncio
+async def test_merge_s_linked_account_is_deleted_and_the_webhook_named(monkeypatch, caplog):
+    merge = _ScriptedMerge().install(monkeypatch)
+    caplog.set_level("DEBUG")
+
+    result, session = await _delete_stored(monkeypatch, "merge_dev")
+
+    (call,) = merge.requests
+    assert (call.method, str(call.url)) == (
+        "POST",
+        "https://merge.test/api/accounting/v1/delete-account",
+    )
+    assert call.headers["X-Account-Token"] == _MERGE_ACCOUNT_TOKEN
+    assert session.deletes == len(CONTROL_DELETIONS)
+    assert (result.erp_grant_provider, result.erp_grant_revocation) == (
+        "merge_dev",
+        erp_oauth.REVOKED,
+    )
+    line = next(ln for ln in format_confirmation(result).splitlines() if "ERP credentials:" in ln)
+    assert "revoked at the provider" in line
+    # The webhook and its key, and the API key, are the customer's Merge
+    # organisation's: only they can end them.
+    assert "webhook" in line and "signature key" in line and "API key" in line
+    for secret in _MERGE_STORED.values():
+        assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_merge_deletion_that_fails_never_stops_the_tenant_deletion(monkeypatch):
+    merge = _ScriptedMerge(status=500).install(monkeypatch)
+
+    result, session = await _delete_stored(monkeypatch, "merge_dev")
+
+    assert len(merge.requests) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKE_FAILED
+    assert session.deletes == len(CONTROL_DELETIONS)
+    confirmation = format_confirmation(result)
+    assert "NOT revoked" in confirmation and "delete the linked account" in confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_closure_deletes_merge_s_linked_account_only_after_its_commit(monkeypatch):
+    merge = _ScriptedMerge().install(monkeypatch)
+    held = _GrantSession(_stored_settings("merge_dev"))
+
+    result, _other = await _delete_stored(monkeypatch, "merge_dev", control_session=held)
+
+    assert merge.requests == [], "Merge was called while the closure held its locks"
+    assert result.erp_grant_revocation == tenant_deletion.GRANT_REVOKE_AFTER_COMMIT
+    await held.commit()
+    assert len(merge.requests) == 1
+    assert result.erp_grant_revocation == erp_oauth.REVOKED

@@ -8,7 +8,13 @@
  * writer, and these helpers only start, read and end that flow.
  */
 import { api } from '#lib/api.ts';
-import type { ErpCatalog, ErpOAuthStatus } from '#lib/types/erpConnection.ts';
+import type {
+	ErpCatalog,
+	ErpDisconnectResult,
+	ErpOAuthStatus,
+	ErpPendingConnect,
+	ErpTestResult
+} from '#lib/types/erpConnection.ts';
 
 const BASE = '/api/organization/erp';
 
@@ -16,10 +22,52 @@ export const getErpCatalog = () => api.get<ErpCatalog>(`${BASE}/providers`);
 
 export const getErpOAuthStatus = () => api.get<ErpOAuthStatus>(`${BASE}/oauth/status`);
 
+/**
+ * The provider's consent URL. A CREDENTIALED request (`credentials: 'include'`):
+ * the response sets the HttpOnly nonce cookie on the API host that the OAuth
+ * callback compares against the signed `state`, binding the connect to this
+ * browser (login-CSRF — `docs/authentication.md` § ERP OAuth connections).
+ * Without it the browser discards the cookie and every callback answers
+ * `erp_error=browser_mismatch`.
+ */
 export const startErpOAuth = (provider: string) =>
-	api.get<{ authorize_url: string }>(`${BASE}/oauth/${encodeURIComponent(provider)}/authorize`);
+	api.get<{ authorize_url: string }>(
+		`${BASE}/oauth/${encodeURIComponent(provider)}/authorize`,
+		{ credentials: 'include' }
+	);
 
-export const disconnectErpOAuth = () => api.post<unknown>(`${BASE}/oauth/disconnect`, {});
+/**
+ * The company picker (decisions §355). When a consent reaches several
+ * companies the callback holds it server-side and returns with
+ * `?erp_choose_company=`. All three calls are CREDENTIALED, like
+ * `startErpOAuth`: the pending connect is keyed on the same HttpOnly nonce
+ * cookie, so only the browser that started the connect can read or finish it.
+ */
+export const getErpPendingConnect = () =>
+	api.get<ErpPendingConnect>(`${BASE}/oauth/pending`, { credentials: 'include' });
+
+export const selectErpCompany = (companyId: string) =>
+	api.post<{ connected: boolean; provider: string; external_tenant_id: string }>(
+		`${BASE}/oauth/pending/select`,
+		{ company_id: companyId },
+		undefined,
+		{ credentials: 'include' }
+	);
+
+export const discardErpPendingConnect = () =>
+	api.delete<{ discarded: boolean }>(`${BASE}/oauth/pending`, undefined, {
+		credentials: 'include'
+	});
+
+export const disconnectErpOAuth = () =>
+	api.post<ErpDisconnectResult>(`${BASE}/oauth/disconnect`, {});
+
+/** The status-sync sweep's pass for this tenant, now (decisions §386, §392):
+ *  202 `{started}`, the pass running after the response. Refused 409 with a
+ *  coded `status_sync_*` reason, or 429 `rate_limited` (four an hour), both
+ *  stated by `api/codedRefusals.ts`. */
+export const startErpStatusSync = () =>
+	api.post<{ started: boolean }>(`${BASE}/oauth/status-sync`, {});
 
 export const testErpConnection = (erp: Record<string, unknown>) =>
-	api.post<{ success: boolean; message: string }>('/api/organization/test-erp', erp);
+	api.post<ErpTestResult>('/api/organization/test-erp', erp);

@@ -3,7 +3,8 @@
  * separate token key so the AP app and the portal can't stomp on each other's
  * localStorage (opening both in the same browser would otherwise clobber one).
  */
-import { apiErrorFromBody } from '#lib/api.ts';
+import { localizedApiError } from '#lib/api.ts';
+import type { ActionRefusal } from '#lib/api/actionVerdicts.ts';
 import { getApiBase, getTenantSlug } from '#lib/tenant.ts';
 
 // Resolved per request, not frozen at module load — see the note in
@@ -54,12 +55,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 			throw new Error('Unauthorized');
 		}
 		const body = await res.json().catch(() => ({}));
-		throw apiErrorFromBody(body, 'Invalid credentials', res.status);
+		throw await localizedApiError(body, 'Invalid credentials', res.status);
 	}
 
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
-		throw apiErrorFromBody(body, `API error ${res.status}`, res.status);
+		throw await localizedApiError(body, `API error ${res.status}`, res.status);
 	}
 
 	if (res.status === 204) return undefined as T;
@@ -84,7 +85,7 @@ async function download(path: string): Promise<Blob> {
 	}
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
-		throw apiErrorFromBody(body, `API error ${res.status}`, res.status);
+		throw await localizedApiError(body, `API error ${res.status}`, res.status);
 	}
 	return res.blob();
 }
@@ -170,7 +171,8 @@ export interface PortalInvoiceListItem {
 	id: string;
 	invoice_number: string;
 	amount: number | string;
-	currency: string;
+	/** `null` until extraction reads a currency off the document. */
+	currency: string | null;
 	status: string;
 	invoice_date: string | null;
 	due_date: string | null;
@@ -191,7 +193,8 @@ export interface PortalPaymentListItem {
 	invoice_id: string;
 	invoice_number: string;
 	amount: number | string;
-	currency: string;
+	/** `null` when the paid invoice records no currency (decisions §473). */
+	currency: string | null;
 	method: string | null;
 	status: string;
 	reference: string | null;
@@ -203,13 +206,18 @@ export interface PortalPOListItem {
 	id: string;
 	po_number: string;
 	status: string;
-	total: number | string;
+	/** `null` while `total_unverifiable` — the buyer's ERP could not confirm it (decisions §323). */
+	total: number | string | null;
+	total_unverifiable: boolean;
 	/** The PO's own code; `null` when no source recorded one, and `<Money>`
 	 *  then renders the total bare. It used to arrive as `"USD"` for every PO,
 	 *  a schema default the handler never overrode (decisions §197). */
 	currency: string | null;
 	line_item_count: number;
 	created_at: string;
+	/** The server's verdict on "Create invoice" (`api/portal.py::po_flip_refusal`):
+	 *  `null` = allowed. Absent (an older backend) reads as a refusal: fail closed. */
+	flip_verdict?: ActionRefusal | null;
 }
 
 /** Filter params for the signed-in vendor's own invoice list. `status` carries

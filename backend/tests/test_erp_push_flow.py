@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -49,7 +50,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.models.invoice import InvoiceStatus
-from app.services.erp import ErpPostRefusedError, retry_erp, send_to_erp_internal
+from app.services.erp import (
+    ATTEMPT_STARTED_AT_KEY,
+    ErpPostRefusedError,
+    retry_erp,
+    send_to_erp_internal,
+)
 
 _UNSET = object()
 
@@ -104,6 +110,32 @@ def _invoice(
     )
 
 
+def _unstamped(state: dict) -> dict:
+    """``state`` without its outcome-unknown stamp, which must be an aware ISO
+    time whenever the outcome is unknown (§405), and absent otherwise; and
+    without the attempt-start stamp, which, when present, must be an aware ISO
+    time too (it is never cleared, §428 round-13 amendment)."""
+    from app.services.erp import (
+        ATTEMPT_STARTED_AT_KEY,
+        OUTCOME_UNKNOWN_AT_FINAL_KEY,
+        OUTCOME_UNKNOWN_AT_KEY,
+        OUTCOME_UNKNOWN_KEY,
+    )
+
+    out = dict(state)
+    attempt = out.pop(ATTEMPT_STARTED_AT_KEY, None)
+    if attempt is not None:
+        assert datetime.fromisoformat(attempt).tzinfo is not None
+    stamp = out.pop(OUTCOME_UNKNOWN_AT_KEY, None)
+    final = out.pop(OUTCOME_UNKNOWN_AT_FINAL_KEY, None)
+    if out.get(OUTCOME_UNKNOWN_KEY):
+        assert datetime.fromisoformat(stamp).tzinfo is not None
+        assert final is True, "an attempt that came back records its end as final"
+    else:
+        assert stamp is None and final is None
+    return out
+
+
 def _instance(*, state_data=None):
     return SimpleNamespace(
         id=uuid.uuid4(),
@@ -129,6 +161,23 @@ class _AuditRecorder:
             for r in self.rows
             if "old_status" in (r.get("details") or {})
         ]
+
+
+@pytest.fixture(autouse=True)
+def _push_gate_reads_the_fixture(request, monkeypatch):
+    """The `sending_to_erp` gate (decisions §410) re-reads the row under a lock.
+
+    These unit tests hand `send_to_erp_internal` an in-memory invoice and a
+    mocked session, so the gate is pointed at that invoice's own status. A test
+    on a real tenant (`realdb`) keeps the real locked read.
+    """
+    if "realdb" in request.fixturenames:
+        return
+
+    async def _status(_db, invoice):
+        return invoice.status
+
+    monkeypatch.setattr("app.services.erp._locked_push_status", _status)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +217,50 @@ async def test_send_to_erp_happy_path_walks_approved_to_done():
     # Instance state_data captures the retry count and the ERP ref.
     assert inst.state_data["erp_reference"] == "ERP-12345"
     assert inst.state_data["erp_retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_status_synced_erp_leaves_the_bill_payable_at_posted_in_erp():
+    """Decisions §295: when the ERP's payment status flows back (QuickBooks
+    with status sync on), a confirmed push lands at `posted_in_erp` — payable,
+    so the ERP-paid path can move it to `paid` — instead of closing at `done`."""
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    inst = _instance()
+    recorder = _AuditRecorder()
+    db = AsyncMock()
+    config = {"type": "quickbooks_online", "integration_method": "direct"}
+
+    with (
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", AsyncMock(return_value="501")),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=inst)),
+        patch("app.services.erp.complete_workflow", AsyncMock()),
+        patch("app.services.erp.status_sync_active", return_value=True) as active,
+    ):
+        await send_to_erp_internal(db, inv, erp_config=config)
+
+    active.assert_called_once_with(config)
+    assert inv.status == InvoiceStatus.posted_in_erp
+    assert recorder.transitions() == [
+        ("sending_to_erp", "sent_to_erp"),
+        ("sent_to_erp", "posted_in_erp"),
+    ]
+
+
+def test_status_sync_needs_the_flag_and_an_adapter_that_reports_back(monkeypatch):
+    from app.config import settings
+    from app.services.erp_status_sync import status_sync_active
+
+    qbo = {"type": "quickbooks_online", "integration_method": "direct"}
+    netsuite = {"type": "netsuite", "integration_method": "direct"}
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    assert status_sync_active(qbo) is False
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    assert status_sync_active(qbo) is True
+    # An ERP whose payments never flow back keeps closing at `done`.
+    assert status_sync_active(netsuite) is False
+    assert status_sync_active(None) is False
+    assert status_sync_active({"type": "no_such_erp", "integration_method": "direct"}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +509,13 @@ async def test_send_to_erp_internal_passes_org_erp_config_to_call_erp():
     inst = _instance()
     db = AsyncMock()
     call_erp = AsyncMock(return_value="ERP-REF-1")
-    cfg = {"type": "netsuite", "integration_method": "direct", "account_id": "ACCT"}
+    cfg = {
+        "type": "netsuite",
+        "integration_method": "direct",
+        "account_id": "ACCT",
+        # Migrated while connected to this account: its NULL-realm links count.
+        "legacy_link_realm": "netsuite:acct",
+    }
 
     with (
         patch("app.services.workflow_engine.dispatch_audit", new=_AuditRecorder()),
@@ -439,15 +538,24 @@ async def test_call_erp_dispatches_via_configured_adapter_not_mock():
 
     resp = AsyncMock()
     resp.status_code = 201
-    resp.json = lambda: {"model": {"id": "merge-inv-77", "number": "INV-1"}}
+    resp.json = lambda **_: {
+        "model": {"id": "merge-inv-77", "number": "INV-1", "total_amount": Decimal("100.00")}
+    }
 
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_merge_no_bill())
         client.post = AsyncMock(return_value=resp)
         ref = await _call_erp(
-            _line_items_db([]),
-            _invoice(),
-            {"integration_method": "merge_dev", "api_key": "k", "account_token": "t"},
+            _line_items_db([], accounts=[("6000", None, "ERP-6000")]),
+            _invoice(gl_account="6000"),
+            {
+                "integration_method": "merge_dev",
+                "api_key": "k",
+                "account_token": "t",
+                # Migrated while on this connection: its NULL-realm links count.
+                "legacy_link_realm": "merge_dev:",
+            },
         )
 
     assert ref == "merge-inv-77"
@@ -462,7 +570,12 @@ async def test_call_erp_carries_an_unconfirmed_erp_job_to_the_next_attempt():
     instance and hands it back on the next attempt — a manual retry after a
     non-retryable `job_unconfirmed` included — so the adapter checks that job
     instead of queueing a second bill. A later result without one clears it."""
-    from app.services.erp import PENDING_JOB_KEY, ErpPostRefusedError, _call_erp
+    from app.services.erp import (
+        OUTCOME_UNKNOWN_KEY,
+        PENDING_JOB_KEY,
+        ErpPostRefusedError,
+        _call_erp,
+    )
     from app.services.erp_adapters.base import ErpPostResult
 
     seen: list[str | None] = []
@@ -482,13 +595,106 @@ async def test_call_erp_carries_an_unconfirmed_erp_job_to_the_next_attempt():
     with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
         with pytest.raises(ErpPostRefusedError):
             await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
-        assert inst.state_data == {"erp_retries": 0, PENDING_JOB_KEY: "job-41"}
+        assert _unstamped(inst.state_data) == {
+            "erp_retries": 0,
+            PENDING_JOB_KEY: "job-41",
+            OUTCOME_UNKNOWN_KEY: True,
+        }
 
         ref = await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
 
     assert ref == "FE-9"
     assert seen == [None, "job-41"]
-    assert inst.state_data == {"erp_retries": 0, PENDING_JOB_KEY: None}
+    assert ATTEMPT_STARTED_AT_KEY in inst.state_data
+    assert _unstamped(inst.state_data) == {
+        "erp_retries": 0,
+        PENDING_JOB_KEY: None,
+        OUTCOME_UNKNOWN_KEY: False,
+        "erp_reference": "FE-9",
+        # The connection realm the bill lives in (§295) — `merge_dev:` for the
+        # default config these tests send with.
+        "erp_realm": "merge_dev:",
+    }
+
+
+@pytest.mark.asyncio
+async def test_call_erp_hands_each_earlier_attempts_invoice_date_to_the_next():
+    """An ERP whose duplicate lookup narrows by date (Blackbaud FE NXT) has to
+    search the date an earlier attempt was sent with, not only the invoice's
+    current one: an edit between a lost attempt and the retry would otherwise
+    hide the bill it made, and the retry would post a second (decisions §322).
+    The date is kept before the call and cleared by a success."""
+    from datetime import date
+
+    from app.services.erp import ATTEMPT_INVOICE_DATES_KEY, ErpPostFailedError, _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+
+    seen: list[tuple[date, list[date]]] = []
+    results = [
+        ErpPostResult(success=False, message="timed out"),
+        ErpPostResult(success=True, erp_document_id="FE-9"),
+    ]
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            seen.append((payload.invoice_date, list(payload.prior_invoice_dates)))
+            return results.pop(0)
+
+    invoice = _invoice()
+    invoice.invoice_date, invoice.due_date = date(2026, 1, 1), date(2026, 1, 31)
+    inst = _instance(state_data={"erp_retries": 0})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        with pytest.raises(ErpPostFailedError):
+            await _call_erp(_line_items_db([]), invoice, {"type": "x"}, instance=inst)
+        assert inst.state_data[ATTEMPT_INVOICE_DATES_KEY] == ["2026-01-01"]
+
+        invoice.invoice_date = date(2026, 1, 11)  # edited before the retry
+        await _call_erp(_line_items_db([]), invoice, {"type": "x"}, instance=inst)
+
+    assert seen == [
+        (date(2026, 1, 1), []),
+        (date(2026, 1, 11), [date(2026, 1, 1)]),
+    ]
+    assert ATTEMPT_INVOICE_DATES_KEY not in inst.state_data
+
+
+@pytest.mark.asyncio
+async def test_an_attempt_that_left_nothing_gives_its_date_slot_back():
+    """Only an attempt that may have reached the ERP keeps its date. A refusal
+    made before any call (`not_posted`: a budget refusal, a pre-flight one)
+    names no bill, so editing the date and being refused again and again never
+    crowds out the date of a bill that may exist (decisions §322)."""
+    from datetime import date
+
+    from app.services.erp import (
+        ATTEMPT_INVOICE_DATES_KEY,
+        ErpPostFailedError,
+        ErpPostRefusedError,
+        _call_erp,
+    )
+    from app.services.erp_adapters.base import ErpPostResult, erp_preflight_refusal
+
+    results = [
+        ErpPostResult(success=False, message="timed out"),
+        *[erp_preflight_refusal("X", "erp_call_budget_exhausted") for _ in range(7)],
+    ]
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            return results.pop(0)
+
+    invoice = _invoice()
+    invoice.invoice_date, invoice.due_date = date(2026, 1, 1), date(2026, 3, 31)
+    inst = _instance(state_data={"erp_retries": 0})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        with pytest.raises(ErpPostFailedError):
+            await _call_erp(_line_items_db([]), invoice, {"type": "x"}, instance=inst)
+        for day in range(2, 9):
+            invoice.invoice_date = date(2026, 1, day)
+            with pytest.raises(ErpPostRefusedError):
+                await _call_erp(_line_items_db([]), invoice, {"type": "x"}, instance=inst)
+
+    assert inst.state_data[ATTEMPT_INVOICE_DATES_KEY] == ["2026-01-01"]
 
 
 # ---------------------------------------------------------------------------
@@ -496,17 +702,28 @@ async def test_call_erp_carries_an_unconfirmed_erp_job_to_the_next_attempt():
 # ---------------------------------------------------------------------------
 
 
-def _line_items_db(rows, *, vendor_erp_id="ERP-V-1", accounts=None):
-    """A fake AsyncSession answering the three reads `_call_erp` makes, routed
+def _line_items_db(
+    rows, *, vendor_erp_id="ERP-V-1", vendor_realm=None, accounts=None, open_exceptions=()
+):
+    """A fake AsyncSession answering the four reads `_call_erp` makes, routed
     by the table each statement selects from:
 
+    * the export gate (`erp_export_gate`, decisions §286) — `open_exceptions`,
+      `(invoice_id, exception_type)` rows; none by default, so the push goes on,
+      and then its live payment / card reads (§309) and its vendor read,
+      always empty here (the
+      gate's own SQL is proven against a real tenant in
+      `test_erp_export_blocking_exceptions.py`);
     * `_fetch_line_items` — the given rows, in the order given (mirrors the
       real query's ORDER BY);
-    * the vendor link — `vendor_erp_id` (None models an unlinked vendor);
-    * the chart — `accounts`, `(code, entity_id, erp_account_id)` rows, which
-      `gl_chart.resolve_erp_account_ids` folds (its SQL filter is proven
-      against a real tenant in the realdb tests below). Default: every line's
-      code, shared, with an `ERP-<code>` id.
+    * the vendor link — `vendor_erp_id` (None models an unlinked vendor),
+      linked under `vendor_realm` (None: a pre-0115 link, which counts only
+      where the config names no company — pass the config's realm otherwise);
+    * the chart — `accounts`, `(code, entity_id, erp_account_id[,
+      erp_link_realm])` rows, which `gl_chart.resolve_erp_account_ids` folds
+      (its SQL filter is proven against a real tenant in the realdb tests
+      below). A row without a realm is a pre-0115 (NULL) link. Default: every
+      line's code, shared, with an `ERP-<code>` id.
 
     `db.calls` records the table of each statement, in order.
     """
@@ -517,15 +734,45 @@ def _line_items_db(rows, *, vendor_erp_id="ERP-V-1", accounts=None):
 
     async def execute(stmt, *_a, **_kw):
         sql = str(stmt)
+        if "FROM exceptions" in sql:
+            db.calls.append("exceptions")
+            return SimpleNamespace(all=lambda: list(open_exceptions))
+        # The gate's live-claim reads (decisions §309): no live payment, no
+        # live card, so the push goes on.
+        if "JOIN payments" in sql:
+            db.calls.append("payments")
+            return SimpleNamespace(all=lambda: [])
+        if "FROM virtual_cards" in sql:
+            db.calls.append("virtual_cards")
+            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+        # The gate's vendor read (`payment_runs.vendor_payability`): no row,
+        # so nothing holds the push (its SQL and every status are proven
+        # against a real tenant in `test_erp_export_blocking_exceptions.py`).
+        if "FROM vendors" in sql and "payments_blocked" in sql:
+            db.calls.append("vendor_payability")
+            return SimpleNamespace(all=lambda: [])
         if "FROM invoice_line_items" in sql:
             db.calls.append("invoice_line_items")
             return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
         if "FROM vendors" in sql:
             db.calls.append("vendors")
-            return SimpleNamespace(scalar_one_or_none=lambda: vendor_erp_id)
+            # The vendor's row link, which `vendor_erp_links.vendor_erp_ids`
+            # folds under the config's realm.
+            return SimpleNamespace(
+                one_or_none=lambda: SimpleNamespace(
+                    id=uuid.uuid4(), erp_vendor_id=vendor_erp_id, erp_link_realm=vendor_realm
+                )
+            )
+        if "FROM vendor_erp_links" in sql:
+            # No link kept from an earlier connection (§356; proven against a
+            # real tenant in `test_erp_link_realm.py`).
+            db.calls.append("vendor_erp_links")
+            return SimpleNamespace(all=lambda: [])
         if "FROM gl_accounts" in sql:
             db.calls.append("gl_accounts")
-            return SimpleNamespace(all=lambda: list(accounts))
+            return SimpleNamespace(
+                all=lambda: [tuple(a) + (None,) * (4 - len(a)) for a in accounts]
+            )
         raise AssertionError(f"unexpected query: {sql}")
 
     db.execute = execute
@@ -574,18 +821,28 @@ async def test_call_erp_includes_line_items_in_payload():
         _line_item(line_number=None, item_code="SKU-2", gl_account="6100", total=Decimal("50.00")),
     ]
     db = _line_items_db(rows)
+    inv = _invoice()
+    inv.amount = Decimal("71.00")  # what the two lines add up to
 
     resp = AsyncMock()
     resp.status_code = 201
-    resp.json = lambda: {"model": {"id": "merge-inv-88", "number": "INV-1"}}
+    resp.json = lambda **_: {
+        "model": {"id": "merge-inv-88", "number": "INV-1", "total_amount": Decimal("71.00")}
+    }
 
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_merge_no_bill())
         client.post = AsyncMock(return_value=resp)
         await _call_erp(
             db,
-            _invoice(),
-            {"integration_method": "merge_dev", "api_key": "k", "account_token": "t"},
+            inv,
+            {
+                "integration_method": "merge_dev",
+                "api_key": "k",
+                "account_token": "t",
+                "legacy_link_realm": "merge_dev:",
+            },
         )
 
     # The adapter serialises the body itself (`content=`, not `json=`) so the
@@ -595,10 +852,11 @@ async def test_call_erp_includes_line_items_in_payload():
     assert len(posted_lines) == 2
     # Merge references accounts by its own object id — the chart's
     # `erp_account_id`, never the GL code.
+    # A Merge invoice line's amount is `total_amount` (decisions §399).
     assert posted_lines[0]["account"] == "ERP-6000"
-    assert posted_lines[0]["total_line_amount"] == 21.00
+    assert posted_lines[0]["total_amount"] == 21.00
     assert posted_lines[1]["account"] == "ERP-6100"
-    assert posted_lines[1]["total_line_amount"] == 50.00
+    assert posted_lines[1]["total_amount"] == 50.00
     assert posted_body["model"]["contact"] == "ERP-V-1"
 
 
@@ -702,6 +960,10 @@ _NETSUITE_CFG = {
     "type": "netsuite",
     "integration_method": "direct",
     "account_id": "FAKE123",
+    # Migrated while connected to this account (migration 0115), so the
+    # fakes' NULL-realm links are trusted — see the realm tests in
+    # test_erp_link_realm.py for the other cases.
+    "legacy_link_realm": "netsuite:fake123",
     "consumer_key": "ck",
     "consumer_secret": "cs",
     "token_id": "ti",
@@ -733,22 +995,30 @@ async def test_call_erp_posts_netsuite_by_vendor_and_account_id():
     # The line makes the approved 100.00, so it posts as its own expense line
     # (lines that do not add up collapse onto the header account instead).
     rows = [_line_item(gl_account="6000", total=Decimal("100.00"))]
+    # The `eid:` lookup's miss: NetSuite's 404 NONEXISTENT_ID.
     lookup = AsyncMock()
-    lookup.status_code = 200
-    lookup.json = lambda: {"items": []}
+    lookup.status_code = 404
+    lookup.json = lambda: {"o:errorDetails": [{"o:errorCode": "NONEXISTENT_ID"}]}
+    # The SuiteQL currency read: USD is internal id 1.
+    currency = AsyncMock()
+    currency.status_code = 200
+    currency.content = b'{"items": [{"id": "1", "symbol": "USD"}], "hasMore": false}'
     created = AsyncMock()
     created.status_code = 204
     created.headers = {"Location": "https://x/vendorBill/1001"}
     created.content = b""
-    # The read-back: NetSuite booked exactly the approved 100.00.
+    # The read-back: NetSuite booked exactly the approved 100.00, in USD, and
+    # shows the bill approved (Open).
     readback = AsyncMock()
     readback.status_code = 200
-    readback.content = b'{"id": "1001", "total": 100.00}'
+    readback.content = (
+        b'{"id": "1001", "total": 100.00, "currency": {"id": "1"}, "status": {"id": "open"}}'
+    )
 
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
         client.get = AsyncMock(side_effect=[lookup, readback])
-        client.post = AsyncMock(return_value=created)
+        client.post = AsyncMock(side_effect=[currency, created])
         ref = await _call_erp(_line_items_db(rows), _invoice(), _NETSUITE_CFG)
 
     assert ref == "1001"
@@ -894,6 +1164,7 @@ async def test_call_erp_keeps_the_id_of_a_bill_a_refusal_left_in_the_erp(kind):
     from app.services.erp import (
         ORPHAN_DOCUMENT_ID_KEY,
         ORPHAN_DOCUMENT_NUMBER_KEY,
+        OUTCOME_UNKNOWN_KEY,
         _call_erp,
     )
 
@@ -913,10 +1184,11 @@ async def test_call_erp_keeps_the_id_of_a_bill_a_refusal_left_in_the_erp(kind):
     assert exc.value.erp_document_id == "XERO-BILL-7"
     assert exc.value.erp_document_number == "BILL-0007"
     assert str(exc.value) == result.message
-    assert inst.state_data == {
+    assert _unstamped(inst.state_data) == {
         "erp_retries": 0,
         ORPHAN_DOCUMENT_ID_KEY: "XERO-BILL-7",
         ORPHAN_DOCUMENT_NUMBER_KEY: "BILL-0007",
+        OUTCOME_UNKNOWN_KEY: True,
     }
 
 
@@ -944,7 +1216,7 @@ async def test_call_erp_retryable_failure_carries_the_bill_ids_too():
 async def test_call_erp_failure_without_a_document_keeps_the_earlier_orphan():
     """A later attempt that reports no document does not erase the bill an
     earlier attempt left in the ERP — it is still there."""
-    from app.services.erp import ORPHAN_DOCUMENT_ID_KEY, _call_erp
+    from app.services.erp import ORPHAN_DOCUMENT_ID_KEY, OUTCOME_UNKNOWN_KEY, _call_erp
     from app.services.erp_adapters.base import erp_refusal
 
     class _Adapter:
@@ -957,7 +1229,70 @@ async def test_call_erp_failure_without_a_document_keeps_the_earlier_orphan():
         with pytest.raises(ErpPostRefusedError) as exc:
             await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
     assert exc.value.erp_document_id is None
-    assert inst.state_data == state
+    assert _unstamped(inst.state_data) == {**state, OUTCOME_UNKNOWN_KEY: True}
+
+
+@pytest.mark.asyncio
+async def test_only_an_orphan_the_adapter_created_is_handed_back_as_its_own():
+    """The orphan id goes back to the adapter as `own_orphan_document_id` only
+    when the attempt that left it said it CREATED it (`erp_document_is_own`).
+    A later attempt that names a document it merely found replaces the orphan
+    and drops the claim, so a BC user's draft is never handed back as ours;
+    a row from before the flag existed is read as not ours (decisions §397)."""
+    from app.services.erp import (
+        ORPHAN_DOCUMENT_FINGERPRINT_KEY,
+        ORPHAN_DOCUMENT_ID_KEY,
+        ORPHAN_DOCUMENT_OWN_KEY,
+        ErpPostFailedError,
+        _call_erp,
+    )
+    from app.services.erp_adapters.base import ErpPostResult
+
+    seen: list[str | None] = []
+    results = [
+        # Our draft, whose read was lost.
+        ErpPostResult(success=False, message="read lost", erp_document_id="D-OURS"),
+        # A draft the lookup found and could not prove was ours.
+        ErpPostResult(success=False, message="refused", erp_document_id="D-FOUND", retryable=False),
+        ErpPostResult(success=False, message="refused", retryable=False),
+    ]
+    results[0].erp_document_is_own = True
+    results[0].erp_document_fingerprint = "120|24|144"
+
+    prints: list[str | None] = []
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            seen.append(payload.own_orphan_document_id)
+            prints.append(payload.own_orphan_document_fingerprint)
+            return results.pop(0)
+
+    inst = _instance(state_data={"erp_retries": 0})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        with pytest.raises(ErpPostFailedError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+        assert inst.state_data[ORPHAN_DOCUMENT_ID_KEY] == "D-OURS"
+        assert inst.state_data[ORPHAN_DOCUMENT_OWN_KEY] is True
+        assert inst.state_data[ORPHAN_DOCUMENT_FINGERPRINT_KEY] == "120|24|144"
+        with pytest.raises(ErpPostRefusedError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+        assert inst.state_data[ORPHAN_DOCUMENT_ID_KEY] == "D-FOUND"
+        assert ORPHAN_DOCUMENT_OWN_KEY not in inst.state_data
+        assert ORPHAN_DOCUMENT_FINGERPRINT_KEY not in inst.state_data
+        with pytest.raises(ErpPostRefusedError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+
+    assert seen == [None, "D-OURS", None]
+    assert prints == [None, "120|24|144", None]
+
+    # Recorded before the flag existed: an orphan with no proof it was ours.
+    legacy = _instance(state_data={"erp_retries": 0, ORPHAN_DOCUMENT_ID_KEY: "D-OLD"})
+    seen.clear()
+    results.append(ErpPostResult(success=False, message="refused", retryable=False))
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        with pytest.raises(ErpPostRefusedError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=legacy)
+    assert seen == [None]
 
 
 @pytest.mark.asyncio
@@ -967,6 +1302,7 @@ async def test_call_erp_success_clears_an_earlier_orphan():
     from app.services.erp import (
         ORPHAN_DOCUMENT_ID_KEY,
         ORPHAN_DOCUMENT_NUMBER_KEY,
+        OUTCOME_UNKNOWN_KEY,
         _call_erp,
     )
     from app.services.erp_adapters.base import ErpPostResult
@@ -980,12 +1316,20 @@ async def test_call_erp_success_clears_an_earlier_orphan():
             "erp_retries": 0,
             ORPHAN_DOCUMENT_ID_KEY: "XERO-BILL-7",
             ORPHAN_DOCUMENT_NUMBER_KEY: "BILL-0007",
+            "erp_orphan_document_own": True,
+            "erp_orphan_document_fingerprint": "120|24|144",
         }
     )
     with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
         ref = await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
     assert ref == "XERO-BILL-7"
-    assert inst.state_data == {"erp_retries": 0}
+    assert ATTEMPT_STARTED_AT_KEY in inst.state_data
+    assert _unstamped(inst.state_data) == {
+        "erp_retries": 0,
+        OUTCOME_UNKNOWN_KEY: False,
+        "erp_reference": "XERO-BILL-7",
+        "erp_realm": "merge_dev:",
+    }
 
 
 @pytest.mark.asyncio
@@ -1060,7 +1404,7 @@ async def test_send_to_erp_failed_audit_row_falls_back_to_an_earlier_orphan():
 # ---------------------------------------------------------------------------
 
 
-async def _seed_erp_failed_invoice(mk, org_id, *, state_data):
+async def _seed_erp_failed_invoice(mk, org_id, *, state_data, status=InvoiceStatus.failed):
     from app.models.invoice import Invoice
     from app.models.workflow import WorkflowDefinition, WorkflowInstance
 
@@ -1074,7 +1418,7 @@ async def _seed_erp_failed_invoice(mk, org_id, *, state_data):
             vendor_name="Acme",
             amount=Decimal("100.00"),
             currency="USD",
-            status=InvoiceStatus.failed,
+            status=status,
             approved_by=str(uuid.uuid4()),
         )
         s.add_all([definition, inv])
@@ -1192,3 +1536,964 @@ async def test_send_to_erp_commits_the_orphan_bill_and_its_audit_row(realdb):
     assert fail_row.details["erp_document_id"] == "XERO-BILL-7"
     assert fail_row.details["erp_document_number"] == "BILL-0007"
     assert _PROVIDER_BODY_MARKER not in json.dumps(fail_row.details)
+
+
+# ---------------------------------------------------------------------------
+# Only an invoice still at `sending_to_erp` is pushed (decisions §410)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        InvoiceStatus.ready_for_review,  # failed, then its approval was recalled
+        InvoiceStatus.failed,
+        InvoiceStatus.approved,
+        InvoiceStatus.sent_to_erp,
+        InvoiceStatus.done,
+    ],
+)
+async def test_a_push_for_an_invoice_no_longer_sending_is_skipped(status, caplog):
+    """A redelivered job for an invoice that has moved on is left alone: no
+    adapter call, no transition, no audit row, the instance untouched, and a
+    normal return so the dispatcher counts the job done."""
+    inv = _invoice(status=status)
+    # A budget left to spend, so the gate, not an exhausted counter, is what
+    # stops it.
+    state = {"erp_retries": 1, "last_error": "down"}
+    inst = _instance(state_data=dict(state))
+    recorder = _AuditRecorder()
+    call = AsyncMock(return_value="ERP-1")
+    db = AsyncMock()
+
+    with (
+        caplog.at_level("WARNING", logger="app.services.erp"),
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", call),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=inst)),
+    ):
+        await send_to_erp_internal(db, inv)
+
+    call.assert_not_called()
+    assert inv.status == status
+    assert recorder.rows == []
+    assert inst.state_data == state
+    db.commit.assert_not_called()
+    db.rollback.assert_awaited()
+    assert f"invoice {inv.id} is at {status.value}, not sending_to_erp" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_gate_is_asked_again_after_every_backoff():
+    """Each backoff gives the row lock back, so the next attempt re-reads it: a
+    concurrent push that landed the bill meanwhile ends this one."""
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    inst = _instance(state_data={})
+    recorder = _AuditRecorder()
+    seen = iter([InvoiceStatus.sending_to_erp, InvoiceStatus.done])
+
+    async def _status(_db, _invoice):
+        return next(seen)
+
+    call = AsyncMock(side_effect=RuntimeError("timeout"))
+    with (
+        patch("app.services.erp._locked_push_status", _status),
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", call),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=inst)),
+        patch("app.services.erp.asyncio.sleep", AsyncMock()),
+    ):
+        await send_to_erp_internal(AsyncMock(), inv)
+
+    assert call.await_count == 1
+    assert recorder.rows == []
+    assert inst.state_data["erp_retries"] == 1
+
+
+class _NeverCalledAdapter:
+    async def post_invoice(self, payload):  # pragma: no cover - the assertion
+        raise AssertionError("the adapter must not be reached")
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_push_after_a_recall_posts_nothing(realdb):
+    """End to end on a real tenant, with the dispatcher's own shape: the job's
+    session loaded the invoice while it was `sending_to_erp`, and before the
+    push ran the invoice failed and its approval was recalled. The committed row
+    decides, not the stale object, and nothing is posted or written."""
+    from sqlalchemy import select, update
+
+    from app.models.invoice import Invoice
+
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    state = {"erp_retries": 0}
+    inv_id = await _seed_erp_failed_invoice(
+        mk, info.org_id, state_data=state, status=InvoiceStatus.sending_to_erp
+    )
+    _, _, rows_before = await _reload(mk, inv_id)
+
+    async with mk() as s:
+        inv = (await s.execute(select(Invoice).where(Invoice.id == inv_id))).scalar_one()
+        assert inv.status == InvoiceStatus.sending_to_erp
+        await s.commit()  # the dispatcher's sessions keep attributes across commits
+        async with mk() as other:
+            await other.execute(
+                update(Invoice)
+                .where(Invoice.id == inv_id)
+                .values(status=InvoiceStatus.ready_for_review)
+            )
+            await other.commit()
+        with patch("app.services.erp.get_erp_adapter", return_value=_NeverCalledAdapter()):
+            await send_to_erp_internal(s, inv, erp_config={"type": "x"})
+
+    inv, inst, rows = await _reload(mk, inv_id)
+    assert inv.status == InvoiceStatus.ready_for_review
+    assert inst.state_data == state
+    assert len(rows) == len(rows_before)
+
+
+@pytest.mark.asyncio
+async def test_a_push_at_sending_to_erp_still_runs_on_a_real_tenant(realdb):
+    """The gate's real locked read lets the push it is meant to let through."""
+    from sqlalchemy import select
+
+    from app.models.invoice import Invoice
+
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed_erp_failed_invoice(
+        mk, info.org_id, state_data={"erp_retries": 0}, status=InvoiceStatus.sending_to_erp
+    )
+    async with mk() as s:
+        inv = (await s.execute(select(Invoice).where(Invoice.id == inv_id))).scalar_one()
+        with patch("app.services.erp._call_erp", AsyncMock(return_value="ERP-9")):
+            await send_to_erp_internal(s, inv)
+
+    inv, _, rows = await _reload(mk, inv_id)
+    assert inv.status == InvoiceStatus.done
+    assert any(r.action == "invoice.erp_confirmed" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# A refusal is recorded as a code + params the browser localizes (§284)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_erp_account_refusal_names_the_unlinked_codes():
+    """`account_not_linked` carries WHICH codes resolved to no ERP account —
+    what the reader must sync or recode — beside the unchanged English."""
+    from app.services.erp import _call_erp
+
+    rows = [_line_item(gl_account="Job Materials"), _line_item(line_number=2, gl_account="6100")]
+    db = _line_items_db(rows, accounts=[("Job Materials", None, None), ("6100", None, "ERP-6100")])
+    with patch("httpx.AsyncClient") as cm:
+        with pytest.raises(ErpPostRefusedError) as exc:
+            await _call_erp(db, _invoice(), _NETSUITE_CFG)
+    cm.assert_not_called()
+    assert str(exc.value) == "NetSuite post refused: account_not_linked"
+    assert exc.value.refusal == {
+        "code": "account_not_linked",
+        "params": {"provider": "NetSuite", "accounts": ["Job Materials"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_call_erp_vendor_refusal_carries_its_code_and_provider():
+    from app.services.erp import _call_erp
+
+    with pytest.raises(ErpPostRefusedError) as exc:
+        await _call_erp(
+            _line_items_db([_line_item()], vendor_erp_id=None), _invoice(), _NETSUITE_CFG
+        )
+    assert exc.value.refusal == {"code": "vendor_not_linked", "params": {"provider": "NetSuite"}}
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_row_carries_the_coded_refusal():
+    from app.services.erp import erp_refusal_record
+
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    recorder = _AuditRecorder()
+    refusal = erp_refusal_record("vendor_not_linked", provider="QuickBooks Online")
+    call_erp = AsyncMock(
+        side_effect=ErpPostRefusedError(
+            "QuickBooks Online post refused: vendor_not_linked", refusal=refusal
+        )
+    )
+    with (
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", call_erp),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=_instance())),
+        patch("app.services.erp.asyncio.sleep", AsyncMock()),
+    ):
+        await send_to_erp_internal(AsyncMock(), inv)
+    fail_row = next(r for r in recorder.rows if r["action"] == "invoice.erp_failed")
+    assert fail_row["details"]["error"] == "QuickBooks Online post refused: vendor_not_linked"
+    assert fail_row["details"]["refusal"] == {
+        "code": "vendor_not_linked",
+        "params": {"provider": "QuickBooks Online"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_missing_oauth_connection_is_recorded_as_not_connected():
+    from app.services.erp_oauth import ErpNotConnectedError
+
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    recorder = _AuditRecorder()
+    with (
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", AsyncMock(side_effect=ErpNotConnectedError("x"))),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=_instance())),
+        patch("app.services.erp.asyncio.sleep", AsyncMock()),
+    ):
+        await send_to_erp_internal(AsyncMock(), inv)
+    fail_row = next(r for r in recorder.rows if r["action"] == "invoice.erp_failed")
+    assert fail_row["details"]["refusal"] == {"code": "not_connected", "params": {}}
+
+
+@pytest.mark.asyncio
+async def test_a_transient_failure_records_no_refusal():
+    """An HTTP failure has no stable code to state; the modal shows its text."""
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    recorder = _AuditRecorder()
+    with (
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", AsyncMock(side_effect=RuntimeError("boom"))),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=_instance())),
+        patch("app.services.erp.asyncio.sleep", AsyncMock()),
+    ):
+        await send_to_erp_internal(AsyncMock(), inv)
+    fail_row = next(r for r in recorder.rows if r["action"] == "invoice.erp_failed")
+    assert "refusal" not in fail_row["details"]
+
+
+# ---------------------------------------------------------------------------
+# A deterministic 4xx is never retried; an answer that can change still is
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [
+        (400, False),
+        (403, False),
+        (404, False),
+        (413, False),
+        (422, False),
+        (401, True),
+        (408, True),
+        (409, True),
+        (423, True),
+        (425, True),
+        (429, True),
+        (500, True),
+        (502, True),
+        (503, True),
+        (200, True),
+    ],
+)
+def test_erp_status_retryable(status, retryable):
+    from app.services.erp_adapters.base import erp_http_failure, erp_status_retryable
+
+    assert erp_status_retryable(status) is retryable
+    result = erp_http_failure("Xero", status)
+    assert (result.success, result.retryable) == (False, retryable)
+    assert result.message.startswith(f"Xero post failed: HTTP {status} (")
+
+
+def _merge_no_bill():
+    """Merge's answer to the pre-create lookup: no bill under this vendor and
+    number yet (decisions §399)."""
+    resp = AsyncMock()
+    resp.status_code = 200
+    resp.json = lambda **_: {"next": None, "results": []}
+    return resp
+
+
+def _merge_send(status: int):
+    """Run a whole send through the real `_call_erp` and the Merge.dev adapter,
+    whose create answers ``status`` every time: the invoice, the audit
+    recorder, the config and the response."""
+    resp = AsyncMock()
+    resp.status_code = status
+    resp.headers = {"content-type": "application/json"}
+    resp.json = lambda **_: {"errors": [{"detail": "Vendor Acme 12-3456789"}]}
+    inv = _invoice(status=InvoiceStatus.sending_to_erp, gl_account="6000")
+    recorder = _AuditRecorder()
+    cfg = {"integration_method": "merge_dev", "api_key": "k", "account_token": "t"}
+    return inv, recorder, cfg, resp
+
+
+@pytest.mark.asyncio
+# 503: Merge.dev's create may have landed, and its listing may not show the
+# bill seconds later, so the adapter does not let it be retried automatically
+# (decisions §399). A 429 is treated the same until #654 shows Merge never
+# answers one after the write reached the integration (§409).
+@pytest.mark.parametrize(("status", "attempts"), [(400, 1), (422, 1), (503, 1), (429, 1)])
+async def test_send_to_erp_retries_only_an_answer_that_can_change(status, attempts):
+    from app.services.erp_link_realm import connection_realm
+
+    inv, recorder, cfg, resp = _merge_send(status)
+    sleep_mock = AsyncMock()
+    with (
+        patch("httpx.AsyncClient") as cm,
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=_instance())),
+        patch("app.services.erp.asyncio.sleep", sleep_mock),
+    ):
+        client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_merge_no_bill())
+        client.post = AsyncMock(return_value=resp)
+        # Linked in the Merge.dev realm the config names, so the push posts.
+        realm = connection_realm(cfg)
+        db = _line_items_db([], vendor_realm=realm, accounts=[("6000", None, "ERP-6000", realm)])
+        await send_to_erp_internal(db, inv, erp_config=cfg)
+
+    assert inv.status == InvoiceStatus.failed
+    assert client.post.await_count == attempts
+    assert sleep_mock.await_count == attempts - 1
+    fail_row = next(r for r in recorder.rows if r["action"] == "invoice.erp_failed")
+    assert fail_row["details"]["retries"] == attempts
+    assert fail_row["details"]["error"].startswith(f"Merge.dev post failed: HTTP {status}")
+
+
+@pytest.mark.asyncio
+async def test_a_coded_erp_refusal_records_its_params_on_the_audit_row():
+    """A QuickBooks Fault refusal (`refusal_params`: the Intuit code, the GL
+    codes) reaches `invoice.erp_failed.refusal` beside the provider."""
+    from app.services.erp_adapters.base import ErpPostResult
+
+    result = ErpPostResult(
+        success=False,
+        message="QuickBooks Online post refused: account_inactive (Intuit fault 2500)",
+        retryable=False,
+        refusal_code="account_inactive",
+        refusal_provider="QuickBooks Online",
+        refusal_params={"intuit_code": "2500", "accounts": ["6100"]},
+    )
+    adapter = SimpleNamespace(post_invoice=AsyncMock(return_value=result))
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    recorder = _AuditRecorder()
+    with (
+        patch("app.services.erp.get_erp_adapter", return_value=adapter),
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=_instance())),
+        patch("app.services.erp.asyncio.sleep", AsyncMock()),
+    ):
+        await send_to_erp_internal(_line_items_db([]), inv, erp_config={"type": "x"})
+
+    assert adapter.post_invoice.await_count == 1
+    fail_row = next(r for r in recorder.rows if r["action"] == "invoice.erp_failed")
+    assert fail_row["details"]["retries"] == 1
+    assert fail_row["details"]["refusal"] == {
+        "code": "account_inactive",
+        "params": {"intuit_code": "2500", "accounts": ["6100"], "provider": "QuickBooks Online"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# _call_erp — whether the ERP may already hold the bill (decisions §286)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "unknown"),
+    [
+        ("retryable", True),
+        ("raised", True),
+        # Fail-closed: from here a refusal made before anything was sent cannot
+        # be told from one made after the create went through (a QuickBooks
+        # read-back that lost its connection answers `not_connected`; a Xero
+        # read-back raises it), so every non-success counts.
+        ("refused", True),
+        ("not_connected", True),
+        # ...except an attempt the adapter states left nothing: the ERP's
+        # create refused it outright (QuickBooks' closed books, 2026-10-20).
+        ("refused_not_posted", False),
+        ("success", False),
+    ],
+)
+async def test_call_erp_records_whether_the_attempt_outcome_is_unknown(answer, unknown):
+    """Only a success says definitely where the bill stands."""
+    from app.services.erp import OUTCOME_UNKNOWN_KEY, _call_erp
+    from app.services.erp_adapters.base import ErpPostResult, erp_refusal
+    from app.services.erp_oauth import ErpNotConnectedError
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            if answer == "raised":
+                raise TimeoutError("read timed out")
+            if answer == "not_connected":
+                raise ErpNotConnectedError("quickbooks_online")
+            if answer == "retryable":
+                return ErpPostResult(success=False, message="HTTP 503", retryable=True)
+            if answer == "refused":
+                return erp_refusal("Xero", "vendor_not_linked")
+            if answer == "refused_not_posted":
+                result = erp_refusal("QuickBooks Online", "period_closed")
+                result.not_posted = True
+                return result
+            return ErpPostResult(success=True, erp_document_id="B-1")
+
+    inst = _instance(state_data={})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        if answer == "success":
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+        else:
+            with pytest.raises((RuntimeError, TimeoutError)):
+                await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is unknown
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_after_an_unknown_outcome_keeps_it_unknown():
+    """The refusal posted nothing, but the earlier 503 may have."""
+    from app.services.erp import OUTCOME_UNKNOWN_KEY, _call_erp, possibly_posted
+    from app.services.erp_adapters.base import erp_refusal
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            return erp_refusal("Xero", "vendor_not_linked")
+
+    inst = _instance(state_data={"erp_retries": 1, OUTCOME_UNKNOWN_KEY: True})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        with pytest.raises(ErpPostRefusedError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is True
+    assert possibly_posted(inst.state_data)
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_posted_nothing_still_keeps_an_earlier_unknown():
+    """``not_posted`` speaks for this attempt only: the earlier 503 may still
+    have left a bill."""
+    from app.services.erp import OUTCOME_UNKNOWN_KEY, _call_erp, possibly_posted
+    from app.services.erp_adapters.base import erp_refusal
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            result = erp_refusal("QuickBooks Online", "period_closed")
+            result.not_posted = True
+            return result
+
+    inst = _instance(state_data={"erp_retries": 1, OUTCOME_UNKNOWN_KEY: True})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        with pytest.raises(ErpPostRefusedError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+    assert possibly_posted(inst.state_data)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ({}, False),
+        ({"erp_retries": 0}, False),
+        # A row written before the key existed is read fail-closed.
+        ({"erp_retries": 3, "last_error": "HTTP 503"}, True),
+        ({"erp_retries": 0, "last_error": "HTTP 503"}, True),
+        # Once pinned, the recorded value wins over the legacy reading.
+        ({"last_error": "refused", "erp_outcome_unknown": False}, False),
+        ({"erp_outcome_unknown": True}, True),
+        ({"erp_outcome_unknown": False, "erp_pending_job_id": "job-41"}, True),
+        ({"erp_outcome_unknown": False, "erp_orphan_document_id": "B-7"}, True),
+        ({"erp_outcome_unknown": False, "erp_reference": "B-1"}, True),
+    ],
+)
+def test_possibly_posted(state, expected):
+    from app.services.erp import possibly_posted
+
+    assert possibly_posted(state) is expected
+
+
+@pytest.mark.asyncio
+async def test_call_erp_commits_the_unknown_outcome_before_the_adapter_call():
+    """A worker that dies mid-call (a Lambda timeout SQS redelivers) leaves the
+    committed row saying the bill may exist, not the state before the call."""
+    from app.services.erp import OUTCOME_UNKNOWN_KEY, _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+
+    inst = _instance(state_data={})
+    db = _line_items_db([])
+    seen_at_call: list[tuple[int, object]] = []
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            seen_at_call.append((db.commit.await_count, inst.state_data[OUTCOME_UNKNOWN_KEY]))
+            return ErpPostResult(success=True, erp_document_id="B-1")
+
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        await _call_erp(db, _invoice(), {"type": "x"}, instance=inst)
+    assert seen_at_call == [(1, True)]
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is False
+
+
+@pytest.mark.asyncio
+async def test_a_success_clears_an_earlier_unknown_and_names_the_bill():
+    """The success is the bill of record, recorded with the result itself so a
+    failure before the caller's transitions commit still reads as posted."""
+    from app.services.erp import OUTCOME_UNKNOWN_KEY, _call_erp, possibly_posted
+    from app.services.erp_adapters.base import ErpPostResult
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            return ErpPostResult(success=True, erp_document_id="B-1")
+
+    inst = _instance(state_data={"erp_retries": 1, OUTCOME_UNKNOWN_KEY: True})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is False
+    assert inst.state_data["erp_reference"] == "B-1"
+    assert possibly_posted(inst.state_data)
+
+
+@pytest.mark.asyncio
+async def test_a_success_stamps_the_bill_and_its_deep_link_on_the_invoice():
+    """The invoice row carries the bill of record, so the invoice can link to
+    it: found live, a Xero push left the bill id only in state_data and the
+    audit row, where no screen showed it."""
+    from app.services.erp import _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+
+    bill = "8f1c2a3b-0000-4000-8000-1234567890ab"
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            return ErpPostResult(success=True, erp_document_id=bill, erp_document_number="7")
+
+    inv = _invoice()
+    config = {"type": "xero", "integration_method": "direct"}
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        await _call_erp(_line_items_db([]), inv, config, instance=_instance(state_data={}))
+    assert inv.erp_document_id == bill
+    assert inv.erp_document_url == (
+        f"https://go.xero.com/AccountsPayable/View.aspx?InvoiceID={bill}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "kept"),
+    [
+        # A failure that left a bill names an orphan, not the bill of record,
+        # and leaves the earlier bill of record alone.
+        ({"success": False, "erp_document_id": "ORPHAN-1", "retryable": False}, "EARLIER"),
+        # A number is not an id, and "UNKNOWN" is what the reference falls back
+        # to. A confirmed push with no id clears the pair: the earlier id may
+        # name another ERP's bill if the org has switched.
+        ({"success": True, "erp_document_number": "7"}, None),
+        ({"success": True}, None),
+    ],
+)
+async def test_only_a_confirmed_id_is_stamped_on_the_invoice(result, kept):
+    """Only the ERP's id is stamped, and only by a confirmed push."""
+    from app.services.erp import _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            return ErpPostResult(**result)
+
+    inv = _invoice()
+    inv.erp_document_id = "EARLIER"
+    inv.erp_document_url = None
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        call = _call_erp(_line_items_db([]), inv, {"type": "x"}, instance=_instance())
+        if result["success"]:
+            await call
+        else:
+            with pytest.raises(ErpPostRefusedError):
+                await call
+    assert inv.erp_document_id == kept
+    assert inv.erp_document_url is None
+
+
+@pytest.mark.asyncio
+async def test_call_erp_refuses_a_bill_due_before_it_is_dated():
+    """Live QuickBooks sandbox, 2026-10-20: a bill dated after its due date
+    posted, and QuickBooks' own UI then flagged it invalid. Whatever path made
+    the invoice, the push refuses it before any adapter is built."""
+    from datetime import date
+
+    from app.services.erp import INVOICE_DUE_BEFORE_DATE, _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+
+    inv = _invoice()
+    inv.invoice_date, inv.due_date = date(2026, 10, 20), date(2026, 10, 15)
+    with patch("app.services.erp.get_erp_adapter") as get_adapter:
+        with pytest.raises(ErpPostRefusedError) as exc:
+            await _call_erp(_line_items_db([]), inv, {"type": "x"}, instance=_instance())
+    get_adapter.assert_not_called()
+    assert exc.value.refusal == {"code": INVOICE_DUE_BEFORE_DATE, "params": {}}
+
+    # Due the day it is dated is fine.
+    inv.due_date = inv.invoice_date
+    adapter = AsyncMock()
+    adapter.post_invoice.return_value = ErpPostResult(success=True, erp_document_id="B-1")
+    with patch("app.services.erp.get_erp_adapter", return_value=adapter):
+        assert await _call_erp(_line_items_db([]), inv, {"type": "x"}) == "B-1"
+
+
+# ---------------------------------------------------------------------------
+# The time an unknown outcome dates from, handed to the next attempt (§405)
+# ---------------------------------------------------------------------------
+
+
+class _Recording:
+    """An adapter answering ``results`` in turn, recording what each attempt
+    was told about an earlier unknown outcome."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.since: list[datetime | None] = []
+
+    async def post_invoice(self, payload):
+        self.since.append(payload.outcome_unknown_since)
+        return self.results.pop(0)
+
+
+async def _attempt(inst, adapter) -> None:
+    from app.services.erp import _call_erp
+
+    with patch("app.services.erp.get_erp_adapter", return_value=adapter):
+        try:
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+        except ErpPostRefusedError:
+            pass
+        except RuntimeError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_outcome_is_dated_from_the_attempts_end_and_handed_on():
+    from app.services.erp import OUTCOME_UNKNOWN_AT_KEY
+    from app.services.erp_adapters.base import ErpPostResult
+
+    adapter = _Recording(
+        ErpPostResult(success=False, message="read timeout (outcome unknown)", retryable=False),
+        ErpPostResult(success=True, erp_document_id="M-1"),
+    )
+    inst = _instance(state_data={})
+    before = datetime.now(UTC)
+    await _attempt(inst, adapter)
+    stamp = datetime.fromisoformat(inst.state_data[OUTCOME_UNKNOWN_AT_KEY])
+    assert before <= stamp <= datetime.now(UTC)
+
+    await _attempt(inst, adapter)
+    # The first attempt was told nothing; the second gets the first's end.
+    assert adapter.since == [None, stamp]
+    # A success settles it: no stamp left to wait on.
+    assert OUTCOME_UNKNOWN_AT_KEY not in inst.state_data
+
+
+@pytest.mark.asyncio
+async def test_an_attempt_that_sent_nothing_keeps_the_earlier_stamp():
+    """A refusal made before anything was sent (Merge's own wait for a sync)
+    must not move the time the wait is for, or it would never end."""
+    from app.services.erp import (
+        OUTCOME_UNKNOWN_AT_FINAL_KEY,
+        OUTCOME_UNKNOWN_AT_KEY,
+        OUTCOME_UNKNOWN_KEY,
+    )
+    from app.services.erp_adapters.base import erp_preflight_refusal
+
+    earlier = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    adapter = _Recording(erp_preflight_refusal("Merge.dev", "merge_sync_pending"))
+    inst = _instance(
+        state_data={
+            OUTCOME_UNKNOWN_KEY: True,
+            OUTCOME_UNKNOWN_AT_KEY: earlier,
+            OUTCOME_UNKNOWN_AT_FINAL_KEY: True,
+        }
+    )
+    await _attempt(inst, adapter)
+
+    assert adapter.since == [datetime.fromisoformat(earlier)]
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is True
+    assert inst.state_data[OUTCOME_UNKNOWN_AT_KEY] == earlier
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_outcome_recorded_before_the_stamp_is_dated_now_and_pinned():
+    """A row flagged unknown before the stamp existed: now is after that
+    attempt too, and the time is kept, so the next read waits for the same."""
+    from app.services.erp import OUTCOME_UNKNOWN_AT_KEY, OUTCOME_UNKNOWN_KEY
+    from app.services.erp_adapters.base import erp_preflight_refusal
+
+    adapter = _Recording(
+        erp_preflight_refusal("Merge.dev", "merge_sync_pending"),
+        erp_preflight_refusal("Merge.dev", "merge_sync_pending"),
+    )
+    inst = _instance(state_data={"erp_retries": 1, "last_error": "HTTP 503"})
+    before = datetime.now(UTC)
+    await _attempt(inst, adapter)
+    await _attempt(inst, adapter)
+
+    first, second = adapter.since
+    assert first is not None and first >= before
+    assert second == first
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is True
+    assert datetime.fromisoformat(inst.state_data[OUTCOME_UNKNOWN_AT_KEY]) == first
+
+
+@pytest.mark.asyncio
+async def test_a_definite_refusal_with_nothing_unknown_before_leaves_no_stamp():
+    from app.services.erp import OUTCOME_UNKNOWN_AT_KEY, OUTCOME_UNKNOWN_KEY
+    from app.services.erp_adapters.base import erp_preflight_refusal
+
+    adapter = _Recording(erp_preflight_refusal("Xero", "vendor_not_linked"))
+    inst = _instance(state_data={})
+    await _attempt(inst, adapter)
+    assert adapter.since == [None]
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is False
+    assert OUTCOME_UNKNOWN_AT_KEY not in inst.state_data
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_that_raises_is_dated_from_when_it_raised():
+    """The pre-call stamp is the attempt's start; a raise moves it to the end,
+    since the request may have reached the ERP at any point until then."""
+    from app.services.erp import OUTCOME_UNKNOWN_AT_KEY, OUTCOME_UNKNOWN_KEY, _call_erp
+
+    started: list[datetime] = []
+
+    class _Raises:
+        async def post_invoice(self, payload):
+            started.append(datetime.now(UTC))
+            raise TimeoutError("read timed out")
+
+    inst = _instance(state_data={})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Raises()):
+        with pytest.raises(TimeoutError):
+            await _call_erp(_line_items_db([]), _invoice(), {"type": "x"}, instance=inst)
+    assert inst.state_data[OUTCOME_UNKNOWN_KEY] is True
+    assert datetime.fromisoformat(inst.state_data[OUTCOME_UNKNOWN_AT_KEY]) >= started[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final", [False, None])
+async def test_a_stamp_that_is_not_final_is_replaced_by_the_time_it_is_read(final):
+    """Only an attempt's END is final; a start left by an attempt that died
+    (False), or a stamp written before the flag existed (None), is restamped
+    when read, since the dead attempt may have created the bill after it."""
+    from app.services.erp import (
+        OUTCOME_UNKNOWN_AT_FINAL_KEY,
+        OUTCOME_UNKNOWN_AT_KEY,
+        OUTCOME_UNKNOWN_KEY,
+    )
+    from app.services.erp_adapters.base import erp_preflight_refusal
+
+    start = datetime.now(UTC) - timedelta(minutes=30)
+    state = {OUTCOME_UNKNOWN_KEY: True, OUTCOME_UNKNOWN_AT_KEY: start.isoformat()}
+    if final is not None:
+        state[OUTCOME_UNKNOWN_AT_FINAL_KEY] = final
+    adapter = _Recording(erp_preflight_refusal("Merge.dev", "merge_sync_pending"))
+    inst = _instance(state_data=state)
+    before = datetime.now(UTC)
+    await _attempt(inst, adapter)
+
+    (since,) = adapter.since
+    assert since >= before > start
+    assert inst.state_data[OUTCOME_UNKNOWN_AT_FINAL_KEY] is True
+    assert datetime.fromisoformat(inst.state_data[OUTCOME_UNKNOWN_AT_KEY]) == since
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_attempt_is_never_dated_from_its_start():
+    """A deploy cancelling the task (``CancelledError`` is no ``Exception``,
+    so no failure handler commits) rolls back to what was committed before
+    the call: the attempt's START. The next attempt must still wait for a
+    sync after the cancellation, not after that start (decisions §409)."""
+    import asyncio
+
+    from app.services.erp import OUTCOME_UNKNOWN_AT_FINAL_KEY, OUTCOME_UNKNOWN_KEY, _call_erp
+
+    inst = _instance(state_data={})
+    committed: list[dict] = []
+    db = _line_items_db([])
+    db.commit = AsyncMock(side_effect=lambda: committed.append(dict(inst.state_data or {})))
+    cancelled_at: list[datetime] = []
+
+    class _Cancelled:
+        async def post_invoice(self, payload):
+            cancelled_at.append(datetime.now(UTC))
+            raise asyncio.CancelledError
+
+    with patch("app.services.erp.get_erp_adapter", return_value=_Cancelled()):
+        with pytest.raises(asyncio.CancelledError):
+            await _call_erp(db, _invoice(), {"type": "x"}, instance=inst)
+
+    # The session rolls back: the row holds only the pre-call commit.
+    (row,) = committed
+    assert row[OUTCOME_UNKNOWN_KEY] is True
+    assert row[OUTCOME_UNKNOWN_AT_FINAL_KEY] is False
+
+    adapter = _Recording(_merge_sync_pending())
+    await _attempt(_instance(state_data=row), adapter)
+    (since,) = adapter.since
+    assert since > cancelled_at[0]
+
+
+def _merge_sync_pending():
+    from app.services.erp_adapters.base import erp_preflight_refusal
+
+    return erp_preflight_refusal("Merge.dev", "merge_sync_pending")
+
+
+# ---------------------------------------------------------------------------
+# A push with no attempts left is a final failure, not a silent stall (§428)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome_unknown", [False, True], ids=["nothing-sent", "possibly-posted"])
+async def test_a_push_with_its_retries_spent_fails_coded_without_calling_the_erp(
+    outcome_unknown,
+):
+    """A job that reaches `sending_to_erp` with `erp_retries` already at the
+    limit (a redelivery after the last attempt, a re-drive of one) used to
+    return without an attempt or a transition, leaving the invoice at
+    `sending_to_erp` for ever. It lands at `failed`, coded, and says so when an
+    earlier attempt may have left the bill in the ERP."""
+    from app.services.erp import ERP_RETRIES_EXHAUSTED, MAX_RETRIES, OUTCOME_UNKNOWN_KEY
+
+    inv = _invoice(status=InvoiceStatus.sending_to_erp)
+    state = {"erp_retries": MAX_RETRIES, OUTCOME_UNKNOWN_KEY: outcome_unknown}
+    inst = _instance(state_data=dict(state))
+    recorder = _AuditRecorder()
+    call = AsyncMock(return_value="ERP-1")
+    db = AsyncMock()
+
+    with (
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", call),
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=inst)),
+    ):
+        await send_to_erp_internal(db, inv)
+
+    call.assert_not_called()
+    assert inv.status == InvoiceStatus.failed
+    assert recorder.transitions() == [("sending_to_erp", "failed")]
+    (row,) = recorder.rows
+    assert row["action"] == "invoice.erp_failed"
+    assert row["details"]["retries"] == MAX_RETRIES
+    refusal = row["details"]["refusal"]
+    assert refusal["code"] == ERP_RETRIES_EXHAUSTED
+    if outcome_unknown:
+        assert refusal["params"] == {"possibly_posted": True}
+        assert row["details"]["possibly_posted"] is True
+    else:
+        assert refusal["params"] == {}
+        assert "possibly_posted" not in row["details"]
+    assert inst.state == "failed"
+    # The record of what may be in the ERP is left for the retry to read.
+    assert inst.state_data == state
+    db.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_spent_push_for_an_invoice_that_moved_on_is_still_only_skipped():
+    """The §410 gate comes first: a spent redelivery for a recalled invoice is
+    a no-op, not a failure of an invoice that is no longer pushing."""
+    from app.services.erp import MAX_RETRIES
+
+    inv = _invoice(status=InvoiceStatus.ready_for_review)
+    inst = _instance(state_data={"erp_retries": MAX_RETRIES})
+    recorder = _AuditRecorder()
+    db = AsyncMock()
+
+    with (
+        patch("app.services.workflow_engine.dispatch_audit", new=recorder),
+        patch("app.services.erp._call_erp", AsyncMock()) as call,
+        patch("app.services.erp.get_workflow_instance", AsyncMock(return_value=inst)),
+    ):
+        await send_to_erp_internal(db, inv)
+
+    call.assert_not_called()
+    assert inv.status == InvoiceStatus.ready_for_review
+    assert recorder.rows == []
+    db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_new_send_from_approved_starts_with_a_full_budget(realdb):
+    """A push that ended spent, then a recall and a re-approval: the next send
+    from `approved` used to inherit `erp_retries == 3` and make no attempt.
+    `start_erp_send` resets the counter as `retry_erp` does, and keeps what may
+    already be in the ERP."""
+    from app.services.erp import OUTCOME_UNKNOWN_KEY, PENDING_JOB_KEY
+    from app.services.erp_send import start_erp_send
+
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed_erp_failed_invoice(
+        mk,
+        info.org_id,
+        state_data={"erp_retries": 3, OUTCOME_UNKNOWN_KEY: True, PENDING_JOB_KEY: "job-9"},
+        status=InvoiceStatus.approved,
+    )
+
+    with patch("app.services.erp_send.dispatch_erp", AsyncMock()) as dispatched:
+        async with mk() as s:
+            await start_erp_send(
+                s, org_id=info.org_id, org_settings={}, invoice_id=inv_id, actor_id=None
+            )
+
+    dispatched.assert_awaited_once()
+    inv, inst, _ = await _reload(mk, inv_id)
+    assert inv.status == InvoiceStatus.sending_to_erp
+    assert inst.state_data == {
+        "erp_retries": 0,
+        OUTCOME_UNKNOWN_KEY: True,
+        PENDING_JOB_KEY: "job-9",
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_push_lands_at_failed_coded_and_possibly_posted(realdb):
+    """`fail_interrupted_erp_send`, the recovery sweep's exit for a stranded
+    push it will not re-drive: `failed`, coded `erp_push_interrupted`, flagged
+    when the ERP may hold the bill, and only from `sending_to_erp`."""
+    from app.services.erp import (
+        ERP_PUSH_INTERRUPTED,
+        ORPHAN_DOCUMENT_ID_KEY,
+        fail_interrupted_erp_send,
+    )
+
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    stranded = await _seed_erp_failed_invoice(
+        mk,
+        info.org_id,
+        state_data={"erp_retries": 1, ORPHAN_DOCUMENT_ID_KEY: "BILL-3"},
+        status=InvoiceStatus.sending_to_erp,
+    )
+    moved = await _seed_erp_failed_invoice(
+        mk, info.org_id, state_data={}, status=InvoiceStatus.ready_for_review
+    )
+
+    async with mk() as s:
+        assert await fail_interrupted_erp_send(s, stranded) is True
+    async with mk() as s:
+        assert await fail_interrupted_erp_send(s, moved) is False
+
+    inv, inst, rows = await _reload(mk, stranded)
+    assert inv.status == InvoiceStatus.failed
+    assert inst.state == "failed"
+    (row,) = [r for r in rows if r.action == "invoice.erp_failed"]
+    assert row.actor_id is None
+    assert row.details["refusal"] == {
+        "code": ERP_PUSH_INTERRUPTED,
+        "params": {"possibly_posted": True},
+    }
+    assert row.details["possibly_posted"] is True
+    assert row.details["erp_document_id"] == "BILL-3"
+    assert row.details["retries"] == 1
+
+    inv, _, rows = await _reload(mk, moved)
+    assert inv.status == InvoiceStatus.ready_for_review
+    assert rows == []

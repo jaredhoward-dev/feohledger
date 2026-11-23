@@ -22,12 +22,29 @@ class Organization(Base, TimestampMixin):
             unique=True,
             postgresql_where=text("scim_bearer_hash IS NOT NULL"),
         ),
+        # The realm index (migration 0117, decisions §295): one tenant per
+        # OAuth ERP company. QuickBooks' webhooks name the company alone, and
+        # this is how they find the tenant; two tenants on one company would
+        # post into each other's books, so the database refuses the second.
+        Index(
+            "uq_organizations_erp_oauth_company",
+            text("((settings -> 'erp' -> 'oauth') ->> 'provider')"),
+            text("((settings -> 'erp' -> 'oauth') ->> 'external_tenant_id')"),
+            unique=True,
+            postgresql_where=text(
+                "(((settings -> 'erp' -> 'oauth') ->> 'external_tenant_id') IS NOT NULL)"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     settings: Mapped[dict | None] = mapped_column(JSONB, default=dict)
+    # LEGACY free-text label set at provisioning and never by a plan change —
+    # not what the org is on. Every surface that names an org's plan reads its
+    # live `Subscription` (`services/billing/entitlements.live_plan_codes`,
+    # decisions §482); nothing displays this column any more.
     plan: Mapped[str] = mapped_column(String(50), default="free")
     db_name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     # sha256(hex) digest of the per-tenant SCIM bearer token. The plaintext

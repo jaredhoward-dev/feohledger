@@ -1,6 +1,7 @@
 # The app VM for the single-VM workload stack (docs/minimal-deployment.md):
-# Docker Compose running Caddy (TLS + the static SPA + /api reverse proxy), the
-# FastAPI backend and Redis. The database is RDS (database.tf), so nothing on
+# Docker Compose running Caddy (TLS + the api.<domain> reverse proxy, plus any
+# customer vanity host), the FastAPI backend and Redis. The SPA is not here:
+# it is S3 + CloudFront (frontend.tf, docs/decisions.md §278, §364). The database is RDS (database.tf), so nothing on
 # this machine's disk is the system of record — losing the VM costs a rebuild,
 # not data.
 #
@@ -99,12 +100,36 @@ resource "aws_iam_role_policy_attachment" "app_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# The region the RDS IAM-auth resource ARN names. The account comes from
+# kms.tf's aws_caller_identity, so nothing about the account is hardcoded.
+data "aws_region" "current" {}
+
+# The database role the app signs in as with an IAM auth token
+# (backend/app/db_engine.py, deploy/db-role-cutover.sh, docs/decisions.md §310).
+# Not a variable: the cutover script creates exactly this role, and widening the
+# grant to another name should be a reviewed change here, not a tfvars edit.
+locals {
+  db_app_role = "feoh_app"
+}
+
 data "aws_iam_policy_document" "app_permissions" {
   # deploy/decrypt-env.sh decrypts prod.sops.yaml with the sops key.
   statement {
     sid       = "DecryptSopsSecrets"
     actions   = ["kms:Decrypt"]
     resources = [data.aws_kms_alias.sops.target_key_arn]
+  }
+
+  # The app (and the deploy scripts' pg tools, on the VM) sign in to RDS as the
+  # app role with a 15-minute IAM token instead of a password. Scoped to that
+  # one database user on this one instance — not `dbuser:*/*`, and never the
+  # master user, which stays password-only for break-glass. The ARN names the
+  # instance's resource id (db-XXXX), not its identifier, so a point-in-time
+  # restore to a new instance needs this re-applied against the new one.
+  statement {
+    sid       = "ConnectAsAppRole"
+    actions   = ["rds-db:connect"]
+    resources = ["arn:aws:rds-db:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:dbuser:${aws_db_instance.main.resource_id}/${local.db_app_role}"]
   }
 
   # The three data buckets default to SSE-KMS under the app key, and S3 checks
@@ -264,12 +289,12 @@ resource "aws_eip" "app" {
 #
 # The apex and the wildcard are the SPA, so they point at the CloudFront
 # distribution (frontend.tf) once var.frontend_on_cloudfront is true, and at the
-# VM's Caddy until then. Only their A records change (plus an AAAA, which the
+# VM's Caddy otherwise. Only their A records change (plus an AAAA, which the
 # VM — IPv4 only — never had); the apex's Migadu MX/TXT records are separate
-# and untouched. api.<domain> stays on the VM either way. Rolling back is
-# setting the variable to false and applying: Route 53 swaps each record in one
-# atomic change, and the VM's Caddy still serves the SPA until the step-4
-# cleanup removes it (issue #582).
+# and untouched. api.<domain> stays on the VM either way. Since
+# docs/decisions.md §364 the VM's Caddy serves no SPA, so setting the variable
+# back to false is no longer a rollback: it points every web host at a server
+# with no site block for it. It stays true.
 
 locals {
   spa_records = {

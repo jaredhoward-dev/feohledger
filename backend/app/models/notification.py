@@ -41,6 +41,17 @@ EVENT_CASH_SHORTFALL_PROJECTED = "cash_shortfall_projected"
 # entity_type on the row is "billing" and entity_id is NULL: it is about the
 # org's plan usage, not any one record.
 EVENT_AI_INVOICE_USAGE = "ai_invoice_usage"
+# The org's OAuth ERP connection (QuickBooks Online and the other consent-based
+# ERPs) expires soon or already needs reconnecting (decisions §295) — emitted by
+# services.erp_connection_health to org admins, once per expiry lead time and
+# once per lost connection. entity_type on the row is "organization" and
+# entity_id is NULL.
+EVENT_ERP_CONNECTION_EXPIRING = "erp_connection_expiring"
+# The org is near or past its daily share of an ERP API quota several tenants
+# share (Blackbaud's SKY subscription key), or the provider said the quota is
+# used (decisions §322) — emitted by services.erp_call_budget to org admins,
+# once per notice per UTC day. entity_type "organization", entity_id NULL.
+EVENT_ERP_CALL_QUOTA = "erp_call_quota"
 
 NOTIFICATION_EVENT_TYPES = (
     EVENT_INVOICE_ASSIGNED,
@@ -51,6 +62,8 @@ NOTIFICATION_EVENT_TYPES = (
     EVENT_CHAT_MESSAGE,
     EVENT_CASH_SHORTFALL_PROJECTED,
     EVENT_AI_INVOICE_USAGE,
+    EVENT_ERP_CONNECTION_EXPIRING,
+    EVENT_ERP_CALL_QUOTA,
 )
 
 

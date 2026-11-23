@@ -21,7 +21,16 @@ import pytest
 from app.config import settings
 from app.services import erp_oauth
 from app.services.erp_adapters import bill_allocation
-from app.services.erp_adapters.base import ErpInvoiceStatus, InvoicePayload, LineItemPayload
+from app.services.erp_adapters.base import (
+    SYNC_LISTING_MAX_ROWS,
+    ErpInvoiceStatus,
+    ErpListingIncomplete,
+    InvoicePayload,
+    LineItemPayload,
+    ListingGap,
+    PoSkipReason,
+    SkippedPo,
+)
 from app.services.erp_adapters.dispatcher import get_erp_adapter
 from app.services.erp_adapters.xero import XeroAdapter
 from app.utils.json_money import dumps_exact_json
@@ -82,6 +91,9 @@ def token():
         yield m
 
 
+SHORT_CODE = "!mBdtL"
+
+
 def _client(cm):
     return cm.return_value.__aenter__.return_value
 
@@ -91,18 +103,25 @@ def _get_router(
     lookup: httpx.Response,
     accounts: httpx.Response | None = None,
     bills: dict[str, dict] | None = None,
+    organisation: httpx.Response | None = None,
 ):
-    """``bills`` serves ``GET /Invoices/{id}`` — the read-back after a create."""
+    """``bills`` serves ``GET /Invoices/{id}`` — the read-back after a create;
+    ``organisation`` the ShortCode read after a confirmed post."""
 
     async def get(url, params=None, headers=None):
         if url.endswith("/Invoices"):
             return lookup
+        if url.endswith("/Organisation"):
+            return organisation or _resp(200, {"Organisations": [{"ShortCode": SHORT_CODE}]})
         if url.endswith("/Accounts"):
             assert accounts is not None, "unexpected Accounts lookup"
             return accounts
         if "/Invoices/" in url:
             bill = (bills or {}).get(url.rsplit("/", 1)[1])
             return _resp(200, {"Invoices": [bill]}) if bill else _resp(404, {})
+        if "/Contacts/" in url or url.endswith("/Organisation"):
+            # The facts a refused create is explained by: unreadable here.
+            return _resp(404, {})
         raise AssertionError(f"unexpected GET {url}")
 
     return AsyncMock(side_effect=get)
@@ -151,6 +170,8 @@ def test_refusals_send_nothing(token, overrides, reason):
         result = _run(_adapter().post_invoice(_payload(**overrides)))
     assert result.success is False
     assert result.message == f"Xero post refused: {reason}"
+    # Refused before any request: the attempt left nothing in the ERP.
+    assert result.not_posted is True
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +549,9 @@ def test_existing_bill_with_same_total_short_circuits(token):
     assert result.success
     assert result.erp_document_id == "inv-old"
     assert "idempotent" in result.message
-    params = client.get.await_args.kwargs["params"]
+    # An adopted bill links into its organisation as a created one does.
+    assert result.erp_company_code == SHORT_CODE
+    params = client.get.await_args_list[0].kwargs["params"]
     assert params["InvoiceNumbers"] == "SUP-1001"
     assert params["ContactIDs"] == VENDOR
 
@@ -547,6 +570,81 @@ def test_existing_bill_with_a_different_total_is_refused_not_adopted(token):
         result = _run(_adapter().post_invoice(_payload()))
     assert result.success is False
     assert result.message == "Xero post refused: duplicate_document_number"
+
+
+# ---------------------------------------------------------------------------
+# post_invoice: the organisation ShortCode for the deep link (decisions §354)
+# ---------------------------------------------------------------------------
+
+
+def _post_with_organisation(organisation=None, *, get_error: Exception | None = None):
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        router = _get_router(
+            lookup=_resp(200, {"Invoices": []}),
+            accounts=_resp(200, _accounts()),
+            bills={"inv-1": {"InvoiceID": "inv-1", "Status": "AUTHORISED", "Total": 1150.0}},
+            organisation=organisation,
+        )
+        if get_error is not None:
+
+            async def get(url, params=None, headers=None):
+                if url.endswith("/Organisation"):
+                    raise get_error
+                return await router(url, params=params, headers=headers)
+
+            client.get = AsyncMock(side_effect=get)
+        else:
+            client.get = router
+        client.put = AsyncMock(
+            return_value=_resp(200, {"Invoices": [{"InvoiceID": "inv-1", "Total": 1150.0}]})
+        )
+        result = _run(_adapter().post_invoice(_payload()))
+    return client, result
+
+
+def test_a_confirmed_post_carries_the_organisation_short_code(token):
+    client, result = _post_with_organisation()
+    assert result.success, result.message
+    assert result.erp_company_code == SHORT_CODE
+    (org_call,) = [c for c in client.get.await_args_list if c.args[0].endswith("/Organisation")]
+    # Read from the connected organisation, not whichever the token reaches first.
+    assert org_call.kwargs["headers"]["Xero-Tenant-Id"] == TENANT
+
+
+@pytest.mark.parametrize(
+    "organisation",
+    [
+        _resp(500, {}),
+        _resp(429, {}, {"Retry-After": "5"}),
+        _resp(200, {"Organisations": []}),
+        _resp(200, {"Organisations": [{"Name": "No code"}]}),
+        _resp(200, {"Organisations": [{"ShortCode": "   "}]}),
+    ],
+)
+def test_an_unreadable_short_code_leaves_the_bill_posted_without_one(token, organisation):
+    _, result = _post_with_organisation(organisation)
+    assert result.success, result.message
+    assert result.erp_document_id == "inv-1"
+    assert result.erp_company_code is None
+
+
+def test_a_failed_organisation_request_never_fails_a_posted_bill(token):
+    _, result = _post_with_organisation(get_error=httpx.ConnectError("down"))
+    assert result.success, result.message
+    assert result.erp_document_id == "inv-1"
+    assert result.erp_company_code is None
+
+
+def test_a_failed_post_reads_no_short_code(token):
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(429, {}, {"Retry-After": "37"}))
+        client.put = AsyncMock(side_effect=AssertionError("must not post"))
+        result = _run(_adapter().post_invoice(_payload()))
+    assert result.success is False
+    assert result.erp_company_code is None
+    assert not [c for c in client.get.await_args_list if c.args[0].endswith("/Organisation")]
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +698,8 @@ def test_validation_failure_message_carries_no_response_body(token):
         )
     assert result.message == "Xero post failed: HTTP 400 (invalid_request)"
     assert "4123456789" not in result.message and "Long Street" not in result.message
+    # A ValidationException creates nothing: not left "possibly posted".
+    assert result.not_posted
 
 
 def test_not_connected_propagates_the_fixed_message(token):
@@ -622,7 +722,14 @@ def test_not_connected_propagates_the_fixed_message(token):
         ({"Status": "SUBMITTED"}, ErpInvoiceStatus.draft),
         ({"Status": "AUTHORISED", "AmountPaid": 0}, ErpInvoiceStatus.open),
         ({"Status": "AUTHORISED", "AmountPaid": 10.5}, ErpInvoiceStatus.partially_paid),
-        ({"Status": "PAID"}, ErpInvoiceStatus.paid),
+        ({"Status": "PAID", "AmountPaid": 100}, ErpInvoiceStatus.paid),
+        # PAID with nothing paid is a bill settled by credit note, not a
+        # payment (decisions §303); a missing AmountPaid reads the same way.
+        (
+            {"Status": "PAID", "AmountPaid": 0, "AmountCredited": 100},
+            ErpInvoiceStatus.settled_no_payment,
+        ),
+        ({"Status": "PAID"}, ErpInvoiceStatus.settled_no_payment),
         ({"Status": "VOIDED"}, ErpInvoiceStatus.cancelled),
         ({"Status": "DELETED"}, ErpInvoiceStatus.cancelled),
         ({"Status": "SOMETHING_NEW"}, ErpInvoiceStatus.unknown),
@@ -711,20 +818,120 @@ def test_list_vendors_filters_suppliers_and_maps_fields(token):
         client = _client(cm)
         client.get = AsyncMock(return_value=_resp(200, {"Contacts": [contact]}))
         vendors = _run(_adapter().list_vendors())
-    assert client.get.await_args.kwargs["params"]["where"] == "IsSupplier==true"
+    params = client.get.await_args_list[0].kwargs["params"]
+    # Not IsSupplier alone: Xero sets it only once a contact has a bill, so a
+    # supplier created with none (neither flag set) must be read too (X1).
+    assert params["where"] == "IsSupplier==true OR IsCustomer==false"
+    # Archived contacts are asked for: Xero omits them otherwise, and a vendor
+    # linked to one would look like a dead link (§284).
+    assert params["includeArchived"] == "true"
     (v,) = vendors
     assert v.erp_vendor_id == VENDOR and v.name == "Acme Supplies" and v.code == "ACM01"
     assert v.phone == "27 215550100"
     assert v.payment_terms == "DAYSAFTERBILLDATE 30"
+    assert v.active is True
 
 
-def test_list_vendors_degrades_to_empty_on_rate_limit(token):
+def _route_get(responses: dict):
+    """A `client.get` answering by (path, the one query value that varies)."""
+
+    async def get(url, params=None, headers=None):
+        path = url.rsplit("/", 1)[-1]
+        key = (path, (params or {}).get("Status") or (params or {}).get("IDs"))
+        return responses.get(key) or _resp(200, {path: []})
+
+    return AsyncMock(side_effect=get)
+
+
+def test_list_vendors_adds_contacts_only_ordered_from(token):
+    """Xero sets IsSupplier only once a contact has a bill, so a supplier
+    with only purchase orders so far is read from the unbilled POs."""
+    supplier = {"ContactID": "c-billed", "Name": "Billed Ltd"}
+    po_only = {"ContactID": "c-po", "Name": "Feoh Test Supplies Inc"}
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _route_get(
+            {
+                ("Contacts", None): _resp(200, {"Contacts": [supplier]}),
+                ("PurchaseOrders", "AUTHORISED"): _resp(
+                    200,
+                    {
+                        "PurchaseOrders": [
+                            {"Contact": {"ContactID": "c-po"}},
+                            {"Contact": {"ContactID": "c-billed"}},
+                        ]
+                    },
+                ),
+                ("PurchaseOrders", "DRAFT"): _resp(
+                    200, {"PurchaseOrders": [{"Contact": {"ContactID": "c-po"}}]}
+                ),
+                ("Contacts", "c-po"): _resp(200, {"Contacts": [po_only]}),
+            }
+        )
+        vendors = _run(_adapter().list_vendors())
+    assert [v.erp_vendor_id for v in vendors] == ["c-billed", "c-po"]
+    statuses = [
+        c.kwargs["params"].get("Status")
+        for c in client.get.await_args_list
+        if c.args[0].endswith("/PurchaseOrders")
+    ]
+    # Only POs not yet billed: a billed PO's contact is already a supplier.
+    assert statuses == ["DRAFT", "SUBMITTED", "AUTHORISED"]
+
+
+def test_list_vendors_raises_when_the_po_contacts_cannot_be_read(token):
+    """The added contacts are evidence too: a failed PO read raises rather
+    than returning a pull the vendor sync would read as those vendors gone."""
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = _route_get({("PurchaseOrders", "SUBMITTED"): _resp(429, {})})
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_vendors())
+    assert exc.value.gap is ListingGap.fetch_failed
+
+
+def test_an_archived_supplier_is_emitted_inactive(token):
+    contact = {"ContactID": VENDOR, "Name": "Gone Ltd", "ContactStatus": "ARCHIVED"}
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(200, {"Contacts": [contact]}))
+        (v,) = _run(_adapter().list_vendors())
+    assert (v.erp_vendor_id, v.active) == (VENDOR, False)
+
+
+def test_list_vendors_raises_on_rate_limit_even_after_a_good_page(token):
+    """A 429 on page 2 used to end the walk with page 1, which the vendor sync
+    took for every vendor and unlinked the rest (§284)."""
+    full_page = {"Contacts": [{"ContactID": f"c{i}", "Name": f"V{i}"} for i in range(100)]}
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(side_effect=[_resp(200, full_page), _resp(429, {})])
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_vendors())
+    assert exc.value.gap is ListingGap.fetch_failed
+
     with patch("httpx.AsyncClient") as cm:
         _client(cm).get = AsyncMock(return_value=_resp(429, {}))
-        assert _run(_adapter().list_vendors()) == []
+        with pytest.raises(ErpListingIncomplete):
+            _run(_adapter().list_vendors())
 
 
-def test_list_gl_accounts_maps_class_and_skips_archived(token):
+def test_list_vendors_past_the_sync_bound_raises_truncated(token):
+    full_page = {"Contacts": [{"ContactID": f"c{i}", "Name": f"V{i}"} for i in range(100)]}
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=_resp(200, full_page))
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_vendors())
+    assert exc.value.gap is ListingGap.truncated
+    assert client.get.await_count == SYNC_LISTING_MAX_ROWS // 100
+
+
+def test_list_gl_accounts_raises_on_a_failed_read(token):
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(503, {}))
+        with pytest.raises(ErpListingIncomplete):
+            _run(_adapter().list_gl_accounts())
+
+
+def test_list_gl_accounts_maps_class_and_emits_archived_inactive(token):
     accounts = {
         "Accounts": [
             {"AccountID": "a1", "Code": "6100", "Name": "Supplies", "Class": "EXPENSE"},
@@ -741,16 +948,18 @@ def test_list_gl_accounts_maps_class_and_skips_archived(token):
     with patch("httpx.AsyncClient") as cm:
         _client(cm).get = AsyncMock(return_value=_resp(200, accounts))
         rows = _run(_adapter().list_gl_accounts())
-    assert [(r.code, r.account_type, r.erp_account_id) for r in rows] == [
-        ("6100", "expense", "a1"),
-        ("800", "liability", "a2"),
+    # An archived account still exists: emitted inactive, not dropped (§284).
+    assert [(r.code, r.account_type, r.erp_account_id, r.active) for r in rows] == [
+        ("6100", "expense", "a1", True),
+        ("800", "liability", "a2", True),
+        ("999", "expense", "a3", False),
     ]
 
 
 def test_list_pos_maps_status_total_and_currency_exactly(token):
     po = {
         "PurchaseOrderNumber": "PO-0001",
-        "Contact": {"Name": "Acme Supplies"},
+        "Contact": {"ContactID": "c-123", "Name": "Acme Supplies"},
         "Total": 1250.10,
         "Status": "BILLED",
         "CurrencyCode": "ZAR",
@@ -763,10 +972,89 @@ def test_list_pos_maps_status_total_and_currency_exactly(token):
         _client(cm).get = AsyncMock(return_value=_resp(200, {"PurchaseOrders": [po]}))
         (row,) = _run(_adapter().list_pos())
     assert row.total == Decimal("1250.10")
+    # The supplier's ContactID — what the vendor sync stamps — links the PO.
+    assert (row.vendor_name, row.vendor_erp_id) == ("Acme Supplies", "c-123")
     assert row.status == "closed"
     assert row.currency == "ZAR"
     assert row.expected_delivery_date == date(2026, 11, 1)
     assert row.line_items[0].unit_price == Decimal("625.05")
+
+
+def test_a_po_with_no_usable_total_is_reported_unpriceable_never_synced_at_zero(token):
+    """A PO with no usable ``Total`` used to sync at 0, so every invoice
+    against it read as over-billed and raised ``po_mismatch``, and a total an
+    earlier sync stored stayed trusted. It is skipped and named ``unpriceable``
+    (decisions §323, §325), never priced from its lines (§325's rule); an
+    unreadable one no longer fails the whole listing. A stated 0 is the ERP's
+    figure and is kept."""
+    line = {"Description": "Paper", "Quantity": 2, "UnitAmount": 5, "LineAmount": 10}
+    rows = [
+        {"PurchaseOrderNumber": "PO-PRICED", "Total": 10, "LineItems": [line]},
+        {"PurchaseOrderNumber": "PO-MISSING", "LineItems": [line]},
+        {"PurchaseOrderNumber": "PO-NULL", "Total": None},
+        {"PurchaseOrderNumber": "PO-GARBAGE", "Total": "n/a"},
+        {"PurchaseOrderNumber": "PO-NAN", "Total": "NaN"},
+        {"PurchaseOrderNumber": "PO-ZERO", "Total": 0},
+        {"PurchaseOrderNumber": "", "Total": None},  # unnumbered: dropped
+    ]
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(200, {"PurchaseOrders": rows}))
+        listing = _run(_adapter().list_pos_report())
+        pos = _run(_adapter().list_pos())
+    assert [(p.po_number, p.total) for p in listing.pos] == [
+        ("PO-PRICED", Decimal("10")),
+        ("PO-ZERO", Decimal("0")),
+    ]
+    assert listing.skipped == [
+        SkippedPo(n, PoSkipReason.unpriceable)
+        for n in ("PO-MISSING", "PO-NULL", "PO-GARBAGE", "PO-NAN")
+    ]
+    assert [p.po_number for p in pos] == ["PO-PRICED", "PO-ZERO"]
+
+
+def test_a_po_listing_is_read_whole_or_raises(token):
+    """A failed or capped PO read raises, never "no POs" or the pages read so
+    far: the PO sync reads the listing's skips, which a partial read would
+    hide (decisions §329). It used to end at a failed page with what it had
+    and stop silently at 10 pages."""
+
+    def page(n: int, size: int = 100) -> httpx.Response:
+        rows = [{"PurchaseOrderNumber": f"PO-{n}-{i}", "Total": 1} for i in range(size)]
+        return _resp(200, {"PurchaseOrders": rows})
+
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+
+        # Past the old 10-page cap: read whole.
+        client.get = AsyncMock(side_effect=[page(n, 100 if n < 11 else 7) for n in range(12)])
+        assert len(_run(_adapter().list_pos())) == 1107
+
+        # A collection past SYNC_LISTING_MAX_ROWS: truncated.
+        client.get = AsyncMock(return_value=page(0))
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_pos_report())
+        assert exc.value.gap is ListingGap.truncated
+        assert client.get.await_count == SYNC_LISTING_MAX_ROWS // 100
+
+        # The first page failing (a 429 included), then a later one.
+        client.get = AsyncMock(return_value=_resp(429, {}))
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_pos())
+        assert (exc.value.gap, exc.value.collection) == (ListingGap.fetch_failed, "PurchaseOrders")
+        client.get = AsyncMock(side_effect=[page(0), _resp(500, {})])
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_pos_report())
+        assert exc.value.gap is ListingGap.fetch_failed
+
+        # A transport error, and an unreadable body.
+        client.get = AsyncMock(side_effect=httpx.ConnectError("dns"))
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_pos_report())
+        assert exc.value.gap is ListingGap.fetch_failed
+        client.get = AsyncMock(return_value=httpx.Response(200, content=b"<html>"))
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(_adapter().list_pos_report())
+        assert exc.value.gap is ListingGap.fetch_failed
 
 
 # ---------------------------------------------------------------------------
@@ -906,12 +1194,13 @@ def _resolve_xero(rows, token: str = "opaque"):
         return httpx.Response(200, json=rows)
 
     with patch("httpx.AsyncClient", _transport_client(handler)):
-        tenant = _run(
-            XeroAdapter.resolve_external_tenant_id(
+        orgs = _run(
+            XeroAdapter.list_external_tenants(
                 access_token=token, token_response={}, callback_params={}
             )
         )
-    return tenant, seen
+    # The callback links on exactly one; the tests below read it the same way.
+    return (orgs[0].id if len(orgs) == 1 else None), seen
 
 
 def test_resolve_tenant_reads_the_one_connected_organisation(monkeypatch):
@@ -947,7 +1236,353 @@ def test_resolve_tenant_never_picks_among_several_organisations(monkeypatch):
     assert tenant is None
 
 
+def test_list_tenants_offers_every_organisation_this_consent_authorised(monkeypatch):
+    """Several organisations in one consent: all of them, named, for the admin
+    to pick from (decisions §355) — an earlier consent's are still left out."""
+    monkeypatch.setattr(settings, "erp_xero_api_base", "")
+    rows = [
+        {"tenantId": "t-a", "tenantType": "ORGANISATION", "authEventId": "e1", "tenantName": "A"},
+        {"tenantId": "t-b", "tenantType": "ORGANISATION", "authEventId": "e1", "tenantName": "B"},
+        {"tenantId": "t-old", "tenantType": "ORGANISATION", "authEventId": "e0"},
+        {"tenantId": "t-p", "tenantType": "PRACTICEMANAGER", "authEventId": "e1"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=rows)
+
+    with patch("httpx.AsyncClient", _transport_client(handler)):
+        got = _run(
+            XeroAdapter.list_external_tenants(
+                access_token=_jwt({"authentication_event_id": "e1"}),
+                token_response={},
+                callback_params={},
+            )
+        )
+    assert [(c.id, c.name) for c in got] == [("t-a", "A"), ("t-b", "B")]
+
+
+def test_list_tenants_failure_is_empty(monkeypatch):
+    monkeypatch.setattr(settings, "erp_xero_api_base", "")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"Title": "Unauthorized"})
+
+    with patch("httpx.AsyncClient", _transport_client(handler)):
+        got = _run(
+            XeroAdapter.list_external_tenants(
+                access_token="t", token_response={}, callback_params={}
+            )
+        )
+    assert got == []
+
+
 def test_resolve_tenant_uses_the_operator_base_for_connections(monkeypatch):
     monkeypatch.setattr(settings, "erp_xero_api_base", "http://localhost:12112/xero/api.xro/2.0")
     _, seen = _resolve_xero([{"tenantId": "t", "tenantType": "ORGANISATION"}])
     assert str(seen[0].url) == "http://localhost:12112/xero/connections"
+
+
+# ---------------------------------------------------------------------------
+# Disconnect: revoking the grant at Xero
+# ---------------------------------------------------------------------------
+
+
+def _revoke_with(monkeypatch, response: httpx.Response, *, override: str = ""):
+    """Run `erp_oauth.revoke` for Xero and return (result, the request sent)."""
+    from app.services.erp_adapters.xero import XERO_OAUTH
+
+    monkeypatch.setattr(settings, "erp_xero_client_id", "xero-client")
+    monkeypatch.setattr(settings, "erp_xero_client_secret", "xero-secret")
+    monkeypatch.setattr(settings, "erp_xero_revoke_url", override)
+    sent = []
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, **kw):
+            sent.append({"url": url, **kw})
+            return response
+
+    monkeypatch.setattr(erp_oauth.httpx, "AsyncClient", _Client)
+    oauth = {"refresh_token": "REFRESH-1", "access_token": "ACCESS-1", "client_source": "platform"}
+    result = _run(erp_oauth.revoke(XERO_OAUTH, {"type": "xero"}, oauth))
+    return result, sent
+
+
+def test_disconnect_revokes_the_refresh_token_at_xero(monkeypatch):
+    """Without a revoke URL, Disconnect only forgot our copy of the tokens: the
+    grant stayed live and the org stayed connected in Xero (seen in the live
+    Demo Company test as "Already connected" on the next consent)."""
+    revoked, (call,) = _revoke_with(monkeypatch, _resp(200))
+    assert revoked is True
+    assert call["url"] == "https://identity.xero.com/connect/revocation"
+    # RFC 7009 form body with HTTP Basic client auth — Xero's documented shape.
+    assert call["data"] == {"token": "REFRESH-1"} and "json" not in call
+    assert call["auth"]._auth_header == httpx.BasicAuth("xero-client", "xero-secret")._auth_header
+
+
+def test_a_refused_revoke_reports_not_revoked(monkeypatch):
+    revoked, _ = _revoke_with(monkeypatch, _resp(400, {"error": "invalid_client"}))
+    assert revoked is False
+
+
+def test_the_revoke_url_override_is_honoured(monkeypatch):
+    _, (call,) = _revoke_with(
+        monkeypatch, _resp(200), override="http://localhost:12112/xero/identity/connect/revocation"
+    )
+    assert call["url"] == "http://localhost:12112/xero/identity/connect/revocation"
+
+
+# ---------------------------------------------------------------------------
+# Inactive records (audit X3, X4): only ACTIVE is active
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "active"),
+    [("ACTIVE", True), ("ARCHIVED", False), ("GDPRREQUEST", False), (None, True)],
+)
+def test_a_contact_is_active_only_when_xero_says_active(token, status, active):
+    contact = {"ContactID": VENDOR, "Name": "Erased"}
+    if status:
+        contact["ContactStatus"] = status
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = _route_get({("Contacts", None): _resp(200, {"Contacts": [contact]})})
+        (v,) = _run(_adapter().list_vendors())
+    assert v.active is active
+
+
+@pytest.mark.parametrize(
+    ("status", "active"), [("ACTIVE", True), ("ARCHIVED", False), ("DELETED", False)]
+)
+def test_an_account_is_active_only_when_xero_says_active(token, status, active):
+    row = {"AccountID": ACCOUNT, "Code": "6100", "Name": "Supplies", "Status": status}
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(200, {"Accounts": [row]}))
+        (a,) = _run(_adapter().list_gl_accounts())
+    assert a.active is active
+
+
+# ---------------------------------------------------------------------------
+# A refused create is coded and not "possibly posted" (audit X2, §285)
+# ---------------------------------------------------------------------------
+
+_VALIDATION = {
+    "ErrorNumber": 10,
+    "Type": "ValidationException",
+    "Message": "A validation exception occurred",
+    "Elements": [{"ValidationErrors": [{"Message": "Acme Supplies quoted back verbatim"}]}],
+}
+
+
+def _refused_create(*, contact_status="ACTIVE", account_status="ACTIVE", locks=None, put=None):
+    """Push a no-tax bill whose PUT Xero answers ``put`` (a ValidationException
+    by default), with the contact, chart and organisation as given."""
+    org = {"Name": "Acme", **(locks or {})}
+
+    async def get(url, params=None, headers=None):
+        if url.endswith("/Invoices"):
+            return _resp(200, {"Invoices": []})
+        if "/Contacts/" in url:
+            return _resp(
+                200, {"Contacts": [{"ContactID": VENDOR, "ContactStatus": contact_status}]}
+            )
+        if url.endswith("/Accounts"):
+            return _resp(200, {"Accounts": [{"AccountID": ACCOUNT, "Status": account_status}]})
+        if url.endswith("/Organisation"):
+            return _resp(200, {"Organisations": [org]})
+        raise AssertionError(url)
+
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(side_effect=get)
+        client.put = AsyncMock(return_value=put or _resp(400, _VALIDATION))
+        return _run(
+            _adapter().post_invoice(
+                _payload(tax_amount=None, gl_account="6100", amount=Decimal("1000.00"))
+            )
+        )
+
+
+def test_a_create_refused_for_an_archived_contact_is_vendor_inactive(token):
+    result = _refused_create(contact_status="ARCHIVED")
+    assert result.refusal_code == "vendor_inactive"
+    assert result.not_posted and not result.retryable
+    assert "verbatim" not in result.message  # Xero's text never reaches the row
+
+
+def test_a_create_refused_for_an_archived_account_names_our_code(token):
+    result = _refused_create(account_status="ARCHIVED")
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6100"]}
+    assert result.not_posted
+
+
+def test_a_create_dated_inside_the_lock_date_is_period_closed(token):
+    # The payload's invoice date is 2026-09-01.
+    before = {"PeriodLockDate": "/Date(1788134400000+0000)/"}  # 2026-08-31
+    assert _refused_create(locks=before).refusal_code is None
+    on = {"EndOfYearLockDate": "/Date(1788220800000+0000)/"}  # 2026-09-01
+    result = _refused_create(locks=on)
+    assert result.refusal_code == "period_closed" and result.not_posted
+
+
+def test_an_unexplained_validation_failure_is_still_not_possibly_posted(token):
+    result = _refused_create()
+    assert result.refusal_code is None
+    assert result.not_posted and not result.retryable
+
+
+@pytest.mark.parametrize("status", [500, 503, 429])
+def test_a_create_that_failed_on_xero_side_may_have_posted(token, status):
+    result = _refused_create(put=_resp(status, {}))
+    assert not result.not_posted and result.retryable
+
+
+def test_a_refusal_is_not_blamed_on_a_contact_or_account_that_states_no_status(token):
+    """Neither a contact nor an account listed without a status is evidence of
+    an inactive one (as in the syncs): the refusal stays unexplained."""
+
+    async def get(url, params=None, headers=None):
+        if url.endswith("/Invoices"):
+            return _resp(200, {"Invoices": []})
+        if "/Contacts/" in url:
+            return _resp(200, {"Contacts": [{"ContactID": VENDOR}]})
+        if url.endswith("/Accounts"):
+            return _resp(200, {"Accounts": [{"AccountID": ACCOUNT}]})
+        if url.endswith("/Organisation"):
+            return _resp(200, {"Organisations": [{"Name": "Acme"}]})
+        raise AssertionError(url)
+
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(side_effect=get)
+        client.put = AsyncMock(return_value=_resp(400, _VALIDATION))
+        result = _run(
+            _adapter().post_invoice(
+                _payload(tax_amount=None, gl_account="6100", amount=Decimal("1000.00"))
+            )
+        )
+    assert result.refusal_code is None
+    assert result.not_posted and not result.retryable
+
+
+@pytest.mark.parametrize(
+    ("xero_status", "expected"),
+    [
+        # Nobody has approved a DRAFT or SUBMITTED order: synced, never matched
+        # against (decisions §394).
+        ("DRAFT", "unissued"),
+        ("SUBMITTED", "unissued"),
+        ("AUTHORISED", "open"),
+        ("BILLED", "closed"),
+        ("DELETED", "cancelled"),
+    ],
+)
+def test_list_pos_maps_an_unapproved_po_to_unissued(token, xero_status, expected):
+    from app.models.procurement import UNISSUED_PO_STATUS
+
+    assert UNISSUED_PO_STATUS == "unissued"
+    po = {
+        "PurchaseOrderNumber": "PO-0002",
+        "Contact": {"ContactID": "c-1", "Name": "Acme"},
+        "Total": 10,
+        "Status": xero_status,
+        "LineItems": [],
+    }
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(200, {"PurchaseOrders": [po]}))
+        (row,) = _run(_adapter().list_pos())
+    assert row.status == expected
+
+
+# ---------------------------------------------------------------------------
+# vendor-link search (decisions §415)
+# ---------------------------------------------------------------------------
+
+
+def test_the_vendor_search_reads_every_contact_by_name_and_tax_number(token):
+    """A customer with no bill and no PO carries neither flag `list_vendors`
+    reads, so the search asks for every contact: no supplier filter, archived
+    ones too; by `searchTerm` and by an exact `TaxNumber`, one page each."""
+    customer = {
+        "ContactID": VENDOR,
+        "Name": "Bloom Florists",
+        "IsCustomer": True,
+        "IsSupplier": False,
+        "TaxNumber": "GB123456789",
+    }
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=_resp(200, {"Contacts": [customer]}))
+        result = _run(_adapter().search_vendors(name="Bloom", tax_id="GB123456789"))
+    by_name, by_tax = (c.kwargs["params"] for c in client.get.await_args_list)
+    assert by_name["searchTerm"] == "Bloom" and "where" not in by_name
+    assert by_tax["where"] == 'TaxNumber=="GB123456789"' and "searchTerm" not in by_tax
+    for params in (by_name, by_tax):
+        assert params["includeArchived"] == "true" and params["page"] == 1
+    # Found by both terms, listed once.
+    assert [v.erp_vendor_id for v in result.vendors] == [VENDOR]
+    assert result.truncated is False
+
+
+def test_the_vendor_search_never_quotes_an_unsafe_tax_number_into_the_filter(token):
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=_resp(200, {"Contacts": []}))
+        _run(_adapter().search_vendors(name="Acme", tax_id='12" OR Name!="'))
+        _run(_adapter().search_vendors(name=None, tax_id=None))
+    assert [c.kwargs["params"].get("where") for c in client.get.await_args_list] == [None]
+
+
+def test_a_full_search_page_is_truncated_and_a_refused_one_raises(token):
+    rows = [{"ContactID": f"c-{i}", "Name": f"Acme {i}"} for i in range(50)]
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(200, {"Contacts": rows}))
+        assert _run(_adapter().search_vendors(name="Acme", tax_id=None)).truncated is True
+    from app.services.erp_adapters.xero import XeroRequestError
+
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(503, {}))
+        with pytest.raises(XeroRequestError):
+            _run(_adapter().search_vendors(name="Acme", tax_id=None))
+
+
+def test_get_vendor_reads_one_contact_by_its_id(token):
+    contact = {"ContactID": VENDOR, "Name": "Bloom Florists", "ContactStatus": "ARCHIVED"}
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=_resp(200, {"Contacts": [contact]}))
+        found = _run(_adapter().get_vendor(VENDOR))
+    assert client.get.await_args.args[0].endswith(f"/Contacts/{VENDOR}")
+    assert (found.erp_vendor_id, found.active) == (VENDOR, False)
+    with patch("httpx.AsyncClient") as cm:
+        _client(cm).get = AsyncMock(return_value=_resp(404, {}))
+        assert _run(_adapter().get_vendor(VENDOR)) is None
+
+
+def test_get_vendor_never_puts_a_non_guid_in_the_path(token):
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock()
+        assert _run(_adapter().get_vendor("../Invoices")) is None
+    client.get.assert_not_awaited()
+
+
+def test_a_tax_number_search_url_is_redacted_from_the_httpx_log():
+    """httpx logs every request URL at INFO; the tax number is in the query."""
+    import app.services.erp_adapters.xero  # noqa: F401 — registers the marker
+    from app.services.erp_adapters.log_redaction import redact_url_query
+
+    line = (
+        "https://api.xero.com/api.xro/2.0/Contacts?where=TaxNumber%3D%3D%22GB123456789%22"
+        "&includeArchived=true"
+    )
+    assert "GB123456789" not in str(redact_url_query(line))

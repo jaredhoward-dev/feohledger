@@ -22,14 +22,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException, Request
-from jose import jwt
 
-from app.config import settings
+from app.utils import jwt_hs256
 
 
 def _mint(payload: dict) -> str:
     """Sign a JWT with the app's real secret so `decode_token` accepts it."""
-    return jwt.encode(payload, settings.secret_key, algorithm="HS256")
+    return jwt_hs256.encode(payload)
 
 
 def _ctrl_db_returning(org):
@@ -69,7 +68,7 @@ async def test_get_tenant_refuses_mismatched_org_claim():
         )
 
     assert exc.value.status_code == 403
-    assert "tenant" in exc.value.detail.lower()
+    assert exc.value.detail["code"] == "token_tenant_mismatch"
 
 
 @pytest.mark.asyncio
@@ -167,16 +166,58 @@ async def test_get_tenant_skips_check_when_authorization_is_unparseable():
 
 
 @pytest.mark.asyncio
-async def test_get_tenant_skips_check_when_token_has_no_org_claim():
-    """A token missing the `org` claim (legacy or hand-rolled) falls
-    through to the downstream user lookup — which will fail closed
-    when it tries to derive an organization_id from the User row.
-    The guard must not 500 on a missing claim."""
+async def test_get_tenant_refuses_access_token_with_no_org_claim():
+    """An employee access token missing the `org` claim is refused, not waved
+    through. It used to fall through on the theory that the downstream user
+    lookup would fail closed — it does not: `get_current_user` resolves the
+    account by `sub` alone and never compares its organization with the
+    resolved tenant, so a claim-less token opened whichever tenant the header
+    named. Every access token the app mints carries `org`."""
     from app.tenant import get_tenant
 
     acme_id = uuid.uuid4()
     token = _mint({"sub": str(uuid.uuid4()), "typ": "user", "jti": "j5"})  # no org claim
 
+    with pytest.raises(HTTPException) as exc:
+        await get_tenant(
+            slug="acme",
+            db=_ctrl_db_returning(_fake_org(acme_id, "acme")),
+            authorization=f"Bearer {token}",
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "token_tenant_mismatch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_org", ["", 0, False])
+async def test_get_tenant_refuses_access_token_with_an_empty_org_claim(empty_org):
+    """An `org` claim that is present but empty is no claim at all: the
+    mismatch check below the refusal only runs for a truthy `org`, so an empty
+    one would otherwise fall through to the `sub`-only user lookup (§474)."""
+    from app.tenant import get_tenant
+
+    acme_id = uuid.uuid4()
+    token = _mint({"sub": str(uuid.uuid4()), "typ": "user", "jti": "j5e", "org": empty_org})
+
+    with pytest.raises(HTTPException) as exc:
+        await get_tenant(
+            slug="acme",
+            db=_ctrl_db_returning(_fake_org(acme_id, "acme")),
+            authorization=f"Bearer {token}",
+        )
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "token_tenant_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_get_tenant_still_resolves_for_an_mfa_challenge_token():
+    """Challenge tokens carry no `org` and are not access tokens
+    (`get_current_user` refuses them), so the claim-less refusal above must not
+    stop a route that reads one from resolving its tenant."""
+    from app.tenant import get_tenant
+
+    acme_id = uuid.uuid4()
+    token = _mint({"sub": str(uuid.uuid4()), "typ": "mfa_challenge", "jti": "j6"})
     org = await get_tenant(
         slug="acme",
         db=_ctrl_db_returning(_fake_org(acme_id, "acme")),
@@ -297,7 +338,14 @@ async def test_end_to_end_swapped_tenant_header_is_refused(realdb):
     async with _real_path_client(realdb, token=realdb.token("a", "admin"), slug=other.slug) as c:
         resp = await c.get("/api/invoices")
     assert resp.status_code == 403, resp.text
-    assert "tenant" in resp.json()["detail"].lower()
+    # Coded, so the SPA can tell a token for another workspace from an
+    # ordinary permission refusal and sign the user out of it instead of
+    # leaving a screen where every call fails (decisions §288).
+    assert resp.json()["detail"] == {
+        "code": "token_tenant_mismatch",
+        "message": "Token does not match the requested tenant",
+        "params": {},
+    }
 
 
 @pytest.mark.asyncio
@@ -329,7 +377,7 @@ async def test_harness_client_enforces_the_org_claim(realdb):
     async with client as c:
         resp = await c.get("/api/invoices")
     assert resp.status_code == 403, resp.text
-    assert "tenant" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "token_tenant_mismatch"
 
 
 @pytest.mark.asyncio

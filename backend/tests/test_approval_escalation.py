@@ -403,10 +403,18 @@ async def test_escalate_tenant_escalates_only_active_overdue_instances(realdb):
 
     async with mk() as s:
         inv_a = Invoice(
-            organization_id=org_id, invoice_number="INV-A", vendor_name="Acme", amount=Decimal("10")
+            organization_id=org_id,
+            invoice_number="INV-A",
+            vendor_name="Acme",
+            amount=Decimal("10"),
+            currency="USD",
         )
         inv_b = Invoice(
-            organization_id=org_id, invoice_number="INV-B", vendor_name="Acme", amount=Decimal("10")
+            organization_id=org_id,
+            invoice_number="INV-B",
+            vendor_name="Acme",
+            amount=Decimal("10"),
+            currency="USD",
         )
         defn = WorkflowDefinition(organization_id=org_id, name="def", steps_config={"steps": []})
         s.add_all([inv_a, inv_b, defn])
@@ -664,6 +672,7 @@ async def test_escalate_tenant_pages_until_the_tenant_is_exhausted(realdb):
                 invoice_number=f"INV-PAGE-{i}",
                 vendor_name="Acme",
                 amount=Decimal("10"),
+                currency="USD",
             )
             s.add(inv)
             await s.flush()
@@ -681,6 +690,7 @@ async def test_escalate_tenant_pages_until_the_tenant_is_exhausted(realdb):
             invoice_number="INV-PAGE-BARE",
             vendor_name="Acme",
             amount=Decimal("10"),
+            currency="USD",
         )
         s.add(inv_bare)
         await s.flush()
@@ -855,6 +865,7 @@ async def test_escalation_never_targets_the_invoices_uploader(realdb):
             invoice_number="INV-ESC-SOD",
             vendor_name="Acme",
             amount=Decimal("100.00"),
+            currency="USD",
             status=InvoiceStatus.ready_for_review,
             uploaded_by_id=uploader,
         )
@@ -945,6 +956,56 @@ async def test_escalation_never_targets_whoever_received_the_goods(realdb):
         inst = await s.get(WorkflowInstance, inst_id)
     chain = get_chain_progress(inst)
     assert not chain or str(receiver) not in chain["levels"][0]["approver_ids"]
+
+
+async def test_escalation_never_targets_whoever_inspected_the_goods(realdb):
+    """Whoever hand-recorded a quality inspection on the invoice's PO is refused
+    at approval time (`approval_segregation_inspector`, decisions §404), so the
+    sweep must not make them a level's approver either."""
+    from decimal import Decimal
+
+    from app.models.invoice import Invoice
+    from app.models.procurement import PurchaseOrder
+    from app.models.quality_inspection import QualityInspection
+    from app.models.workflow import WorkflowInstance
+    from app.services.approval_chain import get_chain_progress
+    from app.services.approval_escalation import _escalate_tenant
+
+    info = realdb.info("a")
+    inspector = info.users["ap_manager"]
+    inst_id, _ = await _seed_unapproved_chain(realdb, review_age_hours=48, target=str(inspector))
+    number = f"PO-ESC-{uuid.uuid4().hex[:6]}"
+    async with realdb.sessionmaker("a")() as s:
+        inst = await s.get(WorkflowInstance, inst_id)
+        invoice = await s.get(Invoice, inst.invoice_id)
+        invoice.po_number = number
+        po = PurchaseOrder(
+            po_number=number,
+            total=Decimal("100.00"),
+            organization_id=info.org_id,
+            entity_id=invoice.entity_id,
+        )
+        s.add(po)
+        await s.flush()
+        s.add(
+            QualityInspection(
+                inspection_number=f"QI-{uuid.uuid4().hex[:6]}",
+                po_id=po.id,
+                result="pass",
+                source="manual",
+                recorded_by_user_id=inspector,
+                organization_id=info.org_id,
+                entity_id=invoice.entity_id,
+            )
+        )
+        await s.commit()
+
+    await _escalate_tenant(info.db_name, datetime.now(UTC), org_id=info.org_id)
+
+    async with realdb.sessionmaker("a")() as s:
+        inst = await s.get(WorkflowInstance, inst_id)
+    chain = get_chain_progress(inst)
+    assert not chain or str(inspector) not in chain["levels"][0]["approver_ids"]
 
 
 async def test_escalated_chain_is_rerouted_when_the_first_approver_corrects_the_amount(realdb):

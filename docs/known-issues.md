@@ -5,12 +5,20 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Six entries are open**: the remove-tenant backup deletion the VM's IAM role
-refuses (found 2026-10-18, at the top),
+**Eight entries are open**: the run builder reading
+a missing invoice currency as USD (found 2026-10-21), the app rendering nothing when browser
+storage is blocked (found 2026-10-20), the remove-tenant backup deletion the
+VM's IAM role refuses (found 2026-10-18),
 the expense-report Attach dead end found while
 writing the help centre, the `all`-mode approval-chain segregation deadlock,
 the legal-contents smooth-scroll race and the e2e cleanup race directly below,
-and the `payments/` local-e2e flake near the bottom. The paid-plan features no
+and the `payments/` local-e2e flake near the bottom. The `/complete` amount
+floor approving an invoice whose PO was never matched, found and struck on
+2026-11-15, sits struck above the run-builder entry. Merge.dev's vendor listing
+calling an endpoint Merge does not publish, found and struck on 2026-10-26, sits
+struck at the top. The payment mock tests that failed locally in one pytest
+process, found and struck on 2026-10-31, sit struck above the run-builder
+entry. The paid-plan features no
 route enforced and the direct ERP adapters posting bills without the ERP's
 vendor and account ids were struck on 2026-10-07 and 2026-10-08, but this line
 went on counting them as open — it said "seven" over five. The assistant
@@ -25,7 +33,7 @@ this note has now warned about twice. Two defects were **fixed on 2026-09-17**:
 the `/organization` 320px reflow defect (issue #432), along with six more routes
 that failed the same criterion and had no entry at all because nothing measured
 them; and the local-e2e `alembic` drift, which now has a pre-run guard that
-refuses to start against a stale database. Nineteen of the twenty-five `##`
+refuses to start against a stale database. Twenty-two of the thirty `##`
 entries are now `~~struck-through~~` resolved stubs. (This line said "the other
 fifteen" while the file held fifteen struck in total, the two above included,
 and later "seventeen of the twenty-four" while nineteen were struck.)
@@ -48,6 +56,211 @@ is worse than one with an entry in it.)
 a credential, an operator step on merged code, or sized-but-unstarted work —
 goes to [followups.md](followups.md). Reasoning behind a deliberate design call
 goes to [decisions.md](decisions.md).
+
+---
+
+## ~~Merge.dev's vendor listing calls an endpoint Merge does not publish~~ — FIXED 2026-10-26
+
+**Resolved 2026-10-26** as recommended below, re-verified against Merge's
+published Accounting OpenAPI (https://docs.merge.dev/openapi/accounting.json),
+its Contacts page (https://docs.merge.dev/accounting/contacts/) and its
+pagination page (https://docs.merge.dev/basics/pagination/).
+`MergeDevAdapter.list_vendors` now lists `GET /contacts?is_supplier=true`
+(`expand=addresses,phone_numbers`, every `next` cursor, `ErpListingIncomplete`
+on any failed page) through `_merge_contact_to_payload`: `phone_numbers[].number`,
+`street_1` / `street_2`, `ARCHIVED` or `remote_was_deleted` → `active=False`, a
+record saying `is_supplier: false` dropped, and `payment_terms` always None. The
+Contact `id` stays the `erp_vendor_id`; it is what a PurchaseOrder's `vendor` and
+an Invoice's `contact` hold, which a unit test pins end to end. The fake ERP now
+serves Merge-shaped Contacts at `/contacts` (plus a customer only an unfiltered
+request sees) and 404s `/vendors`, so `tests-e2e/erp/merge-dev.spec.ts` fails on
+the old adapter (vendor sync 502) and asserts payment terms absent. Detail:
+`backend/docs/erp-integration.md` § Merge.dev suppliers are Contacts. The
+diagnosis is kept below. *Amended 2026-11-15 (decisions §399):* the listing no
+longer filters on `is_supplier=true`, which Xero behind Merge sets only once a
+contact has a bill; a customer-only contact is dropped instead.
+
+
+**Found 2026-10-26** while fixing issue #652 (POs linked to their vendor by
+ERP id); diagnosed against Merge's published Accounting OpenAPI
+(`docs.merge.dev/openapi/accounting.json`), not against a live linked account.
+`MergeDevAdapter.list_vendors` reads `GET /vendors` and maps a "Vendor" model
+(`phone_number`, `addresses[].line1`, `payment_term`). Merge's Accounting API
+has no `/vendors` path and no Vendor model: suppliers are `Contact`s, listed at
+`GET /contacts?is_supplier=true`, with `phone_numbers[]` (`number`),
+`addresses[]` (`street_1` / `street_2`), a `status` of `ACTIVE` / `ARCHIVED`,
+and no payment term. The fake ERP serves `/vendors` in the adapter's shape, so
+every unit test and `tests-e2e/erp/merge-dev.spec.ts` pass against a contract
+Merge never offered.
+
+**Blast radius:** a live Merge connection's vendor sync fails (Merge answers the
+unknown path with an error, which `list_vendors` raises as
+`ErpListingIncomplete`, so `POST /api/vendors/sync-erp` answers 502 and changes
+nothing). With no vendor carrying a Merge id, every invoice push is refused
+`vendor_not_linked` and every PO falls back to linking by name, although
+`list_pos` now reads the vendor's Merge id (#652). Nothing is written wrongly;
+the Merge path just cannot be used. Merge is Scale-only, and no tenant is known
+to run it.
+
+**Recommended fix:** list `contacts` with `is_supplier=true` and
+`expand=addresses,phone_numbers`; map `phone_numbers[0].number`, `street_1` /
+`street_2`, and `ARCHIVED` to `active=False`; drop the payment-term mapping
+(Contact has none). Reshape the fake's Merge vendor fixtures to Contacts at
+`/contacts` (keeping the `merge-vendor-70x` ids the PO fixtures name), and
+update `tests/test_erp_vendor_sync_adapter.py` and the merge-dev e2e spec, whose
+payment-terms assertions go with the field. The Contact `id` stays the
+`erp_vendor_id`, so nothing already linked moves. Not done in the #652 change
+because it rewrites the vendor contract the e2e spec asserts, which needs a run
+against the full stack.
+
+## ~~Some payment mock tests fail locally when run in the same pytest process~~ — FIXED 2026-10-31
+
+**Resolved 2026-10-31.** The suspected cause was right, and it was not the only
+path. `api/payments._require_payment_adapter` calls
+`provider_credentials.provider_config(org, "payments")` with no `db`, and
+`load_secrets` then opens its own `control_session_factory()` session on the
+module-global `control_engine`. The five payment files never opted into
+`provider_store_from_settings`, so every mock execute test made a real query
+against the developer's `feohledger`. It returned no row, so each test passed.
+But the pooled asyncpg connection stayed bound to that test's event loop, and
+the next test, on a new loop, drew it: `got Future … attached to a different
+loop`, or `another operation is in progress`. CI hid it twice over. pytest-split
+separated the files, and once any `realdb` test has run, the harness repoints
+the global sessionmaker at a NullPool engine
+(`_repoint_global_control_session_factory`), which holds nothing across loops.
+That is also why the failures depended on file order.
+
+The fix gives the five files (and `test_payment_reconciler*.py`, which reach the
+same accessor through `_reconcile_tenant`) the fixture. It also adds an autouse
+guard, `_refuse_real_engine_in_mock_tests` in `backend/tests/conftest.py`: a test
+without `realdb` that opens any SQLAlchemy connection raises
+`RealEngineInMockTestError` at the call, naming the app frames that got there.
+It also fails at teardown if the code under test swallowed the error. The first
+full run under the guard found three more side doors that best-effort code or a
+broad `pytest.raises` had been hiding. `audit_dispatch._write_auth_audit`
+resolves the tenant on its own control session: the login, session-revocation,
+custom-role, passkey and step-up test files now use the new
+`no_auth_audit_write` fixture. The `paid` notification's
+`resolve_role_user_ids` is now stubbed in `test_invoice_lifecycle.py`. And
+`provision_tenant`'s closed-slug check is now patched in the one DB-free
+provisioning test that reached it. The tests that connect on purpose, on
+engines they build and dispose themselves (`test_db_engine.py`,
+`test_control_plane_bootstrap.py`, `test_schema_build_parity.py` and two in
+`test_tenant_provisioning.py`), carry the `real_db_engine` marker. The full local run also exposed an
+unrelated order dependency in the `realdb` harness itself: a test that enrolled
+TOTP on the harness admin left the factor in place, which broke
+`test_privacy_unmasked_step_up`'s no-factor case in the same process. The
+harness now resets the seeded users' second factors before each test. Guard tests: `backend/tests/test_mock_db_engine_guard.py`.
+Rule: `backend/CLAUDE.md` § Test databases. The diagnosis is kept below.
+
+**Found 2026-10-31** while integrating the follow-ups batch (PR #679).
+
+**Symptom.** Run together locally, 13 mock tests across
+`test_payment_run_flow.py`, `test_payment_run_atomicity.py`,
+`test_international_payments.py` and `test_compliance.py`, plus
+`test_payment_run_critical_path.py::test_execute_transitions_invoice_via_transition_invoice_not_bare_assign`
+and `::test_execute_holds_payment_when_invoice_has_no_screenable_vendor`, fail
+with asyncpg's `got Future … attached to a different loop`, raised from
+`provider_credentials`. Each passes on its own, and the same tests fail the same
+way on unmodified `main`. CI is green because pytest-split puts them on
+different shards.
+
+**Root cause (suspected).** A mock-based test reaches the real control-plane
+engine through `provider_credentials` (it should be served by the
+`provider_store_from_settings` fixture), and that engine's pooled connection is
+bound to whichever test's event loop first opened it; a later test on a new loop
+then draws it.
+
+**Blast radius.** Local only — a contributor running those files together sees
+red for reasons unrelated to their diff. No production effect.
+
+**Recommended fix.** Find which of these tests reads provider secrets without the
+`provider_store_from_settings` fixture (or a realdb seal) and give it one, then
+add a guard that a mock-DB test touching `provider_credentials` fails loudly
+instead of reaching the real engine.
+
+## ~~The `/complete` amount floor approves an invoice whose PO was never matched~~ — FIXED 2026-11-15
+
+**Fixed** in round 13 (decisions §425): `/complete` runs the PO match on the
+`new` invoice it submits, and both unattended doors (the floor and
+extraction's auto-approve) ask `invoice_warnings.po_match_hold_refusal` before
+stamping an approval, so an open `po_mismatch` / `quality_hold` sends the
+invoice to review. Tests: `backend/tests/test_invoice_complete_auto_approve.py`,
+`backend/tests/test_extraction_reextract_options.py`. The diagnosis is kept
+below.
+
+**Found 2026-11-15**, by round 12's fix lane for decisions §422 (PR #716);
+reproduced with a throwaway test, since deleted. `POST /api/invoices/{id}/complete`
+auto-approves an invoice under the org's amount floor straight from `new`, and
+`invoice_warnings.refresh_warnings` skips the PO match while an invoice is
+`new`. So an invoice citing a PO that does not exist (`PO-DOES-NOT-EXIST-FX1` in
+the reproduction) came back `approved` with an empty `po_match` and no
+`po_mismatch` exception — payable, with no 2/3/4-way match ever run. It predates
+round 12 and is separate from §420 / §422, though it is why §422's re-judge
+almost never has anything to do on the floor.
+
+**Blast radius:** tenants with a `/complete` amount floor configured whose
+invoices cite a PO; below-floor invoices only.
+
+**Recommended fix (needs a policy call):** either run the PO match before the
+floor decides (an invoice whose match fails is held, not approved), or send any
+invoice that cites a PO to review rather than through the floor. The first keeps
+the floor's purpose for PO-less spend and is the recommended default. Test
+beside `tests/test_invoice_complete_auto_approve.py`: a below-floor invoice
+citing an unknown PO is not approved and carries `po_mismatch`.
+
+## The run builder reads a missing invoice currency as USD
+
+**Found 2026-10-21**, in the money-path review of the ERP push gate (decisions
+§309); diagnosed from the code, not reproduced. `services/payment_runs.create_payment_run_for_invoices`
+refuses a run spanning more than one currency with
+`currencies = {invoices[iid].currency or "USD" for iid in invoice_ids}`. An
+invoice with no currency therefore counts as USD: a run of one USD invoice and
+one currency-less invoice passes the single-currency check, and its
+`total_amount` and CFO-threshold comparison add a figure denominated in nothing
+to a USD one. That is the substitution decisions §160 / §196 / §200 rule out ("a
+missing currency stays missing, never a USD guess").
+
+**Blast radius:** only invoices with a NULL `currency`, which entry and
+extraction normally fill; the per-payment settlement still reads each
+invoice's own currency.
+
+**Recommended fix:** treat a missing currency as its own value in that set (or
+refuse the run, naming the invoice, until the currency is set), with a pytest
+beside `tests/test_payment_run_flow.py`'s mixed-currency case.
+
+## The app renders nothing when the browser blocks site storage
+
+**Found 2026-10-20**, building the light theme (decisions §289), whose own
+storage access is wrapped and was being tested for exactly this case.
+
+**Symptom.** With `localStorage` unavailable — the property access throws a
+`SecurityError`, as it does when a browser blocks site data for the origin and
+in some sandboxed frames — `/login` never draws its form: the page stays on the
+empty shell and the console shows an uncaught `SecurityError`. Reproduced on
+`main` (a pre-existing defect, not introduced by the theme work) with a
+Playwright init script that redefines `window.localStorage` as a throwing
+getter. The theme itself still resolves correctly in that state: the
+`app.html` pre-paint script and `src/lib/theme.ts` both catch it and fall back
+to System.
+
+**Root cause.** Several boot-path storage reads are unguarded:
+`src/lib/api.ts` `getToken()` / `setToken()` / `clearToken()`,
+`src/lib/entity.ts` (the selected-entity read and write), and
+`src/lib/portalApi.ts`'s token helpers. Any of them reached during layout boot
+throws out of the effect that decides what to render. `i18n/store.svelte.ts`,
+`ConsentBanner.svelte` and the theme store already wrap theirs.
+
+**Blast radius.** A visitor whose browser blocks storage for the site cannot
+use the app at all, and gets no message saying why. It needs storage to hold a
+session, so it could never work fully — but it should say so rather than render
+a blank page.
+
+**Fix approach.** Route every storage access through one wrapped helper (the
+`browserStorage()` shape in `src/lib/theme.ts` is the model), treat "no
+storage" as "signed out", and have `/login` show a localized "this browser is
+blocking site storage, which signing in needs" notice. Guard with an e2e spec
+that installs the throwing getter and asserts the notice renders.
 
 ---
 
@@ -383,7 +596,7 @@ collects it, so a stock admin's stolen session or password alone no longer
 produces a full account number (`backend/docs/privacy.md` § Banking data in a
 DSAR bundle).
 
-**Issue:** [#423](https://github.com/Absence0760/feohledger/issues/423)
+**Issue:** [#423](https://github.com/jaredhoward-dev/feohledger/issues/423)
 
 **Found:** 2026-09-15, in the pre-counsel legal review of the published pages
 (`reviews/saas-legal-review-legal-pages.md`, H12).
@@ -456,7 +669,7 @@ a deployment that has not enabled it still accumulates these files. That is the
 same posture every sweep in this project has (guard rail 7) and is now a
 deployment step rather than a missing capability.
 
-**Issue:** [#425](https://github.com/Absence0760/feohledger/issues/425)
+**Issue:** [#425](https://github.com/jaredhoward-dev/feohledger/issues/425)
 
 **Found:** 2026-09-15, same review (H10).
 
@@ -521,7 +734,7 @@ collection is capped with a `truncated` flag and its true total. Documents are
 enumerated as references, not inlined as base64 — inlining would have put a
 W-9's TIN into the body of a routine export.
 
-**Issue:** [#424](https://github.com/Absence0760/feohledger/issues/424)
+**Issue:** [#424](https://github.com/jaredhoward-dev/feohledger/issues/424)
 
 **Found:** 2026-09-15, while drafting the published Privacy Policy and DPA
 (`docs/decisions.md` §175) — the pages could not honestly describe the erasure
@@ -766,7 +979,7 @@ retry-safe by construction. The payment fails with the named
 completes and the invoice reaches the payable `posted_in_erp`.
 
 `sent_to_erp` is also gone from the three dispatch legs' transition branch — but
-not by deleting a literal: `api/payments.SCHEDULABLE_INVOICE_STATUSES` is now
+not by deleting a literal: `services/payment_gates.SCHEDULABLE_INVOICE_STATUSES` is now
 **derived** from `workflow_engine.VALID_TRANSITIONS`, so the branch can never
 again name a status the state machine refuses.
 

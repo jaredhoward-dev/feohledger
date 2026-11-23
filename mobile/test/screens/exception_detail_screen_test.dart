@@ -1,12 +1,13 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/exception_detail_screen.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
@@ -14,7 +15,7 @@ import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/exception_store.dart';
 
 Widget _host(Widget home) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: home,
     );
@@ -34,6 +35,11 @@ Map<String, dynamic> _detailJson({
   // amount, because the figure IS that invoice's amount. `null` models the
   // no-invoice-joined case the endpoint also produces.
   Object? currency = 'USD',
+  Map<String, dynamic>? erpReport,
+  String? erpName,
+  // The caller's `decision_refusals`; defaults to a manager's (see
+  // [_managerDecisions]). `null` models a read that carries none.
+  Object? decisions = _managerDefault,
 }) =>
     {
       'id': '1',
@@ -52,7 +58,31 @@ Map<String, dynamic> _detailJson({
       'is_overdue': false,
       'due_at': dueAt,
       'created_at': '2026-01-01T12:00:00',
+      'erp_report': ?erpReport,
+      'erp_name': ?erpName,
+      'decision_refusals': identical(decisions, _managerDefault)
+          ? _managerDecisions(status)
+          : decisions,
     };
+
+const _managerDefault = Object();
+
+const _notActionable = {
+  'code': 'exception_not_actionable',
+  'message': "Cannot resolve from 'resolved' status",
+  'params': <String, dynamic>{},
+};
+
+/// `decision_refusals` as `api/exceptions.py::decision_refusals` builds them
+/// for a reader holding the queue's role with no segregation conflict: every
+/// action accepted on an open or escalated row, the status refusal otherwise.
+Map<String, dynamic> _managerDecisions(String status) {
+  final actionable = status == 'open' || status == 'escalated';
+  return {
+    for (final a in ['resolve', 'dismiss', 'escalate'])
+      a: actionable ? null : _notActionable,
+  };
+}
 
 Map<String, dynamic> _me(List<String> roles) => {
       'id': 'u1',
@@ -128,6 +158,176 @@ void main() {
     expect(find.widgetWithText(OutlinedButton, 'Dismiss'), findsOneWidget);
     // Unassigned by default.
     expect(find.text('Unassigned'), findsOneWidget);
+  });
+
+  testWidgets('a hold the ERP PO sync re-check no longer finds says so',
+      (tester) async {
+    setTallSurface(tester);
+    ApiClient().debugConfigure(
+      client: MockClient(
+        (req) async => _json(
+          _detailJson(
+            erpName: 'NetSuite',
+            erpReport: {
+              'kind': 'po_rematch_clears',
+              'erp_type': 'netsuite',
+              'po_number': 'PO-7',
+              'observed_on': '2026-10-26',
+            },
+          ),
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(
+      _host(const ExceptionDetailScreen(exceptionId: '1')),
+    );
+    await _pumpUntil(tester, find.byKey(const Key('exception-rematch-note')));
+
+    expect(
+      find.text(
+        'PO PO-7 changed in NetSuite on Oct 26, 2026, and a re-check now '
+        'matches. Review it to clear the hold.',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('any other row shows no re-check note', (tester) async {
+    setTallSurface(tester);
+    ApiClient().debugConfigure(
+      client: MockClient(
+        (req) async => _json(
+          _detailJson(erpReport: {'kind': 'paid_not_recorded'}),
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(
+      _host(const ExceptionDetailScreen(exceptionId: '1')),
+    );
+    await _pumpUntil(tester, find.text('PO Mismatch'));
+
+    expect(find.byKey(const Key('exception-rematch-note')), findsNothing);
+  });
+
+  group('the ERP report behind a reconciliation row', () {
+    Future<void> pumpReport(
+      WidgetTester tester,
+      Map<String, dynamic> report, {
+      String? erpName = 'Xero',
+      Locale? locale,
+    }) async {
+      setTallSurface(tester);
+      ApiClient().debugConfigure(
+        client: MockClient(
+          (req) async =>
+              _json(_detailJson(erpName: erpName, erpReport: report)),
+        ),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          localizationsDelegates: appLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          locale: locale,
+          home: const ExceptionDetailScreen(exceptionId: '1'),
+        ),
+      );
+      await _pumpUntil(tester, find.text('PO Mismatch'));
+    }
+
+    testWidgets('a write-back refusal states why, in the reader\'s language',
+        (tester) async {
+      await pumpReport(tester, {
+        'kind': 'payment_writeback_failed',
+        'erp_type': 'xero',
+        'refusal': {
+          'code': 'payments_scope_missing',
+          'params': {'provider': 'Xero'},
+        },
+      }, locale: const Locale('de'));
+
+      final note = find.byKey(const Key('exception-erp-refusal'));
+      expect(note, findsOneWidget);
+      final de = lookupAppLocalizations(const Locale('de'));
+      expect(
+        tester.widget<Text>(note).data,
+        de.erpRefusalPaymentsScopeMissing('Xero'),
+      );
+    });
+
+    testWidgets('a code this build cannot state reads as the generic line',
+        (tester) async {
+      await pumpReport(tester, {
+        'kind': 'payment_void_writeback_failed',
+        'refusal': {
+          'code': 'some_newer_code',
+          'params': {'provider': 'Xero'},
+        },
+      }, erpName: null);
+
+      final note = find.byKey(const Key('exception-erp-refusal'));
+      expect(tester.widget<Text>(note).data,
+          lookupAppLocalizations(const Locale('en')).erpRefusalUnknown('your ERP'));
+      expect(find.textContaining('some_newer_code'), findsNothing);
+    });
+
+    testWidgets('a write-back the ERP gave no code for adds no line',
+        (tester) async {
+      await pumpReport(tester, {
+        'kind': 'payment_writeback_failed',
+        'refusal': null,
+      });
+      expect(find.byKey(const Key('exception-erp-refusal')), findsNothing);
+      expect(find.byKey(const Key('exception-erp-payment')), findsNothing);
+    });
+
+    testWidgets('a reported payment shows the ERP\'s figure in its currency',
+        (tester) async {
+      await pumpReport(tester, {
+        'kind': 'paid_not_recorded',
+        'erp_type': 'xero',
+        'amount': '240.50',
+        'amount_currency': 'EUR',
+        'reference': 'xero:bill-9',
+        'paid_on': '2026-10-30',
+        'paid_on_reported': true,
+      });
+
+      final panel = find.byKey(const Key('exception-erp-payment'));
+      expect(panel, findsOneWidget);
+      Finder inPanel(String text) =>
+          find.descendant(of: panel, matching: find.text(text));
+      expect(inPanel('Payment reported by Xero'), findsOneWidget);
+      expect(inPanel('Amount Xero reports paid'), findsOneWidget);
+      expect(inPanel('€240.50'), findsOneWidget);
+      expect(inPanel('Oct 30, 2026'), findsOneWidget);
+      expect(inPanel('xero:bill-9'), findsOneWidget);
+      // The invoice's own figure stays in its own panel, never replaced.
+      expect(find.text(r'$250.00'), findsOneWidget);
+      // No refusal line on this kind.
+      expect(find.byKey(const Key('exception-erp-refusal')), findsNothing);
+    });
+
+    testWidgets('no stated figure says so; an unreported date is left out',
+        (tester) async {
+      await pumpReport(tester, {
+        'kind': 'paid_not_recorded',
+        'amount': null,
+        'amount_currency': null,
+        'reference': 'qbo:1',
+        'paid_on': '2026-10-30',
+        'paid_on_reported': false,
+      });
+
+      final panel = find.byKey(const Key('exception-erp-payment'));
+      expect(
+        find.descendant(of: panel, matching: find.text('Not stated')),
+        findsOneWidget,
+      );
+      expect(find.text('Oct 30, 2026'), findsNothing);
+      expect(find.text('Paid on'), findsNothing);
+    });
   });
 
   testWidgets('a coded composite description lists its localized findings',
@@ -259,6 +459,83 @@ void main() {
       ExceptionStore.instance.actionErrorDetail,
       isA<Map<String, dynamic>>(),
     );
+  });
+
+  group('decision verdicts', () {
+    Future<void> pumpDetail(
+      WidgetTester tester, {
+      Object? decisions = _managerDefault,
+      String status = 'open',
+    }) async {
+      setTallSurface(tester);
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (req.method == 'GET' &&
+              RegExp(r'/exceptions/[^/]+$').hasMatch(req.url.path)) {
+            return _json(_detailJson(status: status, decisions: decisions));
+          }
+          return _json({'items': [], 'total': 0, 'page': 1});
+        }),
+      );
+      await tester.pumpWidget(
+        _host(const ExceptionDetailScreen(exceptionId: '1')),
+      );
+      await _pumpUntil(tester, find.text('PO Mismatch'));
+    }
+
+    testWidgets('an implicated manager sees Resolve and Dismiss disabled with '
+        'the reason, and Escalate enabled', (tester) async {
+      const sod = {
+        'code': 'segregation_implicated',
+        'message': 'server english',
+        'params': <String, dynamic>{},
+      };
+      await pumpDetail(
+        tester,
+        decisions: {'resolve': sod, 'dismiss': sod, 'escalate': null},
+      );
+
+      final resolve = tester.widget<ButtonStyleButton>(
+        find.ancestor(
+          of: find.text('Resolve'),
+          matching: find.bySubtype<ButtonStyleButton>(),
+        ),
+      );
+      expect(resolve.onPressed, isNull);
+      final escalate = tester.widget<ButtonStyleButton>(
+        find.ancestor(
+          of: find.text('Escalate'),
+          matching: find.bySubtype<ButtonStyleButton>(),
+        ),
+      );
+      expect(escalate.onPressed, isNotNull);
+      expect(find.textContaining('Segregation of duties'), findsNWidgets(2));
+      expect(find.text('server english'), findsNothing);
+    });
+
+    testWidgets('a reader whose role may not decide sees no actions',
+        (tester) async {
+      const role = {'code': 'role_not_permitted', 'message': 'm'};
+      await pumpDetail(
+        tester,
+        decisions: {'resolve': role, 'dismiss': role, 'escalate': role},
+      );
+      expect(find.text('Resolve'), findsNothing);
+      expect(find.text('Escalate'), findsNothing);
+      expect(find.text('Dismiss'), findsNothing);
+    });
+
+    testWidgets('a resolved row offers no actions', (tester) async {
+      await pumpDetail(tester, status: 'resolved');
+      expect(find.text('Escalate'), findsNothing);
+    });
+
+    testWidgets('no verdict offers nothing (fail closed)', (tester) async {
+      await pumpDetail(tester, decisions: null);
+      expect(find.text('Resolve'), findsNothing);
+      expect(find.text('Escalate'), findsNothing);
+      expect(find.text('Dismiss'), findsNothing);
+    });
   });
 
   testWidgets('admin can open the assignee picker and assign a user',

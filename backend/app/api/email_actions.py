@@ -35,12 +35,13 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, Depends, Form, HTTPException
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.api.permissions import PERM_INVOICE_APPROVE, effective_permissions
 from app.config import settings
 from app.database import _make_tenant_url, get_control_db
+from app.db_engine import create_async_engine
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
 from app.models.user import User
@@ -52,6 +53,7 @@ from app.services.email_action_token import (
     approval_facts_changed,
     verify_action_token,
 )
+from app.utils.currency_code import iso_currency_or_none
 from app.utils.http import detail_text
 
 logger = logging.getLogger(__name__)
@@ -117,7 +119,11 @@ def _info_page(title: str, message: str) -> HTMLResponse:
 def _invoice_ref(invoice: Invoice) -> str:
     ref = f"Invoice {invoice.invoice_number} ({invoice.vendor_name})"
     if invoice.amount is not None:
-        ref += f" for {invoice.currency or 'USD'} {invoice.amount:,.2f}"
+        # No code at all when the invoice records none, or a malformed legacy
+        # value no reader could use (decisions §473).
+        currency = iso_currency_or_none(invoice.currency)
+        code = f"{currency} " if currency else ""
+        ref += f" for {code}{invoice.amount:,.2f}"
     return ref
 
 
@@ -214,6 +220,11 @@ async def email_action_confirm_page(
         invoice = (
             await db.execute(select(Invoice).where(Invoice.id == decoded.invoice_id))
         ).scalar_one_or_none()
+        # The round the invoice is in now (decisions §379), read in the same
+        # session: a link from a round a recall or a rejection ended is stale.
+        current_round = (
+            await review_svc.review_round_of(db, invoice.id) if invoice is not None else 0
+        )
 
     if invoice is None:
         return _invalid_link_page()
@@ -225,7 +236,7 @@ async def email_action_confirm_page(
         )
     # The page shows the invoice as it is NOW; an Approve link minted for other
     # figures must not ask the reviewer to confirm these ones.
-    if approval_facts_changed(decoded, invoice):
+    if approval_facts_changed(decoded, invoice, review_round=current_round):
         return _info_page("Invoice has changed", FACTS_CHANGED_MESSAGE)
     return _confirm_page(token, decoded.action, invoice)
 
@@ -322,10 +333,12 @@ async def _apply_action(
     same decision as approving in-app, so it has to read the same org
     ``fraud_rules`` / ``matching`` tolerances / structuring window. Omitting it
     reverted all of them to the platform default for this one door."""
+    from app.services.review import awaiting_review
     from app.services.workflow_engine import get_invoice_for_update
 
     invoice = await get_invoice_for_update(db, decoded.invoice_id)
-    if invoice.status != InvoiceStatus.ready_for_review:
+    # The one review-stage predicate every decision door reads.
+    if not awaiting_review(invoice):
         return _ActionResult(
             False,
             _info_page(
@@ -336,7 +349,9 @@ async def _apply_action(
         )
     # Re-checked under the row lock: the confirm page's check ran on a read
     # that an edit may have overtaken since.
-    if approval_facts_changed(decoded, invoice):
+    if approval_facts_changed(
+        decoded, invoice, review_round=await review_svc.review_round_of(db, invoice.id)
+    ):
         return _ActionResult(False, _info_page("Invoice has changed", FACTS_CHANGED_MESSAGE))
 
     if decoded.action == ACTION_APPROVE:

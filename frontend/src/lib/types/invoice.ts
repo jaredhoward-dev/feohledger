@@ -1,3 +1,4 @@
+import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 import type { MatchingIdsResponse } from '#lib/utils/pagination.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import type { MoneyAmount } from '#lib/utils/money.ts';
@@ -72,6 +73,53 @@ export const INVOICE_STATUS_LABEL_KEYS: Record<InvoiceStatus, MessageKey> = {
  */
 export function invoiceStatusLabelKey(status: string): MessageKey | null {
 	return INVOICE_STATUS_LABEL_KEYS[status as InvoiceStatus] ?? null;
+}
+
+/**
+ * The `Badge` tone each status renders in — `StatusBadge` reads this and
+ * nothing else, so a pill's colour is owned beside its label.
+ *
+ * `StatusBadge` used to carry its own per-status CSS rules, and only six of the
+ * twelve statuses had one: `approved`, `rejected`, `sending_to_erp`,
+ * `posted_in_erp`, `payment_scheduled` and `paid` fell through to the bare
+ * layout rule and rendered as uppercase text with no pill — on `/invoices`,
+ * `DONE` was green while `PAID` beside it had no background at all. A CSS class
+ * per status is invisible to the typechecker; `Record<InvoiceStatus, BadgeTone>`
+ * makes a new status a compile error rather than a missing pill, and
+ * `invoiceStatus.test.ts` checks it against every status the state machine
+ * names.
+ *
+ * The families, read along the pipeline:
+ *   - `new` / `payment_scheduled` — `accent`: in hand, nothing wrong.
+ *   - `pending` — `warning`: mid-extraction, not yet usable.
+ *   - `ready_for_review` / `approved` / `paid` / `done` — `success`.
+ *   - `sending_to_erp` / `sent_to_erp` / `posted_in_erp` — `erp` (violet): the
+ *     one hue that means "the ERP has it", so the hand-off stretch of the
+ *     pipeline scans as one band (decisions.md §289).
+ *   - `rejected` / `failed` — `danger`: someone has to act before it moves.
+ */
+export const INVOICE_STATUS_TONES: Record<InvoiceStatus, BadgeTone> = {
+	new: 'accent',
+	pending: 'warning',
+	ready_for_review: 'success',
+	approved: 'success',
+	rejected: 'danger',
+	sending_to_erp: 'erp',
+	sent_to_erp: 'erp',
+	posted_in_erp: 'erp',
+	payment_scheduled: 'accent',
+	paid: 'success',
+	done: 'success',
+	failed: 'danger'
+};
+
+/**
+ * The tone for a status, or `neutral` (`Badge`'s flat "no signal" chip) for one
+ * this frontend doesn't know — the pill still renders, labelled with the raw
+ * value, rather than dropping to bare text (see {@link invoiceStatusLabelKey}).
+ */
+export function invoiceStatusTone(status: string): BadgeTone {
+	return INVOICE_STATUS_TONES[status as InvoiceStatus] ?? 'neutral';
 }
 
 /** Statuses managed by the system — users should not select or bulk-act on these. */
@@ -254,6 +302,11 @@ export interface PoMatch {
 	match_type: 'none' | '2-way' | '3-way' | '4-way';
 	po_id: string | null;
 	po_number: string | null;
+	/** A multi-PO split's legs (`invoices.split_po_ids`, decisions §433): the
+	 *  match read the invoice against these POs combined, `po_id` is null and
+	 *  `po_number` is the invoice's own combined reference. Empty for a single
+	 *  PO; absent on a match persisted before the matcher read splits. */
+	po_ids?: string[];
 	// `services/po_matching.py::_json_safe` renders every Decimal on the
 	// persisted `invoices.po_match` JSONB down to a JSON number, so these
 	// arrive numeric — but they are money, and the variance in particular is a
@@ -266,6 +319,11 @@ export interface PoMatch {
 	 *  `different` means the amounts were not compared, `unknown` that they were
 	 *  compared at face value because the PO records no currency. */
 	currency_check?: 'same' | 'different' | 'unknown' | null;
+	/** Set when the PO's last ERP sync could not state its total exactly
+	 *  (`erp_adapters.base.PoSkipReason`): the amounts were not compared and
+	 *  `po_total` is null. A match stored before that change may still carry
+	 *  the stale figure, which the modal does not show (decisions §323). */
+	po_total_unverifiable_reason?: string | null;
 	gr_id: string | null;
 	/** `null` when the invoice and the PO are in different currencies. */
 	amount_variance: MoneyAmount;
@@ -275,6 +333,8 @@ export interface PoMatch {
 	inspection_result: 'pass' | 'fail' | 'partial' | null;
 	inspection_accepted_quantity: number | null;
 	inspection_required: boolean;
+	/** Every inspection the match read — one per inspected leg on a split. */
+	inspection_ids?: string[];
 	/** One finding per entry: `{code, params, message}` from the catalogue's
 	 *  `po_match.issue.*` family — localize through `poMatchIssueText`. A match
 	 *  persisted before that family existed holds bare English strings, and
@@ -303,7 +363,10 @@ export interface Invoice {
 	vendor_id: string | null;
 	invoice_number: string;
 	amount: MoneyAmount;
-	currency: string;
+	/** `null` = currency unknown: an upload nothing has read yet, or a document
+	 *  that names none (decisions §473). Render the amount bare, never
+	 *  with a guessed symbol (§160 / §196 / §200). */
+	currency: string | null;
 	invoice_date: string | null;
 	received_date: string | null;
 	due_date: string | null;
@@ -369,7 +432,28 @@ export interface Invoice {
 	file_url: string | null;
 	warnings: InvoiceWarning[] | null;
 	po_match: PoMatch | null;
+	/**
+	 * The bill this invoice was posted as in the ERP (a Xero InvoiceID, a
+	 * QuickBooks Bill Id, ...); `null` until a push is confirmed. Written only by
+	 * the backend's ERP push (`services/erp.py`).
+	 */
+	erp_document_id: string | null;
+	/**
+	 * The provider's deep link to that bill, built by the backend from the ERP
+	 * config that posted it (`services/erp_adapters/deep_links.py` — the one
+	 * provider → URL mapping). `null` for a provider with no stable deep link:
+	 * render the id alone, never build a URL here.
+	 */
+	erp_document_url: string | null;
 	priors_summary: { cache: number; rag: number } | null;
+	/**
+	 * Whether the amount, payee, line items and document are frozen
+	 * (`models/invoice_status.financially_locked` — from `approved` on, and at a
+	 * failed ERP push after approval; decisions §370). A snapshot of the row as
+	 * read: the invoice modal decides from its live `edit_financials` verdict
+	 * instead, which follows the status the modal moves the invoice to.
+	 */
+	financially_locked: boolean;
 }
 
 /**

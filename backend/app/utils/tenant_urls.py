@@ -103,8 +103,10 @@ def password_reset_url(
 ) -> str | None:
     """The tenant-hosted reset page for ``token``, or ``None`` with no base URL.
 
-    One builder for both links that redeem a reset token: the forgot-password
-    email and signup's set-password link (``docs/decisions.md`` §283).
+    One builder for every link that redeems an employee reset token: the
+    forgot-password email, and the set-password link signup, admin invite /
+    reset and partner provisioning send instead of a temporary password
+    (``docs/decisions.md`` §283).
     ``set_password`` adds ``mode=set``, which changes only the page's copy
     ("Set your password" rather than "Set a new password") — the token, the
     endpoint and the single-use redemption are identical.
@@ -124,16 +126,99 @@ def password_reset_url(
     return f"{url}&mode=set" if set_password else url
 
 
+def portal_password_reset_url(
+    slug: str | None,
+    org_settings: Mapping[str, Any] | None,
+    token: str,
+    *,
+    set_password: bool = False,
+) -> str | None:
+    """The supplier portal's set-password page for a portal ``token``.
+
+    The portal twin of :func:`password_reset_url`, over the same resolver, so a
+    white-label tenant's supplier lands on the tenant's own host. ``None`` with
+    no base URL for the same reason: a relative link in an email is dead and
+    leaks a live credential. ``set_password`` (an invite) adds ``mode=set``,
+    which changes only the page's copy.
+    """
+    base = tenant_base_url(slug, org_settings)
+    if not base:
+        return None
+    url = f"{base}/portal/reset-password?token={quote(token)}"
+    return f"{url}&mode=set" if set_password else url
+
+
+def _first_custom_domain(org_settings: Mapping[str, Any] | None) -> str | None:
+    """The first registered vanity host in ``brand.custom_domains``, or ``None``.
+
+    Re-normalized on the way out, through the resolver's own function, because a
+    row edited straight in the database never went through
+    ``PUT /branding/custom-domains`` — and a host under the platform's own
+    domain is skipped for the reason that endpoint refuses one.
+    """
+    from app.tenant import normalize_custom_domain  # app.tenant imports the DB layer
+
+    if not isinstance(org_settings, Mapping):
+        return None
+    brand = org_settings.get("brand")
+    if not isinstance(brand, Mapping):
+        return None
+    raw = brand.get("custom_domains")
+    if not isinstance(raw, list):
+        return None
+    for entry in raw:
+        host = normalize_custom_domain(entry) if isinstance(entry, str) else None
+        if host and not is_under_platform_domain(host):
+            return host
+    return None
+
+
+def sign_in_base_url(slug: str | None, org_settings: Mapping[str, Any] | None = None) -> str:
+    """Where a person should SIGN IN to this tenant, with no trailing slash.
+
+    Like ``tenant_base_url`` except that, when the tenant has set no
+    ``tenant_url_template`` of its own, a registered custom domain beats the
+    platform's ``<slug>`` template. The runbook registers a host only once its
+    DNS and certificate are live (``docs/founder-runbooks/custom-domain-
+    provisioning.md`` Step 4), and the host is not interchangeable with the slug
+    subdomain for signing in: the browser keeps a separate token per origin, and
+    a passkey registered on the vanity host is not offered on the subdomain. An
+    explicit per-org template still wins — it is the tenant's own statement of
+    where its links point. The scheme is the global template's, so a local
+    ``http://`` stack stays ``http://``.
+    """
+    if not _org_template(org_settings):
+        host = _first_custom_domain(org_settings)
+        if host:
+            scheme = urlsplit((settings.tenant_url_template or "").strip()).scheme or "https"
+            return f"{scheme}://{host}"
+    return tenant_base_url(slug, org_settings)
+
+
 def sign_in_url(
-    slug: str | None, org_settings: Mapping[str, Any] | None = None, *, email: str | None = None
+    slug: str | None,
+    org_settings: Mapping[str, Any] | None = None,
+    *,
+    email: str | None = None,
+    prefer_custom_domain: bool = False,
 ) -> str | None:
     """The tenant's sign-in page, with ``email`` prefilled when given.
 
     The login page reads ``?email=`` into its email field and nothing else
     (``frontend/src/lib/utils/prefillEmail.ts``). An address in a link we email
     to that same address tells its reader nothing they did not know.
+
+    ``prefer_custom_domain`` builds it on ``sign_in_base_url`` — the
+    wrong-workspace refusal's link, which sends a person to where they actually
+    sign in. Off by default: the other callers' links are tied to
+    ``tenant_url_template`` by design (``docs/white-label.md``), and moving them
+    is a separate decision.
     """
-    base = tenant_base_url(slug, org_settings)
+    base = (
+        sign_in_base_url(slug, org_settings)
+        if prefer_custom_domain
+        else tenant_base_url(slug, org_settings)
+    )
     if not base:
         return None
     query = f"?{urlencode({'email': email})}" if email else ""

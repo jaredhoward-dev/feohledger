@@ -56,10 +56,42 @@ void main() {
         expect(store.vendors, hasLength(1));
         expect(store.vendors.first.id, '1');
         expect(store.fromCache, isFalse);
-        expect(store.error, isNull);
+        expect(store.loadError, isNull);
         expect(store.loading, isFalse);
       },
     );
+
+    test('the offline cache round-trips the Verify / Reject verdicts',
+        () async {
+      ApiClient().debugConfigure(
+        client: MockClient(
+          (req) async => _list([
+            {
+              ..._vendorJson('1', status: 'active'),
+              'status_actions': {
+                'verify': {
+                  'code': 'vendor_status_not_allowed',
+                  'message': 'Vendor is not in unverified status',
+                  'params': <String, dynamic>{},
+                },
+                'reject': null,
+              },
+            },
+          ]),
+        ),
+      );
+      await store.fetch();
+
+      ApiClient().debugConfigure(
+        client: MockClient((req) async => throw Exception('offline')),
+      );
+      await store.fetch();
+
+      expect(store.fromCache, isTrue);
+      final v = store.vendors.single;
+      expect(v.verifyVerdict.code, 'vendor_status_not_allowed');
+      expect(v.rejectVerdict.allowed, isTrue);
+    });
 
     test('falls back to the offline cache when the network fails', () async {
       ApiClient().debugConfigure(
@@ -86,7 +118,7 @@ void main() {
 
         await store.fetch();
 
-        expect(store.error, isNotNull);
+        expect(store.loadError, isNotNull);
         expect(store.fromCache, isFalse);
       },
     );
@@ -261,7 +293,9 @@ void main() {
       final ok = await store.verify('1');
 
       expect(ok, isFalse);
-      expect(store.error, isNotNull);
+      expect(store.actionError, isNotNull);
+      // A refused action is not a failed load: no "couldn't refresh" banner.
+      expect(store.loadError, isNull);
     });
 
     test('syncErp posts to /sync-erp and returns the server message', () async {
@@ -302,7 +336,7 @@ void main() {
         final message = await store.syncErp();
 
         expect(message, isNull);
-        expect(store.error, isNotNull);
+        expect(store.actionError, isNotNull);
       },
     );
   });

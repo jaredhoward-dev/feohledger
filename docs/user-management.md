@@ -20,7 +20,7 @@ Roles are enforced in the frontend UI. The `/api/auth/me` endpoint returns the u
 ### Role-Based UI Restrictions
 
 The sidebar (driven by `frontend/src/lib/nav.ts`) keeps high-traffic routes as
-direct rows and folds the rest into groups (Procurement / Billing / Insights /
+direct rows and folds the rest into groups (Procurement / Treasury / Insights /
 Automation / Governance / Settings) that open a sub-tabbed page. A group row
 appears when the role can see ≥1 of its children and lands on the first of
 them; the per-page section tabs are filtered by the same per-route `roles` gate
@@ -54,10 +54,17 @@ matching `require_roles(ADMIN, AP_MANAGER)` on the write endpoints.
 | Bulk: delete | Yes | Yes | No | Yes |
 | Bulk: status change | Yes | Yes | Ready for Review / New only | Yes |
 | Bulk: export | Yes | Yes | Yes | Yes |
+| Vendor: adjudicate / revoke a sanctions false positive (`vendor.sanctions.adjudicate`) | Yes³ | No | No | Yes³ |
+| Vendor: block / unblock payments (`vendor.block`) | Yes⁴ | Yes⁴ | No | No |
 
 ¹ Until the invoice is submitted for review, and never on one that was ever
 approved. ² `new` / `rejected` rows; a historical `done` / `paid` row is
-refused per row.
+refused per row. ³ Not the vendor's onboarder, nor whoever requested,
+provisioned the requester of, or approved its current bank details. AP manager
+is deliberately excluded: it already onboards vendors, approves their bank
+details and executes runs (decisions §477). ⁴ Not by the adjudicator of the
+false positive covering a stored sanctions `match`
+(`vendor_unblock_adjudicator`): clearing a match takes two people.
 
 **The AP clerk enters invoices; segregation of duties sits at approval.** That
 is standard AP practice — intake, validation and GL coding are the clerk's job,
@@ -69,7 +76,11 @@ who edits an invoice someone else entered (or nobody did — email intake,
 PEPPOL) is added to `segregation_actor_ids`, so a clerk later given approval
 can still never approve figures they keyed. Receiving is separated the same
 way: whoever hand-recorded a live goods receipt on the invoice's PO is refused
-as its approver (`approval_segregation_receiver`; decisions §267).
+as its approver (`approval_segregation_receiver`; decisions §267), and a
+receipt an approver records afterwards does not lift that invoice's payment
+hold (decisions §389). Inspecting is separated the same way: whoever
+hand-recorded a quality inspection of those goods is refused as its approver
+(`approval_segregation_inspector`; decisions §404).
 
 The gates live in `backend/app/api/invoice_entry.py`: `INVOICE_ENTRY_ROLES`
 (admin, AP manager, AP clerk, CFO) on `POST /api/invoices`,
@@ -100,9 +111,10 @@ is **entry-only**:
   the row and records `auto_approve_suppressed` on the audit row);
 - `import-csv` takes open AP only.
 
-Approve / reject are gated on the `invoice.approve` permission
-(`require_permission`), which admin, AP manager and CFO hold by default and a
-clerk does not (`backend/app/api/permissions.py::ROLE_DEFAULT_PERMISSIONS`).
+Approve / reject, and recalling an approval back to review
+(`POST /recall-approval`, decisions §374), are gated on the `invoice.approve`
+permission (`require_permission`), which admin, AP manager and CFO hold by
+default and a clerk does not (`backend/app/api/permissions.py::ROLE_DEFAULT_PERMISSIONS`).
 The detail modal mirrors this with `canWrite` (a manage role, or an entry role
 inside the entry window) for Save, the line-item editor, the file controls,
 Extract and Reset; an entry-only caller's Submit is offered on a `new` invoice
@@ -118,28 +130,122 @@ Backend API endpoints are role-gated via `Depends(require_roles(...))` in `backe
 
 1. An admin navigates to **Admin > Users** and clicks **+ Invite User**
 2. They enter the user's **full name**, **email**, and select **roles**
-3. The system generates a **12-character temporary password** (alphanumeric)
-4. A confirmation dialog shows the credentials (email + temp password)
-5. The admin clicks **Copy to Clipboard** and shares the credentials with the user out-of-band (Slack, email, etc.)
-6. The user logs in at `<tenant>.localhost:7777/login` with their email and temp password
-7. The user can change their password via the **profile popover** in the sidebar
+3. The account is created with **no password**, and the user is emailed a
+   single-use **set-password link** to the tenant's own
+   `/login/reset-password?…&mode=set` page (`docs/decisions.md` §283 — the same
+   token, store and redemption as forgot-password)
+4. A confirmation dialog says where the link went and when it expires — it
+   shows **no credential**: whoever holds the link chooses the password, so the
+   admin never sees it
+5. The user opens the link, chooses their own password, and signs in
 
-The temporary password is shown **only once** — it is not stored or retrievable after the dialog is closed.
+The link works once and expires after `FEOH_SET_PASSWORD_LINK_TTL_HOURS`
+(default 72). If it expires or never arrives, **Reset password** on the user
+sends a fresh one, and Forgot password works for the account too. The email is
+the link's only channel, so a send failure is a `502
+set_password_email_failed` and no account is created; with no tenant base URL to
+point a link at, the invite is a `503 set_password_link_unavailable` before
+anything is created (`backend/app/api/set_password_links.py`).
+
+### An address can belong to only one workspace
+
+`users.email` is globally unique: one address is one account in one workspace,
+and there is no multi-workspace membership yet (tracked in
+[`followups.md`](followups.md) § Multi-workspace membership). So inviting, or
+renaming a user to, an address that is already taken is a `409` with one of two
+coded refusals, each stated in the reader's language
+(`frontend/src/lib/api/codedRefusals.ts`):
+
+| Code | When | What it tells the admin |
+|---|---|---|
+| `email_in_this_workspace` | A user in **this** workspace already has the address | They already exist here — find and edit them |
+| `email_in_other_workspace` | An account in **another** workspace has it | Use a different address for this person (for example their address at your company) — or, if they no longer use the other workspace, its administrator can close it, which frees the address |
+
+The second used to be a bare "Email already in use", which gave no way forward.
+It names no workspace and no account — but it still tells anyone holding
+`user.manage` that the address is on the platform somewhere. That signal is
+unavoidable while the address is global (refusing without saying why, or
+pretending to succeed, would either strand the admin or quietly create nothing),
+so it is **bounded instead**: each workspace may get 20 other-workspace
+refusals per hour (`admin.EMAIL_COLLISION_LIMIT`), checked before the lookup, so
+a sweep is throttled with a `429` and learns nothing more; a same-workspace hit
+does not spend the budget. While it is spent, **every** create and email rename
+in the workspace gets the coded `429` `email_check_throttled` (free addresses
+too — otherwise the 429 would be the oracle), with `Retry-After`; it lifts on
+its own within the hour. SCIM (`POST`/`PUT`/`PATCH /scim/v2/Users`) answers the
+same two cases as a SCIM `409 uniqueness` with the same distinction in its
+`detail`, without the budget — an IdP retries a doomed write on every reconcile
+cycle, and a throttle would turn that into a stuck provisioning job. An SSO
+sign-in whose IdP asserts such an address is refused the same way
+([`authentication.md`](authentication.md) § JIT user provisioning). Reasoning:
+[`decisions.md`](decisions.md) §291.
+
+### Freeing an address held by an abandoned workspace
+
+The common way into the second refusal is innocent: someone signed up for a
+trial with an address, never used it, and is now being added to their
+employer's workspace. Two things free the address, both on the **other**
+workspace's side:
+
+- **Another administrator there deletes the person's user** (Admin > Users >
+  Delete). The row goes, so the address is free at once.
+- **The person closes the workspace**, when they are its only active user:
+  **Organization → Close workspace** (`/organization?section=close`, admin only).
+  Closing deletes the workspace — its documents, its database and every account
+  in it — through the same code as the operator's `scripts/delete_tenant.py`, so
+  every address in it is free afterwards. It is refused, with the reasons listed
+  on the page, whenever the workspace holds anything that must be kept: other
+  active users, a supplier-portal login, approved invoices, payments, payment
+  runs, virtual cards, applied credit memos, approved expense reports, card
+  transactions, bank statements, tax filings or records, Positive Pay files,
+  e-invoices, goods receipts, stock pushed to a commerce platform, contracts
+  that have been in force, accepted discounts, approved supplier bank or tax
+  changes, data-subject request records, supplier statement reconciliations,
+  approved pre-approvals / requisitions / intake requests, received or closed
+  purchase orders, a paid subscription, a partner relationship or a custom
+  domain. Those go to support. Before anything is asked, the page also lists
+  what a closure WOULD delete (counts of invoices, vendors, purchase orders and
+  so on), so the decision is an informed one.
+
+  **What the deployment must provide.** In a deployed environment the closure
+  needs `FEOH_MFA_ENABLED` on (it takes a second factor, and the page says so
+  instead of offering a close that cannot succeed), a real write-once audit
+  archive (`FEOH_AUDIT_SHIPPING_ENABLED` with non-`mock` providers — the trail is
+  shipped and sealed before the database is dropped), and `local` audit mode. A
+  deployment missing any of these refuses every self-service closure with that
+  reason, and support closes the workspace. Local dev needs none of them.
+  The administrator types the workspace's slug back and, where MFA is on,
+  confirms a code or a passkey (a password alone is not enough, and an account
+  with no second factor enrolls one first). `POST /api/organization/close`;
+  reasoning and the full guard list: [`decisions.md`](decisions.md) §306.
+
+Neither one reveals anything about the other workspace to the inviter; the
+refusal's sentence only says that its administrator can close it.
 
 ## Resetting a user's password
 
-An admin never **chooses** another user's password — they reset it, and the
-server issues a temp exactly like an invite's (`docs/decisions.md` §276, #566):
+An admin never **chooses** — or sees — another user's password. They reset it,
+and the user is emailed a set-password link exactly like an invite's
+(`docs/decisions.md` §276, #566, §283):
 
 1. **Admin > Users**, open the user's **Edit** dialog
 2. Under **Password**, click **Reset password**, then **Confirm reset** (two
    clicks — a reset signs the user out everywhere)
-3. `POST /api/admin/users/:id/reset-password` generates a temp with the shared
-   generator, sets `must_change_password`, revokes every session the user
-   holds, emails the temp best-effort, and returns it once
-4. The **Password Reset** dialog shows the temp (Copy to Clipboard); relay it
-5. On sign-in with the temp the user is sent to `/change-password` and must
-   choose their own before using the app
+3. `POST /api/admin/users/:id/reset-password` clears the password (the old one
+   stops working at once), mints a single-use set-password token, emails the
+   link to the user's own address, then revokes every session the user holds
+4. The **Password Reset** dialog says where the link went and when it expires —
+   no credential
+5. The user opens the link and chooses a new password
+
+A reset also supersedes every earlier link for the account (an unused invite,
+a forgot-password link), and redeeming any link kills its siblings — a
+generation counter beside the tokens in `services/password_reset.py` — so no
+72-hour link outlives the password it was for.
+
+The token is minted and the email sent before the change commits: if either
+fails (`503 set_password_link_unavailable`, `502 set_password_email_failed`)
+nothing changes and the old password still works.
 
 Rules: `user.manage`; org-scoped (another tenant's user is a 404); the same
 out-rank guard as every other mutation (a `user.manage`-only role cannot reset
@@ -167,14 +273,14 @@ Invited (active) --> Deactivated --> Reactivated --> ...
 - **Deactivated**: Cannot log in. Account preserved for audit trail. Can be reactivated.
 - **Deleted**: Permanently removed. Use for users who were created by mistake. Prefer deactivation for users who have activity in the system.
 
-**Forced logout is not a lifecycle state.** A role change, a password reset and deactivation each drop the target's live sessions as a side effect. When you want *only* that — a stolen laptop, a shared credential you've just rotated — use `POST /api/admin/users/:id/revoke-sessions`; deactivating and reactivating to achieve it locks the user out for the duration and leaves a suspension in the audit trail that never happened. See [`authentication.md`](authentication.md) § Session management.
+**Forced logout is not a lifecycle state.** A role change, a password reset and deactivation each drop the target's live sessions as a side effect. When you want *only* that — a stolen laptop, a shared credential you've just rotated — use **Sign out everywhere** on the user's row in `/admin` (click, then **Confirm**; a toast reports how many sessions ended), which calls `POST /api/admin/users/:id/revoke-sessions` (`user.manage`, and the same out-rank guard as every other mutation). The action is not offered on your own row or on an inactive account, whose sessions deactivation already ended. Deactivating and reactivating to achieve it locks the user out for the duration and leaves a suspension in the audit trail that never happened. See [`authentication.md`](authentication.md) § Session management.
 
 ## Self-Service
 
 Users can update their own profile via the sidebar profile popover:
 
 - **Name**: Change display name
-- **Password**: Change password (requires current password for verification). Every self-service change — this one, the forced first-login change at `/change-password`, and `PATCH /api/auth/me` — writes a PII-free `auth.password.changed` audit row (`{"via": "change_password" | "profile", "forced": bool}`; `forced` is true when it replaced an admin- or signup-issued temp)
+- **Password**: Change password (requires current password for verification). Every self-service change — this one, the forced first-login change at `/change-password`, and `PATCH /api/auth/me` — writes a PII-free `auth.password.changed` audit row (`{"via": "change_password" | "profile", "forced": bool}`; `forced` is true when it replaced a temporary password — only an account still carrying one from before the set-password links, or a CLI-provisioned tenant admin, has one)
 
 Users cannot change their own email or roles.
 
@@ -187,11 +293,12 @@ Users cannot change their own email or roles.
 | GET | `/api/admin/users` | List all users in the organization (`user.manage`) |
 | GET | `/api/admin/roles` | List all available roles — the picker `role_names` is chosen from (`user.manage`) |
 | GET | `/api/admin/permissions` | The granular-permission catalog, key + label (`user.manage`) |
-| POST | `/api/admin/users` | Create a user (returns temp password) (`user.manage`) |
-| PATCH | `/api/admin/users/:id` | Update user name, email, roles or active status (`user.manage`). A field resent at its current value is not a change: it is not applied and not named in the `user.updated` audit row. A `password` field is refused (`422 admin_password_field_removed`) |
-| POST | `/api/admin/users/:id/reset-password` | Reset to a generated temp the user must change at next sign-in; revokes their sessions; returns the temp once (`user.manage`, org-scoped, out-rank guarded, not self, audited `user.password_reset`) |
+| POST | `/api/admin/users` | Create a user with no password and email them a set-password link; returns `set_password_link_expires_at`, never a credential (`user.manage`; `502` if the email fails, `503` with no tenant URL — nothing is created either way) |
+| PATCH | `/api/admin/users/:id` | Update user name, email, roles or active status (`user.manage`). A field resent at its current value is not a change: it is not applied and not named in the `user.updated` audit row, which records each changed role list, active flag and address before and after. A `password` field is refused (`422 admin_password_field_removed`). Removing the org's last active admin (demote or deactivate, self or not) is `409`, serialized on the organization row so two admins demoting each other cannot both pass |
+| POST | `/api/admin/users/:id/reset-password` | Clear the password (the old one dies at once), revoke the user's sessions and email them a set-password link; returns `set_password_link_expires_at` and `sessions_revoked`, never a credential (`user.manage`, org-scoped, out-rank guarded, not self, audited `user.password_reset` with `delivery: set_password_link`; a failed email is a `502` that changes nothing) |
 | POST | `/api/admin/users/:id/revoke-sessions` | Force-log-out a user without changing their account (`user.manage`, org-scoped, idempotent, audited) |
-| DELETE | `/api/admin/users/:id` | Permanently delete a user (cannot delete yourself) (`user.manage`) |
+| DELETE | `/api/admin/users/:id` | Permanently delete a user (cannot delete yourself; never the last active admin — `409`) (`user.manage`). Audited `user.deleted` with the account's `email`, `role_names` and `was_active`, written before the delete commits: if the record cannot be written the delete is refused (`503`) |
+| POST | `/api/admin/users/bulk-delete` | The same delete per id, best-effort (`user.manage`). Each row's delete and its `user.deleted` record stand or fall together (a savepoint per row); per-row failure reasons: `not_found`, `self`, `forbidden`, `blocked` (still referenced), `last_admin`, `audit_unavailable` |
 
 `user.manage` defaults to `admin` only — identical to the four endpoints'
 prior `require_roles(ROLE_ADMIN)` gate — but an org can grant it to a custom
@@ -235,7 +342,7 @@ Response (201):
     { "id": "uuid", "name": "ap_clerk", "description": "Enter and code invoices; prepare requisitions, intake and expenses" }
   ],
   "created_at": "2026-04-05T...",
-  "temporary_password": "aB3kLm9xPq2R"
+  "set_password_link_expires_at": "2026-04-08T..."
 }
 ```
 
@@ -285,7 +392,19 @@ organizations
 - **Token revocation**: Redis-backed blocklist (tokens are blocklisted on logout)
 - **Password hashing**: Bcrypt
 
-## Future Considerations
+## Users managed by an IdP (SCIM)
 
-- **Email invitations**: Send invite emails with a magic link or temp password via SMTP (admins currently hand temp passwords to invitees out-of-band)
-- **SCIM `/Groups`**: map IdP groups to our `Role` rows (`/Users` is shipped; group sync is not)
+An org on a plan with SCIM can let its IdP (Okta, Entra, Authentik) create,
+rename and deprovision users and map IdP groups onto roles —
+[`authentication.md` § SCIM 2.0](authentication.md#scim-20-user-provisioning-from-okta--entra).
+Those writes follow the admin rules above:
+
+- **They are on the trail.** `user.created` / `user.updated` with
+  `via: "scim"`, the same before-and-after shape as an admin edit, and a null
+  actor (the IdP's token is not a user).
+- **A deprovision signs the person out** — every session revoked, as an admin
+  deactivation does.
+- **The IdP cannot remove the last active admin.** A deprovision of that user,
+  or a group change that would take `admin` from them, is refused with a SCIM
+  `400 mutability` the IdP shows its admin, and audited. Make someone else an
+  admin here first.

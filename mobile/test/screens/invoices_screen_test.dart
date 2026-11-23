@@ -3,13 +3,14 @@ import 'dart:convert';
 
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/invoices_screen.dart';
 import 'package:feohledger_mobile/services/file_share.dart';
@@ -77,7 +78,7 @@ Future<void> _signInAs(
 // Wraps a screen with the localization delegates it now needs. No explicit
 // `locale` → defaults to `en`, so the English assertions below still hold.
 Widget _localized(Widget home) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: home,
     );
@@ -92,10 +93,11 @@ Map<String, dynamic> _invoiceJson(
   String id, {
   String status = 'pending',
   String vendor = 'Acme Corp',
+  String? number,
 }) =>
     {
       'id': id,
-      'invoice_number': 'INV-$id',
+      'invoice_number': number ?? 'INV-$id',
       'vendor_name': vendor,
       'amount': 100,
       'currency': 'USD',
@@ -110,6 +112,23 @@ Future<void> _pumpUntil(WidgetTester tester, Finder finder) async {
   for (var i = 0; i < 20 && finder.evaluate().isEmpty; i++) {
     await tester.pump(const Duration(milliseconds: 50));
   }
+}
+
+/// Scrolls the horizontal status-chip row until [chip] is built and on
+/// screen. The row is a lazy ListView, so a chip past the window's right
+/// edge does not exist until the row scrolls to it.
+Future<void> _scrollChipRowTo(WidgetTester tester, Finder chip) async {
+  await tester.scrollUntilVisible(
+    chip,
+    150,
+    scrollable: find
+        .ancestor(
+          of: find.byType(FilterChip).first,
+          matching: find.byType(Scrollable),
+        )
+        .first,
+  );
+  await tester.pump();
 }
 
 void main() {
@@ -183,20 +202,124 @@ void main() {
     expect(find.byType(InvoiceListTile), findsNothing);
   });
 
-  testWidgets('falls back to the empty state on a network error with no cache',
+  // A failed first load used to render "No invoices found" — on a dropped
+  // connection the user was told they had no invoices.
+  testWidgets('a failed load with no cache shows the error + Retry, not empty',
       (tester) async {
+    var calls = 0;
     ApiClient().debugConfigure(
-      client: MockClient((req) async => throw Exception('offline')),
+      client: MockClient((req) async {
+        calls++;
+        if (calls == 1) throw Exception('offline');
+        return _list([_invoiceJson('1')]);
+      }),
     );
 
     await tester.pumpWidget(_localized(const InvoicesScreen()));
-    await _pumpUntil(tester, find.text('No invoices found'));
+    await _pumpUntil(tester, find.widgetWithText(FilledButton, 'Retry'));
 
-    // No cached rows exist, so the store ends with an empty list + error set,
-    // and the screen shows its empty placeholder (not a spinner).
-    expect(find.text('No invoices found'), findsOneWidget);
-    expect(store.error, isNotNull);
+    expect(find.text('No invoices found'), findsNothing);
+    expect(store.loadError, isNotNull);
     expect(find.byType(CircularProgressIndicator), findsNothing);
+    // No server answered, so the connection sentence — never the exception.
+    expect(find.textContaining('Exception'), findsNothing);
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Retry'));
+    await _pumpUntil(tester, find.byType(InvoiceListTile));
+    expect(find.byType(InvoiceListTile), findsOneWidget);
+    expect(store.loadError, isNull);
+  });
+
+  testWidgets('a filter that matches nothing says so, and Show all clears it',
+      (tester) async {
+    final statuses = <String?>[];
+    ApiClient().debugConfigure(
+      client: MockClient((req) async {
+        final status = req.url.queryParameters['status'];
+        statuses.add(status);
+        return _list(status == null ? [_invoiceJson('1')] : []);
+      }),
+    );
+
+    await tester.pumpWidget(_localized(const InvoicesScreen()));
+    await _pumpUntil(tester, find.byType(InvoiceListTile));
+
+    // The chips are a lazy horizontal list; at the test window's width
+    // "Paid" sits past the right edge (and is not built), so scroll the row
+    // to it as a user would.
+    final paid = find.widgetWithText(FilterChip, 'Paid');
+    await _scrollChipRowTo(tester, paid);
+    await tester.tap(paid);
+    await _pumpUntil(tester, find.text('No invoices match these filters'));
+
+    expect(find.text('No invoices match these filters'), findsOneWidget);
+    // "No invoices found" under a chip would claim the whole list is empty.
+    expect(find.text('No invoices found'), findsNothing);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Show all'));
+    await _pumpUntil(tester, find.byType(InvoiceListTile));
+
+    expect(store.statusFilter, isNull);
+    expect(store.isFiltered, isFalse);
+    expect(statuses.last, isNull);
+    expect(find.byType(InvoiceListTile), findsOneWidget);
+  });
+
+  testWidgets('a paged list offers Load more and appends the next page',
+      (tester) async {
+    ApiClient().debugConfigure(
+      client: MockClient((req) async {
+        final number = int.parse(req.url.queryParameters['page'] ?? '1');
+        final first = (number - 1) * 20;
+        final count = (25 - first).clamp(0, 20).toInt();
+        return http.Response(
+          jsonEncode({
+            'items': [
+              for (var i = first; i < first + count; i++) _invoiceJson('$i'),
+            ],
+            'total': 25,
+            'page': number,
+            'page_size': 20,
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      }),
+    );
+
+    await tester.pumpWidget(_localized(const InvoicesScreen()));
+    await _pumpUntil(tester, find.byType(InvoiceListTile));
+
+    final loadMore = find.byKey(const ValueKey('list-load-more'));
+    await tester.scrollUntilVisible(
+      loadMore,
+      400,
+      scrollable: find
+          .descendant(
+            of: find.byType(CustomScrollView),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
+    expect(find.text('Showing 20 of 25'), findsOneWidget);
+
+    await tester.tap(loadMore);
+    for (var i = 0; i < 30 && store.invoices.length < 25; i++) {
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+
+    expect(store.invoices, hasLength(25));
+    await tester.scrollUntilVisible(
+      find.text('Showing all 25'),
+      400,
+      scrollable: find
+          .descendant(
+            of: find.byType(CustomScrollView),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
+    expect(find.byKey(const ValueKey('list-load-more')), findsNothing);
   });
 
   testWidgets('renders the search bar, status filter chips and camera action',
@@ -211,7 +334,13 @@ void main() {
     expect(find.byType(SearchBar), findsOneWidget);
     expect(find.widgetWithText(FilterChip, 'All'), findsOneWidget);
     expect(find.widgetWithText(FilterChip, 'Pending'), findsOneWidget);
+    expect(find.widgetWithText(FilterChip, 'Overdue'), findsOneWidget);
+    // The row is a lazy horizontal list: the chips past the window's right
+    // edge are built only once it scrolls to them.
+    await _scrollChipRowTo(
+        tester, find.widgetWithText(FilterChip, 'Approved'));
     expect(find.widgetWithText(FilterChip, 'Approved'), findsOneWidget);
+    await _scrollChipRowTo(tester, find.widgetWithText(FilterChip, 'Paid'));
     expect(find.widgetWithText(FilterChip, 'Paid'), findsOneWidget);
     expect(find.byIcon(Icons.camera_alt), findsOneWidget);
     // Advanced search action is present.
@@ -289,6 +418,97 @@ void main() {
 
     expect(store.statusFilter, 'approved');
     expect(lastStatus, 'approved');
+  });
+
+  // The Overdue quick view spans statuses, so it and a status chip are
+  // mutually exclusive: the chip row shows exactly one of them selected.
+  group('Overdue chip', () {
+    bool selected(WidgetTester tester, String label) =>
+        tester.widget<FilterChip>(find.widgetWithText(FilterChip, label))
+            .selected;
+
+    testWidgets('tapping it selects Overdue, deselects All and asks for it',
+        (tester) async {
+      String? lastOverdue;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          lastOverdue = req.url.queryParameters['overdue'];
+          return _list([]);
+        }),
+      );
+
+      await tester.pumpWidget(_localized(const InvoicesScreen()));
+      await _pumpUntil(tester, find.text('No invoices found'));
+      expect(selected(tester, 'All'), isTrue);
+      expect(selected(tester, 'Overdue'), isFalse);
+
+      await tester.tap(find.widgetWithText(FilterChip, 'Overdue'));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(store.overdueOnly, isTrue);
+      expect(store.statusFilter, isNull);
+      expect(lastOverdue, 'true');
+      expect(selected(tester, 'Overdue'), isTrue);
+      expect(selected(tester, 'All'), isFalse,
+          reason: 'All under the Overdue view would claim the whole list');
+    });
+
+    testWidgets('a status chip leaves the Overdue view', (tester) async {
+      String? lastOverdue;
+      String? lastStatus;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          lastOverdue = req.url.queryParameters['overdue'];
+          lastStatus = req.url.queryParameters['status'];
+          return _list([]);
+        }),
+      );
+
+      await tester.pumpWidget(_localized(const InvoicesScreen()));
+      await _pumpUntil(tester, find.text('No invoices found'));
+      await tester.tap(find.widgetWithText(FilterChip, 'Overdue'));
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(store.overdueOnly, isTrue);
+
+      await tester.tap(find.widgetWithText(FilterChip, 'Approved'));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(store.overdueOnly, isFalse);
+      expect(store.statusFilter, 'approved');
+      expect(lastStatus, 'approved');
+      expect(lastOverdue, isNull);
+      expect(selected(tester, 'Approved'), isTrue);
+      expect(selected(tester, 'Overdue'), isFalse);
+    });
+
+    testWidgets('showOverdue() empties a search the user typed',
+        (tester) async {
+      String? lastSearch;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          lastSearch = req.url.queryParameters['search'];
+          return _list([]);
+        }),
+      );
+
+      await tester.pumpWidget(_localized(const InvoicesScreen()));
+      await _pumpUntil(tester, find.text('No invoices found'));
+      await tester.enterText(find.byType(SearchBar), 'acme');
+      // Past the 300ms debounce, so the query reached the store.
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(lastSearch, 'acme');
+
+      // The dashboard's Overdue card, from outside this screen.
+      store.showOverdue();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(store.searchQuery, isNull);
+      expect(lastSearch, isNull);
+      final box = tester.widget<SearchBar>(find.byType(SearchBar));
+      expect(box.controller?.text, isEmpty,
+          reason: 'the box must not show a query the list no longer applies');
+      expect(selected(tester, 'Overdue'), isTrue);
+    });
   });
 
   testWidgets('typing in the search box drives the store search filter',
@@ -479,10 +699,22 @@ void main() {
             });
           }
           // One row moved/deleted, one skipped: exercises the plural and the
-          // skipped-count suffix in every result line.
+          // skipped-count suffix in every result line, and (for a status
+          // change) the per-row reason, stated from its code.
           if (req.url.path.endsWith('/bulk/status')) {
             return http.Response(
-                jsonEncode({'updated': 1, 'skipped': ['2']}), 200,
+                jsonEncode({
+                  'updated': 1,
+                  'skipped': [
+                    {
+                      'id': '2',
+                      'reason': 'invoice is in an immutable status (paid)',
+                      'code': 'invoice_status_immutable',
+                      'params': {'status': 'paid'},
+                    },
+                  ],
+                }),
+                200,
                 headers: json);
           }
           if (req.url.path.endsWith('/bulk/delete')) {
@@ -490,7 +722,10 @@ void main() {
                 jsonEncode({'deleted': 1, 'skipped': ['2']}), 200,
                 headers: json);
           }
-          return _list([_invoiceJson('1'), _invoiceJson('2')]);
+          return _list([
+            _invoiceJson('1', status: 'ready_for_review'),
+            _invoiceJson('2', status: 'ready_for_review'),
+          ]);
         }),
       );
       await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
@@ -500,7 +735,7 @@ void main() {
         // initState fetch) instead of updating the first run's.
         key: ValueKey(locale),
         locale: locale,
-        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        localizationsDelegates: appLocalizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
         home: const InvoicesScreen(),
       ));
@@ -526,12 +761,16 @@ void main() {
       await _pumpUntilTrue(tester, () => fake.calls >= 1);
       await tester.pumpAndSettle();
 
-      // Status: target sheet, then the result snackbar.
+      // Status: target sheet, then the result dialog naming the skipped row.
       await tester.tap(find.byIcon(Icons.swap_horiz));
       await tester.pumpAndSettle();
       capture();
       await tester.tap(find.widgetWithText(ListTile, l.invoiceStatusApproved));
-      await snack();
+      await _pumpUntil(tester, find.byType(AlertDialog));
+      await tester.pumpAndSettle();
+      capture();
+      await tester.tap(find.widgetWithText(TextButton, l.commonClose));
+      await tester.pumpAndSettle();
 
       // Delete: confirmation dialog, then the result snackbar.
       await selectBoth();
@@ -555,13 +794,15 @@ void main() {
       'Change status to…',
       'Delete invoices?',
       'Moved 1 invoice to Approved (1 skipped)',
+      'This invoice is Paid, so it can no longer be changed.',
       'Deleted 1 invoice (1 skipped)',
     ]));
     expectNoUntranslatedStrings(
       english: english,
       other: await runFlow(const Locale('ja')),
       // File-format names are the same token in every language.
-      allowed: {'CSV', 'XML'},
+      // An invoice number is the same token in every language too.
+      allowed: {'CSV', 'XML', 'INV-2'},
       surface: 'InvoicesScreen bulk flow',
     );
   });
@@ -668,6 +909,151 @@ void main() {
           find.widgetWithText(FilledButton, 'Reject'));
       expect(confirm.onPressed, isNull);
       expect(bodies, isEmpty);
+    });
+  });
+
+  // A bulk approve moves only rows awaiting review (backend decisions §418),
+  // and every row it skips says why.
+  group('bulk status picker and skipped rows', () {
+    MockClient listClient(
+      List<Map<String, dynamic>> rows, {
+      Object skipped = const <Object>[],
+    }) =>
+        MockClient((req) async {
+          final json = {'content-type': 'application/json'};
+          if (req.url.path == '/api/auth/login') {
+            return http.Response(
+                jsonEncode({'access_token': 'tok'}), 200, headers: json);
+          }
+          if (req.url.path == '/api/auth/me') {
+            return http.Response(jsonEncode(_me(['admin'])), 200,
+                headers: json);
+          }
+          if (req.url.path.endsWith('/bulk/status')) {
+            return http.Response(
+                jsonEncode({'updated': 1, 'skipped': skipped}), 200,
+                headers: json);
+          }
+          return _list(rows);
+        });
+
+    Future<void> openPicker(WidgetTester tester, List<String> ids) async {
+      await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
+      await tester.pumpWidget(_localized(const InvoicesScreen()));
+      await _pumpUntil(tester, find.byType(InvoiceListTile));
+      store.enterSelectionMode(ids.first);
+      for (final id in ids.skip(1)) {
+        store.toggleSelected(id);
+      }
+      await tester.pump();
+      await tester.tap(find.widgetWithText(TextButton, 'Status'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('offers Approved when every selected row awaits review',
+        (tester) async {
+      ApiClient().debugConfigure(
+        client: listClient([
+          _invoiceJson('1', status: 'ready_for_review'),
+          _invoiceJson('2', status: 'ready_for_review'),
+        ]),
+      );
+      await openPicker(tester, ['1', '2']);
+      expect(find.widgetWithText(ListTile, 'Approved'), findsOneWidget);
+    });
+
+    testWidgets('hides Approved when any selected row is not in review',
+        (tester) async {
+      ApiClient().debugConfigure(
+        client: listClient([
+          _invoiceJson('1', status: 'ready_for_review'),
+          _invoiceJson('2', status: 'new'),
+        ]),
+      );
+      await openPicker(tester, ['1', '2']);
+      expect(find.widgetWithText(ListTile, 'Approved'), findsNothing);
+      // The other targets are still there.
+      expect(find.widgetWithText(ListTile, 'Rejected'), findsOneWidget);
+    });
+
+    testWidgets('each skipped row is listed with its localized reason, else '
+        'the server\'s English', (tester) async {
+      ApiClient().debugConfigure(
+        client: listClient(
+          [
+            _invoiceJson('1', status: 'ready_for_review'),
+            _invoiceJson('2', status: 'ready_for_review'),
+            _invoiceJson('3', status: 'ready_for_review'),
+          ],
+          skipped: [
+            {
+              'id': '2',
+              'reason': 'server english',
+              'code': 'approval_segregation',
+              'params': <String, dynamic>{},
+            },
+            {'id': '3', 'reason': 'something this build cannot state'},
+          ],
+        ),
+      );
+      await openPicker(tester, ['1', '2', '3']);
+      await tester.tap(find.widgetWithText(ListTile, 'Approved'));
+      await _pumpUntil(tester, find.byType(AlertDialog));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Moved 1 invoice to Approved (2 skipped)'),
+          findsOneWidget);
+      final two = find.byKey(const ValueKey('bulk-skip-2'));
+      expect(find.descendant(of: two, matching: find.text('INV-2')),
+          findsOneWidget);
+      expect(
+        find.descendant(
+            of: two, matching: find.textContaining('Segregation of duties')),
+        findsOneWidget,
+      );
+      expect(find.text('server english'), findsNothing);
+      final three = find.byKey(const ValueKey('bulk-skip-3'));
+      expect(
+        find.descendant(
+            of: three,
+            matching: find.text('something this build cannot state')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a skipped row with no invoice number is named, not shown '
+        'by its id', (tester) async {
+      const id = '6f1c2e9a-0b7d-4c55-9a1e-3d2f4b5c6d7e';
+      ApiClient().debugConfigure(
+        client: listClient(
+          [_invoiceJson(id, status: 'ready_for_review', number: '')],
+          skipped: [
+            {'id': id, 'reason': 'skipped'},
+          ],
+        ),
+      );
+      await openPicker(tester, [id]);
+      await tester.tap(find.widgetWithText(ListTile, 'Approved'));
+      await _pumpUntil(tester, find.byType(AlertDialog));
+      await tester.pumpAndSettle();
+
+      final row = find.byKey(const ValueKey('bulk-skip-$id'));
+      expect(
+        find.descendant(of: row, matching: find.text('Invoice (no number)')),
+        findsOneWidget,
+      );
+      expect(find.textContaining(id), findsNothing);
+    });
+
+    testWidgets('a batch with no skips just confirms', (tester) async {
+      ApiClient().debugConfigure(
+        client: listClient([_invoiceJson('1', status: 'ready_for_review')]),
+      );
+      await openPicker(tester, ['1']);
+      await tester.tap(find.widgetWithText(ListTile, 'Approved'));
+      await _pumpUntil(tester, find.byType(SnackBar));
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(find.text('Moved 1 invoice to Approved'), findsOneWidget);
     });
   });
 }

@@ -37,6 +37,18 @@ export interface BillingSubscription {
 	trial_end: string | null;
 	/** True when a live provider (Stripe) owns the subscription. */
 	externally_managed: boolean;
+	/** A move to a free plan waiting for the end of the paid period
+	 *  (decisions §483); null when nothing is scheduled. */
+	scheduled_change: BillingScheduledChange | null;
+}
+
+/** A plan move that takes effect at the end of the paid period: the org keeps
+ *  its current plan, and everything in it, until `effective_at`. */
+export interface BillingScheduledChange {
+	plan_code: string;
+	plan_name: string;
+	/** ISO timestamp the move takes effect (a UTC period boundary). */
+	effective_at: string;
 }
 
 /** Usage-to-date for the current period. All values are exact strings.
@@ -265,6 +277,56 @@ export interface BillingPlansResponse {
 	plans: BillingPlan[];
 }
 
+/** What one plan in the picker adds, read off the catalog's own entitlements. */
+export interface PlanHighlights {
+	/** The next-cheaper plan this one grants everything of — "Everything in
+	 *  {builtOn}" — or null when there is none (the first plan, a predecessor
+	 *  that grants nothing, or a plan that drops a feature the one before it
+	 *  grants). */
+	builtOn: string | null;
+	/** Granted feature keys beyond `builtOn` (every granted key when it is
+	 *  null), in `order` with keys outside it last. */
+	added: string[];
+}
+
+/**
+ * Per-plan differentiators for the plan-change picker, keyed by plan code.
+ *
+ * `GET /api/billing/plans` returns feature entitlements only (`usage_components`
+ * — the AI-read allowance — and seats are not on the payload), so this says
+ * what each plan adds over the one before it and nothing else: the claim
+ * "Everything in X" is made only when X's granted set really is a subset, so a
+ * negotiated plan that drops a feature lists its own grants instead of
+ * inheriting a promise it does not keep. `plans` arrive cheapest first.
+ */
+export function planHighlights(
+	plans: readonly Pick<BillingPlan, 'code' | 'name' | 'entitlements'>[],
+	order: readonly string[] = []
+): Map<string, PlanHighlights> {
+	const rank = (k: string) => {
+		const i = order.indexOf(k);
+		return i === -1 ? order.length : i;
+	};
+	const granted = (p: Pick<BillingPlan, 'entitlements'>) =>
+		Object.entries(p.entitlements ?? {})
+			.filter(([, v]) => v === true)
+			.map(([k]) => k);
+	const out = new Map<string, PlanHighlights>();
+	let prev: { name: string; keys: Set<string> } | null = null;
+	for (const p of plans) {
+		const keys = granted(p);
+		const own = new Set(keys);
+		// An empty predecessor makes "Everything in X" true but says nothing.
+		const builds = prev !== null && prev.keys.size > 0 && [...prev.keys].every((k) => own.has(k));
+		const added = keys
+			.filter((k) => !(builds && prev!.keys.has(k)))
+			.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+		out.set(p.code, { builtOn: builds ? prev!.name : null, added });
+		prev = { name: p.name, keys: own };
+	}
+	return out;
+}
+
 /**
  * Mid-period proration for a plan change — an exact decimal STRING. Positive =
  * extra charge (upgrade), negative = credit (downgrade), `"0.00"` = no change /
@@ -277,9 +339,64 @@ export interface BillingPlanChangeProration {
 }
 
 /**
- * Result of `POST /api/billing/change-plan`. This call APPLIES the change —
- * there is no preview-only mode on the backend — so `changed` distinguishes a
- * real mutation from the idempotent no-op of "changing" to the plan the org is
+ * `POST /api/billing/change-plan/preview` — what a plan change would charge,
+ * priced by the billing provider and charging nothing (decisions §482). Every
+ * amount is the server's exact decimal STRING; the page renders them, never
+ * computes them. The confirm sends `proration_date`, `amount_due` and
+ * `currency` back ({@link BillingPlanChangeRequest}).
+ */
+export interface BillingPlanChangePreview {
+	plan_code: string;
+	/** Already on this plan: confirming changes nothing. */
+	already_on_plan: boolean;
+	currency: string;
+	/** Charged when the change is confirmed (never negative). */
+	amount_due: string;
+	/** Credited to the account balance instead (a downgrade), else `"0.00"`. */
+	credit: string;
+	/** What recurs after the change, and from when; null when nothing recurs. */
+	next_amount: string | null;
+	next_date: string | null;
+	/** Unix seconds the figures were priced at. */
+	proration_date: number;
+	/** After this the confirm is refused `plan_change_preview_stale`. */
+	expires_at: string;
+	/** A paid plan and no card on file: the dialog asks for one first. */
+	payment_method_required: boolean;
+	/** When the move takes effect, if not on confirm: a move to a free plan
+	 *  keeps the current plan until its period ends (decisions §483). Null =
+	 *  on confirm. */
+	effective_at: string | null;
+	/** Confirming also cancels the org's pending move to a free plan. */
+	clears_scheduled_change: boolean;
+}
+
+/** Body of `POST /api/billing/change-plan`: the target plan and the preview
+ *  the reader confirmed. The server refuses a quote that is stale or below
+ *  what the provider would now charge (decisions §482 names the limits:
+ *  AI-read overage accrued up to the change is billed on top). */
+export interface BillingPlanChangeRequest {
+	plan_code: string;
+	proration_date: number;
+	expected_amount_due: string;
+	currency: string;
+}
+
+/** Build the confirm body from the preview the reader saw — the amounts are
+ *  passed through as the server's strings, never re-derived. */
+export function planChangeRequestFrom(preview: BillingPlanChangePreview): BillingPlanChangeRequest {
+	return {
+		plan_code: preview.plan_code,
+		proration_date: preview.proration_date,
+		expected_amount_due: preview.amount_due,
+		currency: preview.currency
+	};
+}
+
+/**
+ * Result of `POST /api/billing/change-plan`. This call APPLIES the change the
+ * reader confirmed from its preview, so `changed` distinguishes a real
+ * mutation from the idempotent no-op of "changing" to the plan the org is
  * already on (no mutation, zero proration).
  */
 export interface BillingPlanChangeResponse {
@@ -287,4 +404,90 @@ export interface BillingPlanChangeResponse {
 	old_plan_code: string;
 	new_plan_code: string;
 	proration: BillingPlanChangeProration;
+	/** The move waits for the end of the paid period (paid → free): the org
+	 *  stays on `old_plan_code` until `effective_at`. */
+	scheduled: boolean;
+	effective_at: string | null;
+}
+
+/** Result of `POST /api/billing/scheduled-change/cancel` ("Keep {plan}"). */
+export interface BillingKeepPlanResponse {
+	/** False when nothing was pending (an idempotent retry). */
+	cleared: boolean;
+	plan_code: string;
+}
+
+/** Body of `POST /api/billing/payment-method/default`: the SetupIntent whose
+ *  confirmed card becomes the one the subscription charges. The response is the
+ *  refreshed {@link BillingPaymentMethodsResponse}. */
+export interface BillingSetDefaultPaymentMethodRequest {
+	setup_intent_id: string;
+}
+
+/** The billing adapter code that means "real Stripe" (`billing_adapters/stripe_billing.py`). */
+export const STRIPE_BILLING_PROVIDER = 'stripe_billing';
+
+/** The local-first billing adapter (`billing_adapters/mock_adapter.py`). */
+export const MOCK_BILLING_PROVIDER = 'mock';
+
+/**
+ * Which card form the add-card flow shows for a started SetupIntent:
+ *
+ * - `not_configured` — no SetupIntent (org never provisioned, provider off), or
+ *   an adapter this build has no card form for. Not an error: the page offers
+ *   a contact link.
+ * - `stripe` — real Stripe with a publishable key: mount the Payment Element.
+ * - `stripe_key_missing` — the backend runs Stripe but this build was made
+ *   without `PUBLIC_STRIPE_PUBLISHABLE_KEY`, an operator config gap. Stripe.js
+ *   must not load without a key, so the form cannot render.
+ * - `mock` — the local test provider: no card form, a "save test card" button.
+ */
+export type CardFormMode = 'not_configured' | 'stripe' | 'stripe_key_missing' | 'mock';
+
+export function cardFormMode(
+	setup: Pick<BillingSetupIntentResponse, 'provider' | 'configured' | 'client_secret' | 'setup_intent_id'>,
+	publishableKey: string | null | undefined
+): CardFormMode {
+	if (!setup.configured || !setup.setup_intent_id) return 'not_configured';
+	if (setup.provider === MOCK_BILLING_PROVIDER) return 'mock';
+	if (setup.provider === STRIPE_BILLING_PROVIDER) {
+		// Elements confirms against the client secret; without one there is
+		// nothing to mount, whatever the key.
+		if (!setup.client_secret) return 'not_configured';
+		return publishableKey && publishableKey.trim() ? 'stripe' : 'stripe_key_missing';
+	}
+	return 'not_configured';
+}
+
+/**
+ * The toast after a card is saved. Saving a card only charges anything through
+ * a live provider subscription (`externally_managed`, which only a paid plan
+ * has): with one, the subscription is now charged to this card; without one —
+ * a Free workspace adding a card on the way to an upgrade, or the local mock —
+ * the card is simply saved and nothing is charged yet.
+ */
+export function cardSavedMessageKey(
+	subscription: Pick<BillingSubscription, 'externally_managed'> | null | undefined
+): 'billing.card.saved' | 'billing.card.savedOnly' {
+	return subscription?.externally_managed ? 'billing.card.saved' : 'billing.card.savedOnly';
+}
+
+/** `POST /api/billing/change-plan` refused because the org has no saved card. */
+export const PAYMENT_METHOD_REQUIRED = 'payment_method_required';
+/** `POST /api/billing/change-plan` refused because the provider declined the upgrade charge. */
+export const BILLING_PAYMENT_DECLINED = 'billing_payment_declined';
+/** `POST /api/billing/change-plan` refused because the confirmed preview is out of
+ *  date (too old, another month, or the provider would now charge more). */
+export const PLAN_CHANGE_PREVIEW_STALE = 'plan_change_preview_stale';
+
+/**
+ * What the plan-change dialog offers beside a refusal: `add_card` when the org
+ * has no card yet, `update_card` when the card on file was declined, `null`
+ * for every other refusal (its localized message is the whole answer). Keyed
+ * on the refusal CODE, never on the (localized) message.
+ */
+export function planChangeCardAction(code: string | null | undefined): 'add_card' | 'update_card' | null {
+	if (code === PAYMENT_METHOD_REQUIRED) return 'add_card';
+	if (code === BILLING_PAYMENT_DECLINED) return 'update_card';
+	return null;
 }

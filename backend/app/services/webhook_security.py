@@ -19,9 +19,12 @@ past the dedup and replay the one-time effect.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
+import re
 
 from app.redis import get_redis
 
@@ -48,6 +51,85 @@ def verify_hmac_sha256(secret: str, raw_body: bytes, provided_hex: str | None) -
     except Exception:  # noqa: BLE001 — defensive: malformed input must fail closed
         return False
     return hmac.compare_digest(expected, provided_hex)
+
+
+def verify_hmac_sha256_base64(secret: str, raw_body: bytes, provided_b64: str | None) -> bool:
+    """:func:`verify_hmac_sha256` for a provider that sends the digest base64
+    encoded (Intuit's ``intuit-signature``) rather than hex.
+
+    Compares the raw digests, so padding or a re-encoding of the signature
+    cannot make two different digests compare equal. Same fail-closed rules:
+    an empty secret or signature, or one that is not base64, is False.
+    """
+    import base64
+    import binascii
+
+    if not secret or not provided_b64:
+        return False
+    try:
+        provided = base64.b64decode(provided_b64.strip(), validate=True)
+        expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    except (binascii.Error, ValueError):
+        return False
+    return hmac.compare_digest(expected, provided)
+
+
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]+={0,2}")
+_HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _decode_base64url(provided: str) -> bytes | None:
+    """The bytes a strict base64url signature encodes, or None.
+
+    Only the URL-safe alphabet (a standard-base64 ``+`` / ``/`` is refused),
+    padding optional."""
+    text = provided.strip()
+    if not _BASE64URL.fullmatch(text):
+        return None
+    bare = text.rstrip("=")
+    try:
+        return base64.urlsafe_b64decode(bare + "=" * (-len(bare) % 4))
+    except (binascii.Error, ValueError):
+        return None
+
+
+def well_formed_hex_sha256(provided: str | None) -> bool:
+    """Could ``provided`` be a :func:`verify_hmac_sha256` signature at all?
+
+    A shape check, no secret involved: 64 lower-case hex digits, the only form
+    that verifier can ever accept (it compares against ``hexdigest()``
+    exactly). A per-tenant webhook route asks this BEFORE it opens the tenant's
+    sealed key, so a request that could never verify costs no unseal
+    (decisions §408)."""
+    return bool(provided) and _HEX_SHA256.fullmatch(provided) is not None
+
+
+def well_formed_base64url_sha256(provided: str | None) -> bool:
+    """:func:`well_formed_hex_sha256` for :func:`verify_hmac_sha256_base64url`:
+    strict base64url that decodes to exactly a SHA-256 digest (32 bytes)."""
+    if not provided:
+        return False
+    decoded = _decode_base64url(provided)
+    return decoded is not None and len(decoded) == hashlib.sha256().digest_size
+
+
+def verify_hmac_sha256_base64url(secret: str, raw_body: bytes, provided_b64url: str | None) -> bool:
+    """:func:`verify_hmac_sha256` for a provider that sends the digest
+    base64url encoded (Merge.dev's ``X-Merge-Webhook-Signature``).
+
+    Strict: only the URL-safe alphabet is accepted (a standard-base64 ``+`` /
+    ``/`` is not), padding is optional, and the raw digests are compared, so
+    no re-encoding of the signature makes two different digests equal. Same
+    fail-closed rules: an empty secret or signature, or one that does not
+    decode, is False.
+    """
+    if not secret or not provided_b64url:
+        return False
+    provided = _decode_base64url(provided_b64url)
+    if provided is None:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, provided)
 
 
 async def is_event_already_processed(
@@ -98,19 +180,6 @@ async def release_event_claim(provider: str, event_id: str) -> None:
         await r.delete(f"{DEDUP_PREFIX}{provider}:{event_id}")
     except Exception:  # noqa: BLE001 — release is best-effort; never raise
         logger.warning("[webhook-dedup] failed to release claim for provider=%s", provider)
-
-
-async def event_claim_exists(provider: str, event_id: str) -> bool:
-    """Read-only: is a claim made by `is_event_already_processed` still live?
-
-    Never claims. For a caller migrating its claim-key format, which must still
-    honour claims written under the old format until their TTL has elapsed.
-    An empty event id was never claimed, so it reads as absent.
-    """
-    if not event_id:
-        return False
-    r = await get_redis()
-    return bool(await r.exists(f"{DEDUP_PREFIX}{provider}:{event_id}"))
 
 
 def extract_signature_header(headers: dict, *candidates: str) -> str | None:

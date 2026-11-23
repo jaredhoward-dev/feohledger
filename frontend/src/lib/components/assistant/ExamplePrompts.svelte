@@ -1,10 +1,37 @@
 <script lang="ts">
-	import { EXAMPLE_PROMPTS } from '#lib/types/assistant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 
-	// Clicking a prompt fills + sends it (the page wires `onpick`).
-	let { onpick }: { onpick: (prompt: string) => void } = $props();
+	// Clicking a prompt fills + sends it (the page wires `onpick`). The defaults
+	// are the AP assistant's; the cash-flow copilot passes its own prompts and
+	// copy so both chat surfaces share one empty state.
+	let {
+		onpick,
+		prompts,
+		heading,
+		sub
+	}: {
+		onpick: (prompt: string) => void;
+		/** Starter prompts, one button each, already localized. Defaults to the AP
+		 *  assistant's `assistant.example.*` set. */
+		prompts?: readonly string[];
+		/** Already-localized heading; defaults to `assistant.empty.heading`. */
+		heading?: string;
+		/** Already-localized sub-line; defaults to `assistant.empty.sub`. */
+		sub?: string;
+	} = $props();
+
+	// The default lives here, not as a constant beside the types: each prompt is
+	// both a button label and the message it sends, so it follows the active
+	// locale (an English-only default once showed in all six). `$derived`, so a
+	// locale switch relabels the buttons in place.
+	let list = $derived(
+		prompts ?? [
+			m('assistant.example.approvals'),
+			m('assistant.example.topVendors'),
+			m('assistant.example.poMismatch')
+		]
+	);
 </script>
 
 <div class="empty-state">
@@ -14,14 +41,14 @@
 		</svg>
 	</div>
 	<div class="help-row">
-		<h2>{m('assistant.empty.heading')}</h2>
+		<h2>{heading ?? m('assistant.empty.heading')}</h2>
 		<HelpTip term="ai-assistant" />
 	</div>
 	<p class="empty-sub">
-		{m('assistant.empty.sub')}
+		{sub ?? m('assistant.empty.sub')}
 	</p>
 	<div class="prompt-list">
-		{#each EXAMPLE_PROMPTS as prompt (prompt)}
+		{#each list as prompt (prompt)}
 			<button type="button" class="prompt-btn" onclick={() => onpick(prompt)}>
 				{prompt}
 			</button>
@@ -75,12 +102,12 @@
 		font-family: inherit;
 		font-size: 0.9rem;
 		cursor: pointer;
-		transition: all 0.12s;
+		transition: border-color 0.12s;
 	}
 
 	.prompt-btn:hover {
 		border-color: var(--accent);
 		color: var(--accent);
-		background: rgba(99, 140, 255, 0.06);
+		background: color-mix(in srgb, var(--accent) 6%, transparent);
 	}
 </style>

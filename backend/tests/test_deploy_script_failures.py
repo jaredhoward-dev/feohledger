@@ -17,6 +17,7 @@ the call that should fail. Nothing reaches Docker, AWS or a database.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -37,6 +38,14 @@ if [ -f "$STUB_DIR/rules" ]; then
 		[ "$tool" = "$name" ] || continue
 		case "$*" in
 		*"$pattern"*)
+			# A rule whose rc ends in "!" answers once: the first matching call
+			# gets it, later ones fall through to the next rule (or exit 0).
+			case "$rc" in *!)
+				mark="$STUB_DIR/once.$(printf '%s' "$tool|$pattern" | cksum | cut -d' ' -f1)"
+				[ -e "$mark" ] && continue
+				: > "$mark"
+				rc=${rc%!} ;;
+			esac
 			[ -z "$out" ] || printf '%b' "$out"
 			exit "$rc"
 			;;
@@ -75,8 +84,12 @@ class Deploy:
     def env_file(self, text: str) -> None:
         (self.dir / ".env").write_text(text)
 
-    def rule(self, tool: str, pattern: str, rc: int = 0, out: str = "") -> None:
-        self.rules.append(f"{tool}|{pattern}|{rc}|{out}")
+    def rule(
+        self, tool: str, pattern: str, rc: int = 0, out: str = "", *, once: bool = False
+    ) -> None:
+        """``once`` answers only the first matching call, e.g. a backup listing
+        that a successful deletion empties before the script lists it again."""
+        self.rules.append(f"{tool}|{pattern}|{rc}{'!' if once else ''}|{out}")
 
     def run(
         self, *args: str, path: str | None = None, extra_env: dict[str, str] | None = None
@@ -113,7 +126,7 @@ def _deploy(tmp_path: Path, script: str, *tools: str) -> Deploy:
 ADD_ARGS = ("acme", "--name", "Acme Corp", "--admin-email", "admin@acme.test")
 
 
-def test_add_tenant_stops_before_caddy_when_provisioning_fails(tmp_path: Path) -> None:
+def test_add_tenant_fails_when_provisioning_fails(tmp_path: Path) -> None:
     d = _deploy(tmp_path, "add-tenant.sh")
     d.env_file(LOCAL_ENV)
     d.rule("docker", "scripts/create_tenant.py", 1)
@@ -121,31 +134,22 @@ def test_add_tenant_stops_before_caddy_when_provisioning_fails(tmp_path: Path) -
     result = d.run(*ADD_ARGS)
 
     assert result.returncode != 0
-    assert not (d.dir / "tenants.caddy").exists(), "a host block was written for a failed tenant"
-    assert not d.called("caddy")
-
-
-def test_add_tenant_fails_when_caddy_does_not_take_the_host(tmp_path: Path) -> None:
-    d = _deploy(tmp_path, "add-tenant.sh")
-    d.env_file(LOCAL_ENV)
-    d.rule("docker", "--force-recreate --wait caddy", 1)
-
-    result = d.run(*ADD_ARGS)
-
-    assert result.returncode != 0
-    assert "caddy did not take" in result.stderr
     assert "tenant ready" not in result.stdout
 
 
 def test_add_tenant_succeeds_end_to_end_against_the_stubs(tmp_path: Path) -> None:
-    """The control case for the two above: the same stubs, nothing failing."""
+    """The control case for the one above: the same stubs, nothing failing. The
+    tenant host is CloudFront's wildcard (docs/decisions.md §364), so Caddy is
+    neither written to nor reloaded."""
     d = _deploy(tmp_path, "add-tenant.sh")
     d.env_file(LOCAL_ENV)
 
     result = d.run(*ADD_ARGS)
 
     assert result.returncode == 0, result.stderr
-    assert "acme.app.example.com {" in (d.dir / "tenants.caddy").read_text()
+    assert "tenant ready: https://acme.app.example.com" in result.stdout
+    assert not (d.dir / "tenants.caddy").exists()
+    assert not d.called("caddy")
 
 
 @pytest.mark.parametrize("env", [None, "POSTGRES_PASSWORD=x\n"])
@@ -179,7 +183,6 @@ def test_remove_tenant_stops_when_the_inventory_fails(tmp_path: Path, rc: int, w
     Only exit 4 (no such organisation) means that now."""
     d = _deploy(tmp_path, "remove-tenant.sh")
     d.env_file(LOCAL_ENV)
-    (d.dir / "tenants.caddy").write_text("acme.app.example.com {\n\timport spa\n}\n")
     d.rule("docker", "delete_tenant.py --slug acme --dry-run", rc)
     d.rule("aws", "list-object-versions", 0, BACKUP_LISTING)
 
@@ -189,7 +192,6 @@ def test_remove_tenant_stops_when_the_inventory_fails(tmp_path: Path, rc: int, w
     assert "inventory failed" in result.stderr
     assert not d.called("delete-object"), "backups were deleted"
     assert not d.called("--yes"), "the tenant deletion ran"
-    assert "acme.app.example.com {" in (d.dir / "tenants.caddy").read_text()
     assert "removed." not in result.stdout
 
 
@@ -206,11 +208,11 @@ def test_remove_tenant_with_nothing_left_anywhere_is_refused(tmp_path: Path) -> 
 
 def test_remove_tenant_already_deleted_skips_the_data_leg_visibly(tmp_path: Path) -> None:
     """The one deliberate skip: an organisation already gone (exit 4) leaves
-    the Caddy and backup legs to finish, and says it skipped the data."""
+    the backup leg to finish, and says it skipped the data."""
     d = _deploy(tmp_path, "remove-tenant.sh")
-    d.env_file("POSTGRES_PASSWORD=x\nAPP_DOMAIN=app.example.com\n")  # no backup store
-    (d.dir / "tenants.caddy").write_text("acme.app.example.com {\n\timport spa\n}\n")
+    d.env_file(LOCAL_ENV)
     d.rule("docker", "--dry-run", 4)
+    d.rule("aws", "list-object-versions", 0, BACKUP_LISTING, once=True)
 
     result = d.run("acme", "--yes")
 
@@ -218,7 +220,25 @@ def test_remove_tenant_already_deleted_skips_the_data_leg_visibly(tmp_path: Path
     assert "already deleted, or never existed" in result.stdout
     assert "tenant data already deleted — skipping" in result.stdout
     assert not d.called("delete_tenant.py --slug acme --yes")
-    assert "acme.app.example.com" not in (d.dir / "tenants.caddy").read_text()
+    assert d.called("delete-object")
+
+
+def test_remove_tenant_never_touches_caddy(tmp_path: Path) -> None:
+    """A platform tenant host is CloudFront's wildcard (docs/decisions.md §364):
+    a vanity block in tenants.caddy is left for the operator, and the script
+    says so, rather than being guessed at."""
+    d = _deploy(tmp_path, "remove-tenant.sh")
+    d.env_file(LOCAL_ENV)
+    vanity = "shop.acmecorp.com {\n\timport vanity\n}\n"
+    (d.dir / "tenants.caddy").write_text(vanity)
+    d.rule("aws", "list-object-versions", 0, BACKUP_LISTING, once=True)
+
+    result = d.run("acme", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert (d.dir / "tenants.caddy").read_text() == vanity
+    assert not d.called("caddy")
+    assert "vanity domain" in result.stdout
 
 
 def test_remove_tenant_keeps_the_backups_when_the_data_deletion_fails(tmp_path: Path) -> None:
@@ -368,6 +388,50 @@ def test_restore_fails_when_pg_restore_fails(tmp_path: Path) -> None:
     assert "restore complete" not in result.stdout
 
 
+IAM_ENV = (
+    "FEOH_DATABASE_URL=postgresql+asyncpg://feoh_app@db.example.internal:5432/feohledger\n"
+    "FEOH_DATABASE_IAM_AUTH=true\nPGSSLMODE=verify-full\n"
+    "APP_DOMAIN=app.example.com\nBACKUP_S3_BUCKET=feoh-backups\nAWS_REGION=us-east-1\n"
+)
+
+
+def test_restore_refuses_the_iam_app_role_before_touching_anything(tmp_path: Path) -> None:
+    """The app role cannot recreate pgvector, so a logical restore is the
+    master's (docs/decisions.md §310)."""
+    d = _deploy(tmp_path, "restore.sh")
+    d.env_file(IAM_ENV)
+
+    result = d.run("2026-10-19")
+
+    assert result.returncode != 0
+    assert "db-role-cutover.sh" in result.stderr and "master" in result.stderr
+    assert d.calls() == [], "a refused restore still ran a tool"
+
+
+def test_a_break_glass_restore_runs_as_the_master_and_leaves_the_api_stopped(
+    tmp_path: Path,
+) -> None:
+    """With the master URL in the shell for this one run, the restore proceeds —
+    and never rolls the api back up, which would hand it that master URL."""
+    d = _deploy(tmp_path, "restore.sh")
+    d.env_file(IAM_ENV)
+    d.rule("aws", "s3 ls", 0, DUMP_LISTING)
+
+    result = d.run(
+        "2026-10-19",
+        extra_env={
+            "FEOH_DATABASE_URL": "postgresql+asyncpg://postgres:pw@db.example.internal/feohledger",
+            "FEOH_DATABASE_IAM_AUTH": "false",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert d.called("pg_restore")
+    assert d.called("stop api")
+    assert not d.called("up -d --wait"), "the api came back up on the master's URL"
+    assert "./db-role-cutover.sh" in result.stdout and "api is left STOPPED" in result.stdout
+
+
 def test_restore_with_no_dumps_for_the_date_fails(tmp_path: Path) -> None:
     d = _deploy(tmp_path, "restore.sh")
     d.env_file(EXTERNAL_ENV)
@@ -430,14 +494,26 @@ def test_the_wrappers_refuse_without_an_env(tmp_path: Path, script: str) -> None
 BOOTSTRAP_TOOLS = ("sudo", "dnf", "docker", "sops", "aws", "curl", "swapon", "uname")
 
 
-def _bootstrap(tmp_path: Path, *tools: str) -> tuple[Deploy, str]:
+COMPOSE_PIN = re.search(
+    r"^COMPOSE_VERSION=v(\S+)$", (DEPLOY / "bootstrap-vm.sh").read_text(), re.M
+)[1]
+
+
+def _bootstrap(
+    tmp_path: Path, *tools: str, compose: str | None = COMPOSE_PIN
+) -> tuple[Deploy, str]:
     d = Deploy(tmp_path, "bootstrap-vm.sh", tools)
     # A PATH holding only the stubs and the handful of real tools the script
     # needs, so `command -v dnf` answers for the stub and nothing on this host
     # is ever reached.
-    for real in ("dirname", "cat", "grep"):
+    for real in ("dirname", "cat", "grep", "sed"):
         os.symlink(shutil.which(real), d.bin / real)
     d.rule("swapon", "--show", 0, "/swapfile file 2G\\n")
+    # The compose plugin the VM already runs (None: none installed). The stub
+    # answers the same before and after an install, as a plugin that loses to
+    # one earlier on docker's search path would.
+    if compose is not None:
+        d.rule("docker", "compose version --short", 0, f"{compose}\\n")
     return d, str(d.bin)
 
 
@@ -475,3 +551,133 @@ def test_bootstrap_off_ec2_skips_the_hop_limit_visibly(tmp_path: Path) -> None:
     assert "WARN: no EC2 instance metadata reachable" in result.stderr
     assert "bootstrap complete" in result.stdout
     assert not d.called("modify-instance-metadata-options")
+
+
+def test_bootstrap_leaves_the_pinned_compose_alone(tmp_path: Path) -> None:
+    d, path = _bootstrap(tmp_path, *BOOTSTRAP_TOOLS)
+    d.rule("curl", "169.254.169.254/latest/api/token", 22)
+
+    result = d.run(path=path, extra_env={"USER": "ec2-user"})
+
+    assert result.returncode == 0, result.stderr
+    assert not d.called("docker/compose/releases/download")
+
+
+@pytest.mark.parametrize("running", [None, "2.20.0", "5.0.1"])
+def test_bootstrap_converges_compose_on_the_pin(tmp_path: Path, running: str | None) -> None:
+    """Not merely "some compose is installed": CI checks deploy/ with exactly the
+    pinned version (scripts/install_vm_compose.sh), so a VM left on another one
+    after a bump runs a compose nothing tests (#569, #575). Here the stub keeps
+    answering the old version after the install, so the run must also fail
+    loudly instead of reporting a bootstrap that did not take."""
+    d, path = _bootstrap(tmp_path, *BOOTSTRAP_TOOLS, compose=running)
+    d.rule("curl", "169.254.169.254/latest/api/token", 22)
+
+    result = d.run(path=path, extra_env={"USER": "ec2-user"})
+
+    assert d.called(f"docker/compose/releases/download/v{COMPOSE_PIN}/docker-compose-linux-")
+    assert result.returncode != 0
+    assert f"installed docker compose v{COMPOSE_PIN}" in result.stderr
+    assert "bootstrap complete" not in result.stdout
+
+
+def test_every_runnable_deploy_script_is_committed_executable() -> None:
+    """The operator runs these as `./<script>.sh` on the VM, whose checkout takes
+    its file modes from git. `db-role-cutover.sh` shipped as 100644 and answered
+    "Permission denied" at the cutover's first step. The index mode is what the VM
+    gets, so that is what is checked; `lib.sh` is sourced, never run."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-s", "--", "deploy/*.sh"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    modes = {line.split("\t", 1)[1]: line.split()[0] for line in listing}
+    assert "deploy/db-role-cutover.sh" in modes, "the listing found no deploy scripts"
+    not_executable = sorted(
+        path for path, mode in modes.items() if mode != "100755" and path != "deploy/lib.sh"
+    )
+    assert not_executable == []
+
+
+# ── portability guard ────────────────────────────────────────────────────────
+#
+# These scripts run on the VM (Linux) and from contributors' Macs, and this
+# suite runs them on both: a GNU-only flag makes the tests red on macOS
+# (`date: illegal option -- d`). Each pattern is a construct BSD/macOS rejects
+# or bash 3.2 lacks; use the portable form named beside it.
+
+_GNU_ISMS = {
+    r"\bdate\b[^|;\n]*\s(-d|--date)\b": "relative/parsed dates: compute them in python3",
+    r"\bcp\b[^|;\n]*\s(-[a-zA-Z]*[TtrbuvnL]?--|--[a-z])": "GNU long options on cp",
+    r"\bcp\s+-[a-zA-Z]*[Tt]": "cp -T / -t (GNU only)",
+    r"\bsed\s+(-[a-zA-Z]*\s+)*-i(\s|$|[^a-zA-Z'\"])": (
+        "sed -i (needs a suffix on BSD): write a tmp file and mv"
+    ),
+    r"\breadlink\s+-[a-zA-Z]*f": "readlink -f: use cd + pwd -P",
+    r"\bstat\s+(-c|--format)": "stat -c: use wc -c or ls",
+    r"\bgrep\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*P": "grep -P: use grep -E",
+    r"\bxargs\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*r\b": "xargs -r: guard the empty case instead",
+    r"\bmktemp\s+--": "mktemp long options: use -d / a XXXXXX template",
+    r"\b(mapfile|readarray)\b": "mapfile (bash 4+; macOS ships 3.2): use a read loop",
+    r"\$\(date [^)]*%N": "date %N (GNU only)",
+}
+
+
+def _code_lines(path: Path) -> list[tuple[int, str]]:
+    return [
+        (n, line)
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if not line.lstrip().startswith("#")
+    ]
+
+
+def test_deploy_scripts_use_only_portable_flags() -> None:
+    scripts = sorted(DEPLOY.glob("*.sh"))
+    assert scripts, "no deploy/*.sh found — the guard would pass vacuously"
+    hits = [
+        f"{p.name}:{n}: {why}: {line.strip()}"
+        for p in scripts
+        for n, line in _code_lines(p)
+        for pattern, why in _GNU_ISMS.items()
+        if re.search(pattern, line)
+    ]
+    assert not hits, "GNU-only constructs in deploy/:\n" + "\n".join(hits)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'cutoff=$(date -u -d "-30 days" +%F)',
+        "cp -T a b",
+        "cp --archive a b",
+        "sed -i 's/a/b/' f",
+        "sed -E -i 's/a/b/' f",
+        "readlink -f x",
+        "stat -c %s f",
+        "grep -oP 'x' f",
+        "xargs -r rm",
+        "mktemp --tmpdir x",
+        "mapfile -t A < f",
+        'n="$(date +%s%N)"',
+    ],
+)
+def test_portability_guard_catches(line: str) -> None:
+    assert any(re.search(p, line) for p in _GNU_ISMS), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "STAMP=$(date -u +%F)",
+        "cp tenants.caddy.example tenants.caddy",
+        'aws s3 cp - "${PREFIX}/x.dump"',
+        "sed -nE 's/a/b/p' f",
+        "grep -Eq '^x$' f",
+        "work=$(mktemp -d)",
+        "pg_dump -U postgres -Fc -d feohledger",
+    ],
+)
+def test_portability_guard_allows(line: str) -> None:
+    assert not any(re.search(p, line) for p in _GNU_ISMS), line

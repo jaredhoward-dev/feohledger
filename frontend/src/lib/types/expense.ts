@@ -3,7 +3,9 @@
 // `ExpenseResponse` / `ExpenseReportResponse`). Money fields arrive as
 // numbers (backend `float(...)`); date/datetime fields are ISO strings.
 
+import type { ActionRefusal } from '#lib/api/actionVerdicts.ts';
 import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
+import type { ImportResult } from '#lib/types/csvImport.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import type { MoneyAmount, MoneyString } from '#lib/utils/money.ts';
 
@@ -190,8 +192,19 @@ export const EXPENSE_REPORT_STATUS_TONES: Record<ExpenseReportStatus, BadgeTone>
 // string the badge tooltip renders.
 export interface PolicyViolation {
 	code: string;
+	/** The server's English sentence — the fallback for a code (or a stored
+	 *  row) this build cannot state. Render through `policyViolationText`. */
 	message: string;
+	/**
+	 * What the sentence is stated from (`expense_policy.VIOLATION_PARAMS`,
+	 * decisions §378): `amount` / `amount_currency`, `limit` / `currency`,
+	 * `comparison`, plus `category` or `miles` / `rate` / `direction` by code.
+	 * Absent on a row stored before the params existed.
+	 */
+	params?: Record<string, unknown>;
 	policy_id?: string;
+	/** The report line the violation is on — set on the submit 422's list. */
+	expense_id?: string;
 	/** Exact decimal strings — money never round-trips as a JS number. */
 	limit?: string;
 	actual?: string;
@@ -238,8 +251,48 @@ export interface Expense {
 	status: string;
 	reimbursable: boolean;
 	mileage_miles: number | null;
+	// Who created the line — its owner while it sits on no report, and the
+	// only person who may put it on one (decisions §434). null for a line
+	// written before migration 0134 (no recorded creator).
+	created_by_user_id: string | null;
 	created_at: string;
 	updated_at: string;
+}
+
+/**
+ * Whether `userId` counts as this line's creator, the one question both
+ * §434 gates ask: `services/expense_controls.expense_creator_refusal` (only
+ * a LOOSE line's creator may change its claim fields, replace its receipt or
+ * delete it) and `.report_line_creator_refusal` (a line goes only onto a
+ * report its creator owns). A NULL creator is a line written before migration
+ * 0134; there is no recorded owner to refuse on, so it passes, as it does on
+ * the server.
+ *
+ * This is a mirror, not a verdict: the expense list ships no per-row
+ * refusal (frontend/docs/ui-patterns.md § Whether to offer an action), so
+ * this is the one place the page restates the rule. It only decides what to
+ * offer; the server still refuses, and its coded refusal is localized.
+ */
+export function isLineCreator(
+	expense: Pick<Expense, 'created_by_user_id'>,
+	userId: string | null | undefined
+): boolean {
+	const creator = expense.created_by_user_id;
+	return creator == null || (userId != null && creator === userId);
+}
+
+/**
+ * Whether `userId` may author this line: change its claim fields, replace its
+ * receipt, delete it. A line on a report is its report owner's, which the
+ * endpoint gates separately, so only a LOOSE line is judged here
+ * (`api/expenses._require_loose_line_creator`). GL coding stays open to
+ * every entry role either way.
+ */
+export function canAuthorLooseLine(
+	expense: Pick<Expense, 'report_id' | 'created_by_user_id'>,
+	userId: string | null | undefined
+): boolean {
+	return expense.report_id != null || isLineCreator(expense, userId);
 }
 
 export interface ExpenseListResponse {
@@ -297,6 +350,21 @@ export interface ExpenseReport {
 	expenses: Expense[];
 	created_at: string;
 	updated_at: string;
+	// The caller's verdict on each report action — on the list and
+	// `GET /expense-reports/{id}` only, never on a mutation response
+	// (decisions §305). Absent is a refusal: read it through
+	// `#lib/api/actionVerdicts.ts`, never beside a restated rule.
+	actions?: ExpenseReportActions;
+}
+
+/** `ExpenseReportActions` (backend `api/expenses.report_action_refusals`):
+ *  `null` = the endpoint would accept the caller, else its coded refusal.
+ *  `compose` is attach / detach. */
+export interface ExpenseReportActions {
+	submit: ActionRefusal;
+	approve: ActionRefusal;
+	reject: ActionRefusal;
+	compose: ActionRefusal;
 }
 
 export interface ExpenseReportListResponse {
@@ -532,6 +600,17 @@ export interface CorporateCardTransaction {
 	import_batch: string | null;
 	created_at: string;
 	updated_at: string;
+	// The caller's verdict on each row action — list rows only (absent on a
+	// mutation response, which reads as a refusal).
+	actions?: CorporateCardTransactionActions;
+}
+
+/** Backend `api/expense_cards.card_txn_action_refusals`. */
+export interface CorporateCardTransactionActions {
+	match: ActionRefusal;
+	create_expense: ActionRefusal;
+	unmatch: ActionRefusal;
+	ignore: ActionRefusal;
 }
 
 export interface CardTransactionListResponse {
@@ -548,13 +627,10 @@ export interface CardMatchSuggestion {
 	score: number;
 }
 
-// POST /import-csv returns the shared `ImportResult.to_dict()` — `imported` /
-// `skipped` / `errors`.
-export interface CardImportResult {
-	imported: number;
-	skipped: number;
-	errors: { row: number; message: string }[];
-}
+/** `POST /import-csv` — the shared skip-and-report shape. Every row error
+ *  carries `{code, params}` (decisions §377); render it with
+ *  `components/ui/CsvImportErrors.svelte`. */
+export type CardImportResult = ImportResult;
 
 // POST /sync-virtual-cards return shape — created vs already-imported.
 export interface SyncVirtualCardsResult {

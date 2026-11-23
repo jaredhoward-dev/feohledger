@@ -34,8 +34,23 @@ export interface ErpProviderField {
 	 * Says where the stored secrets are sent (a host, account, tenant,
 	 * company or environment). Changing one starts a new connection: the
 	 * backend keeps no stored secret across it, so neither does the form.
+	 * Decided per provider by the backend catalogue, which applies the same
+	 * flag itself (`catalog.destination_keys`): Business Central's
+	 * `environment` is one, QuickBooks' (two Intuit hosts) is not.
 	 */
 	destination?: boolean;
+	/**
+	 * The field applies only while another field of this provider holds one
+	 * of `values` (NetSuite's OAuth 2.0 vs TBA credentials): hidden, and not
+	 * required, otherwise. See `fieldApplies`.
+	 */
+	show_when?: { field: string; values: string[] };
+	/**
+	 * What a SAVED configuration without this key means — the adapter's own
+	 * reading of the absent key. Shown instead of the first option, so a form
+	 * opened on an older connection does not silently switch it on save.
+	 */
+	stored_default?: string;
 }
 
 export interface ErpProvider {
@@ -66,6 +81,25 @@ export interface ErpOAuthProviderStatus {
 	client_source: 'tenant' | 'platform' | null;
 }
 
+/**
+ * Today's (UTC) API calls on an ERP whose quota is shared across tenants and
+ * budgeted per org — Blackbaud SKY (`services/erp_call_budget`, decisions
+ * §322 / §324). Absent for any other ERP, and when the counts can't be read.
+ */
+export interface ErpCallUsage {
+	/** `org_share`: this org's calls against its share of the platform key.
+	 *  `subscription`: every call on the org's own key, against its quota. */
+	scope: 'org_share' | 'subscription' | string;
+	used: number;
+	/** Null when no limit applies (a share or quota configured as 0). */
+	limit: number | null;
+	/** The next 00:00 UTC, when the counts reset. */
+	resets_at: string;
+	/** `rate_limited` | `subscription_quota` | `tenant_budget`, while refused. */
+	paused_reason: string | null;
+	paused_until: string | null;
+}
+
 /** `GET /api/organization/erp/oauth/status` (`api/erp_oauth.py`). No tokens. */
 export interface ErpOAuthStatus {
 	provider: string | null;
@@ -75,7 +109,22 @@ export interface ErpOAuthStatus {
 	external_tenant_id?: string | null;
 	expires_at?: string | null;
 	refresh_token_expires_at?: string | null;
+	/** Inside the first expiry-notice lead time: offer Reconnect now (§295). */
+	expires_soon?: boolean;
+	/** Why `needs_reconnect`: `refresh_token_expired` | `refresh_token_revoked`. */
+	reconnect_reason?: string | null;
 	connected_at?: string | null;
+	/** Today's call usage on a shared-quota ERP (Blackbaud); see `callUsageLines`. */
+	call_usage?: ErpCallUsage | null;
+	/** `POST …/oauth/status-sync` would run a pass now (decisions §392): the
+	 *  server's verdict, by the rule the POST itself applies. */
+	status_sync_available?: boolean;
+	/** Why not, as the POST's 409 code (`status_sync_off` /
+	 *  `status_sync_unsupported` / `status_sync_needs_reconnect`). */
+	status_sync_refusal?: string | null;
+	/** Permissions the consent was found not to cover, coded (decisions §415):
+	 *  `payments_scope_missing`. Reconnecting grants them; see `oauthScopeGapKeys`. */
+	scope_gaps?: string[];
 	/** What a bring-your-own app must register as its redirect URI. */
 	redirect_uri: string;
 	providers: ErpOAuthProviderStatus[];
@@ -106,7 +155,9 @@ const OPTION_LABEL_KEYS: Record<string, MessageKey> = {
 	DRAFT: 'org.erp.option.DRAFT',
 	Pending: 'org.erp.option.Pending',
 	Approved: 'org.erp.option.Approved',
-	other: 'org.erp.option.other'
+	other: 'org.erp.option.other',
+	oauth2_m2m: 'org.erp.option.oauth2_m2m',
+	tba: 'org.erp.option.tba'
 };
 
 export function optionLabelKey(option: string): MessageKey | null {
@@ -164,9 +215,17 @@ export function initialValues(
 		const raw = sameProvider ? stored?.[f.name] : undefined;
 		const value = typeof raw === 'string' ? raw : '';
 		values[f.name] = f.secret ? '' : value;
+		if (!f.secret && !values[f.name] && sameProvider && f.stored_default) {
+			values[f.name] = f.stored_default;
+		}
 		if (!f.secret && !values[f.name] && f.options?.length) values[f.name] = f.options[0];
 	}
 	return values;
+}
+
+/** Does `f` apply to what the form currently says (its `show_when`)? */
+export function fieldApplies(f: ErpProviderField, values: Record<string, string>): boolean {
+	return !f.show_when || f.show_when.values.includes(values[f.show_when.field] ?? '');
 }
 
 /**
@@ -296,7 +355,8 @@ export function byoAppRequired(provider: ErpProvider, status: ErpOAuthStatus | n
  * Required fields still empty. A required secret that is already stored counts
  * as filled, since leaving it blank keeps it, unless the admin chose to remove
  * it (`clear[name]`). With `requireByoApp` the optional client id + secret
- * pair counts as required: there is no other app to connect through.
+ * pair counts as required: there is no other app to connect through. A field
+ * that does not apply to the current choice (`fieldApplies`) is never missing.
  */
 export function missingRequired(
 	provider: ErpProvider,
@@ -308,6 +368,7 @@ export function missingRequired(
 	const clear = opts.clear ?? {};
 	return provider.fields.filter(
 		(f) =>
+			fieldApplies(f, values) &&
 			(f.required || (opts.requireByoApp === true && BYO_APP_FIELDS.includes(f.name))) &&
 			!(values[f.name] ?? '').trim() &&
 			!(secretIsSaved(provider, f, stored, storedNames, values) && clear[f.name] !== true)
@@ -326,11 +387,140 @@ export function oauthConnectionState(
 	return status.connected ? 'connected' : 'not_connected';
 }
 
-/** The `?erp_connected=` / `?erp_error=` return from the OAuth callback. */
+/**
+ * The sentence for a connection that needs the admin's attention, or null:
+ * why it must be reconnected (`reconnect_reason`, decisions §295), or that it
+ * expires soon. A reason this build does not know reads as the generic
+ * "expired" sentence it always showed.
+ */
+export function oauthAttentionKey(
+	providerKey: string,
+	status: ErpOAuthStatus | null
+): MessageKey | null {
+	const state = oauthConnectionState(providerKey, status);
+	if (state === 'needs_reconnect') {
+		if (status?.reconnect_reason === 'refresh_token_revoked') {
+			return 'org.erp.oauth.needsReconnectRevoked';
+		}
+		if (status?.reconnect_reason === 'refresh_token_expired') {
+			return 'org.erp.oauth.needsReconnectExpired';
+		}
+		return 'org.erp.oauth.needsReconnect';
+	}
+	if (state === 'connected' && status?.expires_soon && status.refresh_token_expires_at) {
+		return 'org.erp.oauth.expiresSoon';
+	}
+	return null;
+}
+
+/** The sentence for each coded scope gap (decisions §415). */
+const SCOPE_GAP_KEYS: Record<string, MessageKey> = {
+	payments_scope_missing: 'org.erp.oauth.scopeGapPayments'
+};
+
+/**
+ * The sentences for a connected ERP whose consent lacks a permission
+ * FeohLedger now asks for (`scope_gaps`, decisions §415), one per gap: what
+ * is limited until the admin reconnects. A code this build does not know
+ * reads as the generic "missing a permission" sentence; repeats collapse.
+ * Empty unless connected (a connection that needs reconnecting says so
+ * already).
+ */
+export function oauthScopeGapKeys(
+	providerKey: string,
+	status: ErpOAuthStatus | null
+): MessageKey[] {
+	if (oauthConnectionState(providerKey, status) !== 'connected') return [];
+	const keys = (status?.scope_gaps ?? []).map(
+		(code) => SCOPE_GAP_KEYS[code] ?? ('org.erp.oauth.scopeGap' as MessageKey)
+	);
+	return [...new Set(keys)];
+}
+
+/** The `?erp_connected=` / `?erp_error=` / `?erp_choose_company=` return
+ *  from the OAuth callback. `choose`: the consent reached several companies
+ *  and waits, server-side, for the admin to pick one (decisions §355). */
 export type OAuthReturn =
 	| { kind: 'connected'; provider: string }
+	| { kind: 'choose'; provider: string }
 	| { kind: 'error'; code: string }
 	| null;
+
+/** `POST /api/organization/erp/oauth/disconnect`. `revocation` says whether
+ *  the provider ended the grant: `failed` (it did not confirm) and
+ *  `unsupported` (it has no revocation endpoint — Blackbaud) both leave it
+ *  possibly live there, so the admin is told to remove the app on the
+ *  provider's side (decisions §371). Null when nothing was connected. */
+export interface ErpDisconnectResult {
+	disconnected: boolean;
+	revoked: boolean;
+	revocation: 'revoked' | 'failed' | 'unsupported' | null;
+}
+
+/** The sentence a Disconnect ends with, and its tone. Only a confirmed
+ *  revocation is plain success; anything else tells the admin what is still
+ *  theirs to do at the provider. An unknown outcome reads as `failed`. */
+export function disconnectMessage(result: ErpDisconnectResult | null | undefined): {
+	key: MessageKey;
+	tone: 'success' | 'failure';
+} {
+	switch (result?.revocation) {
+		case 'revoked':
+			return { key: 'org.erp.oauth.disconnected', tone: 'success' };
+		case 'unsupported':
+			return { key: 'org.erp.oauth.disconnectedRemoveAtProvider', tone: 'failure' };
+		default:
+			return { key: 'org.erp.oauth.disconnectedNotRevoked', tone: 'failure' };
+	}
+}
+
+/**
+ * Offer "Check payments now" (`POST …/oauth/status-sync`, decisions §392)?
+ * Only on the connected ERP, and only while the server says a pass would run
+ * (`status_sync_available`): the button follows the POST's own rule rather
+ * than guessing from the provider. An older server that sends no verdict
+ * offers nothing.
+ */
+export function statusSyncNowOffered(providerKey: string, status: ErpOAuthStatus | null): boolean {
+	return (
+		oauthConnectionState(providerKey, status) === 'connected' &&
+		status?.status_sync_available === true
+	);
+}
+
+/** `202 {started}`: a pass began, or one was already running (`started:
+ *  false`, nothing started twice). Either way the invoices it moves update as
+ *  it reads them. */
+export function statusSyncStartedKey(started: boolean): MessageKey {
+	return started ? 'org.erp.oauth.checkPaymentsStarted' : 'org.erp.oauth.checkPaymentsRunning';
+}
+
+/** `GET /api/organization/erp/oauth/pending`: the companies a parked consent
+ *  offers. Never a token — those stay sealed server-side. */
+export interface ErpPendingConnect {
+	provider: string;
+	display_name: string;
+	companies: { id: string; name: string }[];
+	expires_at: string;
+}
+
+/** The coded refusals a company pick can end in, each with its sentence.
+ *  `erp_pick_expired` covers "lapsed", "already used" and "not this browser";
+ *  the server folds them together and so does this. */
+export const PICK_REFUSAL_KEYS = {
+	erp_pick_expired: 'org.erp.oauth.pick.expired',
+	erp_pick_unknown_company: 'org.erp.oauth.pick.unknownCompany',
+	already_linked: 'org.erp.oauth.error.alreadyLinked',
+	credentials_unavailable: 'org.erp.oauth.error.credentialsUnavailable',
+	audit_unavailable: 'org.erp.oauth.error.auditUnavailable'
+} as const satisfies Record<string, MessageKey>;
+
+/** A pick refusal's message key, or null for a code this build does not know
+ *  (the caller then shows the server's sentence). */
+export function pickRefusalKey(code: string | null | undefined): MessageKey | null {
+	if (!code || !Object.hasOwn(PICK_REFUSAL_KEYS, code)) return null;
+	return PICK_REFUSAL_KEYS[code as keyof typeof PICK_REFUSAL_KEYS];
+}
 
 /** The OAuth callback's `erp_error` codes an admin can act on, each with its
  * own explanation. Any other code falls back to the generic message. */
@@ -345,13 +535,41 @@ export const OAUTH_ERROR_KEYS = {
 	already_linked: 'org.erp.oauth.error.alreadyLinked',
 	credentials_unavailable: 'org.erp.oauth.error.credentialsUnavailable',
 	audit_unavailable: 'org.erp.oauth.error.auditUnavailable',
+	// The callback came from a browser without the nonce cookie the authorize
+	// call set (login-CSRF binding, `backend/app/api/erp_oauth.py`).
+	browser_mismatch: 'org.erp.oauth.error.browserMismatch',
 } as const satisfies Record<string, MessageKey>;
+
+/** The 409 `GET …/oauth/{provider}/authorize` answers when this host cannot
+ *  carry the browser-binding cookie — a white-label custom domain, whose `/api`
+ *  is a same-origin proxy, never the API host the callback is on. */
+export const CONNECT_FROM_PLATFORM_HOST = 'erp_connect_platform_host';
+
+/**
+ * Where that refusal says to connect from instead: `params.url`, only when it
+ * is an absolute http(s) URL, else null (the server offered none, or sent
+ * something this page will not turn into a link).
+ */
+export function platformConnectUrl(params: Record<string, unknown>): string | null {
+	const raw = params.url;
+	if (typeof raw !== 'string') return null;
+	try {
+		const url = new URL(raw);
+		return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+	} catch {
+		return null;
+	}
+}
 
 /** Bounded so a crafted URL can't put a paragraph into the status line. */
 const RETURN_PARAM_LIMIT = 64;
 
 /** The query parameters the OAuth callback appends on its way back. */
-export const OAUTH_RETURN_PARAMS: readonly string[] = ['erp_connected', 'erp_error'];
+export const OAUTH_RETURN_PARAMS: readonly string[] = [
+	'erp_connected',
+	'erp_error',
+	'erp_choose_company'
+];
 
 /**
  * `url` without the OAuth return parameters (path + query, the shape
@@ -370,5 +588,108 @@ export function readOAuthReturn(params: Pick<URLSearchParams, 'get'>): OAuthRetu
 	if (error) return { kind: 'error', code: error.slice(0, RETURN_PARAM_LIMIT) };
 	const connected = params.get('erp_connected');
 	if (connected) return { kind: 'connected', provider: connected.slice(0, RETURN_PARAM_LIMIT) };
+	const choose = params.get('erp_choose_company');
+	if (choose) return { kind: 'choose', provider: choose.slice(0, RETURN_PARAM_LIMIT) };
 	return null;
+}
+
+/**
+ * What `POST /api/organization/test-erp` answers. `code` says what happened
+ * (`connected`, `connection_failed`, `credentials_unavailable`,
+ * `unknown_adapter`); `provider` is the ERP's catalogue key (the Merge.dev
+ * linked ERP for a Merge.dev connection), `adapter` the unsupported key.
+ * `message` is the server's English, for a code this build does not know.
+ */
+export interface ErpTestResult {
+	success: boolean;
+	message: string;
+	code?: string;
+	provider?: string;
+	adapter?: string;
+}
+
+type Translate = (key: MessageKey, params?: Record<string, string | number>) => string;
+
+/**
+ * The test result in the reader's language, naming the ERP by its display
+ * name (`label`, the panel's `providerLabel`) rather than the backend's key.
+ * `tested` is the provider the form tested. Anything this build cannot state
+ * (an unknown code, a result for a different ERP than the form shows) is the
+ * server's own sentence.
+ */
+export function erpTestResultText(
+	result: ErpTestResult,
+	tested: ErpProvider,
+	label: (p: ErpProvider) => string,
+	t: Translate
+): string {
+	const sameErp =
+		tested.key === MERGE_DEV_PROVIDER ? !!result.provider : result.provider === tested.key;
+	switch (result.code) {
+		case 'connected':
+			return sameErp ? t('org.erp.test.connected', { erp: label(tested) }) : result.message;
+		case 'connection_failed':
+			if (!sameErp) return result.message;
+			return t(tested.auth === 'oauth' ? 'org.erp.test.failedOAuth' : 'org.erp.test.failed', {
+				erp: label(tested)
+			});
+		case 'credentials_unavailable':
+			return t('org.erp.test.credentialsUnavailable');
+		case 'unknown_adapter':
+			return result.adapter
+				? t('org.erp.test.unknownAdapter', { adapter: result.adapter })
+				: result.message;
+		default:
+			return result.message;
+	}
+}
+
+const CALL_PAUSED_KEYS = {
+	rate_limited: 'org.erp.usage.paused.rateLimited',
+	tenant_budget: 'org.erp.usage.paused.tenantBudget',
+	subscription_quota: 'org.erp.usage.paused.subscriptionQuota'
+} as const satisfies Record<string, MessageKey>;
+
+/** Locale formatters `callUsageLines` renders figures and times with. */
+export interface CallUsageFormat {
+	/** A count in the reader's locale (1,234 / 1.234 / 1 234). */
+	count: (n: number) => string;
+	/** An instant in the reader's locale and time zone. */
+	time: (iso: string) => string;
+}
+
+/**
+ * The sentences the ERP panel shows for `usage`: today's count against the
+ * limit it is measured by, then — while calls are refused — why and until
+ * when. Empty when there is no usage to show (another ERP, or the counts were
+ * unreadable: the panel then says nothing rather than an error). A pause
+ * reason this build does not know reads as the generic "paused until".
+ */
+export function callUsageLines(
+	usage: ErpCallUsage | null | undefined,
+	erp: string,
+	t: Translate,
+	fmt: CallUsageFormat
+): string[] {
+	if (!usage) return [];
+	const used = fmt.count(usage.used);
+	const reset = fmt.time(usage.resets_at);
+	const lines = [
+		usage.limit == null
+			? t('org.erp.usage.noLimit', { erp, used, reset })
+			: t(usage.scope === 'org_share' ? 'org.erp.usage.ofShare' : 'org.erp.usage.ofQuota', {
+					erp,
+					used,
+					limit: fmt.count(usage.limit),
+					reset
+				})
+	];
+	if (usage.paused_reason && usage.paused_until) {
+		const reason = usage.paused_reason;
+		const key = Object.hasOwn(CALL_PAUSED_KEYS, reason)
+			? CALL_PAUSED_KEYS[reason as keyof typeof CALL_PAUSED_KEYS]
+			: 'org.erp.usage.paused';
+		lines.push(t(key, { erp, until: fmt.time(usage.paused_until) }));
+	}
+	return lines;
 }

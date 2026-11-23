@@ -1,5 +1,8 @@
+// ignore_for_file: deprecated_member_use
+
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
+
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -52,6 +55,10 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get commonRetry => 'Retry';
+
+  @override
+  String get commonLoadErrorConnection =>
+      'Couldn\'t reach FeohLedger. Check your connection and tap Retry.';
 
   @override
   String get commonAll => 'All';
@@ -112,6 +119,12 @@ class AppLocalizationsEn extends AppLocalizations {
   String get dashboardForReview => 'For Review';
 
   @override
+  String get dashboardOverdue => 'Overdue';
+
+  @override
+  String get dashboardOverdueOpen => 'Shows the overdue invoices';
+
+  @override
   String get dashboardApproved => 'Approved';
 
   @override
@@ -137,9 +150,25 @@ class AppLocalizationsEn extends AppLocalizations {
       'Showing cached data — couldn\'t reach the server';
 
   @override
-  String dashboardErrorPrefix(String error) {
-    return 'Error: $error';
-  }
+  String get dashboardLoadError =>
+      'Couldn\'t load the dashboard. Check your connection and tap Retry.';
+
+  @override
+  String get dashboardRefreshFailed =>
+      'Couldn\'t refresh — these are the last figures loaded. Tap Retry to try again.';
+
+  @override
+  String get dashboardNeedsAttention => 'Needs your attention';
+
+  @override
+  String get dashboardOverview => 'Overview';
+
+  @override
+  String get dashboardEmpty =>
+      'No invoices yet. Captured and uploaded invoices will appear here.';
+
+  @override
+  String get dashboardTopVendorsEmpty => 'No vendor spend yet.';
 
   @override
   String dashboardInvoiceCount(int count) {
@@ -245,6 +274,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get invoicesFilterPaid => 'Paid';
 
   @override
+  String get invoicesFilterOverdue => 'Overdue';
+
+  @override
   String get invoicesColInvoiceNumber => 'Invoice #';
 
   @override
@@ -284,13 +316,12 @@ class AppLocalizationsEn extends AppLocalizations {
   String get notificationsEmpty => 'No notifications';
 
   @override
-  String get notificationsCaughtUp => 'You\'re all caught up';
-
-  @override
   String get notificationsNothingYet => 'Nothing here yet';
 
   @override
-  String get notificationsLoadError => 'Couldn\'t load notifications';
+  String notificationsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load notifications: $error';
+  }
 
   @override
   String get vendorsTitle => 'Vendors';
@@ -320,7 +351,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get vendorsEmpty => 'No vendors found';
 
   @override
-  String get vendorsLoadError => 'Could not load vendors';
+  String vendorsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load vendors: $error';
+  }
 
   @override
   String get vendorActionVerify => 'Verify';
@@ -342,6 +375,16 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get vendorRejected => 'Vendor rejected';
+
+  @override
+  String vendorRejectConfirmTitle(String name) {
+    return 'Reject $name?';
+  }
+
+  @override
+  String vendorRejectConfirmBody(String name) {
+    return '$name will be marked rejected. Any live virtual cards issued to it will be cancelled.';
+  }
 
   @override
   String vendorCardsNotClosed(int count) {
@@ -426,8 +469,8 @@ class AppLocalizationsEn extends AppLocalizations {
   String get paymentsEmpty => 'No payments';
 
   @override
-  String paymentsErrorPrefix(String error) {
-    return 'Error: $error';
+  String paymentsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load payments: $error';
   }
 
   @override
@@ -453,9 +496,6 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get approvalsNoneWaiting => 'No invoices waiting for approval';
-
-  @override
-  String get approvalsLoadError => 'Could not load pending approvals';
 
   @override
   String approvalsPendingCount(int count) {
@@ -670,6 +710,10 @@ class AppLocalizationsEn extends AppLocalizations {
       'Segregation of duties: a user who recorded a goods receipt this invoice is billed against cannot also approve it.';
 
   @override
+  String get codedRefusalApprovalSegregationInspector =>
+      'Segregation of duties: a user who recorded a quality inspection of the goods this invoice is billed against cannot also approve it.';
+
+  @override
   String get codedRefusalInvoiceStaleApproval =>
       'This invoice was changed after you loaded it. Reload it and review the current version before approving.';
 
@@ -734,6 +778,10 @@ class AppLocalizationsEn extends AppLocalizations {
       'Segregation of duties: a user involved in creating this invoice cannot also clear an exception that blocks its payment. Escalate it, or ask a different user to decide.';
 
   @override
+  String get codedRefusalExceptionSegregationApprover =>
+      'Segregation of duties: a user who approved this invoice cannot also clear its receipt or inspection hold. Escalate it, or ask a different user to decide.';
+
+  @override
   String get invoiceDetailApproved => 'Invoice approved';
 
   @override
@@ -755,6 +803,43 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get invoiceDetailReject => 'Reject';
+
+  @override
+  String get invoiceDetailRecall => 'Recall approval';
+
+  @override
+  String get invoiceDetailRecallTitle => 'Recall this approval?';
+
+  @override
+  String get invoiceDetailRecallBody =>
+      'The invoice goes back to review so its figures can be corrected, then needs a fresh approval through the full approval chain. Segregation of duties will count you as involved in this invoice, as it does its uploader. The original approval stays in the audit trail.';
+
+  @override
+  String get invoiceDetailRecallReason => 'Why are you recalling it?';
+
+  @override
+  String get invoiceDetailRecalled =>
+      'Approval recalled. The invoice is back in review.';
+
+  @override
+  String get invoiceDetailRecallFailed =>
+      'Could not recall the approval — please try again';
+
+  @override
+  String get codedRefusalInvoiceNotRecallable =>
+      'Only an approved invoice, or one whose ERP push failed after approval, can have its approval recalled.';
+
+  @override
+  String get codedRefusalInvoiceRecallInErp =>
+      'The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can\'t be recalled from FeohLedger.';
+
+  @override
+  String get codedRefusalPaymentBlocksRecall =>
+      'FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before recalling the approval.';
+
+  @override
+  String get codedRefusalCardBlocksRecall =>
+      'A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.';
 
   @override
   String invoicesBulkRejectTitle(int count) {
@@ -1038,7 +1123,11 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get invoiceEditLockedNotice =>
-      'Approved — the payee and amount are frozen. To change them, reject the invoice, correct it, then approve it again.';
+      'Approved — the payee and amount are frozen.';
+
+  @override
+  String get invoiceEditLockedNoticeRecall =>
+      'Approved — the payee and amount are frozen. To change them, recall the approval, correct the invoice, then have it approved again.';
 
   @override
   String get invoiceEditLockedHelper => 'Frozen after approval';
@@ -1092,7 +1181,18 @@ class AppLocalizationsEn extends AppLocalizations {
   String get erpStatusLastUpdate => 'Last update';
 
   @override
+  String erpStatusActionBy(String action, String actor) {
+    return '$action by $actor';
+  }
+
+  @override
   String get erpStatusStatus => 'Status';
+
+  @override
+  String get erpStatusOpensInErp => 'opens the bill in the ERP';
+
+  @override
+  String get externalLinkOpenFailed => 'Couldn\'t open the link';
 
   @override
   String get fileViewerPdfTitle => 'Invoice PDF';
@@ -1148,10 +1248,14 @@ class AppLocalizationsEn extends AppLocalizations {
   String get payQueueEmpty => 'No invoices awaiting payment';
 
   @override
-  String get payQueueError => 'Could not load the payment queue';
+  String payQueueLoadErrorPrefix(String error) {
+    return 'Couldn\'t load the payment queue: $error';
+  }
 
   @override
-  String get payQueueRetry => 'Retry';
+  String payRunsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load payment runs: $error';
+  }
 
   @override
   String payQueueDue(String date) {
@@ -1197,6 +1301,10 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get payQueueBlockedVendorNotActive =>
       'Vendor not verified or not active — verify the vendor first';
+
+  @override
+  String get payQueueBlockedCurrencyUnknown =>
+      'No currency recorded on this invoice — set its currency first';
 
   @override
   String get payQueueBlockedAppliedCreditMismatch =>
@@ -1537,21 +1645,13 @@ class AppLocalizationsEn extends AppLocalizations {
   String get adminUsersCreating => 'Creating…';
 
   @override
-  String adminUsersCreated(String name) {
-    return 'Created $name';
+  String adminUsersInvited(String name, String email) {
+    return 'Invited $name. We emailed $email a link to set their password.';
   }
 
   @override
   String adminUsersCreateFailed(String error) {
     return 'Failed to create user: $error';
-  }
-
-  @override
-  String get adminUsersTempPasswordTitle => 'User created';
-
-  @override
-  String adminUsersTempPasswordBody(String name) {
-    return 'Share this one-time password with $name. They\'ll be asked to change it on first sign-in. It won\'t be shown again.';
   }
 
   @override
@@ -1680,7 +1780,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get workflowDetailFallbackTitle => 'Workflow';
 
   @override
-  String get workflowDetailLoadError => 'Could not load workflow';
+  String workflowDetailErrorPrefix(String error) {
+    return 'Could not load the workflow: $error';
+  }
 
   @override
   String get workflowDetailNoSteps => 'This workflow has no steps.';
@@ -1813,6 +1915,27 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String cashFlowPendingAmount(String amount) {
     return 'pending $amount';
+  }
+
+  @override
+  String cashFlowOverdueAmount(String amount) {
+    return 'overdue $amount';
+  }
+
+  @override
+  String cashFlowOverdueSuffix(String amount) {
+    return ', $amount already past due';
+  }
+
+  @override
+  String cashFlowForecastOverdue(int count, String amount) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count invoices',
+      one: '$count invoice',
+    );
+    return '$amount across $_temp0 is already past due. Owed now, so counted in the first period.';
   }
 
   @override
@@ -2074,13 +2197,415 @@ class AppLocalizationsEn extends AppLocalizations {
   String get exceptionDetailTitle => 'Exception';
 
   @override
-  String get exceptionDetailNotFound => 'Exception not found';
+  String exceptionDetailErrorPrefix(String error) {
+    return 'Could not load the exception: $error';
+  }
 
   @override
   String get exceptionDetailOverdue => 'Overdue';
 
   @override
   String get exceptionDetailSectionDescription => 'Description';
+
+  @override
+  String exceptionDetailPoRematch(String po, String erp, String date) {
+    return 'PO $po changed in $erp on $date, and a re-check now matches. Review it to clear the hold.';
+  }
+
+  @override
+  String exceptionDetailPoRematchNoDate(String po, String erp) {
+    return 'PO $po changed in $erp, and a re-check now matches. Review it to clear the hold.';
+  }
+
+  @override
+  String exceptionDetailPoRematchNoPo(String erp) {
+    return 'The purchase order changed in $erp, and a re-check now matches. Review it to clear the hold.';
+  }
+
+  @override
+  String erpRefusalVendorNotLinked(String provider) {
+    return 'This vendor isn\'t in $provider yet. Sync vendors from $provider, or add the vendor there, then retry.';
+  }
+
+  @override
+  String erpRefusalAccountNotLinked(String provider, String accounts) {
+    return 'Not linked to an account in $provider: $accounts. Sync the chart of accounts from $provider, or recode the invoice to a linked account, then retry.';
+  }
+
+  @override
+  String erpRefusalAccountNotLinkedUncoded(String provider) {
+    return 'A line has no GL account, and the invoice has none to fall back on. Code it to an account linked to $provider, then retry.';
+  }
+
+  @override
+  String get erpRefusalNotConnected =>
+      'The ERP isn\'t connected, or its connection has expired. An administrator can reconnect it under Organization, then retry.';
+
+  @override
+  String get erpRefusalInvoiceDueBeforeDate =>
+      'This invoice is due before its invoice date, which the ERP rejects. Correct the dates, then retry.';
+
+  @override
+  String erpRefusalAmountMismatch(String provider) {
+    return 'The line amounts don\'t add up to the approved amount, so the bill wasn\'t sent to $provider. Correct the lines or the tax, then retry.';
+  }
+
+  @override
+  String get erpRefusalLineAmountMissing =>
+      'A line has no amount — no total, and no quantity and unit price to work one out from. Fill it in, then retry.';
+
+  @override
+  String erpRefusalPostedTotalMismatch(String provider) {
+    return '$provider worked out a different total from the approved amount (often a default tax code), so the bill wasn\'t kept. Check the vendor\'s and accounts\' tax settings in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalPostedTotalUnconfirmed(String provider) {
+    return 'The bill was created in $provider, but $provider didn\'t report its total, so it can\'t be confirmed. Check the bill in $provider before you retry.';
+  }
+
+  @override
+  String erpRefusalPreviousBillRemoved(String provider) {
+    return 'Every bill sent for this invoice was deleted or voided in $provider, so it won\'t be sent again automatically. Check $provider, then ask an administrator how to proceed.';
+  }
+
+  @override
+  String erpRefusalTaxNotItemised(String provider) {
+    return '$provider needs the tax on each line, but this invoice states it only in total. Enter the tax per line, then retry.';
+  }
+
+  @override
+  String erpRefusalTaxRateUnresolved(String provider) {
+    return '$provider has no tax rate that matches this invoice\'s tax. Set the rate up in $provider, or correct the tax, then retry.';
+  }
+
+  @override
+  String erpRefusalMissingDates(String provider) {
+    return '$provider needs both an invoice date and a due date. Add them, then retry.';
+  }
+
+  @override
+  String erpRefusalBillRefused(String provider) {
+    return '$provider refused this bill and did not create it. Check the bill\'s vendor, accounts, dates and amounts against $provider, correct them, then retry.';
+  }
+
+  @override
+  String erpRefusalDuplicateNumber(String provider) {
+    return '$provider already has a bill with this invoice number. Check $provider for a duplicate before you retry.';
+  }
+
+  @override
+  String erpRefusalDocNumberTooLong(String provider) {
+    return 'The invoice number is longer than $provider allows. Shorten it, then retry.';
+  }
+
+  @override
+  String erpRefusalCurrencyUnknown(String provider) {
+    return '$provider reports no home currency, so the bill\'s currency can\'t be checked. Set the home currency in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotEnabled(String provider) {
+    return 'This invoice isn\'t in $provider\'s home currency, and multicurrency is off there. Turn multicurrency on in $provider, or correct the currency, then retry.';
+  }
+
+  @override
+  String erpRefusalIdempotencyLookupIncomplete(String provider) {
+    return '$provider couldn\'t confirm whether this invoice was already sent, so it wasn\'t sent again. Retry in a few minutes.';
+  }
+
+  @override
+  String erpRefusalPurchasesNotPermitted(String provider) {
+    return '$provider did not allow this bill to be created. Either the business is on Accounting Start, which cannot create purchase invoices, or the connected Sage user lacks Purchases access. Upgrade the plan or give that user Purchases access in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalExistingInvoiceNotOpen(String provider) {
+    return '$provider already holds this invoice and it\'s no longer a draft, so it can\'t be changed from here. Review it in $provider.';
+  }
+
+  @override
+  String erpRefusalLineAmountPrecision(String provider) {
+    return 'A line amount has more decimal places than this currency allows in $provider. Round it, then retry.';
+  }
+
+  @override
+  String erpRefusalPayToVendorDiffers(String provider) {
+    return '$provider has this bill set to pay a different vendor from the one approved (its pay-to vendor), so it wasn\'t posted as this bill. Check the pay-to vendor on the bill and on the vendor\'s card in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalBillNotPosted(String provider) {
+    return '$provider holds this bill but doesn\'t show it as posted yet, usually because it\'s waiting for approval there. Approve it in $provider, then retry. It won\'t be created twice.';
+  }
+
+  @override
+  String erpRefusalBillRejected(String provider) {
+    return '$provider holds this bill, but it was rejected or cancelled there, so it will never post. Delete it or enter it again in $provider before you retry, and don\'t mark this invoice done: nothing will pay it.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotSetUp(String provider) {
+    return '$provider has no active currency for this invoice\'s currency code. Add or reactivate that currency in $provider (a foreign one needs Multiple Currencies turned on), or correct the invoice\'s currency, then retry.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotSupported(String provider) {
+    return '$provider takes bills only in the company\'s own currency. Correct the currency, or enter the bill in $provider directly.';
+  }
+
+  @override
+  String erpRefusalForeignCurrencySupplier(String provider) {
+    return 'This supplier is set up for a foreign currency in $provider, which can\'t be posted to from here. Enter the bill in $provider directly.';
+  }
+
+  @override
+  String erpRefusalCorrelationTotalMismatch(String provider) {
+    return '$provider already holds a bill from an earlier attempt with a different total. Check that bill in $provider before you retry.';
+  }
+
+  @override
+  String erpRefusalTaxTypeNotResolved(String provider) {
+    return 'An account\'s tax type in $provider isn\'t a fixed rate, so the tax can\'t be split out. Give the account a tax type in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalTaxMismatch(String provider) {
+    return 'The tax $provider would book differs from the tax on the invoice. Check the accounts\' tax types in $provider, or correct the tax, then retry.';
+  }
+
+  @override
+  String erpRefusalTaxNotStated(String provider) {
+    return 'The invoice states no tax, but its accounts carry tax in $provider. Enter the invoice\'s tax, then retry.';
+  }
+
+  @override
+  String erpRefusalSubscriptionKeyMissing(String provider) {
+    return 'The $provider subscription key is missing. An administrator can add it under Organization, then retry.';
+  }
+
+  @override
+  String erpRefusalApAccountNotConfigured(String provider) {
+    return 'No accounts-payable account is set for $provider. An administrator can set it under Organization, then retry.';
+  }
+
+  @override
+  String erpRefusalCurrencyNotConfigured(String provider) {
+    return 'No ledger currency is set for $provider. An administrator can set it under Organization, then retry.';
+  }
+
+  @override
+  String erpRefusalCurrencyMismatch(String provider) {
+    return 'The invoice\'s currency isn\'t the $provider ledger currency. Correct the currency, then retry.';
+  }
+
+  @override
+  String erpRefusalInvoiceDateMissing(String provider) {
+    return '$provider needs an invoice date. Add it, then retry.';
+  }
+
+  @override
+  String erpRefusalDueDateMissing(String provider) {
+    return '$provider needs a due date. Add it, then retry.';
+  }
+
+  @override
+  String erpRefusalAmountNotPositive(String provider) {
+    return '$provider takes only invoices for more than zero. Correct the amount, or record a credit memo instead.';
+  }
+
+  @override
+  String erpRefusalJobUnconfirmed(String provider) {
+    return '$provider accepted the invoice but hasn\'t confirmed it was created. Retry to check again — it won\'t be sent twice.';
+  }
+
+  @override
+  String erpRefusalJobFailed(String provider) {
+    return '$provider accepted the invoice, but its background job failed and created nothing. Check the vendor, accounts, transaction codes and posting period in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalCallBudgetTenant(String provider) {
+    return 'This workspace has used its share of today\'s $provider API calls, so FeohLedger made no call. The allowance resets at midnight UTC — retry then.';
+  }
+
+  @override
+  String erpRefusalCallBudgetQuota(String provider) {
+    return '$provider has paused API calls for the subscription FeohLedger uses (its daily quota is used), so FeohLedger made no call. It resets at midnight UTC — retry then.';
+  }
+
+  @override
+  String erpRefusalCallBudgetRateLimited(String provider) {
+    return '$provider asked FeohLedger to slow down, so no call was made. Retry in a minute.';
+  }
+
+  @override
+  String erpRefusalBillLeftUnposted(String provider) {
+    return '$provider holds this bill as a draft or awaiting approval, not posted, so nothing is in accounts payable there yet. Post or approve it in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalMergeSyncPending(String provider) {
+    return '$provider has not finished syncing invoices since an earlier attempt to send this bill, whose outcome is unknown, so it may already hold the bill. Nothing was sent. Retry after $provider\'s next invoice sync: if the bill is there by then, the retry links to it instead of creating a second one.';
+  }
+
+  @override
+  String get erpRefusalCredentialsUnavailable =>
+      'The ERP credentials couldn\'t be opened just now. Retry in a few minutes; if it keeps failing, tell an administrator.';
+
+  @override
+  String erpRefusalPeriodClosed(String provider) {
+    return '$provider refused this bill because its date is in a closed period (the books are closed). Change the invoice date or reopen the period in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalVendorInactive(String provider) {
+    return '$provider refused this bill because its vendor is inactive or deleted there. Make the vendor active in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalAccountInactive(String provider, String accounts) {
+    return '$provider refused this bill because $accounts is inactive or deleted there. Make the account active in $provider, or recode the invoice to an active account, then retry.';
+  }
+
+  @override
+  String erpRefusalReferenceInvalid(String provider, String code) {
+    return '$provider refused this bill because it refers to a vendor or account it doesn\'t accept (Intuit error $code). Check that the vendor and every account on the bill exist and are active in $provider, sync them again, then retry.';
+  }
+
+  @override
+  String erpRefusalCompanySubscriptionInactive(String provider) {
+    return '$provider refused this bill because the company\'s subscription has ended, was cancelled or has a billing problem. Resolve it in $provider, then retry.';
+  }
+
+  @override
+  String erpRefusalIntuitFault(String provider, String code) {
+    return '$provider refused this bill (Intuit error $code). Check the bill\'s details against $provider and correct them, then retry. If it keeps failing, give an administrator the error code.';
+  }
+
+  @override
+  String erpRefusalPaymentAccountNotMapped(String provider) {
+    return '$provider was not told about this payment: no account to record it from is set. Choose the bill-payment account under Organization → ERP integration, then retry the payment sync.';
+  }
+
+  @override
+  String erpRefusalBillNotInErp(String provider) {
+    return '$provider no longer has the bill this payment was for (it was deleted there), so the payment was not recorded there. Check the bill in $provider.';
+  }
+
+  @override
+  String erpRefusalPaymentExceedsBalance(String provider) {
+    return '$provider shows less still owed on this bill than this payment, so recording it would overpay the bill. Check what was already paid in $provider.';
+  }
+
+  @override
+  String erpRefusalBillPaymentVoided(String provider) {
+    return 'This payment was recorded in $provider and then voided there, so it is not recorded again. Decide in $provider whether the bill is paid.';
+  }
+
+  @override
+  String erpRefusalPaymentsScopeMissing(String provider) {
+    return '$provider was connected before FeohLedger asked for permission to record payments, so this payment isn\'t recorded there. Reconnect $provider in Organization settings to grant it, then record the payment in $provider or retry.';
+  }
+
+  @override
+  String erpRefusalExceptionBlocksExport(String type) {
+    return 'This invoice has an open $type exception. Resolve or dismiss it in Exceptions, then send it to the ERP.';
+  }
+
+  @override
+  String erpRefusalExceptionBlocksExportPossiblyPosted(String type) {
+    return 'This invoice has an open $type exception, and an earlier attempt may already have created the bill in the ERP. Check the ERP before anyone pays it, then resolve or dismiss the exception in Exceptions.';
+  }
+
+  @override
+  String get erpRefusalPaymentBlocksExport =>
+      'FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before sending the invoice to the ERP.';
+
+  @override
+  String get erpRefusalPaymentBlocksExportPossiblyPosted =>
+      'FeohLedger is already paying this invoice, and an earlier attempt may already have created the bill in the ERP. Check the ERP and make sure nobody pays the bill there as well.';
+
+  @override
+  String get erpRefusalVendorBlocked =>
+      'This invoice\'s vendor is blocked from payment. Unblock the vendor before sending the invoice to the ERP.';
+
+  @override
+  String get erpRefusalVendorSanctionsMatch =>
+      'This invoice\'s vendor matched a sanctions list. Review the vendor\'s screening before sending the invoice to the ERP.';
+
+  @override
+  String get erpRefusalVendorSanctionsReview =>
+      'This invoice\'s vendor is held for sanctions screening review. Re-screen the vendor once the review is done, then send the invoice to the ERP.';
+
+  @override
+  String get erpRefusalVendorRejected =>
+      'This invoice\'s vendor has been rejected. Link the invoice to the correct vendor before sending it to the ERP.';
+
+  @override
+  String get erpRefusalVendorStatusUnknown =>
+      'This invoice\'s vendor has a status that cannot be sent to the ERP. Set the vendor to active before sending the invoice to the ERP.';
+
+  @override
+  String get erpRefusalVendorHoldPossiblyPosted =>
+      'An earlier attempt may already have created the bill in the ERP; check there before anyone pays it.';
+
+  @override
+  String get erpRefusalCurrencyBlocksExport =>
+      'This invoice has no valid currency. Set its currency before sending it to the ERP.';
+
+  @override
+  String get erpRefusalRetriesExhausted =>
+      'This push had no attempts left, so no attempt was made this time. Retry to send it with a fresh set of attempts.';
+
+  @override
+  String get erpRefusalPushInterrupted =>
+      'This push was interrupted and never finished. It is too old (or older than the current ERP connection) to send again without someone checking. Make sure the bill isn\'t already in the ERP, then retry.';
+
+  @override
+  String get erpRefusalCardBlocksExport =>
+      'A virtual card has been issued to pay this invoice. Cancel the card before sending the invoice to the ERP.';
+
+  @override
+  String get erpRefusalCardBlocksExportPossiblyPosted =>
+      'A virtual card has been issued to pay this invoice, and an earlier attempt may already have created the bill in the ERP. Check the ERP and make sure nobody pays the bill there as well.';
+
+  @override
+  String get erpRefusalTypeDuplicate => 'Duplicate Invoice';
+
+  @override
+  String get erpRefusalTypeFraudFlag => 'Fraud Flag';
+
+  @override
+  String exceptionDetailErpPaymentTitle(String erp) {
+    return 'Payment reported by $erp';
+  }
+
+  @override
+  String exceptionDetailErpPaymentAmount(String erp) {
+    return 'Amount $erp reports paid';
+  }
+
+  @override
+  String get exceptionDetailErpPaymentPaidOn => 'Paid on';
+
+  @override
+  String get exceptionDetailErpPaymentReference => 'Reference';
+
+  @override
+  String erpRefusalUnknown(String erp) {
+    return 'This was refused in $erp for a reason this version of the app can\'t describe. Update the app, or check the record in $erp.';
+  }
+
+  @override
+  String get exceptionDetailErpPaymentNotStated => 'Not stated';
+
+  @override
+  String get exceptionDetailErpPaymentRecordOnWeb =>
+      'Record this payment from Exceptions in the web app: that resolves the exception and marks the invoice paid.';
+
+  @override
+  String get exceptionDetailYourErp => 'your ERP';
 
   @override
   String get exceptionDetailSectionInvoice => 'Invoice';
@@ -2246,7 +2771,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get inspectionsEmptyFiltered => 'No inspections with this outcome.';
 
   @override
-  String get inspectionsLoadError => 'Could not load inspections';
+  String inspectionsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load inspections: $error';
+  }
 
   @override
   String get inspectionsResultPass => 'Pass';
@@ -2692,12 +3219,12 @@ class AppLocalizationsEn extends AppLocalizations {
       other: '$included AI-read invoices are',
       one: '$included AI-read invoice is',
     );
-    return 'AI reading is paused: this month\'s $_temp0 used. Enter the details manually, or upgrade your plan on the Billing page.';
+    return 'AI reading is paused: this month\'s $_temp0 used. Enter the details manually, or upgrade your plan under Settings → Subscription.';
   }
 
   @override
   String get invoiceWarningAiSpendCapReached =>
-      'AI reading is paused: this month\'s AI spending cap is reached. Enter the details manually, or raise the cap on the Billing page.';
+      'AI reading is paused: this month\'s AI spending cap is reached. Enter the details manually, or raise the cap under Settings → Subscription.';
 
   @override
   String get invoiceWarningUnverifiedVendor => 'Vendor is unverified';
@@ -2780,6 +3307,24 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String invoiceWarningPoBilledBeyondTotal(
+    String billedAmount,
+    String poNumber,
+    String poTotal,
+  ) {
+    return 'Other invoices already bill $billedAmount against PO $poNumber, whose total is $poTotal — this invoice takes it past that total';
+  }
+
+  @override
+  String invoiceWarningPoBilledBeyondReceipt(
+    String totalBilled,
+    String poNumber,
+    String receivedValue,
+  ) {
+    return 'Invoices on PO $poNumber bill $totalBilled, this one included; goods worth $receivedValue have been received';
+  }
+
+  @override
   String invoiceWarningPoAmountVariancePoCurrencyUnknown(
     String variancePct,
     String poNumber,
@@ -2796,6 +3341,29 @@ class AppLocalizationsEn extends AppLocalizations {
     String poCurrency,
   ) {
     return 'Invoice is in $invoiceCurrency but PO $poNumber is in $poCurrency — the amounts were not compared';
+  }
+
+  @override
+  String invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown(
+    String poNumber,
+    String poCurrencies,
+  ) {
+    return 'The invoice records no valid currency and the POs behind $poNumber are in different currencies ($poCurrencies) — the amounts were not compared';
+  }
+
+  @override
+  String invoiceWarningPoCancelled(String poNumber) {
+    return 'PO $poNumber is cancelled — the invoice was not matched against it';
+  }
+
+  @override
+  String invoiceWarningPoNotIssued(String poNumber) {
+    return 'PO $poNumber is not approved in the ERP yet — the invoice was not matched against it';
+  }
+
+  @override
+  String invoiceWarningPoTotalUnverifiable(String poNumber) {
+    return 'The total of PO $poNumber could not be confirmed from the ERP on its last sync — the amounts were not compared';
   }
 
   @override
@@ -2921,6 +3489,23 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String invoiceWarningContractCurrencyMismatch(
+    String invoiceCurrency,
+    String contractNumber,
+    String contractCurrency,
+  ) {
+    return 'Invoice is in $invoiceCurrency but contract $contractNumber is in $contractCurrency — its spend limit was not checked';
+  }
+
+  @override
+  String invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown(
+    String contractNumber,
+    String contractCurrency,
+  ) {
+    return 'The invoice records no valid currency, so the spend limit in $contractCurrency of contract $contractNumber was not checked';
+  }
+
+  @override
   String invoiceWarningContractGlNotAllowed(
     String glAccount,
     String contractNumber,
@@ -2957,6 +3542,19 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String invoiceWarningSelfCorrectionCurrencyConflict(
+    String printedCurrency,
+    String fieldCurrency,
+  ) {
+    return 'Amounts are printed in $printedCurrency, but the invoice currency reads $fieldCurrency. The amounts were left blank — enter them from the document.';
+  }
+
+  @override
+  String invoiceWarningSelfCorrectionCurrencyMixed(String printedCurrencies) {
+    return 'Amounts are printed in more than one currency ($printedCurrencies). The amounts were left blank — enter them from the document.';
+  }
+
+  @override
   String invoiceWarningSelfCorrectionLineItemMath(
     String lineNumber,
     String quantity,
@@ -2969,7 +3567,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String invoiceWarningGlCodesNotInChart(String codes) {
-    return 'AI suggested GL code(s) not in active chart: $codes';
+    return 'GL code(s) not in the active chart of accounts, left uncoded: $codes';
   }
 
   @override
@@ -2989,6 +3587,25 @@ class AppLocalizationsEn extends AppLocalizations {
   ) {
     return 'Currency mismatch: invoice in $invoiceCurrency, PO in $poCurrency — amounts not compared';
   }
+
+  @override
+  String invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown(
+    String poCurrencies,
+  ) {
+    return 'Currency mismatch: invoice records no valid currency, POs in $poCurrencies — amounts not compared';
+  }
+
+  @override
+  String get invoicePoMatchIssuePoCancelled =>
+      'PO is cancelled — amounts not compared';
+
+  @override
+  String get invoicePoMatchIssuePoNotIssued =>
+      'PO not approved in the ERP yet — amounts not compared';
+
+  @override
+  String get invoicePoMatchIssuePoTotalUnverifiable =>
+      'PO total not confirmed by the ERP on its last sync — amounts not compared';
 
   @override
   String invoicePoMatchIssueAmountMismatch(
@@ -3079,6 +3696,383 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpPaidUnrecordedBlockingException(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedBlockingExceptionUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedInRun(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP\'s payment from this exception.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedInRunUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP\'s payment from this exception.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedPaymentLive(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP\'s payment is the real one, then record the ERP\'s payment from this exception.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedPaymentLiveUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP\'s payment is the real one, then record the ERP\'s payment from this exception.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedCardLive(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP\'s payment from this exception.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedCardLiveUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP\'s payment from this exception.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedCreditConflict(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because an applied credit memo no longer matches this invoice\'s supplier or currency, so the amount owed can\'t be stated. Correct the credit memo, then record the ERP\'s payment from this exception.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedCreditConflictUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because an applied credit memo no longer matches this invoice\'s supplier or currency, so the amount owed can\'t be stated. Correct the credit memo, then record the ERP\'s payment from this exception.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedNothingToPay(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedNothingToPayUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedNotPayable(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP\'s payment from this exception or resolve it.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedNotPayableUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP\'s payment from this exception or resolve it.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedAmountMismatch(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP\'s payment from this exception or resolve it.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedAmountMismatchUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP\'s payment from this exception or resolve it.';
+
+  @override
+  String exceptionDescriptionErpPaidUnrecordedOther(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP\'s payment from this exception or resolve it.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidUnrecordedOtherUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP\'s payment from this exception or resolve it.';
+
+  @override
+  String exceptionDescriptionErpPaidWithdrawn(String erp) {
+    return '$erp reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidWithdrawnUnnamed =>
+      'Your ERP reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.';
+
+  @override
+  String exceptionDescriptionErpPaidRetryFailed(String erp) {
+    return '$erp reports this bill paid, but FeohLedger couldn\'t record that payment automatically. Check the details, then record the ERP\'s payment from this exception.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaidRetryFailedUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment automatically. Check the details, then record the ERP\'s payment from this exception.';
+
+  @override
+  String exceptionDescriptionErpSettledShort(String erp) {
+    return '$erp reports this bill paid, but FeohLedger\'s own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.';
+  }
+
+  @override
+  String get exceptionDescriptionErpSettledShortUnnamed =>
+      'Your ERP reports this bill paid, but FeohLedger\'s own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.';
+
+  @override
+  String exceptionDescriptionErpVoidedAfterPost(String erp) {
+    return '$erp reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.';
+  }
+
+  @override
+  String get exceptionDescriptionErpVoidedAfterPostUnnamed =>
+      'Your ERP reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.';
+
+  @override
+  String get exceptionDescriptionErpCreditSettlement =>
+      'The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhileScheduled =>
+      'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.';
+
+  @override
+  String get exceptionDescriptionErpPaidTwice =>
+      'FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.';
+
+  @override
+  String get exceptionDescriptionErpPartlyPaidOutside =>
+      'The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger payment for the full amount would overpay it. Reconcile what is still owed before paying.';
+
+  @override
+  String get exceptionDescriptionErpRecordedPaymentWithdrawn =>
+      'The ERP reported this bill paid, and FeohLedger recorded that payment, but the ERP no longer shows it paid (the payment was deleted or voided there). Confirm whether it is still owed.';
+
+  @override
+  String get exceptionDescriptionErpBillDeletedBlocking =>
+      'The bill this invoice was posted as has been deleted or voided in the ERP; FeohLedger will not pay it until someone confirms it is still owed.';
+
+  @override
+  String get exceptionDescriptionErpBillDeleted =>
+      'The bill this invoice was posted as has been deleted or voided in the ERP. Confirm the books still agree.';
+
+  @override
+  String get exceptionDescriptionErpBillUnlinkedNoDocument =>
+      'FeohLedger cannot check this invoice\'s bill in the ERP, because the ERP did not say which bill it created when the invoice was posted, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.';
+
+  @override
+  String get exceptionDescriptionErpBillUnlinkedNoCompany =>
+      'FeohLedger cannot check this invoice\'s bill in the ERP, because the posting did not record which ERP company it went to, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.';
+
+  @override
+  String get exceptionDescriptionErpBillUnlinkedOtherCompany =>
+      'FeohLedger cannot check this invoice\'s bill in the ERP, because it was posted to a different ERP company than the one now connected, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedPaid =>
+      'FeohLedger was about to pay this invoice, but the ERP shows its bill already paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedPartiallyPaid =>
+      'FeohLedger was about to pay this invoice, but the ERP shows its bill partly paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedDeleted =>
+      'FeohLedger was about to pay this invoice, but the ERP shows its bill deleted or voided. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.';
+
+  @override
+  String get exceptionDescriptionErpDispatchStoppedUnconfirmed =>
+      'FeohLedger was about to pay this invoice, but the ERP could not confirm its bill is still open and unpaid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.';
+
+  @override
+  String get exceptionDescriptionErpReportedPaymentVoided =>
+      'A payment the ERP reported was voided in FeohLedger, but the ERP may still show the bill paid. FeohLedger will not pay it again until someone confirms the ERP\'s payment is undone.';
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackFailed(String erp) {
+    return '$erp did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaymentWritebackFailedUnnamed =>
+      'Your ERP did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.';
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackBalanceOpen(
+    String erp,
+    String amount,
+  ) {
+    return '$erp recorded this invoice\'s payment, but the bill still shows $amount open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed(
+    String amount,
+  ) {
+    return 'Your ERP recorded this invoice\'s payment, but the bill still shows $amount open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
+    return '$erp still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.';
+  }
+
+  @override
+  String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
+      'Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.';
+
+  @override
+  String get exceptionDescriptionErpSyncBackFailed =>
+      'This invoice\'s payment settled, but FeohLedger could not finish recording it, so the invoice has not moved to Paid although the money has gone. Nothing retries this automatically: use Retry ERP sync on the payment\'s run in Payments.';
+
+  @override
+  String exceptionDescriptionExtractionFailed(String errorClass) {
+    return 'Extraction failed: $errorClass';
+  }
+
+  @override
+  String exceptionDescriptionPositivePayAlteredAmount(String checkNumber) {
+    return 'Positive Pay return: check $checkNumber altered amount';
+  }
+
+  @override
+  String exceptionDescriptionPositivePayNotOnFile(String checkNumber) {
+    return 'Positive Pay return: check $checkNumber not on issued file';
+  }
+
+  @override
+  String get exceptionDescriptionVendorBankChanged =>
+      'Vendor bank details changed; verify before payment.';
+
+  @override
+  String get exceptionDescriptionPayeeChangedSincePaid =>
+      'Payee changed since this invoice was last paid; verify before paying again.';
+
+  @override
+  String get exceptionDescriptionPayeeUnrecordedAfterMerge =>
+      'Vendor merged since this invoice was last paid, and that payment recorded no payee; verify before paying again.';
+
+  @override
+  String exceptionDescriptionComplianceHoldFindings(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count reasons',
+      one: '$count reason',
+    );
+    return 'Payment held for compliance review ($_temp0)';
+  }
+
+  @override
+  String get exceptionDescriptionComplianceNoScreenableVendor =>
+      'No screenable vendor on the invoice';
+
+  @override
+  String exceptionDescriptionComplianceProviderUnavailable(String provider) {
+    return 'Sanctions screening could not run: no adapter for the configured provider “$provider”';
+  }
+
+  @override
+  String exceptionDescriptionComplianceReviewRequired(
+    String provider,
+    String matchedList,
+  ) {
+    return 'Vendor screening via $provider requires review ($matchedList)';
+  }
+
+  @override
+  String exceptionDescriptionComplianceReviewRequiredUnlisted(String provider) {
+    return 'Vendor screening via $provider requires review (see the screening record)';
+  }
+
+  @override
+  String exceptionDescriptionComplianceUnrecognisedResult(
+    String provider,
+    String result,
+  ) {
+    return 'Vendor screening via $provider returned an unrecognised result “$result”; treated as requiring review';
+  }
+
+  @override
+  String exceptionDescriptionComplianceAdverseMedia(String provider) {
+    return 'Vendor screening via $provider found adverse media (negative news); AP review required';
+  }
+
+  @override
+  String get exceptionDescriptionComplianceAdverseMediaUnnamedProvider =>
+      'Vendor screening found adverse media (negative news); AP review required';
+
+  @override
+  String exceptionDescriptionComplianceAmlSpend(
+    String projected,
+    String threshold,
+  ) {
+    return 'Trailing 12-month spend with this vendor would reach $projected (threshold $threshold); AP review required';
+  }
+
+  @override
+  String exceptionDescriptionComplianceAmlSpendPartial(
+    String projected,
+    String threshold,
+    int excluded,
+  ) {
+    String _temp0 = intl.Intl.pluralLogic(
+      excluded,
+      locale: localeName,
+      other: '$excluded payments were',
+      one: '$excluded payment was',
+    );
+    return 'Trailing 12-month spend with this vendor would reach at least $projected (threshold $threshold); AP review required. $_temp0 left out for having no figure in the home currency, so the real total is higher';
+  }
+
+  @override
+  String exceptionDescriptionPaymentAgedOut(
+    String paymentId,
+    String hours,
+    String invoiceStatus,
+  ) {
+    return 'Payment $paymentId was still in flight after ${hours}h and the reconciler marked it failed; the rail never confirmed, so the money may or may not have moved. The invoice is “$invoiceStatus”. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionPaymentDispatchInDoubt(
+    String paymentId,
+    String failureCode,
+  ) {
+    return 'Payment $paymentId failed during dispatch ($failureCode) after the processor may already have accepted it, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionPaymentDispatchInterruptedFailed(
+    String paymentId,
+  ) {
+    return 'Payment $paymentId failed, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionPaymentDispatchInterruptedCancelled(
+    String paymentId,
+  ) {
+    return 'Payment $paymentId was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionSettlementCurrencyMismatch(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+  ) {
+    return 'Settlement currency mismatch: the processor reported $settledAmount $settledCurrency but this payment authorizes $authorizedAmount $authorizedCurrency. Money moved in a currency AP did not authorize — reconcile with the processor before releasing this invoice.';
+  }
+
+  @override
+  String exceptionDescriptionSettlementAmountOver(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+    String variance,
+  ) {
+    return 'Settlement amount mismatch: the processor reported $settledAmount $settledCurrency, MORE than the authorized $authorizedAmount $authorizedCurrency (variance $variance). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.';
+  }
+
+  @override
+  String exceptionDescriptionSettlementAmountUnder(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+    String variance,
+  ) {
+    return 'Settlement amount mismatch: the processor reported $settledAmount $settledCurrency, LESS than the authorized $authorizedAmount $authorizedCurrency (variance $variance). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.';
+  }
+
+  @override
   String get warningsPoMatchStatusMatched => 'Matched';
 
   @override
@@ -3093,5 +4087,936 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String warningsPoMatchAnnouncement(String summary) {
     return 'PO match: $summary';
+  }
+
+  @override
+  String get codedRefusalInvoiceNotInReview =>
+      'This invoice is not awaiting review, so it cannot be approved or rejected.';
+
+  @override
+  String get codedRefusalInvoiceBulkNotFound =>
+      'This invoice wasn\'t found in the selected entity.';
+
+  @override
+  String codedRefusalInvoiceStatusImmutable(String status) {
+    return 'This invoice is $status, so it can no longer be changed.';
+  }
+
+  @override
+  String get codedRefusalInvoiceRecallOneAtATime =>
+      'An approval is recalled one invoice at a time, with a reason: use Recall approval on the invoice.';
+
+  @override
+  String codedRefusalInvoiceBulkRefused(String status) {
+    return 'This invoice could not be changed to $status.';
+  }
+
+  @override
+  String codedRefusalInvoiceRequiredFieldsMissing(String fields) {
+    return 'Required fields missing: $fields';
+  }
+
+  @override
+  String codedRefusalInvoiceTransitionInvalid(String from, String to) {
+    return 'This invoice can\'t move from $from to $to.';
+  }
+
+  @override
+  String codedRefusalInvoiceTransitionRecallOnly(String from, String to) {
+    return 'This invoice can move from $from to $to only by recalling its approval, one invoice at a time: use Recall approval on the invoice.';
+  }
+
+  @override
+  String get codedRefusalInvoiceOnceApprovedNotReread =>
+      'This invoice has already been approved, so its document can\'t be read again. Recall its approval and correct it instead.';
+
+  @override
+  String get invoicesBulkSkipNoReason => 'No reason given';
+
+  @override
+  String get invoicesBulkSkipNoNumber => 'Invoice (no number)';
+
+  @override
+  String get reviewVerdictsUnavailable =>
+      'Couldn\'t check what you can do here — pull to retry';
+
+  @override
+  String get reviewVerdictsChecking => 'Checking what you can do here…';
+
+  @override
+  String get payRecordOnlyBanner =>
+      'FeohLedger records payments but never sends them: pay from your bank or ERP, then record each one here (a run\'s bank file is on the web app).';
+
+  @override
+  String payRecordPrefilledFromErp(String erp) {
+    return 'Filled in from the payment $erp reported. Check the details before you record it.';
+  }
+
+  @override
+  String payRecordErpAmount(String erp) {
+    return 'Amount $erp reports paid';
+  }
+
+  @override
+  String payRecordSplitTitle(String erp) {
+    return 'How $erp says it was paid';
+  }
+
+  @override
+  String get payRecordRailNotStated => 'Method not stated';
+
+  @override
+  String get payRecordSplitMethod => 'Split across the methods above';
+
+  @override
+  String get payRecordSplitStands =>
+      'This payment was made with more than one method, so it is recorded with this split. One method cannot describe it.';
+
+  @override
+  String get payRecordSplitDropped =>
+      'These parts do not add up to the amount paid, so the split is not kept. The method you choose is recorded for the whole payment.';
+
+  @override
+  String get payRecordSplitUnjudged =>
+      'Whether this split is kept is decided when the payment is recorded. If it is not kept, the method you choose is recorded for the whole payment.';
+
+  @override
+  String get payRecordAction => 'Record as paid';
+
+  @override
+  String payRecordActionLabel(String invoice) {
+    return 'Record as paid — invoice $invoice';
+  }
+
+  @override
+  String get payRecordTitle => 'Record a payment made outside FeohLedger';
+
+  @override
+  String get payRecordIntro =>
+      'Use this when you have already paid the supplier from your own bank or ERP. FeohLedger records the payment and marks the invoice paid. It doesn\'t send any money.';
+
+  @override
+  String get payRecordAmountOwed => 'Amount owed';
+
+  @override
+  String get payRecordAmountHint =>
+      'The full amount owed is recorded, net of applied credit memos and any accepted early-payment discount still open on the paid-on date. Partial payments can\'t be recorded.';
+
+  @override
+  String get payRecordMethod => 'How you paid';
+
+  @override
+  String get payRecordReference => 'Reference';
+
+  @override
+  String get payRecordReferenceHint =>
+      'The cheque number or your bank\'s confirmation number. Bank reconciliation matches on it.';
+
+  @override
+  String get payRecordPaidOn => 'Paid on';
+
+  @override
+  String get payRecordSubmit => 'Record as paid';
+
+  @override
+  String get payRecordSubmitting => 'Recording…';
+
+  @override
+  String payRecordRecorded(String invoice) {
+    return 'Invoice $invoice recorded as paid';
+  }
+
+  @override
+  String get payRecordFailed => 'Could not record the payment';
+
+  @override
+  String get payRecordUnavailable =>
+      'This invoice can\'t be recorded as paid yet.';
+
+  @override
+  String get payMethodBacs => 'BACS';
+
+  @override
+  String get payMethodFasterPayments => 'Faster Payments';
+
+  @override
+  String get payMethodChaps => 'CHAPS';
+
+  @override
+  String get payMethodCardOutside => 'Card (outside FeohLedger)';
+
+  @override
+  String get payRunActionRecord => 'Record run as paid…';
+
+  @override
+  String get payRunRecordTitle => 'Record run as paid';
+
+  @override
+  String get payRunRecordIntro =>
+      'Once your bank has taken the payments, record them here. Every payment in the run is marked completed and its invoice paid. Nothing is sent.';
+
+  @override
+  String get payRunRecordReference => 'Bank batch reference';
+
+  @override
+  String get payRunRecordReferenceHint =>
+      'The confirmation number your bank gave the batch. Bank reconciliation matches on it.';
+
+  @override
+  String payRunRecordSubmit(String amount) {
+    return 'Record as paid · $amount';
+  }
+
+  @override
+  String payRunRecordRecorded(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count payments recorded as paid',
+      one: '$count payment recorded as paid',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get payRunRecordFailed => 'Could not record the run';
+
+  @override
+  String get payRunRecordLoadFailed => 'Failed to load payment run';
+
+  @override
+  String get payRunStatusExported => 'Exported';
+
+  @override
+  String get codedRefusalPaymentsRecordOnly =>
+      'FeohLedger does not send payments for this organization. Pay the supplier from your bank or ERP, then record the payment as paid outside FeohLedger.';
+
+  @override
+  String codedRefusalExternalPaymentForInvoice(String invoice, String reason) {
+    return 'Invoice $invoice: $reason';
+  }
+
+  @override
+  String codedRefusalExternalPaymentNotPayable(String status) {
+    return 'Only an approved invoice that has not been paid can be recorded as paid (this one is $status).';
+  }
+
+  @override
+  String get codedRefusalExternalPaymentSegregation =>
+      'Segregation of duties: you created or shaped this invoice, so a different user must record its payment.';
+
+  @override
+  String get codedRefusalExternalPaymentCardLive =>
+      'A live virtual card is issued against this invoice. Cancel the card before recording a payment made another way.';
+
+  @override
+  String get codedRefusalExternalPaymentCreditConflict =>
+      'An applied credit memo no longer matches this invoice\'s vendor or currency, so the amount owed can\'t be stated. Correct the invoice first.';
+
+  @override
+  String get codedRefusalExternalPaymentNothingToPay =>
+      'This invoice is fully covered by applied credit memos, so there is nothing to record as paid.';
+
+  @override
+  String codedRefusalExternalPaymentPaymentLive(String status) {
+    return 'A payment for this invoice is already in progress or settled ($status). Void it before recording a payment made another way.';
+  }
+
+  @override
+  String codedRefusalExternalPaymentInRun(String run) {
+    return 'This invoice is in payment run $run. Record the whole run as paid outside FeohLedger, or cancel the run first.';
+  }
+
+  @override
+  String codedRefusalExternalPaymentAmountMismatch(String amount) {
+    return 'The amount must equal what the invoice owes ($amount), net of applied credit memos and any accepted early-payment discount. Partial payments can\'t be recorded.';
+  }
+
+  @override
+  String codedRefusalExternalPaymentAmountChanged(
+    String staged,
+    String amount,
+  ) {
+    return 'What this invoice owes has changed since the run was staged ($staged staged, $amount owed now) because of a credit memo or an early-payment discount. Resolve the difference with the supplier, then record the invoice on its own.';
+  }
+
+  @override
+  String get codedRefusalExternalPaymentErpSplit =>
+      'The ERP reports this invoice paid with more than one payment method. Record it from its exception, which keeps how the payment was split.';
+
+  @override
+  String codedRefusalExternalPaymentErpSplitInRun(String run) {
+    return 'This invoice is in payment run $run, and the ERP reports it paid with more than one payment method, which only its exception can record. Cancel the run first, then record the invoice from its exception.';
+  }
+
+  @override
+  String get codedRefusalExternalPaymentPaidOnFuture =>
+      'The paid-on date can\'t be in the future.';
+
+  @override
+  String get codedRefusalPaymentRunSegregation =>
+      'Segregation of duties: the user who created this payment run cannot also approve or execute it. A different user must.';
+
+  @override
+  String get codedRefusalPaymentRunSegregationRecord =>
+      'Segregation of duties: the user who created this payment run cannot also record it as paid. A different user must.';
+
+  @override
+  String get codedRefusalPaymentRunSegregationExport =>
+      'Segregation of duties: the user who created this payment run cannot also export its bank file. A different user must.';
+
+  @override
+  String get codedRefusalPaymentRunAwaitingCfo =>
+      'This run exceeds the organization\'s CFO-approval threshold and is awaiting sign-off from a user with the CFO role.';
+
+  @override
+  String get codedRefusalMfaCodeInvalid =>
+      'That code is not valid. Check your authenticator app and try again.';
+
+  @override
+  String get codedRefusalMfaEmailCodeInvalid =>
+      'That code is not valid or has expired. Request a new code and try again.';
+
+  @override
+  String get codedRefusalPaymentRunNotRecordable =>
+      'Only a draft run, or one whose bank file was exported, can be recorded as paid.';
+
+  @override
+  String get codedRefusalPaymentRunNothingToRecord =>
+      'This run has no payments left to record.';
+
+  @override
+  String get codedRefusalExternalPaymentBlockingException =>
+      'This invoice has an unresolved payment-blocking exception. Resolve it before recording the invoice as paid.';
+
+  @override
+  String get grRecordTitle => 'Record goods receipt';
+
+  @override
+  String get grRecordIntro =>
+      'Record what arrived against a purchase order. Invoices that quote the PO are matched again as soon as you save.';
+
+  @override
+  String get grRecordSearchPo => 'Find PO';
+
+  @override
+  String get grRecordSearchPlaceholder => 'PO number';
+
+  @override
+  String get grRecordPo => 'Purchase order';
+
+  @override
+  String get grRecordNoPos => 'No matching purchase orders';
+
+  @override
+  String get grRecordLoadPosFailed => 'Failed to load purchase orders';
+
+  @override
+  String get grRecordLoadPoFailed => 'Failed to load the purchase order';
+
+  @override
+  String grRecordPoCancelled(String number) {
+    return 'Purchase order $number is cancelled, so nothing can be received against it.';
+  }
+
+  @override
+  String get grRecordOrdered => 'Ordered';
+
+  @override
+  String get grRecordAlreadyReceived => 'Received so far';
+
+  @override
+  String get grRecordOutstanding => 'Outstanding';
+
+  @override
+  String get grRecordThisDelivery => 'This delivery';
+
+  @override
+  String grRecordQuantityFor(String line) {
+    return 'Quantity received for $line';
+  }
+
+  @override
+  String get grRecordOverReceipt =>
+      'More than is outstanding. Matching will flag this as an over-receipt.';
+
+  @override
+  String get grRecordLinesHint =>
+      'Leave a line blank if it wasn\'t part of this delivery. Enter 0 to record that it was expected but didn\'t arrive.';
+
+  @override
+  String get grRecordNoPoLines =>
+      'This purchase order has no lines, so describe what arrived.';
+
+  @override
+  String get grRecordAddLine => 'Add line';
+
+  @override
+  String grRecordRemoveLine(int n) {
+    return 'Remove line $n';
+  }
+
+  @override
+  String grRecordLineDescription(int n) {
+    return 'Description, line $n';
+  }
+
+  @override
+  String grRecordLineQuantity(int n) {
+    return 'Quantity received, line $n';
+  }
+
+  @override
+  String get grRecordReceivedDate => 'Received on';
+
+  @override
+  String get grRecordNumber => 'Delivery note number';
+
+  @override
+  String get grRecordNumberHint =>
+      'Optional. The supplier\'s packing slip or delivery note number.';
+
+  @override
+  String grRecordNumberPlaceholder(String po) {
+    return 'Blank: GR-$po-n';
+  }
+
+  @override
+  String get grRecordSaving => 'Recording…';
+
+  @override
+  String get grRecordSubmit => 'Record receipt';
+
+  @override
+  String grRecordRecorded(String number) {
+    return 'Recorded goods receipt $number';
+  }
+
+  @override
+  String get grRecordFailed => 'Failed to record the goods receipt';
+
+  @override
+  String get settingsGoodsReceipt => 'Record receipt';
+
+  @override
+  String codedRefusalGoodsReceiptPoCancelled(String poNumber) {
+    return 'Purchase order $poNumber is cancelled; nothing can be received against it.';
+  }
+
+  @override
+  String codedRefusalGoodsReceiptNumberTaken(String grNumber) {
+    return 'A goods receipt numbered $grNumber already exists.';
+  }
+
+  @override
+  String get codedRefusalGoodsReceiptLineNotOnPo =>
+      'Every received line must be one of this purchase order\'s lines.';
+
+  @override
+  String get codedRefusalGoodsReceiptLineDuplicated =>
+      'A purchase-order line can appear only once on a receipt.';
+
+  @override
+  String get codedRefusalGoodsReceiptLineRequired =>
+      'Describe what was received on each line.';
+
+  @override
+  String get codedRefusalGoodsReceiptNothingReceived =>
+      'A receipt must record at least one unit received.';
+
+  @override
+  String get codedRefusalGoodsReceiptIdempotencyReused =>
+      'This request was already used for a different purchase order. Reopen the form and try again.';
+
+  @override
+  String get settingsGoodsReceiptHint =>
+      'Count a delivery in against a purchase order';
+
+  @override
+  String get grRecordSegregationNote =>
+      'Segregation of duties: once you record this receipt, you can\'t approve an invoice billed against this purchase order, and a receipt you record after approving one doesn\'t release it.';
+
+  @override
+  String get grRecordReceiveLines => 'Enter a quantity on at least one line';
+
+  @override
+  String get listShowingSavedCopy =>
+      'Showing a saved copy — couldn\'t reach the server. Tap Retry to try again.';
+
+  @override
+  String get listRefreshFailed =>
+      'Couldn\'t refresh — showing the last list loaded. Tap Retry to try again.';
+
+  @override
+  String exceptionsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load exceptions: $error';
+  }
+
+  @override
+  String contractsLoadErrorPrefix(String error) {
+    return 'Couldn\'t load contracts: $error';
+  }
+
+  @override
+  String get errorNetworkUnreachable =>
+      'Couldn\'t reach the server. Check your connection and try again.';
+
+  @override
+  String errorRequestFailed(int status) {
+    return 'The server couldn\'t complete the request (HTTP $status).';
+  }
+
+  @override
+  String get errorUnexpected => 'Something went wrong. Please try again.';
+
+  @override
+  String payRunCreated(int count, String amount, String cfo) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          'Payment run created with $count payments totalling $amount. CFO approval is required before it can be executed.',
+      one:
+          'Payment run created with $count payment totalling $amount. CFO approval is required before it can be executed.',
+    );
+    String _temp1 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Payment run created with $count payments totalling $amount.',
+      one: 'Payment run created with $count payment totalling $amount.',
+    );
+    String _temp2 = intl.Intl.selectLogic(cfo, {
+      'required': '$_temp0',
+      'other': '$_temp1',
+    });
+    return '$_temp2';
+  }
+
+  @override
+  String payRunCreatedPlain(String cfo) {
+    String _temp0 = intl.Intl.selectLogic(cfo, {
+      'required': 'Payment run created. CFO approval is required before it can be executed.',
+      'other': 'Payment run created.',
+    });
+    return '$_temp0';
+  }
+
+  @override
+  String get payRunApproved => 'Run approved by CFO';
+
+  @override
+  String payRunExecuted(
+    String provider,
+    int completed,
+    int inFlight,
+    int failed,
+  ) {
+    String _temp0 = intl.Intl.pluralLogic(
+      completed,
+      locale: localeName,
+      other: '$completed completed',
+      one: '$completed completed',
+    );
+    String _temp1 = intl.Intl.pluralLogic(
+      inFlight,
+      locale: localeName,
+      other: '$inFlight in flight',
+      one: '$inFlight in flight',
+    );
+    String _temp2 = intl.Intl.pluralLogic(
+      failed,
+      locale: localeName,
+      other: '$failed failed',
+      one: '$failed failed',
+    );
+    return 'Payment run executed via $provider: $_temp0, $_temp1, $_temp2.';
+  }
+
+  @override
+  String get payRunExecutedPlain => 'Payment run executed.';
+
+  @override
+  String payRunExecutedCards(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count virtual cards issued.',
+      one: '$count virtual card issued.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String payRunCancelled(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Draft run cancelled; $count invoices returned to the queue.',
+      one: 'Draft run cancelled; $count invoice returned to the queue.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get payRunCancelledPlain => 'Payment run cancelled.';
+
+  @override
+  String vendorSyncSummary(int created, int updated, int unchanged) {
+    String _temp0 = intl.Intl.pluralLogic(
+      created,
+      locale: localeName,
+      other: '$created new',
+      one: '$created new',
+    );
+    String _temp1 = intl.Intl.pluralLogic(
+      updated,
+      locale: localeName,
+      other: '$updated updated',
+      one: '$updated updated',
+    );
+    String _temp2 = intl.Intl.pluralLogic(
+      unchanged,
+      locale: localeName,
+      other: '$unchanged unchanged',
+      one: '$unchanged unchanged',
+    );
+    return 'Synced $_temp0, $_temp1, $_temp2.';
+  }
+
+  @override
+  String get vendorSyncComplete => 'ERP sync complete.';
+
+  @override
+  String vendorSyncNotLinked(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count not linked (the name matches more than one vendor).',
+      one: '$count not linked (the name matches more than one vendor).',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String vendorSyncUnlinked(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count unlinked (linked under another ERP company).',
+      one: '$count unlinked (linked under another ERP company).',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String vendorSyncRelinked(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          '$count relinked (linked when this ERP company was connected before).',
+      one:
+          '$count relinked (linked when this ERP company was connected before).',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get authInvalidCredentials => 'Invalid credentials';
+
+  @override
+  String get authInvalidCode => 'Invalid or expired code. Please try again.';
+
+  @override
+  String get authVerifyCodeFailed =>
+      'Could not verify the code. Please try again.';
+
+  @override
+  String get authEmailCodeFailed =>
+      'Could not send the email code. Please try again.';
+
+  @override
+  String exceptionsFilteredEmpty(String status) {
+    String _temp0 = intl.Intl.selectLogic(status, {
+      'open': 'No open exceptions',
+      'escalated': 'No escalated exceptions',
+      'resolved': 'No resolved exceptions',
+      'dismissed': 'No dismissed exceptions',
+      'other': 'No matching exceptions',
+    });
+    return '$_temp0';
+  }
+
+  @override
+  String get contractsFilteredEmpty =>
+      'No contracts match your search or filter.';
+
+  @override
+  String get vendorsFilteredEmpty => 'No vendors match your search or filter.';
+
+  @override
+  String get commonShowAll => 'Show all';
+
+  @override
+  String get listLoadMore => 'Load more';
+
+  @override
+  String listShowingCount(int shown, int total) {
+    return 'Showing $shown of $total';
+  }
+
+  @override
+  String listShowingAll(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Showing all $count',
+      one: 'Showing the only item',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get listLoadMoreFailed => 'Couldn\'t load more.';
+
+  @override
+  String invoicesLoadErrorPrefix(String error) {
+    return 'Couldn\'t load invoices: $error';
+  }
+
+  @override
+  String approvalsLoadErrorPrefix(String error) {
+    return 'Could not load pending approvals: $error';
+  }
+
+  @override
+  String get invoicesFilteredEmpty => 'No invoices match these filters';
+
+  @override
+  String statusPillAnnounce(String label) {
+    return 'Status: $label';
+  }
+
+  @override
+  String get vendorStatusActive => 'Active';
+
+  @override
+  String get vendorStatusUnverified => 'Unverified';
+
+  @override
+  String get vendorStatusInactive => 'Inactive';
+
+  @override
+  String get vendorStatusRejected => 'Rejected';
+
+  @override
+  String get contractStatusDraft => 'Draft';
+
+  @override
+  String get contractStatusActive => 'Active';
+
+  @override
+  String get contractStatusExpired => 'Expired';
+
+  @override
+  String get contractStatusTerminated => 'Terminated';
+
+  @override
+  String get contractStatusCancelled => 'Cancelled';
+
+  @override
+  String get contractTypePurchase => 'Purchase';
+
+  @override
+  String get contractTypeService => 'Service';
+
+  @override
+  String get contractTypeSubscription => 'Subscription';
+
+  @override
+  String get contractTypeLease => 'Lease';
+
+  @override
+  String get contractTypeSla => 'SLA';
+
+  @override
+  String get contractTypeMsa => 'MSA';
+
+  @override
+  String get contractTypeSow => 'SOW';
+
+  @override
+  String get contractTypeOther => 'Other';
+
+  @override
+  String get exceptionStatusOpen => 'Open';
+
+  @override
+  String get exceptionStatusEscalated => 'Escalated';
+
+  @override
+  String get exceptionStatusResolved => 'Resolved';
+
+  @override
+  String get exceptionStatusDismissed => 'Dismissed';
+
+  @override
+  String get exceptionSeverityError => 'Error';
+
+  @override
+  String get exceptionSeverityWarning => 'Warning';
+
+  @override
+  String get exceptionSeverityInfo => 'Info';
+
+  @override
+  String get vendorSourceErp => 'ERP';
+
+  @override
+  String get vendorSourceAi => 'AI';
+
+  @override
+  String get vendorSourceManual => 'Manual';
+
+  @override
+  String get vendorSourceOther => 'Other source';
+
+  @override
+  String get notificationEventInvoiceAssigned => 'Invoice assigned';
+
+  @override
+  String get notificationEventInvoiceApproved => 'Invoice approved';
+
+  @override
+  String get notificationEventInvoiceRejected => 'Invoice rejected';
+
+  @override
+  String get notificationEventInvoicePaid => 'Invoice paid';
+
+  @override
+  String get notificationEventContractRenewalDue => 'Contract renewal due';
+
+  @override
+  String get notificationEventChatMessage => 'New message';
+
+  @override
+  String get notificationEventOther => 'Notification';
+
+  @override
+  String get notificationUnread => 'Unread';
+
+  @override
+  String get relativeTimeJustNow => 'just now';
+
+  @override
+  String relativeTimeMinutesAgo(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count minutes ago',
+      one: '$count minute ago',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String relativeTimeHoursAgo(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count hours ago',
+      one: '$count hour ago',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String relativeTimeDaysAgo(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count days ago',
+      one: '$count day ago',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String notificationBellUnread(int count) {
+    return 'Notifications, $count unread';
+  }
+
+  @override
+  String get cashFlowButtonLabel => 'Cash flow forecast';
+
+  @override
+  String get listRowSelected => 'Selected';
+
+  @override
+  String get listRowNotSelected => 'Not selected';
+
+  @override
+  String listRowInvoiceNumber(String number) {
+    return 'invoice $number';
+  }
+
+  @override
+  String listRowDue(String date) {
+    return 'due $date';
+  }
+
+  @override
+  String listRowPastDue(String date) {
+    return 'past due $date';
+  }
+
+  @override
+  String listRowSeverity(String severity) {
+    return '$severity severity';
+  }
+
+  @override
+  String get listRowOverdue => 'Overdue';
+
+  @override
+  String listRowContractNumber(String number) {
+    return 'contract $number';
+  }
+
+  @override
+  String listRowEnds(String date) {
+    return 'ends $date';
+  }
+
+  @override
+  String listRowVendorCode(String code) {
+    return 'code $code';
+  }
+
+  @override
+  String listRowVendorSource(String source) {
+    return 'source $source';
+  }
+
+  @override
+  String listRowInvoiceCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count invoices',
+      one: '$count invoice',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String listRowInvoiceCountShort(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count inv',
+      one: '$count inv',
+    );
+    return '$_temp0';
   }
 }

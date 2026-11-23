@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
@@ -7,6 +7,7 @@ import 'package:feohledger_mobile/stores/admin_user_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/debouncer.dart';
+import 'package:feohledger_mobile/widgets/load_error_state.dart';
 
 /// Admin — user management. Lists the org's users (search by name/email) and
 /// lets an admin change a user's roles or activate / deactivate them over
@@ -75,7 +76,10 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           if (store.error != null && store.users.isEmpty) {
-            return _ErrorState(message: store.error!, onRetry: store.fetch);
+            return LoadErrorState(
+              message: AppLocalizations.of(context).adminUsersLoadError,
+              onRetry: store.fetch,
+            );
           }
           if (store.users.isEmpty) {
             return Center(child: Text(l.adminUsersEmpty));
@@ -88,10 +92,7 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
               separatorBuilder: (_, _) => const Divider(height: 1),
               itemBuilder: (context, index) {
                 final user = store.users[index];
-                return _UserTile(
-                  user: user,
-                  onTap: () => _showActions(user),
-                );
+                return _UserTile(user: user, onTap: () => _showActions(user));
               },
             ),
           );
@@ -137,9 +138,7 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
                   color: user.isActive ? Colors.red.shade700 : Colors.green,
                 ),
                 title: Text(
-                  user.isActive
-                      ? l.adminUsersDeactivate
-                      : l.adminUsersActivate,
+                  user.isActive ? l.adminUsersDeactivate : l.adminUsersActivate,
                 ),
                 subtitle: isSelf
                     ? Text(l.adminUsersCannotDeactivateSelf)
@@ -210,10 +209,12 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
     if (!mounted) return;
     final message = ok
         ? (target
-            ? l.adminUsersActivated(user.fullName)
-            : l.adminUsersDeactivated(user.fullName))
+              ? l.adminUsersActivated(user.fullName)
+              : l.adminUsersDeactivated(user.fullName))
         : l.adminUsersUpdateFailed(
-            user.fullName, AdminUserStore.instance.error ?? '');
+            user.fullName,
+            AdminUserStore.instance.error ?? '',
+          );
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
     A11y.announce(context, message);
@@ -237,61 +238,23 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
     if (!mounted) return;
 
     if (result == null) {
-      final message =
-          l.adminUsersCreateFailed(AdminUserStore.instance.error ?? '');
+      final message = l.adminUsersCreateFailed(
+        AdminUserStore.instance.error ?? '',
+      );
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(message)));
       A11y.announce(context, message);
       return;
     }
 
-    final message = l.adminUsersCreated(result.user.fullName);
+    // No credential to show: the new user was emailed a set-password link.
+    final message = l.adminUsersInvited(
+      result.user.fullName,
+      result.user.email,
+    );
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
     A11y.announce(context, message);
-    // Surface the one-time temp password so the admin can hand it over.
-    await _showTempPassword(result);
-  }
-
-  Future<void> _showTempPassword(CreateUserResult result) async {
-    final l = AppLocalizations.of(context);
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(l.adminUsersTempPasswordTitle),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(l.adminUsersTempPasswordBody(result.user.fullName)),
-            const SizedBox(height: 16),
-            Container(
-              width: double.infinity,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: Theme.of(dialogContext).colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: SelectableText(
-                result.temporaryPassword,
-                style: const TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          FilledButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: Text(AppLocalizations.of(dialogContext).commonClose),
-          ),
-        ],
-      ),
-    );
   }
 
   Future<void> _deleteUser(AdminUser user) async {
@@ -300,18 +263,14 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(l.adminUsersDeleteConfirmTitle(user.fullName)),
-        content: Text(
-          l.adminUsersDeleteConfirmBody(user.fullName, user.email),
-        ),
+        content: Text(l.adminUsersDeleteConfirmBody(user.fullName, user.email)),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
             child: Text(l.commonCancel),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Colors.red.shade700,
-            ),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700),
             onPressed: () => Navigator.of(dialogContext).pop(true),
             child: Text(l.adminUsersDelete),
           ),
@@ -325,7 +284,9 @@ class _AdminUsersScreenState extends State<AdminUsersScreen> {
     final message = ok
         ? l.adminUsersDeleted(user.fullName)
         : l.adminUsersDeleteFailed(
-            user.fullName, AdminUserStore.instance.error ?? '');
+            user.fullName,
+            AdminUserStore.instance.error ?? '',
+          );
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
     A11y.announce(context, message);
@@ -349,8 +310,8 @@ class _NewUserDraft {
 /// Create-user form sheet — full name + email (validated) + a checkbox per
 /// available system role. Returns a [_NewUserDraft] on Create, or null on
 /// Cancel / dismiss. Mirrors the `_RoleEditor` shape + the backend
-/// `CreateUserRequest` (email + full_name + role_names; the temp password is
-/// server-generated).
+/// `CreateUserRequest` (email + full_name + role_names; the user is emailed a
+/// set-password link — no password is ever generated or shown).
 class _CreateUserSheet extends StatefulWidget {
   final List<String> availableRoles;
 
@@ -525,10 +486,7 @@ class _RoleEditorState extends State<_RoleEditor> {
             padding: const EdgeInsets.all(16),
             child: Text(
               l.adminUsersEditRoles,
-              style: const TextStyle(
-                fontWeight: FontWeight.w600,
-                fontSize: 16,
-              ),
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
             ),
           ),
           const Divider(height: 1),
@@ -620,8 +578,7 @@ class _UserTile extends StatelessWidget {
               runSpacing: 4,
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                if (!user.isActive)
-                  _InactiveBadge(),
+                if (!user.isActive) _InactiveBadge(),
                 ...user.roles.map(
                   (r) => Chip(
                     label: Text(r, style: const TextStyle(fontSize: 11)),
@@ -658,30 +615,6 @@ class _InactiveBadge extends StatelessWidget {
           fontSize: 11,
           fontWeight: FontWeight.w600,
         ),
-      ),
-    );
-  }
-}
-
-class _ErrorState extends StatelessWidget {
-  final String message;
-  final Future<void> Function() onRetry;
-
-  const _ErrorState({required this.message, required this.onRetry});
-
-  @override
-  Widget build(BuildContext context) {
-    final l = AppLocalizations.of(context);
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.error_outline, size: 48, color: Colors.red.shade700),
-          const SizedBox(height: 12),
-          Text(l.adminUsersLoadError),
-          const SizedBox(height: 12),
-          FilledButton(onPressed: onRetry, child: Text(l.commonRetry)),
-        ],
       ),
     );
   }

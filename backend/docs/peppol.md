@@ -61,7 +61,7 @@ Each caller decides what the refusal means:
 | Call site | On refusal |
 |---|---|
 | `POST /api/invoices/{id}/peppol-send` | The adapter is resolved in step 5-6, **above** the step-7 slot claim, so a `PeppolSendError("peppol_provider_not_configured")` → **422** with no `PeppolTransmission` row at all and the live slot still free. The body carries the PII-free code, never the admin's raw settings value. |
-| `POST /api/peppol/inbound/{tenant_slug}` | **Bodyless 503**, not the route's usual 204. This is OUR failure, not a decision about the document (`decisions.md` §37): the message is still unprocessed work and a redelivery after the setting is fixed would succeed, so acking it drops a supplier's invoice permanently behind a log line. Bodyless keeps the detail and the tenant out of the response, and it narrows the enumeration surface to "while this tenant is already misconfigured" — the trade §37 accepted for email intake. |
+| `POST /api/peppol/inbound/{organization_id}` | **Bodyless 503**, not the route's usual 204. This is OUR failure, not a decision about the document (`decisions.md` §37): the message is still unprocessed work and a redelivery after the setting is fixed would succeed, so acking it drops a supplier's invoice permanently behind a log line. Bodyless keeps the detail and the tenant out of the response, and it narrows the enumeration surface to "while this tenant is already misconfigured" — the trade §37 accepted for email intake. |
 | `peppol_receive.receive_peppol_message` | Defence in depth (the route resolved the same adapter to parse): a soft `ReceiveResult(reason="peppol_provider_not_configured")` before the tenant engine opens, so no invoice, no transmission row, no S3 object — and never a 500 on a public webhook. |
 
 Guard: `tests/test_adapter_registry_fail_closed.py`.
@@ -255,13 +255,18 @@ provider HMAC signature.
 **Route (public-by-design, signature-gated, tenant in path):**
 
 ```
-POST /api/peppol/inbound/{tenant_slug}      → always 204 No Content
+POST /api/peppol/inbound/{organization_id}      → always 204 No Content
 ```
 
 The route mirrors the payment webhook (`/api/payments/webhook/{tenant_slug}/…`):
 no JWT, no `X-Tenant-Slug` header — the tenant is the URL path segment, so each
 tenant configures its own inbound URL with the Access Point and a leaked URL
-only affects that one tenant. **Every** path — success and every rejection —
+only affects that one tenant. **The segment is the organisation's id, never its
+slug** (decisions §306): the signing key is platform-wide, so the path is the only
+binding, and a slug can pass to a new workspace after a closure's cooldown — an
+Access Point still configured with a slug URL would hand the closed tenant's
+supplier invoices to the new owner. An id is never reused. A slug or any other
+non-id segment is the silent 204 of an unknown tenant. **Every** path — success and every rejection —
 returns `204` silently with a PII-free `logger.warning` (reason code only); a
 distinct 4xx would enumerate which slugs / signing secrets / payload shapes are
 accepted, and the supplier's participant value / tax id / payload never enters a
@@ -289,7 +294,9 @@ log line or the body.
    `InboundPeppolMessage` (message id, sender scheme/value, doc type, process
    id, payload). `None` / missing message id → 204 (can't dedupe → refuse).
 6. In a short-lived tenant session: dedupe pre-check → parse/validate the
-   payload with the **existing** `e_invoice.parse_e_invoice` (malformed →
+   payload with the **existing** `e_invoice.parse_e_invoice`, on a worker
+   thread (`asyncio.to_thread`: a payload starting `%PDF` is probed as a
+   Factur-X hybrid with PyMuPDF whatever mime is passed; malformed →
    204, no invoice) → create `Invoice(status=new)` (vendor/amount/currency from
    the UBL; **amount is `Decimal`**) → freeze the invoice's `WorkflowInstance`
    snapshot (`create_workflow_instance`, same as every other ingress — without
@@ -347,6 +354,19 @@ before either is called.
 
 Per-org overrides live on `Organization.settings.peppol` and win over the
 process-level defaults.
+
+**A per-org `gateway_url` is SSRF-guarded; the operator's is not.** Any tenant
+admin can write `settings.peppol.gateway_url`, and every gateway call carries the
+API key, so `as4_gateway._client` sends it through `url_safety.org_host_client`:
+in a deployed `FEOH_ENVIRONMENT` the URL must resolve only to public addresses
+(checked up front, then pinned at connect so a rebinding DNS answer cannot reach
+an internal host — decisions §334). A refusal sends nothing and reads as the
+PII-free `gateway_url_not_public` (send's `failure_reason`, resolve's
+`unregistered_reason`; `test_connection` is `False`). Outside a deployed
+environment loopback is allowed, still pinned, so a local Access Point emulator
+on `localhost` works. `FEOH_PEPPOL_GATEWAY_URL` is operator configuration, trusted
+like every operator override, and keeps a plain client. Guarded by
+`tests/test_url_safety.py`.
 
 ## Local-first
 

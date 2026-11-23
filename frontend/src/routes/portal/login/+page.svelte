@@ -1,11 +1,16 @@
 <script lang="ts">
+	import { apiErrorMessage } from '#lib/utils/apiError.ts';
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 	import { portalBrand } from '#lib/stores/portalBrand.svelte.ts';
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
+	import PasswordInput from '#lib/components/auth/PasswordInput.svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
-	let email = $state('');
+	// Prefilled from `?email=` — the set-password page's "Go to sign in" link
+	// passes the account it just set a password for.
+	let email = $state(page.url.searchParams.get('email') ?? '');
 	let password = $state('');
 	let error = $state('');
 	let loading = $state(false);
@@ -43,7 +48,7 @@
 				afterAuth();
 			}
 		} catch (err) {
-			error = err instanceof Error ? err.message : m('portal.login.failed');
+			error = apiErrorMessage(err, m('portal.login.failed'));
 		} finally {
 			loading = false;
 		}
@@ -58,7 +63,7 @@
 			await portalAuth.completeMfa(mfaChallenge, mfaCode, mfaMethod);
 			afterAuth();
 		} catch (err) {
-			error = err instanceof Error ? err.message : m('portal.login.mfa.failed');
+			error = apiErrorMessage(err, m('portal.login.mfa.failed'));
 		} finally {
 			loading = false;
 		}
@@ -74,7 +79,7 @@
 			mfaCode = '';
 			emailSent = true;
 		} catch (err) {
-			error = err instanceof Error ? err.message : m('portal.login.mfa.sendFailed');
+			error = apiErrorMessage(err, m('portal.login.mfa.sendFailed'));
 		} finally {
 			emailSending = false;
 		}
@@ -201,14 +206,18 @@
 				<span>{m('portal.login.email')}</span>
 				<input type="email" bind:value={email} required autocomplete="username" />
 			</label>
-			<label>
-				<span>{m('portal.login.password')}</span>
-				<input type="password" bind:value={password} required autocomplete="current-password" />
-			</label>
+			<PasswordInput
+				id="portal-login-password"
+				label={m('portal.login.password')}
+				bind:value={password}
+				required
+				autocomplete="current-password"
+			/>
 
 			<button type="submit" disabled={loading}>
 				{loading ? m('portal.login.signingIn') : m('portal.login.signIn')}
 			</button>
+			<a class="forgot-link" href="/portal/forgot-password">{m('auth.login.forgotPassword')}</a>
 		</form>
 	{/if}
 </div>
@@ -299,8 +308,8 @@
 		color: var(--text-muted);
 	}
 	.error {
-		background: rgba(224, 64, 64, 0.1);
-		border: 1px solid rgba(224, 64, 64, 0.3);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		color: var(--danger);
 		padding: 10px 14px;
 		border-radius: 4px;
@@ -318,7 +327,7 @@
 		text-transform: uppercase;
 		letter-spacing: 0.03em;
 	}
-	input {
+	input:not([type='checkbox']):not([type='radio']) {
 		background: var(--bg);
 		border: 1px solid var(--border);
 		border-radius: 4px;
@@ -327,10 +336,36 @@
 		color: var(--text);
 		font-family: inherit;
 	}
-	input:focus {
+	input:not([type='checkbox']):not([type='radio']):focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
+	}
+	/* The password field is PasswordInput (the show-password toggle the
+	   employee sign-in has), so its label and input are that component's
+	   elements: the same recipe, reached through `:global()` and wrapped in
+	   `:where()` so the component's own rules (the toggle's room) still win. */
+	.login-card :global(:where(.password-field label > span)) {
+		font-size: 0.78rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+	}
+	.login-card :global(:where(.password-field input:not([type='checkbox']):not([type='radio']))) {
+		width: 100%;
+		background: var(--bg);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		padding: 10px 12px;
+		font-size: 0.9rem;
+		color: var(--text);
+		font-family: inherit;
+	}
+	.login-card :global(:where(.password-field input:not([type='checkbox']):not([type='radio']):focus)) {
+		outline: none;
+		border-color: var(--accent);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 	button {
 		margin-top: 8px;
@@ -354,6 +389,13 @@
 		color: var(--text-muted);
 		font-weight: 400;
 		font-size: 0.82rem;
+	}
+	.forgot-link {
+		align-self: center;
+		margin-top: -4px;
+		font-size: 0.82rem;
+		color: var(--accent-strong);
+		text-decoration: underline;
 	}
 	.secondary {
 		margin-top: 0;

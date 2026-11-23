@@ -70,6 +70,18 @@ describe('the Cookie Notice lists every key the app actually stores', () => {
 		).toEqual([]);
 	});
 
+	test('the theme is the only cookie the app writes, as the notice promises', () => {
+		// The notice and the Privacy Policy say the app sets exactly one cookie,
+		// `feoh_theme` (docs/decisions.md §290). A second `document.cookie =`
+		// anywhere would make that false without touching either page.
+		const writers = sourceFiles(SRC).filter((file) =>
+			/\.cookie\s*=(?!=)/.test(readFileSync(file, 'utf8'))
+		);
+		expect(writers.map((f) => f.slice(SRC.length))).toEqual(['lib/theme.ts']);
+		expect(page).toContain('the only cookie it sets is');
+		expect(page).toMatch(/<code>feoh_theme<\/code><\/td>\s*<td>Cookie/);
+	});
+
 	test('the dynamically-keyed entity selection is covered by its prefix', () => {
 		// `entity.ts` builds `selected_entity_id:<tenant>` at runtime, so the scan
 		// above cannot see it. The prefix is the stable part and is what the
@@ -82,7 +94,13 @@ describe('the Cookie Notice lists every key the app actually stores', () => {
 		// vacuously — the failure mode this guard is least able to notice about
 		// itself.
 		const found = declaredKeys();
-		for (const known of ['auth_token', 'portal_auth_token', 'feoh_locale', 'feoh_consent_choice']) {
+		for (const known of [
+			'auth_token',
+			'portal_auth_token',
+			'feoh_locale',
+			'feoh_theme',
+			'feoh_consent_choice'
+		]) {
 			expect(found, `scan missed a known key: ${known}`).toContain(known);
 		}
 	});

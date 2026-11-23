@@ -6,8 +6,10 @@ Uses the extraction adapter pattern — supports platform (Claude Vision) and BY
 Tracks usage for billing when platform mode is used.
 """
 
+import asyncio
 import functools
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -25,14 +27,15 @@ from app.services.decimal_convention import (
     apply_convention,
     detect_convention,
 )
-from app.services.extraction_adapters.base import ExtractionResult
+from app.services.extraction_adapters.base import ExtractedLineItem, ExtractionResult
 from app.services.invoice_warning_catalog import warning
 from app.services.workflow_engine import (
     advance_workflow,
     get_workflow_instance,
     transition_invoice,
 )
-from app.utils.dates import parse_ambiguous_date, resolve_day_first_preference, utc_today
+from app.utils.currency_code import iso_currency_or_none
+from app.utils.dates import parse_ambiguous_date, resolve_day_first_preference
 
 logger = logging.getLogger(__name__)
 
@@ -103,25 +106,33 @@ def resolve_platform_provider(
     return PLATFORM_OFFLINE_PROVIDER, PLATFORM_REASON_NO_KEY_LOCAL
 
 
-def _resolve_extraction_config(org_settings: dict | None, *, announce: bool = True) -> dict:
+async def _resolve_extraction_config(
+    org_settings: dict | None, *, organization_id: uuid.UUID, announce: bool = True
+) -> dict:
     """Build extraction adapter config based on org settings and program type.
+
+    A BYOK org's key is sealed (`services/provider_credentials`, block
+    ``extraction``), so it is opened here through
+    :func:`provider_credentials.byok_extraction_config` — the only way an
+    adapter gets a tenant's own key. A platform-mode org reads nothing sealed.
 
     ``announce=False`` resolves silently. The failure path re-resolves purely to
     read `provider` / `program_type` for the `ExtractionUsage` row, and a second
     identical warning per failed extraction turns the fallback signal into noise
     — which is how a warning stops being read.
     """
-    extraction = (org_settings or {}).get("extraction", {})
-    program_type = extraction.get("program_type", "platform")
+    from app.services import provider_credentials
 
-    if program_type == "byok":
-        # A COPY: `run_extraction` writes this invoice's `gl_account_catalog`
-        # and RAG `few_shot_prompt` into the config it gets back, and handing
-        # out the org's own nested dict wrote them into `org_settings` — so a
-        # caller reusing that dict for a second extraction sent the previous
-        # invoice's chart (another entity's, possibly) and neighbours as this
-        # one's hints whenever this one had none of its own to overwrite them.
-        return dict(extraction)
+    byok = await provider_credentials.byok_extraction_config(organization_id, org_settings)
+    if byok is not None:
+        # A fresh dict per call: `run_extraction` writes this invoice's
+        # `gl_account_catalog` and RAG `few_shot_prompt` into the config it gets
+        # back, and handing out the org's own nested dict wrote them into
+        # `org_settings` — so a caller reusing that dict for a second extraction
+        # sent the previous invoice's chart (another entity's, possibly) and
+        # neighbours as this one's hints whenever this one had none of its own
+        # to overwrite them.
+        return dict(byok)
 
     # Platform mode — use app-level keys
     provider, reason = resolve_platform_provider(
@@ -233,7 +244,8 @@ async def _pause_ai_reading(
 #: code rides the `invoice.extraction_completed` audit row's details as
 #: ``auto_approve_suppressed``, so a reviewer (and the touchless-rate reader)
 #: can tell "the gates didn't fire" from "the gates fired and a person was
-#: required anyway".
+#: required anyway". `invoice_warnings.UNATTENDED_APPROVAL_PO_HOLD_*` join them
+#: when a PO-match hold stops the approval (decisions §425).
 AUTO_APPROVE_SUPPRESSED_BY_CALLER = "requested_by_caller"
 AUTO_APPROVE_SUPPRESSED_SEGREGATION_ACTORS = "segregation_actors"
 AUTO_APPROVE_SUPPRESSED_UPLOADED_BY_ANOTHER_USER = "uploaded_by_another_user"
@@ -351,7 +363,8 @@ def decide_auto_approve(
       * ``require_cfo_above`` — demands a CFO; the ``system (auto-approve)`` actor
         is not a CFO.
     When either gate would trip, the invoice falls back to human review rather
-    than auto-approving past the control. Amount is compared with ``Decimal`` so
+    than auto-approving past the control. An amount of zero or less — no amount
+    was read — never auto-approves on either trigger. Amount is compared with ``Decimal`` so
     a boundary value isn't misjudged by a float cast. Pure — no IO.
 
     ``aggregate_amount`` is what those two gates are measured against: this
@@ -386,6 +399,16 @@ def decide_auto_approve(
 
     amount_gate = _coerce_gate_amount(amount)
     gate_amount = amount_gate if aggregate_amount is None else _coerce_gate_amount(aggregate_amount)
+
+    # No amount was read — nothing here for a policy to approve. An extraction
+    # that leaves the amount at the upload's 0 placeholder (an unparseable
+    # token, or a currency the document contradicts — `_apply_extraction`)
+    # raises `missing_amount`, but that warning is not an input to this pure
+    # gate, and without this a 0 sails under any `auto_approve_below` floor and
+    # past every max / CFO cap. Same `<= 0` rule as the `missing_amount`
+    # warning in `invoice_warnings.refresh_warnings` (`decisions.md` §308).
+    if amount_gate.amount <= 0:
+        return False
 
     # A confidence outside 0..1 is not evidence of anything — it is an adapter
     # reporting on a scale we didn't ask for. Treating it as "very confident" is
@@ -508,13 +531,21 @@ async def resolve_gate_aggregate(
     cfg = get_structuring_config(org_settings)
     if not cfg["enabled"]:
         return amount
+    # A code-less invoice has no currency to scope the vendor's other spend to;
+    # its auto-approve gates fail closed on the unknown currency regardless
+    # (`currency_conversion.reporting_amount_at_locked_rate`, decisions §466).
+    from app.services.payment_runs import payable_currency_code
+
+    currency = payable_currency_code(getattr(invoice, "currency", None))
+    if currency is None:
+        return amount
     try:
         recent = await vendor_recent_spend(
             db,
             vendor_id=vendor_id,
             exclude_invoice_id=invoice.id,
             window_days=cfg["window_days"],
-            currency=getattr(invoice, "currency", None) or "USD",
+            currency=currency,
             entity_id=getattr(invoice, "entity_id", None),
         )
     except Exception:  # noqa: BLE001 — degrade to the single-invoice gate, never break
@@ -670,7 +701,7 @@ async def run_extraction(
     token_usage = None
 
     try:
-        config = _resolve_extraction_config(org_settings)
+        config = await _resolve_extraction_config(org_settings, organization_id=invoice_org_id)
 
         # `get_extraction_adapter` imports (and therefore registers) every
         # built-in adapter itself, and RAISES `UnknownExtractionProviderError`
@@ -703,8 +734,9 @@ async def run_extraction(
         # Factur-X file is routed to the deterministic `einvoice` adapter,
         # overriding the org's configured vision adapter. Everything else
         # (incl. plain scanned PDFs) falls through unchanged. This is the one
-        # detect site every ingress (upload + email-intake) reaches.
-        structured_format = _detect_structured_format(file_bytes, file_key)
+        # detect site every ingress (upload + email-intake) reaches. The probe
+        # opens a PDF (Factur-X attachment sniff), so it runs on a worker thread.
+        structured_format = await asyncio.to_thread(_detect_structured_format, file_bytes, file_key)
         extract_mime_type = "application/pdf"
         if structured_format is not None:
             config = {"program_type": "platform", "provider": "einvoice"}
@@ -740,12 +772,12 @@ async def run_extraction(
         # or the tenant has no embeddings yet.
         from app.services.rag import (
             build_few_shot_prompt,
-            extract_invoice_text,
             neighbors_to_metadata,
+            read_invoice_text,
             retrieve_similar,
         )
 
-        invoice_text = extract_invoice_text(file_bytes)
+        invoice_text = await read_invoice_text(file_bytes)
         neighbors = await retrieve_similar(db, invoice_text, exclude_invoice_id=invoice_id)
         if neighbors:
             config["few_shot_prompt"] = build_few_shot_prompt(neighbors)
@@ -862,23 +894,7 @@ async def run_extraction(
 
             line_item = InvoiceLineItem(
                 invoice_id=invoice.id,
-                line_number=li.line_number,
-                item_code=li.item_code.value if li.item_code.value else None,
-                description=li.description.value if li.description.value else None,
-                quantity=(
-                    _clean_decimal(li.quantity.value, amount_convention)
-                    if li.quantity.value
-                    else None
-                ),
-                unit_price=(
-                    _clean_decimal(li.unit_price.value, amount_convention)
-                    if li.unit_price.value
-                    else None
-                ),
-                tax=_clean_decimal(li.tax.value, amount_convention) if li.tax.value else None,
-                total=(
-                    _clean_decimal(li.total.value, amount_convention) if li.total.value else None
-                ),
+                **extracted_line_values(li, amount_convention),
                 gl_account=li_gl,
             )
             db.add(line_item)
@@ -1123,6 +1139,18 @@ async def run_extraction(
             suppression_reason = await _locked_auto_approve_suppression(
                 db, invoice_id, actor_id=actor_id, read_file_key=read_file_key
             )
+        if auto_approved and suppression_reason is None:
+            # The PO match `refresh_warnings` ran above gates the unattended
+            # approval as it gates `/complete`'s floor (decisions §425): an open
+            # `po_mismatch` / `quality_hold`, or a clearance of one that
+            # stamping the reader would undo (§422), lands at review. Asked
+            # before the stamp, so the invoice is never `approved` with a hold
+            # open.
+            from app.services.invoice_warnings import po_match_hold_refusal
+
+            suppression_reason = await po_match_hold_refusal(
+                db, invoice, approver_id=actor_id, org_settings=org_settings
+            )
         if suppression_reason is not None and auto_approved:
             # A human already rejected this document, an entry-only caller
             # supplied it, or someone other than the reader chose or shaped it
@@ -1138,8 +1166,17 @@ async def run_extraction(
             )
 
         if auto_approved:
-            invoice.approval_date = utc_today()
-            invoice.approved_by = "system (auto-approve)"
+            from app.services.approval_chain import record_final_approval
+
+            # The reader who asked for this read, or NULL for an unattended
+            # channel (decisions §389).
+            record_final_approval(invoice, approved_by="system (auto-approve)", actor_id=actor_id)
+            # The refresh above ran before the reader was the approver: a
+            # receipt or inspection hold they had cleared is re-judged now
+            # (decisions §422).
+            from app.services.invoice_warnings import reraise_holds_cleared_by_an_approver
+
+            await reraise_holds_cleared_by_an_approver(db, invoice, org_settings=org_settings)
 
         await transition_invoice(
             db,
@@ -1169,6 +1206,25 @@ async def run_extraction(
                 await advance_workflow(db, instance, "review", action="extracted")
 
         await db.commit()
+
+        if auto_approved:
+            # "Send to the ERP on approval" (decisions §304), in a transaction of
+            # its own now the approval has committed. Called here rather than
+            # queued post-commit: this runs on the extraction worker's loop,
+            # whose single-connection pool the committing session still holds
+            # while post-commit work runs; here it has been handed back. Its own
+            # session, so `invoice` is not expired under the caller. Never raises.
+            from app.services.erp_send import send_after_approval
+
+            await send_after_approval(
+                db.bind,
+                invoice_id=invoice_id,
+                org_id=invoice_org_id,
+                org_settings=org_settings,
+                actor_id=actor_id,
+                # This loop closes when the extraction job returns.
+                inline_dispatch=True,
+            )
 
         # Billing follow-ups for a read that counted (decisions §253): report
         # any new overage to the billing provider and send a newly reached
@@ -1211,7 +1267,9 @@ async def run_extraction(
             # Silent: the success path above already announced any provider
             # fallback for this attempt, and repeating it here would double
             # every such warning per failed extraction.
-            config = _resolve_extraction_config(org_settings, announce=False)
+            config = await _resolve_extraction_config(
+                org_settings, organization_id=invoice_org_id, announce=False
+            )
             db.add(
                 ExtractionUsage(
                     invoice_id=invoice_id,
@@ -1223,17 +1281,28 @@ async def run_extraction(
                     **(token_usage.as_columns() if token_usage else {}),
                 )
             )
-        except Exception:
-            pass
+        except Exception as meter_exc:  # noqa: BLE001 — losing the meter must not cost the exception record
+            # The class only: the message can quote provider or document text.
+            logger.warning(
+                "[extraction] Failed-usage row not recorded: %s", type(meter_exc).__name__
+            )
 
         # Create exception record (shared chokepoint → emits `exception.raised`)
         from app.services.exception_service import create_exception
+        from app.services.invoice_warning_catalog import exception_finding
 
+        # The exception CLASS, never `str(exc)`: a provider or parser error's
+        # message can quote the document it choked on (a vendor's bank line, a
+        # tax id), and this row is what every AP user reads in the exception
+        # queue (decisions §358).
+        failed = exception_finding("extraction_failed", errorClass=type(exc).__name__)
         await create_exception(
             db,
             exception_type="extraction_failed",
             severity="error",
-            description=f"Extraction failed: {str(exc)[:500]}",
+            description=failed["message"],
+            description_code=failed["code"],
+            description_params=failed["params"],
             status="open",
             organization_id=invoice_org_id,
             invoice=invoice,  # exception follows its invoice (P2)
@@ -1294,6 +1363,24 @@ _CURRENCY_SYMBOLS = "$\u20ac\u00a3\u00a5\u20b9\u20bd\u20a9\u0e3f\u20aa\u20a6"
 # thousands separator in French convention (``1 234,56``).
 _NUMERIC_WHITESPACE = (" ", "\t", "\u00a0", "\u202f")
 
+# An ISO 4217-shaped currency code written beside the figure — ``EUR 8.739,84``,
+# ``1,234.56 USD``. A model transcribing the printed total keeps the code the
+# page prints, and left in place it made the whole token unparseable: the
+# invoice's ``amount`` silently stayed empty and every self-check that needs it
+# skipped (issue #575). It is stripped for the magnitude, but it is NOT
+# decoration: it is the document stating the figure's currency, so
+# :func:`_amount_core_and_codes` hands it back and
+# :func:`extraction_currency_evidence` weighs it against the ``currency`` field
+# (`decisions.md` §308). Discarding it is how ``GBP 9,500.00`` with no currency
+# field was stored as USD 9,500 — the column default — and cleared a USD cap.
+_CURRENCY_CODE_AFFIX = re.compile(
+    r"^(?P<lead>[A-Z]{3})(?=[\s\d.,(+-])|(?<=[\d.,)\s])(?P<trail>[A-Z]{3})$"
+)
+
+# Swiss grouping: ``1'234.50`` / ``1’234.50``. An apostrophe is never a decimal
+# point, so between a digit and a three-digit group it is dropped like a space.
+_APOSTROPHE_GROUP = re.compile(r"(?<=\d)['\u2019](?=\d{3}(?:\D|$))")
+
 # The money fields whose tokens vote on the document's decimal convention.
 # Deliberately money only: `tax_rate` is a percentage and `quantity` a count,
 # and neither is written under an amount's grouping habits.
@@ -1310,11 +1397,22 @@ def _amount_core(val: str | None) -> str | None:
     see is exactly the one that will be parsed. ``None`` when nothing numeric
     survives.
     """
+    return _amount_core_and_codes(val)[0]
+
+
+def _amount_core_and_codes(val: str | None) -> tuple[str | None, frozenset[str]]:
+    """:func:`_amount_core`, plus the ISO codes printed beside the figure.
+
+    The codes are the ones :data:`_CURRENCY_CODE_AFFIX` stripped — usually none,
+    one for ``GBP 9,500.00``, and two (a contradiction the caller must treat as
+    such) for ``USD 100 EUR``. They are returned whether or not the rest parses;
+    :func:`extraction_currency_evidence` only counts the codes of tokens that do.
+    """
     if val is None:
-        return None
+        return None, frozenset()
     s = str(val).strip()
     if s.casefold() in _NULL_SENTINELS:
-        return None
+        return None, frozenset()
 
     # Accounting negatives: "(123.45)" → "-123.45"
     if s.startswith("(") and s.endswith(")"):
@@ -1322,15 +1420,25 @@ def _amount_core(val: str | None) -> str | None:
 
     for sym in _CURRENCY_SYMBOLS:
         s = s.replace(sym, "")
+    codes: set[str] = set()
+
+    def _strip_code(m: re.Match) -> str:
+        codes.add(m.group("lead") or m.group("trail"))
+        return ""
+
+    s = _CURRENCY_CODE_AFFIX.sub(_strip_code, s.strip()).strip()
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1].strip()  # "EUR (12.50)" — the code sat outside the parentheses
     for ws in _NUMERIC_WHITESPACE:
         s = s.replace(ws, "")
+    s = _APOSTROPHE_GROUP.sub("", s)
     s = s.replace("%", "")
     # Unicode minus → ASCII minus
     s = s.replace("\u2212", "-")
 
     if not s or s.casefold() in _NULL_SENTINELS:
-        return None
-    return s
+        return None, frozenset(codes)
+    return s, frozenset(codes)
 
 
 def extraction_amount_convention(result: ExtractionResult) -> AmountConvention | None:
@@ -1374,14 +1482,154 @@ def _clean_decimal(val: str | None, convention: AmountConvention | None = None) 
     keeps the historical US reading there.
 
     Returns None on anything that can't be parsed — never raises.
+
+    The magnitude only: an ISO code printed beside the figure is stripped and
+    dropped here. A caller that decides a currency reads it through
+    :func:`_clean_decimal_and_codes` instead.
     """
-    core = _amount_core(val)
+    return _clean_decimal_and_codes(val, convention)[0]
+
+
+def _clean_decimal_and_codes(
+    val: str | None, convention: AmountConvention | None = None
+) -> tuple[Decimal | None, frozenset[str]]:
+    """:func:`_clean_decimal`, plus the currency codes the token printed.
+
+    The codes come back only when the magnitude parsed — a code beside
+    something that is not a number is not evidence of a number's currency.
+    """
+    core, codes = _amount_core_and_codes(val)
     if core is None:
-        return None
+        return None, frozenset()
     try:
-        return Decimal(apply_convention(core, convention))
-    except Exception:
+        return Decimal(apply_convention(core, convention)), codes
+    except Exception:  # noqa: BLE001 — an unparseable token is "no amount read", never an error
+        return None, frozenset()
+
+
+def _clean_currency_code(val: str | None) -> str | None:
+    """The model's ``currency`` field as an uppercase 3-letter code, or None.
+
+    Models sometimes return ``"US Dollars"`` or ``"USD."``; the sentinel
+    filter + uppercase + trailing-dot trim recovers the second, and anything
+    that is not then three letters is not a code.
+    """
+    cur = _clean_string(val)
+    if cur is None:
         return None
+    # The shared rule: three ASCII letters (decisions §381). `isalpha()` alone
+    # admitted a model's "ÄÖÜ".
+    return iso_currency_or_none(cur.rstrip(".").strip())
+
+
+@dataclass(frozen=True)
+class CurrencyEvidence:
+    """What one extraction says about the currency of its money.
+
+    Two sources can name it: the model's ``currency`` field, and the ISO codes
+    the page printed beside the amounts themselves (``GBP 9,500.00``). They are
+    weighed together, never one silently over the other (`decisions.md` §308):
+
+    * they agree, or only one speaks → :attr:`currency` is that code;
+    * they disagree — the field says ``EUR`` beside ``USD 1,000.00``, or two
+      amounts print different codes → :attr:`conflict`, and :attr:`currency` is
+      ``None``. The writer then leaves every header amount unread rather than
+      label it with a currency the document itself contradicts;
+    * neither speaks → ``None`` and no conflict. The row keeps whatever
+      currency it already had: NULL ("currency unknown") for a fresh upload,
+      which is created that way — there is no placeholder code and no ``USD``
+      column default (`decisions.md` §473).
+    """
+
+    field_currency: str | None
+    printed_codes: frozenset[str]
+
+    @property
+    def conflict(self) -> bool:
+        if len(self.printed_codes) > 1:
+            return True
+        return bool(
+            self.field_currency
+            and self.printed_codes
+            and self.printed_codes != {self.field_currency}
+        )
+
+    @property
+    def currency(self) -> str | None:
+        if self.conflict:
+            return None
+        if self.field_currency:
+            return self.field_currency
+        if self.printed_codes:
+            return next(iter(self.printed_codes))
+        return None
+
+
+def extraction_currency_evidence(
+    result: ExtractionResult, convention: AmountConvention | None = None
+) -> CurrencyEvidence:
+    """The :class:`CurrencyEvidence` of one extraction.
+
+    Every money token votes — the header's and the lines', the same set
+    :func:`extraction_amount_convention` reads — because the lines are stored
+    in the invoice's currency too, and a line printed ``USD`` under a ``GBP``
+    total is the same contradiction as two header figures disagreeing.
+    ``tax_rate`` and ``quantity`` are not money and carry no code.
+    """
+    tokens = [getattr(result, f).value for f in _HEADER_MONEY_FIELDS]
+    for li in result.line_items:
+        tokens.extend(getattr(li, f).value for f in _LINE_MONEY_FIELDS)
+    printed: set[str] = set()
+    for token in tokens:
+        printed |= _clean_decimal_and_codes(token, convention)[1]
+    return CurrencyEvidence(
+        field_currency=_clean_currency_code(result.currency.value),
+        printed_codes=frozenset(printed),
+    )
+
+
+def extracted_line_values(
+    li: ExtractedLineItem, convention: AmountConvention | None = None
+) -> dict:
+    """The ``InvoiceLineItem`` column values one extracted line is stored as.
+
+    The line-level twin of :func:`_apply_extraction`, and the only place a
+    model's line is turned into column values — ``run_extraction`` persists
+    exactly this, and the golden contract tests assert exactly this.
+
+    It used to be inlined with a ``value if value else None`` guard per field,
+    which got three things wrong on real model output (issue #575):
+
+    * text fields skipped the sentinel filter the header uses, so a leaked
+      ``"string or null"`` or ``"N/A"`` was stored as an item code;
+    * a JSON **number** — a model writing a SKU as ``4411`` — reached the
+      ``String`` column as an ``int``, which asyncpg refuses, failing the whole
+      extraction over one item code;
+    * a JSON ``0`` is falsy, so a real zero tax or total was stored as NULL.
+
+    Money goes through :func:`_clean_decimal` under the document's convention,
+    the same reading the header and the self-correction pass use.
+    """
+    return {
+        "line_number": _clean_line_number(li.line_number),
+        "item_code": _clean_string(li.item_code.value),
+        "description": _clean_string(li.description.value),
+        "quantity": _clean_decimal(li.quantity.value, convention),
+        "unit_price": _clean_decimal(li.unit_price.value, convention),
+        "tax": _clean_decimal(li.tax.value, convention),
+        "total": _clean_decimal(li.total.value, convention),
+    }
+
+
+def _clean_line_number(val) -> int | None:
+    """A model's ``line_number`` as an int for the ``Integer`` column, or None."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str) and val.strip().isdigit():
+        return int(val.strip())
+    return None
 
 
 def _clean_string(val: str | None) -> str | None:
@@ -1549,7 +1797,16 @@ def _apply_extraction(
         if cleaned is not None:
             setattr(invoice, dst, cleaned)
 
-    # Decimals.
+    # Which currency the money is in — decided BEFORE any amount is written,
+    # because an amount is only meaningful with its currency (`decisions.md`
+    # §308). A document that contradicts itself about it gets no header money
+    # at all: the amount stays unread, so `refresh_warnings` raises
+    # `missing_amount` / `missing_data` and `decide_auto_approve` refuses a
+    # zero amount — the same fail-closed path an unparseable token always took.
+    # `run_self_correction` names the conflict to the reviewer.
+    evidence = extraction_currency_evidence(result, convention)
+
+    # Decimals. `tax_rate` is a percentage, not money, so it is written either way.
     for src, dst in (
         (result.amount, "amount"),
         (result.subtotal, "subtotal"),
@@ -1558,6 +1815,8 @@ def _apply_extraction(
         (result.discount_amount, "discount_amount"),
         (result.shipping_amount, "shipping_amount"),
     ):
+        if evidence.conflict and dst != "tax_rate":
+            continue
         d = _clean_decimal(src.value, convention)
         if d is not None:
             setattr(invoice, dst, d)
@@ -1571,14 +1830,12 @@ def _apply_extraction(
         if d is not None:
             setattr(invoice, dst, d)
 
-    # Currency — uppercase 3-char code or None. Models sometimes return
-    # "US Dollars" or "USD." with punctuation; we normalise via the
-    # sentinel filter + uppercase, then validate length.
-    cur = _clean_string(result.currency.value)
-    if cur is not None:
-        cur_upper = cur.upper().rstrip(".").strip()
-        if len(cur_upper) == 3 and cur_upper.isalpha():
-            invoice.currency = cur_upper
+    # Currency — the field, or the code printed beside the amounts when the
+    # field is empty, never a default (`CurrencyEvidence`). On a conflict the
+    # row's currency is left as it was, beside amounts that were left as they
+    # were: neither half of the contradiction is written.
+    if evidence.currency is not None:
+        invoice.currency = evidence.currency
 
     # Payment method — map free-form to canonical dropdown values.
     pm = _normalize_payment_method(result.payment_method.value)

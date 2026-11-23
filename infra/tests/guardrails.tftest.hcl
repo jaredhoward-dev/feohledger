@@ -8,8 +8,16 @@
 # input guards, and the release-deploy grant (deploy.tf): one document, one
 # instance, one sha-shaped parameter; and the SPA stack (frontend.tf): a bucket
 # only this distribution reads, the platform certificate on the apex + wildcard,
-# a publish grant scoped to that bucket and distribution, and DNS that stays on
-# the VM until frontend_on_cloudfront moves it — with api. on the VM regardless.
+# a publish grant scoped to that bucket and distribution, a missing-asset alarm
+# on the 404 rate with the monitoring subscription that publishes that metric,
+# and DNS that stays on
+# the VM until frontend_on_cloudfront moves it — with api. on the VM regardless;
+# the VM's database grant: rds-db:connect on the app role alone; the
+# external uptime checks (uptime.tf): which hosts are checked and how,
+# that each alarm pages and emails, that the phone subscription exists only
+# when a number is set, and the certificate-expiry backstop; and the
+# certificate canary (canary.tf): what it fetches, its pinned runtime, its
+# paging alarm and its artifacts bucket's baseline.
 
 mock_provider "aws" {
   # A mocked policy document renders a random string, which the KMS key and
@@ -37,6 +45,20 @@ mock_provider "aws" {
   mock_data "aws_ssm_parameter" {
     defaults = {
       value = "ami-0123456789abcdef0"
+    }
+  }
+
+  # The RDS IAM-auth grant's ARN is built from these; mocked values would be
+  # random strings the assertion could not name.
+  mock_data "aws_region" {
+    defaults = {
+      region = "us-east-1"
+    }
+  }
+
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "000000000000"
     }
   }
 }
@@ -151,6 +173,15 @@ override_resource {
 }
 
 override_resource {
+  target          = aws_s3_bucket.canary_artifacts
+  override_during = plan
+  values = {
+    arn = "arn:aws:s3:::feohledger-canary-test"
+    id  = "feohledger-canary-test"
+  }
+}
+
+override_resource {
   target          = aws_cloudfront_distribution.frontend
   override_during = plan
   values = {
@@ -161,11 +192,47 @@ override_resource {
   }
 }
 
+# The RDS resource id (db-XXXX) is what an rds-db:connect ARN names; a mock
+# leaves it unknown at plan time.
+override_resource {
+  target          = aws_db_instance.main
+  override_during = plan
+  values = {
+    resource_id = "db-TESTRESOURCEID0000000000"
+  }
+}
+
 override_resource {
   target          = aws_eip.app
   override_during = plan
   values = {
     public_ip = "192.0.2.10"
+  }
+}
+
+# The uptime alarms name both topics and their health check; give those known
+# values so the assertions compare them exactly instead of staying unknown.
+override_resource {
+  target          = aws_sns_topic.alerts
+  override_during = plan
+  values = {
+    arn = "arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"
+  }
+}
+
+override_resource {
+  target          = aws_sns_topic.pager
+  override_during = plan
+  values = {
+    arn = "arn:aws:sns:us-east-1:000000000000:feohledger-prod-pager"
+  }
+}
+
+override_resource {
+  target          = aws_route53_health_check.uptime
+  override_during = plan
+  values = {
+    id = "00000000-0000-0000-0000-0000000uptime"
   }
 }
 
@@ -299,10 +366,11 @@ run "access_log_sink_accepts_s3_log_delivery" {
         aws_s3_bucket.audit_logs.arn,
         aws_s3_bucket.backups.arn,
         aws_s3_bucket.frontend.arn,
+        aws_s3_bucket.canary_artifacts.arn,
       ])
       if contains(flatten([for p in s.principals : tolist(p.identifiers)]), "logging.s3.amazonaws.com")
     ])
-    error_message = "The S3 delivery grant must name exactly the four source buckets, or any bucket in the account could log into the sink."
+    error_message = "The S3 delivery grant must name exactly the five source buckets, or any bucket in the account could log into the sink."
   }
 
   assert {
@@ -570,6 +638,26 @@ run "database_accepts_connections_from_the_app_vm_only" {
   }
 }
 
+run "app_vm_signs_in_to_the_database_as_the_app_role_only" {
+  command = plan
+
+  assert {
+    condition = toset(flatten([
+      for s in data.aws_iam_policy_document.app_permissions.statement : tolist(s.resources)
+      if contains(s.actions, "rds-db:connect")
+    ])) == toset(["arn:aws:rds-db:us-east-1:000000000000:dbuser:db-TESTRESOURCEID0000000000/feoh_app"])
+    error_message = "rds-db:connect must name exactly the feoh_app user on this instance — never dbuser:*, another instance, or the master user (docs/decisions.md §310)."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.app_permissions.statement :
+      !contains(s.actions, "rds-db:connect") || length(s.actions) == 1
+    ])
+    error_message = "The database-connect grant is its own statement, so its resource scope cannot widen another action's."
+  }
+}
+
 run "app_vm_has_no_ssh_and_only_web_ports" {
   command = plan
 
@@ -793,6 +881,20 @@ run "distribution_serves_the_apex_and_every_tenant_on_the_platform_certificate" 
   }
 }
 
+run "missing_asset_alarm_watches_404s_and_has_its_metric" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.frontend_404.metric_name == "404ErrorRate" && aws_cloudwatch_metric_alarm.frontend_404.dimensions["DistributionId"] == aws_cloudfront_distribution.frontend.id
+    error_message = "The missing-asset alarm must watch this distribution's 404 rate: the 4xx rate also counts the 403s CloudFront gives disallowed-method requests (scanner POSTs), which page for nothing."
+  }
+
+  assert {
+    condition     = aws_cloudfront_monitoring_subscription.frontend.distribution_id == aws_cloudfront_distribution.frontend.id && one(one(aws_cloudfront_monitoring_subscription.frontend.monitoring_subscription).realtime_metrics_subscription_config).realtime_metrics_subscription_status == "Enabled"
+    error_message = "404ErrorRate is an additional metric: without an enabled monitoring subscription it has no data and the alarm can never fire."
+  }
+}
+
 run "publish_grant_covers_only_this_bucket_and_distribution" {
   command = plan
 
@@ -863,4 +965,304 @@ run "cutover_moves_the_apex_and_tenants_to_cloudfront_and_leaves_api_on_the_vm" 
     condition     = aws_route53_record.api.records == toset(["192.0.2.10"])
     error_message = "api.<domain> must stay on the VM through the cutover."
   }
+}
+
+# ── External uptime checks + paging (uptime.tf, monitoring.tf) ───────────────
+
+run "uptime_checks_the_apex_and_the_api_over_https_from_three_regions" {
+  command = plan
+
+  assert {
+    condition     = toset(keys(aws_route53_health_check.uptime)) == toset(["apex", "api"])
+    error_message = "Without a tenant slug, exactly the apex and the API are checked."
+  }
+
+  assert {
+    condition = alltrue([
+      for c in aws_route53_health_check.uptime :
+      c.port == 443 && c.enable_sni && c.request_interval == 30 && c.failure_threshold == 3 && length(c.regions) == 3
+    ])
+    error_message = "Every check is HTTPS on 443 with SNI (CloudFront needs it), a 30 s interval, 3 failures, and three regions."
+  }
+
+  assert {
+    condition     = aws_route53_health_check.uptime["apex"].fqdn == "feohledger.com" && aws_route53_health_check.uptime["apex"].type == "HTTPS" && aws_route53_health_check.uptime["apex"].resource_path == "/"
+    error_message = "The apex check requests https://<domain>/."
+  }
+
+  assert {
+    condition     = aws_route53_health_check.uptime["api"].fqdn == "api.feohledger.com" && aws_route53_health_check.uptime["api"].resource_path == "/api/health"
+    error_message = "The API check requests the public liveness probe on api.<domain>."
+  }
+
+  assert {
+    condition     = aws_route53_health_check.uptime["api"].type == "HTTPS_STR_MATCH" && aws_route53_health_check.uptime["api"].search_string == "\"status\":\"ok\""
+    error_message = "The API check must match the liveness body, or a 200 from the SPA router (index.html) would pass for it."
+  }
+}
+
+run "uptime_checks_a_tenant_host_when_a_slug_is_set" {
+  command = plan
+
+  variables {
+    uptime_tenant_slug = "pilot-test"
+  }
+
+  assert {
+    condition     = aws_route53_health_check.uptime["tenant"].fqdn == "pilot-test.feohledger.com" && aws_route53_health_check.uptime["tenant"].type == "HTTPS"
+    error_message = "The tenant check requests https://<slug>.<domain>/."
+  }
+
+  assert {
+    condition     = toset(keys(aws_cloudwatch_metric_alarm.uptime)) == toset(["apex", "api", "tenant"])
+    error_message = "Every health check gets its own alarm."
+  }
+}
+
+run "uptime_alarms_page_and_email_on_failure_and_recovery" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for a in aws_cloudwatch_metric_alarm.uptime :
+      a.namespace == "AWS/Route53" && a.metric_name == "HealthCheckStatus" && a.dimensions["HealthCheckId"] == "00000000-0000-0000-0000-0000000uptime"
+      && a.comparison_operator == "LessThanThreshold" && a.threshold == 1
+    ])
+    error_message = "Each uptime alarm watches its health check's HealthCheckStatus and fires below 1."
+  }
+
+  assert {
+    condition = alltrue([
+      for a in aws_cloudwatch_metric_alarm.uptime :
+      toset(a.alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-pager", "arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+      && toset(a.ok_actions) == toset(a.alarm_actions)
+    ])
+    error_message = "An outage and its recovery both go to the pager (phone) and the alerts (email) topics."
+  }
+
+  assert {
+    condition     = alltrue([for a in aws_cloudwatch_metric_alarm.uptime : a.treat_missing_data == "breaching"])
+    error_message = "An uptime alarm that cannot see its metric must not stay quiet."
+  }
+}
+
+run "only_customer_facing_alarms_page" {
+  command = plan
+
+  assert {
+    condition     = contains(aws_cloudwatch_metric_alarm.db_storage.alarm_actions, "arn:aws:sns:us-east-1:000000000000:feohledger-prod-pager")
+    error_message = "Database storage running out pages: past it writes fail, and no uptime check notices first."
+  }
+
+  assert {
+    condition = alltrue([
+      for a in [
+        aws_cloudwatch_metric_alarm.db_cpu,
+        aws_cloudwatch_metric_alarm.db_memory,
+        aws_cloudwatch_metric_alarm.db_cpu_credits,
+        aws_cloudwatch_metric_alarm.app_cpu_credits,
+        aws_cloudwatch_metric_alarm.frontend_5xx,
+        aws_cloudwatch_metric_alarm.frontend_404,
+        aws_cloudwatch_metric_alarm.platform_certificate_expiry,
+      ] : !contains(a.alarm_actions, "arn:aws:sns:us-east-1:000000000000:feohledger-prod-pager")
+    ])
+    error_message = "Sizing, cost and early-warning alarms stay email-only, so the phone only rings when customers are affected."
+  }
+}
+
+run "no_phone_number_means_no_sms_subscription" {
+  command = plan
+
+  assert {
+    condition     = length(aws_sns_topic_subscription.pager_sms) == 0 && length(aws_sns_sms_preferences.pager) == 0 && length(aws_cloudwatch_metric_alarm.pager_delivery_failed) == 0 && length(aws_cloudwatch_metric_alarm.pager_sms_spend) == 0
+    error_message = "With alert_phone_number unset, nothing may be subscribed by SMS, the account's SMS settings stay untouched, and there are no SMS alarms to watch."
+  }
+}
+
+run "a_phone_number_subscribes_the_pager_topic_by_sms" {
+  command = plan
+
+  variables {
+    alert_phone_number = "+12025550123"
+  }
+
+  assert {
+    condition     = length(aws_sns_topic_subscription.pager_sms) == 1 && aws_sns_topic_subscription.pager_sms[0].protocol == "sms" && aws_sns_topic_subscription.pager_sms[0].topic_arn == "arn:aws:sns:us-east-1:000000000000:feohledger-prod-pager"
+    error_message = "The number subscribes to the pager topic over SMS."
+  }
+
+  assert {
+    condition     = nonsensitive(aws_sns_topic_subscription.pager_sms[0].endpoint) == "+12025550123"
+    error_message = "The subscription texts the configured number."
+  }
+
+  assert {
+    condition     = aws_sns_sms_preferences.pager[0].default_sms_type == "Transactional"
+    error_message = "Pages go out as Transactional SMS."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.pager_delivery_failed[0].metric_name == "NumberOfNotificationsFailed" && aws_cloudwatch_metric_alarm.pager_delivery_failed[0].dimensions["TopicName"] == "feohledger-prod-pager" && toset(aws_cloudwatch_metric_alarm.pager_delivery_failed[0].alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+    error_message = "A text SNS could not deliver must be reported by email, never through the pager it failed on."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.pager_sms_spend[0].metric_name == "SMSMonthToDateSpentUSD" && aws_cloudwatch_metric_alarm.pager_sms_spend[0].threshold == 0.8 && toset(aws_cloudwatch_metric_alarm.pager_sms_spend[0].alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+    error_message = "Nearing the USD 1 default SMS spend limit, after which SNS stops texting, must be reported by email."
+  }
+}
+
+run "rejects_a_phone_number_not_in_e164_form" {
+  command = plan
+
+  variables {
+    alert_phone_number = "(202) 555-0123"
+  }
+
+  expect_failures = [var.alert_phone_number]
+}
+
+run "rejects_a_hostname_as_the_uptime_tenant_slug" {
+  command = plan
+
+  variables {
+    uptime_tenant_slug = "pilot.feohledger.com"
+  }
+
+  expect_failures = [var.uptime_tenant_slug]
+}
+
+run "certificate_expiry_backstops_acm_renewal" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.platform_certificate_expiry.namespace == "AWS/CertificateManager" && aws_cloudwatch_metric_alarm.platform_certificate_expiry.metric_name == "DaysToExpiry" && aws_cloudwatch_metric_alarm.platform_certificate_expiry.threshold == 30
+    error_message = "The certificate alarm fires once DaysToExpiry drops under 30."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.platform_certificate_expiry.dimensions["CertificateArn"] == "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000"
+    error_message = "It must watch the platform certificate."
+  }
+
+  assert {
+    condition     = toset(aws_cloudwatch_metric_alarm.platform_certificate_expiry.alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+    error_message = "A month's warning emails; it does not page."
+  }
+}
+
+# The alarms on the default provider (db_storage) publish to the pager topic on
+# the us-east-1 alias; that only works while the two are the same region.
+run "pager_refuses_a_region_its_default_provider_alarms_cannot_reach" {
+  command = plan
+
+  variables {
+    aws_region = "eu-west-1"
+  }
+
+  expect_failures = [aws_sns_topic.pager, aws_s3_bucket.frontend]
+}
+
+# ── Certificate canary (canary.tf) ───────────────────────────────────────────
+
+run "certificate_canary_watches_the_api_hourly_on_a_pinned_runtime" {
+  command = plan
+
+  assert {
+    condition     = aws_synthetics_canary.certificate.name == "feohledger-prod-cert" && length(aws_synthetics_canary.certificate.name) <= 21
+    error_message = "The canary name must fit Synthetics' 21-character limit."
+  }
+
+  assert {
+    condition     = can(regex("^syn-nodejs-puppeteer-[0-9]+\\.[0-9]+$", aws_synthetics_canary.certificate.runtime_version))
+    error_message = "The canary runtime must be pinned to an exact version, never a floating one."
+  }
+
+  assert {
+    condition     = aws_synthetics_canary.certificate.schedule[0].expression == "rate(1 hour)" && aws_synthetics_canary.certificate.start_canary
+    error_message = "The certificate canary runs hourly and is started on apply."
+  }
+
+  assert {
+    condition     = aws_synthetics_canary.certificate.run_config[0].environment_variables["CANARY_HOST"] == "api.feohledger.com" && aws_synthetics_canary.certificate.run_config[0].environment_variables["CANARY_PATH"] == "/api/health"
+    error_message = "The canary must fetch https://api.<domain>/api/health, the host Caddy serves on its own certificate."
+  }
+
+  assert {
+    condition     = aws_synthetics_canary.certificate.run_config[0].environment_variables["CANARY_MIN_DAYS"] == "14" && aws_synthetics_canary.certificate.run_config[0].environment_variables["CANARY_EXPECT"] == "\"status\":\"ok\""
+    error_message = "The canary fails under 14 days to expiry and matches the liveness probe's body."
+  }
+
+  assert {
+    condition     = aws_synthetics_canary.certificate.artifact_config[0].s3_encryption[0].encryption_mode == "SSE_KMS"
+    error_message = "Canary artifacts are encrypted under the app KMS key."
+  }
+}
+
+run "certificate_canary_pages_and_emails_after_two_failed_runs" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.certificate_canary.namespace == "CloudWatchSynthetics" && aws_cloudwatch_metric_alarm.certificate_canary.metric_name == "SuccessPercent" && aws_cloudwatch_metric_alarm.certificate_canary.dimensions["CanaryName"] == "feohledger-prod-cert"
+    error_message = "The alarm watches the canary's SuccessPercent."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.certificate_canary.threshold == 100 && aws_cloudwatch_metric_alarm.certificate_canary.comparison_operator == "LessThanThreshold" && aws_cloudwatch_metric_alarm.certificate_canary.evaluation_periods == 2 && aws_cloudwatch_metric_alarm.certificate_canary.datapoints_to_alarm == 2
+    error_message = "Two failed hourly runs in a row alarm."
+  }
+
+  assert {
+    condition     = toset(aws_cloudwatch_metric_alarm.certificate_canary.alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-pager", "arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+    error_message = "An invalid or expiring API certificate pages and emails: every browser will refuse the API."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.certificate_canary.treat_missing_data == "breaching"
+    error_message = "A canary that stops running must not stay quiet."
+  }
+}
+
+run "certificate_canary_artifacts_bucket_meets_the_bucket_baseline" {
+  command = plan
+
+  assert {
+    condition     = aws_s3_bucket_versioning.canary_artifacts.versioning_configuration[0].status == "Enabled"
+    error_message = "The canary artifacts bucket is versioned like every other bucket."
+  }
+
+  assert {
+    condition     = one(aws_s3_bucket_server_side_encryption_configuration.canary_artifacts.rule).apply_server_side_encryption_by_default[0].sse_algorithm == "aws:kms"
+    error_message = "The canary artifacts bucket is SSE-KMS."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_s3_bucket_public_access_block.canary_artifacts.block_public_acls,
+      aws_s3_bucket_public_access_block.canary_artifacts.block_public_policy,
+      aws_s3_bucket_public_access_block.canary_artifacts.ignore_public_acls,
+      aws_s3_bucket_public_access_block.canary_artifacts.restrict_public_buckets,
+    ])
+    error_message = "The canary artifacts bucket blocks all public access."
+  }
+
+  assert {
+    condition     = aws_s3_bucket_logging.canary_artifacts.target_prefix == "canary-artifacts/"
+    error_message = "The canary artifacts bucket is access-logged to the sink."
+  }
+
+  assert {
+    condition     = anytrue([for r in aws_s3_bucket_lifecycle_configuration.canary_artifacts.rule : try(r.expiration[0].days, 0) == 30])
+    error_message = "Canary run artifacts expire after 30 days."
+  }
+}
+
+run "rejects_a_canary_threshold_inside_caddys_renewal_window" {
+  command = plan
+
+  variables {
+    certificate_canary_min_days = 30
+  }
+
+  expect_failures = [var.certificate_canary_min_days]
 }

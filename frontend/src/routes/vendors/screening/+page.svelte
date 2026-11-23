@@ -1,5 +1,6 @@
 <script lang="ts">
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	// Sanctions-screening review queue — the vendors flagged `match` / `review`
 	// by the screening engine, awaiting a human decision. A separate sub-route
 	// from the vendors LIST page (/vendors) so the two don't collide.
@@ -15,13 +16,17 @@
 		getVendorCounts,
 		blockVendor,
 		unblockVendor,
-		screenVendor
+		screenVendor,
+		adjudicateSanctionsFalsePositive,
+		revokeSanctionsAdjudication
 	} from '#lib/api/vendors.ts';
+	import { isAllowed, isOffered, refusalText } from '#lib/api/actionVerdicts.ts';
 	import type { ScreeningReviewItem, SanctionsCheck } from '#lib/types/vendor.ts';
 	import {
 		screeningStatusLabelKey,
 		riskLevelLabelKey,
 		sanctionsResultLabelKey,
+		sanctionsCheckTypeLabelKey,
 		screeningCategoryLabels
 	} from '#lib/types/vendor.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
@@ -38,10 +43,18 @@
 	import { formatDate } from '#lib/utils/time.ts';
 	import { formatList } from '#lib/utils/list.ts';
 	import { untrack } from 'svelte';
+	// Aliased: `page` below is the loaded queue page number.
+	import { page as urlStore } from '$app/state';
+	import { replaceState } from '$app/navigation';
+	import Badge from '#lib/components/ui/Badge.svelte';
+	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { toastCardRevocations } from '#lib/utils/cardRevocationToast.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { PERM_VENDOR_BLOCK } from '#lib/types/admin.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	// Reviewer capabilities — mirror the backend gates so the UI can't drift.
 	// Block/unblock is the splittable granular permission; re-screen stays on
@@ -64,9 +77,24 @@
 	// two above: a verdict this build has no wording for renders de-underscored
 	// rather than blank — a dropped verdict is the one outcome a compliance
 	// reviewer must never get.
+	// The verdict's tone on the shared `Badge` — the hand-rolled pill this
+	// replaced set the base token as text on its own tint, which is the pairing
+	// the colour rules reserve for `-on-tint` (light theme amber read ~2.5:1).
+	const RESULT_TONES: Record<string, BadgeTone> = {
+		match: 'danger',
+		review_required: 'warning',
+		clear: 'success'
+	};
+
 	const resultLabel = (result: string) => {
 		const key = sanctionsResultLabelKey(result);
 		return key ? m(key) : result.replace(/_/g, ' ');
+	};
+
+	// Why the screen ran; an unknown trigger renders as itself, never blank.
+	const checkTypeLabel = (checkType: string) => {
+		const key = sanctionsCheckTypeLabelKey(checkType);
+		return key ? m(key) : checkType;
 	};
 
 	// Composed through a key rather than concatenated: Japanese parenthesises
@@ -94,7 +122,9 @@
 	let loading = $state(true);
 	let loadingMore = $state(false);
 	let loadError = $state(false);
-	let search = $state('');
+	// URL-backed (`?search=`) like the `/vendors` list, so a reload or a shared
+	// link reproduces the queue the reviewer was looking at.
+	let search = $state(urlStore.url.searchParams.get('search') ?? '');
 	// The term the newest ISSUED request carried, so the debounce effect's first
 	// run (mount) doesn't fire a duplicate load behind the initial fetch.
 	let appliedSearch = $state('');
@@ -110,6 +140,11 @@
 	let blockedTotal = $state<number | null>(null);
 	let matchCount = $state<number | null>(null);
 	let reviewCount = $state<number | null>(null);
+	// The first `/counts` call has not answered yet. Until it does, a `null`
+	// figure is "still loading", not "unavailable": the cards draw the pending
+	// dash with no "unavailable" line, rather than claiming the tallies could
+	// not be had before anything was asked.
+	let countsPending = $state(true);
 
 	// Detail modal — the selected vendor + its screening history.
 	let selected = $state<ScreeningReviewItem | null>(null);
@@ -125,8 +160,21 @@
 	// Keyed to the vendor the action was fired for, not a bare flag. Opening a
 	// second vendor while a block is in flight used to leave ITS buttons
 	// disabled, and the spinner label sat on a row the action never touched.
-	let busy = $state<{ vendorId: string; action: 'block' | 'rescreen' } | null>(null);
+	let busy = $state<{
+		vendorId: string;
+		action: 'block' | 'rescreen' | 'adjudicate';
+	} | null>(null);
+	// The reason for a false-positive adjudication or its revocation (required
+	// by the endpoint; decisions §477).
+	let adjudicationReason = $state('');
 	let blockReason = $state('');
+	// Unblock is armed two-click: it releases payments to a vendor a screen or
+	// a reviewer stopped, on the sanctions path, so one stray click must not do
+	// it. Keyed to the vendor it was armed for, so re-opening the modal on
+	// another vendor never inherits the arm. Block stays one click — it is the
+	// safe direction and the urgent one.
+	let unblockArmedFor = $state<string | null>(null);
+	const unblockArmed = $derived(selected !== null && unblockArmedFor === selected.vendor_id);
 
 	// What the OPEN vendor is busy with — `null` for an action running against
 	// some other vendor, so this modal's controls stay live and honest.
@@ -146,11 +194,11 @@
 	// list says "Contrôle").
 	const COLUMNS = $derived([
 		{ label: m('vendors.col.vendor') },
-		{ label: m('vendors.col.screening') },
-		{ label: m('vendors.screening.queue.col.matchedList') },
-		{ label: m('vendors.screening.queue.col.provider') },
-		{ label: m('vendors.screening.queue.col.riskScore') },
-		{ label: m('vendors.screening.queue.col.lastScreened') },
+		{ label: m('vendors.col.screening'), class: 'col-screening' },
+		{ label: m('vendors.screening.queue.col.matchedList'), class: 'col-list' },
+		{ label: m('vendors.screening.queue.col.provider'), class: 'col-provider' },
+		{ label: m('vendors.screening.queue.col.riskScore'), class: 'col-score' },
+		{ label: m('vendors.screening.queue.col.lastScreened'), class: 'col-date' },
 		{ class: 'actions-col' }
 	]);
 
@@ -229,6 +277,8 @@
 			blockedTotal = null;
 			matchCount = null;
 			reviewCount = null;
+		} finally {
+			if (countsSequence.isCurrentRequest(token)) countsPending = false;
 		}
 	}
 
@@ -241,6 +291,7 @@
 		// un-debounced request on every keystroke (issue #168).
 		const term = untrack(() => search).trim();
 		appliedSearch = term;
+		if (!opts.append) syncUrl(term);
 		if (opts.append) loadingMore = true;
 		else loading = true;
 		loadError = false;
@@ -270,8 +321,17 @@
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!fetchSequence.isCurrentRequest(token)) return;
-			loadError = true;
-			toast(m('vendors.screening.queue.toast.loadFailed'), 'error');
+			// A failed fresh load has nothing true to show, so it is stated in
+			// place by `LoadError` (with a Retry) and the rows go: left up, they
+			// would read as the answer to a search that never ran. A failed
+			// Load-more keeps the rows it did load, so a toast is enough.
+			if (opts.append) {
+				toast(m('vendors.screening.queue.toast.loadFailed'), 'error');
+			} else {
+				loadError = true;
+				items = [];
+				total = 0;
+			}
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -280,12 +340,25 @@
 		}
 	}
 
+	/** Writes the issued search term into the URL. A writer only, never a
+	 *  dependency: it runs inside `loadQueue`, which the mount and debounce
+	 *  effects call, so every URL read is untracked. */
+	function syncUrl(term: string) {
+		untrack(() => {
+			const url = new URL(urlStore.url.href);
+			if (term) url.searchParams.set('search', term);
+			else url.searchParams.delete('search');
+			if (url.search !== urlStore.url.search) replaceState(`${url.pathname}${url.search}`, {});
+		});
+	}
+
 	async function loadMore() {
 		await loadQueue({ append: true, nextPage: page + 1 });
 	}
 
 	function openDetail(item: ScreeningReviewItem) {
 		selected = item;
+		adjudicationReason = '';
 		blockReason = '';
 		history = [];
 		historyVendorId = null;
@@ -312,8 +385,9 @@
 			if (!historySequence.isCurrentRequest(token)) return;
 			history = [];
 			historyVendorId = vendorId;
+			// The timeline states the failure in place, with a Retry
+			// (role="alert"); a toast saying it again would sit over the dialog.
 			historyError = true;
-			toast(m('vendors.screening.queue.toast.historyFailed'), 'error');
 		} finally {
 			if (historySequence.isCurrentRequest(token)) historyLoading = false;
 		}
@@ -321,6 +395,8 @@
 
 	function closeDetail() {
 		selected = null;
+		adjudicationReason = '';
+		unblockArmedFor = null;
 		history = [];
 		historyVendorId = null;
 		historyError = false;
@@ -364,10 +440,18 @@
 
 	async function toggleBlock() {
 		if (!selected) return;
+		if (selected.payments_blocked && !unblockArmed) {
+			unblockArmedFor = selected.vendor_id;
+			return;
+		}
 		// Bind the action to the vendor that was on screen when it was fired.
 		// Everything after the first await must read THIS, never `selected` —
 		// the modal can be closed and re-opened on another vendor mid-flight.
 		const target = selected;
+		// The arm is held through the request, not dropped before it: a busy
+		// commit keeps `.armed` (ui-patterns § `.armed`, the third look), and
+		// dropping it here repainted an in-flight unblock as the muted unarmed
+		// secondary. `finally` releases it.
 		busy = { vendorId: target.vendor_id, action: 'block' };
 		try {
 			const updated = target.payments_blocked
@@ -390,8 +474,67 @@
 			// typed for a vendor opened meanwhile is not this action's to wipe.
 			if (selected?.vendor_id === target.vendor_id) blockReason = '';
 		} catch (err) {
-			const e = err as { detail?: string; message?: string } | null;
-			toast(e?.detail ?? e?.message ?? m('vendors.screening.queue.toast.actionFailed'), 'error');
+			toast(errorMessage(err, m('vendors.screening.queue.toast.actionFailed')), 'error');
+		} finally {
+			if (busy?.vendorId === target.vendor_id) busy = null;
+			if (unblockArmedFor === target.vendor_id) unblockArmedFor = null;
+		}
+	}
+
+	// The adjudicate / revoke responses carry no verdicts, so the row's are
+	// dropped (offering nothing) until the queue is read again — never carried
+	// over a change to what they judged (ui-patterns § Whether to offer an
+	// action).
+	async function applyAdjudication(
+		vendorId: string,
+		adjudication: ScreeningReviewItem['adjudication']
+	) {
+		const patch = (it: ScreeningReviewItem): ScreeningReviewItem =>
+			it.vendor_id === vendorId
+				? {
+						...it,
+						adjudication,
+						adjudicate_refusal: undefined,
+						revoke_adjudication_refusal: undefined
+					}
+				: it;
+		items = items.map(patch);
+		if (selected?.vendor_id === vendorId) selected = patch(selected);
+		await loadQueue();
+		const fresh = items.find((it) => it.vendor_id === vendorId);
+		if (fresh && selected?.vendor_id === vendorId) selected = fresh;
+	}
+
+	async function submitAdjudication(kind: 'adjudicate' | 'revoke') {
+		if (!selected) return;
+		const target = selected;
+		const reason = adjudicationReason.trim();
+		if (reason.length < 3) return;
+		busy = { vendorId: target.vendor_id, action: 'adjudicate' };
+		try {
+			if (kind === 'adjudicate') {
+				// The stamp covers exactly the screen this row shows; a rescreen
+				// since it was read answers 409 and the reload below shows it.
+				if (!target.latest_check_id) return;
+				const adjudication = await adjudicateSanctionsFalsePositive(
+					target.vendor_id,
+					reason,
+					target.latest_check_id
+				);
+				toast(m('vendors.screening.queue.adjudication.adjudicated'), 'success');
+				if (selected?.vendor_id === target.vendor_id) adjudicationReason = '';
+				await applyAdjudication(target.vendor_id, adjudication);
+			} else {
+				await revokeSanctionsAdjudication(target.vendor_id, reason);
+				toast(m('vendors.screening.queue.adjudication.revoked'), 'success');
+				if (selected?.vendor_id === target.vendor_id) adjudicationReason = '';
+				await applyAdjudication(target.vendor_id, null);
+			}
+		} catch (err) {
+			toast(errorMessage(err, m('vendors.screening.queue.adjudication.failed')), 'error');
+			// A refusal means the row's verdicts were stale (a rescreen landed, or
+			// someone else adjudicated): read the queue again before offering more.
+			await applyAdjudication(target.vendor_id, target.adjudication);
 		} finally {
 			if (busy?.vendorId === target.vendor_id) busy = null;
 		}
@@ -400,6 +543,11 @@
 	async function rescreen() {
 		if (!selected) return;
 		const target = selected;
+		// A fresh screen can change the verdict the Confirm unblock was armed
+		// against, and while it runs the commit cannot be pressed — a red fill
+		// on a disabled button reads as "ready". Disarm; the reviewer re-arms
+		// against the new result.
+		if (unblockArmedFor === target.vendor_id) unblockArmedFor = null;
 		busy = { vendorId: target.vendor_id, action: 'rescreen' };
 		try {
 			const updated = await screenVendor(target.vendor_id);
@@ -413,8 +561,7 @@
 			// overwrite the timeline of a vendor opened meanwhile.
 			await loadHistory(target.vendor_id);
 		} catch (err) {
-			const e = err as { detail?: string; message?: string } | null;
-			toast(e?.detail ?? e?.message ?? m('vendors.screening.queue.toast.rescreenFailed'), 'error');
+			toast(errorMessage(err, m('vendors.screening.queue.toast.rescreenFailed')), 'error');
 		} finally {
 			if (busy?.vendorId === target.vendor_id) busy = null;
 		}
@@ -424,7 +571,7 @@
 <PageHeader title={m('vendors.screening.queue.title')}>
 	{#snippet actions()}
 		<button
-			class="btn-outline"
+			class="btn-secondary"
 			onclick={() => {
 				loadQueue();
 				loadCounts();
@@ -444,22 +591,25 @@
 		     failed, or the caller is an ap_clerk (whom `/counts` 403s) — an
 		     em-dash says "we don't know" instead of a page-scoped undercount. -->
 		<KpiCard
-			value={matchCount ?? '—'}
+			value={matchCount}
+			pending={countsPending}
 			label={m('vendors.screening.queue.kpi.matches')}
 			helpTerm="sanctions-screening"
 			highlight={matchCount !== null && matchCount > 0 ? 'red' : null}
-			sub={matchCount === null ? m('vendors.screening.queue.kpi.unavailable') : null}
+			sub={matchCount === null && !countsPending ? m('vendors.screening.queue.kpi.unavailable') : null}
 		/>
 		<KpiCard
-			value={reviewCount ?? '—'}
+			value={reviewCount}
+			pending={countsPending}
 			label={m('vendors.screening.queue.kpi.needsReview')}
 			highlight={reviewCount !== null && reviewCount > 0 ? 'red' : null}
-			sub={reviewCount === null ? m('vendors.screening.queue.kpi.unavailable') : null}
+			sub={reviewCount === null && !countsPending ? m('vendors.screening.queue.kpi.unavailable') : null}
 		/>
 		<KpiCard
-			value={blockedTotal ?? '—'}
+			value={blockedTotal}
+			pending={countsPending}
 			label={m('vendors.screening.queue.kpi.blocked')}
-			sub={blockedTotal === null
+			sub={blockedTotal === null && !countsPending
 				? m('vendors.screening.queue.kpi.unavailable')
 				: m('vendors.screening.queue.kpi.blockedScope')}
 		/>
@@ -473,16 +623,25 @@
 		/>
 	</div>
 
+	{#if loadError}
+		<LoadError
+			message={m('vendors.screening.queue.empty.errored')}
+			onretry={() => {
+				loadQueue();
+				loadCounts();
+			}}
+			testId="screening-queue-load-error"
+		/>
+	{:else}
+	<div class="screening-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={items.length === 0}
-		empty={loading
-			? m('common.loading')
-			: loadError
-				? m('vendors.screening.queue.empty.errored')
-				: search.trim()
-					? m('vendors.screening.queue.empty.filtered')
-					: m('vendors.screening.queue.empty.clean')}
+		{loading}
+		filtered={!!search.trim()}
+		emptyFiltered={m('vendors.screening.queue.empty.filtered')}
+		empty={m('vendors.screening.queue.empty.clean')}
 	>
 		{#snippet body()}
 			{#each items as it (it.vendor_id)}
@@ -507,6 +666,13 @@
 							blocked={it.payments_blocked}
 							adverseMedia={it.adverse_media}
 						/>
+						{#if it.adjudication}
+							<Badge tone="accent" variant="adjudicated">
+								<span data-testid="screening-row-adjudicated">
+									{m('vendors.screening.queue.adjudication.badge')}
+								</span>
+							</Badge>
+						{/if}
 					</td>
 					<td class="muted">{it.latest_matched_list ?? '—'}</td>
 					<td class="muted">{it.latest_provider ?? '—'}</td>
@@ -521,22 +687,21 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 
 	<!-- `showingAll` is rendered ONLY behind `total > 0`: `total` is the server's
 	     whole-set count, so stating it while a later page is unfetched would be
 	     the same claim the KPIs used to make wrongly. -->
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={loadMore} disabled={loadingMore || loading}>
-				{loadingMore
-					? m('common.loading')
-					: m('vendors.loadMore', { shown: items.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('vendors.showingAll', { total })}</span>
-		</div>
+	<LoadMoreFooter
+		shown={items.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		disabled={loading}
+		onloadmore={loadMore}
+		moreKey="vendors.loadMore"
+		allKey="vendors.showingAll"
+	/>
 	{/if}
 </PageHeader>
 
@@ -600,7 +765,7 @@
 			     `tests-e2e/vendors/screening-modal-identity.spec.ts`. -->
 			<div class="review-actions" data-testid="screening-actions" data-vendor-id={selected.vendor_id}>
 				{#if canRescreen}
-					<button class="btn-outline" onclick={rescreen} disabled={selectedBusy !== null}>
+					<button class="btn-secondary" onclick={rescreen} disabled={selectedBusy !== null}>
 						{selectedBusy === 'rescreen'
 							? m('vendors.screening.queue.action.rescreening')
 							: m('vendors.screening.queue.action.rescreen')}
@@ -618,8 +783,8 @@
 						/>
 					{/if}
 					<button
-						class="btn-block"
-						class:unblock={selected.payments_blocked}
+						class={selected.payments_blocked && !unblockArmed ? 'btn-secondary' : 'btn-danger'}
+						class:armed={unblockArmed}
 						onclick={toggleBlock}
 						disabled={selectedBusy !== null}
 					>
@@ -627,7 +792,9 @@
 							{m('vendors.screening.queue.action.working')}
 						{:else}
 							{selected.payments_blocked
-								? m('vendors.screening.queue.action.unblock')
+								? unblockArmed
+									? m('vendors.screening.queue.action.confirmUnblock')
+									: m('vendors.screening.queue.action.unblock')
 								: m('vendors.screening.queue.action.block')}
 						{/if}
 					</button>
@@ -635,6 +802,103 @@
 			</div>
 		{:else}
 			<p class="no-perm-note">{m('vendors.screening.queue.noPermissionNote')}</p>
+		{/if}
+
+		<!-- False-positive adjudication (decisions §477). Offered from the
+		     server's verdicts only (`adjudicate_refusal` /
+		     `revoke_adjudication_refusal`): `role_not_permitted` or no verdict
+		     yet hides the control; any other refusal disables it beside its
+		     reason. -->
+		{#if selected.adjudication || isOffered(selected.adjudicate_refusal)}
+			<section class="adjudication" data-testid="screening-adjudication" data-vendor-id={selected.vendor_id}>
+				<h3>{m('vendors.screening.queue.adjudication.title')}</h3>
+				{#if selected.adjudication}
+					<p data-testid="screening-adjudication-cleared">
+						{m('vendors.screening.queue.adjudication.cleared', {
+							date: formatDate(selected.adjudication.adjudicated_at)
+						})}
+					</p>
+					<p class="muted">{selected.adjudication.reason}</p>
+					{#if isOffered(selected.revoke_adjudication_refusal)}
+						<label class="adjudication-reason">
+							<span>{m('vendors.screening.queue.adjudication.revokeReasonLabel')}</span>
+							<textarea
+								rows="2"
+								minlength="3"
+								maxlength="2000"
+								aria-describedby="adjudication-revoke-hint"
+								bind:value={adjudicationReason}
+								disabled={!isAllowed(selected.revoke_adjudication_refusal)}
+							></textarea>
+						</label>
+						<p class="muted" id="adjudication-revoke-hint">
+							{m('vendors.screening.queue.adjudication.reasonHint')}
+						</p>
+						<button
+							class="btn-secondary"
+							data-testid="screening-adjudication-revoke"
+							aria-describedby={isAllowed(selected.revoke_adjudication_refusal)
+								? undefined
+								: 'adjudication-revoke-refusal'}
+							onclick={() => submitAdjudication('revoke')}
+							disabled={!isAllowed(selected.revoke_adjudication_refusal) ||
+								selectedBusy !== null ||
+								adjudicationReason.trim().length < 3}
+						>
+							{selectedBusy === 'adjudicate'
+								? m('vendors.screening.queue.action.working')
+								: m('vendors.screening.queue.adjudication.revoke')}
+						</button>
+						{#if !isAllowed(selected.revoke_adjudication_refusal)}
+							<p
+								class="muted"
+								id="adjudication-revoke-refusal"
+								data-testid="screening-adjudication-revoke-refusal"
+							>
+								{refusalText(selected.revoke_adjudication_refusal ?? null, m)}
+							</p>
+						{/if}
+					{/if}
+				{:else}
+					<p class="muted">{m('vendors.screening.queue.adjudication.intro')}</p>
+					<label class="adjudication-reason">
+						<span>{m('vendors.screening.queue.adjudication.reasonLabel')}</span>
+						<textarea
+							rows="2"
+							maxlength="2000"
+							placeholder={m('vendors.screening.queue.adjudication.reasonPlaceholder')}
+							minlength="3"
+							aria-describedby="adjudication-reason-hint"
+							data-testid="screening-adjudication-reason"
+							bind:value={adjudicationReason}
+							disabled={!isAllowed(selected.adjudicate_refusal)}
+						></textarea>
+					</label>
+					<p class="muted" id="adjudication-reason-hint">
+						{m('vendors.screening.queue.adjudication.reasonHint')}
+					</p>
+					<button
+						class="btn-primary"
+						data-testid="screening-adjudication-submit"
+						aria-describedby={isAllowed(selected.adjudicate_refusal)
+							? undefined
+							: 'adjudication-refusal'}
+						onclick={() => submitAdjudication('adjudicate')}
+						disabled={!isAllowed(selected.adjudicate_refusal) ||
+							selectedBusy !== null ||
+							adjudicationReason.trim().length < 3}
+					>
+						{selectedBusy === 'adjudicate'
+							? m('vendors.screening.queue.action.working')
+							: m('vendors.screening.queue.adjudication.adjudicate')}
+					</button>
+					{#if !isAllowed(selected.adjudicate_refusal)}
+						<p class="muted" id="adjudication-refusal" data-testid="screening-adjudication-refusal">
+							{refusalText(selected.adjudicate_refusal ?? null, m)}
+						</p>
+					{/if}
+				{/if}
+			</section>
 		{/if}
 
 		<h3>{m('vendors.screening.queue.history.title')}</h3>
@@ -648,18 +912,13 @@
 		     empty claim, so a timeline in flight for the open vendor can't be
 		     read as an answer about it either. -->
 		{#if historyError}
-			<p class="history-error" role="alert" data-testid="screening-history-error">
-				{m('vendors.screening.queue.history.error')}
-				<button
-					type="button"
-					class="btn-retry"
-					onclick={() => selected && loadHistory(selected.vendor_id)}
-				>
-					{m('vendors.screening.queue.history.retry')}
-				</button>
-			</p>
+			<LoadError
+				message={m('vendors.screening.queue.history.error')}
+				onretry={() => selected && loadHistory(selected.vendor_id)}
+				testId="screening-history-error"
+			/>
 		{:else if historyLoading || !historyIsForSelected}
-			<p class="muted" data-testid="screening-history-loading">{m('common.loading')}</p>
+			<LoadingState testId="screening-history-loading" />
 		{:else if history.length === 0}
 			<p class="muted" data-testid="screening-history-empty">
 				{m('vendors.screening.queue.history.empty')}
@@ -668,9 +927,11 @@
 			<ul class="history" data-testid="screening-history" data-vendor-id={historyVendorId}>
 				{#each history as h (h.id)}
 					<li>
-						<span class="history-result {h.result}">{resultLabel(h.result)}</span>
+						<Badge tone={RESULT_TONES[h.result] ?? 'neutral'} variant="history-result {h.result}">
+							{resultLabel(h.result)}
+						</Badge>
 						<span class="history-meta">
-							{h.check_type} · {h.provider}
+							{checkTypeLabel(h.check_type)} · {h.provider}
 							{#if h.matched_list}· {h.matched_list}{/if}
 							{#if h.categories.length}· {formatCategories(h.categories)}{/if}
 							{#if h.risk_score}· {m('vendors.screening.queue.history.score', { score: h.risk_score })}{/if}
@@ -690,28 +951,26 @@
 </Modal>
 
 <style>
-	/* Page-specific styling; shared design-system CSS lives in app.css. */
-	.btn-outline {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-	.btn-outline:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-outline:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.screening-table { min-width: 0; }
+	.screening-table :global(table) { min-width: 1130px; }
+	.screening-table :global(th.col-screening) { width: 210px; }
+	.screening-table :global(th.col-list) { width: 180px; }
+	.screening-table :global(th.col-provider) { width: 140px; }
+	.screening-table :global(th.col-score) { width: 120px; }
+	.screening-table :global(th.col-date) { width: 130px; }
+	.screening-table :global(th.actions-col) { width: 130px; }
 
+	/* Page-specific styling; shared design-system CSS lives in app.css. */
 	.vendor-name {
 		font-weight: 500;
 	}
@@ -725,7 +984,7 @@
 	}
 	.meta {
 		display: grid;
-		grid-template-columns: repeat(2, 1fr);
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 10px 24px;
 		margin: 0 0 16px;
 	}
@@ -740,10 +999,14 @@
 		letter-spacing: 0.03em;
 		color: var(--text-muted);
 	}
+	/* `minmax(0, 1fr)` tracks above + `anywhere` here: a long unbroken value
+	   (a list name, an id) wraps inside its column instead of widening the
+	   dialog past a 320px viewport (WCAG 1.4.10). */
 	.meta dd {
 		margin: 0;
 		font-size: 0.9rem;
 		color: var(--text);
+		overflow-wrap: anywhere;
 	}
 
 	.review-actions {
@@ -770,34 +1033,7 @@
 	.reason-input:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
-	}
-	.btn-block {
-		padding: 8px 16px;
-		border-radius: 6px;
-		border: 1px solid #f06464;
-		background: rgba(224, 64, 64, 0.12);
-		color: #f06464;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-	.btn-block:hover:not(:disabled) {
-		background: rgba(224, 64, 64, 0.2);
-	}
-	.btn-block.unblock {
-		border-color: #1fa86a;
-		background: rgba(31, 168, 106, 0.12);
-		color: #1fa86a;
-	}
-	.btn-block.unblock:hover:not(:disabled) {
-		background: rgba(31, 168, 106, 0.2);
-	}
-	.btn-block:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 	.no-perm-note {
 		font-size: 0.82rem;
@@ -813,24 +1049,6 @@
 	h3 {
 		font-size: 0.95rem;
 		margin: 0 0 8px;
-	}
-	.history-error {
-		display: flex;
-		align-items: baseline;
-		gap: 8px;
-		flex-wrap: wrap;
-		font-size: 0.85rem;
-		color: var(--danger);
-		margin: 0 0 8px;
-	}
-	.btn-retry {
-		border: none;
-		background: none;
-		padding: 0;
-		font: inherit;
-		color: var(--accent-strong);
-		text-decoration: underline;
-		cursor: pointer;
 	}
 	.history {
 		list-style: none;
@@ -849,31 +1067,6 @@
 		flex-wrap: wrap;
 		padding-bottom: 8px;
 		border-bottom: 1px solid var(--border);
-	}
-	.history-result {
-		font-size: 0.72rem;
-		font-weight: 600;
-		/* No `text-transform: capitalize` — it existed to dress up the raw
-		   `review_required` this badge used to print, and the label is properly
-		   cased at the source now. Left in, it would title-case a translated
-		   phrase mid-sentence ("Prüfung Erforderlich"). */
-		padding: 2px 8px;
-		border-radius: 10px;
-		background: var(--bg);
-		color: var(--text-muted);
-		white-space: nowrap;
-	}
-	.history-result.match {
-		background: rgba(224, 64, 64, 0.12);
-		color: #f06464;
-	}
-	.history-result.review_required {
-		background: rgba(212, 148, 10, 0.12);
-		color: #d4940a;
-	}
-	.history-result.clear {
-		background: rgba(31, 168, 106, 0.12);
-		color: #1fa86a;
 	}
 	.history-meta {
 		font-size: 0.8rem;

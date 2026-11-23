@@ -17,6 +17,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Select
 
+from app.api.refusals import TOKEN_TENANT_MISMATCH_DETAIL
 from app.database import commit_before_response, get_control_db, get_tenant_engine
 from app.models.entity import Entity
 from app.models.organization import Organization
@@ -25,6 +26,11 @@ from app.models.organization import Organization
 # every entity. An absent header means the same thing (so API consumers that
 # predate multi-entity keep seeing all rows). Both resolve to ``None``.
 ALL_ENTITIES = "all"
+
+# `services.mfa.CHALLENGE_TYPE` / `VENDOR_CHALLENGE_TYPE`, spelled out to keep
+# this module's imports out of the MFA service (pinned equal by
+# tests/test_tenant_auth_sweep.py). Neither is an access token.
+_CHALLENGE_TOKEN_TYPES = frozenset({"mfa_challenge", "vendor_mfa_challenge"})
 
 
 def normalize_custom_domain(host: str | None) -> str | None:
@@ -168,10 +174,22 @@ async def get_tenant(
 
         if payload is not None and payload.get("typ") != "vendor":
             token_org = payload.get("org")
+            # An employee ACCESS token with no `org` claim is refused too, not
+            # waved through: `get_current_user` resolves the account by `sub`
+            # alone and never compares its organization with this tenant, so
+            # a claim-less token would otherwise open any tenant's DB. Every
+            # access token we mint carries `org`. The MFA challenge types are
+            # not access tokens (`get_current_user` refuses them) and stay
+            # exempt so a route that reads one keeps resolving its tenant.
+            if not token_org and payload.get("typ") not in _CHALLENGE_TOKEN_TYPES:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=TOKEN_TENANT_MISMATCH_DETAIL,
+                )
             if token_org and str(org.id) != token_org:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Token does not match the requested tenant",
+                    detail=TOKEN_TENANT_MISMATCH_DETAIL,
                 )
 
     return org

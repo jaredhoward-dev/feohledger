@@ -2,11 +2,33 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Numeric, String, Text, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, EntityMixin, TimestampMixin
+
+#: Terminal payment states — a payment in one of these no longer represents a
+#: LIVE claim on its invoice. The ONE statement of that rule (issue #575): the
+#: `uq_payments_one_live_per_invoice` predicate below is built from it, and the
+#: app-level live-payment guards (`api/payments`, `payment_runs`,
+#: `external_payment`), the Positive Pay check-issue file and the vendor card
+#: revocation all import it. A void hands the invoice back to `approved` to be
+#: re-paid; a failed / cancelled attempt must not block a fresh one. The order
+#: matters only for the index text, which must match migration 0074.
+LIVE_PAYMENT_TERMINAL_STATUSES: tuple[str, ...] = ("voided", "failed", "cancelled")
+_NOT_LIVE_SQL = ", ".join(f"'{s}'" for s in LIVE_PAYMENT_TERMINAL_STATUSES)
 
 
 class PaymentRun(Base, EntityMixin, TimestampMixin):
@@ -86,7 +108,7 @@ class Payment(Base, EntityMixin, TimestampMixin):
             "uq_payments_one_live_per_invoice",
             "invoice_id",
             unique=True,
-            postgresql_where=text("status NOT IN ('voided', 'failed', 'cancelled')"),
+            postgresql_where=text(f"status NOT IN ({_NOT_LIVE_SQL})"),
         ),
         # `GET /api/payments`'s default order + its status chips. Same shape and
         # same reasoning as `ix_invoices_created_at_id` — see migration 0092.
@@ -104,6 +126,13 @@ class Payment(Base, EntityMixin, TimestampMixin):
             "ix_payments_corridor",
             "corridor",
             postgresql_where=text("corridor IS NOT NULL"),
+        ),
+        # `rail_breakdown` is a JSON array or nothing: the 1099 aggregate walks
+        # it with `jsonb_array_elements`, which raises on an object or a scalar
+        # (migration 0130).
+        CheckConstraint(
+            "rail_breakdown IS NULL OR jsonb_typeof(rail_breakdown) = 'array'",
+            name="ck_payments_rail_breakdown_array",
         ),
     )
 
@@ -164,6 +193,49 @@ class Payment(Base, EntityMixin, TimestampMixin):
     # ops dashboards without parsing audit logs.
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A dispatch attempt that may have reached the processor and whose outcome
+    # was never recorded (migration 0124). `_dispatch_payment_guarded` stamps it
+    # and COMMITS before the attempt starts, and clears it in the transaction
+    # that records the attempt's outcome — unless the row already carried a
+    # stamp when the attempt began, i.e. an earlier pass crashed between its
+    # stamp and its commit, possibly after `adapter.create_payment`. A row that
+    # still holds one is in doubt whatever its `failure_reason` says
+    # (`payment_runs.classify_payment_failure`): a later pre-adapter refusal on
+    # `/resume` proves nothing about what the crashed pass sent.
+    dispatch_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # The payee this payment released money to (migration 0128, decisions §383),
+    # stamped by `services/payee_stamp.stamp_payee` at the rail / card dispatch,
+    # the NACHA export and a record of payment outside FeohLedger. A void
+    # compares it with who a re-payment would pay, because a vendor merge moves
+    # paid invoices and a bank change skips them while they are paid.
+    #
+    # `payee_vendor_id` is history, so it is deliberately NOT a `vendor_id` FK:
+    # a merge must not move it (`vendor_merge.VENDOR_FK_CHILDREN`), and no FK
+    # ties a vendor's lifecycle to the payments that once paid it.
+    # `payee_bank_fingerprint` is a keyed HMAC of the vendor's whole
+    # `bank_details` (`payee_stamp.bank_fingerprint`), never a number. All
+    # three NULL: no money released since 0128, or paid before it — nothing is
+    # backfilled, because today's details are exactly what cannot stand in for
+    # the ones paid (§141).
+    payee_vendor_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    payee_bank_fingerprint: Mapped[str | None] = mapped_column(String(80))
+    payee_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Which rails paid this payment, and how much each, when one payment was
+    # made on several (migration 0130, decisions §396): a bill the ERP shows
+    # paid by a cheque and a card is ONE row here, and `method` holds one rail.
+    # `[{"method": "check" | "card" | null, "amount": "<exact decimal>"}]`, one
+    # entry per cash payment the ERP listed, no account data. Written once, at
+    # an ERP-reported record (`external_payment._complete`), only when the
+    # parts sum EXACTLY to `amount` (`payment_methods.split_by_rail`); `method`
+    # is then the parts' one rail, or NULL when they used several. The 1099
+    # aggregate splits the payment by it (`tax_1099.build_1099_report`). NULL
+    # on every other payment, and on every payment recorded before 0130:
+    # nothing is backfilled, because no stored fact says how an old one split
+    # (§141). `none_as_null`: Python None is SQL NULL, never the JSON `null`
+    # the CHECK below refuses (a plain JSONB column writes `'null'::jsonb`).
+    rail_breakdown: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
 
     # What the PROCESSOR said it actually settled, as reported on its webhook
     # (or re-fetched via `PaymentAdapter.fetch_settlement` for a rail whose

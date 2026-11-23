@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent_decision import AgentDecision
 from app.models.exception import Exception as APException
-from app.models.invoice import Invoice
+from app.models.invoice import Invoice, InvoiceStatus
 from app.services.exception_agents.autonomy import (
     autonomy_threshold,
     resolve_autonomy_level,
@@ -22,12 +22,16 @@ from app.services.exception_agents.base import (
     ACTION_NO_ACTION,
 )
 from app.services.exception_agents.registry import get_resolver
-from app.services.exception_agents.resolvers.amount_mismatch import NotApprovable
+from app.services.exception_agents.resolvers.amount_mismatch import (
+    NotApprovable,
+    PayeeFixedByApproval,
+)
 from app.services.exception_lifecycle import (
     deciding,
     record_decision,
     refusal_message,
     segregation_refusal,
+    workflow_instance_for,
 )
 from app.utils.http import detail_text
 
@@ -213,9 +217,30 @@ async def run_agent(
     # the invoice's uploader triggers escalates here. `duplicate` and
     # `fraud_flag` are escalate-only stubs, and the other blocking types have no
     # resolver at all.
+    #
+    # On a `po_mismatch` the invoice's approvers are refused too (decisions
+    # §420), so a run triggered by someone who already approved the invoice
+    # escalates here. Who had approved is read NOW, before the apply, and the
+    # same set is handed to `record_decision` below: a po_mismatch resolver
+    # approves the invoice on the triggering human's behalf, and judging the
+    # resolve against the row after that would refuse every auto-resolution
+    # with a bare 403. That approval is not the human's word standing in for a
+    # receipt: the row is resolved only when the re-match no longer finds the
+    # mismatch (`decision.refound`) and no receipt that lifts the hold is
+    # implicated, approvers included (`_receipts_implicated`, §389).
+    approvers = None
+    if can_resolve:
+        from app.services.approval_chain import approver_ids
+
+        approvers = approver_ids(invoice, await workflow_instance_for(db, exception, invoice))
     refusal = (
         segregation_refusal(
-            exception, invoice, actor_id, action="resolve", org_settings=org_settings
+            exception,
+            invoice,
+            actor_id,
+            action="resolve",
+            org_settings=org_settings,
+            approvers=approvers,
         )
         if can_resolve
         else None
@@ -276,6 +301,10 @@ async def run_agent(
                         raise _FindingPersists(invoice.status)
                     if await _receipts_implicated(db, exception, invoice, org_settings):
                         raise _ReceiptsImplicated(invoice.status)
+                    if _approved_past_po_overbilling(invoice):
+                        raise _POOverbilled(invoice.status)
+                    if _approved_past_contract_cap(invoice):
+                        raise _ContractCap(invoice.status)
         except (NotApprovable, HTTPException) as exc:
             # Two families of refusal, one outcome — an escalation with a
             # recorded decision.
@@ -308,8 +337,9 @@ async def run_agent(
             if isinstance(exc, _ReceiptsImplicated):
                 reason = (
                     "A goods receipt on the matched purchase order was recorded by "
-                    "someone involved in this invoice, so it cannot be what clears "
-                    "the hold. Escalated to a human."
+                    "someone involved in creating this invoice, by someone who "
+                    "approved it, or by nobody it can name, so it cannot be what "
+                    "clears the hold. Escalated to a human."
                 )
                 logger.info(
                     "Agent resolution rests on an implicated receipt on invoice %s; escalating",
@@ -323,6 +353,34 @@ async def run_agent(
                 )
                 logger.info(
                     "Agent change left the PO-match finding in place on invoice %s; escalating",
+                    invoice.id,
+                )
+            elif isinstance(exc, _POOverbilled):
+                reason = (
+                    "This invoice and the others billing its purchase order exceed the "
+                    "order's total, so it needs a person's approval. Escalated to a human."
+                )
+                logger.info(
+                    "Agent approval would pass a PO's total on invoice %s; escalating",
+                    invoice.id,
+                )
+            elif isinstance(exc, _ContractCap):
+                reason = (
+                    "This invoice is linked to a not-to-exceed contract whose limit it "
+                    "passes, or cannot be measured against because the currencies "
+                    "differ, so it needs a person's approval. Escalated to a human."
+                )
+                logger.info(
+                    "Agent approval would pass a contract cap on invoice %s; escalating",
+                    invoice.id,
+                )
+            elif isinstance(exc, PayeeFixedByApproval):
+                reason = (
+                    "This invoice was approved once, so the agent will not set its "
+                    "vendor from the purchase order. Escalated to a human."
+                )
+                logger.info(
+                    "Agent would set the payee of once-approved invoice %s; escalating",
                     invoice.id,
                 )
             elif isinstance(exc, NotApprovable):
@@ -368,6 +426,7 @@ async def run_agent(
             invoice=invoice,
             via="agent",
             org_settings=org_settings,
+            approvers=approvers,
         )
         action = ACTION_AUTO_RESOLVED
     else:
@@ -431,11 +490,45 @@ class _FindingPersists(NotApprovable):
 
 class _ReceiptsImplicated(NotApprovable):
     """The live match the agent's change leaves behind counts a hand-entered
-    receipt recorded by someone implicated in the invoice (or by nobody known).
-    The PO-match auto-close refuses to release on that evidence
+    receipt recorded by someone implicated in the invoice, by someone who
+    approved it (decisions §389), or by nobody known. The PO-match auto-close
+    refuses to release on that evidence
     (``invoice_warnings.receipts_clear_hold``, decisions §262); an agent run
     must not either, whoever triggered it — so the apply unwinds and the row
     escalates."""
+
+
+class _POOverbilled(NotApprovable):
+    """The apply approved an invoice whose refresh reports the cumulative PO
+    over-billing warning (decisions §469). That warning raises no hold, and
+    the unattended doors send it to a person
+    (``invoice_warnings.UNATTENDED_APPROVAL_PO_OVERBILLED``); an agent approval
+    is no person reading it either, so the apply unwinds and the row
+    escalates."""
+
+
+def _approved_past_po_overbilling(invoice) -> bool:
+    from app.services.invoice_warnings import has_po_overbilling_warning
+
+    status = getattr(invoice.status, "value", invoice.status)
+    return status == InvoiceStatus.approved.value and has_po_overbilling_warning(invoice)
+
+
+class _ContractCap(NotApprovable):
+    """The apply approved an invoice whose refresh reports an ``error``
+    contract finding: a not-to-exceed limit passed, or not measurable because
+    the invoice is in another currency or none (decisions §472).
+    The unattended doors send it to a person
+    (``invoice_warnings.UNATTENDED_APPROVAL_CONTRACT_CAP``); an agent approval
+    is no person reading it either, so the apply unwinds and the row
+    escalates."""
+
+
+def _approved_past_contract_cap(invoice) -> bool:
+    from app.services.invoice_warnings import has_contract_cap_warning
+
+    status = getattr(invoice.status, "value", invoice.status)
+    return status == InvoiceStatus.approved.value and has_contract_cap_warning(invoice)
 
 
 async def _receipts_implicated(db, exception, invoice, org_settings) -> bool:
@@ -448,7 +541,7 @@ async def _receipts_implicated(db, exception, invoice, org_settings) -> bool:
     if not exception_segregation_enabled(org_settings):
         return False
     live = await match_invoice_under_org_rules(db, invoice, org_settings)
-    return not await receipts_clear_hold(db, invoice, live.po_id)
+    return not await receipts_clear_hold(db, invoice, live.matched_po_ids())
 
 
 def _record(

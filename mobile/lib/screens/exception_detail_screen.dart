@@ -1,9 +1,13 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:feohledger_mobile/api/endpoints.dart';
 import 'package:feohledger_mobile/l10n/coded_refusal_messages.dart';
+import 'package:feohledger_mobile/l10n/erp_refusal_messages.dart';
+import 'package:feohledger_mobile/l10n/enum_labels.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/l10n/invoice_warning_messages.dart';
+import 'package:feohledger_mobile/l10n/load_error_messages.dart';
+import 'package:feohledger_mobile/models/action_verdict.dart';
 import 'package:feohledger_mobile/models/admin_user.dart';
 import 'package:feohledger_mobile/models/exception.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
@@ -12,6 +16,7 @@ import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/dates.dart';
 import 'package:feohledger_mobile/utils/money.dart';
 import 'package:feohledger_mobile/widgets/exception_status_badge.dart';
+import 'package:feohledger_mobile/widgets/load_error_state.dart';
 
 /// Single-exception detail — full fields, the linked invoice, SLA / due /
 /// overdue, the current assignee, and the three actions (resolve / escalate /
@@ -31,11 +36,11 @@ class ExceptionDetailScreen extends StatefulWidget {
 class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
   ApException? _exception;
   bool _loading = true;
-  // The raw store error (if any) when a load fails. Kept un-localized here —
-  // `AppLocalizations.of(context)` isn't safe to call from initState/_load, so
-  // the "not found" fallback copy is resolved at render time in build()
-  // (`exceptionDetailNotFound`) whenever this is null but there's no exception.
-  String? _error;
+  // The error [ExceptionStore.getById] threw, worded at render time by
+  // [describeLoadError] — `AppLocalizations.of(context)` isn't safe to call
+  // from initState/_load. The store hands it back rather than recording it,
+  // so a failed detail read never shows up as the list's error.
+  Object? _error;
   // True while an action / assign network call is in flight — disables the
   // controls and guards against a double-tap firing twice.
   bool _submitting = false;
@@ -51,14 +56,20 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
       _loading = true;
       _error = null;
     });
-    final exc = await ExceptionStore.instance.getById(widget.exceptionId);
-    if (!mounted) return;
-    setState(() {
-      _exception = exc;
-      // Keep the raw store error (may be null → "not found" fallback in build).
-      _error = exc == null ? ExceptionStore.instance.error : null;
-      _loading = false;
-    });
+    try {
+      final exc = await ExceptionStore.instance.getById(widget.exceptionId);
+      if (!mounted) return;
+      setState(() {
+        _exception = exc;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e;
+        _loading = false;
+      });
+    }
   }
 
   @override
@@ -74,23 +85,22 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
     }
-    if (_error != null || _exception == null) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.error_outline, size: 56, color: Colors.red),
-            const SizedBox(height: 12),
-            Text(_error ?? l.exceptionDetailNotFound),
-            const SizedBox(height: 12),
-            FilledButton(onPressed: _load, child: Text(l.commonRetry)),
-          ],
-        ),
+    final error = _error;
+    if (error != null) {
+      return LoadErrorState(
+        message: describeLoadError(l, error, l.exceptionDetailErrorPrefix),
+        onRetry: _load,
       );
     }
 
     final exc = _exception!;
-    final canAct = exc.status.isActionable && !_submitting;
+    // Resolve / Escalate / Dismiss from the server's verdicts
+    // (`decision_refusals`): the section renders when any is offered.
+    final offersAction = [
+      exc.resolveVerdict,
+      exc.escalateVerdict,
+      exc.dismissVerdict,
+    ].any((v) => v.isOffered(hiddenCodes: kExceptionHiddenRefusals));
     // Localized off the row's description code — the invoice's own warning
     // wording — with the server's English as the fallback.
     final description = exceptionDescriptionText(l, exc);
@@ -110,6 +120,26 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
               ),
             const SizedBox(height: 16),
           ],
+          if (poRematchText(l, exc) case final note?) ...[
+            Text(
+              note,
+              key: const Key('exception-rematch-note'),
+              style: const TextStyle(fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 16),
+          ],
+          if (erpRefusalNoteFor(l, exc) case final note?) ...[
+            Text(
+              note,
+              key: const Key('exception-erp-refusal'),
+              style: const TextStyle(fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 16),
+          ],
+          if (exc.erpPayment case final payment?) ...[
+            _erpPaymentPanel(l, exc, payment),
+            const SizedBox(height: 16),
+          ],
           _invoicePanel(l, exc),
           const SizedBox(height: 16),
           _slaPanel(l, exc),
@@ -121,7 +151,7 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
             _resolutionPanel(l, exc),
           ],
           const SizedBox(height: 24),
-          if (canAct) _actionButtons(l, exc),
+          if (offersAction) _actionButtons(l, exc),
         ],
       ),
     );
@@ -208,6 +238,43 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
     );
   }
 
+  /// What the ERP says was paid, beside the invoice panel's own figure. Both
+  /// rendered, never compared here: the server refuses a record whose figure
+  /// or currency differs (decisions §386, §413). Recording it is web-only.
+  Widget _erpPaymentPanel(
+    AppLocalizations l,
+    ApException exc,
+    ErpReportedPayment payment,
+  ) {
+    final erp = exc.erpName ?? l.exceptionDetailYourErp;
+    final amount = payment.amount;
+    final paidOn = payment.paidOn;
+    final reference = payment.reference;
+    return KeyedSubtree(
+      key: const Key('exception-erp-payment'),
+      child: _card(
+        title: l.exceptionDetailErpPaymentTitle(erp),
+        children: [
+          _row(
+            l.exceptionDetailErpPaymentAmount(erp),
+            amount == null
+                ? l.exceptionDetailErpPaymentNotStated
+                : formatMoneyString(amount, currency: payment.amountCurrency),
+          ),
+          if (paidOn != null)
+            _row(l.exceptionDetailErpPaymentPaidOn, formatDate(paidOn)),
+          if (reference != null)
+            _row(l.exceptionDetailErpPaymentReference, reference),
+          const SizedBox(height: 8),
+          Text(
+            l.exceptionDetailErpPaymentRecordOnWeb,
+            style: TextStyle(color: Colors.grey.shade700, fontSize: 13),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _invoicePanel(AppLocalizations l, ApException exc) {
     return _card(
       title: l.exceptionDetailSectionInvoice,
@@ -226,7 +293,7 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
             _row(l.exceptionDetailFieldAmount,
                 formatMoneyString(exc.amount, currency: exc.currency)),
         ],
-        _row(l.exceptionDetailFieldSeverity, exc.severity.label),
+        _row(l.exceptionDetailFieldSeverity, exceptionSeverityLabel(l, exc.severity)),
       ],
     );
   }
@@ -308,37 +375,88 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
     );
   }
 
+  /// The three decisions, each from its verdict: absent when refused for the
+  /// reader's role or a terminal status, enabled when accepted, else disabled
+  /// with the refusal in the reader's language (a segregation-of-duties
+  /// refusal names who may act instead) — never a button that can only 403.
   Widget _actionButtons(AppLocalizations l, ApException exc) {
-    return Column(
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: FilledButton.icon(
-                onPressed: () => _runAction('resolve'),
-                icon: const Icon(Icons.check),
-                label: Text(l.exceptionActionResolve),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: () => _runAction('escalate'),
-                icon: const Icon(Icons.arrow_upward),
-                label: Text(l.exceptionActionEscalate),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: OutlinedButton.icon(
-            onPressed: () => _runAction('dismiss'),
-            icon: const Icon(Icons.block),
-            label: Text(l.exceptionActionDismiss),
+    Widget? action(
+      ActionVerdict verdict,
+      String action,
+      Widget Function(VoidCallback? onPressed) button,
+    ) {
+      if (!verdict.isOffered(hiddenCodes: kExceptionHiddenRefusals)) {
+        return null;
+      }
+      final reason = verdict.allowed
+          ? null
+          : localizeCodedRefusal(l, verdict.refusal) ??
+                (verdict.refusal?['message'] as String? ?? '');
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          button(
+            verdict.allowed && !_submitting ? () => _runAction(action) : null,
           ),
-        ),
+          if (reason != null && reason.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                reason,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+        ],
+      );
+    }
+
+    final resolve = action(
+      exc.resolveVerdict,
+      'resolve',
+      (onPressed) => FilledButton.icon(
+        onPressed: onPressed,
+        icon: const Icon(Icons.check),
+        label: Text(l.exceptionActionResolve),
+      ),
+    );
+    final escalate = action(
+      exc.escalateVerdict,
+      'escalate',
+      (onPressed) => OutlinedButton.icon(
+        onPressed: onPressed,
+        icon: const Icon(Icons.arrow_upward),
+        label: Text(l.exceptionActionEscalate),
+      ),
+    );
+    final dismiss = action(
+      exc.dismissVerdict,
+      'dismiss',
+      (onPressed) => OutlinedButton.icon(
+        onPressed: onPressed,
+        icon: const Icon(Icons.block),
+        label: Text(l.exceptionActionDismiss),
+      ),
+    );
+    // Resolve and Escalate side by side, Dismiss full width beneath.
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (resolve != null || escalate != null)
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (resolve != null) Expanded(child: resolve),
+              if (resolve != null && escalate != null)
+                const SizedBox(width: 8),
+              if (escalate != null) Expanded(child: escalate),
+            ],
+          ),
+        if ((resolve != null || escalate != null) && dismiss != null)
+          const SizedBox(height: 8),
+        ?dismiss,
       ],
     );
   }
@@ -389,7 +507,11 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(l.exceptionDetailLoadUsersFailed(e.toString()))),
+        SnackBar(
+          content: Text(
+            describeLoadError(l, e, l.exceptionDetailLoadUsersFailed),
+          ),
+        ),
       );
       return;
     }
@@ -473,3 +595,29 @@ class _ExceptionDetailScreenState extends State<ExceptionDetailScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 }
+
+/// The line that says an ERP PO sync's re-check no longer finds this hold
+/// (decisions §323, amended), or null on any other row. The sync never clears
+/// a hold, so this is the reason a reviewer may now. A missing PO number or
+/// day is left out, never invented.
+String? poRematchText(AppLocalizations l, ApException exc) {
+  final note = exc.poRematch;
+  if (note == null) return null;
+  final erp = exc.erpName ?? l.exceptionDetailYourErp;
+  final po = note.poNumber;
+  final day = note.observedOn;
+  if (po == null) return l.exceptionDetailPoRematchNoPo(erp);
+  if (day == null) return l.exceptionDetailPoRematchNoDate(po, erp);
+  return l.exceptionDetailPoRematch(po, erp, formatDate(day));
+}
+
+/// Why the ERP refused this row's payment write-back, in the reader's
+/// language (`erp_refusal_messages.dart`, the web resolve dialog's
+/// `erpRefusalNote`, decisions §332), or null on any other row.
+String? erpRefusalNoteFor(AppLocalizations l, ApException exc) =>
+    erpRefusalNote(
+      l,
+      exc.erpReportKind,
+      exc.erpRefusal,
+      exc.erpName ?? l.exceptionDetailYourErp,
+    );

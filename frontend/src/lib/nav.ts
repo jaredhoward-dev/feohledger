@@ -44,7 +44,9 @@ import {
 	PERM_PAYMENT_EXECUTE,
 	PERM_PAYMENT_RECORD_EXTERNAL,
 	PERM_PAYMENT_VOID,
-	PERM_USER_MANAGE
+	PERM_USER_MANAGE,
+	PERM_VENDOR_BLOCK,
+	PERM_VENDOR_MANAGE
 } from '#lib/types/admin.ts';
 
 /**
@@ -132,7 +134,19 @@ export const NAV: NavEntry[] = [
 		roles: ['admin', 'ap_manager', 'cfo'],
 		permissions: [PERM_PAYMENT_EXECUTE, PERM_PAYMENT_VOID, PERM_PAYMENT_RECORD_EXTERNAL]
 	},
-	{ kind: 'link', label: 'Vendors', labelKey: 'nav.vendors', href: '/vendors', icon: 'vendors', roles: ['admin', 'ap_manager', 'cfo'] },
+	// `permissions` OR's in a custom role holding only `vendor.manage` /
+	// `vendor.block`: the reads the page makes (GET /api/vendors, /counts, /ids,
+	// /{id}) admit either permission alongside the three roles
+	// (`require_role_or_permission`), so the row must not hide the page from it.
+	{
+		kind: 'link',
+		label: 'Vendors',
+		labelKey: 'nav.vendors',
+		href: '/vendors',
+		icon: 'vendors',
+		roles: ['admin', 'ap_manager', 'cfo'],
+		permissions: [PERM_VENDOR_MANAGE, PERM_VENDOR_BLOCK]
+	},
 	// Sanctions-screening review queue (a sub-route of /vendors). Reuses the
 	// existing `vendors.col.screening` message ("Screening") as its label — a
 	// dedicated `nav.screening` key is a later i18n slice (Lane A owns locales).
@@ -213,10 +227,14 @@ export const NAV: NavEntry[] = [
 			{ label: 'Budgets', labelKey: 'nav.budgets', href: '/budgets', roles: ['admin', 'ap_manager', 'cfo'] },
 		],
 	},
+	// "Treasury", not "Billing" (decisions §314): every row here is the
+	// customer's own payables money — memos, discounts, bank files, the bank
+	// reconciliation — and "Billing" read as OUR subscription, which lived here
+	// too and has moved to Settings.
 	{
 		kind: 'group',
-		label: 'Billing',
-		labelKey: 'nav.group.billing',
+		label: 'Treasury',
+		labelKey: 'nav.group.treasury',
 		icon: 'receipt',
 		children: [
 			{ label: 'Contracts', labelKey: 'nav.contracts', href: '/contracts', roles: ['admin', 'ap_manager', 'ap_clerk', 'cfo'] },
@@ -249,10 +267,6 @@ export const NAV: NavEntry[] = [
 			// renders read-only for a clerk and hiding the row would be a dead end
 			// rather than a gate.
 			{ label: 'Bank Reconciliation', labelKey: 'bankRecon.navLabel', href: '/bank-reconciliation', roles: ['admin', 'ap_manager', 'ap_clerk', 'cfo'] },
-			// Platform billing — the AP platform's OWN subscription / plan / usage
-			// (control-plane), distinct from the customer AP money path above.
-			// Admin/CFO only (the backend GET /api/billing/subscription 403s the rest).
-			{ label: 'Subscription', labelKey: 'nav.platformBilling', href: '/billing', roles: ['admin', 'cfo'] },
 		],
 	},
 	{
@@ -262,7 +276,9 @@ export const NAV: NavEntry[] = [
 		icon: 'assistant',
 		children: [
 			{ label: 'AI Assistant', labelKey: 'nav.aiAssistant', href: '/assistant', roles: ['admin', 'ap_manager', 'ap_clerk', 'cfo'] },
-			{ label: 'Cash Flow', labelKey: 'nav.cashFlow', href: '/cfo', roles: ['admin', 'cfo'] },
+			// "Cash-flow analytics", so it reads as distinct from the Copilot below
+			// it (decisions §314): this is the CFO dashboard, that is a conversation.
+			{ label: 'Cash-flow analytics', labelKey: 'nav.cashFlow', href: '/cfo', roles: ['admin', 'cfo'] },
 			// Conversational cash-flow copilot (finance leaders — mirrors the
 			// /api/cash-flow façade RBAC; distinct from the /cfo analytics dashboard).
 			{ label: 'Cash-Flow Copilot', labelKey: 'nav.cashFlowCopilot', href: '/cash-flow', roles: ['admin', 'ap_manager', 'cfo'] },
@@ -325,6 +341,13 @@ export const NAV: NavEntry[] = [
 		icon: 'settings',
 		children: [
 			{ label: 'Organization', labelKey: 'nav.organization', href: '/organization', roles: ['admin'] },
+			// Platform billing — the AP platform's OWN subscription / plan / usage
+			// (control-plane), distinct from the customer money path in Treasury,
+			// which is where it used to sit (decisions §314). Beside Organization
+			// because both describe the workspace itself. Admin/CFO (the backend
+			// GET /api/billing/subscription 403s the rest), so a CFO sees Settings
+			// as a group of this one page and lands on it.
+			{ label: 'Subscription', labelKey: 'nav.platformBilling', href: '/billing', roles: ['admin', 'cfo'] },
 			// Users + Roles share the /admin route via ?tab=; they're surfaced as
 			// peer section tabs (not a second tab row inside the page).
 			// Users: `GET /api/admin/users` is `require_permission(user.manage)`

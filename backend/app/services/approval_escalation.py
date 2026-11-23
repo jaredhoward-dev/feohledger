@@ -23,10 +23,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.database import _make_tenant_url, control_session_factory
+from app.db_engine import create_async_engine
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
 from app.models.workflow import WorkflowInstance, WorkflowStep
@@ -37,6 +38,7 @@ from app.services.approval_chain import (
     escalation_ineligible,
     get_chain_progress,
     init_chain_for_invoice,
+    inspection_recorders,
     receipt_recorders,
 )
 from app.services.audit_dispatch import dispatch_audit
@@ -86,9 +88,12 @@ async def _notify_escalated_approvers(
     written in this same transaction — never raises."""
     from app.models.invoice import Invoice
     from app.models.notification import EVENT_INVOICE_ASSIGNED
-    from app.services.email_action_token import digest_of_invoice
     from app.services.notification_dispatch import notify_event
     from app.services.notification_templates import InvoiceContext
+    from app.services.payment_runs import (
+        payable_currency_code as _payable_currency_code,
+    )
+    from app.services.review import approval_message_facts
 
     try:
         recipient_ids = [uuid.UUID(uid) for uid in added_user_ids]
@@ -111,9 +116,9 @@ async def _notify_escalated_approvers(
                 invoice_number=invoice.invoice_number,
                 vendor_name=invoice.vendor_name,
                 amount=invoice.amount,
-                currency=invoice.currency or "USD",
+                currency=_payable_currency_code(getattr(invoice, "currency", None)),
             ),
-            action_facts=digest_of_invoice(invoice),
+            action_facts=await approval_message_facts(db, invoice),
             actor_id=None,  # system-initiated sweep
         )
     except Exception:  # noqa: BLE001 — never let a notification bug break escalation
@@ -164,9 +169,9 @@ async def _prepare_for_escalation(
     rolls back otherwise, leaving the lazy path exactly as it was.
 
     The returned set is the payable's implicated actors plus whoever recorded a
-    goods receipt it is billed against (``approval_chain.escalation_ineligible``)
-    — segregation of duties refuses both at approval time, so escalation must
-    not make them approvers.
+    goods receipt it is billed against or an inspection of those goods
+    (``approval_chain.escalation_ineligible``) — segregation of duties refuses
+    all of them at approval time, so escalation must not make them approvers.
     """
     from app.services.review import resolve_approval_config
 
@@ -192,7 +197,12 @@ async def _prepare_for_escalation(
 
     if approval_config.get("require_segregation", True) is False:
         return set()
-    return escalation_ineligible(invoice, approval_config, await receipt_recorders(db, invoice))
+    return escalation_ineligible(
+        invoice,
+        approval_config,
+        await receipt_recorders(db, invoice),
+        await inspection_recorders(db, invoice),
+    )
 
 
 @dataclass

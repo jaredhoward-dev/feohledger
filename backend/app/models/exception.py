@@ -82,6 +82,49 @@ class Exception(Base, EntityMixin, TimestampMixin):
     # `tests/test_exception_raiser_stamping.py` is the guard that keeps every
     # `create_exception` call site answering the question explicitly.
     raised_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # What a person judged, for every row `invoice_warnings._ensure_exception`
+    # raises (migration 0116, decisions §286 for `duplicate` / `fraud_flag`,
+    # §366 for the rest): a SHA-256 of the facts that type's rule reads
+    # (`invoice_warnings.current_finding_fingerprint`: header fields, line
+    # totals, the PO match, priced lines …), stamped once, when the row is
+    # raised. A row a PERSON resolved or dismissed with a fingerprint equal to
+    # the invoice's current one stops the refresh re-raising that finding; a
+    # change to any of those facts re-raises it.
+    # `exception_lifecycle.record_decision` keeps it only when a person clears
+    # the row AND the invoice still hashes as it was raised, so neither a
+    # detector or agent close nor an edit made mid-decision ever suppresses.
+    # NULL on rows other paths open, and on rows closed before their type was
+    # stamped.
+    finding_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    # The control-plane user whose resolve or dismiss closed this row
+    # (migration 0126, decisions §367). `record_decision` writes it on every
+    # clearing decision: the person, or NULL when no person decided (a detector
+    # auto-close, an agent). A closed row suppresses a re-raise only while
+    # `exception_lifecycle.clearance_stands` says segregation would still let
+    # this person clear it, so a decider who became implicated afterwards (an
+    # uploader backfilled by 0126, a recaller, §374) no longer keeps their own
+    # verdict live. Not read from the audit log, which under
+    # `FEOH_AUDIT_MODE=lambda` is not local yet when the next refresh runs. No
+    # FK: control-plane id, as `raised_by_user_id` above.
+    decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # What the ERP reported, kept as data rather than prose (migration 0121,
+    # decisions §319). Set only on the reconciliation rows the ERP paths open
+    # (`services/erp_status_sync`, `api/erp_webhook`): PII-free ids, a status,
+    # and — for ``kind == "paid_not_recorded"`` — the payment the ERP reported
+    # (rail, reference, paid-on date) plus the refusal code that stopped
+    # FeohLedger recording it. Those facts are what lets the payment be
+    # recorded later without anyone re-keying it: automatically once a blocking
+    # exception on the invoice is cleared (`erp_status_sync.
+    # retry_erp_reported_payments`), or in one click from the queue. The
+    # ``description`` is the sentence for a person; machine detail lives here.
+    # Also set, with ``kind == "po_rematch_clears"``, on an open ``po_mismatch``
+    # / ``quality_hold`` row an ERP PO sync's re-match no longer finds: the
+    # sync never clears a hold, so this records that the re-check after the
+    # ERP changed the PO now matches (ERP type, PO number, day observed) —
+    # why a person may now clear it (`invoice_warnings.
+    # ERP_REPORT_PO_REMATCH_CLEARS`, decisions §323 amended).
+    # NULL on every other row, and on rows raised before 0121.
+    erp_report: Mapped[dict | None] = mapped_column(JSONB)
     # SLA: deadline derived from org settings at creation time. NULL =
     # no SLA configured for this exception type.
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

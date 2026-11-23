@@ -1,12 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/cash_flow_screen.dart';
 import 'package:feohledger_mobile/stores/cash_flow_store.dart';
@@ -14,7 +15,7 @@ import 'package:feohledger_mobile/widgets/kpi_card.dart';
 import 'package:feohledger_mobile/widgets/partial_conversion_note.dart';
 
 Widget _localized(Widget home) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: home,
     );
@@ -29,7 +30,7 @@ Map<String, dynamic> _forecastBody({int unconverted = 0}) => {
       'granularity': 'week',
       'horizon_days': 90,
       'periods': [
-        {
+        <String, dynamic>{
           'period': '2026-W26',
           'scheduled_amount': 3000.0,
           'committed_amount': 2000.0,
@@ -38,7 +39,7 @@ Map<String, dynamic> _forecastBody({int unconverted = 0}) => {
           'count': 4,
         },
       ],
-      'totals': {
+      'totals': <String, dynamic>{
         'scheduled_amount': 3000.0,
         'committed_amount': 2000.0,
         'pending_amount': 1000.0,
@@ -248,6 +249,44 @@ void main() {
 
     expect(horizons, contains('30'));
     expect(CashFlowStore.instance.horizonDays, 30);
+  });
+
+  // AP already past due is carried into the FIRST period on its own
+  // figure. The screen names it in words, beside the rows, rather than
+  // letting it pass as part of an on-schedule total.
+  testWidgets('overdue AP is named in the forecast and on its row',
+      (tester) async {
+    final forecast = _forecastBody();
+    (forecast['periods'] as List).first
+      ..['scheduled_amount'] = '1200.00'
+      ..['committed_amount'] = '200.00'
+      ..['pending_amount'] = '0.00'
+      ..['overdue_amount'] = '1000.00'
+      ..['overdue_count'] = 1;
+    (forecast['totals'] as Map<String, dynamic>)
+      ..['overdue_amount'] = '1000.00'
+      ..['overdue_count'] = 1;
+    ApiClient().debugConfigure(client: _client(forecast: forecast));
+
+    await tester.pumpWidget(_localized(const CashFlowScreen()));
+    await _pumpUntil(tester, find.byType(KpiCard));
+
+    final note = find.textContaining('across 1 invoice');
+    await tester.scrollUntilVisible(note, 200);
+    expect(note, findsOneWidget);
+    expect(find.textContaining('is already past due'), findsOneWidget);
+    expect(find.textContaining('overdue '), findsOneWidget);
+  });
+
+  testWidgets('a horizon with nothing overdue says nothing about it',
+      (tester) async {
+    ApiClient().debugConfigure(client: _client());
+
+    await tester.pumpWidget(_localized(const CashFlowScreen()));
+    await _pumpUntil(tester, find.byType(KpiCard));
+    await tester.scrollUntilVisible(find.text('Cash Position'), 200);
+
+    expect(find.textContaining('past due'), findsNothing);
   });
 
   group('part-converted legs are disclosed beside their figures', () {

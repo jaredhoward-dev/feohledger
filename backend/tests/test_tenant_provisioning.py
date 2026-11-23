@@ -73,6 +73,8 @@ def test_control_tables_are_the_expected_control_plane_set():
             "webhook_deliveries",
             "webauthn_credentials",
             "provider_credentials",
+            "workspace_closures",
+            "subprocessor_notices",
         }
     )
 
@@ -117,7 +119,7 @@ async def test_create_postgres_database_creates_when_absent():
     conn.close = AsyncMock()
 
     with patch(
-        "app.services.tenant_provisioning.asyncpg.connect",
+        "app.db_engine.asyncpg.connect",
         new=AsyncMock(return_value=conn),
     ):
         await _create_postgres_database("feoh_freshslug")
@@ -149,7 +151,7 @@ async def test_create_postgres_database_rejects_unsafe_name(evil_name):
     # must be rejected BEFORE any connection or DDL — defense-in-depth at the
     # one DDL sink where the value can't be parameterized.
     connect = AsyncMock()
-    with patch("app.services.tenant_provisioning.asyncpg.connect", new=connect):
+    with patch("app.db_engine.asyncpg.connect", new=connect):
         with pytest.raises(ValueError, match="unsafe tenant database name"):
             await _create_postgres_database(evil_name)
         with pytest.raises(ValueError, match="unsafe tenant database name"):
@@ -167,7 +169,7 @@ async def test_create_postgres_database_idempotent_when_present():
     conn.close = AsyncMock()
 
     with patch(
-        "app.services.tenant_provisioning.asyncpg.connect",
+        "app.db_engine.asyncpg.connect",
         new=AsyncMock(return_value=conn),
     ):
         await _create_postgres_database("feoh_existing")
@@ -184,7 +186,7 @@ async def test_create_postgres_database_closes_connection_on_error():
     conn.close = AsyncMock()
 
     with patch(
-        "app.services.tenant_provisioning.asyncpg.connect",
+        "app.db_engine.asyncpg.connect",
         new=AsyncMock(return_value=conn),
     ):
         with pytest.raises(RuntimeError):
@@ -210,7 +212,7 @@ async def test_create_postgres_database_parses_host_port_from_url():
     test_url = "postgresql+asyncpg://apuser:apsecret@db.example.com:6543/feohledger"
     with patch.object(settings, "database_url", test_url):
         with patch(
-            "app.services.tenant_provisioning.asyncpg.connect",
+            "app.db_engine.asyncpg.connect",
             new=_fake_connect,
         ):
             await _create_postgres_database("feoh_parsetest")
@@ -241,7 +243,7 @@ async def test_create_postgres_database_url_parse_defaults_port_5432():
     test_url = "postgresql+asyncpg://u:p@localhost/feohledger"
     with patch.object(settings, "database_url", test_url):
         with patch(
-            "app.services.tenant_provisioning.asyncpg.connect",
+            "app.db_engine.asyncpg.connect",
             new=_fake_connect,
         ):
             await _create_postgres_database("feoh_defaultport")
@@ -970,6 +972,9 @@ async def _database_exists(db_name: str) -> bool:
         await conn.close()
 
 
+# Deliberately end to end against the configured server, on its own loop-local
+# engine (`_provision_on_test_loop`) and maintenance connection.
+@pytest.mark.real_db_engine
 async def test_provision_tenant_drops_orphan_db_when_provisioning_fails(
     throwaway_slug, _provision_on_test_loop
 ):
@@ -1003,6 +1008,8 @@ async def test_provision_tenant_drops_orphan_db_when_provisioning_fails(
 # ---------------------------------------------------------------------------
 
 
+# Builds its own engine against a scratch control-plane database.
+@pytest.mark.real_db_engine
 async def test_provisioning_refuses_a_control_plane_without_the_system_roles(throwaway_slug):
     """The #566 state: control-plane tables, no system roles. Provisioning used
     to skip the admin grant silently and create an admin with no role; it now
@@ -1147,6 +1154,12 @@ async def test_a_failed_orphan_drop_never_masks_the_provisioning_error(monkeypat
     monkeypatch.setattr(tenant_provisioning, "_provision_into", _boom)
     monkeypatch.setattr(tenant_provisioning, "_drop_postgres_database", _drop_fails)
     monkeypatch.setattr(tenant_provisioning, "_require_system_admin_role", AsyncMock())
+    # The closed-slug hold check reads the control plane; this test is DB-free.
+    ctrl = MagicMock()
+    ctrl.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+    ctrl.return_value.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(tenant_provisioning, "control_session_factory", ctrl)
+    monkeypatch.setattr(tenant_provisioning, "ensure_slug_not_held", AsyncMock())
 
     with pytest.raises(RuntimeError, match="the real provisioning failure"):
         await provision_tenant(
@@ -1206,6 +1219,384 @@ async def test_create_tenant_cli_fails_when_provisioning_fails(monkeypatch):
 
     with pytest.raises(ControlPlaneNotInitialised):
         await cli.main()
+
+
+# ---------------------------------------------------------------------------
+# The first admin gets a set-password link, never a password (decisions §283)
+# ---------------------------------------------------------------------------
+
+_LINK_CLI_ARGS = [
+    "--name",
+    "Acme Co",
+    "--slug",
+    "acmeco",
+    "--admin-email",
+    "admin@acme.test",
+]
+_LINK = "https://acmeco.feohledger.example/login/reset-password?token=tok-secret&mode=set"
+
+
+def _link_cli(monkeypatch, argv: list[str]):
+    """The CLI with provisioning, minting and sending stubbed out."""
+    cli = _load_create_tenant_cli(monkeypatch, argv)
+    monkeypatch.setattr(settings, "tenant_url_template", "https://{slug}.feohledger.example")
+    user_id = uuid.uuid4()
+    monkeypatch.setattr(
+        cli,
+        "provision_tenant",
+        AsyncMock(return_value=MagicMock(db_name="feoh_acmeco", user_id=user_id)),
+    )
+    monkeypatch.setattr(cli, "mint_employee_link", AsyncMock(return_value=_LINK))
+    monkeypatch.setattr(cli, "send_set_password_email", AsyncMock())
+    return cli, user_id
+
+
+async def test_create_tenant_emails_the_admin_a_set_password_link(monkeypatch, capsys):
+    cli, user_id = _link_cli(monkeypatch, _LINK_CLI_ARGS)
+
+    await cli.main()
+
+    kwargs = cli.provision_tenant.await_args.kwargs
+    assert kwargs["admin_password"] is None
+    assert kwargs["must_change_password"] is False
+    cli.mint_employee_link.assert_awaited_once_with("acmeco", None, user_id, set_password=True)
+    message = cli.send_set_password_email.await_args.args[0]
+    assert message.to == "admin@acme.test"
+    assert _LINK in message.body_text
+    out = capsys.readouterr().out
+    # Only where it went: the operator's terminal never carries the link.
+    assert "Set-password link sent to a***@acme.test." in out
+    assert "tok-secret" not in out
+    assert "Password:" not in out
+
+
+async def test_create_tenant_refuses_print_link(monkeypatch, capsys):
+    """There is no way to print the link: this CLI runs on the server, often
+    through SSM, whose output is retained. The flag is unknown, so argparse
+    exits 2 before anything is provisioned, minted or printed."""
+    cli, _ = _link_cli(monkeypatch, [*_LINK_CLI_ARGS, "--print-link"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.provision_tenant.assert_not_awaited()
+    cli.mint_employee_link.assert_not_awaited()
+    captured = capsys.readouterr()
+    assert "unrecognized arguments: --print-link" in captured.err
+    assert "tok-secret" not in captured.out + captured.err
+
+
+async def test_create_tenant_exits_3_when_the_link_is_not_delivered(monkeypatch, capsys):
+    """The tenant exists by then; a wrapper must not report success, and the
+    message says how the admin recovers — without the link in it."""
+    from fastapi import HTTPException
+
+    from app.api.refusals import SET_PASSWORD_EMAIL_FAILED_DETAIL
+
+    cli, _ = _link_cli(monkeypatch, _LINK_CLI_ARGS)
+    monkeypatch.setattr(
+        cli,
+        "send_set_password_email",
+        AsyncMock(side_effect=HTTPException(502, detail=SET_PASSWORD_EMAIL_FAILED_DETAIL)),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == cli.EXIT_LINK_NOT_DELIVERED == 3
+    captured = capsys.readouterr()
+    assert "set_password_email_failed" in captured.err
+    assert "Forgot password" in captured.err
+    assert "tok-secret" not in captured.out + captured.err
+
+
+async def test_create_tenant_refuses_before_provisioning_with_no_tenant_url(monkeypatch, capsys):
+    cli, _ = _link_cli(monkeypatch, _LINK_CLI_ARGS)
+    monkeypatch.setattr(settings, "tenant_url_template", "")
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.provision_tenant.assert_not_awaited()
+    assert "FEOH_TENANT_URL_TEMPLATE" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("extra", "environment"),
+    [
+        (["--admin-password", "Aa1-not-used-000000"], "production"),
+        (["--force-password-change"], "development"),
+    ],
+)
+async def test_create_tenant_refuses_a_password_where_it_does_not_belong(
+    monkeypatch, extra, environment
+):
+    """A deployed environment never takes an operator-chosen password: the
+    admin chooses their own. Locally it still works, for `pnpm` dev setups."""
+    cli, _ = _link_cli(monkeypatch, [*_LINK_CLI_ARGS, *extra])
+    monkeypatch.setattr(settings, "environment", environment)
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.provision_tenant.assert_not_awaited()
+
+
+async def test_create_tenant_admin_password_still_works_locally(monkeypatch, capsys):
+    cli, _ = _link_cli(monkeypatch, [*_LINK_CLI_ARGS, "--admin-password", "Aa1-not-used-000000"])
+    monkeypatch.setattr(settings, "environment", "development")
+
+    await cli.main()
+
+    assert cli.provision_tenant.await_args.kwargs["admin_password"] == "Aa1-not-used-000000"
+    cli.mint_employee_link.assert_not_awaited()
+    cli.send_set_password_email.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# --resend-link: a fresh link for an existing tenant's passwordless admin
+# ---------------------------------------------------------------------------
+
+_RESEND_ARGS = ["--slug", "acmeco", "--admin-email", "admin@acme.test", "--resend-link"]
+
+
+def _resend_cli(monkeypatch, argv: list[str] | None = None):
+    """The CLI in --resend-link mode with the lookup, the token store, the
+    mint, the send and the audit stubbed, recording the order they ran in."""
+    from app.services.tenant_provisioning import ResendTarget
+
+    cli = _load_create_tenant_cli(monkeypatch, argv or _RESEND_ARGS)
+    monkeypatch.setattr(settings, "tenant_url_template", "https://{slug}.feohledger.example")
+    target = ResendTarget(
+        organization_id=uuid.uuid4(),
+        org_name="Acme Co",
+        slug="acmeco",
+        org_settings={"branding": {}},
+        user_id=uuid.uuid4(),
+        admin_name="Ada Admin",
+        admin_email="admin@acme.test",
+    )
+    calls: list[str] = []
+
+    async def _revoke(user_id):
+        calls.append("revoke")
+
+    async def _mint(*args, **kwargs):
+        calls.append("mint")
+        return _LINK
+
+    monkeypatch.setattr(cli, "resend_link_target", AsyncMock(return_value=target))
+    monkeypatch.setattr(cli.password_reset, "revoke_outstanding", AsyncMock(side_effect=_revoke))
+    monkeypatch.setattr(cli, "mint_employee_link", AsyncMock(side_effect=_mint))
+    monkeypatch.setattr(cli, "send_set_password_email", AsyncMock())
+    monkeypatch.setattr(cli, "dispatch_auth_audit", AsyncMock())
+    # Every engine is disposed, the tenant engine the audit row opened included.
+    monkeypatch.setattr(cli, "dispose_all_engines", AsyncMock())
+    monkeypatch.setattr(
+        cli, "provision_tenant", AsyncMock(side_effect=AssertionError("provisioned anyway"))
+    )
+    return cli, target, calls
+
+
+async def test_resend_link_supersedes_earlier_links_and_emails_a_fresh_one(monkeypatch, capsys):
+    cli, target, calls = _resend_cli(monkeypatch)
+
+    await cli.main()
+
+    cli.resend_link_target.assert_awaited_once_with("acmeco", "admin@acme.test")
+    # Earlier links die BEFORE the new one is minted, as an admin reset does —
+    # minting first would put the new link in the superseded generation.
+    assert calls == ["revoke", "mint"]
+    cli.password_reset.revoke_outstanding.assert_awaited_once_with(target.user_id)
+    cli.mint_employee_link.assert_awaited_once_with(
+        "acmeco", target.org_settings, target.user_id, set_password=True
+    )
+    message = cli.send_set_password_email.await_args.args[0]
+    assert message.to == "admin@acme.test"
+    assert message.subject == "Your Acme Co FeohLedger workspace is ready"
+    assert _LINK in message.body_text
+    assert "Hi Ada Admin" in message.body_text
+    assert "replaces any earlier link" in message.body_text
+    audit = cli.dispatch_auth_audit.await_args.kwargs
+    assert audit["action"] == "user.set_password_link_resent"
+    assert audit["entity_id"] == target.user_id
+    assert audit["details"] == {"via": "operator_cli", "delivered": True}
+    assert "tok-secret" not in repr(audit) and "admin@acme.test" not in repr(audit)
+    captured = capsys.readouterr()
+    assert "sent to a***@acme.test" in captured.out
+    # Neither the link nor the whole address reaches the terminal.
+    assert "tok-secret" not in captured.out + captured.err
+    assert "admin@acme.test" not in captured.out + captured.err
+    cli.dispose_all_engines.assert_awaited()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "tenant_not_found",
+        "admin_not_found",
+        "not_an_admin",
+        "admin_inactive",
+        "password_already_set",
+    ],
+)
+async def test_resend_link_refusals_exit_2_and_touch_no_link(monkeypatch, capsys, code):
+    from app.services.tenant_provisioning import ResendRefused
+
+    cli, _, _ = _resend_cli(monkeypatch)
+    cli.resend_link_target.side_effect = ResendRefused(code, "nope.")
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.password_reset.revoke_outstanding.assert_not_awaited()
+    cli.mint_employee_link.assert_not_awaited()
+    cli.send_set_password_email.assert_not_awaited()
+    assert code in capsys.readouterr().err
+    cli.dispose_all_engines.assert_awaited()
+
+
+async def test_resend_link_exits_3_when_the_email_fails(monkeypatch, capsys):
+    from fastapi import HTTPException
+
+    from app.api.refusals import SET_PASSWORD_EMAIL_FAILED_DETAIL
+
+    cli, _, _ = _resend_cli(monkeypatch)
+    cli.send_set_password_email.side_effect = HTTPException(
+        502, detail=SET_PASSWORD_EMAIL_FAILED_DETAIL
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == cli.EXIT_LINK_NOT_DELIVERED == 3
+    # The earlier links were revoked before the send failed, and that
+    # revocation is on the tenant's trail, marked undelivered.
+    audit = cli.dispatch_auth_audit.await_args.kwargs
+    assert audit["action"] == "user.set_password_link_resent"
+    assert audit["details"] == {"via": "operator_cli", "delivered": False}
+    captured = capsys.readouterr()
+    assert "set_password_email_failed" in captured.err
+    assert "tok-secret" not in captured.out + captured.err
+
+
+async def test_resend_link_exits_3_when_earlier_links_cannot_be_superseded(monkeypatch, capsys):
+    """A token store that refuses the generation bump must not mint a link the
+    old ones would still sit beside."""
+    cli, _, _ = _resend_cli(monkeypatch)
+    cli.password_reset.revoke_outstanding.side_effect = ConnectionError("redis down")
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 3
+    cli.mint_employee_link.assert_not_awaited()
+    # Nothing was revoked, so there is nothing to record.
+    cli.dispatch_auth_audit.assert_not_awaited()
+    assert "set_password_link_unavailable" in capsys.readouterr().err
+
+
+async def test_resend_link_refuses_with_no_tenant_url(monkeypatch, capsys):
+    cli, _, _ = _resend_cli(monkeypatch)
+    monkeypatch.setattr(settings, "tenant_url_template", "")
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.password_reset.revoke_outstanding.assert_not_awaited()
+    assert "FEOH_TENANT_URL_TEMPLATE" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "extra", [["--admin-password", "Aa1-not-used-000000"], ["--skip-existing"]]
+)
+async def test_resend_link_takes_no_provisioning_flags(monkeypatch, extra):
+    cli, _, _ = _resend_cli(monkeypatch, [*_RESEND_ARGS, *extra])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.resend_link_target.assert_not_awaited()
+
+
+async def test_provisioning_still_requires_a_name(monkeypatch, capsys):
+    cli, _ = _link_cli(monkeypatch, _LINK_CLI_ARGS[2:])
+
+    with pytest.raises(SystemExit) as exc_info:
+        await cli.main()
+
+    assert exc_info.value.code == 2
+    cli.provision_tenant.assert_not_awaited()
+    assert "--name is required" in capsys.readouterr().err
+
+
+async def test_resend_link_target_refuses_what_it_must(
+    realdb, throwaway_slug, _provision_on_test_loop
+):
+    """The lookup against a real control plane: a passwordless admin is a
+    target; a missing tenant, a stranger, a non-admin, a deactivated admin and
+    an admin who already chose a password are refused, each with its code."""
+    from app.services.tenant_provisioning import ResendRefused, resend_link_target
+
+    slug = throwaway_slug
+    email = f"admin@{slug}.test"
+    try:
+        result = await provision_tenant(
+            company_name="Resend Co",
+            slug=slug,
+            admin_email=email,
+            admin_name="Resend Admin",
+            admin_password=None,
+            must_change_password=False,
+        )
+        # Case and padding are ignored, as at sign-in.
+        target = await resend_link_target(slug, f"  {email.upper()} ")
+        assert target.user_id == result.user_id
+        assert target.org_name == "Resend Co"
+        assert target.admin_name == "Resend Admin"
+
+        async def _refused(s: str, e: str) -> str:
+            with pytest.raises(ResendRefused) as exc_info:
+                await resend_link_target(s, e)
+            return exc_info.value.code
+
+        assert await _refused("nosuch" + slug, email) == "tenant_not_found"
+        assert await _refused(slug, f"someone@{slug}.test") == "admin_not_found"
+
+        engine, mk = await _control_mk()
+        try:
+            async with mk() as s:
+                s.add(
+                    User(
+                        email=f"clerk@{slug}.test",
+                        full_name="Clerk",
+                        organization_id=result.organization_id,
+                    )
+                )
+                await s.commit()
+            assert await _refused(slug, f"clerk@{slug}.test") == "not_an_admin"
+
+            async with mk() as s:
+                user = await s.get(User, result.user_id)
+                user.hashed_password = pwd_context.hash("Aa1-chosen-000000")
+                await s.commit()
+            assert await _refused(slug, email) == "password_already_set"
+
+            async with mk() as s:
+                user = await s.get(User, result.user_id)
+                user.is_active = False
+                await s.commit()
+            assert await _refused(slug, email) == "admin_inactive"
+        finally:
+            await engine.dispose()
+    finally:
+        await _cleanup_org(slug)
 
 
 # ---------------------------------------------------------------------------

@@ -72,7 +72,7 @@ variable "domain_name" {
 }
 
 variable "monthly_budget_limit_usd" {
-  description = "Monthly AWS spend ceiling (USD) for the account-wide budget. The single-VM workload stack runs ~$45–55/month (t4g.medium VM + EBS + public IPv4 ~$31, db.t4g.micro RDS + storage ~$15, KMS, Route 53, S3, flow logs and alarms a few dollars), so 75 leaves headroom while still flagging a runaway within days. Raise it deliberately when the stack grows."
+  description = "Monthly AWS spend ceiling (USD) for the account-wide budget. The single-VM workload stack runs ~$45–55/month (t4g.medium VM + EBS + public IPv4 ~$31, db.t4g.micro RDS + storage ~$15, KMS, Route 53, S3, flow logs, alarms and the SPA distribution's CloudFront additional metrics (~$2.40, frontend.tf) a few dollars), plus ~$8–13 for the external uptime checks and SMS paging (uptime.tf), so 75 leaves headroom while still flagging a runaway within days. Raise it deliberately when the stack grows."
   type        = number
   default     = 75
 
@@ -212,7 +212,7 @@ variable "db_multi_az" {
 }
 
 variable "db_master_password" {
-  description = "RDS master password. Ephemeral and write-only: it is passed to RDS but never stored in Terraform state or plans. Supply it from the private infra-secrets repo at apply time (README.md § Workload stack) — the same value goes into FEOH_DATABASE_URL in the sops env. URL-safe characters only (e.g. `openssl rand -hex 24`), since it is embedded in a connection URL."
+  description = "RDS master password. Ephemeral and write-only: it is passed to RDS but never stored in Terraform state or plans. Supply it from the private infra-secrets repo at apply time (README.md § Workload stack). Break-glass only: the app signs in as feoh_app with an IAM token, so this is not in the VM's sops env (docs/decisions.md §310). URL-safe characters only (e.g. `openssl rand -hex 24`), since the break-glass URL embeds it."
   type        = string
   sensitive   = true
   ephemeral   = true
@@ -220,7 +220,7 @@ variable "db_master_password" {
 
   validation {
     condition     = length(var.db_master_password) >= 24 && can(regex("^[A-Za-z0-9]+$", var.db_master_password))
-    error_message = "db_master_password must be at least 24 alphanumeric characters (URL-safe; it is embedded in FEOH_DATABASE_URL)."
+    error_message = "db_master_password must be at least 24 alphanumeric characters (URL-safe; the break-glass FEOH_DATABASE_URL embeds it)."
   }
 }
 
@@ -245,8 +245,42 @@ variable "alert_emails" {
   }
 }
 
+variable "alert_phone_number" {
+  description = "Mobile number the pager topic texts (uptime.tf's external checks and database storage), in E.164 form such as +15555550123. Personal data and this repo is public, so there is no default: set it only in the private prod.tfvars.sops. Null creates no SMS subscription. In the SNS SMS sandbox it must first be verified in the SNS console (us-east-1), and US delivery needs a registered toll-free origination number (README.md § Uptime checks and paging)."
+  type        = string
+  default     = null
+  sensitive   = true
+
+  validation {
+    condition     = var.alert_phone_number == null || can(regex("^\\+[1-9][0-9]{7,14}$", var.alert_phone_number))
+    error_message = "alert_phone_number must be in E.164 form: a plus sign, the country code and the number, with no spaces or punctuation."
+  }
+}
+
+variable "uptime_tenant_slug" {
+  description = "Slug of one tenant whose host (<slug>.<domain>) uptime.tf checks from outside, covering the tenant wildcard's DNS and certificate on CloudFront. Use a tenant you control, such as a test tenant. No default, so the repo names no real tenant; set it in the private prod.tfvars.sops. Null skips the tenant check; the apex and API checks run regardless."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.uptime_tenant_slug == null || can(regex("^[a-z][a-z0-9-]{2,29}$", var.uptime_tenant_slug))
+    error_message = "uptime_tenant_slug must be a tenant slug (backend/app/utils/slug.py: a lowercase letter, then 2-29 lowercase letters, digits or hyphens), not a hostname."
+  }
+}
+
+variable "certificate_canary_min_days" {
+  description = "The certificate canary (canary.tf) fails a run when the certificate Caddy serves on api.<domain> has fewer than this many days left. Caddy renews 30 days ahead, so 14 means renewal has been failing for over two weeks and still leaves two weeks to fix it."
+  type        = number
+  default     = 14
+
+  validation {
+    condition     = var.certificate_canary_min_days >= 1 && var.certificate_canary_min_days < 30 && floor(var.certificate_canary_min_days) == var.certificate_canary_min_days
+    error_message = "certificate_canary_min_days must be a whole number from 1 to 29: at 30 or more it would fail during Caddy's normal renewal window."
+  }
+}
+
 variable "frontend_on_cloudfront" {
-  description = "Point the apex and the tenant wildcard at the SPA's CloudFront distribution (frontend.tf) instead of the VM. Leave false until a build has been published to the bucket and checked on the distribution's *.cloudfront.net name (issue #582 § Cut-over plan); setting it back to false is the rollback. api.<domain> stays on the VM either way."
+  description = "Point the apex and the tenant wildcard at the SPA's CloudFront distribution (frontend.tf) instead of the VM. Leave false until a build has been published to the bucket and checked on the distribution's *.cloudfront.net name (issue #582 § Cut-over plan). Production has it true, and since docs/decisions.md §364 it must stay true: the VM's Caddy no longer serves the SPA, so false is an outage, not a rollback. api.<domain> stays on the VM either way."
   type        = bool
   default     = false
 }

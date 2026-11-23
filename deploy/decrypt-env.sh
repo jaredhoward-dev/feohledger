@@ -50,7 +50,7 @@ env_value() {
 # uploads/backups silently need.
 REQUIRED_VARS=(APP_DOMAIN API_DOMAIN ACME_EMAIL AWS_REGION
 	FEOH_SECRET_KEY FEOH_ENVIRONMENT FEOH_S3_BUCKET BACKUP_S3_BUCKET
-	FEOH_CREDENTIAL_KMS_KEY_ID FEOH_EMAIL_PROVIDER)
+	FEOH_CREDENTIAL_KMS_KEY_ID FEOH_EMAIL_PROVIDER FEOH_PAYEE_FINGERPRINT_KEY)
 
 # ── Database mode: the same decision deploy/lib.sh makes for every script ────
 # FEOH_DATABASE_URL set → an external database (RDS): it must parse under the
@@ -63,7 +63,19 @@ REQUIRED_VARS=(APP_DOMAIN API_DOMAIN ACME_EMAIL AWS_REGION
 . ./lib.sh
 DB_URL=$(env_value FEOH_DATABASE_URL)
 SSLMODE=$(env_value PGSSLMODE)
+# FEOH_DATABASE_IAM_AUTH (docs/decisions.md §310): spelled the way pydantic
+# reads a bool, or the app refuses to boot on it.
+IAM_AUTH=$(env_value FEOH_DATABASE_IAM_AUTH)
+if feoh_is_true "$IAM_AUTH"; then
+	IAM=1
+elif [ -z "$IAM_AUTH" ] || feoh_is_false "$IAM_AUTH"; then
+	IAM=0
+else
+	die "FEOH_DATABASE_IAM_AUTH='${IAM_AUTH}' is not a boolean the app reads — use \"true\" or \"false\"."
+fi
 if [ -z "$DB_URL" ]; then
+	[ "$IAM" = 0 ] ||
+		die "FEOH_DATABASE_IAM_AUTH is on with no FEOH_DATABASE_URL — IAM auth is for RDS; the local container signs in with POSTGRES_PASSWORD."
 	REQUIRED_VARS+=(POSTGRES_PASSWORD)
 	case "$SSLMODE" in
 	"" | disable | allow | prefer) ;;
@@ -78,7 +90,19 @@ else
 	*\?*) die "FEOH_DATABASE_URL carries a query string — set TLS with PGSSLMODE instead, which the app (asyncpg) and the backup tools (libpq) both read; a URL option reaches only the app." ;;
 	esac
 	[[ "$DB_URL" =~ $FEOH_EXTERNAL_DB_URL_RE ]] ||
-		die "FEOH_DATABASE_URL is not postgresql+asyncpg://USER:PASSWORD@HOST[:PORT]/DATABASE with the RDS endpoint host name (verify-full checks the certificate against it) and user/password in URL-unreserved characters or %XX escapes (openssl rand -hex 24 needs none). Its value is not printed."
+		die "FEOH_DATABASE_URL is not postgresql+asyncpg://USER[:PASSWORD]@HOST[:PORT]/DATABASE with the RDS endpoint host name (verify-full checks the certificate against it) and user/password in URL-unreserved characters or %XX escapes (openssl rand -hex 24 needs none). Its value is not printed."
+	# Group 4 is the password (lib.sh). IAM auth and a password are exclusive:
+	# the app refuses a password beside IAM auth at boot, and with neither
+	# nothing would sign the connection in.
+	if [ "$IAM" = 1 ]; then
+		[ -z "${BASH_REMATCH[4]}" ] ||
+			die "FEOH_DATABASE_IAM_AUTH is on but FEOH_DATABASE_URL carries a password — the IAM form is postgresql+asyncpg://feoh_app@HOST:5432/feohledger. Its value is not printed."
+		[ "$SSLMODE" = verify-full ] ||
+			die "PGSSLMODE must be verify-full with FEOH_DATABASE_IAM_AUTH on (got '${SSLMODE}') — the auth token is a bearer credential, sent only to a verified server; the app refuses anything else at boot."
+	else
+		[ -n "${BASH_REMATCH[4]}" ] ||
+			die "FEOH_DATABASE_URL has no password and FEOH_DATABASE_IAM_AUTH is not \"true\" — set FEOH_DATABASE_IAM_AUTH: \"true\" for the IAM-authenticated app role, or put the (break-glass) master password back."
+	fi
 	case "$SSLMODE" in
 	verify-full) ;;
 	verify-ca | require)
@@ -87,13 +111,15 @@ else
 	*) die "PGSSLMODE='${SSLMODE}' would allow an unencrypted or unverified connection to the external database — use verify-full." ;;
 	esac
 fi
-# FEOH_HCAPTCHA_SECRET is one of those boot checks only while self-service
-# signup is on (config.py _require_captcha_in_deployed_envs): with
-# FEOH_SIGNUP_ENABLED false the signup routes 404 and there is nothing for a
-# captcha to protect. Mirror the rule, including every spelling pydantic reads
-# as false, so the two cannot disagree about whether the secret is needed.
-if ! grep -Eiq '^FEOH_SIGNUP_ENABLED=(false|0|no|off|f|n)$' .env.tmp; then
-	REQUIRED_VARS+=(FEOH_HCAPTCHA_SECRET)
+# The hCaptcha pair is one of those boot checks only while self-service signup
+# is on (config.py _require_captcha_in_deployed_envs): the secret verifies each
+# signup, and the site key is what renders the widget — without it every
+# signup fails the captcha. With FEOH_SIGNUP_ENABLED false the signup routes
+# 404 and there is nothing for a captcha to protect. lib.sh's
+# feoh_signup_enabled mirrors the rule, including every spelling pydantic reads
+# as false, and smoke.sh asks it the same question after the deploy.
+if [ "$(feoh_signup_enabled .env.tmp)" = true ]; then
+	REQUIRED_VARS+=(FEOH_HCAPTCHA_SECRET FEOH_HCAPTCHA_SITEKEY)
 fi
 MISSING=""
 for var in "${REQUIRED_VARS[@]}"; do
@@ -115,13 +141,26 @@ esac
 [ "${#SECRET_KEY_VALUE}" -ge 32 ] ||
 	die "FEOH_SECRET_KEY is ${#SECRET_KEY_VALUE} chars; the app refuses to boot below 32 (openssl rand -hex 32)."
 
+# The payee bank-fingerprint key (config.py
+# _require_payee_fingerprint_key_in_deployed_envs, decisions §383): the app
+# refuses to boot below 32 chars, on the committed dev value, or on the JWT
+# key's own value, which rotates every 90 days and is what this key exists to be
+# independent of. Mirrored here so the deploy stops in its first second.
+FINGERPRINT_KEY_VALUE=$(env_value FEOH_PAYEE_FINGERPRINT_KEY)
+[ "${#FINGERPRINT_KEY_VALUE}" -ge 32 ] ||
+	die "FEOH_PAYEE_FINGERPRINT_KEY is ${#FINGERPRINT_KEY_VALUE} chars; the app refuses to boot below 32 (openssl rand -hex 32)."
+[ "$FINGERPRINT_KEY_VALUE" != dev-payee-fingerprint-key-not-a-secret ] ||
+	die "FEOH_PAYEE_FINGERPRINT_KEY is the committed development value — generate one with 'openssl rand -hex 32'."
+[ "$FINGERPRINT_KEY_VALUE" != "$SECRET_KEY_VALUE" ] ||
+	die "FEOH_PAYEE_FINGERPRINT_KEY equals FEOH_SECRET_KEY — it must be its own key, or every JWT rotation flags old voids (docs/secrets-rotation.md)."
+
 # The app refuses to boot with the console email adapter in a deployed env
-# (config.py _refuse_console_email_in_deployed_envs): it logs every temporary
-# password, reset link and sign-in code instead of sending them. The presence
+# (config.py _refuse_console_email_in_deployed_envs): it logs every
+# set-password link, reset link and sign-in code instead of sending them. The presence
 # loop above already refuses the var unset (the app's default is console).
 EMAIL_PROVIDER_VALUE=$(grep -E '^FEOH_EMAIL_PROVIDER=' .env.tmp | tail -1 | cut -d= -f2- | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
 [ "$EMAIL_PROVIDER_VALUE" != console ] ||
-	die "FEOH_EMAIL_PROVIDER=console would log every temporary password, reset link and sign-in code instead of sending them — set it to ses."
+	die "FEOH_EMAIL_PROVIDER=console would log every set-password link, reset link and sign-in code instead of sending them — set it to ses."
 
 # Invoice extraction is the one adapter with no mock fallback in a deployed env
 # (services/extraction.py resolve_platform_provider): with neither var set,
@@ -131,6 +170,15 @@ EMAIL_PROVIDER_VALUE=$(grep -E '^FEOH_EMAIL_PROVIDER=' .env.tmp | tail -1 | cut 
 if ! grep -Eq '^(FEOH_ANTHROPIC_API_KEY|FEOH_EXTRACTION_PROVIDER)=.+' .env.tmp; then
 	echo "WARN: neither FEOH_ANTHROPIC_API_KEY nor FEOH_EXTRACTION_PROVIDER is set — every invoice upload's extraction will fail (manual entry only). See deploy/prod.sops.yaml.example § Invoice extraction." >&2
 fi
+
+# The published DPA (§ 8) says sub-processor change notices are emailed to
+# every customer's administrators; FEOH_SUBPROCESSOR_NOTICES_ENABLED runs the
+# sweep that sends them (docs/decisions.md §321). It is off by default for
+# local dev, and the app refuses to boot a deployed env with it off
+# (config.py _require_subprocessor_notices_in_deployed_envs) — refused here
+# too, so the deploy stops before compose restarts the API into a boot loop.
+feoh_is_true "$(env_value FEOH_SUBPROCESSOR_NOTICES_ENABLED)" ||
+	die "FEOH_SUBPROCESSOR_NOTICES_ENABLED must be true — the published DPA says sub-processor change notices are emailed to customers, and the app refuses to boot a deployed env without the sweep that sends them. See deploy/prod.sops.yaml.example § Sub-processor change notices."
 
 mv .env.tmp .env
 echo "decrypt-env.sh: deploy/.env written and checked."

@@ -1,18 +1,26 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
+import 'package:feohledger_mobile/l10n/coded_refusal_messages.dart';
+import 'package:feohledger_mobile/l10n/enum_labels.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
+import 'package:feohledger_mobile/l10n/load_error_messages.dart';
+import 'package:feohledger_mobile/models/action_verdict.dart';
 import 'package:feohledger_mobile/models/vendor.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/vendor_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/debouncer.dart';
+import 'package:feohledger_mobile/widgets/async_list_body.dart';
 import 'package:feohledger_mobile/widgets/vendor_list_tile.dart';
 
-/// Vendor management — list with status filters + search, verify / reject an
-/// unverified vendor, and pull vendors from the connected ERP. Mutations are
-/// gated to admin / ap_manager (mirrors the backend `require_roles`); for
-/// read-only roles (CFO) the actions are simply not offered.
+/// Vendor management — list with status filters + search, verify / reject a
+/// vendor, and pull vendors from the connected ERP. Verify / Reject are
+/// offered from each row's `status_actions` verdict (the server's
+/// `vendor.manage` check and status table), never a role or status check
+/// here: a role or status refusal hides the action, any other refusal shows
+/// it disabled with its reason, and a row with no verdict offers nothing. The
+/// ERP sync is gated to admin / ap_manager (the backend `require_roles`).
 class VendorsScreen extends StatefulWidget {
   const VendorsScreen({super.key});
 
@@ -113,31 +121,33 @@ class _VendorsScreenState extends State<VendorsScreen> {
               listenable: VendorStore.instance,
               builder: (context, _) {
                 final store = VendorStore.instance;
+                final loadError = store.loadError;
 
-                if (store.loading && store.vendors.isEmpty) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                if (store.error != null && store.vendors.isEmpty) {
-                  return _ErrorState(
-                    message: store.error!,
-                    onRetry: store.fetch,
-                  );
-                }
-
-                if (store.vendors.isEmpty) {
-                  return Center(child: Text(l.vendorsEmpty));
-                }
-
-                return RefreshIndicator(
+                return AsyncListBody<Vendor>(
+                  items: store.vendors,
+                  loading: store.loading,
+                  // The fetch's failure only — a refused verify leaves the
+                  // list live (actionError), so it raises no banner.
+                  hasError: loadError != null,
+                  fromCache: store.fromCache,
+                  // Worded from the cause: the server's reason on a 403 / 500,
+                  // the connection sentence only when no server answered.
+                  errorMessage: loadError == null
+                      ? ''
+                      : describeLoadError(
+                          l,
+                          loadError,
+                          l.vendorsLoadErrorPrefix,
+                        ),
                   onRefresh: store.fetch,
-                  child: ListView.separated(
-                    itemCount: store.vendors.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      return _buildRow(store.vendors[index]);
-                    },
-                  ),
+                  empty: Text(l.vendorsEmpty, textAlign: TextAlign.center),
+                  filteredEmpty: store.isFiltered
+                      ? FilteredEmptyState(
+                          message: l.vendorsFilteredEmpty,
+                          onShowAll: _showAll,
+                        )
+                      : null,
+                  itemBuilder: (context, vendor) => _buildRow(vendor),
                 );
               },
             ),
@@ -147,37 +157,59 @@ class _VendorsScreenState extends State<VendorsScreen> {
     );
   }
 
+  /// A status refusal (`vendor_status_not_allowed`: verifying an active
+  /// vendor, anything on a rejected one) is about the row, not something the
+  /// reader can act on, so it hides the action like a role refusal does.
+  static const _hiddenRefusals = {'vendor_status_not_allowed'};
+
   Widget _buildRow(Vendor vendor) {
     final l = AppLocalizations.of(context);
+    final verify = vendor.verifyVerdict;
+    final reject = vendor.rejectVerdict;
+    final offered =
+        verify.isOffered(hiddenCodes: _hiddenRefusals) ||
+        reject.isOffered(hiddenCodes: _hiddenRefusals);
     final tile = VendorListTile(
       vendor: vendor,
-      onTap: _canManage && vendor.status.isUnverified
-          ? () => _showActions(vendor)
-          : null,
+      onTap: offered ? () => _showActions(vendor) : null,
     );
 
-    // Swipe verify/reject only for unverified vendors, and only for roles that
-    // may act. Everything else is a read-only row.
-    if (!_canManage || !vendor.status.isUnverified) {
+    // Swipe only in the directions the server would accept now; a refused
+    // action is explained in the sheet, never swiped into a 403 / 409.
+    final direction = verify.allowed && reject.allowed
+        ? DismissDirection.horizontal
+        : verify.allowed
+        ? DismissDirection.startToEnd
+        : reject.allowed
+        ? DismissDirection.endToStart
+        : null;
+    if (direction == null) {
       return tile;
     }
 
     return Dismissible(
       key: ValueKey(vendor.id),
+      direction: direction,
       background: _swipeBackground(
         Colors.green.shade700,
+        Colors.green.shade900,
         Icons.check,
         Alignment.centerLeft,
         l.vendorActionVerify,
       ),
       secondaryBackground: _swipeBackground(
         Colors.red.shade700,
+        Colors.red.shade900,
         Icons.block,
         Alignment.centerRight,
         l.vendorActionReject,
       ),
       confirmDismiss: (direction) async {
         final verify = direction == DismissDirection.startToEnd;
+        // A sideways swipe is easy to make by accident, and Reject is
+        // accepted on an active vendor and cancels its virtual cards, so it
+        // confirms first; cancelling leaves the row where it was.
+        if (!verify && !await _confirmReject(vendor)) return false;
         final ok = verify
             ? await VendorStore.instance.verify(vendor.id)
             : await VendorStore.instance.reject(vendor.id);
@@ -199,24 +231,33 @@ class _VendorsScreenState extends State<VendorsScreen> {
     );
   }
 
+  /// The swipe affordance: what the gesture will do, as text beside the
+  /// icon so the icon is never an unlabelled glyph (WCAG 1.1.1).
+  ///
+  /// [tint] colours the 15% wash; [ink] the icon and the label, one shade
+  /// darker so the copy stays readable on that wash: green.shade900 on the
+  /// green.shade700 wash is 6.5:1 and red.shade900 on the red.shade700 wash
+  /// 5.2:1, where the shade700 ink this used to share with the wash read
+  /// 3.4:1 and 3.9:1 and failed AA (1.4.3).
   Widget _swipeBackground(
-    Color color,
+    Color tint,
+    Color ink,
     IconData icon,
     Alignment alignment,
     String action,
   ) {
     return Container(
-      color: color.withValues(alpha: 0.15),
+      color: tint.withValues(alpha: 0.15),
       alignment: alignment,
       padding: const EdgeInsets.symmetric(horizontal: 24),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: color),
+          Icon(icon, color: ink),
           const SizedBox(width: 8),
           Text(
             action,
-            style: TextStyle(color: color, fontWeight: FontWeight.w600),
+            style: TextStyle(color: ink, fontWeight: FontWeight.w600),
           ),
         ],
       ),
@@ -225,6 +266,22 @@ class _VendorsScreenState extends State<VendorsScreen> {
 
   void _showActions(Vendor vendor) {
     final l = AppLocalizations.of(context);
+    final verify = _sheetAction(
+      vendor,
+      vendor.verifyVerdict,
+      verify: true,
+      icon: const Icon(Icons.check, color: Colors.green),
+      label: l.vendorActionVerify,
+      hint: l.vendorVerifyHint,
+    );
+    final reject = _sheetAction(
+      vendor,
+      vendor.rejectVerdict,
+      verify: false,
+      icon: Icon(Icons.block, color: Colors.red.shade700),
+      label: l.vendorActionReject,
+      hint: l.vendorRejectHint,
+    );
     showModalBottomSheet<void>(
       context: context,
       builder: (sheetContext) {
@@ -237,25 +294,42 @@ class _VendorsScreenState extends State<VendorsScreen> {
                   vendor.name,
                   style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
-                subtitle: Text(l.vendorUnverifiedLabel),
+                subtitle: Text(vendorStatusLabel(l, vendor.status)),
               ),
               const Divider(height: 1),
-              ListTile(
-                leading: const Icon(Icons.check, color: Colors.green),
-                title: Text(l.vendorActionVerify),
-                subtitle: Text(l.vendorVerifyHint),
-                onTap: () => _runAction(sheetContext, vendor, verify: true),
-              ),
-              ListTile(
-                leading: Icon(Icons.block, color: Colors.red.shade700),
-                title: Text(l.vendorActionReject),
-                subtitle: Text(l.vendorRejectHint),
-                onTap: () => _runAction(sheetContext, vendor, verify: false),
-              ),
+              ?verify?.call(sheetContext),
+              ?reject?.call(sheetContext),
             ],
           ),
         );
       },
+    );
+  }
+
+  /// One sheet action from its [verdict]: absent when not offered, enabled
+  /// when accepted, else disabled with the refusal in the reader's language.
+  Widget Function(BuildContext sheetContext)? _sheetAction(
+    Vendor vendor,
+    ActionVerdict verdict, {
+    required bool verify,
+    required Widget icon,
+    required String label,
+    required String hint,
+  }) {
+    if (!verdict.isOffered(hiddenCodes: _hiddenRefusals)) return null;
+    final l = AppLocalizations.of(context);
+    final reason = verdict.allowed
+        ? null
+        : localizeCodedRefusal(l, verdict.refusal) ??
+              (verdict.refusal?['message'] as String? ?? '');
+    return (sheetContext) => ListTile(
+      leading: icon,
+      title: Text(label),
+      subtitle: Text(reason ?? hint),
+      enabled: verdict.allowed,
+      onTap: verdict.allowed
+          ? () => _runAction(sheetContext, vendor, verify: verify)
+          : null,
     );
   }
 
@@ -265,6 +339,8 @@ class _VendorsScreenState extends State<VendorsScreen> {
     required bool verify,
   }) async {
     Navigator.of(sheetContext).pop();
+    if (!verify && !await _confirmReject(vendor)) return;
+    if (!mounted) return;
     final l = AppLocalizations.of(context);
     final store = VendorStore.instance;
     final ok = verify
@@ -278,6 +354,32 @@ class _VendorsScreenState extends State<VendorsScreen> {
           : l.vendorActionFailed,
     );
     if (ok && !verify) _warnLiveCards();
+  }
+
+  /// Asks before rejecting [vendor], naming it and the virtual cards the
+  /// server cancels on reject (`revoke_vendor_cards`). True only on an
+  /// explicit confirm; dismissing the dialog is a no.
+  Future<bool> _confirmReject(Vendor vendor) async {
+    final l = AppLocalizations.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(l.vendorRejectConfirmTitle(vendor.name)),
+        content: Text(l.vendorRejectConfirmBody(vendor.name)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(l.commonCancel),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700),
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(l.vendorActionReject),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
   }
 
   /// Rejecting a vendor cancels its live virtual cards server-side. A card
@@ -306,9 +408,17 @@ class _VendorsScreenState extends State<VendorsScreen> {
     if (!mounted) return;
     setState(() => _syncing = false);
     final text =
-        message ?? l.vendorSyncFailed(VendorStore.instance.error ?? '');
+        message ?? l.vendorSyncFailed(VendorStore.instance.actionError ?? '');
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
     A11y.announce(context, text);
+  }
+
+  /// The filtered-empty state's "Show all": clear the search box with the
+  /// chip, or the field would keep a query the list no longer applies.
+  void _showAll() {
+    _searchDebouncer.cancel();
+    _searchController.clear();
+    VendorStore.instance.clearFilters();
   }
 
   Widget _filterChip(String label, String? value, String? current) {
@@ -319,30 +429,6 @@ class _VendorsScreenState extends State<VendorsScreen> {
         label: Text(label),
         selected: selected,
         onSelected: (_) => VendorStore.instance.setStatusFilter(value),
-      ),
-    );
-  }
-}
-
-class _ErrorState extends StatelessWidget {
-  final String message;
-  final Future<void> Function() onRetry;
-
-  const _ErrorState({required this.message, required this.onRetry});
-
-  @override
-  Widget build(BuildContext context) {
-    final l = AppLocalizations.of(context);
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.error_outline, size: 48, color: Colors.red.shade700),
-          const SizedBox(height: 12),
-          Text(l.vendorsLoadError),
-          const SizedBox(height: 12),
-          FilledButton(onPressed: onRetry, child: Text(l.commonRetry)),
-        ],
       ),
     );
   }

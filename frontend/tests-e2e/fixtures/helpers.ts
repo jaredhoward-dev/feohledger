@@ -33,7 +33,8 @@ const _thisDir = path.dirname(_thisFile);
  * so most specs need no further changes.
  *
  * Auth storage state: a worker-scoped `storageState` fixture lazy-
- * creates `.auth/<tenantSlug>-admin.json` on first use by signing the
+ * creates `.auth/<tenantSlug>-admin@<run key>.json` (see
+ * `_authStateFile`) on first use by signing the
  * worker's admin into a temporary context. Every subsequent test in
  * that worker boots the page with the JWT already in localStorage —
  * no `signInAndWait` needed in `beforeEach`. Specs that need a fresh
@@ -43,6 +44,26 @@ const _thisDir = path.dirname(_thisFile);
  */
 
 const AUTH_DIR = path.resolve(_thisDir, '../.auth');
+
+/**
+ * The saved-login file for one tenant, keyed by the web origin AND the API base
+ * the run points at — not by the tenant alone.
+ *
+ * A storageState file records localStorage per ORIGIN, port included, and the
+ * JWT inside it is only valid against the backend that minted it. Keyed on the
+ * slug alone, two runs on different ports (two worktrees, or two sessions in
+ * one worktree — `E2E_WEB_ORIGIN` / `PUBLIC_API_URL`, tests-e2e/README.md §
+ * Running from a worktree) shared `.auth/e2e1-admin.json`: whichever wrote last
+ * left a file holding the OTHER port's origin, the token probe still passed
+ * (same tenant, possibly the same backend), and every signed-in spec in the
+ * reading run booted with no token for its own origin and bounced to /login.
+ */
+function _authStateFile(tenantSlug: string): string {
+	const runKey = `${WEB_ORIGIN}__${_API_BASE}`
+		.replace(/https?:\/\//g, '')
+		.replace(/[^A-Za-z0-9.-]+/g, '_');
+	return path.join(AUTH_DIR, `${tenantSlug}-admin@${runKey}.json`);
+}
 
 // Exported so `fixtures/globalSetup.ts` (the workflow-definition shape guard,
 // see docs/known-issues.md § "Workflow-mutating e2e specs can strand a tenant
@@ -204,16 +225,19 @@ function watchForStubbedModules(page: Page): string[] {
 
 /**
  * Read the auth_token value out of a persisted storageState JSON
- * (format: `{origins:[{localStorage:[{name,value}]}]}`).
- * Returns null when the file is missing, malformed, or holds no token.
+ * (format: `{origins:[{origin,localStorage:[{name,value}]}]}`), for ONE origin.
+ * Returns null when the file is missing, malformed, or holds no token for
+ * `forOrigin` — a token stored under another origin is useless to this run,
+ * because the browser only hands localStorage to the origin that wrote it.
  */
-function _readStoredToken(file: string): string | null {
+function _readStoredToken(file: string, forOrigin: string): string | null {
 	try {
 		const raw = fs.readFileSync(file, 'utf8');
 		const parsed = JSON.parse(raw) as {
-			origins?: Array<{ localStorage?: Array<{ name: string; value: string }> }>;
+			origins?: Array<{ origin?: string; localStorage?: Array<{ name: string; value: string }> }>;
 		};
 		for (const origin of parsed.origins ?? []) {
+			if (origin.origin !== forOrigin) continue;
 			for (const entry of origin.localStorage ?? []) {
 				if (entry.name === 'auth_token') return entry.value;
 			}
@@ -260,9 +284,9 @@ async function _ensureAdminStorageState(
 	tenantSlug: string,
 	creds: TenantCreds
 ): Promise<string> {
-	const file = path.join(AUTH_DIR, `${tenantSlug}-admin.json`);
+	const file = _authStateFile(tenantSlug);
 	if (fs.existsSync(file)) {
-		const token = _readStoredToken(file);
+		const token = _readStoredToken(file, tenantOrigin(tenantSlug));
 		if (token && (await _isStoredTokenValid(token, tenantSlug))) {
 			return file;
 		}
@@ -596,6 +620,37 @@ export function controlPsql(query: string): string {
 }
 
 /**
+ * A fresh employee account a spec can sign in as, with a password it knows.
+ *
+ * `POST /api/admin/users` returns no credential any more: the new user is
+ * emailed a single-use set-password link (decisions §283), which a UI spec has
+ * no inbox to read. So the account is created through the real endpoint and
+ * then given the worker admin's own, already-known password hash — copied in
+ * the control plane, so no hash or plaintext is baked into the suite.
+ * `mustChange` puts it in the state a legacy temporary-password account (or a
+ * CLI-provisioned tenant admin) is in, which `/change-password`'s forced mode
+ * serves. Scoped to the row the call created, as `controlPsql` requires.
+ */
+export async function createUserWithKnownPassword(
+	page: Page,
+	opts: { mustChange: boolean; emailPrefix?: string; roleNames?: string[] }
+): Promise<{ id: string; email: string; password: string }> {
+	const admin = _currentWorkerAdmin();
+	const email = `${opts.emailPrefix ?? 'e2e-pw'}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}@test.local`;
+	const resp = await page.request.post(`${_API_BASE}/api/admin/users`, {
+		headers: await authedTenantHeaders(page),
+		data: { full_name: 'Password Test', email, role_names: opts.roleNames ?? ['ap_clerk'] }
+	});
+	expect(resp.status()).toBe(201);
+	const body = (await resp.json()) as { id: string; email: string };
+	controlPsql(
+		`UPDATE users SET hashed_password = (SELECT hashed_password FROM users WHERE email = '${admin.email}'), ` +
+			`must_change_password = ${opts.mustChange ? 'true' : 'false'} WHERE id = '${body.id}'`
+	);
+	return { id: body.id, email: body.email, password: admin.password };
+}
+
+/**
  * Seal (or clear) the current worker tenant's provider credentials through
  * their one writer, `PUT /api/organization/credentials/{block}`, signed in as
  * the worker's tenant admin.
@@ -652,6 +707,51 @@ function deleteVirtualCardsWhere(predicate: string, slug?: string): void {
 }
 
 /**
+ * Delete the payment runs matching `predicate`, their payments, and everything
+ * referencing either.
+ *
+ * Seven specs each carried a private `deletePaymentRun(runId)` that deleted the
+ * run's payments and then the run — correct until a payment acquires a child
+ * (a matched bank transaction, a virtual card, a retry) or the run a Positive
+ * Pay file, and silent about any spec that never called it. One did not:
+ * `cash-flow/copilot.spec.ts` staged a draft run over SEEDED approved invoices
+ * on every pass and left it, and a draft run's live payments keep those
+ * invoices out of the payment queue — the cross-spec interference that broke
+ * `payments/execute.spec.ts`.
+ *
+ * The invoices are left alone: deleting a draft run's payments is what puts
+ * them back in the queue. A spec that changed an invoice's status (execute,
+ * void) still resets that itself.
+ *
+ * The last step deletes the payments and the runs in ONE statement, because
+ * `predicate` may be defined by the payments themselves (`deleteInvoicesWhere`
+ * selects the runs holding only its invoices' payments): run as two statements,
+ * the payment delete would empty the set before the run delete read it. Both
+ * foreign keys are NO ACTION, which Postgres checks at the end of the
+ * statement, so the order inside it does not matter.
+ */
+export function deletePaymentRunsWhere(predicate: string, slug?: string): void {
+	const runs = `SELECT id FROM payment_runs WHERE ${predicate}`;
+	const payments = `SELECT id FROM payments WHERE payment_run_id IN (${runs})`;
+
+	tenantPsql(`DELETE FROM bank_transactions WHERE matched_payment_id IN (${payments})`, slug);
+	deleteVirtualCardsWhere(`payment_id IN (${payments})`, slug);
+	// A retry outside the run may point at one of its payments.
+	tenantPsql(
+		`UPDATE payments SET retry_of_payment_id = NULL WHERE retry_of_payment_id IN (${payments})`,
+		slug
+	);
+	tenantPsql(`DELETE FROM positive_pay_files WHERE payment_run_id IN (${runs})`, slug);
+
+	tenantPsql(
+		`WITH doomed AS (${runs}), ` +
+			`gone AS (DELETE FROM payments WHERE payment_run_id IN (SELECT id FROM doomed)) ` +
+			`DELETE FROM payment_runs WHERE id IN (SELECT id FROM doomed)`,
+		slug
+	);
+}
+
+/**
  * Delete the invoices matching `predicate`, and everything that references them.
  *
  * `invoices` is referenced by 16 foreign keys and none of them cascade, so a
@@ -680,6 +780,15 @@ export function deleteInvoicesWhere(predicate: string, slug?: string): void {
 	);
 	tenantPsql(
 		`DELETE FROM bank_transactions WHERE matched_payment_id IN (SELECT id FROM payments WHERE invoice_id IN (${ids}))`,
+		slug
+	);
+	// A run holding ONLY these invoices' payments would be left an empty shell
+	// once they go, so it goes with them. A run that also pays another invoice
+	// keeps that invoice's payment and survives.
+	deletePaymentRunsWhere(
+		`id IN (SELECT payment_run_id FROM payments WHERE invoice_id IN (${ids})) ` +
+			`AND NOT EXISTS (SELECT 1 FROM payments other WHERE other.payment_run_id = payment_runs.id ` +
+			`AND other.invoice_id NOT IN (${ids}))`,
 		slug
 	);
 	// A card can hang off the payment or off the invoice, and carries children
@@ -723,6 +832,36 @@ export function deleteInvoicesWhere(predicate: string, slug?: string): void {
 	);
 
 	tenantPsql(`DELETE FROM invoices WHERE ${predicate}`, slug);
+}
+
+/**
+ * Put a vendor on the `/vendors/screening` review queue: a `match` verdict at
+ * high risk plus one `sanctions_checks` history row, so the queue row and the
+ * modal's timeline both have something to show. The mock screener only flags
+ * a fixed fixture-name set, so the verdict is written directly; that keeps the
+ * vendor's name unique per run. `blocked` also sets `payments_blocked`, which
+ * is what an auto-blocking `match` does, so the modal opens on Unblock.
+ */
+export function flagVendorForScreeningReview(
+	vendorId: string,
+	slug?: string,
+	opts: { blocked?: boolean } = {}
+): void {
+	const blocked = opts.blocked ? ', payments_blocked=true' : '';
+	tenantPsql(
+		`UPDATE vendors SET screening_status='match', last_screened_at=now(), ` +
+			`risk_level='high', risk_score=90${blocked} WHERE id='${vendorId}'`,
+		slug
+	);
+	tenantPsql(
+		`INSERT INTO sanctions_checks ` +
+			`(id, vendor_id, organization_id, provider, check_type, result, ` +
+			`risk_score, matched_list, checked_at) ` +
+			`SELECT gen_random_uuid(), v.id, v.organization_id, 'mock', 'manual', ` +
+			`'match', 90, 'MOCK_TEST_SDN', now() ` +
+			`FROM vendors v WHERE v.id='${vendorId}'`,
+		slug
+	);
 }
 
 /**
@@ -966,6 +1105,39 @@ export async function loadMoreUntilRow(page: Page, row: Locator): Promise<void> 
 		await loadMore.click();
 		await expect.poll(() => rows.count()).toBeGreaterThan(before);
 	}
+}
+
+/**
+ * The first invoice in the worker tenant's payment queue that a payment run
+ * will ACCEPT on the default rail — never a row the queue lists as blocked.
+ *
+ * The queue lists blocked rows too (an unverified vendor, an open
+ * payment-blocking exception, a fully-credited invoice), so "take `items[0]`"
+ * is only correct while no blocked row sorts first. With no due dates the
+ * queue tie-breaks on the random invoice UUID, so one blocked row anywhere in
+ * the tenant made those specs fail a fraction of the time, with a 409 from
+ * `POST /api/payments/runs` far from its cause. `GET /api/payments/queue/ids`
+ * is the server's own selectable set (the one "select all N matching"
+ * resolves), so it answers the question directly instead of restating the
+ * refusal rules here.
+ *
+ * Fails, naming the reason, when the tenant has no payable invoice at all —
+ * every caller's next step would fail anyway, less legibly.
+ */
+export async function firstPayableQueueInvoice(
+	page: Page
+): Promise<{ id: string; invoice_number: string; status: string }> {
+	const headers = await authedTenantHeaders(page);
+	const idsResp = await page.request.get(`${_API_BASE}/api/payments/queue/ids`, { headers });
+	expect(idsResp.status(), 'GET /api/payments/queue/ids').toBe(200);
+	const { ids } = (await idsResp.json()) as { ids: string[] };
+	expect(
+		ids.length,
+		`tenant ${currentTenantSlug()} has no payable (non-blocked) invoice in its payment queue`
+	).toBeGreaterThan(0);
+	const invResp = await page.request.get(`${_API_BASE}/api/invoices/${ids[0]}`, { headers });
+	expect(invResp.status(), `GET /api/invoices/${ids[0]}`).toBe(200);
+	return (await invResp.json()) as { id: string; invoice_number: string; status: string };
 }
 
 /**

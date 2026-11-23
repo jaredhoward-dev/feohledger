@@ -4,8 +4,8 @@ import {
 	currentTenantSlug,
 	deleteVendorsWhere,
 	expect,
+	flagVendorForScreeningReview,
 	signInAndWait,
-	tenantPsql,
 	test
 } from '../fixtures/helpers';
 import type { Page } from '@playwright/test';
@@ -50,20 +50,7 @@ async function createVendor(page: Page, name: string): Promise<{ id: string }> {
 /** Flip a vendor to a `match` screening verdict + seed one history row so it
  *  lands on the review queue with a visible history timeline. */
 function flagForReview(vendorId: string): void {
-	tenantPsql(
-		`UPDATE vendors SET screening_status='match', last_screened_at=now(), ` +
-			`risk_level='high', risk_score=90 WHERE id='${vendorId}'`,
-		SLUG
-	);
-	tenantPsql(
-		`INSERT INTO sanctions_checks ` +
-			`(id, vendor_id, organization_id, provider, check_type, result, ` +
-			`risk_score, matched_list, checked_at) ` +
-			`SELECT gen_random_uuid(), v.id, v.organization_id, 'mock', 'manual', ` +
-			`'match', 90, 'MOCK_TEST_SDN', now() ` +
-			`FROM vendors v WHERE v.id='${vendorId}'`,
-		SLUG
-	);
+	flagVendorForScreeningReview(vendorId, SLUG);
 }
 
 function deleteVendorCascade(vendorId: string): void {
@@ -121,6 +108,8 @@ test.describe('/vendors/screening review queue (admin — cached session)', () =
 			// field above renders the same matched-list name, so an unscoped
 			// getByText resolves to two legitimate elements (strict-mode violation).
 			await expect(modal.locator('ul.history').getByText('MOCK_TEST_SDN')).toBeVisible();
+			// The seeded `check_type='manual'` reads as its label, not the enum.
+			await expect(modal.locator('ul.history')).toContainText('Manual re-screen');
 		} finally {
 			deleteVendorCascade(vendor.id);
 		}
@@ -142,6 +131,99 @@ test.describe('/vendors/screening review queue (admin — cached session)', () =
 			// Admin holds vendor.block AND is a manager → both controls present.
 			await expect(modal.getByRole('button', { name: 'Block payments' })).toBeVisible();
 			await expect(modal.getByRole('button', { name: 'Re-screen now' })).toBeVisible();
+		} finally {
+			deleteVendorCascade(vendor.id);
+		}
+	});
+
+	// Unblock releases payments to a vendor a screen stopped, so it is armed
+	// two-click; Block (the safe, urgent direction) stays one click.
+	test('Unblock payments is armed: the first click only asks to confirm', async ({ page }) => {
+		const name = `Screen-Unblock Co ${Date.now()}`;
+		const vendor = await createVendor(page, name);
+		try {
+			flagForReview(vendor.id);
+			await page.goto('/vendors/screening');
+			await page.locator('table tbody tr', { hasText: name }).locator('.row-link').click();
+			const modal = page.getByRole('dialog', { name: 'Vendor screening review' });
+
+			await modal.getByRole('button', { name: 'Block payments' }).click();
+			const unblock = modal.getByRole('button', { name: 'Unblock payments' });
+			await expect(unblock).toBeVisible();
+
+			let unblockCalls = 0;
+			page.on('request', (r) => {
+				if (r.method() === 'POST' && r.url().endsWith(`/api/vendors/${vendor.id}/unblock`)) {
+					unblockCalls += 1;
+				}
+			});
+			await unblock.click();
+			const confirm = modal.getByRole('button', { name: 'Confirm unblock' });
+			await expect(confirm).toBeVisible();
+			expect(unblockCalls, 'the arming click sends nothing').toBe(0);
+
+			const unblocked = page.waitForResponse(
+				(r) => r.request().method() === 'POST' && r.url().endsWith(`/api/vendors/${vendor.id}/unblock`)
+			);
+			await confirm.click();
+			expect((await unblocked).status()).toBe(200);
+			await expect(modal.getByRole('button', { name: 'Block payments' })).toBeVisible();
+		} finally {
+			deleteVendorCascade(vendor.id);
+		}
+	});
+
+	// The shared limiter's 429 is a CODED refusal (`backend/app/services/
+	// rate_limit.py`): its `detail` is `{code, message, params}`. The toast used
+	// to be built from `e.detail ?? e.message`, so it printed "[object Object]";
+	// it now reads `ApiError.message`, which the transport already localized
+	// (`utils/apiError.ts::errorMessage`). Stubbed: tripping the real limiter
+	// would throttle every other spec on the tenant, and the body is exactly
+	// what the limiter serializes (pinned in backend/tests/test_rate_limit_security.py).
+	test('a rate-limited re-screen is toasted in German, never "[object Object]"', async ({
+		page
+	}) => {
+		const name = `Screen-Throttle Co ${Date.now()}`;
+		const vendor = await createVendor(page, name);
+		try {
+			flagForReview(vendor.id);
+			const screenPath = `/api/vendors/${vendor.id}/screen`;
+			let refused = false;
+			await page.route(
+				(url) => url.pathname === screenPath,
+				async (route) => {
+					if (route.request().method() !== 'POST') return route.fallback();
+					refused = true;
+					await route.fulfill({
+						status: 429,
+						headers: { 'Retry-After': '45' },
+						json: {
+							detail: {
+								code: 'rate_limited',
+								message: 'Too many requests. Please wait 45 seconds before trying again.',
+								params: { retry_after_seconds: 45 }
+							}
+						}
+					});
+				}
+			);
+			await page.addInitScript(() => {
+				localStorage.setItem('feoh_locale', 'de');
+			});
+
+			await page.goto('/vendors/screening');
+			const row = page.locator('table tbody tr', { hasText: name });
+			await row.locator('.row-link').click();
+			const modal = page.getByRole('dialog', { name: 'Lieferanten-Screening-Prüfung' });
+			await modal.getByRole('button', { name: 'Jetzt erneut prüfen' }).click();
+
+			await expect.poll(() => refused).toBe(true);
+			const toast = page.locator('.toast.error .toast-text');
+			await expect(toast).toHaveText(
+				'Zu viele Versuche. Warten Sie 45 Sekunden und versuchen Sie es dann erneut.'
+			);
+			await expect(page.locator('body')).not.toContainText('[object Object]');
+			await expect(page.locator('body')).not.toContainText('Too many requests');
 		} finally {
 			deleteVendorCascade(vendor.id);
 		}

@@ -4,7 +4,7 @@ import type { HelpMessages } from '../../messages';
 // diagram labels under `help.*` — all of them but `help.pageLink` and
 // `help.tip.*`, which every page's chrome reads and so stay in the main
 // catalogue. Split out because it is ~9 KB gzipped per locale that only the
-// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureHelpCatalogue()` in store.svelte.ts;
+// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureSlices('help')` in store.svelte.ts;
 // `satisfies HelpMessages` makes a missing or extra key a compile error.
 export const messages = {
 	'help.title': 'Hilfecenter',
@@ -63,7 +63,6 @@ export const messages = {
 	'help.note.role': 'Wer das darf',
 	'help.glossary.title': 'Glossar',
 	'help.glossary.intro': 'Die Begriffe der Kreditorenbuchhaltung, die in {product} vorkommen, und was jeder hier bedeutet.',
-	'help.glossary.topic': 'Thema',
 	'help.glossary.allTopics': 'Alle Themen',
 	'help.glossary.aliases': 'Auch genannt:',
 	'help.glossary.related': 'Siehe auch:',
@@ -103,7 +102,7 @@ export const messages = {
 	'help.term.credit-memo': 'Gutschrift',
 	'help.term.credit-memo.short': 'Ein Lieferantenbeleg, der Ihre Verbindlichkeit mindert und auf eine offene Rechnung desselben Lieferanten angewendet wird.',
 	'help.term.duplicate-invoice': 'Doppelte Rechnung',
-	'help.term.duplicate-invoice.short': 'Eine zweimal erfasste Rechnung. FeohLedger markiert Verdachtsfälle und sperrt die Zahlung bis zur Klärung.',
+	'help.term.duplicate-invoice.short': 'Eine zweimal erfasste Rechnung. FeohLedger markiert Verdachtsfälle und sperrt die Zahlung und die Übertragung ins ERP bis zur Klärung.',
 	'help.term.purchase-order': 'Bestellung',
 	'help.term.purchase-order.short': 'Ihr verbindlicher Auftrag an einen Lieferanten mit Artikeln, Mengen und Preisen.',
 	'help.term.goods-receipt': 'Wareneingang',
@@ -328,7 +327,7 @@ export const messages = {
 	'help.term.line-total-mismatch': 'Positionssummen-Abweichung',
 	'help.term.line-total-mismatch.short': 'Die Positionen einer Rechnung ergeben nicht ihren Gesamtbetrag. Die Zahlung ist gesperrt, bis jemand das klärt.',
 	'help.term.fraud-flag': 'Betrugshinweis',
-	'help.term.fraud-flag.short': 'Eine Ausnahme, wenn eine Rechnung oder Zahlung nach Betrug aussieht. Die Zahlung ist bis zur Klärung gesperrt.',
+	'help.term.fraud-flag.short': 'Eine Ausnahme, wenn eine Rechnung oder Zahlung nach Betrug aussieht. Die Zahlung und die Übertragung ins ERP sind bis zur Klärung gesperrt.',
 	'help.term.expense-policy': 'Spesenrichtlinie',
 	'help.term.expense-policy.short': 'Ihre Regeln dafür, was Mitarbeitende abrechnen dürfen – Limits, Belege, Vorabgenehmigungen –, bei jeder Ausgabe geprüft.',
 	'help.term.spend-preapproval': 'Vorabgenehmigung von Ausgaben',

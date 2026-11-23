@@ -10,6 +10,7 @@ See ``backend/docs/contracts.md``.
 import csv
 import io
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -557,6 +558,9 @@ async def _transition(
         )
     target = _LIFECYCLE_TARGET[action]
     contract.status = target
+    if target == ContractStatus.active and contract.activated_at is None:
+        # Evidence the contract bound the parties; outlives a later cancel.
+        contract.activated_at = datetime.now(UTC)
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -662,8 +666,8 @@ async def renew_contract(
 
 
 def _bulk_skip_reason(exc: HTTPException, fallback: str) -> str:
-    """The human-readable cause a bulk-status skip is reported with. Mirrors
-    `api/invoices.py::_skip_reason` — `_transition` raises `HTTPException`
+    """The human-readable cause a bulk-status skip is reported with.
+    `_transition` raises `HTTPException`
     with a plain-string `detail` (404 not found / 409 illegal starting
     status), and that string IS the real cause."""
     return exc.detail if isinstance(exc.detail, str) else fallback

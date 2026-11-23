@@ -14,7 +14,32 @@ This file holds the rules. The reference material lives in `mobile/docs/`:
 
 ## Stack
 
-- **Flutter 3.41+**, Dart 3.11+
+- **Flutter 3.50.0, pinned exactly**, Dart 3.14+. `environment: flutter:` in
+  `pubspec.yaml` is the single source: every `subosito/flutter-action` step
+  (`ci.yml`, `mobile-release.yml`) reads it via `flutter-version-file`, so a
+  new stable release can't change CI unannounced (3.50.0 did, deprecating the
+  in-framework Material library, in November 2026). Bump the SDK by editing that
+  one line, in a PR of its own. Pub enforces only the lower bound, so a newer
+  local SDK still resolves.
+- **Material comes from `package:material_ui`, not `package:flutter/material.dart`**
+  (deprecated in 3.50; migration guide:
+  https://docs.flutter.dev/release/breaking-changes/material-ui-and-cupertino-ui).
+  Import `package:material_ui/material_ui.dart` (and `cupertino_ui` for
+  Cupertino). `flutter/widgets`, `services`, `foundation`, `scheduler` and
+  `semantics` are unaffected. The two are different libraries with distinct
+  types: a legacy `Theme` / `MaterialLocalizations` is invisible to a
+  `material_ui` widget and vice versa.
+- **Localization delegates come from `appLocalizationsDelegates`**
+  (`lib/l10n/app_localizations_delegates.dart`), never the generated
+  `AppLocalizations.localizationsDelegates`. Flutter 3.50's gen-l10n still
+  emits the legacy `flutter_localizations` delegates there
+  (flutter/flutter#196475, fix in draft PR #194500), which register the
+  *legacy* `MaterialLocalizations` type, so outside `en` a `material_ui`
+  widget finds no `MaterialLocalizations` at all and fails its lookup.
+  `test/l10n/material_delegates_test.dart` pins the shared list and bans the
+  generated one. The generated file's two deprecated references are
+  silenced by a `header:` in `l10n.yaml`, scoped to the generated `lib/l10n/gen/` files;
+  drop it once gen-l10n emits `material_ui` delegates.
 - **iOS + Android** (single Dart codebase, dual platform targets)
 - **State management**: StatefulWidget + setState + ChangeNotifier singletons (no Bloc/Provider/Riverpod)
 - **HTTP**: `http` package + `flutter_secure_storage` for JWT
@@ -46,6 +71,15 @@ The shape: `screens/` (one per route) · `stores/` (ChangeNotifier state) ·
 `widgets/` (the shared widget library) · `models/` · `services/` (API client).
 Guard rail 10 — put code in the directory its siblings already establish, and
 build screens from the widget library rather than duplicating markup.
+A list screen backed by a store builds its body with `AsyncListBody`
+(`lib/widgets/async_list_body.dart`), never a hand-rolled spinner → error →
+empty → `RefreshIndicator` chain; `test/screens/async_list_body_adoption_test.dart`
+enforces it outside an allowlist of not-yet-converted screens. Its
+`hasError` is the store's **fetch** failure only (`loadError`): a store whose
+actions can fail keeps them in a separate `actionError`, or a refused resolve
+raises "couldn't refresh" over a live list. Slots and wording:
+`docs/project-structure.md` (`async_list_body.dart`).
+
 ## Architecture patterns
 
 - **ChangeNotifier singletons** for stores — `AuthStore.instance`, `InvoiceStore.instance`, etc.
@@ -152,11 +186,11 @@ The mobile app talks to the same FastAPI backend as the web frontend:
 | Dashboard | `GET /api/dashboard` |
 | Cash Flow | `GET /api/analytics/cashflow_forecast` + `GET /api/analytics/cash_position` (both `horizon_days` + `granularity`; CFO/admin) |
 | Invoices | `GET /api/invoices` (advanced search adds `vendor` / `po_number` / `amount_min` / `amount_max` / `due_date_from` / `due_date_to`); bulk ops `POST /api/invoices/bulk/delete` + `POST /api/invoices/bulk/status` + `POST /api/invoices/bulk/export` (CSV/XML → share sheet; admin/ap_manager/cfo) |
-| Admin — User Management | `GET /api/admin/users` (`search`/paginated), `GET /api/admin/roles`, `POST /api/admin/users` (`email` / `full_name` / `role_names` → returns a one-time `temporary_password`), `PATCH /api/admin/users/{id}` (`role_names` / `is_active`), `DELETE /api/admin/users/{id}` — admin only |
+| Admin — User Management | `GET /api/admin/users` (`search`/paginated), `GET /api/admin/roles`, `POST /api/admin/users` (`email` / `full_name` / `role_names` → the user is emailed a set-password link; the response carries `set_password_link_expires_at`, never a credential), `PATCH /api/admin/users/{id}` (`role_names` / `is_active`), `DELETE /api/admin/users/{id}` — admin only |
 | Admin — Organization Settings | `GET /api/organization`, `PATCH /api/organization` (`{name, settings:{company, invoice_defaults}}` — shallow-merged; admin only) |
 | Admin — Workflows (read-only) | `GET /api/workflows` (list), `GET /api/workflows/{id}` (detail) — reads open to any authed role; the mobile entry point is admin-only (mirrors web nav `roles: ['admin']`). No create/edit on mobile |
 | Invoice Detail | `GET /api/invoices/{id}` (carries `warnings` + `po_match`), `POST /api/invoices/{id}/approve` (sends the loaded `updated_at` as `expected_updated_at`; a 409 `invoice_stale_approval` reloads the screen — decisions §263; the Approvals swipe and bulk approve bind the listed version the same way), `POST /api/invoices/{id}/reject`, `PATCH /api/invoices/{id}` (edit fields — admin/ap_manager/cfo, hidden in immutable statuses; financial fields omitted once approved), `GET /api/invoices/{id}/audit-log` (activity timeline + ERP-status derivation, any authenticated role) |
-| Approvals | `GET /api/invoices?status=ready_for_review` — a **server-side** filter into `InvoiceStore._pending`, with its own `SequencedFetch` token. It used to slice the Invoices tab's already-fetched page client-side, so tapping the *Paid* chip on Invoices made Approvals read "All caught up" while invoices sat awaiting review — and because both live in one `IndexedStack`, `initState` never re-fired and pull-to-refresh re-applied the same filter, so it could not self-correct. |
+| Approvals | `GET /api/invoices?status=ready_for_review&include=review_actions` — each row carries the caller's `approve` / `reject` verdict (`Invoice.reviewActions`), which the swipe actions are offered from; no per-row `review-actions` read. A row without one (the offline cache never stores a verdict) offers neither swipe, and the screen says it could not check (`reviewVerdictsUnavailable`, announced). A **server-side** filter into `InvoiceStore._pending`, with its own `SequencedFetch` token. It used to slice the Invoices tab's already-fetched page client-side, so tapping the *Paid* chip on Invoices made Approvals read "All caught up" while invoices sat awaiting review — and because both live in one `IndexedStack`, `initState` never re-fired and pull-to-refresh re-applied the same filter, so it could not self-correct. |
 | Exceptions | `GET /api/exceptions` (status filter), `POST /api/exceptions/{id}/resolve` (action=resolve\|escalate\|dismiss), `POST /api/exceptions/bulk/resolve` (`{ids, action, resolution}` → `{updated, skipped:[{id,reason}]}`) |
 | Exception Detail | `GET /api/exceptions/{id}` (full row + invoice), `POST /api/exceptions/{id}/assign` (`{user_id}`, null = unassign), plus the resolve/bulk routes above. The assignee picker reuses `GET /api/admin/users` (admin-only) |
 | Contracts | `GET /api/contracts` (`status` / `contract_type` / `search` / paginated) — read open to admin/ap_manager/ap_clerk/cfo |
@@ -164,9 +198,10 @@ The mobile app talks to the same FastAPI backend as the web frontend:
 | Notifications | `GET /api/notifications` (`unread_only` filter — envelope carries `items` + total `unread`), `GET /api/notifications/unread-count` (badge), `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all` |
 | Payments | `GET /api/payments` |
 | Vendors | `GET /api/vendors` (status/search filters), `POST /api/vendors/{id}/verify`, `POST /api/vendors/{id}/reject`, `POST /api/vendors/sync-erp` (mutations admin/ap_manager) |
-| Pay (queue) | `GET /api/payments/queue`, `GET /api/payments/summary`, `GET /api/payments/runs/`, `POST /api/payments/runs` (create draft), `POST /api/payments/runs/{id}/execute`, `POST /api/payments/runs/{id}/cancel` (admin/ap_manager/cfo), `POST /api/payments/runs/{id}/approve` (CFO sign-off — **cfo role only**, mirroring the backend `require_roles(ROLE_CFO)`) |
+| Pay (queue) | `GET /api/payments/queue`, `GET /api/payments/summary`, `GET /api/payments/runs/`, `POST /api/payments/runs` (create draft), `POST /api/payments/runs/{id}/execute`, `POST /api/payments/runs/{id}/cancel` (admin/ap_manager/cfo), `POST /api/payments/runs/{id}/approve` (CFO sign-off — **cfo role only**, mirroring the backend `require_roles(ROLE_CFO)`); record-only mode: `GET /api/payments/execution-mode` (Execute offered only on `processor`, fail closed), `POST /api/payments/record-outside` (row, from its `record_outside_refusal`; pre-filled from its `erp_reported_payment`, and a standing ERP split via `POST /api/exceptions/{id}/record-erp-payment`), `GET /api/payments/runs/{id}` + `POST /api/payments/runs/{id}/record-outside` (run, from `actions.record_outside`) — `payment.record_external`, both modes |
 | Quality Inspections | `GET /api/inspections` (`result` / `gr_id` filters, paginated — reads are role-open), `GET /api/inspections/{id}`, `POST /api/inspections` (record — admin/ap_manager), plus `GET /api/goods-receipts` for the record form's receipt picker. `POST /inspections/sync` (QMS pull) is deliberately web-only |
-| Adaptive Workflows | `GET /api/adaptive/approval-patterns`, `GET /api/adaptive/anomalies`, `GET /api/adaptive/suggestions`, `POST /api/adaptive/suggestions/{id}/dismiss` (admin/ap_manager). The two `/apply` paths and `GET /feedback` are deliberately web-only |
+| Record Goods Receipt | `GET /api/purchase-orders` (`search`, picker), `GET /api/purchase-orders/{id}` (lines + received so far), `POST /api/goods-receipts` (`Idempotency-Key` per opened form; quantities as strings) — admin / ap_manager / ap_clerk |
+| Adaptive Workflows | `GET /api/adaptive/approval-patterns`, `GET /api/adaptive/anomalies`, `GET /api/adaptive/suggestions`, `POST /api/adaptive/suggestions/{id}/dismiss` (offered from the row's `actions.dismiss` verdict, `WorkflowSuggestion.dismissVerdict`; no verdict offers nothing). The two `/apply` paths and `GET /feedback` are deliberately web-only |
 | Settings | Uses cached auth state |
 
 ## Role-based UI
@@ -178,7 +213,7 @@ Bottom navigation adapts based on user roles (same as web frontend):
 | Dashboard | All roles |
 | Invoices | All roles |
 | Contracts | All roles (activate / terminate / cancel: Admin, AP Manager only) |
-| Approvals | Anyone holding `invoice.approve` — Admin, AP Manager, CFO by default, or a custom role (`AuthStore.canApproveInvoice`, read from `/auth/me`'s `permissions`; the invoice-detail Approve/Reject bar uses the same gate) |
+| Approvals | Anyone holding `invoice.approve` — Admin, AP Manager, CFO by default, or a custom role (`AuthStore.canApproveInvoice`, read from `/auth/me`'s `permissions`). The tab only: Approve / Reject on an invoice come from the server's verdict, never this gate — the detail bar from `GET /api/invoices/{id}/review-actions` (a placeholder while it loads, "couldn't check" when the read fails), the queue swipe from the list's `review_actions` |
 | Exceptions | Admin, AP Manager |
 | Vendors | Admin, AP Manager, CFO (verify/reject + ERP sync: Admin, AP Manager only) |
 | Pay | Admin, AP Manager, CFO |
@@ -263,8 +298,14 @@ Follow these conventions on every new screen/widget:
   approvals swipe-approve.
 - **Colour contrast ≥4.5:1.** Status/payment badges render the text in a
   *darkened* variant (`.shade700`/`.shade800`/`.shade900`) of the accent over
-  the 0.15-alpha tint — the full-saturation hue fails AA. Muted greys use
-  `grey.shade700` (not `shade500`/`shade600`, which fail at 11-14px).
+  the 0.15-alpha tint — the full-saturation hue fails AA. A new status chip
+  is a `StatusPill` (`lib/widgets/status_pill.dart`) with one of its fixed
+  `StatusTone`s, never another hand-built pill: each tone's pair is computed
+  in `test/widgets/status_pill_test.dart`. Muted text uses
+  `Theme.of(context).colorScheme.onSurfaceVariant` (it tracks light / dark;
+  a fixed grey does not), never `grey.shade500`/`shade600`. Compute any
+  hand-picked pair: the amber stale banner's `amber.shade900` on
+  `amber.shade50` was 2.6:1; it is `brown.shade700` (8.8:1).
 - **Decorative icons** (the `BrandMark` widget, placeholder camera glyph, aging dots) are
   wrapped in `ExcludeSemantics` so they aren't announced.
 - **Tap targets ≥48dp** — use `IconButton` defaults; don't shrink hit areas.
@@ -283,12 +324,18 @@ await expectLater(tester, meetsGuideline(textContrastGuideline));
 ```
 
 plus `find.bySemanticsLabel(...)` to confirm icon buttons expose labels. Covers
-the invoice list tile, KPI card, status badge, login screen, the capture action,
-the approvals approve/reject affordances, the exception list tile + exception
+the invoice list tile, KPI card (alone, and two side by side in a list `Row`,
+which must stay two announcements: a label-only `Semantics` is not a node
+boundary, so `KpiCard` is `container: true`), status badge, login screen, the capture action,
+the approvals approve/reject affordances (an allowed row beside a refused
+one, plus the could-not-check notice), the invoice detail's Approve / Reject
+bar (allowed and refused verdicts; Approve is `green.shade800` under its white
+label, where full-saturation green was 2.78:1), the exception list tile + exception
 status badge + exceptions screen (queue swipe actions) + the exception list tile
 in **selection mode** (exposes a `selected`/checked state, keeps its tap target,
 still announces one merged row label) + the `ExceptionDetailScreen` (the loaded
-detail meets tap-target/label/contrast), the invoice
+detail meets tap-target/label/contrast, also with a `paid_not_recorded` ERP
+payment panel and with a coded write-back refusal), the invoice
 activity timeline + invoice edit-sheet (icon-only close/clear controls labelled,
 one merged announcement per timeline entry; the financially-locked variant keeps
 its labels + AA contrast on the lock notice and per-field "Frozen after

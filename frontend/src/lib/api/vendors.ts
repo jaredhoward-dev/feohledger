@@ -7,6 +7,11 @@ import { triggerDownload } from '#lib/utils/download.ts';
 import type {
 	Vendor,
 	VendorCardRevocation,
+	VendorErpLinkResponse,
+	VendorErpLinksResponse,
+	VendorErpSearchResponse,
+	VendorErpUnlinkResponse,
+	SanctionsAdjudication,
 	SanctionsCheck,
 	ScreeningReviewQueueResponse,
 	VendorRisk,
@@ -209,6 +214,32 @@ export function unblockVendor(id: string): Promise<Vendor> {
 	return api.post<Vendor>(`/api/vendors/${id}/unblock`, {});
 }
 
+// Record the vendor's stored `match` / `review` screen as a false positive
+// (`vendor.sanctions.adjudicate`, decisions §477). The reason is required, and
+// `sanctionsCheckId` is the screen the reviewer saw (the row's
+// `latest_check_id`): a newer screen answers 409 instead of being stamped.
+export function adjudicateSanctionsFalsePositive(
+	id: string,
+	reason: string,
+	sanctionsCheckId: string
+): Promise<SanctionsAdjudication> {
+	return api.post<SanctionsAdjudication>(`/api/vendors/${id}/screening/adjudicate`, {
+		reason,
+		sanctions_check_id: sanctionsCheckId
+	});
+}
+
+// End EVERY active adjudication of the vendor; the gates hold on the screen
+// again, and a revoked match re-blocks the vendor and closes its cards.
+export function revokeSanctionsAdjudication(
+	id: string,
+	reason: string
+): Promise<SanctionsAdjudication[]> {
+	return api.post<SanctionsAdjudication[]>(`/api/vendors/${id}/screening/adjudication/revoke`, {
+		reason
+	});
+}
+
 // Reject an unverified / active vendor. The response carries what happened to
 // its live virtual cards (`card_revocation`).
 export function rejectVendor(id: string): Promise<Vendor> {
@@ -220,6 +251,41 @@ export function rejectVendor(id: string): Promise<Vendor> {
 // `vendor.manage` or `vendor.block`.
 export function cancelVendorCards(id: string): Promise<VendorCardRevocation> {
 	return api.post<VendorCardRevocation>(`/api/vendors/${id}/cancel-cards`, {});
+}
+
+// The vendor's ERP links, one per company (the vendor detail's readers).
+export function getVendorErpLinks(id: string): Promise<VendorErpLinksResponse> {
+	return api.get<VendorErpLinksResponse>(`/api/vendors/${id}/erp-links`);
+}
+
+// Clear the vendor's link in one ERP company (`vendor.manage`, decisions §375).
+// `realm` null is the row link that records no company, asked for explicitly.
+export function unlinkVendorErpLink(
+	id: string,
+	realm: string | null
+): Promise<VendorErpUnlinkResponse> {
+	return api.post<VendorErpUnlinkResponse>(`/api/vendors/${id}/erp-links/unlink`, { realm });
+}
+
+// Search the connected ERP's whole contact list for this vendor's record, by
+// `query` (blank: the vendor's name) and by its stored tax number, which the
+// server reads itself (`vendor.manage`, decisions §415). Links nothing.
+export function searchVendorErpRecords(
+	id: string,
+	query: string | null
+): Promise<VendorErpSearchResponse> {
+	return api.post<VendorErpSearchResponse>(`/api/vendors/${id}/erp-links/search`, { query });
+}
+
+// Link the vendor to one ERP record in the connected company (`vendor.manage`,
+// decisions §415). The server re-reads the record before linking.
+export function linkVendorErpRecord(
+	id: string,
+	erpVendorId: string
+): Promise<VendorErpLinkResponse> {
+	return api.post<VendorErpLinkResponse>(`/api/vendors/${id}/erp-links/link`, {
+		erp_vendor_id: erpVendorId
+	});
 }
 
 // Vendor risk detail + recompute. recompute is admin / ap_manager.
@@ -310,8 +376,9 @@ export interface PortalInvitePayload {
 
 /** Mirrors `backend/app/schemas/portal.PortalInviteResponse`.
  *
- *  There is deliberately **no** `temp_password`: the backend now delivers the
- *  credential only by email to the portal user's own address. Returning it here
+ *  There is deliberately **no** credential: the backend emails a single-use
+ *  set-password link to the portal user's own address (decisions §283).
+ *  Returning a credential here
  *  let one `ap_manager` mint a supplier login at an address they controlled in
  *  a single request — the first link of a BEC bank-redirect chain they could
  *  then complete alone. `portal_url` is `null` when `FEOH_TENANT_URL_TEMPLATE`

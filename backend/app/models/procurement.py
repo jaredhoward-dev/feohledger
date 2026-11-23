@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, EntityMixin, TimestampMixin
+from app.utils.currency_code import iso_currency_or_none
 
 #: PO statuses that no longer represent a live commitment. `PurchaseOrder.status`
 #: is a free-form `String(30)` written by the ERP feed and the requisition
@@ -28,8 +29,31 @@ from app.models.base import Base, EntityMixin, TimestampMixin
 #: silently counting a cancelled order as committed spend is what makes a
 #: figure wrong. Shared by the budget-commitment leg (`services/budget_service`)
 #: and the open-PO accrual (`api/analytics`), which must not disagree about what
-#: "open" means.
-DEAD_PO_STATUSES: tuple[str, ...] = ("cancelled", "closed", "voided")
+#: "open" means. An `unissued` order (`UNISSUED_PO_STATUS`) is not a commitment
+#: YET, so it is left out too until the ERP issues it.
+DEAD_PO_STATUSES: tuple[str, ...] = ("cancelled", "closed", "voided", "unissued")
+
+#: The dead statuses the PO matcher refuses to match an invoice against
+#: (`services/po_matching`): an order that was called off authorizes nothing.
+#: `closed` is deliberately not one. An ERP closes a PO once it is fully billed
+#: (NetSuite's "Fully Billed", for one), which the invoice being matched can
+#: itself have caused, so refusing it would hold the ordinary last invoice.
+CANCELLED_PO_STATUSES: tuple[str, ...] = ("cancelled", "voided")
+
+#: An ERP purchase order nobody in the ERP has approved or issued yet: a Xero
+#: or Merge.dev ``DRAFT`` / ``SUBMITTED``, a NetSuite Pending Supervisor
+#: Approval, a Business Central ``Draft`` / ``In Review``, an Intacct draft or
+#: one still in approval. The PO sync stores it under this status rather than
+#: skipping it, so a re-sync can also take back an order an earlier build
+#: synced as ``open``, and the matcher refuses it with its own finding
+#: (``po_not_issued``) instead of "PO not found". The ERP issuing it moves it
+#: to ``open`` on the next sync. Decisions §394.
+UNISSUED_PO_STATUS = "unissued"
+
+#: Every status the matcher refuses to match an invoice against. The PO sync
+#: re-matches the invoices citing a PO whose status moves into or out of this
+#: set, so the hold appears at sync time (decisions §326, §394).
+UNMATCHABLE_PO_STATUSES: tuple[str, ...] = (*CANCELLED_PO_STATUSES, UNISSUED_PO_STATUS)
 
 
 def po_currency_code(value: object) -> str | None:
@@ -43,10 +67,7 @@ def po_currency_code(value: object) -> str | None:
     §197). ``po_matching`` normalises the invoice side the same way before it
     compares the two.
     """
-    if not isinstance(value, str):
-        return None
-    code = value.strip().upper()
-    return code if len(code) == 3 and code.isascii() and code.isalpha() else None
+    return iso_currency_or_none(value)
 
 
 class PurchaseOrder(Base, EntityMixin, TimestampMixin):
@@ -83,6 +104,13 @@ class PurchaseOrder(Base, EntityMixin, TimestampMixin):
     # GoodsReceipt.received_date to compute the data-enrichment on-time-delivery
     # vendor sub-score (migration 0060). NULL = no promised date → excluded.
     expected_delivery_date: Mapped[date | None] = mapped_column(Date)
+    # Set by the ERP PO sync when the ERP still has this PO but the adapter
+    # could not state its total exactly (an `erp_adapters.base.PoSkipReason`
+    # value): `total` is then a figure the ERP no longer vouches for, and
+    # `po_matching` refuses to compare an invoice against it. Cleared by the
+    # next sync that prices the PO. NULL = no such finding. Migration 0123;
+    # decisions §323.
+    total_unverifiable_reason: Mapped[str | None] = mapped_column(String(40))
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True
@@ -91,6 +119,24 @@ class PurchaseOrder(Base, EntityMixin, TimestampMixin):
     line_items: Mapped[list["POLineItem"]] = relationship(
         back_populates="purchase_order", cascade="all, delete-orphan"
     )
+
+
+#: SQL predicate: this PO's stored figures are ones the ERP still vouches for.
+#: Every aggregate that sums `PurchaseOrder.total` (budget commitments, the
+#: open-PO and GR/IR accrual legs) filters on it and COUNTS what it leaves out,
+#: rather than summing a total the last sync could not confirm (decisions §323,
+#: and §35 for excluded-and-counted).
+PO_TOTAL_VOUCHED = PurchaseOrder.total_unverifiable_reason.is_(None)
+
+
+def po_vouched_money(po: PurchaseOrder, value: Decimal | None) -> Decimal | None:
+    """``value`` — the PO's total or one of its line figures — or ``None``.
+
+    ``None`` while ``total_unverifiable_reason`` is set: the figure came from a
+    sync the ERP has since stopped confirming, so no surface may present it as
+    the PO's (decisions §323). Display paths route every PO money field through
+    this; the reason itself travels beside it so the reader is told why."""
+    return None if po.total_unverifiable_reason else value
 
 
 class POLineItem(Base, TimestampMixin):

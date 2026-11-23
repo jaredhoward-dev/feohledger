@@ -25,7 +25,7 @@ from app.models.expense import (
     PreapprovalStatus,
     ReconciliationStatus,
 )
-from app.models.gl_account import GLAccount
+from app.models.gl_account import GLAccount, GLAccountErpLink
 from app.models.international_tax import IntlTaxRecord, TaxKind
 from app.models.invoice import Invoice, InvoiceExtractionResult, InvoiceLineItem
 from app.models.invoice_embedding import InvoiceEmbedding
@@ -55,9 +55,11 @@ from app.models.provider_credential import ProviderCredential
 from app.models.quality_inspection import QualityInspection
 from app.models.recurring_invoice import RecurringInvoiceTemplate
 from app.models.report_definition import ReportDefinition
+from app.models.sanctions_adjudication import SanctionsAdjudication
 from app.models.sanctions_check import SanctionsCheck
 from app.models.scheduled_report import ScheduledReport
 from app.models.signup import EmailVerification
+from app.models.subprocessor_notice import SubprocessorNotice
 from app.models.supplier_chat import (
     ChatAuthorRole,
     ChatThreadStatus,
@@ -66,7 +68,7 @@ from app.models.supplier_chat import (
 )
 from app.models.tax_filing import Tax1099Filing
 from app.models.user import Role, User, UserRole
-from app.models.vendor import Vendor
+from app.models.vendor import Vendor, VendorErpLink
 from app.models.vendor_change_request import VendorChangeRequest
 from app.models.vendor_priors import VendorExtractionPrior
 from app.models.vendor_statement_recon import (
@@ -79,6 +81,7 @@ from app.models.webauthn_credential import WebAuthnCredential
 from app.models.webhook import WebhookDelivery, WebhookSubscription
 from app.models.workflow import AuditLog, WorkflowDefinition, WorkflowInstance, WorkflowStep
 from app.models.workflow_experiment import WorkflowExperiment
+from app.models.workspace_closure import WorkspaceClosure
 
 __all__ = [
     "Base",
@@ -95,6 +98,8 @@ __all__ = [
     "WebAuthnCredential",
     "WebhookSubscription",
     "WebhookDelivery",
+    "WorkspaceClosure",
+    "SubprocessorNotice",
     # Tenant-scoped models
     "AgentDecision",
     "AuditLog",
@@ -134,6 +139,7 @@ __all__ = [
     "ExpenseReportStatus",
     "ExpenseStatus",
     "GLAccount",
+    "GLAccountErpLink",
     "GoodsReceipt",
     "GRLineItem",
     "IntakeRequest",
@@ -161,6 +167,7 @@ __all__ = [
     "ReportDefinition",
     "RequisitionLineItem",
     "RequisitionStatus",
+    "SanctionsAdjudication",
     "SanctionsCheck",
     "ScheduledReport",
     "SupplierChatMessage",
@@ -168,6 +175,7 @@ __all__ = [
     "Tax1099Filing",
     "Vendor",
     "VendorChangeRequest",
+    "VendorErpLink",
     "VendorExtractionPrior",
     "VendorStatementReconciliation",
     "VendorStatementReconLine",

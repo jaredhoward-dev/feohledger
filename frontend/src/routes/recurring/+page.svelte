@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { RecurringTemplate } from '#lib/types/recurring.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import {
 		RECURRING_STATUSES,
@@ -9,6 +10,7 @@
 		skipReasonKey
 	} from '#lib/types/recurring.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import { ApiError } from '#lib/api.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import {
 		listRecurring,
@@ -23,11 +25,13 @@
 	import type { RecurringTemplateSummary } from '#lib/types/recurring.ts';
 	import { formatCurrencyTotals } from '#lib/utils/currencyGroups.ts';
 	import Badge from '#lib/components/ui/Badge.svelte';
+	import ExplainedBadge from '#lib/components/ui/ExplainedBadge.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
@@ -36,11 +40,14 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
+	import { daysUntil } from './relativeRun.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	const canCreate = $derived(auth.isManager);
 
@@ -63,11 +70,11 @@
 	const COLUMNS = $derived([
 		{ label: m('recurring.col.name') },
 		{ label: m('recurring.col.vendor') },
-		{ label: m('recurring.col.amount'), class: 'right' },
-		{ label: m('recurring.col.cadence') },
-		{ label: m('recurring.col.nextRun') },
-		{ label: m('recurring.col.generated'), class: 'right' },
-		{ label: m('recurring.col.status') },
+		{ label: m('recurring.col.amount'), class: 'right col-amount' },
+		{ label: m('recurring.col.cadence'), class: 'col-cadence' },
+		{ label: m('recurring.col.nextRun'), class: 'col-date' },
+		{ label: m('recurring.col.generated'), class: 'right col-count' },
+		{ label: m('recurring.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -76,14 +83,28 @@
 	// URL-backed filter state (mirrors the contracts page convention).
 	let search = $state(page.url.searchParams.get('search') ?? '');
 	let statusFilter = $state<string>(page.url.searchParams.get('status') ?? 'all');
+	// `gl=off_chart` narrows to templates whose GL code the chart no longer
+	// accepts — the ones generating uncoded invoices until someone re-codes them.
+	let glFilter = $state<string>(
+		page.url.searchParams.get('gl') === 'off_chart' ? 'off_chart' : 'all'
+	);
 
 	let templates = $state<RecurringTemplate[]>([]);
 	let total = $state(0);
 	let pageNum = $state(1);
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// The latest list load failed. `LoadError` replaces the table: clearing the
+	// rows left "No recurring templates match your filters." asserting an empty
+	// list the page never actually received.
+	let loadErrored = $state(false);
 
 	let hasMore = $derived(templates.length < total);
+	// "No templates match your filters" is false with no filter on: a fresh
+	// tenant reads that it filtered something out.
+	let noActiveFilters = $derived(
+		!search.trim() && statusFilter === 'all' && glFilter === 'all'
+	);
 
 	// Modal state: null = create; a RecurringTemplate = detail/edit.
 	let showCreate = $state(false);
@@ -97,8 +118,9 @@
 	// still reads the CURRENT value, so the request carries the live search
 	// term; it just stops the read registering as the caller's dependency.
 	function buildParams() {
-		const params: { status?: string; search?: string } = {};
+		const params: { status?: string; search?: string; gl_off_chart?: boolean } = {};
 		if (statusFilter !== 'all') params.status = statusFilter;
+		if (glFilter === 'off_chart') params.gl_off_chart = true;
 		const currentSearch = untrack(() => search);
 		if (currentSearch.trim()) params.search = currentSearch.trim();
 		return params;
@@ -122,6 +144,14 @@
 			else url.searchParams.delete('status');
 			if (search.trim()) url.searchParams.set('search', search.trim());
 			else url.searchParams.delete('search');
+			if (glFilter === 'off_chart') url.searchParams.set('gl', 'off_chart');
+			else url.searchParams.delete('gl');
+			// `replaceState` never updates `page.url`, so the `?id=` read off it
+			// is the one from the last REAL navigation, even after a close or a
+			// 404 scrubbed it. Owning it from state keeps the next filter
+			// write from putting it back (the same trap /invoices documents).
+			if (deepLinkId) url.searchParams.set('id', deepLinkId);
+			else url.searchParams.delete('id');
 			replaceState(`${url.pathname}${url.search}`, {});
 		});
 	}
@@ -141,7 +171,10 @@
 		// fresh (non-append) list load; its own sequencer guards ordering.
 		if (!opts.append) void loadSummary();
 		if (opts.append) loadingMore = true;
-		else loading = true;
+		else {
+			loading = true;
+			loadErrored = false;
+		}
 		try {
 			const data = await listRecurring({ ...buildParams(), page: nextPage, page_size: PAGE_SIZE });
 			// Superseded by a newer load, or by a local edit.
@@ -153,8 +186,15 @@
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!fetchSequence.isCurrentRequest(token)) return;
-			if (!opts.append) templates = [];
-			toast(e instanceof Error ? e.message : m('recurring.toast.loadFailed'), 'error');
+			// A failed Load-more keeps the rows already shown, so a toast is
+			// enough; a failed list load is stated in place, with a Retry.
+			if (opts.append) {
+				toast(errorMessage(e, m('recurring.toast.loadFailed')), 'error');
+			} else {
+				templates = [];
+				total = 0;
+				loadErrored = true;
+			}
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -192,6 +232,7 @@
 
 	$effect(() => {
 		statusFilter;
+		glFilter;
 		syncUrl();
 		load();
 	});
@@ -205,14 +246,52 @@
 	// until the form is opened.
 
 	// Deep-link: `/recurring?id=<uuid>` opens that template's detail modal.
+	// Read from `page.url` (a deep link arrives by real navigation); the live
+	// value is mirrored into `deepLinkId`, which `syncUrl()` serialises, since
+	// a shallow `replaceState` scrub never reaches `page.url`.
+	let deepLinkId = $state<string | null>(page.url.searchParams.get('id'));
 	let deepLinkLoaded = $state<string | null>(null);
+	// The deep-linked template that could not be fetched for a reason other
+	// than "it does not exist". Only a 404 may say "not found"; a 500 or an
+	// offline backend is a failed load, stated in place with a Retry.
+	let deepLinkFailedId = $state<string | null>(null);
+
+	function openDeepLink(id: string) {
+		deepLinkFailedId = null;
+		getRecurring(id)
+			.then((t) => {
+				// Don't open a modal for a link the user has since left.
+				if (deepLinkId === id) editing = t;
+			})
+			.catch((err) => {
+				if (deepLinkId !== id) return;
+				if (err instanceof ApiError && err.status === 404) {
+					toast(m('recurring.notFound'), 'error');
+					// Nothing will ever open for this id, so drop it from the URL:
+					// left there, Back or a reload re-runs the lookup and re-toasts.
+					deepLinkId = null;
+					syncUrl();
+				} else {
+					deepLinkFailedId = id;
+				}
+			});
+	}
+
 	$effect(() => {
 		const id = page.url.searchParams.get('id');
-		if (!id || deepLinkLoaded === id) return;
-		deepLinkLoaded = id;
-		getRecurring(id)
-			.then((t) => (editing = t))
-			.catch(() => toast(m('recurring.notFound'), 'error'));
+		if (!id) {
+			untrack(() => {
+				deepLinkId = null;
+				deepLinkFailedId = null;
+			});
+			return;
+		}
+		if (untrack(() => deepLinkLoaded) === id) return;
+		untrack(() => {
+			deepLinkId = id;
+			deepLinkLoaded = id;
+			openDeepLink(id);
+		});
 	});
 
 	async function openDetail(t: RecurringTemplate) {
@@ -226,10 +305,12 @@
 	function closeModal() {
 		editing = null;
 		showCreate = false;
-		const url = new URL(page.url.href);
-		if (url.searchParams.has('id')) {
-			url.searchParams.delete('id');
-			replaceState(`${url.pathname}${url.search}`, {});
+		if (deepLinkId) {
+			// Through the single writer, so filters changed since the deep link
+			// arrived survive the close (rebuilding from the frozen `page.url`
+			// reverted them to the ones the link carried).
+			deepLinkId = null;
+			syncUrl();
 			deepLinkLoaded = null;
 		}
 	}
@@ -257,28 +338,44 @@
 	}
 
 	// --- Row lifecycle actions ---
-	let busyId = $state<string | null>(null);
+	type RowActionKind = 'generate' | 'pause' | 'resume' | 'end';
+
+	// One row request at a time, tracked per action: the button that sent it
+	// is `busy` (aria-disabled, so the keyboard user who pressed it keeps
+	// focus — native `disabled` dropped it to <body>) and every other row
+	// action is `disabled` until it settles (component-library.md § RowAction).
+	let inFlight = $state<{ action: RowActionKind; id: string } | null>(null);
+	const isBusy = (action: RowActionKind, id: string) =>
+		inFlight?.action === action && inFlight.id === id;
+	const isHeld = (action: RowActionKind, id: string) =>
+		inFlight !== null && !isBusy(action, id);
 
 	async function runRowLifecycle(
 		t: RecurringTemplate,
+		action: RowActionKind,
 		fn: () => Promise<RecurringTemplate>,
 		successMsg: string,
 		fallback: string
 	) {
-		busyId = t.id;
+		if (inFlight) return;
+		inFlight = { action, id: t.id };
 		try {
 			const updated = await fn();
 			toast(successMsg, 'success');
 			onSaved(updated);
 		} catch (e) {
-			toast(e instanceof Error ? e.message : fallback, 'error');
+			toast(errorMessage(e, fallback), 'error');
 		} finally {
-			busyId = null;
+			inFlight = null;
+			// Disarmed only once the request settles, so a busy End keeps
+			// reading "Confirm" rather than reverting mid-request.
+			confirmEndId = null;
 		}
 	}
 
 	async function generateNow(t: RecurringTemplate) {
-		busyId = t.id;
+		if (inFlight) return;
+		inFlight = { action: 'generate', id: t.id };
 		try {
 			await generateRecurringNow(t.id);
 			toast(m('recurring.toast.generated'), 'success');
@@ -289,9 +386,9 @@
 				/* the toast already confirmed success */
 			}
 		} catch (e) {
-			toast(e instanceof Error ? e.message : m('recurring.toast.generateFailed'), 'error');
+			toast(errorMessage(e, m('recurring.toast.generateFailed')), 'error');
 		} finally {
-			busyId = null;
+			inFlight = null;
 		}
 	}
 
@@ -299,13 +396,14 @@
 	let confirmEndId = $state<string | null>(null);
 
 	async function endTemplate(t: RecurringTemplate) {
+		if (inFlight) return;
 		if (confirmEndId !== t.id) {
 			confirmEndId = t.id;
 			return;
 		}
-		confirmEndId = null;
 		await runRowLifecycle(
 			t,
+			'end',
 			() => endRecurring(t.id),
 			m('recurring.toast.ended'),
 			m('recurring.toast.endFailed')
@@ -322,9 +420,8 @@
 	/** Friendly relative "in 3 days" / "5 days ago" for the next run. */
 	function relativeRun(s: string | null): string {
 		if (!s) return '';
-		const d = new Date(s);
-		if (Number.isNaN(d.getTime())) return '';
-		const days = Math.round((d.getTime() - Date.now()) / 86_400_000);
+		const days = daysUntil(s);
+		if (days === null) return '';
 		if (days === 0) return m('recurring.rel.today');
 		if (days > 0) return m('recurring.rel.inDays', { n: days });
 		return m('recurring.rel.daysAgo', { n: -days });
@@ -337,6 +434,8 @@
 	// normalisation in exact decimal and groups the result by currency —
 	// `formatCurrencyTotals` renders one subtotal per currency, never added. ---
 	let recurringSummary = $state<RecurringTemplateSummary | null>(null);
+	// The first rollup is still out — what `KpiCard pending` announces.
+	let summaryPending = $state(true);
 	const summarySequence = createRequestSequencer();
 
 	async function loadSummary() {
@@ -347,10 +446,28 @@
 			recurringSummary = res;
 		} catch {
 			if (summarySequence.isCurrentRequest(token)) recurringSummary = null;
+		} finally {
+			if (summarySequence.isCurrentRequest(token)) summaryPending = false;
 		}
 	}
 
-	const activeCount = $derived(recurringSummary?.by_status.active ?? 0);
+	// Nullish until the rollup arrives (or when it failed), so `KpiCard` draws
+	// its "no figure" dash: a `0` asserted "no active templates" before, or
+	// without, the server ever saying so.
+	const activeCount = $derived(recurringSummary ? (recurringSummary.by_status.active ?? 0) : null);
+	const offChartCount = $derived(recurringSummary?.gl_off_chart ?? 0);
+	// Offered only while there is something to find (or the filter is already
+	// on, so it can always be turned back off).
+	const showGlFilter = $derived(offChartCount > 0 || glFilter === 'off_chart');
+	const GL_CHIPS = $derived([
+		{ key: 'all', label: m('recurring.glFilter.all') },
+		{
+			key: 'off_chart',
+			label: m('recurring.glFilter.offChart'),
+			count: offChartCount,
+			alert: offChartCount > 0
+		}
+	]);
 	const soonestNextRun = $derived(recurringSummary?.soonest_next_run ?? null);
 	const monthlyGroups = $derived(
 		formatCurrencyTotals(recurringSummary?.monthly_equivalent ?? [])
@@ -364,7 +481,7 @@
 <svelte:window
 	onclick={(e) => {
 		// Un-arm the End confirm when the click lands outside a row action.
-		if (confirmEndId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
+		if (confirmEndId && !inFlight && !(e.target as HTMLElement)?.closest?.('.row-action')) {
 			confirmEndId = null;
 		}
 	}}
@@ -379,13 +496,19 @@
 
 	<!-- KPI row -->
 	<div class="kpi-row">
-		<KpiCard value={activeCount} label={m('recurring.kpi.activeTemplates')} />
 		<KpiCard
-			value={soonestNextRun ? formatDate(soonestNextRun) : '—'}
+			value={activeCount}
+			pending={summaryPending}
+			label={m('recurring.kpi.activeTemplates')}
+		/>
+		<KpiCard
+			value={recurringSummary ? (soonestNextRun ? formatDate(soonestNextRun) : '—') : null}
+			pending={summaryPending}
 			label={m('recurring.kpi.nextRun')}
 		/>
 		<KpiCard
-			value={monthlyRecurringValue ?? '—'}
+			value={recurringSummary ? (monthlyRecurringValue ?? '—') : null}
+			pending={summaryPending}
 			sub={monthlyRecurringRest}
 			label={m('recurring.kpi.monthlyRecurring')}
 			highlight="green"
@@ -396,14 +519,37 @@
 		<SearchBox bind:value={search} placeholder={m('recurring.search.placeholder')} ariaLabel={m('recurring.search.aria')} />
 		<div class="help-row">
 			<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
+			{#if showGlFilter}
+				<FilterChips chips={GL_CHIPS} bind:active={glFilter} />
+			{/if}
 			<HelpTip term="recurring-invoice" />
 		</div>
 	</div>
 
+	{#if deepLinkFailedId}
+		<LoadError
+			message={m('recurring.deepLink.loadFailed')}
+			onretry={() => deepLinkFailedId && openDeepLink(deepLinkFailedId)}
+			testId="recurring-deeplink-error"
+		/>
+	{/if}
+
+	{#if loadErrored}
+		<LoadError
+			message={m('recurring.toast.loadFailed')}
+			onretry={() => load()}
+			testId="recurring-load-error"
+		/>
+	{:else}
+	<div class="recurring-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={!loading && templates.length === 0}
-		empty={loading ? m('common.loading') : m('recurring.empty')}
+		{loading}
+		filtered={!noActiveFilters}
+		emptyFiltered={m('recurring.empty')}
+		empty={m('recurring.empty.fresh')}
 		colspan={8}
 	>
 		{#snippet body()}
@@ -434,7 +580,7 @@
 							<span class="rel">{relativeRun(template.next_run_on)}</span>
 						{/if}
 					</td>
-					<td class="right mono">{template.generated_count}</td>
+					<td class="right mono">{formatCount(template.generated_count)}</td>
 					<td>
 						<!-- The 6px that used to live on `.badge.skipped`'s own margin now
 						     lives on this row: `<Badge>` owns colour and pill metrics, the
@@ -443,18 +589,29 @@
 							<Badge tone={STATUS_TONES[template.status]} variant={template.status}>
 								{statusLabel(template.status)}
 							</Badge>
+							<!-- Each pill names the problem and carries its why as text — a
+							     visually-hidden span, with the tooltip kept for the pointer
+							     user — because a `title` alone reaches neither a keyboard, a
+							     touch screen nor a screen reader (decisions §442, §455). -->
 							{#if template.last_skip}
-								<Badge
+								<ExplainedBadge
 									tone="warning"
 									variant="skipped"
-									title={m('recurring.skip.title', {
+									label={m('recurring.skip.pill')}
+									explanation={m('recurring.skip.title', {
 										n: template.last_skip.consecutive,
 										period: template.last_skip.period_key ?? '—',
 										reason: skipReason(template.last_skip.reason)
 									})}
-								>
-									{m('recurring.skip.pill')}
-								</Badge>
+								/>
+							{/if}
+							{#if template.gl_account_off_chart}
+								<ExplainedBadge
+									tone="warning"
+									variant="gl-off-chart"
+									label={m('recurring.glOffChart.pill', { code: template.gl_account ?? '—' })}
+									explanation={m('recurring.glOffChart.title', { code: template.gl_account ?? '—' })}
+								/>
 							{/if}
 						</span>
 					</td>
@@ -462,7 +619,8 @@
 						{#if canCreate}
 							{#if template.status === 'active'}
 								<RowAction
-									disabled={busyId === template.id}
+									busy={isBusy('generate', template.id)}
+									disabled={isHeld('generate', template.id)}
 									onclick={() => generateNow(template)}
 									ariaLabel={m('recurring.row.generateNowAria', {
 										action: m('recurring.row.generateNow'),
@@ -472,8 +630,9 @@
 									{m('recurring.row.generateNow')}
 								</RowAction>
 								<RowAction
-									disabled={busyId === template.id}
-									onclick={() => runRowLifecycle(template, () => pauseRecurring(template.id), m('recurring.toast.paused'), m('recurring.toast.pauseFailed'))}
+									busy={isBusy('pause', template.id)}
+									disabled={isHeld('pause', template.id)}
+									onclick={() => runRowLifecycle(template, 'pause', () => pauseRecurring(template.id), m('recurring.toast.paused'), m('recurring.toast.pauseFailed'))}
 									ariaLabel={m('recurring.row.pauseAria', { name: template.name })}
 								>
 									{m('recurring.row.pause')}
@@ -481,8 +640,9 @@
 							{:else if template.status === 'paused'}
 								<RowAction
 									variant="success"
-									disabled={busyId === template.id}
-									onclick={() => runRowLifecycle(template, () => resumeRecurring(template.id), m('recurring.toast.resumed'), m('recurring.toast.resumeFailed'))}
+									busy={isBusy('resume', template.id)}
+									disabled={isHeld('resume', template.id)}
+									onclick={() => runRowLifecycle(template, 'resume', () => resumeRecurring(template.id), m('recurring.toast.resumed'), m('recurring.toast.resumeFailed'))}
 									ariaLabel={m('recurring.row.resumeAria', { name: template.name })}
 								>
 									{m('recurring.row.resume')}
@@ -492,7 +652,8 @@
 								<RowAction
 									variant="danger"
 									armed={confirmEndId === template.id}
-									disabled={busyId === template.id}
+									busy={isBusy('end', template.id)}
+									disabled={isHeld('end', template.id)}
 									onclick={() => endTemplate(template)}
 									ariaLabel={m('recurring.row.endAria', { name: template.name })}
 								>
@@ -505,18 +666,18 @@
 			{/each}
 		{/snippet}
 	</DataTable>
-
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={() => load({ append: true })} disabled={loadingMore}>
-				{loadingMore ? m('common.loading') : m('recurring.loadMore', { shown: templates.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('recurring.showingAll', { total })}</span>
-		</div>
+	</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={templates.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		onloadmore={() => load({ append: true })}
+		moreKey="recurring.loadMore"
+		allKey="recurring.showingAll"
+	/>
 </PageHeader>
 
 {#if showCreate}
@@ -528,6 +689,25 @@
 {/if}
 
 <style>
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.recurring-table { min-width: 0; }
+	.recurring-table :global(table) { min-width: 1310px; }
+	.recurring-table :global(th.col-amount) { width: 150px; }
+	.recurring-table :global(th.col-cadence) { width: 150px; }
+	.recurring-table :global(th.col-date) { width: 130px; }
+	.recurring-table :global(th.col-count) { width: 110px; }
+	.recurring-table :global(th.col-status) { width: 180px; }
+	.recurring-table :global(th.actions-col) { width: 330px; }
+
 	/* Page-specific bits; shared design-system CSS lives in app.css. */
 	.filter-row {
 		display: flex;

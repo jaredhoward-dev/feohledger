@@ -336,6 +336,7 @@ async def test_void_records_provider_not_supported_and_still_voids_locally(reald
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("provider_store_from_settings")
 async def test_reconciler_counts_unsupported_provider_as_a_tenant_failure():
     """A tenant the sweep cannot poll must show up as a FAILURE, not as a
     clean pass with zero work.
@@ -588,6 +589,7 @@ async def test_test_erp_endpoint_no_longer_confirms_a_typod_adapter(all_plan_fea
     )
 
     assert res["success"] is False
+    assert (res["code"], res["adapter"]) == ("unknown_adapter", BAD_ERP_TYPE)
     assert BAD_ERP_TYPE in res["message"]
     assert "SECRET" not in res["message"]
 

@@ -1,0 +1,292 @@
+/**
+ * Localizing a refused ERP push — what the invoice modal's ERP panel says when
+ * a send was refused before (or right after) it reached the ERP.
+ *
+ * A refusal lands on the append-only `invoice.erp_failed` audit row twice: as
+ * the server's English (`details.error`, e.g. "QuickBooks Online post refused:
+ * vendor_not_linked") and as `details.refusal = {code, params}`
+ * (`backend/app/services/erp.py::erp_refusal_record`). The code is one of
+ * `backend/app/services/erp_adapters/base.py::ERP_REFUSAL_CODES`; `params`
+ * carries the adapter's `provider` literal and, for `account_not_linked` /
+ * `account_inactive`, the GL `accounts` concerned. A refusal QuickBooks itself
+ * answered with carries Intuit's numeric `intuit_code` too, and the sentences
+ * for an unmapped or unattributed fault name it, so it can be looked up. This module states the code
+ * in the reader's language AND says what to do about it — the English string
+ * is neither, it names a reason code to a person who cannot act on one.
+ *
+ * **Anything this build cannot state → `null`**, and the caller shows the
+ * server's sentence: an unknown code (a newer backend), a row written before
+ * refusals were coded (no `refusal`), a malformed param, or a sentence whose
+ * `refusal` catalogue slice has not loaded yet.
+ *
+ * `erpRefusals.test.ts` reads `ERP_REFUSAL_CODES` out of the backend source and
+ * fails when a code there has no message here, or one here is not there.
+ *
+ * Imports nothing that reaches `$app/*`; the caller passes `m`.
+ */
+import type { MessageKey } from '#lib/i18n/messages.ts';
+import { formatList } from '#lib/utils/list.ts';
+import { resolvedOnly } from '#lib/api/resolvedOnly.ts';
+import { exceptionTypeFallback, exceptionTypeLabelKey } from '#lib/types/exception.ts';
+
+type Translate = (key: MessageKey, params?: Record<string, string | number>) => string;
+type Params = Record<string, unknown>;
+
+/** An open duplicate / fraud exception refused the push before any adapter ran
+ *  (`backend/app/services/erp_export_gate.py`, decisions §286). It names the
+ *  exception TYPE, not a provider, and carries `possibly_posted: true` when an
+ *  earlier attempt may have created the bill anyway. The same code is the 409
+ *  the send doors answer with, which `codedRefusals.ts` states through this
+ *  module. */
+export const EXCEPTION_BLOCKS_ERP_EXPORT = 'exception_blocks_erp_export';
+
+/** FeohLedger is already paying the invoice — a live payment or virtual card —
+ *  so the push was refused before any adapter ran (same module, decisions
+ *  §309). `params.claim` names the rail (`payment` / `virtual_card`), and
+ *  `possibly_posted: true` appears as on the exception refusal. Also a 409 the
+ *  send doors answer with. */
+export const PAYMENT_BLOCKS_ERP_EXPORT = 'payment_blocks_erp_export';
+
+/** The invoice's vendor is one the payment path will not pay — blocked,
+ *  sanctions-held or rejected — so the push was refused before any adapter ran
+ *  (same module). `params.hold` names which, and `possibly_posted: true`
+ *  appears as on the other two. Also a 409 the send doors answer with. */
+export const VENDOR_BLOCKS_ERP_EXPORT = 'vendor_blocks_erp_export';
+
+/** The invoice has no payable currency — blank, whitespace-only or malformed —
+ *  so the push was refused before any adapter ran rather than booked as a bill
+ *  in a guessed one (same module). No params beyond `possibly_posted: true`.
+ *  Also a 409 the send doors answer with. */
+export const CURRENCY_BLOCKS_ERP_EXPORT = 'currency_blocks_erp_export';
+
+/** The sentence per vendor `hold`. A possibly-posted refusal appends one more. */
+const HOLD_KEYS: Record<string, MessageKey> = {
+	payments_blocked: 'erpRefusal.vendorBlocked',
+	sanctions_match: 'erpRefusal.vendorSanctionsMatch',
+	sanctions_review: 'erpRefusal.vendorSanctionsReview',
+	vendor_rejected: 'erpRefusal.vendorRejected',
+	vendor_status_unknown: 'erpRefusal.vendorStatusUnknown'
+};
+
+/** The ERP's shared API quota stopped the call before it was made
+ *  (`backend/app/services/erp_call_budget.py`, decisions §322): a push's
+ *  `invoice.erp_failed` refusal, and the 429 a chart / vendor / PO sync answers
+ *  (`codedRefusals.ts`). `params.reason` says whose allowance ran out. */
+export const ERP_CALL_BUDGET_EXHAUSTED = 'erp_call_budget_exhausted';
+
+/** The sentence per `reason`. */
+const CALL_BUDGET_KEYS: Record<string, MessageKey> = {
+	tenant_budget: 'erpRefusal.callBudgetTenant',
+	subscription_quota: 'erpRefusal.callBudgetQuota',
+	rate_limited: 'erpRefusal.callBudgetRateLimited'
+};
+
+/** The sentence per `claim`, plain and possibly-posted. */
+const CLAIM_KEYS: Record<string, { plain: MessageKey; posted: MessageKey }> = {
+	payment: {
+		plain: 'erpRefusal.paymentBlocksExport',
+		posted: 'erpRefusal.paymentBlocksExportPossiblyPosted'
+	},
+	virtual_card: {
+		plain: 'erpRefusal.cardBlocksExport',
+		posted: 'erpRefusal.cardBlocksExportPossiblyPosted'
+	}
+};
+
+/** The refusals raised outside an adapter, which name no provider. */
+const PROVIDERLESS = new Set([
+	'not_connected',
+	'erp_credentials_unavailable',
+	'invoice_due_before_date'
+]);
+
+/** Pushes `services/erp` failed without an attempt (decisions §428). They name
+ *  no provider, and carry `possibly_posted: true` when an EARLIER attempt may
+ *  have created the bill, so the sentence says to look there before retrying. */
+const UNATTEMPTED = new Set([
+	'erp_retries_exhausted',
+	'erp_push_interrupted',
+	CURRENCY_BLOCKS_ERP_EXPORT
+]);
+
+/** Every code's sentence, each naming `{provider}` unless in `PROVIDERLESS`. */
+const KEYS: Record<string, MessageKey> = {
+	vendor_not_linked: 'erpRefusal.vendorNotLinked',
+	account_not_linked: 'erpRefusal.accountNotLinked',
+	not_connected: 'erpRefusal.notConnected',
+	invoice_due_before_date: 'erpRefusal.invoiceDueBeforeDate',
+	amount_mismatch: 'erpRefusal.amountMismatch',
+	line_amount_missing: 'erpRefusal.lineAmountMissing',
+	posted_total_mismatch: 'erpRefusal.postedTotalMismatch',
+	posted_total_unconfirmed: 'erpRefusal.postedTotalUnconfirmed',
+	previous_bill_removed: 'erpRefusal.previousBillRemoved',
+	tax_not_itemised: 'erpRefusal.taxNotItemised',
+	tax_rate_unresolved: 'erpRefusal.taxRateUnresolved',
+	missing_dates: 'erpRefusal.missingDates',
+	bill_refused: 'erpRefusal.billRefused',
+	duplicate_document_number: 'erpRefusal.duplicateNumber',
+	duplicate_invoice_number: 'erpRefusal.duplicateNumber',
+	doc_number_too_long: 'erpRefusal.docNumberTooLong',
+	currency_unknown: 'erpRefusal.currencyUnknown',
+	currency_not_enabled: 'erpRefusal.currencyNotEnabled',
+	period_closed: 'erpRefusal.periodClosed',
+	vendor_inactive: 'erpRefusal.vendorInactive',
+	account_inactive: 'erpRefusal.accountInactive',
+	reference_invalid: 'erpRefusal.referenceInvalid',
+	company_subscription_inactive: 'erpRefusal.companySubscriptionInactive',
+	intuit_fault: 'erpRefusal.intuitFault',
+	idempotency_lookup_incomplete: 'erpRefusal.idempotencyLookupIncomplete',
+	purchases_not_permitted: 'erpRefusal.purchasesNotPermitted',
+	existing_invoice_not_open: 'erpRefusal.existingInvoiceNotOpen',
+	line_amount_precision: 'erpRefusal.lineAmountPrecision',
+	// Business Central: the bill pays another vendor (decisions §403)
+	pay_to_vendor_differs: 'erpRefusal.payToVendorDiffers',
+	// NetSuite (decisions §398)
+	bill_not_posted: 'erpRefusal.billNotPosted',
+	bill_rejected: 'erpRefusal.billRejected',
+	currency_not_set_up: 'erpRefusal.currencyNotSetUp',
+	currency_not_supported: 'erpRefusal.currencyNotSupported',
+	foreign_currency_supplier: 'erpRefusal.foreignCurrencySupplier',
+	correlation_total_mismatch: 'erpRefusal.correlationTotalMismatch',
+	tax_type_not_resolved: 'erpRefusal.taxTypeNotResolved',
+	tax_mismatch: 'erpRefusal.taxMismatch',
+	tax_not_stated: 'erpRefusal.taxNotStated',
+	subscription_key_missing: 'erpRefusal.subscriptionKeyMissing',
+	ap_account_not_configured: 'erpRefusal.apAccountNotConfigured',
+	currency_not_configured: 'erpRefusal.currencyNotConfigured',
+	currency_mismatch: 'erpRefusal.currencyMismatch',
+	invoice_date_missing: 'erpRefusal.invoiceDateMissing',
+	due_date_missing: 'erpRefusal.dueDateMissing',
+	amount_not_positive: 'erpRefusal.amountNotPositive',
+	job_unconfirmed: 'erpRefusal.jobUnconfirmed',
+	job_failed: 'erpRefusal.jobFailed',
+	[ERP_CALL_BUDGET_EXHAUSTED]: 'erpRefusal.callBudgetTenant',
+	bill_left_unposted: 'erpRefusal.billLeftUnposted',
+	// Merge.dev: waits for a sync after an attempt whose outcome is unknown (decisions §405)
+	merge_sync_pending: 'erpRefusal.mergeSyncPending',
+	erp_credentials_unavailable: 'erpRefusal.credentialsUnavailable',
+	// A push with no attempts left, or stranded with none made (decisions §428)
+	erp_retries_exhausted: 'erpRefusal.retriesExhausted',
+	erp_push_interrupted: 'erpRefusal.pushInterrupted',
+	[EXCEPTION_BLOCKS_ERP_EXPORT]: 'erpRefusal.exceptionBlocksExport',
+	[PAYMENT_BLOCKS_ERP_EXPORT]: 'erpRefusal.paymentBlocksExport',
+	[VENDOR_BLOCKS_ERP_EXPORT]: 'erpRefusal.vendorBlocked',
+	[CURRENCY_BLOCKS_ERP_EXPORT]: 'erpRefusal.currencyBlocksExport',
+	// A FeohLedger payment written back to the ERP (decisions §295)
+	payment_account_not_mapped: 'erpRefusal.paymentAccountNotMapped',
+	bill_not_in_erp: 'erpRefusal.billNotInErp',
+	payment_exceeds_balance: 'erpRefusal.paymentExceedsBalance',
+	bill_payment_voided: 'erpRefusal.billPaymentVoided',
+	// A Xero consent from before `accounting.payments` (decisions §415)
+	payments_scope_missing: 'erpRefusal.paymentsScopeMissing'
+};
+
+/** The sentences that name Intuit's numeric fault code as `{code}`. */
+const NAMES_INTUIT_CODE = new Set(['reference_invalid', 'intuit_fault']);
+
+/** The codes this build states (pinned against the backend registry). */
+export const ERP_REFUSAL_CODES = Object.keys(KEYS);
+
+/** A `{code, params}` refusal as `invoice.erp_failed` records it, or null. */
+export function parseErpRefusal(value: unknown): { code: string; params: Params } | null {
+	if (!value || typeof value !== 'object') return null;
+	const { code, params } = value as Params;
+	if (typeof code !== 'string' || !code) return null;
+	return {
+		code,
+		params: params && typeof params === 'object' && !Array.isArray(params) ? (params as Params) : {}
+	};
+}
+
+/**
+ * The localized, actionable sentence for a recorded refusal, or `null` — then
+ * the caller renders the server's English. Never throws.
+ *
+ * The `erpRefusal.*` sentences live in the PRELOADED `refusal` catalogue slice,
+ * which is not awaited before the first paint, so this reads them through
+ * `resolvedOnly()`: a key `m()` cannot resolve yet makes the whole sentence
+ * `null` and the caller shows the server's sentence or `last_error`, never a
+ * raw key. A caller that renders this from a template or `$derived` re-renders
+ * when the slice lands, since `m()` reads the slice reactively.
+ */
+export function erpRefusalText(value: unknown, t: Translate): string | null {
+	try {
+		return statedRefusal(value, resolvedOnly(t));
+	} catch {
+		return null;
+	}
+}
+
+function statedRefusal(value: unknown, t: Translate): string | null {
+	const refusal = parseErpRefusal(value);
+	if (!refusal) return null;
+	const key = KEYS[refusal.code];
+	if (!key) return null;
+	if (PROVIDERLESS.has(refusal.code)) return t(key);
+	if (UNATTEMPTED.has(refusal.code)) {
+		if (refusal.params.possibly_posted !== true) return t(key);
+		return `${t(key)} ${t('erpRefusal.vendorHoldPossiblyPosted')}`;
+	}
+	if (refusal.code === EXCEPTION_BLOCKS_ERP_EXPORT) {
+		const type = refusal.params.exception_type;
+		if (typeof type !== 'string' || !type.trim()) return null;
+		const label = exceptionTypeLabelKey(type);
+		// An earlier attempt timed out or failed in a way the ERP may still
+		// have applied (`possibly_posted`), so the bill may already be there,
+		// payable from the ERP: say so, and where to look first.
+		const sentence: MessageKey =
+			refusal.params.possibly_posted === true
+				? 'erpRefusal.exceptionBlocksExportPossiblyPosted'
+				: key;
+		return t(sentence, { type: label ? t(label) : exceptionTypeFallback(type) });
+	}
+	if (refusal.code === PAYMENT_BLOCKS_ERP_EXPORT) {
+		const claim = refusal.params.claim;
+		const keys = typeof claim === 'string' ? CLAIM_KEYS[claim] : undefined;
+		if (!keys) return null;
+		return t(refusal.params.possibly_posted === true ? keys.posted : keys.plain);
+	}
+	if (refusal.code === VENDOR_BLOCKS_ERP_EXPORT) {
+		const hold = refusal.params.hold;
+		const plain = typeof hold === 'string' ? HOLD_KEYS[hold] : undefined;
+		if (!plain) return null;
+		// What to do stays first; a possibly-posted refusal adds where to look.
+		if (refusal.params.possibly_posted !== true) return t(plain);
+		return `${t(plain)} ${t('erpRefusal.vendorHoldPossiblyPosted')}`;
+	}
+	// The adapter's fixed literal ("QuickBooks Online"). Every other sentence
+	// names it, so a refusal recorded without one is stated by the server.
+	const provider = refusal.params.provider;
+	if (typeof provider !== 'string' || !provider.trim()) return null;
+
+	if (refusal.code === 'account_not_linked') {
+		const accounts = refusal.params.accounts;
+		if (!Array.isArray(accounts) || !accounts.every((a) => typeof a === 'string' && a)) {
+			return null;
+		}
+		if (accounts.length === 0) return t('erpRefusal.accountNotLinkedUncoded', { provider });
+		return t(key, { provider, accounts: formatList(accounts as string[]) });
+	}
+	if (refusal.code === 'account_inactive') {
+		const accounts = refusal.params.accounts;
+		if (
+			!Array.isArray(accounts) ||
+			accounts.length === 0 ||
+			!accounts.every((a) => typeof a === 'string' && a)
+		) {
+			return null;
+		}
+		return t(key, { provider, accounts: formatList(accounts as string[]) });
+	}
+	if (refusal.code === ERP_CALL_BUDGET_EXHAUSTED) {
+		const reason = refusal.params.reason;
+		const sentence = typeof reason === 'string' ? CALL_BUDGET_KEYS[reason] : undefined;
+		return sentence ? t(sentence, { provider }) : null;
+	}
+	if (NAMES_INTUIT_CODE.has(refusal.code)) {
+		const code = refusal.params.intuit_code;
+		if (typeof code !== 'string' || !/^\d{1,8}$/.test(code)) return null;
+		return t(key, { provider, code });
+	}
+	return t(key, { provider });
+}

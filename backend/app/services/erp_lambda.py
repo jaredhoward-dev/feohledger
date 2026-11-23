@@ -11,7 +11,9 @@ import json
 import uuid
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from app.db_engine import create_async_engine
 
 # `app.tenant_url` imports nothing (bar `os`), so it is safe on this
 # dotenv-free path where `app.database` — which reaches `app.config` — is not.
@@ -29,7 +31,9 @@ def handler(event, context):
 async def _process_message(body: dict) -> None:
     invoice_id = uuid.UUID(body["invoice_id"])
     org_id = uuid.UUID(body["org_id"])
-    actor_id = uuid.UUID(body["actor_id"])
+    # Null when no person started the push (an auto-send after a system
+    # auto-approval, decisions §304).
+    actor_id = uuid.UUID(body["actor_id"]) if body.get("actor_id") else None
 
     db_url = control_url_from_env()
 

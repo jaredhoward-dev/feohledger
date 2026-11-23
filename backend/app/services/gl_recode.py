@@ -32,6 +32,7 @@ would create reconciliation drift with the ERP.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -42,7 +43,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.gl_account import GLAccount
-from app.models.invoice import Invoice, InvoiceStatus
+from app.models.invoice import Invoice
+from app.models.invoice_status import POST_APPROVAL_LOCKED_STATUSES
 from app.models.vendor_priors import VendorExtractionPrior
 from app.services.gl_chart import chart_is_empty
 
@@ -51,18 +53,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Same set as `api/invoices.py:IMMUTABLE_STATUSES`. Keep in sync — the
-# eligibility contract has to match the rest of the bulk-write surface.
-_IMMUTABLE_STATUSES: frozenset[InvoiceStatus] = frozenset(
-    {
-        InvoiceStatus.sending_to_erp,
-        InvoiceStatus.sent_to_erp,
-        InvoiceStatus.posted_in_erp,
-        InvoiceStatus.payment_scheduled,
-        InvoiceStatus.paid,
-        InvoiceStatus.done,
-    }
-)
+# The same set `api/invoices.py:IMMUTABLE_STATUSES` reads — one definition
+# (`models/invoice_status`), so the eligibility contract cannot drift from the
+# rest of the bulk-write surface.
+_IMMUTABLE_STATUSES = POST_APPROVAL_LOCKED_STATUSES
 
 
 class AiRecodeRefused(RuntimeError):
@@ -99,9 +93,14 @@ async def recode_gl_with_ai(
     if not invoice.file_key:
         raise AiRecodeRefused("no document to read")
 
-    config = _resolve_extraction_config(org_settings, announce=False)
+    config = await _resolve_extraction_config(
+        org_settings, organization_id=invoice.organization_id, announce=False
+    )
     file_bytes, _content_type = await _get_object(invoice.file_key)
-    if _detect_structured_format(file_bytes, invoice.file_key) is not None:
+    # The probe opens a PDF to look for a Factur-X attachment: PyMuPDF work,
+    # so it runs on a worker thread (services/pdf_reader).
+    structured = await asyncio.to_thread(_detect_structured_format, file_bytes, invoice.file_key)
+    if structured is not None:
         # A structured e-invoice carries no model suggestion to re-read.
         raise AiRecodeRefused("structured e-invoice")
 

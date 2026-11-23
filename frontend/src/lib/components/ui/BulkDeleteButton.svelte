@@ -3,12 +3,16 @@
 		onconfirm,
 		disabled = false,
 		label = 'Delete',
+		confirmLabel,
 		title = ''
 	}: {
 		onconfirm: () => void;
 		disabled?: boolean;
 		/** Visible label in the unarmed state — defaults to "Delete". */
 		label?: string;
+		/** Label in the armed state. Pass a localized string; the default
+		 *  ("Confirm " + label) is English-only. */
+		confirmLabel?: string;
 		/** Optional native tooltip (e.g. "Cannot delete X — Y"). */
 		title?: string;
 	} = $props();
@@ -34,9 +38,12 @@
 
 <svelte:window onclick={handleWindowClick} />
 
+<!-- `.bulk-delete-btn` is the e2e / outside-click hook; the shared
+     `.btn-danger` (+ `.armed`) paints it, the same box as every other bar
+     button. -->
 <button
 	type="button"
-	class="bulk-delete-btn"
+	class="btn-danger bulk-delete-btn"
 	class:armed
 	{disabled}
 	{title}
@@ -46,7 +53,7 @@
 		<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
 			<polyline points="20 6 9 17 4 12"/>
 		</svg>
-		Confirm {label}
+		{confirmLabel ?? `Confirm ${label}`}
 	{:else}
 		<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
 			<polyline points="3 6 5 6 21 6"/>
@@ -56,36 +63,3 @@
 	{/if}
 </button>
 
-<style>
-	.bulk-delete-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		padding: 5px 12px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.8rem;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-		transition: all 0.15s;
-	}
-
-	.bulk-delete-btn:hover {
-		border-color: var(--danger);
-		color: var(--danger);
-	}
-
-	.bulk-delete-btn.armed {
-		border-color: var(--danger);
-		background: rgba(224, 64, 64, 0.1);
-		color: var(--danger);
-	}
-
-	.bulk-delete-btn:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
-	}
-</style>

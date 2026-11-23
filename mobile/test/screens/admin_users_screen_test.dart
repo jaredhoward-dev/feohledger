@@ -1,58 +1,59 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/admin_users_screen.dart';
 import 'package:feohledger_mobile/stores/admin_user_store.dart';
+import 'package:feohledger_mobile/widgets/load_error_state.dart';
 
 /// Localized host (defaults to `en`) so `AppLocalizations.of(context)` resolves.
 Widget _host(Widget home) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
-      supportedLocales: AppLocalizations.supportedLocales,
-      home: home,
-    );
+  localizationsDelegates: appLocalizationsDelegates,
+  supportedLocales: AppLocalizations.supportedLocales,
+  home: home,
+);
 
 http.Response _json(Object body, [int status = 200]) => http.Response(
-      jsonEncode(body),
-      status,
-      headers: {'content-type': 'application/json'},
-    );
+  jsonEncode(body),
+  status,
+  headers: {'content-type': 'application/json'},
+);
 
 http.Response _users(List<Map<String, dynamic>> items) =>
     _json({'items': items, 'total': items.length, 'page': 1});
 
 http.Response _roles() => _json([
-      {'id': 'r1', 'name': 'admin', 'is_system': true},
-      {'id': 'r2', 'name': 'ap_manager', 'is_system': true},
-      {'id': 'r3', 'name': 'ap_clerk', 'is_system': true},
-      {'id': 'r4', 'name': 'cfo', 'is_system': true},
-    ]);
+  {'id': 'r1', 'name': 'admin', 'is_system': true},
+  {'id': 'r2', 'name': 'ap_manager', 'is_system': true},
+  {'id': 'r3', 'name': 'ap_clerk', 'is_system': true},
+  {'id': 'r4', 'name': 'cfo', 'is_system': true},
+]);
 
 Map<String, dynamic> _userJson(
   String id, {
   String name = 'User',
   bool active = true,
   List<String> roles = const ['ap_clerk'],
-}) =>
-    {
-      'id': id,
-      'email': 'u$id@example.com',
-      'full_name': '$name $id',
-      'is_active': active,
-      'roles': roles.map((r) => {'id': 'role-$r', 'name': r}).toList(),
-      'created_at': '2026-01-01T12:00:00',
-    };
+}) => {
+  'id': id,
+  'email': 'u$id@example.com',
+  'full_name': '$name $id',
+  'is_active': active,
+  'roles': roles.map((r) => {'id': 'role-$r', 'name': r}).toList(),
+  'created_at': '2026-01-01T12:00:00',
+};
 
 MockClient _client(List<Map<String, dynamic>> users) => MockClient((req) async {
-      if (req.url.path.endsWith('/admin/roles')) return _roles();
-      return _users(users);
-    });
+  if (req.url.path.endsWith('/admin/roles')) return _roles();
+  return _users(users);
+});
 
 Future<void> _pumpUntil(WidgetTester tester, Finder finder) async {
   for (var i = 0; i < 20 && finder.evaluate().isEmpty; i++) {
@@ -105,6 +106,14 @@ void main() {
     await tester.pumpWidget(_host(const AdminUsersScreen()));
     await _pumpUntil(tester, find.text('Could not load users'));
 
+    // The shared first-load state, carrying the localized sentence and never
+    // the description the store holds (a bare 500 has no server sentence).
+    expect(find.byType(LoadErrorState), findsOneWidget);
+    expect(AdminUserStore.instance.error, contains('HTTP 500'));
+    expect(find.textContaining('boom'), findsNothing);
+    expect(find.textContaining('ApiException'), findsNothing);
+    expect(find.textContaining('Request failed'), findsNothing);
+
     expect(find.widgetWithText(FilledButton, 'Retry'), findsOneWidget);
   });
 
@@ -138,14 +147,15 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(patchBody, isNotNull);
-    expect(
-      (patchBody!['role_names'] as List).toSet(),
-      {'ap_clerk', 'ap_manager'},
-    );
+    expect((patchBody!['role_names'] as List).toSet(), {
+      'ap_clerk',
+      'ap_manager',
+    });
   });
 
-  testWidgets('create-user flow POSTs the form and refreshes the list',
-      (tester) async {
+  testWidgets('create-user flow POSTs the form and refreshes the list', (
+    tester,
+  ) async {
     Map<String, dynamic>? postBody;
     var created = false;
     ApiClient().debugConfigure(
@@ -155,13 +165,15 @@ void main() {
           created = true;
           return _json({
             ..._userJson('9', name: 'Ada', roles: ['ap_clerk']),
-            'temporary_password': 'Temp-Pass-1234',
+            'set_password_link_expires_at': '2026-11-20T12:00:00Z',
           }, 201);
         }
         if (req.url.path.endsWith('/admin/roles')) return _roles();
         // Before create: only User 1. After: User 1 + the new Ada.
         return _users(
-          created ? [_userJson('1'), _userJson('9', name: 'Ada')] : [_userJson('1')],
+          created
+              ? [_userJson('1'), _userJson('9', name: 'Ada')]
+              : [_userJson('1')],
         );
       }),
     );
@@ -176,9 +188,13 @@ void main() {
 
     // Fill the form and pick a role.
     await tester.enterText(
-        find.widgetWithText(TextFormField, 'Full name'), 'Ada Lovelace');
+      find.widgetWithText(TextFormField, 'Full name'),
+      'Ada Lovelace',
+    );
     await tester.enterText(
-        find.widgetWithText(TextFormField, 'Email'), 'ada@example.com');
+      find.widgetWithText(TextFormField, 'Email'),
+      'ada@example.com',
+    );
     // The role checkbox in the sheet (the same label also appears on a user
     // tile behind the modal, so scope to the CheckboxListTile).
     final clerkCheckbox = find.widgetWithText(CheckboxListTile, 'ap_clerk');
@@ -196,10 +212,15 @@ void main() {
     expect(postBody!['full_name'], 'Ada Lovelace');
     expect((postBody!['role_names'] as List), ['ap_clerk']);
 
-    // The one-time temp password is surfaced for the admin to hand over.
-    expect(find.text('Temp-Pass-1234'), findsOneWidget);
-    await tester.tap(find.widgetWithText(FilledButton, 'Close'));
-    await tester.pumpAndSettle();
+    // No credential is shown: the user was emailed a set-password link, and
+    // the confirmation says so — never a password dialog to hand over.
+    expect(
+      find.text(
+        'Invited Ada 9. We emailed u9@example.com a link to set their password.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.byType(AlertDialog), findsNothing);
 
     // The list refreshed and now shows the new user.
     expect(find.text('Ada 9'), findsOneWidget);
@@ -222,9 +243,13 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.enterText(
-        find.widgetWithText(TextFormField, 'Full name'), 'Ada');
+      find.widgetWithText(TextFormField, 'Full name'),
+      'Ada',
+    );
     await tester.enterText(
-        find.widgetWithText(TextFormField, 'Email'), 'not-an-email');
+      find.widgetWithText(TextFormField, 'Email'),
+      'not-an-email',
+    );
     await tester.tap(find.widgetWithText(FilledButton, 'Create'));
     await tester.pumpAndSettle();
 
@@ -235,8 +260,9 @@ void main() {
     expect(find.text('New user'), findsOneWidget);
   });
 
-  testWidgets('delete-user confirms then DELETEs and refreshes',
-      (tester) async {
+  testWidgets('delete-user confirms then DELETEs and refreshes', (
+    tester,
+  ) async {
     var deleteCalls = 0;
     var deleted = false;
     ApiClient().debugConfigure(

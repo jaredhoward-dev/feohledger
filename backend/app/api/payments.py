@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import case, exists, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,8 @@ from app.api.deps import (
     ROLE_AP_MANAGER,
     ROLE_CFO,
     get_org_id,
+    holds_any_permission,
+    holds_any_role,
     require_permission,
     require_roles,
 )
@@ -44,14 +46,21 @@ from app.models.credit_memo import CreditMemo
 from app.models.exception import Exception as APException
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
-from app.models.payment import Payment, PaymentRun, PaymentSchedule
+from app.models.payment import (
+    LIVE_PAYMENT_TERMINAL_STATUSES,
+    Payment,
+    PaymentRun,
+)
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.models.virtual_card import CardRebate, VirtualCard
 from app.schemas.payment import (
+    RECORD_ONLY_PAYMENT_METHODS,
     PaymentCreate,
+    PaymentListItem,
     PaymentListResponse,
     PaymentResponse,
+    PaymentRunListItem,
     PaymentRunListResponse,
     PaymentRunResponse,
     RecordPaymentOutsideRequest,
@@ -71,6 +80,9 @@ from app.services.currency_conversion import (
     reporting_amount_at_locked_rate,
     resolve_reporting_currency,
 )
+from app.services.discount_opportunities import (
+    capture_discount_offers as _capture_discount_offers,
+)
 from app.services.exception_lifecycle import record_decision
 from app.services.external_payment import (
     ExternalPaymentRefused,
@@ -85,6 +97,7 @@ from app.services.international_payments import (
     normalize_currency_code,
     resolve_home_currency,
 )
+from app.services.invoice_warning_catalog import exception_finding, exception_findings
 from app.services.nacha import MAX_ENTRY_AMOUNT as NACHA_MAX_ENTRY_AMOUNT
 from app.services.nacha import (
     build_nacha_file,
@@ -92,6 +105,7 @@ from app.services.nacha import (
     originator_from_settings,
     originator_problems,
 )
+from app.services.payee_stamp import flag_repayment_payee_change, stamp_payee
 from app.services.payment_adapters import (
     PaymentAdapter,
     PaymentPayload,
@@ -99,15 +113,39 @@ from app.services.payment_adapters import (
     UnknownPaymentProviderError,
     get_payment_adapter,
 )
+from app.services.payment_adapters.base import PENDING_PAYMENT_STATUSES
 from app.services.payment_controls import (
     CFO_REASON_AMOUNT_NOT_EXPRESSIBLE,
     CFO_REASON_THRESHOLD_UNPARSEABLE,
     cfo_approval_decision,
     check_run_segregation,
+    compliance_hold_refusal,
+    payment_settlement_coverage,
+    payment_void_refusal,
+    run_approve_refusal,
+    run_bank_file_applies,
+    run_cancel_refusal,
+    run_execute_refusal,
+    run_nacha_export_refusal,
+    run_nacha_verify_refusal,
+    run_nacha_void_refusal,
+    run_record_outside_refusal,
+    run_retry_failed_refusal,
+    run_sync_erp_refusal,
+    settlement_accept_refusal,
 )
 from app.services.payment_execution_mode import resolve_execution_mode
+from app.services.payment_gates import (
+    INVOICE_LOCKED_DETAIL,
+    INVOICE_LOCKED_REASON,
+    PAYABLE_INVOICE_STATUSES,
+    PAYMENT_BLOCKING_EXCEPTION_TYPES,
+    SCHEDULABLE_INVOICE_STATUSES,
+)
 from app.services.payment_runs import (
     CARD_CLAIM_ONLY_METHOD,
+    CURRENCY_CODE_PATTERN,
+    CURRENCY_TRIM_CHARS,
     PAYABLE_VENDOR_STATUS,
     PaymentRunItemInput,
     active_run_payments,
@@ -125,12 +163,12 @@ from app.services.payment_runs import (
     one_currency,
     payable_amount,
     payable_amounts,
+    payable_currency_code,
     recompute_run_status,
     rollup_payment_statuses,
     run_refusal_reasons,
-    superseded_payment_ids,
 )
-from app.services.payment_settlement import settlement_coverage
+from app.services.payment_schedules import latest_schedules
 from app.services.payment_settlement_record import (
     SettlementCompletion,
     open_settlement_mismatch_exception,
@@ -138,7 +176,6 @@ from app.services.payment_settlement_record import (
 )
 from app.services.provider_credentials import provider_config, settings_with_secrets
 from app.services.workflow_engine import (
-    VALID_TRANSITIONS,
     get_invoice_for_update,
     transition_invoice,
 )
@@ -157,103 +194,21 @@ from app.utils.tenant_urls import tenant_base_url
 
 logger = logging.getLogger(__name__)
 
+
+#: A single payment ``POST /api/payments`` books outside a run, above the org's
+#: CFO-approval threshold, by someone without the CFO role.
+PAYMENT_CFO_REQUIRED = "payment_cfo_required"
+
 router = APIRouter(prefix="/payments", tags=["payments"])
 
-# The invoice statuses a payment may be created against — i.e. an invoice that
-# has cleared AP approval and can directly transition to `payment_scheduled`.
-# `sent_to_erp` is excluded (mid-flight ERP push must reach `posted_in_erp`
-# first); `new`/`pending`/`ready_for_review`/`rejected`/`failed` are pre-approval
-# and must never have money scheduled against them. This is the single source of
-# truth shared by the queue, the run builder, and the standalone payment record,
-# so a payment can't be booked against an unapproved invoice on any path.
-PAYABLE_INVOICE_STATUSES = (
-    InvoiceStatus.approved.value,
-    InvoiceStatus.posted_in_erp.value,
-    InvoiceStatus.payment_scheduled.value,
-)
+# The payable / schedulable invoice statuses, the payment- and ERP-export-blocking
+# exception types and the invoice-locked refusal are owned by
+# `services/payment_gates.py`, imported above.
 
-# Of those, the ones that still need the `→ payment_scheduled` transition once a
-# payment settles. DERIVED from the state machine rather than restated, so it
-# can never name a status `validate_transition` would refuse: a payable status
-# is schedulable exactly when `payment_scheduled` is a legal successor.
-# (`payment_scheduled` itself is payable — a re-attempt — but is already there,
-# and drops out here because it isn't its own successor.) The three dispatch
-# legs used to spell this out as a literal that included `sent_to_erp`, which
-# `VALID_TRANSITIONS` does NOT allow — and the transition runs AFTER the
-# processor accepted the order, so the resulting 409 recorded a settled payment
-# as `failed`. `_execute_single_payment` now refuses a non-payable invoice
-# before the adapter call; this keeps the two facts from drifting apart again.
-SCHEDULABLE_INVOICE_STATUSES = tuple(
-    value
-    for value in PAYABLE_INVOICE_STATUSES
-    if InvoiceStatus.payment_scheduled in VALID_TRANSITIONS.get(InvoiceStatus(value), set())
-)
-
-# Exception classes that block an invoice from entering a payment run while
-# UNRESOLVED (`open`/`escalated`). Every one of them is an `error`-severity
-# financial-integrity flag that approval does NOT gate on — nothing in
-# `services/review.py` or `workflow_engine.py` reads warning severity — so
-# without this gate each could be approved straight past and paid:
-#
-#   duplicate            — the same invoice paid a second time
-#   fraud_flag           — bank-detail swap, rush payment, stat anomaly, an
-#                          altered/never-issued cheque from a Positive Pay return
-#   line_total_mismatch  — the header `amount` a run pays openly disagrees with
-#                          the invoice's own line items (the header is never
-#                          silently recomputed from them — see
-#                          `docs/line-total-reconciliation.md`), so paying it
-#                          would pay a total the lines don't support
-#   payment_reconciliation — the backstop reconciler gave up waiting on a
-#                          `submitted` payment past its max age and marked it
-#                          `failed`. `failed` is in
-#                          `LIVE_PAYMENT_TERMINAL_STATUSES`, so that row stops
-#                          holding the invoice's live-payment slot even though
-#                          real money may still be in flight at the rail. The
-#                          exception is what stops a fresh run paying the same
-#                          invoice a second time until a human has reconciled
-#                          the rail (see `services/payment_reconciler.py`).
-#   quality_hold         — the 4-way leg: the goods failed inspection, were only
-#                          partly accepted, or an inspection the match rule
-#                          requires is not on record. A four-way match exists so
-#                          that failed quality acceptance stops payment; paying
-#                          past it pays for goods the business refused.
-#   po_mismatch          — paying the invoice would pay more than its purchase
-#                          order supports: the cited PO doesn't exist, the
-#                          currencies differ (nothing could be compared), it
-#                          bills ABOVE the PO beyond the match rule's tolerance,
-#                          or it bills beyond the share of the PO actually
-#                          received. Only those raise one
-#                          (`invoice_warnings._refresh_po_match`): billing LESS
-#                          than the PO (a split / blanket PO invoiced delivery by
-#                          delivery), an in-tolerance variance and an
-#                          over-receipt on its own (decisions §67) stay warnings
-#                          on the invoice and never hold it. A refresh that no
-#                          longer finds the problem closes the row again. Same
-#                          rule as an ERP's price/quantity variance payment
-#                          block.
-#
-# Resolving/dismissing the exception is the human sign-off that clears it. The
-# same tuple also scopes segregation of duties on that sign-off
-# (`services/exception_lifecycle.segregation_refusal`): someone implicated in
-# creating the invoice may not clear a flag that blocks its payment.
-#
-# Order is the precedence a row's `blocked_reason` reports when an invoice
-# carries several (`services/payment_runs.blocking_exception_types`).
-PAYMENT_BLOCKING_EXCEPTION_TYPES = (
-    "duplicate",
-    "fraud_flag",
-    "line_total_mismatch",
-    "payment_reconciliation",
-    "quality_hold",
-    "po_mismatch",
-)
-
-# Terminal payment states — a payment in one of these no longer represents a
-# LIVE claim on its invoice, so the "one live payment per invoice" idempotency
-# invariant (both the app-level guard and the `uq_payments_one_live_per_invoice`
-# partial index) excludes them. A void hands the invoice back to `approved` to
-# be re-paid; a failed / cancelled attempt must not block a fresh one.
-LIVE_PAYMENT_TERMINAL_STATUSES = ("voided", "failed", "cancelled")
+# Terminal payment states (no longer a LIVE claim on the invoice) are defined
+# once, beside the partial index that enforces them:
+# `models/payment.LIVE_PAYMENT_TERMINAL_STATUSES`, imported above and
+# re-exported for the callers that already read it from this module.
 
 
 #: `detail.code` of the refusal a record-only tenant gets from every
@@ -468,6 +423,51 @@ def _payment_list_filters(
     return query
 
 
+def _verdict(permitted: bool, refusal) -> dict | None:
+    """An action verdict: the coded ``role_not_permitted`` when the endpoint's
+    permission dependency would refuse, else the gate's coded refusal or
+    ``None``."""
+    from app.api.refusals import role_not_permitted
+
+    if not permitted:
+        return role_not_permitted()
+    return refusal.verdict() if refusal is not None else None
+
+
+def payment_row_verdicts(payment: Payment, invoice: Invoice | None, user: User) -> dict:
+    """What the History row's four actions would answer ``user``, each the
+    endpoint's permission (``holds_any_permission``, the predicate
+    ``require_permission`` enforces) then the gate it raises from:
+
+    * ``void_refusal`` — ``POST /{id}/void``: ``payment.void`` +
+      ``payment_controls.payment_void_refusal``;
+    * ``release_refusal`` — ``POST /{id}/compliance/release``:
+      ``payment.execute`` + ``payment_controls.compliance_hold_refusal``;
+    * ``dismiss_refusal`` — ``POST /{id}/compliance/dismiss``:
+      ``payment.void`` + the same hold gate;
+    * ``accept_settlement_refusal`` — ``POST /{id}/settlement/accept``:
+      ``payment.execute`` + ``payment_controls.settlement_accept_refusal`` over
+      ``invoice``, the invoice the payment pays (``None`` when it is gone).
+
+    Release also refuses on a record-only tenant (``payments_record_only``) —
+    org configuration the page reads once from ``GET /execution-mode``, not a
+    row property.
+    """
+    may_void = holds_any_permission(user, {PERM_PAYMENT_VOID})
+    return {
+        "void_refusal": _verdict(may_void, payment_void_refusal(payment)),
+        "release_refusal": _verdict(
+            holds_any_permission(user, {PERM_PAYMENT_EXECUTE}),
+            compliance_hold_refusal(payment, "release"),
+        ),
+        "dismiss_refusal": _verdict(may_void, compliance_hold_refusal(payment, "dismiss")),
+        "accept_settlement_refusal": _verdict(
+            holds_any_permission(user, {PERM_PAYMENT_EXECUTE}),
+            settlement_accept_refusal(payment, invoice),
+        ),
+    }
+
+
 @router.get("", response_model=PaymentListResponse)
 async def list_payments(
     pagination: PaginationParams = Depends(pagination_params),
@@ -533,7 +533,16 @@ async def list_payments(
     rows = result.all()
 
     return PaymentListResponse(
-        items=[PaymentResponse.from_db(p, inv, card) for p, inv, card in rows],
+        items=[
+            PaymentListItem(
+                **PaymentResponse.from_db(p, inv, card).model_dump(),
+                # What void / release / dismiss / accept-settlement would
+                # answer the caller: each endpoint's permission, then the gate
+                # it raises from.
+                **payment_row_verdicts(p, inv, user),
+            )
+            for p, inv, card in rows
+        ],
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
@@ -579,6 +588,15 @@ def _queue_vendor_not_active():
             Vendor.status.is_distinct_from(PAYABLE_VENDOR_STATUS),
         )
     )
+
+
+def _queue_currency_unknown():
+    """SQL predicate — the invoice records no payable currency (NULL, blank,
+    whitespace-only or malformed), the SAME condition
+    ``services/payment_runs.payable_currency_code`` refuses as
+    ``currency_unknown``: one trim set and one pattern, shared."""
+    trimmed = func.coalesce(func.btrim(Invoice.currency, CURRENCY_TRIM_CHARS), "")
+    return not_(trimmed.op("~")(CURRENCY_CODE_PATTERN))
 
 
 def _live_payment_invoice_ids():
@@ -661,6 +679,7 @@ def _queue_selectable_where() -> list:
         *_queue_base_where(),
         not_(_queue_blocking_exists()),
         not_(_queue_vendor_not_active()),
+        not_(_queue_currency_unknown()),
         not_(applied_credit_conflict_exists()),
         not_(_queue_fully_credited()),
         not_(_queue_live_card_exists()),
@@ -684,6 +703,7 @@ def _queue_blocked_on_every_rail():
     clauses = [
         _queue_blocking_exists(),
         _queue_vendor_not_active(),
+        _queue_currency_unknown(),
         applied_credit_conflict_exists(),
         _queue_fully_credited(),
     ]
@@ -704,7 +724,7 @@ async def _payment_queue_rollup(
 
     Grouped by the invoice's own currency and rolled to the org reporting
     currency **in SQL** — the CASE expressions mirror
-    ``currency_conversion.reporting_amount_for_row`` exactly as ``api/dashboard``
+    ``currency_conversion.reporting_amount_for_row`` exactly as ``services/dashboard_metrics``
     does — so a paginated queue never loses its KPI-bar totals or its
     blocked / early-pay-savings banners to "just this page". ``selectable_only``
     excludes rows a payment run would refuse (the set "select all matching"
@@ -759,25 +779,30 @@ async def _payment_queue_rollup(
     # half-away-from-zero; the Python side passes `ROUND_HALF_UP` explicitly to
     # match it, because `Decimal.quantize`'s default (ROUND_HALF_EVEN) made the
     # two disagree on a genuine half-cent.
+    #
+    # Joined to the invoice's CURRENT schedule only
+    # (`payment_schedules.latest_schedules`): a bare join to the table summed
+    # an invoice's discount once per schedule row it carried.
+    sched = latest_schedules()
     disc_where = [
         *where,
-        PaymentSchedule.discount_date.isnot(None),
-        PaymentSchedule.discount_date >= today,
-        PaymentSchedule.discount_percent.isnot(None),
+        sched.discount_date.isnot(None),
+        sched.discount_date >= today,
+        sched.discount_percent.isnot(None),
     ]
     disc_agg = apply_entity_scope(
         select(
             cur_key.label("cur"),
             func.coalesce(
-                func.sum(func.round(Invoice.amount * PaymentSchedule.discount_percent / 100, 2)),
+                func.sum(func.round(Invoice.amount * sched.discount_percent / 100, 2)),
                 0,
             ).label("save"),
             func.coalesce(
-                func.sum(func.round(rep_expr * PaymentSchedule.discount_percent / 100, 2)), 0
+                func.sum(func.round(rep_expr * sched.discount_percent / 100, 2)), 0
             ).label("save_rep"),
         )
         .select_from(Invoice)
-        .join(PaymentSchedule, PaymentSchedule.invoice_id == Invoice.id)
+        .join(sched, sched.invoice_id == Invoice.id)
         .where(*disc_where)
         .group_by(cur_key),
         Invoice,
@@ -809,7 +834,8 @@ async def _payment_queue_rollup(
                 "total_savings": str(save.quantize(q2)),
             }
         )
-    by_currency.sort(key=lambda e: e["currency"])
+    # The unknown-currency group (`None`, decisions §473) sorts last.
+    by_currency.sort(key=lambda e: (e["currency"] is None, e["currency"] or ""))
     return {
         "total": total,
         "total_amount": str(total_amount.quantize(q2)),
@@ -818,6 +844,112 @@ async def _payment_queue_rollup(
         "unconverted_count": unconverted_count,
         "by_currency": by_currency,
     }
+
+
+async def _queue_blocking_exceptions(
+    db: AsyncSession, invoices: list[Invoice], user: User, org_settings: dict | None
+) -> dict[uuid.UUID, dict]:
+    """``{invoice_id: {id, exception_type, clear_refusal}}`` for the page's rows
+    an open payment-blocking exception holds, in ONE query.
+
+    The exception picked per invoice is the one ``payment_runs.
+    blocking_exception_types`` names (earliest type in
+    ``PAYMENT_BLOCKING_EXCEPTION_TYPES``, then oldest), so the link always
+    leads to the exception the row's ``blocked_reason`` already names.
+    ``clear_refusal`` is ``exception_lifecycle.segregation_refusal``'s code for
+    THIS caller resolving it — the predicate ``record_decision`` raises from —
+    so the banner can say a colleague must clear it instead of leaving the
+    uploader to find that out from a 403. PII-free: ids, a type, a code.
+    """
+    from app.services.exception_lifecycle import (
+        needs_approval_chain,
+        segregation_refusal,
+        workflow_instances_for,
+    )
+
+    by_id = {inv.id: inv for inv in invoices}
+    if not by_id:
+        return {}
+    rows = (
+        (
+            await db.execute(
+                select(APException)
+                .where(
+                    APException.invoice_id.in_(list(by_id)),
+                    APException.exception_type.in_(PAYMENT_BLOCKING_EXCEPTION_TYPES),
+                    APException.status.notin_(("resolved", "dismissed")),
+                )
+                .order_by(APException.created_at.asc(), APException.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    rank = {t: i for i, t in enumerate(PAYMENT_BLOCKING_EXCEPTION_TYPES)}
+    chosen: dict[uuid.UUID, APException] = {}
+    for exc in rows:
+        best = chosen.get(exc.invoice_id)
+        if best is None or rank[exc.exception_type] < rank[best.exception_type]:
+            chosen[exc.invoice_id] = exc
+    # The approver axis reads each held invoice's workflow chain (decisions
+    # §420): one query, for the `po_mismatch` / `quality_hold` rows only.
+    instances = await workflow_instances_for(
+        db,
+        [by_id[i] for i, exc in chosen.items() if needs_approval_chain(exc, by_id[i])],
+    )
+    return {
+        inv_id: {
+            "id": str(exc.id),
+            "exception_type": exc.exception_type,
+            "clear_refusal": segregation_refusal(
+                exc,
+                by_id[inv_id],
+                user.id,
+                action="resolve",
+                org_settings=org_settings,
+                instance=instances.get(inv_id),
+            ),
+        }
+        for inv_id, exc in chosen.items()
+    }
+
+
+async def _queue_erp_reported_payments(
+    db: AsyncSession, invoice_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, dict]:
+    """``{invoice_id: what the ERP reported}`` for rows holding a live
+    ``paid_not_recorded`` exception — the newest one per invoice. The fields
+    the "Record as paid" dialog pre-fills, the exception's id, and what it
+    shows beside them as ``/exceptions`` does (decisions §413, §426): the cash
+    the ERP states in the code it stated, its rail-by-rail breakdown as kept,
+    and ``split_stands``, the server's verdict on that breakdown
+    (``erp_status_sync.kept_split_stands``, the one the exception row carries
+    as ``erp_payment_split_stands``). Where it is true, the dialog books
+    through the row's one-click, since ``record-outside`` refuses
+    (``external_payment_erp_split``)."""
+    from app.services.erp_status_sync import (
+        erp_product_name,
+        kept_split_stands,
+        live_erp_paid_reports,
+    )
+
+    out: dict[uuid.UUID, dict] = {}
+    for exc in await live_erp_paid_reports(db, invoice_ids):
+        if exc.invoice_id in out:
+            continue  # newest first; the first seen is the latest report
+        report = exc.erp_report or {}
+        out[exc.invoice_id] = {
+            "exception_id": str(exc.id),
+            "erp_name": erp_product_name(report.get("erp_type")),
+            "method": report.get("method"),
+            "reference": report.get("reference"),
+            "paid_on": report.get("paid_on"),
+            "amount": report.get("amount"),
+            "amount_currency": report.get("amount_currency"),
+            "payment_parts": report.get("payment_parts"),
+            "split_stands": kept_split_stands(report),
+        }
+    return out
 
 
 @router.get("/queue")
@@ -869,10 +1001,15 @@ async def payment_queue(
     # `services/analytics`, `discount_optimizer` and `cash_flow_alerts` answer.
     today = utc_today()
 
+    # The invoice's CURRENT schedule, at most one per invoice
+    # (`payment_schedules.latest_schedules`). A bare outer join to the table
+    # listed an invoice once per schedule row — twice on one page, and the
+    # duplicate shifted every later page's offset away from `total`.
+    current_schedule = latest_schedules()
     page_q = (
         apply_entity_scope(
-            select(Invoice, PaymentSchedule)
-            .outerjoin(PaymentSchedule, PaymentSchedule.invoice_id == Invoice.id)
+            select(Invoice, current_schedule)
+            .outerjoin(current_schedule, current_schedule.invoice_id == Invoice.id)
             .where(*_queue_base_where()),
             Invoice,
             entity_id,
@@ -904,6 +1041,12 @@ async def payment_queue(
     # from `discount_*` below, which is the invoice's STATIC term ("2/10 net
     # 30") on its payment schedule and is only ever advisory.
     payables = await payable_amounts(db, [inv for inv, _ in rows], pay_date=today)
+    # Which exception blocks each row, so the page can NAME it, link to it and
+    # say whether this caller may clear it — and what the ERP reported for a
+    # row whose ERP payment could not be recorded, so "Record as paid" opens
+    # pre-filled with it (decisions §319).
+    blockers = await _queue_blocking_exceptions(db, [inv for inv, _ in rows], user, org.settings)
+    erp_reports = await _queue_erp_reported_payments(db, [inv.id for inv, _ in rows])
 
     items: list[dict] = []
     for inv, sched in rows:
@@ -989,6 +1132,21 @@ async def payment_queue(
                 "record_outside_refusal": (
                     record_refusals[inv.id].code if inv.id in record_refusals else None
                 ),
+                # The open payment-blocking exception behind `blocked_reason` /
+                # an `external_payment_blocking_exception` refusal: its id (to
+                # link to), its type, and the caller's own verdict on clearing
+                # it — a segregation-of-duties code when they may not (the
+                # uploader of the invoice, say), so the page can say a
+                # colleague must. `None` when nothing blocks the row.
+                "blocking_exception": blockers.get(inv.id),
+                # The payment the ERP reported for this invoice and FeohLedger
+                # could not record, or `None`: rail, reference and paid-on date
+                # straight from the open `paid_not_recorded` exception, with
+                # its stated figure and split. A row whose split stands is NOT
+                # folded into `record_outside_refusal`: the queue's "Record as
+                # paid" books it through that row's one-click instead of
+                # `record-outside` (decisions §426), so the action stays offered.
+                "erp_reported_payment": erp_reports.get(inv.id),
             }
         )
 
@@ -1104,12 +1262,9 @@ async def payment_queue_ids(
     }
 
 
-#: Payment statuses whose money is committed but not yet settled — what
-#: `/summary` reports as `total_pending`. `pending_compliance` belongs here:
-#: the payment is authorized and waiting on a human, so leaving it out made
-#: held money appear in NEITHER KPI (not paid, not pending) — invisible in the
-#: one place a treasurer looks for "what is still out there".
-PENDING_PAYMENT_STATUSES = ("pending", "processing", "submitted", "pending_compliance")
+#: `PENDING_PAYMENT_STATUSES` (committed, not yet settled) lives beside the
+#: other payment-status sets in `services/payment_adapters/base`, so services
+#: such as the dashboard read it without importing this router.
 
 
 @router.get("/summary")
@@ -1295,6 +1450,15 @@ async def compare_corridor_quotes(
         # Same opaque 404 an out-of-scope id gets everywhere else in this file,
         # so the response can't enumerate another entity's invoices.
         raise HTTPException(status_code=404, detail="Invoice not found")
+    quote_currency = normalize_currency_code(invoice.currency)
+    if quote_currency is None:
+        # No recorded currency means nothing to price: quoting it as USD would
+        # rank routes for a payment nobody can make (the run builder refuses
+        # it as `currency_unknown`).
+        raise HTTPException(
+            status_code=409,
+            detail="currency_unknown: the invoice records no currency — set it before quoting",
+        )
 
     vendor_bank: dict | None = None
     if invoice.vendor_id:
@@ -1311,7 +1475,7 @@ async def compare_corridor_quotes(
         invoice_number=invoice.invoice_number or "",
         vendor_name=invoice.vendor_name or "",
         amount=invoice.amount or Decimal("0"),
-        currency=(invoice.currency or "USD").upper(),
+        currency=quote_currency,
         method=(body.method or "ach").strip().lower(),
         description=invoice.description,
         vendor_bank=vendor_bank,
@@ -1670,13 +1834,11 @@ async def void_payment(
     # transitions it (`_lock_payment_invoice`).
     payment = await _get_scoped_payment(db, payment_id, entity_id, for_update=True)
 
-    if payment.status in ("voided", "cancelled"):
-        raise HTTPException(status_code=409, detail=f"Payment already {payment.status}")
-    if payment.status == "failed":
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot void a failed payment (it never settled)",
-        )
+    # Only money that has left, or is leaving, the rail — the ONE definition the
+    # History list's `void_refusal` is read from (`payment_void_refusal`).
+    refusal = payment_void_refusal(payment)
+    if refusal is not None:
+        raise refusal.http()
 
     # Bounded: refused before the processor is asked to reverse anything, so a
     # 409 here leaves the payment exactly as it was (the request rolls back).
@@ -1756,6 +1918,15 @@ async def void_payment(
             action_name="invoice.voided_return_to_approved",
             details={"void_reason": body.reason, "payment_id": str(payment.id)},
         )
+        # Back in the queue, and a re-payment pays whoever the invoice names
+        # NOW. A vendor merge since this payment moved the invoice to another
+        # vendor, or a bank change re-pointed its vendor's account, and neither
+        # could flag it while it was paid: compare the payee this payment
+        # recorded and raise the blocking flag, stamped with whoever changed it
+        # (decisions §286, §383).
+        await flag_repayment_payee_change(
+            db, invoice=invoice, payment=payment, organization_id=org.id
+        )
 
     from app.services.audit_dispatch import dispatch_audit
 
@@ -1815,7 +1986,26 @@ async def void_payment(
 
     await _recompute_parent_run_status(db, payment)
 
+    # Decisions §295. A payment the ERP REPORTED goes back to `approved` while
+    # the ERP still shows the bill paid: hold it out of the runs until a person
+    # confirms. A settled FeohLedger payment may have been written back as a
+    # payment of its bill: record the pending ERP void in this transaction, so
+    # the status-sync sweep resumes it if the process dies before the task runs.
+    void_in_erp = False
+    if invoice is not None and previous_status == "completed":
+        from app.services.erp_payment_writeback import record_pending_erp_void
+        from app.services.erp_status_sync import flag_void_of_erp_reported_payment
+
+        await flag_void_of_erp_reported_payment(db, invoice=invoice, payment=payment, org_id=org.id)
+        void_in_erp = await record_pending_erp_void(db, invoice=invoice, payment=payment)
+
     await db.commit()
+    if void_in_erp:
+        # After the commit and off the response; a failure opens an
+        # `erp_reconciliation` exception rather than touching this void.
+        from app.services.erp_payment_writeback import dispatch_void_writeback
+
+        dispatch_void_writeback(org.id, payment.id)
     await db.refresh(payment)
     resp = PaymentResponse.from_db(payment, invoice)
     # Surface the two best-effort legs' outcomes so the operator (and the void
@@ -1944,8 +2134,17 @@ async def _lock_payment_invoice(db: AsyncSession, payment: Payment) -> Invoice |
     (`/compliance/release` loads it first, and `_dispatch_run_payments` keeps
     one session across many payments with `expire_on_commit=False`): without
     it the locked SELECT would hand back the cached row and its stale status.
-    Lock order is payment, then invoice — every caller already holds the
-    payment's lock, and no path takes them the other way round.
+    Lock order here is payment, then invoice — every caller already holds the
+    payment's lock. Recording a payment made outside FeohLedger takes them the
+    other way round: `POST /record-outside` (`services/external_payment`, the
+    invoice `FOR UPDATE`, then its live payments `FOR UPDATE`) and
+    `POST /runs/{id}/record-outside` (run, then its invoices, then its
+    payments). They cannot deadlock with a caller of this function for long,
+    because THIS wait is the bounded one (below): a caller holding the payment
+    gives up on the invoice with `InvoiceLockedError` — a 409 on the request
+    paths, the retry-safe `invoice_locked` refusal in the dispatch loop — having
+    sent nothing, and the recording then proceeds. (The NACHA export locks the
+    run and its invoices but no payment row, so it shares no cycle with this.)
 
     `FOR NO KEY UPDATE` (`key_share=True`), not `FOR UPDATE`: it still conflicts
     with every status writer (`get_invoice_for_update`'s `FOR UPDATE` and plain
@@ -1990,16 +2189,6 @@ class InvoiceLockedError(Exception):
     compliance release) answer `409` and change nothing."""
 
 
-#: `Payment.failure_reason` for a dispatch refused because the invoice row was
-#: locked past the bound. Retry-safe (`payment_runs._RETRY_SAFE_FAILURE_PREFIXES`).
-INVOICE_LOCKED_REASON = "invoice_locked"
-
-#: The 409 body every request path answers with for the same refusal.
-INVOICE_LOCKED_DETAIL = (
-    "invoice_locked: the invoice is being changed by another request — nothing "
-    "was sent to the processor; retry in a moment"
-)
-
 #: `Payment` columns that describe the ORDER sent to the processor. The FX leg
 #: writes them just before the adapter call (the corridor can change `method`,
 #: the rate lock fills the rest), so a recovery that rolls the attempt back has
@@ -2012,6 +2201,12 @@ _ORDER_FIELDS = (
     "fx_locked_at",
     "corridor",
     "target_country",
+    # Who the order pays (migration 0128, decisions §383): restored with the
+    # rest, so a payment whose order reached the processor keeps the payee it
+    # was sent to even when a database error rolled the attempt back.
+    "payee_vendor_id",
+    "payee_bank_fingerprint",
+    "payee_recorded_at",
 )
 
 #: `failure_reason` prefixes for a dispatch whose database transaction aborted.
@@ -2176,18 +2371,164 @@ async def _flag_in_doubt_dispatch(db: AsyncSession, *, org_id: uuid.UUID, paymen
         db,
         organization_id=org_id,
         payment=payment,
-        description=(
-            f"Payment {payment.id} failed during dispatch "
-            f"({payment.failure_reason}) after the processor may already have "
-            f"accepted it, so the money may or may not have moved. Confirm with "
-            f"the processor and void or re-pay — this invoice is blocked from a "
-            f"new payment run until this is resolved."
+        # `failure_reason` here is the machine `<prefix>:<ExceptionClass>` the
+        # caller just wrote, never free text.
+        finding=exception_finding(
+            "payment_dispatch_in_doubt",
+            paymentId=payment.id,
+            failureCode=payment.failure_reason,
         ),
         log_tag="payment-dispatch",
     )
 
 
+async def _flag_if_dispatch_in_doubt(
+    db: AsyncSession, *, org_id: uuid.UUID, payment: Payment
+) -> None:
+    """Flag ``payment``'s invoice for reconciliation when the row leaves the
+    live-payment slot still carrying a dispatch marker.
+
+    A row keeps `dispatch_attempted_at` only when an earlier dispatch pass may
+    have reached the processor without recording what happened
+    (`_dispatch_payment_guarded`). `failed` / `cancelled` free the invoice's
+    live-payment slot, so without a payment-blocking flag a fresh run would pay
+    the invoice again under a new idempotency key. The one rule for every
+    writer that can move a stamped row there: the dispatch outcome, the run
+    loop's `invoice_locked` refusal, and `/compliance/dismiss`.
+    """
+    if payment.dispatch_attempted_at is None:
+        return
+    if payment.status not in RETRYABLE_PAYMENT_STATUSES:
+        return
+    from app.services.payment_reconciler import flag_payment_for_reconciliation
+
+    # PII-free: the status only, never `failure_reason` (a dismissal's carries
+    # the operator's free-text note). The status is a word, so it picks the code.
+    await flag_payment_for_reconciliation(
+        db,
+        organization_id=org_id,
+        payment=payment,
+        finding=(
+            exception_finding("payment_dispatch_interrupted_failed", paymentId=payment.id)
+            if payment.status == "failed"
+            else exception_finding("payment_dispatch_interrupted_cancelled", paymentId=payment.id)
+        ),
+        log_tag="payment-dispatch",
+    )
+
+
+async def _mark_dispatch_attempt(
+    db: AsyncSession, *, payment: Payment, expected_status: str
+) -> bool | None:
+    """Stamp `Payment.dispatch_attempted_at` and COMMIT it, then re-take the
+    payment's row lock. Returns whether the row already carried a stamp when
+    this attempt began, or ``None`` when another dispatcher claimed the row in
+    the gap the commit opens (skip it — its outcome is theirs to record).
+
+    Why a commit, and why here. The marker exists for the case where a pass
+    calls the processor and the process dies before the per-payment commit:
+    everything that pass wrote is lost, so the only record that it may have
+    reached the processor is one committed BEFORE the call. Nothing else can
+    carry it. A second connection cannot write the row (this transaction holds
+    its `FOR UPDATE` lock, so it would wait on us forever), and a savepoint is
+    not durable. So the stamp is the first write of the attempt and is
+    committed on its own, at the one moment the commit costs nothing: the
+    caller holds only the payment's row lock and has written nothing else, and
+    the invoice lock, every gate and the processor call all come after. The
+    commit does release the payment lock, so it is re-taken and re-checked: the
+    row must still read ``expected_status`` and still carry THIS stamp. A
+    concurrent dispatcher (two `/resume`s, a `/resume` racing `/execute`) that
+    got in between has re-stamped it, so the stamp comparison makes exactly one
+    of them proceed. Each stamp is taken under the row lock and forced past the
+    one it replaces, so a re-stamp always differs from the stamp it overwrote,
+    whatever two hosts' clocks say.
+
+    Callers hold the payment's row lock and have checked ``expected_status``;
+    the session uses `expire_on_commit=False`, so the caller's other loaded
+    instances survive the commit unexpired.
+    """
+    previous = payment.dispatch_attempted_at
+    previously_marked = previous is not None
+    stamp = datetime.now(UTC)
+    if previous is not None and stamp <= previous:
+        stamp = previous + timedelta(microseconds=1)
+    payment.dispatch_attempted_at = stamp
+    await db.commit()
+    await db.refresh(payment, with_for_update=True)
+    if payment.status != expected_status or payment.dispatch_attempted_at != stamp:
+        return None
+    return previously_marked
+
+
 async def _dispatch_payment_guarded(
+    db: AsyncSession,
+    *,
+    payment: Payment,
+    org: Organization,
+    adapter,
+    user: User,
+    now: datetime,
+    expected_status: str,
+    context: str,
+) -> tuple[bool, bool]:
+    """Dispatch one payment with a durable in-doubt marker round the attempt.
+
+    Every dispatch — `/execute`, `/resume`, `/retry-failed` (through the run
+    loop) and `/compliance/release` — comes through here. It stamps and commits
+    `Payment.dispatch_attempted_at` first (`_mark_dispatch_attempt`), runs the
+    attempt (`_dispatch_payment_attempt`), and clears the stamp in the same
+    transaction that records the attempt's outcome. A crash between the two
+    therefore leaves the row stamped, and `payment_runs.classify_payment_failure`
+    reads a stamped row as IN_DOUBT whatever reason a later pass writes onto it.
+
+    The stamp is cleared only when the row was UNSTAMPED when this attempt
+    began: then no earlier pass can have reached the processor without leaving
+    one, and this attempt's own outcome — reason, `provider_payment_id` — is
+    the whole story and classes as it always did. A row that was already
+    stamped keeps it for good. If such a row ends `failed`, it is also flagged
+    for reconciliation (`_flag_in_doubt_dispatch`), because `failed` frees the
+    invoice's live-payment slot and a fresh run would otherwise pay it again
+    under a new idempotency key.
+
+    `InvoiceLockedError` propagates with the stamp already cleared (when it may
+    be) on the session; the caller must commit before answering, or the
+    committed stamp outlives a refusal that provably sent nothing.
+
+    Returns ``(recorded, full_rollback)`` as `_dispatch_payment_attempt` does,
+    and ``(False, False)`` when another dispatcher claimed the row first.
+    """
+    previously_marked = await _mark_dispatch_attempt(
+        db, payment=payment, expected_status=expected_status
+    )
+    if previously_marked is None:
+        logger.info(
+            "payment %s: claimed by another dispatcher during %s; skipped", payment.id, context
+        )
+        return False, False
+    try:
+        recorded, full_rollback = await _dispatch_payment_attempt(
+            db,
+            payment=payment,
+            org=org,
+            adapter=adapter,
+            user=user,
+            now=now,
+            expected_status=expected_status,
+            context=context,
+        )
+    except InvoiceLockedError:
+        if not previously_marked:
+            payment.dispatch_attempted_at = None
+        raise
+    if recorded:
+        if not previously_marked:
+            payment.dispatch_attempted_at = None
+        else:
+            await _flag_if_dispatch_in_doubt(db, org_id=org.id, payment=payment)
+    return recorded, full_rollback
+
+
+async def _dispatch_payment_attempt(
     db: AsyncSession,
     *,
     payment: Payment,
@@ -2406,13 +2747,11 @@ async def release_compliance_hold(
     response reflects that, rather than silently forcing money to move.
     """
     payment = await _get_scoped_payment(db, payment_id, entity_id, for_update=True)
-    if payment.status != "pending_compliance":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Can only release a payment stuck 'pending_compliance', not '{payment.status}'"
-            ),
-        )
+    # Only a held payment — the ONE definition the History list's
+    # `release_refusal` is read from (`payment_controls.compliance_hold_refusal`).
+    refusal = compliance_hold_refusal(payment, "release")
+    if refusal is not None:
+        raise refusal.http()
 
     invoice = (
         await db.execute(select(Invoice).where(Invoice.id == payment.invoice_id))
@@ -2447,13 +2786,19 @@ async def release_compliance_hold(
         )
     except InvoiceLockedError:
         # Refused before the processor call: the payment stays
-        # `pending_compliance` (the request rolls back) and the operator can
-        # simply release again — unlike a run, there is no batch to keep going.
+        # `pending_compliance` and the operator can simply release again —
+        # unlike a run, there is no batch to keep going. Committed, not rolled
+        # back: the dispatch marker was committed before the attempt and has
+        # just been cleared on the session, and a rollback would leave the
+        # stamp behind on a release that provably sent nothing.
+        await db.commit()
         raise HTTPException(status_code=409, detail=INVOICE_LOCKED_DETAIL) from None
     if not recorded:
-        # The connection dropped mid-release and another request moved the
-        # payment before it could be re-locked. What this attempt sent is in
-        # `payment.dispatch_unrecorded`; keep that, report the conflict.
+        # Another request moved the payment before this one could re-lock it:
+        # either in the gap the dispatch marker's commit opens (nothing was
+        # sent), or after the connection dropped mid-release (what this attempt
+        # sent is in `payment.dispatch_unrecorded`). Keep theirs, report the
+        # conflict.
         await db.commit()
         raise HTTPException(
             status_code=409,
@@ -2544,13 +2889,11 @@ async def dismiss_compliance_hold(
     (e.g. a genuine sanctions match, or a decision to pay this vendor a
     different way) and decided this payment should not proceed as-is."""
     payment = await _get_scoped_payment(db, payment_id, entity_id, for_update=True)
-    if payment.status != "pending_compliance":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Can only dismiss a payment stuck 'pending_compliance', not '{payment.status}'"
-            ),
-        )
+    # Only a held payment — the ONE definition the History list's
+    # `dismiss_refusal` is read from (`payment_controls.compliance_hold_refusal`).
+    refusal = compliance_hold_refusal(payment, "dismiss")
+    if refusal is not None:
+        raise refusal.http()
 
     invoice = (
         await db.execute(select(Invoice).where(Invoice.id == payment.invoice_id))
@@ -2560,6 +2903,10 @@ async def dismiss_compliance_hold(
     payment.status = "failed"
     payment.failure_reason = f"compliance_dismissed by {user.full_name}: {body.reason}"
     payment.completed_at = now
+    # A hold reached by a `/resume` (or re-release) of a dispatch that crashed
+    # after its processor call keeps that pass's marker: the row is in doubt,
+    # and `failed` frees the invoice's live-payment slot.
+    await _flag_if_dispatch_in_doubt(db, org_id=org.id, payment=payment)
 
     from app.services.audit_dispatch import dispatch_audit
 
@@ -2634,49 +2981,30 @@ async def accept_settlement(
     """
     payment = await _get_scoped_payment(db, payment_id, entity_id, for_update=True)
 
-    # Only a settlement that actually happened can be accepted.
+    # Every refusal comes from the ONE gate the History row's
+    # `accept_settlement_refusal` is read from
+    # (`payment_controls.settlement_accept_refusal`): only a settlement that
+    # actually happened, that does NOT already cover the invoice (a covered one
+    # reaches `paid` through the ordinary sync — refusing keeps this from being
+    # a general "force the invoice to paid" lever), and whose invoice is still
+    # held. The status half is asked first, before the invoice lock, exactly as
+    # before; the whole gate again once the invoice is locked. The held check
+    # runs BEFORE the audit dispatch so a repeat call never stages a second
+    # `payment.settlement_accepted` row — the first call's row is the record.
     if payment.status != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Can only accept the settlement of a 'completed' payment, not '{payment.status}'"
-            ),
-        )
+        refusal = settlement_accept_refusal(payment, None)
+        if refusal is not None:
+            raise refusal.http()
 
     try:
         invoice = await _lock_payment_invoice(db, payment)
     except InvoiceLockedError:
         raise HTTPException(status_code=409, detail=INVOICE_LOCKED_DETAIL) from None
 
-    coverage = settlement_coverage(
-        settled_amount=payment.settled_amount,
-        settled_currency=payment.settled_currency,
-        target_amount=payment.amount,
-        target_currency=(invoice.currency if invoice else None),
-        source_amount=payment.source_amount,
-        source_currency=payment.source_currency,
-        settled_amount_unstorable=payment.settled_amount_unstorable,
-    )
-    # Nothing to accept. Refusing rather than no-op'ing keeps this endpoint
-    # from becoming a general-purpose "force the invoice to paid" lever: a
-    # fully-covered payment reaches `paid` through the ordinary sync.
-    if coverage.completes_invoice:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This payment's settlement already covers the invoice; there is nothing to accept."
-            ),
-        )
-
-    # Nothing to release — checked BEFORE the audit dispatch so a repeat call
-    # never even stages a second `payment.settlement_accepted` row. Refusing
-    # keeps a retry from letting an operator re-justify the same acceptance
-    # indefinitely on the immutable trail; the first call's row is the record.
-    if invoice is None or invoice.status.value != "payment_scheduled":
-        raise HTTPException(
-            status_code=409,
-            detail="No held invoice to release for this payment.",
-        )
+    refusal = settlement_accept_refusal(payment, invoice)
+    if refusal is not None:
+        raise refusal.http()
+    coverage = payment_settlement_coverage(payment, invoice)
 
     from app.services.audit_dispatch import dispatch_audit
 
@@ -2712,6 +3040,11 @@ async def accept_settlement(
     )
 
     await db.commit()
+    # Paid here by a FeohLedger payment: write it back to an ERP whose bills
+    # sync (decisions §295), exactly as the sync pass does for a full one.
+    from app.services.erp_payment_writeback import dispatch_settled_writeback
+
+    dispatch_settled_writeback(org.id, payment.id)
     await db.refresh(payment)
     return PaymentResponse.from_db(payment, invoice)
 
@@ -2798,6 +3131,17 @@ async def create_payment(
             detail=(
                 "Invoice's vendor is not active (unverified, inactive or rejected) — "
                 f"verify or reactivate the vendor before paying: {invoice.invoice_number}"
+            ),
+        )
+
+    # The invoice must record a currency — the run builder's `currency_unknown`
+    # refusal. A blank is no currency, never USD (decisions §453).
+    if payable_currency_code(invoice.currency) is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "currency_unknown: Invoice records no currency — set the invoice's "
+                f"currency before paying it: {invoice.invoice_number}"
             ),
         )
 
@@ -2915,11 +3259,14 @@ async def create_payment(
     if requires_cfo:
         has_cfo = any(r.name == ROLE_CFO for r in (user.roles or ()))
         if not has_cfo:
+            # Coded: the reader acts on it by routing the payment elsewhere,
+            # so it is stated in their language (decisions §461).
             raise HTTPException(
                 status_code=403,
-                detail=(
+                detail=coded_refusal(
+                    PAYMENT_CFO_REQUIRED,
                     "This payment requires CFO sign-off — book it through a payment "
-                    "run for CFO approval, or have a CFO create it directly"
+                    "run for CFO approval, or have a CFO create it directly",
                 ),
             )
 
@@ -3114,6 +3461,40 @@ async def _run_currencies(
     return {rid: one_currency(codes) for rid, codes in seen.items()}
 
 
+async def _active_run_payment_statuses(
+    db: AsyncSession, run_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[str | None]]:
+    """The statuses of each run's ACTIVE payments, for
+    ``rollup_payment_statuses`` — in ONE grouped query, not a count per run.
+
+    Excludes any attempt a later retry on these runs superseded, matching
+    ``services/payment_runs.active_run_payments`` (the run detail and the
+    dispatcher's own rollup both go through it); expressed as a subquery so it
+    stays one query. The Runs list rolls these up for its tallies and its
+    ``actions.sync_erp`` verdict, and ``POST /runs/{id}/sync-erp`` rolls up the
+    same statuses for the gate it raises from — so the settled count the
+    verdict reads and the one the endpoint refuses on are one definition.
+    """
+    per_run: dict[uuid.UUID, list[str | None]] = {rid: [] for rid in run_ids}
+    if not run_ids:
+        return per_run
+    superseded_q = select(Payment.retry_of_payment_id).where(
+        Payment.payment_run_id.in_(run_ids),
+        Payment.retry_of_payment_id.isnot(None),
+    )
+    status_rows = await db.execute(
+        select(Payment.payment_run_id, Payment.status, func.count())
+        .where(
+            Payment.payment_run_id.in_(run_ids),
+            Payment.id.notin_(superseded_q),
+        )
+        .group_by(Payment.payment_run_id, Payment.status)
+    )
+    for pay_run_id, pay_status, n in status_rows.all():
+        per_run[pay_run_id].extend([pay_status] * int(n))
+    return per_run
+
+
 @router.get("/runs/", response_model=PaymentRunListResponse)
 async def list_payment_runs(
     pagination: PaginationParams = Depends(pagination_params),
@@ -3145,27 +3526,7 @@ async def list_payment_runs(
     # was an N+1). The rollup is what makes a `partial` row actionable in the
     # list — "3 of 12 failed" instead of a bare status word.
     run_ids = [run.id for run in runs]
-    per_run: dict[uuid.UUID, list[str | None]] = {rid: [] for rid in run_ids}
-    if run_ids:
-        # Exclude any attempt a later retry on these runs superseded, matching
-        # `services/payment_runs.active_run_payments` (the run detail and the
-        # dispatcher's own rollup both go through it). Expressed as a subquery
-        # rather than in Python so this stays the single grouped query it was
-        # built to be, not an N+1.
-        superseded_q = select(Payment.retry_of_payment_id).where(
-            Payment.payment_run_id.in_(run_ids),
-            Payment.retry_of_payment_id.isnot(None),
-        )
-        status_rows = await db.execute(
-            select(Payment.payment_run_id, Payment.status, func.count())
-            .where(
-                Payment.payment_run_id.in_(run_ids),
-                Payment.id.notin_(superseded_q),
-            )
-            .group_by(Payment.payment_run_id, Payment.status)
-        )
-        for pay_run_id, pay_status, n in status_rows.all():
-            per_run[pay_run_id].extend([pay_status] * int(n))
+    per_run = await _active_run_payment_statuses(db, run_ids)
 
     # The currency each `total_amount` is denominated in, resolved in one more
     # grouped query rather than folded into the rollup above — the rollup
@@ -3173,6 +3534,7 @@ async def list_payment_runs(
     # its invoices regardless of which attempt is live.
     currencies = await _run_currencies(db, run_ids)
 
+    may_sync_erp = holds_any_permission(user, {PERM_PAYMENT_EXECUTE})
     items = []
     for run in runs:
         rollup = rollup_payment_statuses(per_run.get(run.id, ()))
@@ -3183,14 +3545,22 @@ async def list_payment_runs(
         # `payment_runs.derive_run_status`.
         run.status = derive_run_status(run.status, rollup)
         items.append(
-            PaymentRunResponse.from_db(
-                run,
-                rollup.total,
-                completed=rollup.completed,
-                failed=rollup.failed,
-                in_flight=rollup.in_flight,
-                pending=rollup.pending,
-                currency=currencies.get(run.id),
+            PaymentRunListItem(
+                **PaymentRunResponse.from_db(
+                    run,
+                    rollup.total,
+                    completed=rollup.completed,
+                    failed=rollup.failed,
+                    in_flight=rollup.in_flight,
+                    pending=rollup.pending,
+                    currency=currencies.get(run.id),
+                ).model_dump(),
+                # What `POST /runs/{id}/sync-erp` would answer the caller: its
+                # permission, then the gate it raises from, over the same
+                # active-payment rollup (`completed` = settled legs).
+                actions={
+                    "sync_erp": _verdict(may_sync_erp, run_sync_erp_refusal(rollup.completed)),
+                },
             )
         )
 
@@ -3205,6 +3575,16 @@ async def list_payment_runs(
 class CreatePaymentRunItem(BaseModel):
     invoice_id: str
     method: str = "ach"  # ach, wire, check, virtual_card
+
+    @field_validator("method")
+    @classmethod
+    def _dispatchable(cls, v: str) -> str:
+        # `card` only RECORDS a payment made outside FeohLedger (decisions
+        # §295); a run would book it on a rail nothing dispatches, and off the
+        # 1099 as a card payment.
+        if v in RECORD_ONLY_PAYMENT_METHODS:
+            raise ValueError("card records a payment made outside FeohLedger; record it instead")
+        return v
 
 
 class CreatePaymentRunRequest(BaseModel):
@@ -3280,10 +3660,89 @@ async def create_payment_run(
     }
 
 
+#: Who may sign off / cancel a run — the dependencies on `POST /runs/{id}/approve`
+#: and `/cancel`, and what `run_action_refusals` asks, from one definition.
+RUN_APPROVE_ROLES = (ROLE_CFO,)
+RUN_CANCEL_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
+
+
+def run_action_refusals(
+    run: PaymentRun,
+    user: User,
+    org: Organization,
+    *,
+    effective_status: str,
+    retryable_failures: int,
+    pending_active: int,
+    pending_all: int,
+) -> dict:
+    """What ``POST /runs/{id}/approve``, ``/execute``, ``/cancel``,
+    ``/retry-failed``, ``/record-outside``, ``/nacha/void``, ``/nacha/verify`` and ``GET
+    /runs/{id}/nacha`` (first file, and ``regenerate=true``) would answer
+    ``user`` for ``run`` right now — each the coded refusal (``{code, message,
+    params}``) or ``None``. The run dialog offers a control exactly when its
+    entry is ``None`` (issue #575).
+
+    ``effective_status`` / ``retryable_failures`` are what ``/retry-failed``
+    gates on (the derived status and ``count_retryable_failures`` over the
+    run's active payments); ``pending_active`` is the ``pending`` count
+    ``/record-outside`` reads (active payments) and ``pending_all`` the one
+    the NACHA export reads (every ``pending`` row of the run). The caller has
+    already computed all four.
+
+    Each is the endpoint's own dependency predicate (``holds_any_role`` /
+    ``holds_any_permission`` over the same role / permission set) followed by
+    the endpoint's own gate function (``payment_controls.run_*_refusal``).
+    """
+    payment_config = (org.settings or {}).get("payments")
+    may_execute = holds_any_permission(user, {PERM_PAYMENT_EXECUTE})
+    record_only = resolve_execution_mode(org.settings).record_only
+    problems = originator_problems((payment_config or {}).get("nacha"))
+
+    def nacha(*, regenerate: bool):
+        return run_nacha_export_refusal(
+            run,
+            user.id,
+            payment_config,
+            regenerate=regenerate,
+            record_only=record_only,
+            originator_problems=problems,
+            pending_payments=pending_all,
+        )
+
+    return {
+        "approve": _verdict(
+            holds_any_role(user, RUN_APPROVE_ROLES),
+            run_approve_refusal(run, user.id, payment_config),
+        ),
+        "execute": _verdict(may_execute, run_execute_refusal(run, user.id, payment_config)),
+        "cancel": _verdict(holds_any_role(user, RUN_CANCEL_ROLES), run_cancel_refusal(run)),
+        # `/retry-failed`'s dependency is `payment.execute`, like `/execute`.
+        "retry_failed": _verdict(
+            may_execute,
+            run_retry_failed_refusal(
+                run, effective_status, retryable_failures, user.id, payment_config
+            ),
+        ),
+        # Paying the run outside FeohLedger. Recording is
+        # `payment.record_external`; the bank file and its void are
+        # `payment.execute` (uploading the file is what moves the money).
+        "record_outside": _verdict(
+            holds_any_permission(user, {PERM_PAYMENT_RECORD_EXTERNAL}),
+            run_record_outside_refusal(run, user.id, payment_config, pending_active),
+        ),
+        "nacha_export": _verdict(may_execute, nacha(regenerate=False)),
+        "nacha_regenerate": _verdict(may_execute, nacha(regenerate=True)),
+        "nacha_void": _verdict(may_execute, run_nacha_void_refusal(run, record_only=record_only)),
+        "nacha_verify": _verdict(may_execute, run_nacha_verify_refusal(run, pending_all)),
+    }
+
+
 @router.get("/runs/{run_id}")
 async def get_payment_run(
     run_id: uuid.UUID,
     db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
     # `RunDetailModal.svelte` fetches this on open — it's the load-bearing
     # read that puts the Execute button (itself gated on `payment.execute`)
     # on screen at all. Same exact-match reasoning as the list above.
@@ -3345,6 +3804,8 @@ async def get_payment_run(
     # recovered run would read `partial` forever.
     active = active_run_payments(p for p, _ in rows)
     rollup = rollup_payment_statuses(p.status for p in active)
+    effective_status = derive_run_status(run.status, rollup)
+    retryable_failures = count_retryable_failures(active)
 
     return {
         "id": str(run.id),
@@ -3352,7 +3813,7 @@ async def get_payment_run(
         # status, the counts and `retryable_failures` below can't contradict
         # each other — a run reporting `submitted` with `retryable_failures: 1`
         # offered a retry button that `/retry-failed` then 409ed.
-        "status": derive_run_status(run.status, rollup),
+        "status": effective_status,
         # Money serialises as an exact Decimal STRING, never float().
         "total_amount": str(run.total_amount) if run.total_amount else "0",
         # Early-payment discounts the run's ACTIVE payments take — already
@@ -3383,8 +3844,27 @@ async def get_payment_run(
         # processor (`is_retry_safe`) is excluded: the endpoint would only skip
         # it as `needs_reconciliation`, and offering a button that can't act is
         # how an operator ends up hunting for a second way to force the payment.
-        "retryable_failures": sum(
-            1 for p in active if p.status in RETRYABLE_PAYMENT_STATUSES and is_retry_safe(p)
+        "retryable_failures": retryable_failures,
+        # The caller's verdict on each run decision, from the gates those
+        # endpoints raise from (`run_action_refusals`). The draft / exported
+        # ones read the STORED status, which is what those endpoints compare;
+        # `retry_failed` reads the derived one, which is what it compares.
+        "actions": run_action_refusals(
+            run,
+            user,
+            org,
+            effective_status=effective_status,
+            retryable_failures=retryable_failures,
+            pending_active=sum(1 for p in active if p.status == "pending"),
+            pending_all=sum(1 for p, _ in rows if p.status == "pending"),
+        ),
+        # Whether the dialog's bank-file panel applies: always on a
+        # record-only tenant, and on a processor tenant only while the run
+        # still holds a file exported before the switch — so its Verify and
+        # the refusals' reasons stay on screen (decisions §382). Read from
+        # the STORED status, as the `nacha_*` verdicts are.
+        "bank_file_applies": run_bank_file_applies(
+            run, record_only=resolve_execution_mode(org.settings).record_only
         ),
         "payments": payments,
     }
@@ -3409,7 +3889,7 @@ async def approve_payment_run(
     # this specific sign-off without the full CFO title — just not via the
     # same catalog entry `POST /runs` uses; that would need a distinct
     # permission (e.g. `payment_run.cfo_signoff`) if ever wanted.
-    user: User = Depends(require_roles(ROLE_CFO)),
+    user: User = Depends(require_roles(*RUN_APPROVE_ROLES)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """CFO sign-off on a draft run. Only valid from `draft` AND
@@ -3421,26 +3901,11 @@ async def approve_payment_run(
     # lands, breaking non-repudiation of the money-control gate. The lock
     # serialises them so the second sees the first's commit and 409s.
     run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
-    if run.status != "draft":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Can only approve 'draft' runs, not '{run.status}'",
-        )
-    if not run.requires_cfo_approval:
-        raise HTTPException(
-            status_code=409,
-            detail="This run does not require CFO approval",
-        )
-    if run.cfo_approved_at is not None:
-        raise HTTPException(status_code=409, detail="Run is already CFO-approved")
-    # Maker-checker: the user who created the run cannot also sign it off — a
-    # self-approval defeats the entire purpose of the CFO gate.
-    check_run_segregation(
-        run.initiated_by,
-        user.id,
-        (org.settings or {}).get("payments"),
-        action="approve",
-    )
+    # Draft, needs and lacks a CFO sign-off, not the run's creator — the ONE
+    # definition `GET /runs/{id}`'s `actions.approve` is read from.
+    refusal = run_approve_refusal(run, user.id, (org.settings or {}).get("payments"))
+    if refusal is not None:
+        raise refusal.http()
 
     now = datetime.now(UTC)
     run.cfo_approved_by = user.id
@@ -3473,7 +3938,7 @@ async def cancel_payment_run(
     run_id: uuid.UUID,
     db: AsyncSession = Depends(get_tenant_db),
     org: Organization = Depends(get_tenant),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
+    user: User = Depends(require_roles(*RUN_CANCEL_ROLES)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Cancel a draft run before it executes. Only valid from `draft`;
@@ -3489,11 +3954,9 @@ async def cancel_payment_run(
     # canceller blocks until /execute commits, re-reads `executing`, and 409s
     # before deleting anything.
     run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
-    if run.status != "draft":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Can only cancel 'draft' runs, not '{run.status}'",
-        )
+    refusal = run_cancel_refusal(run)
+    if refusal is not None:
+        raise refusal.http()
 
     pay_result = await db.execute(select(Payment).where(Payment.payment_run_id == run_id))
     payments = pay_result.scalars().all()
@@ -3539,8 +4002,15 @@ async def _open_compliance_hold_exception(
     payment: Payment,
     invoice: Invoice | None,
     org: Organization,
+    findings: list[dict],
 ) -> None:
     """Surface a `pending_compliance` payment in the Exceptions queue.
+
+    ``findings`` are the hold's reasons as catalogue findings
+    (`ComplianceDecision.findings`, or the no-screenable-vendor one). The
+    description is the `exception.compliance_hold_findings` frame over them —
+    the same reasons `payment.failure_reason` joins in English, keyed so the
+    queue reads them in the reviewer's language (decisions §358).
 
     `check_payment_compliance`'s own docstring promises a hold "opens an
     exception for AP review" — until this, none of the four call sites that
@@ -3565,10 +4035,13 @@ async def _open_compliance_hold_exception(
     )
     if existing.scalar_one_or_none() is not None:
         return
+    description = exception_findings("compliance_hold_findings", findings, frame_single=True)
     await create_exception(
         db,
         exception_type="payment_compliance_hold",
-        description=payment.failure_reason,
+        description=description["message"],
+        description_code=description["code"],
+        description_params=description["params"],
         organization_id=org.id,
         severity="error",
         invoice=invoice,
@@ -3579,96 +4052,6 @@ async def _open_compliance_hold_exception(
         # holds they did not cause.
         raised_by_user_id=None,
     )
-
-
-async def _capture_discount_offers(
-    db: AsyncSession,
-    *,
-    org: Organization,
-    payment: Payment,
-    actor_id: uuid.UUID | None,
-    now: datetime,
-    invoice: Invoice | None = None,
-) -> None:
-    """Recognize `payment` settling its invoice at a discounted payoff and
-    capture any matching `accepted` `DiscountOffer` — the wiring
-    `discount_offers.mark_captured` was missing (issue #280): without a
-    caller, `captured_amount`/`captured_at` never got set and the
-    captured-savings KPI always read 0 even when discounts were genuinely
-    accepted and paid at the discounted amount.
-
-    Called from every path a `Payment` reaches `completed` — the synchronous
-    adapter/card leg (`_execute_single_payment`) and the async webhook-driven
-    completion (`payment_webhook`) — so a discount is recognized whether the
-    rail confirms instantly or days later. Both callers already hold the
-    `Invoice` and pass it in; `invoice=None` falls back to resolving it from
-    `payment.invoice_id` for any future caller that doesn't. No invoice found
-    is a no-op (nothing to match against). A payment BOOKED with a discount
-    (`Payment.discount_offer_id`, migration 0104) captures exactly that offer
-    for exactly `Payment.discount_amount`; one booked without falls back to the
-    exact-payoff match, which is how a discount taken the old way — through a
-    credit memo — is still recognized (see
-    `discount_capture.capture_offer_for_settled_payment`).
-
-    NOT called when the settlement verifier flagged a discrepancy — the
-    payoff match runs against OUR authorized amount, which a divergent
-    settlement has just contradicted. See the call site in `payment_webhook`.
-
-    Best-effort, like the vendor card-notify email below: this labels a
-    payment that already, definitely settled with a bookkeeping fact
-    (realized discount savings) — it must never be the reason a payment
-    that DID move money fails to record that it moved (or, on the webhook
-    path, the reason a webhook delivery 5xxs and gets needlessly retried).
-    The invoice lookup lives INSIDE the try for exactly that reason. A
-    failure here is logged (class only — no invoice/vendor PII) and
-    swallowed rather than propagated, mirroring `notify_vendor_of_card`'s
-    own safety net.
-    """
-    try:
-        if invoice is None:
-            inv_result = await db.execute(select(Invoice).where(Invoice.id == payment.invoice_id))
-            invoice = inv_result.scalar_one_or_none()
-        if invoice is None:
-            return
-
-        from app.services.discount_capture import capture_offer_for_settled_payment
-
-        captured = await capture_offer_for_settled_payment(
-            db,
-            payment=payment,
-            invoice_currency=invoice.currency,
-            now=now,
-        )
-        if not captured:
-            return
-
-        from app.services.audit_dispatch import dispatch_audit
-
-        for offer in captured:
-            await dispatch_audit(
-                db,
-                correlation_id=payment.correlation_id or invoice.id,
-                organization_id=org.id,
-                actor_id=actor_id,
-                action="discount_offer.captured",
-                entity_type="discount_offer",
-                entity_id=offer.id,
-                details={
-                    "invoice_id": str(invoice.id),
-                    "payment_id": str(payment.id),
-                    "captured_amount": str(offer.captured_amount),
-                    "payment_amount": str(payment.amount),
-                },
-            )
-    except Exception as exc:  # noqa: BLE001
-        # Log the exception CLASS only, never the message (PII-out-of-logs
-        # invariant — mirrors payment_erp_sync.py's own discipline). Never
-        # `payment.invoice_id` either — best-effort but still no PII risk.
-        logger.warning(
-            "discount-offer capture failed for payment=%s: %s; payment settlement unaffected",
-            payment.id,
-            exc.__class__.__name__,
-        )
 
 
 async def _execute_single_payment(
@@ -3735,9 +4118,35 @@ async def _execute_single_payment(
     # `backend/docs/payments.md` § The invoice's payability is re-checked
     # before the adapter call.
     refusal = await dispatch_preflight(db, payment, invoice, as_of=now.date())
+    if refusal is None:
+        # The one fact no local row knows: is the bill still unpaid IN THE ERP
+        # right now? A bill paid in QuickBooks after this run was approved —
+        # or while an earlier item of this run was being sent — has not
+        # reached us yet, and paying it here pays it twice (decisions §296).
+        # A live read, still before any rail is called and still under the
+        # invoice lock; an unreadable bill holds the item rather than pay blind.
+        from app.services.erp_status_sync import erp_bill_dispatch_refusal
+
+        refusal = await erp_bill_dispatch_refusal(db, invoice=invoice, payment=payment, org=org)
     if refusal is not None:
         payment.status = "failed"
         payment.failure_reason = refusal
+        payment.completed_at = now
+        return
+
+    # The org's home currency decides the FX leg and denominates every
+    # compliance threshold, on the card leg as well as the processor leg, so it
+    # is resolved once here, before either. A setting that is set but not a
+    # code is refused, never read as USD (decisions §473, amended): "EURO" paid
+    # a USD→EUR leg at a real FX lock. `international_payment_error:` keeps the
+    # refusal retry-safe — nothing has reached a processor yet.
+    from app.services.international_payments import HomeCurrencyInvalidError
+
+    try:
+        org_home_currency = resolve_home_currency(org.settings)
+    except HomeCurrencyInvalidError as exc:
+        payment.status = "failed"
+        payment.failure_reason = f"international_payment_error: {exc}"
         payment.completed_at = now
         return
 
@@ -3747,6 +4156,21 @@ async def _execute_single_payment(
             select(Vendor.bank_details).where(Vendor.id == invoice.vendor_id)
         )
         vendor_bank = v_result.scalar_one_or_none()
+
+    def _stamp_payee() -> None:
+        # The payee this attempt pays, from the same read the order is built
+        # from (decisions §383). Written only once every refusal and hold has
+        # passed, immediately before the card / processor call, so a stamp
+        # means money was instructed; `mark_called` then carries it. Each
+        # attempt re-stamps (a compliance release, a resume): each is a fresh
+        # instruction. A void compares it.
+        stamp_payee(
+            payment,
+            vendor_id=invoice.vendor_id,
+            bank_details=vendor_bank,
+            organization_id=org.id,
+            at=datetime.now(UTC),
+        )
 
     # Virtual-card method: skip the payment adapter and mint a card
     # via the card adapter instead. The Payment row still settles
@@ -3781,9 +4205,12 @@ async def _execute_single_payment(
             # funds on a card for an unscreened name, defeating the gate.
             # Fail-safe: hold for AP to attach + verify a vendor (mirrors the
             # ACH/wire leg); never mint a card unscreened.
+            no_vendor = exception_finding("compliance_no_screenable_vendor")
             payment.status = "pending_compliance"
-            payment.failure_reason = "compliance_hold: no screenable vendor on invoice"
-            await _open_compliance_hold_exception(db, payment=payment, invoice=invoice, org=org)
+            payment.failure_reason = "compliance_hold: " + no_vendor["message"]
+            await _open_compliance_hold_exception(
+                db, payment=payment, invoice=invoice, org=org, findings=[no_vendor]
+            )
             return
         card_decision = await check_payment_compliance(
             db,
@@ -3810,7 +4237,9 @@ async def _execute_single_payment(
         if card_decision.verdict == "hold":
             payment.status = "pending_compliance"
             payment.failure_reason = "compliance_hold: " + "; ".join(card_decision.reasons)
-            await _open_compliance_hold_exception(db, payment=payment, invoice=invoice, org=org)
+            await _open_compliance_hold_exception(
+                db, payment=payment, invoice=invoice, org=org, findings=card_decision.findings
+            )
             return
 
         # Idempotency pre-check, mirroring the batch `/api/cards/generate` leg:
@@ -3822,6 +4251,8 @@ async def _execute_single_payment(
         # invoice.
         card = await find_live_card_for_invoice(db, invoice.id)
         minted = False
+        # Minted or converged, this payment settles on a card for this vendor.
+        _stamp_payee()
         if card is None:
             contact.mark_called(payment)
             issue = await issue_card_for_invoice(
@@ -3975,8 +4406,10 @@ async def _execute_single_payment(
     # here and routed EVERY domestic payment down the international leg — a
     # cross-border corridor, a locked FX rate on the row, and a KYC gate reading
     # a different value for the same setting.
-    invoice_currency = normalize_currency_code(invoice.currency if invoice else None) or "USD"
-    org_home_currency = resolve_home_currency(org.settings)
+    #
+    # No `or "USD"`: `dispatch_preflight` has already refused an invoice that
+    # records no currency (`currency_unknown`), so a blank never reaches here.
+    invoice_currency = normalize_currency_code(invoice.currency)
     has_intl_bank_fields = bool(
         vendor_bank and (vendor_bank.get("iban") or vendor_bank.get("swift_bic"))
     )
@@ -4065,9 +4498,12 @@ async def _execute_single_payment(
             # reach here with vendor_id NULL. Paying anyway would route money
             # to an unscreened name, defeating the gate. Fail-safe: hold for
             # AP to attach + verify a vendor, never pay unscreened.
+            no_vendor = exception_finding("compliance_no_screenable_vendor")
             payment.status = "pending_compliance"
-            payment.failure_reason = "compliance_hold: no screenable vendor on invoice"
-            await _open_compliance_hold_exception(db, payment=payment, invoice=invoice, org=org)
+            payment.failure_reason = "compliance_hold: " + no_vendor["message"]
+            await _open_compliance_hold_exception(
+                db, payment=payment, invoice=invoice, org=org, findings=[no_vendor]
+            )
             return
         decision = await check_payment_compliance(
             db,
@@ -4095,7 +4531,9 @@ async def _execute_single_payment(
             payment.status = "pending_compliance"
             payment.failure_reason = "compliance_hold: " + "; ".join(decision.reasons)
             # Hold doesn't flip the invoice — money hasn't moved.
-            await _open_compliance_hold_exception(db, payment=payment, invoice=invoice, org=org)
+            await _open_compliance_hold_exception(
+                db, payment=payment, invoice=invoice, org=org, findings=decision.findings
+            )
             return
 
     payload = PaymentPayload(
@@ -4104,7 +4542,9 @@ async def _execute_single_payment(
         invoice_number=invoice.invoice_number if invoice else "",
         vendor_name=invoice.vendor_name if invoice else "",
         amount=payment.amount,
-        currency=invoice.currency if invoice else "USD",
+        # The normalised code the FX leg compared above, never a default: a
+        # blank was refused by `dispatch_preflight` (`currency_unknown`).
+        currency=invoice_currency,
         method=payment.method or "ach",
         description=invoice.description if invoice else None,
         vendor_bank=vendor_bank,
@@ -4115,6 +4555,7 @@ async def _execute_single_payment(
         target_country=payment.target_country,
     )
 
+    _stamp_payee()
     contact.mark_called(payment)
     result_obj = await adapter.create_payment(payload)
     contact.provider = adapter.provider_name
@@ -4243,15 +4684,21 @@ async def _dispatch_run_payments(
             payment.status = "failed"
             payment.failure_reason = INVOICE_LOCKED_REASON
             payment.completed_at = now
+            # A `/resume` of a pass that crashed after stamping the row: that
+            # pass may have reached the processor, so this refusal is in doubt
+            # (the stamp makes it so) and the invoice is blocked from a new run
+            # until a human reconciles it. A no-op on an unstamped row.
+            await _flag_if_dispatch_in_doubt(db, org_id=org.id, payment=payment)
         if full_rollback:
             # The connection was lost mid-attempt and the whole transaction
             # rolled back, expiring the run too (its status was committed by
             # the caller, so this only re-reads it).
             await db.refresh(run)
         if not recorded:
-            # Another dispatcher recorded this payment in the gap a full
-            # rollback opens; `payment.dispatch_unrecorded` already holds what
-            # this attempt sent. Never overwrite their outcome.
+            # Another dispatcher claimed this payment in the gap the dispatch
+            # marker's commit opens (this attempt sent nothing), or recorded it
+            # in the gap a full rollback opens (`payment.dispatch_unrecorded`
+            # already holds what this attempt sent). Never overwrite theirs.
             await db.commit()
             continue
 
@@ -4385,29 +4832,11 @@ async def execute_payment_run(
     # `PaymentPayload.correlation_id` — defense in depth for processors that
     # honor it, e.g. Modern Treasury / Column.)
     run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
-    if run.status != "draft":
-        raise HTTPException(
-            status_code=409, detail=f"Can only execute 'draft' runs, not '{run.status}'"
-        )
-    # Maker-checker: the user who created the run cannot also execute it (the
-    # money-movement step). Default-on; per-org opt-out for single-operator
-    # accounts. The role/permission split can't enforce this — one user holding
-    # both perms (the default ap_manager) would otherwise run the whole payment
-    # lifecycle solo.
-    check_run_segregation(
-        run.initiated_by,
-        user.id,
-        (org.settings or {}).get("payments"),
-        action="execute",
-    )
-    if run.requires_cfo_approval and run.cfo_approved_at is None:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This run exceeds the org's CFO-approval threshold and is awaiting "
-                "sign-off from a user with the CFO role."
-            ),
-        )
+    # Draft, not the run's creator (maker-checker), CFO-signed when required —
+    # the ONE definition `GET /runs/{id}`'s `actions.execute` is read from.
+    refusal = run_execute_refusal(run, user.id, (org.settings or {}).get("payments"))
+    if refusal is not None:
+        raise refusal.http()
 
     # Resolve the processor BEFORE claiming the run. An unsupported
     # `settings.payments.provider` can dispatch nothing, so refusing here
@@ -4451,30 +4880,16 @@ async def record_run_paid_outside(
     """
     _refuse_future_paid_on(body.paid_on)
     run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
-    # `exported` is the normal case — the customer uploaded the run's NACHA file
-    # and its bank took it. `draft` covers a run the customer paid some other
-    # way (its own bank portal, a file it built itself).
-    if run.status not in ("draft", "exported"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Only a 'draft' or 'exported' run can be recorded as paid, not '{run.status}'"
-            ),
-        )
-    check_run_segregation(
-        run.initiated_by,
-        user.id,
-        (org.settings or {}).get("payments"),
-        action="record as paid",
-    )
-    if run.requires_cfo_approval and run.cfo_approved_at is None:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This run exceeds the org's CFO-approval threshold and is awaiting "
-                "sign-off from a user with the CFO role."
-            ),
-        )
+    payment_config = (org.settings or {}).get("payments")
+    # The run-level refusals come from the ONE gate the run dialog's
+    # `actions.record_outside` is read from
+    # (`payment_controls.run_record_outside_refusal`): a `draft` or `exported`
+    # run, not recorded by its creator (maker-checker), CFO-signed above the
+    # threshold. Asked here without the pending count, before any invoice lock;
+    # asked again with it once the payments are locked.
+    refusal = run_record_outside_refusal(run, user.id, payment_config, None)
+    if refusal is not None:
+        raise refusal.http()
 
     # Lock order: run → invoices → payments, the order the per-invoice record
     # takes (invoice → its payments), so the two can't deadlock on a shared
@@ -4494,8 +4909,9 @@ async def record_run_paid_outside(
         (await db.execute(payment_query.with_for_update())).scalars().all()
     )
     pending = [p for p in payments if p.status == "pending"]
-    if not pending:
-        raise HTTPException(status_code=409, detail="This run has no payments left to record")
+    refusal = run_record_outside_refusal(run, user.id, payment_config, len(pending))
+    if refusal is not None:
+        raise refusal.http()
 
     # Two passes. Lock and check EVERY invoice first, so one refusal refuses
     # the run before anything is written — including an audit row, which in
@@ -4569,14 +4985,13 @@ async def record_run_paid_outside(
 
 
 #: `detail.code`s of the NACHA export's refusals (`export_run_nacha`).
-NACHA_REQUIRES_RECORD_ONLY = "nacha_requires_record_only"
-NACHA_NOT_CONFIGURED = "nacha_not_configured"
+# The run-level ones (`nacha_requires_record_only`, `nacha_not_configured`,
+# `nacha_already_exported`, …) are `payment_controls.run_nacha_export_refusal`'s.
 NACHA_PAYMENT_NOT_ACH = "nacha_payment_not_ach"
 NACHA_VENDOR_BANK_MISSING = "nacha_vendor_bank_missing"
 NACHA_CURRENCY_NOT_USD = "nacha_currency_not_usd"
 NACHA_AMOUNT_TOO_LARGE = "nacha_amount_too_large"
 NACHA_PAYMENT_NOT_PAYABLE = "nacha_payment_not_payable"
-NACHA_ALREADY_EXPORTED = "nacha_already_exported"
 
 #: File-ID modifiers in issue order (NACHA: A-Z, then 0-9).
 NACHA_FILE_ID_MODIFIERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -4618,8 +5033,10 @@ async def export_run_nacha(
       can't be paid twice by a second file, a cancelled-and-restaged run, or a
       later switch to processor mode. A second file for an `exported` run needs
       `regenerate=true` and carries the next file-ID modifier (A, B, C, …), so
-      the bank's duplicate-file check can tell them apart. If the bank rejected
-      the file, `POST /runs/{id}/nacha/void` returns the run to `draft`.
+      the bank's duplicate-file check can tell them apart; `regenerate=true` on
+      a run with no exported file is refused (`nacha_nothing_to_regenerate`)
+      rather than quietly exporting a first one. If the bank rejected the
+      file, `POST /runs/{id}/nacha/void` returns the run to `draft`.
     * **Every dispatch-time check runs** — `payment_runs.dispatch_preflight`,
       the set `/execute` runs before each payment: still payable, no
       payment-blocking exception raised since staging (a BEC bank-detail swap's
@@ -4633,29 +5050,6 @@ async def export_run_nacha(
     Each export writes a `payment_run.nacha_exported` audit row carrying counts,
     the total, the file-ID modifier and the file's SHA-256 — not its contents.
     """
-    if not resolve_execution_mode(org.settings).record_only:
-        raise HTTPException(
-            status_code=409,
-            detail=coded_refusal(
-                NACHA_REQUIRES_RECORD_ONLY,
-                "A bank file can only be exported when FeohLedger records payments rather "
-                "than sending them — otherwise the run could be paid twice.",
-            ),
-        )
-    nacha_cfg = ((org.settings or {}).get("payments") or {}).get("nacha")
-    problems = originator_problems(nacha_cfg)
-    if problems:
-        raise HTTPException(
-            status_code=409,
-            detail=coded_refusal(
-                NACHA_NOT_CONFIGURED,
-                "Set up the bank file in Settings → Payments first (company name, company "
-                "ID and your bank's routing number).",
-                missing=problems,
-            ),
-        )
-    originator = originator_from_settings(nacha_cfg)
-
     today = utc_today()
     if effective_date is None:
         effective_date = _next_business_day(today)
@@ -4667,37 +5061,6 @@ async def export_run_nacha(
         )
 
     run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
-    if run.status == "exported":
-        if not regenerate:
-            raise HTTPException(
-                status_code=409,
-                detail=coded_refusal(
-                    NACHA_ALREADY_EXPORTED,
-                    "This run's bank file was already exported. Uploading a second file "
-                    "would pay these suppliers twice. Regenerate only if your bank never "
-                    "took the first one.",
-                ),
-            )
-    elif run.status != "draft":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Only a 'draft' run can be exported as a bank file, not '{run.status}'",
-        )
-    check_run_segregation(
-        run.initiated_by,
-        user.id,
-        (org.settings or {}).get("payments"),
-        action="export",
-    )
-    if run.requires_cfo_approval and run.cfo_approved_at is None:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This run exceeds the org's CFO-approval threshold and is awaiting "
-                "sign-off from a user with the CFO role."
-            ),
-        )
-
     payments = list(
         (
             await db.execute(
@@ -4709,8 +5072,26 @@ async def export_run_nacha(
         .scalars()
         .all()
     )
-    if not payments:
-        raise HTTPException(status_code=409, detail="This run has no payments left to export")
+    nacha_cfg = ((org.settings or {}).get("payments") or {}).get("nacha")
+    # Every run-level refusal — the run's state (a first file from `draft`, a
+    # regenerated one only from `exported`), a record-only tenant, the bank file
+    # configured, maker-checker, CFO sign-off, something left to send — comes
+    # from the ONE gate the run dialog's `actions.nacha_export` /
+    # `actions.nacha_regenerate` are read from
+    # (`payment_controls.run_nacha_export_refusal`). The coded details it
+    # always answered with are kept.
+    run_refusal = run_nacha_export_refusal(
+        run,
+        user.id,
+        (org.settings or {}).get("payments"),
+        regenerate=regenerate,
+        record_only=resolve_execution_mode(org.settings).record_only,
+        originator_problems=originator_problems(nacha_cfg),
+        pending_payments=len(payments),
+    )
+    if run_refusal is not None:
+        raise run_refusal.http()
+    originator = originator_from_settings(nacha_cfg)
 
     def _refuse(code: str, message: str, invoice: Invoice, **params) -> HTTPException:
         number = invoice.invoice_number or str(invoice.id)
@@ -4720,12 +5101,15 @@ async def export_run_nacha(
         )
 
     entries = []
+    # Who each entry pays, stamped once the file is certain (decisions §383).
+    payees: list[tuple[Payment, uuid.UUID | None, dict | None]] = []
     # Every invoice is locked up front, in ID order — the order `bulk/status`,
     # `bulk/delete` and record-as-paid take them in — so a bulk action over two
     # of this run's invoices cannot deadlock against the export. The per-
     # payment lock below is then already held.
     for invoice_id in sorted({p.invoice_id for p in payments}):
         await get_invoice_for_update(db, invoice_id)
+    checked: list[tuple[Payment, Invoice]] = []
     for payment in payments:
         # Locked like the dispatcher locks it: the checks below decide on the
         # invoice's state, which must not move until this request commits.
@@ -4743,7 +5127,8 @@ async def export_run_nacha(
             raise _refuse(
                 NACHA_PAYMENT_NOT_ACH, "only ACH payments can go in a NACHA file.", invoice
             )
-        if (invoice.currency or "").upper() != "USD":
+        # The run builder's own predicate: " usd" is USD, a blank is no currency.
+        if payable_currency_code(invoice.currency) != "USD":
             raise _refuse(NACHA_CURRENCY_NOT_USD, "a NACHA file carries USD only.", invoice)
         if payment.amount > NACHA_MAX_ENTRY_AMOUNT:
             raise _refuse(
@@ -4763,6 +5148,47 @@ async def export_run_nacha(
                 invoice,
             )
         entries.append(entry)
+        checked.append((payment, invoice))
+        payees.append(
+            (payment, invoice.vendor_id, vendor.bank_details if vendor is not None else None)
+        )
+
+    # The bank's upload of this file is the money moving: the same live read of
+    # each ERP bill as a rail dispatch (decisions §296) — made last, once every
+    # local check has passed, so a file refused for a local reason costs no
+    # ERP call, and made concurrently (decisions §362), because every lock this
+    # request holds is held across the reads.
+    from app.services.erp_status_sync import erp_bill_dispatch_refusals
+
+    erp_refusals = await erp_bill_dispatch_refusals(
+        db, [(invoice, payment) for payment, invoice in checked], org=org
+    )
+    if any(r and r.startswith(("erp_bill_not_open", "erp_bill_unlinked")) for r in erp_refusals):
+        # Keep the exceptions the check just opened: the 409 below rolls the
+        # request back. Nothing else is dirty at this point — everything
+        # before the reads only locked and read, and the file and its audit
+        # row come after — so this commits those exceptions alone (pinned by
+        # tests/test_erp_dispatch_check.py).
+        await db.commit()
+    for (_payment, invoice), erp_refusal in zip(checked, erp_refusals, strict=True):
+        if erp_refusal in ("erp_bill_unverified", "erp_bill_void_pending"):
+            # Nothing is wrong with the run; the bill could not be vouched
+            # for right now. Retrying the export is the fix, not re-staging.
+            raise _refuse(
+                NACHA_PAYMENT_NOT_PAYABLE,
+                "the bill in the ERP could not be checked just now "
+                f"({erp_refusal}). Nothing was exported; try the export again shortly.",
+                invoice,
+                reason=erp_refusal,
+            )
+        if erp_refusal is not None:
+            raise _refuse(
+                NACHA_PAYMENT_NOT_PAYABLE,
+                "this payment can no longer be sent as staged "
+                f"({erp_refusal}). Cancel the run and stage it again.",
+                invoice,
+                reason=erp_refusal,
+            )
 
     from app.services.audit_dispatch import dispatch_audit
 
@@ -4774,6 +5200,18 @@ async def export_run_nacha(
     run.nacha_export_count = prior + 1
 
     now = datetime.now(UTC)
+    # The upload of this file is the money moving, so each payment records the
+    # payee its entry carries — after every refusal above, so the commit kept
+    # for the ERP check's exceptions never carries a stamp for a file that was
+    # not built. A regenerated file re-stamps: the latest file is the one sent.
+    for payment, payee_vendor_id, bank in payees:
+        stamp_payee(
+            payment,
+            vendor_id=payee_vendor_id,
+            bank_details=bank,
+            organization_id=org.id,
+            at=now,
+        )
     content = build_nacha_file(
         originator,
         entries,
@@ -4802,6 +5240,9 @@ async def export_run_nacha(
             "sec_code": sec_code,
             "effective_date": effective_date.isoformat(),
             "file_id_modifier": modifier,
+            # Whether it carries the offsetting debit (decisions §432) — the
+            # fact, never the offset account.
+            "balanced": originator.offset is not None,
             "regenerated": previous_status == "exported",
             "file_sha256": hashlib.sha256(content.encode("ascii")).hexdigest(),
         },
@@ -4837,17 +5278,23 @@ async def void_nacha_export(
     is an attestation — FeohLedger cannot see the customer's bank — so the
     reason is required and lands on the append-only trail
     (`payment_run.nacha_export_voided`). Once back in `draft` the run can be
-    cancelled, re-exported or (on a processor tenant) executed.
+    cancelled or re-exported. Only on a record-only tenant (409
+    `nacha_void_requires_record_only` otherwise): on one switched to processor
+    mode since the export, a released run could be executed — the same
+    suppliers paid by the bank's file and by the rail (decisions §362).
     """
     reason = body.reason.strip()
     if not reason:
         raise HTTPException(status_code=422, detail="reason must not be blank")
     run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
-    if run.status != "exported":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Only an 'exported' run's bank file can be voided, not '{run.status}'",
-        )
+    # The ONE gate the run dialog's `actions.nacha_void` is read from. It
+    # refuses a tenant now in processor mode: releasing the claim there would
+    # hand a file the bank may have taken straight to the rail (§362).
+    refusal = run_nacha_void_refusal(
+        run, record_only=resolve_execution_mode(org.settings).record_only
+    )
+    if refusal is not None:
+        raise refusal.http()
     run.status = "draft"
 
     from app.services.audit_dispatch import dispatch_audit
@@ -4864,6 +5311,173 @@ async def void_nacha_export(
     )
     await db.commit()
     return {"id": str(run.id), "status": run.status}
+
+
+@router.post("/runs/{run_id}/nacha/verify")
+async def verify_run_nacha(
+    run_id: uuid.UUID,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    # The step before the upload that moves the money: the export's own gate.
+    user: User = Depends(require_permission(PERM_PAYMENT_EXECUTE)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Verify an exported bank file before it is uploaded (decisions §362).
+
+    The export read each bill in the ERP when it built the file (§296), but
+    the money moves when a person uploads the file, which can be hours or
+    days later; a bill paid in QuickBooks in between would be paid twice. This
+    re-reads the bill of every payment still in the file, under the same run
+    and invoice locks as the export, concurrently
+    (`erp_status_sync.erp_bill_dispatch_refusals`):
+
+    * **every bill still open** (or none posted to an ERP that reports bill
+      payments back) → `result: "verified"`. Nothing changes.
+    * **a bill no longer open** (paid, part-paid, credited or deleted in the
+      ERP) → that payment is taken out of the run — `failed` with the
+      dispatcher's own `erp_bill_not_open:<state>`, and the blocking
+      `payment_reconciliation` the check opens — and `result: "superseded"`:
+      the downloaded file must NOT be uploaded. With payments left, the run
+      stays `exported` and a regenerated file (`regenerate=true`, the next
+      file-ID modifier) carries only those; with none left, the run is
+      `cancelled`. The run's claim is never released, so this opens no path
+      to the rail on a tenant that has since switched modes.
+    * **a bill that cannot be vouched for right now** (an Intuit outage, a
+      changed connection) → listed under `held`, `result: "held"` when nothing
+      was removed: try again before uploading. Nothing is taken out on a
+      failed read.
+
+    **Idempotent.** A payment already taken out is no longer `pending`, so a
+    second verify re-reads only what is still in the file and changes nothing
+    when those bills are open; the exception is de-duplicated. **Audited:**
+    each call writes `payment_run.nacha_verified` (the result, the counts, the
+    file it checked) — the record that the file was checked, and when — and
+    each payment it takes out writes `payment.failed`.
+    """
+    run = await _get_scoped_run(db, run_id, entity_id, for_update=True)
+    payments = list(
+        (
+            await db.execute(
+                select(Payment)
+                .where(Payment.payment_run_id == run.id, Payment.status == "pending")
+                .order_by(Payment.created_at.asc(), Payment.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # The ONE gate the run dialog's `actions.nacha_verify` is read from.
+    refusal = run_nacha_verify_refusal(run, len(payments))
+    if refusal is not None:
+        raise refusal.http()
+
+    # Locked in invoice-ID order, as the export takes them (see there).
+    for invoice_id in sorted({p.invoice_id for p in payments}):
+        await get_invoice_for_update(db, invoice_id)
+    invoices = [await get_invoice_for_update(db, p.invoice_id) for p in payments]
+
+    from app.services.erp_status_sync import (
+        ERP_BILL_NOT_OPEN,
+        erp_bill_dispatch_refusals,
+        status_sync_active,
+    )
+
+    verdicts = await erp_bill_dispatch_refusals(
+        db, list(zip(invoices, payments, strict=True)), org=org
+    )
+    now = datetime.now(UTC)
+    removed: list[dict] = []
+    removed_payments: list[Payment] = []
+    held: list[dict] = []
+    for payment, invoice, verdict in zip(payments, invoices, verdicts, strict=True):
+        if verdict is None:
+            continue
+        item = {
+            "payment_id": str(payment.id),
+            "invoice_id": str(invoice.id),
+            "invoice_number": invoice.invoice_number,
+            "reason": verdict,
+        }
+        if verdict.startswith(ERP_BILL_NOT_OPEN):
+            # What `_execute_single_payment` records for the same verdict at
+            # the rail: refused before anything moved, retry-safe, and kept
+            # from any later run by the blocking exception the check opened.
+            payment.status = "failed"
+            payment.failure_reason = verdict
+            payment.completed_at = now
+            removed.append(item)
+            removed_payments.append(payment)
+        else:
+            held.append(item)
+
+    remaining = len(payments) - len(removed)
+    if removed and remaining == 0:
+        # Nothing of the file is left to pay. `cancelled`, not a rolled-up
+        # `failed`: a claim state no retry, execute or re-export reaches.
+        run.status = "cancelled"
+    result = "superseded" if removed else ("held" if held else "verified")
+
+    from app.services.audit_dispatch import dispatch_audit
+
+    for payment in removed_payments:
+        await dispatch_audit(
+            db,
+            correlation_id=payment.correlation_id or run.id,
+            organization_id=org.id,
+            actor_id=user.id,
+            action="payment.failed",
+            entity_type="payment",
+            entity_id=payment.id,
+            details={
+                "status": payment.status,
+                "method": payment.method,
+                "amount": str(payment.amount),
+                "failure_reason": payment.failure_reason,
+                "payment_run_id": str(run.id),
+                "source": "nacha_verify",
+            },
+        )
+    export_count = run.nacha_export_count or 0
+    await dispatch_audit(
+        db,
+        correlation_id=uuid.uuid4(),
+        organization_id=org.id,
+        actor_id=user.id,
+        action="payment_run.nacha_verified",
+        entity_type="payment_run",
+        entity_id=run.id,
+        details={
+            "result": result,
+            "checked": len(payments),
+            "remaining": remaining,
+            "remaining_amount": str(
+                sum(
+                    (p.amount for p in payments if p.status == "pending"),
+                    Decimal("0"),
+                )
+            ),
+            # Ids and reason codes only — never bank data.
+            "removed": [{k: i[k] for k in ("payment_id", "invoice_id", "reason")} for i in removed],
+            "held": [{k: i[k] for k in ("payment_id", "invoice_id", "reason")} for i in held],
+            "file_id_modifier": (
+                NACHA_FILE_ID_MODIFIERS[(export_count - 1) % len(NACHA_FILE_ID_MODIFIERS)]
+                if export_count
+                else None
+            ),
+            "status": run.status,
+        },
+    )
+    await db.commit()
+    return {
+        "id": str(run.id),
+        "status": run.status,
+        "result": result,
+        "checked": len(payments),
+        "remaining": remaining,
+        "removed": removed,
+        "held": held,
+        "erp_checked": status_sync_active((org.settings or {}).get("erp")),
+    }
 
 
 @router.post("/runs/{run_id}/resume")
@@ -4973,18 +5587,14 @@ async def retry_run_erp_sync(
     from app.services.payment_erp_sync import _sync_payments
 
     run = await _get_scoped_run(db, run_id, entity_id)
-    settled = (
-        await db.execute(
-            select(func.count())
-            .select_from(Payment)
-            .where(Payment.payment_run_id == run.id, Payment.status == "completed")
-        )
-    ).scalar() or 0
-    if settled == 0:
-        raise HTTPException(
-            status_code=409,
-            detail="This run has no settled payments to sync to the ERP.",
-        )
+    # Settled ACTIVE legs, rolled up from the same statuses the Runs list's
+    # `actions.sync_erp` verdict reads (`_active_run_payment_statuses`), through
+    # the ONE gate both raise from (`payment_controls.run_sync_erp_refusal`).
+    statuses = (await _active_run_payment_statuses(db, [run.id]))[run.id]
+    settled = rollup_payment_statuses(statuses).completed
+    refusal = run_sync_erp_refusal(settled)
+    if refusal is not None:
+        raise refusal.http()
 
     await dispatch_audit(
         db,
@@ -5025,11 +5635,14 @@ async def retry_run_erp_sync(
 # prove no order was created at the processor (see the endpoint docstring).
 RETRYABLE_PAYMENT_STATUSES = ("failed", "cancelled")
 
-# The run statuses that can carry a failed payment worth re-attempting. A
-# `draft` run has never been dispatched (use `/execute`), an `executing` one is
-# either mid-flight or crashed (use `/resume`), and a `cancelled` one has no
-# payments left at all.
-RETRYABLE_RUN_STATUSES = ("partial", "failed")
+
+def count_retryable_failures(active: Iterable[Payment]) -> int:
+    """How many of a run's ACTIVE payments `/retry-failed` may actually send
+    again: failed, and provably never accepted by the processor
+    (`is_retry_safe`). The run detail's `retryable_failures` and the endpoint's
+    `payment_run_nothing_to_retry` gate both read this, so the count a reader
+    sees and the gate the POST applies cannot disagree."""
+    return sum(1 for p in active if p.status in RETRYABLE_PAYMENT_STATUSES and is_retry_safe(p))
 
 
 @router.post("/runs/{run_id}/retry-failed")
@@ -5078,6 +5691,8 @@ async def retry_failed_payments(
     - `vendor_not_active` — the invoice's vendor has since been rejected,
       deactivated or merged away (or was never verified), the run builder's
       `vendor_not_active` refusal (`payment_runs.inactive_vendor_statuses`);
+    - `currency_unknown` — the invoice's currency has since been blanked, the
+      run builder's `currency_unknown` refusal;
     - `needs_reconciliation` — we cannot prove the processor never accepted the
       original order (`classify_payment_failure`): a populated
       `provider_payment_id`, an `unexpected_error:*` / `*_transport_error:*` /
@@ -5098,6 +5713,14 @@ async def retry_failed_payments(
       payment. The savepoint around each insert is the backstop for the same
       conflict arriving as a race.
 
+    **Refused up front** (`payment_controls.run_retry_failed_refusal`, the
+    same gate the run dialog's `actions.retry_failed` verdict reads): a run
+    whose derived status is not `partial`/`failed` (409
+    `payment_run_not_retryable`), the run's creator (403, maker-checker), a run
+    still awaiting CFO sign-off (403), and a run none of whose failures is
+    retry-safe (409 `payment_run_nothing_to_retry` — every one would only be
+    skipped as `needs_reconciliation`, so nothing is claimed or audited).
+
     **Idempotency.** The run is row-locked and claimed (`→ executing`) before
     anything is booked, so a double-click / concurrent retry blocks on the lock
     and then 409s against the non-retryable status — it can't produce a second
@@ -5115,58 +5738,38 @@ async def retry_failed_payments(
     # that can't act" `retryable_failures` exists to prevent. The read
     # endpoints derive the same way (`payment_runs.derive_run_status`), so the
     # status an operator sees and the status this gates on cannot diverge.
-    effective_status = derive_run_status(
-        run.status,
-        rollup_payment_statuses(
-            p.status
-            for p in active_run_payments(
-                (await db.execute(select(Payment).where(Payment.payment_run_id == run_id)))
-                .scalars()
-                .all()
-            )
-        ),
+    active = active_run_payments(
+        (await db.execute(select(Payment).where(Payment.payment_run_id == run_id))).scalars().all()
     )
-    if effective_status not in RETRYABLE_RUN_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Can only retry a run that finished with failures "
-                f"({' or '.join(RETRYABLE_RUN_STATUSES)}), not '{effective_status}'"
-            ),
-        )
-    # Re-attempting moves money exactly like /execute — same maker-checker gate
-    # and the same CFO threshold. Skipping either here would turn `/retry-failed`
-    # into a way around both.
-    check_run_segregation(
-        run.initiated_by,
+    effective_status = derive_run_status(
+        run.status, rollup_payment_statuses(p.status for p in active)
+    )
+    # Every pre-booking refusal comes from the ONE gate the run dialog's
+    # `actions.retry_failed` verdict is built from, so the control is offered
+    # exactly when this would accept it: the run's state; maker-checker and the
+    # CFO threshold (re-attempting moves money exactly like /execute, so
+    # skipping either would turn this into a way around both); and "nothing
+    # here may be sent again", which used to claim the run for an empty
+    # dispatch pass and answer 200.
+    refusal = run_retry_failed_refusal(
+        run,
+        effective_status,
+        count_retryable_failures(active),
         user.id,
         (org.settings or {}).get("payments"),
-        action="execute",
     )
-    if run.requires_cfo_approval and run.cfo_approved_at is None:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This run exceeds the org's CFO-approval threshold and is awaiting "
-                "sign-off from a user with the CFO role."
-            ),
-        )
+    if refusal is not None:
+        raise refusal.http()
 
     # Same pre-flight as /execute and /resume: a run whose processor can't be
     # resolved retries nothing, so refuse before booking any retry attempt row.
     adapter = await _require_payment_adapter(org)
 
-    all_run_payments = (
-        (await db.execute(select(Payment).where(Payment.payment_run_id == run_id))).scalars().all()
-    )
-    # An earlier attempt a previous retry already replaced is history — its
-    # successor is what describes where the invoice stands.
-    superseded = superseded_payment_ids(all_run_payments)
-    failed_payments = [
-        p
-        for p in all_run_payments
-        if p.status in RETRYABLE_PAYMENT_STATUSES and p.id not in superseded
-    ]
+    # From the SAME active set the gate above counted — an earlier attempt a
+    # previous retry already replaced is history, its successor is what
+    # describes where the invoice stands — so the gate and the loop can never
+    # judge two different reads of the run.
+    failed_payments = [p for p in active if p.status in RETRYABLE_PAYMENT_STATUSES]
 
     # Which of those invoices can legitimately take another attempt. Every gate
     # `create_payment_run_for_invoices` applies at run-creation time is re-run
@@ -5192,6 +5795,11 @@ async def retry_failed_payments(
         }
         blocked_ids = await blocked_invoice_ids(db, invoice_ids)
         vendor_refused_ids = set(await inactive_vendor_statuses(db, invoices.values()))
+        # Blanked since the run was built: dispatch would refuse it
+        # (`dispatch_preflight`), so booking an attempt would only add noise.
+        currency_unknown_ids = {
+            iid for iid, inv in invoices.items() if normalize_currency_code(inv.currency) is None
+        }
         credit_conflict_ids = set(await applied_credit_conflicts(db, invoices.values()))
         # A live virtual card minted since the run was built claims the invoice
         # on a rail this retry isn't using. Same shared gate the run builder and
@@ -5224,6 +5832,9 @@ async def retry_failed_payments(
             continue
         if payment.invoice_id in vendor_refused_ids:
             skipped.append("vendor_not_active")
+            continue
+        if payment.invoice_id in currency_unknown_ids:
+            skipped.append("currency_unknown")
             continue
         if payment.invoice_id in card_claimed_ids:
             skipped.append("invoice_has_live_card")

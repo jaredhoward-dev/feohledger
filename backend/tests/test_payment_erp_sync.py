@@ -92,6 +92,7 @@ async def _seed_run(
                 invoice_number="INV-SYNC-1",
                 vendor_name="Vendor Co",
                 amount=amount,
+                currency="USD",
                 status=invoice_status,
                 organization_id=org_id,
             )
@@ -211,6 +212,7 @@ async def test_no_erp_configured_does_not_strand_an_unsettled_invoice(realdb):
                 invoice_number="INV-NOERP-INFLIGHT",
                 vendor_name="Vendor Co",
                 amount=Decimal("100.00"),
+                currency="USD",
                 status=InvoiceStatus.payment_scheduled,
                 organization_id=org_id,
             )
@@ -292,6 +294,7 @@ async def test_sync_does_not_pay_in_flight_payment_invoice(realdb):
                     invoice_number=num,
                     vendor_name="V",
                     amount=Decimal("50.00"),
+                    currency="USD",
                     status=InvoiceStatus.payment_scheduled,
                     organization_id=org_id,
                 )
@@ -353,6 +356,7 @@ async def test_sync_tenant_isolation(realdb):
                 invoice_number="INV-B",
                 vendor_name="B Vendor",
                 amount=Decimal("10.00"),
+                currency="USD",
                 status=InvoiceStatus.payment_scheduled,
                 organization_id=org_b,
             )
@@ -451,10 +455,18 @@ async def test_failed_leg_opens_an_erp_reconciliation_exception(realdb):
     assert len(rows) == 1, "the strand must be visible in the exception queue"
     exc_row = rows[0]
     assert exc_row.severity == "error"
-    # PII-free + actionable: identifiers, the failure CLASS, and the exit.
-    assert "RuntimeError" in exc_row.description
-    assert "erp exploded" not in exc_row.description
-    assert f"/api/payments/runs/{run_id}/sync-erp" in exc_row.description
+    # A catalogue sentence for an AP user: no id, no class name, no API path —
+    # those ride erp_report as data (decisions §319, §331).
+    assert exc_row.description_code == "exception.erp_sync_back_failed"
+    assert exc_row.description_params == {}
+    assert "Retry ERP sync" in exc_row.description
+    for leaked in ("RuntimeError", "erp exploded", "/api/", str(run_id)):
+        assert leaked not in exc_row.description
+    assert exc_row.erp_report["kind"] == "payment_sync_back_failed"
+    assert exc_row.erp_report["payment_run_id"] == str(run_id)
+    assert exc_row.erp_report["failure"] == "RuntimeError"
+    assert exc_row.erp_report["invoice_status"] == "payment_scheduled"
+    assert "erp exploded" not in str(exc_row.erp_report)
 
 
 async def test_unsupported_erp_adapter_strands_visibly_not_silently(realdb):
@@ -491,8 +503,9 @@ async def test_unsupported_erp_adapter_strands_visibly_not_silently(realdb):
     assert len(rows) == 1, "the strand must be visible in the exception queue"
     exc_row = rows[0]
     assert exc_row.severity == "error"
-    assert "UnknownErpAdapterError" in exc_row.description
-    assert f"/api/payments/runs/{run_id}/sync-erp" in exc_row.description
+    assert exc_row.description_code == "exception.erp_sync_back_failed"
+    assert exc_row.erp_report["failure"] == "UnknownErpAdapterError"
+    assert exc_row.erp_report["payment_run_id"] == str(run_id)
 
 
 async def test_unopenable_erp_credentials_fail_the_leg_not_silently_pay(realdb, monkeypatch):
@@ -518,7 +531,7 @@ async def test_unopenable_erp_credentials_fail_the_leg_not_silently_pay(realdb, 
     assert inv.status == InvoiceStatus.payment_scheduled
     rows = await _open_erp_reconciliation_rows(realdb, "a", invoice_id)
     assert len(rows) == 1
-    assert "CredentialCryptoError" in rows[0].description
+    assert rows[0].erp_report["failure"] == "CredentialCryptoError"
 
 
 async def test_failed_leg_exception_is_deduped_across_retries(realdb):
@@ -570,6 +583,7 @@ async def test_failed_leg_does_not_discard_a_sibling_leg_that_already_synced(rea
                     invoice_number=num,
                     vendor_name="V",
                     amount=Decimal("40.00"),
+                    currency="USD",
                     status=InvoiceStatus.payment_scheduled,
                     organization_id=org_id,
                 )
@@ -836,6 +850,7 @@ async def test_retry_endpoint_409s_when_no_payment_settled(realdb):
                 invoice_number="INV-FLIGHT-ONLY",
                 vendor_name="V",
                 amount=Decimal("12.00"),
+                currency="USD",
                 status=InvoiceStatus.payment_scheduled,
                 organization_id=org_id,
             )

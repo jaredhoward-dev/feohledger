@@ -33,7 +33,9 @@ pilot. With it off:
 
 **What production should set:** a deployment that takes self-service customers
 keeps the default (`true`) and **must** set `FEOH_HCAPTCHA_SECRET` and
-`FEOH_HCAPTCHA_SITEKEY` — it refuses to boot without the secret. A deployment
+`FEOH_HCAPTCHA_SITEKEY` — it refuses to boot without either (the site key is
+what `/api/public-config` hands the widget; without it every signup fails the
+captcha), and the post-deploy smoke check confirms `public-config` serves it. A deployment
 whose tenants are provisioned by hand sets `FEOH_SIGNUP_ENABLED=false` and may
 leave both hCaptcha values empty.
 
@@ -49,14 +51,79 @@ file: a secret starting `0x` is otherwise read by YAML as a number.
 ## User journey
 
 1. Visitor lands on the apex domain (no subdomain) and clicks **Create your workspace**.
-2. `/signup` form: company name, desired slug, admin name, admin email, hCaptcha (rendered in its dark theme, since the app is dark-only).
-3. Form submits `POST /api/signup/start`. Backend validates (including refusing an admin name that holds a web or email address: the name greets the reader of an email sent to whatever address the visitor typed, and mail clients auto-link a bare URL even in inert text), records an `EmailVerification` row, and emails a verification link (`PUBLIC_URL/verify?token=...`).
+2. `/signup` form: company name, desired slug, admin name, admin email, hCaptcha (explicit render, in whichever theme the page is showing — `theme.resolved` — and redrawn when that changes unless the visitor has already solved it, decisions §289, §290). The page's theme picker (every `AuthShell` page carries one) writes the shared `feoh_theme` cookie on the platform domain, so a theme chosen here is the one the new workspace opens in. The form holds the server's input rules up front — both names `minlength="2"` (`schemas/signup.py`), and the slug rule from `utils/slug.py` (starts with a letter, no trailing or doubled hyphen; the reserved list stays the availability check's) — and puts a refusal on the field it is about: the `/start` 409 on the workspace address, each Pydantic 422 item on the field its `loc` names (`aria-invalid` + `aria-describedby`, focus moved there); anything else stays in the banner. **Captcha edge cases:** if hCaptcha's script cannot load (a content blocker or a browser privacy shield — the `<script>`'s `error` event, or `load` with no `hcaptcha` global), the page says so where the widget would be (`role="alert"`) and drops the failed element so the next visit retries; and because the backend verifies the captcha *before* the slug-taken 409 or the email 502, any answer from the server clears the token and resets the widget, so a retry never carries a spent token. Guards: `frontend/tests-e2e/signup/captcha.spec.ts`, `form-rules.spec.ts`.
+3. Form submits `POST /api/signup/start`. Backend validates (including refusing an admin name that holds a web or email address: the name greets the reader of an email sent to whatever address the visitor typed, and mail clients auto-link a bare URL even in inert text), records an `EmailVerification` row, and emails a verification link (`PUBLIC_URL/verify?token=...`). The form sends the visitor's UI `locale`, and the verification and welcome emails are written in it (`email_adapters/email_catalogue.py`, all six locales; anything unsupported falls back to English, never a refusal).
+
+   **Every refusal on `/api/signup/*` is coded** (`api/refusals.coded_refusal`, issue #635 finding 18): the workspace-address rules carry `utils/slug.py`'s `SLUG_*` code (`slug_required`, `slug_format`, `slug_reserved`, `slug_hyphen_edge`, `slug_double_hyphen`, `slug_taken`, and `signup_slug_held` for an address resting after a workspace closure — below — each with `params.slug`), the captcha `utils/hcaptcha.py`'s (`captcha_required` / `captcha_unavailable` / `captcha_failed`), and the rest `signup_email_invalid`, `signup_name_has_link`, `signup_email_send_failed`, `signup_link_invalid` (the uniform 410), `signup_unavailable` (503) and `signup_provisioning_failed` (500). One about a form field carries `params.field` — the `SignupStartRequest` field name — and the page puts the sentence under that field. `GET /slug-check` returns the same code beside its `reason`. The client states each from its code (`frontend/src/lib/api/codedRefusals.ts`), so nothing reaches the visitor in the server's English, and the copy says "workspace address", never "slug". The codes are exactly as specific as the English they replace: `/start` still answers an address that has an account like any other (decisions §292). The `/start` success `message` stays English for API clients; the page writes its own confirmation from the address it submitted.
 4. User clicks the link. `/verify?token=...` calls `POST /api/signup/complete`. Backend re-checks availability and provisions the tenant (DB + org + an admin user with **no password** — `hashed_password` NULL, the representation SSO-only users already have, so `/auth/login` refuses the account until a password exists; `must_change_password=false`). It then mints a **set-password link**: a forgot-password reset token (`services/password_reset.issue_reset_token`, same Redis store, keyed digest and single-use `GETDEL`) with a longer life, `FEOH_SIGNUP_SET_PASSWORD_TTL_HOURS` (default 72), built by the same `utils/tenant_urls.password_reset_url` as the reset email plus `&mode=set`. The link is returned to the browser (`set_password_url`) **and** emailed in the welcome message; it is one token, so whichever copy is used first spends the other.
 5. The verify page shows **Set your password**, a button straight to `<tenant>/login/reset-password?token=…&mode=set`. That page (the existing reset page) reads the token with `POST /api/auth/reset-password/check` — a read that never consumes it, so a mail scanner opening the link, or a reload, leaves it usable — fills a hidden `autocomplete="username"` field with the account email so a password manager saves the new password under it, and redeems the token with `POST /api/auth/reset-password` on submit. Only that submit spends the token.
 6. The confirmation links to `/login?email=<address>`; the login page prefills its email field from `?email=` (`frontend/src/lib/utils/prefillEmail.ts`, a plausible single address only). The user signs in with the password they chose — no forced change.
-7. An expired or used link explains itself on the reset page and offers **Forgot password**, which works for this account like any other (it needs only an active user, not an existing password).
+7. An expired or used link explains itself on the reset page and offers **Forgot password**, which works for this account like any other (it needs only an active user, not an existing password). That holds whether the link was already dead when the page loaded (the check's `400`) or died between loading and submitting (another tab or the emailed copy spent it, or it expired): the submit's `400` switches the page to the same screen rather than leaving an error over a form that can never succeed. The page branches on the status, which the reset endpoints reserve for a refused link; a `422` weak password or a `429` keeps the form.
+
+### Opening the verification link again
+
+`/verify` redeems the token on page load, so a reload, a second tab, or a mail scanner that ran the page first all reach `/complete` with a token that is already spent. A spent, unexpired token whose slug now names an organization holding an account with the link's address is **re-answered, not re-run**: `200` with `already_verified: true`, the workspace's URL and `sign_in_url`, and `set_password_url: null`. Nothing is issued: no second set-password link, no welcome email, no audit row. The page then shows **Your workspace is ready** with a **Go to sign in** button and says the set-password link is in the welcome email (or Forgot password works). A spent token that created no workspace, or one past its 24-hour life, is still the uniform `410`. Why a re-answer rather than a redeem button: [decisions.md](decisions.md) §292.
+
+Once `/complete` has answered, the page removes `?token=` from its address (a shallow, replacing `goto`), so the link does not linger in the browser's history list, a copied URL or a screenshot. The token moves into that tab's own history entry (`persistState`), which no copy or share carries, so a reload still re-sends it and gets the re-answer above.
+
+The uniform `410` renders as **This link has expired** with localized copy (verification links work once and last 24 hours), **Start over**, and a note that someone who already set up their workspace signs in at its own address, which their welcome email holds. The page keys on the `410` status, never the server's English, and the response stays uniform: it names no workspace, so it cannot tell a token that never existed from one that did.
+
+### An address that already has an account
+
+`users.email` is unique across every organization, so an address that already has an account can never be provisioned. `/signup/start` answers it **exactly like any other address** and sends the verification link, because a public endpoint must not tell anyone which addresses have accounts. `/signup/complete`, reached only by someone who can read that mailbox, checks the address (case-insensitively) before the slug and before provisioning, and answers `409`:
+
+```json
+{"detail": {"code": "signup_email_has_workspace",
+            "message": "This email address already has a FeohLedger workspace. Sign in at https://<their-workspace>/login?email=….",
+            "params": {"sign_in_url": "https://<their-workspace>/login?email=…"}}}
+```
+
+`sign_in_url` is the **existing** account's sign-in page, built like the wrong-workspace login refusal's (§288). The verification is spent when the refusal is given, so the link never reaches provisioning again, and re-opening it repeats the same refusal. The `/verify` page shows **You already have a workspace**, the localized sentence and a **Go to your workspace's sign-in page** button. If the account appears between the check and provisioning, `provision_tenant` fails on the unique index, drops the database it created and removes its control-plane rows, and `/complete` answers this same refusal instead of a 500.
+
+There is no self-service way yet to find your workspace without starting a signup: see `docs/followups.md` (an apex "email me my workspace address" form).
 
 The welcome email carries the **Set your password** button (with the paste-this fallback and the expiry), the workspace URL and the email as plain panel values, and a sign-in link with the address prefilled — no password anywhere. Its preheader is fixed copy ("Your workspace is live."), never the link. With no tenant base URL configured, `/complete` refuses with `503` **before** provisioning and leaves the verification unconsumed — a passwordless admin with no link to set a password (forgot-password needs that URL too) would have no way in. A Redis failure while minting yields no link (the email and the verify page point at Forgot password) rather than failing a request whose tenant already exists. The response is sent `Cache-Control: no-store`, and the issuance is audited as `auth.password_reset.requested` with `via: signup`.
+
+## Closing a workspace the signer-up no longer wants
+
+The address used at signup becomes that workspace's one account, and one address
+can belong to only one workspace (`docs/decisions.md` §291). A trial that is
+abandoned therefore holds its admin's address: if that person is later added to
+another workspace — their employer's, typically — the add is refused
+`email_in_other_workspace`. The way out is self-service, not support: they sign
+in to the abandoned workspace (**Forgot password** works if they never set one)
+and close it from **Organization → Close workspace**. Closing deletes the
+workspace and every account in it, through the operator's own deletion code, so
+the address is free at once.
+
+It is a narrow door on purpose: a workspace that holds anything that must be
+kept — approved invoices, payments, other active users, a paid subscription and
+the rest of the list in [`user-management.md`](user-management.md) § Freeing an
+address held by an abandoned workspace — is refused with its reasons, and
+support closes it instead. The closure needs the slug typed back and, where MFA
+is on, a code or a passkey. What it leaves behind: a control-plane
+`workspace_closures` row (ids, slug, proof, counts — no address), the
+`organization.closing` audit event already shipped to the write-once archive
+where audit shipping is on, and the per-tenant backups, which an operator
+removes within the DPA's 60 days
+([`founder-runbooks/workspace-closure.md`](founder-runbooks/workspace-closure.md)).
+Until the operator has — and for 90 days from the closure in any case
+(`utils/slug.CLOSED_SLUG_COOLDOWN`), so bookmarks, identity-provider redirect
+URIs and invite emails cannot point at a new owner early — the closed
+workspace's slug is held. Signup says so in its own words: the slug check
+returns `code: signup_slug_held` (the same `code` field as every other
+workspace-address rule — `utils/slug.SLUG_HELD`, raised as `SlugHeld`) and
+`/signup/start` and `/signup/complete` refuse with the coded `409 signup_slug_held` ("temporarily unavailable after a workspace
+closure", localized), never the bare "already taken". The hold lives in
+`provision_tenant`, so the partner and operator paths get it too.
+
+After a closure, the address it held signs up again like any other: `/start`
+and `/complete` provision a new workspace under a different slug, since §292's
+existing-account refusal no longer finds it. The closed workspace's own
+verification link is deleted with it, so re-opening it is the uniform 410.
+Nothing deletes an abandoned trial on its own; why, and what would have to
+change first: `docs/decisions.md` §306 and `docs/followups.md` § Surfaced by
+self-service workspace closure.
 
 ## Backend components
 
@@ -87,12 +154,14 @@ The welcome email carries the **Set your password** button (with the paste-this 
 
 - **Captcha**: hCaptcha on `POST /signup/start`. Skipped locally when `FEOH_HCAPTCHA_SECRET` is empty — but a **deployed** env (`FEOH_ENVIRONMENT` not in `development`/`test`/`ci`/…) with signup on **refuses to boot** with the secret empty, so the gate can't silently fail open in production. The empty-secret skip logs at WARNING. To close signup, don't starve the captcha — set `FEOH_SIGNUP_ENABLED=false` (above), which also lifts the secret requirement.
 - **Rate limit (per IP)**: Redis sliding window keyed by IP+endpoint. `FEOH_SIGNUP_RATE_LIMIT_PER_HOUR` (default 5) caps `/signup/start` and `/signup/complete`; `/signup/slug-check` has its own higher cap (`FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR`, default 120) so it can't be scripted for namespace enumeration / control-plane DB amplification.
+- **A limit's refusal** is a `429` with `Retry-After` and the coded `rate_limited` detail (`params.retry_after_seconds`), which the signup page states in the visitor's language in its banner — "wait 30 minutes", rounded up — since it is about no one field. It names no limit and no count.
 - **Rate limit (per email)**: a second limiter keyed on the target address (`FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR`, default 3) caps verification-email volume to one victim — the per-IP limit alone can't stop an attacker rotating IPs to email-bomb an address. A "resend" also **replaces** any prior un-consumed verification for that email, so the table can't grow unbounded per address.
 - **Email verification**: no resources are provisioned until the user proves inbox access by clicking the link. Stolen email addresses don't result in tenants.
-- **Single-use, race-safe tokens**: `/signup/complete` selects the verification row `FOR UPDATE`, so two concurrent completes for one token can't both pass the consumed-check and double-provision. Every non-actionable token state (missing / consumed / expired) returns the **same** 410 + message, so the response can't be used to tell a token that never existed from one that did.
+- **Single-use, race-safe tokens**: `/signup/complete` selects the verification row `FOR UPDATE`, so two concurrent completes for one token can't both pass the consumed-check and double-provision; the loser waits for the winner's commit and gets the re-answer (above). Every token that cannot be acted on (missing, expired, or spent without having created a workspace for its own address) returns the **same** 410 + message, so the response can't be used to tell a token that never existed from one that did.
+- **No account enumeration at `/start`**: an address that already has an account gets the same response and the same verification email as any other; only `/complete`, after the mailbox is proven, says so.
 - **Slug squatting**: slugs are only locked when `/complete` runs. Abandoned `/start` submissions do not reserve the namespace.
 - **Reserved subdomains**: `utils/slug.py` → `RESERVED_SLUGS` blocks names that would collide with marketing/infra subdomains (`www`, `api`, `admin`, etc.). The check is enforced inside `provision_tenant` too, before any database work, so the operator CLI (`scripts/create_tenant.py`, and `deploy/add-tenant.sh` behind it) cannot provision a reserved or malformed slug; the CLI exits 2 with the reason.
-- **No orphan databases**: if provisioning fails after the tenant DB is created (control-plane insert or table creation errors), the DB this attempt created is dropped, so partial failures don't leak databases or squat the namespace.
+- **No orphan databases**: if provisioning fails after the tenant DB is created (control-plane insert or table creation errors), the DB this attempt created is dropped, so partial failures don't leak databases or squat the namespace. A failure the address or the slug explains (a race lost since the checks) is answered as the coded refusal or the slug `409`; only an unexplained one is a `500`, with the token left unconsumed so a transient fault can be retried.
 - **Log hygiene**: the submitter's email (PII) and raw captcha-network exception text are kept out of logs.
 - **Partial-failure visibility**: if the welcome email fails after provisioning, the verify page still carries the set-password link, and Forgot password works for the account. Logs warn loudly, naming the slug only.
 - **No credential at rest in the inbox**: the welcome email holds a single-use link that dies on first use or after `FEOH_SIGNUP_SET_PASSWORD_TTL_HOURS`, where it used to hold a temporary password that stayed valid until someone signed in. Neither the token nor the link is written to an application log line or the preheader (the `console` adapter, dev-only, prints whole messages by design).
@@ -114,7 +183,7 @@ Adding a provider: copy `app/services/email_adapters/console_adapter.py`, implem
 | `FEOH_EMAIL_FROM` | `no-reply@localhost` | Verified SES sender in prod |
 | `FEOH_AWS_SES_REGION` | `us-east-1` | Only used by the SES adapter |
 | `FEOH_PUBLIC_URL` | `http://localhost:7777` | Frontend URL — used to build verification links |
-| `FEOH_TENANT_URL_TEMPLATE` | `http://{slug}.localhost:7777` | `{slug}` is substituted in the welcome email and the set-password link; blank → `/signup/complete` answers 503 before provisioning |
+| `FEOH_TENANT_URL_TEMPLATE` | `http://{slug}.localhost:7777` | `{slug}` is substituted in the welcome email and the set-password link; blank → `/signup/complete` answers 503 before provisioning. Must be `http(s)://{slug}<host>` with nothing before `{slug}` and no path: the signup form and `/find-workspace` read the host suffix from it (`lib/utils/workspaceAddress.ts::tenantHostSuffix`) and show none for any other shape |
 | `FEOH_SIGNUP_SET_PASSWORD_TTL_HOURS` | `72` | Lifetime of the signup admin's single-use set-password link (minimum 1). Longer than the 30-minute forgot-password link because nobody is waiting at the keyboard for it — see `docs/decisions.md` §283 |
 | `FEOH_ENVIRONMENT` | `development` | Deployment discriminator. Any value outside `development`/`dev`/`local`/`test`/`ci` is "deployed" and turns on the production safety guards (e.g. captcha must be configured). |
 | `FEOH_SIGNUP_ENABLED` | `true` | Master switch for `/api/signup/*`. `false` → every signup route 404s, `/signup` says signup is closed, and the hCaptcha secret is no longer required. See § Turning signup off. |

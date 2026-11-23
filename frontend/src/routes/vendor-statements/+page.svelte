@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Reconciliation, ReconStatus } from '#lib/types/vendorStatementRecon.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import {
 		RECON_STATUSES,
 		reconStatusLabelKey,
@@ -23,12 +24,14 @@
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
 	import VendorStatementReconModal from '#lib/components/modals/VendorStatementReconModal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { page } from '$app/state';
@@ -52,12 +55,12 @@
 
 	const COLUMNS = $derived([
 		{ label: m('vendorStatements.col.vendor') },
-		{ label: m('vendorStatements.col.statementDate') },
-		{ label: m('vendorStatements.col.reference') },
-		{ label: m('vendorStatements.col.discrepancies'), class: 'right' },
-		{ label: m('vendorStatements.col.statementTotal'), class: 'right' },
-		{ label: m('vendorStatements.col.ledgerTotal'), class: 'right' },
-		{ label: m('vendorStatements.col.status') },
+		{ label: m('vendorStatements.col.statementDate'), class: 'col-date' },
+		{ label: m('vendorStatements.col.reference'), class: 'col-ref' },
+		{ label: m('vendorStatements.col.discrepancies'), class: 'right col-count' },
+		{ label: m('vendorStatements.col.statementTotal'), class: 'right col-amount' },
+		{ label: m('vendorStatements.col.ledgerTotal'), class: 'right col-amount' },
+		{ label: m('vendorStatements.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -72,6 +75,10 @@
 	let pageNum = $state(1);
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// A failed first-page load is its own state: rendering the table's empty
+	// row instead told the reader no reconciliation matched, when nothing had
+	// been read at all.
+	let loadError = $state(false);
 
 	let closeReady = $state<boolean | null>(null);
 	let blockingCount = $state(0);
@@ -160,12 +167,18 @@
 			recons = opts.append ? appendUnique(recons, data.items) : data.items;
 			total = data.total;
 			pageNum = nextPage;
+			loadError = false;
 		} catch (e) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!fetchSequence.isCurrentRequest(token)) return;
-			if (!opts.append) recons = [];
-			toast(e instanceof Error ? e.message : m('vendorStatements.toast.loadFailed'), 'error');
+			if (opts.append) {
+				toast(errorMessage(e, m('vendorStatements.toast.loadFailed')), 'error');
+			} else {
+				recons = [];
+				total = 0;
+				loadError = true;
+			}
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -272,11 +285,13 @@
 	let confirmDeleteId = $state<string | null>(null);
 
 	async function deleteRecon(r: Reconciliation) {
+		if (busyId) return;
 		if (confirmDeleteId !== r.id) {
 			confirmDeleteId = r.id;
 			return;
 		}
-		confirmDeleteId = null;
+		// Stays armed until the request settles, so the busy button keeps
+		// reading "Confirm" rather than reverting mid-request.
 		busyId = r.id;
 		try {
 			await deleteReconciliation(r.id);
@@ -287,9 +302,10 @@
 			loadCloseReadiness();
 			void loadSummary();
 		} catch (e) {
-			toast(e instanceof Error ? e.message : m('vendorStatements.toast.deleteFailed'), 'error');
+			toast(errorMessage(e, m('vendorStatements.toast.deleteFailed')), 'error');
 		} finally {
 			busyId = null;
+			confirmDeleteId = null;
 		}
 	}
 
@@ -327,7 +343,7 @@
 
 <svelte:window
 	onclick={(e) => {
-		if (confirmDeleteId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
+		if (confirmDeleteId && !busyId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
 			confirmDeleteId = null;
 		}
 	}}
@@ -357,73 +373,91 @@
 		<HelpTip term="statement-reconciliation" />
 	</div>
 
-	<DataTable
-		columns={COLUMNS}
-		isEmpty={!loading && recons.length === 0}
-		empty={loading ? m('common.loading') : m('vendorStatements.empty')}
-		colspan={8}
-	>
-		{#snippet body()}
-			{#each recons as recon (recon.id)}
-				<tr
-					class="clickable"
-					onclick={(e) => {
-						if (isRowOpenClick(e)) openDetail(recon);
-					}}
-				>
-					<td>
-						<RowLink
-							onclick={() => openDetail(recon)}
-							ariaLabel={m('vendorStatements.row.openAria', { vendor: recon.vendor_name ?? m('vendorStatements.vendorFallback'), date: recon.statement_date })}
-						>
-							{recon.vendor_name ?? '—'}
-						</RowLink>
-					</td>
-					<td class="muted">{formatDate(recon.statement_date)}</td>
-					<td class="muted">{recon.statement_reference ?? '—'}</td>
-					<td class="right mono">
-						{#if discrepancyCount(recon) > 0}
-							<Badge tone="danger" variant="disc-badge">{discrepancyCount(recon)}</Badge>
-						{:else}
-							<span class="disc-clean">0</span>
-						{/if}
-					</td>
-					<td class="right mono"><Money amount={recon.summary.statement_total} currency={recon.currency} /></td>
-					<td class="right mono"><Money amount={recon.summary.ledger_total} currency={recon.currency} /></td>
-					<td>
-						<Badge tone={RECON_STATUS_TONES[recon.status]} variant={recon.status}>
-							{statusLabel(recon.status)}
-						</Badge>
-					</td>
-					<td class="actions">
-						{#if canCreate}
-							<RowAction
-								variant="danger"
-								armed={confirmDeleteId === recon.id}
-								disabled={busyId === recon.id}
-								onclick={() => deleteRecon(recon)}
-								ariaLabel={m('vendorStatements.row.deleteAria', { vendor: recon.vendor_name ?? m('vendorStatements.vendorFallback'), date: recon.statement_date })}
+	{#if loadError && !loading}
+		<LoadError
+			message={m('vendorStatements.toast.loadFailed')}
+			onretry={() => load()}
+			testId="vendor-statements-load-error"
+		/>
+	{:else}
+		<div class="recon-table">
+		<DataTable
+			fixed
+			columns={COLUMNS}
+			isEmpty={!loading && recons.length === 0}
+			{loading}
+			filtered={statusFilter !== 'all' || !!appliedSearch}
+			emptyFiltered={m('vendorStatements.empty')}
+			empty={m('vendorStatements.emptyNone')}
+			colspan={8}
+		>
+			{#snippet body()}
+				{#each recons as recon (recon.id)}
+					<tr
+						class="clickable"
+						onclick={(e) => {
+							if (isRowOpenClick(e)) openDetail(recon);
+						}}
+					>
+						<td>
+							<RowLink
+								onclick={() => openDetail(recon)}
+								ariaLabel={m('vendorStatements.row.openAria', { vendor: recon.vendor_name ?? m('vendorStatements.vendorFallback'), date: formatDate(recon.statement_date) })}
 							>
-								{confirmDeleteId === recon.id ? m('vendorStatements.row.confirm') : m('vendorStatements.row.delete')}
-							</RowAction>
-						{/if}
-					</td>
-				</tr>
-			{/each}
-		{/snippet}
-	</DataTable>
-
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={() => load({ append: true })} disabled={loadingMore}>
-				{loadingMore ? m('common.loading') : m('vendorStatements.loadMore', { shown: recons.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('vendorStatements.showingAll', { total })}</span>
+								{recon.vendor_name ?? '—'}
+							</RowLink>
+						</td>
+						<td class="muted">{formatDate(recon.statement_date)}</td>
+						<!-- Vendor free text, often one unbroken token: clipped to the
+						     fixed column with the full value on hover. -->
+						<td class="muted ref-cell" title={recon.statement_reference ?? undefined}
+							>{recon.statement_reference ?? '—'}</td
+						>
+						<td class="right mono">
+							{#if discrepancyCount(recon) > 0}
+								<Badge tone="danger" variant="disc-badge">{discrepancyCount(recon)}</Badge>
+							{:else}
+								<span class="disc-clean">0</span>
+							{/if}
+						</td>
+						<td class="right mono"><Money amount={recon.summary.statement_total} currency={recon.currency} /></td>
+						<td class="right mono"><Money amount={recon.summary.ledger_total} currency={recon.currency} /></td>
+						<td>
+							<Badge tone={RECON_STATUS_TONES[recon.status]} variant={recon.status}>
+								{statusLabel(recon.status)}
+							</Badge>
+						</td>
+						<td class="actions">
+							{#if canCreate}
+								<RowAction
+									variant="danger"
+									armed={confirmDeleteId === recon.id}
+									busy={busyId === recon.id}
+									disabled={busyId !== null && busyId !== recon.id}
+									onclick={() => deleteRecon(recon)}
+									ariaLabel={m('common.rowActionAria', { action: confirmDeleteId === recon.id ? m('vendorStatements.row.confirm') : m('vendorStatements.row.delete'), name: `${recon.vendor_name ?? m('vendorStatements.vendorFallback')} ${formatDate(recon.statement_date)}` })}
+								>
+									{confirmDeleteId === recon.id ? m('vendorStatements.row.confirm') : m('vendorStatements.row.delete')}
+								</RowAction>
+							{/if}
+						</td>
+					</tr>
+				{/each}
+			{/snippet}
+		</DataTable>
 		</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={recons.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		errored={loadError}
+		onloadmore={() => load({ append: true })}
+		moreKey="vendorStatements.loadMore"
+		allKey="vendorStatements.showingAll"
+	/>
 </PageHeader>
 
 {#if showCreate}
@@ -435,6 +469,30 @@
 {/if}
 
 <style>
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.recon-table { min-width: 0; }
+	.recon-table :global(table) { min-width: 1250px; }
+	.recon-table :global(th.col-date) { width: 140px; }
+	.recon-table :global(th.col-ref) { width: 160px; }
+	.recon-table :global(th.col-count) { width: 140px; }
+	.recon-table :global(th.col-amount) { width: 160px; }
+	.recon-table :global(th.col-status) { width: 150px; }
+	.recon-table :global(th.actions-col) { width: 140px; }
+	.ref-cell {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
 	.filter-row {
 		display: flex;
 		align-items: center;

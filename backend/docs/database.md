@@ -37,6 +37,30 @@ Tenant connections are derived automatically:
 postgresql+asyncpg://postgres:postgres@localhost:5432/feoh_acme
 ```
 
+**Every connection is made by `app/db_engine.py`.** Import
+`create_async_engine` from there (a drop-in for SQLAlchemy's), and open a raw
+connection (CREATE / DROP DATABASE, a one-off probe) with
+`connect_raw(url, database=...)`, never a bare `asyncpg.connect`.
+`tests/test_db_engine_chokepoint.py` fails on any other way in, under `app/`,
+`scripts/` or `alembic/`. The reason is `FEOH_DATABASE_IAM_AUTH`: in production
+the app signs in as the `feoh_app` role with an RDS IAM token the factory mints
+per new connection, off the event loop, and the URL carries no password. A
+connection opened around the factory would have nothing to sign in with
+(`docs/environment.md`, `../../docs/decisions.md` §310).
+
+**The production role owns everything, but is not a superuser.** The app signs
+in as `feoh_app` and every session acts as `feoh_owner` (its `role` default),
+which holds `CREATEDB` and owns the control plane, every tenant database and
+every object in them. Neither role is in `rds_superuser` or can create roles or
+untrusted extensions. `DROP DATABASE … WITH (FORCE)` needs `SET ROLE NONE`
+first, as `tenant_provisioning._drop_postgres_database` does, because only the
+signing-in role may terminate its own other sessions. pgvector comes from `template1`, where the master created
+it once, so `CREATE EXTENSION IF NOT EXISTS vector` is a no-op the role may run.
+**A new migration must not need more than owner rights.** Creating an untrusted
+extension, `ALTER SYSTEM`, or a role change would fail in production as the app
+role. Such a step is a master (break-glass) operation, done by hand
+(`../../deploy/README.md` § Database role).
+
 ## Data Models
 
 ### Numeric column types — the guard is opt-out
@@ -97,17 +121,19 @@ decimal comparison rather than binary drift.
 ### Control-Plane Tables
 
 - `organizations` — tenant registry (name, slug, db_name, settings, plan). `settings.erp.oauth` holds an ERP OAuth connection's metadata only; its tokens are sealed in `provider_credentials` with the block's other secrets (`erp-integration.md` § Where the credentials live).
-- `users` — all users across all tenants. Columns: `email`, `full_name`, `hashed_password` (nullable for SSO-only), `organization_id`, `is_active`, `must_change_password`, `sso_provider` + `sso_provider_id` (OIDC linkage), `mfa_secret` + `mfa_enabled` + `mfa_enrolled_at` (TOTP MFA)
+- `users` — all users across all tenants. Columns: `email` (stored normalized; unique without regard to case via `uq_users_email_lower` on `lower(email)`, migration 0138 — see § Email case collisions), `full_name`, `hashed_password` (nullable for SSO-only), `organization_id`, `is_active`, `must_change_password`, `sso_provider` + `sso_provider_id` (OIDC linkage), `mfa_secret` + `mfa_enabled` + `mfa_enrolled_at` (TOTP MFA)
 - `roles` — role definitions (admin, ap_manager, ap_clerk, cfo)
 - `user_roles` — many-to-many join table
 - `email_verifications` — pending self-service signups (token, email, slug, admin_name, expires_at, consumed_at). Created by `POST /api/signup/start`, consumed by `POST /api/signup/complete`.
+- `subprocessor_notices` — one row per (sub-processor change-log entry, organisation) notified: `claimed_at` / `sent_at` / `audited_at`, the entry's `effective_on`, recipient counts and user ids, and `late` (decisions §321). Ids, dates and counts only; kept when the organisation is deleted.
+- `workspace_closures` — the record of a workspace its administrator closed (`POST /api/organization/close`, decisions §306): ids, slug, step-up proof, what was removed, and whether the operator has removed its backups yet. Kept when the tenant it describes is deleted.
 - `extraction_usage` — billing rows: invoice_id, provider, program_type, period (used for tracking platform-extraction usage), plus the provider's token usage — input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, model (all nullable, migration 0108; `backend/docs/ai-extraction.md` § Token tracking)
 - `card_rebates` — billing rows: virtual_card_id, amount, rate, status, period
 
 ### Tenant Tables
 
 #### Invoice Pipeline
-- `invoices` — master record (invoice_number, vendor_name, amount, currency, due_date, status, file_url, vendor_address, vendor_tax_id, ship_to_address, tax_rate, payment_method, reference_number, assigned_to_id, assigned_to, approved_by, rejected_by, **warnings** JSONB, **po_match** JSONB, **meta** JSONB)
+- `invoices` — master record (invoice_number, vendor_name, amount, **currency** — nullable since migration 0136: NULL means currency unknown (an upload before extraction, or a document that names none), never a guessed USD; a blank `""` from before 0136 became NULL, and every money path refuses NULL as `currency_unknown` (decisions §473), due_date, status, file_url, vendor_address, vendor_tax_id, ship_to_address, tax_rate, payment_method, reference_number, assigned_to_id, assigned_to, approved_by, **approved_by_user_id** — who gave the approval of record, by control-plane id, no FK, migration 0129, read by the reverse order of the receiving rule (`po-matching.md` § Before Payment, decisions §389), rejected_by, **warnings** JSONB, **po_match** JSONB (the latest match; every warning refresh rewrites it), **split_po_ids** JSONB — the POs a multi-PO split linked, stringified UUIDs, written only (append only) by `multi_po_split_v1`, read by the approval door's receiver / inspector sets and by the matcher, which matches a split against these legs while `po_number` still names them, migration 0133, decisions §433, **meta** JSONB, **erp_document_id** / **erp_document_url** — the bill of record in the ERP and its deep link, set only by a confirmed push, migration 0118; the id is indexed (non-unique) since 0132 for the generic ERP webhook's lookup, decisions §417)
   - `meta` is a free-form per-invoice metadata bag. Currently holds the cached audit-log summary under `meta["audit_summary"]` = `{text, confidence_context, source_fingerprint: {count, last_at}, generated_at, model}` — regenerated lazily when the audit-log fingerprint changes. No PII / banking data. See [`audit-summary.md`](audit-summary.md).
 - `invoice_line_items` — individual lines (description, qty, unit_price, tax, total)
 - `invoice_extraction_results` — AI extraction output per attempt (method, confidence, raw JSON, **priors_metadata** — summary of vendor cache overrides + RAG neighbors applied during extraction)
@@ -115,6 +141,14 @@ decimal comparison rather than binary drift.
 
 #### Extraction priors
 - `vendor_extraction_priors` — per-vendor correction cache. Unique on `(vendor_id, field_name)`. Populated when reviewers correct fields during approval; applied to low-confidence extractions for the same vendor.
+
+#### Vendors
+- `vendors` — supplier master. `erp_vendor_id` + `erp_link_realm` are its ERP link in the company it was last synced under (decisions §284); `merged_into_vendor_id` / `merged_by_user_id` / `merged_at` (migration 0128) record, once, the merge that retired it (decisions §383); `screening_adjudication_id` (the active `SanctionsAdjudication` covering the stored screen, cleared by any material edit before its re-screen) and `onboarded_by_user_id` (the creator, refused as adjudicator) are migration 0139 (decisions §477); `uq_vendors_erp_link` (migration 0141) keeps one vendor per ERP record per company — `(organization_id, erp_link_realm, erp_vendor_id) NULLS NOT DISTINCT WHERE erp_vendor_id IS NOT NULL` (decisions §486)
+- `vendor_erp_links` — its links in every other named ERP company (migration 0125): one per `(vendor_id, realm)`, filed by the vendor sync when a link leaves the row and restored by the next sync under that realm, and moved to the canonical vendor by a merge (decisions §373); the push reads a link only for the current realm (`services/vendor_erp_links`, decisions §356, `erp-integration.md` § GL accounts and vendors are linked by the ERP's unique key)
+
+#### Chart of accounts
+- `gl_accounts` — the chart. `erp_account_id` + `erp_link_realm` are its ERP link in the company it was last synced under (decisions §284), with `erp_link_confirmed_at` / `_by` when a person chose it and `erp_link_candidates` while it waits for that choice
+- `gl_account_erp_links` — that state for every other named ERP company (migration 0127): one per `(gl_account_id, realm)`, filed by the chart sync when it leaves the row and restored by the next chart sync under that realm, before rule 0; never posted to (`services/gl_account_erp_links`, decisions §376, `erp-integration.md` § GL accounts and vendors are linked by the ERP's unique key)
 
 #### Procurement (for 3-way matching)
 - `purchase_orders` — PO header (vendor, total, **currency**, status). `currency` is nullable with no default (migration 0099): the code the PO's source knew, NULL when none said — see `docs/decisions.md` §197
@@ -131,7 +165,7 @@ decimal comparison rather than binary drift.
 #### Payments
 - `payment_runs` — batch payment execution records. `nacha_export_count` (`integer NOT NULL DEFAULT 0`, migration 0106, not backfilled) counts the NACHA files exported for a run and drives each file's file-ID modifier (`payments.md` § The bank file); a run whose file is out sits in the `exported` claim status.
 - `payment_schedules` — due dates, early-pay discount windows
-- `payments` — individual payment records (amount, method, status, ref). `discount_offer_id` (FK `discount_offers`, `SET NULL`) + `discount_amount` (`numeric(15,2)`), added by migration 0104 and not backfilled, record the accepted early-payment discount the payment takes; `discount_offers.captured_by_payment_id` (FK `payments`, `SET NULL`) names the settled payment that realized a capture (`dynamic-discounting.md` § Paying the discounted amount). `quality_inspections.source` (`manual` / `qms`) + `recorded_by_user_id` (control-plane id, no FK), migration 0105, not backfilled — who a verdict came from, which decides whether a PO-match refresh may lift a quality hold (`po-matching.md` § Before Payment)
+- `payments` — individual payment records (amount, method, status, ref). `dispatch_attempted_at` (timestamptz, migration 0124): set while a dispatch attempt's outcome is unrecorded; a row that keeps it is in doubt whatever its `failure_reason` (`payments.md` § A dispatch attempt is marked, durably, before it starts). `payee_vendor_id` / `payee_bank_fingerprint` / `payee_recorded_at` (migration 0128): the payee the payment released money to — vendor, keyed fingerprint of its bank details, when — stamped at dispatch, NACHA export and record-outside, and compared by the void (`payments.md` § A payment records the payee it paid). `rail_breakdown` (jsonb, migration 0130, CHECK: an array or NULL): which rails one ERP-reported payment was made on and how much each (`[{"method", "amount"}]`, exact decimal strings, no account data), kept only when the parts sum exactly to `amount`; the 1099 aggregate splits the payment by it (`tax-1099.md` § One payment on two rails is split, decisions §396). `discount_offer_id` (FK `discount_offers`, `SET NULL`) + `discount_amount` (`numeric(15,2)`), added by migration 0104 and not backfilled, record the accepted early-payment discount the payment takes; `discount_offers.captured_by_payment_id` (FK `payments`, `SET NULL`) names the settled payment that realized a capture (`dynamic-discounting.md` § Paying the discounted amount). `quality_inspections.source` (`manual` / `qms`) + `recorded_by_user_id` (control-plane id, no FK), migration 0105, not backfilled — who a verdict came from, which decides whether a PO-match refresh may lift a quality hold (`po-matching.md` § Before Payment)
 
 #### Exceptions
 - `exceptions` — flagged issues (duplicate, mismatch, anomaly, resolution status). `description` is English; `description_code` (`varchar(100)`) + `description_params` (JSONB), added by migration 0103 and not backfilled, key it on the invoice-warning catalogue so clients localize it (`invoice-warnings.md` § Exception descriptions)
@@ -157,6 +191,17 @@ alembic upgrade head
 ```bash
 FEOH_MIGRATE_TENANT=feoh_acme alembic upgrade head
 ```
+
+A tenant database holds no organization settings. On a `FEOH_MIGRATE_TENANT`
+run `alembic/env.py` puts a lookup in `config.attributes["tenant_organization_erp"]`
+that reads this tenant's `organizations.settings->'erp'` from the control plane
+(by `db_name`), on first call only, through the app's engine factory. It returns
+`None` when the organization has no ERP block and raises `LookupError` when no
+organization names the database at all (an orphaned tenant), so a revision can
+tell the two apart. A revision
+that must stamp something by the tenant's current ERP connection calls it
+(0131, decisions §412); a bare `MigrationContext` (tests) has no config and
+no lookup, so such a revision must say what it does without one.
 
 ### All tenant DBs
 
@@ -190,6 +235,30 @@ Migrations may target either the control plane or tenant DBs — never both. Eac
 | 0006     | Tenant  | `invoices`   | Adds `invoices.po_match` JSONB column (latest 2/3-way PO match result).                                                  |
 | 0007     | Tenant  | `payments`   | Adds `payments.provider`, `provider_payment_id`, `failure_reason`, `submitted_at`, `completed_at` (adapter lifecycle).   |
 | 0022     | Tenant  | `vendors`    | Creates `vendor_change_requests` (supplier-portal staged bank/tax changes pending AP approval) + a partial index on `status='pending'`. |
+| 0118     | Tenant  | `invoices`   | Adds `invoices.erp_document_id` varchar(255) + `erp_document_url` varchar(1024); backfills the id from the invoice's single workflow instance's `state_data.erp_reference` (not `UNKNOWN`), never the URL (decisions §302). |
+| 0119     | Control | `workspace_closures` | Creates `workspace_closures`, the control-plane record of a self-service workspace closure that outlives the deleted tenant; no foreign keys; no-op on a tenant DB (decisions §306). |
+| 0120     | Tenant  | `contracts`  | Adds `contracts.activated_at` timestamptz; backfills it from the first `contract.active` audit row, else from an `active`/`expired`/`terminated` status (decisions §306). |
+| 0122     | Control | `subprocessor_notices` | Creates `subprocessor_notices`, the ledger of sub-processor change notices sent per (change-log entry, organisation); UNIQUE pair, no foreign key; downgrade keeps it; no-op on a tenant DB (decisions §321). |
+| 0123     | Tenant  | `purchase_orders` | Adds `purchase_orders.total_unverifiable_reason` varchar(40) — set by the ERP PO sync when the ERP still has the PO but the adapter could not price it exactly; the PO match refuses to compare against the row while it is set. No backfill (decisions §323). |
+| 0121     | Tenant  | `exceptions` | Adds `exceptions.erp_report` jsonb — what the ERP reported, as data, on the reconciliation rows the ERP paths open (the payment it reported and could not be recorded, with the refusal code). No backfill (decisions §319). |
+| 0124     | Tenant  | `payments`   | Adds `payments.dispatch_attempted_at` timestamptz, the in-doubt dispatch marker committed before every dispatch attempt and cleared when its outcome is recorded; backfills it on `pending` payments of `executing` runs, the rows a crashed pass leaves (`payments.md` § A dispatch attempt is marked, durably, before it starts). |
+| 0125     | Tenant  | `vendors`    | Creates `vendor_erp_links` — a vendor's ERP link in each company it is not currently synced under (`vendor_id` FK `ON DELETE CASCADE`, `realm` text NOT NULL, `erp_vendor_id` varchar(255); UNIQUE `(vendor_id, realm)`, index `(organization_id, realm)`). No backfill (decisions §356). |
+| 0126     | Tenant  | `invoices`, `exceptions` | Fills `invoices.uploaded_by_id` on a non-`done` invoice an employee created before decisions §131 (CSV import, recurring generate-now), from the actor on its `invoice.imported_csv` / `invoice.created` (`source = recurring_template`) audit row, only when every creation record on the invoice names that one employee; writes an `invoice.segregation_backfilled` row per change. Adds `exceptions.decided_by_user_id` (nullable `uuid`, no FK), backfilled on closed rows from their `exception.resolved` / `exception.dismissed` rows when every one is a single person's decision, so a suppressed re-raise can re-check segregation against the decider; downgrade drops the column and keeps the uploaders (decisions §367). |
+| 0127     | Tenant  | `gl_accounts` | Creates `gl_account_erp_links` — a GL account's ERP link state (link + confirmation, or open decision) in each named company it is not currently synced under (`gl_account_id` FK `ON DELETE CASCADE`, `realm` text NOT NULL, `erp_account_id` varchar(255) NULL, `erp_link_confirmed_at` / `_by`, `erp_link_candidates` jsonb; UNIQUE `(gl_account_id, realm)`, CHECK link-or-decision and no confirmation without a link, index `(organization_id, realm)`). No backfill (decisions §376). |
+| 0128     | Tenant  | `payments`, `vendors` | Adds the payee stamp: `payee_vendor_id` uuid (no FK — history a merge must not move), `payee_bank_fingerprint` varchar(80) (a keyed HMAC of the vendor's `bank_details`, never a number) and `payee_recorded_at` timestamptz, written when a payment releases money; and the merge record on a retired vendor: `merged_into_vendor_id` / `merged_by_user_id` uuid (no FK) and `merged_at` timestamptz, set once by the merge. The void compares the stamp with who a re-payment would pay and names the merges' stewards. No backfill (decisions §383, `payments.md` § A payment records the payee it paid). |
+| 0129     | Tenant  | `invoices` | Adds `approved_by_user_id` uuid (no FK, a control-plane id): who gave the approval of record, stamped at every final approval (`approval_chain.stamp_approver` — the approver, `/complete`'s floor caller, the reader whose extraction auto-approved; NULL when no person did). Backfilled only from the invoice's own approval of record in `audit_log` (the latest `invoice.approved` / `invoice.auto_approved` row, unique at its instant, naming a person of the org), on invoices approved and not `done`, and never where a recall is on the record and two different people approved; anything else stays NULL. A receipt its own approver hand-records does not lift the invoice's hold (decisions §389). |
+| 0130     | Tenant  | `payments` | Adds `rail_breakdown` jsonb (nullable) and `ck_payments_rail_breakdown_array` (an array or NULL): an ERP-reported payment made on several rails keeps each cash payment's rail and exact amount, written only when they sum exactly to `amount`, and the 1099 aggregate splits the payment by it. No backfill: nothing stored says how an earlier payment split (decisions §396). |
+| 0131     | Tenant + control | `vendors` / `gl_accounts` / `workflow_instances`; `organizations` | Data only. For an org connected to Sage Intacct with a `location_id`, rewrites every realm stamp naming its current company (`sage_intacct:<company>`, now the top level) as `sage_intacct:<company>\|<location>`: row links, kept links, pending candidates and pushed bills' `state_data.erp_realm`, plus 0115's `legacy_link_realm` snapshot. The location is the connection's at migration time, the only one recorded. The tenant step reads the org's `settings.erp` from the control plane through `alembic/env.py`'s `tenant_organization_erp` lookup, and refuses to run without it on a tenant holding Intacct stamps (decisions §412). It refuses the same way when the lookup finds no organization naming the database (an orphaned tenant): with Intacct stamps present the run fails, telling the operator to restore the `organizations` row, and with none it is a no-op. |
+| 0132     | Tenant  | `invoices` | Adds the non-unique index `ix_invoices_erp_document_id` (also `index=True` on the model, so `create_all` builds it under the same name): the generic ERP status webhook resolves an event with no `correlation_id` by `erp_document_id`, acting only on exactly one match (decisions §417). Non-unique on purpose: a repeated id must make the webhook refuse the ambiguous match, not make a second push fail to save. Plain `CREATE INDEX IF NOT EXISTS` inside the migration transaction, so it blocks writes to `invoices` while it builds — fine at current tenant sizes; a large tenant would want `CONCURRENTLY` in an `autocommit_block`. |
+| 0133     | Tenant  | `invoices` | Adds `split_po_ids` jsonb (nullable): the POs a multi-PO split linked, written only by `multi_po_split_v1` and never by the matcher, so a warning refresh that rewrites `po_match` no longer erases the set the receiver / inspector segregation rules read. Backfilled from `po_match.po_ids` on every invoice whose snapshot still carries a non-empty array; a split already refreshed has lost it and stays NULL (decisions §433). |
+| 0134     | Tenant  | `expenses` | Adds `created_by_user_id` uuid (nullable, no FK: a control-plane id in a tenant table, like `invoices.uploaded_by_id`): who created the expense line, so a line on no report has an owner and only its creator may edit it or put it on a report. Stamped by every path that creates an expense for a signed-in employee (`tests/test_expense_creator_stamping.py`). No backfill: existing rows stay NULL, read as "no recorded creator" under the legacy rules (decisions §141, §434). `ADD COLUMN IF NOT EXISTS`; gated on `expenses` existing, so a no-op on the control plane. |
+| 0135     | Control | `organizations` / `provider_credentials` | Data only. Moves the two credentials 0110 left as plain JSONB — a bring-your-own-key extraction org's `settings.extraction.api_key` / `aws_secret_access_key` and the OIDC `settings.sso.client_secret` — into sealed `provider_credentials` rows (blocks `extraction`, `sso`) and strips them from the JSONB; for `sso` it writes the `client_secret_configured: true` marker the sign-in completeness check reads. A value already sealed for the same path wins. Gated on `organizations` like 0110, so a no-op on every tenant DB; a KMS error raises and rolls back, leaving every secret where it was; idempotent. Downgrade opens the rows back into the JSONB (plaintext again) and deletes them. `tests/test_provider_credentials.py` |
+| 0136     | Tenant  | `invoices` | `currency` drops NOT NULL: NULL is the one spelling of "currency unknown", which the upload and the supplier-portal submit now create rows with until extraction reads a code. Every value blank after trimming whitespace (the pre-round-17 PATCH sentinel) becomes NULL. No code is backfilled or removed: a row the old upload stamped USD cannot be told from a real USD (decisions §141, §473). Gated on `invoices` existing, so a no-op on the control plane; idempotent. Downgrade writes `""` into every NULL and restores NOT NULL. `tests/test_migration_0136_invoice_currency_null.py` |
+| 0137     | Tenant  | `invoices` | Adds the non-unique index `ix_invoices_po_number` (also `index=True` on the model, so `create_all` builds it under the same name). The budget PO-relief join (`budget_service._invoice_po_attribution`, on `GET /budgets/check`) narrows invoices by `po_number IN (...)`; the PO detail's invoice list, the portal flip guard and "already invoiced" check, `invoice_warnings.invoices_citing_pos` and the enrichment on-time proxy filter or join on it too. Plain `CREATE INDEX IF NOT EXISTS` in the migration transaction, as 0092/0132 do. Shape pinned by `tests/test_invoice_po_number_index.py`; no latency was measured. |
+| 0138     | Both    | `users` (control) / `vendor_users` (tenant) | Replaces the plain, case-sensitive `UNIQUE(email)` with a unique index on `lower(email)` — `uq_users_email_lower` / `uq_vendor_users_email_lower`, declared on the models so `create_all` builds the same — after lower-casing and trimming every stored address. **Refuses** (`EmailCaseCollision`, nothing changed) while two rows share one normalized address, reporting the table, database and counts but never an address; which account keeps it is the operator's call (§ Email case collisions, decisions §475). The `users` half is gated on `plans` (control plane only), the `vendor_users` half on that table existing. Idempotent; the index builds inside the transaction, blocking writes to the table briefly. Downgrade drops the index and restores `<table>_email_key`; addresses stay lower-cased. `tests/test_migration_0138_email_lower_unique.py` |
+| 0139     | Tenant  | `sanctions_adjudications` (new), `vendors` | Creates `sanctions_adjudications` (one recorded false-positive judgement of one screen result: vendor, `sanctions_check_id`, provider, result, list name, sha256 `fingerprint`, required `reason`, adjudicator + time, revoker + time + reason) with the partial unique index `uq_sanctions_adjudications_active` on `(vendor_id, provider, fingerprint) WHERE revoked_at IS NULL`, and adds two nullable `vendors` columns: `screening_adjudication_id` (the active adjudication covering the stored screen; no FK) and `onboarded_by_user_id` (who created the vendor, for segregation; not backfilled). `IF NOT EXISTS` DDL; decisions §477. `tests/test_migration_0139_sanctions_false_positive.py` |
+| 0140     | Control | `subscriptions` | Adds two nullable columns for a move to a free plan scheduled for the end of the paid period (decisions §483): `pending_plan_id` (FK `plans.id`, Postgres's default name `subscriptions_pending_plan_id_fkey`, as `create_all` builds it) and `pending_plan_effective_at` (timestamptz). No backfill — no row has a scheduled move. Gated on `plans` and `subscriptions` existing, so a no-op on every tenant DB; `IF NOT EXISTS` DDL. Downgrade drops both. `tests/test_migration_0140_subscription_pending_plan.py` |
+| 0141     | Tenant  | `vendors` | Adds the partial unique index `uq_vendors_erp_link` on `(organization_id, erp_link_realm, erp_vendor_id) NULLS NOT DISTINCT WHERE erp_vendor_id IS NOT NULL`, declared on the model so `create_all` builds the same: one vendor per ERP record per company, a NULL realm counting as one company. **Refuses** (`DuplicateErpVendorLink`, nothing changed) while two vendors already share a link in one company, naming the database, the counts and at most ten vendor row ids, never a name or the ERP company; the operator merges or unlinks them (`vendor-management.md` § Duplicate ERP links, decisions §486). Gated on `vendors` + `vendor_erp_links`. Idempotent; the index builds inside the transaction, blocking writes to `vendors` briefly. Downgrade drops it. `tests/test_migration_0141_vendor_erp_link_unique.py` |
 
 > Migration 0022 may need renumbering or a merge revision at integration time — sibling features built on parallel branches may also claim `0022` (all branch off `0021_scim_bearer_hash`).
 
@@ -214,7 +283,14 @@ it deliberately does *not* improve) is in
 [`procurement-budgets.md`](procurement-budgets.md) § Index coverage on the four
 dimensions.
 
-Both revisions gate on the `invoices` table existing, so they no-op on the
+`po_number` is indexed for a related budget read: the PO-relief leg of
+`committed` joins invoices to the budgets' converted POs on it
+(`_invoice_po_attribution`). Migration `0073` indexed only
+`purchase_orders.po_number`; `0137_invoice_po_number_index` adds
+`ix_invoices_po_number`. Its plan test shows the relief predicate is an
+`Index Cond` on it; the real-volume latency was not measured.
+
+All these revisions gate on the `invoices` table existing, so they no-op on the
 control plane and fan out to every tenant DB via
 `scripts/migrate_all_tenants.py`.
 
@@ -230,7 +306,7 @@ on `created_at` or `action`, so five callers seq-scanned the whole table:
 |---|---|---|
 | `GET /api/audit/verify-signatures` (SOX signature sweep) | `action = 'invoice.approved' AND created_at` range | `ix_audit_log_action_created_at` |
 | `GET /api/audit/export` (auditor date-range export) | `created_at` range `ORDER BY created_at` | `ix_audit_log_created_at` |
-| `api/dashboard.py` approval-timing leg (every dashboard load) | `entity_type='invoice' AND action='invoice.approved'` | `ix_audit_log_action_created_at` |
+| `services/dashboard_metrics.py` approval-timing leg (`GET /api/dashboard`, every load) | `entity_type='invoice' AND action='invoice.approved'` | `ix_audit_log_action_created_at` |
 | `api/adaptive_workflows.py` feedback reads | `action IN (…) AND created_at >= :since` | `ix_audit_log_action_created_at` |
 | `services/retention_sweep.py` overdue count | `created_at < :cutoff`, and `… AND shipped_at IS NULL` | `ix_audit_log_created_at` / `ix_audit_log_shipped_at_null` |
 
@@ -479,6 +555,48 @@ So, for a new revision:
   replays the revision over the ORM's spelling.
 - **ON DELETE, NOT NULL, a length, a UNIQUE** — say it the same way in both.
 
+### Email case collisions
+
+Migration 0138 makes `users.email` (control plane) and `vendor_users.email`
+(each tenant) unique without regard to case. A database holding two rows whose
+addresses differ only in case or surrounding whitespace — rows written before
+the app normalized addresses (`docs/authentication.md` § An email address is
+matched without regard to case) — makes it stop with `EmailCaseCollision`,
+naming the table, the database and how many addresses and rows collide, and
+change nothing. It does not pick a winner: one of the pair may hold the roles,
+the password or the SSO link, and only someone who knows the people can say
+which account is real.
+
+List the colliding rows **by id** (the addresses stay out of the terminal and
+any log the session keeps) on the database the error named:
+
+```sql
+-- control plane (feohledger)
+SELECT array_agg(id ORDER BY created_at) AS user_ids,
+       array_agg(organization_id ORDER BY created_at) AS org_ids,
+       count(*) AS n
+FROM users
+GROUP BY lower(btrim(email, E' \t\n\r\f\x0B'))
+HAVING count(*) > 1;
+
+-- a tenant (feoh_<slug>)
+SELECT array_agg(id ORDER BY created_at) AS vendor_user_ids,
+       array_agg(vendor_id ORDER BY created_at) AS vendor_ids,
+       count(*) AS n
+FROM vendor_users
+GROUP BY lower(btrim(email, E' \t\n\r\f\x0B'))
+HAVING count(*) > 1;
+```
+
+For each group, decide with the workspace's administrator which account keeps
+the address, then move the other one off it through the app, so the change is
+audited: give it a different address (`PATCH /api/admin/users/{id}`) or delete
+it (`DELETE /api/admin/users/{id}`); a supplier-portal user is deleted from its
+vendor's portal users. The app's own lookups already treat the pair as one
+address, so this works before the migration has run. Re-run the migration
+(`alembic upgrade head`, or `scripts/migrate_all_tenants.py` for tenants);
+it re-checks before touching anything.
+
 ## Seeding
 
 Seed the control plane and both demo tenants:
@@ -517,7 +635,9 @@ gate fails if a model is added without being classified.
    - `Role` — name (admin, ap_manager, ap_clerk, cfo)
    - `UserRole` — junction table
    - `WebAuthnCredential` — registered passkey (credential_id, public_key, sign_count, transports) per `user_id`; the WebAuthn second factor (migration 0063)
-   - `ProviderCredential` — `provider_credentials`: one row per (organization, settings block `erp` / `payments` / `cards`) holding that block's secrets as ONE envelope-encrypted JSON map (`ciphertext`, `wrapped_key`, `key_provider` `kms`/`local`, `key_id`) plus the stored path NAMES (`secret_fields`, so "is it set?" needs no decrypt); unique `(organization_id, block)`, plain FK to `organizations` (swept by `tenant_deletion`). Control-plane, beside the `Organization.settings` it was moved out of, so migration 0110 could copy-and-strip in one transaction. See `services/provider_credentials.py` and `erp-integration.md` § Where the credentials live
+   - `ProviderCredential` — `provider_credentials`: one row per (organization, settings block `erp` / `payments` / `cards` / `commerce` / `extraction` / `sso`) holding that block's secrets as ONE envelope-encrypted JSON map (`ciphertext`, `wrapped_key`, `key_provider` `kms`/`local`, `key_id`) plus the stored path NAMES (`secret_fields`, so "is it set?" needs no decrypt); unique `(organization_id, block)`, plain FK to `organizations` (swept by `tenant_deletion`). Control-plane, beside the `Organization.settings` it was moved out of, so migration 0110 (and 0135, for the BYOK extraction key and the OIDC client secret) could copy-and-strip in one transaction. See `services/provider_credentials.py` and `erp-integration.md` § Where the credentials live
+   - `SubprocessorNotice` — `subprocessor_notices`: one row per (sub-processor change-log entry, organisation) notified (`services/subprocessor_notices.py`, migration 0122): `entry_id` + `organization_id` (UNIQUE pair, no FK), `claimed_at` / `sent_at` / `audited_at` (claim → sent → tenant audit row written), `effective_on`, `recipients` / `failed_recipients`, `recipient_user_ids` (JSONB user ids), `late`. Exempt from tenant deletion — evidence a contractual notice was given. Ids, dates and counts only
+   - `WorkspaceClosure` — `workspace_closures`: one row per workspace an administrator closed (`services/workspace_closure.py`, migration 0119): `organization_id` (UNIQUE, no FK — the org is deleted), `slug`, `requested_by_user_id` (no FK), `requested_by_roles` (role names, JSONB), `step_up_proof`, `status` `started`/`completed`, counts of what the deletion removed, `last_failure` / `last_failure_at` (the exception class of a part-way failure), and `backups_cleared_at` / `backups_cleared_by` (the operator's backup leg). Its downgrade is a deliberate no-op. The one control-plane table a tenant deletion deliberately keeps (`tenant_deletion.CONTROL_TABLES_EXEMPT`): it is the record that outlives the tenant. No address or name
    - `AssistantUsage` — billing: per-org/month assistant token meter. The
      *only* usage meter that is control-plane; `ExtractionUsage` and
      `CardRebate` read like control-plane data but are tenant-local (see
@@ -529,6 +649,7 @@ gate fails if a model is added without being classified.
    - `InvoiceLineItem` — invoice_id, item_code, description, quantity, unit_price, total, gl_account
    - `InvoiceExtractionResult` — invoice_id, method, confidence, raw_result (JSONB)
    - `Vendor` — name, code, tax_id, status (active/unverified/inactive/rejected), source (manual/erp_sync/ai_extracted)
+   - `VendorErpLink` — a vendor's ERP link in a company it is not currently synced under, one per (vendor, realm); restored by the next sync under that realm (migration 0125, decisions §356)
    - `PurchaseOrder` — po_number, vendor_id, total, currency (nullable, no default — migration 0099), status
    - `POLineItem` — po_id, description, quantity, unit_price, total, catalog_item_id + sku (item identity, migration 0111 — `sku` is a snapshot, never re-joined; decisions §273)
    - `GoodsReceipt` — gr_number, po_id, received_date, status, source, recorded_by_user_id, idempotency_key
@@ -537,6 +658,7 @@ gate fails if a model is added without being classified.
    - `CommerceSkuMapping` — an admin's SKU → provider item id override, unique per `(organization_id, provider, sku)` (migration 0111)
    - `QualityInspection` — inspection_number, po_id, gr_id, result (pass/fail/partial), accepted_quantity, rejected_quantity, deviation_notes — the 4-way match leg (see `docs/po-matching.md`)
    - `GLAccount` — code, name, account_type, parent_code, erp_account_id
+   - `GLAccountErpLink` — a GL account's ERP link state (link, confirmation, or open decision) in a company it is not currently synced under, one per (account, realm); restored by the next chart sync under that realm (migration 0127, decisions §376)
    - `PaymentRun` — status, total_amount, initiated_by, executed_at
    - `PaymentSchedule` — invoice_id, due_date, discount_date, discount_percent
    - `Payment` — invoice_id, payment_run_id, amount, method (`String(50)`, not a DB enum — `ach`/`wire`/`check`/`virtual_card`, the international rails `sepa`/`international_ach`/`international_wire`, and the UK domestic rails `bacs`/`faster_payments`/`chaps`; classified on both the 1099 and geography axes in `services/payment_methods.py`), status, `retry_of_payment_id` (self-FK, migration 0080 — `/runs/{id}/retry-failed` books a NEW attempt row pointing at the failed one it replaces and never mutates that row, because `correlation_id` is the PROCESSOR's idempotency key; run rollups count the latest attempt per invoice via `payment_runs.active_run_payments`. See `docs/payments.md` § Why a payment failed, and retrying it), `settled_amount` / `settled_currency` (migration 0083 — what the PROCESSOR says it moved, beside `amount` which is what AP AUTHORIZED. NULL is meaningful and is not zero: no rail ever reported a figure, which `payment_settlement.settlement_coverage` reads as "nothing indicates a shortfall" and fails OPEN, so an amount-free rail can't hold every invoice it settles. See `docs/payments.md` § Settlement-amount verification)
@@ -550,7 +672,8 @@ gate fails if a model is added without being classified.
    - `Exception` — invoice_id, exception_type, severity, status (open/resolved/escalated/dismissed)
    - `CreditMemo` — vendor_id, original_invoice_id, amount, status (open/applied/voided)
    - `BankStatement` / `BankTransaction` — uploaded statement + parsed transactions for reconciliation
-   - `SanctionsCheck` — append-only KYC / sanctions screening trail per vendor
+   - `SanctionsCheck` — append-only KYC / sanctions screening trail per vendor. Each stored screen's `raw_response.screened_inputs` is a sha256 of what was screened (name, tax id, bank country, owners, latest applied bank change id), part of the adjudication fingerprint
+   - `SanctionsAdjudication` — a recorded false-positive judgement of ONE screen result (migration 0139, decisions §477): `sanctions_check_id`, provider, result, list name, `fingerprint` (hash only, never match details), reason, adjudicator, and revocation fields. Several may be active per vendor (one per result); `vendors.screening_adjudication_id` names the one covering the stored screen
    - `ScheduledReport` — recurring CFO report definition (cron, recipients, format)
    - `InvoiceEmbedding` — vector embedding per invoice for RAG / duplicate detection
    - `VendorExtractionPrior` — accumulated vendor field priors that bias the next extraction

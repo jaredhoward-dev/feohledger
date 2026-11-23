@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.models.invoice import InvoiceStatus
 from app.services.exception_agents.base import ACTION_AUTO_RESOLVED, AgentEvaluation
 from app.services.exception_agents.coordinator import run_agent
 
@@ -38,6 +39,8 @@ def _exception():
         resolved_by=None,
         resolved_at=None,
         time_to_resolution_seconds=None,
+        # The decisions §286 stamp `record_decision` keeps or voids on a clear.
+        finding_fingerprint=None,
     )
 
 
@@ -61,14 +64,22 @@ class _FakeSavepoint:
 
 
 def _mock_db(exc, invoice):
-    """db.execute is awaited twice: the locked-exception read, then the invoice
-    fetch. Each returns a result whose .scalar_one() yields the row."""
+    """db.execute is awaited four times: the locked-exception read, the invoice
+    fetch (each a result whose .scalar_one() yields the row), the invoice's
+    workflow chain for the approver axis (decisions §420; none here), then — because
+    resolving a payment-blocking `po_mismatch` may unblock a payment the ERP
+    reported — `record_decision`'s look for a kept ERP payment on the invoice
+    (decisions §319), which finds none here."""
     exc_res = MagicMock()
     exc_res.scalar_one = MagicMock(return_value=exc)
     inv_res = MagicMock()
     inv_res.scalar_one = MagicMock(return_value=invoice)
+    no_erp_payment = MagicMock()
+    no_erp_payment.scalars.return_value.all.return_value = []
     db = AsyncMock()
-    db.execute = AsyncMock(side_effect=[exc_res, inv_res])
+    no_chain = MagicMock()
+    no_chain.scalars.return_value.all.return_value = []
+    db.execute = AsyncMock(side_effect=[exc_res, inv_res, no_chain, no_erp_payment])
     db.add = MagicMock()
     db.savepoint = _FakeSavepoint()
     db.begin_nested = MagicMock(return_value=db.savepoint)
@@ -86,6 +97,10 @@ async def test_actor_roles_threaded_into_resolver_apply():
         # is payment-blocking, so the queue segregation check reads it.
         uploaded_by_id=None,
         segregation_actor_ids=None,
+        # The post-apply refusals (PO over-billing §469, contract cap §472)
+        # read the refreshed status and warnings, which a real row carries.
+        status=InvoiceStatus.ready_for_review,
+        warnings=[],
     )
     db = _mock_db(exc, invoice)
 
@@ -158,6 +173,10 @@ async def test_missing_actor_roles_fails_closed_to_escalation():
         # is payment-blocking, so the queue segregation check reads it.
         uploaded_by_id=None,
         segregation_actor_ids=None,
+        # The post-apply refusals (PO over-billing §469, contract cap §472)
+        # read the refreshed status and warnings, which a real row carries.
+        status=InvoiceStatus.ready_for_review,
+        warnings=[],
     )
     db = _mock_db(exc, invoice)
 

@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field
 
 from app.api.pagination import PageMeta
 from app.models.procurement import RequisitionStatus
+from app.schemas.action_verdict import CodedRefusal
+from app.schemas.currency import CurrencyCode, OptionalCurrencyCode
 from app.schemas.money import MoneyAmount, OptionalMoneyAmount
 
 # ---------------------------------------------------------------------------
@@ -72,7 +74,7 @@ class RequisitionBase(BaseModel):
     vendor_id: str | None = None
     contract_id: str | None = None
     budget_id: str | None = None
-    currency: str = Field(default="USD", max_length=3)
+    currency: CurrencyCode = "USD"
     notes: str | None = None
 
 
@@ -95,9 +97,25 @@ class RequisitionUpdate(BaseModel):
     vendor_id: str | None = None
     contract_id: str | None = None
     budget_id: str | None = None
-    currency: str | None = Field(default=None, max_length=3)
+    currency: OptionalCurrencyCode = None
     notes: str | None = None
     line_items: list[RequisitionLineItemCreate] | None = None
+
+
+class RequisitionActions(BaseModel):
+    """The caller's verdict on a requisition row's lifecycle actions, each the
+    coded refusal the endpoint would answer with or ``None`` — computed by the
+    endpoints' own gates (``api/requisitions.requisition_action_refusals``,
+    issue #575). Required, not defaulted. Every requisition response carries
+    it, mutations included."""
+
+    submit: CodedRefusal | None
+    approve: CodedRefusal | None
+    reject: CodedRefusal | None
+    convert: CodedRefusal | None
+    cancel: CodedRefusal | None
+    reopen: CodedRefusal | None
+    delete: CodedRefusal | None
 
 
 class RequisitionResponse(BaseModel):
@@ -123,6 +141,7 @@ class RequisitionResponse(BaseModel):
     line_items: list[RequisitionLineItemResponse] = Field(default_factory=list)
     created_at: str
     updated_at: str
+    actions: RequisitionActions
 
 
 class RequisitionListResponse(PageMeta):

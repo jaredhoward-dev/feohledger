@@ -16,6 +16,7 @@
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
@@ -40,6 +41,7 @@
 		OVERLAP_DEFAULT_MINUTES,
 		isOverlapLive
 	} from '#lib/utils/webhookRotation.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	// RBAC: the backend gates every /api/webhooks endpoint to admin only and
 	// 403s the rest. Wait for `auth.user` to resolve before redirecting so we
@@ -95,6 +97,10 @@
 
 	// Delete confirm (armed two-click on the row action).
 	let confirmDeleteId = $state<string | null>(null);
+	// The subscription whose delete is in flight. Its button goes `busy` — the
+	// armed button stays pressable otherwise and a third click sends a second
+	// DELETE — and the other rows' Delete is disabled until it settles.
+	let deletingId = $state<string | null>(null);
 
 	// ── Secret rotation ──────────────────────────────────────────────────────
 	// Rotating mints a replacement signing secret while KEEPING the subscription
@@ -312,6 +318,8 @@
 	}
 
 	async function handleDelete(id: string) {
+		if (deletingId) return;
+		deletingId = id;
 		try {
 			await deleteWebhookSubscription(id);
 			toast(m('admin.webhooks.toast.deleted'), 'success');
@@ -320,6 +328,7 @@
 			toast(e instanceof Error ? e.message : m('admin.webhooks.toast.deleteFailed'), 'error');
 		} finally {
 			confirmDeleteId = null;
+			deletingId = null;
 		}
 	}
 
@@ -485,10 +494,7 @@
 		{#if subsLoading}
 			<p class="state" data-testid="webhooks-loading">{m('admin.webhooks.loadingSubs')}</p>
 		{:else if subsError}
-			<div class="state error" data-testid="webhooks-error" role="alert">
-				<p>{subsError}</p>
-				<button type="button" class="btn-cancel" onclick={loadSubs}>{m('admin.webhooks.retry')}</button>
-			</div>
+			<LoadError message={subsError} onretry={loadSubs} testId="webhooks-error" />
 		{:else}
 			<DataTable
 				columns={SUB_COLUMNS}
@@ -557,6 +563,15 @@
 								<RowAction
 									variant="danger"
 									armed={confirmDeleteId === sub.id}
+									busy={deletingId === sub.id}
+									disabled={deletingId !== null && deletingId !== sub.id}
+									ariaLabel={m('common.rowActionAria', {
+										action:
+											confirmDeleteId === sub.id
+												? m('admin.webhooks.row.confirm')
+												: m('admin.webhooks.row.delete'),
+										name: sub.name
+									})}
 									onclick={(e) => {
 										e.stopPropagation();
 										if (confirmDeleteId === sub.id) {
@@ -588,10 +603,7 @@
 		{#if deliveriesLoading}
 			<p class="state" data-testid="deliveries-loading">{m('admin.webhooks.loadingDeliveries')}</p>
 		{:else if deliveriesError}
-			<div class="state error" data-testid="deliveries-error" role="alert">
-				<p>{deliveriesError}</p>
-				<button type="button" class="btn-cancel" onclick={loadDeliveries}>{m('admin.webhooks.retry')}</button>
-			</div>
+			<LoadError message={deliveriesError} onretry={loadDeliveries} testId="deliveries-error" />
 		{:else}
 			<DataTable
 				columns={DELIVERY_COLUMNS}
@@ -603,7 +615,7 @@
 						<tr>
 							<td>{d.event_type}</td>
 							<td class="mono">{d.event_id}</td>
-							<td>{d.attempt_count}</td>
+							<td>{formatCount(d.attempt_count)}</td>
 							<td>{d.response_code ?? '—'}</td>
 							<td>{formatDate(d.last_attempt_at)}</td>
 							<td>
@@ -888,10 +900,6 @@
 		padding: 0.75rem 0;
 	}
 
-	.state.error {
-		color: #f06464;
-	}
-
 	.mono {
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 		font-size: 0.85rem;
@@ -936,9 +944,9 @@
 	/* Hard cutover is the destructive option — deliveries fail until the
 	   receiver holds the new secret — so it gets the red treatment, not amber. */
 	.cutover-warning {
-		background: rgba(240, 70, 70, 0.12);
-		border: 1px solid rgba(240, 70, 70, 0.35);
-		color: #f06464;
+		background: color-mix(in srgb, var(--danger) 12%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+		color: var(--danger);
 		border-radius: 8px;
 		padding: 0.75rem 1rem;
 		font-size: 0.85rem;

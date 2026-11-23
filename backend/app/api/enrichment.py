@@ -36,8 +36,10 @@ from app.api.deps import (
     require_roles,
 )
 from app.api.permissions import PERM_VENDOR_MANAGE
+from app.api.refusals import coded_refusal
 from app.models.exception import Exception as APException
-from app.models.invoice import Invoice, InvoiceLineItem, InvoiceStatus
+from app.models.invoice import Invoice, InvoiceLineItem
+from app.models.invoice_status import APPROVED_OR_BEYOND_STATUSES
 from app.models.organization import Organization
 from app.models.procurement import GoodsReceipt, PurchaseOrder
 from app.models.user import User
@@ -77,7 +79,7 @@ from app.services.vendor_enrichment import (
     detect_price_variance,
     suggest_fields,
 )
-from app.services.vendor_merge import VendorMergeError, merge_vendors
+from app.services.vendor_merge import VENDOR_MERGE_INVALID_ID, VendorMergeError, merge_vendors
 from app.services.vendor_screening import screen_best_effort
 from app.tenant import apply_entity_scope, get_entity_id, get_tenant, get_tenant_db
 
@@ -93,18 +95,6 @@ _CONSOLIDATION_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
 # External enrichment (calling out to D&B / Clearbit) is a data-stewardship
 # action and may consume a metered external API — managerial, clerk excluded.
 _ENRICH_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)
-
-# Approved-or-beyond — a human-accepted coding/price baseline. Draft / rejected
-# invoices are unreviewed noise and excluded. Mirrors adaptive_workflows.
-_APPROVED_STATUSES = (
-    InvoiceStatus.approved,
-    InvoiceStatus.sending_to_erp,
-    InvoiceStatus.sent_to_erp,
-    InvoiceStatus.posted_in_erp,
-    InvoiceStatus.payment_scheduled,
-    InvoiceStatus.paid,
-    InvoiceStatus.done,
-)
 
 
 def _vendor_in_scope(vendor_id: uuid.UUID, entity_id: uuid.UUID | None):
@@ -202,7 +192,7 @@ async def invoice_suggestions(
             .where(
                 Invoice.vendor_id == inv.vendor_id,
                 Invoice.id != inv.id,
-                Invoice.status.in_(_APPROVED_STATUSES),
+                Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
             )
             .order_by(Invoice.created_at.desc())
             .limit(HISTORY_LIMIT),
@@ -252,7 +242,7 @@ async def invoice_suggestions(
             .where(
                 Invoice.vendor_id == inv.vendor_id,
                 Invoice.id != inv.id,
-                Invoice.status.in_(_APPROVED_STATUSES),
+                Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
                 InvoiceLineItem.unit_price.is_not(None),
             )
             .order_by(Invoice.created_at.desc())
@@ -342,7 +332,7 @@ async def _accuracy_input(
         )
         .where(
             Invoice.vendor_id == vendor_id,
-            Invoice.status.in_(_APPROVED_STATUSES),
+            Invoice.status.in_(APPROVED_OR_BEYOND_STATUSES),
         )
     )
     base = apply_entity_scope(base, Invoice, entity_id)
@@ -626,8 +616,16 @@ async def merge_vendor_consolidation(
     re-deactivates nothing (200 with empty counts). **Audited** — writes a
     PII-free ``vendor.merged`` audit row (canonical id + duplicate ids + the
     per-table reassigned counts; no ``tax_id`` / bank / address). Refuses
-    self-merge, an empty duplicate set, an unknown vendor (404), and a
-    cross-entity merge (422).
+    self-merge, an empty duplicate set, an unknown vendor (404), a
+    cross-entity merge and a payments-blocked duplicate into an unblocked
+    canonical (422), a duplicate holding approved invoices still to be paid
+    (409, ``params.count`` — merged, they would pay the canonical's bank
+    details, which their approver never saw; decisions §379), and an ERP
+    company where the canonical and a duplicate are
+    linked to different supplier records (409, ``params.realms``) — each a
+    coded refusal (``services/vendor_merge``'s ``VENDOR_MERGE_*``) a client
+    states in the reader's language. Each duplicate's ERP links (row and kept)
+    move to the canonical wherever it has none in that company (§373).
 
     RBAC: ``vendor.manage`` (admin / ap_manager by default) — vendor master-data
     control is a splittable SoD duty. Tenant-scoped via ``get_tenant_db`` +
@@ -638,19 +636,23 @@ async def merge_vendor_consolidation(
         canonical_id = uuid.UUID(str(body.canonical_vendor_id))
         duplicate_ids = [uuid.UUID(str(d)) for d in body.duplicate_vendor_ids]
     except (ValueError, AttributeError) as exc:
-        raise HTTPException(status_code=422, detail="Invalid vendor id.") from exc
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(VENDOR_MERGE_INVALID_ID, "Invalid vendor id."),
+        ) from exc
 
     try:
         result = await merge_vendors(
             db,
             canonical_vendor_id=canonical_id,
             duplicate_vendor_ids=duplicate_ids,
+            merged_by_user_id=user.id,
         )
     except VendorMergeError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     # Append-only audit row — a vendor merge re-homes spend + retires vendors, a
-    # material master-data change (invariant #3). PII-free: ids + counts only.
+    # material master-data change (invariant #3). PII-free: ids, counts and ERP record keys only.
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -665,6 +667,9 @@ async def merge_vendor_consolidation(
             "deactivated_vendor_ids": [str(d) for d in result.deactivated_vendor_ids],
             "reassigned": result.reassigned,
             "total_reassigned": result.total_reassigned,
+            # Every ERP link a duplicate gave up and where it went (§373):
+            # realm + the ERP's own record key, never a vendor's tax id or bank.
+            "erp_links": result.erp_links,
         },
     )
 

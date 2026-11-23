@@ -201,10 +201,11 @@ def test_no_money_schema_field_is_annotated_float():
     is identical. The field still holds a binary float in Python afterwards,
     which is exactly what the invariant forbids.
 
-    `InvoiceLineItemResponse.{unit_price, tax, total}` were found this way, after
-    the `float()` sweep came back clean: the class is never constructed today, so
-    nothing pointed at it, and it would have handed the next person to use it a
-    float-typed money field with the guard green.
+    A never-constructed line-item response schema's `unit_price` / `tax` /
+    `total` were found this way, after the `float()` sweep came back clean:
+    nothing pointed at the class, and it would have handed the next person to
+    use it a float-typed money field with the guard green. (The class was later
+    deleted as dead code.)
     """
     violations = [f"{where} — {what}" for where, what in _money_fields_annotated_float()]
     assert not violations, (
@@ -329,6 +330,7 @@ def test_exception_payload_round_trips_a_cent_precise_amount():
         description="d",
         description_code=None,
         description_params=None,
+        erp_report=None,
         status="open",
         resolution=None,
         resolved_by=None,

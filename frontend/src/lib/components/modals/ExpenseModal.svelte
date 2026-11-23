@@ -1,6 +1,9 @@
 <script lang="ts">
+	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
+	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import type { Expense, ExpenseStatus } from '#lib/types/expense.ts';
 	import {
+		canAuthorLooseLine,
 		EXPENSE_PAYMENT_METHODS,
 		EXPENSE_PAYMENT_METHOD_LABEL_KEYS,
 		expenseStatusLabelKey,
@@ -39,6 +42,13 @@
 	const isCreate = $derived(expense === null);
 	// create / update / receipt upload = admin / ap_manager / ap_clerk.
 	const canEdit = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk'));
+	// A colleague's line on no report is theirs to author (decisions §434): its
+	// claim fields and receipt are read-only here, and Save sends only the GL
+	// coding, which the endpoint leaves open to every entry role.
+	const claimLocked = $derived(
+		!isCreate && expense !== null && !canAuthorLooseLine(expense, auth.user?.id)
+	);
+	const claimEditable = $derived(canEdit && !claimLocked);
 
 	/** Today as `YYYY-MM-DD` in the user's own timezone — `toISOString()` would
 	 *  hand back the UTC day, which is the previous date for anyone west of
@@ -68,6 +78,12 @@
 	// it. `normalizeMoneyInput` decides shape with a regex, never `Number`.
 	let amount = $state<string | null>(moneyText(expense?.amount));
 	let currency = $state(expense?.currency ?? 'USD');
+	// An existing record opens on its own code; only a new one follows the
+	// org currency (`CurrencyInput` re-seeds an untouched field).
+	let currencyTouched = $state(Boolean(expense?.currency));
+	$effect(() => {
+		void orgCurrency.ensureLoaded();
+	});
 	let payment_method = $state(expense?.payment_method ?? 'out_of_pocket');
 	let gl_account_id = $state(expense?.gl_account_id ?? '');
 	let description = $state(expense?.description ?? '');
@@ -132,6 +148,10 @@
 	}
 
 	async function handleSave() {
+		if (claimLocked) {
+			await saveGlOnly();
+			return;
+		}
 		// `expense_date` joins the guard: it is required by the API, and clearing
 		// it on an EDIT would PATCH an explicit null at a NOT NULL column.
 		if (!expense_date || !merchant.trim() || amount == null) return;
@@ -177,6 +197,24 @@
 		}
 	}
 
+	/** A claim-locked line saves its GL coding alone: re-sending the claim
+	 *  fields, even unchanged, would risk a normalisation difference reading as
+	 *  an edit the endpoint refuses (`expense_not_creator`). */
+	async function saveGlOnly() {
+		if (!expense) return;
+		saving = true;
+		try {
+			const saved = await updateExpense(expense.id, { gl_account_id: gl_account_id || null });
+			toast(m('expenseModal.toast.saved'), 'success');
+			onsaved(saved);
+			onclose();
+		} catch (err) {
+			handleError(err, m('expenseModal.toast.saveFailed'));
+		} finally {
+			saving = false;
+		}
+	}
+
 	async function viewReceipt() {
 		if (!expense?.receipt_file_key) return;
 		try {
@@ -211,15 +249,18 @@
 				</Badge>
 			</div>
 		{/if}
+		{#if claimLocked && canEdit}
+			<p class="claim-locked" data-testid="expense-claim-locked">{m('expenseModal.claimLocked')}</p>
+		{/if}
 
 		<div class="form-grid">
 			<label>
 				<span>{m('expenseModal.field.date')} <em class="required">*</em></span>
-				<input type="date" bind:value={expense_date} required disabled={!canEdit} />
+				<input type="date" bind:value={expense_date} required disabled={!claimEditable} />
 			</label>
 			<label>
 				<span>{m('expenseModal.field.merchant')} <em class="required">*</em></span>
-				<input type="text" bind:value={merchant} required disabled={!canEdit} />
+				<input type="text" bind:value={merchant} required disabled={!claimEditable} />
 			</label>
 			<label>
 				<span>{m('expenseModal.field.amount')} <em class="required">*</em></span>
@@ -229,12 +270,12 @@
 					min="0"
 					value={amount ?? ''}
 					oninput={(e) => (amount = e.currentTarget.value.trim() || null)}
-					disabled={!canEdit}
+					disabled={!claimEditable}
 				/>
 			</label>
 			<label>
 				<span>{m('expenseModal.field.currency')}</span>
-				<input type="text" bind:value={currency} maxlength="3" disabled={!canEdit} />
+				<CurrencyInput bind:value={currency} bind:touched={currencyTouched} preferred={orgCurrency.currency} disabled={!claimEditable} testid="expense-currency" />
 			</label>
 			<label>
 				<span>{m('expenseModal.field.category')}</span>
@@ -242,12 +283,12 @@
 					type="text"
 					bind:value={category}
 					placeholder={m('expenseModal.field.categoryPlaceholder')}
-					disabled={!canEdit}
+					disabled={!claimEditable}
 				/>
 			</label>
 			<label>
 				<span>{m('expenseModal.field.paymentMethod')}</span>
-				<select bind:value={payment_method} disabled={!canEdit}>
+				<select bind:value={payment_method} disabled={!claimEditable}>
 					{#each EXPENSE_PAYMENT_METHODS as method}
 						<option value={method}>{m(EXPENSE_PAYMENT_METHOD_LABEL_KEYS[method])}</option>
 					{/each}
@@ -276,16 +317,16 @@
 					value={mileage_miles ?? ''}
 					oninput={(e) => (mileage_miles = numOrNull(e.currentTarget.value))}
 					placeholder={m('expenseModal.field.mileageMilesPlaceholder')}
-					disabled={!canEdit}
+					disabled={!claimEditable}
 				/>
 			</label>
 			<label class="checkbox-label">
-				<input type="checkbox" bind:checked={reimbursable} disabled={!canEdit} />
+				<input type="checkbox" bind:checked={reimbursable} disabled={!claimEditable} />
 				<span>{m('expenseModal.field.reimbursable')}</span>
 			</label>
 			<label class="full-width">
 				<span>{m('expenseModal.field.description')}</span>
-				<textarea bind:value={description} rows="2" disabled={!canEdit}></textarea>
+				<textarea bind:value={description} rows="2" disabled={!claimEditable}></textarea>
 			</label>
 		</div>
 
@@ -303,7 +344,7 @@
 			{:else}
 				<span class="receipt-empty">{m('expenseModal.receipt.empty')}</span>
 			{/if}
-			{#if canEdit}
+			{#if claimEditable}
 				<input
 					type="file"
 					accept=".pdf,.png,.jpg,.jpeg,.tiff,.heic,.webp"
@@ -347,6 +388,12 @@
 		align-items: center;
 		gap: 8px;
 		margin-bottom: 12px;
+	}
+
+	.claim-locked {
+		margin: 0 0 12px;
+		font-size: 0.85rem;
+		color: var(--text-muted);
 	}
 
 	.form-grid {

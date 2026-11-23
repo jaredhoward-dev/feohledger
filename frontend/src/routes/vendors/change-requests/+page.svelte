@@ -18,11 +18,15 @@
 	// proposer. That is knowable client-side (`requested_by_user_id`), so the
 	// row says so instead of offering a button that can only fail — and the 403
 	// is still mapped to the specific message, because the UI is not the gate.
-	import { goto } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
+	import { page } from '$app/state';
+	import { untrack } from 'svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { api, ApiError } from '#lib/api.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { PERM_VENDOR_BANK_CHANGE_APPROVE } from '#lib/types/admin.ts';
+	import { isAllowed, isOffered, refusalText } from '#lib/api/actionVerdicts.ts';
 	import type {
 		VendorChangeRequest,
 		VendorChangeRequestCounts,
@@ -36,6 +40,7 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
@@ -43,6 +48,8 @@
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	const PAGE_SIZE = 20;
 
@@ -62,7 +69,23 @@
 	let loading = $state(true);
 	let loadingMore = $state(false);
 	let errored = $state(false);
-	let statusFilter = $state('pending');
+	// URL-backed (`?status=`) like the `/vendors` list it hangs off, so a
+	// reload, Back, or a link shared with a second approver lands on the same
+	// filter. `pending` is the default and is left out of the URL.
+	const STATUS_KEYS = ['all', 'pending', 'approved', 'rejected'];
+	const initialStatus = page.url.searchParams.get('status') ?? '';
+	let statusFilter = $state(STATUS_KEYS.includes(initialStatus) ? initialStatus : 'pending');
+
+	/** Writes the filter into the URL. A writer only: every read is untracked so
+	 *  the filter `$effect` that calls it never depends on the URL it replaces. */
+	function syncUrl() {
+		untrack(() => {
+			const url = new URL(page.url.href);
+			if (statusFilter !== 'pending') url.searchParams.set('status', statusFilter);
+			else url.searchParams.delete('status');
+			if (url.search !== page.url.search) replaceState(`${url.pathname}${url.search}`, {});
+		});
+	}
 
 	// Whole-set tallies for the chips. `total` on the list response counts the
 	// ACTIVE filter's result set, so rendering it on a chip would label the
@@ -82,6 +105,14 @@
 	// silently arm the other).
 	let approveArmedId = $state<string | null>(null);
 	let rejectArmedId = $state<string | null>(null);
+
+	/** Arm one commit and retract the other: two armed red buttons at once is
+	 *  how a mis-click becomes the wrong irreversible decision (the same rule
+	 *  `RunDetailModal` keeps for Execute / Cancel run). */
+	function arm(kind: 'approve' | 'reject', id: string) {
+		approveArmedId = kind === 'approve' ? id : null;
+		rejectArmedId = kind === 'reject' ? id : null;
+	}
 	let busyId = $state<string | null>(null);
 
 	// Detail modal — the selected request plus its REVEALED proposed value, which
@@ -126,11 +157,11 @@
 
 	const COLUMNS = $derived([
 		{ label: m('vendors.col.vendor') },
-		{ label: m('vendors.changeRequests.col.changeType') },
+		{ label: m('vendors.changeRequests.col.changeType'), class: 'col-type' },
 		{ label: m('vendors.changeRequests.col.proposed') },
 		{ label: m('vendors.changeRequests.col.requestedBy') },
-		{ label: m('vendors.changeRequests.col.requested') },
-		{ label: m('vendors.col.status') },
+		{ label: m('vendors.changeRequests.col.requested'), class: 'col-date' },
+		{ label: m('vendors.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -158,9 +189,19 @@
 		return status;
 	}
 
-	/** True when the signed-in user is the AP requester — the backend's 403. */
+	/** True when the signed-in user is the AP requester — used only to LABEL
+	 *  the requester column "You". Whether Approve is offered is the server's
+	 *  `approve_refusal`, which also refuses the approver whose own provisioned
+	 *  portal login staged the change — an axis this page never checked, so
+	 *  that approver used to get an enabled Approve that 403'd (issue #575). */
 	function isOwnRequest(r: VendorChangeRequest): boolean {
 		return !!r.requested_by_user_id && r.requested_by_user_id === auth.user?.id;
+	}
+
+	/** The reader holds the approve permission but the server refuses THIS
+	 *  reader on this request — a colleague must approve it. */
+	function approveBlockedForMe(r: VendorChangeRequest): boolean {
+		return isOffered(r.approve_refusal) && !isAllowed(r.approve_refusal);
 	}
 
 	function requesterLabel(r: VendorChangeRequest): string {
@@ -207,7 +248,11 @@
 		const nextPage = opts.append ? pageNum + 1 : 1;
 		const token = fetchSequence.start();
 		if (opts.append) loadingMore = true;
-		else loading = true;
+		else {
+			loading = true;
+			// Retry unmounts `LoadError` back to the loading line (its contract).
+			errored = false;
+		}
 		try {
 			const params = new URLSearchParams({
 				status: statusFilter,
@@ -242,14 +287,15 @@
 			// rows already loaded ARE the current filter's answer, and only the
 			// next page failed to arrive. `/gl-accounts` and `/exceptions` set
 			// the clearing precedent; neither of them paginates.
+			//
+			// A fresh-load failure is stated in place by `LoadError` (with a
+			// Retry); only a failed Load-more, which keeps the rows shown, toasts.
 			if (!opts.append) {
 				items = [];
 				total = 0;
+			} else {
+				toast(errorMessage(err, m('vendors.changeRequests.toast.loadFailed')), 'error');
 			}
-			toast(
-				err instanceof Error ? err.message : m('vendors.changeRequests.toast.loadFailed'),
-				'error'
-			);
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -263,6 +309,7 @@
 	$effect(() => {
 		statusFilter;
 		if (!allowed) return;
+		syncUrl();
 		// `.catch` on both: neither is awaited here, and each already renders its
 		// own failure (`errored` for the list, label-only chips for the tallies).
 		load().catch(() => {});
@@ -300,11 +347,13 @@
 			// Already resolved by someone else; the row on screen is stale.
 			if (err.status === 409) return m('vendors.changeRequests.toast.resolved');
 		}
-		if (err instanceof Error) return err.message;
-		return m(
-			decision === 'approve'
-				? 'vendors.changeRequests.toast.approveFailed'
-				: 'vendors.changeRequests.toast.rejectFailed'
+		return errorMessage(
+			err,
+			m(
+				decision === 'approve'
+					? 'vendors.changeRequests.toast.approveFailed'
+					: 'vendors.changeRequests.toast.rejectFailed'
+			)
 		);
 	}
 
@@ -390,7 +439,7 @@
 <PageHeader title={m('vendors.changeRequests.title')}>
 	{#snippet actions()}
 		<button
-			class="btn-outline"
+			class="btn-secondary"
 			onclick={() => {
 				load().catch(() => {});
 				loadCounts().catch(() => {});
@@ -414,16 +463,25 @@
 		<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 	</div>
 
+	{#if errored && items.length === 0}
+		<LoadError
+			message={m('vendors.changeRequests.empty.errored')}
+			onretry={() => {
+				load().catch(() => {});
+				loadCounts().catch(() => {});
+			}}
+			testId="change-requests-load-error"
+		/>
+	{:else}
+	<div class="change-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={items.length === 0}
-		empty={loading
-			? m('common.loading')
-			: errored
-				? m('vendors.changeRequests.empty.errored')
-				: statusFilter === 'pending'
-					? m('vendors.changeRequests.empty.pending')
-					: m('vendors.changeRequests.empty.filtered')}
+		{loading}
+		filtered={statusFilter !== 'pending'}
+		emptyFiltered={m('vendors.changeRequests.empty.filtered')}
+		empty={m('vendors.changeRequests.empty.pending')}
 	>
 		{#snippet body()}
 			{#each items as r (r.id)}
@@ -454,22 +512,20 @@
 					</td>
 					<td class="actions">
 						{#if r.status === 'pending'}
-							{#if isOwnRequest(r)}
-								<span class="sod-note">{m('vendors.changeRequests.row.youRequested')}</span>
-							{/if}
 							<RowAction
+								reason={approveBlockedForMe(r) ? refusalText(r.approve_refusal ?? null, m) : undefined}
 								variant={approveArmedId === r.id ? 'danger' : 'success'}
 								armed={approveArmedId === r.id}
-								disabled={busyId === r.id || !canApprove || isOwnRequest(r)}
+								disabled={busyId === r.id || !isAllowed(r.approve_refusal)}
 								title={!canApprove
 									? m('vendors.changeRequests.row.needsPermission')
-									: isOwnRequest(r)
-										? m('vendors.changeRequests.toast.sod')
+									: r.approve_refusal
+										? refusalText(r.approve_refusal, m)
 										: undefined}
 								onclick={(e) => {
 									e.stopPropagation();
 									if (approveArmedId === r.id) decide(r, 'approve');
-									else approveArmedId = r.id;
+									else arm('approve', r.id);
 								}}
 							>
 								{approveArmedId === r.id
@@ -483,7 +539,7 @@
 								onclick={(e) => {
 									e.stopPropagation();
 									if (rejectArmedId === r.id) decide(r, 'reject');
-									else rejectArmedId = r.id;
+									else arm('reject', r.id);
 								}}
 							>
 								{rejectArmedId === r.id
@@ -496,23 +552,17 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 
-	{#if hasMore}
-		<div class="load-more-row">
-			<button
-				class="btn-load-more"
-				onclick={() => load({ append: true })}
-				disabled={loadingMore}
-			>
-				{loadingMore
-					? m('common.loading')
-					: m('vendors.changeRequests.loadMore', { shown: items.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('vendors.changeRequests.showingAll', { total })}</span>
-		</div>
+	<LoadMoreFooter
+		shown={items.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		onloadmore={() => load({ append: true })}
+		moreKey="vendors.changeRequests.loadMore"
+		allKey="vendors.changeRequests.showingAll"
+	/>
 	{/if}
 </PageHeader>
 
@@ -558,7 +608,7 @@
 
 		<h3>{m('vendors.changeRequests.modal.proposed')}</h3>
 		{#if revealLoading}
-			<p class="muted">{m('common.loading')}</p>
+			<LoadingState />
 		{:else if revealError || !revealed}
 			<p class="muted">{m('vendors.changeRequests.modal.revealFailed')}</p>
 		{:else}
@@ -566,7 +616,7 @@
 				<dl class="proposed-fields" data-testid="proposed-value">
 					{#each revealedFields as f (f.field)}
 						<div>
-							<dt>{f.field}</dt>
+							<dt>{f.labelKey ? m(f.labelKey) : f.fallback}</dt>
 							<dd>{f.value}</dd>
 						</div>
 					{/each}
@@ -593,9 +643,9 @@
 				></textarea>
 			</label>
 
-			{#if isOwnRequest(selected)}
+			{#if approveBlockedForMe(selected)}
 				<p class="sod-block" data-testid="sod-block">
-					{m('vendors.changeRequests.toast.sod')}
+					{refusalText(selected.approve_refusal ?? null, m)}
 				</p>
 			{:else if !canApprove}
 				<p class="sod-block">{m('vendors.changeRequests.noPermissionNote')}</p>
@@ -614,16 +664,18 @@
 				     modal makes for its block/re-screen pair. The armed two-click
 				     and its outside-click un-arm are unchanged: both share the
 				     row's `*ArmedId` slots, so arming here and arming the row
-				     behind it can never disagree. -->
+				     behind it can never disagree. The shared `.btn-danger` /
+				     `.btn-primary` paint them (`.armed` included); `.btn-decide`
+				     is only the hook the outside-click un-arm reads. -->
 				<button
 					type="button"
-					class="btn-decide reject"
+					class="btn-danger btn-decide reject"
 					class:armed={rejectArmedId === current.id}
 					disabled={busyId === current.id}
 					onclick={(e) => {
 						e.stopPropagation();
 						if (rejectArmedId === current.id) decide(current, 'reject');
-						else rejectArmedId = current.id;
+						else arm('reject', current.id);
 					}}
 				>
 					{rejectArmedId === current.id
@@ -632,13 +684,13 @@
 				</button>
 				<button
 					type="button"
-					class="btn-decide approve"
+					class="btn-primary btn-decide approve"
 					class:armed={approveArmedId === current.id}
-					disabled={busyId === current.id || !canApprove || isOwnRequest(current)}
+					disabled={busyId === current.id || !isAllowed(current.approve_refusal)}
 					onclick={(e) => {
 						e.stopPropagation();
 						if (approveArmedId === current.id) decide(current, 'approve');
-						else approveArmedId = current.id;
+						else arm('approve', current.id);
 					}}
 				>
 					{approveArmedId === current.id
@@ -651,28 +703,24 @@
 </Modal>
 
 <style>
-	/* Page-specific styling; shared design-system CSS lives in app.css. */
-	.btn-outline {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-	.btn-outline:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-outline:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.change-table { min-width: 0; }
+	.change-table :global(table) { min-width: 1160px; }
+	.change-table :global(th.col-type) { width: 170px; }
+	.change-table :global(th.col-date) { width: 130px; }
+	.change-table :global(th.col-status) { width: 140px; }
+	.change-table :global(th.actions-col) { width: 270px; }
 
+	/* Page-specific styling; shared design-system CSS lives in app.css. */
 	.intro {
 		margin: 0;
 		font-size: 0.85rem;
@@ -700,16 +748,10 @@
 		font-weight: 500;
 	}
 
-	.sod-note {
-		font-size: 0.74rem;
-		color: var(--text-muted);
-		white-space: nowrap;
-	}
-
 	/* --- Detail modal --- */
 	.meta {
 		display: grid;
-		grid-template-columns: repeat(2, 1fr);
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 10px 24px;
 		margin: 0 0 16px;
 	}
@@ -724,10 +766,14 @@
 		letter-spacing: 0.03em;
 		color: var(--text-muted);
 	}
+	/* `minmax(0, 1fr)` tracks above + `anywhere` here: a long unbroken value
+	   (a list name, an id) wraps inside its column instead of widening the
+	   dialog past a 320px viewport (WCAG 1.4.10). */
 	.meta dd {
 		margin: 0;
 		font-size: 0.9rem;
 		color: var(--text);
+		overflow-wrap: anywhere;
 	}
 
 	h3 {
@@ -778,12 +824,12 @@
 	.note-field textarea:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	.proposed-fields {
 		display: grid;
-		grid-template-columns: repeat(2, 1fr);
+		grid-template-columns: repeat(2, minmax(0, 1fr));
 		gap: 10px 24px;
 		margin: 0 0 14px;
 		padding: 10px 12px;

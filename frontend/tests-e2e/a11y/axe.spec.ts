@@ -16,8 +16,9 @@ import { expectNoA11yViolations } from './axe-helper';
  *
  * Pattern: reuses the per-worker `e2e<N>` tenant + storage-state fixtures from
  * `fixtures/helpers.ts` exactly like every other spec — the authenticated specs
- * inherit the default admin storage state; the two unauthenticated surfaces
- * (the AP login page and the supplier portal login) opt out of it.
+ * inherit the default admin storage state; the unauthenticated surfaces
+ * (the AP and supplier-portal sign-in and password-recovery pages, the legal
+ * pages) opt out of it.
  *
  * It is auto-discovered by the normal `pnpm test:e2e` run (the config's
  * `testDir: '.'` walks recursively), so CI catches a11y regressions on every
@@ -69,7 +70,8 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['sso', 'Single Sign-On'],
 	['fraud', 'Fraud Detection'],
 	['residency', 'Data Residency'],
-	['plan', 'Plan']
+	['plan', 'Plan'],
+	['close', 'Close this workspace']
 ];
 
 const AUTHED_ROUTES: { path: string; name: string; ready?: string }[] = [
@@ -108,7 +110,7 @@ const AUTHED_ROUTES: { path: string; name: string; ready?: string }[] = [
 	// The headings are the ones the existing specs for these routes already
 	// select on (`tests-e2e/{billing,reports,cfo}/`), so a title change breaks
 	// them together rather than silently skipping the scan here.
-	{ path: '/billing', name: 'billing', ready: 'Billing' },
+	{ path: '/billing', name: 'billing', ready: 'Subscription' },
 	{ path: '/reports', name: 'report builder', ready: 'Report Builder' },
 	{ path: '/experiments', name: 'workflow experiments', ready: 'Workflow Experiments' },
 	{ path: '/cfo', name: 'cash flow', ready: 'Cash Flow' },
@@ -213,7 +215,10 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 								status: 'open',
 								applied_at: null,
 								applied_by: null,
-								created_at: '2026-01-01T00:00:00Z'
+								created_at: '2026-01-01T00:00:00Z',
+								// The caller's verdicts (`memo_action_refusals`): the page
+								// offers Apply from these alone (issue #575).
+								actions: { apply: null, edit: null, void: null }
 							}
 						],
 						total: 1,
@@ -309,7 +314,7 @@ test.describe('accessibility — public surfaces on the no-tenant origin (WCAG 2
 	test('marketing landing (/) has no axe violations', async ({ page }) => {
 		await page.goto('/');
 		await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
-		await expect(page.locator('.stat-value').first()).toHaveText('11');
+		await expect(page.locator('.stat-value').first()).toHaveText('12');
 		await expectNoA11yViolations(page);
 	});
 
@@ -345,6 +350,28 @@ test.describe('accessibility — unauthenticated surfaces (WCAG 2.2 AA)', () => 
 	test('supplier portal login (/portal/login) has no axe violations', async ({ page }) => {
 		await page.goto('/portal/login');
 		await expect(page.locator('input[type="email"]')).toBeVisible();
+		await expectNoA11yViolations(page);
+	});
+
+	test('supplier portal forgot password (/portal/forgot-password) has no axe violations', async ({
+		page
+	}) => {
+		await page.goto('/portal/forgot-password');
+		await expect(page.locator('input[type="email"]')).toBeVisible();
+		await expectNoA11yViolations(page);
+	});
+
+	test('supplier portal set-password link (/portal/reset-password) has no axe violations', async ({
+		page
+	}) => {
+		// A real token needs the invite email (backend tests mint one); a
+		// stubbed check renders the live form, the state with the most to scan.
+		await page.route(
+			(url) => url.pathname === '/api/portal/auth/reset-password/check',
+			(route) => route.fulfill({ json: { email: 'supplier@vendor.example' } })
+		);
+		await page.goto('/portal/reset-password?token=axe-scan-token');
+		await expect(page.locator('input[type="password"]').first()).toBeVisible();
 		await expectNoA11yViolations(page);
 	});
 

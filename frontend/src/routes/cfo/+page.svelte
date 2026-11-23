@@ -2,6 +2,8 @@
 	import { api } from '#lib/api.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
+	import { toast } from '#lib/components/ui/Toast.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import ByEntityBreakdown from '#lib/components/analytics/ByEntityBreakdown.svelte';
@@ -13,6 +15,7 @@
 	import { formatPeriod } from '#lib/utils/time.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { untrack } from 'svelte';
 	import { openingBalanceSkipKey } from './openingBalanceNotice';
@@ -155,17 +158,22 @@
 		load();
 	});
 
-	// One-shot: the rollup takes none of this page's controls, so it neither
-	// re-fires nor needs the request sequencer.
-	$effect(() => {
+	// The rollup takes none of this page's controls, so it neither re-fires nor
+	// needs the request sequencer; its only re-issue is the Retry on its own
+	// failure. The flag clears as the retry starts, so the card leaves the
+	// error state rather than sitting on it until the answer lands.
+	function loadBudgetRollup() {
+		budgetRollupError = false;
 		getBudgetRollup()
 			.then((r) => {
 				budgetRollup = r;
-				budgetRollupError = false;
 			})
 			.catch(() => {
 				budgetRollupError = true;
 			});
+	}
+	$effect(() => {
+		untrack(loadBudgetRollup);
 	});
 
 	// The two free-text money inputs are debounced — one request per pause, not
@@ -203,7 +211,10 @@
 			a.remove();
 			URL.revokeObjectURL(url);
 		} catch (e) {
-			error = e instanceof Error ? e.message : m('cfo.error.exportFailed');
+			// An action's outcome, not a failed load: a toast. Writing it into
+			// `error` replaced the whole forecast with the export's failure, and
+			// that block's Retry would re-run the forecast, not the export.
+			toast(e instanceof Error ? e.message : m('cfo.error.exportFailed'), 'error');
 		}
 	}
 
@@ -302,7 +313,20 @@
 			label={m('cfo.kpi.pipeline')}
 			pending={loading}
 		/>
-		<!-- The three cards above read the forecast; this one reads the SEPARATE
+		<!-- Projected outflow = committed + pipeline + overdue (decisions §440):
+		     without this card the visible parts stopped summing to the headline
+		     the moment any AP was past due. Shown only when there IS overdue AP,
+		     so the common case keeps its four-card row; a zero would be a true
+		     figure, but one that says nothing the other three do not. -->
+		{#if forecast && forecast.totals.overdue_count > 0}
+			<KpiCard
+				value={fmt(forecast.totals.overdue_amount)}
+				label={m('cfo.kpi.overdue')}
+				highlight="red"
+				pending={loading}
+			/>
+		{/if}
+		<!-- The cards above read the forecast; this one reads the SEPARATE
 		     what-if response. `?? '0'` was actively defeating the honest answer
 		     — `fmt` is `formatMoney`, which already returns the no-figure dash
 		     for a missing amount, and the coercion turned it into a green "$0
@@ -325,14 +349,28 @@
 	</div>
 
 	{#if error}
-		<p class="cf-error" role="alert">{error}</p>
+		<LoadError message={error} onretry={load} testId="cfo-load-error" />
 	{:else if loading}
-		<p class="loading">{m('cfo.loading')}</p>
+		<LoadingState testId="cfo-loading" />
 	{:else if forecast}
 
 		<!-- Forecast bar chart -->
 		<div class="chart-card">
 			<h2>{m('cfo.chart.projectedOutflows', { granularity: granLabel(granularity) })}</h2>
+			<!-- AP already past due is owed now, so the API carries it into the
+			     FIRST period as its own `overdue_amount` — inside the bar's total,
+			     outside committed / pending — rather than dropping it (which
+			     overstated cash by exactly the late AP) or folding it into
+			     "committed" as if it were on schedule. Said in words as well as
+			     drawn, so the bar segment is not the only place it shows. -->
+			{#if forecast.totals.overdue_count > 0}
+				<p class="cf-overdue" data-testid="overdue-outflows">
+					{m('cfo.chart.overdueNote', {
+						n: forecast.totals.overdue_count,
+						amount: fmt(forecast.totals.overdue_amount)
+					})}
+				</p>
+			{/if}
 			{#if forecast.periods.length > 0}
 				<div class="cf-bars">
 					{#each forecast.periods as p (p.period)}
@@ -341,24 +379,44 @@
 							<div
 								class="cf-bar-bg"
 								role="img"
-								aria-label={m('cfo.chart.barAria', { committed: fmt(p.committed_amount), pending: fmt(p.pending_amount) })}
+								aria-label={p.overdue_count > 0
+									? m('cfo.chart.barAriaOverdue', { overdue: fmt(p.overdue_amount), committed: fmt(p.committed_amount), pending: fmt(p.pending_amount) })
+									: m('cfo.chart.barAria', { committed: fmt(p.committed_amount), pending: fmt(p.pending_amount) })}
 							>
-								<div
-									class="cf-bar committed"
-									style="width:{(parseMoneyForLayout(p.committed_amount) / maxScheduled) * 100}%"
-									title={m('cfo.chart.committedTitle', { amount: fmt(p.committed_amount) })}
-								></div>
-								<div
-									class="cf-bar pending"
-									style="width:{(parseMoneyForLayout(p.pending_amount) / maxScheduled) * 100}%"
-									title={m('cfo.chart.pendingTitle', { amount: fmt(p.pending_amount) })}
-								></div>
+								<!-- A segment is drawn only when it holds money, so the
+								     `.cf-bar + .cf-bar` separator below falls exactly
+								     BETWEEN two visible segments, never at the bar's start. -->
+								{#if p.overdue_count > 0 && isPositiveAmount(p.overdue_amount)}
+									<div
+										class="cf-bar overdue"
+										style="width:{(parseMoneyForLayout(p.overdue_amount) / maxScheduled) * 100}%"
+										title={m('cfo.chart.overdueTitle', { amount: fmt(p.overdue_amount) })}
+									></div>
+								{/if}
+								{#if isPositiveAmount(p.committed_amount)}
+									<div
+										class="cf-bar committed"
+										style="width:{(parseMoneyForLayout(p.committed_amount) / maxScheduled) * 100}%"
+										title={m('cfo.chart.committedTitle', { amount: fmt(p.committed_amount) })}
+									></div>
+								{/if}
+								{#if isPositiveAmount(p.pending_amount)}
+									<div
+										class="cf-bar pending"
+										style="width:{(parseMoneyForLayout(p.pending_amount) / maxScheduled) * 100}%"
+										title={m('cfo.chart.pendingTitle', { amount: fmt(p.pending_amount) })}
+									></div>
+								{/if}
 							</div>
 							<span class="cf-bar-amount">{fmt(p.scheduled_amount)}</span>
 						</div>
 					{/each}
 				</div>
 				<div class="cf-legend">
+					<!-- Legend in the bar's own left-to-right order. -->
+					{#if forecast.totals.overdue_count > 0}
+						<span class="cf-dot overdue"></span> {m('cfo.legend.overdue')}
+					{/if}
 					<span class="cf-dot committed"></span> {m('cfo.legend.committed')}
 					<span class="cf-dot pending"></span> {m('cfo.legend.pending')}
 				</div>
@@ -381,6 +439,12 @@
 							<span class="scenario-title">{label}</span>
 							<span class="scenario-outflow">{fmt(s.total_outflow)}</span>
 							<span class="scenario-sub">{m('cfo.whatif.netOutflow')}</span>
+							<!-- Late AP is owed now in every scenario, so it sits inside
+							     each total unchanged; naming it keeps the three totals
+							     from reading as pure payment-timing choices. -->
+							{#if s.overdue_count > 0}
+								<span class="scenario-overdue" data-testid="whatif-overdue">{m('cfo.whatif.overdueIncluded', { amount: fmt(s.overdue_amount) })}</span>
+							{/if}
 							{#if isPositiveAmount(s.total_discount_captured)}
 								<span class="scenario-discount">{m('cfo.whatif.discountCaptured', { amount: fmt(s.total_discount_captured) })}</span>
 							{/if}
@@ -455,7 +519,15 @@
 								<tr class:breach={p.below_threshold} data-breach={p.below_threshold}>
 									<td>{formatPeriod(p.period)}</td>
 									<td class="num">{fmtIn(p.opening, ccy)}</td>
-									<td class="num">-{fmtIn(p.outflow, ccy)}</td>
+									<!-- The first period's outflow carries every past-due
+									     invoice (decisions §440); say so on the row it
+									     inflates rather than leave a jump unexplained. -->
+									<td class="num">
+										-{fmtIn(p.outflow, ccy)}
+										{#if isPositiveAmount(p.overdue_amount)}
+											<span class="cf-row-note" data-testid="position-overdue-note">{m('cfo.position.overdueIncluded', { amount: fmtIn(p.overdue_amount, ccy) })}</span>
+										{/if}
+									</td>
 									<!-- The red row alone said WHICH periods breach only to a
 									     reader who can see red (WCAG 1.4.1 Use of Color); the
 									     banner above gives the count, this names the rows. -->
@@ -500,7 +572,11 @@
 				<h2>{m('cfo.budgets.title')}</h2>
 				<HelpTip term="budget" />
 			</div>
-			<p class="cf-error" role="alert">{m('cfo.budgets.loadFailed')}</p>
+			<LoadError
+				message={m('cfo.budgets.loadFailed')}
+				onretry={loadBudgetRollup}
+				testId="budget-rollup-error"
+			/>
 		</div>
 	{:else if budgetRollup}
 		<div class="chart-card" data-testid="budget-rollup">
@@ -516,6 +592,13 @@
 			{#if budgetRollup.excluded_row_count > 0}
 				<p class="cf-skipped" role="alert" data-testid="budget-rollup-excluded">
 					{m('cfo.budgets.excluded', { n: budgetRollup.excluded_row_count })}
+				</p>
+			{/if}
+			<!-- Same floor, different cause: a linked PO whose total the ERP
+			     could not confirm is left out of committed (decisions §323). -->
+			{#if budgetRollup.unverifiable_po_count > 0}
+				<p class="cf-skipped" role="alert" data-testid="budget-rollup-unverifiable">
+					{m('cfo.budgets.unverifiablePos', { n: budgetRollup.unverifiable_po_count })}
 				</p>
 			{/if}
 			{#if budgetRollup.insufficient_data}
@@ -650,11 +733,6 @@
 		width: 180px;
 	}
 
-	.cf-error {
-		color: var(--danger);
-		font-weight: 500;
-	}
-
 	.chart-card {
 		background: var(--surface);
 		border: 1px solid var(--border);
@@ -706,11 +784,33 @@
 	}
 
 	.cf-bar.committed {
-		background: #638cff;
+		background: var(--accent);
 	}
 
 	.cf-bar.pending {
-		background: #b7c5f5;
+		background: color-mix(in srgb, var(--accent) 45%, var(--text));
+	}
+
+	/* Overdue (--danger) and committed (--accent) are 1.13:1 dark / 1.02:1
+	   light against each other, so colour alone cannot tell adjacent segments
+	   apart (WCAG 1.4.1 / 1.4.11). A 2px --surface rule separates every pair,
+	   drawn as an inset shadow so it takes no width from the proportions.
+	   Each segment against that rule: dark danger 6.27, accent 5.55, pending
+	   9.23; light danger 7.08, accent 6.95, pending 12.11 (all >= 3:1).
+	   Overdue is also hatched, so it is identifiable by pattern, not hue; its
+	   lighter stripe (70% danger) is 3.70 dark / 3.88 light against the rule
+	   too, so the separator holds whichever stripe it lands beside. */
+	.cf-bar + .cf-bar {
+		box-shadow: inset 2px 0 0 var(--surface);
+	}
+
+	.cf-bar.overdue,
+	.cf-dot.overdue {
+		background: repeating-linear-gradient(
+			135deg,
+			var(--danger) 0 4px,
+			color-mix(in srgb, var(--danger) 70%, var(--surface)) 4px 6px
+		);
 	}
 
 	.cf-bar-amount {
@@ -738,11 +838,26 @@
 	}
 
 	.cf-dot.committed {
-		background: #638cff;
+		background: var(--accent);
 	}
 
 	.cf-dot.pending {
-		background: #b7c5f5;
+		background: color-mix(in srgb, var(--accent) 45%, var(--text));
+	}
+
+
+	.cf-row-note {
+		display: block;
+		font-size: 0.72rem;
+		color: var(--danger);
+		white-space: nowrap;
+	}
+
+	.cf-overdue {
+		font-size: 0.85rem;
+		margin: 0 0 12px;
+		color: var(--danger);
+		font-weight: 600;
 	}
 
 	.scenario-grid {
@@ -761,8 +876,8 @@
 	}
 
 	.scenario-card.best {
-		border-color: #2faa6a;
-		background: rgba(47, 170, 106, 0.06);
+		border-color: var(--success);
+		background: color-mix(in srgb, var(--success) 6%, transparent);
 	}
 
 	.scenario-title {
@@ -782,9 +897,15 @@
 		color: var(--text-muted);
 	}
 
+	.scenario-overdue {
+		font-size: 0.78rem;
+		color: var(--danger);
+		margin-top: 4px;
+	}
+
 	.scenario-discount {
 		font-size: 0.82rem;
-		color: #2faa6a;
+		color: var(--success);
 		font-weight: 600;
 	}
 
@@ -805,7 +926,7 @@
 	   the bank. Distinct from `.cf-hint` so "we declined your balance" can't be
 	   read as the ordinary "enter an opening balance" prompt. */
 	.cf-skipped {
-		color: #d4940a;
+		color: var(--warning);
 		font-weight: 600;
 	}
 

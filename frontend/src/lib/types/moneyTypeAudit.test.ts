@@ -68,12 +68,34 @@ const sources = Object.entries(RAW)
  * once every candidate in it is either retyped or judged here.
  */
 const JUDGED_NOT_MONEY: Record<string, Record<string, string>> = {
+	'lib/types/billing.ts': {
+		// The instant a plan-change preview was priced at (decisions §482), in
+		// Unix seconds — a timestamp the confirm hands back, not an amount.
+		'BillingPlanChangePreview.proration_date': 'a Unix timestamp, not money',
+		'BillingPlanChangeRequest.proration_date': 'a Unix timestamp, not money'
+	},
+	'lib/types/auditVerification.ts': {
+		// Caps the signature sweep's findings list (backend default 100, max 1000).
+		'VerifySignaturesParams.limit': 'a cap on returned findings, not a spend limit'
+	},
+	'lib/types/runOutside.ts': {
+		// NACHA verify (decisions §362): how many payments are left in the file
+		// after the ones whose bill was paid in the ERP were taken out.
+		'NachaVerifyResult.remaining': 'a count of payments left in the file, not money'
+	},
 	'lib/types/bankReconciliation.ts': {
 		// Pagination row count of the whole statement set, not money.
 		'BankStatementListResponse.total': 'pagination row count'
 	},
+	'lib/types/erpConnection.ts': {
+		// Blackbaud SKY's daily API-call allowance (decisions §322 / §324).
+		'ErpCallUsage.limit': 'an ERP API call count, not money'
+	},
 	'lib/types/accessReview.ts': {
 		'AccessReviewResponse.total': 'users reviewed — a head count, not money'
+	},
+	'lib/types/cardGenerate.ts': {
+		'CardGenerateResponse.total': 'cards minted by the request — a count, not money'
 	},
 	'lib/types/analytics.ts': {
 		// The dashboard's invoice ROW COUNT — `total_invoices` is money-shaped by

@@ -602,7 +602,7 @@ agreement by `tests/test_dashboard_aggregates.py`
 | `/api/experiments/{id}` | PATCH | **admin only** | Edit — **draft only** (409 otherwise) |
 | `/api/experiments/{id}/start` | POST | **admin only** | draft → running; idempotent (already-running is a no-op); 409 if concluded |
 | `/api/experiments/{id}/stop` | POST | **admin only** | running → draft (stops *new* assignments; in-flight keep their frozen variant); 409 if not running |
-| `/api/experiments/{id}/conclude` | POST | **admin only** | → concluded (terminal; results stay readable); idempotent |
+| `/api/experiments/{id}/conclude` | POST | **admin only** | → concluded (terminal; results stay readable); idempotent; 409 `experiment_never_ran` on a draft that never assigned an invoice (nothing to conclude — delete it) |
 | `/api/experiments/{id}` | DELETE | **admin only** | **draft only** (409 — stop/conclude a running one to preserve its measurement history) |
 | `/api/experiments/{id}/results` | GET | admin / ap_manager / cfo | Per-variant metrics + winner / not-enough-data over the recorded assignments |
 
@@ -620,8 +620,11 @@ experiments `DataTable` with clickable rows opening a **results readout** modal
 (winner / not-enough-data banner + the per-variant metric table, primary metric
 row highlighted), a create `Modal` (pick a definition — seeds both configs from
 its live `steps_config` — set split %, primary metric, min sample, edit the two
-JSON configs), and per-row start / stop / conclude / delete actions gated by
-status + role. Over `#lib/api/experiments.ts` (types in
+JSON configs), and per-row start / stop / conclude / delete actions offered by the row's
+`actions` verdicts (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`,
+the gates the endpoints raise from; decisions §487, §488). A draft offers
+exactly one way out: Delete while it has never assigned an invoice, Conclude
+once it has (a stopped draft keeps its assignments). Over `#lib/api/experiments.ts` (types in
 `#lib/types/experiments.ts`).
 
 ### Frontend — `/adaptive`
@@ -701,8 +704,11 @@ and its own request sequence, so a failing anomaly scan cannot blank the
 patterns a reader is looking at.
 
 **Read-first, and the omissions are the design.** The only write is
-`POST /suggestions/{id}/dismiss` (behind a confirm dialog, gated on
-`canDismissSuggestion` = `_WRITE_ROLES`, so a CFO reads and is not offered it).
+`POST /suggestions/{id}/dismiss` (behind a confirm dialog, offered only when
+the row's `actions.dismiss` verdict is `null`: the role gate and
+`dismiss_refusal`'s status gate both come from the server, so a CFO, or a row
+already dismissed or applied, is offered nothing, a `stale` row the server
+would dismiss is offered it, and a row with no `actions` offers nothing).
 Neither apply path is exposed: `routing-suggestion/apply` reassigns a live
 approval, `threshold-recommendation/apply` raises the org-wide threshold that
 decides which invoices skip human review, and the second one carries the
@@ -879,7 +885,7 @@ SOX-instrumented reads. **Compute-on-read** over `audit_log` + the existing
 | `/api/adaptive/approval-patterns` | GET | admin / ap_manager / cfo | `?days=180` (max 730) lookback |
 | `/api/adaptive/anomalies` | GET | admin / ap_manager / cfo | `?invoice_id=<uuid>` (single) or batch (in-review queue, cap 200); 404 if the invoice isn't in this tenant/entity |
 | `/api/adaptive/suggestions` | GET | admin / ap_manager / cfo | `?status=open|all` (default `open`), `?days=365`; **upserts** then returns |
-| `/api/adaptive/suggestions/{id}/dismiss` | POST | admin / ap_manager | idempotent; 404 outside tenant |
+| `/api/adaptive/suggestions/{id}/dismiss` | POST | admin / ap_manager | `open` / `stale` dismiss; a repeat on `dismissed` is an idempotent no-op; `applied` is refused 409 (`workflow_suggestion_not_dismissable` — overwriting it would erase that the change was made). Each suggestion row carries `actions.dismiss`, built from the same `dismiss_refusal`; the web page offers Dismiss by it. 404 outside tenant |
 | `/api/adaptive/routing-suggestion` | GET | admin / ap_manager / cfo | `?invoice_id=<uuid>` (required), `?days=180` lookback; 404 if the invoice isn't in this tenant/entity. Ranked, advisory — assigns nobody |
 | `/api/adaptive/routing-suggestion/apply` | POST | admin / ap_manager | Body `{invoice_id}`, `?days=180`. Assigns the top recommendation via the audited `review.assign_reviewer`. 409 if not `ready_for_review`; 422 if no eligible approver; 404 outside tenant/entity; idempotent no-op when already assigned to the chosen approver. **Write surface — CFO excluded (read-only on routing).** |
 | `/api/adaptive/threshold-recommendation` | GET | admin / ap_manager / cfo | `?days=365` lookback, `?workflow_id=<uuid>` (defaults to active definition). Conservative recommended raise to `auto_approve_below` + evidence + rationale, **outcome-adjusted** — the same decision the apply POST acts on. Read-only — never mutates the definition |

@@ -5,6 +5,7 @@ import 'package:feohledger_mobile/api/endpoints.dart';
 import 'package:feohledger_mobile/models/audit_entry.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
+import 'package:feohledger_mobile/utils/paged_fetch.dart';
 import 'package:feohledger_mobile/utils/sequenced_fetch.dart';
 
 /// Immutable bundle of the advanced-search filters (vendor, PO, amount range,
@@ -47,17 +48,27 @@ class InvoiceSearchFilters {
       ].where((e) => e).length;
 }
 
-class InvoiceStore extends ChangeNotifier with SequencedFetch {
+class InvoiceStore extends ChangeNotifier
+    with SequencedFetch, PagedFetch<Invoice> {
   static final InvoiceStore instance = InvoiceStore._();
   InvoiceStore._();
 
-  List<Invoice> _invoices = [];
   bool _loading = false;
-  String? _error;
+
+  /// The last **fetch** of the Invoices tab's list failed, as caught — the
+  /// screen words it with `describeLoadError` and it alone drives the list's
+  /// error state and "couldn't refresh" banner. Actions never write it.
+  Object? _loadError;
+
+  /// The last failed **action** (approve, reject, recall, update, bulk,
+  /// export) as a sentence ([describeApiError]). Kept apart from [loadError]
+  /// so a refused approval over a loaded list is not reported as a failed
+  /// refresh.
+  String? _actionError;
 
   /// The raw `detail` of the last refused [update], for a screen that states a
   /// structured refusal in the reader's language
-  /// (`lib/l10n/gl_chart_refusal_messages.dart`). [error] stays the English
+  /// (`lib/l10n/gl_chart_refusal_messages.dart`). [actionError] stays the English
   /// fallback. Null after a successful update or a non-API failure.
   Object? _updateErrorDetail;
 
@@ -78,14 +89,28 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   // the same wrong filter.
   static const pendingApprovalStatus = 'ready_for_review';
   final RequestSequence _pendingSeq = RequestSequence();
-  List<Invoice> _pending = [];
+  late final PagedList<Invoice> _pendingPages = PagedList<Invoice>(
+    _pendingSeq,
+    keyOf: (invoice) => invoice.id,
+  );
   bool _pendingLoading = false;
-  String? _pendingError;
+  Object? _pendingLoadError;
   bool _pendingFromCache = false;
   bool _pendingLoaded = false;
   String? _statusFilter;
   String? _searchQuery;
   InvoiceSearchFilters _filters = InvoiceSearchFilters.empty;
+
+  /// The Overdue quick view: owed and past due, the set the dashboard's
+  /// Overdue figure counts (`GET /api/invoices?overdue=true`). It spans
+  /// statuses (approved AND in review), so it and a status chip are mutually
+  /// exclusive.
+  bool _overdueOnly = false;
+
+  /// Bumped when something outside the Invoices screen clears the search
+  /// ([showOverdue]), so the screen clears its search box once, and only
+  /// then: never mid-typing while a debounced query has not landed yet.
+  int _searchClearedExternally = 0;
   bool _fromCache = false;
 
   // ----- Bulk-operation selection -----
@@ -95,46 +120,80 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   bool _selectionMode = false;
   final Set<String> _selectedIds = <String>{};
 
-  List<Invoice> get invoices => _invoices;
+  List<Invoice> get invoices => pages.items;
   bool get loading => _loading;
-  String? get error => _error;
+  Object? get loadError => _loadError;
+  String? get actionError => _actionError;
   Object? get updateErrorDetail => _updateErrorDetail;
   Object? get approveErrorDetail => _approveErrorDetail;
   String? get statusFilter => _statusFilter;
+  String? get searchQuery => _searchQuery;
+  bool get overdueOnly => _overdueOnly;
+  int get searchClearedExternally => _searchClearedExternally;
   InvoiceSearchFilters get filters => _filters;
   bool get fromCache => _fromCache;
+
+  /// A status chip, search query or advanced filter is narrowing the list —
+  /// an empty result then means "nothing matches", not "no invoices".
+  bool get isFiltered =>
+      _statusFilter != null ||
+      _overdueOnly ||
+      (_searchQuery != null && _searchQuery!.isNotEmpty) ||
+      !_filters.isEmpty;
 
   bool get selectionMode => _selectionMode;
   Set<String> get selectedIds => Set.unmodifiable(_selectedIds);
   int get selectedCount => _selectedIds.length;
   bool isSelected(String id) => _selectedIds.contains(id);
 
+  /// Whether every selected row is a loaded invoice awaiting review — the
+  /// only state a bulk approve moves (backend decisions §418), so the bulk
+  /// sheet offers Approved only then, as the web picker does.
+  bool get selectionAwaitingReview {
+    if (_selectedIds.isEmpty) return false;
+    final statuses = {for (final inv in invoices) inv.id: inv.status};
+    return _selectedIds
+        .every((id) => statuses[id] == InvoiceStatus.readyForReview);
+  }
+
   /// Invoices awaiting approval, as returned by the server for
   /// `status=ready_for_review` — NOT a slice of [invoices].
-  List<Invoice> get pending => _pending;
+  List<Invoice> get pending => _pendingPages.items;
   bool get pendingLoading => _pendingLoading;
-  String? get pendingError => _pendingError;
+
+  /// The approvals queue's last fetch failure, as caught (see [loadError]).
+  Object? get pendingLoadError => _pendingLoadError;
   bool get pendingFromCache => _pendingFromCache;
+
+  /// Every invoice awaiting review, per the server — the queue's count. Not
+  /// `pending.length`, which is only the pages loaded so far.
+  int get pendingTotal => _pendingPages.total;
+  bool get pendingHasMore => _pendingPages.hasMore;
+  bool get pendingLoadingMore => _pendingPages.loadingMore;
+  Object? get pendingLoadMoreError => _pendingPages.loadMoreError;
 
   /// Drop all in-memory state. Called on logout / forced logout through
   /// `SessionManager.endSession` — these are process-lifetime singletons, so
   /// without this a signed-out user's data would still be in memory for the
   /// next account on the device. Tests use it to decouple from run order.
   void reset() {
-    _invoices = [];
+    pages.clear();
     _loading = false;
-    _error = null;
+    _loadError = null;
+    _actionError = null;
     _updateErrorDetail = null;
     _approveErrorDetail = null;
-    _pending = [];
+    _recallErrorDetail = null;
+    _pendingPages.clear();
     _pendingLoading = false;
-    _pendingError = null;
+    _pendingLoadError = null;
     _pendingFromCache = false;
     _pendingLoaded = false;
     _pendingSeq.reset();
     _statusFilter = null;
     _searchQuery = null;
     _filters = InvoiceSearchFilters.empty;
+    _overdueOnly = false;
     _fromCache = false;
     _selectionMode = false;
     _selectedIds.clear();
@@ -167,7 +226,7 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   void selectAll() {
     _selectedIds
       ..clear()
-      ..addAll(_invoices.map((i) => i.id));
+      ..addAll(invoices.map((i) => i.id));
     notifyListeners();
   }
 
@@ -176,8 +235,29 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
     notifyListeners();
   }
 
+  /// A status chip, "All" included, leaves the Overdue quick view.
   void setStatusFilter(String? status) {
     _statusFilter = status;
+    _overdueOnly = false;
+    fetch();
+  }
+
+  /// The Overdue chip: the past-due set across statuses, so the status chip
+  /// clears. Search and advanced filters still narrow it.
+  void setOverdueOnly() {
+    _statusFilter = null;
+    _overdueOnly = true;
+    fetch();
+  }
+
+  /// The dashboard Overdue card's tap-through: the list must hold exactly
+  /// the rows the card counted, so every other filter clears with it.
+  void showOverdue() {
+    _statusFilter = null;
+    _searchQuery = null;
+    _searchClearedExternally++;
+    _filters = InvoiceSearchFilters.empty;
+    _overdueOnly = true;
     fetch();
   }
 
@@ -193,41 +273,74 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
     fetch();
   }
 
+  /// Clear the status chip, the search query and the advanced filters in one
+  /// refetch — the filtered-empty state's "Show all".
+  void clearAllFilters() {
+    _statusFilter = null;
+    _searchQuery = null;
+    _filters = InvoiceSearchFilters.empty;
+    _overdueOnly = false;
+    fetch();
+  }
+
+  /// One page of the Invoices tab's list at the current chip, search and
+  /// advanced filters — [fetch] reads page 1, [loadMore] the rest.
+  @override
+  Future<PagedResult<Invoice>> fetchPage(int page) {
+    final f = _filters;
+    return InvoiceApi.list(
+      status: _statusFilter,
+      search: _searchQuery,
+      vendor: f.vendor,
+      poNumber: f.poNumber,
+      amountMin: f.amountMin,
+      amountMax: f.amountMax,
+      dueDateFrom: f.dueDateFrom,
+      dueDateTo: f.dueDateTo,
+      overdue: _overdueOnly,
+      page: page,
+    );
+  }
+
+  @override
+  Object? pageItemKey(Invoice item) => item.id;
+
+  /// A next page is read only over a settled first page: while a fetch is
+  /// in flight the rows on screen are about to be replaced.
+  @override
+  Future<void> loadMore() async {
+    if (_loading) return;
+    await super.loadMore();
+  }
+
   Future<void> fetch() async {
     // Captured before the first await — if a newer fetch() starts before this
     // one's response lands, that response is stale and gets discarded instead
     // of clobbering state a later request has already written (issue #182).
     final token = nextRequestToken();
     _loading = true;
-    _error = null;
+    _loadError = null;
+    pages.restart();
     notifyListeners();
 
     final f = _filters;
-    final cacheKey = 'invoices_${_statusFilter ?? 'all'}_${_searchQuery ?? ''}'
+    final view = _overdueOnly ? 'overdue' : (_statusFilter ?? 'all');
+    final cacheKey = 'invoices_${view}_${_searchQuery ?? ''}'
         '_${f.vendor ?? ''}_${f.poNumber ?? ''}_${f.amountMin ?? ''}'
         '_${f.amountMax ?? ''}_${f.dueDateFrom?.toIso8601String() ?? ''}'
         '_${f.dueDateTo?.toIso8601String() ?? ''}';
 
     try {
-      final result = await InvoiceApi.list(
-        status: _statusFilter,
-        search: _searchQuery,
-        vendor: f.vendor,
-        poNumber: f.poNumber,
-        amountMin: f.amountMin,
-        amountMax: f.amountMax,
-        dueDateFrom: f.dueDateFrom,
-        dueDateTo: f.dueDateTo,
-      );
+      final result = await fetchPage(1);
       if (!isCurrentRequest(token)) return; // superseded — discard silently
-      _invoices = result;
+      pages.setFirstPage(result);
       _fromCache = false;
       _loading = false;
 
-      // Cache the raw invoice data for offline use
+      // Cache the first page for offline use (offline rows are not paged).
       await OfflineStore.instance.put(
         cacheKey,
-        _invoices.map((i) => _invoiceToJson(i)).toList(),
+        invoices.map((i) => _invoiceToJson(i)).toList(),
       );
 
       notifyListeners();
@@ -238,9 +351,11 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
         final cached = await OfflineStore.instance.get(cacheKey);
         if (cached != null) {
           if (!isCurrentRequest(token)) return;
-          _invoices = (cached as List)
-              .map((j) => Invoice.fromJson(j as Map<String, dynamic>))
-              .toList();
+          pages.setCached(
+            (cached as List)
+                .map((j) => Invoice.fromJson(j as Map<String, dynamic>))
+                .toList(),
+          );
           _fromCache = true;
           _loading = false;
           notifyListeners();
@@ -250,9 +365,11 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
       if (!isCurrentRequest(token)) return;
       // No cache to fall back on — make sure we don't keep claiming the
       // (now absent) data came from cache.
+      // Rows already on screen stay (the banner says they could not be
+      // refreshed); with none, the screen shows the error and Retry.
       _fromCache = false;
       _loading = false;
-      _error = e.toString();
+      _loadError = e;
       notifyListeners();
     }
   }
@@ -265,21 +382,22 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   Future<void> fetchPending() async {
     final token = _pendingSeq.next();
     _pendingLoading = true;
-    _pendingError = null;
+    _pendingLoadError = null;
+    _pendingPages.restart();
     notifyListeners();
 
     const cacheKey = 'invoices_pending_approval';
     try {
-      final result = await InvoiceApi.list(status: pendingApprovalStatus);
+      final result = await _fetchPendingPage(1);
       if (!_pendingSeq.isCurrent(token)) return; // superseded — discard
-      _pending = result;
+      _pendingPages.setFirstPage(result);
       _pendingFromCache = false;
       _pendingLoading = false;
       _pendingLoaded = true;
 
       await OfflineStore.instance.put(
         cacheKey,
-        _pending.map(_invoiceToJson).toList(),
+        pending.map(_invoiceToJson).toList(),
       );
 
       notifyListeners();
@@ -290,9 +408,11 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
         final cached = await OfflineStore.instance.get(cacheKey);
         if (cached != null) {
           if (!_pendingSeq.isCurrent(token)) return;
-          _pending = (cached as List)
-              .map((j) => Invoice.fromJson(j as Map<String, dynamic>))
-              .toList();
+          _pendingPages.setCached(
+            (cached as List)
+                .map((j) => Invoice.fromJson(j as Map<String, dynamic>))
+                .toList(),
+          );
           _pendingFromCache = true;
           _pendingLoading = false;
           _pendingLoaded = true;
@@ -306,9 +426,25 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
       // Surfaced as an error state, never as an empty "all caught up" queue —
       // an approvals list that silently reads empty on a failed request is
       // indistinguishable from having nothing to approve.
-      _pendingError = describeApiError(e);
+      _pendingLoadError = e;
       notifyListeners();
     }
+  }
+
+  /// One page of the approvals queue.
+  Future<PagedResult<Invoice>> _fetchPendingPage(int page) => InvoiceApi.list(
+        status: pendingApprovalStatus,
+        // The queue offers swipe-approve / swipe-reject from each row's own
+        // verdict, carried by this response rather than asked per row.
+        includeReviewActions: true,
+        page: page,
+      );
+
+  /// Append the approvals queue's next page. A no-op while the first page is
+  /// loading, when every pending invoice is shown, or when one is loading.
+  Future<void> loadMorePending() async {
+    if (_pendingLoading) return;
+    await _pendingPages.loadMore(_fetchPendingPage, notifyListeners);
   }
 
   /// Refresh every list this store currently serves after a mutation.
@@ -327,12 +463,13 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   /// [InvoiceApi.approve].
   Future<bool> approve(String id, {String? expectedUpdatedAt}) async {
     _approveErrorDetail = null;
+    _actionError = null;
     try {
       await InvoiceApi.approve(id, expectedUpdatedAt: expectedUpdatedAt);
       await _refreshAfterMutation();
       return true;
     } catch (e) {
-      _error = describeApiError(e);
+      _actionError = describeApiError(e);
       _approveErrorDetail = e is ApiException ? e.detail : null;
       // The list holds the version the server just refused; refetch it, or
       // the next swipe on the same row is refused again for the same reason.
@@ -347,13 +484,37 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   static bool isStaleApproval(Object? detail) =>
       detail is Map && detail['code'] == 'invoice_stale_approval';
 
+  Object? _recallErrorDetail;
+
+  /// The server's refusal body from the last failed [recallApproval] — a coded
+  /// `{code, message, params}` the screen states in the reader's language.
+  Object? get recallErrorDetail => _recallErrorDetail;
+
+  /// `POST /api/invoices/{id}/recall-approval` (backend decisions §374).
+  /// Not money-moving; the server re-checks its gate under the row lock, so a
+  /// claim or push that landed since the verdict is refused, coded.
+  Future<bool> recallApproval(String id, String reason) async {
+    _recallErrorDetail = null;
+    _actionError = null;
+    try {
+      await InvoiceApi.recallApproval(id, reason);
+      await _refreshAfterMutation();
+      return true;
+    } catch (e) {
+      _actionError = describeApiError(e);
+      _recallErrorDetail = e is ApiException ? e.detail : null;
+      notifyListeners();
+      return false;
+    }
+  }
+
   Future<bool> reject(String id, String reason) async {
     try {
       await InvoiceApi.reject(id, reason);
       await _refreshAfterMutation();
       return true;
     } catch (e) {
-      _error = e.toString();
+      _actionError = describeApiError(e);
       notifyListeners();
       return false;
     }
@@ -367,17 +528,18 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
   ///
   /// A refusal here is routine, not exceptional — a GL code outside the
   /// invoice's chart (`docs/decisions.md` §194/§199), a financial field after
-  /// approval, a stale edit — and retrying will not help, so [error] carries
+  /// approval, a stale edit — and retrying will not help, so [actionError] carries
   /// the server's own `detail` sentence (see [describeApiError]) for the
   /// screen to show, never the raw `ApiException(422): …` form.
   Future<Invoice?> update(String id, Map<String, dynamic> changes) async {
     _updateErrorDetail = null;
+    _actionError = null;
     try {
       final updated = await InvoiceApi.update(id, changes);
       await _refreshAfterMutation();
       return updated;
     } catch (e) {
-      _error = describeApiError(e);
+      _actionError = describeApiError(e);
       _updateErrorDetail = e is ApiException ? e.detail : null;
       notifyListeners();
       return null;
@@ -404,7 +566,7 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
       await _refreshAfterMutation();
       return result;
     } catch (e) {
-      _error = e.toString();
+      _actionError = describeApiError(e);
       notifyListeners();
       return null;
     }
@@ -424,7 +586,7 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
     Map<String, String>? versions;
     if (status == 'approved') {
       versions = {
-        for (final inv in _invoices)
+        for (final inv in invoices)
           if (_selectedIds.contains(inv.id) && inv.updatedAt != null)
             inv.id: inv.updatedAt!,
       };
@@ -440,7 +602,7 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
       await _refreshAfterMutation();
       return result;
     } catch (e) {
-      _error = e.toString();
+      _actionError = describeApiError(e);
       notifyListeners();
       return null;
     }
@@ -459,7 +621,7 @@ class InvoiceStore extends ChangeNotifier with SequencedFetch {
     try {
       return await InvoiceApi.bulkExport(ids, format);
     } catch (e) {
-      _error = e.toString();
+      _actionError = describeApiError(e);
       notifyListeners();
       return null;
     }

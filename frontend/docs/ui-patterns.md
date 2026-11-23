@@ -45,6 +45,38 @@ is wide enough for grid pages on 1920–2560px monitors without leaving
 half the viewport empty; on a 13″ laptop the natural body width
 constrains it before the cap kicks in.
 
+The same goes for the page body: a route never wraps its body in a
+`max-width` of its own. Tabs that share one tab bar must be the same width,
+or switching tabs moves the page (Subscription once capped itself at 64rem
+beside a full-width Organization). `src/lib/settingsTabWidth.test.ts` checks
+every Settings tab; cap a prose line's length, never the page.
+
+**Data that lands after first paint must not move what is already drawn.**
+A page mounts, draws its shell, and fills in from responses that arrive a
+round trip later. Anything those responses *add above the table* drops the
+table under the reader on every visit — on a deployed backend the round trip
+is long enough to see, and it reads as "a glitch whenever I change pages".
+So:
+
+- **Draw the slot from first paint.** A KPI / summary strip renders its cards
+  with the shared no-figure dash (`kpiDisplayValue`, or `<KpiCard>` with a
+  nullish `value`) and `aria-busy` while pending, never `{#if summary}` around
+  the whole strip (`/payments`).
+- **A chip row whose roster comes from a response holds its place while that
+  response is pending** — render it with just its "All" chip until the roster
+  lands (`/exceptions`' type row).
+- **Don't put data-sized controls inline beside fixed ones on a wrapping row.**
+  `/invoices`' status chips depend on the active workflow and their width on
+  the tallies; inline beside the search box the row fitted on one line at
+  mount and wrapped once they landed. They take a line of their own
+  (`flex-basis: 100%`). Likewise a `<select>` filled from a response gets a
+  fixed `width`, since a select sizes itself to its widest option.
+
+`tests-e2e/reactivity/layout-stability.spec.ts` holds the late responses
+behind a gate and asserts the table (or tab bar) sits at the same `y` before
+and after — add the page there when you put something above a table that
+loads.
+
 ### Navigating a long page
 
 Three primitives, and which one a page gets depends on **why its sections share
@@ -113,7 +145,7 @@ Use **`<DataTable>`** (`#lib/components/ui/DataTable.svelte`) for every
 grid page instead of hand-rolling `<div class="grid-container"><table>`:
 
 ```svelte
-<DataTable columns={COLUMNS} isEmpty={items.length === 0} empty="No items.">
+<DataTable columns={COLUMNS} isEmpty={items.length === 0} {loading} {errored} empty={m('items.empty')}>
     {#snippet body()}
         {#each items as item (item.id)}
             <tr class:row-selected={selected.has(item.id)}>
@@ -133,11 +165,19 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
 - `isEmpty` + `empty` render the centred `td.empty` row, tagged
   `data-testid="table-empty"` so e2e specs can assert *which* empty state is
   showing.
-- **`empty` must distinguish loading / errored / genuinely-empty.** A list that
-  renders its "nothing here" copy while a fetch is in flight — or forever after
-  a failed one — is asserting something it never established. Compose it:
-  `empty={loading ? m('common.loading') : errored ? m('…empty.errored') : normalEmpty}`,
-  and set both flags in the fetch's `try`/`catch`/`finally`. `/notifications`,
+- **`empty` must distinguish loading / errored / filtered / genuinely-empty,
+  and DataTable does the distinguishing.** A list that renders its "nothing
+  here" copy while a fetch is in flight — or forever after a failed one — is
+  asserting something it never established. Pass the states as props and give
+  each message as a key; the component picks one, in this order:
+  `loading` → `common.loading` (rendered in a `role="status"` span, so it is
+  announced), `errored` → `emptyErrored` (default `common.loadFailed`),
+  `filtered` → `emptyFiltered` (default `common.emptyFiltered`), else `empty`
+  (default `common.empty`). Never hand-build `empty={loading ? m('common.loading') : …}`,
+  pass a page-private "Loading cards…" key, or give `empty` an English
+  literal: `src/lib/dataTableEmpty.test.ts` refuses all three (its `ALLOWED`
+  list may only shrink). A page that shows `ui/LoadError` in the table's place
+  on failure need not pass `errored`. `/notifications`,
   `/exceptions` and the dashboard are the reference implementations; on
   `/exceptions` in particular the empty copy ("Everything looks good!") is a
   claim about open fraud flags and compliance holds, so getting this wrong is a
@@ -165,6 +205,67 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   nowrap` plus a `title` with the full value. Reference: `/vendors`, whose
   widths are scoped under a page wrapper because `SortableHeader` renders the
   `<th>` from another component.
+- **Size fixed widths to the longest locale; fixed headers wrap.** A fixed
+  column cannot grow, so a width measured against English overprints the next
+  column in es/fr/de/pt-BR ("FECHA DEL ESTADO DE CUENTA" ran ≈200px in a 130px
+  column; the badge "En attente d’approbation" ≈190px in 150px). In a `fixed`
+  table DataTable lets each `<th>` wrap, so a header column needs only its
+  longest single *word* in any of the six catalogues
+  (`src/lib/i18n/locales/*.ts`). That holds for a fluid column too: the
+  columns without a width share what the `min-width` leaves, so give a
+  second fluid column a width of its own when that share is narrower than its
+  longest header word (/requisitions' "Departamento", 127px in a 120px
+  share). A `<Badge>` never wraps, so a status column
+  is sized to its longest badge label in any locale, plus the cell padding.
+  **Action columns wrap too:** in a `fixed` table `td.actions` is
+  `white-space: normal`, so when a row's buttons don't fit — another locale, or
+  the widest status's button set — they flow onto a second line rather than
+  out of the table. Size the actions column for the common case in English
+  and let the rest wrap; never widen it to the worst locale's full button row.
+  A single `RowAction` does not wrap inside itself, though, so the column is
+  never narrower than the widest *one* button in any locale. That is also why
+  two row actions share one actions cell rather than each taking a column
+  (the /payments queue's Compare routes and Record as paid).
+  A note in an actions cell (the bank-change queue's separation-of-duties
+  refusal) is `display: block; white-space: normal`, above the buttons.
+  Guard: `tests-e2e/reactivity/layout-stability.spec.ts` opens each page in
+  its `LOCALE_SIZED` set under `de`, `es`, `fr`, `pt-BR` and `ja` and fails if
+  a header, a badge's cell or an action cell has `scrollWidth > clientWidth`;
+  a new fixed table joins that set. A page whose widest badge needs a row the
+  tenant may not hold (an escalated exception, a partially received PO) gets
+  a `WIDEST_ROW` entry there, which patches the first real row into it. A `SortableHeader` needs 14px more than its
+  word (the arrow and its gap), a `HelpTip` about 22px. **Measure, don't
+  guess:** render each candidate string in a browser with the cell's own font
+  metrics (`th`: 0.72rem/600, uppercase, 0.06em; `<Badge>`: 0.75rem/600,
+  uppercase, 0.03em, plus its 20px padding; `RowAction`: 0.8rem plus 26px of
+  chrome) and take the widest across the six catalogues, then round up to the
+  next 10px with at least 5px to spare. CI's fallback font renders wider than
+  a developer laptop's (the fr badge "COMPTABILISÉE DANS L'ERP" ≈191px
+  locally, ≈234px in CI), so a local measurement gets roughly a quarter more
+  on top, which is how /payments is sized. When the widths that gives no longer
+  leave the text columns room inside the 1388px region a 1666px window gives
+  (`tests-e2e/a11y/wide-layout.spec.ts`), a dense table runs 10px of
+  horizontal cell padding instead of 14px (/exceptions, /invoices,
+  /vendors, /payments) before anything else gives way. A page's other tabs
+  join the guard through its `LOCALE_SIZED_VIEWS` list (/payments' history,
+  runs, rebates and cards tables).
+- **A list page's table is `fixed`.** Under `table-layout: auto` the columns
+  are sized against the "Loading…" row and then re-sized against the real
+  rows, so every column slides sideways as the data lands. /invoices,
+  /payments, /exceptions, /vendors, /purchase-orders, /gl-accounts, the
+  screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
+  /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
+  the users directory, /admin/entities, /admin/api-keys,
+  /admin/access-review and both /goods-receipts tabs are converted,
+  /admin/entities, /admin/api-keys, /admin/access-review and the
+  inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
+  separate loading block for it. Size each fixed column to the widest string
+  in any of the six locales, not the English one; `tests-e2e/reactivity/layout-stability.spec.ts` holds each to a
+  cumulative layout shift under 0.1 with production-like API latency and
+  checks a `fixed` table's header x positions. A new sidebar page fails that
+  spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`; a page's second
+  tab with its own table goes in `TAB_PAGES` (`?tab=` href), since a sidebar
+  link only ever opens the first.
 - **Never make a `<td>` / `<th>` `display: flex` (or grid).** It stops being a
   table cell: the column no longer sizes it, so content overflows the table,
   and its border drifts out of line with the row. Lay out inline children with
@@ -308,9 +409,10 @@ appears when one or more rows are selected:
         <BulkDeleteButton
             onconfirm={handleBulkDelete}
             disabled={busy}
-            label={`Delete ${selected.size}`}
+            label={m('things.bulk.delete', { n: selected.size })}
+            confirmLabel={m('things.bulk.confirmDelete')}
         />
-        <!-- additional .bulk-action-btn buttons go here -->
+        <!-- additional .btn-secondary buttons go here -->
     {/snippet}
 </BulkBar>
 ```
@@ -321,8 +423,38 @@ appears when one or more rows are selected:
   (e.g. excluding the current user, the default workflow, or
   immutable-status invoices). Items that can't be selected render
   their `<td class="checkbox-col">` empty rather than disabled.
+- **One size throughout.** Every button in the bar is a shared class at its
+  standard box: Clear is `.btn-cancel`, `BulkDeleteButton` is `.btn-danger`
+  (`.armed` for its confirm), any other action or "select all N matching" is
+  `.btn-secondary`. No compact local copies.
+- While the bar shows, `BulkBar` reserves its measured height (it wraps on a
+  phone) under the page (`html.has-bulk-bar body { padding-bottom }` in
+  `app.css`), so the fixed bar never covers the last rows or the pagination.
+- `countLabel` overrides the count text when the page's noun takes a gender
+  (`invoices.bulk.selected`); the `lead` snippet sits between the count and
+  Clear, for the "select all N matching" button or its in-force note.
 - Delete is always armed-confirm (one click arms; outside-click or
   second click un-arms or commits). `BulkDeleteButton` does this.
+  Pass `confirmLabel` (the armed label) from the catalogue too — its
+  fallback, `"Confirm " + label`, is English-only. `title` sets a native
+  tooltip; wrap the button in a `<span title>` instead when the tooltip
+  must show while it is `disabled` (`/invoices` does). Never restyle a
+  local `.bulk-delete-btn` copy — `/invoices` carried one until it drifted,
+  and a hand-rolled `.bulk-bar` with it (it now uses `<BulkBar>`, so it has the
+  `role="toolbar"` and its name).
+- **Several variants of one action go behind one `MenuButton`.** `/invoices`'
+  CSV, JSON and XML exports are one **Export** menu (`ui/MenuButton.svelte`):
+  as three buttons they wrapped the bar to three rows at 375px. A page with a
+  single format (`/vendors`, `/contracts`: CSV only) keeps its one button —
+  a menu of one is a slower button. The menu flips above the bar, since the
+  bar is pinned to the bottom of the viewport. Placement measures against
+  what is visible of the menu — the viewport cut down to its nearest
+  ancestor whose `overflow` is not `visible` (`utils/menuButton.clipBounds`)
+  — so inside a scrolling pane (InvoiceModal's `.form-scroll`, which holds
+  the e-invoice download menu) it flips and shifts against the pane, not the
+  window. Specs open it first:
+  `getByRole('button', { name: 'Export' })`, then
+  `getByRole('menuitem', { name: 'CSV' })`.
 - Bulk endpoints return a partial-success shape — `{deleted: [],
   failed: [{id, reason, ...}]}` — and the page surfaces the per-row
   reason in a toast. See `bulk_delete_users` in `backend/app/api/admin.py`
@@ -353,22 +485,33 @@ rather than only the currently-loaded page.
 
 Default page size is **20** across all list endpoints. Backend
 returns `{items, total, page, page_size}`; the front-end renders the
-items, then a centred Load More button below the table:
+items, then **`ui/LoadMoreFooter.svelte`** below the table: a centred
+"Load more (20 of 87)" button while rows remain, "Showing all 87 <thing>s"
+once they are all loaded, and nothing for an empty list or a failed load.
 
 ```svelte
-{#if store.hasMore}
-    <div class="load-more-row">
-        <button class="btn-load-more" onclick={loadMore} disabled={store.loading}>
-            {store.loading ? 'Loading…' : `Load more (${store.items.length} of ${store.total})`}
-        </button>
-    </div>
-{:else if store.total > 0}
-    <div class="load-more-row">
-        <span class="load-more-end">Showing all {store.total} <thing>s</span>
-    </div>
-{/if}
+<LoadMoreFooter
+    shown={items.length}
+    {total}
+    {hasMore}
+    loading={loadingMore}
+    errored={loadFailed}
+    onloadmore={() => load({ append: true })}
+    moreKey="<list>.loadMore"
+    allKey="<list>.showingAll"
+/>
 ```
 
+- Never copy its markup into a page. `moreKey` gets `{shown}` and `{total}`
+  through `formatCount`; `allKey` gets the raw `{total}` its plural selects
+  on (`formattedCountPlural.test.ts`). `loadingKey` (default
+  `common.loading`; the portal passes `portal.common.loading`), `disabled`
+  (another load is in flight) and `testId` (on the button) are optional.
+  Its `.load-more-row` / `.btn-load-more` / `.load-more-end` classes are
+  styled in `app.css` and are what Playwright specs select on.
+  `src/lib/utils/pagedListFooter.test.ts` fails on a `.svelte` file other
+  than the component that renders those classes, and on a use whose two
+  keys name different lists.
 - Append, don't replace. `loadMore` issues `page=N+1` and appends the new
   items **via `appendUnique` (`#lib/utils/pagination.ts`)** — never a raw
   `[...existing, ...res.items]` spread. Offset pagination can re-surface a
@@ -386,9 +529,10 @@ items, then a centred Load More button below the table:
   rows it never fetched do not exist. Six lists (budgets, intake,
   catalogs, requisitions, and the `/expenses` Reports + Cards sub-lists)
   shipped that way — 50 rows under a footer reading "Showing all 87",
-  with no control to reach the other 37. `src/lib/utils/pagedListFooter.test.ts`
-  is the guard: any file referencing a `<list>.showingAll` message must
-  also reference the matching `<list>.loadMore`.
+  with no control to reach the other 37. The component makes the pairing
+  structural; `src/lib/utils/pagedListFooter.test.ts` also still fails a
+  file that renders a `<list>.showingAll` message without the matching
+  `<list>.loadMore`.
 - Stores expose `total`, `page`, `hasMore`, and any mutating actions
   (create / delete / bulk-delete) keep `total` in sync without a
   refetch.
@@ -549,6 +693,31 @@ fails any `$effect` body containing `setTimeout(` / `setInterval(` without a
 matching `return () => clear…` — a deliberate static guard, because the
 symptom only shows inside a sub-second window that no non-flaky e2e can pin.
 
+**A debounce `$effect` must also skip its own mount-time run.** A `$effect`
+runs once at mount whether or not `search` changed, and the page's load effect
+has already fetched the list by then — so an unguarded `search;
+debouncedFetch()` loads it a second time 300ms later on every visit (it did on
+`/invoices`, `/vendors`, `/payments` and `/bank-reconciliation`), flipping the
+page's loading state while the reader is looking at the finished table. Open
+the body with the first-run skip:
+
+```ts
+let searchEffectRan = false;
+$effect(() => {
+    search;
+    if (!searchEffectRan) {
+        searchEffectRan = true;
+        return;
+    }
+    debouncedFetch();
+    return () => clearTimeout(searchTimer);
+});
+```
+
+The same source scan enforces it: an `$effect` whose first statement is
+`search;` and which arms a timer (or calls a `debounced…()` helper) must
+`return;` before it does.
+
 **Reading the URL once at mount is only half of the round trip.** SvelteKit
 reuses the mounted component for a navigation within the same route — the
 sidebar row clicked while on a filtered view, a `goto('/invoices?…')`, or
@@ -580,6 +749,10 @@ pill-shaped status filter above the table:
 
 - `chips = [{key, label, count?, alert?}]`. Omit `count` for label-only
   chips; `alert: true` renders the red attention badge (`.count.alert`).
+  Pass `ariaLabel` to name the chip `<nav>` landmark.
+- The chips are painted by `app.css` alone: a scoped rule may place
+  `.filter-chip` but never repaint it, in any file
+  (`src/lib/sharedButtonClasses.test.ts`).
 - The "All" chip comes first; the active chip uses `var(--accent-strong)` +
   white — **not** `var(--accent)`, which is only 3.12:1 against white. See
   *Colour tokens and contrast* below.
@@ -635,8 +808,47 @@ centred dialog with backdrop-click + Esc to close:
   `{#snippet header()}…{/snippet}` instead of `title`. If the body
   dereferences a nullable var, gate `open={x !== null}` and wrap the
   children in `{#if x}…{/if}`.
+- `class="<name>"` puts a class on the dialog element beside `modal`, for a
+  dialog with its own size or layout (style it as `:global(.modal.<name>)`);
+  `fullscreen` drops the backdrop's gutter and fills the viewport (the
+  invoice dialog's toggle) — the dynamic viewport, `100dvh` / `100dvw` after
+  a `100vh` / `100vw` fallback, so on a phone a footer pinned to the dialog's
+  foot is not under the browser toolbar. Both are no-ops when omitted. `InvoiceModal`
+  (`invoice-dialog`) and `RunDetailModal` (`run-detail-dialog`) use them; a
+  `<svelte:window>` listener a dialog needs stays in the caller.
 - Cancel sits left of the primary action. Required-field markers use
   `<em class="required">*</em>`.
+- **A `<label>` in a dialog is a stacked field by default.** `app.css`'s
+  `.modal label` is column flex and styles every direct-child `<span>` as a
+  small uppercase muted caption — right for "Vendor name" over an input, wrong
+  for a radio card. A choice list drawn as cards (one native radio per
+  `<label>`, inside a `<fieldset>` with a `<legend>`) sets `flex-direction:
+  row` on the card and resets `text-transform` / `letter-spacing` /
+  `font-size` / `color` on its own child spans, or it renders as a centred
+  stack of shouting captions (the `/billing` plan picker did, in production).
+  Put the focus ring on the card (`:has(input:focus-visible)`, as
+  `SegmentedControl` does) and mark the selection with border + ring, not an
+  `--accent-tint` fill: muted text on that fill drops under 4.5:1 in the dark
+  theme. Reference: `routes/billing/+page.svelte` (`.plan-option`); guard:
+  `tests-e2e/billing/billing.spec.ts` ("the picker is one radio group").
+- **A long dialog keeps its decisions out of the scroll.** When a dialog's body
+  runs past one screen (the invoice dialog's right pane: summary, fields, line
+  items, activity, chat, e-invoice), split the `<form>` into a scrolling region
+  and an action footer **beside it in the flex column** — `form { display: flex;
+  flex-direction: column; min-height: 0 }`, the body `flex: 1; min-height: 0;
+  overflow-y: auto`, the footer `flex-shrink: 0`. Never `position: sticky` the
+  footer over the content: a pinned strip hides the focused field under it
+  (2.4.11) and intercepts Playwright's scroll-then-click (`docs/decisions.md`
+  §181, § Shared visual layer below). The footer stays inside the `<form>` so
+  Save still submits, holds every forward action (Cancel, Save, Submit, and
+  Approve / Reject with the reject-reason flow), and caps itself at
+  `max-height: 50%` with its own `overflow-y: auto` so a 320px dialog never
+  squeezes the fields to nothing. A primary action disabled for a reason the
+  reader can fix says so beside it, wired with `aria-describedby` (the invoice
+  dialog's "Pick an approver to submit"). Reference:
+  `components/modals/InvoiceModal.svelte` (`.form-scroll` / `.form-actions`);
+  guards: `tests-e2e/invoices/review-verdict.spec.ts` (in view at 1280×720, no
+  spill at 320px) and `approver-picker.spec.ts` (the hint).
 - **Never hand-roll a modal shell.** Every dialog — including the feature
   dialogs in `#lib/components/modals/` — wraps its body in `<Modal>`. Do
   not write your own `.backdrop` / `div.modal[role="dialog"]`, your own
@@ -647,7 +859,30 @@ centred dialog with backdrop-click + Esc to close:
   means the dialog's *body* (custom field grids, pickers, footers) is
   feature-specific — the shell, backdrop, and close behaviour are not.
   If you find yourself writing `position: fixed; inset: 0` or
-  `role="dialog"` in a component, stop and use `<Modal>`.
+  `role="dialog"` in a component, stop and use `<Modal>`. Guard:
+  `src/lib/modalShell.test.ts` fails on a `role="dialog"` attribute or a
+  `class="backdrop"` in any `.svelte` file but `ui/Modal.svelte`; its
+  allowlist (`NotificationBell`'s non-modal popover, the portal login's
+  decorative backdrop) is shrink-only and fails
+  when a listed file no longer needs its entry.
+- **The page behind an open dialog is `inert`** (decisions §384). While any
+  modal dialog is open, everything outside the topmost one carries `inert`:
+  no focus, no pointer or touch, nothing in the accessibility tree. A dialog
+  opened over another (the recall dialog over the invoice dialog) makes the
+  first inert as well, and closing it gives back exactly the state before.
+  `actions/modalInert.ts` does this off `focusTrap`'s open-modal registry, so a
+  dialog gets it by being a `role="dialog"` with `aria-modal="true"` and
+  `use:focusTrap` — which `<Modal>` already is; a dialog needs nothing more.
+  It never removes an `inert` it did not set (the sidebar overlay's), and it
+  never makes the toast region or SvelteKit's route announcer inert, since an
+  inert live region announces nothing — a new app-level live region outside the
+  routed page joins `INERT_EXEMPT_SELECTOR`. **Don't portal a dialog's popup to
+  `<body>`**: nothing does today, and a node added there after the dialog
+  opened is left usable, but keep pickers, menus and listboxes inside the
+  dialog's own subtree. Guards: `src/lib/actions/modalInert.test.ts`,
+  `tests-e2e/a11y/modal-inert.spec.ts`, and axe's `target-size` in
+  `tests-e2e/a11y/recall-import-verify.spec.ts` (the page's sort buttons
+  behind two stacked dialogs at 320px).
 
 ### Unsaved changes (`guardUnsavedChanges`)
 
@@ -685,6 +920,20 @@ for every per-row button across every grid page. Variants:
 Renders as `<a>` when given `href`, otherwise `<button>`. Never copy
 the `padding: 4px 12px; ...` recipe inline — use the component.
 
+While the row's own request is in flight pass `busy` (and `disabled` on the
+other rows until it settles), so an armed two-click confirm cannot send its
+request twice. `busy` is `aria-disabled`, not native `disabled`, so focus stays
+on the button the keyboard user just pressed. The contract and its adopters are
+in `component-library.md` § `RowAction.svelte`.
+
+An action the server would refuse for a reason the reader can act on is
+rendered `disabled`, not hidden, with the reason as its accessible
+description: pass `describedby` naming a `.visually-hidden` element that holds
+the localized reason (and `title` for pointer users). The payment queue's
+"Record as paid" is the worked example (decisions §319). When the reason
+should be read on screen too, pass `reason` instead — see § Whether to offer
+an action → *Showing the reason*.
+
 The actions cell is **always the last column** (right side of the row),
 preceded by a header `<th class="actions-col"></th>`. The `<td>` uses
 `class="actions"` with the standard left-aligned flex layout:
@@ -705,6 +954,110 @@ For the destructive armed-confirm pattern, outside-click un-arms by
 adding a `<svelte:window onclick>` that clears `confirmDeleteId` when
 the click target is not within `.row-action`. See
 `routes/admin/+page.svelte` for the canonical implementation.
+
+### Whether to offer an action: read the server's verdict (issue #575)
+
+A page must not decide whether to show Approve, Execute, Void, Resolve, … by
+**restating the endpoint's rule** — a status list, a role list,
+`uploaded_by_id !== me`. Every such copy drifted from the server in its own
+way: the uploader was offered an Approve that 403'd, a run's creator an Execute
+that 403'd, an unverified vendor's invoice no way to be recorded paid at all
+(#573), an `active` vendor no Reject that both endpoints accept.
+
+Instead the backend ships a **verdict** beside the row, computed by running the
+same gate function the endpoint raises from, so the two cannot disagree:
+`null` when the endpoint would accept the caller, else the coded refusal
+(`{code, message, params}`) it would answer with. Read it through
+`#lib/api/actionVerdicts.ts`:
+
+- `isAllowed(verdict)` — the control may be pressed (`verdict === null`).
+- `isOffered(verdict)` — the control is rendered at all: false while the verdict
+  has not arrived (`undefined` — **fail closed**) and for `role_not_permitted`,
+  a reason the reader cannot act on.
+- `refusalText(verdict, m)` — the reason, localized from its code through
+  `api/codedRefusals.ts` (falling back to the server's English). Render it
+  beside a disabled control when the reader can act on it ("a colleague must
+  approve this").
+
+**Showing the reason.** A visible reason beside a disabled control is always
+`RefusalNote` (`#lib/components/ui/RefusalNote.svelte`), never a page-local
+`<span class="…-note">` with its own CSS — four pages had grown one each
+(requisitions, bank-change queue, expense reports, the exception dialog). It
+renders the sentence on its own line **above** the button(s), wraps in any
+locale, and drops the `td.actions` inline gap on the button under it, so a long
+reason never pushes the row's other actions out of a fixed actions column.
+
+- A row action: `<RowAction disabled reason={refusalText(v, m)} reasonId?>` —
+  `RowAction` renders the note and adds its id to the button's
+  `aria-describedby` (beside any `describedby` you pass). Set `reasonId` only
+  when a test or another control needs the note (`approve-refusal-<id>` on
+  /requisitions).
+- Any other control (a header or dialog button): `<RefusalNote id reason testid?>`
+  placed before the button(s), with each refused button's `aria-describedby`
+  set to that id (/expenses report detail, the /exceptions resolve dialog).
+
+Never add a second check beside the verdict — that is the copy it replaces.
+Org-level configuration the server states elsewhere (the execution mode, read
+once from `GET /api/payments/execution-mode`) is not a row property and stays a
+separate, documented gate. A mutation response that lacks the verdict must not
+be read as "allowed": carry the row's verdict only while what it judged is
+unchanged, otherwise drop it until the next list read
+(`routes/vendors/+page.svelte::applyVendorUpdate`).
+
+Where each verdict lives (backend gate → field):
+
+| Page | Field | Gate(s) the endpoint raises from |
+|---|---|---|
+| Payment queue | `record_outside_refusal` | `services/external_payment.record_outside_refusals` (#573) |
+| Payment history | `void_refusal`, `release_refusal`, `dismiss_refusal`, `accept_settlement_refusal` | `payment_controls.payment_void_refusal`, `.compliance_hold_refusal`, `.settlement_accept_refusal` |
+| Payment runs list | `actions.sync_erp` | `payment_controls.run_sync_erp_refusal` |
+| Run dialog | `actions.{approve,execute,cancel,retry_failed}` | `payment_controls.run_{approve,execute,cancel,retry_failed}_refusal` |
+| Run dialog (paying outside) | `actions.{record_outside,nacha_export,nacha_regenerate,nacha_void}` | `payment_controls.run_record_outside_refusal`, `.run_nacha_export_refusal`, `.run_nacha_void_refusal` |
+| Run dialog (Verify before upload) | `actions.nacha_verify` | `payment_controls.run_nacha_verify_refusal`. `nacha_verify_not_exported` / `nacha_nothing_to_verify` hide the control (no file to check); any other refusal disables it beside its reason (`run-nacha-verify-refusal`), as Download, Regenerate and Bank rejected the file do (decisions §362) |
+| Run dialog (whether the bank-file panel shows at all) | `bank_file_applies` | `payment_controls.run_bank_file_applies`: every run of a record-only tenant, and a processor tenant's run still holding an exported file. Read instead of the tenant's execution mode, so a run exported before a switch to processor mode keeps Verify and states why Regenerate and Bank rejected the file are refused (decisions §382) |
+| Invoice modal | `GET /api/invoices/{id}/review-actions` → `approve`, `reject` | `review.review_refusals` (the approve gates, on a scratch chain) |
+| Invoice modal (Resubmit for Review, file toolbar) | same read → `resubmit`, `manage_file` | `api/workflow.resubmit_refusal`, `api/invoice_entry.manage_file_refusal`. `invoice_not_resubmittable` hides Resubmit; `invoice_document_locked` replaces the toolbar with its sentence (decisions §363) |
+| Invoice modal (amount / vendor / tax rate inputs, line-item editing) | same read → `edit_financials` | `api/invoice_entry.edit_financials_refusal`. Anything but `null` (including no answer yet) disables the money inputs and line editing and keeps them out of the save payload; `invoice_financially_locked` also states its sentence above the form (decisions §370) |
+| Invoice modal (Submit / Send to ERP, Retry ERP) | same read → `complete`, `retry_erp` (and `send_to_erp`) | `api/workflow.workflow_action_refusals`: `complete_status_refusal`, `complete_entry_refusal`, `erp_send.erp_send_refusal` (plan, status, ERP export gate). `invoice_not_completable` / `invoice_not_erp_retryable` hide the control (about the status); the required-fields check stays a form check |
+| Invoice modal (Recall Approval) | same read → `recall_approval` | `services/review.recall_refusal`. `invoice_not_recallable` hides the control (about the status); any other refusal (a bill the ERP may hold, a live payment or card) disables it with its sentence (`recall-refusal`). The reason dialog (`modals/RecallApprovalModal.svelte`) states a refusal the door raises in between (decisions §374) |
+| Exception queue | `decision_refusals.{resolve,dismiss,escalate}` | `api/exceptions.actionable_refusal` + `exception_lifecycle.segregation_refusal` |
+| Credit memos | `actions.{apply,edit,void}` | `_assert_applicable` / `_assert_editable` / `_assert_voidable` |
+| Discount offers | `actions.{accept,decline}`, `capturable_tier_days` (the accept dialog's tiers) | `api/discounts.accept_refusal` / `.decline_refusal` |
+| Experiments | `actions.{start,stop,conclude,delete}` | `api/workflow_experiments.{start,stop,conclude,delete}_refusal`. Every refusal hides the control (`experiment_already_concluded` is the idempotent repeat, nothing to offer; decisions §487) |
+| Adaptive suggestions | `actions.dismiss` | `api/adaptive_workflows.dismiss_refusal` |
+| Vendors | `status_actions.{verify,reject}` | `api/vendors.vendor_status_refusal` |
+| Vendor modal (Find this vendor in the ERP) | `GET /api/vendors/{id}/erp-links` → `search_refusal` (also on the link / unlink responses) | `services/vendor_erp_manual_link.search_refusal`. `vendor_erp_link_exists` replaces the search with its sentence; any other refusal hides it (decisions §415) |
+| Bank-change queue | `approve_refusal` | `api/vendors.change_request_approve_refusal` |
+| Screening review queue | `adjudicate_refusal`, `revoke_adjudication_refusal` | `services/sanctions_adjudication.adjudicate_refusal`, `.revoke_refusal` (decisions §477). `role_not_permitted` hides the control; `sanctions_adjudication_segregation` disables Adjudicate beside its sentence; `already_cleared` / `not_active` pick which of the two is shown |
+| Expense reports (list + detail) | `actions.{submit,approve,reject,compose}` | `services/expense_controls.report_{submit,approve,reject,compose}_refusal` |
+| Expense card transactions | `actions.{match,create_expense,unmatch,ignore}` | `services/expense_controls.card_txn_{link,unmatch,ignore}_refusal` |
+| Intake | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.intake_transition_refusal` / `.intake_convert_refusal` / `.intake_delete_refusal`. Every refusal hides the control; a row that already names its requisition shows the link instead of Convert (which would only replay it) |
+| Requisitions | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.requisition_{transition,approve,convert,delete}_refusal`. `requisition_approval_segregation` shows Approve disabled with its reason above it (`RowAction reason`, `approve-refusal-<id>`); every other refusal hides the control; a converted row with its PO hides Convert |
+
+Each is pinned by a backend parity test that, for every seeded role and row
+state, asks both sides — the verdict and the real POST — and fails unless they
+agree (`tests/test_payment_action_verdicts.py`,
+`tests/test_queue_action_verdicts.py`, `tests/test_review_actions_parity.py`,
+`tests/test_payment_queue_blocked.py`, `tests/test_expense_action_verdicts.py`,
+`tests/test_offer_experiment_suggestion_verdicts.py`,
+`tests/test_procurement_action_verdicts.py`, `tests/test_sanctions_adjudication_verdicts.py`,
+`tests/test_vendor_erp_manual_link.py`).
+A new verdict ships with one.
+
+Which refusals a page *explains* beside a disabled control, rather than hiding
+the control, is a presentation choice keyed on the verdict's `code` — never a
+restated rule. The expenses page explains only `expense_cfo_required` (Approve
+stays visible, disabled, naming the CFO gate) and hides every other refusal,
+the reader's own report included.
+
+One documented mirror stands in for a missing verdict: the expense list ships no
+per-line refusal, so `/expenses` reads line ownership (decisions §434) through
+`types/expense.ts::isLineCreator` / `canAuthorLooseLine`, the single restatement
+of `expense_controls.expense_creator_refusal` / `.report_line_creator_refusal`.
+It hides Delete and makes the claim fields read-only on a colleague's loose line
+and filters the attach suggestions. Replace it with an `actions` verdict on
+`ExpenseResponse` if a second line-level gate ever needs offering; do not add a
+second copy beside it.
 
 ### Clickable rows (`RowLink` + `isRowOpenClick`)
 
@@ -733,7 +1086,11 @@ accessible:
    label from the visible string rather than retyping it — the catalogue
    template takes it as a parameter, so every locale keeps the match:
    `m('payments.quotes.openAria', { action: m('payments.quotes.open'), invoice })`
-   with `'{action} for invoice {invoice}'`. Keep a badge or other extra
+   with `'{action} for invoice {invoice}'`. Where the label is a separate
+   `<key>Aria` message beside the visible `<key>`, start it with the visible
+   words (`Choose ERP account for {code}`, not `Choose the ERP account for
+   {code}`): `frontend/src/lib/a11y/labelInName.test.ts` checks every such
+   pair in every locale, with no list of tolerated gaps. Keep a badge or other extra
    text *beside* the link, not inside it, or it becomes visible text the
    label lacks (the `/workflows` "Default" badge).
 
@@ -876,25 +1233,117 @@ the `ui/` primitive in the Source column.
 | Data table | `.grid-container` + `table`/`th`/`td`/`.empty` | `ui/DataTable.svelte` |
 | Search input | `.search-box` | `ui/SearchBox.svelte` |
 | Bulk bar | `.bulk-bar` | `ui/BulkBar.svelte` |
-| Bulk delete | `.bulk-delete-btn` (+ `.armed`) | `ui/BulkDeleteButton.svelte` |
-| Bulk action | `.bulk-action-btn` | per-route, but always inside a BulkBar |
+| Bulk delete | `.btn-danger.bulk-delete-btn` (+ `.armed`) | `ui/BulkDeleteButton.svelte` |
+| Bulk action | `.btn-secondary` (`.btn-primary` for the bar's lead action) | `src/app.css`, always inside a BulkBar |
 | Per-row action | `<RowAction>` (variant + armed) | `ui/RowAction.svelte` |
+| Why an action is refused (visible) | `<RowAction reason>` / `<RefusalNote>` | `ui/RefusalNote.svelte` |
 | Clickable-row open control | `<RowLink>` + `.clickable` row + `isRowOpenClick` | `ui/RowLink.svelte` / `utils/rowNav.ts` |
 | Filter pill | `.filter-chip` (+ `.active`, `.count`) | `ui/FilterChips.svelte` |
 | Tab bar | `.tab-row` / `.tab` (+ `.active`) | `ui/Tabs.svelte` |
 | Load more | `.btn-load-more` / `.load-more-row` / `.load-more-end` | per-route, copy /admin |
+| Buttons: lead / dismiss / other action / destructive trigger / link-like / icon-only | `.btn-primary` / `.btn-cancel` / `.btn-secondary` / `.btn-danger` / `.btn-ghost` / `.btn-icon` (+ `.armed`) | `src/app.css` (see below) |
 | Modal dialog | `.modal[role="dialog"]` + `.backdrop` | `ui/Modal.svelte` |
 | KPI card | `.kpi` / `.kpi-value` / `.kpi-label` | `ui/KpiCard.svelte` |
-| Status badge (invoice) | `<StatusBadge>` | `ui/StatusBadge.svelte` |
+| Status badge (invoice) | `<StatusBadge>` (tone from `INVOICE_STATUS_TONES`) | `ui/StatusBadge.svelte` |
 | Tinted badge (any tone) | `<Badge tone=…>` | `ui/Badge.svelte` |
 | Money / currency | `<Money>` / `formatMoney` | `ui/Money.svelte` / `utils/money.ts` |
 | Field-level advisory | `.field-warning` (`role="status"`) | `ui/FieldWarning.svelte` |
 | Zero-data onboarding block | `.empty-state` (+ `data-testid`) | `ui/EmptyState.svelte` |
+| Setup steps with done states | `.setup-checklist` (`li[data-done]`) | `ui/SetupChecklist.svelte` |
+| Standalone loading block (page, panel, modal, card) | `<LoadingState label? testId?>` (`role="status"`, polite) | `ui/LoadingState.svelte` |
+| Failed load + Retry (page, or whole screen) | `.load-error` (`role="alert"` in a page) | `ui/LoadError.svelte` |
 | Heading / label + ⓘ HelpTip | `.help-row` (+ a local class for spacing only) | `src/app.css` (see § Contextual help) |
 | Checkbox / radio / file | `input[type='checkbox'\|'radio'\|'file']` (global base) | `src/app.css` |
 
-**Native form controls** are dark-themed globally in `src/app.css` so a
-bare `<input>` fits the theme without per-route CSS:
+**Buttons** are six shared classes in `src/app.css`; the four boxed ones
+share one box size so a toolbar mixing them is one height. Never re-declare
+one per route, and never paint one from a scoped rule (placing it — margin,
+`align-self`, padding to fill a slot — is fine). The `/vendors` `.btn-outline`,
+`/invoices` `.btn-secondary`, `/payments` `.btn-pay` / `.btn-execute`,
+`RunDetailModal`'s `.btn-execute` / `.btn-discard` / `.btn-approve`, every
+bulk-bar `.bulk-action-btn`, `/vendors/screening`'s `.btn-block`, and the
+per-modal copies in `InvoiceModal`, `ContractModal`, the workflow-management
+modals and the rest, and every header `.close-btn` / `.icon-btn` and the
+`/invoices` `.advanced-btn`, were folded into these. Guard:
+`src/lib/sharedButtonClasses.test.ts` — a file joins its `COVERED` list in
+the change that migrates it:
+- `.btn-primary` — the page's one lead action (white on `--accent-strong`).
+  One per footer: `RunDetailModal` renders Execute as `.btn-secondary` while
+  the CFO sign-off (`.btn-primary`) is pending; `InvoiceModal`'s Save steps
+  back to `.btn-secondary` while Submit, Resubmit or a reviewer's Approve is
+  offered; `ContractModal`'s Save does while the Renew / Create PO sub-form
+  (whose confirm is the lead) is open.
+  `.btn-primary` and `.btn-cancel` share the `.btn-secondary` box
+  (`inline-flex`, a 1px border — transparent on the primary — and a
+  `<button>`'s `line-height`), so an icon + label centres the same way in all
+  four.
+- `.btn-cancel` — dismiss / back out, beside a Save. Reads in `--text-muted`.
+- `.btn-secondary` — any other action (Create beside Upload, Import CSV,
+  Refresh, Merge duplicates). Reads in `--text`; works on an `<a>` that
+  navigates, and on a hidden `<span>` slot reserve, with the same box.
+- `.btn-danger` — the outlined destructive *trigger* (Erase, Disable, Reject)
+  that opens a confirmation. In a table row the armed two-click confirm stays
+  with `<RowAction armed>` / `<BulkDeleteButton>`.
+- `.btn-ghost` — an action that reads as a link: Back out of a detail view, a
+  Download inside the sentence that explains it. No box, underlined in
+  `--accent` so colour is not the only cue (WCAG 1.4.1). `inline-flex` with a
+  24px `min-height`, so standing alone it meets WCAG 2.5.8.
+- `.btn-icon` — a control whose whole label is a glyph: a header ✕, the
+  `InvoiceModal` fullscreen toggle, the `/invoices` advanced-filter button.
+  The name goes in `aria-label`. No box at rest; hover and press add one. A
+  24px minimum target both ways (WCAG 2.5.8), the global `:focus-visible`
+  ring, and a text glyph at 1.25rem (an `<svg>` keeps its own size). A
+  toggle sets `aria-pressed` and keeps ONE name: the on state is an
+  `--accent-tint` fill with `--accent-on-tint` glyph and an `--accent`
+  border, so a name that flipped with it ("Exit fullscreen") would say the
+  state twice. Scoped CSS may size it (`/invoices` makes its toggle 34px)
+  or style a child (that toggle's filters-set dot), never paint it.
+- `.armed` on `.btn-primary` / `.btn-danger` — the second, committing click
+  of a two-click confirm (execute a run, file 1099s, cancel a run, propose
+  bulk discounts, unblock a vendor's payments on `/vendors/screening`):
+  a `--danger-strong` fill, whatever the button looked like unarmed. Pair it
+  with a distinct armed label (`Confirm execute · …`), since a colour change
+  announces nothing to a screen reader — and when the button carries an
+  `aria-label`, switch that with the state too (`<key>Aria` /
+  `<confirmKey>Aria`, as `VendorModal`'s ERP unlink and `/organization`'s
+  webhook Remove and intake Rotate do) and drop it while busy, or the armed
+  name still says the unarmed words (WCAG 2.5.3; `a11y/labelInName.test.ts`
+  scans for a fixed label over switched text).
+  **Arming follows the precondition.** A commit has three looks, and `.armed`
+  is only on while the click would actually commit:
+  1. **Disabled, precondition unmet** (no reject reason typed, the workspace
+     slug not typed, the server's verdict refuses execute): no `.armed` — the
+     plain muted disabled look of its base class. A red fill on a button that
+     cannot be pressed reads as "ready".
+  2. **Ready**: `.armed` — the `--danger-strong` fill.
+  3. **Busy** (disabled while the request is in flight): `.armed` stays on,
+     and it shows the danger tint with `--danger-on-tint` text and the strong
+     border, never `opacity`.
+  So write `class:armed={precondition || busy}`, never a static
+  `class="… armed"` on a button whose `disabled` reads anything but busy
+  (`CloseWorkspacePanel`: `class:armed={canSubmit || submitting}`;
+  `InvoiceModal` Confirm reject: `class:armed={!!rejectReason.trim()}`).
+  A two-click arm is the precondition, so hold it through the request and
+  release it after (`/vendors/screening` Confirm unblock), and drop it when
+  something else disables the commit (a re-screen in flight there).
+  `tests-e2e/a11y/armed-buttons.spec.ts` walks each commit through all three.
+- **A confirmation dialog's destructive commit is `.btn-danger.armed`.** The
+  outlined `.btn-danger` trigger opened the dialog (or the inline confirm it
+  reveals), so that step is the first click and its commit is the second: Void payment, Dismiss compliance
+  hold, Accept short settlement (`/payments`), Confirm reject (an expense
+  report), Disable MFA (`/portal/company`), Clear credentials
+  (`CredentialResetPrompt`). Never a hand-rolled `--danger-strong` fill. The
+  one exception is the bank-file Reject submit in `RunDetailModal`, a plain
+  `.btn-danger`: its panel sits above the run footer, where a permanent red
+  fill would read as a second armed commit beside Execute's.
+  `CloseWorkspacePanel`'s typed-confirmation Close workspace and
+  `InvoiceModal`'s Confirm reject are `.btn-danger.armed` too.
+`.btn-secondary` / `.btn-danger` show disabled with `--text-muted` and a
+neutral border, not `opacity` (contrast measured per theme in the
+`app.css` comment).
+
+**Native form controls** are themed globally in `src/app.css` so a
+bare `<input>` fits the theme — either theme — without per-route CSS:
 - **Checkbox / radio** — `appearance: none` + a drawn mark (white check
   / inset accent dot) so *both* states are themed — empty = subtle
   outline on `--bg`, on = `--accent` fill, plus
@@ -913,10 +1362,11 @@ bare `<input>` fits the theme without per-route CSS:
   did, before the scoped rules were collapsed onto this recipe.)
 - **Range** — `accent-color: var(--accent)` (the modern cross-browser
   approach; no pseudo-element rebuild).
-- `:root { color-scheme: dark }` puts the remaining native controls
-  (date pickers, scrollbars) in dark mode; scrollbars are further
-  thinned + tinted, the date-picker indicator gets a hover, and
-  `::selection` is accent-tinted.
+- `color-scheme` is set **per palette** (`dark` on `:root`, `light` in the
+  light blocks — § Themes) so the remaining native controls (date pickers,
+  scrollbars) follow whichever theme is showing; scrollbars are further
+  thinned + tinted (`--scrollbar-thumb`), the date-picker indicator gets a
+  hover, and `::selection` is accent-tinted.
 
 Don't re-add per-route `accent-color` rules on checkboxes/radios — they
 only tint the *checked* state and are redundant no-ops under the global
@@ -980,9 +1430,25 @@ inherit it for free. Reuse these; don't re-solve them per page.
      show everything. Something that cannot fit — a marquee — is rendered
      static instead (`marketing/AdapterRail.svelte`). The OS preference does
      not discharge 2.2.2. Guards: `src/lib/a11y/marketingMotion.test.ts` (no
-     `infinite`, literal timing within budget) and
+     `infinite`, literal timing within budget — over the marketing components
+     *and* the auth shell: `components/auth/` plus the `/login`, `/verify`,
+     `/signup`, `/change-password` and `/find-workspace` routes) and
      `tests-e2e/marketing/landing.spec.ts` (every running animation's
      `getComputedTiming().endTime` ≤ 5000 ms).
+  4a. **One exemption: a busy spinner, and it is `ui/Spinner.svelte`.** The
+     ring may loop while the request it stands for is in flight — mounted
+     inside an `{#if}` on that request's state, so it unmounts when the answer
+     lands, and paired with text that says what is happening (its own `label`,
+     a `role="status"` region, or the caller's live region / field hint). That
+     is 2.2.2's own carve-out: an indicator of a phase the user is waiting on
+     is essential, and these are either user-started (a submit, a typed slug)
+     or the page's sole content (`/verify`, the SSO callback). A finite spin
+     would be worse — a ring that freezes at 5 s on a slow request reads as a
+     hang. Reduced motion stills it (the component's own media query; app.css
+     collapses iteration counts besides) and the text carries the meaning.
+     The exemption lives in that one component: a hand-rolled `.spinner` loop
+     anywhere else, a loop on any other selector, or a `<Spinner>` rendered
+     outside an `{#if}` fails the same guard; the marketing pages get none.
   5. **Fade with colour, not `opacity`, at rest.** A decorative watermark takes
      an `rgba()` colour; `opacity` composites a whole subtree
      (`opacityAudit.test.ts`). `opacity: 0` / `1` in a reveal or keyframe is fine.
@@ -991,7 +1457,16 @@ inherit it for free. Reuse these; don't re-solve them per page.
   motion test reads computed opacity up the ancestor chain
   (`tests-e2e/marketing/landing.spec.ts`), and the axe scans of these pages run
   under `emulateMedia({ reducedMotion: 'reduce' })` so contrast is measured at
-  rest rather than mid-fade.
+  rest rather than mid-fade. That emulation does not shorten a transition
+  already running, so `expectNoA11yViolations` also waits for
+  `document.getAnimations()` to finish first (`tests-e2e/README.md`
+  § Accessibility guard).
+
+  **Name the properties a hover transition animates; never `transition: all`.**
+  `all` also animates the colour tokens on a theme change, so text fades
+  through sub-4.5:1 values for the length of the transition (#635). Transition
+  `border-color`, or `background-color` where the resting background is
+  `none` or transparent, and let colours swap at once.
 - **Modal / focus trap** (`ui/Modal.svelte` + `#lib/actions/focusTrap.ts`;
   WCAG 2.1.2 / 2.4.3) — `use:focusTrap={{ onEscape }}` on a dialog box
   (with `tabindex="-1"`) moves focus in on open, traps Tab / Shift+Tab
@@ -1002,20 +1477,95 @@ inherit it for free. Reuse these; don't re-solve them per page.
   synchronously is then lost to `<body>` when it unmounts. If the trigger is
   gone or now disabled, focus lands on `<main id="main-content">` instead; if
   something else already took focus (a second dialog), it is left alone.
-  Guard: `tests-e2e/a11y/screen-reader.spec.ts`. `ui/Modal` uses it, and so do the four pre-existing hand-rolled
-  feature shells (`InvoiceModal`, `RunDetailModal`, `BulkRecodeGLModal`,
-  portal discount-accept) so every dialog gets identical focus management.
-  Prefer `ui/Modal` for new dialogs; if you must hand-roll a shell, add
-  `use:focusTrap` rather than re-implementing it.
+  The page outside the topmost dialog is `inert` while it is open (§ Modals,
+  decisions §384), and that is taken off before the restore runs, so the
+  trigger can take focus again.
+  Guard: `tests-e2e/a11y/screen-reader.spec.ts`. `ui/Modal` is its only
+  caller, and every dialog (`InvoiceModal` and `RunDetailModal` included)
+  renders through `ui/Modal`, so every dialog gets identical focus
+  management. New dialogs use `ui/Modal`; `src/lib/modalShell.test.ts` refuses
+  a new hand-rolled shell.
 - **Reorder controls** (WCAG 2.5.7 Dragging Movements) — any drag-to-reorder
   needs a single-pointer + keyboard alternative. The workflow-builder
   `StepNode` pairs its drag handle with per-node Move ↑ / Move ↓ buttons
   (`onmoveup`/`onmovedown` over the canvas `onreorder`). Mirror this for any
   new drag interaction; don't ship drag as the only path.
-- **Toast** (`ui/Toast.svelte`; WCAG 4.1.3) — `role="region"` +
-  two persistent live containers (`aria-live="assertive"` for errors,
-  `"polite"` for the rest). Each toast has a real `<button>` dismiss
-  (`aria-label="Dismiss notification"`); auto-dismiss timer kept.
+- **Toast** (`ui/Toast.svelte`; WCAG 4.1.3, 2.2.1) — `role="region"` named
+  "Status messages" (`toast.region`; not "Notifications", which is the sidebar
+  bell's name) + two persistent live containers (`aria-live="assertive"` for
+  errors, `"polite"` for the rest). Each toast has a real 24px `<button>`
+  dismiss (`toast.dismiss`). **Timing (decisions §313, superseding the fixed
+  5-second timer this entry used to call deliberate):** an **error stays until
+  dismissed** — an explicit `duration` does not change that; every other toast
+  times out (5 s, or the caller's explicit `duration`), but its clock **stops
+  while the pointer is over a toast or focus is inside the region**, and runs
+  on with the time it had left. At most three errors stay on screen (the
+  oldest goes), and the same error text arriving again replaces its old copy —
+  a fresh insertion, so it is announced again. When a focused toast leaves
+  (dismissed, evicted by the cap, replaced), focus moves to the next toast's
+  dismiss, or back to where it came from when it was the last (`<main>` if that
+  element is gone). The region rises above a showing bulk-action bar
+  (`.bulk-bar`) and the consent banner, and a toast is never wider than
+  `100vw − 32px` (2.4.11, 1.4.10). **A toast never covers any part of an open
+  modal dialog** (a `role="dialog"` with `aria-modal="true"` — every dialog here
+  carries both): when the corner stack would touch the dialog's box, the dialog
+  **yields a band** at the bottom of the viewport and the stack sits in it,
+  beside the dialog (`utils/toastPlacement.ts`, #635, #636). The backdrop's
+  bottom padding grows to the band and the dialog's height is capped to what is
+  left; its own scrolling takes the rest, each scroller keeping its distance from
+  its bottom (so the footer the reader retries from stays in view) and the
+  focused control scrolled into view. The stack takes at most 40% of the
+  viewport's height and scrolls past that. Once yielded the band is kept, and
+  only grows, until the dialog closes: a dialog moving back as a toast left
+  would slide its footer under the pointer that just dismissed it (on a phone,
+  an armed "Confirm cancel"). A click in the band does not close the dialog
+  (it is backdrop, which every shell reads as "close"), a new viewport
+  (rotation, zoom) recomputes the cap, and the band is only taken from a dialog
+  whose parent is a full-viewport fixed backdrop. A dialog the corner does not
+  touch never moves.
+  Steering the stack around the dialog's contents was tried first (around the
+  footer, then the focused control) and cannot work: a dialog is controls top to
+  bottom, so on a phone there is no gap — the payment run's error sat over
+  "Record run as paid…" in its body. A new dialog needs nothing for this beyond
+  being centred in a full-viewport backdrop (its parent), the rule below.
+  **The region is hosted inside the topmost modal dialog** while one is open
+  (appended last, still
+  `position: fixed`), and goes back to its place in the layout when the dialog
+  closes: `aria-modal` hides everything outside the dialog from assistive tech
+  (WebKit and Chromium prune it), so a region left outside was not announced
+  and its dismiss buttons could not be reached. `actions/focusTrap` puts the
+  region's dismiss buttons (`data-dialog-satellite`) after the dialog's own
+  controls in its Tab cycle — last control → toasts → first control,
+  Shift+Tab the reverse — and never gives one the dialog's initial focus;
+  dismissing the last toast hands focus back to the dialog control it came
+  from (2.1.1, 2.4.3). Escape on a focused toast dismisses that toast, not the
+  dialog. The trap is told which dialogs are modal by the `aria-modal`
+  attribute, so a new dialog without it neither hosts the region nor is
+  avoided by it. **A modal's backdrop must be `position: fixed; inset: 0`**:
+  every backdrop has `backdrop-filter`, which makes it the containing block of
+  the hosted (fixed) region, and only a full-viewport backdrop keeps the stack
+  in the viewport corner. A toast inserted while the region was detached or
+  outside the open modal is re-inserted once the region has moved, so it is
+  still announced. Browser guard:
+  `tests-e2e/a11y/toast-timing.spec.ts` (Playwright clock, no sleeps). The
+  rules are the pure `utils/toastQueue.ts` (unit-tested with fake timers).
+  **A toast is never the only sign of a failed LOAD**: a page whose data did not
+  arrive says so in place with `ui/LoadError` and a Retry (the vendors list and
+  the notification bell are the worked examples); a toast reports an action's
+  outcome. **One error, one signal:** an error a dialog or panel already states
+  in place — a `role="alert"` element beside the control that failed — is not
+  also toasted. `role="alert"` is announced the moment it appears, so the copy
+  added nothing for a screen-reader user, and since an error toast no longer
+  times out it sat over the dialog until dismissed (the payment run's NACHA
+  refusal, stated in its panel AND toasted, covered "Record run as paid…"). A
+  form that has an error slot puts its own client-side refusals there too
+  (`cfo/ForecastVariancePanel`). A failed LOAD's generic in-place block may
+  still be paired with a toast carrying the server's own detail — the two say
+  different things. Guard: `src/lib/a11y/errorDoubleReport.test.ts` (Svelte AST:
+  no `toast(…, 'error')` passes a variable rendered inside `role="alert"`, or
+  sits on the same code path as an assignment to one — or, for an `{#if flag}`
+  alert with fixed words, raises fixed words too). It reads one file at a time,
+  so an error state passed down to a child component is outside it.
 - **Inline form feedback** (WCAG 4.1.3) — a message that appears in response
   to an action (`{#if saved}<div class="message">…`) must be announced, not
   just shown. A polite status sits inside a live region that already exists
@@ -1027,6 +1577,19 @@ inherit it for free. Reuse these; don't re-solve them per page.
   forgot/reset-password pages do. Guard: `src/lib/a11y/liveRegionAudit.test.ts`
   (Svelte-AST scan of every `{#if}`-rendered `error` / `message` / `msg` /
   `success` element; the two non-feedback matches are an explained allowlist).
+- **Field validation** (WCAG 3.3.1, 3.3.3) — keep Submit **enabled** and
+  validate on submit: a Submit disabled until the form is valid gives no reason,
+  and any message it guards can never appear (issue #635 #14). On submit, mark
+  every bad field (`aria-invalid`, its message beside it and first in its
+  `aria-describedby`) and move focus to the first one — focus is what reads the
+  message, so don't also put it in a live region. A server refusal that is
+  about one field (a wrong current password, a refused new one) goes beside
+  that field the same way and clears when it is edited; only what belongs to
+  no field stays in the banner. A message that appears while focus is elsewhere
+  (a confirmation mismatch shown on blur) is the one case for a polite live
+  region, rendered empty up front. Reference: `auth/PasswordInput.svelte`,
+  `auth/NewPasswordFields.svelte`, `/change-password`. Help text such as a
+  rules checklist is linked by `aria-describedby` too, after the error.
 - **Tabs** (`ui/Tabs.svelte`; WAI-ARIA tabs) — roving `tabindex`
   (active=0, others=-1) + Arrow/Home/End key navigation, plus the
   existing `role=tablist/tab` + `aria-selected` + `aria-controls`. The
@@ -1076,9 +1639,37 @@ inherit it for free. Reuse these; don't re-solve them per page.
   `<Badge tone="danger">Below minimum</Badge>` in the Closing cell, the
   `/payments` queue's overdue rows an "Overdue" badge. The banner above a table
   can give the count; only the row can say which.
+- **Sidebar on a phone** (WCAG 1.4.10, 2.1.2, 2.4.3; #635) — at 700px and
+  below the sidebar starts as its 60px icon rail, and expanding it opens the
+  panel as an **overlay**, never a push: `<main>` keeps the rail's 60px offset
+  and its full width, a `--overlay` backdrop covers it, and `<main>` plus the
+  skip link carry `inert` while it is open (with the body scroll lock `ui/Modal`
+  takes). Focus moves to the first nav row on open and back to the toggle when
+  Escape or the backdrop closes it; following a link closes it too. A popup
+  inside the panel (bell, entity menu, profile) takes Escape first — the panel
+  reads `[aria-expanded="true"]` inside itself, so the order the window
+  listeners run in does not matter. The open panel stacks at z-index 55
+  (backdrop 54): above a page's own fixed bars (`BulkBar` is 50), below
+  modals (100). It stays the primary-nav landmark rather than becoming a
+  `role="dialog"` — the inert page already confines the screen reader to it,
+  and the toggle's name ("Collapse sidebar") states that it is open. The
+  rail's buttons transition `background-color` only, never `all`: a colour
+  transition fades the muted labels through sub-4.5:1 values on every theme
+  change. Desktop keeps the push layout. State lives
+  in `stores/sidebar.svelte.ts` (`narrow`, `overlay`). Guard:
+  `tests-e2e/a11y/sidebar-overlay.spec.ts` (375 and 320px, both themes under
+  axe, desktop unchanged).
 - **Icon-only controls** — every icon-only `<button>` needs an
   `aria-label` (NotificationBell reflects the unread count; the sidebar
   collapse toggle + profile button carry `aria-label` + `aria-expanded`).
+- **The sidebar's profile disclosure closes when focus leaves it** (WCAG
+  2.4.11). It is drawn above its trigger, over the Help link (and over the
+  icon column in the 60px rail), so a `focusout` whose `relatedTarget` is
+  outside `.profile-wrapper` closes it without moving focus — Shift+Tab to
+  Help or Tab past Log out never lands on a control hidden under it. Its
+  trigger's name is "Profile and account" (a disclosure, not a menu). Guard:
+  `tests-e2e/smoke/sidebar.spec.ts` (both directions, axe in the collapsed
+  rail in both themes).
 - **De-emphasised rows** (`.row-muted`, app.css; WCAG 1.4.3) — a paused
   subscription, a revoked API key, a deactivated user. Put
   `class:row-muted` on the `<tr>`; the shared rule colours its non-actions
@@ -1102,23 +1693,123 @@ inherit it for free. Reuse these; don't re-solve them per page.
   (axe, stubs the list so the faded row is actually on screen — the route
   scan passed for years because a fresh tenant has no paused row).
 
+### Themes — dark, light, and System (docs/decisions.md §289)
+
+The web app has **two palettes and three choices**. The palette is all CSS;
+script only decides which one the page asks for.
+
+| Choice | `<html data-theme>` | What renders |
+|---|---|---|
+| System (default) | `system` | dark, unless the OS says `prefers-color-scheme: light` |
+| Light | `light` | the light palette |
+| Dark | `dark` | the dark palette |
+
+- **`src/app.css`** declares the dark palette on `:root` (it is the default,
+  and what an OS with no preference gets), the light palette on
+  `:root[data-theme='light']`, and the **same light block again** inside
+  `@media (prefers-color-scheme: light) { :root:not([data-theme='dark']) {…} }`
+  for System. CSS cannot share one declaration block between a plain selector
+  and a media-gated one, so the copy is unavoidable — `tokenPairing.test.ts`
+  fails if the two drift, if the light block misses a colour token the dark one
+  declares, or if either loses `color-scheme`. An OS that changes theme while
+  the page is open switches it with no script at all.
+- **`src/app.html`** carries a tiny inline script that reads the stored choice
+  and sets `data-theme` **before first paint**, so a Light user never sees a
+  dark frame (the SPA's own CSS and JS arrive later). It cannot import the
+  module below, so it repeats its facts — the key, the three values, the
+  cookie-first read order, the two `theme-color`s — and `src/lib/theme.test.ts`
+  *executes* the script against every cookie × stored value × OS preference to
+  hold it to them.
+- **Where the choice lives** (decisions §290). Every workspace is its own
+  origin (`<slug>.feohledger.com`, plus the apex for signup), and
+  `localStorage` is per origin — so on a platform host the choice is a
+  **`feoh_theme` cookie on the platform's registrable domain**
+  (`Domain=feohledger.com`, `SameSite=Lax`, a year, `Secure` on https), which
+  every workspace and the signup page read alike. System is written to it as
+  `system`, so it overrides a stale per-origin Light. The domain is only ever
+  one the build declares as ours: a `PUBLIC_PLATFORM_DOMAINS` entry or the
+  host of `PUBLIC_SITE_URL` (the apex every deploy sets), which the current
+  host must equal or sit beneath (`hostRouting.ts::sharedCookieDomainForHost`,
+  via `tenant.ts::sharedCookieDomain()`). It is never hardcoded, and never
+  taken from the legacy host rule, which would read a customer's
+  `ap.customer.example` as ours. On localhost, an IP literal, a customer's
+  vanity host, or a build that declares nothing there is none, and the choice falls back
+  to `localStorage` per origin (System = no entry) — as it does when the
+  browser drops the cookie, which the write detects by reading it back. A
+  cookie, when present, wins over `localStorage`.
+- **`src/lib/theme.ts`** (pure) + **`stores/theme.svelte.ts`** (rune wrapper)
+  own the choice: read / write the cookie and the `localStorage` fallback,
+  resolve the palette that is showing, set `<meta name="theme-color">`.
+  **Every cookie and storage access is wrapped** — both throw in some private
+  modes and with blocked site data, and the page falls back to System rather
+  than failing. Only non-CSS consumers need `theme.resolved` (the hCaptcha
+  widget on `/signup`, an iframe that cannot see our palette: it is rendered
+  explicitly and redrawn when `theme.resolved` changes — unless already solved,
+  so a theme change never costs the visitor their token).
+- **The control** is `ui/ThemePicker` (a `SegmentedControl` — a fieldset of
+  native radios) on `/profile?section=appearance` and under the form on every
+  `AuthShell` page. It is listed on the Cookie Notice (`feoh_theme`), which
+  with the Privacy Policy says it is the only cookie the app sets —
+  `storageInventory.test.ts` fails if a second `document.cookie =` appears.
+- **Everything follows the theme:** the signed-in app, the auth shell
+  (`AuthShell`, signup, MFA, reset), the supplier portal, the help centre, the
+  legal pages and the marketing landing page (decisions §312, which ended
+  §289's dark pin). There is no per-subtree palette pin, and
+  `tokenPairing.test.ts` fails if a `data-theme-scope` reappears. The landing
+  page's header carries a compact `ThemePicker` (an anonymous visitor has no
+  `/profile`).
+- **The public pages' brand colours are tokens too.** `--gilt` (the tally's
+  gold) and `--brand-violet` are the gradient stops beside the accent blue
+  (headline, stat figures, pipeline rail, featured-plan ring); `--drop-shade`
+  is the cast shadow under a lit object. Each has a light value, and the stops
+  are held to 4.5:1 on `--bg` / `--surface` in both palettes, because a
+  `background-clip: text` gradient is something the rule scan cannot measure.
+  The marketing components may type no colour literal at all except `#fff` on
+  a `-strong` fill and a mask's `#000` (the same test).
+- **A raster picks its file from `theme.resolved`.** The rendered tally
+  ornament has a lighting per palette (`#lib/marketing/ornament.ts`, generated
+  by `pnpm gen:marketing`); a `<picture>` with a `prefers-color-scheme` source
+  would follow the OS and ignore a stored choice. Both renders share one
+  intrinsic size so a theme switch never moves the layout.
+- **A new colour token goes in both palettes**, measured in both. The light
+  base tokens are deliberately darker than the bare-surface bar needs: ~40
+  rules set a base token as text on a 10–20% tint of its own hue, and each base
+  token clears its own 20% tint.
+- **A white-label accent is derived per theme.** No colour clears 4.5:1 as
+  text on both palettes, so the brand store never writes `--accent` inline: it
+  writes `--brand-accent-dark` / `--brand-accent-light`, each the tenant's
+  colour or the least darker / lighter shade of it that reads as text there
+  (`stores/brandTheme.ts` `themeAccent`), and each palette's `--accent` reads
+  its own (`docs/decisions.md` §478). A new palette block that redeclares
+  `--accent` must keep that `var(--brand-accent-*, …)` shape.
+
 ### Colour tokens and contrast (WCAG 1.4.3)
 
-The palette in `src/app.css` `:root` is small and every colour token has a
-**stated job**. They come in families, and picking the wrong member is the one
-mistake this codebase kept making:
+The palette in `src/app.css` is small and every colour token has a **stated
+job**. They come in families, and picking the wrong member is the one mistake
+this codebase kept making. Values below are dark / light (§ Themes):
 
-| Base token — text / icons / borders on a dark surface | `-strong` companion — the FILL behind white text | `-tint` / `-on-tint` pair — the status-badge recipe |
+| Base token — text / icons / borders on an app surface | `-strong` companion — the FILL behind white text | `-tint` / `-on-tint` pair — the status-badge recipe |
 |---|---|---|
-| `--accent` `#638cff` | `--accent-strong` `#3f5fd6` | `--accent-tint` + `--accent-on-tint` `#7d9bff` |
-| `--success` `#1fa86a` | `--success-strong` `#177a4d` | `--success-tint` + `--success-on-tint` `#26b977` |
-| `--danger` `#f87171` | `--danger-strong` `#c43535` | `--danger-tint` + `--danger-on-tint` `#f87171` |
-| — | — | `--warning-tint` + `--warning-on-tint` `#dca014` |
-| `--text-muted` `#8a8fa0` | — | `--muted-tint` + `--muted-on-tint` `#9aa0b2` |
+| `--accent` `#638cff` / `#2c4fc4` | `--accent-strong` `#3f5fd6` / `#2546b0` | `--accent-tint` + `--accent-on-tint` `#7d9bff` / `#2a47b0` |
+| `--success` `#1fa86a` / `#11663a` | `--success-strong` `#177a4d` / `#0f5e35` | `--success-tint` + `--success-on-tint` `#26b977` / `#0f5c34` |
+| `--danger` `#f87171` / `#a82622` | `--danger-strong` `#c43535` / `#9c221e` | `--danger-tint` + `--danger-on-tint` `#f87171` / `#a3221f` |
+| `--warning` `#d4940a` / `#7f5400` | — (nothing puts white text on amber) | `--warning-tint` + `--warning-on-tint` `#dca014` / `#7a4c00` |
+| `--text-muted` `#8a8fa0` / `#5a6072` | — | `--muted-tint` + `--muted-on-tint` `#9aa0b2` / `#454a59` |
+| — | — | `--violet-tint` + `--violet-on-tint` `#a585f5` / `#5a36b5` (the "with the ERP" pill) |
 
-- **Never put white text on a base token.** All three are mid-tones chosen to
-  be legible *as text on the dark surfaces*; white on them is 3.06–3.12:1,
-  well under the 4.5:1 bar. That is what the `-strong` half is for, and it is
+Chrome tokens with no text on them: `--border-strong` (a hover edge),
+`--border-soft` (a dialog's edge), `--overlay` (the dimmed page behind a
+modal), `--scrollbar-thumb` / `--scrollbar-thumb-hover`. A tone-tinted
+background is written `color-mix(in srgb, var(--<tone>) N%, transparent)`,
+never an `rgba()` of today's hex — the audit resolves that `color-mix()`
+spelling (and the opaque two-colour form) so it is measured like the literal it
+replaced.
+
+- **Never put white text on a base token.** In the dark theme all three are
+  mid-tones chosen to be legible *as text on the dark surfaces*; white on them
+  is 3.06–3.12:1, well under the 4.5:1 bar. In the light theme they happen to
+  carry white, but a stylesheet serves both themes, so the rule stands. That is what the `-strong` half is for, and it is
   the only thing it is for — `--danger-strong` as *text* on `--surface` would
   be unreadable in the other direction.
 - **A tinted badge takes the `-on-tint` text, never the base token.** A
@@ -1130,9 +1821,10 @@ mistake this codebase kept making:
   nothing else; the pair is calibrated together and carries ≥0.7 of margin on
   both `--bg` and `--surface`. `--danger-on-tint` equals `--danger` on purpose
   — red needs no lift — so that the rule has no exception to remember.
-- **`--surface-2` `#232b44` is the hostile surface.** Only `--text` clears
-  4.5:1 on it (11.0:1). `--text-muted` is 4.34:1 there — the failure the axe
-  guard originally caught. Muted text belongs on `--bg` or `--surface`.
+- **`--surface-2` `#232b44` is the hostile surface** (dark theme). Only `--text`
+  clears 4.5:1 on it (11.0:1). `--text-muted` is 4.34:1 there — the failure the
+  axe guard originally caught. Muted text belongs on `--bg` or `--surface`; the
+  light palette happens to admit it, but design to the dark refusal.
 - **Never write a `var(--token, fallback)` fallback.** Every token above is
   declared, so the fallback is dead code that becomes the *wrong colour* the
   day a token is renamed. `--surface-2` shipped for months as
@@ -1150,7 +1842,7 @@ mistake this codebase kept making:
 Two guards enforce it, and neither subsumes the other:
 
 - **`src/lib/a11y/tokenPairing.test.ts`** (vitest, no browser) scans **every**
-  stylesheet in `src/` — `app.css` plus every `<style>` block — for a rule that
+  stylesheet in `src/`, **once per theme** — `app.css` plus every `<style>` block — for a rule that
   sets both `color` and a `background`, resolves both through the palette, and
   fails below 4.5:1 (3:1 when the rule itself declares a large-text size). It
   also fails a bare literal `color:` that can't clear the bar on `--bg` or
@@ -1166,7 +1858,8 @@ Two guards enforce it, and neither subsumes the other:
   asserts each `-tint` / `-on-tint` pair directly, so a tone that drifts names
   one token instead of the dozen sites that spelled it. Pure scanners live in
   `a11y/cssAudit.ts`; the WCAG math in `a11y/contrast.ts`.
-- **`tests-e2e/a11y/axe.spec.ts`** covers what the scanner deliberately can't:
+- **`tests-e2e/a11y/axe.spec.ts`** (dark) and **`light-theme.spec.ts`** (light, a
+  cross-section of the same surfaces) cover what the scanner deliberately can't:
   a rule setting only `color` inherits its background through the cascade at
   runtime, and an **ancestor's** `opacity` fades a descendant the scan reads as
   fine (a revoked-row fade put `/admin/api-keys`' status pill at 2.44:1). Add a
@@ -1205,5 +1898,8 @@ always exists. Rationale + what was rejected: `docs/decisions.md` §28.
 `accentStrongMeetsAA` (same file, same WCAG primitive) drive a `FieldWarning`
 advisory on both surfaces that edit it — `/organization` Branding and the
 `/admin/partner` child-branding modal. Advisory, not a block: the backend
-accepts any valid hex and the brand is the tenant's call.
+accepts any valid hex and the brand is the tenant's call. `--accent` as text
+is not left to the tenant: it is derived per theme (§ Themes, decisions §478),
+and `accentTextContrast` reports the result for both themes on `/organization`
+Branding.
 

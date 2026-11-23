@@ -31,9 +31,17 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import { isAllowed } from '#lib/api/actionVerdicts.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import { errorMessage } from '#lib/utils/apiError.ts';
+	import { formatPercent } from '#lib/utils/percent.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
+	import { page } from '$app/state';
+	import { afterNavigate, replaceState } from '$app/navigation';
 
 	const canMutate = $derived(auth.isAdmin);
 
@@ -47,17 +55,49 @@
 	const COLUMNS = $derived([
 		{ label: m('experiments.col.name') },
 		{ label: m('experiments.col.workflow') },
-		{ label: m('experiments.col.primaryMetric') },
-		{ label: m('experiments.col.split') },
-		{ label: m('experiments.col.assigned'), class: 'right' },
-		{ label: m('experiments.col.status') },
+		{ label: m('experiments.col.primaryMetric'), class: 'col-metric' },
+		{ label: m('experiments.col.split'), class: 'col-split' },
+		{ label: m('experiments.col.assigned'), class: 'right col-count' },
+		{ label: m('experiments.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
 	let experiments = $state<Experiment[]>([]);
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
-	let statusFilter = $state<string>('all');
+	// URL-backed (`?status=`), like every other list's chips: Back / reload /
+	// a shared link restore the view. An unknown value falls back to All rather
+	// than an empty table no chip is lit for.
+	function statusFromUrl(params: Pick<URLSearchParams, 'get'>): string {
+		const s = params.get('status');
+		return s && (EXPERIMENT_STATUSES as string[]).includes(s) ? s : 'all';
+	}
+	let statusFilter = $state<string>(statusFromUrl(page.url.searchParams));
+
+	// The one reader of URL state. SvelteKit reuses this component for a
+	// navigation within the route (the sidebar link while filtered, Back /
+	// Forward between two entries), so the mount-time seed above never sees it
+	// (`docs/ui-patterns.md` § "Reading the URL once at mount is only half of
+	// the round trip"). The filter is client-side, so no refetch is needed.
+	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
+		const next = statusFromUrl(params);
+		if (next !== statusFilter) statusFilter = next;
+	}
+
+	afterNavigate(({ from, to }) => {
+		if (from?.route.id && from.route.id === to?.route.id && to?.url) {
+			readUrlState(to.url.searchParams);
+		}
+	});
+
+	// A writer of URL state, never a dependency of it (`docs/ui-patterns.md`):
+	// called from the chip's `onchange`, so it cannot re-trigger itself.
+	function syncUrl(key: string) {
+		const url = new URL(page.url.href);
+		if (key !== 'all') url.searchParams.set('status', key);
+		else url.searchParams.delete('status');
+		replaceState(`${url.pathname}${url.search}`, {});
+	}
 
 	let definitions = $state<WorkflowDefinition[]>([]);
 
@@ -113,16 +153,23 @@
 		}))
 	]);
 
+	// Every lifecycle action and a Retry re-issue this, so two can be in flight
+	// at once: the newest wins, or a slow pre-action response re-lists a
+	// concluded experiment as running (`frontend/CLAUDE.md` § Sequencing).
+	const listSequence = createRequestSequencer();
+
 	async function load() {
+		const token = listSequence.start();
 		loading = true;
 		loadError = null;
 		try {
 			const res = await listExperiments();
+			if (!listSequence.canCommit(token)) return;
 			experiments = res.experiments;
 		} catch {
-			loadError = m('experiments.error.load');
+			if (listSequence.isCurrentRequest(token)) loadError = m('experiments.error.load');
 		} finally {
-			loading = false;
+			if (listSequence.isCurrentRequest(token)) loading = false;
 		}
 	}
 
@@ -215,56 +262,83 @@
 			toast(m('experiments.toast.created'), 'success');
 			await load();
 		} catch (e) {
-			createError = e instanceof Error ? e.message : m('experiments.toast.createFailed');
+			createError = errorMessage(e, m('experiments.toast.createFailed'));
 		} finally {
 			saving = false;
 		}
 	}
 
-	async function doStart(exp: Experiment) {
+	type RowActionKind = 'start' | 'stop' | 'conclude' | 'delete';
+
+	// One lifecycle call at a time, tracked per action: the button that sent
+	// it is `busy` (aria-disabled, so the keyboard user who pressed it keeps
+	// focus) and every other row action is `disabled` until it settles, so a
+	// double-click cannot start, stop or conclude twice.
+	let inFlight = $state<{ action: RowActionKind; id: string } | null>(null);
+	const isBusy = (action: RowActionKind, id: string) =>
+		inFlight?.action === action && inFlight.id === id;
+	const isHeld = (action: RowActionKind, id: string) =>
+		inFlight !== null && !isBusy(action, id);
+
+	// Two destructive actions, each armed two-click (ui-patterns § RowAction):
+	// Delete (a draft) and Conclude, which is TERMINAL — a concluded experiment
+	// takes no new assignments and cannot be restarted — and used to fire on a
+	// single click beside the reversible Stop. One armed slot for the page, so
+	// arming one row's action disarms every other — two separate slots let a
+	// Delete on one row and a Conclude on another sit armed at once.
+	let armed = $state<{ action: 'delete' | 'conclude'; id: string } | null>(null);
+	const isArmed = (action: 'delete' | 'conclude', id: string) =>
+		armed?.action === action && armed.id === id;
+
+	async function runAction(
+		exp: Experiment,
+		action: RowActionKind,
+		call: (id: string) => Promise<unknown>,
+		done: string,
+		failed: string
+	) {
+		if (inFlight) return;
+		inFlight = { action, id: exp.id };
 		try {
-			await startExperiment(exp.id);
-			toast(m('experiments.toast.started'), 'success');
+			await call(exp.id);
+			toast(done, 'success');
 			await load();
-		} catch {
-			toast(m('experiments.toast.startFailed'), 'error');
+		} catch (e) {
+			// The server's reason (a 409 "already running", a refusal) is the
+			// useful part; the fixed sentence is only the fallback.
+			toast(errorMessage(e, failed), 'error');
+		} finally {
+			inFlight = null;
+			// Disarmed only once the request settles, so the busy button keeps
+			// reading "Confirm" rather than reverting mid-request.
+			armed = null;
 		}
 	}
 
-	async function doStop(exp: Experiment) {
-		try {
-			await stopExperiment(exp.id);
-			toast(m('experiments.toast.stopped'), 'success');
-			await load();
-		} catch {
-			toast(m('experiments.toast.stopFailed'), 'error');
-		}
+	function doStart(exp: Experiment) {
+		return runAction(exp, 'start', startExperiment, m('experiments.toast.started'), m('experiments.toast.startFailed'));
 	}
 
-	async function doConclude(exp: Experiment) {
-		try {
-			await concludeExperiment(exp.id);
-			toast(m('experiments.toast.concluded'), 'success');
-			await load();
-		} catch {
-			toast(m('experiments.toast.concludeFailed'), 'error');
-		}
+	function doStop(exp: Experiment) {
+		return runAction(exp, 'stop', stopExperiment, m('experiments.toast.stopped'), m('experiments.toast.stopFailed'));
 	}
 
-	let confirmDeleteId = $state<string | null>(null);
-	async function doDelete(exp: Experiment) {
-		if (confirmDeleteId !== exp.id) {
-			confirmDeleteId = exp.id;
+	function doConclude(exp: Experiment) {
+		if (inFlight) return;
+		if (!isArmed('conclude', exp.id)) {
+			armed = { action: 'conclude', id: exp.id };
 			return;
 		}
-		confirmDeleteId = null;
-		try {
-			await deleteExperiment(exp.id);
-			toast(m('experiments.toast.deleted'), 'success');
-			await load();
-		} catch {
-			toast(m('experiments.toast.deleteFailed'), 'error');
+		return runAction(exp, 'conclude', concludeExperiment, m('experiments.toast.concluded'), m('experiments.toast.concludeFailed'));
+	}
+
+	function doDelete(exp: Experiment) {
+		if (inFlight) return;
+		if (!isArmed('delete', exp.id)) {
+			armed = { action: 'delete', id: exp.id };
+			return;
 		}
+		return runAction(exp, 'delete', deleteExperiment, m('experiments.toast.deleted'), m('experiments.toast.deleteFailed'));
 	}
 
 	async function openResults(exp: Experiment) {
@@ -292,7 +366,9 @@
 </script>
 
 <svelte:window onclick={(e) => {
-	if (confirmDeleteId && !(e.target as HTMLElement)?.closest('.row-action')) confirmDeleteId = null;
+	if (armed && !inFlight && !(e.target as HTMLElement)?.closest('.row-action')) {
+		armed = null;
+	}
 }} />
 
 <PageHeader title={m('experiments.title')}>
@@ -304,23 +380,24 @@
 
 	<p class="lede">{m('experiments.lede')}</p>
 
-	<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
+	<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} onchange={syncUrl} />
 
 	{#if loadError}
 		<!-- Not rendered ALONGSIDE the table: the banner and "No experiments yet."
 		     used to appear together, telling the reader two different things at
 		     once — and neither offered a way to try again, since the toast-less
-		     banner came from a dependency-free `$effect`. Same error-with-retry
-		     block `/admin/api-keys` uses. -->
-		<div class="state error" data-testid="experiments-error" role="alert">
-			<p>{loadError}</p>
-			<button type="button" class="btn-cancel" onclick={load}>{m('experiments.retry')}</button>
-		</div>
+		     banner came from a dependency-free `$effect`. -->
+		<LoadError message={loadError} onretry={load} testId="experiments-error" />
 	{:else}
+	<div class="experiment-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={filtered.length === 0}
-		empty={loading ? m('common.loading') : m('experiments.table.empty')}
+		{loading}
+		filtered={experiments.length > 0}
+		emptyFiltered={m('experiments.table.emptyFiltered')}
+		empty={m('experiments.table.empty')}
 	>
 		{#snippet body()}
 			{#each filtered as exp (exp.id)}
@@ -332,32 +409,70 @@
 					</td>
 					<td>{exp.workflow_definition_name ?? '—'}</td>
 					<td>{m(PRIMARY_METRIC_LABEL_KEYS[exp.primary_metric])}</td>
-					<td class="mono">{exp.split_a_pct}% / {100 - exp.split_a_pct}%</td>
-					<td class="right mono">{exp.assigned_count}</td>
+					<td class="mono">{formatPercent(exp.split_a_pct)} / {formatPercent(100 - exp.split_a_pct)}</td>
+					<td class="right mono">{formatCount(exp.assigned_count)}</td>
 					<td>
 						<Badge tone={STATUS_TONES[exp.status]} variant={exp.status}>
 							{statusLabel(exp.status)}
 						</Badge>
 					</td>
 					<td class="actions">
-						{#if canMutate && exp.status === 'draft'}
-							<RowAction variant="success" onclick={() => doStart(exp)}>{m('experiments.row.start')}</RowAction>
+						<!-- Every row action reads the row's verdict (`actions.*`, from
+						     the endpoints' own `{start,stop,conclude,delete}_refusal`);
+						     every refusal hides its control. -->
+						{#if isAllowed(exp.actions?.start)}
+							<RowAction
+								variant="success"
+								busy={isBusy('start', exp.id)}
+								disabled={isHeld('start', exp.id)}
+								ariaLabel={m('common.rowActionAria', { action: m('experiments.row.start'), name: exp.name })}
+								onclick={() => doStart(exp)}
+							>{m('experiments.row.start')}</RowAction>
+						{/if}
+						{#if isAllowed(exp.actions?.delete)}
 							<RowAction
 								variant="danger"
-								armed={confirmDeleteId === exp.id}
+								armed={isArmed('delete', exp.id)}
+								busy={isBusy('delete', exp.id)}
+								disabled={isHeld('delete', exp.id)}
+								ariaLabel={m('common.rowActionAria', {
+									action: isArmed('delete', exp.id) ? m('experiments.row.confirm') : m('experiments.row.delete'),
+									name: exp.name
+								})}
 								onclick={() => doDelete(exp)}
 							>
-								{confirmDeleteId === exp.id ? m('experiments.row.confirm') : m('experiments.row.delete')}
+								{isArmed('delete', exp.id) ? m('experiments.row.confirm') : m('experiments.row.delete')}
 							</RowAction>
-						{:else if canMutate && exp.status === 'running'}
-							<RowAction onclick={() => doStop(exp)}>{m('experiments.row.stop')}</RowAction>
-							<RowAction variant="danger" onclick={() => doConclude(exp)}>{m('experiments.row.conclude')}</RowAction>
+						{/if}
+						{#if isAllowed(exp.actions?.stop)}
+							<RowAction
+								busy={isBusy('stop', exp.id)}
+								disabled={isHeld('stop', exp.id)}
+								ariaLabel={m('common.rowActionAria', { action: m('experiments.row.stop'), name: exp.name })}
+								onclick={() => doStop(exp)}
+							>{m('experiments.row.stop')}</RowAction>
+						{/if}
+						{#if isAllowed(exp.actions?.conclude)}
+							<RowAction
+								variant="danger"
+								armed={isArmed('conclude', exp.id)}
+								busy={isBusy('conclude', exp.id)}
+								disabled={isHeld('conclude', exp.id)}
+								ariaLabel={m('common.rowActionAria', {
+									action: isArmed('conclude', exp.id) ? m('experiments.row.confirm') : m('experiments.row.conclude'),
+									name: exp.name
+								})}
+								onclick={() => doConclude(exp)}
+							>
+								{isArmed('conclude', exp.id) ? m('experiments.row.confirm') : m('experiments.row.conclude')}
+							</RowAction>
 						{/if}
 					</td>
 				</tr>
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 	{/if}
 </PageHeader>
 
@@ -438,7 +553,7 @@
 	onclose={() => (resultsFor = null)}
 >
 	{#if resultsLoading}
-		<p>{m('experiments.results.loading')}</p>
+		<LoadingState label={m('experiments.results.loading')} />
 	{:else if resultsError}
 		<p class="error-banner">{resultsError}</p>
 	{:else if results}
@@ -475,8 +590,8 @@
 					</tr>
 				</thead>
 				<tbody>
-					<tr><td>{m('experiments.results.assigned')}</td><td class="right mono">{results.variant_a.assigned_count}</td><td class="right mono">{results.variant_b.assigned_count}</td></tr>
-					<tr><td>{m('experiments.results.completed')}</td><td class="right mono">{results.variant_a.completed_count}</td><td class="right mono">{results.variant_b.completed_count}</td></tr>
+					<tr><td>{m('experiments.results.assigned')}</td><td class="right mono">{formatCount(results.variant_a.assigned_count)}</td><td class="right mono">{formatCount(results.variant_b.assigned_count)}</td></tr>
+					<tr><td>{m('experiments.results.completed')}</td><td class="right mono">{formatCount(results.variant_a.completed_count)}</td><td class="right mono">{formatCount(results.variant_b.completed_count)}</td></tr>
 					<tr class:primary={results.primary_metric === 'time_to_approval_days'}>
 						<td>{m('experiments.results.medianTime')}</td>
 						<td class="right mono">{results.variant_a.median_time_to_approval_days}</td>
@@ -484,18 +599,18 @@
 					</tr>
 					<tr class:primary={results.primary_metric === 'touchless_rate_pct'}>
 						<td>{m('experiments.results.touchlessRate')}</td>
-						<td class="right mono">{results.variant_a.touchless_rate_pct}%</td>
-						<td class="right mono">{results.variant_b.touchless_rate_pct}%</td>
+						<td class="right mono">{formatPercent(results.variant_a.touchless_rate_pct)}</td>
+						<td class="right mono">{formatPercent(results.variant_b.touchless_rate_pct)}</td>
 					</tr>
 					<tr class:primary={results.primary_metric === 'exception_rate_pct'}>
 						<td>{m('experiments.results.exceptionRate')}</td>
-						<td class="right mono">{results.variant_a.exception_rate_pct}%</td>
-						<td class="right mono">{results.variant_b.exception_rate_pct}%</td>
+						<td class="right mono">{formatPercent(results.variant_a.exception_rate_pct)}</td>
+						<td class="right mono">{formatPercent(results.variant_b.exception_rate_pct)}</td>
 					</tr>
 					<tr class:primary={results.primary_metric === 'rejection_rate_pct'}>
 						<td>{m('experiments.results.rejectionRate')}</td>
-						<td class="right mono">{results.variant_a.rejection_rate_pct}%</td>
-						<td class="right mono">{results.variant_b.rejection_rate_pct}%</td>
+						<td class="right mono">{formatPercent(results.variant_a.rejection_rate_pct)}</td>
+						<td class="right mono">{formatPercent(results.variant_b.rejection_rate_pct)}</td>
 					</tr>
 				</tbody>
 			</table>
@@ -505,6 +620,24 @@
 </Modal>
 
 <style>
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.experiment-table { min-width: 0; }
+	.experiment-table :global(table) { min-width: 1200px; }
+	.experiment-table :global(th.col-metric) { width: 190px; }
+	.experiment-table :global(th.col-split) { width: 130px; }
+	.experiment-table :global(th.col-count) { width: 120px; }
+	.experiment-table :global(th.col-status) { width: 160px; }
+	.experiment-table :global(th.actions-col) { width: 220px; }
+
 	.lede {
 		color: var(--text-muted);
 		max-width: 70ch;
@@ -514,20 +647,6 @@
 	/* The status pill is `<Badge>` now — it had re-typed the shared recipe by
 	   hand, under classes that named the paint (green/amber/grey) rather than
 	   the status. The tone per status lives in `types/experiments`. */
-	/* Error-with-retry block — same shape as `/admin/api-keys`. */
-	.state {
-		color: var(--text-muted);
-		padding: 0.75rem 0;
-	}
-
-	.state.error {
-		color: var(--danger);
-	}
-
-	.state.error p {
-		margin: 0 0 8px;
-	}
-
 	.error-banner {
 		color: var(--danger);
 		margin: 8px 0;

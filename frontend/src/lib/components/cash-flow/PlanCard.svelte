@@ -57,6 +57,12 @@
 	 *  on) — the stale-plan guard. Surface a friendly nudge to re-ask instead
 	 *  of a raw error. */
 	function describeFailure(err: unknown): string {
+		// A CODED 409 (e.g. `/draft-run`'s `draft_run_no_run_currency`) is a
+		// refusal stated in its own words — already localized by the transport —
+		// not the stale-plan guard, which answers a plain string.
+		if (err instanceof ApiError && err.status === 409 && err.code) {
+			return err.message;
+		}
 		if (err instanceof ApiError && err.status === 409) {
 			return m('cashFlow.plan.actions.stale');
 		}
@@ -79,6 +85,15 @@
 			);
 			if (res.requires_cfo_approval) {
 				draftMessage = `${draftMessage} ${m('cashFlow.plan.actions.cfoApprovalNote')}`;
+			}
+			const skipped = res.skipped ?? [];
+			const unknown = skipped.filter((s) => s.code === 'currency_unknown').length;
+			const other = skipped.filter((s) => s.code === 'currency_not_run_currency').length;
+			if (other > 0) {
+				draftMessage = `${draftMessage} ${m('cashFlow.plan.actions.skippedOtherCurrency', { n: other, currency: res.run_currency })}`;
+			}
+			if (unknown > 0) {
+				draftMessage = `${draftMessage} ${m('cashFlow.plan.actions.skippedCurrencyUnknown', { n: unknown })}`;
 			}
 		} catch (err) {
 			draftError = describeFailure(err);
@@ -327,8 +342,8 @@
 		margin: 0 0 10px;
 		padding: 8px 12px;
 		border-radius: 8px;
-		background: rgba(240, 70, 70, 0.1);
-		border: 1px solid rgba(240, 70, 70, 0.3);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		color: var(--danger);
 		font-size: 0.82rem;
 	}
@@ -445,7 +460,7 @@
 	}
 	.plan-capture-btn.armed {
 		border-color: var(--danger);
-		background: rgba(240, 70, 70, 0.1);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
 		color: var(--danger);
 	}
 

@@ -5,10 +5,20 @@ the employee and supplier-portal auth routers (`api/auth.py`,
 `api/portal_auth.py`), the approval path (`services/approval_chain.py`,
 `services/review.py`), the exception queue's segregation refusal
 (`services/exception_lifecycle.py`), credit-memo application
-(`api/credit_memos.py`) and the invoice stale-edit 409 (`api/invoices.py`).
+(`api/credit_memos.py`), payment-run maker-checker and CFO sign-off
+(`services/payment_controls.py`, `api/payments.py`), expense reports and card reconciliation
+(`services/expense_controls.py`, `api/expenses.py`), the invoice stale-edit 409
+and currency-edit 422s (`api/invoices.py`), self-service signup
+(`api/signup.py`), vendor merge (`services/vendor_merge.py`) and the shared
+rate limiter's 429 (`services/rate_limit.py`).
 A server-side catcher that turns one back into text reads it through
 `utils/http.detail_text`, never `str(exc.detail)`.
 """
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from fastapi import HTTPException
 
 
 def coded_refusal(code: str, message: str, **params: object) -> dict:
@@ -30,12 +40,529 @@ def coded_refusal(code: str, message: str, **params: object) -> dict:
     return {"code": code, "message": message, "params": params}
 
 
+#: An action verdict's refusal for a caller whose roles / permissions the
+#: action's endpoint would turn away. The endpoints themselves answer that with
+#: ``require_roles`` / ``require_permission``'s plain-string 403 (unchanged —
+#: every client reads it); a verdict is read BEFORE any click, so it carries the
+#: same sentence under a code the page can localize. Built from the same
+#: predicates the dependencies use (``api/deps.holds_any_role`` /
+#: ``holds_any_permission``), never a restated role list.
+ROLE_NOT_PERMITTED = "role_not_permitted"
+ROLE_NOT_PERMITTED_MESSAGE = "Your role does not permit this action."
+
+
+@dataclass(frozen=True)
+class ActionRefusal:
+    """One gate's refusal, in the two shapes it is read in.
+
+    The gate function returns it (or ``None``); the endpoint raises
+    :meth:`http` and the verdict a page reads before offering the control is
+    :meth:`verdict` — so both come from the one function (issue #575).
+    :meth:`http` keeps the plain-string ``detail`` the endpoint always answered
+    with, for the clients (mobile included) that read it as text — unless
+    ``coded`` is set, for an endpoint that already answered with the coded
+    ``{code, message, params}`` detail (the NACHA export's refusals), which it
+    keeps. ``params`` ride both shapes' coded form.
+    """
+
+    code: str
+    message: str
+    http_status: int
+    params: dict | None = None
+    coded: bool = False
+
+    def http(self) -> HTTPException:
+        detail = self.verdict() if self.coded else self.message
+        return HTTPException(status_code=self.http_status, detail=detail)
+
+    def verdict(self) -> dict:
+        return coded_refusal(self.code, self.message, **(self.params or {}))
+
+
+def role_not_permitted() -> dict:
+    """The coded verdict for :data:`ROLE_NOT_PERMITTED`."""
+    return coded_refusal(ROLE_NOT_PERMITTED, ROLE_NOT_PERMITTED_MESSAGE)
+
+
+def refusal_of(exc: HTTPException, *, fallback_code: str) -> dict:
+    """An endpoint gate's raised refusal, as an action verdict.
+
+    A verdict is computed by RUNNING the gate the endpoint runs and catching
+    what it raises, so the page and the endpoint cannot disagree on a rule
+    (issue #575 § One rule, one place). A coded detail passes through as-is; a
+    gate still answering with a plain string is wrapped under
+    ``fallback_code`` with that string as its ``message``.
+    """
+    detail = exc.detail
+    if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+        return detail
+    return coded_refusal(fallback_code, str(detail))
+
+
 #: A wrong authenticator code on a SIGNED-IN factor change that takes only a
 #: code — confirming a new enrollment (employee and portal) and the portal's
 #: disable. A 400, not a 401: the session is valid and only the code is wrong,
 #: and both web clients read a 401 on an authenticated call as an expired
 #: session — they clear the token and bounce to the login page, so a mistyped
 #: code used to sign the user out. Exactly as specific as the "Invalid code" it
-#: replaces. The login challenge's own "Invalid code" stays a 401: there is no
-#: session yet, so a 401 is the truth and nobody is signed out by it.
+#: replaces. The login challenge's wrong TOTP code (``POST /api/auth/mfa/verify``
+#: and the portal's) carries the same detail but stays a 401: there is no
+#: session yet, so a 401 is the truth and nobody is signed out by it — neither
+#: web client bounces an anonymous 401, mobile ends a session on a 401 only when
+#: it presented a token, and the per-account MFA failure budget counts the
+#: attempt either way (decisions §461).
 MFA_CODE_INVALID_DETAIL = coded_refusal("mfa_code_invalid", "Invalid code")
+
+#: The login challenge's email one-time code missed: wrong, expired, or already
+#: spent (``POST /api/auth/mfa/verify`` with ``method=email``, and the portal's
+#: ``/mfa/challenge``). Its own code because its sentence differs from the TOTP
+#: one above — an emailed code also expires — and, like it, folds a wrong code
+#: and an expired one together. A 401 for the same reason (decisions §465).
+MFA_EMAIL_CODE_INVALID_DETAIL = coded_refusal("mfa_email_code_invalid", "Invalid or expired code")
+
+
+#: An ERP pull (chart, vendor or PO sync) refused because the org's OAuth
+#: connection is gone — never consented, revoked at the provider, or past its
+#: lifetime (``erp_oauth.ErpNotConnectedError``). A 409: the request was fine
+#: and only the connection's state stops it, and an administrator reconnecting
+#: resolves it. Before this it was the 502 "ERP request failed:
+#: ErpNotConnectedError", which named an exception class to a person who could
+#: not act on one (live QuickBooks sandbox, 2026-10-19).
+ERP_NOT_CONNECTED = "erp_not_connected"
+
+#: An ERP pull whose adapter could not read the whole collection
+#: (``ErpListingIncomplete``): a page failed (``gap = fetch_failed``) or the
+#: walk hit the adapter's row bound (``truncated``; each adapter has its own).
+#: Still a 502 and nothing synced, but stated, where it used to read "ERP
+#: request failed: ErpListingIncomplete" — a class name.
+ERP_LISTING_INCOMPLETE = "erp_listing_incomplete"
+
+
+def erp_pull_failure(exc: Exception) -> HTTPException:
+    """The HTTP answer for an ERP sync whose adapter read raised ``exc``.
+
+    A lost connection is the coded 409 above, and a listing that could not be
+    read whole is a coded 502. Anything else — a provider
+    outage, a token refresh that could not reach the provider
+    (``ErpTokenRefreshError``, whose connection is still good), an incomplete
+    listing — stays the 502 it always was: the gateway failed and a later
+    retry may succeed.
+    """
+    from app.services.erp_adapters.base import (
+        ERP_CALL_BUDGET_EXHAUSTED,
+        ErpCallBudgetExhausted,
+        ErpListingIncomplete,
+    )
+    from app.services.erp_oauth import ErpNotConnectedError, ErpTokenRefreshError
+
+    if isinstance(exc, ErpCallBudgetExhausted):
+        # Refused before the call by the shared-quota budget (decisions §322):
+        # a 429 with the time it frees up, nothing read and nothing synced.
+        wait = max(1, int((exc.retry_after - datetime.now(UTC)).total_seconds()))
+        return HTTPException(
+            status_code=429,
+            detail=coded_refusal(
+                ERP_CALL_BUDGET_EXHAUSTED,
+                f"{exc.provider} API calls are paused ({exc.reason}) until "
+                f"{exc.retry_after.isoformat()}, so nothing was synced.",
+                provider=exc.provider,
+                reason=exc.reason,
+                retry_after=exc.retry_after.isoformat(),
+            ),
+            headers={"Retry-After": str(wait)},
+        )
+
+    if isinstance(exc, ErpListingIncomplete):
+        return HTTPException(
+            status_code=502,
+            detail=coded_refusal(
+                ERP_LISTING_INCOMPLETE,
+                f"{exc.provider} could not be read in full ({exc.gap.value}), so nothing was "
+                "synced.",
+                provider=exc.provider,
+                gap=exc.gap.value,
+            ),
+        )
+
+    if isinstance(exc, ErpNotConnectedError) and not isinstance(exc, ErpTokenRefreshError):
+        return HTTPException(
+            status_code=409,
+            detail=coded_refusal(
+                ERP_NOT_CONNECTED,
+                "The ERP isn't connected, or its connection has expired. An administrator "
+                "can reconnect it under Organization, then sync again.",
+            ),
+        )
+    return HTTPException(status_code=502, detail=f"ERP request failed: {type(exc).__name__}")
+
+
+#: An invoice whose due date falls before its invoice date. QuickBooks accepts
+#: such a bill over the API and then flags it invalid in its own UI (live
+#: sandbox, 2026-10-20: changing only the invoice date to escape a closed
+#: period left bill 154 due five days before it was dated). Entry refuses the
+#: pair; the ERP push refuses it too (``services/erp``), for invoices that
+#: arrive by extraction, CSV or the recurring sweep.
+INVOICE_DUE_BEFORE_DATE = "invoice_due_before_date"
+
+
+def refuse_due_before_invoice_date(invoice_date, due_date) -> None:
+    """422 when both dates are set and the invoice is due before it is dated."""
+    if invoice_date is not None and due_date is not None and due_date < invoice_date:
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(
+                INVOICE_DUE_BEFORE_DATE,
+                "The due date is before the invoice date. Correct one of them.",
+            ),
+        )
+
+
+#: A statement upload (bank reconciliation, vendor statement) whose
+#: ``currency`` form field is blank or absent. The statement's currency is one
+#: field for the whole file, so it is refused for the upload, never defaulted to
+#: ``USD``: a GBP statement read as dollars matches the wrong payments
+#: (decisions §377, the statement-level twin of §372's per-row codes).
+STATEMENT_CURRENCY_REQUIRED = "statement_currency_required"
+#: The same field holding something that is not a three-letter ISO 4217 code.
+#: Params: ``value``.
+STATEMENT_CURRENCY_INVALID = "statement_currency_invalid"
+
+
+def statement_currency(raw: str | None) -> str:
+    """The normalized currency of an uploaded statement, or a coded 422.
+
+    Shape-checked by ``utils.currency_code.normalize_iso_currency``, the one check
+    every currency boundary uses, so ``"usd"`` is stored ``USD`` and ``"EURO"``
+    is refused rather than overflowing the ``String(3)`` column.
+    """
+    return _currency_or_refusal(
+        raw,
+        required=(
+            STATEMENT_CURRENCY_REQUIRED,
+            "Choose the statement's currency (a three-letter code such as USD or EUR).",
+        ),
+        invalid_code=STATEMENT_CURRENCY_INVALID,
+    )
+
+
+#: ``PATCH /api/invoices/{id}`` setting ``currency`` to a blank (or ``null``),
+#: or ``POST /api/invoices`` omitting it. A blank edit used to land as ``""``, a
+#: "no currency" every money path then had to know about (decisions §457), and
+#: an omitted create was booked in USD (§473). An edit may change the currency,
+#: never erase it; a create must state it.
+INVOICE_CURRENCY_REQUIRED = "invoice_currency_required"
+#: The same field holding something that is not a three-letter ISO 4217 code.
+#: Params: ``value``.
+INVOICE_CURRENCY_INVALID = "invoice_currency_invalid"
+
+
+def invoice_currency(raw: str | None, *, creating: bool = False) -> str:
+    """The normalized currency an invoice create or edit writes, or a coded 422.
+
+    A PATCH only calls it when the edit names ``currency``: one that leaves it
+    out never reaches here, so a row whose currency is unknown stays editable.
+    A create always calls it (``creating=True``), so an omitted code is refused
+    rather than defaulted.
+    """
+    return _currency_or_refusal(
+        raw,
+        required=(
+            INVOICE_CURRENCY_REQUIRED,
+            "Choose the invoice's currency (a three-letter code such as USD or EUR)."
+            if creating
+            else "An invoice's currency cannot be cleared. Choose a three-letter code "
+            "such as USD or EUR.",
+        ),
+        invalid_code=INVOICE_CURRENCY_INVALID,
+    )
+
+
+def _currency_or_refusal(raw: object, *, required: tuple[str, str], invalid_code: str) -> str:
+    from app.utils.currency_code import normalize_iso_currency
+
+    value = raw.strip() if isinstance(raw, str) else ""
+    if not value:
+        raise HTTPException(status_code=422, detail=coded_refusal(*required))
+    try:
+        return normalize_iso_currency(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(
+                invalid_code,
+                f"{value!r} is not a three-letter currency code such as USD or EUR.",
+                value=value,
+            ),
+        ) from None
+
+
+#: An employee token presented on another workspace's page (``tenant.get_tenant``:
+#: the token's ``org`` claim is not the requested tenant). Still a 403 and still
+#: refused; coded so the SPA can tell this from an ordinary permission refusal
+#: and treat it like an expired session — clear the token and send the user to
+#: this workspace's sign-in page — instead of leaving a signed-in screen where
+#: every call fails (production, 2026-10-20; ``docs/decisions.md`` §288).
+TOKEN_TENANT_MISMATCH = "token_tenant_mismatch"
+TOKEN_TENANT_MISMATCH_DETAIL = coded_refusal(
+    TOKEN_TENANT_MISMATCH, "Token does not match the requested tenant"
+)
+
+
+#: An SSO / SAML first sign-in whose IdP asserted an address that already names
+#: an account in ANOTHER workspace (``identity_provisioning.EmailInOtherWorkspace``).
+#: ``users.email`` is globally unique, so this workspace cannot create a second
+#: account for it; before this was coded the insert raised at flush and both
+#: callbacks answered a bare 500 (``docs/decisions.md`` §291). A 403 with no
+#: params: deliberately no link to the account's own sign-in page, because this
+#: workspace's IdP — which its own admin controls — can assert any address, so
+#: a link would hand that admin the name of another tenant's workspace for any
+#: address they type.
+SSO_EMAIL_IN_OTHER_WORKSPACE = "sso_email_in_other_workspace"
+SSO_EMAIL_IN_OTHER_WORKSPACE_DETAIL = coded_refusal(
+    SSO_EMAIL_IN_OTHER_WORKSPACE,
+    "This email address already belongs to an account in another workspace, so it "
+    "can't sign in here. Sign in on your own workspace's page, or ask this "
+    "workspace's administrator to have your identity provider use a different address.",
+)
+
+#: The other SSO sign-in refusals a person can act on, stated by the OIDC
+#: callback (``api/auth_sso.py``) and by the SAML bridge's ``/exchange`` alike,
+#: in the same English the OIDC callback has always answered with. Each is
+#: exactly as specific as that English: the IdP has already vouched for the
+#: address, so none says anything the IdP's own admin cannot already see.
+#: ``sso_account_inactive`` — the IdP vouched, but the account is deactivated
+#: (``DeactivatedAccount``); ``sso_email_domain_blocked`` — the address is
+#: outside ``allowed_email_domains``; ``sso_email_unusable`` — the asserted
+#: address carries a control character (``UnsafeEmailAddress``). All 403.
+SSO_ACCOUNT_INACTIVE = "sso_account_inactive"
+SSO_ACCOUNT_INACTIVE_DETAIL = coded_refusal(
+    SSO_ACCOUNT_INACTIVE, "This account has been deactivated. Contact your administrator."
+)
+SSO_EMAIL_DOMAIN_BLOCKED = "sso_email_domain_blocked"
+SSO_EMAIL_DOMAIN_BLOCKED_DETAIL = coded_refusal(
+    SSO_EMAIL_DOMAIN_BLOCKED, "Your email domain isn't allowed to sign in to this workspace."
+)
+SSO_EMAIL_UNUSABLE = "sso_email_unusable"
+SSO_EMAIL_UNUSABLE_DETAIL = coded_refusal(
+    SSO_EMAIL_UNUSABLE, "The identity provider supplied an unusable email address."
+)
+
+#: Every SAML response the ACS could not verify — a bad or foreign signature,
+#: an unparseable document, an issuer that is not this workspace's IdP, an
+#: unsolicited response, a replayed assertion, an assertion naming no subject
+#: or address, a login session missing its AuthnRequest binding. ONE code for
+#: all of them, deliberately: telling them apart would tell whoever holds a
+#: forged or captured assertion which check stopped it. The audit row keeps the
+#: precise reason (``auth.saml.login.failure`` ``details.reason``). A 400.
+SAML_LOGIN_UNVERIFIED = "saml_login_unverified"
+SAML_LOGIN_UNVERIFIED_DETAIL = coded_refusal(
+    SAML_LOGIN_UNVERIFIED, "SAML login could not be verified."
+)
+
+#: The workspace's SAML configuration stopped resolving between ``/login`` and
+#: the ACS — an admin turned it off, broke it, or the plan lost ``sso``
+#: (decisions §258). The same sentence ``/login`` answers an unconfigured
+#: workspace with. A 400.
+SAML_NOT_CONFIGURED = "saml_not_configured"
+SAML_NOT_CONFIGURED_DETAIL = coded_refusal(
+    SAML_NOT_CONFIGURED, "SAML SSO is not configured for this tenant."
+)
+
+#: ``POST`` / ``PATCH /api/admin/users`` with an address an account in THIS
+#: workspace already holds. A 409.
+EMAIL_IN_THIS_WORKSPACE = "email_in_this_workspace"
+EMAIL_IN_THIS_WORKSPACE_DETAIL = coded_refusal(
+    EMAIL_IN_THIS_WORKSPACE, "A user with this email address already exists in this workspace."
+)
+
+#: The same writes with an address an account in ANOTHER workspace holds. A 409
+#: that names no workspace and no account — only that the address is taken and
+#: what to do instead, since one address is one account in one workspace
+#: (``docs/decisions.md`` §291).
+EMAIL_IN_OTHER_WORKSPACE = "email_in_other_workspace"
+EMAIL_IN_OTHER_WORKSPACE_DETAIL = coded_refusal(
+    EMAIL_IN_OTHER_WORKSPACE,
+    "This email address already has an account in another workspace. An address "
+    "can belong to only one workspace, so use a different address for this person. "
+    "If they no longer use that other workspace, its administrator can close it, "
+    "which frees the address.",
+)
+
+#: The admin path's other-workspace budget is spent (``admin.EMAIL_COLLISION_LIMIT``
+#: an hour per workspace). A 429 for every create / email rename, free addresses
+#: included, until the window rolls — refusing only taken ones would make the
+#: 429 itself the oracle the budget bounds (``docs/decisions.md`` §291).
+EMAIL_CHECK_THROTTLED = "email_check_throttled"
+EMAIL_CHECK_THROTTLED_DETAIL = coded_refusal(
+    EMAIL_CHECK_THROTTLED,
+    "Too many addresses entered in this workspace recently already belonged to other "
+    "workspaces, so adding users or changing their email is paused for up to an hour. "
+    "Try again later.",
+)
+
+
+# --- Closing a workspace (`api/organization_close.py`, decisions §306) --------
+
+#: The typed confirmation did not match the workspace's slug. A 400; nothing
+#: was checked or changed.
+WORKSPACE_CLOSE_CONFIRMATION_MISMATCH = "workspace_close_confirmation_mismatch"
+WORKSPACE_CLOSE_CONFIRMATION_MISMATCH_DETAIL = coded_refusal(
+    WORKSPACE_CLOSE_CONFIRMATION_MISMATCH,
+    "Type this workspace's address exactly as shown to confirm that it should be closed.",
+)
+
+#: A save of a credential block (`PUT /api/organization/credentials/{block}`,
+#: or `PATCH /api/organization` dropping a rail's keys) could not open the
+#: block's stored sealed value to merge into it: its KMS key is disabled, or in
+#: dev `FEOH_SECRET_KEY` changed. A 503 whose `params.block` names the block, so
+#: the organization page can offer `DELETE /api/organization/credentials/{block}`
+#: — the only way out (decisions §464). A seal failure is a different 503, with
+#: no code: it is retried, never answered by removing keys.
+CREDENTIAL_BLOCK_UNOPENABLE = "credential_block_unopenable"
+
+
+def credential_block_unopenable_detail(block: str) -> dict:
+    return coded_refusal(
+        CREDENTIAL_BLOCK_UNOPENABLE,
+        "The stored credentials for this section can no longer be opened, so nothing was "
+        "saved. An administrator can clear them and enter each one again.",
+        block=block,
+    )
+
+
+#: The workspace holds something a self-service closure must not destroy. A
+#: 409 whose `params.blockers` lists the stable codes
+#: (`services/workspace_closure.BLOCKERS`), so the page can say what each one
+#: is. The way forward for any of them is support, never a retry.
+WORKSPACE_CLOSE_REFUSED = "workspace_close_refused"
+
+
+def workspace_close_refused_detail(blockers: list[str]) -> dict:
+    return coded_refusal(
+        WORKSPACE_CLOSE_REFUSED,
+        "This workspace can't be closed here because it holds records that must be "
+        "kept or other people's accounts. Contact support to close it.",
+        blockers=list(blockers),
+    )
+
+
+#: Under the closure's lock, the requester was no longer an active administrator
+#: of the workspace (deactivated, demoted or removed since the request began).
+#: A 403; nothing was deleted.
+WORKSPACE_CLOSE_ACTOR_NOT_ADMIN = "workspace_close_actor_not_admin"
+WORKSPACE_CLOSE_ACTOR_NOT_ADMIN_DETAIL = coded_refusal(
+    WORKSPACE_CLOSE_ACTOR_NOT_ADMIN,
+    "Only an active administrator of this workspace can close it.",
+)
+
+#: Another closure of the same workspace is running. A 409.
+WORKSPACE_CLOSE_IN_PROGRESS = "workspace_close_in_progress"
+WORKSPACE_CLOSE_IN_PROGRESS_DETAIL = coded_refusal(
+    WORKSPACE_CLOSE_IN_PROGRESS,
+    "This workspace is already being closed.",
+)
+
+#: The closure's audit record could not be written or shipped to the
+#: write-once archive, so nothing was deleted. A 503; a retry is safe.
+WORKSPACE_CLOSE_AUDIT_UNAVAILABLE = "workspace_close_audit_unavailable"
+WORKSPACE_CLOSE_AUDIT_UNAVAILABLE_DETAIL = coded_refusal(
+    WORKSPACE_CLOSE_AUDIT_UNAVAILABLE,
+    "The workspace could not be closed right now because its audit record could not be "
+    "saved. Nothing was deleted. Try again in a few minutes.",
+)
+
+#: The deletion started and failed part-way. A 503; a retry by the same
+#: administrator finishes it (every step of `services/tenant_deletion` is
+#: idempotent, and the guards are not re-run against a database already gone).
+WORKSPACE_CLOSE_INCOMPLETE = "workspace_close_incomplete"
+WORKSPACE_CLOSE_INCOMPLETE_DETAIL = coded_refusal(
+    WORKSPACE_CLOSE_INCOMPLETE,
+    "Closing the workspace did not finish. Try again; if it fails again, contact support.",
+)
+
+
+#: An invite or admin-initiated reset that cannot mint its set-password link:
+#: no tenant base URL to point it at, or the token store refused. A 503, raised
+#: BEFORE anything is created or changed — the account would otherwise exist (or
+#: have lost its password) with no way to set one (``docs/decisions.md`` §283).
+SET_PASSWORD_LINK_UNAVAILABLE = "set_password_link_unavailable"
+SET_PASSWORD_LINK_UNAVAILABLE_DETAIL = coded_refusal(
+    SET_PASSWORD_LINK_UNAVAILABLE,
+    "A set-password link cannot be issued right now, so nothing was changed. Try again later.",
+)
+
+#: The same flows when the email carrying the link could not be sent. A 502,
+#: and the request is rolled back: the email is the link's only channel — it is
+#: never shown to the admin — so an account whose link never arrived would be
+#: one nobody can sign in to.
+SET_PASSWORD_EMAIL_FAILED = "set_password_email_failed"
+SET_PASSWORD_EMAIL_FAILED_DETAIL = coded_refusal(
+    SET_PASSWORD_EMAIL_FAILED,
+    "The set-password email could not be sent, so nothing was changed. "
+    "Check the email provider configuration and try again.",
+)
+
+
+# --- auth refusals that used to send an exception's text --------------------
+# Each replaces a ``detail=str(exc)``: library or internal wording no client
+# can translate, which `tests/test_no_exception_text_in_detail.py` now bans.
+# Every one folds the raising function's cases into ONE code, so no code
+# distinguishes what the old English did not need to (an expired challenge
+# from a replayed one, a bad nonce from a bad signature);
+# the exception class is logged server-side instead.
+
+
+def password_refusal(exc) -> dict:
+    """The coded 422 for a password that broke a complexity rule.
+
+    ``exc`` is a ``utils.passwords.PasswordError``, which names its rule:
+    ``password_too_short`` (params ``min_length``), ``password_needs_uppercase``,
+    ``password_needs_lowercase`` or ``password_needs_digit``. The rule is the
+    user's own input, so naming it enumerates nothing.
+    """
+    return coded_refusal(exc.code, str(exc), **exc.params)
+
+
+#: The login MFA challenge token could not be redeemed — expired, already
+#: spent, malformed or of the wrong type (``mfa.decode_challenge_token`` /
+#: ``decode_vendor_challenge_token``). A 401: there is no session yet, and the
+#: only way on is to sign in again, whatever the reason.
+MFA_CHALLENGE_INVALID = "mfa_challenge_invalid"
+MFA_CHALLENGE_INVALID_DETAIL = coded_refusal(
+    MFA_CHALLENGE_INVALID, "This sign-in attempt has expired. Sign in again."
+)
+
+#: A passkey registration ceremony that did not verify (challenge expired,
+#: origin not allowed, attestation rejected). A 400.
+PASSKEY_REGISTRATION_FAILED = "passkey_registration_failed"
+PASSKEY_REGISTRATION_FAILED_DETAIL = coded_refusal(
+    PASSKEY_REGISTRATION_FAILED, "The passkey could not be registered. Try again."
+)
+
+#: The SSO login's server-minted state (OIDC ``state`` / SAML ``RelayState``)
+#: is unknown, spent or expired. A 400.
+SSO_SESSION_EXPIRED = "sso_session_expired"
+SSO_SESSION_EXPIRED_DETAIL = coded_refusal(
+    SSO_SESSION_EXPIRED, "Login session expired or was tampered with. Please try again."
+)
+
+#: The OIDC token exchange failed: the identity provider refused the code, or
+#: its configuration could not be used to reach it. A 400.
+SSO_LOGIN_REJECTED = "sso_login_rejected"
+SSO_LOGIN_REJECTED_DETAIL = coded_refusal(
+    SSO_LOGIN_REJECTED, "Identity provider rejected the login. Please try again."
+)
+
+#: The identity provider's ID token did not verify (signature, issuer,
+#: audience, expiry or nonce). A 400.
+SSO_TOKEN_INVALID = "sso_token_invalid"
+SSO_TOKEN_INVALID_DETAIL = coded_refusal(
+    SSO_TOKEN_INVALID, "Identity provider token could not be verified. Please try again."
+)
+
+#: The one-time SSO handoff code the sign-in bridge swaps for a session is
+#: unknown, spent or expired. A 400.
+SSO_LINK_EXPIRED = "sso_link_expired"
+SSO_LINK_EXPIRED_DETAIL = coded_refusal(
+    SSO_LINK_EXPIRED, "This login link has expired. Please sign in again."
+)

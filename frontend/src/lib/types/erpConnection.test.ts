@@ -1,21 +1,36 @@
 import { describe, expect, it } from 'vitest';
+import { SUPPORTED_LOCALES } from '#lib/i18n/locale.ts';
+import type { MessageKey } from '#lib/i18n/messages.ts';
 import {
 	buildErpPayload,
 	buildErpSecretUpdate,
 	buildErpTestPayload,
 	byoAppRequired,
+	callUsageLines,
+	type ErpCallUsage,
+	fieldApplies,
 	groupProviders,
 	initialValues,
 	missingRequired,
+	oauthAttentionKey,
 	oauthConnectionState,
+	oauthScopeGapKeys,
 	optionLabelKey,
 	withoutOAuthReturn,
 	type ErpOAuthStatus,
 	OAUTH_ERROR_KEYS,
+	CONNECT_FROM_PLATFORM_HOST,
+	platformConnectUrl,
 	destinationChanged,
+	disconnectMessage,
+	erpTestResultText,
 	readOAuthReturn,
+	pickRefusalKey,
+	PICK_REFUSAL_KEYS,
 	secretIsSaved,
 	selectedProviderKey,
+	statusSyncNowOffered,
+	statusSyncStartedKey,
 	type ErpProvider
 } from './erpConnection';
 
@@ -56,7 +71,44 @@ const qbo: ErpProvider = {
 			label_key: 'org.erp.environment',
 			secret: false,
 			required: true,
-			options: ['production', 'sandbox']
+			options: ['production', 'sandbox'],
+			// As the backend catalogue serves it (decisions §316).
+			destination: false
+		}
+	]
+};
+
+/** Business Central: here `environment` IS a destination (a URL path segment). */
+const bc: ErpProvider = {
+	key: 'dynamics_365_bc',
+	label: 'Microsoft Dynamics 365 Business Central',
+	regions: ['US', 'ZA'],
+	auth: 'credentials',
+	docs_url: 'https://example.invalid/bc',
+	available: true,
+	fields: [
+		{
+			name: 'environment',
+			label_key: 'org.erp.environment',
+			secret: false,
+			required: false,
+			destination: true
+		},
+		{
+			name: 'tenant_id',
+			label_key: 'org.erp.tenantId',
+			secret: false,
+			required: true,
+			destination: true
+		},
+		{ name: 'client_id', label_key: 'org.erp.clientId', secret: false, required: true },
+		{ name: 'client_secret', label_key: 'org.erp.clientSecret', secret: true, required: true },
+		{
+			name: 'company_id',
+			label_key: 'org.erp.companyId',
+			secret: false,
+			required: true,
+			destination: true
 		}
 	]
 };
@@ -153,6 +205,43 @@ describe('initialValues / secretIsSaved', () => {
 
 	it('defaults a choice field to its first option', () => {
 		expect(initialValues(qbo, undefined).environment).toBe('production');
+	});
+
+	it("keeps QuickBooks' own-app secret across an environment change", () => {
+		// The catalogue marks QuickBooks' environment destination: false (it
+		// only picks between two Intuit hosts), so production → sandbox is the
+		// same connection and Save must not ask for the client secret again.
+		const stored = {
+			type: 'quickbooks_online',
+			integration_method: 'direct',
+			client_id: 'byo',
+			environment: 'production'
+		};
+		const values = { client_id: 'byo', client_secret: '', environment: 'sandbox' };
+		const secret = qbo.fields[1];
+		expect(destinationChanged(qbo, values, stored)).toBe(false);
+		expect(secretIsSaved(qbo, secret, stored, ['client_secret'], values)).toBe(true);
+		expect(
+			missingRequired(qbo, values, stored, ['client_secret'], { requireByoApp: true })
+		).toEqual([]);
+	});
+
+	it('still asks again when a Business Central environment changes', () => {
+		const stored = {
+			type: 'dynamics_365_bc',
+			integration_method: 'direct',
+			environment: 'production',
+			tenant_id: 't',
+			client_id: 'c',
+			company_id: 'co'
+		};
+		const values = { ...initialValues(bc, stored), environment: 'sandbox' };
+		const secret = bc.fields.find((f) => f.name === 'client_secret')!;
+		expect(destinationChanged(bc, values, stored)).toBe(true);
+		expect(secretIsSaved(bc, secret, stored, ['client_secret'], values)).toBe(false);
+		expect(missingRequired(bc, values, stored, ['client_secret']).map((f) => f.name)).toEqual([
+			'client_secret'
+		]);
 	});
 });
 
@@ -251,16 +340,89 @@ describe('readOAuthReturn', () => {
 	});
 });
 
+describe('readOAuthReturn: the company picker', () => {
+	it('reads erp_choose_company as a pick to make, and strips it', () => {
+		expect(readOAuthReturn(new URLSearchParams('section=erp&erp_choose_company=xero'))).toEqual({
+			kind: 'choose',
+			provider: 'xero'
+		});
+		expect(
+			withoutOAuthReturn(new URL('https://acme.test/organization?section=erp&erp_choose_company=xero'))
+		).toBe('/organization?section=erp');
+	});
+
+	it('lets an error win over a pick', () => {
+		expect(
+			readOAuthReturn(new URLSearchParams('erp_choose_company=xero&erp_error=state_expired'))
+		).toEqual({ kind: 'error', code: 'state_expired' });
+	});
+});
+
+describe('pickRefusalKey', () => {
+	it('states every pick refusal the server codes', () => {
+		for (const code of [
+			'erp_pick_expired',
+			'erp_pick_unknown_company',
+			'already_linked',
+			'credentials_unavailable',
+			'audit_unavailable'
+		]) {
+			expect(pickRefusalKey(code)).toBe(PICK_REFUSAL_KEYS[code as keyof typeof PICK_REFUSAL_KEYS]);
+		}
+	});
+
+	it('leaves an unknown code to the server sentence', () => {
+		expect(pickRefusalKey('something_new')).toBeNull();
+		expect(pickRefusalKey('toString')).toBeNull();
+		expect(pickRefusalKey(null)).toBeNull();
+	});
+});
+
 describe('OAUTH_ERROR_KEYS', () => {
 	it('explains every actionable callback code in every locale', async () => {
-		const { CATALOGUE_LOADERS } = await import('#lib/i18n/catalogues.ts');
-		for (const [locale, load] of Object.entries(CATALOGUE_LOADERS)) {
-			const messages = await load();
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
 			for (const key of Object.values(OAUTH_ERROR_KEYS)) {
 				expect(messages[key], `${locale}: ${key}`).toBeTruthy();
 			}
 		}
 		expect(OAUTH_ERROR_KEYS.no_external_tenant).toBe('org.erp.oauth.error.noExternalTenant');
+		// The login-CSRF refusal: a callback from a browser that did not start it.
+		expect(OAUTH_ERROR_KEYS.browser_mismatch).toBe('org.erp.oauth.error.browserMismatch');
+	});
+
+	it('states the connect-from-platform refusal in every locale', async () => {
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
+			for (const key of [
+				'org.erp.oauth.connectFromPlatform',
+				'org.erp.oauth.connectUnavailableHere'
+			] as const) {
+				expect(messages[key], `${locale}: ${key}`).toContain('{erp}');
+			}
+			expect(messages['org.erp.oauth.connectFromPlatformLink'], locale).toBeTruthy();
+		}
+	});
+});
+
+describe('platformConnectUrl', () => {
+	it('is the code the backend refuses a vanity-host connect with', () => {
+		expect(CONNECT_FROM_PLATFORM_HOST).toBe('erp_connect_platform_host');
+	});
+
+	it('links only an absolute http(s) URL', () => {
+		expect(platformConnectUrl({ url: 'https://acme.feohledger.com/organization?section=erp' })).toBe(
+			'https://acme.feohledger.com/organization?section=erp'
+		);
+		expect(platformConnectUrl({ url: 'http://acme.localhost:7777/organization' })).toBe(
+			'http://acme.localhost:7777/organization'
+		);
+		expect(platformConnectUrl({})).toBeNull();
+		expect(platformConnectUrl({ url: 42 })).toBeNull();
+		expect(platformConnectUrl({ url: '/organization' })).toBeNull();
+		expect(platformConnectUrl({ url: 'javascript:alert(1)' })).toBeNull();
 	});
 });
 
@@ -347,6 +509,46 @@ describe('oauthConnectionState', () => {
 	});
 });
 
+describe('oauthAttentionKey', () => {
+	it('names why a lost connection must be reconnected (decisions §295)', () => {
+		const revoked = status({
+			provider: 'quickbooks_online',
+			needs_reconnect: true,
+			reconnect_reason: 'refresh_token_revoked'
+		});
+		expect(oauthAttentionKey('quickbooks_online', revoked)).toBe(
+			'org.erp.oauth.needsReconnectRevoked'
+		);
+		const expired = status({
+			provider: 'quickbooks_online',
+			needs_reconnect: true,
+			reconnect_reason: 'refresh_token_expired'
+		});
+		expect(oauthAttentionKey('quickbooks_online', expired)).toBe(
+			'org.erp.oauth.needsReconnectExpired'
+		);
+		// A reason this build does not know keeps the generic sentence.
+		const other = status({ provider: 'quickbooks_online', needs_reconnect: true });
+		expect(oauthAttentionKey('quickbooks_online', other)).toBe('org.erp.oauth.needsReconnect');
+	});
+
+	it('warns before expiry only for a live connection with a stated expiry', () => {
+		const soon = status({
+			provider: 'quickbooks_online',
+			connected: true,
+			expires_soon: true,
+			refresh_token_expires_at: '2026-11-01T00:00:00+00:00'
+		});
+		expect(oauthAttentionKey('quickbooks_online', soon)).toBe('org.erp.oauth.expiresSoon');
+		expect(
+			oauthAttentionKey('quickbooks_online', { ...soon, refresh_token_expires_at: null })
+		).toBeNull();
+		expect(oauthAttentionKey('quickbooks_online', { ...soon, expires_soon: false })).toBeNull();
+		// Another ERP's connection says nothing about this one.
+		expect(oauthAttentionKey('xero', soon)).toBeNull();
+	});
+});
+
 describe('withoutOAuthReturn', () => {
 	it('drops both return params and keeps the rest', () => {
 		const base = 'http://acme.localhost/organization';
@@ -362,11 +564,11 @@ describe('withoutOAuthReturn', () => {
 
 describe('optionLabelKey', () => {
 	it('labels every catalogued option value in every locale, and nothing else', async () => {
-		const { CATALOGUE_LOADERS } = await import('#lib/i18n/catalogues.ts');
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
 		// Blackbaud approval_status, Xero bill_status, QuickBooks environment, Merge.dev "other".
 		const values = ['Pending', 'Approved', 'AUTHORISED', 'DRAFT', 'production', 'sandbox', 'other'];
-		for (const [locale, load] of Object.entries(CATALOGUE_LOADERS)) {
-			const messages = await load();
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
 			for (const value of values) {
 				const key = optionLabelKey(value);
 				expect(key, value).not.toBeNull();
@@ -375,5 +577,347 @@ describe('optionLabelKey', () => {
 		}
 		expect(optionLabelKey('sap_s4hana')).toBeNull();
 		expect(optionLabelKey('toString')).toBeNull();
+	});
+});
+
+describe('erpTestResultText', () => {
+	const t = (key: string, params?: Record<string, string | number>) =>
+		`${key}${params ? ' ' + JSON.stringify(params) : ''}`;
+	const label = (p: ErpProvider) => p.label;
+	const merge: ErpProvider = { ...netsuite, key: 'merge_dev', label: 'Merge.dev' };
+
+	it('names a connected ERP by its display name, not its key', () => {
+		const result = {
+			success: true,
+			code: 'connected',
+			provider: 'quickbooks_online',
+			message: 'Connected to quickbooks_online successfully'
+		};
+		expect(erpTestResultText(result, qbo, label, t)).toBe(
+			'org.erp.test.connected {"erp":"QuickBooks Online"}'
+		);
+	});
+
+	it('tells an OAuth ERP to reconnect and a credentials ERP to check its details', () => {
+		const failed = (provider: string) => ({
+			success: false,
+			code: 'connection_failed',
+			provider,
+			message: 'Connection failed — check your credentials'
+		});
+		expect(erpTestResultText(failed('quickbooks_online'), qbo, label, t)).toBe(
+			'org.erp.test.failedOAuth {"erp":"QuickBooks Online"}'
+		);
+		expect(erpTestResultText(failed('netsuite'), netsuite, label, t)).toBe(
+			'org.erp.test.failed {"erp":"Oracle NetSuite"}'
+		);
+		// A Merge.dev connection reports the linked ERP's type as its provider.
+		expect(erpTestResultText(failed('sap_s4hana'), merge, label, t)).toBe(
+			'org.erp.test.failed {"erp":"Merge.dev"}'
+		);
+	});
+
+	it('states the provider-less codes', () => {
+		expect(
+			erpTestResultText(
+				{ success: false, code: 'credentials_unavailable', message: 'x' },
+				netsuite,
+				label,
+				t
+			)
+		).toBe('org.erp.test.credentialsUnavailable');
+		expect(
+			erpTestResultText(
+				{ success: false, code: 'unknown_adapter', adapter: 'quikbooks', message: 'x' },
+				netsuite,
+				label,
+				t
+			)
+		).toBe('org.erp.test.unknownAdapter {"adapter":"quikbooks"}');
+	});
+
+	it.each([
+		['no code (an older backend)', { success: true, message: 'server says' }],
+		['an unknown code', { success: true, code: 'brand_new', message: 'server says' }],
+		[
+			'a result for another ERP than the form shows',
+			{ success: true, code: 'connected', provider: 'xero', message: 'server says' }
+		],
+		['an unknown adapter with no key', { success: false, code: 'unknown_adapter', message: 'server says' }]
+	])('falls back to the server sentence for %s', (_label, result) => {
+		expect(erpTestResultText(result, qbo, label, t)).toBe('server says');
+	});
+});
+
+/** NetSuite as the catalogue now serves it: a sign-in method, then each
+ *  method's own credentials (`catalog.py`, issue #653). */
+const OAUTH2 = { field: 'auth_method', values: ['oauth2_m2m'] };
+const TBA = { field: 'auth_method', values: ['tba'] };
+const netsuiteTwoMethods: ErpProvider = {
+	...netsuite,
+	fields: [
+		{ name: 'account_id', label_key: 'org.erp.accountId', secret: false, required: true },
+		{
+			name: 'auth_method',
+			label_key: 'org.erp.field.auth_method',
+			secret: false,
+			required: true,
+			options: ['oauth2_m2m', 'tba'],
+			stored_default: 'tba'
+		},
+		{ name: 'client_id', label_key: 'org.erp.clientId', secret: false, required: true, show_when: OAUTH2 },
+		{
+			name: 'private_key',
+			label_key: 'org.erp.field.private_key',
+			secret: true,
+			required: true,
+			show_when: OAUTH2
+		},
+		{ name: 'consumer_key', label_key: 'org.erp.consumerKey', secret: false, required: true, show_when: TBA },
+		{
+			name: 'consumer_secret',
+			label_key: 'org.erp.consumerSecret',
+			secret: true,
+			required: true,
+			show_when: TBA
+		}
+	]
+};
+
+describe('NetSuite sign-in method (show_when / stored_default)', () => {
+	it('starts a new connection on OAuth 2.0, the first option', () => {
+		expect(initialValues(netsuiteTwoMethods, undefined).auth_method).toBe('oauth2_m2m');
+	});
+
+	it('reads a saved connection with no method as TBA, as the adapter does', () => {
+		// Showing the first option here would switch a working tenant on save.
+		expect(initialValues(netsuiteTwoMethods, storedNetsuite).auth_method).toBe('tba');
+		const saved = { ...storedNetsuite, auth_method: 'oauth2_m2m' };
+		expect(initialValues(netsuiteTwoMethods, saved).auth_method).toBe('oauth2_m2m');
+	});
+
+	it('applies only the chosen method’s fields', () => {
+		const shown = (method: string) =>
+			netsuiteTwoMethods.fields
+				.filter((f) => fieldApplies(f, { auth_method: method }))
+				.map((f) => f.name);
+		expect(shown('oauth2_m2m')).toEqual(['account_id', 'auth_method', 'client_id', 'private_key']);
+		expect(shown('tba')).toEqual(['account_id', 'auth_method', 'consumer_key', 'consumer_secret']);
+	});
+
+	it('never requires the other method’s credentials', () => {
+		const values = { account_id: '123', auth_method: 'oauth2_m2m', client_id: '', private_key: '' };
+		expect(missingRequired(netsuiteTwoMethods, values, undefined, []).map((f) => f.name)).toEqual([
+			'client_id',
+			'private_key'
+		]);
+	});
+
+	it('labels both methods', () => {
+		expect(optionLabelKey('oauth2_m2m')).toBe('org.erp.option.oauth2_m2m');
+		expect(optionLabelKey('tba')).toBe('org.erp.option.tba');
+	});
+});
+
+describe('callUsageLines', () => {
+	const t = (key: string, params?: Record<string, string | number>) =>
+		`${key}${params ? ' ' + JSON.stringify(params) : ''}`;
+	// Stand-ins that show the figures went through the locale formatters.
+	const fmt = { count: (n: number) => `#${n}`, time: (iso: string) => `@${iso}` };
+	const RESET = '2026-10-27T00:00:00+00:00';
+	const usage = (overrides: Partial<ErpCallUsage> = {}): ErpCallUsage => ({
+		scope: 'org_share',
+		used: 1234,
+		limit: 2500,
+		resets_at: RESET,
+		paused_reason: null,
+		paused_until: null,
+		...overrides
+	});
+
+	it('says nothing when the status carries no usage', () => {
+		expect(callUsageLines(null, 'Blackbaud', t, fmt)).toEqual([]);
+		expect(callUsageLines(undefined, 'Blackbaud', t, fmt)).toEqual([]);
+	});
+
+	it("measures a platform-key org against its share and its own key against the key's quota", () => {
+		expect(callUsageLines(usage(), 'Blackbaud', t, fmt)).toEqual([
+			`org.erp.usage.ofShare {"erp":"Blackbaud","used":"#1234","limit":"#2500","reset":"@${RESET}"}`
+		]);
+		expect(
+			callUsageLines(usage({ scope: 'subscription', limit: 25000 }), 'Blackbaud', t, fmt)
+		).toEqual([
+			`org.erp.usage.ofQuota {"erp":"Blackbaud","used":"#1234","limit":"#25000","reset":"@${RESET}"}`
+		]);
+		expect(callUsageLines(usage({ limit: null }), 'Blackbaud', t, fmt)).toEqual([
+			`org.erp.usage.noLimit {"erp":"Blackbaud","used":"#1234","reset":"@${RESET}"}`
+		]);
+	});
+
+	it('says why calls are paused and until when, and falls back for a reason it does not know', () => {
+		const until = '2026-10-26T14:02:00+00:00';
+		const paused = (reason: string) =>
+			callUsageLines(usage({ paused_reason: reason, paused_until: until }), 'FE NXT', t, fmt)[1];
+		expect(paused('rate_limited')).toBe(
+			`org.erp.usage.paused.rateLimited {"erp":"FE NXT","until":"@${until}"}`
+		);
+		expect(paused('tenant_budget')).toBe(
+			`org.erp.usage.paused.tenantBudget {"erp":"FE NXT","until":"@${until}"}`
+		);
+		expect(paused('subscription_quota')).toBe(
+			`org.erp.usage.paused.subscriptionQuota {"erp":"FE NXT","until":"@${until}"}`
+		);
+		expect(paused('something_new')).toBe(`org.erp.usage.paused {"erp":"FE NXT","until":"@${until}"}`);
+		expect(paused('toString')).toBe(`org.erp.usage.paused {"erp":"FE NXT","until":"@${until}"}`);
+		// A reason with no time is not a pause the page can state.
+		expect(callUsageLines(usage({ paused_reason: 'rate_limited' }), 'X', t, fmt)).toHaveLength(1);
+	});
+
+	it('has every usage sentence in every locale', async () => {
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
+		const keys: MessageKey[] = [
+			'org.erp.usage.ofShare',
+			'org.erp.usage.ofQuota',
+			'org.erp.usage.noLimit',
+			'org.erp.usage.paused',
+			'org.erp.usage.paused.rateLimited',
+			'org.erp.usage.paused.tenantBudget',
+			'org.erp.usage.paused.subscriptionQuota'
+		];
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
+			for (const key of keys) expect(messages[key], `${locale}: ${key}`).toBeTruthy();
+		}
+	});
+});
+
+describe('disconnectMessage', () => {
+	it('is plain success only when the provider confirmed the revocation', () => {
+		expect(
+			disconnectMessage({ disconnected: true, revoked: true, revocation: 'revoked' })
+		).toEqual({ key: 'org.erp.oauth.disconnected', tone: 'success' });
+	});
+
+	it('tells the admin to remove the app at a provider with no revoke endpoint', () => {
+		// Blackbaud SKY API (decisions §371).
+		expect(
+			disconnectMessage({ disconnected: true, revoked: false, revocation: 'unsupported' })
+		).toEqual({ key: 'org.erp.oauth.disconnectedRemoveAtProvider', tone: 'failure' });
+	});
+
+	it('reads a failed or unknown outcome as not revoked, never as success', () => {
+		const notRevoked = { key: 'org.erp.oauth.disconnectedNotRevoked', tone: 'failure' };
+		expect(
+			disconnectMessage({ disconnected: true, revoked: false, revocation: 'failed' })
+		).toEqual(notRevoked);
+		expect(
+			disconnectMessage({ disconnected: true, revoked: true, revocation: null })
+		).toEqual(notRevoked);
+		expect(disconnectMessage(null)).toEqual(notRevoked);
+	});
+
+	it('has every sentence, naming the ERP, in every locale', async () => {
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
+			for (const key of [
+				'org.erp.oauth.disconnected',
+				'org.erp.oauth.disconnectedNotRevoked',
+				'org.erp.oauth.disconnectedRemoveAtProvider'
+			] as const) {
+				expect(messages[key], `${locale}: ${key}`).toContain('{erp}');
+			}
+		}
+	});
+});
+
+describe('statusSyncNowOffered', () => {
+	const connected = (overrides: Partial<ErpOAuthStatus> = {}) =>
+		status({ provider: 'xero', connected: true, ...overrides });
+
+	it('offers the check only while the server says a pass would run', () => {
+		expect(statusSyncNowOffered('xero', connected({ status_sync_available: true }))).toBe(true);
+		expect(
+			statusSyncNowOffered(
+				'xero',
+				connected({ status_sync_available: false, status_sync_refusal: 'status_sync_off' })
+			)
+		).toBe(false);
+	});
+
+	it('offers nothing an older server sent no verdict for', () => {
+		expect(statusSyncNowOffered('xero', connected())).toBe(false);
+	});
+
+	it('offers nothing for another ERP, or a connection that is not live', () => {
+		const live = connected({ status_sync_available: true });
+		expect(statusSyncNowOffered('quickbooks_online', live)).toBe(false);
+		expect(
+			statusSyncNowOffered('xero', { ...live, needs_reconnect: true, connected: false })
+		).toBe(false);
+		expect(statusSyncNowOffered('xero', null)).toBe(false);
+	});
+});
+
+describe('statusSyncStartedKey', () => {
+	it('says a check started, or that one already runs', () => {
+		expect(statusSyncStartedKey(true)).toBe('org.erp.oauth.checkPaymentsStarted');
+		expect(statusSyncStartedKey(false)).toBe('org.erp.oauth.checkPaymentsRunning');
+	});
+
+	it('has every sentence of the button, naming the ERP, in every locale', async () => {
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
+			for (const key of [
+				'org.erp.oauth.checkPaymentsHint',
+				'org.erp.oauth.checkPaymentsStarted',
+				'org.erp.oauth.checkPaymentsRunning'
+			] as const) {
+				expect(messages[key], `${locale}: ${key}`).toContain('{erp}');
+			}
+			for (const key of ['org.erp.oauth.checkPayments', 'org.erp.oauth.checkingPayments'] as const) {
+				expect(messages[key], `${locale}: ${key}`).toBeTruthy();
+			}
+		}
+	});
+});
+
+describe('oauthScopeGapKeys', () => {
+	const connected = (overrides: Partial<ErpOAuthStatus> = {}) =>
+		status({ provider: 'xero', connected: true, ...overrides });
+
+	it('says what a consent without the payments scope limits (decisions §415)', () => {
+		expect(oauthScopeGapKeys('xero', connected({ scope_gaps: ['payments_scope_missing'] }))).toEqual(
+			['org.erp.oauth.scopeGapPayments']
+		);
+		expect(oauthScopeGapKeys('xero', connected({ scope_gaps: [] }))).toEqual([]);
+		// An older server sends no field.
+		expect(oauthScopeGapKeys('xero', connected())).toEqual([]);
+	});
+
+	it('reads a gap this build does not know as the generic sentence, once', () => {
+		expect(
+			oauthScopeGapKeys('xero', connected({ scope_gaps: ['new_gap', 'other_gap'] }))
+		).toEqual(['org.erp.oauth.scopeGap']);
+	});
+
+	it('says nothing for another ERP or a connection that is not live', () => {
+		const gap = connected({ scope_gaps: ['payments_scope_missing'] });
+		expect(oauthScopeGapKeys('quickbooks_online', gap)).toEqual([]);
+		expect(oauthScopeGapKeys('xero', { ...gap, needs_reconnect: true, connected: false })).toEqual(
+			[]
+		);
+		expect(oauthScopeGapKeys('xero', null)).toEqual([]);
+	});
+
+	it('has every scope-gap sentence, naming the ERP, in every locale', async () => {
+		const { loadAllMessages } = await import('#lib/i18n/allMessages.ts');
+		for (const locale of SUPPORTED_LOCALES) {
+			const messages = await loadAllMessages(locale);
+			for (const key of ['org.erp.oauth.scopeGapPayments', 'org.erp.oauth.scopeGap'] as const) {
+				expect(messages[key], `${locale}: ${key}`).toContain('{erp}');
+			}
+		}
 	});
 });

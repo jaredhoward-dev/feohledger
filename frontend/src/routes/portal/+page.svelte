@@ -14,7 +14,9 @@
 	 */
 	import { onMount } from 'svelte';
 	import { getPortalSummary, type PortalSummary } from '#lib/portalApi.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
@@ -68,16 +70,11 @@
 	</header>
 
 	{#if loading}
-		<p class="state">{m('portal.common.loading')}</p>
+		<LoadingState label={m('portal.common.loading')} />
 	{:else if error}
 		<!-- Distinct from the empty state: something failed, so offer a retry
 		     rather than a first-run call to action. -->
-		<div class="state error" role="alert">
-			<p>{error}</p>
-			<button type="button" class="btn-secondary" onclick={load}>
-				{m('portal.home.retry')}
-			</button>
-		</div>
+		<LoadError message={error} onretry={load} testId="portal-home-error" />
 	{:else if summary && !hasInvoices}
 		<EmptyState
 			icon="📄"
@@ -191,18 +188,6 @@
 		margin: 4px 0 0;
 		color: var(--text-muted);
 		font-size: 0.9rem;
-	}
-
-	.state {
-		color: var(--text-muted);
-		font-size: 0.9rem;
-	}
-
-	.state.error {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		color: var(--danger);
 	}
 
 	.kpis {

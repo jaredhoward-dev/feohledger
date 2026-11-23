@@ -57,6 +57,7 @@ from app.api.permissions import (
     PERM_VENDOR_BANK_CHANGE_APPROVE,
     PERM_VENDOR_BLOCK,
     PERM_VENDOR_MANAGE,
+    PERM_VENDOR_SANCTIONS_ADJUDICATE,
     ROLE_DEFAULT_PERMISSIONS,
 )
 from app.main import app
@@ -173,6 +174,7 @@ _VENDOR_MANAGE = frozenset({PERM_VENDOR_MANAGE})
 _VENDOR_BLOCK = frozenset({PERM_VENDOR_BLOCK})
 _BANK_CHANGE_APPROVE = frozenset({PERM_VENDOR_BANK_CHANGE_APPROVE})
 _USER_MANAGE = frozenset({PERM_USER_MANAGE})
+_SANCTIONS_ADJUDICATE = frozenset({PERM_VENDOR_SANCTIONS_ADJUDICATE})
 
 CASES = [
     ("/api/invoices/{invoice_id}/approve", "POST", _INVOICE_APPROVE),
@@ -180,6 +182,7 @@ CASES = [
     # reject, and a custom role from which `invoice.approve` was stripped must
     # not be able to reject through the back door. Same permission as approve.
     ("/api/invoices/{invoice_id}/reject", "POST", _INVOICE_APPROVE),
+    ("/api/invoices/{invoice_id}/recall-approval", "POST", _INVOICE_APPROVE),
     # --- payment.execute: the routes that actually move money, or that decide
     # an already-moved payment's fate in AP's favour. These are the reason the
     # SoD layer exists at all, so they are pinned individually rather than left
@@ -268,10 +271,15 @@ CASES = [
     ("/api/payments/execution-mode", "GET", _EXECUTE_OR_VOID),
     ("/api/payments/record-outside", "POST", _RECORD_EXTERNAL),
     ("/api/payments/runs/{run_id}/record-outside", "POST", _RECORD_EXTERNAL),
+    # The exception queue's one-click record of an ERP-reported payment
+    # (decisions §319) — a record outside FeohLedger, like the two above.
+    ("/api/exceptions/{exception_id}/record-erp-payment", "POST", _RECORD_EXTERNAL),
     # The NACHA export is the counterpart of `/execute` — uploading the file is
     # the money moving — so it gates on `payment.execute`, not on recording.
     ("/api/payments/runs/{run_id}/nacha", "GET", _EXECUTE),
     ("/api/payments/runs/{run_id}/nacha/void", "POST", _EXECUTE),
+    # Verify before upload (decisions §362): the step before the money moves.
+    ("/api/payments/runs/{run_id}/nacha/verify", "POST", _EXECUTE),
     # --- vendor.manage: create / edit / verify / reject / delete a vendor, and
     # the bulk-import paths that do the same thing at volume. ---
     ("/api/vendors", "POST", _VENDOR_MANAGE),
@@ -287,6 +295,11 @@ CASES = [
     # or the bulk endpoint becomes the way around it.
     ("/api/vendors/bulk/status", "POST", _VENDOR_MANAGE),
     ("/api/enrichment/vendors/consolidation/merge", "POST", _VENDOR_MANAGE),
+    # Clearing a vendor's ERP link in one company (decisions §375) — an edit to
+    # the vendor master like every other one here.
+    ("/api/vendors/{vendor_id}/erp-links/unlink", "POST", _VENDOR_MANAGE),
+    ("/api/vendors/{vendor_id}/erp-links/search", "POST", _VENDOR_MANAGE),
+    ("/api/vendors/{vendor_id}/erp-links/link", "POST", _VENDOR_MANAGE),
     # --- vendor.block: sticky payment block/unblock. ---
     ("/api/vendors/{vendor_id}/block", "POST", _VENDOR_BLOCK),
     # `cancel-cards` retries the card revocation a reject / deactivate (vendor
@@ -295,6 +308,9 @@ CASES = [
     # stays with `payment.void`.
     ("/api/vendors/{vendor_id}/cancel-cards", "POST", _VENDOR_MANAGE | _VENDOR_BLOCK),
     ("/api/vendors/{vendor_id}/unblock", "POST", _VENDOR_BLOCK),
+    # --- vendor.sanctions.adjudicate: clearing a false-positive screen (§477).
+    ("/api/vendors/{vendor_id}/screening/adjudicate", "POST", _SANCTIONS_ADJUDICATE),
+    ("/api/vendors/{vendor_id}/screening/adjudication/revoke", "POST", _SANCTIONS_ADJUDICATE),
     # --- vendor.bank_change.approve: the BEC / bank-redirect dual-control gate.
     # Its sibling `POST /change-requests/{id}/reject` is deliberately NOT here —
     # reject never touches the vendor row (it can't redirect a payment), so it

@@ -5,6 +5,10 @@
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 
+	import type { Snippet } from 'svelte';
+
+	let { children }: { children: Snippet } = $props();
+
 	/**
 	 * The frame every published legal route renders inside — the index and the
 	 * six documents.
@@ -141,7 +145,7 @@
 		own header demoted to the section heading it always was.
 	-->
 	<main class="legal-sheet">
-		<slot />
+		{@render children()}
 	</main>
 </div>
 
@@ -268,7 +272,7 @@
 		background: linear-gradient(
 			90deg,
 			transparent,
-			rgba(99, 140, 255, 0.45),
+			color-mix(in srgb, var(--accent) 45%, transparent),
 			rgba(231, 185, 94, 0.28),
 			transparent
 		);

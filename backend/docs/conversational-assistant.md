@@ -117,9 +117,9 @@ float). Params clamp limits so an odd model arg can't request an unbounded scan.
 | Tool | Wraps | Returns |
 |------|-------|---------|
 | `list_invoices` | filtered `select(Invoice)` (entity-scoped) | invoice summaries + total + applied filters |
-| `get_vendor_spend` | `services.analytics.compute_supplier_concentration` (statuses from `app/api/analytics._COMMITTED_STATUSES`) | top-N vendors + share %, reporting currency |
+| `get_vendor_spend` | `services.analytics.compute_supplier_concentration` (statuses from `services/open_ap_due.COMMITTED_STATUSES`) | top-N vendors + share %, reporting currency |
 | `list_pending_approvals` | `ready_for_review` invoices ⋈ active approval `WorkflowStep` | approval-queue rows (`assignee=me\|anyone`) |
-| `get_payment_forecast` | `services.analytics.bucket_outflows` (`_COMMITTED_STATUSES` + `_PENDING_STATUSES`) | due-dated outflow buckets + total |
+| `get_payment_forecast` | `ap_commitments.commitment_rows` → `services.analytics.bucket_outflows` (the CFO forecast's own rows: reporting currency, latest payment schedule, past-due AP carried into the first bucket) | due-dated outflow buckets + total, with the `overdue` slice named |
 | `find_invoices_by_text` | `services.rag.retrieve_similar` (pgvector; mock embeddings by default) | similar invoices + non-PII snippet |
 | `get_cashflow_forecast` | cash-flow copilot (`tools/cashflow.py`) | projected outflow by period: committed / pending / discount-eligible |
 | `get_cash_position` | cash-flow copilot (`tools/cashflow.py`) | running balance per period + first shortfall |
@@ -199,9 +199,13 @@ despite the same per-org framing are tenant-local. This line used to cite
   `Organization.settings.assistant.monthly_token_budget` beats the platform
   default. (A single turn is still bounded by `max_tokens ×
   FEOH_ASSISTANT_MAX_TOOL_HOPS`, bounding how large that overshoot can get.)
-- **Refusal contract** — `AssistantBudgetExceeded` → **HTTP 429** with
-  `{"detail": "...", "code": "assistant_budget_exceeded", "used", "budget",
-  "period"}`. No tool runs, no model call, nothing persisted.
+- **Refusal contract** — `AssistantBudgetExceeded` → **HTTP 429** whose
+  `detail` is `{"detail": "...", "code": "assistant_budget_exceeded", "used",
+  "budget", "period"}` (an `HTTPException` with a dict detail, so the wire body
+  nests it under `detail`). No tool runs, no model call, nothing persisted. The
+  frontend reads a 429 as the budget only when that detail carries a numeric
+  `budget` (`frontend/src/lib/api/assistantBudget.ts`); any other 429 — the
+  shared limiter's coded `rate_limited` — is rendered as that refusal.
 - **Recording** — `usage.record` upserts the meter (atomic
   `INSERT … ON CONFLICT DO UPDATE` increment) but **does not commit**: it flushes
   onto the request's `control_db` and rides the request commit boundary
@@ -259,7 +263,9 @@ conversation_id?}`), auth, tenant resolution, RBAC (`_ASSISTANT_ROLES`), and
 entity scoping. The response is a `StreamingResponse(media_type=
 "text/event-stream")` with `Cache-Control: no-cache`, `X-Accel-Buffering: no`,
 and `Connection: keep-alive`. The frontend treats the terminal `done` event as
-the source of truth and falls back to the same handling as `/chat` on a 429.
+the source of truth. A pre-stream 429 is a refusal, not an unavailable stream:
+the page shows it (the budget notice, or the localized `rate_limited` sentence)
+and does **not** retry on `/chat`, which would refuse the same turn.
 
 ### Event protocol
 

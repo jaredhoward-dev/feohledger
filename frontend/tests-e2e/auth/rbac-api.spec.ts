@@ -2,6 +2,7 @@ import {
 	API_BASE,
 	currentTenantSlug,
 	deleteInvoicesWhere,
+	deleteVendorsWhere,
 	escapeRegExp,
 	expect,
 	tenantBase,
@@ -131,11 +132,17 @@ test.describe('RBAC at the API layer', () => {
 		tenantManager
 	}) => {
 		const managerToken = await tokenAfterLogin(page, tenantManager);
-		const r = await request.post(`${API_BASE}/api/vendors`, {
-			headers: { Authorization: `Bearer ${managerToken}`, 'X-Tenant-Slug': currentTenantSlug() },
-			data: { name: `Playwright Vendor ${Date.now()}` }
-		});
-		expect(r.status(), 'manager should not be RBAC-denied').not.toBe(403);
+		const name = `Playwright Vendor ${Date.now()}`;
+		try {
+			const r = await request.post(`${API_BASE}/api/vendors`, {
+				headers: { Authorization: `Bearer ${managerToken}`, 'X-Tenant-Slug': currentTenantSlug() },
+				data: { name }
+			});
+			expect(r.status(), 'manager should not be RBAC-denied').not.toBe(403);
+		} finally {
+			// The positive control really creates the vendor.
+			deleteVendorsWhere(`name='${name}'`);
+		}
 	});
 
 	// ---- CFO-only --------------------------------------------------------
@@ -239,7 +246,12 @@ test.describe('RBAC at the API layer', () => {
 			const headers = { Authorization: `Bearer ${token}`, 'X-Tenant-Slug': currentTenantSlug() };
 			const created = await request.post(`${API_BASE}/api/invoices`, {
 				headers,
-				data: { vendor: 'E2E Clerk Entry Vendor', invoice_number: marker, amount: '42.00' }
+				data: {
+					vendor: 'E2E Clerk Entry Vendor',
+					invoice_number: marker,
+					amount: '42.00',
+					currency: 'USD'
+				}
 			});
 			expect(created.status(), 'clerk POST /invoices').toBe(201);
 			const { id } = (await created.json()) as { id: string };

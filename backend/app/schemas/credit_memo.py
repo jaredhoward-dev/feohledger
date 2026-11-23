@@ -3,34 +3,26 @@ from datetime import date
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from app.api.pagination import PageMeta
-from app.schemas.expense import normalize_iso_currency
+from app.schemas.action_verdict import CodedRefusal
+from app.schemas.currency import CurrencyCode, CurrencyCodeOrUnset
 from app.schemas.money import MoneyAmount
-
-
-def _normalize_optional_currency(value: str | None) -> str | None:
-    """Blank means "not asserted"; anything else must be a real ISO 4217 shape.
-
-    `max_length=3` alone accepted `""`, `"e"` and `"us"`, and a memo stamped
-    with a code no invoice carries can never pass the currency guard on either
-    application path — it is born unappliable. Blank stays the "resolve it for
-    me" signal `api/credit_memos.create_credit_memo` documents.
-    """
-    if value is None or not value.strip():
-        return None
-    return normalize_iso_currency(value)
-
 
 #: Shared by create and PATCH so the two cannot validate a memo differently.
 MemoNumber = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 #: Digits match `credit_memos.amount` Numeric(15, 2); strictly positive, since a
 #: zero or negative credit is not a credit.
 MemoAmount = Annotated[Decimal, Field(gt=0, max_digits=15, decimal_places=2)]
-OptionalMemoCurrency = Annotated[str | None, AfterValidator(_normalize_optional_currency)]
+#: Blank means "not asserted"; anything else must be a real ISO 4217 shape.
+#: `max_length=3` alone accepted `""`, `"e"` and `"us"`, and a memo stamped
+#: with a code no invoice carries can never pass the currency guard on either
+#: application path — it is born unappliable. Blank stays the "resolve it for
+#: me" signal `api/credit_memos.create_credit_memo` documents.
+OptionalMemoCurrency = CurrencyCodeOrUnset
 #: A NOT NULL column's PATCH type: shape-checked, never blank.
-MemoCurrency = Annotated[str, AfterValidator(normalize_iso_currency)]
+MemoCurrency = CurrencyCode
 
 
 class CreditMemoCreate(BaseModel):
@@ -100,8 +92,25 @@ class CreditMemoResponse(BaseModel):
     created_at: str
 
 
+class CreditMemoActions(BaseModel):
+    """The caller's verdict on a memo's three row actions, each the coded
+    refusal the endpoint would answer with or ``None`` — from the endpoints' own
+    gates (``api/credit_memos.memo_action_refusals``, issue #575). Required,
+    not defaulted: a ``None`` nobody computed would read as "allowed"."""
+
+    apply: CodedRefusal | None
+    edit: CodedRefusal | None
+    void: CodedRefusal | None
+
+
+class CreditMemoListItem(CreditMemoResponse):
+    """A list row plus the caller's verdict on its three actions."""
+
+    actions: CreditMemoActions
+
+
 class CreditMemoListResponse(PageMeta):
-    items: list[CreditMemoResponse]
+    items: list[CreditMemoListItem]
     total: int
 
 
@@ -132,7 +141,9 @@ class EligibleInvoiceResponse(BaseModel):
     status: str
     due_date: str | None = None
     amount: MoneyAmount
-    currency: str
+    # `None` = the invoice records no currency; the picker offers it to a memo of
+    # any currency, as `eligible_invoices_query` does.
+    currency: str | None
     # `amount` minus every credit already APPLIED to the invoice — the figure
     # the over-application guard on both application paths compares against.
     creditable_balance: MoneyAmount

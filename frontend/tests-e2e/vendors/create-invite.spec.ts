@@ -23,9 +23,12 @@ test.describe('/vendors create + portal invite (acme admin)', () => {
 
 		try {
 			await page.goto('/vendors');
+			// Exact: the vendor this test creates is named "E2E New Vendor …", so
+			// its row's "Open vendor …" button also contains "New Vendor".
+			const newVendor = page.getByRole('button', { name: '+ New Vendor', exact: true });
 
 			// --- Create ---
-			await page.getByRole('button', { name: 'New Vendor' }).click();
+			await newVendor.click();
 			const createModal = page.getByRole('dialog', { name: 'Create vendor' });
 			await expect(createModal).toBeVisible();
 			// Labels carry a trailing " *" for required fields, so match non-exact.
@@ -39,9 +42,23 @@ test.describe('/vendors create + portal invite (acme admin)', () => {
 			vendorId = (await (await createResp).json()).id as string;
 			expect(vendorId).toBeTruthy();
 
-			// Find it by name. The list is name-ordered and paged, so on a tenant
-			// with more than a page of vendors a new one can sort past page one
-			// (tracked in docs/followups.md); this spec is about the invite.
+			// A create ends on the new vendor's detail (decisions §416): the list
+			// is name-ordered and paged, so on a well-used tenant the new row can
+			// sort past page one and the detail is the proof it was saved.
+			await expect(createModal).toHaveCount(0);
+			const detail = page.getByRole('dialog', { name: 'Vendor screening and risk' });
+			await expect(detail).toBeVisible();
+			await expect(detail.getByRole('heading', { name: vendorName, exact: true })).toBeVisible();
+			// Focus moved into the detail, and closing it hands focus back to the
+			// "+ New Vendor" trigger, not to <body> (WCAG 2.4.3).
+			await expect
+				.poll(() => detail.evaluate((el) => el.contains(document.activeElement)))
+				.toBe(true);
+			await page.keyboard.press('Escape');
+			await expect(detail).toHaveCount(0);
+			await expect(newVendor).toBeFocused();
+
+			// Find its row by name for the invite (it may sit past page one).
 			await page.goto(`/vendors?search=${encodeURIComponent(vendorName)}`);
 			const row = page.locator('table tbody tr', { hasText: vendorName });
 			await expect(row).toHaveCount(1, { timeout: 10_000 });
@@ -63,12 +80,12 @@ test.describe('/vendors create + portal invite (acme admin)', () => {
 			await inviteModal.getByRole('button', { name: 'Send invite' }).click();
 			expect((await inviteResp).status()).toBe(201);
 
-			// The confirmation names the address the credential was emailed to —
-			// and carries NO password. The temp password is delivered only by the
-			// email adapter now: returning it to the caller (who also chose the
+			// The confirmation names the address the set-password link was emailed
+			// to — and carries NO credential. The link is delivered only by the
+			// email adapter: returning a credential to the caller (who also chose the
 			// address) let one ap_manager mint a supplier login they controlled,
 			// which is the first link of the BEC bank-redirect chain the approval
-			// segregation check now refuses. If a password ever reappears in this
+			// segregation check now refuses. If a credential ever reappears in this
 			// dialog, that hole is back.
 			const sent = page.getByTestId('vendor-invite-sent');
 			await expect(sent).toBeVisible({ timeout: 10_000 });

@@ -8,6 +8,10 @@
 	import { hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
+	import type { Snippet } from 'svelte';
+
+	let { children }: { children: Snippet } = $props();
+
 	// Tri-state: `undefined` until the browser resolves it, then true/false.
 	// "Does this host carry a tenant", NOT "what is its slug" — a white-label
 	// vanity host has a tenant but no slug in the URL (the backend resolves it
@@ -36,8 +40,20 @@
 		// link. The URL token is the credential — vendors don't need a
 		// portal login to use it. Skip the auth redirect for this path.
 		const isPublicCardReveal = path.startsWith('/portal/cards/');
+		// `/portal/reset-password` is where the AP team's invite and reset
+		// links land; the supplier has no password yet, so it must be reachable
+		// signed out (the link's token is the credential).
+		const isSetPasswordLink = path === '/portal/reset-password';
+		// `/portal/forgot-password` is where a signed-out supplier asks for one.
+		const isForgotPassword = path === '/portal/forgot-password';
 
-		if (!portalAuth.loggedIn && path !== '/portal/login' && !isPublicCardReveal) {
+		if (
+			!portalAuth.loggedIn &&
+			path !== '/portal/login' &&
+			!isPublicCardReveal &&
+			!isSetPasswordLink &&
+			!isForgotPassword
+		) {
 			goto('/portal/login');
 			return;
 		}
@@ -69,10 +85,10 @@
 	<div class="no-tenant">
 		<p>{m('portal.shell.noTenant')}</p>
 	</div>
-{:else if page.url.pathname === '/portal/login' || page.url.pathname === '/portal/change-password' || page.url.pathname.startsWith('/portal/cards/')}
+{:else if page.url.pathname === '/portal/login' || page.url.pathname === '/portal/change-password' || page.url.pathname === '/portal/reset-password' || page.url.pathname === '/portal/forgot-password' || page.url.pathname.startsWith('/portal/cards/')}
 	<div class="portal-shell">
 		<div class="portal-standalone">
-			<slot />
+			{@render children()}
 		</div>
 		<!--
 			The legal links belong on the SIGNED-OUT surfaces too, and this is the
@@ -169,7 +185,7 @@
 			</div>
 		</header>
 		<main id="main-content" tabindex="-1" class="portal-main">
-			<slot />
+			{@render children()}
 		</main>
 		<!--
 			The footer now always renders, because two of its links are ours and
@@ -224,10 +240,14 @@
 		flex: 1;
 	}
 
+	/* Wraps rather than overflows: seven nav links plus the brand and the
+	   user block are far wider than a phone, and a no-wrap row pushed Log out
+	   off-screen at 390px (WCAG 1.4.10 Reflow). No breakpoint needed. */
 	.portal-header {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
-		gap: 24px;
+		gap: 12px 24px;
 		padding: 12px 24px;
 		background: var(--surface);
 		border-bottom: 1px solid var(--border);
@@ -271,9 +291,9 @@
 
 	nav {
 		display: flex;
-		gap: 16px;
-		flex: 1;
-		margin-left: 24px;
+		flex-wrap: wrap;
+		gap: 4px 16px;
+		flex: 1 1 auto;
 	}
 
 	nav a {

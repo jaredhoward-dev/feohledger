@@ -12,6 +12,7 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import {
@@ -45,9 +46,9 @@
 	// $derived so the column headers re-render when the locale changes.
 	let COLUMNS = $derived([
 		{ label: m('admin.entities.col.name') },
-		{ label: m('admin.entities.col.slug') },
-		{ label: m('admin.entities.col.currency') },
-		{ label: m('admin.entities.col.status') },
+		{ label: m('admin.entities.col.slug'), class: 'col-slug' },
+		{ label: m('admin.entities.col.currency'), class: 'col-currency' },
+		{ label: m('admin.entities.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -78,6 +79,10 @@
 
 	// Make-default row action (armed two-click, mirroring the api-keys revoke).
 	let confirmDefaultId = $state<string | null>(null);
+	// The entity whose make-default is in flight. Its button goes `busy` — the
+	// armed button stays pressable otherwise and a third click sends the request
+	// twice — and the other rows' make-default is disabled until it settles.
+	let settingDefaultId = $state<string | null>(null);
 
 	/** Auto-suggest a slug while the admin types a name, until they edit the
 	 *  slug themselves — then leave their value alone. */
@@ -182,6 +187,8 @@
 	}
 
 	async function handleSetDefault(id: string) {
+		if (settingDefaultId) return;
+		settingDefaultId = id;
 		try {
 			await setDefaultEntity(id);
 			toast(m('admin.entities.toast.defaultChanged'), 'success');
@@ -194,6 +201,7 @@
 			);
 		} finally {
 			confirmDefaultId = null;
+			settingDefaultId = null;
 		}
 	}
 
@@ -223,15 +231,22 @@
 		<PlanUpgradeNotice feature={FEATURE_MULTI_ENTITY} testId="entities-plan-upgrade" />
 	{/if}
 
-	{#if loading}
-		<p class="state" data-testid="entities-loading">{m('admin.entities.loading')}</p>
-	{:else if error}
-		<div class="state error" data-testid="entities-error" role="alert">
-			<p>{error}</p>
-			<button type="button" class="btn-cancel" onclick={load}>{m('admin.entities.retry')}</button>
-		</div>
+	<!-- The table is mounted from first paint with its own "Loading…" row: a
+	     separate loading block swapped for the table moved the page when the
+	     entities landed, and `fixed` plus the header widths below keep the
+	     columns from re-sizing against the real rows (frontend/docs/
+	     ui-patterns.md § Data tables; tests-e2e/reactivity/layout-stability.spec.ts). -->
+	{#if error}
+		<LoadError message={error} onretry={load} testId="entities-error" />
 	{:else}
-		<DataTable columns={COLUMNS} isEmpty={entities.length === 0} empty={m('admin.entities.empty')}>
+		<div class="entities-table">
+		<DataTable
+			columns={COLUMNS}
+			fixed
+			{loading}
+			isEmpty={entities.length === 0}
+			empty={m('admin.entities.empty')}
+		>
 			{#snippet body()}
 				{#each entities as entity (entity.id)}
 					<tr
@@ -251,7 +266,7 @@
 								{entity.name}
 							</RowLink>
 						</td>
-						<td class="mono">{entity.slug}</td>
+						<td class="mono slug-cell" title={entity.slug}>{entity.slug}</td>
 						<td>{entity.currency ?? m('admin.entities.currencyInherited')}</td>
 						<td class="status-col">
 							<span class="status-pills">
@@ -269,6 +284,15 @@
 							{#if !entity.is_default}
 								<RowAction
 									armed={confirmDefaultId === entity.id}
+									busy={settingDefaultId === entity.id}
+									disabled={settingDefaultId !== null && settingDefaultId !== entity.id}
+									ariaLabel={m('common.rowActionAria', {
+										action:
+											confirmDefaultId === entity.id
+												? m('admin.entities.row.confirm')
+												: m('admin.entities.row.makeDefault'),
+										name: entity.name
+									})}
 									onclick={(e) => {
 										e.stopPropagation();
 										if (confirmDefaultId === entity.id) {
@@ -288,6 +312,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 	{/if}
 </PageHeader>
 
@@ -433,6 +458,27 @@
 </Modal>
 
 <style>
+	/* Column widths for the `fixed` entity table: slug, currency, the status
+	   pills (Default + Active) and Make default are sized to their widest
+	   content in any locale (fr "Devise de reporting", es "Predeterminada" +
+	   "Inactiva", es "Definir como predeterminada"); Name takes the rest, and the `min-width` keeps it readable
+	   (past it the table scrolls inside its region). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under this
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.entities-table {
+		min-width: 0;
+	}
+	.slug-cell {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.entities-table :global(table) { min-width: 1060px; }
+	.entities-table :global(th.col-slug) { width: 180px; }
+	.entities-table :global(th.col-currency) { width: 180px; }
+	.entities-table :global(th.col-status) { width: 240px; }
+	.entities-table :global(th.actions-col) { width: 260px; }
+
 	.page-hint {
 		margin: 0;
 		color: var(--text-muted);
@@ -446,7 +492,7 @@
 	}
 
 	.state.error {
-		color: #f06464;
+		color: var(--danger);
 	}
 
 	.mono {

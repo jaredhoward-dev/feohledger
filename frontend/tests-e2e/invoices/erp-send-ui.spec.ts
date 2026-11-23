@@ -12,8 +12,8 @@ import {
  * API-level lifecycle spec doesn't cover.
  *
  * Regression: an approved invoice is financially frozen server-side — a
- * `PATCH /api/invoices/{id}` that touches any `_FINANCIALLY_LOCKED_STATUSES`
- * financial field (amount / tax_rate / …) 409s. The modal's submit handler
+ * `PATCH /api/invoices/{id}` that touches any financial field (amount /
+ * tax_rate / …) of a financially locked invoice 409s. The modal's submit handler
  * (`submitDone`) pre-saved the WHOLE field set — including the frozen `amount`
  * — before calling `/complete`, so on an approved invoice the pre-save 409'd
  * and the "Send to ERP" click silently did nothing (the invoice never left
@@ -25,11 +25,14 @@ import {
 
 type Inv = { id: string; invoice_number: string; status: string };
 
+// Not a round figure: `round_amount` (>= 1000, a multiple of 100) opens a
+// `fraud_flag`, and an open fraud flag refuses the ERP send (decisions §286).
+
 async function createNewInvoice(page: import('@playwright/test').Page): Promise<Inv> {
 	const unique = `E2E-ERPUI-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
 	const resp = await page.request.post(`${API_BASE}/api/invoices`, {
 		headers: await authedTenantHeaders(page),
-		data: { invoice_number: unique, vendor: 'ERP UI Vendor', amount: '1500.00', currency: 'USD', status: 'new' }
+		data: { invoice_number: unique, vendor: 'ERP UI Vendor', amount: '1534.21', currency: 'USD', status: 'new' }
 	});
 	if (resp.status() !== 201) throw new Error(`create failed (${resp.status()}): ${await resp.text()}`);
 	return (await resp.json()) as Inv;

@@ -9,10 +9,18 @@ discovery document. Tenant-scoped config lives on Organization.settings.sso:
       "provider": "okta" | "entra" | "oidc",     # label only, drives UI copy
       "discovery_url": "https://<tenant>.okta.com/.well-known/openid-configuration",
       "client_id": "...",
-      "client_secret": "...",                    # encrypted at rest via pg
+      "client_secret_configured": true,          # the secret itself is sealed
       "scim_bearer_hash": "<sha256 hex>",        # per-tenant SCIM API token
       "allowed_email_domains": ["acme.com"]      # optional JIT allowlist
     }
+
+The OIDC client secret is not in this block. It is sealed in
+``provider_credentials`` (block ``sso``, ``services/provider_credentials``),
+written only by ``PUT /api/organization/sso`` and opened only by the OIDC
+callback (:func:`load_client_secret`). The block carries a boolean marker,
+``client_secret_configured``, written by that same endpoint in the same
+transaction, so the completeness check that runs on every password sign-in
+(:func:`is_sso_only`) stays local and sync and never unseals anything.
 """
 
 from __future__ import annotations
@@ -39,7 +47,12 @@ from app.config import settings
 from app.redis import get_redis
 from app.schemas.organization import looks_like_http_url
 from app.tenant import resolve_tenant_slug_by_custom_domain
-from app.utils.url_safety import UnsafeUrlError, assert_public_url_async
+from app.utils.url_safety import (
+    UnsafeUrlError,
+    assert_public_url_async,
+    pinned_async_client,
+    resolve_public_addresses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +104,12 @@ class SSOValidationError(ValueError):
 
 @dataclass
 class ResolvedSSOConfig:
+    """The OIDC block's configuration. The client secret is not here: it is
+    sealed, and only the callback opens it (:func:`load_client_secret`)."""
+
     provider: str
     discovery_url: str
     client_id: str
-    client_secret: str
     allowed_email_domains: list[str]
 
 
@@ -104,8 +119,13 @@ class ResolvedSSOConfig:
 # return None for the other protocol so neither can be driven by the wrong one.
 SAML_PROTOCOL = "saml"
 
-# The keys each protocol's IdP block cannot resolve without.
-OIDC_REQUIRED_FIELDS = ("discovery_url", "client_id", "client_secret")
+# The keys each protocol's IdP block cannot resolve without. OIDC also needs
+# its client secret, which is sealed: the block records that one is stored
+# with this marker (see the module docstring), and a missing marker is
+# reported under the name the admin knows, `client_secret`.
+OIDC_REQUIRED_FIELDS = ("discovery_url", "client_id")
+CLIENT_SECRET_FIELD = "client_secret"
+CLIENT_SECRET_MARKER = "client_secret_configured"
 SAML_REQUIRED_FIELDS = ("idp_entity_id", "idp_sso_url", "idp_x509_cert")
 
 
@@ -329,6 +349,28 @@ async def _assert_sso_url_public(url: str, *, what: str, error: type[ValueError]
         )
 
 
+def _sso_http_client(*, what: str, error: type[ValueError], timeout: float) -> httpx.AsyncClient:
+    """The client for an IdP fetch: pinned to the address it vets at connect.
+
+    `_assert_sso_url_public` alone checks one lookup and httpx then makes its
+    own, so a rebinding record could pass the check and still hand the token
+    exchange (client secret + authorization code) to an internal host. The
+    pinned client re-vets in the connect and dials the vetted IP. Same
+    environment rule as the check: outside a deployed environment loopback is
+    allowed (local Keycloak), though the connection is still pinned.
+    """
+    allow_private = not settings.is_deployed
+
+    async def resolve(host: str, port: int) -> list[str]:
+        try:
+            return await resolve_public_addresses(host, port, allow_private=allow_private)
+        except UnsafeUrlError as exc:
+            logger.warning("SSO %s resolved to a non-public address at connect; refusing", what)
+            raise error(f"SSO {what} must be a publicly routable http(s) URL.") from exc
+
+    return pinned_async_client(resolve=resolve, timeout=timeout)
+
+
 def _pinned_endpoint(discovery_doc: dict, key: str) -> str:
     """Return `discovery_doc[key]`, pinned to the document's own issuer host.
 
@@ -376,15 +418,45 @@ def resolve_sso_config(org_settings: Mapping[str, Any] | None) -> ResolvedSSOCon
     if _settings_protocol(sso) == SAML_PROTOCOL:
         # SAML tenant — resolved via resolve_saml_config, not the OIDC path.
         return None
-    discovery, client_id, client_secret = _required_text(sso, OIDC_REQUIRED_FIELDS)
+    missing = [
+        name
+        for name in OIDC_REQUIRED_FIELDS
+        if not (isinstance(sso.get(name), str) and sso.get(name).strip())
+    ]
+    # Only a literal `true` counts: the marker is written by the one endpoint
+    # that seals the secret, and a stray plaintext `client_secret` in the
+    # block is never read (the sealed store is the only source).
+    if sso.get(CLIENT_SECRET_MARKER) is not True:
+        missing.append(CLIENT_SECRET_FIELD)
+    if missing:
+        raise SSOConfigError(
+            f"SSO is enabled but these keys are missing, blank or not text: {', '.join(missing)}.",
+            fields=tuple(missing),
+        )
+    discovery, client_id = (sso[name] for name in OIDC_REQUIRED_FIELDS)
     _assert_sso_url_shape(discovery, what="discovery_url")
     return ResolvedSSOConfig(
         provider=_optional_text(sso, "provider", "oidc"),
         discovery_url=discovery,
         client_id=client_id,
-        client_secret=client_secret,
         allowed_email_domains=_email_domains(sso),
     )
+
+
+async def load_client_secret(org_id, *, db: AsyncSession | None = None) -> str | None:
+    """The tenant's sealed OIDC client secret, or ``None`` when none is stored.
+
+    THE read path for it — the callback's code exchange is its only caller, and
+    it runs only after a single-use ``state`` this server minted has been
+    consumed, so an unauthenticated request cannot make the server unseal.
+    Raises ``credential_crypto.CredentialCryptoError`` when the store cannot
+    open it; the caller fails the sign-in closed. Never logged.
+    """
+    from app.services import provider_credentials
+
+    secrets = await provider_credentials.load_secrets(org_id, "sso", db=db)
+    value = secrets.get(CLIENT_SECRET_FIELD)
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _brand_sso_callback_base(org_settings: Mapping[str, Any] | None) -> str:
@@ -599,7 +671,7 @@ async def fetch_discovery(discovery_url: str) -> dict[str, Any]:
     if cached:
         return json.loads(cached)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with _sso_http_client(what="discovery_url", error=SSOConfigError, timeout=10.0) as client:
         resp = await client.get(discovery_url)
         resp.raise_for_status()
         doc = resp.json()
@@ -623,7 +695,7 @@ async def fetch_jwks(jwks_uri: str) -> dict[str, Any]:
     if cached:
         return json.loads(cached)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with _sso_http_client(what="jwks_uri", error=SSOValidationError, timeout=10.0) as client:
         resp = await client.get(jwks_uri)
         resp.raise_for_status()
         jwks = resp.json()
@@ -718,6 +790,24 @@ async def create_saml_handoff(
     return code
 
 
+async def create_saml_refusal_handoff(refusal: str, tenant_slug: str) -> str:
+    """Park a refusal the ACS decided behind the same one-time code shape, so
+    the browser lands on the SPA bridge (which can state it, localized) rather
+    than on the ACS's raw JSON. `/exchange` answers the code with the coded
+    refusal and no token. Same TTL, prefix and single-use consume as a token
+    handoff — the bridge cannot tell them apart until it exchanges.
+
+    `refusal` is a code from `api/refusals.py` (every ACS refusal once the
+    tenant is known comes through here, decisions §359) — never a reason
+    string, never anything from the assertion: the record holds the code and
+    the tenant slug, nothing else."""
+    code = secrets.token_urlsafe(32)
+    r = await get_redis()
+    payload = json.dumps({"refusal": refusal, "tenant": tenant_slug})
+    await r.setex(f"{SAML_HANDOFF_PREFIX}{code}", settings.saml_handoff_ttl_seconds, payload)
+    return code
+
+
 async def consume_saml_handoff(code: str) -> dict[str, Any]:
     """Look up + delete the handoff record (single-use). Raises if expired."""
     r = await get_redis()
@@ -779,7 +869,9 @@ async def exchange_code_for_tokens(
     """
     token_endpoint = _pinned_endpoint(discovery_doc, "token_endpoint")
     await _assert_sso_url_public(token_endpoint, what="token_endpoint", error=SSOValidationError)
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with _sso_http_client(
+        what="token_endpoint", error=SSOValidationError, timeout=15.0
+    ) as client:
         resp = await client.post(
             token_endpoint,
             data={

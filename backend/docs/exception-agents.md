@@ -165,9 +165,11 @@ that follows does.
 ### The agent inherits the queue's segregation rule
 
 Clearing a payment-**blocking** exception (`duplicate` / `fraud_flag` /
-`line_total_mismatch` / `payment_reconciliation`) is what lets a payment run pay
-the invoice, and it is refused for an actor implicated in that payable or
-recorded as having raised the flag — see
+`line_total_mismatch` / `payment_reconciliation` / `quality_hold` /
+`po_mismatch`) is what lets a payment run pay the invoice, and it is refused for
+an actor implicated in that payable, recorded as having raised the flag, or —
+on a `po_mismatch` / `quality_hold` — one of the invoice's approvers
+(decisions §420) — see
 [`docs/authentication.md`](../../docs/authentication.md) § Segregation of duties
 on the exception queue.
 
@@ -193,7 +195,27 @@ so an org that disabled the control does not find the agent still refusing.
 resolvers** (amount-within-tolerance, missing-PO, multi-PO split). They joined the
 gate when `po_mismatch` became payment-blocking, so a run the invoice's uploader
 triggers escalates rather than clearing their own PO variance
-(`test_a_po_mismatch_agent_run_triggered_by_the_uploader_escalates`). `duplicate`
+(`test_a_po_mismatch_agent_run_triggered_by_the_uploader_escalates`), and so does
+one its approver triggers
+(`test_a_po_mismatch_agent_run_triggered_by_its_approver_escalates`). Those
+resolvers approve the invoice on the triggering human's behalf before the row is
+resolved, so the approver axis is judged against who had approved **before** the
+run: the coordinator reads `approval_chain.approver_ids` ahead of `apply` and
+passes the same set to `record_decision` (`approvers=`). The run's own approval
+does not refuse its own resolve, which rests on the re-match no longer finding
+the mismatch (`decision.refound`) and on no implicated receipt lifting the hold
+(`_receipts_implicated`), not on the human's word
+(`test_the_approval_an_agent_run_gives_does_not_refuse_its_own_resolve`). An
+apply that leaves the invoice `approved` with the cumulative PO over-billing
+warning (`po_billed_beyond_total`, decisions §469, or
+`po_billed_beyond_receipt`, §470) unwinds and escalates too
+(`_POOverbilled`): that warning raises no hold, and an agent's approval is no
+person reading it. The
+approval's re-judge of cleared holds (decisions §422) does not undo it either:
+the row being decided is still open when `apply` approves, so nothing is
+re-raised beside it, and the re-judge runs no detector that could mark it
+`refound`
+(`test_the_re_judge_does_not_undo_an_agents_own_resolve`). `duplicate`
 and `fraud_flag` are escalate-only stubs (§ Deferred) and the remaining blocking
 types have no resolver at all. That is why
 `tests/test_exception_agent_queue_segregation.py` also registers a probe resolver
@@ -323,7 +345,7 @@ that approve ran the invoice through the **platform** defaults:
 
 * a fraud rule the tenant had explicitly **disabled** still opened a
   payment-BLOCKING `fraud_flag` (`duplicate` / `fraud_flag` /
-  `line_total_mismatch` are in `api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`),
+  `line_total_mismatch` are in `services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`),
   so the agent's own "resolution" refused the invoice's next payment run; and
 * a stricter-than-default per-vendor / per-commodity PO tolerance
   (`settings.matching.vendor_rules`) was **erased** from `invoice.po_match` by
@@ -411,6 +433,11 @@ rather than escalating a blank.
   PO total and so legitimately gates on it; this matches `multi_po_split_v1`). The
   gate is also checked **before** any `po_number`/`po_match` mutation, so an
   escalation never leaves a half-applied PO link in the committed state.
+  **The payee of an invoice approved once is never the agent's** (decisions
+  §379): where filling the empty `vendor_id` would set it on an invoice that
+  was ever approved (a recalled one, back in review with its stamps), `apply`
+  escalates before any mutation (`amount_mismatch.PayeeFixedByApproval`, raised
+  by `refuse_payee_change_after_approval`, which `multi_po_split_v1` asks too).
   Idempotent: a re-run after the link finds the live match no longer `no_po` and
   bails, and the coordinator's exception row-lock already prevents a second
   decision on a resolved exception. Writes the two audit rows (`invoice.approved`
@@ -466,11 +493,18 @@ or three POs. This is the deferred *"Multi-PO split matching"* follow-up to
   CFO / maximum gate exactly as the single-PO resolvers (the gate is on the
   **invoice** amount, which never changes — the combined PO total is informational),
   sets `invoice.po_number` to a combined `"PO-A,PO-B"` reference + aligns
-  `vendor_id`, and writes a **multi-PO match snapshot** onto `invoice.po_match`
-  (`match_type: "multi-po-split"`, the PO ids/numbers + combined total) for the
-  modal. The single-PO matcher can't produce a `matched` for a split, so the
-  snapshot is written **directly** — `refresh_warnings` is deliberately **not**
-  called (it would re-run the single-PO matcher and re-raise a `no_po` exception).
+  `vendor_id` (escalating instead when that would set the payee of an invoice
+  ever approved, as `missing_po_v1` does), records the set in
+  **`invoice.split_po_ids`** (append only; its one writer; the approval door's
+  receiver / inspector sets read the split's POs from it, decisions §433), then
+  re-matches through `refresh_warnings` as `missing_po_v1` does. The matcher
+  reads a split from its legs while the reference names them
+  (`po-matching.md` § A multi-PO split is matched against its legs), so the
+  `po_match` it writes is the matcher's own — the same one every later refresh
+  writes, which no longer re-raises `no_po`. The agent goes on only if that
+  re-match is a clean `matched`, in the invoice's currency, read as the split it
+  linked; anything else (a leg short-received, a failed inspection) escalates,
+  and the link unwinds with the savepoint.
   It then approves through `review.approve_invoice` (with the triggering user's real `actor_roles`).
   **It NEVER adjusts the invoice amount** — the sum only *selects* the set; the
   amount is left exactly as-is, so the invoice is approved at its own face value.

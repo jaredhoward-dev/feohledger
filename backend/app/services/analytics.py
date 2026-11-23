@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
+from app.models.invoice_status import OPEN_AP_STATUSES as _OPEN_AP_STATUS_MEMBERS
+from app.models.invoice_status import SETTLED_STATUSES as _SETTLED_STATUS_MEMBERS
 from app.utils.dates import utc_today
 
 # Canonical "open accounts-payable" invoice-status set — an approved liability
@@ -57,15 +59,9 @@ from app.utils.dates import utc_today
 # the aging bands always sum to the AP balance. Kept here (pure, IO-free module)
 # so the API layer, the dashboard, and the scheduled-report runner import the
 # same tuple instead of maintaining drifting copies (the F-4 root cause). Values
-# are the `InvoiceStatus` enum's `.value` strings — stated literally to keep this
-# module free of an ORM-model import.
-OPEN_AP_STATUSES: tuple[str, ...] = (
-    "approved",
-    "sending_to_erp",
-    "sent_to_erp",
-    "posted_in_erp",
-    "payment_scheduled",
-)
+# are the `InvoiceStatus` enum's `.value` strings, derived from the one set in
+# `models/invoice_status` rather than listed here a second time.
+OPEN_AP_STATUSES: tuple[str, ...] = tuple(s.value for s in _OPEN_AP_STATUS_MEMBERS)
 
 
 @dataclass(frozen=True)
@@ -451,7 +447,7 @@ def compute_discount_capture(invoice_rows: list) -> DiscountCaptureMetrics:
 #: into. Exhaustive and mutually exclusive: captured (paid inside the discount
 #: window), missed (the window closed unused), pending (still capturable — no
 #: deadline, or one that has not passed). Named here because the SQL ``CASE``
-#: in ``api/dashboard`` emits these exact strings and
+#: in ``services/dashboard_metrics.discount_capture`` emits these exact strings and
 #: ``discount_capture_from_grouped_rows`` reads them back.
 DISCOUNT_CAPTURE_BUCKETS = ("captured", "missed", "pending")
 
@@ -564,13 +560,10 @@ def discount_capture_from_grouped_rows(groups: list[dict]) -> DiscountCaptureMet
 # every `VALID_TRANSITIONS` edge into them originates at `approved`, and every
 # writer of `approved` stamps `Invoice.approval_date`. Status alone is proof
 # here, so no extra evidence is needed.
-TOUCHLESS_CLEARED_STATUSES: tuple[str, ...] = (
-    "approved",
-    "sending_to_erp",
-    "sent_to_erp",
-    "posted_in_erp",
-    "payment_scheduled",
-)
+#
+# That is exactly the open-AP set — approved and not yet paid or closed — so it
+# is named by it rather than listed a second time (issue #575).
+TOUCHLESS_CLEARED_STATUSES: tuple[str, ...] = OPEN_AP_STATUSES
 
 # Statuses reachable EITHER through review or around it — status alone proves
 # nothing, so these are in the cleared leg only with the approval stamp:
@@ -580,7 +573,13 @@ TOUCHLESS_CLEARED_STATUSES: tuple[str, ...] = (
 #              `sending_to_erp` (approved, then the ERP export blew up).
 # The durable `Invoice.approval_date` stamp (written on every approval path,
 # never cleared) is the evidence; an unstamped row is out of the population.
-TOUCHLESS_REVIEW_EVIDENCE_STATUSES: tuple[str, ...] = ("done", "paid", "failed")
+# That is the settled set (`models/invoice_status.SETTLED_STATUSES`) plus
+# `failed`: everything approval reaches beyond open AP, and the one status
+# reachable from both sides of review.
+TOUCHLESS_REVIEW_EVIDENCE_STATUSES: tuple[str, ...] = (
+    *(s.value for s in _SETTLED_STATUS_MEMBERS),
+    "failed",
+)
 
 # Review finished and the invoice did NOT clear — denominator only. A rejection
 # is a person's decision by construction, so it can never be touchless.
@@ -1061,9 +1060,17 @@ def compute_forecast_variance(
 #
 # A "commitment row" is a dict with:
 #   {"due_date": date, "amount": Decimal, "committed": bool,
+#    "overdue": bool (optional, default False),
 #    "discount_date": date | None, "discount_percent": Decimal | None}
 # `committed` distinguishes firm commitments (approved → payment_scheduled)
 # from the still-in-flight pipeline (new / pending / ready_for_review).
+# `overdue` marks a row already past due on the day the rows were read
+# (`ap_commitments.commitment_rows`): it is timed on `today`, in the first
+# period, and reported on its own `overdue_amount` / `overdue_count` rather
+# than inside `committed_amount` / `pending_amount`. It is an explicit flag,
+# not "`due_date` < `today`", because `bucket_outflows` also buckets
+# historical rows that are not obligations at all (the plan-vs-actual side
+# buckets settled payments by their completion date).
 
 _CENTS = Decimal("0.01")
 
@@ -1128,13 +1135,24 @@ def bucket_outflows(rows: list[dict], *, granularity: str = "week", today=None) 
     ``period``:
 
         {period, period_start, period_end, scheduled_amount,
-         committed_amount, pending_amount, discount_eligible_amount,
-         count, unconverted_count}
+         committed_amount, pending_amount, overdue_amount,
+         discount_eligible_amount, count, overdue_count, unconverted_count}
+
+    A row flagged ``overdue`` (already past due when the rows were read) is
+    timed on ``today`` — the money is owed now and cannot leave in the past —
+    so it lands in the period containing ``today``, the forecast's first.
+    It counts toward ``scheduled_amount`` (the period's whole outflow, which
+    the cash-position curve subtracts) and ``count``, and toward
+    ``overdue_amount`` / ``overdue_count`` INSTEAD of ``committed_amount`` /
+    ``pending_amount``. So ``scheduled = committed + pending + overdue``, and
+    ``committed_amount`` keeps meaning "firm AP falling due in this period":
+    a reader is told that a thousand is already late rather than shown it
+    folded into a figure that implies it is on schedule.
 
     ``unconverted_count`` is how many of the period's rows arrived with a
     truthy ``unconverted`` flag — a foreign invoice whose reporting-currency
     figure could not be established, which
-    ``api/analytics.py::_commitment_rows`` includes at FACE VALUE rather than
+    ``services/ap_commitments.py::commitment_rows`` includes at FACE VALUE rather than
     dropping (dropping would understate the outflow). That face value is a
     different currency's number sitting in a reporting-currency total, so the
     count is what stops it being silent: a single unconverted ¥10,000,000
@@ -1144,8 +1162,9 @@ def bucket_outflows(rows: list[dict], *, granularity: str = "week", today=None) 
     module-header promise ("visible rather than silent") true.
 
     ``today`` does NOT filter which rows are bucketed — the API layer owns the
-    horizon window. It governs one thing: whether a row's early-pay discount is
-    still capturable (see ``discount_eligible_amount`` below). Defaults to the
+    horizon window. It governs two things: the period an ``overdue`` row is
+    timed into, and whether a row's early-pay discount is still capturable
+    (see ``discount_eligible_amount`` below). Defaults to the
     system date, mirroring ``apply_payment_timing_scenario``; every production
     caller passes it explicitly."""
     # UTC, not the host's local date: every other consumer of these rows
@@ -1158,7 +1177,10 @@ def bucket_outflows(rows: list[dict], *, granularity: str = "week", today=None) 
         due = r.get("due_date")
         if due is None:
             continue
-        key, start, end = _period_bounds(due, granularity)
+        overdue = bool(r.get("overdue"))
+        # An overdue row is owed now: it is timed on `today`, never on a date
+        # the forecast has already left behind (see the docstring).
+        key, start, end = _period_bounds(max(due, today) if overdue else due, granularity)
         amount = _row_amount(r)
         b = buckets.setdefault(
             key,
@@ -1169,13 +1191,18 @@ def bucket_outflows(rows: list[dict], *, granularity: str = "week", today=None) 
                 "scheduled_amount": Decimal("0"),
                 "committed_amount": Decimal("0"),
                 "pending_amount": Decimal("0"),
+                "overdue_amount": Decimal("0"),
                 "discount_eligible_amount": Decimal("0"),
                 "count": 0,
+                "overdue_count": 0,
                 "unconverted_count": 0,
             },
         )
         b["scheduled_amount"] += amount
-        if r.get("committed"):
+        if overdue:
+            b["overdue_amount"] += amount
+            b["overdue_count"] += 1
+        elif r.get("committed"):
             b["committed_amount"] += amount
         else:
             b["pending_amount"] += amount
@@ -1183,7 +1210,7 @@ def bucket_outflows(rows: list[dict], *, granularity: str = "week", today=None) 
         # still be paid early for a discount". An ELAPSED window can't be, so
         # counting it told a CFO to fund a run against savings that no longer
         # exist. The commitment rows this consumes are bounded on their DUE
-        # date only (`api/analytics._commitment_rows`), so an in-horizon
+        # date only (`ap_commitments.commitment_rows`), so an in-horizon
         # invoice on 2/10-net-60 terms routinely arrives with a `discount_date`
         # that passed weeks ago. Same rule the discount optimizer
         # (`discount_optimizer.optimize`: "capturable only while the deadline
@@ -1209,6 +1236,7 @@ def bucket_outflows(rows: list[dict], *, granularity: str = "week", today=None) 
                 "scheduled_amount": _q(b["scheduled_amount"]),
                 "committed_amount": _q(b["committed_amount"]),
                 "pending_amount": _q(b["pending_amount"]),
+                "overdue_amount": _q(b["overdue_amount"]),
                 "discount_eligible_amount": _q(b["discount_eligible_amount"]),
             }
         )
@@ -1235,9 +1263,15 @@ def apply_payment_timing_scenario(
     - ``late``    → pay ``due_date + grace_days``, full amount, no
       discount (you forfeit any early-pay discount by paying late).
 
+    A row flagged ``overdue`` is already past its due date, so no scenario may
+    time it in the past: ``on_time`` (and ``early``, whose window closed no
+    later than the due date) pays it ``today``, and ``late`` pays it at
+    ``max(due_date + grace_days, today)``. It keeps its ``overdue`` flag, so
+    each scenario's periods report it on ``overdue_amount`` too.
+
     The elapsed-window guard is load-bearing, not defensive coding. The
     commitment rows this consumes are bounded on their DUE date only (see
-    ``api/analytics.py::_commitment_rows``), so an in-horizon invoice on
+    ``services/ap_commitments.py::commitment_rows``), so an in-horizon invoice on
     ``2/10 net 60`` terms routinely arrives with a ``discount_date`` that
     passed weeks ago. Without the guard the ``early`` card claimed a
     discount nobody can still take, timed the outflow on a date in the
@@ -1290,6 +1324,10 @@ def apply_payment_timing_scenario(
         else:  # on_time, or early with no discount still available
             pay_date = due
             net, captured = amount, Decimal("0")
+        overdue = bool(r.get("overdue"))
+        if overdue:
+            # Already late: the earliest it can leave is today.
+            pay_date = max(pay_date, today)
 
         total_outflow += net
         total_discount += captured
@@ -1301,6 +1339,7 @@ def apply_payment_timing_scenario(
                 "due_date": pay_date,
                 "amount": net,
                 "committed": r.get("committed", False),
+                "overdue": overdue,
                 "discount_date": None,
                 "discount_percent": None,
                 # Re-timing doesn't make a row convertible — carry the flag so
@@ -1325,6 +1364,10 @@ def apply_payment_timing_scenario(
         # could not convert (see `bucket_outflows`). Comparing two scenarios'
         # totals is only meaningful once this is 0.
         "unconverted_count": sum(p["unconverted_count"] for p in periods),
+        # The slice of `total_outflow` that is already past due — the same in
+        # every scenario (re-timing cannot make a late invoice on time).
+        "overdue_amount": _q(sum((p["overdue_amount"] for p in periods), Decimal("0"))),
+        "overdue_count": sum(p["overdue_count"] for p in periods),
     }
 
 
@@ -1349,7 +1392,12 @@ def compute_cash_position(
     Returns one row per period::
 
         {period, period_start, period_end, opening, outflow, inflow,
-         closing, below_threshold, unconverted_count}
+         closing, below_threshold, overdue_amount, unconverted_count}
+
+    ``outflow`` is the period's ``scheduled_amount``, which INCLUDES any
+    overdue AP ``bucket_outflows`` timed into it; ``overdue_amount`` rides
+    through so a reader can see how much of the first period's drop is money
+    already late rather than money falling due.
 
     ``below_threshold`` is True iff a threshold is supplied and the
     period's closing balance falls below it.
@@ -1378,6 +1426,7 @@ def compute_cash_position(
                 "inflow": _q(inflow),
                 "closing": _q(closing),
                 "below_threshold": below,
+                "overdue_amount": _q(Decimal(str(p.get("overdue_amount", "0") or "0"))),
                 "unconverted_count": int(p.get("unconverted_count", 0) or 0),
             }
         )

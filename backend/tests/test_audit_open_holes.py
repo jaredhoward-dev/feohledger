@@ -187,18 +187,17 @@ async def _make_vendor(realdb, key: str, name: str) -> uuid.UUID:
 
 
 @pytest.mark.asyncio
-async def test_invite_portal_user_audits_without_the_email_or_temp_password(realdb, monkeypatch):
+async def test_invite_portal_user_audits_without_the_email_or_the_link(realdb, monkeypatch):
     """Minting a supplier credential is the provisioning half of the
     segregation-of-duties chain: this account can submit invoices and stage
     bank-detail changes. `vendor_user.deleted` already audited the revoke, so
     without this the trail recorded the end of a credential's life but not its
     start. The row names the actor, the vendor and the new VendorUser — never
-    the login address, and never the temp password.
+    the login address, and never the set-password link.
 
-    The password is read out of the DELIVERED EMAIL rather than the response:
-    the response no longer carries it at all (see
-    `test_vendor_bank_change_provisioner_sod.py`), and the audit row must stay
-    clear of the credential wherever it travelled.
+    The link is read out of the DELIVERED EMAIL rather than the response: the
+    response never carries it (see `test_vendor_bank_change_provisioner_sod.py`),
+    and the audit row must stay clear of the credential wherever it travelled.
     """
     vendor_id = await _make_vendor(realdb, "a", "Portal Invite Co")
     info = realdb.info("a")
@@ -221,11 +220,9 @@ async def test_invite_portal_user_audits_without_the_email_or_temp_password(real
     assert resp.status_code == 201, resp.text
     payload = resp.json()
     assert "temp_password" not in payload
-    temp_password = next(
-        line.split("Password:", 1)[1].strip()
-        for line in outbox[0].body_text.splitlines()
-        if line.strip().startswith("Password:")
-    )
+    from tests.set_password_mail import link_token
+
+    token = link_token(outbox[0])
     vendor_user_id = payload["user"]["id"]
 
     rows = await _audit_rows(realdb, "a", "vendor_user.invited")
@@ -237,7 +234,7 @@ async def test_invite_portal_user_audits_without_the_email_or_temp_password(real
     assert row.details == {"vendor_user_id": vendor_user_id}
 
     blob = _blob(row)
-    assert temp_password not in blob, "the temp password must never enter the audit trail"
+    assert token not in blob, "the set-password link must never enter the audit trail"
     assert supplier_email not in blob
     assert "Sam Supplier" not in blob
 
@@ -321,9 +318,9 @@ async def test_invoice_csv_import_audits_each_invoice_on_its_own_trail(realdb):
     from app.models.invoice import Invoice
 
     csv_text = (
-        "invoice_number,vendor_name,amount,status\n"
-        "INV-IMP-1,Historic Supplier,1250.00,paid\n"
-        "INV-IMP-2,Historic Supplier,90.00,new\n"
+        "invoice_number,vendor_name,amount,currency,status\n"
+        "INV-IMP-1,Historic Supplier,1250.00,USD,paid\n"
+        "INV-IMP-2,Historic Supplier,90.00,USD,new\n"
     )
     async with realdb.client(key="a") as client:
         resp = await client.post(
@@ -373,7 +370,8 @@ async def test_invoice_csv_import_audits_the_vendor_stub_it_mints(realdb):
             files={
                 "file": (
                     "invoices.csv",
-                    b"invoice_number,vendor_name,amount\nINV-STUB-1,Brand New Payee,10.00\n",
+                    b"invoice_number,vendor_name,amount,currency\n"
+                    b"INV-STUB-1,Brand New Payee,10.00,USD\n",
                     "text/csv",
                 )
             },
@@ -434,7 +432,12 @@ async def test_erp_vendor_sync_audits_create_update_and_link(realdb):
             actor_id=actor,
         )
         await s.commit()
-    assert result == {"created": 1, "updated": 1, "unchanged": 0}
+    assert {k: result[k] for k in ("created", "updated", "unchanged", "conflicts")} == {
+        "created": 1,
+        "updated": 1,
+        "unchanged": 0,
+        "conflicts": [],
+    }
 
     rows = await _audit_rows(realdb, "a", "vendor.synced_from_erp")
     assert {r.details["change"] for r in rows} == {"created", "linked"}

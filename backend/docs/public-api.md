@@ -85,7 +85,11 @@ another key, even within the same org). The cap is
 `FEOH_PUBLIC_API_RATE_LIMIT_PER_MINUTE` (default **120 req/min**) over a fixed
 **60-second** window. A key over its cap gets an
 **HTTP `429 Too Many Requests`** with a **`Retry-After`** header (seconds until
-the oldest in-window request ages out).
+the oldest in-window request ages out). The body is the limiter's coded refusal,
+the same on every surface it guards:
+`{"detail": {"code": "rate_limited", "message": "Too many requests. Please wait N seconds before trying again.", "params": {"retry_after_seconds": N}}}`
+— `N` is the header's figure. Back off on the header; key on `detail.code`,
+never on the message text.
 
 Ordering matters for non-enumeration: the limit is checked **after** the key
 authenticates, inside `get_api_key_principal` (just before the principal is
@@ -140,8 +144,11 @@ a key is gated too, since a key the plan cannot use would only 402 on every
 call (decisions §258). The refusal path
 stays exercisable locally instead of being something only a paying customer
 could ever hit. Move a tenant across the gate with
-`POST /api/billing/change-plan {"plan_code": "growth"}` (the `mock` billing
-adapter handles it with no Stripe key).
+`/billing` → Change plan → Growth → Confirm (the `mock` billing adapter handles
+it with no Stripe key; over the API it is `POST /api/billing/change-plan/preview
+{"plan_code": "growth"}`, then `POST /api/billing/change-plan` with that
+preview's `proration_date`, `amount_due` as `expected_amount_due`, and
+`currency` — decisions §482).
 
 Every `e2e<N>` Playwright worker tenant is on `scale` — see
 `docs/billing.md` § Which plan the seed lands each tenant on.
@@ -173,6 +180,12 @@ invariant).
 V1Invoice = { id, invoice_number, vendor_name, amount, currency,
               status, invoice_date, due_date, created_at }
 ```
+
+`currency` is an ISO 4217 code, or **`null` when the invoice records no
+currency** (an upload extraction has not read yet, or a document that names
+none). It is never filled with a default; treat `null` as "unknown", not USD.
+The `invoice.*` and `exception.raised` webhook payloads below carry the same
+nullable `currency`.
 
 ## Published OpenAPI spec
 
@@ -252,6 +265,16 @@ What the document carries:
   typed as a **string** (money-is-exact — exact arithmetic over JSON, no float),
   and the `status` / `page` / `page_size` pagination parameters on the list
   operation.
+- A `webhooks` section (OpenAPI 3.1) — the push half of the contract: one entry
+  per outbound event in `WEBHOOK_EVENT_TYPES`, its request body the signed
+  envelope (`id`, `type`, `created_at`, `organization_id`, `data`), its headers
+  (`X-Webhook-Signature`, `-Previous`, `-Event-Id`, `-Event-Type`), and `data`
+  a `$ref` to the event's component schema (`WebhookInvoiceData`,
+  `WebhookInvoiceApprovalRecalledData`, `WebhookExceptionData`). Those schemas
+  come from `app/schemas/webhook_events.py`, the same Pydantic models the
+  emitters build the payload through, so the published payload and the bytes a
+  receiver gets cannot drift; a type with no model fails the spec build. The
+  `/api/v1/docs` page lists them under **Webhooks** (decisions §414).
 
 The route mount is additive in `app/main.py` (`public_v1_openapi_router`); the
 generator is pure with respect to the app (reads routes, returns a fresh dict),
@@ -277,6 +300,12 @@ build against it safely:
   enum, or make an optional param required — those are breaking changes and
   require a new version. The `V1Invoice` schema is decoupled from the internal
   ORM precisely so an internal column change never silently alters the contract.
+- **Error bodies are not part of the field contract.** An error is identified by
+  its HTTP status, its standard headers (`Retry-After`, `WWW-Authenticate`) and,
+  where present, `detail.code`; `detail`'s English text and shape may change
+  within `v1`. Key on those, never on the message. (The 429 `detail` became the
+  coded `rate_limited` object in issue #635; its status and `Retry-After` did
+  not change.)
 - **Deprecation window.** When a version is slated for sunset, it is announced in
   this doc and (where applicable) flagged via the standard `Deprecation` /
   `Sunset` response headers and `deprecated: true` in the OpenAPI operation. A
@@ -346,9 +375,20 @@ gated on the `organizations` table existing — mirrors 0055).
 
 ### Event catalog
 
-`invoice.approved`, `payment.settled`, `exception.raised` (see
-`app/models/webhook.py::WEBHOOK_EVENT_TYPES`). The catalog is plain strings, so
-adding one needs no migration.
+`invoice.approved`, `invoice.approval_recalled`, `payment.settled`,
+`exception.raised` (see `app/models/webhook.py::WEBHOOK_EVENT_TYPES`). The
+catalog is plain strings, so adding one needs no migration — but it does need a
+`data` model and summary in `app/schemas/webhook_events.py` and an entry in the
+admin page's picker (`frontend/src/lib/types/webhooks.ts`);
+`tests/test_webhook_event_catalogue.py` fails until all three agree, and the
+published spec's `webhooks` section picks the new event up from the model.
+
+**`invoice.approval_recalled`** (decisions §374, §414) tells an integrator that
+an approval it may already have acted on — from `invoice.approved` — was taken
+back (`POST /api/invoices/{id}/recall-approval`). The invoice is back at
+`ready_for_review` and is not payable until it is approved again, which emits a
+fresh `invoice.approved`. A receiver that queued a bill or told the supplier it
+would be paid on the approval should undo that here.
 
 ### Signing
 
@@ -442,6 +482,23 @@ Re-emitting the SAME occurrence (same id) still collapses to one delivery — th
 is what makes a replay safe. `exception.raised` is unaffected: an exception row's
 id is already occurrence-unique, since a re-raised exception is a new row.
 
+`invoice.approval_recalled` carries the same invoice fields plus the status
+the approval was recalled from (`approved`, or `failed` for an approved
+invoice whose ERP push failed). It names no person (decisions §421), and the
+recall's free-text reason is **not** sent — it can hold anything a person typed, and it
+stays in the `invoice.approval_recalled` audit row:
+
+```jsonc
+{ "id": "invoice.approval_recalled:<occurrence-id>", "type": "invoice.approval_recalled",
+  "created_at": "<iso8601>", "organization_id": "<org-id>",
+  "data": { "invoice_id": "…", "invoice_number": "…", "vendor_name": "…",
+            "amount": "123.45", "currency": "USD", "status": "ready_for_review",
+            "recalled_from": "approved" } }
+```
+
+Like the approval it withdraws, its id is per occurrence: recalled, re-approved
+and recalled again delivers twice.
+
 `exception.raised` carries the exception classification plus the same invoice
 metadata (and a deep link):
 
@@ -460,7 +517,9 @@ exception (e.g. a Positive Pay never-issued cheque) carries `invoice_id` /
 `invoice_number` / `vendor_name` / `amount` as `null` and `link: "/exceptions"`.
 
 `amount` is an **exact JSON string** (money-is-exact), not a float. Payloads are
-PII-free — invoice/exception metadata only, no bank/tax/PAN fields.
+PII-free — invoice/exception metadata only, no bank/tax/PAN fields, no name or
+email, and no person reference: `invoice.approval_recalled` does not name who
+recalled (decisions §421); that is in the audit trail.
 
 ### Dispatch + retry + dead-letter
 
@@ -486,6 +545,26 @@ PII-free — invoice/exception metadata only, no bank/tax/PAN fields.
   that org**, silently and with no delivery row to show for it, on exactly the
   replay the dedupe exists to make safe. An org with a single subscription never
   saw it. Guard: `tests/test_outbound_webhooks.py::test_emit_duplicate_for_one_sub_still_queues_the_others`.
+- **after the commit** (`dispatch._emit_after_commit`) — every event source
+  is a change made inside a tenant transaction the caller has not committed yet,
+  and `emit_event` commits the delivery row in its own control-plane session.
+  So the typed emitters (`emit_invoice_approved`, `emit_invoice_approval_recalled`,
+  `emit_payment_settled`, `emit_exception_raised`) take the caller's session as a
+  required `db=` keyword, build the payload **now** (the state being
+  committed), and queue the `emit_event` call on `services/post_commit` — the
+  same `Session.info` queue and `after_commit` hook the notification email /
+  chat legs and the ERP auto-send ride. A transaction that rolls back queues
+  nothing; a savepoint that rolls back drops only its own events, so a bulk
+  approve emits one event per invoice it actually approved, after the outer
+  commit. Before this the delivery was durable while the change it announced
+  could still roll back, and a receiver reading the invoice back on receipt
+  could see the old status (decisions §427). `db=None` is the explicit
+  "no caller transaction" case and emits immediately. The `(subscription_id,
+  event_id)` dedupe is unchanged. Guards:
+  `tests/test_outbound_webhooks.py::test_a_committed_approval_emits_once_after_the_commit`,
+  `::test_a_rolled_back_approval_emits_nothing`,
+  `::test_a_bulk_approval_emits_one_event_per_committed_invoice`, and
+  `tests/test_outbound_webhooks_exception.py::test_a_rolled_back_exception_emits_nothing`.
 - **deliver** (`delivery.process_delivery`) — signs the byte-identical frozen
   payload, POSTs via `httpx` (10 s timeout), classifies the result. `2xx` →
   `delivered`; otherwise increment `attempt_count` and, if attempts remain
@@ -542,12 +621,20 @@ alongside the existing notification hook, keyed off the resulting status:
 `approved` → `invoice.approved`, `paid` → `payment.settled`. Every path that
 converges on those statuses (the ERP-sync / payment-webhook / direct-schedule
 paths) emits exactly once, here — once per *transition*, each carrying the
-occurrence id that transition minted.
+occurrence id that transition minted, and only once the caller commits
+the transition.
+
+**`invoice.approval_recalled`** comes from the same hook, but keyed off the
+transition's action (`workflow_engine.RECALL_ACTION`, the one action allowed to
+walk the recall edges) rather than its resulting status — `ready_for_review` is
+also where a resubmit or a fresh extraction lands, and those are not events.
+`transition_invoice` hands the hook the status it left, which
+becomes `recalled_from`; the actor is not sent (decisions §421).
 
 **`exception.raised`** is emitted from the shared exception-create chokepoint
 `services/exception_service.create_exception`. Every `Exception` row in the
 codebase is now constructed through this one helper — it builds the row,
-flushes for the id, then best-effort emits `exception.raised` (the exception id
+flushes for the id, then queues `exception.raised` for the caller's commit (the exception id
 is the `event_key`, so a re-run / double-fire dedupes on
 `(subscription, exception.raised:<exception-id>)`). The five former
 construction sites all route through it, so coverage is complete (no
@@ -606,11 +693,19 @@ enforced, not just documented: `app/main.py::lifespan` **refuses to boot** with
 the flag on when `FEOH_DEBUG=false` (same fail-fast block as the secret-key /
 billing-webhook guards).
 
-**Residual risk:** the actual connection is opened by `httpx`, which performs
-its own DNS lookup — a narrow rebinding window remains between the send-time
-check and the socket connect. Pinning the checked IP for the connection itself
-would close it; re-resolving immediately before send is the accepted fix per
-issue #171, and the window is bounded to a single race per attempt.
+**The send is pinned to a vetted address.** A check alone left a window:
+`httpx` makes its own DNS lookup when it opens the socket, so a record with a
+short TTL could pass the send-time check and then answer the connect with
+`127.0.0.1`. `delivery._post` therefore sends through
+`utils/url_safety.pinned_async_client` with `url_guard.resolve_pinned_addresses`
+as its resolver. The host is resolved once per connection, every address is
+judged by the rule above, and the socket opens to one of those IP literals, so
+no second lookup exists to rebind. The URL is unchanged, so the `Host` header,
+TLS SNI and certificate verification still name the hostname. A refusal at
+connect raises `WebhookTargetNotAllowed` and is the same failed attempt as a
+refusal at the check. The escape hatch skips the address judgement here too,
+but the connection is still pinned to what resolved. Proxies from the
+environment are ignored by the pinned client (a proxy would do its own lookup).
 
 ### Management API (`/api/webhooks`)
 

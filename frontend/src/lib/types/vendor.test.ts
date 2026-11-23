@@ -1,9 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import {
 	ENRICHABLE_FIELD_LABEL_KEYS,
+	erpCandidateLinkable,
 	RISK_LEVEL_LABEL_KEYS,
 	SANCTIONS_RESULTS,
 	SANCTIONS_RESULT_LABEL_KEYS,
+	SANCTIONS_CHECK_TYPES,
+	SANCTIONS_CHECK_TYPE_LABEL_KEYS,
+	PROPOSAL_FIELD_LABEL_KEYS,
+	proposalFieldLabelKey,
+	revealedProposalFields,
+	sanctionsCheckTypeLabelKey,
 	SCREENING_CATEGORIES,
 	SCREENING_CATEGORY_LABEL_KEYS,
 	SCREENING_STATUS_LABEL_KEYS,
@@ -22,7 +29,7 @@ import {
 	type ScreeningStatus
 } from './vendor';
 import { interpolate } from '#lib/i18n/interpolate.ts';
-import { en } from '#lib/i18n/locales/en.ts';
+import { EN_ALL } from '#lib/i18n/allMessages.ts';
 
 /**
  * Map-completeness guard for the sanctions-screening label map.
@@ -39,13 +46,13 @@ describe('SCREENING_STATUS_LABEL_KEYS', () => {
 		for (const status of SCREENING_STATUSES) {
 			const key = SCREENING_STATUS_LABEL_KEYS[status];
 			expect(key, `${status} has no label key`).toBeTruthy();
-			expect(Object.keys(en), `${status} → "${key}" is not in the catalogue`).toContain(key);
+			expect(Object.keys(EN_ALL), `${status} → "${key}" is not in the catalogue`).toContain(key);
 		}
 	});
 
 	it('never uses the raw enum value as its own label', () => {
 		for (const status of SCREENING_STATUSES) {
-			expect(en[SCREENING_STATUS_LABEL_KEYS[status]]).not.toBe(status);
+			expect(EN_ALL[SCREENING_STATUS_LABEL_KEYS[status]]).not.toBe(status);
 		}
 	});
 
@@ -61,9 +68,9 @@ describe('SCREENING_STATUS_LABEL_KEYS', () => {
 	it('carries the pill labels ScreeningBadge renders beside the verdict', () => {
 		// Both live in the same pill row as the verdict above; an English
 		// literal there is the hybrid this conversion exists to remove.
-		expect(Object.keys(en)).toContain('vendors.screening.blocked');
-		expect(Object.keys(en)).toContain('vendors.screening.adverseMedia');
-		expect(Object.keys(en)).toContain('vendors.screening.adverseMediaTitle');
+		expect(Object.keys(EN_ALL)).toContain('vendors.screening.blocked');
+		expect(Object.keys(EN_ALL)).toContain('vendors.screening.adverseMedia');
+		expect(Object.keys(EN_ALL)).toContain('vendors.screening.adverseMediaTitle');
 	});
 });
 
@@ -72,8 +79,8 @@ describe('VENDOR_STATUS_LABEL_KEYS', () => {
 		for (const status of VENDOR_STATUSES) {
 			const key = VENDOR_STATUS_LABEL_KEYS[status];
 			expect(key, `${status} has no label key`).toBeTruthy();
-			expect(Object.keys(en), `${status} → "${key}" is not in the catalogue`).toContain(key);
-			expect(en[key]).not.toBe(status);
+			expect(Object.keys(EN_ALL), `${status} → "${key}" is not in the catalogue`).toContain(key);
+			expect(EN_ALL[key]).not.toBe(status);
 		}
 	});
 
@@ -99,7 +106,7 @@ describe('VENDOR_STATUS_LABEL_KEYS', () => {
 describe('VENDOR_SOURCE_LABEL_KEYS', () => {
 	it('names a real catalogue key for every vendor source', () => {
 		for (const key of Object.values(VENDOR_SOURCE_LABEL_KEYS)) {
-			expect(Object.keys(en), `"${key}" is not in the catalogue`).toContain(key);
+			expect(Object.keys(EN_ALL), `"${key}" is not in the catalogue`).toContain(key);
 		}
 		expect(vendorSourceLabelKey('erp_sync')).toBe('vendors.source.erpSync');
 		expect(vendorSourceLabelKey('portal_self_service')).toBeNull();
@@ -113,8 +120,8 @@ describe('RISK_LEVEL_LABEL_KEYS', () => {
 		for (const level of RISK_LEVELS) {
 			const key = RISK_LEVEL_LABEL_KEYS[level];
 			expect(key, `${level} has no label key`).toBeTruthy();
-			expect(Object.keys(en), `${level} → "${key}" is not in the catalogue`).toContain(key);
-			expect(en[key]).not.toBe(level);
+			expect(Object.keys(EN_ALL), `${level} → "${key}" is not in the catalogue`).toContain(key);
+			expect(EN_ALL[key]).not.toBe(level);
 		}
 	});
 
@@ -131,10 +138,10 @@ describe('RISK_LEVEL_LABEL_KEYS', () => {
 		// translated pills. Both composed strings carry `{level}`, so a locale
 		// can put the noun wherever its grammar wants it.
 		for (const key of ['vendors.risk.pill', 'vendors.risk.title'] as const) {
-			expect(Object.keys(en)).toContain(key);
-			expect(en[key], `${key} must interpolate the level`).toContain('{level}');
+			expect(Object.keys(EN_ALL)).toContain(key);
+			expect(EN_ALL[key], `${key} must interpolate the level`).toContain('{level}');
 			expect(
-				interpolate(en[key], { level: en[RISK_LEVEL_LABEL_KEYS.high] })
+				interpolate(EN_ALL[key], { level: EN_ALL[RISK_LEVEL_LABEL_KEYS.high] })
 			).not.toContain('{level}');
 		}
 	});
@@ -166,9 +173,9 @@ describe('SCREENING_CATEGORY_LABEL_KEYS', () => {
 		for (const category of SCREENING_CATEGORIES) {
 			const key = SCREENING_CATEGORY_LABEL_KEYS[category];
 			expect(key, `${category} has no label key`).toBeTruthy();
-			expect(Object.keys(en), `${category} → "${key}" is not in the catalogue`).toContain(key);
-			expect(en[key].trim().length).toBeGreaterThan(0);
-			expect(en[key]).not.toBe(category);
+			expect(Object.keys(EN_ALL), `${category} → "${key}" is not in the catalogue`).toContain(key);
+			expect(EN_ALL[key].trim().length).toBeGreaterThan(0);
+			expect(EN_ALL[key]).not.toBe(category);
 		}
 	});
 
@@ -216,9 +223,9 @@ describe('SANCTIONS_RESULT_LABEL_KEYS', () => {
 		for (const result of SANCTIONS_RESULTS) {
 			const key = SANCTIONS_RESULT_LABEL_KEYS[result];
 			expect(key, `${result} has no label key`).toBeTruthy();
-			expect(Object.keys(en), `${result} → "${key}" is not in the catalogue`).toContain(key);
-			expect(en[key].trim().length).toBeGreaterThan(0);
-			expect(en[key]).not.toBe(result);
+			expect(Object.keys(EN_ALL), `${result} → "${key}" is not in the catalogue`).toContain(key);
+			expect(EN_ALL[key].trim().length).toBeGreaterThan(0);
+			expect(EN_ALL[key]).not.toBe(result);
 		}
 	});
 
@@ -247,7 +254,100 @@ describe('ENRICHABLE_FIELD_LABEL_KEYS', () => {
 		// apply-checkbox aria-label, so an English literal here landed
 		// mid-sentence in a translated label.
 		for (const key of Object.values(ENRICHABLE_FIELD_LABEL_KEYS)) {
-			expect(Object.keys(en), `"${key}" is not in the catalogue`).toContain(key);
+			expect(Object.keys(EN_ALL), `"${key}" is not in the catalogue`).toContain(key);
 		}
+	});
+});
+
+describe('erpCandidateLinkable (decisions §415)', () => {
+	const base = {
+		erp_vendor_id: 'c-1',
+		name: 'Acme Ltd',
+		email: null,
+		active: true,
+		tax_id_matches: false,
+		linked_elsewhere: false
+	};
+
+	it('offers Link only for an active record no other vendor holds', () => {
+		expect(erpCandidateLinkable(base)).toBe(true);
+		expect(erpCandidateLinkable({ ...base, active: false })).toBe(false);
+		expect(erpCandidateLinkable({ ...base, linked_elsewhere: true })).toBe(false);
+	});
+});
+
+describe('SANCTIONS_CHECK_TYPE_LABEL_KEYS', () => {
+	// Every `check_type=` literal the backend writes (`grep -rn 'check_type="'
+	// backend/app`), and the `schemas/sanctions.py` comment that lists them.
+	const BACKEND_CHECK_TYPES = [
+		'initial',
+		'periodic',
+		'manual',
+		'pre_payment',
+		'bank_change',
+		'tax_id_change'
+	];
+
+	it('covers exactly the triggers the backend writes', () => {
+		expect([...SANCTIONS_CHECK_TYPES].sort()).toEqual([...BACKEND_CHECK_TYPES].sort());
+	});
+
+	it('names a real, non-empty, non-raw catalogue key for every trigger', () => {
+		for (const type of SANCTIONS_CHECK_TYPES) {
+			const key = SANCTIONS_CHECK_TYPE_LABEL_KEYS[type];
+			expect(Object.keys(EN_ALL), `${type} → "${key}" is not in the catalogue`).toContain(key);
+			expect(EN_ALL[key].trim().length).toBeGreaterThan(0);
+			expect(EN_ALL[key]).not.toBe(type);
+		}
+	});
+
+	it('returns null for an unknown trigger so the caller can render it raw', () => {
+		expect(sanctionsCheckTypeLabelKey('pre_payment')).toBe('vendors.screening.checkType.prePayment');
+		expect(sanctionsCheckTypeLabelKey('quarterly_sweep')).toBeNull();
+	});
+});
+
+describe('proposal field labels', () => {
+	it('names a real catalogue key for every known field', () => {
+		for (const [field, key] of Object.entries(PROPOSAL_FIELD_LABEL_KEYS)) {
+			expect(Object.keys(EN_ALL), `${field} → "${key}" is not in the catalogue`).toContain(key);
+		}
+	});
+
+	it('does not resolve inherited object properties as fields', () => {
+		expect(proposalFieldLabelKey('constructor')).toBeNull();
+		expect(proposalFieldLabelKey('toString')).toBeNull();
+	});
+
+	it('labels revealed bank fields by key and keeps unknown ones visible', () => {
+		const rows = revealedProposalFields('bank_details', {
+			bank_details: { bank_name: 'First Bank', account_last4: '4321', branch_code: '007' }
+		});
+		expect(rows).toEqual([
+			{
+				field: 'bank_name',
+				labelKey: 'vendors.changeRequests.field.bankName',
+				fallback: 'bank name',
+				value: 'First Bank'
+			},
+			{
+				field: 'account_last4',
+				labelKey: 'vendors.changeRequests.field.accountLast4',
+				fallback: 'account last4',
+				value: '4321'
+			},
+			{ field: 'branch_code', labelKey: null, fallback: 'branch code', value: '007' }
+		]);
+	});
+
+	it('labels a tax-ID change', () => {
+		expect(revealedProposalFields('tax_id', { tax_id: '12-3456789' })).toEqual([
+			{
+				field: 'tax_id',
+				labelKey: 'vendors.changeRequests.field.taxId',
+				fallback: 'tax id',
+				value: '12-3456789'
+			}
+		]);
 	});
 });

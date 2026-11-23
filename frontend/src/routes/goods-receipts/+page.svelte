@@ -25,11 +25,13 @@
 	 * regardless of what the page shows.
 	 */
 	import { api } from '#lib/api.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { MAX_PAGE_SIZE, appendUnique } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import LineDescription from '#lib/components/ui/LineDescription.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
@@ -40,6 +42,7 @@
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { goodsReceiptTone } from '#lib/types/goodsReceipt.ts';
@@ -53,32 +56,42 @@
 	import {
 		GR_SOURCE_MANUAL,
 		RECEIPT_ENTRY_ROLES,
-		isCancelledGoodsReceipt
+		isCancelledGoodsReceipt,
+		goodsReceiptStatusLabelKey
 	} from '#lib/types/goodsReceipt.ts';
 	import type { InspectableReceipt } from './RecordInspectionModal.svelte';
 	import { page as pageStore } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 
+	// The status column is free-form, so an unknown spelling renders raw rather
+	// than disappearing; every value the backend writes has a label.
+	const statusLabel = (status: string) => {
+		const key = goodsReceiptStatusLabelKey(status);
+		return key ? m(key) : status;
+	};
+
 	const canMutate = $derived(auth.isManager);
 	const canRecordReceipt = $derived(auth.hasAnyRole(...RECEIPT_ENTRY_ROLES));
 
+	// Each `class` is the hook its column width hangs on (see the style block);
+	// the PO and Notes columns carry none and take the rest.
 	const COLUMNS = $derived([
-		{ label: m('goodsReceipts.col.grNumber') },
+		{ label: m('goodsReceipts.col.grNumber'), class: 'col-number' },
 		{ label: m('goodsReceipts.col.po') },
-		{ label: m('goodsReceipts.col.received') },
-		{ label: m('goodsReceipts.col.status') },
-		{ label: m('goodsReceipts.col.lines') },
-		{ label: m('goodsReceipts.col.created') }
+		{ label: m('goodsReceipts.col.received'), class: 'col-date' },
+		{ label: m('goodsReceipts.col.status'), class: 'col-status' },
+		{ label: m('goodsReceipts.col.lines'), class: 'col-lines' },
+		{ label: m('goodsReceipts.col.created'), class: 'col-date' }
 	]);
 
 	const INSPECTION_COLUMNS = $derived([
-		{ label: m('goodsReceipts.inspections.col.number') },
-		{ label: m('goodsReceipts.inspections.col.result') },
-		{ label: m('goodsReceipts.inspections.col.receipt') },
-		{ label: m('goodsReceipts.inspections.col.inspected') },
-		{ label: m('goodsReceipts.inspections.col.inspector') },
-		{ label: m('goodsReceipts.inspections.col.quantities') },
+		{ label: m('goodsReceipts.inspections.col.number'), class: 'col-number' },
+		{ label: m('goodsReceipts.inspections.col.result'), class: 'col-result' },
+		{ label: m('goodsReceipts.inspections.col.receipt'), class: 'col-receipt' },
+		{ label: m('goodsReceipts.inspections.col.inspected'), class: 'col-date' },
+		{ label: m('goodsReceipts.inspections.col.inspector'), class: 'col-inspector' },
+		{ label: m('goodsReceipts.inspections.col.quantities'), class: 'col-quantities' },
 		{ label: m('goodsReceipts.inspections.col.notes') }
 	]);
 
@@ -144,6 +157,12 @@
 	let page = $state(1);
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// Set by a failed page-1 load, cleared by a successful one. A failed load
+	// renders `ui/LoadError` (with a Retry) in the table's place: on its own the
+	// toast faded and left the empty-state line claiming nothing matched — or,
+	// on a re-load, the previous filter's rows standing as this one's answer.
+	// A failed load-more keeps the rows already shown and only toasts.
+	let errored = $state(false);
 
 	let detailId = $state<string | null>(null);
 	let detail = $state<GRDetail | null>(null);
@@ -152,6 +171,11 @@
 	let inspections = $state<Inspection[]>([]);
 	let inspectionsLoaded = $state(false);
 	let inspectionsLoading = $state(false);
+	/** Set once the first page-1 load has answered, either way. Until then the
+	 *  tab draws DataTable's loading row rather than its "no inspections" line,
+	 *  so the first paint never claims an empty list it has not asked about
+	 *  (`inspectionsLoading` itself only turns on once the tab's effect runs). */
+	let inspectionsAttempted = $state(false);
 	let loadingMoreInspections = $state(false);
 	let inspectionsTotal = $state(0);
 	let inspectionsPage = $state(1);
@@ -234,7 +258,14 @@
 	async function loadGRs(opts: { append?: boolean; nextPage?: number } = {}) {
 		const token = listSequence.start();
 		if (opts.append) loadingMore = true;
-		else loading = true;
+		else {
+			loading = true;
+			// Cleared when a fresh load STARTS (as /credit-memos does) so Retry
+			// takes `LoadError` down while the request is out and a second
+			// failure re-announces it — cleared only on success, Retry looked
+			// like a no-op.
+			errored = false;
+		}
 		try {
 			const nextPage = opts.nextPage ?? 1;
 			const params = new URLSearchParams({
@@ -251,9 +282,11 @@
 			grs = opts.append ? appendUnique(grs, data.items) : data.items;
 			total = data.total;
 			page = nextPage;
+			errored = false;
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit`: only the newest request reports.
 			if (!listSequence.isCurrentRequest(token)) return;
+			if (!opts.append) errored = true;
 			toast(err instanceof Error ? err.message : m('goodsReceipts.toast.loadListFailed'), 'error');
 		} finally {
 			// Both flags belong to the newest request: an append used to clear
@@ -316,6 +349,7 @@
 			if (inspectionSequence.isCurrentRequest(token)) {
 				inspectionsLoading = false;
 				loadingMoreInspections = false;
+				inspectionsAttempted = true;
 			}
 		}
 	}
@@ -580,10 +614,20 @@
 			role="tabpanel"
 			aria-labelledby="goods-receipts-tab-receipts"
 		>
+			{#if errored}
+				<LoadError
+					message={m('goodsReceipts.empty.errored')}
+					onretry={() => loadGRs()}
+					testId="goods-receipts-error"
+				/>
+			{:else}
+			<div class="gr-table receipts-table">
 			<DataTable
+				fixed
 				columns={COLUMNS}
 				isEmpty={grs.length === 0}
-				empty={loading ? m('common.loading') : m('goodsReceipts.empty')}
+				{loading}
+				empty={m('goodsReceipts.empty')}
 				colspan={6}
 			>
 				{#snippet body()}
@@ -604,27 +648,26 @@
 							</td>
 							<td class="mono">{gr.po_number ?? '—'}</td>
 							<td>{formatDate(gr.received_date)}</td>
-							<td><Badge tone={goodsReceiptTone(gr.status)} variant={gr.status}>{gr.status}</Badge></td>
+							<td><Badge tone={goodsReceiptTone(gr.status)} variant={gr.status}>{statusLabel(gr.status)}</Badge></td>
 							<td class="muted">{gr.line_count}</td>
 							<td class="muted">{formatDate(gr.created_at)}</td>
 						</tr>
 					{/each}
 				{/snippet}
 			</DataTable>
-
-			{#if hasMore}
-				<div class="load-more-row">
-					<button class="btn-load-more" onclick={loadMore} disabled={loadingMore}>
-						{loadingMore
-							? m('common.loading')
-							: m('goodsReceipts.loadMore', { shown: grs.length, total })}
-					</button>
-				</div>
-			{:else if total > 0}
-				<div class="load-more-row">
-					<span class="load-more-end">{m('goodsReceipts.showingAll', { total })}</span>
-				</div>
+			</div>
 			{/if}
+
+			<LoadMoreFooter
+				shown={grs.length}
+				{total}
+				{hasMore}
+				loading={loadingMore}
+				{errored}
+				onloadmore={loadMore}
+				moreKey="goodsReceipts.loadMore"
+				allKey="goodsReceipts.showingAll"
+			/>
 		</div>
 	{:else}
 		<div
@@ -642,10 +685,13 @@
 				<HelpTip term="four-way-match" />
 			</p>
 
+			<div class="gr-table inspections-table">
 			<DataTable
+				fixed
 				columns={INSPECTION_COLUMNS}
 				isEmpty={inspections.length === 0}
-				empty={inspectionsLoading ? m('common.loading') : m('goodsReceipts.inspections.empty')}
+				loading={inspectionsLoading || !inspectionsAttempted}
+				empty={m('goodsReceipts.inspections.empty')}
 				colspan={7}
 			>
 				{#snippet body()}
@@ -685,30 +731,18 @@
 					{/each}
 				{/snippet}
 			</DataTable>
+			</div>
 
-			{#if hasMoreInspections}
-				<div class="load-more-row">
-					<button
-						class="btn-load-more"
-						onclick={loadMoreInspections}
-						disabled={loadingMoreInspections}
-						data-testid="load-more-inspections"
-					>
-						{loadingMoreInspections
-							? m('common.loading')
-							: m('goodsReceipts.inspections.loadMore', {
-									shown: inspections.length,
-									total: inspectionsTotal
-								})}
-					</button>
-				</div>
-			{:else if inspectionsTotal > 0}
-				<div class="load-more-row">
-					<span class="load-more-end">
-						{m('goodsReceipts.inspections.showingAll', { total: inspectionsTotal })}
-					</span>
-				</div>
-			{/if}
+			<LoadMoreFooter
+				shown={inspections.length}
+				total={inspectionsTotal}
+				hasMore={hasMoreInspections}
+				loading={loadingMoreInspections}
+				onloadmore={loadMoreInspections}
+				moreKey="goodsReceipts.inspections.loadMore"
+				allKey="goodsReceipts.inspections.showingAll"
+				testId="load-more-inspections"
+			/>
 		</div>
 	{/if}
 </PageHeader>
@@ -721,7 +755,7 @@
 				<HelpTip term="goods-receipt" />
 				{#if detail}
 					<span class="num-badge">{detail.gr_number}</span>
-					<Badge tone={goodsReceiptTone(detail.status)} variant={detail.status}>{detail.status}</Badge>
+					<Badge tone={goodsReceiptTone(detail.status)} variant={detail.status}>{statusLabel(detail.status)}</Badge>
 				{/if}
 			</div>
 			<button class="close-btn" onclick={() => (detailId = null)} aria-label={m('goodsReceipts.modal.close')}>&times;</button>
@@ -730,7 +764,7 @@
 
 	<div class="modal-body">
 		{#if detailLoading}
-			<div class="loading">{m('common.loading')}</div>
+			<LoadingState />
 		{:else if detail}
 			<dl class="meta">
 				<dt>{m('goodsReceipts.modal.po')}</dt><dd class="mono">{detail.po_number ?? '—'}</dd>
@@ -1046,6 +1080,35 @@
 		color: var(--text-muted);
 	}
 
+	/* Column widths. Both tabs' tables are `table-layout: fixed` (DataTable's
+	   `fixed`) and mounted from first paint with DataTable's loading row: under
+	   `auto` the columns were sized against "Loading…" and re-sized against the
+	   rows, sliding every column sideways when a page landed. Under `fixed` the
+	   widths come from the header alone and hold. Each predictable column is
+	   sized to its widest content in the six locales, with ~12% headroom over a
+	   local measurement because CI's font renders wider: a header to its
+	   longest word (es "INSPECCIONADA", de "WARENEINGANG"), Status to de
+	   "RÜCKGÄNGIG GEMACHT" (168px), Result to fr "ACCEPTATION PARTIELLE"
+	   (172px), the number columns to a mono "INS-2026-00001". PO (receipts) and
+	   Notes (inspections) carry no width and take the rest; past the
+	   `min-width` the table scrolls inside its region. Widths reach the
+	   DataTable-rendered `<th>` through `:global` under the page-owned wrapper
+	   (the /gl-accounts pattern). Guard: tests-e2e/reactivity/
+	   layout-stability.spec.ts (both tabs, de/es/fr/pt-BR/ja). */
+	.gr-table {
+		min-width: 0;
+	}
+	.receipts-table :global(table) { min-width: 960px; }
+	.inspections-table :global(table) { min-width: 1260px; }
+	.gr-table :global(th.col-number) { width: 160px; }
+	.gr-table :global(th.col-date) { width: 160px; }
+	.gr-table :global(th.col-status) { width: 240px; }
+	.gr-table :global(th.col-lines) { width: 140px; }
+	.gr-table :global(th.col-result) { width: 250px; }
+	.gr-table :global(th.col-receipt) { width: 190px; }
+	.gr-table :global(th.col-inspector) { width: 150px; }
+	.gr-table :global(th.col-quantities) { width: 160px; }
+
 	.notes {
 		max-width: 32ch;
 		overflow: hidden;
@@ -1053,10 +1116,5 @@
 		white-space: nowrap;
 	}
 
-	.loading {
-		padding: 40px;
-		text-align: center;
-		color: var(--text-muted);
-	}
 
 </style>

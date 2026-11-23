@@ -31,6 +31,7 @@
 	} from '#lib/api/positivePay.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { normalizeMoneyInput } from '#lib/utils/moneyInput.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	interface RunOption {
 		id: string;
@@ -166,10 +167,10 @@
 			const flagged = result.amount_mismatches + result.not_on_file;
 			toast(
 				flagged > 0
-					? m('positivePay.modal.toast.returnFlagged', { flagged }) +
-							m('positivePay.modal.toast.returnExceptions', {
-								exceptions: result.exceptions_created
-							})
+					? m('positivePay.modal.toast.returnFlagged', {
+							flagged,
+							exceptions: result.exceptions_created
+						})
 					: m('positivePay.modal.toast.returnClean'),
 				flagged > 0 ? 'error' : 'success'
 			);
@@ -336,7 +337,7 @@
 		<div class="totals-row">
 			<div class="total-box">
 				<span class="total-label">{m('positivePay.modal.items')}</span>
-				<span class="total-value">{detail.item_count}</span>
+				<span class="total-value">{formatCount(detail.item_count)}</span>
 			</div>
 			<div class="total-box">
 				<span class="total-label">{m('positivePay.modal.totalAmount')}</span>

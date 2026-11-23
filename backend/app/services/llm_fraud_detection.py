@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -31,6 +32,7 @@ import httpx
 
 from app.config import settings
 from app.schemas.money import json_money
+from app.services import provider_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,9 @@ class HistoricalInvoice:
     invoice_number: str
     invoice_date: str | None
     amount: Decimal
-    currency: str
+    # None when the invoice records no currency: the model is told it is
+    # unknown (JSON null), never that it is USD (decisions §466).
+    currency: str | None
     description: str | None
     payment_method: str | None
     remit_to_address: str | None
@@ -71,7 +75,9 @@ class CandidateInvoice:
     invoice_number: str
     invoice_date: str | None
     amount: Decimal
-    currency: str
+    # None when the invoice records no currency: the model is told it is
+    # unknown (JSON null), never that it is USD (decisions §466).
+    currency: str | None
     description: str | None
     payment_method: str | None
     remit_to_address: str | None
@@ -186,7 +192,9 @@ def parse_response(text: str) -> AnomalyResult:
     )
 
 
-def resolve_anomaly_llm_config(org_settings: dict | None) -> tuple[str, str | None]:
+async def resolve_anomaly_llm_config(
+    org_settings: dict | None, *, organization_id: uuid.UUID
+) -> tuple[str, str | None]:
     """The Anthropic ``(api_key, model)`` the anomaly check may use, or ``("", None)``.
 
     Platform mode uses the platform key and the platform extraction model. A
@@ -198,8 +206,8 @@ def resolve_anomaly_llm_config(org_settings: dict | None) -> tuple[str, str | No
     back to the platform key would bill the platform and engage Anthropic as a
     sub-processor for an org that chose a different one.
     """
-    extraction = (org_settings or {}).get("extraction") or {}
-    if extraction.get("program_type") == "byok":
+    extraction = await provider_credentials.byok_extraction_config(organization_id, org_settings)
+    if extraction is not None:
         if extraction.get("provider") != "claude_vision":
             return "", None
         return extraction.get("api_key") or "", extraction.get("model") or None
@@ -278,6 +286,13 @@ async def detect_anomaly(
     return parse_response(text)
 
 
+def _invoice_currency(invoice) -> str | None:
+    """The invoice's own code, or None when it records none."""
+    from app.services.payment_runs import payable_currency_code
+
+    return payable_currency_code(getattr(invoice, "currency", None))
+
+
 def invoice_to_candidate(invoice) -> CandidateInvoice:
     """Adapter from a SQLAlchemy `Invoice` (or test stub) to the
     LLM-ready dataclass."""
@@ -285,7 +300,7 @@ def invoice_to_candidate(invoice) -> CandidateInvoice:
         invoice_number=invoice.invoice_number or "",
         invoice_date=invoice.invoice_date.isoformat() if invoice.invoice_date else None,
         amount=invoice.amount if invoice.amount is not None else Decimal("0"),
-        currency=invoice.currency or "USD",
+        currency=_invoice_currency(invoice),
         description=invoice.description,
         payment_method=invoice.payment_method,
         remit_to_address=invoice.remit_to_address,
@@ -300,7 +315,7 @@ def invoice_to_history(invoice) -> HistoricalInvoice:
         invoice_number=invoice.invoice_number or "",
         invoice_date=invoice.invoice_date.isoformat() if invoice.invoice_date else None,
         amount=invoice.amount if invoice.amount is not None else Decimal("0"),
-        currency=invoice.currency or "USD",
+        currency=_invoice_currency(invoice),
         description=invoice.description,
         payment_method=invoice.payment_method,
         remit_to_address=invoice.remit_to_address,

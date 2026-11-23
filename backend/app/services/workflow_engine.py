@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.api.refusals import coded_refusal
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.workflow import WorkflowDefinition, WorkflowInstance, WorkflowStep
 from app.services.audit_dispatch import dispatch_audit
@@ -52,6 +53,10 @@ VALID_TRANSITIONS: dict[InvoiceStatus, set[InvoiceStatus]] = {
         InvoiceStatus.sending_to_erp,
         InvoiceStatus.payment_scheduled,
         InvoiceStatus.done,
+        # Recalling the approval (decisions §374): only through
+        # `POST /{id}/recall-approval` (`review.recall_refusal`: no live
+        # payment or card, no bill in the ERP). `POST /bulk/status` refuses it.
+        InvoiceStatus.ready_for_review,
     },
     InvoiceStatus.rejected: {InvoiceStatus.ready_for_review, InvoiceStatus.new},
     InvoiceStatus.sending_to_erp: {InvoiceStatus.sent_to_erp, InvoiceStatus.failed},
@@ -63,7 +68,14 @@ VALID_TRANSITIONS: dict[InvoiceStatus, set[InvoiceStatus]] = {
     InvoiceStatus.payment_scheduled: {InvoiceStatus.paid, InvoiceStatus.approved},
     InvoiceStatus.paid: {InvoiceStatus.done, InvoiceStatus.approved},
     InvoiceStatus.done: set(),  # terminal
-    InvoiceStatus.failed: {InvoiceStatus.pending, InvoiceStatus.sending_to_erp},
+    InvoiceStatus.failed: {
+        InvoiceStatus.pending,
+        InvoiceStatus.sending_to_erp,
+        # Recalling the approval of a failed ERP push (decisions §374) — the
+        # same door and gate as from `approved`; a never-approved `failed`
+        # extraction is refused there (`review.holds_recallable_approval`).
+        InvoiceStatus.ready_for_review,
+    },
 }
 
 # The step-type vocabulary lives in ONE module (services/workflow_step_types.py)
@@ -159,13 +171,131 @@ async def is_step_enabled(
     return _check_step_enabled(defn.steps_config, step_type)
 
 
+#: The audit action of the one transition allowed to walk :data:`RECALL_EDGES`
+#: (`services/review.recall_approval`, decisions §374).
+RECALL_ACTION = "invoice.approval_recalled"
+
+#: `approved` / `failed → ready_for_review`: legal edges, but only as the
+#: recall, which first asks `review.recall_refusal` (no live claim, no ERP
+#: bill), stamps the recaller and clears the chain. Any other caller — a bulk
+#: transition, an extraction re-read redelivered after a human approved the
+#: invoice — is refused here, at the chokepoint, as it was before the edges
+#: existed.
+RECALL_EDGES: frozenset[tuple[InvoiceStatus, InvoiceStatus]] = frozenset(
+    {
+        (InvoiceStatus.approved, InvoiceStatus.ready_for_review),
+        (InvoiceStatus.failed, InvoiceStatus.ready_for_review),
+    }
+)
+
+
+# ---------- the engine's refusals, coded ----------
+#
+# Every 409 below is a `coded_refusal` (`api/refusals.py`): it reaches a person
+# through `POST /bulk/status`'s skip rows and every single-invoice door that
+# transitions, so the browser states it from the code and its params (the
+# statuses, as `InvoiceStatus` values) and keeps the English for a code it
+# predates. The codes are only as specific as the sentences they replace.
+
+#: No edge from ``params.status`` to ``params.target`` in the state machine.
+INVOICE_TRANSITION_INVALID = "invoice_transition_invalid"
+#: ``params.status → params.target`` is a :data:`RECALL_EDGES` edge, walked by
+#: the recall alone (§374).
+INVOICE_TRANSITION_RECALL_ONLY = "invoice_transition_recall_only"
+#: A once-approved invoice's document is never read again (`→ pending`, §374).
+INVOICE_ONCE_APPROVED_NOT_REREAD = "invoice_once_approved_not_reread"
+#: A once-approved invoice never goes back to draft (`→ new`, §379).
+INVOICE_ONCE_APPROVED_NOT_TO_DRAFT = "invoice_once_approved_not_to_draft"
+#: A once-approved invoice is never closed from draft (`new → done`, §379).
+INVOICE_ONCE_APPROVED_NOT_CLOSED_FROM_DRAFT = "invoice_once_approved_not_closed_from_draft"
+
+
+def _engine_refusal(code: str, message: str, **params: object) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT, detail=coded_refusal(code, message, **params)
+    )
+
+
 def validate_transition(current: InvoiceStatus, target: InvoiceStatus) -> None:
     allowed = VALID_TRANSITIONS.get(current, set())
     if target not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Cannot transition from '{current.value}' to '{target.value}'",
+        raise _engine_refusal(
+            INVOICE_TRANSITION_INVALID,
+            f"Cannot transition from '{current.value}' to '{target.value}'",
+            status=current.value,
+            target=target.value,
         )
+
+
+#: Why a once-approved invoice's document may not be read again (§374).
+ONCE_APPROVED_NOT_REREAD = (
+    "This invoice has already been approved, so its document can't be read "
+    "again. Recall its approval and correct it instead."
+)
+#: Why a once-approved invoice may not go back to draft (decisions §374, §379).
+ONCE_APPROVED_NOT_TO_DRAFT = (
+    "This invoice has already been approved, so it can't go back to draft. "
+    "Resubmit it for review instead."
+)
+#: Why a once-approved invoice may not be closed from draft without a fresh
+#: approval (§379). Reached only by a row written before that rule.
+ONCE_APPROVED_NOT_CLOSED_FROM_DRAFT = (
+    "This invoice has already been approved once, so it can't be closed without "
+    "being approved again. Submit it for review."
+)
+
+
+def _refuse_outside_the_recall(invoice: Invoice, target: InvoiceStatus, action_name: str) -> None:
+    """The engine-level rules the recall's edges need (decisions §374, §379).
+
+    * :data:`RECALL_EDGES` are walked by the recall alone.
+    * An invoice that was ever approved never re-enters ``pending``. Extraction
+      rewrites the vendor, amount and lines, and `failed` with an approval stamp
+      is read everywhere (`/retry-erp`, `financially_locked`, the recall itself)
+      as "an approved invoice whose push failed". A once-approved invoice that
+      reached `failed` through a re-read would be pushed, and then paid, on
+      figures nobody approved. `/extract` already refused it; this holds it for
+      `POST /bulk/status`, the portal resubmit and any future door.
+    * Nor does it re-enter ``new`` (§379). Draft is where the unattended exits
+      start: `/complete`'s amount-floor auto-approve (`new → approved`) and its
+      close with no approval step (`new → done`). Recall, reject, then
+      `POST /bulk/status → new` used to land a recalled invoice there, its
+      financial lock off; anyone outside the segregation set could re-point the
+      payee, and the floor then approved it as "system (below threshold)" with
+      nobody independent signing. From `rejected` the one way back is
+      `→ ready_for_review` (resubmit), where a person approves.
+    * And it never leaves ``new`` for ``done`` (§379): a row that reached draft
+      with a stamp before the rule above cannot be closed without a second
+      approval. (`new → approved` cannot be held here — every approval site sets
+      the stamp before its transition — so `/complete` reads the stamp before
+      the floor stamps it and sends such a row to review.)
+    """
+    if (invoice.status, target) in RECALL_EDGES and action_name != RECALL_ACTION:
+        raise _engine_refusal(
+            INVOICE_TRANSITION_RECALL_ONLY,
+            f"Cannot transition from '{invoice.status.value}' to '{target.value}' "
+            "except by recalling the approval",
+            status=invoice.status.value,
+            target=target.value,
+        )
+    if not ever_approved(invoice):
+        return
+    if target == InvoiceStatus.pending:
+        raise _engine_refusal(INVOICE_ONCE_APPROVED_NOT_REREAD, ONCE_APPROVED_NOT_REREAD)
+    if target == InvoiceStatus.new:
+        raise _engine_refusal(INVOICE_ONCE_APPROVED_NOT_TO_DRAFT, ONCE_APPROVED_NOT_TO_DRAFT)
+    if invoice.status == InvoiceStatus.new and target == InvoiceStatus.done:
+        raise _engine_refusal(
+            INVOICE_ONCE_APPROVED_NOT_CLOSED_FROM_DRAFT, ONCE_APPROVED_NOT_CLOSED_FROM_DRAFT
+        )
+
+
+def ever_approved(invoice) -> bool:
+    """`models/invoice_status.was_ever_approved`, read through getattr: unit
+    tests drive the engine with bare namespaces that carry no approval stamp."""
+    return getattr(invoice, "approval_date", None) is not None or bool(
+        getattr(invoice, "approved_by", None)
+    )
 
 
 async def get_invoice_for_update(db: AsyncSession, invoice_id: uuid.UUID) -> Invoice:
@@ -200,6 +330,7 @@ async def transition_invoice(
 ) -> Invoice:
     """Validate and apply a status transition, writing an audit log entry."""
     validate_transition(invoice.status, target_status)
+    _refuse_outside_the_recall(invoice, target_status, action_name)
     old_status = invoice.status.value
     invoice.status = target_status
 
@@ -243,39 +374,67 @@ async def transition_invoice(
     # Best-effort outbound-webhook emit (the push counterpart of the /api/v1
     # pull surface). Same chokepoint as the notification hook — keyed off the
     # resulting status so every path that converges on `approved`/`paid` emits
-    # exactly once. `emit_event` opens its own control-plane session, never
-    # raises into here, and is a silent no-op when FEOH_WEBHOOKS_ENABLED is off.
+    # exactly once, and off the action for the recall, whose resulting status
+    # (`ready_for_review`) other transitions share. The emitters queue the event
+    # on `db` and send it only once the caller commits (`post_commit`), so a
+    # transition that rolls back announces nothing (decisions §427). Never
+    # raises into here, and a silent no-op when FEOH_WEBHOOKS_ENABLED is off.
     try:
-        await _maybe_emit_webhook(invoice, target_status, occurrence_id=occurrence_id)
+        await _maybe_emit_webhook(
+            db,
+            invoice,
+            target_status,
+            occurrence_id=occurrence_id,
+            action_name=action_name,
+            old_status=old_status,
+        )
     except Exception:  # noqa: BLE001 — a webhook emit must never break the transition
         _log.exception("webhook emit hook failed for invoice transition to %s", target_status.value)
     return invoice
 
 
 async def _maybe_emit_webhook(
+    db: AsyncSession,
     invoice: Invoice,
     target_status: InvoiceStatus,
     *,
     occurrence_id: uuid.UUID | None = None,
+    action_name: str | None = None,
+    old_status: str | None = None,
 ) -> None:
     """Map an invoice status transition to an outbound webhook event + emit.
 
-    Only `approved` → `invoice.approved` and `paid` → `payment.settled` are
-    emitted here (`exception.raised` is emitted from
-    `exception_service.create_exception`).
+    Emitted here: `approved` → `invoice.approved`, `paid` → `payment.settled`,
+    and the recall (:data:`RECALL_ACTION`, the one action allowed to walk
+    :data:`RECALL_EDGES`) → `invoice.approval_recalled`, carrying the status
+    it was recalled from and who recalled it (decisions §374, §414). The recall
+    is matched on the action, not the resulting status, because
+    `ready_for_review` is also where a resubmit or a fresh extraction lands.
+    `exception.raised` is emitted from `exception_service.create_exception`.
 
     `occurrence_id` is the caller's per-transition id and becomes the event's
     dedupe key. Re-emitting the SAME transition (same id) still dedupes; a NEW
     transition mints a new id and therefore a new, deliverable event.
+
+    The event is built now and sent after `db` commits; a rollback drops it.
     """
-    if target_status is InvoiceStatus.approved:
+    if action_name == RECALL_ACTION:
+        from app.services.webhooks import emit_invoice_approval_recalled
+
+        await emit_invoice_approval_recalled(
+            invoice,
+            db=db,
+            recalled_from=old_status,
+            occurrence_id=occurrence_id,
+        )
+    elif target_status is InvoiceStatus.approved:
         from app.services.webhooks import emit_invoice_approved
 
-        await emit_invoice_approved(invoice, occurrence_id=occurrence_id)
+        await emit_invoice_approved(invoice, db=db, occurrence_id=occurrence_id)
     elif target_status is InvoiceStatus.paid:
         from app.services.webhooks import emit_payment_settled
 
-        await emit_payment_settled(invoice, occurrence_id=occurrence_id)
+        await emit_payment_settled(invoice, db=db, occurrence_id=occurrence_id)
 
 
 async def _maybe_notify_transition(
@@ -301,6 +460,9 @@ async def _maybe_notify_transition(
         resolve_role_user_ids,
     )
     from app.services.notification_templates import InvoiceContext
+    from app.services.payment_runs import (
+        payable_currency_code as _payable_currency_code,
+    )
 
     event_type: str | None = None
     recipients: list[uuid.UUID] = []
@@ -325,8 +487,13 @@ async def _maybe_notify_transition(
             recipients.append(uploaded_by_id)
         try:
             recipients.extend(await resolve_role_user_ids(invoice.organization_id, "ap_manager"))
-        except Exception:  # noqa: BLE001 — role lookup must not break the transition
-            pass
+        except Exception as exc:  # noqa: BLE001 — role lookup must not break the transition
+            # The uploader is still notified; the AP managers are not, so say so
+            # (class only — the message may carry a recipient's address).
+            _log.warning(
+                "paid notification: AP manager lookup failed (%s); managers not notified",
+                type(exc).__name__,
+            )
 
     if not event_type:
         return
@@ -356,7 +523,7 @@ async def _maybe_notify_transition(
         invoice_number=getattr(invoice, "invoice_number", ""),
         vendor_name=getattr(invoice, "vendor_name", ""),
         amount=getattr(invoice, "amount", None),
-        currency=getattr(invoice, "currency", None) or "USD",
+        currency=_payable_currency_code(getattr(invoice, "currency", None)),
         reason=(details or {}).get("reason"),
     )
     await notify_event(

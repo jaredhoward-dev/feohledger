@@ -12,7 +12,7 @@ them is stored in ``settings.erp``: they are sealed in the control-plane
 §266), written only through the audited ``PUT
 /api/organization/credentials/erp`` and never read back. What this module
 decides about them is *when they stop applying*: a save that points the block
-at a different ERP or a different destination (:data:`DESTINATION_KEYS`) drops
+at a different ERP or a different destination (:func:`destination_keys`) drops
 them (:func:`secrets_to_drop`). ``settings.erp.oauth`` — the consent metadata
 ``services/erp_oauth`` writes beside its sealed tokens — is never writable
 through the settings API, and reads see only ``{"connected": bool}``.
@@ -29,6 +29,14 @@ from typing import Any
 #: The OAuth consent metadata block. Its only writer is ``services/erp_oauth``;
 #: its tokens are sealed in ``provider_credentials``, not stored here.
 OAUTH_KEY = "oauth"
+#: ``settings.erp`` key: the ERP company every pre-0115 link is assumed to
+#: belong to (``services/erp_link_realm``). Written only by migration 0115.
+LEGACY_REALM_KEY = "legacy_link_realm"
+#: ``settings.erp`` key: when the block last started naming its current ERP
+#: connection (ISO time). Written only by ``PATCH /api/organization``, when a
+#: save changes the ERP or its destination / link realm; never taken from a
+#: save. The auto-send recovery sweep fences on it (decisions §428).
+CONFIGURED_AT_KEY = "configured_at"
 #: Token keys that must never sit in the JSONB OAuth block.
 _OAUTH_TOKEN_KEYS = frozenset({"access_token", "refresh_token"})
 
@@ -59,9 +67,9 @@ _EXISTING_LABEL_KEYS: dict[str, str] = {
 #: host itself (``base_url``), or a value an adapter builds the host or the
 #: target books from (NetSuite's ``account_id`` is a hostname label; Business
 #: Central's ``tenant_id`` / ``environment`` / ``company_id`` are URL path
-#: segments; QuickBooks' ``environment`` picks its API host; SYSPRO and Intacct
-#: log in to ``company_id``). A save that changes any of them is a NEW
-#: connection: the sealed secrets are dropped and have to be typed again
+#: segments; SYSPRO and Intacct log in to ``company_id``). A save that changes
+#: any of them is a NEW connection: the sealed secrets are dropped and have to
+#: be typed again
 #: (:func:`secrets_to_drop`; the inbound webhook key, :data:`EXTRA_SECRET_KEYS`,
 #: is never sent outbound and so survives), and a connection test against the
 #: changed form gets none of them. Without this, ``{"type": "syspro",
@@ -70,6 +78,16 @@ _EXISTING_LABEL_KEYS: dict[str, str] = {
 #: ``POST /organization/test-erp`` or a settings PATCH. A catalogue field that
 #: names a host belongs here: ``tests/test_erp_catalog.py`` fails on any
 #: ``*_url`` / ``*host*`` field left out.
+#:
+#: This is the DEFAULT, by name, for every provider — including for a key the
+#: provider's form does not render, since an adapter may still read it. A
+#: provider narrows it only by declaring one of its own fields
+#: ``destination=False`` (:func:`destination_keys`), and only with evidence that
+#: no value of that field moves the credentials off the vendor's own hosts.
+#: QuickBooks Online's ``environment`` is the one such field: it picks between
+#: two Intuit hosts and nothing else (decisions §316).
+#: ``tests/test_erp_catalog.py`` pins the opt-outs, so a new one is a reviewed
+#: change.
 DESTINATION_KEYS: frozenset[str] = frozenset(
     {"base_url", "tenant_id", "account_id", "company_id", "environment"}
 )
@@ -84,16 +102,31 @@ def _field(
     help_key: str | None = None,
     label_key: str | None = None,
     options: list[str] | None = None,
+    destination: bool | None = None,
+    show_when: dict[str, Any] | None = None,
+    stored_default: str | None = None,
 ) -> dict[str, Any]:
-    """One form field. ``label_key`` is a frontend i18n ``MessageKey``."""
+    """One form field. ``label_key`` is a frontend i18n ``MessageKey``.
+
+    ``destination`` defaults to membership of :data:`DESTINATION_KEYS`; pass it
+    only to override that for this provider (see :func:`destination_keys`).
+
+    ``show_when`` (``{"field": name, "values": [...]}``) makes the field apply
+    only while another field of the same provider holds one of ``values``: the
+    form hides it, and does not require it, otherwise. ``stored_default`` is
+    what a SAVED block without this key means (the adapter's reading of the
+    absent key), which the form shows instead of the first option; a new
+    connection still starts on the first option.
+    """
     out: dict[str, Any] = {
         "name": name,
         "label_key": label_key or _EXISTING_LABEL_KEYS.get(name, f"org.erp.field.{name}"),
         "secret": secret,
         "required": required,
         # Changing a destination field starts a new connection: the form then
-        # asks for the secrets again rather than claiming they are kept.
-        "destination": name in DESTINATION_KEYS,
+        # asks for the secrets again rather than claiming they are kept. The
+        # backend's own rule (`destination_keys`) reads this same flag.
+        "destination": (name in DESTINATION_KEYS) if destination is None else destination,
     }
     if placeholder is not None:
         out["placeholder"] = placeholder
@@ -101,6 +134,10 @@ def _field(
         out["help_key"] = help_key
     if options is not None:
         out["options"] = options
+    if show_when is not None:
+        out["show_when"] = show_when
+    if stored_default is not None:
+        out["stored_default"] = stored_default
     return out
 
 
@@ -114,15 +151,22 @@ def _byo_app_fields() -> list[dict[str, Any]]:
 
 
 #: Sage Intacct's REST API, client-credentials grant. Kept as one list so the
-#: field names can be changed in one place to match the adapter.
+#: field names can be changed in one place to match the adapter. The REST API
+#: still needs a Web Services licence (sender ID) authorized in the customer's
+#: company, which the ``user_id`` help says (decisions §395, correcting §269).
 SAGE_INTACCT_FIELDS: list[dict[str, Any]] = [
     _field("client_id"),
     _field("client_secret", secret=True),
     _field("company_id"),
-    _field("user_id"),
+    _field("user_id", help_key="org.erp.help.intacctUser"),
     _field("location_id", required=False, help_key="org.erp.help.intacctLocation"),
     _field("po_document_type", required=False, placeholder="Purchase Order"),
 ]
+
+#: NetSuite's two sign-in methods (``erp_adapters/netsuite.AUTH_METHODS``):
+#: each one's fields apply only while it is the chosen ``auth_method``.
+_NETSUITE_OAUTH2: dict[str, Any] = {"field": "auth_method", "values": ["oauth2_m2m"]}
+_NETSUITE_TBA: dict[str, Any] = {"field": "auth_method", "values": ["tba"]}
 
 #: Every direct ERP, in dropdown order within its region group.
 ERP_PROVIDERS: list[dict[str, Any]] = [
@@ -133,7 +177,32 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
         "auth": "oauth",
         "fields": [
             *_byo_app_fields(),
-            _field("environment", options=["production", "sandbox"], placeholder="production"),
+            # Not a destination: it only picks between Intuit's sandbox and
+            # production API hosts (the adapter maps any other value to
+            # production), and the OAuth endpoints are Intuit constants, so no
+            # value sends a credential anywhere but Intuit. Treated as one, it
+            # dropped a bring-your-own-app client_secret on every switch, which
+            # made a sandbox connection impossible to save (decisions §316).
+            _field(
+                "environment",
+                options=["production", "sandbox"],
+                placeholder="production",
+                destination=False,
+            ),
+            # The GL codes (our chart) of the accounts a FeohLedger payment is
+            # written back from as a QuickBooks BillPayment (decisions §295).
+            # Not required: without one, write-back refuses
+            # `payment_account_not_mapped` and the bill stays unpaid there.
+            _field(
+                "bill_payment_bank_account",
+                required=False,
+                help_key="org.erp.help.billPaymentBankAccount",
+            ),
+            _field(
+                "bill_payment_card_account",
+                required=False,
+                help_key="org.erp.help.billPaymentCardAccount",
+            ),
         ],
         "docs_url": "https://developer.intuit.com/app/developer/qbo/docs/get-started",
     },
@@ -155,10 +224,13 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
         "docs_url": "https://developer.xero.com/documentation/getting-started-guide/",
     },
     {
-        # Sage's v3.1 API: US, UK, IE and CA, not South Africa (see below).
+        # Sage's v3.1 API: the UK, Ireland, Canada and the EU countries it lists.
+        # Not the US, where Sage retired the product on 2024-12-31, and not
+        # South Africa (a separate product, below). Outside both region groups,
+        # so the picker lists it under "Other".
         "key": "sage_accounting",
         "label": "Sage Business Cloud Accounting",
-        "regions": ["US"],
+        "regions": ["GB"],
         "auth": "oauth",
         "fields": [
             *_byo_app_fields(),
@@ -225,7 +297,7 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
         "regions": ["US", "ZA"],
         "auth": "credentials",
         "fields": SAGE_INTACCT_FIELDS,
-        "docs_url": "https://developer.intacct.com/web-services/",
+        "docs_url": "https://developer.sage.com/intacct/docs/1/sage-intacct-rest-api/",
     },
     {
         "key": "netsuite",
@@ -234,10 +306,34 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
         "auth": "credentials",
         "fields": [
             _field("account_id", placeholder="1234567"),
-            _field("consumer_key"),
-            _field("consumer_secret", secret=True),
-            _field("token_id"),
-            _field("token_secret", secret=True),
+            # OAuth 2.0 client credentials first: from NetSuite 2027.1 it is the
+            # only method a NEW integration record can use. A block saved
+            # before this choice existed is TBA (the adapter reads an absent
+            # key that way, and so does the form). Not a destination: either
+            # method signs in to the same account's hosts.
+            _field(
+                "auth_method",
+                options=["oauth2_m2m", "tba"],
+                stored_default="tba",
+                help_key="org.erp.help.netsuiteAuthMethod",
+            ),
+            _field("client_id", show_when=_NETSUITE_OAUTH2),
+            _field(
+                "certificate_id",
+                show_when=_NETSUITE_OAUTH2,
+                help_key="org.erp.help.netsuiteCertificateId",
+            ),
+            _field(
+                "private_key",
+                secret=True,
+                show_when=_NETSUITE_OAUTH2,
+                placeholder="-----BEGIN PRIVATE KEY-----",
+                help_key="org.erp.help.netsuitePrivateKey",
+            ),
+            _field("consumer_key", show_when=_NETSUITE_TBA),
+            _field("consumer_secret", secret=True, show_when=_NETSUITE_TBA),
+            _field("token_id", show_when=_NETSUITE_TBA),
+            _field("token_secret", secret=True, show_when=_NETSUITE_TBA),
         ],
         "docs_url": "https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4247337262.html",
     },
@@ -288,6 +384,26 @@ MERGE_DEV_PROVIDER: dict[str, Any] = {
     "fields": [
         _field("api_key", secret=True, label_key="org.erp.mergeApiKey", placeholder="test_..."),
         _field("account_token", secret=True, label_key="org.erp.accountToken"),
+        # The Merge stack the linked account lives on; its token is refused by
+        # the others. Not a destination: every value is one of Merge's own
+        # hosts (`merge_dev.MERGE_REGION_BASES`), so the secrets never reach
+        # anyone else, and a saved block without it is the US stack.
+        _field(
+            "region",
+            required=False,
+            options=["US", "EU", "APAC"],
+            help_key="org.erp.help.mergeRegion",
+            stored_default="US",
+        ),
+        # The Merge organisation's webhook signature key, which verifies
+        # `POST /api/erp/webhook/merge_dev/{slug}` (decisions §399). Inbound
+        # only, so it is never a destination either.
+        _field(
+            "webhook_signing_secret",
+            secret=True,
+            required=False,
+            help_key="org.erp.help.mergeWebhook",
+        ),
     ],
     "docs_url": "https://docs.merge.dev/accounting/",
 }
@@ -315,8 +431,9 @@ MERGE_DEV_LONG_TAIL: list[dict[str, str]] = [
 #: registry test accepts these as unregistered; empty it as each adapter lands.
 PENDING_ADAPTERS: frozenset[str] = frozenset()
 
-#: ``settings.erp`` keys that are secrets but no form field names: the inbound
-#: webhook's HMAC key (``api/erp_webhook``) and its older spelling.
+#: ``settings.erp`` keys that are secrets whatever provider is chosen: the
+#: inbound webhook's HMAC key (``api/erp_webhook``; only the Merge.dev form
+#: renders it) and its older spelling.
 EXTRA_SECRET_KEYS: frozenset[str] = frozenset({"webhook_signing_secret", "webhook_secret"})
 
 
@@ -399,25 +516,44 @@ def same_erp(stored: Any, incoming: Any) -> bool:
     )
 
 
+def destination_keys(erp_config: Any) -> frozenset[str]:
+    """The ``settings.erp`` keys that are a destination for this block's ERP.
+
+    :data:`DESTINATION_KEYS`, plus any field the provider's entry marks
+    ``destination``, minus any field it explicitly marks not one. The by-name
+    default still covers every key the provider does not declare, rendered or
+    not: narrowing is opt-in per field, never inferred from what a form shows.
+    """
+    entry = provider(catalog_key(erp_config)) if isinstance(erp_config, dict) else None
+    fields = entry["fields"] if entry else []
+    declared = frozenset(f["name"] for f in fields if f["destination"])
+    excluded = frozenset(f["name"] for f in fields if not f["destination"])
+    return (DESTINATION_KEYS | declared) - excluded
+
+
 def same_connection(stored: Any, incoming: Any) -> bool:
     """Does ``incoming`` name the same ERP, at the same destination, as ``stored``?
 
     The one condition under which the sealed secrets stay with the block across
     a save (:func:`secrets_to_drop`), and under which a connection test may use
-    them (``provider_credentials.config_for_connection_test``).
+    them (``provider_credentials.config_for_connection_test``). Which keys are
+    the destination is per ERP (:func:`destination_keys`); both blocks select
+    the same ERP by this point, so either one names it.
     """
     if not same_erp(stored, incoming):
         return False
     return all(
         _destination_value(stored.get(key)) == _destination_value(incoming.get(key))
-        for key in DESTINATION_KEYS
+        for key in destination_keys(stored)
     )
 
 
 def secrets_to_drop(stored: Any, merged: Any) -> frozenset[str]:
     """The sealed ``erp`` secrets a save from ``stored`` to ``merged`` removes.
 
-    * Same ERP, same destination — none.
+    * Same ERP, same destination — the secrets of a sign-in method the save
+      switched away from (:func:`secrets_switched_off`): a NetSuite block moved
+      from TBA to OAuth 2.0 must not keep TBA's token secret sealed and unused.
     * Same ERP, new destination — every secret but the inbound webhook's HMAC
       key (:data:`EXTRA_SECRET_KEYS`), which verifies what the ERP sends US and
       is never sent anywhere. Without this, ``{"type": "syspro", "base_url":
@@ -438,10 +574,43 @@ def secrets_to_drop(stored: Any, merged: Any) -> frozenset[str]:
     if not isinstance(stored, dict) or not (stored.get("type") or stored.get("integration_method")):
         return frozenset()
     if same_connection(stored, merged):
-        return frozenset()
+        return secrets_switched_off(stored, merged)
     if same_erp(stored, merged):
         return SECRET_KEYS - EXTRA_SECRET_KEYS
     return SECRET_KEYS
+
+
+def secrets_switched_off(stored: Any, merged: Any) -> frozenset[str]:
+    """The provider's secret fields that applied to ``stored`` and no longer
+    apply to ``merged``, by their catalogue ``show_when``.
+
+    Only a field the save turned OFF: a secret stored for a method the block
+    was not yet on (the credentials endpoint takes secrets before or after the
+    configuration save) is left for the save that selects it. An absent
+    controlling key reads as its ``stored_default``, as the adapter reads it.
+    """
+    if not (isinstance(stored, dict) and isinstance(merged, dict)):
+        return frozenset()
+    entry = provider(catalog_key(stored))
+    if entry is None:
+        return frozenset()
+    by_name = {f["name"]: f for f in entry["fields"]}
+
+    def value(cfg: dict, name: str) -> Any:
+        current = cfg.get(name)
+        if current is None or (isinstance(current, str) and not current.strip()):
+            return by_name.get(name, {}).get("stored_default")
+        return current
+
+    off = {
+        f["name"]
+        for f in entry["fields"]
+        if f["secret"]
+        and (cond := f.get("show_when")) is not None
+        and value(stored, cond["field"]) in cond["values"]
+        and value(merged, cond["field"]) not in cond["values"]
+    }
+    return frozenset(off) & SECRET_KEYS
 
 
 def merge_erp_update(stored: Any, incoming: dict) -> dict:
@@ -453,14 +622,24 @@ def merge_erp_update(stored: Any, incoming: dict) -> dict:
 
     * Non-secret keys come from ``incoming``. For the same ERP, a stored key
       the form does not render (and so never sends) is kept when omitted.
+    * ``legacy_link_realm`` (``services/erp_link_realm``) is never taken from
+      ``incoming``; the stored value is kept for the same ERP only.
     * ``oauth`` is never taken from ``incoming``; the stored block is kept, even
       when the ERP is cleared or switched — only the OAuth disconnect removes it,
       after revoking at the provider.
     """
     stored = stored if isinstance(stored, dict) else {}
     merged: dict[str, Any] = {
-        key: value for key, value in incoming.items() if key != OAUTH_KEY and key not in SECRET_KEYS
+        key: value
+        for key, value in incoming.items()
+        if key not in (OAUTH_KEY, LEGACY_REALM_KEY) and key not in SECRET_KEYS
     }
+    if same_erp(stored, incoming) and LEGACY_REALM_KEY in stored:
+        # Which company the pre-0115 ERP links belong to (services/
+        # erp_link_realm): written by that migration only. Kept for the same
+        # ERP, never taken from a save — and dropped with the block when the
+        # ERP changes, since the old links belong to neither.
+        merged[LEGACY_REALM_KEY] = stored[LEGACY_REALM_KEY]
     if same_erp(stored, incoming):
         # Keys the form never renders (an API-set Blackbaud
         # `transaction_code_values`, say) survive a save that omits them. A
@@ -469,7 +648,12 @@ def merge_erp_update(stored: Any, incoming: dict) -> dict:
         entry = provider(catalog_key(incoming))
         rendered = {f["name"] for f in entry["fields"]} if entry else set()
         for key, value in stored.items():
-            if key in incoming or key in rendered or key in SECRET_KEYS or key == OAUTH_KEY:
+            if (
+                key in incoming
+                or key in rendered
+                or key in SECRET_KEYS
+                or key in (OAUTH_KEY, LEGACY_REALM_KEY)
+            ):
                 continue
             merged[key] = value
     if OAUTH_KEY in stored:

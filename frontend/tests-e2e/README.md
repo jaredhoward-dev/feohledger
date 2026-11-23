@@ -88,6 +88,7 @@ tests-e2e/
 │   ├── helpers.ts                   per-worker fixtures + signIn / tenantPsql / etc.
 │   ├── services.ts                  reachability gates for the opt-in compose services
 │   ├── realisticRows.ts             production-shaped rows (long names / numbers / emails, non-ASCII, big amounts) — see "Layout guard" below
+│   ├── realisticValues.ts           reads backend/scripts/fixtures/realistic_rows.json, the ONE file those values live in (seed + e2e)
 │   └── globalSetup.ts               pre-run guard — see "Workflow shape guard" below
 ├── a11y/                            axe-core accessibility regression guard (WCAG 2.2 AA)
 ├── meta/                            source guards over the specs themselves — see "Row teardown" and "Ports" below
@@ -97,7 +98,7 @@ tests-e2e/
 ├── payments/                        queue, runs, void/cancel, CFO approval, execute
 ├── workflows/                       lifecycle, step config, approval matrix, etc.
 ├── exceptions/                      queue, assign, filter, resolve
-├── erp/                             merge-dev / netsuite / dynamics / quickbooks-online / xero / sage-accounting / blackbaud-fe-nxt / sage-intacct / syspro / sage-accounting-za adapter e2e + inbound ERP webhook + fake-erp request hardening (gated — needs fake-erp)
+├── erp/                             merge-dev / netsuite / dynamics / quickbooks-online (+ the recorded QBO sandbox company) / xero / sage-accounting / blackbaud-fe-nxt / sage-intacct / syspro / sage-accounting-za adapter e2e + inbound ERP webhook + fake-erp request hardening (gated — needs fake-erp)
 ├── commerce/                        receipt → commerce platform push: mock.spec.ts (no extra service) + one spec per provider (gated — needs fake-commerce, `pnpm commerce:up`)
 ├── credit-memos/                    list, pagination, the invoice pickers
 ├── organization/                    settings, fraud rules, GL accounts sync
@@ -132,7 +133,28 @@ pnpm test:e2e:a11y      # frontend/package.json — targets just tests-e2e/a11y
 It uses the same per-worker `e2e<N>` tenant + admin storage-state fixtures as
 every other spec (the two login surfaces opt out of the storage state). The
 shared `a11y/axe-helper.ts` owns the tag set + the `expectNoA11yViolations`
-assertion; reuse it when adding a route to the guard. Automated tooling only
+assertion; reuse it when adding a route to the guard. Call it rather than
+`new AxeBuilder(...)` directly, because it measures the page **at rest**:
+
+- It emulates `prefers-reduced-motion: reduce`, which collapses every new
+  animation and transition to its final frame (`app.css` § Reduced motion).
+- It then waits until nothing on the document is moving
+  (`waitForMotionToSettle`, exported for a spec that needs the same wait for
+  its own reads). Reduced motion does not cover this case: a transition that
+  was already running when the media changed keeps the duration it started
+  with. So a spec that flips the theme (`emulateMedia({ colorScheme })` or the
+  theme picker) and scans at once measured backgrounds part-way between the
+  two surfaces. One example: `EntitySwitcher`'s old `transition: all` read
+  #3a3c43 under its hint text, a false 3.41:1, and failed 4 of 10 runs of
+  `dashboard/first-run.spec.ts` (#635). The wait lets two animation frames
+  pass, so a style change made just before the call has started its
+  transitions. Then it awaits the `finished` promise of every running
+  `document.getAnimations()` entry, looping until a pass finds none.
+  Infinite and paused animations are skipped, not awaited. The wait is
+  bounded by the test timeout and uses no sleep. With it, the same spec passed
+  20 of 20 runs with the `transition: all` put back.
+
+Automated tooling only
 covers the machine-detectable criteria — the manual screen-reader passes and
 the conformance docs (`docs/accessibility.md`, `docs/accessibility-vpat.md`)
 cover the rest.
@@ -143,14 +165,26 @@ cover the rest.
 shipped at 1666px: a table that fit every seeded row and overflowed the card
 the first day a customer used it. It seeds `fixtures/realisticRows.ts` — long
 vendor names, ERP-length invoice numbers, an email assignee, a non-ASCII
-vendor, thirteen-digit amounts — through the API (falling back to
-`tenantPsql` only for workflow state no endpoint mints), then visits every
+unverified vendor, a tax-exclusive invoice with net lines, thirteen-digit
+amounts — through the API (falling back to `tenantPsql` only for state no
+endpoint mints: workflow status, an unverified vendor), then visits every
 page in `NAV` at 1280px and 1666px and asserts that no table, row action or KPI
 card leaves its container. At 1666px a table must fit outright; at 1280px it
 may scroll inside a `tabindex="0"` region. **Use `REALISTIC` for any new layout
 assertion** rather than inventing strings — short test strings are how #574
 passed. An overflow it reports is a layout defect to fix in the page; never
 widen its tolerance.
+
+**The values are shared with the seed.** They are spelled once, in
+`backend/scripts/fixtures/realistic_rows.json`, and read here through
+`fixtures/realisticValues.ts` (with an `LYT575` marker appended so teardown
+finds exactly these rows), by the day-one journey (`day-one/fixtures.ts`), and
+by `backend/scripts/seed_realistic.py`. The lean seed every CI e2e tenant gets
+therefore carries them too: the two vendors that own invoices have the long
+and the non-ASCII (unverified) names, `LEAN-003` is tax-exclusive with net
+lines, `LEAN-004` has an ERP-length number and the open exception is assigned
+to the long routing alias — reshaped rather than added, so no spec's row counts
+move. Change a value in the JSON, never at a reader.
 
 ## Workflow shape guard (`fixtures/globalSetup.ts`)
 
@@ -173,7 +207,7 @@ fast, at the start of the run, naming the exact tenant and field — see
 Skip it (e.g. exercising one non-tenant spec by hand against an unseeded DB)
 with `FEOH_E2E_SKIP_WORKFLOW_SHAPE_CHECK=true`.
 
-## Row teardown (`deleteInvoicesWhere` / `deleteVendorsWhere` / `deleteWorkflowsWhere`)
+## Row teardown (`deleteInvoicesWhere` / `deleteVendorsWhere` / `deleteWorkflowsWhere` / `deletePaymentRunsWhere`)
 
 `invoices` is referenced by **16 foreign keys and none of them cascade**, so a
 bare `DELETE FROM invoices WHERE …` only succeeds while that invoice happens to
@@ -194,9 +228,9 @@ import { deleteInvoicesWhere } from '../fixtures/helpers';
 test.afterEach(() => deleteInvoicesWhere(`invoice_number LIKE '${MARKER}%'`));
 ```
 
-### Three owners, three signatures
+### Four owners, two signatures
 
-`invoices` was the first table to earn an owner; two more followed for the same
+`invoices` was the first table to earn an owner; three more followed for the same
 reason, and **their signatures differ** — read the one you need rather than
 assuming.
 
@@ -205,6 +239,7 @@ assuming.
 | `deleteInvoicesWhere(predicate, slug?)` | a WHERE body | none — the predicate is the whole scope |
 | `deleteVendorsWhere(predicate, slug?)` | a WHERE body | none |
 | `deleteWorkflowsWhere(namePrefix, slug?)` | a **name prefix** | `is_default = false`, baked in |
+| `deletePaymentRunsWhere(predicate, slug?)` | a WHERE body on `payment_runs` | none |
 
 `deleteWorkflowsWhere` takes a prefix rather than a predicate on purpose. A
 tenant's seeded default workflow must survive every teardown, and the fallback
@@ -218,12 +253,27 @@ contains invoices, so it delegates to `deleteInvoicesWhere` rather than
 restating it. Rows that exist only because of the vendor are deleted; independent
 records that merely point at one of its rows have the link cleared.
 
+`deletePaymentRunsWhere` removes the runs, their payments and the payments'
+children, and leaves the invoices: deleting a draft run's payments is what puts
+its invoices back in the payment queue, so it is the teardown for a run staged
+over seeded invoices (`cash-flow/copilot`). `deleteInvoicesWhere` calls it for
+every run holding only the doomed invoices' payments, so a spec that removes its
+own invoices removes their runs too.
+
 ### The source guard
 
 `meta/teardown-guard.spec.ts` scans every `.ts` file under `tests-e2e/`
 (comments stripped, so prose about the pattern is fine) and fails if any file
 other than the helper itself issues `DELETE FROM invoices`, `DELETE FROM
-vendors` or `DELETE FROM workflow_definitions`. Without it the twentieth spec
+vendors`, `DELETE FROM workflow_definitions` or `DELETE FROM payment_runs`.
+It also fails a file that **creates** a payment run (`.post(` to
+`/api/payments/runs` or the copilot's `/draft-run`, or `INSERT INTO
+payment_runs`) or a vendor (`.post(` to `/api/vendors`, or `INSERT INTO
+vendors`) and never calls an owner that removes it — `deletePaymentRunsWhere` /
+`deleteInvoicesWhere` / `deleteVendorsWhere` for a run, `deleteVendorsWhere` for
+a vendor. A file whose only such request is one the server must refuse is listed
+in the guard's `CREATES_NOTHING` with the request named. UI-driven creates and
+URLs held in variables are out of reach of the scan. Without it the twentieth spec
 re-introduces the pattern, and the failure lands weeks later as a foreign-key
 error in someone else's file. Its message quotes the real signature per table,
 because a guard that tells you to pass a predicate to the one helper that takes
@@ -319,6 +369,34 @@ anchored to the tenant root rather than matching any page below it, and that
 `escapeRegExp` escapes backslashes, so one tenant's pattern can never be
 satisfied by another tenant's origin.
 
+Two more things are per-origin, and both used to be shared by every run in one
+checkout — each made a run on its own port sign in against the wrong state and
+bounce every signed-in spec to `/login`:
+
+- **SvelteKit's generated env modules.** `vite dev` writes the resolved
+  `PUBLIC_API_URL` into `<outDir>/generated/dev/env/*` when it starts, and every
+  dev server watching that file reloads from it. With one `.svelte-kit` per
+  checkout, a second dev server (another session's e2e run, or a `pnpm dev`)
+  overwrote the first one's value, and the first server's pages then called the
+  second's backend. `playwright.config.ts` now passes `SVELTEKIT_OUT_DIR=
+  .svelte-kit/e2e-<port>` to the dev server it starts, and `vite.config.ts` hands
+  that to SvelteKit as `outDir` — so each e2e dev server owns its generated
+  files. It is under `.svelte-kit/`, so already gitignored, and SvelteKit's
+  watcher ignores every sibling of `<outDir>/generated`, so the default server
+  does not react to it either. Preview runs (CI) keep the default, because
+  `vite preview` serves the `<outDir>/output` that `pnpm build` wrote. If you
+  hand-start a second `vite dev` in one checkout, give it its own
+  `SVELTEKIT_OUT_DIR` the same way (`docs/environment.md`).
+- **The saved admin login** (`.auth/`). A storageState file holds localStorage
+  per origin, port included, and its JWT is only valid against the backend
+  that issued it. The file was keyed by tenant alone (`e2e1-admin.json`), so two
+  runs on different ports overwrote each other's, the token probe still passed,
+  and the reading run booted with no token for its own origin. It is now
+  `<slug>-admin@<web origin>_<api base>.json`
+  (`fixtures/helpers.ts::_authStateFile`), and the token is read only from the
+  entry for the run's own tenant origin. Old `<slug>-admin.json` files are
+  simply never read again; delete them whenever you like.
+
 Three things stay shared and are NOT covered by these variables:
 
 - **The databases.** Every session still shares one Postgres, so pin a distinct
@@ -335,7 +413,10 @@ Three things stay shared and are NOT covered by these variables:
   specs assert against that template (`organization/tenant-url.spec.ts`,
   `organization/custom-domain-rejection.spec.ts`), so a second session on a
   non-default web origin must set `FEOH_TENANT_URL_TEMPLATE` on its backend to
-  match, or those two fail while everything else passes.
+  match, or those two fail while everything else passes. The same goes for
+  the browser OAuth connects in `erp/` (`connectOAuthThroughPanel`): the
+  callback 302s to that template's origin, so with a mismatched template the
+  browser lands on another session's server.
 
 ### The backend's Python imports (`backend/.venv` is the primary checkout's)
 
@@ -497,7 +578,7 @@ container is up.
 |---|---|---|
 | `sso/login.spec.ts` | Keycloak + acme SSO seeded | `pnpm idp:up && pnpm idp:seed` |
 | `email/signup-email.spec.ts` | Mailpit + backend on `FEOH_EMAIL_PROVIDER=smtp` | `pnpm mail:up`, restart backend with smtp |
-| `erp/` (merge-dev / netsuite / dynamics / quickbooks-online / xero / sage-accounting / blackbaud-fe-nxt / sage-intacct / syspro / sage-accounting-za + erp-webhook + fake-erp-hardening specs) | fake-erp on :12112 + backend on the committed `.env.development` `FEOH_ERP_*` base URLs | `pnpm erp:up`, then `pnpm test:erp` |
+| `erp/` (merge-dev / netsuite / dynamics / quickbooks-online (+ the recorded QBO sandbox company) / xero / sage-accounting / blackbaud-fe-nxt / sage-intacct / syspro / sage-accounting-za + erp-webhook + fake-erp-hardening specs) | fake-erp on :12112 + backend on the committed `.env.development` `FEOH_ERP_*` base URLs | `pnpm erp:up`, then `pnpm test:erp` |
 | `scim/provisioning.spec.ts` | (none — CI-safe contract test) | always runs |
 
 Backend-only service flows are pytest integration tests, also gated:
@@ -522,12 +603,13 @@ creates, and the journey makes the rest through the UI.
 | Step | What it proves |
 |---|---|
 | install | `/api/health`, signup reported closed (`FEOH_SIGNUP_ENABLED=false`), the tenant host serves `/login` |
-| first admin | the generated temporary password signs in, a change is forced, TOTP enrols |
-| invite | an AP Manager is created; the invitation reaches Mailpit with the tenant URL and the same temporary password the admin saw |
+| first admin | the set-password link add-tenant emailed (read from Mailpit) sets a password, it signs in, TOTP enrols |
+| invite | an AP Manager and a financial controller (a second AP Manager) are created; the admin is shown no credential, and each invitation reaches Mailpit with a single-use set-password link on the tenant's own host (decisions §283) |
 | credentials | a provider secret is sealed (a deployed env refuses the local key, so this went through KMS) |
 | first invoice | a tax-exclusive UBL e-invoice (net lines, tax on the header) from an unknown, long, non-ASCII supplier is picked from the empty state's file dialog and reaches review **without a reload**; its only findings are the unverified vendor and the PO that does not exist |
-| AP Manager | forced change on first sign-in, clears the PO flag, verifies the supplier, approves, records it paid outside FeohLedger |
-| reset | the admin's reset issues a generated temporary password (also emailed), the old one stops working, the next sign-in is forced to change it, the new one works |
+| controller | sets a password from the emailed link, clears the PO flag. A third person, because the admin uploaded the invoice and the AP Manager approves it: an approver's own clearance is re-raised by their approval (decisions §420, §422) |
+| AP Manager | sets a password from the emailed link, verifies the supplier, approves (the controller's clearance survives it), records it paid outside FeohLedger |
+| reset | the admin's reset shows no credential, the old password stops working at once, a fresh set-password link reaches Mailpit, and the password it sets works |
 | MFA | the admin signs back in through the TOTP challenge |
 
 The long strings (`fixtures.ts::REAL`) are the production-shaped values; every
@@ -733,6 +815,16 @@ Reach for these instead of duplicating boilerplate per spec:
   delete rows in those three tables. See "Row teardown" above; a source guard
   fails the suite if a spec issues its own `DELETE FROM`. Note the third takes a
   name prefix, not a predicate.
+- `firstPayableQueueInvoice(page)` — the first invoice a payment run will
+  accept, from `GET /api/payments/queue/ids` (the server's selectable set).
+  Never take `queue.items[0]`: the queue lists BLOCKED rows too, and with no
+  due dates its order is the random invoice id, so one blocked row anywhere in
+  the tenant makes that pick fail some of the time with a 409. In the UI, pick
+  a row whose checkbox is enabled, not `tbody tr` `.first()`.
+- A spec that places a row in a payable status (`approved`, `posted_in_erp`,
+  `payment_scheduled`) must remove it in `afterEach`. A leaked one stays in that
+  tenant's payment queue for every later spec on the worker
+  (`invoices/delete-gate.spec.ts` leaked BLOCKED rows that way for weeks).
 - `API_BASE`, `ACME_BASE`, `TECHFLOW_BASE`, `NO_TENANT_BASE`,
   `tenantBase(slug)` — the same origins everyone was redeclaring inline, all
   derived from `E2E_WEB_ORIGIN` / `PUBLIC_API_URL` (see "Running from a
@@ -775,7 +867,7 @@ same origin so the vanity `Host` reaches the backend. See
 ## Storage-state (future)
 
 The auth-storage-state pattern (sign each user in once, persist to
-`.auth/<user>.json`, then `test.use({ storageState })` per spec) is
+`.auth/<user>@<origin>.json`, then `test.use({ storageState })` per spec) is
 already the default (`fixtures/helpers.ts::_ensureAdminStorageState`),
 just lazy per-worker rather than precomputed for every seeded user
 up front — login is fast enough that this is fine. A `globalSetup`

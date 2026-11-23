@@ -20,7 +20,10 @@ infra/
 ├── network.tf                   # workload VPC: 2 public subnets (VM), 2 private (RDS), no NAT, REJECT flow logs
 ├── compute.tf                   # app VM (EC2 Graviton, Session Manager, IMDSv2) + instance role + Elastic IP + apex/api/* DNS
 ├── database.tf                  # RDS Postgres 16: private, encrypted, TLS-only, point-in-time restore, write-only password
-├── monitoring.tf                # SNS alerts topic + VM recovery/reboot and DB CPU/memory/storage alarms
+├── monitoring.tf                # SNS alerts (email) + pager (SMS) topics + VM recovery/reboot and DB CPU/memory/storage alarms
+├── uptime.tf                    # Route 53 HTTPS checks on the apex, a tenant host and api./api/health, their paging alarms, ACM expiry alarm
+├── canary.tf                    # hourly Synthetics canary validating api.'s Let's Encrypt certificate (pages under 14 days) + its artifacts bucket and role
+├── canary/api-certificate/      # the canary's script (index.js), zipped at plan time into .build/ (gitignored)
 ├── deploy.tf                    # release deploys: the SSM command document that runs deploy.sh --ref, + the deploy role's grant to run it
 ├── frontend.tf                  # the SPA: private S3 bucket + CloudFront (OAC, SPA router, headers, logs, alarms) + the deploy role's publish grant
 ├── cloudfront/spa-router.js     # the CloudFront Function: built files pass through, routes become /index.html
@@ -42,7 +45,7 @@ Every resource in this module follows the SOC 2 baseline:
 | S3 Object Lock — governance mode, 365d | `s3.tf` — invoice-files bucket |
 | S3 Object Lock — compliance mode, 7y | `s3.tf` — audit-logs bucket |
 | SSE-KMS on every data bucket; SSE-S3 on the access-logs sink | `s3.tf` — the invoice-files, audit-logs and backups buckets reference `aws_kms_key.app`. AWS does not support SSE-KMS on a server-access-log destination, so the sink uses S3-managed keys (`../docs/decisions.md` §166) |
-| Server-access logging on every data bucket | `s3.tf` — delivered to the access-logs sink, whose bucket policy grants `logging.s3.amazonaws.com` `s3:PutObject`, pinned to this account and the four source buckets (the SPA bucket included); CloudFront access logs arrive through `delivery.logs.amazonaws.com`, under `cloudfront/` only; ACLs disabled |
+| Server-access logging on every data bucket | `s3.tf` — delivered to the access-logs sink, whose bucket policy grants `logging.s3.amazonaws.com` `s3:PutObject`, pinned to this account and the five source buckets (the SPA and canary-artifacts buckets included); CloudFront access logs arrive through `delivery.logs.amazonaws.com`, under `cloudfront/` only; ACLs disabled |
 | Public access block on every bucket | `s3.tf`, `frontend.tf` — all four flags true; the SPA bucket is read only by its CloudFront distribution (OAC) |
 | Lifecycle cost guards | `s3.tf` — backups bucket expires dumps after `backup_retention_days` (90d default; deliberately NO Object Lock — the lifecycle IS the retention policy), and every lifecycle rule reaps incomplete multipart uploads after 7 days |
 
@@ -54,7 +57,7 @@ disarmed `aws-deploy.yml`) assume through OIDC, whose ARN is the
 be added to it.** It is minted by the estate account
 bootstrap (`~/github/templates/infra/modules/project-baseline`, driven by
 `~/github/templates/scripts/new-project-account.sh`), its inputs live in
-`Absence0760/infra-secrets` → `feohledger/bootstrap.tfvars`, and its state is in
+`jaredhoward-dev/infra-secrets` → `feohledger/bootstrap.tfvars`, and its state is in
 the mgmt account's bucket. Change the trust policy there, never here — the
 module is shared by every project account, so fixing it locally would fix this
 account and leave the next one broken.
@@ -83,7 +86,7 @@ can see, and across this org some do and some do not. So read it, never build it
 from the slug:
 
 ```bash
-gh api repos/Absence0760/feohledger/actions/oidc/customization/sub --jq .sub_claim_prefix
+gh api repos/jaredhoward-dev/feohledger/actions/oidc/customization/sub --jq .sub_claim_prefix
 ```
 
 Getting it wrong is silent: the role mints fine, the plan is clean, and the first
@@ -127,7 +130,7 @@ The apex SPF authorizes Migadu alone: SES mail's envelope sender is on `send.`, 
 
 Bring it up in this order:
 
-1. **Add the domain in Migadu** (admin.migadu.com → Domains, in the estate's existing account) and copy the token from its DNS page — the part after `hosted-email-verify=`. Put it, and the DMARC report mailbox, in `infra-secrets/feohledger/prod.tfvars`:
+1. **Add the domain in Migadu** (admin.migadu.com → Domains, in the estate's existing account) and copy the token from its DNS page — the part after `hosted-email-verify=`. Put it, and the DMARC report mailbox, in `infra-secrets/feohledger/prod.tfvars.sops` (`AWS_PROFILE=feohledger sops ~/github/infra-secrets/feohledger/prod.tfvars.sops`):
    ```hcl
    migadu_verification_token = "<token>"
    dmarc_report_email        = "ops@feohledger.com"
@@ -180,15 +183,16 @@ aws sso login --profile feohledger
 printf 'bucket = "feohledger-tfstate-%s"\n' "$(aws sts get-caller-identity --profile feohledger --query Account --output text)" > backend.config
 rm -f backend_override.tf   # a leftover validate override would keep state on your laptop
 AWS_PROFILE=feohledger terraform init -backend-config=backend.config
-AWS_PROFILE=feohledger terraform plan -var-file=../../infra-secrets/feohledger/prod.tfvars -out=tfplan
+AWS_PROFILE=feohledger sops exec-file --no-fifo --filename prod.tfvars ../../infra-secrets/feohledger/prod.tfvars.sops 'terraform plan -var-file={} -out=tfplan'
 AWS_PROFILE=feohledger terraform apply tfplan
+rm tfplan
 ```
 
-The filled tfvars is operator config rather than a secret — bucket names, the budget alert address — but it is not public either, so its canonical copy lives in the private `infra-secrets` repo as `feohledger/prod.tfvars` (plaintext, beside the encrypted secrets) — the estate convention for non-secret env config. Start it from `terraform.tfvars.example`. The path above assumes `infra-secrets` is cloned beside this repo under `~/github/`.
+The filled tfvars is operator config rather than a credential — bucket names, the budget alert address, the Migadu verification token — but it is not public either, so its canonical copy lives in the private `infra-secrets` repo as `feohledger/prod.tfvars.sops`, sops-encrypted (binary format) under `alias/feohledger-sops` like the secrets beside it: the org will have other members, and the values stay off GitHub. Edit it with `AWS_PROFILE=feohledger sops ~/github/infra-secrets/feohledger/prod.tfvars.sops`; start a new one from `terraform.tfvars.example`. `sops exec-file` decrypts it to a 0600 temp file outside the repo, passes that path as `{}`, and deletes it when `terraform plan` exits. The saved plan does hold the variable values in plaintext: `tfplan` is gitignored (`infra/.gitignore`), and delete it after the apply. The path above assumes `infra-secrets` is cloned beside this repo under `~/github/`.
 
 ## Workload stack
 
-`network.tf`, `compute.tf`, `database.tf` and `monitoring.tf` are the infrastructure the app runs on: one EC2 VM running the Docker Compose stack in `../deploy/` (Caddy, the API, Redis), and the database on RDS. Why that shape rather than the full ECS build-out, and why RDS rather than Postgres on the VM: `../docs/decisions.md` §254. Roughly **$45–55/month**:
+`network.tf`, `compute.tf`, `database.tf` and `monitoring.tf` are the infrastructure the app runs on: one EC2 VM running the Docker Compose stack in `../deploy/` (Caddy for `api.` and any vanity host, the API, Redis), and the database on RDS. Why that shape rather than the full ECS build-out, and why RDS rather than Postgres on the VM: `../docs/decisions.md` §254. Roughly **$45–55/month**:
 
 | Resource | Monthly (us-east-1) |
 |---|---|
@@ -202,24 +206,25 @@ Both instances are burstable and run in *unlimited* credit mode (the AWS default
 
 - **No SSH.** Port 22 is closed and there is no key pair; you reach the VM with Session Manager: `aws ssm start-session --target <app_instance_id> --profile feohledger` (needs the Session Manager plugin for the AWS CLI installed locally).
 - **The VM holds no AWS keys.** Its instance role can decrypt the sops secrets, read and write the three data buckets under the app key, and send mail as the platform domain — nothing else.
-- **The database is private.** Private subnets with no internet route, reachable only from the VM's security group, encrypted with the app key, TLS forced (`rds.force_ssl`), deletion-protected, IAM database authentication enabled (password login still works beside it; the app uses the password today), and restorable to any point in the last `db_backup_retention_days` (default 7). The nightly logical dumps (`../deploy/backup.sh`) keep 90 days beyond that.
-- **DNS.** `api.` points at the VM's Elastic IP. The apex and `*.` (every tenant) do too until `frontend_on_cloudfront` moves them to the SPA's CloudFront distribution (§ Frontend on CloudFront).
-- **Alarms** go to `alert_emails` through SNS — each address must click AWS's confirmation link once. The VM recovers itself onto new hardware on a host failure and reboots on a guest failure.
+- **The database is private.** Private subnets with no internet route, reachable only from the VM's security group, encrypted with the app key, TLS forced (`rds.force_ssl`), deletion-protected, IAM database authentication enabled — the app signs in as the `feoh_app` role with a per-connection token, and the VM role's `rds-db:connect` names that one user on this one instance (`compute.tf`, `../docs/decisions.md` §310); the master keeps password login for break-glass only — and restorable to any point in the last `db_backup_retention_days` (default 7). The nightly logical dumps (`../deploy/backup.sh`) keep 90 days beyond that.
+- **DNS.** `api.` points at the VM's Elastic IP. The apex and `*.` (every tenant) are aliases of the SPA's CloudFront distribution, with `frontend_on_cloudfront = true` (§ Frontend on CloudFront); the VM serves no SPA since `../docs/decisions.md` §364.
+- **Alarms** go to `alert_emails` through SNS — each address must click AWS's confirmation link once. The VM recovers itself onto new hardware on a host failure and reboots on a guest failure. Database storage running out also texts `alert_phone_number`, as do the external uptime checks (§ Uptime checks and paging).
 
 **The database password never enters Terraform state.** `db_master_password` is an *ephemeral* variable feeding RDS's *write-only* `password_wo`, so it is sent to AWS and stored nowhere else — not in state, not in a plan file. That is why this module does not read it through a `sops_file` data source (§ Secrets): a data source's value is written to state in plaintext. The operator supplies it at apply time from the private `infra-secrets` repo, as an environment variable on the one command.
 
 **First apply — operator steps.** Steps 2–3 touch a secret, so they are yours to run; nothing here prints it.
 
-1. Add `alert_emails = ["…"]` to `prod.tfvars` (it has no default — the repo is public).
-2. Create the password once in `infra-secrets` (a 48-hex-character value is URL-safe, which it must be because it is embedded in `FEOH_DATABASE_URL`): `cd ~/github/infra-secrets && AWS_PROFILE=feohledger sops feohledger/terraform.sops.yaml`, and add a `db_master_password:` key set to the output of `openssl rand -hex 24`.
+1. Add `alert_emails = ["…"]` to `prod.tfvars.sops` (`AWS_PROFILE=feohledger sops ~/github/infra-secrets/feohledger/prod.tfvars.sops`; it has no default — the repo is public).
+2. Create the master password once in `infra-secrets` (a 48-hex-character value is URL-safe, which it must be because the break-glass `FEOH_DATABASE_URL` embeds it): `cd ~/github/infra-secrets && AWS_PROFILE=feohledger sops feohledger/terraform.sops.yaml`, and add a `db_master_password:` key set to the output of `openssl rand -hex 24`.
 3. Plan and apply with the password passed in from sops (one line each):
-   `cd ~/github/feohledger/infra && AWS_PROFILE=feohledger TF_VAR_db_master_password="$(sops -d --extract '["db_master_password"]' ../../infra-secrets/feohledger/terraform.sops.yaml)" terraform plan -var-file=../../infra-secrets/feohledger/prod.tfvars -out=tfplan`
-   then `AWS_PROFILE=feohledger TF_VAR_db_master_password="$(sops -d --extract '["db_master_password"]' ../../infra-secrets/feohledger/terraform.sops.yaml)" terraform apply tfplan`.
-   An ephemeral variable must be supplied again at apply time even from a saved plan — that is the reason it appears twice.
+   `cd ~/github/feohledger/infra && AWS_PROFILE=feohledger TF_VAR_db_master_password="$(AWS_PROFILE=feohledger sops -d --extract '["db_master_password"]' ../../infra-secrets/feohledger/terraform.sops.yaml)" sops exec-file --no-fifo --filename prod.tfvars ../../infra-secrets/feohledger/prod.tfvars.sops 'terraform plan -var-file={} -out=tfplan'`
+   then `AWS_PROFILE=feohledger TF_VAR_db_master_password="$(AWS_PROFILE=feohledger sops -d --extract '["db_master_password"]' ../../infra-secrets/feohledger/terraform.sops.yaml)" terraform apply tfplan`.
+   An ephemeral variable must be supplied again at apply time even from a saved plan — that is the reason it appears twice; the other variables are inside the saved plan, so `apply` takes no var file. `sops exec-file` hands the environment, `TF_VAR_db_master_password` included, to `terraform plan`. `AWS_PROFILE` is set inside the `$( … )` too: a prefix assignment reaches only the command it precedes, so without it the substitution decrypts with no profile.
+   If `plan` reports the cached provider "does not match any of the checksums recorded in the dependency lock file", re-run `terraform init -backend-config=backend.config` and keep the `h1:` line it adds until the apply is done — restoring the lock first brings the error straight back. Then `git restore .terraform.lock.hcl`, so one workstation's hash never lands in a commit.
 4. Confirm the SNS subscription email AWS sends to each alert address.
-5. Then the VM side: `../deploy/README.md` (bootstrap, the sops env with `FEOH_DATABASE_URL` pointing at the `db_address` output, first deploy).
+5. Then the VM side: `../deploy/README.md` (bootstrap, the sops env with `FEOH_DATABASE_URL` pointing at the `db_address` output, first deploy, then § Database role to move the app onto `feoh_app`).
 
-**Rotating the database password**: put the new value in `terraform.sops.yaml`, bump `db_master_password_version` in `prod.tfvars`, apply as in step 3, then update the password inside `FEOH_DATABASE_URL` in `prod.sops.yaml` and redeploy. Between the apply and the redeploy the app cannot connect, so do both in one sitting.
+**Rotating the master password**: put the new value in `terraform.sops.yaml`, bump `db_master_password_version` in `prod.tfvars.sops`, and apply as in step 3. Once the app is on `feoh_app` (`../deploy/README.md` § Database role) nothing on the VM holds the master password, so the app keeps running through it. Before that cutover the password was inside `FEOH_DATABASE_URL` in `prod.sops.yaml` too, and had to be changed there and redeployed in the same sitting. `../docs/secrets-rotation.md` § RDS master password.
 
 ## Release deploys
 
@@ -258,13 +263,13 @@ reviewer, and sends SSM Run Command to the VM, which runs
 3. **Give the workflow the instance id**, as a `production` environment secret
    (secret, not variable: this repo's workflow logs are public, and secrets are
    masked in them):
-   `gh secret set VM_INSTANCE_ID --env production --repo Absence0760/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw app_instance_id)"`
+   `gh secret set VM_INSTANCE_ID --env production --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw app_instance_id)"`
 4. **Prove the OIDC handshake** (issue #449): run **AWS OIDC preflight**
-   (`gh workflow run aws-oidc-preflight.yml --repo Absence0760/feohledger`) and
+   (`gh workflow run aws-oidc-preflight.yml --repo jaredhoward-dev/feohledger`) and
    approve it. If it fails, the trust policy's subject is wrong — fix it in the
    baseline module (§ The deploy role is not owned here), not here.
 5. **Arm the workflow**:
-   `gh variable set VM_DEPLOY_ENABLED --repo Absence0760/feohledger --body true`.
+   `gh variable set VM_DEPLOY_ENABLED --repo jaredhoward-dev/feohledger --body true`.
    Until then a release skips the deploy job rather than failing it.
 6. **Publish a release** (or run `Deploy to the VM` by hand from `main`) and
    approve it; the run's log ends with the tail of `deploy.sh`'s output.
@@ -295,9 +300,15 @@ creates:
 - **Access logs** through CloudWatch log delivery into the access-logs sink under
   `cloudfront/`. Not the legacy `logging_config`, which needs bucket ACLs the
   sink disables.
-- **Alarms**: 5xx above 5% for 10 minutes and 4xx above 10% for 15 minutes, to
-  the alerts topic. The router means a route never 404s, so a 4xx surge means
-  missing files.
+- **Alarms**: 5xx above 5% for 10 minutes and 404s above 10% for 15 minutes, to
+  the alerts topic. The router means a route never 404s, so a 404 surge means a
+  publish left referenced files out. It watches 404, not 4xx, because the
+  distribution allows only GET/HEAD and answers any other method with 403: a
+  vulnerability scanner POSTing login and WordPress paths once tripped the old
+  4xx alarm with no deploy and no failed real request. `404ErrorRate` is a
+  CloudFront additional metric, so `aws_cloudfront_monitoring_subscription.frontend`
+  turns those on for this distribution (up to 8 metrics at the CloudWatch
+  custom-metric rate, $0.30 each, so at most ~$2.40/month).
 - **The deploy role's grant** (`aws_iam_role_policy.deploy_frontend`): list,
   put, delete and abort-multipart on that bucket, and create/get invalidation plus
   get-distribution on that distribution. Nothing else, and no `GetObject`.
@@ -323,15 +334,15 @@ are in the repo root with `AWS_PROFILE=feohledger`.
    record.
 2. **Give the workflow its targets** as `production` environment secrets. The
    bucket name embeds the account id and this repo's run logs are public:
-   `gh secret set FRONTEND_BUCKET --env production --repo Absence0760/feohledger --body "$(terraform -chdir=infra output -raw frontend_bucket)"`
+   `gh secret set FRONTEND_BUCKET --env production --repo jaredhoward-dev/feohledger --body "$(terraform -chdir=infra output -raw frontend_bucket)"`
    and
-   `gh secret set CLOUDFRONT_DISTRIBUTION_ID --env production --repo Absence0760/feohledger --body "$(terraform -chdir=infra output -raw frontend_distribution_id)"`.
+   `gh secret set CLOUDFRONT_DISTRIBUTION_ID --env production --repo jaredhoward-dev/feohledger --body "$(terraform -chdir=infra output -raw frontend_distribution_id)"`.
 3. **Set the two build variables** as repository variables (the SPA builds in
    an ungated job, which can't read environment variables):
-   `gh variable set APP_URL --repo Absence0760/feohledger --body https://feohledger.com`
-   and `gh variable set PUBLIC_API_URL --repo Absence0760/feohledger --body https://api.feohledger.com`.
+   `gh variable set APP_URL --repo jaredhoward-dev/feohledger --body https://feohledger.com`
+   and `gh variable set PUBLIC_API_URL --repo jaredhoward-dev/feohledger --body https://api.feohledger.com`.
 4. **Arm the publish**:
-   `gh variable set FRONTEND_PUBLISH_ENABLED --repo Absence0760/feohledger --body true`.
+   `gh variable set FRONTEND_PUBLISH_ENABLED --repo jaredhoward-dev/feohledger --body true`.
 5. **Publish a release** and approve it. After the VM step the job uploads the
    build, waits for the invalidation, and smoke-checks the distribution's
    `*.cloudfront.net` name: this build's `version.json`, the SPA on `/` and on a
@@ -340,26 +351,194 @@ are in the repo root with `AWS_PROFILE=feohledger`.
 6. **Try a tenant flow on the CloudFront hostname** before moving DNS. The
    `*.cloudfront.net` name carries no tenant, so the app shows the marketing
    page there. Sign-in is checked properly after step 7, on `sandbox.`.
-7. **Cut over**: `frontend_on_cloudfront = true` in `prod.tfvars`, then plan and
+7. **Cut over**: `frontend_on_cloudfront = true` in `prod.tfvars.sops`, then plan and
    apply. The plan should change `aws_route53_record.apex` and `.tenants` from
    the IP to an alias, and add two `spa_ipv6` records. Nothing else. The next
    release's smoke check then covers the apex and a tenant host too: it notices
    CloudFront's `x-amz-cf-id` header on the apex.
-8. **Watch for a day**, then remove the SPA from Caddy, `deploy.sh` and
-   `add-tenant.sh` (the step-4 follow-up in `../docs/followups.md`). Do it within
-   about 30 days: Caddy can no longer renew the apex and tenant certificates
-   once DNS points elsewhere.
+8. **Watch for a day**, then remove the SPA from the VM. Done in
+   `../docs/decisions.md` §364: Caddy keeps only `api.` and vanity hosts,
+   `deploy.sh` builds no SPA, and `add-tenant.sh` writes no Caddy block.
 
-**Rollback**: set `frontend_on_cloudfront = false` and apply. The records swap
-back to the VM, whose Caddy still serves the SPA until step 8. For a bad
-*build*, rather than bad infrastructure, see `../deploy/README.md` § Frontend
-rollback.
+**Rollback**: since step 8, setting `frontend_on_cloudfront = false` is an
+outage, not a rollback: the records would swap back to a VM with no site block
+for the apex or a tenant. The only way back to the VM serving the SPA is
+re-deploying a commit from before §364 (its `deploy.sh` builds and publishes
+the SPA under `deploy/www/` again), putting back the `<slug>.<domain> { import
+spa }` block per tenant that the first §364 deploy dropped from
+`deploy/tenants.caddy` (its log lists them), and only then the flag. For a bad *build*,
+rather than bad infrastructure, see `../deploy/README.md` § Frontend rollback.
+
+## Uptime checks and paging
+
+`uptime.tf` checks the product from outside, and the pager topic in
+`monitoring.tf` texts the operator's phone when it fails (`../docs/decisions.md`
+§311). The alarms above all watch AWS's view from inside the account. None of
+them notices a wrong DNS record, a Caddy that stopped proxying, or an API
+container that exited on a healthy VM.
+
+**What it creates**
+
+- **Route 53 HTTPS health checks** (with SNI) from three regions (`us-east-1`,
+  `us-west-2`, `eu-west-1`) every 30 seconds. An endpoint reads unhealthy after 3
+  failures in a row, about 90 seconds:
+  - `https://<domain>/`, the apex SPA;
+  - `https://api.<domain>/api/health`, matched on the body `"status":"ok"`, so a
+    200 from anything else (the SPA router answering that path with
+    `index.html`, a parked domain) fails. `backend/tests/test_sweep_health.py`
+    pins the string against what the endpoint really sends;
+  - `https://<uptime_tenant_slug>.<domain>/`, one tenant host: the wildcard
+    record, the wildcard SAN and, before the CloudFront cutover, that tenant's
+    Caddy block. Skipped while `uptime_tenant_slug` is unset.
+- **One alarm per check** (`<project>-<env>-uptime-<apex|api|tenant>`), in
+  us-east-1 because Route 53 publishes health-check metrics only there. It goes
+  to the pager topic (text) **and** the alerts topic (email), on failure and on
+  recovery. Missing data counts as a failure, so expect one page right after the
+  first apply, before Route 53's first datapoint.
+- **The pager topic** (`<project>-<env>-pager`, us-east-1) and, when
+  `alert_phone_number` is set, its SMS subscription, the account's SMS type set
+  to Transactional, and two email alarms: a text SNS failed to deliver
+  (`pager-sms-failed`), and this month's SMS spend reaching 80% of the
+  account's SMS spend limit (`pager-sms-spend`), past which SNS stops texting.
+- **Which alarms page:** the uptime checks and `db-storage-low` (past it writes
+  fail, and no uptime check notices first). Everything else stays email-only:
+  CPU, memory and CPU credits are sizing and cost signals, and a failed VM status
+  check or a CloudFront error surge that customers can see already fails an
+  uptime check, so paging those too would send two or three texts per incident.
+- **Certificate expiry** (`<project>-<env>-certificate-expiry`, email): the ACM
+  certificate's `DaysToExpiry` under 30. Route 53 checks complete the TLS
+  handshake but don't validate the certificate, so an expired one would pass
+  them. ACM renews from 60 days out on its own, so this only fires when that
+  renewal has failed. The VM's own Let's Encrypt certificate (Caddy, on `api.`)
+  is the certificate canary's job: § Certificate canary.
+
+**Cost**: about **$8–13 a month**. Each HTTPS check is $0.50–0.75 a month plus
+$1–2 for HTTPS and, on the API, $1–2 for the string match. The lower figures are
+AWS's rates for an AWS endpoint, and these checks may bill at the non-AWS rate
+since they target hostnames. That comes to $5.50–10.25 for three checks. The
+toll-free number is $2 a month, each text about a cent (base fee plus carrier
+fee, `aws.amazon.com/end-user-messaging/pricing`), and up to six new alarms
+about $0.60. The 10-second fast interval and latency graphs are off: each adds $1–2
+per check. Fewer regions don't lower the price, which is per check, but they
+cut the requests the checkers make against CloudFront and the API. The $75
+budget still covers the stack plus this.
+
+**Phone delivery, before you set `alert_phone_number`** (US numbers; these are
+console steps, not Terraform). New accounts are in the SNS **SMS sandbox**,
+which texts only verified numbers (up to 10). The operator is the only
+recipient, so the sandbox is fine to stay in. US carriers also refuse SMS
+without a registered **origination identity**. A toll-free number is the
+cheapest: $2 a month, registration in about 15 days.
+
+1. **Request a toll-free number** in the AWS End User Messaging SMS console, in
+   **us-east-1** (a number belongs to one region, and the pager topic is
+   there): SMS capability, message type Transactional. Requesting it opens its
+   registration form.
+2. **Complete the registration.** Business type *Sole proprietor* (no EIN
+   needed), website `https://feohledger.com`, privacy and terms URLs
+   `https://feohledger.com/legal/privacy` and `https://feohledger.com/legal/terms`
+   (required on registrations since 2026-09-15), use case *Account
+   notifications*, with details along the lines of "infrastructure alerts sent
+   only to the business owner's own phone". Message sample:
+   `ALARM: "feohledger-prod-uptime-api" in US East (N. Virginia)`. The form also
+   asks for a street address and contact phone. Those go to AWS and the
+   carriers, not to any published page. The number sends nothing until the
+   registration reads **Complete**.
+3. **Let SNS use the number.** AWS's registration docs require a resource
+   policy on it for SNS: on the number's *Resource policy* tab, allow
+   `sns.amazonaws.com` `sms-voice:SendTextMessage` on that number, conditioned
+   on `aws:SourceAccount` = this account
+   (`docs.aws.amazon.com/sms-voice/latest/userguide/shared-resources.html`).
+4. **Verify the destination number** in the SNS console, us-east-1 → Text
+   messaging (SMS) → Sandbox destination phone numbers → Add phone number, then
+   enter the code it texts.
+5. The SMS spend limit for a new account is $1 a month, about a hundred texts.
+   That covers paging; `pager-sms-spend` emails at 80% of it, in time to raise
+   it in the SNS console's text messaging preferences.
+
+**Operator steps**
+
+1. **Apply the checks** (they need no phone): add `uptime_tenant_slug` (a
+   tenant you control, such as the test tenant) to `prod.tfvars.sops`, then plan and
+   apply as in § Workload stack step 3. The plan should add the health checks
+   (two, or three with the slug), one `uptime` alarm per check,
+   `platform_certificate_expiry` and `aws_sns_topic.pager`. It should change
+   only `db_storage` (its actions gain the pager topic) and destroy nothing.
+   Each alarm emails ALARM, then OK, within a few minutes of the apply.
+2. **Add the phone** once the toll-free registration is Complete and the
+   number is verified: `alert_phone_number = "+1…"` in `prod.tfvars.sops`, then plan
+   and apply again. The plan should add `pager_sms`, the `pager` SMS
+   preferences, `pager_delivery_failed` and `pager_sms_spend`, and the number shows as
+   `(sensitive value)`.
+3. **Ring the phone**:
+   `aws cloudwatch set-alarm-state --alarm-name feohledger-prod-uptime-api --state-value ALARM --state-reason "Paging test" --region us-east-1 --profile feohledger`.
+   A text and an email arrive within a minute. The next evaluation sets the
+   alarm back to OK, which sends a second text. If no text comes, check
+   `feohledger-prod-pager-sms-failed` and the registration status.
+
+## Certificate canary
+
+`canary.tf` watches the one certificate no AWS metric sees: the Let's Encrypt
+certificate Caddy obtains and renews on the VM for `api.<domain>` (since
+`../docs/decisions.md` §364 the apex and tenant hosts are on CloudFront's ACM
+certificate, which § Uptime checks and paging already covers). The Route 53
+checks complete the TLS handshake without validating the certificate, so an
+expired one reads healthy there while every browser refuses the API.
+
+**What it creates**
+
+- **A CloudWatch Synthetics canary** `<project>-<env>-cert` (us-east-1), on the
+  pinned runtime `syn-nodejs-puppeteer-19.0`, running
+  `canary/api-certificate/index.js` **hourly**. It fetches
+  `https://api.<domain>/api/health` with Node's certificate validation on (an
+  expired, self-signed or wrong-host certificate fails the handshake), fails the
+  run when the certificate has fewer than `certificate_canary_min_days` (default
+  **14**, must be under 30) days left, and requires the liveness body
+  `"status":"ok"`. Caddy renews 30 days ahead, so a failing run means renewal
+  has been failing for over two weeks.
+- **An alarm** `<project>-<env>-api-certificate` on the canary's
+  `SuccessPercent`: two failed hourly runs in a row **page and email**, like the
+  uptime checks. Missing data is breaching (a canary that stops running is a
+  watch gone blind), so expect one page right after the first apply, before
+  the first two runs land.
+- **An artifacts bucket** `<project>-canary-<env>-<account-id>`: versioned,
+  SSE-KMS under the app key, public access blocked, access-logged to the sink,
+  TLS only, run reports expired after 30 days.
+- **An execution role** `<project>-<env>-certificate-canary`, trusted by Lambda
+  in this account only, allowed to write its own artifacts (`canary/*`) and log
+  group (`/aws/lambda/cwsyn-<name>-*`), use the app key, and publish metrics to
+  the `CloudWatchSynthetics` namespace only. `s3:ListAllMyBuckets` and
+  `cloudwatch:PutMetricData` take `"*"` because AWS offers no narrower resource.
+
+**Runtime upkeep.** The runtime is pinned, never floating. AWS deprecates old
+Synthetics runtimes, and a canary on a deprecated one can no longer be updated,
+so bump `local.certificate_canary_runtime` to the newest
+`syn-nodejs-puppeteer-*` listed under "Runtime versions using Node.js and
+Puppeteer" in the CloudWatch docs whenever this file is touched. The script uses
+only `node:https`, so a runtime bump needs no code change.
+
+**Cost**: about **$1 a month**: $0.0012 a run × ~730 runs ≈ $0.88 (the list
+price this was sized on; check the CloudWatch pricing page), one alarm $0.10,
+a few KB of S3 artifacts and logs, Lambda time inside the free tier.
+
+**Applied 2026-11-21**, first run **Passed**. To re-apply after a change, plan and
+apply as in § Workload stack step 3, which needs `db_master_password` like any
+plan of this stack. The first apply also brought up everything else on `main`
+that had not been applied yet: the uptime health checks and their pager topic
+(§ Uptime checks and paging, still without a phone), the `frontend-404` alarm
+replacing `frontend-4xx` with the CloudFront metrics subscription it needs, and
+the platform certificate expiry alarm. It destroyed only the old 4xx alarm. After any apply, in the
+CloudWatch console (us-east-1) → Application Signals → Synthetics Canaries,
+the first run should be **Passed**, its log naming the certificate's issuer and
+days left. To see the failure path without touching production, run the
+script locally against an expired host
+(`CANARY_HOST=expired.badssl.com CANARY_PATH=/ node -e 'require("./canary/api-certificate/index.js").handler().catch(e=>console.log(e.message))'`).
 
 ## Secrets
 
-This repo is **public**, so it holds no secret — not even an encrypted one (`../docs/decisions.md` §12, §165). The project's secrets live sops-encrypted in the private `Absence0760/infra-secrets` repo under `feohledger/`, keyed by `alias/feohledger-sops`. The estate account bootstrap (`~/github/templates/scripts/new-project-account.sh`) created that key in the FeohLedger account, alongside the state bucket and the deploy role; this module neither creates nor manages it.
+This repo is **public**, so it holds no secret — not even an encrypted one (`../docs/decisions.md` §12, §165). The project's secrets live sops-encrypted in the private `jaredhoward-dev/infra-secrets` repo under `feohledger/`, keyed by `alias/feohledger-sops`. The estate account bootstrap (`~/github/templates/scripts/new-project-account.sh`) created that key in the FeohLedger account, alongside the state bucket and the deploy role; this module neither creates nor manages it.
 
-The one secret this module handles is the RDS master password, and it handles it without storing it: an ephemeral variable feeding a write-only attribute, supplied from `infra-secrets/feohledger/terraform.sops.yaml` at apply time (§ Workload stack). The earlier plan here — a `carlpett/sops` `sops_file` data source — was dropped because a data source's value lands in state in plaintext; the write-only path keeps it out of state and plan files entirely. Every other variable is operator config, not a credential. Access is IAM — an operator needs `kms:Decrypt` on the key plus read access to the private repo; nothing in this repo changes. Rotation: `../docs/secrets-rotation.md`.
+The one secret this module handles is the RDS master password (break-glass only — the app signs in with IAM tokens, `../docs/decisions.md` §310), and it handles it without storing it: an ephemeral variable feeding a write-only attribute, supplied from `infra-secrets/feohledger/terraform.sops.yaml` at apply time (§ Workload stack). The earlier plan here — a `carlpett/sops` `sops_file` data source — was dropped because a data source's value lands in state in plaintext; the write-only path keeps it out of state and plan files entirely. Every other variable is operator config, not a credential; it is still sops-encrypted in `infra-secrets/feohledger/prod.tfvars.sops` and decrypted only for the length of `terraform plan` (§ Applying). Access is IAM — an operator needs `kms:Decrypt` on the key plus read access to the private repo; nothing in this repo changes. Rotation: `../docs/secrets-rotation.md`.
 
 ## Tearing everything down
 
@@ -369,7 +548,7 @@ Note: audit-logs bucket uses Object Lock in **Compliance** mode — you cannot d
 
 ## See also
 
-- `~/github/infra-secrets/feohledger/` (private) — the encrypted secrets and their plaintext template
+- `~/github/infra-secrets/feohledger/` (private) — the encrypted secrets, `prod.tfvars.sops`, and their plaintext template
 - `~/github/project-mgmt/docs/secrets-management.md` — the estate secrets pattern
 - `../backend/CLAUDE.md` § Secrets management — day-to-day encrypt/decrypt workflow
 - `../docs/soc2-readiness.md` — control-by-control status + pending items

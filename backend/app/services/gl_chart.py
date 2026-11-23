@@ -42,10 +42,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.gl_account import GLAccount
+from app.services.erp_link_realm import link_is_live
 
 
 @dataclass(frozen=True)
@@ -315,6 +316,51 @@ async def load_invoice_chart(
     return InvoiceChart(ownership=ownership, entity_id=entity_id, has_active_accounts=has_active)
 
 
+def gl_code_off_chart(
+    code: ColumnElement,
+    entity_id: ColumnElement,
+    organization_id: ColumnElement,
+) -> ColumnElement[bool]:
+    """SQL twin of "``InvoiceChart.judge([code])`` would refuse it" for a row
+    that STORES a GL code — true when the row's code, judged against the chart
+    of the row's own entity today, is another entity's (§194) or, while that
+    chart has any active account, not an active account of it (§199).
+
+    For a reader that has to ask the question of many stored rows at once — a
+    filter or a flag over a whole list, where one :func:`load_invoice_chart`
+    per row would be a query per row. The three arguments are the row's own
+    columns, so the subqueries correlate to it. A blank / NULL code is never
+    off the chart, exactly as :meth:`InvoiceChart.judge` skips one.
+    ``tests/test_gl_code_entity_chart.py`` pins this against ``judge`` over the
+    same verdict matrix, so the two cannot drift.
+    """
+    base = GLAccount.organization_id == organization_id
+    # `entity_id = NULL` is NULL, so a NULL-entity row sees the shared chart
+    # alone — `ChartOwnership.in_own_chart`'s rule.
+    own = or_(GLAccount.entity_id.is_(None), GLAccount.entity_id == entity_id)
+    same_code = GLAccount.code == code
+    active = GLAccount.is_active.is_(True)
+    in_own_active = select(GLAccount.id).where(base, own, same_code, active).exists()
+    in_own_any = select(GLAccount.id).where(base, own, same_code).exists()
+    elsewhere = (
+        select(GLAccount.id)
+        .where(
+            base,
+            same_code,
+            GLAccount.entity_id.is_not(None),
+            GLAccount.entity_id.is_distinct_from(entity_id),
+        )
+        .exists()
+    )
+    chart_has_active = select(GLAccount.id).where(base, own, active).exists()
+    return and_(
+        code.is_not(None),
+        code != "",
+        ~in_own_active,
+        or_(chart_has_active, and_(~in_own_any, elsewhere)),
+    )
+
+
 async def refuse_gl_codes_outside_chart(
     db: AsyncSession,
     *,
@@ -351,6 +397,9 @@ async def resolve_erp_account_ids(
     organization_id: uuid.UUID,
     entity_id: uuid.UUID | None,
     codes: Iterable[str | None],
+    *,
+    realm: str | None = None,
+    trust_legacy: bool = False,
 ) -> dict[str, str]:
     """Map each of ``codes`` to its account's ERP id (``erp_account_id``) in
     the invoice's own chart — shared ∪ ``entity_id``'s own. One query.
@@ -358,7 +407,7 @@ async def resolve_erp_account_ids(
     Resolution follows the chart rule this module owns: never another entity's
     account, and where a code exists in BOTH scopes the entity's own row is the
     account (it OVERRIDES the shared one — the precedence
-    ``api/gl_accounts._sync_match_query`` applies). ``entity_id`` None sees the
+    ``services/gl_account_sync._preference`` applies). ``entity_id`` None sees the
     shared chart alone. Read over every row, active or retired, like
     :meth:`ChartOwnership.in_own_chart`: the code on the invoice still names
     that account, and whether the ERP will post to it is the ERP's call.
@@ -366,6 +415,14 @@ async def resolve_erp_account_ids(
     A code that resolves to no account, or to one with no ``erp_account_id``
     (never synced from the ERP), is ABSENT from the result. The ERP push
     refuses such a line rather than guess.
+
+    So is one whose link belongs to another ERP company: ``realm`` is the
+    connection being posted to, and a link stamped with any other realm — or
+    a pre-0115 NULL one unless ``trust_legacy`` — does not resolve
+    (``services/erp_link_realm``, docs/decisions.md §284). An id only means
+    something in the company that issued it. ``realm`` None filters nothing.
+    The row still decides precedence: an entity's own row whose link is dead
+    does not fall back to the shared account.
     """
     wanted = sorted({c for c in codes if c})
     if not wanted:
@@ -377,7 +434,12 @@ async def resolve_erp_account_ids(
     )
     rows = (
         await db.execute(
-            select(GLAccount.code, GLAccount.entity_id, GLAccount.erp_account_id).where(
+            select(
+                GLAccount.code,
+                GLAccount.entity_id,
+                GLAccount.erp_account_id,
+                GLAccount.erp_link_realm,
+            ).where(
                 GLAccount.organization_id == organization_id,
                 GLAccount.code.in_(wanted),
                 in_chart,
@@ -386,7 +448,9 @@ async def resolve_erp_account_ids(
     ).all()
     shared: dict[str, str | None] = {}
     own: dict[str, str | None] = {}
-    for code, owner, erp_id in rows:
+    for code, owner, erp_id, link_realm in rows:
+        if erp_id and not link_is_live(link_realm, realm, trust_legacy=trust_legacy):
+            erp_id = None
         (shared if owner is None else own)[code] = erp_id
     resolved: dict[str, str] = {}
     for code in wanted:

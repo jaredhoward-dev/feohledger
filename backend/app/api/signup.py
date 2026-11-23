@@ -26,7 +26,19 @@ The split protects against:
   - Abusive slug squatting: a slug is only locked up once the verification
     is consumed, so abandoned signups don't waste namespace.
   - Partial failures: if provisioning fails mid-way at /complete, the
-    verification token is left unconsumed and can be retried.
+    verification token is left unconsumed and can be retried (provisioning
+    drops the database it created, so a retry starts clean).
+  - An address that already has an account: ``users.email`` is unique across
+    every organization, so it could never be provisioned. /start answers it
+    exactly like any other address (a public endpoint must not say which
+    addresses have accounts), and /complete — where the visitor has proven
+    they read the mailbox — refuses it, coded ``signup_email_has_workspace``,
+    with the existing workspace's sign-in link, and spends the token
+    (decisions §292).
+  - Re-opening the link: a reload, a second tab, or a mail scanner that ran
+    the page first. /complete re-answers a spent token whose workspace exists
+    with that workspace (``already_verified: true``) instead of a 410, and
+    issues nothing new — no second set-password link (decisions §292).
 """
 
 from __future__ import annotations
@@ -41,9 +53,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.refusals import coded_refusal
 from app.config import settings
 from app.database import get_control_db
+from app.models.organization import Organization
 from app.models.signup import EmailVerification
+from app.models.user import User
 from app.schemas.signup import (
     SignupCompleteRequest,
     SignupCompleteResponse,
@@ -69,7 +84,7 @@ from app.services.email_adapters.layout import (
 )
 from app.services.rate_limit import check_rate_limit, resolve_client_ip
 from app.services.tenant_provisioning import provision_tenant
-from app.utils.emails import looks_like_email
+from app.utils.emails import email_matches, exact_email_first, looks_like_email
 from app.utils.hcaptcha import CaptchaError, verify_captcha
 from app.utils.slug import SlugError, ensure_slug_available, validate_slug_format
 from app.utils.tenant_urls import password_reset_url, sign_in_url, tenant_base_url
@@ -103,6 +118,44 @@ router = APIRouter(
 
 VERIFICATION_TTL = timedelta(hours=24)
 
+#: /complete for an address that already has an account (decisions §292).
+SIGNUP_EMAIL_HAS_WORKSPACE = "signup_email_has_workspace"
+
+# Every other refusal on this router is coded too (`api/refusals.coded_refusal`),
+# so the signup and verify pages state it in the visitor's language instead of
+# this module's English (issue #635 finding 18). A refusal about one form field
+# carries `params.field` — the `SignupStartRequest` field name — so the page
+# can put it under that field. The workspace-address refusals take their code
+# from `utils/slug.SlugError.code`; the captcha's from `utils/hcaptcha`. Each
+# code is exactly as specific as the English it replaces: none of them says
+# anything about which addresses have accounts (that stays /complete's, after
+# the mailbox is proven — decisions §292). A slug resting after its workspace
+# was closed is `utils/slug.SLUG_HELD` (`signup_slug_held`, decisions §306):
+# its own code, so the page says the address is temporarily unavailable rather
+# than taken — nobody owns it, and "taken" would send the visitor looking for
+# its owner.
+SIGNUP_EMAIL_INVALID = "signup_email_invalid"
+SIGNUP_NAME_HAS_LINK = "signup_name_has_link"
+SIGNUP_EMAIL_SEND_FAILED = "signup_email_send_failed"
+SIGNUP_LINK_INVALID = "signup_link_invalid"
+SIGNUP_UNAVAILABLE = "signup_unavailable"
+SIGNUP_PROVISIONING_FAILED = "signup_provisioning_failed"
+
+_INVALID_LINK = "This verification link is invalid or has expired. Please sign up again."
+
+
+def _invalid_link() -> HTTPException:
+    """The uniform 410 for every token that cannot be acted on."""
+    return HTTPException(status_code=410, detail=coded_refusal(SIGNUP_LINK_INVALID, _INVALID_LINK))
+
+
+def _slug_refusal(status_code: int, exc: SlugError, slug: str) -> HTTPException:
+    """A workspace-address refusal, about the form's address field."""
+    return HTTPException(
+        status_code=status_code,
+        detail=coded_refusal(exc.code, str(exc), field="slug", slug=slug),
+    )
+
 
 def _tenant_url(slug: str) -> str:
     """Where the just-provisioned tenant's app lives.
@@ -125,7 +178,12 @@ def _validate_email_shape(email: str) -> None:
     # `app/utils/emails.py` owns the rule; partner provisioning and the
     # scheduled-report recipient list read the same one.
     if not looks_like_email(email):
-        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(
+                SIGNUP_EMAIL_INVALID, "Enter a valid email address.", field="admin_email"
+            ),
+        )
 
 
 # What a mail client would turn into a link on its own: a scheme, `www.`, an
@@ -141,7 +199,12 @@ _LINK_LIKE_NAME = re.compile(r"://|www\.|[@/\\]|\w\.[a-z]{2,}", re.IGNORECASE)
 def _validate_admin_name(name: str) -> None:
     if _LINK_LIKE_NAME.search(name):
         raise HTTPException(
-            status_code=422, detail="Your name can't contain a web or email address."
+            status_code=422,
+            detail=coded_refusal(
+                SIGNUP_NAME_HAS_LINK,
+                "Your name can't contain a web or email address.",
+                field="admin_name",
+            ),
         )
 
 
@@ -166,7 +229,7 @@ async def slug_check(
         await ensure_slug_available(slug, db)
         return SlugCheckResponse(slug=slug, available=True)
     except SlugError as exc:
-        return SlugCheckResponse(slug=slug, available=False, reason=str(exc))
+        return SlugCheckResponse(slug=slug, available=False, reason=str(exc), code=exc.code)
 
 
 @router.post("/start", response_model=SignupStartResponse)
@@ -189,7 +252,7 @@ async def signup_start(
     try:
         validate_slug_format(body.slug)
     except SlugError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise _slug_refusal(422, exc, body.slug) from exc
 
     # 2b. Per-EMAIL rate limit (keyed on the target address, normalised) so an
     #     attacker rotating IPs can't bomb one victim with verification emails.
@@ -207,13 +270,13 @@ async def signup_start(
     try:
         await verify_captcha(body.captcha_token, client_ip)
     except CaptchaError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=coded_refusal(exc.code, str(exc))) from exc
 
     # 4. Availability check at start-time (best-effort; re-checked at complete).
     try:
         await ensure_slug_available(body.slug, db)
     except SlugError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _slug_refusal(409, exc, body.slug) from exc
 
     # 5. Drop any prior un-consumed verifications for this email so a "resend"
     #    replaces rather than accumulates (caps unbounded pending-row growth,
@@ -281,7 +344,10 @@ async def signup_start(
         logger.exception("Failed to send verification email (verification id=%s)", verification.id)
         raise HTTPException(
             status_code=502,
-            detail="Couldn't send the verification email. Please try again.",
+            detail=coded_refusal(
+                SIGNUP_EMAIL_SEND_FAILED,
+                "Couldn't send the verification email. Please try again.",
+            ),
         ) from exc
 
     return SignupStartResponse(
@@ -309,30 +375,39 @@ async def signup_complete(
     # 1. Look up the verification and LOCK the row (SELECT ... FOR UPDATE) so
     #    two concurrent /complete calls for the same token can't both pass the
     #    consumed-check and double-provision the tenant. The loser blocks until
-    #    the winner commits, then sees consumed_at set below.
+    #    the winner commits, then sees consumed_at set and is re-answered below.
     result = await db.execute(
         select(EmailVerification).where(EmailVerification.token == body.token).with_for_update()
     )
     verification = result.scalar_one_or_none()
 
-    # Uniform response for every non-actionable token state (missing, already
-    # used, expired) — a distinct 404-vs-410 would let a scraper tell a token
-    # that never existed from one that did.
-    if (
-        verification is None
-        or verification.consumed_at is not None
-        or verification.expires_at < datetime.now(UTC)
-    ):
-        raise HTTPException(
-            status_code=410,
-            detail="This verification link is invalid or has expired. Please sign up again.",
-        )
+    # Uniform response for every token that cannot be acted on (missing,
+    # expired, or spent with nothing to show for it) — a distinct 404-vs-410
+    # would let a scraper tell a token that never existed from one that did.
+    if verification is None or verification.expires_at < datetime.now(UTC):
+        raise _invalid_link()
 
-    # 2. Re-check slug availability in case another signup raced ahead.
+    # 1b. A spent link is re-answered, never re-run (decisions §292): the page
+    #     redeems on load, so a reload, a second tab or a mail scanner that ran
+    #     it first used to meet "invalid, sign up again" — and signing up again
+    #     then failed on the slug this very link had just claimed.
+    if verification.consumed_at is not None:
+        return await _answer_spent_link(db, verification, response)
+
+    # 2. An address that already has an account cannot be provisioned:
+    #    `users.email` is unique across every organization. Refused HERE, not
+    #    at /start — the visitor has now proven they read this mailbox, so
+    #    naming the workspace tells nobody anything new; /start is public and
+    #    must answer every address alike (decisions §292). Checked before the
+    #    slug, so someone signing up again for their own workspace is pointed
+    #    at it rather than told the name is taken.
+    await _refuse_if_email_has_account(db, verification)
+
+    # 2a. Re-check slug availability in case another signup raced ahead.
     try:
         await ensure_slug_available(verification.slug, db)
     except SlugError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise _slug_refusal(409, exc, verification.slug) from exc
 
     # 2b. Refuse BEFORE provisioning when there is nowhere to send the admin.
     #     The admin will have no password, and both the set-password link and
@@ -347,7 +422,10 @@ async def signup_complete(
         )
         raise HTTPException(
             status_code=503,
-            detail="Workspace creation is temporarily unavailable. Please try again later.",
+            detail=coded_refusal(
+                SIGNUP_UNAVAILABLE,
+                "Workspace creation is temporarily unavailable. Please try again later.",
+            ),
         )
 
     # 3. Provision the tenant. The admin gets NO password: they choose their
@@ -364,10 +442,36 @@ async def signup_complete(
             must_change_password=False,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Provisioning failed for slug=%s", verification.slug)
+        # `provision_tenant` has already dropped the database it created and
+        # removed any control-plane rows it committed, so nothing half-made is
+        # left behind. A race lost since the checks above (the address or the
+        # slug taken in between) is a definite answer, stated as one, rather
+        # than a 500 the link would repeat on every reload. The traceback is
+        # logged only after both are ruled out: a lost unique-index race
+        # carries Postgres' `Key (email)=(…)` detail, which must not reach a
+        # log sink (PII). Those races log the slug alone.
+        slug = verification.slug
+        await db.rollback()
+        verification = (
+            await db.execute(
+                select(EmailVerification)
+                .where(EmailVerification.token == body.token)
+                .with_for_update()
+            )
+        ).scalar_one()
+        await _refuse_if_email_has_account(db, verification)
+        try:
+            await ensure_slug_available(verification.slug, db)
+        except SlugError as slug_exc:
+            logger.warning("Provisioning lost a slug race (slug=%s)", slug)
+            raise _slug_refusal(409, slug_exc, slug) from exc
+        logger.exception("Provisioning failed for slug=%s", slug)
         raise HTTPException(
             status_code=500,
-            detail=("Something went wrong while creating your workspace. Please contact support."),
+            detail=coded_refusal(
+                SIGNUP_PROVISIONING_FAILED,
+                "Something went wrong while creating your workspace. Please contact support.",
+            ),
         ) from exc
 
     # 4. Mark verification consumed (same txn as the commits already made by
@@ -437,7 +541,89 @@ async def signup_complete(
         tenant_url=tenant_url,
         admin_email=verification.email,
         set_password_url=set_password_url,
+        sign_in_url=sign_in_url(verification.slug, email=verification.email),
     )
+
+
+async def _account_for(db: AsyncSession, address: str) -> User | None:
+    """The account an address already names, in any organization.
+
+    Case- and padding-insensitive, like sign-in (`api/auth._user_by_email`):
+    the stored address is normalized, so `Jane@Example.com` collides with
+    `jane@example.com` at the unique index and has to collide here too.
+    """
+    return (
+        await db.execute(
+            select(User)
+            .where(email_matches(User.email, address))
+            .order_by(exact_email_first(User.email, address).desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _refuse_if_email_has_account(db: AsyncSession, verification: EmailVerification) -> None:
+    """409 ``signup_email_has_workspace`` when the address already has an account.
+
+    The link is spent before the refusal is raised — committed, because the
+    request's session rolls back on an exception — so it never runs
+    provisioning again; re-opening it re-derives this same answer through
+    `_answer_spent_link`. ``params.sign_in_url`` is the existing account's own
+    sign-in page, built as the wrong-workspace login refusal builds it
+    (`api/auth._refuse_other_workspace`).
+    """
+    user = await _account_for(db, verification.email)
+    if user is None:
+        return
+    org = await db.get(Organization, user.organization_id)
+    url = sign_in_url(org.slug, org.settings, email=verification.email) if org else None
+    slug = verification.slug
+    if verification.consumed_at is None:
+        verification.consumed_at = datetime.now(UTC)
+        verification.meta = {**(verification.meta or {}), "outcome": "email_has_workspace"}
+        await db.commit()
+    # The requested slug only — never the address (PII stays out of log sinks).
+    logger.info("Signup refused: the address already has an account (slug=%s)", slug)
+    raise HTTPException(
+        status_code=409,
+        detail=coded_refusal(
+            SIGNUP_EMAIL_HAS_WORKSPACE,
+            "This email address already has a FeohLedger workspace."
+            + (f" Sign in at {url}." if url else " Sign in on your workspace's own page."),
+            sign_in_url=url,
+        ),
+    )
+
+
+async def _answer_spent_link(
+    db: AsyncSession, verification: EmailVerification, response: Response
+) -> SignupCompleteResponse:
+    """The answer for a verification link that was already used.
+
+    When the link created its workspace — an organization on the link's slug
+    whose account is the link's address — the answer is that workspace again,
+    flagged ``already_verified``. Nothing is issued: no set-password link (the
+    first answer and the welcome email carry the only one, and minting another
+    would hand a fresh credential to every re-opening of an email link), no
+    email, no audit row. A link spent on the existing-account refusal re-states
+    the refusal. Anything else is the uniform 410.
+    """
+    org = (
+        await db.execute(select(Organization).where(Organization.slug == verification.slug))
+    ).scalar_one_or_none()
+    user = await _account_for(db, verification.email)
+    if org is not None and user is not None and user.organization_id == org.id:
+        response.headers["Cache-Control"] = "no-store"
+        return SignupCompleteResponse(
+            slug=org.slug,
+            tenant_url=tenant_base_url(org.slug, org.settings),
+            admin_email=verification.email,
+            set_password_url=None,
+            sign_in_url=sign_in_url(org.slug, org.settings, email=verification.email),
+            already_verified=True,
+        )
+    await _refuse_if_email_has_account(db, verification)
+    raise _invalid_link()
 
 
 async def _mint_set_password_url(slug: str, user_id: uuid.UUID) -> str | None:

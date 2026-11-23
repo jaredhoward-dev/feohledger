@@ -44,6 +44,10 @@ Controls, the same as the money path where the reason carries over:
 * a live virtual card, an applied credit that no longer pairs, or another live
   payment (one FeohLedger dispatched or holds in a run) refuses — each is a
   double-pay risk or a figure we cannot state;
+* a payment the ERP reported made on several rails (a live
+  ``paid_not_recorded`` row whose kept breakdown stands) refuses a person's
+  record by any door but that row's own one-click, which books the split
+  (:func:`erp_split_refusal`, decisions §426);
 * the amount is the invoice's net payable (credit memos, accepted early-pay
   discount at the paid-on date). A caller-stated amount must equal it; partial
   payments are not supported.
@@ -57,8 +61,9 @@ payable-status gate requires, already applied the CFO approval threshold.)
 
 from __future__ import annotations
 
+import logging
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -70,10 +75,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
-from app.models.payment import Payment
+from app.models.payment import Payment, PaymentRun
 from app.services.applied_credit_integrity import applied_credit_conflicts
 from app.services.approval_chain import violates_segregation
+from app.services.discount_opportunities import capture_discount_offers
 from app.services.payment_controls import run_segregation_enabled
+from app.services.payment_methods import (
+    RAIL_SPLIT_APPLIED,
+    RAIL_SPLIT_SUPERSEDED,
+    RAIL_SPLIT_UNRECONCILED,
+    RailPart,
+    RailSplit,
+    normalize_payment_method,
+    rail_breakdown_json,
+    split_by_rail,
+)
 from app.services.payment_runs import (
     blocking_exception_types,
     card_claimed_invoice_ids,
@@ -82,6 +98,9 @@ from app.services.payment_runs import (
     payable_amounts,
 )
 from app.services.workflow_engine import VALID_TRANSITIONS, transition_invoice
+from app.utils.currency_code import iso_currency_or_none
+
+logger = logging.getLogger(__name__)
 
 #: ``Payment.provider`` of every payment recorded through this module. Not a
 #: registered payment adapter, so nothing can ever dispatch, void upstream or
@@ -104,6 +123,12 @@ REFUSAL_PAYMENT_LIVE = "external_payment_payment_live"
 REFUSAL_PAYMENT_IN_RUN = "external_payment_in_run"
 REFUSAL_AMOUNT_MISMATCH = "external_payment_amount_mismatch"
 REFUSAL_AMOUNT_CHANGED = "external_payment_amount_changed"
+#: The invoice holds a live ``paid_not_recorded`` row whose kept ERP breakdown
+#: stands over more than one rail (decisions §396, §426): a person's record
+#: names one rail, so only the row's own one-click
+#: (``POST /api/exceptions/{id}/record-erp-payment``) may book it.
+#: ``params.exception_id`` is that row.
+REFUSAL_ERP_SPLIT = "external_payment_erp_split"
 
 
 @dataclass(frozen=True)
@@ -139,7 +164,7 @@ def paid_on_timestamp(paid_on: date) -> datetime:
 
 
 async def _live_payments(db: AsyncSession, invoice_id: uuid.UUID) -> list[Payment]:
-    from app.api.payments import LIVE_PAYMENT_TERMINAL_STATUSES
+    from app.models.payment import LIVE_PAYMENT_TERMINAL_STATUSES
 
     return list(
         (
@@ -204,12 +229,15 @@ async def check_recordable(
     org: Organization,
     invoice: Invoice,
     actor_id: uuid.UUID | None,
+    answering: frozenset[uuid.UUID] = frozenset(),
 ) -> Refusal | None:
     """Every invoice-level gate except the live-payment one. ``None`` = recordable.
 
-    The caller holds ``invoice`` FOR UPDATE.
+    The caller holds ``invoice`` FOR UPDATE. ``answering`` names exceptions this
+    very record answers, which therefore do not refuse it — see
+    :func:`record_invoice_paid_outside`.
     """
-    from app.api.payments import PAYABLE_INVOICE_STATUSES
+    from app.services.payment_gates import PAYABLE_INVOICE_STATUSES
 
     if invoice.status.value not in PAYABLE_INVOICE_STATUSES:
         return Refusal(
@@ -220,10 +248,15 @@ async def check_recordable(
     refusal = segregation_refusal(invoice, actor_id, org.settings)
     if refusal is not None:
         return refusal
-    return (await _state_refusals(db, [invoice])).get(invoice.id)
+    return (await _state_refusals(db, [invoice], answering=answering)).get(invoice.id)
 
 
-async def _state_refusals(db: AsyncSession, invoices: list[Invoice]) -> dict[uuid.UUID, Refusal]:
+async def _state_refusals(
+    db: AsyncSession,
+    invoices: list[Invoice],
+    *,
+    answering: frozenset[uuid.UUID] = frozenset(),
+) -> dict[uuid.UUID, Refusal]:
     """The actor-independent invoice-level gates of :func:`check_recordable`, batched.
 
     The ONE implementation of those gates: :func:`check_recordable` asks it about
@@ -232,7 +265,7 @@ async def _state_refusals(db: AsyncSession, invoices: list[Invoice]) -> dict[uui
     if not invoices:
         return {}
     ids = [inv.id for inv in invoices]
-    blocking = await blocking_exception_types(db, ids)
+    blocking = await blocking_exception_types(db, ids, exclude_exception_ids=answering)
     # `None` method: a recorded payment takes no card leg, so it may never be
     # booked against a card-claimed invoice — the fail-closed reading.
     card_claimed = await card_claimed_invoice_ids(db, ((i, None) for i in ids))
@@ -259,6 +292,103 @@ async def _state_refusals(db: AsyncSession, invoices: list[Invoice]) -> dict[uui
                 "currency, so the amount owed can't be stated. Correct the invoice first.",
             )
     return out
+
+
+async def _standing_erp_split(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    answering: frozenset[uuid.UUID] = frozenset(),
+):
+    """The invoice's live ``paid_not_recorded`` row whose kept split over
+    several rails stands, other than one in ``answering``; None if none."""
+    from app.services.erp_status_sync import kept_split_stands, live_erp_paid_reports
+
+    for row in await live_erp_paid_reports(db, [invoice.id], fresh=True):
+        if row.id not in answering and kept_split_stands(row.erp_report):
+            return row
+    return None
+
+
+async def erp_split_refusal(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    answering: frozenset[uuid.UUID] = frozenset(),
+    payment_run_id: uuid.UUID | None = None,
+) -> Refusal | None:
+    """Refuse a person's record of an invoice whose ERP-reported payment was
+    made on several rails, unless it answers that very row. ``None`` = allowed.
+
+    The row keeps how the ERP says the payment split rail by rail (§396), and
+    the one-click books that split (§413). A record through any other door
+    names one rail and books the invoice's own figure, so the split was
+    dropped and the card part landed on the payer's 1099. Rather than teach a
+    second door to read the row, the split is booked in ONE place: the row's
+    own one-click, which ``params.exception_id`` names (decisions §426). A row
+    whose breakdown does not stand (one rail, or parts that do not add up)
+    leaves the person's rail as the record, so any door may book it, as before.
+
+    ``payment_run_id``: the draft run the invoice is in, when the run-level
+    record asks. That one-click refuses an invoice in a run
+    (``external_payment_in_run``), so the refusal also says the invoice must
+    leave the run first, and carries the run as ``params.payment_run_id``
+    (:func:`_in_run_refusal`; round-13 amendment to §426).
+    """
+    row = await _standing_erp_split(db, invoice, answering=answering)
+    if row is None:
+        return None
+    if payment_run_id is not None:
+        return Refusal(
+            REFUSAL_ERP_SPLIT,
+            SPLIT_IN_RUN_MESSAGE,
+            params={"exception_id": str(row.id), "payment_run_id": str(payment_run_id)},
+        )
+    return Refusal(
+        REFUSAL_ERP_SPLIT,
+        "The ERP reports this invoice paid on more than one payment method. Record "
+        "it from its exception, which keeps how the payment was split.",
+        params={"exception_id": str(row.id)},
+    )
+
+
+#: The one sentence both doors give for an invoice in a draft run whose ERP
+#: split only its exception can book: each door alone refuses it, so each says
+#: the run has to let it go first (decisions §426, round-13 amendment). A draft
+#: run gives up its invoices only by being cancelled.
+SPLIT_IN_RUN_MESSAGE = (
+    "This invoice is in a payment run, and the ERP reports it paid on more than one "
+    "payment method, which only its exception can record. Cancel the run first, then "
+    "record the invoice from its exception."
+)
+
+
+async def _in_run_refusal(
+    db: AsyncSession,
+    invoice: Invoice,
+    payment_run_id: uuid.UUID,
+    *,
+    source: Source,
+) -> Refusal:
+    """``external_payment_in_run`` for an invoice in a draft run. For a person's
+    record of an invoice whose kept ERP split stands (the row's one-click, or
+    any other door), the run-level record is no way out either (it refuses
+    ``external_payment_erp_split``), so the refusal says to cancel the run and
+    names the row (``params.exception_id``)."""
+    if source == "user":
+        row = await _standing_erp_split(db, invoice)
+        if row is not None:
+            return Refusal(
+                REFUSAL_PAYMENT_IN_RUN,
+                SPLIT_IN_RUN_MESSAGE,
+                params={"payment_run_id": str(payment_run_id), "exception_id": str(row.id)},
+            )
+    return Refusal(
+        REFUSAL_PAYMENT_IN_RUN,
+        "This invoice is in a payment run. Record the whole run as paid "
+        "outside FeohLedger, or cancel the run first.",
+        params={"payment_run_id": str(payment_run_id)},
+    )
 
 
 _NOTHING_TO_PAY = Refusal(
@@ -339,7 +469,37 @@ async def _discount_predates_acceptance(
     return accepted_at is None or paid_on < accepted_at.astimezone(UTC).date()
 
 
-def _check_amount(stated: Decimal | None, owed: Decimal, currency: str | None) -> None:
+def _check_amount(
+    stated: Decimal | None,
+    owed: Decimal,
+    currency: str | None,
+    *,
+    stated_currency: str | None = None,
+    currency_stated: bool = False,
+) -> None:
+    """Refuse a stated amount that is not what is owed.
+
+    ``currency_stated`` says the figure came with a currency of its own (an
+    ERP's report), not keyed against this invoice: a missing one, or one
+    other than the invoice's, says nothing about what is owed here, so it is
+    refused the same way, never compared as a bare number (decisions §386).
+    """
+    if (
+        stated is not None
+        and currency_stated
+        and (
+            iso_currency_or_none(stated_currency) is None
+            or iso_currency_or_none(stated_currency) != iso_currency_or_none(currency)
+        )
+    ):
+        raise ExternalPaymentRefused(
+            Refusal(
+                REFUSAL_AMOUNT_MISMATCH,
+                "The payment is reported in another currency than the invoice's, or in none.",
+                http_status=422,
+                params={"amount": str(stated), "currency": stated_currency},
+            )
+        )
     if stated is not None and stated != owed:
         raise ExternalPaymentRefused(
             Refusal(
@@ -351,6 +511,15 @@ def _check_amount(stated: Decimal | None, owed: Decimal, currency: str | None) -
                 params={"amount": str(owed), "currency": currency},
             )
         )
+
+
+async def _sent_in_an_exported_file(db: AsyncSession, payment: Payment) -> bool:
+    if payment.payee_recorded_at is None or payment.payment_run_id is None:
+        return False
+    run_status = (
+        await db.execute(select(PaymentRun.status).where(PaymentRun.id == payment.payment_run_id))
+    ).scalar_one_or_none()
+    return run_status == "exported"
 
 
 async def _complete(
@@ -365,16 +534,34 @@ async def _complete(
     actor_id: uuid.UUID | None,
     source: Source,
     converted: bool,
+    actor_name: str | None = None,
+    rail_parts: Sequence[RailPart] = (),
 ) -> None:
     """Book ``payment`` as completed outside FeohLedger and walk the invoice to ``paid``."""
-    from app.api.payments import _capture_discount_offers
     from app.services.audit_dispatch import dispatch_audit
 
     at = paid_on_timestamp(paid_on)
     previous_status = payment.status if converted else None
+    split = _rail_split(rail_parts, payment.amount, method=method, source=source)
     payment.status = "completed"
     payment.provider = EXTERNAL_PAYMENT_PROVIDER
-    payment.method = method or payment.method
+    if split.status is None:
+        payment.method = method or payment.method
+    else:
+        # The ERP said which rails paid (decisions §396): that, not a rail the
+        # booking was staged with, is the record. Several rails, or parts that
+        # do not reconcile, leave `method` NULL; only an applied breakdown is
+        # kept, and the 1099 aggregate splits the payment by it.
+        payment.method = split.method
+        payment.rail_breakdown = rail_breakdown_json(split.breakdown) if split.breakdown else None
+        if split.status == RAIL_SPLIT_UNRECONCILED:
+            # Ids only: the breakdown is audited below, never logged.
+            logger.warning(
+                "ERP rail breakdown does not sum to the recorded amount; recorded as "
+                "1099-reportable: invoice=%s payment=%s",
+                invoice.id,
+                payment.id,
+            )
     payment.reference = reference
     payment.submitted_at = at
     payment.completed_at = at
@@ -384,6 +571,18 @@ async def _complete(
     # None for that case anyway, and inventing a rate would be worse).
     payment.settled_amount = payment.amount
     payment.settled_currency = (invoice.currency or "").upper() or None
+    # The payee this record pays (decisions §383): the invoice's vendor and its
+    # bank details on file now, the only payee FeohLedger can know for money it
+    # never saw move. An entry of an EXPORTED NACHA file keeps the payee that
+    # file carried, since the customer's upload is what paid it; a file the bank
+    # rejected (`/nacha/void`, run back to `draft`) paid nobody, so its stamp is
+    # replaced.
+    if not await _sent_in_an_exported_file(db, payment):
+        from app.services.payee_stamp import stamp_payee_from_vendor
+
+        await stamp_payee_from_vendor(
+            db, payment, invoice=invoice, organization_id=org.id, at=datetime.now(UTC)
+        )
     await db.flush()
 
     await dispatch_audit(
@@ -409,10 +608,25 @@ async def _complete(
             "discount_amount": (
                 str(payment.discount_amount) if payment.discount_amount is not None else None
             ),
+            # Which rails the ERP says paid how much (each cash payment's rail
+            # and exact amount, no account data), and whether it stands:
+            # `applied` (kept on the payment, the 1099 splits by it),
+            # `unreconciled` (its parts do not sum to `amount`: dropped, the
+            # whole payment reportable) or `superseded` (a person named another
+            # rail). Absent when no breakdown was stated (decisions §396).
+            **(
+                {
+                    "rail_breakdown": rail_breakdown_json(split.stated),
+                    "rail_breakdown_status": split.status,
+                    "method_stated": method,
+                }
+                if split.status is not None
+                else {}
+            ),
         },
     )
 
-    await _capture_discount_offers(
+    await capture_discount_offers(
         db, org=org, payment=payment, actor_id=actor_id, now=at, invoice=invoice
     )
 
@@ -435,6 +649,56 @@ async def _complete(
         details=details,
     )
 
+    # A "the ERP reported this paid and we couldn't record it" exception is
+    # answered now, whichever door recorded the payment (decisions §319).
+    from app.services.erp_status_sync import close_erp_paid_reports
+
+    await close_erp_paid_reports(
+        db, invoice, actor_id=actor_id, actor_name=actor_name, org_settings=org.settings
+    )
+
+
+def split_stands_over_any_rail(parts: Sequence[RailPart], amount: Decimal) -> bool:
+    """Would this ERP breakdown be the record whatever one rail a person names?
+
+    True exactly when :func:`_rail_split` keeps it against a person's rail: it
+    reconciles (``split_by_rail`` applies it) and it spans more than one rail,
+    a part with no rail stated counting as one of them. The exception queue's
+    record dialog reads this to show the split in place of a rail picker, and
+    ``POST /api/exceptions/{id}/record-erp-payment`` to accept a record that
+    names no rail (decisions §396, §413). ``parts`` are as booked: run through
+    ``erp_status_sync.reported_payment_parts`` first."""
+    split = split_by_rail(parts, amount, method=None)
+    return split.status == RAIL_SPLIT_APPLIED and len({p.method for p in split.breakdown}) > 1
+
+
+def _rail_split(
+    parts: Sequence[RailPart], amount: Decimal, *, method: str | None, source: Source
+) -> RailSplit:
+    """The ERP's per-payment breakdown judged against the amount booked
+    (``payment_methods.split_by_rail``), with a person's word on top: a person
+    recording it (the exception queue's one-click) who names one rail other
+    than the single rail the breakdown states (or states none for) has
+    corrected it, and their rail is the record (``superseded``). A breakdown
+    over several rails stands against a person's one rail, as the ERP's cash
+    figure stands against theirs: one rail cannot describe a payment made on two, and the record's
+    form asks for one (decisions §396). A breakdown that does not reconcile is
+    dropped whoever records it: the ERP's own record falls back to no rail
+    (reportable), a person's to the rail they named."""
+    split = split_by_rail(parts, amount, method=method)
+    if source == "user" and split.status == RAIL_SPLIT_UNRECONCILED:
+        return RailSplit(method=method, status=RAIL_SPLIT_UNRECONCILED, stated=split.stated)
+    if (
+        source == "user"
+        and split.status == RAIL_SPLIT_APPLIED
+        # One rail across every part, stated or not: a person's rail corrects
+        # it, or fills in a rail the ERP did not state.
+        and len({p.method for p in split.breakdown}) == 1
+        and normalize_payment_method(method) != (split.method or "")
+    ):
+        return RailSplit(method=method, status=RAIL_SPLIT_SUPERSEDED, stated=split.stated)
+    return split
+
 
 async def record_invoice_paid_outside(
     db: AsyncSession,
@@ -447,10 +711,37 @@ async def record_invoice_paid_outside(
     actor_id: uuid.UUID | None,
     source: Source,
     amount: Decimal | None = None,
+    answering_exception_ids: frozenset[uuid.UUID] = frozenset(),
+    actor_name: str | None = None,
+    amount_currency: str | None = None,
+    rail_parts: Sequence[RailPart] = (),
 ) -> RecordedPayment:
     """Record one invoice as paid outside FeohLedger. Never commits.
 
     The caller holds ``invoice`` FOR UPDATE (`get_invoice_for_update`).
+
+    ``amount`` is refused (``amount_mismatch``) unless it is what is owed. With
+    ``source="erp"`` it is the ERP's own figure, in ``amount_currency``, and a
+    missing or different currency is refused the same way. Both are judged
+    after the live-claim refusals, so a FeohLedger payment, run or card on the
+    invoice is named first (§309).
+
+    ``rail_parts`` is the ERP's breakdown of the payment by rail (each cash
+    payment's rail and exact amount; ``ErpBillReport.payment_parts``). It is
+    kept on the payment only when its parts sum exactly to the amount booked,
+    and the 1099 then splits the payment by it; otherwise it is dropped, the
+    payment is recorded with no rail (reportable) and the audit row says so
+    (``_rail_split``, decisions §396).
+
+    ``answering_exception_ids`` names exceptions this record ANSWERS, so they do
+    not refuse it on the blocking-exception gate, nor, for a person's record,
+    on :func:`erp_split_refusal` (a kept ERP split is booked by its row only).
+    One caller passes any: the exception queue's one-click record of an
+    ERP-reported payment (`api/exceptions.record_erp_payment`), whose own row
+    is payment-blocking by design, and which has already applied that row's clearing rules to the
+    caller under lock. Every other gate still runs, and every refusal is raised
+    before anything is written or audited. On success that row is resolved by
+    `erp_status_sync.close_erp_paid_reports`, as ``actor_name`` (decisions §319).
 
     **Idempotent**: replaying the same record (same reference and paid-on date)
     for an invoice it already paid returns the existing payment with
@@ -463,7 +754,9 @@ async def record_invoice_paid_outside(
             if _same_record(existing, reference=reference, paid_on=paid_on):
                 return RecordedPayment(existing, created=False)
 
-    refusal = await check_recordable(db, org=org, invoice=invoice, actor_id=actor_id)
+    refusal = await check_recordable(
+        db, org=org, invoice=invoice, actor_id=actor_id, answering=answering_exception_ids
+    )
     if refusal is not None:
         raise ExternalPaymentRefused(refusal)
 
@@ -472,12 +765,7 @@ async def record_invoice_paid_outside(
     for existing in live:
         if existing.payment_run_id is not None:
             raise ExternalPaymentRefused(
-                Refusal(
-                    REFUSAL_PAYMENT_IN_RUN,
-                    "This invoice is in a payment run. Record the whole run as paid "
-                    "outside FeohLedger, or cancel the run first.",
-                    params={"payment_run_id": str(existing.payment_run_id)},
-                )
+                await _in_run_refusal(db, invoice, existing.payment_run_id, source=source)
             )
         if not _is_undispatched(existing) or target is not None:
             raise ExternalPaymentRefused(
@@ -490,11 +778,24 @@ async def record_invoice_paid_outside(
             )
         target = existing
 
+    if source == "user":
+        # After the live-claim refusals, so a FeohLedger payment or run on the
+        # invoice is named first (§309); before anything is written.
+        split_refusal = await erp_split_refusal(db, invoice, answering=answering_exception_ids)
+        if split_refusal is not None:
+            raise ExternalPaymentRefused(split_refusal)
+
     if target is not None:
         # A standalone booking FeohLedger never dispatched: the customer paid it
         # themselves. Complete it in place rather than leave it holding the
         # live-payment slot. Its booked amount is what is owed.
-        _check_amount(amount, target.amount, invoice.currency)
+        _check_amount(
+            amount,
+            target.amount,
+            invoice.currency,
+            stated_currency=amount_currency,
+            currency_stated=source == "erp",
+        )
         await _complete(
             db,
             org=org,
@@ -506,11 +807,19 @@ async def record_invoice_paid_outside(
             actor_id=actor_id,
             source=source,
             converted=True,
+            actor_name=actor_name,
+            rail_parts=rail_parts,
         )
         return RecordedPayment(target, created=True)
 
     owed, discount_offer_id, discount_amount = await _amount_owed(db, invoice, paid_on=paid_on)
-    _check_amount(amount, owed, invoice.currency)
+    _check_amount(
+        amount,
+        owed,
+        invoice.currency,
+        stated_currency=amount_currency,
+        currency_stated=source == "erp",
+    )
     payment = Payment(
         invoice_id=invoice.id,
         entity_id=invoice.entity_id,
@@ -549,6 +858,8 @@ async def record_invoice_paid_outside(
         actor_id=actor_id,
         source=source,
         converted=False,
+        actor_name=actor_name,
+        rail_parts=rail_parts,
     )
     return RecordedPayment(payment, created=True)
 
@@ -571,6 +882,9 @@ async def run_payment_refusal(
     cannot take it back, and the trail would record a payment that never was.
     """
     refusal = await check_recordable(db, org=org, invoice=invoice, actor_id=actor_id)
+    if refusal is not None:
+        return refusal
+    refusal = await erp_split_refusal(db, invoice, payment_run_id=payment.payment_run_id)
     if refusal is not None:
         return refusal
     if not _is_undispatched(payment):

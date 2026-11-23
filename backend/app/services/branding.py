@@ -195,19 +195,19 @@ def fetch_logo_bytes(logo_url: str | None) -> bytes | None:
     # SSRF guard: refuse to fetch a logo whose host resolves to an internal
     # address (e.g. the cloud metadata endpoint). Any user can trigger this via
     # a PDF export, and the admin-set logo_url is otherwise unvalidated.
-    from app.utils.url_safety import is_public_url
+    from app.utils.url_safety import is_public_url, pinned_client
 
     if not is_public_url(url):
         logger.info("brand logo fetch refused: non-public URL; using product-name header")
         return None
 
     try:
-        import httpx
-
-        # follow_redirects is OFF: a redirect to an internal host would bypass
-        # the pre-flight host check above. A redirecting CDN just yields a 3xx
-        # here, which we treat as a miss and fall back to the text header.
-        with httpx.Client(timeout=LOGO_FETCH_TIMEOUT_SECONDS, follow_redirects=False) as client:
+        # follow_redirects is OFF: a redirect is a miss here, and a redirecting
+        # CDN falls back to the text header. The client is PINNED: it re-vets
+        # the host in the connect and dials the vetted IP, so a DNS record that
+        # flips after the check above cannot reach an internal host. A refusal
+        # there raises, and lands in the best-effort fallback below.
+        with pinned_client(timeout=LOGO_FETCH_TIMEOUT_SECONDS, follow_redirects=False) as client:
             with client.stream("GET", url) as resp:
                 if resp.status_code != 200:
                     return None
@@ -311,6 +311,8 @@ def _platform_mark_header(brand: BrandContext, *, max_height_pt: float, name_sty
         from reportlab.pdfbase.pdfmetrics import stringWidth
         from reportlab.platypus import Paragraph, Table, TableStyle
 
+        from app.services.pdf_text import pdf_markup
+
         # Two text lines tall reads as a mark beside its name rather than a
         # banner over it, and the header box still caps it.
         side = min(max_height_pt, name_style.leading * 2)
@@ -323,7 +325,7 @@ def _platform_mark_header(brand: BrandContext, *, max_height_pt: float, name_sty
         style = ParagraphStyle("brand-mark-caption", parent=name_style, spaceBefore=0, spaceAfter=0)
         caption_w = stringWidth(caption, style.fontName, style.fontSize) + 2
         row = Table(
-            [[mark, Paragraph(_escape_html(caption), style)]],
+            [[mark, Paragraph(pdf_markup(caption), style)]],
             colWidths=[side + side / 4, caption_w],
             hAlign="LEFT",
         )

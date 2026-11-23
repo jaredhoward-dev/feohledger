@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Catalog, GuidedBuyingSuggestion } from '#lib/types/catalog.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { catalogTypeLabelKey, guidedBuyingReasonLabelKey } from '#lib/types/catalog.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
@@ -20,11 +21,15 @@
 	import CatalogModal from '#lib/components/modals/CatalogModal.svelte';
 	import PunchoutModal from '#lib/components/modals/PunchoutModal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto, replaceState } from '$app/navigation';
+	import { page } from '$app/state';
+	import { untrack } from 'svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	const canCreate = $derived(auth.isManager); // admin | ap_manager
 	// Buyers (admin / ap_manager / ap_clerk) may start a punch-out session.
@@ -62,8 +67,52 @@
 	// The list is paged: `total` is the whole filtered set, so a footer that
 	// says "Showing all {total}" is only true once every row is loaded.
 	let hasMore = $derived(catalogs.length < total);
-	let search = $state('');
-	let typeFilter = $state<string>('all'); // all | internal | punchout | preferred
+	// Search and type filter round-trip through the URL (`?search=`, `?type=`)
+	// like every sibling list, so back / reload / a shared link restore the
+	// view. `readUrlState` is the one reader — at mount, and again from
+	// `afterNavigate` for a navigation that reuses this page (a sidebar click
+	// while filtered, Back/Forward between two of its history entries), which
+	// a mount-only read never sees. `syncUrl()` is the only writer.
+	const TYPE_KEYS = ['all', 'internal', 'punchout', 'preferred'] as const;
+	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
+		const t = params.get('type');
+		return {
+			search: params.get('search') ?? '',
+			type: t && (TYPE_KEYS as readonly string[]).includes(t) ? t : 'all'
+		};
+	}
+	const initialUrl = readUrlState(page.url.searchParams);
+	let search = $state(initialUrl.search);
+	let typeFilter = $state<string>(initialUrl.type);
+
+	afterNavigate(({ from, to, type }) => {
+		if (type === 'enter' || !from || !to || from.route.id !== to.route.id) return;
+		const next = readUrlState(to.url.searchParams);
+		const typeChanged = next.type !== typeFilter;
+		const searchChanged = next.search !== search;
+		if (typeChanged) typeFilter = next.type;
+		// A search change reloads through the search effect, which reads the
+		// type filter too; only a type-only change needs its own fetch.
+		if (searchChanged) search = next.search;
+		else if (typeChanged) load();
+	});
+
+	// A WRITER, never a dependency: everything is read untracked, `page.url`
+	// included, or the replaceState would re-trigger the effect that called it.
+	// Merges into the current URL rather than rebuilding it, so params this
+	// page does not own survive, and skips the write when nothing changed.
+	function syncUrl() {
+		untrack(() => {
+			const url = new URL(page.url.href);
+			const q = search.trim();
+			if (q) url.searchParams.set('search', q);
+			else url.searchParams.delete('search');
+			if (typeFilter !== 'all') url.searchParams.set('type', typeFilter);
+			else url.searchParams.delete('type');
+			if (url.search === new URL(page.url.href).search) return;
+			replaceState(`${url.pathname}${url.search}`, {});
+		});
+	}
 
 	// --- Modal + selection state ---
 	let showCreate = $state(false);
@@ -93,9 +142,9 @@
 
 	const COLUMNS = $derived([
 		{ label: m('catalogs.col.name') },
-		{ label: m('catalogs.col.type') },
-		{ label: m('catalogs.col.items'), class: 'right' },
-		{ label: m('catalogs.col.status') },
+		{ label: m('catalogs.col.type'), class: 'col-type' },
+		{ label: m('catalogs.col.items'), class: 'right col-count' },
+		{ label: m('catalogs.col.status'), class: 'col-status' },
 		{ label: '', class: 'actions-col' }
 	]);
 
@@ -113,7 +162,12 @@
 		const nextPage = opts.append ? pageNum + 1 : 1;
 		const token = fetchSequence.start();
 		if (opts.append) loadingMore = true;
-		else loading = true;
+		else {
+			loading = true;
+			// Cleared when a fresh load STARTS, so Retry unmounts LoadError while
+			// the request is out and a second failure re-announces.
+			errored = false;
+		}
 		try {
 			const params: {
 				search?: string;
@@ -136,8 +190,22 @@
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// delete still failed, and no newer load is coming to report it.
 			if (!fetchSequence.isCurrentRequest(token)) return;
-			errored = true;
-			toast(err instanceof Error ? err.message : m('catalogs.toast.loadFailed'), 'error');
+			// A failed load-more, or a load a local delete already superseded,
+			// leaves trustworthy rows on screen: keep them and toast. Only a
+			// failed first page has nothing to show, so LoadError replaces the
+			// table (it used to do so for load-more too, throwing away every
+			// row already loaded).
+			if (opts.append || fetchSequence.wasSupersededByEdit(token)) {
+				toast(errorMessage(err, m('catalogs.toast.loadFailed')), 'error');
+			} else {
+				errored = true;
+				// Drop the rows this load was replacing: they are the previous
+				// filter's catalogs, and the Retry that clears `errored` would
+				// redraw them — clickable — as this filter's answer until it lands.
+				catalogs = [];
+				total = 0;
+				pageNum = 1;
+			}
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -148,10 +216,18 @@
 
 	// Debounce text search: re-fetch 280ms after the last keystroke. Reading
 	// `search` registers the dependency so edits re-run this effect.
+	// The first run (mount, including a bookmarked `?search=`) loads at once;
+	// only a typed change waits for the debounce.
+	let searchEffectRan = false;
 	$effect(() => {
 		const q = search;
 		clearTimeout(searchTimer);
-		searchTimer = setTimeout(() => load(), q === '' ? 0 : 280);
+		const delay = q === '' || !searchEffectRan ? 0 : 280;
+		searchEffectRan = true;
+		searchTimer = setTimeout(() => {
+			syncUrl();
+			load();
+		}, delay);
 		return () => clearTimeout(searchTimer);
 	});
 
@@ -182,7 +258,7 @@
 			total = Math.max(0, total - 1);
 			toast(m('catalogs.toast.deleted'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('catalogs.toast.deleteFailed'), 'error');
+			toast(errorMessage(err, m('catalogs.toast.deleteFailed')), 'error');
 		} finally {
 			confirmDeleteId = null;
 		}
@@ -196,7 +272,7 @@
 				q: guidedQuery.trim() || undefined
 			});
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('catalogs.toast.guidedFailed'), 'error');
+			toast(errorMessage(err, m('catalogs.toast.guidedFailed')), 'error');
 		} finally {
 			guidedLoading = false;
 		}
@@ -305,21 +381,23 @@
 		<SearchBox bind:value={search} placeholder={m('catalogs.search.placeholder')} ariaLabel={m('catalogs.search.aria')} />
 	</div>
 
-	<FilterChips chips={TYPE_CHIPS} bind:active={typeFilter} onchange={() => load()} />
+	<FilterChips chips={TYPE_CHIPS} bind:active={typeFilter} onchange={() => {
+		syncUrl();
+		load();
+	}} />
 
 	{#if errored}
 		<!-- A failed load is a dead end without a way back: the toast that
-		     reported it has already faded. Same error-with-retry block
-		     `/admin/api-keys` uses. -->
-		<div class="state error" data-testid="catalogs-error" role="alert">
-			<p>{m('catalogs.empty.errored')}</p>
-			<button type="button" class="btn-cancel" onclick={() => load()}>{m('catalogs.retry')}</button>
-		</div>
+		     reported it has already faded. -->
+		<LoadError message={m('catalogs.empty.errored')} onretry={() => load()} testId="catalogs-error" />
 	{:else}
+	<div class="catalog-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={catalogs.length === 0}
-		empty={loading ? m('common.loading') : m('catalogs.empty')}
+		{loading}
+		empty={m('catalogs.empty')}
 	>
 		{#snippet body()}
 			{#each catalogs as c (c.id)}
@@ -351,24 +429,19 @@
 			{/each}
 		{/snippet}
 	</DataTable>
-	{/if}
+	</div>
 
-	{#if hasMore}
-		<div class="load-more-row">
-			<button
-				class="btn-load-more"
-				onclick={() => load({ append: true })}
-				disabled={loadingMore}
-			>
-				{loadingMore
-					? m('common.loading')
-					: m('catalogs.loadMore', { shown: catalogs.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('catalogs.showingAll', { total })}</span>
-		</div>
+	<!-- Inside the success branch: under LoadError the stale rows' counts
+	     ("Load more (100 of 240)") describe a list that is not on screen. -->
+	<LoadMoreFooter
+		shown={catalogs.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		onloadmore={() => load({ append: true })}
+		moreKey="catalogs.loadMore"
+		allKey="catalogs.showingAll"
+	/>
 	{/if}
 </PageHeader>
 
@@ -403,19 +476,22 @@
 {/if}
 
 <style>
-	/* Error-with-retry block — same shape as `/admin/api-keys`. */
-	.state {
-		color: var(--text-muted);
-		padding: 0.75rem 0;
-	}
-
-	.state.error {
-		color: var(--danger);
-	}
-
-	.state.error p {
-		margin: 0 0 8px;
-	}
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.catalog-table { min-width: 0; }
+	.catalog-table :global(table) { min-width: 830px; }
+	.catalog-table :global(th.col-type) { width: 150px; }
+	.catalog-table :global(th.col-count) { width: 110px; }
+	.catalog-table :global(th.col-status) { width: 120px; }
+	.catalog-table :global(th.actions-col) { width: 220px; }
 
 	.toolbar-row {
 		display: flex;
@@ -424,7 +500,7 @@
 	}
 
 	.pref-dot {
-		color: #d4940a;
+		color: var(--warning);
 		margin-left: 4px;
 	}
 
@@ -496,8 +572,8 @@
 		border-radius: 10px;
 		font-size: 0.7rem;
 		font-weight: 600;
-		background: rgba(31, 168, 106, 0.15);
-		color: #1fa86a;
+		background: color-mix(in srgb, var(--success) 15%, transparent);
+		color: var(--success);
 	}
 
 	.sub {

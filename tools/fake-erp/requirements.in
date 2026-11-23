@@ -2,7 +2,7 @@
 # the generated `requirements.txt` (hash-pinned), never from this file —
 # regenerate it after editing:
 #
-#   uv pip compile requirements.in --universal --python-version 3.14 \
+#   uv pip compile requirements.in --universal --python-version 3.15 \
 #       --generate-hashes -o requirements.txt
 #
 # Dependabot also maintains that pair on its own: its pip-compile support
@@ -12,8 +12,11 @@
 #
 # Keep this list minimal: fake-erp is a deterministic in-memory fixture and
 # every dependency it grows is one more thing to pin and scan.
-fastapi>=0.143.2,<1
+fastapi>=0.163.1,<1
 uvicorn>=0.54.0,<1
 # Request-supplied XML (the SYSPRO routes) is parsed through defusedxml, not
 # the stdlib parser, so a DTD / entity-expansion payload is refused.
 defusedxml>=0.7.1,<1
+# The NetSuite OAuth 2.0 token route verifies the client assertion's
+# RSA-PSS / ECDSA signature (netsuite_oauth2.py). Same floor as the backend.
+cryptography>=50.0.2,<51

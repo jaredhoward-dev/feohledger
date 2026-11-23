@@ -1,5 +1,7 @@
 <script lang="ts">
 	import type { Payment, PaymentMethod, PaymentStatus } from '#lib/types/payment.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
+	import { queueBlockedReasonKey } from '#lib/types/paymentQueue.ts';
 	import {
 		PAYMENT_STATUSES,
 		paymentStatusLabelKey,
@@ -11,7 +13,7 @@
 	} from '#lib/types/payment.ts';
 	import { paymentStore } from '#lib/stores/payments.svelte.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
-	import { api } from '#lib/api.ts';
+	import { api, ApiError } from '#lib/api.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import RunDetailModal from '#lib/components/modals/RunDetailModal.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
@@ -49,13 +51,12 @@
 	} from '#lib/utils/currencyGroups.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { formatDate } from '#lib/utils/time.ts';
+	import { formatPercent } from '#lib/utils/percent.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
-	import {
-		PERM_PAYMENT_EXECUTE,
-		PERM_PAYMENT_RECORD_EXTERNAL,
-		PERM_PAYMENT_VOID
-	} from '#lib/types/admin.ts';
+	import { PERM_PAYMENT_EXECUTE, PERM_PAYMENT_RECORD_EXTERNAL } from '#lib/types/admin.ts';
+	import GenerateCardsModal from '#lib/components/payments/GenerateCardsModal.svelte';
+	import { isAllowed, type ActionRefusal } from '#lib/api/actionVerdicts.ts';
 	import {
 		acceptPaymentSettlement,
 		getExecutionMode,
@@ -66,12 +67,20 @@
 		type RunErpSyncResult
 	} from '#lib/api/payments.ts';
 	import {
-		EXTERNAL_PAYMENT_METHODS,
 		canDispatchPayments,
 		isExternalPayment,
 		localToday,
 		type PaymentExecutionMode
 	} from '#lib/types/paymentExecution.ts';
+	import {
+		erpPaymentParts,
+		erpPrefill,
+		spansSeveralRails,
+		type QueueErpReportedPayment
+	} from '#lib/types/erpReport.ts';
+	import { codedRefusalText } from '#lib/api/codedRefusals.ts';
+	import RecordPaymentFields from '#lib/components/payments/RecordPaymentFields.svelte';
+	import ErpPaymentSplit from '#lib/components/payments/ErpPaymentSplit.svelte';
 	import {
 		confirmCardRebate,
 		listCardRebates,
@@ -85,42 +94,47 @@
 		type RebateListResponse,
 		type RebateTransition
 	} from '#lib/types/cardRebate.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
 	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
+	import { kpiDisplayValue } from '#lib/utils/kpiValue.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	let RUNS_COLUMNS = $derived([
 		{ label: m('payments.col.run') },
-		{ label: m('payments.col.status') },
-		{ label: m('payments.col.total'), class: 'right' },
-		{ label: m('payments.summary.payments') },
-		{ label: m('payments.col.executed') },
-		{ label: m('payments.col.created') },
+		{ label: m('payments.col.status'), class: 'col-status' },
+		{ label: m('payments.col.total'), class: 'right col-amount' },
+		{ label: m('payments.summary.payments'), class: 'col-count' },
+		{ label: m('payments.col.executed'), class: 'col-date' },
+		{ label: m('payments.col.created'), class: 'col-date' },
 		// Actions column: the run-level ERP sync-back retry lives here. Always
 		// rendered so the table keeps its shape for a role that can't use it.
 		{ class: 'actions-col' }
 	]);
 
 	let CARDS_COLUMNS = $derived([
-		{ label: m('payments.col.card') },
+		{ label: m('payments.col.card'), class: 'col-card' },
 		{ label: m('payments.col.vendor') },
-		{ label: m('payments.col.invoice') },
-		{ label: m('payments.col.limit'), class: 'right' },
-		{ label: m('payments.col.charged'), class: 'right' },
-		{ label: m('payments.col.status') },
-		{ label: m('payments.col.expires') },
+		{ label: m('payments.col.invoice'), class: 'col-number' },
+		{ label: m('payments.col.limit'), class: 'right col-amount' },
+		{ label: m('payments.col.charged'), class: 'right col-amount' },
+		{ label: m('payments.col.status'), class: 'col-status' },
+		{ label: m('payments.col.expires'), class: 'col-date' },
 		{ class: 'actions-col' }
 	]);
 
 	let REBATES_COLUMNS = $derived([
 		{ label: m('payments.rebates.col.period') },
-		{ label: m('payments.rebates.col.card') },
-		{ label: m('payments.rebates.col.rate'), class: 'right' },
-		{ label: m('payments.rebates.col.amount'), class: 'right' },
-		{ label: m('payments.rebates.col.status') },
+		{ label: m('payments.rebates.col.card'), class: 'col-card' },
+		{ label: m('payments.rebates.col.rate'), class: 'right col-count' },
+		{ label: m('payments.rebates.col.amount'), class: 'right col-amount' },
+		{ label: m('payments.rebates.col.status'), class: 'col-status' },
 		// Actions column: the one available lifecycle step. Always rendered so
 		// the table keeps its shape for a terminal (`paid_out`) row.
 		{ class: 'actions-col' }
@@ -147,7 +161,9 @@
 	);
 
 	let sortField = $state<string | null>(page.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((page.url.searchParams.get('order') as SortOrder) ?? 'desc');
+	// Only `asc` is honoured from the URL: a hand-edited `?order=` must not
+	// reach the API as an unknown direction.
+	let sortOrder = $state<SortOrder>(page.url.searchParams.get('order') === 'asc' ? 'asc' : 'desc');
 
 	// WRITER — every read untracked, `page.url` included (issue #168 / the
 	// self-trigger on replaceState). Called from the tab/status effect, the
@@ -221,6 +237,10 @@
 		excluded_rebate_count?: number;
 	}
 	let summary = $state<Summary | null>(null);
+	// The summary request failed and nothing has replaced it: the strip's cards
+	// stay drawn (with the no-figure dash) but stop announcing "Loading…".
+	let summaryFailed = $state(false);
+	let summaryPending = $derived(summary === null && !summaryFailed);
 
 	// The shared `<Tabs>` (WAI-ARIA tablist: role=tab + aria-selected + roving
 	// tabindex). The tab bar used to be four plain buttons whose selected state
@@ -294,6 +314,19 @@
 		// "Record as paid" action may be offered. Independent of `blocked`:
 		// a run refuses an unverified vendor, recording does not.
 		record_outside_refusal?: string | null;
+		// The open payment-blocking exception behind `blocked_reason` — its id
+		// (the row links to it), its type, and THIS reader's segregation-of-
+		// duties code for clearing it (`segregation_implicated` /
+		// `segregation_raiser` / `segregation_approver`), so the row can say a
+		// colleague must clear it.
+		blocking_exception?: {
+			id: string;
+			exception_type: string;
+			clear_refusal: string | null;
+		} | null;
+		// The payment the ERP reported for this invoice and FeohLedger could
+		// not record (decisions §319). "Record as paid" opens pre-filled with it.
+		erp_reported_payment?: QueueErpReportedPayment | null;
 	}
 
 	// Per-currency slice of the WHOLE queue (or of the whole selectable set, on
@@ -302,7 +335,8 @@
 	// then contradict the "N of M" footer. `total_amount` on `/queue` covers
 	// every payable row; on `/queue/ids` only the selectable (unblocked) ones.
 	interface QueueCurrencySlice {
-		currency: string;
+		/** `null` groups the invoices that record no currency (decisions §473). */
+		currency: string | null;
 		count: number;
 		total_amount: string;
 		total_savings: string;
@@ -397,41 +431,11 @@
 
 	/** Localised sentence for why a run would refuse — or constrain — a row.
 	 *
-	 *  Maps the backend's fixed reason vocabulary; an unrecognised or missing
-	 *  code falls back to the generic reason rather than rendering a raw
-	 *  identifier at the operator. */
+	 *  Maps the backend's fixed reason vocabulary (`QUEUE_BLOCKED_REASON_KEYS`);
+	 *  an unrecognised or missing code falls back to the generic reason rather
+	 *  than rendering a raw identifier at the operator. */
 	function blockedReason(item: QueueItem): string {
-		switch (item.blocked_reason) {
-			case 'duplicate':
-				return m('payments.queue.blocked.duplicate');
-			case 'fraud_flag':
-				return m('payments.queue.blocked.fraudFlag');
-			case 'line_total_mismatch':
-				return m('payments.queue.blocked.lineTotalMismatch');
-			case 'payment_reconciliation':
-				// The fourth member of PAYMENT_BLOCKING_EXCEPTION_TYPES, and the
-				// one this switch was missing — so a row held because an earlier
-				// payment's fate at the rail is unknown fell through to the
-				// generic string and told the operator nothing actionable. The
-				// default arm stays for codes this build genuinely doesn't know.
-				return m('payments.queue.blocked.paymentReconciliation');
-			case 'quality_hold':
-				return m('payments.queue.blocked.qualityHold');
-			case 'po_mismatch':
-				return m('payments.queue.blocked.poMismatch');
-			case 'vendor_not_active':
-				return m('payments.queue.blocked.vendorNotActive');
-			case 'applied_credit_mismatch':
-				return m('payments.queue.blocked.appliedCreditMismatch');
-			case 'fully_credited':
-				return m('payments.queue.blocked.fullyCredited');
-			case 'live_virtual_card':
-				// Not a block — the row is pinned to the card rail. Its own
-				// sentence says so, rather than the "can't be paid" generic.
-				return m('payments.queue.blocked.liveVirtualCard');
-			default:
-				return m('payments.queue.blocked.generic');
-		}
+		return m(queueBlockedReasonKey(item.blocked_reason));
 	}
 
 	// The rows a payment run could actually be built from. Everything that
@@ -602,7 +606,7 @@
 			createRunError = '';
 			if (res.truncated) {
 				toast(
-					m('payments.queue.selectAllTruncated', { shown: res.ids.length, total: res.total }),
+					m('payments.queue.selectAllTruncated', { shown: formatCount(res.ids.length), total: formatCount(res.total) }),
 					'error'
 				);
 			} else {
@@ -624,13 +628,10 @@
 
 	async function createDraftRun() {
 		if (selectedQueue.size === 0) return;
-		if (mixedCurrencySelection) {
-			// Advance signal for the backend's own 422 — never send a request we
-			// already know is refused.
-			createRunError = m('payments.queue.mixedCurrencyBlocked');
-			toast(createRunError, 'error');
-			return;
-		}
+		// Never send a request we already know is refused (the backend's own
+		// 422). The button is disabled for it and `mixed-currency-warning` states
+		// why, so there is nothing to add here.
+		if (mixedCurrencySelection) return;
 		createRunError = '';
 		creatingRun = true;
 		try {
@@ -655,7 +656,7 @@
 				{ items }
 			);
 
-			toast('Draft payment run created — review and execute', 'success');
+			toast(m('payments.queue.draftCreated'), 'success');
 			selectedQueue = new Set();
 			showReview = false;
 			activeRunId = run.id;
@@ -665,11 +666,11 @@
 		} catch (err) {
 			// `ApiError.message` is `formatApiDetail(body.detail, …)`, so the
 			// backend's 409 detail — which names the offending invoice numbers —
-			// arrives intact. Surface it in BOTH places: the toast announces it
-			// (assertive live region), the panel keeps it readable.
-			const detail = err instanceof Error ? err.message : m('payments.queue.createFailed');
-			createRunError = detail;
-			toast(detail, 'error');
+			// arrives intact. The panel states it (role="alert", so it is
+			// announced as it appears) beside the button that was refused, and
+			// nothing else does: one error, one signal (`docs/ui-patterns.md`
+			// § Toast).
+			createRunError = err instanceof Error ? err.message : m('payments.queue.createFailed');
 		} finally {
 			creatingRun = false;
 		}
@@ -682,8 +683,32 @@
 		await loadQueue();
 		await loadRuns();
 		if (activeTab === 'history') {
-			await paymentStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method; routes through api.get
+			await refreshPaymentList();
 			await fetchPaymentCounts();
+		}
+	}
+
+	/**
+	 * Re-read the History list after a mutation has landed. Never rejects.
+	 *
+	 * The store re-throws so an awaiting caller can handle a failure, and every
+	 * caller here awaits it right after a write that already succeeded — a void,
+	 * a card close, a compliance release, a run execute. Left to propagate, the
+	 * rejection reached that write's own `catch` and was reported as the WRITE
+	 * failing ("Payment voided", then "could not be voided"), or, from
+	 * `RunDetailModal`'s un-awaited `onchange`, as an unhandled rejection. A
+	 * failed refresh is a stale list, so it says exactly that, once. The
+	 * summary, queue and counts loaders already report their own failures.
+	 */
+	async function refreshPaymentList() {
+		try {
+			await paymentStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method; routes through api.get
+		} catch {
+			// The store rejects even when a newer load superseded this one;
+			// `errored` is set only when the NEWEST load failed, which is exactly
+			// when the list on screen is stale. A superseded failure under a list
+			// that has since loaded says nothing.
+			if (paymentStore.errored) toast(m('payments.history.refreshFailed'), 'error');
 		}
 	}
 
@@ -720,11 +745,15 @@
 	// depends on who records), so the server's 403 explains it, localized by
 	// `api/codedRefusals.ts` like every other refusal.
 	let recordTarget = $state<QueueItem | null>(null);
-	let recordMethod = $state<PaymentMethod>('ach');
+	let recordMethod = $state<PaymentMethod | ''>('ach');
 	let recordReference = $state('');
 	let recordPaidOn = $state('');
 	let recording = $state(false);
 	let recordError = $state('');
+	// The exception a refusal points at (`external_payment_erp_split`: the ERP
+	// reported a payment on several rails after this queue was loaded), so the
+	// dialog can link to where it is recorded with its split; else null.
+	let recordErrorExceptionId = $state<string | null>(null);
 	// The latest paid-on date offered: the reader's own calendar day. The
 	// server allows one day past the UTC date for exactly this reader, so a
 	// local "today" always passes and a later date is in the future anywhere.
@@ -734,42 +763,129 @@
 		return !!auth.user && auth.can(PERM_PAYMENT_RECORD_EXTERNAL);
 	}
 
+	/** The queue's actions column is drawn when the caller holds either of
+	 *  its two row actions (compare routes, record as paid). */
+	function hasQueueActions(): boolean {
+		return canCompareRoutes() || canRecordOutside();
+	}
+
 	function canRecordRow(item: QueueItem): boolean {
 		return canRecordOutside() && !item.record_outside_refusal;
 	}
 
+	/**
+	 * Why "Record as paid" is disabled on this row, in the reader's language —
+	 * the action is shown disabled with this as its accessible description,
+	 * never hidden, so the operator learns what to clear rather than hunting
+	 * for a button that is not there. Localized through the same registry the
+	 * endpoint's own refusal would be (`api/codedRefusals.ts`), from the
+	 * params the row already carries; an unknown code reads generically.
+	 */
+	function recordRefusalText(item: QueueItem): string {
+		const code = item.record_outside_refusal;
+		if (!code) return '';
+		const params: Record<string, unknown> = { status: item.status };
+		if (item.blocking_exception) params.exception_type = item.blocking_exception.exception_type;
+		return codedRefusalText(code, params, m) ?? m('payments.recordOutside.unavailable');
+	}
+
+	/** The row's sentence about who may clear its blocking exception, when it
+	 *  is not this reader — or `''`. */
+	function clearRefusalText(item: QueueItem): string {
+		switch (item.blocking_exception?.clear_refusal) {
+			case 'segregation_implicated':
+				return m('payments.queue.clearRefusal.implicated');
+			case 'segregation_raiser':
+				return m('payments.queue.clearRefusal.raiser');
+			case 'segregation_approver':
+				return m('payments.queue.clearRefusal.approver');
+			case null:
+			case undefined:
+				return '';
+			default:
+				return m('payments.queue.clearRefusal.generic');
+		}
+	}
+
+	// The ERP's product name for the pre-fill note, or the reader's own words
+	// for "your ERP" when the adapter has none.
+	let recordErpName = $state<string | null>(null);
+
+	// The ERP's breakdown of the payment it reported, shown as `/exceptions`
+	// shows it (decisions §413, §426), from the same server data: the row's
+	// kept parts and the server's verdict on them. Shown only when it spans
+	// more than one rail; one rail is just the method the form pre-fills.
+	const recordReported = $derived(recordTarget?.erp_reported_payment ?? null);
+	const recordParts = $derived(erpPaymentParts(recordReported));
+	const recordShowSplit = $derived(spansSeveralRails(recordParts));
+	// The split is the record whatever rail is picked. `record-outside` would
+	// book one rail and refuse (`external_payment_erp_split`), so the record
+	// goes through the row's own one-click, which books the split, and names
+	// no rail, as `/exceptions` does (decisions §426).
+	const recordSplitStands = $derived(recordShowSplit && recordReported?.split_stands === true);
+
 	function openRecordOutside(item: QueueItem) {
 		recordTarget = item;
-		recordMethod = 'ach';
-		recordReference = '';
 		recordMaxDate = localToday();
-		recordPaidOn = recordMaxDate;
 		recordError = '';
+		recordErrorExceptionId = null;
+		const reported = item.erp_reported_payment;
+		if (reported) {
+			// What the ERP already said — rail, reference, date — so nobody
+			// re-keys it. A rail the ERP did not state stays unchosen rather than
+			// defaulting to ACH (wrong for a cheque, which is how this started).
+			const prefill = erpPrefill(reported, recordMaxDate);
+			recordMethod = prefill.method;
+			recordReference = prefill.reference;
+			recordPaidOn = prefill.paidOn;
+			recordErpName = reported.erp_name ?? m('payments.recordOutside.yourErp');
+		} else {
+			recordMethod = 'ach';
+			recordReference = '';
+			recordPaidOn = recordMaxDate;
+			recordErpName = null;
+		}
 	}
 
 	function closeRecordOutside() {
 		recordTarget = null;
 		recordError = '';
+		recordErrorExceptionId = null;
 	}
 
 	async function commitRecordOutside() {
 		if (!recordTarget) return;
 		const reference = recordReference.trim();
-		if (!reference || !recordPaidOn) return;
+		const method = recordMethod;
+		const splitStands = recordSplitStands;
+		const reported = recordReported;
+		if (!reference || !recordPaidOn || (!method && !splitStands)) return;
 		const target = recordTarget;
 		recording = true;
 		recordError = '';
+		recordErrorExceptionId = null;
 		try {
-			// No `amount`: the server binds it to what the invoice owes on
-			// `paid_on` (net of credits, and of an accepted discount only while
-			// its pay-by date holds). Sending the queue row's figure would 422 a
-			// legitimate payment dated after the discount lapsed.
-			await recordPaymentOutside({
-				invoice_id: target.id,
-				method: recordMethod,
-				reference,
-				paid_on: recordPaidOn
-			});
+			if (splitStands && reported) {
+				// The row's one-click: the payment and the row's resolve in one
+				// transaction, at the figure the ERP states, with its split. No
+				// `method`: the split is the record over any rail, so the audit's
+				// `method_stated` stays null rather than a pick nobody made.
+				await api.post(`/api/exceptions/${reported.exception_id}/record-erp-payment`, {
+					reference,
+					paid_on: recordPaidOn
+				});
+			} else if (method) {
+				// No `amount`: the server binds it to what the invoice owes on
+				// `paid_on` (net of credits, and of an accepted discount only while
+				// its pay-by date holds). Sending the queue row's figure would 422 a
+				// legitimate payment dated after the discount lapsed.
+				await recordPaymentOutside({
+					invoice_id: target.id,
+					method,
+					reference,
+					paid_on: recordPaidOn
+				});
+			}
 			toast(m('payments.recordOutside.recorded', { invoice: target.invoice_number }), 'success');
 			recordTarget = null;
 			// The selection may hold the row that just left the queue.
@@ -780,10 +896,14 @@
 			}
 			await Promise.all([loadSummary(), loadQueue()]);
 		} catch (err) {
-			// Kept in the dialog (role="alert") as well as toasted: a coded
-			// refusal names what to fix, and the toast fades.
+			// Stated in the dialog (role="alert") beside the form, and only
+			// there: a coded refusal names what to fix, and a second copy in a
+			// toast would sit over the dialog (one error, one signal).
 			recordError = err instanceof Error ? err.message : m('payments.recordOutside.failed');
-			toast(recordError, 'error');
+			if (err instanceof ApiError && err.code === 'external_payment_erp_split') {
+				const id = err.params.exception_id;
+				recordErrorExceptionId = typeof id === 'string' && id ? id : null;
+			}
 		} finally {
 			recording = false;
 		}
@@ -801,7 +921,9 @@
 	// `no_card`, a non-card payment), which closes the dialog as before.
 	let voidCardResult = $state<Payment | null>(null);
 	let retryingCardCancel = $state(false);
-	let cardRetryFailed = $state(false);
+	// Why the last card-close retry did not close the card ('' = it did, or
+	// none was tried). Stated in the dialog, never also toasted.
+	let cardRetryError = $state('');
 
 	const voidCardDisposition = $derived(voidCardResult?.void_card_disposition ?? null);
 	// Only the retryable verdict gets a button. `not_closed_final` (the card was
@@ -810,17 +932,23 @@
 	// one would be a control that cannot work.
 	const canRetryCardCancel = $derived(voidCardDisposition === 'not_closed_retryable');
 
+	// The reason field's own error — set on submit, cleared as it is edited.
+	let voidReasonError = $state('');
+	let voidReasonInput = $state<HTMLInputElement | null>(null);
+
 	function openVoid(p: Payment) {
 		voidTarget = p;
 		voidReason = '';
+		voidReasonError = '';
 		voidCardResult = null;
-		cardRetryFailed = false;
+		cardRetryError = '';
 	}
 
 	function closeVoid() {
 		voidTarget = null;
+		voidReasonError = '';
 		voidCardResult = null;
-		cardRetryFailed = false;
+		cardRetryError = '';
 	}
 
 	/** Refresh every surface a void (or a later card close) can change. */
@@ -828,7 +956,7 @@
 		await Promise.all([
 			loadSummary(),
 			loadQueue(),
-			paymentStore.fetch(buildParams()), // noqa: raw-fetch-in-component — store method; routes through api.get
+			refreshPaymentList(),
 			fetchPaymentCounts(),
 		]);
 	}
@@ -837,30 +965,39 @@
 		if (!voidTarget) return;
 		const reason = voidReason.trim();
 		if (!reason) {
-			toast('Reason is required for a void', 'error');
+			// A field error, not a toast: beside the input, read with it through
+			// `aria-describedby` when focus lands there (`docs/ui-patterns.md`
+			// § Field validation).
+			voidReasonError = m('payments.void.reasonRequired');
+			voidReasonInput?.focus();
 			return;
 		}
 		voiding = true;
+		let voided: Payment;
 		try {
-			const voided = await voidPayment(voidTarget.id, reason);
-			toast('Payment voided', 'success');
-			// Branch on the SERVER's verdict, never on the raw outcome tag: a tag
-			// this build doesn't know must not read as "closed" (decisions §132).
-			const disposition = voided.void_card_disposition ?? null;
-			if (disposition === 'not_closed_retryable' || disposition === 'not_closed_final') {
-				voidCardResult = voided;
-				voidReason = '';
-			} else {
-				closeVoid();
-				voidReason = '';
-			}
-			await reloadAfterVoid();
+			voided = await voidPayment(voidTarget.id, reason);
 		} catch (err) {
-			const e = err as { detail?: string; message?: string } | null;
-			toast(e?.detail ?? e?.message ?? 'Void failed', 'error');
-		} finally {
 			voiding = false;
+			toast(errorMessage(err, m('payments.void.failed')), 'error');
+			return;
 		}
+		// The void has landed. Nothing below may report it as failed: the
+		// refresh is outside the try, as in `commitCardCancelRetry`, and reports
+		// its own failure as a stale list (`refreshPaymentList`).
+		toast(m('payments.void.done'), 'success');
+		// Branch on the SERVER's verdict, never on the raw outcome tag: a tag
+		// this build doesn't know must not read as "closed" (decisions §132).
+		const disposition = voided.void_card_disposition ?? null;
+		if (disposition === 'not_closed_retryable' || disposition === 'not_closed_final') {
+			voidCardResult = voided;
+		} else {
+			closeVoid();
+		}
+		voidReason = '';
+		// Re-enabled only once the dialog has left the submit state, so no
+		// second submit can reach a void that already landed.
+		voiding = false;
+		await reloadAfterVoid();
 	}
 
 	/**
@@ -872,38 +1009,36 @@
 	async function commitCardCancelRetry() {
 		if (!voidCardResult) return;
 		retryingCardCancel = true;
-		cardRetryFailed = false;
+		cardRetryError = '';
 		try {
 			const retried = await retryVoidCardCancel(voidCardResult.id);
 			voidCardResult = retried;
 			if ((retried.void_card_disposition ?? null) === 'closed') {
 				toast(m('payments.void.card.closed'), 'success');
 			} else {
-				cardRetryFailed = true;
+				cardRetryError = m('payments.void.card.retryFailed');
 			}
-			await reloadAfterVoid();
 		} catch (err) {
-			const e = err as { detail?: string; message?: string } | null;
-			cardRetryFailed = true;
-			toast(e?.detail ?? e?.message ?? m('payments.void.card.retryFailed'), 'error');
+			cardRetryError = errorMessage(err, m('payments.void.card.retryFailed'));
+			return;
 		} finally {
 			retryingCardCancel = false;
 		}
+		// Outside the try: a list that fails to refresh reports itself, and is
+		// not a failed card close — the dialog must not say both. It never
+		// rejects (each loader handles its own failure), so nothing escapes
+		// this click handler as an unhandled rejection.
+		await reloadAfterVoid();
 	}
 
 	function canVoid(p: Payment): boolean {
-		// Server-side gate: require_permission(payment.void) — defaults to
-		// admin/cfo, but a custom role can be granted it. Status: anything that
-		// isn't already terminal-by-failure.
-		//
-		// `pending_compliance` is deliberately NOT offered here: nothing ever
-		// reached the processor, so there is no rail to reverse. Its purpose-built
-		// exits are Release / Dismiss below, which also close the
-		// `payment_compliance_hold` exception the hold opened — a void would not.
-		if (auth.user && auth.can(PERM_PAYMENT_VOID)) {
-			return p.status === 'completed' || p.status === 'submitted' || p.status === 'processing';
-		}
-		return false;
+		// The server's verdict for this reader (`void_refusal`, from the gate
+		// `POST /{id}/void` raises from — `payment_controls.payment_void_refusal`),
+		// never a status list restated here (issue #575). That gate voids only
+		// money that has left or is leaving the rail; a `pending_compliance`
+		// payment's exits are Release / Dismiss below, and a `pending` leg's are
+		// its run's (cancel, or the bank-file exits).
+		return isAllowed(p.void_refusal);
 	}
 
 	// --- Compliance hold (pending_compliance) --------------------------------
@@ -913,47 +1048,50 @@
 	//                money, so `payment.execute` (mirrors POST .../execute).
 	//   * dismiss  → gives up, flips to `failed`, moves nothing, so
 	//                `payment.void` (mirrors POST .../void).
-	// Both 409 outside `pending_compliance`; hiding them elsewhere keeps the row
-	// honest, and the backend enforces regardless.
+	// Whether each is offered is the server's verdict on the row
+	// (`release_refusal` / `dismiss_refusal`, from the permission and the
+	// `payment_controls.compliance_hold_refusal` gate those endpoints raise
+	// from — issue #575), never the status + permission restated here.
 	type ComplianceMode = 'release' | 'dismiss';
 	let complianceTarget = $state<Payment | null>(null);
 	let complianceMode = $state<ComplianceMode>('release');
 	let complianceReason = $state('');
+	// The dismiss reason's own error — set on submit, cleared as it is edited.
+	let complianceReasonError = $state('');
+	let complianceReasonInput = $state<HTMLInputElement | null>(null);
 	let complianceBusy = $state(false);
 
 	function canReleaseHold(p: Payment): boolean {
 		// Release re-runs the gate AND dispatches, so a record-only tenant —
 		// or one whose mode hasn't resolved yet (fail closed) — is never offered
-		// it: the server 409s `payments_record_only`. Dismiss stays, because it
-		// moves nothing.
-		return (
-			p.status === 'pending_compliance' &&
-			!!auth.user &&
-			auth.can(PERM_PAYMENT_EXECUTE) &&
-			canDispatchPayments(executionMode)
-		);
+		// it: the server 409s `payments_record_only`. That is org configuration
+		// the server states once (`GET /execution-mode`), not a row verdict.
+		// Dismiss stays, because it moves nothing.
+		return isAllowed(p.release_refusal) && canDispatchPayments(executionMode);
 	}
 
 	function canDismissHold(p: Payment): boolean {
-		return p.status === 'pending_compliance' && !!auth.user && auth.can(PERM_PAYMENT_VOID);
+		return isAllowed(p.dismiss_refusal);
 	}
 
 	function openCompliance(p: Payment, mode: ComplianceMode) {
 		complianceTarget = p;
 		complianceMode = mode;
 		complianceReason = '';
+		complianceReasonError = '';
 	}
 
 	function closeCompliance() {
 		complianceTarget = null;
 		complianceReason = '';
+		complianceReasonError = '';
 	}
 
 	async function refreshAfterCompliance() {
 		await Promise.all([
 			loadSummary(),
 			loadQueue(),
-			paymentStore.fetch(buildParams()), // noqa: raw-fetch-in-component — store method; routes through api.get
+			refreshPaymentList(),
 			fetchPaymentCounts()
 		]);
 	}
@@ -964,7 +1102,9 @@
 		const mode = complianceMode;
 		const reason = complianceReason.trim();
 		if (mode === 'dismiss' && !reason) {
-			toast(m('payments.compliance.reasonRequired'), 'error');
+			// A field error beside the input (§ Field validation), not a toast.
+			complianceReasonError = m('payments.compliance.reasonRequired');
+			complianceReasonInput?.focus();
 			return;
 		}
 		complianceBusy = true;
@@ -985,17 +1125,21 @@
 				await api.post<Payment>(`/api/payments/${id}/compliance/dismiss`, { reason });
 				toast(m('payments.compliance.dismiss.done'), 'success');
 			}
-			closeCompliance();
-			await refreshAfterCompliance();
 		} catch (err) {
 			const fallback =
 				mode === 'release'
 					? m('payments.compliance.release.failed')
 					: m('payments.compliance.dismiss.failed');
 			toast(err instanceof Error ? err.message : fallback, 'error');
+			return;
 		} finally {
 			complianceBusy = false;
 		}
+		// The release / dismiss landed. The refresh is outside the try, as in
+		// `commitVoid`, so a list that fails to reload never reads as a failed
+		// release — which would invite a second one.
+		closeCompliance();
+		await refreshAfterCompliance();
 	}
 
 	// --- Settlement acceptance (the under-settlement hold's other exit) -------
@@ -1007,62 +1151,39 @@
 	// re-pay — and only void was wired here, which is the wrong action: the
 	// money already left, and a void invites a second payment for it.
 	//
-	// Whether a reported figure actually covers the invoice is the SERVER's
-	// call (it needs both authorized legs and the invoice currency, neither of
-	// which is on this wire) — and comparing two amounts client-side is barred
-	// outright by frontend/CLAUDE.md § Money formatting. So the row offers the
-	// action wherever a figure was reported at all, and the dialog asks the
-	// backend the one question it can answer cheaply and without money math:
-	// is the invoice still HELD? An invoice past `payment_scheduled` has
-	// nothing to accept, and the confirm stays out of reach rather than
-	// becoming a button that can only 409.
+	// Whether the row offers Accept is the SERVER's verdict
+	// (`accept_settlement_refusal`, from `payment.execute` and the gate the
+	// endpoint raises from — `payment_controls.settlement_accept_refusal`),
+	// never a rule restated here (issue #575). That gate needs what this wire
+	// cannot answer without money math: whether the reported figure covers the
+	// invoice (both authorized legs, the invoice currency), and whether the
+	// invoice is still HELD at `payment_scheduled`. The row used to offer the
+	// action wherever any figure was reported, and the dialog then fetched the
+	// invoice to discover whether there was anything to accept.
 	let settlementTarget = $state<Payment | null>(null);
 	let settlementReason = $state('');
+	// The reason field's own error — set on submit, cleared as it is edited.
+	let settlementReasonError = $state('');
+	let settlementReasonInput = $state<HTMLInputElement | null>(null);
 	let settlementBusy = $state(false);
-	// Invoice status behind the target payment: `null` while in flight,
-	// `'?'` when we could not read it (fail OPEN — the backend re-checks).
-	let settlementInvoiceStatus = $state<string | null>(null);
 	let settlementError = $state<string | null>(null);
 
-	/** The invoice status the backend's own release guard requires. */
-	const SETTLEMENT_HELD_STATUS = 'payment_scheduled';
-
 	function canAcceptSettlement(p: Payment): boolean {
-		// Presence, never a comparison: `settled_amount` is null when no rail
-		// ever reported a figure, which the backend treats as "nothing
-		// contradicts this invoice" — there is no shortfall to accept.
-		return (
-			p.status === 'completed' &&
-			p.settled_amount !== null &&
-			p.settled_amount !== undefined &&
-			!!auth.user &&
-			auth.can(PERM_PAYMENT_EXECUTE)
-		);
+		return isAllowed(p.accept_settlement_refusal);
 	}
 
-	async function openSettlement(p: Payment) {
+	function openSettlement(p: Payment) {
 		settlementTarget = p;
 		settlementReason = '';
+		settlementReasonError = '';
 		settlementError = null;
-		settlementInvoiceStatus = null;
-		const invoiceId = p.invoice_id;
-		try {
-			const inv = await api.get<{ status: string }>(`/api/invoices/${invoiceId}`);
-			// Guard against a slow response landing after the dialog moved on.
-			if (settlementTarget?.invoice_id === invoiceId) settlementInvoiceStatus = inv.status;
-		} catch {
-			// Could not read the invoice — say so rather than guessing either
-			// way. `'?'` renders the unknown state, which still offers the
-			// confirm because the backend re-checks and 409s if it isn't held.
-			if (settlementTarget?.invoice_id === invoiceId) settlementInvoiceStatus = '?';
-		}
 	}
 
 	function closeSettlement() {
 		settlementTarget = null;
 		settlementReason = '';
+		settlementReasonError = '';
 		settlementError = null;
-		settlementInvoiceStatus = null;
 	}
 
 	async function commitSettlement() {
@@ -1070,24 +1191,29 @@
 		const id = settlementTarget.id;
 		const reason = settlementReason.trim();
 		if (!reason) {
-			toast(m('payments.settlement.reasonRequired'), 'error');
+			// A field error beside the input (§ Field validation), not a toast.
+			settlementReasonError = m('payments.settlement.reasonRequired');
+			settlementReasonInput?.focus();
 			return;
 		}
 		settlementBusy = true;
 		settlementError = null;
 		try {
 			await acceptPaymentSettlement(id, reason);
-			toast(m('payments.settlement.done'), 'success');
-			closeSettlement();
-			await refreshAfterCompliance();
 		} catch (err) {
 			// Persistent, not a toast that fades: the backend's 409 detail
 			// ("already covers", "no held invoice") is the actionable half of
 			// the refusal and the operator needs it while the dialog is open.
 			settlementError = err instanceof Error ? err.message : m('payments.settlement.failed');
+			return;
 		} finally {
 			settlementBusy = false;
 		}
+		// The acceptance landed; the refresh is outside the try so a list that
+		// fails to reload can never read as a failed acceptance.
+		toast(m('payments.settlement.done'), 'success');
+		closeSettlement();
+		await refreshAfterCompliance();
 	}
 
 	// --- Run-level ERP sync-back retry ---------------------------------------
@@ -1104,17 +1230,14 @@
 	let erpSyncResult = $state<RunErpSyncResult | null>(null);
 	let erpSyncError = $state<string | null>(null);
 
-	// Statuses that can't hold a settled payment: `draft` has never been
-	// dispatched and `cancelled` has no payments left, so the endpoint would
-	// 409 on both. Everything else may carry one — the backend counts.
-	const ERP_SYNC_INELIGIBLE_RUN_STATUSES = new Set(['draft', 'cancelled']);
-
+	// Offered from the server's verdict (`actions.sync_erp`, from
+	// `payment.execute` and `payment_controls.run_sync_erp_refusal`, the gate
+	// the endpoint raises from): a run with at least one settled payment. The
+	// page used to offer it on every run that was not `draft` / `cancelled`,
+	// so a `failed` run, or one still `executing`, got a button that could
+	// only 409.
 	function canSyncRunErp(run: RunItem): boolean {
-		return (
-			!ERP_SYNC_INELIGIBLE_RUN_STATUSES.has(run.status) &&
-			!!auth.user &&
-			auth.can(PERM_PAYMENT_EXECUTE)
-		);
+		return isAllowed(run.actions?.sync_erp);
 	}
 
 	function openErpSync(run: RunItem) {
@@ -1139,12 +1262,15 @@
 			// anything" — `synced` counts legs that RAN and stays true on a
 			// repeat. Reporting `synced` as success would claim a recovery on
 			// every retry of an already-clean run.
-			await onRunChanged();
 		} catch (err) {
 			erpSyncError = err instanceof Error ? err.message : m('payments.erpSync.failed');
+			return;
 		} finally {
 			erpSyncBusy = false;
 		}
+		// Outside the try, as in `commitVoid`: the sync landed, and a refresh
+		// that fails is a stale list, never "ERP sync failed".
+		await onRunChanged();
 	}
 
 	async function downloadRemittance(p: Payment) {
@@ -1159,7 +1285,7 @@
 			a.remove();
 			URL.revokeObjectURL(url);
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Could not download remittance', 'error');
+			toast(err instanceof Error ? err.message : m('payments.history.remittanceFailed'), 'error');
 		}
 	}
 
@@ -1175,6 +1301,11 @@
 		executed_at: string | null;
 		created_at: string;
 		payment_count: number;
+		/** The CALLER's verdict on the row action, from
+		 *  `schemas/payment.py::PaymentRunListItem`: `actions.sync_erp` is
+		 *  `null` when `POST /runs/{id}/sync-erp` would accept, else the coded
+		 *  refusal it would answer with. */
+		actions?: { sync_erp?: ActionRefusal };
 	}
 	let runs = $state<RunItem[]>([]);
 	// Three states, not two — the same rule the Queue and History tabs in this
@@ -1212,9 +1343,22 @@
 	}
 
 	// Three states, not two: a failed load must not read as "nothing matched".
-	let historyEmptyMessage = $derived(
-		paymentStore.errored ? m('payments.history.empty.errored') : m('payments.history.empty')
-	);
+	// Three states the table can be empty in, never one sentence for all of
+	// them: still loading, a filter that matched nothing, and a tenant with no
+	// payments at all. "No payments match your filters." over an unfiltered
+	// first visit blamed filters nobody had set. A failed load renders
+	// `<LoadError>` instead of the table (see the template).
+	let historyFiltered = $derived(search.trim() !== '' || activeStatus !== 'all');
+
+	function retryHistory() {
+		paymentStore.fetch(buildParams()).catch(() => {}); // noqa: raw-fetch-in-component — store method; routes through api.get
+		fetchPaymentCounts();
+	}
+
+	/** What a history row action names in its accessible label. */
+	function rowInvoice(p: Payment): string {
+		return p.invoice_number ?? p.id.slice(0, 8);
+	}
 
 	let searchTimer: ReturnType<typeof setTimeout>;
 	function debouncedFetch() {
@@ -1233,10 +1377,13 @@
 		}, 300);
 	}
 
+	// The queue is NOT loaded here: only the Queue tab shows it, and the tab
+	// effect below loads it whenever that tab is (or becomes) the open one —
+	// including at mount, where loading it here too sent the same request twice
+	// on every visit.
 	$effect(() => {
 		orgCurrency.ensureLoaded();
 		loadSummary();
-		loadQueue();
 		loadExecutionMode();
 	});
 
@@ -1258,8 +1405,16 @@
 		}
 	});
 
+	// `searchEffectRan` skips the mount run: the tab effect above has already
+	// loaded the history list (when that tab is open), and the unguarded run
+	// fetched it again 300ms later.
+	let searchEffectRan = false;
 	$effect(() => {
 		search;
+		if (!searchEffectRan) {
+			searchEffectRan = true;
+			return;
+		}
 		debouncedFetch();
 		// Cancel a pending debounce on teardown: without it the timer fires
 		// after the page is gone and lands a stale list into the shared store.
@@ -1280,13 +1435,20 @@
 
 	async function loadSummary() {
 		const token = summarySequence.start();
+		// Cleared when the request STARTS, as the lists below do: Retry takes
+		// `LoadError` down while the request is out (the cards fall back to
+		// their pending dash when nothing is shown yet), and a second failure
+		// remounts it, so it is announced again rather than looking inert.
+		summaryFailed = false;
 		try {
 			const data = await api.get<Summary>('/api/payments/summary');
 			if (!summarySequence.canCommit(token)) return; // superseded by a newer load
 			summary = data;
+			summaryFailed = false;
 		} catch (err) {
 			if (summarySequence.isCurrentRequest(token)) {
-				toast(err instanceof Error ? err.message : 'Failed to load summary', 'error');
+				summaryFailed = true;
+				toast(errorMessage(err, m('payments.summary.loadFailed')), 'error');
 			}
 		}
 	}
@@ -1299,6 +1461,10 @@
 		// execute/void via onRunChanged drops rows). Drop matching mode so the
 		// prune effect resumes narrowing the selection to what's on screen.
 		selectedAllQueueMatching = false;
+		// Cleared when the request STARTS so Retry takes `LoadError` down while
+		// the new request is out, and a second failure remounts (re-announces)
+		// it — cleared only on success, Retry looked like a no-op.
+		queueErrored = false;
 		try {
 			const data = await api.get<QueueResponse>(
 				`/api/payments/queue?page=1&page_size=${QUEUE_PAGE_SIZE}`
@@ -1315,7 +1481,18 @@
 		} catch (err) {
 			if (queueSequence.isCurrentRequest(token)) {
 				queueErrored = true;
-				toast(err instanceof Error ? err.message : 'Failed to load payment queue', 'error');
+				// A failed RELOAD keeps the rows already shown (a selection may be
+				// live on them, and dropping it mid-build is worse — the in-place
+				// `LoadError` is for an empty queue only). So the toast is the one
+				// sign, and it has to say those rows may no longer be current.
+				toast(
+					queue.length > 0
+						? m('payments.queue.refreshFailedStale', {
+								reason: errorMessage(err, m('payments.queue.loadFailed'))
+							})
+						: errorMessage(err, m('payments.queue.loadFailed')),
+					'error'
+				);
 			}
 		} finally {
 			// `isCurrentRequest`, not `canCommit`: a local edit that supersedes
@@ -1353,7 +1530,7 @@
 			queueSelectableTotal = data.selectable_total ?? queueSelectableTotal;
 		} catch (err) {
 			if (queueSequence.isCurrentRequest(token)) {
-				toast(err instanceof Error ? err.message : 'Failed to load more of the payment queue', 'error');
+				toast(err instanceof Error ? err.message : m('payments.queue.loadMoreFailed'), 'error');
 			}
 		} finally {
 			if (queueSequence.isCurrentRequest(token)) {
@@ -1452,7 +1629,12 @@
 		// reload must not append a stale page onto the new list.
 		const token = cardsSequence.start();
 		if (opts.append) loadingMoreCards = true;
-		else loadingCards = true;
+		else {
+			loadingCards = true;
+			// Cleared when a fresh load STARTS so Retry takes `LoadError` down
+			// while the request is out and a second failure re-announces it.
+			cardsErrored = false;
+		}
 		try {
 			const listReq = api.get<{ items: CardItem[]; total: number }>(
 				`/api/cards?page=${nextPage}&page_size=${CARDS_PAGE_SIZE}`
@@ -1474,7 +1656,12 @@
 			// read as current, and let the table render the errored copy.
 			if (cardsSequence.isCurrentRequest(token)) {
 				cardsErrored = true;
-				if (!opts.append) cards = [];
+				// The total goes with the rows: left behind, the footer read
+				// "Load more (0 of N)" under the error.
+				if (!opts.append) {
+					cards = [];
+					cardsTotal = 0;
+				}
 				toast(err instanceof Error ? err.message : m('payments.cards.errored'), 'error');
 			}
 		} finally {
@@ -1489,6 +1676,20 @@
 
 	async function loadMoreCards() {
 		await loadCards({ append: true, nextPage: cardsPage + 1 });
+	}
+
+	// --- Generate a card directly (`POST /api/cards/generate`) ---------------
+	// Gated on what the endpoint itself checks first: `payment.execute` (the
+	// permission, not a role — a custom role can hold or lose it) and a tenant
+	// whose payments FeohLedger dispatches (`refuse_record_only`; the
+	// execution-mode read the Execute controls already use, failing closed
+	// while unknown). Whether the card programme is switched on is not exposed
+	// to this page; the endpoint's coded `cards_not_enabled` is stated in the
+	// dialog instead. Per-invoice gates are the server's, reported as skips.
+	let generateOpen = $state(false);
+
+	function canGenerateCards(): boolean {
+		return !!auth.user && auth.can(PERM_PAYMENT_EXECUTE) && canDispatchPayments(executionMode);
 	}
 
 	// The AP-side reveal renders exactly what `CardDetailsResponse` declares
@@ -1521,7 +1722,7 @@
 				expires: formatCardExpiry(resp.exp_month, resp.exp_year)
 			};
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Card not viewable', 'error');
+			toast(err instanceof Error ? err.message : m('payments.cards.revealFailed'), 'error');
 		}
 	}
 
@@ -1684,7 +1885,12 @@
 		// reload must not append a stale page onto the new list.
 		const token = rebatesSequence.start();
 		if (opts.append) loadingMoreRebates = true;
-		else loadingRebates = true;
+		else {
+			loadingRebates = true;
+			// Cleared when a fresh load STARTS so Retry takes `LoadError` down
+			// while the request is out and a second failure re-announces it.
+			rebatesErrored = false;
+		}
 		try {
 			const list = await listCardRebates({ page: nextPage, pageSize: REBATES_PAGE_SIZE });
 			if (!rebatesSequence.canCommit(token)) return; // superseded
@@ -1704,7 +1910,16 @@
 			// failed read (mirrors `/exceptions`, `frontend/CLAUDE.md`).
 			if (rebatesSequence.isCurrentRequest(token)) {
 				rebatesErrored = true;
-				if (!opts.append) rebates = [];
+				// The envelope figures go with the rows: left behind, the footer
+				// read "Load more (0 of N)" under the error, beside a total and a
+				// mixed-currency notice for a list no longer on screen.
+				if (!opts.append) {
+					rebates = [];
+					rebateCount = 0;
+					rebateTotalAmount = null;
+					rebateListCurrency = null;
+					rebateExcludedCount = 0;
+				}
 				toast(
 					err instanceof Error ? err.message : m('payments.rebates.errored'),
 					'error'
@@ -1785,7 +2000,7 @@
 		} catch (err) {
 			if (runsSequence.isCurrentRequest(token)) {
 				runsErrored = true;
-				toast(err instanceof Error ? err.message : 'Failed to load payment runs', 'error');
+				toast(err instanceof Error ? err.message : m('payments.runs.loadFailed'), 'error');
 			}
 		} finally {
 			// `isCurrentRequest`, not `canCommit`: a request superseded by a local
@@ -1893,39 +2108,57 @@
 </script>
 
 <PageHeader title={m('payments.title')}>
-	{#if summary}
-		<div class="summary-cards">
-			<div class="scard">
-				<span class="scard-value">
-					{formatCurrency(summary.total_paid, summary.currency)}
-				</span>
-				<span class="scard-label">{m('payments.summary.totalPaid')}</span>
-			</div>
-			<div class="scard">
-				<span class="scard-value">
-					{formatCurrency(summary.total_pending, summary.currency)}
-				</span>
-				<span class="scard-label">{m('payments.summary.pending')}</span>
-			</div>
-			<div class="scard">
-				<span class="scard-value">{summary.queue_count}</span>
-				<span class="scard-label">{m('payments.summary.readyToPay')}</span>
-			</div>
-			<div class="scard">
-				<span class="scard-value">{summary.payment_count}</span>
-				<span class="scard-label">{m('payments.summary.payments')}</span>
-			</div>
-			{#if Number(summary.total_rebates) > 0}
-				<div class="scard rebate">
-					<!-- `summary.currency` is what the API says EVERY money figure in
-					     this block is denominated in, `total_rebates` included — the
-					     three cards above pass it and this one didn't, falling through
-					     to the store instead of the response's own declaration. -->
-					<span class="scard-value">{formatCurrency(summary.total_rebates, summary.currency)}</span>
-					<span class="scard-label">{m('payments.summary.rebatesEarned')}</span>
-				</div>
-			{/if}
+	<!-- The four headline cards are drawn from first paint, holding the shared
+	     no-figure dash until /api/payments/summary lands. They used to appear
+	     only once it had, inserting a ~94px strip ABOVE the tabs and the table
+	     on every visit and dropping both under the reader
+	     (tests-e2e/reactivity/layout-stability.spec.ts). -->
+	{#if summaryFailed}
+		<!-- In place, with a Retry: the toast fades, and the cards alone read
+		     as a dash (or as figures from an earlier load) with no way back.
+		     When an earlier load's figures are still on the cards, say they
+		     may be out of date rather than that nothing loaded. -->
+		<LoadError
+			message={summary
+				? m('payments.summary.refreshFailedStale')
+				: m('payments.summary.loadFailed')}
+			onretry={loadSummary}
+			testId="summary-error"
+		/>
+	{/if}
+	<div class="summary-cards" aria-busy={summaryPending ? 'true' : undefined}>
+		<div class="scard">
+			<span class="scard-value">
+				{kpiDisplayValue(summary ? formatCurrency(summary.total_paid, summary.currency) : null, summaryPending)}
+			</span>
+			<span class="scard-label">{m('payments.summary.totalPaid')}</span>
 		</div>
+		<div class="scard">
+			<span class="scard-value">
+				{kpiDisplayValue(summary ? formatCurrency(summary.total_pending, summary.currency) : null, summaryPending)}
+			</span>
+			<span class="scard-label">{m('payments.summary.pending')}</span>
+		</div>
+		<div class="scard">
+			<span class="scard-value">{kpiDisplayValue(summary?.queue_count, summaryPending)}</span>
+			<span class="scard-label">{m('payments.summary.readyToPay')}</span>
+		</div>
+		<div class="scard">
+			<span class="scard-value">{kpiDisplayValue(summary?.payment_count, summaryPending)}</span>
+			<span class="scard-label">{m('payments.summary.payments')}</span>
+		</div>
+		{#if summary && Number(summary.total_rebates) > 0}
+			<div class="scard rebate">
+				<!-- `summary.currency` is what the API says EVERY money figure in
+				     this block is denominated in, `total_rebates` included — the
+				     three cards above pass it and this one didn't, falling through
+				     to the store instead of the response's own declaration. -->
+				<span class="scard-value">{formatCurrency(summary.total_rebates, summary.currency)}</span>
+				<span class="scard-label">{m('payments.summary.rebatesEarned')}</span>
+			</div>
+		{/if}
+	</div>
+	{#if summary}
 		<!-- A payment with no rate into the reporting currency is left out of the
 		     totals above, so the headline understates what actually moved. Same
 		     notice pattern as /discounts' excluded foreign offers and the /cfo
@@ -2025,7 +2258,8 @@
 					</span>
 					{#if allQueueSelected && !selectedAllQueueMatching && queueSelectableTotal > selectableQueue.length}
 						<button
-							class="btn-select-all-matching"
+							type="button"
+							class="btn-secondary"
 							data-testid="queue-select-all-matching"
 							disabled={selectingAllQueue}
 							onclick={selectAllQueueMatching}
@@ -2041,7 +2275,7 @@
 					{/if}
 					{#if !showReview}
 						<button
-							class="btn-pay"
+							class="btn-primary"
 							disabled={mixedCurrencySelection}
 							title={mixedCurrencySelection ? m('payments.queue.mixedCurrencyBlocked') : ''}
 							onclick={() => (showReview = true)}
@@ -2049,7 +2283,7 @@
 							{m('payments.queue.reviewAndPay')}
 						</button>
 					{/if}
-					<button class="btn-clear" onclick={clearQueueSelection}>{m('common.clear')}</button>
+					<button type="button" class="btn-cancel btn-clear" onclick={clearQueueSelection}>{m('common.clear')}</button>
 				</div>
 			</div>
 		{/if}
@@ -2103,15 +2337,15 @@
 										</span>
 										<span class="pinned-method-why">{blockedReason(item)}</span>
 									{:else}
-										<select class="method-select" aria-label={`Payment method for ${item.invoice_number}`} value={paymentMethods[item.id] || 'ach'} onchange={(e) => (paymentMethods[item.id] = e.currentTarget.value)}>
-											<option value="ach">ACH</option>
-											<option value="wire">Wire</option>
-											<option value="check">Check</option>
+										<select class="method-select" aria-label={m('payments.queue.methodAria', { invoice: item.invoice_number })} value={paymentMethods[item.id] || 'ach'} onchange={(e) => (paymentMethods[item.id] = e.currentTarget.value)}>
+											<option value="ach">{m('payments.method.ach')}</option>
+											<option value="wire">{m('payments.method.wire')}</option>
+											<option value="check">{m('payments.method.check')}</option>
 											{#if canDispatchPayments(executionMode)}
 												<!-- Executing a card leg MINTS a card, which a record-only
 												     tenant's server refuses (`payments_record_only`); and a
 												     card is never a way to pay outside FeohLedger. -->
-												<option value="virtual_card">Virtual Card</option>
+												<option value="virtual_card">{m('payments.method.virtualCard')}</option>
 											{/if}
 										</select>
 									{/if}
@@ -2144,7 +2378,8 @@
 				<div class="review-footer">
 					<span class="review-total">{m('payments.queue.total', { amount: formatGroups(selectedGroups) })}</span>
 					<button
-						class="btn-execute"
+						type="button"
+						class="btn-primary btn-execute"
 						disabled={creatingRun || mixedCurrencySelection}
 						title={mixedCurrencySelection ? m('payments.queue.mixedCurrencyBlocked') : ''}
 						onclick={createDraftRun}
@@ -2166,37 +2401,45 @@
 
 		{#if queueSavingsGroups.length > 0}
 			<div class="savings-banner">
-				<span class="savings-icon">💸</span>
+				<span class="savings-icon" aria-hidden="true">💸</span>
 				<span>
 					{m('payments.queue.savingsBanner', { amount: formatGroups(queueSavingsGroups) })}
 				</span>
 			</div>
 		{/if}
 
+		{#if queueErrored && queue.length === 0}
+			<!-- Same in-place failure + Retry as the Runs tab: the toast fades,
+			     and "Try again." with nothing to press was a dead end. -->
+			<LoadError
+				message={m('payments.queue.empty.errored')}
+				onretry={loadQueue}
+				testId="queue-error"
+			/>
+		{:else}
+		<div class="pay-table pay-queue">
 		<DataTable
+			fixed
 			isEmpty={queue.length === 0}
-			empty={queueLoading
-				? m('common.loading')
-				: queueErrored
-					? m('payments.queue.empty.errored')
-					: m('payments.queue.empty')}
-			colspan={8 + (canCompareRoutes() ? 1 : 0) + (canRecordOutside() ? 1 : 0)}
+			loading={queueLoading}
+			empty={m('payments.queue.empty')}
+			colspan={8 + (hasQueueActions() ? 1 : 0)}
 		>
 			{#snippet header()}
 				<tr>
 					<th class="checkbox-col"><input type="checkbox" aria-label={m('payments.selectAllPayableAria')} checked={allQueueSelected} disabled={selectableQueue.length === 0} onchange={toggleQueueSelectAll} /></th>
-					<th>{m('payments.col.invoiceNumber')}</th>
+					<th class="col-number">{m('payments.col.invoiceNumber')}</th>
 					<th>{m('payments.col.vendor')}</th>
-					<th class="right">{m('payments.col.amount')}</th>
-					<th>{m('payments.col.dueDate')}</th>
-					<th>{m('payments.col.discount')} <HelpTip term="dynamic-discounting" /></th>
-					<th>{m('payments.col.terms')}</th>
-					<th>{m('payments.col.status')}</th>
-					{#if canCompareRoutes()}
-						<th class="right">{m('payments.col.routes')}</th>
-					{/if}
-					{#if canRecordOutside()}
-						<!-- Row action: record a payment made outside FeohLedger. -->
+					<th class="right col-amount">{m('payments.col.amount')}</th>
+					<th class="col-date">{m('payments.col.dueDate')}</th>
+					<th class="col-discount">{m('payments.col.discount')} <HelpTip term="dynamic-discounting" /></th>
+					<th class="col-terms">{m('payments.col.terms')}</th>
+					<th class="col-queue-status">{m('payments.col.status')}</th>
+					{#if hasQueueActions()}
+						<!-- Row actions: compare routes, record a payment made outside
+						     FeohLedger. One cell for both, so neither needs a fixed
+						     column of its own (a fixed table wraps a cell's buttons
+						     onto a second row instead of overprinting). -->
 						<th class="actions-col"></th>
 					{/if}
 				</tr>
@@ -2226,7 +2469,7 @@
 									})}
 								/>
 							{:else}
-								<input type="checkbox" aria-label={`Select invoice ${item.invoice_number}`} checked={selectedQueue.has(item.id)} onchange={() => toggleQueueSelect(item)} />
+								<input type="checkbox" aria-label={m('payments.selectInvoiceAria', { invoice: item.invoice_number })} checked={selectedQueue.has(item.id)} onchange={() => toggleQueueSelect(item)} />
 							{/if}
 						</td>
 						<td class="mono">{item.invoice_number}</td>
@@ -2254,10 +2497,13 @@
 							{:else if item.discount_eligible && item.discount_amount && item.discount_percent}
 								<span
 									class="discount-chip"
-									title="{item.discount_percent}% discount expires {formatDate(item.discount_date)}"
+									title={m('payments.queue.discountTitle', {
+										percent: formatPercent(item.discount_percent, { maximumFractionDigits: 2 }),
+										date: formatDate(item.discount_date)
+									})}
 								>
 									{m('payments.queue.discountSave', { amount: formatCurrency(item.discount_amount, item.currency) })}
-									<span class="discount-pct">{m('payments.queue.discountBy', { percent: item.discount_percent, date: formatDate(item.discount_date) })}</span>
+									<span class="discount-pct">{m('payments.queue.discountBy', { percent: formatPercent(item.discount_percent, { maximumFractionDigits: 2 }), date: formatDate(item.discount_date) })}</span>
 								</span>
 							{:else}
 								<span class="muted">—</span>
@@ -2270,6 +2516,26 @@
 								<span class="blocked-chip" data-testid="queue-blocked-chip">
 									{blockedReason(item)}
 								</span>
+								{#if item.blocking_exception}
+									<!-- Name the exception and lead to it: the banner
+									     alone told the operator to clear "the exception"
+									     without saying which, or where. -->
+									<a
+										class="blocked-link"
+										href="/exceptions?id={item.blocking_exception.id}"
+										data-testid="queue-blocked-exception-link"
+										aria-label={m('payments.queue.openExceptionAria', {
+											invoice: item.invoice_number
+										})}
+									>
+										{m('payments.queue.openException')}
+									</a>
+									{#if clearRefusalText(item)}
+										<span class="blocked-note" data-testid="queue-blocked-clear-refusal">
+											{clearRefusalText(item)}
+										</span>
+									{/if}
+								{/if}
 							{:else if requiredMethod(item)}
 								<!-- Not blocked — payable, but only on one rail. Its own chip,
 								     because reusing the blocked one would read as "can't be
@@ -2279,34 +2545,47 @@
 								</span>
 							{/if}
 						</td>
-						{#if canCompareRoutes()}
-							<!-- Advisory: opening this prices the invoice across the
-							     org's configured processors. It selects nothing and
-							     moves nothing — offered on a BLOCKED row too, because
-							     seeing what a payment would cost is not paying it. -->
-							<td class="right">
-								<RowAction
-									ariaLabel={m('payments.quotes.openAria', {
-										action: m('payments.quotes.open'),
-										invoice: item.invoice_number
-									})}
-									onclick={() => openQuotes(item)}
-								>
-									{m('payments.quotes.open')}
-								</RowAction>
-							</td>
-						{/if}
-						{#if canRecordOutside()}
-							<td class="actions">
-								{#if canRecordRow(item)}
+						{#if hasQueueActions()}
+							<td class="actions record-cell">
+								{#if canCompareRoutes()}
+									<!-- Advisory: opening this prices the invoice across the
+									     org's configured processors. It selects nothing and
+									     moves nothing — offered on a BLOCKED row too, because
+									     seeing what a payment would cost is not paying it. -->
+									<RowAction
+										ariaLabel={m('payments.quotes.openAria', {
+											action: m('payments.quotes.open'),
+											invoice: item.invoice_number
+										})}
+										onclick={() => openQuotes(item)}
+									>
+										{m('payments.quotes.open')}
+									</RowAction>
+								{/if}
+								{#if canRecordOutside()}
+									<!-- Shown on every row, disabled with its reason when the
+									     server would refuse it whoever records — hiding it left
+									     the operator hunting for an action that was not there. -->
 									<RowAction
 										ariaLabel={m('payments.recordOutside.actionAria', {
 											invoice: item.invoice_number
 										})}
+										disabled={!canRecordRow(item)}
+										describedby={canRecordRow(item) ? undefined : `record-why-${item.id}`}
+										title={canRecordRow(item) ? undefined : recordRefusalText(item)}
 										onclick={() => openRecordOutside(item)}
 									>
 										{m('payments.recordOutside.action')}
 									</RowAction>
+									{#if !canRecordRow(item)}
+										<span
+											class="visually-hidden"
+											id="record-why-{item.id}"
+											data-testid="queue-record-refusal"
+										>
+											{recordRefusalText(item)}
+										</span>
+									{/if}
 								{/if}
 							</td>
 						{/if}
@@ -2314,36 +2593,50 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 
-		{#if hasMoreQueue}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={loadMoreQueue} disabled={queueLoadingMore}>
-					{queueLoadingMore
-						? m('common.loading')
-						: m('payments.queue.loadMore', { shown: queue.length, total: queueTotal })}
-				</button>
-			</div>
-		{:else if queueTotal > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('payments.queue.showingAll', { total: queueTotal })}</span>
-			</div>
+		<LoadMoreFooter
+			shown={queue.length}
+			total={queueTotal}
+			hasMore={hasMoreQueue}
+			loading={queueLoadingMore}
+			onloadmore={loadMoreQueue}
+			moreKey="payments.queue.loadMore"
+			allKey="payments.queue.showingAll"
+		/>
 		{/if}
 
 	{:else if activeTab === 'history'}
+		{#if paymentStore.errored && !paymentStore.loading}
+			<!-- A failed list load replaces the table, rows or not (as /invoices
+			     does): gated on an empty list, a failed chip / search / sort
+			     re-fetch left the PREVIOUS filter's rows under the new chip with
+			     nothing saying they were stale. -->
+			<LoadError
+				message={m('payments.history.empty.errored')}
+				onretry={retryHistory}
+				testId="history-error"
+			/>
+		{:else}
+		<div class="pay-table pay-history">
 		<DataTable
+			fixed
 			isEmpty={paymentStore.all.length === 0}
-			empty={historyEmptyMessage}
+			loading={paymentStore.loading}
+			filtered={historyFiltered}
+			emptyFiltered={m('payments.history.empty')}
+			empty={m('payments.history.empty.fresh')}
 			colspan={8}
 		>
 			{#snippet header()}
 				<tr>
-					<th scope="col">{m('payments.col.invoiceNumber')}</th>
+					<th scope="col" class="col-number">{m('payments.col.invoiceNumber')}</th>
 					<th scope="col">{m('payments.col.vendor')}</th>
-					<SortableHeader field="method" label={m('payments.col.method')} active={sortField === 'method'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
-					<SortableHeader field="amount" label={m('payments.col.amount')} class="right" active={sortField === 'amount'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
-					<SortableHeader field="status" label={m('payments.col.status')} active={sortField === 'status'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
+					<SortableHeader field="method" label={m('payments.col.method')} class="col-method" active={sortField === 'method'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
+					<SortableHeader field="amount" label={m('payments.col.amount')} class="right col-amount" active={sortField === 'amount'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
+					<SortableHeader field="status" label={m('payments.col.status')} class="col-status" active={sortField === 'status'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
 					<th scope="col">{m('payments.col.reference')}</th>
-					<SortableHeader field="created_at" label={m('payments.col.date')} active={sortField === 'created_at'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
+					<SortableHeader field="created_at" label={m('payments.col.date')} class="col-date" active={sortField === 'created_at'} order={sortOrder} onsort={handleHistorySort} onclear={handleClearSort} />
 					<th class="actions-col"></th>
 				</tr>
 			{/snippet}
@@ -2403,15 +2696,28 @@
 						<td class="muted">{formatDate(p.created_at)}</td>
 						<td class="actions">
 							{#if p.status === 'completed'}
-								<RowAction onclick={() => downloadRemittance(p)}>{m('payments.history.remittance')}</RowAction>
+								<RowAction
+									onclick={() => downloadRemittance(p)}
+									ariaLabel={m('payments.history.remittanceAria', { invoice: rowInvoice(p) })}
+								>
+									{m('payments.history.remittance')}
+								</RowAction>
 							{/if}
 							{#if canReleaseHold(p)}
-								<RowAction variant="accent" onclick={() => openCompliance(p, 'release')}>
+								<RowAction
+									variant="accent"
+									onclick={() => openCompliance(p, 'release')}
+									ariaLabel={m('payments.history.complianceReleaseAria', { invoice: rowInvoice(p) })}
+								>
 									{m('payments.history.complianceRelease')}
 								</RowAction>
 							{/if}
 							{#if canDismissHold(p)}
-								<RowAction variant="danger" onclick={() => openCompliance(p, 'dismiss')}>
+								<RowAction
+									variant="danger"
+									onclick={() => openCompliance(p, 'dismiss')}
+									ariaLabel={m('payments.history.complianceDismissAria', { invoice: rowInvoice(p) })}
+								>
 									{m('payments.history.complianceDismiss')}
 								</RowAction>
 							{/if}
@@ -2420,51 +2726,56 @@
 									variant="accent"
 									onclick={() => openSettlement(p)}
 									ariaLabel={m('payments.history.settlementAcceptAria', {
-										invoice: p.invoice_number ?? p.id.slice(0, 8)
+										invoice: rowInvoice(p)
 									})}
 								>
 									{m('payments.history.settlementAccept')}
 								</RowAction>
 							{/if}
 							{#if canVoid(p)}
-								<RowAction variant="danger" onclick={() => openVoid(p)}>{m('payments.history.void')}</RowAction>
+								<RowAction
+									variant="danger"
+									onclick={() => openVoid(p)}
+									ariaLabel={m('payments.history.voidAria', { invoice: rowInvoice(p) })}
+								>
+									{m('payments.history.void')}
+								</RowAction>
 							{/if}
 						</td>
 					</tr>
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 
-		{#if paymentStore.hasMore}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={() => paymentStore.loadMore()} disabled={paymentStore.loading}>
-					{paymentStore.loading
-						? m('common.loading')
-						: m('payments.history.loadMore', { shown: paymentStore.all.length, total: paymentStore.total })}
-				</button>
-			</div>
-		{:else if paymentStore.total > 0}
-			<div class="load-more-row">
-				<span class="load-more-end"
-					>{m('payments.history.showingAll', { total: paymentStore.total })}</span
-				>
-			</div>
+		<LoadMoreFooter
+			shown={paymentStore.all.length}
+			total={paymentStore.total}
+			hasMore={paymentStore.hasMore}
+			loading={paymentStore.loading}
+			onloadmore={() => paymentStore.loadMore()}
+			moreKey="payments.history.loadMore"
+			allKey="payments.history.showingAll"
+		/>
 		{/if}
 
 	{:else if activeTab === 'runs'}
 		{#if runsErrored}
 			<!-- A failed load is a dead end without a way back: the toast that
-			     reported it has already faded. Same error-with-retry block
-			     `/admin/api-keys` uses. -->
-			<div class="state error" data-testid="runs-error" role="alert">
-				<p>{m('payments.runs.empty.errored')}</p>
-				<button type="button" class="btn-cancel" onclick={loadRuns}>{m('payments.runs.retry')}</button>
-			</div>
+			     reported it has already faded. -->
+			<LoadError
+				message={m('payments.runs.empty.errored')}
+				onretry={loadRuns}
+				testId="runs-error"
+			/>
 		{:else}
+		<div class="pay-table pay-runs">
 		<DataTable
+			fixed
 			columns={RUNS_COLUMNS}
 			isEmpty={runs.length === 0}
-			empty={runsLoading ? m('common.loading') : m('payments.runs.empty')}
+			loading={runsLoading}
+			empty={m('payments.runs.empty')}
 			colspan={7}
 		>
 			{#snippet body()}
@@ -2504,6 +2815,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 		{/if}
 	{:else if activeTab === 'cards'}
 		{#if cardDashboard}
@@ -2569,15 +2881,20 @@
 			</p>
 		{/if}
 
-		<div data-testid="rebates-table">
+		<div class="pay-table pay-rebates" data-testid="rebates-table">
+		{#if rebatesErrored && rebates.length === 0}
+			<LoadError
+				message={m('payments.rebates.errored')}
+				onretry={() => loadRebates()}
+				testId="rebates-error"
+			/>
+		{:else}
 		<DataTable
+			fixed
 			columns={REBATES_COLUMNS}
 			isEmpty={rebates.length === 0}
-			empty={loadingRebates
-				? m('payments.rebates.loading')
-				: rebatesErrored
-					? m('payments.rebates.errored')
-					: m('payments.rebates.empty')}
+			loading={loadingRebates}
+			empty={m('payments.rebates.empty')}
 			colspan={6}
 		>
 			{#snippet body()}
@@ -2626,24 +2943,19 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		{/if}
 		</div>
 
-		{#if hasMoreRebates}
-			<div class="load-more-row">
-				<button
-					class="btn-load-more"
-					onclick={loadMoreRebates}
-					disabled={loadingMoreRebates}
-					data-testid="load-more-rebates"
-				>
-					{loadingMoreRebates ? m('common.loading') : m('payments.rebates.loadMore', { shown: rebates.length, total: rebateCount })}
-				</button>
-			</div>
-		{:else if rebateCount > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('payments.rebates.showingAll', { total: rebateCount })}</span>
-			</div>
-		{/if}
+		<LoadMoreFooter
+			shown={rebates.length}
+			total={rebateCount}
+			hasMore={hasMoreRebates}
+			loading={loadingMoreRebates}
+			onloadmore={loadMoreRebates}
+			moreKey="payments.rebates.loadMore"
+			allKey="payments.rebates.showingAll"
+			testId="load-more-rebates"
+		/>
 
 		{#if rebateCount > 0 && rebateListCurrency}
 			<!-- The WHOLE filtered set's total, off the envelope — never a sum of
@@ -2659,6 +2971,16 @@
 		<div class="help-row section-title-row">
 			<h2 class="section-heading">{m('payments.rebates.cardsTitle')}</h2>
 			<HelpTip term="virtual-card" />
+			{#if canGenerateCards()}
+				<button
+					type="button"
+					class="btn-primary cards-generate"
+					data-testid="cards-generate"
+					onclick={() => (generateOpen = true)}
+				>
+					{m('payments.cards.generate')}
+				</button>
+			{/if}
 		</div>
 
 		<!-- The Cards tab stacks TWO tables (rebates above, cards here), so a
@@ -2666,15 +2988,20 @@
 		     scope the cards-pagination spec measures its page size against —
 		     a real API, not scaffolding: without it the assertion silently
 		     starts counting a sibling table's rows. -->
-		<div data-testid="cards-table">
+		<div class="pay-table pay-cards" data-testid="cards-table">
+		{#if cardsErrored && cards.length === 0}
+			<LoadError
+				message={m('payments.cards.errored')}
+				onretry={() => loadCards()}
+				testId="cards-error"
+			/>
+		{:else}
 		<DataTable
+			fixed
 			columns={CARDS_COLUMNS}
 			isEmpty={cards.length === 0}
-			empty={loadingCards
-				? m('payments.cards.loading')
-				: cardsErrored
-					? m('payments.cards.errored')
-					: m('payments.cards.empty')}
+			loading={loadingCards}
+			empty={m('payments.cards.empty')}
 			colspan={8}
 		>
 			{#snippet body()}
@@ -2707,22 +3034,30 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		{/if}
 		</div>
 
-		{#if hasMoreCards}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={loadMoreCards} disabled={loadingMoreCards}>
-					{loadingMoreCards ? m('common.loading') : m('payments.cards.loadMore', { shown: cards.length, total: cardsTotal })}
-				</button>
-			</div>
-		{:else if cardsTotal > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('payments.cards.showingAll', { total: cardsTotal })}</span>
-			</div>
-		{/if}
+		<LoadMoreFooter
+			shown={cards.length}
+			total={cardsTotal}
+			hasMore={hasMoreCards}
+			loading={loadingMoreCards}
+			onloadmore={loadMoreCards}
+			moreKey="payments.cards.loadMore"
+			allKey="payments.cards.showingAll"
+		/>
 	{/if}
 	</div>
 </PageHeader>
+
+{#if generateOpen}
+	<GenerateCardsModal
+		onclose={() => (generateOpen = false)}
+		ongenerated={() => {
+			void loadCards();
+		}}
+	/>
+{/if}
 
 {#if activeRunId}
 	<RunDetailModal
@@ -2735,7 +3070,7 @@
 
 <Modal
 	open={revealedCard !== null}
-	ariaLabel="Card details"
+	ariaLabel={m('payments.cardDetails.dialogLabel')}
 	title={m('payments.cardDetails.title')}
 	onclose={() => (revealedCard = null)}
 >
@@ -2773,7 +3108,7 @@
      button that moves money. -->
 <Modal
 	open={rebateTarget !== null}
-	ariaLabel="Advance card rebate"
+	ariaLabel={m('payments.rebates.dialog.label')}
 	title={rebateMode === 'confirm'
 		? m('payments.rebates.dialog.confirmTitle')
 		: m('payments.rebates.dialog.markPaidTitle')}
@@ -2847,38 +3182,51 @@
 				</strong>
 				<span class="record-owed-hint">{m('payments.recordOutside.amountHint')}</span>
 			</div>
-			<label>
-				<span>{m('payments.recordOutside.method')}</span>
-				<select bind:value={recordMethod} data-testid="record-method">
-					{#each EXTERNAL_PAYMENT_METHODS as method (method)}
-						<option value={method}>{methodLabel(method)}</option>
-					{/each}
-				</select>
-			</label>
-			<label>
-				<span>{m('payments.recordOutside.reference')}</span>
-				<input
-					type="text"
-					bind:value={recordReference}
-					maxlength="255"
-					required
-					aria-describedby="record-reference-hint"
-					data-testid="record-reference"
+			{#if recordReported?.amount && recordErpName}
+				<!-- What the ERP says was paid, in the code it stated, beside what
+				     is owed in the invoice's own: rendered, never compared here
+				     (the server refuses a figure that differs, decisions §386). -->
+				<div class="record-owed">
+					<span class="record-owed-label">
+						{m('exceptions.erpPayment.reportedAmount', { erp: recordErpName })}
+					</span>
+					<strong class="mono" data-testid="record-erp-amount">
+						{formatCurrency(recordReported.amount, recordReported.amount_currency ?? null)}
+					</strong>
+				</div>
+			{/if}
+			{#if recordErpName}
+				<p class="modal-note" data-testid="record-prefilled-from-erp">
+					{m('payments.recordOutside.prefilledFromErp', { erp: recordErpName })}
+				</p>
+			{/if}
+			{#if recordShowSplit && recordErpName}
+				<ErpPaymentSplit
+					parts={recordParts}
+					currency={recordReported?.amount_currency ?? null}
+					erp={recordErpName}
+					stands={recordReported?.split_stands}
+					idPrefix="record"
+					testid="record"
 				/>
-			</label>
-			<p class="field-hint" id="record-reference-hint">{m('payments.recordOutside.referenceHint')}</p>
-			<label>
-				<span>{m('payments.recordOutside.paidOn')}</span>
-				<input
-					type="date"
-					bind:value={recordPaidOn}
-					max={recordMaxDate}
-					required
-					data-testid="record-paid-on"
-				/>
-			</label>
+			{/if}
+			<RecordPaymentFields
+				bind:method={recordMethod}
+				bind:reference={recordReference}
+				bind:paidOn={recordPaidOn}
+				maxDate={recordMaxDate}
+				idPrefix="record"
+				methodFixed={recordSplitStands ? m('exceptions.erpPayment.splitMethod') : null}
+			/>
 			{#if recordError}
-				<p class="review-error" role="alert" data-testid="record-error">{recordError}</p>
+				<p class="review-error" role="alert" data-testid="record-error">
+					{recordError}
+					{#if recordErrorExceptionId}
+						<a href="/exceptions?id={recordErrorExceptionId}" data-testid="record-error-exception">
+							{m('payments.queue.openException')}
+						</a>
+					{/if}
+				</p>
 			{/if}
 			<div class="modal-footer">
 				<button type="button" class="btn-cancel" onclick={closeRecordOutside}>
@@ -2889,6 +3237,7 @@
 					class="btn-primary"
 					data-testid="record-confirm"
 					disabled={recording ||
+						(!recordMethod && !recordSplitStands) ||
 						!recordReference.trim() ||
 						!recordPaidOn ||
 						recordPaidOn > recordMaxDate}
@@ -2902,7 +3251,7 @@
 
 <Modal
 	open={voidTarget !== null}
-	ariaLabel="Void payment"
+	ariaLabel={m('payments.void.title')}
 	title={voidCardResult && voidCardDisposition !== 'closed'
 		? m('payments.void.card.title')
 		: m('payments.void.title')}
@@ -2944,9 +3293,9 @@
 					{labelKey ? m(labelKey) : voidCardResult.void_card_outcome}
 				</p>
 			{/if}
-			{#if cardRetryFailed}
+			{#if cardRetryError}
 				<p class="state error" role="alert" data-testid="void-card-retry-failed">
-					{m('payments.void.card.retryFailed')}
+					{cardRetryError}
 				</p>
 			{/if}
 			<div class="modal-footer">
@@ -2978,21 +3327,29 @@
 					<input
 						type="text"
 						bind:value={voidReason}
+						bind:this={voidReasonInput}
+						oninput={() => (voidReasonError = '')}
 						placeholder={m('payments.void.reasonPlaceholder')}
 						maxlength="500"
 						data-testid="void-reason"
-						autofocus
+						aria-invalid={voidReasonError ? 'true' : undefined}
+						aria-describedby="void-reason-error"
+						data-autofocus
 					/>
 				</label>
+				<!-- Always in the DOM, so `aria-describedby` always resolves; empty
+				     until a submit finds the reason missing. Focus moving to the
+				     input is what reads it — no live region (§ Field validation). -->
+				<p class="field-error" id="void-reason-error" data-testid="void-reason-error">{voidReasonError}</p>
 				<div class="modal-footer">
 					<button type="button" class="btn-cancel" onclick={closeVoid}>
 						{m('common.cancel')}
 					</button>
 					<button
 						type="submit"
-						class="btn-danger"
+						class="btn-danger armed"
 						data-testid="void-confirm"
-						disabled={voiding || !voidReason.trim()}
+						disabled={voiding}
 					>
 						{voiding ? m('payments.void.voiding') : m('payments.void.confirm')}
 					</button>
@@ -3007,7 +3364,7 @@
      payment — neither should be a single stray click on a table row. -->
 <Modal
 	open={complianceTarget !== null}
-	ariaLabel="Resolve compliance hold"
+	ariaLabel={m('payments.compliance.dialogLabel')}
 	title={complianceMode === 'release'
 		? m('payments.compliance.release.title')
 		: m('payments.compliance.dismiss.title')}
@@ -3032,18 +3389,24 @@
 					<input
 						type="text"
 						bind:value={complianceReason}
+						bind:this={complianceReasonInput}
+						oninput={() => (complianceReasonError = '')}
 						placeholder={m('payments.compliance.reasonPlaceholder')}
 						maxlength="1000"
-						autofocus
+						data-testid="compliance-reason"
+						aria-invalid={complianceReasonError ? 'true' : undefined}
+						aria-describedby="compliance-reason-error"
+						data-autofocus
 					/>
 				</label>
+				<p class="field-error" id="compliance-reason-error" data-testid="compliance-reason-error">{complianceReasonError}</p>
 			{/if}
 			<div class="modal-footer">
 				<button type="button" class="btn-cancel" onclick={closeCompliance}>
 					{m('common.cancel')}
 				</button>
 				{#if complianceMode === 'release'}
-					<button type="submit" class="btn-pay" disabled={complianceBusy}>
+					<button type="submit" class="btn-primary" disabled={complianceBusy}>
 						{complianceBusy
 							? m('payments.compliance.release.busy')
 							: m('payments.compliance.release.confirm')}
@@ -3051,8 +3414,8 @@
 				{:else}
 					<button
 						type="submit"
-						class="btn-danger"
-						disabled={complianceBusy || !complianceReason.trim()}
+						class="btn-danger armed"
+						disabled={complianceBusy}
 					>
 						{complianceBusy
 							? m('payments.compliance.dismiss.busy')
@@ -3070,7 +3433,7 @@
      actually settled. Irreversible — it is not a void. -->
 <Modal
 	open={settlementTarget !== null}
-	ariaLabel="Accept settlement as final"
+	ariaLabel={m('payments.settlement.title')}
 	title={m('payments.settlement.title')}
 	onclose={closeSettlement}
 >
@@ -3101,61 +3464,46 @@
 			</div>
 		</dl>
 
-		{#if settlementInvoiceStatus === null}
-			<p class="modal-hint" data-testid="settlement-checking">
-				{m('payments.settlement.checking')}
-			</p>
-		{:else if settlementInvoiceStatus !== SETTLEMENT_HELD_STATUS && settlementInvoiceStatus !== '?'}
-			<!-- Nothing to accept: the invoice is no longer held. Say so instead
-			     of offering a confirm the backend would 409. -->
-			<p class="modal-warn" role="alert" data-testid="settlement-not-held">
-				{m('payments.settlement.notHeld')}
-				<StatusBadge
-					status={settlementInvoiceStatus as import('#lib/types/invoice.ts').InvoiceStatus}
+		<p class="modal-warn" data-testid="settlement-warning">
+			{m('payments.settlement.warning')}
+			<HelpTip term="settlement" />
+		</p>
+		{#if settlementError}
+			<p class="state error" role="alert" data-testid="settlement-error">{settlementError}</p>
+		{/if}
+		<form onsubmit={(e) => { e.preventDefault(); commitSettlement(); }}>
+			<label>
+				<span>{m('payments.settlement.reason')}</span>
+				<input
+					type="text"
+					bind:value={settlementReason}
+					bind:this={settlementReasonInput}
+					oninput={() => (settlementReasonError = '')}
+					placeholder={m('payments.settlement.reasonPlaceholder')}
+					maxlength="1000"
+					data-testid="settlement-reason"
+					aria-invalid={settlementReasonError ? 'true' : undefined}
+					aria-describedby="settlement-reason-error"
+					data-autofocus
 				/>
-			</p>
+			</label>
+			<p class="field-error" id="settlement-reason-error" data-testid="settlement-reason-error">{settlementReasonError}</p>
 			<div class="modal-footer">
 				<button type="button" class="btn-cancel" onclick={closeSettlement}>
-					{m('payments.close')}
+					{m('common.cancel')}
+				</button>
+				<button
+					type="submit"
+					class="btn-danger armed"
+					data-testid="settlement-confirm"
+					disabled={settlementBusy}
+				>
+					{settlementBusy
+						? m('payments.settlement.busy')
+						: m('payments.settlement.confirm')}
 				</button>
 			</div>
-		{:else}
-			<p class="modal-warn" data-testid="settlement-warning">
-				{m('payments.settlement.warning')}
-				<HelpTip term="settlement" />
-			</p>
-			{#if settlementError}
-				<p class="state error" role="alert" data-testid="settlement-error">{settlementError}</p>
-			{/if}
-			<form onsubmit={(e) => { e.preventDefault(); commitSettlement(); }}>
-				<label>
-					<span>{m('payments.settlement.reason')}</span>
-					<input
-						type="text"
-						bind:value={settlementReason}
-						placeholder={m('payments.settlement.reasonPlaceholder')}
-						maxlength="1000"
-						data-testid="settlement-reason"
-						autofocus
-					/>
-				</label>
-				<div class="modal-footer">
-					<button type="button" class="btn-cancel" onclick={closeSettlement}>
-						{m('common.cancel')}
-					</button>
-					<button
-						type="submit"
-						class="btn-danger"
-						data-testid="settlement-confirm"
-						disabled={settlementBusy || !settlementReason.trim()}
-					>
-						{settlementBusy
-							? m('payments.settlement.busy')
-							: m('payments.settlement.confirm')}
-					</button>
-				</div>
-			</form>
-		{/if}
+		</form>
 	{/if}
 </Modal>
 
@@ -3165,7 +3513,7 @@
      "did this recover anything"). A run with nothing to recover says so. -->
 <Modal
 	open={erpSyncTarget !== null}
-	ariaLabel="Retry ERP sync for payment run"
+	ariaLabel={m('payments.erpSync.dialogLabel')}
 	title={m('payments.erpSync.title')}
 	onclose={closeErpSync}
 >
@@ -3229,7 +3577,7 @@
 				</button>
 				<button
 					type="button"
-					class="btn-pay"
+					class="btn-primary"
 					data-testid="erp-sync-confirm"
 					disabled={erpSyncBusy}
 					onclick={commitErpSync}
@@ -3249,7 +3597,7 @@
      choice is worse than no comparison. -->
 <Modal
 	open={quoteTarget !== null}
-	ariaLabel="Compare payment routes"
+	ariaLabel={m('payments.quotes.title')}
 	title={m('payments.quotes.title')}
 	width="lg"
 	onclose={closeQuotes}
@@ -3301,7 +3649,7 @@
 		</div>
 
 		{#if quoteBusy}
-			<p class="state" data-testid="quotes-loading">{m('common.loading')}</p>
+			<LoadingState testId="quotes-loading" />
 		{:else if quoteError}
 			<!-- Persistent, not a toast. The 409 body names each provider's own
 			     machine reason, which is what tells an operator whether the corridor
@@ -3390,7 +3738,6 @@
 <style>
 	/* Page-specific styling; shared design-system CSS lives in app.css. */
 
-	/* Error-with-retry block — same shape as `/admin/api-keys`. */
 	.state {
 		color: var(--text-muted);
 		padding: 0.75rem 0;
@@ -3398,10 +3745,6 @@
 
 	.state.error {
 		color: var(--danger);
-	}
-
-	.state.error p {
-		margin: 0 0 8px;
 	}
 
 	/* --- Summary --- */
@@ -3425,8 +3768,8 @@
 	}
 
 	.scard.rebate {
-		border-color: rgba(31, 168, 106, 0.3);
-		background: rgba(31, 168, 106, 0.04);
+		border-color: color-mix(in srgb, var(--success) 30%, transparent);
+		background: color-mix(in srgb, var(--success) 4%, transparent);
 	}
 
 	.scard-value {
@@ -3436,7 +3779,7 @@
 	}
 
 	.scard.rebate .scard-value {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	.scard-label {
@@ -3450,11 +3793,11 @@
 	/* --- Queue --- */
 
 	.overdue {
-		background: rgba(224, 64, 64, 0.04);
+		background: color-mix(in srgb, var(--danger) 4%, transparent);
 	}
 
 	.overdue-text {
-		color: #f06464;
+		color: var(--danger);
 	}
 
 	/* Date + its overdue pill. The gap used to be the pill's own
@@ -3544,6 +3887,94 @@
 		color: var(--text-muted);
 	}
 
+	/* --- Column widths ---
+	   Every table here is `table-layout: fixed` (DataTable's `fixed`). Under
+	   `auto` the header cells were sized against the one "Loading…" row and
+	   then re-sized against the real rows, so every column slid sideways as
+	   the data landed. Fixed widths come from the header alone, so they hold
+	   from first paint. The `<th>` render from this page's snippets,
+	   DataTable's `columns`, and SortableHeader alike, so the selectors go
+	   through `:global` under a page-owned wrapper (the /vendors pattern; a
+	   scoped `th` selector never reaches a SortableHeader's cell).
+
+	   Each predictable column is sized to its widest content in the six
+	   locales, measured, plus a quarter for CI's wider fallback font (the fr
+	   badge "COMPTABILISÉE DANS L'ERP" measures ~191px here and ~234px in CI):
+	   a header to its longest word, since a fixed header wraps (de
+	   "FÄLLIGKEITSDATUM", "KONDITIONEN", "RECHNUNGS-NR.", pt-BR "PAGAMENTOS");
+	   a status column to its longest badge, which does not (queue: fr
+	   "COMPTABILISÉE DANS L'ERP"; history: es "RETENCIÓN POR CUMPLIMIENTO";
+	   runs: fr "EXÉCUTION EN COURS"; rebates: es "CONFIRMADO"); an actions
+	   column to its longest single button, since a fixed table wraps a cell's
+	   buttons onto a second row (queue: fr "Enregistrer comme payée"; history:
+	   de "Zahlungseingang akzeptieren"; runs: pt-BR "Repetir sincronização com
+	   o ERP"; rebates: de "Als ausgezahlt markieren"). The method and card
+	   pills carry a processor name and card digits, not a closed set, so they
+	   wrap inside their column instead. The free-text columns (vendor,
+	   reference, run, period) carry no width and share what is left; past the
+	   `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables), which is what a phone
+	   gets. Cells run 10px of horizontal padding instead of the global 14px
+	   (the /invoices arrangement): that is what keeps the queue and the
+	   history inside the 1388px region a 1666px window gives
+	   (tests-e2e/a11y/wide-layout.spec.ts). Held per locale by
+	   tests-e2e/reactivity/layout-stability.spec.ts (`LOCALE_SIZED`). */
+	.pay-table {
+		min-width: 0;
+	}
+	.pay-table :global(th),
+	.pay-table :global(td) {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+	/* The checkbox hugs its box (the rule below, restated: this one would
+	   otherwise win on specificity). */
+	.pay-table :global(.checkbox-col) { padding-right: 4px; }
+	.pay-table :global(th.checkbox-col) { width: 40px; }
+	.pay-table :global(th.col-number) { width: 150px; }
+	.pay-table :global(th.col-amount) { width: 140px; }
+	.pay-queue :global(th.col-amount) { width: 132px; }
+	.pay-table :global(th.col-date) { width: 130px; }
+	.pay-table :global(th.col-count) { width: 130px; }
+	.pay-table :global(th.col-card) { width: 150px; }
+	.pay-table :global(th.col-method) { width: 150px; }
+	.pay-queue :global(th.col-date) { width: 170px; }
+	.pay-table :global(th.col-discount) { width: 120px; }
+	.pay-table :global(th.col-terms) { width: 135px; }
+	/* Holds the status pill plus, on a blocked row, a wrapping reason chip and
+	   the link to its exception. */
+	.pay-table :global(th.col-queue-status) { width: 270px; }
+	.pay-history :global(th.col-status) { width: 300px; }
+	.pay-runs :global(th.col-status) { width: 220px; }
+	.pay-rebates :global(th.col-status) { width: 160px; }
+	/* Card statuses render raw today (docs/followups.md § "Virtual-card
+	   statuses render untranslated"); resize this when they get labels. */
+	.pay-cards :global(th.col-status) { width: 150px; }
+	/* The queue's one actions cell holds "Compare routes" and "Record as
+	   paid"; the column is the longer of the two. */
+	.pay-queue :global(th.actions-col) { width: 240px; }
+	.pay-history :global(th.actions-col) { width: 280px; }
+	.pay-runs :global(th.actions-col) { width: 300px; }
+	.pay-rebates :global(th.actions-col) { width: 250px; }
+	.pay-cards :global(th.actions-col) { width: 130px; }
+	.pay-table :global(.badge.method-badge),
+	.pay-table :global(.badge.card-badge) {
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+	/* Each min-width is the fixed columns' sum plus ~110px per free-text
+	   column. The queue's fixed columns sum to 1257px and the history's to
+	   1150px, so both stay inside the 1388px region at 1666px. The queue's
+	   due date (170px) and amount (132px) are the widths /invoices holds the
+	   same headers to, measured in CI in every locale; together with a 240px
+	   actions cell they leave Vendor ~123px, which fits fr "FOURNISSEUR"
+	   (110px in CI's font, the round-35 run that found a 100px column). */
+	.pay-queue :global(table) { min-width: 1380px; }
+	.pay-history :global(table) { min-width: 1370px; }
+	.pay-runs :global(table) { min-width: 1160px; }
+	.pay-rebates :global(table) { min-width: 940px; }
+	.pay-cards :global(table) { min-width: 1110px; }
+
 	/* --- Queue selection & payment --- */
 
 	.checkbox-col {
@@ -3590,7 +4021,7 @@
 	.fx-skipped {
 		font-size: 0.85rem;
 		margin: 0 0 12px;
-		color: #d4940a;
+		color: var(--warning);
 		font-weight: 600;
 	}
 
@@ -3599,7 +4030,7 @@
 		max-width: 56ch;
 		font-size: 0.8rem;
 		line-height: 1.35;
-		color: #d4940a;
+		color: var(--warning);
 	}
 
 	.pay-bar-count {
@@ -3610,31 +4041,8 @@
 	}
 
 	.pay-bar-savings {
-		color: #1fa86a;
+		color: var(--success);
 		font-weight: 600;
-	}
-
-	.btn-select-all-matching {
-		padding: 4px 10px;
-		border-radius: 4px;
-		border: 1px solid var(--accent);
-		background: transparent;
-		color: var(--accent);
-		font-size: 0.8rem;
-		font-weight: 600;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.btn-select-all-matching:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-
-	.btn-select-all-matching:not(:disabled):hover {
-		background: var(--accent-strong);
-		color: #fff;
 	}
 
 	.pay-bar-all-matching {
@@ -3654,8 +4062,8 @@
 		align-items: center;
 		gap: 10px;
 		padding: 10px 14px;
-		background: rgba(31, 168, 106, 0.08);
-		border: 1px solid rgba(31, 168, 106, 0.3);
+		background: color-mix(in srgb, var(--success) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
 		border-radius: 6px;
 		font-size: 0.85rem;
 		color: var(--text);
@@ -3666,11 +4074,11 @@
 	}
 
 	tbody tr.discount-eligible {
-		background: rgba(31, 168, 106, 0.04);
+		background: color-mix(in srgb, var(--success) 4%, transparent);
 	}
 
 	tbody tr.discount-eligible:hover {
-		background: rgba(31, 168, 106, 0.08);
+		background: color-mix(in srgb, var(--success) 8%, transparent);
 	}
 
 	/* NOT a `<Badge>`: two stacked lines, so it needs the metrics a shared
@@ -3700,27 +4108,6 @@
 		font-size: 0.7rem;
 		font-weight: 400;
 		color: inherit;
-	}
-
-	.btn-pay {
-		padding: 6px 16px;
-		border-radius: 4px;
-		border: none;
-		background: var(--success-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.btn-pay:hover:not(:disabled) {
-		opacity: 0.9;
-	}
-
-	.btn-pay:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
 	}
 
 	/* A queue row the backend would refuse: readable, visibly inert, never
@@ -3757,6 +4144,32 @@
 		color: var(--danger-on-tint);
 		font-size: 0.72rem;
 		font-weight: 600;
+		white-space: normal;
+	}
+
+	/* The cell holding "Record as paid" anchors its visually-hidden refusal
+	   reason. `.visually-hidden` is `position: absolute`; without a positioned
+	   ancestor INSIDE the table's scroll region, its containing block is outside
+	   that region, so at 1280px — where the queue table scrolls inside its card —
+	   the 1px reason, sitting at the far end of the row, escaped the region's
+	   clipping and scrolled the whole document sideways (`a11y/wide-layout`). */
+	.record-cell {
+		position: relative;
+	}
+
+	/* The way to the exception behind a blocked chip, and who may clear it. */
+	.blocked-link {
+		display: inline-block;
+		margin-left: 6px;
+		font-size: 0.78rem;
+		color: var(--accent);
+	}
+
+	.blocked-note {
+		display: block;
+		margin-top: 2px;
+		font-size: 0.75rem;
+		color: var(--text-muted);
 		white-space: normal;
 	}
 
@@ -3810,21 +4223,6 @@
 		color: var(--text);
 		font-size: 0.85rem;
 		line-height: 1.4;
-	}
-
-	.btn-clear {
-		padding: 6px 12px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.82rem;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.btn-clear:hover {
-		color: var(--text);
 	}
 
 	/* --- Review panel --- */
@@ -3885,27 +4283,6 @@
 		color: var(--text);
 	}
 
-	.btn-execute {
-		padding: 8px 20px;
-		border-radius: 6px;
-		border: none;
-		background: var(--success-strong);
-		color: #fff;
-		font-size: 0.88rem;
-		font-weight: 600;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.btn-execute:hover:not(:disabled) {
-		opacity: 0.9;
-	}
-
-	.btn-execute:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
 	/* --- Record-only mode + record-outside dialog (issue #517) --- */
 
 	/* Neutral, like `.modal-note`: describes how this organization pays, it
@@ -3942,49 +4319,39 @@
 		letter-spacing: 0.03em;
 	}
 
-	.record-owed-hint,
-	.field-hint {
+	/* The form's own hint lives in `RecordPaymentFields`. */
+	.record-owed-hint {
 		margin: 0;
 		font-size: 0.75rem;
 		color: var(--text-muted);
 		line-height: 1.4;
 	}
 
-	.field-hint {
-		margin-top: -8px;
+	/* --- Void modal --- */
+
+	.field-error {
+		margin: -8px 0 0;
+		font-size: 0.82rem;
+		line-height: 1.4;
+		color: var(--danger);
 	}
 
-	/* --- Void modal --- */
+	.field-error:empty {
+		display: none;
+	}
+
+	input[aria-invalid='true'] {
+		border-color: var(--danger);
+	}
 
 	.modal-warn {
 		font-size: 0.82rem;
 		color: var(--text);
 		margin: 0 0 14px;
 		padding: 10px 12px;
-		background: rgba(224, 64, 64, 0.08);
-		border: 1px solid rgba(224, 64, 64, 0.3);
+		background: color-mix(in srgb, var(--danger) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		border-radius: 4px;
-	}
-
-	.btn-danger {
-		padding: 8px 18px;
-		border-radius: 4px;
-		border: 1px solid var(--danger-strong);
-		background: var(--danger-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.btn-danger:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-
-	.btn-danger:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
 	}
 
 	.rebate-grid {
@@ -4005,8 +4372,8 @@
 	}
 
 	.rebate-card.highlight {
-		border-color: rgba(31, 168, 106, 0.4);
-		background: rgba(31, 168, 106, 0.05);
+		border-color: color-mix(in srgb, var(--success) 40%, transparent);
+		background: color-mix(in srgb, var(--success) 5%, transparent);
 	}
 
 	.rebate-label {
@@ -4024,7 +4391,7 @@
 	}
 
 	.rebate-card.highlight .rebate-value {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	.rebate-sub {
@@ -4049,6 +4416,10 @@
 
 	.section-title-row > .section-heading {
 		margin: 0;
+	}
+
+	.section-title-row > .cards-generate {
+		margin-left: auto;
 	}
 
 	.review-title-row {

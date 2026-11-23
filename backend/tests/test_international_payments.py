@@ -53,7 +53,7 @@ from app.services.payment_adapters import PaymentStatus
 # These tests drive the payment money paths over a hand-built `AsyncMock`
 # session, which cannot model the invoice lock's SAVEPOINT-scoped bound — see
 # the `mock_session_lock_wait` fixture in conftest.py.
-pytestmark = pytest.mark.usefixtures("mock_session_lock_wait")
+pytestmark = pytest.mark.usefixtures("mock_session_lock_wait", "provider_store_from_settings")
 
 
 def _invoice(*, amount=Decimal("1000.00"), currency="EUR"):
@@ -285,6 +285,26 @@ async def test_prepare_refuses_intl_wire_without_valid_swift():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blank", ["", "   ", None])
+async def test_prepare_refuses_an_invoice_with_no_currency(blank):
+    """A blank invoice currency is unknown, not the home currency: pricing it as
+    domestic would pay it in a currency nobody recorded (decisions §453)."""
+    fx = MockFXAdapter()
+    fx.get_rate = AsyncMock()
+    inv = _invoice(currency=blank)
+    vendor = _vendor(country="US")
+
+    with pytest.raises(InternationalPaymentError, match="currency_unknown"):
+        await prepare_international_payment(
+            invoice=inv,
+            vendor=vendor,
+            org_home_currency="USD",
+            fx_adapter=fx,
+        )
+    fx.get_rate.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_prepare_refuses_when_fx_provider_returns_zero_rate():
     """A misbehaving FX provider returning rate=0 must NOT produce a
     DivisionByZero in source_amount computation — refuse the
@@ -446,6 +466,7 @@ def _payment(*, method="international_wire"):
         completed_at=None,
         failure_reason=None,
         retry_of_payment_id=None,
+        dispatch_attempted_at=None,  # migration 0124
         correlation_id=uuid.uuid4(),
         source_currency=None,
         source_amount=None,
@@ -557,7 +578,9 @@ def _mock_db(*, run, payment, invoice, vendor_bank, compliance_vendor=None, comp
     # `inactive_vendor_statuses` — the invoice names a vendor, so its status is
     # read; still `active`, so dispatch carries on.
     vendor_status_res = MagicMock()
-    vendor_status_res.all = MagicMock(return_value=[(invoice.vendor_id, "active")])
+    vendor_status_res.all = MagicMock(
+        return_value=[(invoice.vendor_id, "active", False, "clear", None)]
+    )
 
     # `payable_amount` → `applicable_discounts`: no accepted offer, so the
     # payment moves the net it was booked at.

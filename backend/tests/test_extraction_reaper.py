@@ -278,6 +278,7 @@ async def _add_pending_invoice(mk, org_id, *, created_at):
             invoice_number=f"INV-{uuid.uuid4().hex[:8]}",
             vendor_name="Acme",
             amount=Decimal("10.00"),
+            currency="USD",
             status=InvoiceStatus.pending,
         )
         s.add(inv)
@@ -296,8 +297,9 @@ async def test_reap_skips_an_invoice_whose_extraction_landed_mid_tick(realdb):
     in-memory `pending`, `pending -> failed` is a legal edge, so the UPDATE
     stamped `failed` over the row's real, freshly-committed state — leaving a
     successfully-extracted invoice `failed` with an `extraction_timeout`
-    warning, and unable to return (`failed -> ready_for_review` is not a legal
-    edge). Now each candidate is re-read `FOR UPDATE` and re-checked first.
+    warning, and unable to return (`failed -> ready_for_review` is only the
+    recall of an approval, decisions §374, which a never-approved extraction
+    cannot take). Now each candidate is re-read `FOR UPDATE` and re-checked first.
     """
     from unittest.mock import AsyncMock, patch
 

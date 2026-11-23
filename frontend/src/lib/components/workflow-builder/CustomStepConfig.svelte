@@ -8,6 +8,7 @@
 		EmailRecipientKind,
 	} from '#lib/types/workflow.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { formatHours } from '#lib/utils/duration.ts';
 	import {
 		headersToRows,
 		rowsMatchHeaders,
@@ -245,7 +246,7 @@
 				oninput={(e) =>
 					patchDelay({ duration_seconds: Math.max(0, parseInt(e.currentTarget.value, 10) || 0) })}
 			/>
-			<p class="hint">{m('workflows.builder.delay.hours', { hours: (delay.duration_seconds / 3600).toFixed(2) })}</p>
+			<p class="hint">{formatHours(delay.duration_seconds / 3600, { unitDisplay: 'long', maximumFractionDigits: 2 })}</p>
 		</div>
 		<div class="field">
 			<label for="dl-until">{m('workflows.builder.delay.untilField')}</label>
@@ -311,7 +312,7 @@
 	.field select:focus,
 	.field textarea:focus {
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	.row {

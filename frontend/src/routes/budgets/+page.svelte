@@ -1,9 +1,10 @@
 <script lang="ts">
 	import type { Budget } from '#lib/types/budget.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import {
 		BUDGET_DIMENSIONS,
-		BUDGET_DIMENSION_LABELS,
-		type BudgetDimension
+		BUDGET_DIMENSION_LABEL_KEYS,
+		budgetDimensionLabelKey
 	} from '#lib/types/budget.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
@@ -18,6 +19,7 @@
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
@@ -48,6 +50,12 @@
 	let loading = $state(false);
 	let pageNum = $state(1);
 	let loadingMore = $state(false);
+	// Set by a failed page-1 load, cleared by a successful one. A failed load
+	// renders `ui/LoadError` (with a Retry) in the table's place: on its own the
+	// toast faded and left the empty-state line claiming nothing matched — or,
+	// on a re-load, the previous filter's rows standing as this one's answer.
+	// A failed load-more keeps the rows already shown and only toasts.
+	let errored = $state(false);
 
 	// The list is paged: `total` is the whole filtered set, so a footer that
 	// says "Showing all {total}" is only true once every row is loaded.
@@ -60,15 +68,15 @@
 
 	const DIMENSION_CHIPS = $derived([
 		{ key: 'all', label: m('common.all') },
-		...BUDGET_DIMENSIONS.map((d) => ({ key: d, label: BUDGET_DIMENSION_LABELS[d] }))
+		...BUDGET_DIMENSIONS.map((d) => ({ key: d, label: m(BUDGET_DIMENSION_LABEL_KEYS[d]) }))
 	]);
 
 	const COLUMNS = $derived([
 		{ label: m('budgets.col.name') },
-		{ label: m('budgets.col.dimension') },
+		{ label: m('budgets.col.dimension'), class: 'col-type' },
 		{ label: m('budgets.col.value') },
-		{ label: m('budgets.col.period') },
-		{ label: m('budgets.col.allocation'), class: 'right' },
+		{ label: m('budgets.col.period'), class: 'col-period' },
+		{ label: m('budgets.col.allocation'), class: 'right col-amount' },
 		{ label: '', class: 'actions-col' }
 	]);
 
@@ -177,7 +185,14 @@
 		const nextPage = opts.append ? pageNum + 1 : 1;
 		const token = fetchSequence.start();
 		if (opts.append) loadingMore = true;
-		else loading = true;
+		else {
+			loading = true;
+			// Cleared when a fresh load STARTS (as /credit-memos does) so Retry
+			// takes `LoadError` down while the request is out and a second
+			// failure re-announces it — cleared only on success, Retry looked
+			// like a no-op.
+			errored = false;
+		}
 		try {
 			const res = await listBudgets({
 				...buildParams(),
@@ -189,10 +204,12 @@
 			budgets = opts.append ? appendUnique(budgets, res.items) : res.items;
 			total = res.total;
 			pageNum = nextPage;
+			errored = false;
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!fetchSequence.isCurrentRequest(token)) return;
+			if (!opts.append) errored = true;
 			toast(err instanceof Error ? err.message : m('budgets.toast.loadFailed'), 'error');
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
@@ -279,7 +296,8 @@
 	}
 
 	function dimLabel(d: string): string {
-		return BUDGET_DIMENSION_LABELS[d as BudgetDimension] ?? d;
+		const key = budgetDimensionLabelKey(d);
+		return key ? m(key) : d;
 	}
 </script>
 
@@ -308,10 +326,16 @@
 		<FilterChips chips={DIMENSION_CHIPS} bind:active={dimensionFilter} />
 	</div>
 
+	{#if errored}
+		<LoadError message={m('budgets.empty.errored')} onretry={() => load()} testId="budgets-error" />
+	{:else}
+	<div class="budget-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={visibleBudgets.length === 0}
-		empty={loading ? m('common.loading') : m('budgets.empty')}
+		{loading}
+		empty={m('budgets.empty')}
 	>
 		{#snippet body()}
 			{#each visibleBudgets as b (b.id)}
@@ -344,24 +368,19 @@
 			{/each}
 		{/snippet}
 	</DataTable>
-
-	{#if hasMore}
-		<div class="load-more-row">
-			<button
-				class="btn-load-more"
-				onclick={() => load({ append: true })}
-				disabled={loadingMore}
-			>
-				{loadingMore
-					? m('common.loading')
-					: m('budgets.loadMore', { shown: budgets.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('budgets.showingAll', { total })}</span>
-		</div>
+	</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={budgets.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		{errored}
+		onloadmore={() => load({ append: true })}
+		moreKey="budgets.loadMore"
+		allKey="budgets.showingAll"
+	/>
 </PageHeader>
 
 {#if showCreate}
@@ -373,6 +392,23 @@
 {/if}
 
 <style>
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.budget-table { min-width: 0; }
+	.budget-table :global(table) { min-width: 920px; }
+	.budget-table :global(th.col-type) { width: 150px; }
+	.budget-table :global(th.col-period) { width: 130px; }
+	.budget-table :global(th.col-amount) { width: 160px; }
+	.budget-table :global(th.actions-col) { width: 140px; }
+
 	.filter-row {
 		display: flex;
 		align-items: center;

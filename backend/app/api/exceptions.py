@@ -3,12 +3,20 @@
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import status as http_status
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import ROLE_ADMIN, ROLE_AP_MANAGER, require_roles
+from app.api.deps import (
+    ROLE_ADMIN,
+    ROLE_AP_MANAGER,
+    holds_any_permission,
+    holds_any_role,
+    require_permission,
+    require_roles,
+)
 from app.api.pagination import (
     MAX_SELECT_ALL_IDS,
     MatchingIdsResponse,
@@ -16,49 +24,178 @@ from app.api.pagination import (
     paginated,
     pagination_params,
 )
+from app.api.permissions import PERM_PAYMENT_RECORD_EXTERNAL
+from app.api.refusals import ActionRefusal
 from app.api.sorting import SortParams, resolve_order_by, sort_params
 from app.database import get_control_db
 from app.models.exception import Exception as APException
 from app.models.invoice import Invoice
 from app.models.organization import Organization
 from app.models.user import User
+from app.models.workflow import WorkflowInstance
 from app.schemas.money import json_money_string
+from app.schemas.payment import RecordErpReportedPaymentRequest
+from app.services.erp_status_sync import (
+    erp_product_name,
+    is_erp_paid_report,
+    kept_split_stands,
+)
 from app.services.exception_lifecycle import (
     ACTIONABLE_STATUSES,
     EXCEPTION_SEVERITY_RANK,
+    EXCEPTION_TYPE_LABELS,
     RESOLUTION_ACTIONS,
     invoices_for,
+    needs_approval_chain,
     record_assignment,
     record_decision,
     segregation_refusal,
+    workflow_instance_for,
+    workflow_instances_for,
 )
 from app.tenant import apply_entity_scope, get_entity_id, get_tenant, get_tenant_db
+from app.utils.currency_code import iso_currency_or_none
 from app.utils.search import ilike_contains
 
 router = APIRouter(prefix="/exceptions", tags=["exceptions"])
 
-#: Friendly label per ``Exception.exception_type`` for the queue UI. Must cover
-#: ``exception_lifecycle.EXCEPTION_TYPES`` exactly — a missing entry silently
-#: renders the raw snake_case key, and two of these types are the ones that block
-#: a payment run, so the queue must not label them like debug output.
-#: ``tests/test_exception_type_labels`` is the guard.
-EXCEPTION_TYPE_LABELS = {
-    "duplicate": "Duplicate Invoice",
-    "po_mismatch": "PO Mismatch",
-    "fraud_flag": "Fraud Flag",
-    "extraction_failed": "Extraction Failed",
-    "unverified_vendor": "Unverified Vendor",
-    "review_rejected": "Rejected",
-    "amount_exceeded": "Amount Exceeded",
-    "missing_data": "Missing Data",
-    "quality_hold": "Quality Hold",
-    "price_variance": "Price Variance",
-    "contract_noncompliant": "Contract Non-Compliant",
-    "erp_reconciliation": "ERP Reconciliation",
-    "line_total_mismatch": "Line Total Mismatch",
-    "payment_compliance_hold": "Compliance Hold",
-    "payment_reconciliation": "Payment Reconciliation",
-}
+# `EXCEPTION_TYPE_LABELS` (the queue's label per type) is owned by
+# `services/exception_lifecycle.py`, beside the roster it must cover.
+
+
+#: Who may act on the queue — the dependency on every `/api/exceptions`
+#: mutation, and what `decision_refusals` asks.
+EXCEPTION_DECIDE_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
+EXCEPTION_NOT_ACTIONABLE = "exception_not_actionable"
+
+
+def actionable_refusal(exc: APException) -> ActionRefusal | None:
+    """``POST /{id}/resolve``'s status gate: only an open or escalated row can
+    be resolved, escalated or dismissed."""
+    if exc.status in ACTIONABLE_STATUSES:
+        return None
+    return ActionRefusal(
+        EXCEPTION_NOT_ACTIONABLE,
+        f"Cannot resolve from '{exc.status}' status",
+        http_status.HTTP_409_CONFLICT,
+    )
+
+
+def decision_refusals(
+    exc: APException,
+    inv: Invoice | None,
+    user: User,
+    org_settings: dict | None,
+    instance: WorkflowInstance | None = None,
+) -> dict:
+    """What ``POST /{id}/resolve`` would answer ``user`` for each action on
+    this row — ``{"resolve", "dismiss", "escalate"}``, each a coded refusal or
+    ``None`` (issue #575). The endpoint's own gates, in its order: the role
+    dependency, :func:`actionable_refusal`, then
+    ``exception_lifecycle.segregation_refusal`` — the predicate
+    ``record_decision`` raises from. The queue used to check only the status,
+    so the uploader of a duplicate invoice was offered a Resolve that 403s.
+    ``instance`` is the invoice's workflow instance, which the approver axis
+    reads on a ``po_mismatch`` / ``quality_hold`` (decisions §420).
+    """
+    from app.api.refusals import coded_refusal, role_not_permitted
+    from app.services.exception_lifecycle import refusal_message
+
+    if not holds_any_role(user, EXCEPTION_DECIDE_ROLES):
+        return {action: role_not_permitted() for action in RESOLUTION_ACTIONS}
+    state = actionable_refusal(exc)
+    if state is not None:
+        return {action: state.verdict() for action in RESOLUTION_ACTIONS}
+    out: dict = {}
+    for action in RESOLUTION_ACTIONS:
+        code = segregation_refusal(
+            exc, inv, user.id, action=action, org_settings=org_settings, instance=instance
+        )
+        out[action] = coded_refusal(code, refusal_message(code)) if code else None
+    return out
+
+
+#: `detail.code` when `POST /{id}/record-erp-payment` is asked of a row that
+#: carries no ERP-reported payment.
+EXCEPTION_NOT_ERP_PAID_REPORT = "exception_not_erp_paid_report"
+
+
+#: `detail.code` when `POST /{id}/record-erp-payment` names no rail over a
+#: payment whose kept breakdown does not stand over every rail by itself
+#: (`erp_payment_split_stands`): one rail, none, or parts that do not add up
+#: to the stated cash leave the person's rail as the record, so it must be
+#: named (decisions §413).
+ERP_PAYMENT_METHOD_REQUIRED = "erp_payment_method_required"
+
+
+def record_erp_payment_refusal(
+    exc: APException,
+    inv: Invoice | None,
+    user: User,
+    org_settings: dict | None,
+    instance: WorkflowInstance | None = None,
+) -> dict | None:
+    """What ``POST /{id}/record-erp-payment`` would answer ``user`` before it
+    reaches the money gates — ``None`` to offer the action, else a coded
+    refusal. The endpoint's own checks, in its order, so the page offers the
+    button exactly when the server would take it (issue #575's rule):
+
+    * the row carries an ERP-reported payment and is still open;
+    * the caller may record a payment made outside FeohLedger
+      (``payment.record_external``) and is not implicated in the invoice
+      (``external_payment.segregation_refusal`` — the recorder's SoD);
+    * a payment-BLOCKING row is cleared on the way, so the caller must also be
+      allowed to resolve it (the queue's role gate and
+      ``exception_lifecycle.segregation_refusal``).
+
+    The invoice-state gates (another blocker, a live payment or card, ...) are
+    left to the record itself, whose coded refusal says which one bit.
+    """
+    from app.api.refusals import coded_refusal, role_not_permitted
+    from app.services.exception_lifecycle import is_payment_blocking, refusal_message
+    from app.services.external_payment import segregation_refusal as record_segregation
+
+    if not is_erp_paid_report(exc) or inv is None:
+        return coded_refusal(
+            EXCEPTION_NOT_ERP_PAID_REPORT,
+            "This exception has no payment reported by the ERP to record.",
+        )
+    if not holds_any_permission(user, (PERM_PAYMENT_RECORD_EXTERNAL,)):
+        return role_not_permitted()
+    state = actionable_refusal(exc)
+    if state is not None:
+        return state.verdict()
+    if is_payment_blocking(exc.exception_type):
+        if not holds_any_role(user, EXCEPTION_DECIDE_ROLES):
+            return role_not_permitted()
+        code = segregation_refusal(
+            exc, inv, user.id, action="resolve", org_settings=org_settings, instance=instance
+        )
+        if code:
+            return coded_refusal(code, refusal_message(code))
+    refusal = record_segregation(inv, user.id, org_settings)
+    if refusal is not None:
+        return coded_refusal(refusal.code, refusal.message)
+    return None
+
+
+def _caller_verdicts(
+    exc: APException,
+    inv: Invoice | None,
+    user: User,
+    org_settings: dict | None,
+    instance: WorkflowInstance | None = None,
+) -> dict:
+    """The caller's verdicts on this row's actions, for the list and the detail:
+    Resolve / Dismiss / Escalate (`decision_refusals`) and — only on a row that
+    carries an ERP-reported payment — recording it in one click
+    (`record_erp_payment_refusal`)."""
+    out = {"decision_refusals": decision_refusals(exc, inv, user, org_settings, instance)}
+    if is_erp_paid_report(exc):
+        out["record_erp_payment_refusal"] = record_erp_payment_refusal(
+            exc, inv, user, org_settings, instance
+        )
+    return out
 
 
 def _exception_dict(exc: APException, inv: Invoice | None) -> dict:
@@ -112,6 +249,23 @@ def _exception_dict(exc: APException, inv: Invoice | None) -> dict:
         "description": exc.description,
         "description_code": exc.description_code,
         "description_params": exc.description_params,
+        # What the ERP reported, as data — PII-free ids, a status, and for a
+        # `paid_not_recorded` row the payment it reported (rail, reference,
+        # paid-on date, the refusal that stopped it). NULL on every other row.
+        # The queue pre-fills its "Record the ERP's payment" dialog from it.
+        "erp_report": exc.erp_report,
+        # The ERP's product name for that report (a proper noun), or None when
+        # the adapter has none — the client then says "your ERP" itself.
+        "erp_name": (
+            erp_product_name((exc.erp_report or {}).get("erp_type")) if exc.erp_report else None
+        ),
+        # On a `paid_not_recorded` row stating a figure and a breakdown: True
+        # when that breakdown is booked whatever one rail a person names (it
+        # adds up and spans several rails, decisions §396), so the record
+        # dialog shows the split in place of its rail picker and may send no
+        # rail; False when the person's rail would be the record. None on
+        # every other row (§413).
+        "erp_payment_split_stands": kept_split_stands(exc.erp_report),
         "status": exc.status,
         "resolution": exc.resolution,
         "resolved_by": exc.resolved_by,
@@ -219,6 +373,7 @@ async def list_exceptions(
     sort: SortParams = Depends(sort_params),
     pagination: PaginationParams = Depends(pagination_params),
     db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
@@ -256,8 +411,24 @@ async def list_exceptions(
     query = query.order_by(*order_by).offset(pagination.offset).limit(pagination.limit)
     result = await db.execute(query)
     rows = result.all()
+    # The page's workflow chains in one query, for the approver axis on its
+    # `po_mismatch` / `quality_hold` rows only.
+    instances = await workflow_instances_for(
+        db, [inv for exc, inv in rows if needs_approval_chain(exc, inv)]
+    )
 
-    return paginated([_exception_dict(exc, inv) for exc, inv in rows], int(total), pagination)
+    items = [
+        {
+            **_exception_dict(exc, inv),
+            # The caller's verdict on Resolve / Dismiss / Escalate for this row,
+            # from the gates the resolve endpoint runs (`decision_refusals`).
+            **_caller_verdicts(
+                exc, inv, user, org.settings, instances.get(inv.id) if inv else None
+            ),
+        }
+        for exc, inv in rows
+    ]
+    return paginated(items, int(total), pagination)
 
 
 # Registered BEFORE the parametric `/{exception_id}` route — same reason
@@ -372,6 +543,7 @@ async def exception_summary(
 async def get_exception(
     exception_id: uuid.UUID,
     db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
@@ -387,7 +559,13 @@ async def get_exception(
     if row is None:
         raise HTTPException(status_code=404, detail="Exception not found")
     exc, inv = row
-    return _exception_dict(exc, inv)
+    # With the caller's verdicts, like a list row: the queue opens this row's
+    # dialog from a deep link (`/exceptions?id=`) and offers its buttons from them.
+    instance = await workflow_instance_for(db, exc, inv)
+    return {
+        **_exception_dict(exc, inv),
+        **_caller_verdicts(exc, inv, user, org.settings, instance),
+    }
 
 
 class ResolveRequest(BaseModel):
@@ -467,17 +645,23 @@ async def bulk_resolve(
     # invoice's correlation) or to run the segregation check (which reads the
     # invoice's implicated actors).
     invoices = await invoices_for(db, rows)
+    # Likewise one query for the workflow chains the approver axis reads, on the
+    # batch's `po_mismatch` / `quality_hold` rows only.
+    instances = await workflow_instances_for(
+        db, [invoices.get(e.id) for e in rows if needs_approval_chain(e, invoices.get(e.id))]
+    )
 
     for exc in rows:
         if exc.status not in ACTIONABLE_STATUSES:
             skipped.append({"id": str(exc.id), "reason": f"already_{exc.status}"})
             continue
         inv = invoices.get(exc.id)
+        instance = instances.get(inv.id) if inv is not None else None
         # Pre-check rather than catching `record_decision`'s 403: this endpoint
         # owes a per-row reason, and a raise mid-loop would also abandon the
         # rows already mutated in this transaction.
         refusal = segregation_refusal(
-            exc, inv, user.id, action=body.action, org_settings=org.settings
+            exc, inv, user.id, action=body.action, org_settings=org.settings, instance=instance
         )
         if refusal is not None:
             skipped.append({"id": str(exc.id), "reason": refusal})
@@ -491,6 +675,7 @@ async def bulk_resolve(
             actor_name=user.full_name,
             invoice=inv,
             org_settings=org.settings,
+            instance=instance,
         )
         updated += 1
 
@@ -533,8 +718,9 @@ async def resolve_exception(
         raise HTTPException(status_code=404, detail="Exception not found")
     exc, inv = row
 
-    if exc.status not in ACTIONABLE_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Cannot resolve from '{exc.status}' status")
+    refusal = actionable_refusal(exc)
+    if refusal is not None:
+        raise refusal.http()
 
     # The segregation 403 is raised by `record_decision` — the chokepoint every
     # caller shares — and propagates untouched (it is an HTTPException, not the
@@ -556,6 +742,213 @@ async def resolve_exception(
     await db.commit()
 
     return {"id": str(exc.id), "status": exc.status, "message": f"Exception {body.action}d"}
+
+
+@router.post("/{exception_id}/record-erp-payment")
+async def record_erp_payment(
+    exception_id: uuid.UUID,
+    body: RecordErpReportedPaymentRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_PAYMENT_RECORD_EXTERNAL)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Record the payment an ERP reported, from the exception that holds it.
+
+    The one-click path for a ``paid_not_recorded`` row (decisions §319): the
+    dialog arrives pre-filled from the row's ``erp_report`` and the person
+    confirms or corrects the rail, reference and date. In ONE transaction the
+    payment is recorded through ``external_payment.record_invoice_paid_outside``
+    as a user record — the recorder's segregation of duties, every other open
+    blocker, a live FeohLedger payment or card and the amount all still refuse —
+    and then the row is resolved as this caller. A payment-blocking row (the
+    double-pay refusals, which by design refuse the record until someone
+    decides) needs a caller who may clear it under the queue's own rules, which
+    :func:`record_erp_payment_refusal` checks first, under lock. Every refusal
+    comes before anything is written, so the row stays open and nothing is
+    audited, with one exception: a NON-blocking row that states no cash figure,
+    whose bill cannot be read back to confirm one (§393), is re-raised as the
+    blocking row it should be, committed, and then refused. A replay of a
+    record already booked answers 200, not 201.
+
+    Not ``POST /api/payments/record-outside``: a blocking row would refuse that
+    record on itself, and clearing it first in a separate request would leave a
+    window in which the invoice is payable with nothing recorded.
+    """
+    from decimal import Decimal
+
+    from app.api.payments import (
+        _external_refusal_http,
+        _refuse_future_paid_on,
+    )
+    from app.api.refusals import coded_refusal
+    from app.schemas.payment import PaymentResponse
+    from app.services.erp_status_sync import (
+        ERP_PAID_AMOUNT_UNCONFIRMED,
+        hold_unconfirmed_erp_payment,
+        read_back_unstated_figure,
+        reported_payment_parts,
+    )
+    from app.services.exception_lifecycle import is_payment_blocking
+    from app.services.external_payment import (
+        REFUSAL_AMOUNT_MISMATCH,
+        ExternalPaymentRefused,
+        record_invoice_paid_outside,
+        split_stands_over_any_rail,
+    )
+    from app.services.payment_methods import rail_parts_from_json
+
+    _refuse_future_paid_on(body.paid_on)
+    scoped = apply_entity_scope(
+        select(APException).where(APException.id == exception_id), APException, entity_id
+    )
+    found = (await db.execute(scoped)).scalar_one_or_none()
+    if found is None:
+        raise HTTPException(status_code=404, detail="Exception not found")
+    invoice = None
+    if found.invoice_id is not None:
+        # The INVOICE first, then the row: the order every ERP writer
+        # (`apply_bill_report`, the webhook, the re-attempt) takes them in, so
+        # a click racing a sweep tick waits rather than deadlocks.
+        invoice = (
+            await db.execute(
+                select(Invoice)
+                .where(Invoice.id == found.invoice_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    # Then the row, locked and RE-READ, so a second click that waited on the
+    # first judges it as the first left it (resolved → 409), not as it was.
+    row = (
+        await db.execute(
+            scoped.with_for_update(of=APException).execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if row is None or row.invoice_id != found.invoice_id:
+        raise HTTPException(status_code=404, detail="Exception not found")
+
+    verdict = record_erp_payment_refusal(
+        row, invoice, user, org.settings, await workflow_instance_for(db, row, invoice)
+    )
+    if verdict is not None:
+        status_code = {
+            EXCEPTION_NOT_ERP_PAID_REPORT: http_status.HTTP_409_CONFLICT,
+            EXCEPTION_NOT_ACTIONABLE: http_status.HTTP_409_CONFLICT,
+        }.get(verdict.get("code"), http_status.HTTP_403_FORBIDDEN)
+        raise HTTPException(status_code=status_code, detail=verdict)
+
+    # The ERP stated the cash it paid (decisions §386, §393): that figure is the
+    # one recorded, never FeohLedger's own, so a row kept for
+    # `amount_mismatch` stays refused until the invoice or the bill is
+    # corrected. A body figure that disagrees with it is refused here.
+    amount = body.amount
+    facts = row.erp_report or {}
+    stated = facts.get("amount")
+    stated_currency_raw = facts.get("amount_currency")
+    # How the ERP says that figure was paid, rail by rail (decisions §396): kept
+    # beside it, and booked with it, so the 1099 splits a cheque-plus-card bill.
+    stated_parts = rail_parts_from_json(facts.get("payment_parts")) if stated else ()
+    if not stated and invoice is not None:
+        # No figure stated (a QuickBooks row kept before §393): the bill is
+        # read again under the invoice lock held above, and only the figure it
+        # states now is recorded, the re-attempt's rule. A read that confirms
+        # none is refused, and a non-blocking row is re-raised as blocking:
+        # the bill is paid in the ERP, so no run may pay it meanwhile.
+        figure = await read_back_unstated_figure(db, invoice=invoice, org=org, facts=facts)
+        if figure.needed:
+            if figure.amount is None:
+                if not is_payment_blocking(row.exception_type):
+                    await hold_unconfirmed_erp_payment(db, invoice, org=org, facts=facts)
+                    await db.commit()
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=coded_refusal(
+                        ERP_PAID_AMOUNT_UNCONFIRMED,
+                        "The ERP's bill could not be read to confirm what was paid. "
+                        "Check the bill in the ERP, then try again.",
+                    ),
+                )
+            stated, stated_currency_raw = figure.amount, figure.currency
+            stated_parts = figure.parts
+    if stated:
+        try:
+            stated_amount = Decimal(str(stated))
+        except ArithmeticError:
+            stated_amount = None
+        stated_currency = iso_currency_or_none(stated_currency_raw)
+        if (
+            stated_amount is None
+            or (amount is not None and amount != stated_amount)
+            or invoice is None
+            # A figure with no currency stated says nothing about what this
+            # invoice owes, the rule the sweep applies to the same facts
+            # (§386); never compared as a bare number (§160, §196).
+            or not stated_currency
+            or stated_currency != iso_currency_or_none(invoice.currency)
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=coded_refusal(
+                    REFUSAL_AMOUNT_MISMATCH,
+                    "The amount must equal what the ERP reports was paid.",
+                    amount=str(stated),
+                    currency=invoice.currency if invoice is not None else None,
+                ),
+            )
+        amount = stated_amount
+
+    # No rail named: only over a breakdown that is the record whatever rail a
+    # person would name (decisions §396), the case the dialog shows the split
+    # for instead of its picker. Anywhere else the person's rail IS the record
+    # (one rail stated, none, or parts that do not add up), so it must be
+    # named, never defaulted. Judged on the figure being booked, the stated one
+    # or the read-back's, before anything is written (§413).
+    if body.method is None and not (
+        stated
+        and amount is not None
+        and split_stands_over_any_rail(reported_payment_parts(stated_parts), amount)
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=coded_refusal(
+                ERP_PAYMENT_METHOD_REQUIRED,
+                "Choose how this payment was made.",
+            ),
+        )
+
+    # Every refusal BEFORE anything is written: in `lambda` audit mode an audit
+    # row leaves for SQS when it is dispatched, so resolving first and rolling
+    # back on a refused record would ship an `exception.resolved` for a row
+    # that stays open. So the record runs first — every money gate, with this
+    # one row not counted as a blocker, since the record answers it — and the
+    # row is resolved as this caller by `_complete`, after the payment is
+    # booked (`erp_status_sync.close_erp_paid_reports`, under the same
+    # clearing rule the verdict above already passed).
+    try:
+        recorded = await record_invoice_paid_outside(
+            db,
+            org=org,
+            invoice=invoice,
+            method=body.method.value if body.method is not None else None,
+            reference=body.reference,
+            paid_on=body.paid_on,
+            actor_id=user.id,
+            source="user",
+            amount=amount,
+            answering_exception_ids=frozenset({row.id}),
+            actor_name=user.full_name,
+            rail_parts=reported_payment_parts(stated_parts) if stated else (),
+        )
+    except ExternalPaymentRefused as exc_:
+        raise _external_refusal_http(exc_) from exc_
+
+    if recorded.created:
+        await db.commit()
+        response.status_code = http_status.HTTP_201_CREATED
+    await db.refresh(recorded.payment)
+    return PaymentResponse.from_db(recorded.payment, invoice)
 
 
 # ---------- Assignment ----------------------------------------------------

@@ -439,6 +439,7 @@ async def test_delete_workflow_with_instances_409(realdb):
             invoice_number="INV-WF",
             vendor_name="V",
             amount=Decimal("10.00"),
+            currency="USD",
             status=InvoiceStatus.new,
             organization_id=org_id,
         )
@@ -663,6 +664,7 @@ async def test_deactivating_the_last_active_workflow_is_refused(realdb):
         created = await c.post(
             "/api/invoices",
             json={
+                "currency": "USD",
                 "vendor": "Guard Vendor",
                 "invoice_number": f"WF-GUARD-{uuid.uuid4().hex[:8]}",
                 "amount": "10.00",

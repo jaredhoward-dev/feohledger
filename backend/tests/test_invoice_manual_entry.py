@@ -8,9 +8,10 @@ a file (409), and it never triggers extraction — a manually-entered invoice
 stays exactly as keyed in.
 """
 
+import uuid
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.workflow import AuditLog
@@ -84,6 +85,13 @@ async def test_manual_create_then_self_approve_is_blocked_by_segregation(realdb)
         assert create.status_code == 201, create.text
         invoice_id = create.json()["id"]
 
+        # Into review, where the approve door accepts a decision at all
+        # (`review.refuse_unless_in_review`) — so the 403 below is the
+        # segregation gate, not the stage.
+        async with realdb.sessionmaker("a")() as s:
+            (await s.get(Invoice, uuid.UUID(invoice_id))).status = InvoiceStatus.ready_for_review
+            await s.commit()
+
         resp = await c.post(f"/api/invoices/{invoice_id}/approve", json={})
     assert resp.status_code == 403, resp.text
     assert "segregation" in resp.json()["detail"]["message"].lower()
@@ -150,7 +158,12 @@ async def test_ap_clerk_can_manually_create_an_invoice_and_is_its_uploader(reald
     async with realdb.client(key="a", role="ap_clerk") as c:
         resp = await c.post(
             "/api/invoices",
-            json={"vendor": "X", "invoice_number": "CLERK-001", "amount": "1.00"},
+            json={
+                "currency": "USD",
+                "vendor": "X",
+                "invoice_number": "CLERK-001",
+                "amount": "1.00",
+            },
         )
     assert resp.status_code == 201, resp.text
 
@@ -166,6 +179,7 @@ async def test_attach_file_to_manual_invoice_succeeds_once(realdb):
         create = await c.post(
             "/api/invoices",
             json={
+                "currency": "USD",
                 "vendor": "File Vendor Co",
                 "invoice_number": "MANUAL-FILE-001",
                 "amount": "125.00",
@@ -214,7 +228,12 @@ async def test_attach_file_rejects_disallowed_content_type(realdb):
     async with realdb.client(key="a", role="admin") as c:
         create = await c.post(
             "/api/invoices",
-            json={"vendor": "V", "invoice_number": "MANUAL-BAD-001", "amount": "1.00"},
+            json={
+                "currency": "USD",
+                "vendor": "V",
+                "invoice_number": "MANUAL-BAD-001",
+                "amount": "1.00",
+            },
         )
         invoice_id = create.json()["id"]
 
@@ -302,6 +321,7 @@ async def test_manual_create_audit_row_is_on_the_invoice_trail(realdb):
         resp = await c.post(
             "/api/invoices",
             json={
+                "currency": "USD",
                 "vendor": "Trail Vendor",
                 "invoice_number": f"MANUAL-TRAIL-{uuid.uuid4().hex[:8]}",
                 "amount": "10.00",
@@ -316,3 +336,128 @@ async def test_manual_create_audit_row_is_on_the_invoice_trail(realdb):
     entries = trail.json()
     actions = [e["action"] for e in entries]
     assert "invoice.created" in actions, actions
+
+
+async def test_an_invoice_due_before_it_is_dated_is_refused_at_entry(realdb):
+    """Live QuickBooks sandbox, 2026-10-20: moving an invoice's date out of a
+    closed period left it due five days before it was dated, and the bill that
+    posted was invalid in QuickBooks. Entry refuses the pair; an edit is judged
+    on the pair as it will stand."""
+    body = {
+        "vendor": "Date Order Co",
+        "invoice_number": "DATES-001",
+        "amount": "10.00",
+        "currency": "USD",
+        "invoice_date": "2026-10-20",
+        "due_date": "2026-10-15",
+    }
+    async with realdb.client(key="a", role="ap_manager") as c:
+        refused = await c.post("/api/invoices", json=body)
+        assert refused.status_code == 422, refused.text
+        assert refused.json()["detail"]["code"] == "invoice_due_before_date"
+
+        created = await c.post("/api/invoices", json={**body, "invoice_date": "2026-10-01"})
+        assert created.status_code == 201, created.text
+        inv_id = created.json()["id"]
+
+        # Moving the date past the due date alone is refused...
+        moved = await c.patch(f"/api/invoices/{inv_id}", json={"invoice_date": "2026-10-20"})
+        assert moved.status_code == 422, moved.text
+        assert moved.json()["detail"]["code"] == "invoice_due_before_date"
+        # ...moving both together is not, and neither is an edit of other fields.
+        both = await c.patch(
+            f"/api/invoices/{inv_id}",
+            json={"invoice_date": "2026-10-20", "due_date": "2026-11-19"},
+        )
+        assert both.status_code == 200, both.text
+        other = await c.patch(f"/api/invoices/{inv_id}", json={"description": "fine"})
+        assert other.status_code == 200, other.text
+
+
+async def test_a_create_must_state_its_currency(realdb):
+    """`POST /api/invoices` used to book an omitted currency as USD (decisions
+    §473). An omitted, null or blank code is now the coded 422
+    `invoice_currency_required`, a malformed one `invoice_currency_invalid`,
+    and none of them writes a row."""
+    number = f"CUR-CREATE-{uuid.uuid4().hex[:8]}"
+    base = {"vendor": "Currency Create Co", "invoice_number": number, "amount": "10.00"}
+    async with realdb.client(key="a", role="ap_manager") as c:
+        for body, code in [
+            (base, "invoice_currency_required"),
+            ({**base, "currency": None}, "invoice_currency_required"),
+            ({**base, "currency": "  "}, "invoice_currency_required"),
+            ({**base, "currency": "EURO"}, "invoice_currency_invalid"),
+        ]:
+            resp = await c.post("/api/invoices", json=body)
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"]["code"] == code
+
+        created = await c.post("/api/invoices", json={**base, "currency": " eur "})
+        assert created.status_code == 201, created.text
+        assert created.json()["currency"] == "EUR"
+
+    async with realdb.sessionmaker("a")() as s:
+        rows = (
+            (await s.execute(select(Invoice).where(Invoice.invoice_number == number)))
+            .scalars()
+            .all()
+        )
+    assert [r.currency for r in rows] == ["EUR"]
+
+
+async def test_an_edit_cannot_clear_or_garble_the_currency(realdb):
+    """`invoices.currency` is NOT NULL, so a blanked currency used to land as
+    `""`, a "no currency" every money path then had to recognise (decisions
+    §457). An edit may change the currency, never erase it; and a row already
+    blank stays editable for everything else (decisions §460)."""
+    body = {
+        "vendor": "Currency Edit Co",
+        "invoice_number": "CUR-EDIT-001",
+        "amount": "10.00",
+        "currency": "USD",
+    }
+    async with realdb.client(key="a", role="ap_manager") as c:
+        created = await c.post("/api/invoices", json=body)
+        assert created.status_code == 201, created.text
+        inv_id = created.json()["id"]
+
+        for blank in ("", "   ", None):
+            resp = await c.patch(f"/api/invoices/{inv_id}", json={"currency": blank})
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"]["code"] == "invoice_currency_required"
+        for bad in ("EURO", "US", "ÄÖÜ"):
+            resp = await c.patch(f"/api/invoices/{inv_id}", json={"currency": bad})
+            assert resp.status_code == 422, resp.text
+            detail = resp.json()["detail"]
+            assert detail["code"] == "invoice_currency_invalid"
+            assert detail["params"] == {"value": bad}
+
+        async with realdb.sessionmaker("a")() as s:
+            row = (
+                await s.execute(select(Invoice).where(Invoice.id == uuid.UUID(inv_id)))
+            ).scalar_one()
+            assert row.currency == "USD"
+
+        changed = await c.patch(f"/api/invoices/{inv_id}", json={"currency": " eur "})
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["currency"] == "EUR"
+
+        # A row whose currency is unknown (NULL: an upload extraction found no
+        # code in, or a pre-0136 "" blank) is not held hostage: an edit that
+        # leaves the currency out still saves, and reads back as unknown.
+        async with realdb.sessionmaker("a")() as s:
+            await s.execute(
+                update(Invoice).where(Invoice.id == uuid.UUID(inv_id)).values(currency=None)
+            )
+            await s.commit()
+        other = await c.patch(f"/api/invoices/{inv_id}", json={"description": "still editable"})
+        assert other.status_code == 200, other.text
+        assert other.json()["currency"] is None
+        # Naming no currency explicitly is still refused, not written as NULL.
+        cleared = await c.patch(f"/api/invoices/{inv_id}", json={"currency": None})
+        assert cleared.status_code == 422, cleared.text
+        assert cleared.json()["detail"]["code"] == "invoice_currency_required"
+        # ...and naming a real code is how it gets one.
+        fixed = await c.patch(f"/api/invoices/{inv_id}", json={"currency": "GBP"})
+        assert fixed.status_code == 200, fixed.text
+        assert fixed.json()["currency"] == "GBP"

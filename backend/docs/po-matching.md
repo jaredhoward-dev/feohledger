@@ -146,6 +146,242 @@ Covered by `backend/tests/test_po_matching_algorithm.py` (the guard),
 `test_po_matching_critical_path.py::test_realdb_currency_guard_against_recorded_po_currencies`
 and the three agent test files.
 
+### A PO that records no currency
+
+`unknown` is honest, but for a PO with no source left to ask it is permanent:
+migration 0099 copied the requisition's code and nothing else, there is no
+`PATCH /api/purchase-orders/{id}`, and only an ERP re-sync that states a code
+ever writes one. Until then every invoice matched against that PO carries the
+face-value note, and the three agents above escalate on it — so a tenant on
+pre-0099 POs (seeded, contract-spawned, or from an ERP that states no code)
+loses agent autonomy on exactly the invoices that used to auto-resolve.
+
+**When to run the backfill:** a tenant's agents stop auto-resolving PO
+mismatches with "the PO records no currency", or a support request asks to
+label legacy POs — and someone who knows the answer can say "these orders were
+all USD". `scripts/backfill_po_currency.py` takes that assertion; it never
+infers one (the org-currency proxy is what §197 rejected):
+
+```bash
+# from backend/ — dry run (the default): what would be stamped, what the set already records
+python scripts/backfill_po_currency.py --tenant acme --currency USD
+# narrow the set: an entity (slug or id), a po_number prefix, created strictly before a date
+python scripts/backfill_po_currency.py --tenant acme --currency EUR \
+    --entity acme-de --po-prefix DE- --created-before 2026-09-22
+# write, and keep the PII-free manifest (counts + PO ids)
+python scripts/backfill_po_currency.py --tenant acme --currency USD --apply --manifest po-currency-acme.json
+```
+
+- **Only NULL rows are written**, by a compare-and-swap `UPDATE … WHERE currency
+  IS NULL`; a PO whose source stated a code keeps it. The dry run lists the codes
+  the named set *already* records and warns when one differs from the assertion —
+  the sign the set is drawn wider than the orders you know about.
+- **The code must be a real ISO 4217 currency** (shape via
+  `utils.currency_code`, membership via `e_invoice.codelists.ISO_4217_CURRENCIES`);
+  the no-currency and testing codes are refused.
+- **Matching re-verifies in the same transaction.** Every invoice citing a
+  stamped PO that is not `paid` / `done` is re-matched with the org's settings
+  through `refresh_invoices_citing_pos` — the lookup a goods receipt uses, so a
+  multi-PO split is found by its legs (`split_po_ids`) as well as by number, and
+  each invoice is locked `FOR UPDATE` as a receipt locks it, so an approval
+  racing the stamp lands on one side of it (decisions §267, §389). The dry run's
+  "would re-match" count reads the same lookup. Only the PO match re-runs
+  (`invoice_warnings.refresh_po_match_only`): the stamp moved nothing else an
+  invoice's warnings read, so duplicate detection, the vendor-history fraud
+  rules and an opted-in LLM anomaly check are not repeated per invoice, and the
+  warnings they wrote stay as they were. An invoice in the asserted currency now reads `same`, so the note
+  goes and the agents can act; one in another currency reads `different` and gets
+  its `po_currency_mismatch` warning and payment-blocking `po_mismatch` hold with
+  the stamp. A stamp cannot make a finding disappear (`unknown` already compared
+  at face value, which is what `same` compares), so this raises holds and
+  closes none that a refresh would not close anyway. Paid / done invoices are
+  skipped, as the ERP PO sync skips them: a hold on money already paid stops
+  nothing.
+- **Audited:** one `purchase_order.currency_backfilled` row per applied run (no
+  actor — a tool run by an operator), carrying the asserted code, the scope,
+  the counts and the stamped PO ids; never a PO number, vendor or amount.
+
+A wrong assertion is a wrong label that looks right, which is worse than the
+bare figure it replaces — check it against the source (the ERP's base currency,
+the contract, the requisitions) before `--apply`. Covered by
+`backend/tests/test_po_currency_backfill.py`.
+
+### The sync refreshes a PO's lines, never just its total
+
+The receipt-value check scales the PO total by received / ordered quantity, so
+a re-sync that moved the total and kept the old lines valued receipts wrongly:
+a PO amended from 10 × 10 to 20 × 10 kept 10 ordered units, and a 10-unit
+receipt was valued at the whole 200. When the adapter sends lines, the sync now
+brings the stored ones in line (`api/purchase_orders._refresh_po_lines`,
+decisions §327), comparing at the column scales so the ERP's `3` and the stored
+`3.0000` are the same line:
+
+- **No goods received against the lines:** they are replaced.
+- **Goods received against some:** a goods-receipt line points at its PO line
+  by id, so a received line is updated in place, paired with an ERP line of the
+  same SKU (else the same description); unreceived lines are replaced; new ERP
+  lines are added.
+- **A received line with nothing to pair with** (the ERP dropped it, or changed
+  its SKU and description): nothing is changed and the PO is marked
+  `lines_changed`, so the match refuses it and the invoice is held until a
+  person looks. A later sync whose lines pair again lifts the mark.
+
+A payload with no lines (NetSuite's headers-only sync) leaves the stored lines
+alone. A line refresh re-matches the invoices citing the PO, hold-only.
+
+### A cancelled PO authorizes nothing
+
+A PO whose status is `cancelled` or `voided` (`procurement.CANCELLED_PO_STATUSES`)
+is never matched against. The matcher compares nothing (`status = "mismatch"`,
+`within_tolerance = false`, no variance, `MatchResult.po_cancelled = true`, one
+issue `po_match.issue.po_cancelled`), and `refresh_warnings` raises the
+`po_cancelled` warning with a payment-blocking `po_mismatch` at `warning`, so a
+person decides. The ERP PO sync re-matches the invoices citing a PO whose status
+moves into or out of cancelled, so the hold lands at sync time.
+
+`closed` is deliberately still matched. An ERP closes a PO once it is fully
+billed (NetSuite's "Fully Billed", for one), and the invoice being matched can
+itself be the bill that closed it, so refusing `closed` would hold the ordinary
+last invoice on every PO. Accruals and budgets still treat `closed` as dead
+(`DEAD_PO_STATUSES`), since they count what is still open (decisions §326).
+
+### An unissued PO authorizes nothing
+
+A PO the ERP has not approved or issued yet (status `unissued`,
+`procurement.UNISSUED_PO_STATUS`: a draft, or one awaiting approval; the
+per-adapter mapping is in `erp-integration.md`) is treated as a cancelled one
+is. The matcher compares nothing (`status = "mismatch"`, `within_tolerance =
+false`, no variance, `MatchResult.po_not_issued = true`, one issue
+`po_match.issue.po_not_issued`), whatever its amount or receipts say, and
+`refresh_warnings` raises the `po_not_issued` warning with a payment-blocking
+`po_mismatch` at `warning`. It is not `po_not_found`: the order exists, and
+reading it as missing would send the missing-PO agent looking for another PO.
+
+The ERP PO sync re-matches the invoices citing a PO whose status moves into or
+out of `procurement.UNMATCHABLE_PO_STATUSES` (cancelled, voided, unissued), so
+an order taken back to draft holds its invoices at sync time. Like every
+sync-triggered re-match the hold is raise-only (decisions §323, amended): the
+ERP approving the order clears the finding on the next refresh but leaves the
+`po_mismatch` row open for a person. Budgets and the open-PO accruals leave an
+unissued PO out (`DEAD_PO_STATUSES`), and the supplier portal does not list,
+show or flip one (decisions §394).
+
+### A PO total the ERP no longer vouches for
+
+An ERP adapter leaves out a PO whose total it cannot state exactly (SYSPRO: a
+line discount, a mixed-currency order, a currency it cannot place against the
+company's; see `erp-integration.md`). Before decisions §323 that was silent: a
+PO synced earlier at 100.00 kept 100.00 after the ERP amended it into something
+the adapter could not price, and every invoice for 100.00 kept reading
+`matched` against it.
+
+The adapter now names each skipped PO (`ErpAdapter.list_pos_report`), and the
+PO sync stamps `purchase_orders.total_unverifiable_reason` (a `PoSkipReason`:
+`unpriceable`, `lines_unread`, `no_lines`, `local_currency_unknown`) on the
+existing row the sync would refresh for that number (own entity first, else an
+unstamped row — the row a later priced sync clears). The sync stamps one reason
+of its own, `lines_changed`, described below. While it is set:
+
+- the matcher **compares nothing**: `status = "mismatch"`,
+  `within_tolerance = false`, `po_total` / `amount_variance` /
+  `amount_variance_pct` = `null` (so the stale figure never reaches
+  `invoice.po_match`), `MatchResult.po_total_unverifiable_reason` carries the
+  reason, and the
+  one issue is `po_match.issue.po_total_unverifiable`. The 3-way receipt-value
+  leg is skipped too, since it would scale the same stale total;
+- `refresh_warnings` raises the `po_total_unverifiable` warning and a
+  payment-blocking `po_mismatch` exception at `warning` — the currency guard's
+  treatment, for the same reason: with no figure there is no way to show the
+  invoice is not over-billing (`blocking_finding_types` agrees);
+- the invoice modal hides the PO total (the stale figure is not the PO's) and
+  shows the issue instead;
+- `missing_po_v1` and `multi_po_split_v1` never take such a PO as a candidate,
+  and the split agent re-checks the mark under the lock at apply time;
+- the supplier portal refuses to flip it into an invoice (409).
+
+The sync re-matches the invoices citing a PO whose mark, total or stated currency
+changed (the same figure in another currency is a different order, which the
+currency guard must hold). It re-matches the invoices that can match that row:
+the synced entity's and unstamped ones, or every entity's when the row itself is
+unstamped. `paid` and `done` invoices are left alone, since a hold on money
+already paid stops nothing. It runs in the
+same transaction and not best-effort, so the hold lands at sync time or the sync
+fails and the mark is rolled back with it. The next sync that prices the PO
+clears the mark — but **not the hold**.
+
+**A sync's re-match raises holds and never clears one** (decisions §323,
+amended 2026-10-26 — a product-owner call pending CISO review). That covers
+every re-match the PO sync runs, whether the ERP changed a total or re-priced a
+marked PO, and both PO-match types (`po_mismatch`, `quality_hold`). Whoever can
+edit a PO in the ERP is outside the invoice's implicated set (§267's receipt
+recorder has no ERP twin), so a sync that closed holds would let an ERP-side
+total increase release an over-billing hold at sync time with no FeohLedger
+sign-off. The sync passes `erp_po_sync` to `refresh_invoices_citing_pos`, and
+`invoice_warnings._reconcile_po_exceptions` then, instead of calling
+`_close_cleared_po_exceptions`, leaves a row it no longer finds **open and
+payment-blocking** and records why it now reads as clearable in the row's
+`erp_report`:
+
+```json
+{"kind": "po_rematch_clears", "erp_type": "syspro", "po_number": "PO-1001", "observed_on": "2026-10-26"}
+```
+
+PII-free (the ERP type, the PO number matched, the UTC day). `GET
+/api/exceptions` returns it with the rest of the row, and both clients say it in
+one line: on web, under the row's description on `/exceptions` and in its
+resolve dialog (`lib/types/erpReport.poRematchNote`); on mobile, on the
+exception detail screen (`PoRematchClears`, `poRematchText`). It reads "PO
+{po} changed in {erp} on {date}, and a re-check now matches. Review it to
+clear the hold." A missing PO number or day is left out, never invented.
+A person clears the hold
+through the queue (`exception_lifecycle.record_decision`, with its segregation
+refusal). Any later refresh that finds the finding again — a sync lowering the
+total back, an invoice edit — removes the note from the still-open row.
+
+Refreshes a FeohLedger action triggers (an invoice save, a receipt, the QMS
+sync) are unchanged: they keep the auto-close below, as they had before §323.
+So an ERP-side increase can still let the hold lift at the invoice's *next*
+FeohLedger edit, under that close's past-approval and segregation limits — the
+behaviour that predates §323, and part of the question left to the CISO
+review.
+
+Outside the match, no surface presents or sums the stale figure:
+
+- **Display.** The PO list and detail (`/api/purchase-orders`) send `total:
+  null` and `null` line `unit_price` / `total` (quantities stay — the receipt
+  form needs them) beside `total_unverifiable_reason`; `/purchase-orders`
+  renders "Not verifiable" in place of the figure and the catalogued reason in
+  the detail. The supplier portal's list and detail send the same `null`s and
+  `total_unverifiable: true` (never the internal code); its page shows "Being
+  confirmed" and disables the flip. One owner: `models/procurement.po_vouched_money`.
+- **Aggregates — excluded and counted** (decisions §35, the rule behind
+  `excluded_rebate_count` and the budgets' `excluded_row_count`). Budget
+  `committed` leaves a marked converted PO out and reports
+  `unverifiable_po_count` on `/spend`, `/check` and `/rollup`, apart from the
+  currency count because the remedy differs. `/analytics/cfo` leaves it out of
+  the open-PO and received (GR/IR) accrual legs and reports
+  `accruals.unverifiable_po_count` (distinct POs across both legs);
+  `/analytics/by-entity` leaves it out of open POs and reports
+  `open_po_unverifiable_count`. Each surface prints the count beside the figure
+  it qualifies. Filter: `models/procurement.PO_TOTAL_VOUCHED`.
+- **Not affected.** The public `/api/v1` API carries no PO figures (only an
+  invoice's `po_number`), and no CSV / PDF export includes a PO total or the
+  accruals. A contract-generated PO (`POST /api/contracts/{id}/create-po`)
+  and a requisition conversion create a fresh row, never a marked one.
+
+Covered by `test_po_matching_algorithm.py` (the two matcher cases),
+`test_po_matching_wiring.py` (the raise rule and the pure predicate agree),
+`test_purchase_orders.py::test_sync_erp_marks_an_already_synced_po_the_adapter_now_skips`
+(sync → mark → hold → re-price → the mark clears, the hold stays annotated, end
+to end), `test_sync_erp_lowering_a_po_total_opens_a_blocking_hold`,
+`test_sync_erp_raising_a_po_total_never_clears_the_hold` (the run stays
+refused), `test_a_refresh_outside_the_erp_sync_still_auto_closes_as_before` and
+`test_exception_agents_missing_po.py`, and for the surfaces outside the match
+`test_purchase_orders.py::test_list_and_detail_withhold_the_money_of_a_po_whose_total_is_unverifiable`,
+`test_portal_self_service.py::test_portal_po_list_and_detail_withhold_a_total_the_erp_no_longer_vouches_for`,
+`test_budget_rollup.py::test_a_po_whose_total_is_unverifiable_is_left_out_of_committed_and_counted`
+and the two `*_unverifiable_po*` cases in `test_multicurrency_kpi_reporting.py`.
+
 ### Cancelled receipts do not count as delivered goods
 
 The GR query excludes any receipt whose `status` is in
@@ -260,6 +496,164 @@ would substitute one masking bug for another (shipment 2 passed, so shipment 1
 reads inspected). Covered by
 `backend/tests/test_po_matching_critical_path.py` § 4-way leg.
 
+### A multi-PO split is matched against its legs
+
+The split agent (`multi_po_split_v1`) links one consolidated invoice to several
+POs by writing a combined `po_number` ("PO-A,PO-B") and the legs' ids in
+`invoices.split_po_ids` (decisions §433). The combined reference resolves to no
+single PO, so the matcher used to read `no_po` on the next refresh after any
+edit and raise again the `po_mismatch` the agent had just resolved. Now
+`match_invoice_to_po` reads the split from its legs (`_split_legs`), on one
+condition: **the reference still names them.** Every number in `po_number`
+must resolve to a PO in `split_po_ids` under the single-PO lookup's own filters
+(the invoice's entity, strictly; its vendor when it has one; the newest row
+per number). A reference someone edited — to one PO, or to a number the set
+does not hold — is matched as written, so it resolves or reads `no_po` like
+any other. A PO in the (append-only) set that the reference no longer names is
+not a leg.
+
+A split is matched as `_match_split` describes:
+
+- **2-way on the combined total** of the legs. Any leg cancelled, unissued or
+  with an unverifiable total holds the invoice, as that PO would alone. Any leg
+  in another currency from the invoice — or two legs whose own codes disagree,
+  even when the invoice's is absent — is a currency mismatch (`different`, held
+  as `po_currency_mismatch`, or `po_currency_mismatch_invoice_currency_unknown`
+  naming the legs' codes when the invoice's own code is malformed), and the
+  combined `po_total` is `null`: USD 600 +
+  EUR 400 is not 1,000 of anything, and stored as a total it rendered as
+  "€1,000.00". Each leg keeps its own `po_total` and `po_currency` in
+  `details["legs"]`. A split whose legs are `{code, NULL}` (one leg in the
+  invoice's currency, one recording none) is §197's rule extended to a sum: the
+  combined total is compared at face value and the result reads `unknown`, and
+  `multi_po_split_v1` refuses such a set — it never links or approves a split
+  it cannot prove is in one currency.
+- **3-way and 4-way per leg, then combined.** Quantities are never pooled
+  before they are judged, because an over-receipt on one leg would hide a short
+  receipt on another. A short leg is worth the share of its total its receipts
+  cover; every other leg its whole total (a leg with no receipt is a 2-way leg).
+  The invoice bills beyond receipt when it asks for more than that sum.
+  `ordered_quantity` / `received_quantity` are the legs' sums, or `null` when
+  one leg is short and another over. Each leg's inspection is read: a `fail`
+  is the representative verdict, then a required inspection missing on any
+  leg (`inspection_result` `null`), then a `partial`.
+- The result names the split: `po_ids` lists the legs, `po_number` is the
+  invoice's own reference and `po_id` is `null`. `inspection_ids` lists every
+  inspection read. The auto-close vets every leg's hand-entered receipts
+  (`receipts_clear_hold` over `MatchResult.matched_po_ids()`) and every
+  inspection (`_inspection_clears_hold`), and a receipt or inspection on one
+  leg re-matches the split (`refresh_invoices_citing_pos` also finds invoices
+  whose `split_po_ids` hold a PO of that number).
+
+The agent now re-matches through the matcher too, the way `missing_po_v1`
+does, and approves only on a clean `matched` read as the split it linked; so
+the `po_match` it leaves is the one every later refresh writes. A split with a
+leg short-received escalates instead of being approved.
+
+Covered by `backend/tests/test_po_match_exception_reconciliation.py` § A
+multi-PO split and `backend/tests/test_exception_agents_multi_po_split.py`.
+
+### Billing past the PO across invoices
+
+The matcher compares ONE invoice with the whole PO, so two invoices that each
+fit pass it: a supplier's PO flip (which bills the whole total under no invoice
+number, so duplicate detection has nothing to match) followed by the same
+order billed again through the portal, email or AP keying.
+`invoice_warnings._refresh_po_overbilling` closes that gap. On a single-PO
+match whose total is trustworthy and in the invoice's own currency, it sums the
+OTHER invoices billing the PO, in every status but `rejected`, in that
+currency: one whose last match resolved to this PO (`po_match->>'po_id'`), one
+a multi-PO split linked to it (`split_po_ids`, counted at its whole amount),
+and one not matched to any PO yet that cites the PO's number within the PO's
+entity (either side unstamped spans entities) and names the PO's vendor or no
+vendor. Another vendor's invoice citing the same number is not counted. When
+those plus this invoice exceed the PO total by more than the match rule's
+tolerance, it adds `po_billed_beyond_total` (type `po_overbilled`, severity
+`warning`), naming what the others already bill, the PO total and the
+normalised currency code.
+
+- **Not a hold, but no unattended approval.** Credit memos, corrective
+  re-bills, and a sibling rejected or reopened after this refresh all move the
+  sum without re-running it on this invoice, so a payment-blocking row would go
+  stale both ways. Instead `po_match_hold_refusal` answers `po_overbilled`
+  while the warning stands, so extraction's auto-approve and `/complete`'s
+  floor send the invoice to review, and an exception agent's approval unwinds
+  and escalates (see [Before an unattended approval](#before-an-unattended-approval)). A person reads it at
+  approval, as with the other findings.
+- **Its own type**, not `po_mismatch`: the invoice modal shows `po_mismatch`
+  warnings through the PO-match panel's own `issues`, which this cross-invoice
+  finding is not one of. `refresh_po_match_only` rebuilds it with the match.
+- **Skipped** for a multi-PO split (its amount cannot be attributed to one
+  leg), and for a cancelled, unissued, unvouched or other-currency PO, which
+  each raise their own finding. A rejected invoice is neither checked nor
+  counted. It bills nothing while rejected. Once reopened to `new` it counts
+  again, but only in a refresh run after that: the reopened invoice's own
+  (`new` gets no match until it is submitted) or a sibling's next one. A
+  sibling already refreshed keeps its earlier answer until then.
+
+Reasoning: `docs/decisions.md` §469.
+
+#### And past what has been received
+
+The receipt leg has the same blind spot: it compares ONE invoice with the
+received slice of the PO (`received_value`, `po_total × received / ordered`),
+so with 400.00 of a 1000.00 PO received, two invoices of 400.00 each fit it.
+On a SHORT receipt the same refresh measures the same siblings plus this
+invoice against `received_value` at the same tolerance, and when they exceed
+it adds `po_billed_beyond_receipt` (type `po_overbilled`, severity `warning`),
+naming what every live bill on the PO comes to, this one included
+(`totalBilled`), the received value (to the cent; the comparison uses the
+exact share, so 3 of 7 units of 1000.00 is a limit of exactly 450.00 at 5 %)
+and the currency code.
+
+- **One finding at most.** Past the PO total, only `po_billed_beyond_total` is
+  written: no receipt could cure that bill.
+- **Not when this invoice alone bills beyond receipt.** The matcher's own
+  `billed_beyond_receipt` has already raised the payment-blocking
+  `po_mismatch` for that.
+- **Not on a full receipt** (`received_value` is unset; the received slice is
+  the whole PO, which the total check measured).
+- **Same type, same consequences:** no unattended approval while it stands
+  (`po_match_hold_refusal` answers `po_overbilled`), the exception-agent
+  unwind, and a rebuild by `refresh_po_match_only`. Recording a goods receipt
+  re-matches every invoice citing the PO in the same transaction, so a
+  delivery that covers the bills drops the finding at once, and cancelling a
+  receipt raises it.
+- **A warning, not a hold, before approval**, for §469's staleness reason,
+  and one more: the finding cannot say which of the bills is the excess one,
+  so every bill on the PO carries it, and a hold would stop the legitimate
+  first bill with the second.
+- **A hold past approval, when new or worse.** A receipt cancelled after both
+  bills were approved (§262 allows it) reaches them only through the
+  re-match, and nobody reads the warning again. So on an invoice outside
+  `PRE_APPROVAL_STATUSES` the finding also raises the payment-blocking
+  `po_mismatch`, with the warning's own sentence, when it is new or worse than
+  the one the invoice carried into the refresh
+  (`_beyond_receipt_worsened`: none before, less received, more billed,
+  another PO, or an unreadable figure). A finding unchanged since the
+  approver read it raises nothing, so their sign-off needs no second one.
+  Once raised, the hold is kept found while the finding stands
+  (`_open_po_mismatch_hold`), so one row survives any number of refreshes.
+  It closes like every PO-match hold, on the refresh that no longer finds it,
+  through `_close_cleared_po_exceptions` and therefore `receipts_clear_hold`:
+  a covering receipt typed in by someone implicated in the invoice, or by an
+  approver, leaves it for a person. A new run refuses the invoice; a draft
+  run's payment is refused at dispatch, NACHA export or the paid-elsewhere
+  close-out (`dispatch_preflight`, `invoice_blocked:po_mismatch`); a file
+  already exported has left with the customer's upload, and the hold only
+  puts the invoice in the queue.
+- **An implicated receipt stops unattended approval.** While any live
+  hand-entered receipt on the matched PO was recorded by someone implicated
+  in the invoice or by nobody known (`receipts_clear_hold`),
+  `po_match_hold_refusal` answers `po_receipt_implicated`: such a receipt can
+  make the per-invoice and cumulative receipt findings vanish. The org's
+  `settings.exceptions.require_segregation: false` lifts it.
+- **The total leg gets no post-approval hold.** A PO total rarely moves after
+  approval, and §469's warning already covers that leg.
+
+Receipts are still valued pro rata across the PO's lines, not per line; see
+`docs/followups.md`. Reasoning: `docs/decisions.md` §470.
+
 ### Recording a goods receipt
 
 `POST /api/goods-receipts` (`services/goods_receipts.py`) is the one in-app
@@ -280,7 +674,7 @@ receipt**.
 | `received_date` no later than the server's UTC date + 1 day | A user east of UTC is already on tomorrow; a future receipt would satisfy the 3-way leg for goods not yet here |
 | `gr_number` optional (the delivery-note number), unique per org case-folded; blank → `GR-<po_number>-<n>` | 409 `goods_receipt_number_taken` |
 | `Idempotency-Key` header: a replay of the **same** request (PO, date, lines) returns the same receipt with **200**; the key reused for anything else is a 409 `goods_receipt_idempotency_reused` — including the same key raced onto two POs, which the partial unique index `uq_goods_receipts_org_idempotency_key` catches inside a SAVEPOINT | A duplicate receipt doubles the received quantity and could lift a hold; a reused key answered with a receipt that says something else would be a lie |
-| `source = "manual"`, `recorded_by_user_id` stamped | The auto-close's segregation check above, and approval's: the recorder of a live manual receipt on an invoice's PO cannot approve that invoice (403 `approval_segregation_receiver`, decisions §267) |
+| `source = "manual"`, `recorded_by_user_id` stamped | The auto-close's segregation check above, and approval's: the recorder of a live manual receipt on an invoice's PO cannot approve that invoice (403 `approval_segregation_receiver`, decisions §267), and a receipt recorded by someone who already approved an invoice on the PO does not lift that invoice's hold (decisions §389) |
 | Audit `goods_receipt.created` — number, PO number, line count, total quantity, date; no free text | The procurement audit shape |
 | Every invoice citing the PO is re-matched **in the same transaction, not best-effort** | A receipt that landed without the holds it should raise (or lift) would be worse than no receipt; the QMS sync's rematch stays best-effort because it is a batch |
 
@@ -320,7 +714,8 @@ MatchResult:
     po_id, po_number, po_total
     po_currency: str | None     # the PO's own code — labels po_total
     currency_check: "same" | "different" | "unknown" | None  # None = no PO found
-    gr_id  # if 3-way
+    gr_id  # if 3-way (the newest live receipt across a split's legs)
+    po_ids: list[str]           # a multi-PO split's legs; [] for a single PO
     amount_variance: Decimal | None      # invoice - PO; None on a currency mismatch
     amount_variance_pct: Decimal | None  # as percentage; None on a currency mismatch
     within_tolerance: bool
@@ -328,6 +723,7 @@ MatchResult:
     inspection_result: "pass" | "fail" | "partial" | None
     inspection_accepted_quantity: float | None  # partial acceptance qty
     inspection_required: bool              # require_inspection on + inspection missing
+    inspection_ids: list[str]              # every inspection read (one per inspected leg)
     over_receipt: bool          # 3-way: received quantity EXCEEDS ordered
     issues: list[dict]          # {code, params, message} — po_match.issue.* findings
     details: dict               # full match data for audit (has_inspection, inspection_result)
@@ -359,6 +755,27 @@ PO matching can run after extraction when the invoice has a `po_number`. The mat
 - Shown in the invoice modal
 - Routed to the exception queue if mismatched
 
+### Before an unattended approval
+An invoice citing a PO is matched before anything approves it unattended, and a
+failed match holds it for a person (decisions §425). Extraction's refresh runs
+the match on the `pending` invoice it has just read; `POST /api/invoices/{id}/complete`
+runs it on the `new` invoice it is submitting (`refresh_warnings(...,
+match_po_on_new=True)` — a refresh otherwise skips `new` as an unentered draft),
+so the reviewer also sees the match on every invoice `/complete` sends to review.
+Then `invoice_warnings.po_match_hold_refusal` is asked **before** the approval is
+stamped, by both unattended doors: `/complete`'s `auto_approve_below` floor and
+extraction's auto-approve. An open or escalated `po_mismatch` / `quality_hold`
+(a PO that cannot be found, an over-billed or cancelled PO, a failed inspection)
+sends the invoice to `ready_for_review` instead, recorded as
+`auto_approve_suppressed: "po_match_hold"` on the audit row. So does a clearance
+of one that the stamp itself would undo (`"po_match_hold_cleared_by_approver"`):
+the caller cleared the hold while not its approver, and the §422 re-judge would
+raise it again straight after stamping them. Neither door can leave an invoice
+`approved` with a PO-match hold open. So do the cumulative over-billing
+warnings above, past the total or past what was received, which raise no row:
+`"po_overbilled"` (decisions §469, §470). An
+invoice with no PO reference has no such row, and the floor behaves as before.
+
 ### In the Review Step
 Reviewers see the match status:
 - **Matched** (green) — PO found, amounts within tolerance
@@ -369,7 +786,7 @@ Reviewers see the match status:
 ### Before Payment
 An unresolved (`open` / `escalated`) `po_mismatch` or `quality_hold` exception
 blocks payment — both are members of
-`api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`, so the run builder refuses the
+`services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`, so the run builder refuses the
 invoice, the payment queue marks the row blocked (reason code `po_mismatch` /
 `quality_hold`), dispatch refuses a payment whose invoice picked one up after the
 run was built, and `/retry-failed`, `POST /api/payments` and
@@ -391,7 +808,10 @@ on the invoice. Resolving or dismissing the exception is the sign-off that
 releases it, and **segregation of duties applies**: the invoice's uploader (or
 anyone in its `segregation_actor_ids`) may not clear it, and an exception agent
 run they trigger escalates instead of auto-resolving
-([exception-lifecycle.md](exception-lifecycle.md)).
+([exception-lifecycle.md](exception-lifecycle.md)). A person's clearance holds
+across refreshes while the match is unchanged (the invoice's PO fields and the
+persisted `invoice.po_match`); a PO edit, a receipt, an inspection or a rule
+change raises the hold again (decisions §366).
 
 **A hold lifts when the evidence catches up.** Each refresh closes any open or
 escalated `po_mismatch` / `quality_hold` row whose finding it no longer reports
@@ -434,9 +854,22 @@ where somebody could:
   inspection by hand.
   `QualityInspection.source` / `recorded_by_user_id` (migration 0105) say where
   a verdict came from: a `qms` one lifts the hold; a `manual` one only when its
-  recorder is known and not implicated in the invoice
-  (`approval_chain.violates_segregation`); one of unknown provenance (a manual
-  row with no recorder, or a row predating the columns) never — fail closed.
+  recorder is known, not implicated in the invoice
+  (`approval_chain.violates_segregation`) and did not approve it (decisions
+  §401: the approval of record or any chain level, `approval_chain.
+  approvers_in_force` — the same approver set §389's receipt rule reads, lifted
+  by the approval step's `require_segregation: false`); one of unknown
+  provenance (a manual row with no recorder, or a row predating the columns)
+  never — fail closed. The way through is an independent person's own verdict
+  recorded where the matcher looks: the matcher reads the newest inspection on
+  the invoice's newest live receipt and falls back to a PO-level one only when
+  that receipt has none, so a hold raised by a receipt's `fail` lifts only on a
+  pass recorded against that receipt — a PO-level pass beside it is never
+  read. Raising a hold is never refused — a `fail` from anyone lands. Nor may
+  an approver resolve or dismiss the held row by hand in the queue: on a
+  `quality_hold` (and a `po_mismatch`) `exception_lifecycle.segregation_refusal`
+  refuses the invoice's approvers too, 403 `segregation_approver` (decisions
+  §420).
   Not the audit log: in `FEOH_AUDIT_MODE=lambda` no local row exists, so an
   audit-based check would fail open. When the QMS sync takes over a row that
   was not its own (same inspection number), it also replaces the typed PO / GR
@@ -455,6 +888,39 @@ where somebody could:
   predates receipt entry (before migration 0109 no app user could type one
   in), so it is trusted as it always was; `tests/test_goods_receipt_source_stamping.py`
   fails on an in-app construction site that forgets the stamp.
+- **A receipt does not release the invoice its own recorder approved.**
+  Receiving and approving are separate duties in either order (decisions
+  §389). §267 refuses a receiver at approval; here, while anyone who approved
+  the invoice also hand-recorded a live receipt it is billed against, its
+  `po_mismatch` rows stay for a person. "Approved" is the approval of record,
+  by id (`invoices.approved_by_user_id`, migration 0129 — the approver, the
+  `/complete` floor's caller, or the reader whose extraction auto-approved),
+  plus every level signed on its approval chain, even with later levels still
+  open (`approval_chain.approver_ids`). "Billed against" is the approval door's
+  own receipt set (`approval_chain.receipt_recorders`: every PO the invoice
+  names, including every leg of a multi-PO split through
+  `invoices.split_po_ids`, decisions §433), and the two are compared by one rule,
+  `approval_chain.receiving_conflicts`, so the orders cannot disagree. The
+  receipt itself is recorded and counts towards the 3-way leg — for this
+  invoice and every other on the PO, whose holds it lifts as before; it is only
+  not evidence that releases its recorder's own approval. **The way through is
+  an independent person:** cancel the approver's receipt (cancelling can only
+  raise a hold) and have someone else record the delivery, which lifts the hold
+  in that request, or have someone else resolve the held row in the queue after
+  checking the delivery. That someone must not be an approver: the queue refuses
+  the invoice's approvers resolving or dismissing its `po_mismatch`
+  (`exception_lifecycle.segregation_refusal`, 403 `segregation_approver`,
+  decisions §420), and a hold someone cleared before they approved is raised
+  again by their approval, in the same transaction (decisions §422). The
+  approval step's `require_segregation: false` lifts it, as it lifts §267, and
+  so does `settings.exceptions.require_segregation: false`, which lifts every
+  auto-close limit here. Receipt entry re-matches the PO's invoices under
+  `FOR UPDATE`, so a receipt and an approval of one of them serialise on the
+  invoice row and neither order can be raced past. A recall keeps the approver's id until the next
+  approval replaces it (as it keeps `approved_by`), so a receipt the recalled
+  approver typed in meanwhile still does not release the invoice; an approval
+  naming nobody (an unattended auto-approve, or one before 0129 that its audit
+  row could not name) has nobody to refuse.
 - **An exception agent is held to the same receipt rule.** The agent
   coordinator's own segregation gate only vets the human who triggered the
   run, so after a resolver's change it re-matches under the org's rules and,
@@ -475,11 +941,21 @@ The org's `settings.exceptions.require_segregation: false` opt-out lifts the two
 segregation limits, as it does on the queue.
 
 Refreshes run on every invoice save, approval-with-corrections, QMS sync,
-**recording or cancelling a goods receipt** and the other `refresh_warnings`
-callers. A receipt re-matches every invoice that cites its PO in the same
-transaction (`invoice_warnings.refresh_invoices_citing_pos`), so the hold lifts
-— or is raised — the moment the receipt lands. Nothing re-evaluates an
-untouched invoice on a schedule.
+**recording or cancelling a goods receipt**, **recording an inspection by hand**
+and the other `refresh_warnings` callers. A receipt or a hand-entered
+inspection re-matches every invoice that cites its PO in the same transaction
+(`invoice_warnings.refresh_invoices_citing_pos`, `caller="goods-receipts"` /
+`"inspections"`), so the hold lifts — or is raised — the moment the row lands,
+and a re-match that fails rolls the row back with it. An inspection reaches
+its own `po_id`, or its goods receipt's PO. Both lock the invoices they
+re-match (`lock_invoices=True`), so each serialises with an approval of one of
+them (decisions §389, §401). Nothing re-evaluates an untouched invoice on a
+schedule.
+
+**The ERP PO sync is the one refresh that never closes a row** — it may only
+raise. A row it no longer finds stays open, annotated
+`erp_report.kind = "po_rematch_clears"`, for a person to clear (§ A PO total
+the ERP no longer vouches for, above; decisions §323, amended).
 
 ### Quality-hold exceptions
 The 4-way leg routes inspection outcomes to a dedicated `quality_hold`
@@ -803,6 +1279,29 @@ hold, and a `pass` is what clears one — so this is the only inspection a human
 can author, and it was the only one with no record of who authored it while its
 QMS-synced sibling had audited since the integration shipped.
 
+### Manual inspections re-match in the same request
+
+`POST /api/inspections` re-runs the match on every invoice citing the PO the
+inspection reaches — its own `po_id`, or the PO of its `gr_id`'s receipt —
+in the same transaction, with the org's own settings and the invoices locked
+(`api/inspections._rematch` → `refresh_invoices_citing_pos(caller="inspections",
+lock_invoices=True)`), as receipt entry does (decisions §401). A `fail` or
+`partial` therefore raises the `quality_hold` before the response returns; a
+`pass` closes one only when `_inspection_clears_hold` allows it (above: not the
+invoice's implicated actors, not anyone who approved it). In the other order,
+whoever recorded a manual inspection of the invoice's goods is refused as its
+approver (403 `approval_segregation_inspector`,
+`approval_chain.inspection_recorders`, decisions §404). Before this, the row
+landed and the invoice kept describing the old verdict until something else
+refreshed it. A rematch failure rolls the inspection back (not best-effort; the
+QMS sync's batch rematch stays best-effort), and the audit row is written after
+the rematch. The cited `po_id` / `gr_id` must be inside the caller's
+`X-Entity-ID` (else the same 404 as a missing one), a receipt on another PO
+than the body's `po_id` is a 422, and the row is booked to the cited
+document's entity — the matcher reads inspections with no entity filter, so a
+verdict filed from one subsidiary must not release another's hold. Pinned in
+`tests/test_inspections_api.py`.
+
 ## Data Models
 
 The procurement models already exist:
@@ -900,5 +1399,5 @@ unknown-recorder and cancelled-receipt cases in
 | Exception routing for mismatches (`po_mismatch` exceptions auto-created by severity: error / warning / info) | Done |
 | Currency guard (`compare_currencies`; a currency mismatch is a `mismatch` with no variance, an unrecorded PO currency is compared at face value and reported `unknown`) | Done (migration 0099, decisions §197) |
 | PO management UI (list + detail page) | Done (`/purchase-orders`) |
-| PO sync from ERP (`list_pos()`) | Done — `mock` and `merge_dev` (which maps the record's `currency`); NetSuite / Business Central inherit the empty default |
+| PO sync from ERP (`list_pos()`) | Done — `mock` and every direct adapter with a PO collection (`merge_dev` maps the record's `currency`); each listing is read whole or raises `ErpListingIncomplete` (erp-integration.md § GL accounts and vendors are linked by the ERP's unique key) |
 | Configurable tolerance per org (`Organization.settings.po_matching.tolerance_pct`) | Planned |

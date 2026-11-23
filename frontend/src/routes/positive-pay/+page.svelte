@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PositivePayFile } from '#lib/types/positivePay.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import {
@@ -23,6 +24,7 @@
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
@@ -30,6 +32,7 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
@@ -62,13 +65,13 @@
 
 	const COLUMNS = $derived([
 		{ label: m('positivePay.col.file') },
-		{ label: m('positivePay.col.type') },
-		{ label: m('positivePay.col.format') },
-		{ label: m('positivePay.col.items'), class: 'right' },
-		{ label: m('positivePay.col.total'), class: 'right' },
-		{ label: m('positivePay.col.account') },
-		{ label: m('positivePay.col.created') },
-		{ label: m('positivePay.col.status') },
+		{ label: m('positivePay.col.type'), class: 'col-type' },
+		{ label: m('positivePay.col.format'), class: 'col-format' },
+		{ label: m('positivePay.col.items'), class: 'right col-count' },
+		{ label: m('positivePay.col.total'), class: 'right col-amount' },
+		{ label: m('positivePay.col.account'), class: 'col-account' },
+		{ label: m('positivePay.col.created'), class: 'col-date' },
+		{ label: m('positivePay.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -83,6 +86,9 @@
 	let pageNum = $state(1);
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// A failed first-page load is its own state: rendering the table's empty
+	// row instead told the reader no file matched, when nothing had been read.
+	let loadError = $state(false);
 
 	let hasMore = $derived(files.length < total);
 
@@ -182,12 +188,18 @@
 			files = opts.append ? appendUnique(files, data.items) : data.items;
 			total = data.total;
 			pageNum = nextPage;
+			loadError = false;
 		} catch (e) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!fetchSequence.isCurrentRequest(token)) return;
-			if (!opts.append) files = [];
-			toast(e instanceof Error ? e.message : m('positivePay.toast.loadFailed'), 'error');
+			if (opts.append) {
+				toast(errorMessage(e, m('positivePay.toast.loadFailed')), 'error');
+			} else {
+				files = [];
+				total = 0;
+				loadError = true;
+			}
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -273,11 +285,13 @@
 	let confirmDeleteId = $state<string | null>(null);
 
 	async function deleteFile(f: PositivePayFile) {
+		if (busyId) return;
 		if (confirmDeleteId !== f.id) {
 			confirmDeleteId = f.id;
 			return;
 		}
-		confirmDeleteId = null;
+		// Stays armed until the request settles, so the busy button keeps
+		// reading "Confirm" rather than reverting mid-request.
 		busyId = f.id;
 		try {
 			await deletePositivePayFile(f.id);
@@ -287,9 +301,10 @@
 			void loadSummary();
 			toast(m('positivePay.toast.deleted'), 'success');
 		} catch (e) {
-			toast(e instanceof Error ? e.message : m('positivePay.toast.deleteFailed'), 'error');
+			toast(errorMessage(e, m('positivePay.toast.deleteFailed')), 'error');
 		} finally {
 			busyId = null;
+			confirmDeleteId = null;
 		}
 	}
 
@@ -318,7 +333,7 @@
 
 <svelte:window
 	onclick={(e) => {
-		if (confirmDeleteId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
+		if (confirmDeleteId && !busyId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
 			confirmDeleteId = null;
 		}
 	}}
@@ -348,68 +363,82 @@
 		<HelpTip term="positive-pay" />
 	</div>
 
-	<DataTable
-		columns={COLUMNS}
-		isEmpty={!loading && files.length === 0}
-		empty={loading ? m('common.loading') : m('positivePay.empty')}
-		colspan={9}
-	>
-		{#snippet body()}
-			{#each files as file (file.id)}
-				<tr
-					class="clickable"
-					onclick={(e) => {
-						if (isRowOpenClick(e)) openDetail(file);
-					}}
-				>
-					<td>
-						<RowLink
-							onclick={() => openDetail(file)}
-							ariaLabel={m('positivePay.row.open', { label: fileLabel(file) })}
-						>
-							{fileLabel(file)}
-						</RowLink>
-					</td>
-					<td class="muted">{m(POSITIVE_PAY_FILE_TYPE_LABEL_KEYS[file.file_type])}</td>
-					<td class="muted">{bankFormatLabel(file.bank_format)}</td>
-					<td class="right mono">{file.item_count}</td>
-					<td class="right mono"><Money amount={file.total_amount} currency={file.currency} /></td>
-					<td class="mono muted">{file.account_last4 ? `••••${file.account_last4}` : '—'}</td>
-					<td class="muted">{formatDate(file.created_at)}</td>
-					<td>
-						<Badge tone={POSITIVE_PAY_STATUS_TONES[file.status]} variant={file.status}>
-							{statusLabel(file.status)}
-						</Badge>
-					</td>
-					<td class="actions">
-						{#if canCreate}
-							<RowAction
-								variant="danger"
-								armed={confirmDeleteId === file.id}
-								disabled={busyId === file.id}
-								onclick={() => deleteFile(file)}
-								ariaLabel={m('positivePay.row.deleteAria', { label: fileLabel(file) })}
+	{#if loadError && !loading}
+		<LoadError
+			message={m('positivePay.toast.loadFailed')}
+			onretry={() => load()}
+			testId="positive-pay-load-error"
+		/>
+	{:else}
+		<div class="ppay-table">
+		<DataTable
+			fixed
+			columns={COLUMNS}
+			isEmpty={!loading && files.length === 0}
+			{loading}
+			filtered={typeFilter !== 'all' || !!appliedSearch}
+			emptyFiltered={m('positivePay.empty')}
+			empty={m('positivePay.emptyNone')}
+			colspan={9}
+		>
+			{#snippet body()}
+				{#each files as file (file.id)}
+					<tr
+						class="clickable"
+						onclick={(e) => {
+							if (isRowOpenClick(e)) openDetail(file);
+						}}
+					>
+						<td>
+							<RowLink
+								onclick={() => openDetail(file)}
+								ariaLabel={m('positivePay.row.open', { label: fileLabel(file) })}
 							>
-								{confirmDeleteId === file.id ? m('positivePay.row.confirm') : m('positivePay.row.delete')}
-							</RowAction>
-						{/if}
-					</td>
-				</tr>
-			{/each}
-		{/snippet}
-	</DataTable>
-
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={() => load({ append: true })} disabled={loadingMore}>
-				{loadingMore ? m('common.loading') : m('positivePay.loadMore', { shown: files.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('positivePay.showingAll', { total })}</span>
+								{fileLabel(file)}
+							</RowLink>
+						</td>
+						<td class="muted">{m(POSITIVE_PAY_FILE_TYPE_LABEL_KEYS[file.file_type])}</td>
+						<td class="muted">{bankFormatLabel(file.bank_format)}</td>
+						<td class="right mono">{file.item_count}</td>
+						<td class="right mono"><Money amount={file.total_amount} currency={file.currency} /></td>
+						<td class="mono muted">{file.account_last4 ? `••••${file.account_last4}` : '—'}</td>
+						<td class="muted">{formatDate(file.created_at)}</td>
+						<td>
+							<Badge tone={POSITIVE_PAY_STATUS_TONES[file.status]} variant={file.status}>
+								{statusLabel(file.status)}
+							</Badge>
+						</td>
+						<td class="actions">
+							{#if canCreate}
+								<RowAction
+									variant="danger"
+									armed={confirmDeleteId === file.id}
+									busy={busyId === file.id}
+									disabled={busyId !== null && busyId !== file.id}
+									onclick={() => deleteFile(file)}
+									ariaLabel={m('common.rowActionAria', { action: confirmDeleteId === file.id ? m('positivePay.row.confirm') : m('positivePay.row.delete'), name: fileLabel(file) })}
+								>
+									{confirmDeleteId === file.id ? m('positivePay.row.confirm') : m('positivePay.row.delete')}
+								</RowAction>
+							{/if}
+						</td>
+					</tr>
+				{/each}
+			{/snippet}
+		</DataTable>
 		</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={files.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		errored={loadError}
+		onloadmore={() => load({ append: true })}
+		moreKey="positivePay.loadMore"
+		allKey="positivePay.showingAll"
+	/>
 </PageHeader>
 
 {#if showCreate}
@@ -421,6 +450,27 @@
 {/if}
 
 <style>
+	/* Column widths. The table is `table-layout: fixed` (DataTable's
+	   `fixed`): under `auto` the columns were sized against the one
+	   "Loading…" row, then re-sized against the real rows, so every column
+	   slid sideways as the data landed (tests-e2e/reactivity/
+	   layout-stability.spec.ts). The predictable columns get widths sized to
+	   their widest content in any locale; the text column(s) carry none and share the rest.
+	   Past the `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables). DataTable renders these
+	   `<th>` from `columns`, so the selectors go through `:global` under a
+	   page-owned wrapper (the /gl-accounts pattern). */
+	.ppay-table { min-width: 0; }
+	.ppay-table :global(table) { min-width: 1350px; }
+	.ppay-table :global(th.col-type) { width: 150px; }
+	.ppay-table :global(th.col-format) { width: 150px; }
+	.ppay-table :global(th.col-count) { width: 110px; }
+	.ppay-table :global(th.col-amount) { width: 150px; }
+	.ppay-table :global(th.col-account) { width: 110px; }
+	.ppay-table :global(th.col-date) { width: 120px; }
+	.ppay-table :global(th.col-status) { width: 210px; }
+	.ppay-table :global(th.actions-col) { width: 140px; }
+
 	.filter-row {
 		display: flex;
 		align-items: center;

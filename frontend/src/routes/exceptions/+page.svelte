@@ -3,20 +3,24 @@
 	import { page as pageStore } from '$app/state';
 	import { afterNavigate, replaceState } from '$app/navigation';
 	import { api } from '#lib/api.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import type { MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
+	import RefusalNote from '#lib/components/ui/RefusalNote.svelte';
 	import BulkBar from '#lib/components/ui/BulkBar.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import Tabs from '#lib/components/ui/Tabs.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
+	import Money from '#lib/components/ui/Money.svelte';
 	import {
 		EXCEPTION_SEVERITIES,
 		exceptionSeverityLabelKey,
@@ -31,18 +35,38 @@
 	import AgentDashboard from '#lib/components/exceptions/AgentDashboard.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { formatMoney, type MoneyAmount } from '#lib/utils/money.ts';
-	import { formatDate, timeAgo } from '#lib/utils/time.ts';
-	import { getActiveFormatLocale } from '#lib/i18n/formatLocale.ts';
+	import { formatDate, formatDueIn, timeAgo } from '#lib/utils/time.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { formatApiDetail } from '#lib/utils/apiError.ts';
 	import {
+		isAllowed,
+		isOffered,
+		refusalText,
+		type ActionRefusal
+	} from '#lib/api/actionVerdicts.ts';
+	import {
 		exceptionDescriptionText,
 		exceptionDescriptionTitle,
 		type ExceptionDescriptionText
 	} from '#lib/api/exceptionDescription.ts';
+	import {
+		erpPaymentParts,
+		erpPrefill,
+		erpRefusalNote,
+		isErpPaidReport,
+		poRematchNote,
+		spansSeveralRails,
+		type ErpReport,
+		type RailPartView
+	} from '#lib/types/erpReport.ts';
+	import type { PaymentMethod } from '#lib/types/payment.ts';
+	import { localToday } from '#lib/types/paymentExecution.ts';
+	import RecordPaymentFields from '#lib/components/payments/RecordPaymentFields.svelte';
+	import ErpPaymentSplit from '#lib/components/payments/ErpPaymentSplit.svelte';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	interface ExceptionItem {
 		id: string;
@@ -78,6 +102,30 @@
 		is_overdue: boolean;
 		time_to_resolution_hours: number | null;
 		created_at: string;
+		/** The CALLER's verdict on each decision for this row — `null` when
+		 *  `POST /{id}/resolve` would accept that action from them, else the
+		 *  coded refusal it would answer with (`api/exceptions.py::
+		 *  decision_refusals`: the status gate, then the segregation predicate
+		 *  `record_decision` raises from). The resolve dialog offers each button
+		 *  from this; the page used to check only the status, so the uploader of
+		 *  a duplicate invoice was offered a Resolve that 403'd (issue #575).
+		 *  Absent on a row from any other payload = unknown = nothing offered. */
+		decision_refusals?: Record<Action, ActionRefusal>;
+		/** What the ERP reported, as data (decisions §319) — null on every row
+		 *  but the ERP reconciliation ones. */
+		erp_report?: ErpReport | null;
+		/** The ERP's product name for that report, or null ("your ERP"). */
+		erp_name?: string | null;
+		/** Only on a row carrying an ERP-reported payment: the caller's verdict
+		 *  on `POST /{id}/record-erp-payment`. Absent = unknown = not offered. */
+		record_erp_payment_refusal?: ActionRefusal;
+		/** On a `paid_not_recorded` row stating a figure and a breakdown: the
+		 *  SERVER's judgement that the breakdown is booked whatever one rail a
+		 *  person names (it adds up exactly and spans several rails, decisions
+		 *  §396, §413). True → the dialog shows the split instead of a rail
+		 *  picker and sends no rail; false → the person's rail is the record.
+		 *  Null or absent on every other row, and the picker stays. */
+		erp_payment_split_stands?: boolean | null;
 	}
 
 	/** Every chip tally on the page — see {@link ExceptionSummary}. */
@@ -201,53 +249,77 @@
 				params.set('sort', sortField);
 				params.set('order', sortOrder);
 			}
+			// The open dialog is part of the view, so a link can open it
+			// (`/exceptions?id=` — the payment queue links a blocked row here).
+			const openId = resolveTarget?.id ?? pendingOpenId;
+			if (openId) params.set('id', openId);
 			const qs = params.toString();
 			replaceState(`${pageStore.url.pathname}${qs ? `?${qs}` : ''}`, {});
 		});
 	}
 
 	let resolveTarget = $state<ExceptionItem | null>(null); // single-row resolve modal
+	/** The open exception's Resolve is refused for a reason the reader can act
+	 *  on (a colleague must clear it): explain it above the footer. */
+	const decisionRefused = $derived(
+		!!resolveTarget?.decision_refusals?.resolve &&
+			isOffered(resolveTarget.decision_refusals.resolve)
+	);
+	// `?id=` names an exception whose dialog the page opens once it has loaded
+	// that row — the payment queue's "Open exception" link lands here.
+	let pendingOpenId = $state<string | null>(pageStore.url.searchParams.get('id'));
+
+	// "Record the ERP's payment" — the one-click path for a row holding a
+	// payment the ERP reported and FeohLedger could not record (decisions
+	// §319). Pre-filled from the row's `erp_report` when the dialog opens.
+	let erpMethod = $state<PaymentMethod | ''>('');
+	let erpReference = $state('');
+	let erpPaidOn = $state('');
+	let erpMaxDate = $state(localToday());
+	let recordingErp = $state(false);
+	let erpError = $state('');
 	let bulkResolveOpen = $state(false);                    // bulk-resolve modal
 	let resolutionText = $state('');
 	let saving = $state(false);
 
-	// Badge text sits on a 12%-tint-of-itself background, so the tone must
-	// clear WCAG 1.4.3 (4.5:1) on that tint — #e04040 (3.68) and #8b5cf6
-	// (3.60) fail; their lighter siblings #f06464 (4.76) / #a78bfa (5.27)
-	// pass. Amber #d4940a (5.51) already passes.
+	// Each type names a palette TONE, never a hex: the badge renders the
+	// tone's calibrated `-tint` / `-on-tint` pair, which `tokenPairing.test.ts`
+	// asserts in BOTH themes. These were literal hexes (`#f06464`, …) with a
+	// `1f` alpha suffix concatenated on for the background — a pairing measured
+	// on navy, and 2.5:1 once the page is light (docs/decisions.md §289).
 	// Must cover the backend roster (`services/exception_lifecycle.EXCEPTION_TYPES`);
-	// a missing key falls back to grey, which reads as "unclassified" next to
+	// a missing key falls back to `muted`, which reads as "unclassified" next to
 	// every colour-coded sibling — worst on the types that BLOCK a payment run.
-	// Reuse a tone already in this map rather than introducing one: each was
-	// picked against the contrast rule above.
-	const TYPE_COLORS: Record<string, string> = {
-		duplicate: '#a78bfa',
-		po_mismatch: '#d4940a',
-		fraud_flag: '#f06464',
-		extraction_failed: '#f06464',
-		unverified_vendor: '#d4940a',
-		review_rejected: '#f06464',
-		amount_exceeded: '#f06464',
-		missing_data: '#d4940a',
-		quality_hold: '#f06464',
-		price_variance: '#d4940a',
-		erp_reconciliation: '#f06464',
-		contract_noncompliant: '#f06464',
-		line_total_mismatch: '#f06464',
-		payment_compliance_hold: '#f06464',
+	// Reuse a tone already in this map rather than introducing one.
+	type TypeTone = 'danger' | 'warning' | 'violet' | 'muted';
+	const TYPE_TONES: Record<string, TypeTone> = {
+		duplicate: 'violet',
+		po_mismatch: 'warning',
+		fraud_flag: 'danger',
+		extraction_failed: 'danger',
+		unverified_vendor: 'warning',
+		review_rejected: 'danger',
+		amount_exceeded: 'danger',
+		missing_data: 'warning',
+		quality_hold: 'danger',
+		price_variance: 'warning',
+		erp_reconciliation: 'danger',
+		contract_noncompliant: 'danger',
+		line_total_mismatch: 'danger',
+		payment_compliance_hold: 'danger',
 	};
 
 	// Total over `ExceptionSeverity`, the same pairing `EXCEPTION_STATUS_TONES`
 	// has with its label map: a severity that gains a colour without a label —
 	// a tinted cell printing a raw wire value — is a compile error. It stays
 	// HERE rather than moving next to the label keys because it is the sibling
-	// of `TYPE_COLORS` above, and the contrast reasoning written there governs
+	// of `TYPE_TONES` above, and the contrast reasoning written there governs
 	// both; `#lib/types/` carries vocabularies and tone NAMES
-	// (`EXCEPTION_STATUS_TONES` is `BadgeTone`), not measured hexes.
-	const SEVERITY_COLORS: Record<ExceptionSeverity, string> = {
-		error: '#f06464',
-		warning: '#d4940a',
-		info: '#638cff',
+	// (`EXCEPTION_STATUS_TONES` is `BadgeTone`).
+	const SEVERITY_TONES: Record<ExceptionSeverity, 'danger' | 'warning' | 'accent'> = {
+		error: 'danger',
+		warning: 'warning',
+		info: 'accent',
 	};
 
 	/**
@@ -499,8 +571,14 @@
 			// blanking the rows here would discard what it is about to publish.
 			if (!fetchSequence.isCurrentRequest(token)) return;
 			errored = true;
-			if (!opts.append) exceptions = [];
-			toast(m('exceptions.toast.loadFailed'), 'error');
+			// A failed first page is stated in place, with a Retry (`LoadError`
+			// below); a failed Load more keeps its rows, so only a toast can say so.
+			// The total goes with the rows: left behind, the footer read
+			// "Load more (0 of N)" under the in-place error.
+			if (!opts.append) {
+				exceptions = [];
+				total = 0;
+			} else toast(m('exceptions.toast.loadFailed'), 'error');
 		} finally {
 			// Flags and selection belong to the newest request only: a stale
 			// response used to clear the spinner while the live fetch was still
@@ -556,6 +634,105 @@
 	function openResolve(exc: ExceptionItem) {
 		resolveTarget = exc;
 		resolutionText = '';
+		erpError = '';
+		erpMaxDate = localToday();
+		if (isErpPaidReport(exc.erp_report)) {
+			const prefill = erpPrefill(exc.erp_report, erpMaxDate);
+			erpMethod = prefill.method;
+			erpReference = prefill.reference;
+			erpPaidOn = prefill.paidOn;
+		}
+	}
+
+	// The open dialog rides the URL (`?id=`), like every other piece of view
+	// state here — so opening or closing it rewrites the query string.
+	$effect(() => {
+		void resolveTarget?.id;
+		void pendingOpenId;
+		syncUrl();
+	});
+
+	// Open the dialog a link asked for (`?id=`), once. The row comes from the
+	// detail read, which carries the same verdicts as a list row, so the
+	// dialog offers exactly what the server would accept.
+	$effect(() => {
+		const id = pendingOpenId;
+		if (!id) return;
+		untrack(async () => {
+			try {
+				openResolve(await api.get<ExceptionItem>(`/api/exceptions/${encodeURIComponent(id)}`));
+			} catch {
+				toast(m('exceptions.toast.notFound'), 'error');
+			} finally {
+				pendingOpenId = null;
+			}
+		});
+	});
+
+	/** The ERP's name for the record panel, in the reader's words when the
+	 *  adapter has no product name. */
+	function erpName(exc: ExceptionItem): string {
+		return exc.erp_name ?? m('payments.recordOutside.yourErp');
+	}
+
+	/** A hold an ERP PO sync's re-check no longer finds stays open for a person
+	 *  (decisions §323, amended); this is the line that says why they may now
+	 *  clear it. Null on every other row. */
+	function rematchNote(exc: ExceptionItem): string | null {
+		return poRematchNote(exc.erp_report, erpName(exc), m, (day) => formatDate(day));
+	}
+
+	/** Why the ERP refused a payment write-back, in the reader's words, for the
+	 *  resolve dialog. Null on every other row. */
+	function refusalNote(exc: ExceptionItem): string | null {
+		return erpRefusalNote(exc.erp_report, m);
+	}
+
+	// The ERP's breakdown of the payment, shown only when it spans more than
+	// one rail (one rail is just the method, which the form already shows).
+	const erpParts = $derived<RailPartView[]>(
+		resolveTarget && isErpPaidReport(resolveTarget.erp_report)
+			? erpPaymentParts(resolveTarget.erp_report)
+			: []
+	);
+	const erpShowSplit = $derived(spansSeveralRails(erpParts));
+	// The split is the record over any rail picked: the picker becomes a fact.
+	const erpSplitStands = $derived(erpShowSplit && resolveTarget?.erp_payment_split_stands === true);
+	// The note under the split reads the server's three-state verdict
+	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
+
+	async function commitRecordErpPayment() {
+		const target = resolveTarget;
+		const reference = erpReference.trim();
+		const method = erpMethod;
+		const splitStands = erpSplitStands;
+		if (!target || (!method && !splitStands) || !reference || !erpPaidOn) return;
+		recordingErp = true;
+		erpError = '';
+		try {
+			// No `amount`: the server records the figure the ERP states (reading
+			// the bill again when the row kept none), never one typed here. No
+			// `method` over a split that stands: the server books the split
+			// whatever rail is named, so the audit's `method_stated` stays null
+			// rather than recording a pick nobody made (decisions §413).
+			await api.post(`/api/exceptions/${target.id}/record-erp-payment`, {
+				...(splitStands ? {} : { method }),
+				reference,
+				paid_on: erpPaidOn
+			});
+			toast(
+				m('exceptions.erpPayment.recorded', { invoice: target.invoice_number ?? '—' }),
+				'success'
+			);
+			resolveTarget = null;
+			await Promise.all([loadExceptions(), loadSummary()]);
+		} catch (err) {
+			// In the dialog, beside the form (role="alert"): the coded refusal
+			// names what is still in the way, already in the reader's language.
+			erpError = err instanceof Error ? err.message : m('exceptions.erpPayment.failed');
+		} finally {
+			recordingErp = false;
+		}
 	}
 
 	function openBulkResolve() {
@@ -691,8 +868,11 @@
 
 	let selectableIds = $derived(
 		new Set(
+			// Selectable = some decision is open to the reader on the row (escalate
+			// is refused only by the status and role gates). Bulk resolve still
+			// reports a per-row segregation skip by name.
 			exceptions
-				.filter((e) => e.status === 'open' || e.status === 'escalated')
+				.filter((e) => e.decision_refusals && Object.values(e.decision_refusals).some(isAllowed))
 				.map((e) => e.id)
 		)
 	);
@@ -730,7 +910,7 @@
 			selectedAllMatching = true;
 			if (res.truncated) {
 				toast(
-					m('exceptions.toast.selectAllTruncated', { shown: res.ids.length, total: res.total }),
+					m('exceptions.toast.selectAllTruncated', { shown: formatCount(res.ids.length), total: formatCount(res.total) }),
 					'error'
 				);
 			} else {
@@ -776,17 +956,7 @@
 	};
 
 	function dueLabel(exc: ExceptionItem): string {
-		if (!exc.due_at) return '—';
-		const due = new Date(exc.due_at).getTime();
-		if (Number.isNaN(due)) return '—';
-		const hours = Math.round((due - Date.now()) / 3600000);
-		const fmt = new Intl.RelativeTimeFormat(getActiveFormatLocale(), {
-			numeric: 'always',
-			style: 'short'
-		});
-		return Math.abs(hours) < 24
-			? fmt.format(hours, 'hour')
-			: fmt.format(Math.round(hours / 24), 'day');
+		return formatDueIn(exc.due_at);
 	}
 
 	let COLUMNS = $derived([
@@ -854,8 +1024,9 @@
 	// The type row's "All types" key. `typeFilter` is `null` for "no type", and a
 	// chip key is a string; the empty string cannot collide with a wire type.
 	const ALL_TYPES = '';
-	// "All types" is label-only (no tally), as it always was. Rendered only when
-	// there is at least one type to choose between — `typeChips.length > 1`.
+	// "All types" is label-only (no tally), as it always was. Once the summary
+	// has landed the row renders only when there is at least one type to choose
+	// between — `typeChips.length > 1`; before then it holds its place (template).
 	let typeChips = $derived([
 		{ key: ALL_TYPES, label: m('exceptions.filter.allTypes') },
 		...typeChipEntries.map(([type, count]) => ({ key: type, label: typeLabel(type), count }))
@@ -898,15 +1069,6 @@
 	// finding none read as an all-clear on the whole queue. Only the
 	// unfiltered Open view has earned that sentence — a type or severity chip,
 	// or a search term, falls back to the neutral "No exceptions found."
-	let emptyMessage = $derived(
-		loading
-			? m('common.loading')
-			: errored
-				? m('exceptions.empty.errored')
-				: statusFilter === 'open' && !typeFilter && severityFilter === 'all' && !appliedSearch
-					? m('exceptions.empty.open')
-					: m('exceptions.empty.other')
-	);
 </script>
 
 <PageHeader title={m('exceptions.title')}>
@@ -945,7 +1107,12 @@
 				<HelpTip term="exception" />
 			</div>
 
-			{#if typeChips.length > 1}
+			<!-- Drawn from first paint, holding only "All types" until the summary
+			     says which types exist: gating it on the roster alone inserted the
+			     row ~40px above the search box and the table once the summary
+			     landed, on every visit (tests-e2e/reactivity/layout-stability.spec.ts).
+			     It still goes when a LOADED summary leaves nothing to choose between. -->
+			{#if summary === null || typeChips.length > 1}
 				<!-- `data-testid`: the e2e suite's handle on THIS row, since every
 				     row now renders the same `.filter-chip`. -->
 				<div class="help-row" data-testid="exception-type-filters">
@@ -976,7 +1143,7 @@
 	>
 		{#snippet actions()}
 			{#if allSelected && !selectedAllMatching && total > selectableIds.size}
-				<button class="bulk-action-btn" disabled={selectingAllMatching} onclick={selectAllMatching}>
+				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
 						: m('common.selectAllMatching', { total })}
@@ -984,7 +1151,7 @@
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 			{/if}
-			<button class="bulk-action-btn" onclick={openBulkResolve}>
+			<button type="button" class="btn-primary" onclick={openBulkResolve}>
 				{m('exceptions.bulk.resolve', { n: selectedIds.size })}
 			</button>
 		{/snippet}
@@ -1000,8 +1167,26 @@
 	     right edge. Fixed layout sizes the columns from the header row; the
 	     long single-line values clip with an ellipsis and keep the full text
 	     in `title`. -->
+	{#if errored && exceptions.length === 0 && !loading}
+		<!-- "Could not load exceptions. Try again." used to sit in the empty row
+		     with nothing to try again WITH; the reader had to reload the page. -->
+		<LoadError
+			message={m('exceptions.empty.errored')}
+			onretry={() => loadExceptions()}
+			testId="exceptions-load-error"
+		/>
+	{:else}
 	<div class="exc-table">
-	<DataTable columns={COLUMNS} isEmpty={exceptions.length === 0} empty={emptyMessage} colspan={11} fixed>
+	<DataTable
+		columns={COLUMNS}
+		isEmpty={exceptions.length === 0}
+		{loading}
+		filtered={!(statusFilter === 'open' && !typeFilter && severityFilter === 'all' && !appliedSearch)}
+		emptyFiltered={m('exceptions.empty.other')}
+		empty={m('exceptions.empty.open')}
+		colspan={11}
+		fixed
+	>
 		{#snippet header()}
 			<tr>
 				<!-- This page passes its own `header` snippet, so it owns `scope`
@@ -1068,7 +1253,7 @@
 					<td class="type-cell">
 						<span
 							class="type-badge"
-							style="background:{TYPE_COLORS[exc.exception_type] ?? '#888'}1f;color:{TYPE_COLORS[exc.exception_type] ?? '#888'}"
+							style="background:var(--{TYPE_TONES[exc.exception_type] ?? 'muted'}-tint);color:var(--{TYPE_TONES[exc.exception_type] ?? 'muted'}-on-tint)"
 						>
 							{typeLabel(exc.exception_type, exc.type_label)}
 						</span>
@@ -1086,17 +1271,20 @@
 								<span class="type-detail" title={exceptionDescriptionTitle(desc)}>{desc.summary}</span>
 							{/if}
 						{/if}
+						{#if rematchNote(exc)}
+							<span class="type-detail rematch-note" title={rematchNote(exc)} data-testid="exception-rematch-note">{rematchNote(exc)}</span>
+						{/if}
 					</td>
 					<td>
 						<span
 							class="severity"
-							style="color:{SEVERITY_COLORS[exc.severity as ExceptionSeverity] ?? '#888'}"
+							style="color:var(--{SEVERITY_TONES[exc.severity as ExceptionSeverity] ?? 'text-muted'})"
 						>
 							{severityLabel(exc.severity)}
 						</span>
 					</td>
 					<td class="mono cell-clip" title={exc.invoice_number ?? undefined}>{exc.invoice_number ?? '—'}</td>
-					<td class="muted-cell cell-clip" title={exc.vendor_name ?? undefined}>{exc.vendor_name ?? '—'}</td>
+					<td class="muted-cell vendor-cell">{exc.vendor_name ?? '—'}</td>
 					<td class="mono right">{formatCurrency(exc.amount, exc.currency)}</td>
 					<td class="muted-cell cell-clip" title={exc.assigned_to ?? undefined}>{exc.assigned_to ?? '—'}</td>
 					<!-- The precise instant belongs in `title`, formatted — the raw
@@ -1120,7 +1308,9 @@
 						</Badge>
 					</td>
 					<td class="actions">
-						{#if exc.status === 'open' || exc.status === 'escalated'}
+						<!-- Open the dialog when ANY decision is open to this reader —
+						     escalate stays open to a refused actor, and is their exit. -->
+						{#if exc.decision_refusals && Object.values(exc.decision_refusals).some(isAllowed)}
 							<RowAction onclick={() => openResolve(exc)}>{m('exceptions.row.resolve')}</RowAction>
 						{/if}
 						{#if exc.invoice_id}
@@ -1132,18 +1322,17 @@
 		{/snippet}
 	</DataTable>
 	</div>
-
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={loadMoreExceptions} disabled={loadingMore}>
-				{loadingMore ? m('common.loading') : m('exceptions.loadMore', { shown: exceptions.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('exceptions.showingAll', { total })}</span>
-		</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={exceptions.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		onloadmore={loadMoreExceptions}
+		moreKey="exceptions.loadMore"
+		allKey="exceptions.showingAll"
+	/>
 	</div>
 	{/if}
 </PageHeader>
@@ -1181,6 +1370,102 @@
 				{/if}
 			</div>
 		{/if}
+		{#if rematchNote(resolveTarget)}
+			<p class="modal-hint rematch-note" data-testid="exception-rematch-note-detail">
+				{rematchNote(resolveTarget)}
+			</p>
+		{/if}
+		{#if refusalNote(resolveTarget)}
+			<p class="modal-hint" data-testid="exception-erp-refusal-detail">
+				{refusalNote(resolveTarget)}
+			</p>
+		{/if}
+		{#if isErpPaidReport(resolveTarget.erp_report) && isOffered(resolveTarget.record_erp_payment_refusal)}
+			<!-- The payment the ERP reported, pre-filled, recorded in one step.
+			     Resolving this exception and recording the payment happen in one
+			     transaction server-side, so neither can land without the other. -->
+			<section class="erp-payment" data-testid="erp-payment-panel" aria-labelledby="erp-payment-title">
+				<h3 id="erp-payment-title">
+					{m('exceptions.erpPayment.title', { erp: erpName(resolveTarget) })}
+				</h3>
+				<p class="modal-hint">{m('exceptions.erpPayment.intro')}</p>
+				<!-- The figures to reconcile: what the ERP says was paid, in the code
+				     it stated, beside what the invoice is for, in the invoice's own.
+				     Both rendered, never compared here: the server refuses a record
+				     whose figure or currency differs (decisions §386). -->
+				<dl class="erp-figures" data-testid="erp-payment-figures">
+					<div>
+						<dt>{m('exceptions.erpPayment.reportedAmount', { erp: erpName(resolveTarget) })}</dt>
+						<dd data-testid="erp-payment-reported-amount">
+							{#if resolveTarget.erp_report?.amount}
+								<Money
+									amount={resolveTarget.erp_report.amount}
+									currency={resolveTarget.erp_report.amount_currency ?? null}
+								/>
+							{:else}
+								{m('exceptions.erpPayment.amountNotStated')}
+							{/if}
+						</dd>
+					</div>
+					<div>
+						<dt>{m('exceptions.erpPayment.invoiceAmount')}</dt>
+						<dd data-testid="erp-payment-invoice-amount">
+							<Money amount={resolveTarget.amount} currency={resolveTarget.currency} />
+						</dd>
+					</div>
+				</dl>
+				{#if erpShowSplit}
+					<ErpPaymentSplit
+						parts={erpParts}
+						currency={resolveTarget.erp_report?.amount_currency ?? null}
+						erp={erpName(resolveTarget)}
+						stands={resolveTarget.erp_payment_split_stands}
+						idPrefix="erp-payment"
+						testid="erp-payment"
+					/>
+				{/if}
+				<form
+					data-testid="erp-payment-form"
+					onsubmit={(e) => { e.preventDefault(); commitRecordErpPayment(); }}
+				>
+					<RecordPaymentFields
+						bind:method={erpMethod}
+						bind:reference={erpReference}
+						bind:paidOn={erpPaidOn}
+						maxDate={erpMaxDate}
+						idPrefix="erp-payment"
+						testid="erp-payment"
+						methodFixed={erpSplitStands ? m('exceptions.erpPayment.splitMethod') : null}
+					/>
+					{#if erpError}
+						<p class="modal-error" role="alert" data-testid="erp-payment-error">{erpError}</p>
+					{/if}
+					<div class="modal-footer">
+						<button
+							type="submit"
+							class="btn-primary"
+							data-testid="erp-payment-submit"
+							aria-describedby={resolveTarget.record_erp_payment_refusal
+								? 'erp-payment-refusal'
+								: undefined}
+							disabled={recordingErp ||
+								!isAllowed(resolveTarget.record_erp_payment_refusal) ||
+								(!erpMethod && !erpSplitStands) ||
+								!erpReference.trim() ||
+								!erpPaidOn ||
+								erpPaidOn > erpMaxDate}
+						>
+							{recordingErp ? m('exceptions.erpPayment.recording') : m('exceptions.erpPayment.record')}
+						</button>
+					</div>
+					{#if resolveTarget.record_erp_payment_refusal}
+						<p class="modal-hint" id="erp-payment-refusal" data-testid="erp-payment-refusal">
+							{refusalText(resolveTarget.record_erp_payment_refusal, m)}
+						</p>
+					{/if}
+				</form>
+			</section>
+		{/if}
 		<!-- `data-testid` is the e2e suite's handle on this dialog, so a spec
 		     never has to name it by its accessible name — which is translated. -->
 		<form
@@ -1197,6 +1482,15 @@
 					autofocus
 				/>
 			</label>
+			{#if decisionRefused}
+				<!-- Why Resolve / Dismiss are disabled, in the server's words: a
+				     colleague must clear this one; escalating it is still open. -->
+				<RefusalNote
+					id="exception-decision-refusal"
+					testid="exception-decision-refusal"
+					reason={refusalText(resolveTarget.decision_refusals?.resolve ?? null, m)}
+				/>
+			{/if}
 			<div class="modal-footer">
 				<button type="button" class="btn-cancel" onclick={() => (resolveTarget = null)}>
 					{m('common.cancel')}
@@ -1204,20 +1498,33 @@
 				<button
 					type="button"
 					class="btn-secondary"
-					disabled={saving}
+					disabled={saving || !isAllowed(resolveTarget.decision_refusals?.dismiss)}
+					aria-describedby={decisionRefused &&
+					!isAllowed(resolveTarget.decision_refusals?.dismiss)
+						? 'exception-decision-refusal'
+						: null}
 					onclick={() => commitResolve('dismiss')}
 				>
 					{m('exceptions.resolveModal.dismiss')}
 				</button>
 				<button
 					type="button"
-					class="btn-warning"
-					disabled={saving || !resolutionText.trim()}
+					class="btn-secondary"
+					disabled={saving ||
+						!resolutionText.trim() ||
+						!isAllowed(resolveTarget.decision_refusals?.escalate)}
 					onclick={() => commitResolve('escalate')}
 				>
 					{m('exceptions.resolveModal.escalate')}
 				</button>
-				<button type="submit" class="btn-primary" disabled={saving || !resolutionText.trim()}>
+				<button
+					type="submit"
+					class="btn-primary"
+					disabled={saving ||
+						!resolutionText.trim() ||
+						!isAllowed(resolveTarget.decision_refusals?.resolve)}
+					aria-describedby={decisionRefused ? 'exception-decision-refusal' : null}
+				>
 					{saving ? m('common.saving') : m('exceptions.resolveModal.resolve')}
 				</button>
 			</div>
@@ -1264,7 +1571,7 @@
 			</button>
 			<button
 				type="button"
-				class="btn-warning"
+				class="btn-secondary"
 				disabled={saving || !resolutionText.trim()}
 				onclick={() => commitBulkResolve('escalate')}
 			>
@@ -1308,30 +1615,6 @@
 		margin: 0;
 	}
 
-	/* --- Bulk-bar action --- */
-
-	.bulk-action-btn {
-		padding: 6px 14px;
-		border-radius: 4px;
-		border: 1px solid var(--accent-strong);
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.bulk-action-btn:hover {
-		filter: brightness(1.1);
-	}
-
-	.bulk-action-btn:disabled {
-		opacity: 0.6;
-		cursor: default;
-		filter: none;
-	}
-
 	.bulk-all-matching-note {
 		font-size: 0.85rem;
 		color: var(--text-muted);
@@ -1345,16 +1628,20 @@
 	   4.5:1 contrast floor. The resolved/dismissed status badge carries the
 	   state signal. */
 	tbody tr.resolved td {
-		background: rgba(138, 143, 160, 0.05);
+		background: color-mix(in srgb, var(--text-muted) 5%, transparent);
 	}
 
 	/* --- Queue table column widths ---
 	   `DataTable fixed`: the columns are sized from these header widths, never
 	   from the longest value in some row. The predictable columns are sized to
 	   their widest content in the six locales (fr "AVERTISSEMENT", a
-	   seven-figure amount, "Résoudre" + "Facture"). Invoice and Vendor take a
-	   share of the width, so they gain room on a wide window; Type carries no
-	   width and takes the rest — it is the column with the most to say.
+	   seven-figure amount, "Résoudre" + "Facture"; es "RESPONSABLE" and
+	   "ANTIGÜEDAD", pt-BR "VENCIMENTO" with the sort arrow; the badge ja
+	   "エスカレーション済み"). Invoice clips with its full number in `title`.
+	   Vendor and Type carry no width and share the rest, so both gain room on
+	   a wide window (a fixed Vendor squeezed Type to ~106px at 1666px); a long
+	   vendor name wraps rather than clipping, so all of it is on screen for a
+	   keyboard or touch reader, not only in a hover `title`.
 
 	   Eleven columns is one more than any other list here, so this table runs
 	   10px of horizontal cell padding instead of the global 14px: that 88px is
@@ -1379,13 +1666,12 @@
 	}
 	.exc-table :global(th.checkbox-col) { width: 40px; }
 	.exc-table :global(th.col-sev) { width: 116px; }
-	.exc-table :global(th.col-invoice) { width: 10%; }
-	.exc-table :global(th.col-vendor) { width: 11%; }
+	.exc-table :global(th.col-invoice) { width: 110px; }
 	.exc-table :global(th.col-amount) { width: 132px; }
-	.exc-table :global(th.col-assignee) { width: 116px; }
-	.exc-table :global(th.col-age) { width: 104px; }
-	.exc-table :global(th.col-due) { width: 100px; }
-	.exc-table :global(th.col-status) { width: 120px; }
+	.exc-table :global(th.col-assignee) { width: 130px; }
+	.exc-table :global(th.col-age) { width: 130px; }
+	.exc-table :global(th.col-due) { width: 130px; }
+	.exc-table :global(th.col-status) { width: 170px; }
 	.exc-table :global(th.actions-col) { width: 184px; }
 
 	/* A status longer than its column (ja "エスカレーション済み") wraps inside
@@ -1399,13 +1685,20 @@
 		padding-right: 0;
 	}
 
-	/* One line, clipped to the column: an ERP invoice number, a long vendor
-	   name or an email assignee ends in "…" (full value in `title`) instead of
-	   widening the table or running under the next column. */
+	/* One line, clipped to the column: an ERP invoice number or an email
+	   assignee ends in "…" (full value in `title`) instead of widening the
+	   table or running under the next column. */
 	.cell-clip {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	/* Vendor names wrap (the /vendors `.vendor-name` arrangement); one
+	   unbroken run still breaks inside the column. */
+	.vendor-cell {
+		white-space: normal;
+		overflow-wrap: anywhere;
 	}
 
 	.muted-cell {
@@ -1475,6 +1768,55 @@
 		margin: 0;
 	}
 
+	/* The ERP-reported payment, recorded from the dialog (decisions §319). */
+	.erp-payment {
+		margin: 0 0 16px;
+		padding: 12px;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+	}
+
+	.erp-payment h3 {
+		margin: 0 0 6px;
+		font-size: 0.9rem;
+	}
+
+	.erp-payment form {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.erp-figures {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+		gap: 8px 16px;
+		margin: 0 0 12px;
+	}
+
+	.erp-figures dt {
+		margin: 0 0 2px;
+		font-size: 0.78rem;
+		font-weight: 500;
+		color: var(--text-muted);
+	}
+
+	.erp-figures dd {
+		margin: 0;
+		font-size: 0.9rem;
+		color: var(--text);
+	}
+
+	.modal-error {
+		margin: 0;
+		padding: 8px 10px;
+		border: 1px solid var(--danger);
+		border-radius: 6px;
+		background: var(--danger-tint);
+		color: var(--text);
+		font-size: 0.82rem;
+	}
+
 	.modal-description ul {
 		margin: 6px 0 0;
 		padding-left: 18px;
@@ -1483,43 +1825,6 @@
 	.modal input:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
-	}
-
-	.btn-secondary {
-		padding: 8px 14px;
-		border-radius: 4px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.btn-secondary:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.btn-warning {
-		padding: 8px 14px;
-		border-radius: 4px;
-		border: 1px solid #d4940a;
-		background: var(--surface);
-		color: #d4940a;
-		font-size: 0.85rem;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.btn-warning:hover:not(:disabled) {
-		background: rgba(212, 148, 10, 0.1);
-	}
-
-	.btn-secondary:disabled,
-	.btn-warning:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 </style>

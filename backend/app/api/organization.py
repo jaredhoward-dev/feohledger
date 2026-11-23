@@ -15,6 +15,7 @@ from app.api.deps import (
     require_entitlement,
     require_roles,
 )
+from app.api.refusals import coded_refusal, credential_block_unopenable_detail
 from app.config import settings
 from app.database import get_control_db
 from app.models.organization import Organization
@@ -28,6 +29,7 @@ from app.schemas.organization import (
     UpdateOrganizationRequest,
 )
 from app.services.audit_dispatch import dispatch_auth_audit, record_auth_audit_or_raise
+from app.services.billing.entitlements import live_plan_codes
 from app.services.billing.plan_catalog import FEATURE_SCIM
 from app.services.credential_crypto import CredentialCryptoError
 from app.services.currency_conversion import resolve_reporting_currency
@@ -43,14 +45,19 @@ from app.services.org_settings_view import settings_for_response
 from app.services.provider_credentials import (
     CREDENTIAL_BLOCKS,
     CREDENTIALS_UNAVAILABLE_DETAIL,
+    SECRET_FIELDS,
+    StoredCredentialUnopenableError,
     config_for_connection_test,
     credential_status,
     extract_secrets,
+    extraction_secrets_to_drop,
+    rail_secrets_to_drop,
     strip_secrets,
     update_secrets,
 )
 from app.services.sso import generate_scim_token
 from app.tenant import get_tenant, lock_organization, normalize_custom_domain
+from app.utils.currency_code import iso_currency_or_none
 from app.utils.tenant_urls import is_under_platform_domain
 
 logger = logging.getLogger(__name__)
@@ -101,7 +108,7 @@ def _is_admin(user: User) -> bool:
     return ROLE_ADMIN in {r.name for r in (user.roles or [])}
 
 
-def _org_response(org: Organization, *, is_admin: bool) -> OrganizationResponse:
+def _org_response(org: Organization, *, is_admin: bool, plan: str) -> OrganizationResponse:
     """Serialize the org, projecting `settings` to what this caller may see.
 
     `is_admin` is REQUIRED, not defaulted: this response carries the tenant's
@@ -134,7 +141,9 @@ def _org_response(org: Organization, *, is_admin: bool) -> OrganizationResponse:
         id=str(org.id),
         name=org.name,
         slug=org.slug,
-        plan=org.plan,
+        # The live subscription's plan code (`entitlements.live_plan_codes`),
+        # not the legacy `Organization.plan` string no plan change updates.
+        plan=plan,
         settings=raw,
         created_at=org.created_at.isoformat() if org.created_at else "",
         # Computed from the RAW settings, not `raw` above: the three rungs it
@@ -151,6 +160,7 @@ def _org_response(org: Organization, *, is_admin: bool) -> OrganizationResponse:
 async def get_organization(
     org: Organization = Depends(get_tenant),
     user: User = Depends(get_current_user),
+    control_db: AsyncSession = Depends(get_control_db),
 ):
     """Return the org + the settings this caller's role may read.
 
@@ -168,7 +178,8 @@ async def get_organization(
     three-rung resolution stays only as a fallback for an older cached
     response.
     """
-    return _org_response(org, is_admin=_is_admin(user))
+    plan = (await live_plan_codes(control_db, [org.id]))[org.id]
+    return _org_response(org, is_admin=_is_admin(user), plan=plan)
 
 
 @router.get("/fraud-rules/defaults")
@@ -183,6 +194,11 @@ async def get_fraud_rule_defaults(
     return DEFAULT_FRAUD_RULES
 
 
+#: `PATCH /api/organization` with a `payments.home_currency` that is not a
+#: three-letter code (decisions §473, amended).
+HOME_CURRENCY_SETTING_INVALID = "organization_home_currency_invalid"
+
+
 def _validate_settings_patch(incoming: dict) -> None:
     """Reject the specific type-confusion holes a careless PATCH can sneak
     through for the well-known settings sub-keys this endpoint understands.
@@ -194,10 +210,15 @@ def _validate_settings_patch(incoming: dict) -> None:
     otherwise persist silently and corrupt a value every other reader assumes
     is well-typed:
 
-    * `invoice_defaults.currency` — must be a 3-letter alpha string (ISO-4217
-      shape). Every currency formatter downstream (`<Money>`, the reporting
-      rollups) assumes this; a stray int or a 2-char typo would corrupt every
+    * `invoice_defaults.currency` — must be three ASCII letters (the shared
+      ISO 4217 shape rule, `utils/currency_code`); it is uppercased in place.
+      Every currency formatter downstream (`<Money>`, the reporting rollups)
+      assumes this; a stray int or a 2-char typo would corrupt every
       invoice created under the default from then on.
+    * `payments.home_currency` — three ASCII letters, uppercased in place, or
+      blank / null for unset; anything else is the coded 422
+      `organization_home_currency_invalid` (a malformed value refuses every
+      payment, decisions §473).
     * `payments.cfo_approval_above` — must be numeric (int/float, not `bool`
       — `bool` is a `int` subclass in Python and would otherwise sneak past a
       bare `isinstance(x, (int, float))` check) when present. It gates the
@@ -210,17 +231,15 @@ def _validate_settings_patch(incoming: dict) -> None:
     """
     invoice_defaults = incoming.get("invoice_defaults")
     if isinstance(invoice_defaults, dict) and "currency" in invoice_defaults:
-        currency = invoice_defaults["currency"]
-        if (
-            not isinstance(currency, str)
-            or len(currency) != 3
-            or not currency.isascii()
-            or not currency.isalpha()
-        ):
+        # The one shape rule (decisions §381), stored uppercased: a lowercase
+        # default used to pass and stamp every new invoice in lowercase.
+        currency = iso_currency_or_none(invoice_defaults["currency"])
+        if currency is None:
             raise HTTPException(
                 status_code=422,
                 detail="invoice_defaults.currency must be a 3-letter currency code (e.g. 'USD').",
             )
+        invoice_defaults["currency"] = currency
 
     payments_cfg = incoming.get("payments")
     if isinstance(payments_cfg, dict) and "mode" in payments_cfg:
@@ -246,6 +265,27 @@ def _validate_settings_patch(incoming: dict) -> None:
                 status_code=422,
                 detail=f"payments.nacha has invalid fields: {', '.join(problems)}.",
             )
+    if isinstance(payments_cfg, dict) and "home_currency" in payments_cfg:
+        # Read by the payment path for the FX leg and every compliance
+        # threshold. A malformed value used to read as USD silently; it now
+        # refuses payment (decisions §473, amended), so it is refused here, on
+        # write, where the admin can see it. Blank or null means "unset" (the
+        # platform default applies) and is stored as null.
+        raw_home = payments_cfg["home_currency"]
+        if raw_home is None or (isinstance(raw_home, str) and not raw_home.strip()):
+            payments_cfg["home_currency"] = None
+        else:
+            home = iso_currency_or_none(raw_home)
+            if home is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=coded_refusal(
+                        HOME_CURRENCY_SETTING_INVALID,
+                        "The home currency must be a three-letter currency code such as "
+                        "USD or EUR.",
+                    ),
+                )
+            payments_cfg["home_currency"] = home
     if isinstance(payments_cfg, dict) and "cfo_approval_above" in payments_cfg:
         threshold = payments_cfg["cfo_approval_above"]
         if threshold is not None and (
@@ -282,6 +322,32 @@ def _changed_key_names(before: object, after: object) -> list[str]:
     return sorted(k for k in set(b) | set(a) if b.get(k) != a.get(k))
 
 
+def _stamp_erp_configured_at(stored: object, merged: dict) -> dict:
+    """``merged`` with ``configured_at`` set by the server, never by the save.
+
+    Stamped now when the save names a different ERP, destination
+    (``catalog.same_connection``, the condition the sealed secrets follow) or
+    link realm (``erp_link_realm.connection_realm``); otherwise the stored
+    stamp is kept. A directly configured ERP (NetSuite, Business Central,
+    Intacct, SYSPRO) has no OAuth ``connected_at``, so this is the moment the
+    auto-send recovery sweep fences on: an approval before it was made against
+    another ERP, or none, and is never pushed as "recovered" (decisions §428).
+    """
+    from datetime import UTC, datetime
+
+    from app.services.erp_link_realm import connection_realm
+
+    key = erp_catalog.CONFIGURED_AT_KEY
+    out = {k: v for k, v in merged.items() if k != key}
+    if not erp_catalog.same_connection(stored, out) or connection_realm(stored) != connection_realm(
+        out
+    ):
+        out[key] = datetime.now(UTC).isoformat()
+    elif isinstance(stored, dict) and isinstance(stored.get(key), str):
+        out[key] = stored[key]
+    return out
+
+
 @router.patch("", response_model=OrganizationResponse)
 async def update_organization(
     body: UpdateOrganizationRequest,
@@ -296,9 +362,37 @@ async def update_organization(
     if body.name is not None:
         org.name = body.name
     credential_changes: dict[str, list[str]] = {}
-    erp_secrets_to_drop: frozenset[str] = frozenset()
+    nacha_changes: dict[str, list[str]] = {}
+    # Sealed secrets a save leaves pointing somewhere new, per block, with the
+    # audited reason: dropped below, in this transaction.
+    secret_drops: dict[str, tuple[frozenset[str], str]] = {}
 
     if body.settings is not None:
+        # The NACHA offset account number reads back masked, so a re-save of
+        # the payments block sends it blank (or as the mask): keep the stored
+        # number rather than validate the blank and refuse (decisions §432).
+        incoming_payments = body.settings.get("payments")
+        if isinstance(incoming_payments, dict) and "nacha" in incoming_payments:
+            from app.services.nacha import OffsetAccountReentryRequired, carry_offset_account
+
+            stored_payments = (org.settings or {}).get("payments")
+            try:
+                carried = carry_offset_account(
+                    incoming_payments.get("nacha"),
+                    stored_payments.get("nacha") if isinstance(stored_payments, dict) else None,
+                )
+            except OffsetAccountReentryRequired as exc:
+                # The stored number belongs to the old bank or account type:
+                # never carried onto a new one (§432, round-13 amendment).
+                # Field name only: the number is never echoed.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"payments.nacha.{exc.field} must be re-entered: "
+                        "offset_routing or offset_account_type changed."
+                    ),
+                ) from None
+            body.settings["payments"] = {**incoming_payments, "nacha": carried}
         _validate_settings_patch(body.settings)
 
         # Saving a LIVE ERP adapter is plan-gated, and one routed through
@@ -323,7 +417,9 @@ async def update_organization(
             # silently and report the save as a success.
             _refuse_credentials_in_patch("erp", incoming_erp)
             if isinstance(incoming_erp, dict):
-                body.settings["erp"] = erp_catalog.merge_erp_update(erp_before, incoming_erp)
+                body.settings["erp"] = _stamp_erp_configured_at(
+                    erp_before, erp_catalog.merge_erp_update(erp_before, incoming_erp)
+                )
             else:
                 # Clearing the ERP still keeps the OAuth block: only the OAuth
                 # disconnect removes it (it revokes at the provider first).
@@ -332,7 +428,36 @@ async def update_organization(
                     kept[erp_catalog.OAUTH_KEY] = erp_before[erp_catalog.OAUTH_KEY]
                 body.settings["erp"] = kept or None
             await ensure_live_erp_entitled(db, org.id, body.settings.get("erp"))
-            erp_secrets_to_drop = erp_catalog.secrets_to_drop(erp_before, body.settings["erp"])
+            # Same connection: only a switched-off sign-in method's secrets go.
+            secret_drops["erp"] = (
+                erp_catalog.secrets_to_drop(erp_before, body.settings["erp"]),
+                "erp_sign_in_method_changed"
+                if erp_catalog.same_connection(erp_before, body.settings["erp"])
+                else "erp_destination_changed",
+            )
+        # A BYOK extraction key belongs to the provider it was typed for:
+        # `claude_vision` and `openai_vision` share the `api_key` slot, so a
+        # save that switches provider drops it rather than send one vendor's
+        # secret to the other (`provider_credentials.extraction_secrets_to_drop`).
+        if "extraction" in body.settings and extraction_secrets_to_drop(
+            (org.settings or {}).get("extraction"), body.settings["extraction"]
+        ):
+            secret_drops["extraction"] = (
+                SECRET_FIELDS["extraction"],
+                "extraction_provider_changed",
+            )
+        # A payment-rail or card-issuer key belongs to the provider and the
+        # environment it was typed for: a save that changes either (or removes
+        # a multi-route entry) drops the stranded secrets rather than send them
+        # to the new host (`provider_credentials.rail_secrets_to_drop`).
+        for rail in ("payments", "cards"):
+            if rail not in body.settings:
+                continue
+            rail_drop = rail_secrets_to_drop(
+                rail, (org.settings or {}).get(rail), body.settings[rail]
+            )
+            if rail_drop:
+                secret_drops[rail] = (rail_drop, f"{rail}_provider_changed")
 
         # The chat webhook URL has one sanctioned writer — the audited
         # `PUT /api/organization/chat-notifications/webhook`. This generic merge
@@ -444,9 +569,19 @@ async def update_organization(
                 continue
             _refuse_credentials_in_patch(block, incoming_settings[block])
             incoming_settings[block] = strip_secrets(block, incoming_settings[block])
-            changed = _changed_key_names((org.settings or {}).get(block), incoming_settings[block])
+            before_block = (org.settings or {}).get(block)
+            changed = _changed_key_names(before_block, incoming_settings[block])
             if changed:
                 credential_changes[block] = changed
+            if block == "payments" and "nacha" in changed:
+                # The NACHA block holds the originator and the offset account
+                # (banking data): name which of its keys moved, never a value.
+                nacha_changes[block] = _changed_key_names(
+                    before_block.get("nacha") if isinstance(before_block, dict) else None,
+                    incoming_settings[block].get("nacha")
+                    if isinstance(incoming_settings[block], dict)
+                    else None,
+                )
 
         # Merge incoming keys into existing settings (don't replace the whole dict)
         existing = dict(org.settings or {})
@@ -486,7 +621,11 @@ async def update_organization(
                 action="organization.provider_config_updated",
                 entity_type="organization",
                 entity_id=org.id,
-                details={"block": block, "changed": changed},
+                details={
+                    "block": block,
+                    "changed": changed,
+                    **({"nacha_changed": nacha_changes[block]} if block in nacha_changes else {}),
+                },
             )
         except Exception:
             await db.rollback()
@@ -494,17 +633,20 @@ async def update_organization(
                 status_code=503,
                 detail="The change could not be recorded in the audit trail, so it was not saved.",
             ) from None
-    # A save that points the ERP block at a different ERP or destination drops
-    # the sealed secrets that belonged to the old one, through the same audited
-    # writer the credentials endpoint uses: audit row first, sealed-store write
-    # second, both in this transaction. Only names actually stored are touched,
-    # so a save that drops nothing never opens the store.
-    if erp_secrets_to_drop:
-        stored_names = set((await credential_status(db, org.id))["erp"])
-        to_clear = sorted(stored_names & erp_secrets_to_drop)
+    # A save that points the ERP block at a different ERP or destination (or
+    # the extraction, payments or cards block at a different provider) drops the sealed secrets
+    # that belonged to the old one, through the same audited writer the
+    # credentials endpoint uses: audit row first, sealed-store write second,
+    # all in this transaction. Only names actually stored are touched, so a
+    # save that drops nothing never opens the store.
+    stored_status = await credential_status(db, org.id) if secret_drops else {}
+    for drop_block, (drop_names, drop_reason) in secret_drops.items():
+        to_clear = sorted(set(stored_status.get(drop_block, [])) & drop_names)
         if to_clear:
 
-            async def _audit_drop(changed: list[str]) -> None:
+            async def _audit_drop(
+                changed: list[str], block: str = drop_block, reason: str = drop_reason
+            ) -> None:
                 try:
                     await record_auth_audit_or_raise(
                         organization_id=org.id,
@@ -513,10 +655,10 @@ async def update_organization(
                         entity_type="organization",
                         entity_id=org.id,
                         details={
-                            "block": "erp",
+                            "block": block,
                             "changed": changed,
                             "cleared": changed,
-                            "reason": "erp_destination_changed",
+                            "reason": reason,
                         },
                     )
                 except Exception:
@@ -529,7 +671,12 @@ async def update_organization(
                     ) from None
 
             try:
-                await update_secrets(db, org.id, "erp", {}, to_clear, before_write=_audit_drop)
+                await update_secrets(db, org.id, drop_block, {}, to_clear, before_write=_audit_drop)
+            except StoredCredentialUnopenableError:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=503, detail=credential_block_unopenable_detail(drop_block)
+                ) from None
             except CredentialCryptoError:
                 await db.rollback()
                 raise HTTPException(
@@ -541,7 +688,8 @@ async def update_organization(
                 raise
     await db.commit()
     # Admin-only endpoint, so the response is the admin projection.
-    return _org_response(org, is_admin=True)
+    plan = (await live_plan_codes(db, [org.id]))[org.id]
+    return _org_response(org, is_admin=True, plan=plan)
 
 
 def _residency_response(org: Organization, region: str) -> DataResidencyResponse:
@@ -948,6 +1096,16 @@ async def test_erp_connection(
     A live adapter is plan-gated like a save (``ensure_live_erp_entitled``,
     decisions §258 / §281) — a test reaches the real ERP with the tenant's
     credentials, and a Merge.dev one is a Merge connection. ``mock`` stays open.
+
+    Works the same for an OAuth ERP: the form's body names the saved provider,
+    so ``config_for_connection_test`` completes it with the saved ``oauth``
+    block and the stored tokens, and the adapter calls the ERP with them.
+
+    The answer is coded — ``code`` is ``connected`` / ``connection_failed`` /
+    ``credentials_unavailable`` / ``unknown_adapter``, with the ERP's catalogue
+    key as ``provider`` (or the bad key as ``adapter``) — so the panel states it
+    in the reader's language with the ERP's display name; ``message`` is the
+    English fallback for a client that does not know the code.
     """
     # Stored secrets join the test only while the form names the saved ERP at
     # the saved destination (`provider_credentials.config_for_connection_test`).
@@ -958,7 +1116,11 @@ async def test_erp_connection(
     except CredentialCryptoError:
         # The sealed credentials could not be opened (KMS unreachable, a bad
         # envelope). Say so; name no value, and never test without them.
-        return {"success": False, "message": CREDENTIALS_UNAVAILABLE_DETAIL}
+        return {
+            "success": False,
+            "code": "credentials_unavailable",
+            "message": CREDENTIALS_UNAVAILABLE_DETAIL,
+        }
     if not erp_config:
         raise HTTPException(status_code=400, detail="No ERP configuration provided")
     await ensure_live_erp_entitled(db, org.id, erp_config)
@@ -974,24 +1136,34 @@ async def test_erp_connection(
         # <typo> successfully". Name the bad value; echo no credential.
         return {
             "success": False,
+            "code": "unknown_adapter",
+            "adapter": exc.adapter_key,
             "message": (
                 f"'{exc.adapter_key}' is not a supported ERP adapter. "
                 "Pick one from the ERP list and re-test."
             ),
         }
 
+    provider = str(erp_config.get("type") or "")
+    failed = {
+        "success": False,
+        "code": "connection_failed",
+        "provider": provider,
+        "message": "Connection failed — check your credentials",
+    }
     try:
         success = await adapter.test_connection()
-        if success:
-            return {
-                "success": True,
-                "message": f"Connected to {erp_config.get('type', 'ERP')} successfully",
-            }
-        else:
-            return {"success": False, "message": "Connection failed — check your credentials"}
     except Exception:
         logger.exception("ERP test_connection failed")
-        return {"success": False, "message": "Connection failed — check your credentials"}
+        return failed
+    if not success:
+        return failed
+    return {
+        "success": True,
+        "code": "connected",
+        "provider": provider,
+        "message": f"Connected to {provider or 'ERP'} successfully",
+    }
 
 
 @router.post("/sso/scim-token", response_model=SCIMTokenResponse)
@@ -1114,11 +1286,26 @@ async def test_extraction_connection(
     request: dict | None = None,
     org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    db: AsyncSession = Depends(get_control_db),
 ):
-    """Test the AI extraction provider connection. Uses request body config if provided."""
-    config = (
-        request if request and request.get("provider") else (org.settings or {}).get("extraction")
-    )
+    """Test the AI extraction provider connection.
+
+    Uses the request body (the form, possibly unsaved) when it names a
+    provider, otherwise the saved block. The BYOK key is sealed and write-only:
+    the stored one joins a request body only when it names the saved provider
+    (`provider_credentials.config_for_connection_test`), so the form can test a
+    saved key with its field left blank but cannot send it to another provider.
+    """
+    try:
+        config = await config_for_connection_test(
+            org, "extraction", request if request and request.get("provider") else None, db=db
+        )
+    except CredentialCryptoError:
+        return {
+            "success": False,
+            "code": "credentials_unavailable",
+            "message": CREDENTIALS_UNAVAILABLE_DETAIL,
+        }
     if not config:
         raise HTTPException(status_code=400, detail="No extraction configuration provided")
 

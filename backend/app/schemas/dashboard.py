@@ -19,7 +19,9 @@ from app.schemas.money import MoneyAmount
 
 
 class ReportingByCurrency(BaseModel):
-    currency: str
+    #: ``None`` groups the invoices that record no currency, every one of them
+    #: counted in ``unconverted_count`` (decisions §473).
+    currency: str | None
     original_amount: MoneyAmount
     reporting_amount: MoneyAmount
     count: int
@@ -61,7 +63,7 @@ class ReportingAgingBuckets(AgingBuckets):
     face-value cross-currency sum in its entirety, so "N rows could not be
     converted" would understate it, while these bands are converted apart from
     the rows this counts. One count for the band set rather than five — see
-    `api/dashboard.py` for why.
+    `services/dashboard_metrics.aging` for why.
     """
 
     unconverted_count: int = 0
@@ -90,6 +92,19 @@ class UpcomingPayment(BaseModel):
     currency: str | None
     due_date: str | None
     is_overdue: bool
+
+
+class DueByCurrency(BaseModel):
+    """One currency's share of `overdue_total` / `due_soon_total`.
+
+    `amount` is the FACE sum of those invoices in `currency`, never converted.
+    `currency` is null for invoices that record no code: a client renders that
+    figure without a symbol rather than substituting one.
+    """
+
+    currency: str | None
+    amount: MoneyAmount
+    count: int
 
 
 class ProcessingTimeMetrics(BaseModel):
@@ -144,14 +159,42 @@ class DiscountCapture(BaseModel):
     insufficient_data: bool
 
 
+class OnboardingProgress(BaseModel):
+    """First-run setup facts, each derived on read from data another feature
+    owns — never a stored tick. Field meanings: `app/services/onboarding.py`
+    (`docs/decisions.md` §315)."""
+
+    company: bool
+    users: bool
+    security: bool
+    erp: bool
+    vendors: bool
+    workflow: bool
+    email_intake: bool
+
+
+class OnboardingResponse(OnboardingProgress):
+    """`GET /api/dashboard/onboarding` — the progress plus the one fact that
+    retires the dashboard checklist."""
+
+    organization_has_invoices: bool
+
+
 class DashboardResponse(BaseModel):
     total_invoices: int
+    #: Whether the ORGANIZATION has any invoice, ignoring the selected entity.
+    #: `total_invoices` is entity-scoped, so it cannot tell a brand-new
+    #: workspace from a brand-new subsidiary of an established one.
+    organization_has_invoices: bool
+    #: Setup progress — present only for an admin on a workspace with no
+    #: invoices, `null` otherwise.
+    onboarding: OnboardingProgress | None = None
     total_amount: MoneyAmount
     reporting: ReportingRollup
     total_paid: MoneyAmount
     total_pending: MoneyAmount
     # Reporting-currency counterparts of `total_paid` / `total_pending` — see
-    # `app/api/dashboard.py`'s `payment_reporting_amount_sql` comment.
+    # `services/dashboard_metrics.payment_totals`.
     total_paid_reporting: MoneyAmount
     total_pending_reporting: MoneyAmount
     total_paid_unconverted_count: int
@@ -176,6 +219,16 @@ class DashboardResponse(BaseModel):
     upcoming_total_amount: MoneyAmount
     upcoming_total_amount_reporting: MoneyAmount
     upcoming_unconverted_count: int
+    #: Open AP (approved and still owed, plus the in-review pipeline) whose
+    #: effective due date — latest payment schedule, else the invoice's own —
+    #: is before today. Counted in SQL over the whole book by
+    #: `services/open_ap_due`, the predicate the /cfo overdue card reads too;
+    #: never derived from `upcoming_payments`, which is capped at ten rows.
+    overdue_count: int = 0
+    overdue_total: list[DueByCurrency] = []
+    #: The same population, due today through seven days out.
+    due_soon_count: int = 0
+    due_soon_total: list[DueByCurrency] = []
     processing_time: ProcessingTimeMetrics
     approval_bottleneck: list[ApprovalBottleneckEntry]
     discount_capture: DiscountCapture

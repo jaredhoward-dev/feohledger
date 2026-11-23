@@ -25,7 +25,7 @@ product name, logo, and accent colors. Shipped so far:
 |-------|-----------|--------|
 | `product_name` | `settings.brand.product_name` | Sidebar product name + document `<title>`. Fallback: **"FeohLedger"**. |
 | `logo_url` | `settings.brand.logo_url` | Sidebar logo `<img>`, and the mark in PDF and email headers. Fallback: the FeohLedger mark while the product keeps the platform name, otherwise a monogram of `product_name` in the app and the product name alone on PDFs and emails (see **The fallback mark** below). |
-| `accent_color` | `settings.brand.accent_color` | Overrides the `--accent` CSS token (borders, focus rings, accent text). |
+| `accent_color` | `settings.brand.accent_color` | Overrides the `--accent` CSS token (borders, focus rings, accent text), once per theme: shown as itself where it reads as text, as a darker (Light) or lighter (Dark) shade of it where it does not (see **The accent as text, per theme** below). |
 | `accent_strong_color` | `settings.brand.accent_strong_color` | Overrides the `--accent-strong` token (text-bearing accent backgrounds — buttons, active chips). |
 | `support_url` | `settings.brand.support_url` | Reserved for support links (exposed via the brand store). |
 | `legal_url` | `settings.brand.legal_url` | Reserved for legal/terms links (exposed via the brand store). |
@@ -62,6 +62,24 @@ that edit the colour — the `/organization` Branding panel and the
 else's users — show the real white-on-colour ratio inline as the field is
 typed (`stores/brandTheme.ts` `accentStrongContrast`, `ui/FieldWarning`).
 
+**The accent as text, per theme.** `accent_color` becomes `--accent`, which is
+also small text: links, the active tab, armed row actions. No colour reads at
+4.5:1 on both palettes (a colour dark enough for the light `--bg` is too dark
+for the dark `--surface`), so one inline `--accent` beating both palettes was
+bound to fail one of them. The brand store therefore never writes `--accent`
+inline. It writes `--brand-accent-dark` and `--brand-accent-light`, and each
+palette in `src/app.css` reads its own (`--accent: var(--brand-accent-dark,
+#638cff)` in the dark block, `var(--brand-accent-light, #2c4fc4)` in both light
+copies). Each value is `themeAccent(accent_color, theme)` in
+`stores/brandTheme.ts`: the tenant's hex unchanged when it already clears 4.5:1
+on that theme's `--bg` and `--surface`, otherwise the least mix of it toward
+black (Light) or white (Dark) that does. A mix with black or white keeps the
+hue. There is no per-theme setting: the tenant picks one colour, and the app
+keeps it legible in whichever theme the reader chose (decisions §478). The
+`/organization` Branding panel says so per theme while the field is typed,
+with the ratio and the shade the app will show instead
+(`accentTextContrast`, `ui/FieldWarning`).
+
 It is **advisory, not a block.** The backend accepts any valid hex on purpose:
 the brand is the tenant's call, and a hard refusal would make the API the
 arbiter of a design decision. What was missing was anyone stating the cost
@@ -92,15 +110,40 @@ unit-tested under vitest): `isValidHexColor()` and `brandThemeVars(brand)`. The
 latter returns only the CSS custom-property overrides for colors the org
 configured **with a valid hex** — an unset or malformed color is omitted so the
 AA-passing `src/app.css` default token stands. The theme is **never duplicated**;
-only `--accent` / `--accent-strong` are overridden.
+only the accent is overridden, through `BRAND_ACCENT_PROPS`
+(`--brand-accent-dark`, `--brand-accent-light`, `--accent-strong`).
 
 **Application** — `frontend/src/routes/+layout.svelte` runs an `$effect` (gated
 on the user being fully signed into a tenant, since the read needs auth) that
 calls `brand.ensureLoadedAndApply()`. `applyTheme()` writes the configured
 accent tokens onto `document.documentElement.style` (or removes them when
 unset). The document `<title>` and the sidebar logo + product name read the
-store reactively. `reset()` clears both the cache and the inline `<html>`
+store reactively. So do the auth pages' own tab titles (sign-in, SSO callback,
+verify, forgot / reset password, change password): each is a catalogue entry
+taking the name as a `{product}` param, never a hardcoded "FeohLedger". Before
+sign-in the branding read cannot run, so they show the platform fallback, the
+same as the shell's mark; once loaded (change password, or a sign-in page
+reached after one) they carry the tenant's name. `reset()` clears both the cache and the inline `<html>`
 overrides (logout / tenant switch).
+
+**Accent before first paint** — the applied accent is cached per workspace so a
+branded tenant never sees the platform blue first. `brand.applyTheme()` writes
+the values it applied (`BRAND_ACCENT_PROPS`) to this origin's `localStorage` under
+`feoh_brand_accent:<getTenantStorageKey()>` (the slug on a platform host, the
+hostname on a vanity host; never the shared `feoh_theme` cookie, which every
+workspace sees) via `frontend/src/lib/stores/brandAccentCache.ts`, and only after
+a successful read. On a reload, `<script id="accent-boot">` in `src/app.html`
+applies that entry before first paint; on an in-app sign-in (no reload),
+`ensureLoaded()` applies it before the read is sent. The fetched branding then
+corrects a stale entry or, for an org with no accent, removes it. A failed read
+leaves the cached colour standing. Every value is re-validated as a 3- or
+6-digit hex on read, in the store and in the inline script alike, so a tampered
+entry cannot inject CSS; every storage access is wrapped, and blocked storage
+means "no cache" (the old behaviour). `reset()` clears the entry.
+`brandAccentCache.test.ts` executes the inline script against the store's own
+reads to keep the two equal (decisions §463). An entry cached before §478 holds
+`--accent`, which both readers drop: that workspace's next cold load paints the
+platform accent once, and the read re-caches the per-theme values.
 
 **The fallback mark** — `brand.mark` (`brandTheme.ts::brandMark`,
 `docs/decisions.md` §173). A configured logo always wins. Without one, the
@@ -133,7 +176,8 @@ When an org sets a custom accent, that's their choice. The defaults
 the **strong** accent exists specifically as a darker companion so white text on
 an accent background clears WCAG 1.4.3 contrast. Orgs are encouraged (UI hint) to
 set a darker strong accent for the same reason, but the app does not enforce a
-contrast ratio on custom colors in this slice.
+contrast ratio on `accent_strong_color`. `accent_color` as text is different:
+each theme shows a shade of it that clears 4.5:1 (above, decisions §478).
 
 ## Supplier-portal theming
 
@@ -189,7 +233,7 @@ helpers (`brandThemeVars`, `isValidHexColor`) with the employee store via
 The portal layout (`frontend/src/routes/portal/+layout.svelte`) runs an
 `$effect` that calls `portalBrand.ensureLoadedAndApply()` once a tenant is
 resolved (gated only on the tenant, not on auth, so it runs on the login page).
-`applyTheme()` writes `--accent` / `--accent-strong` onto
+`applyTheme()` writes the same `BRAND_ACCENT_PROPS` onto
 `document.documentElement` only for valid configured colors (an unset/malformed
 color leaves the AA-passing `app.css` token standing). The portal header renders
 the tenant logo (when set) + product name, falling back to the FeohLedger mark
@@ -213,7 +257,7 @@ buyer's theme.
   request never returns B's brand).
 - Frontend: `frontend/tests-e2e/portal/branding.spec.ts` — sets a known brand
   via the admin `PUT /api/organization/branding` then asserts the portal login
-  applies the accent (`--accent`/`--accent-strong` on `<html>`) + the
+  applies the accent (`--brand-accent-dark`/`--accent-strong` on `<html>`) + the
   product-name heading + `<title>` + the logo `<img>`.
 
 ## Branded outbound surfaces (PDFs + emails)
@@ -368,6 +412,15 @@ white-label "served under the partner's own domain" ask. The TLS certificate and
 DNS for the vanity host are **infra** concerns (CloudFront/ALB + ACM + a CNAME to
 the platform) and out of scope for the app code; the app's job is purely to map
 an inbound request on that host back to the right tenant.
+
+**Connecting an OAuth ERP is the one thing a vanity host cannot do.** The
+connect binds itself to the admin's browser with a cookie set on the API host
+(`backend/docs/erp-integration.md` § Connecting an OAuth ERP), and a vanity
+host's `/api` is a same-origin proxy whose cookies never reach the callback. So
+`GET /api/organization/erp/oauth/{provider}/authorize` on a vanity host answers
+409 `erp_connect_platform_host` with the tenant's `<slug>.<app domain>` settings
+URL, which the ERP panel shows as a link, and the callback returns the admin
+there. Everything else about the connection, once made, works from either host.
 
 ### Storage — no migration
 
@@ -738,10 +791,16 @@ failure), so we never half-create; a slug that races past the pre-check trips th
 unique constraint inside provisioning → a clean **409** (not a 500). An invalid
 slug is **422**, a taken slug **409** (the only enumeration surface is the
 partner's *own* choice of slug, which public signup already exposes — not a
-cross-tenant leak). Returns the `ChildTenantSummary` plus the new admin's
-`admin_email` + a one-time `temp_password` (returned EXACTLY once, like an API-key
-mint — the new admin rotates it on first login via `must_change_password`). No
-migration (the `parent_org_id` column already exists).
+cross-tenant leak). The new admin is provisioned with **no password** and
+emailed a single-use set-password link to the child's own host (decisions §283),
+so the partner never holds a credential for the child. Returns the
+`ChildTenantSummary` plus the new admin's `admin_email`,
+`set_password_email_sent` and `set_password_link_expires_at`. The email is
+best-effort here — the tenant and its database already exist and are not unwound
+— so a failed send is reported as `set_password_email_sent: false` and the admin
+uses Forgot password; with no tenant base URL the request is a `503
+set_password_link_unavailable` before any database is created. No migration (the
+`parent_org_id` column already exists).
 
 **Why this authorization model is safe (the privilege boundary).** The hard
 question attach poses: who may declare org X a child of partner P? Letting any
@@ -822,7 +881,9 @@ and an armed two-click **Detach** `RowAction` per child row
   (realdb — provisioning creates the org + tenant DB and stamps
   `parent_org_id = caller`; the child appears in the partner overview; both
   trails audited PII-free (`child_provisioned`/`parent_linked`, never the admin
-  email or temp password); admin-only (403) + 401 unauth; slug collision → clean
+  email or set-password link); the admin gets a link, not a password, and a
+  failed send is reported rather than failing; no tenant URL → 503 before any
+  database exists; admin-only (403) + 401 unauth; slug collision → clean
   409 with the existing tenant undisturbed; invalid slug / email → 422. Each test
   drops the provisioned DB + control rows in a `finally`).
 - Frontend: `frontend/tests-e2e/admin/partner.spec.ts` (branding admin surface) +

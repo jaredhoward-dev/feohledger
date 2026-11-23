@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
+	import RefusalNote from './RefusalNote.svelte';
 
 	type Variant = 'default' | 'accent' | 'success' | 'danger';
 
@@ -13,8 +14,26 @@
 		/** When true, renders a tighter padded square — for icon-only buttons. */
 		icon?: boolean;
 		disabled?: boolean;
+		/** The action's own request is in flight. The button refuses further
+		 *  clicks and announces `aria-busy`, so an armed confirm cannot send its
+		 *  request twice. Spelled `aria-disabled` rather than `disabled` so a
+		 *  keyboard user who just pressed it keeps focus (a natively disabled
+		 *  button drops focus to `<body>`). Ignored for the `href` form. */
+		busy?: boolean;
 		title?: string;
 		ariaLabel?: string;
+		/** Id of an element describing the action — e.g. why a disabled action
+		 *  is disabled, so a screen reader hears the reason, not just "dimmed". */
+		describedby?: string;
+		/** Why the action is refused, when the reader can act on it (a
+		 *  verdict's `refusalText`). Non-empty renders a `RefusalNote` on its
+		 *  own line above the button and adds it to `aria-describedby`; pair it
+		 *  with `disabled` (frontend/docs/ui-patterns.md § Whether to offer an
+		 *  action). Ignored for the `href` form. */
+		reason?: string;
+		/** Id for the reason note (defaults to a generated one) — set it when a
+		 *  test or another control needs to find the note. */
+		reasonId?: string;
 		/** When set, renders as an `<a>` for client-side navigation. */
 		href?: string;
 		/** Click handler. */
@@ -29,13 +48,34 @@
 		armed = false,
 		icon = false,
 		disabled = false,
+		busy = false,
 		title,
 		ariaLabel,
+		describedby,
+		reason,
+		reasonId,
 		href,
 		onclick,
 		type = 'button',
 		children,
 	}: Props = $props();
+
+	const uid = $props.id();
+	const noteId = $derived(reasonId ?? `${uid}-reason`);
+	const describedbyIds = $derived(
+		[reason ? noteId : null, describedby ?? null].filter(Boolean).join(' ') || null
+	);
+
+	function handleClick(e: MouseEvent) {
+		if (busy) {
+			// Swallow it whole: a row action's click usually also opens or
+			// un-arms something further up the tree.
+			e.preventDefault();
+			e.stopPropagation();
+			return;
+		}
+		onclick?.(e);
+	}
 </script>
 
 {#if href}
@@ -53,6 +93,7 @@
 		{@render children()}
 	</a>
 {:else}
+	{#if reason}<RefusalNote id={noteId} {reason} />{/if}
 	<button
 		class="row-action"
 		class:variant-accent={variant === 'accent'}
@@ -60,11 +101,15 @@
 		class:variant-danger={variant === 'danger'}
 		class:armed
 		class:icon
+		class:busy
 		{type}
 		{disabled}
-		{onclick}
+		onclick={handleClick}
 		title={title ?? null}
 		aria-label={ariaLabel ?? null}
+		aria-describedby={describedbyIds}
+		aria-disabled={busy || null}
+		aria-busy={busy || null}
 	>
 		{@render children()}
 	</button>
@@ -99,7 +144,7 @@
 		height: 28px;
 	}
 
-	.row-action:hover:not(:disabled) {
+	.row-action:hover:not(:disabled):not(.busy) {
 		border-color: var(--accent);
 		color: var(--accent);
 	}
@@ -111,17 +156,17 @@
 	}
 
 	.row-action.variant-accent:hover:not(:disabled) {
-		background: rgba(99, 140, 255, 0.08);
+		background: color-mix(in srgb, var(--accent) 8%, transparent);
 	}
 
 	/* --- success: green border + text */
 	.row-action.variant-success {
-		border-color: #1fa86a;
-		color: #1fa86a;
+		border-color: var(--success);
+		color: var(--success);
 	}
 
 	.row-action.variant-success:hover:not(:disabled) {
-		background: rgba(31, 168, 106, 0.1);
+		background: color-mix(in srgb, var(--success) 10%, transparent);
 	}
 
 	/* --- danger: neutral by default, red on hover; armed = red filled */
@@ -132,12 +177,17 @@
 
 	.row-action.variant-danger.armed {
 		border-color: var(--danger);
-		background: rgba(224, 64, 64, 0.1);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
 		color: var(--danger);
 	}
 
 	.row-action:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
+	}
+
+	.row-action.busy {
+		opacity: 0.6;
+		cursor: progress;
 	}
 </style>

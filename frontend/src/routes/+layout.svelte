@@ -6,6 +6,7 @@
 	import Toast from '#lib/components/ui/Toast.svelte';
 	import UnsavedChangesDialog from '#lib/components/ui/UnsavedChangesDialog.svelte';
 	import ConsentBanner from '#lib/components/ConsentBanner.svelte';
+	import AccountLoadState from '#lib/components/layout/AccountLoadState.svelte';
 	import { sidebar } from '#lib/stores/sidebar.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { brand } from '#lib/stores/brand.svelte.ts';
@@ -15,6 +16,12 @@
 	import { hasTenantContext } from '#lib/tenant.ts';
 	import { browser } from '$app/env';
 	import { initLocale, m } from '#lib/i18n/store.svelte.ts';
+	import { theme } from '#lib/stores/theme.svelte.ts';
+	import { FIND_WORKSPACE_PATH, tenantHostRoute } from '#lib/utils/tenantHostRoute.ts';
+
+	import type { Snippet } from 'svelte';
+
+	let { children }: { children: Snippet } = $props();
 
 	// Tri-state: `undefined` until the browser resolves it (render nothing, no
 	// flash), then true/false. This asks "does this host carry a tenant at all",
@@ -31,8 +38,27 @@
 		if (browser) initLocale();
 	});
 
-	// Routes that render without a tenant context (signup flow).
-	const PUBLIC_PATHS = ['/signup', '/verify'];
+	// Pick up the colour theme `app.html` already applied before first paint,
+	// and keep `theme.resolved` true to the OS while System is chosen
+	// (docs/decisions.md §289).
+	$effect(() => {
+		if (browser) theme.init();
+	});
+
+	// The apex has no sign-in form: each company signs in at its own workspace
+	// host. `/find-workspace` asks which one (#635 finding 4), and an apex
+	// `/login` — a bookmark, a typed URL, a legal page's "Sign in" — goes
+	// there instead of quietly showing the marketing page.
+	const FIND_WORKSPACE = FIND_WORKSPACE_PATH;
+
+	// Standalone pages that render in their own `AuthShell` whatever the host
+	// and whoever is signed in: the signup flow, and "find your workspace".
+	// Each brings its own `<main>`, so none may fall through to the app shell's
+	// branch below — on a workspace host with a signed-in user /find-workspace
+	// once did, and the page briefly carried two `<main>` landmarks. On a
+	// workspace host /find-workspace now renders nothing while the effect
+	// below sends it on.
+	const PUBLIC_PATHS = ['/signup', '/verify', FIND_WORKSPACE];
 
 	// The published legal documents (/legal, /legal/privacy, …). Public by
 	// design and by necessity: a data subject exercising a GDPR right, a
@@ -55,6 +81,14 @@
 		}
 	});
 
+	const isLoginPath = (path: string) => path === '/login' || path.startsWith('/login/');
+
+	$effect(() => {
+		if (hasTenant === false && isLoginPath(page.url.pathname)) {
+			goto(FIND_WORKSPACE, { replace: true });
+		}
+	});
+
 	$effect(() => {
 		if (!hasTenant) return;
 
@@ -69,38 +103,55 @@
 		// data subject with no account is a dead end, not a detour.
 		if (path.startsWith(LEGAL_PREFIX)) return;
 
-		if (!auth.loggedIn && !path.startsWith('/login')) {
-			goto('/login');
-			return;
-		}
-
-		if (auth.loggedIn && !auth.user) {
-			auth.fetchUser();
-			return;
-		}
-
-		if (
-			auth.loggedIn &&
-			auth.user?.must_change_password &&
-			path !== '/change-password'
-		) {
-			goto('/change-password');
+		// Every other path's destination — the auth wall (the page asked for
+		// rides through sign-in as `?next=`), the account load, the forced
+		// password change, and `/find-workspace`, which on a workspace host
+		// goes to `/login` or `/` — is decided in ONE place, so no page races
+		// this effect with a navigation of its own (`tenantHostRoute`).
+		const action = tenantHostRoute({
+			path,
+			search: page.url.search,
+			loggedIn: auth.loggedIn,
+			userLoaded: !!auth.user,
+			mustChangePassword: !!auth.user?.must_change_password
+		});
+		if (action.kind === 'goto') {
+			goto(action.to, { replace: true });
+		} else if (action.kind === 'loadUser') {
+			// Start loading the account once; the shell's AccountLoadState shows
+			// the load in flight, and a failure waits for the user's Retry rather
+			// than looping here.
+			if (auth.userStatus === 'idle') auth.fetchUser();
 		}
 	});
 
 	// WCAG 1.4.10 Reflow: on narrow viewports collapse the sidebar to its icon
 	// rail so the 220px panel doesn't force the page wider than the screen. Nav
-	// stays reachable (icon rail), the user can still expand it. Desktop is
-	// unaffected — the breakpoint only fires below 700px.
+	// stays reachable (icon rail), and expanding it there opens the panel as an
+	// OVERLAY over the page (`sidebar.overlay`) rather than pushing the content
+	// into the ~100px a 320px screen has left beside it (#635 finding 39).
+	// Desktop is unaffected — the breakpoint only fires at 700px and below.
 	$effect(() => {
 		if (!browser) return;
 		const mq = window.matchMedia('(max-width: 700px)');
 		const apply = () => {
-			if (mq.matches && !sidebar.collapsed) sidebar.toggle();
+			sidebar.setNarrow(mq.matches);
+			if (mq.matches) sidebar.collapse();
 		};
 		apply();
 		mq.addEventListener('change', apply);
 		return () => mq.removeEventListener('change', apply);
+	});
+
+	// While the overlay is open the page behind it is inert (below) and must not
+	// scroll under the backdrop either — the same lock `ui/Modal` takes.
+	$effect(() => {
+		if (!sidebar.overlay) return;
+		const prev = document.body.style.overflow;
+		document.body.style.overflow = 'hidden';
+		return () => {
+			document.body.style.overflow = prev;
+		};
 	});
 
 	// White-label theming: once the user is fully signed into a tenant, load the
@@ -150,33 +201,50 @@
 		them for a beat on load, and on the apex would hand the reader the
 		marketing Landing page instead of the document they asked for.
 	-->
-	<slot />
+	{@render children()}
 {:else if hasTenant === undefined}
 	<!-- SSR / hydration: tenant not resolved yet, render nothing to avoid flash -->
 {:else if page.url.pathname.startsWith(PORTAL_PREFIX)}
-	<slot />
+	{@render children()}
+{:else if hasTenant && page.url.pathname === FIND_WORKSPACE}
+	<!-- A workspace host's /find-workspace: on its way to /login or / (the
+	     effect above); the apex-only page never mounts here. -->
 {:else if PUBLIC_PATHS.includes(page.url.pathname)}
-	<slot />
+	{@render children()}
+{:else if hasTenant === false && isLoginPath(page.url.pathname)}
+	<!-- Apex /login: on its way to /find-workspace (above); nothing to flash. -->
 {:else if hasTenant === false}
 	<Landing />
 {:else if page.url.pathname.startsWith('/login') || page.url.pathname === '/change-password'}
-	<slot />
+	{@render children()}
 {:else if auth.loggedIn && auth.user && !auth.user.must_change_password}
 	<div class="app-shell">
 		<!-- WCAG 2.4.1 Bypass Blocks: first focusable element jumps past the
 		     sidebar nav straight to the page content. -->
-		<a href="#main-content" class="skip-link">{m('shell.skipToMain')}</a>
+		<a href="#main-content" class="skip-link" inert={sidebar.overlay}>{m('shell.skipToMain')}</a>
 		<Sidebar />
+		<!-- On a narrow viewport the expanded sidebar floats OVER the page, so
+		     the page keeps the rail's 60px offset and is inert behind the
+		     overlay: no focus, no clicks, hidden from assistive tech until the
+		     panel closes (`sidebar.overlay`). -->
 		<main
 			id="main-content"
 			tabindex="-1"
 			class="main-content"
-			style="margin-left: {sidebar.collapsed ? 60 : 220}px"
+			inert={sidebar.overlay}
+			style="margin-left: {sidebar.collapsed || sidebar.narrow ? 60 : 220}px"
 		>
 			<SectionTabs />
-			<slot />
+			{@render children()}
 		</main>
 	</div>
+{:else if auth.loggedIn && !auth.user}
+	<!-- Signed in, account not loaded yet (or it failed): never a blank page. -->
+	<AccountLoadState
+		status={auth.userStatus}
+		onretry={() => auth.fetchUser()}
+		onlogout={() => auth.logout()}
+	/>
 {/if}
 
 <Toast />
@@ -185,10 +253,10 @@
 <UnsavedChangesDialog />
 
 <!--
-	Consent banner is mounted here, outside the routed `<slot />`, so it renders
+	Consent banner is mounted here, outside the routed `{@render children()}`, so it renders
 	on every surface — the app shell, the no-tenant marketing landing, the
 	signup/verify flow, and the supplier portal (whose `/portal/+layout.svelte`
-	only owns the slot content; this root layout still wraps it). It governs
+	only owns the routed content; this root layout still wraps it). It governs
 	non-essential/analytics storage only — essential JWT auth is exempt.
 -->
 <ConsentBanner />
@@ -214,8 +282,8 @@
 		pointer-events: none;
 		background:
 			radial-gradient(1100px 480px at 72% -14%, var(--accent-wash), transparent 70%),
-			linear-gradient(to right, rgba(226, 228, 234, 0.02) 1px, transparent 1px) 0 0 / 64px 64px,
-			linear-gradient(to bottom, rgba(226, 228, 234, 0.02) 1px, transparent 1px) 0 0 / 64px 64px;
+			linear-gradient(to right, color-mix(in srgb, var(--text) 2%, transparent) 1px, transparent 1px) 0 0 / 64px 64px,
+			linear-gradient(to bottom, color-mix(in srgb, var(--text) 2%, transparent) 1px, transparent 1px) 0 0 / 64px 64px;
 		mask-image: linear-gradient(to bottom, #000 0, #000 360px, transparent 720px);
 	}
 

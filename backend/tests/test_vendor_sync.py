@@ -9,12 +9,32 @@ isolation.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
-from sqlalchemy import func, select
+import pytest
+from sqlalchemy import func, select, text
 
 from app.models.vendor import Vendor
+from app.services.erp_adapters.base import ErpAdapter, VendorPayload
+from app.services.vendor_erp_manual_link import (
+    ERP_VENDOR_ALREADY_LINKED,
+    ErpManualLinkError,
+    link_vendor_to_erp_record,
+)
 from app.services.vendor_sync import sync_vendors_from_erp
+
+#: What a pull with no realm and nothing to repair reports beside its counts.
+_QUIET = {
+    "unlinked": [],
+    "deactivated": 0,
+    "codes_cleared": 0,
+    "realm_adopted": 0,
+    "restored": 0,
+    "values_too_long": [],
+    "names_shortened": [],
+    "realm": None,
+}
 
 # ---------------------------------------------------------------------------
 # Service-layer (direct DB) cases
@@ -35,7 +55,7 @@ async def test_sync_creates_new_vendors(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 2, "updated": 0, "unchanged": 0}
+    assert result == _QUIET | {"created": 2, "updated": 0, "unchanged": 0, "conflicts": []}
 
     async with mk() as s:
         vendors = (await s.execute(select(Vendor).order_by(Vendor.erp_vendor_id))).scalars().all()
@@ -62,7 +82,7 @@ async def test_sync_skips_rows_without_erp_id(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 1, "updated": 0, "unchanged": 0}
+    assert result == _QUIET | {"created": 1, "updated": 0, "unchanged": 0, "conflicts": []}
     async with mk() as s:
         count = (await s.execute(select(func.count()).select_from(Vendor))).scalar_one()
     assert count == 1
@@ -92,7 +112,7 @@ async def test_sync_updates_changed_fields(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 0, "updated": 1, "unchanged": 0}
+    assert result == _QUIET | {"created": 0, "updated": 1, "unchanged": 0, "conflicts": []}
     async with mk() as s:
         v = (await s.execute(select(Vendor).where(Vendor.erp_vendor_id == "ERP-7"))).scalar_one()
     assert v.name == "New Name"
@@ -123,7 +143,7 @@ async def test_sync_unchanged_when_no_diff(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 0, "updated": 0, "unchanged": 1}
+    assert result == _QUIET | {"created": 0, "updated": 0, "unchanged": 1, "conflicts": []}
 
 
 async def test_sync_does_not_null_out_existing_fields(realdb):
@@ -151,10 +171,80 @@ async def test_sync_does_not_null_out_existing_fields(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 0, "updated": 0, "unchanged": 1}
+    assert result == _QUIET | {"created": 0, "updated": 0, "unchanged": 1, "conflicts": []}
     async with mk() as s:
         v = (await s.execute(select(Vendor).where(Vendor.erp_vendor_id == "ERP-K"))).scalar_one()
     assert v.email == "keep@vendor.test"
+
+
+async def test_a_value_too_long_for_its_column_is_dropped_never_aborts_the_sync(realdb):
+    """A NetSuite `entityid` is up to 83 characters and `Vendor.code` is 50:
+    writing it failed the flush and rolled back the WHOLE sync. The vendor
+    syncs, the over-long field is not written (an existing value is kept, never
+    truncated), and the run says which fields."""
+    from app.models.workflow import AuditLog
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add(
+            Vendor(
+                name="Has Code",
+                code="OLD-CODE",
+                erp_vendor_id="ERP-L1",
+                organization_id=org_id,
+                status="active",
+                source="erp_sync",
+            )
+        )
+        await s.commit()
+
+    long_code = "V" * 51
+    async with mk() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-L1", "name": "Has Code", "code": long_code},
+                {
+                    "erp_vendor_id": "ERP-L2",
+                    "name": "Long Fields Ltd",
+                    "code": long_code,
+                    "phone": "1" * 51,
+                    "tax_id": "9" * 51,
+                    "email": "ap@long.test",
+                },
+                {"erp_vendor_id": "ERP-L3", "name": "Fine Co", "code": "FINE"},
+            ],
+        )
+        await s.commit()
+
+    assert result["created"] == 2
+    assert result["values_too_long"] == [
+        {"name": "Has Code", "erp_vendor_id": "ERP-L1", "fields": ["code"]},
+        {
+            "name": "Long Fields Ltd",
+            "erp_vendor_id": "ERP-L2",
+            "fields": ["code", "phone", "tax_id"],
+        },
+    ]
+    async with mk() as s:
+        rows = {v.erp_vendor_id: v for v in (await s.execute(select(Vendor))).scalars().all()}
+        audit = (
+            await s.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "vendor.synced_from_erp")
+                .where(AuditLog.entity_id == rows["ERP-L2"].id)
+            )
+        ).scalar_one()
+    assert rows["ERP-L1"].code == "OLD-CODE"
+    long_fields = rows["ERP-L2"]
+    assert (long_fields.code, long_fields.phone, long_fields.tax_id) == (None, None, None)
+    assert long_fields.email == "ap@long.test"
+    assert rows["ERP-L3"].code == "FINE"
+    # Field NAMES only on the append-only row, never the values.
+    assert audit.details["values_too_long"] == ["code", "phone", "tax_id"]
+    assert long_code not in str(audit.details)
 
 
 async def test_sync_links_name_match_and_activates(realdb):
@@ -181,7 +271,7 @@ async def test_sync_links_name_match_and_activates(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 0, "updated": 1, "unchanged": 0}
+    assert result == _QUIET | {"created": 0, "updated": 1, "unchanged": 0, "conflicts": []}
     async with mk() as s:
         rows = (await s.execute(select(Vendor))).scalars().all()
     # No duplicate created — the existing row was linked, not a new insert.
@@ -231,7 +321,7 @@ async def test_sync_filters_name_match_by_org(realdb):
         )
         await s.commit()
 
-    assert result == {"created": 1, "updated": 0, "unchanged": 0}
+    assert result == _QUIET | {"created": 1, "updated": 0, "unchanged": 0, "conflicts": []}
     async with mk() as s:
         mine = (
             await s.execute(select(Vendor).where(Vendor.organization_id == org_id))
@@ -370,3 +460,567 @@ async def test_sync_erp_endpoint_tenant_isolation(realdb):
     async with mk_b() as s:
         count = (await s.execute(select(func.count()).select_from(Vendor))).scalar_one()
     assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# A name links a vendor only when it is unambiguous on both sides (§284)
+# ---------------------------------------------------------------------------
+
+
+async def _manual_vendor(realdb, name: str) -> uuid.UUID:
+    async with realdb.sessionmaker("a")() as s:
+        v = Vendor(
+            name=name,
+            organization_id=realdb.info("a").org_id,
+            status="unverified",
+            source="manual",
+        )
+        s.add(v)
+        await s.commit()
+        return v.id
+
+
+async def test_two_erp_vendors_sharing_a_local_name_link_neither(realdb):
+    """Linking whichever "Acme" came first would post one supplier's bills to
+    the other's ERP record. Neither is linked, neither is created."""
+    local = await _manual_vendor(realdb, "Acme")
+    async with realdb.sessionmaker("a")() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            realdb.info("a").org_id,
+            [
+                {"erp_vendor_id": "ERP-A1", "name": "Acme"},
+                {"erp_vendor_id": "ERP-A2", "name": "Acme"},
+            ],
+        )
+        await s.commit()
+    assert result == _QUIET | {
+        "created": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "conflicts": [
+            {"name": "Acme", "reason": "ambiguous_name", "erp_vendor_ids": ["ERP-A1", "ERP-A2"]}
+        ],
+    }
+    async with realdb.sessionmaker("a")() as s:
+        rows = (await s.execute(select(Vendor))).scalars().all()
+    assert [(r.id, r.erp_vendor_id) for r in rows] == [(local, None)]
+
+
+async def test_one_erp_vendor_matching_two_local_names_links_neither(realdb):
+    await _manual_vendor(realdb, "Globex")
+    await _manual_vendor(realdb, "Globex")
+    async with realdb.sessionmaker("a")() as s:
+        result = await sync_vendors_from_erp(
+            s, realdb.info("a").org_id, [{"erp_vendor_id": "ERP-G", "name": "Globex"}]
+        )
+        await s.commit()
+    assert result["conflicts"] == [
+        {"name": "Globex", "reason": "ambiguous_name", "erp_vendor_ids": ["ERP-G"]}
+    ]
+    assert (result["created"], result["updated"]) == (0, 0)
+    async with realdb.sessionmaker("a")() as s:
+        linked = (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id.is_not(None))
+            )
+        ).scalar_one()
+    assert linked == 0
+
+
+async def test_two_same_named_erp_vendors_with_no_local_are_both_created(realdb):
+    """No local candidate means no guess: each ERP record gets its own row,
+    linked by its own id."""
+    async with realdb.sessionmaker("a")() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            realdb.info("a").org_id,
+            [
+                {"erp_vendor_id": "ERP-I1", "name": "Initech"},
+                {"erp_vendor_id": "ERP-I2", "name": "Initech"},
+            ],
+        )
+        await s.commit()
+    assert result == _QUIET | {"created": 2, "updated": 0, "unchanged": 0, "conflicts": []}
+
+
+async def test_names_differing_only_in_case_or_spacing_are_one_name_to_the_guard(realdb):
+    """The realm evidence (`_same_vendor`) already read "Acme" and " ACME "
+    as one supplier while the ambiguous-name counts compared exactly, so a
+    manual "Acme" was linked to the record spelled the same and "ACME" was
+    created beside it. Both counts are on the normalised name now: neither is
+    linked, neither created, and the conflict names the first spelling."""
+    local = await _manual_vendor(realdb, "Acme")
+    async with realdb.sessionmaker("a")() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            realdb.info("a").org_id,
+            [
+                {"erp_vendor_id": "ERP-A1", "name": "Acme"},
+                {"erp_vendor_id": "ERP-A2", "name": " ACME "},
+            ],
+        )
+        await s.commit()
+    assert result == _QUIET | {
+        "created": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "conflicts": [
+            {"name": "Acme", "reason": "ambiguous_name", "erp_vendor_ids": ["ERP-A1", "ERP-A2"]}
+        ],
+    }
+    async with realdb.sessionmaker("a")() as s:
+        rows = (await s.execute(select(Vendor))).scalars().all()
+    assert [(r.id, r.erp_vendor_id) for r in rows] == [(local, None)]
+
+
+async def test_two_local_spellings_of_one_name_link_neither(realdb):
+    await _manual_vendor(realdb, "Globex Corp")
+    await _manual_vendor(realdb, "GLOBEX  corp")
+    async with realdb.sessionmaker("a")() as s:
+        result = await sync_vendors_from_erp(
+            s, realdb.info("a").org_id, [{"erp_vendor_id": "ERP-G", "name": "Globex Corp"}]
+        )
+        await s.commit()
+    assert result["conflicts"] == [
+        {"name": "Globex Corp", "reason": "ambiguous_name", "erp_vendor_ids": ["ERP-G"]}
+    ]
+    assert (result["created"], result["updated"]) == (0, 0)
+
+
+async def test_a_unique_name_links_across_case_and_spacing(realdb):
+    """One record and one unlinked local under the same normalised name is
+    the unambiguous case: linked, the local keeps its own spelling."""
+    local = await _manual_vendor(realdb, "Initech  Ltd")
+    async with realdb.sessionmaker("a")() as s:
+        result = await sync_vendors_from_erp(
+            s, realdb.info("a").org_id, [{"erp_vendor_id": "ERP-I", "name": "INITECH Ltd"}]
+        )
+        await s.commit()
+    assert (result["created"], result["updated"], result["conflicts"]) == (0, 1, [])
+    async with realdb.sessionmaker("a")() as s:
+        row = await s.get(Vendor, local)
+    assert (row.erp_vendor_id, row.name) == ("ERP-I", "Initech  Ltd")
+
+
+async def test_an_over_long_name_is_stored_shortened_and_marked_never_aborts_the_sync(realdb):
+    """QuickBooks' `DisplayName` allows 500 characters and `vendors.name` is
+    255: written unchecked, one such vendor failed the flush and rolled back
+    the whole sync. The vendor syncs under the shared rule's shortened, marked
+    name; the run and its audit row say so; and a re-sync of the same name is
+    unchanged rather than an update every run."""
+    from app.models.workflow import AuditLog
+    from app.services.erp_record_names import SHORTENED_MARK, fit_name
+
+    long_name = "Northwind Traders " + "and Associates " * 30
+    stored, cut = fit_name(long_name, 255)
+    assert cut and len(stored) == 255 and stored.endswith(SHORTENED_MARK)
+    pull = [
+        {"erp_vendor_id": "ERP-N", "name": long_name},
+        {"erp_vendor_id": "ERP-F", "name": "Fine Co"},
+    ]
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        result = await sync_vendors_from_erp(s, org_id, pull)
+        await s.commit()
+
+    assert result["created"] == 2
+    assert result["names_shortened"] == [{"name": stored, "erp_vendor_id": "ERP-N"}]
+    async with mk() as s:
+        rows = {v.erp_vendor_id: v for v in (await s.execute(select(Vendor))).scalars().all()}
+        audit = (
+            await s.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "vendor.synced_from_erp")
+                .where(AuditLog.entity_id == rows["ERP-N"].id)
+            )
+        ).scalar_one()
+    assert rows["ERP-N"].name == stored
+    assert audit.details["name_shortened"] is True
+
+    async with mk() as s:
+        again = await sync_vendors_from_erp(s, org_id, pull)
+        await s.commit()
+    assert (again["updated"], again["unchanged"]) == (0, 2)
+
+
+# ---------------------------------------------------------------------------
+# A sync and a hand-made link on one realm serialize (decisions §415)
+#
+# Nothing on `vendors` makes an ERP id unique per realm, so the advisory lock
+# both take (`vendor_erp_manual_link.link_lock`) is the only thing stopping a
+# sync's name link and a person's link from both landing on one ERP record.
+# Each case holds one side's transaction open, proves the other is BLOCKED on
+# the lock (`pg_stat_activity`, a real signal, not a sleep), then commits.
+# ---------------------------------------------------------------------------
+
+
+class _OneRecordErp(ErpAdapter):
+    """A connected, searchable ERP holding one supplier record."""
+
+    erp_type = "xero"
+    supports_vendor_search = True
+
+    def __init__(self, record: VendorPayload):
+        super().__init__({})
+        self.record = record
+
+    async def search_vendors(self, *, name, tax_id):  # pragma: no cover - unused
+        raise NotImplementedError
+
+    async def get_vendor(self, erp_vendor_id):
+        return self.record if erp_vendor_id == self.record.erp_vendor_id else None
+
+
+async def _blocked_on_a_lock(mk, pid: int, *, timeout_s: float = 10.0) -> bool:
+    """Poll ``pg_stat_activity`` until backend ``pid`` waits on a lock."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        async with mk() as s:
+            waiting = (
+                await s.execute(
+                    text("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :pid"),
+                    {"pid": pid},
+                )
+            ).scalar_one_or_none()
+        if waiting == "Lock":
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def _two_candidates(mk, org_id, name: str) -> tuple[uuid.UUID, uuid.UUID]:
+    """``name_match``: an unlinked manual vendor a sync would adopt by name;
+    ``other``: the vendor a person links to the same record by hand."""
+    async with mk() as s:
+        name_match = Vendor(organization_id=org_id, name=name, status="unverified", source="manual")
+        other = Vendor(organization_id=org_id, name=f"{name} (AP)", status="active")
+        s.add_all([name_match, other])
+        await s.commit()
+        return name_match.id, other.id
+
+
+async def _holders(mk, org_id, realm: str, erp_id: str) -> list[uuid.UUID]:
+    async with mk() as s:
+        return list(
+            (
+                await s.execute(
+                    select(Vendor.id).where(
+                        Vendor.organization_id == org_id,
+                        Vendor.erp_vendor_id == erp_id,
+                        Vendor.erp_link_realm == realm,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _pid(session) -> int:
+    return (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+
+async def test_a_sync_waits_for_a_hand_made_link_and_then_honours_it(realdb):
+    """A person's link holds the lock; the sync blocks behind it and, once the
+    link commits, matches the record by its id on the linked vendor rather
+    than adopting the name-matching one as a second holder."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    realm = f"xero:{uuid.uuid4().hex[:12]}"
+    name = f"Lockstep Supplies {uuid.uuid4().hex[:6]}"
+    record = VendorPayload(erp_vendor_id="ERP-LOCK", name=name, active=True)
+    name_match, other = await _two_candidates(mk, org_id, name)
+
+    async with mk() as linking, mk() as syncing:
+        await link_vendor_to_erp_record(
+            linking, _OneRecordErp(record), vendor_id=other, realm=realm, erp_vendor_id="ERP-LOCK"
+        )
+        sync_pid = await _pid(syncing)
+        sync = asyncio.create_task(
+            sync_vendors_from_erp(
+                syncing, org_id, [{"erp_vendor_id": "ERP-LOCK", "name": name}], realm=realm
+            )
+        )
+        try:
+            assert await _blocked_on_a_lock(mk, sync_pid), "the sync did not wait on the link"
+            assert not sync.done()
+            await linking.commit()
+            result = await asyncio.wait_for(sync, timeout=30)
+            await syncing.commit()
+        finally:
+            if not sync.done():
+                sync.cancel()
+
+    assert result["conflicts"] == []
+    assert await _holders(mk, org_id, realm, "ERP-LOCK") == [other]
+    async with mk() as s:
+        assert (await s.get(Vendor, name_match)).erp_vendor_id is None
+
+
+async def test_a_hand_made_link_waits_for_a_sync_and_is_then_refused(realdb):
+    """The other order: the sync adopts the record by name under the lock; the
+    person's link blocks behind it and, once the sync commits, is refused as
+    already linked instead of making a second holder."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    realm = f"xero:{uuid.uuid4().hex[:12]}"
+    name = f"Lockstep Traders {uuid.uuid4().hex[:6]}"
+    record = VendorPayload(erp_vendor_id="ERP-LOCK", name=name, active=True)
+    name_match, other = await _two_candidates(mk, org_id, name)
+
+    async with mk() as syncing, mk() as linking:
+        result = await sync_vendors_from_erp(
+            syncing, org_id, [{"erp_vendor_id": "ERP-LOCK", "name": name}], realm=realm
+        )
+        assert result["updated"] == 1  # linked by name, not yet committed
+        link_pid = await _pid(linking)
+        link = asyncio.create_task(
+            link_vendor_to_erp_record(
+                linking,
+                _OneRecordErp(record),
+                vendor_id=other,
+                realm=realm,
+                erp_vendor_id="ERP-LOCK",
+            )
+        )
+        try:
+            assert await _blocked_on_a_lock(mk, link_pid), "the link did not wait on the sync"
+            assert not link.done()
+            await syncing.commit()
+            with pytest.raises(ErpManualLinkError) as refused:
+                await asyncio.wait_for(link, timeout=30)
+            await linking.rollback()
+        finally:
+            if not link.done():
+                link.cancel()
+
+    assert refused.value.code == ERP_VENDOR_ALREADY_LINKED
+    assert await _holders(mk, org_id, realm, "ERP-LOCK") == [name_match]
+
+
+# ---------------------------------------------------------------------------
+# One holder per (company, ERP record) — uq_vendors_erp_link, migration 0141
+# ---------------------------------------------------------------------------
+
+
+def _linked(org_id, name: str, erp_id: str, realm: str | None) -> Vendor:
+    return Vendor(
+        name=name,
+        organization_id=org_id,
+        status="active",
+        source="erp_sync",
+        erp_vendor_id=erp_id,
+        erp_link_realm=realm,
+    )
+
+
+@pytest.mark.parametrize("realm", [None, "xero:dup-company"])
+async def test_the_database_refuses_a_second_holder_of_one_record_in_one_company(realdb, realm):
+    """A NULL realm is one company too (NULLS NOT DISTINCT): the no-realm sync
+    looks those links up as ``erp_link_realm IS NULL``."""
+    from sqlalchemy.exc import IntegrityError
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add(_linked(org_id, "First Holder", "ERP-DUP", realm))
+        await s.flush()
+        s.add(_linked(org_id, "Second Holder", "ERP-DUP", realm))
+        with pytest.raises(IntegrityError) as exc:
+            await s.flush()
+        assert "uq_vendors_erp_link" in str(exc.value)
+        await s.rollback()
+
+
+async def test_one_record_id_may_be_held_once_per_company(realdb):
+    """The same id under two named companies, or a named one and none, is two
+    records (QuickBooks numbers vendors per company), and unlinked vendors hold
+    nothing."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add_all(
+            [
+                _linked(org_id, "Sandbox Co", "57", "quickbooks_online:sandbox"),
+                _linked(org_id, "Production Co", "57", "quickbooks_online:production"),
+                _linked(org_id, "Legacy Co", "57", None),
+                Vendor(name="Unlinked A", organization_id=org_id, status="active"),
+                Vendor(name="Unlinked B", organization_id=org_id, status="active"),
+            ]
+        )
+        await s.commit()
+    async with mk() as s:
+        assert (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id == "57")
+            )
+        ).scalar_one() == 3
+
+
+@pytest.mark.parametrize("realm", [None, "xero:dup-company"])
+async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_on(realdb, realm):
+    """A tenant not yet at 0141 can still hold such a pair (0141 refuses to
+    build its index over one). The lookup by id used to raise
+    ``MultipleResultsFound`` and abort the whole pull; now it reports the
+    record as a ``duplicate_link`` conflict, touches neither holder, and syncs
+    the rest. The index is dropped inside the test's own transaction, which is
+    rolled back, so the shared tenant keeps it."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        await s.execute(text("DROP INDEX uq_vendors_erp_link"))
+        first = _linked(org_id, "Twin Supply", "ERP-TWIN", realm)
+        second = _linked(org_id, "Twin Supply Ltd", "ERP-TWIN", realm)
+        s.add_all([first, second])
+        await s.flush()
+
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-TWIN", "name": "Twin Supply Renamed", "code": "TW"},
+                {"erp_vendor_id": "ERP-NEW", "name": "Fresh Co"},
+            ],
+            realm=realm,
+        )
+
+        assert result["conflicts"] == [
+            {
+                "name": "Twin Supply Renamed",
+                "reason": "duplicate_link",
+                "erp_vendor_ids": ["ERP-TWIN"],
+            }
+        ]
+        assert (result["created"], result["updated"], result["unchanged"]) == (1, 0, 0)
+        # Neither holder was touched: which one is the supplier is a person's call.
+        for vendor, name in ((first, "Twin Supply"), (second, "Twin Supply Ltd")):
+            await s.refresh(vendor)
+            assert (vendor.name, vendor.code, vendor.erp_synced_at) == (name, None, None)
+            assert (vendor.erp_vendor_id, vendor.erp_link_realm) == ("ERP-TWIN", realm)
+        await s.rollback()
+
+    async with mk() as s:
+        index = (
+            await s.execute(
+                text("SELECT 1 FROM pg_indexes WHERE indexname = 'uq_vendors_erp_link'")
+            )
+        ).scalar_one_or_none()
+    assert index == 1
+
+
+async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
+    """A provider page overlap repeats a record two vendors hold: it is one
+    record, so one ``duplicate_link`` conflict, and the endpoint's message
+    counts it once ("1 not updated"), not once per sighting."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        await s.execute(text("DROP INDEX uq_vendors_erp_link"))
+        s.add_all(
+            [
+                _linked(org_id, "Echo Supply", "ERP-ECHO", None),
+                _linked(org_id, "Echo Supply Ltd", "ERP-ECHO", None),
+            ]
+        )
+        await s.flush()
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-ECHO", "name": "Echo Supply"},
+                {"erp_vendor_id": "ERP-ECHO", "name": "Echo Supply"},
+            ],
+        )
+        await s.rollback()
+    assert result["conflicts"] == [
+        {"name": "Echo Supply", "reason": "duplicate_link", "erp_vendor_ids": ["ERP-ECHO"]}
+    ]
+
+
+async def test_two_no_realm_syncs_creating_one_record_serialize(realdb):
+    """Two no-realm pulls of one new record (decisions §489): the second
+    waits on the link lock the first holds and, once the first commits, finds
+    the vendor it created instead of inserting a second holder and failing
+    ``uq_vendors_erp_link`` at flush."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    pull = [{"erp_vendor_id": "ERP-RACE", "name": f"Race Co {uuid.uuid4().hex[:6]}"}]
+    async with mk() as first, mk() as second:
+        created = await sync_vendors_from_erp(first, org_id, pull)
+        assert created["created"] == 1  # not yet committed
+        second_pid = await _pid(second)
+        racing = asyncio.create_task(sync_vendors_from_erp(second, org_id, pull))
+        try:
+            assert await _blocked_on_a_lock(mk, second_pid), "the second sync did not wait"
+            assert not racing.done()
+            await first.commit()
+            result = await asyncio.wait_for(racing, timeout=30)
+            await second.commit()
+        finally:
+            if not racing.done():
+                racing.cancel()
+    assert (result["created"], result["unchanged"], result["conflicts"]) == (0, 1, [])
+    async with mk() as s:
+        assert (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id == "ERP-RACE")
+            )
+        ).scalar_one() == 1
+
+
+async def test_sync_erp_endpoint_counts_each_conflict_reason_on_its_own(realdb, monkeypatch):
+    """The message names a duplicate link apart from an ambiguous name: they
+    ask the operator for different fixes (link by hand vs merge / unlink)."""
+    import app.api.vendors as vendors_api
+
+    async def canned(*_args, **_kwargs):
+        return {
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "conflicts": [
+                {"name": "Acme", "reason": "ambiguous_name", "erp_vendor_ids": ["1", "2"]},
+                {"name": "Beta", "reason": "ambiguous_name", "erp_vendor_ids": ["3"]},
+                {"name": "Twin", "reason": "duplicate_link", "erp_vendor_ids": ["4"]},
+            ],
+            **_QUIET,
+        }
+
+    monkeypatch.setattr(vendors_api, "sync_vendors_from_erp", canned)
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post("/api/vendors/sync-erp")
+    assert resp.status_code == 200
+    assert resp.json()["message"] == (
+        "Synced 0 new, 0 updated, 0 unchanged"
+        "; 2 not linked (the name matches more than one vendor)"
+        "; 1 not updated (more than one vendor is linked to it:"
+        " merge them or unlink the stale one)"
+    )
+
+
+async def test_a_pull_listing_one_record_twice_still_makes_one_vendor(realdb):
+    """A provider page overlap repeats a record: the second sighting finds the
+    vendor the first created, so the index is never reached."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "ERP-REPEAT", "name": "Repeat Co"},
+                {"erp_vendor_id": "ERP-REPEAT", "name": "Repeat Co"},
+            ],
+        )
+        await s.commit()
+    assert (result["created"], result["conflicts"]) == (1, [])
+    async with mk() as s:
+        assert (
+            await s.execute(
+                select(func.count()).select_from(Vendor).where(Vendor.erp_vendor_id == "ERP-REPEAT")
+            )
+        ).scalar_one() == 1

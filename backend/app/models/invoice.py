@@ -1,4 +1,3 @@
-import enum
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -19,21 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, EntityMixin, TimestampMixin
-
-
-class InvoiceStatus(enum.StrEnum):
-    new = "new"
-    pending = "pending"
-    ready_for_review = "ready_for_review"
-    approved = "approved"
-    rejected = "rejected"
-    sending_to_erp = "sending_to_erp"
-    sent_to_erp = "sent_to_erp"
-    posted_in_erp = "posted_in_erp"
-    payment_scheduled = "payment_scheduled"
-    paid = "paid"
-    done = "done"
-    failed = "failed"
+from app.models.invoice_status import InvoiceStatus  # the one enum; re-exported
 
 
 class Invoice(Base, EntityMixin, TimestampMixin):
@@ -61,7 +46,15 @@ class Invoice(Base, EntityMixin, TimestampMixin):
     vendor_name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     amount: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
-    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    # NULL means "currency unknown" (migration 0136, decisions §473): a
+    # document nobody has read yet, or one whose extraction found no code, records
+    # no currency rather than a guessed one (§160/§196/§200). Every money path
+    # refuses it as `currency_unknown` through `payment_runs.payable_currency_code`.
+    # No column default: a column `default` also replaces an explicit `None` at
+    # INSERT, which would turn the upload's "unknown" back into USD. Nor a
+    # constructor default: a construction that omits `currency` is NULL too
+    # (decisions §476), so every `Invoice(...)` names it.
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
     # Materialized conversion of `amount` into the org's reporting (base)
     # currency. Populated by `services.currency_conversion.materialize_reporting_amount`
     # whenever the invoice is created / mutated, locking the FX rate AT THAT
@@ -89,7 +82,9 @@ class Invoice(Base, EntityMixin, TimestampMixin):
         Enum(InvoiceStatus, native_enum=False, length=30),
         default=InvoiceStatus.new,
     )
-    po_number: Mapped[str | None] = mapped_column(String(100))
+    # Indexed (migration 0137): the budget PO-relief join, the PO detail's
+    # invoice list and the portal / re-match "who cites this PO" reads filter it.
+    po_number: Mapped[str | None] = mapped_column(String(100), index=True)
     subtotal: Mapped[Decimal | None] = mapped_column(Numeric(15, 2))
     tax_amount: Mapped[Decimal | None] = mapped_column(Numeric(15, 2))
     discount_amount: Mapped[Decimal | None] = mapped_column(Numeric(15, 2))
@@ -105,6 +100,16 @@ class Invoice(Base, EntityMixin, TimestampMixin):
     notes: Mapped[str | None] = mapped_column(Text)
     approval_date: Mapped[date | None] = mapped_column(Date)
     approved_by: Mapped[str | None] = mapped_column(String(255))
+    # Who gave the approval of record, by control-plane id — the person
+    # `approved_by` names for display. Stamped at every final approval
+    # (`approval_chain.stamp_approver`): the approving person, or the caller
+    # whose `/complete` the amount floor approved, or the reader whose
+    # extraction auto-approved; NULL when no person did. Like `approved_by` it
+    # survives a recall until the next approval replaces it. Read by the
+    # receiving rule's reverse order (`approval_chain.approver_ids`): a receipt
+    # its own approver hand-recorded does not lift the invoice's payment hold
+    # (decisions §389, migration 0129). No FK: a control-plane id.
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     rejected_by: Mapped[str | None] = mapped_column(String(255))
     uploaded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     # Control-plane user ids (stringified UUIDs) implicated in this payable's
@@ -152,6 +157,27 @@ class Invoice(Base, EntityMixin, TimestampMixin):
     # has_gr, gr_id, issues}. Populated by `services.invoice_warnings.refresh_warnings`
     # whenever the invoice changes. NULL when the invoice has no `po_number`.
     po_match: Mapped[dict | None] = mapped_column(JSONB)
+    # The POs a multi-PO split linked this invoice to (stringified UUIDs, like
+    # `segregation_actor_ids`). The split writes a combined `po_number` that
+    # resolves to no PO, and `po_match` is rewritten by every warning refresh,
+    # so this column is the only durable record of the set. One writer, append
+    # only: `exception_agents/resolvers/multi_po_split.apply`; the matcher never
+    # touches it, and a later `po_number` edit does not clear it. Read by
+    # `approval_chain._invoice_po_ids`, the PO set the receiver / inspector
+    # segregation rules check (decisions §267, §389, §404, §433; migration 0133).
+    split_po_ids: Mapped[list | None] = mapped_column(JSONB)
+    # The bill of record in the ERP: the document id the adapter returned when a
+    # push was confirmed (`services/erp._call_erp`, the one writer), e.g. a Xero
+    # InvoiceID or a QuickBooks Bill Id. NULL until a push succeeds. Kept across
+    # a payment void (the bill is still in the ERP) and overwritten by a later
+    # confirmed push (cleared if that push reports no id).
+    # `erp_document_url` is the provider's deep link to it, built once from the
+    # adapter config that posted it (`erp_adapters.deep_links`); NULL for a
+    # provider with no stable deep link. Migration 0118. Indexed (migration
+    # 0132) because the generic ERP status webhook resolves an invoice by it
+    # when a delivery carries no correlation id (decisions §417).
+    erp_document_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    erp_document_url: Mapped[str | None] = mapped_column(String(1024))
     # Free-form per-invoice metadata bag. Currently holds the cached
     # audit-log summary under `meta["audit_summary"]`:
     #   {"text": str, "confidence_context": str|None,

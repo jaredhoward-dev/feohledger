@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { afterNavigate } from '$app/navigation';
+	import { tick } from 'svelte';
 	import { sidebar } from '#lib/stores/sidebar.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { brand } from '#lib/stores/brand.svelte.ts';
@@ -9,6 +11,7 @@
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
 	import { NAV, entryHref, isEntryActive, isEntryVisible, type NavEntry } from '#lib/nav.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { topModalDialog } from '#lib/actions/focusTrap.ts';
 
 	let collapsed = $derived(sidebar.collapsed);
 	let mark = $derived(brand.mark);
@@ -20,15 +23,72 @@
 	});
 	let showProfile = $state(false);
 	let profileBtn = $state<HTMLButtonElement | null>(null);
+	let panel = $state<HTMLElement | null>(null);
+	let toggleBtn = $state<HTMLButtonElement | null>(null);
 
-	// Esc closes the profile popover and returns focus to its trigger, matching
-	// the backdrop-click dismissal. Without this the only way out is a click —
-	// a keyboard user who opened the menu was stranded in it.
+	// The narrow-viewport overlay (`sidebar.overlay`, #635 finding 39). The page
+	// behind it is inert (`routes/+layout.svelte`), so focus has to be put
+	// somewhere it can go: into the panel when it opens, and back onto the
+	// toggle that opened it when Escape or the backdrop closes it.
+	let overlay = $derived(sidebar.overlay);
+	let wasOverlay = false;
+	$effect(() => {
+		const open = overlay;
+		if (open && !wasOverlay) {
+			void tick().then(() => panel?.querySelector<HTMLElement>('.nav-main a')?.focus());
+		}
+		wasOverlay = open;
+	});
+
+	function closeOverlay() {
+		sidebar.collapse();
+		toggleBtn?.focus();
+	}
+
+	// Following a link out of the overlay closes it: the reader chose where to
+	// go, and the page they chose should not open hidden behind the panel. Focus
+	// is left to the navigation (SvelteKit moves it to the new page).
+	afterNavigate(() => {
+		if (sidebar.overlay) sidebar.collapse();
+	});
+
+	function onProfileFocusOut(e: FocusEvent) {
+		if (!showProfile) return;
+		const next = e.relatedTarget as Node | null;
+		const wrapper = e.currentTarget as HTMLElement;
+		if (next && wrapper.contains(next)) return;
+		showProfile = false;
+	}
+
 	function onWindowKeydown(e: KeyboardEvent) {
-		if (e.key === 'Escape' && showProfile) {
+		if (e.key !== 'Escape') return;
+		// An open modal dialog owns Escape: its own `focusTrap` handler closes
+		// it, and this window listener sees the same press after it. Without
+		// this check one press closed both — "Unsaved changes" opened over the
+		// phone overlay took the overlay down with it. The registry `focusTrap`
+		// keeps of open `aria-modal` dialogs is the signal: the dialog leaves it
+		// only when it unmounts, on the flush AFTER this event, so it still
+		// reads as open here. The target check covers a press from inside a
+		// dialog that is no longer registered.
+		if (topModalDialog() || (e.target as Element | null)?.closest?.('[aria-modal="true"]')) {
+			return;
+		}
+		// Esc closes the profile popover and returns focus to its trigger,
+		// matching the backdrop-click dismissal. Without this the only way out
+		// is a click — a keyboard user who opened the menu was stranded in it.
+		if (showProfile) {
 			showProfile = false;
 			profileBtn?.focus();
+			return;
 		}
+		// A popup inside the panel (the bell, the entity menu) takes Escape
+		// first; the overlay closes on the NEXT press. Read off the DOM rather
+		// than each child's state, so the answer does not depend on which
+		// window listener runs first — the attribute only changes on the next
+		// flush, after every listener has seen this event.
+		// Popup TRIGGERS only (`aria-haspopup`), so a future `aria-expanded` on
+		// the panel's own toggle cannot match and lock the overlay open.
+		if (overlay && !panel?.querySelector('[aria-haspopup][aria-expanded="true"]')) closeOverlay();
 	}
 
 	// Role/permission checks bound to the auth store; reads reactive state so
@@ -55,7 +115,15 @@
 
 <svelte:window onkeydown={onWindowKeydown} />
 
-<aside class="sidebar" class:collapsed>
+{#if overlay}
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events
+	     The overlay's backdrop: dims the inert page and closes the panel on a
+	     click. Keyboard users close it with Escape (above), so it is not a
+	     control of its own. -->
+	<div class="sidebar-backdrop" data-testid="sidebar-backdrop" onclick={closeOverlay}></div>
+{/if}
+
+<aside class="sidebar" class:collapsed class:overlay bind:this={panel}>
 	<div class="sidebar-header" class:collapsed>
 		<div class="logo">
 			{#if mark.kind === 'logo'}
@@ -160,11 +228,45 @@
 		{#if !collapsed}<span class="help-label">{m('shell.help')}</span>{/if}
 	</a>
 
-	<div class="profile-wrapper">
+	<!--
+		Focus leaving the disclosure closes it (WCAG 2.4.11 Focus Not Obscured):
+		left open, Shift+Tab from the trigger lands on the Help link, which the
+		popover is drawn over, and in the collapsed rail it covers the icon
+		column. Focus is not moved — it is already where the reader sent it. A
+		null `relatedTarget` (focus going to the page body or another window)
+		closes it too: nothing inside the wrapper holds focus any more.
+	-->
+	<div class="profile-wrapper" onfocusout={onProfileFocusOut}>
 		{#if showProfile}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="profile-backdrop" onclick={() => (showProfile = false)} onkeydown={() => {}}></div>
-			<div class="profile-popover">
+		{/if}
+		<button
+			bind:this={profileBtn}
+			class="profile-btn"
+			class:collapsed
+			title={collapsed ? m('shell.profile') : ''}
+			aria-label={collapsed
+				? m('shell.profileMenu')
+				: m('shell.profileMenuNamed', { name: auth.user?.full_name ?? m('shell.profile') })}
+			aria-expanded={showProfile}
+			aria-controls={showProfile ? 'sidebar-profile-popover' : undefined}
+			onclick={() => (showProfile = !showProfile)}
+		>
+			<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+			{#if !collapsed}
+				<span class="profile-label">{auth.user?.full_name ?? m('shell.profile')}</span>
+			{/if}
+		</button>
+		<!--
+			A disclosure, not an ARIA menu (WAI-ARIA APG § Disclosure): it holds
+			the signed-in identity, two links and Log out, so the trigger states
+			only `aria-expanded` (no `aria-haspopup="menu"`, which promises
+			menuitems and arrow keys). It follows its trigger in the DOM so Tab
+			moves into it; it is drawn above the trigger by `bottom: 100%`.
+		-->
+		{#if showProfile}
+			<div class="profile-popover" id="sidebar-profile-popover">
 				<div class="profile-info">
 					<div class="profile-name">{auth.user?.full_name ?? '—'}</div>
 					<div class="profile-email">{auth.user?.email ?? '—'}</div>
@@ -193,26 +295,9 @@
 				<button class="profile-logout" onclick={() => auth.logout()}>{m('shell.logOut')}</button>
 			</div>
 		{/if}
-		<button
-			bind:this={profileBtn}
-			class="profile-btn"
-			class:collapsed
-			title={collapsed ? m('shell.profile') : ''}
-			aria-label={collapsed
-				? m('shell.profileMenu')
-				: m('shell.profileMenuNamed', { name: auth.user?.full_name ?? m('shell.profile') })}
-			aria-haspopup="menu"
-			aria-expanded={showProfile}
-			onclick={() => (showProfile = !showProfile)}
-		>
-			<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-			{#if !collapsed}
-				<span class="profile-label">{auth.user?.full_name ?? m('shell.profile')}</span>
-			{/if}
-		</button>
 	</div>
 
-	<button class="collapse-btn" class:collapsed onclick={() => sidebar.toggle()} aria-label={collapsed ? m('shell.expandSidebar') : m('shell.collapseSidebar')}>
+	<button bind:this={toggleBtn} class="collapse-btn" class:collapsed onclick={() => sidebar.toggle()} aria-label={collapsed ? m('shell.expandSidebar') : m('shell.collapseSidebar')}>
 		<span class="nav-icon">
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class:flipped={collapsed}>
 				<polyline points="15 18 9 12 15 6" />
@@ -235,7 +320,12 @@
 		   --surface (5.38:1), and a translucent rail would let whatever scrolls
 		   beneath it decide their contrast. The depth is a gradient within the
 		   surface's own range plus an edge highlight. */
-		background: linear-gradient(180deg, #1a1c26 0%, var(--surface) 38%, #15171f 100%);
+		background: linear-gradient(
+			180deg,
+			color-mix(in srgb, var(--text) 2%, var(--surface)) 0%,
+			var(--surface) 38%,
+			color-mix(in srgb, var(--bg) 55%, var(--surface)) 100%
+		);
 		border-right: 1px solid var(--border);
 		box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.02);
 		display: flex;
@@ -247,6 +337,24 @@
 
 	.sidebar.collapsed {
 		width: 60px;
+	}
+
+	/* Narrow viewport, expanded: the panel floats over the page instead of
+	   pushing it aside, so it carries the lift of a floating surface. */
+	.sidebar.overlay {
+		box-shadow: var(--shadow-float);
+		/* Above the page's own fixed layers (the bulk-action bar sits at 50,
+		   which would otherwise cover the panel's footer and a focused toggle
+		   — SC 2.4.11), below modals (100). */
+		z-index: 55;
+	}
+
+	/* Under the overlay panel, over the page and its fixed bars. */
+	.sidebar-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 54;
+		background: var(--overlay);
 	}
 
 	.sidebar-header {
@@ -338,14 +446,17 @@
 		font-size: 0.88rem;
 		font-weight: 500;
 		text-decoration: none;
-		transition: all 0.12s;
+		/* The background only, here and on the profile and collapse buttons:
+		   with `all`, the muted label colour faded across a theme change and
+		   sat below 4.5:1 for the length of the fade (#635). */
+		transition: background-color 0.12s;
 	}
 	.help-link.collapsed {
 		justify-content: center;
 		padding: 9px 0;
 	}
 	.help-link:hover {
-		background: rgba(226, 228, 234, 0.05);
+		background: color-mix(in srgb, var(--text) 5%, transparent);
 		color: var(--text);
 	}
 	/* The same "you are here" as `.nav-item.active` below: the tenant's own
@@ -389,7 +500,7 @@
 		color: var(--text-muted);
 		cursor: pointer;
 		font-family: inherit;
-		transition: all 0.12s;
+		transition: background-color 0.12s;
 	}
 
 	.profile-btn.collapsed {
@@ -398,7 +509,7 @@
 	}
 
 	.profile-btn:hover {
-		background: rgba(226, 228, 234, 0.05);
+		background: color-mix(in srgb, var(--text) 5%, transparent);
 		color: var(--text);
 	}
 
@@ -462,7 +573,7 @@
 		padding: 7px 12px;
 		border-radius: 5px;
 		border: 1px solid var(--danger);
-		background: rgba(224, 64, 64, 0.1);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
 		color: var(--danger);
 		font-size: 0.82rem;
 		font-weight: 500;
@@ -472,7 +583,7 @@
 	}
 
 	.profile-logout:hover {
-		background: rgba(224, 64, 64, 0.2);
+		background: color-mix(in srgb, var(--danger) 20%, transparent);
 	}
 
 	.profile-action {
@@ -521,7 +632,7 @@
 	}
 
 	.nav-item:hover {
-		background: rgba(226, 228, 234, 0.05);
+		background: color-mix(in srgb, var(--text) 5%, transparent);
 		color: var(--text);
 	}
 
@@ -576,7 +687,7 @@
 		color: var(--text-muted);
 		cursor: pointer;
 		font-family: inherit;
-		transition: all 0.12s;
+		transition: background-color 0.12s;
 	}
 
 	.collapse-btn.collapsed {
@@ -585,7 +696,7 @@
 	}
 
 	.collapse-btn:hover {
-		background: rgba(226, 228, 234, 0.05);
+		background: color-mix(in srgb, var(--text) 5%, transparent);
 		color: var(--text);
 	}
 

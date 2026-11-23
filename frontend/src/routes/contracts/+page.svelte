@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Contract, ContractStatus, ContractType } from '#lib/types/contract.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import {
 		CONTRACT_STATUSES,
@@ -21,6 +22,7 @@
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
 	import BulkBar from '#lib/components/ui/BulkBar.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
@@ -33,6 +35,7 @@
 	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { type MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
@@ -59,13 +62,8 @@
 
 	// Modal state: null = create; a Contract = detail/edit.
 	// Three states, not two: a failed load must not read as "nothing matched".
-	let emptyMessage = $derived(
-		contractStore.loading
-			? m('common.loading')
-			: contractStore.errored
-				? m('contracts.empty.errored')
-				: m('contracts.empty')
-	);
+	// The failed state renders `ui/LoadError` (with a Retry) in the table's
+	// place, so the empty line only has loading vs. empty to say.
 
 	let showCreate = $state(false);
 	let editing = $state<Contract | null>(null);
@@ -198,14 +196,14 @@
 			selectedAllMatching = true;
 			if (res.truncated) {
 				toast(
-					`Selected the first ${res.ids.length} of ${res.total} matching — narrow your filters to select the rest.`,
+					m('contracts.toast.selectedTruncated', { shown: formatCount(res.ids.length), total: formatCount(res.total) }),
 					'error'
 				);
 			} else {
-				toast(`Selected all ${res.ids.length} matching contract(s)`, 'success');
+				toast(m('contracts.toast.selectedAllMatching', { n: res.ids.length }), 'success');
 			}
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Failed to select all matching', 'error');
+			toast(err instanceof Error ? err.message : m('contracts.toast.selectAllFailed'), 'error');
 		} finally {
 			selectingAllMatching = false;
 		}
@@ -218,11 +216,11 @@
 			await contractStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method, routes through api client
 			clearSelection();
 			const msg = res.skipped.length
-				? m('contracts.bulk.updated', { n: res.updated }) + m('contracts.bulk.skipped', { n: res.skipped.length })
+				? m('contracts.bulk.updatedSkipped', { n: res.updated, skipped: res.skipped.length })
 				: m('contracts.bulk.updated', { n: res.updated });
 			toast(msg, res.updated > 0 ? 'success' : 'error');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk status change failed', 'error');
+			toast(err instanceof Error ? err.message : m('contracts.toast.bulkStatusFailed'), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -235,7 +233,7 @@
 			await exportContractsCsv(ids);
 			toast(m('contracts.bulk.exported', { n: ids.length }), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : 'Bulk export failed', 'error');
+			toast(err instanceof Error ? err.message : m('contracts.toast.bulkExportFailed'), 'error');
 		} finally {
 			bulkBusy = false;
 		}
@@ -344,9 +342,17 @@
 		<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 	</div>
 
+	{#if contractStore.errored}
+		<LoadError
+			message={m('contracts.empty.errored')}
+			onretry={() => contractStore.fetch(buildParams()).catch(() => {})}
+			testId="contracts-error"
+		/>
+	{:else}
 	<DataTable
 		isEmpty={contractStore.all.length === 0}
-		empty={emptyMessage}
+		loading={contractStore.loading}
+		empty={m('contracts.empty')}
 		colspan={8}
 	>
 		{#snippet header()}
@@ -418,26 +424,24 @@
 			{/each}
 		{/snippet}
 	</DataTable>
-
-	{#if contractStore.hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={() => contractStore.loadMore()} disabled={contractStore.loading}>
-				{contractStore.loading
-					? m('common.loading')
-					: m('contracts.loadMore', { shown: contractStore.all.length, total: contractStore.total })}
-			</button>
-		</div>
-	{:else if contractStore.total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('contracts.showingAll', { total: contractStore.total })}</span>
-		</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={contractStore.all.length}
+		total={contractStore.total}
+		hasMore={contractStore.hasMore}
+		loading={contractStore.loading}
+		errored={contractStore.errored}
+		onloadmore={() => contractStore.loadMore()}
+		moreKey="contracts.loadMore"
+		allKey="contracts.showingAll"
+	/>
 
 	{#if canManage}
 		<BulkBar count={selected.size} onclear={clearSelection}>
 			{#snippet actions()}
 				{#if allSelected && !selectedAllMatching && contractStore.total > contractStore.all.length}
-					<button class="bulk-action-btn secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
+					<button class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 						{selectingAllMatching
 							? m('common.loading')
 							: m('common.selectAllMatching', { total: contractStore.total })}
@@ -450,9 +454,9 @@
 					<option value="terminate">{m('contracts.modal.lifecycle.terminate')}</option>
 					<option value="cancel">{m('contracts.modal.lifecycle.cancel')}</option>
 				</select>
-				<button class="bulk-action-btn" disabled={bulkBusy} onclick={bulkStatusChange}>{m('contracts.bulk.changeStatus')}</button>
+				<button class="btn-primary" disabled={bulkBusy} onclick={bulkStatusChange}>{m('contracts.bulk.changeStatus')}</button>
 				<div class="bulk-divider"></div>
-				<button class="bulk-action-btn" disabled={bulkBusy} onclick={bulkExport}>{m('contracts.bulk.exportCsv')}</button>
+				<button class="btn-secondary" disabled={bulkBusy} onclick={bulkExport}>{m('contracts.bulk.exportCsv')}</button>
 			{/snippet}
 		</BulkBar>
 	{/if}
@@ -504,29 +508,6 @@
 		border-radius: 6px;
 		background-color: var(--surface);
 		font-size: 0.82rem;
-	}
-	.bulk-action-btn {
-		padding: 6px 14px;
-		border-radius: 6px;
-		border: 1px solid var(--accent-strong);
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.82rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-	.bulk-action-btn:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-	.bulk-action-btn:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.bulk-action-btn.secondary {
-		background: transparent;
-		color: var(--accent-strong);
 	}
 	.bulk-all-matching-note {
 		font-size: 0.82rem;

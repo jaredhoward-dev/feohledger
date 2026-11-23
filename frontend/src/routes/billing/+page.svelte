@@ -1,5 +1,11 @@
 <script lang="ts">
+	import { tick, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page as appPage } from '$app/state';
+	import { ApiError } from '#lib/api.ts';
+	import { toast } from '#lib/components/ui/Toast.svelte';
+	import CardSetupPanel from '#lib/components/billing/CardSetupPanel.svelte';
+	import { takePendingPlan } from '#lib/utils/pendingPlanChange.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
@@ -17,10 +23,15 @@
 		getBillingPaymentMethods,
 		getBillingPlans,
 		getBillingSubscription,
-		startBillingSetupIntent
+		keepCurrentBillingPlan,
+		previewBillingPlanChange,
+		setDefaultBillingPaymentMethod
 	} from '#lib/api/billing.ts';
-	import { formatMoney } from '#lib/utils/money.ts';
+	import { formatMoney, isPositiveAmount } from '#lib/utils/money.ts';
+	import { formatCount } from '#lib/utils/count.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	// The published-address registry, not a literal typed here. All three
 	// `mailto:`s below read `billing@example.com` — the IANA-reserved TLD, which
 	// can never deliver — so every "contact us" on this page was a dead button.
@@ -35,12 +46,22 @@
 		BillingInvoice,
 		BillingInvoiceStatus,
 		BillingPaymentMethod,
+		BillingPaymentMethodsResponse,
 		BillingPlan,
+		BillingPlanChangePreview,
 		BillingPlanChangeResponse,
 		BillingSubscriptionResponse
 	} from '#lib/types/billing.ts';
-	import { rebateMeterGroups } from '#lib/types/billing.ts';
-	import { formatDate } from '#lib/utils/time.ts';
+	import {
+		PLAN_CHANGE_PREVIEW_STALE,
+		cardSavedMessageKey,
+		planChangeCardAction,
+		planHighlights,
+		rebateMeterGroups
+	} from '#lib/types/billing.ts';
+	import { formatDate, formatMonth } from '#lib/utils/time.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
+	import { PLAN_FEATURES, isPlanFeature, planFeatureLabelKey } from '#lib/types/planFeatures.ts';
 
 	// RBAC: the backend gates `GET /api/billing/subscription` to admin / cfo and
 	// 403s everyone else. `isAdmin` covers admin; `isCfo` = admin|cfo, so the
@@ -68,13 +89,18 @@
 	let invoicesLoading = $state(true);
 	let invoicesError = $state<string | null>(null);
 
+	// The first subscription read, so a card saved through a Stripe redirect
+	// is announced against the loaded subscription (`cardSavedMessageKey`),
+	// not against a page that has not read it yet.
+	let firstLoad: Promise<void> | null = null;
+
 	async function load() {
 		loading = true;
 		error = null;
 		try {
 			data = await getBillingSubscription();
 		} catch (e) {
-			error = e instanceof Error ? e.message : m('billing.error.load');
+			error = errorMessage(e, m('billing.error.load'));
 		} finally {
 			loading = false;
 		}
@@ -86,7 +112,7 @@
 		try {
 			invoices = (await getBillingInvoices()).invoices;
 		} catch (e) {
-			invoicesError = e instanceof Error ? e.message : m('billing.error.loadInvoices');
+			invoicesError = errorMessage(e, m('billing.error.loadInvoices'));
 		} finally {
 			invoicesLoading = false;
 		}
@@ -100,16 +126,12 @@
 	let pmLoading = $state(true);
 	let pmError = $state<string | null>(null);
 
-	// Add / replace card flow. The deployed flow confirms `client_secret` against
-	// the provider's JS SDK (Stripe Elements); the local-first stack has no real
-	// Stripe and the frontend must not call secret-bearing services directly, so
-	// the secret is surfaced as a clearly-marked "next step" seam, never used to
-	// charge or to mount real Elements here.
-	let addingCard = $state(false);
-	let cardSetup = $state<{
-		state: 'idle' | 'starting' | 'ready' | 'not_configured' | 'error';
-		message: string | null;
-	}>({ state: 'idle', message: null });
+	// Add / replace card flow — `components/billing/CardSetupPanel.svelte`
+	// (Stripe Elements when the backend runs Stripe and the build has a
+	// publishable key; a "save test card" step on the local mock provider).
+	// Keyed by `cardFlowNonce`, so every attempt is a fresh SetupIntent.
+	let cardFlowOpen = $state(false);
+	let cardFlowNonce = $state(0);
 
 	async function loadPaymentMethods() {
 		pmLoading = true;
@@ -117,63 +139,125 @@
 		try {
 			paymentMethods = (await getBillingPaymentMethods()).payment_methods;
 		} catch (e) {
-			pmError = e instanceof Error ? e.message : m('billing.error.loadPaymentMethods');
+			pmError = errorMessage(e, m('billing.error.loadPaymentMethods'));
 		} finally {
 			pmLoading = false;
 		}
 	}
 
-	async function startAddCard() {
-		addingCard = true;
-		cardSetup = { state: 'starting', message: null };
-		try {
-			const res = await startBillingSetupIntent();
-			if (!res.configured || !res.client_secret) {
-				// Org never provisioned with the provider, or the provider isn't
-				// configured (the live adapter fails closed without a key). Not an
-				// error — a clear "billing not configured" affordance.
-				cardSetup = {
-					state: 'not_configured',
-					message: m('billing.card.notConfigured')
-				};
-				return;
-			}
-			// A real SetupIntent secret came back. Mounting the provider's card form
-			// (Stripe Elements) is a deployed-only piece — see the placeholder below.
-			// Re-list cards so a card attached out-of-band shows up.
-			cardSetup = {
-				state: 'ready',
-				message: m('billing.card.ready')
-			};
-			await loadPaymentMethods();
-		} catch (e) {
-			cardSetup = {
-				state: 'error',
-				message: e instanceof Error ? e.message : m('billing.card.startError')
-			};
-		} finally {
-			addingCard = false;
-		}
+	function startAddCard() {
+		cardFlowNonce += 1;
+		cardFlowOpen = true;
+	}
+
+	// The section's "Add or replace card" button: where focus goes back to
+	// when the card panel closes (WCAG 2.4.3).
+	let addCardButton = $state<HTMLButtonElement | undefined>();
+
+	async function returnFocusToAddCard() {
+		// The button is disabled while the panel is open; it is enabled (and
+		// focusable) only once the close has rendered.
+		await tick();
+		addCardButton?.focus();
 	}
 
 	function closeAddCard() {
-		cardSetup = { state: 'idle', message: null };
+		cardFlowOpen = false;
+		returnFocusToAddCard();
 	}
 
-	// Plan-change flow. `POST /api/billing/change-plan` APPLIES the change on
-	// the spot — there is no preview-only mode on the backend — so the modal
-	// says so before the confirm click, then shows the real proration the
-	// response returns. Idempotent: re-"changing" to the current plan comes
-	// back `changed: false` with a zero proration, rendered as a clean no-op
-	// rather than an error.
+	/** A card saved from the payment-methods section. Saving a card only
+	 *  saves the card — it never changes the plan (decisions §482). */
+	async function onCardSaved(res: BillingPaymentMethodsResponse) {
+		paymentMethods = res.payment_methods;
+		pmError = null;
+		cardFlowOpen = false;
+		toast(m(cardSavedMessageKey(data?.subscription)), 'success');
+		await returnFocusToAddCard();
+	}
+
+	/**
+	 * Finish a SetupIntent Stripe confirmed through a REDIRECT. A card confirms
+	 * in place (`redirect: 'if_required'`), so this only runs for a
+	 * redirect-based method: Stripe returns to `/billing?setup_intent=…&
+	 * redirect_status=…&setup_intent_client_secret=…`. The query is dropped
+	 * first, so the single-use secret does not linger in the address bar or
+	 * history, and a reload cannot repeat the call. (Should the session have
+	 * expired meanwhile, the auth wall's `next` drops the secret too —
+	 * `utils/postLoginRedirect.ts::SECRET_QUERY_PARAMS`.)
+	 *
+	 * Resolves to the plan code the plan dialog's card step stashed for THIS
+	 * intent before leaving (`utils/pendingPlanChange.ts`), once the card is
+	 * saved — the caller reopens the dialog at that plan's price review, and
+	 * nothing is charged until the reader confirms there — else `null`.
+	 */
+	async function finishRedirectedSetup(): Promise<string | null> {
+		const { id, status } = untrack(() => {
+			const params = appPage.url.searchParams;
+			return { id: params.get('setup_intent'), status: params.get('redirect_status') };
+		});
+		if (!id) return null;
+		// A shallow replace: drops the query without a navigation or a history entry.
+		const path = untrack(() => appPage.url.pathname);
+		await goto(path, { state: {}, shallow: true, replace: true });
+		// Read and clear in every outcome, so no later return can pick it up.
+		const pending = takePendingPlan(id);
+		if (status === 'processing') {
+			// Not a failure: the bank has not settled it yet.
+			toast(m('billing.card.redirectProcessing'), 'info');
+			return null;
+		}
+		if (status !== 'succeeded') {
+			toast(m('billing.card.confirmFailed'), 'error');
+			return null;
+		}
+		try {
+			await setDefaultBillingPaymentMethod(id);
+			await firstLoad;
+			toast(m(cardSavedMessageKey(data?.subscription)), 'success');
+			return pending;
+		} catch (e) {
+			toast(errorMessage(e, m('billing.card.saveFailed')), 'error');
+			return null;
+		}
+	}
+
+	// Plan-change flow — one guided dialog (decisions §482):
+	//   pick a plan → (no card on file for a paid plan: add one, in the
+	//   dialog) → review what is charged today and what recurs, priced by the
+	//   provider (`POST /change-plan/preview`) → "Confirm and pay" →
+	//   result. Nothing is charged before that click: the confirm carries the
+	//   preview's figures, and the server refuses a stale one
+	//   (`plan_change_preview_stale`), after which a fresh preview is shown.
+	type PlanStep = 'pick' | 'card' | 'review' | 'result';
 	let showChangePlan = $state(false);
+	let planStep = $state<PlanStep>('pick');
 	let availablePlans = $state<BillingPlan[]>([]);
 	let plansLoading = $state(false);
 	let plansError = $state<string | null>(null);
 	let selectedPlanCode = $state<string | null>(null);
-	let changingPlan = $state(false);
+	let preview = $state<BillingPlanChangePreview | null>(null);
+	let previewLoading = $state(false);
+	let previewError = $state<string | null>(null);
+	let confirming = $state(false);
 	let changeError = $state<string | null>(null);
+	// What the review offers beside a refusal: add a card (none on file) or
+	// update it (the charge was declined). Keyed on the refusal code.
+	let changeErrorAction = $state<'add_card' | 'update_card' | null>(null);
 	let changeResult = $state<BillingPlanChangeResponse | null>(null);
+	// The preview the reader confirmed, for the result view's wording.
+	let confirmedPreview = $state<BillingPlanChangePreview | null>(null);
+	// Keys the in-dialog card form, so every visit is a fresh SetupIntent.
+	let cardStepNonce = $state(0);
+	// Where focus lands when a step replaces the one it was on (WCAG 2.4.3).
+	let reviewContainer = $state<HTMLElement | undefined>();
+	let reviewFocus = $state<HTMLElement | undefined>();
+	let reviewAlert = $state<HTMLElement | undefined>();
+	let resultFocus = $state<HTMLElement | undefined>();
+	let pickForm = $state<HTMLFormElement | undefined>();
+	// Each preview request's ticket: an answer that arrives after the dialog
+	// was closed, reset or re-priced is dropped rather than steering it.
+	let previewSeq = 0;
 
 	async function loadAvailablePlans() {
 		plansLoading = true;
@@ -181,39 +265,200 @@
 		try {
 			availablePlans = (await getBillingPlans()).plans;
 		} catch (e) {
-			plansError = e instanceof Error ? e.message : m('billing.plan.changeModal.loadError');
+			plansError = errorMessage(e, m('billing.plan.changeModal.loadError'));
 		} finally {
 			plansLoading = false;
 		}
 	}
 
+	function resetChangeFlow() {
+		previewSeq += 1;
+		planStep = 'pick';
+		preview = null;
+		previewError = null;
+		changeError = null;
+		changeErrorAction = null;
+		changeResult = null;
+		confirmedPreview = null;
+	}
+
 	function openChangePlan() {
 		showChangePlan = true;
 		selectedPlanCode = null;
-		changeError = null;
-		changeResult = null;
+		resetChangeFlow();
 		loadAvailablePlans();
 	}
 
 	function closeChangePlan() {
+		previewSeq += 1;
 		showChangePlan = false;
 	}
 
-	async function confirmPlanChange() {
-		if (!selectedPlanCode) return;
-		changingPlan = true;
-		changeError = null;
+	/**
+	 * Price the selected plan and show the review — or, when the plan needs a
+	 * card and none is on file, the card step first. Charges nothing.
+	 * `focusAlert` keeps focus on the refusal the reader is being told about
+	 * (a stale price) instead of moving it to the new figures.
+	 */
+	async function loadPreview(code: string, { focusAlert = false } = {}) {
+		const ticket = ++previewSeq;
+		planStep = 'review';
+		previewLoading = true;
+		previewError = null;
+		preview = null;
+		// The picker's button is gone: hold focus on the step while it loads.
+		await tick();
+		if (!focusAlert) reviewContainer?.focus();
+		let priced: BillingPlanChangePreview | null = null;
+		let failure: string | null = null;
 		try {
-			changeResult = await changeBillingPlan(selectedPlanCode);
-			// Refresh the plan/usage surface behind the modal so it reflects the
-			// new plan by the time the user closes the dialog.
-			await load();
+			priced = await previewBillingPlanChange(code);
 		} catch (e) {
-			changeError = e instanceof Error ? e.message : m('billing.plan.changeModal.changeFailed');
+			failure = errorMessage(e, m('billing.plan.review.loadError'));
+		}
+		if (ticket !== previewSeq) return; // closed, reset or re-priced meanwhile
+		previewLoading = false;
+		if (priced?.payment_method_required) {
+			openCardStep();
+			return;
+		}
+		preview = priced;
+		previewError = failure;
+		await tick();
+		if (focusAlert && reviewAlert) reviewAlert.focus();
+		else if (preview) reviewFocus?.focus();
+		else reviewContainer?.focus();
+	}
+
+	function continueToReview() {
+		if (!selectedPlanCode) return;
+		changeError = null;
+		changeErrorAction = null;
+		loadPreview(selectedPlanCode);
+	}
+
+	function openCardStep() {
+		cardStepNonce += 1;
+		planStep = 'card';
+	}
+
+	/** The card step's card is saved: refresh the list and price the change
+	 *  again (the review is the next step — saving never applies the plan). */
+	async function onCardStepSaved(res: BillingPaymentMethodsResponse) {
+		paymentMethods = res.payment_methods;
+		pmError = null;
+		toast(m(cardSavedMessageKey(data?.subscription)), 'success');
+		changeError = null;
+		changeErrorAction = null;
+		if (selectedPlanCode) await loadPreview(selectedPlanCode);
+	}
+
+	async function backToPick() {
+		previewSeq += 1;
+		changeError = null;
+		changeErrorAction = null;
+		planStep = 'pick';
+		// Back on the plan the reader had chosen (or the group's first radio).
+		await tick();
+		const radios = pickForm?.querySelectorAll<HTMLInputElement>('input[name="plan-code"]:not(:disabled)');
+		const chosen = [...(radios ?? [])].find((r) => r.checked) ?? radios?.[0];
+		chosen?.focus();
+	}
+
+	/** The reader's "Confirm and pay": the only call that changes the plan. */
+	async function confirmPlanChange() {
+		if (!preview || confirming) return;
+		const confirmed = preview;
+		confirming = true;
+		changeError = null;
+		changeErrorAction = null;
+		try {
+			changeResult = await changeBillingPlan(confirmed);
+			confirmedPreview = confirmed;
+			planStep = 'result';
+			// Refresh the surface behind the dialog so it shows the new plan
+			// (and the new receipt) by the time the reader closes it.
+			await Promise.all([load(), loadInvoices()]);
+			await tick();
+			resultFocus?.focus();
+		} catch (e) {
+			const code = e instanceof ApiError ? e.code : null;
+			changeError = errorMessage(e, m('billing.plan.changeModal.changeFailed'));
+			changeErrorAction = planChangeCardAction(code);
+			// The figure moved on: show the current one, to confirm again.
+			if (code === PLAN_CHANGE_PREVIEW_STALE && selectedPlanCode) {
+				await loadPreview(selectedPlanCode, { focusAlert: true });
+			}
 		} finally {
-			changingPlan = false;
+			confirming = false;
 		}
 	}
+
+	/** A card added inside the dialog from a redirect-based method came back:
+	 *  reopen the dialog at that plan's price review — never apply it. */
+	async function resumeReview(code: string) {
+		selectedPlanCode = code;
+		resetChangeFlow();
+		showChangePlan = true;
+		if (availablePlans.length === 0) await loadAvailablePlans();
+		await loadPreview(code);
+	}
+
+	/** Money in a review sentence, from the server's exact string. */
+	function reviewMoney(amount: string, currency: string): string {
+		return formatMoney(amount, { currency });
+	}
+
+	/** The first day the new monthly price applies, as a reader says it. */
+	function reviewDate(iso: string | null): string {
+		return formatDate(iso, '—', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+	}
+
+	const planModalTitle = $derived(
+		{
+			pick: m('billing.plan.changeModal.selectHeading'),
+			card: m('billing.plan.changeModal.cardTitle'),
+			review: m('billing.plan.changeModal.reviewTitle'),
+			result: changeResult?.scheduled
+				? m('billing.plan.changeModal.scheduledHeading')
+				: m('billing.plan.changeModal.successHeading')
+		}[planStep]
+	);
+
+	/** How many differentiators a picker card shows before "+N more" — enough
+	 *  to tell the plans apart without turning each row into a pricing table. */
+	const PLAN_HIGHLIGHT_LIMIT = 3;
+
+	/**
+	 * One short line per picker card: what the plan adds over the next-cheaper
+	 * one, from the catalog's own entitlements (`planHighlights`). Joined into a
+	 * single string so it is also the radio's accessible description, read as
+	 * one phrase rather than run-together spans.
+	 */
+	const planHighlightLines = $derived.by(() => {
+		const byCode = planHighlights(availablePlans, PLAN_FEATURES);
+		const lines = new Map<string, string>();
+		for (const [code, h] of byCode) {
+			const parts: string[] = [];
+			if (h.builtOn) parts.push(m('billing.plan.changeModal.everythingIn', { plan: h.builtOn }));
+			const labels = h.added.map((k) =>
+				isPlanFeature(k) ? m(planFeatureLabelKey(k)) : k.replace(/_/g, ' ')
+			);
+			const room = PLAN_HIGHLIGHT_LIMIT - parts.length;
+			if (labels.length > room) {
+				parts.push(...labels.slice(0, room - 1));
+				parts.push(
+					m('billing.plan.changeModal.moreFeatures', { count: labels.length - (room - 1) })
+				);
+			} else {
+				parts.push(...labels);
+			}
+			// A no-break space before the dot keeps it at the end of a wrapped line
+			// rather than opening the next one.
+			if (parts.length) lines.set(code, parts.join('\u00a0· '));
+		}
+		return lines;
+	});
 
 	/** Display name for a plan code the picker already fetched, falling back to
 	 *  the bare code if the list has since moved on (defensive, not expected). */
@@ -225,9 +470,16 @@
 		// Only fetch once we know the role is allowed (avoids a guaranteed 403
 		// for the clerk/manager before the redirect fires).
 		if (userLoaded && allowed) {
-			load();
+			firstLoad = load();
 			loadInvoices();
-			loadPaymentMethods();
+			// A Stripe redirect return is finished before the list loads, so
+			// the list it shows already holds the new default card. A plan the
+			// card was being added for reopens at its price review — nothing
+			// is charged until the reader confirms there.
+			finishRedirectedSetup().then(async (pending) => {
+				await loadPaymentMethods();
+				if (pending) await resumeReview(pending);
+			});
 		}
 	});
 
@@ -245,37 +497,81 @@
 		});
 	}
 
+	// No actions column: nothing acts on a single saved card (Add / replace
+	// works on the set), and an empty, unlabelled column was dead width.
 	const PAYMENT_METHOD_COLUMNS = $derived([
 		{ label: m('billing.pm.colCard') },
-		{ label: m('billing.pm.colExpiry') },
-		{ label: '', class: 'actions-col' }
+		{ label: m('billing.pm.colExpiry') }
 	]);
 
 	const plan = $derived(data?.plan ?? null);
 	const subscription = $derived(data?.subscription ?? null);
 	const hasSubscription = $derived(plan !== null && subscription !== null);
+	// A move to a free plan waiting for the end of the paid period (§483).
+	const scheduledChange = $derived(subscription?.scheduled_change ?? null);
 
-	/** Currency for the proration figure — the target plan's own currency,
-	 *  falling back to the (now-current) plan's currency defensively. */
-	const changedPlanCurrency = $derived(
-		changeResult
-			? (availablePlans.find((p) => p.code === changeResult!.new_plan_code)?.currency ??
-					plan?.currency)
-			: undefined
-	);
+	// "Keep {plan}": cancel the scheduled move. Nothing is charged.
+	let keeping = $state(false);
+	let changePlanButton = $state<HTMLButtonElement | undefined>();
+
+	async function keepPlan() {
+		if (keeping || !plan) return;
+		const kept = plan.name;
+		keeping = true;
+		try {
+			await keepCurrentBillingPlan();
+			toast(m('billing.plan.scheduled.kept', { plan: kept }), 'success');
+			await load();
+			// The Keep button is gone with the notice: focus goes to the plan
+			// card's own action rather than to the top of the page (WCAG 2.4.3).
+			await tick();
+			changePlanButton?.focus();
+		} catch (e) {
+			toast(errorMessage(e, m('billing.plan.scheduled.keepFailed')), 'error');
+			// The move may have taken effect meanwhile (409
+			// `scheduled_change_already_due`): show what is true now.
+			await load();
+		} finally {
+			keeping = false;
+		}
+	}
 
 	/** Whole-number usage counter rendered defensively (the API sends strings). */
 	function asCount(n: string | undefined): string {
 		if (n === undefined || n === '') return '0';
-		const v = Number(n);
-		return Number.isFinite(v) ? v.toLocaleString() : n;
+		return formatCount(n, { fallback: n });
 	}
 
-	/** Period window label, e.g. "Jun 1 – Jul 1, 2026". */
+	/**
+	 * Period boundaries are UTC midnights (the provider bills on UTC days), so
+	 * they render in UTC: in local time a reader west of UTC saw "Oct 31 –
+	 * Nov 30" for a period that starts on Nov 1.
+	 */
+	const UTC_DATE_OPTS: Intl.DateTimeFormatOptions = {
+		month: 'short',
+		day: 'numeric',
+		year: 'numeric',
+		timeZone: 'UTC'
+	};
+
+	/** Period window label, e.g. "Jun 1, 2026 – Jul 1, 2026". */
 	const periodWindow = $derived(
 		subscription
-			? `${formatDate(subscription.current_period_start)} → ${formatDate(subscription.current_period_end)}`
+			? `${formatDate(subscription.current_period_start, '—', UTC_DATE_OPTS)} – ${formatDate(subscription.current_period_end, '—', UTC_DATE_OPTS)}`
 			: '—'
+	);
+
+	/** The usage month as a reader says it ("November 2026"), not the `YYYY-MM` key. */
+	const usagePeriod = $derived(data?.period ? formatMonth(data.period, 'long') : null);
+
+	// Who bills the subscription. The adapter code (`stripe_billing`) is a
+	// config value, not a name; a provider brand is a proper noun and stays
+	// untranslated. An adapter not listed here falls back to the generic word.
+	const PROVIDER_NAMES: Record<string, string> = { stripe_billing: 'Stripe' };
+	const managedBy = $derived(
+		subscription?.externally_managed
+			? (PROVIDER_NAMES[data?.provider ?? ''] ?? m('billing.plan.provider'))
+			: m('billing.plan.selfServe')
 	);
 
 	/** Human label for an invoice settlement state. */
@@ -306,245 +602,272 @@
 		{ label: '', class: 'actions-col' }
 	]);
 
-	/** Pretty list of granted entitlement flags (truthy boolean keys). */
-	const entitlementFlags = $derived(
-		plan
-			? Object.entries(plan.entitlements)
-					.filter(([, v]) => v === true)
-					.map(([k]) => k)
-			: []
-	);
+	/**
+	 * Granted features, named as the pricing page names them (`planFeature.*`)
+	 * and in catalogue order. The raw key (`public_api`) used to be the label.
+	 * A key the client does not know yet (an operator-negotiated grant) still
+	 * shows, de-snaked, after the known ones rather than vanishing.
+	 */
+	const entitlementLabels = $derived.by(() => {
+		if (!plan) return [] as { key: string; label: string }[];
+		const granted = Object.entries(plan.entitlements)
+			.filter(([, v]) => v === true)
+			.map(([k]) => k);
+		const known = PLAN_FEATURES.filter((f) => granted.includes(f)).map((f) => ({
+			key: f,
+			label: m(planFeatureLabelKey(f))
+		}));
+		const unknown = granted
+			.filter((k) => !isPlanFeature(k))
+			.map((k) => ({ key: k, label: k.replace(/_/g, ' ') }));
+		return [...known, ...unknown];
+	});
 </script>
 
 <PageHeader title={m('billing.title')}>
-	{#if error}
-		<div class="state error" data-testid="billing-error" role="alert">
-			<p>{error}</p>
-			<button type="button" class="btn" onclick={load}>{m('billing.retry')}</button>
-		</div>
-	{:else}
-		{#if loading}
-			<p class="state" data-testid="billing-loading">{m('billing.loading')}</p>
-		{:else if !hasSubscription}
-			<!-- Friendly empty state — the org has no live subscription yet. -->
-			<div class="empty" data-testid="billing-empty">
-				<h2>{m('billing.empty.heading')}</h2>
-				<p>{m('billing.empty.body')}</p>
-				<!-- Labelled "Contact sales": the org has no subscription yet. -->
-				<a class="btn primary" href="mailto:{CONTACT.sales}"
-					>{m('billing.empty.contactSales')}</a
-				>
-			</div>
-		{:else if plan && subscription}
-			<!-- Active subscription detail. -->
-			<section class="plan-card" aria-label={m('billing.plan.aria')} data-testid="billing-plan">
-				<div class="plan-head">
-					<div>
-						<span class="eyebrow">{m('billing.plan.current')}</span>
-						<h2 class="plan-name">{plan.name}</h2>
-					</div>
-					<SubscriptionBadge status={subscription.status} />
-				</div>
-
-				<div class="plan-meta">
-					<div class="meta-item">
-						<span class="meta-label">{m('billing.plan.price')}</span>
-						<span class="meta-value">
-							<Money amount={plan.monthly_price} currency={plan.currency} />
-							<span class="per">{m('billing.plan.perMonth')}</span>
-						</span>
-					</div>
-					<div class="meta-item">
-						<span class="meta-label">{m('billing.plan.period')}</span>
-						<span class="meta-value">{periodWindow}</span>
-					</div>
-					{#if subscription.status === 'trialing'}
-						<div class="meta-item">
-							<span class="meta-label">{m('billing.plan.trialEnds')}</span>
-							<span class="meta-value">{formatDate(subscription.trial_end)}</span>
-						</div>
-					{/if}
-					<div class="meta-item">
-						<span class="meta-label">{m('billing.plan.managedBy')}</span>
-						<span class="meta-value">
-							{subscription.externally_managed ? data?.provider ?? m('billing.plan.provider') : m('billing.plan.selfServe')}
-						</span>
-					</div>
-				</div>
-
-				{#if entitlementFlags.length > 0}
-					<div class="entitlements">
-						<span class="meta-label">{m('billing.plan.included')}</span>
-						<ul>
-							{#each entitlementFlags as flag (flag)}
-								<li>{flag.replace(/_/g, ' ')}</li>
-							{/each}
-						</ul>
+	<!-- One reading column, top to bottom in the order the reader asks the
+	     questions: what am I on and is it healthy (plan), how much have I used
+	     against it (usage), how do I pay (payment method), what have I paid
+	     (invoices). Every section shares the column's width, so the edges line
+	     up instead of the plan card stopping at 720px under a full-width meter. -->
+	<div class="billing">
+		{#if error}
+			<LoadError message={error} onretry={load} testId="billing-error" />
+		{:else}
+			{#if loading}
+				<!-- The plan card's slot, held from first paint so the sections
+				     below (which load on their own) do not jump when it lands. -->
+				<section class="panel plan-card plan-pending" aria-busy="true" data-testid="billing-loading">
+					<LoadingState label={m('billing.loading')} />
+				</section>
+			{:else if !hasSubscription}
+				<!-- The org has no live subscription yet. Not `<EmptyState>`: its
+				     title is a paragraph, and this one is the page's section heading. -->
+				<section class="panel empty" data-testid="billing-empty">
+					<h2>{m('billing.empty.heading')}</h2>
+					<p>{m('billing.empty.body')}</p>
+					<!-- Labelled "Contact sales": the org has no subscription yet. -->
+					<a class="btn-primary btn-link" href="mailto:{CONTACT.sales}"
+						>{m('billing.empty.contactSales')}</a
+					>
+				</section>
+			{:else if plan && subscription}
+				{#if subscription.status === 'past_due'}
+					<!-- The one state that needs the reader to act before the dunning
+					     sweep cancels them; it says what to do and takes them to where
+					     they do it. (`canceled` never reaches this page: the endpoint
+					     reports only a live subscription, so that is the empty state.) -->
+					<div class="callout tone-danger" role="status" data-testid="billing-status-callout">
+						<strong>{m('billing.status.pastDue.title')}</strong>
+						<p>{m('billing.status.pastDue.body')}</p>
+						<a href="#billing-payment-methods">{m('billing.status.pastDue.action')}</a>
 					</div>
 				{/if}
 
-				<div class="actions">
-					<button
-						type="button"
-						class="btn"
-						onclick={openChangePlan}
-						data-testid="billing-change-plan"
-					>
-						{m('billing.plan.changePlan')}
-					</button>
-					<!-- "Need a plan change?" is a commercial ask, so it goes to sales. -->
-					<a class="link" href="mailto:{CONTACT.sales}">{m('billing.plan.changeContact')}</a>
+				<section class="panel plan-card" aria-label={m('billing.plan.aria')} data-testid="billing-plan">
+					<div class="plan-head">
+						<div class="plan-title">
+							<span class="eyebrow">{m('billing.plan.current')}</span>
+							<div class="plan-name-row">
+								<h2 class="plan-name">{plan.name}</h2>
+								<SubscriptionBadge status={subscription.status} />
+							</div>
+						</div>
+						<p class="plan-price">
+							<span class="price-figure"><Money amount={plan.monthly_price} currency={plan.currency} /></span>
+							<span class="per">{m('billing.plan.perMonth')}</span>
+						</p>
+					</div>
+
+					<dl class="plan-meta">
+						<div class="meta-item">
+							<dt>{m('billing.plan.period')}</dt>
+							<dd>{periodWindow}</dd>
+						</div>
+						{#if subscription.status === 'trialing'}
+							<div class="meta-item">
+								<dt>{m('billing.plan.trialEnds')}</dt>
+								<dd>{formatDate(subscription.trial_end, '—', UTC_DATE_OPTS)}</dd>
+							</div>
+						{/if}
+						<div class="meta-item">
+							<dt>{m('billing.plan.managedBy')}</dt>
+							<dd>{managedBy}</dd>
+						</div>
+					</dl>
+
+					{#if scheduledChange}
+						<!-- A move to a free plan at the end of the paid period
+						     (decisions §483): said plainly on the card, with the undo
+						     beside it. Nothing is charged by either. -->
+						<div class="callout tone-info scheduled-change" data-testid="billing-scheduled-change">
+							<strong>
+								{m('billing.plan.scheduled.notice', {
+									plan: scheduledChange.plan_name,
+									date: reviewDate(scheduledChange.effective_at)
+								})}
+							</strong>
+							<p>{m('billing.plan.scheduled.detail', { plan: plan.name })}</p>
+							<button
+								type="button"
+								class="btn-cancel"
+								onclick={keepPlan}
+								disabled={keeping}
+								data-testid="billing-keep-plan"
+							>
+								{keeping
+									? m('billing.plan.scheduled.keeping')
+									: m('billing.plan.scheduled.keep', { plan: plan.name })}
+							</button>
+						</div>
+					{/if}
+
+					{#if entitlementLabels.length > 0}
+						<div class="entitlements">
+							<h3 class="meta-label">{m('billing.plan.included')}</h3>
+							<ul>
+								{#each entitlementLabels as f (f.key)}
+									<li>
+										<svg class="check" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+											<path d="M3.5 8.5l3 3 6-7" />
+										</svg>
+										<span>{f.label}</span>
+									</li>
+								{/each}
+							</ul>
+						</div>
+					{/if}
+
+					<div class="plan-actions">
+						<button
+							type="button"
+							class="btn-primary"
+							onclick={openChangePlan}
+							bind:this={changePlanButton}
+							data-testid="billing-change-plan"
+						>
+							{m('billing.plan.changePlan')}
+						</button>
+						<!-- "Need a plan change?" is a commercial ask, so it goes to sales. -->
+						<a class="link" href="mailto:{CONTACT.sales}">{m('billing.plan.changeContact')}</a>
+					</div>
+				</section>
+			{/if}
+
+			<!-- Usage — ONE section, rendered on every non-error state rather than
+			     a copy inside each branch of the chain above (decisions §125, §143: a KPI
+			     row is never gated on its own response, and which branch would own
+			     it is the question still in flight). `asCount` coerces a missing
+			     count to `'0'`, so the guard is on `data`, not on the field.
+
+			     The priced meter leads (decisions §253): AI-read invoices against
+			     the allowance, overage, cap and pause state. It renders for an org
+			     with no subscription too — that org is on the Free allowance. Only
+			     an admin edits the cap (the endpoint is admin-only). The raw
+			     extraction counters follow as activity, not as the bill. -->
+			<section class="usage" aria-label={m('billing.usage.aria')}>
+				<h2 class="section-title">
+					{m('billing.usage.heading')}
+					{#if usagePeriod}<span class="period">· {usagePeriod}</span>{/if}
+				</h2>
+
+				<div class="panel">
+					<AiUsagePanel
+						usage={data?.ai_usage ?? null}
+						pending={loading}
+						canEditCap={auth.isAdmin}
+						onUsageChange={(ai) => {
+							if (data) data = { ...data, ai_usage: ai };
+						}}
+					/>
+				</div>
+
+				<div class="usage-counts" data-testid="billing-usage-counts">
+					<div class="help-row usage-title">
+						<h3>{m('billing.usage.activity')}</h3>
+						<HelpTip term="extraction" />
+					</div>
+					<div class="kpi-row">
+						<KpiCard
+							value={data ? asCount(data.usage.extractions) : null}
+							label={m('billing.usage.extractions')}
+							pending={loading}
+						/>
+						<KpiCard
+							value={data ? asCount(data.usage.extractions_platform) : null}
+							label={m('billing.usage.billableExtractions')}
+							pending={loading}
+						/>
+						<!-- One card PER CURRENCY, never a cross-currency sum. No
+						     rebates → no card, rather than a $0.00 in a currency the
+						     page picked. `rebateGroups` is empty while `data` is null,
+						     so these appear with the response and never as a dash.
+						     An org with no subscription gets them IN the row; one
+						     with a plan gets the note below it. -->
+						{#if !hasSubscription}
+							{#each rebateGroups as group (group.currency)}
+								<KpiCard
+									value={formatMoney(group.total, { currency: group.currency })}
+									label={rebateGroups.length > 1
+										? `${m('billing.usage.cardRebates')} (${group.currency})`
+										: m('billing.usage.cardRebates')}
+									highlight="green"
+								/>
+							{/each}
+						{/if}
+					</div>
+					{#if hasSubscription && rebateGroups.length > 0}
+						<p class="note">
+							{m('billing.usage.cardRebatesNote')}
+							{#each rebateGroups as group, i (group.currency)}{i > 0
+									? ', '
+									: ''}<Money amount={group.total} currency={group.currency} />{/each}
+							{m('billing.usage.informational')}
+							<HelpTip term="card-rebate" />
+						</p>
+					{/if}
 				</div>
 			</section>
 		{/if}
 
-		<!-- Usage meters — ONE section, rendered on every non-error state rather
-		     than a copy inside each branch of the chain above.
-
-		     It used to be two, both gated on `{#if loading}` having already
-		     resolved, so the meters collapsed to nothing while the subscription
-		     was in flight (`docs/decisions.md` §125 — a KPI row is never gated on
-		     its own response). They could not simply each take `pending`: which
-		     branch owns the row is decided by `hasSubscription`, and while the
-		     response is out there is no answer to that — the row has to live
-		     outside the question. Two copies also could not BOTH be brought onto
-		     the convention without a third for the loading state.
-
-		     `asCount` coerces a missing count to `'0'`, so the guard is on `data`
-		     rather than on the field: a `'0'` is a figure as far as `KpiCard` is
-		     concerned, and `pending` would have had nothing to do. Every settled
-		     figure is unchanged.
-
-		     The two presentations the branches carried are preserved exactly: an
-		     org with no subscription gets its per-currency rebate cards IN the
-		     row, one with a plan gets the note below it. -->
-		<section class="usage-section" aria-label={m('billing.usage.aria')}>
-			<div class="help-row usage-title">
-				<h3>{m('billing.usage.heading')} <span class="period">({data?.period ?? '—'})</span></h3>
-				<HelpTip term="extraction" />
-			</div>
-			<div class="kpi-row">
-				<KpiCard
-					value={data ? asCount(data.usage.extractions) : null}
-					label={m('billing.usage.extractions')}
-					pending={loading}
-				/>
-				<KpiCard
-					value={data ? asCount(data.usage.extractions_platform) : null}
-					label={m('billing.usage.billableExtractions')}
-					pending={loading}
-				/>
-				<!-- One card PER CURRENCY. The meter used to be a single
-				     cross-currency sum rendered with no currency at all, so a
-				     tenant accruing EUR rebates read them as dollars. No
-				     rebates → no card, rather than a $0.00 in a currency the
-				     page picked. `rebateGroups` is empty while `data` is null,
-				     so these appear with the response and never as a dash. -->
-				{#if !hasSubscription}
-					{#each rebateGroups as group (group.currency)}
-						<KpiCard
-							value={formatMoney(group.total, { currency: group.currency })}
-							label={rebateGroups.length > 1
-								? `${m('billing.usage.cardRebates')} (${group.currency})`
-								: m('billing.usage.cardRebates')}
-							highlight="green"
-						/>
-					{/each}
-				{/if}
-			</div>
-			{#if hasSubscription && rebateGroups.length > 0}
-				<p class="note">
-					{m('billing.usage.cardRebatesNote')}
-					{#each rebateGroups as group, i (group.currency)}{i > 0
-							? ', '
-							: ''}<Money amount={group.total} currency={group.currency} />{/each}
-					{m('billing.usage.informational')}
-					<HelpTip term="card-rebate" />
-				</p>
-			{/if}
-		</section>
-
-		<!-- The priced meter (decisions §253): AI-read invoices against the plan
-		     allowance, the overage + its projection, the spending cap and the
-		     pause state. Rendered for an org with no subscription too — it is on
-		     the Free allowance. Only an admin edits the cap (the endpoint is
-		     admin-only); a CFO sees it read-only. -->
-		<AiUsagePanel
-			usage={data?.ai_usage ?? null}
-			pending={loading}
-			canEditCap={auth.isAdmin}
-			onUsageChange={(ai) => {
-				if (data) data = { ...data, ai_usage: ai };
-			}}
-		/>
-	{/if}
-
-	<!-- Payment methods — the org's saved cards (PII-safe metadata only). Loaded
-	     independently of the plan/usage block, so it renders for an org with a
-	     card on file but no live subscription too. -->
-	{#if !loading && !error}
+		<!-- Payment methods — the org's saved cards (PII-safe metadata only).
+		     Loaded independently of the plan/usage block, with its own loading
+		     and error states, so it renders while the plan is still loading, for
+		     an org with no live subscription, and even when the plan failed. -->
 		<section
-			class="payment-methods-section"
+			id="billing-payment-methods"
+			class="list-section"
 			aria-label={m('billing.pm.aria')}
 			data-testid="billing-payment-methods"
 		>
-			<div class="pm-head">
-				<h3>{m('billing.pm.heading')}</h3>
+			<div class="section-head">
+				<h2 class="section-title">{m('billing.pm.heading')}</h2>
 				<button
 					type="button"
-					class="btn"
+					class="btn-cancel"
 					onclick={startAddCard}
-					disabled={addingCard}
+					disabled={cardFlowOpen}
+					bind:this={addCardButton}
 					data-testid="billing-add-card"
 				>
-					{addingCard ? m('billing.pm.starting') : m('billing.pm.addReplace')}
+					{m('billing.pm.addReplace')}
 				</button>
 			</div>
 
-			{#if cardSetup.state !== 'idle'}
-				<!-- Add-card flow affordance. The real card-collection form (the
-				     provider's Stripe Elements) is a deployed-only piece — it can't run
-				     in the local-first stack and the frontend must never call a
-				     secret-bearing service directly. So we surface the right next-step
-				     state here and leave a clearly-marked seam for Elements. -->
-				<div
-					class="card-setup state-{cardSetup.state}"
-					data-testid="billing-card-setup"
-					role={cardSetup.state === 'error' ? 'alert' : 'status'}
-				>
-					{#if cardSetup.state === 'starting'}
-						<p>{m('billing.card.starting')}</p>
-					{:else if cardSetup.state === 'not_configured'}
-						<p>{cardSetup.message}</p>
-						<!-- The payment provider is not configured — an operational
-						     fault on our side, not a purchase question, so: support. -->
-						<a class="link" href="mailto:{CONTACT.support}">{m('billing.card.contactUs')}</a>
-					{:else if cardSetup.state === 'error'}
-						<p>{cardSetup.message}</p>
-						<button type="button" class="btn" onclick={startAddCard}>{m('billing.retry')}</button>
-					{:else if cardSetup.state === 'ready'}
-						<p>{cardSetup.message}</p>
-						<!-- DEPLOYED-ONLY SEAM: mount the provider's card form (Stripe
-						     Elements) here, confirm the SetupIntent client_secret against
-						     it, then re-list cards. No Stripe keys are hardcoded in the
-						     static frontend; the secret never leaves this boundary. -->
-						<p class="card-setup-placeholder" data-testid="billing-card-elements-placeholder">
-							{m('billing.card.elementsPlaceholder')}
-						</p>
-					{/if}
-					<button type="button" class="link card-setup-dismiss" onclick={closeAddCard}>
-						{m('billing.card.dismiss')}
-					</button>
-				</div>
+			{#if cardFlowOpen}
+				{#key cardFlowNonce}
+					<CardSetupPanel onsaved={onCardSaved} onclose={closeAddCard} />
+				{/key}
 			{/if}
 
 			{#if pmLoading}
-				<p class="state" data-testid="billing-payment-methods-loading">{m('billing.pm.loading')}</p>
+				<LoadingState label={m('billing.pm.loading')} testId="billing-payment-methods-loading" />
 			{:else if pmError}
-				<div class="state error" data-testid="billing-payment-methods-error" role="alert">
-					<p>{pmError}</p>
-					<button type="button" class="btn" onclick={loadPaymentMethods}>{m('billing.retry')}</button>
-				</div>
+				<LoadError
+					message={pmError}
+					onretry={loadPaymentMethods}
+					testId="billing-payment-methods-error"
+				/>
 			{:else}
 				<DataTable
 					columns={PAYMENT_METHOD_COLUMNS}
@@ -555,34 +878,31 @@
 						{#each paymentMethods as pm (pm.id)}
 							<tr>
 								<td>
-									{cardLabel(pm)}
+									<span class="card-label">{cardLabel(pm)}</span>
 									{#if pm.is_default}
 										<span class="default-pill">{m('billing.pm.default')}</span>
 									{/if}
 								</td>
-								<td>{cardExpiry(pm)}</td>
-								<td class="actions"></td>
+								<td class="muted">{cardExpiry(pm)}</td>
 							</tr>
 						{/each}
 					{/snippet}
 				</DataTable>
 			{/if}
 		</section>
-	{/if}
 
-	<!-- Invoices / receipts — the org's past platform-billing invoices. Loaded
-	     independently of the plan/usage block above, so it renders for an org
-	     with receipts but no live subscription too. -->
-	{#if !loading && !error}
-		<section class="invoices-section" aria-label={m('billing.invoices.aria')} data-testid="billing-invoices">
-			<h3>{m('billing.invoices.heading')}</h3>
+		<!-- Invoices / receipts — the org's past platform-billing invoices, loaded
+		     independently of everything above for the same reason. -->
+		<section class="list-section" aria-label={m('billing.invoices.aria')} data-testid="billing-invoices">
+			<h2 class="section-title">{m('billing.invoices.heading')}</h2>
 			{#if invoicesLoading}
-				<p class="state" data-testid="billing-invoices-loading">{m('billing.invoices.loading')}</p>
+				<LoadingState label={m('billing.invoices.loading')} testId="billing-invoices-loading" />
 			{:else if invoicesError}
-				<div class="state error" data-testid="billing-invoices-error" role="alert">
-					<p>{invoicesError}</p>
-					<button type="button" class="btn" onclick={loadInvoices}>{m('billing.retry')}</button>
-				</div>
+				<LoadError
+					message={invoicesError}
+					onretry={loadInvoices}
+					testId="billing-invoices-error"
+				/>
 			{:else}
 				<DataTable
 					columns={INVOICE_COLUMNS}
@@ -592,9 +912,9 @@
 					{#snippet body()}
 						{#each invoices as inv (inv.id)}
 							<tr>
-								<td class="mono">{inv.number ?? '—'}</td>
-								<td>{inv.period ?? '—'}</td>
-								<td class="num"><Money amount={inv.amount} currency={inv.currency} /></td>
+								<td class="mono nowrap">{inv.number ?? '—'}</td>
+								<td class="nowrap">{inv.period ? formatMonth(inv.period) : '—'}</td>
+								<td class="num"><Money amount={inv.amount} currency={inv.currency} mono /></td>
 								<td>
 									<Badge tone={INVOICE_STATUS_TONES[inv.status] ?? 'muted'} variant={inv.status}>
 										{INVOICE_STATUS_LABELS[inv.status] ?? inv.status}
@@ -622,42 +942,44 @@
 				</DataTable>
 			{/if}
 		</section>
-	{/if}
+	</div>
 </PageHeader>
 
-<!-- Plan-change dialog. `POST /api/billing/change-plan` applies the move on the
-     spot (no preview mode on the backend), so the confirm step says so plainly;
-     the result state then renders the REAL proration the response returned
-     (or a clean no-op message when `changed` is false). -->
+<!-- Plan-change dialog — one guided flow (decisions §482): pick → card (only
+     when a paid plan needs one) → review → result. The review shows the
+     provider's own figures for today and what recurs; "Confirm and pay" is the
+     only control that changes the plan or charges anything. -->
 <Modal
 	open={showChangePlan}
 	ariaLabel={m('billing.plan.changeModal.aria')}
-	title={changeResult
-		? m('billing.plan.changeModal.successHeading')
-		: m('billing.plan.changeModal.selectHeading')}
+	title={planModalTitle}
 	onclose={closeChangePlan}
 >
-	{#if changeResult}
+	{#if planStep === 'result' && changeResult}
 		<div class="change-result" data-testid="billing-plan-change-result">
-			{#if changeResult.changed}
-				<p>
+			<!-- A scheduled move (or a retry of one, `changed: false`) reads the
+			     same: when it happens, and what the org keeps until then. -->
+			{#if changeResult.scheduled}
+				<p tabindex="-1" bind:this={resultFocus} data-testid="billing-plan-change-scheduled">
+					{m('billing.plan.changeModal.scheduledResult', {
+						to: planName(changeResult.new_plan_code),
+						from: planName(changeResult.old_plan_code),
+						date: reviewDate(changeResult.effective_at)
+					})}
+				</p>
+			{:else if changeResult.changed}
+				<p tabindex="-1" bind:this={resultFocus}>
 					{m('billing.plan.changeModal.successChanged', {
 						plan: planName(changeResult.new_plan_code)
 					})}
 				</p>
-				<dl class="proration">
-					<dt>{m('billing.plan.changeModal.prorationLabel')}</dt>
-					<dd>
-						<Money
-							amount={changeResult.proration.amount}
-							currency={changedPlanCurrency}
-							accounting
-						/>
-					</dd>
-				</dl>
-				<p class="hint">{m('billing.plan.changeModal.prorationHint')}</p>
+				{#if confirmedPreview && isPositiveAmount(confirmedPreview.amount_due)}
+					<p class="hint">{m('billing.plan.changeModal.paidResult')}</p>
+				{:else if confirmedPreview && isPositiveAmount(confirmedPreview.credit)}
+					<p class="hint">{m('billing.plan.changeModal.creditResult')}</p>
+				{/if}
 			{:else}
-				<p data-testid="billing-plan-change-noop">
+				<p data-testid="billing-plan-change-noop" tabindex="-1" bind:this={resultFocus}>
 					{m('billing.plan.changeModal.successNoop', {
 						plan: planName(changeResult.new_plan_code)
 					})}
@@ -669,46 +991,234 @@
 				</button>
 			</div>
 		</div>
+	{:else if planStep === 'card'}
+		<!-- Keyed: each visit starts a fresh SetupIntent. Saving the card moves on
+		     to the review; it never changes the plan. -->
+		{#key cardStepNonce}
+			<CardSetupPanel
+				pendingPlanName={selectedPlanCode ? planName(selectedPlanCode) : null}
+				pendingPlanCode={selectedPlanCode}
+				onsaved={onCardStepSaved}
+				onclose={backToPick}
+			/>
+		{/key}
+	{:else if planStep === 'review'}
+		<div class="review" data-testid="billing-plan-review" tabindex="-1" bind:this={reviewContainer}>
+			{#if changeError}
+				<!-- Outside the figures, so a refusal stays put (and keeps focus)
+				     while a stale price is re-fetched beneath it. -->
+				<div
+					class="state error change-error"
+					role="alert"
+					tabindex="-1"
+					bind:this={reviewAlert}
+					data-testid="billing-plan-change-error"
+				>
+					<p>{changeError}</p>
+					{#if changeErrorAction}
+						<!-- No card on file / the card was declined: the card step,
+						     then this review again with a fresh price. -->
+						<button
+							type="button"
+							class="btn-primary"
+							onclick={openCardStep}
+							data-testid="billing-plan-change-add-card"
+						>
+							{changeErrorAction === 'add_card'
+								? m('billing.plan.changeModal.addCard')
+								: m('billing.plan.changeModal.updateCard')}
+						</button>
+					{/if}
+				</div>
+			{/if}
+			{#if previewLoading}
+				<LoadingState label={m('billing.plan.review.loading')} />
+				<div class="modal-footer">
+					<button type="button" class="btn-cancel" onclick={backToPick}>
+						{m('billing.plan.review.back')}
+					</button>
+				</div>
+			{:else if previewError}
+				<LoadError
+					message={previewError}
+					onretry={() => selectedPlanCode && loadPreview(selectedPlanCode)}
+					testId="billing-plan-review-error"
+				/>
+				<div class="modal-footer">
+					<button type="button" class="btn-cancel" onclick={backToPick}>
+						{m('billing.plan.review.back')}
+					</button>
+				</div>
+			{:else if preview}
+				{#if preview.already_on_plan}
+					<p data-testid="billing-plan-change-noop" tabindex="-1" bind:this={reviewFocus}>
+						{m('billing.plan.changeModal.successNoop', { plan: planName(preview.plan_code) })}
+					</p>
+					<div class="modal-footer">
+						<button type="button" class="btn-primary" onclick={closeChangePlan}>
+							{m('billing.plan.changeModal.done')}
+						</button>
+					</div>
+				{:else}
+					<p
+						class="review-summary"
+						tabindex="-1"
+						bind:this={reviewFocus}
+						data-testid={preview.effective_at ? 'billing-plan-review-scheduled' : undefined}
+					>
+						{preview.effective_at
+							? m('billing.plan.review.keepUntil', {
+									from: plan?.name ?? '—',
+									to: planName(preview.plan_code),
+									date: reviewDate(preview.effective_at)
+								})
+							: m('billing.plan.review.summary', {
+									from: plan?.name ?? '—',
+									to: planName(preview.plan_code)
+								})}
+					</p>
+					<!-- The provider's figures, as the server sent them. -->
+					<ul class="review-figures" data-testid="billing-plan-review-figures">
+						<li data-testid="billing-plan-review-today">
+							{isPositiveAmount(preview.amount_due)
+								? m('billing.plan.review.payToday', {
+										amount: reviewMoney(preview.amount_due, preview.currency)
+									})
+								: m('billing.plan.review.nothingToday')}
+						</li>
+						{#if isPositiveAmount(preview.credit)}
+							<li data-testid="billing-plan-review-credit">
+								{m('billing.plan.review.credit', {
+									amount: reviewMoney(preview.credit, preview.currency)
+								})}
+							</li>
+						{/if}
+						<li data-testid="billing-plan-review-recurring">
+							{preview.next_amount !== null && preview.next_date
+								? m('billing.plan.review.thenMonthly', {
+										amount: reviewMoney(preview.next_amount, preview.currency),
+										date: reviewDate(preview.next_date)
+									})
+								: m('billing.plan.review.noMonthly', { plan: planName(preview.plan_code) })}
+						</li>
+					</ul>
+					{#if preview.clears_scheduled_change && scheduledChange}
+						<p class="hint" data-testid="billing-plan-review-clears-scheduled">
+							{m('billing.plan.review.clearsScheduled', {
+								plan: scheduledChange.plan_name,
+								date: reviewDate(scheduledChange.effective_at)
+							})}
+						</p>
+					{/if}
+					{#if data?.ai_usage?.overage_unit_price}
+						<!-- The current plan bills AI-read overage: what accrues up to the
+						     change is invoiced with it, beyond the figure above (§482) —
+						     or, for a move kept until the period ends, on that period's
+						     last invoice (§483). -->
+						<p class="hint" data-testid="billing-plan-review-overage">
+							{preview.effective_at
+								? m('billing.plan.review.overageNoteScheduled', { plan: plan?.name ?? '—' })
+								: m('billing.plan.review.overageNote')}
+						</p>
+					{/if}
+
+					<div class="modal-footer">
+						<button type="button" class="btn-cancel" onclick={backToPick} disabled={confirming}>
+							{m('billing.plan.review.back')}
+						</button>
+						<button
+							type="button"
+							class="btn-primary"
+							onclick={confirmPlanChange}
+							disabled={confirming}
+							data-testid="billing-plan-confirm"
+						>
+							{confirming
+								? m('billing.plan.review.confirming')
+								: isPositiveAmount(preview.amount_due)
+									? m('billing.plan.review.confirmPay')
+									: m('billing.plan.review.confirm')}
+						</button>
+					</div>
+				{/if}
+			{/if}
+		</div>
 	{:else}
 		<form
+			bind:this={pickForm}
 			onsubmit={(e) => {
 				e.preventDefault();
-				confirmPlanChange();
+				continueToReview();
 			}}
 		>
 			{#if plansLoading}
-				<p class="state">{m('billing.plan.changeModal.loading')}</p>
+				<LoadingState label={m('billing.plan.changeModal.loading')} />
 			{:else if plansError}
-				<div class="state error" role="alert">
-					<p>{plansError}</p>
-					<button type="button" class="btn" onclick={loadAvailablePlans}>
-						{m('billing.retry')}
-					</button>
-				</div>
+				<LoadError
+					message={plansError}
+					onretry={loadAvailablePlans}
+					testId="billing-plans-error"
+				/>
 			{:else if availablePlans.length === 0}
 				<p class="state">{m('billing.plan.changeModal.empty')}</p>
 			{:else}
-				<fieldset class="plan-options">
-					<legend>{m('billing.plan.changeModal.legend')}</legend>
+				<fieldset class="plan-options" data-testid="billing-plan-options">
+					<!-- The dialog's own heading ("Choose a plan") already says what
+					     this is, so the legend names the group for assistive tech
+					     without printing a second caption under it. -->
+					<legend class="visually-hidden">{m('billing.plan.changeModal.legend')}</legend>
+					<!-- Native radios in a fieldset: Tab enters the group, the arrow
+					     keys move and select, and "2 of 3" comes from the browser.
+					     The whole card is the radio's <label>, so any click on it
+					     selects. The radio's name stays short ("Select the Growth
+					     plan"); price, highlights and the current-plan marker are its
+					     description. -->
 					{#each availablePlans as p (p.code)}
 						{@const isCurrent = plan?.code === p.code}
-						<label class="plan-option" class:selected={selectedPlanCode === p.code}>
+						<!-- Already where the scheduled move goes: not offered again. -->
+						{@const isScheduled = scheduledChange?.plan_code === p.code}
+						{@const highlights = planHighlightLines.get(p.code)}
+						{@const idBase = `plan-option-${p.code}`}
+						<label
+							class="plan-option"
+							class:selected={selectedPlanCode === p.code}
+							data-testid="billing-plan-option"
+						>
 							<input
 								type="radio"
 								name="plan-code"
 								value={p.code}
 								checked={selectedPlanCode === p.code}
-								disabled={isCurrent}
+								disabled={isCurrent || isScheduled}
 								onchange={() => (selectedPlanCode = p.code)}
 								aria-label={m('billing.plan.changeModal.selectAria', { name: p.name })}
+								aria-describedby={[
+									isCurrent ? `${idBase}-current` : null,
+									isScheduled ? `${idBase}-scheduled` : null,
+									`${idBase}-price`,
+									highlights ? `${idBase}-features` : null
+								]
+									.filter(Boolean)
+									.join(' ')}
 							/>
-							<span class="plan-option-name">
-								{p.name}
-								{#if isCurrent}
-									<span class="current-pill">{m('billing.plan.changeModal.currentBadge')}</span>
+							<span class="plan-option-body">
+								<span class="plan-option-head">
+									<span class="plan-option-name">{p.name}</span>
+									{#if isCurrent}
+										<span class="current-pill" id="{idBase}-current">
+											{m('billing.plan.changeModal.currentBadge')}
+										</span>
+									{:else if isScheduled}
+										<span class="current-pill" id="{idBase}-scheduled">
+											{m('billing.plan.changeModal.scheduledBadge')}
+										</span>
+									{/if}
+								</span>
+								{#if highlights}
+									<span class="plan-option-features" id="{idBase}-features">{highlights}</span>
 								{/if}
 							</span>
-							<span class="plan-option-price">
+							<span class="plan-option-price" id="{idBase}-price">
 								<Money amount={p.monthly_price} currency={p.currency} />
 								<span class="per">{m('billing.plan.perMonth')}</span>
 							</span>
@@ -716,11 +1226,7 @@
 					{/each}
 				</fieldset>
 
-				{#if changeError}
-					<div class="state error" role="alert">{changeError}</div>
-				{/if}
-
-				<p class="apply-notice">{m('billing.plan.changeModal.applyNotice')}</p>
+				<p class="apply-notice">{m('billing.plan.changeModal.pickNotice')}</p>
 
 				<div class="modal-footer">
 					<button type="button" class="btn-cancel" onclick={closeChangePlan}>
@@ -729,12 +1235,10 @@
 					<button
 						type="submit"
 						class="btn-primary"
-						disabled={!selectedPlanCode || changingPlan}
-						data-testid="billing-change-plan-confirm"
+						disabled={!selectedPlanCode}
+						data-testid="billing-change-plan-continue"
 					>
-						{changingPlan
-							? m('billing.plan.changeModal.changing')
-							: m('billing.plan.changeModal.changeButton')}
+						{m('billing.plan.changeModal.continue')}
 					</button>
 				</div>
 			{/if}
@@ -743,113 +1247,351 @@
 </Modal>
 
 <style>
+	/* The page body fills the shared workspace frame like every other
+	   Settings tab: no width cap of its own (frontend/docs/ui-patterns.md
+	   § Page layout; guarded by src/lib/settingsTabWidth.test.ts). */
+	.billing {
+		display: flex;
+		flex-direction: column;
+		gap: 2rem;
+		width: 100%;
+		min-width: 0;
+	}
+
+	.billing > :global(*) {
+		min-width: 0;
+	}
+
+	/* The card surface every non-table section sits on — the same radius and
+	   shadow `.grid-container` and `.kpi` use, so the page reads as one set. */
+	.panel {
+		background: var(--surface);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		box-shadow: var(--shadow-card);
+		padding: 1.5rem;
+	}
+
+	.section-title {
+		margin: 0;
+		font-size: 1.1rem;
+		font-weight: 600;
+	}
+
+	.section-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+	}
+
+	.list-section,
+	.usage {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
 	.state {
 		color: var(--text-muted);
-		padding: 1rem 0;
+		margin: 0;
+		padding: 0.5rem 0;
 	}
 
 	.state.error {
-		color: #f06464;
+		color: var(--danger);
 	}
 
-	.empty {
-		max-width: 640px;
-		padding: 1rem 0;
+	.change-error {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.75rem;
 	}
 
+	.change-error p {
+		margin: 0;
+		flex: 1 1 16rem;
+	}
+
+	/* --- Status callout (past due) --- */
+	.callout {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		border-left-width: 4px;
+		border-radius: var(--radius);
+		padding: 1rem 1.25rem;
+	}
+
+	.callout.tone-danger {
+		border-left-color: var(--danger);
+	}
+
+	.callout.tone-info {
+		border-left-color: var(--accent);
+	}
+
+	.scheduled-change {
+		margin-top: 1.25rem;
+	}
+
+	.scheduled-change button {
+		align-self: flex-start;
+		margin-top: 0.5rem;
+	}
+
+	.callout p {
+		margin: 0;
+		color: var(--text-muted);
+	}
+
+	.callout a {
+		color: var(--accent);
+		font-weight: 600;
+		align-self: flex-start;
+		margin-top: 0.25rem;
+	}
+
+	/* --- Empty (no subscription) --- */
 	.empty h2 {
 		margin: 0 0 0.5rem;
+		font-size: 1.25rem;
 	}
 
 	.empty p {
 		color: var(--text-muted);
-		margin: 0 0 1rem;
+		margin: 0 0 1.25rem;
+		max-width: 42rem;
 	}
 
-	.plan-card {
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 12px;
-		padding: 1.5rem;
-		max-width: 720px;
-		margin-bottom: 1.5rem;
+	.btn-link {
+		display: inline-block;
+		text-decoration: none;
+	}
+
+	/* --- Current plan --- */
+	.plan-pending {
+		/* Roughly the settled card's height, so the sections below do not jump
+		   when the plan lands. */
+		min-height: 14rem;
 	}
 
 	.plan-head {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: flex-start;
 		justify-content: space-between;
-		gap: 1rem;
+		gap: 1rem 2rem;
 	}
 
-	.eyebrow {
+	.plan-title {
+		min-width: 0;
+	}
+
+	.eyebrow,
+	.meta-label,
+	.plan-meta dt {
 		display: block;
 		font-size: 0.75rem;
+		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 		color: var(--text-muted);
 	}
 
-	.plan-name {
-		margin: 0.25rem 0 0;
-		font-size: 1.5rem;
-	}
-
-	.plan-meta {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-		gap: 1rem;
-		margin-top: 1.25rem;
-	}
-
-	.meta-item {
+	.plan-name-row {
 		display: flex;
-		flex-direction: column;
-		gap: 0.25rem;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 0.75rem;
+		margin-top: 0.35rem;
 	}
 
-	.meta-label {
-		font-size: 0.75rem;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--text-muted);
+	.plan-name {
+		margin: 0;
+		font-size: 1.75rem;
+		line-height: 1.2;
+		overflow-wrap: anywhere;
 	}
 
-	.meta-value {
-		font-weight: 600;
+	.plan-price {
+		margin: 0;
+		display: flex;
+		align-items: baseline;
+		gap: 0.35rem;
+		white-space: nowrap;
+	}
+
+	.price-figure {
+		font-size: 1.75rem;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.per {
 		font-weight: 400;
 		color: var(--text-muted);
-		font-size: 0.85rem;
+		font-size: 0.9rem;
+	}
+
+	.plan-meta {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+		gap: 1rem 1.5rem;
+		margin: 1.5rem 0 0;
+		padding-top: 1.25rem;
+		border-top: 1px solid var(--hairline);
+	}
+
+	.meta-item {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+		min-width: 0;
+	}
+
+	.plan-meta dd {
+		margin: 0;
+		font-weight: 600;
+		overflow-wrap: anywhere;
 	}
 
 	.entitlements {
-		margin-top: 1.25rem;
+		margin-top: 1.5rem;
 	}
 
+	.entitlements h3 {
+		margin: 0;
+	}
+
+	/* A checklist, not tag pills: the features are what the plan buys, and a
+	   list of sentences reads as one where a cloud of chips does not. */
 	.entitlements ul {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+		gap: 0.5rem 1.5rem;
 		list-style: none;
 		padding: 0;
-		margin: 0.5rem 0 0;
+		margin: 0.6rem 0 0;
 	}
 
-	/* Not `<Badge>`: an entitlement TAG list, not a status — sentence-cased,
-	   regular weight, and read as a group. Colour comes from the palette pair. */
 	.entitlements li {
+		display: flex;
+		align-items: flex-start;
+		gap: 0.5rem;
+		font-size: 0.9rem;
+	}
+
+	.check {
+		flex: none;
+		width: 1rem;
+		height: 1rem;
+		margin-top: 0.15rem;
+		fill: none;
+		stroke: var(--success);
+		stroke-width: 2;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+
+	.plan-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.75rem 1.25rem;
+		margin-top: 1.5rem;
+		padding-top: 1.25rem;
+		border-top: 1px solid var(--hairline);
+	}
+
+	.link {
+		color: var(--accent);
+		font-size: 0.9rem;
+	}
+
+	/* --- Usage --- */
+	.period {
+		font-weight: 400;
+		color: var(--text-muted);
+		font-size: 0.95rem;
+	}
+
+	/* `AiUsagePanel` draws its own top rule and offset for when it followed
+	   other content; as the first thing inside its card those are a stray
+	   line. Neutralised here rather than in the shared component. */
+	.usage .panel > :global(.ai-usage) {
+		margin-top: 0;
+		padding-top: 0;
+		border-top: none;
+	}
+
+	.usage-counts {
+		margin-top: 0.5rem;
+	}
+
+	.usage-title {
+		margin: 0 0 0.75rem;
+	}
+
+	.usage-title > h3 {
+		margin: 0;
+		font-size: 0.95rem;
+	}
+
+	.kpi-row {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+		gap: 1rem;
+	}
+
+	.note {
+		margin: 0.75rem 0 0;
+		color: var(--text-muted);
+		font-size: 0.9rem;
+	}
+
+	/* --- Payment methods --- */
+	.card-label {
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+	}
+
+	/* Not `<Badge>`: the "default card" marker inside a table cell — a
+	   register smaller than a status pill, metric-matched to `.current-pill`
+	   below, and it owns its own inline offset. Colour is the palette pair. */
+	.default-pill {
+		display: inline-block;
+		margin-left: 0.5rem;
 		background: var(--accent-tint);
 		color: var(--accent-on-tint);
-		padding: 3px 10px;
-		border-radius: 12px;
-		font-size: 0.8rem;
-		text-transform: capitalize;
+		padding: 2px 8px;
+		border-radius: 10px;
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		font-weight: 600;
 	}
 
-	/* Plan-change modal: picker fieldset + result panel. */
+	/* --- Invoices --- */
+	.num {
+		text-align: right;
+	}
+
+	/* An invoice number or month broken across lines ("FL-/2026-/10") is
+	   unreadable; at phone width the table scrolls inside `DataTable` instead. */
+	.nowrap {
+		white-space: nowrap;
+	}
+
+	.muted {
+		color: var(--text-muted);
+	}
+
+	/* --- Plan-change modal: picker fieldset + result panel --- */
 	.plan-options {
 		border: none;
 		padding: 0;
@@ -859,49 +1601,99 @@
 		gap: 0.5rem;
 	}
 
-	.plan-options legend {
-		font-size: 0.75rem;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--text-muted);
-		padding: 0 0 0.5rem;
-	}
-
+	/* A radio card. `.modal label` (app.css) is the stacked field recipe —
+	   column flex, and every direct-child span set as a small uppercase muted
+	   caption — so each rule below states the direction and type it means
+	   rather than inheriting a form label's. */
 	.plan-option {
 		display: flex;
+		flex-direction: row;
 		align-items: center;
 		gap: 0.75rem;
 		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 0.65rem 0.85rem;
+		border-radius: var(--radius-sm);
+		padding: 0.7rem 0.9rem;
 		cursor: pointer;
+		transition: border-color 0.15s var(--ease-out);
 	}
 
+	.plan-option:hover:not(:has(input:disabled)) {
+		border-color: var(--border-strong);
+	}
+
+	/* The ring goes on the card, not the 16px dot: the card is the target the
+	   reader sees (same move as SegmentedControl's segment). */
+	.plan-option:has(input:focus-visible) {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+
+	/* The plan you already have: de-emphasised with the muted colour token,
+	   never `opacity`, which takes the text below its contrast floor. */
 	.plan-option:has(input:disabled) {
 		cursor: default;
-		opacity: 0.6;
+		color: var(--text-muted);
 	}
 
+	/* Border + ring, no tinted fill: muted highlight text on --accent-tint
+	   over --surface is ~4.3:1 in the dark theme, under the 4.5:1 floor. */
 	.plan-option.selected {
 		border-color: var(--accent);
+		box-shadow: 0 0 0 1px var(--accent);
 	}
 
-	.plan-option-name {
+	.plan-option-body,
+	.plan-option-price {
+		text-transform: none;
+		letter-spacing: normal;
+		font-size: 0.9rem;
+		color: inherit;
+	}
+
+	.plan-option-body {
 		flex: 1;
-		font-weight: 600;
+		min-width: 0;
 		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		font-weight: 400;
+	}
+
+	.plan-option-head {
+		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.5rem;
 	}
 
+	.plan-option-name {
+		font-weight: 600;
+		font-size: 0.95rem;
+	}
+
+	.plan-option-features {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+
 	.plan-option-price {
+		margin-left: auto;
+		text-align: right;
 		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
 		font-weight: 600;
 	}
 
+	.plan-option-price .per {
+		font-weight: 400;
+		font-size: 0.8rem;
+		color: var(--text-muted);
+	}
+
 	/* Not `<Badge>`: a "this is the one you already have" marker inside a
-	   radio label, deliberately smaller than a status pill (0.7rem) and metric-
-	   matched to `.default-pill` below. Colour comes from the palette pair. */
+	   radio label, deliberately smaller than a status pill and metric-matched
+	   to `.default-pill` above. Colour comes from the palette pair. */
 	.current-pill {
 		background: var(--muted-tint);
 		color: var(--muted-on-tint);
@@ -919,194 +1711,39 @@
 		margin: 0 0 1rem;
 	}
 
-	.change-result .proration {
+	.review {
 		display: flex;
-		align-items: baseline;
-		justify-content: space-between;
-		gap: 1rem;
-		background: var(--surface-2);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 0.75rem 1rem;
-		margin: 0.75rem 0;
+		flex-direction: column;
+		gap: 0.75rem;
 	}
 
-	.change-result .proration dt {
-		/* Same 4.34:1 failure as the admin code chips — muted text on
-		   --surface-2. /billing is not in the axe route list, so this one was
-		   latent rather than caught. */
-		color: var(--text);
+	.review .hint {
+		margin: 0;
 		font-size: 0.85rem;
+		color: var(--text-muted);
 	}
 
-	.change-result .proration dd {
+	.review-summary {
 		margin: 0;
 		font-weight: 600;
-		font-size: 1.1rem;
+	}
+
+	/* The figures the reader is confirming. Muted text on --surface-2 is
+	   4.34:1, so this panel uses --text (1.4.3). */
+	.review-figures {
+		margin: 0;
+		padding: 0.75rem 1rem 0.75rem 2rem;
+		background: var(--surface-2);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		color: var(--text);
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
 	}
 
 	.change-result .hint {
 		font-size: 0.85rem;
 		color: var(--text-muted);
 	}
-
-	.actions {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.75rem;
-		margin-top: 1.5rem;
-		padding-top: 1.25rem;
-		border-top: 1px solid var(--border);
-	}
-
-	.usage-section h3 {
-		margin: 0 0 0.75rem;
-	}
-	.usage-title {
-		margin: 0 0 0.75rem;
-	}
-	.usage-section .usage-title > h3 {
-		margin: 0;
-	}
-
-	.period {
-		font-weight: 400;
-		color: var(--text-muted);
-		font-size: 0.9rem;
-	}
-
-	.kpi-row {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-		gap: 1rem;
-	}
-
-	.note {
-		margin-top: 0.75rem;
-		color: var(--text-muted);
-		font-size: 0.9rem;
-	}
-
-	.btn {
-		background: var(--surface-2);
-		color: var(--text);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 0.5rem 1rem;
-		font-size: 0.9rem;
-		cursor: pointer;
-	}
-
-	.btn:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn.primary {
-		background: var(--accent-strong);
-		color: #fff;
-		border-color: transparent;
-		text-decoration: none;
-		display: inline-block;
-	}
-
-	.link {
-		color: var(--accent);
-		font-size: 0.9rem;
-	}
-
-	.payment-methods-section {
-		margin-top: 1.5rem;
-		max-width: 720px;
-	}
-
-	.pm-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 1rem;
-		margin: 0 0 0.75rem;
-	}
-
-	.pm-head h3 {
-		margin: 0;
-	}
-
-	.card-setup {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.75rem;
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 0.75rem 1rem;
-		margin-bottom: 0.75rem;
-		font-size: 0.9rem;
-	}
-
-	.card-setup p {
-		margin: 0;
-		color: var(--text);
-	}
-
-	.card-setup.state-error {
-		border-color: #f06464;
-	}
-
-	.card-setup.state-error p {
-		color: #f06464;
-	}
-
-	.card-setup-placeholder {
-		color: var(--text-muted) !important;
-		font-style: italic;
-		flex-basis: 100%;
-	}
-
-	.card-setup-dismiss {
-		margin-left: auto;
-		background: none;
-		border: none;
-		cursor: pointer;
-		padding: 0;
-	}
-
-	/* Not `<Badge>`: the "default card" marker inside a table cell — same
-	   smaller register as `.current-pill` above, and it owns its own inline
-	   offset. Colour comes from the palette pair. */
-	.default-pill {
-		display: inline-block;
-		margin-left: 0.5rem;
-		background: var(--accent-tint);
-		color: var(--accent-on-tint);
-		padding: 2px 8px;
-		border-radius: 10px;
-		font-size: 0.7rem;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-		font-weight: 600;
-	}
-
-	.invoices-section {
-		margin-top: 1.5rem;
-		max-width: 720px;
-	}
-
-	.invoices-section h3 {
-		margin: 0 0 0.75rem;
-	}
-
-	.num {
-		text-align: right;
-	}
-
-	.muted {
-		color: var(--text-muted);
-	}
-
-	/* The settlement-state pill is `<Badge>` now. It already spelled out the
-	   shared recipe by hand ("mirrors the StatusBadge .badge recipe") in three
-	   private tones — exactly the duplication the primitive exists to end. */
 </style>

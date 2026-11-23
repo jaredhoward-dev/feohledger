@@ -379,6 +379,157 @@ test.describe("/portal — self-service (PO flip, remittance, company)", () => {
     }
   });
 
+  test("a PO whose total the buyer's ERP cannot confirm shows no figure and cannot be flipped", async ({
+    page,
+  }) => {
+    // The portal API sends `total: null` + `total_unverifiable: true` for such
+    // a PO (decisions §323), and the flip answers 409. The page names the
+    // state, explains it once above the table, and disables the button.
+    await portalSignIn(page);
+    await expect(page).toHaveURL(/\/portal\/invoices/, { timeout: 15_000 });
+    await page.route(
+      (url) => url.pathname === "/api/portal/purchase-orders",
+      (route) =>
+        route.fulfill({
+          json: {
+            items: [
+              {
+                id: "00000000-0000-0000-0000-00000000f002",
+                po_number: "PO-PORTAL-UNV",
+                status: "open",
+                total: null,
+                total_unverifiable: true,
+                currency: "USD",
+                line_item_count: 1,
+                created_at: "2026-09-01T10:00:00",
+                flip_verdict: {
+                  code: "po_total_unverifiable",
+                  message:
+                    "This purchase order's total could not be confirmed. Submit your invoice instead.",
+                  params: {},
+                },
+              },
+            ],
+            total: 1,
+            page: 1,
+            page_size: 20,
+          },
+        }),
+    );
+    await page.getByRole("link", { name: "Purchase Orders" }).click();
+
+    const row = page.locator("table tbody tr", { hasText: "PO-PORTAL-UNV" });
+    await expect(row).toContainText("Being confirmed");
+    await expect(row).not.toContainText("$");
+    const button = row.getByRole("button", { name: "Create invoice" });
+    await expect(button).toBeDisabled();
+    await expect(button).toHaveAttribute("aria-describedby", "po-unverifiable-note");
+    await expect(page.locator("#po-unverifiable-note")).toContainText(
+      "Submit your own invoice",
+    );
+  });
+
+  test("a closed or cancelled PO offers no Create invoice, and its status reads as a label", async ({
+    page,
+  }) => {
+    // The server refuses to flip a PO that no longer commits spend
+    // (`po_not_invoiceable`) and says so per row as `flip_verdict`; the page
+    // reads that verdict instead of a status list of its own. Real backend,
+    // real rows: a closed and an open PO seeded for the portal vendor.
+    await portalSignIn(page);
+    await expect(page).toHaveURL(/\/portal\/invoices/, { timeout: 15_000 });
+
+    const vendorId = tenantPsql(
+      `SELECT vendor_id FROM vendor_users WHERE email='${PORTAL_EMAIL}'`,
+    ).trim();
+    const orgId = tenantPsql(
+      `SELECT organization_id FROM vendors WHERE id='${vendorId}'`,
+    ).trim();
+    const stamp = Date.now();
+    const closedPo = `E2E-CLOSED-${stamp}`;
+    const openPo = `E2E-OPEN-${stamp}`;
+    tenantPsql(
+      `INSERT INTO purchase_orders (id, po_number, vendor_id, total, status, organization_id)
+       VALUES (gen_random_uuid(), '${closedPo}', '${vendorId}', 90.00, 'closed', '${orgId}'),
+              (gen_random_uuid(), '${openPo}', '${vendorId}', 90.00, 'open', '${orgId}')`,
+    );
+
+    try {
+      await page.getByRole("link", { name: "Purchase Orders" }).click();
+      const closedRow = page.locator("table tbody tr", { hasText: closedPo });
+      const openRow = page.locator("table tbody tr", { hasText: openPo });
+      await expect(closedRow).toBeVisible();
+      await expect(closedRow).toContainText("Closed");
+      await expect(closedRow).not.toContainText("closed");
+      // The pill keeps the raw wire value as a class hook (`<Badge
+      // variant="status-badge {status}">`) while its text is the label.
+      await expect(closedRow.locator(".status-badge.closed")).toHaveText("Closed");
+      await expect(openRow.locator(".status-badge.open")).toHaveText("Open");
+      await expect(
+        closedRow.getByRole("button", { name: "Create invoice" }),
+      ).toHaveCount(0);
+      await expect(closedRow.getByTestId("po-flip-refusal")).toHaveText(
+        "No longer open for invoicing",
+      );
+      await expect(openRow).toContainText("Open");
+      await expect(
+        openRow.getByRole("button", { name: "Create invoice" }),
+      ).toBeEnabled();
+    } finally {
+      tenantPsql(
+        `DELETE FROM purchase_orders WHERE po_number IN ('${closedPo}', '${openPo}')`,
+      );
+    }
+  });
+
+  test("an open PO the vendor already invoiced offers no Create invoice", async ({
+    page,
+  }) => {
+    // The flip refuses an open PO a live invoice of this vendor already cites
+    // (`po_already_invoiced`, decisions §468), and the row says so from its
+    // `flip_verdict`. Real backend, real rows: an open PO and an ordinary
+    // invoice citing it, seeded for the portal vendor.
+    await portalSignIn(page);
+    await expect(page).toHaveURL(/\/portal\/invoices/, { timeout: 15_000 });
+
+    const vendorId = tenantPsql(
+      `SELECT vendor_id FROM vendor_users WHERE email='${PORTAL_EMAIL}'`,
+    ).trim();
+    const orgId = tenantPsql(
+      `SELECT organization_id FROM vendors WHERE id='${vendorId}'`,
+    ).trim();
+    const billedPo = `E2E-BILLED-${Date.now()}`;
+    tenantPsql(
+      `INSERT INTO purchase_orders (id, po_number, vendor_id, total, status, organization_id)
+       VALUES (gen_random_uuid(), '${billedPo}', '${vendorId}', 120.00, 'open', '${orgId}')`,
+    );
+    tenantPsql(
+      `INSERT INTO invoices
+         (id, correlation_id, invoice_number, vendor_name, vendor_id, amount, currency,
+          status, po_number, organization_id, created_at, updated_at)
+       VALUES (gen_random_uuid(), gen_random_uuid(), '${billedPo}-INV', 'Portal Vendor',
+               '${vendorId}', 120.00, 'USD', 'ready_for_review', '${billedPo}', '${orgId}',
+               now(), now())`,
+    );
+
+    try {
+      await page.getByRole("link", { name: "Purchase Orders" }).click();
+      const row = page.locator("table tbody tr", { hasText: billedPo });
+      await expect(row).toBeVisible();
+      await expect(
+        row.getByRole("button", { name: "Create invoice" }),
+      ).toHaveCount(0);
+      await expect(row.getByTestId("po-flip-refusal")).toHaveText(
+        "Already invoiced",
+      );
+    } finally {
+      deleteInvoicesWhere(
+        `vendor_id='${vendorId}' AND po_number='${billedPo}'`,
+      );
+      tenantPsql(`DELETE FROM purchase_orders WHERE po_number='${billedPo}'`);
+    }
+  });
+
   test("a vendor downloads a remittance PDF for a completed payment", async ({
     page,
     request,
@@ -469,24 +620,121 @@ test.describe("/portal/change-password", () => {
     await expect(page.locator('input[type="password"]')).toHaveCount(3);
   });
 
-  test("mismatched new/confirm passwords show an inline error and do not submit", async ({
+  test("Submit stays enabled and a submit says what is wrong beside each field", async ({
     page,
   }) => {
+    // #635: the portal form uses the employee forms' PasswordInput +
+    // NewPasswordFields, so it gets the same contract — no disabled Submit,
+    // no banner for a field's problem, each error read with its field.
     await portalSignIn(page);
-    await expect(page).toHaveURL(/\/portal\/invoices/, { timeout: 15_000 });
-
     await page.goto("/portal/change-password");
 
-    const fields = page.locator('input[type="password"]');
-    await fields.nth(0).fill(PORTAL_PASSWORD);
-    await fields.nth(1).fill("A-Strong-New-Pass-1");
-    await fields.nth(2).fill("does-not-match-Pass-1");
-    await page.locator('button[type="submit"]').click();
+    const current = page.getByLabel("Current (temporary) password", { exact: true });
+    const newPw = page.getByLabel("New password", { exact: true });
+    const confirm = page.getByLabel("Confirm new password", { exact: true });
+    const submit = page.getByRole("button", { name: "Save password" });
+    await expect(submit).toBeEnabled();
 
-    // Client-side guard catches the mismatch before any API call —
-    // the `.error` banner shows and we stay on the page.
-    await expect(page.locator(".error")).toBeVisible({ timeout: 5_000 });
+    // Any request the form sends is a failure of the client-side checks.
+    let posted = 0;
+    page.on("request", (r) => {
+      if (r.url().includes("/api/portal/auth/change-password")) posted += 1;
+    });
+
+    // Nothing typed: every field is marked, the first one gets focus.
+    await submit.click();
+    await expect(current).toBeFocused();
+    await expect(current).toHaveAttribute("aria-invalid", "true");
+    await expect(current).toHaveAccessibleDescription("Enter your current password.");
+    await expect(newPw).toHaveAttribute("aria-invalid", "true");
+    await expect(confirm).toHaveAttribute("aria-invalid", "true");
+
+    // The portal enforces the employee rules (`validate_password_complexity`),
+    // so the same checklist describes the field.
+    const rulesId = await page.locator("ul.strength").getAttribute("id");
+    expect(rulesId).toBeTruthy();
+    await expect(newPw).toHaveAttribute("aria-describedby", new RegExp(`\\b${rulesId}\\b`));
+    await current.fill(PORTAL_PASSWORD);
+    await newPw.fill("weakpw");
+    await submit.click();
+    await expect(newPw).toBeFocused();
+    await expect(current).not.toHaveAttribute("aria-invalid", "true");
+    await expect(
+      page.getByText("Password does not meet the complexity requirements."),
+    ).toBeVisible();
+
+    // A mismatch is named on the confirmation, not in a banner.
+    await newPw.fill("A-Strong-New-Pass-1");
+    await confirm.fill("does-not-match-Pass-1");
+    await submit.click();
+    await expect(confirm).toBeFocused();
+    await expect(confirm).toHaveAttribute("aria-invalid", "true");
+    await expect(confirm).toHaveAccessibleDescription("Passwords do not match.");
+    await expect(page.locator(".error")).toHaveCount(0);
     await expect(page).toHaveURL(/\/portal\/change-password/);
+    expect(posted).toBe(0);
+  });
+
+  test("a wrong current password is named beside its field", async ({ page }) => {
+    // The 400 changes nothing server-side (no failure budget on this route),
+    // so it runs against the real backend and the seeded supplier.
+    await portalSignIn(page);
+    await page.goto("/portal/change-password");
+
+    const current = page.getByLabel("Current (temporary) password", { exact: true });
+    await current.fill("not-the-current-password");
+    await page.getByLabel("New password", { exact: true }).fill("A-Strong-New-Pass-1");
+    await page.getByLabel("Confirm new password", { exact: true }).fill("A-Strong-New-Pass-1");
+    const refused = page.waitForResponse(
+      (r) =>
+        r.url().includes("/api/portal/auth/change-password") &&
+        r.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Save password" }).click();
+    expect((await refused).status()).toBe(400);
+
+    await expect(current).toBeFocused();
+    await expect(current).toHaveAttribute("aria-invalid", "true");
+    await expect(current).toHaveAccessibleDescription("That isn't your current password.");
+    await expect(page.locator(".error")).toHaveCount(0);
+
+    // Editing the field clears the server's refusal.
+    await current.fill(PORTAL_PASSWORD);
+    await expect(current).not.toHaveAttribute("aria-invalid", "true");
+  });
+
+  test("each field has the show-password toggle", async ({ page }) => {
+    await portalSignIn(page);
+    await page.goto("/portal/change-password");
+
+    const toggles = page.getByRole("button", { name: "Show password", exact: true });
+    await expect(toggles).toHaveCount(3);
+    const current = page.getByLabel("Current (temporary) password", { exact: true });
+    await current.fill(PORTAL_PASSWORD);
+    await toggles.first().click();
+    await expect(toggles.first()).toHaveAttribute("aria-pressed", "true");
+    await expect(current).toHaveAttribute("type", "text");
+    await expect(current).toHaveAttribute("autocomplete", "current-password");
+  });
+});
+
+test.describe("/portal/login show-password", () => {
+  test("the sign-in field has the toggle, and signing in still works with it on", async ({
+    page,
+  }) => {
+    await acceptConsent(page);
+    await page.goto("/portal/login");
+    const password = page.getByLabel("Password", { exact: true });
+    const toggle = page.getByRole("button", { name: "Show password", exact: true });
+    await page.locator('input[type="email"]').fill(PORTAL_EMAIL);
+    await password.fill(PORTAL_PASSWORD);
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-pressed", "true");
+    await expect(password).toHaveAttribute("type", "text");
+    await expect(password).toHaveAttribute("autocomplete", "current-password");
+
+    await page.getByRole("button", { name: /Sign in/ }).click();
+    await expect(page).toHaveURL(/\/portal\/?$/, { timeout: 15_000 });
   });
 });
 

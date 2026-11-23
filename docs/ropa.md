@@ -23,7 +23,7 @@ transfer mechanism changes.
 | Recipients / sub-processors (who else touches the data) | [`docs/sub-processors.md`](sub-processors.md) — internal working copy; the published register is `/legal/sub-processors` |
 | Retention periods (how the windows are enforced) | [`backend/docs/retention.md`](../backend/docs/retention.md) |
 | International transfers / data residency | [`docs/data-residency.md`](data-residency.md) |
-| Breach notification procedure | [`docs/founder-runbooks/breach-notification.md`](founder-runbooks/breach-notification.md) |
+| Breach notification procedure | [`docs/founder-runbooks/breach-notification.md`](founder-runbooks/breach-notification.md) — GDPR Art. 33's 72 hours to the authority, the processor's "without undue delay" to each controller, and the 24-hour notices the connected platforms' developer terms require (its § 3a) |
 | Cookie / non-essential consent | `frontend/src/lib/components/ConsentBanner.svelte` (banner) |
 
 Retention windows below are summarized from
@@ -165,5 +165,6 @@ When you add an integration/provider, update this RoPA,
 [`docs/sub-processors.md`](sub-processors.md) **and the published register at
 `/legal/sub-processors`** in the same change — the published page is the one a
 customer's DPO reads, and a change to it also triggers the 30-day sub-processor
-notice in `/legal/dpa` § 8 (whose notification half is still manual — see
-`docs/sub-processors.md` § Maintenance).
+notice in `/legal/dpa` § 8: add a `notice=True` entry to
+`backend/app/services/subprocessor_changelog.py`, which publishes the § 10 row
+and emails the notice (see `docs/sub-processors.md` § Maintenance).

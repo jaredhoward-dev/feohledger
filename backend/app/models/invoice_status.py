@@ -1,0 +1,159 @@
+"""The invoice status vocabulary and the named groupings of it.
+
+`InvoiceStatus` is the ONE enum for `Invoice.status`: `models.invoice` and
+`schemas.invoice` both re-export it from here. It used to be declared twice,
+member for member, with nothing holding the two together.
+
+The groupings below are the questions the codebase keeps asking about a
+status — "has a human accepted this yet?", "is it still owed?", "is its
+content frozen?" — answered once. Each was previously restated as a literal
+list in several modules, and the copies had drifted: the budget's realised
+spend left out `sending_to_erp`, and the vendor fraud baselines left out
+`sending_to_erp`, `sent_to_erp` and `done` (issue #575). A module that needs
+one of these sets imports it; `tests/test_invoice_status_groups.py` fails on a
+new literal restatement and pins each set against `VALID_TRANSITIONS`.
+
+Pure: no ORM import, so the IO-free analytics module can use it.
+"""
+
+from __future__ import annotations
+
+import enum
+
+
+class InvoiceStatus(enum.StrEnum):
+    new = "new"
+    pending = "pending"
+    ready_for_review = "ready_for_review"
+    approved = "approved"
+    rejected = "rejected"
+    sending_to_erp = "sending_to_erp"
+    sent_to_erp = "sent_to_erp"
+    posted_in_erp = "posted_in_erp"
+    payment_scheduled = "payment_scheduled"
+    paid = "paid"
+    done = "done"
+    failed = "failed"
+
+
+#: Entered but not yet decided: draft, mid-extraction, or waiting on an
+#: approver. The pipeline the cash forecast projects as lower-certainty
+#: outflow, the "in review" population of the adaptive baselines, and the
+#: statuses a past-due invoice is still worth warning about.
+IN_REVIEW_STATUSES: tuple[InvoiceStatus, ...] = (
+    InvoiceStatus.new,
+    InvoiceStatus.pending,
+    InvoiceStatus.ready_for_review,
+)
+
+#: Everything before an approval decision has been made and stuck. An invoice
+#: here reaches money only through a fresh approval, which is why the
+#: bank-change flag leaves it alone and why a PO-match hold may auto-clear
+#: against a different PO only here (`invoice_warnings`).
+PRE_APPROVAL_STATUSES: frozenset[InvoiceStatus] = frozenset(
+    {*IN_REVIEW_STATUSES, InvoiceStatus.rejected}
+)
+
+#: Approved and still owed: the firm AP commitment. The AP balance, the aging
+#: bands, the committed leg of the cash forecast and the population a
+#: vendor-wide discount can still be captured against. `services/analytics`
+#: re-exports it as strings (`OPEN_AP_STATUSES`).
+OPEN_AP_STATUSES: tuple[InvoiceStatus, ...] = (
+    InvoiceStatus.approved,
+    InvoiceStatus.sending_to_erp,
+    InvoiceStatus.sent_to_erp,
+    InvoiceStatus.posted_in_erp,
+    InvoiceStatus.payment_scheduled,
+)
+
+#: Approved and paid out, or finished: the money has left (or the invoice was
+#: closed as history), so it is no longer owed. Where a payee becomes history
+#: (vendor merge, the bank-change flag), what an open-items statement can no
+#: longer list, what retention may archive, and the importable statuses a CSV
+#: row can never leave for a live stage. `paid` is not terminal (a void takes
+#: it back to `approved`), so this is "settled now", not "settled for good".
+SETTLED_STATUSES: tuple[InvoiceStatus, ...] = (
+    InvoiceStatus.paid,
+    InvoiceStatus.done,
+)
+
+#: The statuses a payment may be created against: approved and able to move
+#: straight to `payment_scheduled` (or already there, a re-attempt). Not
+#: `sending_to_erp` / `sent_to_erp`: a push in flight must reach
+#: `posted_in_erp` first. `services/payment_gates.PAYABLE_INVOICE_STATUSES` is this set
+#: as strings.
+PAYABLE_STATUSES: tuple[InvoiceStatus, ...] = (
+    InvoiceStatus.approved,
+    InvoiceStatus.posted_in_erp,
+    InvoiceStatus.payment_scheduled,
+)
+
+#: Accepted into the books, whatever has happened since: still owed, paid, or
+#: finished. The "historically accepted" population every vendor baseline
+#: reads (coding, price and amount history, remit-to address, anomaly
+#: detection) and the realised leg of a budget. `paid` / `done` also hold
+#: settled history that never went through review (`new -> done`, a CSV import),
+#: which is accepted history all the same; where proof of an approval matters,
+#: read `Invoice.approval_date` (`services/analytics.TOUCHLESS_*`). `failed` is
+#: excluded because it is reachable from `pending` (never reviewed) as well as
+#: from `sending_to_erp`, so the status alone proves nothing; the budget adds it
+#: back only with the stamp (`budget_service.realised_invoice_clause`). Why the
+#: baselines read imported `done` history when §73's touchless rate does not:
+#: `docs/decisions.md` §308.
+APPROVED_OR_BEYOND_STATUSES: tuple[InvoiceStatus, ...] = (
+    *OPEN_AP_STATUSES,
+    *SETTLED_STATUSES,
+)
+
+#: Past approval AND handed onward (ERP push started, payment scheduled, paid,
+#: or finished): the invoice is immutable — no edit, delete, or bulk recode.
+#: `approved` is not in it because its metadata (GL coding, notes, addresses)
+#: is still edited there; its financial fields are frozen by
+#: :func:`financially_locked`, which adds it back.
+POST_APPROVAL_LOCKED_STATUSES: frozenset[InvoiceStatus] = frozenset(
+    set(APPROVED_OR_BEYOND_STATUSES) - {InvoiceStatus.approved}
+)
+
+#: Approved, whatever has happened since: the invoice's financial content
+#: (amount, payee, line items) and its source document are what the approver
+#: signed off. Not the whole lock on its own — an approved invoice whose ERP
+#: push failed sits at `failed` — so read :func:`financially_locked`, never
+#: membership of this set (decisions §363, §370).
+FINANCIALLY_LOCKED_STATUSES: frozenset[InvoiceStatus] = frozenset(
+    {InvoiceStatus.approved} | POST_APPROVAL_LOCKED_STATUSES
+)
+
+
+def was_ever_approved(invoice) -> bool:
+    """Whether the invoice has ever been finally approved.
+
+    Every approval site sets both `approval_date` and `approved_by`, and
+    nothing clears either. Both are read: `approved_by` is a display name and
+    can be empty for a user with a blank `full_name`. Duck-typed over the row
+    so this module stays free of the ORM.
+    """
+    return invoice.approval_date is not None or bool(invoice.approved_by)
+
+
+def financially_locked(invoice) -> bool:
+    """Whether the invoice's amount, payee, line items and source document are
+    frozen — the ONE predicate every door that changes them asks
+    (decisions §363, §370).
+
+    Frozen from `approved` on (:data:`FINANCIALLY_LOCKED_STATUSES`), and at
+    `failed` once the invoice was ever approved: that is a failed ERP push,
+    which `/retry-erp` pushes again — and a payment run then pays — with no new
+    approval. A `failed` extraction (never approved) stays open; its corrected
+    figures still meet approval.
+
+    Fail closed: only the statuses known to sit before an approval decision
+    are open, so a status added to the enum later is frozen until someone
+    decides otherwise. `tests/test_invoice_status_groups.py` pins this to
+    :data:`FINANCIALLY_LOCKED_STATUSES` for every status that exists today.
+    """
+    status = invoice.status
+    if status in PRE_APPROVAL_STATUSES:
+        return False
+    if status == InvoiceStatus.failed:
+        return was_ever_approved(invoice)
+    return True

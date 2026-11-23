@@ -64,12 +64,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import settings
 from app.database import _make_tenant_url, control_session_factory
-from app.models.invoice import Invoice, InvoiceStatus
+from app.db_engine import create_async_engine
+from app.models.invoice import Invoice
+from app.models.invoice_status import SETTLED_STATUSES
 from app.models.organization import Organization
 from app.models.positive_pay import PositivePayFile
 from app.models.workflow import AuditLog
@@ -81,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 # Terminal invoice states eligible for soft-archival once past the window. We
 # never archive an in-flight invoice — only a closed one (paid out or done).
-_ARCHIVABLE_INVOICE_STATES = (InvoiceStatus.done, InvoiceStatus.paid)
+_ARCHIVABLE_INVOICE_STATES = SETTLED_STATUSES
 
 # Average days per month for window math. Retention windows are coarse
 # (months / years), so a 30.44-day month is plenty precise and avoids a

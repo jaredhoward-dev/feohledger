@@ -61,6 +61,27 @@ export function timeAgo(iso: string, placeholder = '—'): string {
 }
 
 /**
+ * A deadline relative to now, in the reader's language: "in 3 hr." / "in 2
+ * days", or "3 hr. ago" once it has passed (overdue is the negative of the
+ * same unit). Hours under a day, whole days after that — the buckets the
+ * exception queue's Due column has always used. Reads the active locale and
+ * shares {@link timeAgo}'s memoized formatter, so a table of rows constructs
+ * one `Intl.RelativeTimeFormat`, not one per cell.
+ *
+ * Null, empty or unparseable input returns `placeholder` (default `—`).
+ */
+export function formatDueIn(iso: string | null | undefined, placeholder = '—'): string {
+	if (!iso) return placeholder;
+	const due = new Date(iso).getTime();
+	if (Number.isNaN(due)) return placeholder;
+	const hours = Math.round((due - Date.now()) / 3600000);
+	const fmt = relativeFormatter('always');
+	return Math.abs(hours) < 24
+		? fmt.format(hours, 'hour')
+		: fmt.format(Math.round(hours / 24), 'day');
+}
+
+/**
  * Parse a bare calendar date (`YYYY-MM-DD` or `YYYY-MM`) into a `Date` at
  * *local* midnight. `new Date('2026-06-20')` parses the string as UTC, which
  * in a negative-offset timezone (e.g. America/New_York) rolls the displayed
@@ -136,4 +157,18 @@ export function formatPeriod(p: string): string {
 		day: isMonthKey ? undefined : 'numeric',
 		year: '2-digit'
 	});
+}
+
+/**
+ * A `YYYY-MM` month key as a reader says it, with the full year: "Nov 2026"
+ * (`short`) or "November 2026" (`long`). Use it wherever a month stands alone
+ * as a label, e.g. a billing period. {@link formatPeriod}'s two-digit year is
+ * for dense chart axes; on its own "Nov 26" reads as the 26th of November.
+ * Returns the raw key unchanged if it isn't a parseable month.
+ */
+export function formatMonth(key: string, style: 'short' | 'long' = 'short'): string {
+	if (!/^\d{4}-\d{2}$/.test(key)) return key;
+	const d = parseLocalDate(key);
+	if (!d) return key;
+	return d.toLocaleDateString(getActiveFormatLocale(), { month: style, year: 'numeric' });
 }

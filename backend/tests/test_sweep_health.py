@@ -565,6 +565,34 @@ async def test_public_health_probe_contract_is_unchanged():
     assert resp.json() == {"status": "ok"}
 
 
+async def test_public_health_probe_body_matches_the_external_uptime_check():
+    """Route 53's external check on api.<domain> (infra/uptime.tf) passes only
+    when the raw body contains a literal string. Pin that string against the
+    bytes this endpoint actually sends, so a change to either side — a body
+    reformatted with spaces, or the Terraform string edited — fails here
+    instead of paging the operator for an API that is up."""
+    import re
+
+    import httpx
+
+    from app.main import app
+
+    uptime_tf = Path(__file__).resolve().parents[2] / "infra" / "uptime.tf"
+    match = re.search(r'api_health_search_string\s*=\s*"((?:[^"\\]|\\.)*)"', uptime_tf.read_text())
+    assert match, "infra/uptime.tf no longer declares api_health_search_string"
+    search_string = match.group(1).replace('\\"', '"')
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get("/api/health")
+
+    assert resp.status_code == 200
+    assert search_string in resp.text
+    # Route 53 only reads the first 5,120 bytes of the body.
+    assert resp.text.index(search_string) + len(search_string) <= 5120
+
+
 async def test_sweep_report_returns_every_sweep_for_an_admin(health_client, monkeypatch):
     _disable_all(monkeypatch)
     sweep_health.sweep_started(_TEST_SWEEP)
@@ -657,3 +685,86 @@ async def test_sweep_report_flags_an_enabled_sweep_that_never_started(health_cli
     shipper = next(r for r in body["sweeps"] if r["name"] == "audit-log-shipper")
     assert shipper["state"] == STATE_NOT_STARTED
     assert shipper["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# erp-auto-send (decisions §411): listed, off by default, started only when on
+# ---------------------------------------------------------------------------
+
+
+def test_erp_auto_send_is_a_canonical_sweep_off_by_default(monkeypatch):
+    from app.config import Settings
+
+    assert SWEEP_ENABLED_FLAGS["erp-auto-send"] == "erp_auto_send_sweep_enabled"
+    assert Settings.model_fields["erp_auto_send_sweep_enabled"].default is False
+    # The committed local defaults must not turn it on either (guard rail 7).
+    dev_env = (Path(__file__).resolve().parents[1] / ".env.development").read_text()
+    assert "FEOH_ERP_AUTO_SEND_SWEEP_ENABLED" not in dev_env
+
+    monkeypatch.setattr(settings, "erp_auto_send_sweep_enabled", False)
+    assert sweep_health.snapshot_of("erp-auto-send").state == STATE_DISABLED
+    monkeypatch.setattr(settings, "erp_auto_send_sweep_enabled", True)
+    assert sweep_health.snapshot_of("erp-auto-send").state == STATE_NOT_STARTED
+
+
+async def test_erp_auto_send_appears_in_the_sweep_report(health_client, monkeypatch):
+    _disable_all(monkeypatch)
+
+    async with health_client("admin") as client:
+        resp = await client.get("/api/health/sweeps")
+
+    row = next(r for r in resp.json()["sweeps"] if r["name"] == "erp-auto-send")
+    assert row["enabled"] is False
+    assert row["state"] == STATE_DISABLED
+
+
+async def _drive_lifespan(monkeypatch, *, enabled: bool) -> list[str]:
+    """Run app/main.py's real lifespan with every other sweep off and the
+    auto-send loop replaced by a probe; returns what the probe saw."""
+    import app.database
+    import app.services.erp_auto_send_sweep as auto_send
+    from app.main import app as fastapi_app
+
+    seen: list[str] = []
+    running = asyncio.Event()
+
+    async def _probe_loop():
+        seen.append("started")
+        running.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            seen.append("cancelled")
+            raise
+
+    async def _no_dispose():
+        return None
+
+    _disable_all(monkeypatch)
+    monkeypatch.setattr(settings, "debug", True)  # skip the deploy-config guards
+    monkeypatch.setattr(settings, "erp_auto_send_sweep_enabled", enabled)
+    monkeypatch.setattr(auto_send, "run_auto_send_sweep_loop", _probe_loop)
+    # The shared engines outlive this test; shutdown must not dispose them.
+    monkeypatch.setattr(app.database, "dispose_all_engines", _no_dispose)
+
+    async with fastapi_app.router.lifespan_context(fastapi_app):
+        if enabled:
+            await asyncio.wait_for(running.wait(), timeout=5)
+        tasks = {t.get_name() for t in asyncio.all_tasks()}
+        seen.append("task-present" if "erp-auto-send" in tasks else "task-absent")
+    return seen
+
+
+async def test_lifespan_starts_and_cancels_erp_auto_send_only_when_enabled(monkeypatch):
+    assert await _drive_lifespan(monkeypatch, enabled=True) == [
+        "started",
+        "task-present",
+        "cancelled",
+    ]
+    # Cancelled at shutdown is a clean stop, not a death.
+    assert sweep_health.snapshot_of("erp-auto-send").state == STATE_STOPPED
+
+
+async def test_lifespan_leaves_erp_auto_send_off_by_default(monkeypatch):
+    assert await _drive_lifespan(monkeypatch, enabled=False) == ["task-absent"]
+    assert sweep_health.snapshot_of("erp-auto-send").state == STATE_DISABLED

@@ -4,18 +4,19 @@ publish_to: 'none'
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.11.4
+  sdk: ^3.14.0
+  flutter: 3.50.0
 
 dependencies:
-  cached_network_image: ^4.0.4
-  camera: ^0.12.1
+  cached_network_image: ^4.0.7
+  camera: ^0.12.2
   cupertino_icons: ^2.0.0
-  file_picker: ^12.0.0-beta.7
-  firebase_core: ^5.0.0
-  firebase_messaging: ^17.0.0
+  file_picker: ^13.3.2
+  firebase_core: ^5.1.0
+  firebase_messaging: ^17.0.1
   flutter:
     sdk: flutter
-  flutter_local_notifications: ^22.3.2
+  flutter_local_notifications: ^22.3.3
   flutter_localizations:
     sdk: flutter
   flutter_secure_storage: ^11.2.0
@@ -24,18 +25,20 @@ dependencies:
   image_picker: ^1.2.4
   intl: ^0.20.2
   local_auth: ^3.0.2
+  material_ui: ^1.11.0
   path: ^1.9.1
   path_provider: ^2.1.6
   pdfx: ^2.11.0
   pull_to_refresh_flutter3: ^2.0.2
   share_plus: ^13.3.1
-  sqflite: ^2.4.4+1
+  sqflite: ^2.4.6
+  url_launcher: ^6.3.3
 
 dev_dependencies:
   flutter_lints: ^6.0.0
   flutter_test:
     sdk: flutter
-  sqflite_common_ffi: ^2.4.4
+  sqflite_common_ffi: ^2.4.7
 
 flutter:
   generate: true

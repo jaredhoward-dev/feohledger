@@ -1,5 +1,9 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
+	import { page as appPage } from '$app/state';
+	import { untrack } from 'svelte';
+	import { formatPercent } from '#lib/utils/percent.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { hasPartialRealisedSet, partialRealisedCount } from '#lib/utils/discountPartialSet.ts';
@@ -14,10 +18,13 @@
 	import type { MoneyAmount, MoneyString } from '#lib/utils/money.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import { isAllowed } from '#lib/api/actionVerdicts.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
@@ -59,8 +66,10 @@
 	// audit page documents the same gotcha).
 	const userLoaded = $derived(auth.user !== null);
 	const canRead = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk', 'cfo'));
-	const canDecide = $derived(auth.isManager || auth.isCfo);
-	// PROPOSE (`_WRITE_ROLES`) = admin / ap_manager — narrower than `canDecide`.
+	// DECIDE (accept / decline) is not restated here: each row carries the
+	// server's verdict (`offer.actions`, from the endpoints' own gates — a
+	// settled invoice, closed tier windows, a lapsed or decided offer, the role).
+	// PROPOSE (`_WRITE_ROLES`) = admin / ap_manager — narrower than deciding.
 	// A CFO may accept or decline an offer a supplier put on the table, but
 	// putting one TO a supplier is an AP operation, so `POST /bulk-negotiate`
 	// 403s them. Showing the trigger to a CFO would be the same dead end this
@@ -96,11 +105,52 @@
 	let offers = $state<DiscountOffer[]>([]);
 	let total = $state(0);
 	let page = $state(1);
-	let statusFilter = $state<DiscountStatusFilter>('all');
+	// URL-backed (`?status=`), like every sibling list: back / reload / a shared
+	// link land on the same filtered view. An unknown value falls back to `all`.
+	const STATUS_FILTERS: readonly DiscountStatusFilter[] = [
+		'all',
+		'offered',
+		'accepted',
+		'captured',
+		'missed'
+	];
+	function statusFromUrl(): DiscountStatusFilter {
+		const raw = appPage.url.searchParams.get('status');
+		return STATUS_FILTERS.find((s) => s === raw) ?? 'all';
+	}
+	let statusFilter = $state<DiscountStatusFilter>(statusFromUrl());
+
+	// A WRITER, never a dependency source: every read is untracked so the
+	// effect that calls it does not re-fire on its own replaceState.
+	function syncUrl() {
+		untrack(() => {
+			const url = new URL(appPage.url.href);
+			if (statusFilter !== 'all') url.searchParams.set('status', statusFilter);
+			else url.searchParams.delete('status');
+			if (url.search !== appPage.url.search) replaceState(`${url.pathname}${url.search}`, {});
+		});
+	}
+
+	// Percentages follow the active in-app locale ("12.3 %" in French, not a
+	// hard-coded `12.3%`) through the shared formatter. Rates are shown at a
+	// fixed precision; a tier's discount keeps up to two places so a 1.25 %
+	// tier is not rounded into a neighbour.
+	function formatPct(value: number, digits: number): string {
+		return formatPercent(value, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+	}
+	function tierPct(value: number): string {
+		return formatPercent(value, { maximumFractionDigits: 2 });
+	}
 
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// The KPI dashboard's failure. The offers list has its own flag below: the
+	// two are separate requests, and one shared message let a successful offers
+	// load wipe the dashboard's error while its cards still read "—".
 	let error = $state<string | null>(null);
+	// A failed first-page offers load. Rendered in place of the table, which
+	// otherwise claimed "No discount offers match this filter." for an outage.
+	let offersError = $state(false);
 
 	// The KPI row's own load state, separate from `loading` (which tracks the
 	// OFFERS list — a different request that resolves on its own schedule).
@@ -150,6 +200,13 @@
 		return o.tiers.reduce((best, t) => (t.percent > best.percent ? t : best));
 	}
 
+	/** The tiers `POST /accept` takes by name today (`capturable_tier_days`,
+	 *  from the endpoint's own tier gate) — the only ones the dialog offers. */
+	function capturableTiers(o: DiscountOffer): DiscountTier[] {
+		const days = new Set(o.capturable_tier_days ?? []);
+		return o.tiers.filter((t) => days.has(t.days));
+	}
+
 	function bestDiscountAmount(o: DiscountOffer): MoneyString | null {
 		const t = bestTier(o);
 		if (!t) return null;
@@ -183,12 +240,13 @@
 			if (!dashboardSequence.canCommit(token)) return;
 			dashboard = data;
 			dashboardPending = false;
+			error = null;
 		} catch (e) {
 			// The KPI row is best-effort — a failure here shouldn't blank the table.
 			if (!dashboardSequence.isCurrentRequest(token)) return;
 			dashboard = null;
 			dashboardPending = false;
-			if (!error) error = e instanceof Error ? e.message : m('discounts.error.dashboard');
+			error = e instanceof Error ? e.message : m('discounts.error.dashboard');
 		}
 	}
 
@@ -208,13 +266,18 @@
 			offers = opts.append ? appendUnique(offers, data.items) : data.items;
 			total = data.total;
 			page = nextPage;
-			error = null;
+			offersError = false;
 		} catch (e) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!offersSequence.isCurrentRequest(token)) return;
-			error = e instanceof Error ? e.message : m('discounts.error.offers');
-			if (!opts.append) offers = [];
+			if (opts.append) {
+				toast(e instanceof Error ? e.message : m('discounts.error.offers'), 'error');
+			} else {
+				offers = [];
+				total = 0;
+				offersError = true;
+			}
 		} finally {
 			if (offersSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -233,6 +296,7 @@
 		if (!canRead) return;
 		// Re-fetch the offers whenever the status filter changes.
 		statusFilter;
+		syncUrl();
 		loadOffers();
 	});
 
@@ -243,8 +307,8 @@
 
 	function openAccept(o: DiscountOffer) {
 		acceptTarget = o;
-		// Default to the richest tier.
-		selectedTierDays = bestTier(o)?.days ?? null;
+		// Default to the richest tier the server will still take today.
+		selectedTierDays = bestTier({ ...o, tiers: capturableTiers(o) })?.days ?? null;
 	}
 
 	async function confirmAccept() {
@@ -371,7 +435,7 @@
 	{/snippet}
 
 	{#if !userLoaded}
-		<p class="loading">{m('common.loading')}</p>
+		<LoadingState />
 	{:else if !canRead}
 		<p class="loading">{m('discounts.redirecting')}</p>
 	{:else}
@@ -429,7 +493,7 @@
 			     claim we cannot make before the response lands. -->
 			<KpiCard
 				value={dashboard && !dashboard.insufficient_data
-					? `${(dashboard.capture_rate_pct ?? 0).toFixed(0)}%`
+					? formatPct(dashboard.capture_rate_pct ?? 0, 0)
 					: null}
 				label={m('discounts.kpi.captureRate')}
 				sub={dashboard?.insufficient_data ? m('discounts.kpi.captureRateUnknown') : null}
@@ -514,7 +578,7 @@
 					<span>{m('discounts.opt.availableSavings')} <strong>{aggMoney(optimization.total_savings_available, optimization.currency)}</strong></span>
 					<span>{m('discounts.opt.selectedSavings')} <strong class="pos">{aggMoney(optimization.total_savings_selected, optimization.currency)}</strong></span>
 					<span>{m('discounts.opt.selectedOutlay')} <strong>{aggMoney(optimization.total_outlay_selected, optimization.currency)}</strong></span>
-					<span>{m('discounts.opt.costOfCapital')} <strong>{optimization.cost_of_capital_pct.toFixed(1)}%</strong></span>
+					<span>{m('discounts.opt.costOfCapital')} <strong>{formatPct(optimization.cost_of_capital_pct, 1)}</strong></span>
 				</div>
 				<!-- The optimizer half of the same guard: an offer in another
 				     currency is excluded from all three totals above (and from
@@ -549,7 +613,7 @@
 								<span class="scenario-roi" class:pos={rec.roi.worthwhile === true}>
 									{rec.roi.annualized_return_pct === null
 										? m('discounts.opt.aprUnknown')
-										: `${rec.roi.annualized_return_pct.toFixed(1)}% APR`}
+										: m('discounts.opt.apr', { pct: formatPct(rec.roi.annualized_return_pct, 1) })}
 								</span>
 								<span class="scenario-sub">
 									{m('discounts.opt.save')}
@@ -560,7 +624,7 @@
 											>{formatAmountWithoutCurrency(rec.roi.savings)}</span
 										>
 									{/if}
-									· {rec.discount_percent}% / {rec.tier_days}d
+									· {m('discounts.opt.tierTerms', { percent: tierPct(rec.discount_percent), days: rec.tier_days })}
 								</span>
 								<!-- The banner above reports how MANY rows are excluded; this
 								     says which one you are looking at. Without it the card
@@ -610,7 +674,7 @@
 										{:else}
 											<span class="money">{formatAmountWithoutCurrency(rec.roi.savings)}</span>
 										{/if}
-										· {rec.discount_percent}% / {rec.tier_days}d
+										· {m('discounts.opt.tierTerms', { percent: tierPct(rec.discount_percent), days: rec.tier_days })}
 									</span>
 									<span class="scenario-flag">{m('discounts.opt.notRanked')}</span>
 								</div>
@@ -625,90 +689,101 @@
 		<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 
 		{#if error}
-			<p class="dash-error" role="alert">{error}</p>
+			<LoadError message={error} onretry={() => loadDashboard()} testId="discounts-dashboard-error" />
 		{/if}
 
-		<DataTable
-			columns={OFFER_COLUMNS}
-			isEmpty={!loading && offers.length === 0}
-			empty={loading ? m('discounts.table.loading') : m('discounts.table.empty')}
-			colspan={8}
-		>
-			{#snippet body()}
-				{#each offers as offer (offer.id)}
-					{@const best = bestTier(offer)}
-					{@const bestAmt = bestDiscountAmount(offer)}
-					<tr>
-						<td>
-							<span class="primary">{offer.vendor_name ?? '—'}</span>
-							{#if offer.invoice_number}
-								<span class="secondary mono">{offer.invoice_number}</span>
-							{/if}
-						</td>
-						<td><span class="scope-pill">{offer.scope}</span></td>
-						<td>
-							<DiscountTierBar
-								tiers={offer.tiers}
-								acceptedDays={offer.accepted_tier?.days ?? null}
-							/>
-						</td>
-						<td class="right"><Money amount={offer.base_amount} currency={offer.currency} mono /></td>
-						<td class="right">
-							{#if bestAmt !== null && best}
-								<span class="best-discount">
-									<Money amount={bestAmt} currency={offer.currency} mono />
-									<span class="best-pct">{best.percent}%</span>
-								</span>
-							{:else}
-								<span class="muted">—</span>
-							{/if}
-						</td>
-						<td>
-							<Badge tone={DISCOUNT_STATUS_TONES[offer.status]} variant="status-badge {offer.status}">
-								{STATUS_LABELS[offer.status]}
-							</Badge>
-						</td>
-						<td class="muted">
-							{formatDate(offer.valid_until)}
-							{#if offer.valid_until && offer.status === 'offered'}
-								<span class="rel">{relativeDeadline(offer.valid_until)}</span>
-							{/if}
-						</td>
-						<td class="actions">
-							<!-- Deciding an offer is `_ACCEPT_ROLES` (admin / ap_manager /
-							     cfo). A clerk reads this page; showing them buttons the
-							     API would 403 is the dead end in the other direction. -->
-							{#if offer.status === 'offered' && canDecide}
-								<RowAction variant="success" onclick={() => openAccept(offer)} ariaLabel={m('discounts.row.acceptAria', { vendor: offer.vendor_name ?? offer.id.slice(0, 8) })}>
-									{m('discounts.row.accept')}
-								</RowAction>
-								<RowAction
-									variant="danger"
-									armed={confirmDeclineId === offer.id}
-									disabled={declining}
-									onclick={() => decline(offer)}
-									ariaLabel={m('discounts.row.declineAria', { vendor: offer.vendor_name ?? offer.id.slice(0, 8) })}
-								>
-									{confirmDeclineId === offer.id ? m('discounts.row.confirm') : m('discounts.row.decline')}
-								</RowAction>
-							{/if}
-						</td>
-					</tr>
-				{/each}
-			{/snippet}
-		</DataTable>
-
-		{#if hasMore}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={() => loadOffers({ append: true })} disabled={loadingMore}>
-					{loadingMore ? m('common.loading') : m('discounts.loadMore', { shown: offers.length, total })}
-				</button>
-			</div>
-		{:else if total > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('discounts.showingAll', { total })}</span>
-			</div>
+		{#if offersError && !loading}
+			<LoadError
+				message={m('discounts.error.offers')}
+				onretry={() => loadOffers()}
+				testId="discounts-offers-error"
+			/>
+		{:else}
+			<DataTable
+				columns={OFFER_COLUMNS}
+				isEmpty={!loading && offers.length === 0}
+				{loading}
+				empty={m('discounts.table.empty')}
+				colspan={8}
+			>
+				{#snippet body()}
+					{#each offers as offer (offer.id)}
+						{@const best = bestTier(offer)}
+						{@const bestAmt = bestDiscountAmount(offer)}
+						<tr>
+							<td>
+								<span class="primary">{offer.vendor_name ?? '—'}</span>
+								{#if offer.invoice_number}
+									<span class="secondary mono">{offer.invoice_number}</span>
+								{/if}
+							</td>
+							<td><span class="scope-pill">{offer.scope}</span></td>
+							<td>
+								<DiscountTierBar
+									tiers={offer.tiers}
+									acceptedDays={offer.accepted_tier?.days ?? null}
+								/>
+							</td>
+							<td class="right"><Money amount={offer.base_amount} currency={offer.currency} mono /></td>
+							<td class="right">
+								{#if bestAmt !== null && best}
+									<span class="best-discount">
+										<Money amount={bestAmt} currency={offer.currency} mono />
+										<span class="best-pct">{tierPct(best.percent)}</span>
+									</span>
+								{:else}
+									<span class="muted">—</span>
+								{/if}
+							</td>
+							<td>
+								<Badge tone={DISCOUNT_STATUS_TONES[offer.status]} variant="status-badge {offer.status}">
+									{STATUS_LABELS[offer.status]}
+								</Badge>
+							</td>
+							<td class="muted">
+								{formatDate(offer.valid_until)}
+								{#if offer.valid_until && offer.status === 'offered'}
+									<span class="rel">{relativeDeadline(offer.valid_until)}</span>
+								{/if}
+							</td>
+							<td class="actions">
+								<!-- Each control reads the row's verdict (`offer.actions`), the
+								     answer the endpoint itself would give this reader — never a
+								     restated status or role check (ui-patterns.md § Whether to
+								     offer an action). -->
+								{#if isAllowed(offer.actions?.accept)}
+									<RowAction variant="success" onclick={() => openAccept(offer)} ariaLabel={m('discounts.row.acceptAria', { vendor: offer.vendor_name ?? offer.id.slice(0, 8) })}>
+										{m('discounts.row.accept')}
+									</RowAction>
+								{/if}
+								{#if isAllowed(offer.actions?.decline)}
+									<RowAction
+										variant="danger"
+										armed={confirmDeclineId === offer.id}
+										disabled={declining}
+										onclick={() => decline(offer)}
+										ariaLabel={m('common.rowActionAria', { action: confirmDeclineId === offer.id ? m('discounts.row.confirm') : m('discounts.row.decline'), name: offer.vendor_name ?? offer.id.slice(0, 8) })}
+									>
+										{confirmDeclineId === offer.id ? m('discounts.row.confirm') : m('discounts.row.decline')}
+									</RowAction>
+								{/if}
+							</td>
+						</tr>
+					{/each}
+				{/snippet}
+			</DataTable>
 		{/if}
+
+		<LoadMoreFooter
+			shown={offers.length}
+			{total}
+			{hasMore}
+			loading={loadingMore}
+			errored={offersError}
+			onloadmore={() => loadOffers({ append: true })}
+			moreKey="discounts.loadMore"
+			allKey="discounts.showingAll"
+		/>
 	{/if}
 </PageHeader>
 
@@ -728,10 +803,10 @@
 				· {m('discounts.modal.base')} <Money amount={acceptTarget.base_amount} currency={acceptTarget.currency} />
 			</p>
 
-			{#if acceptTarget.tiers.length > 0}
+			{#if capturableTiers(acceptTarget).length > 0}
 				<fieldset class="tier-picker">
 					<legend>{m('discounts.modal.chooseTier')}</legend>
-					{#each [...acceptTarget.tiers].sort((a, b) => a.days - b.days) as tier (tier.days)}
+					{#each capturableTiers(acceptTarget).sort((a, b) => a.days - b.days) as tier (tier.days)}
 						<label class="tier-option">
 							<input
 								type="radio"
@@ -741,7 +816,7 @@
 								onchange={() => (selectedTierDays = tier.days)}
 							/>
 							<span class="tier-option-label">
-								{m('discounts.modal.tierOption', { percent: tier.percent, days: tier.days })}
+								{m('discounts.modal.tierOptionFormatted', { percent: tierPct(tier.percent), days: tier.days })}
 								<span class="tier-option-amt">
 									{m('discounts.modal.save')} <Money
 										amount={scaleMoney(acceptTarget.base_amount, tier.percent, {
@@ -783,18 +858,13 @@
 		padding: 20px;
 	}
 
-	.dash-error {
-		color: var(--danger);
-		font-weight: 500;
-	}
-
 	/* Amber, not red: the totals are still usable — they just don't cover every
 	   offer on screen. Same tone + weight as the /cfo cash-position card's
 	   `.cf-skipped` notice, which reports the mirror-image currency gap. */
 	.disc-skipped {
 		font-size: 0.85rem;
 		margin: 0;
-		color: #d4940a;
+		color: var(--warning);
 		font-weight: 600;
 	}
 
@@ -879,7 +949,7 @@
 		color: var(--text);
 	}
 	.opt-summary strong.pos {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	/* --- Optimizer recommendation cards (cfo scenario-grid style) --- */
@@ -899,8 +969,8 @@
 	}
 
 	.scenario-card.best {
-		border-color: #2faa6a;
-		background: rgba(47, 170, 106, 0.06);
+		border-color: var(--success);
+		background: color-mix(in srgb, var(--success) 6%, transparent);
 	}
 
 	.scenario-title {
@@ -915,7 +985,7 @@
 	}
 
 	.scenario-roi.pos {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	.scenario-sub {
@@ -931,7 +1001,7 @@
 	}
 
 	.scenario-flag.selected {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	/* The unrankable block sits BELOW the ranked grid and is visibly its own
@@ -955,7 +1025,7 @@
 	.scenario-warn {
 		font-size: 0.72rem;
 		font-weight: 600;
-		color: #d4940a;
+		color: var(--warning);
 	}
 
 	/* --- Offers table cells --- */
@@ -999,7 +1069,7 @@
 
 	.best-pct {
 		font-size: 0.7rem;
-		color: #1fa86a;
+		color: var(--success);
 		font-weight: 600;
 	}
 
@@ -1046,7 +1116,7 @@
 
 	.tier-option-amt {
 		font-size: 0.78rem;
-		color: #1fa86a;
+		color: var(--success);
 		font-weight: 600;
 	}
 

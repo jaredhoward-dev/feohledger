@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:feohledger_mobile/api/api_client.dart';
 import 'package:feohledger_mobile/api/endpoints.dart';
 import 'package:feohledger_mobile/config.dart';
+import 'package:feohledger_mobile/l10n/ambient_localizations.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/models/mfa_challenge.dart';
 import 'package:feohledger_mobile/models/user.dart';
@@ -41,10 +42,17 @@ class AuthStore extends ChangeNotifier {
   User? _user;
   bool _loading = false;
   String? _error;
+  Object? _errorDetail;
 
   User? get user => _user;
   bool get loading => _loading;
   String? get error => _error;
+
+  /// The raw decoded `detail` behind [error] when the server coded it — the
+  /// sign-in challenge's wrong code (`mfa_code_invalid`), which the code
+  /// screen states through `localizeCodedRefusal` with [error] as the
+  /// fallback. Cleared with [error].
+  Object? get errorDetail => _errorDetail;
   bool get loggedIn => _user != null;
 
   bool get isAdmin => _user?.isAdmin ?? false;
@@ -61,6 +69,12 @@ class AuthStore extends ChangeNotifier {
   // hid the Approvals tab and the Approve button from the CFO — the one role
   // the `require_cfo_above` gate (services/review.py) demands for a high-value
   // invoice — so such an invoice could not be approved from mobile at all.
+  //
+  // It gates the Approvals TAB only (`home_screen`): whether this user reviews
+  // invoices at all, the permission the server lists on `/auth/me`. Whether to
+  // offer Approve / Reject on a given invoice is the server's per-invoice
+  // verdict (`GET /api/invoices/{id}/review-actions`), read by the detail
+  // screen and the approvals queue; never gate those buttons on this.
   bool get canApproveInvoice => _user?.can(kPermInvoiceApprove) ?? false;
   bool get canViewPayments => isAdmin || isManager || isCfo;
   // Vendor verify/reject + ERP sync — mirrors the backend gate on those
@@ -71,15 +85,20 @@ class AuthStore extends ChangeNotifier {
   // (same as viewing payments). CFO sign-off on over-threshold runs is a
   // separate server-side gate surfaced via `requires_cfo_approval`.
   bool get canManagePayments => isAdmin || isManager || isCfo;
-  // CFO sign-off on an over-threshold payment run — mirrors the backend
-  // `require_roles(ROLE_CFO)` on POST /api/payments/runs/{id}/approve. This is
-  // deliberately the STRICT cfo role, not `canManagePayments` and not "admin
-  // counts as CFO": `require_roles` does not special-case admin, so an admin
-  // without the cfo role would see the control and get a 403 on every tap —
-  // and widening the backend isn't the fix, because a sign-off an admin can
-  // grant themselves is not a sign-off. Mirrors the web app's
-  // `auth.hasRole('cfo')` on the same button.
-  bool get canApprovePaymentRun => isCfo;
+  // CFO sign-off on an over-threshold payment run has no getter here: the
+  // Runs tab offers it from the run detail's `actions.approve` verdict, which
+  // carries the strict cfo role AND maker-checker (the CFO who created the
+  // run is refused) — a role check alone offered that CFO an Approve that
+  // could only 403.
+  // Recording a payment made outside FeohLedger — `POST
+  // /api/payments/record-outside` is require_permission(PERM_PAYMENT_RECORD_
+  // EXTERNAL), held by admin / ap_manager / cfo by default and grantable to a
+  // custom role, so it is the permission, never a role list. It gates whether
+  // the queue shows "Record as paid" at all; whether a given row may be
+  // recorded is that row's server verdict (`record_outside_refusal`), and a
+  // run's is the run detail's `actions.record_outside`.
+  bool get canRecordExternalPayment =>
+      _user?.can(kPermPaymentRecordExternal) ?? false;
   // Invoice field editing at any editable status — the manage roles
   // (admin / ap_manager / cfo) of `backend/app/api/invoice_entry.py`.
   bool get canEditInvoice => isAdmin || isManager || isCfo;
@@ -117,19 +136,18 @@ class AuthStore extends ChangeNotifier {
   // so the Settings entry point is hidden for them rather than handing them a
   // guaranteed 403 on first paint.
   bool get canViewAdaptive => isAdmin || isManager || isCfo;
-  // Dismissing an advisory suggestion — the backend `_WRITE_ROLES`
-  // (require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)) on
-  // POST /api/adaptive/suggestions/{id}/dismiss. A CFO reads the suggestions
-  // and simply isn't offered the action. Mobile exposes no other adaptive
-  // write: the two apply paths change live approval routing and the org-wide
-  // auto-approve threshold, and stay on the web.
-  bool get canDismissSuggestion => isAdmin || isManager;
   // Recording a quality inspection — mirrors
   // require_roles(ROLE_ADMIN, ROLE_AP_MANAGER) on POST /api/inspections. The
   // inspection *list* and detail are `get_current_user` (role-open), so every
   // role can read the queue and only these two get the record affordance —
   // the same split the web /goods-receipts Inspections tab applies.
   bool get canRecordInspection => isAdmin || isManager;
+  // Recording a goods receipt — mirrors `RECEIPT_ENTRY_ROLES`
+  // (require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK)) on
+  // POST /api/goods-receipts. A CFO is not offered the form: receiving is a
+  // duty segregated from approval (backend decisions §267).
+  bool get canRecordGoodsReceipt =>
+      isAdmin || isManager || (_user?.hasRole('ap_clerk') ?? false);
 
   /// Drop all in-memory state. Called on logout / forced logout through
   /// `SessionManager.endSession` — this is a process-lifetime singleton, so
@@ -139,6 +157,7 @@ class AuthStore extends ChangeNotifier {
     _user = null;
     _loading = false;
     _error = null;
+    _errorDetail = null;
     notifyListeners();
   }
 
@@ -181,6 +200,7 @@ class AuthStore extends ChangeNotifier {
   Future<LoginResult> login(String email, String password, String tenant) async {
     _loading = true;
     _error = null;
+    _errorDetail = null;
     notifyListeners();
 
     try {
@@ -205,8 +225,8 @@ class AuthStore extends ChangeNotifier {
     } catch (e) {
       _loading = false;
       _error = e is ApiException
-          ? 'Invalid credentials'
-          : 'Connection failed: $e';
+          ? ambientLocalizations().authInvalidCredentials
+          : describeApiError(e);
       notifyListeners();
       return const LoginResult(LoginOutcome.failure);
     }
@@ -224,6 +244,7 @@ class AuthStore extends ChangeNotifier {
   }) async {
     _loading = true;
     _error = null;
+    _errorDetail = null;
     notifyListeners();
 
     try {
@@ -242,9 +263,10 @@ class AuthStore extends ChangeNotifier {
       // transport problem. Neither leaks why (no enumeration).
       _error = e is ApiException
           ? (e.statusCode == 401
-              ? 'Invalid or expired code. Please try again.'
-              : 'Could not verify the code. Please try again.')
-          : 'Connection failed: $e';
+              ? ambientLocalizations().authInvalidCode
+              : ambientLocalizations().authVerifyCodeFailed)
+          : describeApiError(e);
+      _errorDetail = e is ApiException && e.statusCode == 401 ? e.detail : null;
       notifyListeners();
       return const LoginResult(LoginOutcome.failure);
     }
@@ -255,13 +277,14 @@ class AuthStore extends ChangeNotifier {
   /// code screen can show a retry affordance.
   Future<bool> requestEmailOtp(String challengeToken) async {
     _error = null;
+    _errorDetail = null;
     try {
       await AuthApi.requestEmailOtp(challengeToken);
       return true;
     } catch (e) {
       _error = e is ApiException
-          ? 'Could not send the email code. Please try again.'
-          : 'Connection failed: $e';
+          ? ambientLocalizations().authEmailCodeFailed
+          : describeApiError(e);
       notifyListeners();
       return false;
     }

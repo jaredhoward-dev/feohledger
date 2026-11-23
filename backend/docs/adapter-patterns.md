@@ -13,6 +13,55 @@ with no registered adapter must fail closed, never silently fall back to `mock`.
 To add one: copy `mock_adapter.py`, implement the interface, register with the
 decorator.
 
+## Where an adapter's host comes from
+
+Every outbound host falls in exactly one of three classes, and the class decides
+the client (`utils/url_safety`, decisions §334 / §339):
+
+- **Per-org host** (any tenant admin can write it) — untrusted. Route it through
+  `url_safety.org_host_client`: an up-front SSRF check, then a client pinned to
+  the vetted address. Pass `allow_private=not settings.is_deployed` only when a
+  local emulator exists; otherwise `False`.
+- **Per-org value constrained to the vendor's domain** (an account id spliced
+  into `<id>.vendor.com`, a host allowlist) — validate the interpolated part
+  strictly (one hostname label / exact host: no `.`, `:`, `/`, `@`, `\`,
+  `%`, whitespace or non-ASCII), test an injection corpus, and list the module in
+  `tests/test_url_safety.py::_PLAIN_CLIENT_ALLOWED` with the reason.
+- **Operator config** (`FEOH_*`, or a vendor constant) — trusted; a plain client.
+  A provider's per-org config must **never** repoint a vendor's API base: the
+  sealed credential would follow it.
+
+| Adapter | Host source | Class |
+|---|---|---|
+| PEPPOL `as4_gateway` | `settings.peppol.gateway_url` | per-org → `org_host_client` (dev loopback) |
+| Extraction `ollama` | `settings.extraction.base_url` (BYOK) | per-org → `org_host_client` (dev loopback) |
+| Chat `slack` / `teams` | `settings.chat_notifications.webhook_url` | per-org → `org_host_client` |
+| Enrichment `clearbit` / `dun_bradstreet` | `settings.enrichment.base_url` | per-org → `org_host_client` |
+| ERP `syspro`, SSO, branding logo, outbound webhooks, commerce `woocommerce` | admin URL | per-org → own check + pinned client (`_ORG_HOST_BESPOKE`) |
+| ERP `netsuite` | `account_id` → `<id>.suitetalk.api.netsuite.com` / `<id>.restlets.api.netsuite.com` | constrained (`_ACCOUNT_ID_RE`), and pinned (`_ORG_HOST_BESPOKE`) |
+| ERP `dynamics_365_bc` / `sage_accounting_za` | `base_url` allowlisted to the vendor host | constrained |
+| Commerce `shopify` / `lightspeed` | `<handle>.myshopify.com` / `<prefix>.retail.lightspeed.app` | constrained, and pinned via the commerce client |
+| ERP `quickbooks_online`, commerce `square` | `environment` picks one of two vendor hosts | constrained |
+| ERP Merge.dev / Xero / Sage / Intacct / Blackbaud, payments, cards, sanctions, FX, 1099, TIN, LLMs, billing, SMTP, AWS | vendor constant or `FEOH_*` | operator |
+| QMS `generic`, tax-rate `avalara` / `taxjar`, workflow webhook step | per-org URL, **nothing sent yet** | `_ORG_HOST_NOT_YET_SENT` — fails the day a client is built |
+
+The classification is enforced by discovery, not by review: any module under
+`app/` that imports `httpx`, `aiohttp`, `requests`, `smtplib` or
+`urllib.request` must appear in one of `test_url_safety.py`'s lists
+(`_OPERATOR_HOST_MODULES` with its reason, `_ORG_HOST_MODULES`,
+`_ORG_HOST_BESPOKE` or `_PLAIN_CLIENT_ALLOWED`), so a new adapter that reads
+`cfg["base_url"]` into a plain client fails CI. The four no-emulator
+`org_host_client` adopters are also pinned to a literal `allow_private=False`.
+In a module that imports `url_safety`, every spelling of a plain httpx client
+counts against `_PLAIN_CLIENT_ALLOWED` (`import httpx as h`, `from httpx import
+AsyncClient as X`, sync `Client`, `httpx.get(...)`), and each `org_host_client`
+adopter is listed with its per-org config key: the URL the factory checks must
+trace back to that key, not to a constant or a `FEOH_*` setting (decisions §419).
+
+`stripe_treasury` used to accept a per-org `api_base`; it is now
+`FEOH_STRIPE_API_BASE` only (`payments.md` § Local testing). Operator overrides
+that point at fake-erp / fake-commerce / stripe-mock stay unpinned (§334).
+
 
 ### Extraction adapters (`services/extraction_adapters/`)
 
@@ -365,7 +414,7 @@ class AmountMismatchResolver(ExceptionResolver):
     async def apply(self, db, *, exception, invoice, evaluation, actor_id) -> None: ...
 ```
 
-Registry by `exception_type` (`@register_exception_agent`). The `coordinator.run_agent` dispatches by exception type, gates auto-resolve on the org's `autonomy_level` → confidence threshold, and writes an append-only `AgentDecision` row every run; auto-resolves also write the DB-immutable `invoice.approved` audit row via `review.approve_invoice`. `po_mismatch` is owned by a single registered **dispatcher** (`resolvers/po_mismatch.py`) that delegates to three real resolvers, disjoint: `amount_mismatch_v1` (status `matched` — amount variance, snap to PO total + approve), `missing_po_v1` (status `no_po`, exactly one PO matching the full amount — find the real PO by vendor + amount + date, link by `po_number`, approve; never adjusts the amount), and `multi_po_split_v1` (status `no_po`, no single PO matching but a **unique** PO set summing to the total within tolerance — a consolidated invoice spanning several POs; links the whole set via a combined `po_number` ref + multi-PO `po_match` snapshot, approves; never adjusts the amount; bounded combinatorial search ≤12 candidates / set-size ≤4, over-cap pool escalates, ambiguous/none escalates). `missing_data` is owned by a second dispatcher delegating to `gl_coding_v1` (fill/correct the GL — and an empty cost center — from the vendor's dominant approved history via the pure `vendor_enrichment.suggest_fields`, then approve through `review.approve_invoice(corrections=…)`; never moves money). Plus escalate-only stubs for `duplicate`, `fraud_flag`. Local-first: the optional LLM rationale fails soft to a deterministic template with no key. See `docs/exception-agents.md`.
+Registry by `exception_type` (`@register_exception_agent`). The `coordinator.run_agent` dispatches by exception type, gates auto-resolve on the org's `autonomy_level` → confidence threshold, and writes an append-only `AgentDecision` row every run; auto-resolves also write the DB-immutable `invoice.approved` audit row via `review.approve_invoice`. `po_mismatch` is owned by a single registered **dispatcher** (`resolvers/po_mismatch.py`) that delegates to three real resolvers, disjoint: `amount_mismatch_v1` (status `matched` — amount variance, snap to PO total + approve), `missing_po_v1` (status `no_po`, exactly one PO matching the full amount — find the real PO by vendor + amount + date, link by `po_number`, approve; never adjusts the amount), and `multi_po_split_v1` (status `no_po`, no single PO matching but a **unique** PO set summing to the total within tolerance — a consolidated invoice spanning several POs; links the whole set via a combined `po_number` ref + `split_po_ids`, re-matches through the split-aware matcher and approves only on a clean `matched`; never adjusts the amount; bounded combinatorial search ≤12 candidates / set-size ≤4, over-cap pool escalates, ambiguous/none escalates). `missing_data` is owned by a second dispatcher delegating to `gl_coding_v1` (fill/correct the GL — and an empty cost center — from the vendor's dominant approved history via the pure `vendor_enrichment.suggest_fields`, then approve through `review.approve_invoice(corrections=…)`; never moves money). Plus escalate-only stubs for `duplicate`, `fraud_flag`. Local-first: the optional LLM rationale fails soft to a deterministic template with no key. See `docs/exception-agents.md`.
 
 ### PEPPOL adapters (`services/peppol_adapters/`)
 
@@ -380,7 +429,7 @@ class MyAdapter(PeppolAdapter):
 
 Registered: `mock` (in-process, no network — the **local-first default**), `as4_gateway` (real — `httpx` to a hosted Access Point; key via sops, no hardcoded fallback). Selection via `Organization.settings.peppol.provider` → `FEOH_PEPPOL_PROVIDER` (default `mock`). Outbound **send** turns an invoice into UBL via the `e_invoice` package, resolves the receiver via SMP/SML (`resolve_participant`), and transmits via the gateway; SBDH wrapping lives in the adapter, never the generator. `services/peppol_send.send_invoice_over_peppol` orchestrates it (map → tax-validate → UBL → resolve → INSERT `peppol_transmissions('sending')` → send → audit), idempotent at the DB layer. Route `POST /api/invoices/{id}/peppol-send`.
 
-**Inbound receive** (the C4 corner) is now implemented: `parse_inbound` is real on both adapters (mock parses a dev JSON/header envelope; `as4_gateway` maps the hosted AP's inbound-delivery envelope). `api/peppol_inbound.public_router` mounts `POST /api/peppol/inbound/{tenant_slug}` (public-by-design, HMAC-gated, tenant in path, always 204). `services/peppol_receive.receive_peppol_message` mirrors `email_intake.process_inbound_email`: dedupe-precheck → `e_invoice.parse_e_invoice` (structural validate) → create `Invoice(status=new)` → claim the `uq_peppol_message_id` slot with a `PeppolTransmission(direction="inbound", status="delivered")` flushed **before** the S3 upload (so a concurrent-redelivery loser's `IntegrityError` rolls back the whole tenant txn — no second invoice, no orphaned S3 object) → upload payload → `invoice.peppol_received` audit → commit → `dispatch_extraction` (auto-routes to the `einvoice` adapter). Dedupe is the DB unique index only (deliberately **not** Redis — a 24h TTL would let a later redelivery slip through). See `docs/peppol.md`.
+**Inbound receive** (the C4 corner) is now implemented: `parse_inbound` is real on both adapters (mock parses a dev JSON/header envelope; `as4_gateway` maps the hosted AP's inbound-delivery envelope). `api/peppol_inbound.public_router` mounts `POST /api/peppol/inbound/{organization_id}` (public-by-design, HMAC-gated, tenant in path, always 204). `services/peppol_receive.receive_peppol_message` mirrors `email_intake.process_inbound_email`: dedupe-precheck → `e_invoice.parse_e_invoice` (structural validate) → create `Invoice(status=new)` → claim the `uq_peppol_message_id` slot with a `PeppolTransmission(direction="inbound", status="delivered")` flushed **before** the S3 upload (so a concurrent-redelivery loser's `IntegrityError` rolls back the whole tenant txn — no second invoice, no orphaned S3 object) → upload payload → `invoice.peppol_received` audit → commit → `dispatch_extraction` (auto-routes to the `einvoice` adapter). Dedupe is the DB unique index only (deliberately **not** Redis — a 24h TTL would let a later redelivery slip through). See `docs/peppol.md`.
 
 ### Punch-out adapters (`services/punchout_adapters/`)
 
@@ -467,13 +516,18 @@ unconfigured), and the payment-method endpoint (`POST
 admin/cfo, PII-safe card metadata only, graceful not-configured / empty on
 no-customer / unconfigured) are shipped; the invoices/receipts + payment-method
 UI ships on `/billing` (`frontend/src/routes/billing/` — saved-cards list +
-add/replace-card SetupIntent flow with a deployed-only Stripe Elements seam),
-and so does the **live plan-change UI** — a `Modal` picker over `GET
-/api/billing/plans` → an "applies immediately, prorates the current period"
-notice (there is no preview-only mode on the backend) → `POST
-/api/billing/change-plan` on confirm → the result view renders the real
-returned proration via `<Money>` (or a clean no-op message when `changed`
-comes back `false`). See `docs/billing.md`.
+add/replace-card flow, Stripe Elements when a publishable key is configured),
+and so does the **live plan-change UI** — one guided `Modal`: pick a plan
+over `GET /api/billing/plans` → a card step when a paid plan needs one → a
+review of the provider's own price from `POST /api/billing/change-plan/preview`
+(the adapter's `preview_plan_change`) → `POST /api/billing/change-plan` on
+"Confirm and pay", held to that price (decisions §482) → a result view. With a live provider a plan change also creates, amends
+or cancels the customer's Stripe subscription (`services/billing/provider_sync.py`,
+the adapter's `find_live_subscription` / `change_subscription_plan` /
+`cancel_subscription` / `ensure_default_payment_method` / `adopt_setup_intent`;
+decisions §480); a move to a free plan is scheduled for the period end instead
+(`cancel_subscription_at_period_end`, undone by `resume_subscription`;
+`services/billing/scheduled_downgrade.py`, decisions §483). See `docs/billing.md`.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|

@@ -2,25 +2,53 @@
 
 **Why the REST API and not the XML Web Services gateway.** Sage Intacct exposes
 two APIs. The XML gateway (``https://api.intacct.com/ia/xml/xmlgw.phtml``) needs
-a Web Services *sender ID* — a paid developer subscription that every customer
-company must separately authorize — plus a per-request session dance, and it
-answers in XML whose error blocks echo the submitted fields. The REST API
-(``https://api.intacct.com/ia/api/v1``) went generally available in 2025, is
-the API Sage now points new integrations at, and covers every object this
-adapter touches (``accounts-payable/bill``, ``accounts-payable/vendor``,
-``general-ledger/account``, ``purchasing/document``). Its client-credentials
-grant authenticates a Web Services user directly, so the customer pastes
-credentials into the setup page and nobody has to click through a consent
-screen. JSON in, JSON out — no XML parser on this path at all.
+a per-request session dance and answers in XML whose error blocks echo the
+submitted fields. The REST API (``https://api.intacct.com/ia/api/v1``) went
+generally available in 2025, is the API Sage now points new integrations at,
+and covers every object this adapter touches (``accounts-payable/bill``,
+``accounts-payable/vendor``, ``general-ledger/account``,
+``purchasing/document``). JSON in, JSON out — no XML parser on this path.
 
-References (checked 2026-10):
+**Licensing: the REST API still needs a Web Services licence.** Choosing REST
+does NOT avoid the Web Services sender ID (decisions §395, correcting
+§269). Sage's REST quick start requires a Sage Intacct Web Services licence
+(a sender ID and sender password); the app is enrolled in Sage's developer
+programme against that sender ID; and each customer company must authorize the
+sender ID, subscribe to Web Services, and list our client id together with its
+Web Services user under Company > Setup > Company > Security > Authorized
+Client Applications. Only then does the client-credentials grant below answer.
 
-* REST overview + OAuth 2.0 guide —
-  https://developer.sage.com/intacct/docs/developer-portal/guides/oauth2
-* REST FAQ (``X-IA-API-Param-Entity`` for multi-entity companies) —
-  https://developer.sage.com/intacct/docs/developer-portal/rest-api-faq
-* Purchasing documents —
-  https://developer.sage.com/intacct/docs/openapi/purchasing/purchasing.document/tag/Documents
+**Revocation (decisions §400).** The grant itself is that Authorized Client
+Applications entry, and only the customer can remove it. What FeohLedger can end
+is the tokens: the client-credentials grant issues no refresh token, only
+access tokens that live 12 h, cached per worker below. Intacct documents
+``POST /oauth2/revoke`` (form ``token``, the client as form fields or HTTP
+Basic, answering ``{"revoked": true}``), and revoking one token revokes every
+token issued for that Web Services user and company. So
+:meth:`SageIntacctAdapter.revoke_stored_access` mints one fresh token and
+revokes it, which ends any token another worker still holds; tenant deletion
+calls it, and its confirmation still tells the customer to remove the entry.
+
+References (checked 2026-10-23; Sage's guide pages refuse automated fetches,
+the OpenAPI ``.md`` variants do not):
+
+* REST docs root (quick start, OAuth 2.0, query service, error handling) —
+  https://developer.sage.com/intacct/docs/1/sage-intacct-rest-api/
+* OAuth 2.0 (client credentials, "Revoke a token"; checked 2026-11-13 by
+  reading the text the portal ships in the page at this path, and its
+  ``/api/search?term=revoke`` answer, which automated fetches do reach) —
+  https://developer.sage.com/intacct/docs/1/sage-intacct-rest-api/authorization-and-security/oauth2
+* Bill create / get / delete / reverse —
+  https://developer.sage.com/intacct/apis/intacct/1/intacct-openapi/groups/accounts-payable/groups/bills/tags/accounts_payable_bills/paths/create-accounts-payable-bill.md
+  (and ``get-accounts-payable-bill-key``, ``delete-accounts-payable-bill-key``,
+  ``reverse-accounts-payable-bill``)
+* Vendor (``status``, approval ``state``) and GL account (``status``) —
+  ``…/accounts-payable/groups/vendors/…/get-accounts-payable-vendor-key.md`` and
+  ``…/general-ledger/groups/gl-accounts/…/get-general-ledger-account-key.md``
+* Purchasing documents (``totalInTxnCurrency``, ``txnCurrency``) —
+  ``…/purchasing/groups/documents/…/get-purchasing-named-document-key.md``
+* Query service (``orderBy``, ``size`` up to 4000) —
+  ``…/common-resources/tags/common_resources_query/paths/post-services-query.md``
 
 Required ``settings.erp`` config (``type: "sage_intacct"``,
 ``integration_method: "direct"``):
@@ -37,33 +65,65 @@ Optional:
     po_document_type:  the purchasing transaction definition that represents a
                        purchase order (default ``"Purchase Order"``)
 
+**Posting.** A bill is created with ``state: "posted"``: Intacct's create
+defaults to ``draft``, which books nothing to AP or the GL, and the state can
+only move afterwards through a workflow, never a PATCH. Every bill we report as
+posted — one just created, or one a retry finds by ``referenceNumber`` — is
+read back first, and counts only when Intacct shows it posted (``bill_left_
+unposted`` otherwise) at exactly the approved total (``posted_total``).
+
+**Refusals.** A create Intacct refuses with a deterministic 4xx created
+nothing (``ErpPostResult.not_posted``). It is coded, never retried: the bill's
+vendor and accounts are read back by id, and an inactive one is named
+(``vendor_inactive`` / ``account_inactive``); anything else is
+``bill_refused``. Intacct's own error text is never read into a message.
+
 Idempotency: our ``correlation_id`` rides in the bill's ``referenceNumber``,
 and ``post_invoice`` queries for it before creating anything.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import time
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from app.config import settings
 from app.services.erp_adapters.base import (
+    NOT_CONNECTED,
     VENDOR_NOT_LINKED,
     ErpAdapter,
     ErpInvoiceStatus,
+    ErpListingIncomplete,
     ErpPostResult,
     GLAccountPayload,
     InvoicePayload,
+    ListingGap,
+    PoListing,
     PoPayload,
+    PoSkipReason,
+    SkippedPo,
     VendorPayload,
-    erp_failure_message,
+    erp_http_failure,
+    erp_preflight_refusal,
     erp_refusal,
+    erp_status_retryable,
+    sync_listing_pages,
 )
+from app.services.erp_adapters.bill_allocation import MISSING_DATES
 from app.services.erp_adapters.bill_lines import bill_lines
 from app.services.erp_adapters.dispatcher import register_adapter
+from app.services.erp_adapters.posted_total import VoidOutcome, check_posted_total
+from app.utils.dates import utc_today
+
+logger = logging.getLogger(__name__)
 
 PROVIDER = "Sage Intacct"
 DEFAULT_API_BASE = "https://api.intacct.com/ia/api/v1"
@@ -71,18 +131,70 @@ DEFAULT_API_BASE = "https://api.intacct.com/ia/api/v1"
 BILL_OBJECT = "accounts-payable/bill"
 VENDOR_OBJECT = "accounts-payable/vendor"
 GL_ACCOUNT_OBJECT = "general-ledger/account"
+REVERSE_BILL_WORKFLOW = "workflows/accounts-payable/bill/reverse"
 
-#: Query page size and page cap — 10 × 100 = the 1000-row bound every other
-#: adapter's list sync uses.
+#: Stable reason codes of this adapter (beside the shared ones in ``base``).
+#: The create was refused and no further reason could be read.
+BILL_REFUSED = "bill_refused"
+VENDOR_INACTIVE = "vendor_inactive"
+ACCOUNT_INACTIVE = "account_inactive"
+#: Intacct holds a bill under our reference, but not in a posted state (a draft,
+#: or awaiting approval): nothing is in AP to pay, so it is not "posted".
+BILL_LEFT_UNPOSTED = "bill_left_unposted"
+#: The bill under our reference is reversed or declined: not posted, and not
+#: ours to replace (the shared code Business Central uses for the same case).
+EXISTING_INVOICE_NOT_OPEN = "existing_invoice_not_open"
+
+#: Query page size, and the page cap of a lookup made while posting a bill.
+#: The sync listings (chart, vendors, POs) read up to ``SYNC_LISTING_MAX_ROWS``
+#: and raise past it.
 _PAGE_SIZE = 100
 _MAX_PAGES = 10
 
+#: Every paged query is ordered: Intacct evaluates each page independently, so
+#: without a stable order page boundaries shift and rows are skipped or repeated.
+_ORDER_BY = [{"key": "asc"}]
 
-_PO_FIELDS = ["key", "documentNumber", "vendor.name", "state", "txnTotal", "currency.txnCurrency"]
+#: Re-mint a cached token this long before Intacct says it expires.
+_TOKEN_MARGIN_SECONDS = 300
+#: Cached client-credentials tokens: credential digest → (token, expires_at).
+#: Intacct tokens live 12 h; minting one per call spends a transaction and a
+#: round trip each time. The key is a digest, so no secret is held twice.
+_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+
+# `vendor.id` is the vendor ID `list_vendors` reports as `erp_vendor_id`: the
+# PO sync links by it before `vendor.name`, which a rename breaks. The total and
+# currency are the purchasing document's `totalInTxnCurrency` and top-level
+# `txnCurrency`; it has no `txnTotal`, and Intacct 400s a query naming a field
+# the object lacks.
+_PO_FIELDS = [
+    "key",
+    "documentNumber",
+    "vendor.id",
+    "vendor.name",
+    "state",
+    "totalInTxnCurrency",
+    "txnCurrency",
+]
+
+
+def clear_token_cache() -> None:
+    """Forget every cached token (tests, and nothing else, call this)."""
+    _TOKEN_CACHE.clear()
 
 
 class IntacctConfigError(ValueError):
     """``settings.erp`` is missing a field the adapter needs. Names the key only."""
+
+
+class IntacctTokenError(RuntimeError):
+    """The token exchange failed in a way a retry may fix (5xx, 429, network)."""
+
+
+class IntacctNotConnected(IntacctTokenError):
+    """Intacct refused the client credentials (400 / 401 / 403): a wrong secret,
+    an app no longer authorized for the company, or a changed Web Services user.
+    Retrying cannot help."""
 
 
 def _money(value: Decimal) -> str:
@@ -95,7 +207,7 @@ def _money(value: Decimal) -> str:
 
 
 def _decimal_or_none(raw: object) -> Decimal | None:
-    if raw is None or raw == "":
+    if raw is None or raw == "" or isinstance(raw, bool):
         return None
     try:
         return Decimal(str(raw))
@@ -103,9 +215,17 @@ def _decimal_or_none(raw: object) -> Decimal | None:
         return None
 
 
+def _date_or_none(raw: object) -> date | None:
+    try:
+        return date.fromisoformat(str(raw)[:10]) if raw else None
+    except ValueError:
+        return None
+
+
 #: Intacct bill ``state`` (lower-cased) → our status.
 _BILL_STATE_MAP: dict[str, ErpInvoiceStatus] = {
     "draft": ErpInvoiceStatus.draft,
+    "analyzing": ErpInvoiceStatus.draft,
     "submitted": ErpInvoiceStatus.draft,
     "partiallyapproved": ErpInvoiceStatus.draft,
     "approved": ErpInvoiceStatus.open,
@@ -113,6 +233,9 @@ _BILL_STATE_MAP: dict[str, ErpInvoiceStatus] = {
     "selected": ErpInvoiceStatus.open,
     "partiallypaid": ErpInvoiceStatus.partially_paid,
     "paid": ErpInvoiceStatus.paid,
+    # "Posted but has not affected the GL" (a zero-total bill): nothing owing,
+    # and no payment behind it (decisions §303).
+    "novalue": ErpInvoiceStatus.settled_no_payment,
     "reversed": ErpInvoiceStatus.cancelled,
     "reversal": ErpInvoiceStatus.cancelled,
     "declined": ErpInvoiceStatus.cancelled,
@@ -123,17 +246,48 @@ _BILL_STATE_MAP: dict[str, ErpInvoiceStatus] = {
 _UNDELETABLE_STATES = frozenset({"partiallypaid", "paid", "reversed", "reversal", "selected"})
 
 
+def _state(record: dict) -> str:
+    return str(record.get("state") or "").replace("_", "").replace(" ", "").lower()
+
+
 def map_bill_status(record: dict) -> ErpInvoiceStatus:
-    state = str(record.get("state") or "").replace("_", "").replace(" ", "").lower()
-    status = _BILL_STATE_MAP.get(state, ErpInvoiceStatus.unknown)
-    if status is ErpInvoiceStatus.open:
-        # A posted bill with nothing left due has been paid in full, even when
-        # the tenant's state vocabulary hasn't caught up.
-        due = _decimal_or_none(record.get("totalTxnAmountDue"))
-        total = _decimal_or_none(record.get("totalTxnAmount"))
-        if due is not None and total and due == 0:
-            return ErpInvoiceStatus.paid
-    return status
+    """The bill's own ``state``, and nothing else.
+
+    A posted bill with nothing left due is NOT read as paid: an applied credit
+    zeroes the due amount too, and only Intacct's ``paid`` state says money
+    went out (docs/decisions.md §303). A bill whose state lags its payment is
+    reported ``open`` until the state catches up, and the next poll sees it.
+    """
+    return _BILL_STATE_MAP.get(_state(record), ErpInvoiceStatus.unknown)
+
+
+async def _leave_in_place(_key: str) -> VoidOutcome:
+    """The ``void_bill`` for a found bill: never touched, reported not voided."""
+    return VoidOutcome.NOT_VOIDED
+
+
+def _account_codes(payload: InvoicePayload) -> dict[str, str]:
+    """Our GL code for each Intacct account id the payload references."""
+    pairs = [(payload.gl_account_erp_id, payload.gl_account)]
+    pairs += [(li.gl_account_erp_id, li.gl_account) for li in payload.line_items]
+    return {str(erp_id): code for erp_id, code in pairs if erp_id and code}
+
+
+def _vendor_usable(raw: dict) -> bool:
+    """False for a vendor Intacct will not post a bill against.
+
+    ``status`` is ``active`` / ``activeNonPosting`` / ``inactive`` (null reads
+    as the documented default, ``active``); an approval ``state`` of ``s``
+    (submitted) or ``r`` (declined) means its transactions can only be drafts.
+    """
+    status = raw.get("status")
+    state = str(raw.get("state") or "").lower()
+    return (status in (None, "", "active")) and state not in ("s", "r")
+
+
+def _account_usable(raw: dict) -> bool:
+    """False for an ``inactive`` GL account ("cannot be used or referenced")."""
+    return raw.get("status") in (None, "", "active")
 
 
 @register_adapter("sage_intacct")
@@ -141,6 +295,11 @@ class SageIntacctAdapter(ErpAdapter):
     """Direct integration with the Sage Intacct REST API."""
 
     erp_type = "sage_intacct"
+    provider_side_disconnect = (
+        "remove FeohLedger's client ID under Company > Setup > Company > Security > "
+        "Authorized Client Applications in Sage Intacct"
+    )
+    revokes_stored_access = True
 
     # -- config / transport ---------------------------------------------------
 
@@ -157,26 +316,57 @@ class SageIntacctAdapter(ErpAdapter):
         # guard is needed on either branch.
         return (settings.erp_intacct_api_base or DEFAULT_API_BASE).rstrip("/")
 
-    async def _token(self, client: httpx.AsyncClient) -> str:
-        """Client-credentials token for ``user_id@company_id``.
+    def _token_key(self) -> str:
+        parts = [
+            self._base(),
+            self._require("client_id"),
+            self._require("client_secret"),
+            self._require("user_id"),
+            self._require("company_id"),
+        ]
+        return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
+
+    async def _token(self, client: httpx.AsyncClient, *, fresh: bool = False) -> str:
+        """Client-credentials token for ``user_id@company_id``, cached until
+        shortly before Intacct's ``expires_in``.
 
         The secret goes in the form body, never the URL, and is never logged.
-        A failed exchange raises with the status code only.
+        A refused exchange raises :class:`IntacctNotConnected`, any other
+        failure :class:`IntacctTokenError`; both name the status only.
         """
-        resp = await client.post(
-            f"{self._base()}/oauth2/token",
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self._require("client_id"),
-                "client_secret": self._require("client_secret"),
-                "username": f"{self._require('user_id')}@{self._require('company_id')}",
-            },
-        )
+        key = self._token_key()
+        cached = _TOKEN_CACHE.get(key)
+        if cached and not fresh and cached[1] > time.monotonic():
+            return cached[0]
+        try:
+            resp = await client.post(
+                f"{self._base()}/oauth2/token",
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._require("client_id"),
+                    "client_secret": self._require("client_secret"),
+                    "username": f"{self._require('user_id')}@{self._require('company_id')}",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise IntacctTokenError(
+                f"{PROVIDER} token exchange failed: {type(exc).__name__}"
+            ) from None
+        if resp.status_code in (400, 401, 403):
+            _TOKEN_CACHE.pop(key, None)
+            raise IntacctNotConnected(f"{PROVIDER} token exchange refused: HTTP {resp.status_code}")
         if resp.status_code != 200:
-            raise RuntimeError(f"{PROVIDER} token exchange failed: HTTP {resp.status_code}")
-        token = (resp.json() or {}).get("access_token")
+            raise IntacctTokenError(f"{PROVIDER} token exchange failed: HTTP {resp.status_code}")
+        body = resp.json() or {}
+        token = body.get("access_token")
         if not token:
-            raise RuntimeError(f"{PROVIDER} token exchange returned no access token")
+            raise IntacctTokenError(f"{PROVIDER} token exchange returned no access token")
+        try:
+            lifetime = max(int(body.get("expires_in") or 0) - _TOKEN_MARGIN_SECONDS, 0)
+        except (TypeError, ValueError):
+            lifetime = 0
+        if lifetime:
+            _TOKEN_CACHE[key] = (str(token), time.monotonic() + lifetime)
         return str(token)
 
     def _headers(self, token: str) -> dict[str, str]:
@@ -185,46 +375,94 @@ class SageIntacctAdapter(ErpAdapter):
             headers["X-IA-API-Param-Entity"] = str(self.config["location_id"])
         return headers
 
+    async def _send(
+        self, client: httpx.AsyncClient, method: str, path: str, body: dict | None = None
+    ) -> httpx.Response:
+        """One API call with a (cached) token. A 401 means the cached token is
+        no longer good — revoked, or the app de-authorized — so it is minted
+        afresh once; a second 401 is returned as is. A 401 created nothing, so
+        repeating even a create is safe."""
+        kwargs: dict[str, Any] = {}
+        if body is not None:
+            kwargs["content"] = json.dumps(body)
+        for fresh in (False, True):
+            token = await self._token(client, fresh=fresh)
+            resp = await client.request(
+                method, f"{self._base()}/{path}", headers=self._headers(token), **kwargs
+            )
+            if resp.status_code != 401:
+                return resp
+        return resp
+
     async def _query(
         self,
         client: httpx.AsyncClient,
-        token: str,
         obj: str,
         fields: list[str],
         filters: list[dict] | None = None,
         *,
         max_pages: int = _MAX_PAGES,
         size: int = _PAGE_SIZE,
+        complete: str | None = None,
     ) -> list[dict] | None:
-        """POST ``services/core/query``, following ``ia::meta.next``.
+        """POST ``services/core/query``, ordered by ``key``, following
+        ``ia::meta.next``.
 
         Returns None when the first page fails (so callers can tell "no rows"
         from "couldn't ask"); a later page failing ends the walk with what was
         read so far.
+
+        ``complete`` (the collection's name) asks for the whole collection
+        instead: any failing page — a transport error or an unreadable body
+        included — or more rows than ``max_pages`` reach, raises
+        :class:`ErpListingIncomplete` rather than returning part of it.
         """
         rows: list[dict] = []
         start = 1
         for page in range(max_pages):
-            body: dict = {"object": obj, "fields": fields, "start": start, "size": size}
+            body: dict = {
+                "object": obj,
+                "fields": fields,
+                "orderBy": _ORDER_BY,
+                "start": start,
+                "size": size,
+            }
             if filters:
                 body["filters"] = filters
-            resp = await client.post(
-                f"{self._base()}/services/core/query",
-                content=json.dumps(body),
-                headers=self._headers(token),
-            )
+            try:
+                resp = await self._send(client, "POST", "services/core/query", body)
+            except (httpx.HTTPError, IntacctTokenError):
+                # A token Intacct refused or could not mint is a failed page
+                # too: a sync listing is then incomplete, never an uncoded error.
+                if complete is not None:
+                    raise ErpListingIncomplete(
+                        PROVIDER, complete, ListingGap.fetch_failed
+                    ) from None
+                raise
             if resp.status_code != 200:
+                if complete is not None:
+                    raise ErpListingIncomplete(PROVIDER, complete, ListingGap.fetch_failed)
                 return None if page == 0 else rows
-            data = resp.json() or {}
+            try:
+                data = resp.json() or {}
+            except ValueError:
+                if complete is not None:
+                    raise ErpListingIncomplete(
+                        PROVIDER, complete, ListingGap.fetch_failed
+                    ) from None
+                raise
             rows.extend(r for r in data.get("ia::result") or [] if isinstance(r, dict))
             nxt = (data.get("ia::meta") or {}).get("next")
             if not nxt:
                 break
             start = int(nxt)
+        else:
+            if complete is not None:
+                raise ErpListingIncomplete(PROVIDER, complete, ListingGap.truncated)
         return rows
 
     async def _find_bill_key(
-        self, client: httpx.AsyncClient, token: str, correlation_id: str
+        self, client: httpx.AsyncClient, correlation_id: str
     ) -> str | None | bool:
         """Key of the bill already carrying ``correlation_id``.
 
@@ -234,7 +472,6 @@ class SageIntacctAdapter(ErpAdapter):
         """
         rows = await self._query(
             client,
-            token,
             BILL_OBJECT,
             ["key", "id", "billNumber", "referenceNumber"],
             [{"$eq": {"referenceNumber": correlation_id}}],
@@ -250,116 +487,298 @@ class SageIntacctAdapter(ErpAdapter):
         # an unusable lookup rather than a miss.
         return str(key) if key else False
 
+    async def _get_bill(self, client: httpx.AsyncClient, key: str) -> dict | None:
+        resp = await self._send(client, "GET", f"objects/{BILL_OBJECT}/{quote(key, safe='')}")
+        if resp.status_code != 200:
+            return None
+        try:
+            record = (resp.json() or {}).get("ia::result")
+        except ValueError:
+            return None
+        return record if isinstance(record, dict) else None
+
     # -- ErpAdapter -----------------------------------------------------------
 
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         if not payload.vendor_erp_id:
-            return erp_refusal(PROVIDER, VENDOR_NOT_LINKED)
+            return erp_preflight_refusal(PROVIDER, VENDOR_NOT_LINKED)
+        # Both dates are required by the create; refused before any call
+        # rather than as a 400 after the token and the lookup.
+        if payload.invoice_date is None or payload.due_date is None:
+            return erp_preflight_refusal(PROVIDER, MISSING_DATES)
         lines = bill_lines(payload)
         if isinstance(lines, str):
-            return erp_refusal(PROVIDER, lines)
+            return erp_preflight_refusal(PROVIDER, lines)
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            token = await self._token(client)
-
-            existing = await self._find_bill_key(client, token, payload.correlation_id)
-            if existing is False:
-                return ErpPostResult(
-                    success=False,
-                    message=f"{PROVIDER} post failed: idempotency lookup unavailable",
-                )
-            if existing:
-                return ErpPostResult(
-                    success=True,
-                    erp_document_id=existing,
-                    erp_document_number=payload.invoice_number,
-                    message="Already posted to Sage Intacct (idempotent — found by "
-                    "referenceNumber)",
-                )
-
-            body: dict = {
-                "vendor": {"id": payload.vendor_erp_id},
-                "billNumber": payload.invoice_number,
-                "referenceNumber": payload.correlation_id,
-                "currency": {"txnCurrency": payload.currency},
-                "lines": [
-                    {"glAccount": {"id": gl}, "txnAmount": _money(amount), "memo": memo}
-                    for gl, amount, memo in lines
-                ],
-            }
-            if payload.invoice_date:
-                body["createdDate"] = payload.invoice_date.isoformat()
-            if payload.due_date:
-                body["dueDate"] = payload.due_date.isoformat()
-            if payload.description:
-                body["description"] = payload.description
-
-            resp = await client.post(
-                f"{self._base()}/objects/{BILL_OBJECT}",
-                content=json.dumps(body),
-                headers=self._headers(token),
-            )
-
-        if resp.status_code in (200, 201):
-            result = (resp.json() or {}).get("ia::result") or {}
-            key = result.get("key") or result.get("id")
+        # The key of a bill this attempt knows exists in Intacct — created now,
+        # or found under our reference — once there is one. A token refused
+        # after that point says nothing about the bill, so it must not be
+        # reported as "nothing posted".
+        known: dict[str, str] = {}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                return await self._post(client, payload, lines, known)
+        except IntacctNotConnected:
+            if "key" not in known:
+                # Raised by a token exchange before any bill existed, or in
+                # place of a create (a 401 created nothing).
+                return erp_preflight_refusal(PROVIDER, NOT_CONNECTED)
+            refused = erp_refusal(PROVIDER, NOT_CONNECTED)
+            refused.erp_document_id = known["key"]
+            refused.erp_document_number = payload.invoice_number
+            return refused
+        except IntacctTokenError as exc:
             return ErpPostResult(
-                success=True,
-                erp_document_id=str(key) if key is not None else None,
-                erp_document_number=payload.invoice_number,
-                message="Posted to Sage Intacct",
-                raw_response=result if isinstance(result, dict) else None,
+                success=False,
+                erp_document_id=known.get("key"),
+                erp_document_number=payload.invoice_number if known else None,
+                message=str(exc),
             )
-        return ErpPostResult(success=False, message=erp_failure_message(PROVIDER, resp.status_code))
 
-    async def _get_bill(self, client: httpx.AsyncClient, token: str, key: str) -> dict | None:
-        resp = await client.get(
-            f"{self._base()}/objects/{BILL_OBJECT}/{quote(key, safe='')}",
-            headers=self._headers(token),
+    async def _post(
+        self,
+        client: httpx.AsyncClient,
+        payload: InvoicePayload,
+        lines: list[tuple[str, Decimal, str]],
+        known: dict[str, str],
+    ) -> ErpPostResult:
+        existing = await self._find_bill_key(client, payload.correlation_id)
+        if existing is False:
+            return ErpPostResult(
+                success=False,
+                message=f"{PROVIDER} post failed: idempotency lookup unavailable",
+            )
+        if existing:
+            # Our earlier attempt. It counts as posted on the same terms as a
+            # bill just created: Intacct shows it posted at the approved total.
+            known["key"] = str(existing)
+            return await self._confirm(
+                client,
+                payload,
+                str(existing),
+                "Already posted to Sage Intacct (idempotent — found by referenceNumber)",
+                found=True,
+            )
+
+        body: dict = {
+            "vendor": {"id": payload.vendor_erp_id},
+            "billNumber": payload.invoice_number,
+            "referenceNumber": payload.correlation_id,
+            # Intacct's create defaults to `draft`, which books nothing.
+            "state": "posted",
+            "createdDate": payload.invoice_date.isoformat(),  # type: ignore[union-attr]
+            "dueDate": payload.due_date.isoformat(),  # type: ignore[union-attr]
+            "currency": {"txnCurrency": payload.currency},
+            "lines": [
+                {"glAccount": {"id": gl}, "txnAmount": _money(amount), "memo": memo}
+                for gl, amount, memo in lines
+            ],
+        }
+        if payload.description:
+            body["description"] = payload.description
+
+        resp = await self._send(client, "POST", f"objects/{BILL_OBJECT}", body)
+        if resp.status_code not in (200, 201):
+            if resp.status_code == 401:
+                # Re-minted once and still unauthenticated: nothing created.
+                return erp_preflight_refusal(PROVIDER, NOT_CONNECTED)
+            if erp_status_retryable(resp.status_code):
+                return erp_http_failure(PROVIDER, resp.status_code)
+            try:
+                refused = await self._create_refusal(client, payload, lines)
+            except (httpx.HTTPError, IntacctTokenError):
+                # The reads that would name the cause failed; the create was
+                # still refused, so it is coded all the same.
+                refused = erp_refusal(PROVIDER, BILL_REFUSED)
+            # A deterministic refusal of the create itself created nothing.
+            refused.not_posted = True
+            return refused
+
+        try:
+            result = (resp.json() or {}).get("ia::result") or {}
+        except ValueError:
+            # Created, with an answer we cannot read: unconfirmed below, and a
+            # retry's reference lookup finds the bill.
+            result = {}
+        key = result.get("key") or result.get("id") if isinstance(result, dict) else None
+        if key is None:
+            # Created, but with nothing to read back or void: unconfirmed.
+            return await check_posted_total(
+                self,
+                PROVIDER,
+                payload,
+                posted_total=None,
+                document_id=None,
+                document_number=payload.invoice_number,
+            )
+        known["key"] = str(key)
+        return await self._confirm(client, payload, str(key), "Posted to Sage Intacct")
+
+    async def _confirm(
+        self,
+        client: httpx.AsyncClient,
+        payload: InvoicePayload,
+        key: str,
+        message: str,
+        *,
+        found: bool = False,
+    ) -> ErpPostResult:
+        """Read the bill back: success only when Intacct shows it posted at
+        exactly ``payload.amount``.
+
+        Intacct computes ``totalTxnAmount`` itself, and a tax-enabled company's
+        tax solution can make it differ from the lines we sent. A bill it holds
+        as a draft or awaiting approval is refused ``bill_left_unposted`` and
+        left alone: it is the customer's draft now, and a retry once it is
+        posted finds it here again. One Intacct shows reversed or declined is
+        no posted bill either: it is refused ``existing_invoice_not_open`` and
+        left for a person, never reported posted.
+
+        A total mismatch voids a bill this attempt just created. A *found* one
+        is refused ``posted_total_mismatch`` and left alone: it may be a draft
+        we refused ``bill_left_unposted`` that a person has since edited and
+        posted, and deleting it would undo their work.
+        """
+        bill = await self._get_bill(client, key)
+        if bill is None:
+            return ErpPostResult(
+                success=False,
+                erp_document_id=key,
+                erp_document_number=payload.invoice_number,
+                message=f"{PROVIDER} post unconfirmed: the bill could not be read back",
+            )
+        status = map_bill_status(bill)
+        if status in (ErpInvoiceStatus.draft, ErpInvoiceStatus.unknown):
+            refused = erp_refusal(PROVIDER, BILL_LEFT_UNPOSTED)
+            refused.erp_document_id = key
+            refused.erp_document_number = payload.invoice_number
+            return refused
+        if status is ErpInvoiceStatus.cancelled:
+            refused = erp_refusal(PROVIDER, EXISTING_INVOICE_NOT_OPEN)
+            refused.erp_document_id = key
+            refused.erp_document_number = payload.invoice_number
+            return refused
+        problem = await check_posted_total(
+            self,
+            PROVIDER,
+            payload,
+            posted_total=_decimal_or_none(bill.get("totalTxnAmount")),
+            document_id=key,
+            document_number=payload.invoice_number,
+            void_bill=_leave_in_place if found else None,
         )
-        if resp.status_code != 200:
-            return None
-        record = (resp.json() or {}).get("ia::result")
-        return record if isinstance(record, dict) else None
+        if problem:
+            return problem
+        return ErpPostResult(
+            success=True,
+            erp_document_id=key,
+            erp_document_number=payload.invoice_number,
+            message=message,
+        )
+
+    async def _create_refusal(
+        self,
+        client: httpx.AsyncClient,
+        payload: InvoicePayload,
+        lines: list[tuple[str, Decimal, str]],
+    ) -> ErpPostResult:
+        """Why Intacct refused the create, as a coded non-retryable result.
+
+        Intacct documents no stable error id for a closed period, an inactive
+        vendor or an inactive account, so the bill's vendor and accounts are
+        read back by id (the decisions §285 approach): one Intacct positively
+        reports unusable is named; anything else is ``bill_refused``. An
+        unreadable answer is "don't know", never "inactive". Intacct's error
+        text is never read.
+        """
+        vendors = await self._query(
+            client,
+            VENDOR_OBJECT,
+            ["key", "id", "status", "state"],
+            [{"$eq": {"id": payload.vendor_erp_id}}],
+            max_pages=1,
+            size=1,
+        )
+        if vendors is not None and (not vendors or not _vendor_usable(vendors[0])):
+            return erp_refusal(PROVIDER, VENDOR_INACTIVE)
+        codes = _account_codes(payload)
+        inactive: set[str] = set()
+        for account_id in dict.fromkeys(gl for gl, _, _ in lines):
+            rows = await self._query(
+                client,
+                GL_ACCOUNT_OBJECT,
+                ["key", "id", "status"],
+                [{"$eq": {"id": account_id}}],
+                max_pages=1,
+                size=1,
+            )
+            if rows is not None and (not rows or not _account_usable(rows[0])):
+                inactive.add(codes.get(str(account_id), str(account_id)))
+        if inactive:
+            refused = erp_refusal(PROVIDER, ACCOUNT_INACTIVE)
+            refused.refusal_params = {"accounts": sorted(inactive)}
+            return refused
+        return erp_refusal(PROVIDER, BILL_REFUSED)
 
     async def get_invoice_status(self, erp_document_id: str) -> ErpInvoiceStatus:
         async with httpx.AsyncClient(timeout=15) as client:
-            token = await self._token(client)
-            record = await self._get_bill(client, token, erp_document_id)
+            record = await self._get_bill(client, erp_document_id)
         if record is None:
             return ErpInvoiceStatus.unknown
         return map_bill_status(record)
 
     async def void_invoice(self, erp_document_id: str) -> bool:
-        """Delete an unpaid bill.
+        """Delete an unpaid bill, or reverse a posted one Intacct won't delete.
 
-        Intacct deletes a draft or posted-but-unpaid bill in an open period. A
-        bill with a payment applied (or selected for one) is refused here: it
-        has to be reversed in Intacct together with its payment, which is an
+        Intacct deletes a draft or posted-but-unpaid bill. A company enabled for
+        reversals refuses every delete; there a ``posted`` bill is reversed
+        (``workflows/accounts-payable/bill/reverse``, dated after its posting
+        date), which works only when AP allows reversing unpaid bills. A bill
+        with a payment applied (or selected for one) is refused here: it has to
+        be reversed in Intacct together with its payment, which is an
         accountant's decision, not an automatic one.
         """
         async with httpx.AsyncClient(timeout=30) as client:
-            token = await self._token(client)
-            record = await self._get_bill(client, token, erp_document_id)
+            record = await self._get_bill(client, erp_document_id)
             if record is None:
                 return False
-            state = str(record.get("state") or "").replace(" ", "").lower()
+            state = _state(record)
             if state in _UNDELETABLE_STATES:
                 return False
-            resp = await client.delete(
-                f"{self._base()}/objects/{BILL_OBJECT}/{quote(erp_document_id, safe='')}",
-                headers=self._headers(token),
+            resp = await self._send(
+                client, "DELETE", f"objects/{BILL_OBJECT}/{quote(erp_document_id, safe='')}"
             )
-        return resp.status_code in (200, 202, 204)
+            if resp.status_code in (200, 202, 204):
+                return True
+            if state != "posted" or erp_status_retryable(resp.status_code):
+                return False
+            posted_on = _date_or_none(record.get("postingDate") or record.get("createdDate"))
+            reverse_on = utc_today()
+            if posted_on is not None and reverse_on <= posted_on:
+                reverse_on = posted_on + timedelta(days=1)
+            reverse = await self._send(
+                client,
+                "POST",
+                REVERSE_BILL_WORKFLOW,
+                {
+                    "key": str(record.get("key") or erp_document_id),
+                    "reverseDate": reverse_on.isoformat(),
+                    "notes": "Reversed from FeohLedger",
+                },
+            )
+        return reverse.status_code in (200, 201)
 
     async def list_vendors(self) -> list[VendorPayload]:
-        """Best-effort like the other adapters: any failure degrades to []."""
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                token = await self._token(client)
-                rows = await self._query(client, token, VENDOR_OBJECT, ["key", "id", "name"])
-        except Exception:
-            return []
+        """Every vendor, inactive ones ``active=False``, or
+        :class:`ErpListingIncomplete`; never a partial list."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            rows = await self._query(
+                client,
+                VENDOR_OBJECT,
+                ["key", "id", "name", "status", "state"],
+                max_pages=sync_listing_pages(_PAGE_SIZE),
+                complete="vendors",
+            )
         vendors = []
         for raw in rows or []:
             vendor_id = raw.get("id")
@@ -370,22 +789,22 @@ class SageIntacctAdapter(ErpAdapter):
                     erp_vendor_id=str(vendor_id),
                     name=str(raw.get("name") or vendor_id),
                     code=str(vendor_id),
+                    active=_vendor_usable(raw),
                 )
             )
         return vendors
 
     async def list_gl_accounts(self) -> list[GLAccountPayload]:
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                token = await self._token(client)
-                rows = await self._query(
-                    client,
-                    token,
-                    GL_ACCOUNT_OBJECT,
-                    ["key", "id", "name", "accountType", "normalBalance"],
-                )
-        except Exception:
-            return []
+        """The whole chart, inactive accounts ``active=False``, or
+        :class:`ErpListingIncomplete`."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            rows = await self._query(
+                client,
+                GL_ACCOUNT_OBJECT,
+                ["key", "id", "name", "accountType", "normalBalance", "status"],
+                max_pages=sync_listing_pages(_PAGE_SIZE),
+                complete="accounts",
+            )
         accounts = []
         for raw in rows or []:
             account_id = raw.get("id")
@@ -397,49 +816,110 @@ class SageIntacctAdapter(ErpAdapter):
                     name=str(raw.get("name") or account_id),
                     account_type=_gl_account_type(raw),
                     erp_account_id=str(account_id),
+                    active=_account_usable(raw),
                 )
             )
         return accounts
 
     async def list_pos(self) -> list[PoPayload]:
+        return (await self.list_pos_report()).pos
+
+    async def list_pos_report(self) -> PoListing:
+        """Purchasing documents of ``po_document_type``. A document with no
+        number is dropped. One with a number but no usable ``totalInTxnCurrency`` is
+        skipped and named in ``skipped`` as ``unpriceable``: it used to sync
+        at 0, which every invoice against it then over-billed, and a total an
+        earlier sync stored for it must stop being matched against (decisions
+        §323).
+
+        Read whole or not at all: a failed or truncated read raises
+        :class:`ErpListingIncomplete`, never "no purchase orders", which would
+        hide every skip the report exists to carry."""
         doc_type = self.config.get("po_document_type") or "Purchase Order"
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                token = await self._token(client)
-                rows = await self._query(
-                    client,
-                    token,
-                    f"purchasing/document::{doc_type}",
-                    _PO_FIELDS,
-                )
-        except Exception:
-            return []
-        pos = []
+        async with httpx.AsyncClient(timeout=30) as client:
+            rows = await self._query(
+                client,
+                f"purchasing/document::{doc_type}",
+                _PO_FIELDS,
+                max_pages=sync_listing_pages(_PAGE_SIZE),
+                complete="purchase orders",
+            )
+        pos: list[PoPayload] = []
+        skipped: list[SkippedPo] = []
         for raw in rows or []:
             number = raw.get("documentNumber")
             if not number:
                 continue
+            total = _decimal_or_none(raw.get("totalInTxnCurrency"))
+            if total is None:
+                skipped.append(SkippedPo(str(number), PoSkipReason.unpriceable))
+                continue
             vendor_name = _field(raw, "vendor", "name")
-            currency = _field(raw, "currency", "txnCurrency")
+            vendor_id = _field(raw, "vendor", "id")
+            currency = raw.get("txnCurrency")
             pos.append(
                 PoPayload(
                     po_number=str(number),
                     vendor_name=str(vendor_name) if vendor_name else None,
-                    total=_decimal_or_none(raw.get("txnTotal")) or Decimal("0"),
+                    vendor_erp_id=str(vendor_id) if vendor_id else None,
+                    total=total,
                     status=_po_status(raw.get("state")),
                     currency=str(currency) if currency else None,
                 )
             )
-        return pos
+        return PoListing(pos=pos, skipped=skipped)
 
     async def test_connection(self) -> bool:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                token = await self._token(client)
-                rows = await self._query(client, token, VENDOR_OBJECT, ["key"], max_pages=1, size=1)
+                rows = await self._query(client, VENDOR_OBJECT, ["key"], max_pages=1, size=1)
             return rows is not None
         except Exception:
             return False
+
+    async def revoke_stored_access(self) -> str | None:
+        """Revoke every token Intacct holds for this Web Services user and
+        company (decisions §400).
+
+        Intacct's ``POST /oauth2/revoke`` ends the token it is given and every
+        other token for the same user and company, so one freshly minted token
+        reaches the ones other workers have cached, which this process cannot
+        see. The client goes as form fields, as the token exchange sends it.
+        ``revoked`` only on Intacct's documented ``200 {"revoked": true}``;
+        a refused mint (the app already de-authorized), a refusal or an outage
+        is ``failed``, and the confirmation then says what the customer removes.
+        Never raises; names the status only, never a token or the secret.
+        """
+        from app.services.erp_oauth import REVOKE_FAILED, REVOKED
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                token = await self._token(client, fresh=True)
+                resp = await client.post(
+                    f"{self._base()}/oauth2/revoke",
+                    data={
+                        "token": token,
+                        "client_id": self._require("client_id"),
+                        "client_secret": self._require("client_secret"),
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort by contract
+            logger.warning("%s token revocation failed: %s", PROVIDER, type(exc).__name__)
+            return REVOKE_FAILED
+        finally:
+            try:
+                _TOKEN_CACHE.pop(self._token_key(), None)
+            except IntacctConfigError:
+                pass
+        if resp.status_code != 200:
+            logger.warning("%s token revocation refused: HTTP %s", PROVIDER, resp.status_code)
+            return REVOKE_FAILED
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        confirmed = isinstance(body, dict) and body.get("revoked") is True
+        return REVOKED if confirmed else REVOKE_FAILED
 
 
 def _field(raw: dict, parent: str, child: str) -> object:
@@ -466,10 +946,18 @@ def _gl_account_type(raw: dict) -> str | None:
     return None
 
 
+#: PO ``state`` values for an order not yet approved (decisions §394): a
+#: draft, one submitted for approval, one partly through a multi-step approval,
+#: or one still being analysed. Nothing matches against one.
+_UNISSUED_PO_STATES = frozenset({"draft", "submitted", "partiallyapproved", "analyzing"})
+
+
 def _po_status(state: object) -> str:
-    s = str(state or "").replace(" ", "").lower()
+    s = str(state or "").replace(" ", "").replace("_", "").lower()
     if s in {"closed", "converted", "convertedbyline"}:
         return "closed"
-    if s in {"canceled", "cancelled"}:
+    if s in {"canceled", "cancelled", "declined"}:
         return "cancelled"
+    if s in _UNISSUED_PO_STATES:
+        return "unissued"
     return "open"

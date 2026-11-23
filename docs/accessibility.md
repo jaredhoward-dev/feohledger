@@ -20,7 +20,7 @@ This statement covers the three end-user surfaces of the product:
 | ------- | ----- | ----- |
 | Web app (AP staff) | SvelteKit 3 / Svelte 5, static SPA | The full invoice → approve → pay workflow, vendors, payments, exceptions, analytics, admin. |
 | Supplier portal | SvelteKit (same app, `/portal/*`) | Vendor self-service: invoice submission, payment history, virtual-card reveal, supplier chat. |
-| Mobile app | Flutter 3.41+ (iOS + Android) | Core approval workflow, camera OCR, push notifications. |
+| Mobile app | Flutter 3.50 (iOS + Android) | Core approval workflow, camera OCR, push notifications. |
 
 Marketing / signup pages (`/`, `/signup`, `/verify`) and the published legal
 documents (`/legal/*`, including the statement this file backs) are in scope as
@@ -101,7 +101,13 @@ CI plus two kinds of human review:
    overwrite `--accent` / `--accent-strong` at runtime. Both surfaces that edit
    those colours (`/organization` Branding, the `/admin/partner` child-branding
    modal) show the real white-on-colour ratio as an inline advisory before it
-   is saved — advisory, because the brand is the tenant's call.
+   is saved — advisory, because the brand is the tenant's call. `--accent` is
+   also small text, and there the app does not leave it to the tenant: each
+   palette shows the brand accent as itself where it clears 4.5:1 on that
+   theme's `--bg` and `--surface`, otherwise as the least darker (Light) or
+   lighter (Dark) shade of its hue that does (`stores/brandTheme.ts`
+   `themeAccent`, decisions §478). `/organization` Branding reports the ratio
+   and the shade per theme as the colour is typed.
 3. **Automated (opacity de-emphasis scan, every CI run).** The two guards
    above share one blind spot, and it is the app's most-repeated de-emphasis
    idiom. `opacity` is *group* opacity: it composites an element's whole
@@ -172,7 +178,11 @@ CI plus two kinds of human review:
    cannot reflow scrolls **inside its own container**, which does not count
    toward that measurement; the page does not.
    **It enumerates `frontend/src/routes` off disk rather than naming paths**,
-   so a route is covered the day it lands. That is the whole point of the file:
+   so a route is covered the day it lands. Routes with a path parameter
+   (`/workflows/[id]`, `/help/guides/[id]`) are walked too: each needs an
+   entry in the spec's `DYNAMIC_ROUTE_SAMPLES` naming a real record to open,
+   and the walk fails on a dynamic app route with no sample. That is how the
+   workflow editor's 142px overflow at 320px was found. That is the whole point of the file:
    the guard previously named five paths by hand (`/`, `/invoices`, `/vendors`,
    `/payments`, `/contracts`) and was green while seven other routes failed the
    same criterion — `/organization` (137px, a diagnosed entry in
@@ -244,12 +254,67 @@ The current build implements:
   back the moment a choice is made. Guarded by
   `frontend/tests-e2e/legal/pages.spec.ts` (the consent-banner rail test).
 - **Live-region announcements** for toasts and async status (`aria-live`).
+- **Toasts are timing-adjustable** (SC 2.2.1, decisions §313) — an error toast
+  stays until the reader dismisses it with its keyboard-reachable dismiss
+  button; any other toast's timer stops while it is hovered or holds focus and
+  resumes afterwards. Persistent errors are capped at three on screen, and a
+  repeated error replaces its earlier copy rather than stacking. The toast
+  region is named "Status messages", so it is not a second landmark called
+  "Notifications" beside the sidebar bell. A failed page load is stated in
+  place with a Retry (`ui/LoadError`), never by a toast alone. Persistent
+  errors rise above a showing bulk-action bar and the consent banner rather
+  than covering them (SC 2.4.11), and while a dialog is open they sit clear of
+  its action row and of the control that has focus — lifted above them, or
+  capped and scrolling when the stack is too tall to fit — so an error never
+  hides the button the reader retries with or the field they are typing in
+  (`utils/toastPlacement.ts`, issue #635). While a modal dialog is open the
+  toast region lives inside it, so `aria-modal` does not hide the toasts from
+  a screen reader, and the dialog's focus trap includes their dismiss buttons
+  after its own controls: an error that stays until dismissed can be reached
+  and dismissed by keyboard without closing the dialog, and focus returns into
+  the dialog afterwards (SC 2.1.1, 2.4.3, 4.1.3); Escape on a focused toast
+  dismisses the toast, not the dialog. A dialog control that loses
+  focus to the page (disabled under it while saving) hands it back to the
+  dialog rather than letting the next Tab leave a modal. Guarded by
+  `frontend/src/lib/utils/toastQueue.test.ts`, `toastPlacement.test.ts` and
+  `frontend/src/lib/actions/focusTrap.test.ts` (the rules) and
+  `frontend/tests-e2e/a11y/toast-timing.spec.ts` (the wiring in a page: `ui/Modal`
+  and `InvoiceModal` at 1280, 375 and 320px, and a capped, scrolling stack).
+- **An open dialog makes the page behind it inert** (SC 1.3.2, 2.4.3, 2.5.8;
+  decisions §384) — while a modal dialog is open everything outside the
+  topmost one is `inert`, so a screen reader's cursor, a pointer or a touch
+  cannot reach the page behind, and a dialog opened over another makes the
+  first one inert too until it closes. `aria-modal` alone only asks assistive
+  tech to stay inside, and axe's target-size rule reported the controls behind
+  as obscured targets. The toast region and the route announcer are never made
+  inert, so status messages are still announced, and focus still returns to
+  the control that opened the dialog. Guarded by
+  `frontend/src/lib/actions/modalInert.test.ts` and
+  `frontend/tests-e2e/a11y/modal-inert.spec.ts`.
+- **The sidebar on a phone floats over the page** — at 700px and below the
+  sidebar is an icon rail, and expanding it opens the full panel as an overlay
+  over an inert, dimmed page instead of squeezing the content to the ~100px a
+  320px screen has left beside a pushed panel (SC 1.4.10). Focus moves into the
+  panel on open and back to its toggle on Escape or a backdrop click; following
+  a link closes it. Guarded by `frontend/tests-e2e/a11y/sidebar-overlay.spec.ts`.
+- **Popovers that are dialogs take focus** — the sidebar notification bell's
+  popover (`role="dialog"`, labelled by its heading) moves focus to that
+  heading on open and back to the bell on Escape, an outside click or opening
+  an item; tabbing out of it closes it. A failed load inside it says so with a
+  Retry rather than "No notifications yet" — above any older rows too.
+  Guarded by `frontend/tests-e2e/notifications/bell.spec.ts`.
+- **Disclosure toggles state what they control** — e.g. the consent banner's
+  Manage button carries `aria-expanded` and `aria-controls` naming the details
+  list (guarded by `frontend/tests-e2e/consent-banner.spec.ts`).
 - **Labelled form fields** — every input has an associated `<label>`;
   required fields are marked.
-- **Sufficient colour contrast** in the dark theme (text and UI components meet
-  the 4.5:1 / 3:1 AA thresholds), verified three ways: the contrast rules in the
-  axe guard on what a route renders, the stylesheet-wide colour-token scan on
-  every rule in the app whether a guarded route renders it or not, and the
+- **Sufficient colour contrast** in both the dark and the light theme (text and
+  UI components meet the 4.5:1 / 3:1 AA thresholds; the theme follows the OS or
+  a choice on `/profile` or the auth pages, shared across the platform's
+  workspaces, decisions §289, §290), verified three ways: the
+  contrast rules in the axe guard on what a route renders (`axe.spec.ts` dark,
+  `light-theme.spec.ts` light), the stylesheet-wide colour-token scan on every
+  rule in the app — once per theme — whether a guarded route renders it or not, and the
   opacity scan on the one thing neither can see — a fade applied to an
   ancestor, whose cost lands on descendants' colours.
 - **Reduced-motion support** — animations respect
@@ -295,7 +360,9 @@ We are honest about where we are not yet fully conformant:
   but the backend accepts any valid hex on purpose — the brand is the tenant's
   call, and a hard refusal would make the API the arbiter of a design decision
   ([white-label.md](white-label.md), [decisions.md](decisions.md) §28). The
-  published statement discloses this as content we do not control.
+  published statement discloses this as content we do not control. The
+  `accent_color`, used as text, is not in this gap: each theme shows a shade of
+  it that clears 1.4.3 ([decisions.md](decisions.md) §478).
 - **PDF invoice previews.** Uploaded invoice PDFs are third-party documents
   whose internal tagging we don't control; the extracted invoice data is
   always available as accessible HTML alongside the preview.

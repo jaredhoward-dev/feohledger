@@ -4,15 +4,35 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+from app.services.payment_methods import RailPart
+
+if TYPE_CHECKING:
+    from app.services.erp_call_budget import CallBudget
 
 
 class ErpInvoiceStatus(enum.StrEnum):
+    """What ``get_invoice_status`` read about a posted bill.
+
+    ``paid`` is a claim that money left the customer: an adapter returns it only
+    on the ERP's own paid status or a payment the ERP records against the bill,
+    never on a zero balance alone (docs/decisions.md §303). A credit note, a
+    write-off or a zero-total bill also leaves nothing owing, and recording one
+    of those as a payment would book money that never moved.
+    ``settled_no_payment`` is that case: nothing is owing, but the read shows no
+    payment, so a caller must flag it for a person rather than record a
+    payment. (QuickBooks' status sync-back reads bills through ``bill_report``,
+    which judges the same question from the balance, §295.)
+    """
+
     draft = "draft"
     open = "open"
     partially_paid = "partially_paid"
     paid = "paid"
+    settled_no_payment = "settled_no_payment"
     cancelled = "cancelled"
     unknown = "unknown"
 
@@ -73,6 +93,30 @@ class InvoicePayload:
     #: An adapter with asynchronous creates checks this job before queueing
     #: another, so a retry while the first is still running cannot post twice.
     pending_job_id: str | None = None
+    #: The invoice dates earlier attempts of this push were sent with, when
+    #: they differ from ``invoice_date`` (persisted by ``services/erp``). An
+    #: adapter whose duplicate lookup narrows by date searches these too, so
+    #: a bill an earlier attempt created is found after the date was edited.
+    prior_invoice_dates: list[date] = field(default_factory=list)
+    #: The ERP id of a document an earlier attempt of this push CREATED and
+    #: left behind (:attr:`ErpPostResult.erp_document_is_own`, persisted by
+    #: ``services/erp``) — never one an attempt merely found. An adapter whose
+    #: duplicate lookup cannot otherwise tell its own lost-response draft from
+    #: one keyed by hand may treat a found document with exactly this id as its
+    #: own, and only while it is still what was sent (Business Central,
+    #: decisions §397).
+    own_orphan_document_id: str | None = None
+    #: What the ERP said that document held when it was created
+    #: (:attr:`ErpPostResult.erp_document_fingerprint`), so the adapter can
+    #: tell it is unchanged. None means no proof, and the document is not ours.
+    own_orphan_document_fingerprint: str | None = None
+    #: Set when an earlier attempt of this push may have created the bill
+    #: (``services/erp.possibly_posted`` by way of its unknown outcome): a time
+    #: no earlier than that attempt's end, persisted by ``services/erp``. An
+    #: adapter whose duplicate lookup reads a copy the provider refreshes by
+    #: sync waits for a sync after it before re-creating (Merge.dev, decisions
+    #: §405). None when no earlier attempt is unknown.
+    outcome_unknown_since: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +173,55 @@ def erp_failure_message(provider: str, status_code: int) -> str:
     return f"{provider} post failed: HTTP {status_code} ({erp_failure_reason(status_code)})"
 
 
+#: The 4xx answers that can change on a re-send, and so stay retryable:
+#:
+#: * 401 — an expired or rotated token; each adapter refreshes and the next
+#:   attempt carries a fresh one.
+#: * 408 / 425 / 429 — timed out, too early, rate limited: the ERP said "later".
+#: * 409 / 423 — a concurrent edit or a lock (Business Central answers a stale
+#:   etag with 409); the next attempt re-reads.
+#:
+#: Every other 4xx is the ERP's answer to the bill itself (400 bad request,
+#: 403 forbidden, 404, 422 validation): sending the same bill again gets the
+#: same answer, only later and with another call against the ERP's quota.
+_RETRYABLE_CLIENT_STATUSES = frozenset({401, 408, 409, 423, 425, 429})
+
+
+def erp_status_retryable(status_code: int) -> bool:
+    """Whether a failed ERP call that answered ``status_code`` may succeed if
+    ``services/erp`` sends the same bill again (``ErpPostResult.retryable``).
+
+    5xx and anything that is not an HTTP error at all stay retryable; a 4xx
+    does only when it is one of :data:`_RETRYABLE_CLIENT_STATUSES`.
+    """
+    if 400 <= status_code < 500:
+        return status_code in _RETRYABLE_CLIENT_STATUSES
+    return True
+
+
+def erp_http_failure(
+    provider: str,
+    status_code: int,
+    *,
+    erp_document_id: str | None = None,
+    raw_response: dict | None = None,
+) -> ErpPostResult:
+    """The failed :class:`ErpPostResult` for an ERP call answered with
+    ``status_code``: the PII-free :func:`erp_failure_message`, retryable only
+    when :func:`erp_status_retryable` says a re-send could change the answer.
+
+    Every adapter's HTTP failure goes through here, so none of them spends
+    ``services/erp``'s backoff budget re-sending a bill the ERP refused.
+    """
+    return ErpPostResult(
+        success=False,
+        erp_document_id=erp_document_id,
+        message=erp_failure_message(provider, status_code),
+        raw_response=raw_response,
+        retryable=erp_status_retryable(status_code),
+    )
+
+
 #: Stable reason code: the payload has no ``vendor_erp_id`` — the invoice's
 #: vendor was never linked to a record in this ERP (run the vendor sync, or the
 #: invoice has no resolved ``vendor_id`` at all). Every direct adapter refuses
@@ -179,11 +272,131 @@ def erp_refusal_message(provider: str, reason: str) -> str:
     return f"{provider} post refused: {reason}"
 
 
+#: Every reason code an adapter can refuse a push with (:func:`erp_refusal`),
+#: plus the two non-retryable post-create outcomes that carry a code too
+#: (``posted_total.posted_total_failure`` / ``previous_bill_removed``). The
+#: browser states each in the reader's language from this code
+#: (``frontend/src/lib/api/erpRefusals.ts``), so a code missing here — or one
+#: here with no message there — fails ``tests/test_erp_refusal_codes.py`` and
+#: ``erpRefusals.test.ts``. A literal set rather than an import of each
+#: adapter's constant: ``base`` is imported by every adapter, so it cannot
+#: import them back.
+ERP_REFUSAL_CODES: frozenset[str] = frozenset(
+    {
+        # shared (`base`, `bill_allocation`, `posted_total`)
+        "vendor_not_linked",
+        "account_not_linked",
+        "not_connected",
+        "amount_mismatch",
+        "line_amount_missing",
+        "posted_total_mismatch",
+        "posted_total_unconfirmed",
+        "previous_bill_removed",
+        "tax_not_itemised",
+        "tax_rate_unresolved",
+        "missing_dates",
+        "duplicate_document_number",
+        "bill_refused",
+        # QuickBooks Online
+        "doc_number_too_long",
+        "currency_unknown",
+        "currency_not_enabled",
+        # QuickBooks Online: coded from the Fault it answers a bill create with
+        "period_closed",
+        "vendor_inactive",
+        "account_inactive",
+        "reference_invalid",
+        "company_subscription_inactive",
+        "intuit_fault",
+        # Sage Business Cloud Accounting
+        "idempotency_lookup_incomplete",
+        "purchases_not_permitted",
+        # Business Central
+        "existing_invoice_not_open",
+        "line_amount_precision",
+        "pay_to_vendor_differs",  # decisions §403
+        # NetSuite (decisions §398)
+        "bill_not_posted",
+        "bill_rejected",
+        "currency_not_set_up",
+        # SYSPRO / Sage Accounting ZA / Blackbaud FE NXT
+        "duplicate_invoice_number",
+        # Sage Accounting ZA
+        "currency_not_supported",
+        "foreign_currency_supplier",
+        "correlation_total_mismatch",
+        "tax_type_not_resolved",
+        "tax_mismatch",
+        "tax_not_stated",
+        # Blackbaud FE NXT
+        "subscription_key_missing",
+        "ap_account_not_configured",
+        "currency_not_configured",
+        "currency_mismatch",
+        "invoice_date_missing",
+        "due_date_missing",
+        "amount_not_positive",
+        "job_unconfirmed",
+        "job_failed",
+        # `services/erp_call_budget`: the shared SKY call quota (decisions §322)
+        "erp_call_budget_exhausted",
+        # Sage Intacct
+        "bill_left_unposted",
+        # Merge.dev: no sync of invoices since an attempt whose outcome is unknown (§405)
+        "merge_sync_pending",
+        # `services/erp` itself: the sealed ERP credentials could not be opened
+        "erp_credentials_unavailable",
+        # `services/erp_export_gate`: an open duplicate / fraud exception (§286)
+        "exception_blocks_erp_export",
+        # `services/erp_export_gate`: FeohLedger is already paying it (§309)
+        "payment_blocks_erp_export",
+        # `services/erp_export_gate`: the vendor is blocked, sanctions-held or rejected
+        "vendor_blocks_erp_export",
+        # `services/erp_export_gate`: the invoice has no payable currency
+        "currency_blocks_erp_export",
+        # `services/erp` itself: the invoice is due before it is dated
+        "invoice_due_before_date",
+        # `services/erp` itself: a push with no attempts left, and one stranded
+        # at `sending_to_erp` that the recovery sweep will not re-drive (§428)
+        "erp_retries_exhausted",
+        "erp_push_interrupted",
+        # A payment written back to the ERP (`post_payment`, decisions §295)
+        "payment_account_not_mapped",
+        "bill_not_in_erp",
+        "payment_exceeds_balance",
+        "bill_payment_voided",
+        # Xero: a connection consented before `accounting.payments` (§415)
+        "payments_scope_missing",
+    }
+)
+
+
 def erp_refusal(provider: str, reason: str) -> ErpPostResult:
-    """The non-retryable :class:`ErpPostResult` for a payload refused pre-flight."""
+    """The non-retryable :class:`ErpPostResult` for a payload refused pre-flight.
+
+    Carries ``reason`` and ``provider`` as data as well as in ``message``, so
+    ``services/erp`` can record the refusal as a code the browser localizes
+    rather than only as the English sentence.
+    """
     return ErpPostResult(
-        success=False, message=erp_refusal_message(provider, reason), retryable=False
+        success=False,
+        message=erp_refusal_message(provider, reason),
+        retryable=False,
+        refusal_code=reason,
+        refusal_provider=provider,
     )
+
+
+def erp_preflight_refusal(provider: str, reason: str) -> ErpPostResult:
+    """:func:`erp_refusal` for a refusal made before the adapter's first
+    network call, which therefore left nothing in the ERP
+    (``ErpPostResult.not_posted``). Use it ONLY there: a refusal after any
+    request — a lookup that found our own earlier bill, a lost read-back — may
+    stand beside a document, and must stay the fail-closed :func:`erp_refusal`.
+    """
+    result = erp_refusal(provider, reason)
+    result.not_posted = True
+    return result
 
 
 @dataclass
@@ -215,6 +428,188 @@ class ErpPostResult:
     #: finish. ``services/erp`` persists it and hands it back as
     #: :attr:`InvoicePayload.pending_job_id` on the next attempt; None clears it.
     pending_job_id: str | None = None
+    #: The stable reason code of a non-retryable refusal (one of
+    #: :data:`ERP_REFUSAL_CODES`) and the provider literal that refused it.
+    #: Set by :func:`erp_refusal` and the ``posted_total`` outcomes; None for an
+    #: HTTP failure, whose code lives in ``message`` (:func:`erp_failure_message`).
+    refusal_code: str | None = None
+    refusal_provider: str | None = None
+    #: Extra PII-free params of the refusal beyond ``provider`` — the numeric
+    #: code the ERP answered with (``intuit_code``), the GL ``accounts`` it
+    #: named. ``services/erp`` merges them into the recorded refusal's params.
+    refusal_params: dict | None = None
+    #: True only when the adapter KNOWS this attempt left no document in the
+    #: ERP — the ERP's own create answered a deterministic refusal (a 4xx that
+    #: names why: books closed, an inactive vendor). ``services/erp`` then does
+    #: not count the attempt as one whose outcome is unknown. Never set it on a
+    #: path that may have created something first (a failed read-back, a
+    #: timeout, a 5xx): the default False is the fail-closed answer.
+    not_posted: bool = False
+    #: For :meth:`ErpAdapter.post_payment`: what the ERP still shows open on
+    #: the bill after this payment (None = not read). A positive figure means
+    #: the bill stays partly open there — a discount or credit taken in
+    #: FeohLedger that the ERP does not know about (``payment_erp_sync``).
+    bill_balance_after: Decimal | None = None
+    #: The ERP's own code for the company the document was posted in, when its
+    #: web UI needs one to open the document in that company (Xero's
+    #: organisation ``ShortCode``). Read by ``deep_links.erp_document_url``
+    #: only; None leaves the link to the user's currently selected company.
+    erp_company_code: str | None = None
+    #: True only when ``erp_document_id`` names a document THIS push created
+    #: (in this attempt, or an earlier one whose own id it recognised as still
+    #: unedited). ``services/erp`` persists it beside the orphan id and hands
+    #: the id back as :attr:`InvoicePayload.own_orphan_document_id`; a document
+    #: the adapter found and cannot prove it made leaves it False, so it is
+    #: never handed back as ours. Default False is the fail-closed answer.
+    erp_document_is_own: bool = False
+    #: With ``erp_document_is_own``: the adapter's opaque digest of the
+    #: document as the ERP reported it at creation (Business Central: its
+    #: three totals), persisted and handed back as
+    #: :attr:`InvoicePayload.own_orphan_document_fingerprint`.
+    erp_document_fingerprint: str | None = None
+
+
+#: Stable reason code: a payment written back to the ERP (``post_payment``)
+#: needs the ERP account it was paid from, and the org has mapped none for the
+#: payment's rail (``settings.erp.bill_payment_bank_account`` /
+#: ``bill_payment_card_account``, GL codes), or the code is not linked to an
+#: account in the connected company. Never guessed.
+PAYMENT_ACCOUNT_NOT_MAPPED = "payment_account_not_mapped"
+
+#: Stable reason code: the bill the payment would be applied to is not (or no
+#: longer) in the ERP — deleted there, or never confirmed.
+BILL_NOT_IN_ERP = "bill_not_in_erp"
+
+#: Stable reason code: the payment is larger than what the ERP still shows
+#: open on the bill. Posting it would overpay the bill in the ERP.
+PAYMENT_EXCEEDS_BALANCE = "payment_exceeds_balance"
+
+#: Stable reason code, and the coded scope gap recorded on the connection
+#: (``settings.erp.oauth.scope_gaps``, decisions §415): the consent predates
+#: the ERP's payments permission (Xero's ``accounting.payments``), so the
+#: payment write-back cannot be made, and the status sync reads payments only
+#: through the bills' own changes until an admin reconnects.
+PAYMENTS_SCOPE_MISSING = "payments_scope_missing"
+
+#: Stable reason code: the ERP payment this payment id already created was
+#: voided in the ERP by someone there. Posting it again would overrule them,
+#: so the write-back stops and a person decides.
+BILL_PAYMENT_VOIDED = "bill_payment_voided"
+
+
+class ErpBillState(enum.StrEnum):
+    """Where a bill stands in the ERP, as the status sync reads it (§295)."""
+
+    open = "open"
+    partially_paid = "partially_paid"
+    paid = "paid"
+    #: Gone from the ERP: deleted, or voided where the ERP voids.
+    deleted = "deleted"
+    unknown = "unknown"
+
+
+@dataclass
+class ErpBillReport:
+    """One bill as the ERP reports it, for ``services/erp_status_sync``.
+
+    PII-free by construction: ids, a state, a date, a rail and the cash paid.
+    Never the vendor, the memo text, or an amount beyond what decides the
+    state and what was paid.
+    """
+
+    bill_id: str
+    state: ErpBillState
+    #: The correlation id our ``post_invoice`` wrote onto the bill (QuickBooks:
+    #: the ``PrivateNote`` marker), or None when the bill carries none — a bill
+    #: someone keyed in the ERP by hand, or one we can no longer read.
+    correlation_id: str | None = None
+    #: True for an ERP that writes no marker of ours onto a bill but whose bill
+    #: ids are never reused within a company (Xero's InvoiceID is a GUID). The
+    #: sync then matches the bill by the invoice's ``erp_reference`` within the
+    #: connection realm the push recorded, in any state — not only a deleted
+    #: bill, as it does for an ERP that marks its bills (§386).
+    match_by_reference: bool = False
+    #: The date of the latest payment the ERP applied that FeohLedger did NOT
+    #: post itself, and that payment's rail as a ``Payment.method`` value
+    #: (None = not stated; it then counts as 1099-reportable).
+    paid_on: date | None = None
+    payment_method: str | None = None
+    #: The ERP's own ids of those payments (``external``), and whether every
+    #: payment on the bill is one FeohLedger posted (``post_payment``). A bill
+    #: paid only by our own write-back is not news to us.
+    external_payment_ids: tuple[str, ...] = ()
+    paid_only_by_us: bool = False
+    #: True when the bill was taken down by MORE than FeohLedger's own
+    #: write-backs applied to it — judged from the balance, so a vendor credit
+    #: or a journal entry counts as well as a person's payment. This, not the
+    #: payment list, is what says "settled outside FeohLedger".
+    reduced_outside: bool = False
+    #: True when that outside reduction was (at least partly) a vendor credit,
+    #: or nothing readable paid it in cash: the bill was settled without the
+    #: money leaving, so it must not be booked as a cash payment.
+    settled_by_credit: bool = False
+    #: True when a payment FeohLedger wrote back (``post_payment``) is applied
+    #: to the bill now, as the ERP lists it. Set only by an adapter that can
+    #: tell (Xero and QuickBooks: a live payment carrying our marker); False =
+    #: not stated.
+    our_payment_applied: bool = False
+    #: How much was taken off the bill beyond FeohLedger's own write-backs
+    #: (``total - due - ours``), exact, when the adapter can state it (Xero).
+    #: The status sync reads it to tell a bookkeeper recording the discount
+    #: our write-back left open from a second settlement (decisions §386).
+    #: None = not stated.
+    reduced_outside_amount: Decimal | None = None
+    #: The cash the ERP shows a person applied to the bill outside FeohLedger,
+    #: exact, when the adapter can state it (Xero: the sum of the bill's own
+    #: payments that are not ours; QuickBooks: what the person's cash
+    #: BillPayments' lines applied to this bill). Only for a bill paid in full
+    #: in cash (``paid``, ``reduced_outside``, not ``settled_by_credit``). The
+    #: status sync then records the payment at THIS figure, and refuses (a
+    #: person decides) when it is not what the invoice owes here, rather than
+    #: booking FeohLedger's own figure as what left (decisions §386, §393).
+    #: None = not stated: an adapter that cannot say is recorded at what is
+    #: owed here; a bill our own write-back part-paid (``our_payment_applied``)
+    #: blocks for a person instead, since no one payment states it (§393).
+    paid_amount: Decimal | None = None
+    #: The ISO 4217 code ``paid_amount`` is in (the bill's currency). The sync
+    #: compares it with the invoice's before comparing figures; a missing or
+    #: different one is refused like a different amount.
+    paid_currency: str | None = None
+    #: How ``paid_amount`` was paid: one ``RailPart`` per cash payment a person
+    #: made, its rail (a ``Payment.method`` value, None = not stated) and the
+    #: exact amount it applied to THIS bill. No account data. Stated only with
+    #: ``paid_amount``, and its parts sum to it; a bill paid on two rails is
+    #: then recorded with this breakdown and split by it on the 1099, which one
+    #: ``payment_method`` cannot do (decisions §396). Empty = not stated.
+    payment_parts: tuple[RailPart, ...] = ()
+
+
+@dataclass
+class PaymentPayload:
+    """A FeohLedger payment written back to the ERP against its bill (§295)."""
+
+    #: Our ``Payment.id`` — the idempotency key (QuickBooks ``requestid`` and
+    #: the marker in the bill payment's ``PrivateNote``).
+    payment_id: str
+    #: The ERP bill the invoice was posted as (``erp_reference``).
+    bill_id: str
+    amount: Decimal
+    currency: str
+    paid_on: date
+    #: The payment's rail (``Payment.method``).
+    method: str | None = None
+    #: True when the rail is a payment card (``payment_methods.
+    #: CARD_PAYMENT_METHODS``): booked from a credit-card account, not a bank.
+    card: bool = False
+    #: The ERP's id for the account the payment is booked from — the org's
+    #: mapped bank or card account (``settings.erp.bill_payment_bank_account``
+    #: / ``bill_payment_card_account``, our GL codes) resolved through the
+    #: chart under the current connection realm. None = not mapped or not
+    #: linked; the adapter refuses ``payment_account_not_mapped``.
+    pay_from_account_erp_id: str | None = None
+    vendor_erp_id: str | None = None
+    #: The remittance reference, when the rail has one (a cheque number).
+    reference: str | None = None
 
 
 @dataclass
@@ -233,14 +628,22 @@ class PoLinePayload:
 class PoPayload:
     """Normalized purchase order returned by `ErpAdapter.list_pos`.
 
-    `status` is one of {"open", "closed", "cancelled"} — the same set
-    `PurchaseOrder.status` accepts. Adapters that get something exotic
-    from their ERP should normalize to one of these or default to
-    "open" rather than passing the raw vendor string through.
+    `status` is one of {"open", "closed", "cancelled", "unissued"} — the same
+    set `PurchaseOrder.status` accepts. `unissued` is an order the ERP has not
+    approved or issued yet (a draft, or one awaiting approval): it is synced,
+    and the matcher refuses it (`models/procurement.UNISSUED_PO_STATUS`,
+    decisions §394). Adapters that get something exotic from their ERP should
+    normalize to one of these or default to "open" rather than passing the raw
+    vendor string through.
     """
 
     po_number: str
     vendor_name: str | None = None
+    # The supplier's id in the ERP — the same id `list_vendors` reports as
+    # `VendorPayload.erp_vendor_id`. The sync links the PO to the vendor
+    # holding it before falling back to `vendor_name`, which a rename on either
+    # side breaks. None when the adapter does not read it.
+    vendor_erp_id: str | None = None
     total: Decimal = Decimal("0")
     status: str = "open"
     # Promised / expected delivery date from the ERP, when the upstream PO
@@ -256,6 +659,67 @@ class PoPayload:
     # default is a label nobody gave the figure; decisions §197), and the sync
     # then stores NULL, rendered bare.
     currency: str | None = None
+    # Numbers an earlier build of this adapter stored the same PO under (Merge
+    # keyed a PO by its record id before it read `purchase_order_number`). When
+    # no row holds `po_number` yet, the sync re-keys the row found under one of
+    # these instead of creating a duplicate the old row's total is summed
+    # beside (decisions §328).
+    legacy_po_numbers: tuple[str, ...] = ()
+
+
+class PoSkipReason(enum.StrEnum):
+    """Why an adapter's PO listing left a purchase order out (``SkippedPo``).
+
+    Coded, never the ERP's own text. Every reason means the same thing to the
+    sync: the ERP has this PO, and the adapter could not state its total
+    exactly, so whatever total FeohLedger holds for that number may no longer
+    be the ERP's (decisions §323).
+    """
+
+    #: The total cannot be computed exactly from what the ERP returned (a
+    #: discount, a price unit of measure, a charge or price of unknown
+    #: currency, a missing price, no total field).
+    unpriceable = "unpriceable"
+    #: The PO's lines could not be read whole.
+    lines_unread = "lines_unread"
+    #: The ERP returned the header and no lines.
+    no_lines = "no_lines"
+    #: The PO is labelled with a currency the adapter cannot place against the
+    #: company's local currency, because that could not be read.
+    local_currency_unknown = "local_currency_unknown"
+    #: Stamped by the sync, not an adapter: the ERP amended lines goods were
+    #: already received against, and a received line has no ERP line it can be
+    #: paired with, so the stored lines cannot be refreshed safely.
+    lines_changed = "lines_changed"
+
+
+@dataclass(frozen=True)
+class SkippedPo:
+    """A PO the ERP has and ``list_pos`` deliberately did not return.
+
+    ``legacy_po_numbers`` mirrors :attr:`PoPayload.legacy_po_numbers`: the keys
+    an earlier build of the adapter stored this PO under (Merge: its record id,
+    decisions §328). The sync marks the row under one of them when none is
+    stored under ``po_number`` yet, so a PO that was never re-keyed is not left
+    trusted at its old total."""
+
+    po_number: str
+    reason: PoSkipReason
+    legacy_po_numbers: tuple[str, ...] = ()
+
+
+@dataclass
+class PoListing:
+    """``ErpAdapter.list_pos_report``: the POs, and the ones left out.
+
+    ``skipped`` is what lets the sync tell "the ERP no longer reports a usable
+    total for this PO" apart from "this PO was never here": without it a PO the
+    adapter starts skipping keeps the total an earlier sync stored, and the PO
+    match keeps trusting it.
+    """
+
+    pos: list[PoPayload]
+    skipped: list[SkippedPo] = field(default_factory=list)
 
 
 @dataclass
@@ -268,6 +732,18 @@ class GLAccountPayload:
     doesn't classify the account; the API endpoint accepts that.
     `erp_account_id` is the upstream's canonical identifier so future
     pulls can detect renames.
+
+    **`code` must be a key the ERP itself keeps unique** across the whole
+    chart — an account number, a fully-qualified path, the record id — never
+    a display name the ERP lets two accounts share. The sync refuses any code
+    two accounts in one pull resolve to rather than link either
+    (`services/gl_account_sync`, docs/decisions.md §284), so a repeatable key
+    leaves accounts unlinked; it never merges them.
+
+    `legacy_codes` are codes an earlier version of the adapter gave the same
+    account (QuickBooks' bare `Name`, before §284). Only the sync's ambiguity
+    check reads them: an existing row still keyed by one of them that two
+    accounts claim is unlinked rather than trusted.
     """
 
     code: str
@@ -275,6 +751,23 @@ class GLAccountPayload:
     account_type: str | None = None
     erp_account_id: str | None = None
     parent_code: str | None = None
+    #: The parent's ``erp_account_id``, for an adapter that knows it. The sync
+    #: then names the parent by OUR code for that account — the row linked to
+    #: it — rather than the ERP's, which differ whenever a row kept a code the
+    #: ERP has since changed (a numbered parent: ours "Office Expenses", the
+    #: ERP's "6020"). ``parent_code`` is the fallback for a parent we hold no
+    #: row for.
+    parent_erp_account_id: str | None = None
+    #: True when the adapter states this account's parentage outright, so a
+    #: None parent means "top-level" and the sync CLEARS a stale one. False
+    #: (the default) reads None as "not reported" and leaves ours alone.
+    reports_parent: bool = False
+    legacy_codes: tuple[str, ...] = ()
+    #: False for an account the ERP has made inactive. An adapter EMITS such
+    #: accounts rather than dropping them: their ids are still the ERP's, so a
+    #: row linked to one is not "dead", and the sync marks the row inactive in
+    #: our chart (it never creates a row for one).
+    active: bool = True
 
 
 @dataclass
@@ -296,15 +789,171 @@ class VendorPayload:
     address: str | None = None
     tax_id: str | None = None
     payment_terms: str | None = None
+    #: False for a vendor the ERP has made inactive — emitted, not dropped, for
+    #: the same reason as ``GLAccountPayload.active``. The sync never creates
+    #: or links a payee for one, and marks a linked vendor ``inactive``.
+    active: bool = True
+    #: A value an earlier version of the adapter wrote into ``code`` that was
+    #: never our identifier (QuickBooks' ``AcctNum``: our account number AT
+    #: the vendor). The sync clears it from an ERP-created vendor's ``code``.
+    legacy_code: str | None = None
+
+
+@dataclass
+class VendorSearchResult:
+    """What :meth:`ErpAdapter.search_vendors` found. ``truncated``: the ERP had
+    more matches than one search reads, so the person should narrow it."""
+
+    vendors: list[VendorPayload]
+    truncated: bool = False
+
+
+#: How many rows a chart or vendor listing reads before it gives up as
+#: incomplete (an adapter whose own page cap already reaches further, such as
+#: QuickBooks' 50 x 1000, keeps it). Generous on purpose: past it the listing
+#: RAISES (:class:`ErpListingIncomplete`) instead of returning the first N rows,
+#: so it has to sit above any chart or vendor master a sync can sensibly read
+#: in one request.
+SYNC_LISTING_MAX_ROWS = 10_000
+
+
+class ListingGap(enum.StrEnum):
+    """Why a listing could not be proven complete."""
+
+    #: A page (the first or a later one) could not be read.
+    fetch_failed = "fetch_failed"
+    #: The walk stopped at :data:`SYNC_LISTING_MAX_ROWS` with more to read.
+    truncated = "truncated"
+
+
+class ErpListingIncomplete(RuntimeError):
+    """``list_gl_accounts`` / ``list_vendors`` could not read the whole collection.
+
+    The chart and vendor syncs read ABSENCE as evidence — a link whose id is not
+    in the pull, or whose id now holds something else, is dropped
+    (``services/gl_account_sync``, ``services/vendor_sync``) — and they decide
+    whether a code or a name is unique by counting it in the pull. Both are
+    only true of the whole collection. A listing that returned what it had read
+    before a failure, or the first N rows of a longer one, would unlink every
+    good link the missing pages held and could link a name that is not unique
+    (docs/decisions.md §284). So a listing either returns everything or raises
+    this, and the sync endpoints answer 502 without syncing anything.
+
+    An adapter's ``list_pos_report`` raises it too: nothing judges a link by a
+    PO's absence, but its ``skipped`` report covers only the part it read, so a
+    failed or capped read would leave a no-longer-priceable PO's stored total
+    trusted (decisions §323).
+
+    PII-free by construction: the provider literal, the collection and the
+    :class:`ListingGap` — never a response body, URL or credential.
+    """
+
+    def __init__(self, provider: str, collection: str, gap: ListingGap):
+        self.provider = provider
+        self.collection = collection
+        self.gap = gap
+        super().__init__(f"{provider} {collection} listing incomplete: {gap.value}")
+
+
+#: Stable reason code: the adapter refused to spend an API call because the
+#: org's share of a shared provider quota is used, the whole subscription's
+#: quota is, or the provider asked us to slow down (``services/erp_call_budget``,
+#: decisions §322). ``params.reason`` says which and ``params.retry_after`` when
+#: (ISO-8601 UTC). Nothing was sent.
+ERP_CALL_BUDGET_EXHAUSTED = "erp_call_budget_exhausted"
+
+
+class ErpScopeMissing(RuntimeError):
+    """A change listing the connection's consent does not cover (decisions §415).
+
+    Raised by :meth:`ErpAdapter.changed_bills` when the ERP refuses one of its
+    listings as forbidden for want of a permission the consent never granted (a Xero
+    connection made before ``accounting.payments``), after the listings it
+    CAN read went through. ``code`` is the scope gap the status sync records
+    on the connection (``settings.erp.oauth.scope_gaps``), after which the
+    adapter stops asking; ``bill_ids`` is what the readable listings found.
+    No retry changes the answer, and only a reconnect clears it (a new
+    connection starts with no recorded gap).
+
+    PII-free: the provider literal, a code and the ERP's bill ids.
+    """
+
+    def __init__(self, provider: str, code: str, bill_ids: list[str]):
+        self.provider = provider
+        self.code = code
+        self.bill_ids = bill_ids
+        super().__init__(f"{provider} change listing not covered by the consent: {code}")
+
+
+class ErpCallBudgetExhausted(RuntimeError):
+    """An ERP read refused before its call by ``services/erp_call_budget``.
+
+    Raised by a sync listing or status read; a push returns the coded
+    :data:`ERP_CALL_BUDGET_EXHAUSTED` result instead. PII-free: the provider
+    literal, a reason word and a UTC timestamp.
+    """
+
+    def __init__(self, provider: str, reason: str, retry_after: datetime):
+        self.provider = provider
+        self.reason = reason
+        self.retry_after = retry_after
+        super().__init__(f"{provider} call budget exhausted: {reason}")
+
+
+def sync_listing_pages(page_size: int) -> int:
+    """Pages a listing of ``page_size`` rows a page may read (rounded up)."""
+    return -(-SYNC_LISTING_MAX_ROWS // page_size)
 
 
 class ErpAdapter:
     """Base class for ERP integrations. Subclass and implement all methods."""
 
     erp_type: str = "base"
+    #: True for an adapter whose bills' payment status flows back to us
+    #: (``bill_report`` / ``changed_bills``) AND whose payments we write back
+    #: (``post_payment``). Only then may a confirmed push leave the invoice
+    #: payable at ``posted_in_erp`` (``services/erp_status_sync``, §295).
+    supports_status_sync: bool = False
+    #: True for an adapter whose bill reports set
+    #: ``ErpBillReport.match_by_reference`` (no marker of ours on the bill):
+    #: its bills match an invoice only within the realm the push recorded, so
+    #: the sweep never reads a bill only a realm-less push names (§386).
+    bills_match_by_reference: bool = False
+    #: True for an adapter that can search the ERP's whole contact list for a
+    #: supplier by name or tax number, and read one record by its id
+    #: (:meth:`search_vendors` / :meth:`get_vendor`): the vendor page's "find
+    #: in the ERP" link, for a supplier its vendor walk cannot see yet
+    #: (decisions §415).
+    supports_vendor_search: bool = False
+    #: For an ERP reached with stored credentials rather than an OAuth consent:
+    #: the step the customer takes at the provider to end the access those
+    #: credentials gave FeohLedger, which deleting our copy does not end
+    #: (decisions §400). Tenant deletion states it in the confirmation. None:
+    #: nothing to say (an OAuth adapter, whose grant ``erp_oauth`` revokes, or
+    #: one not yet assessed).
+    provider_side_disconnect: str | None = None
+    #: True when :meth:`revoke_stored_access` calls the provider, so tenant
+    #: deletion defers it past a closure's commit like an OAuth revoke.
+    revokes_stored_access: bool = False
 
     def __init__(self, config: dict):
         self.config = config
+
+    async def revoke_stored_access(self) -> str | None:
+        """End, at the provider, the access this adapter's stored credentials
+        hold, once a tenant is being deleted (decisions §400).
+
+        Returns ``erp_oauth.REVOKED`` / ``REVOKE_FAILED`` /
+        ``REVOKE_UNSUPPORTED``, or None when the adapter states no
+        :attr:`provider_side_disconnect` (nothing to report). The default calls
+        no one: an adapter whose provider documents a revocation endpoint
+        overrides this. Never raises, never logs a credential.
+        """
+        if self.provider_side_disconnect is None:
+            return None
+        from app.services.erp_oauth import REVOKE_UNSUPPORTED
+
+        return REVOKE_UNSUPPORTED
 
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         """Send an invoice to the ERP. Returns the ERP document ID."""
@@ -318,6 +967,19 @@ class ErpAdapter:
         """Request cancellation of a posted invoice."""
         raise NotImplementedError
 
+    def call_budget(self) -> CallBudget | None:
+        """The shared-quota budget this connection's calls are counted
+        against (``services/erp_call_budget``, decisions §322), or None for an
+        ERP whose API quota is not shared across tenants. Read by the
+        connection status endpoint to show the org its usage (§324).
+        """
+        return None
+
+    #: Placeholder PO numbers an earlier build of this adapter wrote for POs it
+    #: could not number, several POs into one row. The sync marks such a row
+    #: unverifiable so its merged total is never matched or summed (§328).
+    retired_po_numbers: tuple[str, ...] = ()
+
     async def list_pos(self) -> list[PoPayload]:
         """Pull purchase orders from the ERP.
 
@@ -328,27 +990,110 @@ class ErpAdapter:
         """
         return []
 
-    async def list_gl_accounts(self) -> list[GLAccountPayload]:
-        """Pull the chart of accounts from the ERP.
+    async def list_pos_report(self) -> PoListing:
+        """:meth:`list_pos` plus the POs it deliberately left out.
 
-        Same contract as `list_pos`: default returns an empty list so
-        an adapter that doesn't expose a chart endpoint just leaves the
-        local chart untouched. The Auto GL Coding pipeline relies on
-        this — the prompt only constrains AI suggestions when the org
-        has synced a real chart.
+        What the PO sync calls. The default wraps :meth:`list_pos` and reports
+        nothing skipped, so an adapter that never skips a PO needs no change.
+        An adapter that DOES leave a PO out because it cannot state its total
+        exactly overrides this and names each one (:class:`SkippedPo`), so the
+        sync can mark a total synced earlier as no longer verifiable instead of
+        leaving it for the PO match to trust (decisions §323). Such an adapter
+        keeps :meth:`list_pos` returning ``(await self.list_pos_report()).pos``.
+        """
+        return PoListing(pos=await self.list_pos())
+
+    async def list_gl_accounts(self) -> list[GLAccountPayload]:
+        """Pull the WHOLE chart of accounts from the ERP, or raise.
+
+        An adapter that reads a chart returns every account (inactive ones
+        included, ``active=False``) or raises — :class:`ErpListingIncomplete`
+        for a page it could not read or a chart past
+        :data:`SYNC_LISTING_MAX_ROWS` — never what it had read so far: the
+        sync reads absence as evidence (see that class).
+
+        The default returns an empty list so an adapter that doesn't expose a
+        chart endpoint leaves the local chart untouched; the sync treats an
+        empty pull as proving nothing and changes no link on it.
         """
         return []
 
     async def list_vendors(self) -> list[VendorPayload]:
-        """Pull vendors from the ERP.
+        """Pull EVERY vendor from the ERP, or raise.
 
-        Same contract as `list_pos` / `list_gl_accounts`: default returns
-        an empty list so an adapter that doesn't yet support vendor sync
-        just reports "0 new" instead of 500ing the `/api/vendors/sync-erp`
-        endpoint. Adapters that *do* support it override this.
+        Same contract as :meth:`list_gl_accounts`: an adapter that reads
+        vendors returns all of them (inactive ones ``active=False``) or raises
+        :class:`ErpListingIncomplete`, and skips a record with no id of the
+        kind its ``post_invoice`` posts against — never substituting a number
+        or a name for it. The default returns an empty list, on which the sync
+        changes no link.
         """
         return []
+
+    async def search_vendors(self, *, name: str | None, tax_id: str | None) -> VendorSearchResult:
+        """Records in the ERP's WHOLE contact list matching ``name`` (a text
+        search) or ``tax_id`` (exactly), whatever their supplier flag — for a
+        person choosing which record to link a vendor to by hand
+        (``services/vendor_erp_manual_link``, decisions §415). Not a listing:
+        absence here is evidence of nothing, and no sync reads it. Raises on a
+        failed read. Default (``supports_vendor_search`` False): nothing found.
+        """
+        return VendorSearchResult(vendors=[])
+
+    async def get_vendor(self, erp_vendor_id: str) -> VendorPayload | None:
+        """The ERP record ``erp_vendor_id`` names, read now, or None when the
+        ERP answers that it does not exist. Raises on a failed read. Default:
+        None."""
+        return None
 
     async def test_connection(self) -> bool:
         """Verify the ERP connection is working."""
         raise NotImplementedError
+
+    # -- status sync-back + payment write-back (decisions §295) -------------
+    #
+    # Every caller checks ``supports_status_sync`` first, and an adapter without
+    # it keeps the old behaviour (the push closes the invoice at ``done``;
+    # ``payment_erp_sync`` writes nothing back). The defaults below are
+    # therefore the honest answer of an ERP that does not report back, and each
+    # is fail-closed if anything ever reached it anyway: a write-back is
+    # refused (never "posted"), a bill reads ``unknown`` (never ``open``, so
+    # the dispatch-time check would refuse, not pay), and no changes or linked
+    # bills are claimed. Not NotImplementedError: these adapters are not
+    # skeletons — status sync is an optional capability, like the payment
+    # adapters' (``tests/test_adapter_contract_integrity.py``).
+
+    def _no_status_sync(self) -> ErpPostResult:
+        return ErpPostResult(
+            success=False,
+            message=f"{self.erp_type} does not support payment write-back",
+            retryable=False,
+        )
+
+    async def post_payment(self, payload: PaymentPayload) -> ErpPostResult:
+        """Apply a FeohLedger payment to its bill in the ERP, idempotently on
+        ``payload.payment_id``: a retry never creates a second ERP payment.
+        Default: refused — this ERP takes no write-back."""
+        return self._no_status_sync()
+
+    async def void_payment(self, payload: PaymentPayload) -> ErpPostResult:
+        """Reverse what :meth:`post_payment` wrote for ``payload.payment_id``.
+        Success when nothing of ours is left on the bill. Default: refused."""
+        return self._no_status_sync()
+
+    async def bill_report(self, bill_id: str) -> ErpBillReport:
+        """Where ``bill_id`` stands now. ``deleted`` only on the ERP's positive
+        answer; an unreadable bill raises, never reads as gone. Default:
+        ``unknown`` — never ``open``, so nothing is paid on its say-so."""
+        return ErpBillReport(bill_id=str(bill_id), state=ErpBillState.unknown)
+
+    async def bills_for_payment(self, payment_id: str) -> list[str]:
+        """The bills an ERP payment record is applied to (for a webhook that
+        names the payment, not the bill). Default: none known."""
+        return []
+
+    async def changed_bills(self, since: datetime) -> list[str]:
+        """Every bill changed since ``since`` — directly, or through a payment
+        applied to it — the change-data-capture backstop for lost webhooks.
+        Raises rather than return a partial list. Default: none reported."""
+        return []

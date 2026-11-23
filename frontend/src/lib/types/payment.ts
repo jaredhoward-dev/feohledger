@@ -1,6 +1,7 @@
 import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import type { MoneyAmount } from '#lib/utils/money.ts';
+import type { ActionRefusal } from '#lib/api/actionVerdicts.ts';
 
 // Mirrors the statuses the backend actually persists on `payments.status`.
 // `pending_compliance` is the parking state the sanctions/KYC gate
@@ -220,7 +221,8 @@ export type PaymentMethod =
 	| 'virtual_card'
 	| 'bacs'
 	| 'faster_payments'
-	| 'chaps';
+	| 'chaps'
+	| 'card';
 
 export const PAYMENT_METHODS: PaymentMethod[] = [
 	'ach',
@@ -229,7 +231,8 @@ export const PAYMENT_METHODS: PaymentMethod[] = [
 	'virtual_card',
 	'bacs',
 	'faster_payments',
-	'chaps'
+	'chaps',
+	'card'
 ];
 
 /**
@@ -250,7 +253,8 @@ export const PAYMENT_METHOD_LABEL_KEYS: Record<PaymentMethod, MessageKey> = {
 	virtual_card: 'payments.method.virtualCard',
 	bacs: 'payments.method.bacs',
 	faster_payments: 'payments.method.fasterPayments',
-	chaps: 'payments.method.chaps'
+	chaps: 'payments.method.chaps',
+	card: 'payments.method.card'
 };
 
 /**
@@ -263,14 +267,46 @@ export function paymentMethodLabelKey(method: string): MessageKey | null {
 	return PAYMENT_METHOD_LABEL_KEYS[method as PaymentMethod] ?? null;
 }
 
+/** One part of a payment's kept rail breakdown (`schemas/payment.py::PaymentRailPart`). */
+export interface PaymentRailPart {
+	method: string | null;
+	amount: MoneyAmount;
+}
+
 export interface Payment {
 	id: string;
+	/**
+	 * The CALLER's verdict on voiding this payment, on History-list rows only
+	 * (`schemas/payment.py::PaymentListItem`): `null` when `POST /{id}/void`
+	 * would void it, else the coded refusal it would answer with — from the
+	 * endpoint's own gate (`payment_controls.payment_void_refusal`). Absent
+	 * (`undefined`) on any other payload, which offers no Void (fail closed).
+	 */
+	void_refusal?: ActionRefusal;
+	/** The same, for `POST /{id}/compliance/release` (`payment.execute` +
+	 *  `payment_controls.compliance_hold_refusal`). The page still withholds
+	 *  Release on a record-only tenant — org config, from `/execution-mode`. */
+	release_refusal?: ActionRefusal;
+	/** The same, for `POST /{id}/compliance/dismiss` (`payment.void` + the
+	 *  same hold gate). */
+	dismiss_refusal?: ActionRefusal;
+	/** The same, for `POST /{id}/settlement/accept` (`payment.execute` +
+	 *  `payment_controls.settlement_accept_refusal`: completed, the recorded
+	 *  settlement does NOT cover the invoice, and the invoice is still held at
+	 *  `payment_scheduled`). */
+	accept_settlement_refusal?: ActionRefusal;
 	correlation_id: string | null;
 	invoice_id: string;
 	payment_run_id: string | null;
 	/** `schemas/payment.py::PaymentResponse.amount` is `MoneyAmount` — a JSON number on the wire. */
 	amount: MoneyAmount;
 	method: PaymentMethod | null;
+	/** Which rails paid how much, when the ERP stated a breakdown that stands
+	 *  (`PaymentResponse.rail_breakdown`, migration 0130, decisions §396): what
+	 *  explains `method: null` on a payment made on two rails. Each part's
+	 *  `amount` is in the payment's `currency`; `method` null = not stated.
+	 *  Null or absent when no breakdown is kept. */
+	rail_breakdown?: PaymentRailPart[] | null;
 	status: PaymentStatus;
 	reference: string | null;
 	/**

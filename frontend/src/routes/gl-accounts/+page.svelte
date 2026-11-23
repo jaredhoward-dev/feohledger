@@ -22,13 +22,15 @@
 	 * pair with a "Showing all N" claim.
 	 */
 	import { listGlAccounts, syncGlAccountsFromErp, updateGlAccount } from '#lib/api/glAccounts.ts';
+	import { glSyncReportLines } from '#lib/utils/erpSyncReport.ts';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import type { GlAccount } from '#lib/types/glAccount.ts';
 	import {
 		GL_ACCOUNT_TYPES,
 		GL_ACCOUNT_TYPE_LABEL_KEYS,
 		canEditGlAccount,
-		glAccountTypeLabelKey
+		glAccountTypeLabelKey,
+		needsErpDecision
 	} from '#lib/types/glAccount.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { entityStore } from '#lib/stores/entity.svelte.ts';
@@ -37,9 +39,11 @@
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import GlAccountModal from '#lib/components/modals/GlAccountModal.svelte';
+	import GlAccountErpLinkModal from '#lib/components/modals/GlAccountErpLinkModal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -74,6 +78,16 @@
 	let showCreate = $state(false);
 	/** The row whose Edit dialog is open. */
 	let editingAccount = $state<GlAccount | null>(null);
+	/** The row whose "which ERP account is this?" dialog is open. */
+	let linkingAccount = $state<GlAccount | null>(null);
+	/**
+	 * Rows the last ERP sync left unlinked because their code could mean more
+	 * than one ERP account (docs/decisions.md §284). Persisted on the row, so
+	 * the decision is visible here after the sync's toast is gone — before
+	 * this, the top-level QuickBooks "Depreciation" was refused on every sync
+	 * with no way out in the product.
+	 */
+	const pendingDecisions = $derived(accounts.filter(needsErpDecision).length);
 	/** Retire is armed two-click (the api-keys revoke shape): first click arms
 	 *  the row, the second commits, a click anywhere else disarms. */
 	let confirmRetireId = $state<string | null>(null);
@@ -96,30 +110,22 @@
 	const showStatus = $derived(includeInactive);
 
 	const COLUMNS = $derived([
-		{ label: m('glAccounts.col.code') },
+		{ label: m('glAccounts.col.code'), class: 'col-code' },
 		{ label: m('glAccounts.col.name') },
-		{ label: m('glAccounts.col.type') },
-		{ label: m('glAccounts.col.parent') },
-		...(showScope ? [{ label: m('glAccounts.col.scope') }] : []),
-		{ label: m('glAccounts.col.erpId') },
-		...(showStatus ? [{ label: m('glAccounts.col.status') }] : []),
+		{ label: m('glAccounts.col.type'), class: 'col-type' },
+		{ label: m('glAccounts.col.parent'), class: 'col-parent' },
+		...(showScope ? [{ label: m('glAccounts.col.scope'), class: 'col-scope' }] : []),
+		{ label: m('glAccounts.col.erpId'), class: 'col-erp' },
+		...(showStatus ? [{ label: m('glAccounts.col.status'), class: 'col-status' }] : []),
 		...(canManage ? [{ class: 'actions-col' }] : [])
 	]);
 
 	const filtersActive = $derived(search.trim() !== '' || typeFilter !== 'all');
 
-	// Four distinct empty states (frontend/docs/ui-patterns.md § Data tables):
-	// loading, errored, a filter that matched nothing, and a genuinely empty
-	// chart. The last one gets the EmptyState block below instead of a cell.
-	const emptyMessage = $derived(
-		loading
-			? m('common.loading')
-			: errored
-				? m('glAccounts.empty.errored')
-				: filtersActive
-					? m('glAccounts.empty.filtered')
-					: m('glAccounts.empty')
-	);
+	// Four distinct states (frontend/docs/ui-patterns.md § Data tables):
+	// loading, a filter that matched nothing, a genuinely empty chart (the
+	// EmptyState block below), and a failed load — which replaces the table
+	// with `LoadError` and its Retry rather than sitting in an empty cell.
 
 	const showOnboarding = $derived(
 		loaded && !errored && accounts.length === 0 && !filtersActive
@@ -188,11 +194,13 @@
 	async function load() {
 		const token = fetchSequence.start();
 		loading = true;
+		// Cleared as the request starts, so a Retry (or a new filter) swaps the
+		// error block for the table's loading row instead of leaving it up.
+		errored = false;
 		try {
 			const rows = await listGlAccounts(buildParams());
 			if (!fetchSequence.canCommit(token)) return;
 			accounts = rows;
-			errored = false;
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit`: a superseded request's failure
 			// is not this table's news — the newer one owns the error state, and
@@ -200,7 +208,7 @@
 			if (!fetchSequence.isCurrentRequest(token)) return;
 			errored = true;
 			// **Clear the rows.** `errored` only reaches the reader through
-			// `emptyMessage`, which `DataTable` renders on `isEmpty` alone — so
+			// the table's empty row, which `DataTable` renders on `isEmpty` alone — so
 			// a SECOND failed load (a chip click or a search after one good
 			// fetch) would otherwise leave the previous filter's rows on screen
 			// with nothing but a toast that fades, and the count footer below
@@ -208,7 +216,9 @@
 			// it never ran. `/exceptions` sets the same precedent for the same
 			// reason.
 			accounts = [];
-			toast(err instanceof Error ? err.message : m('glAccounts.toast.loadFailed'), 'error');
+			// No toast: `LoadError` already states the failure (with Retry) as
+			// a `role="alert"`, and a toast on top would announce it twice.
+			// There is no load-more here, so this is always a first-page load.
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -227,6 +237,7 @@
 	 * "Include inactive", which is where Reactivate lives.
 	 */
 	async function setActive(acct: GlAccount, active: boolean) {
+		if (busyId) return;
 		confirmRetireId = null;
 		busyId = acct.id;
 		try {
@@ -263,7 +274,11 @@
 		syncing = true;
 		try {
 			const result = await syncGlAccountsFromErp();
-			toast(result.message, 'success');
+			// A refused or unlinked code is something to act on (recode its
+			// invoices), so it is its own warning, not a clause in the summary.
+			for (const line of glSyncReportLines(result, m)) {
+				toast(line.text, line.tone, line.tone === 'warning' ? 12_000 : undefined);
+			}
 			await load();
 		} catch (err) {
 			toast(err instanceof Error ? err.message : m('glAccounts.toast.syncFailed'), 'error');
@@ -363,7 +378,7 @@
 			</button>
 			<!-- `POST /api/gl-accounts/sync-erp` is require_roles(ADMIN, AP_MANAGER),
 			     matching the buttons on /purchase-orders and /vendors. -->
-			<button class="btn-outline" disabled={syncing} onclick={syncFromErp}>
+			<button class="btn-cancel" disabled={syncing} onclick={syncFromErp}>
 				{syncing ? m('glAccounts.action.syncing') : m('glAccounts.action.syncErp')}
 			</button>
 		{/if}
@@ -383,6 +398,12 @@
 		</label>
 	</div>
 
+	{#if pendingDecisions > 0}
+		<p class="decision-notice" role="status" data-testid="gl-erp-decisions">
+			{m('glAccounts.erpLink.pending', { n: pendingDecisions })}
+		</p>
+	{/if}
+
 	{#if showOnboarding}
 		<EmptyState
 			icon="📒"
@@ -392,8 +413,19 @@
 			actionLabel={canManage ? m('glAccounts.action.new') : undefined}
 			onaction={canManage ? () => (showCreate = true) : undefined}
 		/>
+	{:else if errored}
+		<LoadError message={m('glAccounts.empty.errored')} onretry={load} testId="gl-accounts-error" />
 	{:else}
-		<DataTable columns={COLUMNS} isEmpty={accounts.length === 0} empty={emptyMessage}>
+		<div class="gl-table">
+		<DataTable
+			fixed
+			columns={COLUMNS}
+			isEmpty={accounts.length === 0}
+			{loading}
+			filtered={filtersActive}
+			emptyFiltered={m('glAccounts.empty.filtered')}
+			empty={m('glAccounts.empty')}
+		>
 			{#snippet body()}
 				{#each accounts as acct (acct.id)}
 					<!-- `.row-muted` (not opacity) de-emphasises a retired account —
@@ -414,7 +446,15 @@
 								{/if}
 							</td>
 						{/if}
-						<td class="mono muted">{acct.erp_account_id ?? '—'}</td>
+						<td class="mono muted">
+							{#if needsErpDecision(acct)}
+								<Badge tone="warning" variant="needs-decision">
+									{m('glAccounts.erpLink.needsDecision')}
+								</Badge>
+							{:else}
+								{acct.erp_account_id ?? '—'}
+							{/if}
+						</td>
 						{#if showStatus}
 							<td>
 								{#if acct.is_active}
@@ -427,6 +467,15 @@
 						{#if canManage}
 							<td class="actions">
 								{#if editable(acct)}
+									{#if needsErpDecision(acct)}
+										<RowAction
+											ariaLabel={m('glAccounts.erpLink.chooseAria', { code: acct.code })}
+											disabled={busyId === acct.id}
+											onclick={() => (linkingAccount = acct)}
+										>
+											{m('glAccounts.erpLink.choose')}
+										</RowAction>
+									{/if}
 									<RowAction
 										ariaLabel={m('glAccounts.row.editAria', { code: acct.code })}
 										disabled={busyId === acct.id}
@@ -439,9 +488,13 @@
 											variant="danger"
 											armed={confirmRetireId === acct.id}
 											ariaLabel={confirmRetireId === acct.id
-												? undefined
+												? m('common.rowActionAria', {
+														action: m('glAccounts.row.confirm'),
+														name: acct.code
+													})
 												: m('glAccounts.row.retireAria', { code: acct.code })}
-											disabled={busyId === acct.id}
+											busy={busyId === acct.id}
+											disabled={busyId !== null && busyId !== acct.id}
 											onclick={(e) => {
 												e.stopPropagation();
 												if (confirmRetireId === acct.id) void setActive(acct, false);
@@ -455,7 +508,8 @@
 									{:else}
 										<RowAction
 											ariaLabel={m('glAccounts.row.reactivateAria', { code: acct.code })}
-											disabled={busyId === acct.id}
+											busy={busyId === acct.id}
+											disabled={busyId !== null && busyId !== acct.id}
 											onclick={() => void setActive(acct, true)}
 										>
 											{m('glAccounts.row.reactivate')}
@@ -474,6 +528,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 
 		{#if accounts.length > 0}
 			<!-- A plain count, never "Showing all N": the read is unpaginated, so
@@ -491,6 +546,16 @@
 	<GlAccountModal onclose={() => (showCreate = false)} onsaved={() => void load()} />
 {/if}
 
+{#if linkingAccount}
+	{#key linkingAccount.id}
+		<GlAccountErpLinkModal
+			account={linkingAccount}
+			onclose={() => (linkingAccount = null)}
+			onsaved={() => void load()}
+		/>
+	{/key}
+{/if}
+
 {#if editingAccount}
 	<!-- Keyed so a second Edit opens a fresh form seeded from THAT row. -->
 	{#key editingAccount.id}
@@ -503,6 +568,34 @@
 {/if}
 
 <style>
+	/* Column widths. The chart is
+	   `table-layout: fixed` (DataTable's `fixed`): under `auto` the header
+	   cells were sized against the one "Loading…" row, then re-sized against
+	   the real rows, so every column slid sideways as the data landed. Fixed
+	   widths come from the header alone and hold from first paint. The
+	   predictable columns get widths sized to their widest content in the six
+	   locales (the headers de "KONTONUMMER", "ÜBERGEORDNET", "GELTUNGSBEREICH";
+	   the badges pt-BR "COMPARTILHADA", "PRECISA DE UMA DECISÃO"); the text
+	   column carries none and takes the rest. The `min-width` keeps it
+	   readable: past it the table scrolls inside its region, which is what a
+	   phone gets (frontend/docs/ui-patterns.md § Data tables). DataTable
+	   renders these `<th>` from `columns`, so the selectors go through
+	   `:global` under a page-owned wrapper (the /vendors pattern). */
+	.gl-table {
+		min-width: 0;
+	}
+	.gl-table :global(table) { min-width: 1380px; }
+	.gl-table :global(th.col-code) { width: 140px; }
+	.gl-table :global(th.col-type) { width: 140px; }
+	.gl-table :global(th.col-parent) { width: 150px; }
+	.gl-table :global(th.col-scope) { width: 170px; }
+	.gl-table :global(th.col-erp) { width: 230px; }
+	.gl-table :global(th.col-status) { width: 120px; }
+	/* Edit + Retire on one line; a row that also offers the ERP link wraps
+	   its third button onto a second line (td.actions wraps in a fixed table).
+	   The longest single button, pt-BR "Escolher conta do ERP", fits. */
+	.gl-table :global(th.actions-col) { width: 260px; }
+
 	.filter-row {
 		display: flex;
 		align-items: center;
@@ -517,6 +610,14 @@
 		color: var(--text-muted);
 		white-space: nowrap;
 	}
+	.decision-notice {
+		margin: 0;
+		padding: 8px 12px;
+		border-radius: 6px;
+		font-size: 0.85rem;
+		background: var(--warning-tint);
+		color: var(--warning-on-tint);
+	}
 	.row-hint {
 		font-size: 0.8rem;
 		color: var(--text-muted);
@@ -529,23 +630,5 @@
 	.count-line {
 		font-size: 0.8rem;
 		color: var(--text-muted);
-	}
-	.btn-outline {
-		padding: 8px 16px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-size: 0.85rem;
-		cursor: pointer;
-		font-family: inherit;
-	}
-	.btn-outline:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-outline:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
 	}
 </style>

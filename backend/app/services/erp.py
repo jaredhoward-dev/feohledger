@@ -1,8 +1,10 @@
 """ERP integration service — push approved invoices to an external ERP system."""
 
 import asyncio
+import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,12 +17,21 @@ from app.services.erp_adapters import (
     LineItemPayload,
     get_erp_adapter,
 )
+from app.services.erp_adapters.base import ACCOUNT_NOT_LINKED, NOT_CONNECTED
+from app.services.erp_adapters.deep_links import erp_document_url
+from app.services.erp_export_gate import erp_export_refusal
+from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+from app.services.erp_status_sync import status_sync_active
 from app.services.gl_chart import resolve_erp_account_ids
+from app.services.vendor_erp_links import vendor_erp_ids
 from app.services.workflow_engine import (
     complete_workflow,
+    get_invoice_for_update,
     get_workflow_instance,
     transition_invoice,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 BASE_DELAY_SECONDS = 2
@@ -28,6 +39,17 @@ BASE_DELAY_SECONDS = 2
 #: ``WorkflowInstance.state_data`` key holding an ERP background job an earlier
 #: attempt queued but could not confirm (``ErpPostResult.pending_job_id``).
 PENDING_JOB_KEY = "erp_pending_job_id"
+
+#: ``WorkflowInstance.state_data`` key: the invoice dates (ISO) earlier attempts
+#: of this push sent, newest last, until one succeeds. An adapter whose
+#: duplicate lookup narrows by date (Blackbaud FE NXT) searches each of them as
+#: well as the current one, so a bill an earlier attempt may have created is
+#: still found after someone edits the invoice date (decisions §322). Only an
+#: attempt that may have reached the ERP keeps its date: one that states it
+#: left nothing (``ErpPostResult.not_posted``) gives its slot back, so refusals
+#: never crowd out the date of a bill that may exist. Never trimmed: dropping
+#: the oldest would drop the likeliest real bill.
+ATTEMPT_INVOICE_DATES_KEY = "erp_attempt_invoice_dates"
 
 #: ``WorkflowInstance.state_data`` keys naming a bill a failed attempt left in
 #: the ERP: a ``posted_total_mismatch`` the adapter could not void, a
@@ -40,6 +62,119 @@ PENDING_JOB_KEY = "erp_pending_job_id"
 ORPHAN_DOCUMENT_ID_KEY = "erp_orphan_document_id"
 ORPHAN_DOCUMENT_NUMBER_KEY = "erp_orphan_document_number"
 _ORPHAN_KEYS = (ORPHAN_DOCUMENT_ID_KEY, ORPHAN_DOCUMENT_NUMBER_KEY)
+#: True when the recorded orphan is a document this push itself created
+#: (``ErpPostResult.erp_document_is_own``), not one an attempt found. Only then
+#: is its id handed back as ``InvoicePayload.own_orphan_document_id``, so an
+#: adapter may treat it as its own; a found document's id never is (§397).
+ORPHAN_DOCUMENT_OWN_KEY = "erp_orphan_document_own"
+#: With the flag: the adapter's digest of that document at creation
+#: (``ErpPostResult.erp_document_fingerprint``), handed back so it can tell the
+#: document is unchanged (``InvoicePayload.own_orphan_document_fingerprint``).
+ORPHAN_DOCUMENT_FINGERPRINT_KEY = "erp_orphan_document_fingerprint"
+
+#: ``WorkflowInstance.state_data`` key: True once an attempt of this push
+#: reached the adapter and did not come back with a success, so the ERP may
+#: hold the bill even though we recorded a failure; False after a success.
+#: Fail-closed on purpose: from here a refusal the adapter made before sending
+#: anything (``vendor_not_linked``) cannot be told apart from one it made after
+#: the create went through (a QuickBooks read-back that lost its connection
+#: returns ``not_connected``; a Xero read-back raises it), so every non-success
+#: counts — unless the adapter states the attempt left nothing
+#: (``ErpPostResult.not_posted``: QuickBooks' create refused outright, as for
+#: closed books), and then only if no earlier attempt was already unknown.
+#: It is committed as True BEFORE the adapter call, so a worker that dies
+#: mid-call (a Lambda timeout, which SQS redelivers) leaves it True.
+#: Read through :func:`possibly_posted`, which is what a later refusal reports.
+OUTCOME_UNKNOWN_KEY = "erp_outcome_unknown"
+
+#: ``WorkflowInstance.state_data`` key beside :data:`OUTCOME_UNKNOWN_KEY`: an
+#: ISO time no earlier than the end of the latest attempt whose outcome is
+#: unknown. Handed to the adapter as ``InvoicePayload.outcome_unknown_since``,
+#: so one whose duplicate lookup reads a synced copy (Merge.dev) can wait for a
+#: sync after it (decisions §405). Written when an attempt comes back unknown
+#: or raises (its end), kept when an attempt sent nothing, dropped on a
+#: success. Only such a write is final (:data:`OUTCOME_UNKNOWN_AT_FINAL_KEY`).
+OUTCOME_UNKNOWN_AT_KEY = "erp_outcome_unknown_at"
+
+#: True once :data:`OUTCOME_UNKNOWN_AT_KEY` names an attempt's END. The stamp
+#: committed before the call is the attempt's start and is written False: an
+#: attempt that dies before its failure is committed (a worker crash, a deploy
+#: cancelling the task) leaves only that start, and a sync that began after
+#: the start but before the create landed would vouch for a listing without
+#: the bill (decisions §409). A stamp read back not final, like a row from
+#: before the stamp existed, is replaced by the time it is read, which is
+#: after the dead attempt, and pinned final.
+OUTCOME_UNKNOWN_AT_FINAL_KEY = "erp_outcome_unknown_at_final"
+
+#: ``WorkflowInstance.state_data`` key: an ISO time, the start of the latest
+#: attempt that reached the point of calling the ERP adapter. Committed with
+#: the pre-call write in :func:`_call_erp` and NEVER cleared, unlike
+#: :data:`OUTCOME_UNKNOWN_AT_KEY`, which a clean ``not_posted`` failure drops.
+#: The recovery sweep reads it to tell a push mid-backoff (an attempt began,
+#: its job is sleeping before the next) from one whose job never ran; reading
+#: the outcome stamp instead made a push between two attempts look stranded
+#: with none made, and re-driving it ran a second send loop beside the first
+#: (decisions §428, round-13 amendment).
+ATTEMPT_STARTED_AT_KEY = "erp_attempt_started_at"
+
+#: The push refusal for an invoice due before it is dated (`api/refusals`).
+INVOICE_DUE_BEFORE_DATE = "invoice_due_before_date"
+
+#: The push refusal for a push that reached `sending_to_erp` with its retry
+#: counter already spent (a redelivered job after the last attempt, or a re-drive
+#: of one): nothing is attempted, and the invoice lands at `failed` where
+#: `POST /{id}/retry-erp` gives it a fresh budget (decisions §428).
+ERP_RETRIES_EXHAUSTED = "erp_retries_exhausted"
+
+#: The push refusal for a push that sat at `sending_to_erp` with no attempt made
+#: for longer than the recovery sweep re-drives (its lookback), or since before
+#: the tenant's current ERP was configured: a person decides whether it still
+#: belongs in that ERP, through `POST /{id}/retry-erp` (decisions §428).
+ERP_PUSH_INTERRUPTED = "erp_push_interrupted"
+
+
+def _outcome_unknown(state_data: dict | None) -> bool:
+    """The recorded :data:`OUTCOME_UNKNOWN_KEY`, read fail-closed for a row
+    written before the key existed: any failure it records may have been a
+    timeout the ERP applied."""
+    state = state_data or {}
+    if OUTCOME_UNKNOWN_KEY in state:
+        return bool(state[OUTCOME_UNKNOWN_KEY])
+    return bool(state.get("last_error") or state.get("erp_retries"))
+
+
+def _stamp_time(raw: object) -> datetime | None:
+    """An :data:`OUTCOME_UNKNOWN_AT_KEY` value as an aware datetime, or None."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _final_stamp(at: datetime) -> dict:
+    """The state keys that record ``at`` as a final unknown-outcome stamp."""
+    return {OUTCOME_UNKNOWN_AT_KEY: at.isoformat(), OUTCOME_UNKNOWN_AT_FINAL_KEY: True}
+
+
+def possibly_posted(state_data: dict | None) -> bool:
+    """May the ERP already hold a bill for this invoice?
+
+    True when an earlier attempt's outcome is unknown, an ERP job it queued is
+    unconfirmed (``PENDING_JOB_KEY``), it left a bill behind (the orphan keys),
+    or an earlier push was confirmed (``erp_reference``). A refusal that stops
+    the next attempt says so (decisions §286), because a bill already in the
+    ERP is payable there whatever our gate decides.
+    """
+    state = state_data or {}
+    return bool(
+        _outcome_unknown(state)
+        or state.get(PENDING_JOB_KEY)
+        or any(state.get(key) for key in _ORPHAN_KEYS)
+        or state.get("erp_reference")
+    )
 
 
 @dataclass(frozen=True)
@@ -58,7 +193,10 @@ class ErpRefs:
 
 
 async def _resolve_erp_refs(
-    db: AsyncSession, invoice: Invoice, line_items: list[InvoiceLineItem]
+    db: AsyncSession,
+    invoice: Invoice,
+    line_items: list[InvoiceLineItem],
+    erp_config: dict | None = None,
 ) -> ErpRefs:
     """Resolve the ERP ids :func:`_build_payload` puts on the payload.
 
@@ -70,20 +208,41 @@ async def _resolve_erp_refs(
     against the invoice's own chart (shared ∪ its entity's —
     ``gl_chart.resolve_erp_account_ids``, the rule the extraction catalogue and
     the coding guards use).
+
+    Both resolve only links made in the ERP company ``erp_config`` connects to
+    (``services/erp_link_realm``, docs/decisions.md §284): QuickBooks numbers
+    vendors and accounts per company, so a link carried over from the sandbox
+    would otherwise post to whatever production calls the same id. A link from
+    another company is "not linked" here, and the push refuses it.
     """
+    realm = connection_realm(erp_config)
+    trust_legacy = legacy_links_trusted(erp_config, realm)
     vendor_erp_id: str | None = None
     if invoice.vendor_id is not None:
-        vendor_erp_id = (
+        # The vendor's link in THIS company (services/vendor_erp_links): the
+        # row's when it was made here, else one kept from an earlier connection
+        # here. Never a link another ERP or company set (§284, §356).
+        vendor = (
             await db.execute(
-                select(Vendor.erp_vendor_id).where(
+                select(Vendor.id, Vendor.erp_vendor_id, Vendor.erp_link_realm).where(
                     Vendor.id == invoice.vendor_id,
                     Vendor.organization_id == invoice.organization_id,
                 )
             )
-        ).scalar_one_or_none() or None
+        ).one_or_none()
+        if vendor is not None:
+            ids = await vendor_erp_ids(
+                db, invoice.organization_id, [vendor], realm=realm, trust_legacy=trust_legacy
+            )
+            vendor_erp_id = ids.get(vendor.id)
     codes = [invoice.gl_account, *(li.gl_account for li in line_items)]
     account_erp_ids = await resolve_erp_account_ids(
-        db, invoice.organization_id, invoice.entity_id, codes
+        db,
+        invoice.organization_id,
+        invoice.entity_id,
+        codes,
+        realm=realm,
+        trust_legacy=trust_legacy,
     )
     return ErpRefs(vendor_erp_id=vendor_erp_id, account_erp_ids=account_erp_ids)
 
@@ -96,13 +255,17 @@ def _build_payload(
     ``refs`` carries the ERP ids :func:`_resolve_erp_refs` looked up; without
     it every ERP reference is None (unlinked), which a direct adapter refuses.
     """
+    from app.services.payment_runs import payable_currency_code
+
     refs = refs or ErpRefs()
     return InvoicePayload(
         correlation_id=str(invoice.correlation_id),
         invoice_number=invoice.invoice_number,
         vendor_name=invoice.vendor_name,
         amount=invoice.amount,
-        currency=invoice.currency or "USD",
+        # The export gate refused a blank or malformed code before this
+        # (`erp_export_gate.CURRENCY_BLOCKS_ERP_EXPORT`); never substitute one.
+        currency=payable_currency_code(invoice.currency),
         vendor_tax_id=invoice.vendor_tax_id,
         invoice_date=invoice.invoice_date,
         due_date=invoice.due_date,
@@ -139,6 +302,42 @@ def _build_payload(
             )
             for idx, li in enumerate(line_items)
         ],
+    )
+
+
+def _unlinked_accounts(
+    invoice: Invoice, line_items: list[InvoiceLineItem], refs: ErpRefs
+) -> list[str]:
+    """The GL codes on the invoice that resolved to no ERP account id.
+
+    What an ``account_not_linked`` refusal names, so the reader knows which
+    account to sync or recode. Empty when the refusal was for a bill with no
+    account at all (an uncoded line and no header account).
+
+    The header account only counts when some line falls back to it — a bill
+    with no lines, or a line with no account of its own (``bill_lines``). When
+    every line carries its own code the header is posted nowhere, and naming
+    it would send the reader to fix an account the bill never used.
+    """
+    codes = [li.gl_account for li in line_items]
+    if not line_items or any(not li.gl_account for li in line_items):
+        codes.append(invoice.gl_account)
+    return sorted({c for c in codes if c and c not in refs.account_erp_ids})
+
+
+def _result_refusal(
+    result, invoice: Invoice, line_items: list[InvoiceLineItem], refs: ErpRefs
+) -> dict | None:
+    """The coded refusal an adapter's failed result carries, or None."""
+    code = getattr(result, "refusal_code", None)
+    if not code:
+        return None
+    accounts = _unlinked_accounts(invoice, line_items, refs) if code == ACCOUNT_NOT_LINKED else None
+    return erp_refusal_record(
+        code,
+        provider=getattr(result, "refusal_provider", None),
+        accounts=accounts,
+        extra=getattr(result, "refusal_params", None),
     )
 
 
@@ -205,10 +404,7 @@ async def retry_erp(
     # an earlier attempt queued before it queues another, or the retry posts a
     # second bill. The orphan-document keys stay: that bill is still in the ERP
     # until a successful push supersedes it.
-    instance = await get_workflow_instance(db, invoice.id)
-    if instance:
-        instance.state_data = {**(instance.state_data or {}), "erp_retries": 0}
-        instance.state = "active"
+    await reset_erp_push_budget(db, invoice.id)
 
     await transition_invoice(
         db,
@@ -218,6 +414,23 @@ async def retry_erp(
         action_name="invoice.erp_retried",
     )
     await db.commit()
+
+
+async def reset_erp_push_budget(db: AsyncSession, invoice_id: uuid.UUID) -> None:
+    """Give the push about to start a full retry budget (``erp_retries`` = 0).
+
+    Every new push calls it, not only ``retry_erp``: a send from ``approved``
+    inherits the counter the invoice's last push left, and a push that ended
+    spent (three failures, then a recall and a re-approval, §374) would
+    otherwise start with no attempts left and be failed at once as
+    ``erp_retries_exhausted`` (decisions §428). Only the counter: the
+    outcome-unknown flag, the pending job and the orphan keys describe what may
+    already be in the ERP, and the next attempt must still read them.
+    """
+    instance = await get_workflow_instance(db, invoice_id)
+    if instance:
+        instance.state_data = {**(instance.state_data or {}), "erp_retries": 0}
+        instance.state = "active"
 
 
 class ErpPostFailedError(RuntimeError):
@@ -235,10 +448,14 @@ class ErpPostFailedError(RuntimeError):
         *,
         erp_document_id: str | None = None,
         erp_document_number: str | None = None,
+        refusal: dict | None = None,
     ) -> None:
         super().__init__(message)
         self.erp_document_id = erp_document_id
         self.erp_document_number = erp_document_number
+        #: ``{"code", "params"}`` when the adapter refused with a stable reason
+        #: code (:func:`erp_refusal_record`) — what the browser localizes.
+        self.refusal = refusal
 
 
 class ErpPostRefusedError(ErpPostFailedError):
@@ -247,7 +464,44 @@ class ErpPostRefusedError(ErpPostFailedError):
     not be confirmed as the approved amount. Never retried."""
 
 
-def _orphan_details(exc: BaseException, state_data: dict | None) -> dict:
+def erp_refusal_record(
+    code: str,
+    *,
+    provider: str | None = None,
+    accounts: list[str] | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """The coded form of a push refusal, as ``invoice.erp_failed`` records it.
+
+    ``{"code": <ERP_REFUSAL_CODES member>, "params": {...}}`` beside the English
+    ``error`` — the shape every coded refusal in this app takes, so the invoice
+    modal states it in the reader's language and says what to do
+    (``frontend/src/lib/api/erpRefusals.ts``), falling back to ``error`` for a
+    code it does not know. PII-free like ``error``: ``provider`` is the adapter's
+    fixed literal and ``accounts`` are GL codes, which are tenant configuration.
+    """
+    # ``extra`` is the adapter's own PII-free params (``ErpPostResult.
+    # refusal_params``: an ERP's numeric fault code, the GL codes it named).
+    params: dict = dict(extra or {})
+    if provider:
+        params["provider"] = provider
+    if accounts is not None:
+        params["accounts"] = accounts
+    return {"code": code, "params": params}
+
+
+def _refusal_details(exc: BaseException) -> dict:
+    """``{"refusal": ...}`` for the failure audit row, or empty for an uncoded one."""
+    from app.services.erp_oauth import ErpNotConnectedError, ErpTokenRefreshError
+
+    refusal = getattr(exc, "refusal", None)
+    if refusal is None and isinstance(exc, ErpNotConnectedError):
+        if not isinstance(exc, ErpTokenRefreshError):
+            refusal = erp_refusal_record(NOT_CONNECTED)
+    return {"refusal": refusal} if refusal else {}
+
+
+def _orphan_details(exc: BaseException | None, state_data: dict | None) -> dict:
     """The ERP ids of a bill a failed push left behind, for the audit row.
 
     The failing attempt's own report first; else what an earlier attempt of
@@ -266,6 +520,27 @@ def _orphan_details(exc: BaseException, state_data: dict | None) -> dict:
     return details
 
 
+def _possibly_posted_details(instance: WorkflowInstance | None) -> dict:
+    """``{"possibly_posted": True}`` for the failure audit row when the ERP may
+    already hold this bill (:func:`possibly_posted`), so whoever reads why the
+    push failed knows to look in the ERP before anyone pays or re-posts it.
+    Empty otherwise, and with no workflow instance to read."""
+    if instance is not None and possibly_posted(instance.state_data):
+        return {"possibly_posted": True}
+    return {}
+
+
+def _attempt_dates(state: dict) -> list[date]:
+    """:data:`ATTEMPT_INVOICE_DATES_KEY` as dates (an unreadable entry is skipped)."""
+    out: list[date] = []
+    for raw in state.get(ATTEMPT_INVOICE_DATES_KEY) or []:
+        try:
+            out.append(date.fromisoformat(str(raw)))
+        except ValueError:
+            continue
+    return out
+
+
 def _is_final(exc: BaseException) -> bool:
     """Would a re-send fail the same way? Then the push is not retried."""
     from app.services.erp_oauth import ErpNotConnectedError, ErpTokenRefreshError
@@ -282,8 +557,12 @@ async def send_to_erp_internal(
     actor_id: uuid.UUID | None = None,
     erp_config: dict | None = None,
 ) -> None:
-    """Run the ERP call, with bounded retries (invoice is already in
-    `sending_to_erp`).
+    """Run the ERP call, with bounded retries, for an invoice at `sending_to_erp`.
+
+    Any other status (a redelivered job for a push that already landed or
+    failed, or whose approval was since recalled) is left exactly as it is: no
+    adapter call, no transition, no audit row, one warning log line, and a
+    normal return so the job is done rather than retried (decisions §410).
 
     This is the ONLY path that pushes an invoice to an ERP —
     `api/workflow.py` → `dispatch_erp` → `erp_dispatch` / `erp_lambda` all land
@@ -310,8 +589,42 @@ async def send_to_erp_internal(
     # `POST /{id}/retry-erp` (which resets the counter to 0) gets a full budget
     # while an in-flight sequence is not restarted from scratch.
     retry_count = state_data.get("erp_retries", 0)
+    if not isinstance(retry_count, int) or retry_count < 0:
+        # Unreadable: spend nothing on a guess, fail closed as spent below.
+        retry_count = MAX_RETRIES
+
+    if retry_count >= MAX_RETRIES:
+        # No attempt left: a redelivered job after the last attempt, or a
+        # re-drive of a push whose budget was already spent. Making none and
+        # returning left the invoice at `sending_to_erp` with nothing on its
+        # trail and nothing that would ever move it. It is a final failure,
+        # stated as one, so `POST /{id}/retry-erp` can give it a fresh budget
+        # (decisions §428). Still only from `sending_to_erp` (§410).
+        if not await _push_gate_open(db, invoice):
+            return
+        await _fail_push(
+            db,
+            invoice,
+            instance,
+            actor_id=actor_id,
+            error=f"ERP push not attempted: {ERP_RETRIES_EXHAUSTED}",
+            retries=retry_count,
+            refusal_code=ERP_RETRIES_EXHAUSTED,
+        )
+        await db.commit()
+        return
 
     for attempt in range(retry_count, MAX_RETRIES):
+        # Only an invoice still at `sending_to_erp` is pushed (decisions §410).
+        # The dispatchers hand over whatever row they find, and a redelivered
+        # job can arrive after the push it repeats has already landed, failed,
+        # or been followed by a recall of the approval, so a bill would be
+        # posted for an invoice that is in review again. Asked before EVERY
+        # attempt, under the row lock and from the committed row (the
+        # dispatchers' sessions do not expire on commit), because each backoff
+        # releases the lock and a concurrent push may finish meanwhile.
+        if not await _push_gate_open(db, invoice):
+            return
         try:
             erp_ref = await _call_erp(db, invoice, erp_config, instance=instance)
 
@@ -323,13 +636,31 @@ async def send_to_erp_internal(
                 action_name="invoice.erp_confirmed",
                 details={"erp_reference": erp_ref},
             )
-            await transition_invoice(
-                db,
-                invoice,
-                InvoiceStatus.done,
-                actor_id=actor_id,
-                action_name="invoice.completed",
-            )
+            if status_sync_active(erp_config):
+                # The ERP reports this bill's payment status back to us
+                # (webhooks + the reconciliation sweep), and our payments are
+                # written back to it, so the bill stays PAYABLE here: a bill
+                # paid in the ERP reaches `paid` through the ERP-paid path and
+                # leaves the payment queue (decisions §295).
+                await transition_invoice(
+                    db,
+                    invoice,
+                    InvoiceStatus.posted_in_erp,
+                    actor_id=actor_id,
+                    action_name="invoice.erp_status_posted_in_erp",
+                    details={"erp_reference": erp_ref, "erp_status": "confirmed_by_push"},
+                )
+            else:
+                # Nothing would ever tell us the ERP paid this bill, so it is
+                # the ERP's to pay: leaving it payable here invites a double
+                # payment.
+                await transition_invoice(
+                    db,
+                    invoice,
+                    InvoiceStatus.done,
+                    actor_id=actor_id,
+                    action_name="invoice.completed",
+                )
 
             if instance:
                 instance.state_data = {
@@ -369,7 +700,9 @@ async def send_to_erp_internal(
                     details={
                         "error": str(exc),
                         "retries": attempt + 1,
+                        **_refusal_details(exc),
                         **_orphan_details(exc, instance.state_data if instance else None),
+                        **_possibly_posted_details(instance),
                     },
                 )
                 if instance:
@@ -383,13 +716,142 @@ async def send_to_erp_internal(
                 return
 
 
+async def _push_gate_open(db: AsyncSession, invoice: Invoice) -> bool:
+    """The §410 gate: True, holding the row lock, when the invoice is still at
+    `sending_to_erp`. Otherwise one warning, a rollback, and False: the job is
+    done and nothing about the invoice is the push's to change."""
+    current = await _locked_push_status(db, invoice)
+    if current is InvoiceStatus.sending_to_erp:
+        return True
+    # Logged before the rollback that releases the lock: a rollback expires
+    # every loaded attribute, `invoice.id` included.
+    logger.warning(
+        "ERP push skipped: invoice %s is at %s, not sending_to_erp",
+        invoice.id,
+        current.value if current is not None else "missing",
+    )
+    await db.rollback()
+    return False
+
+
+async def _fail_push(
+    db: AsyncSession,
+    invoice: Invoice,
+    instance: WorkflowInstance | None,
+    *,
+    actor_id: uuid.UUID | None,
+    error: str,
+    retries: int,
+    refusal_code: str,
+) -> None:
+    """Land a push at `failed` without an attempt now, with a coded refusal.
+
+    The refusal carries ``possibly_posted`` when an EARLIER attempt may have
+    left the bill in the ERP (:func:`possibly_posted`), as the export gate's
+    refusals do, so whoever retries looks there first; the audit row carries
+    the flag and any known orphan as a failed attempt's does. The counter and
+    every other state key are left as they are. The caller commits."""
+    state = instance.state_data if instance is not None else None
+    extra = {"possibly_posted": True} if possibly_posted(state) else None
+    await transition_invoice(
+        db,
+        invoice,
+        InvoiceStatus.failed,
+        actor_id=actor_id,
+        action_name="invoice.erp_failed",
+        details={
+            "error": error,
+            "retries": retries,
+            "refusal": erp_refusal_record(refusal_code, extra=extra),
+            **_orphan_details(None, state),
+            **_possibly_posted_details(instance),
+        },
+    )
+    if instance is not None:
+        instance.state = "failed"
+
+
+async def fail_interrupted_erp_send(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
+    """Land a push the recovery sweep will not re-drive at `failed` (§428).
+
+    A push that has sat at `sending_to_erp` with no attempt for longer than the
+    sweep's lookback, or since before the tenant's current ERP was configured,
+    is not sent on nobody's say-so: the bill may have been keyed into the ERP
+    by hand meanwhile, or the push was meant for a different ERP. At `failed`
+    it is visible, coded ``erp_push_interrupted``, and `POST /{id}/retry-erp`
+    takes it. Re-locked, and only moved from `sending_to_erp`. True when moved.
+    """
+    invoice = await get_invoice_for_update(db, invoice_id)
+    if invoice.status is not InvoiceStatus.sending_to_erp:
+        await db.rollback()
+        return False
+    instance = await get_workflow_instance(db, invoice_id)
+    await _fail_push(
+        db,
+        invoice,
+        instance,
+        actor_id=None,
+        error=f"ERP push interrupted: {ERP_PUSH_INTERRUPTED}",
+        retries=((instance.state_data or {}).get("erp_retries", 0) if instance else 0),
+        refusal_code=ERP_PUSH_INTERRUPTED,
+    )
+    await db.commit()
+    return True
+
+
+async def _locked_push_status(db: AsyncSession, invoice: Invoice) -> InvoiceStatus | None:
+    """The invoice's committed status, read under ``FOR UPDATE``; None if gone.
+
+    ``populate_existing`` so the caller's in-memory ``Invoice`` (same session)
+    is refreshed too: a dispatcher's session keeps attributes across commits.
+    """
+    result = await db.execute(
+        select(Invoice)
+        .where(Invoice.id == invoice.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    row = result.scalar_one_or_none()
+    return row.status if row is not None else None
+
+
+#: The `invoice.erp_failed` reason when a push was committed at `sending_to_erp`
+#: and then could not be handed to the dispatcher (an SQS send that raised).
+ERP_DISPATCH_FAILED = "ERP send could not be queued"
+
+
+async def fail_erp_send_not_dispatched(
+    db: AsyncSession, invoice_id: uuid.UUID, *, actor_id: uuid.UUID | None
+) -> None:
+    """Land a committed `sending_to_erp` at `failed` when its dispatch raised.
+
+    Nothing will ever run that push, and `POST /{id}/retry-erp` takes only
+    `failed`, so leaving it at `sending_to_erp` would strand it. Re-locked here:
+    the caller already committed, and the row is only moved if it is still
+    where the caller left it.
+    """
+    invoice = await get_invoice_for_update(db, invoice_id)
+    if invoice.status != InvoiceStatus.sending_to_erp:
+        await db.rollback()
+        return
+    await transition_invoice(
+        db,
+        invoice,
+        InvoiceStatus.failed,
+        actor_id=actor_id,
+        action_name="invoice.erp_failed",
+        details={"error": ERP_DISPATCH_FAILED, "retries": 0},
+    )
+    await db.commit()
+
+
 #: The `invoice.erp_failed` reason when the org's sealed ERP credentials could
 #: not be opened (`services/provider_credentials`). A code, never the error text.
 ERP_CREDENTIALS_UNAVAILABLE = "erp_credentials_unavailable"
 
 
 async def fail_erp_send_without_credentials(
-    db: AsyncSession, invoice: Invoice, *, actor_id: uuid.UUID
+    db: AsyncSession, invoice: Invoice, *, actor_id: uuid.UUID | None
 ) -> None:
     """Land an in-flight send at `failed` because its credentials can't be opened.
 
@@ -407,7 +869,11 @@ async def fail_erp_send_without_credentials(
         InvoiceStatus.failed,
         actor_id=actor_id,
         action_name="invoice.erp_failed",
-        details={"error": ERP_CREDENTIALS_UNAVAILABLE, "retries": 0},
+        details={
+            "error": ERP_CREDENTIALS_UNAVAILABLE,
+            "retries": 0,
+            "refusal": erp_refusal_record(ERP_CREDENTIALS_UNAVAILABLE),
+        },
     )
     await db.commit()
 
@@ -431,30 +897,180 @@ async def _call_erp(
     second one. A failure that reports the bill it left in the ERP has that
     bill's ids kept the same way (``ORPHAN_DOCUMENT_ID_KEY`` /
     ``ORPHAN_DOCUMENT_NUMBER_KEY``) and carried on the raised error; a success
-    clears them. The caller's commit persists all of it.
+    clears them. When the adapter says it created that bill itself
+    (``erp_document_is_own``) that is kept too, and the id goes back to the
+    adapter as ``payload.own_orphan_document_id``. The caller's commit persists all of it, except
+    ``OUTCOME_UNKNOWN_KEY = True``, which is committed here before the call.
     """
+    # Pin how much we know about earlier attempts before this one writes
+    # `last_error`: a row from before `OUTCOME_UNKNOWN_KEY` is read once, from
+    # what it records, and every later read takes the pinned value.
+    state = (instance.state_data if instance is not None else None) or {}
+    prior_unknown = _outcome_unknown(state)
+    if instance is not None and OUTCOME_UNKNOWN_KEY not in state:
+        state = {**state, OUTCOME_UNKNOWN_KEY: prior_unknown}
+        instance.state_data = state
+    # When that earlier outcome is unknown, the time it was unknown since. A
+    # stamp that is not final (the start an attempt that died left behind), an
+    # unreadable one, or none (a row from before the stamp existed) is
+    # replaced by now, which is after that attempt too, and pinned final like
+    # the flag, so a later read takes the same time (§405, §409).
+    prior_unknown_at = (
+        _stamp_time(state.get(OUTCOME_UNKNOWN_AT_KEY))
+        if prior_unknown and state.get(OUTCOME_UNKNOWN_AT_FINAL_KEY) is True
+        else None
+    )
+    if prior_unknown and prior_unknown_at is None:
+        prior_unknown_at = datetime.now(UTC)
+        state = {**state, **_final_stamp(prior_unknown_at)}
+        if instance is not None:
+            instance.state_data = state
+
+    # Before anything reaches an adapter: a bill whose liability is in question
+    # (an open duplicate or fraud flag) is never posted, because once it is in
+    # the ERP it can be paid there, past our payment-run gate (decisions §286).
+    # A retry after an attempt whose outcome is unknown may find the bill
+    # already there, so the refusal says so rather than reading as "nothing
+    # was posted". Nothing is looked up in the ERP from here: the gate refuses
+    # before any adapter is built, and once a person clears the flag the next
+    # push's own idempotency lookup finds that bill instead of posting another.
+    # The same gate refuses an invoice FeohLedger is already paying (a live
+    # payment or virtual card, decisions §309): posted now, the bill would be
+    # payable from the ERP as well. Asked here as well as at the HTTP doors, so
+    # a push queued before the run was staged is stopped at the last moment.
+    # Last, a vendor the payment path will not pay (blocked, sanctions-held,
+    # rejected) is not booked where it could be paid past our screening, and an
+    # invoice with no payable currency is not booked as a bill in a guessed one.
+    refused = await erp_export_refusal(db, invoice, possibly_posted=possibly_posted(state))
+    if refused is not None:
+        raise ErpPostRefusedError(refused.error, refusal=refused.refusal)
+    # A bill due before it is dated is invalid in the ERP, whichever path made
+    # the invoice; entry refuses the pair too (`api/refusals`). No adapter has
+    # been built, so this attempt sent nothing.
+    if invoice.invoice_date and invoice.due_date and invoice.due_date < invoice.invoice_date:
+        raise ErpPostRefusedError(
+            f"ERP post refused: {INVOICE_DUE_BEFORE_DATE}",
+            refusal=erp_refusal_record(INVOICE_DUE_BEFORE_DATE),
+        )
+
     config = erp_config or {"type": "mock", "integration_method": "direct"}
 
     adapter = get_erp_adapter(config)
     line_items = await _fetch_line_items(db, invoice.id)
-    refs = await _resolve_erp_refs(db, invoice, line_items)
+    refs = await _resolve_erp_refs(db, invoice, line_items, config)
     payload = _build_payload(invoice, line_items, refs)
-    state = (instance.state_data if instance is not None else None) or {}
     payload.pending_job_id = state.get(PENDING_JOB_KEY)
-    result = await adapter.post_invoice(payload)
+    payload.outcome_unknown_since = prior_unknown_at
+    # Strictly `is True`: a row written before the key existed records no
+    # proof the orphan was ours, and is read as not ours.
+    if state.get(ORPHAN_DOCUMENT_OWN_KEY) is True:
+        payload.own_orphan_document_id = state.get(ORPHAN_DOCUMENT_ID_KEY) or None
+        payload.own_orphan_document_fingerprint = state.get(ORPHAN_DOCUMENT_FINGERPRINT_KEY)
+    attempt_dates = _attempt_dates(state)
+    dates_before = state.get(ATTEMPT_INVOICE_DATES_KEY)
+    payload.prior_invoice_dates = [d for d in attempt_dates if d != payload.invoice_date]
+    if payload.invoice_date is not None and payload.invoice_date not in attempt_dates:
+        attempt_dates = [*attempt_dates, payload.invoice_date]
+    if attempt_dates:
+        # Recorded before the call, with the outcome-unknown flag: whatever this
+        # attempt does, a later one searches the date it was sent with.
+        state = {**state, ATTEMPT_INVOICE_DATES_KEY: [d.isoformat() for d in attempt_dates]}
+    # Until the ERP answers, assume it may act on this request, and commit that
+    # before the call: an exception out of the adapter reaches the caller's
+    # failure path with it on the instance, and a worker that dies mid-call
+    # leaves it in the row the redelivered attempt reads. The commit also ends
+    # the transaction for the length of the HTTP call.
+    if instance is not None:
+        # The attempt's start, NOT final: if this attempt dies before its end
+        # is committed, the next read restamps it (§409).
+        attempt_started = datetime.now(UTC).isoformat()
+        instance.state_data = {
+            **state,
+            OUTCOME_UNKNOWN_KEY: True,
+            OUTCOME_UNKNOWN_AT_KEY: attempt_started,
+            OUTCOME_UNKNOWN_AT_FINAL_KEY: False,
+            ATTEMPT_STARTED_AT_KEY: attempt_started,
+        }
+        await db.commit()
+    try:
+        result = await adapter.post_invoice(payload)
+    except BaseException:
+        if instance is not None:
+            # Unknown since this attempt ended, as for an unknown result below.
+            # In memory only: the caller's failure path commits it, and if it
+            # never runs (a cancellation, a crash) the provisional start stays
+            # and is restamped on the next read.
+            instance.state_data = {
+                **(instance.state_data or {}),
+                **_final_stamp(datetime.now(UTC)),
+            }
+        raise
+    reference = result.erp_document_id or result.erp_document_number or "UNKNOWN"
+
+    if result.success:
+        # The bill of record, on the invoice row so the invoice can link to it
+        # (the UI reads neither state_data nor the audit row). Only the ERP's
+        # own id: a number is not addressable and "UNKNOWN" names nothing. A
+        # success with no id CLEARS the pair rather than keeping an earlier
+        # one, which may name another ERP's bill if the org has switched.
+        # Persisted by the caller's commit.
+        invoice.erp_document_id = result.erp_document_id or None
+        invoice.erp_document_url = erp_document_url(
+            config, result.erp_document_id, company_code=result.erp_company_code
+        )
 
     if instance is not None:
         new_state = dict(state)
+        # `state` is from before the pre-call write: carry this attempt's start.
+        new_state[ATTEMPT_STARTED_AT_KEY] = attempt_started
+        # A refusal the ERP answered outright adds no uncertainty of its own,
+        # but cannot clear an earlier attempt's: that one may have posted.
+        new_state[OUTCOME_UNKNOWN_KEY] = not result.success and (
+            prior_unknown or not result.not_posted
+        )
+        if not result.success and not result.not_posted:
+            # Unknown since this attempt ended: whatever it created was sent by now.
+            new_state.update(_final_stamp(datetime.now(UTC)))
+        elif not new_state[OUTCOME_UNKNOWN_KEY]:
+            new_state.pop(OUTCOME_UNKNOWN_AT_KEY, None)
+            new_state.pop(OUTCOME_UNKNOWN_AT_FINAL_KEY, None)
+        # else: this attempt sent nothing, so the earlier attempt's stamp stands.
+        if result.success:
+            # Recorded with the success itself, not only once the caller's
+            # transitions commit: a failure between the two would otherwise
+            # leave a confirmed bill reading as never posted.
+            new_state["erp_reference"] = reference
+            # The ERP company the bill lives in: an ERP's ids are per company,
+            # so the status sync matches a bill id only within it (§295).
+            new_state["erp_realm"] = connection_realm(config)
         if result.pending_job_id != payload.pending_job_id:
             new_state[PENDING_JOB_KEY] = result.pending_job_id
         if result.success:
-            for key in _ORPHAN_KEYS:
+            for key in (
+                *_ORPHAN_KEYS,
+                ORPHAN_DOCUMENT_OWN_KEY,
+                ORPHAN_DOCUMENT_FINGERPRINT_KEY,
+                ATTEMPT_INVOICE_DATES_KEY,
+            ):
                 new_state.pop(key, None)
+        elif result.not_posted:
+            # This attempt left nothing in the ERP: its date names no bill.
+            if dates_before is None:
+                new_state.pop(ATTEMPT_INVOICE_DATES_KEY, None)
+            else:
+                new_state[ATTEMPT_INVOICE_DATES_KEY] = dates_before
         elif result.erp_document_id or result.erp_document_number:
             new_state[ORPHAN_DOCUMENT_ID_KEY] = result.erp_document_id
             new_state[ORPHAN_DOCUMENT_NUMBER_KEY] = result.erp_document_number
-        if new_state != state:
-            instance.state_data = new_state
+            # Written only as True: a document an attempt found, not made,
+            # replaces the orphan AND drops any earlier claim to it.
+            if result.erp_document_is_own and result.erp_document_id:
+                new_state[ORPHAN_DOCUMENT_OWN_KEY] = True
+                new_state[ORPHAN_DOCUMENT_FINGERPRINT_KEY] = result.erp_document_fingerprint
+            else:
+                new_state.pop(ORPHAN_DOCUMENT_OWN_KEY, None)
+                new_state.pop(ORPHAN_DOCUMENT_FINGERPRINT_KEY, None)
+        instance.state_data = new_state
 
     if not result.success:
         error = ErpPostFailedError if result.retryable else ErpPostRefusedError
@@ -462,6 +1078,7 @@ async def _call_erp(
             result.message or ("ERP post failed" if result.retryable else "ERP post refused"),
             erp_document_id=result.erp_document_id,
             erp_document_number=result.erp_document_number,
+            refusal=_result_refusal(result, invoice, line_items, refs),
         )
 
-    return result.erp_document_id or result.erp_document_number or "UNKNOWN"
+    return reference

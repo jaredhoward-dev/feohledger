@@ -8,7 +8,7 @@ both humans and agents run on.
 ## Why an exception is a control, not a note
 
 Six exception types block a payment run outright —
-`api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`:
+`services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`:
 
 | Type | Raised by |
 |---|---|
@@ -22,6 +22,66 @@ Six exception types block a payment run outright —
 Invoice **approval gates on none of them**. So clearing one of these is the
 human sign-off that lets the money move — the last control between a flagged
 payable and a funded payment run.
+
+Two of them, `duplicate` and `fraud_flag`
+(`services/payment_gates.ERP_EXPORT_BLOCKING_EXCEPTION_TYPES`), also refuse the **ERP
+push** while open or escalated: a bill in the ERP can be paid from inside the
+ERP, where the payment-run gate never sees it. Clearing one is then also what
+lets the invoice post ([erp-integration.md](erp-integration.md) § An open
+duplicate or fraud exception refuses the push; decisions §286). The
+`fraud_flag` a vendor bank-change approval opens on that vendor's approved,
+unpaid invoices is included. When an earlier push attempt may already have
+created the bill (a timeout or 5xx the ERP may have applied), the refusal, the
+409 and the `invoice.erp_failed` row carry `possibly_posted: true`: check the
+ERP for that bill before anyone pays it, then clear the exception.
+
+Once a person has resolved or dismissed a finding, `refresh_warnings` does not
+raise it again **while the facts its rule reads are unchanged**. This holds for
+every type `_ensure_exception` raises, payment-blocking or not (decisions §286
+for these two, §366 for the rest). Each detector row carries
+`finding_fingerprint` (migration 0116), a hash of the facts that type's rule
+reads, stamped when the row is raised. A closed row suppresses the re-raise
+only when its fingerprint equals the invoice's current one. The one rule for
+"the facts" is `invoice_warnings.current_finding_fingerprint`:
+
+| Type | Facts hashed | So this re-raises it |
+|---|---|---|
+| `duplicate`, `fraud_flag`, `missing_data` | the finding's code and the header fields the rules read (vendor, number, amount, currency, dates, remit address, PO number, entity …), plus the vendor email domain for `personal_email_domain` | an edit to any of those fields |
+| `line_total_mismatch` | the header money (`amount`, `subtotal`, `tax_amount`, `shipping_amount`, `discount_amount`, `currency`) and the summed line totals | editing a line total or a header money field |
+| `po_mismatch`, `quality_hold` | the invoice's PO number, amount, currency, vendor, GL code and entity, and what the persisted `invoice.po_match` found (PO total, currency and status, receipt quantities, inspection id and verdict, tolerance, each issue's code and params; not its wording) | a PO change (an ERP sync included), a receipt recorded or cancelled, a new inspection, a match-rule change |
+| `price_variance` | the invoice's priced lines (item, description, unit price), vendor and currency; not the history's medians | changing a line's price or item |
+| `contract_noncompliant` | the contract and the invoice fields compliance reads, and *which* terms are breached; not the running spend | a newly breached term, or an invoice edit |
+| `unverified_vendor` | the linked vendor | re-linking the invoice to another vendor |
+
+The non-header types are keyed on the type, not the row's code, because one row
+holds every finding of its type: clearing it accepts all of them.
+
+`record_decision` keeps the fingerprint on a resolve or dismiss only when a
+person decided (an `actor_id`, no `via` such as an agent or a PO-match refresh)
+and the invoice still hashes as it was raised, and every refresh voids the stamp
+of an open row the invoice has moved away from, so an edit made while someone
+was deciding (even one reverted before they click) never rides their verdict.
+Suppression only honours a decision `record_decision` let through, so the
+segregation rules below decide who can create one. **It also re-asks them at
+every refresh.** `record_decision` records the person on the row
+(`decided_by_user_id`, migration 0126; NULL for a detector or an agent), and a
+closed payment-blocking row suppresses only while `segregation_refusal` would
+still let that person clear it (`exception_lifecycle.clearance_stands`). So a
+decider who has become implicated since (an importer migration 0126 named as
+the uploader, or a person who recalled the invoice's approval) no longer keeps
+their own clearance live, and the finding is raised again for someone else;
+a clearance by anyone the invoice does not implicate still holds. A
+payment-blocking row with no recorded decider never suppresses (decisions §367).
+An approval does not wait for the next refresh: every site that stamps an
+approver re-judges the invoice's closed `po_mismatch` / `quality_hold` rows in
+the same transaction (`invoice_warnings.reraise_holds_cleared_by_an_approver`),
+so a hold its new approver cleared first is open again before a payment run can
+stage the invoice (decisions §422).
+The decision writes its
+`exception.resolved` / `exception.dismissed` row as always; a suppressed
+refresh writes nothing, because nothing was raised. A row closed before its type
+was stamped (before 0116, or before §366 for the types it added) has no
+fingerprint and never suppresses.
 
 ## Why the trail is in `audit_log`, not on the exception row
 
@@ -78,7 +138,7 @@ groups that exception's raise / assign / resolve rows together.
 ```
 
 - **`payment_blocking`** is derived from
-  `api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES` at write time
+  `services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES` at write time
   (`exception_lifecycle.is_payment_blocking`), never a second hardcoded list —
   add a type to the gate and the trail follows. It is what tells an auditor
   this decision unblocked money.
@@ -120,6 +180,16 @@ the row — **and enforces segregation of duties**. Every decider goes through i
   hold cleared by a `pass` someone implicated in the invoice typed in
   themselves, and a row an agent is mid-way through deciding
   (`exception_lifecycle.deciding`) is left for the agent ([po-matching.md](po-matching.md) § Before Payment).
+  **A refresh the ERP PO sync triggers never takes this door** (decisions
+  §323, amended — a product-owner call pending CISO review): it may raise a
+  `po_mismatch` / `quality_hold` but not clear one, because an ERP-side actor
+  who changed the PO is outside the invoice's implicated set and so invisible
+  to `segregation_refusal`. A row the sync's re-match no longer finds stays
+  open and payment-blocking, with `erp_report = {"kind": "po_rematch_clears",
+  "erp_type", "po_number", "observed_on"}` recording that the re-check now
+  matches; a person clears it here, through `record_decision`, under the
+  segregation refusal below. The note is removed if a later refresh finds the
+  finding again.
 
 Previously these were copies (the coordinator's helper carried a comment saying
 it was mirroring the API's; the payments one said the same), and none wrote an
@@ -135,15 +205,19 @@ Clearing a payment-**blocking** exception is a money-path authorisation, so
 `record_decision` refuses an actor implicated in the linked invoice
 (`Invoice.uploaded_by_id` ∪ `Invoice.segregation_actor_ids`, through
 `approval_chain.violates_segregation`) **or** recorded as the flag's raiser
-(`exceptions.raised_by_user_id`, migration `0098`). `resolve` and `dismiss`
-only — `escalate` is the refused actor's exit and an escalated row still blocks
-the run. NULL on both axes is permissive; `settings.exceptions
-.require_segregation: false` is the explicit per-org opt-out. The single-row
-403 is a coded refusal whose `code` is the same `segregation_raiser` /
-`segregation_implicated` string `/bulk/resolve` reports per skipped row. Full rules,
+(`exceptions.raised_by_user_id`, migration `0098`) **or**, on a `po_mismatch` or
+`quality_hold` only, one of the invoice's approvers (`approval_chain.approver_ids`:
+the approval of record ∪ the chain's level approvals; decisions §420 — those
+holds wait for a receipt or an inspection the approver did not supply).
+`resolve` and `dismiss` only — `escalate` is the refused actor's exit and an
+escalated row still blocks the run. NULL on every axis is permissive;
+`settings.exceptions.require_segregation: false` is the explicit per-org
+opt-out. The single-row 403 is a coded refusal whose `code` is the same
+`segregation_raiser` / `segregation_implicated` / `segregation_approver` string
+`/bulk/resolve` reports per skipped row. Full rules,
 including what each refusal says and why a refusal is logged rather than
 audited: [`docs/authentication.md`](../../docs/authentication.md) § Segregation
-of duties on the exception queue, and `docs/decisions.md` §169–§170.
+of duties on the exception queue, and `docs/decisions.md` §169–§170 and §420.
 
 **Being the chokepoint is what makes it safe to put the check here**, and it is
 also why the two non-queue callers (compliance release, portal) need no exemption: neither
@@ -154,6 +228,25 @@ is a control. `record_decision` also **loads the invoice itself** when a caller
 omits it, so the check cannot be switched off by leaving an optional argument
 out, and `org_settings` defaults to enforcing so a forgetful caller fails
 closed.
+
+### Clearing a blocker re-attempts the ERP's reported payment
+
+Because every clearing door passes through it, `record_decision` is also where a
+payment the ERP reported, and FeohLedger could not record, is tried again
+(decisions §319). After a `resolve` / `dismiss` of a payment-blocking
+exception, if the invoice holds a live, non-blocking row whose
+`erp_report.kind` is `paid_not_recorded`, `erp_status_sync.
+retry_erp_reported_payments` re-runs `record_erp_reported_payment` with the
+stored facts in the caller's transaction. Every refusal is re-run; a refusal
+refreshes the row. It is skipped when the cleared row is itself an ERP payment
+row (so `close_erp_paid_reports`, which closes those rows through
+`record_decision` once the invoice is recorded, never recurses), and for a
+blocking `paid_not_recorded` row, which a person records in one click
+(`POST /api/exceptions/{id}/record-erp-payment`) because it refuses the record
+on itself by design. Because the detector's auto-close and the agent
+coordinator go through `record_decision` too, either can record the payment
+when it clears the last blocker. That is the same record the ERP sweep would
+make, under the same gates, with no human actor.
 
 ## Escalation is not a resolution
 
@@ -185,7 +278,7 @@ their own queue.
 beside the rest of an exception's behaviour (payment-blocking, actionable,
 auditable). Two things key off it:
 
-- `api/exceptions.EXCEPTION_TYPE_LABELS` must cover it **exactly**. A missing
+- `services/exception_lifecycle.EXCEPTION_TYPE_LABELS` must cover it **exactly**. A missing
   entry isn't a crash — the lookup falls back to the raw key — so the queue just
   renders `line_total_mismatch` at an AP manager instead of "Line Total
   Mismatch". That matters most for exactly the types it kept happening to:
@@ -220,11 +313,18 @@ code the same way.
 Both columns are NULL — and clients render `description` — for a human-authored
 description (`review_rejected`'s reason), for every row raised before 0103 (no
 backfill), and for the `create_exception` sites still composing unkeyed English
-(ERP reconciliation, Positive Pay returns, the vendor bank-change flag, payment
-compliance holds, the reconciler's aged-out payment, settlement discrepancies,
-ERP sync-back failures, extraction failures). The code families, the composite
+(Positive Pay returns, the vendor bank-change flag, payment compliance holds,
+the reconciler's aged-out payment, settlement discrepancies, extraction
+failures). The code families, the composite
 convention and the client fallback order are in
 [invoice-warnings.md](invoice-warnings.md) § Exception descriptions.
+
+The ERP payment rows (`erp_report`, migration 0121) write that English for an
+AP user: what happened and what to do, never an API path, id or refusal code.
+Their machine detail is in `erp_report`, which the queue reads to pre-fill the
+"Record the ERP's payment" form. Each sentence is an `exception.erp_*`
+catalogue code (`erp_status_sync.erp_finding`), so the queue renders it in the
+reader's language; a refreshed row moves its code and params with its English.
 
 ## Where it surfaces
 

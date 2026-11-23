@@ -1,5 +1,6 @@
 <script lang="ts">
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import type {
 		Expense,
 		ExpenseStatus,
@@ -13,6 +14,7 @@
 		PolicyViolation,
 		CorporateCardTransaction,
 		CardMatchSuggestion,
+		CardImportResult,
 		ExpenseSummary
 	} from '#lib/types/expense.ts';
 	import {
@@ -27,10 +29,14 @@
 		EXPENSE_PREAPPROVAL_STATUS_TONES,
 		RECONCILIATION_STATUSES,
 		reconciliationStatusLabelKey,
+		canAuthorLooseLine,
+		isLineCreator,
 		RECONCILIATION_STATUS_TONES
 	} from '#lib/types/expense.ts';
 	import { expenseStore } from '#lib/stores/expenses.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import { isAllowed, refusalText, type ActionRefusal } from '#lib/api/actionVerdicts.ts';
+	import { policyViolationText } from '#lib/api/policyViolations.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import {
 		listGlAccounts,
@@ -72,9 +78,12 @@
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
+	import CsvImportErrors from '#lib/components/ui/CsvImportErrors.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
+	import RefusalNote from '#lib/components/ui/RefusalNote.svelte';
 	import BulkBar from '#lib/components/ui/BulkBar.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
 	import { DEFAULT_CURRENCY, formatMoney } from '#lib/utils/money.ts';
@@ -90,9 +99,11 @@
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { normalizeMoneyInput } from '#lib/utils/moneyInput.ts';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
 	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { formatCount } from '#lib/utils/count.ts';
 
 	const canCreate = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk'));
 	// Policy CRUD + report/pre-approval REJECT = admin | ap_manager.
@@ -107,11 +118,6 @@
 		{ key: 'preapprovals', label: m('expenses.tab.preapprovals') },
 		{ key: 'cards', label: m('expenses.tab.cards') }
 	]);
-	// Report APPROVE is admin | ap_manager | cfo — and above the org's
-	// `expense_approval.cfo_threshold` the backend demands cfo/admin, so the CFO
-	// must be able to see the button. `auth.isCfo` = admin|cfo, so the union with
-	// `isManager` is exactly those three roles.
-	const canApproveReports = $derived(auth.isManager || auth.isCfo);
 
 	// --- Tabs ---
 	type Tab = 'expenses' | 'reports' | 'policies' | 'preapprovals' | 'cards';
@@ -466,14 +472,14 @@
 			selectedAllMatching = true;
 			if (res.truncated) {
 				toast(
-					`Selected the first ${res.ids.length} of ${res.total} matching — narrow your filters to select the rest.`,
+					m('expenses.toast.selectedTruncated', { shown: formatCount(res.ids.length), total: formatCount(res.total) }),
 					'error'
 				);
 			} else {
-				toast(`Selected all ${res.ids.length} matching expense(s)`, 'success');
+				toast(m('expenses.toast.selectedAllMatching', { n: res.ids.length }), 'success');
 			}
-		} catch {
-			toast('Failed to select all matching', 'error');
+		} catch (err) {
+			toast(err instanceof Error ? err.message : m('expenses.toast.selectAllFailed'), 'error');
 		} finally {
 			selectingAllMatching = false;
 		}
@@ -485,7 +491,7 @@
 		try {
 			const res = await bulkGlCode([...selected], bulkGl || null);
 			const msg = res.skipped?.length
-				? `${m('expenses.toast.glCoded', { n: res.updated })} (skipped ${res.skipped.length})`
+				? m('expenses.toast.glCodedSkipped', { n: res.updated, skipped: res.skipped.length })
 				: m('expenses.toast.glCoded', { n: res.updated });
 			toast(msg, 'success');
 			selected = new Set();
@@ -547,6 +553,12 @@
 	let reportsTotal = $state(0);
 	let reportsPage = $state(1);
 	let reportsLoadingMore = $state(false);
+	// A failed FIRST page: `ui/LoadError` replaces the table, so a failure never
+	// reads as "No expense reports yet." A failed load-more keeps the rows it
+	// already has and toasts instead. Cleared when a fresh load starts, so Retry
+	// unmounts the block and a second failure re-announces. Same rule on the
+	// policies / pre-approvals / cards tabs below.
+	let reportsErrored = $state(false);
 
 	// `reportsTotal` is the whole set, so the footer may only claim to be
 	// showing all of it once every row is actually loaded.
@@ -574,15 +586,9 @@
 	// re-fetches through `loadReports()` — so it needs no `supersedeInFlight()`;
 	// the sequencer here only stops two of those refreshes landing out of order.
 	// Three states, not one: a failed load must not read as "nothing matched".
-	// The search term reaches the server, so once the fetch settles the plain
-	// empty message is a true statement about the whole filtered set.
-	let expensesEmptyMessage = $derived(
-		expenseStore.loading
-			? m('expenses.loading')
-			: expenseStore.errored
-				? m('expenses.empty.errored')
-				: m('expenses.empty')
-	);
+	// The failed state renders `ui/LoadError` (with a Retry) in the table's
+	// place. The search term reaches the server, so once the fetch settles the
+	// plain empty message is a true statement about the whole filtered set.
 
 	const reportsSequence = createRequestSequencer();
 
@@ -590,7 +596,10 @@
 		const nextPage = opts.append ? reportsPage + 1 : 1;
 		const token = reportsSequence.start();
 		if (opts.append) reportsLoadingMore = true;
-		else reportsLoading = true;
+		else {
+			reportsLoading = true;
+			reportsErrored = false;
+		}
 		try {
 			const res = await listExpenseReports({
 				page: nextPage,
@@ -600,6 +609,16 @@
 			reports = opts.append ? appendUnique(reports, res.items) : res.items;
 			reportsTotal = res.total;
 			reportsPage = nextPage;
+		} catch (err) {
+			// Handled here rather than re-thrown: the mutations below await this
+			// refresh inside their own try, and a failed REFRESH after a
+			// successful submit/approve used to surface as "Submit failed".
+			if (!reportsSequence.isCurrentRequest(token)) return;
+			if (opts.append) {
+				toast(err instanceof Error ? err.message : m('expenses.reports.toast.loadFailed'), 'error');
+			} else {
+				reportsErrored = true;
+			}
 		} finally {
 			if (reportsSequence.isCurrentRequest(token)) {
 				reportsLoading = false;
@@ -642,6 +661,18 @@
 		}
 	}
 
+	// A decision's response carries no verdicts (decisions §305), so the detail
+	// is re-read to learn what the reader may do next. If that read fails the
+	// response is shown without them, and every control stays hidden (an
+	// absent verdict is a refusal) until the report is reopened.
+	async function adoptReport(updated: ExpenseReport) {
+		try {
+			activeReport = await getExpenseReport(updated.id);
+		} catch {
+			activeReport = updated;
+		}
+	}
+
 	function closeReport() {
 		activeReport = null;
 		activeSummary = null;
@@ -673,12 +704,32 @@
 		}
 	}
 
+	// The caller's own loaded lines that sit on no report: what the attach
+	// input suggests. Attach goes only onto a report its line's creator owns
+	// (decisions §434, `expense_report_foreign_line`), so a colleague's line is
+	// never offered. Only the loaded page is known here; an ID typed beyond it
+	// is the server's to judge.
+	const attachableExpenses = $derived(
+		activeReport
+			? expenseStore.all.filter(
+					(e) => e.report_id === null && isLineCreator(e, activeReport!.employee_user_id)
+				)
+			: []
+	);
+
 	async function attachToReport() {
 		if (!activeReport || !attachId.trim()) return;
+		// A line this page has loaded and knows is a colleague's is refused here
+		// with the server's own sentence, not sent to be refused.
+		const known = expenseStore.all.find((e) => e.id === attachId.trim());
+		if (known && !isLineCreator(known, activeReport.employee_user_id)) {
+			toast(m('refusal.expenseReportForeignLine'), 'error');
+			return;
+		}
 		reportBusy = true;
 		try {
 			const updated = await attachExpenses(activeReport.id, [attachId.trim()], false);
-			activeReport = updated;
+			await adoptReport(updated);
 			attachId = '';
 			toast(m('expenses.reports.toast.attached'), 'success');
 			await refreshSummary();
@@ -695,7 +746,7 @@
 		reportBusy = true;
 		try {
 			const updated = await attachExpenses(activeReport.id, [expenseId], true);
-			activeReport = updated;
+			await adoptReport(updated);
 			toast(m('expenses.reports.toast.detached'), 'success');
 			await refreshSummary();
 			await loadReports();
@@ -720,7 +771,7 @@
 			// pre-approval) without transitioning — surfaced inline + as a toast.
 			const result = await apiSubmitReport(activeReport.id);
 			if (result.ok) {
-				activeReport = result.report;
+				await adoptReport(result.report);
 				toast(m('expenses.reports.toast.submitted'), 'success');
 				await refreshSummary();
 				await loadReports();
@@ -740,7 +791,7 @@
 		reportBusy = true;
 		try {
 			const updated = await approveReport(activeReport.id);
-			activeReport = updated;
+			await adoptReport(updated);
 			toast(m('expenses.reports.toast.approved'), 'success');
 			await refreshSummary();
 			await loadReports();
@@ -759,7 +810,7 @@
 		reportBusy = true;
 		try {
 			const updated = await rejectReport(activeReport.id, rejectReason.trim());
-			activeReport = updated;
+			await adoptReport(updated);
 			showReject = false;
 			rejectReason = '';
 			toast(m('expenses.reports.toast.rejected'), 'success');
@@ -772,29 +823,17 @@
 		}
 	}
 
-	// Reject is admin | ap_manager (`POST /expense-reports/{id}/reject`), and never
-	// by the report's own owner (segregation of duties — decider != submitter).
-	function canDecideReport(r: ExpenseReport): boolean {
-		return canManagePolicies && r.status === 'submitted' && auth.user?.id !== r.employee_user_id;
-	}
-
-	// Approve is a WIDER role set than reject: admin | ap_manager | cfo
-	// (`POST /expense-reports/{id}/approve`). Above
-	// `settings.expense_approval.cfo_threshold` the backend REQUIRES cfo/admin —
-	// so gating Approve on the manager-only predicate hid the button from the
-	// exact person the CFO gate escalates to, leaving a large report with no
-	// approver at all. Same SoD self-check.
-	function canApproveReport(r: ExpenseReport): boolean {
-		return canApproveReports && r.status === 'submitted' && auth.user?.id !== r.employee_user_id;
-	}
-
-	// Composition (attach / detach) and submit are the OWNER's alone
-	// (`employee_user_id`), whatever the viewer's role: report segregation refuses
-	// only the owner at approval, so a manager who could build or submit a
-	// clerk's report could then approve it. The server refuses a non-owner with
-	// 403 `expense_report_not_owner`; this only stops offering the buttons.
-	function canComposeReport(r: ExpenseReport): boolean {
-		return canCreate && r.status === 'draft' && auth.user?.id === r.employee_user_id;
+	// Whether to offer Submit / Approve / Reject / Attach / Detach is the
+	// server's verdict on the report (`actions`, built from the gates each
+	// endpoint raises from — `frontend/docs/ui-patterns.md` § Whether to offer an
+	// action). The page used to restate them (role + status + `employee_user_id`
+	// against the reader) and offered an ap_manager an Approve the CFO gate
+	// refused. A refused control is hidden, except where the reader can act on
+	// the reason: above the CFO threshold Approve stays visible, disabled, with
+	// the gate's sentence (someone with the CFO role must approve).
+	const EXPLAINED_APPROVE_REFUSALS = new Set(['expense_cfo_required']);
+	function approveExplained(verdict: ActionRefusal | undefined): verdict is NonNullable<ActionRefusal> {
+		return !!verdict && EXPLAINED_APPROVE_REFUSALS.has(verdict.code);
 	}
 
 	function exportReportCsv() {
@@ -804,7 +843,7 @@
 
 	// --- Violation badge helpers (shared by expenses + report-detail rows) ---
 	function violationTitle(list: PolicyViolation[]): string {
-		return list.map((v) => v.message).join('; ');
+		return list.map((v) => policyViolationText(v, m)).join('; ');
 	}
 
 	function switchTab(next: Tab) {
@@ -828,6 +867,7 @@
 
 	let policies = $state<ExpensePolicy[]>([]);
 	let policiesLoading = $state(false);
+	let policiesErrored = $state(false);
 	let showPolicyCreate = $state(false);
 	let editingPolicy = $state<ExpensePolicy | null>(null);
 	let confirmDeletePolicyId = $state<string | null>(null);
@@ -840,6 +880,7 @@
 	async function loadPolicies() {
 		const token = policiesSequence.start();
 		policiesLoading = true;
+		policiesErrored = false;
 		try {
 			const loaded = await listPolicies();
 			// Superseded by a newer load, or by a local create/edit/delete.
@@ -849,7 +890,14 @@
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!policiesSequence.isCurrentRequest(token)) return;
-			toast(err instanceof Error ? err.message : m('expenses.policies.toast.loadFailed'), 'error');
+			// Superseded by a local edit: the rows on screen are that edit's,
+			// so keep them and toast. Otherwise nothing trustworthy is on
+			// screen and the table gives way to LoadError.
+			if (policiesSequence.wasSupersededByEdit(token)) {
+				toast(err instanceof Error ? err.message : m('expenses.policies.toast.loadFailed'), 'error');
+			} else {
+				policiesErrored = true;
+			}
 		} finally {
 			if (policiesSequence.isCurrentRequest(token)) policiesLoading = false;
 		}
@@ -882,6 +930,7 @@
 	// ======================== Pre-approvals tab ========================
 	let preapprovals = $state<ExpensePreapproval[]>([]);
 	let preapprovalsLoading = $state(false);
+	let preapprovalsErrored = $state(false);
 	let preapprovalStatus = $state<string>(page.url.searchParams.get('pa_status') ?? 'all');
 	let showNewPreapproval = $state(false);
 	let paBusy = $state(false);
@@ -908,6 +957,7 @@
 	async function loadPreapprovals() {
 		const token = preapprovalsSequence.start();
 		preapprovalsLoading = true;
+		preapprovalsErrored = false;
 		try {
 			const params = preapprovalStatus !== 'all' ? { status: preapprovalStatus } : {};
 			const loaded = await listPreapprovals(params);
@@ -918,7 +968,12 @@
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!preapprovalsSequence.isCurrentRequest(token)) return;
-			toast(err instanceof Error ? err.message : m('expenses.preapprovals.toast.loadFailed'), 'error');
+			// Same split as policies: a local approve/reject owns the rows.
+			if (preapprovalsSequence.wasSupersededByEdit(token)) {
+				toast(err instanceof Error ? err.message : m('expenses.preapprovals.toast.loadFailed'), 'error');
+			} else {
+				preapprovalsErrored = true;
+			}
 		} finally {
 			if (preapprovalsSequence.isCurrentRequest(token)) preapprovalsLoading = false;
 		}
@@ -1001,12 +1056,17 @@
 	let cardsTotal = $state(0);
 	let cardsPage = $state(1);
 	let cardsLoadingMore = $state(false);
+	let cardsErrored = $state(false);
 
 	// Same rule as the reports list: `cardsTotal` is the whole set.
 	let cardsHasMore = $derived(cardTxns.length < cardsTotal);
 	let reconFilter = $state<string>(page.url.searchParams.get('recon') ?? 'all');
 	let cardBusy = $state(false);
 	let cardFileInput = $state<HTMLInputElement>();
+	// The last card import's refused rows, listed above the table until
+	// dismissed or the next import (decisions §377). A refused row used to
+	// show only as part of a "skipped" count, with no reason.
+	let cardImportResult = $state<CardImportResult | null>(null);
 
 	// Match-suggestion picker modal state.
 	let matchTxn = $state<CorporateCardTransaction | null>(null);
@@ -1035,7 +1095,10 @@
 		const nextPage = opts.append ? cardsPage + 1 : 1;
 		const token = cardsSequence.start();
 		if (opts.append) cardsLoadingMore = true;
-		else cardsLoading = true;
+		else {
+			cardsLoading = true;
+			cardsErrored = false;
+		}
 		try {
 			const params = reconFilter !== 'all' ? { reconciliation_status: reconFilter } : {};
 			const res = await listCardTransactions({
@@ -1049,7 +1112,11 @@
 			cardsPage = nextPage;
 		} catch (err) {
 			if (!cardsSequence.isCurrentRequest(token)) return;
-			toast(err instanceof Error ? err.message : m('expenses.cards.toast.loadFailed'), 'error');
+			if (opts.append) {
+				toast(err instanceof Error ? err.message : m('expenses.cards.toast.loadFailed'), 'error');
+			} else {
+				cardsErrored = true;
+			}
 		} finally {
 			if (cardsSequence.isCurrentRequest(token)) {
 				cardsLoading = false;
@@ -1073,14 +1140,16 @@
 		const file = input.files?.[0];
 		if (!file) return;
 		cardBusy = true;
+		cardImportResult = null;
 		try {
 			const result = await importCardCsv(file);
+			// `skipped` counts refused rows too; only the rest are duplicates.
+			const refused = result.errors.length;
+			const duplicates = Math.max(result.skipped - refused, 0);
+			cardImportResult = refused > 0 ? result : null;
 			toast(
-				m('expenses.cards.toast.imported', { n: result.imported }) +
-					(result.skipped
-						? m('expenses.cards.toast.importedSkipped', { n: result.skipped })
-						: ''),
-				result.imported > 0 ? 'success' : 'info'
+				m('expenses.cards.toast.imported', { n: result.imported, duplicates, refused }),
+				refused > 0 ? 'info' : result.imported > 0 ? 'success' : 'info'
 			);
 			await loadCardTxns();
 		} catch (err) {
@@ -1096,8 +1165,9 @@
 		try {
 			const res = await syncVirtualCards();
 			toast(
-				m('expenses.cards.toast.synced', { n: res.created }) +
-					(res.skipped ? m('expenses.cards.toast.syncedSkipped', { n: res.skipped }) : ''),
+				res.skipped
+					? m('expenses.cards.toast.syncedSkipped', { n: res.created, skipped: res.skipped })
+					: m('expenses.cards.toast.synced', { n: res.created }),
 				'success'
 			);
 			await loadCardTxns();
@@ -1235,10 +1305,18 @@
 			<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 		</div>
 
+		{#if expenseStore.errored}
+			<LoadError
+				message={m('expenses.empty.errored')}
+				onretry={() => expenseStore.fetch(buildParams()).catch(() => {})}
+				testId="expenses-error"
+			/>
+		{:else}
 		<DataTable
 			columns={COLUMNS}
 			isEmpty={expenseStore.all.length === 0}
-			empty={expensesEmptyMessage}
+			loading={expenseStore.loading}
+			empty={m('expenses.empty')}
 		>
 			{#snippet header()}
 				<tr>
@@ -1302,7 +1380,9 @@
 							</span>
 						</td>
 						<td class="actions">
-							{#if canCreate}
+							<!-- A colleague's line on no report is theirs to delete
+							     (decisions §434, `expense_not_creator`). -->
+							{#if canCreate && canAuthorLooseLine(exp, auth.user?.id)}
 								<RowAction
 									variant="danger"
 									armed={confirmDeleteId === exp.id}
@@ -1320,24 +1400,24 @@
 				{/each}
 			{/snippet}
 		</DataTable>
-
-		{#if expenseStore.hasMore}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={() => expenseStore.loadMore()} disabled={expenseStore.loading}>
-					{expenseStore.loading ? m('expenses.loading') : m('expenses.loadMore', { shown: expenseStore.all.length, total: expenseStore.total })}
-				</button>
-			</div>
-		{:else if expenseStore.total > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('expenses.showingAll', { total: expenseStore.total })}</span>
-			</div>
 		{/if}
+
+		<LoadMoreFooter
+			shown={expenseStore.all.length}
+			total={expenseStore.total}
+			hasMore={expenseStore.hasMore}
+			loading={expenseStore.loading}
+			errored={expenseStore.errored}
+			onloadmore={() => expenseStore.loadMore()}
+			moreKey="expenses.loadMore"
+			allKey="expenses.showingAll"
+		/>
 	{:else if tab === 'reports'}
 		<!-- ===================== Reports tab ===================== -->
 		{#if activeReport}
 			<div class="report-detail">
 				<div class="report-detail-head">
-					<button class="btn-back" onclick={closeReport}>{m('expenses.reports.back')}</button>
+					<button type="button" class="btn-ghost" onclick={closeReport}>{m('expenses.reports.back')}</button>
 					<div class="report-title-block">
 						<h2>{activeReport.report_number}</h2>
 						<Badge tone={EXPENSE_REPORT_STATUS_TONES[activeReport.status as ExpenseReportStatus]} variant={activeReport.status}>{reportStatusLabel(activeReport.status)}</Badge>
@@ -1345,14 +1425,17 @@
 					</div>
 					<div class="report-detail-actions">
 						<button class="btn-secondary" onclick={exportReportCsv}>{m('expenses.reports.exportCsv')}</button>
-						{#if canComposeReport(activeReport)}
+						{#if isAllowed(activeReport.actions?.submit)}
 							<button class="btn-primary" disabled={reportBusy} onclick={submitReport}>{m('expenses.reports.submit')}</button>
 						{/if}
-						{#if canApproveReport(activeReport)}
+						{#if isAllowed(activeReport.actions?.approve)}
 							<button class="btn-primary" disabled={reportBusy} onclick={approveActiveReport}>{m('expenses.reports.approve')}</button>
+						{:else if approveExplained(activeReport.actions?.approve)}
+							<RefusalNote id="approve-refusal" reason={refusalText(activeReport.actions.approve, m)} />
+							<button class="btn-primary" disabled aria-describedby="approve-refusal">{m('expenses.reports.approve')}</button>
 						{/if}
-						{#if canDecideReport(activeReport)}
-							<button class="btn-secondary danger" disabled={reportBusy} onclick={() => (showReject = true)}>{m('expenses.reports.reject')}</button>
+						{#if isAllowed(activeReport.actions?.reject)}
+							<button class="btn-danger" disabled={reportBusy} onclick={() => (showReject = true)}>{m('expenses.reports.reject')}</button>
 						{/if}
 					</div>
 				</div>
@@ -1361,8 +1444,10 @@
 					<div class="violation-panel">
 						<strong>{m('expenses.reports.submitBlocked')}</strong>
 						<ul>
-							{#each submitViolations as v (v.code + (v.policy_id ?? ''))}
-								<li>{v.message}</li>
+							<!-- One line can breach one policy's rule once, so the key is
+							     (line, policy, code); the same policy on two lines is two items. -->
+							{#each submitViolations as v (`${v.expense_id ?? ''}:${v.policy_id ?? ''}:${v.code}`)}
+								<li>{policyViolationText(v, m)}</li>
 							{/each}
 						</ul>
 					</div>
@@ -1376,7 +1461,7 @@
 							bind:value={rejectReason}
 							aria-label={m('expenses.reports.rejectAria')}
 						/>
-						<button class="btn-secondary danger" disabled={reportBusy} onclick={rejectActiveReport}>{m('expenses.reports.confirmReject')}</button>
+						<button class="btn-danger armed" disabled={reportBusy} onclick={rejectActiveReport}>{m('expenses.reports.confirmReject')}</button>
 						<button class="btn-secondary" disabled={reportBusy} onclick={() => { showReject = false; rejectReason = ''; }}>{m('expenses.reports.cancel')}</button>
 					</div>
 				{/if}
@@ -1432,16 +1517,25 @@
 					</div>
 				{/if}
 
-				{#if canComposeReport(activeReport)}
+				{#if isAllowed(activeReport.actions?.compose)}
 					<div class="attach-row">
 						<input
 							type="text"
 							placeholder={m('expenses.reports.attachPlaceholder')}
 							bind:value={attachId}
 							aria-label={m('expenses.reports.attachAria')}
+							aria-describedby="expense-attach-hint"
+							list="expense-attach-options"
+							data-testid="expense-attach-input"
 						/>
+						<datalist id="expense-attach-options">
+							{#each attachableExpenses as e (e.id)}
+								<option value={e.id}>{e.merchant ?? e.id} · {formatMoney(e.amount, { currency: e.currency })}</option>
+							{/each}
+						</datalist>
 						<button class="btn-secondary" disabled={reportBusy || !attachId.trim()} onclick={attachToReport}>{m('expenses.reports.attach')}</button>
 					</div>
+					<p class="attach-hint" id="expense-attach-hint">{m('expenses.reports.attachHint')}</p>
 				{/if}
 
 				<DataTable
@@ -1474,7 +1568,7 @@
 									</span>
 								</td>
 								<td class="actions">
-									{#if activeReport && canComposeReport(activeReport)}
+									{#if isAllowed(activeReport?.actions?.compose)}
 										<RowAction variant="default" onclick={() => detachFromReport(exp.id)}>{m('expenses.reports.detach')}</RowAction>
 									{/if}
 								</td>
@@ -1483,6 +1577,12 @@
 					{/snippet}
 				</DataTable>
 			</div>
+		{:else if reportsErrored}
+			<LoadError
+				message={m('expenses.reports.toast.loadFailed')}
+				onretry={() => loadReports()}
+				testId="expense-reports-error"
+			/>
 		{:else}
 			<DataTable
 				columns={[
@@ -1492,7 +1592,8 @@
 					{ label: m('expenses.reports.col.total'), class: 'right' }
 				]}
 				isEmpty={reports.length === 0}
-				empty={reportsLoading ? m('expenses.loading') : m('expenses.reports.empty')}
+				loading={reportsLoading}
+				empty={m('expenses.reports.empty')}
 			>
 				{#snippet body()}
 					{#each reports as r (r.id)}
@@ -1509,29 +1610,25 @@
 					{/each}
 				{/snippet}
 			</DataTable>
-			{#if reportsHasMore}
-				<div class="load-more-row">
-					<button
-						class="btn-load-more"
-						onclick={() => loadReports({ append: true })}
-						disabled={reportsLoadingMore}
-					>
-						{reportsLoadingMore
-							? m('common.loading')
-							: m('expenses.reports.loadMore', {
-									shown: reports.length,
-									total: reportsTotal
-								})}
-					</button>
-				</div>
-			{:else if reportsTotal > 0}
-				<div class="load-more-row">
-					<span class="load-more-end">{m('expenses.reports.showingAll', { total: reportsTotal })}</span>
-				</div>
-			{/if}
+			<LoadMoreFooter
+				shown={reports.length}
+				total={reportsTotal}
+				hasMore={reportsHasMore}
+				loading={reportsLoadingMore}
+				onloadmore={() => loadReports({ append: true })}
+				moreKey="expenses.reports.loadMore"
+				allKey="expenses.reports.showingAll"
+			/>
 		{/if}
 	{:else if tab === 'policies'}
 		<!-- ===================== Policies tab ===================== -->
+		{#if policiesErrored}
+			<LoadError
+				message={m('expenses.policies.toast.loadFailed')}
+				onretry={() => loadPolicies()}
+				testId="expense-policies-error"
+			/>
+		{:else}
 		<DataTable
 			columns={[
 				{ label: m('expenses.policies.col.name') },
@@ -1544,7 +1641,8 @@
 				{ label: '', class: 'actions-col' }
 			]}
 			isEmpty={policies.length === 0}
-			empty={policiesLoading ? m('expenses.loading') : m('expenses.policies.empty')}
+			loading={policiesLoading}
+			empty={m('expenses.policies.empty')}
 		>
 			{#snippet body()}
 				{#each policies as p (p.id)}
@@ -1585,12 +1683,20 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		{/if}
 	{:else if tab === 'preapprovals'}
 		<!-- ==================== Pre-approvals tab ==================== -->
 		<div class="filter-row">
 			<FilterChips chips={PREAPPROVAL_CHIPS} bind:active={preapprovalStatus} />
 		</div>
 
+		{#if preapprovalsErrored}
+			<LoadError
+				message={m('expenses.preapprovals.toast.loadFailed')}
+				onretry={() => loadPreapprovals()}
+				testId="expense-preapprovals-error"
+			/>
+		{:else}
 		<DataTable
 			columns={[
 				{ label: m('expenses.preapprovals.col.title') },
@@ -1600,7 +1706,8 @@
 				{ label: '', class: 'actions-col' }
 			]}
 			isEmpty={preapprovals.length === 0}
-			empty={preapprovalsLoading ? m('expenses.loading') : m('expenses.preapprovals.empty')}
+			loading={preapprovalsLoading}
+			empty={m('expenses.preapprovals.empty')}
 		>
 			{#snippet body()}
 				{#each preapprovals as pa (pa.id)}
@@ -1628,6 +1735,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		{/if}
 	{:else if tab === 'cards'}
 		<!-- ===================== Cards tab (WF4) ===================== -->
 		<div class="kpi-row">
@@ -1636,11 +1744,39 @@
 			<KpiCard value={cardsTotal} label={m('expenses.cards.kpi.transactions')} />
 		</div>
 
+		{#if cardImportResult}
+			<!-- A plain container, not a <section>: the list inside is the one
+			     "Rows not imported" region (ui/CsvImportErrors), and a labelled
+			     section around it would announce two landmarks with one name. -->
+			<div class="card-import-errors">
+				<div class="card-import-errors-head">
+					<h2 id="card-import-errors-title">{m('csvImport.result.errorsTitle')}</h2>
+					<button type="button" class="btn-secondary" onclick={() => (cardImportResult = null)}>
+						{m('csvImport.result.dismiss')}
+					</button>
+				</div>
+				<p class="card-import-errors-summary">
+					{m('csvImport.result.summary', {
+						imported: cardImportResult.imported,
+						skipped: cardImportResult.skipped
+					})}
+				</p>
+				<CsvImportErrors errors={cardImportResult.errors} />
+			</div>
+		{/if}
+
 		<div class="filter-row">
 			<FilterChips chips={RECON_CHIPS} bind:active={reconFilter} />
 			<HelpTip term="virtual-card" />
 		</div>
 
+		{#if cardsErrored}
+			<LoadError
+				message={m('expenses.cards.toast.loadFailed')}
+				onretry={() => loadCardTxns()}
+				testId="expense-cards-error"
+			/>
+		{:else}
 		<DataTable
 			columns={[
 				{ label: m('expenses.cards.col.date') },
@@ -1651,7 +1787,8 @@
 				{ label: '', class: 'actions-col' }
 			]}
 			isEmpty={cardTxns.length === 0}
-			empty={cardsLoading ? m('expenses.loading') : m('expenses.cards.empty')}
+			loading={cardsLoading}
+			empty={m('expenses.cards.empty')}
 		>
 			{#snippet body()}
 				{#each cardTxns as txn (txn.id)}
@@ -1693,16 +1830,20 @@
 						     the same flag: choosing a target while another mutation is
 						     retiring the row is the same stale-row problem. -->
 						<td class="actions">
-							{#if canManagePolicies && txn.reconciliation_status === 'unmatched'}
+							<!-- Each action is offered from the row's server verdict
+							     (`txn.actions`, the gate its endpoint raises from), never a
+							     restated role + status check. An `ignored` row is offered
+							     Match / Create expense: that is how an ignore is undone. -->
+							{#if isAllowed(txn.actions?.match)}
 								<RowAction variant="default" disabled={cardBusy} onclick={() => openMatchPicker(txn)}>{m('expenses.cards.match')}</RowAction>
 							{/if}
-							{#if canCreate && txn.reconciliation_status === 'unmatched'}
+							{#if isAllowed(txn.actions?.create_expense)}
 								<RowAction variant="default" disabled={cardBusy} onclick={() => createExpenseForCard(txn)}>{m('expenses.cards.createExpense')}</RowAction>
 							{/if}
-							{#if canManagePolicies && txn.reconciliation_status === 'matched'}
+							{#if isAllowed(txn.actions?.unmatch)}
 								<RowAction variant="default" disabled={cardBusy} onclick={() => unmatchCard(txn)}>{m('expenses.cards.unmatch')}</RowAction>
 							{/if}
-							{#if canManagePolicies && txn.reconciliation_status === 'unmatched'}
+							{#if isAllowed(txn.actions?.ignore)}
 								<RowAction variant="default" disabled={cardBusy} onclick={() => ignoreCard(txn)}>{m('expenses.cards.ignore')}</RowAction>
 							{/if}
 						</td>
@@ -1710,22 +1851,15 @@
 				{/each}
 			{/snippet}
 		</DataTable>
-		{#if cardsHasMore}
-			<div class="load-more-row">
-				<button
-					class="btn-load-more"
-					onclick={() => loadCardTxns({ append: true })}
-					disabled={cardsLoadingMore}
-				>
-					{cardsLoadingMore
-						? m('common.loading')
-						: m('expenses.cards.loadMore', { shown: cardTxns.length, total: cardsTotal })}
-				</button>
-			</div>
-		{:else if cardsTotal > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('expenses.cards.showingAll', { total: cardsTotal })}</span>
-			</div>
+		<LoadMoreFooter
+			shown={cardTxns.length}
+			total={cardsTotal}
+			hasMore={cardsHasMore}
+			loading={cardsLoadingMore}
+			onloadmore={() => loadCardTxns({ append: true })}
+			moreKey="expenses.cards.loadMore"
+			allKey="expenses.cards.showingAll"
+		/>
 		{/if}
 	{/if}
 	</div>
@@ -1742,7 +1876,7 @@
 	>
 		{#snippet actions()}
 			{#if allSelected && !selectedAllMatching && expenseStore.total > expenseStore.all.length}
-				<button class="bulk-action-btn secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
+				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
 						: m('common.selectAllMatching', { total: expenseStore.total })}
@@ -1756,7 +1890,7 @@
 					<option value={g.id}>{g.code} — {g.name}</option>
 				{/each}
 			</select>
-			<button class="bulk-action-btn" disabled={bulkBusy} onclick={applyBulkGl}>
+			<button type="button" class="btn-primary" disabled={bulkBusy} onclick={applyBulkGl}>
 				{bulkBusy ? m('expenses.bulk.applying') : m('expenses.bulk.glCode', { n: selected.size })}
 			</button>
 		{/snippet}
@@ -1843,7 +1977,7 @@
 	<Modal open ariaLabel={m('expenses.match.aria')} title={m('expenses.match.title')} width="sm" onclose={closeMatchPicker}>
 		<div class="match-picker">
 			{#if matchLoading}
-				<p class="muted">{m('expenses.match.loading')}</p>
+				<LoadingState label={m('expenses.match.loading')} />
 			{:else if matchSuggestions.length === 0}
 				<p class="muted">{m('expenses.match.empty')}</p>
 			{:else}
@@ -1878,20 +2012,28 @@
 		flex-wrap: wrap;
 	}
 
-	.btn-secondary {
-		padding: 8px 14px;
-		border-radius: 6px;
+	/* The last card import's refused rows (decisions §377). */
+	.card-import-errors {
 		border: 1px solid var(--border);
+		border-radius: 8px;
 		background: var(--surface);
-		color: var(--text);
-		font-size: 0.88rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
+		padding: 12px 14px;
+		margin-bottom: 14px;
 	}
-	.btn-secondary:hover {
-		border-color: var(--accent);
-		color: var(--accent);
+	.card-import-errors-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
+	}
+	.card-import-errors-head h2 {
+		font-size: 0.95rem;
+		margin: 0;
+	}
+	.card-import-errors-summary {
+		font-size: 0.85rem;
+		margin: 8px 0;
 	}
 
 	/* Every pill on this page is `<Badge>`. The tone per status lives beside the
@@ -1929,33 +2071,6 @@
 		font-size: 0.82rem;
 	}
 
-	.bulk-action-btn {
-		padding: 6px 14px;
-		border-radius: 6px;
-		border: 1px solid var(--accent-strong);
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.82rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.bulk-action-btn:hover:not(:disabled) {
-		filter: brightness(1.1);
-	}
-
-	.bulk-action-btn:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-
-	.bulk-action-btn.secondary {
-		background: transparent;
-		color: var(--accent-strong);
-	}
-
 	.bulk-all-matching-note {
 		font-size: 0.82rem;
 		color: var(--text-muted);
@@ -1986,20 +2101,16 @@
 	.report-detail-actions {
 		margin-left: auto;
 		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
 		gap: 8px;
 	}
-	.btn-back {
-		border: none;
-		background: none;
+	.attach-hint {
+		margin: 6px 0 12px;
+		font-size: 0.8rem;
 		color: var(--text-muted);
-		font-size: 0.85rem;
-		cursor: pointer;
-		font-family: inherit;
-		padding: 4px 0;
 	}
-	.btn-back:hover {
-		color: var(--accent);
-	}
+
 	.attach-row,
 	.reject-row {
 		display: flex;
@@ -2022,16 +2133,10 @@
 		min-width: 280px;
 	}
 
-	/* Danger variant of the secondary button (report reject). */
-	.btn-secondary.danger:hover {
-		border-color: var(--danger);
-		color: var(--danger);
-	}
-
 	/* Inline blocking-violation panel above the report detail. */
 	.violation-panel {
 		border: 1px solid var(--danger);
-		background: rgba(224, 64, 64, 0.06);
+		background: color-mix(in srgb, var(--danger) 6%, transparent);
 		border-radius: 8px;
 		padding: 12px 14px;
 		color: var(--text);
@@ -2049,8 +2154,8 @@
 	/* Partial-total notice: some lines lack an FX lock and were excluded. */
 	.unconverted-panel {
 		margin-top: 10px;
-		border: 1px solid #c98a00;
-		background: rgba(201, 138, 0, 0.08);
+		border: 1px solid var(--warning);
+		background: color-mix(in srgb, var(--warning) 8%, transparent);
 		border-radius: 8px;
 		padding: 10px 14px;
 		color: var(--text);

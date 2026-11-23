@@ -6,6 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -25,7 +26,20 @@ from app.api.permissions import (
     permissions_for_role,
     sanitize_permissions,
 )
-from app.api.refusals import coded_refusal
+from app.api.refusals import (
+    EMAIL_CHECK_THROTTLED_DETAIL,
+    EMAIL_IN_OTHER_WORKSPACE_DETAIL,
+    EMAIL_IN_THIS_WORKSPACE_DETAIL,
+    coded_refusal,
+)
+from app.api.set_password_links import (
+    expiry_sentence,
+    link_expires_at,
+    link_unavailable,
+    mint_employee_link,
+    require_link_base,
+    send_set_password_email,
+)
 from app.database import get_control_db, get_tenant_engine
 from app.models.organization import Organization
 from app.models.user import Role, User, UserRole
@@ -41,11 +55,24 @@ from app.schemas.admin import (
     UpdateRoleRequest,
     UpdateUserRequest,
 )
-from app.services.audit_dispatch import dispatch_auth_audit
-from app.services.email_adapters import EmailMessage, get_email_adapter
+from app.services import password_reset
+from app.services.admin_lockout import (
+    LAST_ADMIN_MESSAGE,
+    LastAdminLockout,
+    guard_against_last_admin_lockout,
+)
+from app.services.audit_dispatch import dispatch_auth_audit, record_auth_audit_or_raise
+from app.services.email_adapters import EmailMessage
+from app.services.identity_provisioning import email_holder_org_id
+from app.services.rate_limit import (
+    RateLimitExceeded,
+    auth_identity_key,
+    check_auth_failures,
+    record_auth_failure,
+)
 from app.services.session_management import revoke_user_sessions
-from app.utils.emails import email_matches, normalize_email
-from app.utils.passwords import generate_temp_password, hash_password
+from app.services.user_audit import user_deleted_details, user_updated_details
+from app.utils.emails import normalize_email
 from app.utils.search import ilike_contains
 from app.utils.tenant_urls import tenant_base_url
 
@@ -404,25 +431,82 @@ def _authorize_target_mutation(caller: User, target: User) -> None:
         )
 
 
-async def _org_has_other_active_admin(
-    db: AsyncSession, org_id: uuid.UUID, *, exclude_user_id: uuid.UUID
-) -> bool:
-    """Whether the org has an active system-``admin`` holder other than the
-    excluded user. Backs the last-admin lockout guard below."""
-    result = await db.execute(
-        select(func.count(func.distinct(User.id)))
-        .select_from(User)
-        .join(UserRole, UserRole.user_id == User.id)
-        .join(Role, Role.id == UserRole.role_id)
-        .where(
-            User.organization_id == org_id,
-            User.id != exclude_user_id,
-            User.is_active.is_(True),
-            Role.name == ROLE_ADMIN,
-            Role.organization_id.is_(None),
+#: Budget on refusals that an address belongs to ANOTHER workspace, per acting
+#: workspace. One address is one account (`users.email` is globally unique), so
+#: that refusal unavoidably says "an account exists somewhere on the platform"
+#: — an oracle to anyone holding `user.manage`, including the admin of a free
+#: self-signup tenant. Generous for a real admin (inviting someone already on
+#: the platform is occasional), tight for a sweep. Per WORKSPACE rather than per
+#: user, so minting extra user-managers does not widen it. `docs/decisions.md`
+#: §291.
+EMAIL_COLLISION_SCOPE = "admin_email_other_workspace"
+EMAIL_COLLISION_LIMIT = 20
+EMAIL_COLLISION_WINDOW_SECONDS = 3600
+
+
+async def _refuse_taken_email(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    email: str,
+    *,
+    exclude_user_id: uuid.UUID | None = None,
+) -> None:
+    """409 when ``email`` already names an account — here, or in another workspace.
+
+    Two coded refusals, because they need different actions: an address in THIS
+    workspace is a user the admin can already see and edit; one in ANOTHER is a
+    dead end until the person uses a different address, and the message has to
+    say so instead of a bare "Email already in use". The second names no
+    workspace and no account. It still confirms the address is on the platform
+    — unavoidable while one address is one account — which the budget above
+    bounds; it is checked BEFORE the lookup so a throttled sweep learns nothing
+    more, and only an other-workspace hit spends it.
+    """
+    budget_key = auth_identity_key(str(org_id))
+    try:
+        await check_auth_failures(
+            EMAIL_COLLISION_SCOPE,
+            budget_key,
+            limit=EMAIL_COLLISION_LIMIT,
+            window_seconds=EMAIL_COLLISION_WINDOW_SECONDS,
         )
+    except RateLimitExceeded as exc:
+        # Spent: EVERY create / email rename in this workspace waits, a free
+        # address included — refusing only the taken ones would make the 429
+        # itself the oracle. Said in words, so an admin onboarding people
+        # knows why and that it lifts on its own.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=EMAIL_CHECK_THROTTLED_DETAIL,
+            headers=exc.headers,
+        ) from exc
+    await _refuse_held_email(db, org_id, email, exclude_user_id=exclude_user_id)
+
+
+async def _refuse_held_email(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    email: str,
+    *,
+    exclude_user_id: uuid.UUID | None = None,
+) -> None:
+    """The lookup half of :func:`_refuse_taken_email`, without the budget gate.
+
+    Also what a create that lost the race to the database answers with: a
+    concurrent writer took the address between the pre-check and the flush,
+    and `uq_users_email_lower` refused the insert (§475) — the same coded 409
+    the pre-check would have given a moment later, never a 500."""
+    holder = await email_holder_org_id(db, email, exclude_user_id=exclude_user_id)
+    if holder is None:
+        return
+    if holder == org_id:
+        raise HTTPException(status_code=409, detail=EMAIL_IN_THIS_WORKSPACE_DETAIL)
+    await record_auth_failure(
+        EMAIL_COLLISION_SCOPE,
+        auth_identity_key(str(org_id)),
+        window_seconds=EMAIL_COLLISION_WINDOW_SECONDS,
     )
-    return (result.scalar() or 0) > 0
+    raise HTTPException(status_code=409, detail=EMAIL_IN_OTHER_WORKSPACE_DETAIL)
 
 
 async def _guard_against_last_admin_lockout(
@@ -435,35 +519,34 @@ async def _guard_against_last_admin_lockout(
     new_is_active: bool,
     new_role_names: list[str],
 ) -> None:
-    """Refuse a mutation that would leave the org with zero active admins.
+    """Refuse (409) a mutation that would leave the org with zero active admins.
 
     `_authorize_target_mutation` only stops a caller from seizing authority
-    on SOMEONE ELSE's account — self-mutation always passes it (a user's own
-    permissions are trivially a subset of themselves), so it does nothing to
-    stop the org's sole admin from removing their own `admin` role or
-    deactivating their own account. Either is a one-way door: once the last
-    admin is gone, nothing short of a DB fix can create a new one (role
-    grants and reactivation both require `user.manage`, which only an admin
-    holds by default).
+    on SOMEONE ELSE's account — self-mutation always passes it, so it does
+    nothing to stop the org's sole admin from removing their own `admin` role
+    or deactivating their own account. Either is a one-way door: once the
+    last admin is gone, nothing short of a DB fix can create a new one.
 
-    Fires whenever the target is CURRENTLY an active admin and the mutation
-    would make them not one (demoted, deactivated, or both) — self or not —
-    and no OTHER active admin exists to undo it. For a caller acting on
-    someone else, `_authorize_target_mutation` already required the caller
-    to be an admin themselves, so the caller remains one and this is a
-    no-op; it only ever actually blocks the self-service case.
+    The rule and its serialization live in `services/admin_lockout`, shared
+    with SCIM; this wrapper only gives the refusal the admin API's shape. The
+    lock it takes is what makes the third-party case real too: two admins
+    demoting (or deleting) each other at the same moment each passed the old
+    unlocked count, and the org was left with none.
     """
-    is_admin_now = was_active and ROLE_ADMIN in previous_role_names
-    stays_admin = new_is_active and ROLE_ADMIN in new_role_names
-    if is_admin_now and not stays_admin:
-        if not await _org_has_other_active_admin(db, org_id, exclude_user_id=target.id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Cannot remove the organization's last active admin. "
-                    "Promote another user to admin first."
-                ),
-            )
+    try:
+        await guard_against_last_admin_lockout(
+            db,
+            org_id=org_id,
+            target_id=target.id,
+            was_active=was_active,
+            previous_role_names=previous_role_names,
+            new_is_active=new_is_active,
+            new_role_names=new_role_names,
+        )
+    except LastAdminLockout:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=LAST_ADMIN_MESSAGE
+        ) from None
 
 
 #: `PATCH /admin/users/{id}` no longer sets a password (issue #566,
@@ -473,54 +556,58 @@ async def _guard_against_last_admin_lockout(
 ADMIN_PASSWORD_FIELD_REMOVED = "admin_password_field_removed"
 
 #: `POST /admin/users/{id}/reset-password` on the caller's own account. A self
-#: reset would sign the caller out of the tab they made it from and hand them a
-#: temp credential for an account whose password they already know — the
+#: reset would sign the caller out of the tab they made it from and clear the
+#: password of an account whose password they already know — the
 #: caller's own path is `POST /api/auth/change-password`.
 ADMIN_PASSWORD_RESET_SELF = "admin_password_reset_self"
 
 
-async def _send_credentials_email(
-    db: AsyncSession,
-    org_id: uuid.UUID,
+async def _load_org(db: AsyncSession, org_id: uuid.UUID) -> Organization:
+    org_row = (
+        await db.execute(select(Organization).where(Organization.id == org_id))
+    ).scalar_one_or_none()
+    if org_row is None:  # pragma: no cover - get_org_id resolved it
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return org_row
+
+
+async def _send_set_password_email(
+    org_row: Organization,
     user: User,
-    temp_password: str,
+    link: str,
     *,
     subject: str,
     lead: str,
 ) -> None:
-    """Best-effort mail of a generated temp credential to its owner.
+    """Mail the account's set-password link to its owner, or raise 502.
 
     Shared by "Invite User" and the admin password reset so the two cannot
-    drift. A failed send never fails the request: the temp password also rides
-    the API response, which is what local dev (the `console` adapter only logs)
-    and an admin relaying it out-of-band both rely on.
+    drift. Required, not best-effort: the email is the link's only channel —
+    the API response never carries it, because whoever holds it chooses the
+    password (``api/set_password_links``, ``docs/decisions.md`` §283) — so a
+    failed send rolls the caller's request back.
     """
-    org_row = (
-        await db.execute(select(Organization).where(Organization.id == org_id))
-    ).scalar_one_or_none()
-    if org_row is None:
-        return
     tenant_url = tenant_base_url(org_row.slug, org_row.settings) or None
-    try:
-        await get_email_adapter().send(
-            EmailMessage(
-                to=user.email,
-                subject=subject.format(org=org_row.name),
-                body_text=(
-                    f"Hi {user.full_name},\n\n"
-                    + lead.format(org=org_row.name)
-                    + "\n\n"
-                    + (f"  URL:      {tenant_url}\n" if tenant_url else "")
-                    + f"  Email:    {user.email}\n"
-                    f"  Password: {temp_password}\n\n"
-                    "You'll be asked to change your password on first sign-in.\n"
-                ),
-                links=(tenant_url,) if tenant_url else (),
-                preheader="Your sign-in details are inside.",
-            )
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Credentials email failed for user %s (org=%s)", user.id, org_id)
+    await send_set_password_email(
+        EmailMessage(
+            to=user.email,
+            subject=subject.format(org=org_row.name),
+            body_text=(
+                f"Hi {user.full_name},\n\n"
+                + lead.format(org=org_row.name)
+                + "\n\n"
+                + f"  {link}\n\n"
+                + expiry_sentence()
+                + " If it has expired, use Forgot password on the sign-in page.\n\n"
+                + (f"  URL:      {tenant_url}\n" if tenant_url else "")
+                + f"  Email:    {user.email}\n"
+            ),
+            links=(link, tenant_url) if tenant_url else (link,),
+            # Fixed copy: the derived preview would reach the link.
+            preheader="Use the link in this email to set your password.",
+        ),
+        log_ref=f"user={user.id}",
+    )
 
 
 @router.post("/users", response_model=CreateUserResponse, status_code=status.HTTP_201_CREATED)
@@ -537,26 +624,33 @@ async def create_user(
     # identifier, so `Jane@Acme.com` and `jane@acme.com` are one person
     # (`utils/emails`).
     email = normalize_email(body.email)
-    existing = await db.execute(select(User.id).where(email_matches(User.email, email)).limit(1))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Email already in use")
+    await _refuse_taken_email(db, org_id, email)
 
-    # The SHARED generator (`utils/passwords`), not a local one. The local copy
-    # this replaces drew 12 characters from `ascii_letters + digits` with no
-    # guarantee of case mix or a digit, so an admin-created account could be
-    # handed a temp credential that `validate_password_complexity` — the policy
-    # every other password on the platform must satisfy — would itself refuse.
-    # Signup and partner provisioning already use this one.
-    temp_password = generate_temp_password()
+    # Nowhere to point a set-password link → refuse before creating anything.
+    org_row = await _load_org(db, org_id)
+    require_link_base(org_row.slug, org_row.settings)
+
+    # No password at all: the user chooses their own through the emailed
+    # set-password link, so there is nothing for the admin to see or relay and
+    # nothing to force-change (`docs/decisions.md` §283). `/auth/login` refuses
+    # the account until a password exists — the JIT/SCIM representation.
     new_user = User(
         email=email,
         full_name=body.full_name,
-        hashed_password=await hash_password(temp_password),
+        hashed_password=None,
         organization_id=org_id,
-        must_change_password=True,
+        must_change_password=False,
     )
-    db.add(new_user)
-    await db.flush()
+    # A savepoint, so losing the race to a concurrent create of the same
+    # address (any case: the index is on `lower(email)`) is the coded 409, and
+    # the session stays usable to say so.
+    try:
+        async with db.begin_nested():
+            db.add(new_user)
+            await db.flush()
+    except IntegrityError:
+        await _refuse_held_email(db, org_id, email)
+        raise
 
     # Assign roles. Restrict the lookup to system roles + this org's
     # custom roles so an admin from acme can't accidentally (or
@@ -579,6 +673,23 @@ async def create_user(
         select(User).where(User.id == new_user.id).options(selectinload(User.roles))
     )
     new_user = result.scalar_one()
+
+    # Mint and send BEFORE the commit: a token-store or email failure raises,
+    # and the request's transaction unwinds — no account whose link never
+    # arrived. (A token minted for a user the rollback discards resolves to
+    # no account, so redeeming it is the same 400 as any dead link.)
+    link = await mint_employee_link(org_row.slug, org_row.settings, new_user.id, set_password=True)
+    await _send_set_password_email(
+        org_row,
+        new_user,
+        link,
+        subject="You've been invited to {org} on FeohLedger",
+        lead=(
+            "An administrator has created an account for you on {org}'s FeohLedger "
+            "workspace. Choose your password with this link:"
+        ),
+    )
+    expires_at = link_expires_at()
     await db.commit()
 
     await dispatch_auth_audit(
@@ -586,24 +697,14 @@ async def create_user(
         actor_id=user.id,
         action="user.created",
         entity_id=new_user.id,
-        details={"role_names": sorted(r.name for r in new_user.roles)},
-    )
-
-    # Best-effort welcome email — same posture as the supplier-portal invite
-    # (`vendors.py::invite_vendor_portal_user`) and the tenant-signup welcome
-    # email. This makes "Invite User" an actual email invite instead of only a
-    # shown-once password the admin must copy.
-    await _send_credentials_email(
-        db,
-        org_id,
-        new_user,
-        temp_password,
-        subject="You've been invited to {org} on FeohLedger",
-        lead=("An administrator has created an account for you on {org}'s FeohLedger workspace."),
+        details={
+            "role_names": sorted(r.name for r in new_user.roles),
+            "delivery": "set_password_link",
+        },
     )
 
     resp = _user_to_response(new_user)
-    return CreateUserResponse(**resp.model_dump(), temporary_password=temp_password)
+    return CreateUserResponse(**resp.model_dump(), set_password_link_expires_at=expires_at)
 
 
 @router.patch("/users/{user_id}", response_model=AdminUserResponse)
@@ -626,8 +727,8 @@ async def update_user(
             detail=coded_refusal(
                 ADMIN_PASSWORD_FIELD_REMOVED,
                 "Setting a password through this endpoint is no longer supported. "
-                "Use POST /api/admin/users/{id}/reset-password to issue a temporary "
-                "password the user must change at next sign-in.",
+                "Use POST /api/admin/users/{id}/reset-password to email the user a "
+                "link to set a new password.",
             ),
         )
 
@@ -654,6 +755,7 @@ async def update_user(
     # Snapshot pre-state so we can decide whether to force-logout the target.
     previous_role_names = sorted(r.name for r in target.roles)
     was_active = target.is_active
+    previous_email = target.email
 
     # Refuse — before touching anything — a mutation that would leave the org
     # with zero active admins. Must run on the pre-mutation snapshot, not
@@ -683,17 +785,17 @@ async def update_user(
     if body.full_name is not None and body.full_name != target.full_name:
         target.full_name = body.full_name
         changed_fields.append("full_name")
+    target_email_new: str | None = None
     if body.email is not None:
         new_email = normalize_email(body.email)
         if new_email != normalize_email(target.email):
-            existing = await db.execute(
-                select(User.id)
-                .where(email_matches(User.email, new_email), User.id != user_id)
-                .limit(1)
-            )
-            if existing.scalar_one_or_none():
-                raise HTTPException(status_code=409, detail="Email already in use")
-            target.email = new_email
+            target_email_new = new_email
+            await _refuse_taken_email(db, org_id, new_email, exclude_user_id=user_id)
+            # Assigned inside the savepoint below, not here: any query in
+            # between autoflushes, and `begin_nested()` itself flushes pending
+            # changes in the OUTER transaction before issuing SAVEPOINT — so a
+            # rename assigned now would hit `uq_users_email_lower` outside the
+            # savepoint, poisoning the session instead of yielding the 409.
             changed_fields.append("email")
     if body.is_active is not None and body.is_active != target.is_active:
         target.is_active = body.is_active
@@ -717,7 +819,21 @@ async def update_user(
     if roles_changed:
         changed_fields.append("role_names")
 
-    await db.flush()
+    # A savepoint, as on create: a concurrent writer that takes the new address
+    # between the pre-check and this flush trips `uq_users_email_lower` (§475),
+    # and the rename answers with the same coded 409 rather than a 500. The
+    # rename is applied INSIDE it — `begin_nested()` flushes everything already
+    # pending in the outer transaction first, so only a change made after it
+    # opens is one the savepoint can roll back.
+    try:
+        async with db.begin_nested():
+            if target_email_new is not None:
+                target.email = target_email_new
+            await db.flush()
+    except IntegrityError:
+        if "email" in changed_fields:
+            await _refuse_held_email(db, org_id, target_email_new, exclude_user_id=user_id)
+        raise
 
     # `populate_existing()`: the role change above deletes `UserRole` rows via
     # a raw Core-level `.delete()`, which bypasses the ORM unit-of-work and
@@ -752,11 +868,15 @@ async def update_user(
             actor_id=current_user.id,
             action="user.updated",
             entity_id=user_id,
-            details={
-                "changed_fields": changed_fields,
-                "role_names": sorted(r.name for r in target.roles) if roles_changed else None,
-                "is_active": target.is_active if "is_active" in changed_fields else None,
-            },
+            details=user_updated_details(
+                changed_fields,
+                previous_email=previous_email,
+                email=target.email,
+                previous_role_names=previous_role_names,
+                role_names=sorted(r.name for r in target.roles),
+                previous_is_active=was_active,
+                is_active=target.is_active,
+            ),
         )
 
     return _user_to_response(target)
@@ -769,19 +889,21 @@ async def reset_user_password(
     current_user: User = Depends(require_permission(PERM_USER_MANAGE)),
     org_id: uuid.UUID = Depends(get_org_id),
 ) -> ResetUserPasswordResponse:
-    """Reset a user's password to a generated temp they must change at sign-in.
+    """Reset a user's password: clear it, and email them a set-password link.
 
-    The same credential shape "Invite User" issues: the shared generator (so the
-    temp satisfies `validate_password_complexity`), `must_change_password=True`,
-    shown once on the response and mailed best-effort. The admin never chooses
-    the value, so they never hold a working long-term credential for someone
-    else's account — the temp stops working the moment its owner replaces it
-    (#566, `docs/decisions.md` §276).
+    The admin never sees a credential for someone else's account — not a value
+    they type (#566, `docs/decisions.md` §276), and since the set-password
+    links not a generated temporary password either (§283): the reset leaves
+    the account with NO usable password (the old one dies at once, which is
+    what a reset of a possibly-compromised account is for) and mails a
+    single-use, expiring link to the account's own address. The link is never
+    in the response.
 
     Org-scoped (a foreign user is the same 404 as a missing one), out-rank
     guarded (resetting an admin's password is a takeover primitive), refused on
     the caller's own account, revokes every session the target holds, and
-    audited `user.password_reset` with no credential in it.
+    audited `user.password_reset` with no credential in it. Nothing changes
+    unless the link was minted and mailed (503 / 502 otherwise).
     """
     target = (
         await db.execute(
@@ -802,18 +924,43 @@ async def reset_user_password(
         )
     _authorize_target_mutation(current_user, target)
 
-    temp_password = generate_temp_password()
-    target.hashed_password = await hash_password(temp_password)
-    target.must_change_password = True
+    org_row = await _load_org(db, org_id)
+    require_link_base(org_row.slug, org_row.settings)
+
+    target.hashed_password = None
+    target.must_change_password = False
+    await db.flush()
+
+    # Any earlier invite / reset / forgot-password link for this account dies
+    # with the old password — a 72-hour link must not outlive the reset.
+    try:
+        await password_reset.revoke_outstanding(target.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Could not supersede earlier links for user %s", target.id)
+        raise link_unavailable() from exc
+
+    # Mint and mail before the commit, so a failure of either leaves the old
+    # password working rather than an account nobody can sign in to.
+    link = await mint_employee_link(org_row.slug, org_row.settings, target.id, set_password=False)
+    await _send_set_password_email(
+        org_row,
+        target,
+        link,
+        subject="Your {org} FeohLedger password was reset",
+        lead=(
+            "An administrator has reset the password for your account on "
+            "{org}'s FeohLedger workspace. Choose a new password with this link:"
+        ),
+    )
+    expires_at = link_expires_at()
     await db.commit()
 
     # After the commit, like every other forced logout here: a token an
     # attacker already holds is exactly what a reset exists to kill (#160).
-    # But a revoke failure (Redis down) must NOT turn into a 500 here: the
-    # password is already replaced, and this response is the only place the
-    # temp is ever shown — a 500 would lock the user out with no audit row and
-    # no email. So it is caught, recorded on the audit row, and reported on the
-    # response (`sessions_revoked: false`) so the admin knows to retry the
+    # A revoke failure (Redis down) must not turn into a 500: the password is
+    # already cleared and the link already mailed, so a 500 would hide a reset
+    # that happened. It is caught, recorded on the audit row, and reported on
+    # the response (`sessions_revoked: false`) so the admin knows to retry the
     # standalone force-logout.
     try:
         revoked_count: int | None = len(await revoke_user_sessions(user_id))
@@ -827,27 +974,15 @@ async def reset_user_password(
         entity_id=user_id,
         details={
             "changed_fields": ["password"],
-            "must_change_password": True,
+            "delivery": "set_password_link",
             "sessions_revoked": revoked_count,
         },
-    )
-
-    await _send_credentials_email(
-        db,
-        org_id,
-        target,
-        temp_password,
-        subject="Your {org} FeohLedger password was reset",
-        lead=(
-            "An administrator has reset the password for your account on "
-            "{org}'s FeohLedger workspace. Sign in with this temporary password."
-        ),
     )
 
     resp = _user_to_response(target)
     return ResetUserPasswordResponse(
         **resp.model_dump(),
-        temporary_password=temp_password,
+        set_password_link_expires_at=expires_at,
         sessions_revoked=revoked_count is not None,
     )
 
@@ -1008,21 +1143,51 @@ async def delete_user(
             },
         )
 
+    role_names = [r.name for r in target.roles]
+    # The caller is an admin when the request starts, but a concurrent request
+    # can be deleting or demoting THEM at the same moment — the lock this takes
+    # is what stops the pair of them leaving the org with no admin.
+    await _guard_against_last_admin_lockout(
+        db,
+        org_id=org_id,
+        target=target,
+        was_active=target.is_active,
+        previous_role_names=role_names,
+        new_is_active=False,
+        new_role_names=[],
+    )
+    details = user_deleted_details(
+        email=target.email, role_names=role_names, was_active=target.is_active
+    )
+
     # Remove role assignments first
     await db.execute(UserRole.__table__.delete().where(UserRole.user_id == user_id))
     await db.delete(target)
+    await db.flush()
+
+    # The record is written before the delete commits, and a failed write
+    # refuses the delete: once the row is gone this audit row is the only place
+    # that says who the account was. A commit failing after it leaves a row for
+    # a delete that did not land — the safe direction to be wrong in.
+    try:
+        await record_auth_audit_or_raise(
+            organization_id=org_id,
+            actor_id=current_user.id,
+            action="user.deleted",
+            entity_id=user_id,
+            details=details,
+        )
+    except Exception:
+        await db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="The deletion could not be recorded in the audit trail, so it was not made.",
+        ) from None
     await db.commit()
 
     # Deletion → revoke any active JWT so the tombstoned user can't keep
     # hitting the API until their token expires.
     await revoke_user_sessions(user_id)
-
-    await dispatch_auth_audit(
-        organization_id=org_id,
-        actor_id=current_user.id,
-        action="user.deleted",
-        entity_id=user_id,
-    )
 
 
 class BulkDeleteRequest(BaseModel):
@@ -1031,7 +1196,8 @@ class BulkDeleteRequest(BaseModel):
 
 class BulkDeleteFailure(BaseModel):
     user_id: str
-    reason: str  # "not_found" | "self" | "forbidden" | "blocked"
+    # "not_found" | "self" | "forbidden" | "blocked" | "last_admin" | "audit_unavailable"
+    reason: str
     references: UserDeleteConflict | None = None
 
 
@@ -1098,19 +1264,52 @@ async def bulk_delete_users(
             failed.append(BulkDeleteFailure(user_id=raw_id, reason="blocked", references=conflict))
             continue
 
+        role_names = [r.name for r in target.roles]
+        try:
+            await _guard_against_last_admin_lockout(
+                db,
+                org_id=org_id,
+                target=target,
+                was_active=target.is_active,
+                previous_role_names=role_names,
+                new_is_active=False,
+                new_role_names=[],
+            )
+        except HTTPException:
+            failed.append(BulkDeleteFailure(user_id=raw_id, reason="last_admin"))
+            continue
+        details = user_deleted_details(
+            email=target.email, role_names=role_names, was_active=target.is_active
+        )
+
+        # Each row's delete and its audit record stand or fall together, the
+        # same rule as the single delete: the delete is flushed inside a
+        # savepoint, the record is written while it is still open, and a failed
+        # write undoes just this row's delete. The rows used to be audited
+        # after the commit, so a failed write lost the record while the delete
+        # stood.
+        savepoint = await db.begin_nested()
         await db.execute(UserRole.__table__.delete().where(UserRole.user_id == user_uuid))
         await db.delete(target)
+        await db.flush()
+        try:
+            await record_auth_audit_or_raise(
+                organization_id=org_id,
+                actor_id=current_user.id,
+                action="user.deleted",
+                entity_id=user_uuid,
+                details=details,
+            )
+        except Exception:
+            await savepoint.rollback()
+            failed.append(BulkDeleteFailure(user_id=raw_id, reason="audit_unavailable"))
+            continue
+        await savepoint.commit()
         deleted.append(raw_id)
 
     await db.commit()
 
     for raw_id in deleted:
         await revoke_user_sessions(uuid.UUID(raw_id))
-        await dispatch_auth_audit(
-            organization_id=org_id,
-            actor_id=current_user.id,
-            action="user.deleted",
-            entity_id=uuid.UUID(raw_id),
-        )
 
     return BulkDeleteResponse(deleted=deleted, failed=failed)

@@ -3,9 +3,15 @@ import { describe, expect, it } from 'vitest';
 import {
 	aiUsagePercent,
 	aiUsageTone,
+	cardFormMode,
+	cardSavedMessageKey,
 	parseSpendCapInput,
+	planChangeCardAction,
+	planChangeRequestFrom,
+	planHighlights,
 	rebateMeterGroups,
 	type BillingAiUsage,
+	type BillingPlanChangePreview,
 	type BillingUsage
 } from './billing';
 
@@ -125,5 +131,156 @@ describe('parseSpendCapInput', () => {
 		for (const bad of ['-1', '1.005', '1000000.01', 'abc', '1,000', '1e3', '.5']) {
 			expect(parseSpendCapInput(bad), bad).toEqual({ ok: false });
 		}
+	});
+});
+
+describe('cardFormMode', () => {
+	const stripe = {
+		provider: 'stripe_billing',
+		configured: true,
+		client_secret: 'seti_x_secret_y',
+		setup_intent_id: 'seti_x'
+	};
+	const mock = {
+		provider: 'mock',
+		configured: true,
+		client_secret: 'mock_seti_cus_1_secret',
+		setup_intent_id: 'mock_seti_cus_1'
+	};
+
+	it('mounts Stripe Elements only for stripe_billing with a publishable key', () => {
+		expect(cardFormMode(stripe, 'pk_test_abc')).toBe('stripe');
+	});
+
+	it('names the operator gap when the backend runs Stripe but the build has no key', () => {
+		// Stripe.js must never load without a key; this is a config gap, not
+		// the "billing not configured" state the org can do nothing about.
+		expect(cardFormMode(stripe, '')).toBe('stripe_key_missing');
+		expect(cardFormMode(stripe, '   ')).toBe('stripe_key_missing');
+		expect(cardFormMode(stripe, undefined)).toBe('stripe_key_missing');
+	});
+
+	it('uses the local test path for the mock provider, key or no key', () => {
+		expect(cardFormMode(mock, '')).toBe('mock');
+		expect(cardFormMode(mock, 'pk_test_abc')).toBe('mock');
+	});
+
+	it('is not_configured when no SetupIntent was started', () => {
+		const off = { provider: 'stripe_billing', configured: false, client_secret: null, setup_intent_id: null };
+		expect(cardFormMode(off, 'pk_test_abc')).toBe('not_configured');
+		expect(cardFormMode({ ...mock, configured: false }, '')).toBe('not_configured');
+		expect(cardFormMode({ ...mock, setup_intent_id: null }, '')).toBe('not_configured');
+	});
+
+	it('is not_configured for Stripe without a client secret, or an adapter with no card form', () => {
+		expect(cardFormMode({ ...stripe, client_secret: null }, 'pk_test_abc')).toBe('not_configured');
+		expect(cardFormMode({ ...stripe, provider: 'paddle' }, 'pk_test_abc')).toBe('not_configured');
+	});
+});
+
+describe('planChangeCardAction', () => {
+	it('offers to add a card when the org has none', () => {
+		expect(planChangeCardAction('payment_method_required')).toBe('add_card');
+	});
+
+	it('offers to update the card when the upgrade charge was declined', () => {
+		expect(planChangeCardAction('billing_payment_declined')).toBe('update_card');
+	});
+
+	it('offers nothing for any other refusal', () => {
+		expect(planChangeCardAction('billing_not_configured')).toBeNull();
+		expect(planChangeCardAction('plan_change_in_progress')).toBeNull();
+		expect(planChangeCardAction('plan_feature_required')).toBeNull();
+		expect(planChangeCardAction(null)).toBeNull();
+		expect(planChangeCardAction(undefined)).toBeNull();
+	});
+});
+
+describe('planHighlights', () => {
+	const order = ['public_api', 'erp_integrations', 'sso', 'scim', 'multi_entity'];
+	const plan = (code: string, name: string, ents: Record<string, unknown>) => ({
+		code,
+		name,
+		entitlements: ents
+	});
+
+	it('lists the first plan\'s own grants and each next plan\'s additions over it', () => {
+		const h = planHighlights(
+			[
+				plan('free', 'Free', { erp_integrations: true }),
+				plan('growth', 'Growth', { erp_integrations: true, sso: true, public_api: true }),
+				plan('scale', 'Scale', {
+					erp_integrations: true,
+					sso: true,
+					public_api: true,
+					multi_entity: true,
+					scim: true
+				})
+			],
+			order
+		);
+		expect(h.get('free')).toEqual({ builtOn: null, added: ['erp_integrations'] });
+		// Catalogue order, not insertion order.
+		expect(h.get('growth')).toEqual({ builtOn: 'Free', added: ['public_api', 'sso'] });
+		expect(h.get('scale')).toEqual({ builtOn: 'Growth', added: ['scim', 'multi_entity'] });
+	});
+
+	it('never claims "everything in" a plan whose grant it drops', () => {
+		const h = planHighlights(
+			[plan('a', 'A', { sso: true, scim: true }), plan('b', 'B', { sso: true, public_api: true })],
+			order
+		);
+		expect(h.get('b')).toEqual({ builtOn: null, added: ['public_api', 'sso'] });
+	});
+
+	it('skips an empty predecessor and ignores non-true flags', () => {
+		const h = planHighlights(
+			[
+				plan('a', 'A', {}),
+				plan('b', 'B', { sso: true, max_seats: 25, scim: false, custom_grant: true })
+			],
+			order
+		);
+		expect(h.get('a')).toEqual({ builtOn: null, added: [] });
+		// An unknown key sorts after the known ones rather than vanishing.
+		expect(h.get('b')).toEqual({ builtOn: null, added: ['sso', 'custom_grant'] });
+	});
+});
+
+describe('planChangeRequestFrom', () => {
+	it('confirms exactly the figures the preview showed, as the server sent them', () => {
+		const preview: BillingPlanChangePreview = {
+			plan_code: 'growth',
+			already_on_plan: false,
+			currency: 'USD',
+			amount_due: '14.80',
+			credit: '0.00',
+			next_amount: '49.00',
+			next_date: '2026-12-01T00:00:00Z',
+			proration_date: 1795000000,
+			expires_at: '2026-11-21T12:10:00Z',
+			payment_method_required: false,
+			effective_at: null,
+			clears_scheduled_change: false
+		};
+		expect(planChangeRequestFrom(preview)).toEqual({
+			plan_code: 'growth',
+			proration_date: 1795000000,
+			// The string itself — never parsed, rounded or re-derived.
+			expected_amount_due: '14.80',
+			currency: 'USD'
+		});
+	});
+});
+
+describe('cardSavedMessageKey', () => {
+	it('says the subscription is charged to the card only when a live provider bills one', () => {
+		expect(cardSavedMessageKey({ externally_managed: true })).toBe('billing.card.saved');
+	});
+
+	it('says only "Card saved." when nothing is billed yet (Free mid-upgrade, the mock, no plan)', () => {
+		expect(cardSavedMessageKey({ externally_managed: false })).toBe('billing.card.savedOnly');
+		expect(cardSavedMessageKey(null)).toBe('billing.card.savedOnly');
+		expect(cardSavedMessageKey(undefined)).toBe('billing.card.savedOnly');
 	});
 });

@@ -1,19 +1,21 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/adaptive_screen.dart';
 import 'package:feohledger_mobile/stores/adaptive_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
+import 'package:feohledger_mobile/widgets/load_error_state.dart';
 
 Widget _localized(Widget home) => MaterialApp(
-  localizationsDelegates: AppLocalizations.localizationsDelegates,
+  localizationsDelegates: appLocalizationsDelegates,
   supportedLocales: AppLocalizations.supportedLocales,
   home: home,
 );
@@ -32,7 +34,33 @@ Map<String, dynamic> _me(List<String> roles) => {
   'roles': roles,
 };
 
-Map<String, dynamic> _suggestion(String id, {String status = 'open'}) => {
+/// The row's `actions.dismiss` as `_suggestion_actions` serves it: `null`
+/// when the server would accept a dismiss now.
+const Object? _allowed = null;
+
+/// What a CFO's row carries — `_WRITE_ROLES` refused.
+const Map<String, dynamic> _roleRefused = {
+  'code': 'role_not_permitted',
+  'message': 'Your role does not permit this action.',
+  'params': <String, dynamic>{},
+};
+
+/// What a dismissed row carries — `dismiss_refusal`'s status gate.
+const Map<String, dynamic> _notDismissable = {
+  'code': 'workflow_suggestion_not_dismissable',
+  'message': 'A suggestion that is dismissed cannot be dismissed.',
+  'params': {'status': 'dismissed'},
+};
+
+/// Marks a suggestion served with no `actions` at all (an older backend).
+const Object _noActions = Object();
+
+Map<String, dynamic> _suggestion(
+  String id, {
+  String status = 'open',
+  Object? dismiss = _allowed,
+}) => {
+  if (!identical(dismiss, _noActions)) 'actions': {'dismiss': dismiss},
   'id': id,
   'kind': 'auto_approve_threshold',
   'vendor_id': 'v1',
@@ -133,10 +161,14 @@ MockClient _adaptiveClient({
     if (req.method == 'POST' && path.endsWith('/dismiss')) {
       onDismiss?.call(path);
       if (dismissStatus != 200) {
-        return _json({'detail': 'Your role does not permit this.'}, dismissStatus);
+        return _json({
+          'detail': 'Your role does not permit this.',
+        }, dismissStatus);
       }
       return _json({
-        'suggestions': [_suggestion('s1', status: 'dismissed')],
+        'suggestions': [
+          _suggestion('s1', status: 'dismissed', dismiss: _notDismissable),
+        ],
       });
     }
     if (path.endsWith('/approval-patterns')) {
@@ -145,7 +177,9 @@ MockClient _adaptiveClient({
     if (path.endsWith('/anomalies')) {
       return _json(anomalies ?? _anomalies());
     }
-    return _json({'suggestions': suggestions ?? [_suggestion('s1')]});
+    return _json({
+      'suggestions': suggestions ?? [_suggestion('s1')],
+    });
   });
 }
 
@@ -194,8 +228,9 @@ void main() {
     expect(find.widgetWithText(Tab, 'Anomalies'), findsOneWidget);
   });
 
-  testWidgets('the suggestions tab renders the row and the advisory note',
-      (tester) async {
+  testWidgets('the suggestions tab renders the row and the advisory note', (
+    tester,
+  ) async {
     await loginThen(['ap_manager'], _adaptiveClient());
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
@@ -216,10 +251,9 @@ void main() {
 
   testWidgets('a manager can dismiss, via a confirm dialog', (tester) async {
     String? dismissedPath;
-    await loginThen(
-      ['ap_manager'],
-      _adaptiveClient(onDismiss: (p) => dismissedPath = p),
-    );
+    await loginThen([
+      'ap_manager',
+    ], _adaptiveClient(onDismiss: (p) => dismissedPath = p));
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(tester, find.text('Dismiss'));
@@ -243,10 +277,9 @@ void main() {
 
   testWidgets('cancelling the dialog dismisses nothing', (tester) async {
     String? dismissedPath;
-    await loginThen(
-      ['admin'],
-      _adaptiveClient(onDismiss: (p) => dismissedPath = p),
-    );
+    await loginThen([
+      'admin',
+    ], _adaptiveClient(onDismiss: (p) => dismissedPath = p));
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(tester, find.text('Dismiss'));
@@ -263,11 +296,79 @@ void main() {
     );
   });
 
-  testWidgets('a CFO reads the suggestions and is offered no dismiss',
-      (tester) async {
-    // `_WRITE_ROLES` on the backend is admin | ap_manager; a CFO would get a
-    // 403, so the control is not rendered rather than rendered and refused.
-    await loginThen(['cfo'], _adaptiveClient());
+  testWidgets('a CFO reads the suggestions and is offered no dismiss', (
+    tester,
+  ) async {
+    // `_WRITE_ROLES` on the backend is admin | ap_manager; the CFO's row
+    // carries that refusal as its `actions.dismiss`, so the control is not
+    // rendered rather than rendered and refused.
+    await loginThen([
+      'cfo',
+    ], _adaptiveClient(suggestions: [_suggestion('s1', dismiss: _roleRefused)]));
+
+    await tester.pumpWidget(_localized(const AdaptiveScreen()));
+    await _pumpUntil(
+      tester,
+      find.text('Vendor Acme: 14/14 invoices approved unmodified'),
+    );
+
+    expect(find.text('Dismiss'), findsNothing);
+  });
+
+  testWidgets('a dismiss refused for its status is not offered', (
+    tester,
+  ) async {
+    // The verdict, not the role: an admin looking at an already-applied row
+    // gets `workflow_suggestion_not_dismissable` and no button.
+    await loginThen(
+      ['admin'],
+      _adaptiveClient(
+        suggestions: [
+          _suggestion(
+            's1',
+            status: 'applied',
+            dismiss: {
+              'code': 'workflow_suggestion_not_dismissable',
+              'message': 'A suggestion that is applied cannot be dismissed.',
+              'params': {'status': 'applied'},
+            },
+          ),
+        ],
+      ),
+    );
+
+    await tester.pumpWidget(_localized(const AdaptiveScreen()));
+    await _pumpUntil(
+      tester,
+      find.text('Vendor Acme: 14/14 invoices approved unmodified'),
+    );
+
+    expect(find.text('Dismiss'), findsNothing);
+  });
+
+  testWidgets('a stale row the server would dismiss offers Dismiss', (
+    tester,
+  ) async {
+    // `dismiss_refusal` accepts `open` and `stale`; the old status check
+    // offered only `open`. The verdict is what decides.
+    await loginThen([
+      'ap_manager',
+    ], _adaptiveClient(suggestions: [_suggestion('s1', status: 'stale')]));
+
+    await tester.pumpWidget(_localized(const AdaptiveScreen()));
+    await _pumpUntil(tester, find.text('Dismiss'));
+
+    expect(find.widgetWithText(TextButton, 'Dismiss'), findsOneWidget);
+  });
+
+  testWidgets('a row served without a verdict offers no dismiss', (
+    tester,
+  ) async {
+    // Fail closed: an admin whose role the backend admits still gets no
+    // control when the row carries no `actions` to say so.
+    await loginThen([
+      'admin',
+    ], _adaptiveClient(suggestions: [_suggestion('s1', dismiss: _noActions)]));
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(
@@ -300,8 +401,9 @@ void main() {
     );
   });
 
-  testWidgets('the show filter asks the server for all statuses',
-      (tester) async {
+  testWidgets('the show filter asks the server for all statuses', (
+    tester,
+  ) async {
     final statuses = <String?>[];
     await loginThen(
       ['ap_manager'],
@@ -309,7 +411,9 @@ void main() {
         final path = req.url.path;
         if (path.endsWith('/suggestions')) {
           statuses.add(req.url.queryParameters['status']);
-          return _json({'suggestions': [_suggestion('s1')]});
+          return _json({
+            'suggestions': [_suggestion('s1')],
+          });
         }
         if (path.endsWith('/approval-patterns')) return _json(_patterns());
         return _json(_anomalies());
@@ -334,8 +438,9 @@ void main() {
     expect(find.textContaining('No suggestions'), findsOneWidget);
   });
 
-  testWidgets('the suggestions tab has its own error state with Retry',
-      (tester) async {
+  testWidgets('the suggestions tab has its own error state with Retry', (
+    tester,
+  ) async {
     await loginThen(
       ['ap_manager'],
       MockClient((req) async {
@@ -352,11 +457,21 @@ void main() {
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(tester, find.text('Could not load the suggestions.'));
 
+    // The shared first-load state, carrying the localized sentence and never
+    // the description the store holds (a bare 500 has no server sentence).
+    expect(find.byType(LoadErrorState), findsOneWidget);
+    expect(AdaptiveStore.instance.suggestionsError, contains('HTTP 500'));
+    expect(find.textContaining('boom'), findsNothing);
+    expect(find.textContaining('ApiException'), findsNothing);
+    expect(find.textContaining('Request failed'), findsNothing);
+
     expect(find.widgetWithText(FilledButton, 'Retry'), findsOneWidget);
   });
 
   testWidgets('the patterns tab renders both sections', (tester) async {
-    await loginThen(['cfo'], _adaptiveClient(patterns: _patterns(unconverted: 2)));
+    await loginThen([
+      'cfo',
+    ], _adaptiveClient(patterns: _patterns(unconverted: 2)));
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(tester, find.text('Suggestions'));
@@ -373,10 +488,7 @@ void main() {
     // exact strings the backend sent, and the section note is what says what
     // they are in.
     expect(find.text('Median 1150.00 · average 1200.00'), findsOneWidget);
-    expect(
-      find.textContaining('reporting currency'),
-      findsWidgets,
-    );
+    expect(find.textContaining('reporting currency'), findsWidgets);
     // Excluded approvals are disclosed, because the sample still counts them.
     expect(
       find.textContaining('2 approvals could not be expressed'),
@@ -385,32 +497,31 @@ void main() {
   });
 
   testWidgets(
-      'per-vendor amounts wear the org reporting currency once it resolves',
-      (tester) async {
-    // The patterns tab is the surface that had to opt out of money formatting:
-    // its figures are in the org's reporting currency and `approval-patterns`
-    // does not name it, so rather than stamp the `\$` the other four screens
-    // asserted, it rendered raw strings under a note. `OrgCurrencyStore`
-    // resolves the same settings rungs the server used to denominate them, so
-    // the figures can now carry the real symbol — and the note, whose only job
-    // was to cover for its absence, goes away.
-    await loginThen(
-      ['cfo'],
-      _adaptiveClient(reportingCurrency: 'ZAR'),
-    );
+    'per-vendor amounts wear the org reporting currency once it resolves',
+    (tester) async {
+      // The patterns tab is the surface that had to opt out of money formatting:
+      // its figures are in the org's reporting currency and `approval-patterns`
+      // does not name it, so rather than stamp the `\$` the other four screens
+      // asserted, it rendered raw strings under a note. `OrgCurrencyStore`
+      // resolves the same settings rungs the server used to denominate them, so
+      // the figures can now carry the real symbol — and the note, whose only job
+      // was to cover for its absence, goes away.
+      await loginThen(['cfo'], _adaptiveClient(reportingCurrency: 'ZAR'));
 
-    await tester.pumpWidget(_localized(const AdaptiveScreen()));
-    await _pumpUntil(tester, find.text('Suggestions'));
-    await tester.tap(find.widgetWithText(Tab, 'Approval patterns'));
-    await tester.pumpAndSettle();
+      await tester.pumpWidget(_localized(const AdaptiveScreen()));
+      await _pumpUntil(tester, find.text('Suggestions'));
+      await tester.tap(find.widgetWithText(Tab, 'Approval patterns'));
+      await tester.pumpAndSettle();
 
-    expect(find.text('Median R1,150.00 · average R1,200.00'), findsOneWidget);
-    expect(find.textContaining('reporting currency.'), findsNothing);
-    expect(find.textContaining(r'$'), findsNothing);
-  });
+      expect(find.text('Median R1,150.00 · average R1,200.00'), findsOneWidget);
+      expect(find.textContaining('reporting currency.'), findsNothing);
+      expect(find.textContaining(r'$'), findsNothing);
+    },
+  );
 
-  testWidgets('the anomalies tab renders the scan count and each flag',
-      (tester) async {
+  testWidgets('the anomalies tab renders the scan count and each flag', (
+    tester,
+  ) async {
     await loginThen(['ap_manager'], _adaptiveClient());
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
@@ -429,12 +540,12 @@ void main() {
     );
   });
 
-  testWidgets('an empty anomaly scan still reports what it looked at',
-      (tester) async {
-    await loginThen(
-      ['ap_manager'],
-      _adaptiveClient(anomalies: _anomalies(flagged: false)),
-    );
+  testWidgets('an empty anomaly scan still reports what it looked at', (
+    tester,
+  ) async {
+    await loginThen([
+      'ap_manager',
+    ], _adaptiveClient(anomalies: _anomalies(flagged: false)));
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(tester, find.text('Suggestions'));

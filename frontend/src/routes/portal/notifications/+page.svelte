@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import {
 		getPortalNotificationPreferences,
 		updatePortalNotificationPreferences,
@@ -13,6 +15,10 @@
 	let saving = $state(false);
 	let msg = $state('');
 	let err = $state('');
+	// A failed read of the saved preferences. The form is withheld while it
+	// stands: it would otherwise show the `true` defaults as if they were the
+	// supplier's settings, and Save would write them over the real ones.
+	let loadErr = $state('');
 
 	function apply(p: PortalNotificationPreferences) {
 		emailOnPayment = p.email_on_payment;
@@ -21,11 +27,11 @@
 
 	async function load() {
 		loading = true;
-		err = '';
+		loadErr = '';
 		try {
 			apply(await getPortalNotificationPreferences());
 		} catch (e) {
-			err = e instanceof Error ? e.message : m('portal.notifications.loadFailed');
+			loadErr = e instanceof Error ? e.message : m('portal.notifications.loadFailed');
 		} finally {
 			loading = false;
 		}
@@ -67,7 +73,9 @@
 		<h2>{m('portal.notifications.cardTitle')}</h2>
 		<p class="note">{m('portal.notifications.cardNote')}</p>
 		{#if loading}
-			<p class="note">{m('portal.notifications.loading')}</p>
+			<LoadingState label={m('portal.notifications.loading')} />
+		{:else if loadErr}
+			<LoadError message={loadErr} onretry={load} testId="portal-notifications-load-error" />
 		{:else}
 			<form onsubmit={save}>
 				<label class="toggle">
@@ -137,21 +145,10 @@
 	}
 	.btn-primary {
 		align-self: flex-start;
-		padding: 8px 16px;
-		border: none;
-		border-radius: 4px;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		cursor: pointer;
-	}
-	.btn-primary:disabled {
-		opacity: 0.55;
-		cursor: default;
 	}
 	.error {
-		background: rgba(224, 64, 64, 0.1);
-		border: 1px solid rgba(224, 64, 64, 0.3);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		color: var(--danger);
 		padding: 8px 12px;
 		border-radius: 4px;
@@ -159,8 +156,8 @@
 		font-size: 0.85rem;
 	}
 	.message {
-		background: rgba(40, 160, 80, 0.12);
-		border: 1px solid rgba(40, 160, 80, 0.35);
+		background: color-mix(in srgb, var(--success) 12%, transparent);
+		border: 1px solid color-mix(in srgb, var(--success) 35%, transparent);
 		color: var(--success);
 		padding: 8px 12px;
 		border-radius: 4px;

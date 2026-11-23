@@ -7,6 +7,8 @@
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import SecretReveal from '#lib/components/ui/SecretReveal.svelte';
 	import SecretField from '#lib/components/ui/SecretField.svelte';
+	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
+	import { CREDENTIAL_BLOCK_UNOPENABLE } from '#lib/api/codedRefusals.ts';
 	import {
 		getProviderCredentials,
 		updateProviderCredentials
@@ -17,7 +19,11 @@
 		type ProviderCredentialStatus
 	} from '#lib/types/providerCredentials.ts';
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
-	import { m } from '#lib/i18n/store.svelte.ts';
+	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
+	import { normalizeCurrencyCode, currencyCodeProblem } from '#lib/utils/currencyCode.ts';
+	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
+	import { planCodeLabel } from '#lib/types/planFeatures.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
@@ -43,8 +49,14 @@
 	} from '#lib/types/ssoSettings.ts';
 	import { formatList } from '#lib/utils/list.ts';
 	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
+	import { errorMessage } from '#lib/utils/apiError.ts';
+	import SetupChecklist from '#lib/components/ui/SetupChecklist.svelte';
+	import { setupStepDone, setupStepHref, type SetupStepId } from '#lib/utils/onboarding.ts';
+	import type { OnboardingResponse } from '#lib/types/analytics.ts';
 	import ErpConnectionPanel from '#lib/components/organization/ErpConnectionPanel.svelte';
 	import CommerceConnectionPanel from '#lib/components/organization/CommerceConnectionPanel.svelte';
+	import CloseWorkspacePanel from '#lib/components/organization/CloseWorkspacePanel.svelte';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
 	import {
 		FEATURE_ERP_INTEGRATIONS,
@@ -54,6 +66,7 @@
 	} from '#lib/types/planFeatures.ts';
 	import {
 		NACHA_FIELD_LABEL_KEYS,
+		NACHA_OFFSET_ACCOUNT_TYPES,
 		nachaForSave,
 		nachaProblems,
 		type PaymentExecutionMode
@@ -118,6 +131,10 @@
 	}
 
 	let org = $state<OrgResponse | null>(null);
+	// Set when `GET /api/organization` fails, so the page says so and offers a
+	// retry. `org` is only ever set on success, so without this the template's
+	// fallback branch read "Loading…" forever after a failed load (#635).
+	let orgLoadFailed = $state(false);
 	// Editable fields
 	let name = $state('');
 	let address = $state('');
@@ -127,12 +144,41 @@
 	let vatNumber = $state('');
 	let companiesHouseNumber = $state('');
 	let currency = $state('USD');
+	// The stored default is the user's choice, never re-seeded; marking it
+	// touched once loaded also shows a malformed stored code as an error.
+	let currencyTouched = $state(false);
 	let paymentTerms = $state('Net 30');
+	// The stored value is the English term the backend and the ERP exports
+	// read, so it stays the option's `value`; only the label is localized.
+	const PAYMENT_TERMS = [
+		'Due on Receipt',
+		'Net 10',
+		'Net 15',
+		'Net 30',
+		'Net 45',
+		'Net 60',
+		'Net 90',
+		'2/10 Net 30'
+	] as const;
+	// A term saved through the API (or before this list) that is not one of the
+	// presets is still offered, so the select shows what is actually stored
+	// rather than a blank box that silently overwrites it on the next save.
+	const paymentTermOptions = $derived(
+		(PAYMENT_TERMS as readonly string[]).includes(paymentTerms)
+			? [...PAYMENT_TERMS]
+			: [...PAYMENT_TERMS, paymentTerms]
+	);
+	function paymentTermLabel(term: string): string {
+		if (term === 'Due on Receipt') return m('org.defaults.terms.dueOnReceipt');
+		if (term === '2/10 Net 30') return m('org.defaults.terms.twoTenNet30');
+		const net = /^Net (\d+)$/.exec(term);
+		return net ? m('org.defaults.terms.net', { days: Number(net[1]) }) : term;
+	}
 	let numberPrefix = $state('INV-');
 	let defaultGl = $state('');
 	let defaultCostCenter = $state('');
 	// Provider credentials are write-only (`/api/organization/credentials`). Each
-	// secret input on the payments and cards panels (the ERP panel keeps its own,
+	// secret input on the payments, cards and extraction panels (the ERP panel keeps its own,
 	// `ErpConnectionPanel`) starts EMPTY and holds
 	// only what the admin types — a blank one keeps the stored value. `creds`
 	// lists which paths the server holds (names only); `secretClear` is each
@@ -144,7 +190,9 @@
 		'payments.api_key': false,
 		'payments.webhook_secret': false,
 		'cards.api_key': false,
-		'cards.client_secret': false
+		'cards.client_secret': false,
+		'extraction.api_key': false,
+		'extraction.aws_secret_access_key': false
 	});
 	const isStored = (block: CredentialBlock, path: string): boolean =>
 		creds?.[block].includes(path) ?? false;
@@ -176,6 +224,26 @@
 		creds = await updateProviderCredentials(block, body);
 		for (const path of Object.keys(typed)) secretClear[`${block}.${path}`] = false;
 	}
+	// A block whose stored value can no longer be opened: every save of it
+	// answers 503 `credential_block_unopenable` (the server must open it to
+	// merge), so its panel offers clearing it instead (`CredentialResetPrompt`,
+	// decisions §464). Set from the refusal's own `params.block` — a PATCH that
+	// drops a rail's keys names the block it could not open.
+	let unopenable = $state<Partial<Record<CredentialBlock, boolean>>>({});
+	function noteUnopenable(err: unknown): void {
+		if (!(err instanceof ApiError) || err.code !== CREDENTIAL_BLOCK_UNOPENABLE) return;
+		const block = err.params.block;
+		if (block === 'payments' || block === 'cards' || block === 'extraction') {
+			unopenable[block] = true;
+		}
+	}
+	function onCredentialsCleared(block: CredentialBlock, status: ProviderCredentialStatus): void {
+		creds = status;
+		unopenable[block] = false;
+		for (const key of Object.keys(secretClear)) {
+			if (key.startsWith(`${block}.`)) secretClear[key] = false;
+		}
+	}
 	// Extraction
 	let extractionProgramType = $state('platform');
 	let extractionProvider = $state('claude_vision');
@@ -184,6 +252,31 @@
 	let extractionAwsSecret = $state('');
 	let extractionAwsRegion = $state('us-east-1');
 	let savingExtraction = $state(false);
+	// The provider the stored key belongs to — as loaded, then as last saved
+	// (`null`: the block names none). A save that changes it drops the sealed
+	// key server-side (`extraction_secrets_to_drop`, decisions §444), so the
+	// key field reads "stored" only while the dropdown still shows this one.
+	let extractionSavedProvider = $state<string | null>(null);
+	let extractionKeyInvalid = $state(false);
+	const extractionProviderChanged = $derived(extractionProvider !== extractionSavedProvider);
+	const extractionKeyStored = (path: string): boolean =>
+		!extractionProviderChanged && isStored('extraction', path);
+	// A key is stored for the saved provider, and this save would drop it.
+	const extractionSwitchDropsKey = $derived(
+		extractionProviderChanged &&
+			(isStored('extraction', 'api_key') || isStored('extraction', 'aws_secret_access_key'))
+	);
+	/** The secret path a provider needs, or `null` (Ollama runs keyless). */
+	const extractionSecretPath = (provider: string): 'api_key' | 'aws_secret_access_key' | null =>
+		provider === 'aws_textract'
+			? 'aws_secret_access_key'
+			: provider === 'claude_vision' || provider === 'openai_vision'
+				? 'api_key'
+				: null;
+	const extractionProviderLabel = (provider: string): string =>
+		provider === 'ollama'
+			? m('org.extraction.providerOllama')
+			: (EXTRACTION_PROVIDERS.find((p) => p.value === provider)?.name ?? provider);
 	let testingExtraction = $state(false);
 	let extractionTestResult = $state<{ success: boolean; message: string } | null>(null);
 
@@ -201,17 +294,27 @@
 				model: extractionOllamaModel,
 			});
 		} catch (err) {
-			extractionTestResult = { success: false, message: err instanceof Error ? err.message : m('org.toast.testFailed') };
+			extractionTestResult = { success: false, message: errorMessage(err, m('org.toast.testFailed')) };
 		} finally {
 			testingExtraction = false;
 		}
 	}
 
+	// Product names, not copy, except Ollama's "(local)" note, which is keyed
+	// (`extractionProviderLabel`).
 	const EXTRACTION_PROVIDERS = [
-		{ value: 'claude_vision', label: 'Claude Vision (Anthropic)' },
-		{ value: 'openai_vision', label: 'GPT-4V (OpenAI)' },
-		{ value: 'aws_textract', label: 'AWS Textract' },
-		{ value: 'ollama', label: 'Ollama (Local)' },
+		{ value: 'claude_vision', name: 'Claude Vision (Anthropic)' },
+		{ value: 'openai_vision', name: 'GPT-4V (OpenAI)' },
+		{ value: 'aws_textract', name: 'AWS Textract' },
+		{ value: 'ollama', name: 'Ollama' },
+	];
+	// Product and model names, not copy: they read the same in every locale.
+	const MODERN_TREASURY = 'Modern Treasury';
+	const OLLAMA_MODELS = [
+		{ value: 'llama3.2-vision:11b', name: 'Llama 3.2 Vision 11B' },
+		{ value: 'llama3.2-vision:90b', name: 'Llama 3.2 Vision 90B' },
+		{ value: 'llava:13b', name: 'LLaVA 13B' },
+		{ value: 'llava:34b', name: 'LLaVA 34B' }
 	];
 	let extractionOllamaUrl = $state('http://localhost:11434');
 	let extractionOllamaModel = $state('llama3.2-vision:11b');
@@ -228,21 +331,28 @@
 	let cardsExpiryDays = $state(30);
 	let cardsSandbox = $state(true);
 	let savingCards = $state(false);
+	// `value` is the stored card-program region (the backend keeps `UK`, not
+	// ISO's `GB`); `iso` is what Intl names in the reader's language.
 	const CARD_REGIONS = [
-		{ value: 'US', label: 'United States', default_provider: 'lithic' },
-		{ value: 'UK', label: 'United Kingdom', default_provider: 'lithic' },
-		{ value: 'DE', label: 'Germany (EU)', default_provider: 'lithic' },
-		{ value: 'FR', label: 'France (EU)', default_provider: 'lithic' },
-		{ value: 'NL', label: 'Netherlands (EU)', default_provider: 'lithic' },
-		{ value: 'ZA', label: 'South Africa', default_provider: 'nium' },
-		{ value: 'AU', label: 'Australia', default_provider: 'nium' },
-		{ value: 'SG', label: 'Singapore', default_provider: 'nium' },
-		{ value: 'HK', label: 'Hong Kong', default_provider: 'nium' },
-		{ value: 'IN', label: 'India', default_provider: 'nium' },
-		{ value: 'CA', label: 'Canada', default_provider: 'nium' },
-		{ value: 'AE', label: 'UAE', default_provider: 'nium' },
-		{ value: 'JP', label: 'Japan', default_provider: 'nium' },
+		{ value: 'US', iso: 'US', eu: false, default_provider: 'lithic' },
+		{ value: 'UK', iso: 'GB', eu: false, default_provider: 'lithic' },
+		{ value: 'DE', iso: 'DE', eu: true, default_provider: 'lithic' },
+		{ value: 'FR', iso: 'FR', eu: true, default_provider: 'lithic' },
+		{ value: 'NL', iso: 'NL', eu: true, default_provider: 'lithic' },
+		{ value: 'ZA', iso: 'ZA', eu: false, default_provider: 'nium' },
+		{ value: 'AU', iso: 'AU', eu: false, default_provider: 'nium' },
+		{ value: 'SG', iso: 'SG', eu: false, default_provider: 'nium' },
+		{ value: 'HK', iso: 'HK', eu: false, default_provider: 'nium' },
+		{ value: 'IN', iso: 'IN', eu: false, default_provider: 'nium' },
+		{ value: 'CA', iso: 'CA', eu: false, default_provider: 'nium' },
+		{ value: 'AE', iso: 'AE', eu: false, default_provider: 'nium' },
+		{ value: 'JP', iso: 'JP', eu: false, default_provider: 'nium' },
 	];
+	const regionNames = $derived(new Intl.DisplayNames([currentLocale()], { type: 'region' }));
+	function cardRegionLabel(r: (typeof CARD_REGIONS)[number]): string {
+		const country = regionNames.of(r.iso) ?? r.value;
+		return r.eu ? m('org.cards.regionEu', { country }) : country;
+	}
 
 	let autoProvider = $derived(
 		CARD_REGIONS.find(r => r.value === cardsRegion)?.default_provider ?? 'nium'
@@ -335,7 +445,12 @@
 		},
 		{
 			labelKey: 'org.rail.group.account',
-			items: [{ slug: 'plan', labelKey: 'org.section.plan' }]
+			items: [
+				{ slug: 'plan', labelKey: 'org.section.plan' },
+				// Deleting an unused workspace, which frees its addresses
+				// (decisions §306). Last: the one irreversible panel.
+				{ slug: 'close', labelKey: 'org.section.close' }
+			]
 		}
 	];
 
@@ -408,6 +523,48 @@
 	 */
 	const requestedPanels = new Set<string>();
 
+	/**
+	 * Getting started — the settings a new workspace configures first, each
+	 * ticked from the same server-side facts as the dashboard's setup checklist
+	 * (`GET /api/dashboard/onboarding`, `docs/decisions.md` §315). Read again
+	 * each time the panel is shown, so a step saved on another panel is ticked
+	 * on the way back. Admin-only: a non-admin, or a read that fails, gets the
+	 * same links with no done state at all — an unknown is never drawn as
+	 * unfinished.
+	 */
+	let onboarding = $state<OnboardingResponse | null>(null);
+	const GETTING_STARTED: { id: SetupStepId; labelKey: MessageKey }[] = [
+		{ id: 'company', labelKey: 'org.gettingStarted.company' },
+		{ id: 'defaults', labelKey: 'org.gettingStarted.defaults' },
+		{ id: 'users', labelKey: 'org.gettingStarted.users' },
+		{ id: 'security', labelKey: 'org.gettingStarted.security' },
+		{ id: 'erp', labelKey: 'org.gettingStarted.erp' },
+		{ id: 'vendors', labelKey: 'org.gettingStarted.vendors' },
+		// Invoice approval thresholds (auto-approve, CFO above, maximum) live on
+		// the workflow's approval step, not on this page; the Payments panel's
+		// only threshold is the CFO sign-off for a payment RUN, which is its own
+		// step (#635).
+		{ id: 'workflow', labelKey: 'org.gettingStarted.approvals' },
+		{ id: 'payments', labelKey: 'org.gettingStarted.paymentRunSignoff' },
+		{ id: 'email_intake', labelKey: 'org.gettingStarted.emailIntake' },
+		{ id: 'branding', labelKey: 'org.gettingStarted.branding' }
+	];
+	const gettingStartedSteps = $derived(
+		GETTING_STARTED.map(({ id, labelKey }) => ({
+			id,
+			label: m(labelKey),
+			href: setupStepHref(id, '/organization'),
+			done: setupStepDone(id, onboarding)
+		}))
+	);
+	$effect(() => {
+		if (section !== 'getting-started' || !userLoaded || !auth.isAdmin) return;
+		api.get<OnboardingResponse>('/api/dashboard/onboarding').then(
+			(res) => (onboarding = res),
+			() => (onboarding = null)
+		);
+	});
+
 	function once(slug: string, load: () => void) {
 		if (section !== slug || requestedPanels.has(slug)) return;
 		requestedPanels.add(slug);
@@ -425,6 +582,7 @@
 	});
 
 	async function loadOrg() {
+		orgLoadFailed = false;
 		try {
 			const data = await api.get<OrgResponse>('/api/organization');
 			org = data;
@@ -436,6 +594,7 @@
 			vatNumber = data.settings.company.vat_registration_number ?? '';
 			companiesHouseNumber = data.settings.company.companies_house_number ?? '';
 			currency = data.settings.invoice_defaults.currency;
+			currencyTouched = true;
 			paymentTerms = data.settings.invoice_defaults.payment_terms;
 			numberPrefix = data.settings.invoice_defaults.number_prefix;
 			defaultGl = data.settings.invoice_defaults.default_gl_account;
@@ -451,7 +610,12 @@
 				cardsCustomerHashId = (cards.customer_hash_id as string) || '';
 				cardsWalletHashId = (cards.wallet_hash_id as string) || '';
 				cardsExpiryDays = (cards.default_expiry_days as number) || 30;
-				cardsSandbox = (cards.sandbox as boolean) ?? true;
+				// A stored block with no `sandbox` key runs LIVE: the card adapters
+				// read `config.get("sandbox", False)`. Showing it as testing made the
+				// next save silently move the block to sandbox (and, since §464,
+				// drop its keys). A block never configured keeps the declared
+				// default above.
+				cardsSandbox = typeof cards.sandbox === 'boolean' ? cards.sandbox : false;
 			}
 			// Security (MFA enforcement)
 			const mfaCfg = (data.settings as unknown as Record<string, unknown>).mfa as
@@ -486,9 +650,13 @@
 			if (extraction) {
 				extractionProgramType = (extraction.program_type as string) || 'platform';
 				extractionProvider = (extraction.provider as string) || 'claude_vision';
-				extractionApiKey = (extraction.api_key as string) || '';
+				extractionSavedProvider =
+					typeof extraction.provider === 'string' && extraction.provider.trim()
+						? extraction.provider.trim()
+						: null;
+				// The BYOK key / AWS secret are sealed and never read back: their
+				// fields start empty ("leave blank to keep"), like every SecretField.
 				extractionAwsKeyId = (extraction.aws_access_key_id as string) || '';
-				extractionAwsSecret = (extraction.aws_secret_access_key as string) || '';
 				extractionAwsRegion = (extraction.aws_region as string) || 'us-east-1';
 				extractionOllamaUrl = (extraction.base_url as string) || 'http://localhost:11434';
 				extractionOllamaModel = (extraction.model as string) || 'llama3.2-vision:11b';
@@ -508,7 +676,8 @@
 				brandSsoCallbackBaseUrl = (brandCfg.sso_callback_base_url as string) || '';
 			}
 		} catch {
-			toast(m('org.toast.loadFailed'), 'error');
+			// In place, not a toast: the toast faded and left the loading line.
+			orgLoadFailed = true;
 		}
 	}
 
@@ -606,6 +775,28 @@
 	let nachaCompanyId = $state('');
 	let nachaOdfiRouting = $state('');
 	let nachaBankName = $state('');
+	// The balanced-file offset account (decisions §432). The account number
+	// reads back masked (`****1234`), so the input starts blank with the mask as
+	// its placeholder; saving it blank keeps the stored number.
+	let nachaOffsetRouting = $state('');
+	let nachaOffsetAccount = $state('');
+	let nachaOffsetAccountMask = $state('');
+	// The stored offset's bank, while an account number is on file: a blank
+	// account is "keep it" only at that same bank (`nachaProblems`).
+	let nachaOffsetOnFile = $state<{ offset_routing: string; offset_account_type: string } | null>(
+		null
+	);
+	function rememberNachaOnFile(block: Record<string, unknown> | null | undefined): void {
+		nachaOffsetOnFile =
+			typeof block?.offset_account === 'string' && block.offset_account !== ''
+				? {
+						offset_routing: typeof block.offset_routing === 'string' ? block.offset_routing : '',
+						offset_account_type:
+							typeof block.offset_account_type === 'string' ? block.offset_account_type : ''
+					}
+				: null;
+	}
+	let nachaOffsetAccountType = $state('');
 	// Every OTHER key of the stored `settings.payments` block. The save is a
 	// shallow replace of the whole block, so a key this form does not manage —
 	// `require_run_segregation`, `home_currency`, anything newer than this
@@ -638,6 +829,13 @@
 		nachaCompanyId = typeof nacha.company_id === 'string' ? nacha.company_id : '';
 		nachaOdfiRouting = typeof nacha.odfi_routing === 'string' ? nacha.odfi_routing : '';
 		nachaBankName = typeof nacha.bank_name === 'string' ? nacha.bank_name : '';
+		nachaOffsetRouting = typeof nacha.offset_routing === 'string' ? nacha.offset_routing : '';
+		nachaOffsetAccount = '';
+		nachaOffsetAccountMask =
+			typeof nacha.offset_account === 'string' ? nacha.offset_account : '';
+		rememberNachaOnFile(nacha);
+		nachaOffsetAccountType =
+			typeof nacha.offset_account_type === 'string' ? nacha.offset_account_type : '';
 	}
 	let testingPayments = $state(false);
 	let paymentsTestResult = $state<{ success: boolean; message: string } | null>(null);
@@ -659,19 +857,25 @@
 		} catch (err) {
 			paymentsTestResult = {
 				success: false,
-				message: err instanceof Error ? err.message : m('org.toast.testFailed'),
+				message: errorMessage(err, m('org.toast.testFailed')),
 			};
 		} finally {
 			testingPayments = false;
 		}
 	}
 
-	async function patchSettings(section: string, partial: Record<string, unknown>) {
+	/** PATCH the org's settings. No toast: a save with a credential PUT after
+	 *  it toasts once, when both have settled. */
+	async function patchOrg(partial: Record<string, unknown>) {
 		const data = await api.patch<OrgResponse>('/api/organization', {
 			...(partial.company ? { name: name.trim() } : {}),
 			settings: partial,
 		});
 		org = data;
+	}
+
+	async function patchSettings(section: string, partial: Record<string, unknown>) {
+		await patchOrg(partial);
 		toast(m('org.toast.sectionSaved', { section }), 'success');
 	}
 
@@ -688,13 +892,27 @@
 				},
 			});
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingProfile = false;
 		}
 	}
 
 	async function saveDefaults() {
+		// The section has no <form>, so the field's own validity cannot block
+		// the save: refuse here with the same words the field shows.
+		const code = normalizeCurrencyCode(currency);
+		if (code === null) {
+			currencyTouched = true;
+			toast(
+				currencyCodeProblem(currency) === 'required'
+					? m('common.currencyCode.required')
+					: m('common.currencyCode.invalid', { value: currency.trim() }),
+				'error'
+			);
+			return;
+		}
+		currency = code;
 		savingDefaults = true;
 		try {
 			await patchSettings(m('org.section.defaultsSaved'), {
@@ -713,29 +931,62 @@
 			orgCurrency.reset();
 			void orgCurrency.ensureLoaded();
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingDefaults = false;
 		}
 	}
 
 	async function saveExtraction() {
+		const byok = extractionProgramType === 'byok';
+		// Platform mode hides the provider dropdown: resend the saved one, so a
+		// choice the admin can no longer see cannot drop the stored key.
+		const provider = byok ? extractionProvider : (extractionSavedProvider ?? extractionProvider);
+		// Refuse a switch that would leave BYOK keyless: the stored key goes
+		// with the old provider, so the new one's must be typed in this save.
+		const needed = byok ? extractionSecretPath(provider) : null;
+		const typed = { api_key: extractionApiKey, aws_secret_access_key: extractionAwsSecret };
+		if (extractionSwitchDropsKey && needed && typed[needed].trim() === '') {
+			extractionKeyInvalid = true;
+			toast(
+				m('org.extraction.switchNeedsKey', { provider: extractionProviderLabel(provider) }),
+				'error'
+			);
+			document
+				.getElementById(needed === 'api_key' ? 'extraction-api-key' : 'extraction-aws-secret')
+				?.focus();
+			return;
+		}
+		extractionKeyInvalid = false;
 		savingExtraction = true;
 		try {
-			await patchSettings(m('org.section.extractionSaved'), {
+			// Configuration first: a save that switches provider drops the old
+			// provider's sealed key server-side, so the key typed for the new one
+			// must be written after it.
+			await patchOrg({
 				extraction: {
 					program_type: extractionProgramType,
-					provider: extractionProvider,
-					api_key: extractionApiKey,
+					provider,
 					aws_access_key_id: extractionAwsKeyId,
-					aws_secret_access_key: extractionAwsSecret,
 					aws_region: extractionAwsRegion,
 					base_url: extractionOllamaUrl,
 					model: extractionOllamaModel,
 				},
 			});
+			extractionSavedProvider = provider;
+			// …and the panel re-reads what is stored, since that save may have
+			// dropped a key the page still believes is there.
+			await loadCredentials();
+			await saveSecrets('extraction', typed);
+			extractionApiKey = extractionAwsSecret = '';
+			toast(
+				m('org.toast.sectionSaved', { section: m('org.section.extractionSaved') }),
+				'success'
+			);
+			unopenable.extraction = false;
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			noteUnopenable(err);
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingExtraction = false;
 		}
@@ -744,7 +995,7 @@
 	async function saveCards() {
 		savingCards = true;
 		try {
-			await patchSettings(m('org.section.cardsSaved'), {
+			await patchOrg({
 				cards: {
 					enabled: cardsEnabled,
 					program_type: cardsProgramType,
@@ -759,8 +1010,11 @@
 			});
 			await saveSecrets('cards', { api_key: cardsApiKey, client_secret: cardsClientSecret });
 			cardsApiKey = cardsClientSecret = '';
+			toast(m('org.toast.sectionSaved', { section: m('org.section.cardsSaved') }), 'success');
+			unopenable.cards = false;
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			noteUnopenable(err);
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingCards = false;
 		}
@@ -773,7 +1027,7 @@
 				mfa: { required: mfaRequired },
 			});
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingSecurity = false;
 		}
@@ -791,7 +1045,7 @@
 			await patchSettings(m('org.section.fraudSaved'), { fraud_rules: payload });
 			fraud = payload;
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingFraud = false;
 		}
@@ -808,12 +1062,17 @@
 			company_name: nachaCompanyName,
 			company_id: nachaCompanyId,
 			odfi_routing: nachaOdfiRouting,
-			bank_name: nachaBankName
+			bank_name: nachaBankName,
+			offset_routing: nachaOffsetRouting,
+			offset_account: nachaOffsetAccount,
+			offset_account_type: nachaOffsetAccountType
 		});
 		if (nacha) {
 			// The server 422s the same fields (`services/nacha.originator_problems`);
 			// naming them here keeps the admin on the form with the reason.
-			const problems = nachaProblems(nacha);
+			const problems = nachaProblems(nacha, {
+				onFile: nachaOffsetOnFile
+			});
 			if (problems.length > 0) {
 				toast(
 					m('org.payments.nachaInvalid', {
@@ -828,7 +1087,7 @@
 		const sendMode = paymentsModeStored !== null || paymentsMode !== 'processor';
 		savingPayments = true;
 		try {
-			await patchSettings(m('org.section.paymentsSaved'), {
+			await patchOrg({
 				payments: {
 					...paymentsExtras,
 					...(sendMode ? { mode: paymentsMode } : {}),
@@ -842,28 +1101,43 @@
 				},
 			});
 			if (sendMode) paymentsModeStored = paymentsMode;
+			// The typed offset account number is now on file: show it as the
+			// server does, masked, and clear the input.
+			const savedNacha = (
+				(org?.settings as unknown as Record<string, unknown> | undefined)?.payments as
+					| Record<string, unknown>
+					| undefined
+			)?.nacha as Record<string, unknown> | null | undefined;
+			nachaOffsetAccountMask =
+				typeof savedNacha?.offset_account === 'string' ? savedNacha.offset_account : '';
+			rememberNachaOnFile(savedNacha);
+			nachaOffsetAccount = '';
 			await saveSecrets('payments', {
 				api_key: paymentsApiKey,
 				webhook_secret: paymentsWebhookSecret
 			});
 			paymentsApiKey = paymentsWebhookSecret = '';
+			toast(m('org.toast.sectionSaved', { section: m('org.section.paymentsSaved') }), 'success');
+			unopenable.payments = false;
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			noteUnopenable(err);
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingPayments = false;
 		}
 	}
 
-	const planLabel = (plan: string): string =>
-		({
-			free: m('org.plan.free'),
-			pro: m('org.plan.pro'),
-			enterprise: m('org.plan.enterprise'),
-		})[plan] ?? plan;
+	// `org.plan` is the live subscription's plan code (decisions §482); a
+	// negotiated plan the client has no name for shows its code.
+	const planLabel = (plan: string): string => planCodeLabel(plan, m);
 
 	// ── White-label branding ────────────────────────────────────────────
 	import { brand } from '#lib/stores/brand.svelte.ts';
-	import { accentStrongContrast } from '#lib/stores/brandTheme.ts';
+	import {
+		accentStrongContrast,
+		accentTextContrast,
+		THEME_NAMES
+	} from '#lib/stores/brandTheme.ts';
 	import { formatRatio, WCAG_AA_NORMAL } from '#lib/a11y/contrast.ts';
 	import FieldWarning from '#lib/components/ui/FieldWarning.svelte';
 
@@ -928,6 +1202,11 @@
 	const accentStrongFails = $derived(
 		accentStrongRatio !== null && accentStrongRatio < WCAG_AA_NORMAL
 	);
+	// `accent_color` is also small text (links, the active tab), and no colour
+	// reads at 4.5:1 on both palettes' surfaces. Each theme shows the least
+	// shade of it that does (`themeAccent`, decisions §478); say so per theme,
+	// with the shade, so the change to the brand is never silent.
+	const accentText = $derived(accentTextContrast(brandAccentColor));
 
 	async function saveBranding() {
 		// Client-side validation mirroring the backend BrandConfig guards, so a
@@ -975,7 +1254,7 @@
 			await brand.ensureLoadedAndApply();
 			toast(m('org.branding.toast.saved'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			savingBranding = false;
 		}
@@ -1021,6 +1300,19 @@
 		return h;
 	}
 
+	// One answer for every panel's failed READ. A 4xx carries a refusal the
+	// server wrote for this reader (already localized when it is coded), so it
+	// is worth showing. A 5xx's message is only its status reason — a 500 read
+	// "Internal Server Error" — and a network failure's is the browser's
+	// ("Failed to fetch"); neither says more than the panel's own translated
+	// fallback, and both are English in five locales.
+	function panelLoadError(err: unknown, fallback: string): string {
+		if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+			return errorMessage(err, fallback);
+		}
+		return fallback;
+	}
+
 	async function loadCustomDomains() {
 		loadingDomains = true;
 		domainsError = '';
@@ -1030,7 +1322,7 @@
 			);
 			customDomains = data.custom_domains ?? [];
 		} catch (err) {
-			domainsError = err instanceof Error ? err.message : m('org.customDomains.toast.loadFailed');
+			domainsError = panelLoadError(err, m('org.customDomains.toast.loadFailed'));
 		} finally {
 			loadingDomains = false;
 		}
@@ -1053,10 +1345,7 @@
 			// ("already registered to another organization") or the
 			// platform-domain refusal reads as itself instead of a generic
 			// "Failed to save".
-			domainSaveError =
-				err instanceof Error && err.message
-					? err.message
-					: m('org.customDomains.toast.saveFailed');
+			domainSaveError = errorMessage(err, m('org.customDomains.toast.saveFailed'));
 			return false;
 		} finally {
 			savingDomains = false;
@@ -1143,7 +1432,7 @@
 		try {
 			applyResidency(await api.get<ResidencyResponse>('/api/organization/data-residency'));
 		} catch (err) {
-			residencyError = err instanceof Error ? err.message : m('org.residency.toast.loadFailed');
+			residencyError = panelLoadError(err, m('org.residency.toast.loadFailed'));
 		} finally {
 			loadingResidency = false;
 		}
@@ -1161,7 +1450,7 @@
 			);
 			toast(m('org.residency.toast.saved'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.residency.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.residency.toast.saveFailed')), 'error');
 			// Snap the control back to what is actually persisted, so the panel
 			// never shows a region the tenant is not pinned to.
 			residencyRegion = residencySavedRegion;
@@ -1269,7 +1558,7 @@
 		try {
 			applyChat(await getChatNotifications());
 		} catch (err) {
-			chatError = err instanceof Error ? err.message : m('org.chat.toast.loadFailed');
+			chatError = panelLoadError(err, m('org.chat.toast.loadFailed'));
 		} finally {
 			loadingChat = false;
 		}
@@ -1289,7 +1578,7 @@
 			);
 			toast(m('org.chat.toast.saved'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.chat.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.chat.toast.saveFailed')), 'error');
 		} finally {
 			savingChat = false;
 		}
@@ -1309,7 +1598,7 @@
 			newChatWebhook = '';
 			toast(m('org.chat.webhook.toast.saved'), 'success');
 		} catch (err) {
-			toast(err instanceof Error ? err.message : m('org.chat.webhook.toast.saveFailed'), 'error');
+			toast(errorMessage(err, m('org.chat.webhook.toast.saveFailed')), 'error');
 		} finally {
 			savingChatWebhook = false;
 		}
@@ -1328,7 +1617,7 @@
 			toast(m('org.chat.webhook.toast.removed'), 'success');
 		} catch (err) {
 			toast(
-				err instanceof Error ? err.message : m('org.chat.webhook.toast.removeFailed'),
+				errorMessage(err, m('org.chat.webhook.toast.removeFailed')),
 				'error'
 			);
 		} finally {
@@ -1417,7 +1706,7 @@
 		try {
 			applySso(await getSsoSettings());
 		} catch (err) {
-			ssoLoadError = err instanceof Error ? err.message : m('orgSso.toast.loadFailed');
+			ssoLoadError = panelLoadError(err, m('orgSso.toast.loadFailed'));
 		} finally {
 			loadingSso = false;
 		}
@@ -1458,12 +1747,12 @@
 			);
 			toast(m('orgSso.toast.saved'), 'success');
 		} catch (err) {
-			const text =
+			// Stated beside Save (role="alert"), and only there: one error, one
+			// signal (`docs/ui-patterns.md` § Toast).
+			ssoSaveError =
 				err instanceof ApiError
 					? (ssoRefusalText(err, m) ?? err.message)
 					: m('orgSso.toast.saveFailed');
-			ssoSaveError = text;
-			toast(text, 'error');
 		} finally {
 			savingSso = false;
 		}
@@ -1526,7 +1815,7 @@
 			// available, not silently reporting a working one as switched off.
 			intakeDomainConfigured = data.domain_configured ?? true;
 		} catch (err) {
-			intakeError = err instanceof Error ? err.message : m('org.emailIntake.toast.loadFailed');
+			intakeError = panelLoadError(err, m('org.emailIntake.toast.loadFailed'));
 		} finally {
 			loadingIntake = false;
 		}
@@ -1604,7 +1893,7 @@
 			toast(successMessage, 'success');
 		} catch (err) {
 			toast(
-				err instanceof Error ? err.message : m('org.emailIntake.toast.rotateFailed'),
+				errorMessage(err, m('org.emailIntake.toast.rotateFailed')),
 				'error'
 			);
 		} finally {
@@ -1644,6 +1933,49 @@
 		<div class="settings-layout">
 			<SettingsRail groups={railGroups} active={section} label={m('org.rail.label')} />
 
+			{#snippet customDomainsIntro()}
+				<h2>{m('org.section.customDomains')}</h2>
+				<p class="card-hint">
+					{m('org.customDomains.hint', { example: 'ap.acmecorp.com', slug: org?.slug ?? 'tenant' })}
+				</p>
+				<p class="card-hint">
+					{m('org.customDomains.setupHint', {
+						runbook: 'docs/founder-runbooks/custom-domain-provisioning.md'
+					})}
+				</p>
+			{/snippet}
+			{#snippet residencyIntro()}
+				<div class="help-row">
+					<h2>{m('org.section.dataResidency')}</h2>
+					<HelpTip term="data-residency" />
+				</div>
+				<p class="card-hint">{m('org.residency.hint')}</p>
+			{/snippet}
+
+			<!-- A failed panel READ renders here, OUTSIDE the lock below. Retry
+			     only re-reads, and a disabled <fieldset> disables every
+			     descendant control with no per-control opt-out, so inside it a
+			     non-admin was shown a Retry they could not press. Only the
+			     panels a non-admin actually loads are listed: chat, email
+			     intake, SSO and the close panel make no read for a non-admin
+			     (they show their admin-only note instead), so their LoadError
+			     can never meet the lock. A new panel a non-admin loads joins
+			     this chain, not the fieldset. -->
+			{#if section === 'custom-domains' && !loadingDomains && domainsError}
+				<div class="sections">
+					<section class="card">
+						{@render customDomainsIntro()}
+						<LoadError message={domainsError} onretry={loadCustomDomains} testId="custom-domains-load-error" />
+					</section>
+				</div>
+			{:else if section === 'residency' && !loadingResidency && residencyError}
+				<div class="sections">
+					<section class="card">
+						{@render residencyIntro()}
+						<LoadError message={residencyError} onretry={loadResidency} testId="residency-load-error" />
+					</section>
+				</div>
+			{:else}
 			<!-- A single disabled <fieldset> is the whole read-only mode: the
 			     attribute natively disables every descendant control, so a panel
 			     added later is covered without anyone remembering to gate it.
@@ -1652,19 +1984,17 @@
 			<fieldset class="sections" disabled={readOnly}>
 				{#if section === 'getting-started'}
 					<section class="getting-started card">
-						<h2>{m('org.gettingStarted.title')}</h2>
+						<h2 id="org-getting-started-heading">{m('org.gettingStarted.title')}</h2>
 						<p class="card-hint">{m('org.gettingStarted.intro')}</p>
 						<!-- These were `#org-*` anchors into one long scroll. They now name
 						     the panel that owns each step directly; the old anchors still
 						     resolve, via `LEGACY_HASH_SECTIONS`, for the copies of them
 						     that exist outside this repo. -->
-						<nav class="gs-links" aria-label={m('org.gettingStarted.title')}>
-							<a href="?section=company">{m('org.gettingStarted.company')}</a>
-							<a href="?section=defaults">{m('org.gettingStarted.defaults')}</a>
-							<a href="/admin">{m('org.gettingStarted.users')}</a>
-							<a href="?section=payments">{m('org.gettingStarted.approvals')}</a>
-							<a href="?section=branding">{m('org.gettingStarted.branding')}</a>
-						</nav>
+						<SetupChecklist
+							steps={gettingStartedSteps}
+							labelledby="org-getting-started-heading"
+							testId="org-getting-started-steps"
+						/>
 					</section>
 				{/if}
 
@@ -1698,7 +2028,7 @@
 							</label>
 							<label>
 								<span>{m('org.company.website')}</span>
-								<input type="url" bind:value={website} placeholder="https://" />
+								<input type="url" bind:value={website} placeholder={'https://'} />
 							</label>
 						</div>
 						<div class="section-footer">
@@ -1716,31 +2046,26 @@
 						<div class="form-grid">
 							<label>
 								<span>{m('org.defaults.currency')}</span>
-								<select bind:value={currency}>
-									<option value="USD">USD — US Dollar</option>
-									<option value="EUR">EUR — Euro</option>
-									<option value="GBP">GBP — British Pound</option>
-									<option value="CAD">CAD — Canadian Dollar</option>
-									<option value="AUD">AUD — Australian Dollar</option>
-									<option value="JPY">JPY — Japanese Yen</option>
-								</select>
+								<!-- Any ISO 4217 code: six hardcoded options left a PLN or
+								     ZAR organization unable to set its own default, which is
+								     also a rung of the reporting currency (decisions §381). -->
+								<CurrencyInput
+									bind:value={currency}
+									bind:touched={currencyTouched}
+									testid="org-default-currency"
+								/>
 							</label>
 							<label>
 								<span>{m('org.defaults.paymentTerms')}</span>
 								<select bind:value={paymentTerms}>
-									<option value="Due on Receipt">Due on Receipt</option>
-									<option value="Net 10">Net 10</option>
-									<option value="Net 15">Net 15</option>
-									<option value="Net 30">Net 30</option>
-									<option value="Net 45">Net 45</option>
-									<option value="Net 60">Net 60</option>
-									<option value="Net 90">Net 90</option>
-									<option value="2/10 Net 30">2/10 Net 30</option>
+									{#each paymentTermOptions as term (term)}
+										<option value={term}>{paymentTermLabel(term)}</option>
+									{/each}
 								</select>
 							</label>
 							<label>
 								<span>{m('org.defaults.numberPrefix')}</span>
-								<input type="text" bind:value={numberPrefix} placeholder="INV-" />
+								<input type="text" bind:value={numberPrefix} placeholder={'INV-'} />
 							</label>
 							<label>
 								<span>{m('org.defaults.defaultGl')}</span>
@@ -1798,6 +2123,22 @@
 										placeholder={DEFAULT_ACCENT}
 									/>
 								</span>
+								{#each THEME_NAMES as theme (theme)}
+									{@const verdict = accentText?.[theme]}
+									<FieldWarning
+										show={!!verdict && !verdict.meetsAA}
+										testId={`accent-text-contrast-${theme}`}
+										message={m(
+											theme === 'light'
+												? 'org.branding.accentTextLight'
+												: 'org.branding.accentTextDark',
+											{
+												ratio: verdict ? formatRatio(verdict.ratio) : '',
+												applied: verdict?.applied ?? ''
+											}
+										)}
+									/>
+								{/each}
 							</label>
 							<label>
 								<span>{m('org.branding.accentStrong')}</span>
@@ -1894,20 +2235,10 @@
 
 				{#if section === 'custom-domains'}
 					<section class="card">
-						<h2>{m('org.section.customDomains')}</h2>
-						<p class="card-hint">
-							{m('org.customDomains.hint', { example: 'ap.acmecorp.com', slug: org?.slug ?? 'tenant' })}
-						</p>
-						<p class="card-hint">
-							{m('org.customDomains.setupHint', {
-								runbook: 'docs/founder-runbooks/custom-domain-provisioning.md'
-							})}
-						</p>
+						{@render customDomainsIntro()}
 
 						{#if loadingDomains}
-							<p class="card-hint">{m('org.customDomains.loading')}</p>
-						{:else if domainsError}
-							<p class="domain-error" role="alert">{domainsError}</p>
+							<LoadingState label={m('org.customDomains.loading')} />
 						{:else}
 							{#if domainSaveError}
 								<p class="domain-error" role="alert" data-testid="custom-domain-error">
@@ -1967,7 +2298,7 @@
 						<p class="card-hint">{m('org.chat.hint')}</p>
 
 						{#if !userLoaded || loadingChat}
-							<p class="card-hint">{m('org.chat.loading')}</p>
+							<LoadingState label={m('org.chat.loading')} />
 						{:else if readOnly}
 							<!-- GET is admin-only, so nothing is fetched for a non-admin and
 							     there is nothing to show. Say that, exactly as the Email
@@ -1977,7 +2308,7 @@
 								{m('org.chat.adminOnly')}
 							</p>
 						{:else if chatError}
-							<p class="chat-error" role="alert">{chatError}</p>
+							<LoadError message={chatError} onretry={loadChat} testId="chat-load-error" />
 						{:else if chat}
 							<div class="form-grid">
 								<label class="switch-row">
@@ -2043,7 +2374,11 @@
 											class="btn-remove-domain"
 											class:armed={confirmRemoveChatWebhook}
 											disabled={savingChatWebhook}
-											aria-label={m('org.chat.webhook.removeAria')}
+											aria-label={savingChatWebhook
+												? undefined
+												: confirmRemoveChatWebhook
+													? m('org.chat.webhook.confirmRemoveAria')
+													: m('org.chat.webhook.removeAria')}
 											onclick={removeChatWebhook}
 										>
 											{confirmRemoveChatWebhook
@@ -2093,7 +2428,7 @@
 						<p class="card-hint">{m('org.emailIntake.hint')}</p>
 
 						{#if !userLoaded || loadingIntake}
-							<p class="card-hint">{m('org.emailIntake.loading')}</p>
+							<LoadingState label={m('org.emailIntake.loading')} />
 						{:else if readOnly}
 							<!-- GET is admin-only. Say that, rather than firing a request
 							     that 403s and rendering a load failure nobody can act on. -->
@@ -2101,9 +2436,7 @@
 								{m('org.emailIntake.adminOnly')}
 							</p>
 						{:else if intakeError}
-							<p class="domain-error" role="alert" data-testid="email-intake-error">
-								{intakeError}
-							</p>
+							<LoadError message={intakeError} onretry={loadEmailIntake} testId="email-intake-error" />
 						{:else if intakeUnavailable}
 							<!-- Proven: a token exists and the server still renders no
 							     address, which only happens when the platform has no
@@ -2135,7 +2468,7 @@
 								<button
 									type="button"
 									class="btn-save-section"
-									aria-label={m('org.emailIntake.copyAria')}
+									aria-label={intakeCopied ? undefined : m('org.emailIntake.copyAria')}
 									onclick={copyIntakeAddress}
 								>
 									{intakeCopied ? m('org.emailIntake.copied') : m('org.emailIntake.copy')}
@@ -2154,7 +2487,11 @@
 									class="btn-remove-domain"
 									class:armed={confirmRotateIntake}
 									disabled={rotatingIntake}
-									aria-label={m('org.emailIntake.rotateAria')}
+									aria-label={rotatingIntake
+										? undefined
+										: confirmRotateIntake
+											? m('org.emailIntake.rotateConfirmAria')
+											: m('org.emailIntake.rotateAria')}
 									onclick={rotateIntakeAddress}
 								>
 									{rotatingIntake
@@ -2170,16 +2507,10 @@
 
 				{#if section === 'residency'}
 					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.dataResidency')}</h2>
-							<HelpTip term="data-residency" />
-						</div>
-						<p class="card-hint">{m('org.residency.hint')}</p>
+						{@render residencyIntro()}
 
 						{#if loadingResidency}
-							<p class="card-hint">{m('org.residency.loading')}</p>
-						{:else if residencyError}
-							<p class="residency-error" role="alert">{residencyError}</p>
+							<LoadingState label={m('org.residency.loading')} />
 						{:else}
 							<div class="form-grid">
 								<label>
@@ -2289,7 +2620,7 @@
 										<span>{m('org.extraction.provider')}</span>
 										<select bind:value={extractionProvider}>
 											{#each EXTRACTION_PROVIDERS as p}
-												<option value={p.value}>{p.label}</option>
+												<option value={p.value}>{extractionProviderLabel(p.value)}</option>
 											{/each}
 										</select>
 									</label>
@@ -2302,22 +2633,30 @@
 							</div>
 
 							{#if extractionProgramType === 'platform'}
-								<p class="card-hint" style="margin-top: 10px;">{m('org.extraction.platformHint')}</p>
+								<p class="card-hint after-control">{m('org.extraction.platformHint')}</p>
 							{:else if extractionProvider === 'claude_vision' || extractionProvider === 'openai_vision'}
-								<div class="form-grid" style="margin-top: 14px;">
-									<label>
-										<span>{extractionProvider === 'claude_vision' ? m('org.extraction.anthropicKey') : m('org.extraction.openaiKey')}</span>
-										<input
-											type="password"
-											bind:value={extractionApiKey}
-											placeholder="sk-..."
-											autocomplete="new-password"
-											spellcheck="false"
-										/>
-									</label>
+								<div class="form-grid">
+									<SecretField
+										id="extraction-api-key"
+										label={extractionProvider === 'claude_vision' ? m('org.extraction.anthropicKey') : m('org.extraction.openaiKey')}
+										bind:value={extractionApiKey}
+										bind:clear={secretClear['extraction.api_key']}
+										configured={extractionKeyStored('api_key')}
+										placeholder={'sk-...'}
+										testId="extraction-api-key"
+										required={extractionSwitchDropsKey}
+										invalid={extractionKeyInvalid}
+										oninput={() => (extractionKeyInvalid = false)}
+										describedBy={extractionSwitchDropsKey ? 'extraction-switch-hint' : undefined}
+									/>
 								</div>
+								{#if extractionSwitchDropsKey}
+									<p class="card-hint" id="extraction-switch-hint" data-testid="extraction-switch-hint">
+										{m('org.extraction.switchDropsKey', { provider: extractionProviderLabel(extractionProvider) })}
+									</p>
+								{/if}
 							{:else if extractionProvider === 'aws_textract'}
-								<div class="form-grid" style="margin-top: 14px;">
+								<div class="form-grid">
 									<label>
 										<span>{m('org.extraction.awsKeyId')}</span>
 										<input
@@ -2327,39 +2666,52 @@
 											spellcheck="false"
 										/>
 									</label>
-									<label>
-										<span>{m('org.extraction.awsSecret')}</span>
-										<input
-											type="password"
-											bind:value={extractionAwsSecret}
-											autocomplete="new-password"
-											spellcheck="false"
-										/>
-									</label>
+									<SecretField
+										id="extraction-aws-secret"
+										label={m('org.extraction.awsSecret')}
+										bind:value={extractionAwsSecret}
+										bind:clear={secretClear['extraction.aws_secret_access_key']}
+										configured={extractionKeyStored('aws_secret_access_key')}
+										testId="extraction-aws-secret"
+										required={extractionSwitchDropsKey}
+										invalid={extractionKeyInvalid}
+										oninput={() => (extractionKeyInvalid = false)}
+										describedBy={extractionSwitchDropsKey ? 'extraction-switch-hint' : undefined}
+									/>
 									<label>
 										<span>{m('org.extraction.awsRegion')}</span>
-										<input type="text" bind:value={extractionAwsRegion} placeholder="us-east-1" />
+										<input type="text" bind:value={extractionAwsRegion} placeholder={'us-east-1'} />
 									</label>
 								</div>
+								{#if extractionSwitchDropsKey}
+									<p class="card-hint" id="extraction-switch-hint" data-testid="extraction-switch-hint">
+										{m('org.extraction.switchDropsKey', { provider: extractionProviderLabel(extractionProvider) })}
+									</p>
+								{/if}
 							{:else if extractionProvider === 'ollama'}
-								<div class="form-grid" style="margin-top: 14px;">
+								<div class="form-grid">
 									<label>
 										<span>{m('org.extraction.ollamaUrl')}</span>
-										<input type="url" bind:value={extractionOllamaUrl} placeholder="http://localhost:11434" />
+										<input type="url" bind:value={extractionOllamaUrl} placeholder={'http://localhost:11434'} />
 									</label>
 									<label>
 										<span>{m('org.extraction.model')}</span>
 										<select bind:value={extractionOllamaModel}>
-											<option value="llama3.2-vision:11b">Llama 3.2 Vision 11B</option>
-											<option value="llama3.2-vision:90b">Llama 3.2 Vision 90B</option>
-											<option value="llava:13b">LLaVA 13B</option>
-											<option value="llava:34b">LLaVA 34B</option>
+											{#each OLLAMA_MODELS as model (model.value)}
+												<option value={model.value}>{model.name}</option>
+											{/each}
 										</select>
 									</label>
 								</div>
-								<p class="card-hint" style="margin-top: 8px;">{m('org.extraction.ollamaHint')} <code>brew install ollama && ollama pull {extractionOllamaModel}</code></p>
+								<p class="card-hint after-control">{m('org.extraction.ollamaHint')} <code>{`brew install ollama && ollama pull ${extractionOllamaModel}`}</code></p>
 							{/if}
 
+							{#if unopenable.extraction && auth.isAdmin}
+								<CredentialResetPrompt
+									block="extraction"
+									oncleared={(status) => onCredentialsCleared('extraction', status)}
+								/>
+							{/if}
 							<div class="erp-test-row">
 								<button class="btn-save-section" disabled={savingExtraction} onclick={saveExtraction}>
 									{savingExtraction ? m('org.common.saving') : m('org.extraction.save')}
@@ -2481,6 +2833,72 @@
 										/>
 									</label>
 								</div>
+								<p class="card-hint" id="org-payments-nacha-offset-hint">
+									{m('org.payments.nachaOffsetHint')}
+								</p>
+								<div class="form-grid" data-testid="payments-nacha-offset">
+									<label>
+										<span>{m('org.payments.nachaField.offsetRouting')}</span>
+										<input
+											type="text"
+											inputmode="numeric"
+											bind:value={nachaOffsetRouting}
+											maxlength="9"
+											autocomplete="off"
+											aria-describedby="org-payments-nacha-offset-hint"
+										/>
+									</label>
+									<div>
+										<label>
+											<span>{m('org.payments.nachaField.offsetAccount')}</span>
+											<input
+												type="text"
+												bind:value={nachaOffsetAccount}
+												maxlength="20"
+												autocomplete="off"
+												placeholder={nachaOffsetAccountMask || undefined}
+												aria-describedby={nachaOffsetAccountMask
+													? 'org-payments-nacha-offset-hint org-payments-nacha-offset-onfile'
+													: 'org-payments-nacha-offset-hint'}
+											/>
+										</label>
+										<!-- The placeholder alone was the only sign an account is on
+										     file: it vanishes on focus and is no accessible
+										     description. Visible text outside the <label> (so it is
+										     not swallowed into the name), tied to the input. -->
+										{#if nachaOffsetAccountMask}
+											<p
+												class="field-hint"
+												id="org-payments-nacha-offset-onfile"
+												data-testid="payments-nacha-offset-onfile"
+											>
+												{m('org.payments.nachaOffsetOnFile', { mask: nachaOffsetAccountMask })}
+											</p>
+										{/if}
+									</div>
+									<label>
+										<!-- Named by its label text alone: a <select> inside its
+										     <label> otherwise takes the chosen option into its name
+										     ("Offset account type None"). -->
+										<span id="org-payments-nacha-offset-type-label"
+											>{m('org.payments.nachaField.offsetAccountType')}</span
+										>
+										<select
+											bind:value={nachaOffsetAccountType}
+											aria-labelledby="org-payments-nacha-offset-type-label"
+											aria-describedby="org-payments-nacha-offset-hint"
+										>
+											<option value="">{m('org.payments.nachaOffsetTypeNone')}</option>
+											{#each NACHA_OFFSET_ACCOUNT_TYPES as type (type)}
+												<option value={type}>
+													{type === 'savings'
+														? m('org.payments.nachaOffsetType.savings')
+														: m('org.payments.nachaOffsetType.checking')}
+												</option>
+											{/each}
+										</select>
+									</label>
+								</div>
 							{/if}
 
 							<div class="form-grid">
@@ -2488,7 +2906,7 @@
 									<span>{m('org.payments.provider')}</span>
 									<select bind:value={paymentsProvider}>
 										<option value="mock">{m('org.payments.providerMock')}</option>
-										<option value="modern_treasury">Modern Treasury</option>
+										<option value="modern_treasury">{MODERN_TREASURY}</option>
 									</select>
 								</label>
 							</div>
@@ -2497,7 +2915,7 @@
 								<div class="form-grid">
 									<label>
 										<span>{m('org.payments.orgId')}</span>
-										<input type="text" bind:value={paymentsOrgId} placeholder="org_..." />
+										<input type="text" bind:value={paymentsOrgId} placeholder={'org_...'} />
 									</label>
 									<SecretField
 										id="payments-api-key"
@@ -2553,6 +2971,12 @@
 								<HelpTip term="reporting-currency" />
 							</p>
 
+							{#if unopenable.payments && auth.isAdmin}
+								<CredentialResetPrompt
+									block="payments"
+									oncleared={(status) => onCredentialsCleared('payments', status)}
+								/>
+							{/if}
 							<div class="section-footer">
 								<button class="btn-save-section" disabled={savingPayments} onclick={savePayments}>
 									{savingPayments ? m('org.common.saving') : m('org.payments.save')}
@@ -2606,8 +3030,8 @@
 								<label>
 									<span>{m('org.cards.region')}</span>
 									<select bind:value={cardsRegion}>
-										{#each CARD_REGIONS as r}
-											<option value={r.value}>{r.label}</option>
+										{#each CARD_REGIONS as r (r.value)}
+											<option value={r.value}>{cardRegionLabel(r)}</option>
 										{/each}
 									</select>
 								</label>
@@ -2618,11 +3042,11 @@
 							</div>
 
 							{#if cardsEnabled && cardsProgramType === 'platform'}
-								<p class="card-hint" style="margin-top: 10px;">{m('org.cards.platformHint', { provider: autoProvider === 'lithic' ? 'Lithic' : 'Nium' })}</p>
+								<p class="card-hint after-control">{m('org.cards.platformHint', { provider: autoProvider === 'lithic' ? 'Lithic' : 'Nium' })}</p>
 							{/if}
 
 							{#if cardsEnabled && cardsProgramType === 'byok'}
-								<div class="form-grid" style="margin-top: 14px;">
+								<div class="form-grid">
 									<label>
 										<span>{m('org.cards.provider')}</span>
 										<select bind:value={cardsProvider}>
@@ -2634,14 +3058,14 @@
 								</div>
 
 								{#if effectiveProvider === 'lithic'}
-									<div class="form-grid" style="margin-top: 14px;">
+									<div class="form-grid">
 										<SecretField
 											id="cards-api-key"
 											label={m('org.cards.lithicApiKey')}
 											bind:value={cardsApiKey}
 											bind:clear={secretClear['cards.api_key']}
 											configured={isStored('cards', 'api_key')}
-											placeholder="api-key-..."
+											placeholder={'api-key-...'}
 											testId="cards-api-key"
 										/>
 										<label>
@@ -2653,7 +3077,7 @@
 										</label>
 									</div>
 								{:else if effectiveProvider === 'nium'}
-									<div class="form-grid" style="margin-top: 14px;">
+									<div class="form-grid">
 										<label>
 											<span>{m('org.cards.clientId')}</span>
 											<input type="text" bind:value={cardsClientId} />
@@ -2685,6 +3109,12 @@
 								{/if}
 							{/if}
 
+							{#if unopenable.cards && auth.isAdmin}
+								<CredentialResetPrompt
+									block="cards"
+									oncleared={(status) => onCredentialsCleared('cards', status)}
+								/>
+							{/if}
 							<div class="section-footer">
 								<button class="btn-save-section" disabled={savingCards} onclick={saveCards}>
 									{savingCards ? m('org.common.saving') : m('org.cards.save')}
@@ -2731,13 +3161,13 @@
 						<p class="card-hint">{m('orgSso.hint')}</p>
 
 						{#if !userLoaded || loadingSso}
-							<p class="card-hint">{m('orgSso.loading')}</p>
+							<LoadingState label={m('orgSso.loading')} />
 						{:else if readOnly}
 							<p class="card-hint" data-testid="sso-admin-only">
 								{m('org.readOnly.sectionAdminOnly')}
 							</p>
 						{:else if ssoLoadError}
-							<p class="chat-error" role="alert">{ssoLoadError}</p>
+							<LoadError message={ssoLoadError} onretry={loadSso} testId="sso-load-error" />
 						{:else if sso}
 							{#if sso.password_sign_in_closed}
 								<p class="sso-status" data-testid="sso-status-closed">
@@ -2788,7 +3218,7 @@
 										<input
 											type="url"
 											bind:value={ssoDiscoveryUrl}
-											placeholder="https://example.okta.com/.well-known/openid-configuration"
+											placeholder={'https://example.okta.com/.well-known/openid-configuration'}
 											autocomplete="off"
 											spellcheck="false"
 										/>
@@ -2854,7 +3284,7 @@
 											bind:value={ssoIdpCert}
 											rows="4"
 											spellcheck="false"
-											placeholder="-----BEGIN CERTIFICATE-----"
+											placeholder={'-----BEGIN CERTIFICATE-----'}
 										></textarea>
 									</label>
 									<label>
@@ -2884,7 +3314,7 @@
 										<input
 											type="text"
 											bind:value={ssoDomains}
-											placeholder="example.com, example.co.uk"
+											placeholder={'example.com, example.co.uk'}
 											autocomplete="off"
 											spellcheck="false"
 											aria-describedby="sso-domains-hint"
@@ -3199,10 +3629,17 @@
 						</div>
 					</section>
 				{/if}
+
+				{#if section === 'close'}
+					<CloseWorkspacePanel {readOnly} {userLoaded} />
+				{/if}
 			</fieldset>
+			{/if}
 		</div>
+	{:else if orgLoadFailed}
+		<LoadError message={m('org.error.loadFailed')} onretry={loadOrg} testId="org-load-error" />
 	{:else}
-		<div class="loading">{m('org.loading')}</div>
+		<LoadingState label={m('org.loading')} />
 	{/if}
 </PageHeader>
 
@@ -3354,27 +3791,15 @@
 		margin: 0 0 14px;
 	}
 
+	/* A hint under the provider picker it qualifies, not at the top of a card. */
+	.card-hint.after-control {
+		margin-top: 10px;
+	}
+
 	/* First-time-admin wayfinding — links jump to the sections a new tenant
 	   configures first. Purely a shortcut; nothing is hidden. */
 	.getting-started {
 		border-color: var(--accent);
-	}
-
-	.gs-links {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 8px 18px;
-		margin-top: 4px;
-	}
-
-	.gs-links a {
-		font-size: 0.85rem;
-		color: var(--accent);
-		text-decoration: none;
-	}
-
-	.gs-links a:hover {
-		text-decoration: underline;
 	}
 
 	.form-grid {
@@ -3544,11 +3969,10 @@
 		flex: 1;
 	}
 
-	/* Panel-level load failure (custom domains, data residency, chat) — a
-	   persistent region rather than a toast, because it explains why the panel
-	   is empty. */
+	/* An in-panel save refusal (a domain add, an SSO save). A panel's failed
+	   LOAD is `ui/LoadError` instead, which carries the Retry this line had no
+	   room for. */
 	.domain-error,
-	.residency-error,
 	.chat-error {
 		color: var(--danger);
 		font-size: 0.88rem;
@@ -3696,7 +4120,7 @@
 	textarea:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	.plan-card h2 {
@@ -3808,7 +4232,7 @@
 	}
 
 	.test-result.success {
-		color: #1fa86a;
+		color: var(--success);
 	}
 
 	.test-result.failure {
@@ -3888,12 +4312,6 @@
 	.btn-outline:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	.loading {
-		text-align: center;
-		padding: 40px;
-		color: var(--text-muted);
 	}
 
 	label.switch-row {
@@ -3998,7 +4416,7 @@
 	.threshold-row textarea:focus {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	.threshold-row input:disabled,

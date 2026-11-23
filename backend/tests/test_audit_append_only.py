@@ -237,8 +237,16 @@ _TENANT_MUTATORS_WITHOUT_DIRECT_AUDIT: dict[tuple[str, str], str] = {
     ("app.api.reports", "run_adhoc"): "runs a whitelisted report query — reads, never writes",
     ("app.api.reports", "run_saved"): "runs a whitelisted report query — reads, never writes",
     ("app.api.vendors", "bulk_export_vendors"): "CSV export — reads, never writes",
+    ("app.api.vendors", "search_vendor_erp_records"): (
+        "searches the ERP's contact list for candidates — links nothing, persists nothing "
+        "(decisions §415); the link it leads to is the audited write"
+    ),
     ("app.api.workflow_definitions", "simulate_workflow"): (
         "dry-run of a definition against a synthetic invoice — persists nothing"
+    ),
+    ("app.api.portal_auth", "portal_check_reset_token"): (
+        "peeks a set-password link without spending it — persists nothing; the "
+        "redemption (`portal_reset_password`) is the audited write"
     ),
     # -- the caller's own record / a derived cache, not tenant business state -
     # The assistant + copilot persist only the caller's own chat transcript;
@@ -339,6 +347,12 @@ _TENANT_MUTATORS_WITHOUT_DIRECT_AUDIT: dict[tuple[str, str], str] = {
         "audits via services/external_payment.record_invoice_paid_outside "
         "(`payment.recorded_outside`, plus the invoice transitions)"
     ),
+    ("app.api.exceptions", "record_erp_payment"): (
+        "audits via services/external_payment.record_invoice_paid_outside "
+        "(`payment.recorded_outside`, the invoice transitions, and the answered "
+        "row's `exception.resolved` through erp_status_sync.close_erp_paid_reports "
+        "→ exception_lifecycle.record_decision); writes nothing on any refusal"
+    ),
     ("app.api.portal", "resubmit_invoice"): (
         "audits via workflow_engine.transition_invoice + exception_lifecycle.record_decision"
     ),
@@ -361,9 +375,21 @@ _TENANT_MUTATORS_WITHOUT_DIRECT_AUDIT: dict[tuple[str, str], str] = {
         "audits via services/vendor_card_revocation.revoke_vendor_cards (`card.cancelled` / "
         "`card.cancel_failed` / `card.cancel_deferred_to_void`, one row per card)"
     ),
+    ("app.api.vendors", "adjudicate_sanctions_false_positive"): (
+        "audits via services/sanctions_adjudication.adjudicate "
+        "(`vendor.sanctions_adjudicated` + `vendor.screening_clearance_changed`, decisions §477)"
+    ),
+    ("app.api.vendors", "revoke_sanctions_adjudication"): (
+        "audits via services/sanctions_adjudication.revoke "
+        "(`vendor.sanctions_adjudication_revoked` per row, + `vendor.screening_clearance_changed` "
+        "when the stored screen was covered, decisions §477)"
+    ),
     ("app.api.workflow", "approve_invoice"): "audits via services/review.approve_invoice",
     ("app.api.workflow", "assign_reviewer"): "audits via services/review.assign_reviewer",
     ("app.api.workflow", "reject_invoice"): "audits via services/review.reject_invoice",
+    ("app.api.workflow", "recall_approval"): (
+        "audits via services/review.recall_approval (invoice.approval_recalled, decisions §374)"
+    ),
     ("app.api.workflow", "resubmit_invoice"): "audits via services/review.resubmit_invoice",
     ("app.api.workflow", "complete_invoice"): "audits via workflow_engine.transition_invoice",
     ("app.api.workflow", "reset_extraction"): "audits via workflow_engine.transition_invoice",

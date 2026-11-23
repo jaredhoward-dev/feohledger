@@ -108,6 +108,7 @@ async def test_slug_check_taken_returns_unavailable(realdb):
     body = resp.json()
     assert body["available"] is False
     assert "taken" in body["reason"].lower()
+    assert body["code"] == "slug_taken"
 
 
 async def test_slug_check_reserved_returns_unavailable(realdb):
@@ -117,6 +118,7 @@ async def test_slug_check_reserved_returns_unavailable(realdb):
     body = resp.json()
     assert body["available"] is False
     assert "reserved" in body["reason"].lower()
+    assert body["code"] == "slug_reserved"
 
 
 async def test_slug_check_malformed_returns_unavailable(realdb):
@@ -126,6 +128,9 @@ async def test_slug_check_malformed_returns_unavailable(realdb):
         resp = await c.get("/api/signup/slug-check", params={"slug": "Bad_Slug"})
     assert resp.status_code == 200
     assert resp.json()["available"] is False
+    assert resp.json()["code"] == "slug_format"
+    # User-facing English says "workspace address", never the internal "slug".
+    assert "slug" not in resp.json()["reason"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +227,11 @@ async def test_signup_start_rejects_malformed_email(realdb, cleanup_signup):
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/start", json=_start_body(slug, email="not-an-email"))
     assert resp.status_code == 422
-    assert "valid email" in resp.json()["detail"]
+    assert resp.json()["detail"] == {
+        "code": "signup_email_invalid",
+        "message": "Enter a valid email address.",
+        "params": {"field": "admin_email"},
+    }
 
 
 async def test_signup_start_rejects_bad_slug_format(realdb):
@@ -237,7 +246,10 @@ async def test_signup_start_rejects_reserved_slug(realdb):
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/start", json=body)
     assert resp.status_code == 422
-    assert "reserved" in resp.json()["detail"].lower()
+    detail = resp.json()["detail"]
+    assert detail["code"] == "slug_reserved"
+    assert detail["params"] == {"field": "slug", "slug": "support"}
+    assert "reserved" in detail["message"].lower()
 
 
 async def test_signup_start_conflict_on_taken_slug(realdb):
@@ -245,7 +257,10 @@ async def test_signup_start_conflict_on_taken_slug(realdb):
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/start", json=_start_body(taken))
     assert resp.status_code == 409
-    assert "taken" in resp.json()["detail"].lower()
+    detail = resp.json()["detail"]
+    assert detail["code"] == "slug_taken"
+    assert detail["params"] == {"field": "slug", "slug": taken}
+    assert "taken" in detail["message"].lower()
 
 
 async def test_signup_start_captcha_failure_returns_400(realdb, monkeypatch, cleanup_signup):
@@ -267,7 +282,8 @@ async def test_signup_start_captcha_failure_returns_400(realdb, monkeypatch, cle
         resp = await c.post("/api/signup/start", json=_start_body(slug))
 
     assert resp.status_code == 400
-    assert "captcha" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "captcha_failed"
+    assert "captcha" in resp.json()["detail"]["message"].lower()
 
     # No verification row was created (captcha is checked before the insert).
     mk = realdb.control_sessionmaker()
@@ -354,6 +370,14 @@ async def test_slug_check_rate_limited_returns_429(realdb, monkeypatch):
             last_resp = await c.get("/api/signup/slug-check", params={"slug": _unique_slug()})
     assert last_resp is not None
     assert last_resp.status_code == 429
+    # On the wire: the coded refusal the signup page localizes, with the
+    # standard Retry-After header still set and naming the same wait.
+    wait = int(last_resp.headers["Retry-After"])
+    assert wait >= 1
+    detail = last_resp.json()["detail"]
+    assert detail["code"] == "rate_limited"
+    assert detail["params"] == {"retry_after_seconds": wait}
+    assert detail["message"].startswith("Too many requests.")
 
 
 def test_config_requires_captcha_in_deployed_env():
@@ -390,7 +414,9 @@ def test_config_requires_captcha_in_deployed_env():
             email_provider="ses",
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="0xabc",
+            hcaptcha_sitekey="site-key",
             secret_key=strong_key,
+            subprocessor_notices_enabled=True,
         ).is_deployed
         is True
     )
@@ -574,7 +600,11 @@ async def test_a_link_like_admin_name_is_refused_before_any_email(
             "/api/signup/start", json=_start_body(slug, email) | {"admin_name": name}
         )
     assert resp.status_code == 422
-    assert resp.json()["detail"] == "Your name can't contain a web or email address."
+    assert resp.json()["detail"] == {
+        "code": "signup_name_has_link",
+        "message": "Your name can't contain a web or email address.",
+        "params": {"field": "admin_name"},
+    }
     assert capture.sent == []
 
 
@@ -713,6 +743,7 @@ async def test_without_a_tenant_url_signup_refuses_before_provisioning(
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/complete", json={"token": token})
     assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "signup_unavailable"
     provision.assert_not_awaited()
     issue.assert_not_awaited()
     assert capture.sent == []
@@ -937,13 +968,10 @@ async def test_forgot_password_works_for_a_signup_admin_who_never_set_one(
         async with realdb.client(key="a", role=None) as c:
             resp = await c.post("/api/auth/forgot-password", json={"email": login_email})
             assert resp.status_code == 200
-            # The send runs on a detached task; let it finish.
-            import asyncio
+            # The send runs on a detached task; wait for it to finish.
+            from app.utils.detached_tasks import drain_detached
 
-            for _ in range(50):
-                if sent:
-                    break
-                await asyncio.sleep(0)
+            await drain_detached()
             (msg,) = sent
             token = msg.body_text.split("token=")[1].split()[0]
             reset = await c.post(
@@ -983,6 +1011,10 @@ async def test_issue_reset_token_stores_the_requested_lifetime(monkeypatch):
         async def setex(self, key, ttl, value):
             stored[key] = ttl
 
+        async def get(self, key):
+            # The subject's generation counter (no reset has superseded any).
+            return None
+
     async def _get():
         return _Recorder()
 
@@ -1012,7 +1044,8 @@ async def test_signup_complete_unknown_token_returns_uniform_410(realdb):
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/complete", json={"token": "x" * 40})
     assert resp.status_code == 410
-    assert "invalid or has expired" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "signup_link_invalid"
+    assert "invalid or has expired" in resp.json()["detail"]["message"].lower()
 
 
 async def test_signup_complete_already_consumed_410(realdb, cleanup_signup):
@@ -1027,7 +1060,8 @@ async def test_signup_complete_already_consumed_410(realdb, cleanup_signup):
         resp = await c.post("/api/signup/complete", json={"token": token})
     assert resp.status_code == 410
     # Uniform message — does not reveal that the token was specifically "consumed".
-    assert "invalid or has expired" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "signup_link_invalid"
+    assert "invalid or has expired" in resp.json()["detail"]["message"].lower()
 
 
 async def test_signup_complete_expired_410(realdb, cleanup_signup):
@@ -1041,7 +1075,7 @@ async def test_signup_complete_expired_410(realdb, cleanup_signup):
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/complete", json={"token": token})
     assert resp.status_code == 410
-    assert "expired" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "signup_link_invalid"
 
 
 async def test_signup_complete_slug_taken_409(realdb, monkeypatch, cleanup_signup):
@@ -1063,6 +1097,8 @@ async def test_signup_complete_slug_taken_409(realdb, monkeypatch, cleanup_signu
         resp = await c.post("/api/signup/complete", json={"token": token})
 
     assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "slug_taken"
+    assert resp.json()["detail"]["params"] == {"field": "slug", "slug": taken}
     provision.assert_not_awaited()
 
 
@@ -1071,6 +1107,218 @@ async def test_signup_complete_token_too_short_422(realdb):
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post("/api/signup/complete", json={"token": "short"})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# An address that already has an account (decisions §292)
+#
+# `users.email` is unique across every organization, so such an address can
+# never be provisioned. It used to reach `provision_tenant`, hit the unique
+# index and answer 500 "contact support" — with the token left unconsumed, so
+# every reload of the link 500'd again.
+# ---------------------------------------------------------------------------
+
+
+async def _verification_row(realdb, token: str) -> EmailVerification:
+    mk = realdb.control_sessionmaker()
+    async with mk() as s:
+        return (
+            await s.execute(select(EmailVerification).where(EmailVerification.token == token))
+        ).scalar_one()
+
+
+async def test_signup_start_answers_an_existing_address_like_any_other(realdb, cleanup_signup):
+    """/start is public: refusing there would tell anyone which addresses have
+    accounts. The answer is the same verification-sent response."""
+    slugs, emails = cleanup_signup
+    slug = _unique_slug()
+    slugs.append(slug)
+    taken_email = realdb.email("a", "admin")
+
+    async with realdb.client(key="a", role=None) as c:
+        taken = await c.post("/api/signup/start", json=_start_body(slug, taken_email))
+        fresh_email = f"{slug}@example.com"
+        emails.append(fresh_email)
+        fresh = await c.post("/api/signup/start", json=_start_body(slug, fresh_email))
+
+    assert taken.status_code == fresh.status_code == 200
+    assert taken.json()["status"] == fresh.json()["status"]
+    assert taken.json()["message"].replace(taken_email, "X") == fresh.json()["message"].replace(
+        fresh_email, "X"
+    )
+
+
+async def test_complete_refuses_an_address_that_already_has_an_account(
+    realdb, monkeypatch, cleanup_signup
+):
+    from app.api import signup as signup_mod
+
+    slugs, _ = cleanup_signup
+    slug = _unique_slug()
+    slugs.append(slug)
+    # A case variant of an existing login: the unique index sees the stored,
+    # normalized address, so the check must too.
+    email = realdb.email("a", "admin").upper()
+    token = await _seed_verification(realdb, slug=slug, email=email)
+    provision = AsyncMock()
+    monkeypatch.setattr(signup_mod, "provision_tenant", provision)
+    capture = _CaptureAdapter()
+    monkeypatch.setattr(signup_mod, "get_email_adapter", lambda: capture)
+
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/complete", json={"token": token})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "signup_email_has_workspace"
+    url = detail["params"]["sign_in_url"]
+    # The EXISTING account's own sign-in page, address prefilled — not the
+    # slug this signup asked for.
+    assert url.startswith(f"http://{realdb.info('a').slug}.")
+    assert "/login?email=" in url
+    assert slug not in url
+    assert url in detail["message"]
+    provision.assert_not_awaited()
+    assert capture.sent == []
+
+    # The link is spent, so it can never run provisioning again…
+    row = await _verification_row(realdb, token)
+    assert row.consumed_at is not None
+    assert row.meta["outcome"] == "email_has_workspace"
+
+    # …and re-opening it (a reload, a second tab) states the same refusal
+    # rather than "invalid link, sign up again".
+    async with realdb.client(key="a", role=None) as c:
+        again = await c.post("/api/signup/complete", json={"token": token})
+    assert again.status_code == 409
+    assert again.json()["detail"] == detail
+    provision.assert_not_awaited()
+
+
+async def test_an_account_created_mid_provisioning_leaves_no_database_and_a_coded_refusal(
+    realdb, monkeypatch, cleanup_signup, caplog
+):
+    """The race: the address gains an account after the up-front check. The
+    REAL `provision_tenant` then fails on the unique index; it must leave no
+    database and no organization behind, and the answer must be the coded
+    refusal on a spent link — not a 500 every reload repeats."""
+    import asyncpg
+
+    from app.api import signup as signup_mod
+    from app.services import tenant_provisioning
+
+    slugs, _ = cleanup_signup
+    slug = _unique_slug()
+    slugs.append(slug)
+    email = realdb.email("a", "admin")
+    token = await _seed_verification(realdb, slug=slug, email=email)
+
+    real_account_for = signup_mod._account_for
+    calls = 0
+
+    async def account_appears_late(db, address):
+        nonlocal calls
+        calls += 1
+        return None if calls == 1 else await real_account_for(db, address)
+
+    monkeypatch.setattr(signup_mod, "_account_for", account_appears_late)
+
+    caplog.set_level("DEBUG", logger="app.api.signup")
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/complete", json={"token": token})
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "signup_email_has_workspace"
+    # The unique-index error names the address (`Key (email)=(…)`): the
+    # signup router must not hand it to a log sink.
+    signup_logs = "\n".join(
+        r.getMessage() + (str(r.exc_info[1]) if r.exc_info else "")
+        for r in caplog.records
+        if r.name == "app.api.signup"
+    )
+    assert signup_logs, "the refusal is logged (slug only)"
+    assert email.lower() not in signup_logs.lower()
+    assert not any(r.exc_info for r in caplog.records if r.name == "app.api.signup")
+    assert (await _verification_row(realdb, token)).consumed_at is not None
+
+    conn = await asyncpg.connect(**tenant_provisioning._parse_maintenance_dsn())
+    try:
+        leaked = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", f"feoh_{slug}")
+    finally:
+        await conn.close()
+    assert leaked is None
+    mk = realdb.control_sessionmaker()
+    async with mk() as s:
+        orgs = (await s.execute(select(Organization).where(Organization.slug == slug))).all()
+    assert orgs == []
+
+
+# ---------------------------------------------------------------------------
+# Re-opening a used verification link (decisions §292)
+#
+# /verify redeems on page load, so a reload or a second tab used to get the 410
+# "invalid, sign up again" — and signing up again then failed on the slug the
+# link had just claimed.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_used_link_is_re_answered_with_its_workspace_and_issues_nothing(
+    realdb, monkeypatch, cleanup_signup
+):
+    from app.api import signup as signup_mod
+
+    _, emails = cleanup_signup
+    info = realdb.info("a")
+    email = realdb.email("a", "admin")
+    # The link that created tenant "a": its slug, its admin, already used.
+    token = await _seed_verification(realdb, slug=info.slug, email=email, consumed=True)
+    emails.append(email)
+    provision = AsyncMock()
+    monkeypatch.setattr(signup_mod, "provision_tenant", provision)
+    issue = AsyncMock()
+    monkeypatch.setattr(signup_mod.password_reset, "issue_reset_token", issue)
+    capture = _CaptureAdapter()
+    monkeypatch.setattr(signup_mod, "get_email_adapter", lambda: capture)
+
+    async with realdb.client(key="a", role=None) as c:
+        first = await c.post("/api/signup/complete", json={"token": token})
+        second = await c.post("/api/signup/complete", json={"token": token})
+
+    for resp in (first, second):
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["already_verified"] is True
+        assert body["slug"] == info.slug
+        assert body["admin_email"] == email
+        assert body["sign_in_url"].startswith(f"{body['tenant_url']}/login?email=")
+        # Nothing sensitive is re-issued.
+        assert body["set_password_url"] is None
+        assert resp.headers["cache-control"] == "no-store"
+    provision.assert_not_awaited()
+    issue.assert_not_awaited()
+    assert capture.sent == []
+
+
+async def test_a_first_redemption_is_not_flagged_as_already_verified(
+    realdb, monkeypatch, cleanup_signup
+):
+    body, _msg, email = await _complete_capturing(realdb, monkeypatch, cleanup_signup)
+    assert body["already_verified"] is False
+    assert body["sign_in_url"] == (f"{body['tenant_url']}/login?email={quote(email, safe='')}")
+
+
+async def test_a_used_link_whose_slug_belongs_to_someone_else_stays_410(realdb, cleanup_signup):
+    """Spent, and the workspace on its slug is not this address's: nothing to
+    re-answer, so the uniform 410 — never another tenant's details."""
+    _, emails = cleanup_signup
+    email = f"{_unique_slug()}@example.com"
+    emails.append(email)
+    token = await _seed_verification(realdb, slug=realdb.info("a").slug, email=email, consumed=True)
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/complete", json={"token": token})
+    assert resp.status_code == 410
+    assert resp.json()["detail"]["code"] == "signup_link_invalid"
+    assert "invalid or has expired" in resp.json()["detail"]["message"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1463,7 @@ def test_a_deployed_env_with_signup_closed_needs_no_captcha_secret():
         hcaptcha_secret="",
         secret_key=strong_key,
         signup_enabled=False,
+        subprocessor_notices_enabled=True,
     )
     assert closed.is_deployed is True
     assert closed.signup_enabled is False
@@ -1228,3 +1477,99 @@ def test_a_deployed_env_with_signup_closed_needs_no_captcha_secret():
             secret_key=strong_key,
             signup_enabled=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Every refusal is coded (issue #635 finding 18)
+#
+# The signup and verify pages state a refusal in the visitor's language from
+# its `code` (frontend `api/codedRefusals.ts`), and put it under the form field
+# `params.field` names. English `detail` strings were shown verbatim in all six
+# locales, and called the workspace address a "slug".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("slug", "code"),
+    [
+        ("1acme", "slug_format"),
+        ("acme-", "slug_hyphen_edge"),
+        ("ac--me", "slug_double_hyphen"),
+    ],
+)
+async def test_a_malformed_workspace_address_is_a_coded_refusal_about_its_field(
+    realdb, cleanup_signup, slug, code
+):
+    _, emails = cleanup_signup
+    email = f"{_unique_slug()}@example.com"
+    emails.append(email)
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/start", json=_start_body(slug, email))
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == code
+    assert detail["params"] == {"field": "slug", "slug": slug}
+    assert "slug" not in detail["message"].lower()
+
+
+async def test_the_verification_email_is_written_in_the_locale_the_form_sent(
+    realdb, monkeypatch, cleanup_signup
+):
+    """The form sends the visitor's UI locale; the email reads in it."""
+    from app.api import signup as signup_mod
+    from app.services.email_adapters import translate
+
+    slugs, emails = cleanup_signup
+    slug = _unique_slug()
+    email = f"{slug}@example.com"
+    slugs.append(slug)
+    emails.append(email)
+    capture = _CaptureAdapter()
+    monkeypatch.setattr(signup_mod, "get_email_adapter", lambda: capture)
+
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/start", json=_start_body(slug, email) | {"locale": "fr"})
+    assert resp.status_code == 200, resp.text
+    (msg,) = capture.sent
+    assert msg.locale == "fr"
+    assert msg.subject == translate("signup.verify.subject", "fr")
+    assert msg.subject != translate("signup.verify.subject", "en")
+
+
+async def test_an_email_that_cannot_be_sent_is_a_coded_refusal(realdb, monkeypatch, cleanup_signup):
+    from app.api import signup as signup_mod
+
+    slugs, emails = cleanup_signup
+    slug = _unique_slug()
+    email = f"{slug}@example.com"
+    slugs.append(slug)
+    emails.append(email)
+
+    class _Down:
+        async def send(self, message) -> None:  # noqa: ARG002
+            raise RuntimeError("smtp down")
+
+    monkeypatch.setattr(signup_mod, "get_email_adapter", lambda: _Down())
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/start", json=_start_body(slug, email))
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["code"] == "signup_email_send_failed"
+    assert resp.json()["detail"]["params"] == {}
+
+
+async def test_a_provisioning_failure_is_a_coded_refusal(realdb, monkeypatch, cleanup_signup):
+    from app.api import signup as signup_mod
+
+    slugs, emails = cleanup_signup
+    slug = _unique_slug()
+    email = f"{slug}@example.com"
+    slugs.append(slug)
+    emails.append(email)
+    token = await _seed_verification(realdb, slug=slug, email=email)
+    monkeypatch.setattr(signup_mod, "provision_tenant", AsyncMock(side_effect=RuntimeError("boom")))
+
+    async with realdb.client(key="a", role=None) as c:
+        resp = await c.post("/api/signup/complete", json={"token": token})
+    assert resp.status_code == 500
+    assert resp.json()["detail"]["code"] == "signup_provisioning_failed"
+    assert (await _verification_row(realdb, token)).consumed_at is None

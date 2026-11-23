@@ -9,12 +9,22 @@
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import Money from '#lib/components/ui/Money.svelte';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
+	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
-	import { portalPaymentStatusLabelKey, PORTAL_PAYMENT_PHASES } from '#lib/types/portalStatus.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import {
+		portalPaymentStatusLabelKey,
+		portalPaymentStatusTone,
+		PORTAL_PAYMENT_PHASES
+	} from '#lib/types/portalStatus.ts';
+	import Badge from '#lib/components/ui/Badge.svelte';
 	import PortalListFilters from '#lib/components/portal/PortalListFilters.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
+	import { paymentMethodLabelKey } from '#lib/types/payment.ts';
 
 	type PortalPayment = PortalPaymentListItem;
 
@@ -26,6 +36,9 @@
 	let loading = $state(false);
 	let loadingMore = $state(false);
 	let error = $state('');
+	// A failed first-page read — kept apart from `error` so it is never
+	// rendered as "no payments yet" (see the invoice list).
+	let loadError = $state('');
 	let downloading = $state<string | null>(null);
 
 	const hasMore = $derived(items.length < total);
@@ -103,6 +116,7 @@
 		if (opts.append) loadingMore = true;
 		else loading = true;
 		error = '';
+		if (!opts.append) loadError = '';
 		try {
 			const res = await listPortalPayments({
 				page: nextPage,
@@ -119,7 +133,14 @@
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit` — a superseded load still failed.
 			if (!fetchSequence.isCurrentRequest(token)) return;
-			error = err instanceof Error ? err.message : m('portal.payments.loadFailed');
+			const msg = err instanceof Error ? err.message : m('portal.payments.loadFailed');
+			if (opts.append) {
+				error = msg;
+			} else {
+				items = [];
+				total = 0;
+				loadError = msg;
+			}
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) {
 				loading = false;
@@ -153,6 +174,14 @@
 		}
 	}
 
+	// The rail is a backend enum (`virtual_card`, `faster_payments`); render its
+	// label, and the raw value only for a rail this build does not know.
+	function methodLabel(method: string | null): string {
+		if (!method) return m('portal.common.dash');
+		const key = paymentMethodLabelKey(method);
+		return key ? m(key) : method;
+	}
+
 	onMount(refresh);
 </script>
 
@@ -177,7 +206,9 @@
 	/>
 
 	{#if loading && !items.length}
-		<div class="loading">{m('portal.common.loading')}</div>
+		<LoadingState label={m('portal.common.loading')} />
+	{:else if loadError}
+		<LoadError message={loadError} onretry={refresh} testId="portal-payments-load-error" />
 	{:else if !items.length}
 		<div class="empty">
 			{#if filtered}
@@ -191,28 +222,32 @@
 			{/if}
 		</div>
 	{:else}
-		<table>
-			<thead>
-				<tr>
-					<th>{m('portal.payments.col.invoiceNumber')}</th>
-					<th>{m('portal.payments.col.submitted')}</th>
-					<th>{m('portal.payments.col.completed')}</th>
-					<th>{m('portal.payments.col.method')}</th>
-					<th class="num">{m('portal.payments.col.amount')}</th>
-					<th>{m('portal.payments.col.status')}</th>
-					<th>{m('portal.payments.col.reference')}</th>
-					<th class="actions-col"></th>
-				</tr>
-			</thead>
-			<tbody>
+		<!-- DataTable: eight columns scroll inside a named, focusable region
+		     at narrow widths instead of overflowing the page (WCAG 1.4.10). -->
+		<DataTable
+			ariaLabel={m('portal.payments.tableAria')}
+			columns={[
+				{ label: m('portal.payments.col.invoiceNumber') },
+				{ label: m('portal.payments.col.submitted') },
+				{ label: m('portal.payments.col.completed') },
+				{ label: m('portal.payments.col.method') },
+				{ label: m('portal.payments.col.amount'), class: 'right' },
+				{ label: m('portal.payments.col.status') },
+				{ label: m('portal.payments.col.reference') },
+				{}
+			]}
+		>
+			{#snippet body()}
 				{#each items as p (p.id)}
 					<tr>
 						<td>{p.invoice_number}</td>
 						<td>{formatDate(p.submitted_at, m('portal.common.dash'))}</td>
 						<td>{formatDate(p.completed_at, m('portal.common.dash'))}</td>
-						<td>{p.method || m('portal.common.dash')}</td>
-						<td class="num"><Money amount={p.amount} currency={p.currency} /></td>
-						<td><span class="status s-{p.status}">{m(portalPaymentStatusLabelKey(p.status))}</span></td>
+						<td>{methodLabel(p.method)}</td>
+						<td class="right"><Money amount={p.amount} currency={p.currency} mono /></td>
+						<td><Badge tone={portalPaymentStatusTone(p.status)} variant="status-badge {p.status}"
+								>{m(portalPaymentStatusLabelKey(p.status))}</Badge
+							></td>
 						<td>{p.reference || m('portal.common.dash')}</td>
 						<td class="actions">
 							{#if p.status === 'completed'}
@@ -228,27 +263,19 @@
 						</td>
 					</tr>
 				{/each}
-			</tbody>
-		</table>
+			{/snippet}
+		</DataTable>
 
-		{#if hasMore}
-			<div class="load-more-row">
-				<button
-					type="button"
-					class="btn-load-more"
-					onclick={() => load({ append: true })}
-					disabled={loadingMore}
-				>
-					{loadingMore
-						? m('portal.common.loading')
-						: m('portal.payments.loadMore', { shown: items.length, total })}
-				</button>
-			</div>
-		{:else if total > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('portal.payments.showingAll', { total })}</span>
-			</div>
-		{/if}
+		<LoadMoreFooter
+			shown={items.length}
+			{total}
+			{hasMore}
+			loading={loadingMore}
+			onloadmore={() => load({ append: true })}
+			moreKey="portal.payments.loadMore"
+			allKey="portal.payments.showingAll"
+			loadingKey="portal.common.loading"
+		/>
 	{/if}
 </div>
 
@@ -264,42 +291,8 @@
 		margin: 0;
 		font-size: 1.25rem;
 	}
-	table {
-		width: 100%;
-		border-collapse: collapse;
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		overflow: hidden;
-	}
-	th,
-	td {
-		text-align: left;
-		padding: 10px 12px;
-		font-size: 0.88rem;
-		border-bottom: 1px solid var(--border);
-	}
-	th {
-		background: var(--bg);
-		color: var(--text-muted);
-		font-weight: 500;
-		text-transform: uppercase;
-		font-size: 0.72rem;
-		letter-spacing: 0.04em;
-	}
-	tbody tr:last-child td {
-		border-bottom: none;
-	}
-	.num {
-		text-align: right;
-		font-variant-numeric: tabular-nums;
-	}
-	.actions {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		white-space: nowrap;
-	}
+	/* Table chrome (padding, borders, header, `.right`, `td.actions`) is
+	   app.css's `.grid-container`, owned by DataTable. */
 	.remit-btn {
 		padding: 4px 12px;
 		border: 1px solid var(--border);
@@ -317,30 +310,7 @@
 		opacity: 0.6;
 		cursor: default;
 	}
-	.status {
-		padding: 2px 8px;
-		border-radius: 3px;
-		font-size: 0.75rem;
-		background: var(--bg);
-		border: 1px solid var(--border);
-	}
-	.s-completed {
-		background: rgba(40, 160, 80, 0.15);
-		border-color: rgba(40, 160, 80, 0.4);
-	}
-	.s-failed {
-		background: rgba(224, 64, 64, 0.12);
-		border-color: rgba(224, 64, 64, 0.35);
-	}
 	.empty,
-	.loading {
-		padding: 40px;
-		text-align: center;
-		background: var(--surface);
-		border: 1px dashed var(--border);
-		border-radius: 4px;
-		color: var(--text-muted);
-	}
 	.empty .hint {
 		font-size: 0.82rem;
 	}
@@ -356,8 +326,8 @@
 		text-decoration: underline;
 	}
 	.error {
-		background: rgba(224, 64, 64, 0.1);
-		border: 1px solid rgba(224, 64, 64, 0.3);
+		background: color-mix(in srgb, var(--danger) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 		color: var(--danger);
 		padding: 10px 14px;
 		border-radius: 4px;

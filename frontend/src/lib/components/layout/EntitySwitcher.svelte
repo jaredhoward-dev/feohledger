@@ -142,7 +142,12 @@
 		color: var(--text);
 		cursor: pointer;
 		font-family: inherit;
-		transition: all 0.12s;
+		/* The border, and only the border — the one thing hover changes. `all`
+		   also animated the background and text colour across a theme change,
+		   and for those 120ms the "Entity" hint sat on a half-way grey at
+		   3.41:1 (#635); the colours swap at once now, like the rest of the
+		   rail. */
+		transition: border-color 0.12s;
 	}
 
 	.entity-btn:hover {
@@ -244,7 +249,7 @@
 	}
 
 	.entity-option:not(:disabled):hover {
-		background: rgba(99, 140, 255, 0.08);
+		background: color-mix(in srgb, var(--accent) 8%, transparent);
 	}
 
 	/* De-emphasised with the muted TOKEN, never `opacity` — a fade composites
@@ -256,7 +261,7 @@
 	}
 
 	.entity-option.selected {
-		background: rgba(99, 140, 255, 0.12);
+		background: color-mix(in srgb, var(--accent) 12%, transparent);
 		color: var(--accent);
 	}
 

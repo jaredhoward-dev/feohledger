@@ -30,8 +30,9 @@ When an ingested file is a **structured** e-invoice — UBL 2.1 (PEPPOL BIS
 Billing 3.0), standalone UN/CEFACT CII, or a Factur-X / ZUGFeRD hybrid PDF/A-3 —
 it is parsed deterministically instead of going through a vision model.
 
-- **Auto-detect on ingest.** `extraction.run_extraction` calls
-  `_detect_structured_format(file_bytes, file_key)` right after the S3 fetch
+- **Auto-detect on ingest.** `extraction.run_extraction` runs
+  `_detect_structured_format(file_bytes, file_key)` on a worker thread
+  (`asyncio.to_thread`; it may open a PDF) right after the S3 fetch
   (the single choke point both upload and email intake reach). A structured file
   overrides the org's configured adapter with the `einvoice` adapter and passes
   the real mime (XML vs PDF) into `adapter.extract`. A plain scanned PDF (no
@@ -127,6 +128,14 @@ cd backend && .venv/bin/pip install -e ".[dev]"
 
 PyMuPDF is included in the project dependencies (`pyproject.toml`).
 
+Every read goes through `app/services/pdf_reader.py`, the one module that opens
+a PDF with PyMuPDF. Adapters `await pdf_reader.pdf_text(...)` for the text layer
+and `await pdf_reader.rasterize_pages(...)` for the page images (with the
+auto-rotate pass above); both run on a worker thread, because rendering a
+20-page scan at 200 dpi on the event loop would stall every other request on
+the worker. `tests/test_pdf_render_offloaded.py` refuses a `pymupdf.open`
+anywhere else and a coroutine calling one of the sync cores directly.
+
 ## Extraction Flow
 
 ```
@@ -138,7 +147,7 @@ Dispatch (local or Lambda)
     v
 Resolve Config
     ├── Platform → use app-level Anthropic key (FEOH_ANTHROPIC_API_KEY)
-    └── BYOK → use customer's key from org.settings.extraction
+    └── BYOK → use customer's key, sealed (provider_credentials.byok_extraction_config)
     |
     v
 Structured e-invoice? → `einvoice` adapter (no model, never billed)
@@ -238,6 +247,32 @@ statement cell can't drift apart:
   cleaners and into `run_self_correction`, so the header, the lines and the
   checker can't be read under different rules.
 
+### A currency code printed beside the figure
+
+A model transcribing the printed total often keeps the code the page prints:
+`GBP 9,500.00`, `1,234.56 USD`. `_amount_core_and_codes` strips the code so the
+magnitude parses, and **returns it** — it is the document stating that figure's
+currency, not decoration (`docs/decisions.md` §308). `extraction_currency_evidence`
+collects the codes from every money token that parses (the same header + line
+set the convention vote reads) and weighs them against the model's `currency`
+field (`CurrencyEvidence`):
+
+| `currency` field | Codes printed on the amounts | Result |
+|---|---|---|
+| `GBP` | none, or `GBP` | currency `GBP`, money read |
+| empty / not a code | `GBP` | currency `GBP` from the code — never the upload's `USD` placeholder |
+| `EUR` | `USD` | **conflict** — no header money is written, currency left as it was |
+| any | `GBP` and `USD` | **conflict** — same |
+| empty | none | row keeps its currency (see `docs/followups.md` on the `USD` default) |
+
+On a conflict the amount stays at the upload's `0`, so `missing_amount` fires
+and `decide_auto_approve` refuses it — a zero or negative amount never
+auto-approves on either trigger. `tax_rate` (a percentage) is still read. The
+self-correction pass names the conflict to the reviewer
+(`self_correction_currency_conflict` / `self_correction_currency_mixed`) and
+docks `amount` / `currency`. A symbol (`€`, `$`) is not evidence — `$` alone
+names a dozen currencies.
+
 ### Date disambiguation (DD/MM vs MM/DD)
 
 A numeric date like `03/04/2026` is the same class of problem as the amount
@@ -276,10 +311,14 @@ CSV and PDF-statement intake paths, via `parse_date`).
 
 Runs after `_apply_extraction()`, before line items are saved. Implemented in `services/extraction_self_correction.py`.
 
-**Invariant checks (4):**
+**Invariant checks (5):**
 
 1. **Total reconciliation** — `|subtotal + tax_amount + shipping_amount - discount_amount - amount| / amount <= 2%` (skipped when no subtotal was extracted)
-2. **Date ordering** — `due_date >= invoice_date`
+2. **Date ordering** — `due_date >= invoice_date`, with both dates read by
+   `extraction._clean_date` under the org's day-first preference — the same
+   reading `_apply_extraction` stored them under. It used to accept ISO only, so
+   a swapped `28/10/2026` / `28/09/2026` pair (or `March 15, 2026`) went
+   unchecked.
 3. **Line items sum** — `sum(line_item.total)` must reconcile with the header by
    `invoice_warnings.line_total_reconciles`, the **same definition the
    payment-blocking `line_total_mismatch` check uses**: within one cent of
@@ -291,7 +330,16 @@ Runs after `_apply_extraction()`, before line items are saved. Implemented in `s
    the payment gate itself accepted (issue #566). The gate's absolute cent
    replaced the 2 % slop so the two checks cannot disagree in either direction.
    See `line-total-reconciliation.md`.
-4. **Line item math** — per line: `|quantity * unit_price - total| / total <= 1%`
+4. **Line item math** — per line: `|quantity * unit_price - total| / total <= 1%`,
+   or, when the line states its own `tax`, the same test against
+   `quantity * unit_price + tax` — a Net / VAT / Gross invoice whose model read
+   reports the net unit price and the gross line total is consistent, and was
+   flagged on every line until #575.
+5. **Currency evidence** — the ISO codes printed on the amounts agree with each
+   other and with the `currency` field (see *A currency code printed beside the
+   figure* above). The writer already refused the money on a conflict, whether
+   or not this pass runs; this check is what tells the reviewer why, and it
+   docks `amount` and `currency`.
 
 **On violation:**
 
@@ -300,6 +348,46 @@ Runs after `_apply_extraction()`, before line items are saved. Implemented in `s
 - Results stored in `InvoiceExtractionResult.priors_metadata.self_correction`
 
 Controlled by `org_settings.extraction.self_correction_enabled` (default: true).
+
+### Golden extraction cases
+
+`tests/test_extraction_golden.py` replays real-shaped Claude answers through the
+real pipeline, so the mock adapter's conventions (tax-inclusive lines, bare
+`"1234.56"` strings, USD) are not the only ones tested (issue #575). Each case
+is a PDF plus the recorded Messages API response for it, in
+`tests/fixtures/extraction_golden/`:
+
+| Case | What it covers |
+|---|---|
+| `us_tax_exclusive` | USD, net lines, header subtotal + sales tax + shipping, `$1,156.00` strings |
+| `gb_vat_inclusive` | GBP Net / VAT / Gross columns: net unit price, line VAT, gross line total |
+| `eur_multipage` | EUR decimal commas (`1.180,00`, qty `12,5`), `EUR 8.739,84`, 16 lines over two pages with a carry-forward row |
+| `jpy_zero_decimal` | JPY `¥176,440` (every token the ambiguous shape), `null` due date / PO |
+| `us_scanned` | Image-only PDF; a `thinking` block, a ```` ```json ```` fence, JSON numbers, a numeric SKU, `N/A` and `string or null` sentinels |
+| `inconsistent_gb` | A wrong read: transposed total, dropped line, misread unit price, swapped day-first dates. All four self-checks must fire, and the payment gate must refuse the lines too |
+
+The replay swaps only httpx's transport (`httpx.MockTransport`). The adapter's
+request build, the response-block walk, the fence strip, `_apply_extraction`,
+`extracted_line_values`, the decimal-convention vote, `run_self_correction` and
+`reconcile_line_totals` all run for real. A correct case must extract exactly
+the stated `Decimal`s and raise **no** self-check flag or confidence penalty.
+
+**To add a case:**
+
+1. Add a builder to `tests/fixtures/extraction_golden/generate.py` that returns
+   the page layout and the recorded answer, and register it in `CASES`. Use
+   invented vendors, addresses and tax ids only. Never record a response from
+   the real API against a customer document. Write the answer the way a current
+   model writes it, quirks included, not the way the mock does.
+2. Run `.venv/bin/python tests/fixtures/extraction_golden/generate.py` from
+   `backend/`. ReportLab runs with `invariant=1`, so unchanged cases regenerate
+   byte-identical files.
+3. Add a `Golden(...)` entry to `test_extraction_golden.py` with the expected
+   values **written out literally**. Do not derive them from the generator,
+   because then a fixture change would rewrite its own expectations.
+4. If the case fails, the fix goes in the parser, the cleaners or the
+   self-check, with the case as its regression test. Do not change the
+   recorded answer or loosen the expectation to make it pass.
 
 ### Auto-Approve on Confidence
 
@@ -391,7 +479,7 @@ Even with the chart pinned in the prompt, the model can still hallucinate a plau
 {
   "type": "gl_account_invalid",
   "severity": "warning",
-  "message": "AI suggested GL code(s) not in active chart: 9999",
+  "message": "GL code(s) not in the active chart of accounts, left uncoded: 9999",
   "codes": ["9999"]
 }
 ```
@@ -440,7 +528,7 @@ default priors-only pass to size how many priors the chart rejected.
 
 Each persisted change writes an `invoice.gl_recoded` audit-log row with `{old_gl, new_gl, source, bulk_run_at}` so the activity is traceable on the invoice's history.
 
-Frontend: "Bulk Re-code GL" toolbar button on `/invoices` (admin-only) opens a preview-then-apply modal in `frontend/src/lib/components/BulkRecodeGLModal.svelte`.
+Frontend: "Bulk Re-code GL" toolbar button on `/invoices` (admin-only) opens a preview-then-apply modal in `frontend/src/lib/components/modals/BulkRecodeGLModal.svelte`.
 
 ## ExtractionResult Structure
 
@@ -515,7 +603,7 @@ A refused read is **not a failure**. The invoice:
 - gets a coded, localizable warning — `ai_allowance_reached` (with the
   allowance as `included`) or `ai_spend_cap_reached`, type
   `ai_reading_paused` — telling the user AI reading is paused and how to resume
-  (upgrade the plan / raise the cap on the Billing page);
+  (upgrade the plan / raise the cap under Settings → Subscription);
 - transitions `pending → new` (`invoice.ai_reading_paused` audit row) — the
   draft state an extraction-disabled upload is left in — so it is keyed by hand
   and then submitted, approved, matched and paid like any other invoice.
@@ -546,11 +634,39 @@ BYOK example:
 {
   "extraction": {
     "program_type": "byok",
-    "provider": "openai_vision",
-    "api_key": "sk-..."
+    "provider": "openai_vision"
   }
 }
 ```
+
+**The BYOK key is not in this block.** `api_key` (`claude_vision` /
+`openai_vision`) and `aws_secret_access_key` (`aws_textract`) are sealed in
+`provider_credentials` (block `extraction`, envelope-encrypted under the app
+KMS key), written only through `PUT /api/organization/credentials/extraction`
+and never returned — the settings panel shows a "leave blank to keep" field
+and `GET /api/organization/credentials` reports which are stored, by name.
+`aws_access_key_id` is an identifier and stays here. `PATCH
+/api/organization` refuses a non-blank key in the block, and a save that
+changes `provider` drops the sealed key (audited as
+`organization.credentials_updated`, reason `extraction_provider_changed`):
+`claude_vision` and `openai_vision` share the `api_key` slot, so keeping it
+would send one vendor's secret to the other. The settings panel follows that
+rule before the save: it remembers the provider the stored key belongs to, so
+once the dropdown names another one the key field stops saying a key is stored
+and a hint says the save drops it; a save that would drop the key while the new
+provider's key field is blank is refused with the field marked, since it would
+leave BYOK keyless (Ollama needs no key and is not refused). Platform mode
+resends the saved provider, so a choice the hidden dropdown still holds cannot
+drop the key. Every reader — extraction, the
+GL-only re-read, statement reads, and the three side features that may reuse
+a `claude_vision` key (audit summary, LLM anomaly check, exception-agent
+rationale) — opens it through `provider_credentials.byok_extraction_config`,
+which ignores a stray plaintext key in the JSONB and never opens the store for
+a platform-mode org. `POST /api/organization/test-extraction` joins the stored
+key to an unsaved form only when the form names the saved provider. A store
+that cannot open the key fails the read closed (the invoice lands `failed`; a
+statement upload gets a 422). Migration `0135_seal_extraction_sso` moved
+every existing plaintext key.
 
 A BYOK `claude_vision` org may also set `"model"` (any current Claude model id;
 empty → the platform default) and `"effort"` (`output_config.effort`; omitted
@@ -942,7 +1058,7 @@ The disclosure problem was real too: `matches_to_warning` put the matched invoic
 
 A NULL `entity_id` on either side means *unstamped* (a pre-multi-entity row, or a single-entity tenant), **not** "some other entity" — so single-entity tenants, the overwhelming majority, see no change at all. When both a same-entity and a cross-entity match exist, the headline is built from the same-entity one (the viewer can act on that and needs the identifiers) with a bare count of the cross-entity ones appended.
 
-The `duplicate` Exception is in `api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`, so a cross-entity hit still blocks the payment run until a human clears it. That is intended: a suspected intra-group double-bill wants the human sign-off, and the clearing path is unchanged.
+The `duplicate` Exception is in `services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`, so a cross-entity hit still blocks the payment run until a human clears it. That is intended: a suspected intra-group double-bill wants the human sign-off, and the clearing path is unchanged.
 
 ### Threshold rationale
 

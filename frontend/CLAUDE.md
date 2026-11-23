@@ -114,6 +114,14 @@ resolves `cookie@0.7.2` and `undici@8.10.0`, so neither override matches
 anything today. They exist to block a *future* transitive downgrade onto a
 vulnerable version — which is exactly why losing one is easy to miss.
 
+An advisory with no fixed release is answered with a local `pnpm patch`
+(`pnpm.patchedDependencies`) plus a guard test that fails if the patch stops
+applying, and only then an ID-scoped ignore in `pnpm.auditConfig.ignoreGhsas`
+and the root `osv-scanner.toml`; an ignore without a patch, or a patch without
+the guard, is not enough (decisions §352). None is in place today: the one
+there was, deepmerge's GHSA-gcqx-w48m-w2h4, was withdrawn upstream and all
+four pieces went with it (decisions §484).
+
 Two Dependabot npm PRs (#344, #351) arrived with the lockfile's whole
 `overrides:` block deleted, red on every job that installs:
 
@@ -194,16 +202,12 @@ project actually uses.
 
 Two consequences worth knowing before you touch either half:
 
-- **Bumping the floor is a two-file-set edit**, not one. Raising
-  `node-version:` means checking every other place a Node version is written
-  down. There is no `.nvmrc`, no `engines` block in either `package.json`, and
-  no Node Dockerfile in the app tree — but the production frontend builds in
-  `deploy/compose.prod.yml`'s `frontend-build` service, a
-  `node:<major>-alpine` image (`docs/minimal-deployment.md`). **Both halves
-  move together**: Dependabot ignores that image's majors, and
-  `backend/tests/test_container_supply_chain.py` fails when its major differs
-  from any `node-version:`, because a deploy image behind CI builds production
-  on a runtime CI never tested.
+- **Bumping the floor is a workflow-set edit**: every `node-version:` above,
+  and nowhere else. There is no `.nvmrc`, no `engines` block in either
+  `package.json`, and no Node image in the app tree. The production SPA builds
+  in CI too (`vm-deploy.yml`'s `build-frontend` job, on `setup-node`); the VM's
+  `node:<major>-alpine` build service went in `docs/decisions.md` §364, so
+  there is no second Node version to keep in step.
 - **The `# vN.N.N` comment beside a `setup-node@<sha>` pin is documentation,
   not the pin.** Eight of the nine sites carried `# v6.0.0` against a SHA that
   is really `v7.0.0`; Scorecard's PinnedDependencies check reads the SHA and
@@ -234,11 +238,11 @@ All data fetching goes through this module. Never call `fetch()` directly for AP
 
 - Auto-adds `Authorization: Bearer <token>` from localStorage
 - Auto-adds `X-Tenant-Slug` header from subdomain
-- 401 responses clear token and redirect to `/login`
+- A 401, or a 403 coded `token_tenant_mismatch` (a token for another workspace), clears the token and redirects to `/login` (`endSessionIfRejected`; the second adds `?reason=other_workspace`, decisions §288), with `?next=` naming the page the user was on. **Any `next` is read and written only through `#lib/utils/postLoginRedirect.ts`** — it is the open-redirect gate (`docs/authentication.md` § Sign-in returns to the page asked for). Every raw-`fetch` path that bypasses `request()` calls the same helper
 - Methods: `api.get<T>()`, `api.post<T>()`, `api.patch<T>()`, `api.put<T>()`, `api.delete()`, `api.upload<T>()`
 - Token helpers: `setToken()`, `clearToken()`, `hasToken()`
-- **Error messages** — every non-OK response is thrown as an `ApiError` whose message comes from `formatApiDetail(body.detail, fallback)` (`src/lib/utils/apiError.ts`, re-exported from `api.ts`). FastAPI's `detail` is **not always a string**: a Pydantic 422 carries a LIST of `{loc, msg, type}`, which the old `body.detail || fallback` stringified as literally `"[object Object]"` in the toast. The helper renders a string as-is, a validation list as `field: msg; field: msg` (dropping the `body`/`query` `loc` prefix), a lone `{msg}`/`{message}`, and falls back otherwise. It is pure (no `$env`, no `fetch`) so it lives in `utils/` and is unit-tested (`apiError.test.ts`). It deliberately FLATTENS to one string — a caller that needs the structure reads the raw body itself, which is why `api/expenses.ts::submitReport` still hand-rolls its own `fetch` to keep the policy-violation list intact. A **coded** detail (`{code, message, params}`, e.g. the step-up refusals) also lands its `code` / `params` on `ApiError` (`apiErrorCode` in the same file), so a page can localize on the code — see `api/authRefusals.ts` and `docs/i18n.md` § A coded refusal. The supplier portal's `portalApi.ts` builds its errors through the same `apiErrorFromBody`; it used to throw `new Error(body.detail || …)`, which rendered every 422 list and every coded detail as `"[object Object]"`. Every known coded refusal — the GL-chart refusal, the money-path refusals (SoD, CFO / max-amount gates, credit memos, stale edit) and the auth refusals — is additionally rendered first through the `api/codedRefusals.ts::localizeApiDetail` registry inside `apiErrorFromBody`, so its toast is in the reader's language (`docs/i18n.md` § A structured server refusal); `ApiError.detail` carries the raw body for a caller that needs it. **Branch on `ApiError.code`, never on `err.message`** — the message is localized, so an English substring match fails in every other locale.
-- **Streaming** — `streamAssistantChat(body, { onTool, onDelta, onDone, onError }, signal?)` streams the AP assistant turn from `POST /api/assistant/chat/stream` (`text/event-stream`). It uses `fetch` + `response.body.getReader()` (NOT `EventSource`, which can't set the Authorization / tenant / entity headers) and a small SSE parser (split on `\n\n`, read `event:`/`data:` lines), reusing the shared `authHeaders()` helper so the header logic can't drift from `request()`. SSE frames: `tool` (one per tool invocation; `result` carries the structured output for charts), `delta` (incremental answer text), `done` (authoritative payload), `error` (mid-stream failure). A pre-stream HTTP 429 throws `AssistantBudgetError` (carries `used`/`budget`/`period`); any other non-OK / network failure throws a plain `Error` — the `/assistant` page catches both and falls back to the non-streaming `POST /api/assistant/chat`.
+- **Error messages** — every non-OK response is thrown as an `ApiError` whose message comes from `formatApiDetail(body.detail, fallback)` (`src/lib/utils/apiError.ts`, re-exported from `api.ts`). FastAPI's `detail` is **not always a string**: a Pydantic 422 carries a LIST of `{loc, msg, type}`, which the old `body.detail || fallback` stringified as literally `"[object Object]"` in the toast. The helper renders a string as-is, a validation list as `field: msg; field: msg` (dropping the `body`/`query` `loc` prefix), a lone `{msg}`/`{message}`, and falls back otherwise. It is pure (no `$env`, no `fetch`) so it lives in `utils/` and is unit-tested (`apiError.test.ts`). It deliberately FLATTENS to one string — a caller that needs the structure reads the raw body itself, which is why `api/expenses.ts::submitReport` still hand-rolls its own `fetch` to keep the policy-violation list intact. A **coded** detail (`{code, message, params}`, e.g. the step-up refusals) also lands its `code` / `params` on `ApiError` (`apiErrorCode` in the same file), so a page can localize on the code — see `api/authRefusals.ts` and `docs/i18n.md` § A coded refusal. The supplier portal's `portalApi.ts` builds its errors through the same `apiErrorFromBody`; it used to throw `new Error(body.detail || …)`, which rendered every 422 list and every coded detail as `"[object Object]"`. Every known coded refusal — the GL-chart refusal, the money-path refusals (SoD, CFO / max-amount gates, credit memos, stale edit) and the auth refusals — is additionally rendered first through the `api/codedRefusals.ts::localizeApiDetail` registry inside `apiErrorFromBody`, so its toast is in the reader's language (`docs/i18n.md` § A structured server refusal); `ApiError.detail` carries the raw body for a caller that needs its structure — never display it (a coded detail is an object: `[object Object]`); show `utils/apiError.ts::errorMessage(err, fallback)`, ratcheted by `utils/errorDetailDisplay.test.ts`. **The signed-out auth pages** (login, MFA, reset, signup, verify, find-workspace, the portal's sign-in steps, `components/auth/`) use the stricter `apiErrorMessage(err, fallback)`, which also drops a network `TypeError`, a passkey `DOMException`, a bodyless response and any uncoded 5xx to the localized fallback (a coded 5xx, like signup's 502 `signup_email_send_failed`, is written for the reader and kept); `utils/authRoutesErrorText.test.ts` bans `.message` reads there. **Branch on `ApiError.code`, never on `err.message`** — the message is localized, so an English substring match fails in every other locale.
+- **Streaming** — `streamAssistantChat(body, { onTool, onDelta, onDone, onError }, signal?)` streams the AP assistant turn from `POST /api/assistant/chat/stream` (`text/event-stream`). It uses `fetch` + `response.body.getReader()` (NOT `EventSource`, which can't set the Authorization / tenant / entity headers) and a small SSE parser (split on `\n\n`, read `event:`/`data:` lines), reusing the shared `authHeaders()` helper so the header logic can't drift from `request()`. SSE frames: `tool` (one per tool invocation; `result` carries the structured output for charts), `delta` (incremental answer text), `done` (authoritative payload), `error` (mid-stream failure). A pre-stream HTTP 429 throws `AssistantBudgetError` (carries `used`/`budget`/`period`) **only when its `detail` carries a numeric `budget`** (`api/assistantBudget.ts`); any other 429 — the shared limiter's `rate_limited` — throws the localized `ApiError` from `apiErrorFromBody`. Any other non-OK / network failure throws a plain `Error`, and only that one makes `/assistant` (and `/cash-flow`) fall back to the non-streaming `POST /api/assistant/chat`; a refusal is shown, not retried.
 - Typed feature helpers wrap `api` per domain — e.g. `src/lib/api/audit.ts` (`getInvoiceAuditLog`, `getAuditExport`, `downloadAuditExportCsv`) over the SOX audit endpoints, with `AuditEntry` / `AuditFieldChange` types in `src/lib/types/audit.ts`. The invoice-modal Activity timeline renders `details.changes` (per-field before/after) from these. `src/lib/api/tax.ts` (`get1099Report`) wraps the 1099 endpoint, with `Report1099` / `Vendor1099Row` types in `src/lib/types/tax.ts`.
 
 ### Money formatting — `src/lib/utils/money.ts` + `ui/Money.svelte`
@@ -303,6 +307,19 @@ in all six locales; guide bodies under `src/lib/help/` are English, rendered
 `lang="en"`, and name every UI label with `{ui:key}` rather than typing it —
 `src/lib/help/content.test.ts` resolves each reference. See `docs/help-centre.md`.
 
+**Not every key lives in `locales/<loc>.ts`.** Strings only some routes render
+are lazy catalogue slices — `locales/help/`, `locales/settings/` (`org.*`,
+`orgSso.*`, `admin.*`, `billing.*`, `sweepHealth.*`), `locales/portal/` and
+`locales/marketing/` (the apex landing page, which awaits it itself) and
+`locales/audit/` (`/audit`'s action labels, `audit.action.*` /
+`audit.actionPattern.*`) —
+loaded by `ensureSlices()` from those routes' `+layout.ts` (decisions §261,
+§300). A new key under a slice prefix goes in the slice; a new route or shared
+component that renders slice keys must load the slice or keep the key in main.
+`src/lib/i18n/slices.test.ts` fails on either mistake and names the import
+chain. Tests that need a key's English text whichever chunk it is in read
+`#lib/i18n/allMessages.ts`, never the app.
+
 ### Tenant — `src/lib/tenant.ts` + `src/lib/hostRouting.ts`
 
 `hostRouting.ts` owns the pure rules ("what does this hostname mean") and is
@@ -333,6 +350,11 @@ simply stay unreachable until an operator opts in.
   an operator requirement (see `docs/white-label.md`).
 - `getTenantStorageKey()` — per-tenant browser-storage key (`#lib/entity.ts`):
   the slug on a platform host, the hostname on a vanity one.
+- `sharedCookieDomain()` — the `Domain` for a cookie every host of the
+  platform reads (apex + every workspace): only a build-declared domain
+  (`PUBLIC_PLATFORM_DOMAINS` or `PUBLIC_SITE_URL`'s host), never the legacy
+  host rule; `null` on localhost / IP / vanity hosts. Only the theme uses it
+  (decisions §290); per-workspace state must never go through it.
 
 `tenantSlugUsage.test.ts` ratchets both invariants: nothing re-derives the slug
 by hand, and the list of files still reading `PUBLIC_API_URL` directly may only
@@ -351,12 +373,13 @@ and the only way to exercise one on a laptop.
 
 | Store | File | State | Key methods |
 |-------|------|-------|-------------|
-| `auth` | `auth.svelte.ts` | `user` (incl. `mfa_enabled`, `mfa_required_by_org`, `password_sign_in_closed` — the server's own "is the password a step-up proof here" predicate, which `/profile` reads; never re-derive it from the public SSO `/config` echo, `docs/decisions.md` §201), `loggedIn`, role checks (`isAdmin`, `isManager`, `isCfo`, `isClerkOnly`) | `login()` (returns `{kind:'ok'} \| {kind:'mfa', challenge}` — MFA branch routes to `/login/mfa`), `completeMfa(token, code, method)`, `requestEmailMfa(token)`, `completePasskey(token)`, `listPasskeys()`, `passkeyStepUp(operation)` (mint + sign a factor-change step-up assertion), `registerPasskey(name, stepUp)`, `deletePasskey(id, stepUp)`, `listSessions()` / `revokeSession(id)` / `revokeOtherSessions()` (the caller's own live sessions — see the `/profile` row), `logout()`, `fetchUser()`, `hasRole()`, `hasAnyRole()`, `hasFeature(f)` (the plan features `/auth/me`'s `entitlements` lists — render `ui/PlanUpgradeNotice` instead of a control that 402s) |
+| `auth` | `auth.svelte.ts` | `userStatus` (`idle`/`loading`/`ready`/`error` — the `/me` load; the layout renders `layout/AccountLoadState` until `ready`), `user` (incl. `mfa_enabled`, `mfa_required_by_org`, `password_sign_in_closed` — the server's own "is the password a step-up proof here" predicate, which `/profile` reads; never re-derive it from the public SSO `/config` echo, `docs/decisions.md` §201), `loggedIn`, role checks (`isAdmin`, `isManager`, `isCfo`, `isClerkOnly`) | `login()` (returns `{kind:'ok'} \| {kind:'mfa', challenge}` — MFA branch routes to `/login/mfa`), `completeMfa(token, code, method)`, `requestEmailMfa(token)`, `completePasskey(token)`, `listPasskeys()`, `passkeyStepUp(operation)` (mint + sign a factor-change step-up assertion), `registerPasskey(name, stepUp)`, `deletePasskey(id, stepUp)`, `listSessions()` / `revokeSession(id)` / `revokeOtherSessions()` (the caller's own live sessions — see the `/profile` row), `logout()`, `fetchUser()` (never throws; latest request wins; a failed refresh keeps a loaded account), `hasRole()`, `hasAnyRole()`, `hasFeature(f)` (the plan features `/auth/me`'s `entitlements` lists — render `ui/PlanUpgradeNotice` instead of a control that 402s) |
 | `invoiceStore` | `invoices.svelte.ts` | `all`, `loading`, `errored`, `total`, `statusCounts` | `fetch(params)`, `fetchCounts(params)` (pass the list's `buildParams()` — the chip tallies are population-filtered too; own `countsSequence`), `update(id, changes)` |
 | `paymentStore` | `payments.svelte.ts` | `all`, `loading`, `errored`, `total`, `hasMore` | `fetch(params)`, `loadMore()` (history-tab Load-More; remembers filter params) |
 | `workflowStore` | `workflows.svelte.ts` | `all`, `loading`, `total`, `hasMore`, `activeSteps` | `fetch()`, `loadMore()`, `fetchActiveSteps()`, `getById()`, `create()`, `update()` |
 | `adminStore` | `admin.svelte.ts` | `users`, `roles`, `loading` | `fetchUsers()`, `fetchRoles()`, `createUser()`, `updateUser()`, `deleteUser()` |
-| `sidebar` | `sidebar.svelte.ts` | `collapsed` | `toggle()` |
+| `sidebar` | `sidebar.svelte.ts` | `collapsed`, `narrow` (viewport ≤ 700px, set by `+layout`'s `matchMedia`), `overlay` (`narrow && !collapsed` — the expanded panel floating over an inert page) | `toggle()`, `collapse()`, `setNarrow()` |
+| `theme` | `theme.svelte.ts` | `choice` (`system`/`light`/`dark`), `resolved` (the palette showing) | read at construction in the browser, so `resolved` is right before `+layout`'s effect runs; `init()` (from `+layout`) tracks the OS and re-applies, `set(choice)` — pure logic in `#lib/theme.ts` (decisions §289) |
 | `orgCurrency` | `orgSettings.svelte.ts` | `currency` (`string \| null`), `label` | `ensureLoaded()`, `reset()` — tenant REPORTING currency for aggregate money no payload labels; lazy-loads from `/api/organization` and resolves via `utils/reportingCurrency.ts` in the backend's order. **`null` when unresolved, never a USD guess** — figures render bare, forms take `?? DEFAULT_CURRENCY` themselves, labels read `label` (`docs/money-formatting.md`, decisions §200) |
 | `notificationStore` | `notifications.svelte.ts` | `items`, `unread`, **`inboxTotal`** (the WHOLE inbox, filter-independent — the All chip), **`filteredTotal`** (the count of what the current filter matched — `hasMore`, Load-more, "Showing all N"), `loading`, `hasMore`, `prefs`. The two were one field, so an `unread_only=true` response overwrote the inbox count and both chips showed the same number | `fetchList({unreadOnly})`, `loadMore()`, `fetchUnreadCount()`, `markRead(id)`, `markAllRead()`, `fetchPrefs()`, `updatePrefs()`, `startPolling()`/`stopPolling()` (60s unread-count poll for the sidebar-header bell badge; started from `+layout` when signed in) |
 
@@ -370,12 +393,12 @@ Grouped into subfolders by role; import with the full path
 component the second time you would duplicate one.**
 
 - `help/` — `HelpTip` (the ⓘ toggletip: `<HelpTip term="glossary-id" />`; `KpiCard helpTerm` / DataTable column `help` forward one) `RichText` `HelpNav` `HelpCrumbs` `InvoiceLifecycle` `EnglishNotice` `diagrams/` — placement rules in `docs/ui-patterns.md` § Contextual help
-- `ui/` — primitives: `PageHeader` (renders the page's "How this page works" link) `DataTable` `FilterChips` `Modal` `KpiCard` `Badge` `EmptyState` `Money` `SectionTabs` `Tabs` `SettingsRail` `FieldWarning` `SecretReveal` `BrandMark` `PlanUpgradeNotice` (a setting the plan lacks — decisions §258)
+- `ui/` — primitives: `PageHeader` (renders the page's "How this page works" link) `DataTable` `FilterChips` `Modal` `KpiCard` `Badge` `EmptyState` `Money` `SectionTabs` `Tabs` `SettingsRail` `SegmentedControl` `ThemePicker` `FieldWarning` `SecretReveal` `BrandMark` `PlanUpgradeNotice` (a setting the plan lacks — decisions §258) `LoadError` (a failed load stated in place, with Retry — never a toast alone) `LoadMoreFooter` (every paged list's Load more / Showing all N footer — never a copy of its markup) `SetupChecklist` (setup steps, each linked, `done` true / false / null — decisions §315)
 - domain: `InvoiceModal` `VendorModal` `VendorPicker` `InvoicePicker` (both over `ui/SearchPicker`) `RunDetailModal` `ApprovalMatrixEditor` `BulkRecodeGLModal` `AdvancedSearchModal` `ScreeningBadge` `SubscriptionBadge` `SpendBarChart` `UsageMeter` `PortalListFilters`
 - chrome: `Sidebar` `NotificationBell` `EntitySwitcher`
 - chat/assistant: `SupplierChatThread` `ChatMessage` `ExamplePrompts` `ToolResultView`
 - marketing: `Landing` `Pricing` `Atmosphere` `HeroPipeline` `AdapterRail`
-- auth: `AuthShell` (every pre-auth employee page) `AuthCard`
+- auth: `AuthShell` (every pre-auth employee page) `AuthCard` `AuthBrandMark` (the form-column mark; a home link on the apex only) `AuthCallback` (the SSO / SAML return page) `PasswordInput` (every password field, with the show-password toggle and a field-level error — employee and supplier portal) `NewPasswordFields` (new + confirm + the rules checklist from `#lib/utils/passwordRules.ts`; Submit stays enabled, `validate()` marks each field)
 
 Two invariants the library enforces, worth knowing before you call anything:
 
@@ -392,7 +415,7 @@ Two invariants the library enforces, worth knowing before you call anything:
 - `admin.ts` — `AdminUser`, `Role` (admin, ap_manager, ap_clerk, cfo)
 - `tax.ts` — `Report1099`, `Vendor1099Row` (1099 reporting dashboard)
 - `supplierChat.ts` — `ChatThread`, `ChatMessage`, `ChatAttachment`, `ChatTemplate` (AP, full) + masked `PortalChatThread` / `PortalChatMessage` (portal — no `author_user_id`, no mentions)
-- `assistant.ts` — `ToolInvocation`, `ChatResponse`, `ConversationSummary` / `ConversationDetail` / `ConversationListResponse`, `UsageResponse`, the five structured tool-result shapes (`VendorSpendResult`, `ForecastResult`, `InvoiceListResult`, `PendingApprovalsResult`, `TextSearchResult`), the UI-side `UiMessage`, and `EXAMPLE_PROMPTS` (the three built-in empty-state prompts). Money fields are string-Decimal — pass to `formatMoney`, never `parseFloat` for display.
+- `assistant.ts` — `ToolInvocation`, `ChatResponse`, `ConversationSummary` / `ConversationDetail` / `ConversationListResponse`, `UsageResponse`, the five structured tool-result shapes (`VendorSpendResult`, `ForecastResult`, `InvoiceListResult`, `PendingApprovalsResult`, `TextSearchResult`), and the UI-side `UiMessage`. (The empty-state starter prompts are message keys, `assistant.example.*`, defaulted in `ExamplePrompts.svelte`.) Money fields are string-Decimal — pass to `formatMoney`, never `parseFloat` for display.
 - `vendor.ts` — `Vendor` (incl. `screening_status` / `last_screened_at` / `payments_blocked(+_reason)` / `risk_score` / `risk_level`), `SanctionsCheck`, `ScreeningReviewItem`, `VendorRisk`, `RiskSummaryBucket`, the `ScreeningStatus` / `RiskLevel` unions + label maps, and the dual-control change-request shapes — `VendorChangeRequest` / `VendorChangeRequestPage` / `VendorChangeRequestStatus` / `VendorChangeType` plus two pure formatters for the two views of `proposed_value`: `maskedProposalSummary` (the queue list's last-4-only line — it renders the backend's mask and never invents a full account number) and `revealedProposalFields` (the detail dialog's field list, returning `null` — so the caller falls back to raw JSON — whenever it can't flatten the payload without dropping a field)
 
 ## Multi-tenant routing
@@ -423,14 +446,14 @@ The rules that hold everywhere, so you know when you need to go read the detail:
 - **List fetches go through `createRequestSequencer`** — a late response from a superseded request must never overwrite a newer one.
 - **Money renders through `<Money>`**, never a hand-rolled `toFixed` or `Intl` call. See `### Money formatting`.
 - **User-facing strings go through `m()`** — never a hardcoded literal. See `### Internationalization`.
-- **Accessibility is WCAG 2.2 AA and it is tested.** Focus management, keyboard reachability, target size, and reflow at 320 px are guarded by `frontend/tests-e2e/a11y/` (axe-core). `reflow.spec.ts` enumerates `src/routes` off disk, so a NEW route is measured at 320px the day it lands and there is no list to add it to — and for a route that shows one panel at a time behind `?section=` it reads the slugs off disk too, from the page's own `SECTION_GROUPS`, since visiting the bare path would measure only the default panel. Never loosen those specs — fix the markup.
-- **Colour comes from the tokens in `app.css`**, never a literal hex in a component. Contrast ratios are computed and asserted; a new token pair must pass 1.4.3.
+- **Accessibility is WCAG 2.2 AA and it is tested.** Focus management, keyboard reachability, target size, and reflow at 320 px are guarded by `frontend/tests-e2e/a11y/` (axe-core). `reflow.spec.ts` enumerates `src/routes` off disk, so a NEW route is measured at 320px the day it lands and there is no list to add it to (a route with a path parameter needs a `DYNAMIC_ROUTE_SAMPLES` entry naming a record to open; the walk fails without one) — and for a route that shows one panel at a time behind `?section=` it reads the slugs off disk too, from the page's own `SECTION_GROUPS`, since visiting the bare path would measure only the default panel. Never loosen those specs — fix the markup.
+- **Colour comes from the tokens in `app.css`**, never a literal hex in a component. Contrast ratios are computed and asserted; a new token pair must pass 1.4.3. **There are two palettes** — dark (`:root`, the default) and light (`:root[data-theme='light']`, copied verbatim into the `prefers-color-scheme` block for System) — so a new colour token is declared in both, and `tokenPairing.test.ts` audits every stylesheet once per theme. A literal tuned for one ground is the bug the light theme found ~300 of (`docs/ui-patterns.md` § Themes, decisions §289).
 - **Motion ends on its resting frame, hides nothing by stylesheet, and stops on its own within 5 s.** No `infinite`, and `delay + duration × count ≤ 5s` — that is how the public pages meet WCAG 2.2.2 without a pause control (decisions §279; guards `src/lib/a11y/marketingMotion.test.ts` + `tests-e2e/marketing/landing.spec.ts`); reduced motion collapses durations *and* delays. The five rules are `docs/ui-patterns.md` § Motion.
 - **A chrome or decorative `<img>` is not draggable.** Pair `draggable="false"` on the element with `-webkit-user-drag: none; user-select: none;` in CSS (never `pointer-events: none`, which also swallows hit-testing) — see `AuthShell.svelte`'s `.panel-art`. `src/lib/a11y/imageDragging.test.ts` guards every `<img>` in the tree against an explicit, commented allowlist (a user's own document, e.g. `InvoiceModal`, stays draggable on purpose).
 - **Class names follow the documented convention** rather than utility soup; the conventions section is the reference.
 ## Conventions
 
-- **Svelte 5 runes** — `$state`, `$derived`, `$effect`, `$props`. No legacy options API.
+- **Svelte 5 runes** — `$state`, `$derived`, `$effect`, `$props`. No legacy options API, and no `<slot>`: passed content renders with `{@render children()}` (guard: `src/lib/noLegacySlot.test.ts`).
 - **TypeScript** — `lang="ts"` on all `<script>` blocks.
 - **SvelteKit 3 shapes** — there is no `svelte.config.js`: Kit + compiler options live in the `sveltekit({...})` call in `vite.config.ts` (an existing `svelte.config.js` is a hard error). Import from `#lib/...` (a package.json `imports` entry) **with the file's real extension** — `#lib/api.ts`, `#lib/i18n/store.svelte.ts`, `#lib/components/ui/Modal.svelte`; extensionless specifiers do not resolve. The route/URL state is `page` from `$app/state` (read `page.url`, never `$page`); `browser` comes from `$app/env`. A new environment variable is declared in `src/env.ts` (`static: true` — there is no runtime to read it) and imported from `$app/env/public`. `asset('logo.svg')` takes a path with no leading slash.
 - **API access** — always through `src/lib/api.ts`, never raw `fetch()`.

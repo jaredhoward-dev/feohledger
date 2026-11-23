@@ -28,7 +28,8 @@ endpoint ever returns it" false and give the settings page a silent, unaudited
 second way to see it.
 
 **Provider credentials are not in the JSONB at all any more.** The secrets of
-the `erp`, `payments` and `cards` blocks live sealed in `provider_credentials`
+the `erp`, `payments`, `cards`, `commerce` and `extraction` blocks live sealed
+in `provider_credentials`
 (`services/provider_credentials`), written only by the audited
 `PUT /api/organization/credentials/{block}` and reported by
 `GET /api/organization/credentials` as names-only "is set" flags. The settings
@@ -41,8 +42,12 @@ beside its sealed tokens — reads as `{"connected": bool}` for the same reason:
 its `connection_id` is the capability the token refresher checks
 (`erp_adapters/catalog.public_erp_config`).
 
-Admins otherwise still get the settings verbatim. `extraction.api_key` is the
-remaining credential an admin reads back; it is tracked separately.
+The OIDC client secret is sealed there too (block `sso`, written only by
+`PUT /api/organization/sso`); the block keeps a `client_secret_configured`
+marker, and `ALWAYS_REDACTED` still drops a stray `client_secret` as the same
+second line.
+
+Admins otherwise still get the settings verbatim.
 
 Pure: no DB, no request, no I/O.
 """
@@ -51,6 +56,7 @@ from __future__ import annotations
 
 from app.services.erp_adapters.catalog import public_erp_config
 from app.services.provider_credentials import strip_all_blocks
+from app.utils.bank_masking import mask_secret
 
 # Top-level settings blocks a NON-ADMIN may read.
 #
@@ -94,9 +100,10 @@ NON_ADMIN_SETTINGS: dict[str, set[str] | None] = {
 # "is one set?", not for general credential hygiene.
 ALWAYS_REDACTED: tuple[tuple[str, str], ...] = (
     ("chat_notifications", "webhook_url"),
-    # The OIDC client secret. Its one writer, `PUT /api/organization/sso`, keeps
-    # the stored value when the field is left blank, so no page needs to read it
-    # back; `GET /api/organization/sso` reports `client_secret_configured` only.
+    # The OIDC client secret. Sealed in `provider_credentials` (block `sso`) by
+    # its one writer, `PUT /api/organization/sso`, so a value here is a stray
+    # (a hand edit, a pre-0135 backup restored) and must not reappear;
+    # `GET /api/organization/sso` reports `client_secret_configured` only.
     ("sso", "client_secret"),
 )
 
@@ -124,6 +131,23 @@ def _with_public_erp(settings: dict) -> dict:
     return settings
 
 
+def _with_masked_nacha_offset(settings: dict) -> dict:
+    """``settings`` with ``payments.nacha.offset_account`` reduced to a last-4.
+
+    The NACHA offset account (decisions §432) is the customer's own bank
+    account number — banking data, shown masked on every surface
+    (`utils/bank_masking`). Its writer keeps the stored number when a save
+    sends it blank or sends this mask back (`nacha.carry_offset_account`), so
+    no page needs the full number. Copies only the path it touches.
+    """
+    payments = settings.get("payments")
+    nacha = payments.get("nacha") if isinstance(payments, dict) else None
+    if not isinstance(nacha, dict) or nacha.get("offset_account") in (None, ""):
+        return settings
+    masked = {**nacha, "offset_account": mask_secret(nacha["offset_account"])}
+    return {**settings, "payments": {**payments, "nacha": masked}}
+
+
 def settings_for_response(settings: dict | None, *, is_admin: bool) -> dict:
     """Return the settings a caller of this role may see.
 
@@ -133,7 +157,9 @@ def settings_for_response(settings: dict | None, *, is_admin: bool) -> dict:
     """
     raw = settings or {}
     if is_admin:
-        return _without_always_redacted(_with_public_erp(strip_all_blocks(raw)))
+        return _with_masked_nacha_offset(
+            _without_always_redacted(_with_public_erp(strip_all_blocks(raw)))
+        )
 
     projected: dict = {}
     for block, allowed_keys in NON_ADMIN_SETTINGS.items():

@@ -243,14 +243,18 @@ async def _apply_slack_action(
     ``org_settings`` is threaded for the same reason as the email door: this is
     the same approval decision, so it must read the org's own ``fraud_rules`` /
     ``matching`` tolerances / structuring window, not the platform defaults."""
+    from app.services.review import awaiting_review
     from app.services.workflow_engine import get_invoice_for_update
 
     invoice = await get_invoice_for_update(db, decoded.invoice_id)
-    if invoice.status != InvoiceStatus.ready_for_review:
+    # The one review-stage predicate every decision door reads.
+    if not awaiting_review(invoice):
         return False, "This invoice is no longer awaiting review."
     # The message's figures, checked against the row under the lock — an edit
     # since the post was sent is re-reviewed in the app, not approved from chat.
-    if approval_facts_changed(decoded, invoice):
+    if approval_facts_changed(
+        decoded, invoice, review_round=await review_svc.review_round_of(db, invoice.id)
+    ):
         return False, FACTS_CHANGED_MESSAGE
 
     if decoded.action == ACTION_APPROVE:

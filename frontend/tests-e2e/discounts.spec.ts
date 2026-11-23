@@ -63,6 +63,26 @@ test.describe('/discounts (admin)', () => {
 		expect(resp.request().url()).toContain('status=captured');
 	});
 
+	test('the status filter round-trips through the URL', async ({ page }) => {
+		// The chip writes `?status=`, and a reload restores both the chip and
+		// the filtered request — the same contract as every sibling list.
+		await page.locator('.filter-chip', { hasText: 'Captured' }).click();
+		await expect(page).toHaveURL(/[?&]status=captured\b/);
+
+		const reloaded = page.waitForResponse(
+			(r) => r.url().includes('/api/discounts/offers') && r.url().includes('status=captured')
+		);
+		await page.reload();
+		await reloaded;
+		await expect(page.locator('.filter-chip', { hasText: 'Captured' })).toHaveAttribute(
+			'aria-pressed',
+			'true'
+		);
+
+		await page.locator('.filter-chip', { hasText: 'All' }).click();
+		await expect(page).not.toHaveURL(/status=/);
+	});
+
 	test('clicking Optimize posts to /optimize', async ({ page }) => {
 		const respPromise = page.waitForResponse((r) =>
 			r.url().includes('/api/discounts/optimize')
@@ -84,7 +104,7 @@ test.describe('/discounts (admin)', () => {
 		if (rowCount === 0) {
 			// No seeded offers (or router not wired) → friendly empty state.
 			await expect(page.locator('td.empty')).toBeVisible();
-			await expect(page.locator('td.empty')).toContainText(/No discount offers|Loading offers/);
+			await expect(page.locator('td.empty')).toContainText(/No discount offers|Loading…/);
 			return;
 		}
 
@@ -137,7 +157,8 @@ test.describe('/discounts (clerk — read-only)', () => {
 			data: {
 				vendor: vendor.name,
 				invoice_number: `DISC-RBAC-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
-				amount: 1000
+				amount: 1000,
+				currency: 'USD'
 			}
 		});
 		const invoiceId = ((await invResp.json()) as { id: string }).id;
@@ -186,7 +207,7 @@ test.describe('/discounts (clerk — read-only)', () => {
 
 			// …but with no decide controls on any row.
 			await expect(page.getByRole('button', { name: /^Accept discount for / })).toHaveCount(0);
-			await expect(page.getByRole('button', { name: /^Decline discount for / })).toHaveCount(0);
+			await expect(page.getByRole('button', { name: /^Decline for / })).toHaveCount(0);
 
 			// The optimizer is a read for RBAC purposes, so a clerk may run it.
 			const optimize = page.waitForResponse((r) => r.url().includes('/api/discounts/optimize'));

@@ -57,16 +57,18 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import settings
 from app.database import _make_tenant_url
+from app.db_engine import create_async_engine
 from app.models.exception import Exception as APException
 from app.models.invoice import Invoice
 from app.models.organization import Organization
 from app.models.payment import Payment
 from app.services.credential_crypto import CredentialCryptoError
 from app.services.exception_service import create_exception
+from app.services.invoice_warning_catalog import exception_finding
 from app.services.payment_settlement import settlement_coverage
 from app.services.provider_credentials import provider_config
 
@@ -77,6 +79,9 @@ logger = logging.getLogger(__name__)
 #: disagreement needing human reconciliation — same situation, so no new
 #: taxonomy entry (see ``services/exception_lifecycle.EXCEPTION_TYPES``).
 ERP_SYNC_FAILURE_EXCEPTION_TYPE = "erp_reconciliation"
+
+#: ``erp_report["kind"]`` of that exception.
+ERP_REPORT_SYNC_BACK_FAILED = "payment_sync_back_failed"
 
 #: Per-leg outcomes, in the order they are decided.
 _SYNCED = "synced"
@@ -381,13 +386,14 @@ async def _sync_one_leg(
                 )
             ).scalar_one_or_none()
 
-        # In production, this would call `adapter.post_payment()` — the
-        # `adapter` resolved above is the one it would use, and a leg with no
-        # ERP configured skips that call entirely. For now, log and mark as
-        # synced. Amount is not PII; goes through the module logger so it
-        # reaches the same aggregation/redaction pipeline as the rest of the
-        # sync. The provider NAME is logged so an operator reading the strand
-        # can see which ERP the leg was aimed at (or that there was none).
+        # An adapter that supports status sync (QuickBooks Online) gets the
+        # payment written back once the invoice is `paid` (below, after the
+        # commit); every other adapter keeps the log-only leg, and a leg with
+        # no ERP configured skips the ERP entirely. Amount is not PII; goes
+        # through the module logger so it reaches the same aggregation /
+        # redaction pipeline as the rest of the sync. The provider NAME is
+        # logged so an operator reading the strand can see which ERP the leg
+        # was aimed at (or that there was none).
         logger.info(
             "[payment-sync] syncing payment %s via %s: invoice=%s, amount=%s, method=%s",
             payment.id,
@@ -454,6 +460,39 @@ async def _sync_one_leg(
             moved = True
 
         await db.commit()
+
+        # Phase 4 (decisions §295): an ERP whose bills sync back is told about
+        # the payment too — the bill reads paid there, so nobody pays it again
+        # from inside the ERP. After the commit above, so no invoice lock is
+        # held across the ERP call; idempotent on the payment id, so a re-run
+        # of this pass (the `/sync-erp` retry) never writes it twice. A refusal
+        # is recorded and flagged by the write-back itself and never undoes the
+        # transition: the money moved.
+        if (
+            adapter is not None
+            and getattr(adapter, "supports_status_sync", False) is True
+            and invoice is not None
+            and invoice.status.value == "paid"
+        ):
+            from app.models.workflow import WorkflowInstance
+            from app.services.erp_payment_writeback import write_back_payment
+
+            state = (
+                await db.execute(
+                    select(WorkflowInstance.state_data).where(
+                        WorkflowInstance.invoice_id == invoice.id
+                    )
+                )
+            ).scalar_one_or_none()
+            await db.commit()
+            await write_back_payment(
+                db,
+                adapter=adapter,
+                erp_config=erp_config or {},
+                payment=payment,
+                invoice=invoice,
+                state_data=state,
+            )
         return _SYNCED, moved
 
     except Exception as exc:
@@ -494,9 +533,10 @@ async def _flag_sync_failure(
     invoice, so a repeated retry doesn't pile up rows (and so an ERP-void
     reconciliation raised by ``api/erp_webhook`` isn't duplicated either).
 
-    **PII-free**: identifiers, the failure's exception class, the invoice's
-    current status, and the retry path. Never the raw error message, which can
-    embed partial account / PAN data.
+    **PII-free**: the sentence is a catalogue code for an AP user
+    (``exception.erp_sync_back_failed``); the payment and run ids, the failure's
+    exception class and the invoice's status ride ``erp_report`` as data. Never
+    the raw error message, which can embed partial account / PAN data.
     """
     try:
         invoice_id = (
@@ -518,17 +558,22 @@ async def _flag_sync_failure(
             return
 
         invoice = await db.get(Invoice, invoice_id)
-        current_status = invoice.status.value if invoice else "?"
+        finding = exception_finding("erp_sync_back_failed")
         await create_exception(
             db,
             exception_type=ERP_SYNC_FAILURE_EXCEPTION_TYPE,
             severity="error",
-            description=(
-                f"Payment {payment_id} settled but its ERP sync-back leg failed "
-                f"({failure}); the invoice is still '{current_status}' although the "
-                f"money moved. Nothing re-runs this automatically — retry with "
-                f"POST /api/payments/runs/{run_id}/sync-erp."
-            ),
+            description=finding["message"],
+            description_code=finding["code"],
+            description_params=finding["params"],
+            # The machine detail the sentence used to carry, as data (§319).
+            erp_report={
+                "kind": ERP_REPORT_SYNC_BACK_FAILED,
+                "payment_id": str(payment_id),
+                "payment_run_id": str(run_id),
+                "failure": failure,
+                "invoice_status": invoice.status.value if invoice else None,
+            },
             status="open",
             organization_id=org_id,
             invoice=invoice,

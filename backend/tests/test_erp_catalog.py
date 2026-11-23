@@ -18,6 +18,8 @@ form and names which ERP fields are secrets; those are sealed in
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
@@ -59,7 +61,24 @@ def test_merge_dev_is_the_scale_plan_choice():
     assert {f["name"] for f in catalog.MERGE_DEV_PROVIDER["fields"] if f["secret"]} == {
         "api_key",
         "account_token",
+        # Merge's webhook signature key, optional (decisions §399).
+        "webhook_signing_secret",
     }
+    fields = {f["name"]: f for f in catalog.MERGE_DEV_PROVIDER["fields"]}
+    assert not fields["webhook_signing_secret"]["required"]
+    # The region picks one of Merge's own hosts and nothing else, so it is no
+    # destination: changing it keeps the stored Merge credentials. Its options
+    # are exactly the adapter's hosts, and a saved block without it is the US.
+    from app.services.erp_adapters import merge_dev
+
+    region = fields["region"]
+    assert region["destination"] is False and not region["required"]
+    assert set(region["options"]) == set(merge_dev.MERGE_REGION_BASES)
+    assert region["stored_default"] == merge_dev.DEFAULT_REGION
+    assert all(
+        host.startswith("https://api") and ".merge.dev/" in host
+        for host in merge_dev.MERGE_REGION_BASES.values()
+    )
     long_tail = {e["value"] for e in catalog.MERGE_DEV_LONG_TAIL}
     assert {"sap_s4hana", "epicor", "acumatica"} <= long_tail
     # A direct ERP must not also be offered as a Merge.dev long-tail entry.
@@ -79,7 +98,16 @@ def test_catalogue_entries_are_well_formed():
             assert isinstance(f["secret"], bool) and isinstance(f["required"], bool)
             # The form drops "saved" from secrets when a destination field
             # changes; it learns which fields those are from this flag only.
-            assert f["destination"] is (f["name"] in catalog.DESTINATION_KEYS), f
+            # The backend's own rule (`destination_keys`) reads the same flag.
+            assert f["destination"] is (f["name"] in catalog.destination_keys(_block(entry))), f
+            # A conditional field names a sibling choice field and one of its
+            # options; a typo would hide the field for good.
+            if "show_when" in f:
+                by_name = {g["name"]: g for g in entry["fields"]}
+                choice = by_name[f["show_when"]["field"]]
+                assert set(f["show_when"]["values"]) <= set(choice["options"]), f
+            if "stored_default" in f:
+                assert f["stored_default"] in f["options"], f
         if entry["auth"] == "oauth":
             # OAuth providers: the BYO-app pair is optional, never required.
             assert not any(f["required"] for f in entry["fields"] if f["secret"])
@@ -88,13 +116,14 @@ def test_catalogue_entries_are_well_formed():
 
 def test_every_catalogue_message_key_exists_in_the_frontend_catalogue():
     """`label_key` / `help_key` are frontend `MessageKey`s; a typo would render
-    the raw key. `en.ts` is the source dict every locale is checked against."""
+    the raw key. The English dicts are what every locale is checked against: the
+    main catalogue plus the settings slice, which /organization loads and which
+    holds the ERP form's labels (decisions §300)."""
     import pathlib
     import re
 
-    en = (
-        pathlib.Path(__file__).resolve().parents[2] / "frontend/src/lib/i18n/locales/en.ts"
-    ).read_text()
+    locales = pathlib.Path(__file__).resolve().parents[2] / "frontend/src/lib/i18n/locales"
+    en = (locales / "en.ts").read_text() + (locales / "settings/en.ts").read_text()
     defined = set(re.findall(r"^\s*'([^']+)':", en, re.MULTILINE))
     used = {
         key
@@ -110,6 +139,12 @@ def test_existing_direct_adapters_keep_their_fields():
     by_key = {e["key"]: {f["name"]: f for f in e["fields"]} for e in catalog.ERP_PROVIDERS}
     assert set(by_key["netsuite"]) == {
         "account_id",
+        "auth_method",
+        # OAuth 2.0 client credentials (issue #653)
+        "client_id",
+        "certificate_id",
+        "private_key",
+        # Token-Based Authentication, kept for integrations created before 2027.1
         "consumer_key",
         "consumer_secret",
         "token_id",
@@ -124,7 +159,29 @@ def test_existing_direct_adapters_keep_their_fields():
         "company_id",
     }
     assert by_key["netsuite"]["token_secret"]["secret"] is True
+    assert by_key["netsuite"]["private_key"]["secret"] is True
     assert by_key["dynamics_365_bc"]["client_secret"]["secret"] is True
+
+
+def test_netsuite_offers_oauth2_first_and_reads_a_saved_block_as_tba():
+    """A new NetSuite connection starts on OAuth 2.0 (TBA closes to new
+    integrations in 2027.1); a block saved before the choice existed has no
+    `auth_method`, which the adapter reads as TBA, and the form must show the
+    same — otherwise its first save would switch a working tenant to OAuth 2.0."""
+    from app.services.erp_adapters import netsuite
+
+    fields = {f["name"]: f for f in catalog.provider("netsuite")["fields"]}
+    method = fields["auth_method"]
+    assert method["options"][0] == netsuite.AUTH_OAUTH2_M2M
+    assert set(method["options"]) == set(netsuite.AUTH_METHODS)
+    assert method["stored_default"] == netsuite.AUTH_TBA
+    assert netsuite.NetSuiteAdapter({})._auth_method() == netsuite.AUTH_TBA
+    # Each method's fields show only under it, and are what the adapter needs.
+    for name, required in netsuite._REQUIRED_KEYS.items():
+        shown = {
+            f for f, spec in fields.items() if name in spec.get("show_when", {}).get("values", [])
+        }
+        assert shown == set(required), name
 
 
 def test_secret_keys_cover_every_secret_field_and_the_webhook_key():
@@ -299,6 +356,23 @@ def test_an_unchanged_destination_drops_nothing():
     assert catalog.secrets_to_drop(SYSPRO, incoming) == frozenset()
 
 
+def test_switching_the_sign_in_method_drops_only_the_old_methods_secrets():
+    """Same NetSuite account, TBA -> OAuth 2.0: TBA's sealed secrets have no
+    reader any more and must not stay stored; the inbound webhook key and the
+    new method's secrets are untouched. An absent auth_method reads as TBA."""
+    oauth = {**STORED, "auth_method": "oauth2_m2m", "client_id": "c", "certificate_id": "k"}
+    assert catalog.secrets_to_drop(STORED, oauth) == {"consumer_secret", "token_secret"}
+    assert catalog.secrets_to_drop({**STORED, "auth_method": "tba"}, oauth) == {
+        "consumer_secret",
+        "token_secret",
+    }
+    assert catalog.secrets_to_drop(oauth, {**oauth, "auth_method": "tba"}) == {"private_key"}
+    # A save that keeps the method drops nothing — a secret PUT ahead of the
+    # save that selects its method stays for that save.
+    assert catalog.secrets_to_drop(STORED, {**STORED, "auth_method": "tba"}) == frozenset()
+    assert catalog.secrets_to_drop(oauth, dict(oauth)) == frozenset()
+
+
 def test_a_different_erp_or_a_cleared_one_drops_every_secret():
     """Business Central's client_secret must not become Xero's BYO app secret."""
     d365 = {"type": "dynamics_365_bc", "integration_method": "direct"}
@@ -325,9 +399,105 @@ def test_destination_keys_cover_every_host_naming_catalogue_field():
             name = f["name"]
             if name.endswith("_url") or "host" in name or name == "url":
                 assert name in catalog.DESTINATION_KEYS, name
+                # ...and for its own provider: a host field can never opt out.
+                assert f["destination"] is True, (entry["key"], name)
+                assert name in catalog.destination_keys(_block(entry)), (entry["key"], name)
+
+
+#: Every (provider, field) that opts OUT of the by-name destination default.
+#: Each needs evidence that no value of the field moves a credential off the
+#: vendor's own hosts (decisions §316); adding one means adding it here.
+REVIEWED_DESTINATION_OPT_OUTS = {("quickbooks_online", "environment")}
+
+
+def test_destination_opt_outs_are_the_reviewed_ones():
+    opt_outs = {
+        (entry["key"], f["name"])
+        for entry in catalog.all_providers()
+        for f in entry["fields"]
+        if f["name"] in catalog.DESTINATION_KEYS and not f["destination"]
+    }
+    assert opt_outs == REVIEWED_DESTINATION_OPT_OUTS
+
+
+def test_business_central_environment_stays_a_destination():
+    """BC's environment is a URL path segment: another value is other books."""
+    bc = catalog.provider("dynamics_365_bc")
+    env = next(f for f in bc["fields"] if f["name"] == "environment")
+    assert env["destination"] is True
+    assert "environment" in catalog.destination_keys(_block(bc))
+
+
+def test_an_undeclared_key_keeps_the_by_name_default():
+    """Narrowing is per declared field only: QuickBooks, which renders no
+    `base_url`, still treats it as a destination, as does an unknown ERP."""
+    qbo = catalog.destination_keys({"type": "quickbooks_online", "integration_method": "direct"})
+    assert qbo == catalog.DESTINATION_KEYS - {"environment"}
+    unknown = catalog.destination_keys({"type": "nope", "integration_method": "direct"})
+    assert unknown == catalog.DESTINATION_KEYS
+    assert catalog.destination_keys(None) == catalog.DESTINATION_KEYS
+    # Routed through Merge.dev, the QuickBooks opt-out does not apply.
+    merge_qbo = catalog.destination_keys({"type": "quickbooks_online"})
+    assert merge_qbo == catalog.DESTINATION_KEYS
+
+
+QBO = {
+    "type": "quickbooks_online",
+    "integration_method": "direct",
+    "client_id": "byo-client",
+    "environment": "production",
+}
+
+
+@pytest.mark.parametrize("new_env", ["sandbox", "", "production "])
+def test_a_quickbooks_environment_change_is_the_same_connection(new_env):
+    """Production → sandbox picks another Intuit host, not another destination:
+    the bring-your-own-app client_secret stays. (v0.1.6: it was dropped, so a
+    sandbox connection could not be saved.)"""
+    incoming = {**QBO, "environment": new_env}
+    assert catalog.same_connection(QBO, incoming)
+    assert catalog.secrets_to_drop(QBO, incoming) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "key, new_value",
+    [("base_url", "https://attacker.tld"), ("company_id", "other"), ("tenant_id", "t2")],
+)
+def test_quickbooks_still_drops_on_an_undeclared_destination_key(key, new_value):
+    """The opt-out is `environment` only: a host key added to a QuickBooks
+    block is still a new destination."""
+    assert not catalog.same_connection(QBO, {**QBO, key: new_value})
+    drop = catalog.secrets_to_drop(QBO, {**QBO, key: new_value})
+    assert "client_secret" in drop
+    assert "webhook_signing_secret" not in drop
+
+
+BC = {
+    "type": "dynamics_365_bc",
+    "integration_method": "direct",
+    "environment": "production",
+    "tenant_id": "t",
+    "client_id": "c",
+    "company_id": "co",
+}
+
+
+@pytest.mark.parametrize(
+    "key, new_value", [("environment", "sandbox"), ("base_url", "https://attacker.tld")]
+)
+def test_a_business_central_environment_or_base_url_change_drops(key, new_value):
+    assert not catalog.same_connection(BC, {**BC, key: new_value})
+    assert "client_secret" in catalog.secrets_to_drop(BC, {**BC, key: new_value})
 
 
 # ---------- the endpoints ----------------------------------------------------
+
+
+def _block(entry: dict) -> dict:
+    """A minimal `settings.erp` block selecting catalogue `entry`."""
+    if entry["key"] == catalog.METHOD_MERGE_DEV:
+        return {"type": "other", "integration_method": catalog.METHOD_MERGE_DEV}
+    return {"type": entry["key"], "integration_method": catalog.METHOD_DIRECT}
 
 
 async def _seed_erp(realdb, block: dict, secrets: dict | None = None, key: str = "a") -> None:
@@ -514,6 +684,43 @@ async def test_patch_with_a_changed_destination_drops_the_sealed_secrets(realdb)
 
 @pytest.mark.asyncio
 @pytest.mark.plan("scale")
+async def test_patch_switching_the_sign_in_method_drops_the_old_methods_secrets(realdb):
+    await _seed_erp(
+        realdb, dict(STORED), {**STORED_SECRETS, "private_key": "-----BEGIN PRIVATE KEY-----x"}
+    )
+    async with realdb.client(key="a", role="admin") as c:
+        shown = (await c.get("/api/organization")).json()["settings"]["erp"]
+        resp = await c.patch(
+            "/api/organization",
+            json={
+                "settings": {
+                    "erp": {
+                        **shown,
+                        "auth_method": "oauth2_m2m",
+                        "client_id": "cid",
+                        "certificate_id": "kid",
+                    }
+                }
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    assert (await _stored_erp(realdb))["auth_method"] == "oauth2_m2m"
+    assert await _sealed(realdb) == {
+        "private_key": "-----BEGIN PRIVATE KEY-----x",
+        "webhook_signing_secret": "whs-STORED",
+    }
+    rows = await _audit_rows(realdb, "organization.credentials_updated")
+    assert len(rows) == 1
+    assert rows[0].details == {
+        "block": "erp",
+        "changed": ["consumer_secret", "token_secret"],
+        "cleared": ["consumer_secret", "token_secret"],
+        "reason": "erp_sign_in_method_changed",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.plan("scale")
 async def test_patch_switching_erp_drops_every_sealed_secret(realdb):
     await _seed_erp(
         realdb,
@@ -605,6 +812,50 @@ async def test_test_erp_keeps_stored_secrets_when_only_a_non_destination_field_c
 
 @pytest.mark.asyncio
 @pytest.mark.plan("scale")
+async def test_patch_switching_quickbooks_to_sandbox_keeps_the_byo_app_secret(realdb):
+    """The v0.1.6 bug end to end: production → sandbox persists, and the sealed
+    client_secret of the tenant's own Intuit app survives the save."""
+    await _seed_erp(realdb, dict(QBO), {"client_secret": "qbo-STORED"})
+    async with realdb.client(key="a", role="admin") as c:
+        shown = (await c.get("/api/organization")).json()["settings"]["erp"]
+        resp = await c.patch(
+            "/api/organization",
+            json={"settings": {"erp": {**shown, "environment": "sandbox"}}},
+        )
+    assert resp.status_code == 200, resp.text
+    assert (await _stored_erp(realdb))["environment"] == "sandbox"
+    assert await _sealed(realdb) == {"client_secret": "qbo-STORED"}
+    assert await _audit_rows(realdb, "organization.credentials_updated") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.plan("scale")
+async def test_test_erp_uses_the_byo_app_secret_across_a_quickbooks_environment_change(
+    realdb, monkeypatch
+):
+    """Test Connection on the unsaved sandbox form still gets the sealed secret."""
+    from app.services.erp_adapters import quickbooks_online
+
+    seen: dict = {}
+
+    async def fake_test_connection(self):
+        seen.update(self.config)
+        return True
+
+    monkeypatch.setattr(
+        quickbooks_online.QuickBooksOnlineAdapter, "test_connection", fake_test_connection
+    )
+    await _seed_erp(realdb, dict(QBO), {"client_secret": "qbo-STORED"})
+    async with realdb.client(key="a", role="admin") as c:
+        shown = (await c.get("/api/organization")).json()["settings"]["erp"]
+        resp = await c.post("/api/organization/test-erp", json={**shown, "environment": "sandbox"})
+    assert resp.status_code == 200, resp.text
+    assert seen["environment"] == "sandbox"
+    assert seen["client_secret"] == "qbo-STORED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.plan("scale")
 async def test_test_erp_reports_an_unopenable_store_and_never_falls_back(realdb, monkeypatch):
     from app.services.credential_crypto import CredentialCryptoError
 
@@ -618,6 +869,7 @@ async def test_test_erp_reports_an_unopenable_store_and_never_falls_back(realdb,
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "success": False,
+        "code": "credentials_unavailable",
         "message": provider_credentials.CREDENTIALS_UNAVAILABLE_DETAIL,
     }
 
@@ -639,3 +891,71 @@ async def test_a_sync_with_an_unopenable_store_is_a_503(realdb, monkeypatch, pat
         resp = await c.post(path)
     assert resp.status_code == 503, resp.text
     assert resp.json()["detail"] == provider_credentials.CREDENTIALS_UNAVAILABLE_DETAIL
+
+
+# ---------------------------------------------------------------------------
+# `settings.erp.configured_at`: when the block began naming its connection
+# (decisions §428; the auto-send recovery sweep fences on it)
+# ---------------------------------------------------------------------------
+
+
+def _configured_at(block: dict) -> datetime:
+    moment = datetime.fromisoformat(block[catalog.CONFIGURED_AT_KEY])
+    assert moment.tzinfo is not None
+    return moment
+
+
+@pytest.mark.asyncio
+@pytest.mark.plan("scale")
+async def test_a_first_erp_save_stamps_configured_at_and_a_same_connection_save_keeps_it(realdb):
+    before = datetime.now(UTC)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.patch("/api/organization", json={"settings": {"erp": dict(STORED)}})
+        assert resp.status_code == 200, resp.text
+        first = _configured_at(await _stored_erp(realdb))
+        assert first >= before
+
+        # Same ERP, same destination: an edit, and a forged stamp, change nothing.
+        shown = (await c.get("/api/organization")).json()["settings"]["erp"]
+        forged = "2000-01-01T00:00:00+00:00"
+        resp = await c.patch(
+            "/api/organization",
+            json={
+                "settings": {
+                    "erp": {**shown, "token_id": "tid-2", catalog.CONFIGURED_AT_KEY: forged}
+                }
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    stored = await _stored_erp(realdb)
+    assert stored["token_id"] == "tid-2"
+    assert _configured_at(stored) == first
+
+
+@pytest.mark.asyncio
+@pytest.mark.plan("scale")
+@pytest.mark.parametrize(
+    ("seeded", "saved"),
+    [
+        (STORED, {**STORED, "account_id": "456"}),  # same ERP, another account
+        (STORED, dict(SYSPRO)),  # another ERP
+        (
+            {"type": "sage_intacct", "integration_method": "direct", "company_id": "acme"},
+            {
+                "type": "sage_intacct",
+                "integration_method": "direct",
+                "company_id": "acme",
+                "location_id": "EU",
+            },
+        ),  # Intacct entity: the link realm moves (§412)
+    ],
+    ids=["destination", "erp", "realm"],
+)
+async def test_a_save_that_moves_the_connection_restamps_configured_at(realdb, seeded, saved):
+    old = "2026-01-01T00:00:00+00:00"
+    await _seed_erp(realdb, {**seeded, catalog.CONFIGURED_AT_KEY: old})
+    before = datetime.now(UTC)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.patch("/api/organization", json={"settings": {"erp": saved}})
+    assert resp.status_code == 200, resp.text
+    assert _configured_at(await _stored_erp(realdb)) >= before

@@ -99,14 +99,78 @@ def test_merge_dev_override_applies_to_posts_too(monkeypatch):
         invoice_date=date(2026, 1, 1),
         correlation_id="corr-1",
         vendor_erp_id="merge-vendor-1",
+        gl_account="6000",
+        gl_account_erp_id="merge-acct-6000",
     )
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value
-        client.post = AsyncMock(return_value=_mock_response(201, {"model": {"id": "m1"}}))
+        client.get = AsyncMock(return_value=_mock_response(200, {"results": [], "next": None}))
+        client.post = AsyncMock(
+            return_value=_mock_response(201, {"model": {"id": "m1", "total_amount": 100.00}})
+        )
         result = _run(adapter.post_invoice(payload))
     assert result.success
     url = client.post.await_args.args[0]
     assert url == f"{FAKE_MERGE}/invoices"
+    # The pre-create lookup reads the same host.
+    assert client.get.await_args.args[0] == f"{FAKE_MERGE}/invoices"
+
+
+@pytest.mark.parametrize(
+    ("region", "host"),
+    [
+        (None, "https://api.merge.dev"),
+        ("", "https://api.merge.dev"),
+        ("US", "https://api.merge.dev"),
+        ("eu", "https://api-eu.merge.dev"),
+        ("APAC", "https://api-ap.merge.dev"),
+    ],
+)
+def test_merge_dev_region_picks_merges_own_regional_host(region, host):
+    """A linked account lives on one Merge stack, and its token is refused by
+    the others; a blank region is the US stack every older connection is on
+    (decisions §399)."""
+    adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok", "region": region})
+    with patch("httpx.AsyncClient") as cm:
+        client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_mock_response(200, {"status": "OPEN"}))
+        _run(adapter.get_invoice_status("doc-1"))
+    assert client.get.await_args.args[0] == f"{host}/api/accounting/v1/invoices/doc-1"
+
+
+def test_merge_dev_unknown_region_is_refused_not_guessed():
+    from datetime import date
+    from decimal import Decimal
+
+    from app.services.erp_adapters.base import InvoicePayload
+
+    adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok", "region": "mars"})
+    payload = InvoicePayload(
+        invoice_number="INV-1",
+        vendor_name="Acme",
+        amount=Decimal("100.00"),
+        currency="USD",
+        invoice_date=date(2026, 1, 1),
+        correlation_id="corr-1",
+        vendor_erp_id="merge-vendor-1",
+        gl_account_erp_id="merge-acct-6000",
+    )
+    with patch("httpx.AsyncClient") as cm:
+        result = _run(adapter.post_invoice(payload))
+    assert not result.success and not result.retryable and result.not_posted
+    assert "config_invalid" in result.message
+    cm.assert_not_called()
+
+
+def test_merge_dev_region_does_not_override_an_operator_base(monkeypatch):
+    """The operator's base (fake-erp) wins over a tenant's region."""
+    monkeypatch.setattr(settings, "erp_merge_api_base", FAKE_MERGE)
+    adapter = MergeDevAdapter({"api_key": "k", "account_token": "tok", "region": "EU"})
+    with patch("httpx.AsyncClient") as cm:
+        client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=_mock_response(200, {"status": "OPEN"}))
+        _run(adapter.get_invoice_status("doc-1"))
+    assert client.get.await_args.args[0] == f"{FAKE_MERGE}/invoices/doc-1"
 
 
 # ---------- NetSuite -------------------------------------------------------
@@ -122,7 +186,23 @@ def test_netsuite_base_url_derives_from_account_id_when_override_empty():
 
 
 @pytest.mark.parametrize(
-    "account_id", ["evil.tld/x?", "evil.tld#", "a@evil.tld", "123 456", 'x" , oauth_x="', ""]
+    "account_id",
+    [
+        "evil.tld/x?",
+        "evil.tld#",
+        "a@evil.tld",
+        "123 456",
+        'x" , oauth_x="',
+        "",
+        # The value must stay ONE hostname label: no dot, port, newline,
+        # backslash, percent-escape or non-ASCII digit rides along.
+        "1234567.evil",
+        "1234567:8443",
+        "1234567\n",
+        "evil.tld\\",
+        "１２３４５６７",  # fullwidth digits: `\d` would match them, the alphabet must not
+        "1234567%2eevil",
+    ],
 )
 def test_netsuite_account_id_is_validated_before_it_reaches_the_hostname(account_id):
     """`account_id` is admin-supplied and spliced into the API HOSTNAME: before
@@ -230,7 +310,8 @@ def test_netsuite_oauth_signature_is_computed_over_the_override_url(monkeypatch)
     ).decode()
 
     auth_header = client.get.await_args.kwargs["headers"]["Authorization"]
-    assert f'oauth_signature="{quote(expected_sig)}"' in auth_header
+    # RFC 5849 §3.6 encoding: `/` in the base64 is encoded too (safe="~").
+    assert f'oauth_signature="{quote(expected_sig, safe="~")}"' in auth_header
 
 
 # ---------- Dynamics 365 BC ------------------------------------------------
@@ -267,9 +348,10 @@ def test_d365_api_url_uses_override_and_skips_ssrf_guard(monkeypatch):
     """The operator override is trusted: a localhost base must NOT raise
     UnsafeUrlError, and config base_url must not be required at all."""
     monkeypatch.setattr(settings, "erp_d365_api_base", FAKE_D365)
-    adapter = BusinessCentralAdapter({"environment": "sandbox", "company_id": "c-1"})
+    company = "1b2c3d4e-0000-0000-0000-00000000c001"
+    adapter = BusinessCentralAdapter({"environment": "sandbox", "company_id": company})
     url = _run(adapter._api_url("purchaseInvoices"))
-    assert url == f"{FAKE_D365}/sandbox/api/v2.0/companies(c-1)/purchaseInvoices"
+    assert url == f"{FAKE_D365}/sandbox/api/v2.0/companies({company})/purchaseInvoices"
 
 
 @pytest.mark.parametrize(
@@ -293,7 +375,9 @@ def test_d365_admin_base_url_must_be_https_on_microsofts_api_host(monkeypatch, b
     SSRF guard would happily pass — is a credential leak. The error names the
     key, never the value."""
     monkeypatch.setattr(settings, "erp_d365_api_base", "")
-    adapter = BusinessCentralAdapter({"base_url": base_url, "company_id": "c-1"})
+    adapter = BusinessCentralAdapter(
+        {"base_url": base_url, "company_id": "1b2c3d4e-0000-0000-0000-00000000c001"}
+    )
     with pytest.raises(BusinessCentralConfigError) as exc:
         _run(adapter._api_url("purchaseInvoices"))
     assert "'base_url'" in str(exc.value)
@@ -303,11 +387,13 @@ def test_d365_admin_base_url_must_be_https_on_microsofts_api_host(monkeypatch, b
 def test_d365_blank_base_url_is_microsofts_default(monkeypatch):
     """`base_url` is optional in the provider catalogue; blank used to KeyError."""
     monkeypatch.setattr(settings, "erp_d365_api_base", "")
-    adapter = BusinessCentralAdapter({"environment": "production", "company_id": "c-1"})
+    adapter = BusinessCentralAdapter(
+        {"environment": "production", "company_id": "1b2c3d4e-0000-0000-0000-00000000c001"}
+    )
     with patch("app.utils.url_safety.assert_public_url_async", AsyncMock()):
         url = _run(adapter._api_url("vendors"))
     assert url == (
-        "https://api.businesscentral.dynamics.com/v2.0/production/api/v2.0/companies(c-1)/vendors"
+        "https://api.businesscentral.dynamics.com/v2.0/production/api/v2.0/companies(1b2c3d4e-0000-0000-0000-00000000c001)/vendors"
     )
 
 
@@ -316,7 +402,10 @@ def test_d365_microsofts_host_still_passes_through_the_ssrf_guard(monkeypatch):
     allowed host ever resolved inward, the request is still refused."""
     monkeypatch.setattr(settings, "erp_d365_api_base", "")
     adapter = BusinessCentralAdapter(
-        {"base_url": "https://api.businesscentral.dynamics.com/v2.0", "company_id": "c-1"}
+        {
+            "base_url": "https://api.businesscentral.dynamics.com/v2.0",
+            "company_id": "1b2c3d4e-0000-0000-0000-00000000c001",
+        }
     )
     guard = AsyncMock(side_effect=UnsafeUrlError("internal"))
     with patch("app.utils.url_safety.assert_public_url_async", guard):
@@ -340,7 +429,7 @@ def test_d365_post_invoice_refuses_a_bad_base_url_before_any_request(monkeypatch
             "tenant_id": "t",
             "client_id": "c",
             "client_secret": "s",
-            "company_id": "c-1",
+            "company_id": "1b2c3d4e-0000-0000-0000-00000000c001",
         }
     )
     payload = InvoicePayload(
@@ -350,7 +439,7 @@ def test_d365_post_invoice_refuses_a_bad_base_url_before_any_request(monkeypatch
         currency="USD",
         invoice_date=date(2026, 1, 1),
         correlation_id="corr-1",
-        vendor_erp_id="V-1",
+        vendor_erp_id="00000000-0000-0000-0000-0000000000a1",
         gl_account_erp_id="A-1",
     )
     with patch("httpx.AsyncClient") as cm:
@@ -374,7 +463,7 @@ def test_d365_list_syncs_keep_the_ssrf_guard_on_admin_config(monkeypatch, method
             "base_url": "http://169.254.169.254/latest",
             "client_id": "c",
             "client_secret": "s",
-            "company_id": "c-1",
+            "company_id": "1b2c3d4e-0000-0000-0000-00000000c001",
         }
     )
     with patch("httpx.AsyncClient") as cm:
@@ -390,7 +479,10 @@ def test_d365_api_url_override_takes_precedence_over_admin_config(monkeypatch):
     """Both set → the operator env wins (and the admin value is never fetched)."""
     monkeypatch.setattr(settings, "erp_d365_api_base", FAKE_D365 + "/")  # rstrip
     adapter = BusinessCentralAdapter(
-        {"base_url": "https://api.businesscentral.dynamics.com/v2.0", "company_id": "c-1"}
+        {
+            "base_url": "https://api.businesscentral.dynamics.com/v2.0",
+            "company_id": "1b2c3d4e-0000-0000-0000-00000000c001",
+        }
     )
     url = _run(adapter._api_url("vendors"))
     assert url.startswith(f"{FAKE_D365}/production/")

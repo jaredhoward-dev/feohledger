@@ -36,6 +36,10 @@ from tests.test_webauthn import (
     platform_rp,
 )
 
+# Mock-DB tests: a step-up writes an auth audit row through its own
+# control-plane/tenant sessions (tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("no_auth_audit_write")
+
 ORIGIN = "http://localhost:7777"
 
 
@@ -359,7 +363,7 @@ async def test_passwordless_account_disables_totp_with_an_assertion(all_plan_fea
 
     user = _sso_only_user()
     user.mfa_enabled = True
-    user.mfa_secret = "JBSWY3DPEHPK3PXP"
+    user.mfa_secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     soft, cred = await _register_passkey(user)
     db = _CredDB([cred])
 

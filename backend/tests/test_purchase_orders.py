@@ -21,7 +21,13 @@ from sqlalchemy import func, select
 
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
-from app.models.procurement import POLineItem, PurchaseOrder
+from app.models.procurement import (
+    UNISSUED_PO_STATUS,
+    GoodsReceipt,
+    GRLineItem,
+    POLineItem,
+    PurchaseOrder,
+)
 from app.models.vendor import Vendor
 
 # ---------------------------------------------------------------------------
@@ -113,6 +119,46 @@ async def test_list_purchase_orders_happy_path(realdb):
     assert item["status"] == "open"
     assert len(item["line_items"]) == 1
     assert item["line_items"][0]["description"] == "Widgets"
+
+
+async def test_list_and_detail_withhold_the_money_of_a_po_whose_total_is_unverifiable(realdb):
+    """A PO the ERP's last sync could not price (decisions §323) keeps its old
+    figures in the row, but the list and the detail send `null` for the total
+    and every line figure, with the reason beside them, so no client can show
+    a stale figure as the PO's. Quantities stay — the receipt form needs them."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    po_id = await _add_po(
+        mk,
+        org_id,
+        po_number="PO-UNVERIFIABLE",
+        total=Decimal("1200.50"),
+        currency="USD",
+        line_items=[
+            {
+                "description": "Widgets",
+                "quantity": Decimal("10"),
+                "unit_price": Decimal("120.05"),
+                "total": Decimal("1200.50"),
+            }
+        ],
+    )
+    async with mk() as s:
+        po = await s.get(PurchaseOrder, po_id)
+        po.total_unverifiable_reason = "unpriceable"
+        await s.commit()
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        listed = (await c.get("/api/purchase-orders")).json()["items"][0]
+        detail = (await c.get(f"/api/purchase-orders/{po_id}")).json()
+
+    for body in (listed, detail):
+        assert body["total"] is None
+        assert body["total_unverifiable_reason"] == "unpriceable"
+        assert body["currency"] == "USD"
+        line = body["line_items"][0]
+        assert line["unit_price"] is None and line["total"] is None
+        assert line["quantity"] == 10.0
 
 
 async def test_list_purchase_orders_requires_auth(realdb):
@@ -340,6 +386,7 @@ async def test_get_purchase_order_detail_with_invoices(realdb):
                 invoice_number="INV-1",
                 vendor_name="Cloud Services Inc",
                 amount=Decimal("12000.00"),
+                currency="USD",
                 po_number="PO-2024-201",
                 status=InvoiceStatus.approved,
                 organization_id=org_id,
@@ -557,6 +604,196 @@ async def test_sync_erp_currency_is_erp_owned_but_silence_never_erases_it(realdb
     assert body["created"] == 2
 
 
+async def _vendor_of(realdb, po_number: str) -> uuid.UUID | None:
+    async with realdb.sessionmaker("a")() as s:
+        return (
+            await s.execute(
+                select(PurchaseOrder.vendor_id).where(PurchaseOrder.po_number == po_number)
+            )
+        ).scalar_one()
+
+
+async def test_sync_erp_links_vendor_by_erp_id_before_name(realdb, monkeypatch):
+    """The ERP's supplier id wins over the name: a vendor renamed on our side
+    still links, and a second vendor merely sharing the ERP's name does not."""
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        by_id = Vendor(name="Feoh Supplies (renamed)", erp_vendor_id="c-1", organization_id=org_id)
+        by_name = Vendor(name="Feoh Test Supplies Inc", organization_id=org_id)
+        s.add_all([by_id, by_name])
+        await s.commit()
+        by_id_id, by_name_id = by_id.id, by_name.id
+
+    await _sync_with_payloads(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="ERP-ID",
+                vendor_name="Feoh Test Supplies Inc",
+                vendor_erp_id="c-1",
+                total=Decimal("250.00"),
+            ),
+            # An id no vendor holds falls back to the name.
+            PoPayload(
+                po_number="ERP-NAME",
+                vendor_name="Feoh Test Supplies Inc",
+                vendor_erp_id="c-unknown",
+                total=Decimal("250.00"),
+            ),
+        ],
+    )
+
+    assert await _vendor_of(realdb, "ERP-ID") == by_id_id
+    assert await _vendor_of(realdb, "ERP-NAME") == by_name_id
+
+
+async def test_sync_erp_never_name_links_a_po_onto_a_vendor_linked_to_another_id(
+    realdb, monkeypatch
+):
+    """Two suppliers share a name. Ours is linked to ERP id 77; the PO belongs
+    to id 56, not yet synced. Linking by name would match our Acme's invoices
+    against another supplier's order, so the PO stays unlinked until the vendor
+    sync brings 56 in."""
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        s.add(Vendor(name="Acme Twin Ltd", erp_vendor_id="77", organization_id=org_id))
+        await s.commit()
+
+    await _sync_with_payloads(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="ERP-TWIN",
+                vendor_name="Acme Twin Ltd",
+                vendor_erp_id="56",
+                total=Decimal("300.00"),
+            )
+        ],
+    )
+
+    assert await _vendor_of(realdb, "ERP-TWIN") is None
+
+
+async def test_sync_erp_ignores_an_id_link_made_in_another_erp_company(realdb, monkeypatch):
+    """QuickBooks reuses small ids across companies, so a vendor linked as "56"
+    under the sandbox is not the production company's "56": the PO falls back
+    to the name, as the invoice push refuses the same stale link."""
+    from app.api import purchase_orders
+    from app.services.erp_adapters.base import PoPayload
+
+    monkeypatch.setattr(purchase_orders, "connection_realm", lambda _cfg: "qbo:prod")
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        stale = Vendor(
+            name="Sandbox Vendor",
+            erp_vendor_id="56",
+            erp_link_realm="qbo:sandbox",
+            organization_id=org_id,
+        )
+        by_name = Vendor(name="Acme", organization_id=org_id)
+        s.add_all([stale, by_name])
+        await s.commit()
+        by_name_id = by_name.id
+
+    await _sync_with_payloads(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="QBO-1", vendor_name="Acme", vendor_erp_id="56", total=Decimal("1"))],
+    )
+
+    assert await _vendor_of(realdb, "QBO-1") == by_name_id
+
+
+async def test_sync_erp_links_a_po_by_the_vendors_kept_link_in_this_company(realdb, monkeypatch):
+    """Acme's row holds its sandbox link; its production "56" is kept in
+    `vendor_erp_links` from an earlier production connection (decisions §356).
+    A production PO naming "56" is Acme's, as the push would post "56" for it;
+    the row's sandbox "56"-alike on another vendor is not."""
+    from app.api import purchase_orders
+    from app.models.vendor import VendorErpLink
+    from app.services.erp_adapters.base import PoPayload
+
+    monkeypatch.setattr(purchase_orders, "connection_realm", lambda _cfg: "qbo:prod")
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        acme = Vendor(
+            name="Acme",
+            erp_vendor_id="9",
+            erp_link_realm="qbo:sandbox",
+            organization_id=org_id,
+        )
+        sandbox_56 = Vendor(
+            name="Sandbox Fifty-Six",
+            erp_vendor_id="56",
+            erp_link_realm="qbo:sandbox",
+            organization_id=org_id,
+        )
+        s.add_all([acme, sandbox_56])
+        await s.flush()
+        s.add(
+            VendorErpLink(
+                organization_id=org_id, vendor_id=acme.id, realm="qbo:prod", erp_vendor_id="56"
+            )
+        )
+        await s.commit()
+        acme_id = acme.id
+
+    await _sync_with_payloads(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="QBO-K", vendor_name="Other", vendor_erp_id="56", total=Decimal("1"))],
+    )
+
+    assert await _vendor_of(realdb, "QBO-K") == acme_id
+
+
+async def test_sync_erp_fills_a_missing_vendor_on_resync_and_never_repoints(realdb, monkeypatch):
+    """A PO synced before its supplier gets linked by the next sync once the
+    vendor exists; a vendor already on a PO is left alone."""
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        chosen = Vendor(name="Chosen By A Person", organization_id=org_id)
+        s.add(chosen)
+        await s.commit()
+        chosen_id = chosen.id
+    await _add_po(mk, org_id, po_number="ERP-UNLINKED", total=Decimal("250.00"))
+    await _add_po(mk, org_id, po_number="ERP-LINKED", total=Decimal("250.00"), vendor_id=chosen_id)
+    async with mk() as s:
+        synced = Vendor(name="Feoh Test Supplies Inc", erp_vendor_id="c-1", organization_id=org_id)
+        s.add(synced)
+        await s.commit()
+        synced_id = synced.id
+
+    payloads = [
+        PoPayload(
+            po_number=n,
+            vendor_name="Feoh Test Supplies Inc",
+            vendor_erp_id="c-1",
+            total=Decimal("250.00"),
+        )
+        for n in ("ERP-UNLINKED", "ERP-LINKED")
+    ]
+    body = await _sync_with_payloads(realdb, monkeypatch, payloads)
+
+    assert await _vendor_of(realdb, "ERP-UNLINKED") == synced_id
+    assert await _vendor_of(realdb, "ERP-LINKED") == chosen_id
+    # Filling the link is a change; the untouched PO is skipped.
+    assert (body["updated"], body["skipped"], body["created"]) == (1, 1, 0)
+
+    # Nothing left to fill: a third sync changes nothing.
+    again = await _sync_with_payloads(realdb, monkeypatch, payloads)
+    assert (again["updated"], again["skipped"]) == (0, 2)
+
+
 async def test_sync_erp_isolated_per_tenant(realdb):
     """A sync against tenant A leaves tenant B's PO table empty."""
     await _set_org_erp(
@@ -757,3 +994,1226 @@ async def test_sync_erp_refreshes_total_status_and_backfills_delivery_date_toget
     assert refreshed.total == Decimal("15000.00")
     assert refreshed.status == "open"
     assert refreshed.expected_delivery_date == date(2024, 7, 1)
+
+
+# ---------------------------------------------------------------------------
+# sync-erp: a PO the adapter now skips (decisions §323)
+# ---------------------------------------------------------------------------
+
+
+async def _sync_with_listing(realdb, monkeypatch, pos, skipped=()) -> dict:
+    """Run sync-erp against the mock adapter, answering ``list_pos_report``."""
+    from app.services.erp_adapters.base import PoListing
+    from app.services.erp_adapters.mock_adapter import MockAdapter
+
+    async def _report(self):
+        return PoListing(pos=list(pos), skipped=list(skipped))
+
+    monkeypatch.setattr(MockAdapter, "list_pos_report", _report)
+    await _set_org_erp(
+        realdb, realdb.info("a").org_id, {"type": "mock", "integration_method": "direct"}
+    )
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post("/api/purchase-orders/sync-erp")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_sync_erp_marks_an_already_synced_po_the_adapter_now_skips(realdb, monkeypatch):
+    """A PO synced at 100.00 that the ERP later makes unpriceable (SYSPRO: a
+    discount added; Blackbaud: the order total gone) used to keep 100.00, and
+    the 3-way match kept passing invoices against it. Now the row is marked,
+    the matcher refuses to compare, the invoice citing it is held, and the
+    next sync that prices the PO lifts the mark."""
+    from app.models.exception import Exception as ExceptionRow
+    from app.services.erp_adapters.base import PoPayload, PoSkipReason, SkippedPo
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    priced = PoPayload(po_number="PO-SKIP", total=Decimal("100.00"), currency="USD")
+
+    first = await _sync_with_listing(realdb, monkeypatch, [priced])
+    assert first["created"] == 1 and first["unverifiable"] == 0
+
+    async with mk() as s:
+        inv = Invoice(
+            invoice_number="INV-SKIP-1",
+            vendor_name="Anyone",
+            amount=Decimal("100.00"),
+            currency="USD",
+            po_number="PO-SKIP",
+            status=InvoiceStatus.ready_for_review,
+            organization_id=org_id,
+        )
+        s.add(inv)
+        await s.commit()
+        inv_id = inv.id
+
+    second = await _sync_with_listing(
+        realdb, monkeypatch, [], [SkippedPo("PO-SKIP", PoSkipReason.unpriceable)]
+    )
+    assert second["not_priced"] == 1
+    assert second["unverifiable"] == 1
+    assert "could not be priced exactly" in second["message"]
+
+    async with mk() as s:
+        po = (
+            await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == "PO-SKIP"))
+        ).scalar_one()
+        assert po.total == Decimal("100.00")  # nothing invented, nothing erased
+        assert po.total_unverifiable_reason == "unpriceable"
+        inv = await s.get(Invoice, inv_id)
+        assert inv.po_match["status"] == "mismatch"
+        assert inv.po_match["po_total_unverifiable_reason"] == "unpriceable"
+        assert inv.po_match["amount_variance"] is None
+        assert [i["code"] for i in inv.po_match["issues"]] == [
+            "po_match.issue.po_total_unverifiable"
+        ]
+        assert "po_total_unverifiable" in [w["code"] for w in inv.warnings or []]
+        held = (
+            (
+                await s.execute(
+                    select(ExceptionRow).where(
+                        ExceptionRow.invoice_id == inv_id,
+                        ExceptionRow.exception_type == "po_mismatch",
+                        ExceptionRow.status == "open",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(held) == 1
+
+    third = await _sync_with_listing(realdb, monkeypatch, [priced])
+    assert third["unverifiable"] == 0 and third["updated"] == 1
+
+    async with mk() as s:
+        po = (
+            await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == "PO-SKIP"))
+        ).scalar_one()
+        assert po.total_unverifiable_reason is None
+        inv = await s.get(Invoice, inv_id)
+        assert inv.po_match["status"] == "matched"
+        # The mark lifts, the HOLD does not: a sync never clears one (§323,
+        # amended). It stays for a person, annotated with why it now reads as
+        # clearable.
+        row = (
+            await s.execute(
+                select(ExceptionRow).where(
+                    ExceptionRow.invoice_id == inv_id,
+                    ExceptionRow.exception_type == "po_mismatch",
+                )
+            )
+        ).scalar_one()
+        assert row.status == "open"
+        assert row.erp_report["kind"] == "po_rematch_clears"
+
+
+async def test_sync_erp_skip_marks_only_rows_in_the_synced_entity_scope(realdb, monkeypatch):
+    """The mark follows the upsert's scope: this entity and unstamped rows,
+    never another subsidiary's PO that happens to share the number."""
+    from app.models.entity import Entity
+    from app.services.erp_adapters.base import PoSkipReason, SkippedPo
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        other = Entity(name="Other Sub", slug="oth-skip", organization_id=org_id)
+        s.add(other)
+        await s.flush()
+        s.add(
+            PurchaseOrder(
+                po_number="PO-SHARED",
+                total=Decimal("50.00"),
+                currency="USD",
+                organization_id=org_id,
+                entity_id=other.id,
+            )
+        )
+        await s.commit()
+
+    body = await _sync_with_listing(
+        realdb, monkeypatch, [], [SkippedPo("PO-SHARED", PoSkipReason.unpriceable)]
+    )
+    assert body["unverifiable"] == 0
+    async with mk() as s:
+        reason = (
+            await s.execute(
+                select(PurchaseOrder.total_unverifiable_reason).where(
+                    PurchaseOrder.po_number == "PO-SHARED"
+                )
+            )
+        ).scalar_one()
+    assert reason is None
+
+
+async def test_sync_erp_marks_a_blackbaud_po_that_lost_its_order_total(realdb, monkeypatch):
+    """The Blackbaud wiring end to end, through the real adapter: FE NXT
+    lists PO 501 at 100.00, then without an ``order_total``. The adapter used
+    to drop it silently, so the row kept 100.00 in the 3-way match; now it is
+    named ``unpriceable`` and the sync marks the row (decisions §323)."""
+    import httpx
+
+    from app.config import settings
+    from app.services.erp_adapters.blackbaud_fe_nxt import BlackbaudFeNxtAdapter
+
+    monkeypatch.setattr(settings, "erp_blackbaud_subscription_key", "platform-sub-key")
+    monkeypatch.setattr(settings, "erp_blackbaud_api_base", "")
+
+    async def token(self):
+        return "tok"
+
+    monkeypatch.setattr(BlackbaudFeNxtAdapter, "access_token", token)
+    rows: list[dict] = []
+
+    def sky(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/accountspayable/v1/purchaseorders"
+        return httpx.Response(200, json={"count": len(rows), "value": rows})
+
+    def client(self, *, timeout):
+        return httpx.AsyncClient(timeout=timeout, transport=httpx.MockTransport(sky))
+
+    monkeypatch.setattr(BlackbaudFeNxtAdapter, "oauth_client", client)
+    await _set_org_erp(
+        realdb,
+        realdb.info("a").org_id,
+        {
+            "type": "blackbaud_fe_nxt",
+            "integration_method": "direct",
+            "oauth": {"external_tenant_id": "p-env-123"},
+        },
+    )
+
+    async def sync() -> dict:
+        async with realdb.client(key="a", role="ap_manager") as c:
+            resp = await c.post("/api/purchase-orders/sync-erp")
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    async def mark() -> tuple[Decimal, str | None]:
+        async with realdb.sessionmaker("a")() as s:
+            po = (
+                await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == "501"))
+            ).scalar_one()
+            return po.total, po.total_unverifiable_reason
+
+    rows[:] = [{"order_number": 501, "order_total": 100, "order_status": "OpenPurchaseOrder"}]
+    assert (await sync())["created"] == 1
+    assert await mark() == (Decimal("100.00"), None)
+
+    rows[:] = [{"order_number": 501, "order_status": "OpenPurchaseOrder"}]
+    body = await sync()
+    assert body["not_priced"] == 1 and body["unverifiable"] == 1
+    assert await mark() == (Decimal("100.00"), "unpriceable")
+
+    rows[:] = [{"order_number": 501, "order_total": 120, "order_status": "OpenPurchaseOrder"}]
+    assert (await sync())["unverifiable"] == 0
+    assert await mark() == (Decimal("120.00"), None)
+
+
+async def test_sync_erp_never_stores_a_po_with_no_total_at_zero(realdb, monkeypatch):
+    """Xero end to end, through the real adapter. Xero, Merge.dev and
+    QuickBooks Online used to sync a PO with no total at 0, so every invoice
+    citing it read as over-billed: a ``po_mismatch`` raised on an amount
+    variance against a figure the ERP never stated. Now the PO is reported
+    ``unpriceable`` (decisions §323, §325): a PO the sync has never seen is not
+    created at all, and one it stored earlier keeps its total, is marked, and
+    holds its invoice as ``po_total_unverifiable`` — the hold §323 wants —
+    never as an over-bill against 0. The other two mappers are covered in
+    their adapter tests; the listing contract they share is the same."""
+    import httpx
+
+    from app.models.exception import Exception as ExceptionRow
+    from app.services.erp_adapters.xero import XeroAdapter
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    records: list[dict] = []
+
+    async def token(self):
+        return "tok"
+
+    def xero(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/PurchaseOrders")
+        return httpx.Response(200, json={"PurchaseOrders": records})
+
+    def client(self, *, timeout):
+        return httpx.AsyncClient(timeout=timeout, transport=httpx.MockTransport(xero))
+
+    monkeypatch.setattr(XeroAdapter, "access_token", token)
+    monkeypatch.setattr(XeroAdapter, "oauth_client", client)
+    await _set_org_erp(
+        realdb,
+        org_id,
+        {"type": "xero", "integration_method": "direct", "oauth": {"external_tenant_id": "t-1"}},
+    )
+
+    async def sync() -> dict:
+        async with realdb.client(key="a", role="ap_manager") as c:
+            resp = await c.post("/api/purchase-orders/sync-erp")
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    async def row(number: str) -> PurchaseOrder | None:
+        async with mk() as s:
+            return (
+                await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == number))
+            ).scalar_one_or_none()
+
+    # A PO first seen with no total: reported, never created at 0.
+    records[:] = [{"PurchaseOrderNumber": "PO-NEW-NOTOTAL", "CurrencyCode": "USD"}]
+    body = await sync()
+    assert body["created"] == 0 and body["not_priced"] == 1
+    assert await row("PO-NEW-NOTOTAL") is None
+
+    # A PO synced at 100.00 with a matching invoice, which then loses its total.
+    records[:] = [{"PurchaseOrderNumber": "PO-XERO", "Total": 100.00, "CurrencyCode": "USD"}]
+    assert (await sync())["created"] == 1
+    async with mk() as s:
+        inv = Invoice(
+            invoice_number="INV-XERO-1",
+            vendor_name="Anyone",
+            amount=Decimal("100.00"),
+            currency="USD",
+            po_number="PO-XERO",
+            status=InvoiceStatus.ready_for_review,
+            organization_id=org_id,
+        )
+        s.add(inv)
+        await s.commit()
+        inv_id = inv.id
+
+    records[:] = [{"PurchaseOrderNumber": "PO-XERO", "CurrencyCode": "USD"}]
+    body = await sync()
+    assert body["not_priced"] == 1 and body["unverifiable"] == 1
+
+    po = await row("PO-XERO")
+    assert po is not None
+    assert po.total == Decimal("100.00")  # never overwritten with 0
+    assert po.total_unverifiable_reason == "unpriceable"
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        # The matcher compared nothing: no variance, so no over-bill against 0.
+        assert inv.po_match["amount_variance"] is None
+        assert inv.po_match["po_total_unverifiable_reason"] == "unpriceable"
+        codes = [w["code"] for w in inv.warnings or []]
+        assert "po_total_unverifiable" in codes
+        assert "po_amount_variance" not in codes
+        rows = (
+            (
+                await s.execute(
+                    select(ExceptionRow).where(
+                        ExceptionRow.invoice_id == inv_id,
+                        ExceptionRow.exception_type == "po_mismatch",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [r.status for r in rows] == ["open"]
+
+
+def test_an_adapter_that_never_skips_reports_nothing_skipped():
+    """The additive contract: an adapter that only implements ``list_pos``
+    works unchanged."""
+    import asyncio
+
+    from app.services.erp_adapters.base import ErpAdapter, PoPayload
+
+    class OnlyListPos(ErpAdapter):
+        erp_type = "only_list_pos"
+
+        async def list_pos(self):
+            return [PoPayload(po_number="P1", total=Decimal("1"))]
+
+    listing = asyncio.run(OnlyListPos({}).list_pos_report())
+    assert [p.po_number for p in listing.pos] == ["P1"]
+    assert listing.skipped == []
+
+
+# ---------------------------------------------------------------------------
+# sync-erp: the vendor link is entity-scoped and never a guess
+# ---------------------------------------------------------------------------
+
+
+async def test_sync_erp_links_only_a_vendor_in_the_synced_entity(realdb, monkeypatch):
+    """Two subsidiaries each kept in their own ERP company can both hold
+    supplier id "v-9" — a Sage Intacct entity is its own realm (decisions
+    §412). One company's "v-9" is one supplier (``uq_vendors_erp_link``,
+    §486), so the pair differs by realm. The mock sync names no realm and
+    reads every link (``erp_link_realm.link_is_live``), so only the entity
+    scope keeps them apart: the id map was built over the whole org, so the
+    vendor read last won and a PO synced into this entity could link to the
+    other subsidiary's vendor."""
+    from app.models.entity import Entity
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        default_entity = (
+            await s.execute(select(Entity).where(Entity.is_default.is_(True)))
+        ).scalar_one()
+        other = Entity(name="Sub B", slug="sub-b-vscope", organization_id=org_id)
+        s.add(other)
+        await s.flush()
+        ours = Vendor(
+            name="Ours",
+            erp_vendor_id="v-9",
+            erp_link_realm="sage_intacct:co|loc-a",
+            organization_id=org_id,
+            entity_id=default_entity.id,
+        )
+        s.add(ours)
+        await s.flush()
+        # Created after ours, so it is the one a last-wins map would pick.
+        theirs = Vendor(
+            name="Theirs",
+            erp_vendor_id="v-9",
+            erp_link_realm="sage_intacct:co|loc-b",
+            organization_id=org_id,
+            entity_id=other.id,
+        )
+        s.add(theirs)
+        await s.commit()
+        ours_id = ours.id
+
+    await _sync_with_payloads(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="ERP-SCOPED", vendor_erp_id="v-9", total=Decimal("10.00"))],
+    )
+    assert await _vendor_of(realdb, "ERP-SCOPED") == ours_id
+
+
+async def test_sync_erp_leaves_a_po_unlinked_when_its_erp_id_is_ambiguous(realdb, monkeypatch):
+    """Two vendors in scope hold the same ERP id: neither is linked, and the
+    name does not break the tie — the ERP named an id, not a name.
+
+    One company's id has one holder (``uq_vendors_erp_link``, §486), so the
+    pair is two companies' "v-dup": a pre-0115 link with no realm and one made
+    under a named company. A sync that names no realm (the mock here; an OAuth
+    ERP before its consent) reads every link (``erp_link_realm.link_is_live``),
+    so both are in play and neither may be guessed."""
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        s.add_all(
+            [
+                Vendor(name="Dup One", erp_vendor_id="v-dup", organization_id=org_id),
+                Vendor(
+                    name="Dup Two",
+                    erp_vendor_id="v-dup",
+                    erp_link_realm="netsuite:tstdrv1",
+                    organization_id=org_id,
+                ),
+            ]
+        )
+        await s.commit()
+
+    await _sync_with_payloads(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="ERP-AMBIG",
+                vendor_erp_id="v-dup",
+                vendor_name="Dup One",
+                total=Decimal("10.00"),
+            )
+        ],
+    )
+    assert await _vendor_of(realdb, "ERP-AMBIG") is None
+
+
+async def test_sync_erp_marks_and_clears_the_same_row_when_a_shared_twin_exists(
+    realdb, monkeypatch
+):
+    """An entity's own row and an unstamped (shared) row can carry one number.
+    The upsert refreshes only the own-entity row, so the mark goes on that row
+    alone — marking the shared twin too would leave a mark no sync clears and
+    hold its invoices for good."""
+    from app.models.entity import Entity
+    from app.services.erp_adapters.base import PoPayload, PoSkipReason, SkippedPo
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        default_entity = (
+            await s.execute(select(Entity).where(Entity.is_default.is_(True)))
+        ).scalar_one()
+        own = PurchaseOrder(
+            po_number="PO-TWIN",
+            total=Decimal("100.00"),
+            currency="USD",
+            organization_id=org_id,
+            entity_id=default_entity.id,
+        )
+        shared = PurchaseOrder(
+            po_number="PO-TWIN", total=Decimal("100.00"), currency="USD", organization_id=org_id
+        )
+        s.add_all([own, shared])
+        await s.commit()
+        own_id, shared_id = own.id, shared.id
+
+    async def _reasons() -> dict:
+        async with mk() as s:
+            rows = await s.execute(
+                select(PurchaseOrder.id, PurchaseOrder.total_unverifiable_reason).where(
+                    PurchaseOrder.po_number == "PO-TWIN"
+                )
+            )
+            return dict(rows.all())
+
+    body = await _sync_with_listing(
+        realdb, monkeypatch, [], [SkippedPo("PO-TWIN", PoSkipReason.unpriceable)]
+    )
+    assert body["unverifiable"] == 1
+    assert await _reasons() == {own_id: "unpriceable", shared_id: None}
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-TWIN", total=Decimal("100.00"), currency="USD")],
+    )
+    assert await _reasons() == {own_id: None, shared_id: None}
+
+
+async def test_sync_erp_rolls_back_the_mark_when_the_rematch_fails(realdb, monkeypatch):
+    """The mark exists to RAISE a hold, and the payment gate reads only open
+    exceptions: a mark committed without its hold would leave an approved
+    invoice payable against the stale total. A failed re-match fails the sync
+    and nothing is marked."""
+    from app.services import invoice_warnings
+    from app.services.erp_adapters.base import PoPayload, PoSkipReason, SkippedPo
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-RB", total=Decimal("100.00"), currency="USD")],
+    )
+    async with mk() as s:
+        s.add(
+            Invoice(
+                invoice_number="INV-RB-1",
+                vendor_name="Anyone",
+                amount=Decimal("100.00"),
+                currency="USD",
+                po_number="PO-RB",
+                status=InvoiceStatus.approved,
+                organization_id=org_id,
+            )
+        )
+        await s.commit()
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(invoice_warnings, "refresh_warnings", _boom)
+    from app.services.erp_adapters.base import PoListing
+    from app.services.erp_adapters.mock_adapter import MockAdapter
+
+    async def _report(self):
+        return PoListing(pos=[], skipped=[SkippedPo("PO-RB", PoSkipReason.unpriceable)])
+
+    monkeypatch.setattr(MockAdapter, "list_pos_report", _report)
+    async with realdb.client(key="a", role="ap_manager") as c:
+        try:
+            resp = await c.post("/api/purchase-orders/sync-erp")
+        except RuntimeError:
+            resp = None
+    assert resp is None or resp.status_code >= 500
+
+    async with mk() as s:
+        reason = (
+            await s.execute(
+                select(PurchaseOrder.total_unverifiable_reason).where(
+                    PurchaseOrder.po_number == "PO-RB"
+                )
+            )
+        ).scalar_one()
+    assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# sync-erp: the re-match may raise a hold, never clear one (§323, amended)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_approved_po_invoice(realdb, *, number: str, po_number: str, amount: str):
+    """An approved, payable invoice citing ``po_number`` (no vendor, so the
+    run builder's vendor gate does not stand in for the exception gate)."""
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        inv = Invoice(
+            invoice_number=number,
+            vendor_name="Rematch Vendor",
+            amount=Decimal(amount),
+            currency="USD",
+            po_number=po_number,
+            status=InvoiceStatus.approved,
+            organization_id=org_id,
+        )
+        s.add(inv)
+        await s.commit()
+        return inv.id
+
+
+async def _po_mismatch_rows(realdb, inv_id) -> list:
+    from app.models.exception import Exception as ExceptionRow
+
+    async with realdb.sessionmaker("a")() as s:
+        return list(
+            (
+                await s.execute(
+                    select(ExceptionRow).where(
+                        ExceptionRow.invoice_id == inv_id,
+                        ExceptionRow.exception_type == "po_mismatch",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _try_run(realdb, inv_id):
+    async with realdb.client(key="a", role="admin") as c:
+        return await c.post(
+            "/api/payments/runs",
+            json={"items": [{"invoice_id": str(inv_id), "method": "ach"}]},
+        )
+
+
+async def test_sync_erp_lowering_a_po_total_opens_a_blocking_hold(realdb, monkeypatch):
+    """The ERP cuts a PO from 150 to 100 under an approved 150 invoice: the
+    sync's re-match opens a payment-blocking `po_mismatch` at once, and the
+    payment run refuses the invoice."""
+    from app.services.erp_adapters.base import PoPayload
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-LOWER", total=Decimal("150.00"), currency="USD")],
+    )
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-LOWER-1", po_number="PO-LOWER", amount="150.00"
+    )
+    assert await _po_mismatch_rows(realdb, inv_id) == []
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-LOWER", total=Decimal("100.00"), currency="USD")],
+    )
+    rows = await _po_mismatch_rows(realdb, inv_id)
+    assert [r.status for r in rows] == ["open"]
+    assert rows[0].erp_report is None
+
+    resp = await _try_run(realdb, inv_id)
+    assert resp.status_code == 409, resp.text
+    assert "po_mismatch" in resp.json()["detail"]
+
+
+async def test_sync_erp_restating_a_po_currency_opens_a_blocking_hold(realdb, monkeypatch):
+    """The ERP restates a 1,000.00 USD PO as 1,000.00 EUR under an approved
+    1,000.00 USD invoice. The total did not move, but it is a different order:
+    the sync re-matches, the currency guard opens a hold, and the run refuses."""
+    from app.services.erp_adapters.base import PoPayload
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-CCY", total=Decimal("1000.00"), currency="USD")],
+    )
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-CCY-1", po_number="PO-CCY", amount="1000.00"
+    )
+    assert await _po_mismatch_rows(realdb, inv_id) == []
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-CCY", total=Decimal("1000.00"), currency="EUR")],
+    )
+    assert [r.status for r in await _po_mismatch_rows(realdb, inv_id)] == ["open"]
+
+    # Refused. A currency mismatch also raises `fraud_flag`, which the refusal
+    # may name first; either way the invoice is held.
+    resp = await _try_run(realdb, inv_id)
+    assert resp.status_code == 409, resp.text
+    assert "INV-CCY-1" in resp.json()["detail"]
+
+
+async def test_sync_erp_rematch_skips_other_entities_and_paid_invoices(realdb, monkeypatch):
+    """The sync re-matches the invoices that can match the PO it changed: this
+    entity's and unstamped ones. Another subsidiary's invoice citing the same
+    number is left alone (it matches its own PO), and so is a paid one (a hold
+    on money already gone stops nothing)."""
+    from app.models.entity import Entity
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-SCOPE", total=Decimal("150.00"), currency="USD")],
+    )
+    async with realdb.sessionmaker("a")() as s:
+        default_entity = (
+            await s.execute(select(Entity).where(Entity.is_default.is_(True)))
+        ).scalar_one()
+        other = Entity(name="Sub C", slug="sub-c-rematch", organization_id=org_id)
+        s.add(other)
+        await s.flush()
+
+        def inv(number, status, entity):
+            return Invoice(
+                invoice_number=number,
+                vendor_name="Rematch Vendor",
+                amount=Decimal("150.00"),
+                currency="USD",
+                po_number="PO-SCOPE",
+                status=status,
+                organization_id=org_id,
+                entity_id=entity,
+            )
+
+        ours = inv("INV-SCOPE-OURS", InvoiceStatus.approved, default_entity.id)
+        theirs = inv("INV-SCOPE-THEIRS", InvoiceStatus.approved, other.id)
+        paid = inv("INV-SCOPE-PAID", InvoiceStatus.paid, default_entity.id)
+        s.add_all([ours, theirs, paid])
+        await s.commit()
+        ids = {"ours": ours.id, "theirs": theirs.id, "paid": paid.id}
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-SCOPE", total=Decimal("100.00"), currency="USD")],
+    )
+
+    assert [r.status for r in await _po_mismatch_rows(realdb, ids["ours"])] == ["open"]
+    assert await _po_mismatch_rows(realdb, ids["theirs"]) == []
+    assert await _po_mismatch_rows(realdb, ids["paid"]) == []
+
+
+async def test_sync_erp_cancelling_a_po_holds_the_invoice_citing_it(realdb, monkeypatch):
+    """The ERP cancels a PO an approved invoice matched exactly. The total did
+    not move, but a cancelled order authorizes nothing: the sync re-matches,
+    the invoice is held, and the run refuses it."""
+    from app.services.erp_adapters.base import PoPayload
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-CXL", total=Decimal("500.00"), currency="USD")],
+    )
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-CXL-1", po_number="PO-CXL", amount="500.00"
+    )
+    assert await _po_mismatch_rows(realdb, inv_id) == []
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="PO-CXL", total=Decimal("500.00"), currency="USD", status="cancelled"
+            )
+        ],
+    )
+    assert [r.status for r in await _po_mismatch_rows(realdb, inv_id)] == ["open"]
+
+    resp = await _try_run(realdb, inv_id)
+    assert resp.status_code == 409, resp.text
+    assert "po_mismatch" in resp.json()["detail"]
+
+
+async def test_sync_erp_taking_a_po_back_to_unissued_holds_the_invoice_citing_it(
+    realdb, monkeypatch
+):
+    """An earlier sync stored a PO as `open`; the ERP now reports it as not
+    approved (decisions §394). The total did not move, but an unissued order
+    authorizes nothing: the sync re-matches, the invoice is held with the
+    `po_not_issued` finding, and the run refuses it. The ERP approving it
+    later does not lift the hold from the sync (decisions §323, amended)."""
+    from app.services.erp_adapters.base import PoPayload
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-UNISS", total=Decimal("500.00"), currency="USD")],
+    )
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-UNISS-1", po_number="PO-UNISS", amount="500.00"
+    )
+    assert await _po_mismatch_rows(realdb, inv_id) == []
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="PO-UNISS",
+                total=Decimal("500.00"),
+                currency="USD",
+                status=UNISSUED_PO_STATUS,
+            )
+        ],
+    )
+    [held] = await _po_mismatch_rows(realdb, inv_id)
+    assert held.status == "open"
+    async with realdb.sessionmaker("a")() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.po_match["po_not_issued"] is True
+        assert "po_not_issued" in [w.get("code") for w in inv.warnings or []]
+
+    resp = await _try_run(realdb, inv_id)
+    assert resp.status_code == 409, resp.text
+    assert "po_mismatch" in resp.json()["detail"]
+
+    # The ERP issues it: the re-match matches again, but the sync never clears.
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-UNISS", total=Decimal("500.00"), currency="USD")],
+    )
+    async with realdb.sessionmaker("a")() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.po_match["status"] == "matched"
+        assert inv.po_match["po_not_issued"] is False
+    [row] = await _po_mismatch_rows(realdb, inv_id)
+    assert row.id == held.id and row.status == "open"
+
+
+async def test_sync_erp_raising_a_po_total_never_clears_the_hold(realdb, monkeypatch):
+    """The over-billing hold is open; someone raises the PO total in the ERP to
+    the invoiced amount and syncs. The re-match now MATCHES, but the hold stays
+    open and blocking — an ERP-side actor is outside the invoice's implicated
+    set, so the release must be a FeohLedger person's sign-off. The row records
+    why it now reads as clearable, and the run is still refused."""
+    from app.services.erp_adapters.base import PoPayload
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-RAISE", total=Decimal("150.00"), currency="USD")],
+    )
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-RAISE-1", po_number="PO-RAISE", amount="150.00"
+    )
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-RAISE", total=Decimal("100.00"), currency="USD")],
+    )
+    [held] = await _po_mismatch_rows(realdb, inv_id)
+    assert held.status == "open"
+
+    body = await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-RAISE", total=Decimal("150.00"), currency="USD")],
+    )
+    assert body["updated"] == 1
+
+    async with realdb.sessionmaker("a")() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.po_match["status"] == "matched"
+    [row] = await _po_mismatch_rows(realdb, inv_id)
+    assert row.id == held.id
+    assert row.status == "open"
+    assert row.resolved_at is None and row.resolved_by is None
+    assert row.erp_report["kind"] == "po_rematch_clears"
+    assert row.erp_report["erp_type"] == "mock"
+    assert row.erp_report["po_number"] == "PO-RAISE"
+    assert row.erp_report["observed_on"]
+
+    resp = await _try_run(realdb, inv_id)
+    assert resp.status_code == 409, resp.text
+    assert "po_mismatch" in resp.json()["detail"]
+
+    # The ERP lowers it again: the finding is back, so the "now matches" note
+    # comes off the still-open row.
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-RAISE", total=Decimal("100.00"), currency="USD")],
+    )
+    [row] = await _po_mismatch_rows(realdb, inv_id)
+    assert row.status == "open" and row.erp_report is None
+
+
+async def test_a_refresh_outside_the_erp_sync_still_auto_closes_as_before(realdb, monkeypatch):
+    """Only the sync is hold-only. A refresh a FeohLedger action triggers (an
+    invoice edit, a receipt) keeps its pre-§323 behaviour: the cleared finding's
+    row is closed under `_close_cleared_po_exceptions`' segregation limits."""
+    from app.services.erp_adapters.base import PoPayload
+    from app.services.invoice_warnings import refresh_warnings
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-HUMAN", total=Decimal("100.00"), currency="USD")],
+    )
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-HUMAN-1", po_number="PO-HUMAN", amount="150.00"
+    )
+    org_id = realdb.info("a").org_id
+    async with realdb.control_sessionmaker()() as cs:
+        org = (await cs.execute(select(Organization).where(Organization.id == org_id))).scalar_one()
+        org_settings = dict(org.settings or {})
+
+    async with realdb.sessionmaker("a")() as s:
+        inv = await s.get(Invoice, inv_id)
+        await refresh_warnings(s, inv, org_settings=org_settings)
+        await s.commit()
+    [held] = await _po_mismatch_rows(realdb, inv_id)
+    assert held.status == "open"
+
+    # The amount corrected in FeohLedger to the PO's figure.
+    async with realdb.sessionmaker("a")() as s:
+        inv = await s.get(Invoice, inv_id)
+        inv.amount = Decimal("100.00")
+        await refresh_warnings(s, inv, org_settings=org_settings)
+        await s.commit()
+    [row] = await _po_mismatch_rows(realdb, inv_id)
+    assert row.status == "resolved"
+
+
+# ---------------------------------------------------------------------------
+# sync-erp: the ERP's lines are refreshed too (decisions §327)
+# ---------------------------------------------------------------------------
+
+
+async def _lines_of(realdb, po_number: str) -> list[POLineItem]:
+    async with realdb.sessionmaker("a")() as s:
+        po_id = (
+            await s.execute(select(PurchaseOrder.id).where(PurchaseOrder.po_number == po_number))
+        ).scalar_one()
+        return list(
+            (await s.execute(select(POLineItem).where(POLineItem.po_id == po_id))).scalars().all()
+        )
+
+
+async def _receive_against(realdb, po_number: str, line: POLineItem, qty: str) -> uuid.UUID:
+    org_id = realdb.info("a").org_id
+    async with realdb.sessionmaker("a")() as s:
+        po_id = (
+            await s.execute(select(PurchaseOrder.id).where(PurchaseOrder.po_number == po_number))
+        ).scalar_one()
+        gr = GoodsReceipt(gr_number=f"GR-{po_number}", po_id=po_id, organization_id=org_id)
+        s.add(gr)
+        await s.flush()
+        gr_line = GRLineItem(
+            gr_id=gr.id, po_line_item_id=line.id, quantity_received=Decimal(qty), sku=line.sku
+        )
+        s.add(gr_line)
+        await s.commit()
+        return gr_line.id
+
+
+def _po_with_lines(number: str, *lines: tuple[str, str, str, str]):
+    """A PoPayload whose total is its lines' sum; each line (sku, qty, price, total)."""
+    from app.services.erp_adapters.base import PoLinePayload, PoPayload
+
+    return PoPayload(
+        po_number=number,
+        total=sum((Decimal(t) for _, _, _, t in lines), Decimal("0")),
+        currency="USD",
+        line_items=[
+            PoLinePayload(
+                description=f"Item {sku}",
+                item_code=sku,
+                quantity=Decimal(q),
+                unit_price=Decimal(p),
+                total=Decimal(t),
+            )
+            for sku, q, p, t in lines
+        ],
+    )
+
+
+async def test_sync_erp_replaces_the_lines_of_a_po_nothing_was_received_against(
+    realdb, monkeypatch
+):
+    """PO-1 is 10 × 10 = 100; the ERP amends it to 20 × 10 = 200. The total
+    used to move while the lines stayed at 10 units, so a 10-unit receipt was
+    valued at the whole 200. Now the lines follow the ERP."""
+    await _sync_with_listing(
+        realdb, monkeypatch, [_po_with_lines("PO-L1", ("A", "10", "10", "100"))]
+    )
+    await _sync_with_listing(
+        realdb, monkeypatch, [_po_with_lines("PO-L1", ("A", "20", "10", "200"))]
+    )
+
+    lines = await _lines_of(realdb, "PO-L1")
+    assert [(li.sku, li.quantity, li.total) for li in lines] == [
+        ("A", Decimal("20.0000"), Decimal("200.00"))
+    ]
+
+
+async def test_sync_erp_is_idempotent_for_lines(realdb, monkeypatch):
+    """The same lines twice change nothing: the second sync reports the PO as
+    skipped, and the line ids are kept."""
+    payload = _po_with_lines("PO-L2", ("A", "3", "33.33", "99.99"))
+    await _sync_with_listing(realdb, monkeypatch, [payload])
+    before = [li.id for li in await _lines_of(realdb, "PO-L2")]
+    body = await _sync_with_listing(realdb, monkeypatch, [payload])
+
+    assert body["skipped"] == 1 and body["updated"] == 0
+    assert [li.id for li in await _lines_of(realdb, "PO-L2")] == before
+
+
+async def test_sync_erp_updates_a_received_line_in_place(realdb, monkeypatch):
+    """Goods were received against line A; the ERP raises A's quantity and adds
+    line B. A is updated in place, so the receipt still points at it, and B is
+    added."""
+    await _sync_with_listing(
+        realdb, monkeypatch, [_po_with_lines("PO-L3", ("A", "10", "10", "100"))]
+    )
+    (line_a,) = await _lines_of(realdb, "PO-L3")
+    await _receive_against(realdb, "PO-L3", line_a, "5")
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [_po_with_lines("PO-L3", ("A", "15", "10", "150"), ("B", "1", "50", "50"))],
+    )
+
+    by_sku = {li.sku: li for li in await _lines_of(realdb, "PO-L3")}
+    assert set(by_sku) == {"A", "B"}
+    assert by_sku["A"].id == line_a.id
+    assert by_sku["A"].quantity == Decimal("15.0000")
+    async with realdb.sessionmaker("a")() as s:
+        po = (
+            await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == "PO-L3"))
+        ).scalar_one()
+    assert po.total == Decimal("200.00")
+    assert po.total_unverifiable_reason is None
+
+
+async def test_sync_erp_marks_a_po_whose_received_line_the_erp_dropped(realdb, monkeypatch):
+    """Goods were received against line A, and the ERP's amended PO has no A:
+    there is nothing to pair the receipt with, so the stored lines are left as
+    they are, the PO is marked `lines_changed` and the invoice citing it is
+    held for a person."""
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [_po_with_lines("PO-L4", ("A", "10", "10", "100"), ("B", "10", "10", "100"))],
+    )
+    line_a = next(li for li in await _lines_of(realdb, "PO-L4") if li.sku == "A")
+    await _receive_against(realdb, "PO-L4", line_a, "10")
+    inv_id = await _seed_approved_po_invoice(
+        realdb, number="INV-L4-1", po_number="PO-L4", amount="100.00"
+    )
+
+    await _sync_with_listing(
+        realdb, monkeypatch, [_po_with_lines("PO-L4", ("B", "20", "10", "200"))]
+    )
+
+    async with realdb.sessionmaker("a")() as s:
+        po = (
+            await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == "PO-L4"))
+        ).scalar_one()
+    assert po.total_unverifiable_reason == "lines_changed"
+    assert {li.sku for li in await _lines_of(realdb, "PO-L4")} == {"A", "B"}
+    assert [r.status for r in await _po_mismatch_rows(realdb, inv_id)] == ["open"]
+
+
+# ---------------------------------------------------------------------------
+# sync-erp: rows an earlier adapter build keyed differently (decisions §328)
+# ---------------------------------------------------------------------------
+
+
+async def test_sync_erp_rekeys_a_row_an_earlier_build_stored_under_another_key(realdb, monkeypatch):
+    """Merge POs used to be stored under their Merge UUID. The next sync made a
+    second row under the real number, and /cfo summed both. Now the UUID row is
+    re-keyed and refreshed: one row, the ERP's total."""
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    await _add_po(mk, org_id, po_number="3f2a-uuid", total=Decimal("10000.00"))
+
+    body = await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="PO-0042",
+                total=Decimal("10000.00"),
+                currency="USD",
+                legacy_po_numbers=("3f2a-uuid",),
+            )
+        ],
+    )
+
+    assert body["created"] == 0
+    async with mk() as s:
+        numbers = (
+            (
+                await s.execute(
+                    select(PurchaseOrder.po_number).where(
+                        PurchaseOrder.po_number.in_(["PO-0042", "3f2a-uuid"])
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert numbers == ["PO-0042"]
+
+
+async def test_sync_erp_marks_an_unpriceable_po_still_stored_under_its_legacy_key(
+    realdb, monkeypatch
+):
+    """Only a priced PO re-keys (§328). A Merge PO an earlier build stored under
+    its UUID that the ERP now lists with no total used to sync at 0 under the
+    real number; reported ``unpriceable`` instead, it would leave the UUID row
+    trusted at its old total unless the mark follows the legacy key. It does,
+    and the priced sync that later re-keys the row clears it. A legacy key the
+    listing reports as another PO's real number is never taken."""
+    from app.services.erp_adapters.base import PoPayload, PoSkipReason, SkippedPo
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    await _add_po(mk, org_id, po_number="7c1d-uuid", total=Decimal("500.00"), currency="USD")
+    await _add_po(mk, org_id, po_number="PO-OWNED", total=Decimal("80.00"), currency="USD")
+
+    async def reason_of(number: str) -> str | None:
+        async with mk() as s:
+            return (
+                await s.execute(
+                    select(PurchaseOrder.total_unverifiable_reason).where(
+                        PurchaseOrder.po_number == number
+                    )
+                )
+            ).scalar_one()
+
+    body = await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="PO-OWNED", total=Decimal("80.00"), currency="USD")],
+        [
+            SkippedPo("PO-0077", PoSkipReason.unpriceable, legacy_po_numbers=("7c1d-uuid",)),
+            # Its legacy key is another listed PO's number: not this PO's row.
+            SkippedPo("PO-0078", PoSkipReason.unpriceable, legacy_po_numbers=("PO-OWNED",)),
+        ],
+    )
+    assert body["unverifiable"] == 1
+    assert await reason_of("7c1d-uuid") == "unpriceable"
+    assert await reason_of("PO-OWNED") is None
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(
+                po_number="PO-0077",
+                total=Decimal("520.00"),
+                currency="USD",
+                legacy_po_numbers=("7c1d-uuid",),
+            )
+        ],
+    )
+    assert await reason_of("PO-0077") is None
+
+
+async def test_sync_erp_marks_a_retired_placeholder_row(realdb, monkeypatch):
+    """Every unnumbered Merge PO used to be filed under one "UNKNOWN" row, a
+    total no single order has. The sync marks it, so it is never matched or
+    summed, and a second sync leaves it as it is."""
+    from app.services.erp_adapters.mock_adapter import MockAdapter
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    await _add_po(mk, org_id, po_number="UNKNOWN", total=Decimal("1400.00"))
+    monkeypatch.setattr(MockAdapter, "retired_po_numbers", ("UNKNOWN",))
+
+    await _sync_with_listing(realdb, monkeypatch, [])
+    await _sync_with_listing(realdb, monkeypatch, [])
+
+    async with mk() as s:
+        po = (
+            await s.execute(select(PurchaseOrder).where(PurchaseOrder.po_number == "UNKNOWN"))
+        ).scalar_one()
+    assert po.total_unverifiable_reason == "unpriceable"
+
+
+async def test_sync_erp_retires_quickbooks_none_row_but_never_a_listed_po_so_numbered(
+    realdb, monkeypatch
+):
+    """QuickBooks Online filed a PO with neither DocNumber nor Id under the
+    literal number "None"; it retires that row like Merge's "UNKNOWN" (§328).
+    A placeholder the listing reports as a real PO number is that PO's: the
+    upsert prices it and the retirement leaves it unmarked."""
+    from app.services.erp_adapters.base import PoPayload
+    from app.services.erp_adapters.mock_adapter import MockAdapter
+    from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
+
+    assert QuickBooksOnlineAdapter.retired_po_numbers == ("None",)
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    await _add_po(mk, org_id, po_number="None", total=Decimal("900.00"))
+    await _add_po(mk, org_id, po_number="UNKNOWN", total=Decimal("40.00"))
+    monkeypatch.setattr(MockAdapter, "retired_po_numbers", ("None", "UNKNOWN"))
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [PoPayload(po_number="UNKNOWN", total=Decimal("40.00"), currency="USD")],
+    )
+
+    async with mk() as s:
+        reasons = dict(
+            (
+                await s.execute(
+                    select(PurchaseOrder.po_number, PurchaseOrder.total_unverifiable_reason).where(
+                        PurchaseOrder.po_number.in_(["None", "UNKNOWN"])
+                    )
+                )
+            ).all()
+        )
+    assert reasons == {"None": "unpriceable", "UNKNOWN": None}
+
+
+async def test_sync_erp_never_rekeys_a_row_another_listed_po_owns(realdb, monkeypatch):
+    """PO-7's legacy key "123" is also another PO's real number in the same
+    listing. Row "123" belongs to that PO, whichever order they come in: it is
+    refreshed, and PO-7 gets a row of its own."""
+    from app.services.erp_adapters.base import PoPayload
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    await _add_po(mk, org_id, po_number="123", total=Decimal("50.00"))
+
+    await _sync_with_listing(
+        realdb,
+        monkeypatch,
+        [
+            PoPayload(po_number="123", total=Decimal("60.00"), currency="USD"),
+            PoPayload(
+                po_number="PO-7",
+                total=Decimal("700.00"),
+                currency="USD",
+                legacy_po_numbers=("123",),
+            ),
+        ],
+    )
+
+    async with mk() as s:
+        rows = {
+            p.po_number: p.total
+            for p in (
+                await s.execute(
+                    select(PurchaseOrder).where(PurchaseOrder.po_number.in_(["123", "PO-7"]))
+                )
+            ).scalars()
+        }
+    assert rows == {"123": Decimal("60.00"), "PO-7": Decimal("700.00")}

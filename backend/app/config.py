@@ -23,6 +23,11 @@ _EXTRACTION_PROVIDERS = frozenset(
 )
 
 
+# The non-secret payee-fingerprint key committed in backend/.env.development. A
+# deployed environment refuses it (`_require_payee_fingerprint_key_in_deployed_envs`).
+_DEV_PAYEE_FINGERPRINT_KEY = "dev-payee-fingerprint-key-not-a-secret"
+
+
 class Settings(BaseSettings):
     model_config = {"env_prefix": "FEOH_"}
 
@@ -34,6 +39,15 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/feohledger"
     tenant_db_prefix: str = "feoh_"
+    # FEOH_DATABASE_IAM_AUTH: sign in to the database with an RDS IAM auth token
+    # minted per connection instead of a password in the URL (`app/db_engine.py`,
+    # docs/decisions.md §310). Off by default, so a laptop and CI keep password
+    # auth against the local container (guard rail 7). On, `database_url` must
+    # carry NO password and TLS must be verify-full — checked at boot below, and
+    # again by the engine factory itself on paths that never load settings
+    # (the Lambda handlers). The factory reads the same variable from the
+    # environment; Settings has no env_file, so the two cannot disagree.
+    database_iam_auth: bool = False
 
     # Auth / JWT
     secret_key: str = "change-me-in-production"
@@ -69,6 +83,13 @@ class Settings(BaseSettings):
     # single-use link that dies on first use — where the temporary password it
     # replaces stayed valid in the inbox until someone signed in.
     signup_set_password_ttl_hours: int = Field(default=72, ge=1)
+    # Lifetime of the set-password link every OTHER account-creating or
+    # admin-reset flow sends instead of a temporary password: admin "Invite
+    # User" and "Reset password", the supplier-portal invite and reset, and
+    # partner child provisioning. Same reasoning as the signup link above —
+    # nobody asked for it a minute ago — and kept separate from it so an
+    # operator can shorten one without the other.
+    set_password_link_ttl_hours: int = Field(default=72, ge=1)
 
     # S3 / MinIO
     s3_endpoint_url: str = "http://localhost:9000"
@@ -305,6 +326,14 @@ class Settings(BaseSettings):
     # fake-erp so the connect flow runs with no Xero account (guard rail 7).
     erp_xero_authorize_url: str = ""
     erp_xero_token_url: str = ""
+    erp_xero_revoke_url: str = ""
+    # Xero webhooks (`POST /api/erp/webhook/xero`, decisions §392). The
+    # platform app's ONE webhook key, which signs every delivery
+    # (`x-xero-signature`, base64 HMAC-SHA256 over the raw body). A secret:
+    # sops in infra-secrets. Empty (the default) = webhooks are off and every
+    # delivery is refused, never verified against a fallback.
+    # backend/.env.development sets a dev value for fake-erp's deliveries.
+    erp_xero_webhook_key: str = ""
     erp_sage_accounting_api_base: str = ""
     erp_sage_accounting_client_id: str = ""
     erp_sage_accounting_client_secret: str = ""
@@ -312,6 +341,7 @@ class Settings(BaseSettings):
     # every call. Empty → Sage's real endpoints. Dev points them at fake-erp.
     erp_sage_accounting_authorize_url: str = ""
     erp_sage_accounting_token_url: str = ""
+    erp_sage_accounting_revoke_url: str = ""
     # Sage Business Cloud Accounting (South Africa) API base. Empty = the
     # admin-config base_url (https-only, SSRF guard) or, absent that, the real
     # https://accounting.sageone.co.za/api/2.0.0.
@@ -333,6 +363,14 @@ class Settings(BaseSettings):
     # Authorize-endpoint override (operator-trusted, non-secret). Empty →
     # Blackbaud's real one. Dev points it at fake-erp so the connect runs locally.
     erp_blackbaud_authorize_url: str = ""
+    # SKY call budget (services/erp_call_budget, decisions §322). SKY meters
+    # calls per subscription key and resets its daily quota at 00:00 UTC. The
+    # quota is the key's tier as Blackbaud states it (25,000 on "Standard
+    # APIs"); no call is made past it. The tenant budget is what ONE tenant on
+    # the shared platform key may spend a day (0 = no per-tenant share); a
+    # tenant with its own subscription_key has its key's whole quota.
+    erp_blackbaud_daily_call_quota: int = 25_000
+    erp_blackbaud_tenant_daily_call_budget: int = 2_500
     # ERP OAuth authorization-code connections (QuickBooks Online, Xero, Sage
     # Accounting — services/erp_oauth.py). Lifetime of the signed, single-use
     # `state` carried across the provider's consent redirect.
@@ -350,6 +388,67 @@ class Settings(BaseSettings):
     erp_qbo_authorize_url: str = ""
     erp_qbo_token_url: str = ""
     erp_qbo_revoke_url: str = ""
+    # QuickBooks webhooks (`POST /api/erp/webhook/quickbooks`, decisions §295).
+    # The Intuit app's ONE verifier token, which signs every CloudEvents
+    # delivery (`intuit-signature`, base64 HMAC-SHA256 over the raw body).
+    # A secret: sops in infra-secrets. Empty (the default) = webhooks are off
+    # and every delivery is refused (silent 204), never verified against a
+    # fallback. backend/.env.development sets a dev value for fake-erp.
+    erp_qbo_webhook_verifier_token: str = ""
+    # QuickBooks status sync-back (decisions §295, `services/erp_status_sync`).
+    # ON: a confirmed QuickBooks push leaves the invoice PAYABLE at
+    # `posted_in_erp` (not `done`), and the change-data-capture sweep below
+    # reconciles every connected company's bills and bill payments, so a bill
+    # paid or deleted in QuickBooks reaches FeohLedger even when a webhook was
+    # lost. OFF (the default, like every outbound sweep): a QuickBooks push
+    # closes the invoice at `done` as before, because nothing guarantees a
+    # bill paid in QuickBooks would ever leave our payment queue.
+    erp_status_sync_enabled: bool = False
+    erp_status_sync_interval_seconds: int = 21600
+    # How far back each sweep asks QuickBooks' CDC for changes. Stateless and
+    # overlapping on purpose (applying a report twice is a no-op); Intuit's CDC
+    # answers at most 30 days.
+    erp_status_sync_lookback_hours: int = 72
+    # The live read of a QuickBooks bill immediately before one of our payments
+    # for it is handed to a rail (decisions §296). Bounded, because the invoice
+    # row lock is held across it; past the bound the item is HELD, never paid
+    # blind (`erp_bill_unverified`, retry-safe).
+    erp_dispatch_check_timeout_seconds: float = 10.0
+    # How many of those reads one request makes at once when it checks many
+    # bills under its locks — the NACHA export and its verify step (decisions
+    # §362). Each `bill_report` is two QuickBooks calls (the bill, then its
+    # payments), so 4 keeps one file at 8 requests in flight, under Intuit's
+    # per-company concurrency throttle.
+    erp_dispatch_check_concurrency: int = 4
+    # OAuth connection health (Phase 5, decisions §295,
+    # `services/erp_connection_health`): keeps a quiet connection's refresh
+    # token alive, and tells admins (in-app + email) before it expires or as
+    # soon as it has. Off by default like every outbound sweep.
+    erp_connection_health_enabled: bool = False
+    erp_connection_health_interval_seconds: int = 86400
+    # A refresh token with fewer days than this left is refreshed by the sweep
+    # (Intuit's lifetime rolls forward on a refresh, up to its hard cap).
+    erp_connection_keepalive_days: int = 45
+    # Lead times, in days, for the "reconnect soon" notice. Each is sent once
+    # per expiry date Intuit reports.
+    erp_connection_expiry_notice_days: list[int] = [30, 7, 1]
+    # Auto-send recovery (decisions §411, `services/erp_auto_send_sweep`): an
+    # approval whose "send to the ERP on approval" job never ran (the process
+    # died between the approval's commit and the post-commit push) is found and
+    # pushed through `erp_send.send_after_approval`, the approval's own path.
+    # Off by default like every sweep that calls out. Only approvals older than
+    # the delay (so the approval's own job has had its chance) and younger than
+    # the lookback (so turning it on never pushes old approvals nobody expected
+    # to move) are taken, oldest first, at most `batch_size` per tenant a tick.
+    erp_auto_send_sweep_enabled: bool = False
+    erp_auto_send_sweep_interval_seconds: int = 300
+    # The floor keeps the sweep from racing an approval whose own job is still
+    # running. Neither the push nor a refusal can double (both are decided
+    # under the invoice row lock), so it is about not doing redundant work, and
+    # about lambda audit mode, where a refusal row lands late.
+    erp_auto_send_sweep_delay_seconds: int = Field(default=300, ge=60)
+    erp_auto_send_sweep_lookback_hours: int = Field(default=24, ge=1)
+    erp_auto_send_sweep_batch_size: int = Field(default=100, ge=1)
 
     # Commerce / inventory sync (decisions §273, `services/commerce_sync.py`).
     # OPERATOR-only override that points EVERY commerce adapter at one fake
@@ -538,7 +637,8 @@ class Settings(BaseSettings):
     # via the subdomain regex. Empty in local dev so we never silently
     # match a third-party host; deploys must set it to the real domain
     # (e.g. ``app.example.com``). Comma-separated list of multiple domains
-    # is supported.
+    # is supported. A deployed environment admits no loopback origin unless
+    # `cors_origins` is set explicitly (`app/main.py::_cors_allow_origins`).
     cors_origins: list[str] = ["http://localhost:7777", "http://localhost:5173"]
     cors_production_domain: str = ""
 
@@ -768,6 +868,12 @@ class Settings(BaseSettings):
     # point the adapter at a mock server. The adapter still fails closed without
     # an API key regardless of this value.
     billing_stripe_api_base: str = "https://api.stripe.com"
+    # The Stripe API version every billing request pins (`Stripe-Version`), so
+    # the response shapes the adapter parses (a subscription's billing window
+    # per ITEM, an invoice's subscription under `parent`) cannot change when the
+    # account's default version moves. Bump it deliberately, with the adapter
+    # tests, never implicitly. Empty = the account default (not recommended).
+    billing_stripe_api_version: str = "2026-11-18.endive"
     # Master switch for the INBOUND billing webhook route
     # (`POST /api/billing/webhook/{provider}`). OFF in local dev (no outbound
     # billing integration), flipped ON in deployed envs alongside the live
@@ -794,6 +900,17 @@ class Settings(BaseSettings):
     # Hourly by default: well inside the provider's 24 h idempotency window, so
     # an event re-sent after a lost marker write replays as the original.
     billing_ai_overage_sweep_interval_seconds: int = 3600
+
+    # Sub-processor change notices (`services/subprocessor_notices.py`, issue
+    # #427, decisions §321). The sweep emails every organisation's active
+    # administrators about each change-log entry that needs the DPA's 30-day
+    # notice, once per organisation, and records when. OFF by default like
+    # every sweep that emails, so local dev / tests never send one; it MUST be
+    # on in every deployment — the published DPA says the notice is emailed,
+    # so a deployed environment refuses to boot with it off
+    # (`_require_subprocessor_notices_in_deployed_envs`).
+    subprocessor_notices_enabled: bool = False
+    subprocessor_notices_interval_seconds: int = 3600
 
     # SAML 2.0 SSO (Service-Provider side). Additive, separate code path from
     # OIDC; like OIDC it is gated PER-TENANT via Organization.settings.sso
@@ -856,7 +973,7 @@ class Settings(BaseSettings):
     # PEPPOL AS4 INBOUND receive (the receiver-corner C4 webhook the Access
     # Point posts inbound documents to). Master switch — mirrors
     # ``email_intake_domain`` / ``audit_shipping_enabled`` gating: the public
-    # ``POST /api/peppol/inbound/{tenant_slug}`` route is a no-op 204 until this
+    # ``POST /api/peppol/inbound/{organization_id}`` route is a no-op 204 until this
     # is on, so the surface is closed by default. The signing secret is the
     # HMAC-SHA256 key the Access Point signs the inbound POST body with; it has
     # NO hardcoded secret fallback (the boot guard refuses to start a deployed
@@ -1000,6 +1117,25 @@ class Settings(BaseSettings):
     # the child's admin and the partner's admin, not a long-lived invite.
     partner_link_ttl_minutes: int = 30
 
+    # Payee bank fingerprint (decisions §383). The HMAC-SHA256 key over a
+    # vendor's whole `bank_details` that every payment records as the payee it
+    # paid (`services/payee_stamp.py`), compared when the payment is voided.
+    # Its own secret, not a derivation of `secret_key`: the JWT key rotates
+    # every 90 days, and each rotation turned every older void into a false
+    # `payee_changed_since_paid` fraud flag. Empty by default (no hardcoded
+    # fallback): a payment then records no fingerprint and its void flags, and a
+    # deployed environment refuses to boot (validator below). The committed
+    # .env.development sets a NON-secret dev value. Rotate ONLY through the
+    # keyring below, never by replacing the value alone
+    # (docs/secrets-rotation.md § FEOH_PAYEE_FINGERPRINT_KEY).
+    payee_fingerprint_key: str = ""
+    # Retired fingerprint keys, comma-separated. A stamp names the id of the
+    # key that made it (`v2:<kid>:<hmac>`, the id derived from the key), and a
+    # void recomputes it under that key, so a retired key stays here for as
+    # long as any payment it stamped may still be voided. A stamp whose key is
+    # in neither setting is compared as changed, which flags.
+    payee_fingerprint_previous_keys: str = ""
+
     # Retention policies (SOX records management). The enforcement sweep is a
     # long-lived loop (like contract renewal / qms sync) that finds records past
     # their configured retention window and archives them via a privileged,
@@ -1056,6 +1192,19 @@ class Settings(BaseSettings):
         return self.environment.strip().lower() not in _NON_DEPLOYED_ENVS
 
     @model_validator(mode="after")
+    def _validate_database_iam_auth(self) -> "Settings":
+        # Fail closed at boot: with IAM auth on, a password still in the URL is a
+        # second, long-lived way in, and anything short of verify-full would send
+        # the bearer token to an unverified server. The message never echoes the
+        # URL. Imported here, not at module top, to keep config's import graph
+        # free of SQLAlchemy for the modules that only want settings.
+        if self.database_iam_auth:
+            from app.db_engine import validate_iam_database_url
+
+            validate_iam_database_url(self.database_url)
+        return self
+
+    @model_validator(mode="after")
     def _validate_extraction_provider(self) -> "Settings":
         # Empty is the documented "derive from the key" default; anything else
         # must name a registered adapter. See `_EXTRACTION_PROVIDERS`.
@@ -1096,6 +1245,18 @@ class Settings(BaseSettings):
                 "refusing to boot with captcha verification disabled on the public "
                 "signup endpoint. Set FEOH_SIGNUP_ENABLED=false to close signup instead."
             )
+        # The other half of the pair. With the secret set the server verifies
+        # every signup, but the browser only renders the widget when
+        # /api/public-config hands it a site key — so a missing key is a
+        # signup page whose every submit fails the captcha (#575: the
+        # post-deploy smoke check asserts the same thing from outside).
+        if self.is_deployed and self.signup_enabled and not self.hcaptcha_sitekey.strip():
+            raise ValueError(
+                "FEOH_HCAPTCHA_SITEKEY must be set when FEOH_ENVIRONMENT is a deployed "
+                f"environment ({self.environment!r}) and self-service signup is on; "
+                "without it /signup renders no captcha and every signup is refused. "
+                "Set FEOH_SIGNUP_ENABLED=false to close signup instead."
+            )
         return self
 
     @model_validator(mode="after")
@@ -1135,6 +1296,26 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _require_payee_fingerprint_key_in_deployed_envs(self) -> "Settings":
+        # Without the key every payment records no bank fingerprint and every
+        # void of one raises a payee-change fraud flag a person must clear, so
+        # a deploy that forgot it would bury real flags in false ones. Refuse to
+        # boot instead. The committed dev value and the JWT key are refused too:
+        # the first is public, and the second rotates every 90 days, which is
+        # exactly what this key exists to be independent of.
+        if not self.is_deployed:
+            return self
+        key = self.payee_fingerprint_key.strip()
+        if len(key) < 32 or key == _DEV_PAYEE_FINGERPRINT_KEY or key == self.secret_key.strip():
+            raise ValueError(
+                "FEOH_PAYEE_FINGERPRINT_KEY must be set to its own cryptographically random "
+                "value of at least 32 chars (not FEOH_SECRET_KEY, not the committed dev value) "
+                f"when FEOH_ENVIRONMENT is deployed ({self.environment!r}); refusing to boot "
+                "with payee bank fingerprints off."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _require_credential_kms_key_in_deployed_envs(self) -> "Settings":
         # Without a KMS key id, tenant provider credentials would be sealed under
         # a key derived from FEOH_SECRET_KEY — a dev convenience, not a control,
@@ -1168,6 +1349,23 @@ class Settings(BaseSettings):
                 "FEOH_NIUM_SANDBOX must be false when Nium credentials are set in a "
                 f"deployed environment ({self.environment!r}); refusing to boot a live "
                 "card program pointed at the Nium sandbox host."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_subprocessor_notices_in_deployed_envs(self) -> "Settings":
+        # The published DPA (§ 8) and /legal/sub-processors say every change-log
+        # entry that needs the 30-day notice is EMAILED to each customer's
+        # administrators; this sweep is the only thing that sends it. Off in a
+        # deployment, the contract describes a mechanism that is not running and
+        # nothing anywhere says so. Off by default so local dev / tests / CI never
+        # send one (decisions §321).
+        if self.is_deployed and not self.subprocessor_notices_enabled:
+            raise ValueError(
+                "FEOH_SUBPROCESSOR_NOTICES_ENABLED must be true when FEOH_ENVIRONMENT is "
+                f"deployed ({self.environment!r}); the published DPA says sub-processor "
+                "change notices are emailed to every customer's administrators, and this "
+                "sweep is what sends them."
             )
         return self
 

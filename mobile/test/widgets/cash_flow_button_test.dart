@@ -1,11 +1,13 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
+import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/api/api_client.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/widgets/cash_flow_button.dart';
@@ -33,8 +35,10 @@ MockClient _client(List<String> roles) => MockClient((req) async {
       return http.Response('not found', 404);
     });
 
-Widget _host() => const MaterialApp(
-      home: Scaffold(
+Widget _host() => MaterialApp(
+      localizationsDelegates: appLocalizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: const Scaffold(
         appBar: null,
         body: Row(children: [CashFlowButton()]),
       ),

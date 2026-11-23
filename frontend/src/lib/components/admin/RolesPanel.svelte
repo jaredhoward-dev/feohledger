@@ -8,6 +8,7 @@
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { roleLabelKey } from '#lib/types/admin.ts';
 	import type { Role } from '#lib/types/admin.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	// $derived so the column headers re-render when the locale changes.
 	let SYSTEM_COLUMNS = $derived([{ label: m('admin.roles.col.name') }, { label: m('admin.roles.col.description') }]);
@@ -142,8 +143,7 @@
 	}
 
 	function extractError(err: unknown): string {
-		const e = err as { detail?: string; message?: string } | null;
-		return e?.detail ?? e?.message ?? m('admin.roles.toast.requestFailed');
+		return errorMessage(err, m('admin.roles.toast.requestFailed'));
 	}
 
 	let systemRoles = $derived(adminStore.roles.filter((r) => r.is_system));
@@ -163,7 +163,8 @@
 	<DataTable
 	columns={SYSTEM_COLUMNS}
 	isEmpty={systemRoles.length === 0}
-	empty={adminStore.rolesErrored ? m('common.loadFailed') : m('admin.roles.system.empty')}
+	errored={adminStore.rolesErrored}
+	empty={m('admin.roles.system.empty')}
 >
 		{#snippet body()}
 			{#each systemRoles as role (role.id)}
@@ -192,7 +193,8 @@
 	<DataTable
 	columns={CUSTOM_COLUMNS}
 	isEmpty={customRoles.length === 0}
-	empty={adminStore.rolesErrored ? m('common.loadFailed') : m('admin.roles.custom.empty')}
+	errored={adminStore.rolesErrored}
+	empty={m('admin.roles.custom.empty')}
 >
 		{#snippet body()}
 			{#each customRoles as role (role.id)}

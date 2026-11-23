@@ -19,6 +19,8 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from app.services.branding import get_brand_context
 from app.services.report_export import (
     EXPORTERS,
@@ -68,6 +70,8 @@ def test_cashflow_forecast_header_and_row_order():
             "pending_amount": Decimal("500.00"),
             "discount_eligible_amount": Decimal("250.00"),
             "count": 3,
+            "overdue_amount": Decimal("0.00"),
+            "overdue_count": 0,
         }
     ]
     out = _read(export_cashflow_forecast(rows))
@@ -80,6 +84,8 @@ def test_cashflow_forecast_header_and_row_order():
         "pending_amount",
         "discount_eligible_amount",
         "count",
+        "overdue_amount",
+        "overdue_count",
     ]
     assert out[1] == [
         "2026-06",
@@ -90,7 +96,33 @@ def test_cashflow_forecast_header_and_row_order():
         "500.00",
         "250.00",
         "3",
+        "0.00",
+        "0",
     ]
+
+
+def test_cashflow_forecast_exports_the_overdue_slice_and_blanks_an_unknown_one():
+    """Past-due AP is carried into the first period (`bucket_outflows`); the
+    CSV names it in two APPENDED columns. A row from a caller that reports no
+    overdue figure exports blank, not `0` — `0` would claim nothing is late."""
+    rows = [
+        {
+            "period": "2026-06",
+            "period_start": date(2026, 6, 1),
+            "period_end": date(2026, 6, 30),
+            "scheduled_amount": Decimal("1200.00"),
+            "committed_amount": Decimal("200.00"),
+            "pending_amount": Decimal("0.00"),
+            "discount_eligible_amount": Decimal("0.00"),
+            "count": 2,
+            "overdue_amount": Decimal("1000.00"),
+            "overdue_count": 1,
+        },
+        {"period": "2026-07", "scheduled_amount": Decimal("5.00"), "count": 1},
+    ]
+    out = _read(export_cashflow_forecast(rows))
+    assert out[1][-2:] == ["1000.00", "1"]
+    assert out[2][-2:] == ["", ""]
 
 
 def test_cashflow_forecast_empty_emits_header_only():
@@ -143,6 +175,26 @@ def test_invoice_register_emits_one_data_row_per_invoice():
     assert rows[1][1] == "INV-001"
     assert rows[1][3] == "123.45"
     assert rows[1][5] == "approved"
+
+
+@pytest.mark.parametrize("currency", [None, ""])
+def test_invoice_register_leaves_an_unknown_currency_blank(currency):
+    """An invoice that records no currency exports a blank cell, never a
+    guessed USD (decisions §160 / §196 / §473)."""
+    inv = SimpleNamespace(
+        id=uuid.uuid4(),
+        invoice_number="NOCUR",
+        vendor_name="V",
+        amount=Decimal("1"),
+        currency=currency,
+        status="new",
+        invoice_date=None,
+        due_date=None,
+        created_at=None,
+        po_number=None,
+    )
+    rows = _read(export_invoice_register([inv]))
+    assert rows[1][4] == ""
 
 
 def test_invoice_register_handles_enum_status():

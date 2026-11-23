@@ -32,6 +32,8 @@
 		UnmatchedDebit
 	} from '#lib/types/bankReconciliation.ts';
 	import { isTruncated } from '#lib/types/bankReconciliation.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
+	import { paymentMethodLabelKey, paymentStatusLabelKey } from '#lib/types/payment.ts';
 	import {
 		deleteBankStatement,
 		getBankStatement,
@@ -58,7 +60,10 @@
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import { formatCurrencyTotals } from '#lib/utils/currencyGroups.ts';
 	import { formatMoney } from '#lib/utils/money.ts';
+	import { errorMessage } from '#lib/utils/apiError.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { formatDate } from '#lib/utils/time.ts';
@@ -173,9 +178,17 @@
 	// counts stay whole-set, so a client-side filter would hide matches past the
 	// cap and report "nothing matched" under a whole-set header. Debounced, and
 	// the fetch goes through the same sequencer as every other load.
+	// `searchEffectRan` skips the mount run: the age-filter effect above has
+	// already loaded `/outstanding`, and the unguarded run loaded it again 300ms
+	// later on every visit.
 	let searchTimer: ReturnType<typeof setTimeout>;
+	let searchEffectRan = false;
 	$effect(() => {
 		search;
+		if (!searchEffectRan) {
+			searchEffectRan = true;
+			return;
+		}
 		clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {
 			syncUrl();
@@ -345,6 +358,20 @@
 		{ class: 'actions-col' }
 	]);
 
+	// A payment's rail and status are enums on the wire (`payment_scheduled`,
+	// `virtual_card`); `/payments` labels the same unions through these keys,
+	// so this worksheet does too. An unrecognised value still renders raw
+	// rather than as a blank cell.
+	function paymentStatusLabel(status: string): string {
+		const key = paymentStatusLabelKey(status);
+		return key ? m(key) : status;
+	}
+	function paymentMethodLabel(method: string | null): string {
+		if (!method) return '—';
+		const key = paymentMethodLabelKey(method);
+		return key ? m(key) : method;
+	}
+
 	function statementLabel(s: BankStatement): string {
 		return `${s.account_identifier} · ${formatDate(s.period_end)}`;
 	}
@@ -422,11 +449,13 @@
 	let confirmDeleteId = $state<string | null>(null);
 
 	async function deleteStatement(s: BankStatement) {
+		if (busyId) return;
 		if (confirmDeleteId !== s.id) {
 			confirmDeleteId = s.id;
 			return;
 		}
-		confirmDeleteId = null;
+		// Stays armed until the request settles, so the busy button keeps
+		// reading "Confirm" rather than reverting to "Delete" mid-request.
 		busyId = s.id;
 		try {
 			await deleteBankStatement(s.id);
@@ -436,9 +465,10 @@
 			void loadOutstanding();
 			toast(m('bankRecon.toast.deleted'), 'success');
 		} catch (e) {
-			toast(e instanceof Error ? e.message : m('bankRecon.toast.deleteFailed'), 'error');
+			toast(errorMessage(e, m('bankRecon.toast.deleteFailed')), 'error');
 		} finally {
 			busyId = null;
+			confirmDeleteId = null;
 		}
 	}
 
@@ -450,7 +480,7 @@
 
 <svelte:window
 	onclick={(e) => {
-		if (confirmDeleteId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
+		if (confirmDeleteId && !busyId && !(e.target as HTMLElement)?.closest?.('.row-action')) {
 			confirmDeleteId = null;
 		}
 	}}
@@ -526,14 +556,13 @@
 			</div>
 
 			{#if outstandingLoading}
-				<p class="state-note muted" data-testid="outstanding-loading">{m('common.loading')}</p>
+				<LoadingState testId="outstanding-loading" />
 			{:else if outstandingError}
-				<p class="state-note" role="alert" data-testid="outstanding-error">
-					{m('bankRecon.error.load')}
-					<button class="link-btn" onclick={() => loadOutstanding()}>
-						{m('bankRecon.error.retry')}
-					</button>
-				</p>
+				<LoadError
+					message={m('bankRecon.error.load')}
+					onretry={() => loadOutstanding()}
+					testId="outstanding-error"
+				/>
 			{:else if outstanding}
 				<!-- Bucket 1 — we sent it; no bank line claims it. -->
 				<section class="bucket">
@@ -556,7 +585,9 @@
 					<DataTable
 						columns={UNCLEARED_COLUMNS}
 						isEmpty={unclearedRows.length === 0}
-						empty={term ? m('bankRecon.empty.filtered') : m('bankRecon.empty.uncleared')}
+						filtered={!!term}
+						emptyFiltered={m('bankRecon.empty.filtered')}
+						empty={m('bankRecon.empty.uncleared')}
 						colspan={7}
 					>
 						{#snippet body()}
@@ -571,8 +602,8 @@
 										     `null` renders bare, never the org's code (decisions §196). -->
 										<Money amount={p.amount} currency={p.currency} mono />
 									</td>
-									<td class="muted">{p.method ?? '—'}</td>
-									<td class="muted">{p.status}</td>
+									<td class="muted">{paymentMethodLabel(p.method)}</td>
+									<td class="muted">{paymentStatusLabel(p.status)}</td>
 									<td class="muted">{formatDate(p.sent_on)}</td>
 									<td class="right mono muted">{p.days_outstanding ?? '—'}</td>
 								</tr>
@@ -602,7 +633,9 @@
 					<DataTable
 						columns={UNMATCHED_COLUMNS}
 						isEmpty={unmatchedRows.length === 0}
-						empty={term ? m('bankRecon.empty.filtered') : m('bankRecon.empty.unmatched')}
+						filtered={!!term}
+						emptyFiltered={m('bankRecon.empty.filtered')}
+						empty={m('bankRecon.empty.unmatched')}
 						colspan={5}
 					>
 						{#snippet body()}
@@ -656,7 +689,9 @@
 					<DataTable
 						columns={DISCREPANCY_COLUMNS}
 						isEmpty={discrepancyRows.length === 0}
-						empty={term ? m('bankRecon.empty.filtered') : m('bankRecon.empty.discrepancies')}
+						filtered={!!term}
+						emptyFiltered={m('bankRecon.empty.filtered')}
+						empty={m('bankRecon.empty.discrepancies')}
 						colspan={7}
 					>
 						{#snippet body()}
@@ -682,7 +717,7 @@
 											{DISCREPANCY_LABELS[d.classification] ?? d.classification}
 										</Badge>
 										{#if d.payment_status}
-											<span class="pay-status muted">{d.payment_status}</span>
+											<span class="pay-status muted">{paymentStatusLabel(d.payment_status)}</span>
 										{/if}
 									</td>
 									<td class="right"><Money amount={d.bank_amount} currency={d.bank_currency} mono /></td>
@@ -726,12 +761,11 @@
 			</div>
 
 			{#if statementsError}
-				<p class="state-note" role="alert" data-testid="statements-error">
-					{m('bankRecon.error.statements')}
-					<button class="link-btn" onclick={() => loadStatements()}>
-						{m('bankRecon.error.retry')}
-					</button>
-				</p>
+				<LoadError
+					message={m('bankRecon.error.statements')}
+					onretry={() => loadStatements()}
+					testId="statements-error"
+				/>
 			{:else if !statementsLoading && statements.length === 0 && !statementTerm}
 				<!-- The onboarding affordance is for a tenant that has imported
 				     NOTHING. A search that matched nothing is a different claim,
@@ -750,9 +784,8 @@
 				<DataTable
 					columns={STATEMENT_COLUMNS}
 					isEmpty={statements.length === 0}
-					empty={statementsLoading
-						? m('common.loading')
-						: m('bankRecon.empty.statementsFiltered')}
+					loading={statementsLoading}
+					empty={m('bankRecon.empty.statementsFiltered')}
 					colspan={7}
 				>
 					{#snippet body()}
@@ -791,9 +824,15 @@
 										<RowAction
 											variant="danger"
 											armed={confirmDeleteId === s.id}
-											disabled={busyId === s.id}
+											busy={busyId === s.id}
+											disabled={busyId !== null && busyId !== s.id}
 											onclick={() => deleteStatement(s)}
-											ariaLabel={m('bankRecon.row.deleteAria', { label: statementLabel(s) })}
+											ariaLabel={confirmDeleteId === s.id
+												? m('common.rowActionAria', {
+														action: m('bankRecon.row.confirmDelete'),
+														name: statementLabel(s)
+													})
+												: m('bankRecon.row.deleteAria', { label: statementLabel(s) })}
 										>
 											{confirmDeleteId === s.id
 												? m('bankRecon.row.confirmDelete')
@@ -806,25 +845,15 @@
 					{/snippet}
 				</DataTable>
 
-				{#if hasMoreStatements}
-					<div class="load-more-row">
-						<button
-							class="btn-load-more"
-							onclick={() => loadStatements({ append: true })}
-							disabled={statementsLoadingMore}
-						>
-							{statementsLoadingMore
-								? m('common.loading')
-								: m('bankRecon.loadMore', { shown: statements.length, total: statementTotal })}
-						</button>
-					</div>
-				{:else if statementTotal > 0}
-					<div class="load-more-row">
-						<span class="load-more-end">
-							{m('bankRecon.showingAll', { total: statementTotal })}
-						</span>
-					</div>
-				{/if}
+				<LoadMoreFooter
+					shown={statements.length}
+					total={statementTotal}
+					hasMore={hasMoreStatements}
+					loading={statementsLoadingMore}
+					onloadmore={() => loadStatements({ append: true })}
+					moreKey="bankRecon.loadMore"
+					allKey="bankRecon.showingAll"
+				/>
 			{/if}
 		</div>
 	{/if}
@@ -878,11 +907,6 @@
 		line-height: 1.45;
 	}
 
-	.state-note {
-		margin: 20px 0;
-		font-size: 0.9rem;
-	}
-
 	.truncated {
 		margin: 6px 0 0;
 		font-size: 0.78rem;
@@ -900,16 +924,6 @@
 	.mono {
 		font-variant-numeric: tabular-nums;
 		font-family: var(--font-mono);
-	}
-
-	.link-btn {
-		background: none;
-		border: none;
-		padding: 0;
-		color: var(--accent-on-tint);
-		text-decoration: underline;
-		cursor: pointer;
-		font: inherit;
 	}
 
 </style>

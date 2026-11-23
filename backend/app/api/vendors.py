@@ -5,12 +5,14 @@ import dataclasses
 import io
 import logging
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -20,7 +22,9 @@ from app.api.deps import (
     ROLE_CFO,
     ensure_live_erp_entitled,
     get_org_id,
+    holds_any_permission,
     require_permission,
+    require_role_or_permission,
     require_roles,
 )
 from app.api.pagination import (
@@ -34,16 +38,27 @@ from app.api.permissions import (
     PERM_VENDOR_BANK_CHANGE_APPROVE,
     PERM_VENDOR_BLOCK,
     PERM_VENDOR_MANAGE,
+    PERM_VENDOR_SANCTIONS_ADJUDICATE,
+)
+from app.api.refusals import ActionRefusal, erp_pull_failure, role_not_permitted
+from app.api.set_password_links import (
+    expiry_sentence,
+    link_unavailable,
+    mint_portal_link,
+    require_link_base,
+    send_set_password_email,
 )
 from app.api.sorting import SortParams, resolve_order_by, sort_params
 from app.database import get_control_db
 from app.models.contract import Contract
 from app.models.credit_memo import CreditMemo
 from app.models.discount import DiscountOffer
-from app.models.invoice import Invoice
+from app.models.invoice import Invoice, InvoiceStatus
 from app.models.invoice_embedding import InvoiceEmbedding
+from app.models.invoice_status import PRE_APPROVAL_STATUSES, SETTLED_STATUSES
 from app.models.organization import Organization
 from app.models.procurement import PurchaseOrder
+from app.models.sanctions_adjudication import SanctionsAdjudication
 from app.models.sanctions_check import SanctionsCheck
 from app.models.user import User
 from app.models.vendor import Vendor
@@ -57,6 +72,9 @@ from app.schemas.portal import (
     PortalUserResponse,
 )
 from app.schemas.sanctions import (
+    SanctionsAdjudicateRequest,
+    SanctionsAdjudicationResponse,
+    SanctionsAdjudicationRevokeRequest,
     SanctionsCheckResponse,
     ScreeningReviewItem,
     VendorBlockRequest,
@@ -75,16 +93,27 @@ from app.schemas.vendor import (
     VendorChangeRequestResponse,
     VendorChangeReviewRequest,
     VendorCreate,
+    VendorErpCandidate,
+    VendorErpLinkItem,
+    VendorErpLinkRequest,
+    VendorErpLinkResponse,
+    VendorErpLinksResponse,
+    VendorErpSearchRequest,
+    VendorErpSearchResponse,
+    VendorErpUnlinkRequest,
+    VendorErpUnlinkResponse,
     VendorResponse,
     VendorStatusCounts,
     VendorUpdate,
     validate_bank_routing_fields,
 )
+from app.services import password_reset, sanctions_adjudication
 from app.services.audit_access import build_field_diff, log_access
 from app.services.audit_dispatch import dispatch_audit
 from app.services.credential_crypto import CredentialCryptoError
 from app.services.csv_import import MAX_CSV_IMPORT_SIZE, import_vendors_csv
-from app.services.email_adapters import EmailMessage, get_email_adapter
+from app.services.email_adapters import EmailMessage
+from app.services.erp_link_realm import connection_realm
 from app.services.provider_credentials import (
     CREDENTIALS_UNAVAILABLE_DETAIL,
     provider_config,
@@ -94,10 +123,24 @@ from app.services.sanctions_categories import (
     categories_from_raw_response,
     has_adverse_media,
 )
+from app.services.session_management import revoke_user_sessions
+from app.services.vendor_bank_change import flag_invoice_for_bank_change
 from app.services.vendor_card_revocation import revoke_vendor_cards
+from app.services.vendor_erp_manual_link import (
+    ErpManualLinkError,
+    link_vendor_to_erp_record,
+    search_candidates,
+    search_refusal,
+)
+from app.services.vendor_erp_unlink import (
+    ErpUnlinkError,
+    unlink_vendor_erp_link,
+    vendor_erp_links,
+)
 from app.services.vendor_screening import screen_best_effort, screen_vendor_record
 from app.services.vendor_sync import sync_vendors_from_erp
 from app.services.vendor_tax_id import rekey_tax_id
+from app.services.workflow_engine import VALID_TRANSITIONS
 from app.tenant import (
     apply_entity_scope,
     ensure_in_entity_scope,
@@ -118,13 +161,24 @@ from app.utils.bank_masking import BANK_SECRET_KEYS as _BANK_SECRET_KEYS  # noqa
 from app.utils.bank_masking import bank_details_audit_summary as _bank_details_audit_summary
 from app.utils.bank_masking import last4 as _last4
 from app.utils.emails import email_matches, normalize_email
-from app.utils.passwords import generate_temp_password, hash_password
 from app.utils.search import ilike_contains
 from app.utils.tenant_urls import tenant_base_url
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/vendors", tags=["vendors"])
+
+#: The vendor READS a vendor-permission holder needs to reach the rows it acts
+#: on — the list, its select-all ids, its chip counts and the detail the Block /
+#: Edit controls open from. The system roles keep exactly the set they had
+#: (admin, ap_manager, cfo); a custom role holding only `vendor.manage` or
+#: `vendor.block` is admitted too, where the role-only gate answered 403 on the
+#: list its own permission acts on. `cfo` holds no vendor permission, so this
+#: cannot be a plain `require_permission` the way the payment-run list is.
+_VENDOR_READ = require_role_or_permission(
+    roles=(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO),
+    permissions=(PERM_VENDOR_MANAGE, PERM_VENDOR_BLOCK),
+)
 
 
 def _merge_bank_details(existing: dict | None, incoming: dict | None) -> dict | None:
@@ -275,21 +329,47 @@ async def _screen_best_effort(
     )
 
 
-# Invoices already cleared for payment (mirrors payments.PAYABLE_INVOICE_STATUSES).
-# Defined locally to avoid importing the payments router into vendors.
-_BANK_CHANGE_PAYABLE_STATUSES = (
-    "approved",
-    "posted_in_erp",
-    "payment_scheduled",
-)
+# Where money has already left: nothing for the flag to stop.
+_MONEY_MOVED_STATUSES = frozenset(SETTLED_STATUSES)
+
+
+def _bank_change_flag_statuses() -> frozenset[InvoiceStatus]:
+    """Every status on a forward path from `approved` to `paid`, DERIVED from
+    `VALID_TRANSITIONS` (decisions §286).
+
+    These are the invoices that can still reach a payment run OR an ERP push
+    without a second approval. The hand-listed tuple this replaced mirrored
+    `payment_gates.PAYABLE_INVOICE_STATUSES`, which is the payment-run question, and
+    so missed `failed` and `sending_to_erp`: an approved invoice whose push hit
+    503s sat at `failed` with no flag, and `/retry-erp` then posted the bill,
+    payable from the ERP to the new bank details. It missed `sent_to_erp` too,
+    which walks on to `posted_in_erp` and into our own payment queue unflagged.
+    """
+    reached: set[InvoiceStatus] = set()
+    frontier = [InvoiceStatus.approved]
+    while frontier:
+        current = frontier.pop()
+        # Pre-approval statuses reach money only through a fresh approval, so the
+        # flag leaves them alone (`models/invoice_status.PRE_APPROVAL_STATUSES`).
+        if current in reached or current in PRE_APPROVAL_STATUSES:
+            continue
+        reached.add(current)
+        if current not in _MONEY_MOVED_STATUSES:
+            frontier.extend(VALID_TRANSITIONS.get(current, set()))
+    return frozenset(reached - _MONEY_MOVED_STATUSES)
+
+
+_BANK_CHANGE_FLAG_STATUSES = _bank_change_flag_statuses()
 
 
 async def _flag_payable_invoices_for_bank_change(
     db: AsyncSession, *, vendor: Vendor, actor_id: uuid.UUID
 ) -> None:
-    """Raise a de-duped ``fraud_flag`` exception on every in-queue invoice for a
-    vendor whose bank details just changed, forcing a human second look before
-    the next payment run pays into the new account. Description is PII-free.
+    """Raise a de-duped ``fraud_flag`` exception on every approved, unpaid
+    invoice for a vendor whose bank details just changed
+    (``_BANK_CHANGE_FLAG_STATUSES``), forcing a human second look before the
+    next payment run pays into the new account or the ERP push posts a bill
+    that can be paid there (decisions §286). Description is PII-free.
 
     ``actor_id`` is the approver, stamped as the exception's
     ``raised_by_user_id``. This is the ONE raise site in the codebase where the
@@ -302,15 +382,20 @@ async def _flag_payable_invoices_for_bank_change(
     implicated-actor set cannot reach this case: the approver is not the
     uploader of the invoices the change re-points.
     """
-    from app.models.exception import Exception as APException
-    from app.services.exception_service import create_exception
-
     invoices = (
         (
             await db.execute(
                 select(Invoice).where(
                     Invoice.vendor_id == vendor.id,
-                    Invoice.status.in_(_BANK_CHANGE_PAYABLE_STATUSES),
+                    Invoice.status.in_(_BANK_CHANGE_FLAG_STATUSES),
+                    # `failed` is also where a failed EXTRACTION lands, before
+                    # any approval; only an approved invoice's failed push
+                    # counts. Same reading as `invoice_entry.was_ever_approved`.
+                    or_(
+                        Invoice.status != InvoiceStatus.failed,
+                        Invoice.approval_date.is_not(None),
+                        func.coalesce(Invoice.approved_by, "") != "",
+                    ),
                 )
             )
         )
@@ -318,28 +403,7 @@ async def _flag_payable_invoices_for_bank_change(
         .all()
     )
     for inv in invoices:
-        # De-dupe: don't pile a second open fraud_flag on the same invoice.
-        existing = (
-            await db.execute(
-                select(func.count()).where(
-                    APException.invoice_id == inv.id,
-                    APException.exception_type == "fraud_flag",
-                    APException.status.in_(["open", "escalated"]),
-                )
-            )
-        ).scalar() or 0
-        if existing:
-            continue
-        await create_exception(
-            db,
-            exception_type="fraud_flag",
-            severity="error",
-            description="Vendor bank details changed; verify before payment.",
-            status="open",
-            organization_id=inv.organization_id,
-            invoice=inv,
-            raised_by_user_id=actor_id,
-        )
+        await flag_invoice_for_bank_change(db, invoice=inv, actor_id=actor_id)
 
 
 # `sort=` allowlist for `GET /vendors` — see `api/sorting.py`. `.id` is
@@ -391,7 +455,7 @@ async def list_vendors(
     source: str | None = None,
     sort: SortParams = Depends(sort_params),
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
+    user: User = Depends(_VENDOR_READ),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     query = _vendor_list_filters(
@@ -445,7 +509,15 @@ async def list_vendors(
             ).all()
         }
 
-    items = [VendorResponse.from_db(v, invoice_counts.get(v.id, 0)) for v in vendors]
+    items = [
+        {
+            **VendorResponse.from_db(v, invoice_counts.get(v.id, 0)).model_dump(mode="json"),
+            # The caller's verdict on the row's Verify / Reject, from the gate
+            # those endpoints raise from (`vendor_status_actions`).
+            "status_actions": vendor_status_actions(v, user),
+        }
+        for v in vendors
+    ]
 
     return paginated(items, total, pagination)
 
@@ -460,7 +532,7 @@ async def list_vendor_ids(
     status_filter: str | None = Query(None, alias="status"),
     source: str | None = None,
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
+    user: User = Depends(_VENDOR_READ),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Every vendor id matching the caller's list filters — the resolver
@@ -481,14 +553,46 @@ async def list_vendor_ids(
     return MatchingIdsResponse(ids=ids, total=total, truncated=total > len(ids))
 
 
-# Vendor targets a bulk `status` change may legitimately drive — the same two
-# the single-row `POST /{vendor_id}/verify` / `/reject` endpoints support.
-# Each starting status is enforced per-row below, mirroring those endpoints'
-# own 409s, so a bulk call can't reach a state the single-row path refuses.
-_VENDOR_BULK_STATUS_STARTING: dict[str, set[str]] = {
-    "active": {"unverified"},
-    "rejected": {"unverified", "active"},
+# The statuses a vendor may be verified (→ `active`) or rejected (→ `rejected`)
+# from. ONE table, read by `POST /{vendor_id}/verify` / `/reject`, the bulk
+# status endpoint and the list rows' `status_actions` verdict, so none of the
+# four can offer or perform a move another refuses (issue #575 — the list page
+# hid Reject on an active vendor that both endpoints accept).
+_VENDOR_STATUS_STARTING: dict[str, frozenset[str]] = {
+    "active": frozenset({"unverified"}),
+    "rejected": frozenset({"unverified", "active"}),
 }
+VENDOR_STATUS_NOT_ALLOWED = "vendor_status_not_allowed"
+_VENDOR_STATUS_REFUSAL_MESSAGES = {
+    "active": "Vendor is not in unverified status",
+    "rejected": "Vendor cannot be rejected from this status",
+}
+
+
+def vendor_status_refusal(vendor, target: str) -> ActionRefusal | None:
+    """Why moving ``vendor`` to ``target`` (``active`` = verify, ``rejected``)
+    would be refused, or ``None``."""
+    if vendor.status in _VENDOR_STATUS_STARTING[target]:
+        return None
+    return ActionRefusal(
+        VENDOR_STATUS_NOT_ALLOWED,
+        _VENDOR_STATUS_REFUSAL_MESSAGES[target],
+        status.HTTP_409_CONFLICT,
+    )
+
+
+def vendor_status_actions(vendor, user: User) -> dict:
+    """The caller's verdict on Verify and Reject for one vendor row — the
+    endpoints' permission (``vendor.manage``), then :func:`vendor_status_refusal`."""
+    from app.api.refusals import role_not_permitted
+
+    if not holds_any_permission(user, {PERM_VENDOR_MANAGE}):
+        return {"verify": role_not_permitted(), "reject": role_not_permitted()}
+    out = {}
+    for action, target in (("verify", "active"), ("reject", "rejected")):
+        refusal = vendor_status_refusal(vendor, target)
+        out[action] = refusal.verdict() if refusal is not None else None
+    return out
 
 
 @router.post("/bulk/status", response_model=VendorBulkStatusResponse)
@@ -510,7 +614,7 @@ async def bulk_vendor_status(
     writes, same audit actions) so a bulk call can't do anything the
     single-row endpoints wouldn't.
     """
-    starting = _VENDOR_BULK_STATUS_STARTING[body.status]
+    starting = _VENDOR_STATUS_STARTING[body.status]
     updated = 0
     skipped: list[VendorBulkStatusSkip] = []
     card_revocations: list[VendorCardRevocationResponse] = []
@@ -525,7 +629,7 @@ async def bulk_vendor_status(
         if vendor is None:
             skipped.append(VendorBulkStatusSkip(id=raw, reason="not found"))
             continue
-        if vendor.status not in starting:
+        if vendor_status_refusal(vendor, body.status) is not None:
             skipped.append(
                 VendorBulkStatusSkip(
                     id=raw, reason=f"vendor is in '{vendor.status}' status, not {sorted(starting)}"
@@ -685,7 +789,7 @@ async def vendor_status_counts(
     search: str | None = None,
     source: str | None = None,
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
+    user: User = Depends(_VENDOR_READ),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Status tallies for the vendor filter chips, plus the payment-block tally.
@@ -856,11 +960,29 @@ async def list_change_requests(
 
     # One batched name lookup for the page, not one per staged request.
     names = await _vendor_names(db, [r.vendor_id for r in rows])
+    may_approve = holds_any_permission(user, {PERM_VENDOR_BANK_CHANGE_APPROVE})
     items = [
-        VendorChangeRequestResponse.from_db(r, vendor_name=names.get(r.vendor_id), reveal=False)
+        {
+            **VendorChangeRequestResponse.from_db(
+                r, vendor_name=names.get(r.vendor_id), reveal=False
+            ).model_dump(mode="json"),
+            # What `POST /change-requests/{id}/approve` would answer the CALLER:
+            # its permission, then `change_request_approve_refusal` — the gate
+            # the endpoint raises from (issue #575).
+            "approve_refusal": _change_request_approve_verdict(r, user, may_approve),
+        }
         for r in rows
     ]
     return paginated(items, total, pagination)
+
+
+def _change_request_approve_verdict(req, user: User, may_approve: bool) -> dict | None:
+    from app.api.refusals import role_not_permitted
+
+    if not may_approve:
+        return role_not_permitted()
+    refusal = change_request_approve_refusal(req, user.id)
+    return refusal.verdict() if refusal is not None else None
 
 
 # ---------- Sanctions / risk screening ----------
@@ -930,39 +1052,25 @@ async def screening_review_queue(
     )
     vendors = (await db.execute(query)).scalars().all()
 
-    # The newest `sanctions_checks` row for every vendor on the page in ONE
-    # query. `DISTINCT ON (vendor_id)` with a matching leading `ORDER BY` is
-    # Postgres' own "first row per group", so it returns exactly what the
-    # per-vendor `ORDER BY checked_at DESC LIMIT 1` did — asked once instead of
-    # once per row. `.id DESC` is appended purely as a tie-break: a bulk
-    # re-screen stamps a whole batch inside one transaction, and without it
-    # Postgres may pick a different row of that batch between two identical
-    # reads (the per-vendor `LIMIT 1` had the same latitude — this narrows it).
-    vendor_ids = [v.id for v in vendors]
-    latest_by_vendor: dict[uuid.UUID, SanctionsCheck] = {}
-    if vendor_ids:
-        latest_rows = (
-            (
-                await db.execute(
-                    select(SanctionsCheck)
-                    .where(SanctionsCheck.vendor_id.in_(vendor_ids))
-                    .distinct(SanctionsCheck.vendor_id)
-                    .order_by(
-                        SanctionsCheck.vendor_id,
-                        SanctionsCheck.checked_at.desc(),
-                        SanctionsCheck.id.desc(),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        latest_by_vendor = {c.vendor_id: c for c in latest_rows}
+    # Per page, not per row: the stored screen each row shows (the newest
+    # non-`pre_payment` `sanctions_checks` row, `DISTINCT ON (vendor_id)` with
+    # an `id DESC` tie-break, exactly the row an adjudication stamps), every
+    # active adjudication, and the latest applied bank change, in one query
+    # each (`sanctions_adjudication.load_contexts`).
+    contexts = await sanctions_adjudication.load_contexts(db, vendors)
 
+    may_adjudicate = holds_any_permission(user, {PERM_VENDOR_SANCTIONS_ADJUDICATE})
     items: list[ScreeningReviewItem] = []
     for v in vendors:
-        latest = latest_by_vendor.get(v.id)
+        ctx = contexts[v.id]
+        latest = ctx.latest
         categories = categories_from_raw_response(latest.raw_response) if latest else ()
+        (
+            adjudication,
+            active_adjudications,
+            adjudicate_verdict,
+            revoke_verdict,
+        ) = await _adjudication_verdicts(db, v, user, may_adjudicate, ctx)
         items.append(
             ScreeningReviewItem(
                 vendor_id=str(v.id),
@@ -976,8 +1084,13 @@ async def screening_review_queue(
                 ),
                 latest_matched_list=latest.matched_list if latest else None,
                 latest_provider=latest.provider if latest else None,
+                latest_check_id=str(latest.id) if latest else None,
                 latest_categories=list(categories),
                 adverse_media=has_adverse_media(categories),
+                adjudication=adjudication,
+                active_adjudications=active_adjudications,
+                adjudicate_refusal=adjudicate_verdict,
+                revoke_adjudication_refusal=revoke_verdict,
             )
         )
     return ScreeningReviewQueueResponse(
@@ -989,7 +1102,7 @@ async def screening_review_queue(
 async def get_vendor(
     vendor_id: uuid.UUID,
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
+    user: User = Depends(_VENDOR_READ),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     await ensure_in_entity_scope(
@@ -1050,6 +1163,9 @@ async def create_vendor(
         source="manual",
         verified_by=user.full_name,
         verified_at=datetime.now(UTC),
+        # Segregation: the onboarder may not adjudicate this vendor's sanctions
+        # screen (decisions §477).
+        onboarded_by_user_id=user.id,
     )
     db.add(vendor)
     await db.flush()
@@ -1296,6 +1412,9 @@ async def delete_vendor(
     # independent retention value for a never-transacted vendor (its screening
     # trail, extraction priors, embeddings; change-requests + portal users
     # already cascade), then delete the vendor.
+    await db.execute(
+        sa_delete(SanctionsAdjudication).where(SanctionsAdjudication.vendor_id == vendor_id)
+    )
     await db.execute(sa_delete(SanctionsCheck).where(SanctionsCheck.vendor_id == vendor_id))
     await db.execute(
         sa_delete(VendorExtractionPrior).where(VendorExtractionPrior.vendor_id == vendor_id)
@@ -1480,6 +1599,11 @@ async def unblock_vendor_payments(
         db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
     )
     vendor = await _get_vendor_or_404(db, vendor_id)
+    # Two people clear a sanctions match: whoever adjudicated it may not also
+    # lift the block it set (decisions §477; admin holds both permissions).
+    refusal = await sanctions_adjudication.unblock_refusal(db, vendor, user.id)
+    if refusal is not None:
+        raise refusal.http()
     reason = (body.reason if body else None) or "manually unblocked by AP"
 
     vendor.payments_blocked = False
@@ -1502,6 +1626,127 @@ async def unblock_vendor_payments(
     return VendorResponse.from_db(vendor)
 
 
+async def _adjudication_verdicts(
+    db: AsyncSession,
+    vendor: Vendor,
+    user: User,
+    may_adjudicate: bool,
+    ctx: sanctions_adjudication.AdjudicationContext,
+) -> tuple[
+    SanctionsAdjudicationResponse | None,
+    list[SanctionsAdjudicationResponse],
+    dict | None,
+    dict | None,
+]:
+    """The review queue's adjudication state (the one covering the stored
+    screen, and every active one) and its two action verdicts, from the gates
+    the adjudicate / revoke endpoints raise (issue #575), over the page-wide
+    context `screening_review_queue` loads once."""
+    adjudication = SanctionsAdjudicationResponse.from_db(ctx.pointer) if ctx.pointer else None
+    all_active = [SanctionsAdjudicationResponse.from_db(a) for a in ctx.active]
+    if not may_adjudicate:
+        return adjudication, all_active, role_not_permitted(), role_not_permitted()
+    adjudicate = await sanctions_adjudication.adjudicate_refusal(db, vendor, user.id, ctx=ctx)
+    revoke = await sanctions_adjudication.revoke_refusal(db, vendor, ctx=ctx)
+    return (
+        adjudication,
+        all_active,
+        adjudicate.verdict() if adjudicate else None,
+        revoke.verdict() if revoke else None,
+    )
+
+
+async def _lock_vendor_for_adjudication(
+    db: AsyncSession, vendor_id: uuid.UUID, entity_id: uuid.UUID | None
+) -> Vendor:
+    await ensure_in_entity_scope(
+        db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
+    )
+    # Locked, so two reviewers cannot both pass the gate and stamp twice (the
+    # partial unique index would refuse the second as a 500 otherwise).
+    vendor = (
+        await db.execute(
+            select(Vendor)
+            .where(Vendor.id == vendor_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if vendor is None:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    return vendor
+
+
+@router.post(
+    "/{vendor_id}/screening/adjudicate",
+    response_model=SanctionsAdjudicationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def adjudicate_sanctions_false_positive(
+    vendor_id: uuid.UUID,
+    body: SanctionsAdjudicateRequest,
+    db: AsyncSession = Depends(get_tenant_db),
+    user: User = Depends(require_permission(PERM_VENDOR_SANCTIONS_ADJUDICATE)),
+    org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Record the vendor's stored `match` / `review` screen as a false positive
+    (decisions §477). Later screens returning the SAME result read as clear at
+    dispatch, `/compliance/release`, the run gate and the ERP push; a new or
+    different hit holds again. Does not lift a sticky payment block: that is
+    `POST /{id}/unblock` (`vendor.block`). 403 for the vendor's onboarder or the
+    people behind its current bank details; 409
+    `sanctions_adjudication_stale_screen` when `sanctions_check_id` (the screen
+    the reviewer saw) is no longer the vendor's latest stored screen."""
+    vendor = await _lock_vendor_for_adjudication(db, vendor_id, entity_id)
+    refusal = await sanctions_adjudication.adjudicate_refusal(
+        db, vendor, user.id, sanctions_check_id=body.sanctions_check_id
+    )
+    if refusal is not None:
+        raise refusal.http()
+    adj = await sanctions_adjudication.adjudicate(
+        db, vendor=vendor, actor_id=user.id, organization_id=org_id, reason=body.reason
+    )
+    await db.commit()
+    await db.refresh(adj)
+    return SanctionsAdjudicationResponse.from_db(adj)
+
+
+@router.post(
+    "/{vendor_id}/screening/adjudication/revoke",
+    response_model=list[SanctionsAdjudicationResponse],
+)
+async def revoke_sanctions_adjudication(
+    vendor_id: uuid.UUID,
+    body: SanctionsAdjudicationRevokeRequest,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_VENDOR_SANCTIONS_ADJUDICATE)),
+    org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """End EVERY active false-positive adjudication of the vendor; the gates
+    hold on the stored screen again at once. A revoked `match` re-sets the
+    sticky block and closes the vendor's live cards in the same transaction,
+    as the uncovered screen would have."""
+    vendor = await _lock_vendor_for_adjudication(db, vendor_id, entity_id)
+    refusal = await sanctions_adjudication.revoke_refusal(db, vendor)
+    if refusal is not None:
+        raise refusal.http()
+    rows = await sanctions_adjudication.revoke(
+        db,
+        vendor=vendor,
+        actor_id=user.id,
+        organization_id=org_id,
+        org_settings=org.settings,
+        reason=body.reason,
+    )
+    await db.commit()
+    for adj in rows:
+        await db.refresh(adj)
+    return [SanctionsAdjudicationResponse.from_db(adj) for adj in rows]
+
+
 @router.post("/{vendor_id}/verify", response_model=VendorResponse)
 async def verify_vendor(
     vendor_id: uuid.UUID,
@@ -1514,12 +1759,21 @@ async def verify_vendor(
     await ensure_in_entity_scope(
         db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
     )
-    result = await db.execute(select(Vendor).where(Vendor.id == vendor_id))
+    # Locked, so two concurrent clicks cannot both pass the status gate and
+    # each write a status-change audit row; the second re-reads the first's
+    # commit and is refused by `vendor_status_refusal`.
+    result = await db.execute(
+        select(Vendor)
+        .where(Vendor.id == vendor_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     vendor = result.scalar_one_or_none()
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor not found")
-    if vendor.status != "unverified":
-        raise HTTPException(status_code=409, detail="Vendor is not in unverified status")
+    refusal = vendor_status_refusal(vendor, "active")
+    if refusal is not None:
+        raise refusal.http()
 
     vendor.status = "active"
     vendor.verified_by = user.full_name
@@ -1555,12 +1809,21 @@ async def reject_vendor(
     await ensure_in_entity_scope(
         db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
     )
-    result = await db.execute(select(Vendor).where(Vendor.id == vendor_id))
+    # Locked, so two concurrent clicks cannot both pass the status gate and
+    # each write a status-change audit row; the second re-reads the first's
+    # commit and is refused by `vendor_status_refusal`.
+    result = await db.execute(
+        select(Vendor)
+        .where(Vendor.id == vendor_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     vendor = result.scalar_one_or_none()
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor not found")
-    if vendor.status not in ("unverified", "active"):
-        raise HTTPException(status_code=409, detail="Vendor cannot be rejected from this status")
+    refusal = vendor_status_refusal(vendor, "rejected")
+    if refusal is not None:
+        raise refusal.http()
 
     prev_status = vendor.status
     vendor.status = "rejected"
@@ -1633,6 +1896,257 @@ async def cancel_vendor_cards(
     return VendorCardRevocationResponse.from_result(revocation)
 
 
+def _erp_link_items(links) -> list[VendorErpLinkItem]:
+    return [
+        VendorErpLinkItem(realm=x.realm, erp_vendor_id=x.erp_vendor_id, placement=x.placement)
+        for x in links
+    ]
+
+
+@router.get("/{vendor_id}/erp-links", response_model=VendorErpLinksResponse)
+async def list_vendor_erp_links(
+    vendor_id: uuid.UUID,
+    db: AsyncSession = Depends(get_tenant_db),
+    user: User = Depends(_VENDOR_READ),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+    org: Organization = Depends(get_tenant),
+):
+    """The vendor's ERP links, one per company: the row link (the company it was
+    last synced in) and each link kept for another company (decisions §356).
+    The same readers as the vendor detail. `search_refusal`: the verdict on
+    searching the connected ERP for a record and linking this vendor to it by
+    hand (§415) — `null` when both doors would accept, else their coded
+    refusal (`vendor_erp_search_unavailable`, `vendor_erp_link_exists`)."""
+    await ensure_in_entity_scope(
+        db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
+    )
+    vendor = await _get_vendor_or_404(db, vendor_id)
+    links = await vendor_erp_links(db, vendor)
+    return VendorErpLinksResponse(
+        vendor_id=str(vendor.id),
+        links=_erp_link_items(links),
+        search_refusal=await _erp_search_refusal(db, org, vendor),
+    )
+
+
+async def _erp_search_refusal(db: AsyncSession, org: Organization, vendor: Vendor) -> dict | None:
+    """`search_refusal` (`vendor_erp_manual_link.search_refusal`) read from the
+    stored settings alone (no credential store opened on a read): the adapter
+    class the settings select, and the company the stored connection names. A
+    connection that needs reconnecting answers `vendor_erp_search_unavailable`;
+    the search would only be refused."""
+    from app.services.erp_adapters.dispatcher import adapter_class, resolve_adapter_key
+
+    erp = (org.settings or {}).get("erp")
+    adapter_cls = realm = None
+    if isinstance(erp, dict) and erp:
+        oauth = erp.get("oauth")
+        if not (isinstance(oauth, dict) and oauth.get("needs_reconnect")):
+            adapter_cls = adapter_class(resolve_adapter_key(erp))
+            realm = connection_realm(erp)
+    refusal = await search_refusal(db, vendor, adapter_cls=adapter_cls, realm=realm)
+    return refusal.detail if refusal is not None else None
+
+
+async def _erp_adapter_for_link(org: Organization, control_db: AsyncSession):
+    """``(adapter, realm)`` for a hand-made link: the resolved config, the
+    live-ERP plan gate, and the adapter it selects (the vendor sync's own
+    steps). 503 when the sealed credentials cannot be opened; 409
+    `vendor_erp_search_unavailable` when no ERP, or one that cannot search."""
+    from app.services.erp_adapters import UnknownErpAdapterError, get_erp_adapter
+
+    try:
+        erp_config = await provider_config(org, "erp", db=control_db)
+    except CredentialCryptoError:
+        raise HTTPException(status_code=503, detail=CREDENTIALS_UNAVAILABLE_DETAIL) from None
+    if not erp_config:
+        exc = ErpManualLinkError.unavailable()
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    await ensure_live_erp_entitled(control_db, org.id, erp_config)
+    try:
+        adapter = get_erp_adapter(erp_config)
+    except UnknownErpAdapterError:
+        exc = ErpManualLinkError.unavailable()
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
+    return adapter, connection_realm(erp_config)
+
+
+@router.post("/{vendor_id}/erp-links/search", response_model=VendorErpSearchResponse)
+async def search_vendor_erp_records(
+    vendor_id: uuid.UUID,
+    body: VendorErpSearchRequest,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_VENDOR_MANAGE)),  # noqa: ARG001 - gate
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+    control_db: AsyncSession = Depends(get_control_db),
+):
+    """Search the connected ERP's whole contact list for this vendor's record
+    (decisions §415, `services/vendor_erp_manual_link`): by `query` (the
+    vendor's name when blank) and by the vendor's tax number, read from its
+    row. For a supplier no vendor sync can see — a Xero customer with no bill
+    or PO from us yet. Reads only; links nothing.
+
+    `vendor.manage`, like the link it leads to. 409
+    `vendor_erp_search_unavailable` when the ERP cannot be searched or no
+    company is connected; 502 on a failed ERP read (`erp_pull_failure`). A
+    candidate says whether its tax number matches, never the number."""
+    await ensure_in_entity_scope(
+        db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
+    )
+    vendor = await _get_vendor_or_404(db, vendor_id)
+    adapter, realm = await _erp_adapter_for_link(org, control_db)
+    try:
+        candidates, truncated = await search_candidates(
+            db, adapter, vendor, realm=realm, query=body.query
+        )
+    except ErpManualLinkError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception as exc:
+        logger.warning(
+            "ERP vendor search failed for vendor %s: %s", vendor_id, exc.__class__.__name__
+        )
+        raise erp_pull_failure(exc) from exc
+    return VendorErpSearchResponse(
+        realm=str(realm),
+        candidates=[
+            VendorErpCandidate(
+                erp_vendor_id=c.erp_vendor_id,
+                name=c.name,
+                email=c.email,
+                active=c.active,
+                tax_id_matches=c.tax_id_matches,
+                linked_elsewhere=c.linked_elsewhere,
+            )
+            for c in candidates
+        ],
+        truncated=truncated,
+    )
+
+
+@router.post("/{vendor_id}/erp-links/link", response_model=VendorErpLinkResponse)
+async def link_vendor_erp_record(
+    vendor_id: uuid.UUID,
+    body: VendorErpLinkRequest,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_VENDOR_MANAGE)),
+    org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+    control_db: AsyncSession = Depends(get_control_db),
+):
+    """Link the vendor to an ERP supplier record by hand, in the connected
+    company (decisions §415). The record is re-read from the ERP by its id
+    first: 404 `erp_vendor_not_found`, 409 `erp_vendor_inactive`. 409
+    `vendor_erp_link_exists` when the vendor already holds a link in this
+    company (unlink it first, §375); 409 `erp_vendor_already_linked` when
+    another vendor holds the record here; 409 `vendor_erp_search_unavailable`.
+    A row link from another company is kept for it (§356). Writes
+    `vendor.erp_linked` naming the realm, the record, its ERP name and
+    whether its tax number matched. Only the link changes: the vendor's own
+    fields stay as keyed until a sync that lists the record updates them.
+    The response carries the vendor's new `search_refusal`
+    (`vendor_erp_link_exists` now), so the panel stops offering Link."""
+    await ensure_in_entity_scope(
+        db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
+    )
+    await _get_vendor_or_404(db, vendor_id)
+    adapter, realm = await _erp_adapter_for_link(org, control_db)
+    try:
+        result = await link_vendor_to_erp_record(
+            db, adapter, vendor_id=vendor_id, realm=realm, erp_vendor_id=body.erp_vendor_id
+        )
+    except ErpManualLinkError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except Exception as exc:
+        logger.warning(
+            "ERP vendor read failed for vendor %s: %s", vendor_id, exc.__class__.__name__
+        )
+        raise erp_pull_failure(exc) from exc
+    await dispatch_audit(
+        db,
+        correlation_id=uuid.uuid4(),
+        organization_id=org_id,
+        actor_id=user.id,
+        action="vendor.erp_linked",
+        entity_type="vendor",
+        entity_id=vendor_id,
+        details={
+            "realm": result.realm,
+            "erp_vendor_id": result.erp_vendor_id,
+            "erp_name": result.erp_name,
+            "tax_id_matches": result.tax_id_matches,
+            **({"kept": result.kept} if result.kept else {}),
+        },
+    )
+    await db.commit()
+    vendor = await _get_vendor_or_404(db, vendor_id)
+    await db.refresh(vendor)
+    links = await vendor_erp_links(db, vendor)
+    return VendorErpLinkResponse(
+        realm=result.realm,
+        erp_vendor_id=result.erp_vendor_id,
+        vendor=VendorResponse.from_db(vendor),
+        links=_erp_link_items(links),
+        search_refusal=await _erp_search_refusal(db, org, vendor),
+    )
+
+
+@router.post("/{vendor_id}/erp-links/unlink", response_model=VendorErpUnlinkResponse)
+async def unlink_vendor_erp(
+    vendor_id: uuid.UUID,
+    body: VendorErpUnlinkRequest,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_VENDOR_MANAGE)),
+    org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Clear the vendor's link to a supplier record in one ERP company
+    (decisions §375, `services/vendor_erp_unlink`): the row link and the kept
+    link for that company. The way through a merge refused
+    `vendor_merge_erp_link_conflict` — unlink the stale record, then merge.
+
+    `vendor.manage`, like every other edit to the vendor master. 404
+    `vendor_erp_link_not_found` when the vendor holds no link there; 409
+    `vendor_erp_unlink_in_flight` (`params.invoices`) while one of its invoices
+    is in flight to that company. Writes `vendor.erp_unlinked` naming the realm
+    and every id cleared. The vendor's next push to that company is refused
+    `vendor_not_linked`, and a later sync may re-link it only by the normal
+    unique-name rule. The response carries the vendor's new `search_refusal`
+    (§415), since clearing the connected company's link may open the search.
+    """
+    await ensure_in_entity_scope(
+        db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
+    )
+    await _get_vendor_or_404(db, vendor_id)
+    try:
+        result = await unlink_vendor_erp_link(db, vendor_id=vendor_id, realm=body.realm)
+    except ErpUnlinkError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    await dispatch_audit(
+        db,
+        correlation_id=uuid.uuid4(),
+        organization_id=org_id,
+        actor_id=user.id,
+        action="vendor.erp_unlinked",
+        entity_type="vendor",
+        entity_id=vendor_id,
+        details={"realm": result.realm, "cleared": result.cleared},
+    )
+    await db.commit()
+    vendor = await _get_vendor_or_404(db, vendor_id)
+    await db.refresh(vendor)
+    links = await vendor_erp_links(db, vendor)
+    return VendorErpUnlinkResponse(
+        realm=result.realm,
+        cleared=result.cleared,
+        vendor=VendorResponse.from_db(vendor),
+        links=_erp_link_items(links),
+        search_refusal=await _erp_search_refusal(db, org, vendor),
+    )
+
+
 @router.post("/sync-erp")
 async def sync_vendors_from_erp_endpoint(
     db: AsyncSession = Depends(get_tenant_db),
@@ -1678,10 +2192,8 @@ async def sync_vendors_from_erp_endpoint(
         erp_vendors = await adapter.list_vendors()
     except Exception as exc:
         logger.exception("ERP list_vendors failed for org %s", org_id)
-        raise HTTPException(
-            status_code=502,
-            detail=f"ERP request failed: {type(exc).__name__}",
-        ) from exc
+
+        raise erp_pull_failure(exc) from exc
 
     vendor_dicts = [dataclasses.asdict(v) for v in erp_vendors]
 
@@ -1692,18 +2204,34 @@ async def sync_vendors_from_erp_endpoint(
         entity_id=entity_id,
         actor_id=user.id,
         org_settings=org.settings,
+        # Which ERP company these ids belong to (§284): a vendor linked under
+        # another one is re-judged, never matched by a colliding id.
+        realm=connection_realm(erp_config),
     )
     await db.commit()
 
-    return {
-        "success": True,
-        "message": (
-            f"Synced {result['created']} new, "
-            f"{result['updated']} updated, "
-            f"{result['unchanged']} unchanged"
-        ),
-        **result,
-    }
+    message = (
+        f"Synced {result['created']} new, "
+        f"{result['updated']} updated, "
+        f"{result['unchanged']} unchanged"
+    )
+    reasons = Counter(c["reason"] for c in result["conflicts"])
+    if reasons["ambiguous_name"]:
+        message += (
+            f"; {reasons['ambiguous_name']} not linked (the name matches more than one vendor)"
+        )
+    if reasons["duplicate_link"]:
+        message += (
+            f"; {reasons['duplicate_link']} not updated (more than one vendor is linked to it:"
+            " merge them or unlink the stale one)"
+        )
+    if result["unlinked"]:
+        message += f"; {len(result['unlinked'])} unlinked (linked under another ERP company)"
+    if result["restored"]:
+        message += (
+            f"; {result['restored']} relinked (linked when this ERP company was connected before)"
+        )
+    return {"success": True, "message": message, **result}
 
 
 @router.post("/import-csv", status_code=status.HTTP_200_OK)
@@ -1802,23 +2330,22 @@ async def invite_vendor_portal_user(
     org_id: uuid.UUID = Depends(get_org_id),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    """Create a supplier-portal user for a vendor and email them a temp
-    password. Idempotent-ish: second invite for the same email is rejected
-    (409) so we don't silently overwrite a working credential.
+    """Create a supplier-portal user for a vendor and email them a
+    set-password link. Idempotent-ish: second invite for the same email is
+    rejected (409) so we don't silently overwrite a working credential.
 
-    The temp password is **delivered only by email** — it is not in the
-    response. AP chooses the address, so returning the plaintext credential to
-    the caller made "provision a supplier identity I control" a single
-    frictionless request with no delivery record; the credential now always
-    leaves through the email adapter, which every environment has (`console` in
-    local dev). Delivery is therefore no longer best-effort: a send failure
-    rolls the whole request back (502) rather than leaving a portal account
-    whose password nobody holds. Recovery for a genuinely lost credential is
-    `POST .../reset-password`, which mints and emails a new one.
+    No credential is generated or returned: the account starts with NO
+    password, and a single-use, expiring set-password link bound to this
+    tenant goes to the invited address (`api/set_password_links`,
+    `docs/decisions.md` §283). The email is the link's only channel, so
+    delivery is required: a send failure rolls the whole request back (502)
+    rather than leaving a portal account nobody can sign in to. Recovery for a
+    lost or expired link is `POST .../reset-password`, which mails a new one.
 
     The AP actor is recorded on `VendorUser.provisioned_by_user_id`, which
     `approve_change_request` reads to refuse a bank-change approval by the same
-    person — see that route and `backend/docs/supplier-portal.md`.
+    person — see that route and `backend/docs/supplier-portal.md`. AP still
+    chooses the address the link goes to, so the stamp stays.
     """
     await ensure_in_entity_scope(
         db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
@@ -1836,22 +2363,42 @@ async def invite_vendor_portal_user(
     if existing:
         raise HTTPException(status_code=409, detail="A portal user with this email already exists.")
 
-    temp_password = generate_temp_password()
+    # Nowhere to point the set-password link → refuse before creating anything.
+    require_link_base(org.slug, org.settings)
+
     vu = VendorUser(
         vendor_id=vendor.id,
         organization_id=vendor.organization_id,
         email=email,
         full_name=body.full_name,
-        hashed_password=await hash_password(temp_password),
+        # No password until the supplier sets one through the emailed link;
+        # portal login refuses the account until then.
+        hashed_password=None,
         is_active=True,
-        must_change_password=True,
-        # Segregation of duties, not bookkeeping: this AP actor now knows a
-        # working password for a supplier identity, so they are not an
-        # independent second party to anything that identity submits.
+        must_change_password=False,
+        # Segregation of duties, not bookkeeping: this AP actor chose the
+        # address the set-password link goes to, so they may control this
+        # supplier identity and are not an independent second party to
+        # anything it submits.
         provisioned_by_user_id=user.id,
     )
-    db.add(vu)
-    await db.flush()
+    # A concurrent invite of the same address (any case) that passed the check
+    # above trips `uq_vendor_users_email_lower` (§475): the same 409, not a 500.
+    try:
+        async with db.begin_nested():
+            db.add(vu)
+            await db.flush()
+    except IntegrityError:
+        taken = (
+            await db.execute(
+                select(VendorUser.id).where(email_matches(VendorUser.email, email)).limit(1)
+            )
+        ).scalar_one_or_none()
+        if taken is None:
+            raise
+        raise HTTPException(
+            status_code=409, detail="A portal user with this email already exists."
+        ) from None
     await db.refresh(vu)
 
     # Provisioning a supplier credential is an access-control change, and it is
@@ -1861,9 +2408,9 @@ async def invite_vendor_portal_user(
     # only the deletion. Keyed on the VENDOR (the durable entity), matching the
     # delete row, so both ends of the credential's life sit on the same trail.
     # PII-free by construction: the AP actor, the vendor and the new
-    # `VendorUser` id — never the supplier's login address, and never the temp
-    # password (which is emailed, but must not be written into an append-only,
-    # WORM-shipped store).
+    # `VendorUser` id — never the supplier's login address, and never the
+    # set-password link (which is emailed, but must not be written into an
+    # append-only, WORM-shipped store).
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -1875,47 +2422,36 @@ async def invite_vendor_portal_user(
         details={"vendor_user_id": str(vu.id)},
     )
 
-    # The welcome email is now the ONLY channel the temp password travels on,
-    # so it is a required step rather than a best-effort one. Sent before the
-    # commit: if it fails we raise and the transaction unwinds, so we never
-    # leave a portal account whose credential was never delivered.
-    email_adapter = get_email_adapter()
-    # Real tenant portal URL, resolved through the one `tenant_base_url`
-    # resolver the signup welcome email and the supplier-chat portal-link email
-    # also use — so a white-label tenant's supplier is invited to the tenant's
-    # own vanity host, never a placeholder domain. Nothing configured -> no URL
-    # line rather than a fabricated one.
+    # The email is the ONLY channel the set-password link travels on, so it is
+    # a required step. Minted and sent before the commit: a failure raises and
+    # the transaction unwinds, so we never leave a portal account whose link
+    # was never delivered. The portal URL comes from the one `tenant_base_url`
+    # resolver, so a white-label tenant's supplier lands on the tenant's own
+    # vanity host.
     template_base = tenant_base_url(org.slug, org.settings)
     portal_url = f"{template_base}/portal" if template_base else None
-    try:
-        await email_adapter.send(
-            EmailMessage(
-                to=body.email,
-                subject=f"You've been invited to {org.name}'s supplier portal",
-                body_text=(
-                    f"Hi {body.full_name},\n\n"
-                    f"{org.name} has set up a supplier-portal account for "
-                    f"{vendor.name}. Use it to submit invoices and track "
-                    f"payment status.\n\n"
-                    + (f"  URL:      {portal_url}\n" if portal_url else "")
-                    + f"  Email:    {body.email}\n"
-                    f"  Password: {temp_password}\n\n"
-                    "You'll be asked to change your password on first sign-in.\n"
-                ),
-                links=(portal_url,) if portal_url else (),
-                preheader="Your supplier-portal sign-in details are inside.",
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        # PII guard: the vendor id only — never the supplier's login address.
-        logger.exception("Portal-user welcome email failed (vendor=%s)", vendor.id)
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not deliver the portal invitation email, so no account "
-                "was created. Check the email provider configuration and retry."
+    link = await mint_portal_link(org.slug, org.settings, vu.id, set_password=True)
+    await send_set_password_email(
+        EmailMessage(
+            to=vu.email,
+            subject=f"You've been invited to {org.name}'s supplier portal",
+            body_text=(
+                f"Hi {body.full_name},\n\n"
+                f"{org.name} has set up a supplier-portal account for "
+                f"{vendor.name}. Use it to submit invoices and track "
+                "payment status. Choose your password with this link:\n\n"
+                f"  {link}\n\n"
+                + expiry_sentence()
+                + f" If it has expired, ask {org.name} to send a new one.\n\n"
+                + (f"  URL:      {portal_url}\n" if portal_url else "")
+                + f"  Email:    {vu.email}\n"
             ),
-        ) from exc
+            links=(link, portal_url) if portal_url else (link,),
+            preheader="Use the link in this email to set your supplier-portal password.",
+        ),
+        # PII guard: ids only — never the supplier's login address.
+        log_ref=f"vendor={vendor.id}",
+    )
 
     await db.commit()
     return PortalInviteResponse(user=_vendor_user_response(vu), portal_url=portal_url)
@@ -1984,22 +2520,20 @@ async def reset_vendor_portal_user_password(
     their password was AP deleting and re-inviting them — a new `VendorUser.id`
     that breaks anything referencing the old one (chat authorship, audit rows,
     the notification-preferences row) and forces the vendor to re-learn a new
-    login. This mints a fresh temp password onto the SAME row instead: same
-    permission gate as invite/delete (admin/ap_manager), the SHARED
-    `utils/passwords.generate_temp_password()` (never a local one — see
-    `backend/CLAUDE.md` § Passwords), and forces a change on next login via
-    the existing `must_change_password` flag (mirrors `invite_vendor_portal_user`).
-    Overwriting `hashed_password` immediately invalidates the old password —
-    there is no separate "revoke" step.
+    login. This resets the SAME row instead: same permission gate as
+    invite/delete (admin/ap_manager). The password is cleared — the old one
+    stops working at once, with no separate "revoke" step — every portal
+    session of the supplier is ended, and a single-use, expiring set-password
+    link bound to this tenant is mailed to the portal user's own stored
+    address (`docs/decisions.md` §283). Nothing credential-bearing is in the
+    response.
 
-    Like invite, the new password is **emailed to the portal user's own stored
-    address and not returned in the response**, and the reset re-stamps
-    `VendorUser.provisioned_by_user_id` with the resetting AP actor. Reset is
-    the *other* way an AP actor can come to hold a working supplier credential
-    — it is how the bank-redirect attack works against an already-existing
-    portal identity — so it has to leave the same record invite does. Delivery
-    failure rolls the reset back so a working credential is never replaced by
-    one nobody received.
+    The reset re-stamps `VendorUser.provisioned_by_user_id` with the resetting
+    AP actor. Reset is the other way an AP actor can steer a supplier
+    credential — it is how the bank-redirect attack works against an
+    already-existing portal identity — so it leaves the same record invite
+    does. Delivery failure rolls the reset back, so a working password is never
+    cleared for a link nobody received.
     """
     await ensure_in_entity_scope(
         db, Vendor, vendor_id, entity_id, detail="Vendor not found", include_shared=True
@@ -2015,12 +2549,21 @@ async def reset_vendor_portal_user_password(
     if not vu:
         raise HTTPException(status_code=404, detail="Portal user not found")
 
-    temp_password = generate_temp_password()
-    vu.hashed_password = await hash_password(temp_password)
-    vu.must_change_password = True
+    require_link_base(org.slug, org.settings)
+
+    vu.hashed_password = None
+    vu.must_change_password = False
     vu.provisioned_by_user_id = user.id
     await db.flush()
     await db.refresh(vu)
+
+    # Any earlier invite / reset link for this supplier dies with the old
+    # password — a 72-hour link must not outlive the reset.
+    try:
+        await password_reset.revoke_outstanding_portal(vu.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Could not supersede earlier portal links (vendor_user=%s)", vu.id)
+        raise link_unavailable() from exc
 
     await dispatch_audit(
         db,
@@ -2030,42 +2573,44 @@ async def reset_vendor_portal_user_password(
         action="vendor_portal_user.password_reset",
         entity_type="vendor_user",
         entity_id=vu.id,
-        details={"vendor_id": str(vendor_id)},
+        details={"vendor_id": str(vendor_id), "delivery": "set_password_link"},
     )
 
     template_base = tenant_base_url(org.slug, org.settings)
     portal_url = f"{template_base}/portal" if template_base else None
-    try:
-        await get_email_adapter().send(
-            EmailMessage(
-                to=vu.email,
-                subject=f"Your {org.name} supplier-portal password was reset",
-                body_text=(
-                    f"Hi {vu.full_name},\n\n"
-                    f"{org.name} has reset the supplier-portal password for "
-                    f"{vendor.name}.\n\n"
-                    + (f"  URL:      {portal_url}\n" if portal_url else "")
-                    + f"  Email:    {vu.email}\n"
-                    f"  Password: {temp_password}\n\n"
-                    "You'll be asked to change your password on first sign-in.\n"
-                ),
-                links=(portal_url,) if portal_url else (),
-                preheader="Your new supplier-portal sign-in details are inside.",
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        # PII guard: ids only — never the supplier's login address.
-        logger.exception("Portal-user password-reset email failed (vendor=%s)", vendor.id)
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not deliver the new password, so the reset was not "
-                "applied and the existing password still works. Check the "
-                "email provider configuration and retry."
+    link = await mint_portal_link(org.slug, org.settings, vu.id, set_password=False)
+    await send_set_password_email(
+        EmailMessage(
+            to=vu.email,
+            subject=f"Your {org.name} supplier-portal password was reset",
+            body_text=(
+                f"Hi {vu.full_name},\n\n"
+                f"{org.name} has reset the supplier-portal password for "
+                f"{vendor.name}. Choose a new password with this link:\n\n"
+                f"  {link}\n\n"
+                + expiry_sentence()
+                + f" If it has expired, ask {org.name} to send a new one.\n\n"
+                + (f"  URL:      {portal_url}\n" if portal_url else "")
+                + f"  Email:    {vu.email}\n"
             ),
-        ) from exc
+            links=(link, portal_url) if portal_url else (link,),
+            preheader="Use the link in this email to set a new supplier-portal password.",
+        ),
+        # PII guard: ids only — never the supplier's login address.
+        log_ref=f"vendor={vendor.id}",
+    )
 
     await db.commit()
+
+    # After the commit: a reset exists to cut off whoever holds the old
+    # password, and a portal session minted under it would otherwise live until
+    # its token expired. A Redis failure here must not 500 a reset that has
+    # already happened and been mailed — logged, and the old sessions die with
+    # their token's expiry.
+    try:
+        await revoke_user_sessions(vu.id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Portal session revoke after reset failed (vendor_user=%s)", vu.id)
 
     return PortalInviteResponse(user=_vendor_user_response(vu), portal_url=portal_url)
 
@@ -2161,8 +2706,38 @@ async def approve_change_request(
     409 — the lock + status check makes the apply exactly-once.
     """
     req = await _get_scoped_change_request_for_update(db, request_id, entity_id)
+    # Pending, and not proposed by this approver on either axis — the ONE
+    # definition the review queue's `approve_refusal` is read from.
+    refusal = change_request_approve_refusal(req, user.id)
+    if refusal is not None:
+        raise refusal.http()
+
+    vendor = (
+        await db.execute(select(Vendor).where(Vendor.id == req.vendor_id))
+    ).scalar_one_or_none()
+    if not vendor:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    return await _apply_approved_change(db, org, user, req, vendor, body)
+
+
+CHANGE_REQUEST_NOT_PENDING = "vendor_change_not_pending"
+CHANGE_REQUEST_SELF_REQUESTED = "vendor_change_self_requested"
+CHANGE_REQUEST_SELF_PROVISIONED = "vendor_change_self_provisioned"
+
+
+def change_request_approve_refusal(req, actor_id: uuid.UUID) -> ActionRefusal | None:
+    """Why ``POST /change-requests/{id}/approve`` would refuse ``actor_id``
+    (who holds ``vendor.bank_change.approve``), or ``None`` — raised by the
+    endpoint and read as ``approve_refusal`` by the review queue (issue #575).
+
+    The queue used to compare only ``requested_by_user_id`` with the reader, so
+    an approver whose own provisioned portal login staged the change was shown
+    an Approve that could only 403.
+    """
     if req.status != "pending":
-        raise HTTPException(status_code=409, detail="Change request already resolved")
+        return ActionRefusal(
+            CHANGE_REQUEST_NOT_PENDING, "Change request already resolved", status.HTTP_409_CONFLICT
+        )
     # Segregation of duties, on BOTH axes an AP actor can be the proposer.
     #
     # (1) AP-initiated: the user named on `requested_by_user_id` staged it.
@@ -2188,29 +2763,27 @@ async def approve_change_request(
     # own credential has a NULL provisioner, and a request provisioned by a
     # DIFFERENT AP user still has a real second pair of eyes, which is all dual
     # control asks for.
-    self_requested = req.requested_by_user_id is not None and req.requested_by_user_id == user.id
-    self_provisioned = (
-        req.requester_provisioned_by_user_id is not None
-        and req.requester_provisioned_by_user_id == user.id
-    )
-    if self_requested or self_provisioned:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "You cannot approve a bank-detail change you requested."
-                if self_requested
-                else (
-                    "You cannot approve a change submitted by a supplier-portal "
-                    "login you provisioned. Another approver must review it."
-                )
-            ),
+    if req.requested_by_user_id is not None and req.requested_by_user_id == actor_id:
+        return ActionRefusal(
+            CHANGE_REQUEST_SELF_REQUESTED,
+            "You cannot approve a bank-detail change you requested.",
+            status.HTTP_403_FORBIDDEN,
         )
+    if (
+        req.requester_provisioned_by_user_id is not None
+        and req.requester_provisioned_by_user_id == actor_id
+    ):
+        return ActionRefusal(
+            CHANGE_REQUEST_SELF_PROVISIONED,
+            "You cannot approve a change submitted by a supplier-portal "
+            "login you provisioned. Another approver must review it.",
+            status.HTTP_403_FORBIDDEN,
+        )
+    return None
 
-    vendor = (
-        await db.execute(select(Vendor).where(Vendor.id == req.vendor_id))
-    ).scalar_one_or_none()
-    if not vendor:
-        raise HTTPException(status_code=404, detail="Vendor not found")
+
+async def _apply_approved_change(db, org, user, req, vendor, body):
+    """Apply an approval that has passed :func:`change_request_approve_refusal`."""
 
     last4: str | None = None
     if req.change_type == "bank_details":
@@ -2259,10 +2832,11 @@ async def approve_change_request(
 
     # BEC gate: a bank-detail change silently re-points where money goes. After
     # applying it, (a) re-screen the vendor against sanctions/KYC with the new
-    # coordinates, and (b) raise a fraud_flag exception on every invoice already
-    # in the payment queue for this vendor — so the next payment run gets a human
-    # second look before money leaves. Without this the queue shows nothing and a
-    # phished/insider approval lands the redirect with no operational signal.
+    # coordinates, and (b) raise a fraud_flag exception on every approved,
+    # unpaid invoice for this vendor — so the next payment run, and the next ERP
+    # push, get a human second look before money leaves. Without this the queue
+    # shows nothing and a phished/insider approval lands the redirect with no
+    # operational signal.
     if req.change_type == "bank_details":
         await _screen_best_effort(
             db,

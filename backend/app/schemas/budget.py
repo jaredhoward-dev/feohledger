@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.api.pagination import PageMeta
 from app.models.procurement import BudgetDimension
+from app.schemas.currency import CurrencyCode, OptionalCurrencyCode
 from app.schemas.money import MoneyAmount
 
 # ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ class BudgetBase(BaseModel):
     # Digits match `budgets.amount` Numeric(15, 2). An allocation is never
     # negative — `0` already expresses a frozen budget.
     amount: Decimal = Field(ge=0, max_digits=15, decimal_places=2)
-    currency: str = Field(default="USD", max_length=3)
+    currency: CurrencyCode = "USD"
     notes: str | None = None
 
 
@@ -50,7 +51,7 @@ class BudgetUpdate(BaseModel):
     period_start: date | None = None
     period_end: date | None = None
     amount: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
-    currency: str | None = Field(default=None, max_length=3)
+    currency: OptionalCurrencyCode = None
     notes: str | None = None
 
 
@@ -97,6 +98,9 @@ class BudgetSpendResponse(BaseModel):
     # them rather than adding unlike face values. Non-zero means `committed` /
     # `actual` describe PART of the linked activity — say so where they render.
     excluded_row_count: int = 0
+    # A COUNT: linked open POs left out of `committed` because the ERP could not
+    # confirm their total at its last sync (decisions §323). Same rule.
+    unverifiable_po_count: int = 0
 
 
 class BudgetCurrencyTotal(BaseModel):
@@ -146,6 +150,7 @@ class BudgetCurrencyRollupEntry(BaseModel):
     utilization_pct: str | None
     over_budget_count: int
     excluded_row_count: int
+    unverifiable_po_count: int = 0
 
 
 class BudgetRollupResponse(BaseModel):
@@ -166,6 +171,9 @@ class BudgetRollupResponse(BaseModel):
     by_currency: list[BudgetCurrencyRollupEntry]
     excluded_row_count: int
     insufficient_data: bool
+    #: Linked open POs left out of ``committed`` because their total is one the
+    #: ERP no longer vouches for (decisions §323) — a second floor disclosure.
+    unverifiable_po_count: int = 0
 
 
 class BudgetCheckResponse(BaseModel):
@@ -183,6 +191,10 @@ class BudgetCheckResponse(BaseModel):
     remaining_after: MoneyAmount
     would_overspend: bool
     currency: str
+    # Linked open POs left out of `committed` (decisions §323): non-zero means
+    # `remaining` may overstate the headroom, so `would_overspend: false` is
+    # not the whole answer.
+    unverifiable_po_count: int = 0
 
 
 __all__ = [

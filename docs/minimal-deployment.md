@@ -11,8 +11,8 @@ footprint.
 Postgres 16 for the databases, real S3 for files, everything else in-process.**
 
 ```
-        *.feohledger.com  ──────────► one VM (EC2 t4g.medium)
-                                 ├── Caddy         — TLS, static frontend, /api reverse-proxy
+        api.feohledger.com ─────────► one VM (EC2 t4g.medium)
+                                 ├── Caddy         — TLS, /api reverse-proxy (+ vanity hosts)
                                  ├── FastAPI       — backend container (uvicorn)
                                  └── Redis 7       — token blocklist, rate limits, MFA state
                                         │  TLS (verify-full)
@@ -69,7 +69,10 @@ when each piece graduates.
 | RDS storage 20 GB gp3 (backup storage up to the DB's size is free) | ~$2.30 |
 | VPC flow logs (rejected traffic only) + CloudWatch alarms | ~$1–2 |
 | SPA on S3 + CloudFront (inside CloudFront's always-free 1 TB / 10M requests) | ~$0–1 |
+| CloudFront additional metrics on the SPA distribution (feeds the 404 alarm; up to 8 metrics × $0.30) | ~$2.40 |
 | **Total** | **~$45–55** |
+| Plus external uptime checks (3 Route 53 HTTPS checks) and SMS paging (a toll-free number), `infra/uptime.tf` | ~$8–13 |
+| Plus the hourly certificate canary on `api.`'s Let's Encrypt certificate, `infra/canary.tf` | ~$1 |
 
 This is the stack `infra/` defines (`docs/decisions.md` §254). Both instances are
 burstable in unlimited credit mode, so sustained load adds surplus-CPU charges on
@@ -103,25 +106,25 @@ Resizing is a change to `app_instance_type` in the tfvars (a stop → change-typ
    SSE-KMS) plus the backups bucket (lifecycle-expired, no lock — see
    § Backups). Set `FEOH_S3_BUCKET`, omit `FEOH_S3_ENDPOINT_URL`, and drop the
    MinIO container — less RAM, real durability, pennies at pilot volume.
-2. **Caddy on the VM serves the frontend.** GitHub Pages can't serve wildcard
-   tenant subdomains and CloudFront+ACM is more moving parts. Caddy serves the
-   static SPA (published releases under `deploy/www/`, swapped atomically —
-   `deploy/README.md` § How the SPA is served), reverse-proxies `api.feohledger.com` to the backend, and
-   auto-provisions TLS. Start with an **explicit hostname list** (one line per
-   tenant subdomain — plain HTTP-01, no DNS plugin, no extra IAM); move to a
-   wildcard cert via DNS-01 + the Route 53 plugin only when tenant churn makes
-   the list annoying.
-   **Superseded for the SPA by S3 + CloudFront** (`infra/frontend.tf`,
-   `docs/decisions.md` §278). The first release deploy took the site down
-   because the files Caddy served were rebuilt in place. An upload plus an
-   invalidation has no empty moment, and one wildcard certificate covers every
-   tenant. Until the DNS cutover (`frontend_on_cloudfront`) and the step-4
-   cleanup after it, Caddy still serves the SPA as described here and is the
-   rollback path. It keeps `api.` either way.
+2. **The SPA is S3 + CloudFront; Caddy on the VM serves the API.** The first
+   plan here was Caddy serving the static SPA as well, because GitHub Pages
+   can't serve wildcard tenant subdomains and CloudFront + ACM looked like more
+   moving parts. The first release deploy changed that: it took the site down
+   because the files Caddy served were rebuilt in place (#579). The SPA moved to
+   S3 + CloudFront (`infra/frontend.tf`, `docs/decisions.md` §278), where an
+   upload plus an invalidation has no empty moment and one wildcard certificate
+   covers every tenant, and after a day of clean traffic the VM stopped
+   building and serving it (§364). Caddy now reverse-proxies
+   `api.feohledger.com` to the backend, auto-provisions its TLS, and serves
+   customer vanity hosts (`docs/founder-runbooks/custom-domain-provisioning.md`
+   § 3a), proxying their pages from CloudFront. Tenant subdomains need no Caddy
+   block and no DNS record. Rolling back to the VM serving the SPA means
+   re-deploying a commit from before §364 (`infra/README.md` § Frontend on
+   CloudFront, Rollback).
 3. **Everything stays in `local` dispatch mode.** The Lambda/SQS split exists
    for burst isolation, which a pilot doesn't have.
 4. **Secrets follow the estate pattern.** This repo is public — `*.sops` files
-   go in the private `Absence0760/infra-secrets` repo (per-project subdir +
+   go in the private `jaredhoward-dev/infra-secrets` repo (per-project subdir +
    per-project KMS key), never committed here. The EC2 instance profile gets
    KMS access to both the sops key and the app key, plus scoped S3 access
    (§ 1 below), so no static AWS keys live on the box;
@@ -203,12 +206,12 @@ Resizing is a change to `app_instance_type` in the tfvars (a stop → change-typ
   (dnf-automatic, security-only; docker/containerd excluded so a package
   update never bounces the stack at a random hour — update those around a
   deploy window), 2 GB swap, the nightly backup cron, and the IMDS hop-limit
-  fix. Node/pnpm are *not* needed on the VM — the frontend builds inside a
-  `node:24` container.
-- DNS: three records → the instance IP: `feohledger.com`, `api.feohledger.com`, and a
-  **wildcard `*.feohledger.com`** so tenant onboarding never touches DNS again.
-  (A DNS wildcard needs no wildcard *certificate* — Caddy still issues
-  ordinary per-host HTTP-01 certs.)
+  fix. Node/pnpm are *not* needed on the VM — the SPA builds in CI.
+- DNS (`infra/compute.tf`): `api.feohledger.com` → the instance IP; the apex
+  and a **wildcard `*.feohledger.com`** alias the SPA's CloudFront
+  distribution (`frontend_on_cloudfront = true`), whose ACM wildcard
+  certificate covers every tenant, so tenant onboarding never touches DNS or
+  Caddy.
 
 ### 1b. Database (RDS)
 
@@ -217,8 +220,10 @@ is [§ Database](#database). In short: `db.t4g.micro`, single-AZ, encrypted
 gp3 storage, automated backups on (that retention window *is* the
 point-in-time-restore window), `rds.force_ssl = 1`, an initial database named
 `feohledger`, not publicly accessible, and a security group admitting 5432
-from the VM's security group only. The instance profile needs nothing for it —
-the app authenticates with the master password, not IAM.
+from the VM's security group only. The app signs in as the least-privilege
+role `feoh_app` with an IAM auth token minted per connection, so the instance
+profile holds `rds-db:connect` on that one user (`infra/compute.tf`) and the
+master password is not on the VM ([§ The app's database role](#the-apps-database-role)).
 
 ### 2. Production compose stack (`deploy/compose.prod.yml` — built)
 
@@ -255,28 +260,19 @@ redeploy can never pick up an upstream retag; bumps arrive as Dependabot
   Caddy's `X-Forwarded-For` — untrusted, every user would collapse into the
   proxy's container IP and the signup/login caps would throttle everyone
   collectively.
-- `caddy` — ports 80/443, mounts `deploy/www/` at `/srv` and serves
-  `/srv/current`, a symlink `deploy.sh` swaps by rename to each newly published
-  release, keeping the previous one for an instant rollback. Never the build
-  output itself: the build deletes and recreates `frontend/build`, and a bind
-  mount left on the deleted directory served every page as an empty 404 (#579,
-  `docs/decisions.md` §277). Plus `deploy/Caddyfile` (domains via env) and the per-VM, gitignored
-  `deploy/tenants.caddy` host list (one block per tenant subdomain —
-  per-host HTTP-01 certs, no DNS plugin; maintained by `add-tenant.sh`, not
-  by hand):
-  - `feohledger.com` + each tenant host → SPA (`try_files {path} /index.html`)
-  - `api.feohledger.com` → `reverse_proxy api:8000`
-- `frontend-build` — the Node 24 alpine container `deploy.sh` builds the SPA
-  in (`docker compose run --rm frontend-build`), with the repo bind-mounted and
-  the pnpm store cached in a volume. A `build` profile keeps `up` from ever
-  starting it. It lives in the compose file, not as a `docker run` in
-  `deploy.sh`, so Dependabot reads its image (`docs/decisions.md` §203).
+- `caddy` — ports 80/443. `deploy/Caddyfile` (domains via env) has one site,
+  `api.feohledger.com` → `reverse_proxy api:8000`, and a `vanity` snippet for
+  customer domains, listed one block each in the per-VM, gitignored
+  `deploy/tenants.caddy` (per-host HTTP-01 certs; `/api` to the backend under
+  the vanity `Host`, the page proxied from CloudFront). It mounts no site
+  directory: the apex and every tenant host are CloudFront's
+  (`docs/decisions.md` §364).
 
-The frontend is built by the deploy script with
+The SPA is built in CI (`vm-deploy.yml`'s `build-frontend` job) with
 `PUBLIC_API_URL=https://<API_DOMAIN>` and `PUBLIC_SITE_URL=https://<APP_DOMAIN>`
-baked in. The second is the origin of the absolute `og:image` URL in the
-link-preview card (`frontend/src/app.html`); see
-[environment.md](environment.md) § Frontend.
+baked in, and published to S3 + CloudFront after the VM deploy. The second is
+the origin of the absolute `og:image` URL in the link-preview card
+(`frontend/src/app.html`); see [environment.md](environment.md) § Frontend.
 
 ### 3. Backend env (`prod.sops.yaml` — contract: `deploy/prod.sops.yaml.example`)
 
@@ -296,9 +292,10 @@ Beyond the committed defaults, the deployed env sets at minimum:
 | `FEOH_SECRET_KEY` | `openssl rand -hex 32` |
 | `FEOH_CREDENTIAL_KMS_KEY_ID` | `terraform output app_kms_key_alias` (e.g. `alias/feohledger-app-prod`) — the key that seals tenant ERP / payment / card credentials. **Required**: the API (and `alembic`) refuse to boot in production without it, and `deploy.sh` refuses first. Set it before the first deploy carrying migration 0110, which seals the existing credentials with it. The VM role already holds `kms:GenerateDataKey` + `kms:Decrypt` on that key (`infra/compute.tf`) |
 | `FEOH_SIGNUP_ENABLED` | `false` to keep self-service signup closed (every `/api/signup/*` route 404s and `/signup` says signup is closed) — the usual choice here, with tenants provisioned by `deploy/add-tenant.sh`. Leave it unset (on) only when you want public signup, and then set both hCaptcha keys |
-| `FEOH_HCAPTCHA_SECRET` / `FEOH_HCAPTCHA_SITEKEY` | **Required while signup is on** — the API refuses to boot in production with the secret empty, and `deploy.sh` refuses first. With `FEOH_SIGNUP_ENABLED=false` neither is needed. |
-| `FEOH_DATABASE_URL` | **RDS path:** `postgresql+asyncpg://<master user>:<master password>@<RDS endpoint>:5432/feohledger` — the endpoint host name exactly as RDS reports it (verify-full checks the certificate against it), no query string, and a URL-safe password (`openssl rand -hex 24`; anything else percent-encoded). Setting it is what selects the RDS path. **Container path:** leave unset — compose derives it from `POSTGRES_PASSWORD` |
-| `PGSSLMODE` | **RDS path:** `verify-full` (required; `require` / `verify-ca` warn, anything weaker is refused). **Container path:** leave unset — the container serves no TLS |
+| `FEOH_HCAPTCHA_SECRET` / `FEOH_HCAPTCHA_SITEKEY` | **Both required while signup is on** — the API refuses to boot in production with either empty (no site key means no widget, so every signup fails the captcha), and `deploy.sh` refuses first. With `FEOH_SIGNUP_ENABLED=false` neither is needed. |
+| `FEOH_DATABASE_URL` | **RDS path:** `postgresql+asyncpg://feoh_app@<RDS endpoint>:5432/feohledger` — no password (IAM auth), the endpoint host name exactly as RDS reports it (verify-full checks the certificate against it, and the token is signed for it), no query string. Before `deploy/db-role-cutover.sh` (and on the break-glass path) it is the master's URL with its URL-safe password instead. Setting it is what selects the RDS path. **Container path:** leave unset — compose derives it from `POSTGRES_PASSWORD` |
+| `FEOH_DATABASE_IAM_AUTH` | **RDS path:** `"true"` with the password-less app-role URL above; `"false"` (or unset) only with a password URL. `decrypt-env.sh` refuses both together and neither. **Container path:** leave unset |
+| `PGSSLMODE` | **RDS path:** `verify-full` (required; with a password URL `require` / `verify-ca` warn, and with IAM auth anything but `verify-full` is refused). **Container path:** leave unset — the container serves no TLS |
 | `POSTGRES_PASSWORD` | **Container path:** `openssl rand -hex 24` (compose derives `FEOH_DATABASE_URL` from it). **RDS path:** leave empty — nothing reads it |
 | `FEOH_S3_BUCKET` | invoice-files bucket; set `FEOH_S3_ENDPOINT_URL` / `FEOH_S3_ACCESS_KEY` / `FEOH_S3_SECRET_KEY` **empty** → real S3 via the instance-profile credential chain |
 | `FEOH_MFA_ENABLED` / `FEOH_HSTS_ENABLED` | `true` / `true` |
@@ -309,6 +306,7 @@ Beyond the committed defaults, the deployed env sets at minimum:
 | `FEOH_DEPLOYED_REGION` | the region this VM runs in (`us`/`eu`/`uk`/`ca`/`au`) — advisory only, but empty makes every tenant's data-residency `alignment` report `unknown` / `aligned: null` ("cannot attest") |
 | `FEOH_EMAIL_PROVIDER` / `FEOH_EMAIL_FROM` | `ses` / verified sender |
 | `FEOH_ANTHROPIC_API_KEY` **or** `FEOH_EXTRACTION_PROVIDER` | **Decide before first boot.** A real key (Claude Vision; Anthropic becomes a sub-processor of tenant invoices), `mock` (fabricated fields — a demo box only), or neither (invoices keyed in by hand; every upload's extraction fails and `deploy.sh` warns). Extraction is the one adapter that does not fall back to `mock` in a deployed env — `backend/docs/ai-extraction.md` § Platform provider precedence |
+| `FEOH_PAYEE_FINGERPRINT_KEY` | **Required.** `openssl rand -hex 32`, its own value (never `FEOH_SECRET_KEY`'s): the key of the payee bank fingerprint each payment records and its void compares (decisions §383). The API refuses to boot without it and `decrypt-env.sh` refuses first. Rotate only through `FEOH_PAYEE_FINGERPRINT_PREVIOUS_KEYS`, never by replacement (`docs/secrets-rotation.md`) |
 | `FEOH_APPROVAL_SIGNING_KEY` + the other HMAC signing keys | real values (each key's presence is its feature's on-switch; leave unset = feature off) |
 
 Everything else keeps its safe default: mock adapters (extraction excepted,
@@ -330,20 +328,23 @@ Copy `prod.sops.yaml` onto the VM as `deploy/prod.sops.yaml` (`deploy/decrypt-en
 checks it without deploying), then run
 `deploy/deploy.sh`: it preflights its own prerequisites and the required env
 keys (clear errors before any work happens), pulls main, decrypts secrets,
-builds the frontend in the `frontend-build` service's `node:24` container
-(`PUBLIC_API_URL` baked from `API_DOMAIN`, `PUBLIC_SITE_URL` from `APP_DOMAIN`;
-pnpm store cached in a volume) and the backend image, runs
+builds the backend image, runs
 `sh scripts/deploy_migrate.sh` (`init_control_plane.py`, `alembic upgrade head`, `migrate_all_tenants.py`) **before**
 the new API serves traffic (same ordering contract as the future ECS
 pipeline), then rolls the containers with `up -d --wait` — the deploy fails
 loudly if the API healthcheck never passes, and a failed build or migration
-leaves the previous containers serving. Only then does the new SPA go live — a
-copy of the build under `deploy/www/releases/`, switched in by one symlink
-rename — followed by a Caddy reload and a **smoke check**: `curl` from the VM,
-through its own Caddy, must get a 200 with a non-empty body from
-`https://<APP_DOMAIN>/` and `https://<API_DOMAIN>/api/health`, or the deploy
-fails (`deploy/README.md` § Deploys, § How the SPA is served). Flags: `--no-pull`, `--ref <sha>`,
-`--backend-only`, `--frontend-only`. Only one deploy runs at a time (a `flock`
+leaves the previous containers serving. Then a Caddy reload and, last, a
+**smoke check** (`deploy/smoke.sh --vm`): `curl` from the VM, through its own
+Caddy, must get a 200 with a non-empty body from
+`https://<API_DOMAIN>/api/health` and the first vanity host if there is one
+(over a valid certificate), and `/api/public-config` must report signup as
+`.env` configures it, with a captcha site key while it is on — or the deploy
+fails (`deploy/README.md` § Deploys). The VM builds no SPA (`docs/decisions.md`
+§364); the release workflow publishes it to CloudFront afterwards, checks
+the edge, and last runs `deploy/smoke.sh` from the runner through public DNS
+(the apex, `api.` health, `smoke-check.<apex>` TLS and `public-config`), the
+check the on-VM one cannot make. Flags: `--no-pull`, `--ref <sha>`, and `--backend-only`, which every
+deploy now is and which is accepted for compatibility. Only one deploy runs at a time (a `flock`
 on `deploy/.deploy.lock`), and after the checkout the script re-runs the
 `deploy.sh` it just checked out, so a release that changes the deploy steps is
 deployed by them.
@@ -368,8 +369,10 @@ the newest. One-time setup: `infra/README.md` § Release deploys.
 
 Tenants are one command each: `deploy/add-tenant.sh <slug> --name "Company"
 --admin-email admin@company.com` provisions the tenant (the same
-`provision_tenant` path self-service signup uses), appends the Caddy host
-block, and reloads — no DNS step thanks to the wildcard record. Do **not**
+`provision_tenant` path self-service signup uses) — no Caddy block and no DNS
+step, since the tenant host is CloudFront's wildcard. If the admin's
+set-password email did not send, add `--resend-link` (with `<slug>` and
+`--admin-email`, no `--name`) once mail works. Do **not**
 run `scripts/seed.py` (demo data) in prod.
 
 ### 5. Backups (RDS automated backups + `deploy/backup.sh`)
@@ -411,14 +414,19 @@ Two layers on the RDS path, one in container mode:
   [--force] [db …]`, streamed straight from S3; existing DBs are skipped
   unless `--force`. Container mode replays the role globals and then each DB
   via `pg_restore --create`. **On the RDS path it does not replay globals and
-  restores each DB with `--no-owner --no-acl`:** the app needs exactly one
-  role — the master user it connects as, which RDS already has — and the
+  restores each DB with `--no-owner --no-acl`, as the master:** the roles the
+  app needs already exist on the instance — the master, `feoh_owner` and
+  `feoh_app` — and the
   dumped roles cannot be recreated as dumped (a container dump's `postgres`
   is a SUPERUSER, which RDS refuses; an RDS dump's `rds*` roles belong to
   AWS). Without `--no-owner`, a container dump restored into RDS would try to
-  hand every object to a `postgres` role the app does not connect as. The
-  master user is `rds_superuser`, which is enough for `pg_restore --create`
-  (`CREATEDB`) and for the `CREATE EXTENSION vector` inside each tenant dump.
+  hand every object to a `postgres` role the app does not connect as. It runs
+  as the master (break-glass, `deploy/README.md` § Database role), because
+  `pg_restore --create` builds each database from `template0` and only
+  `rds_superuser` may `CREATE EXTENSION vector` (not a trusted extension on
+  RDS); the app role is refused. Re-run `deploy/db-role-cutover.sh` afterwards
+  to hand the restored objects to `feoh_owner`, then bring the api up from a
+  clean shell (`deploy/README.md` § Database role).
   **Test a restore once** before calling this done: scratch stack,
   `restore.sh <yesterday>`, log in.
 - RPO / RTO: on the RDS path the database's RPO is about five minutes (the
@@ -442,9 +450,10 @@ you switch.
    as possible").
 3. Wait, then read its endpoint: `aws rds wait db-instance-available --profile feohledger --db-instance-identifier <instance>-pitr-<yyyymmddhhmm>` and `aws rds describe-db-instances --profile feohledger --db-instance-identifier <instance>-pitr-<yyyymmddhhmm> --query 'DBInstances[0].Endpoint.Address' --output text`
 4. Switch the app to it. Either change the host in `FEOH_DATABASE_URL` in
-   `infra-secrets/feohledger/prod.sops.yaml` (same master user and password —
-   they are restored with the data), copy the file onto the VM and run
-   `./deploy.sh`; or keep the endpoint by renaming — `aws rds modify-db-instance --profile feohledger --db-instance-identifier <instance> --new-db-instance-identifier <instance>-old --apply-immediately`,
+   `infra-secrets/feohledger/prod.sops.yaml` (same users — roles are restored
+   with the data — but `rds-db:connect` names the instance's resource id, so
+   re-apply `infra/` against the new instance first or the app role's tokens
+   are refused), copy the file onto the VM and run `./deploy.sh`; or keep the endpoint by renaming — `aws rds modify-db-instance --profile feohledger --db-instance-identifier <instance> --new-db-instance-identifier <instance>-old --apply-immediately`,
    wait, then the same with `--db-instance-identifier <instance>-pitr-<yyyymmddhhmm> --new-db-instance-identifier <instance>`
    — the endpoint host name follows the identifier, so the secrets file does
    not change; restart the api (`./compose.sh restart api`). Either way,
@@ -493,15 +502,25 @@ explicitly so it survives a parameter-group swap), **an initial database named
 not publicly accessible, and a security group admitting TCP 5432 from the VM's
 security group and nothing else. The master password must be URL-safe
 (`openssl rand -hex 24`, or Terraform's `random_password` with
-`special = false`): it is embedded in `FEOH_DATABASE_URL`, and `decrypt-env.sh`
-refuses a URL `lib.sh` cannot hand to libpq.
+`special = false`): the break-glass `FEOH_DATABASE_URL` embeds it, and
+`decrypt-env.sh` refuses a URL `lib.sh` cannot hand to libpq.
 
-The app connects as the master user. That user is a member of
-`rds_superuser`, **not** a superuser, and nothing in the app needs more:
-tenant provisioning's `CREATE DATABASE` / `DROP DATABASE … WITH (FORCE)` need
-`CREATEDB` and ownership, which it has; the audit-log immutability triggers
-are ordinary `CREATE FUNCTION` / `CREATE TRIGGER`; no code path uses an event
-trigger, `ALTER SYSTEM`, or a role change.
+### The app's database role
+
+The app does **not** connect as the master (a member of `rds_superuser`). It
+connects as `feoh_app` (`LOGIN`, `rds_iam`, no password), and every session
+acts as `feoh_owner` (`NOLOGIN`, `CREATEDB`), the owner of the control plane and
+every tenant database. Neither role has `CREATEROLE` or is in `rds_superuser`,
+and the master joins only `feoh_owner`, so it keeps its password login. That is all the app needs: tenant provisioning's
+`CREATE DATABASE` / `DROP DATABASE … WITH (FORCE)` need `CREATEDB` and
+ownership; the audit-log immutability triggers are ordinary
+`CREATE FUNCTION` / `CREATE TRIGGER` on tables it owns; no code path uses an
+event trigger, `ALTER SYSTEM`, or a role change. It signs in with a 15-minute
+IAM token minted per connection from the instance profile
+(`backend/app/db_engine.py`), so there is no long-lived database credential on
+the VM. pgvector is created once in `template1` by the master, because the app
+role may not create it. The cutover, rollback and break-glass procedure is
+`deploy/README.md` § Database role; the reasoning is `docs/decisions.md` §310.
 
 ### Database TLS
 
@@ -515,7 +534,7 @@ the stack sets it in one place:
   `require` and above it loads `PGSSLROOTCERT`, and `verify-full` also checks
   the host name. Nothing in the app passes `ssl`: SQLAlchemy's asyncpg
   dialect forwards only the URL's query string, and the raw
-  `asyncpg.connect` calls (`tenant_provisioning.asyncpg_connect_kwargs`, used
+  connections (`db_engine.connect_raw` over `db_engine.asyncpg_connect_kwargs`, used
   by provisioning, deletion, `seed.py` and the rename script) parse the URL
   with the same `make_url` the engines use. So the control-plane engine, every
   tenant engine, Alembic (control and per-tenant), the raw CREATE/DROP
@@ -552,10 +571,13 @@ the stack sets it in one place:
 
 RDS for PostgreSQL 16 ships pgvector as the `vector` extension (every 16.x
 minor; the pgvector version follows the minor — 0.8.x on current 16.x). No
-`shared_preload_libraries` change is needed, and the master user
-(`rds_superuser`) may `CREATE EXTENSION vector`, which is what tenant
-provisioning (`CREATE EXTENSION IF NOT EXISTS vector`), migration
-`0003_rag_embeddings` and every tenant dump's restore run. The container image
+`shared_preload_libraries` change is needed. It is **not** a trusted extension
+on RDS: only the master (`rds_superuser`) may `CREATE EXTENSION vector`, so
+`deploy/db-role-cutover.sh` creates it once in `template1`. Every tenant
+database is copied from `template1`, so tenant provisioning's and migration
+`0003_rag_embeddings`'s `CREATE EXTENSION IF NOT EXISTS vector` find it
+present, which is a no-op the app role may run. A logical restore recreates it,
+which is why that restore runs as the master. The container image
 pins pgvector 0.8.7; a dump moves between the two either way, because
 `pg_dump` records `CREATE EXTENSION vector` without a version. To confirm on
 the live instance, from `deploy/` on the VM:
@@ -581,7 +603,9 @@ and losing the VM without a dump means losing the data.
 3. Copy the file onto the VM and run `./decrypt-env.sh` — the VM is now in RDS
    mode for every script.
 4. `./restore.sh <today> --force` — into RDS, without globals, with
-   `--no-owner --no-acl`, so every object belongs to the master user.
+   `--no-owner --no-acl`, so every object belongs to the master user (the
+   URL is still the master's at this point); then `./db-role-cutover.sh` and
+   the rest of `deploy/README.md` § Database role move the app onto `feoh_app`.
    `--force` because `feohledger` already exists on the new instance (created
    empty with it) and would otherwise be skipped; nothing else is there yet to
    overwrite.
@@ -602,10 +626,10 @@ rebuilding the stack:
 | Managed Redis (ElastiCache) | Same HA push | Same seam: set `FEOH_REDIS_URL` in the sops env, redeploy. Redis holds only ephemeral state (blocklist / MFA / rate limits) — no data migration. |
 | SQS + Lambda async workers | Extraction/OCR saturates the VM | Already implemented and bundled in the same image (`awslambdaric`). Provision queues + functions (production-deployment.md § Lambda workers), flip `FEOH_EXTRACTION_MODE=lambda` + `FEOH_SQS_*_QUEUE_URL` in the sops env, redeploy. Same pattern for the ERP and audit modes. |
 | ~~CloudFront + S3 frontend~~ | ~~Global latency / offloading the VM~~ | **Built** (`infra/frontend.tf`, published by `vm-deploy.yml`; `docs/decisions.md` §278). The trigger turned out to be deploy safety, not latency. Cutover steps: `infra/README.md` § Frontend on CloudFront. |
-| Wildcard TLS certificate | Tenant count makes per-host certs noisy (Let's Encrypt ~50 certs/week limit) | DNS already wildcards; swap the Caddy image for an xcaddy build with the Route 53 DNS plugin and replace `tenants.caddy` with one `*.feohledger.com` site block. |
+| ~~Wildcard TLS certificate~~ | ~~Tenant count makes per-host certs noisy~~ | **Moot** since `docs/decisions.md` §364: tenant hosts are on CloudFront's ACM wildcard, and Caddy issues only `api.` and vanity-host certificates. |
 | Real provider adapters (payments, cards, AI extraction, ERP, sanctions…) | Going live with real money / real data | Per-org `Organization.settings.*` flips + sops keys — zero infrastructure. |
 | Background sweeps (payment reconciler, audit shipping, renewals, dunning…) | First real payments / compliance needs | `FEOH_*_ENABLED=true` in the sops env, redeploy. |
-| SES production access | Emailing unverified recipients (self-service signup) | AWS console request; until it clears, keep `FEOH_EMAIL_PROVIDER=ses` (the sandbox still delivers to verified addresses), signup closed, and tenants CLI-provisioned. Never `console` in a deployment: it logs every temporary password, reset link and sign-in code, and the app refuses to boot with it. |
+| SES production access | Emailing unverified recipients (self-service signup) | AWS console request; until it clears, keep `FEOH_EMAIL_PROVIDER=ses` (the sandbox still delivers to verified addresses), signup closed, and tenants CLI-provisioned. Never `console` in a deployment: it logs every set-password link, reset link and sign-in code, and the app refuses to boot with it. |
 | Multi-instance / ECS / ALB | >1 instance needed | The full `production-deployment.md` build-out; the compose file retires. Nothing here changes shape — the same image, env contract, DB schema, and S3 layout move onto ECS. |
 
 ## Implementation status
@@ -616,7 +640,7 @@ healthcheck, the `localdb` / `pgtools` split, and the RDS/ElastiCache override
 seams), `Caddyfile` (+ `tenants.caddy.example`), `lib.sh` (the database-mode
 decision every script sources) + `compose.sh` / `psql.sh` (ad-hoc compose and
 psql in that mode), `deploy.sh` (preflight → build → migrate → roll →
-verify), `add-tenant.sh` (tenant + Caddy + reload in one command,
+verify), `add-tenant.sh` (tenant DB + org + admin in one command,
 re-runnable via `--skip-existing`), `backup.sh`, `restore.sh` (streamed
 restore of any night's dumps, either database mode), and `decrypt-env.sh` +
 `prod.sops.yaml.example` (the secrets file and the contract it is checked

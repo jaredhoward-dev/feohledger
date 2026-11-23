@@ -1,12 +1,13 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/models/payment.dart';
 import 'package:feohledger_mobile/screens/payment_queue_screen.dart';
@@ -17,7 +18,7 @@ import 'package:feohledger_mobile/stores/payment_queue_store.dart';
 /// Wraps a screen in a MaterialApp carrying the localization delegates so
 /// `AppLocalizations.of(context)` resolves (defaults to English).
 Widget _localized(Widget home) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: home,
     );
@@ -67,12 +68,17 @@ Map<String, dynamic> _summaryJson({String currency = 'USD'}) => {
       'currency': currency,
     };
 
-Map<String, dynamic> _me(List<String> roles) => {
+Map<String, dynamic> _me(
+  List<String> roles, {
+  List<String> permissions = const [],
+}) =>
+    {
       'id': 'u1',
       'email': 'demo@acme.com',
       'full_name': 'Demo User',
       'organization_id': 'org1',
       'roles': roles,
+      'permissions': permissions,
     };
 
 http.Response _queueResponse(List<Map<String, dynamic>> items) => _json({
@@ -117,17 +123,102 @@ Map<String, dynamic> _runResponse({
       'cfo_approved_at': cfoApprovedAt,
     };
 
+/// `GET /api/payments/runs/{id}` for a run awaiting CFO sign-off, carrying
+/// the caller's `actions.approve` verdict (`run_action_refusals`):
+/// `null` = the server would accept, a map = the coded refusal it would answer.
+/// Execute and Cancel are accepted unless [execute] says otherwise.
+Map<String, dynamic> _pendingCfoDetail(
+  Map<String, dynamic>? approve, {
+  Map<String, dynamic>? execute,
+}) =>
+    {
+      ..._runResponse(requiresCfoApproval: true),
+      'actions': {'approve': approve, 'execute': execute, 'cancel': null},
+    };
+
+/// `GET /api/payments/runs/{id}` for a draft run with the caller's
+/// `actions.execute` / `.cancel` verdicts.
+Map<String, dynamic> _draftDetail({
+  Map<String, dynamic>? execute,
+  Map<String, dynamic>? cancel,
+  bool requiresCfoApproval = false,
+}) =>
+    {
+      ..._runResponse(requiresCfoApproval: requiresCfoApproval),
+      'actions': {'execute': execute, 'cancel': cancel},
+    };
+
+/// `actions.approve` for a caller without the cfo role (`holds_any_role`).
+const _roleRefused = {
+  'code': 'role_not_permitted',
+  'message': 'Your role does not permit this action',
+  'params': <String, dynamic>{},
+};
+
+/// `GET /api/payments/execution-mode`'s `mode`. Defaults to `processor` so the
+/// screen's Execute tests keep reading a tenant FeohLedger sends payments for;
+/// `null` makes the read fail, which must hide Execute (fail closed).
+///
+/// `GET /api/payments/runs/{id}` answers [runDetail] when given; otherwise the
+/// listed run with Execute and Cancel accepted (`actions.execute` /
+/// `.cancel` null) and no other verdict, or a 503 when [runDetailFails].
 MockClient _screenClient({
   List<Map<String, dynamic>>? queue,
   List<Map<String, dynamic>>? runs,
   http.Response Function(http.Request req)? onPost,
   String summaryCurrency = 'USD',
+  String? mode = 'processor',
+  Map<String, dynamic>? runDetail,
+  bool runDetailFails = false,
+}) =>
+    MockClient(
+      _screenHandler(
+        queue: queue,
+        runs: runs,
+        onPost: onPost,
+        summaryCurrency: summaryCurrency,
+        mode: mode,
+        runDetail: runDetail,
+        runDetailFails: runDetailFails,
+      ),
+    );
+
+/// [_screenClient]'s responses as a bare handler, for a test that overrides
+/// one route and delegates the rest. Delegating through a second
+/// `MockClient.send` instead re-finalizes the already-sent request and every
+/// delegated read fails with "Can't finalize a finalized Request".
+MockClientHandler _screenHandler({
+  List<Map<String, dynamic>>? queue,
+  List<Map<String, dynamic>>? runs,
+  http.Response Function(http.Request req)? onPost,
+  String summaryCurrency = 'USD',
+  String? mode = 'processor',
+  Map<String, dynamic>? runDetail,
+  bool runDetailFails = false,
 }) {
-  return MockClient((req) async {
+  return (req) async {
     if (req.method == 'POST') {
       return onPost?.call(req) ?? _json({'message': 'ok'});
     }
     final path = req.url.path;
+    if (path.endsWith('/payments/execution-mode')) {
+      return mode == null
+          ? _json({'detail': 'unavailable'}, 503)
+          : _json({'mode': mode, 'reason': 'configured'});
+    }
+    final detailOf = RegExp(r'/payments/runs/([^/]+)$').firstMatch(path);
+    if (detailOf != null) {
+      if (runDetailFails) return _json({'detail': 'unavailable'}, 503);
+      if (runDetail != null) return _json(runDetail);
+      final listed = (runs ?? const <Map<String, dynamic>>[])
+          .where((r) => r['id'] == detailOf.group(1));
+      if (listed.isNotEmpty) {
+        return _json({
+          ...listed.first,
+          'actions': {'execute': null, 'cancel': null},
+        });
+      }
+    }
     if (path.endsWith('/payments/queue')) {
       return _queueResponse(queue ?? [_queueItem('1')]);
     }
@@ -139,7 +230,7 @@ MockClient _screenClient({
       return _json({'items': items, 'total': items.length});
     }
     return _json({});
-  });
+  };
 }
 
 Future<void> _pumpUntil(WidgetTester tester, Finder finder) async {
@@ -168,13 +259,17 @@ void main() {
     ApiClient().debugConfigure();
   });
 
-  Future<void> loginThen(List<String> roles, MockClient screenClient) async {
+  Future<void> loginThen(
+    List<String> roles,
+    MockClient screenClient, {
+    List<String> permissions = const [],
+  }) async {
     ApiClient().debugConfigure(
       client: MockClient((req) async {
         if (req.url.path == '/api/auth/login') {
           return _json({'access_token': 'tok'});
         }
-        return _json(_me(roles));
+        return _json(_me(roles, permissions: permissions));
       }),
     );
     await AuthStore.instance.login('demo@acme.com', 'demo', 'acme');
@@ -268,6 +363,72 @@ void main() {
     expect(find.text('No invoices awaiting payment'), findsOneWidget);
   });
 
+  // Both tabs are AsyncListBody, each with its own load error: one shared
+  // `error` used to put the Queue tab into its error state when only the runs
+  // read failed, and the queue's error was a hand-built column.
+  testWidgets('a failed queue load says why and offers Retry, which reloads',
+      (tester) async {
+    var fail = true;
+    final ok = _screenHandler(queue: [_queueItem('1')]);
+    await loginThen(
+      ['ap_manager'],
+      MockClient((req) async {
+        if (fail && req.url.path.endsWith('/payments/queue')) {
+          return _json({'detail': 'Queue unavailable'}, 503);
+        }
+        return ok(req);
+      }),
+    );
+
+    await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+    await _pumpUntil(tester, find.text('Retry'));
+
+    expect(
+      find.text("Couldn't load the payment queue: Queue unavailable"),
+      findsOneWidget,
+    );
+    // Never the empty state over a failed read.
+    expect(find.text('No invoices awaiting payment'), findsNothing);
+
+    fail = false;
+    await tester.tap(find.widgetWithText(FilledButton, 'Retry'));
+    await _pumpUntil(tester, find.text('Vendor 1'));
+
+    expect(find.text('Vendor 1'), findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+  });
+
+  testWidgets('a failed runs load is the Runs tab\'s error, not the queue\'s',
+      (tester) async {
+    final ok = _screenHandler(queue: [_queueItem('1')]);
+    await loginThen(
+      ['ap_manager'],
+      MockClient((req) async {
+        if (req.url.path.contains('/payments/runs')) {
+          return _json({'detail': 'Runs unavailable'}, 503);
+        }
+        return ok(req);
+      }),
+    );
+
+    await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+    await _pumpUntil(tester, find.text('Vendor 1'));
+
+    // The queue is live: no error state, no "couldn't refresh" banner.
+    expect(find.text('Vendor 1'), findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+
+    await tester.tap(find.text('Runs'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text("Couldn't load payment runs: Runs unavailable"),
+      findsOneWidget,
+    );
+    expect(find.widgetWithText(FilledButton, 'Retry'), findsOneWidget);
+    expect(find.text('No payment runs'), findsNothing);
+  });
+
   // The CFO-approval gate. `GET /api/payments/runs/` must declare
   // `requires_cfo_approval` / `cfo_approved_at` on `PaymentRunResponse` for
   // this to be reachable at all — without them FastAPI strips the keys, both
@@ -281,14 +442,25 @@ void main() {
       await tester.pump(const Duration(milliseconds: 400));
     }
 
-    testWidgets('a run awaiting sign-off is flagged and Execute never reaches '
-        'the server', (tester) async {
+    // The CFO wait is the server's `actions.execute` refusal
+    // (`payment_run_awaiting_cfo`), not a client pre-flight: Execute renders
+    // disabled with the localized reason and nothing reaches the server.
+    testWidgets('a run awaiting sign-off is flagged and Execute is disabled '
+        'with the server reason', (tester) async {
       var executeCalls = 0;
       await loginThen(
         ['ap_manager'],
         _screenClient(
           queue: [],
           runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _draftDetail(
+            requiresCfoApproval: true,
+            execute: {
+              'code': 'payment_run_awaiting_cfo',
+              'message': 'server english',
+              'params': <String, dynamic>{},
+            },
+          ),
           onPost: (req) {
             if (req.url.path.endsWith('/execute')) executeCalls++;
             return _json({'message': 'ok'});
@@ -303,15 +475,22 @@ void main() {
 
       await tester.tap(find.byType(PopupMenuButton<String>));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Execute'));
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 400));
-
-      expect(executeCalls, 0, reason: 'the pre-flight gate must short-circuit');
+      final item = find.ancestor(
+        of: find.text('Execute'),
+        matching: find.byType(PopupMenuItem<String>),
+      );
+      expect(tester.widget<PopupMenuItem<String>>(item).enabled, isFalse);
       expect(
-        find.text('This run needs CFO approval before it can be executed.'),
+        find.text("This run exceeds the organization's CFO-approval threshold "
+            'and is awaiting sign-off from a user with the CFO role.'),
         findsOneWidget,
       );
+      expect(find.text('server english'), findsNothing);
+
+      await tester.tap(find.text('Execute'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.text('Execute payment run?'), findsNothing);
+      expect(executeCalls, 0);
     });
 
     testWidgets('a signed-off run executes normally', (tester) async {
@@ -356,9 +535,9 @@ void main() {
         ['ap_manager'],
         _screenClient(
           queue: [],
-          // The server says sign-off is not required (e.g. the threshold moved
-          // after the run was drafted), so the pre-flight gate lets it through
-          // and the refusal comes back over the wire.
+          // The detail read accepted Execute, but the state moved between the
+          // read and the tap (e.g. the threshold changed), so the refusal
+          // comes back over the wire.
           runs: [_runResponse()],
           onPost: (req) {
             if (req.url.path.endsWith('/execute')) {
@@ -418,6 +597,7 @@ void main() {
         _screenClient(
           queue: [],
           runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail(null),
           onPost: (req) {
             if (req.url.path.endsWith('/approve')) {
               approvePaths.add(req.url.path);
@@ -476,6 +656,7 @@ void main() {
         _screenClient(
           queue: [],
           runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail(null),
           onPost: (req) {
             if (req.url.path.endsWith('/approve')) approveCalls++;
             return _json({'message': 'ok'});
@@ -501,6 +682,7 @@ void main() {
         _screenClient(
           queue: [],
           runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail(_roleRefused),
         ),
       );
 
@@ -518,11 +700,14 @@ void main() {
         (tester) async {
       // The backend gate is `require_roles(ROLE_CFO)`, which does NOT
       // special-case admin — showing the item to an admin would 403 every tap.
+      // The verdict says so (`role_not_permitted`); the app no longer
+      // restates the role.
       await loginThen(
         ['admin'],
         _screenClient(
           queue: [],
           runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail(_roleRefused),
         ),
       );
 
@@ -575,6 +760,7 @@ void main() {
         _screenClient(
           queue: [],
           runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail(null),
           onPost: (req) {
             if (req.url.path.endsWith('/approve')) {
               return _json(
@@ -601,6 +787,275 @@ void main() {
         findsOneWidget,
       );
       expect(find.textContaining('{"detail"'), findsNothing);
+    });
+
+    // Maker-checker (`payment_controls.run_approve_refusal`): the CFO who
+    // CREATED the run may not sign it off. A role check alone used to offer
+    // that CFO an Approve that could only 403; the verdict now renders it
+    // disabled with the localized reason, as the web run dialog does.
+    testWidgets('the CFO who created the run sees Approve disabled with the '
+        'maker-checker reason, and nothing is sent', (tester) async {
+      var approveCalls = 0;
+      await loginThen(
+        ['cfo'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail({
+            'code': 'payment_run_segregation',
+            'message': 'The user who created this run cannot approve it.',
+            'params': {'step': 'approve'},
+          }),
+          onPost: (req) {
+            if (req.url.path.endsWith('/approve')) approveCalls++;
+            return _json({'message': 'ok'});
+          },
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+      await openRunMenu(tester);
+
+      final item = find.ancestor(
+        of: find.text('Approve as CFO'),
+        matching: find.byType(PopupMenuItem<String>),
+      );
+      expect(item, findsOneWidget);
+      expect(tester.widget<PopupMenuItem<String>>(item).enabled, isFalse);
+      // The reason in the reader's language, not the server's English.
+      expect(
+        find.text(
+          'Segregation of duties: the user who created this payment run '
+          'cannot also approve or execute it. A different user must.',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.text('The user who created this run cannot approve it.'),
+        findsNothing,
+      );
+
+      await tester.tap(find.text('Approve as CFO'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.text('Approve payment run?'), findsNothing);
+      expect(approveCalls, 0);
+    });
+
+    testWidgets('a refusal this build cannot localize shows the server sentence',
+        (tester) async {
+      await loginThen(
+        ['cfo'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse(requiresCfoApproval: true)],
+          runDetail: _pendingCfoDetail({
+            'code': 'payment_run_some_new_gate',
+            'message': 'A newer gate refuses this sign-off.',
+            'params': <String, dynamic>{},
+          }),
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+      await openRunMenu(tester);
+
+      expect(find.text('Approve as CFO'), findsOneWidget);
+      expect(find.text('A newer gate refuses this sign-off.'), findsOneWidget);
+    });
+
+    testWidgets('no verdict (the detail read failed) offers no sign-off',
+        (tester) async {
+      // No `runDetail`: `GET /runs/{id}` answers with no `actions.approve`,
+      // so that verdict is unanswered and the screen fails closed on it.
+      await loginThen(
+        ['cfo'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse(requiresCfoApproval: true)],
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+      await openRunMenu(tester);
+
+      expect(find.text('Approve as CFO'), findsNothing);
+      expect(find.text('Execute'), findsOneWidget);
+    });
+  });
+
+  // Execute and Cancel are offered from the run detail's `actions.execute` /
+  // `.cancel` (`run_action_refusals`), never from `canManagePayments` and the
+  // run's status: a role refusal hides the item, any other refusal renders it
+  // disabled with the reason, and no verdict offers nothing.
+  group('run Execute / Cancel verdicts', () {
+    Future<void> openRunsTab(WidgetTester tester) async {
+      await _pumpUntil(tester, find.text('Runs'));
+      await tester.tap(find.text('Runs'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+    }
+
+    Future<void> openRunMenu(WidgetTester tester) async {
+      await tester.tap(find.byType(PopupMenuButton<String>));
+      await tester.pumpAndSettle();
+    }
+
+    PopupMenuItem<String> itemFor(WidgetTester tester, String label) =>
+        tester.widget<PopupMenuItem<String>>(
+          find.ancestor(
+            of: find.text(label),
+            matching: find.byType(PopupMenuItem<String>),
+          ),
+        );
+
+    testWidgets('the creator of a run sees Execute disabled with the '
+        'maker-checker reason, and Cancel still enabled', (tester) async {
+      var executeCalls = 0;
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse()],
+          runDetail: _draftDetail(
+            execute: {
+              'code': 'payment_run_segregation',
+              'message': 'server english',
+              'params': {'step': 'execute'},
+            },
+          ),
+          onPost: (req) {
+            if (req.url.path.endsWith('/execute')) executeCalls++;
+            return _json({'message': 'ok'});
+          },
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+      await openRunMenu(tester);
+
+      expect(itemFor(tester, 'Execute').enabled, isFalse);
+      expect(
+        find.text(
+          'Segregation of duties: the user who created this payment run '
+          'cannot also approve or execute it. A different user must.',
+        ),
+        findsOneWidget,
+      );
+      expect(itemFor(tester, 'Cancel').enabled, isTrue);
+
+      await tester.tap(find.text('Execute'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.text('Execute payment run?'), findsNothing);
+      expect(executeCalls, 0);
+    });
+
+    testWidgets('a reader whose role may do neither sees neither',
+        (tester) async {
+      const role = {
+        'code': 'role_not_permitted',
+        'message': 'Your role does not permit this action',
+        'params': <String, dynamic>{},
+      };
+      await loginThen(
+        ['cfo'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse()],
+          runDetail: _draftDetail(execute: role, cancel: role),
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+
+      // Nothing to offer, so no menu at all.
+      expect(find.byType(PopupMenuButton<String>), findsNothing);
+    });
+
+    testWidgets('a run that left draft since the list was read offers neither',
+        (tester) async {
+      const notDraft = {
+        'code': 'payment_run_not_draft',
+        'message': "Can only execute 'draft' runs, not 'executing'",
+        'params': <String, dynamic>{},
+      };
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse()],
+          runDetail: _draftDetail(execute: notDraft, cancel: notDraft),
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+
+      expect(find.byType(PopupMenuButton<String>), findsNothing);
+    });
+
+    testWidgets('a failed detail read shows each control disabled with '
+        '"couldn\'t check", and nothing can be sent', (tester) async {
+      var posts = 0;
+      await loginThen(
+        ['cfo'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse(requiresCfoApproval: true)],
+          runDetailFails: true,
+          onPost: (req) {
+            posts++;
+            return _json({'message': 'ok'});
+          },
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+
+      // The run still lists; its controls say why they cannot be used.
+      expect(find.text('Draft'), findsOneWidget);
+      await openRunMenu(tester);
+      for (final label in ['Approve as CFO', 'Execute', 'Cancel']) {
+        expect(itemFor(tester, label).enabled, isFalse, reason: label);
+      }
+      expect(
+        find.text("Couldn't check what you can do here — pull to retry"),
+        findsNWidgets(3),
+      );
+
+      await tester.tap(find.text('Execute'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(posts, 0);
+    });
+
+    testWidgets('an accepted Cancel posts /cancel', (tester) async {
+      final posted = <String>[];
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          queue: [],
+          runs: [_runResponse()],
+          onPost: (req) {
+            posted.add(req.url.path);
+            return _json({'message': 'Payment run cancelled'});
+          },
+        ),
+      );
+
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await openRunsTab(tester);
+      await openRunMenu(tester);
+      expect(itemFor(tester, 'Execute').enabled, isTrue);
+      await tester.tap(find.text('Cancel'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+
+      expect(posted, ['/api/payments/runs/run1/cancel']);
     });
   });
 
@@ -651,6 +1106,27 @@ void main() {
     await tester.pump();
     expect(PaymentQueueStore.instance.hasSelection, isFalse);
     expect(find.text('Create Run'), findsNothing);
+  });
+
+  testWidgets('a row with no recorded currency names that, not the generic',
+      (tester) async {
+    await loginThen(
+      ['ap_manager'],
+      _screenClient(queue: [
+        _queueItem('1', blocked: true, blockedReason: 'currency_unknown'),
+      ]),
+    );
+
+    await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+    await _pumpUntil(tester, find.text('Vendor 1'));
+
+    expect(
+      find.text('No currency recorded on this invoice — set its currency first'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('currency_unknown'), findsNothing);
+    final checkbox = tester.widget<Checkbox>(find.byType(Checkbox));
+    expect(checkbox.onChanged, isNull, reason: 'blocked checkbox is disabled');
   });
 
   testWidgets('an unresolved-exception row renders its own reason',
@@ -829,5 +1305,339 @@ void main() {
       find.text('This sends 5000.00 via the configured payment processor.'),
       findsOneWidget,
     );
+  });
+
+  // ── Record-only mode (the no-rail pilot, issue #517, decisions §251) ────
+  // The web hides Execute on a tenant whose payments FeohLedger only records
+  // and offers "Record as paid" instead; mobile reads the same server signals:
+  // the execution mode, the queue row's `record_outside_refusal`, and the run
+  // detail's `actions.record_outside` verdict.
+  group('record-only mode', () {
+    const recorder = ['payment.record_external', 'payment.execute'];
+
+    // The banner, the KPI bar, the queue rows with their record actions and
+    // the record dialog's form do not all fit the default 800x600 test
+    // surface; a phone-height-and-more surface keeps every control on screen.
+    Future<void> tall(WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(800, 1400));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+    }
+
+    Future<void> openRunMenu(WidgetTester tester) async {
+      await tester.tap(find.text('Runs'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(PopupMenuButton<String>));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a record-only tenant sees the banner and no Execute',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(mode: 'record_only', runs: [_runResponse()]),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      final banner = find.byKey(const Key('record-only-banner'));
+      expect(banner, findsOneWidget);
+      // It is the header of the tab's own scroll view, so it scrolls away
+      // with the rows rather than holding height above them at a large text
+      // size, and it sends the reader to the web for a run's bank file.
+      expect(
+        find.ancestor(of: banner, matching: find.byType(NestedScrollView)),
+        findsOneWidget,
+      );
+      expect(
+        find.text('FeohLedger records payments but never sends them: pay '
+            "from your bank or ERP, then record each one here (a run's bank "
+            'file is on the web app).'),
+        findsOneWidget,
+      );
+      expect(find.text('Record as paid'), findsOneWidget);
+
+      await openRunMenu(tester);
+      // The Runs tab leads with it too.
+      expect(banner, findsOneWidget);
+      expect(
+        find.ancestor(of: banner, matching: find.byType(NestedScrollView)),
+        findsOneWidget,
+      );
+      expect(find.text('Execute'), findsNothing);
+      expect(find.text('Record run as paid…'), findsOneWidget);
+      expect(find.text('Cancel'), findsOneWidget);
+    });
+
+    testWidgets('a processor tenant keeps Execute and shows no banner',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(runs: [_runResponse()]),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      expect(find.byKey(const Key('record-only-banner')), findsNothing);
+      // Recording a cheque is offered in both modes, as on the web.
+      expect(find.text('Record as paid'), findsOneWidget);
+
+      await openRunMenu(tester);
+      expect(find.text('Execute'), findsOneWidget);
+      expect(find.text('Record run as paid…'), findsOneWidget);
+    });
+
+    testWidgets('an unknown mode hides Execute but claims nothing',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(mode: null, runs: [_runResponse()]),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      expect(find.byKey(const Key('record-only-banner')), findsNothing);
+      await openRunMenu(tester);
+      expect(find.text('Execute'), findsNothing);
+    });
+
+    testWidgets('without payment.record_external there is no record action',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(mode: 'record_only', runs: [_runResponse()]),
+        permissions: const ['payment.execute'],
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      expect(find.text('Record as paid'), findsNothing);
+      await openRunMenu(tester);
+      expect(find.text('Record run as paid…'), findsNothing);
+    });
+
+    testWidgets('a refused row shows the action disabled with its reason',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(mode: 'record_only', queue: [
+          {
+            ..._queueItem('1'),
+            'record_outside_refusal': 'external_payment_card_live',
+          },
+        ]),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      final button = tester.widget<TextButton>(
+        find.ancestor(
+          of: find.text('Record as paid'),
+          matching: find.byWidgetPredicate((w) => w is TextButton),
+        ),
+      );
+      expect(button.onPressed, isNull);
+      expect(
+        find.text('A live virtual card is issued against this invoice. '
+            'Cancel the card before recording a payment made another way.'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('an unverified-vendor row the RUN refuses can still be recorded',
+        (tester) async {
+      await tall(tester);
+      // `blocked` is the run builder's verdict; recording reads its own.
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(mode: 'record_only', queue: [
+          {
+            ..._queueItem('1', blocked: true, blockedReason: 'vendor_not_active'),
+            'record_outside_refusal': null,
+          },
+        ]),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      final button = tester.widget<TextButton>(
+        find.ancestor(
+          of: find.text('Record as paid'),
+          matching: find.byWidgetPredicate((w) => w is TextButton),
+        ),
+      );
+      expect(button.onPressed, isNotNull);
+    });
+
+    testWidgets('recording a row posts to /record-outside and confirms',
+        (tester) async {
+      await tall(tester);
+      http.Request? posted;
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          mode: 'record_only',
+          queue: [
+            {..._queueItem('1'), 'payable_amount': '100.00'},
+          ],
+          onPost: (req) {
+            posted = req;
+            return _json({'id': 'p1', 'status': 'completed'}, 201);
+          },
+        ),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      await tester.tap(find.text('Record as paid'));
+      await tester.pumpAndSettle();
+      expect(find.text('Record a payment made outside FeohLedger'),
+          findsOneWidget);
+      expect(find.text('Amount owed: \$100.00'), findsOneWidget);
+
+      // Submit stays disabled until a reference is entered.
+      final submit = find.widgetWithText(FilledButton, 'Record as paid');
+      expect(tester.widget<FilledButton>(submit).onPressed, isNull);
+      await tester.enterText(
+          find.widgetWithText(TextField, 'Reference'), 'CHK-1001');
+      await tester.pump();
+      await tester.tap(submit);
+      await tester.pumpAndSettle();
+
+      expect(posted!.url.path, '/api/payments/record-outside');
+      final body = jsonDecode(posted!.body) as Map<String, dynamic>;
+      expect(body['invoice_id'], '1');
+      expect(body['method'], 'ach');
+      expect(body['reference'], 'CHK-1001');
+      expect(body.containsKey('amount'), isFalse);
+      expect(find.text('Invoice INV-1 recorded as paid'), findsOneWidget);
+    });
+
+    testWidgets('a refusal from the server is stated beside the form',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          mode: 'record_only',
+          onPost: (req) => _json({
+            'detail': {
+              'code': 'external_payment_segregation',
+              'message': 'server english',
+              'params': null,
+            },
+          }, 403),
+        ),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+
+      await tester.tap(find.text('Record as paid'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.widgetWithText(TextField, 'Reference'), 'R');
+      await tester.pump();
+      await tester.tap(find.widgetWithText(FilledButton, 'Record as paid'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Segregation of duties: you created or shaped this invoice, '
+            'so a different user must record its payment.'),
+        findsOneWidget,
+      );
+      // The dialog stays open on the refusal.
+      expect(find.text('Record a payment made outside FeohLedger'),
+          findsOneWidget);
+    });
+
+    Map<String, dynamic> detail(Object? recordVerdict, {String status = 'draft'}) => {
+          ..._runResponse(status: status),
+          'actions': {'record_outside': recordVerdict},
+        };
+
+    testWidgets('a run the server refuses this reader states why, with no form',
+        (tester) async {
+      await tall(tester);
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          mode: 'record_only',
+          runs: [_runResponse()],
+          runDetail: detail({
+            'code': 'payment_run_segregation',
+            'message': 'server english',
+            'params': {'step': 'record_outside'},
+          }),
+        ),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+      await openRunMenu(tester);
+      await tester.tap(find.text('Record run as paid…'));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Segregation of duties: the user who created this payment '
+            'run cannot also record it as paid. A different user must.'),
+        findsOneWidget,
+      );
+      expect(find.byType(TextField), findsNothing);
+      expect(find.byType(FilledButton), findsNothing);
+    });
+
+    testWidgets('an exported run is recorded from the verdict', (tester) async {
+      await tall(tester);
+      http.Request? posted;
+      await loginThen(
+        ['ap_manager'],
+        _screenClient(
+          mode: 'record_only',
+          runs: [_runResponse(status: 'exported')],
+          runDetail: detail(null, status: 'exported'),
+          onPost: (req) {
+            posted = req;
+            return _json({
+              'id': 'run1',
+              'status': 'completed',
+              'payment_count': 2,
+              'total_amount': '5000.00',
+            });
+          },
+        ),
+        permissions: recorder,
+      );
+      await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+      await _pumpUntil(tester, find.text('Vendor 1'));
+      await openRunMenu(tester);
+      // An exported run is claimed: no Execute, no Cancel — only recording.
+      expect(find.text('Execute'), findsNothing);
+      expect(find.text('Cancel'), findsNothing);
+      await tester.tap(find.text('Record run as paid…'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+          find.widgetWithText(TextField, 'Bank batch reference'), 'BATCH-9');
+      await tester.pump();
+      await tester.tap(
+          find.widgetWithText(FilledButton, 'Record as paid · \$5,000.00'));
+      await tester.pumpAndSettle();
+
+      expect(posted!.url.path, '/api/payments/runs/run1/record-outside');
+      final body = jsonDecode(posted!.body) as Map<String, dynamic>;
+      expect(body['reference'], 'BATCH-9');
+      expect(body['paid_on'], matches(RegExp(r'^\d{4}-\d{2}-\d{2}$')));
+      expect(find.text('2 payments recorded as paid'), findsOneWidget);
+    });
   });
 }

@@ -37,9 +37,12 @@ on:
       - '.github/workflows/terraform.yml'
 
 permissions:
+  # Read-only at the top. The SARIF upload's `security-events: write` is
+  # granted on the trivy-iac job alone (fmt-validate never needed it), and
+  # the `pull-requests: write` once held "for a future PR-comment step" is
+  # gone — nothing used it. backend/tests/test_workflow_token_permissions.py
+  # keeps it that way.
   contents: read
-  security-events: write
-  pull-requests: write
 
 jobs:
   fmt-validate:
@@ -48,6 +51,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
@@ -92,10 +97,16 @@ jobs:
 
   trivy-iac:
     name: Trivy IaC scan
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Trivy config scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -112,7 +123,7 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy IaC SARIF
-        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         if: always()
         with:
           sarif_file: trivy-iac.sarif

@@ -16,6 +16,8 @@ moment a rail exists anywhere in the codebase without BOTH treatments.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from app.schemas.payment import PaymentMethod
@@ -238,3 +240,216 @@ def test_no_module_hand_rolls_the_international_rail_set():
         f"{offenders}. Import INTERNATIONAL_PAYMENT_METHODS / "
         "is_international_payment_method from app/services/payment_methods.py."
     )
+
+
+def test_card_is_a_record_only_rail_off_the_1099():
+    """`card` — a company card used outside FeohLedger (decisions §295): off
+    the 1099 like `virtual_card`, recordable, and refused on every payment
+    FeohLedger would dispatch (a standalone payment and a run item)."""
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.payments import CreatePaymentRunItem
+    from app.schemas.payment import PaymentCreate, RecordPaymentOutsideRequest
+    from app.services.payment_methods import CARD_PAYMENT_METHODS, IRS_1099_REPORTABLE_METHODS
+
+    assert "card" in CARD_PAYMENT_METHODS and "card" not in IRS_1099_REPORTABLE_METHODS
+    with pytest.raises(ValidationError):
+        PaymentCreate(invoice_id="x", method="card")
+    with pytest.raises(ValidationError):
+        CreatePaymentRunItem(invoice_id="x", method="card")
+    recorded = RecordPaymentOutsideRequest(
+        invoice_id="00000000-0000-0000-0000-000000000001",
+        method="card",
+        reference="AMEX-1",
+        paid_on="2026-10-01",
+    )
+    assert recorded.method == "card"
+
+
+# ---------------------------------------------------------------------------
+# One payment on several rails (decisions §396)
+# ---------------------------------------------------------------------------
+
+
+def _parts(*pairs):
+    from decimal import Decimal
+
+    from app.services.payment_methods import RailPart
+
+    return tuple(RailPart(m, Decimal(a)) for m, a in pairs)
+
+
+def test_a_cheque_and_a_card_that_sum_to_the_payment_are_kept_with_no_one_rail():
+    from decimal import Decimal
+
+    from app.services.payment_methods import RAIL_SPLIT_APPLIED, card_share, split_by_rail
+
+    parts = _parts(("check", "150.00"), ("card", "100.00"))
+    split = split_by_rail(parts, Decimal("250.00"), method=None)
+    assert split.status == RAIL_SPLIT_APPLIED
+    assert split.method is None  # no one rail paid it all
+    assert split.breakdown == parts
+    assert card_share(split.breakdown) == Decimal("100.00")
+
+
+def test_parts_all_on_card_state_the_card_rail():
+    from decimal import Decimal
+
+    from app.services.payment_methods import RAIL_SPLIT_APPLIED, split_by_rail
+
+    split = split_by_rail(
+        _parts(("card", "100.00"), ("CARD ", "150.00")), Decimal("250.00"), method="card"
+    )
+    assert split.status == RAIL_SPLIT_APPLIED and split.method == "card"
+    assert {p.method for p in split.breakdown} == {"card"}
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        (("check", "150.00"), ("card", "99.99")),  # a cent short
+        (("check", "150.00"), ("card", "100.01")),  # a cent over
+        (("check", "250.00"), ("card", "0.00")),  # a zero part
+        (("check", "300.00"), ("card", "-50.00")),  # a negative part
+        (("check", "NaN"),),
+        # Finer than a cent: sums to 250.00, but neither part is printable.
+        (("check", "166.665"), ("card", "83.335")),
+    ],
+)
+def test_parts_that_do_not_reconcile_fail_closed_to_reportable(pairs):
+    """Never prorated, never rounded: a breakdown that is not exactly the
+    payment is dropped, and the whole payment has no rail (reportable)."""
+    from decimal import Decimal
+
+    from app.services.payment_methods import RAIL_SPLIT_UNRECONCILED, split_by_rail
+
+    split = split_by_rail(_parts(*pairs), Decimal("250.00"), method="card")
+    assert split.status == RAIL_SPLIT_UNRECONCILED
+    assert split.method is None and split.breakdown == ()
+    # Kept for the audit row as stated (compared as text: NaN != NaN).
+    assert [str(p.amount) for p in split.stated] == [a for _, a in pairs]
+    assert is_1099_reportable_method(split.method)
+
+
+def test_no_breakdown_leaves_the_stated_rail_alone():
+    from decimal import Decimal
+
+    from app.services.payment_methods import split_by_rail
+
+    split = split_by_rail((), Decimal("250.00"), method="check")
+    assert split.status is None and split.method == "check" and split.breakdown == ()
+
+
+def test_a_part_on_a_rail_we_do_not_know_is_a_part_with_no_rail():
+    from decimal import Decimal
+
+    from app.services.payment_methods import split_by_rail
+
+    split = split_by_rail(
+        _parts(("barter", "50.00"), ("card", "50.00")), Decimal("100.00"), method=None
+    )
+    assert [p.method for p in split.breakdown] == [None, "card"]
+
+
+def test_a_breakdown_round_trips_as_exact_strings_and_a_malformed_one_is_none():
+    from app.services.payment_methods import rail_breakdown_json, rail_parts_from_json
+
+    parts = _parts(("check", "0.10"), (None, "1234567890123.45"))
+    stored = rail_breakdown_json(parts)
+    assert stored == [
+        {"method": "check", "amount": "0.10"},
+        {"method": None, "amount": "1234567890123.45"},
+    ]
+    assert rail_parts_from_json(stored) == parts
+    # One bad part voids the whole breakdown: the rest is not the whole.
+    assert rail_parts_from_json([*stored, {"method": "card", "amount": 5}]) == ()
+    assert rail_parts_from_json([{"method": "card", "amount": "x"}]) == ()
+    assert rail_parts_from_json({"method": "card"}) == ()
+    assert rail_parts_from_json(None) == ()
+
+
+@pytest.mark.parametrize(
+    ("parts", "amount", "stands"),
+    [
+        # Two rails summing exactly: the split is the record over any one rail.
+        ((("check", "150.00"), ("card", "100.00")), "250.00", True),
+        # A part with no rail stated counts as a rail of its own.
+        ((("check", "150.00"), (None, "100.00")), "250.00", True),
+        # One rail: a person naming another corrects it (`superseded`).
+        ((("card", "200.00"), ("card", "50.00")), "250.00", False),
+        # A cent short, or a fraction of a cent: dropped, the person's rail stands.
+        ((("check", "150.00"), ("card", "99.99")), "250.00", False),
+        ((("check", "33.335"), ("card", "66.665")), "100.00", False),
+        # No breakdown at all.
+        ((), "250.00", False),
+    ],
+)
+def test_a_split_stands_over_any_rail_only_when_it_reconciles_across_rails(parts, amount, stands):
+    """The rule the record dialog's read-only rail reads (decisions §413):
+    exactly when `_rail_split` keeps a breakdown against a person's rail."""
+    from app.services.external_payment import _rail_split, split_stands_over_any_rail
+
+    stated = _parts(*parts)
+    assert split_stands_over_any_rail(stated, Decimal(amount)) is stands
+    # Whatever rail a person names, a standing split is booked unchanged.
+    if stands:
+        for rail in ("ach", "card", None):
+            kept = _rail_split(stated, Decimal(amount), method=rail, source="user")
+            assert kept.status == "applied" and kept.method is None
+
+
+def test_the_payment_response_states_its_kept_breakdown_or_none():
+    """`method: null` on a two-rail payment is explained by its parts; a
+    malformed or absent breakdown reads as none, never as part of one."""
+    from types import SimpleNamespace
+
+    from app.schemas.payment import PaymentResponse
+
+    def payment(breakdown):
+        return SimpleNamespace(
+            id="p",
+            correlation_id=None,
+            invoice_id="i",
+            payment_run_id=None,
+            amount=Decimal("250.00"),
+            method=None,
+            status="completed",
+            reference="R",
+            created_at=None,
+            updated_at=None,
+            provider="external",
+            failure_reason=None,
+            submitted_at=None,
+            completed_at=None,
+            settled_amount=None,
+            settled_currency=None,
+            discount_amount=None,
+            discount_offer_id=None,
+            rail_breakdown=breakdown,
+        )
+
+    split = [{"method": "check", "amount": "150.00"}, {"method": None, "amount": "100.00"}]
+    out = PaymentResponse.from_db(payment(split)).model_dump(mode="json")
+    assert out["rail_breakdown"] == [
+        {"method": "check", "amount": 150.0},
+        {"method": None, "amount": 100.0},
+    ]
+    assert PaymentResponse.from_db(payment(None)).rail_breakdown is None
+    malformed = [{"method": "card", "amount": 5}]
+    assert PaymentResponse.from_db(payment(malformed)).rail_breakdown is None
+
+
+def test_only_the_erp_record_may_omit_the_rail():
+    """The one-click may name no rail (the endpoint judges whether it may);
+    recording a payment with no ERP breakdown behind it always names one."""
+    from pydantic import ValidationError
+
+    from app.schemas.payment import RecordErpReportedPaymentRequest, RecordPaymentOutsideRequest
+
+    body = {"reference": "R", "paid_on": "2026-11-01"}
+    assert RecordErpReportedPaymentRequest(**body).method is None
+    with pytest.raises(ValidationError):
+        RecordPaymentOutsideRequest(**body, invoice_id="00000000-0000-0000-0000-000000000001")
+    with pytest.raises(ValidationError):
+        RecordErpReportedPaymentRequest(**body, method="virtual_card")

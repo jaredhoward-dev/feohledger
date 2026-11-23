@@ -1,3 +1,4 @@
+// ignore_for_file: deprecated_member_use
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -197,6 +198,12 @@ abstract class AppLocalizations {
   /// **'Retry'**
   String get commonRetry;
 
+  /// No description provided for @commonLoadErrorConnection.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t reach FeohLedger. Check your connection and tap Retry.'**
+  String get commonLoadErrorConnection;
+
   /// No description provided for @commonAll.
   ///
   /// In en, this message translates to:
@@ -311,6 +318,18 @@ abstract class AppLocalizations {
   /// **'For Review'**
   String get dashboardForReview;
 
+  /// Dashboard KPI title: open invoices past their due date, counted over the whole book.
+  ///
+  /// In en, this message translates to:
+  /// **'Overdue'**
+  String get dashboardOverdue;
+
+  /// Screen-reader hint on the dashboard Overdue card: tapping it opens the Invoices tab filtered to overdue invoices.
+  ///
+  /// In en, this message translates to:
+  /// **'Shows the overdue invoices'**
+  String get dashboardOverdueOpen;
+
   /// No description provided for @dashboardApproved.
   ///
   /// In en, this message translates to:
@@ -359,11 +378,41 @@ abstract class AppLocalizations {
   /// **'Showing cached data — couldn\'t reach the server'**
   String get dashboardCachedBanner;
 
-  /// No description provided for @dashboardErrorPrefix.
+  /// No description provided for @dashboardLoadError.
   ///
   /// In en, this message translates to:
-  /// **'Error: {error}'**
-  String dashboardErrorPrefix(String error);
+  /// **'Couldn\'t load the dashboard. Check your connection and tap Retry.'**
+  String get dashboardLoadError;
+
+  /// No description provided for @dashboardRefreshFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t refresh — these are the last figures loaded. Tap Retry to try again.'**
+  String get dashboardRefreshFailed;
+
+  /// No description provided for @dashboardNeedsAttention.
+  ///
+  /// In en, this message translates to:
+  /// **'Needs your attention'**
+  String get dashboardNeedsAttention;
+
+  /// No description provided for @dashboardOverview.
+  ///
+  /// In en, this message translates to:
+  /// **'Overview'**
+  String get dashboardOverview;
+
+  /// No description provided for @dashboardEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No invoices yet. Captured and uploaded invoices will appear here.'**
+  String get dashboardEmpty;
+
+  /// No description provided for @dashboardTopVendorsEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No vendor spend yet.'**
+  String get dashboardTopVendorsEmpty;
 
   /// No description provided for @dashboardInvoiceCount.
   ///
@@ -491,6 +540,12 @@ abstract class AppLocalizations {
   /// **'Paid'**
   String get invoicesFilterPaid;
 
+  /// Invoices list quick-view chip: owed and past due, across statuses (the set the dashboard Overdue figure counts).
+  ///
+  /// In en, this message translates to:
+  /// **'Overdue'**
+  String get invoicesFilterOverdue;
+
   /// No description provided for @invoicesColInvoiceNumber.
   ///
   /// In en, this message translates to:
@@ -569,23 +624,17 @@ abstract class AppLocalizations {
   /// **'No notifications'**
   String get notificationsEmpty;
 
-  /// No description provided for @notificationsCaughtUp.
-  ///
-  /// In en, this message translates to:
-  /// **'You\'re all caught up'**
-  String get notificationsCaughtUp;
-
   /// No description provided for @notificationsNothingYet.
   ///
   /// In en, this message translates to:
   /// **'Nothing here yet'**
   String get notificationsNothingYet;
 
-  /// No description provided for @notificationsLoadError.
+  /// Notifications list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
   ///
   /// In en, this message translates to:
-  /// **'Couldn\'t load notifications'**
-  String get notificationsLoadError;
+  /// **'Couldn\'t load notifications: {error}'**
+  String notificationsLoadErrorPrefix(String error);
 
   /// No description provided for @vendorsTitle.
   ///
@@ -641,11 +690,11 @@ abstract class AppLocalizations {
   /// **'No vendors found'**
   String get vendorsEmpty;
 
-  /// No description provided for @vendorsLoadError.
+  /// Vendors list first-load failure carrying the server's own reason (a 403 / 500 detail). A connection failure uses commonLoadErrorConnection instead.
   ///
   /// In en, this message translates to:
-  /// **'Could not load vendors'**
-  String get vendorsLoadError;
+  /// **'Couldn\'t load vendors: {error}'**
+  String vendorsLoadErrorPrefix(String error);
 
   /// No description provided for @vendorActionVerify.
   ///
@@ -688,6 +737,18 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Vendor rejected'**
   String get vendorRejected;
+
+  /// No description provided for @vendorRejectConfirmTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Reject {name}?'**
+  String vendorRejectConfirmTitle(String name);
+
+  /// Confirm dialog before rejecting a vendor. The server cancels the vendor's live virtual cards on reject.
+  ///
+  /// In en, this message translates to:
+  /// **'{name} will be marked rejected. Any live virtual cards issued to it will be cancelled.'**
+  String vendorRejectConfirmBody(String name);
 
   /// No description provided for @vendorCardsNotClosed.
   ///
@@ -809,11 +870,11 @@ abstract class AppLocalizations {
   /// **'No payments'**
   String get paymentsEmpty;
 
-  /// No description provided for @paymentsErrorPrefix.
+  /// Payments history first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
   ///
   /// In en, this message translates to:
-  /// **'Error: {error}'**
-  String paymentsErrorPrefix(String error);
+  /// **'Couldn\'t load payments: {error}'**
+  String paymentsLoadErrorPrefix(String error);
 
   /// No description provided for @paymentStatusPending.
   ///
@@ -862,12 +923,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'No invoices waiting for approval'**
   String get approvalsNoneWaiting;
-
-  /// No description provided for @approvalsLoadError.
-  ///
-  /// In en, this message translates to:
-  /// **'Could not load pending approvals'**
-  String get approvalsLoadError;
 
   /// No description provided for @approvalsPendingCount.
   ///
@@ -1151,6 +1206,12 @@ abstract class AppLocalizations {
   /// **'Segregation of duties: a user who recorded a goods receipt this invoice is billed against cannot also approve it.'**
   String get codedRefusalApprovalSegregationReceiver;
 
+  /// Coded refusal (lib/l10n/coded_refusal_messages.dart) `approval_segregation_inspector`: the approver recorded a quality inspection of the goods the invoice is billed against.
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: a user who recorded a quality inspection of the goods this invoice is billed against cannot also approve it.'**
+  String get codedRefusalApprovalSegregationInspector;
+
   /// Coded refusal (lib/l10n/coded_refusal_messages.dart) `invoice_stale_approval`: the invoice changed after the approver loaded it, so nothing was approved.
   ///
   /// In en, this message translates to:
@@ -1223,6 +1284,12 @@ abstract class AppLocalizations {
   /// **'Segregation of duties: a user involved in creating this invoice cannot also clear an exception that blocks its payment. Escalate it, or ask a different user to decide.'**
   String get codedRefusalExceptionSegregationImplicated;
 
+  /// Coded refusal `segregation_approver` on resolving an exception (backend decisions §420).
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: a user who approved this invoice cannot also clear its receipt or inspection hold. Escalate it, or ask a different user to decide.'**
+  String get codedRefusalExceptionSegregationApprover;
+
   /// No description provided for @invoiceDetailApproved.
   ///
   /// In en, this message translates to:
@@ -1264,6 +1331,66 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Reject'**
   String get invoiceDetailReject;
+
+  /// Button on an approved invoice that recalls its approval back to review (POST /recall-approval).
+  ///
+  /// In en, this message translates to:
+  /// **'Recall approval'**
+  String get invoiceDetailRecall;
+
+  /// Title of the reason prompt shown before recalling an approval.
+  ///
+  /// In en, this message translates to:
+  /// **'Recall this approval?'**
+  String get invoiceDetailRecallTitle;
+
+  /// Explanation in the recall prompt: what a recall does and its segregation-of-duties consequence.
+  ///
+  /// In en, this message translates to:
+  /// **'The invoice goes back to review so its figures can be corrected, then needs a fresh approval through the full approval chain. Segregation of duties will count you as involved in this invoice, as it does its uploader. The original approval stays in the audit trail.'**
+  String get invoiceDetailRecallBody;
+
+  /// Label of the reason field in the recall prompt.
+  ///
+  /// In en, this message translates to:
+  /// **'Why are you recalling it?'**
+  String get invoiceDetailRecallReason;
+
+  /// Snackbar after an approval was recalled.
+  ///
+  /// In en, this message translates to:
+  /// **'Approval recalled. The invoice is back in review.'**
+  String get invoiceDetailRecalled;
+
+  /// Snackbar when a recall failed for a reason the app cannot state from its code.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not recall the approval — please try again'**
+  String get invoiceDetailRecallFailed;
+
+  /// Coded refusal `invoice_not_recallable` on recalling an approval.
+  ///
+  /// In en, this message translates to:
+  /// **'Only an approved invoice, or one whose ERP push failed after approval, can have its approval recalled.'**
+  String get codedRefusalInvoiceNotRecallable;
+
+  /// Coded refusal `invoice_recall_in_erp`: the ERP may hold the bill.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can\'t be recalled from FeohLedger.'**
+  String get codedRefusalInvoiceRecallInErp;
+
+  /// Coded refusal `invoice_recall_claimed` with claim `payment`.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before recalling the approval.'**
+  String get codedRefusalPaymentBlocksRecall;
+
+  /// Coded refusal `invoice_recall_claimed` with claim `virtual_card`.
+  ///
+  /// In en, this message translates to:
+  /// **'A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.'**
+  String get codedRefusalCardBlocksRecall;
 
   /// Title of the reason prompt shown before bulk-rejecting the selected invoices.
   ///
@@ -1661,11 +1788,17 @@ abstract class AppLocalizations {
   /// **'Clear due date'**
   String get invoiceEditClearDueDate;
 
-  /// No description provided for @invoiceEditLockedNotice.
+  /// Edit sheet notice on a financially locked invoice whose approval cannot be recalled from here (past the recall, or no recall verdict).
   ///
   /// In en, this message translates to:
-  /// **'Approved — the payee and amount are frozen. To change them, reject the invoice, correct it, then approve it again.'**
+  /// **'Approved — the payee and amount are frozen.'**
   String get invoiceEditLockedNotice;
+
+  /// Edit sheet notice on a financially locked invoice when the server says this user may recall its approval (review-actions recall_approval allowed).
+  ///
+  /// In en, this message translates to:
+  /// **'Approved — the payee and amount are frozen. To change them, recall the approval, correct the invoice, then have it approved again.'**
+  String get invoiceEditLockedNoticeRecall;
 
   /// No description provided for @invoiceEditLockedHelper.
   ///
@@ -1757,11 +1890,29 @@ abstract class AppLocalizations {
   /// **'Last update'**
   String get erpStatusLastUpdate;
 
+  /// ERP panel last-update value: the audit action and who performed it.
+  ///
+  /// In en, this message translates to:
+  /// **'{action} by {actor}'**
+  String erpStatusActionBy(String action, String actor);
+
   /// No description provided for @erpStatusStatus.
   ///
   /// In en, this message translates to:
   /// **'Status'**
   String get erpStatusStatus;
+
+  /// No description provided for @erpStatusOpensInErp.
+  ///
+  /// In en, this message translates to:
+  /// **'opens the bill in the ERP'**
+  String get erpStatusOpensInErp;
+
+  /// No description provided for @externalLinkOpenFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t open the link'**
+  String get externalLinkOpenFailed;
 
   /// No description provided for @fileViewerPdfTitle.
   ///
@@ -1853,17 +2004,17 @@ abstract class AppLocalizations {
   /// **'No invoices awaiting payment'**
   String get payQueueEmpty;
 
-  /// No description provided for @payQueueError.
+  /// Pay screen, Queue tab: first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
   ///
   /// In en, this message translates to:
-  /// **'Could not load the payment queue'**
-  String get payQueueError;
+  /// **'Couldn\'t load the payment queue: {error}'**
+  String payQueueLoadErrorPrefix(String error);
 
-  /// No description provided for @payQueueRetry.
+  /// Pay screen, Runs tab: first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
   ///
   /// In en, this message translates to:
-  /// **'Retry'**
-  String get payQueueRetry;
+  /// **'Couldn\'t load payment runs: {error}'**
+  String payRunsLoadErrorPrefix(String error);
 
   /// No description provided for @payQueueDue.
   ///
@@ -1936,6 +2087,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Vendor not verified or not active — verify the vendor first'**
   String get payQueueBlockedVendorNotActive;
+
+  /// No description provided for @payQueueBlockedCurrencyUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'No currency recorded on this invoice — set its currency first'**
+  String get payQueueBlockedCurrencyUnknown;
 
   /// No description provided for @payQueueBlockedAppliedCreditMismatch.
   ///
@@ -2495,29 +2652,17 @@ abstract class AppLocalizations {
   /// **'Creating…'**
   String get adminUsersCreating;
 
-  /// No description provided for @adminUsersCreated.
+  /// No description provided for @adminUsersInvited.
   ///
   /// In en, this message translates to:
-  /// **'Created {name}'**
-  String adminUsersCreated(String name);
+  /// **'Invited {name}. We emailed {email} a link to set their password.'**
+  String adminUsersInvited(String name, String email);
 
   /// No description provided for @adminUsersCreateFailed.
   ///
   /// In en, this message translates to:
   /// **'Failed to create user: {error}'**
   String adminUsersCreateFailed(String error);
-
-  /// No description provided for @adminUsersTempPasswordTitle.
-  ///
-  /// In en, this message translates to:
-  /// **'User created'**
-  String get adminUsersTempPasswordTitle;
-
-  /// No description provided for @adminUsersTempPasswordBody.
-  ///
-  /// In en, this message translates to:
-  /// **'Share this one-time password with {name}. They\'ll be asked to change it on first sign-in. It won\'t be shown again.'**
-  String adminUsersTempPasswordBody(String name);
 
   /// No description provided for @adminUsersDelete.
   ///
@@ -2729,11 +2874,11 @@ abstract class AppLocalizations {
   /// **'Workflow'**
   String get workflowDetailFallbackTitle;
 
-  /// No description provided for @workflowDetailLoadError.
+  /// No description provided for @workflowDetailErrorPrefix.
   ///
   /// In en, this message translates to:
-  /// **'Could not load workflow'**
-  String get workflowDetailLoadError;
+  /// **'Could not load the workflow: {error}'**
+  String workflowDetailErrorPrefix(String error);
 
   /// No description provided for @workflowDetailNoSteps.
   ///
@@ -2924,6 +3069,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'pending {amount}'**
   String cashFlowPendingAmount(String amount);
+
+  /// No description provided for @cashFlowOverdueAmount.
+  ///
+  /// In en, this message translates to:
+  /// **'overdue {amount}'**
+  String cashFlowOverdueAmount(String amount);
+
+  /// Appended to a forecast row's screen-reader label when part of the period is already past due.
+  ///
+  /// In en, this message translates to:
+  /// **', {amount} already past due'**
+  String cashFlowOverdueSuffix(String amount);
+
+  /// No description provided for @cashFlowForecastOverdue.
+  ///
+  /// In en, this message translates to:
+  /// **'{amount} across {count, plural, one {{count} invoice} other {{count} invoices}} is already past due. Owed now, so counted in the first period.'**
+  String cashFlowForecastOverdue(int count, String amount);
 
   /// No description provided for @cashFlowPosition.
   ///
@@ -3326,11 +3489,11 @@ abstract class AppLocalizations {
   /// **'Exception'**
   String get exceptionDetailTitle;
 
-  /// No description provided for @exceptionDetailNotFound.
+  /// No description provided for @exceptionDetailErrorPrefix.
   ///
   /// In en, this message translates to:
-  /// **'Exception not found'**
-  String get exceptionDetailNotFound;
+  /// **'Could not load the exception: {error}'**
+  String exceptionDetailErrorPrefix(String error);
 
   /// No description provided for @exceptionDetailOverdue.
   ///
@@ -3343,6 +3506,522 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Description'**
   String get exceptionDetailSectionDescription;
+
+  /// An ERP PO sync re-check no longer finds this hold (decisions §323); the sync never clears it, so a person may now.
+  ///
+  /// In en, this message translates to:
+  /// **'PO {po} changed in {erp} on {date}, and a re-check now matches. Review it to clear the hold.'**
+  String exceptionDetailPoRematch(String po, String erp, String date);
+
+  /// No description provided for @exceptionDetailPoRematchNoDate.
+  ///
+  /// In en, this message translates to:
+  /// **'PO {po} changed in {erp}, and a re-check now matches. Review it to clear the hold.'**
+  String exceptionDetailPoRematchNoDate(String po, String erp);
+
+  /// No description provided for @exceptionDetailPoRematchNoPo.
+  ///
+  /// In en, this message translates to:
+  /// **'The purchase order changed in {erp}, and a re-check now matches. Review it to clear the hold.'**
+  String exceptionDetailPoRematchNoPo(String erp);
+
+  /// No description provided for @erpRefusalVendorNotLinked.
+  ///
+  /// In en, this message translates to:
+  /// **'This vendor isn\'t in {provider} yet. Sync vendors from {provider}, or add the vendor there, then retry.'**
+  String erpRefusalVendorNotLinked(String provider);
+
+  /// No description provided for @erpRefusalAccountNotLinked.
+  ///
+  /// In en, this message translates to:
+  /// **'Not linked to an account in {provider}: {accounts}. Sync the chart of accounts from {provider}, or recode the invoice to a linked account, then retry.'**
+  String erpRefusalAccountNotLinked(String provider, String accounts);
+
+  /// No description provided for @erpRefusalAccountNotLinkedUncoded.
+  ///
+  /// In en, this message translates to:
+  /// **'A line has no GL account, and the invoice has none to fall back on. Code it to an account linked to {provider}, then retry.'**
+  String erpRefusalAccountNotLinkedUncoded(String provider);
+
+  /// No description provided for @erpRefusalNotConnected.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP isn\'t connected, or its connection has expired. An administrator can reconnect it under Organization, then retry.'**
+  String get erpRefusalNotConnected;
+
+  /// No description provided for @erpRefusalInvoiceDueBeforeDate.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is due before its invoice date, which the ERP rejects. Correct the dates, then retry.'**
+  String get erpRefusalInvoiceDueBeforeDate;
+
+  /// No description provided for @erpRefusalAmountMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'The line amounts don\'t add up to the approved amount, so the bill wasn\'t sent to {provider}. Correct the lines or the tax, then retry.'**
+  String erpRefusalAmountMismatch(String provider);
+
+  /// No description provided for @erpRefusalLineAmountMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'A line has no amount — no total, and no quantity and unit price to work one out from. Fill it in, then retry.'**
+  String get erpRefusalLineAmountMissing;
+
+  /// No description provided for @erpRefusalPostedTotalMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} worked out a different total from the approved amount (often a default tax code), so the bill wasn\'t kept. Check the vendor\'s and accounts\' tax settings in {provider}, then retry.'**
+  String erpRefusalPostedTotalMismatch(String provider);
+
+  /// No description provided for @erpRefusalPostedTotalUnconfirmed.
+  ///
+  /// In en, this message translates to:
+  /// **'The bill was created in {provider}, but {provider} didn\'t report its total, so it can\'t be confirmed. Check the bill in {provider} before you retry.'**
+  String erpRefusalPostedTotalUnconfirmed(String provider);
+
+  /// No description provided for @erpRefusalPreviousBillRemoved.
+  ///
+  /// In en, this message translates to:
+  /// **'Every bill sent for this invoice was deleted or voided in {provider}, so it won\'t be sent again automatically. Check {provider}, then ask an administrator how to proceed.'**
+  String erpRefusalPreviousBillRemoved(String provider);
+
+  /// No description provided for @erpRefusalTaxNotItemised.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} needs the tax on each line, but this invoice states it only in total. Enter the tax per line, then retry.'**
+  String erpRefusalTaxNotItemised(String provider);
+
+  /// No description provided for @erpRefusalTaxRateUnresolved.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} has no tax rate that matches this invoice\'s tax. Set the rate up in {provider}, or correct the tax, then retry.'**
+  String erpRefusalTaxRateUnresolved(String provider);
+
+  /// No description provided for @erpRefusalMissingDates.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} needs both an invoice date and a due date. Add them, then retry.'**
+  String erpRefusalMissingDates(String provider);
+
+  /// No description provided for @erpRefusalBillRefused.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill and did not create it. Check the bill\'s vendor, accounts, dates and amounts against {provider}, correct them, then retry.'**
+  String erpRefusalBillRefused(String provider);
+
+  /// No description provided for @erpRefusalDuplicateNumber.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} already has a bill with this invoice number. Check {provider} for a duplicate before you retry.'**
+  String erpRefusalDuplicateNumber(String provider);
+
+  /// No description provided for @erpRefusalDocNumberTooLong.
+  ///
+  /// In en, this message translates to:
+  /// **'The invoice number is longer than {provider} allows. Shorten it, then retry.'**
+  String erpRefusalDocNumberTooLong(String provider);
+
+  /// No description provided for @erpRefusalCurrencyUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} reports no home currency, so the bill\'s currency can\'t be checked. Set the home currency in {provider}, then retry.'**
+  String erpRefusalCurrencyUnknown(String provider);
+
+  /// No description provided for @erpRefusalCurrencyNotEnabled.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice isn\'t in {provider}\'s home currency, and multicurrency is off there. Turn multicurrency on in {provider}, or correct the currency, then retry.'**
+  String erpRefusalCurrencyNotEnabled(String provider);
+
+  /// No description provided for @erpRefusalIdempotencyLookupIncomplete.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} couldn\'t confirm whether this invoice was already sent, so it wasn\'t sent again. Retry in a few minutes.'**
+  String erpRefusalIdempotencyLookupIncomplete(String provider);
+
+  /// No description provided for @erpRefusalPurchasesNotPermitted.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} did not allow this bill to be created. Either the business is on Accounting Start, which cannot create purchase invoices, or the connected Sage user lacks Purchases access. Upgrade the plan or give that user Purchases access in {provider}, then retry.'**
+  String erpRefusalPurchasesNotPermitted(String provider);
+
+  /// No description provided for @erpRefusalExistingInvoiceNotOpen.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} already holds this invoice and it\'s no longer a draft, so it can\'t be changed from here. Review it in {provider}.'**
+  String erpRefusalExistingInvoiceNotOpen(String provider);
+
+  /// No description provided for @erpRefusalLineAmountPrecision.
+  ///
+  /// In en, this message translates to:
+  /// **'A line amount has more decimal places than this currency allows in {provider}. Round it, then retry.'**
+  String erpRefusalLineAmountPrecision(String provider);
+
+  /// No description provided for @erpRefusalPayToVendorDiffers.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} has this bill set to pay a different vendor from the one approved (its pay-to vendor), so it wasn\'t posted as this bill. Check the pay-to vendor on the bill and on the vendor\'s card in {provider}, then retry.'**
+  String erpRefusalPayToVendorDiffers(String provider);
+
+  /// No description provided for @erpRefusalBillNotPosted.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} holds this bill but doesn\'t show it as posted yet, usually because it\'s waiting for approval there. Approve it in {provider}, then retry. It won\'t be created twice.'**
+  String erpRefusalBillNotPosted(String provider);
+
+  /// No description provided for @erpRefusalBillRejected.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} holds this bill, but it was rejected or cancelled there, so it will never post. Delete it or enter it again in {provider} before you retry, and don\'t mark this invoice done: nothing will pay it.'**
+  String erpRefusalBillRejected(String provider);
+
+  /// No description provided for @erpRefusalCurrencyNotSetUp.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} has no active currency for this invoice\'s currency code. Add or reactivate that currency in {provider} (a foreign one needs Multiple Currencies turned on), or correct the invoice\'s currency, then retry.'**
+  String erpRefusalCurrencyNotSetUp(String provider);
+
+  /// No description provided for @erpRefusalCurrencyNotSupported.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} takes bills only in the company\'s own currency. Correct the currency, or enter the bill in {provider} directly.'**
+  String erpRefusalCurrencyNotSupported(String provider);
+
+  /// No description provided for @erpRefusalForeignCurrencySupplier.
+  ///
+  /// In en, this message translates to:
+  /// **'This supplier is set up for a foreign currency in {provider}, which can\'t be posted to from here. Enter the bill in {provider} directly.'**
+  String erpRefusalForeignCurrencySupplier(String provider);
+
+  /// No description provided for @erpRefusalCorrelationTotalMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} already holds a bill from an earlier attempt with a different total. Check that bill in {provider} before you retry.'**
+  String erpRefusalCorrelationTotalMismatch(String provider);
+
+  /// No description provided for @erpRefusalTaxTypeNotResolved.
+  ///
+  /// In en, this message translates to:
+  /// **'An account\'s tax type in {provider} isn\'t a fixed rate, so the tax can\'t be split out. Give the account a tax type in {provider}, then retry.'**
+  String erpRefusalTaxTypeNotResolved(String provider);
+
+  /// No description provided for @erpRefusalTaxMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'The tax {provider} would book differs from the tax on the invoice. Check the accounts\' tax types in {provider}, or correct the tax, then retry.'**
+  String erpRefusalTaxMismatch(String provider);
+
+  /// No description provided for @erpRefusalTaxNotStated.
+  ///
+  /// In en, this message translates to:
+  /// **'The invoice states no tax, but its accounts carry tax in {provider}. Enter the invoice\'s tax, then retry.'**
+  String erpRefusalTaxNotStated(String provider);
+
+  /// No description provided for @erpRefusalSubscriptionKeyMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'The {provider} subscription key is missing. An administrator can add it under Organization, then retry.'**
+  String erpRefusalSubscriptionKeyMissing(String provider);
+
+  /// No description provided for @erpRefusalApAccountNotConfigured.
+  ///
+  /// In en, this message translates to:
+  /// **'No accounts-payable account is set for {provider}. An administrator can set it under Organization, then retry.'**
+  String erpRefusalApAccountNotConfigured(String provider);
+
+  /// No description provided for @erpRefusalCurrencyNotConfigured.
+  ///
+  /// In en, this message translates to:
+  /// **'No ledger currency is set for {provider}. An administrator can set it under Organization, then retry.'**
+  String erpRefusalCurrencyNotConfigured(String provider);
+
+  /// No description provided for @erpRefusalCurrencyMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'The invoice\'s currency isn\'t the {provider} ledger currency. Correct the currency, then retry.'**
+  String erpRefusalCurrencyMismatch(String provider);
+
+  /// No description provided for @erpRefusalInvoiceDateMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} needs an invoice date. Add it, then retry.'**
+  String erpRefusalInvoiceDateMissing(String provider);
+
+  /// No description provided for @erpRefusalDueDateMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} needs a due date. Add it, then retry.'**
+  String erpRefusalDueDateMissing(String provider);
+
+  /// No description provided for @erpRefusalAmountNotPositive.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} takes only invoices for more than zero. Correct the amount, or record a credit memo instead.'**
+  String erpRefusalAmountNotPositive(String provider);
+
+  /// No description provided for @erpRefusalJobUnconfirmed.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} accepted the invoice but hasn\'t confirmed it was created. Retry to check again — it won\'t be sent twice.'**
+  String erpRefusalJobUnconfirmed(String provider);
+
+  /// No description provided for @erpRefusalJobFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} accepted the invoice, but its background job failed and created nothing. Check the vendor, accounts, transaction codes and posting period in {provider}, then retry.'**
+  String erpRefusalJobFailed(String provider);
+
+  /// No description provided for @erpRefusalCallBudgetTenant.
+  ///
+  /// In en, this message translates to:
+  /// **'This workspace has used its share of today\'s {provider} API calls, so FeohLedger made no call. The allowance resets at midnight UTC — retry then.'**
+  String erpRefusalCallBudgetTenant(String provider);
+
+  /// No description provided for @erpRefusalCallBudgetQuota.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} has paused API calls for the subscription FeohLedger uses (its daily quota is used), so FeohLedger made no call. It resets at midnight UTC — retry then.'**
+  String erpRefusalCallBudgetQuota(String provider);
+
+  /// No description provided for @erpRefusalCallBudgetRateLimited.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} asked FeohLedger to slow down, so no call was made. Retry in a minute.'**
+  String erpRefusalCallBudgetRateLimited(String provider);
+
+  /// No description provided for @erpRefusalBillLeftUnposted.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} holds this bill as a draft or awaiting approval, not posted, so nothing is in accounts payable there yet. Post or approve it in {provider}, then retry.'**
+  String erpRefusalBillLeftUnposted(String provider);
+
+  /// No description provided for @erpRefusalMergeSyncPending.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} has not finished syncing invoices since an earlier attempt to send this bill, whose outcome is unknown, so it may already hold the bill. Nothing was sent. Retry after {provider}\'s next invoice sync: if the bill is there by then, the retry links to it instead of creating a second one.'**
+  String erpRefusalMergeSyncPending(String provider);
+
+  /// No description provided for @erpRefusalCredentialsUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP credentials couldn\'t be opened just now. Retry in a few minutes; if it keeps failing, tell an administrator.'**
+  String get erpRefusalCredentialsUnavailable;
+
+  /// No description provided for @erpRefusalPeriodClosed.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill because its date is in a closed period (the books are closed). Change the invoice date or reopen the period in {provider}, then retry.'**
+  String erpRefusalPeriodClosed(String provider);
+
+  /// No description provided for @erpRefusalVendorInactive.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill because its vendor is inactive or deleted there. Make the vendor active in {provider}, then retry.'**
+  String erpRefusalVendorInactive(String provider);
+
+  /// No description provided for @erpRefusalAccountInactive.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill because {accounts} is inactive or deleted there. Make the account active in {provider}, or recode the invoice to an active account, then retry.'**
+  String erpRefusalAccountInactive(String provider, String accounts);
+
+  /// No description provided for @erpRefusalReferenceInvalid.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill because it refers to a vendor or account it doesn\'t accept (Intuit error {code}). Check that the vendor and every account on the bill exist and are active in {provider}, sync them again, then retry.'**
+  String erpRefusalReferenceInvalid(String provider, String code);
+
+  /// No description provided for @erpRefusalCompanySubscriptionInactive.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill because the company\'s subscription has ended, was cancelled or has a billing problem. Resolve it in {provider}, then retry.'**
+  String erpRefusalCompanySubscriptionInactive(String provider);
+
+  /// No description provided for @erpRefusalIntuitFault.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} refused this bill (Intuit error {code}). Check the bill\'s details against {provider} and correct them, then retry. If it keeps failing, give an administrator the error code.'**
+  String erpRefusalIntuitFault(String provider, String code);
+
+  /// No description provided for @erpRefusalPaymentAccountNotMapped.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} was not told about this payment: no account to record it from is set. Choose the bill-payment account under Organization → ERP integration, then retry the payment sync.'**
+  String erpRefusalPaymentAccountNotMapped(String provider);
+
+  /// No description provided for @erpRefusalBillNotInErp.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} no longer has the bill this payment was for (it was deleted there), so the payment was not recorded there. Check the bill in {provider}.'**
+  String erpRefusalBillNotInErp(String provider);
+
+  /// No description provided for @erpRefusalPaymentExceedsBalance.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} shows less still owed on this bill than this payment, so recording it would overpay the bill. Check what was already paid in {provider}.'**
+  String erpRefusalPaymentExceedsBalance(String provider);
+
+  /// No description provided for @erpRefusalBillPaymentVoided.
+  ///
+  /// In en, this message translates to:
+  /// **'This payment was recorded in {provider} and then voided there, so it is not recorded again. Decide in {provider} whether the bill is paid.'**
+  String erpRefusalBillPaymentVoided(String provider);
+
+  /// No description provided for @erpRefusalPaymentsScopeMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} was connected before FeohLedger asked for permission to record payments, so this payment isn\'t recorded there. Reconnect {provider} in Organization settings to grant it, then record the payment in {provider} or retry.'**
+  String erpRefusalPaymentsScopeMissing(String provider);
+
+  /// No description provided for @erpRefusalExceptionBlocksExport.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has an open {type} exception. Resolve or dismiss it in Exceptions, then send it to the ERP.'**
+  String erpRefusalExceptionBlocksExport(String type);
+
+  /// No description provided for @erpRefusalExceptionBlocksExportPossiblyPosted.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has an open {type} exception, and an earlier attempt may already have created the bill in the ERP. Check the ERP before anyone pays it, then resolve or dismiss the exception in Exceptions.'**
+  String erpRefusalExceptionBlocksExportPossiblyPosted(String type);
+
+  /// No description provided for @erpRefusalPaymentBlocksExport.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before sending the invoice to the ERP.'**
+  String get erpRefusalPaymentBlocksExport;
+
+  /// No description provided for @erpRefusalPaymentBlocksExportPossiblyPosted.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger is already paying this invoice, and an earlier attempt may already have created the bill in the ERP. Check the ERP and make sure nobody pays the bill there as well.'**
+  String get erpRefusalPaymentBlocksExportPossiblyPosted;
+
+  /// No description provided for @erpRefusalVendorBlocked.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice\'s vendor is blocked from payment. Unblock the vendor before sending the invoice to the ERP.'**
+  String get erpRefusalVendorBlocked;
+
+  /// No description provided for @erpRefusalVendorSanctionsMatch.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice\'s vendor matched a sanctions list. Review the vendor\'s screening before sending the invoice to the ERP.'**
+  String get erpRefusalVendorSanctionsMatch;
+
+  /// No description provided for @erpRefusalVendorSanctionsReview.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice\'s vendor is held for sanctions screening review. Re-screen the vendor once the review is done, then send the invoice to the ERP.'**
+  String get erpRefusalVendorSanctionsReview;
+
+  /// No description provided for @erpRefusalVendorRejected.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice\'s vendor has been rejected. Link the invoice to the correct vendor before sending it to the ERP.'**
+  String get erpRefusalVendorRejected;
+
+  /// No description provided for @erpRefusalVendorStatusUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice\'s vendor has a status that cannot be sent to the ERP. Set the vendor to active before sending the invoice to the ERP.'**
+  String get erpRefusalVendorStatusUnknown;
+
+  /// No description provided for @erpRefusalVendorHoldPossiblyPosted.
+  ///
+  /// In en, this message translates to:
+  /// **'An earlier attempt may already have created the bill in the ERP; check there before anyone pays it.'**
+  String get erpRefusalVendorHoldPossiblyPosted;
+
+  /// No description provided for @erpRefusalCurrencyBlocksExport.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has no valid currency. Set its currency before sending it to the ERP.'**
+  String get erpRefusalCurrencyBlocksExport;
+
+  /// No description provided for @erpRefusalRetriesExhausted.
+  ///
+  /// In en, this message translates to:
+  /// **'This push had no attempts left, so no attempt was made this time. Retry to send it with a fresh set of attempts.'**
+  String get erpRefusalRetriesExhausted;
+
+  /// No description provided for @erpRefusalPushInterrupted.
+  ///
+  /// In en, this message translates to:
+  /// **'This push was interrupted and never finished. It is too old (or older than the current ERP connection) to send again without someone checking. Make sure the bill isn\'t already in the ERP, then retry.'**
+  String get erpRefusalPushInterrupted;
+
+  /// No description provided for @erpRefusalCardBlocksExport.
+  ///
+  /// In en, this message translates to:
+  /// **'A virtual card has been issued to pay this invoice. Cancel the card before sending the invoice to the ERP.'**
+  String get erpRefusalCardBlocksExport;
+
+  /// No description provided for @erpRefusalCardBlocksExportPossiblyPosted.
+  ///
+  /// In en, this message translates to:
+  /// **'A virtual card has been issued to pay this invoice, and an earlier attempt may already have created the bill in the ERP. Check the ERP and make sure nobody pays the bill there as well.'**
+  String get erpRefusalCardBlocksExportPossiblyPosted;
+
+  /// The exception type named by the erpRefusalExceptionBlocksExport sentences.
+  ///
+  /// In en, this message translates to:
+  /// **'Duplicate Invoice'**
+  String get erpRefusalTypeDuplicate;
+
+  /// No description provided for @erpRefusalTypeFraudFlag.
+  ///
+  /// In en, this message translates to:
+  /// **'Fraud Flag'**
+  String get erpRefusalTypeFraudFlag;
+
+  /// The card for a payment the ERP reported that FeohLedger could not record (erp_report kind paid_not_recorded, decisions §319).
+  ///
+  /// In en, this message translates to:
+  /// **'Payment reported by {erp}'**
+  String exceptionDetailErpPaymentTitle(String erp);
+
+  /// The cash the ERP states was paid, in the currency it stated (decisions §386, §413).
+  ///
+  /// In en, this message translates to:
+  /// **'Amount {erp} reports paid'**
+  String exceptionDetailErpPaymentAmount(String erp);
+
+  /// No description provided for @exceptionDetailErpPaymentPaidOn.
+  ///
+  /// In en, this message translates to:
+  /// **'Paid on'**
+  String get exceptionDetailErpPaymentPaidOn;
+
+  /// No description provided for @exceptionDetailErpPaymentReference.
+  ///
+  /// In en, this message translates to:
+  /// **'Reference'**
+  String get exceptionDetailErpPaymentReference;
+
+  /// A coded ERP refusal this build has no sentence for (a newer backend). Never shows the raw code.
+  ///
+  /// In en, this message translates to:
+  /// **'This was refused in {erp} for a reason this version of the app can\'t describe. Update the app, or check the record in {erp}.'**
+  String erpRefusalUnknown(String erp);
+
+  /// No description provided for @exceptionDetailErpPaymentNotStated.
+  ///
+  /// In en, this message translates to:
+  /// **'Not stated'**
+  String get exceptionDetailErpPaymentNotStated;
+
+  /// Recording the reported payment is web-only.
+  ///
+  /// In en, this message translates to:
+  /// **'Record this payment from Exceptions in the web app: that resolves the exception and marks the invoice paid.'**
+  String get exceptionDetailErpPaymentRecordOnWeb;
+
+  /// No description provided for @exceptionDetailYourErp.
+  ///
+  /// In en, this message translates to:
+  /// **'your ERP'**
+  String get exceptionDetailYourErp;
 
   /// No description provided for @exceptionDetailSectionInvoice.
   ///
@@ -3644,11 +4323,11 @@ abstract class AppLocalizations {
   /// **'No inspections with this outcome.'**
   String get inspectionsEmptyFiltered;
 
-  /// No description provided for @inspectionsLoadError.
+  /// Inspections list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
   ///
   /// In en, this message translates to:
-  /// **'Could not load inspections'**
-  String get inspectionsLoadError;
+  /// **'Couldn\'t load inspections: {error}'**
+  String inspectionsLoadErrorPrefix(String error);
 
   /// No description provided for @inspectionsResultPass.
   ///
@@ -4263,13 +4942,13 @@ abstract class AppLocalizations {
   /// No description provided for @invoiceWarningAiAllowanceReached.
   ///
   /// In en, this message translates to:
-  /// **'AI reading is paused: this month\'s {included, plural, one {{included} AI-read invoice is} other {{included} AI-read invoices are}} used. Enter the details manually, or upgrade your plan on the Billing page.'**
+  /// **'AI reading is paused: this month\'s {included, plural, one {{included} AI-read invoice is} other {{included} AI-read invoices are}} used. Enter the details manually, or upgrade your plan under Settings → Subscription.'**
   String invoiceWarningAiAllowanceReached(int included);
 
   /// No description provided for @invoiceWarningAiSpendCapReached.
   ///
   /// In en, this message translates to:
-  /// **'AI reading is paused: this month\'s AI spending cap is reached. Enter the details manually, or raise the cap on the Billing page.'**
+  /// **'AI reading is paused: this month\'s AI spending cap is reached. Enter the details manually, or raise the cap under Settings → Subscription.'**
   String get invoiceWarningAiSpendCapReached;
 
   /// No description provided for @invoiceWarningUnverifiedVendor.
@@ -4360,6 +5039,26 @@ abstract class AppLocalizations {
     String poTotal,
   );
 
+  /// No description provided for @invoiceWarningPoBilledBeyondTotal.
+  ///
+  /// In en, this message translates to:
+  /// **'Other invoices already bill {billedAmount} against PO {poNumber}, whose total is {poTotal} — this invoice takes it past that total'**
+  String invoiceWarningPoBilledBeyondTotal(
+    String billedAmount,
+    String poNumber,
+    String poTotal,
+  );
+
+  /// No description provided for @invoiceWarningPoBilledBeyondReceipt.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoices on PO {poNumber} bill {totalBilled}, this one included; goods worth {receivedValue} have been received'**
+  String invoiceWarningPoBilledBeyondReceipt(
+    String totalBilled,
+    String poNumber,
+    String receivedValue,
+  );
+
   /// No description provided for @invoiceWarningPoAmountVariancePoCurrencyUnknown.
   ///
   /// In en, this message translates to:
@@ -4380,6 +5079,33 @@ abstract class AppLocalizations {
     String poNumber,
     String poCurrency,
   );
+
+  /// No description provided for @invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'The invoice records no valid currency and the POs behind {poNumber} are in different currencies ({poCurrencies}) — the amounts were not compared'**
+  String invoiceWarningPoCurrencyMismatchInvoiceCurrencyUnknown(
+    String poNumber,
+    String poCurrencies,
+  );
+
+  /// No description provided for @invoiceWarningPoCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'PO {poNumber} is cancelled — the invoice was not matched against it'**
+  String invoiceWarningPoCancelled(String poNumber);
+
+  /// No description provided for @invoiceWarningPoNotIssued.
+  ///
+  /// In en, this message translates to:
+  /// **'PO {poNumber} is not approved in the ERP yet — the invoice was not matched against it'**
+  String invoiceWarningPoNotIssued(String poNumber);
+
+  /// No description provided for @invoiceWarningPoTotalUnverifiable.
+  ///
+  /// In en, this message translates to:
+  /// **'The total of PO {poNumber} could not be confirmed from the ERP on its last sync — the amounts were not compared'**
+  String invoiceWarningPoTotalUnverifiable(String poNumber);
 
   /// No description provided for @invoiceWarningPoPartialReceipt.
   ///
@@ -4520,6 +5246,25 @@ abstract class AppLocalizations {
     String spendLimit,
   );
 
+  /// No description provided for @invoiceWarningContractCurrencyMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice is in {invoiceCurrency} but contract {contractNumber} is in {contractCurrency} — its spend limit was not checked'**
+  String invoiceWarningContractCurrencyMismatch(
+    String invoiceCurrency,
+    String contractNumber,
+    String contractCurrency,
+  );
+
+  /// No description provided for @invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'The invoice records no valid currency, so the spend limit in {contractCurrency} of contract {contractNumber} was not checked'**
+  String invoiceWarningContractCurrencyMismatchInvoiceCurrencyUnknown(
+    String contractNumber,
+    String contractCurrency,
+  );
+
   /// No description provided for @invoiceWarningContractGlNotAllowed.
   ///
   /// In en, this message translates to:
@@ -4560,6 +5305,21 @@ abstract class AppLocalizations {
     String amount,
   );
 
+  /// No description provided for @invoiceWarningSelfCorrectionCurrencyConflict.
+  ///
+  /// In en, this message translates to:
+  /// **'Amounts are printed in {printedCurrency}, but the invoice currency reads {fieldCurrency}. The amounts were left blank — enter them from the document.'**
+  String invoiceWarningSelfCorrectionCurrencyConflict(
+    String printedCurrency,
+    String fieldCurrency,
+  );
+
+  /// No description provided for @invoiceWarningSelfCorrectionCurrencyMixed.
+  ///
+  /// In en, this message translates to:
+  /// **'Amounts are printed in more than one currency ({printedCurrencies}). The amounts were left blank — enter them from the document.'**
+  String invoiceWarningSelfCorrectionCurrencyMixed(String printedCurrencies);
+
   /// No description provided for @invoiceWarningSelfCorrectionLineItemMath.
   ///
   /// In en, this message translates to:
@@ -4575,7 +5335,7 @@ abstract class AppLocalizations {
   /// No description provided for @invoiceWarningGlCodesNotInChart.
   ///
   /// In en, this message translates to:
-  /// **'AI suggested GL code(s) not in active chart: {codes}'**
+  /// **'GL code(s) not in the active chart of accounts, left uncoded: {codes}'**
   String invoiceWarningGlCodesNotInChart(String codes);
 
   /// No description provided for @invoiceWarningGlCodeStalePrior.
@@ -4598,6 +5358,32 @@ abstract class AppLocalizations {
     String invoiceCurrency,
     String poCurrency,
   );
+
+  /// No description provided for @invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'Currency mismatch: invoice records no valid currency, POs in {poCurrencies} — amounts not compared'**
+  String invoicePoMatchIssueCurrencyMismatchInvoiceCurrencyUnknown(
+    String poCurrencies,
+  );
+
+  /// No description provided for @invoicePoMatchIssuePoCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'PO is cancelled — amounts not compared'**
+  String get invoicePoMatchIssuePoCancelled;
+
+  /// No description provided for @invoicePoMatchIssuePoNotIssued.
+  ///
+  /// In en, this message translates to:
+  /// **'PO not approved in the ERP yet — amounts not compared'**
+  String get invoicePoMatchIssuePoNotIssued;
+
+  /// No description provided for @invoicePoMatchIssuePoTotalUnverifiable.
+  ///
+  /// In en, this message translates to:
+  /// **'PO total not confirmed by the ERP on its last sync — amounts not compared'**
+  String get invoicePoMatchIssuePoTotalUnverifiable;
 
   /// No description provided for @invoicePoMatchIssueAmountMismatch.
   ///
@@ -4693,6 +5479,476 @@ abstract class AppLocalizations {
   /// **'{count, plural, one {{count} contract-compliance finding} other {{count} contract-compliance findings}}'**
   String exceptionDescriptionContractNoncompliantFindings(int count);
 
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedBlockingException.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.'**
+  String exceptionDescriptionErpPaidUnrecordedBlockingException(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedBlockingExceptionUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because another exception on this invoice is blocking payment. Clear that exception and FeohLedger records the payment automatically.'**
+  String get exceptionDescriptionErpPaidUnrecordedBlockingExceptionUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedInRun.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP\'s payment from this exception.'**
+  String exceptionDescriptionErpPaidUnrecordedInRun(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedInRunUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is also in a FeohLedger payment run, so the supplier could be paid twice. Take it out of the run or cancel the run, then record the ERP\'s payment from this exception.'**
+  String get exceptionDescriptionErpPaidUnrecordedInRunUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedPaymentLive.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP\'s payment is the real one, then record the ERP\'s payment from this exception.'**
+  String exceptionDescriptionErpPaidUnrecordedPaymentLive(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedPaymentLiveUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger has its own payment in progress for this invoice, so the supplier could be paid twice. Void that payment if the ERP\'s payment is the real one, then record the ERP\'s payment from this exception.'**
+  String get exceptionDescriptionErpPaidUnrecordedPaymentLiveUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedCardLive.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP\'s payment from this exception.'**
+  String exceptionDescriptionErpPaidUnrecordedCardLive(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedCardLiveUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because a virtual card is still live for this invoice, so the supplier could be paid twice. Cancel the card, then record the ERP\'s payment from this exception.'**
+  String get exceptionDescriptionErpPaidUnrecordedCardLiveUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedCreditConflict.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because an applied credit memo no longer matches this invoice\'s supplier or currency, so the amount owed can\'t be stated. Correct the credit memo, then record the ERP\'s payment from this exception.'**
+  String exceptionDescriptionErpPaidUnrecordedCreditConflict(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedCreditConflictUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because an applied credit memo no longer matches this invoice\'s supplier or currency, so the amount owed can\'t be stated. Correct the credit memo, then record the ERP\'s payment from this exception.'**
+  String get exceptionDescriptionErpPaidUnrecordedCreditConflictUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedNothingToPay.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.'**
+  String exceptionDescriptionErpPaidUnrecordedNothingToPay(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedNothingToPayUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because credit memos already cover the whole invoice, so there is no payment to record. Check the bill in the ERP, then resolve this exception.'**
+  String get exceptionDescriptionErpPaidUnrecordedNothingToPayUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedNotPayable.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP\'s payment from this exception or resolve it.'**
+  String exceptionDescriptionErpPaidUnrecordedNotPayable(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedNotPayableUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because the invoice is not at a status that can be marked paid. Check the invoice, then record the ERP\'s payment from this exception or resolve it.'**
+  String get exceptionDescriptionErpPaidUnrecordedNotPayableUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedAmountMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP\'s payment from this exception or resolve it.'**
+  String exceptionDescriptionErpPaidUnrecordedAmountMismatch(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedAmountMismatchUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because the amount it shows paid is not what this invoice owes in FeohLedger, after credit memos and any early-payment discount. Check the bill and the invoice, correct the one that is wrong, then record the ERP\'s payment from this exception or resolve it.'**
+  String get exceptionDescriptionErpPaidUnrecordedAmountMismatchUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedOther.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP\'s payment from this exception or resolve it.'**
+  String exceptionDescriptionErpPaidUnrecordedOther(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidUnrecordedOtherUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment because FeohLedger refused to record it. Check the invoice, then record the ERP\'s payment from this exception or resolve it.'**
+  String get exceptionDescriptionErpPaidUnrecordedOtherUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidWithdrawn.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.'**
+  String exceptionDescriptionErpPaidWithdrawn(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidWithdrawnUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reported this bill paid, but no longer shows it paid. FeohLedger did not record that payment. Check the bill in the ERP: if it is still owed, resolve this exception and pay it as usual.'**
+  String get exceptionDescriptionErpPaidWithdrawnUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaidRetryFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger couldn\'t record that payment automatically. Check the details, then record the ERP\'s payment from this exception.'**
+  String exceptionDescriptionErpPaidRetryFailed(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaidRetryFailedUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger couldn\'t record that payment automatically. Check the details, then record the ERP\'s payment from this exception.'**
+  String get exceptionDescriptionErpPaidRetryFailedUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpSettledShort.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill paid, but FeohLedger\'s own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.'**
+  String exceptionDescriptionErpSettledShort(String erp);
+
+  /// No description provided for @exceptionDescriptionErpSettledShortUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill paid, but FeohLedger\'s own payment for it settled for less than AP authorized, so the invoice is held at Payment scheduled. Open the payment and either accept the settled amount or void the payment.'**
+  String get exceptionDescriptionErpSettledShortUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpVoidedAfterPost.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.'**
+  String exceptionDescriptionErpVoidedAfterPost(String erp);
+
+  /// No description provided for @exceptionDescriptionErpVoidedAfterPostUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP reports this bill voided or cancelled, but FeohLedger had already sent it on for payment, so it was not cancelled here. Check whether a payment is on its way to the supplier, and stop or recover it if the bill is really void.'**
+  String get exceptionDescriptionErpVoidedAfterPostUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpCreditSettlement.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.'**
+  String get exceptionDescriptionErpCreditSettlement;
+
+  /// No description provided for @exceptionDescriptionErpPaidWhileScheduled.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.'**
+  String get exceptionDescriptionErpPaidWhileScheduled;
+
+  /// No description provided for @exceptionDescriptionErpPaidTwice.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.'**
+  String get exceptionDescriptionErpPaidTwice;
+
+  /// No description provided for @exceptionDescriptionErpPartlyPaidOutside.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger payment for the full amount would overpay it. Reconcile what is still owed before paying.'**
+  String get exceptionDescriptionErpPartlyPaidOutside;
+
+  /// No description provided for @exceptionDescriptionErpRecordedPaymentWithdrawn.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP reported this bill paid, and FeohLedger recorded that payment, but the ERP no longer shows it paid (the payment was deleted or voided there). Confirm whether it is still owed.'**
+  String get exceptionDescriptionErpRecordedPaymentWithdrawn;
+
+  /// No description provided for @exceptionDescriptionErpBillDeletedBlocking.
+  ///
+  /// In en, this message translates to:
+  /// **'The bill this invoice was posted as has been deleted or voided in the ERP; FeohLedger will not pay it until someone confirms it is still owed.'**
+  String get exceptionDescriptionErpBillDeletedBlocking;
+
+  /// No description provided for @exceptionDescriptionErpBillDeleted.
+  ///
+  /// In en, this message translates to:
+  /// **'The bill this invoice was posted as has been deleted or voided in the ERP. Confirm the books still agree.'**
+  String get exceptionDescriptionErpBillDeleted;
+
+  /// No description provided for @exceptionDescriptionErpBillUnlinkedNoDocument.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger cannot check this invoice\'s bill in the ERP, because the ERP did not say which bill it created when the invoice was posted, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.'**
+  String get exceptionDescriptionErpBillUnlinkedNoDocument;
+
+  /// No description provided for @exceptionDescriptionErpBillUnlinkedNoCompany.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger cannot check this invoice\'s bill in the ERP, because the posting did not record which ERP company it went to, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.'**
+  String get exceptionDescriptionErpBillUnlinkedNoCompany;
+
+  /// No description provided for @exceptionDescriptionErpBillUnlinkedOtherCompany.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger cannot check this invoice\'s bill in the ERP, because it was posted to a different ERP company than the one now connected, so it will not pay it. Confirm in the ERP whether it is still owed, then record it as paid outside FeohLedger or re-post it.'**
+  String get exceptionDescriptionErpBillUnlinkedOtherCompany;
+
+  /// No description provided for @exceptionDescriptionErpDispatchStoppedPaid.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger was about to pay this invoice, but the ERP shows its bill already paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.'**
+  String get exceptionDescriptionErpDispatchStoppedPaid;
+
+  /// No description provided for @exceptionDescriptionErpDispatchStoppedPartiallyPaid.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger was about to pay this invoice, but the ERP shows its bill partly paid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.'**
+  String get exceptionDescriptionErpDispatchStoppedPartiallyPaid;
+
+  /// No description provided for @exceptionDescriptionErpDispatchStoppedDeleted.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger was about to pay this invoice, but the ERP shows its bill deleted or voided. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.'**
+  String get exceptionDescriptionErpDispatchStoppedDeleted;
+
+  /// No description provided for @exceptionDescriptionErpDispatchStoppedUnconfirmed.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger was about to pay this invoice, but the ERP could not confirm its bill is still open and unpaid. It was stopped before any money moved. Confirm what is still owed before paying it; if a virtual card was already issued for this invoice, cancel it.'**
+  String get exceptionDescriptionErpDispatchStoppedUnconfirmed;
+
+  /// No description provided for @exceptionDescriptionErpReportedPaymentVoided.
+  ///
+  /// In en, this message translates to:
+  /// **'A payment the ERP reported was voided in FeohLedger, but the ERP may still show the bill paid. FeohLedger will not pay it again until someone confirms the ERP\'s payment is undone.'**
+  String get exceptionDescriptionErpReportedPaymentVoided;
+
+  /// No description provided for @exceptionDescriptionErpPaymentWritebackFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.'**
+  String exceptionDescriptionErpPaymentWritebackFailed(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaymentWritebackFailedUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.'**
+  String get exceptionDescriptionErpPaymentWritebackFailedUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpPaymentWritebackBalanceOpen.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} recorded this invoice\'s payment, but the bill still shows {amount} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.'**
+  String exceptionDescriptionErpPaymentWritebackBalanceOpen(
+    String erp,
+    String amount,
+  );
+
+  /// No description provided for @exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP recorded this invoice\'s payment, but the bill still shows {amount} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.'**
+  String exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed(
+    String amount,
+  );
+
+  /// No description provided for @exceptionDescriptionErpPaymentVoidWritebackFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.'**
+  String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp);
+
+  /// No description provided for @exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.'**
+  String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpSyncBackFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice\'s payment settled, but FeohLedger could not finish recording it, so the invoice has not moved to Paid although the money has gone. Nothing retries this automatically: use Retry ERP sync on the payment\'s run in Payments.'**
+  String get exceptionDescriptionErpSyncBackFailed;
+
+  /// No description provided for @exceptionDescriptionExtractionFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Extraction failed: {errorClass}'**
+  String exceptionDescriptionExtractionFailed(String errorClass);
+
+  /// No description provided for @exceptionDescriptionPositivePayAlteredAmount.
+  ///
+  /// In en, this message translates to:
+  /// **'Positive Pay return: check {checkNumber} altered amount'**
+  String exceptionDescriptionPositivePayAlteredAmount(String checkNumber);
+
+  /// No description provided for @exceptionDescriptionPositivePayNotOnFile.
+  ///
+  /// In en, this message translates to:
+  /// **'Positive Pay return: check {checkNumber} not on issued file'**
+  String exceptionDescriptionPositivePayNotOnFile(String checkNumber);
+
+  /// No description provided for @exceptionDescriptionVendorBankChanged.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor bank details changed; verify before payment.'**
+  String get exceptionDescriptionVendorBankChanged;
+
+  /// No description provided for @exceptionDescriptionPayeeChangedSincePaid.
+  ///
+  /// In en, this message translates to:
+  /// **'Payee changed since this invoice was last paid; verify before paying again.'**
+  String get exceptionDescriptionPayeeChangedSincePaid;
+
+  /// No description provided for @exceptionDescriptionPayeeUnrecordedAfterMerge.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor merged since this invoice was last paid, and that payment recorded no payee; verify before paying again.'**
+  String get exceptionDescriptionPayeeUnrecordedAfterMerge;
+
+  /// No description provided for @exceptionDescriptionComplianceHoldFindings.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment held for compliance review ({count, plural, one {{count} reason} other {{count} reasons}})'**
+  String exceptionDescriptionComplianceHoldFindings(int count);
+
+  /// No description provided for @exceptionDescriptionComplianceNoScreenableVendor.
+  ///
+  /// In en, this message translates to:
+  /// **'No screenable vendor on the invoice'**
+  String get exceptionDescriptionComplianceNoScreenableVendor;
+
+  /// No description provided for @exceptionDescriptionComplianceProviderUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Sanctions screening could not run: no adapter for the configured provider “{provider}”'**
+  String exceptionDescriptionComplianceProviderUnavailable(String provider);
+
+  /// No description provided for @exceptionDescriptionComplianceReviewRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor screening via {provider} requires review ({matchedList})'**
+  String exceptionDescriptionComplianceReviewRequired(
+    String provider,
+    String matchedList,
+  );
+
+  /// No description provided for @exceptionDescriptionComplianceReviewRequiredUnlisted.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor screening via {provider} requires review (see the screening record)'**
+  String exceptionDescriptionComplianceReviewRequiredUnlisted(String provider);
+
+  /// No description provided for @exceptionDescriptionComplianceUnrecognisedResult.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor screening via {provider} returned an unrecognised result “{result}”; treated as requiring review'**
+  String exceptionDescriptionComplianceUnrecognisedResult(
+    String provider,
+    String result,
+  );
+
+  /// No description provided for @exceptionDescriptionComplianceAdverseMedia.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor screening via {provider} found adverse media (negative news); AP review required'**
+  String exceptionDescriptionComplianceAdverseMedia(String provider);
+
+  /// No description provided for @exceptionDescriptionComplianceAdverseMediaUnnamedProvider.
+  ///
+  /// In en, this message translates to:
+  /// **'Vendor screening found adverse media (negative news); AP review required'**
+  String get exceptionDescriptionComplianceAdverseMediaUnnamedProvider;
+
+  /// No description provided for @exceptionDescriptionComplianceAmlSpend.
+  ///
+  /// In en, this message translates to:
+  /// **'Trailing 12-month spend with this vendor would reach {projected} (threshold {threshold}); AP review required'**
+  String exceptionDescriptionComplianceAmlSpend(
+    String projected,
+    String threshold,
+  );
+
+  /// No description provided for @exceptionDescriptionComplianceAmlSpendPartial.
+  ///
+  /// In en, this message translates to:
+  /// **'Trailing 12-month spend with this vendor would reach at least {projected} (threshold {threshold}); AP review required. {excluded, plural, one {{excluded} payment was} other {{excluded} payments were}} left out for having no figure in the home currency, so the real total is higher'**
+  String exceptionDescriptionComplianceAmlSpendPartial(
+    String projected,
+    String threshold,
+    int excluded,
+  );
+
+  /// No description provided for @exceptionDescriptionPaymentAgedOut.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment {paymentId} was still in flight after {hours}h and the reconciler marked it failed; the rail never confirmed, so the money may or may not have moved. The invoice is “{invoiceStatus}”. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionPaymentAgedOut(
+    String paymentId,
+    String hours,
+    String invoiceStatus,
+  );
+
+  /// No description provided for @exceptionDescriptionPaymentDispatchInDoubt.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment {paymentId} failed during dispatch ({failureCode}) after the processor may already have accepted it, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionPaymentDispatchInDoubt(
+    String paymentId,
+    String failureCode,
+  );
+
+  /// No description provided for @exceptionDescriptionPaymentDispatchInterruptedFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment {paymentId} failed, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionPaymentDispatchInterruptedFailed(String paymentId);
+
+  /// No description provided for @exceptionDescriptionPaymentDispatchInterruptedCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment {paymentId} was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionPaymentDispatchInterruptedCancelled(
+    String paymentId,
+  );
+
+  /// No description provided for @exceptionDescriptionSettlementCurrencyMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved in a currency AP did not authorize — reconcile with the processor before releasing this invoice.'**
+  String exceptionDescriptionSettlementCurrencyMismatch(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+  );
+
+  /// No description provided for @exceptionDescriptionSettlementAmountOver.
+  ///
+  /// In en, this message translates to:
+  /// **'Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, MORE than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.'**
+  String exceptionDescriptionSettlementAmountOver(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+    String variance,
+  );
+
+  /// No description provided for @exceptionDescriptionSettlementAmountUnder.
+  ///
+  /// In en, this message translates to:
+  /// **'Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, LESS than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.'**
+  String exceptionDescriptionSettlementAmountUnder(
+    String settledAmount,
+    String settledCurrency,
+    String authorizedAmount,
+    String authorizedCurrency,
+    String variance,
+  );
+
   /// No description provided for @warningsPoMatchStatusMatched.
   ///
   /// In en, this message translates to:
@@ -4722,6 +5978,1241 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'PO match: {summary}'**
   String warningsPoMatchAnnouncement(String summary);
+
+  /// Coded refusal `invoice_not_in_review` (services/review.refuse_unless_in_review): the approve / reject verdict on an invoice not in ready_for_review, and a bulk approve / reject skip.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is not awaiting review, so it cannot be approved or rejected.'**
+  String get codedRefusalInvoiceNotInReview;
+
+  /// Coded refusal `invoice_bulk_not_found`: a bulk status skip for an id not found in the selected entity.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice wasn\'t found in the selected entity.'**
+  String get codedRefusalInvoiceBulkNotFound;
+
+  /// Coded refusal `invoice_status_immutable`: a bulk status skip for an invoice in an immutable status.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is {status}, so it can no longer be changed.'**
+  String codedRefusalInvoiceStatusImmutable(String status);
+
+  /// Coded refusal `invoice_recall_one_at_a_time`: a bulk move to Ready for Review of an approved invoice, which only Recall approval may do. Names the invoiceDetailRecall button.
+  ///
+  /// In en, this message translates to:
+  /// **'An approval is recalled one invoice at a time, with a reason: use Recall approval on the invoice.'**
+  String get codedRefusalInvoiceRecallOneAtATime;
+
+  /// Coded refusal `invoice_bulk_refused`: a bulk status skip for a row refused without a code of its own; status is the target status label.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice could not be changed to {status}.'**
+  String codedRefusalInvoiceBulkRefused(String status);
+
+  /// Coded refusal `invoice_required_fields_missing`: a bulk submit for review skipped for missing fields.
+  ///
+  /// In en, this message translates to:
+  /// **'Required fields missing: {fields}'**
+  String codedRefusalInvoiceRequiredFieldsMissing(String fields);
+
+  /// Coded refusal `invoice_transition_invalid`: the state machine refused the edge (a bulk status skip).
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice can\'t move from {from} to {to}.'**
+  String codedRefusalInvoiceTransitionInvalid(String from, String to);
+
+  /// Coded refusal `invoice_transition_recall_only`: the edge exists only as a recall of the approval. Names the invoiceDetailRecall button.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice can move from {from} to {to} only by recalling its approval, one invoice at a time: use Recall approval on the invoice.'**
+  String codedRefusalInvoiceTransitionRecallOnly(String from, String to);
+
+  /// Coded refusal `invoice_once_approved_not_reread`: a once-approved invoice can't be sent back to extraction (a bulk move to Pending).
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has already been approved, so its document can\'t be read again. Recall its approval and correct it instead.'**
+  String get codedRefusalInvoiceOnceApprovedNotReread;
+
+  /// Shown under a skipped invoice in the bulk status result dialog when the server gave no reason.
+  ///
+  /// In en, this message translates to:
+  /// **'No reason given'**
+  String get invoicesBulkSkipNoReason;
+
+  /// Names a skipped invoice that has no invoice number in the bulk status result dialog, instead of its internal id.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice (no number)'**
+  String get invoicesBulkSkipNoNumber;
+
+  /// One line shown (and announced) when the server's verdict on which review actions the user may take could not be read — offline, a cached approvals queue, or a failed request. Approve / Reject stay unavailable until a pull-to-refresh reads it.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t check what you can do here — pull to retry'**
+  String get reviewVerdictsUnavailable;
+
+  /// Placeholder in the invoice detail action bar while the server's verdict on Approve / Reject is loading.
+  ///
+  /// In en, this message translates to:
+  /// **'Checking what you can do here…'**
+  String get reviewVerdictsChecking;
+
+  /// Pay tab banner on a tenant whose payments FeohLedger records but never sends (GET /api/payments/execution-mode = record_only).
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger records payments but never sends them: pay from your bank or ERP, then record each one here (a run\'s bank file is on the web app).'**
+  String get payRecordOnlyBanner;
+
+  /// Record-as-paid dialog note when the queue row's erp_reported_payment pre-filled the form.
+  ///
+  /// In en, this message translates to:
+  /// **'Filled in from the payment {erp} reported. Check the details before you record it.'**
+  String payRecordPrefilledFromErp(String erp);
+
+  /// Label for the cash the ERP states was paid, beside the amount owed.
+  ///
+  /// In en, this message translates to:
+  /// **'Amount {erp} reports paid'**
+  String payRecordErpAmount(String erp);
+
+  /// Heading over the ERP's rail-by-rail payment breakdown.
+  ///
+  /// In en, this message translates to:
+  /// **'How {erp} says it was paid'**
+  String payRecordSplitTitle(String erp);
+
+  /// A breakdown part whose rail the ERP did not state (or cannot be recorded outside FeohLedger).
+  ///
+  /// In en, this message translates to:
+  /// **'Method not stated'**
+  String get payRecordRailNotStated;
+
+  /// Stands in for the method picker when the ERP's split is the record (split_stands true).
+  ///
+  /// In en, this message translates to:
+  /// **'Split across the methods above'**
+  String get payRecordSplitMethod;
+
+  /// Note under the split: the server judged it stands (decisions §413).
+  ///
+  /// In en, this message translates to:
+  /// **'This payment was made with more than one method, so it is recorded with this split. One method cannot describe it.'**
+  String get payRecordSplitStands;
+
+  /// Note under the split: judged and does not add up.
+  ///
+  /// In en, this message translates to:
+  /// **'These parts do not add up to the amount paid, so the split is not kept. The method you choose is recorded for the whole payment.'**
+  String get payRecordSplitDropped;
+
+  /// Note under the split: not judged.
+  ///
+  /// In en, this message translates to:
+  /// **'Whether this split is kept is decided when the payment is recorded. If it is not kept, the method you choose is recorded for the whole payment.'**
+  String get payRecordSplitUnjudged;
+
+  /// Queue-row button: record this invoice as paid outside FeohLedger.
+  ///
+  /// In en, this message translates to:
+  /// **'Record as paid'**
+  String get payRecordAction;
+
+  /// Screen-reader label of the queue-row Record as paid button.
+  ///
+  /// In en, this message translates to:
+  /// **'Record as paid — invoice {invoice}'**
+  String payRecordActionLabel(String invoice);
+
+  /// No description provided for @payRecordTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Record a payment made outside FeohLedger'**
+  String get payRecordTitle;
+
+  /// No description provided for @payRecordIntro.
+  ///
+  /// In en, this message translates to:
+  /// **'Use this when you have already paid the supplier from your own bank or ERP. FeohLedger records the payment and marks the invoice paid. It doesn\'t send any money.'**
+  String get payRecordIntro;
+
+  /// No description provided for @payRecordAmountOwed.
+  ///
+  /// In en, this message translates to:
+  /// **'Amount owed'**
+  String get payRecordAmountOwed;
+
+  /// No description provided for @payRecordAmountHint.
+  ///
+  /// In en, this message translates to:
+  /// **'The full amount owed is recorded, net of applied credit memos and any accepted early-payment discount still open on the paid-on date. Partial payments can\'t be recorded.'**
+  String get payRecordAmountHint;
+
+  /// No description provided for @payRecordMethod.
+  ///
+  /// In en, this message translates to:
+  /// **'How you paid'**
+  String get payRecordMethod;
+
+  /// No description provided for @payRecordReference.
+  ///
+  /// In en, this message translates to:
+  /// **'Reference'**
+  String get payRecordReference;
+
+  /// No description provided for @payRecordReferenceHint.
+  ///
+  /// In en, this message translates to:
+  /// **'The cheque number or your bank\'s confirmation number. Bank reconciliation matches on it.'**
+  String get payRecordReferenceHint;
+
+  /// No description provided for @payRecordPaidOn.
+  ///
+  /// In en, this message translates to:
+  /// **'Paid on'**
+  String get payRecordPaidOn;
+
+  /// No description provided for @payRecordSubmit.
+  ///
+  /// In en, this message translates to:
+  /// **'Record as paid'**
+  String get payRecordSubmit;
+
+  /// No description provided for @payRecordSubmitting.
+  ///
+  /// In en, this message translates to:
+  /// **'Recording…'**
+  String get payRecordSubmitting;
+
+  /// No description provided for @payRecordRecorded.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice {invoice} recorded as paid'**
+  String payRecordRecorded(String invoice);
+
+  /// No description provided for @payRecordFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not record the payment'**
+  String get payRecordFailed;
+
+  /// Fallback reason a queue row cannot be recorded as paid, when its refusal code is unknown to this build.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice can\'t be recorded as paid yet.'**
+  String get payRecordUnavailable;
+
+  /// No description provided for @payMethodBacs.
+  ///
+  /// In en, this message translates to:
+  /// **'BACS'**
+  String get payMethodBacs;
+
+  /// No description provided for @payMethodFasterPayments.
+  ///
+  /// In en, this message translates to:
+  /// **'Faster Payments'**
+  String get payMethodFasterPayments;
+
+  /// No description provided for @payMethodChaps.
+  ///
+  /// In en, this message translates to:
+  /// **'CHAPS'**
+  String get payMethodChaps;
+
+  /// A payment card used outside FeohLedger's own card programme.
+  ///
+  /// In en, this message translates to:
+  /// **'Card (outside FeohLedger)'**
+  String get payMethodCardOutside;
+
+  /// Run menu item: record the whole run as paid outside FeohLedger.
+  ///
+  /// In en, this message translates to:
+  /// **'Record run as paid…'**
+  String get payRunActionRecord;
+
+  /// No description provided for @payRunRecordTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Record run as paid'**
+  String get payRunRecordTitle;
+
+  /// No description provided for @payRunRecordIntro.
+  ///
+  /// In en, this message translates to:
+  /// **'Once your bank has taken the payments, record them here. Every payment in the run is marked completed and its invoice paid. Nothing is sent.'**
+  String get payRunRecordIntro;
+
+  /// No description provided for @payRunRecordReference.
+  ///
+  /// In en, this message translates to:
+  /// **'Bank batch reference'**
+  String get payRunRecordReference;
+
+  /// No description provided for @payRunRecordReferenceHint.
+  ///
+  /// In en, this message translates to:
+  /// **'The confirmation number your bank gave the batch. Bank reconciliation matches on it.'**
+  String get payRunRecordReferenceHint;
+
+  /// No description provided for @payRunRecordSubmit.
+  ///
+  /// In en, this message translates to:
+  /// **'Record as paid · {amount}'**
+  String payRunRecordSubmit(String amount);
+
+  /// No description provided for @payRunRecordRecorded.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} payment recorded as paid} other {{count} payments recorded as paid}}'**
+  String payRunRecordRecorded(int count);
+
+  /// No description provided for @payRunRecordFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not record the run'**
+  String get payRunRecordFailed;
+
+  /// No description provided for @payRunRecordLoadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to load payment run'**
+  String get payRunRecordLoadFailed;
+
+  /// Payment-run status: its bank (NACHA) file was downloaded and it awaits recording.
+  ///
+  /// In en, this message translates to:
+  /// **'Exported'**
+  String get payRunStatusExported;
+
+  /// No description provided for @codedRefusalPaymentsRecordOnly.
+  ///
+  /// In en, this message translates to:
+  /// **'FeohLedger does not send payments for this organization. Pay the supplier from your bank or ERP, then record the payment as paid outside FeohLedger.'**
+  String get codedRefusalPaymentsRecordOnly;
+
+  /// No description provided for @codedRefusalExternalPaymentForInvoice.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice {invoice}: {reason}'**
+  String codedRefusalExternalPaymentForInvoice(String invoice, String reason);
+
+  /// No description provided for @codedRefusalExternalPaymentNotPayable.
+  ///
+  /// In en, this message translates to:
+  /// **'Only an approved invoice that has not been paid can be recorded as paid (this one is {status}).'**
+  String codedRefusalExternalPaymentNotPayable(String status);
+
+  /// No description provided for @codedRefusalExternalPaymentSegregation.
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: you created or shaped this invoice, so a different user must record its payment.'**
+  String get codedRefusalExternalPaymentSegregation;
+
+  /// No description provided for @codedRefusalExternalPaymentCardLive.
+  ///
+  /// In en, this message translates to:
+  /// **'A live virtual card is issued against this invoice. Cancel the card before recording a payment made another way.'**
+  String get codedRefusalExternalPaymentCardLive;
+
+  /// No description provided for @codedRefusalExternalPaymentCreditConflict.
+  ///
+  /// In en, this message translates to:
+  /// **'An applied credit memo no longer matches this invoice\'s vendor or currency, so the amount owed can\'t be stated. Correct the invoice first.'**
+  String get codedRefusalExternalPaymentCreditConflict;
+
+  /// No description provided for @codedRefusalExternalPaymentNothingToPay.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is fully covered by applied credit memos, so there is nothing to record as paid.'**
+  String get codedRefusalExternalPaymentNothingToPay;
+
+  /// No description provided for @codedRefusalExternalPaymentPaymentLive.
+  ///
+  /// In en, this message translates to:
+  /// **'A payment for this invoice is already in progress or settled ({status}). Void it before recording a payment made another way.'**
+  String codedRefusalExternalPaymentPaymentLive(String status);
+
+  /// No description provided for @codedRefusalExternalPaymentInRun.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is in payment run {run}. Record the whole run as paid outside FeohLedger, or cancel the run first.'**
+  String codedRefusalExternalPaymentInRun(String run);
+
+  /// No description provided for @codedRefusalExternalPaymentAmountMismatch.
+  ///
+  /// In en, this message translates to:
+  /// **'The amount must equal what the invoice owes ({amount}), net of applied credit memos and any accepted early-payment discount. Partial payments can\'t be recorded.'**
+  String codedRefusalExternalPaymentAmountMismatch(String amount);
+
+  /// No description provided for @codedRefusalExternalPaymentAmountChanged.
+  ///
+  /// In en, this message translates to:
+  /// **'What this invoice owes has changed since the run was staged ({staged} staged, {amount} owed now) because of a credit memo or an early-payment discount. Resolve the difference with the supplier, then record the invoice on its own.'**
+  String codedRefusalExternalPaymentAmountChanged(String staged, String amount);
+
+  /// No description provided for @codedRefusalExternalPaymentErpSplit.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP reports this invoice paid with more than one payment method. Record it from its exception, which keeps how the payment was split.'**
+  String get codedRefusalExternalPaymentErpSplit;
+
+  /// No description provided for @codedRefusalExternalPaymentErpSplitInRun.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is in payment run {run}, and the ERP reports it paid with more than one payment method, which only its exception can record. Cancel the run first, then record the invoice from its exception.'**
+  String codedRefusalExternalPaymentErpSplitInRun(String run);
+
+  /// No description provided for @codedRefusalExternalPaymentPaidOnFuture.
+  ///
+  /// In en, this message translates to:
+  /// **'The paid-on date can\'t be in the future.'**
+  String get codedRefusalExternalPaymentPaidOnFuture;
+
+  /// No description provided for @codedRefusalPaymentRunSegregation.
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: the user who created this payment run cannot also approve or execute it. A different user must.'**
+  String get codedRefusalPaymentRunSegregation;
+
+  /// No description provided for @codedRefusalPaymentRunSegregationRecord.
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: the user who created this payment run cannot also record it as paid. A different user must.'**
+  String get codedRefusalPaymentRunSegregationRecord;
+
+  /// No description provided for @codedRefusalPaymentRunSegregationExport.
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: the user who created this payment run cannot also export its bank file. A different user must.'**
+  String get codedRefusalPaymentRunSegregationExport;
+
+  /// No description provided for @codedRefusalPaymentRunAwaitingCfo.
+  ///
+  /// In en, this message translates to:
+  /// **'This run exceeds the organization\'s CFO-approval threshold and is awaiting sign-off from a user with the CFO role.'**
+  String get codedRefusalPaymentRunAwaitingCfo;
+
+  /// No description provided for @codedRefusalMfaCodeInvalid.
+  ///
+  /// In en, this message translates to:
+  /// **'That code is not valid. Check your authenticator app and try again.'**
+  String get codedRefusalMfaCodeInvalid;
+
+  /// No description provided for @codedRefusalMfaEmailCodeInvalid.
+  ///
+  /// In en, this message translates to:
+  /// **'That code is not valid or has expired. Request a new code and try again.'**
+  String get codedRefusalMfaEmailCodeInvalid;
+
+  /// No description provided for @codedRefusalPaymentRunNotRecordable.
+  ///
+  /// In en, this message translates to:
+  /// **'Only a draft run, or one whose bank file was exported, can be recorded as paid.'**
+  String get codedRefusalPaymentRunNotRecordable;
+
+  /// No description provided for @codedRefusalPaymentRunNothingToRecord.
+  ///
+  /// In en, this message translates to:
+  /// **'This run has no payments left to record.'**
+  String get codedRefusalPaymentRunNothingToRecord;
+
+  /// The type is not named here: the queue row's blocked chip already names it.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has an unresolved payment-blocking exception. Resolve it before recording the invoice as paid.'**
+  String get codedRefusalExternalPaymentBlockingException;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.title`.
+  ///
+  /// In en, this message translates to:
+  /// **'Record goods receipt'**
+  String get grRecordTitle;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.intro`.
+  ///
+  /// In en, this message translates to:
+  /// **'Record what arrived against a purchase order. Invoices that quote the PO are matched again as soon as you save.'**
+  String get grRecordIntro;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.searchPo`.
+  ///
+  /// In en, this message translates to:
+  /// **'Find PO'**
+  String get grRecordSearchPo;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.searchPlaceholder`.
+  ///
+  /// In en, this message translates to:
+  /// **'PO number'**
+  String get grRecordSearchPlaceholder;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.po`.
+  ///
+  /// In en, this message translates to:
+  /// **'Purchase order'**
+  String get grRecordPo;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.noPos`.
+  ///
+  /// In en, this message translates to:
+  /// **'No matching purchase orders'**
+  String get grRecordNoPos;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.loadPosFailed`.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to load purchase orders'**
+  String get grRecordLoadPosFailed;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.loadPoFailed`.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to load the purchase order'**
+  String get grRecordLoadPoFailed;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.poCancelled`.
+  ///
+  /// In en, this message translates to:
+  /// **'Purchase order {number} is cancelled, so nothing can be received against it.'**
+  String grRecordPoCancelled(String number);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.ordered`.
+  ///
+  /// In en, this message translates to:
+  /// **'Ordered'**
+  String get grRecordOrdered;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.alreadyReceived`.
+  ///
+  /// In en, this message translates to:
+  /// **'Received so far'**
+  String get grRecordAlreadyReceived;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.outstanding`.
+  ///
+  /// In en, this message translates to:
+  /// **'Outstanding'**
+  String get grRecordOutstanding;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.thisDelivery`.
+  ///
+  /// In en, this message translates to:
+  /// **'This delivery'**
+  String get grRecordThisDelivery;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.quantityFor`.
+  ///
+  /// In en, this message translates to:
+  /// **'Quantity received for {line}'**
+  String grRecordQuantityFor(String line);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.overReceipt`.
+  ///
+  /// In en, this message translates to:
+  /// **'More than is outstanding. Matching will flag this as an over-receipt.'**
+  String get grRecordOverReceipt;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.linesHint`.
+  ///
+  /// In en, this message translates to:
+  /// **'Leave a line blank if it wasn\'t part of this delivery. Enter 0 to record that it was expected but didn\'t arrive.'**
+  String get grRecordLinesHint;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.noPoLines`.
+  ///
+  /// In en, this message translates to:
+  /// **'This purchase order has no lines, so describe what arrived.'**
+  String get grRecordNoPoLines;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.addLine`.
+  ///
+  /// In en, this message translates to:
+  /// **'Add line'**
+  String get grRecordAddLine;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.removeLine`.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove line {n}'**
+  String grRecordRemoveLine(int n);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.lineDescription`.
+  ///
+  /// In en, this message translates to:
+  /// **'Description, line {n}'**
+  String grRecordLineDescription(int n);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.lineQuantity`.
+  ///
+  /// In en, this message translates to:
+  /// **'Quantity received, line {n}'**
+  String grRecordLineQuantity(int n);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.receivedDate`.
+  ///
+  /// In en, this message translates to:
+  /// **'Received on'**
+  String get grRecordReceivedDate;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.number`.
+  ///
+  /// In en, this message translates to:
+  /// **'Delivery note number'**
+  String get grRecordNumber;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.numberHint`.
+  ///
+  /// In en, this message translates to:
+  /// **'Optional. The supplier\'s packing slip or delivery note number.'**
+  String get grRecordNumberHint;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.numberPlaceholder`.
+  ///
+  /// In en, this message translates to:
+  /// **'Blank: GR-{po}-n'**
+  String grRecordNumberPlaceholder(String po);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.saving`.
+  ///
+  /// In en, this message translates to:
+  /// **'Recording…'**
+  String get grRecordSaving;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.submit`.
+  ///
+  /// In en, this message translates to:
+  /// **'Record receipt'**
+  String get grRecordSubmit;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.toast.recorded`.
+  ///
+  /// In en, this message translates to:
+  /// **'Recorded goods receipt {number}'**
+  String grRecordRecorded(String number);
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.toast.recordFailed`.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to record the goods receipt'**
+  String get grRecordFailed;
+
+  /// Goods-receipt record form; mirrors web `goodsReceipts.record.action`.
+  ///
+  /// In en, this message translates to:
+  /// **'Record receipt'**
+  String get settingsGoodsReceipt;
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptPoCancelled`.
+  ///
+  /// In en, this message translates to:
+  /// **'Purchase order {poNumber} is cancelled; nothing can be received against it.'**
+  String codedRefusalGoodsReceiptPoCancelled(String poNumber);
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptNumberTaken`.
+  ///
+  /// In en, this message translates to:
+  /// **'A goods receipt numbered {grNumber} already exists.'**
+  String codedRefusalGoodsReceiptNumberTaken(String grNumber);
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptLineNotOnPo`.
+  ///
+  /// In en, this message translates to:
+  /// **'Every received line must be one of this purchase order\'s lines.'**
+  String get codedRefusalGoodsReceiptLineNotOnPo;
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptLineDuplicated`.
+  ///
+  /// In en, this message translates to:
+  /// **'A purchase-order line can appear only once on a receipt.'**
+  String get codedRefusalGoodsReceiptLineDuplicated;
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptLineRequired`.
+  ///
+  /// In en, this message translates to:
+  /// **'Describe what was received on each line.'**
+  String get codedRefusalGoodsReceiptLineRequired;
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptNothingReceived`.
+  ///
+  /// In en, this message translates to:
+  /// **'A receipt must record at least one unit received.'**
+  String get codedRefusalGoodsReceiptNothingReceived;
+
+  /// Goods-receipt record form; mirrors web `refusal.goodsReceiptIdempotencyReused`.
+  ///
+  /// In en, this message translates to:
+  /// **'This request was already used for a different purchase order. Reopen the form and try again.'**
+  String get codedRefusalGoodsReceiptIdempotencyReused;
+
+  /// Settings → Procurement: subtitle of the record-goods-receipt entry.
+  ///
+  /// In en, this message translates to:
+  /// **'Count a delivery in against a purchase order'**
+  String get settingsGoodsReceiptHint;
+
+  /// Note on the goods-receipt form: the receiver may not approve invoices on this PO (backend decisions §267, §389).
+  ///
+  /// In en, this message translates to:
+  /// **'Segregation of duties: once you record this receipt, you can\'t approve an invoice billed against this purchase order, and a receipt you record after approving one doesn\'t release it.'**
+  String get grRecordSegregationNote;
+
+  /// Goods-receipt form: shown when submit is tried with no positive quantity on any line.
+  ///
+  /// In en, this message translates to:
+  /// **'Enter a quantity on at least one line'**
+  String get grRecordReceiveLines;
+
+  /// No description provided for @listShowingSavedCopy.
+  ///
+  /// In en, this message translates to:
+  /// **'Showing a saved copy — couldn\'t reach the server. Tap Retry to try again.'**
+  String get listShowingSavedCopy;
+
+  /// No description provided for @listRefreshFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t refresh — showing the last list loaded. Tap Retry to try again.'**
+  String get listRefreshFailed;
+
+  /// Exceptions list first-load failure carrying the server's own reason (a 403 / 500 detail). A connection failure uses commonLoadErrorConnection instead.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t load exceptions: {error}'**
+  String exceptionsLoadErrorPrefix(String error);
+
+  /// Contracts list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t load contracts: {error}'**
+  String contractsLoadErrorPrefix(String error);
+
+  /// A store's error text when the request never reached the server (offline, DNS, timeout, TLS).
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t reach the server. Check your connection and try again.'**
+  String get errorNetworkUnreachable;
+
+  /// A store's error text when the server refused without a sentence of its own.
+  ///
+  /// In en, this message translates to:
+  /// **'The server couldn\'t complete the request (HTTP {status}).'**
+  String errorRequestFailed(int status);
+
+  /// A store's error text for a failure that is neither a server refusal nor a network fault (an unreadable reply).
+  ///
+  /// In en, this message translates to:
+  /// **'Something went wrong. Please try again.'**
+  String get errorUnexpected;
+
+  /// Run-created toast. `cfo` is `required` when the run trips the CFO approval threshold, else `none`.
+  ///
+  /// In en, this message translates to:
+  /// **'{cfo, select, required{{count, plural, one{Payment run created with {count} payment totalling {amount}. CFO approval is required before it can be executed.} other{Payment run created with {count} payments totalling {amount}. CFO approval is required before it can be executed.}}} other{{count, plural, one{Payment run created with {count} payment totalling {amount}.} other{Payment run created with {count} payments totalling {amount}.}}}}'**
+  String payRunCreated(int count, String amount, String cfo);
+
+  /// Run-created toast when the reply carries no count or total. `cfo` as in payRunCreated.
+  ///
+  /// In en, this message translates to:
+  /// **'{cfo, select, required{Payment run created. CFO approval is required before it can be executed.} other{Payment run created.}}'**
+  String payRunCreatedPlain(String cfo);
+
+  /// No description provided for @payRunApproved.
+  ///
+  /// In en, this message translates to:
+  /// **'Run approved by CFO'**
+  String get payRunApproved;
+
+  /// Run-executed toast. `provider` is the payment adapter's name, as the server reports it.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment run executed via {provider}: {completed, plural, one{{completed} completed} other{{completed} completed}}, {inFlight, plural, one{{inFlight} in flight} other{{inFlight} in flight}}, {failed, plural, one{{failed} failed} other{{failed} failed}}.'**
+  String payRunExecuted(
+    String provider,
+    int completed,
+    int inFlight,
+    int failed,
+  );
+
+  /// No description provided for @payRunExecutedPlain.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment run executed.'**
+  String get payRunExecutedPlain;
+
+  /// No description provided for @payRunExecutedCards.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} virtual card issued.} other {{count} virtual cards issued.}}'**
+  String payRunExecutedCards(int count);
+
+  /// No description provided for @payRunCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {Draft run cancelled; {count} invoice returned to the queue.} other {Draft run cancelled; {count} invoices returned to the queue.}}'**
+  String payRunCancelled(int count);
+
+  /// No description provided for @payRunCancelledPlain.
+  ///
+  /// In en, this message translates to:
+  /// **'Payment run cancelled.'**
+  String get payRunCancelledPlain;
+
+  /// No description provided for @vendorSyncSummary.
+  ///
+  /// In en, this message translates to:
+  /// **'Synced {created, plural, one{{created} new} other{{created} new}}, {updated, plural, one{{updated} updated} other{{updated} updated}}, {unchanged, plural, one{{unchanged} unchanged} other{{unchanged} unchanged}}.'**
+  String vendorSyncSummary(int created, int updated, int unchanged);
+
+  /// No description provided for @vendorSyncComplete.
+  ///
+  /// In en, this message translates to:
+  /// **'ERP sync complete.'**
+  String get vendorSyncComplete;
+
+  /// No description provided for @vendorSyncNotLinked.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one{{count} not linked (the name matches more than one vendor).} other{{count} not linked (the name matches more than one vendor).}}'**
+  String vendorSyncNotLinked(int count);
+
+  /// No description provided for @vendorSyncUnlinked.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one{{count} unlinked (linked under another ERP company).} other{{count} unlinked (linked under another ERP company).}}'**
+  String vendorSyncUnlinked(int count);
+
+  /// No description provided for @vendorSyncRelinked.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one{{count} relinked (linked when this ERP company was connected before).} other{{count} relinked (linked when this ERP company was connected before).}}'**
+  String vendorSyncRelinked(int count);
+
+  /// No description provided for @authInvalidCredentials.
+  ///
+  /// In en, this message translates to:
+  /// **'Invalid credentials'**
+  String get authInvalidCredentials;
+
+  /// No description provided for @authInvalidCode.
+  ///
+  /// In en, this message translates to:
+  /// **'Invalid or expired code. Please try again.'**
+  String get authInvalidCode;
+
+  /// No description provided for @authVerifyCodeFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not verify the code. Please try again.'**
+  String get authVerifyCodeFailed;
+
+  /// No description provided for @authEmailCodeFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not send the email code. Please try again.'**
+  String get authEmailCodeFailed;
+
+  /// Exceptions list: the status chip filters every row out. `status` is the chip's API value.
+  ///
+  /// In en, this message translates to:
+  /// **'{status, select, open{No open exceptions} escalated{No escalated exceptions} resolved{No resolved exceptions} dismissed{No dismissed exceptions} other{No matching exceptions}}'**
+  String exceptionsFilteredEmpty(String status);
+
+  /// Contracts list: the search query or status chip filters every row out.
+  ///
+  /// In en, this message translates to:
+  /// **'No contracts match your search or filter.'**
+  String get contractsFilteredEmpty;
+
+  /// Vendors list: the search query or status chip filters every row out.
+  ///
+  /// In en, this message translates to:
+  /// **'No vendors match your search or filter.'**
+  String get vendorsFilteredEmpty;
+
+  /// Action on a filtered-to-zero list that clears the filter / search.
+  ///
+  /// In en, this message translates to:
+  /// **'Show all'**
+  String get commonShowAll;
+
+  /// Button under a paged list that reads its next page.
+  ///
+  /// In en, this message translates to:
+  /// **'Load more'**
+  String get listLoadMore;
+
+  /// Footer of a paged list while more rows exist on the server: rows shown of the server's total. Announced as a live region.
+  ///
+  /// In en, this message translates to:
+  /// **'Showing {shown} of {total}'**
+  String listShowingCount(int shown, int total);
+
+  /// Footer of a paged list once every row is loaded; count is the server's total.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {Showing the only item} other {Showing all {count}}}'**
+  String listShowingAll(int count);
+
+  /// Footer of a paged list when reading the next page failed; the rows shown are still live and Load more retries.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t load more.'**
+  String get listLoadMoreFailed;
+
+  /// Invoices list first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t load invoices: {error}'**
+  String invoicesLoadErrorPrefix(String error);
+
+  /// Approvals queue first-load failure carrying the server's own reason. A connection failure uses commonLoadErrorConnection instead.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not load pending approvals: {error}'**
+  String approvalsLoadErrorPrefix(String error);
+
+  /// Invoices list: a status chip, search or advanced filter leaves no rows.
+  ///
+  /// In en, this message translates to:
+  /// **'No invoices match these filters'**
+  String get invoicesFilteredEmpty;
+
+  /// Screen-reader announcement for a status pill, e.g. 'Status: Approved'.
+  ///
+  /// In en, this message translates to:
+  /// **'Status: {label}'**
+  String statusPillAnnounce(String label);
+
+  /// Vendor lifecycle status.
+  ///
+  /// In en, this message translates to:
+  /// **'Active'**
+  String get vendorStatusActive;
+
+  /// No description provided for @vendorStatusUnverified.
+  ///
+  /// In en, this message translates to:
+  /// **'Unverified'**
+  String get vendorStatusUnverified;
+
+  /// No description provided for @vendorStatusInactive.
+  ///
+  /// In en, this message translates to:
+  /// **'Inactive'**
+  String get vendorStatusInactive;
+
+  /// No description provided for @vendorStatusRejected.
+  ///
+  /// In en, this message translates to:
+  /// **'Rejected'**
+  String get vendorStatusRejected;
+
+  /// Contract lifecycle status.
+  ///
+  /// In en, this message translates to:
+  /// **'Draft'**
+  String get contractStatusDraft;
+
+  /// No description provided for @contractStatusActive.
+  ///
+  /// In en, this message translates to:
+  /// **'Active'**
+  String get contractStatusActive;
+
+  /// No description provided for @contractStatusExpired.
+  ///
+  /// In en, this message translates to:
+  /// **'Expired'**
+  String get contractStatusExpired;
+
+  /// No description provided for @contractStatusTerminated.
+  ///
+  /// In en, this message translates to:
+  /// **'Terminated'**
+  String get contractStatusTerminated;
+
+  /// No description provided for @contractStatusCancelled.
+  ///
+  /// In en, this message translates to:
+  /// **'Cancelled'**
+  String get contractStatusCancelled;
+
+  /// Contract type.
+  ///
+  /// In en, this message translates to:
+  /// **'Purchase'**
+  String get contractTypePurchase;
+
+  /// No description provided for @contractTypeService.
+  ///
+  /// In en, this message translates to:
+  /// **'Service'**
+  String get contractTypeService;
+
+  /// No description provided for @contractTypeSubscription.
+  ///
+  /// In en, this message translates to:
+  /// **'Subscription'**
+  String get contractTypeSubscription;
+
+  /// No description provided for @contractTypeLease.
+  ///
+  /// In en, this message translates to:
+  /// **'Lease'**
+  String get contractTypeLease;
+
+  /// Service-level agreement; keep the acronym where the market uses it.
+  ///
+  /// In en, this message translates to:
+  /// **'SLA'**
+  String get contractTypeSla;
+
+  /// Master services agreement.
+  ///
+  /// In en, this message translates to:
+  /// **'MSA'**
+  String get contractTypeMsa;
+
+  /// Statement of work.
+  ///
+  /// In en, this message translates to:
+  /// **'SOW'**
+  String get contractTypeSow;
+
+  /// No description provided for @contractTypeOther.
+  ///
+  /// In en, this message translates to:
+  /// **'Other'**
+  String get contractTypeOther;
+
+  /// Exception-queue status.
+  ///
+  /// In en, this message translates to:
+  /// **'Open'**
+  String get exceptionStatusOpen;
+
+  /// No description provided for @exceptionStatusEscalated.
+  ///
+  /// In en, this message translates to:
+  /// **'Escalated'**
+  String get exceptionStatusEscalated;
+
+  /// No description provided for @exceptionStatusResolved.
+  ///
+  /// In en, this message translates to:
+  /// **'Resolved'**
+  String get exceptionStatusResolved;
+
+  /// No description provided for @exceptionStatusDismissed.
+  ///
+  /// In en, this message translates to:
+  /// **'Dismissed'**
+  String get exceptionStatusDismissed;
+
+  /// Exception severity.
+  ///
+  /// In en, this message translates to:
+  /// **'Error'**
+  String get exceptionSeverityError;
+
+  /// No description provided for @exceptionSeverityWarning.
+  ///
+  /// In en, this message translates to:
+  /// **'Warning'**
+  String get exceptionSeverityWarning;
+
+  /// No description provided for @exceptionSeverityInfo.
+  ///
+  /// In en, this message translates to:
+  /// **'Info'**
+  String get exceptionSeverityInfo;
+
+  /// Where a vendor record came from: synced from the ERP.
+  ///
+  /// In en, this message translates to:
+  /// **'ERP'**
+  String get vendorSourceErp;
+
+  /// Vendor record created by AI extraction.
+  ///
+  /// In en, this message translates to:
+  /// **'AI'**
+  String get vendorSourceAi;
+
+  /// Vendor record entered by hand.
+  ///
+  /// In en, this message translates to:
+  /// **'Manual'**
+  String get vendorSourceManual;
+
+  /// Vendor source the app does not recognise.
+  ///
+  /// In en, this message translates to:
+  /// **'Other source'**
+  String get vendorSourceOther;
+
+  /// Notification event type.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice assigned'**
+  String get notificationEventInvoiceAssigned;
+
+  /// No description provided for @notificationEventInvoiceApproved.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice approved'**
+  String get notificationEventInvoiceApproved;
+
+  /// No description provided for @notificationEventInvoiceRejected.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice rejected'**
+  String get notificationEventInvoiceRejected;
+
+  /// No description provided for @notificationEventInvoicePaid.
+  ///
+  /// In en, this message translates to:
+  /// **'Invoice paid'**
+  String get notificationEventInvoicePaid;
+
+  /// No description provided for @notificationEventContractRenewalDue.
+  ///
+  /// In en, this message translates to:
+  /// **'Contract renewal due'**
+  String get notificationEventContractRenewalDue;
+
+  /// No description provided for @notificationEventChatMessage.
+  ///
+  /// In en, this message translates to:
+  /// **'New message'**
+  String get notificationEventChatMessage;
+
+  /// An event type this app version does not know.
+  ///
+  /// In en, this message translates to:
+  /// **'Notification'**
+  String get notificationEventOther;
+
+  /// Announced first on an unread notification row.
+  ///
+  /// In en, this message translates to:
+  /// **'Unread'**
+  String get notificationUnread;
+
+  /// Notification age under a minute.
+  ///
+  /// In en, this message translates to:
+  /// **'just now'**
+  String get relativeTimeJustNow;
+
+  /// Notification age in minutes.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} minute ago} other {{count} minutes ago}}'**
+  String relativeTimeMinutesAgo(int count);
+
+  /// Notification age in hours.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} hour ago} other {{count} hours ago}}'**
+  String relativeTimeHoursAgo(int count);
+
+  /// Notification age in days (under a week).
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} day ago} other {{count} days ago}}'**
+  String relativeTimeDaysAgo(int count);
+
+  /// Bell button announcement carrying the live unread count.
+  ///
+  /// In en, this message translates to:
+  /// **'Notifications, {count} unread'**
+  String notificationBellUnread(int count);
+
+  /// App-bar action that opens the cash-flow forecast.
+  ///
+  /// In en, this message translates to:
+  /// **'Cash flow forecast'**
+  String get cashFlowButtonLabel;
+
+  /// Row announcement prefix in multi-select mode.
+  ///
+  /// In en, this message translates to:
+  /// **'Selected'**
+  String get listRowSelected;
+
+  /// No description provided for @listRowNotSelected.
+  ///
+  /// In en, this message translates to:
+  /// **'Not selected'**
+  String get listRowNotSelected;
+
+  /// Row announcement fragment naming an invoice number.
+  ///
+  /// In en, this message translates to:
+  /// **'invoice {number}'**
+  String listRowInvoiceNumber(String number);
+
+  /// Row announcement fragment: due date not yet passed.
+  ///
+  /// In en, this message translates to:
+  /// **'due {date}'**
+  String listRowDue(String date);
+
+  /// Row announcement fragment: due date already passed.
+  ///
+  /// In en, this message translates to:
+  /// **'past due {date}'**
+  String listRowPastDue(String date);
+
+  /// Exception row announcement fragment, e.g. 'Error severity'.
+  ///
+  /// In en, this message translates to:
+  /// **'{severity} severity'**
+  String listRowSeverity(String severity);
+
+  /// Exception row flag: past its SLA.
+  ///
+  /// In en, this message translates to:
+  /// **'Overdue'**
+  String get listRowOverdue;
+
+  /// Contract row announcement fragment.
+  ///
+  /// In en, this message translates to:
+  /// **'contract {number}'**
+  String listRowContractNumber(String number);
+
+  /// Contract row announcement fragment: end date.
+  ///
+  /// In en, this message translates to:
+  /// **'ends {date}'**
+  String listRowEnds(String date);
+
+  /// Vendor row announcement fragment.
+  ///
+  /// In en, this message translates to:
+  /// **'code {code}'**
+  String listRowVendorCode(String code);
+
+  /// Vendor row announcement fragment: where the record came from.
+  ///
+  /// In en, this message translates to:
+  /// **'source {source}'**
+  String listRowVendorSource(String source);
+
+  /// Vendor row announcement: how many invoices it has.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} invoice} other {{count} invoices}}'**
+  String listRowInvoiceCount(int count);
+
+  /// Compact invoice count shown on a vendor row.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, one {{count} inv} other {{count} inv}}'**
+  String listRowInvoiceCountShort(int count);
 }
 
 class _AppLocalizationsDelegate

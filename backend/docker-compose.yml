@@ -19,7 +19,7 @@ services:
     # is safe — the image is binary-compatible with the same data directory.
     # The `-pg16` suffix is what holds the Postgres major: Dependabot only
     # proposes tags of the same shape, and a major is a data-directory upgrade.
-    image: pgvector/pgvector:0.8.7-pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
+    image: pgvector/pgvector:0.8.7-pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -30,13 +30,18 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./init-tenants.sql:/docker-entrypoint-initdb.d/02-tenants.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # Over TCP, not the socket: on a fresh volume the entrypoint runs a
+      # temporary socket-only server for initdb (and init-tenants.sql), which
+      # socket-form `pg_isready` reports ready, so the first client met "the
+      # database system is shutting down". Same as deploy/compose.prod.yml;
+      # tests/test_postgres_healthchecks.py keeps every probe this way.
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
-    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     ports:
       - "6379:6379"
     healthcheck:
@@ -79,7 +84,7 @@ services:
   # (feohledger-app) and two test users (demo@acme.com, newhire@acme.com),
   # both password `demo`.
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8.1@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
+    image: quay.io/keycloak/keycloak:26.8.2@sha256:7e66a96e4739239070aeaf72e4c5decf0f7f682cfc725b9f7ea2b336eaba38b3
     profiles: ["idp"]
     command: ["start-dev", "--import-realm"]
     environment:
@@ -109,7 +114,7 @@ services:
   # up with `pnpm idp:up`, then `pnpm scim:seed` sets the matching token on the
   # acme tenant. Full walkthrough: ../../docs/local-sso-keycloak.md § Authentik.
   authentik-postgres:
-    image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    image: postgres:16.15-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     profiles: ["idp"]
     environment:
       POSTGRES_USER: authentik
@@ -118,13 +123,14 @@ services:
     volumes:
       - authentik-pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U authentik"]
+      # TCP for the same reason as `postgres` above.
+      test: ["CMD-SHELL", "pg_isready -U authentik -h 127.0.0.1"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   authentik-redis:
-    image: redis:7.4.11-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     profiles: ["idp"]
     command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
     healthcheck:
@@ -134,7 +140,7 @@ services:
       retries: 10
 
   authentik-server:
-    image: ghcr.io/goauthentik/server:2026.8.4@sha256:e7226ae116dac5aa0a5643803e735b010038f492c401e08e16b3bf1ac54c090c
+    image: ghcr.io/goauthentik/server:2026.8.6@sha256:da89d8338a3b1889800eb033fd61f8d43f7aa9a1c5a042cb5e03d891b1f0c56c
     profiles: ["idp"]
     command: server
     environment:
@@ -171,7 +177,7 @@ services:
       start_period: 60s
 
   authentik-worker:
-    image: ghcr.io/goauthentik/server:2026.8.4@sha256:e7226ae116dac5aa0a5643803e735b010038f492c401e08e16b3bf1ac54c090c
+    image: ghcr.io/goauthentik/server:2026.8.6@sha256:da89d8338a3b1889800eb033fd61f8d43f7aa9a1c5a042cb5e03d891b1f0c56c
     profiles: ["idp"]
     command: worker
     environment:
@@ -240,7 +246,7 @@ services:
   # the deploy block for NVIDIA GPU (needs nvidia-container-toolkit).
   # See backend/docs/local-ai-testing.md.
   ollama:
-    image: ollama/ollama:0.40.5@sha256:5d3a2f25f9825628daba94dc0b1d421c7d57d6c03ae5faa9ba050e058bab8241
+    image: ollama/ollama:0.40.16@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
     profiles: ["ai"]
     ports:
       - "11435:11434"
@@ -315,7 +321,7 @@ services:
   # instead of the real internet — view rendered HTML at http://localhost:8025.
   # Opt-in under the `mail` profile (`pnpm mail:up`). Captures only; never relays.
   mailpit:
-    image: axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
+    image: axllent/mailpit:v1.33.1@sha256:aef2aacc11f075ec0fb6874275ee4a421e688e11a96ebb296134d1735c7761ce
     profiles: ["mail"]
     ports:
       - "1025:1025"   # SMTP — FEOH_SMTP_PORT

@@ -9,8 +9,12 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import FieldWarning from '#lib/components/ui/FieldWarning.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { planCodeLabel } from '#lib/types/planFeatures.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
+	import { formatDate } from '#lib/utils/time.ts';
 	import { accentStrongContrast } from '#lib/stores/brandTheme.ts';
 	import { formatRatio, WCAG_AA_NORMAL } from '#lib/a11y/contrast.ts';
 	import {
@@ -228,8 +232,8 @@
 	let provSlug = $state('');
 	let provEmail = $state('');
 	let provisioning = $state(false);
-	// The temp credential is returned exactly once — held only until the result
-	// dialog is dismissed, then dropped (never re-fetchable).
+	// The new child, and whether its admin was emailed their set-password link.
+	// No credential ever reaches the partner (decisions §283).
 	let provisioned = $state<ProvisionedChild | null>(null);
 
 	const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
@@ -273,16 +277,6 @@
 		}
 	}
 
-	async function copyTempPassword() {
-		if (!provisioned) return;
-		try {
-			await navigator.clipboard.writeText(provisioned.temp_password);
-			toast(m('admin.partner.toast.passwordCopied'), 'success');
-		} catch {
-			toast(m('admin.partner.toast.passwordCopyFailed'), 'error');
-		}
-	}
-
 	function closeProvision() {
 		showProvision = false;
 		provisioned = null;
@@ -290,14 +284,18 @@
 
 	// ── Detach a child (armed two-click confirm) ───────────────────────────────
 	let confirmDetachId = $state<string | null>(null);
-	let detaching = $state(false);
+	// The child whose detach is in flight. Its button goes `busy` so the
+	// still-armed confirm cannot send a second request; other rows' Detach is
+	// disabled until it settles.
+	let detachingId = $state<string | null>(null);
 
 	async function handleDetach(child: ChildTenant) {
+		if (detachingId) return;
 		if (confirmDetachId !== child.id) {
 			confirmDetachId = child.id;
 			return;
 		}
-		detaching = true;
+		detachingId = child.id;
 		try {
 			await detachChild(child.id);
 			toast(m('admin.partner.toast.detached', { name: child.name }), 'success');
@@ -306,7 +304,7 @@
 		} catch (e) {
 			toast(e instanceof Error ? e.message : m('admin.partner.toast.detachFailed'), 'error');
 		} finally {
-			detaching = false;
+			detachingId = null;
 		}
 	}
 </script>
@@ -364,12 +362,9 @@
 	</section>
 
 	{#if loading}
-		<p class="state" data-testid="partner-loading">{m('admin.partner.loading')}</p>
+		<LoadingState testId="partner-loading" />
 	{:else if error}
-		<div class="state error" data-testid="partner-error" role="alert">
-			<p>{error}</p>
-			<button type="button" class="btn-cancel" onclick={load}>{m('admin.partner.retry')}</button>
-		</div>
+		<LoadError message={error} onretry={load} testId="partner-error" />
 	{:else if overview && !overview.is_partner}
 		<div class="state" data-testid="partner-empty">
 			<p>
@@ -395,15 +390,23 @@
 							</RowLink>
 						</td>
 						<td class="mono">{child.slug}</td>
-						<td>{child.plan}</td>
+						<!-- The child's live subscription plan (decisions §482). -->
+						<td>{planCodeLabel(child.plan, m)}</td>
 						<td>{child.product_name || '—'}</td>
 						<td class="actions">
 							<RowAction
 								variant="danger"
 								armed={confirmDetachId === child.id}
-								disabled={detaching}
+								busy={detachingId === child.id}
+								disabled={detachingId !== null && detachingId !== child.id}
 								onclick={() => handleDetach(child)}
-								ariaLabel={m('admin.partner.detachAria', { name: child.name })}
+								ariaLabel={m('common.rowActionAria', {
+									action:
+										confirmDetachId === child.id
+											? m('admin.partner.row.confirmDetach')
+											: m('admin.partner.row.detach'),
+									name: child.name
+								})}
 							>
 								{confirmDetachId === child.id ? m('admin.partner.row.confirmDetach') : m('admin.partner.row.detach')}
 							</RowAction>
@@ -425,12 +428,13 @@
 	{#if editingChild}
 		<h2>{m('admin.partner.branding.heading', { name: editingChild.name })}</h2>
 		{#if brandLoading}
-			<p class="state" data-testid="brand-loading">{m('admin.partner.branding.loading')}</p>
+			<LoadingState label={m('admin.partner.branding.loading')} testId="brand-loading" />
 		{:else if brandError}
-			<div class="state error" role="alert">
-				<p>{brandError}</p>
-				<button type="button" class="btn-cancel" onclick={() => openEdit(editingChild!)}>{m('admin.partner.retry')}</button>
-			</div>
+			<LoadError
+				message={brandError}
+				onretry={() => openEdit(editingChild!)}
+				testId="partner-brand-error"
+			/>
 		{:else if brand}
 			<form
 				onsubmit={(e) => {
@@ -531,22 +535,30 @@
 	onclose={closeProvision}
 >
 	{#if provisioned}
-		<!-- Result: the one-time temp credentials. Shown once; dropped on close. -->
+		<!-- Result: the new tenant, and where its admin's set-password link went.
+		     Never a credential — the link reaches only the admin's inbox. -->
 		<div class="provisioned-result" data-testid="provisioned-result">
 			<p class="modal-hint">
-				<strong>{provisioned.name}</strong> ({provisioned.slug}) {m('admin.partner.provision.resultHintPre')}
-				<strong>{m('admin.partner.provision.resultHintOnce')}</strong> {m('admin.partner.provision.resultHintPost')}
+				{provisioned.set_password_email_sent && provisioned.set_password_link_expires_at
+					? m('admin.partner.provision.resultSent', {
+							name: provisioned.name,
+							slug: provisioned.slug,
+							expires: formatDate(provisioned.set_password_link_expires_at, '—', {
+								month: 'short',
+								day: 'numeric',
+								hour: 'numeric',
+								minute: '2-digit'
+							})
+						})
+					: m('admin.partner.provision.resultNotSent', {
+							name: provisioned.name,
+							slug: provisioned.slug
+						})}
 			</p>
 			<dl class="cred">
 				<dt>{m('admin.partner.provision.adminEmail')}</dt>
 				<dd class="mono">{provisioned.admin_email}</dd>
-				<dt>{m('admin.partner.provision.tempPassword')}</dt>
-				<dd class="mono pw">
-					<code class="code-value">{provisioned.temp_password}</code>
-					<button type="button" class="btn-cancel copy-btn" onclick={copyTempPassword}>{m('admin.partner.provision.copy')}</button>
-				</dd>
 			</dl>
-			<p class="panel-hint">{m('admin.partner.provision.changeNote')}</p>
 			<div class="modal-footer">
 				<button type="button" class="btn-primary" onclick={closeProvision}>{m('admin.partner.provision.done')}</button>
 			</div>
@@ -611,10 +623,6 @@
 	.state {
 		color: var(--text-muted);
 		padding: 0.75rem 0;
-	}
-
-	.state.error {
-		color: #f06464;
 	}
 
 	.mono {
@@ -698,13 +706,6 @@
 	.cred dd {
 		margin: 0;
 		font-size: 0.85rem;
-	}
-
-	.cred dd.pw {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		flex-wrap: wrap;
 	}
 
 	.copy-btn {

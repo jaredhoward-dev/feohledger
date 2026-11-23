@@ -82,6 +82,8 @@ async def test_bulk_approve_of_own_upload_is_skipped_by_segregation(realdb):
     # showing for every skip regardless of why it happened.
     assert "immutable" not in skip["reason"].lower()
     assert "segregation" in skip["reason"].lower()
+    # A coded approval refusal keeps its code on the skip row.
+    assert skip["code"] == "approval_segregation"
 
     mk = realdb.sessionmaker("a")
     async with mk() as s:
@@ -122,6 +124,9 @@ async def test_bulk_approve_mix_reports_a_distinct_reason_per_skip(realdb):
     assert "segregation" in reasons_by_id[str(segregation_id)].lower()
     assert "immutable" not in reasons_by_id[str(segregation_id)].lower()
     assert "immutable" in reasons_by_id[str(immutable_id)].lower()
+    immutable_skip = next(s for s in body["skipped"] if s["id"] == str(immutable_id))
+    assert immutable_skip["code"] == "invoice_status_immutable"
+    assert immutable_skip["params"] == {"status": "done"}
     # The two reasons must actually differ — collapsing them defeats the point.
     assert reasons_by_id[str(segregation_id)] != reasons_by_id[str(immutable_id)]
 
@@ -385,35 +390,58 @@ async def test_bulk_resubmit_reopens_a_review_step(realdb):
 async def test_one_illegal_transition_is_skipped_not_a_batch_abort(realdb):
     """A member the state machine refuses is `skipped`; the rest still land.
 
-    `ready_for_review → done` has no edge in VALID_TRANSITIONS, and the 409 it
-    raises used to escape the loop uncaught: the whole request failed AND the
-    sibling transition that had already succeeded was rolled back with it. The
-    endpoint's declared contract is `{updated, skipped}`.
+    `approved → new` has no edge in VALID_TRANSITIONS, and the 409 it raised
+    used to escape the loop uncaught: the whole request failed AND the sibling
+    transition that had already succeeded was rolled back with it. The
+    endpoint's declared contract is `{updated, skipped}`. (This used `done`
+    until bulk `done` gained its own source-status gate, decisions §357, which
+    now answers before the state machine does.)
     """
     info = realdb.info("a")
     mk = realdb.sessionmaker("a")
-    ok_id = await _seed(mk, info.org_id, number="BULK-MIX-OK", status=InvoiceStatus.approved)
-    bad_id = await _seed(
-        mk, info.org_id, number="BULK-MIX-BAD", status=InvoiceStatus.ready_for_review
-    )
+    ok_id = await _seed(mk, info.org_id, number="BULK-MIX-OK", status=InvoiceStatus.rejected)
+    bad_id = await _seed(mk, info.org_id, number="BULK-MIX-BAD", status=InvoiceStatus.approved)
 
     async with realdb.client(key="a", role="ap_manager") as c:
         resp = await c.post(
             "/api/invoices/bulk/status",
-            json={"ids": [str(ok_id), str(bad_id)], "status": "done"},
+            json={"ids": [str(ok_id), str(bad_id)], "status": "new"},
         )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["updated"] == 1
     assert [s["id"] for s in body["skipped"]] == [str(bad_id)]
-    # The state machine's own refusal message, not a generic label.
-    assert "ready_for_review" in body["skipped"][0]["reason"]
+    # The state machine's own refusal message, not a generic label — and its
+    # code and the edge, so the list names both statuses in the reader's
+    # language.
+    skip = body["skipped"][0]
+    assert skip["reason"] == "Cannot transition from 'approved' to 'new'"
+    assert skip["code"] == "invoice_transition_invalid"
+    assert skip["params"] == {"status": "approved", "target": "new"}
 
     async with mk() as s:
         ok = (await s.execute(select(Invoice).where(Invoice.id == ok_id))).scalar_one()
         bad = (await s.execute(select(Invoice).where(Invoice.id == bad_id))).scalar_one()
-    assert ok.status == InvoiceStatus.done, "the legal transition must survive the batch"
-    assert bad.status == InvoiceStatus.ready_for_review, "the refused one must not move"
+    assert ok.status == InvoiceStatus.new, "the legal transition must survive the batch"
+    assert bad.status == InvoiceStatus.approved, "the refused one must not move"
+
+
+@pytest.mark.asyncio
+async def test_bulk_done_refuses_a_status_it_does_not_close_from(realdb):
+    """`ready_for_review` has no edge to `done` either; the close gate names it
+    before the state machine would, with `/complete`'s code."""
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(mk, info.org_id, number="BULK-DONE-RFR")
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(
+            "/api/invoices/bulk/status", json={"ids": [str(inv_id)], "status": "done"}
+        )
+    assert resp.status_code == 200, resp.text
+    skip = resp.json()["skipped"][0]
+    assert skip["code"] == "invoice_not_completable"
+    assert skip["params"] == {"status": "ready_for_review"}
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +483,8 @@ async def test_bulk_approve_skips_a_row_edited_after_the_list_loaded(realdb):
     assert body["updated"] == 1
     assert [s["id"] for s in body["skipped"]] == [str(edited)]
     assert "changed after you loaded it" in body["skipped"][0]["reason"]
+    assert body["skipped"][0]["code"] == "invoice_stale_approval"
+    assert body["skipped"][0]["params"] == {}
 
     async with mk() as s:
         rows = {
@@ -537,7 +567,12 @@ async def test_bulk_submit_skips_an_invoice_missing_required_fields(realdb):
     body = resp.json()
     assert body["updated"] == 1
     assert body["skipped"] == [
-        {"id": str(blank_id), "reason": "Required fields missing: vendor, amount"}
+        {
+            "id": str(blank_id),
+            "reason": "Required fields missing: vendor, amount",
+            "code": "invoice_required_fields_missing",
+            "params": {"fields": ["vendor", "amount"]},
+        }
     ]
 
     async with mk() as s:
@@ -617,3 +652,351 @@ async def test_a_refused_bulk_approval_leaves_no_chain_state_behind(realdb):
             await s.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id == inv_id))
         ).scalar_one()
     assert instance.state_data == {}, "a refused approval must not leave a routed chain"
+
+
+# ---------------------------------------------------------------------------
+# Bulk `done` asks `/complete`'s close rule (decisions §357): only from `new` /
+# `approved`, and never while a live payment or card holds the invoice. A
+# staged or exported run, and a minted card, all leave the invoice `approved`.
+# ---------------------------------------------------------------------------
+
+
+async def _stage_payment(mk, org_id, inv_id, *, run_status="draft", payment_status="pending"):
+    from app.models.payment import Payment, PaymentRun
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        run = PaymentRun(
+            organization_id=org_id,
+            status=run_status,
+            total_amount=inv.amount,
+            requires_cfo_approval=False,
+        )
+        s.add(run)
+        await s.flush()
+        s.add(
+            Payment(
+                invoice_id=inv_id,
+                payment_run_id=run.id,
+                amount=inv.amount,
+                method="ach",
+                status=payment_status,
+                correlation_id=inv.correlation_id,
+            )
+        )
+        await s.commit()
+
+
+async def _mint_card(mk, org_id, inv_id, *, status="active"):
+    from app.models.virtual_card import VirtualCard
+
+    async with mk() as s:
+        s.add(
+            VirtualCard(
+                organization_id=org_id,
+                invoice_id=inv_id,
+                card_provider="mock",
+                provider_card_id=f"mock-{uuid.uuid4().hex[:8]}",
+                amount_limit=Decimal("500.00"),
+                currency="USD",
+                status=status,
+                last_four="4242",
+            )
+        )
+        await s.commit()
+
+
+async def _bulk_done(realdb, ids):
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(
+            "/api/invoices/bulk/status",
+            json={"ids": [str(i) for i in ids], "status": "done"},
+        )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _status(mk, inv_id):
+    async with mk() as s:
+        return (await s.get(Invoice, inv_id)).status
+
+
+@pytest.mark.asyncio
+async def test_bulk_done_refuses_a_posted_in_erp_invoice(realdb):
+    """`posted_in_erp → done` is a legal edge, and it skips the payment."""
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(
+        mk, info.org_id, number="BULK-DONE-POSTED", status=InvoiceStatus.posted_in_erp
+    )
+
+    body = await _bulk_done(realdb, [inv_id])
+
+    assert body["updated"] == 0
+    assert body["skipped"] == [
+        {
+            "id": str(inv_id),
+            "reason": "Only a new or approved invoice can be submitted or completed.",
+            "code": "invoice_not_completable",
+            "params": {"status": "posted_in_erp"},
+        }
+    ]
+    assert await _status(mk, inv_id) == InvoiceStatus.posted_in_erp
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claim_kind", "claim"),
+    [("staged_run", "payment"), ("exported_run", "payment"), ("live_card", "virtual_card")],
+)
+async def test_bulk_done_refuses_an_approved_invoice_our_rails_hold(realdb, claim_kind, claim):
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    held_id = await _seed(
+        mk, info.org_id, number=f"BULK-DONE-{claim_kind}", status=InvoiceStatus.approved
+    )
+    free_id = await _seed(
+        mk, info.org_id, number=f"BULK-DONE-FREE-{claim_kind}", status=InvoiceStatus.approved
+    )
+    if claim_kind == "staged_run":
+        await _stage_payment(mk, info.org_id, held_id)
+    elif claim_kind == "exported_run":
+        await _stage_payment(mk, info.org_id, held_id, run_status="exported")
+    else:
+        await _mint_card(mk, info.org_id, held_id)
+
+    body = await _bulk_done(realdb, [held_id, free_id])
+
+    # The held row is skipped with the coded reason; its sibling still closes.
+    assert body["updated"] == 1
+    assert len(body["skipped"]) == 1
+    skip = body["skipped"][0]
+    assert skip["id"] == str(held_id)
+    assert skip["code"] == "payment_blocks_completion"
+    assert skip["params"] == {"claim": claim}
+    assert await _status(mk, held_id) == InvoiceStatus.approved
+    assert await _status(mk, free_id) == InvoiceStatus.done
+    async with mk() as s:
+        audits = await s.scalar(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(AuditLog.entity_id == held_id, AuditLog.action == "invoice.bulk_status_change")
+        )
+    assert audits == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dead", ["voided", "failed", "cancelled"])
+async def test_bulk_done_closes_an_invoice_whose_payment_is_no_longer_live(realdb, dead):
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(
+        mk, info.org_id, number=f"BULK-DONE-DEAD-{dead}", status=InvoiceStatus.approved
+    )
+    await _stage_payment(mk, info.org_id, inv_id, payment_status=dead)
+
+    body = await _bulk_done(realdb, [inv_id])
+
+    assert body == {"updated": 1, "skipped": []}
+    assert await _status(mk, inv_id) == InvoiceStatus.done
+
+
+@pytest.mark.asyncio
+async def test_bulk_done_closes_an_invoice_whose_card_was_cancelled(realdb):
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(mk, info.org_id, number="BULK-DONE-CARD-X", status=InvoiceStatus.approved)
+    await _mint_card(mk, info.org_id, inv_id, status="cancelled")
+
+    body = await _bulk_done(realdb, [inv_id])
+
+    assert body == {"updated": 1, "skipped": []}
+    assert await _status(mk, inv_id) == InvoiceStatus.done
+
+
+@pytest.mark.asyncio
+async def test_bulk_done_on_an_unclaimed_approved_invoice_writes_its_audit_row(realdb):
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(mk, info.org_id, number="BULK-DONE-PLAIN", status=InvoiceStatus.approved)
+
+    body = await _bulk_done(realdb, [inv_id])
+
+    assert body == {"updated": 1, "skipped": []}
+    async with mk() as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AuditLog).where(
+                        AuditLog.entity_id == inv_id,
+                        AuditLog.action == "invoice.bulk_status_change",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_draft_skip_of_an_invoice_still_being_read_is_coded(realdb):
+    """`pending → new` by hand is skipped while extraction runs, and the skip
+    carries a code the list states in the reader's language (decisions §387)."""
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(mk, info.org_id, number="BULK-PEND-NEW", status=InvoiceStatus.pending)
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(
+            "/api/invoices/bulk/status", json={"ids": [str(inv_id)], "status": "new"}
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["updated"] == 0
+    assert body["skipped"] == [
+        {
+            "id": str(inv_id),
+            "reason": "the invoice is still being read; wait for extraction to finish",
+            "code": "invoice_still_extracting",
+            "params": {},
+        }
+    ]
+
+
+def test_every_skip_the_bulk_endpoint_writes_itself_is_coded():
+    """Every skip `bulk_status_change` writes goes through `_coded_skip` (or
+    `_refused_skip`, which codes a coded refusal): a bare `BulkStatusSkip(...,
+    reason=...)` in its body is an English-only row beside localized ones."""
+    import inspect
+
+    from app.api import invoices
+
+    body = inspect.getsource(invoices.bulk_status_change)
+    assert "BulkStatusSkip(" not in body
+    for code in (
+        invoices.INVOICE_BULK_NOT_FOUND,
+        invoices.INVOICE_STATUS_IMMUTABLE,
+        invoices.INVOICE_STILL_EXTRACTING,
+        invoices.INVOICE_RECALL_ONE_AT_A_TIME,
+        invoices.INVOICE_BULK_REFUSED,
+    ):
+        assert code.startswith("invoice_")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("detail", "reason"),
+    [
+        # A plain-string refusal keeps its own sentence as the English.
+        ("Some new uncoded refusal", "Some new uncoded refusal"),
+        # A structured detail that is not `{code, message, params}` (the
+        # GL-chart refusal's shape) contributes its sentence, never a dict.
+        ({"code": "gl_codes_outside_chart", "message": "GL 9999 is unknown"}, "GL 9999 is unknown"),
+        # Nothing readable at all: the branch's own fallback.
+        ({"unexpected": True}, "transition was refused"),
+    ],
+)
+async def test_an_uncoded_refusal_is_still_a_coded_skip(realdb, monkeypatch, detail, reason):
+    """A refusal a service raises without `{code, message, params}` is reported
+    as `invoice_bulk_refused` naming the target, with the refusal's English as
+    `reason` — never an English-only row in a translated list (decisions §465).
+    Every refusal those services raise today is coded, so the fake stands in for
+    the next one that is not."""
+    from fastapi import HTTPException
+
+    from app.api import invoices
+
+    async def _refuse(*args, **kwargs):
+        raise HTTPException(status_code=409, detail=detail)
+
+    monkeypatch.setattr(invoices, "transition_invoice", _refuse)
+
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed(mk, info.org_id, number="BULK-UNCODED", status=InvoiceStatus.approved)
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(
+            "/api/invoices/bulk/status", json={"ids": [str(inv_id)], "status": "new"}
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["updated"] == 0
+    assert body["skipped"] == [
+        {
+            "id": str(inv_id),
+            "reason": reason,
+            "code": "invoice_bulk_refused",
+            "params": {"status": "new"},
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Bulk approve is a review decision (decisions §418): a row that is not in
+# `ready_for_review` is skipped with the code the four single review doors
+# refuse with, never moved `new → approved` past the review it never entered.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [InvoiceStatus.new, InvoiceStatus.pending, InvoiceStatus.rejected]
+)
+async def test_bulk_approve_skips_a_row_not_awaiting_review(realdb, status):
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    # uploaded_by_id NULL: no segregation refusal to mask the review-stage one.
+    draft_id = await _seed(mk, info.org_id, number=f"BULK-NOREV-{status.value}", status=status)
+    ok_id = await _seed(mk, info.org_id, number=f"BULK-NOREV-OK-{status.value}")
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(
+            "/api/invoices/bulk/status",
+            json={"ids": [str(draft_id), str(ok_id)], "status": "approved"},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The row in review still lands; only the other is skipped.
+    assert body["updated"] == 1
+    assert body["skipped"] == [
+        {
+            "id": str(draft_id),
+            "reason": "This invoice is not awaiting review, so it cannot be approved or rejected.",
+            "code": "invoice_not_in_review",
+            "params": {},
+        }
+    ]
+
+    async with mk() as s:
+        draft = (await s.execute(select(Invoice).where(Invoice.id == draft_id))).scalar_one()
+        ok = (await s.execute(select(Invoice).where(Invoice.id == ok_id))).scalar_one()
+        approved_rows = (
+            await s.execute(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(AuditLog.entity_id == draft_id, AuditLog.action == "invoice.approved")
+            )
+        ).scalar_one()
+    assert draft.status == status, "a row outside review must not move"
+    assert draft.approval_date is None and not draft.approved_by
+    assert approved_rows == 0
+    assert ok.status == InvoiceStatus.approved
+
+
+@pytest.mark.asyncio
+async def test_bulk_approve_review_skip_answers_before_the_version_check(realdb):
+    """A draft is refused for being a draft even when the client bound no
+    version for it — the stage is the fact the approver needs, not staleness."""
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    draft_id = await _seed(mk, info.org_id, number="BULK-NOREV-VER", status=InvoiceStatus.new)
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(
+            "/api/invoices/bulk/status",
+            json={"ids": [str(draft_id)], "status": "approved", "expected_updated_at": {}},
+        )
+    assert resp.status_code == 200, resp.text
+    assert [s["code"] for s in resp.json()["skipped"]] == ["invoice_not_in_review"]

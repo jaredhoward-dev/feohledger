@@ -1,6 +1,9 @@
 <script lang="ts">
+	import { formatPercent } from '#lib/utils/percent.ts';
+	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
+	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import type { Budget, BudgetDimension, BudgetSpend } from '#lib/types/budget.ts';
-	import { BUDGET_DIMENSIONS, BUDGET_DIMENSION_LABELS } from '#lib/types/budget.ts';
+	import { BUDGET_DIMENSIONS, BUDGET_DIMENSION_LABEL_KEYS } from '#lib/types/budget.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
@@ -39,6 +42,12 @@
 	// which may itself arrive as a JSON number.
 	let amount = $state(String(budget?.amount ?? ''));
 	let currency = $state(budget?.currency ?? 'USD');
+	// An existing record opens on its own code; only a new one follows the
+	// org currency (`CurrencyInput` re-seeds an untouched field).
+	let currencyTouched = $state(Boolean(budget?.currency));
+	$effect(() => {
+		void orgCurrency.ensureLoaded();
+	});
 	let notes = $state(budget?.notes ?? '');
 	/* eslint-enable svelte/state-referenced-locally */
 
@@ -149,7 +158,7 @@
 			     neither of which has a "no figure yet" form. -->
 			<div class="kpi-row">
 				<KpiCard
-					value={spend ? `${spend.utilization_pct.toFixed(1)}%` : null}
+					value={spend ? formatPercent(spend.utilization_pct, { minimumFractionDigits: 1 }) : null}
 					label={m('budgets.modal.kpi.utilization')}
 					highlight={spend && spend.utilization_pct >= 100 ? 'red' : null}
 					pending={spendLoading}
@@ -168,7 +177,7 @@
 				/>
 			</div>
 			{#if spend}
-				<div class="util-bar" aria-label={m('budgets.modal.utilizationAria', { percent: spend.utilization_pct.toFixed(1) })}>
+				<div class="util-bar" aria-label={m('budgets.modal.utilizationAria', { percent: formatPercent(spend.utilization_pct, { minimumFractionDigits: 1 }) })}>
 					<div class="util-fill {utilClass}" style={`width: ${Math.min(spend.utilization_pct, 100)}%`}></div>
 				</div>
 				<div class="spend-detail">
@@ -179,6 +188,12 @@
 						{m('budgets.modal.detail.remaining')} <Money amount={spend.remaining} currency={spend.currency} accounting />
 					</span>
 				</div>
+				{#if spend.unverifiable_po_count > 0}
+					<!-- Committed leaves these POs out (decisions §323); say so beside it. -->
+					<p class="spend-floor" role="note" data-testid="budget-spend-unverifiable">
+						{m('budgets.modal.unverifiablePos', { n: spend.unverifiable_po_count })}
+					</p>
+				{/if}
 			{:else if spendLoading}
 				<p class="muted">{m('budgets.modal.loadingSpend')}</p>
 			{/if}
@@ -193,7 +208,7 @@
 				<span>{m('budgets.modal.field.dimension')}</span>
 				<select bind:value={dimension} disabled={!canEdit}>
 					{#each BUDGET_DIMENSIONS as d}
-						<option value={d}>{BUDGET_DIMENSION_LABELS[d]}</option>
+						<option value={d}>{m(BUDGET_DIMENSION_LABEL_KEYS[d])}</option>
 					{/each}
 				</select>
 			</label>
@@ -221,7 +236,7 @@
 			</label>
 			<label>
 				<span>{m('budgets.modal.field.currency')}</span>
-				<input type="text" bind:value={currency} maxlength="3" disabled={!canEdit} />
+				<CurrencyInput bind:value={currency} bind:touched={currencyTouched} preferred={orgCurrency.currency} disabled={!canEdit} testid="budget-currency" />
 			</label>
 			<label>
 				<span>{m('budgets.modal.field.period')}</span>
@@ -299,9 +314,9 @@
 		border-radius: 4px;
 		transition: width 0.2s ease;
 	}
-	.util-fill.ok { background: #1fa86a; }
-	.util-fill.warn { background: #d4940a; }
-	.util-fill.over { background: #e04040; }
+	.util-fill.ok { background: var(--success); }
+	.util-fill.warn { background: var(--warning); }
+	.util-fill.over { background: var(--danger); }
 
 	.spend-detail {
 		display: flex;
@@ -314,6 +329,14 @@
 	.spend-detail span.over {
 		color: var(--danger);
 		font-weight: 600;
+	}
+
+	.spend-floor {
+		margin: 6px 0 0;
+		padding-left: 10px;
+		border-left: 3px solid var(--warning);
+		font-size: 0.82rem;
+		color: var(--text);
 	}
 
 	.muted {

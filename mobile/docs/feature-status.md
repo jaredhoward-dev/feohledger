@@ -24,16 +24,29 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   and one for the top-five vendor ranking (the sum over the rows it renders)
   with each affected row's subtitle naming its own count. Nothing renders at
   zero. The monthly trend's per-bar count is not read, because mobile draws no
-  trend
-- Invoice list with search + status filter chips
+  trend. **Overdue and Upcoming are whole-book counts, never read off the
+  `upcoming_payments` list** (the server caps it at ten rows, overdue first):
+  the Overdue card reads `overdue_count` / `overdue_total`, the Upcoming card
+  `due_soon_count` / `due_soon_total` (due today through seven days out), each
+  money line one compact figure per currency in the invoices' own code
+  (`€1K · $2.1K`, `DueRollup`), summed on the server and converting nothing. A
+  payload (or offline cache) predating those fields shows no Overdue card and
+  the legacy Upcoming figure, never a `0` nobody reported. **Tapping the Overdue
+  card opens the Invoices tab on its Overdue quick view** (`HomeScreen` passes
+  `DashboardScreen.onShowOverdue` → `InvoiceStore.showOverdue`), which reads
+  `GET /api/invoices?overdue=true`, the same `services/open_ap_due` set the
+  count reads, with every other filter cleared so the list holds exactly the
+  invoices counted. The card is a button to a screen reader, with a hint
+  (`dashboardOverdueOpen`); the other KPI cards stay plain figures
+- Invoice list with search + status filter chips, plus an **Overdue** quick-view chip (`InvoiceStore.setOverdueOnly`, `overdue=true`): owed and past due across statuses, so it and a status chip are mutually exclusive; search and advanced filters still narrow it, and it caches under its own offline key
 - Advanced search — `AdvancedSearchSheet` (app-bar `tune` action; a dot badge marks an active advanced filter) filters the list by vendor, PO number, amount range and due-date range via `InvoiceStore.setFilters` → `GET /api/invoices` (`vendor` / `po_number` / `amount_min` / `amount_max` / `due_date_from` / `due_date_to`). Seeded from the live filters; validates min ≤ max + plain-decimal amounts; Apply / Clear / dismiss. The advanced filters compose with the quick status chips + search box (all carried into the same request + offline cache key)
 - Invoice detail with approve/reject
 - Invoice warnings / fraud flags + PO match — `InvoiceWarningsPanel` on the detail screen renders `Invoice.warnings` (`{type, severity, message, code, params}`, localized off `code` with `message` as the fallback, severity-coloured to WCAG AA) and the `po_match` panel (match type, localized status, variance %, issues — `po_match.issue.*` findings localized the same way, a pre-catalogue bare-string issue rendered as written; `mobile/docs/i18n.md` § Invoice warnings). The variance reads `amount_variance_pct` — the key `MatchResult` writes; it read a top-level `variance_pct` that the backend never sends, so it never rendered — and is absent when the invoice and the PO are in different currencies, where the matcher compares nothing (`docs/decisions.md` §197). No mobile screen shows a PO's own money, so there is no PO figure to label. Parity with the web invoice modal; nothing renders when there are no warnings and no PO
-- ERP status — `ErpStatusPanel` shows the invoice's ERP integration status (ERP reference / document id / send error + last action). `ErpInfo.fromAuditLog` derives it from the already-loaded audit log (latest `invoice.erp_*` / `invoice.completed` entry), so no extra request. Shown for ERP-bound statuses (`sending_to_erp` / `sent_to_erp` / `posted_in_erp`) and ERP-failed invoices
-- Invoice editing — edit-sheet on the detail screen (vendor, invoice #, amount, PO, GL account, description, due date) via `PATCH /api/invoices/{id}`; amount sent as string-Decimal (never a lossy float); input validation; RBAC-gated (admin/ap_manager/cfo, hidden for clerks) and hidden in immutable statuses (the backend would 409); save success/failure announced via `A11y.announce`, and a refused save shows the **server's own sentence** (`InvoiceStore.update` records `describeApiError`) rather than a generic "try again" — the GL field is free text, so a code outside the invoice's chart (`docs/decisions.md` §194/§199) is refused with a sentence naming the code and the reason, and retrying the same save cannot succeed. That refusal arrives structured (`{code: "gl_codes_outside_chart", foreign, retired, unknown, on_lines, message}`), so the snackbar states it in the reader's language (`lib/l10n/gl_chart_refusal_messages.dart`, fed by `InvoiceStore.updateErrorDetail` ← `ApiException.detail`) and falls back to the server's English `message` only for a body this build does not recognise. **The financial freeze is mirrored client-side**: once an invoice is `approved` or later (`InvoiceStatus.isFinanciallyLocked` ⇄ the backend `_FINANCIALLY_LOCKED_STATUSES` = `{approved}` ∪ `IMMUTABLE_STATUSES`), the money + payee fields render **read-only** under a short notice saying how to change them (reject → correct → re-approve), and `stripFinancialFields` drops every key in `kFinancialInvoiceFields` (the mirror of the backend `_FINANCIAL_FIELDS`: amount, currency, subtotal, tax_amount, discount_amount, shipping_amount, tax_rate, vendor, vendor_name, remit_to_address) from the PATCH diff. The backend 409s the WHOLE request if one slips through, so a combined description + amount edit used to lose the description too — same guard the web modal applies in `invoiceFieldPayload()`. Locked by `test/widgets/invoice_edit_sheet_test.dart` + the `financial freeze` group in `test/models/invoice_test.dart`
+- ERP status — `ErpStatusPanel` shows the invoice's ERP integration status (ERP reference / document id / send error + last action). The reference is the invoice's `erp_document_id`; when the backend built a deep link (`erp_document_url`, Xero scoped to the bill's organisation — backend decisions §354) it is a tappable `ExternalLink` that opens the bill outside the app. `ErpInfo.fromAuditLog` derives it from the already-loaded audit log (latest `invoice.erp_*` / `invoice.completed` entry), so no extra request. The last-update row's "{action} by {actor}" is localized (`erpStatusActionBy`). A screen reader reads the panel in screen order: one merged node when nothing is tappable; with a linked reference, the title, then the reference and its link, then the details merged (they used to ride the title's label, ahead of the reference above them). Shown for ERP-bound statuses (`sending_to_erp` / `sent_to_erp` / `posted_in_erp`) and ERP-failed invoices
+- Invoice editing — edit-sheet on the detail screen (vendor, invoice #, amount, PO, GL account, description, due date) via `PATCH /api/invoices/{id}`; amount sent as string-Decimal (never a lossy float); input validation; RBAC-gated (admin/ap_manager/cfo, hidden for clerks) and hidden in immutable statuses (the backend would 409); save success/failure announced via `A11y.announce`, and a refused save shows the **server's own sentence** (`InvoiceStore.update` records `describeApiError`) rather than a generic "try again" — the GL field is free text, so a code outside the invoice's chart (`docs/decisions.md` §194/§199) is refused with a sentence naming the code and the reason, and retrying the same save cannot succeed. That refusal arrives structured (`{code: "gl_codes_outside_chart", foreign, retired, unknown, on_lines, message}`), so the snackbar states it in the reader's language (`lib/l10n/gl_chart_refusal_messages.dart`, fed by `InvoiceStore.updateErrorDetail` ← `ApiException.detail`) and falls back to the server's English `message` only for a body this build does not recognise. **The financial freeze is the server's verdict**: once an invoice is financially locked (`Invoice.financiallyLocked` ← `InvoiceResponse.financially_locked`, the backend's `models/invoice_status.financially_locked` — `approved` or later, or a failed ERP push after approval, decisions §370; a response without it is locked), the money + payee fields render **read-only** under a short notice. It names the way out only when the server's `recall_approval` verdict offers it (recall the approval → correct → re-approve; the old notice said "reject", which the server refuses on an approved invoice, and later said "recall" on every locked invoice, including `sent_to_erp` → `done`, where the recall is always refused). A recall refused for a reason the reader can act on (a bill the ERP may hold, a live payment or card) appends that refusal's own sentence, since the sheet covers the action bar; anything else reads as the plain freeze sentence (`InvoiceEditSheet.recall`, passed from the detail screen's verdict; `test/widgets/invoice_edit_sheet_test.dart` § the lock notice follows the recall verdict). **Recall approval** is on the detail screen's action bar for an approved invoice or an approved invoice's failed push, offered from the `recall_approval` verdict of `GET /review-actions` (`InvoiceApi.reviewActions` → `ActionVerdict`, fail-closed on a missing key): hidden on `invoice_not_recallable` / `role_not_permitted`, disabled with the localized reason on a bill the ERP may hold or a live payment / card; it asks for the reason in the shared `showRejectReasonDialog` and posts `POST /api/invoices/{id}/recall-approval` (backend decisions §374). Locked by `test/screens/invoice_detail_screen_test.dart` § Recall approval and `test/models/action_verdict_test.dart`, and `stripFinancialFields` drops every key in `kFinancialInvoiceFields` (the mirror of the backend `_FINANCIAL_FIELDS`: amount, currency, subtotal, tax_amount, discount_amount, shipping_amount, tax_rate, vendor, vendor_name, remit_to_address) from the PATCH diff. The backend 409s the WHOLE request if one slips through, so a combined description + amount edit used to lose the description too — same guard the web modal applies in `invoiceFieldPayload()`. Locked by `test/widgets/invoice_edit_sheet_test.dart` + the `financial freeze` group in `test/models/invoice_test.dart`
 - Activity timeline — invoice audit log on the detail screen (`GET /api/invoices/{id}/audit-log`): action label, actor, timestamp, per-field before→after diff from `details.changes`; loading / empty / error states; one merged Semantics announcement per entry
-- Approvals tab with swipe-to-approve (shown to anyone holding `invoice.approve` — admin / AP manager / CFO by default, or a custom role)
-- Exception queue (list + status filter + resolve / escalate / dismiss via swipe; admin / AP manager only). **Detail / assign / bulk-resolve** now shipped: tapping a row opens `ExceptionDetailScreen` (`GET /api/exceptions/{id}`) — full fields (the description localized off its `description_code`, a composite's findings listed beneath it, the English `description` as the fallback) + linked invoice + SLA/due/overdue + current assignee, with resolve/escalate/dismiss reachable there and loading/error/empty states. An admin-gated assignee picker (`POST /api/exceptions/{id}/assign`, null = unassign) reuses the admin-only `/admin/users` list — `ap_manager` can act but doesn't get the picker (no org-user-list access); reassignment patches the row in place. Multi-select (long-press or the checklist app-bar action) drives the shared `BulkActionBar` (Status → resolve, Delete → dismiss) → `POST /api/exceptions/bulk/resolve`, whose `{updated, skipped:[{id,reason}]}` partial-success result is surfaced in a snackbar. The bottom-sheet picker is height-capped (60% of the viewport) so a long user list scrolls inside the sheet
+- Approvals tab with swipe-to-approve (the tab is shown to anyone holding `invoice.approve` — admin / AP manager / CFO by default, or a custom role). **Approve / Reject are the server's verdict, never a restated rule** (`frontend/docs/ui-patterns.md` § Whether to offer an action, issue #575): the detail screen reads `GET /api/invoices/{id}/review-actions` (`InvoiceApi.reviewActions` → `ActionVerdict` for `approve` / `reject` / `recall_approval`) and offers each button from it — hidden on `role_not_permitted` / `invoice_not_in_review`, disabled beside the localized reason on any other refusal (segregation of duties, the CFO or max-amount gate, the named approver), nothing at all while unanswered or on a failed read. The approvals queue asks the same read per row (keyed by id + `updated_at`, re-asked on pull-to-refresh): a row swipes to approve only on an allowed verdict, and a refused one states its reason under the row. Locked by `test/screens/invoice_detail_screen_test.dart` § Approve / Reject from the server's verdict and `test/screens/approvals_screen_test.dart` § Swipe-to-approve from the server's verdict
+- Exception queue (list + status filter + resolve / dismiss via swipe, escalate on the detail). Each decision is offered from the row's `decision_refusals` (list and detail; `api/exceptions.py::decision_refusals` — the queue's role, the status gate, then segregation of duties), never a role or status check in the app: `role_not_permitted` or `exception_not_actionable` hides it, a segregation refusal shows it disabled on the detail with the localized reason (Escalate, the implicated reader's exit, stays enabled), no verdict offers nothing, the swipe goes only in an accepted direction, and only a decidable row enters bulk selection by long-press; the verdicts ride the offline cache. **Detail / assign / bulk-resolve** now shipped: tapping a row opens `ExceptionDetailScreen` (`GET /api/exceptions/{id}`) — full fields (the description localized off its `description_code`, a composite's findings listed beneath it, the English `description` as the fallback) + linked invoice + SLA/due/overdue + current assignee, with resolve/escalate/dismiss reachable there and loading/error/empty states. An admin-gated assignee picker (`POST /api/exceptions/{id}/assign`, null = unassign) reuses the admin-only `/admin/users` list — `ap_manager` can act but doesn't get the picker (no org-user-list access); reassignment patches the row in place. Multi-select (long-press or the checklist app-bar action) drives the shared `BulkActionBar` (Status → resolve, Delete → dismiss) → `POST /api/exceptions/bulk/resolve`, whose `{updated, skipped:[{id,reason}]}` partial-success result is surfaced in a snackbar. The bottom-sheet picker is height-capped (60% of the viewport) so a long user list scrolls inside the sheet. **The ERP report behind a reconciliation row** is stated on the detail screen as the web resolve dialog states it (backend decisions §332, §413): a payment write-back row (`erp_report.kind` `payment_writeback_failed` / `payment_void_writeback_failed`) shows why the ERP refused, from `erp_report.refusal`'s `{code, params}` through `lib/l10n/erp_refusal_messages.dart` (the mirror of the web `api/erpRefusals.ts`: every code the web states, with the same params rules); a code this build cannot state reads as a generic sentence (`erpRefusalUnknown`), never the raw code, and a write-back with no coded refusal adds no line. A `paid_not_recorded` row gets a "Payment reported by {erp}" card: the amount the ERP states in the currency it stated (or "Not stated"), its payment date only when the ERP reported one (`paid_on_reported`), the reference, and a note that recording the payment is web-only — the rail breakdown and the one-click record stay web-only. `test/l10n/erp_refusal_messages_test.dart` pins the mobile code set to the web `KEYS` read from source (the web test pins those to the backend's), and checks every code renders a full sentence in every locale; the strings reuse the web catalogue's translations
 - In-app notification center — `NotificationsScreen` + `NotificationStore` over `GET /api/notifications` (+ `unread-count` / `{id}/read` / `read-all`). Reached from the `NotificationBell` app-bar action (live unread `Badge`) in the Dashboard app bar (all roles). All / Unread filter chips; tapping a row marks it read (optimistic — flips the row + decrements the badge instantly, reconciles via refetch on failure) and deep-links to the invoice detail when the row is an `invoice` with an `entity_id` (other entity types e.g. `contract` just mark read — no mobile detail yet); mark-all-read app-bar action shown only while something is unread; offline-cached list + empty / loading / error (Retry) states. The email/in-app backend (Priority 8) serves mobile with no new endpoints
 - Contract management (CLM) — `ContractsScreen` + `ContractStore` over
   `GET /api/contracts` with status filter chips + debounced search; tapping a
@@ -51,18 +64,67 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   repository, renewal, and contract-based PO creation
 - Payment history list
 - Predictive cash-flow forecast (CFO/admin) — `CashFlowScreen` + `CashFlowStore` combine `GET /api/analytics/cashflow_forecast` + `GET /api/analytics/cash_position` (same `horizon_days` + `granularity` so the two legs line up). A KPI summary (opening balance + its source, projected end balance — red when a breach is projected, total committed vs pending outflow over the horizon), a low-balance alert banner when the cash position breaches the org's persisted threshold (names the worst period + shortfall), a per-period forecast list (scheduled / committed / pending + invoice count) and a running cash-position list (period closing balance, breached rows flagged red). 30 / 60 / 90-day horizon chips (`CashFlowStore.setHorizon`), pull-to-refresh, loading / error (Retry) / empty states. Reached from the `CashFlowButton` Dashboard app-bar action (CFO/admin only). **Money is rendered from server-supplied display strings — the device never does float arithmetic on currency** (every total, opening/closing balance and shortfall is server-computed; mirrors the payment-queue invariant). Both legs' `unconverted_count` — commitments projected at FACE value for want of a rate into the reporting currency — is disclosed in its own section: `totals.unconverted_count` above the forecast rows (naming the committed / pending KPI totals it also touches), `cash_position.unconverted_count` above the running balance (naming the projected-end KPI, which is its last period); nothing renders at zero. Not offline-cached (privileged, fast-moving CFO read)
-- Vendor management — `VendorsScreen` + `VendorStore` over `GET /api/vendors` with status filters + search; verify / reject an unverified vendor via swipe (verify ⟶ / reject ⟵) or the action sheet, and an ERP-sync app-bar action (`POST /api/vendors/sync-erp`). Read is admin/ap_manager/cfo; the mutating actions are gated to admin/ap_manager (mirrors `require_roles`) and simply hidden for CFO. Offline-cached list
-- Payment queue + runs — `PaymentQueueScreen` + `PaymentQueueStore`. Queue tab lists approved invoices (`GET /api/payments/queue`), each row a checkbox + per-row method picker; the selection creates a draft run (`POST /api/payments/runs`). A row the backend marks `blocked` (an unresolved payment-blocking exception, a vendor that is not verified and active, or fully covered by applied credit memos) is rendered but **unselectable** — its checkbox is disabled, and the localized reason is both shown on the row and carried in its merged screen-reader announcement — because one such invoice 409s the whole draft run, taking every other invoice in it down with no way to bisect. A row carrying `required_method` (a live virtual card already claims it, and `virtual_card` converges onto that card rather than opening a second outflow) is NOT blocked: it stays selectable but is **pinned** to that rail — no method picker, and the pin wins over any stored operator pick at send time. `PaymentQueueItem.isSelectable` is the single predicate; the guard is enforced in `PaymentQueueStore.toggleSelection` / `setMethod` and re-applied by `_reconcileSelection` on every fetch (live and offline-cache), not just on the checkbox. `blocked_reason` is a stable PII-free CODE, never the exception's description, so it renders only through the screen's own label map. A pin naming a rail this build cannot resolve makes the row unselectable rather than defaulting to ACH — the same fail-closed direction the backend takes when it can no longer name one converging rail. Runs tab lists runs (`GET /api/payments/runs/`) and executes / cancels drafts. A KPI summary bar (total paid / pending / queue / card rebates) sits above both (`GET /api/payments/summary`). CFO-approval-required runs surface the gate before an execute attempt — **and a CFO can now clear it from the phone**: the run popup carries an "Approve as CFO" item
-  (`POST /api/payments/runs/{id}/approve`) whenever the run is a draft that
-  still needs sign-off. It is gated on the **strict `cfo` role**
-  (`AuthStore.canApprovePaymentRun`), not `canManagePayments` and not "admin
-  counts as CFO" — the backend gate is `require_roles(ROLE_CFO)`, which does
-  not special-case admin, and a sign-off an admin can grant themselves is not a
-  sign-off (same reasoning as the web `auth.hasRole('cfo')` on that button).
+- Vendor management — `VendorsScreen` + `VendorStore` over `GET /api/vendors` with status filters + search; verify / reject a vendor via swipe (verify ⟶ / reject ⟵) or the action sheet, and an ERP-sync app-bar action (`POST /api/vendors/sync-erp`). Verify / Reject are offered from each row's `status_actions` (`vendor_status_actions`: `vendor.manage`, then the one status table the endpoints refuse from), never a role or status check in the app — so an active vendor offers Reject, as the server accepts. `role_not_permitted` or `vendor_status_not_allowed` hides an action, any other refusal shows it disabled in the sheet with its reason, a row with no verdict offers nothing, and a swipe goes only in an accepted direction; the verdicts ride the offline cache. Read is admin/ap_manager/cfo; the ERP sync stays gated to admin/ap_manager (mirrors `require_roles`). Offline-cached list
+- Payment queue + runs — `PaymentQueueScreen` + `PaymentQueueStore`. Queue tab lists approved invoices (`GET /api/payments/queue`), each row a checkbox + per-row method picker; the selection creates a draft run (`POST /api/payments/runs`). A row the backend marks `blocked` (an unresolved payment-blocking exception, a vendor that is not verified and active, or fully covered by applied credit memos) is rendered but **unselectable** — its checkbox is disabled, and the localized reason is both shown on the row and carried in its merged screen-reader announcement — because one such invoice 409s the whole draft run, taking every other invoice in it down with no way to bisect. A row carrying `required_method` (a live virtual card already claims it, and `virtual_card` converges onto that card rather than opening a second outflow) is NOT blocked: it stays selectable but is **pinned** to that rail — no method picker, and the pin wins over any stored operator pick at send time. `PaymentQueueItem.isSelectable` is the single predicate; the guard is enforced in `PaymentQueueStore.toggleSelection` / `setMethod` and re-applied by `_reconcileSelection` on every fetch (live and offline-cache), not just on the checkbox. `blocked_reason` is a stable PII-free CODE, never the exception's description, so it renders only through the screen's own label map. A pin naming a rail this build cannot resolve makes the row unselectable rather than defaulting to ACH — the same fail-closed direction the backend takes when it can no longer name one converging rail. Runs tab lists runs (`GET /api/payments/runs/`) and executes / cancels drafts — each offered from the run detail's `actions.execute` / `actions.cancel` (`run_action_refusals`), never `canManagePayments` and the run's status: `role_not_permitted` or `payment_run_not_draft` hides the item, any other refusal (maker-checker, the CFO wait `payment_run_awaiting_cfo`) shows it disabled with the localized reason, and Execute additionally needs the server's execution mode to be `processor`. There is no client-side CFO pre-flight any more: the CFO wait is the execute verdict. A KPI summary bar (total paid / pending / queue / card rebates) sits above both (`GET /api/payments/summary`). CFO-approval-required runs show Execute disabled with that reason — **and a CFO can now clear it from the phone**: the run popup carries an "Approve as CFO" item
+  (`POST /api/payments/runs/{id}/approve`) for a draft that still needs
+  sign-off (`PaymentRun.canTakeCfoApproval`, which only says the run HAS a CFO
+  step). Whether THIS reader may sign is the server's verdict, never a role
+  check in the app: the runs list carries no verdicts, so
+  `PaymentQueueStore.fetchRuns` publishes the list at once and then reads
+  `GET /runs/{id}`'s `actions` for every draft run, filling each run's
+  `approve` / `execute` / `cancel` verdicts as its read lands (one slow read
+  never holds the tab back); the menu reads `runApproveVerdict` /
+  `runExecuteVerdict` / `runCancelVerdict`. `approve` is
+  `payment_controls.run_approve_refusal` after `require_roles(ROLE_CFO)`. `role_not_permitted`
+  (anyone not a CFO, admins included — a sign-off an admin can grant
+  themselves is not a sign-off) hides the item; any other refusal — the CFO
+  who created the run, refused by maker-checker — shows it disabled with the
+  localized reason (`localizeCodedRefusal`), as the web run dialog does. A
+  failed detail read leaves nothing tappable (fail closed) but shows the run's
+  items disabled with "couldn't check — pull to refresh"
+  (`runVerdictsFailed`), and the next refresh retries it.
   Authorizing a run is a money-path decision, so it confirms first and the
   dialog names the run (created date + payment count) and its total; the
   server's own refusal sentence (409 wrong state / 403 maker-checker) surfaces
   verbatim. Approving moves no money — execution stays a separate action.
+  **Retrying a run's failed payments is web-only** (the run dialog's *Retry
+  failed payments*): mobile has no run-detail surface, and the runs list it
+  reads (`GET /api/payments/runs/`) carries no `actions` verdict to offer the
+  control from — only `GET /runs/{id}` does.
+  **Record-only mode** (the no-rail pilot, issue #517, backend decisions §251)
+  reads the same three server signals as the web payments page, and restates
+  none of them. `PaymentQueueStore` reads `GET /api/payments/execution-mode`
+  beside the queue; Execute is offered only on `processor` and **fails closed**
+  while the mode is unknown (loading, a failed read, offline, a value this
+  build predates — `canDispatchPayments`), and a confirmed `record_only` tenant
+  gets a one-sentence note saying FeohLedger records but never sends and that a
+  run's bank file is on the web app; it leads each tab's scroll list rather than
+  sitting above both tabs. **Record as paid**
+  is offered in both modes, as on the web, to holders of
+  `payment.record_external` (`AuthStore.canRecordExternalPayment`): per queue
+  row from the row's own `record_outside_refusal` (deliberately not `blocked`,
+  the run builder's verdict — #566), shown disabled with its localized reason
+  when refused; the dialog (`widgets/record_payment_dialog.dart`) takes the
+  rail (every rail but `virtual_card`), reference and paid-on date (capped at
+  the reader's today) and posts `POST /api/payments/record-outside` with no
+  `amount`, so the server binds the figure owed. A row carrying
+  `erp_reported_payment` (a live `paid_not_recorded` exception) opens the
+  dialog pre-filled from it, as the web's `erpPrefill` does: the rail only when
+  it is one a payment outside FeohLedger can be recorded on (otherwise left
+  unchosen, and submit waits for a choice), the reference, and the ERP's date
+  unless missing or in the future (then today). It shows the ERP's stated
+  figure and, when the breakdown spans more than one rail, the split with the
+  server's verdict on it; where `split_stands` is true the rail picker gives
+  way to "split across the methods above" and the record posts to the
+  exception's one-click, `POST /api/exceptions/{id}/record-erp-payment`, with
+  no rail (decisions §426). A refusal is announced once (`A11y.announce`); the
+  error line is not also a live region. Per run, a draft or exported
+  run's menu carries **Record run as paid…**, whose dialog reads `GET
+  /runs/{id}`'s `actions.record_outside` verdict before it offers a form and
+  posts `POST /runs/{id}/record-outside`. Refusals (`external_payment_*`,
+  `payment_run_*`, `payments_record_only`) are stated through
+  `l10n/coded_refusal_messages.dart`. Still web-only: the NACHA bank file
+  (download, verify, void), which hands over bank account numbers.
   Money is rendered as server-supplied display strings — the device never does float arithmetic on money (totals are server-computed)
 - Quality inspections (4-way matching) — `InspectionsScreen` + `InspectionStore`
   over `GET /api/inspections` with **server-side** outcome chips (`?result=`;
@@ -83,17 +145,35 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   admin / ap_manager only. Reached from **Settings → Procurement**. QMS sync is
   deliberately web-only — it is an operator action against org-level config that
   409s unless `settings.qms` is set. Not offline-cached: a stale pass/fail is a
-  wrong answer about whether an invoice can be paid. **Recording a goods
-  receipt** (`POST /api/goods-receipts`, web `/goods-receipts` → Record receipt)
-  is web-only for now — there is no receipts screen on mobile; tracked in
-  `docs/followups.md`
+  wrong answer about whether an invoice can be paid.
+- Goods-receipt entry (3-way matching) — `GoodsReceiptRecordScreen` +
+  `GoodsReceiptStore`, the mobile half of the web `/goods-receipts` → Record
+  receipt form, on the same endpoints with no backend change: a debounced PO
+  search + picker (`GET /api/purchase-orders`), the picked PO's lines with
+  ordered / received so far / outstanding (`GET /api/purchase-orders/{id}`),
+  outstanding pre-filled and a fully received line left blank (a pre-filled 0
+  would claim a shortfall), free-text lines for a PO synced with none, an
+  over-receipt note beside a line, received date and an optional delivery-note
+  number, then `POST /api/goods-receipts` with one `Idempotency-Key` per opened
+  form (a retry replays, never books twice). Quantities are kept as typed text
+  and sent as **strings**; outstanding is worked in ten-thousandths, never a
+  `double`. The `goods_receipt_*` coded refusals are stated in the reader's
+  language; the form also says up front that the receiver cannot approve
+  invoices on the PO (`approval_segregation_receiver` at the approval door,
+  decisions §267, §389). Reached from **Settings → Procurement → Record
+  receipt**, shown to admin / ap_manager / ap_clerk (`RECEIPT_ENTRY_ROLES`).
+  The receipts list, detail and cancel stay on the web. Not offline-cached.
 - Adaptive AI workflows (read-first) — `AdaptiveScreen` + `AdaptiveStore` over
   `GET /api/adaptive/{suggestions,approval-patterns,anomalies}`, three tabs each
   with its own loading / error / empty state and its own request sequence (a
   failing anomaly scan cannot blank the patterns a reader is looking at). The one
   write is **dismiss a suggestion** (`POST /suggestions/{id}/dismiss`, behind a
-  confirm dialog, gated on admin / ap_manager = the backend `_WRITE_ROLES`; a CFO
-  reads and is not offered it). **The two apply paths are deliberately absent** —
+  confirm dialog). It is offered from each row's `actions.dismiss`
+  (`_suggestion_actions`: `_WRITE_ROLES`, then `dismiss_refusal`'s status gate),
+  never a role or status check in the app: `null` offers it, any refusal
+  (`role_not_permitted` for a CFO, `workflow_suggestion_not_dismissable` for a
+  row already dismissed or applied) hides it, and a row with no verdict offers
+  nothing. **The two apply paths are deliberately absent** —
   `routing-suggestion/apply` reassigns a live approval and
   `threshold-recommendation/apply` raises the org-wide auto-approve threshold,
   which is a money-path control surface, and the latter's stale-value 409 needs a
@@ -141,6 +221,11 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   log in by email OTP on mobile and is pointed to the web app to finish setup.
 - **Passkey (WebAuthn) MFA** — web-only; never offered as a mobile factor.
 - **Org Security settings** — the web `/organization` page exposes the `mfa.required` toggle; mobile has no equivalent.
+- **Closing a workspace** — web-only by design (`/organization?section=close`,
+  `docs/decisions.md` §306). It is an irreversible configuration action whose
+  refusals (the list of records that must be kept) need room to explain
+  themselves, and its second-factor step-up offers a passkey, which mobile
+  never does. `OrgSettingsScreen` deliberately has no equivalent.
 - **OIDC SSO** — `Sign in with Okta/Microsoft` button is web-only.
 - **Workflow management (create / edit / no-code builder)** — the read-only
   list + step viewer is now on mobile (see Done → "Workflow management
@@ -151,8 +236,15 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
 - **Bulk operations** — invoice multi-select (long-press or the checklist
   app-bar action) + bulk delete / bulk status-change / **bulk export** over
   `POST /api/invoices/bulk/{delete,status,export}`; gated to
-  admin/ap_manager/cfo; the backend skips immutable-status rows and the result
-  snackbar reports deleted/updated + skipped counts. Bulk **reject** first asks
+  admin/ap_manager/cfo; the backend skips the rows it refuses and the result
+  reports deleted/updated + skipped counts. A status change that skips rows
+  lists each one in a dialog — its invoice number and the reason, stated from
+  the skip's `code` / `params` through `coded_refusal_messages.dart` (the
+  server's English `reason` for a code this build does not know); bulk delete
+  answers bare ids, so it keeps the count. **Approved** is offered only when
+  every selected row is `ready_for_review` (`InvoiceStore.selectionAwaitingReview`),
+  the only state a bulk approve moves (backend decisions §418), as the web
+  picker does. Bulk **reject** first asks
   for a reason (the shared `reject_reason_dialog.dart`) and sends it as
   `reason` — the backend 422s a reasonless bulk rejection. **Export** offers CSV / XML
   from a format sheet, POSTs the selected ids to `bulk/export` (raw bytes via
@@ -172,9 +264,9 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   offline-cached (privileged admin read).
 - **Admin user management** — `AdminUsersScreen` over `/api/admin/*`: list/search
   users, **create a user** (a FAB opens a validated form sheet — full name +
-  email + system-role pick → `POST /api/admin/users`; the server-generated
-  one-time temporary password is surfaced in a dialog for the admin to hand
-  over, then the list refreshes), edit a user's roles (system roles only —
+  email + system-role pick → `POST /api/admin/users`; the user is emailed a
+  single-use set-password link and the screen confirms it in a snackbar — no
+  credential is ever shown, decisions §283 — then the list refreshes), edit a user's roles (system roles only —
   the mobile role editor offers only the four SYSTEM roles — custom roles are created and granted on the web (`/admin?tab=roles`). Custom roles DO confer access: effective permissions are the union over a user's roles, custom ones via the `roles.permissions` JSONB column (migration 0062) — see `backend/app/api/permissions.py`), activate/deactivate, and **delete a
   user** (an armed/confirmed destructive action in the per-user sheet →
   `DELETE /api/admin/users/{id}`; self-delete is disabled client-side and the

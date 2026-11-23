@@ -1,20 +1,26 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'package:feohledger_mobile/l10n/coded_refusal_messages.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
+import 'package:feohledger_mobile/l10n/load_error_messages.dart';
 import 'package:feohledger_mobile/models/exception.dart';
 import 'package:feohledger_mobile/screens/exception_detail_screen.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/exception_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
+import 'package:feohledger_mobile/widgets/async_list_body.dart';
 import 'package:feohledger_mobile/widgets/bulk_action_bar.dart';
 import 'package:feohledger_mobile/widgets/exception_list_tile.dart';
 
 /// Exception queue — list flagged invoices with status filters and act on each
 /// (resolve / escalate / dismiss). Swipe a row right to resolve, left to
-/// dismiss; the trailing menu carries escalate (a third action doesn't map onto
-/// a binary swipe). Mirrors `ApprovalsScreen` + `InvoicesScreen`.
+/// dismiss; the detail screen carries escalate (a third action doesn't map
+/// onto a binary swipe). Each direction is offered from the row's
+/// `decision_refusals` verdict, never a role or status check here: a swipe
+/// goes only where the server would accept it now, and a refused action is
+/// explained on the detail screen. Mirrors `ApprovalsScreen` +
+/// `InvoicesScreen`.
 class ExceptionsScreen extends StatefulWidget {
   const ExceptionsScreen({super.key});
 
@@ -134,46 +140,56 @@ class _ExceptionsScreenState extends State<ExceptionsScreen> {
               listenable: ExceptionStore.instance,
               builder: (context, _) {
                 final store = ExceptionStore.instance;
+                final loadError = store.loadError;
+                final filter = store.statusFilter;
 
-                if (store.loading && store.exceptions.isEmpty) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                if (store.exceptions.isEmpty) {
-                  return Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
+                return AsyncListBody<ApException>(
+                  items: store.exceptions,
+                  loading: store.loading,
+                  // The fetch's failure only — a refused resolve leaves the
+                  // list live (actionError), so it raises no banner.
+                  hasError: loadError != null,
+                  fromCache: store.fromCache,
+                  // Worded from the cause: the server's reason on a 403 / 500,
+                  // the connection sentence only when no server answered.
+                  errorMessage: loadError == null
+                      ? ''
+                      : describeLoadError(
+                          l,
+                          loadError,
+                          l.exceptionsLoadErrorPrefix,
+                        ),
+                  onRefresh: store.fetch,
+                  filteredEmpty: filter == null
+                      ? null
+                      : FilteredEmptyState(
+                          message: l.exceptionsFilteredEmpty(filter),
+                          onShowAll: () => store.setStatusFilter(null),
+                        ),
+                  empty: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const ExcludeSemantics(
+                        child: Icon(
                           Icons.check_circle,
                           size: 64,
                           color: Colors.green,
                         ),
-                        const SizedBox(height: 16),
-                        Text(
-                          l.exceptionsEmpty,
-                          style: const TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w600,
-                          ),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        l.exceptionsEmpty,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w600,
                         ),
-                        const SizedBox(height: 4),
-                        Text(l.exceptionsQueueClear),
-                      ],
-                    ),
-                  );
-                }
-
-                return RefreshIndicator(
-                  onRefresh: store.fetch,
-                  child: ListView.separated(
-                    itemCount: store.exceptions.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      final exc = store.exceptions[index];
-                      return _buildRow(exc);
-                    },
+                      ),
+                      const SizedBox(height: 4),
+                      Text(l.exceptionsQueueClear, textAlign: TextAlign.center),
+                    ],
                   ),
+                  itemBuilder: (context, exc) => _buildRow(exc),
                 );
               },
             ),
@@ -186,6 +202,13 @@ class _ExceptionsScreenState extends State<ExceptionsScreen> {
     final l = AppLocalizations.of(context);
     final store = ExceptionStore.instance;
     final selecting = store.selectionMode;
+    final resolve = exc.resolveVerdict;
+    final dismiss = exc.dismissVerdict;
+    // A row the reader may decide at all — not refused for their role or for
+    // a terminal status. Only those enter bulk selection.
+    final decidable =
+        resolve.isOffered(hiddenCodes: kExceptionHiddenRefusals) ||
+        dismiss.isOffered(hiddenCodes: kExceptionHiddenRefusals);
 
     final tile = ExceptionListTile(
       exception: exc,
@@ -193,18 +216,27 @@ class _ExceptionsScreenState extends State<ExceptionsScreen> {
       onTap: selecting
           ? () => store.toggleSelected(exc.id)
           : () => _openDetail(exc),
-      onLongPress: _canBulk && !selecting && exc.status.isActionable
+      onLongPress: _canBulk && !selecting && decidable
           ? () => store.enterSelectionMode(exc.id)
           : null,
     );
 
-    // In selection mode, or for terminal (read-only) rows, no swipe.
-    if (selecting || !exc.status.isActionable) {
+    // In selection mode no swipe; otherwise only in a direction the server
+    // would accept now (a segregation refusal is explained on the detail).
+    final direction = resolve.allowed && dismiss.allowed
+        ? DismissDirection.horizontal
+        : resolve.allowed
+        ? DismissDirection.startToEnd
+        : dismiss.allowed
+        ? DismissDirection.endToStart
+        : null;
+    if (selecting || direction == null) {
       return tile;
     }
 
     return Dismissible(
       key: ValueKey(exc.id),
+      direction: direction,
       background: _swipeBackground(
         Colors.green.shade700,
         Icons.check,

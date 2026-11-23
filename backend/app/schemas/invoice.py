@@ -1,9 +1,12 @@
 from datetime import date, datetime
 from decimal import Decimal
-from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.models.invoice_status import (
+    InvoiceStatus,  # the one enum; see that module
+    financially_locked,
+)
 from app.schemas.money import MoneyAmount, OptionalMoneyAmount
 from app.services.storage import invoice_file_url
 from app.services.vendor_consolidation import mask_tax_id
@@ -13,7 +16,8 @@ from app.services.vendor_consolidation import mask_tax_id
 #: verbatim turned a save that changed nothing into an `invoice.edited` row
 #: recording `null -> ""` on the SOX trail (the modal's Send to ERP saves the
 #: form first). `vendor` and `invoice_number` are NOT NULL columns and
-#: `currency` has a default, so they are not in this list.
+#: `currency` is checked through `api/refusals.invoice_currency`, so they are
+#: not in this list.
 OPTIONAL_TEXT_FIELDS = (
     "payment_terms",
     "po_number",
@@ -46,27 +50,18 @@ def _is_masked_tax_id(value) -> bool:
     return isinstance(value, str) and value.startswith("***")
 
 
-class InvoiceStatus(StrEnum):
-    new = "new"
-    pending = "pending"
-    ready_for_review = "ready_for_review"
-    approved = "approved"
-    rejected = "rejected"
-    sending_to_erp = "sending_to_erp"
-    sent_to_erp = "sent_to_erp"
-    posted_in_erp = "posted_in_erp"
-    payment_scheduled = "payment_scheduled"
-    paid = "paid"
-    done = "done"
-    failed = "failed"
-
-
 class InvoiceBase(BaseModel):
     vendor: str = Field(..., max_length=255)
     invoice_number: str = Field(..., max_length=100)
     # Digits match `invoices.amount` Numeric(15, 2).
     amount: Decimal = Field(..., ge=0, max_digits=15, decimal_places=2)
-    currency: str = Field(default="USD", max_length=3)
+    # Required, with no default: an omitted code used to book the invoice in
+    # USD (decisions §473). Raw here, like `InvoiceUpdate.currency`, so the
+    # create handler's `api/refusals.invoice_currency(..., creating=True)`
+    # answers an omitted, blank or malformed code with the coded 422
+    # `invoice_currency_required` / `invoice_currency_invalid` a client can
+    # state, not Pydantic's field list.
+    currency: str | None = None
     invoice_date: date | None = None
     received_date: date | None = None
     due_date: date | None = None
@@ -120,7 +115,10 @@ class InvoiceUpdate(BaseModel):
     vendor: str | None = Field(default=None, max_length=255)
     invoice_number: str | None = Field(default=None, max_length=100)
     amount: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
-    currency: str | None = Field(default=None, max_length=3)
+    # Raw on purpose: the handler shape-checks it through
+    # `api/refusals.invoice_currency`, so a blank or malformed code is a coded
+    # 422 a client can state, not Pydantic's list (decisions §460).
+    currency: str | None = None
     invoice_date: date | None = None
     received_date: date | None = None
     due_date: date | None = None
@@ -192,7 +190,9 @@ class InvoiceResponse(BaseModel):
     vendor_id: str | None = None
     invoice_number: str
     amount: MoneyAmount
-    currency: str
+    # `None` = currency unknown (an upload before extraction, or a document
+    # that names none). Never defaulted: clients render it without a symbol.
+    currency: str | None
     invoice_date: str | None
     received_date: str | None
     due_date: str | None
@@ -244,6 +244,12 @@ class InvoiceResponse(BaseModel):
     # `services.invoice_warnings.refresh_warnings`. Null when the invoice has
     # no `po_number`. The invoice modal renders this as a PO Match panel.
     po_match: dict | None = None
+    # The bill this invoice was posted as in the ERP (a Xero InvoiceID, a
+    # QuickBooks Bill Id, ...) and the provider's deep link to it. Null until a
+    # push is confirmed; the URL is null too for a provider with no stable deep
+    # link (`services/erp_adapters/deep_links.py`). Set only by `services/erp`.
+    erp_document_id: str | None = None
+    erp_document_url: str | None = None
     # Summary counts from the latest extraction's priors_metadata — feeds the
     # small "priors applied" indicator on the invoice-list row. Null when no
     # extraction ran or no priors fired.
@@ -252,6 +258,13 @@ class InvoiceResponse(BaseModel):
     # this on load and echoes it back as `expected_updated_at` on the next
     # `PATCH` — the client-side half of the optimistic-concurrency guard.
     updated_at: str
+    # Whether the amount, payee, line items and document are frozen
+    # (`models/invoice_status.financially_locked`: from `approved` on, and at
+    # a failed ERP push after approval — decisions §370). The server's answer,
+    # so a client strips the frozen fields from a save without restating the
+    # status list; the mobile edit sheet reads it. No default: every response
+    # states it, and a client treats its absence as locked.
+    financially_locked: bool
 
     model_config = {"from_attributes": True}
 
@@ -311,7 +324,10 @@ class InvoiceResponse(BaseModel):
             file_url=invoice_file_url(inv.file_key) if inv.file_key else inv.file_url,
             warnings=inv.warnings,
             po_match=inv.po_match,
+            erp_document_id=inv.erp_document_id,
+            erp_document_url=inv.erp_document_url,
             priors_summary=_priors_summary(inv),
+            financially_locked=financially_locked(inv),
         )
 
 
@@ -329,8 +345,19 @@ def _priors_summary(inv) -> dict | None:
     return {"cache": cache, "rag": rag}
 
 
+class InvoiceListItem(InvoiceResponse):
+    """A row of ``GET /api/invoices``: the invoice, plus — only when the caller
+    asked with ``?include=review_actions`` — the caller's ``approve`` /
+    ``reject`` verdicts on it, exactly the two keys
+    ``GET /api/invoices/{id}/review-actions`` answers (``review.review_refusals``,
+    each ``null`` or the coded refusal). ``null`` when not asked for, so the
+    main list pays nothing for it."""
+
+    review_actions: dict[str, dict | None] | None = None
+
+
 class InvoiceListResponse(BaseModel):
-    items: list[InvoiceResponse]
+    items: list[InvoiceListItem]
     total: int
     page: int
     page_size: int
@@ -392,10 +419,17 @@ class BulkStatusSkip(BaseModel):
     frozen"; `reason` carries the real cause (the underlying service's own
     `HTTPException.detail`) so the caller isn't misled into treating an
     authorization refusal as a data problem.
+
+    A skip from a coded refusal (`api/refusals.coded_refusal`) also carries its
+    ``code`` and ``params``, so the browser states it in the reader's language
+    and falls back to ``reason`` for a code it does not know. Both are left out
+    of an uncoded skip (the route drops ``None``), whose shape is unchanged.
     """
 
     id: str
     reason: str
+    code: str | None = None
+    params: dict | None = None
 
 
 class BulkStatusResponse(BaseModel):
@@ -421,24 +455,6 @@ class BulkRecodeGLRequest(BaseModel):
     vendor_ids: list[str] = Field(default_factory=list)
     include_ai_fallback: bool = False
     dry_run: bool = True
-
-
-class InvoiceLineItemResponse(BaseModel):
-    id: str
-    line_number: int | None
-    item_code: str | None
-    description: str | None
-    quantity: float | None
-    # Money stays `Decimal` in Python and serialises to the same JSON number —
-    # matching what `GET /api/invoices/{id}/line-items` actually emits, which
-    # builds its dict through `schemas.money.json_money`. `quantity` above is a
-    # count, not money, so it is honestly a float.
-    unit_price: OptionalMoneyAmount
-    tax: OptionalMoneyAmount
-    total: OptionalMoneyAmount
-    gl_account: str | None
-
-    model_config = {"from_attributes": True}
 
 
 class RouteIntercompanyRequest(BaseModel):

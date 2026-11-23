@@ -46,7 +46,10 @@ from tests.commerce_contract import (
     use_fake_commerce,
 )
 
-EN_CATALOGUE = pathlib.Path(__file__).resolve().parents[2] / "frontend/src/lib/i18n/locales/en.ts"
+# The English main catalogue plus the settings slice, which /organization loads
+# and which holds the commerce form's labels (decisions §300).
+_LOCALES = pathlib.Path(__file__).resolve().parents[2] / "frontend/src/lib/i18n/locales"
+EN_CATALOGUES = (_LOCALES / "en.ts", _LOCALES / "settings/en.ts")
 
 
 @pytest.fixture(autouse=True)
@@ -162,7 +165,7 @@ def test_every_registered_spec_is_well_formed():
 
 
 def test_every_catalogue_message_key_exists_in_the_frontend_catalogue():
-    text = EN_CATALOGUE.read_text()
+    text = "".join(p.read_text() for p in EN_CATALOGUES)
     keys = {f"org.commerce.field.{name}" for name in catalog.KNOWN_FIELD_LABELS}
     for cls in registry.registered_adapters().values():
         for f in cls.spec.fields:
@@ -170,7 +173,7 @@ def test_every_catalogue_message_key_exists_in_the_frontend_catalogue():
             if "help_key" in f:
                 keys.add(f["help_key"])
     missing = sorted(k for k in keys if f"'{k}':" not in text)
-    assert not missing, f"frontend en.ts lacks {missing}"
+    assert not missing, f"the frontend English catalogue (main + settings slice) lacks {missing}"
 
 
 def test_every_host_naming_field_is_a_destination_key():
@@ -304,6 +307,43 @@ async def test_api_base_refuses_plain_http_and_internal_hosts(secret_provider, m
         await adapter.api_base("https://169.254.169.254")
 
 
+async def test_http_client_is_pinned_and_a_rebind_is_a_config_error(secret_provider, monkeypatch):
+    """`api_base`'s check resolves once; httpx would resolve again at connect.
+    Outside the overrides the client is pinned, and an internal answer at
+    connect time is the same CommerceConfigError the check raises."""
+    import httpcore
+
+    from app.utils import url_safety
+
+    monkeypatch.setattr(settings, "commerce_api_base_override", "")
+    monkeypatch.setattr(commerce_base, "_TRANSPORT_OVERRIDE", None)
+
+    class _Backend(httpcore.AsyncNetworkBackend):
+        async def connect_tcp(self, *_a, **_kw):
+            raise AssertionError("an internal answer must not be dialled")
+
+        async def connect_unix_socket(self, *_a, **_kw):
+            raise AssertionError("never a unix socket")
+
+        async def sleep(self, seconds):
+            pass
+
+    async def lookup(host, port):
+        return ["169.254.169.254"]
+
+    monkeypatch.setattr(url_safety.httpcore, "AnyIOBackend", _Backend)
+    monkeypatch.setattr(url_safety, "_lookup_async", lookup)
+    adapter = secret_provider({"provider": "secretshop"})
+    async with adapter.http_client() as client:
+        assert isinstance(client._transport, url_safety.PinnedAsyncTransport)
+        with pytest.raises(CommerceConfigError):
+            await client.get("https://shop.example.com/admin/api/locations.json")
+
+    monkeypatch.setattr(settings, "commerce_api_base_override", "http://localhost:12113")
+    async with adapter.http_client() as client:
+        assert not isinstance(client._transport, url_safety.PinnedAsyncTransport)
+
+
 def test_require_names_the_missing_field(secret_provider):
     with pytest.raises(CommerceConfigError, match="access_token"):
         secret_provider({"provider": "secretshop"}).require("access_token")
@@ -316,6 +356,7 @@ def test_a_deployed_environment_refuses_the_override():
             commerce_api_base_override="http://localhost:12113",
             secret_key="x" * 40,
             hcaptcha_secret="h",
+            hcaptcha_sitekey="site-key",
             credential_kms_key_id="arn:aws:kms:us-east-1:111122223333:key/test",
         )
 

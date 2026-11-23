@@ -11933,3 +11933,12863 @@ failed check (429, outage) is retryable rather than "expired", set mode, the
 hidden username field and the prefilled sign-in link;
 `tests-e2e/auth/login.spec.ts` the prefill; `tests-e2e/signup/` and
 `tests-e2e/email/signup-email.spec.ts` the whole journey through Mailpit.
+
+## 284. GL accounts and vendors link by the ERP's unique key, within the ERP company that issued it; a push refusal is a code the reader can act on (migrations 0114, 0115, 2026-10-19)
+
+**Found live.** Against the real QuickBooks Online sandbox, a first chart sync
+into an empty chart reported 89 accounts as "81 new, 8 updated", and an invoice
+coded "Job Materials" — shown under "Job Expenses" in our picker — was posted as
+a Bill to "Landscaping Services:Job Materials". Two defects stacked:
+
+1. `quickbooks_online._account_code` keyed an account by `AcctNum or Name`.
+   QuickBooks keeps a `Name` unique only among its siblings; the sandbox repeats
+   eight sub-account names under two parents. Only `FullyQualifiedName` (the
+   colon-joined path) is unique, and `AcctNum` when numbering is on.
+2. `POST /api/gl-accounts/sync-erp` upserted by code, with a per-run `pending`
+   dict by code, so the second account with a code overwrote the first row's
+   `erp_account_id` and counted as "updated". The push resolves a code to that
+   id, so the bookkeeper's choice was silently replaced by whichever account the
+   sync read last.
+
+**The rule now: a row is linked to an ERP account only by a key the ERP keeps
+unique, and nothing ambiguous is linked at all** (`services/gl_account_sync`,
+backend/docs/erp-integration.md § GL accounts and vendors are linked by the
+ERP's unique key):
+
+- match by `erp_account_id` first (an ERP rename renames our row), then by
+  code; a row linked to another live account keeps its link and the newcomer is
+  refused (`code_taken`); a dead link (an id the pull no longer contains) is
+  re-pointed by code. That alone does NOT make a sandbox → production move
+  safe: QuickBooks ids collide across companies, which is the next section;
+- a code two pulled accounts resolve to is refused for **both**
+  (`duplicate_code`) and an existing row with it loses its link — reported, never
+  counted as updated;
+- every adapter's `code` was audited against its provider's uniqueness rule
+  (the table in the doc). QuickBooks now uses `AcctNum`, else the path; Merge.dev
+  falls back to the Merge `id`, never the `name`. The others already used a
+  unique key (Xero `Code`, BC No., NetSuite `acctnumber`/`fullname`, Sage nominal
+  code / ID, Intacct ACCOUNTNO, SYSPRO `GlCode`, FE NXT account number).
+- **Vendors**: the name fallback in `vendor_sync` links a manually created
+  vendor only when the name is unique among the pulled records *and* among the
+  unlinked locals; otherwise it is reported (`ambiguous_name`) and nothing is
+  linked or created. It used `scalar_one_or_none`, so two local vendors with one
+  name was a 500 as well as a guess. QuickBooks `Vendor.AcctNum` stopped feeding
+  our vendor `code`: it is the company's account number *at* the vendor.
+
+**An ERP id means something only in the company that issued it (migration
+0115).** Review of the first cut found that the matching above trusted an id
+across companies. QuickBooks numbers accounts and vendors per company with small
+integers, so a sandbox and a production company share most ids: our "Office
+Supplies", linked to sandbox "7", posted to production "7" (Advertising) after a
+reconnect, and the next sync matched the row by that colliding id, renamed it
+"Advertising", and recorded no link change. `vendor_sync` did the same and
+overwrote the vendor's name. So:
+
+- **every link records its connection realm** — `gl_accounts.erp_link_realm`,
+  `vendors.erp_link_realm` (`services/erp_link_realm`), `"<adapter>:<company>"`
+  built from NON-secret configuration only: the OAuth consent's company id
+  (QuickBooks `realmId`, Xero tenant, Sage business, Blackbaud environment), or a
+  direct adapter's company fields (NetSuite account; BC tenant + environment +
+  company; Intacct company; SYSPRO / Sage ZA host + company). Merge.dev's ids
+  are Merge-assigned UUIDs, unique across linked accounts, so its realm is the
+  adapter alone. `mock`, and an OAuth ERP with no consent, have none (`None`):
+  nothing can post there, so nothing is filtered. A secret is never fingerprinted
+  into a realm: it would land on every row and every audit row, and rotating it
+  would read as a company change.
+- **the push resolves only links of the current realm** (`services/erp
+  ._resolve_erp_refs`, `gl_chart.resolve_erp_account_ids`). A link from another
+  company is "not linked", and the bill is refused `vendor_not_linked` /
+  `account_not_linked` before any HTTP call.
+- **a sync re-judges every link of another realm by evidence, and records the
+  outcome** (rule 0 in `gl_account_sync`, the realm pass in `vendor_sync`). A
+  link is kept only when the pull shows the SAME id holding the row's own code
+  (GL: its current code or the legacy key an older adapter gave it) or, for a
+  vendor, the same supplier (same name ignoring case and spacing, or the same
+  non-blank tax id). Then the id names what the row meant in the new company too
+  — a production company copied from the sandbox keeps its links — and the move
+  is recorded (`link_changes` with `from_realm` / `to_realm`; `vendor.synced_from
+  _erp` `change: realm_changed`). Anything else is dead: dropped, never matched
+  by the colliding id, re-matched by code (GL) or by the unambiguous-name rule
+  (vendors), and every change written to `link_changes` / the per-vendor audit
+  row (`change: unlinked`). Rejected: re-matching purely by code and ignoring the
+  old id — it would churn every pre-§284 sub-account row a single-company tenant
+  has, whose code is the legacy key, not the current one.
+- **the connect callback audits a change of company**
+  (`organization.erp_realm_changed`, beside `organization.erp_connected`, both
+  naming the realms). Informational: the per-row realm is what keeps old links
+  from posting, so a reconnect after a disconnect — which leaves no previous
+  company to compare — needs no flag to be safe.
+
+**Links made before 0115 carry no realm (NULL), and nothing recorded which
+company they came from.** Two wrong answers: treat them all as dead (every
+existing tenant's pushes refused until someone syncs — an automatic
+approve-then-push flow strands every invoice), or adopt them into whatever the
+tenant is connected to at the first sync (a tenant that reconnected to another
+company first would have its colliding links blessed — the defect itself). The
+chosen rule: **the migration records, per organization, the realm its ERP
+config names at that moment** (`settings.erp.legacy_link_realm`, control-plane
+step of 0115; absent when no company is nameable, **and never written for a
+QuickBooks Online org**). A QuickBooks org's NULL links are exactly the ones
+the old name-keyed chart sync made, and a sub-account name repeated under two
+parents was merged into one row linked to whichever account the sync read last
+(eight rows in the sandbox). Trusting them on the snapshot would keep those
+rows posting to the wrong account until someone re-ran the sync. So for
+QuickBooks the push refuses every pre-0115 link (`account_not_linked` /
+`vendor_not_linked`) until the first chart sync and vendor sync adopt it by
+evidence and stamp its realm. That holds even on the company the tenant never
+left: refusing the push is the cost of not posting a bill to the wrong account.
+Merge.dev orgs are still stamped: their links were always keyed by the Merge
+record `id` (the name was only a fallback for an id-less record, which Merge
+does not send). The push trusts a NULL link only while the org is still
+connected to that realm — so a tenant **on any other ERP** that never changed
+company keeps posting with no action, and one that connects anywhere else from
+then on has its unverified links refused until a sync re-judges them. The syncs
+never trust a NULL link on the snapshot alone: they apply the same evidence
+rule as for any other realm and stamp the realm (`realm_adopted` counts the
+silent confirmations). The snapshot is written only by the migration;
+`catalog.merge_erp_update` never takes it from a settings save and drops it with
+the block when the ERP changes. Residual, accepted: a tenant that switched
+company *before* 0115 and has not synced since is indistinguishable, at the push,
+from one that never switched; its first sync after 0115 sorts its links by
+evidence. Pre-0115 history is not recoverable from any record. The migration
+computes the realm with a frozen copy of `connection_realm`, not by importing
+it: a revision must write the same thing on every replay (§282).
+`tests/test_migration_0115_erp_link_realm.py` pins the copy to the live
+function, and a failure there after 0115 has shipped means the realm format
+changed and needs its own revision.
+
+**The repair passes cover the whole organization.** Rules 0, 3 and 4 are about
+which ERP account an id or a code names, not about which subsidiary holds the
+row, so they run over every chart row whichever entity the sync was run under
+(they used to run over shared ∪ the selected entity only, leaving a merged row
+in another subsidiary's chart posting until someone synced under it). Matching
+and creating stay scoped to the chart being synced into.
+
+**A person settles what the rules will not guess.** The live sandbox showed the
+hole in "unlink, never guess": the old row "Depreciation" was correctly unlinked
+(the top-level account 40 and "Truck:Depreciation" 39 were both keyed
+"Depreciation" before §284), but the top-level account's current code IS
+"Depreciation", so rule 2 found that same row, judged it legacy-ambiguous and
+refused — on every sync, forever. A bookkeeper could not code a bill to
+top-level Depreciation at all. Now a row left unlinked by rule 3 or 4 keeps the
+ERP accounts it could mean (`gl_accounts.erp_link_candidates`, with the realm
+they came from); `/gl-accounts` shows it as "Needs a decision"; and an admin or
+AP manager picks one (`POST /api/gl-accounts/{id}/erp-link`, audited
+`gl_account.erp_link_confirmed`). Only an offered id under the same connection
+is accepted, and only on an unlinked row. A confirmed link
+(`erp_link_confirmed_at` / `_by`) is exempt from rules 3 and 4 — it is the
+answer to the question they ask — but still dies with its realm or when its
+account leaves the ERP. Nothing auto-picks: the invoices coded to the row are
+the evidence, and only a person can read them. If the person picks
+"Truck:Depreciation" for the old row, the top-level account cannot also own the
+code "Depreciation" in the same chart and stays `code_taken`; that is the
+consequence of their answer, and the doc says so. Considered and rejected:
+persisting the whole last sync report (it goes stale with every edit; the
+per-row candidates are refreshed against each pull and cleared on link).
+
+**Inactive records are read, marked and never created.** `select * from
+Account` returns only active QuickBooks accounts, so an account made inactive
+vanished from the pull: a row linked to it looked like a dead link and our chart
+kept it active (live: Bank Charges, id 8). The adapter now queries `where Active
+IN (true, false)` for accounts and vendors (QuickBooks' documented form), and
+every adapter emits inactive records with `active=False` (NetSuite `isinactive`,
+BC `blocked`) instead of dropping them. Their ids count as live; a matched row
+is marked inactive in our chart (reported as `deactivated`), no row is created
+for one, and a sync never reactivates — a retirement here may be our own
+decision. A vendor linked to an inactive ERP record becomes `inactive` if it was
+`active` (live: Squeaky Kleen Car Wash, 57); no payee is created or linked for
+one. Whether the ERP accepts a bill against an account it made inactive stays
+the ERP's call, as for any retired account (`resolve_erp_account_ids`).
+
+**Smaller holes closed in the same pass.** An account the ERP sends with no id
+is refused (`missing_erp_id`) before the dedupe, which used to collapse two
+id-less accounts into one and count "linked" for writing a NULL. NetSuite and
+BC no longer drop over-long codes themselves: they emit them, the sync refuses
+them `code_too_long`, and their ids stay live for a row already linked to one.
+Vendors the pre-§284 QuickBooks mapping created still carried `Vendor.AcctNum`
+in `code`, which CSV import resolves vendors by: the sync clears `code` where it
+equals the record's AcctNum on a vendor it created (`source = erp_sync`; a
+manual vendor's code may be a person's choice), audited without the old value.
+An `account_not_linked` refusal no longer names the header code when every line
+carries its own (the header is posted nowhere then). And the QuickBooks PO sync
+stopped reading the whole chart to resolve PO-line accounts: `po_line_items`
+has no column for one and nothing reads `PoLinePayload.gl_account`, so the
+call bought discarded data. Lines carry no GL (never the `AccountRef` name);
+persist it by id when a consumer needs it.
+
+**The code is never rewritten on an id match.** The obvious way to repair a
+collapsed row is to re-key it to the account's real code. Rejected: invoices,
+lines, recurring templates and contract lines record the GL as a **string**
+(`schemas/gl_account.GLAccountUpdate` makes `code` immutable for exactly this
+reason, and followups (c) tracks the FK that would lift it), so re-keying
+silently detaches every line coded to it. A drifted code is kept, stays
+correctly linked by id, and is reported (`code_drift`).
+
+**Repair of collapsed rows is an unlink, not a guess.** A pre-fix row "Job
+Materials" linked to Landscaping's id cannot say which account its invoices
+meant (our picker showed it under Job Expenses). `GLAccountPayload.legacy_codes`
+carries the key an older adapter used (QuickBooks' bare `Name`); a row whose
+code is the legacy key of more than one pulled account, and which no longer
+matches its linked account's current code, loses its link. Its invoices are then
+refused `account_not_linked`, naming the code, before any HTTP call, and each
+real account gets its own row. Only legacy keys count as evidence of a merge: a
+current code another account holds is a rename (rule 2's `code_taken`), and
+unlinking there would have re-pointed the old row's invoices at the newcomer.
+Residual, accepted: a collapsed row whose link landed on the account whose new
+code equals the old one (a top-level account named like the sub-accounts) looks
+exactly like a correct row and keeps its link.
+
+**Code length: widen to 100, the width that records a code.** QuickBooks paths
+pass 50 in the sandbox itself ("Landscaping Services:Job Materials:Decks and
+Patios" is 51). Considered:
+
+- *a short stable form within 50* (truncate + id): unreadable for ordinary
+  sub-accounts, in the one field a line picker shows;
+- *skip over-long accounts*, as NetSuite and BC did: a bookkeeper cannot code to
+  a real account at all;
+- *widen past 100*: every column that records a code (`invoices.gl_account`,
+  `invoice_line_items.gl_account`, recurring template and contract lines) is
+  `String(100)`, so a longer chart code could not be coded anywhere, and widening
+  those means touching the eight services that parse them.
+
+So `GL_CODE_MAX_LENGTH = 100` (migration `0114_gl_code_width`, tenant DBs,
+catalog-only `ALTER … TYPE varchar(100)`, downgrade refuses if a value would
+truncate), and the rare QuickBooks path past 100 keeps its head and ends
+`…#<Id>`, unique because the id is. NetSuite and BC emit an over-long code
+as it is (they first skipped it, which hid a live id from the sync). The sync
+refuses anything longer (`code_too_long`) rather than let the database raise.
+
+**Push refusals are coded end to end.** The live test also showed the AP user
+the raw "QuickBooks Online post refused: vendor_not_linked" in the invoice
+modal: English-only, and a reason code is not an instruction. `ErpPostResult`
+now carries `refusal_code` / `refusal_provider`; `services/erp` records
+`refusal = {code, params}` beside `error` on `invoice.erp_failed` (`provider`,
+plus `accounts` for `account_not_linked`); and `api/erpRefusals.ts` states each
+of the registry's codes (`base.ERP_REFUSAL_CODES`) in six locales with what to
+do. Two guards keep it complete: a backend scan that every reason constant under
+`erp_adapters/` is registered, and a vitest that reads the registry out of
+`base.py`. The code lives on the audit row rather than a new invoice column
+because that row is already where the panel reads the failure from, and it is
+append-only — the refusal a user saw is the refusal that was recorded.
+
+## 285. QuickBooks refusals are coded from Intuit's numeric Fault codes, and a deterministic 4xx is never retried (2026-10-19)
+
+**Context.** A live run against the Intuit sandbox (2026-10-19) posted three
+bills QuickBooks refused for three different reasons — dated into books closed
+through 2026-09-30 (closing set to "warning only" in the UI; the API refused
+anyway), coded to an account made inactive, and for a vendor made inactive. All
+three reached the AP user as the same "QuickBooks Online post failed: HTTP 400
+(invalid_request)", and each was sent three times over six seconds before
+failing. The adapter deliberately never read the body (`base.erp_failure_reason`: Intuit's
+`Fault` quotes the submitted bill back, and the message lands on an append-only,
+shipped audit row).
+
+**Decision.** Read the Fault, but only its numbers. `_fault_errors` keeps each
+error's numeric `code` and an `element` that is on a fixed allowlist of Bill
+field names — never `Message` / `Detail`. Known codes map to refusals
+(`period_closed`, `duplicate_document_number`, `company_subscription_inactive`);
+the codes that mean "a reference is bad" (2500, 610, and the catch-all 6000) are
+resolved by reading the bill's own vendor and accounts back by id, so the
+refusal says WHICH (`vendor_inactive`, or `account_inactive` naming our GL
+codes); anything else is `intuit_fault` with the number, so the next unknown is
+diagnosable from the row instead of needing another live run. All are
+non-retryable. Separately, `base.erp_http_failure` makes every adapter's HTTP
+failure retryable only when the status can change on a re-send (5xx, 401, 408,
+409, 423, 425, 429).
+
+That includes Fault 6140 (`duplicate_document_number`, another bill already
+carries the DocNumber). `_find_existing` looks for our own earlier bill before
+every create, so a 6140 is normally someone else's bill; but if QuickBooks'
+query lags and the lookup misses our own, the invoice lands at `failed` instead
+of finding it on a later attempt. That is the safe direction (nothing is posted
+twice), and a manual retry recovers once the query catches up.
+
+**Rejected.** *Reading `Detail` and redacting it* — the redaction would have to
+know every field Intuit might echo, and a miss is permanent on a WORM row.
+*Guessing account vs vendor from the code alone* — 2500 covers both, and the
+read-back is two or three GETs on a path that has already failed. *Retrying
+409 / 423 as deterministic too* — Business Central's stale-etag answer is 409
+and succeeds on the re-read, so treating every 4xx alike would turn a
+concurrency race into a hard failure.
+
+## 286. An open duplicate or fraud exception refuses the ERP push, not only the payment run (migration 0116, 2026-10-19)
+
+**Found live.** In a QuickBooks Online test a clerk entered a second invoice
+with the vendor and number of one already posted. The app raised the
+`duplicate_invoice_number` warning and an open `duplicate` exception, a member
+of `PAYMENT_BLOCKING_EXCEPTION_TYPES`, so our payment runs would not pay it.
+Approval gates on none of those types (§169), so an admin approved it, and
+"Send to ERP" posted it as a second Bill. A posted bill can be paid from inside
+the ERP (QuickBooks "Mark as paid", Bill Pay), so the duplicate liability now
+sat where our payment-run control does not reach.
+
+**The rule:** the push refuses while the invoice has an open or escalated
+exception of a type that says the liability itself is wrong.
+`api/payments.ERP_EXPORT_BLOCKING_EXCEPTION_TYPES`, defined once beside the
+payment set and asserted to be a subset of it:
+
+| Type | Refuses the push? | Why |
+|---|---|---|
+| `duplicate` | yes | the obligation is already booked; a second bill is a second liability for one debt |
+| `fraud_flag` | yes | the obligation may not exist, or not be owed to this payee |
+| `line_total_mismatch` | no | the approver signed the header amount, which is never recomputed from lines and is the total the bill is posted and read back at (`posted_total`). The hold is on paying until the lines are reconciled |
+| `payment_reconciliation` | no | raised on a payment, after the bill exists; the liability is real and the question is whether a rail already holds an order |
+| `quality_hold` | no | goods received and awaiting inspection are still owed; ERP practice is to book the bill, hold payment, and credit any return |
+| `po_mismatch` | no | billing over the PO or ahead of receipt is the ERP's own 3-way-match hold; the vendor's claim is still recorded |
+
+For the four "no" types a bookkeeper paying from the ERP pays a real debt,
+perhaps early; for the two "yes" types they pay money that is not owed. A
+`fraud_flag` at `info` severity (a round amount) refuses too, because it is the
+same row that blocks the payment run: one row, one meaning, and a person clears
+it. So does the `fraud_flag` an approved vendor bank change opens on every
+approved, unpaid invoice for that vendor (`api/vendors._BANK_CHANGE_FLAG_STATUSES`,
+derived from `VALID_TRANSITIONS`: every status on a forward path from
+`approved` to `paid` — `approved`, `sending_to_erp`, `sent_to_erp`, `failed`,
+`posted_in_erp`, `payment_scheduled` — with `failed` counted only for an
+invoice that was ever approved), although it is about the payment destination
+rather than the debt: the change may itself be the BEC, and a bill in the ERP
+is paid against the ERP's own vendor record, which the same request may have
+changed too. Every approved bill for that vendor waits for a second person, and
+the fail-closed cost is that wait. A `paid` invoice is out of reach when the change lands, so voiding its
+payment re-raises the flag if a bank change was approved after that payment
+was made (`api/vendors.reflag_voided_invoice_for_bank_change`, called from
+`POST /api/payments/{id}/void`), stamped with that change's approver; the
+re-payment would otherwise go to the new account unreviewed.
+
+**One chokepoint, plus a synchronous answer.** `services/erp._call_erp` asks
+`services/erp_export_gate.erp_export_blocking_exception` before it builds an
+adapter. Every push reaches it: `POST /complete` (the modal's "Send to ERP"),
+`/send-to-erp`, `/retry-erp`, the local dispatcher and the Lambda worker, all
+through `send_to_erp_internal`. It re-reads on each attempt, so a flag raised
+after the push was queued still stops it, and it raises `ErpPostRefusedError`,
+so the invoice lands at `failed` on the first attempt with
+`refusal = {code: "exception_blocks_erp_export", params: {exception_type}}` on
+`invoice.erp_failed`. The predicate is `payment_runs.blocking_exception_types`
+narrowed with `types=`, so "which flags are live" (anything but resolved or
+dismissed) stays one query. The three HTTP doors also ask, before their
+transition, and answer 409 with the same coded refusal: the push runs in the
+background, and a 202 that fails a second later would leave the user reading
+the audit trail to find out why. The invoice stays `approved` (or `failed`) and
+nothing is queued. The 409 commits first: `/complete` runs `refresh_warnings`,
+which may open the very duplicate the refusal names, and the rollback a raised
+`HTTPException` causes would otherwise send the user to an empty queue.
+
+**A refusal says when the bill may already be in the ERP.** `_call_erp`
+commits `state_data.erp_outcome_unknown = true` before every adapter call and
+sets it false only on a success, so a timeout, a 5xx, a worker that died
+mid-call, or any refusal leaves it true. Every non-success counts because a
+refusal made after the create went through (a QuickBooks read-back that lost
+its connection, a Xero read-back raising `ErpNotConnectedError`) cannot be told
+from one made before anything was sent. `erp.possibly_posted` also reads an
+unconfirmed ERP job, an orphan document, or an `erp_reference`; a row from
+before the key is read fail-closed from `last_error` / `erp_retries`, once.
+When the gate refuses such a retry, the refusal params, the 409 and the
+`invoice.erp_failed` row carry `possibly_posted: true`. The gate does not look
+the bill up: it refuses before any adapter is built, and once the flag is
+cleared the next push's own idempotency lookup finds the bill instead of
+posting another.
+
+**Clearing the flag is the segregated sign-off already in place.** Both types
+are payment-blocking, so `exception_lifecycle.record_decision` refuses anyone
+implicated in the invoice (§169–§170). The invoice's uploader cannot dismiss
+the duplicate and then post it; someone else can, and then the push goes
+through. Nothing in the gate writes to an exception.
+
+**A finding a person cleared stays cleared, while the invoice is unchanged.**
+`_ensure_exception` deduped only against open and escalated rows, so the next
+`refresh_warnings` re-opened a `duplicate` a reviewer had dismissed. With the
+gate, that made a legitimate invoice that shares a number (a vendor who reuses
+numbers yearly) unpostable, because `/complete` refreshes on every send. For
+these two types each detector row now carries `finding_fingerprint` (migration
+0116): a SHA-256 of the finding's code and the invoice fields those rules read
+(`invoice_warnings.finding_fingerprint`), stamped once when the row is raised.
+A row a person resolved or dismissed whose fingerprint equals the invoice's
+current one suppresses the re-raise; an edit to any of those fields raises it
+again. The one input a rule reads from outside the invoice row, the vendor
+email domain of `personal_email_domain`, is hashed from the finding's params.
+
+Matching on the finding's display params was the first version and the review
+rejected it both ways. Three findings have no params (`duplicate_invoice_number`,
+`remit_to_changed`, `future_invoice_date`), so one dismissal exempted the
+invoice from the same finding after an edit re-pointed it at another, already
+paid bill, or at an attacker's remit address: the warning showed but nothing
+blocked, weakening the payment-run gate as well as this one. Other params drift
+with no edit (a new vendor's age in days, a vendor mean, an LLM's wording), so
+a dismissal came back the next day. The fingerprint is over what the person
+judged, the invoice, not over what the sentence displays; it is hashed so the
+column holds no address.
+
+"A person, about this invoice" is enforced, not assumed.
+`exception_lifecycle.record_decision`, the one path that closes an exception,
+keeps the fingerprint on a resolve or dismiss only when a person decided (an
+`actor_id` and no `via`: not a PO-match refresh, not an agent) AND the invoice
+still hashes as it did when the finding was raised. The second condition is
+what the second review asked for: restamping the open row on each refresh let
+an implicated clerk re-point the invoice while a manager had the queue open,
+and the manager's dismissal then recorded a state they never saw. With the
+stamp fixed at raise time, that dismissal binds nothing, the next refresh
+raises the finding again, and a person sees the re-pointed invoice. The same
+holds for writers that change these fields without a refresh (vendor merge,
+the amount-mismatch and multi-PO agent resolvers). The third review closed the
+timed variant, an edit reverted just before the click (S1 to a clean-looking S2
+and back): every `refresh_warnings` voids the stamp of an open row the invoice
+no longer hashes to, whether or not the rule still fires, so once the invoice
+has diverged that row's verdict can never bind (`_void_stale_finding_stamps`).
+The cost of all three is one extra review round, never a dead end: the next
+refresh raises a fresh row stamped with the current state, and its dismissal
+holds. Escalation, including an agent's, leaves the stamp alone. Today no detector or agent closes either type
+anyway. A row closed before 0116 has no fingerprint and never suppresses, which
+is how it behaved. Other types keep re-opening after a person closes them,
+which is a follow-up.
+
+**Not done here** (`docs/followups.md`): a flag raised after the bill is
+already in the ERP leaves that bill payable there, and nothing yet offers the
+existing ERP void from the exception. Voiding automatically was rejected, since
+a flag can be false.
+
+## 287. Absence is evidence only in a whole listing, and only a named company can judge a link (2026-10-19)
+
+**Absence is evidence only in a whole listing, and only a named company can
+judge a link.** Review of §284 found three holes in the rules it added.
+
+1. **A partial pull read as a complete one.** Rule 0 and the dead-link
+   handling read "this id is not in the pull" as "that record is gone", and
+   both syncs count codes and names across the pull to decide uniqueness. But
+   most adapters' chart and vendor listings returned `[]` on any error, the
+   rows read before a later page failed, or the first 1000 rows. So a
+   transient failure, or a large chart, on the first sync after 0115 unlinked
+   every NULL-realm and cross-realm link the pull lacked. A listing now
+   returns everything or raises `ErpListingIncomplete` (`fetch_failed` /
+   `truncated`; QuickBooks raises its own request error on a failed page),
+   which the sync endpoints answer 502 without syncing. The bound is
+   `base.SYNC_LISTING_MAX_ROWS` (10,000; QuickBooks keeps its 50 × 1000 =
+   50,000), and reaching it raises. A truncation marker on a partial result
+   was rejected: the syncs also count codes and names across the pull to
+   decide uniqueness, which a partial pull gets wrong whatever it is marked.
+   An empty pull changes nothing. Locked, inactive and archived records
+   (Blackbaud accounts closed to data entry, inactive Sage ZA accounts,
+   archived Xero accounts and contacts) are emitted `active=False`, not
+   dropped, since a dropped record also reads as a dead link. PO listings keep their bounded best-effort
+   reads: nothing judges a link by a PO's absence.
+2. **A pull with no realm judged real links.** `mock`, or an OAuth ERP with no
+   consent, has no realm, and a sync under one re-judged every link stamped
+   with a named realm against fixture data: real links were dropped, matched
+   by a fixture's colliding id and renamed, re-linked by code, and pending
+   link decisions wiped. Such a pull now leaves every row tied to a named
+   realm alone (a link stamped with one, or candidates offered under one), and
+   a pulled code such a row holds is `code_taken`. It works only on unlinked
+   rows and NULL-realm links.
+3. **A legacy code proved nothing between two named realms.** Rule 0 kept a
+   link moving from one named realm to another (sandbox to production) when
+   the colliding id held the row's legacy code, which for QuickBooks is the
+   bare account `Name` two sub-accounts can share. The current code is now
+   required, or the row is unlinked and the accounts its legacy key names
+   become its `erp_link_candidates` for a person to choose from. A legacy key
+   is still evidence for a NULL-realm (pre-0115) link, overwhelmingly into the
+   same company. Likewise a vendor link between named realms is kept only on
+   a name or tax id that is unique in the pull.
+
+**Smaller holes closed in the same pass.** Business Central and Merge.dev
+vendors with no proper id are skipped, as NetSuite's mapping already did, and
+never keyed by the vendor No., `remote_id` or name: a name used as an id let
+two same-named vendors each relink one row past the ambiguous-name guard, and
+the other fallbacks are a different kind of key from the one the push posts. An
+ERP value too long for its column is dropped and reported, never truncated, and
+never aborts the sync: a vendor's over-long optional field (`code`, email,
+phone, address, tax id, payment terms) is not written and the vendor still
+syncs (`values_too_long`, field names only, also on its audit row); an
+account whose `parent_code` does not fit syncs without one
+(`parent_code_dropped`). Before, one NetSuite `entityid` over 50 characters
+failed the flush and rolled back the whole vendor sync.
+
+**Not done here** (`docs/followups.md`): a resumable sync for listings over the
+bound, the sync UI's reporting of the new keys, over-long names, and the
+adapters that still drop or mislabel records.
+
+## 288. Password sign-in is refused on another workspace's page (2026-10-20)
+
+**Found in production.** A user of one workspace signed in on
+`sandbox.feohledger.com`. Login looks the user up by email across every
+organization and minted a token for the user's own org, whatever page the form
+was on. The page then sent `X-Tenant-Slug: sandbox` with that token,
+`tenant.get_tenant` refused every tenant-scoped call with `403`, and the user
+saw a signed-in screen stuck on "Loading…".
+
+**The rule:** when the login request names a workspace (`X-Tenant-Slug`, or a
+registered custom domain in `Host`) that is not the account's own, login answers
+`403` coded `wrong_workspace`, issues no token, audits
+`auth.login.failure` / `reason=wrong_workspace`, and carries the account's own
+sign-in URL in `params.sign_in_url`. It runs after the password verifies, like
+the `sso_only` refusal, so the unknown-vs-wrong-password parity is untouched and
+the link discloses nothing a correct password does not already prove. A request
+naming no workspace (an API client) is unaffected.
+
+**Rejected:** silently issuing the token and redirecting the browser to the
+account's own workspace. The user asked to sign in *here*; moving them to a
+different tenant without saying so hides which workspace they are in, and a
+token for one tenant handed to another tenant's origin is the confusion the
+refusal exists to stop. Detail: `docs/authentication.md` § Signing in on another
+workspace's page is refused.
+
+**Recovery, for a mismatched token that already exists:** `get_tenant`'s refusal
+is coded `token_tenant_mismatch` (still `403`), and the SPA ends the session on
+it as it does on a `401` — token cleared, `/login?reason=other_workspace` with a
+localized notice — instead of leaving the shell waiting on calls that will never
+succeed.
+
+**Why the suites missed it:** backend tests always send the matching
+`X-Tenant-Slug`, and the e2e isolation specs signed in on each tenant's own
+origin and hopped, where per-origin storage just leaves the other origin signed
+out. They asserted no data leaked, which held, not that the user lands somewhere
+usable. `tests-e2e/auth/tenant-isolation.spec.ts` now signs in on the wrong
+page. Two specs had encoded the defect: `login-security.spec.ts` pinned the old
+"header is advisory" login, and `discounts/bulk-negotiate.spec.ts` signed acme's
+CFO and clerk in on the worker tenant's page, so its role-refusal checks passed
+on the tenant-mismatch 403.
+
+## 289. The web app has a light theme, chosen by the OS or per browser, and the marketing page stays dark (2026-10-20)
+
+**The web app was dark-only, and now follows the reader.** `app.css` set
+`color-scheme: dark` on `:root` and carried one palette; nothing ever decided
+that the product should be dark-only — §28, §180 and §181 were all written
+against the only palette there was ("a base token for text on a dark
+surface"). This supersedes that assumption, not those decisions: the two-token
+contract (§28), the badge tint pairs (§30) and the shared visual layer (§181)
+hold unchanged in both themes. What a theme is: **System** by default (follow
+`prefers-color-scheme`; an OS that states no preference gets dark, the palette
+the app was designed in), or **Light** / **Dark** chosen on
+`/profile?section=appearance` and kept per browser in `localStorage`
+(`feoh_theme`), like the display language — a preference about this screen,
+not about the account.
+
+**The palette switch is all CSS; script only says which one is wanted.** The
+dark palette stays on `:root`, the light one sits on
+`:root[data-theme='light']`, and System is the same light block inside
+`@media (prefers-color-scheme: light) { :root:not([data-theme='dark']) {…} }`.
+The duplication is deliberate: CSS cannot share a declaration block between a
+selector and a media-gated selector, and the alternatives were worse.
+`light-dark()` would have put both values on every token in one place, but it
+changes what `getComputedStyle` returns for a token, needs the audit to model a
+per-element colour scheme, and a white-label override of `--accent` would have
+had to be written as a `light-dark()` pair too. Having the inline script
+resolve System into `light`/`dark` itself would have needed one block, but it
+puts the OS preference on a JavaScript listener rather than the cascade, and a
+page whose script fails would lose the OS's choice. So the copy exists, and
+`tokenPairing.test.ts` holds it: the two light blocks byte-identical, every
+dark colour token redeclared in light, `color-scheme` set in each.
+
+**No dark frame for a Light user.** `src/app.html` carries a short
+inline script that runs before any stylesheet or module and sets `data-theme`
+from storage. It repeats three facts from `src/lib/theme.ts` because it cannot
+import it, and `theme.test.ts` runs the script against every stored value ×
+OS preference — including storage that throws — and compares the result with
+what the module would do. The CloudFront policy sets no CSP (`infra/frontend.tf`
+notes SvelteKit's hydration needs inline script anyway), so the script costs no
+policy change; a future CSP needs its hash.
+
+**Both palettes are held to the same bars, and the audit runs per theme.**
+Every check in `tokenPairing.test.ts` now runs once for dark and once for
+light, never with a looser threshold. Running it the first time on the light
+palette found **~80 failing rules** and, behind them, ~300 colour literals in
+component `<style>` blocks: status red, green and amber typed as hex
+(`#f06464`, `#1fa86a`, `#d4940a`) and tinted backgrounds typed as `rgba()` of
+those hexes. Each was legible on navy and 2.2–2.9:1 on white. They are tokens
+now — a new `--warning` base token, a `--violet` tint pair for the ERP pill
+(two badges spelled it as a literal "rather than a token with one caller",
+which a second theme ends), chrome tokens for borders, scrollbars and the
+modal overlay, and `color-mix(in srgb, var(--tone) N%, transparent)` for every
+tone-tinted background. The audit learned to resolve that `color-mix()` form
+(and the opaque two-colour one): without it, converting a literal to a
+theme-following token would have *removed* its contrast check, which is the
+wrong way for a refactor to move a guard. The exceptions queue and the agent
+dashboard built badges as a literal hex plus a concatenated `1f` alpha in an
+inline `style`; they now name a palette tone and render its tint pair.
+
+**The light base tokens are darker than the bare-surface bar needs.** About
+forty rules put a base token as text on a 10–20% tint of its own hue (an armed
+delete, an inline error box). A first light palette that cleared 4.5:1 on
+white failed every one of them at 4.1–4.5:1; rather than convert forty rules to
+the `-on-tint` pair one by one, each light base token was darkened until it
+clears its own 20% tint, which is a property of the token and can be asserted
+there.
+
+**The marketing landing page stays dark.** It is the one surface designed as
+a picture rather than as UI: the Blender-rendered tally (§180), the grain, the
+glass panels and the hero card were all composed on navy, and a light version
+is a design job — a re-render and new panel treatments — not a token swap.
+Its root carries `data-theme-scope="dark"`, which `app.css` includes in the
+dark palette's selector list; custom properties inherit, so the subtree renders
+dark whatever the page's theme, with no third palette copy. The light audit
+skips the four components only it renders, and a test proves they are rendered
+nowhere else. **The legal pages follow the theme**: they are documents read at
+length, often arriving from outside the app, and a reader who asked for light
+text on a light ground is exactly who should get it; their chrome is tokens
+already. The auth shell, signup, the supplier portal and the help centre follow
+it too.
+
+**Two things this does not settle, tracked rather than half-done.** A
+white-label tenant's `--accent` is written inline on `<html>` and so applies in
+both themes; nothing measured it as text even in dark, and a blue chosen for
+navy is ~3:1 on white (`docs/followups.md`). And testing the storage-throwing
+path showed the app shell renders nothing at all when the browser blocks site
+storage — on `main`, independent of the theme, whose own storage access is
+wrapped (`docs/known-issues.md`).
+
+Guards: `src/lib/a11y/tokenPairing.test.ts` (both palettes, the light blocks'
+identity and coverage, the dark-pinned subtree), `src/lib/theme.test.ts` (the
+resolution rules, storage throwing, and the pre-paint script executed against
+the module), `src/lib/legal/storageInventory.test.ts` (`feoh_theme` is on the
+Cookie Notice), and `tests-e2e/a11y/light-theme.spec.ts` (choose → reload →
+`data-theme` present at the first animation frame, System following the OS
+through CSS alone, the keyboard model of the picker, and axe in light mode on
+a cross-section of the signed-in app, the portal, the auth shell, the help
+centre and the legal pages).
+
+## 290. The theme choice is a cookie on the platform domain, so it follows the visitor across workspaces (2026-10-20)
+
+**§289 said "per browser", and built per origin.** The choice lived in
+`localStorage`, which is scoped to an origin, and every workspace is its own
+origin: `acme.feohledger.com`, `globex.feohledger.com`, and the apex
+`feohledger.com` where signup lives. So Light picked on one workspace did not
+reach another, and — the case a new customer meets first — a theme picked
+while signing up was gone the moment the verification link landed them in
+their new workspace. The copy ("Choose the colour theme for this browser")
+was the intent; the storage was the bug.
+
+**Options weighed.** (a) Keep per-origin and reword everything to say "this
+workspace" — honest, but it makes a screen preference behave like workspace
+data, and the signup → workspace hop would still drop it. (b) Store it on the
+account — §289 already rejected that (a preference about this screen, not the
+person), and signup and sign-in come before any account. (c) Hand it over in
+the post-signup redirect URL — fixes one hop, not workspace → workspace. (d) A
+cookie on the platform's registrable domain, read by the pre-paint script.
+Only (d) is per browser in fact, so it is what shipped.
+
+**How.** On a platform host the choice is written to `feoh_theme` with
+`Domain=<platform domain>; Path=/; Max-Age=1 year; SameSite=Lax` (+ `Secure`
+on https). The domain is never hardcoded. It is never inferred from the
+host's shape either: it is only ever one the build positively declares as
+ours. `hostRouting.ts::sharedCookieDomainForHost` matches the host against
+`PUBLIC_PLATFORM_DOMAINS`, when set, and against the host of
+`PUBLIC_SITE_URL`, the platform's apex origin, which every deployed build
+already sets (`vm-deploy.yml` from `APP_URL`, `deploy/deploy.sh` from
+`APP_DOMAIN`) and which switches no routing on. Production builds leave
+`PUBLIC_PLATFORM_DOMAINS` unset, because setting it turns on vanity-domain
+routing. So the site URL is what makes the cookie work there.
+
+**The legacy host rule is deliberately not an input.** A first cut used it
+when `PUBLIC_PLATFORM_DOMAINS` was unset: a 3+-label host shared at its
+parent. That rule reads a customer's `ap.customer.example` as workspace `ap` of
+`customer.example`, so it would have put our cookie on the customer's own
+parent domain. That is wrong technically, and it would also make the "one
+cookie, on our domain" sentence in the Cookie Notice false. A host that is not
+equal to, or beneath, a declared domain gets no shared cookie, and a build
+that declares nothing shares nothing.
+
+There is no shared domain on localhost (browsers refuse `Domain=localhost`),
+on an IP literal, or on a customer's vanity host (a platform cookie does not
+belong on the customer's domain, and no other workspace could read it there).
+Those keep the §289 `localStorage` behaviour, per origin. On a vanity host
+that loses nothing, because it serves one workspace. The pre-paint
+script reads the cookie first and `localStorage` second, so a choice made on
+another workspace beats an older one remembered here. Two consequences of that
+order, both deliberate: System is written to the cookie as `system` rather
+than by deleting it — deleting would let a stale per-origin Light resurface —
+and a write reads the cookie back before removing this origin's copy, because
+a browser blocking cookies drops the write silently; then the choice falls
+back to `localStorage` and still survives a reload.
+
+**It is a cookie, and the legal pages said there were none.** The Cookie
+Notice and the Privacy Policy both stated the app sets no cookies. They now
+say it sets exactly one, `feoh_theme`: the one word, set only when the visitor
+picks a theme, identifying no one, classified like the language preference as
+functional storage the visitor explicitly asked for (ePrivacy's
+user-interface-customisation exemption). It is sent with navigations to the
+platform's hosts but not with API calls (the API client never sends
+credentials cross-origin). `storageInventory.test.ts` now fails if a second
+`document.cookie =` appears anywhere in `src/`, so "exactly one" cannot go
+stale silently the way "none" would have.
+
+**A picker on the auth pages.** A cross-workspace theme is most useful before
+there is a workspace, and signed-out visitors have no `/profile`. Every
+`AuthShell` page (sign-in, MFA, signup, verify, change-password) now carries
+the same picker under the form — `ui/ThemePicker`, extracted because it was
+about to be wired twice — outside `.form-wrap` so the shell's field styles
+never reach it.
+
+**hCaptcha follows the theme after first render.** It was told the palette
+once, at render, so changing the theme (or the OS, on System) left a dark
+captcha on a light form. hCaptcha has no call to restyle a live widget, so the
+page now loads it in explicit-render mode and an effect redraws it (remove +
+render) whenever `theme.resolved` changes — except when the visitor has
+already solved it: redrawing would discard a token they earned, for a
+cosmetic reason. A solved widget is redrawn in the current palette once its
+token is gone (expired, or spent on a submit).
+
+Guards: `src/lib/theme.test.ts` (the domain derivation — apex, workspace,
+localhost, IP, vanity, the site-URL-only production shape, and a custom
+domain under a foreign parent never getting a `Domain=` with only the legacy
+rule in play; cookie read/write incl. System, a blocked and a
+throwing jar; the pre-paint script against every cookie × stored value),
+`src/lib/legal/storageInventory.test.ts` (one cookie writer, and the notice
+says so), `tests-e2e/a11y/light-theme.spec.ts` (the cookie beats a stored
+choice at the first frame; localhost writes no cookie; the auth-shell picker
+persists and passes axe) and `tests-e2e/signup/flow.spec.ts` (the captcha
+redraws on a picker change and on an OS change, keeps a solved widget, and
+redraws after expiry).
+
+## 291. One address is one account in one workspace, and every collision says so (2026-10-20)
+
+**Found by the admin persona review.** `users.email` is globally unique, so an
+address names one account in one workspace and there is no multi-workspace
+membership. Three paths had not caught up with that:
+
+- **SSO/SAML JIT** searched only the signing-in workspace, then inserted, and the
+  UNIQUE constraint raised at flush: a bare `500` on the callback, no audit row.
+  A contractor in two customers' IdPs hit it on first sign-in and nobody could
+  see why. SCIM already answered the same collision with a `409`.
+- **Admin create/rename** answered a bare "Email already in use" — a dead end
+  for the inviter, and a platform-wide existence oracle for anyone holding
+  `user.manage`, including the admin of a free self-signup tenant.
+- **The `wrong_workspace` row** (§288) recorded neither the workspace whose page
+  it was nor that the password had verified.
+
+**The rules:**
+
+1. `identity_provisioning.email_holder_org_id` is the one platform-wide,
+   case-insensitive "who holds this address" lookup; JIT, admin and SCIM all ask
+   it before writing. JIT raises `EmailInOtherWorkspace` before the insert, and
+   the insert runs in a savepoint so a concurrent writer is the same refusal.
+2. **SSO refuses with a coded `403` `sso_email_in_other_workspace`, and no link.**
+   The password path links the account's own sign-in page because only someone
+   who proved the password sees it. Here the proof is an assertion from the
+   signing-in workspace's IdP, which that workspace's admin controls and can
+   make assert any address; a link would name another tenant's workspace (slug
+   or vanity host) for any address typed. The real user knows their own
+   workspace; the sentence tells them to sign in there or ask for a different
+   address. The row goes in the IdP's workspace (its admin is the one who can
+   act) and **not** in the account's: that admin must not be able to write
+   rows into another tenant's log by typing addresses. SAML routes the refusal
+   through a refusal-only handoff code so the browser lands on the SPA bridge,
+   not raw JSON at the ACS.
+3. **Admin and SCIM say which case it is** — `email_in_this_workspace` (edit the
+   existing user) or `email_in_other_workspace` (use a different address) —
+   naming no workspace and no account.
+4. **The remaining existence signal is bounded, not hidden.** While the address
+   is global, any refusal confirms it is taken. Hiding it would mean answering a
+   collision as if it succeeded (inventing a user that does not exist) or
+   refusing without a reason (the dead end again), so the admin path spends a
+   per-workspace budget of 20 other-workspace refusals an hour, checked before
+   the lookup so a throttled sweep learns nothing. Per workspace rather than per
+   user, so minting extra user-managers does not widen it. Once spent, EVERY
+   create and email rename in that workspace waits out the window — a free
+   address included, with its own coded 429 `email_check_throttled` saying so
+   — because refusing only the taken addresses would make the 429 the oracle.
+   That can pause a real onboarding for up to an hour after twenty
+   other-workspace hits, which is the accepted price. SCIM and SSO are **not**
+   budgeted, and their signal is accepted: an IdP re-sends a doomed SCIM write
+   every reconcile cycle, so a throttle would turn a stated 409 into a stuck
+   provisioning job, and a budget on SSO refusals would lock a whole
+   workspace's sign-ins; both also need the plan-gated SSO/SCIM feature and a
+   configured IdP, each SSO probe is a full browser round trip that leaves a
+   row in the prober's own audit log, and the same admin can already ask the
+   budgeted admin path.
+5. **`wrong_workspace` audits `attempted_workspace` and `password_verified:
+   true` in the account's workspace, and nothing in the attempted one.** An
+   unknown address leaves no row anywhere, so a row in the attempted workspace
+   only when the password was right would make its log an oracle; the event is
+   the account's.
+6. **The wrong-workspace link prefers a registered custom domain** when the org
+   sets no `tenant_url_template` (an explicit template still wins). The runbook
+   registers a host only once DNS and TLS are live, and the slug subdomain is a
+   different origin: another stored token, and no passkeys bound to the vanity
+   host. Other outbound links are unchanged.
+7. **A token refused as `token_tenant_mismatch` is also revoked**, best-effort,
+   by the SPA calling `POST /api/auth/logout` with it and without the page's
+   `X-Tenant-Slug` (logout reads the token's own claims and needs no
+   workspace). Clearing it locally left a live session in its own workspace.
+
+**Rejected:** silently linking or migrating the person into the second
+workspace (an IdP is not entitled to move an account between tenants), and
+true multi-workspace membership now — the right long-term model, but it
+reaches login, sessions, every `organization_id`-keyed user query, SCIM, JIT,
+access reviews and DSAR; tracked in `docs/followups.md` § Surfaced by the
+cross-workspace identity fixes.
+
+Tests: `backend/tests/test_email_identity_case.py` (JIT, the race, the OIDC
+callback, admin create/rename, the budget, SCIM, the wrong-workspace audit
+row), `backend/tests/test_saml_acs_integration.py` (ACS → bridge → exchange),
+`backend/tests/test_tenant_url_resolver.py` (the custom-domain link),
+`frontend/src/lib/api/sessionRejection.test.ts` (revocation) and
+`frontend/src/lib/api/codedRefusals.test.ts` (the three sentences).
+
+## 292. Signup refuses an address that already has an account at /complete, and a used verification link is re-answered (2026-10-20)
+
+**Two dead ends in self-service signup.**
+
+1. **An address that already had an account.** `users.email` is unique across
+   every organization, but `/signup/start` never looked at the address. The
+   visitor was told a link was on its way; opening it ran `provision_tenant`,
+   which created the database, hit the unique index, dropped the database and
+   surfaced as a 500 "Something went wrong… contact support". The verification
+   stayed unconsumed, so every reload did all of that again.
+2. **Opening the link twice.** `/verify` redeems on page load and the token is
+   spent on success, so a reload, a second tab, or a mail scanner that ran the
+   page first met the uniform 410 "invalid or expired, please sign up again" —
+   and signing up again then failed, because the slug was now taken by the
+   workspace that very link had created.
+
+**The rule for (1): refuse at `/complete`, keep `/start` uniform.**
+`/signup/complete` checks the address (case-insensitively, as sign-in does)
+before the slug and before provisioning. An address with an account answers
+`409` coded `signup_email_has_workspace`, with `params.sign_in_url` the existing
+account's own sign-in page, built exactly as the wrong-workspace login refusal
+builds it (§288). The verification is spent and committed before the refusal is
+raised, so it can never reach provisioning again, and re-opening it re-states
+the same refusal. The address is checked before the slug so someone signing up
+again for their own workspace is pointed at it, not told the name is taken.
+
+`/start` answers an address with an account exactly as it answers any other —
+same status, same message, a verification link sent. It is public and captcha'd
+but unauthenticated, and a different answer there would let anyone test which
+addresses have accounts. At `/complete` the visitor has proven they read the
+mailbox, so naming the workspace tells them nothing they could not learn from
+their own inbox.
+
+**Rejected: sending a "you already have a workspace" email from `/start`
+instead of a verification link.** It saves the visitor a click and also keeps
+the answer uniform, but it needs a second email template in six locales, and
+`/complete` needs the check regardless: an address can gain an account between
+the two steps. One refusal point covers both.
+
+**The race is a definite answer too.** If the account appears after the check,
+the real `provision_tenant` fails on the unique index. It already drops the
+database it created and removes any control-plane rows it committed (#575), so
+nothing half-made is left. `/complete` then re-reads the address and the slug
+and, when either explains the failure, answers the coded refusal or the slug
+409, never a 500 the link would repeat. A failure neither explains is still the
+500 with the link left unconsumed, so a transient fault can be retried.
+
+**The rule for (2): `/complete` is idempotent for a spent link.** A spent,
+unexpired verification whose slug now names an organization holding an account
+with the link's address is re-answered with that workspace: `200`,
+`already_verified: true`, the tenant URL, the address and `sign_in_url`.
+Nothing is issued. There is no second set-password link (`set_password_url` is
+null), no welcome email, and no audit row. The first answer and the welcome
+email carry the only link, and minting a fresh credential every time an email
+link is opened is what the single-token design of §283 avoids. The page shows
+"Your workspace is ready" with **Go to sign in** and says where the
+set-password link is. A spent link that matches no workspace, or one past its
+24-hour life, is still the uniform 410: the re-answer never shows a workspace
+the link did not create, and a stale link is not kept alive.
+
+**Rejected: redeeming on a button, as the reset-password page spends its token
+only on submit.** The property that page has is that opening the link costs the
+user nothing (its load is a non-consuming `check`, §283). A button would not
+give `/verify` that property: once the workspace exists the token is spent
+however it was spent, so a reload after success would still meet the 410. The
+re-answer does give it, for every way the link gets opened, the button click
+included. It also makes a JavaScript-running mail scanner harmless: if it
+redeems first, the person who clicks next sees their workspace, and the
+set-password link is in the welcome email the scanner's visit sent.
+
+**Not fixed here.** Nobody who has forgotten which workspace their account is in
+can find it without support. Forgot-password works only on a workspace host,
+and the apex has no sign-in page. This refusal helps only someone who has
+already started a signup. The durable fix, an apex "email me my workspace
+address" form with a uniform answer, is in `docs/followups.md`.
+
+Guards: `backend/tests/test_signup.py` (`/start` uniform for an address with an
+account; the coded refusal on a case variant, never provisioning and stable
+across re-opening; the race against the real `provision_tenant` leaving no
+database and no organization; a spent link re-answered twice with nothing
+minted, sent or provisioned; a spent link on someone else's slug still 410),
+`frontend/src/lib/api/codedRefusals.test.ts` (the refusal localized, the link
+carried), and `frontend/tests-e2e/signup/flow.spec.ts` (both states stubbed, plus
+through Mailpit: the link opened again in a second tab after success, and an
+existing login's signup refused on first open and on reload, with the slug left
+free).
+
+## 293. SCIM writes are audited and last-admin guarded, the guard is serialized, and a deleted user's row says who they were (2026-10-20)
+
+An admin persona review found four gaps in how user accounts change, all in the
+same family: the record of a change, and the one invariant user management
+exists to keep.
+
+**SCIM wrote no audit row and had no last-admin guard.** Create, rename and
+every spelling of a deprovision (`PATCH active:false`, `PUT active:false`,
+`DELETE`) changed the account with nothing on the trail, never revoked the
+deprovisioned user's sessions, and skipped the guard `PATCH /api/admin/users`
+has applied since the sole-admin lockout fix. "Who offboarded Jane, and when?"
+had no answer for IdP-driven leavers, and an IdP misconfiguration could leave
+the org with no admin and no way back short of a database fix. Each SCIM user
+write now commits, revokes sessions on a deactivation, and writes the same
+`user.created` / `user.updated` row the admin API writes, with `via: "scim"`
+and a null `actor_id` (the bearer token is not a user; the group-role rows
+already used null). A failed revoke is recorded (`sessions_revoked: null`)
+rather than failing the request: the deactivation has committed, and a 5xx
+would only make the IdP retry a change that already happened. The SCIM rows are
+deliberately best-effort (`dispatch_auth_audit`), not write-first like the admin
+delete below: refusing a deprovision because the trail is unavailable would keep
+a leaver's account active, which is worse than a deactivation without its row.
+
+*What SCIM gets for the last admin.* `400` with `scimType: "mutability"`.
+RFC 7644 §3.12 defines `mutability` as a modification "not compatible with the
+target attribute's … current state", which is exactly this, and IdPs surface a
+400 to their admin rather than retrying it. A `409` was rejected: the RFC
+reserves it for uniqueness and version conflicts, and this codebase already
+answers `409 uniqueness` on SCIM, so an IdP reading the two alike would be
+reading a different problem. The refusal is audited
+(`user.deactivation_refused`), because an IdP that keeps pushing it is itself
+something an admin must see. The same guard covers a `/Groups` write that would
+revoke an IdP-managed `admin` role from the last admin
+(`auth.scim.role_revoke_refused`) — the same lockout reached through a group,
+which the finding did not name but the invariant does. It is checked before any
+role is touched, so the group write is refused whole rather than half-applied.
+
+**The guard is shared, not copied.** The rule moved out of `api/admin.py` into
+`services/admin_lockout`, which raises a domain exception both surfaces map to
+their own shape. Duplicating it into `scim.py` would have produced two rules
+that drift, and the serialization below would have had to be fixed twice.
+
+**The guard is serialized on the organization row.** It counted the org's other
+active admins and then acted, holding nothing between. Two admins demoting (or
+deleting) each other at the same moment each counted the other, both passed,
+and the org was left with none. The earlier docs called the third-party case "a
+no-op — acting on an admin already required the caller to be one", which holds
+only one request at a time. The guard now locks the organization row before it
+counts, held to the commit, so the second removal waits and then counts what
+the first left. Alternatives:
+
+- *Lock the admin `user_roles` rows* (`SELECT … FOR UPDATE` over the org's admin
+  set, as the review suggested). It does not close the race: each request locks
+  the rows that exist, and a demotion deletes the row the other request would
+  need to see. A row lock protects rows; this invariant is about a set.
+- *A `pg_advisory_xact_lock` keyed on the org.* Correct, but a second
+  serialization mechanism beside the one the codebase already uses for
+  per-org writes (`tenant.lock_organization`).
+- *`SERIALIZABLE` isolation for these requests.* Correct too, but it turns the
+  loser into a serialization failure every caller would need a retry loop for.
+
+The lock is `FOR NO KEY UPDATE`, not `lock_organization`'s `FOR UPDATE`: it
+still conflicts with every settings writer, but not with the `FOR KEY SHARE` an
+insert of a `users` row takes through its foreign key, so inviting a user is not
+made to wait behind a demotion. It is taken only when the write would actually
+remove an active admin. The delete paths gained the guard too: a single delete
+could already never remove the caller, but under concurrency the caller is
+exactly who another request is removing. `tests/test_admin_lockout.py` drives
+the race against Postgres (two sessions, the first holding its demotion open,
+the second observed blocked in `pg_stat_activity`) and fails without the lock.
+
+**A deleted user's audit row says who they were, and is never lost.**
+`user.deleted` carried only the id of a row that no longer exists. It now
+carries the `email`, `role_names` and `was_active` the account held — the
+address recorded the way every `auth.*` row already records it; `full_name`
+stays out, the rule `user.updated` has always followed. The single delete
+wrote its row after the commit with the swallow-everything
+`dispatch_auth_audit`, and the bulk delete did the same after its one commit,
+so a failed write lost the record while the delete stood. The audit row lives
+in the tenant database and the user in the control plane, so one transaction
+cannot hold both; the nearest equivalent, which `PUT /api/organization/sso` and
+the SSO break-glass already use, is to write the row first with
+`record_auth_audit_or_raise` and refuse the change if that fails. A commit
+failing afterwards leaves a row for a delete that did not land — the safe
+direction to be wrong in. The bulk delete does this per row inside a savepoint,
+so one unrecordable row fails as `audit_unavailable` and the rest of the batch
+still lands.
+
+`user.updated` recorded only the new role list. It now records each changed
+role list, active flag and address before and after (`services/user_audit`,
+shared with SCIM).
+
+**The vendor reads admit the vendor permissions.** `GET /api/vendors` (and
+`/ids`, `/counts`, `/{id}`) were `require_roles(admin, ap_manager, cfo)`, so a
+custom role holding only `vendor.manage` or `vendor.block` saw the Vendors page
+in no nav and got a 403 on the list its permission acts on. The payment and
+admin lists were fixed by moving to `require_permission` because their default
+permission holders were exactly the roles they already admitted; here `cfo`
+reads vendors without any vendor permission, so the same move would have taken
+the page from the CFO. `deps.require_role_or_permission` admits either, so the
+system roles keep exactly what they had, and the nav row ORs the same two
+permissions.
+
+## 294. The landing page stays dark as brand, not as a gap waiting for a light version (2026-10-20)
+
+**§289 left the marketing page dark for a reason of cost; this makes it the
+decision.** §289 kept the landing page on the dark palette because a light
+version is a design job (a re-render of the §180 tally on a light ground, new
+grain, new glass-panel and hero-card treatments), not a token swap. It did not
+say whether that job should ever be done, and without an answer the question
+comes back every time someone notices that a light-mode visitor sees a dark
+landing page and then a light sign-in page.
+
+**The answer is no, until evidence says otherwise.** The landing page is the
+one surface composed as a picture, and dark is its brand: the render, the grain
+and the panels were designed together on navy and have passed the accessibility
+audit as they stand. A visitor sees it once or twice before signing up, a dark
+marketing site in front of a light product is a common and unremarkable
+pairing, and a day spent on a second version moves nothing for the first pilot
+customer. Everything a reader spends time in already follows the theme (§289:
+the app, the auth shell, signup, the legal pages, the help centre, the supplier
+portal), so the theme preference is honoured wherever it matters.
+
+**What would reopen it:** measured drop-off of light-mode visitors between the
+landing page and sign-in or signup, or repeated feedback that the switch is
+jarring. Either is a reason to do the design job properly (a light render of
+the tally, panel treatments composed for a light ground, contrast re-measured),
+following the visitor's theme through the existing `data-theme-scope`
+mechanism rather than a page-local toggle. Not a reason: consistency for its
+own sake, or a token swap that leaves the dark-composed render on white.
+
+## 300. Strings only some routes render load with those routes, as lazy catalogue slices in every locale (2026-10-20)
+
+(Numbered 300 because §292–§299 are held by pull requests still in flight.)
+
+The Japanese catalogue measured 100 KB gzipped on `main` — the per-chunk
+ceiling in `web-bundle-budget.yml` — and the five keys of PR #611 took it to
+101. The help slice of §261 had bought two weeks. Behind it sat a second
+problem: English main is a static import, so it shares an entry chunk with
+the i18n runtime, and that chunk was at ~97 KB. Moving keys out of the other
+five catalogues alone would have left the English chunk to trip the ceiling
+next.
+
+The keys moved were chosen by measuring gzipped bytes per top-level namespace
+in `ja` and `en` and keeping the namespaces only a bounded set of routes
+renders:
+
+| Slice | Namespaces | Keys | Share of `ja` | Loaded by |
+|---|---|---|---|---|
+| `settings` | `org`, `orgSso`, `admin`, `billing`, `sweepHealth` | 1,023 | ~20% | `/organization`, `/admin/**`, `/billing`, `/help` |
+| `portal` | `portal` | 295 | ~5% | `/portal/**` |
+
+`invoices`, `vendors`, `payments` and `workflows` are as large but render
+across the app (modals, pickers, status badges), so they stay in the main
+catalogue. Measured on `main` + the split: largest main catalogue 77 KB,
+largest chunk 77 KB (the English one), settings 21 KB, portal 6 KB, total
+1034 KB (was 1050); with #611 on top, 77 / 78 / 1034.
+
+How it works, and what it guarantees:
+
+1. **One mechanism, not a second hand-rolled copy of §261's.**
+   `ensureSlices(...names)` replaces `ensureHelpCatalogue()`;
+   `SLICE_LOADERS` holds a loader per slice per locale; `m()` reads the main
+   catalogue first and only then finds a key's slice by prefix
+   (`SLICE_PREFIXES`), so the runtime never bundles a slice's key list.
+   `MessageKey` now means any key `m()` resolves.
+2. **A route awaits its slice.** Each route's `+layout.ts` is
+   `export const load = () => ensureSlices('settings')`. SvelteKit awaits it
+   before rendering, so a slice key is never read before its slice is there and
+   a client-side navigation paints the reader's language on the first frame —
+   which is better than §261's "English until it lands" on a route.
+   `tests-e2e/i18n/catalogue-slices.spec.ts` proves this with the slice's
+   chunk deliberately delayed; a `load` that does not wait fails it.
+3. **The route-scoped slices are lazy in English too.** Nothing reads them
+   unloaded, and keeping their English out of the entry chunk is what brought
+   the English chunk from ~97 to 77 KB. The help slice keeps its static
+   English copy: a HelpTip renders on every page with no route `load` to wait
+   on, so it needs something to show while its chunk is in flight.
+4. **A key rendered where its slice is not loaded is a test failure.**
+   `src/lib/i18n/slices.test.ts` builds the import graph of `src/` and fails on
+   any file that names a key of a slice (a literal, a `{ui:}` reference in help
+   prose, or a runtime-built prefix) and is reachable from a route whose
+   layouts do not load that slice, naming the chain. Keys the backend names —
+   the ERP and commerce form fields' `label_key`s — are read out of the backend
+   adapter packages and attributed to the panel that renders them. Every slice
+   key must be named somewhere, so a key the scan cannot place fails rather
+   than slipping through; that found two dead keys (`help.glossary.topic`,
+   `org.section.brandingSaved`), removed. In dev, `m()` also logs such a key.
+   The thirteen keys under the slice prefixes that shared code renders —
+   role names, NACHA field names, commerce environment options, the portal's
+   "waiting on" phases — stay in the main catalogue, which the test is what
+   decided.
+5. **A locale switch swaps everything at once.** `setLocale` loads the main
+   catalogue and every wanted slice in parallel and assigns them together, so
+   a settings form never shows one language inside another's chrome. A slice
+   that fails in the new locale falls back to English. §261's loader retried a
+   failed help chunk in a loop for as long as it kept failing; the loader now
+   retries only when the locale changed while it was in flight.
+6. **Parity and plurals cover every slice.** `messages_parity.test.ts` holds
+   each slice in each locale to the main catalogue's rules;
+   `plural_messages.test.ts` and `approvalThresholdCurrency.test.ts` read every
+   slice through `allMessages.ts::loadAllMessages`, having silently stopped
+   seeing the keys that moved (help's plurals included, since §261).
+7. **The budget counts one file per catalogue kind**, the kinds read off the
+   `locales/` subdirectories, so a further slice is counted correctly without
+   editing the workflow.
+
+Rejected:
+
+- **Raising `MAX_LARGEST_CHUNK_KB`.** The workflow's own log says not to for
+  catalogues, and the next feature would trip it again.
+- **A slice per route.** Six thousand keys reorganised for a problem two
+  prefixes solved, and a page's strings would fragment across its modals and
+  shared components.
+- **Moving `invoices.*` / `vendors.*` / `payments.*`.** Larger, but rendered
+  from shared modals and pickers on most routes; the scope test would have
+  kept most of them in main, and a slice every route loads saves nothing.
+- **Keeping the new slices' English static, as help's is.** Simpler, but it
+  leaves the English chunk at ~98 KB, two kilobytes from the ceiling.
+- **Resolving the visitor's locale before the first route `load` runs**, so a
+  non-English cold load of a settings route does not fetch the English slice
+  before its own. It saves ~15 KB on that one cold load and would mean the
+  route `load` and `initLocale` racing to decide the locale; the existing
+  English-first paint of the main catalogue already has the same shape.
+
+Tests: `frontend/src/lib/i18n/slices.test.ts`,
+`frontend/src/lib/i18n/messages_parity.test.ts`,
+`frontend/src/lib/i18n/plural_messages.test.ts`,
+`frontend/tests-e2e/i18n/catalogue-slices.spec.ts`, and the backend's
+`test_erp_catalog.py` / `test_commerce_adapters.py`, which now read the
+settings slice for the form labels they check.
+
+## 295. QuickBooks status flows back, our payments flow there, and a dying connection says so (QuickBooks Phases 3–5, migration 0117, 2026-10-20)
+
+**Context.** Phases 0–2 of the QuickBooks Online adapter (§269–§270, §284–§287)
+push bills. Three things were open (`backend/docs/quickbooks-online-adapter.md`):
+a bill paid or deleted in QuickBooks never reached FeohLedger, a payment made in
+FeohLedger never reached QuickBooks, and nothing warned before the refresh token
+expired. Reading the money path to scope them found the premise missing: a
+confirmed push walked `sent_to_erp → done` (since the `done` status was added),
+so a pushed invoice was never payable here at all, and a QuickBooks "paid" had
+nothing to move. The double-payment risk the plan worried about could not occur
+— and neither could the feature it was meant to protect.
+
+**Decision — where a push lands.** A confirmed push lands at `posted_in_erp`
+(payable) instead of `done` **only when the ERP's payment status provably comes
+back**: `FEOH_ERP_STATUS_SYNC_ENABLED` on AND an adapter with
+`supports_status_sync` (QuickBooks Online). `services/erp_status_sync.
+status_sync_active` is the one predicate `send_to_erp_internal` asks. Off (the
+default, like every outbound sweep), the push still closes at `done`: leaving a
+bill payable here while nothing would ever tell us QuickBooks paid it is the
+double payment. The same flag starts the change-data-capture sweep, so the
+landing can never be on without its guaranteed channel. The push records
+`state_data.erp_realm` beside `erp_reference`: QuickBooks numbers bills per
+company (§284), so a bill id only names a bill within its realm.
+
+Rejected: *landing at `posted_in_erp` for every ERP* (no other adapter reports
+payments back, so every pushed invoice would sit payable while the ERP paid it);
+*gating on the webhook token alone* (Intuit does not guarantee delivery; the CDC
+sweep is the guaranteed channel); *a per-tenant "who pays" setting* (a second
+switch that can contradict the first; nothing here stops a QuickBooks tenant
+paying in either place, and the sync handles both).
+
+**Decision — inbound (Phase 3).**
+
+- `POST /api/erp/webhook/quickbooks`, declared before `/webhook/{erp_type}`.
+  The raw body is verified with the Intuit app's ONE verifier token
+  (`FEOH_ERP_QBO_WEBHOOK_VERIFIER_TOKEN`, base64 HMAC-SHA256 in
+  `intuit-signature`, `webhook_security.verify_hmac_sha256_base64`) before any
+  parse; empty token = every delivery refused, no fallback. CloudEvents only
+  (`qbo.bill.*`, `qbo.billpayment.*`); the event's `data` is never trusted —
+  the bill is read back. Each event is claimed by its id before the 204 goes
+  back (a dedup store we cannot reach is a bodyless 503 so Intuit redelivers);
+  the reads and the transition run after the response, on the request's loop
+  (`payment_erp_sync`'s shape), because Intuit wants an answer within seconds
+  and an event costs up to three reads of the company. A failed event releases
+  its claim. Every rejection is a silent 204.
+- **The realm index is a unique expression index on the OAuth block, not an
+  `erp_connections` table** (migration 0117, control plane:
+  `uq_organizations_erp_oauth_company` on `settings.erp.oauth.(provider,
+  external_tenant_id)`). The block is the one record of the connection, written
+  only by the callback, the refresher and disconnect; a table would be a copy
+  all three must keep in step. The index serves the webhook's routing and makes
+  "one tenant per company" a database rule (the callback maps the
+  IntegrityError of a racing second tenant to `already_linked`). The migration
+  refuses a control plane already holding two tenants on one company rather
+  than pick one. A tenant that switched to another ERP keeps the block (§270) but
+  is not synced.
+- The CDC sweep (`erp-status-sync`) is stateless: every tick asks each company
+  for changes over an overlapping window (`FEOH_ERP_STATUS_SYNC_LOOKBACK_HOURS`,
+  72 h). Re-applying a report is a no-op, so no cursor is stored; a full CDC page
+  raises rather than apply part (§287's "absence is evidence only in a whole
+  listing").
+- `apply_bill_report` matches a bill to its invoice by our `PrivateNote` marker
+  AND the invoice's `erp_reference` (a deleted bill, which cannot be read, by
+  `erp_reference` within the recorded realm only), locks the invoice, and acts
+  by the table in `quickbooks-online-adapter.md` § Phases 3–5 as built. Paid by a
+  person → the existing ERP-paid path (recorded as paid outside, `source=erp`).
+  Paid there while a FeohLedger payment is scheduled, part-paid there, or deleted
+  there while payable here → the payment-BLOCKING `payment_reconciliation`,
+  because each lets a run pay money not owed; the other disagreements →
+  `erp_reconciliation`. **A bill paid only by our own write-back is not news**:
+  the adapter tells our BillPayments (marker) from a person's.
+- The followup "an ERP-reported payment is dated the day the webhook arrives"
+  is the same code path, so it is closed here: the generic webhook takes
+  optional `paid_on` / `payment_method`, QuickBooks supplies the paying
+  BillPayment's `TxnDate` / `PayType`, both validated like the user's own record
+  (a real date not in the future; a recordable rail, never `virtual_card`) and
+  falling back to arrival date / NULL. QuickBooks `CreditCard` needed a rail
+  that is a card but not ours: **`card`**, recorded only (refused on a payment
+  FeohLedger would dispatch), excluded from the 1099 like `virtual_card`.
+
+**Decision — outbound (Phase 4).** `payment_erp_sync` writes a settled payment
+back once its invoice is `paid`, after that commit (no lock across Intuit), only
+for a bill pushed under the CURRENT realm. Idempotent on the payment id in the
+bill's two layers (find our own marker on the bill's BillPayments; `requestid`).
+A replay of a payment someone voided in QuickBooks is refused
+(`bill_payment_voided`) rather than reported written — re-posting would overrule
+them. The pay-from account is the org's choice, as GL codes from our chart
+(`bill_payment_bank_account` / `bill_payment_card_account`, resolved under the
+realm): QuickBooks needs a bank account for `Check` and a card account for
+`CreditCard`, and a guess books money from the wrong account. Never more than the
+bill's open balance (`payment_exceeds_balance`). Refusals are coded on the
+existing registry (`intuit_code`, never `Message`/`Detail`), audited
+`payment.erp_post_failed`, flagged `erp_reconciliation`; they never undo the
+transition, since the money moved. Open question 3 (early-pay discounts) is
+answered conservatively: post what was paid and flag the balance left open for
+the bookkeeper — no vendor credit is created on their behalf. A FeohLedger void
+voids our BillPayment (flagged when it cannot).
+
+**Decision — the connection (Phase 5).** The refresher already records the
+expiry Intuit returns on every rotation. The `erp-connection-health` sweep (off
+by default) **first keeps a quiet connection alive** — a token with fewer than 45
+days left is refreshed through the refresher's own lock and compare-and-swap
+(`force_refresh`) — and only then warns: admins get an in-app + email
+`erp_connection_expiring` notice at each lead (30/7/1 days) still crossed after
+the refresh, once per (reported expiry, lead), the marker written after the
+send so a crash repeats a warning rather than losing one. A connection the
+provider refused gets one "reconnect" notice; the refresher now records why
+(`reconnect_reason`: expired past the reported expiry, else revoked), which
+`/status` and the ERP panel state, with Reconnect offered from the first lead.
+Warning without refreshing was rejected: Intuit rolls the lifetime forward on a
+refresh, so most "expiring" connections are only idle, and a notice for those
+trains admins to ignore the one about the hard cap.
+
+**Hardened in review, before merge.** The money-path review found four ways
+the first cut could still pay a bill twice, each closed here:
+
+- *A vendor credit is not a void.* QuickBooks records a credit applied to a bill
+  as a $0 BillPayment; reading every $0 BillPayment as voided made a
+  fully-credited bill look "paid only by our write-back" and left it payable.
+  "Settled outside FeohLedger" is now judged from the BALANCE (`TotalAmt −
+  Balance` beyond what our marked BillPayments applied), and a credit-settled
+  bill opens the blocking flag instead of being booked as a (1099-reportable)
+  cash payment.
+- *A stateless window loses multi-day gaps.* The sweep keeps a per-connection
+  high-water mark of its last COMPLETE pass and reads from it; with no mark, a
+  mark past CDC's 30 days, or a CDC answer too full to trust, it reads back
+  every bill still payable here instead. A reconnect starts with no mark.
+- *Voiding an ERP-reported payment* reopened the invoice while QuickBooks still
+  showed the bill paid and would never report it again: the void now opens the
+  blocking flag in the same transaction.
+- *A void's ERP leg must survive a crash*, so the pending ERP void is written in
+  the void's transaction and the sweep finishes it; and the write-back re-reads
+  the payment's status, posts the settled amount, and runs for an accepted
+  short settlement too. A run item may not name the record-only `card` rail.
+
+**The remaining window is closed at dispatch (§296):** between a payment made
+in QuickBooks and its webhook (seconds) or the next sweep, a FeohLedger run
+could still execute the same bill; every dispatch now re-reads the bill live.
+Status sync and connection health are separate flags but meant to run
+together: a lost connection is skipped by the sweep and only the health sweep
+tells anyone.
+
+## 296. A payment re-reads its QuickBooks bill immediately before the rail, and an unreadable bill is held (2026-10-20)
+
+**Context.** §295 brings a payment made in QuickBooks back to us by webhook
+(seconds) or by the change-data-capture sweep (hours), and only then does the
+invoice leave our payment queue. A run approved before that — or the second
+item of a run whose first item is at the rail when the bookkeeper pays — still
+went out: the bill was paid twice, and the blocking flag the ERP-paid path
+raises afterwards only stopped what had not yet been dispatched. No local
+check can close this, because the fact that changed lives in QuickBooks.
+
+**Decision.** `services/erp_status_sync.erp_bill_dispatch_refusal` runs at
+every point where money is about to move, with the invoice row locked:
+`api/payments._execute_single_payment` — which every rail dispatch reaches
+(`/execute`, `/resume`, `/retry-failed`, a standalone payment,
+`/compliance/release`, the virtual-card leg) — after
+`payment_runs.dispatch_preflight` has re-confirmed the local facts (still
+payable, no open payment-blocking exception, vendor active, amount still owed)
+and BEFORE the rail adapter; the NACHA export, since the bank's upload of the
+file is the money moving; and `POST /api/cards/generate` before it mints, since
+a minted card is spendable the moment it exists.
+
+- It reads only for an ERP whose bills sync back (`status_sync_active`) and an
+  invoice pushed there under the CURRENT connection realm. An invoice never
+  pushed, or pushed before §295 (closed at `done`, never payable here), is not
+  read.
+- **Open** — nothing taken off the bill by anyone — pays. **Anything else**
+  (paid, part-paid, credited, deleted, a state we cannot classify) refuses the
+  item `erp_bill_not_open:<state>` and opens the blocking
+  `payment_reconciliation` in the same transaction, so neither a later run nor
+  `/retry-failed` pays it until a person clears it. The rest of the run
+  proceeds: one bill's state says nothing about another's.
+- **Paid only by our own write-back while a FeohLedger void of it is recorded
+  as pending** is **held** `erp_bill_void_pending`, retry-safe, with no
+  exception: nothing outside us paid it, the pending-void sweep resolves it,
+  and a flag a person must clear would be a false alarm. "Paid only by us"
+  with NO pending void is unexplained and takes the blocking path.
+- **A bill that can never be read under this connection** — the push named no
+  document, recorded no company, or lives in a company other than the one
+  connected now (a sandbox → production switch) — is held
+  `erp_bill_unlinked:<why>` with a non-blocking `erp_reconciliation`: a retry
+  cannot clear it, so the way out (record it as paid outside FeohLedger, or
+  re-post) needs an owner.
+- **When the bill cannot be vouched for right now** — a network error, an
+  Intuit 5xx/429/401, a lost connection, or a read past
+  `FEOH_ERP_DISPATCH_CHECK_TIMEOUT_SECONDS` (10 s, the whole read: the bill and
+  its payments) — the item is **held**: refused `erp_bill_unverified`,
+  retry-safe, no exception. A connection-level failure holds that org's further
+  checks for a minute without reading, so a degraded QuickBooks costs a long
+  run one timeout, not one per item with each invoice locked; an error about
+  one bill (a 400) holds that item alone. A token refresh cut short by the
+  bound is safe: `erp_oauth.get_access_token` runs the rotation and its
+  persistence as one shielded task, so a refresh Intuit has answered is always
+  stored. Argued:
+  - *Paying blind* re-opens exactly the double payment this exists to close,
+    and the failure is most likely precisely when QuickBooks is busy or
+    degraded — month-end, when bookkeepers pay bills. A double payment is a
+    recovery from the supplier; a held payment is a day's delay that
+    `/retry-failed` ends as soon as Intuit answers, with nothing to undo.
+  - *Raising the blocking exception* on a failed read was rejected: nothing is
+    known to be wrong, and a flag that needs a person (with segregation of
+    duties) to clear an Intuit outage would train people to clear flags
+    unread. The refusal reason on the payment row, the run's partial status and
+    the audit row the dispatch loop writes for every attempt already make the
+    hold visible.
+  - *Retrying the read inline* was rejected: the invoice row lock is held, and
+    the bounded single read is what keeps that lock short.
+- **Idempotent and audited.** The check is a read plus a de-duplicated
+  exception; the refusal is recorded by the dispatch loop's per-payment
+  `payment.*` audit row like every other pre-rail refusal; both reasons are in
+  `payment_runs._RETRY_SAFE_FAILURE_PREFIXES` because no order exists at the
+  processor.
+
+**Accepted residual.** For a rail dispatch and a card mint, the read and the
+money moving are milliseconds apart, not atomic: a bill paid in QuickBooks in
+that gap still goes out, and §295's webhook then raises the blocking flag on
+anything left. Closing it would need a lock QuickBooks does not offer. **A
+NACHA file is different:** the money moves when a person uploads it to the
+bank, hours or days after the export's read, and nothing re-reads the bill in
+between. The record-only pilot's customer is asked to upload promptly; the
+export's own read is what this change can guarantee; a re-check between export
+and upload, and reading the file's bills concurrently rather than one after
+another under the run and invoice locks, are tracked in `docs/followups.md`.
+The old "refuse while the last sync is stale" idea is unnecessary — the live
+read is fresher than any sync. The check follows
+`FEOH_ERP_STATUS_SYNC_ENABLED`: an operator who turns sync off leaves
+`posted_in_erp` invoices payable with no read, by design — the flag is the
+statement that QuickBooks is in the loop.
+
+## 301. The bundle budget and the security scans gate merges through `CI gate`, called from ci.yml (2026-10-20)
+
+**What was wrong.** Branch protection on `main` requires one status check,
+`CI gate` (the `ci-gate` job in `ci.yml`), which fans in on every job in that
+file. Two workflows ran on pull requests from files of their own —
+`web-bundle-budget.yml` and `security.yml` (CodeQL Python, TypeScript/JavaScript
+and GitHub Actions, plus Trivy on the backend image) — so the gate never saw
+their results. A red one was advisory in practice: PR #611 merged with the
+budget red and left `main` failing it, though the budget file's own header said
+"a PR that pushes either metric over its budget fails".
+
+**Rejected: make them required checks too.** The budget is path-scoped. A
+required check whose workflow never triggers never reports, and GitHub holds
+the PR as "expected — waiting for status" forever. Every PR that leaves
+`frontend/` alone would have hung. That is the same reason `ci.yml` has no
+`paths-ignore` and does its scoping inside the run (the `changes` job).
+
+**The rule.** A check that lives in another workflow file gates merges only by
+being *called* from `ci.yml` (`on: workflow_call`), from a job `ci-gate` needs.
+Both files are now reusable workflows, and `ci.yml` calls them as
+`bundle-budget` and `security`.
+
+- **Path scoping moves into `changes`.** The budget's old `paths:` list
+  (`frontend/**`, its own workflow file) is the new `bundle` filter, plus
+  `ci.yml` like every other filter. An unrelated PR **skips** the caller job;
+  `ci-gate` counts `skipped` as a pass and anything else — `failure`,
+  `cancelled` — as a fail, unchanged. If `changes` itself fails, the caller is
+  skipped, but `ci-gate` needs `changes` directly, so the gate still fails.
+- **Security runs on every PR and every push to main, with no filter.** It
+  used to skip docs-only PRs (`paths-ignore`). Keeping that would need a
+  negated filter, and `dorny/paths-filter`'s default `some` quantifier cannot
+  express "anything except docs"; switching the quantifier would change every
+  other filter. CodeQL on a docs-only PR costs two minutes. Not worth a
+  second mechanism.
+- **Trivy comes along.** It is in the same file. It runs with `exit-code: 0`, so
+  only an image that fails to build (or a broken scan step) can turn it red, and
+  a backend image that does not build should block a merge.
+- **The weekly schedule stays in `security.yml`.** No commit starts a CI run on
+  Monday morning, and a full CI run to rescan for new CVEs would be waste. So
+  `security.yml` keeps `schedule` alongside `workflow_call`. Nothing else
+  triggers either file, so no job runs twice.
+- **Permissions are granted at the call site.** A called workflow's token is
+  capped by the calling job, and `ci.yml` defaults to `contents: read`, so the
+  `security` job grants `security-events: write` (SARIF upload) and
+  `actions: read` (CodeQL's workflow-run lookup) itself.
+- **The budget's steps, comments, ceilings and change log are untouched.**
+  Only the trigger changed, so the error messages that tell a contributor to
+  edit `web-bundle-budget.yml` still point at the right file.
+
+**CodeQL timeout: 10 → 20 minutes, no retries.** One CodeQL Python run hit
+the 10-minute timeout on 2026-10-20. Its log shows it was not hung. Extraction
+progressed the whole time, at about ten times the normal per-file cost: 943
+files in 8.5 minutes, where a healthy runner did 1431 in 83 seconds. Over the
+previous 60 runs the three CodeQL jobs took a median of 0.7–1.5 minutes and a
+maximum of 6.6. Ten minutes was about 2× a slow-but-healthy run, too little
+for a check that now blocks merges. Twenty absorbs a degraded runner and still
+stops a real hang long before GitHub's six-hour default. Retrying was
+rejected: a second attempt would hide a genuine hang instead of surfacing it.
+Trivy keeps 10 (median 0.9, max 3.8).
+
+**Transition note.** CodeQL keys an analysis by workflow file and job, so the
+first runs from `ci.yml` start a new configuration beside the old
+`security.yml` ones. The weekly schedule still runs from `security.yml`. Alerts
+are matched across configurations, so this changes which configuration an
+alert is reported under, not whether it is reported.
+
+## 302. The invoice carries its ERP bill id, and the deep link is built once, at push time, by the backend (2026-10-20)
+
+**Found live against Xero.** FEOH-INV-001 was posted and Xero returned its
+InvoiceID, but the id went only to `workflow_instances.state_data
+["erp_reference"]` and the `invoice.erp_confirmed` audit row. The invoice modal
+read its ERP reference off the *latest* ERP audit row, which on a success is
+`invoice.completed` (no reference), and hid the ERP section at `done` anyway. A
+user had no way from the invoice to the bill.
+
+**The rule.** `invoices.erp_document_id` (migration 0118) holds the bill of
+record, written by `services/erp._call_erp` beside the existing state_data
+write — the one place a push is confirmed. It takes the adapter's
+`erp_document_id` only: a document *number* is not addressable (no deep link,
+no API lookup), and `"UNKNOWN"` names nothing. A payment void does not clear it
+(the bill is still in the ERP), and every later confirmed push overwrites the
+pair. A push that confirms without reporting an id CLEARS both columns rather
+than keeping the earlier pair. Keeping it was the first draft, on the grounds
+that the push idempotency resolves a re-push to the same bill, but that only
+holds within one ERP. After an org switches ERP, the kept pair would link a
+money record to another system's bill. A failed push never writes it: a bill a
+failure left behind is the `erp_orphan_document_id` state, not the bill of
+record.
+
+**The deep link is stored, not derived on read.** `invoices.erp_document_url`
+comes from `erp_adapters/deep_links.py`, the one provider → URL mapping, at
+push time. Rejected: a frontend helper over a stored provider name. The link
+depends on the adapter config that posted the bill — QuickBooks sandbox and
+production companies are on different hosts — which only the backend holds,
+and an org may change ERP after posting, so deriving it on read from the
+*current* config would point an old bill at the wrong system. Mobile and any
+other client also get the link with no copy of the mapping. Only Xero and
+QuickBooks Online have one; Merge.dev's id is Merge's own, and the other
+adapters' web UIs are not addressable by the id alone, so they show the id with
+no link. Both URLs are documented by neither vendor: Xero's
+`AccountsPayable/View.aspx?InvoiceID=` matches the page Xero's own MCP server
+targets (which wraps it in an organisation-choosing redirect; not done here —
+`docs/followups.md`), and QuickBooks' `app/bill?txnId=` is the bill page's own
+URL.
+
+**Backfill.** 0118 copies `state_data->>'erp_reference'` where the invoice has
+exactly one workflow instance and the value is not `UNKNOWN`. That value is the
+adapter's id on every adapter that returns one; only a success with a number
+and no id stored the number, which cannot be told apart afterwards and is
+accepted. The URL is not backfilled: the tenant database does not record which
+adapter posted the bill.
+
+**Where it is shown.** Both columns are on `InvoiceResponse`, which the web
+invoice modal and the mobile ERP panel read. Each shows the reference at `done`,
+and after a void, as well as at the ERP statuses. Mobile shows the id without a
+link (`docs/followups.md`). The supplier portal's invoice schema and the public
+`/api/v1` contract deliberately leave both out. The ERP bill is our ledger's
+record, not the supplier's, and adding a field to `/v1` is a published-contract
+change that needs its own decision.
+
+## 303. An adapter reads a bill as paid only on the ERP's own paid status or a payment it records (2026-10-21)
+
+**The problem.** `get_invoice_status` mapped a zero balance to `paid` in three
+adapters (SYSPRO, Sage Accounting ZA, QuickBooks), and Sage Intacct and
+Blackbaud FE NXT did the same as a fallback when their own status word still
+said open. A credit note, a write-off or a zero-total bill also leaves nothing
+owing, so anything recording an ERP-reported payment from that answer would
+book money that never moved, as a 1099-reportable cash payment. The open
+follow-up named this as the precondition for wiring any status poll.
+
+**The rule.** `paid` is a claim that money left the customer. An adapter returns
+it only on the ERP's own paid status, or on a payment the ERP records against
+the bill:
+
+| Adapter | `paid` when | Nothing owing otherwise |
+|---|---|---|
+| QuickBooks Online | `Balance == 0`, `TotalAmt != 0`, and a `BillPaymentCheck` / `BillPaymentCreditCard` in `LinkedTxn` | `settled_no_payment` |
+| Xero | `Status == PAID` and `AmountPaid > 0` (credit notes count in `AmountCredited`) | `settled_no_payment` |
+| Sage Accounting ZA | `AmountDue == 0`, Sage's own `Paid` flag, and a non-zero `Total` | `settled_no_payment` |
+| SYSPRO | never: `ApInvoice` states only a balance | `settled_no_payment` |
+| Sage Intacct | `state == paid` | `open` until the state catches up |
+| Blackbaud FE NXT | `status == Paid` | `open` until the status catches up |
+
+`settled_no_payment` is a new `ErpInvoiceStatus` member. It means "nothing is
+owing, and no payment can be seen", and a caller must flag it for a person, not
+record a payment. Intacct and FE NXT return `open` instead because a lagging
+status word is a timing issue that the next read resolves, not a different fact.
+
+**Relation to §295.** QuickBooks' status sync-back does not use
+`get_invoice_status`. It reads `bill_report`, which judges "settled outside
+FeohLedger" from the balance and treats a vendor credit as not cash. This entry
+brings the older per-adapter read into line with that, so a later generic poll
+for ERPs without `supports_status_sync` (Xero, the gap the live Demo Company
+test found, which is tracked in `docs/followups.md`) starts from honest answers.
+No caller under `app/` reads `get_invoice_status` today, so nothing changes at
+runtime.
+
+*Update 2026-10-26 (issue #650 S4):* the SYSPRO row was wrong about SYSPRO —
+it does record payments against an invoice, in `ApInvoicePay`. SYSPRO now
+returns `paid` when the balance is zero, the invoice is non-zero, and an
+`ApInvoicePay` row by (`Supplier`, `Invoice`) is a payment (`TrnType` `P`,
+non-zero `TrnValue`); otherwise `settled_no_payment`, as before. The payment
+code is unconfirmed until a sandbox shows it, and an unrecognised code reads as
+no payment, so the failure mode stays `settled_no_payment`.
+
+*Update 2026-10-26 (PR #670 money review):* one payment row was not enough. It
+proves only that some money left, so an invoice settled 40 by cheque and 60 by
+a credit note, or closed by a 0.01 payment and a write-off, read `paid` for the
+whole 100. SYSPRO now returns `paid` only when the absolute sum of the payment
+rows' `TrnValue` equals `abs(OrigInvValue)`; any shortfall is
+`settled_no_payment`. Guard: `test_zero_balance_is_paid_only_with_a_recorded_payment`.
+
+Guards: `tests/test_erp_{quickbooks_online,xero,sage_accounting_za,syspro,sage_intacct,blackbaud}_adapter.py`.
+
+## 304. Approval sends to the ERP when the workflow says so, and a refusal leaves the invoice approved (2026-10-20)
+
+**Found live.** In a Xero test, tenant `acme`'s default workflow had the ERP
+export step's `auto_send_on_approval: true`, the builder's "Auto-send on
+approval" switch showed it on, and a manager approved FEOH-INV-001. It sat at
+`approved` until someone clicked "Send to ERP". The flag was in the schema, the
+templates and the builder, and nothing in the backend read it; §286 had even
+written "approval never pushes" down as the rule.
+
+**The rule.** An approval that finalises an invoice starts its ERP push when
+three things hold: the invoice's frozen snapshot (never the live definition, as
+for every other step) has an enabled `erp_export` step whose config holds
+`auto_send_on_approval` as the literal `true`; the org has a live ERP; and the
+same gates a person's "Send to ERP" meets let it through. Every approval door
+counts: `review.approve_invoice`'s final level (in-app single and bulk, email,
+Slack, Teams, mobile, the exception agents), `/complete`'s amount-floor
+auto-approve, and the extraction worker's auto-approve. A partial chain
+approval is not a final one and does not send.
+
+**One sequence for every push.** `services/erp_send.start_erp_send` is the plan
+gate (§258/§281), the export gate (§286), the `approved → sending_to_erp`
+transition with its audit row, the commit, and then `dispatch_erp`, in that
+order. `/send-to-erp`, `/retry-erp`, `/complete` and the auto-send all call it,
+so the auto path cannot skip a gate the manual one applies or apply them in
+another order.
+
+**After the approval commits, in a transaction of its own.** The approval
+doors queue the push as post-commit work (`services/post_commit`); the
+extraction worker calls `send_after_approval` itself once its own commit
+returns, because there post-commit work runs inline while the committing
+session still holds the worker's single connection. Either way the push opens
+its own session, re-locks the invoice and acts only on `approved`. Two things
+follow:
+
+- **A refusal cannot undo the approval.** The approval has already committed.
+  The invoice stays `approved`, which is still payable and still sendable by
+  hand, and the refusal is recorded as an `invoice.erp_auto_send_refused` audit
+  row carrying `{trigger, status_code, refusal: {code, params}}`, the same coded
+  refusal the manual door would have answered with. The approver's response
+  says `approved` and is never a 402 or 409 for a push they did not ask for.
+  Rejected: running the gates inside the approval transaction and failing the
+  approval on a refusal. An open duplicate would then make an invoice
+  unapprovable rather than unpostable, and the plan gate would turn a downgrade
+  into a block on approving. Also rejected: transitioning to `sending_to_erp`
+  in the approval transaction. Every caller that reads the status after
+  `approve_invoice` (the email, Slack and Teams doors tell a partial chain
+  approval from a final one that way) would have seen a status that was not
+  `approved`.
+- **It cannot dispatch twice.** Approval leaves `ready_for_review` and happens
+  once. A retried job, or a manual send or payment schedule that got there
+  first, finds a status other than `approved` under the row lock and does
+  nothing. The `approved → sending_to_erp` transition under that lock is the
+  single guard, as it already was for the manual doors. A bulk approve queues
+  one job per transaction and sends its invoices one after another.
+
+**A missing key is off, and so is the schema default.** The seeded and
+provisioned definitions carry no `auto_send_on_approval` key, and the builder
+renders a missing key as the switch off with the "users must manually trigger
+Send to ERP" warning, so only the literal `true` counts. The schema default for
+`ErpExportStepConfig.auto_send_on_approval` was `true`, and every definition
+save runs each step through that model and stores the dump: an admin who
+changed an approval threshold on a workflow showing the switch off stored
+`true` without seeing it. The default is now `false`. A builder-added step and
+the templates still set it on explicitly, where the switch shows it.
+
+**Stored `true` values are not rewritten.** Before this change the flag did
+nothing, so a `true` saved through the old default cannot be told from one an
+admin chose. Rewriting them to `false` would undo real choices (`acme`'s, the
+one that found this); leaving them means a tenant whose admin saved a workflow
+since the schema existed starts auto-sending on deploy. That is an operator
+call per tenant, tracked as a (b) entry in `docs/followups.md`: before
+deploying, list the definitions holding `true` and confirm each with its
+admin.
+
+**What auto-send hands over.** A successful push ends the invoice at `done`,
+live ERP or mock, by hand or automatically (`erp.send_to_erp_internal`), and
+`done` is not payable here: the bill is paid from the ERP. With an ERP's status
+sync on (QuickBooks, §295) the push lands at `posted_in_erp` instead, still
+payable here, and auto-send changes nothing about that. That is the existing
+meaning of "Send to ERP"; auto-send makes it happen at approval, so with the
+switch on an approved invoice leaves FeohLedger's payment queue moments after
+approval, before anyone can schedule it directly. The builder says so under the
+switch, and `backend/docs/payments.md` notes it. Tenants that pay through
+FeohLedger runs keep the switch off.
+
+**Why the mock ERP is skipped.** For the same reason, applied to tenants with no
+real ledger: the mock is the local-first stand-in (guard rail 7), and every dev
+and e2e tenant runs on it. Auto-sending there would empty the payment queue
+those tenants and the payment specs depend on, with no ERP to pay from. A person
+can still send to it by hand.
+
+**No person behind it.** An extraction auto-approval of an emailed invoice has
+no actor, so `dispatch_erp` and the Lambda worker now carry a null `actor_id`
+instead of the string `"None"`.
+
+**The extraction worker awaits the send.** Its loop (in-process, or the
+Lambda handler's) closes when the job returns, so a local-mode send started as
+a task there would be abandoned at `sending_to_erp`. It passes
+`inline_dispatch=True`, and the send holds that worker until it finishes,
+retries included.
+
+**`post_commit` was running at savepoint boundaries.** SQLAlchemy fires
+`after_commit` when a SAVEPOINT is released and `after_rollback` when one rolls
+back. Bulk approve runs each row in a savepoint, so every queued job (the
+approval emails and chat posts, and now the auto-send) ran at the first row's
+release, inside the still-open outer transaction, and a skipped row's rollback
+then dropped whatever was queued after. A release now leaves the queue alone,
+and a savepoint rollback drops only the jobs queued inside that savepoint.
+
+**A hand-off that fails lands at `failed`.** If `dispatch_erp` raises after the
+`sending_to_erp` commit (an SQS send in lambda mode), nothing will ever run that
+push and `/retry-erp` takes only `failed`. `start_erp_send` now moves it there
+with an `invoice.erp_failed` row, for the manual doors too, which used to
+answer 500 and leave the invoice stranded at `sending_to_erp`.
+
+**Not done here** (`docs/followups.md`): the auto-send is post-commit work, so
+a process that dies between the approval's commit and the job leaves the
+invoice `approved` with neither an `erp_submitted` nor an
+`erp_auto_send_refused` row. Nothing is lost (it is payable and sendable by
+hand), but nothing notices either; a reconciliation sweep is the durable fix.
+
+Guards: `backend/tests/test_erp_auto_send_on_approval.py` (sends with the flag
+on; not with it off, absent, the step disabled, no instance, no ERP or the mock
+ERP; the snapshot decides in both directions; the floor and extraction
+auto-approvals; a partial chain; an open duplicate and the plan each recorded
+with the invoice left approved; a rolled-back approval sends nothing; a second
+run and a bulk approve each dispatch once), `tests/test_erp_dispatch.py` and
+`tests/test_erp_lambda.py` (inline dispatch in a worker scope, the null actor),
+and `frontend/tests-e2e/erp/xero.spec.ts` (approving reaches fake Xero as a bill
+with no click; with the flag off nothing is posted until the click).
+
+## 305. A page offers an action from the server's verdict, computed by the gate the endpoint raises from (issue #575, 2026-10-21)
+
+**What was wrong.** Pages decided whether to show a money-path control by
+restating the endpoint's rule — a status list, a role list, `uploaded_by !==
+me` — and every copy drifted in its own direction. The invoice modal checked
+status + `invoice.approve`, so the uploader, a non-named approver and an
+ap_manager over the CFO limit were offered an Approve that 403'd. The run dialog
+offered the run's creator an Execute (and a CFO-creator an Approve as CFO) that
+maker-checker refused. The exception queue checked only the status, so the
+uploader of a duplicate invoice got a Resolve that 403'd. The bank-change queue
+compared only `requested_by_user_id`, missing the provisioned-login SoD axis.
+The vendor list hid Reject on an `active` vendor both `/reject` and bulk status
+accept. #573 fixed one instance (`record_outside_refusal`); this generalises it.
+
+**The rule.** Each covered action has ONE gate function returning an
+`api/refusals.ActionRefusal` (or raising the coded `HTTPException` it already
+did). The endpoint raises from it, and the read that lists the row ships
+`*_refusal` / `actions` built from the endpoint's permission predicate
+(`api/deps.holds_any_role` / `holds_any_permission`, which `require_roles` /
+`require_permission` now call too) followed by that same gate. `null` = offer
+it; a coded refusal = don't, and say why. The client reads it through
+`#lib/api/actionVerdicts.ts`: unknown is a refusal (fail closed),
+`role_not_permitted` hides the control, any other refusal disables it beside
+its localized reason. The invoice review verdict is its own read (`GET
+/api/invoices/{id}/review-actions`, `review.review_refusals`) because its gates
+need the workflow instance and the receipts — the approve path was split into
+`_identity_gates` / `_figure_gates` / `_chain_level_gate` so the verdict runs
+exactly those, the chain on a scratch copy so reading writes nothing.
+
+Every verdict has a parity test that asks both sides for every seeded role and
+row state — the verdict and the real POST — and fails unless they agree. A
+verdict compared only to itself would prove nothing.
+
+**Two refusals moved onto the server rather than off the page.** Where a page's
+restated rule was stricter than its endpoint, and the endpoint's looser
+behaviour was the defect, the endpoint took the rule:
+
+- `POST /api/invoices/{id}/approve|reject` refuse an invoice that is not
+  `ready_for_review` (409 `invoice_not_in_review`). The single in-app door used
+  to approve a `new` draft straight past review while the email, Slack and
+  Teams doors already refused; all four now read one predicate,
+  `review.awaiting_review`. `POST /api/invoices/bulk/status` with
+  `status=approved` still moves a draft (`new → approved` is a legal
+  transition, through the same approve gates). That is the documented
+  "manager sets a batch's status" capability rather than a review decision, and
+  whether it should skip drafts too is a product call this change does not
+  make — tracked in `docs/followups.md`.
+- `POST /api/payments/{id}/void` refuses a run's `pending` leg and
+  `pending_compliance` (`payment_controls.payment_void_refusal`). A pending leg of an exported run
+  could be voided back into the queue while the uploaded bank file could still
+  pay it — a second payment — and voiding a compliance hold left its
+  `payment_compliance_hold` exception open beside a re-queued invoice. Their
+  exits are the run's (Cancel run, Bank rejected the file, Record run as paid)
+  and Release / Dismiss. Cancel run releases every leg: there is no per-leg
+  removal from a draft run, which is a capability this takes away rather than
+  one it ever offered safely. A standalone `pending` payment (no run, booked by
+  `POST /api/payments`) stays voidable — nothing will send it, and refusing the
+  void would leave recording a payment that never happened as its only exit.
+
+**Rejected: put the verdicts on the mutation responses too.** The rows are
+re-read after a decision on every covered page except the vendor list's
+detail-modal updates, which keep the row's verdict while its status is
+unchanged and drop it otherwise (fail closed until the next read). Widening
+every mutation response to carry a reader-specific verdict would put a
+per-caller field on payloads other clients (mobile, the public API) share.
+
+**Not covered here** (tracked in `docs/followups.md`): the modal's
+assigned-elsewhere clause, which the server does not enforce, and the pages
+that still restate a predicate.
+
+## 306. An administrator can close an unused workspace, which releases its addresses; anything that must be kept goes to support (migrations 0119, 0120, 2026-10-20)
+
+**The dead end.** Since §291 an address names one account in one workspace.
+Someone who signs up with an address, abandons the trial, and is later added to
+another workspace with it is refused `email_in_other_workspace`, and deleting a
+workspace was operator-only (`scripts/delete_tenant.py`), so the only way out
+was support. Reproduced end to end in `backend/tests/test_workspace_closure.py`
+(provision a trial, refuse the address in a second workspace, close the trial,
+accept the address; and through signup: the same address signs up again, §292's
+refusal no longer finding it). Phase 0 of #614; it does not depend on
+multi-workspace membership.
+
+**The call: a self-service close for an administrator, fail-closed to the
+unused workspace, and nothing else.** `POST /api/organization/close` (admin
+role, not a permission: closing is not a splittable duty). It deletes the
+workspace through `services/tenant_deletion.delete_tenant`, and deleting the
+user rows is what frees the addresses. `GET` is the preflight the page reads
+first: the blockers, and — so the irreversible action is an informed one — a
+count per class of what WILL be deleted (invoices, vendors, purchase orders,
+credit memos, expense reports, contracts, exceptions, deactivated accounts).
+
+**What refuses it**, each by a stable code the page states, and the way forward
+for every one is support:
+
+- records with a retention obligation or an effect outside the workspace: an
+  approved invoice (status past review, or `approved_by` set, which also
+  catches one whose ERP send failed); any payment, payment run or virtual card;
+  an applied credit memo; an approved or reimbursed expense report or an
+  approved spend pre-approval; imported card transactions or bank statements;
+  supplier statement reconciliations (`backend/docs/privacy.md` keeps their
+  files as evidence); 1099 filings, VAT / GST / withholding records, Positive
+  Pay files, sent or received e-invoices; a purchase order that has been
+  received or closed; an approved or converted requisition or intake request;
+  goods receipts and stock pushed to a commerce platform; a contract that was
+  ever in force; an accepted discount; an approved supplier bank or tax change;
+  a data-subject request record;
+- other people's accounts: another **active** user (another administrator can
+  remove the caller instead, which frees the address the same way), or a
+  supplier-portal login;
+- a commercial relationship: a live subscription the billing provider knows
+  about, or an active / past-due one on a priced plan; a partner parent or a
+  partner-managed child;
+- operator-side state: a registered custom domain;
+- a deployment that cannot keep the promises below: MFA switched off in a
+  deployed environment (`require_sensitive_step_up` would refuse every attempt,
+  so the page says so up front), no real write-once audit archive configured
+  (shipping off, no sink, or `mock` among the sinks), or `lambda` audit mode
+  (an audit row can still be in SQS, invisible and undrainable per tenant, when
+  the database is dropped; tracked in `docs/followups.md`). Local dev and CI
+  are exempt, as from every MFA check (guard rail 7);
+- and, fail-closed, any check that cannot be evaluated (`records_unverifiable`).
+
+**Every tenant table is decided, not remembered.** `TENANT_CHECKS` and
+`CLOSURE_ALLOWED` (table → reason, the shape of
+`tenant_deletion.CONTROL_TABLES_EXEMPT`) together cover every tenant table
+exactly once, and a test fails on a table in neither, so the next table cannot
+reach a closure without someone deciding whether it is a record that must be
+kept. Allowed, with the reasons in the code: children of a guarded parent;
+master and reference data (vendors, GL accounts, entities, policies, budgets,
+catalogues) — a trial plausibly holds them, and an approved bank change blocks
+on its own; configuration (workflows, reports, mappings, templates — every
+invoice a template generated is guarded as an invoice); open, draft, rejected
+and cancelled work of every kind, including an **untouched purchase order**:
+native POs exist (`requisition_service.convert_requisition_to_po`, a
+contract's create-PO, intake) and others are pulled from an ERP, but an order
+nothing has happened to records an intent to buy, while everything that makes
+it a transaction — a receipt, an approved requisition, a contract in force, an
+approved invoice, a payment — blocks; exceptions and agent decisions (a cleared
+payment-blocking exception matters once a payment exists, which blocks);
+sanctions-screening results (the same); notifications and chat history; and
+the audit log itself, shipped and sealed first (below).
+
+**A contract's evidence is `activated_at`, not its status.** `/cancel` is
+allowed from `active`, so a contract that bound the parties could read as a
+draft; `signed_date` is optional input. Migration 0120 adds `activated_at`,
+stamped on first activation and never cleared, backfilled from the first
+`contract.active` audit row, else from a status that says the contract has
+been in force.
+
+**The step-up is a second factor, not the password**: `require_sensitive_step_up`
+(operation `workspace_close`), as the unmasked DSAR export uses (§182). An
+account with no second factor is refused, not exempted; enrolling one needs no
+step-up. The slug is typed back first.
+
+**Nothing checked can change before the delete.** The control-plane checks run
+under `FOR UPDATE` on the organisation row, held until the control-plane rows
+are deleted in that same transaction (`delete_tenant(control_session=…)`):
+every insert referencing the organisation — an invite, a SCIM or SSO provision,
+a subscription — takes `FOR KEY SHARE` on that row for its foreign key, and
+every `settings` writer takes `FOR UPDATE`, so all of them wait. An UPDATE of a
+row that already exists does not touch the organisation row (a billing webhook
+moving the free subscription onto a priced plan, a reactivated user), so the
+organisation's `subscriptions` and `users` rows are locked too. **The actor is
+re-validated under that lock** — still present, active, in the organisation
+and an admin — and refused (`403 workspace_close_actor_not_admin`) if not. The
+tenant checks run again in a transaction holding `SHARE` locks on every guarded
+table, kept open until `DROP DATABASE … WITH (FORCE)` terminates it. Either
+lock not coming within 5 s is `records_unverifiable`; an unrelated writer that
+collides with the table locks can fail its own transaction, accepted for a
+workspace the guards say is unused. Two closures serialize on a
+transaction-scoped advisory lock (`409 workspace_close_in_progress`). The
+control-plane transaction stays open across the drop and the document sweep; a
+server-side `idle_in_transaction_session_timeout` (none is set) killing it would
+end as `workspace_close_incomplete`, which the resume path finishes. The route
+also checks the account belongs to the workspace, since `get_tenant` skips a
+token with no `org` claim.
+
+**No audit row is lost with the database.** An `organization.closing` row is
+written first, synchronously in every audit mode, carrying the source IP and
+the actor's role names the way auth rows carry an IP. Where shipping is on, the
+process's queued audit writes are awaited (`audit_dispatch.settle_auth_audits`),
+the tenant's trail is flushed to the archive (`audit_log_shipper.flush_tenant`),
+and the table is then **sealed**: `LOCK TABLE audit_log IN EXCLUSIVE MODE` on a
+connection held until the drop. If a row committed between the flush and the
+seal it is seen under the seal, which is released and the round repeats (three
+rounds, then refuse). After the seal a write waits and fails with the database,
+which `audit_dispatch` reports at ERROR — a write that never committed, never a
+committed row the archive lacks. Any failure here is `503
+workspace_close_audit_unavailable` with nothing deleted, and is logged with ids
+only rather than audited into the tenant, because the audit path is what just
+failed.
+
+**The record that outlives the tenant** is a control-plane `workspace_closures`
+row (migration 0119; no foreign keys, no address, no name, no IP — ids, slug,
+the requester's role names, proof, counts). It reads `completed` in the same
+transaction that deletes the organisation. Refusals and a closure already
+running are audited into the tenant's own log (it still exists); a closure that
+fails part-way records the exception class on the row (`last_failure`, the
+tenant's log may be gone) and an id-only ERROR line. Its downgrade is a
+deliberate no-op: the rows are the only evidence of deletions that happened and
+the operator's backup queue.
+
+**The deletion order changes for every caller: database, then documents, then
+the control plane.** §179 put documents first; the reasoning there was only
+that the control-plane row (which names the storage prefix) must go last, and
+that still holds. But documents-first meant a drop that failed left a LIVE
+workspace whose invoices pointed at deleted files. Database-first, a failed drop
+leaves the workspace whole, and a failed sweep leaves a workspace that is
+already unusable under a prefix the org row still names, which a re-run (or the
+closure's resume path: database gone plus a `started` row) finishes. With the
+database gone no upload can commit, and the sweep makes a second pass for an
+object an in-flight request PUT during the first listing. `scripts/delete_tenant.py`
+and `deploy/remove-tenant.sh` inherit it unchanged otherwise.
+
+**After the commit**, the deleted accounts' Redis state is cleared
+(`services/credential_cleanup`): live sessions blocklisted and their set and
+metadata deleted, a pending TOTP enrollment, an email OTP, passkey challenges,
+and any unspent reset / set-password link (found by scanning the reset prefix,
+since those keys are digests of the token). Best-effort: the tokens are already
+inert against deleted user rows.
+
+**The slug is held** — by `utils/slug.ensure_slug_not_held`, called from
+`provision_tenant` itself so signup, partner provisioning and the operator CLI
+behind `deploy/add-tenant.sh` all get it — until an operator has removed the
+backups (a new tenant would reuse `feoh_<slug>`, and removing the old dumps
+would remove the new) **and** `CLOSED_SLUG_COOLDOWN` (90 days, covering the
+backup retention cycle and so beyond the DPA's 60-day window) has passed, so
+bookmarks, IdP redirect URIs, invite and approval emails cannot point at a new
+owner early. Signup states it with its own code, `signup_slug_held`, not "taken".
+`scripts/workspace_closures.py list` is the operator's queue (owed backups, and
+closures that never finished); `mark-cleared <organization-id> --operator
+<handle>` records who removed them and when (runbook:
+`docs/founder-runbooks/workspace-closure.md`).
+
+**A reused slug inherits nothing addressed to its old owner.** PEPPOL inbound
+was the one route where it would have: the signing key is platform-wide, so the
+path was the only binding, and it named the slug. It now names the organisation
+id (`POST /api/peppol/inbound/{organization_id}`), which no later tenant can
+hold; a delivery addressed by slug is the silent 204 of an unknown tenant. The
+siblings were checked: email / Slack / Teams approval tokens name a user and an
+invoice that exist only in the closed tenant (refused, tested); payment, card
+and ERP webhooks verify a per-tenant secret deleted with the organisation;
+punch-out returns match a session in the tenant database; email intake keys on
+a per-tenant random token. None was changed.
+
+**The sign-in page of a closed workspace** renders its notice
+(`/login?reason=workspace_closed`) from the URL alone; its only calls, the SSO
+and SAML config probes, answer 404 for the deleted tenant, which the page
+already treats as "no SSO" (tested against a really-deleted tenant).
+
+**Rejected: a sweep deleting unverified or abandoned trials past N days.**
+Unverified signups never become accounts (the workspace is provisioned only at
+`/signup/complete`), so they hold no address. A verified-but-idle workspace is a
+customer's data under the DPA, deleted on the customer's instruction or after
+termination plus notice, and "idle" is not an instruction: nothing records a
+trial as ended (the baseline subscription is the free plan, `active`, with no
+`trial_end`). It is not needed for the dead end either: whoever is refused
+controls the address and can sign in to the abandoned workspace and close it.
+Abandoned workspaces kept forever are a storage-limitation question, tracked in
+`docs/followups.md`.
+
+**Rejected: a support runbook only** — the status quo, at the cost of an
+operator's destructive manual run for the commonest case, an empty trial.
+
+**Rejected: the password as the step-up.** Factor management accepts it (§191)
+because what it protects is the factor; here the output is the destruction of
+everything in the workspace, which is the DSAR export's reasoning.
+
+**Also changed:** the `email_in_other_workspace` sentence says the other
+workspace's administrator can close it to free the address.
+
+**Where its strings live (§300).** The panel's strings are `org.close.*` and
+`org.section.close`, in the settings slice that /organization loads. Everything a
+route without that slice can render stays in the main catalogue: the coded
+refusals (`refusal.workspaceClose*`, `refusal.signupSlugHeld`), and the
+`/login?reason=workspace_closed` notice. `api/codedRefusals.ts` reads a refusal's
+blocker list through the key-free `types/workspaceClosureRefusal.ts`, never
+`types/workspaceClosure.ts`, so the registry every route imports names no slice
+key (`i18n/slices.test.ts`).
+
+Numbered §306, after #616's §300: #611 landed as §292, and the open #612 and #613 claim §293 and §294.
+
+Tests: `backend/tests/test_workspace_closure.py` (each record class through a
+real row built from the model; what must not block; the table classification;
+each control-plane and deployment blocker; the inventory; admin-only and
+unauthenticated refusals; the dead end released through admin create and
+through signup; the resting slug's own code at slug-check and `/complete`; the
+closed workspace's spent link as the uniform 410; the confirmation; the actor
+re-validated under the lock; a record written after the preflight refused under
+lock with its audit row; the concurrency lock and its audit row; an unshippable
+trail, a trail that keeps growing, and a row committed between flush and seal;
+a drop that fails leaving the documents, recorded and finished by a retry; the
+resume path; the second factor with MFA on; Redis cleared; the closed sign-in
+page's probes; the operator queue, `--operator` and the cooldown; the operator
+CLI refused a held slug; a reused slug inheriting no approval email; a token
+with no workspace claim; a tenant write, an invite and a subscription or user
+update each held off until the delete), `backend/tests/test_tenant_deletion.py`
+(the order, a failed drop leaving documents, the second pass),
+`backend/tests/test_peppol_inbound.py` (a slug addresses nothing),
+`backend/tests/test_migration_0119_workspace_closures.py`,
+`backend/tests/test_migration_0120_contract_activated_at.py`,
+`backend/tests/test_audit_log_shipper.py` (`flush_tenant`),
+`frontend/src/lib/types/workspaceClosure.test.ts`,
+`frontend/src/lib/api/codedRefusals.test.ts`,
+`frontend/src/lib/api/sessionRejection.test.ts` and
+`frontend/tests-e2e/organization/close-workspace.spec.ts`.
+
+## 307. PDFs draw non-Latin text through one escaper with font fallback; the seed carries production-shaped rows from one shared file (2026-10-20)
+
+**Found by the production-shaped fixtures (#575 § 2).** The seed and e2e
+fixtures now carry a non-ASCII vendor (`Ōsaka Seimitsu Kōgyō 株式会社 — …
+Zürich`), and rendering it into the remittance advice printed
+`■saka Seimitsu K■gy■ ■■■■`. Every PDF here sets text in ReportLab's built-in
+Helvetica, a WinAnsi (cp1252) Type 1 font with no glyph outside Latin-1, and
+each renderer had its own `_escape` that only escaped XML. The same render
+showed a second defect: the remittance line table put the invoice number and
+description in **bare** cell strings, so a long ERP invoice number never wrapped
+(it ran through the Description column) and the description printed its
+escaped `&amp;` literally.
+
+**Decision.** `services/pdf_text.pdf_markup` is the one escaper: it escapes and
+wraps each run Helvetica cannot draw in a `<font>` that can — DejaVu Sans,
+bundled (~1.4 MB, Bitstream Vera / DejaVu licence) and subset-embedded, for
+Latin Extended / Greek / Cyrillic; ReportLab's built-in Adobe CID fonts for CJK
+(`HeiseiKakuGo-W5`) and Hangul (`HYGothic-Medium`). Supplier text in a table
+cell becomes a `Paragraph`.
+
+**Rejected: switching every PDF's base font to DejaVu.** It would change the
+look of every existing document for the benefit of the few characters
+Helvetica lacks; fallback per run leaves an all-Latin-1 document byte-for-byte
+in its old typeface.
+
+**Rejected: bundling a CJK TrueType face.** Noto Sans CJK ships as CFF/OTF,
+which ReportLab cannot embed, and a TrueType CJK face is several MB in a public
+repo. The CID fonts cost nothing and every mainstream viewer (Acrobat, Preview,
+pdf.js, pdfium) supplies the glyphs. The trade: CJK glyphs are the viewer's,
+not embedded, and Han characters are drawn with the Japanese face (which covers
+the common Chinese repertoire). Revisit if a customer reports a viewer without
+Adobe-Japan1 / Korea1 support.
+
+**Shared values.** The long / non-ASCII / tax-exclusive values live in
+`backend/scripts/fixtures/realistic_rows.json` and nowhere else: the full seed
+adds them (`scripts/seed_realistic.py`), the lean seed reshapes its existing
+rows with them (so no e2e count moves), and the layout specs and day-one
+journey read them through `frontend/tests-e2e/fixtures/realisticValues.ts`. A
+value spelled twice is how the layout spec and the demo would drift apart.
+
+Guards: `backend/tests/test_pdf_text.py` (each renderer, with the fixture's
+names, asserts no glyph outside cp1252 was drawn in a Helvetica face; the long
+number wraps; `&` prints as `&`), `backend/tests/test_seed_realistic.py`.
+
+## 308. "Approved or beyond" is one population for budgets and fraud baselines; a printed currency code is evidence, never a default (#575, 2026-10-20)
+
+(Numbered 308, with §307 above it, because §295, §296, §301 and §302–§304
+landed on `main` first and §297–§299, §305 and §306 are held by pull requests
+still in flight.)
+
+**Budget actual.** The realised leg of a budget (and the PO-relief leg, which
+must admit exactly the same invoices) is `APPROVED_OR_BEYOND_STATUSES`, so it now
+includes `sending_to_erp`: an approved invoice no longer drops out of `actual`
+while its ERP push is in flight or stuck. It also includes `failed` **with**
+`Invoice.approval_date` set — an approved invoice whose push failed is still
+spend a human signed off, while an unstamped `failed` is a failed extraction
+nobody reviewed (`budget_service.realised_invoice_clause`). That is the same
+evidence rule §73 uses for the touchless rate and §286 for the bank-change flag.
+
+**Fraud baselines.** The remit-to-change, statistical-anomaly and LLM-anomaly
+baselines in `invoice_warnings` now read `APPROVED_OR_BEYOND_STATUSES` too,
+which adds `sending_to_erp`, `sent_to_erp` and `done`. Before that, a vendor
+whose history had all finished (`done`) had no baseline at all, so every check
+that needs one silently skipped.
+
+**The trade-off we accepted.** `done` is the CSV importer's default status
+(`services/csv_import`), so unreviewed imported history now seeds the remit-to
+baseline (and the anomaly baselines). `paid` was already in the set and already
+importable, so the exposure is not new in kind. The direction it fails is the
+safe one: a baseline built from unreviewed history makes the checks fire *more*
+often (a remit-to that differs from an imported row raises `remit_to_changed`),
+never less. An attacker who could plant a CSV row could already plant a `paid`
+one.
+
+**Why this is not §73.** §73 says `done` / `paid` are not proof of *review*,
+and it is right for the question it answers: the touchless rate claims the
+platform did the approving, and an imported row is evidence neither way. A
+baseline asks something else: "what has this vendor historically billed us,
+and where did we pay?" Accepted history answers that whether or not this
+platform reviewed it, and excluding it leaves a migrated tenant with no
+baseline at all, which is worse. Where proof of an approval matters (touchless
+rate, budget `failed`, bank-change flag), read `approval_date`. Where the
+question is history, read the status set.
+
+**A currency code printed on an amount.** A model transcribing `GBP 9,500.00`
+keeps the code. Stripping it so the magnitude parses (#575) then discarded it,
+so with no `currency` field the invoice kept the upload's `USD` placeholder and
+was gated as USD 9,500; `USD 1,000.00` beside `currency: EUR` was silently
+EUR 1,000. Before #575 the token failed to parse, so the amount stayed empty.
+That was wrong too, but it erred towards a human. The code is now evidence
+(`extraction.CurrencyEvidence`), weighed with the field and never overruled by
+a default (§160, §196, §200: a missing currency stays missing):
+
+- the field and the printed codes agree, or only one of them speaks → that is the currency;
+- they disagree, or two amounts print different codes → no header money is written and the row's currency is left as it was. The amount stays at `0`, so `missing_amount` fires, and `self_correction_currency_conflict` / `_mixed` tells the reviewer why;
+- neither speaks → unchanged (see `docs/followups.md`: the upload still stamps `USD`).
+
+A symbol (`$`, `€`) is not evidence, because `$` names a dozen currencies.
+
+**Rejected: let the field win.** It is the model's summary, and the code is
+the page's own text next to the figure. When they disagree there is no basis
+for picking one, and either pick can be wrong by the full exchange rate.
+
+**Found alongside it.** "Amount unset" did not actually block auto-approve.
+`decide_auto_approve` never read `missing_amount`, so an extraction that left
+the 0 placeholder auto-approved under any `auto_approve_below` floor (0 < floor)
+or on confidence alone. It now refuses an amount `<= 0` on both triggers, the
+same rule as the `missing_amount` warning.
+
+Guards: `tests/test_budget_rollup.py::test_actual_counts_an_invoice_mid_erp_push`,
+`tests/test_budgets.py::test_spend_po_relief_counts_an_approved_invoice_whose_erp_push_failed`,
+`tests/test_extraction_cleaners.py` (currency evidence),
+`tests/test_extraction_golden.py` (the eur_multipage read with its currency
+field removed and contradicted), `tests/test_extraction_self_correction.py`,
+`tests/test_extraction_confidence_contract.py::test_no_amount_never_auto_approves_on_either_trigger`.
+
+## 309. The ERP push refuses an invoice FeohLedger is already paying (2026-10-21)
+
+**The gap.** The run builder and the card mint each refuse an invoice the
+other rail already holds (`uq_payments_one_live_per_invoice`,
+`live_payment_invoices`, `live_card_invoice_ids`). The ERP push asked neither.
+Staging a run books a live `pending` payment and leaves the invoice `approved`;
+an `exported` NACHA run is the same; a minted card leaves it `approved` too.
+"Send to ERP" then posted the bill, and a bill in the ERP can be paid there
+("Mark as paid", Bill Pay). One invoice, two outflows: our rail and the ERP.
+The ERP is a third rail, and it was the only one not checking the other two.
+
+**The rule.** The push refuses while the invoice holds a live payment (any
+status outside `api/payments.LIVE_PAYMENT_TERMINAL_STATUSES`) or a live virtual
+card (any card not `cancelled`), with the coded refusal
+`payment_blocks_erp_export`, `params = {claim: "payment" | "virtual_card"}`,
+and `possibly_posted: true` on §286's terms. It is in
+`services/erp_export_gate.py` beside §286's exception check, through one
+function, `erp_export_refusal`, which every push asks: the three HTTP doors
+(409 before their transition) and `services/erp._call_erp` (before any
+adapter is built). An open duplicate / fraud exception is named first, so
+§286's refusals read as before.
+
+- **"Live" is not restated.** `erp_export_live_claim` calls
+  `payment_runs.live_payment_invoices` and `card_issuance.live_card_invoice_ids`,
+  the predicates the two rails refuse each other with, which mirror the two
+  partial unique indexes. A second spelling is how the gates would come to
+  disagree about a `pending_compliance` or `charged` row.
+- **A settled card or a completed payment still refuses.** The money has
+  already moved on our rail; a bill posted now is payable a second time. The
+  remedy the refusal names is the rail's own exit (cancel the run, void the
+  payment, cancel the card), the same one the other rail would need.
+- **Why `_call_erp` asks too, not only the doors.** `sending_to_erp` and
+  `failed` are outside `PAYABLE_INVOICE_STATUSES`, so once the door's
+  transition commits no run can be staged on the invoice. But the run builder
+  reads its invoices without a lock (the door and the card mint do lock), so
+  a run staged concurrently with a send can still read the invoice as
+  `approved` and book a payment after the door's gate saw none. Re-reading at
+  `_call_erp`, immediately before the adapter, stops a push whose claim landed
+  in that window, and it covers pushes that never pass a door: a dispatcher,
+  a Lambda redelivery, a row written before this gate (a `failed` invoice
+  with a live payment beside it, which `/retry-erp` would otherwise post), or
+  a future entry point (the auto-send on approval in flight as PR #625 routes
+  through the same gate). §286 put its check at the chokepoint for the same
+  reason. The cost is two indexed reads per attempt. It narrows the race but
+  does not close it; locking the run builder's invoices is the durable fix,
+  tracked in `docs/followups.md`. A claim that slips through is not a double
+  payment today: with status sync off the invoice closes at `done` and
+  dispatch refuses the payment (`invoice_not_payable`); with it on, the
+  invoice lands at `posted_in_erp` and is paid once, with a BillPayment
+  written back.
+- **Interaction with QuickBooks status sync (§295, §296).** Status sync covers
+  the other order. With it on, a confirmed push lands the invoice at
+  `posted_in_erp`, still payable here; a payment staged then is written back
+  to QuickBooks as a BillPayment, and a bill paid in QuickBooks while
+  FeohLedger also holds a payment opens the blocking `payment_reconciliation`
+  exception. None of that passes this gate: an invoice at `posted_in_erp` (or
+  `payment_scheduled` / `paid`) is never pushed again, so a payment against it
+  is never refused here. With sync off, a confirmed push closes the invoice at
+  `done`, so nothing is paid here after it either. With an ERP, the supported
+  order is therefore *push, then pay*; *pay, then push* is what this refuses.
+  That tightens a flow that used to work with sync on: staging a run and then
+  pushing ended at `posted_in_erp`, where the write-back and the
+  `payment_reconciliation` exception caught a QuickBooks payment after the
+  fact. The refusal is still right with sync on. Between the push and our
+  run's execution the bill sits open in QuickBooks and anyone can pay it
+  there, and the exception only reports that payment once it has been made.
+  Do not exempt sync-on orgs from this gate.
+
+**Rejected: transition the invoice off `approved` when a run is staged or a
+card minted.** That would change the payment queue, the run builder's own
+payable-status check and every screen that reads `approved`, to fix a gap in
+one consumer. The claim already exists as a row; the push only had to read it.
+
+**Rejected: refuse silently (a 202 that fails a second later).** Same reason as
+§286: the user would have to read the audit trail to learn why.
+
+Tests: `backend/tests/test_erp_export_blocking_exceptions.py` (draft run,
+exported run, live card, voided / failed / cancelled payment, cancelled card,
+no claim, the real run builder then cancel, `/retry-erp` with
+`possibly_posted`, and `_call_erp` stopping a push queued before the claim);
+`frontend/src/lib/api/erpRefusals.test.ts` and `codedRefusals.test.ts` (all
+six locales).
+
+## 310. The app signs in to RDS as a least-privilege role with an IAM token, and the master password leaves the VM (2026-10-21)
+
+**The problem.** Production connected as the RDS master user `postgres`, whose
+password sat in `FEOH_DATABASE_URL` in the VM's deploy env. A leaked env file,
+a backup of the VM disk, or a shell on the box was therefore a full,
+long-lived login to every tenant database, as a member of `rds_superuser`.
+IAM database authentication was already enabled on the instance and used by
+nothing. This had to close before the first paying customer's data landed.
+
+**What changed.**
+
+- **Two roles, created by the master once** with `deploy/db-role-cutover.sh`
+  (the SQL is in `deploy/sql/db-role-{cluster,database}.sql`):
+  - `feoh_owner` is `NOLOGIN`, `CREATEDB`, and a member of nothing. It owns the
+    control plane, every `feoh_<slug>` database, and everything in them.
+  - `feoh_app` is `LOGIN` with no password. It is a member of `rds_iam` and of
+    `feoh_owner`, and nothing else. Its `role` defaults to `feoh_owner`, so
+    every session acts as the owner and every object the app creates is owned
+    by the owner too.
+  - Neither role has `CREATEROLE`, membership in `rds_superuser`, or superuser.
+  - The cutover verifies all of this (attributes and an allowlist of
+    memberships) on every run, not only when it creates the roles.
+- **A token per new connection.** `backend/app/db_engine.py` is now where every
+  engine and every raw asyncpg connection is made. `create_async_engine` there
+  is a drop-in for SQLAlchemy's; `connect_raw` replaces bare `asyncpg.connect`.
+  With `FEOH_DATABASE_IAM_AUTH` on, both pass asyncpg a callable `password`
+  that signs a fresh RDS auth token. asyncpg calls it once per connection
+  attempt and awaits an awaitable result, so the 15-minute token lifetime
+  never matters to a pooled engine (minting once per process would break the
+  first reconnect after a quarter of an hour). The same callable works through
+  SQLAlchemy 2's asyncpg dialect (`connect_args` reach `asyncpg.connect`
+  unchanged), so no `do_connect` event is needed, and a single mechanism covers
+  engines, raw connections, Alembic and the Lambda handlers.
+- **Off the event loop.** `generate_db_auth_token` signs locally, but it needs
+  credentials, and botocore resolves and refreshes instance-profile credentials
+  with a synchronous IMDS call. The callable is a coroutine that runs every
+  boto3 step in `asyncio.to_thread`. The one RDS client is created lazily, in
+  that worker thread, under a lock.
+- **Fail closed.** With the flag on, a URL that still carries a password, a
+  URL with no user or host, or TLS short of `verify-full` is refused: at boot
+  (`Settings`), at every engine construction, and by `decrypt-env.sh` before a
+  deploy. A token is a bearer credential for its 15 minutes, so `require`
+  (which accepts any certificate) is not enough. The flag defaults off, so a
+  laptop and CI keep password auth against the local container (guard rail 7).
+- **Deploy tooling.** `deploy/lib.sh` accepts the password-less IAM URL. Each
+  `pgtools` run (`psql.sh`, `backup.sh`) mints its own token on the VM with
+  `aws rds generate-db-auth-token` and passes it as `PGPASSWORD` through the
+  environment, never an argv. The instance role holds `rds-db:connect` on
+  exactly `dbuser:<resource id>/feoh_app` (`infra/compute.tf`). `feoh_owner`
+  cannot sign in at all. The master
+  password lives only in `infra-secrets` (`terraform.sops.yaml`), for
+  break-glass.
+
+**pgvector is not a trusted extension on RDS.** The AWS list of extensions a
+non-`rds_superuser` holding `CREATE` may install does not include `vector`
+(verified against the RDS user guide's "PostgreSQL trusted extensions" list,
+2026-10-21; the pgvector image's control file says the same locally). So the
+cutover creates it once in `template1`, as the master. Every database the app
+creates afterwards is copied from `template1` and already has it, and the
+`CREATE EXTENSION IF NOT EXISTS vector` in provisioning and migration 0003 is
+a permitted no-op. PostgreSQL checks for an existing extension before it checks
+privilege, which was verified against a non-superuser role. The extension (and
+its member objects) stays owned by the master. Ownership cannot be transferred
+anyway, and updating pgvector is a master operation.
+
+**No separate provisioning role.** The earlier follow-up proposed "a separate,
+narrower path for `CREATE DATABASE`" (`feoh_owner` is not that: it exists for
+the master's sake, and the app always acts as it). A provisioning role would add
+no isolation. Self-service
+signup and partner provisioning run `CREATE DATABASE` inside the running API,
+so a second role's credential would have to be reachable from the same process
+(and the same instance profile). Anyone who compromised the API would hold both
+roles. What `CREATEDB` adds on top of owning every tenant database already is
+only the ability to create more databases. The real reductions are the ones
+made here: no `rds_superuser`, no `CREATEROLE`, and no password to steal.
+
+**Explicit `ALTER … OWNER`, not `REASSIGN OWNED`.** `REASSIGN OWNED BY postgres`
+also reassigns shared objects the master owns (the `postgres` maintenance
+database, any database outside the app's set) and extension ownership, in one
+statement whose reach cannot be read off the page. Here everything moves to
+`feoh_owner`. The per-database SQL names
+what it moves: schemas, relations (owned sequences follow their table), types,
+and routines. It then fails if `pg_shdepend` shows anything else outside
+extensions still owned by the master. An object class it does not handle stops
+the run, so nothing is quietly left behind.
+
+**Why two roles, and why the master never joins the login role.** RDS signs a
+member of `rds_iam` in by token only, and AWS documents that inherited
+membership counts. The master has to stay a password login, because it is the
+rollback and the break-glass path. It also has to be able to `SET` to the
+owner, since a non-superuser may transfer ownership only to such a role, and to
+inherit the owner's privileges, which is what makes the rollback work. One role
+cannot both carry `rds_iam` and be joined by the master. So ownership sits on
+`feoh_owner`, which has no `rds_iam` and which the master joins
+`WITH INHERIT TRUE, SET TRUE`. The master is never made a member of `feoh_app`
+beyond the ADMIN-only grant PG16 gives a role's creator, the same link AWS's own
+"`CREATE USER …; GRANT rds_iam …`" procedure leaves. The cutover refuses to
+finish if the master is a member of `feoh_app` with INHERIT or SET. (The first
+draft made the master an inheriting member of a single `feoh_app`. The security
+review caught that this could make the master IAM-only on RDS, part-way through
+the cutover itself.)
+
+One consequence: `DROP DATABASE … WITH (FORCE)` terminates the database's other
+sessions. Postgres allows that only to a role holding the privileges of the role
+that *signed those sessions in*, and `feoh_owner` does not hold `feoh_app`'s.
+`tenant_provisioning._drop_postgres_database` therefore runs `SET ROLE NONE`
+first. As the session user, `feoh_app`, it has both its own sessions and the
+owner's privileges. `RESET ROLE` would not do this, because it returns to the
+role default, `feoh_owner`. Locally the statement is a no-op.
+
+**The cutover's own queries resolve names from the catalog only.** After the
+cutover the app owns `public` in every app database. A `public.format(text,
+text, text)` planted there would match more exactly than
+`pg_catalog.format(text, VARIADIC "any")`, and so it would run with the master's
+privileges on the next re-run (the CVE-2018-1058 shape). Both SQL files set
+`search_path = pg_catalog, pg_temp`, and the script passes the same setting to
+every psql it runs through `PGOPTIONS`. A test plants exactly that function.
+
+**Rollback is trivial by construction.** The master inherits the owner's
+privileges. Pointing `FEOH_DATABASE_URL` back at the master, with
+`FEOH_DATABASE_IAM_AUTH` off, just works, migrations and tenant provisioning
+included. Objects created during that window belong to the master, and
+re-running the cutover hands them back.
+
+**What stays with the master (break-glass).** A logical `restore.sh` recreates
+each database from `template0`, which has no pgvector, so it refuses in IAM mode
+and runs with the master URL, followed by a re-run of the cutover. A
+point-in-time restore keeps the roles, and is still the first choice. The
+`rds-db:connect` ARN names the instance's resource id, so a PITR into a new
+instance needs the grant re-applied. Rotating the master password no longer
+touches the VM.
+
+**No migration.** Roles and database ownership are cluster-level. Nothing in any
+schema changes, so there is no Alembic revision.
+
+**Verified.** Every engine site moved to the factory, and
+`tests/test_db_engine_chokepoint.py` fails on a new direct
+`create_async_engine` / `async_engine_from_config` / `asyncpg.connect` under
+`app/`, `scripts/` or `alembic/`. `tests/test_db_engine.py` covers the factory:
+a token per new connection against the real local Postgres with the generator
+stubbed, minted off the loop, and the fail-closed rules.
+`tests/test_db_role_cutover.py` runs the cutover SQL as a non-superuser
+master-like role on throwaway databases, and covers the script's wiring.
+Deploy-side coverage is in `test_deploy_db_mode.py` and
+`test_deploy_decrypt_env.py`. End to end against a throwaway pgvector cluster,
+with a non-superuser master: the deploy migration and a tenant provisioned as
+the master, then the cutover, then a second run (a no-op), then, as `feoh_app`
+(acting as `feoh_owner`), the migration step, a new tenant, downgrade and
+upgrade of a pre-cutover tenant, DDL and queries, and `delete_tenant.py` with
+another app session open on the database (the `WITH (FORCE)` path). For the
+rollback, the master downgraded, migrated and provisioned a tenant, and the next
+cutover run handed that tenant over. The
+operator rollout is `deploy/README.md` § Database role.
+
+## 311. The site is checked from outside by Route 53, and only customer-facing failures text the phone (2026-10-21)
+
+**The gap.** Every alarm in `infra/` watched AWS's view of its own resources:
+the VM's status checks, RDS CPU, memory and storage, CloudFront error rates. A
+wrong DNS record, a Caddy that stopped proxying, an API container that exited
+on a healthy VM, or a distribution serving the wrong thing moved none of them,
+and all of them only sent email. Operator to-do #446 asked for uptime
+monitoring that reaches the phone before customer #1.
+
+**Route 53 health checks, not a monitoring vendor.** Route 53's checkers make
+real HTTPS requests from several AWS regions, live in the same Terraform and
+state as the stack they check, and need no account, API key or extra
+sub-processor. The public status page is still a vendor call
+(`founder-runbooks/support-and-status.md`). A vendor that runs its own monitors
+can sit beside these checks. It does not replace them.
+
+**Three hosts, one per way to be down.** The apex (the SPA), one tenant host
+(the wildcard record, the wildcard SAN and, before the CloudFront cutover, that
+tenant's Caddy block), and `api.<domain>/api/health`. The tenant slug is a
+variable with no default, so the public repo names no customer. Unset skips
+that check.
+
+**HTTPS everywhere, a body match only on the API.** An HTTP check would follow
+nothing and pass on the redirect. HTTPS, string matching and the fast interval
+each bill per check. The API's match on `"status":"ok"` earns its cost: the
+SPA router answers every path with `index.html`, so if `api.` ever resolved to
+CloudFront a status-only check would read healthy. The SPA hosts already fail
+on the status code or the handshake in every way a person would notice (an
+empty bucket, a missing object, a stopped Caddy, a host with no certificate).
+`backend/tests/test_sweep_health.py` reads the string out of `uptime.tf` and
+checks it against the bytes `/api/health` returns, so reformatting either side
+fails CI instead of paging for an API that is up.
+
+**30-second interval, 3 failures, 3 regions.** About 90 seconds of sustained
+failure before a check reads unhealthy, which a deploy's few-second container
+restart never reaches. The 10-second interval would cut that to about 30
+seconds, at $1–2 more per check, for a pilot with no uptime commitment.
+Three regions is Route 53's minimum. They don't lower the price, which is per
+check, but every checker is a request against CloudFront's free allowance and
+the API, and three regions on two continents still tell a regional network
+fault from an outage. All in, about $8–13 a month with the toll-free number.
+
+**us-east-1, by construction.** Route 53 publishes health-check metrics only
+in us-east-1, and an alarm can notify only a topic in its own region. The
+alarms and the pager topic are pinned to the existing `aws.us_east_1` alias.
+`frontend.tf` already refuses any other `aws_region`, which keeps the alerts
+topic and the database alarm that pages there too. No new provider, so the lock
+file is unchanged.
+
+**A separate pager topic, and only customer-facing alarms on it.** Putting an
+SMS subscription on `alerts` would text CPU-credit warnings at 3 a.m. Instead
+the uptime alarms and `db-storage-low` (past it writes fail, and no uptime
+check notices first) notify both `pager` (SMS) and `alerts` (email). Everything
+else stays email-only. CPU, memory and credits are sizing and cost signals. A
+failed VM status check, or a CloudFront 5xx surge customers can see, fails an
+uptime check anyway, so paging it too would send two or three texts per
+incident and teach the operator to ignore the phone.
+
+**Missing data is an outage for the uptime alarms, not for the certificate
+alarm.** Route 53 emits `HealthCheckStatus` every minute while a check exists,
+so silence means the check or the metric pipeline is broken. An uptime alarm
+that goes quiet when it cannot see is the failure this exists to remove. The
+cost is one page right after the first apply, which doubles as a delivery
+test. ACM's `DaysToExpiry` is daily with drifting timestamps, so an empty
+window there is normal and reads `notBreaching`.
+
+**Certificate expiry: ACM covered, Caddy tracked.** Route 53 does not validate
+certificates, so an expired one passes. ACM renews the platform certificate
+from 60 days out on its own. An alarm at under 30 days catches a renewal that
+failed (validation CNAME deleted, a CAA record) with a month left, by email.
+The Let's Encrypt certificates Caddy holds on the VM emit no AWS metric. That
+gap is a (c) follow-up (a Synthetics canary) rather than half-built here.
+
+**The phone number stays out of the repo, and its absence is safe.**
+`alert_phone_number` has no default, is `sensitive` so plans print
+`(sensitive value)`, and is validated as E.164. Unset creates no subscription,
+leaves the account's SMS settings alone and adds no delivery alarm, so
+plan, validate and the offline tests need no number. The `count` reads
+`nonsensitive(var.alert_phone_number != null)`, because whether a number is set
+reveals nothing and `count` refuses a sensitive value.
+
+**US SMS has prerequisites Terraform cannot do.** A new account is in the SNS
+SMS sandbox, which delivers only to numbers verified in the console. That is
+fine to stay in, since the operator is the only recipient. US carriers also
+refuse SMS without a registered origination identity. A toll-free number is
+the cheapest: $2 a month and about 15 days to register, as a sole proprietor
+with no EIN. Registrations since 2026-09-15 need privacy and terms URLs, which
+`/legal/` already publishes. SNS then needs a resource policy on the number.
+These are console steps (`infra/README.md` § Uptime checks and paging) and a
+(b) follow-up. Leasing the number through Terraform was rejected: the
+registration form carries the operator's address and contact phone, which
+belong in neither the public repo nor its state. A text SNS cannot deliver
+fails silently (unregistered number, unverified destination, the $1 default
+monthly spend limit), so with a number set an alarm on the pager topic's
+`NumberOfNotificationsFailed`, which counts an SMS once SNS stops trying to
+deliver it, emails the operator, and a second emails at 80% of the spend limit
+(`SMSMonthToDateSpentUSD`), since past it SNS stops texting for the rest of the
+month. A carrier dropping a text SNS handed over is invisible to both, which is
+why the README ends with a test-fire. `aws_sns_topic.pager` also carries its
+own `aws_region == "us-east-1"` precondition: `db_storage` sits on the default
+provider and publishes to it, which only works in the same region.
+
+**Tests.** `infra/tests/guardrails.tftest.hcl` pins the hosts, paths, body
+match, interval, threshold and regions, the tenant check appearing only with a
+slug, every uptime alarm paging and emailing on failure and recovery with
+missing data breaching, which alarms may page, the SMS subscription, SMS
+preferences and both SMS alarms existing only with a number, the E.164 and
+slug validations, the region precondition, and the certificate alarm.
+
+## 312. The landing page follows the visitor's theme, with a light render of the tally (2026-10-21)
+
+**This supersedes §289's "the marketing landing page stays dark" and §294's
+"not until evidence says otherwise".** §294 named what would reopen the
+question — drop-off or repeated feedback — and what doing it properly would
+mean: a light render of the tally, panel treatments composed for a light
+ground, contrast re-measured, the theme followed rather than toggled per page.
+What reopened it is the operator asking for it directly: a visitor who chose
+Light (or whose OS did) met a navy landing page between a light sign-in page
+and a light app, and on the apex domain that page is the product's first
+impression. The job was done the way §294 said it must be, not as a token
+swap that leaves a dark-composed render on white.
+
+**What changed.**
+
+- **No pin.** `data-theme-scope="dark"` is gone from `Landing` and from
+  `app.css`'s dark selector list; nothing else used the mechanism, so it was
+  removed rather than kept idle. The landing subtree (`Landing`, `Pricing`,
+  `HeroPipeline`, `AdapterRail`, `Atmosphere`) takes System / Light / Dark
+  from the same pre-paint script and store as everything else, so a stored
+  Light is on `<html>` at the first frame here too.
+- **Every colour is a token.** 85 literals — navy glass `rgba(24, 26, 35, …)`,
+  accent glows, the text-gradient stops, the stamp and ping greens — became
+  palette tokens or `color-mix(in srgb, var(--token) N%, transparent)`. Three
+  tokens are new, in both palettes: `--gilt` (the tally's gold), `--brand-violet`
+  (the gradient midpoint) and `--drop-shade` (a cast shadow: black on navy, a
+  soft ink on light, where black at the same strength reads as dirt). The dark
+  values are the old literals, so the dark page is unchanged to the eye.
+- **Light treatments, not an inversion.** Glass panels are translucent
+  `--surface` (white, in light) with `--shadow-card`, so they lift off the pale
+  ground by shadow rather than by being lighter than it; the hero card is
+  `--surface` with `--shadow-float`; the eyebrow pills moved onto the
+  calibrated `--accent-tint` / `--accent-on-tint` pair; the grid, grain and
+  vignette already followed `--text` / `--bg`. The brand mark is untouched.
+- **A second render of the tally.** On the light ground the dark render's
+  softbox reflections came out as near-white cream, the page's own value, and
+  the stick's near edges dissolved. `tally_scene.py` now takes
+  `TALLY_VARIANT=light`: dimmer softbox, ~0.45 stop less exposure, a warm weak
+  fill and a lower rim, everything else shared — so the two renders trim to the
+  same 1100 × 460 frame and swapping them never moves the layout.
+  `gen-marketing.sh` renders both (or one, by argument, so retuning one
+  lighting leaves the other's bytes alone) and refuses a pair that disagrees in
+  size. The page picks the file from `theme.resolved`
+  (`lib/marketing/ornament.ts`) rather than a `<picture>` media query, which
+  would follow the OS and ignore a stored choice; `AuthShell`'s panel, which
+  already followed the theme and was showing the dark render on white, uses the
+  same map. The grain overlay is shared — a grey tile under `overlay` blending
+  reads as grain on either ground — so it was not re-rendered.
+- **A theme switch in the header.** An anonymous visitor has no `/profile`.
+  `ThemePicker` and `SegmentedControl` gained `compact`: the same fieldset of
+  native radios drawn as three icons, legend and labels visually hidden but in
+  the accessibility tree, each segment titled, 30px targets, the radio clipped
+  (not faded) and the segment carrying the focus ring. With the dot hidden the
+  raised fill was no cue at all (1.04:1 against the track), so the chosen
+  segment takes an `--accent` ring on the accent tint pair — an edge the other
+  segments lack, ≥5.7:1 against the track in both palettes (1.4.11, 1.4.1). It sits beside the
+  `<nav>`, not in it — a setting, not a destination — and fits beside the mark
+  and the short CTA at 320px. No new strings: it reuses `profile.appearance.*`,
+  translated in all six locales.
+
+**Rejected.** *A page-local toggle* (a landing-only light/dark switch that
+does not touch the global choice) — §294 already ruled it out, and a choice
+that reverts on the next page is not a choice. *Keeping the scope mechanism for
+later* — an unused pin is an exemption from the light audit waiting to be
+reused. *CSS-swapping two `<img>` elements* — needs the light selectors written
+twice more (explicit and System) for one image, where the store already knows
+the answer.
+
+Guards: `src/lib/a11y/tokenPairing.test.ts` (both palettes over every
+marketing stylesheet with no exemption; no `data-theme-scope` anywhere; the
+marketing components type no colour literal — hex, any functional notation,
+`white` / `black`, in `<style>` or an inline `style=` — but `#fff` in a rule
+that also sets a `-strong` background, and a mask's `#000`; `--gilt`, `--brand-violet` and `--accent-on-tint` held to 4.5:1
+on `--bg` and `--surface` in each palette, since the scan cannot measure a
+`background-clip: text` gradient), `src/lib/marketing/ornament.test.ts` (both
+renders committed, same intrinsic size, not the same file), and
+`tests-e2e/a11y/light-theme.spec.ts` (the landing under a light OS: axe clean,
+light render; dark: axe clean, dark render; a stored Light under a dark OS:
+`data-theme` at the first frame, the ornament's first `src` the light file and
+the dark one never requested;
+the header switch reached by Tab, operated by arrow keys and by pointer,
+persisting across a reload, segments ≥ 24px, a drawn focus ring, a checked
+edge the others lack; at 320px the header holds mark, CTA and switch with no
+overflow; the auth shell's panel follows the theme).
+
+Numbered §312, with this branch's §313–§315 after it: they were drafted as §306–§309, main took §306–§308 and §310 first, and the open #631 and #634 claim §309 and §311.
+
+## 313. Error toasts stay until dismissed; other toasts pause while hovered or focused (issue #635, 2026-10-21)
+
+**This supersedes the fixed five-second timer `frontend/docs/ui-patterns.md`
+documented as deliberate** ("auto-dismiss timer kept"). Decided by the
+operator's delegate on #635 finding 24.
+
+**What was wrong.** Every toast vanished five seconds after it appeared,
+whatever it said and whatever the reader was doing. Several screens used a
+toast as their only error signal, some with an instruction in it (#6, #20,
+#21 on the issue); a screen-reader user hears it once, a slow reader may not
+finish it, and someone moving the pointer onto it to read it watched it go.
+That is WCAG 2.2.1 Timing Adjustable: content with a time limit needs a way
+to turn it off, adjust it or extend it.
+
+**The rule** (`frontend/src/lib/utils/toastQueue.ts`, rendered by
+`ui/Toast.svelte`):
+
+- An **error** toast has no timer. It stays until dismissed with its visible,
+  keyboard-reachable dismiss button. An explicit `duration` does not make an
+  error transient — no caller passed one, and an error that can be timed away
+  is the defect.
+- Any **other** toast keeps its timer (5 s, or the caller's explicit
+  `duration` — the sync report's 12 s warnings keep theirs), but the clock
+  **stops while the pointer is over a toast or focus is inside the region**
+  and resumes with the time it had left. A toast that arrives during a pause
+  starts its clock on resume.
+- **Persistent errors are bounded.** At most three stay on screen; a fourth
+  removes the oldest. The same error text arriving again replaces its earlier
+  copy instead of stacking — a page retrying a failing call cannot fill the
+  corner with identical cards.
+- **Live-region behaviour is unchanged where it matters.** Errors still go in
+  the assertive container and the rest in the polite one. Pausing changes no
+  DOM, so it announces nothing; a repeated error is a fresh insertion, so it is
+  announced again rather than silently deduplicated.
+- **Focus never falls to `<body>`.** Dismissing from the button moves focus to
+  the next toast's dismiss button, or to `<main>` when it was the last.
+- The region is named **"Status messages"**, not "Notifications": that is the
+  sidebar bell's name, and two landmarks sharing one name are
+  indistinguishable in a landmark list.
+
+**A toast is still not a load-error state.** A page whose data did not arrive
+says so in place with `ui/LoadError` and a Retry; the vendor list (#635
+finding 20) and the notification bell (finding 22) moved off toast-only
+failures in the same change. The persistent error toast is for an action's
+outcome.
+
+**Rejected: a longer fixed timer** (10 s, 15 s). It moves the line rather than
+removing it, and 2.2.1's "extend" option needs the reader to be able to ask
+for more time, which a fixed timer cannot give. **Rejected: making every toast
+persistent.** Success and info toasts confirm what the reader just did and
+the page already shows; requiring a dismissal for each would bury the errors
+that do need one.
+
+**Sign-off.** This changes a documented accessibility pattern
+(`docs/accessibility.md`, `frontend/docs/ui-patterns.md` § Toast); it should
+be confirmed by whoever owns `docs/accessibility.md`.
+
+## 314. The sidebar's groups say what is in them: Treasury, Subscription under Settings, Cash-flow analytics (issue #635, 2026-10-21)
+
+**Decided** by the operator's delegate on #635 finding 23 · `frontend/src/lib/nav.ts`
+
+A new admin met about thirteen sidebar rows and forty-odd destinations on day
+one, and three of the names misled:
+
+- **"Billing" held the customer's payables money tools** — Credit Memos,
+  Discounts, Positive Pay, Bank Reconciliation, vendor Statements — beside
+  *our* subscription page. Read cold, "Billing" is the vendor's bill or the
+  platform's invoice to you, not treasury work. The group is now
+  **Treasury** (`nav.group.treasury`; the old `nav.group.billing` key is gone,
+  so nothing can keep rendering the old name).
+- **Subscription moved to Settings, directly after Organization.** It is the
+  platform's plan and usage page (`/billing`, control plane), which describes
+  the workspace itself — the same kind of thing as Organization — and is
+  nothing to do with paying suppliers. It keeps its gate (admin | cfo, the
+  backend's `GET /api/billing/subscription`). A CFO, who can see no other
+  Settings child, now sees a Settings row that lands on Subscription; per-item
+  gating already handles a one-child view (the group row is the page).
+- **`/cfo` is "Cash-flow analytics"**, so it reads as distinct from
+  "Cash-Flow Copilot" beside it: one is the forecasting dashboard, the other a
+  conversation. Only the nav label changed (`nav.cashFlow`); the page keeps its
+  own heading key. In French the old label *was* "Trésorerie", which would have
+  collided with the new group name, so the guard below checks every locale.
+
+**What this does not change.** §174's row budget is untouched: no row was
+added, Treasury drops from nine tabs to eight, Settings grows from eight to
+nine, both under `nav.test.ts`'s ten-tab ceiling. The role matrix in
+`nav.test.ts` (`NAV_GATES`) moves `/billing` to the Settings block with the
+same roles.
+
+**Guard.** `nav.test.ts` pins the new placement, the CFO landing, and a
+locale-wide rule: no two sidebar rows share a name, and within a group no two
+tabs (nor a tab and its group) read the same, in any of the six catalogues.
+`tests-e2e/smoke/section-nav.spec.ts` checks the rendered sidebar.
+
+**The page and every pointer to it say "Subscription".** The rename left the
+`/billing` heading (`billing.title`) on "Billing" while the nav said
+"Subscription", and the messages that send a user there — the public pricing
+page's "starts on Free" line, the plan-feature refusal
+(`refusal.planFeatureRequired`), both AI-reading-paused invoice warnings and
+the three AI-usage notices (80%, 100%, spending cap) — named a "Billing" page no row is
+called. The name a user hunts for is the one in the sidebar, so the heading
+now matches the nav label in every locale, and each pointer names the path,
+**Settings → Subscription** (translated with each locale's own nav labels), since
+the row sits inside the Settings group. The backend's English for the same
+warnings (`invoice_warning_catalog.py`, regenerated into the web and mobile
+code maps) and the notices (`notification_templates.py`) changed with them, as
+did the mobile ARB copies of the two warnings. The route stays `/billing`;
+only words changed.
+
+**Partner Admin is NOT hidden yet — it needs a product call.** The finding
+asked to hide it unless the workspace is a partner. There is no partner flag:
+`GET /api/partner`'s `is_partner` is *derived* — true once the org parents at
+least one child — and the page that row opens is also where a standalone org
+(a) provisions or attaches its **first** child, which is how it becomes a
+partner at all, and (b) mints the link code that consents to being adopted
+*by* a partner. Gating the row on `is_partner` would make both unreachable
+from the UI for exactly the orgs that need them, and the row's gate would no
+longer agree with the page's (admin-only, the backend's
+`require_roles(ROLE_ADMIN)` on every `/api/partner` route) — the mismatch
+`frontend/CLAUDE.md` calls a defect. Doing it properly means either an
+operator-set partner capability (a plan entitlement or an
+`organizations.is_partner` column, exposed on `/auth/me`) with the link-code
+minting moved to Organization settings, or accepting the row as is. Tracked in
+`docs/followups.md`.
+
+## 315. An admin's first run is a setup checklist ticked from facts the app already holds; emptiness is the workspace's (issue #635, 2026-10-21)
+
+Decided by the operator's delegate on #635 findings 9 and 38.
+
+**What was wrong.** A new workspace's dashboard offered one button, "Go to
+invoices". The `start-admin` guide says to configure first — company, users,
+sign-in security, ERP, vendors, the approval workflow — so a new admin's first
+invoice landed in an untuned default workflow with no vendors to match and no
+one else to approve it. The `/organization` "Getting started" panel had six
+static links with no progress and left out the ERP, vendors, security and email
+intake. Separately, the dashboard decided "brand-new workspace" from
+`total_invoices`, which is scoped to the selected entity, so an established
+customer that added a subsidiary was welcomed with "upload your first invoice"
+the moment they switched to it.
+
+**The rule.**
+
+- **An admin on a workspace with no invoices gets a setup checklist** in place
+  of the empty state: company details, invite the team, require two-factor
+  sign-in, connect the accounting system, add vendors, set up the approval
+  workflow, and uploading the first invoice last. Each step links to the panel
+  that owns it, and the list links the `start-admin` guide.
+- **A step is ticked only from a fact some other feature already owns,
+  derived on read** (`backend/app/services/onboarding.py`). There is no
+  tracking table and no "mark as done" write, so a step cannot be ticked by
+  visiting a page and cannot drift from the setting it names. Each fact is
+  narrow and named for what it reads: a Company Profile field beyond the name
+  signup sets; more than one active user; `mfa.required` or SSO switched on;
+  a non-`mock` ERP selected (the plan gate's own predicate); a vendor row; the
+  workflow saved since it was provisioned (a version, an edit, or a second
+  definition, because every tenant is provisioned with one); a live intake
+  address. "Reviewed the security panel" and "looked at the workflow" are not
+  knowable, so they are not claimed — the steps are worded as the change whose
+  saved result is the fact.
+- **A step with no fact behind it carries no done state at all.** The settings
+  panel's Invoice defaults, payment-run sign-off and Branding links are drawn
+  with their number only, never as unfinished: a blank defaults form is a valid
+  choice. A non-admin, or a progress read that fails, gets the same links with
+  no states rather than a row of empty boxes.
+- **One server field, one derivation, two readers.** `GET /api/dashboard`
+  carries `onboarding` (computed in the same request, only for an admin on an
+  empty workspace — everyone else gets `null` and pays for none of its
+  queries), and `GET /api/dashboard/onboarding` (admin-only) serves the same
+  `compute_onboarding` to `/organization` without computing a dashboard.
+  `frontend/src/lib/utils/onboarding.ts` is the one map from step to panel, so
+  the two surfaces cannot send a step to two places.
+- **The checklist retires itself** when the workspace has its first invoice:
+  the server stops sending `onboarding`. No dismiss control — it would need a
+  stored preference, and the condition that ends it is one every workspace
+  reaches on its first real day.
+- **Emptiness is decided org-wide** (`organization_has_invoices`, unscoped by
+  `X-Entity-ID`). An entity with nothing in it yet keeps its true zero KPI row
+  and says "No invoices for <entity> yet" in place of the charts; the
+  new-workspace welcome and the checklist never appear for it.
+- **Every other role on an empty workspace** keeps the empty state, fitted to
+  what it can do: a role that may add invoices is sent to `/invoices`; one that
+  may not (no system role today — a custom role can) is told what will appear,
+  with no button into a page whose upload would refuse it.
+
+**Not regressed.** The checklist, like the empty state before it, replaces the
+KPI row only once the response has landed (`isEmptyTenant` keys on `data`), so
+the loading → empty hand-off of §125 / §154 is unchanged.
+
+**Considered and rejected.** A per-step "mark done" store: it reintroduces the
+drift this avoids and makes the tick a claim about intent. Ticking security on
+the admin's *own* MFA enrolment: it says nothing about everyone else signing
+in. Counting "a workflow definition exists": always true since provisioning
+seeds one.
+
+Tests: `backend/tests/test_dashboard_onboarding.py` (each flag follows its
+owning data; admin-only; retires with the first invoice; an empty entity on an
+established workspace); `frontend/src/lib/utils/onboarding.test.ts`;
+`frontend/tests-e2e/dashboard/first-run.spec.ts` (checklist, done states,
+non-admin views, retirement and the entity case against the real backend, axe
+in both themes); `frontend/tests-e2e/organization/getting-started.spec.ts`.
+
+## 316. A QuickBooks environment change is not a new destination; destination-ness is per provider (2026-10-22)
+
+**What broke.** In v0.1.6 a tenant connected by OAuth to a QuickBooks Online
+*sandbox* company, using its own Intuit app (per-tenant `client_id` + sealed
+`client_secret`, no platform app), could not switch Environment from
+Production to Sandbox. §271 made `environment` a destination key for every
+ERP by name, so the form stopped counting the stored `client_secret` as saved,
+`missingRequired` blocked Save (the own-app pair is required when no platform
+app exists), nothing persisted, and Test Connection went on calling the
+production host with the sandbox company's tokens.
+
+**Why `environment` is not a destination for QuickBooks.** The rule §271
+protects is that an admin (or a stolen admin session) must not be able to send
+a stored secret to a host of their choosing. The QuickBooks adapter maps
+`environment == "sandbox"` to `sandbox-quickbooks.api.intuit.com` and every
+other value to `quickbooks.api.intuit.com`; the authorize, token and revoke
+endpoints (`QBO_OAUTH`) are Intuit constants that no setting reaches. No value
+of the field can send the client secret, or the OAuth tokens, anywhere but
+Intuit. Dropping the secret on a switch protected nothing and broke the only
+way to test against a sandbox company.
+
+**Business Central's `environment` stays a destination.** It is a URL path
+segment (`{base}/{environment}/api/v2.0/companies(...)`) — a different value is
+different books in the customer's tenant, which is exactly what §271 means by a
+new destination. No other ERP catalogue entry declares `environment`.
+
+**The shape.** Destination-ness is now decided per provider from one flag. The
+catalogue's `_field(..., destination=...)` defaults to membership of the
+by-name `DESTINATION_KEYS`; QuickBooks declares `environment` with
+`destination=False`. `catalog.destination_keys(block)` is `DESTINATION_KEYS`
+plus the provider's fields marked destination, minus those it marks not, and
+`same_connection` / `secrets_to_drop` (so the save, and the test-erp secret
+fill) use it. The settings form already read the same per-field flag from
+`GET /organization/erp/providers`, so the frontend needed no logic change.
+
+- **Narrowing is opt-in per declared field, never inferred from what a form
+  renders.** A key the provider does not declare keeps the by-name default:
+  a `base_url` added to a QuickBooks block through the API is still a new
+  destination. A block routed through Merge.dev gets no opt-out.
+- **A host-naming field can never opt out** (`*_url` / `*host*`), and
+  `tests/test_erp_catalog.py` pins the list of opt-outs, so adding one is a
+  reviewed change with its own evidence.
+
+**Considered and rejected.**
+- *Removing `environment` from `DESTINATION_KEYS` globally.* It would open
+  Business Central, and any future provider that builds a URL from the value.
+- *Deriving the keys only from each provider's rendered fields.* Fails open
+  for a key an adapter reads that the form does not show.
+- *Carrying the same change to commerce.* Square's `environment` has the same
+  host-pair shape, but a Square access token is issued per environment, so
+  asking for it again on a switch is the right prompt there, not a bug. Left as
+  is.
+
+Intuit issues separate development and production keys for one app, so a
+switch may still need a new secret; the admin can type one. That is a
+credential choice, not a destination, and the form no longer forces it.
+
+Tests: `backend/tests/test_erp_catalog.py` (QuickBooks environment keeps the
+secret and is the same connection; an undeclared host key on a QuickBooks block
+still drops; Business Central environment and `base_url` still drop; the
+opt-out list is pinned; the PATCH and test-erp round trips against the real
+backend); `frontend/src/lib/types/erpConnection.test.ts` (QuickBooks keeps the
+secret counted as saved and Save unblocked; Business Central asks again).
+
+## 317. A bill's payments are read by the LinkedTxn types QuickBooks really uses (2026-10-22)
+
+**What broke.** In production a person paid a QuickBooks Online bill with Pay
+Bills, $150 from a bank account: an ordinary cash payment, no vendor credit.
+The status sync opened a blocking `payment_reconciliation` saying the bill was
+"settled, at least in part by a vendor credit", instead of recording the
+invoice paid outside FeohLedger.
+
+**Root cause.** The adapter had two definitions of "a bill-payment link".
+`map_bill_status` (§303) matched `LinkedTxn.TxnType` against `BillPaymentCheck`
+/ `BillPaymentCreditCard`. `_bill_payments`, which every other reader goes
+through, matched the entity name `BillPayment`. A Bill types the link by how it
+was paid (the payment's `PayType`), so against a real company `_bill_payments`
+found nothing. In `bill_report` the cash list was then empty, so
+`settled_by_credit = reduced_outside and (... or not cash)` came out True and
+`apply_bill_report` took the vendor-credit branch. The same empty read reached
+further than the reported symptom:
+
+- our own write-back was invisible, so a bill FeohLedger paid read as paid
+  outside us (`paid_only_by_us` False). That flags `payment_scheduled` as a
+  double payment and a FeohLedger-paid invoice as "paid twice";
+- `post_payment`'s first idempotency layer (find ours by marker) never matched.
+  Intuit's `requestid` replay was the only thing preventing a duplicate;
+- `void_payment` answered "no bill payment of ours to void" and reported
+  success, while our BillPayment stayed live in QuickBooks.
+
+`tools/fake-erp` and the adapter test doubles both emitted `"TxnType":
+"BillPayment"`, so they agreed with the wrong reader and CI's erp-e2e stayed
+green.
+
+**Intuit's values.** Intuit's linked-transactions guide says a Bill's link to
+its payment is set by QuickBooks through the BillPayment and appears in the
+Bill's `LinkedTxn`. The documented `LinkedTxn` type enumeration lists
+`BillPaymentCheck` and `BillPaymentCreditCard` and no `BillPayment`. Client
+libraries built against the API (quickbooks-ruby's `LinkedTransaction`
+defaults to `BillPaymentCheck`) agree, and so does the production bill: its
+payment was not found under `BillPayment`.
+
+**The rule.** `_BILL_PAYMENT_TXN_TYPES` is the one definition, and
+`_bill_payment_ids(bill)` the one reader. `_has_bill_payment` (status mapping)
+and `_bill_payments` (bill report, write-back idempotency, void) both use it.
+The other `_linked_ids` calls are unaffected: a BillPayment's own lines link to
+a `Bill` or a `VendorCredit` by those names, and the webhook's `billpayment` is
+the CloudEvents entity name, not a link type. The fake ERP links a `Check`
+payment as `BillPaymentCheck` and a `CreditCard` one as
+`BillPaymentCreditCard`, so the erp-e2e exercises the real shape.
+
+**A bare `BillPayment` is deliberately not accepted.** No Intuit source shows
+it on a Bill. Accepting it "defensively" is how this hid: the doubles kept a
+reader passing that real QuickBooks never matched. It would also either split
+the definition again or widen what §303 counts as proof that money left. The
+cost of an unrecognised link type is bounded on the inbound side: no payment is
+read, so a bill taken down outside FeohLedger still blocks for a person and is
+never booked as cash. The void side is not bounded the same way. That is why
+`test_qbo_status_sync_adapter.py` now pins the real types in the double, and
+why the double and fake-erp derive the link type from the pay type, not a
+literal.
+
+**Cash is defined positively.** Fixing the reader made a second gap reachable,
+which the money-path review caught before merge. `bill_report` called a
+person's payment cash when it had no `VendorCredit` line. That was harmless
+while no payment was ever read; once payments are read, a journal-entry credit
+cleared through Pay Bills (a $0 BillPayment whose lines link the `Bill` and a
+`JournalEntry`) would have been booked as a $150 cheque. Cash is now
+`_is_cash_payment`: a positive `TotalAmt` and every line linked to a `Bill` and
+nothing else. `settled_by_credit` is True whenever any payment made outside us
+is not cash, or the cash read does not cover what left the bill outside us.
+Both cases block for a person and book nothing.
+
+**Rows already wrong.** Before this fix every QuickBooks bill read as having no
+payments, so production may hold any of these:
+
+- *A bill paid in cash, flagged as a vendor credit* (the reported case). The
+  open `payment_reconciliation` stays, and while it is open it also refuses
+  the ERP-paid record (`record_invoice_paid_outside` refuses on an open
+  payment-blocking exception). A person dismisses it (§169), then records the
+  invoice paid outside FeohLedger with QuickBooks' date and rail. Alternatively
+  they make any edit to the bill in QuickBooks, so the webhook or CDC re-reads
+  it. An unchanged bill is not re-read on its own.
+- *A FeohLedger write-back read as a payment made outside us.* This shows up as
+  a non-blocking "paid twice" `erp_reconciliation` on a FeohLedger-paid
+  invoice, or a blocking "FeohLedger is paying it too" on a `payment_scheduled`
+  one. Both were false and are dismissed.
+- *A void that left our BillPayment standing.* `void_payment` answered "nothing
+  of ours to void", so `payment.erp_void_not_needed` was audited and no pending
+  void was kept, and the payment can no longer be voided again here. Each one
+  is voided by hand in QuickBooks. They are tracked in `docs/followups.md` (b),
+  with the query that finds them.
+
+Tests: `backend/tests/test_qbo_status_sync_adapter.py` (a `BillPaymentCheck`
+and a `BillPaymentCreditCard` cash payment read as cash, not credit, with date
+and rail; a genuine vendor credit, a journal-entry credit, a part-credit
+payment, a $0 payment without a void note and cash short of the reduction all
+read as not cash; a bare `BillPayment` link is not read; the write-back, cheque
+or card, is found, read as ours and voided through the real link),
+`backend/tests/test_erp_status_sync.py` (the adapter's report from a real-shape
+bill, carried through `apply_bill_report`, records `paid_recorded` with no
+exception).
+
+## 318. QuickBooks payment shapes come from a recording of a real company, not from the author of the reader (2026-10-22)
+
+**What broke.** §317: the status sync read a bill's payments under
+`LinkedTxn.TxnType: "BillPayment"`, real QuickBooks says `BillPaymentCheck` /
+`BillPaymentCreditCard`, and CI was green because `tools/fake-erp` and the
+adapter tests emitted `BillPayment` too. Every double was written by the same
+hand, from the same belief, as the code it checked. Fixing the reader fixed
+that belief; this entry is about the next one we do not know is wrong.
+
+**The shape.**
+
+- **Recorded fixtures.** `backend/scripts/record_qbo_contract_fixtures.py`
+  (`pnpm gen:qbo-recordings`) uses a local tenant's QuickBooks connection to
+  build each status-sync scenario in a SANDBOX company — a bill paid by cheque,
+  by card, in part, by a vendor credit, by our own write-back marker; a voided
+  payment; a deleted bill; change-data-capture over the run; a webhook body —
+  and writes Intuit's answers to `tools/fake-erp/fixtures/qbo_recorded/`.
+  `backend/tests/test_qbo_recorded_replay.py` replays them through the real
+  adapter over a `MockTransport` and asserts what each scenario MEANS (a bill
+  paid by cheque is cash, paid outside FeohLedger, by cheque, on the payment's
+  date), never what the adapter happened to answer. A bill can also be recorded
+  as a person made it (`--bill SCENARIO=ID`), since the production defect came
+  from QuickBooks' own Pay Bills screen.
+- **Scrubbed by allowlist, because the repository is public.** Strings survive
+  only under the keys the sync reads (ids, `SyncToken`, `TxnType`, `PayType`,
+  dates, reference values, `status`, Fault `code`); a memo keeps only a leading
+  "Voided" and our markers; names and addresses become fake ones; the realm id
+  becomes a placeholder; numbers stay. No token passes through the script: the
+  access token stays inside `erp_oauth` and the adapter's `_request`. The
+  scrubber is pinned by tests, and every committed recording must be a fixed
+  point of it.
+- **A scenario not recorded yet is a named skip**, with the command that
+  records it. That is a visible state in every run, not a masked failure; the
+  recording itself is the operator's step (`docs/followups.md`).
+- **The fake is compared to the recording, not fed from it.** The fake mints
+  bills per test with fresh ids, so it cannot serve recorded records verbatim.
+  Instead its Bill / BillPayment / void / CDC builders moved to
+  `tools/fake-erp/qbo_records.py` (stdlib only, so the backend suite can import
+  it; `app.py` needs FastAPI and defusedxml), and the replay suite fails when a
+  field the sync reads is missing from the fake's record, has another JSON
+  type, or carries another link type than QuickBooks used.
+- **A live check as well** (`pnpm test:erp:qbo-live`,
+  `backend/tests/test_qbo_live_contract.py`), mirroring Xero's (§ live Xero
+  contract check): opt-in, local, read-only, never in CI. A recording pins one
+  run; the live check re-asks the company, so a shape the recording never
+  covered still surfaces as a named failure.
+
+**Considered and rejected.**
+- *Committing raw responses and trusting review to catch PII.* The repository
+  is public and a review of a 500-line JSON blob is not a control.
+- *Calling Intuit from CI.* Needs an interactive OAuth consent and a rotating
+  refresh token held by a public repository's runners.
+- *Generating the fake's records from the recording at runtime.* It would make
+  the fake agree with the recording by construction while hiding what the fake
+  does with a shape the recording lacks; the comparison keeps the fake's
+  behaviour explicit and its drift loud.
+
+Tests: `backend/tests/test_qbo_recorded_replay.py` (scrubber, replay per
+scenario, fake against recording); `backend/tests/test_qbo_live_contract.py`
+(opt-in).
+
+## 319. The ERP's reported payment is kept as data, and recorded once what blocked it clears (2026-10-22)
+
+**What happened.** §317's production case, after its fix deployed: the sweep
+read the QuickBooks bill as paid and called `record_invoice_paid_outside`,
+which refused because the stale `payment_reconciliation` from the old bug was
+still open. That refusal opened a second exception, `erp_reconciliation`, whose
+description told an AP user to "record it via POST /api/payments/record-outside
+(erp_document_id=…, event=…)". To clean up, the operator had to work out that
+the two rows were linked and in which order to clear them; find that the
+payment queue's banner said "clear the exception first" without naming it,
+linking to it or saying the uploader may not clear it; find that "Record as
+paid" was hidden (not disabled) on the row; and re-key the rail, reference and
+date the ERP had already reported, in a form that defaulted to ACH for a
+cheque. Dismissing the blocker recorded nothing: the sweep reads only bills
+that change, so nothing would ever try again.
+
+**The rule.** A reconciliation exception the ERP paths open keeps what the ERP
+reported as **data**, in `exceptions.erp_report` (JSONB, migration 0121), and
+its `description` is a sentence for an AP user: what happened, what to do, no
+API path, no ids, no refusal code. For `kind: "paid_not_recorded"` the data is
+the payment itself (rail, reference, paid-on date and whether the ERP stated
+it, the ERP document and event ids) plus the refusal code that stopped it.
+The two other ERP-webhook rows carry their ids too (`settled_short`,
+`voided_after_post`).
+
+**One live row per invoice, refreshed, never stale.**
+
+- A later report while a `paid_not_recorded` row is open refreshes that row
+  instead of being dropped by the per-type dedupe. It refreshes the payment
+  conservatively: an undated report never replaces a stated date, an id-less
+  report never replaces the reference (an event-derived reference changes per
+  delivery, and the reference is the replay key), and `first_reported_at` keeps
+  the claim's age.
+- There is at most one live `paid_not_recorded` row per invoice, whatever its
+  type. A new double-pay refusal over a non-blocking row opens the blocking row
+  and closes the other as superseded (audited). A live blocking row stays the
+  row, keeping its own reason, because a later report is refused by that very
+  row and so says nothing new. Two live rows would each offer to record the
+  same payment, and a stale one would be re-attempted against a decision a
+  person made on the other.
+- **A payment the ERP withdraws is retired, not kept.** When the ERP later
+  reports the bill open, part-paid, deleted or voided (`apply_bill_report`;
+  the generic webhook on ANY status but `Paid` for an invoice still payable
+  here, checked before its transition screen because
+  `posted_in_erp → posted_in_erp` is a silent no-op), every live
+  `paid_not_recorded` row on the invoice becomes `paid_withdrawn`: it stays
+  open for a person, with a sentence saying so, but nothing re-attempts it and
+  no one-click offers it. Without this, a cheque voided in QuickBooks after the
+  first report would be booked as paid the moment someone cleared an unrelated
+  blocker, or cleared the deletion row to say "still owed". The sweep reads
+  only bills that change, so nothing would ever have flagged it. A blocking row
+  is never closed by a machine here.
+
+**Recording it later goes through the same gates, never around them.**
+
+- *Automatically.* When `exception_lifecycle.record_decision` resolves or
+  dismisses a payment-blocking exception, and the invoice holds a live,
+  non-blocking `paid_not_recorded` row, the stored facts go back through
+  `record_erp_reported_payment` in the same transaction
+  (`erp_status_sync.retry_erp_reported_payments`). Every refusal is re-run:
+  another open blocker, a live FeohLedger payment, run or card (which now opens
+  the blocking `payment_reconciliation`, exactly as a first report would), a
+  credit that cannot be netted. A refusal refreshes the row's code and
+  sentence. The payment is dated from the first report, never the day the
+  blocker cleared. `record_decision` is the hook because it is the one
+  chokepoint every clearing door shares (§169); escalating is not a clear and
+  records nothing. The record is the ERP's, not the clearer's (`actor_id`
+  NULL, `source="erp"`), exactly as the first attempt was, so the clearer needs
+  no `payment.record_external` and the recorder's segregation rule does not
+  apply to them. Their own act — clearing the blocker — has already passed the
+  queue's segregation rule. The payment to record is chosen only under the
+  invoice lock every ERP writer takes first, and re-read rather than served
+  from the identity map, so a withdrawal the sweep committed while the
+  decision waited is seen. The attempt runs in a SAVEPOINT: an unexpected
+  failure (a lock timeout, a bug) rolls back only the attempt, is logged with
+  its traceback, and stamps the row (`retry_failed_at`) with a sentence
+  pointing at the one-click record instead of promising an automatic one. It
+  must not undo a person's clearing of a duplicate or fraud flag.
+- *In one click.* `POST /api/exceptions/{id}/record-erp-payment`, from the
+  exception dialog, pre-filled from `erp_report`. It records the payment as a
+  user record (`source="user"`) and resolves the row as the caller, in one
+  transaction. **Every refusal comes before anything is written or audited.**
+  In `lambda` audit mode an audit row leaves for SQS when it is dispatched, so
+  resolving first and rolling back on a refused record would ship an
+  `exception.resolved` for a row that stays open. So the record runs first,
+  with this one row not counted as a blocker (`answering_exception_ids`, the
+  only door that passes one), and `_complete` resolves the row as the caller
+  once the payment is booked. The invoice and then the exception row are
+  locked (the order every ERP writer takes them in, so a click racing a sweep
+  tick waits instead of deadlocking) and re-read before anything is judged, so
+  a second click finds the row resolved and 409s. Not `record-outside`: a
+  `paid_not_recorded` row opened for a double-pay refusal is itself
+  payment-blocking, so `record-outside` refuses on it. Clearing it first in a
+  separate request would leave a window with the invoice payable and nothing
+  recorded. The caller needs `payment.record_external`; for a blocking row also
+  the queue's role and its segregation rule (`segregation_refusal`), and
+  always the recorder's (`external_payment.segregation_refusal`). Both are
+  reported per row as `record_erp_payment_refusal`, so the button is offered
+  exactly when the server would take it (issue #575's rule).
+- *Whichever door records the invoice as paid outside FeohLedger* (the
+  re-attempt, the one-click, a user's own "Record as paid", a run recorded
+  outside), `external_payment._complete` resolves every live
+  `paid_not_recorded` row on it through `record_decision`
+  (`via: payment_recorded`), because the question is answered. A FeohLedger
+  rail cannot pay such an invoice in the meantime: every refusal that leaves a
+  non-blocking row open (another blocker, an applied-credit conflict, nothing
+  left to pay) also refuses the payment run, and a double-pay refusal opens the
+  blocking row.
+
+**Why a blocking `paid_not_recorded` row is not re-attempted automatically.**
+It exists because FeohLedger held its own claim on paying the invoice when the
+ERP paid it. Which of the two payments stands is a person's call, and the row
+refuses the record on itself by design until someone who may clear it makes
+that call. The one-click path is that call.
+
+**Why not parse the old rows.** Rows raised before 0121 hold their facts only in
+prose. Parsing them back into a payment record would invent precision the row
+never had, so they are recorded by hand as before. The production row that
+prompted this is one of them.
+
+**The payment queue says what blocks a row.** Each row now carries
+`blocking_exception` (the exception's id and type, and this caller's
+segregation code for clearing it, or null) and `erp_reported_payment`. The
+blocked chip links to `/exceptions?id=…`, which opens that exception's dialog,
+and says when someone else must clear it. "Record as paid" is shown disabled
+with its reason as an accessible description instead of hidden. It opens
+pre-filled from the ERP's report when there is one, with no method chosen when
+the ERP stated none, rather than ACH.
+
+**Not done: localized ERP descriptions.** ERP reconciliation sentences are
+English, like every non-detector exception description, so the queue shows them
+in English in every locale. The dialog's own chrome and the ERP-payment panel
+are catalogued in all six locales. Moving these sentences onto
+`description_code` is tracked in `docs/followups.md`.
+
+Tests: `backend/tests/test_erp_reported_payment_recovery.py` (facts stored and
+refreshed, an undated report keeping the stated date; dismissing the blocker
+records with the ERP's rail, reference and date and closes the row with an
+audit row; a second blocker and a FeohLedger run still refuse, leaving one live
+row; idempotent; a failed re-attempt never undoes the clear; escalate records
+nothing; a user's own record closes the row; the one-click records and resolves
+a blocking row as the caller, is refused to the uploader on both SoD rules, a
+second click 409s, and a money-gate refusal books nothing and ships no audit
+row in `lambda` mode; the queue names the blocker and carries the ERP's
+payment), `test_erp_status_sync.py` (a payment the ERP withdrew — bill open,
+deleted or part-paid — is not recorded when every blocker is cleared),
+`test_erp_paid_recorded_outside.py`, `test_erp_webhook_transitions.py`,
+`frontend/src/lib/types/erpReport.test.ts`,
+`frontend/tests-e2e/payments/erp-reported-payment.spec.ts`.
+
+## 320. NetSuite signs in with OAuth 2.0 client credentials, and a saved block without a method stays TBA (2026-10-26)
+
+**Context.** Oracle closes Token-Based Authentication to new REST integrations
+in NetSuite 2027.1 ("Use OAuth 2.0"). The adapter only spoke TBA, so a customer
+onboarding on 2027.1 could not create the integration record our setup asked
+for (issue #653).
+
+**Decision.** `settings.erp.auth_method` picks `oauth2_m2m` (the client-
+credentials grant: a JWT signed with the private key of a certificate mapped to
+the integration, exchanged for a 60-minute bearer) or `tba`. The private key is
+an `erp` secret sealed in `provider_credentials`, write-only like the others;
+the client id and certificate id are configuration.
+
+- **Absent means `tba`, in the adapter and in the form.** Every NetSuite block
+  saved before the choice existed is TBA. Making the key mandatory would have
+  needed a control-plane data migration for a value we already know; reading
+  absent as OAuth 2.0 would break every existing tenant. The form starts a NEW
+  connection on OAuth 2.0 (first option) but shows a saved block without the
+  key as TBA (`stored_default`), because showing the first option there would
+  switch a working tenant on its next save. Any other value is refused, never
+  guessed.
+- **Each method's fields apply only under it** (`show_when`), so the form never
+  requires a TBA token secret of an OAuth 2.0 connection or the reverse. That
+  is a generic catalogue attribute rather than a NetSuite branch in the panel.
+- **The bearer is cached in process, keyed by a hash of the credentials**, and
+  a 401 re-mints once. The grant has no refresh token, so the only alternative
+  is a token request per push (three calls each) against NetSuite's
+  concurrency limits; persisting the token would add a sealed secret with no
+  owner. Hashing the private key into the key means a rotated certificate can
+  never reuse the old one's token.
+- **The algorithm follows the key**: PS256 for RSA 3072/4096, ES256/384/512 by
+  curve — Oracle's certificate conditions, refused up front otherwise rather
+  than after a round trip NetSuite would refuse anyway. NetSuite does not take
+  RS256.
+- **A refused token request is returned as the failed call.** Every caller
+  already treats a non-200 as failure, so a push fails non-retryable on a 400
+  (`invalid_client`: no certificate mapped) without reaching the record API, and
+  the OAuth `error` code is logged — never the assertion or a token. A 200 with
+  no token raises instead, since as a response it would read as success.
+- **fake-erp verifies the assertion cryptographically**
+  (`tools/fake-erp/netsuite_oauth2.py`), unlike its TBA shape check: a header
+  shape check would have proved nothing about whether NetSuite accepts what we
+  sign. Certificates are mapped through a test hook with the public key only,
+  and survive `/__reset` so a parallel worker cannot unmap a running spec.
+
+**Not done: live verification.** Built from Oracle's documentation and proven
+against the fake's verifier; a real account is the remaining proof
+(`docs/followups.md` (a)).
+
+Tests: `backend/tests/test_erp_netsuite_auth.py`, `test_erp_catalog.py`,
+`frontend/src/lib/types/erpConnection.test.ts`,
+`frontend/tests-e2e/erp/netsuite.spec.ts`. Reference:
+`backend/docs/erp-integration.md` § NetSuite sign-in.
+
+## 321. A sub-processor change is one change-log entry; the notice is emailed from it (issue #427, 2026-10-26)
+
+**What happened.** `/legal/dpa` § 8 and `/legal/sub-processors` § 9 promise
+every customer at least 30 days' notice before a new sub-processor processes
+their data. Nothing backed it: § 10 was a hand-typed `<tr>`, the DPA defined the
+notice as "this page is updated — checking it is how you receive it", and the
+30 days were prose in three places and an assertion in none. An Art. 28(2)
+general authorisation resting on "check this page" is weak, and a register row
+added without anyone told was one forgotten step away.
+
+**The rule.** The change log is data — `app/services/subprocessor_changelog.py`
+— and both halves derive from one entry, so adding the row and giving the notice
+are the same action:
+
+- `scripts/gen_subprocessor_changelog.py` (`pnpm gen:subprocessor-changelog`,
+  `check:` in CI's Backend lint job) writes the module § 10 renders.
+- `services/subprocessor_notices.py` (sweep `subprocessor-notices`) emails each
+  `notice=True` entry to every active system-`admin` of every organisation that
+  existed on its publication date.
+
+The 30 days are enforced, not described: a `notice=True` entry must state
+`effective_on` at least `NOTICE_PERIOD_DAYS` after `published_on`, or carry an
+`urgent_reason` (the DPA's security/availability carve-out). `validate` refuses
+anything else and generation refuses to write past it, so the page cannot
+publish a short notice that does not say why. The sent notice is measured too:
+each ledger row stores the entry's effective date and `late` — sent with under
+30 days to run, which an urgent entry or a sweep left off would cause — and the
+tick reports `late_notices` on `/api/health/sweeps`.
+
+**Idempotent and on the record, with no lock held across I/O.** A
+control-plane `subprocessor_notices` row, UNIQUE (entry, organisation), moves
+through three short transactions: the **claim** is inserted `ON CONFLICT DO
+NOTHING` and committed before any email goes out, so a second replica or a
+re-run sends nothing; **`sent_at`**, the counts, the recipient user ids and
+`late` are committed once at least one admin's email reached the provider (if
+none did, the claim is deleted and the next tick retries); then the tenant's
+`privacy.subprocessor_notice_sent` audit row is written and **`audited_at`**
+stamped. A failed audit write is a tick failure and is retried alone every tick
+— it never re-sends the notice. (The first cut held the claim open across the
+sends and the tenant write, so a tenant that refused the audit row rolled the
+claim back and re-mailed every admin hourly; review caught it before merge.) A
+claim with no `sent_at` older than `CLAIM_TIMEOUT` (an hour) is a run that died
+mid-send and is re-taken: that is the one at-least-once path, and a duplicate
+notice is recoverable where a silent miss is not. The ledger has no foreign key
+and is exempt from tenant deletion: it is evidence a contractual notice was
+given, and should outlive the customer it was given to.
+
+**No retroactive notices.** `NOTICES_SINCE` (2026-10-26) is the day this
+shipped; `validate` refuses a `notice=True` entry published before it, which
+would otherwise be mailed to every organisation on the first tick for a change
+that already happened without notice. A late notice (an urgent entry, or a
+sweep that was off) says "Took effect" rather than claim a future date.
+
+**Why each choice.**
+
+- **Administrators, not a DPO field.** The platform holds no privacy contact
+  for an organisation; inventing one meant an endpoint, a settings field and a
+  contractual decision (instead of the admins, or as well?) that is counsel's,
+  not code's. The active admins are the contact the platform does hold, the
+  DPA now says exactly that, and it keeps — rather than drops — the existing
+  offer to copy the notice by hand to another address requested at `privacy@`.
+  The field is the (c) follow-up.
+- **Not a notification event.** `notify_event` is preference-gated; a user who
+  muted email would have opted their organisation out of a contractual notice.
+  The sweep sends through the email adapter directly, with no in-app row.
+- **English, unbranded.** The DPA is English-only by design (§174) and the
+  notice is given under it; a white-label child tenant is still notified by the
+  processor, which is the platform.
+- **Organisations created after publication are not told.** They signed up
+  against a register that already listed the change.
+- **Append-only, stable ids.** The ledger is keyed by entry id: renaming one
+  re-notifies everyone, deleting one leaves a sent notice the page no longer
+  shows. The id must start with its publication date; `validate` checks both
+  that and order.
+- **The sweep is off by default and required in production.** Every sweep that
+  emails is off locally (guard rail 7). Because the DPA now says the notice *is*
+  emailed, `deploy/prod.sops.yaml.example` sets it and `decrypt-env.sh` warns on
+  every deploy while it is off. Warn, not refuse: a deploy should not be blocked
+  on it, and the warning plus the (b) follow-up make it impossible to miss.
+
+**Historical rows.** All six existing rows are `notice=False`: the register's
+first publication; the move of the databases to RDS (same provider, same
+region, same data — no new party); and four systems the customer connects
+itself (§ 4), which are not sub-processors. None is ever emailed.
+
+**Rejected.** A subscribe endpoint / mailing list (a second recipient model to
+keep consistent with the admin set, and a list a customer has to know to join —
+the same weakness as "check the page"); notifying from the git diff of the page
+(no stable id to dedupe on, and nothing measures the 30 days).
+
+**Tests.** `backend/tests/test_subprocessor_changelog.py` (the rules, the
+generator's drift guard and its refusal), `test_subprocessor_notices.py` (only
+active admins, once per entry, roll back when nobody is reached, one failed
+address does not stop the rest, `late`, organisations created after
+publication, the CLI), `test_migration_0122_subprocessor_notices.py`,
+`test_deploy_decrypt_env.py` (the warning),
+`frontend/src/lib/legal/subprocessorChangelog.test.ts` (the email's objection
+address is `CONTACT.privacy`).
+
+**Amended in review (2026-10-26): refuse, not warn.** "Warn, not refuse" left
+a deployment free to run with the contractual mechanism off, the one state the
+DPA cannot describe. `config.py` now refuses to boot a deployed environment with
+`FEOH_SUBPROCESSOR_NOTICES_ENABLED` off — the same shape as the `console` email
+refusal — and `decrypt-env.sh` refuses the file instead of warning, so a deploy
+stops before compose restarts the API into that refusal
+(`test_config_boot_guards.py`, `test_deploy_decrypt_env.py`). Local dev, tests
+and CI keep it off; the day-one rehearsal (production-shaped) turns it on.
+
+**Also amended in review.** An organisation with no active administrator raised
+the same error as one whose every email bounced, so it counted as a tick
+failure on every tick and held `/api/health/sweeps` red indefinitely; it is now
+`organizations_without_admin`, a counter that is not a failure, and the
+organisation stays owed (the undelivered case is a (c) follow-up). The audit row
+was appended once per attempt, so a control-plane stamp lost after the tenant
+commit appended a second row to the append-only trail next tick; it is now
+written only when the tenant holds no row with that action and `correlation_id`
+= the notice id, under an advisory lock, and synchronously in every audit mode
+— in `lambda` mode a row still in SQS is invisible to that check, the reason
+`dispatch_durable_auth_audit` writes synchronously too. Per-notice
+`failed_recipients` reach the operator as a tick counter and in
+`scripts/subprocessor_notices.py list`.
+
+## 322. Blackbaud: `OnHold` vendors are not payable, the shared SKY quota is budgeted per org, and the duplicate lookup searches every attempt's date (#651, 2026-10-26)
+
+Three Blackbaud FE NXT calls from the #651 audit, recorded together because
+all three are about what the adapter may assume about FE NXT's state.
+
+**1. An `OnHold` vendor syncs as inactive and is not paid from FeohLedger.**
+FE NXT's `VendorStatus` is `Active`, `Inactive` or `OnHold` (read from the
+live SKY definitions). `list_vendors` emits both `Inactive` and `OnHold` with
+`active=False` (`_UNPAYABLE_VENDOR_STATUSES`). The sync then creates no payee
+for one and marks a linked vendor inactive, so no payment run picks it up.
+`OnHold` still *takes an invoice* in FE NXT, but FE NXT holds its payments: a
+hold is how a nonprofit's finance office says "do not pay this supplier yet"
+(a dispute, missing paperwork, an audit). Paying the vendor from FeohLedger
+would go around that hold, because our payment never passes through FE NXT's
+payables. The vendor is still emitted, not dropped (§284: absence from a pull
+unlinks, and the vendor still exists). Lifting the hold in FE NXT does **not**
+reactivate the local vendor: re-enabling a payee is a person's call, and a sync
+that silently made one payable again would undo whatever the local team
+decided in the meantime. Rejected: treating `OnHold` as active because FE NXT
+accepts invoices for it. That reads "may be billed" as "may be paid", which
+are the two things the hold separates.
+
+**2. The SKY call quota is shared, so it is budgeted per org.**
+
+*What SKY does* (Blackbaud's "Rate limits and quotas" and "Throttling and
+retry patterns" pages, checked 2026-10-26): a per-second rate limit answered
+with **429**, and a daily call quota answered with **403**, both carrying
+`Retry-After`. The quota resets at **00:00 UTC**, and Blackbaud says to wait
+`Retry-After` rather than compute a reset. "Standard APIs" is 10 calls/s and
+25,000 calls/day **per subscription**. One platform subscription key
+(`FEOH_ERP_BLACKBAUD_SUBSCRIPTION_KEY`) serves every tenant without its own,
+so one tenant's bulk send or vendor sync could spend the day for all of them.
+A quota 403 used to reach the admin only as a failed push.
+
+*What we do* (`services/erp_call_budget.py`):
+
+- Every SKY call goes through an httpx request hook that counts it in Redis,
+  per subscription key (a SHA-256 digest, never the key) and per org, per UTC
+  day. A response hook records a 429's or quota 403's `Retry-After` as a
+  cool-down for the **whole key**, so no tenant keeps calling into a refusal.
+- An org on the platform key may spend
+  `FEOH_ERP_BLACKBAUD_TENANT_DAILY_CALL_BUDGET` (default 2,500, a tenth of
+  Standard) a day, and no org may take a key past
+  `FEOH_ERP_BLACKBAUD_DAILY_CALL_QUOTA` (default 25,000; set it to the key's
+  real tier). A tenant with its own `subscription_key` is held only to its
+  key's quota, since that bucket is its own.
+- **A push is never cut off half way.** It asks for its worst case before its
+  first call (`push_call_reserve`: the lookup pages, the fiscal years, the
+  create, the 400's vendor read and the job watch; more when it reads an
+  earlier job or searches extra dates) and then runs unenforced. A call
+  refused after the create would leave the job unconfirmed and the invoice
+  in doubt, which is worse than overshooting the share by one push. The
+  check and the spend are not atomic, so concurrent pushes can overshoot by up
+  to their number times the reserve, and a 401 token replay is one call more
+  than the reserve counts. SKY's own 403 and the shared cool-down are the
+  backstop.
+- The refusal is coded, `erp_call_budget_exhausted` with `reason`
+  (`tenant_budget`, `subscription_quota`, `rate_limited`) and `retry_after`,
+  and is made before any call (`not_posted`). An earlier attempt's job stays on
+  the result, so it is still read first next time. Only `rate_limited` is
+  retryable by `services/erp`'s seconds-long backoff; the other two fail the
+  invoice with the reason, and the operator retries after the reset.
+- A sync listing is refused call by call. The hook raises
+  `ErpCallBudgetExhausted` (never an `httpx.HTTPError`, which the push reads as
+  "outcome unknown"). The listing returns nothing (§284: never a partial pull),
+  and `erp_pull_failure` answers a coded **429** with `Retry-After`. A PO
+  sync too: `list_pos` otherwise reads any failure as "no POs", and a refusal
+  must say why.
+- A 403 *with* `Retry-After` is read as the quota, as SKY documents. A
+  permission 403 that happened to carry the header would pause the whole key
+  until it passes. That is accepted as the documented contract, not guessed
+  around from the body (never parsed: it can echo the payload).
+- The org's admins get an `erp_call_quota` notification (in-app + email,
+  preference-gated), once per UTC day each, at 80% of the share, when the
+  share is used, and when the subscription's quota is. It is claimed by a
+  Redis SET NX and released if nobody could be told, delivered through
+  `erp_connection_health.notify_org_admins`: the ERP connection's existing
+  notice path, under its own event type so the "needs reconnecting" label is
+  not stretched over a quota.
+
+*Why Redis, when it held mostly auth state.* The counts last a day, must be
+shared by every worker, the dispatch task and the Lambda path, and are
+incremented on every HTTP call. That is the `services/rate_limit` shape, not a
+JSONB write under the org row lock per request. Losing them (a Redis restart)
+costs at most a day's count. **It fails open**: a Redis error lets the call go
+ahead uncounted. This is a courtesy brake on a quota SKY enforces itself, and
+its 403 stays the backstop, so failing closed would only turn a Redis blip into
+"no Blackbaud posts". (Auth fails closed on Redis; that asymmetry is
+deliberate.)
+
+*Rejected.* Sleeping on `Retry-After` inside the push: a worker held for up to
+a day, with the transaction discipline of `services/erp` built around seconds.
+An automatic re-send at the reset: worth having, but it is a re-dispatch sweep
+over `failed` invoices with its own idempotency story, so it is a follow-up.
+A share computed from the number of connected tenants (quota ÷ n): it moves as
+tenants connect, and one busy tenant could still never use what quiet ones
+leave.
+
+**3. The narrowed duplicate lookup searches every date an attempt was sent
+with.** When the unnarrowed `search_text` page (500 rows) is full, the lookup
+narrows with `from_date` / `to_date` to a day either side of the invoice date.
+It narrowed on the **current** date. If the date was edited between an
+attempt whose outcome is unknown and the retry, our own marked bill sat outside
+the window and the retry posted a second bill. `services/erp._call_erp` now
+records each attempt's invoice date on the workflow instance
+(`erp_attempt_invoice_dates`, before the call, cleared by a success). It hands the earlier ones over as
+`InvoicePayload.prior_invoice_dates`, and the adapter narrows on each.
+
+Only an attempt that may have reached the ERP keeps its date. One that
+states it left nothing (`not_posted`: a budget or pre-flight refusal) gives its
+slot back, and the list is never trimmed. A first version kept the five newest,
+so a run of date edits, each refused all day by the budget, could push out the
+date of the one bill that may exist: the hole this closes, reopened.
+
+*Trade-off kept.* A **hand-keyed** duplicate (no marker of ours) dated outside
+every window we search, for a number busy enough to fill the first 500 hits,
+is not seen. Nothing ties it to a date we know, and walking every page of a
+busy number on every post is the quota problem above. A marked bill of ours is
+always found, since every date it can carry is searched. The duplicate keyed
+by hand is still caught when the number is not busy, which is the usual case,
+and FeohLedger's own duplicate warnings run before approval.
+
+**Tests.** `backend/tests/test_erp_blackbaud_adapter.py`: the cool-down shared
+across tenants, a 429 retryable and a quota 403 not, the per-org share and the
+key quota, the own-key exemption, the 80% warning once, a notice nobody got
+retried, the pending job kept on a refusal, a sync refused page by page and
+its coded 429, a status read under a cool-down, Redis down, `Retry-After`
+parsing, and the date-edit retry finding the first bill.
+`test_erp_push_flow.py` (dates recorded and handed back),
+`test_notification_templates.py`, `frontend/src/lib/api/erpRefusals.test.ts`.
+fake-erp's `POST /blackbaud/__throttle` reproduces SKY's 429 / 403 locally.
+
+## 323. A PO the ERP adapter cannot price is reported, and an earlier total for it stops being matched against (PR #670 money review, migration 0123, 2026-10-26)
+
+**The problem.** Adapters skip a PO whose total they cannot state exactly:
+SYSPRO a PO with a line discount, a price unit of measure, a mixed-currency
+order or a currency it cannot place (§303's issue #650 work); Blackbaud FE NXT
+one with no `order_total`. Skipping is right for a PO the sync has never seen.
+For one it synced earlier it was silent: the row kept the old total, the sync
+said nothing, and the 3-way match kept passing invoices against a figure the
+ERP no longer stated. Nothing in the sync could tell "the ERP skipped this PO"
+from "this PO was never here".
+
+**The rule.** An adapter that skips a PO says so, and the sync stops trusting
+the row:
+
+- **Contract.** `ErpAdapter.list_pos_report() -> PoListing(pos, skipped)`, each
+  skip a `SkippedPo(po_number, PoSkipReason)` with a coded reason
+  (`unpriceable`, `lines_unread`, `no_lines`, `local_currency_unknown`). The
+  base default wraps `list_pos` and reports nothing skipped, so every adapter
+  that does not override it — and every test double that patches `list_pos` —
+  behaves exactly as before. It is additive on purpose: a second abstract method
+  would have broken adapters other sessions were editing. SYSPRO overrides it;
+  Blackbaud's wiring is a `docs/followups.md` entry.
+- **The mark.** The sync stamps `purchase_orders.total_unverifiable_reason` on
+  the existing row the upsert would refresh for a skipped number
+  (`_sync_target`: this entity's row first, else an unstamped one). Marking
+  every row in scope was rejected in review: the upsert clears only that one
+  row, so a shared twin would stay marked, and its invoices held, for good. It
+  does not change `total`: there is no honest
+  figure to write, and erasing one would invent a zero. The next sync that
+  prices the PO clears the mark. The response reports `not_priced` and
+  `unverifiable`, and the purchase-orders page shows a warning toast.
+- **The match.** While the mark is set, `po_matching` compares nothing —
+  `mismatch`, no variance, issue `po_total_unverifiable` — and skips the
+  receipt-value leg. `refresh_warnings` raises a payment-blocking `po_mismatch`
+  at `warning`, the currency guard's treatment and for its reason: with no
+  trustworthy figure there is no way to show the invoice is not over-billing.
+  The missing-PO and multi-PO-split agents never take such a PO as a candidate.
+- **When it lands.** The sync re-matches the invoices citing every PO whose mark
+  or total it changed, in its own transaction and **not** best-effort, so the
+  hold appears at sync time rather than at the invoice's next edit, and lifts
+  the same way. The QMS sync's best-effort precedent does not carry over: a
+  receipt changes evidence, while this mark exists to raise a hold, and the
+  payment gate reads only open exceptions — a committed mark without its hold
+  would leave an approved invoice payable against the stale total. A failed
+  re-match fails the sync and rolls the mark back.
+- **A failed currency read is not a fact.** SYSPRO skips a currency-labelled PO
+  as `local_currency_unknown` only when `GetLogonProfile` answers with a profile
+  stating no usable code. A failed read (HTTP error, `ERROR`, unreadable) fails
+  the listing (`ErpListingIncomplete`): skipping would mark every labelled PO
+  and hold every invoice citing one over a transient outage, and some of those
+  holds (past approval, manual receipts) would outlive it.
+- **Elsewhere.** The supplier portal refuses to flip a marked PO (409); the PO
+  list and detail return the reason. Budget commitments and spend analytics
+  still sum the stale total — reporting, not payment; a `docs/followups.md`
+  entry.
+- **A note for the CISO / Security Analyst.** Re-matching on every ERP total
+  change means an ERP-side increase can now close an over-billing `po_mismatch`
+  at sync time instead of at the invoice's next edit. The guards are the ones
+  every re-match has (org settings, past-approval and segregation limits), but
+  nobody with ERP access is treated as an implicated actor the way a manual
+  receipt's recorder is (§267). Where one person can edit both the ERP PO and
+  the AP invoice, that is a segregation question for the customer's controls.
+
+**Considered and rejected.**
+
+- *Setting the PO to `cancelled` or deleting it.* Both are claims the ERP did
+  not make; an invoice against a deleted PO also reads `po_not_found`, which
+  sends the missing-PO agent looking for another PO to link.
+- *Zeroing `total`.* `NOT NULL` aside, a zero total is a figure, and the
+  matcher would compare against it.
+- *Holding only invoices still pre-approval.* The point of the mark is that
+  nothing pays against an unverified total, which is the payment gate's job.
+
+Guards: `tests/test_purchase_orders.py` (sync → mark → hold → re-price →
+clear, the entity scope, mark and clear on the same row beside a shared twin,
+a failed re-match rolling the mark back, the base default),
+`test_po_matching_algorithm.py`, `test_po_matching_wiring.py`,
+`test_exception_agents_missing_po.py`,
+`test_portal_self_service.py::test_po_flip_refuses_a_po_whose_total_the_erp_no_longer_vouches_for`,
+`test_erp_syspro_adapter.py` (`test_list_pos_report_names_every_po_it_skips_and_why`,
+`test_a_failed_logon_profile_read_fails_the_listing_instead_of_skipping`),
+`test_migration_0123_po_total_unverifiable.py`.
+
+**Later in PR #670: the stale total leaves every other surface too.** The
+"Elsewhere" bullet above deferred budgets and analytics; that deferral is
+closed. Display paths send `null` for a marked PO's total and line money
+(`models/procurement.po_vouched_money`) — the PO API with the reason, the
+supplier portal with only a `total_unverifiable` flag, since the reason code is
+the buyer's — and the web shows a named state, not a dash that would read as
+"no total". Aggregates follow §35 (exclude and count, the rule `excluded_rebate_count`
+(§62) and the budgets' `excluded_row_count` already apply): budget `committed`,
+the `/cfo` open-PO and GR/IR accrual legs and by-entity open POs leave the PO
+out and report `unverifiable_po_count` / `open_po_unverifiable_count`, rendered
+beside the figure. A separate count, not folded into `excluded_row_count`,
+because that one means "re-denominate the row" and this one means "the ERP has
+to price the PO". *Rejected:* showing the last-synced figure labelled "stale" —
+a labelled number still gets copied, summed and compared, which is what the mark
+exists to stop. Guards: `po-matching.md` § A PO total the ERP no longer vouches for.
+
+**Amendment (2026-10-26): the sync's re-match raises holds, never clears them.**
+A product-owner decision, **pending the CISO / Security Analyst review** the
+note above asks for. It answers that note's question for the sync itself:
+anyone with ERP access could raise a PO total and close an over-billing
+`po_mismatch` at sync time with no FeohLedger sign-off, and ERP-side actors are
+outside the implicated set `segregation_refusal` checks.
+
+- The PO sync passes `erp_po_sync` to `refresh_invoices_citing_pos`, and
+  `invoice_warnings._reconcile_po_exceptions` then never calls
+  `_close_cleared_po_exceptions`. The re-match may still open or keep a
+  `po_mismatch` / `quality_hold`. This replaces "lifts the same way" in *When it
+  lands*. Re-pricing a marked PO clears the mark, not the hold.
+- A row the re-match no longer finds stays open and payment-blocking, with
+  `erp_report = {"kind": "po_rematch_clears", "erp_type", "po_number",
+  "observed_on"}`: §319's machine-detail column, PII-free, so a reviewer can see
+  why the row now reads as clearable. Clearing it is a person's action through
+  `record_decision`, under its segregation checks. A later refresh that finds
+  the finding again removes the note.
+- Refreshes a FeohLedger action triggers (invoice save, receipt, QMS sync) keep
+  their auto-close. Before §323 the sync re-matched nothing (checked against
+  `5f833334^`), so this leaves every human-triggered path as it was. The
+  residual: an ERP-side increase can still let the hold lift at the invoice's
+  next FeohLedger edit, as it could before §323. That is the open question for
+  the CISO review (`docs/followups.md`). The note is not yet rendered by either
+  client (also `docs/followups.md`).
+- *Considered and rejected:* closing on sync when the invoice is still
+  pre-approval, as the relink rule does. An approver still reviews the invoice,
+  but not the ERP edit, and the payment gate is where this control has to hold.
+
+Guards: `test_purchase_orders.py` (`test_sync_erp_raising_a_po_total_never_clears_the_hold`:
+the run is still refused; `test_sync_erp_lowering_a_po_total_opens_a_blocking_hold`;
+`test_a_refresh_outside_the_erp_sync_still_auto_closes_as_before`; and the
+re-price leg of `test_sync_erp_marks_an_already_synced_po_the_adapter_now_skips`).
+
+## 324. Blackbaud reports the POs it skips, a PO listing that fails says so, and an org can see its SKY call usage (PR #670 round 3, 2026-10-26)
+
+**1. Blackbaud FE NXT names a PO it drops for want of a total.** §323 added
+`list_pos_report` and left Blackbaud's wiring as a follow-up. A PO FE NXT lists
+with no usable `order_total` (absent, null, unreadable, or not finite) is now
+`SkippedPo(number, unpriceable)`, so a PO synced at a total and later listed
+without one is marked and held exactly as SYSPRO's are. Templates and deleted
+orders are still dropped without a report: neither is a PO the match may use,
+and a `DeletedOrder` the sync marked would hold invoices over a PO that no
+longer exists rather than one the ERP stopped pricing.
+
+**2. A PO listing that could not be read whole raises.** `list_pos` caught
+every exception except the budget refusal and returned `[]`. The PO sync read
+that as "the ERP has no POs": it synced nothing, said nothing, and dropped the
+skip report from (1) with it, so the mark could never land during an outage. It
+also read only 10 pages (1,000 POs) and returned them as the whole list. The PO
+listing now goes through `_sync_rows`, like vendors and the chart: a failed
+page, a transport error (`httpx.HTTPError`, now mapped for all three listings,
+as Business Central, Merge.dev and NetSuite already did) or more than
+`SYNC_LISTING_MAX_ROWS` raises `ErpListingIncomplete` (a coded 502), a lost
+connection is the coded 409, and a budget refusal is still the coded 429 of
+§322. Nothing is synced in any of them.
+
+Tests: `backend/tests/test_erp_blackbaud_adapter.py`
+(`test_list_pos_report_names_every_po_it_left_out_for_want_of_a_total`,
+`test_a_po_listing_that_cannot_be_read_whole_raises_rather_than_finding_none`,
+`test_a_transport_error_on_a_listing_is_an_incomplete_listing`,
+`test_a_po_listing_without_a_connection_says_so`),
+`tests/test_purchase_orders.py::test_sync_erp_marks_a_blackbaud_po_that_lost_its_order_total`
+(the real adapter through `sync-erp`: synced at 100.00, marked when the total
+goes, cleared when it returns).
+
+**3. An org can see today's SKY call usage.** The `erp_call_quota` notice
+(§322) was the only place an org learned where it stood against the budget,
+and only at 80%, 100% or a refusal. `GET /api/organization/erp/oauth/status`,
+the connection status the ERP panel already reads, now carries `call_usage`
+for an adapter that has a `call_budget` (`ErpAdapter.call_budget()`, None by
+default; Blackbaud's is the one): `scope` (`org_share` on the platform key,
+`subscription` on the org's own), `used`, `limit`, `resets_at`, and
+`paused_reason` / `paused_until` while calls are refused. The panel renders it
+under the connection line in all six locales, with localized counts and times.
+
+- *The figure is the org's own.* On the platform key `used` is this org's calls
+  against its share; the key's total is not reported, since it is every
+  tenant's activity. On an org's own key it is every call on that key, against
+  the key's quota.
+- *It is a read only* (`CallBudget.usage`). `check` sends notices and is the
+  gate; a status page rendered every visit must do neither. A pause is the
+  key's cool-down, or a share or quota already used by our own count — the
+  same three reasons a push would be refused with.
+- *It fails open.* A Redis error, a missing subscription key or an adapter that
+  will not build gives `call_usage: null` and the panel shows nothing. The
+  figure is a courtesy over a courtesy brake; a status read that errored over
+  it would hide the connection state, which matters more.
+- *Rejected:* a separate usage endpoint. The status read is already the
+  panel's one call for "where does this connection stand", is admin-only, and
+  is where the expiry warning (§295) lives.
+
+Tests: `backend/tests/test_erp_oauth.py` (the share and the other tenant's
+calls kept out of it, a 429 cool-down and a used-up share as pauses, an own
+key against its quota, Redis down, a non-budgeted ERP, no key),
+`frontend/src/lib/types/erpConnection.test.ts` (`callUsageLines`, every
+sentence in every locale).
+
+## 325. Every adapter that drops a numbered PO for want of a total reports it (PR #670 review, 2026-10-26)
+
+**Context.** §323 made `list_pos_report` the way an adapter says "I have this
+PO and cannot state its total", so the sync stops matching against a total
+stored for it earlier. SYSPRO and Blackbaud FE NXT (§324) overrode it. The
+PR's review found three more adapters that silently skipped a numbered PO with
+no usable total (NetSuite `foreigntotal`, Business Central
+`totalAmountIncludingTax`, Sage Accounting (ZA) `Total`), and one that synced
+it at 0 (Sage Intacct `txnTotal`). Those had exactly the gap §323 closed: the
+earlier total stayed trusted, and for Intacct every invoice against the PO read
+as over-billed.
+
+**Decision.** All four override `list_pos_report` and name such a PO
+`unpriceable`; `list_pos` returns the report's `pos`. A PO with no number is
+still dropped unreported, because no stored row can be found for it. The four
+PO listings still degrade on a failed read, as §284 kept for POs: NetSuite and
+Business Central return what they had read (and stop at their page cap), the
+two Sage adapters an empty list. Unlike Blackbaud's, they do not raise
+`ErpListingIncomplete`, so a failed or capped read hides the skips in the part
+it did not read. That gap is a `docs/followups.md` (c) entry.
+
+**Tests.** `test_erp_po_sync.py` (NetSuite and Business Central),
+`test_erp_sage_accounting_za_adapter.py::test_a_po_with_no_total_is_reported_skipped`,
+`test_erp_sage_intacct_adapter.py::test_a_po_with_no_total_is_reported_skipped_never_synced_at_zero`.
+
+## 326. The PO matcher refuses a cancelled PO, and still matches a closed one (PR #670 review, 2026-10-26)
+
+**Context.** The PR #670 money-path review found that `po_matching` ignored the
+PO's status: an invoice citing a `cancelled` order matched it and could pass the
+amount control, although accruals and budgets already counted that order as
+dead (`DEAD_PO_STATUSES`). It predates the PR.
+
+**Decision.** A PO in `CANCELLED_PO_STATUSES` (`cancelled`, `voided`) is never
+matched against: the matcher compares nothing and raises
+`po_match.issue.po_cancelled`, and `refresh_warnings` raises the `po_cancelled`
+warning with a payment-blocking `po_mismatch`, the currency guard's treatment.
+The ERP PO sync re-matches the invoices citing a PO whose status moves into or
+out of that set, so a cancellation holds its invoices at sync time (hold-only,
+as §323 amended).
+
+**`closed` is not refused.** An ERP closes a PO once it is fully billed, and
+the invoice being matched can be the bill that closed it (we push it; the ERP
+marks the PO fully billed; the next sync reads `closed`). Refusing `closed`
+would hold the ordinary last invoice on every PO. A closed PO stays a valid
+match; a second invoice against a fully billed PO is the over-billing and
+duplicate checks' job, not the status's.
+
+**Tests.** `test_po_matching_algorithm.py` (`test_a_cancelled_po_is_never_matched_against`,
+`test_a_closed_po_still_matches`) and
+`test_purchase_orders.py::test_sync_erp_cancelling_a_po_holds_the_invoice_citing_it`.
+
+## 327. The ERP PO sync refreshes a PO's lines, in place where goods were received (PR #670 review, 2026-10-26)
+
+**Context.** The PR #670 money-path review found that the sync refreshed an
+existing PO's `total` but never its lines, which predates the PR. The 3-way
+receipt-value check is `po_total × gr_qty / po_qty_total`, so after an ERP
+amendment from 10 × 10 to 20 × 10 the stored 10 ordered units valued a 10-unit
+receipt at the whole 200, and a 200 invoice passed "billed beyond receipt"
+with half the goods delivered. The GR/IR accrual was overstated the same way.
+
+**Decision.** When the adapter sends lines, the sync makes the stored lines
+match them, comparing at `po_line_items`' column scales so an unchanged PO is a
+no-op. Goods-receipt lines reference PO lines by id (migration 0109), so a line
+something was received against is never deleted: it is updated in place,
+paired with an ERP line of the same SKU, else the same description. Unreceived
+lines are replaced and new ones added. When a received line has nothing to pair
+with, the sync changes no line and marks the PO with its own `PoSkipReason`,
+`lines_changed`, so §323's machinery refuses the match and holds the invoice
+for a person. A payload without lines leaves the stored ones alone. Any line
+change re-matches the invoices citing the PO, hold-only (§323 amended).
+
+**Rejected.** Pairing received lines by position: ERP line order is not stable
+across amendments, and a wrong pairing would move a receipt onto another
+line's quantity. Deleting received lines and nulling the receipts' link: it
+would erase which line the goods arrived against.
+
+**Tests.** `test_purchase_orders.py`: `test_sync_erp_replaces_the_lines_of_a_po_nothing_was_received_against`,
+`test_sync_erp_is_idempotent_for_lines`, `test_sync_erp_updates_a_received_line_in_place`,
+`test_sync_erp_marks_a_po_whose_received_line_the_erp_dropped`.
+
+## 328. A PO sync re-keys a row an earlier adapter build stored differently, and retires its placeholder (PR #670 review, 2026-10-26)
+
+**Context.** Before PR #670 the Merge.dev adapter keyed a PO by `number`, then
+`transaction_number`, then its Merge record id, and filed every PO with none of
+those under one shared `"UNKNOWN"` row. Merge's real number field is
+`purchase_order_number`, so most POs were stored under a UUID. Once the adapter
+read the right field, the next sync created a second row under the real number
+and never touched the UUID row: `/cfo` open-PO accruals and the by-entity rollup
+summed the order twice, and the merged `"UNKNOWN"` row stayed open.
+
+**Decision.** Generic, so another adapter's re-keying needs no new mechanism:
+
+- `PoPayload.legacy_po_numbers` names the keys an earlier build used for the
+  same PO. When no row holds the real number, the sync re-keys the first row
+  found under a legacy key (the same `_sync_target` scope as the upsert), then
+  refreshes it as an existing PO, and re-matches the invoices citing it.
+- `ErpAdapter.retired_po_numbers` names placeholders an earlier build wrote for
+  several POs. The sync marks such a row `unpriceable` (§323), so it is never
+  matched or summed; an already-marked row is left alone.
+
+Both are counted in the sync's audit row (`rekeyed`, `retired`). A re-keyed row
+keeps its id, so receipts and invoices already linked to it stay linked.
+
+**Rejected.** A one-off data migration: it would need Merge's record shape in
+the database, which the row does not keep, and could not tell a UUID key from a
+real PO number. The sync already has the record in hand.
+
+**Tests.** `test_erp_po_sync.py::test_merge_dev_list_pos_reads_purchase_order_number`,
+`test_purchase_orders.py::test_sync_erp_rekeys_a_row_an_earlier_build_stored_under_another_key`,
+`test_purchase_orders.py::test_sync_erp_marks_a_retired_placeholder_row`.
+
+
+## 329. The four remaining PO listings are read whole or raise (PR #670 follow-up, 2026-10-31)
+
+**Context.** §325 left NetSuite, Business Central, Sage Accounting (ZA) and Sage
+Intacct degrading on a failed PO read, as §287 rule 1 had kept for POs. §323
+made that unsafe in a different way: the sync reads the listing's `skipped`
+report, which covers only the part the adapter read, so a failed or capped read
+left a PO that had just become unpriceable trusted at its stored total.
+
+**Decision.** Each of the four `list_pos_report`s reads up to
+`SYNC_LISTING_MAX_ROWS` or raises `ErpListingIncomplete` (`fetch_failed` /
+`truncated`), as Blackbaud and SYSPRO do (§324). `list_pos` returns the report's
+`pos` and so raises too, and `POST /api/purchase-orders/sync-erp` answers the
+coded 502 with nothing synced. The 10-page best-effort mode is removed (NetSuite
+`_suiteql`, Business Central `_list_collection`); the Sage pair's `_MAX_PAGES`
+now bounds only the lookups made while posting a bill. A transport error (and on
+Intacct an unreadable body) on either Sage adapter's sync listings is now an
+`ErpListingIncomplete` rather than `SageZaError` / a raw `httpx` error, and a
+token failure on the PO read raises instead of reading as "no POs".
+
+**Rejected.** Returning the partial list with a truncation flag, for §287's
+reason: a partial report is still read as a complete one.
+
+**Tests.** `test_erp_po_sync.py::test_{bc,netsuite}_po_listing_is_read_whole_or_raises`;
+in both Sage adapter test files `test_every_sync_listing_raises_on_failure_the_po_list_included`,
+`test_a_po_listing_is_read_whole_or_raises` and
+`test_a_transport_error_on_any_sync_listing_is_an_incomplete_listing`.
+
+## 330. The run builder locks its invoices before it checks them (§309 follow-up, 2026-10-31)
+
+**Context.** `create_payment_run_for_invoices` read its invoices with a plain
+`SELECT`. A run staged while `/send-to-erp` held the invoice `FOR UPDATE` read
+`approved` with no live payment and booked a `pending` payment beside the push —
+its FK insert's `FOR KEY SHARE` only waited for the send's commit. That is the
+double claim §309 refuses.
+
+**Decision.** `payment_runs.lock_run_invoices` locks the run's invoices
+`FOR NO KEY UPDATE`, in id order, under the bounded invoice-lock wait (§233,
+`FEOH_PAYMENT_INVOICE_LOCK_TIMEOUT_MS`) before any gate reads them. Whichever
+commits first wins and the other refuses: the run on `sending_to_erp`, the send
+on `payment_blocks_erp_export`. No separate "ERP claim" predicate is needed: a
+push moves the invoice off `PAYABLE_INVOICE_STATUSES` in the same transaction
+that passed its gate. `FOR NO KEY UPDATE` matches dispatch and the card mint
+(§265). Id order and taking no vendor or payment lock keep it cycle-free with the
+mint (vendor → invoice) and dispatch (payment → invoice). A timeout is
+`409 invoice_locked` with nothing booked. A `plan_id` replay re-checks for an
+existing run after the lock, so the copilot's enact stays idempotent.
+
+**Rejected.** A plain re-read after the insert: a commit landing between the two
+statements still defeats it.
+
+**Tests.** `test_erp_export_blocking_exceptions.py` — run-waits-on-send,
+send-waits-on-run, lock timeout, and the `plan_id` replay under the lock.
+
+## 331. ERP reconciliation sentences are catalogue codes (§319 follow-up, 2026-10-31)
+
+**Decision.** Every sentence `open_erp_reconciliation_exception` writes is an
+`exception.erp_*` code in `invoice_warning_catalog` with typed params, carried
+as `description_code` / `description_params`; the English `description` stays as
+the fallback. A sentence that names the ERP has an `_unnamed` twin ("Your ERP")
+picked by `erp_finding()`, because a word picks the code rather than being
+spliced in — German's "your ERP" is declined. The ids the sync-back and
+pre-payment bill-check sentences used to end with moved into `erp_report`
+(`kind` `bill_state` / `dispatch_stopped` / `bill_unlinked` /
+`erp_payment_voided`), applying §319's no-ids-in-the-sentence rule to them.
+
+**Not done.** The QuickBooks write-back failures (`erp_payment_writeback.py`)
+and `payment_erp_sync`'s sync-back failure still carry adapter codes, payment
+ids and API paths in English (`docs/followups.md`).
+
+## 332. The last three PO listings read whole, and the write-back sentences are catalogue codes (§329 / §331 follow-ups, 2026-10-31)
+
+**Decision.**
+
+1. Merge.dev, Xero and QuickBooks Online read their PO listing up to their
+   bound or raise `ErpListingIncomplete` (`fetch_failed` / `truncated`), as §329
+   did for the other six. Merge.dev used to answer `[]` on a failure and stop at
+   1,000; Xero ended at a failed page (or a lost token) with what it had and
+   stopped at 10 pages; QuickBooks returned the first 50 of a longer list.
+   QuickBooks' `_query_all` is always complete and maps a failed page to
+   `fetch_failed`, so its chart and vendor syncs also answer the coded 502
+   instead of naming an exception class.
+2. The QuickBooks write-back's three failure sentences and `payment_erp_sync`'s
+   failed-leg sentence are `exception.erp_*` codes
+   (`erp_payment_writeback_failed` / `_balance_open` /
+   `erp_payment_void_writeback_failed`, with `_unnamed` twins;
+   `erp_sync_back_failed`, never named). Payment id, run id, bill, the coded
+   refusal or exception class, and the invoice status ride `erp_report`. The
+   retry is stated as the run's Retry ERP sync action, not an API path. The web
+   resolve dialog states the refusal from `erp_report.refusal` through the
+   existing `erpRefusal.*` messages. `open_erp_reconciliation_exception` takes
+   only `finding=`.
+
+**Rejected.** Keeping best-effort PO reads on these three because they report
+no skips: the listing is read as the whole list either way, and the gap reopens
+the moment one starts reporting.
+
+## 333. The ERP push refuses a vendor the payment path will not pay (§286 / §309 follow-up, 2026-10-31)
+
+**Context.** A payment run refuses a vendor that is not `active`; dispatch
+refuses one that is `payments_blocked` or screens `match`, and holds one that
+screens `review`. The ERP push asked none of this, so a blocked or
+sanctions-held payee's approved bill was booked in the ERP, where it can be paid
+against the ERP's own vendor record past our screening — §286's reasoning
+applied to the payee instead of the debt.
+
+**Decision.** `erp_export_gate.erp_export_vendor_hold` runs after the exception
+check (§286) and the live-claim check (§309), at `_call_erp` and the three send
+doors (and so the auto-send), with the coded refusal `vendor_blocks_erp_export`,
+`params = {hold, possibly_posted?}`. It reads `payment_runs.vendor_payability`,
+the one vendor read the run gate's `inactive_vendor_statuses` now shares.
+
+- **Refused:** `payments_blocked`; last stored screen `match` / `review`;
+  `rejected`; any unknown status (fail-closed — the bookable statuses are named).
+- **Books:** `unverified` and `inactive`. The approver signed a real debt;
+  verification is a pre-payment control the run gate still enforces, and the ERP
+  applies its own inactive-vendor rule. Use the block, not deactivation, for
+  suspicion.
+
+The gate reads the **stored** screen, never a live one: no provider charge and no
+`sanctions_checks` row per push. A stale `review` is cleared by re-screening,
+which the 409 names. A vendor whose screen persists at `match` / `review` is
+neither payable nor bookable; false-positive adjudication is tracked in
+`docs/followups.md`.
+
+**Rejected.** Refusing `unverified` (it would stop booking the AI-extracted
+vendors whose bills are most common, for a control about paying, not owing); a
+live screen per push (cost, and a third-party call on the send path).
+
+**Tests.** `test_erp_export_blocking_exceptions.py` (each state × each door,
+`_call_erp`, parity with the run gate, re-screen and unblock exits),
+`test_erp_auto_send_on_approval.py`, `erpRefusals.test.ts`,
+`codedRefusals.test.ts`.
+
+## 334. SSRF-guarded requests connect to the address they vetted (2026-10-31)
+
+**Context.** Checking a URL and then letting httpx resolve it again leaves a
+DNS-rebinding window: a record can pass the check and answer the connect with
+`127.0.0.1` or `169.254.169.254`.
+
+**Decision.** `utils/url_safety` provides a pinned transport: a custom httpcore
+network backend resolves the host once per connection, judges every address,
+and connects to a vetted IP literal. The URL is unchanged, so `Host`, SNI and
+certificate verification still use the hostname. `pinned_async_client` (and the
+blocking `pinned_client`, worker threads only) is the one factory; a call site
+may pass its own resolver for a stricter rule (outbound webhooks) or its own
+error type (commerce, SSO). Proxies, mounts and custom transports are refused,
+because each would resolve or connect around the pin. Adopted by SYSPRO,
+outbound webhooks, Slack / Teams, the commerce client, Clearbit / D&B, SSO
+discovery / JWKS / token, and the branding logo fetch. Operator overrides stay
+unpinned (trusted, as they already skip the check). Dev loopback allowances skip
+the address judgement but still pin. Hosts restricted to a vendor's own domain
+(Business Central, Sage SA) are not pinned — a rebind would need that vendor's
+DNS — and `tests/test_url_safety.py::_PLAIN_CLIENT_ALLOWED` keeps that list
+explicit.
+
+**Rejected.** Re-checking immediately before sending (issue #171's accepted
+fix): it narrows the window but does not close it.
+
+## 335. Retry-failed is offered from one gate, and an empty retry is refused (2026-10-31)
+
+**Decision.** `POST /api/payments/runs/{id}/retry-failed` raises every up-front
+refusal from `payment_controls.run_retry_failed_refusal`, the same function
+behind `GET /runs/{id}`'s `actions.retry_failed` (§305). It reads the run status
+derived from its payments, as the endpoint always did. A run with no retry-safe
+failure is now refused (409 `payment_run_nothing_to_retry`) instead of being
+claimed, audited and dispatched with nothing to send. The run dialog offers
+**Retry failed payments** from that verdict; `payment_run_not_retryable` hides it
+rather than showing it disabled. Mobile does not offer the control: its runs list
+carries no verdict.
+
+**Consequence.** The control exposes the in-doubt resume case recorded in
+`docs/followups.md` (a resumed dispatch refused before the adapter call is
+classed retry-safe), so that entry's trigger has fired.
+
+## 336. ERP OAuth connects are bound to the starting browser (2026-10-31)
+
+**Context.** The OAuth callback is public, so a signed `state` alone allowed
+login-CSRF: a rogue tenant admin could get a victim to approve consent and link
+the victim's books to the attacker's tenant.
+
+**Decision.** `/authorize`, the one bearer-authenticated step, is a credentialed
+fetch to the API host that sets a `__Host-feoh_erp_oauth_nonce` HttpOnly, Secure
+cookie; the signed state carries its SHA-256. The callback compares them in
+constant time after burning the state, refuses with `erp_error=browser_mismatch`
+(and a best-effort `organization.erp_connect_refused` audit row), and clears the
+cookie only once it has matched — so a junk-state link cannot wipe an admin's
+cookie mid-connect. Consequences:
+
+- The app and the API must be same-site, inside `FEOH_CORS_PRODUCTION_DOMAIN`.
+- Custom-domain tenants connect from `<slug>.<domain>` (coded 409
+  `erp_connect_platform_host`, `params.url`), and the callback returns there.
+- Loopback dev uses `SameSite=None; Secure`, because `*.localhost` →
+  `localhost` is cross-site; deployed environments never do. Local connects need
+  Chromium.
+- One cookie slot per browser: two parallel connects cannot both finish.
+
+**Rejected.** A bearer-less "start" redirect (the binding becomes a transferable
+link again); confirming on the tenant origin after the redirect (the handle in
+the URL can be leaked by the victim).
+
+## 337. QuickBooks' realm is confirmed, not read from the redirect (2026-10-31)
+
+**Decision.** The callback links `realmId` only after
+`GET /v3/company/{realm}/companyinfo/{realm}` answers 200 with `CompanyInfo`
+under the new token, the way Xero and Sage resolve theirs; anything else refuses
+with `no_external_tenant`. Realm ids are checked against `[A-Za-z0-9-]{1,64}`
+before entering the URL. A refused realm does not revoke the token: Intuit's
+revoke applies to the app's whole grant for a company, so revoking after a
+failed reconnect (an outage, say) could cut that tenant's live connection.
+
+## 338. Loopback CORS origins are a non-deployed convenience (§336 follow-up, 2026-10-31)
+
+**Decision.** In a deployed `FEOH_ENVIRONMENT` (`settings.is_deployed`) the CORS
+middleware admits no loopback origin: the `localhost` pattern is off, and
+loopback entries are dropped from `FEOH_CORS_ORIGINS`' shipped default, because
+credentialed CORS now carries the ERP `/authorize` fetch (§336). A list the
+operator sets explicitly is used as written, with a boot warning if it names a
+loopback origin — the day-one rehearsal's path (`scripts/day-one/stack.sh` runs
+as `production` and sets its own list), following §334's trusted-operator rule.
+
+**Rejected.** Refusing to boot on an explicit loopback origin: it would break the
+production-shaped day-one rehearsal without adding a control, since only the
+operator can set the list.
+
+## 339. Hosts an organisation configures go through `org_host_client` (§334 follow-up, 2026-10-31)
+
+**Decision.** A per-org URL is untrusted. `url_safety.org_host_client` checks it
+up front (a clean refusal before a body is built) and pins it at connect
+(§334); outside a deployed environment loopback is allowed but still pinned. The
+adopters are the PEPPOL `as4_gateway` `gateway_url` (refusal
+`gateway_url_not_public`) and the Ollama extraction `base_url`. Their
+process-level settings (`FEOH_PEPPOL_GATEWAY_URL`, `FEOH_OLLAMA_BASE_URL`) are
+operator config and stay on a plain client. `test_url_safety._ORG_HOST_MODULES`
+keeps the list explicit.
+
+## 340. Merge.dev, Xero and QuickBooks Online report a PO with no usable total (§325 follow-up, 2026-10-31)
+
+**Context.** Their mappers fell back to `Decimal("0")`, so an invoice against
+such a PO read as over-billed and a total stored earlier stayed trusted.
+
+**Decision.** All three override `list_pos_report` and report a numbered PO
+whose total (`total_amount` / `Total` / `TotalAmt`) is absent, empty,
+unreadable or not finite as `unpriceable`. A stated 0 is the ERP's figure and
+syncs as one (§323); a total is never summed from lines (§325). Merge's skip
+carries `SkippedPo.legacy_po_numbers`: only a priced PO re-keys (§328), so when
+no row holds the real number the sync marks the row under the old key where it
+stands — never a key the listing reports as another PO's number — and the sync
+that next prices the PO re-keys it and clears the mark. QuickBooks drops a PO
+with neither `DocNumber` nor `Id` (a count is logged); it used to file such POs
+under `"None"`, which it now retires as Merge retires `"UNKNOWN"`, leaving alone
+a placeholder the listing reports as a real number. A garbled Xero `Total` skips
+that PO instead of failing the listing.
+
+**Rejected.** Treating a stated 0 as unpriceable (0 is a figure, and holding the
+invoice is the safe outcome); deriving a missing total from lines (lines can
+omit tax, charges or discounts).
+
+**Tests.** The three adapter tests,
+`test_purchase_orders.py::test_sync_erp_never_stores_a_po_with_no_total_at_zero`,
+`::test_sync_erp_marks_an_unpriceable_po_still_stored_under_its_legacy_key`,
+`::test_sync_erp_retires_quickbooks_none_row_but_never_a_listed_po_so_numbered`.
+
+## 341. CSV import refuses a normalized invoice-number match per row (2026-10-31)
+
+**Decision.** A byte-exact repeat for the same vendor is still skipped silently.
+A match once formatting is ignored (`INV-1` / `INV-001`), against the ledger or
+an earlier row of the same file, is a coded row error naming the invoice
+(`csv_invoice_number_matches_existing` / `csv_invoice_number_matches_row`); when
+the match is another entity's invoice it says only that a match exists
+(`csv_invoice_number_matches_other_entity`, §40). The lookup is the duplicate
+gate's own, extracted as `invoice_warnings.find_normalized_number_match`, so the
+two cannot disagree.
+
+**Rejected.** Skipping silently (it could drop a genuinely different invoice);
+importing for the gate to flag (it becomes queue work).
+
+**Consequence.** Historical `done` / `paid` near-matches, which used to import
+unflagged, are refused too — narrowing §77's accepted limit, so a supplier whose
+numbering truly distinguishes `INV-1` from `INV-001` enters those rows by hand.
+The importer matches on vendor id only; the gate also matches on name.
+
+## 342. `/cards/generate` names every skip (2026-10-31)
+
+**Decision.** The response adds `skipped: [{invoice_id, code, message, params}]`
+beside the unchanged `items` and `total`, with one `card_skip_*` code per gate in
+`card_issuance` (prefixed because the frontend refusal registry is shared) and
+params limited to fixed values or the caller's own ids. An out-of-scope invoice
+reads as a nonexistent one, and `lock_invoices_for_mint`'s vendor lookup is now
+entity-scoped so a lock timeout cannot tell them apart. A lost insert race reads
+`already_carded` only when the winning card is the same provider card;
+otherwise `issue_failed` with a warning, so an unrecorded provider card is never
+hidden behind a clean answer. The bare `409 invoice_locked` is kept when nothing
+was minted and a lock timed out (backward compatibility).
+
+## 343. A dispatch attempt is marked, committed, before it starts (migration 0124, 2026-10-31)
+
+**Context.** `/resume` re-dispatches `pending` rows, and one can be a row whose
+earlier pass called the processor and died before its commit. If the resume
+refused it before its own adapter call, it was recorded `failed` with a
+retry-safe reason, and Retry failed payments (§335) sent it again under a new
+idempotency key.
+
+**Decision.**
+
+- Every dispatch (`_dispatch_payment_guarded`, behind `/execute`, `/resume`,
+  `/retry-failed` and `/compliance/release`) stamps
+  `payments.dispatch_attempted_at` and commits it before the attempt, then
+  re-locks the row and requires its own stamp; each stamp is forced later than
+  the one it replaces, so exactly one of two racing dispatchers proceeds.
+- The stamp is cleared with the recorded outcome only when the row was
+  unstamped at the start, so a first attempt's ordinary refusal stays
+  retry-safe.
+- `classify_payment_failure` reads a stamped row as IN_DOUBT whatever its
+  reason, so `retryable_failures`, the run's retry verdict and `/retry-failed`
+  all refuse it.
+- A stamped row that ends `failed` or `cancelled` is flagged with the blocking
+  `payment_reconciliation` exception wherever that happens: the dispatch
+  outcome, the run loop's `invoice_locked` refusal, or `/compliance/dismiss`.
+
+The commit is the only record that survives the process dying. It is taken
+while the attempt holds only the payment row lock, before the invoice lock
+(§214, §233), so no guarantee is given up. Migration 0124 backfills `pending`
+payments on `executing` runs — exactly what a crashed pass leaves.
+
+**Rejected.** A second connection (it would wait on our own row lock forever); a
+savepoint (not durable); stamping just before the processor call (the commit
+would release the invoice lock mid-gates, so every gate would re-run).
+
+**Accepted costs.** One extra commit per payment, and rows reported in doubt that
+were never sent, each costing a human check: a crash between the stamp and the
+processor call, a lost race for the stamp window, and the backfill.
+
+**Tests.** `test_payment_dispatch_marker.py` (the real-DB crash-then-resume
+scenario, the race, dismiss and release), `test_migration_0124_payment_dispatch_marker.py`.
+
+## 344. Settlement accept, ERP sync and paying a run outside are offered from their gates; regenerate needs an exported file (2026-10-31)
+
+**Decision.** Six more payments controls follow §305: History's Accept
+settlement (`accept_settlement_refusal`), the Runs tab's Retry ERP sync
+(`actions.sync_erp`), and the run dialog's record-run-as-paid, bank-file
+download, regenerate and bank-rejected (`actions.record_outside` /
+`nacha_export` / `nacha_regenerate` / `nacha_void`). Each endpoint raises from
+one `payment_controls` gate and the read ships the same answer. Accept was
+offered on every completed payment with a reported figure, and the dialog then
+fetched the invoice to learn whether it was held; Retry ERP sync was offered on
+`failed` and `executing` runs that could only 409.
+
+`GET /runs/{id}/nacha?regenerate=true` on a run with no exported file is now
+refused (`nacha_nothing_to_regenerate`). It used to export a first file under a
+flag that means "a second one", so a run released back to draft after the bank
+rejected its file was claimed again without the reader being told, and the
+audit row recorded `regenerated: false`. No caller depended on it.
+
+The per-invoice and per-payment refusals inside record-run-as-paid and the
+export are not in the verdicts, because they need the invoices locked.
+
+**Open.** The bank-rejected void on a tenant that switched to processor mode
+after exporting is a double-payment path §251 meant to close
+(`docs/followups.md`, Security Analyst review).
+
+## 345. Every outbound host is classified, and per-org config never repoints a vendor API (§339 follow-up, 2026-10-31)
+
+**Context.** A sweep of every adapter for a host read from per-org settings
+found one that carried a credential: Stripe Treasury read
+`settings.payments.api_base`, which any tenant admin can write, and sent the
+sealed Stripe secret key to whatever host it named.
+
+**Decision.** A host is one of three classes:
+
+- **Per-org** — goes through `url_safety.org_host_client`, or its own check plus
+  pinned client where it needs a custom resolver, error type or blocking client
+  (`_ORG_HOST_BESPOKE`: SYSPRO, SSO, the branding logo, outbound webhooks, the
+  commerce client).
+- **Per-org but constrained to the vendor's domain** (NetSuite's account id,
+  Business Central / Sage SA's exact host, Shopify / Lightspeed handles) —
+  validated strictly, tested against an injection corpus, and listed in
+  `_PLAIN_CLIENT_ALLOWED` with its reason.
+- **Operator config** (`FEOH_*` or a vendor constant).
+
+Slack, Teams, Clearbit and D&B adopt `org_host_client` with a literal
+`allow_private=False` (no local emulator). Stripe Treasury no longer reads a
+per-org `api_base`; `FEOH_STRIPE_API_BASE` stays for stripe-mock. Modules that
+read a per-org URL but send nothing yet (generic QMS, Avalara, TaxJar, the
+workflow webhook step) sit in `_ORG_HOST_NOT_YET_SENT`, which fails the moment
+one builds a client. Any module under `app/` importing an HTTP or SMTP client
+must be classified (`test_every_module_with_an_http_client_classifies_its_host`).
+The full table is `backend/docs/adapter-patterns.md` § Where an adapter's host
+comes from.
+
+**Rejected.** Converting the bespoke sites to `org_host_client`: each needs
+something the helper does not offer, and each already checks and pins.
+
+## 346. The payments Cards tab offers Generate card (2026-10-31)
+
+**Decision.** `POST /api/cards/generate` gets a web caller: a dialog on the Cards
+tab, offered to holders of `payment.execute` on a `processor` execution mode —
+the endpoint's first two gates. Whether `cards.enabled` is on is not exposed to
+the page; the endpoint's 400 is now coded `cards_not_enabled` (same status and
+message) and stated in the dialog. Invoices come from `GET /api/invoices`
+narrowed to `PAYABLE_INVOICE_STATUSES`, mirrored as `CARDABLE_INVOICE_STATUSES`
+with a vitest that reads the backend tuple, because the payment queue has no
+search. The picker does not pre-judge the other gates; §342's per-invoice skips
+explain them. A 4xx means nothing was issued; a 5xx or dropped connection is
+reported as "some cards may have been issued" and reloads the list, because the
+mint commits per invoice and a retry answers `card_skip_already_carded`.
+
+**Rejected.** The queue's bulk bar (the follow-up asked for the Cards tab);
+search on `/payments/queue` (its whole-queue totals would describe a filtered
+list).
+
+## 347. Submit, Send to ERP and Retry ERP are offered from their gates; `/complete` and the ERP push start only from their statuses (2026-10-31)
+
+**Decision.** `GET /api/invoices/{id}/review-actions` also answers `complete`,
+`send_to_erp` and `retry_erp`, from `api/workflow.workflow_action_refusals`: the
+route's role list, then `complete_status_refusal` / `complete_entry_refusal` /
+`erp_send.erp_send_refusal` — status, then plan (§258), then the export gate
+(§286 / §309 / §333) read through its write-free half
+(`blocked_erp_export_detail`).
+
+- `/complete` advances only `new` and `approved` (409
+  `invoice_not_completable`). It used to close `sent_to_erp`, `posted_in_erp`
+  and `paid` to `done`, which skipped the payment of a `posted_in_erp` invoice.
+- `/send-to-erp` starts only from `approved` (409 `invoice_not_erp_sendable`).
+  `failed → sending_to_erp` is a legal edge, so it pushed failed, never-approved
+  extractions into the ERP.
+- `/retry-erp` needs an approved invoice's failed push
+  (`invoice_not_erp_retryable`).
+
+The status gate runs before the plan gate, on an unlocked read and again under
+the lock; the auto-send path (`only_from`) skips it. The modal hides
+`invoice_not_completable` and `invoice_not_erp_retryable` and shows every other
+refusal beside a disabled control. Not covered: the required-fields 422, and a
+duplicate `/complete`'s own `refresh_warnings` would open.
+
+**Open.** `POST /bulk/status → done` has no source-status or live-claim gate
+(`docs/followups.md`).
+
+## 348. Expense report and card reconciliation actions are offered from their gates; the owner cannot reject their own report (2026-10-31)
+
+**Decision.** Submit, approve, reject and attach / detach on an expense report,
+and match, create-expense, unmatch and ignore on a card transaction, follow
+§305: each endpoint raises from one `services/expense_controls` gate and the
+list and detail reads ship the same answer as `actions`. The page used to
+restate role + status + `employee_user_id`; it offered an ap_manager an Approve
+the CFO gate refused (now a disabled Approve with the reason), and it hid Reject
+from the owner while the endpoint accepted it. The endpoint now refuses that
+(403 `expense_report_self_reject`): the decider is never the submitter, for
+reject as for approve, as pre-approval reject already did — accepting it let an
+owner with a manager role record a review decision on their own claim and
+unlock its submitted lines. A repeat ignore of a card transaction is refused
+(409), because it wrote a second audit row. An ignored transaction can still be
+matched or turned into an expense; that is how an ignore is undone. Not in the
+verdicts, because they depend on input the row does not hold: submit's blocking
+policy violations, attach's per-line refusals, and match's checks on the chosen
+expense.
+
+## 349. zizmor and osv-scanner run advisory in their own workflow, outside `CI gate`, until the baseline is fixed (2026-11-08)
+
+**Decision.** `.github/workflows/supply-chain-scan.yml` runs two scanners on
+every pull request, push to `main` and a weekly schedule: zizmor 1.31.1 over
+`.github/workflows` and `dependabot.yml`, and osv-scanner 2.7.0 over every
+tracked lockfile (both `pnpm-lock.yaml`, `mobile/pubspec.lock`, the
+`tools/fake-*` requirements). Both upload SARIF to code scanning (categories
+`zizmor`, `osv-scanner`) and write a job summary, and neither fails on a
+finding: zizmor exits 0 in SARIF mode, and the osv step accepts exit 1
+(vulnerabilities found) and 128 (no packages) and fails on anything else, so a
+broken scan never reads as clean. The workflow is not called from `ci.yml`,
+unlike `security.yml`, because a fold would gate on the scanners completing
+(an OSV database or GitHub API outage) rather than on what they found. zizmor
+comes from zizmor-action pinned by SHA, which installs the wheel by hash;
+osv-scanner is the release binary checked against a pinned sha256, because
+`osv-scanner-action` resolves its Docker image by a mutable tag. osv-scanner
+runs `--offline-vulnerabilities`, so no package list leaves the runner, and
+zizmor's online audits call only the GitHub API. **Gaps:**
+`backend/pyproject.toml` has no lockfile, so the backend's Python dependencies
+are invisible to it (Trivy's image scan covers what is installed in the image);
+Gradle has no lockfiles; Terraform providers are not in OSV. **Making them
+blocking** waits on the current findings being fixed and a CISO / Security
+Analyst sign-off; the change then is calling the workflow from `ci.yml` or a
+code-scanning ruleset naming both tools.
+
+## 350. The supply-chain baseline is fixed at the root, and the backend's locks are scanned too (2026-11-11)
+
+**Decision.** The fix pass for §349's baseline. zizmor 1.31.1, regular
+persona, `--offline` on the merged tree: **77 findings (19 high, 42 medium,
+2 low, 14 informational) became 2 (0 high, 0 medium, 2 low, 0
+informational).** The online audits §349 also measured add 41
+`ref-version-mismatch` mediums (118 in all); each pin was resolved against its
+repository's tags and all 41 are fixed. Fixed rather than waived wherever a fix
+exists:
+
+- `dependabot-auto-merge.yml` moved from `pull_request_target` to
+  `pull_request`: GitHub runs a Dependabot PR's `pull_request` workflow with the
+  `permissions:` it declares, so the base-branch context bought nothing and
+  handed a write token to a workflow every PR can trigger. It and all three
+  `dependabot-lockfile.yml` jobs gate on `github.event.pull_request.user.login`,
+  not the spoofable `github.actor`, which names whoever caused the event. The
+  cost: a conflicting PR has no merge ref and so no run, and a conflicting PR
+  cannot auto-merge anyway.
+- `vm-deploy.yml`'s SPA build restores no cache (`package-manager-cache:
+  false`): a cache is writable by any default-branch run and that build is what
+  production serves.
+- Every checkout whose job never uses git credentials sets
+  `persist-credentials: false` (31, `claude.yml` included: claude-code-action
+  strips the persisted credential and authenticates with its own token).
+- Every pin comment names the release its SHA is (codeql-action v4.39.3, not
+  `v4`; setup-python v7.1.0, not v6.1.0; and five more Dependabot had bumped
+  under a stale comment). Every Dependabot entry waits out a 7-day `cooldown`,
+  the age rule §349's hand-made pins follow.
+- `aws-deploy.yml` passes `vars.*` and step outputs to its scripts through
+  `env:` instead of expanding them into the script text.
+
+**Waived inline, each with its reason, because there is no fix:**
+`dependabot-lockfile.yml` keeps `pull_request_target` (its push job needs a
+write token without a PAT; the resolver jobs run PR code read-only and name no
+secret, the header's design); `pr-title-lint.yml` keeps it so a conflicting PR
+still gets its title linted, and its workflow-level `read-all` dropped to none;
+`claude.yml`'s `issue_comment` has no alternative trigger and runs only for the
+authorized owner; and the ten `unpinned-images` findings on the CI service
+containers, whose refs come from `compose_image_refs.sh`, which refuses any ref
+that is not `repo:tag@sha256:<digest>` (§203) where zizmor cannot see it.
+**Left:** two low `self-repository` findings on `ci.yml`'s local action
+references, which want GitHub's `$/` syntax that actionlint cannot read yet.
+
+**osv-scanner.** §349 called `backend/pyproject.toml` unlocked. It is not:
+`backend/requirements.lock` and `requirements-dev.lock` are uv-compiled,
+hash-pinned pip requirements, which the recursive walk skips for their `.lock`
+names. The workflow now names each with `--lockfile requirements.txt:<path>`,
+by glob, so a renamed lock fails the scan rather than dropping out of it. That
+surfaced python-jose 3.5.0 (GHSA-3qf3-8w2g-rqmx, critical) and its dependency
+ecdsa 0.19.2 (GHSA-wj6h-64fc-37mp, high). `opentelemetry-api` 1.45.0
+(GHSA-xcq7-p3pf-p88h) is fixed by moving both `tools/fake-*` locks to 1.45.2.
+The other three have no patched release and are ignored by advisory ID in a
+root `osv-scanner.toml`, passed with `--config` so it reaches every lockfile,
+with `ignoreUntil = 2027-05-11` and a drop condition each: python-jose is used
+only for HS256 with a symmetric key and `algorithms=["HS256"]` on every decode,
+which the DER-key confusion needs unrestricted; nothing calls ecdsa's signing
+API; deepmerge 4.3.1 reaches only vite-plugin-svelte's build-time option merge.
+**Rejected:** an ID-less package ignore, which would hide the next advisory, and
+per-directory configs, which `--config` would override anyway.
+
+**Still open:** replacing python-jose with joserfc (already a dependency), which
+drops two of the three ignores; and making the scans blocking, which is adding
+`zizmor` (then `osv-scanner`) to the Code scanning gate ruleset beside CodeQL
+after a CISO / Security Analyst sign-off, not a `needs:` in `ci.yml`. Both are
+in `docs/followups.md`.
+
+## 351. The backend's own tokens move from python-jose to joserfc, byte for byte (2026-11-11)
+
+**Decision.** Closes §350's first "still open" item. Every token the backend
+mints for itself — the employee and supplier-portal access tokens and both MFA
+challenge tokens — is now signed and verified by one module,
+`backend/app/utils/jwt_hs256.py`, over joserfc. `api/deps.py` and
+`services/mfa.py` call its `encode` / `decode`; python-jose is gone from
+`pyproject.toml`, and with it python-jose, ecdsa and rsa from both locks. The
+two `osv-scanner.toml` ignores §350 added for them (GHSA-3qf3-8w2g-rqmx,
+GHSA-wj6h-64fc-37mp) are deleted rather than left to expire. joserfc was
+already a dependency (1.7.7, `services/sso.py` and the NetSuite adapter), so no
+new package enters the image.
+
+**Compatibility is exact, not approximate.** python-jose wrote the header as
+`{"alg":"HS256","typ":"JWT"}` (sorted keys) and the payload as compact JSON with
+`datetime` time claims as integer seconds. joserfc's default header puts its
+own `typ` first, so the module passes the header whole with
+`default_type=None`; its payload encoding already matched. The result is the
+same token for the same claims, byte for byte, so a session minted before the
+deploy verifies after it and nobody is logged out. `tests/test_jwt_hs256.py`
+pins that against literals the pre-migration mint functions produced under
+python-jose (access, vendor access, both challenge types, and an expired
+access token), the way `tests/test_bcrypt_sha256_compat.py` pins passlib's
+hashes (§151): it asserts each literal decodes to its claims, re-encodes to the
+identical string, and passes `decode_token`, `get_current_user` and the MFA
+decoders.
+
+**Verification keeps python-jose's rules.** `algorithms=["HS256"]` only (`none`,
+`HS384`/`HS512`, `RS256` refused before a key is used); the key is an `OctKey`,
+which in joserfc 1.7.7 refuses an asymmetric public key as HMAC material
+outright, the class GHSA-3qf3-8w2g-rqmx is about. `exp` / `nbf` / `iat` are
+checked when present with no leeway. python-jose also refused an `aud` when the
+caller named no audience; joserfc's registry type-checks `sub` and `jti` as
+python-jose did but accepts any `aud`, so the module refuses `aud` itself. It
+also refuses a non-finite `exp` / `nbf` / `iat`: JSON admits `NaN` and
+`Infinity`, joserfc's numeric check accepts any float, and `NaN < now` is
+false, so a signed `"exp": NaN` would never expire (python-jose's `int()`
+refused it). A non-object payload is refused. Every failure is one
+`InvalidTokenError`, mapped exactly as `JWTError` was: a 401 `"Invalid token"`
+in `decode_token`, the same `ValueError` in the MFA decoders. Malformed input
+(bad segments, bad base64, bad JSON) was checked to raise only that exception,
+so no token shape can reach a 500.
+
+**Two differences, both tightening, neither reachable by a token we mint:**
+joserfc rejects an `iat` in the future (python-jose only type-checked it), and
+it rejects a string `exp` that python-jose would have parsed with `int()`. No
+token we issue carries `iat`, and every `exp` is an integer.
+
+**Rejected:** requiring `exp`. Every token we have ever minted carries one, so
+it would cost nothing in production, but python-jose did not require it, a
+handful of tenant-isolation tests mint without it, and an auth-library swap is the
+wrong change to also move a validation rule in. A token without `exp` can only
+be minted with `FEOH_SECRET_KEY`, which already forges anything. Pinned by
+`test_token_without_exp_is_accepted_as_python_jose_did`, so changing it is a
+decision. Also rejected: calling joserfc directly in `deps.py` and `mfa.py` as
+python-jose was, which would duplicate the extra claim checks and the error
+mapping in two places; `security-patterns.sh`'s `bypass-decode-token` rule now
+allows `jwt.decode` only in `utils/jwt_hs256.py` and `services/sso.py`.
+
+## 352. deepmerge 4.3.1 is patched locally, and both scanners ignore it only on that basis (2026-11-12)
+
+**Decision.** Closes #695 and #689. GHSA-gcqx-w48m-w2h4 (CVE-2026-93753):
+deepmerge's `mergeObject()` copies a `"__proto__"` key with plain assignment,
+which sets the merged object's prototype when the target has no such
+property for `propertyIsUnsafe`'s `in` check to see. 4.3.1 is the last
+release and the advisory lists no patched version; its only dependent here is
+`@sveltejs/vite-plugin-svelte`, whose latest (7.3.1, already pinned) still
+declares `deepmerge ^4.3.1`, so neither a bump nor an override can remove it.
+§350 had answered it with an `osv-scanner.toml` ignore alone, and `audit.yml`'s
+`pnpm audit` kept reopening #689 because nothing told pnpm.
+
+- `frontend/patches/deepmerge@4.3.1.patch` (`pnpm patch`, listed under
+  `package.json` `pnpm.patchedDependencies`) makes `propertyIsUnsafe` refuse
+  the `"__proto__"` key in `index.js`, `dist/cjs.js` and `dist/umd.js`. It is
+  the same patch project-water-management carries.
+- `frontend/src/lib/deepmergePatch.security.test.ts` loads the copy
+  vite-plugin-svelte resolves and fails if a `"__proto__"` key still sets the
+  prototype (checked against the unpatched 4.3.1: it does). It also fails if
+  `pnpm.auditConfig.ignoreGhsas` names the advisory while the resolved version
+  has no patch entry, and if the `osv-scanner.toml` entry loses its expiry.
+- `pnpm.auditConfig.ignoreGhsas` in `frontend/package.json` carries the same
+  exception for `pnpm audit`, so `audit.yml`'s threshold and steps need no
+  change for it. The
+  `osv-scanner.toml` entry now names the patch and expires 2027-02-10, ~90
+  days, rather than §350's six months.
+
+`opentelemetry-api` (GHSA-xcq7-p3pf-p88h, fixed in 1.45.1), the issue's other
+two rows, was already at 1.45.2 in both `tools/fake-*` locks since §350.
+
+**Rejected:** the ignore alone (§350's state): it records a judgement that the
+reachable input is trusted, which holds today but is enforced by nothing.
+Replacing or forking vite-plugin-svelte for one build-time option merge.
+**Drop** the patch, both ignores and the guard once deepmerge ships a fixed
+release or vite-plugin-svelte stops depending on it. The patch is keyed to
+4.3.1, so a resolved version that moves off it leaves the copy unpatched and
+the guard red, which is the prompt to re-check.
+
+*Amended by §484:* GitHub withdrew the advisory on 2026-11-16, so the patch,
+both ignores and the guard were removed.
+
+## 353. An ERP name too long for its column is stored shortened and marked; vendor names are matched case and spacing aside (2026-11-12)
+
+**Found** while closing two §287 / §284 follow-ups. `vendors.name` and
+`gl_accounts.name` are `String(255)`. The vendor sync wrote the ERP's name
+unchecked, so one QuickBooks vendor whose `DisplayName` (up to 500 characters)
+ran past the column failed the flush and rolled back the whole sync; the chart
+sync relied on three adapters (QuickBooks, NetSuite, Business Central) cutting
+the account name to 255 themselves, silently, and the others not at all.
+Separately, the vendor sync's ambiguous-name counts compared names with `==`
+while its realm evidence (`_same_vendor`) already ignored case and spacing, so
+"Acme" and "ACME" in one pull did not trip `ambiguous_name`: the manual "Acme"
+was linked to the record spelled the same and "ACME" created beside it.
+
+**The name rule, once for both syncs** (`services/erp_record_names.fit_name`).
+A name that does not fit keeps its first `max - 1` characters, trailing space
+trimmed, plus `…`, and the record syncs and links as usual; the run reports it
+(`names_shortened`, and on the vendor's audit row `name_shortened: true`), and
+the sync page shows a warning. The adapters no longer cut names. The shortening
+is deterministic, so an unchanged long name re-syncs as `unchanged`.
+
+**Why shortened, not refused.** Neither name is a key. A bill posts by the
+record's ERP id and a chart row matches by id and code; the name tells a person
+which record it is. Refusing the record would cost a payee its link (every bill
+refused `vendor_not_linked`) or a chart account its postability over a label.
+The `…` says, on every screen, that the full name is in the ERP. A code or tax
+id is the opposite case, an identifier, where a cut value names something else,
+so those stay dropped or refused (§287). The sanctions screen of a vendor so
+named runs on the stored name (its first 254 characters), as every other
+reader of the row does.
+
+**The ambiguous-name counts use the realm evidence's key.** Both the pull's
+count and the unlinked locals' count are keyed by `_norm_name` (whitespace
+collapsed, casefolded), and the name link looks the vendor up by the same key
+(by id from that count, not by `Vendor.name ==`). Casefolding stays in Python
+rather than SQL's `lower()`, which is not Unicode case folding ("ß"), so the
+one normaliser is the only one. Every comparison uses the stored (fitted) form
+of the ERP name, which is what a local row can hold.
+
+**Rejected:** a wider `name` column. It moves the limit rather than settling
+what happens past it (500 is QuickBooks' limit, not every ERP's), and costs a
+migration across every tenant for a label. Also rejected: listing each
+shortened vendor name in the toast, since each one is up to 255 characters; the
+vendor line counts them and the response carries the names.
+
+## 354. The Xero deep link names the bill's organisation by a ShortCode read at each push; QuickBooks has no such link (2026-11-12)
+
+**The gap.** §302 stored `https://go.xero.com/AccountsPayable/View.aspx?InvoiceID=`
+and QuickBooks' `app/bill?txnId=` from the bill id alone. Both open in whichever
+organisation or company the user last had open, so a user who works in several
+lands on "not found", or in another company's books.
+
+**Xero: the organisation-login redirect.** The link is
+`https://go.xero.com/organisationlogin/default.aspx?shortcode=<ShortCode>&redirecturl=/AccountsPayable/View.aspx?InvoiceID=<id>`.
+Xero switches the signed-in user to the organisation named by its `ShortCode`,
+then opens the bill. Xero's own MCP server builds the same form
+(`src/consts/deeplinks.ts` in `XeroAPI/xero-mcp-server`). The
+`ShortCode` comes from `GET /Organisation` (Xero's OpenAPI describes it as "A
+unique identifier for the organisation"). The redirect path is sent
+unencoded, as Xero's links send it. That is safe because the bill id inside it
+is already fully percent-quoted, so it holds no `&` or `#` that could end the
+query. The ShortCode is quoted with only `!` left literal. We kept the
+`View.aspx` page from §302. Xero's MCP server targets `Edit.aspx` for bills,
+but the view page is the read-only one, and it is the one already tested.
+
+**Read at each confirmed push, not stored on the connection.** After a bill is
+created, or an existing one is adopted idempotently,
+`XeroAdapter.organisation_short_code` reads `/Organisation` with the
+connection's own `Xero-Tenant-Id`. It returns the code as
+`ErpPostResult.erp_company_code`, and `deep_links.erp_document_url(…,
+company_code=)` builds the link. The link stored on the invoice is the only
+copy that persists. We considered storing the code in
+`settings.erp.oauth` when `resolve_external_tenant_id` runs at connect time,
+and rejected it for three reasons. (1) Every connection made before this
+change would have no code until someone reconnected it, so a lazy fill on the
+push path would be needed anyway, which is a control-plane write from the
+tenant push path. (2) The connect flow is being reworked separately, to choose
+among several organisations. (3) A stored code is a second copy that can go
+stale. A migration was never on the table, since the per-org JSON would have
+held it. The cost is one Xero call per confirmed push, which already makes
+three or four, against Xero's 60-per-minute limit.
+
+**Best effort, never failing the push.** The read happens after the bill is
+confirmed. A non-200 answer, an empty or missing `ShortCode`, or an exception
+means `erp_company_code=None`, and the link falls back to the bare §302 page.
+It is logged with only the status or the exception type. Turning a posted
+bill into a failed push over a link would make the next retry's idempotency
+lookup carry the whole outcome for a cosmetic field. Links stored before this
+change are not rebuilt: the tenant database does not record the code, and
+reading it now for old bills would mean assuming the connection never changed
+organisation.
+
+**QuickBooks: none exists.** We found no Intuit documentation for a web URL
+that selects a company by `realmId`. developer.intuit.com documents only the
+REST path `/v3/company/<realmId>/bill/<id>`, which is not a page a browser
+opens. Intuit's help centre's only route is Settings → Switch company
+(quickbooks.intuit.com/learn-support, "Switch company files"). Community
+answers give `qbo.intuit.com/app/<entity>?txnId=` with no company selector. So
+the QuickBooks link is unchanged, and the docs say it opens in the current
+company. An undocumented `companyId=`-style parameter would be a guess that
+could fail silently.
+
+**Mobile.** The mobile ERP panel parses `erp_document_url` and makes the
+reference a link through the shared `ExternalLink` widget, which uses
+`url_launcher` and opens the link outside the app. It accepts only an
+`https` URL. Anything else shows as plain text, the same as a provider with
+no link.
+
+## 355. A consent that reaches several companies waits, server-side, for the admin's pick (2026-11-12)
+
+**Context.** Xero (several organisations authorised in one consent) and Sage
+v3.1 (a login with several businesses) can answer one consent with more than
+one company. The callback resolved those to none and refused the connect
+(`no_external_tenant`), so such a customer could not connect at all. Picking one
+for them stays ruled out: we never choose a customer's ledger.
+
+**Decision.** The callback reads `OAuthErpAdapter.list_external_tenants`. One
+company links at once, as before; none is still `no_external_tenant`; several
+link nothing. The exchanged token is sealed (`credential_crypto`, AAD = org,
+provider, browser binding) and parked in Redis, keyed on the org and the hash of
+a FRESH nonce the callback mints once the request's cookie has matched (§336),
+with the starting admin's id and the provider's `(id, name)` list, for one
+`state` lifetime. The callback sets that new nonce as the cookie for the window
+and returns with `?erp_choose_company=<provider>`. Minting rather than renewing
+means no request value is ever written back into a cookie (CodeQL
+`py/cookie-injection`), and the nonce spent with the state is not reused.
+The settings page lists the companies (`GET …/oauth/pending`) and posts the pick
+(`POST …/oauth/pending/select`). Both are admin, bearer-authenticated and
+credentialed, and find nothing for another browser or another admin
+(`erp_pick_expired`). `select` GETDELs the record before any check, so a pick is
+single-use whatever it ends in. It links only an id from the list the provider
+returned under the new token (`erp_pick_unknown_company` otherwise, audited),
+and links through the callback's own `_claim_and_link`: the realm lock, the
+cross-tenant check, the unique index and audit-first, with `picked_from` on
+`organization.erp_connected`. QuickBooks keeps §337: its list is the default
+wrapper around its confirmed realm. A cancelled or lapsed pick revokes nothing,
+for §337's reason.
+
+**Amended in review (round PR #707): which refusals spend the pick, and why
+none revokes.** The exchanged grant stays live at the provider whatever the pick
+ends in, so a refusal that spent the record left that grant with nothing left
+to use it, and the admin a second consent to give. Revoking is still ruled out
+on every path, and §337's reason covers each of them, not only QuickBooks':
+the revoke we can send is per token, but what it ends is the provider's to
+decide (Intuit's reaches the app's whole grant for a company; Xero's removes
+the connections the token holds), and a consent that lists several companies
+can include one this workspace is already connected to (a reconnect) or one
+another FeohLedger workspace holds (`already_linked`). Cutting a live
+connection, possibly another customer's, is worse than an unused grant that
+lapses with the provider's own refresh-token lifetime. Per path:
+
+- *An id the consent did not offer* and *the plan lost since the consent* need
+  no token, so they are now checked on a peek, before the GETDEL, and refuse
+  without spending (`erp_pick_unknown_company` is still audited). The admin
+  picks again, or picks once the plan covers the ERP, within the window. The
+  plan-lost case is the one where revoking was most tempting, since the
+  workspace may never connect; but the consent may still name the company the
+  workspace is connected to now, and its plan can come back.
+- *A provider no longer configured* drops the record (`erp_pick_expired`):
+  no pick can succeed, and without its spec there is no revoke endpoint to
+  call.
+- *A claim refusal* (`already_linked`, `credentials_unavailable`,
+  `audit_unavailable`) needs the opened token, so it comes after the GETDEL,
+  and `restore_pending_connect` puts the record back: same browser, admin,
+  companies and window (never extended), the token as aged so far, and never
+  over a newer connect that browser parked meanwhile (SET NX). The consent's
+  other company may be free, and the 503s are transient. Best-effort: if it
+  cannot be put back, the pick is spent as before.
+- *Cancel* (`DELETE …/pending`) drops the record and revokes nothing, for the
+  reason above.
+- *A token that cannot be opened* (`credentials_unavailable` at the take) is
+  spent: it cannot be used or revoked, and it lapses.
+
+A pick is still single-use where it matters: two picks cannot both link (the
+GETDEL), and a successful one leaves nothing to replay.
+
+The list fails closed: one row with an unaddressable id empties it
+(`no_external_tenant`), because dropping that row could leave a single company
+of several and link it unasked. Xero's list keeps its existing fallback to every
+organisation the token reaches when none matches this consent's `authEventId`;
+each is still offered rather than linked, and the claim checks apply.
+
+**Rejected.**
+- *The pending handle in the redirect URL.* §336 rejected a URL-borne handle
+  for the confirm step, since the victim can leak it. Keying on the HttpOnly
+  cookie needs nothing in the URL.
+- *A second consent per company.* Xero's and Sage's consent screens do not let
+  us name one company, so the admin would meet the same list again.
+- *Storing the list on the grant and switching companies later.* Nobody has
+  asked to move a connection between companies, and a realm change already
+  re-judges every vendor and GL link (§284). One connect, one company.
+
+## 356. A vendor keeps its ERP link for every company it was linked in; only the current company's is ever pushed (migration 0125, 2026-11-12)
+
+**What the follow-up said, and what was left of it.** "A vendor holds one
+`erp_vendor_id`, whichever ERP set it; a tenant that switches ERP posts the old
+ERP's ids." It predates §284. Since §284 a link records its realm,
+`"<adapter>:<company>"`, and the push and the PO sync resolve only links of the
+current realm, so the posting half was already closed: a push to ERP B refuses
+an id ERP A set as `vendor_not_linked`, before any HTTP call. (The "name or code
+stored where the ERP gave no id" half was closed with it: every adapter's
+`erp_vendor_id` is the ERP's own record key, and an id-less record is skipped.)
+What remained was the single slot. The first sync under B re-judged A's link by
+evidence and dropped it, so a tenant that went back to A, or flipped QuickBooks
+sandbox → production → sandbox, re-derived its links from names. Every vendor
+whose name was ambiguous in the pull came back unlinked, and every invoice to
+it was refused until someone linked it by hand.
+
+**The shape: the row keeps the current company's link, and `vendor_erp_links`
+keeps the rest** (`services/vendor_erp_links`). The table holds one row per
+`(vendor_id, realm)` (unique, FK `ON DELETE CASCADE`), never for the realm the
+vendor row itself holds and never for a NULL realm. `services/vendor_sync` is
+its only writer:
+
+- a link leaving the row under a named realm, dropped or moved by §284's
+  evidence rule, is first filed under that realm (`change: unlinked` /
+  `realm_changed` carries `kept: true`);
+- a sync under realm R begins by putting R's kept links back on their rows
+  (`change: restored`, counted `restored`, "N relinked" in the response). Each
+  row's own named link is filed in turn, so after the sync no link for R is
+  kept. A restored link is not re-judged, because a same-company link never
+  is; it left the row only because a sync ran elsewhere;
+- the push and the PO sync read a vendor's link through one accessor,
+  `vendor_erp_ids`: the row's link when it is live in the current realm (the
+  §284 rule, legacy trust included), else the link kept for exactly that realm.
+  So a tenant back on A posts A's ids at once, before any sync.
+
+Two guards keep a restore from making two payees one ERP supplier. A kept id
+that another vendor already holds in R, or that two kept links claim, is
+dropped and reported `unlinked` (`kept: false`). And the re-judge pass no
+longer adopts a link whose id a vendor already holds in R; before, that left
+two rows on one id and the next lookup's `scalar_one_or_none` aborted the sync.
+
+**Rejected: the link table as the only store** (dropping
+`vendors.erp_vendor_id` / `erp_link_realm`). It is the more normalised design,
+but it changes what the public `erp_vendor_id` means (relative to a realm the
+serializer would have to resolve per request), touches the frontend and mobile
+mirrors, and rewrites the realm rules §284 and §287 pinned with live QuickBooks
+evidence, all to store the same facts. The row's pair is what a person sees and
+what the adapters' tests and the PO sync were written against. The kept table
+adds only what was being lost. **Rejected: keyed JSON (`{realm: id}`) on
+`vendors`.** It allows no uniqueness per realm and no index for "which vendor
+holds id X here", and the restore guard needs both. **Rejected: keying by ERP
+type.** One adapter covers many companies, and QuickBooks reuses ids across
+them (§284). The key has to be the realm, not the ERP.
+
+**Existing rows: no backfill (§141).** Every link a vendor holds today is still
+on its row with its realm, and stays there, so nothing live is lost. The links
+earlier syncs dropped are named only in `vendor.synced_from_erp` audit rows.
+Those record that a link was dropped at some moment, not that the id still names
+the supplier in that company. Filing them as live links would post on a reading
+of history nobody re-checked. A NULL-realm link (pre-0115, or made by a no-realm
+sync) is never kept either. Nothing recorded which company set it, and the org's
+ERP at migration time is not evidence of that: §284 already declined to adopt
+NULL links on a snapshot except for the push's narrow legacy trust, and a kept
+link would be restored without any re-judging. A NULL link a named sync cannot
+vouch for is dropped, as before.
+
+**Not changed.** A vendor merge moves no ERP link: the duplicate keeps its row
+link and its kept links, as it always kept `erp_vendor_id`, so the canonical
+vendor can be unlinked in a realm only the duplicate was linked in. A sync with no
+realm (`mock`, or an OAuth ERP with no consent) neither keeps nor restores,
+because it speaks for no company (§287). GL accounts still hold one link per
+row. They are matched by code, which survives a switch, so a return to A
+re-links them by code, except for rows a person confirmed (`erp_link_confirmed_at`)
+or left waiting with candidates. Both residuals are tracked in
+`docs/followups.md`.
+
+## 357. Closing an invoice by hand refuses a status it does not close from and a live claim, at both doors (§309 / §347 follow-up, 2026-11-12)
+
+**The gap.** §347 narrowed `POST /{id}/complete` to `new` / `approved` but left
+`POST /bulk/status → done` with no gate of its own, and neither door asked the
+rails. A staged run books a live `pending` payment and leaves its invoice
+`approved`; an exported NACHA run and a minted virtual card do the same. Closing
+that invoice to `done` took it off the payable set while our rail still paid it,
+and from `done` (terminal) no void puts the claim back on the queue — the
+invoice's state and its money stop agreeing. (`posted_in_erp` / `sent_to_erp` /
+`paid` rows were already skipped by bulk's `IMMUTABLE_STATUSES` check, so the
+follow-up's `posted_in_erp` case was closed in practice; it is now refused by
+the shared rule with `/complete`'s code rather than by a side effect of the
+edit lock.)
+
+**The rule.** One predicate, `api/workflow.close_refusals(db, invoices)`, beside
+`complete_status_refusal` which it calls first, then a live claim read by
+`services/erp_export_gate.live_claims` — the batch form of §309's
+`erp_export_live_claim`, which now delegates to it — through
+`payment_runs.live_payment_invoices` and `card_issuance.live_card_invoice_ids`.
+"Live" therefore has one reading for the run builder, the card mint, the ERP
+push and closing: a payment outside `LIVE_PAYMENT_TERMINAL_STATUSES`, a card not
+`cancelled`. The refusal is `payment_blocks_completion`, `params.claim`
+`payment` / `virtual_card`, payment named first.
+
+- **`/complete` asks only where its outcome is `done`** (`new` with no approval
+  step, `approved` with no ERP step). Submit-for-review moves nothing payable,
+  and the send branch already meets §309's `payment_blocks_erp_export`, so a
+  second code there would only rename the same refusal. `GET /review-actions`
+  reads the same function, so the modal's verdict and the door agree (pinned
+  by the parity matrix).
+- **Bulk asks once for the locked batch** and reports each refused row as a skip,
+  before the immutable-status check, so a closed-from-the-wrong-status row
+  carries `invoice_not_completable` too. The skip gained optional `code` /
+  `params` beside its English `reason`; the list localizes a coded skip and
+  keeps the server sentence otherwise. Other skips are unchanged.
+- **A new code, not `payment_blocks_erp_export`.** That sentence tells the reader
+  to clear the claim "before sending the invoice to the ERP"; the action here is
+  closing it. Same remedy (cancel the run, void the payment, cancel the card),
+  different verb.
+- **No race window.** Both doors read on rows locked `FOR UPDATE`, and the run
+  builder (§330) and the card mint lock the invoice too.
+- **Rejected:** letting a settled (`completed`) payment through, as "the money
+  moved, so it is done". A completed payment is what `paid → done` is for; an
+  `approved` invoice holding one is out of step already, and closing it hides
+  that. The rail's own exits apply, as §309 says for the push.
+
+## 358. The direct `create_exception` callers are keyed too, and Positive Pay de-duplicates on the code (2026-11-13)
+
+**Context.** §240 keyed every `_ensure_exception` finding and §319 the ERP
+reconciliation rows, but six sites still opened an exception through
+`exception_service.create_exception` with composed English and no
+`description_code`: extraction failure, Positive Pay returns, the bank-change
+flag, compliance holds, the reconciler / in-doubt dispatch flag and settlement
+discrepancies. The queue rendered them in server English beside localized rows.
+
+**Decision.** Each sentence is an `exception.*` catalogue code
+(`invoice_warning_catalog.DIRECT_EXCEPTION_SPECS`), built by `exception_finding`
+and passed as `description` / `description_code` / `description_params`; the
+generator covers both clients.
+
+- **`extraction_failed` carries the exception class only.** `str(exc)` used to be
+  stored (truncated to 500 characters). A provider or parser error can quote the
+  document it failed on, so the message stays on the worker's log and audit
+  detail and never reaches the row every AP user reads.
+- **A compliance hold lists its reasons as findings under an always-present
+  frame.** `ComplianceDecision` gains `findings` beside `reasons` (same order,
+  same English), filled by every reason that can produce a `hold`; the
+  exception is `exception_findings("compliance_hold_findings", …,
+  frame_single=True)`. Each reason is a lower-case clause written to follow
+  "compliance_hold: ", so a lone reason is not a description by itself.
+  `failure_reason` is unchanged in shape. Refusal-only reasons stay uncoded:
+  no exception is opened for a refusal.
+- **A word picks the code, never a param** (§157's rule): MORE / LESS for a
+  settlement variance, `failed` / `cancelled` for an interrupted dispatch, a
+  screening result with or without a list name, adverse media with or without a
+  provider name, the AML alert with or without excluded payments.
+- **Settlement figures are `number`s beside `text` currency codes**, because a
+  currency mismatch has two currencies and one `currency` param labels one side
+  (§197).
+- **Positive Pay's dedupe moves to code + `checkNumber`, with a legacy arm.** A
+  coded open row matches on `description_code` and
+  `description_params->>'checkNumber'`; an uncoded row (raised before this)
+  matches on `description`. The new English fallback is byte-identical to the
+  old description, so the legacy arm catches every row already in the queue
+  and a redelivered return file re-raises nothing.
+- **A guard keeps it that way.** `tests/test_invoice_warning_catalog.py` fails
+  on any `create_exception` call under `app/` that passes no
+  `description_code`, except `services/review.py`'s rejection, whose
+  description is the reviewer's own words.
+
+**Rejected.**
+- *Backfilling codes onto old rows* by parsing their English: the scraping the
+  catalogue exists to retire (§240's reasoning). The legacy dedupe arm is a
+  comparison against a sentence we wrote, not a parse.
+- *Dropping the legacy arm and matching on code alone*: every return already in
+  the queue would be raised again on the first redelivery after deploy.
+- *Matching coded rows on `description` too*: it would keep the English as the
+  key, and a reworded template would then silently stop de-duplicating.
+- *Keeping the payment id out of the reconciliation sentences* (moving it to
+  machine detail as the ERP rows did): `erp_report` is ERP data, and the id is
+  the only thing that tells the reader which of an invoice's payments to chase.
+
+## 359. Every SAML ACS refusal lands on the SPA bridge, coded; verification failures stay one sentence (2026-11-13)
+
+**Context.** §291 routed one ACS refusal, an address held in another workspace,
+through a refusal-only handoff code to the SPA bridge. Every other refusal still
+left the browser on `{"detail": "SAML login could not be verified."}` at the API
+origin: English only, no page chrome, no way back to sign-in. The OIDC callback
+never had that problem because the SPA posts the callback itself.
+
+**Decision.** Once the RelayState has named the tenant, the ACS answers every
+refusal the same way: audit the PII-free reason exactly as before, park a
+refusal code behind `sso.create_saml_refusal_handoff` (same prefix, TTL and
+`GETDEL` single use as a token handoff), and 303 to the bridge. `/exchange`
+maps the code to its coded refusal and no token. The table lives in
+`api/auth_saml._SAML_REFUSALS`; a code it does not know fails closed to
+`saml_login_unverified`.
+
+- **Verification failures are one code.** `assertion_invalid`, `issuer_mismatch`,
+  `unsolicited`, `replay` and `missing_email` all become `saml_login_unverified`
+  (400) with the sentence the ACS already used. Telling them apart would show
+  whoever holds a forged or captured assertion which check stopped it. The
+  bridge says no more than the ACS did, and only the audit row differs.
+  `missing_email` counts as one of them because it describes how the assertion
+  is shaped, not anything the person can act on.
+- **Identity refusals are coded the way OIDC states them.** `inactive`,
+  `domain_blocked` and `unsafe_email` become `sso_account_inactive`,
+  `sso_email_domain_blocked` and `sso_email_unusable` (403), in the English the
+  OIDC callback always answered with. The OIDC callback now answers with the
+  same coded details, so both protocols localize alike. None of them reveals
+  more than OIDC already did. The IdP has vouched for the address, and its admin
+  can already see each fact. `unsafe_email` used to be generic on SAML only, and
+  the user cannot fix it, but stating it tells the admin where to look and leaks
+  nothing.
+- **Two unaudited refusals move too.** State with no AuthnRequest binding becomes
+  `saml_login_unverified`, and SAML switched off or the plan losing `sso` since
+  `/login` (§258) becomes `saml_not_configured` (400). Neither wrote a row before,
+  and neither writes one now.
+- **What stays a 400 at the ACS.** A malformed form, an unknown or spent
+  RelayState, or a tenant gone since `/login` has no workspace origin to send
+  the browser to, and no row to scope.
+
+**Rejected.** (1) A per-reason code for each verification failure, because it
+is an oracle for assertion forgery. (2) Putting the refusal code in the bridge
+URL instead of behind a handoff code. The bridge would then render whatever an
+attacker-crafted link said, and the page would be able to tell a refusal from a
+token handoff before exchanging. (3) Redirecting the no-tenant cases to a
+global page. That needs an origin chosen without knowing the tenant, and the
+bridge would then be stating a refusal on a host the workspace's session does
+not live on.
+
+## 360. A label the server owns renders by its key, and an export's summary from its typed counts (i18n follow-up, 2026-11-13)
+
+**The gap.** The Report Builder, `/admin/privacy`, `/admin/access-review` and the
+budget dimension labels (`lib/types/budget.ts`) were literal English, so the help
+guides had to name their controls in `**bold**` rather than `{ui:}`. Two of those
+surfaces show text the *server* composed: the builder's catalog carries an
+English `label` per source and field, and the privacy page's only result summary
+was a hand-built "`Erased. ${n} field(s) redacted.`" beside a raw JSON dump.
+
+**The calls.**
+
+- **Catalog labels key on the catalog key.** `types/reports.ts` maps each source
+  and field key to a catalogue entry and composes a measure's name the way
+  `report_builder._measure_label` does; the server's `label` is the fallback for
+  a key this build predates, never the first choice. One flat field map serves
+  all four sources because a key means one thing in every source —
+  `types/reports.test.ts` reads `report_builder.py` and fails if that stops
+  holding, if a key has no label, or if the English differs from the server's.
+  Rejected: a `label_key` on the catalog response (the ERP-form pattern, §300's
+  `SERVER_NAMED`). It would be the more general shape, but the catalog is a
+  fixed whitelist of ~30 keys that the client already knows by name, and the
+  server-side change would buy nothing the drift test does not.
+- **The DSAR summary comes from typed counts the response did not have.**
+  `DSARResponse` gains `record_counts: dict[str, int]` (additive, default `{}`),
+  computed by `privacy_export.bundle_record_counts` over
+  `DSAR_COUNTED_SECTIONS`: a list counts its length, a capped collection or the
+  document manifest its true `total`. The bundle's own tallies were not usable —
+  only the vendor bundle has `counts`, the user bundle's `activity` covers two
+  sections, and the vendor-user bundle has neither. The frontend's label map is
+  pinned to the tuple by reading the Python source; `test_privacy.py` proves
+  each subject type's real bundle is covered section by section. The persisted
+  history row's `record_counts` is deliberately unchanged.
+- **The erasure toast is two ICU plurals over the typed counts**, and a
+  `documents_failed > 0` result now says the erasure is incomplete (the field
+  was on the response and the page ignored it). A 404 renders a localized "no
+  one matches" instead of the server's "Subject not found".
+- **The admin pages' keys are `admin.privacy.*` / `admin.accessReview.*` in the
+  settings slice,** not the `privacy.admin.*` the follow-up suggested: §300
+  already puts every `/admin/**` string there, `admin/+layout.ts` loads it, and
+  `/help` loads it for the guides' `{ui:}` references. A main-catalogue
+  namespace would have shipped them to every page. The builder's and budgets'
+  keys stay in the main catalogue (`reports.*`, `budgets.dimension.*`); neither
+  route loads a slice.
+- **The untranslated-copy guard reads component props and script labels.**
+  Its attribute list was the HTML five, so `KpiCard label="Dormant"`,
+  `DataTable empty="…"` and a script-side `COLUMNS = [{ label: 'User' }]`
+  passed it. `label` / `ariaLabel` / `empty` join the attribute list, and a new
+  script scan catches copy-bearing object properties, skipping values shaped
+  like message keys. Every file already on the roster passed unchanged.
+
+**Left as is.** Enum *values* inside the builder (a status filter's options, a
+status cell) are the stored codes, as on the API. Role names in the access
+review render through `roleLabelKey` (system roles translated, custom roles
+verbatim). All five non-English locales are first-pass translations pending
+native review.
+
+## 361. Expense-report and corporate-card refusals are coded at the endpoint, not only in the verdict (§348 follow-up, 2026-11-13)
+
+**Decision.** Every `services/expense_controls` gate is now `coded=True`, so
+submit, approve, reject, attach / detach, match, create-expense, unmatch and
+ignore answer with exactly the `{code, message, params}` their row's verdict
+ships, instead of a plain string beside it. The same pass codes the refusals
+the verdicts cannot hold: a line edited, deleted or moved off a locked report
+(`expense_report_locked`, the gate moved into `expense_controls` with
+`LOCKED_REPORT_STATUSES`), an attached line with no FX source or no rate
+(`expense_fx_source_missing`, `expense_fx_rate_unavailable` with both
+currency codes), deleting a reconciled expense (`expense_card_reconciled`),
+and `/match`'s expense side (`card_txn_expense_already_matched`,
+`card_txn_currency_mismatch`, one `card_match_expense_refusal`). Each
+`message` is byte for byte the English the endpoint sent before, so a client
+reading `detail` as text — `formatApiDetail`, mobile's `ApiClient.errorMessage`
+— renders the same sentence. Statuses are unchanged.
+
+**The mobile half was a non-issue.** The follow-up kept the strings plain "so
+mobile keeps working", but mobile calls no expense-report or card endpoint, and
+its client already reads a coded `detail` by its `message`
+(`test/api/api_client_test.dart`). Mobile's registry therefore gets no entries:
+its header already scopes it to the surfaces mobile ships, and ARB strings for
+codes no screen can receive would be dead text in every locale.
+
+**The web submit path needed its own fix.** `api/expenses.submitReport`
+hand-rolls its fetch to keep the violation list, so it bypassed `api.ts`'s
+`localizeApiDetail`: a coded 403 or not-draft 422 reached the toast in
+English. It now builds its errors with `apiErrorFromBody` and localizes a
+coded 422 before falling back to `message`.
+
+**Not done:** submit's two list-shaped 422s (`{message, violations}` and
+`{message, expense_ids}`) stay uncoded; stating a policy violation in the
+reader's language is the policy engine's change, tracked in
+`docs/followups.md`. The role dependency's 403 stays a plain string, as
+everywhere (`role_not_permitted` is only its verdict form).
+
+## 362. A file exported before a switch to processor mode keeps its claim; a NACHA file's bills are read concurrently and re-read before upload (§251 / §296 / §344 follow-ups, 2026-11-13)
+
+**Context.** Two gaps in the bank-file path. First, "Bank rejected the file"
+(`/nacha/void`) checked only that the run was `exported`. A tenant that
+exported a file, had it taken by its bank, and then switched `payments.mode` to
+`processor` could release the run to `draft` over the API and Execute it — or
+cancel and restage it — so the rail paid the suppliers the file already paid.
+§251 says the `exported` claim closes the switch-to-processor path; the void
+reopened it, and §344's parity test pinned that verdict. Second, the export's
+ERP-bill read (§296) happens when the file is built, but the money moves when
+a person uploads it; a bill paid in QuickBooks in between was paid twice. And
+the export read its bills one after another while holding the run lock and
+every invoice lock.
+
+**Decision.**
+
+- **The void is refused on a tenant that does not record payments**
+  (`run_nacha_void_refusal(run, record_only=…)`, 409 coded
+  `nacha_void_requires_record_only`), resolved by `payment_execution_mode` —
+  the same condition the export required. The claim stays, so `/execute`,
+  `/cancel` and re-staging keep refusing. Exits: record the run as paid, or an
+  admin switches back to record-only and voids there. Refusing the void rather
+  than the Execute after it is what closes every path: a gate on Execute (say,
+  on `nacha_export_count > 0`) still lets the released run be cancelled and its
+  invoices restaged into a fresh run, because the invoices carry no memory of
+  the file. Accepted residual: a void made on a record-only tenant is an
+  attestation, as §251 says, and a tenant can switch modes after one — the same
+  trust a regenerated second file already rests on.
+- **The export reads its bills concurrently**, at most
+  `FEOH_ERP_DISPATCH_CHECK_CONCURRENCY` (4; a `bill_report` is two QuickBooks
+  calls) at once, and only after every local check has passed.
+  `erp_status_sync.erp_bill_dispatch_refusal` is split into a database half
+  before the read, the read itself (no session), and a database half after it;
+  `erp_bill_dispatch_refusals` runs the halves sequentially on the one session
+  (an `AsyncSession` cannot be shared between tasks) and only the reads under a
+  semaphore. Verdicts are unchanged. The org-wide "unreachable" hold is checked
+  as each read starts, so after a connection failure the reads not yet started
+  hold without reading; those already in flight cost at most one timeout each.
+- **Verify before upload**, `POST /runs/{id}/nacha/verify` (`payment.execute`,
+  `run_nacha_verify_refusal`, `actions.nacha_verify`). It re-reads the bill of
+  every `pending` payment in an `exported` run. A bill no longer open takes its
+  payment out of the run — `failed` with `erp_bill_not_open:<state>`, exactly
+  what the rail dispatcher records, plus the blocking `payment_reconciliation`
+  — and answers `superseded`: do not upload the file; regenerate it
+  (`regenerate=true`, next modifier) for what is left, or, with nothing left,
+  the run is `cancelled`. A failed read takes nothing out (`held`).
+  - *"Void and regenerate" literally* was rejected. Voiding returns the run to
+    `draft` with the paid bill's payment still in it, and the next export
+    refuses it on the flag the check opened; there is no per-leg removal from a
+    draft run. Worse, it would release the claim — the path the first bullet
+    closes — and a verify run by mistake after the upload would turn "the bank
+    took it" into a draft anyone can pay again. Taking the stale payment out
+    while the run stays claimed has neither problem.
+  - *No maker-checker or CFO gate*: verify only takes money out of a file, and
+    the uploader is who should run it. *No record-only gate*: it never releases
+    the run, so it is safe on a tenant that has switched modes.
+  - *Bills only*, not `dispatch_preflight` again: the file on disk is fixed at
+    export, so a local change since (a bank-detail swap, a credit) does not
+    alter what the bank would pay; only a payment made elsewhere does. The
+    preflight's discount check also depends on the file's effective date,
+    which the run does not store.
+  - **Idempotent and audited.** A payment taken out is no longer `pending`, so
+    a repeat reads only what is left and changes nothing when those bills are
+    open; the exception is de-duplicated. Every call writes
+    `payment_run.nacha_verified` (result, counts, ids and reason codes, the
+    file-ID modifier checked) as evidence that the file was checked and when;
+    each payment taken out writes `payment.failed`. A taken-out payment is
+    retry-safe like the dispatcher's, but its run is `exported` or `cancelled`,
+    which `/retry-failed` refuses; after a later record-outside rolls the run up
+    to `partial`, a retry still meets the blocking flag, as at the rail.
+
+**Review pending.** The first bullet closes a double-payment path a Security
+Analyst asked to review; the fail-closed fix landed ahead of that review, which
+is tracked in `docs/followups.md`.
+
+## 363. An invoice's source document freezes with its financial fields, and a superseded document is kept, not deleted (§16 follow-up, 2026-11-13)
+
+**The gap.** §16 froze `PUT` / `DELETE /api/invoices/{id}/file` only at `done`.
+From `approved` through `paid` both succeeded, and the replace path deleted the
+previous object after the commit. The document the approver signed off, and the
+one the payment was made against, could be swapped or removed after the fact.
+The audit row kept the filename, but the bytes were gone. A same-name replace
+before approval overwrote the object in place, so the version a reviewer
+rejected was lost too.
+
+**The rule.** One predicate, `api/invoice_entry.document_locked`:
+`FINANCIALLY_LOCKED_STATUSES` (now owned by `models/invoice_status`, and
+`api/invoices._FINANCIALLY_LOCKED_STATUSES` is that set), plus `failed` when the
+invoice was ever approved. That is a failed ERP push, which `/retry-erp` pushes
+again without a new approval. All three file routes, attach included, answer 409
+`invoice_document_locked` (`params.status`) once it holds. The clerk's entry
+window is checked first, as before, so a clerk still sees 403
+`invoice_entry_window_closed`.
+
+- **The modal reads the server, not a list.** `GET /review-actions` gains
+  `manage_file` (`invoice_entry.manage_file_refusal`: role, entry window, lock,
+  in the doors' order), and `canManageFile` is `isAllowed` of it. A locked
+  document shows the refusal's sentence where the toolbar was.
+- **Attach is frozen too.** A document added after sign-off is one nobody
+  approved against, and adding one to a paid invoice is exactly how a fraud
+  would be papered over. A late scan for the record belongs in the supplier
+  chat or the notes, not as the invoice's document.
+- **Before the lock, nothing is destroyed.** Replace and delete detach the
+  document and keep its object. Attach, replace and the supplier-portal resubmit
+  write a versioned key, `<org>/<invoice>/<12 hex>~<filename>`. `~` cannot come
+  out of `_safe_filename`, so the marker is unambiguous and
+  `storage.invoice_file_display_name` recovers the filename. The key keeps the
+  three segments `api/file_proxy` expects, so no other reader changes. The audit
+  row names the kept key (`invoice.file_replaced.previous_file_key`,
+  `invoice.file_deleted.file_key`, `invoice.resubmitted_by_vendor.previous_file_key`).
+  It is the only reference to that key, so `privacy_documents` reads the kept
+  documents from those rows and lists them as `RETAIN` evidence beside the
+  current one. The DSAR export stays complete, and erasure treats them as it
+  treats the invoice's own document. The proxy serves only the current
+  `file_key`, so a kept version is evidence for an auditor and the export, not
+  something the modal shows.
+- **PII.** A key carries two ids and the sanitized filename the audit row
+  already held. Nothing new goes to a log.
+
+**Rejected:**
+- *Keep replacement open after approval, versioned.* It keeps the evidence but
+  leaves the invoice presenting a document nobody approved. A corrected
+  document after approval is a correction to what was approved. It goes back
+  through review, the same way the amount does.
+- *A `superseded_file_keys` column.* It would need a migration fanned out to
+  every tenant, to hold a list the append-only audit row already holds, and
+  the audit row is shipped to WORM storage besides.
+- *Destroying the object on a pre-approval delete* (a document attached to the
+  wrong invoice). Delete-then-attach would then be a replace that bypasses the
+  rule. The remedy for a document that should not be held at all is erasure,
+  which already decides invoice documents.
+
+**Also:** `POST /{id}/resubmit` answers a coded 409 `invoice_not_resubmittable`
+in place of the state machine's plain "Cannot transition". It re-runs warnings,
+as the bulk resubmit already did. `review-actions` serves its `resubmit` verdict
+(`api/workflow.resubmit_refusal`: role, status, entry window), and the modal's
+new "Resubmit for Review" reads it.
+
+**Left open:** the financial fields themselves still unlock on an approved
+invoice's failed push (`docs/followups.md`). The document predicate covers that
+case. The PATCH and line-item gates do not yet.
+
+## 364. The VM stops building and serving the SPA; Caddy keeps `api.` and vanity hosts (#582 step 4, 2026-11-13)
+
+**Context.** §278 moved the SPA to S3 + CloudFront and left the VM serving it
+too, as the one-flag rollback for the first day. The cutover ran on
+2026-10-19 (#582: `frontend_on_cloudfront = true` applied, every release since
+v0.1.2 published through CloudFront). Since then the VM's copy was cost (a Node
+build on a t4g.medium every deploy) and a slow failure: with DNS on CloudFront,
+Caddy could no longer renew the apex and tenant certificates, so a rollback
+after ~90 days would have landed on expired ones.
+
+**Decision.** Nothing on the VM builds or serves the SPA.
+
+- **Caddy** keeps `api.<domain>` and a `vanity` snippet. No `(spa)`, no apex
+  block, no site directory mount. `compose.prod.yml` loses `frontend-build`,
+  the pnpm-store volume and the `./www` mount; `deploy.sh` loses the build and
+  the release swap (`--backend-only` still parses, `--frontend-only` is
+  refused with a pointer). `add-tenant.sh` and `remove-tenant.sh` no longer
+  touch `tenants.caddy`: a tenant host is CloudFront's wildcard.
+- **Vanity hosts stay on Caddy** (§278, #582 option (b)), now as
+  `{ import vanity }`: `/api` goes to the backend under the vanity `Host`
+  (how a registered custom domain resolves to its tenant), and everything else
+  is proxied from `https://<APP_DOMAIN>` with `Host` and SNI rewritten to it,
+  because CloudFront refuses a `Host` that is not one of its alternate names.
+  Their DNS is a `CNAME` to `api.`, not the apex, which is CloudFront now.
+- **The live host list migrates itself.** `tenants.caddy` on the VM holds one
+  `{ import spa }` block per tenant, and a Caddyfile without `spa` would make
+  the Caddy the roll recreates refuse the whole config, taking `api.` down.
+  `deploy.sh` drops every apex / `*.<domain>` block before the roll (in place,
+  for the single-file mount, and listed in the log) and moves any remaining
+  `import spa` to `import vanity`. Leftovers it cannot know are safe to delete
+  (`deploy/www/`, the pnpm volume) are named in a NOTE, not deleted.
+- **The rollback guard inverts.** `feoh_sync_source` required a commit's
+  compose file to mount `./www`; that would refuse this commit. It now refuses
+  one that mounts `../frontend/build` (pre-§277, the #579 outage), so the §277
+  to §363 range stays deployable: re-deploying one of those, restoring the
+  dropped tenant blocks and flipping the flag back is the rollback.
+  `frontend_on_cloudfront = false` alone is now an outage, and `vm-deploy.yml`
+  fails its edge check when the apex lacks CloudFront's header instead of
+  reading that as "not cut over yet".
+- **`smoke.sh --vm` checks what the VM serves**: `api/health`,
+  `public-config`, and the first vanity host's TLS. The apex and a tenant host
+  are checked against CloudFront after the publish (`smoke-frontend.sh`).
+- **CI adapts the Caddyfile** with the pinned Caddy image and a vanity block
+  (`scripts/check_deploy_caddyfile.sh`, in `deploy-compose`). The Caddyfile is
+  now the API host's whole config, and the check also covers a Dependabot bump
+  of the Caddy image on its own PR, which closes the follow-up about production
+  images CI never ran (its other half, the Node build image, is gone).
+- **The SSM document's 45-minute timeout stays.** The SPA build was most of
+  the old ceiling, but the timeout only bounds a hung run, a cold image build
+  plus migrations across every tenant has no tight bound, and changing it is a
+  Terraform apply for no gain.
+
+**Rejected.** *Deleting `deploy/www/` and the pnpm volume from `deploy.sh`*: a
+deploy script removing operator state on a one-off migration is a hazard the
+next reader does not expect, and a NOTE costs one command. *Renaming
+`tenants.caddy` to match its new contents*: the file is live on the VM, and a
+rename is a second migration for a cosmetic gain. *Moving vanity hosts onto
+CloudFront*: one ACM SAN and one alternate name per customer (§278), with none
+in use yet.
+
+## 365. The two same-repository workflow calls use `$/`, and the zizmor baseline is empty (§350 follow-up, 2026-11-13)
+
+**Decision.** `ci.yml` calls `security.yml` and `web-bundle-budget.yml` as
+`$/.github/workflows/…` instead of `./.github/workflows/…`. That clears the two
+low `self-repository` findings §350 left, so zizmor 1.31.1 (regular persona)
+reports **no findings at any severity**: offline on this tree, and online on
+`origin/main` in CI run 43081175409, whose only results were those two. The
+workflows changed since §350 (the Flutter `flutter-version-file` pin in
+`ci.yml` and `mobile-release.yml`, and `audit.yml`'s tracking-issue scoping)
+add no `uses:` change and no finding. `$/` resolves to this repository at the
+running commit, the same code `./` named, without depending on the checked-out
+workspace. GitHub made it GA on github.com on 2026-07-30 and recommends it.
+It needs runner 2.336.0 or newer, and every job here runs on a GitHub-hosted
+runner.
+
+§350 deferred this on the belief that actionlint, run by the CI workflow lint,
+rejected `$/`. Nothing in this repository runs actionlint, so nothing blocked
+it. The two tools that do read these references accept `$/`. Scorecard 5.6.0,
+the release bundled in the pinned scorecard-action v2.5.0, counts `$/` as a
+local reference for Pinned-Dependencies. The repo's own guards now take both
+forms: `test_workflow_actions_are_pinned_by_full_sha` exempts `$/` like `./`,
+and `test_workflow_token_permissions` follows a `$/` call into the called
+workflow. Without that second change it would have stopped following
+`security.yml` and reported `ci.yml`'s `security-events: write` as unused.
+
+**Rejected:** an inline `# zizmor: ignore[self-repository]`. That audit has a
+fix, and §350's rule is to fix rather than waive wherever a fix exists. Also
+rejected: keeping `./` until a GHES mirror needs it. `$/` is unavailable on
+GHES, but this repository runs only on github.com.
+
+## 366. A person's clearance of any detector finding holds until that type's facts change (§286 follow-up, 2026-11-13)
+
+**Found.** §286 stopped `refresh_warnings` re-opening a `duplicate` or
+`fraud_flag` a person had resolved or dismissed while the invoice was
+unchanged. Every other type `_ensure_exception` raises deduped only against
+open rows, so the next refresh re-opened it. For the payment-blocking
+`line_total_mismatch`, `po_mismatch` and `quality_hold` that meant a reviewer
+who accepted a line variance, an over-PO bill or a failed inspection saw the
+hold come back the next time anyone saved the invoice, received a line, or
+pressed "Send to ERP" (`/complete` refreshes). A clearance that does not hold
+is not a sign-off.
+
+**The rule, once.** `_ensure_exception` stamps `finding_fingerprint` on every
+row it raises, and `invoice_warnings.current_finding_fingerprint` is the one
+definition of "the facts", read by the raise, by the stale-stamp check
+(`_void_stale_finding_stamps`, now over every stamped open row) and by a
+person's decision (`exception_lifecycle._bind_fingerprint_to_decision`, now
+async because two types need a read). §286's binding rules apply unchanged to
+every type: the stamp is fixed at raise; it survives a resolve or dismiss only
+when a person decided (an `actor_id`, no `via`) and the invoice still hashes as
+raised; any refresh that sees the facts differ voids an open row's stamp, so a
+change reverted before the click binds nothing.
+
+**What "facts" means, per type.** Each type hashes what its own rule reads,
+and nothing that drifts with no edit (the lesson of §286's second version):
+
+| Type | Hashed | Deliberately not hashed |
+|---|---|---|
+| `duplicate`, `fraud_flag`, `missing_data` | §286's header payload, byte for byte, so stamps written since 0116 still compare | — |
+| `line_total_mismatch` | header money (`amount`, `subtotal`, `tax_amount`, `shipping_amount`, `discount_amount`, `currency`) + the summed line totals | the invoice number, dates, vendor: the reconciliation reads none of them |
+| `po_mismatch`, `quality_hold` | the invoice's PO number, amount, currency, vendor, GL code, entity + the persisted `invoice.po_match` | — |
+| `price_variance` | the priced lines (item code, description, unit price), vendor, currency | the history's medians, which move as other invoices are approved |
+| `contract_noncompliant` | the invoice fields compliance reads, the contract id, and *which* terms are breached | the running spend figure, which grows with every other invoice on the contract |
+| `unverified_vendor` | the linked vendor | everything else on the invoice |
+
+`invoice.po_match` stands in for "the PO and receipts" because it already is
+their reading: the PO's total, currency and status, the summed receipt
+quantities, the inspection's id and verdict, and the tolerance the rule chose.
+Hashing the match rather than re-reading the PO tables keeps one source for
+what the matcher saw, and a match-rule change (a tighter tolerance) counts as a
+fact change, which is right: the person accepted a variance under the old rule.
+The hash reads a named subset of the match (`_PO_MATCH_FACT_FIELDS`, the
+tolerance, and each issue as `[code, params]`), not the whole dict: each issue
+carries its English `message`, so rewording a catalogue sentence or adding a
+`MatchResult` field would otherwise re-raise every cleared hold on the first
+refresh after a deploy. Numbers are canonicalized (`_canonical`) because the
+column round-trips the match through JSONB floats while the raise sees it in
+memory. The review also found the matcher's PO, receipt and inspection picks
+ordered by `created_at` alone, which is transaction time, so rows a sync wrote
+together tied and the pick (and with two inspections, the 4-way verdict
+itself) rested on physical row order. Each now breaks the tie on `id`.
+
+The non-header types are keyed on the exception type, not the row's
+`description_code`. These rows are one per type and invoice, and the code names
+only the first finding raised (a composite frame, or the first of two PO-match
+findings that folded into the open row). The person cleared the row with
+everything it held; keying on the code would re-raise a second finding that was
+there all along and ask for a second round for nothing. The header types keep
+§286's code-keyed payload so existing stamps stay valid.
+
+**Where the PO facts are read.** The stale-stamp check runs at the start of a
+refresh, before the match is recomputed, so a PO-match row compares against the
+match the previous refresh persisted. A match that moves and moves back is
+still seen one refresh later, and a decision in between compares against the
+moved match and binds nothing, so the timed variant §286 closed stays closed.
+
+**SoD is untouched.** Suppression honours only a decision `record_decision`
+accepted, so `segregation_refusal` (the invoice's implicated set and the
+recorded `raised_by_user_id`) still decides who can create one. A refused
+uploader leaves the row open and blocking. Detector auto-closes
+(`_close_cleared_po_exceptions`, `via="po_match_refresh"`) and agent decisions
+carry no verdict and clear the stamp, as before. The ERP PO sync's hold-only
+rule (§323) is unaffected: a sync that changes the PO changes the match, which
+re-raises a cleared hold rather than suppressing one.
+
+**The trail.** The person's decision writes its `exception.resolved` /
+`exception.dismissed` row as before. A refresh that suppresses writes nothing,
+because nothing is raised; the warning stays on `invoice.warnings` for the
+approver to read.
+
+**Not changed.** Rows opened by other paths through `create_exception`
+(Positive Pay, settlement, the reconciler, ERP sync, extraction's own
+duplicate, the bank-change flag) carry no stamp and keep their own dedupe;
+`payment_reconciliation` is raised only there, never by a refresh, so there is
+nothing to re-open. No migration: the column exists since 0116, and a row
+closed before this change has no stamp and never suppresses, which is how it
+behaved.
+
+**Not done** (`docs/followups.md`): a hand-entered inspection
+(`POST /api/inspections`) re-matches nothing, so `invoice.po_match` keeps
+describing the old verdict until another write refreshes the invoice. It cannot
+make a changed fact read as cleared (the next refresh recomputes the match),
+but the hold it should raise waits for that refresh.
+
+## 367. An invoice an employee created before §131 gets the uploader its own creation record names, and only that (§198 follow-up, 2026-11-13)
+
+**Decided:** 2026-11-13 · `backend/alembic/versions/0126_uploader_audit_backfill.py` ·
+`backend/app/services/exception_lifecycle.py` (`clearance_stands`) ·
+`backend/tests/test_migration_0126_uploader_audit_backfill.py` ·
+`backend/tests/test_exception_clearance_fingerprint.py`
+
+Before §131, CSV import and recurring `generate-now` built the invoice without
+`uploaded_by_id`, so `violates_segregation` read it as "no employee created this"
+and the importer or the clicker could approve it, or clear a payment-blocking
+exception on it (§169). §198's residual named the fix: both paths wrote the
+acting employee into `actor_id` on an audit row keyed to the invoice, so the
+person is recorded, not inferred, and §141's "no honest author" objection does
+not apply. Migration `0126_uploader_audit_backfill` copies them in. The other
+pre-§131 employee paths were checked at `08ae54b8c^`: manual create and file
+upload both passed `uploaded_by_id=user.id`, and the mirror was 0100's.
+
+**The rule is "every creation record agrees on one named employee", not "the
+earliest matching row".** The follow-up said to take the earliest row's actor.
+That picks a winner when two rows disagree, which is a guess with a tiebreak.
+Instead the migration reads every audit row on the invoice whose action a
+creation path writes (`invoice.created`, `invoice.imported_csv`,
+`invoice.uploaded`, `invoice.submitted_by_vendor`, `invoice.created_from_po`,
+`invoice.peppol_received`, and `invoice.intercompany_routed` with
+`role = 'mirror'`). It stamps only when all of them are evidence rows and all
+name the same employee. Two import rows naming two people, an import row beside
+a portal or PEPPOL record, or a generator row beside one with no actor: each
+leaves the invoice NULL, because the records disagree about who created it and
+the migration cannot know which is right. A human can.
+
+**An evidence row must describe its own invoice.** `invoice.imported_csv` counts
+only with `details.source = 'csv_import'` on an invoice whose
+`meta.imported.source` is `'csv_import'`; the importer writes both in one
+transaction. The operator's provenance backfill (§81) stamps a different source
+and leaves no audit row, so it never qualifies. `invoice.created` counts only
+with `details.source = 'recurring_template'` and a `recurring_template_id` equal
+to the invoice's own. The actor must be present, must belong to the invoice's
+organization, and must not be the nil-UUID sentinel email intake and PEPPOL
+write. So the system channels stay NULL: the sweep's row has no actor, and a
+template written before 0096 has no author to fall back to (§141's call stands).
+
+**Scope matches 0100:** every status with a successor in `VALID_TRANSITIONS`
+(all but `done`), because the uploader also gates clearing an exception after
+approval and `paid` can be voided. A stamped uploader is never overwritten. Each
+invoice changed gets an `invoice.segregation_backfilled` row with no actor, the
+old and new uploader, and the ids of the audit rows it read, so an approval
+given before the backfill stays legible as one the rules then allowed. The
+UPDATE and the INSERT are one statement. `downgrade` is a no-op for 0100's
+reason.
+
+**What it does not reach.** `invoice.imported_csv` was first written on
+2026-09-08 (#384), one day before §131. An import before that left no audit row
+at all, so nothing names its importer, and those invoices keep the legacy NULL
+reading. `generate-now` wrote its row from the feature's first commit, so every
+pre-§131 generate-now invoice is covered.
+
+**A clearance the backfilled uploader gave themselves stops holding.** Review
+found that stamping the uploader refuses them the next clearance but not the one
+they already gave. While the uploader was NULL, the importer could dismiss a
+`duplicate` or `fraud_flag` on their own invoice, and that dismissal kept its
+§286 fingerprint. `_finding_cleared_by_a_person` honoured any person's past
+verdict and never re-checked who gave it, so the self-clearance went on
+suppressing the finding on every refresh after 0126. Two fixes were weighed:
+
+- *(a) In 0126, clear the fingerprint on closed payment-blocking rows of each
+  stamped invoice whose decision audit row names the new uploader.* It closes
+  this case once and nothing else. A recaller (§374) who cleared a hold before
+  the recall stamped them is the same hole, and so is any later way someone
+  joins the set.
+- *(b) Re-ask segregation of the decider at suppression time.* Chosen, because it
+  is the general rule: a cleared finding stays cleared only while the person who
+  cleared it could still clear it.
+
+The rule lives in one place. `exception_lifecycle.clearance_stands` re-asks the
+same `segregation_refusal` the decision met, with the recorded decider, against
+the invoice as it stands. Its scope is `segregation_applies`, split out of
+`segregation_refusal` so the two cannot drift: a clearing verb, a
+payment-blocking type, and an org that has not opted out. Outside that scope the
+decider does not matter and the clearance holds, as before. A clearance by
+anyone the invoice does not implicate still suppresses. The org's
+`require_segregation: false` opt-out covers this check as it covers the decision.
+
+The decider has to be on the row. Reading the decision's audit row at refresh
+time was rejected for 0105's reason: under `FEOH_AUDIT_MODE=lambda` (production)
+that row goes to SQS and is not local yet, so a refresh right after a dismissal
+(`/complete` runs one) would find no decider. So 0126 also adds
+`exceptions.decided_by_user_id`, which `record_decision` writes on every resolve
+or dismiss (the person; NULL for a detector or an agent), and backfills it for
+rows already closed from their `exception.resolved` / `exception.dismissed`
+rows. The backfill uses the same rule as the uploader: every decision row on the
+exception must be a person's (an actor, not the sentinel, no `via`, its
+`new_status` equal to the row's, same organization), and all must name one
+person. It writes no audit row, because the column copies an audit row verbatim
+and changes nobody's rights. A payment-blocking row with no recorded decider
+never suppresses. That fails closed, as an unknown inspection recorder does
+(0105), and the cost is one more review of that finding. 0126 had not been
+released, so the column went into it rather than a new revision: it belongs with
+the backfill whose hole it closes. `downgrade` drops the column and keeps the
+uploaders.
+
+The migration's literals (terminal statuses, the sentinel, the import marker,
+the creation actions, the decision actions) restate app constants, and the test
+pins each to its source so a rename fails CI rather than silently narrowing the
+conflict check.
+
+## 368. Email intake reads only the per-tenant dedup claim; the legacy unscoped check is gone (PR #509 follow-up, 2026-11-13)
+
+PR #509 scoped the intake dedup claim to `email_intake:<org_id>:<message_id>`
+and kept a transitional read of the bare `email_intake:<message_id>` key
+(`_legacy_claim_live`) so a redelivery of a pre-deploy message could not create
+a second payable. That guard only mattered while a pre-#509 claim could still
+be live, i.e. for the 72h dedup TTL after #509 reached each environment. #509
+merged 2026-10-05 and shipped in v0.1.0; production's first deploy (2026-10-18)
+already carried it, so production never held an unscoped claim, and any local
+or pre-production Redis has been past the TTL for over five weeks. The check,
+its only helper `webhook_security.event_claim_exists` (no other caller), and
+their tests are deleted. `test_an_unscoped_message_id_claim_no_longer_blocks_any_tenant`
+pins the absence: a bare Message-ID claim no longer drops any tenant's invoice.
+
+## 369. A DSAR export caps every large section inline and streams the complete bundle on request; nothing is stored (privacy follow-up, 2026-11-13)
+
+**The gap.** §237 put every `.limit()` collection of the DSAR bundle behind
+`_capped`, but `services/privacy_export` still returned a vendor subject's
+invoices and payments whole. A supplier with years of volume therefore built one
+unbounded JSON document in memory, in a synchronous response, on the event loop.
+The sections that *were* capped had the opposite problem: they reported their
+true total, but the subject only ever received the first thousand rows. GDPR
+Art. 15 is a right to the data, not to a tally of what was left out.
+
+**The calls.**
+
+- **Every high-volume section is capped in the `POST /privacy/dsar` response,**
+  invoices and payments now included, and the document manifest's listing too
+  (it gains `returned` / `truncated`). **That is a shape change:**
+  `data.related_invoices` / `data.related_payments` were arrays and are now
+  `{total, returned, truncated, items}` objects like every other capped
+  section. No consumer in the repo read them as arrays (the page summarises
+  from `record_counts`), and a uniform shape was preferred over keeping two
+  sections the odd ones out. The response gains `complete`,
+  `truncated_sections` and `full_bundle_url`, so a cut is stated for the
+  export as a whole, not only per section. The routine `privacy.dsar_export`
+  audit row records `complete` and the cut section names.
+- **The complete set is `GET /privacy/dsar/{request_id}/bundle`, streamed.**
+  Every capped section is declared once as a `_Section` (a column select and its
+  serialiser); the inline reader takes the first `MAX_EXPORT_ROWS` of it and the
+  streamed reader walks all of it off a server-side cursor
+  (`yield_per=STREAM_CHUNK_ROWS`). One declaration is what keeps the preview and
+  the file from disagreeing about a section. Payments and vendor chat reach the
+  vendor's invoices by subquery, and a user's expenses join their reports, so
+  each section and its total are the same set whether or not a sibling section
+  was cut (the old code listed only the lines of the reports it had returned).
+- **The body is spooled, then audited, then sent.** Chunks go into an anonymous
+  `SpooledTemporaryFile` (1 MB in memory, then disk, writes off the loop). The
+  helpers moved from `api/audit` to `utils/spooled_export`, because the SOX
+  audit export solved exactly this problem (§105, §110). Only after the whole body is
+  rendered is `privacy.dsar_export.full_bundle` committed, and only then are the
+  sessions released and the bytes sent. A failure while rendering is a clean 500
+  with no row and no data, and every retrieval is its own row. The closing
+  braces come last, so an aborted transfer never parses as complete.
+- **The download is always masked.** The `vendor` record is the only section
+  with banking data, and it is never capped, so the step-up-gated `POST` already
+  delivers it whole when an unmasked disclosure is authorized. Re-running that
+  gate on a GET would buy nothing the POST does not, and honouring an earlier
+  request's unmasked flag would turn one step-up into a reusable grant.
+- **Any admin may download any of the org's DSAR exports by id**, the same reach
+  the `POST` has; an erasure's id, another tenant's or an unknown one is the same
+  404. The bundle is read at download time (`generated_at` says when), not
+  frozen at request time.
+
+**Rejected: an async job that writes the bundle to object storage and hands
+back a signed URL** (the follow-up's proposal). It would put a complete copy of
+the subject's PII in a bucket with a GOVERNANCE Object Lock default retention
+(`infra/s3.tf`, `invoice_retention_days`). That copy would outlive the export's
+purpose, and a later Art. 17 erasure of the same subject could not delete it:
+`privacy_documents` does not know it exists, and the lock refuses the delete.
+A signed URL is also a bearer credential that skips the tenant and role checks
+the storage module refuses to bypass (`storage.invoice_file_url`: "never a
+presigned or bucket URL"). And an in-process job that dies on a restart leaves a
+request stuck in `pending`, which then needs a recovery sweep. Streaming gives
+the subject the same complete set with none of that, at the price of a slower
+download for a very large subject: the same price the SOX audit export already
+pays (§105, §110). **Rejected: paging the response.**
+The subject is owed one whole set, and pages read at different moments are not
+one.
+
+**Left as is.** The sections are read under the session's default READ
+COMMITTED, so a write that lands mid-download can make two sections reflect
+slightly different moments, as the inline response always could. The
+`DataSubjectRequest` row's `record_counts` is still the vendor bundle's
+`counts`.
+
+## 370. An approved invoice's failed push keeps its financial fields frozen, and the clients read the lock from the server (§363 follow-up, 2026-11-13)
+
+**The gap.** `PATCH /api/invoices/{id}` (on a financial field) and
+`PUT /{id}/line-items` refused only while the status was in
+`FINANCIALLY_LOCKED_STATUSES`, `approved` onward. An approved invoice whose ERP
+push failed sits at `failed`, which is not in the set. A manager could change
+its amount, payee or lines there, and `/retry-erp` then pushed, and the payment
+run then paid, figures nobody approved. §363 had already closed the same case
+for the source document. The web modal and the mobile edit sheet each restated
+the status list, so neither would have kept up with a server-side fix: they
+would have sent the frozen fields, and every save would have 409'd.
+
+**The rule.** One predicate, `models/invoice_status.financially_locked`:
+frozen from `approved` on, and at `failed` once the invoice was ever approved
+(`was_ever_approved`, now owned by the same module and re-exported by
+`api/invoice_entry`). A `failed` extraction, never approved, stays open: its
+corrected figures still meet approval.
+
+- **Fail closed.** The predicate names the open side: the pre-approval statuses
+  and a never-approved `failed`. A status added to the enum later is frozen
+  until someone decides otherwise. `tests/test_invoice_status_groups.py` pins it
+  to "in the set, or `failed` and approved" for every status that exists.
+- **Every door asks it.** `document_locked` (the file routes) is now the same
+  call. `invoice_entry.financial_lock_refusal` gives both edit doors a coded
+  409, `invoice_financially_locked` (`params.status`). There was no coded
+  financial-lock refusal before, only two English sentences.
+- **The web modal reads the server's verdict.** `GET /review-actions` gains
+  `edit_financials` (`invoice_entry.edit_financials_refusal`: entry roles, entry
+  window, then the lock, in the doors' order). The modal's
+  `FINANCIALLY_LOCKED_STATUSES` copy is gone. `financiallyLocked` is
+  `!isAllowed(verdict)`, so it is locked until the server answers. The money
+  inputs (vendor, amount, tax rate) render **disabled** while locked, and line
+  editing is hidden. The old modal left them editable and dropped them from the
+  save without a word. With a fail-closed verdict that would also swallow a
+  typed amount on a slow load, so disabling them is what makes failing closed
+  safe. A locked invoice states the refusal's sentence above the form.
+- **The mobile app reads it off the invoice.** Mobile has no `review-actions`
+  client, and its edit sheet only needs the invoice-level fact, not the
+  caller's verdict. So `InvoiceResponse` carries `financially_locked`, and
+  `Invoice.financiallyLocked` reads it. A missing field (an older backend, an
+  old offline cache, or an `Invoice` built without saying) is locked. The
+  status getter `InvoiceStatus.isFinanciallyLocked` is gone. The web modal
+  deliberately does not use the response field: its `status` moves under it
+  (approve, reset extraction), and the verdict is re-asked when it does.
+
+**Other readers of the locked sets, one by one:**
+- `IMMUTABLE_STATUSES` (`POST_APPROVAL_LOCKED_STATUSES`) in `PATCH`'s
+  whole-edit refusal, `DELETE`, `bulk/delete`, `bulk/status` and
+  `services/gl_recode`: unchanged. `failed` after approval is treated like
+  `approved`, not like an immutable status. Its metadata, GL coding included,
+  stays editable. GL coding moves no money and names no payee (`bulk-recode-gl`
+  changes only the GL code, §253). Delete is the exit an approved invoice
+  already has, and it still refuses an invoice with a live payment.
+- `_PEPPOL_SENDABLE_STATUSES`: unchanged. A failed ERP push is not cleared for
+  e-invoice transmission any more than before.
+- Credit-memo apply (`CREDITABLE_INVOICE_STATUSES`): unchanged. A credit does
+  not edit the approved figure. The payment nets it (`net_payable_amount`), the
+  same as on `approved`.
+- `/extract`: already refused any invoice ever approved, and that refusal is
+  broader than the lock (it also covers a reworked `new`). Left as it is.
+- The exception agents that re-point `vendor_id` (`missing_po`,
+  `multi_po_split`) act only at `ready_for_review`, before approval.
+
+**Rejected:**
+- *Adding `failed` to `FINANCIALLY_LOCKED_STATUSES`.* It would lock a failed
+  extraction, whose figures are exactly what needs keying.
+- *A served frozen-field list.* The field set (`_FINANCIAL_FIELDS`) never
+  varies by invoice. Only whether it applies varies, and that is one boolean.
+  The mobile `kFinancialInvoiceFields` mirror stays, pinned by its own test.
+- *Leaving the modal's money inputs editable and only dropping them from the
+  payload.* With a verdict that fails closed, a typed amount would vanish from a
+  save made before the verdict arrived.
+
+**Left open:** a locked invoice whose approved figures are wrong has no path
+back to review, because `approved` and `failed` have no edge to `rejected`. The
+mobile notice still promises "reject, correct, approve again"
+(`docs/followups.md`).
+
+## 371. Disconnect and tenant deletion revoke every ERP OAuth grant, or say why they cannot (2026-11-13)
+
+**Context.** Two paths forgot an ERP OAuth grant without ending it. Sage
+Accounting and Blackbaud FE NXT had no `revoke_url`, so Disconnect cleared our
+tokens and answered `revoked: false`, and the page still said "Disconnected".
+Tenant deletion deleted the sealed `provider_credentials` row and never called
+the provider at all. Either way the refresh token stayed valid until it expired,
+up to five years for QuickBooks, and the customer's ERP still listed the app.
+
+**Decision.**
+
+- **Every `OAuthProviderSpec` sets exactly one of `revoke_url` and
+  `no_revoke_endpoint_reason`.** A spec with neither, or both, raises at
+  construction. A new provider cannot silently skip revocation.
+- **Sage revokes at `https://oauth.accounting.sage.com/revoke`.** The body is an
+  RFC 7009 form `token` (the refresh token), with the client as `client_id` /
+  `client_secret` form fields, the way Sage's token endpoint takes it. Never
+  HTTP Basic: `erp_oauth.revoke` now follows `spec.token_auth`.
+  `FEOH_ERP_SAGE_ACCOUNTING_REVOKE_URL` points dev at fake-erp's
+  `POST /sage/oauth2/revoke`, which refuses Basic and JSON so a wrong shape
+  fails the e2e spec. Sources: Sage's own guide answers automated fetches with
+  403, so the URL and shape come from Apideck's Sage configuration page
+  (developers.apideck.com/apis/accounting/sage-business-cloud-accounting/configuration)
+  and the sage-business-cloud-accounting-api-ts README, which cites Sage's guide
+  (`POST …/revoke` with `client_id`, `client_secret` and `token`). The
+  olsgreen/oauth2-sage-business-cloud client names the same URL. The v3.0
+  guide's regional hosts (`oauth.{na,eu}.sageone.com/revoke`) belong to the
+  retired v3.0 API. A sandbox Disconnect is on the platform-app follow-up.
+- **Blackbaud has no endpoint, and Disconnect says so.** SKY API's OAuth service
+  has `/authorization` and `/token` only. Blackbaud's SKY API team says on the
+  community forum (community.blackbaud.com/discussion/comment/262802, "Revoking
+  Tokens?") that disconnecting the application from the environment, by the
+  customer in Marketplace or the developer under My Apps, revokes that
+  connection's refresh tokens, and that regenerating the client secret does not.
+  Its 2025 announcement "Disconnect your SKY Application from Customer
+  Environments" added the developer-side disconnect. Blackbaud's developer docs
+  are a client-rendered app we could not read automatically, so the claim of
+  "no endpoint" rests on the forum. Disconnect answers
+  `revocation: "unsupported"` without calling out.
+- **Disconnect returns `revocation`** (`revoked` / `failed` / `unsupported`)
+  beside `revoked`, and audits it on `organization.erp_token_revoked`. The
+  settings page says plain "Disconnected" only on `revoked`. On `failed` it
+  says the provider did not confirm; on `unsupported` it says to disconnect
+  FeohLedger from the environment in Blackbaud. Both tell the admin to remove
+  the app on the provider's side.
+- **Tenant deletion revokes best-effort, and never under a lock.** Between the
+  document sweep and the control-plane delete, it reads `settings.erp.oauth`
+  and the sealed tokens (`_read_erp_grant`, which calls no provider). A tenant
+  holds one grant, a single block with two fixed sealed paths. Where the
+  provider is called depends on who holds the control-plane transaction:
+  - *Operator deletion* (`scripts/delete_tenant.py`, no `control_session`): the
+    read uses a short session closed before the provider is called, and the
+    control-plane delete opens its own transaction after. Nothing is locked
+    during the call.
+  - *Self-service closure* (`control_session`): the closure holds the org, user
+    and subscription rows `FOR UPDATE` until its caller commits. The read runs
+    on that session, inside a savepoint so a failed read cannot abort the
+    closure's transaction before its control-plane delete. The provider call
+    (15 s timeout at most) is queued with `post_commit` and runs once the
+    closure has committed, so no provider's latency is charged to a
+    transaction holding locks (root `CLAUDE.md`, `services/post_commit`). A
+    closure that rolls back drops the queued call: the organisation and its
+    sealed row survive, and the resumed closure reads and revokes again. An
+    outcome that needs no call (`unsupported`, `unreadable`, a read that
+    failed, an unknown provider) is decided at the read and not queued.
+  The outcome (`revoked`, `failed`, `unsupported`, or `unreadable` when the
+  store cannot be opened) is on `TenantDeletionResult`, and in
+  `format_confirmation`, with "the customer should remove FeohLedger from the
+  provider's connected apps" for anything but `revoked`. On a closure's result
+  it reads `after_commit` until the provider answers, then the outcome. A
+  closure writes no confirmation; its record is the log, a line when the call
+  is queued and one with the outcome (the runbook
+  `docs/founder-runbooks/workspace-closure.md` reads them). Nothing about it can
+  stop the deletion. The log lines name the provider and the outcome, never a
+  token.
+
+**Why after the drop and the sweep, not first.** If revocation came first and
+the drop then failed, a live workspace would be left with its ERP cut off at
+the provider while its own state still said connected. After the irreversible
+steps the workspace is already unusable, and the sealed row is still there to
+read. A re-run after a later failure revokes again. A provider may answer an
+already-revoked token with an error, and the confirmation then says "NOT
+revoked" for a grant that is gone: the error is on the safe side.
+
+**Rejected.**
+- *Calling the provider inside the closure's transaction.* This section first
+  shipped that way, on the argument that only writers to a doomed org would
+  wait. Review held it to the rule instead: up to 15 s of a third party's
+  latency on a transaction holding row locks is exactly what `post_commit`
+  exists to prevent, and the exemption would have to be re-argued at every
+  new writer to those rows.
+- *Revoking after the commit on the operator path too.* That path's commit is
+  `delete_tenant`'s own and nothing is locked during the call, and its written
+  confirmation must state the outcome. Only the closure's commit belongs to its
+  caller, so only that path needs `post_commit`.
+- *Failing the deletion when revocation fails.* A provider outage would keep a
+  terminated customer's data past the DPA's 60 days, to protect a grant the
+  customer can end themselves.
+- *Revoking a consent parked for the company picker* (§355), at deletion as at
+  cancel, for §337's reason. It lapses with its Redis TTL.
+- *Regenerating the Blackbaud client secret* as a way to revoke. Blackbaud says
+  it does not invalidate refresh tokens, and it would cut every tenant at once.
+
+## 372. CSV import resolves vendors within its entity, refuses a blank currency, and codes every row error (follow-up, 2026-11-13)
+
+Three defects in `services/csv_import`, fixed together because they share the
+row loop and the report shape.
+
+**Vendor resolution is scoped to the import's entity ∪ unstamped vendors.** The
+invoice importer resolved a row's vendor by code, then name, across the whole
+tenant, so a row imported into subsidiary A could link B's supplier record —
+the mislink the invoice matcher's scope exists to prevent
+(`docs/multi-entity.md` § Vendor matching), since `Invoice.vendor_id` is
+what the credit-memo guard compares and what the spend rollup and bank details
+are read from. The vendor importer had the mirror flaw: a row was skipped when
+*any* subsidiary held the code or name, leaving A with no vendor. Both lookups
+also used `scalar_one_or_none()`, a 500 for the whole file once the same
+supplier existed under two entities. The rule is not restated:
+`vendor_matching.scope_vendor_candidates` is now the single statement of
+`apply_entity_scope(..., include_shared=True)` plus the own-entity-first order,
+`_candidate_query` builds on it, and `csv_import._find_vendor` applies it with
+`.limit(1)`. NULL is admitted for the reason the matcher admits it: excluding an
+unstamped supplier would silently mint a duplicate. The importer keeps no status
+filter (unlike the matcher): an import has always resolved to an existing
+`inactive` / `rejected` record, and changing that would mint a fresh,
+verifiable stub beside a supplier someone deliberately retired. The exact
+`(vendor, invoice_number)` dedup moved to an ordered `.limit(1)` too, because an
+unstamped vendor can carry the same number in two entities. A repeat in the
+import's own entity (or an unstamped one) is still the silent skip; a repeat
+that exists only in another entity is now the existence-only
+`csv_invoice_number_matches_other_entity` refusal the near match already gave,
+instead of a row dropped with no reason.
+
+**A blank currency refuses the row** (`csv_currency_required`), and a cell that
+is not three letters is `csv_currency_invalid` rather than truncated by
+`upper()[:3]`. The shape check is `schemas.expense.normalize_iso_currency`, the
+one every other currency boundary uses. Considered: deriving it. Rejected,
+because nothing on hand is evidence of what a supplier billed. `Vendor` has no
+currency column, and `Entity.currency` is the entity's *reporting* currency
+(NULL means the org's): a UK subsidiary pays EUR suppliers. §160/§196/§200 say a
+missing currency stays missing, and `Invoice.currency` cannot hold "unknown"
+(it is NOT NULL; `docs/followups.md` tracks that column), so the only honest
+outcome is a refused row the operator fixes in the file. Also rejected: a
+file-level "assume currency X" form field. It would be the same default with a
+checkbox in front of it, and a Day-0 file that mixes currencies is exactly the
+one it gets wrong. The cost is real and accepted: a single-currency USD tenant's
+file now needs the column. The refusal runs before vendor resolution, so a
+refused row leaves no stub.
+
+**Every row error is coded.** The near-duplicate and GL-chart refusals already
+were; the rest were English-only `{row, message}`, so `ImportCsvModal` showed
+them in English in every locale. They now carry `{code, params}` through one
+`_coded` helper (`csv_malformed`, `csv_vendor_name_required`,
+`csv_invoice_number_required`, `csv_vendor_required`, `csv_amount_invalid`,
+`csv_currency_required`, `csv_currency_invalid`, `csv_status_invalid`,
+`csv_status_not_importable`, `csv_status_records_history`), registered in
+`codedRefusals.ts` with sentences in all six locales. `params` are the cell as
+written, not a localized label: the reader has to find and edit that cell in the
+file. `message` stays as the English fallback.
+
+**Scope.** The invoice importer (`POST /api/invoices/import-csv`) is the only
+CSV path that creates invoices; the vendor importer shared the entity flaw and
+is fixed here; there is no PO CSV import. The corporate-card feed
+(`import_corporate_card_csv`) has the same `or "USD"` default but its page shows
+no row reasons, so refusing there needs UI work too; it is tracked in
+`docs/followups.md`.
+
+Guards: `tests/test_csv_import.py` (blank / malformed / missing-column currency, an exact repeat held only by
+another entity,
+a mixed file reported per row with codes, the two-entity vendor scope at the
+service and the endpoint, the scoped vendor dedup, uploader stamped on every
+scoped row), `frontend/src/lib/api/codedRefusals.test.ts` (each code stated in
+every locale, fallback on missing params).
+
+## 373. A vendor merge moves the duplicates' ERP links, company by company, and refuses two different ids in one company (§356 follow-up, 2026-11-13)
+
+**The gap.** §356 left the merge alone: `services/vendor_merge` moved every
+`vendor_id` FK but no ERP link, neither the row's `erp_vendor_id` /
+`erp_link_realm` nor a kept `vendor_erp_links` row. Where only the duplicate
+was linked, the merged invoices were the canonical's and the push resolved the
+canonical, so they were refused `vendor_not_linked` while the id sat on a
+retired vendor. And the next sync under a kept realm restored the kept link
+onto that retired duplicate, keeping the ERP supplier pointed at a vendor
+nothing pays.
+
+**The rule** (`_plan_erp_links`, then `_apply_erp_links`). A vendor's links are
+its row link plus its kept links, one per realm. The merge plans, before any
+write, where each duplicate link goes, in request order:
+
+- the canonical (or an earlier duplicate's moved link) holds the **same** id in
+  that realm → released; the duplicate just drops it;
+- it holds a **different** id there → conflict;
+- a NULL-realm link names no company, so it may be the same company as any
+  named link: it conflicts with any differing id on the other side, in any
+  realm, and is reported as realm `null`;
+- otherwise the link moves. A duplicate's row link takes the canonical's row if
+  that row is empty (a NULL-realm link can only live on a row); every other
+  moved link is filed as the canonical's kept link.
+
+Then every duplicate's kept rows are deleted and its row link cleared, and the
+canonical gains the moved links. The duplicate ends with none, so no sync can
+restore one onto it. §356's shape holds: one link per `(vendor, realm)`, and
+the row's realm is never also kept. A merge never raises the number of vendors
+holding an id in a realm: the id leaves the duplicate as it reaches the
+canonical, and the unique `(vendor_id, realm)` constraint is never crossed
+mid-statement because the duplicate rows are deleted rather than re-pointed.
+The `vendor.merged` audit row carries `erp_links`, one
+`{realm, erp_vendor_id, from_vendor_id, placed}` per link a duplicate gave up.
+The kept rows are locked `FOR UPDATE` with the vendors, since a concurrent sync
+files and restores them. Bank details, sanctions state and the SoD sets are not
+touched; only the link columns and the kept rows move.
+
+**A conflict refuses the whole merge** (409 `vendor_merge_erp_link_conflict`,
+`params.realms` sorted, `null` last), with nothing moved. **Rejected: leave both
+links and flag the realm.** The merged invoices are the canonical's, so they
+would post to the canonical's ERP supplier while the duplicate's record (the one
+those bills were raised against) stays on a retired vendor and can be restored
+onto it. Which ERP supplier the merged vendor's bills post to would be chosen
+silently, by which vendor the steward picked as canonical, and a flag nobody
+reads before the next push does not stop that. Two ERP records for one payee
+is a fact about the ERP the steward has to settle, and refusing is the only
+option that states it before money is booked. **Rejected: pick a winner** (the
+canonical's, or the most recently synced). That is the same silent choice with
+a rule attached. **Rejected: refuse only on the realm currently connected.**
+Every kept realm is a company the tenant may return to, and §356's point is
+that those links are live the moment it does.
+
+The refusal has one way through today: leave that duplicate out. No endpoint
+lets a person clear a vendor's ERP link, and merging the suppliers in the ERP
+does not clear one either (a same-company link is never re-judged). That gap
+is tracked in `docs/followups.md` with its durable fix (an audited unlink
+action), rather than loosening the merge to work around it.
+
+**Not done here: GL accounts' single link** (the adjacent §356 follow-up). The
+durable fix is a kept-link table for `gl_accounts` mirroring `vendor_erp_links`,
+which needs a migration; repurposing an existing column (such as
+`erp_link_candidates` JSONB) would be the keyed-JSON shape §356 rejected for
+vendors, with no uniqueness per realm. It stays in `docs/followups.md`.
+
+## 374. An approval can be recalled to review, refused while a rail or the ERP holds the invoice (§370 follow-up, 2026-11-13)
+
+**The gap.** §370 froze an approved invoice's amount, payee and lines, and its
+failed push after approval with them. Nothing led back: `approved` had no edge
+into review, `failed` only `pending` / `sending_to_erp`, and `/reject` takes
+only `ready_for_review`. The mobile lock notice promised "reject the invoice,
+correct it, then approve it again", which the server refused. The one way to
+correct a signed-off figure was to delete the invoice and enter it again.
+
+**The rule.** `POST /api/invoices/{id}/recall-approval` (body `{reason}`,
+required) moves an `approved` invoice, or a `failed` one that was ever approved,
+to `ready_for_review`. The two edges are in `VALID_TRANSITIONS`, and this door
+is the only one that walks them: `POST /bulk/status` reports such a row as a
+skip. One predicate, `services/review.recall_refusal`, gates the door on the
+locked row, and `GET /review-actions` serves it as `recall_approval`. The web
+modal and the mobile detail screen both read that verdict. In order:
+
+1. `invoice.approve` — the approve and reject doors' permission.
+2. The status (409 `invoice_not_recallable`, `params.status`). The clients hide
+   the action on this code.
+3. The ERP may hold the bill (409 `invoice_recall_in_erp`): `erp_document_id`
+   is set (a confirmed push, or an invoice a void walked back to `approved` from
+   `posted_in_erp`), or the push's own record says a bill may exist
+   (`services/erp.possibly_posted`: an attempt with an unknown outcome, a queued
+   job, an orphan document, a confirmed reference). This is fail-closed: a push
+   that failed with an unknown outcome refuses. It is named before a claim
+   because nothing in FeohLedger clears it, so nobody cancels a run only to meet
+   this refusal next. Recalling a bill that is already in the ERP is the
+   `void-erp` product call in `docs/followups.md`. This change does not
+   pre-empt it.
+4. A live payment or virtual card (409 `invoice_recall_claimed`,
+   `params.claim`), read by `erp_export_gate.live_claims`, so "live" means here
+   what it means for the run builder, the card mint, the push and closing
+   (§309, §357). A payment run holds its invoices only through payment rows, so
+   a staged, approved, exported or executed run refuses. The remedy is the
+   rail's own exit.
+
+The run builder, the card mint and the push each lock the invoice, so no claim
+or push lands between the read and the transition. A late auto-send meets the
+push's own status gate.
+
+**The engine holds the two edges for the recall** (`workflow_engine.
+RECALL_EDGES`, refused unless the action is `invoice.approval_recalled`).
+Without that, a legal edge is open to every caller of `transition_invoice`. The
+extraction worker has no status precondition of its own, so a re-read
+redelivered after a human approved the invoice would have rewritten its figures
+and walked it back to review. It would have skipped the claim and ERP gate, the
+stamp and the chain reset, and a completed chain would then have let one
+approver sign past every level. Before these edges existed, the same re-read hit
+a 409 and rolled back. It does so again.
+
+**A once-approved invoice never re-enters `pending`**, for any caller. The
+recall keeps the approval stamps (below), and `failed` with a stamp is read as
+"an approved invoice whose push failed" by `/retry-erp`, `financially_locked`
+and this recall. If a recalled invoice could be re-read (reject, back to draft,
+`pending` through bulk status, then a failed extraction or `reset-extraction`),
+it would sit at `failed` posing as an approved push. `/retry-erp` would then
+post, and a run would then pay, figures nobody approved. `/extract` already
+refused a once-approved invoice. The engine now refuses one for bulk status and
+any future door too. That also closes the older form of the same hole, where an
+approved invoice's failed push was sent back to `pending` by bulk status. The
+supplier-portal resubmit skips the re-read for such an invoice: the corrected
+document goes to the reviewer, who keys any change by hand. This keeps `failed`
+plus a stamp meaning what every reader takes it to mean, without a migration. A
+separate "approval in force" column was weighed and is not needed while no
+re-read can reach `failed`.
+
+**A recall from a failed push resets the push's retry counter**, as `/retry-erp`
+does, and keeps its other keys. The instance is made `active` again (the
+escalation sweep reads only active instances). The step the approval opened is
+closed and a fresh approval step is opened, so the approval queue and the
+bottleneck panel see one open step.
+
+**Why `ready_for_review`, not `rejected`.** A recall withdraws a decision, and
+`ready_for_review` is the state that means "awaiting a decision". From there
+every exit is the existing one: approve (corrections included), or reject for
+rework when the supplier has to reissue. `rejected` would have been wrong in
+three ways:
+
+- It is the supplier portal's "action required" bucket. A supplier could then
+  resubmit, and replace the document of, an invoice AP had approved.
+- `reject_invoice` opens a `review_rejected` exception and counts toward the
+  rejection metrics, so it would record a decision nobody made.
+- It would need a resubmit step, and `rejected → new` would put the invoice back
+  in draft, where `/complete` with no approval step closes it unapproved.
+
+A manager corrects the figures with `PATCH` while the invoice sits in review.
+The lock is off there and a clerk's entry window stays shut. The approval then
+binds the version the approver loaded (§263).
+
+**Who may recall.** Holders of `invoice.approve`. Recall takes back an approval
+and moves no money, so it sits with the duty that gives approvals, not with
+`payment.void`. There is no threshold: the CFO gate applies again at
+re-approval, which is where it counts.
+
+**The recaller joins the segregation set**
+(`approval_chain.add_implicated_actor`, now shared with `stamp_entry_editor`).
+Someone who reopens signed figures is disputing them, and is usually the one who
+corrects them. Without the stamp, one person could approve, recall, re-point the
+payee and approve again, with nobody else looking after the first sign-off. A
+manager who edits before review is not stamped, because approve-with-corrections
+is the approver editing what they sign. A recall is different: it comes after a
+signature, and that is what makes the next signature need a second person. The
+org-level `require_segregation: false` opt-out covers the recaller as it covers
+the uploader, so a one-person team can still finish the loop. The original
+approver is not stamped. They may approve the corrected figures.
+
+Because the stamp joins `implicated_actors`, it reaches two more places, by
+design. The recaller can no longer clear a payment-blocking exception on the
+invoice (`exception_lifecycle.segregation_refusal`, §169); they escalate it, as
+the uploader would. And a goods receipt the recaller hand-recorded stops lifting
+a "billed beyond receipt" hold (`receipts_clear_hold`, §267) once the recall's
+`refresh_warnings` runs. A person who reopened the figures is not the
+independent receiver that rule wants.
+
+**Nothing is erased.** The `invoice.approved` row and its signature stay. The
+recall writes `invoice.approval_recalled` (`reason`, `recalled_from`,
+`recalled_approval: {approved_by, approval_date}`). The row's `approved_by` /
+`approval_date` keep naming the recalled approval until a new one overwrites
+them, so `was_ever_approved` holds: `/extract` still refuses to re-read the
+document, and a clerk cannot reopen it for entry.
+
+**Re-approval re-runs everything.** The chain state is cleared (as
+`reject_invoice` clears it), `recall_count` is bumped, and a fresh review step
+is opened. The next approval re-routes the chain from level 0 against the
+corrected figures, and meets segregation, the receiving rule and the max-amount
+and CFO gates again.
+
+**Rejected:**
+- *Keep delete-and-re-enter as the documented exit.* It loses the row's link to
+  its payments, exceptions, chat and document versions, and re-entry produces a
+  new uploader, which segregation would then measure against instead of the
+  real preparer.
+- *A bulk recall.* Each recall carries its own reason and its own claim read,
+  and a batch that silently skipped claimed rows would read as done.
+- *Clearing `approved_by` / `approval_date` on recall.* `was_ever_approved` is
+  what keeps a clerk and `/extract` away from figures that were once signed off.
+  The audit trail names who approved, and the next approval replaces the
+  display fields.
+
+**The vendor-setting exception agents stay safe on a recalled invoice**
+(money-path review, §379). §370 cleared `missing_po` and `multi_po_split`
+because they act only at `ready_for_review`, "before approval"; since the
+recall, that status no longer means before approval. Neither re-points a payee
+that is set: each only fills an empty `vendor_id` from the purchase order it
+links, and approves as the triggering human, whose segregation the coordinator
+checks first, so a run the recaller triggers escalates. The one case left, a
+recalled invoice whose vendor was cleared and which the agent would then fill
+and approve, escalates since §379: both resolvers ask
+`refuse_payee_change_after_approval` before any mutation. Recall also starts a
+new review round, so approval links sent before it stop working, and the
+engine keeps a recalled invoice out of draft (both §379).
+
+**Left open** (`docs/followups.md`): no outbound webhook says an approval was
+withdrawn; a PEPPOL transmission sent while the invoice was approved, and an
+inter-company mirror, keep the recalled figures; and the ERP dispatchers do not
+re-check `sending_to_erp` before a redelivered push.
+
+**Clients.** Web: "Recall Approval" in the invoice modal opens
+`RecallApprovalModal` (the shared `ui/Modal`, rendered beside the invoice dialog
+so its Esc and focus trap stay its own). Mobile: the same action on the detail
+screen, read through `ActionVerdict`, with a missing key failing closed. The
+financial-lock sentence now names the exit, on the server and in every locale.
+The mobile lock notice does the same.
+
+Tests: `backend/tests/test_invoice_recall_approval.py` (happy path, each
+refusal, verdict/door parity for every role, SoD after recall and the opt-out,
+the audit row, the chain and the CFO gate re-run, bulk refusal);
+`tests/test_invoice_status_groups.py` and `tests/test_workflow_state_machine.py`
+(the two edges, that nothing else goes back before approval, the engine's
+recall-only and no-re-read rules); `tests/test_invoice_uploader_stamping.py`
+(the two post-construction writers of the segregation set);
+`frontend/tests-e2e/invoices/recall-approval.spec.ts`;
+`frontend/src/lib/api/codedRefusals.test.ts`; and the mobile
+`invoice_detail_screen_test.dart`, `action_verdict_test.dart` and
+`coded_refusal_messages_test.dart`.
+
+## 375. A person can clear a vendor's ERP link in one company, never while an invoice is in flight there, and a later sync re-links it only by the ordinary rules (§373 follow-up, 2026-11-13)
+
+**The gap.** §373 refuses a merge where the canonical and a duplicate hold
+different ids in one ERP company (`vendor_merge_erp_link_conflict`), and left
+the steward one way forward: leave the duplicate out. Nothing could clear a
+vendor's link. No endpoint touched `erp_vendor_id` / `erp_link_realm` or a kept
+`vendor_erp_links` row, and merging the two suppliers in the ERP did not help,
+because a sync never re-judges a same-company link (§284, §356).
+
+**The action** (`services/vendor_erp_unlink.unlink_vendor_erp_link`, `POST
+/api/vendors/{id}/erp-links/unlink` with `{realm}`). It clears the vendor's link
+in one realm: the row link when its realm is that one, and the kept link for it.
+If both exist (§356 never makes that, but nothing in the schema forbids it), it
+clears both, so no link for that company is left for the push to read.
+`realm: null` names the row link that records no company. It is a required
+value, never a default, so an empty body cannot clear the unnamed link by
+accident. `GET /api/vendors/{id}/erp-links` lists the links for the vendor
+detail's readers, and the vendor modal's **ERP links** panel offers an armed
+two-click **Unlink** per company. The merge refusal's sentence now points at it.
+
+- **`vendor.manage`**, like every other edit to the vendor master (create,
+  edit, verify, reject, sync, merge). It is not a new permission. Clearing a link
+  moves no money and routes no bill: the vendor's next push to that company is
+  refused `vendor_not_linked` before any HTTP call. A split duty for it would
+  be one more grant with nothing to separate it from.
+- **Audited** as `vendor.erp_unlinked` with `{realm, cleared: [{placement,
+  erp_vendor_id}]}`. Ids only, the same floor as `vendor.merged`'s `erp_links`.
+- **Locks** the vendor, then its kept links, in the order a merge takes them, so
+  an unlink and a merge of the same vendor serialise rather than deadlock. The
+  vendor row is re-read under the lock (`populate_existing`), not taken from the
+  identity map.
+
+**"In flight" means anything that may still use the link, and it fails closed
+where the company is not on record.** Refused 409 `vendor_erp_unlink_in_flight`,
+`params.invoices` the count, no invoice named:
+
+- `sending_to_erp`, in **every** company. The push resolves the link when it
+  runs, under whatever connection it runs against, and no row records that
+  connection ahead of time;
+- `sent_to_erp` where the workflow state's `erp_realm` (written with the
+  confirmed push, §295) is that company, or is missing, or the realm asked for
+  is null. A link that names no company may be any company's;
+- `failed` where `services/erp.possibly_posted` is true, in every company. The
+  uncertain attempt's company is not recorded (an `erp_realm` in the state may
+  name an earlier push), and its retry or reconcile pushes again. A failure
+  that certainly posted nothing does not count: its retry meets
+  `vendor_not_linked`, which is the unlink's intended, visible consequence.
+
+From `posted_in_erp` on, a bill carries its own id. Status sync-back matches it
+by `erp_reference` within `erp_realm`, and the payment write-back posts against
+that bill id, so neither reads the vendor's link and an unlink cannot move that
+bill. **Rejected: refuse while any open bill exists** (`posted_in_erp` /
+`payment_scheduled`). It would block the unlink for as long as the vendor has
+payables, protecting nothing that reads the link. **Rejected: scope
+`sending_to_erp` to the current connection's realm.** That would need the
+control-plane config on this path and would still be wrong if the connection
+changes before the dispatch reads it. The status is transient, so refusing it
+everywhere costs a retry.
+
+A push that reaches `sending_to_erp` after the check reads the link in its own
+transaction. Before the unlink commits, it still sees the link and posts with
+it; that bill is then the in-flight one the next unlink is refused over. After
+the commit, it sees none and is refused `vendor_not_linked`. Neither posts to a
+supplier the vendor is not linked to, so the check needs no lock on the
+invoices.
+
+**A later sync follows the ordinary rules; the unlink is not a "never link"
+marker.** Nothing is kept for that company any more, so nothing is restored. The
+record is matched by id only if a vendor holds it, and it is adopted by name
+only when the name is unique among the pulled records and among the unlinked
+local vendors (§284). An ambiguous name is reported as a conflict and links
+nothing. A vendor still linked in that company is never a name candidate, so a
+sync cannot put the stale record onto the vendor a merge kept, which is the
+"wrong supplier" case that matters. The one re-attachment the rules allow is the
+same record back onto the vendor it was cleared from, by a unique name. It is
+audited `linked` and reported by the sync. A record that should never link
+again is made inactive (or merged) in the ERP, and inactive records are never
+linked or created. **Rejected: a tombstone the sync honours** (do not re-adopt
+this id onto this vendor). It needs a new column or table and so a migration,
+and it would block the legitimate re-link of a link cleared by mistake. The ERP
+is the place the stale record lives, and it already has the switch that keeps
+it out. **Rejected: reading the `vendor.erp_unlinked` audit rows as that
+tombstone.** The trail is evidence, not state. In `lambda` audit mode it is not
+written in the request's transaction either.
+
+## 376. A GL account keeps its ERP link state for every company it was synced under, restored before rule 0 (§356/§373 follow-up, migration 0127, 2026-11-13)
+
+**The gap.** §356 gave vendors a link per company; `gl_accounts` still held
+one. A chart sync under another ERP company dropped a row's link (rule 0, §284),
+cleared a person's confirmation of it, and cleared an open decision
+(`erp_link_candidates` from another realm). A return to the first company
+re-linked most rows by code, but a link a person had confirmed among
+candidates had to be confirmed again, and a row waiting for a decision under a
+code that is only a legacy key there came back unlinked with nothing to decide:
+rule 2 visits rows by the pull's current codes, so it never reached the row.
+
+**The decision.** A kept-state table, `gl_account_erp_links` (migration 0127),
+mirroring `vendor_erp_links`: one row per `(gl_account_id, realm)`, `realm`
+never NULL, holding what the row held in that company — the link with its
+confirmation, or the open decision with its candidates. A CHECK refuses a row
+holding neither, or a confirmation with no link. `services/gl_account_erp_links`
+owns it, and `services/gl_account_sync` calls it on every pull with a named
+realm, before rule 0: first every row's state from another named company is
+filed under that company (so rule 0 moving or dropping a link loses nothing,
+including a link rule 0 moves by evidence), then the state kept for the pull's
+own company is put back on its row and removed from the table.
+
+A restored state is **restored before re-judging, not instead of it.** A
+restored unconfirmed link meets rules 3 and 4 like any same-company link; a
+confirmed one is exempt from them, as it was before it left; a restored
+decision is refreshed against the pull (candidates the ERP no longer has are
+dropped, a row the rules can now link is linked). Restoring is not a new
+judgement, so nothing here weakens a rule.
+
+**No two rows hold one account on the rules' own judgement.** The sync never
+leaves two unconfirmed rows linked to one ERP account, so an unconfirmed kept
+link whose id another unconfirmed row holds there, or that two unconfirmed kept
+links claim, is dropped (`restore_dropped`) and the row is judged as it stands;
+which row the account belongs to would be a guess. A confirmed link always comes
+back: the one sanctioned share is a person's choice of an account that the row
+named after it also holds (§284's "Truck:Depreciation" case), and dropping it
+would undo exactly the decision this exists to keep.
+
+**The push still reads only the row.** Vendors post a kept link at once on
+reconnecting (§356). GL accounts do not: a restored unconfirmed link is
+re-judged by rules 3 and 4 first, and the push cannot run them, so after a
+reconnect the chart needs one sync before restored links post. Until then the
+push refuses `account_not_linked`, which fails closed.
+
+**Only a named realm is kept, and nothing is backfilled** — §356's reasoning:
+a NULL-realm link names no company, and the links earlier syncs dropped exist
+only in `gl_account.synced_from_erp` audit rows, which are history, not live
+state. A no-realm (`mock`) pull neither keeps nor restores.
+
+**Rejected: candidates or kept links in a JSONB column on `gl_accounts`.** The
+keyed-JSON shape §356 and §373 already turned down: no uniqueness per realm, and
+every reader has to parse it. **Rejected: restore after rule 0.** Rule 0 would
+first judge the row's other-company link against this company's pull and could
+move it by evidence, so the kept state and the row would disagree about which
+link is this company's.
+
+## 377. The corporate-card feed and the statement uploads refuse a blank currency too (§372 follow-up, 2026-11-13)
+
+§372 stopped the invoice importer stamping `USD` on a blank currency cell. The
+corporate-card feed (`csv_import.import_corporate_card_csv`) still wrote
+`(currency or "USD").upper()[:3]`, so a GBP card statement with no currency
+column reconciled as dollars, and a long cell was truncated. That matters more
+here than it looks: match suggestions and `/match` compare currencies exactly,
+so every such line became a candidate for USD expenses and for no GBP one.
+
+**The card feed refuses the row with §372's codes and helper.** A blank cell,
+or no `currency` column, is `csv_currency_required`; a malformed one is
+`csv_currency_invalid` with `params.value`, both through `_parse_currency`, so
+there is one rule and one shape check (`normalize_iso_currency`). A refused row
+does not claim its `external_txn_id`, so a corrected repeat later in the file
+still imports. The feed's other row errors are coded in the same change
+(`csv_card_amount_invalid`, distinct from `csv_amount_invalid` because a
+negative amount is a refund on a card feed and imports; `csv_date_invalid`;
+`csv_malformed`), since the page that now shows them would otherwise show
+server English for those in five locales. **Rejected: default to the entity's
+or the organization's currency.** It is what the entity reports in, not what a
+card was charged in, which is §372's reason and the same here; a card programme
+billed in one currency is exactly when the column is easiest to add.
+
+**The Cards tab lists refused rows.** It used to toast only imported / skipped
+counts, so a refused row would have vanished, and the toast called every
+skipped row a duplicate. The list `ImportCsvModal` rendered is now a shared
+component (`components/ui/CsvImportErrors.svelte`), used by the modal and by a
+dismissible panel above the card table; the toast counts duplicates and
+refused rows separately. `refusal.csvCurrencyRequired` now says "the row's"
+currency rather than "the invoice's", since a card row shares the sentence.
+
+**The two statement uploads have the same default at the statement level.**
+`POST /api/bank-reconciliation/upload` and `POST /api/vendor-statements/upload`
+took `currency: str = Form("USD")`, and passed any string through (an `EURO`
+overflowed the `String(3)` column). Both now go through
+`api/refusals.statement_currency`: absent or blank is 422
+`statement_currency_required`, malformed is 422 `statement_currency_invalid`,
+before the file is read, and a lowercase code is stored uppercased;
+`bank_reconciliation.parse_csv_statement` no longer defaults it either. These are
+new codes, not §372's, because the field is one per file and §372's sentences
+say "this row was not imported". The vendor-statement modal's free-text
+currency (which sent a blank as "use the default") became the same ISO list the
+bank-statement modal already used, defaulted to the organization's currency.
+
+The other CSV ingest paths checked: budgets and catalogs have no CSV import
+(their `currency` defaults are JSON create schemas). The pasted-lines vendor
+statement create (`ReconciliationCreate.currency`, `default="USD"`) is not a
+CSV path but has the same default; it is tracked in `docs/followups.md`, since
+making it required touches every caller that omits it.
+
+## 378. Each policy violation is coded by the engine, and submit's two list-shaped 422s are coded refusals that keep their lists (§361 follow-up, 2026-11-13)
+
+**Context.** §361 coded every expense-report and card refusal except
+`POST /expense-reports/{id}/submit`'s two list-shaped 422s: `{message,
+violations}` for blocking policy violations and `{message, expense_ids}` for
+lines with no rate locked into the report currency. Each violation carried a
+`code` but its figures only inside a server-English `message`, so the web
+toast and the violation panel were English in every locale.
+
+**Decision.**
+
+- **The policy engine builds the params, per violation.** `_violation` adds
+  `params` from the same values the English sentence is composed from, and
+  `expense_policy.VIOLATION_PARAMS` is the catalogue of which keys each code
+  carries: `amount` + `amount_currency`, `limit` + `currency`, `comparison`
+  for all; `category` for `category_limit`; `miles`, `rate`, `direction` for
+  `mileage_amount_mismatch`. Money is `str(Decimal)` beside its ISO code.
+  `amount_currency` is explicit rather than derived from `comparison`, so a
+  client never has to know that a fell-closed comparison quotes the face
+  amount in the expense's own currency. Building them at the call site that
+  already composes the sentence, rather than parsing the sentence or
+  re-deriving figures in the endpoint, is what keeps the two from drifting.
+- **The params are a nested object; the flat keys stay.** `limit`, `actual`,
+  `currency`, `comparison`, `miles`, `rate` were already top-level, and
+  `expenses.policy_violations` stores them in JSONB. Moving them would break
+  the badge and every stored row; adding `params` beside them gives the
+  violation the same `{code, message, params}` shape as a coded refusal at
+  the cost of duplicating a few strings. A row stored before this has no
+  `params` and states its English `message` until its next write refreshes it
+  — no backfill, because the refresh is already on every write path and a
+  migration recomputing violations would need the live policies and FX state.
+- **Direction is a param, not a code.** Over- and under-claimed mileage stay
+  one code (`mileage_amount_mismatch`), so `BLOCKING_CODES`, the badge count
+  and every consumer that keys on the code are unchanged; the sentence picks
+  its variant from `params.direction` (and from `comparison` for the
+  fell-closed variants of every rule).
+- **The envelopes are coded refusals that keep their lists.**
+  `expense_controls.report_policy_blocked_detail` and
+  `report_lines_unconverted_detail` return `coded_refusal(...)` plus the
+  original `violations` / `expense_ids` key, with byte-identical English
+  `message`s. Codes: `expense_report_policy_blocked` (`count`) and
+  `expense_report_lines_unconverted` (`count`, `currency`). `count` on the
+  latter is the rollup's `unconverted_count`, not the id list's length, since a
+  line with no id still counts. Status 422 unchanged. The no-locked-rate list
+  holds ids, not per-line reasons (every entry has the same reason), so only
+  its envelope is coded.
+- **The web states each violation in a module of its own**,
+  `api/policyViolations.ts`, not in the `codedRefusals.ts` registry: a
+  violation is advisory data shown in a panel and a badge, not an error
+  `detail`, and its function always returns a sentence (the localized one, or
+  `message`) where the registry returns `null`. `miles` and `rate` are shown
+  as sent: `formatMoney` would round a four-place per-mile rate to two places.
+  A free-text category is named verbatim.
+
+**Mobile.** No change: §361 confirmed mobile calls no expense-report endpoint.
+
+**Also fixed.** The submit panel's `{#each}` key was `code + policy_id`, which
+collides when one policy blocks two lines (Svelte throws on a duplicate key);
+it now includes `expense_id`.
+
+## 379. A once-approved invoice reaches approval again only through a person, and nothing changes its payee unseen (§374 follow-up, money-path review, 2026-11-13)
+
+**Found** (the round's money-path review of §374):
+
+1. **Recall → reject → `POST /bulk/status → new`** put a once-approved invoice
+   in draft. The financial lock is off there, so anyone outside the
+   segregation set could re-point the vendor and amount, and `/complete`'s
+   amount floor then approved it (`invoice.auto_approved`, approved_by
+   "system (below threshold)"). Nobody independent signed the corrected payee.
+   With no approval step, `/complete` closed it `new → done` unapproved. §374
+   named this risk for `rejected → new` and did not close it.
+2. **Email, Slack and Teams Approve links outlived their round.** The digest
+   they bind holds eight displayed and payment facts, not line items, tax or
+   the review round, so a first-round link still approved after a recall with
+   those facts unchanged. The pair consume (`ActionToken.consume_key`) only retires a
+   message whose own link was clicked, so an in-app reject and resubmit left
+   the old link working too.
+3. **§370 called the vendor-repointing agents safe because they act "before
+   approval"**, at `ready_for_review`. Since §374 that status can hold a
+   recalled invoice.
+4. **A vendor merge re-pointed `Invoice.vendor_id` on approved, financially
+   locked invoices** without asking `financially_locked`. The payment run and
+   the ERP push read the bank details of whichever vendor the invoice names,
+   so an approved invoice signed for the duplicate's payee would be paid to the
+   canonical's account, outside the bank-change dual control.
+
+**The rule.** A once-approved invoice gets back to an approval only through a
+human approval at `ready_for_review` (resubmit from `rejected`, or the recall),
+and nothing unattended changes its payee.
+
+- **The engine keeps it out of draft** (`workflow_engine.
+  _refuse_outside_the_recall`, beside §374's "never re-enters `pending`"): an
+  invoice that was ever approved never enters `new`, and never leaves `new` for
+  `done`. Draft is where every unattended exit starts (`/complete`'s floor
+  `new → approved`, its `new → done`, and extraction's auto-approve after
+  `→ pending`), so holding the edge in covers every door that reaches it:
+  bulk status today, any future one. The portal resubmit already went straight
+  to review for such an invoice. From `rejected` the way back is resubmit.
+- **`new → approved` cannot be held at the engine**: every approval site sets
+  `approved_by` / `approval_date` before its transition, so the engine cannot
+  tell this approval's stamp from an earlier one. `/complete` therefore reads
+  `was_ever_approved` before anything stamps the row, never fires the floor for
+  it, and treats it as needing approval whatever the workflow says
+  (`api/workflow.approval_applies`, which `GET /review-actions` reads too, so
+  the verdict and the door agree). After the engine rule only a row written
+  with a stamp at `new` before it can reach this; it lands in review.
+- **A token belongs to its review round.** The digest appends the round
+  (`email_action_token.round_from_state_data`: `rejection_count` +
+  `recall_count` from the invoice's workflow instance, both only growing) when
+  it is above 0. Both sides read it one way: `services/review.
+  approval_message_facts` when a message is minted (the guard test now
+  requires it at every `invoice_assigned` sender), and `review_round_of` at
+  the three doors, against the locked row. A stale round reads as "This
+  invoice changed after this message was sent", which is the reviewer's
+  remedy either way. **Chosen over spending a round's outstanding pairs** when
+  it ends: that needs a registry of every pair minted per invoice in Redis,
+  and a Redis outage at the recall would leave the old links live; the round
+  needs no state that can be lost. **Round 0 is the old digest byte for byte**,
+  so links already in inboxes for an invoice never rejected or recalled kept
+  working across the deploy; a link for an invoice already in a later round
+  stopped then, which costs one sign-in. Reject stays unbound, as before. An
+  invoice with no workflow instance reads round 0, and a recall or rejection
+  of one bumps nothing (both bump only an existing instance), so its links are
+  retired only by the eight facts, as before.
+- **Agents never set the payee of a once-approved invoice.**
+  `exception_agents/resolvers/amount_mismatch.refuse_payee_change_after_approval`
+  raises `PayeeFixedByApproval` (a `NotApprovable`) when a resolver would write
+  a different `vendor_id` onto an invoice ever approved; `missing_po` and
+  `multi_po_split` ask it before any mutation, and the coordinator escalates
+  with its own rationale. Agents may still approve a recalled invoice as the
+  triggering human when the payee is untouched: the coordinator's segregation
+  check already refuses the recaller, and the corrected figures meet the chain
+  and money gates again. Refusing agent approval outright was weighed and not
+  needed for the payee risk this closes.
+- **A vendor merge refuses while a duplicate holds an approved invoice still to
+  be paid**, 409 `vendor_merge_approved_unpaid`, `params.count` across every
+  duplicate, with nothing written. "Approved and unpaid" is
+  `vendor_merge.approved_unpaid_clause`: `financially_locked` minus `paid` /
+  `done`, in SQL, naming the open side so a new status is held (the
+  population the bank-change flag covers, §286). The Invoice reassignment also
+  excludes such rows and recounts, so an approval that lands while the merge
+  runs refuses it rather than moving. The way through is to let them be paid,
+  or to recall their approvals, after which they move and their next approval
+  signs the canonical payee. A live virtual card on an approved invoice
+  therefore refuses the merge too (`tests/test_vendor_card_revocation.py`).
+
+**Rejected for the merge:**
+- *Refusing on any financially locked invoice*, as the review first put it.
+  That includes `paid` and `done`, so no vendor with a payment history could
+  ever be merged. Their payee is history, and folding history is the point of
+  a merge.
+- *Leaving locked invoices on the retired duplicate.* The duplicate's ERP links
+  move to the canonical (§373), so those invoices would stop posting, and a
+  retired vendor fails the payment path's `vendor_not_active` check. They
+  would be stuck rather than safe.
+- *Moving them and raising the bank-change `fraud_flag` on each.* It keeps
+  merges unblocked, but it re-points a signed payee and leans on a second look
+  to undo it. A refusal changes nothing that was approved. It also leaves the
+  ERP side clean: a bill already posted names the duplicate's ERP supplier.
+
+**Left open** (`docs/followups.md`): a `paid` invoice moved by a merge and
+then voided is re-paid to the canonical's bank details with no flag, because
+`Payment` records no payee to compare against (needs a migration); and the new
+merge code and the engine's two once-approved sentences read in English only.
+
+Tests: `tests/test_workflow_state_machine.py` (the two engine edges refused
+with a stamp and open without, resubmit still allowed);
+`tests/test_invoice_recall_approval.py` (recall → reject → bulk `new` skipped
+then resubmit; the floor fires for a never-approved draft and never for a
+once-approved one; no approval step: review, not `done`, verdict and bulk
+alike; the `pending` rule on a stamped draft);
+`tests/test_email_action_token.py` (round 0 is the old digest, each round its
+own, a first-round link refused later, the counters, every sender binding
+`approval_message_facts`); `tests/test_email_actions.py` (a recall, and an
+in-app reject and resubmit, retire the first round's link; a new-round link
+approves); `tests/test_exception_agents_missing_po.py` and
+`tests/test_exception_agents_multi_po_split.py` (the agent fills an empty payee
+only before any approval); `tests/test_vendor_merge.py` (each approved-unpaid
+status refuses, nothing moves; paid, done, failed extraction, recalled and
+rejected move; the count across duplicates; recall clears the way).
+
+## 380. The state machine's refusals are coded, every coded bulk skip keeps its code, and the company picker asks the server whether to stay open (§379 / §355 follow-up, 2026-11-13)
+
+**Context.** §379 left `vendor_merge_approved_unpaid` and the engine's
+once-approved sentences English-only, and §355's amendment kept the parked
+consent through most pick refusals while the settings page still closed its
+picker on every coded one and told the admin to "connect again".
+
+**Decision.**
+
+- **Every 409 `workflow_engine` raises is a `coded_refusal`**, not only the
+  once-approved ones: `invoice_transition_invalid` (no edge;
+  `params.status` / `params.target`), `invoice_transition_recall_only` (a
+  recall edge, same params), `invoice_once_approved_not_reread` /
+  `_not_to_draft` / `_not_closed_from_draft`. The generic "Cannot transition"
+  sentence reaches people through every door that transitions, and the bulk
+  skip is where they meet it most; coding three of the engine's five sentences
+  would leave the commonest one in English. Each `message` is the old English
+  byte for byte, so every client that reads `detail` as text (mobile's
+  `errorMessage`, `utils/http.detail_text`, `refusal_of`) reads the same
+  sentence.
+- **A bulk-status skip keeps the code of any coded refusal it carries**
+  (`api/invoices._refused_skip`), not only §357's close refusal: the approval
+  gates, resubmit and the engine now reach the list localized. A structured
+  detail without `params` (the GL-chart refusal) contributes its sentence only,
+  as before. The endpoint's own skip sentences stay English, tracked in
+  `docs/followups.md`.
+- **The picker closes only when the server holds nothing to pick.** After a
+  refused pick other than `erp_pick_expired`, the panel re-reads
+  `GET …/oauth/pending`: the record decides, not a client list of which codes
+  spend it. One code cannot say: `credentials_unavailable` is put back after a
+  claim refusal and spent when the token cannot be opened at the take, and a
+  put-back is best-effort. A failed re-read keeps the list already shown. The
+  picker drops a selection the re-read list no longer holds (a newer consent
+  from the same browser).
+
+**Rejected.**
+- *Branching the picker on the code* (close on the two that can spend, keep on
+  the rest): wrong for `credentials_unavailable` either way, and wrong for any
+  put-back that failed.
+- *A new code for the 409 a bulk row gets for each status pair*: the pair is
+  params; one sentence names both statuses by their labels.
+
+Tests: `tests/test_workflow_state_machine.py` (each engine code and its
+params); `tests/test_invoice_recall_approval.py` and
+`tests/test_bulk_status_controls.py` (the skip rows carry the engine codes,
+the recall-only edge on a never-approved `failed` row, a segregation skip's
+code); `frontend/src/lib/api/codedRefusals.test.ts` (every engine and merge
+code the backend defines has a sentence, each in six locales, the count and the
+statuses named, malformed params fall back);
+`frontend/tests-e2e/erp/xero-company-picker.spec.ts` (an unoffered company and
+`already_linked` keep the picker, and the same consent then links).
+
+## 381. One currency shape rule, ASCII first, and no shortlist pickers left (§377 follow-up, 2026-11-13)
+
+§377 moved the statement uploads off a `<select>` over `COMMON_CURRENCIES`.
+Two more pickers had the same limit: the `/credit-memos` create / edit dialog
+(the shortlist), and `/organization`'s Invoice Defaults currency (six
+hardcoded options), which is also a rung of the reporting currency. A PLN
+credit memo, or a ZAR organization's own default, could not be entered from
+the web at all. **Both now use `ui/CurrencyInput`.** It gained a bindable
+`touched`: an edit (and a loaded setting) opens the field touched, so the
+record's own code is never re-seeded from the org currency, and the credit-memo
+dialog resets it for each new memo, as its select did. A linked credit memo's
+currency stays a disabled one-option display, because it is the invoice's and
+asserting any other is a 409. The other create forms (invoice, expense,
+budget, recurring, contract, requisition, intake, entity) already took a plain
+text input, so nothing limited them to a list; `utils/currencyPickers.test.ts`
+fails on any `.svelte` that builds options from the shortlist or hardcodes a
+common code as an `<option value>`.
+
+**The rule is three ASCII letters, checked before uppercasing.**
+`normalize_iso_currency` checked `len == 3 and isalpha()`, which is true for
+`"ÄÖÜ"`, and the browser cannot format such a code (`Intl.NumberFormat`
+throws, so the figure renders bare). Uppercasing first is not safe either:
+`"uß".upper()` is the ASCII `"USS"` (and `"ﬀ"` is `"FF"`), in Python and in
+JavaScript alike. So the rule strips, refuses non-ASCII, then uppercases and
+requires `[A-Z]{3}` in full. It lives in `app/utils/currency_code.py`
+(`normalize_iso_currency` raising, `iso_currency_or_none` not), and the
+frontend's `normalizeCurrencyCode` applies the same order; `CurrencyInput`
+uppercases only ASCII letters as typed, so a typed `ß` stays visibly invalid
+instead of becoming `SS`.
+
+**Every request schema's currency field shares it.** They checked four ways: a
+bare `max_length=3` (invoices, contracts, intake, budgets, catalogs,
+requisitions), `min_length=3, max_length=3` (entities, discount offers,
+recurring templates, pasted vendor statements), two copies of an `isalpha()`
+validator (`threshold_currency`), and the shared helper (expenses, credit
+memos). An API client could store `""`, `"us"`, `"usd"` or `"ÄÖÜ"`. They now
+use `app/schemas/currency.py`, whose four types differ only in what blank
+means: `CurrencyCode` (required), `OptionalCurrencyCode` (`None` = not sent,
+blank refused), `CurrencyCodeOrUnset` (blank = `None`, for the credit memo's
+"resolve it for me" and the policy's "use the reporting currency"), and
+`BlankableCurrencyCode`, the invoice PATCH only, where `""` is the legacy "no
+currency" value the credit-memo currency guard answers with a 409, not a 422.
+Defaults are unchanged (several create schemas still default `USD`; the pasted
+vendor statement's is tracked in `docs/followups.md`). The non-schema checks
+call the same rule: the statement uploads, the CSV `_parse_currency`, the
+organization `invoice_defaults.currency` PATCH (now stored uppercased),
+`models.procurement.po_currency_code`, the punch-out cart, and the extraction
+normaliser. **Rejected: validate against the full ISO 4217 list.** The
+backend has no maintained list to pin, a list rejects a code issued after it
+was cut, and the shape is what the formatters and grouping keys need.
+
+## 382. The server says whether a run's bank-file panel applies; a run exported before a switch to processor mode keeps it (§362 follow-up, 2026-11-13)
+
+**The gap.** §362 keeps "Verify before upload" open in either mode, since it
+never releases the run, and refuses "Bank rejected the file" on a tenant that no
+longer records payments. The run dialog hid the whole bank-file panel unless the
+tenant's execution mode was `record_only` (`canDownloadBankFile`). On a tenant
+switched to processor mode with a run still `exported`, the reader holding the
+file could not verify it before uploading and was not told why the run could not
+be released. Only Record was left. Nothing was paid twice, because the server
+keeps the claim, but the dialog restated a client condition where it should have
+read a server verdict.
+
+**Decision.**
+
+- **`GET /runs/{id}` carries `bank_file_applies`**, from
+  `payment_controls.run_bank_file_applies(run, record_only=…)`. It is `true` on
+  every run of a record-only tenant, and on a processor tenant only while the
+  run's stored status is `exported`, which is the claim §251 / §362 keep. A
+  processor tenant's draft has no file and never gets one, so the panel does
+  not apply to it. The field says only whether the panel is the right place to
+  look. Which controls it offers stays each control's own `actions.nacha_*`
+  verdict, and those already answered coherently in processor mode: Download is
+  hidden (`nacha_already_exported`), Regenerate is refused
+  `nacha_requires_record_only`, Bank rejected the file is refused
+  `nacha_void_requires_record_only`, and Verify is `null`. The dialog renders
+  the refused ones disabled beside their sentences, so the reader learns why
+  the run cannot be released or redone.
+- **The client mode check is gone.** `canDownloadBankFile` was removed. A
+  verify result already on screen stays there whatever the run became, because
+  a superseded file must not be uploaded even after the run is cancelled.
+
+**Rejected:**
+- *Hide Download on `nacha_requires_record_only` and drop the mode check, with
+  no new field.* It works today, but it gives one code two meanings: hidden on
+  Download, explained on Regenerate. It also makes the panel's presence an
+  accident of which refusals happen to be hidden. One server fact is plainer
+  and has a parity test of its own.
+- *Gate on `nacha_export_count > 0`.* A run released back to `draft` after the
+  bank rejected its file keeps its count but no longer holds a file. The
+  stored `exported` status is what the `nacha_*` verdicts compare, so the
+  panel reads the same thing.
+
+**Tests.** `backend/tests/test_payment_action_verdicts.py`
+(`test_run_bank_file_applies`, `test_the_bank_file_panel_verdict_in_each_mode`:
+the field and the four verdicts on a run exported before the switch, Verify
+accepted in both modes with the claim kept, no panel on a processor draft);
+`frontend/tests-e2e/payments/nacha-verify.spec.ts` (an exported run, switched
+to processor: the panel shows Verify enabled and the two refusals' sentences).
+
+## 383. A payment records the payee it paid, and a void flags a re-payment to another one (§379 follow-up, migration 0128, 2026-11-13)
+
+**The gap.** §379 lets a merge move `paid` invoices (their payee is history),
+and `POST /api/payments/{id}/void` sends one back to `approved`. The re-payment
+reads the bank details of whichever vendor the invoice names now, so a paid
+invoice merged onto another vendor and voided was re-paid to the canonical's
+account with no flag. `reflag_voided_invoice_for_bank_change` (§286) only asked
+about approved bank changes on the invoice's current vendor, and `Payment`
+recorded no payee to compare against.
+
+**The rule.** Every payment records, at the step that releases its money, the
+payee it pays: `payee_vendor_id`, `payee_bank_fingerprint` and
+`payee_recorded_at` (`services/payee_stamp.stamp_payee`). The steps are:
+
+- the rail and card dispatch (`_execute_single_payment`), from the read the
+  order is built from, after every refusal and compliance hold and immediately
+  before the processor or card call, so a stamp means money was instructed.
+  It is carried in `_ORDER_FIELDS`, so a rolled-back attempt that reached the
+  processor keeps it;
+- the NACHA export, after every refusal, so the commit the ERP check keeps
+  never holds a stamp for an unbuilt file;
+- a payment recorded outside FeohLedger (`external_payment._complete`, which
+  serves the user's record, the run record and the ERP-reported payment). An
+  entry of an `exported` file keeps the payee its file carried; a rejected
+  file's stamp is replaced, since it paid nobody.
+
+A merge records, on each duplicate it retires for the first time, where it went
+and who merged it (`vendors.merged_into_vendor_id` / `merged_by_user_id` /
+`merged_at`), in its own transaction.
+
+The void reads the invoice's vendor `FOR SHARE` and asks
+`flag_repayment_payee_change`. A different vendor, or the same vendor with a
+different bank fingerprint, opens the `fraud_flag` `payee_changed_since_paid`.
+That type already blocks every run, dispatch, record-outside and ERP push, and
+its clearing already runs the payment-blocking segregation rule. One flag is
+opened **per person whose act re-pointed the payee**, each with that person as
+its raiser, so none of them can clear their own:
+
+- vendor differs → every steward on the merge chain from the paid vendor to the
+  current one, walked through the retired vendors' own records (only a merge
+  moves a paid invoice's vendor; an approved one is financially locked);
+- bank differs → every approver of a bank change since the stamp.
+
+**Why per person, along the chain.** The money-path review found that "the
+latest merge into the current vendor" names the wrong person: a later,
+unrelated merge into the same canonical (or a no-op re-run of the same merge)
+took over the raiser, and the steward who actually moved the invoice could then
+clear the flag. A chain D → B → C by two stewards moved the payee twice. A merge
+has no dual control of its own, so this flag is the only independent look at it.
+One `raised_by_user_id` names one person, so each gets a row; a person can
+still clear someone else's, which takes two people acting together.
+**Rejected: reading the merge from its `vendor.merged` audit row.** In `lambda`
+audit mode that row lands asynchronously or not at all, and a money gate must
+not wait on audit delivery; the record on the vendor is written with the merge.
+The audit row is read only for a merge from before 0128, which has no record:
+the earliest row naming the vendor a duplicate, so a re-run never re-attributes
+it.
+
+**Why `FOR SHARE`.** A bank-change approval updates the vendor and then flags
+the vendor's payable invoices, which the voided one is not until the void
+commits. Without the lock each side read the other's state from before it and
+neither flagged, which was already true of §286's re-flag. With it, whichever
+runs second sees the first: the void reads the new details, or the approval
+sees an `approved` invoice.
+
+- **The fingerprint** is HMAC-SHA256 over the canonical JSON of the whole
+  `bank_details` blob and the tenant id, keyed by its own secret,
+  `FEOH_PAYEE_FINGERPRINT_KEY`, and tagged `v2:<kid>:<hmac>`. Whole blob,
+  because the dual control already treats any change to it as a bank change
+  and an allowlist would miss the next key that steers money
+  (`counterparty_id`, a cheque's `mailing_address`). Keyed, because an unkeyed
+  hash of a routing and an account number is brute-forceable. Tenant in the
+  message, so one account paid by two tenants does not fingerprint alike.
+  **Rejected: storing the last four digits** (already shown everywhere): two
+  accounts sharing a last-4 would compare equal, which is the BEC case.
+- **Its own key, rotated through a keyring.** The first cut derived the key
+  from `FEOH_SECRET_KEY` to avoid provisioning a secret, accepting "one extra
+  flag" per rotation. That cost was misjudged: the JWT key rotates every 90
+  days (`docs/secrets-rotation.md`), so every quarter each void of an older
+  payment would open a false `payee_changed_since_paid` flag for a person to
+  clear. Fail-closed, but recurring noise built into a routine operation, and
+  it trains people to clear fraud flags without looking, which defeats the
+  flag. So the fingerprint has a dedicated key, and each stamp names the key
+  that made it: `kid` is the first 8 hex of a domain-separated SHA-256 of the
+  key. Retired keys live in `FEOH_PAYEE_FINGERPRINT_PREVIOUS_KEYS`
+  (comma-separated), and the void recomputes a stamp under the key its `kid`
+  names (`payee_stamp.fingerprint_matches`), so a rotation through the
+  keyring flags nothing. The column (`varchar(80)`) holds the 76 characters
+  unchanged. **The `kid` is derived, not configured beside the key**, so an
+  operator cannot pair an id with the wrong key or reuse one for a new key.
+  Thirty-two bits of a hash of a 256-bit random key say nothing about it.
+  **Rotation by replacement is the one wrong move**, and it is fail-closed: a
+  `kid` in neither setting compares as changed, flags, and logs the id. A
+  deployed environment refuses to boot with the key empty, under 32 chars,
+  equal to the committed dev value or equal to `FEOH_SECRET_KEY` (the last
+  would bring the quarterly noise back), and `deploy/decrypt-env.sh` refuses
+  the same before compose restarts anything. **`v1` is not read.** `v1` stamps
+  existed only on this PR's branch before it merged (migration 0128 was not on
+  `main`), so nothing deployed carries one. A stray `v1` in a local database
+  compares as changed and flags, like any unknown scheme.
+- **An empty key stamps the payee without a fingerprint, and its void flags.**
+  There is no fallback key. With the key empty (local dev only, given the boot
+  refusal), `stamp_payee` still records `payee_vendor_id` and
+  `payee_recorded_at` with a `NULL` fingerprint and logs a warning. A void then
+  still catches a merge on the vendor id, and the bank comparison, which cannot
+  run, fails closed: `payee_changed_since_paid`, raised by any bank-change
+  approver since the stamp, else `NULL`. That differs from the unstamped rule
+  below on purpose. An unstamped payment predates the stamp, so nothing can
+  honestly be compared and flagging every one would flag "for no fact at
+  all". A stamped payment released money while the stamp existed, and a
+  missing fingerprint there is a configuration fault, not history.
+  **Rejected: refusing to stamp** (`payee_recorded_at` left NULL): the void
+  would then treat the payment as pre-0128 and compare nothing, the silent
+  direction. **Rejected: falling back to §286's re-flag** for the bank
+  question: it misses any route that changes bank details without a change
+  request, which is the gap the fingerprint closes. **Rejected: refusing the
+  payment** when the key is missing: it would stop money in dev over a
+  comparison that only matters at a void. pytest does not load
+  `.env.development`, so `tests/conftest.py` gives the suite a test key; the
+  empty-key path is pinned by monkeypatching it away.
+- **`payee_vendor_id` is not a `vendor_id` FK.** It is history: the merge must
+  never move it (its name keeps it out of `VENDOR_FK_CHILDREN`'s drift guard on
+  purpose), and nothing should tie a vendor row's lifecycle to the payments
+  that once paid it.
+- **The comparison runs at the void, not in the run builder.** The void is the
+  one moment a paid invoice re-enters the queue, and a flag raised there stops
+  the ERP push too (`fraud_flag` is in `ERP_EXPORT_BLOCKING_EXCEPTION_TYPES`),
+  which a run-builder check would not: a bill pushed after the void can be paid
+  from the ERP. After the void the invoice is approved and unpaid, so a later
+  merge is refused (§379) and a later bank change flags it (§286); nothing else
+  re-points it between the void and the re-payment. A second comparison in the
+  builder would have to re-decide a flag a person already cleared (§366), for no
+  case the void misses. The run builder is unchanged.
+- **A stamped payment no longer runs the §286 re-flag**: its fingerprint
+  answers "did the bank details change" for every route, including one that
+  bypasses a change request, and running both raised two flags for one cause.
+- **De-duplicated on the finding and the raiser, not on the type**
+  (`flag_invoice_for_bank_change`, which now takes the finding code). The old
+  type-wide count let an open Positive Pay or detector `fraud_flag`, raised by
+  nobody, absorb a bank-change flag, so a person clearing that unrelated row
+  cleared a payee change they never saw. Folding a second approver's change
+  into the first approver's open row did the same for the second approver. This
+  applies to `vendor_bank_changed` too, and §286's re-flag now flags once per
+  approver since the payment. A pre-§358 row with no code is matched on its
+  English.
+
+**A payment with no stamp** (paid before 0128) is never compared, and nothing is
+backfilled. §141's reasoning holds exactly: the vendor's details today are what
+may differ from the ones paid, so stamping them would absolve every change made
+since, and there is no honest record to recover. **Rejected: fail closed on
+every unstamped void.** It would flag every void of a pre-migration payment
+for no fact at all. The one fact on record is a merge into the invoice's vendor
+after the payment was booked (a retired vendor's record, or for an older merge
+its audit row, if it moved anything). Then the invoice may have moved, and the
+void raises `payee_unrecorded_after_merge`, once per steward of those merges. A
+canonical's own invoice voided after an unrelated merge is flagged too; that
+costs one look and is the price of not inventing a payee. For a pre-0128 merge
+the audit row is the only evidence, so in `lambda` mode a row that never landed
+means no flag. That residue shrinks to nothing as pre-0128 payments age out, and
+every merge since is on the vendor. The §286 re-flag still answers an unstamped
+payment's bank change. A raiser that cannot be found is `NULL`: the flag still
+blocks, and anyone outside the invoice's implicated set clears it.
+
+Tests: `tests/test_payment_payee_stamp.py`:
+- the fingerprint; it does not change with the JWT key; a rotation through the
+  keyring keeps an old stamp equal (unit and through a real void); a stamp
+  whose key is in neither setting, another scheme or a malformed value does
+  not match and its void flags; with no key nothing is fingerprinted, the
+  payee vendor is still recorded and the void flags;
+- the stamp at the rail, card, NACHA, single and run record-outside and
+  ERP-reported steps; none on booking, a compliance hold or a refused export;
+  an exported entry's payee kept and a rejected file's replaced;
+- the merge record, first merge wins; the merge leaves the payment's stamp;
+- merge → void flags, blocks the run and the ERP gate, the steward is refused
+  the clear and an independent person clears it;
+- a later unrelated merge or a re-run does not take over the flag; both
+  stewards of a chain are each refused their own;
+- same payee raises nothing; bank changes raise one flag per approver;
+- a bank change racing the void is flagged;
+- an unrelated fraud flag does not absorb the payee flag, and another person's
+  change gets its own row;
+- the unstamped cases.
+
+Also `tests/test_config_boot_guards.py` and `tests/test_deploy_decrypt_env.py`
+(a deployed env refuses a missing, short, dev or JWT-equal fingerprint key, and
+the day-one rehearsal env boots with its own),
+`tests/test_payment_dispatch_db_error.py` (the stamp survives a
+post-processor rollback and is absent when nothing was sent),
+`tests/test_migration_0128_payee_and_merge_stamp.py`, and
+`tests/test_payment_run_actions.py` / `tests/test_exception_raiser_stamping.py`
+updated for the new call.
+
+## 384. While a modal dialog is open, everything outside the topmost one is inert (a11y, 2026-11-13)
+
+**Context.** Every dialog rendered in place with `role="dialog"
+aria-modal="true"` and the shared focus trap, and nothing more. `aria-modal`
+only asks assistive tech to stay inside; the trap only holds Tab. A screen
+reader's virtual cursor, a pointer and a touch still reached the page behind,
+and axe's WCAG 2.2 `target-size` rule reported the `/invoices` sort buttons
+behind the invoice dialog and the recall dialog stacked over it as "partially
+obscured" targets at 320px (`tests-e2e/a11y/recall-import-verify.spec.ts`).
+The phone sidebar overlay had already solved the same problem for itself with
+`inert` (`routes/+layout.svelte`).
+
+**Decision.** `lib/actions/modalInert.ts` marks `inert` on everything that
+neither is the topmost open modal dialog nor contains it, walked down from
+`<body>` along that dialog's ancestor path. It is driven by the open-modal
+registry `actions/focusTrap.ts` already keeps (the one the toast region hosts
+itself by), synchronously on every open and close:
+
+- **Home: the focus trap's registry, not a new action per shell.** Every modal
+  here, `ui/Modal` and the four hand-rolled shells (`InvoiceModal`,
+  `RunDetailModal`, `BulkRecodeGLModal`, the portal discount-accept dialog),
+  already registers there by carrying `aria-modal="true"` and `use:focusTrap`,
+  so all five get it with no edit, and a new dialog cannot opt out by
+  forgetting a second action. The marking itself lives in its own module so
+  the walk unit-tests without a DOM. A shell-level `$effect` (where `ui/Modal`
+  keeps its scroll lock) was rejected: it would cover one shell of five.
+- **Stacking is a recompute, not a nest of saved states.** Each sync takes off
+  every mark it made and marks afresh for the current top. The recall dialog
+  over the invoice dialog therefore makes the invoice dialog inert, and closing
+  either, in either order, leaves exactly what the remaining stack needs.
+- **Never clobber.** An element already `inert` when a sync marks (the layout's
+  `<main>` and skip link behind the sidebar overlay) is skipped and not
+  recorded, so no sync ever removes it.
+- **Live regions stay live.** An inert subtree is pruned from the accessibility
+  tree, so the toast region (`data-dialog-satellite`) and SvelteKit's route
+  announcer are keepers wherever they are, and no attribute is ever written
+  onto the region itself (it would travel with it into the dialog). The region
+  normally lives inside the topmost dialog anyway; `ui/Toast.svelte` re-syncs
+  after each move, so the marks follow it. A toast raised while the region was
+  still outside the new top dialog is re-inserted after the move, as before.
+- **Focus.** The sync runs before the closing dialog's deferred focus restore,
+  so the trigger is focusable again by then. A dialog with another stacked over
+  it no longer reclaims focus when inert drops its focused control
+  (`onFocusOut` acts only for the topmost).
+- **Portals.** Nothing in the app moves a picker, menu or listbox out of a
+  dialog to `<body>` (the only `body.appendChild` calls are transient download
+  links; native datalists are browser UI). A node inserted at `<body>` level
+  after a dialog opened is not marked, so a future portal would keep working;
+  content inserted inside a marked subtree inherits its inertness.
+
+**Rejected: `aria-hidden` on the background** (the `aria-hidden` library's
+pattern). It hides from assistive tech only, so pointer, touch and focus still
+reach the page and axe's target-size finding stands. **Rejected: native
+`<dialog>` + `showModal()`.** It gives top-layer inertness for free, but every
+shell, the toast hosting and its band placement (§313, #635/#636) are built on
+an in-place fixed backdrop; converting five shells is a larger, riskier change
+for the same result.
+
+Tests: `src/lib/actions/modalInert.test.ts` (open, nested open, close in both
+orders, a pre-existing `inert` preserved, the exempt regions, the region
+following the top dialog); `tests-e2e/a11y/modal-inert.spec.ts` (the page and
+then the under-dialog go inert, the toast region stays live, closing restores
+each and returns focus); `tests-e2e/a11y/recall-import-verify.spec.ts` at 320px
+is the axe guard that was red.
+
+## 385. Sage Accounting SA is driven by the 2.0.0 API as documented, not as assumed (#655, drafted 2026-10-23, landed 2026-11-13)
+
+**What happened.** A docs-against-code audit of `sage_accounting_za.py` (the
+ERP audit tracked in #655) found the adapter built on four things the SA API
+2.0.0 does not do, each hidden by a fake-erp surface that did them anyway:
+
+- **`SupplierInvoice/Save` renumbered every invoice.** Its
+  `useSystemDocumentNumber` parameter is "Default value is True. Use system
+  Document Number or Document Number provided." We never sent it, so Sage gave
+  each invoice its own sequence number, the supplier's number was lost in Sage,
+  and the duplicate-number guard could never match.
+- **The idempotency lookup filtered on strings.** "Filter and Orderby will not
+  work for string values of any kind" (DeveloperProgram.aspx). The lookup's
+  `Reference eq '…' or DocumentNumber eq '…'` therefore either 400s (every push
+  fails "idempotency lookup unavailable") or is ignored (every supplier with a
+  prior invoice reads as a duplicate, and past 100 invoices a retry after a
+  timed-out save can miss its own first attempt and post twice).
+- **Void called `SupplierInvoice/Delete`, which does not exist.** The 2.0.0
+  method list for SupplierInvoice is Get, Get/{id}, Save, Calculate, Email and
+  Export. The `posted_total_mismatch` cleanup leaned on it, so a wrongly-booked
+  invoice was reported "voided" by the fake and stayed live in real Sage.
+- **Paging had no order.** "If no default order clause is specified, you will
+  need to provide one"; unordered `$skip` pages can drop rows, and a dropped
+  row reads as a dead link to the chart and vendor syncs (§284).
+
+**Decisions.**
+
+1. **The save sends `useSystemDocumentNumber=false`**, and the number recorded
+   is the one Sage echoes back.
+2. **The idempotency lookup filters on integers and dates only** —
+   `SupplierId` plus a one-day `Date` window, ordered `ID desc`, every page —
+   and compares `Reference` / `DocumentNumber` in the adapter. Our own earlier
+   attempt has the same `Date`, so it is always in the window; a window too
+   long to read (10 pages) or a failed page fails closed. *Rejected:* walking a
+   supplier's whole invoice history on every push, to keep the duplicate-number
+   guard across all dates. It costs one call per 100 invoices against a limit
+   of 100 requests a minute and 5,000 a day per company; the guard now covers
+   the same day, and FeohLedger's own duplicate detection covers the rest.
+   `Date` became required for the push (`missing_dates`), which Sage requires
+   anyway.
+3. **`void_invoice` refuses, with no call.** The documented way to reverse a
+   supplier invoice is a `SupplierReturn` allocated against it. That changes
+   the supplier's balance and the VAT return, so — like §303's payment rule —
+   it is an accountant's decision, not one an automatic cleanup makes. The
+   mismatch message now says, truthfully, that the invoice could not be
+   voided. *Rejected:* posting the SupplierReturn automatically.
+4. **A refused save is coded and known to have created nothing**, the shape
+   §285 gave QuickBooks: 402 is `company_subscription_inactive`; any other 4xx
+   is classified from what Sage holds now (`Company.LockProcessing` +
+   `LockProcessingDate` → `period_closed`; `Active: false` on the supplier or
+   an account → `vendor_inactive` / `account_inactive`), else the new shared
+   code `bill_refused`. All carry `not_posted`, so none reads as "possibly
+   posted". Sage's `Message` / `ModelState` is never read into the result: it
+   can echo the invoice. Inactive suppliers and accounts are also refused
+   before the save, and inactive suppliers are now emitted `active=False` by
+   the vendor sync rather than linked as live payees.
+5. **401 and 429 stop, they don't retry.** Sage blocks a user for 24 hours
+   after 20 failed logins in an hour, and blocks a company for an hour on a 429
+   with "do not continue to make requests as this may extend the blocking
+   period". The shared `_RETRYABLE_CLIENT_STATUSES` treats both as retryable
+   (right for OAuth ERPs whose 401 means "refresh"), so this adapter overrides
+   it: a 401 anywhere is `not_connected`, a 429 on the save is non-retryable.
+6. **fake-erp's `/sageza` now behaves like the API**: string `$filter`
+   literals are 400, paging needs `$orderby`, the save keeps the supplier's
+   number only on `useSystemDocumentNumber=false`, there is no Delete, Date and
+   DueDate are required, and it refuses an inactive supplier, an inactive
+   account and a locked period. The adapter as it stood fails against it.
+
+**Not settled without a sandbox** (#654): whether a string `$filter` 400s or is
+ignored; the exact OData `datetime'…'` literal Sage accepts; Sage's 400 body
+for a locked period, an inactive supplier or account and a duplicate number;
+whether `Paid` turns true when a SupplierReturn (credit) is allocated (if so,
+`paid` must come from a SupplierPayment allocation, §303); whether a ZAR
+supplier reports a null or a home `CurrencyId`; the real account-category
+descriptions and PO status strings; and the Resellers (Sandbox) host, which
+`base_url` is deliberately not widened to until it is confirmed. The PO's
+supplier link by `SupplierId` (#652's Sage SA row) already landed in #670.
+
+**Porting note.** Drafted as §320 on `fix/erp-sage-accounting-za` and
+renumbered on landing (§320 was taken). Since the draft, every Sage SA sync
+listing (the PO listing included, §323) is read whole or raises, and a
+transport error is an incomplete listing too; the 401 stop composes with that,
+so a 401 on a sync listing is `ErpListingIncomplete`, never an uncoded error.
+`bill_refused` is deliberately shared (`base.ERP_REFUSAL_CODES`,
+`erpRefusals.ts`, six locales): the Sage UK and Intacct ports reuse it for a 4xx
+they cannot classify further.
+
+Tests: `backend/tests/test_erp_sage_accounting_za_adapter.py`,
+`frontend/tests-e2e/erp/sage-accounting-za.spec.ts`.
+
+## 386. Xero's bills sync back: matched by their id, recorded at Xero's cash, written back at the exact amount (issue #655 X1–X5, 2026-11-13)
+
+**Context.** §295 brought QuickBooks bills' payment status back and wrote our
+payments there, gated on `supports_status_sync`. Xero, the other direct OAuth
+ERP, still closed every push at `done`, so a bill paid in Xero never reached
+FeohLedger (the live Demo Company test's FEOH-INV-001). The 2026-10-23 audit of
+the Xero adapter against Xero's published API (#655) also found four reading
+errors (X1–X4) and a wrong rate-limit figure (X5). A WIP branch
+(`feat/erp-xero-status-sync`, `f8e5cee5`) drafted the work; this entry is the
+port onto main (with #707's company picker, ShortCode deep link and per-company
+vendor links in place) and its completion.
+
+**Decision — Xero reports back.** `XeroAdapter.supports_status_sync = True`.
+With `FEOH_ERP_STATUS_SYNC_ENABLED` on, a confirmed Xero push lands at
+`posted_in_erp`, and §295's table, §296's dispatch-time read, §309's live-claim
+refusals and §319's kept report apply unchanged. The sweep selects tenants by
+`dispatcher.status_sync_adapter_keys()`, derived from the adapter classes, so
+the next adapter that turns the capability on is swept with no second list.
+
+- **Matched by the bill's id, in any state.** Xero's `Reference` is
+  ACCREC-only, so a bill carries no marker of ours. An `InvoiceID` is a GUID
+  Xero never reuses, so the report sets `match_by_reference` and
+  `_matching_invoice_id` matches by `erp_reference` within the recorded realm,
+  exactly one invoice or none, the way QuickBooks' deleted bills already were.
+  A push that recorded no realm can therefore never match, so the sweep does
+  not read its bill either (`ErpAdapter.bills_match_by_reference`, which
+  `_bills_we_posted` asks; QuickBooks' marker can still match such a bill, so
+  it keeps reading them). Rejected: writing our correlation id into a line description (a person can
+  edit it, and it would print on the bill).
+- **"Paid" is read from the payments on the bill, never `Status` alone (§303).**
+  `AmountPaid` must equal the sum of the listed payments, or the report is
+  `unknown` (the dispatch check then holds). Credit notes, overpayments and
+  prepayments sit in `AmountCredited`, so a bill they settled is
+  `settled_by_credit`. Our write-backs are told apart by `Reference:
+  "FeohLedger payment <id>"`.
+- **The cash Xero shows is recorded, not FeohLedger's figure.** New
+  `ErpBillReport.paid_amount`: the exact cash a person applied outside us, set
+  only for a bill paid wholly in cash. The ERP-paid path passes it to
+  `record_invoice_paid_outside(amount=…)`, which records only when it equals
+  what the invoice owes here; anything else is refused `amount_mismatch`
+  (`external_payment_amount_mismatch`, a new `erp_paid_unrecorded_*` clause in
+  every locale) and kept on the `paid_not_recorded` row with the amount and its
+  currency, which the re-attempt and a merge never drop. A figure in another
+  currency than the invoice's, or none stated, is refused the same way, never
+  compared as a bare number. That check sits in `record_invoice_paid_outside`
+  beside the amount check (`source="erp"`), so it runs AFTER §309's live-claim
+  refusals: a payment in another currency on an invoice FeohLedger is also
+  paying is reported as the double payment it is (`in_run` / `payment_live` /
+  `card_live`), naming the claim a person must undo. Recording the owed figure, as QuickBooks still does
+  (it states no amount; `docs/followups.md`), would book money that did not
+  leave whenever a credit memo or an early-payment discount applies only here.
+  **The row is payment-blocking** (`amount_mismatch` joins
+  `DOUBLE_PAY_REFUSALS`): the bill is paid in full there, so paying it here is
+  the double payment, and an undispatched booking of ours surfaces exactly this
+  way (it is completed in place, and its figure is what disagrees). Leaning on
+  §296's dispatch read alone would leave it payable whenever status sync is
+  turned off. **The one-click record books the stated figure or nothing**:
+  `POST /api/exceptions/{id}/record-erp-payment` takes the row's stated amount
+  as the amount, so it refuses until a person corrects the invoice or the bill,
+  and a body figure that disagrees is a 422, as is a stated figure with no
+  currency (the sweep's rule on the same facts; a blank on both sides is not a
+  match). Before this, the dialog's
+  amount-less record would have booked FeohLedger's figure (and captured a
+  discount the supplier never granted) and closed the row.
+- **The channel is the sweep, plus an admin's "check now".** No Xero webhook is
+  wired (a follow-up). `changed_bills` reads `Invoices` and `Payments` with
+  `If-Modified-Since` from the connection's high-water mark, 1,000 rows a page,
+  counted against `SYNC_LISTING_MAX_ROWS` in rows. A connection consented
+  before `accounting.payments` (added to the scopes now) cannot list payments:
+  that 401/403 is an incomplete listing, so the pass reads every payable bill,
+  which needs only the invoices scope. The header is sent as Xero documents it,
+  `yyyy-mm-ddThh:mm:ss` in UTC. **Only bills an invoice was pushed as are read
+  back** (`sync_bills` → `_bills_we_posted`, for every adapter): a change feed
+  lists every bill the company changed, and reading the hand-keyed ones spends
+  Xero's daily allowance on bills that could only be unmatched. `POST
+  /api/organization/erp/oauth/status-sync` runs the same pass for one tenant:
+  admin-only, audited first (and its outcome after, a refusal included), four
+  an hour per tenant, and **run after the response (202)**, since a full
+  reconciliation at Xero's 60 calls a minute outlasts any HTTP timeout. One at a
+  time per tenant, by a 15-minute Redis claim the pass releases; a Redis that
+  cannot be reached falls back to the worker's own check, and a second pass is
+  then only as costly as two sweep ticks (the mark only ever moves to a pass's
+  own start).
+- **Xero's per-minute limit is waited out on status reads, once.** A full
+  reconciliation reads one to three calls per bill, so a tenant with more than
+  a few dozen payable bills met a 429 on every pass and the pass failed at the
+  same bill each time, never reading the rest. A status-sync GET answered 429
+  with a `Retry-After` of at most 60 s, and an `X-Rate-Limit-Problem` that is
+  absent or names a per-minute limit, sleeps that long and reads again, once
+  (`xero._status_get`). The header decides first because the daily cap can
+  carry a short `Retry-After` near midnight. That is Xero's pacing instruction, not a retry of an
+  unknown failure (guard rail 4), and it is bounded. A longer `Retry-After` is
+  the daily cap, and the pass fails with its mark unmoved. At the dispatch check
+  the 10 s bound cuts a wait short and the payment is held (§296). Pushes still
+  never wait: `services/erp`'s backoff owns their timing.
+- **The rail is best effort.** Reading which account paid costs two more calls
+  for a bill already known to be paid outside; a failure there is "not stated"
+  (1099-reportable), never a failed report, so it cannot turn a known
+  `erp_bill_not_open` into an unverified hold or stop a sweep at that bill.
+
+**Decision — the write-back.** `post_payment` applies a Xero Payment to the bill
+from the mapped pay-from account at the exact `Decimal` that reached the
+supplier (`dumps_exact_json`), idempotent in §295's two layers (our marker,
+looked up among all payments, deleted ones included; and `Idempotency-Key`).
+A write-back someone deleted in Xero is refused `bill_payment_voided`. Refused
+before any write: no account, a bill gone, another currency (or none stated on
+either side: fail closed, in the QuickBooks write-back too), or more than is
+due. **A discount is not a payment**: Xero's Payment has no discount field, so
+the bill is left open by the discount and flagged
+(`erp_payment_writeback_balance_open`, now carrying `discount_amount` in its
+`erp_report`), §295's conservative answer kept; booking it as a credit note is
+an opt-in for a product call (`docs/followups.md`). Following that flag's
+advice must not raise an alarm, so a credit after our payment is not "paid
+twice" when, and only when, every fact says it is that discount: the bill was
+settled by credit with no payment of anyone else's on it, **our write-back is
+on the bill** (`ErpBillReport.our_payment_applied`), and what came off beyond
+our write-back (`reduced_outside_amount`, `total - due - ours`) is no more than
+the `Payment.discount_amount` FeohLedger's own completed payments took. Without
+the write-back the bill still showed the whole amount due when our rail paid
+(say the write-back was refused `payment_account_not_mapped`), so a credit for
+it is a second settlement and raises `erp_paid_twice`; so does a credit larger
+than the discount, or one after a payment that took none. (A first draft keyed
+the exemption on "credit and no outside payment" alone, which hid exactly that
+case; the money-path review caught it.) QuickBooks states neither fact (it
+lists a credit as a $0 BillPayment anyway), so its rule is unchanged.
+`void_payment` deletes our Xero payment (Xero has no payment void), finding
+"ours" exactly as `post_payment` does, by `GET Payments` on our `Reference` for
+this bill, live ones only, never only among the bill's own `Payments`: two
+definitions would let a payment one sees go undeleted by the other. A
+reconciled one is refused by Xero and flagged.
+
+**Decision — the audit findings.**
+
+- **X1.** The vendor walk read `IsSupplier==true`, which Xero sets only once a
+  contact has a bill (and the API cannot set), so a new supplier was never
+  synced and its first push refused `vendor_not_linked` for good. It now reads
+  `IsSupplier==true OR IsCustomer==false`; customer-only contacts stay out. A
+  customer who becomes a supplier with no bill or PO is still missed (a
+  follow-up), and the opt-in live contract check asserts the OR is honoured.
+- **X2.** A bill create Xero refuses (HTTP 400 `ValidationException`,
+  `ErrorNumber: 10`, nothing created) is coded from facts read back, never
+  from its `Message` (which quotes the bill): contact not `ACTIVE` →
+  `vendor_inactive`; a line's account not `ACTIVE` → `account_inactive` with
+  our GL codes; dated on or before `PeriodLockDate` / `EndOfYearLockDate` →
+  `period_closed`. All non-retryable and `not_posted`, the codes QuickBooks uses
+  (§285). An unexplained validation failure is the plain failure, still
+  `not_posted`; anything but a ValidationException may have posted, as before.
+- **X3.** A contact is active only when `ContactStatus == ACTIVE`: `ARCHIVED`
+  and `GDPRREQUEST` (erased on request) are not payees.
+- **X4.** An account is active only when `Status == ACTIVE`: `DELETED` read as
+  active before.
+- **X5.** The documented "5,000 calls a day" holds only on Xero's Core tier and
+  above; the default Starter tier allows 1,000 per organisation and 5
+  connections. The adapter's references and the docs say so; moving the
+  platform app to Core before a sixth tenant is the operator step in #654.
+
+**Not verified live.** Everything above is against the published API, a
+stateful double (`test_xero_status_sync_adapter.py`) and fake-erp. Unconfirmed
+until a Demo Company pass (#654): the `If-Modified-Since` format Xero accepts,
+that `GET Payments` lists deleted payments, that a bill's own `Payments` array
+carries each payment's `Reference` (our marker; `report_from_bill` relies on
+it, `void_payment` no longer does), the `X-Rate-Limit-Problem` values, the `OR`
+filter, and the ValidationException body for each refusal.
+
+**Accepted residual.** A payment someone keys in Xero with our exact marker text
+(`FeohLedger payment <uuid>`) reads as ours. Checking the id against this
+invoice's payments would need a tenant read inside the adapter's report; the
+marker is a UUID nobody types by accident.
+
+Tests: `tests/test_xero_status_sync_adapter.py` (`bill_report`,
+`changed_bills`, `bills_for_payment`, `post_payment` idempotency and refusals,
+`void_payment` by the same lookup as the post, the fail-closed currency, the
+minute-limit wait, the paid amount, our write-back and the outside reduction on
+the report);
+`tests/test_erp_xero_adapter.py` (X1–X4); the Xero section of
+`tests/test_erp_status_sync.py` (real rows: recorded at Xero's amount, a
+mismatch kept and blocking and the one-click refused, another currency
+refused or none stated, §309's live claim named before a currency mismatch,
+the one-click refusing a currency-less figure, a credit after our discounted
+payment not paid twice, while a credit our write-back never reached, one past
+the discount and one after an undiscounted payment are,
+matched only in the recorded organisation, a hand-keyed bill and a realm-less
+push's bill never read, the
+sweep covers Xero, the on-request refusals, single-flight and its audit); `tests/test_erp_oauth.py` § status sync on request;
+`tests/test_erp_payment_writeback.py` (the discount on the balance flag);
+`tests/test_qbo_status_sync_adapter.py` (the QuickBooks write-back's
+fail-closed currency).
+
+## 387. The bulk-status endpoint's own skips are coded, reusing codes where the meaning is the same
+
+`POST /api/invoices/bulk/status` wrote seven skip sentences itself, in English
+only, beside rows its services already coded (§357, `_refused_skip`). Each now
+goes through `_coded_skip(coded_refusal(...))`, so the invoice list's toast
+(`localizeApiDetail` per row) states every row in the reader's language.
+
+- **Reused where the sentence means the same thing:** an entry-only caller's
+  source → `invoice_entry_window_closed` (`params.status`); a stale version →
+  `invoice_stale_approval` (it was the seventh uncoded skip, not in the
+  follow-up's list); blank fields → `invoice_required_fields_missing`
+  (`params.fields`).
+- **New, in `api/invoices.py`:** `invoice_bulk_not_found`,
+  `invoice_status_immutable` (`params.status`, the `invoice_not_completable`
+  shape, named by its label), `invoice_still_extracting`,
+  `invoice_recall_one_at_a_time`. Not reused: `invoice_not_completable` says
+  "only new or approved can be completed", which is false for an immutable row
+  under a non-`done` target; `invoice_transition_recall_only` is the engine's
+  edge refusal and needs `params.target`, while the bulk recall skip is the
+  endpoint declining before any edge is tried.
+- **Other bulk endpoints left uncoded on purpose:** vendors `/bulk/status` and
+  `/bulk/screen`, exceptions bulk resolve, expenses `/bulk/gl-code` write
+  English (or machine) `reason`s, but no page renders them — their toasts show
+  counts only — so coding them would add codes nobody states. The expenses
+  toast's own English splice is a follow-up.
+
+Guards: `tests/test_bulk_status_controls.py::test_every_skip_the_bulk_endpoint_writes_itself_is_coded`
+(no bare `BulkStatusSkip(` in the endpoint body) and the exact-row tests;
+`codedRefusals.test.ts` reverse-pins the codes in `api/invoices.py`.
+
+## 389. A receipt its own approver records after approving does not release the invoice (§267 follow-up, migration 0129, 2026-11-13)
+
+**The gap.** §267 refuses a receiver at approval. The reverse order was open:
+a manager approves an invoice held "billed beyond receipt", then records the
+goods receipt that lifts the hold, and the payment run pays it. One person
+both signed the invoice and counted the delivery in. `receipts_clear_hold`
+(and the agent coordinator's `_receipts_implicated`, which reads it) measured a
+recorder against the implicated set only, and nothing recorded a single-level
+approver by id: `approved_by` is a display name, and the audit log is not
+local under `FEOH_AUDIT_MODE=lambda` when the refresh runs. A chain's level
+approvals were already recorded by id in its state.
+
+**The two options, and the one taken.** The follow-up offered refusing the
+recorder at the receipt door, or letting the receipt stand but not count
+towards that invoice's hold. The hold is the fail-closed one, so it was
+chosen:
+
+- *It holds in any order of events.* The door sees only receipts recorded
+  after an approval through itself; the hold is re-asked at every refresh, so
+  it also catches a `po_number` re-pointed after approval onto a PO the
+  approver had already received, and a level approver whose chain is still
+  open.
+- *It refuses nothing that is true.* A receipt serves every invoice on its PO.
+  Refused at the door, an approver of one invoice could not book a delivery
+  for any of them, and the PO's other invoices, and the commerce sync, would
+  wait on someone else typing in a fact. Recorded, it counts towards the 3-way
+  leg and lifts the holds of every invoice its recorder did not approve; it is
+  only not evidence that releases their own approval.
+- *A wrong input leaves a hold for a person*, never a payment.
+
+**One rule, read in both orders.** `approval_chain.receiving_conflicts(
+receipt_recorders, approvers)` is the intersection. The approval door passes
+the would-be approver (`violates_receiving_segregation` now calls it); the
+hold passes the invoice's recorded approvers (`receiving_conflict_on`, read by
+`receipts_clear_hold` after its §262 check). The receipt side is always
+`receipt_recorders`, the approval door's own set (live, `manual`, a named
+recorder, every PO the invoice names, its own entity), so the two orders
+cannot disagree about which receipts count. The approval step's
+`require_segregation: false` lifts both, as §267 said. The queue's
+`settings.exceptions.require_segregation: false` also lifts the reverse order,
+because it switches off the auto-close's segregation limits altogether and the
+queue then lets anyone clear the row by hand: holding it in the auto-close
+would be a refusal nothing enforces, which is §267's own argument for not
+refusing receivers at the queue. The hold is read only when a `po_mismatch`
+row is open, so a refresh with nothing to release pays no extra queries.
+
+**The two orders serialise.** Without that, one person could send the approval
+and the receipt at once: the approval reads no receipt yet, the receipt's
+re-match reads the invoice as not yet approved, and both commit. Every human
+approval door already locks the invoice row (single and bulk approve, the
+email / Slack / Teams links, `/complete`), so the receipt's re-match now takes
+the invoices citing its PO `FOR UPDATE`, in id order, before re-reading them
+(`refresh_invoices_citing_pos(lock_invoices=True)`, set only by receipt entry).
+Whichever commits second sees the other. There is no lock cycle: the receipt
+holds its PO and then the invoices; the approval holds the invoice and reads
+receipts without a lock. The batch callers (QMS, ERP PO sync) do not lock: the
+ERP sync never clears a hold (§323), and neither adds a hand-typed receipt.
+The exception agents approve without the invoice lock; they act for the human
+who triggered the run, re-check `receipts_clear_hold` themselves, and a
+concurrent receipt by that same human is the residue left there.
+
+**Who approved, by id.** `approved_by` and the chain state were checked first.
+The chain state records every level approver by id and is reset exactly where
+an approval stops being in force (reject, recall), so it is read as is. A
+single-level approval recorded no id anywhere local, so migration 0129 adds
+`invoices.approved_by_user_id` (uuid, no FK). `approval_chain.
+record_final_approval` is now the one writer of an invoice's `approval_date`,
+`approved_by` and the id together (a source-scan test fails on any other
+write under `app/`, so a fourth approval site cannot set the display fields
+and forget the id); it is called at each of the three final approval sites: the
+approving person (`review.approve_invoice`, every door); `/complete`'s amount
+floor, whose caller §267 already treats as the effective approver; and
+extraction's auto-approve, whose reader asked for the approving read (§268).
+The nil-UUID system actor and NULL stamp NULL, never a sentinel a comparison
+could match. `approver_ids` is the stamp ∪ every chain approval.
+
+**A recall keeps the stamp**, as it keeps `approved_by` (§374): the next
+approval replaces it. A receipt the recalled approver types in meanwhile still
+does not release the invoice; once someone else approves, the hold is
+re-judged against them at the next refresh. That can leave a hold for a person
+a little longer than strictly needed, which is the safe error.
+
+**History is filled from evidence only (§141, §367).** The invoice's approval
+of record already names its approver: every final approval writes
+`invoice.approved` or `invoice.auto_approved` with the actor in the same
+transaction as `approved_by`, and `audit_log` is append-only. 0129 copies the
+actor of the latest such row (the one `approved_by` names, since each approval
+overwrites it), only when that row is alone at its instant and names a person
+of the invoice's organization, on invoices approved and not `done`. An earlier
+row is never a fallback for a latest one that names nobody. An invoice is only
+approved twice through a recall, and under `FEOH_AUDIT_MODE=lambda` a row's
+`created_at` is when the worker inserted it, not when the approval happened, so
+once a recall is on the record and two different people approved, nothing is
+stamped: "latest" is trusted only when there is nobody else it could have
+meant. **The backfill runs once.** An approval given by the previous release
+while the migration runs (before the new code serves) is not stamped and reads
+as "no approver known"; `BACKFILL_SQL` only fills NULLs and can be re-run
+safely after the deploy if that window mattered. No audit row is
+written for it: the column restates the row it was read from (0126's
+`decided_by_user_id` reasoning). What stays NULL, an unattended
+auto-approval or an approval whose row is missing, has nobody to refuse, and
+the receipt rule reads it as before.
+
+**What an independent person does.** The held row says the delivery has not
+been vouched for by anyone outside the approval. Either the approver's receipt
+is cancelled (cancelling can only raise a hold, so anyone with receipt entry
+may) and someone else records the delivery, which lifts the hold in that
+request; or someone else checks the delivery and resolves the row in the queue.
+
+**Left open** (`docs/followups.md`): the queue does not refuse the approver of
+record resolving the held `po_mismatch` by hand. `segregation_refusal` refuses
+the implicated set and the raiser, and §169 deliberately left approvers able to
+clear; adding an approver axis widens that policy for every door the predicate
+serves, so it is tracked rather than slipped in here.
+
+**Rejected:**
+- *Stamping the approver into `segregation_actor_ids`.* That set is who shaped
+  the payable's terms; it would refuse the approver their own re-approval
+  after a recall, which §374 allows.
+- *Failing closed on a NULL approver of a human approval.* NULL cannot tell an
+  unattended auto-approval from an unrecorded person without parsing the
+  display name, and refusing every auto-approved invoice's receipts would make
+  that channel's holds permanently manual.
+- *Reading the audit log at refresh time.* It fails open in lambda mode,
+  which is why the column exists.
+
+Tests: `tests/test_goods_receipt_entry.py` (approve then receipt holds; an
+independent recorder releases; cancel and re-record by someone else releases;
+one receipt over two invoices holds only its recorder's; a chain level
+approver; the approval-step and the queue opt-outs; an approval naming nobody;
+approving and receiving at once);
+`tests/test_approval_receiver_segregation.py` (receipt then approve still 403;
+the door and the floor stamp the approver; `receiving_conflicts`,
+`stamp_approver`, `approver_ids`; `record_final_approval` is the only writer); `tests/test_exception_agent_receipt_segregation.py`
+(the agent escalates on the approver's receipt, clears on an independent one);
+`tests/test_invoice_recall_approval.py` (the stamp survives a recall);
+`tests/test_invoice_clerk_entry.py` (extraction's auto-approve stamps its
+reader); `tests/test_migration_0129_invoice_approver_id.py` (literals pinned to
+the app, chain, parity, each backfill case including the two recall cases,
+idempotence, Alembic on a tenant and on the control plane).
+
+## 390. Sage Business Cloud Accounting (UK) reads paid from its allocations and codes a refused create (#655, drafted 2026-10-23, landed 2026-11-13)
+
+**Found by a docs-versus-code audit, before any live test** (the v3.1 Swagger
+Sage publishes, vendored at `github.com/nook-io/python-sage/openapi.json`, since
+developer.sage.com refuses automated reads). The v3.1 adapter
+(`erp_adapters/sage_accounting.py`) had been left out of §303 and §285.
+
+**Paid (§303's table gains a row).** Sage sets a purchase invoice `PAID` when a
+credit note is allocated to it as well as when it is paid, and `total_paid`
+"includes any payments, allocations and discounts", so neither says money left.
+Each `payments_allocations` entry names what it is: a payment carries
+`contact_payment`, a credit note or other contact allocation carries
+`contact_allocation`. So:
+
+| Adapter | `paid` when | Nothing owing otherwise |
+|---|---|---|
+| Sage Business Cloud Accounting (v3.1) | `status == PAID` and an allocation with a `contact_payment` (not a `negative_payment`), read with `show_payments_allocations=true` | `settled_no_payment` |
+
+`PART_PAID` is `partially_paid` on the same test and `open` when only credit has
+reduced it: nothing has been paid and money is still owed.
+
+**This is a read, not status sync, and it records no money.** Sage UK keeps
+`supports_status_sync = False`: the port adds no `bill_report`, no
+`changed_bills` and no write-back, a push still closes at `done`, and nothing
+under `app/` calls `get_invoice_status` to record a payment. So §386's rule
+(record only the ERP's stated cash figure, refuse an amount or currency that
+disagrees with what is owed here) has nothing to apply to yet, and nothing here
+contradicts it. When Sage UK gets status sync (the open `docs/followups.md`
+entry "A bill paid in an ERP other than QuickBooks or Xero"), the report must
+follow Xero's shape: `paid_amount` is the sum of the `contact_payment`
+allocations, in the invoice's `currency`, set only when payments alone settled
+it; a bill settled partly by credit reads `paid` here but states no cash
+figure, so `record_invoice_paid_outside` refuses it rather than book what is
+owed.
+
+**A refused create is coded and marked as having created nothing (§285).** Any
+4xx a re-send cannot change (`base.erp_status_retryable` is False) means Sage
+saved nothing, so the result is non-retryable with `not_posted=True`, and
+`services/erp` no longer flags the attempt possibly posted. Sage's own
+`$dataCode` values are undocumented and its `$message` echoes the submitted
+fields, so neither is read. The adapter instead reads back what the Swagger
+documents, in this order: `financial_settings.year_end_lockdown_date` on or
+after the invoice date → `period_closed`; a foreign currency with
+`multi_currency_enabled: false` → `currency_not_enabled`; the contact 404, or
+carrying `deleted_at` / `gdpr_obfuscated` → `vendor_inactive`; a line's ledger
+404 or `included_in_chart: false` → `account_inactive`, naming our codes;
+anything else → the shared `bill_refused` §385 added. A read that fails is "don't
+know", never "inactive". 5xx, 401, 429 and timeouts stay retryable and unknown.
+The lockdown check runs only after a refusal rather than before every push: it
+would spend one of Sage's per-minute calls on every push to save a create Sage
+refuses anyway.
+
+**Accounting Start cannot create purchase invoices.** The Swagger's Endpoint
+Availability lists `POST` / `DELETE purchase_invoices` for Accounting Plus and
+Standard only (GET works on Start). Nothing in the v3.1 Accounting API reports
+the plan, so it cannot be refused before a push or at test-connection time: a
+Start business connects, syncs and tests green. A 403 from the create is coded
+`purchases_not_permitted`, whose sentence names both causes (the plan, or a
+user without Purchases access), since both answer 403. Which status Sage really
+returns for Start is a sandbox question (#654).
+
+**The chart keeps what it used to drop (§284).** Ledgers out of the chart were
+skipped, so a row linked to one read as a dead link and was unlinked while the
+ledger still existed. They are now emitted `active=False`, as are control
+accounts (`is_control_account`), which Sage reserves for its own postings.
+`show_included_in_chart`'s default is undocumented, so the chart is read once
+with each value and joined by id. A GDPR-obfuscated contact is emitted inactive.
+
+**Also corrected.** v3.1 has no purchase-order resource at all, on any plan (the
+old comment said "not on every plan"), and the purchase `DELETE` takes no
+parameters, so whether `void_reason` is honoured there is a sandbox question too.
+
+Fake-erp now behaves the same way (lockdown, deleted contact, out-of-chart
+ledger and multi-currency refusals as Sage's 422 error array; a Start plan's
+403; allocations returned only on request; out-of-chart and control ledgers; an
+obfuscated contact), and the code before this change fails against it.
+
+**Porting note.** Drafted as §320 on `fix/erp-sage-accounting` (`f4698c72`)
+and renumbered on landing (§320 was taken). Its own `bill_refused`
+registration was dropped: §385 had already added the code to
+`base.ERP_REFUSAL_CODES`, `erpRefusals.ts` and the six locales.
+
+Tests: `backend/tests/test_erp_sage_accounting_adapter.py`,
+`frontend/tests-e2e/erp/sage-accounting.spec.ts` (lockdown → `period_closed`,
+Start → `purchases_not_permitted`), `frontend/src/lib/api/erpRefusals.test.ts`.
+
+## 391. Business Central posts on its own duplicate key, reprices only its own VAT draft, and reads the posted total back (issue #655 BC, drafted 2026-10-23, landed 2026-11-14)
+
+**Context.** The 2026-10-23 docs-versus-code audit of
+`erp_adapters/dynamics_365_bc.py` found the adapter would fail its first live
+push: the pre-create idempotency lookup filtered `purchaseInvoices` on
+`externalDocumentNumber`, which API v2.0's purchaseInvoice does not have (it
+is a salesInvoice field;
+https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_purchaseinvoice).
+Three `docs/followups.md` entries were open against the same adapter: a
+VAT-registered company could not post at all, a draft edited in BC between our
+total check and our post was booked unchecked, and the vendor sync stored the
+`paymentTermsId` GUID as the terms text. BC's `blocked` / `directPosting` were
+not read as inactive. The fix was drafted on `fix/erp-bc-netsuite` and ported
+onto main after #670, which had since introduced `tax_not_itemised` and
+`posted_total_mismatch` as shared codes.
+
+**Decision.**
+- **The lookup key is BC's own duplicate key**: `vendorId` and
+  `vendorInvoiceNumber`, upper-cased (it is a `Code[35]` field) with a quote
+  doubled. More than one hit refuses `duplicate_document_number`; an invoice
+  number over 35 characters refuses `doc_number_too_long` before any call.
+  `company_id` and `vendor_erp_id` must be GUIDs, since both are spliced into a
+  URL or a `$filter`.
+- **What the lookup finds is never deleted, so never repriced.** The new key
+  also catches the same bill keyed by hand in BC. A found draft at the
+  approved total is posted; at any other total it is refused
+  `posted_total_mismatch` and left in BC with the message saying so. The
+  drafted branch repriced a found gross draft taxed on top (a DELETE first);
+  the port does not, because it cannot tell our lost-response draft from a BC
+  user's; for the same reason a coded post refusal (`period_closed`, say) of
+  a found draft leaves it in BC. The cost: a VAT-company push whose create
+  response, or the read after it, was lost needs its draft removed in BC
+  before the retry. Accepted, because the alternative deletes a person's work
+  silently; the failed read names the draft so the push records it as an
+  orphan, and recognising that recorded id as ours is a follow-up.
+  *Amended by §397:* a found draft with the id our own create recorded, still
+  exactly what we sent, is ours and is repriced or deleted as a fresh one;
+  every other found draft is still never touched.
+  *Amended by §403:* any record, found or created, whose `payToVendorId` is
+  another vendor's is refused `pay_to_vendor_differs` whatever its total.
+- **A found `Paid` invoice is refused, not reported posted**
+  (`existing_invoice_not_open`). With the new key it may be the same bill
+  keyed and paid by hand in BC, perhaps before or without our approval. BC
+  has no status sync, so success would close the invoice at `done` as though
+  our push had created the bill: linked to a document FeohLedger never sent,
+  with a payment made in BC recorded nowhere here (no payment row, no 1099
+  line) and nobody asked to reconcile it. (A first draft of this entry said
+  success would send it to our payment run; that holds only for an ERP whose
+  bills sync back, which BC's do not.) A found `Open` one at the approved
+  total is the idempotent success it always was. A lookup BC answers 200
+  with no readable collection is a retryable failure, never a miss.
+- **A found invoice must also be in the invoice's currency** (money-path
+  review). Matching the figure says nothing across currencies: a hand-keyed
+  1,000.00 EUR bill is not the approved 1,000.00 USD one. A draft we create
+  carries the invoice's `currencyCode`; one the lookup finds may be a BC
+  user's in any. So before a found `Open` / `Paid` invoice is reported posted,
+  and before a found draft is posted, its `currencyCode` must equal the
+  invoice's. BC leaves the code blank for the company's local currency
+  (LCY), and that blank is read as the company's LCY
+  (`GET companies({id})/companyInformation`, whose `currencyCode` API v2.0
+  documents; read as one object or a one-row collection), never assumed.
+  A difference, or an LCY BC does not state, is `posted_total_mismatch` with
+  the record left in BC (a currency-specific code exists only as Blackbaud's
+  `currency_mismatch`, whose sentence names the ledger currency, which is not
+  the fault here); a failed LCY read is retryable. Only found records are
+  checked: the read costs one call, and only where the currency is not ours.
+- **A VAT company gets one net reprice of a draft we created.** When the gross
+  draft's `totalAmountExcludingTax` is the approved amount and BC added
+  non-zero tax (`pricesIncludeTax` false), that draft is deleted (real etag,
+  never `*`) and one is created at each line's net from
+  `bill_allocation.allocate_bill_lines`. It goes through the same total check
+  and is never repriced again. **Reconciling with #670:** `tax_not_itemised`
+  keeps #670's meaning — the invoice gives no exact per-line tax, so a split
+  would be invented — and BC raises it only in the one case that matters for
+  BC: a taxed company and several tax-inclusive lines with header-only tax. An
+  untaxed BC company still posts those lines at their gross, which is exact.
+  `posted_total_mismatch` keeps its base meaning (the ERP's own total differs
+  from the approved one) for every BC outcome: a rate other than the
+  supplier's, a draft edited in BC, an untaxed invoice that BC taxes. No new
+  code was minted for either.
+- **The posted invoice is read back** at the same id (BC carries a draft's id
+  to the posted invoice in the API). A different total is
+  `posted_total_mismatch` with the posted invoice left for an accountant's
+  corrective credit memo; a failed read is retryable, since the retry's
+  lookup finds the posted invoice and checks it.
+- **Refusals are coded from facts** (§285's rule): vendor blocked `All` or
+  gone → `vendor_inactive`; an account blocked, not direct-posting or gone →
+  `account_inactive` with our codes; BC's allowed-posting-dates dialog →
+  `period_closed`. A refused create is `not_posted`; a coded post refusal
+  deletes the draft first.
+- **Listings read inactive as inactive.** A vendor `blocked` `Payment` or
+  `All` is `active=False` (a vendor BC will not pay is not one our runs pay);
+  a Posting account with `directPosting: false` is `active=False`. Payment
+  terms are the expanded `paymentTerm.code`, never the GUID. `Corrective`
+  status maps to `unknown`, not `cancelled`: it is a live document BC made by
+  cancelling a credit memo, never one we pushed.
+
+**Left open.** BC purchase-approval workflows (an invoice left `In Review`,
+refused `existing_invoice_not_open`) need a product decision — submit for
+approval and poll, or support only companies without workflows — and stay in
+`docs/followups.md`. NetSuite's N1–N5 from the same branch are a separate,
+unstarted lane. Nothing here has run against a live BC tenant (#654).
+
+**Rejected:**
+- *Keeping `externalDocumentNumber`.* The filter is refused by BC on every
+  push.
+- *Pro-rating a header-only tax across tax-inclusive lines* to get a net per
+  line. It invents a split the supplier never stated (`erp_adapters/bill_allocation.py`).
+- *Repricing again after a second mismatch.* There is no rate to converge to;
+  it loops.
+- *Deleting a posted invoice whose total moved.* Reversing a posted document
+  is an accountant's corrective credit memo in BC.
+
+Tests: `tests/test_erp_adapter_idempotency.py` (the lookup filter, several
+hits, an unreadable lookup, the GUID and length preflights, the VAT reprice
+and its refusals, a found taxed draft left not repriced, a found Paid invoice
+refused, a found draft's coded post refusal left in BC, the post read-back, coded create and post
+refusals, `Corrective` → unknown; a found Open or draft invoice in EUR refused,
+a found blank-code one accepted in the company's LCY and refused against
+another or an unstated LCY, a failed LCY read retryable); `tests/test_erp_adapter_money_exact.py`;
+`tests/test_erp_vendor_sync_adapter.py` (terms code, blocked vendor);
+`tests/test_erp_gl_sync.py` (`directPosting`);
+`tests/test_erp_base_url_overrides.py`; `tests/test_erp_adapter_error_pii.py`;
+`frontend/tests-e2e/erp/dynamics.spec.ts` (VAT net post, edited-draft
+refusal, terms code, against fake-erp; the VAT net post's invoice number is
+kept inside BC's `Code[35]`, since a longer one was correctly refused
+`doc_number_too_long` before any call). fake-erp answers `companyInformation`
+with a USD LCY.
+
+## 392. Xero's invoice webhook answers in Xero's own codes, and the ERP panel can check payments now (§386 follow-ups, 2026-11-14)
+
+**Context.** §386 made Xero's bills sync back, through the sweep and an admin's
+`POST /api/organization/erp/oauth/status-sync`, and left two follow-ups: no
+Xero webhook, so a bill paid in Xero waited for the next tick; and no button
+for the on-request pass, which was API-only.
+
+**Decision — the webhook.** `POST /api/erp/webhook/xero`
+(`api/erp_webhook.xero_webhook`, the work in `services/erp_xero_webhook`).
+Xero's webhook documentation could not be fetched (the developer site refused
+automated reads); the protocol below is from Xero's published AsyncAPI
+description and integrators' guides, and the live check is the operator step
+in `docs/followups.md`.
+
+- **Verified first, with one platform key.** `x-xero-signature` is the base64
+  HMAC-SHA256 of the raw body under the app's webhook key
+  (`FEOH_ERP_XERO_WEBHOOK_KEY`, sops; `.env.development` carries
+  `dev-xero-webhook-key`, as it does QuickBooks' verifier token). Checked with
+  `webhook_security.verify_hmac_sha256_base64`, the QuickBooks route's helper,
+  before the body is parsed. An empty key refuses every delivery: no fallback.
+- **The answers are Xero's, not the generic route's silent 204.** Xero enables
+  a webhook only after its intent-to-receive check: a correctly signed
+  delivery with no events must answer 200 and an incorrectly signed one 401,
+  both with no body, and anything else (a 204 included) fails it. It keeps
+  sending such checks, so a route that answered 204 to a bad signature would
+  be switched off. So: **401** for every unverifiable delivery (no key, a body
+  past `FEOH_ERP_WEBHOOK_MAX_BYTES`, a bad or missing signature) and a
+  bodyless **200** for every verified one, whatever it then decided (not
+  JSON, an unknown organisation, a duplicate, an applied event). The
+  invariant's purpose holds: the 401 says only "not signed with the one
+  platform key", which names no tenant and no invoice, and every
+  post-verification decision answers identically. Our own failure (the dedup
+  store down) is the bodyless 503 the other webhooks use, so Xero redelivers.
+- **Deduped by the event's own identity.** Xero sends no event id. An event is
+  keyed by the SHA-256 of what it states about itself (`tenantId`,
+  `eventCategory`, `eventType`, `resourceId`, `eventDateUtc`), which a
+  redelivery repeats; two changes to one bill differ in time. It is claimed
+  (`is_event_already_processed`, namespace `erp:xero`) before the answer, and
+  a failed event's claim is released after it, as QuickBooks' are. Rejected:
+  `firstEventSequence` (it numbers a delivery, not an event, and its
+  uniqueness is not published) and `resourceId` alone (it would swallow every
+  later change to the bill for the dedup TTL).
+- **The tenant is the one connected to the event's organisation, fail
+  closed.** `tenantId` goes through `erp_status_sync.org_for_company("xero",
+  …)`, the control-plane index on the stored connection (migration 0117),
+  which also requires the tenant still be on Xero. No connection, or another
+  ERP, is a silent no-op; the bill id alone never picks a tenant.
+- **One rule decides.** A tenant the sweep or the on-request pass would skip
+  (`status_sync_now_refusal`: status sync off, an unsupported ERP, a
+  connection that needs reconnecting) is skipped. Otherwise the event's
+  `resourceId` goes to `erp_status_sync.sync_bills`, the sweep's per-bill
+  path, unchanged: it reads only a bill an invoice here was pushed as in that
+  organisation (`_bills_we_posted`), so a sales invoice or a hand-keyed bill
+  costs no Xero call, and `apply_bill_report` decides exactly as it does for
+  a sweep tick. Only `INVOICE` events are read; `CONTACT`, `CREDITNOTE` and
+  application events are dropped, as is an event whose `tenantType` is not
+  `ORGANISATION`.
+- **After the response.** Xero wants its answer within five seconds, and an
+  event costs one to three reads (§386's minute-limit wait included), so the
+  claimed events run as a task on the request's loop
+  (`dispatch_xero_events`, the `dispatch_qbo_events` shape). The sweep stays
+  the backstop for anything a failed or lost event misses.
+- **fake-erp signs what Xero would send.** `tools/fake-erp/xero_webhooks.py`
+  (stdlib only) builds Xero's envelope and signs it with the dev key; `POST
+  /xero/api.xro/2.0/__webhook` returns `{body, signature}` for a spec to POST
+  (the fake never calls the backend), and the backend's tests load the module
+  in-process to prove the route accepts what it signs.
+
+**Decision — "Check payments now".** `GET /api/organization/erp/oauth/status`
+now states the on-request pass's verdict, `status_sync_available` and
+`status_sync_refusal` (the POST's 409 code), computed by
+`status_sync_now_refusal`, the rule the POST applies; a credential store that
+cannot be opened reads as unavailable with no code. `ErpConnectionPanel`
+offers the button only on a connected ERP while that verdict says a pass would
+run, so it never shows on a server with status sync off or an ERP that does
+not report back. The click's answer lands in the panel's live region: 202
+`started` or "already running", or the coded refusal in the reader's language
+(the limiter's `rate_limited` with how long to wait; the three
+`status_sync_*` codes, now in `api/codedRefusals.ts` and every locale), after
+which a 409 re-reads the status so the button follows the new verdict. A
+server verdict was chosen over showing the button everywhere and letting the
+409 explain: the three refusals are facts the admin cannot act on from this
+panel (the operator's flag, the ERP's capability) or already sees there (the
+reconnect state), §382's reasoning for the bank-file panel.
+
+**The QuickBooks webhook keeps both rules too (amended, round 8).** Two of
+the Xero rules above were new, and `POST /api/erp/webhook/quickbooks` lagged
+them. Now `erp_status_sync.claim_qbo_events` releases the claims it already
+made and re-raises when the dedup store fails partway through a delivery
+(the route's 503 dispatches nothing, so a kept claim would dedupe Intuit's
+redelivery away), and `process_qbo_event` skips a tenant
+`status_sync_now_refusal` refuses before any QuickBooks read (with status
+sync off a push closes the invoice at `done`, and `apply_bill_report` would
+otherwise open an `erp_reconciliation` on it for a bill deleted there). The
+rule is called, not restated: the adapter's own `supports_status_sync` check
+in the handler went with it. QuickBooks' answers are unchanged: a silent 204
+for every rejection, since Intuit runs no handshake. Tests:
+`tests/test_qbo_webhook.py` (a mid-delivery failure releasing only its own
+claims, every refusal skipped for bill and bill-payment events, and on real
+rows a `done` invoice left untouched with status sync off beside the same
+delivery reaching it with sync on).
+
+**Not verified live.** That paying a bill in Xero raises an `INVOICE` UPDATE
+for it (a payment has no category of its own), that `eventDateUtc` repeats
+exactly on a retry, that every delivery carries `tenantType`, and the exact
+intent-to-receive rules, are from the published description, not a Demo
+Company pass (`docs/followups.md` (b)).
+
+Tests: `tests/test_xero_webhook.py` (the signature, raw-byte coverage, no key,
+an oversized body, the handshake's 200 and 401 with no body, the dedup store
+down, parsing, the event key, dedupe, a failed event's release, an unknown
+organisation, every skip refusal, real rows: a bill paid in Xero reaching
+`paid` at Xero's amount through the webhook, a hand-keyed bill and another
+organisation's event reading nothing, status sync off, and fake-erp's signed
+delivery verifying); `tests/test_rbac.py` (the route's alternate gate);
+`tests/test_erp_oauth.py` (the status verdict, and an unreadable one);
+`src/lib/types/erpConnection.test.ts` (`statusSyncNowOffered`,
+`statusSyncStartedKey`, the strings in every locale);
+`src/lib/api/codedRefusals.test.ts` (the three codes);
+`tests-e2e/erp/xero-status-sync.spec.ts` (the webhook against fake-erp, a
+forged delivery, the handshake, the panel's button).
+
+## 393. QuickBooks' bills are recorded at the cash QuickBooks shows, as Xero's are (follow-up of §386, 2026-11-14)
+
+**The gap.** §386 made Xero's report state the cash a person paid outside us
+(`ErpBillReport.paid_amount`), so a payment that is not what the invoice owes
+here is refused `amount_mismatch` and kept, blocking, for a person. QuickBooks'
+`bill_report` stated no amount, so the ERP-paid path booked FeohLedger's own
+figure. A bill paid in full in QuickBooks while a credit memo or an
+early-payment discount applied only here was recorded at the smaller figure, as
+money that left, and the difference vanished from the ledger.
+
+**The rule.** `QuickBooksOnlineAdapter.bill_report` states `paid_amount` and
+`paid_currency` on exactly Xero's condition: a bill `paid`, reduced outside us,
+not `settled_by_credit`, and no write-back of ours on it.
+
+- **The figure is what the lines applied to this bill.** It is the sum of
+  `_applied_to(payment, bill)` over the person's cash BillPayments
+  (`_is_cash_payment`, §317), never a payment's `TotalAmt`, because one
+  BillPayment can pay several bills.
+- **The currency is the bill's `CurrencyRef`.** QuickBooks states it on every
+  bill, the home currency included, which `post_payment` already relies on. It
+  is None when the bill states none, or when a cash payment states another
+  currency. The sync refuses None as a mismatch and never compares a bare
+  number (§386).
+- **§303's paid-versus-credited rule is unchanged.** Any vendor credit, journal
+  entry or unreadable reduction beside the cash makes the bill
+  `settled_by_credit`, so no amount is stated and the bill blocks as a credit
+  settlement. A cheque and a card together are both cash, so the figure is
+  their sum.
+- **No one rail, no rail.** A bill paid part by cheque and part by card had
+  the later payment's rail stand for the whole figure. It is now not stated,
+  which counts as 1099-reportable. One `Payment` row cannot hold two rails, and
+  the conservative reading is the one §303 already takes for an unstated rail.
+  The cost is an over-report: the card part lands on the payer's 1099-NEC
+  although the card settlement entity reports it on a 1099-K, and nothing
+  records the split yet. Before, the later payment's rail stood for the whole
+  figure and could leave a cheque off the 1099. Keeping the split, and Xero's
+  same latest-rail shape, are tracked in `docs/followups.md`.
+- **Our own live write-back beside outside cash blocks.** QuickBooks now states
+  `our_payment_applied`, as Xero does. When it is set, the outside reduction is
+  real, no amount is stated, and the invoice is payable here, the sync opens a
+  blocking `payment_reconciliation` (`erp_partly_paid_outside`) and books
+  nothing. That only happens after a void here whose ERP void did not land.
+  Before, such a bill was recorded at the whole owed figure although only the
+  outside part left (the money-path review's example: our 245.00 still standing,
+  a 5.00 cheque, 250.00 booked as cash). The branch is in the shared path, so
+  Xero gets it too.
+
+**One path.** Nothing in `erp_status_sync` or `external_payment` names
+QuickBooks. `apply_bill_report` already passed `report.paid_amount` /
+`paid_currency` to `record_erp_reported_payment`, and the amount and currency
+checks in `record_invoice_paid_outside` run after §309's live-claim
+refusals, so the webhook, the sweep, the re-attempt (§319) and the one-click
+record all apply the QuickBooks figure the way they apply Xero's.
+`amount_mismatch` is in `DOUBLE_PAY_REFUSALS`, so the row blocks.
+
+**Rows kept before this change are read again (money-path review).** Every
+QuickBooks `paid_not_recorded` row written before §393 carries `amount: None`,
+and prod has QuickBooks status sync on, so such rows exist. The re-attempt and
+the one-click passed that None on, and `record_invoice_paid_outside` booked
+what is owed here: a 10.00 credit memo applied only here, a bill QuickBooks
+shows paid 250.00 by cheque, and 240.00 booked as cash. Now a row that states no
+figure, from an ERP whose bills read back (`status_sync_adapter_keys`), is never
+booked as it stands. Under the invoice lock the caller already holds, the bill
+is read again through the dispatch check's own connection rules and bound
+(`read_back_unstated_figure`: the row's ERP is the one connected, the invoice
+names its bill and company, that company is the connected one), and only a
+`paid_amount` the bill states now goes to the record, whose amount and currency
+checks then refuse a mismatch as they would a fresh report (blocking). A read
+that fails, or that states no figure (part-paid since, credit-settled, another
+company), re-raises the row as a blocking `payment_reconciliation`
+(`hold_unconfirmed_erp_payment`, `refusal_code: erp_paid_amount_unconfirmed`)
+with the existing `erp_paid_retry_failed` sentence, which says the record did
+not happen automatically and points at the one-click. The one-click reads
+again too: a body figure the bill does not state is a 422, a read that confirms
+none is a 409 with that code, and a non-blocking row is first re-raised as
+blocking and committed (the one write a one-click refusal makes, since the bill
+is paid there and no run may pay it meanwhile).
+- *Rows from the generic ERP webhook* (NetSuite and the rest, which never read
+  a bill back) are unchanged: their first report records what is owed here, so
+  a re-attempt doing the same is no new risk.
+- *A sentence of its own* for the held row was weighed against a new catalogue
+  entry in six web locales, seven ARB files and their generated code; the
+  retry-failed sentence is accurate for both causes, and `refusal_code` carries
+  the machine detail. The one-click's 409 is localized
+  (`refusal.erpPaidAmountUnconfirmed`).
+- *The read happens inside a person's dismissal* (the re-attempt runs in that
+  transaction) and holds the invoice lock for at most
+  `FEOH_ERP_DISPATCH_CHECK_TIMEOUT_SECONDS`, as the dispatch check already does.
+  A connection-level failure trips the same one-minute org-wide hold, so a
+  QuickBooks outage re-raises legacy rows as blocking rather than waiting.
+
+**Rejected.**
+- *Stating `TotalAmt − Balance`.* That is what left the bill, not what the cash
+  says. It would agree with the balance by construction and hide a cash read
+  that does not cover it, which §317 already turns into `settled_by_credit`.
+- *Stating an amount on a bill we part-paid.* Xero refuses the same: no single
+  payment a record could state.
+
+**Not verified live.** No recording exists yet under
+`tools/fake-erp/fixtures/qbo_recorded/` (the replay names its skips), so the
+replay now also asserts the meaning: a bill paid wholly by cheque or card
+states its whole total in its own currency, and every other scenario states
+none. That runs when the operator records. The fake's BillPayment now carries
+its bill's `CurrencyRef`, as real BillPayments do, and `PAYMENT_READS` names
+it.
+
+Tests: `tests/test_qbo_status_sync_adapter.py` (cash in full; lines on this
+bill only; cheque plus card summed with no rail; partial; a vendor credit
+beside a cheque or a card; our own part-payment or full write-back, and a voided
+one not applied; the bill's currency, none, or a payment in another, with the
+amount still stated); `tests/test_erp_status_sync.py` (real rows: recorded at
+QuickBooks' figure, cheque plus card at their sum, partial and credit-settled
+blocking with nothing booked, a credit memo here refused `amount_mismatch` with
+QuickBooks' figure kept, blocking and refused by the one-click, the bill in
+another currency or none and a payment in another refused, outside cash beside
+our live write-back blocking, and through Xero's own `report_from_bill`; a row
+kept with no figure booked only at the bill's re-read figure, refused at another,
+held blocking when the read fails or states none, and the one-click's same three
+outcomes); `tests/test_erp_reported_payment_recovery.py` (rows now carry the
+stated figure); `tests/test_qbo_recorded_replay.py` (the paid amount per
+recorded scenario); `frontend/src/lib/api/codedRefusals.test.ts` (the 409's
+sentence).
+
+## 394. An ERP purchase order nobody has approved syncs as `unissued`, and the matcher refuses it (issue #655 PO status, drafted 2026-10-23, landed 2026-11-14)
+
+**Context.** `PurchaseOrder.status` had three values (open / closed /
+cancelled), so every adapter mapped a draft or awaiting-approval order to
+`open`: Xero and Merge.dev `DRAFT` / `SUBMITTED`, NetSuite Pending Supervisor
+Approval (`A`), Business Central `Draft` / `In Review` (the adapter wrote
+`open` for every BC order), Intacct drafts and in-approval states, SYSPRO's
+in-process `OrderStatus 0`. In the Xero Demo Company a Draft PO showed as OPEN,
+and an invoice could pass 2- or 3-way match against an order nobody in the ERP
+had approved (issue #655: Xero X7, Merge.dev M6, Intacct #12, the Sage SA
+strings; the `docs/followups.md` entry from the live Xero test).
+
+**Decision.** A fourth status, `unissued` (`models/procurement.UNISSUED_PO_STATUS`),
+treated the way §326 treats a cancelled PO:
+
+- **Adapters map, they do not skip.** Skipping a not-yet-issued PO in each
+  `list_pos` was the other option the follow-up named. It was rejected: the
+  sync never deletes, so a PO an earlier build stored as `open` would keep
+  matching for good, and an invoice citing a skipped draft would read
+  `po_not_found` and send the missing-PO agent looking for some other PO. The
+  mapping lines are per adapter (listed in `erp-integration.md`); an unknown
+  value still maps to `open`, the existing default. Adapters write the literal
+  `"unissued"` as they write `"open"`, without importing the model, and the
+  adapter tests pin each one to the constant. Sage SA's real PO strings are
+  unconfirmed (#654), so it reads words (draft, approval) as `_po_status`
+  already read "cancel". QuickBooks Online has only Open / Closed; Blackbaud
+  FE NXT maps nothing yet, pending its live-system check
+  (`docs/followups.md`).
+- **The matcher refuses it.** `po_matching` sets `po_not_issued`, `mismatch`,
+  no variance (a 0 would read as a perfect match), issue
+  `po_match.issue.po_not_issued`, whatever the amount or receipts say.
+  `refresh_warnings` raises the `po_not_issued` warning and a payment-blocking
+  `po_mismatch` at `warning`, the cancelled PO's severity (the 2026-10-23 draft
+  used `error`, as for a missing PO; the cancelled precedent landed since and
+  is the closer case: the order exists and a person decides).
+- **The sync holds at sync time.** The re-match trigger moves from
+  `CANCELLED_PO_STATUSES` to `UNMATCHABLE_PO_STATUSES` (cancelled, voided,
+  unissued), so a PO taken back to draft holds its invoices when the sync
+  runs. The ERP approving it re-matches too, but under §323 (amended) the
+  sync never clears a hold: the finding goes and the `po_mismatch` row stays
+  open for a person.
+- **Elsewhere.** `DEAD_PO_STATUSES` gains `unissued`, so budgets and the CFO
+  open-PO accrual stop counting an order that is not a commitment yet;
+  workspace closure treats it as untouched, like `draft`. The supplier portal
+  no longer lists, shows or flips an unissued PO: a draft has not been sent to
+  the supplier, and before this it showed there as `open`. The
+  purchase-orders page gets a "Not issued" chip and a warning-toned badge.
+- **The fingerprint does not name the new flag.** `_PO_MATCH_FACT_FIELDS`
+  leaves `po_not_issued` out: a match stored before this lacks the key, so
+  naming it would move every cleared finding's fingerprint (§366) on the first
+  refresh after the deploy. The issue code it raises carries the same fact.
+
+**Not ported.** The branch's two vendor-gate commits (`35739b4d`,
+`74ff4dfb`): §333 decided the push vendor gate differently in #679.
+
+Tests: `test_po_matching_algorithm.py` (an unissued PO refused at an exact
+amount and with full receipts; the same PO `open` matches),
+`test_po_matching_wiring.py` (the warning and blocking `po_mismatch`; the
+pure `blocking_finding_types` agrees), `test_purchase_orders.py` (a sync taking
+an approved invoice's PO back to unissued holds it and the run refuses it; the
+ERP issuing it re-matches without clearing), `test_portal_self_service.py`
+(hidden from list, detail and flip), and the adapter mappings in
+`test_erp_po_sync.py` (BC, NetSuite, Merge.dev), `test_erp_xero_adapter.py`,
+`test_erp_sage_intacct_adapter.py`, `test_erp_syspro_adapter.py` and
+`test_erp_sage_accounting_za_adapter.py`.
+
+## 395. Sage Intacct: a bill counts as posted only when Intacct shows it posted, and the REST API still needs a sender ID (#655, drafted 2026-10-23, landed 2026-11-15)
+
+**What happened.** A docs-against-code audit of the Intacct adapter (part of
+#655), checked against Sage's published OpenAPI rather than our memory of it,
+found the adapter could not have worked against a real company, and that
+fake-erp hid it:
+
+- The bill create sent no `state`. The spec's default is `draft`, which books
+  nothing to AP or the GL and cannot be paid; the state moves afterwards only
+  through a workflow, never a PATCH. We recorded "Posted to Sage Intacct", and
+  the fake hard-coded `posted`.
+- The PO query selected `txnTotal` and `currency.txnCurrency`. The purchasing
+  document has `totalInTxnCurrency` and a top-level `txnCurrency`; an unknown
+  field 400s the query, and `list_pos` swallowed it, so PO sync silently synced
+  nothing. Had Intacct tolerated the field, every PO would have synced at 0.
+- A create Intacct refused (400 schema, 422 business validation: a closed
+  period, an inactive vendor or account) was the generic `erp_http_failure`,
+  recorded as possibly posted (QuickBooks lesson 3, §285).
+- §269 said REST avoids the XML gateway's paid Web Services sender ID. It does
+  not: Sage's REST quick start requires a Web Services licence, the developer
+  app is enrolled against that sender ID, and each customer company authorizes
+  it and lists our client id with its Web Services user under Authorized Client
+  Applications. (Sage's guide pages refuse automated fetches, so this rests on
+  the quick start's wording as quoted by third-party integration guides
+  (Merge's help centre, Celigo, Agave), which agree; a sandbox confirms it, #654.)
+  §269 stands for the API choice; its licensing reason is withdrawn.
+
+**Decision.**
+
+- **The create sends `state: "posted"`, and nothing counts as posted until it
+  is read back.** After a 201, and on a retry that finds our earlier bill by
+  `referenceNumber`, the adapter `GET`s the bill. A draft / submitted /
+  analyzing / unknown state is the non-retryable `bill_left_unposted` (the bill
+  exists, so not `not_posted`; a retry once someone posts it in Intacct finds
+  it and succeeds). A reversed or declined one is the shared
+  `existing_invoice_not_open` (Business Central's code for a found document
+  that is no longer ours to change, §391), left in Intacct: reporting it posted
+  would close the invoice against a bill nothing will pay. A posted bill must
+  show `totalTxnAmount` equal to the approved amount (`posted_total`), because
+  a tax-enabled company's tax solution computes it. An unreadable read-back is
+  a retryable failure, never success. A mismatch voids a bill this attempt
+  created; a *found* one is refused `posted_total_mismatch` and left in
+  Intacct, since it may be a draft we refused that a person since edited and
+  posted. Making the state configurable
+  (`submitted` for companies with bill approvals) is deferred until a sandbox
+  shows how such a company answers a `posted` create (#654).
+- **A deterministic 4xx from the create is coded and created nothing.** The
+  adapter reads the bill's vendor and accounts back by id: one Intacct reports
+  inactive, `activeNonPosting`, awaiting or declined approval (vendor `state`
+  `s` / `r`), or absent is `vendor_inactive` / `account_inactive` (named by our
+  code); anything else is the shared `bill_refused` §385 added. All set
+  `not_posted`, including when the reads that would name the cause fail.
+  Intacct's `errorId`s for a closed period or a duplicate bill number are not
+  published, so they are not mapped yet; a sandbox capture can add
+  `period_closed` (#654). Intacct's error text is never read. 5xx / 429 stay
+  retryable and possibly posted.
+- **The token is cached and a refusal of it is coded.** A client-credentials
+  token lives 12 h, so it is cached per process under a digest of the
+  credentials until 5 minutes before `expires_in`; a 401 from any call mints a
+  fresh one once. A 400 / 401 / 403 from the token exchange is
+  `not_connected` (non-retryable, nothing posted); a 5xx or network failure is
+  a retryable failure naming the status only. On a sync listing either is a
+  failed page, so `ErpListingIncomplete`, never an uncoded error. On a push,
+  `not_connected` carries `not_posted` only while no bill exists: a token
+  refused after the create returned a key, or after the lookup found our bill,
+  is a plain refusal naming that bill (money-path review).
+- **Smaller corrections, all from the spec:** both dates are required
+  (`missing_dates` before any call); `analyzing` reads draft and `noValue`
+  ("posted but has not affected the GL") reads `settled_no_payment` (§303);
+  every query sends `orderBy: [{"key": "asc"}]` because Intacct evaluates each
+  page independently; vendors and accounts sync their `status` (and vendor
+  approval `state`) as `active=False` instead of linking a dead record (§284);
+  a PO's total is `totalInTxnCurrency` and its currency the top-level
+  `txnCurrency`, and one with no total is skipped `unpriceable` (§323); and
+  `void_invoice` falls back to the `bill/reverse` workflow, dated after the
+  posting date, when a reversal-enabled company refuses the delete of a posted
+  bill. A paid bill is still never reversed automatically: Intacct requires its
+  payment voided first, which is an accountant's call.
+- **fake-erp behaves like the spec, so it fails the old code**: a create
+  without `state` is a draft, dates are required, a query naming a field the
+  object lacks is a 400, inactive vendor / account and a pre-2020 date are 422s,
+  `expires_in` is 43200, and a reversal-enabled switch refuses every DELETE. The
+  audit's claim that Intacct's error body is a top-level `ia::error` is
+  **refuted** by the published OpenAPI (`error-response`: `ia::error` nested in
+  `ia::result`), so the fake keeps that shape and the adapter reads neither.
+
+**Rejected.** Mapping 422 → `period_closed` by status alone (a 422 is any
+business rule, so it would mislabel an inactive vendor as a closed period);
+keeping the read-back optional for a 201 that carries a key (the 201 says
+nothing about state, which is the bug); adding `location_id` to the link realm
+in this change (it is a realm migration with its own rollout, tracked in
+`docs/followups.md`, "Intacct's link realm ignores `location_id`").
+
+**Porting note.** Drafted as §320 on `fix/erp-sage-intacct` (`9ac3a997`, WIP)
+and renumbered on landing (§320 was taken). Since the draft, #670 and #679 made
+every Intacct sync listing, the PO listing included, read whole or raise and
+link a PO's vendor by `vendor.id`; the port keeps both and moves the PO fields
+onto `totalInTxnCurrency` / `txnCurrency` inside that shape. Its own
+`bill_refused` registration was dropped: §385 had already added it to
+`base.ERP_REFUSAL_CODES`, `erpRefusals.ts` and the six locales. Only
+`bill_left_unposted` is new, with its sentence in the six locales.
+
+**PO status (#655 Intacct #12) is not mapped yet.** A draft, submitted,
+partially approved or declined purchasing document authorizes nothing, but it
+still syncs `open`, as every adapter's unissued PO does. The states are named
+in `sage_intacct._UNISSUED_PO_STATES` with a TODO to return
+`models.procurement.UNISSUED_PO_STATUS` once the PO-status lane defines it;
+this change deliberately defines no status of its own, so the vocabulary is
+decided once (`docs/followups.md`, "An unapproved ERP purchase order syncs as
+`open`").
+
+Tests: `backend/tests/test_erp_sage_intacct_adapter.py` (create posted, a
+draft or submitted read-back refused, a found reversed / declined bill refused,
+a different total voided but a found one left in place, an unreadable
+read-back or create answer never success, a token refused after the bill
+exists never `not_posted`, coded
+refusals by vendor / account read-back and `bill_refused` when those reads
+fail, the token cache and its coded refusals, a sync listing whose token fails
+incomplete, ordered queries, the reverse fallback, inactive vendors and
+accounts, the PO fields); `frontend/tests-e2e/erp/sage-intacct.spec.ts` (the
+bill read from fake-erp is `posted`; a closed period is `bill_refused`; PO sync
+against the spec's field names).
+
+## 396. A payment the ERP shows made on two rails keeps the split, and the 1099 reports it part by part (follow-up of §393, migration 0130, 2026-11-15)
+
+**The gap.** A bill an ERP shows paid by a cheque AND a card is recorded here as
+one `Payment`, and `Payment.method` holds one rail. QuickBooks' report stated no
+rail for such a bill (§393), so the card part was reported on the payer's
+1099-NEC although the card settlement entity reports it on a 1099-K: an
+over-report. Xero's report read the rail of the latest cash payment alone, so a
+bank payment followed by a card one was booked as all card and the bank part
+left off the 1099: an under-report. Nothing on the payment or its audit row
+said which rails paid how much.
+
+**The rule.**
+
+- **The report states the split.** `ErpBillReport.payment_parts`: one
+  `payment_methods.RailPart` (a rail, or None = not stated, and an exact
+  `Decimal`) per cash payment a person made, no account data. Stated only with
+  `paid_amount`, which it breaks down. QuickBooks: each cash BillPayment's
+  `PayType` and what its lines applied to this bill (`_cash_parts`, the same
+  `_applied_to` figures `paid_amount` sums). Xero: every cash payment's account
+  is read, each account once per bill (`_payment_rails`); `CREDITCARD` is
+  `card`, anything else, or a read that fails for that payment, not stated.
+  Xero's `payment_method` is `card` only when every part is card. Rails are
+  read only for a bill `paid` (the only one ever recorded), and these reads
+  never wait out a 429 (`_status_get`'s once-a-minute wait would otherwise
+  repeat per payment, under the invoice lock the read-back holds and past the
+  dispatch check's bound): a rate-limited read leaves that payment not stated,
+  an over-report, never an under-report.
+- **The record keeps it, or drops it whole.** `payment_methods.split_by_rail`
+  is the one judgement. A breakdown stands only when every part is a positive
+  whole-cent amount (33.335 + 66.665 sums to 100.00, but neither prints
+  unrounded on a form) and the parts sum EXACTLY to the amount booked. Then `method` is
+  the parts' one rail, or NULL over several, and `payments.rail_breakdown`
+  holds the parts. Anything else is `unreconciled`: no breakdown, no rail, so
+  the whole payment is reportable, logged by id only. Nothing is prorated or
+  rounded. The `payment.recorded_outside` audit row carries the stated parts,
+  `rail_breakdown_status` (`applied` / `unreconciled` / `superseded`) and
+  `method_stated`, so the trail says what the ERP claimed whether or not it
+  stood.
+- **The 1099 splits by it.** `build_1099_report` joins a `LATERAL` sum over the
+  array (`payment_methods.rail_breakdown_sums_sql`, card parts classified by
+  the same `CARD_PAYMENT_METHODS`), and applies the split only when the row
+  passes the writer's rule again (`RailBreakdownSumsSql.applies_to`: every part
+  a positive whole-cent amount, cast only from an exact decimal string, summing
+  to `Payment.amount`), so a row written by any other path cannot bend a filed
+  figure (a negative part, a missing amount SUM would skip) or fail the report
+  (an amount that is not a number); and the 1099 figure is the
+  payment's own amount in the invoice's currency
+  (`PaymentReportingAmountSql.is_payment_amount`). Otherwise the payment counts
+  as its `method` says, which for a split one is NULL: reportable, whole. A
+  split payment is counted on `payment_count` and `card_payment_count` both,
+  and its reportable part takes its invoice's box, so the per-box
+  reconciliation stays exact.
+- **The kept facts carry it.** A refused record keeps `payment_parts` beside
+  `amount` on the `paid_not_recorded` row, a later amount-less report never
+  erases either (`_merged_report`), and the re-attempt, the read-back of a row
+  that stated no figure (`ReadBackFigure.parts`) and the one-click all book
+  the same split.
+- **A person's one rail.** The one-click form asks for one rail. Over a
+  breakdown of several rails the breakdown stands, as the ERP's cash figure
+  stands against a typed one (§386): one rail cannot describe a payment made on
+  two. Against a breakdown of one rail, a person naming another has corrected
+  it and their rail is the record (`superseded`). Against an unreconciled one,
+  their rail stands. The dialog does not yet show the split or say it will
+  stand over the rail picked; that is tracked in `docs/followups.md`.
+
+**Where it persists: a JSONB column on `payments`, not a child table.** The
+aggregate needs it queryable, so it must be stored, not only audited (under
+`FEOH_AUDIT_MODE=lambda` the audit row is not even local). The breakdown is
+written once, in the record's own transaction, never changed alone, and read
+only summed per payment inside the one query that already reads the row. A
+`payment_rail_parts` table would put a record with no lifecycle of its own into
+the per-table registries (workspace closure's `CLOSURE_ALLOWED`, for one) and
+need a grouped join to answer what a lateral over the row answers. What a table would
+have given, typed amounts and a shape the database enforces, is covered by
+exact decimal strings cast to `numeric` in SQL, the writer's exact-sum rule,
+the read-side re-check, and `ck_payments_rail_breakdown_array` (an array or
+NULL, so `jsonb_array_elements` can never meet an object and fail the report).
+Rejected too: a single `card_amount` column. It answers the 1099 but not the
+follow-up's other question, which rails paid how much, and a Xero bank part
+(not stated) would be indistinguishable from a cheque.
+
+**No backfill (§141).** A payment recorded before 0130 states one rail or none,
+and nothing stored says how it split: its audit row names the rail booked, not
+the ERP's payments, and re-reading today's bill would date a split from a read
+nobody made then. Those payments keep counting by `method` (QuickBooks' two-rail
+ones as reportable, Xero's latest-card ones as card); a preparer who needs a
+past year exact reads the bill in the ERP.
+
+**Not verified live.** Both adapters' readings are against their doubles and the
+published shapes (§386, §393); no recorded QuickBooks or Xero bill paid on two
+rails exists yet.
+
+Tests: `tests/test_payment_methods.py` (the split judgement: two rails, all
+card, a cent short or over, a zero, a negative or a NaN part fail closed, an
+unknown rail, the JSON round trip and a malformed breakdown);
+`tests/test_qbo_status_sync_adapter.py` (cheque plus card parts summing to the
+cash, only this bill's lines, none without a cash figure);
+`tests/test_xero_status_sync_adapter.py` (bank then card is not all card, two
+card payments read their account once, one unreadable payment not stated);
+`tests/test_erp_status_sync.py` (real rows: cheque plus card kept and audited,
+two cards recorded as card, parts not summing recorded reportable and audited
+`unreconciled`, a kept two-rail row booked with its split when its blocker
+clears, the one-click booking the split over a person's one rail, the merge
+keeping the parts, Xero bank plus card); `tests/test_tax_1099_boxes.py` (the
+aggregate's split per box and count, parts not summing counted whole, a split
+on a home-currency figure not applied);
+`tests/test_migration_0130_payment_rail_breakdown.py` (parity with
+`create_all`, idempotent, no backfill, the CHECK, a control-plane no-op).
+
+## 397. Business Central recognises its own lost-read draft by the id its create recorded, and only while it is unedited (§391 follow-up, 2026-11-15)
+
+**Context.** §391 made every draft the duplicate lookup finds untouchable,
+because the lookup's key (vendor + Vendor Invoice No.) also matches a bill a
+BC user keyed by hand. The cost it accepted: a VAT company's push whose read
+after the create was lost could not be finished by the retry. The read failure
+names the gross draft, so `services/erp` records it as the orphan, but the
+retry found it, could not tell it from a person's, and refused it
+`posted_total_mismatch`, left in BC. Someone had to delete it before retrying.
+
+**Decision.**
+- **Ownership is recorded, never inferred.** `ErpPostResult` gains
+  `erp_document_is_own`: true only when the document it names is one this push
+  created (in this attempt, or an earlier one's it recognised). `_call_erp`
+  keeps `state_data["erp_orphan_document_own"] = true` beside the orphan id,
+  only when the result says so, and drops it whenever a failure names a
+  document the adapter merely found. Beside it goes
+  `erp_orphan_document_fingerprint`: the three totals BC answered our create
+  with. The next attempt gets both (`InvoicePayload.own_orphan_document_id` /
+  `_fingerprint`); a row from before the flag existed, or one with no
+  fingerprint, is read as not ours. So a BC user's draft, once named by a
+  refusal, can never come back as "ours" on a later retry.
+- **Only that exact id counts.** A lookup hit is ours only when its id equals
+  the recorded one (a GUID compared case-insensitively). Any other hit, even
+  one identical to what we would send, keeps §391's rule: never deleted, never
+  repriced.
+- **And only while it is still what we sent.** Before acting on it, the
+  adapter requires the draft's `totalAmountExcludingTax` / `totalTaxAmount` /
+  `totalAmountIncludingTax` to equal the recorded fingerprint. This is what
+  catches a line moved to another tax group: `taxCode` is a field we never
+  send, so the lines look unchanged and only the tax moves (money-path
+  review), and any `payToVendorId` to be the bill's own vendor (we never send
+  one, so another means a BC user redirected the payee). It then reads the
+  draft's lines (`GET purchaseInvoices({id})/purchaseInvoiceLines`)
+  and requires them to equal, as a multiset, our gross or our net lines in
+  every field we send (type, account, description, quantity, unit cost);
+  `totalAmountExcludingTax` to equal those lines' sum, which catches a field we
+  never send (a line discount, prices made tax-inclusive); the invoice and due
+  dates we sent; and the invoice's currency (blank read as the company's LCY,
+  as §391). A gross match is handled as a draft just created, so BC's VAT on
+  top gets the one net reprice; a net match is not repriced again (a mismatch
+  is deleted and refused, as for a net draft we just made).
+- **Edited, or no longer a draft: it is no longer ours.** It gets exactly the
+  found treatment §391 gives anyone's record: a draft at another total refused
+  `posted_total_mismatch` and left in BC, a `Paid` one refused
+  `existing_invoice_not_open`, an `Open` one accepted only at the approved
+  total and currency. Its refusal does not claim it as ours, so the next retry
+  will not either. No new refusal code: the found treatment's codes already say
+  what happened, and a person who edited the draft now owns it.
+  *Amended by §403:* a pay-to edit is now refused `pay_to_vendor_differs`
+  rather than by the found treatment's total check.
+- A failed read before the draft is judged (its record, its lines, the
+  company's LCY) is a retryable failure naming the draft, and it KEEPS the
+  claim: nothing was deleted or posted, and the next attempt judges the same
+  id afresh. Dropping it there would strand our draft after one 503 (money-path
+  review). A failure that names no document leaves the recorded id and claim
+  as they were, even when the draft has since been deleted (by our refusal's
+  own DELETE, say): the id then matches nothing, because BC does not reuse
+  ids, so the stale entry is harmless.
+
+**Left open, accepted.** A create whose response was lost outright (a timeout
+or 5xx after BC made the draft) reports no id, so nothing is recorded and the
+retry cannot recognise the draft: it still needs deleting in BC, as §391
+describes. Recognising it would need us to choose the id before the create;
+whether API v2.0 honours a client-supplied `id` on a purchaseInvoice POST is
+undocumented, and nothing here has run against a live BC tenant (#654). The
+lines comparison assumes BC returns a line's `unitCost`, `description` and
+`accountId` as we sent them, and the fingerprint assumes BC's create response
+states the draft's three totals. If a live tenant does otherwise, our own
+drafts read as edited or unproven and fall back to §391's behaviour, which is
+safe. The DELETE before a reprice carries the etag from the header read,
+which comes before the lines read. A line edited between the two is stopped
+only if BC moves the header's etag when a line changes, which is undocumented
+(as it was already for a draft just created).
+
+**Rejected:**
+- *Recognising our draft by its shape alone* (gross lines, approved
+  excluding-tax total). A BC user keying the same bill makes the same shape;
+  that is what §391 refuses to delete.
+- *Recognising it by an etag recorded at create.* Whether BC moves the
+  header's etag for a line edit, or for its own post-insert recalculation, is
+  undocumented. The header's totals are computed from the lines, so they
+  answer the question that matters (is the money still what we sent?), and
+  the lines comparison covers the rest.
+- *Refusing an edited own draft outright, even at the approved total.* That
+  makes a draft we once made stricter than one a person keyed from scratch,
+  for the same facts; handing it to the found treatment keeps one rule for
+  every draft a person has shaped.
+
+Tests: `backend/tests/test_erp_adapter_idempotency.py` (a lost-read VAT draft
+repriced by the retry and posted; a created-then-lost draft marked ours; a
+hand-keyed identical draft untouched even with an orphan recorded; our draft
+edited seven ways, tax group and pay-to vendor included, refused and left; our draft found `Paid`
+refused as any; a failed lines read retryable and keeping the claim; a
+recorded id with no fingerprint not ours); `backend/tests/test_erp_push_flow.py` (only a
+created orphan is handed back, a found one drops the claim, a legacy row is
+not ours; success clears the flag); `frontend/tests-e2e/erp/dynamics.spec.ts`
+against fake-erp's `fake-vat-lostread-co` / `fake-vat-lostedit-co` (first
+draft read per invoice number answers 503, the second company also adding a
+10.00 line first) and a draft keyed by hand in `fake-vat-co`.
+
+## 398. NetSuite posts by ids, reads its own PO sign, and counts a bill posted only when NetSuite shows it approved (issue #655 N1–N5, 2026-11-15)
+
+**Context.** The 2026-10-23 docs-versus-code audit listed NetSuite findings
+N1–N5; the report itself is not in the repo, so each was re-derived from the
+issue's text, its cross-cutting classes and Oracle's SuiteTalk REST docs. N1
+(the TBA signer put the query inside the signed URI) landed with §320 and N5
+(a synced PO linked to its vendor by name) with #652; both were re-checked
+against the code and stand. N6 (OAuth 2.0) is §320. This entry is N2–N4, the
+PO lines `docs/followups.md` kept open, and the classes #655 asks of every
+adapter. Nothing here has run against a NetSuite account (#654).
+
+**Decision.**
+- **N2 — the idempotency lookup is `GET /vendorBill/eid:<correlation id>`.**
+  Oracle documents `eid:` for addressing any record by external id, and shows
+  the collection query `?q=externalId IS "…"` only as a workaround for an id
+  holding a pipe; integrators report NetSuite refusing that query on
+  transaction records, which would fail every push at its lookup. A miss is a
+  404 whose `o:errorCode` is `NONEXISTENT_ID`; any other 404, or a 200 we
+  cannot parse, fails the push as before (a lookup that could not be made is
+  not a miss). The hit is the bill itself, so it is not read twice.
+- **N3 — the currency is posted by internal id, and the PO total by its
+  magnitude.** A reference's `refName` is its display text (`getFieldText`:
+  the currency record's name, which an administrator can rename), so
+  `{"refName": "USD"}` named no currency reliably, and a bill NetSuite
+  defaulted to the vendor's currency would have passed a total check that
+  compares figures only. The adapter reads the active currency whose
+  `symbol` (ISO code, the column the PO sync already trusts) is the
+  invoice's, posts `{"id": …}`, and confirms the read-back bill's
+  `currency.id`. None active, or not an ISO code: `currency_not_set_up`
+  (new), `not_posted` when the lookup has just shown no bill of ours exists.
+  A failed read is retryable. A found bill in another currency is
+  `posted_total_mismatch`, as BC's is (§391). Separately, SuiteQL states a
+  transaction header in posting sign and a purchase order's is the
+  vendor-side credit, so `foreigntotal` reads -2,100.50 for an order the UI
+  shows at 2,100.50; stored as read, no invoice could match a NetSuite PO and
+  every open-PO rollup subtracted it. The total is now `abs(foreigntotal)`.
+  Sources are integrators' (an ODBC report, a published SuiteQL query that
+  negates it), not Oracle's, so this is a sandbox item.
+- **N4 — a bill counts as posted only when NetSuite shows it approved.** Under
+  approval routing a bill is created Pending Approval and posts nothing to
+  the GL. It used to be reported posted, which closes the invoice at `done`
+  (NetSuite has no status sync), so a bill NetSuite's approver then rejected
+  would be paid by nobody. After the total and currency checks, the bill's
+  `approvalStatus` (1 pending, 3 rejected) and `status` (a word, a refName or
+  a `VendBill:` letter, all read alike) decide: Open or Paid In Full, not
+  pending or rejected → success; Pending Approval or anything unreadable →
+  `bill_not_posted` (new); rejected or cancelled → `bill_rejected` (new).
+  Both leave the bill: the approval is NetSuite's to give, and `retry-erp`
+  after it finds the bill by `eid:` and reports it posted, so it is never
+  created twice. BC's `existing_invoice_not_open` was the first choice for a
+  rejected bill and was dropped in money-path review: its sentence ("no
+  longer a draft, so it can't be changed from here") reads as a live bill,
+  which invites closing an invoice that nothing will pay. The total check still
+  runs first, so a mismatched pending bill is deleted as before.
+  *Rejected:* setting `approvalStatus` to Approved on the create. It would
+  overrule the customer's own NetSuite control with FeohLedger's approval,
+  and only a role holding the approve permission can do it anyway.
+- **Coded create refusals (§285's class).** A create NetSuite answers with a
+  4xx a re-send cannot change is coded from facts read back, and is
+  `not_posted` only once the `eid:` lookup, made again, misses: the 4xx may be
+  NetSuite's duplicate-externalId answer to a second create racing the first
+  (an SQS redelivery after a lost response), so a hit goes through the posted
+  checks as our bill, and a lookup that cannot be made leaves the refusal
+  fail-closed. The facts, in order: the base accounting period holding the
+  bill's date closed, A/P-locked or all-locked → `period_closed`; the vendor
+  gone or `isinactive` → `vendor_inactive`; an account gone or inactive →
+  `account_inactive` naming our codes; otherwise the shared `bill_refused`
+  (§385). NetSuite's body is never read for the cause: its `o:errorCode` is a
+  generic `USER_ERROR` / `INVALID_CONTENT` and its `detail` echoes the
+  submitted fields. A read that fails is "don't know", never "inactive". Only
+  integer internal ids are spliced into SuiteQL. 401, 408, 409, 423, 425, 429
+  and 5xx stay uncoded and retryable.
+- **Paid versus credited (§303's table gains a row).** NetSuite sets Paid In
+  Full when a vendor credit is applied as well as a vendor payment, so
+  `get_invoice_status` reads what was applied to the bill
+  (`NextTransactionLineLink` where `previousdoc` is the bill): `paid` only
+  when every link is a `VendPymt` and together they are exactly the bill's
+  total; a credit, any other link, a shortfall, or rows of mixed sign (a
+  payment and its reversal) is `settled_no_payment`; a failed read is
+  `unknown`. No caller reads it today (§303), so nothing
+  changes at runtime.
+
+  | Adapter | `paid` when | Nothing owing otherwise |
+  |---|---|---|
+  | NetSuite | Paid In Full and the applied links are all `VendPymt`, summing to the bill's `total` | `settled_no_payment` |
+
+- **PO lines (the `docs/followups.md` entry).** After the headers, the lines
+  of every PO not closed or cancelled are read from `transactionline`
+  (`mainline = 'F' AND taxline = 'F'`), 100 PO ids a query, each chunk read
+  whole or the listing raises `ErpListingIncomplete`. The sync then refreshes
+  stored lines by §327's rule; a closed or cancelled PO is sent without lines,
+  which leaves the stored ones alone. Reading only the live POs keeps each
+  read inside `SYNC_LISTING_MAX_ROWS` for an account with years of orders,
+  and a chunk that still runs past it is read again in halves, down to one PO
+  (only a single PO past the bound raises). Lines are debits and read
+  positive; a PO whose line amounts sum negative (credit sign, as the header
+  is stated) has its line totals and quantities negated, so the 3-way receipt
+  value never mixes signs. A line NetSuite closed is kept: the header total
+  still counts it, and dropping it would unlink a receipt recorded against
+  it. An expense line's `gl_account` is the chart sync's code for its account
+  (`acctnumber`, else its name); an item line's account is the item's own,
+  so it carries none. *Rejected:* one query over every PO's lines (it hits
+  the listing bound long before the headers do).
+- **Payment terms were already stored by code.** BC's half of the old
+  follow-up stored a GUID (§391). NetSuite's vendor sync reads
+  `BUILTIN.DF(terms)`, the term record's name ("Net 30"), which is the only
+  identifier a NetSuite term has besides its internal id; nothing changed,
+  and `test_erp_vendor_sync_adapter.py` pins it.
+
+**Draft and pending-approval POs.** A PO in Pending Supervisor Approval (`A`)
+is the PO-status lane's (§394, `models/procurement.UNISSUED_PO_STATUS`), whose
+change maps it in the same file; this entry does not touch that mapping. Its
+lines are read like any other live PO's.
+
+**Sandbox-only (#654).** That NetSuite answers the `eid:` miss with 404
+`NONEXISTENT_ID`; that `refName` on a reference is display-only on input; the
+sign of `foreigntotal` and of PO line `quantity` / `foreignamount` (taken as
+stated, lines being debits); the `accountingperiod`, `currency`,
+`transactionline` and `NextTransactionLineLink` columns used; the status and
+`approvalStatus` shapes a vendorBill GET returns; the duplicate-externalId
+answer to a racing create; whether closed PO lines (`isclosed`) should count;
+and that Paid In Full is set by an applied vendor credit.
+
+Tests: `tests/test_erp_netsuite_adapter.py` (the adapter against fake-erp's
+NetSuite routes in process: a clean push by currency id, the `eid:` retry, a
+pending bill refused and left then posted once approved, a rejected one, the
+currency, period, vendor and account refusals, PO totals and lines; mocked:
+line chunks, a failed line read, a lookup 404 that is not a miss, an
+unreadable currency, `bill_refused`, retryable create answers, a found bill
+in another currency, every status shape, paid versus credited; the
+money-path review's follow-ups: a refused create whose bill exists after all,
+a second lookup that fails, a hit that is not plainly ours, a truncated line
+chunk split in halves, credit-sign lines, a payment and its reversal);
+`tests/test_erp_adapter_idempotency.py`, `test_erp_adapter_money_exact.py`,
+`test_erp_adapter_error_pii.py`, `test_erp_push_flow.py`,
+`test_erp_netsuite_auth.py`, `test_erp_void_invoice.py`,
+`test_erp_po_sync.py` (the new request sequence);
+`frontend/src/lib/api/erpRefusals.test.ts` (the two codes);
+`frontend/tests-e2e/erp/netsuite.spec.ts` (PO lines and sign, a pending bill
+completed after approval, a closed period). fake-erp's NetSuite section now
+answers `eid:`, SuiteQL `currency`, `accountingperiod` and `transactionline`,
+refuses a currency given by `refName`, refuses a bill dated in its closed
+January 2020, states PO headers negative and gives bills an `approvalStatus`.
+
+## 399. Merge.dev posts each line's amount, finds its own bill before a retry, codes Merge's refusals, and takes Merge's webhook per tenant (issue #655 M1–M14, drafted 2026-10-23, landed 2026-11-15)
+
+**Context.** The 2026-10-23 docs-versus-code audit listed Merge.dev findings
+M1–M14; the report is not in the repo, so each was re-derived from the WIP
+branch `fix/erp-merge-intacct-sage` (7ac03f49, written against an older main and
+used as a specification, not merged) and re-checked against Merge's Accounting
+OpenAPI spec (<https://docs.merge.dev/openapi/accounting.json>), its idempotency
+guide (<https://docs.merge.dev/merge-unified/writing-data/idempotency>), its
+webhook guide (<https://docs.merge.dev/merge-unified/reading-data/webhooks/merge-webhooks>)
+and its write-error reference, all read 2026-11-13. Some had landed already:
+suppliers read from `/contacts` with Merge's Contact keys (2026-10-26,
+`docs/known-issues.md`), an `INACTIVE` / deleted account emitted inactive and
+`parent_account` carried as a Merge id (2026-10-26, with the Contacts fix), the PO number read from
+`purchase_order_number` (§328), PO status (M6, §394) and a PO's vendor linked by
+Merge id (M7, #652). Nothing here has run against a Merge linked account (#654).
+
+**Decision.**
+- **A line's amount is `total_amount`.** Merge's invoice line has no
+  `total_line_amount` — that is a purchase-order line field — so every bill went
+  out with lines and no amounts, and the integration either refused it or
+  booked what it computed. The lines are now the shared `bill_lines` grosses,
+  which sum to the approved amount or refuse (`amount_mismatch`,
+  `line_amount_missing`, `account_not_linked`), sent with `inclusive_of_tax:
+  true`. An uncoded line takes the header account as on every other adapter;
+  it used to go out with no account at all. `sub_total` and `total_discount`
+  are not sent (against gross lines they state a second total), nor
+  `purchase_order_number` and `integration_params.correlation_id`, which are not
+  fields of Merge's Invoice and were never echoed back.
+- **Idempotency is a lookup first, then Merge's header.** The adapter sent
+  `X-Idempotency-Key`, which Merge does not read; Merge's header is
+  `Idempotency-Key`, and it is a beta Merge enables per customer and keeps 24
+  hours. So before creating, `GET /invoices?number=&contact_id=&type=
+  ACCOUNTS_PAYABLE` (exact filters) looks for a live bill: one at exactly the
+  approved total is our earlier attempt and the push succeeds without a second
+  create; anything else under the number refuses `duplicate_document_number`;
+  a lookup that cannot finish fails retryably and creates nothing (a 401 is
+  `not_connected`). A found bill in another currency is a duplicate too. The
+  header is still sent, as a second line. Because Merge's listing may not show
+  a bill written through it for a while, a create whose outcome is unknown (a
+  5xx, 408 or 409, a read timeout or dropped connection after it was sent) is
+  **not retried automatically**: `services/erp`'s retry comes 2 and 4 seconds
+  later, inside that window. Only 429 and a connection never made are retried.
+  *Residual:* a person's retry inside the window can still re-create the bill
+  where the beta is off; `docs/followups.md` has the durable fix (wait on
+  `GET /sync-status`). Found in money-path review: the first draft retried a
+  timed-out create automatically.
+- **A 2xx is a bill only when Merge says so.** A model with no `id`, or one
+  carrying `errors`, is `bill_refused`, possibly posted, never success. The
+  total Merge reports goes through `posted_total.check_posted_total`
+  (mismatch / unconfirmed); Merge cannot void, so the bill stays for a person.
+  Responses are parsed with `parse_float=Decimal`: a total read through a
+  float failed the comparison against an exact amount.
+- **Refusals are coded from `problem_type` alone.** 401 and `RELINK_NEEDED` /
+  `CREDENTIAL_REFRESH_FAILED` → `not_connected`; the two duplicate problems →
+  `duplicate_document_number`, kept possibly posted (it may be our own
+  attempt); `PROVIDER_ERROR` → the contact and accounts read back, naming an
+  `ARCHIVED` contact (`vendor_inactive`) or `INACTIVE` accounts by our codes
+  (`account_inactive`), else the shared `bill_refused` (§385) kept possibly
+  posted, since `PROVIDER_ERROR` is the integration's catch-all and nothing
+  says a multi-step write left nothing; any other documented "not created"
+  problem → `bill_refused`, not posted. `detail`,
+  `title` and `raw_error` are never read (they echo what was sent), and a
+  `problem_type` that is not enum-shaped is not echoed either. 5xx and 429 stay
+  retryable; `ERROR`, an undocumented code or no `errors` stays the plain
+  non-retryable failure, possibly posted.
+- **Status reads Merge's enum and §303.** The old map read `VOIDED`, which
+  Merge never sends (`VOID`), and called every `PAID` a payment. `PAID` is
+  `paid` only with a payment listed and no credit applied; a credit note or
+  vendor credit, in whole or part, or nothing behind it, is
+  `settled_no_payment`. `remote_was_deleted` is `cancelled`.
+- **Region.** A linked account lives on one Merge stack (`api`, `api-eu`,
+  `api-ap`) and its token is refused by the others, so EU and APAC customers
+  could not connect at all. `settings.erp.region` (`US` default, `EU`, `APAC`)
+  picks the host; an unknown value refuses the push, never guesses. It is not
+  a destination key: every value is Merge's own host. The operator's
+  `FEOH_ERP_MERGE_API_BASE` (fake-erp) still wins.
+- **The connection test reads the link's status.** Merge answers
+  `/account-details` 200 for a link that needs relinking; `INCOMPLETE` /
+  `RELINK_NEEDED` now fail the test. An unknown region fails a listing as
+  incomplete and reads a status `unknown`, never a 500.
+- **Suppliers are not filtered on `is_supplier`.** Xero behind Merge sets it
+  only once a contact has a bill, so a new supplier was never synced and so
+  could never be billed through us. The whole contact list is read and a
+  customer-only contact (`is_customer` true, `is_supplier` false) dropped.
+- **The webhook is per tenant, verified under that tenant's key, and applied
+  by the status sync's reconciler.** The generic route read Merge's
+  `linked_account_id` from the body as our tenant slug and compared Merge's
+  signature as hex; Merge sends neither (its payload names only its own
+  `linked_account`, and signs base64url), so every delivery was dropped, and
+  had one matched, the body would have chosen whose books it touched. Each
+  tenant connects its own Merge organisation, so the route is
+  `POST /api/erp/webhook/merge_dev/{tenant_slug}`, the URL the tenant
+  registers, and the raw body must verify under that tenant's signature key
+  (`webhook_signing_secret`, now an optional sealed field on the Merge form;
+  `webhook_security.verify_hmac_sha256_base64url`, strict alphabet, raw
+  digests compared) before it is parsed. Merge's `hook.id` names the
+  subscription, so a delivery is deduped by the tenant, linked account,
+  event, bill and `modified_at` (the tenant, so no tenant's deliveries can
+  claim another's keys). Only the bill's id is taken from the body: a bill no
+  invoice was pushed as is not read; otherwise it is read back from Merge with
+  the tenant's credentials, as the QuickBooks and Xero webhooks read theirs
+  (§392) — a late redelivery of an older change, or a body forged with a
+  leaked key, states nothing — mapped to an `ErpBillReport` and applied by
+  `erp_status_sync.apply_bill_report`, matched by `erp_reference` within the
+  push's realm (Merge ids are UUIDs, never reused), so it means what the
+  QuickBooks and Xero sweeps mean. A 404 is gone only for `Invoice.removed`.
+  Every decision is a silent 204; our own failure (a failed read included)
+  is a bodyless 503 with the claim released (the generic route's invariant).
+  The generic route no longer reads Merge's shape. Unlike §392's webhooks it
+  is not gated on `FEOH_ERP_STATUS_SYNC_ENABLED` (`status_sync_now_refusal`
+  would refuse every Merge tenant): that switch decides whether a push stays
+  payable, which never applies to Merge, whose pushes close at `done`; the
+  tenant opts in by storing its key.
+  *Rejected:* the specification's own path, a second copy of the generic
+  route's transition logic keyed by `erp_document_id`. Merge has no status
+  sync, so its pushes close at `done`, where that logic can only flag a void;
+  `apply_bill_report` already flags a void or deletion, a credit settlement
+  and a part payment on any invoice it matches, and one reconciler cannot
+  disagree with itself. *Rejected:* trusting `linked_account.id` to pick the
+  tenant: we store no linked-account id, and a URL plus a per-tenant key needs
+  none.
+
+- **The reconciler's credit branch covers `sent_to_erp` (shared, §303).**
+  `apply_bill_report` flagged a credit-settled bill only for an invoice in
+  `PAYABLE_HERE`; one at `sent_to_erp` (recordable but not payable) fell
+  through to the cash branch and was booked as a payment. It now takes the
+  credit branch for any recordable or payable status. `sent_to_erp` is
+  transient on every adapter today, so this closes a path rather than a
+  reported case. Found in money-path review.
+
+**What it does at runtime.** A push is now one more call (the lookup) and may
+read the contact and accounts after a `PROVIDER_ERROR`; a timed-out or 5xx
+create fails at once instead of after two more attempts, and waits for a
+person's retry. A Merge tenant that
+registers the webhook gets an `erp_reconciliation` exception when a bill it
+pushed is voided or deleted behind Merge; a bill Merge shows paid changes
+nothing on a `done` invoice. A tenant with no key stored gets nothing, as
+before.
+
+**Sandbox-only (#654).** That the idempotency beta is honoured where enabled;
+whether `GET /invoices` lists a bill written through Merge before its next
+sync; the `PROVIDER_ERROR` / `MODEL_NOT_FOUND` answers each integration gives
+an archived contact or inactive account; whether integrations honour
+`inclusive_of_tax`; that `payments` lists cash and the two `applied_*credit*`
+lists credits as documented; and an `Invoice.removed` delivery's body.
+
+Tests: `tests/test_merge_dev_adapter.py` (lines and amounts, the 2xx checks,
+every refusal class, the connection test), `tests/test_merge_webhook.py` (the
+signature, tenant resolution, every silent path, dedupe, the 503s, the report
+mapping and status map; end to end against real rows: a void flagged, a paid
+bill on a `done` invoice unchanged, a credit settlement blocking a payable one,
+an unknown bill and another tenant's key touching nothing, the bill Merge has
+deciding over the delivery, a removed bill, an unreadable read, a credit
+settlement at `sent_to_erp`),
+`test_erp_adapter_idempotency.py` (the lookup and header),
+`test_erp_adapter_money_exact.py`, `test_erp_adapter_error_pii.py`,
+`test_erp_base_url_overrides.py` (region), `test_erp_vendor_sync_adapter.py`,
+`test_erp_push_flow.py`, `test_erp_catalog.py`, `test_rbac.py`;
+`frontend/tests-e2e/erp/merge-dev.spec.ts` (the full send now syncs the chart
+and codes the invoice). fake-erp's Merge section now honours only
+`Idempotency-Key`, answers the exact `GET /invoices` filters, refuses a line
+without `total_amount`, lines that do not sum, an archived contact or inactive
+account with Merge's error shape, serves `GET /contacts/{id}` /
+`/accounts/{id}`, an inactive account, a supplier Xero has not flagged, and
+lets `__set-status` set payments and credits.
+
+**Amendment (round-10 review gate): the generic route refuses a Merge tenant.**
+Storing Merge's signature key as `webhook_signing_secret` put a key a third
+party holds into the field the generic `/webhook/{erp_type}` route verifies its
+hex HMAC against, and that route takes the tenant from the body, finds the
+invoice by `correlation_id`, never reads the bill back, and records a signed
+`{"status": "Paid"}` as a payment (`_record_erp_reported_payment`). So Merge's
+key unlocked a body-trusting write to the money path. The generic route now
+refuses, with the same silent 204, any `erp_type` that is not the tenant's own
+adapter (`resolve_adapter_key(erp_config) != erp_type`) and `merge_dev`
+outright, before the signature is checked. A Merge tenant's key is therefore
+checked only by the per-tenant Merge route, which reads the bill back. Nothing
+else stores a third-party-held key there: only the Merge form renders the
+field, a direct ERP's key is shared between the tenant and its own integration,
+and a switch to another ERP drops every sealed secret, the webhook key included
+(`catalog.secrets_to_drop`), so a key never outlives the ERP it was stored for.
+Tests: `test_erp_webhook_transitions.py` (a Merge-signed body under
+`merge_dev`, `generic` and `netsuite`; an `erp_type` that is not the tenant's
+adapter), `test_plan_feature_gates.py` (the in-flight exemption, now on a
+direct ERP).
+
+**Not gated, deliberately: an invoice back in approval.** The Merge webhook can
+reach `record_erp_reported_payment` for an invoice that re-entered approval
+after an earlier push attempt recorded its `erp_reference`, since the match is
+by that reference. That is correct, because the bill is read back from Merge
+before anything is applied: a payment Merge shows on it is real. Do not gate it.
+
+## 400. Sage's revoke is checked against Sage's own guide, and stored-credential ERPs are ended or named at tenant deletion (issue #655 OAuth row, 2026-11-13)
+
+**Context.** Issue #655's OAuth row listed five items. Three had landed: the
+login-CSRF binding (§336), the QuickBooks realm check (§337), and revocation on
+Disconnect and tenant deletion, with Blackbaud's missing endpoint stated (§371).
+Two were open. **Sage UK S3**, the revoke request's shape, rested on Apideck and
+a client library because Sage's guide pages are rendered in the browser and
+refused our fetches. **The Intacct and Sage SA notes** said there was nothing to
+revoke, and deletion said nothing about either: the Intacct adapter's docstring
+read "no long-lived token here to revoke", and a deleted Intacct or Sage SA
+tenant's confirmation had no ERP line at all, though in both cases the access
+outlives our sealed copy.
+
+**Decision.**
+
+- **Sage Accounting's revoke is unchanged and now cited to Sage.** Sage's
+  developer portal answers its search API (`/api/search?term=…`) and serves each
+  guide's text in the page payload at its real path, so the guide was readable
+  after all. "Revoke a Refresh Token"
+  (<https://developer.sage.com/accounting/docs/v1.0.0/guides/learning/authenticating/authentication>,
+  checked 2026-11-13): `POST https://oauth.accounting.sage.com/revoke`,
+  `application/x-www-form-urlencoded`, `client_id`, `client_secret`, `token`
+  (the refresh token), `200 {"success": "ok"}`. Access tokens cannot be
+  revoked; they live out their five minutes. That is exactly what §371 sends,
+  so no code changed. A live sandbox Disconnect stays on the platform-app
+  follow-up.
+- **Sage Intacct's tokens are revoked at tenant deletion.** Intacct's OAuth page
+  (<https://developer.sage.com/intacct/docs/1/sage-intacct-rest-api/authorization-and-security/oauth2>,
+  "Revoke a token", checked 2026-11-13) documents
+  `POST /ia/api/v1/oauth2/revoke` with form `token` (access or refresh) and the
+  client as form fields or HTTP Basic, answering `{"revoked": true}`, and says
+  that revoking one token revokes every other token for the same Web Services
+  user and company. Our client-credentials tokens live 12 hours in a
+  per-worker cache that the deleting process cannot see, so
+  `SageIntacctAdapter.revoke_stored_access` mints one fresh token and revokes
+  it. Intacct's rule then ends the tokens the other workers hold. The client
+  goes as form fields, like the token exchange. The outcome is `revoked` only
+  on `200` with `revoked: true`; a refused mint, a refusal, an outage or a
+  garbled body is `failed`.
+- **Sage Accounting (ZA) has nothing to revoke, and says so.** Every call sends
+  the Sage user's own login in HTTP Basic, and no token is issued. The API's
+  Help index (<https://accounting.sageone.co.za/api/2.0.0/Help>, checked
+  2026-11-13) lists only `POST Login/Validate` and an undocumented
+  `DELETE CoreTokens/Delete`, for a token we never hold. Deletion reports
+  `unsupported` without a call.
+- **The adapter states the provider-side step.**
+  `ErpAdapter.provider_side_disconnect` is the step the customer takes at the
+  provider. For Intacct it is removing our client ID under Authorized Client
+  Applications, which revoking tokens does not undo. For Sage SA it is changing
+  that user's password or removing the user.
+  `revoke_stored_access` defaults to `unsupported` when a step is stated and to
+  None otherwise. `revokes_stored_access` marks an override that calls out.
+  `tenant_deletion._read_erp_grant` falls through to it when no OAuth tokens
+  are sealed. The call follows §371's rules: the operator path calls in place,
+  a closure queues it with `post_commit`, and an outcome needing no call is
+  decided at the read. The confirmation's line reads `ERP credentials:` and
+  names the provider's step on every outcome, `revoked` included. The log names
+  only the provider and the outcome.
+
+**Rejected.**
+
+- *Revoking only the token this process has cached.* The deleting process
+  (the operator script, or whichever worker runs the closure) usually holds
+  none, and the other workers' tokens would live out their 12 hours.
+- *Calling `CoreTokens/Delete` for Sage SA.* It is undocumented, and we hold no
+  token for it to delete.
+- *A generic "remove the app from connected apps" line for every
+  stored-credential ERP.* Intacct has no connected-apps list, and the Sage SA
+  customer gave us a password, not an app grant. A wrong instruction is worse
+  than none.
+- *Setting a step for Merge.dev, Business Central, NetSuite and SYSPRO in this
+  change.* Each needs its own reading of the provider's documentation, and two
+  of those adapters were owned by parallel lanes. They are a `docs/followups.md`
+  (c) entry.
+
+**Side effect, accepted.** Intacct's revoke reaches every token for the Web
+Services user and company, not only ours. Another FeohLedger tenant sharing that
+company and user (a partner's child tenant, say) loses its cached token and
+re-mints on its next call: `_send` retries once after a 401. A customer
+integration sharing the Web Services user is affected the same way. The runbook
+says so.
+
+**Not changed.** In-app Disconnect stays OAuth-only (`/organization/erp/oauth/disconnect`).
+Replacing or clearing an Intacct configuration does not revoke: the old tokens
+are reachable only from our own workers' memory and lapse within 12 hours.
+
+## 401. A hand-entered inspection re-matches its PO's invoices in the same request, and an approver's later pass does not release their own invoice (§366 follow-up, 2026-11-15)
+
+**The gap.** `POST /api/inspections` flushed and audited the row and re-matched
+nothing. The goods-receipt doors and the QMS sync both call
+`invoice_warnings.refresh_invoices_citing_pos`; this door did not, so a typed-in
+`fail` raised no `quality_hold` until something else refreshed the invoice, a
+typed-in `pass` lifted none, and `invoice.po_match` (which §366's clearance
+fingerprint reads) kept describing the old verdict.
+
+**Decision.**
+
+- **Re-match in the request, as receipt entry does.** After the flush,
+  `api/inspections._rematch` resolves the PO the inspection reaches (its own
+  `po_id`, or its `gr_id`'s receipt's PO; the matcher reads a receipt's own
+  inspection first) and calls
+  `refresh_invoices_citing_pos(..., org_settings=<the org's own>,
+  caller="inspections", lock_invoices=True)`. Not best-effort: a failed
+  re-match rolls the inspection back, because a verdict on file whose hold was
+  never raised is worse than no verdict, and the audit row is written after the
+  re-match so `FEOH_AUDIT_MODE=lambda` never ships one for a rolled-back row.
+  The org's own settings, because a refresh without them may raise a hold but
+  never close one.
+- **The cited documents are checked first.** The matcher reads inspections by
+  `po_id` / `gr_id` with no entity filter, and the door now releases holds on
+  the spot, so a `po_id` / `gr_id` outside the caller's `X-Entity-ID` is the
+  same opaque 404 as a missing one (it was an FK 500), a receipt on a
+  different PO than the body's `po_id` is a 422 (the matcher would never read
+  that link), and the row is booked to the cited document's entity, as a
+  goods receipt is booked to its PO's.
+- **Locked, for §389's reason.** The refresh takes the invoices `FOR UPDATE`, as
+  receipt entry does, so an inspection and an approval of one of those
+  invoices serialise on the invoice row: whichever commits second sees the
+  other. If the approval commits second, the inspection came first — the
+  forward order, still open (below). No lock cycle: the insert holds a `KEY
+  SHARE` on the PO / receipt it cites (its foreign keys) and then takes the
+  invoices, the PO-then-invoices order receipt entry takes; an approval holds
+  the invoice and takes no PO or receipt lock.
+- **The approver's own later pass does not release their invoice.**
+  `_inspection_clears_hold` already refused a manual verdict whose recorder is
+  unknown or implicated in the invoice (§262's rule). Now reachable from the
+  door, it also refuses one whose recorder approved the invoice — the
+  approval of record or any level of its chain — which is §389 applied to the
+  fourth leg: passing the goods after signing the invoice off is still one
+  person doing both. The approver set is the one §389 reads
+  (`approval_chain.approvers_in_force`, factored out of
+  `receiving_conflict_on` so both rules read one set), and the approval step's
+  `require_segregation: false` lifts it as it lifts §267 and §389; the queue's
+  `settings.exceptions.require_segregation: false` lifts it with every other
+  auto-close limit. The verdict itself lands and is what the matcher reads;
+  raising a hold is never refused.
+- **The way through is an independent person's verdict on the same leg.** The
+  matcher reads the newest inspection on the invoice's newest live receipt and
+  falls back to a PO-level one (`gr_id` NULL) only when that receipt has none.
+  So someone else's pass lifts the hold in that request when it is recorded
+  where the matcher looks: against the receipt when the hold came from a
+  receipt's inspection, against the PO when it came from a PO-level one. A
+  PO-level pass beside a receipt's `fail` is never read. Or someone else
+  resolves the held row in the queue — which does not yet refuse the approver
+  doing it themselves (`exception_lifecycle.segregation_refusal` refuses the
+  implicated set and the raiser, not approvers; the `docs/followups.md` entry
+  §389 opened now names `quality_hold` too). Like §389, this binds an
+  approver who does not use the queue.
+
+**Rejected.** *Refusing an approver at the inspection door*: an inspection
+serves every invoice on its PO, so refusing it would stop a true fact from
+being recorded for the invoices its recorder never approved (§389's argument
+for the hold over the door). *Best-effort, like the QMS sync*: that sync is a
+batch whose rows are the contract; this is one interactive write.
+
+**Still open (`docs/followups.md`).** The forward order: a manager records the
+pass (not yet an approver, so it lifts the hold) and then approves. For
+receipts §267 refuses that at the approval door; no door refuses an inspector
+yet. It needs its own refusal code catalogued on web and mobile and the bulk /
+escalation / `/complete` wiring §267 has, so it is tracked rather than folded
+in here. This closes §366's "Not done" item.
+
+## 402. The pasted vendor statement's currency is required, refused by the body schema (§377 follow-up, 2026-11-15)
+
+**Context.** §377 stopped `POST /api/vendor-statements/upload` defaulting the
+statement currency to `USD`, and §381 put `ReconciliationCreate.currency` on the
+shared `CurrencyCode` rule, but the pasted-lines door still declared it
+`= "USD"`. A run is matched only against the ledger in its own currency, so an
+API client that left the field out had a GBP statement reconciled against the
+vendor's dollar invoices: every GBP line `missing_on_our_side`, every dollar
+invoice `missing_on_their_side`. The web modal always sent a currency, so only
+API callers (and the backend tests) reached the default.
+
+**Decision.** `ReconciliationCreate.currency` is a required `CurrencyCode` with
+no default, so OpenAPI shows it required. Omitted, blank or malformed is
+FastAPI's 422 on `["body", "currency"]` (`type` `missing` or `value_error`),
+before any run is built; a lowercase code is stored uppercased. The ORM column
+lost its Python-side `default="USD"` as well (the server default went in 0113),
+so a future construction site that forgets the currency fails on insert rather
+than writing dollars. (Amended in the round-10 review gate: `_create_run`, the
+persist path both doors share, still read `(currency or "USD")`, so a caller
+reaching it with none was filtered to the dollar ledger before the insert could
+fail. It now runs `refusals.statement_currency` on its argument, so an empty
+currency is the coded 422 before anything is read.) The frontend `ReconciliationCreate` type makes `currency`
+required too.
+
+**Rejected: the upload's coded refusal on this door.** The upload refuses with
+`statement_currency_required` / `_invalid` because a multipart `Form` field
+cannot carry the shared annotation, so `api/refusals.statement_currency` checks
+it in the handler. Doing the same here means typing the field
+`str | None = None` and checking it in the handler: OpenAPI would advertise an
+optional field, and a malformed code would refuse in a different shape from
+every other JSON currency field, which all refuse through `CurrencyCode` since
+§381. A JSON body's missing required field refuses in FastAPI's shape across
+the whole API (`vendor_id` and `statement_date` on this same body already do),
+and the web client sends the field, so no translated sentence is lost.
+
+Tests: `backend/tests/test_vendor_statement_recon_api.py` (omitted, blank and
+malformed currency refused with no run created; a lowercase `eur` statement
+stored `EUR` and matched only against the EUR ledger); the existing callers in
+that file, `test_paginated_list_search_legs.py` and `test_privacy_documents.py`
+now name their currency.
+
+## 403. Business Central refuses a bill that pays another vendor, with its own code (§391 / §397 follow-up, 2026-11-15)
+
+**Context.** A purchaseInvoice in BC has two vendors: the buy-from vendor
+(`vendorId`, which we send and the duplicate lookup keys on) and the pay-to
+vendor (`payToVendorId`, which we never send). §391 posts a draft the lookup
+finds at the approved total and currency, and accepts a found `Open` one, but
+never read the pay-to. A BC user who redirected who a bill pays had it booked
+as our approved bill: the liability sat on a vendor nobody here approved,
+while our payment run paid the approved one. §397 checked the pay-to only on
+our own recognised draft, and only to decide it was no longer ours; it then
+fell to the found treatment, which posted it if the total matched.
+
+**Decision.**
+- **The bill must pay its own vendor.** A record whose `payToVendorId` is set
+  (not blank, not BC's empty GUID) and is not our linked vendor, or whose own
+  `vendorId` is not ours, is refused `pay_to_vendor_differs`, non-retryably
+  (`_bc_pay_to_redirected`; GUIDs compared case-insensitively). The lookup's
+  key pins `vendorId` only for found records; a draft we created and our
+  post's read-back have no such pin, so a buy-from vendor changed in BC
+  between our check and our post is caught too (money-path review).
+- **Every record, not only found ones.** BC fills the pay-to of a draft we
+  create from the vendor card's `Pay-to Vendor No.` (else the buy-from
+  vendor), so a standing redirect on the card reaches our own drafts too.
+  Checking only found records would refuse a lost-read retry and post the
+  same bill on a clean first attempt. So a draft is checked before its total
+  (and before any reprice): one we created is deleted (real etag), one the
+  lookup found is left in BC. An `Open` / `Paid` record is checked inside
+  `_bc_posted`, the one success builder, so a found invoice, one posted
+  between our create and read, and our post's read-back all are; a posted
+  one is never deleted.
+- **A new code**, because none of the existing ones says it.
+  `posted_total_mismatch` tells the reader to check tax settings, and the
+  totals may well agree; `existing_invoice_not_open` is about status. The
+  sentence (six locales, `erpRefusals.ts`) sends the reader to the bill's
+  pay-to vendor and the vendor card in BC.
+- **Pay-to checked before total.** A redirected draft at another total is
+  refused for the redirect, the fault a person must fix first. A draft we
+  created with a redirect is not repriced: repricing creates another draft
+  that BC would fill with the same pay-to.
+- **§397's own-draft path compared the pay-to against our vendor only**, as
+  raw strings. It now uses the same helper (empty GUID read as unset, and the
+  record's own `vendorId` compared too). An own draft with another pay-to is
+  still "no longer ours" and gets the found treatment, which is now this
+  refusal, left in BC: we cannot tell a BC user's edit from the vendor card's
+  default, and §397 deletes only what is still exactly what we sent.
+
+**Left open, accepted.** A vendor whose BC card names another pay-to vendor
+cannot be pushed until that is cleared in BC or our vendor is linked to the
+pay-to vendor instead. That is deliberate: the alternative books liabilities
+to a vendor FeohLedger did not approve. Nothing here has run against a live
+BC tenant (#654); that BC fills `payToVendorId` on the API's purchaseInvoice
+from the vendor card is BC's documented Purchase Header behaviour, not yet
+observed through API v2.0; that check, and how BC writes an unset or braced
+GUID, are on the #654 sandbox entry in `docs/followups.md`. An earlier
+attempt's own draft that BC gave the card's pay-to reads as no longer ours, so
+it is refused and left in BC, not deleted: the safe direction, since §397
+deletes only what is still exactly what we sent. fake-erp seeds no vendor with
+a card pay-to, so the refusal is covered by unit tests, not e2e.
+
+**Rejected:**
+- *Sending `payToVendorId` = `vendorId` on create.* It would override a
+  vendor card's pay-to silently, which is the accountant's setting, and does
+  nothing for a found record.
+- *Reusing `posted_total_mismatch`.* Its sentence names the wrong fix.
+
+Tests: `backend/tests/test_erp_adapter_idempotency.py` (a found draft or
+`Open` invoice paying another vendor refused and left, whatever its total;
+a pay-to equal to the vendor in another case, the empty GUID and blank all
+posted; a created draft with a redirect deleted and refused; a redirect made
+between our check and our post refused on the read-back; the helper against
+the record's own `vendorId`, which is refused even with a blank pay-to;
+§397's pay-to edit now refused with this code);
+`tests/test_erp_refusal_codes.py` and `frontend/src/lib/api/erpRefusals.test.ts`
+(the code catalogued and stated). fake-erp's BC create now states
+`payToVendorId` (the vendor card's, else the vendor's own).
+
+## 404. Whoever recorded the invoice's quality inspection may not approve it (§401 follow-up, 2026-11-15)
+
+**The gap.** §401 stopped an approver's later `pass` from lifting their own
+invoice's `quality_hold`, §389's order applied to the fourth leg. The other
+order was open: a manager records the `pass` that lifts the hold (they are not
+yet an approver, so `_inspection_clears_hold` allows it), then approves the
+invoice, and the payment run pays it. For receipts §267 refuses that second
+step at the approval door; no door refused an inspector.
+
+**Decision.** Inspecting and approving are different duties, as receiving and
+approving are. The approval door refuses the inspector with its own code.
+
+- **The set.** `approval_chain.inspection_recorders_by_invoice`: on the POs
+  the receipt rule reads (`_invoice_po_ids`, now shared by both, so the two
+  sets name the same goods), every inspection the 4-way leg could read — a
+  PO-level row (`po_id` on one of them, no `gr_id`) or a receipt's own row
+  (`gr_id` a live receipt of one of them) — that is `source = manual`, names
+  its recorder, and is booked in the invoice's own entity. An inspection on a
+  cancelled receipt is never read by the matcher and vouches for nothing, as a
+  cancelled receipt's recorder does not. A QMS verdict was typed by nobody
+  here; a row predating migration 0105 names nobody to refuse.
+- **Every verdict counts**, not only `pass`. The rule is about the duty, not
+  the outcome — a receipt's recorder is refused whatever quantity they
+  counted — and a `fail` recorder who approves is still the person who judged
+  the goods signing off the bill for them.
+- **Its own code, `approval_segregation_inspector`**, for §267's reason: the
+  refusal must name the duty that collides, or the reader cannot tell who
+  should approve instead. Catalogued for web (`codedRefusals.ts`, six
+  locales) and mobile (`coded_refusal_messages.dart`, the ARBs).
+- **The receiver's doors, all of them.** `review._figure_gates` checks it
+  after the receiving check, after any correction (a `po_number` correction
+  cannot re-point the invoice at a PO the approver inspected); bulk approve
+  resolves the batch up front (three queries whatever its size); the
+  `/complete` amount floor lands such an invoice at review; the escalation
+  sweep's `escalation_ineligible` excludes inspectors; `review_refusals`, which
+  runs the same gates, states it before the click. The approval step's
+  `require_segregation: false` lifts it, as it lifts every segregation check.
+- **Not in `implicated_actors`**, for the reason receivers are not: that set
+  is what `_inspection_clears_hold` measures an inspection's recorder against,
+  so folding inspectors in would make every typed inspection implicate its
+  own recorder and no `pass` could ever lift a hold.
+
+**Rejected:**
+- *Reusing `approval_segregation_receiver`.* Its sentence names a goods
+  receipt the approver did not record.
+- *Counting only the inspection the matcher currently reads.* Which row is
+  "latest" changes as rows arrive; the approval door would refuse or allow the
+  same person depending on someone else's later entry. Every readable row is
+  coarser and the safe error, as §267 counts every same-numbered PO.
+- *A status filter on inspections.* Nothing cancels an inspection (the QMS
+  sync and the door both write `completed`), so a filter would have nothing
+  to read; liveness comes from the receipt the row is tied to.
+
+Tests: `backend/tests/test_approval_receiver_segregation.py` (§ Inspecting ≠
+approving: the single door, bulk skip with the code, the shared
+`approve_invoice`, a correction re-pointing at an inspected PO, a receipt's
+own inspection counting and a cancelled receipt's not, every verdict counting,
+QMS / sibling-entity / unnamed / sourceless rows not counting, the opt-out,
+the batch lookup's three statements, the predicate and `escalation_ineligible`,
+the `/complete` floor); `tests/test_approval_escalation.py` (the sweep never
+targets an inspector); `tests/test_review_actions_parity.py` (the verdict
+matches the POST); `frontend/src/lib/api/codedRefusals.test.ts` and
+`mobile/test/l10n/coded_refusal_messages_test.dart` (the code stated).
+
+## 405. A Merge.dev retry after an unknown outcome waits for Merge's invoice sync, and tenant deletion deletes the Merge linked account (§399 / §400 follow-ups, 2026-11-14)
+
+**Context.** Two `docs/followups.md` (c) entries named `merge_dev.py`. **§399's
+residual:** the pre-create lookup reads `GET /invoices`, which is Merge's synced
+copy of the ERP, and the `Idempotency-Key` beta may be off for a tenant's Merge
+organisation. So a person's `retry-erp` after a create whose response was lost
+could find nothing and post a second bill. **§400's Merge share:** a deleted
+Merge tenant's confirmation said nothing about the linked account, nor about
+the webhook signature key §399 stores as `webhook_signing_secret`, which is the
+customer's own Merge organisation's.
+
+Read 2026-11-14 in Merge's Accounting OpenAPI spec
+(<https://docs.merge.dev/openapi/accounting.json>) and its pages:
+
+- `GET /sync-status`
+  (<https://docs.merge.dev/merge-unified/accounting/data-management/sync-status/list>)
+  is a cursor-paginated list of `SyncStatus` rows: `model_name`, `status` and
+  `last_sync_result` (`SYNCING, DONE, FAILED, DISABLED, PAUSED,
+  PARTIALLY_SYNCED`), `last_sync_start`, `last_sync_finished`, and
+  `data_fresh_as_of`, "the start time of the most recent sync that completed
+  successfully for the model", null until one has. Merge warns that
+  `last_sync_start` and `last_sync_finished` may belong to different syncs.
+- `POST /delete-account`
+  (<https://docs.merge.dev/merge-unified/accounting/linked-account/delete-account/delete>)
+  takes `X-Account-Token` and answers 200 with no body. Merge's help centre
+  (<https://help.merge.dev/en/articles/5388451-deleting-a-linked-account>) says
+  deletion removes the account at once and its logs later. Neither page says
+  what happens to the credentials Merge holds for the ERP behind the link.
+- The webhook guide
+  (<https://docs.merge.dev/merge-unified/reading-data/webhooks/merge-webhooks>)
+  says the signature key is per organisation and "can be regenerated".
+
+**Decision.**
+
+- **`services/erp` records when the outcome became unknown.**
+  `erp_outcome_unknown_at` sits beside `erp_outcome_unknown`. It is stamped
+  before the call, so a worker that dies mid-call leaves the attempt's start.
+  It moves to the attempt's end when the attempt comes back unknown or the
+  adapter raises. An attempt
+  that sent nothing (`not_posted`) keeps the earlier stamp, so a refusal made
+  while waiting never pushes the wait further out. A success drops it. It
+  reaches the adapter as `InvoicePayload.outcome_unknown_since`. A row flagged
+  unknown before the key existed is stamped when next read and pinned there.
+  That time is after the attempt too, so the wait it sets is safe, only longer.
+- **Merge's push asks `GET /sync-status` first, and only after an unknown
+  outcome.** The `Invoice` row must be fresh as of a time strictly after the
+  stamp. That means `data_fresh_as_of` when Merge reports it. Without that
+  field, it means a link at rest (not `SYNCING`) whose last result is `DONE`
+  and whose last sync started after the stamp. The sync status is read
+  **before** the lookup, so the listing the lookup reads is at least that
+  fresh. A bill the lookup finds is our own, and the push succeeds whatever the
+  sync says. If the lookup finds nothing and the sync is not yet past the
+  stamp, or `Invoice` is not listed, the push is refused `merge_sync_pending`.
+  That refusal is coded and not posted. It is catalogued on the web (six
+  locales); mobile has no ERP-refusal catalogue, as for every other adapter
+  code. An unreadable sync status is the retryable `sync_status_unavailable`
+  with nothing sent, the same shape as an unreadable lookup. A 401 is
+  `not_connected`. A first attempt never asks.
+- **`merge_sync_pending` is not retried automatically.** "Retryable" here means
+  that a person's retry after Merge's next sync goes through. `services/erp`'s
+  backoff retries 2 and 4 seconds later, which would meet the same sync and
+  only spend calls.
+- **A 429 and a connection never made are now `not_posted`.** Both were
+  already retried automatically on §399's reasoning that nothing reached the
+  ERP. Left counted as unknown, their own automatic retry would now wait for a
+  sync and fail the push.
+- **Tenant deletion deletes the linked account.** `revoke_stored_access` sends
+  `POST /delete-account` with the tenant's tokens (`revokes_stored_access`, so
+  a closure sends it after its commit, as for Intacct). It reads `revoked` only
+  on 200. Anything else, an outage, or a missing credential is `failed`.
+  `provider_side_disconnect` names what only the customer can end in the Merge
+  dashboard: the webhook that points at FeohLedger, the webhook signature key
+  (regenerate), the API key FeohLedger held (regenerate or delete), and the
+  linked account if it is still listed. Every outcome line names that step,
+  including `revoked`. Until the customer acts, the webhook keeps calling the
+  deleted slug's URL. A later tenant on that slug verifies under its own key,
+  so those deliveries are dropped.
+- **fake-erp** serves `GET /sync-status` with `Invoice` fresh as of now,
+  because its listing shows a write at once. It also serves
+  `POST /delete-account` (200, no body), and keeps the token working, since
+  parallel e2e workers share the fake.
+
+**Rejected.**
+
+- *Waiting on `last_sync_finished` alone.* Merge says it can belong to a
+  different sync from `last_sync_start`. A sync that started before the lost
+  create and finished after it would pass without having seen the bill.
+- *Asking for the sync status after the lookup.* A sync that finished between
+  the two reads would vouch for a listing older than itself.
+- *Forcing a resync (`POST /sync-status/resync`).* It is an organisation-wide
+  action that Merge rate-limits. It would also not change the rule: the push
+  would still have to wait for that sync to finish.
+- *Mentioning the webhook only when a signing key is stored.* A tenant can
+  register the webhook without storing the key. The step costs nothing to
+  state when there is no webhook.
+
+**Unverified (#654 sandbox).** Whether `GET /invoices` lags a write through
+Merge at all, which is the premise of the wait. The `model_name` spelling
+Merge uses for invoices: the example reads `Invoice`, matched
+case-insensitively. Whether Merge can finish a create after our client gave up
+on it (the stamp is the attempt's end, not Merge's). Whether a 429 is ever
+answered after the write reached the integration. What deleting the linked
+account does to the ERP credentials Merge holds.
+
+Tests: `tests/test_merge_dev_adapter.py` (each sync-status answer:
+`invoice_sync_covers` per field shape; covered, not yet, found anyway, not
+listed, a later page, unreadable, 401, never asked on a first attempt; a
+connection never made is not posted; the delete-account call, its failures, the
+step's wording); `tests/test_erp_push_flow.py` (the stamp: set at an unknown
+attempt's end and handed on, kept by an attempt that sent nothing, pinned for a
+legacy row, absent without an unknown outcome, moved to the end of an
+attempt that raised; the three exact-state asserts
+now strip and check it); `tests/test_tenant_deletion.py` (Merge revoked and
+named, a failed deletion never stopping the tenant's, a closure calling Merge
+only after its commit); `frontend/src/lib/api/erpRefusals.test.ts` (the code
+catalogued and stated in every locale).
+
+## 406. NetSuite connects through the pinned client, revokes its TBA token at tenant deletion, and names the certificate otherwise (§334 / §400 follow-up, issue #655, 2026-11-14)
+
+**Context.** NetSuite built six plain `httpx.AsyncClient`s and sat on
+`_PLAIN_CLIENT_ALLOWED` because its host is built from `account_id`, which is
+validated to one hostname label under Oracle's domain. That stops the token
+going to another domain, but not a rebinding record for
+`<account>.suitetalk.api.netsuite.com` answering the connect's own lookup with
+an internal address while the request carries the TBA signature or the bearer.
+And NetSuite was one of the four stored-credential ERPs §400 left silent at
+tenant deletion.
+
+**Decision.**
+
+- **Every call goes through `NetSuiteAdapter._client`**, which builds
+  `url_safety.pinned_async_client` with NetSuite's own resolver. The resolver
+  applies the shared public-address rule and raises a non-public answer as
+  `httpcore.ConnectError`, so it reaches callers as `httpx.ConnectError`: the
+  SuiteQL listings, the void-after-refusal path and the connection test
+  already treat that as a failed fetch, and an `UnsafeUrlError` (a
+  `ValueError`) would have escaped all of them. The operator override
+  (`FEOH_ERP_NETSUITE_API_BASE`, fake-erp) keeps one plain client, as §334 and
+  SYSPRO do. So NetSuite moves to `_ORG_HOST_BESPOKE` and its
+  `_PLAIN_CLIENT_ALLOWED` entry drops from six calls to that one branch; the
+  count guard now fails any new plain client in the module.
+- **TBA tokens are revoked at deletion.** Oracle's "Issue Token and Revoke
+  Token REST Services for Token-based Authentication"
+  (<https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/chapter_157017286140.html>,
+  checked 2026-11-14) documents `GET https://<account>.restlets.api.netsuite.com/rest/revoketoken`
+  with `consumerKey` and `token`, authenticated by an OAuth header, and forbids
+  only revoking another user's token. We hold the token's own consumer key and
+  secret and token id and secret, so `revoke_stored_access` signs the call with
+  that token. Oracle documents no response body, so a 2xx is not taken as
+  proof: the outcome is `revoked` only when the same token is then refused
+  `401` on `GET /vendor?limit=1`. A refusal, an outage, or a token that still
+  works is `failed`. `revokes_stored_access` is True for TBA, so a closure
+  defers the call past its commit (§371).
+- **OAuth 2.0 client credentials are `unsupported`.** Oracle's OAuth 2.0
+  revoke endpoint
+  (<https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_161071224088.html>,
+  checked 2026-11-14) revokes a refresh token and its access tokens, and this
+  grant issues no refresh token. What ends it is revoking the certificate
+  mapping, which takes an administrator or the OAuth 2.0 Authorized
+  Applications Management permission
+  (<https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_162686838198.html>,
+  checked 2026-11-14).
+- **The step follows the sign-in method.** `provider_side_disconnect` is a
+  property. For TBA it says to revoke the token under Setup > Users/Roles > User
+  Management > Access Tokens
+  (<https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/bridgehead_4249078810.html>,
+  checked 2026-11-14), "if it does not already show as inactive". For OAuth 2.0
+  it says to revoke the certificate under Setup > Integration > Manage
+  Authentication > OAuth 2.0 Client Credentials (M2M) Setup. A block whose
+  `auth_method` is unreadable names both, reads `failed`, and makes no call.
+- **fake-erp answers `revoketoken`** at `/netsuite/rest/revoketoken`, beside the
+  overridden REST root. After that, the revoked token gets `401 INVALID_LOGIN`
+  everywhere, so the adapter suite proves the call in process against the same
+  handlers.
+
+**Rejected.**
+
+- *Pinning the operator override too* (`allow_private=True`), which would take
+  NetSuite off `_PLAIN_CLIENT_ALLOWED` entirely. §334 keeps trusted operator
+  overrides plain. SYSPRO and the commerce client sit on the list for the same
+  one branch, and the list's job is to count it.
+- *Calling the certificate rotation endpoint to revoke an M2M certificate.*
+  It needs the "Manage own OAuth 2.0 Client Credentials certificates"
+  permission, which our setup never asks the customer to grant. On a role
+  without it, the call fails every time, and a failed revoke would read as an
+  attempt.
+- *Reading a 2xx from `revoketoken` as `revoked`.* The response body is
+  undocumented. Probing the token afterwards is the only evidence we can read.
+- *Blocking the integration record as the step.* The customer may use that
+  record for other integrations. The token, or the certificate, is ours alone.
+
+**Not verified.** No real NetSuite account has accepted the revoke. The fake
+encodes our reading of Oracle's page, as the rest of the NetSuite suite does
+(the sandbox follow-up, #654).
+
+## 407. Business Central and SYSPRO name the customer's step at tenant deletion, with nothing to call (§400 follow-up, 2026-11-14)
+
+**Context.** §400 made tenant deletion end or name the access a
+stored-credential ERP holds, keyed on the adapter's `provider_side_disconnect`,
+and left Merge.dev, Business Central, NetSuite and SYSPRO silent. A deleted
+Business Central or SYSPRO tenant's confirmation said nothing about access that
+outlives our sealed copy.
+
+**Decision.**
+
+- **Business Central: `unsupported`, and the customer disables our client ID
+  and deletes the secret.** The connection is service-to-service: the customer
+  registers an app in their own Microsoft Entra tenant, gives us its client id
+  and a client secret, and enables the client id on BC's *Microsoft Entra
+  Applications* page ("Using Service to Service Authentication", Task 1 and
+  Task 2,
+  <https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/administration/automation-apis-using-s2s-authentication>,
+  checked 2026-11-14). We hold the secret, never a consent or a refresh token,
+  and mint access tokens that live 60–90 minutes ("Access tokens" § Token
+  lifetime, <https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens>,
+  checked 2026-11-14). The identity platform's discovery document
+  (<https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration>,
+  read 2026-11-14) lists no `revocation_endpoint`. So
+  `BusinessCentralAdapter.provider_side_disconnect` names both halves: set our
+  client ID to Disabled (or delete it) on that BC page, and delete the client
+  secret from the app registration in the Entra admin center.
+- **SYSPRO: `unsupported`, and the customer locks out the operator.** The access
+  is the stored operator code and password. e.net's `Logoff` ends one session,
+  not the operator's ability to log on, and every operation already sends it in
+  a `finally`, so there is no session of ours to end and no call that ends the
+  credential. SYSPRO's Operator Maintenance
+  (<https://help.syspro.com/syspro-8-2025/g_programs/imp/imppmp/imppmp.htm>,
+  checked 2026-11-14) documents **Operator locked out** ("the operator is unable
+  to load SYSPRO") and **Usage for e.net business objects** = **No access**
+  ("the operator code cannot be used as a login for the business objects of
+  e.net Solutions"); the step names those, or a new password.
+- Neither adapter sets `revokes_stored_access`: the outcome is decided at the
+  read with no provider call, so a closure defers nothing.
+
+**Rejected.**
+
+- *Counting a SYSPRO `Logoff` at deletion as a revoke.* It would need a `Logon`
+  first, with the very credential we are told to forget, only to end the
+  session it just opened. It ends nothing that outlives the call, and reporting
+  `revoked` would tell the customer the operator is safe when it is not.
+- *Deleting our client secret or disabling the service principal through
+  Microsoft Graph.* Our token is scoped to the Business Central API only. Asking
+  every customer to grant us `Application.ReadWrite.*` in their directory to
+  make deletion tidier would widen what a leaked secret can do far more than
+  it narrows what deletion leaves.
+- *Asking the SYSPRO customer to change the company password too.* Every
+  operator of the company shares it; changing it breaks every other user and
+  integration, and the operator lockout already ends our access.
+- *A generic "remove FeohLedger from connected apps" line.* Neither product has
+  such a list (as §400 found for Intacct).
+
+**Side effect, accepted.** BC access tokens already issued live out their 60–90
+minutes after the customer acts; nothing on either side can shorten that. The
+confirmation's "NOT revoked: the provider has no revocation endpoint" wording
+is accurate for both: neither documents a revocation for what we hold.
+
+**Tests.** `tests/test_tenant_deletion.py`
+(`test_bc_and_syspro_are_unsupported_at_once_and_name_the_step`: no HTTP call,
+`unsupported` decided at the read on a closure's session, the step named, no
+secret in the log or confirmation) and `tests/test_erp_syspro_adapter.py`
+(`test_revoke_is_unsupported_and_calls_no_one`: no `Logon` or `Logoff`). Business
+Central has no adapter-specific suite; its case is the deletion test.
+
+## 408. The per-tenant ERP webhooks open a tenant's sealed key only after the checks that need no secret, and answer every unverified delivery the same (§399 follow-up, issue #655, 2026-11-15)
+
+**Context.** The generic `POST /api/erp/webhook/{erp_type}` and the per-tenant
+`POST /api/erp/webhook/merge_dev/{tenant_slug}` (§399) verify a delivery
+against a key sealed in the tenant's ERP credentials. Both looked the slug up
+and opened the whole sealed ERP block (`provider_config`) before they looked at
+the signature, so an unauthenticated caller could make us unseal any tenant's
+credentials on demand, without even sending a signature header. And a block
+that could not be opened (`CredentialCryptoError`) answered a bodyless 503 —
+before the signature was checked — while an unknown slug answered 204: the
+response told a slug with unreadable credentials from every other one. The
+webhook invariant is that every rejection path is the same silent 204 and only
+our own failure on a verified delivery asks for a retry. The QuickBooks and
+Xero routes verify against one platform key from the environment
+(`FEOH_ERP_QBO_WEBHOOK_VERIFIER_TOKEN`, `FEOH_ERP_XERO_WEBHOOK_KEY`) and open no
+tenant secret, so they had neither problem; their 503 already follows the
+signature.
+
+**Decision.**
+
+- **Cheap checks first, the unseal last, every refusal the same 204.** Both
+  routes now refuse, in order and without any secret: a body over the cap; on
+  the generic route, `erp_type == merge_dev`; a signature header that could
+  never verify (`webhook_security.well_formed_hex_sha256`: 64 lower-case hex
+  digits, the only thing `hexdigest()` can equal;
+  `well_formed_base64url_sha256`: strict base64url decoding to 32 bytes); on the
+  generic route, a body that is not a JSON object or a `tenant_slug` that is not
+  a string (it reached the query as a non-string bind, a 500). Then one helper,
+  `api/erp_webhook._tenant_webhook_config`, shared by both routes: the slug
+  names an organisation; its PUBLIC ERP configuration resolves to the route's
+  adapter (`integration_method` / `type` are configuration, never sealed); a
+  webhook key is stored at all, read from the sealed row's path NAMES with no
+  decrypt (`provider_credentials.stored_secret_paths`, the names-only sibling
+  of `credential_status`); and only then `provider_config` opens the block,
+  once. The signature is verified against the key it returns.
+- **A key that cannot be opened is the 204 too, not a 503.** The task allowed
+  a 503 for a real tenant's transient failure only after the signature had
+  verified, and here it cannot: the key that failed to open is the key the
+  signature needs. A 503 before verification answers a configured slug
+  differently from every other. It is logged as an error naming the slug and
+  adapter (no value), so an operator sees it. The cost is real: a genuine
+  delivery that arrives while the credential store is down is acknowledged and
+  not redelivered. With the DEK cache (`credential_crypto`, five minutes per
+  data key per process) a KMS blip mostly misses tenants that received a
+  delivery recently; a corrupted row loses every delivery until it is
+  re-saved. Tracked in `docs/followups.md`.
+- **Two small paths on the generic route corrected while there.** The dedup
+  store unreachable after the signature verifies escaped as a 500; it is now
+  the bodyless 503 the other ERP routes give. A verified body whose
+  `correlation_id` is not a UUID raised inside the handler's `try` into the 503
+  path, so the ERP redelivered the same unparseable body for ever; it is parsed
+  before the tenant DB is opened and is a silent 204 (a decision: it names no
+  invoice of ours).
+
+**What remains, stated plainly.**
+
+- The sealed block is ONE envelope per (organisation, block), so opening it
+  decrypts the block's other secrets with the webhook key. Nothing reads them
+  before the signature verifies (the Merge route needs the API key afterwards
+  to read the bill back). Sealing the webhook key on its own would need a
+  second envelope per tenant and a migration; not worth it for what it buys
+  while the plaintext lives only in this request's memory.
+- A configured tenant with a well-formed but wrong signature still costs one
+  unseal: verification needs the key. The KMS `Decrypt` behind it happens at
+  most once per data key per process per five minutes; after that it is one
+  AES-GCM operation. So the response TIME of a configured tenant can differ
+  measurably from an unknown slug's (a second control-plane query and an
+  unseal) even though the response never does. Tenant slugs are the app's
+  public subdomains, so what timing can still reveal is "this tenant has a
+  webhook key stored", not that the tenant exists.
+- The DEK cache holds at most 512 keys and clears when full, so a caller
+  cycling well-formed signatures across more configured tenants than that
+  could force a KMS call per request. Only KMS's own request quota bounds
+  that today; no limiter was added on these routes (`docs/followups.md`).
+
+*Rejected:* keeping the 503 on a credential-store failure for the provider's
+retry. It is the oracle the change removes, and it fires before anything is
+proven about the sender. *Rejected:* equalising the timing by opening a dummy
+envelope for unknown slugs — it would spend a KMS call on exactly the requests
+we want to be cheap, which is the amplification the change removes.
+
+**Tests.** `tests/test_merge_webhook.py`: a signature that could never verify
+looks nothing up; unknown slug, a tenant on another ERP, no key stored and no
+ERP open nothing; an unknown slug and a bad signature answer the same; a key
+that cannot be opened is a silent 204 logged without the key; and, against the
+real store through the ASGI app, `credential_crypto.open_envelope` is called
+zero times for an unknown slug, a keyless tenant and a malformed signature, and
+once for a well-formed wrong one. `tests/test_webhook_security.py`: the same
+for the generic route, plus the non-string slug, the non-UUID correlation id
+and the dedup store down after verifying.
+
+## 409. A Merge.dev retry's wait dates only from an attempt's recorded end, past a settle margin, and a 429 stays possibly posted (amends §405, round-11 money-path review, 2026-11-15)
+
+**Context.** The round's money-path review of §405 found one double-post path
+and two assumptions the wait leaned on that §405 itself listed as unverified.
+
+- **A dead attempt left its start as the stamp.** `services/erp` committed
+  `erp_outcome_unknown_at` before the adapter call, and only the post-call or
+  exception write moved it to the attempt's end. If the attempt died before
+  its failure was committed — a worker crash, or a deploy cancelling the task
+  (`asyncio.CancelledError` is not an `Exception`, so `send_to_erp_internal`
+  never handles it and the session rolls back) — the row kept the start. The
+  sequence: 10:00:00 the attempt starts and commits; 10:00:05 a Merge sync
+  starts and finishes; 10:00:12 our POST creates the bill; 10:00:20 the worker
+  dies. A later retry reads `data_fresh_as_of` 10:00:05 > 10:00:00, the lookup
+  reads the 10:00:05 copy, finds nothing, and posts a second bill.
+- **`fresh > since` had no margin.** `since` is when our client gave up, not
+  when Merge finished. httpx's `timeout=30` is per operation, so a request can
+  run past a minute, and whether Merge completes a create the client
+  abandoned is a #654 item.
+- **§405 moved a 429 to "nothing sent"** on §399's reading that Merge's rate
+  limit processed nothing, while listing "whether a 429 is ever answered after
+  the write reached the integration" as unverified.
+
+**Decision.**
+
+- **Only an attempt's end is a final stamp.** The pre-call commit writes the
+  start with `erp_outcome_unknown_at_final: False`. The post-call write of an
+  unknown result and the exception path write the end with `True`. A read
+  that finds the outcome unknown and the stamp not `True` (provisional, absent,
+  unreadable, or written before the flag existed) replaces it with the time of
+  the read, which is after the dead attempt, and pins that as final. An
+  attempt that sent nothing keeps the pinned stamp, as in §405. A success
+  drops both keys.
+- **`SYNC_SETTLE_MARGIN` = 10 minutes.** `invoice_sync_covers` requires the
+  `Invoice` row fresh as of strictly more than `since + SYNC_SETTLE_MARGIN`,
+  on both the `data_fresh_as_of` path and the at-rest fallback. Too short a
+  margin costs a second bill; too long costs one more sync's wait, so it is
+  generous. #654's answer to how long Merge can keep writing after the client
+  gives up resizes it.
+- **A 429 is possibly posted again, and not retried automatically.** It goes
+  through the same branch as a 5xx: non-retryable, `not_posted` False. Kept
+  retryable, `services/erp`'s retry 2 seconds later would always meet the sync
+  wait (no sync can be 10 minutes past an attempt seconds old) and fail
+  `merge_sync_pending` after a wasted call. So a rate-limited push now waits
+  for a person's retry after Merge's next sync, until #654 shows Merge never
+  answers 429 after the write reached the integration. A connection never
+  made stays `not_posted`: nothing was sent.
+
+**Rejected.**
+
+- *Committing the exception path's end stamp from inside `_call_erp`.* A
+  cancelled task cannot be relied on to finish an `await db.commit()`, and a
+  crash runs nothing. Treating the pre-call stamp as provisional covers every
+  way an attempt can die.
+- *Dating a dead attempt from its start plus the margin.* The attempt could
+  have run for longer than any fixed margin before it died; the time of the
+  next read is the only time known to be after it.
+
+**Cost.** A Merge push whose attempt died, or that met a 429, now waits for a
+Merge sync that starts more than 10 minutes after the next read or the
+attempt's end before it can be retried. That is one sync's delay, against a
+second bill in the customer's ledger.
+
+Tests: `tests/test_erp_push_flow.py` (a cancelled attempt: the row holds only
+the provisional start, and the next attempt waits from after the
+cancellation; a provisional or flag-less stamp is restamped when read; the
+exact-state helper checks the final flag; Merge's 429 sent once);
+`tests/test_merge_dev_adapter.py` (`invoice_sync_covers` inside, at and past
+the margin on both paths; the margin's floor; a 429 possibly posted and not
+retried). The #654 sandbox entry in `docs/followups.md` now names the margin
+and the 429 as what that pass settles.
+
+## 410. An ERP push runs only for an invoice still at `sending_to_erp`; any other status is skipped and the job counts as done (§374 follow-up, 2026-11-14)
+
+**Context.** `erp_dispatch._run_local` and `erp_lambda` load the invoice by id
+and call `services/erp.send_to_erp_internal` whatever status it holds. An SQS
+redelivery, or a second dispatch of the same push, can arrive after the first
+has finished. Since §374 that includes an invoice whose push failed and whose
+approval was then recalled to `ready_for_review`: the stale job posted a bill
+for an invoice under review, with figures that may be about to change. A job
+for an invoice that had already landed (`sent_to_erp`, `done`) called the
+adapter again, then hit an invalid transition and raised out of both its
+success and failure branches.
+
+**Decision.** `send_to_erp_internal` asks before every attempt, the first
+included. It re-reads the row `FOR UPDATE` with `populate_existing`, so the
+committed status decides even though the dispatchers' sessions keep loaded
+attributes across commits. Unless that status is `sending_to_erp`, the skip
+leaves behind:
+
+- **No adapter call and no status change.** Nothing about the invoice is the
+  push's to change anymore.
+- **No audit row.** The audit trail records status transitions, and none
+  happened. An `invoice.erp_*` row would also become the "latest ERP entry"
+  that the web modal's and the mobile panel's ERP status read
+  (`InvoiceModal.svelte` `erpInfo`, `erp_status_panel.dart`), so a no-op
+  redelivery would replace the real outcome in the UI.
+- **`state_data` untouched.** The retry counter, the outcome-unknown flag and
+  its final stamp (§405, §409), the pending job and the orphan keys stay as
+  the last real attempt left them. A later `POST /{id}/retry-erp` after
+  re-approval resumes from that record.
+- **One `logger.warning`** naming the invoice id and the status found (no
+  PII). It is logged before the rollback that releases the lock, because a
+  rollback expires `invoice.id`.
+- **A normal return.** The Lambda deletes the message instead of redelivering
+  a job that can never become valid, and the local worker ends.
+
+The check runs before each attempt, not only the first. Every backoff commits
+and gives the lock back, and a concurrent push of the same invoice can finish
+in that window. `sending_to_erp` leaves only by a push (`sent_to_erp` /
+`failed`), so the gate cannot pre-empt a person's action.
+
+**Rejected.**
+
+- *Checking in the dispatchers.* There are two, and `send_to_erp_internal` is
+  the only push path. One check there covers both, and any future caller.
+- *Raising so the job retries or dead-letters.* The status will not come back
+  to this job, so a retry only delays the same skip. A dead letter would page
+  someone over a correct no-op.
+- *Holding the lock across the adapter call.* `_call_erp` already commits the
+  outcome-unknown flag before the call, ending the transaction. The lock makes
+  the gate read the committed status, and the correlation-id idempotency key
+  still covers two pushes that both pass it.
+
+**Cost.** One extra locked `SELECT` per attempt. A push with no workflow
+instance (no pre-call commit in `_call_erp`) holds the row lock across the
+adapter call, as its final transition already needed the row.
+
+Tests: `tests/test_erp_push_flow.py`: each non-`sending_to_erp` status
+skipped with no call, audit row or `state_data` change, and the warning
+logged; the gate asked again after a backoff; on a real tenant, a stale
+`sending_to_erp` object whose row was recalled meanwhile posts nothing, and a
+real `sending_to_erp` push still lands. The mock-session tests point the gate
+at the fixture invoice's own status through an autouse fixture.
+
+## 411. A skipped auto-send is recovered by a sweep, inside a window, and a refusal is recorded once per approval (§304 follow-up, 2026-11-14)
+
+**The gap.** §304 runs the "send to the ERP on approval" push as post-commit
+work, in its own transaction after the approval commits. A process that dies
+in between (a deploy, an OOM) leaves the invoice `approved` with neither an
+`invoice.erp_submitted` nor an `invoice.erp_auto_send_refused` row. Nothing is
+lost, since the invoice is payable and sendable by hand, but the automation the
+workflow promised was skipped and nothing said so.
+
+**The fix.** `services/erp_auto_send_sweep` (sweep `erp-auto-send`, off by
+default, `FEOH_ERP_AUTO_SEND_SWEEP_*`) finds such approvals and runs each
+through `erp_send.send_after_approval`, the approval's own path. It does not
+re-implement any gate: the live-ERP check, the snapshot predicate
+(`auto_send_configured`), the row lock that acts only on `approved`, the plan
+and export gates, and the refusal row are all the ones an on-time auto-send
+meets. `send_after_approval` now returns what it did (`AUTO_SEND_SENT` /
+`_REFUSED` / `_SKIPPED` / `_FAILED`) so the sweep can count; the approval doors
+ignore the value. A recovered push or refusal carries `details.recovered: true`
+beside the usual `trigger`, and a NULL actor, because no person started it.
+
+**What counts as missed.** `approved` now; a snapshot with a not-disabled
+`erp_export` step carrying `auto_send_on_approval: true` (a JSONB containment
+pre-filter, exact for any workflow the builder can save, with the Python
+predicate re-applied inside `send_after_approval`); a latest approval, by its
+audit row (`invoice.approved` or `invoice.auto_approved`, the only two
+transitions that queue an auto-send), inside the window; and nothing since that
+approval answering it.
+
+- **Since that approval, not ever.** A refusal of an earlier approval does not
+  answer a re-approval after a recall: the second approval's job is the one
+  that never ran.
+- **A void is not an approval.** `POST /api/payments/{id}/void` returns an
+  invoice to `approved`, and it may already hold a bill in the ERP. A later
+  entry into `approved` by any action other than the two approval actions
+  answers the approval, so a voided invoice is never auto-pushed. Rejected:
+  keying on the latest entry into `approved` of any kind; that would have
+  re-posted voided invoices whose bill is already in the ERP.
+- **Keyed by audit row, not `approval_date`.** `approval_date` is a `Date`,
+  which cannot tell "two minutes ago" from "this morning", and it survives a
+  recall. The audit rows are joined on `correlation_id` (indexed) as well as
+  `entity_id` (not indexed on `audit_log`).
+
+**The window.** At least `FEOH_ERP_AUTO_SEND_SWEEP_DELAY_SECONDS` (5 min, floor
+60) after the approval, so the approval's own job has had its chance (neither
+the push nor a refusal can double, below, so the delay saves redundant work
+rather than guarding correctness). At most `FEOH_ERP_AUTO_SEND_SWEEP_LOOKBACK_HOURS` (24 h). The
+lookback is a fence: §304 left stored `true` flags in place, so a tenant can
+hold approved invoices from before auto-send existed whose snapshot says
+"send". Without a lookback, turning the sweep on would push every one of them,
+out of the payment queue, without anyone having chosen that. With it, only
+approvals recent enough that the automation plainly should have run are taken.
+The cost: an approval missed while the sweep itself was off for longer than the
+lookback stays unsent, as it would have without the sweep. It is still
+sendable by hand.
+
+**A cap, not a page.** `backend/CLAUDE.md` says batch size is a page, because a
+bare `LIMIT` starves the tail when the work does not change the state the sweep
+filters on. This work does: a recovery is sent (no longer `approved`) or
+refused (a refusal row now answers the approval). So each tenant takes at most
+`FEOH_ERP_AUTO_SEND_SWEEP_BATCH_SIZE` (100) a tick, oldest approval first, by
+`(approved_at, id)`, a total order. The one case that stays a candidate is a
+send that raised unexpectedly and wrote nothing. It is counted in
+`invoice_failures`, so `GET /api/health/sweeps` reports the tick `partial` and
+the streak alert fires if it persists, and the lookback releases the row after
+at most that window, so no row holds the tail for ever.
+
+**An approval made before the ERP was live is not a missed one.** The
+approval's job returns without writing anything when the tenant has no live
+ERP (the mock, or none), so that trail looks exactly like a crash's, and a
+tenant that approves on the mock and then connects a real ERP would otherwise
+have its last day's flagged approvals pushed as "recovered". For an OAuth ERP
+(QuickBooks, Xero, Sage) the connection's `settings.erp.oauth.connected_at` is
+a second floor under the lookback: an approval before it is never taken. A
+reconnect moves that stamp forward too, which only ever excludes more. A
+directly configured ERP (NetSuite, Business Central, Intacct, SYSPRO) records
+no such moment, so for those the residual stands, bounded by the lookback: an
+approval made on the mock up to 24 hours before the live ERP was saved can be
+pushed once. Rejected: writing an `invoice.erp_auto_send_skipped` row whenever
+the job finds no live ERP. That would put a new action on every approval in
+every mock tenant with the flag on (all the dev and e2e ones), and need its
+own label on three clients, to close a narrow window the lookback already
+bounds.
+
+**A refusal is recorded once per approval, under the row lock.** The push
+could never double: `start_erp_send`'s `approved → sending_to_erp` transition
+under the invoice row lock is its guard. A refusal could, and not only between
+two sweep replicas. `audit_log.created_at` is its transaction's start, so a bulk
+approve's rows all carry the batch's start while its one post-commit job works
+through the invoices in turn; a batch whose job outruns the delay can meet the
+sweep on the same approval. `erp_send` now asks, under the invoice's row lock,
+whether a refusal of the latest approval is already on the trail, and writes
+nothing if so (`_refusal_already_recorded`). Two runs on one approval
+serialise on that lock, and the second sees the first's committed row. This
+makes the refusal idempotent in itself, for the approval doors too, so no
+cross-request lock is needed. Rejected: a per-tenant session-level advisory
+lock held for the pass. It was the first draft, and review found it a
+liability. It did not cover the bulk-job case. It held a pooled connection idle
+for up to a hundred sends. A cancellation during the unlock could return the
+connection to the pool still holding the lock. And session-level advisory
+locks break silently behind a transaction-pooling proxy. In
+`FEOH_AUDIT_MODE=lambda` the refusal row lands later through SQS, so the check
+cannot see it there; the delay is what covers that mode, and the push still
+cannot double.
+
+**Production.** Off by default, like every sweep that calls out. Turning it on
+is a (b) entry in `docs/followups.md`, ordered after the §304 check of stored
+flags.
+
+Tests: `backend/tests/test_erp_auto_send_sweep.py` (sent once and marked; a
+refusal recorded once; both edges of the window; a re-approval after an earlier
+refusal; a void back to `approved`; snapshots that do not say so; a mock-ERP
+tenant; two sweeps at once recording one refusal; a refusal already on the
+trail not recorded again; an approval before and after an OAuth connection;
+a raising send counted as a failure the health report sees; the cap taking the
+oldest first; off by default and registered). `tests/test_sweep_health.py`
+pins the name, the flag and the lifespan start.
+
+## 412. A Sage Intacct entity is its own ERP realm; migration 0131 stamps a located connection's links with its current location (§395 follow-up, 2026-11-14)
+
+**The gap.** `services/erp_link_realm` keyed Sage Intacct by `company_id`
+alone (§284's realm). With `location_id` set, every Intacct call carries
+`X-IA-API-Param-Entity`, and an entity holds vendors and accounts the top
+level and its sibling entities do not. Re-pointing a connection at another
+entity of the same company therefore kept the first entity's vendor and GL
+links as this realm's, and the push sent a vendor id the new entity does not
+hold. Intacct refuses it and the adapter reads the refusal back as
+`vendor_inactive`, which tells the user to reactivate a vendor that is fine.
+
+**The realm.** The Intacct identity is now `<company>|<location>`, the
+location normalised like every identity field and **appended only when set**
+(`_OPTIONAL_IDENTITY_FIELDS`). A location change is then a realm change like
+a QuickBooks company change, with nothing new to build: the push refuses the
+old entity's links (`vendor_not_linked` / `account_not_linked`); the next
+vendor and chart sync files them as kept links for that entity (§356, §376)
+and re-judges each by evidence; a return to the first entity posts its vendor
+links at once and restores its GL state at the next chart sync. A pushed
+bill's `state_data.erp_realm` carries the entity too, so the status sync and
+the write-back stop reading a bill in an entity the connection no longer
+reaches, and a bill there is held as `erp_bill_unlinked_other_company`.
+
+**Rejected: always writing the delimiter** (`sage_intacct:<company>|` for the
+top level). It would make every pre-0131 stamp distinguishable from a new one,
+but it changes the realm of every Intacct connection, so every top-level
+tenant's links and bills would need rewriting for no change in meaning, and
+0115's frozen realm (pinned to the live function by its test) would stop
+matching. Appending only when set leaves a top-level connection's realm
+exactly as it was.
+
+**Migration 0131: what an existing stamp's location was.** Nothing recorded
+the location a link or bill was made under. The only location anything knows
+is the connection's own at migration time, so 0131 reads a stamp naming the
+org's **current** company as made under its **current** location, and
+rewrites `sage_intacct:<company>` to `sage_intacct:<company>|<location>` in
+every place a realm is stored: `vendors` / `gl_accounts.erp_link_realm`, the
+pending `erp_link_candidates.realm`, `vendor_erp_links` /
+`gl_account_erp_links` (+ candidates), `workflow_instances.state_data.erp_realm`,
+and 0115's `settings.erp.legacy_link_realm` on the control plane. That is a
+guess for one case, and this says so: a link made at the top level before the
+location was set is attributed to the location. Nothing distinguishes it, and
+if the guess is wrong the next sync re-judges it by evidence. A top-level
+connection's stamps are untouched, since its realm did not change. A stamp
+naming another Intacct company is untouched too, and now reads as that
+company's top level. With no connection to that company there is no location
+to name. Leaving the stamp is the honest reading. It matters only if the
+tenant reconnects to that company's top level, where a kept vendor link made
+under one of its entities would post before any sync, as every kept link does
+(§356). Whether Intacct then refuses the id or another vendor holds it depends
+on whether vendor ids repeat across entities, which is not verified yet; the
+sandbox pass in `docs/followups.md` (Verify the SYSPRO, Sage Intacct, ...
+adapters, #654) now names that question.
+
+**Rejected: nulling the old stamps and leaning on 0115's legacy trust.** A
+NULL link is trusted by the push only while the realm equals
+`legacy_link_realm`. Re-pointing that snapshot at the Intacct entity would
+also trust every older NULL link in the tenant, including those made under a
+previous ERP or a mock sync, on Intacct pushes. **Rejected: leaving old stamps
+to the next sync, no migration.** A located connection's links would refuse
+until a sync, and every bill it had pushed would read as another company's,
+opening `erp_bill_unlinked_other_company` holds on invoices that are fine.
+**Rejected: a realm alias** (a control-plane map of "old stamp means new
+realm") honoured by every reader. Every link reader, both syncs, the kept-link
+restore and four bill-realm comparisons would carry it permanently, for a
+one-off.
+
+**How a tenant migration knows its organization's connection.** A tenant
+database holds no organization settings, so `alembic/env.py`, on a
+`FEOH_MIGRATE_TENANT` run, puts a lookup in
+`config.attributes["tenant_organization_erp"]`. It reads that tenant's
+`organizations.settings->'erp'` from the control plane by `db_name`, through
+the app's engine factory (IAM auth included), on first call only, awaited on
+the migration's greenlet. It reads and never writes, so the objection to a
+tenant migration that reads the control plane (§266: two databases, no
+atomicity between a copy and a strip) does not arise. Without the lookup (a bare
+`MigrationContext`, or the control plane's own run over its tenant-table
+copies) 0131 cannot tell which stamps to rewrite. It raises if the database
+holds any `sage_intacct:` stamp, and is a no-op otherwise.
+
+Tests: `tests/test_erp_link_realm.py` (the entity realm, and a location change
+that refuses, re-judges, keeps and restores the entity's vendor and GL links);
+`tests/test_migration_0131_intacct_location_realm.py` (the frozen realm pinned
+to the live one; every stamp kind rewritten for the current company only,
+idempotent and reversible; other connections untouched; the refusal without
+the org's settings; the control-plane snapshot; and a real
+`FEOH_MIGRATE_TENANT` `alembic upgrade` from 0130 through env.py's lookup).
+
+## 413. The record dialog shows the ERP's figure and split, and names no rail over a split that stands (§386 and §396 follow-ups, 2026-11-15)
+
+**The gap.** A `paid_not_recorded` row keeps the cash the ERP states
+(`erp_report.amount` / `amount_currency`, §386) and how it was paid rail by
+rail (`payment_parts`, §396), and the one-click record books both. The dialog
+on `/exceptions` showed neither. A person saw an `amount_mismatch` refusal
+without the figure to reconcile, and a payment made on two rails asked for one
+rail the server then ignored, with a response whose `method: null` said
+nothing about why.
+
+**The rule.**
+
+- **Both figures, never compared on the client.** The dialog shows the ERP's
+  figure in the code the ERP stated beside the invoice's amount in the
+  invoice's own code. The followup said "in the invoice's currency"; we render
+  each figure in its own code instead (`frontend/docs/money-formatting.md`).
+  The two codes differ exactly when the server refuses the record (§386), and
+  labelling the ERP figure with the invoice's code would hide that. A row
+  stating no figure says so: the bill is read again at record time (§393).
+- **Whether a split stands is the server's call.** "Stands" means the
+  breakdown adds up exactly, in whole cents, and spans more than one rail
+  (`split_by_rail` applies it). That needs exact sums, which the client may
+  not do. The row carries `erp_payment_split_stands`, computed by
+  `external_payment.split_stands_over_any_rail`, the same rule `_rail_split`
+  uses to keep a breakdown against a person's rail. The client compares
+  rails only, to decide when to show a split at all (more than one rail; a
+  part with no rail stated counts as one).
+- **No rail is named over a split that stands.** The picker becomes a
+  read-only line and the body omits `method`. The server's `method` is
+  optional on `record-erp-payment` only. An omitted rail is accepted only
+  when the figure being booked (stated, or the read-back's) carries a
+  breakdown that stands. Anywhere else it is 422
+  `erp_payment_method_required`, because the person's rail is then the record
+  (one rail, none, or parts that do not add up). `record-outside` still
+  requires a rail. Rejected: sending the prefilled or first part's rail
+  anyway. The server would ignore it, but the audit's `method_stated` would
+  record a pick nobody made. A null `method_stated` beside an `applied`
+  breakdown says what happened.
+- **A split that does not stand is shown, with the picker.** The note says the
+  parts do not add up, so the split is not kept and the rail chosen is
+  recorded for the whole payment, as `_rail_split` books it.
+- **The payment says how it split.** `PaymentResponse.rail_breakdown` (each
+  part's rail or null and amount, through `rail_parts_from_json`, so a
+  malformed array reads as none) explains `method: null` on every payment
+  read, not only this one.
+
+**Mobile.** The mobile exception detail has no record flow (it shows the
+PO-rematch note only), so it has nothing to change.
+
+Tests: `tests/test_payment_methods.py` (the stands rule against
+`_rail_split` for every rail a person could name; `PaymentResponse`'s
+breakdown and a malformed one; only the ERP record may omit the rail);
+`tests/test_erp_status_sync.py` (the detail's verdict, the response's
+breakdown, no rail over a standing split audited as `method_stated: null`,
+422 with nothing booked over one rail, a cent short, or no breakdown);
+`frontend/src/lib/types/erpReport.test.ts` (parts as booked, malformed as
+none, rails only); `codedRefusals.test.ts`;
+`tests-e2e/payments/erp-reported-payment.spec.ts` (the figures beside each
+other, the split shown and booked with no rail sent).
+
+## 414. A recalled approval is an outbound webhook event, and the published OpenAPI carries the webhook catalogue (§374 follow-up, 2026-11-14)
+
+**The gap.** `transition_invoice` emitted `invoice.approved` to webhook
+subscribers, but the recall (§374) emitted nothing. An integrator that acted on
+the approval (queued the bill, told the supplier it would be paid) never
+learned it had been withdrawn. And the published OpenAPI described none of the
+webhooks: the push half of the developer contract lived only in
+`backend/docs/public-api.md`.
+
+**Decision.**
+
+- **`invoice.approval_recalled` joins `WEBHOOK_EVENT_TYPES`.** It is emitted
+  from the same hook as its siblings, `workflow_engine._maybe_emit_webhook`,
+  keyed off the transition's action (`RECALL_ACTION`, the only action allowed
+  to walk `RECALL_EDGES`), not its resulting status: `ready_for_review` is also
+  where a resubmit or a fresh extraction lands, and those are not events. The
+  hook now receives the action, the status left and the actor from
+  `transition_invoice`.
+- **What it carries.** The same invoice fields as `invoice.approved` (id,
+  number, vendor name, amount as an exact string, currency, status, here
+  `ready_for_review`), plus `recalled_from` (`approved` or `failed`) and
+  `recalled_by_user_id`, the recaller's opaque control-plane id. **Not** the
+  reason: it is free text a person typed, so it can hold anything, and it stays
+  in the `invoice.approval_recalled` audit row. The user id is the one datum
+  `invoice.approved` does not carry: pseudonymous (no name or email crosses
+  the boundary, and only the customer's own admins can map it to a person),
+  sent to the customer's own endpoint, and what lets a receiver attribute the
+  withdrawal at all.
+- **Each event's `data` is defined once**, as a Pydantic model in
+  `app/schemas/webhook_events.py`. The emitters build the payload through it
+  (`model_dump()`), and `api/v1_openapi.build_public_openapi` publishes it
+  under the OpenAPI 3.1 `webhooks` section (one entry per catalogued type: the
+  signed envelope, the delivery headers, `data` as a component `$ref`), and the
+  `/api/v1/docs` page lists them. Building through the model, rather than a
+  parallel schema checked against hand-written dicts, means the published
+  payload and the bytes a receiver gets cannot drift. The existing three
+  events' payloads are byte-for-byte unchanged.
+- **One catalogue, held together by a test.** `tests/test_webhook_event_catalogue.py`
+  fails unless the models, the summaries, the admin page's event picker
+  (`frontend/src/lib/types/webhooks.ts`, read as source) and the spec's
+  `webhooks` entries all name exactly `WEBHOOK_EVENT_TYPES`, and each emitter
+  sends exactly its model's fields. `invoice.approval_recalled:<uuid>` is 62
+  characters, inside `webhook_deliveries.event_id`'s 64.
+
+**Timing, kept as it is.** Like `invoice.approved` and `payment.settled`, the
+recall is emitted inline in `transition_invoice`, and `emit_event` commits the
+delivery row in its own control-plane session — before the tenant transaction
+that changed the status commits. A rollback after that point delivers an event
+for a change that did not happen. That holds for all three invoice events, so
+the recall keeps its siblings' timing rather than diverge; moving the hook onto
+`post_commit.enqueue_post_commit` for all of them is a (c) entry in
+`docs/followups.md`.
+
+**Considered.** A separate `invoice.status_changed` event carrying every
+transition: rejected, because receivers subscribe to meanings, and a generic
+event would push the state machine's graph into every integration. Emitting
+`invoice.approved` again with a `recalled: true` flag: rejected, because a
+receiver filtering on the event type would read the withdrawal as a second
+approval.
+
+**Where.** `app/models/webhook.py`, `app/schemas/webhook_events.py`,
+`app/services/webhooks/dispatch.py`, `app/services/workflow_engine.py`,
+`app/api/v1_openapi.py`, `frontend/src/lib/types/webhooks.ts` and the six
+locale hints. Tests: `tests/test_webhook_event_catalogue.py`;
+`tests/test_invoice_recall_approval.py::test_the_recall_is_delivered_to_webhook_subscribers`
+(the door, end to end, to a delivery row). Docs: `backend/docs/public-api.md`
+(§ Event catalog, § Payload, § Event sources wired, § Published OpenAPI spec),
+`backend/docs/api-surface.md` (`/invoices`, `/webhooks`). Closes the §374
+follow-up "nothing outside FeohLedger hears that an approval was recalled".
+
+## 415. A Xero consent without the payments scope is recorded on the connection, and a supplier no sync can see is linked by hand (§386 follow-ups, 2026-11-14)
+
+**Context.** §386 left two Xero follow-ups. A connection consented before
+`accounting.payments` was asked for cannot list payments, and the sweep read
+that 401/403 as an incomplete change listing and fell back to reading every
+payable bill: correct, but it spent the organisation's daily allowance (1,000
+calls on Xero's Starter tier) on every tick, and nothing told the admin why.
+And the vendor walk (`IsSupplier==true OR IsCustomer==false`, plus every
+unbilled PO's contact) cannot see a contact that is already a **customer** and
+has had no bill and no PO from us, since Xero sets `IsSupplier` only on a
+contact's first bill; that vendor's first push was refused
+`vendor_not_linked`, and only a bill, the very thing refused, could ever flag
+it.
+
+**Decision — the scope gap is a coded state on the connection.**
+
+- **Found by the refusal, not guessed from the token.** `changed_bills` reads
+  `Invoices` first, so when Xero then refuses the `Payments` listing 403 the
+  token has just been honoured for this organisation, and the refusal is the
+  missing scope. **A 401 is not a gap**: it has already been through
+  `RefreshOnUnauthorized`'s replay, so it means the token was not accepted,
+  and recording it would stop the payments listing and the write-back for
+  good (only a reconnect clears a gap) for a reason that is not the scope. It
+  fails the pass with its mark unmoved, like a 503 (the review caught a first
+  draft that took 401 too). The adapter raises `ErpScopeMissing(code=
+  "payments_scope_missing", bill_ids=<what Invoices found>)`. Rejected:
+  reading the access token's `scope` claim (unverified, its shape
+  unpublished, and a misread would stop the payments listing on a consent
+  that has it until someone reconnects).
+- **Recorded once, by the status sync.** `sync_org` writes
+  `settings.erp.oauth.scope_gaps = ["payments_scope_missing"]` through
+  `erp_oauth.update_connection_metadata`, keyed to the connection id. That
+  pass still reads every payable bill, as every pass before it did, so the
+  switch loses nothing the missing listing would have named since the mark.
+  A reconnect mints a new block (`new_connection`) asking for every scope, so
+  the gap clears itself; nothing re-probes.
+- **Then the adapter stops asking.** `OAuthErpAdapter.scope_gaps()` reads the
+  recorded codes from its config. With the payments gap, `changed_bills`
+  reads the incremental `Invoices` listing alone (no request a certain
+  refusal answers, no full fall-back), and `post_payment` / `void_payment`
+  refuse `payments_scope_missing` before any call (a new `ERP_REFUSAL_CODES`
+  member, localized as `erpRefusal.paymentsScopeMissing`), where before they
+  spent a 401 (and a token refresh) and read it as an HTTP failure.
+- **Shown.** `GET /api/organization/erp/oauth/status` states `scope_gaps`
+  (empty while the connection needs reconnecting anyway), and
+  `ErpConnectionPanel` says what is limited (`org.erp.oauth.scopeGapPayments`;
+  an unknown code reads as the generic `scopeGap`) and offers Reconnect, the
+  button it already showed for an expiring connection. The on-request pass
+  stays available: it reads the Invoices listing.
+
+**Accepted residual.** With the gap recorded, a payment reaches us only when
+it moves its bill's `UpdatedDateUTC`. Applying or deleting a payment changes
+the bill's `AmountPaid`, `AmountDue` and possibly `Status`, so it should; the
+`INVOICE` webhook (§392) rests on the same assumption. Unconfirmed live
+(`docs/followups.md` (b), the Xero webhook entry).
+
+**Decision — a vendor is linked to an ERP record by hand.**
+
+- **Search the whole contact list, on demand, from the vendor page.**
+  `ErpAdapter.search_vendors(name, tax_id)` (`supports_vendor_search`; Xero:
+  `GET Contacts?searchTerm=` and `?where=TaxNumber==""`, archived included,
+  one page of 50 each, `truncated` past it) and `get_vendor(id)` (`GET
+  Contacts/{id}`). `searchTerm` covers Name, FirstName, LastName,
+  ContactNumber and EmailAddress (Xero-OpenAPI `xero_accounting.yaml`,
+  checked 2026-11-14; the developer site refuses automated reads), so the tax
+  number needs its own `where`. Not a listing: absence proves nothing and no
+  sync reads it. A tax number with a quote or backslash is not searched for;
+  the tax-number URL's query is redacted from the httpx log (marker
+  `taxnumber`).
+- **The tax number never travels.** `POST /api/vendors/{id}/erp-links/search`
+  takes only a name (`query`, the vendor's own when blank); the server reads
+  the vendor's stored tax number itself, and a candidate says only
+  `tax_id_matches` (separators and case aside), `active`, and
+  `linked_elsewhere` when another vendor holds it in this company (a flag, not
+  the holder's id: realm uniqueness is org-wide, but the holder may sit in an
+  entity the searching user cannot see).
+- **The link re-reads the record and keeps every link rule.** `POST
+  …/erp-links/link` re-reads the record by id (404 `erp_vendor_not_found`,
+  409 `erp_vendor_inactive`); refuses a vendor already linked in this company
+  (row, kept, or a row link naming no company: 409 `vendor_erp_link_exists`,
+  unlink first, §375) and a record another vendor holds here (409
+  `erp_vendor_already_linked`); keeps a row link from another named company
+  (§356); writes only the link, stamped with the connected company (§284). A
+  later sync that lists the record matches it by id; one that does not leaves
+  it alone (a same-company link is never re-judged). Audited
+  `vendor.erp_linked` with the record's ERP name. `vendor.manage`, like the
+  unlink. The vendor modal mounts the search keyed by vendor, and a search
+  answer that lands after the vendor changed is dropped.
+- **One lock for every writer of new links in a company.** The check-then-write
+  runs under the vendor row lock and an advisory transaction lock on
+  `(organization, realm)` (`vendor_erp_manual_link.link_lock`), which
+  `sync_vendors_from_erp` now takes too, so two links of one record, or a link
+  racing a sync's name adoption, cannot both land.
+- **Offered only where it can run.** `GET /api/vendors/{id}/erp-links` states
+  `search_available` from the stored settings alone (the adapter class and a
+  named company; no credential store opened on a read), and the vendor modal
+  shows the search to a `vendor.manage` holder only then.
+- Rejected: syncing the found contact through `sync_vendors_from_erp` (it reads
+  a whole listing, and a one-record pull would unlink by absence and count
+  names wrongly); widening the walk to every contact (customer-only contacts
+  can number in the thousands, and the name rule would link the wrong one);
+  returning the tax number masked (any part of it is more than the person
+  needs to choose).
+
+**fake-erp.** `GET /xero/…/Contacts` honours `searchTerm` and `where=
+TaxNumber==`, and the customer `xero-contact-2` carries a tax number, so the
+hand-made link can be driven against it.
+
+**Not verified live:** that Xero answers a missing scope 403 (a 401 there
+would leave such a connection failing its passes instead, visibly, until a
+reconnect), that a
+payment moves the bill's `UpdatedDateUTC`, and the two Contacts searches
+(added to the Xero Demo Company checks in `docs/followups.md` (b)).
+
+Tests: `tests/test_xero_status_sync_adapter.py` (the gap raised with the
+Invoices bills, a recorded gap reading Invoices alone, a 503 still failing the
+pass, the write-back and void refused before any call);
+`tests/test_erp_status_sync.py` (the sweep records the gap once, reads every
+bill on that pass, and the next pass is built from it with no full read);
+`tests/test_erp_oauth.py` (`scope_gaps` on `/status`, none while reconnecting,
+none on a fresh consent); `tests/test_erp_xero_adapter.py` (both searches,
+the unsafe tax number, truncation, `get_vendor`, the path guard, the log
+redaction); `tests/test_vendor_erp_manual_link.py` (search and link on real
+rows, every refusal, the kept link, the audit row, `vendor.manage`, a later
+sync leaving the link, `search_available`); `tests/test_sod_endpoint_wiring.py`;
+`src/lib/types/erpConnection.test.ts` (`oauthScopeGapKeys`, the strings in
+every locale); `src/lib/api/codedRefusals.test.ts` (the five link refusals);
+`src/lib/types/vendor.test.ts` (`erpCandidateLinkable`);
+`tests-e2e/organization/erp-connection.spec.ts` (the panel's gap and
+Reconnect) and `tests-e2e/vendors/erp-unlink.spec.ts` (find and link, stubbed
+ERP).
+
+## 416. A vendor create ends on the new vendor's detail, over the unchanged list (closes a `docs/followups.md` entry, round 12, 2026-11-14)
+
+**Context.** `/vendors` is ordered by name and pages 25 at a time, and
+`CreateVendorModal`'s `onsaved` only refetched page one. On a tenant with more
+than a page of vendors, a new vendor whose name sorted past page one did not
+appear after it was created, and nothing but the closed dialog said it had
+been saved. `tests-e2e/vendors/create-invite.spec.ts` hit it on a well-used
+e2e tenant.
+
+**Decision.** After `CreateVendorModal` saves, the page closes it and opens the
+new vendor's `VendorModal` (`routes/vendors/+page.svelte::openCreatedVendor`),
+then refetches the list behind it. The detail is a dialog over the list, so
+the list's URL-backed `?search=&status=&sort=&order=` is untouched and closing
+the detail returns the user to exactly the view they created from. The page
+waits for the create dialog to unmount (`await tick()`) before opening the
+detail, so the create dialog's focus restore lands on **+ New Vendor** first
+and the detail records that as its trigger: focus moves into the detail on
+open and returns to **+ New Vendor** on close (WCAG 2.4.3), never to a control
+inside a dialog that has already gone. `CreateVendorModal`'s contract is
+unchanged (`onsaved(vendor)` still hands the created vendor back), and
+`/vendors` is its only caller.
+
+**Rejected.**
+
+- *Pinning the new vendor at the top of the list until the next reload.* A row
+  out of sort order is a second ordering rule the table has to explain, and it
+  disagrees with the count, the chips and Load more until it disappears.
+- *Filtering the list to the new vendor.* It rewrites the user's own
+  search / status in the URL, so Back and a shared link no longer show the
+  view they were working in.
+
+**Cost.** A user creating several vendors in a row closes each detail before
+the next **+ New Vendor**. That is one Esc, and the detail is where the next
+step for a new vendor (screening, bank details, invite) starts anyway.
+
+Tests: `tests-e2e/vendors/create-invite.spec.ts` (the create dialog closes, the
+detail opens on the new vendor's name with focus inside it, and Esc returns
+focus to **+ New Vendor**). No vitest: the change is a dialog hand-off with no
+logic separable from the DOM.
+
+## 417. The generic ERP webhook matches a delivery with no correlation id by the ERP's document id, to exactly one invoice in the push's realm (§302 follow-up, round 12, 2026-11-14)
+
+**Context.** `POST /api/erp/webhook/{erp_type}` resolved an invoice only by
+`correlation_id` and returned early without one ("not supported yet"). A
+provider whose webhook names its own bill but does not echo our correlation id
+therefore had every status change dropped. Since §302 the bill id a confirmed
+push returned is on `invoices.erp_document_id`, so there is a column to look
+it up by; the followup (`docs/followups.md`, "Surfaced by storing the ERP
+document id on the invoice") asked for that lookup, acting only on exactly one
+match. QuickBooks, Xero and Merge.dev have their own routes, which already
+match a bill by `erp_reference` within the push's realm (§392, §399), so this
+is for direct integrations on the generic route.
+
+**Decision.**
+
+- **The lookup sits after the signature, inside the tenant's own database.**
+  §408's order is unchanged: every secret-free check, then the unseal, then
+  the HMAC, then dedup and the status map. A document id that can name no
+  invoice (not a string or integer, blank, or longer than the column's 255) is
+  refused with the body's other shape checks, before the tenant database is
+  opened. A correlation id that is present still decides alone, unparseable
+  ones included.
+- **Exactly one candidate, or nothing.** `api/erp_webhook._invoice_id_by_document`
+  selects distinct invoice ids carrying the id (limit 2). Two or more is the
+  same silent 204 as none, logged as a warning without the id: an ambiguous
+  id is never resolved by picking one, because the wrong invoice moving to
+  `paid` or `failed` is worse than a status a person can still see in the ERP.
+- **Scoped to the realm the push recorded.** An invoice whose push stamped
+  `state_data["erp_realm"]` counts only when it equals the realm the tenant's
+  connection names now (`erp_link_realm.connection_realm`), so an id issued by
+  another ERP, or another company of the same ERP after a reconnect, matches
+  nothing. A push from before realms were recorded has none and is judged by
+  the id alone, as §392's correlation path judges it; a connection that names
+  no realm (`mock`) matches only those.
+- **Same row lock, re-checked under it.** The id found is locked through
+  `get_invoice_for_update`, like the correlation path, and the handler stops if
+  the locked row no longer carries the document id: a confirmed re-push can
+  replace the bill between the lookup and the lock.
+- **Indexed, not unique.** Migration 0132 adds `ix_invoices_erp_document_id`
+  (tenant DBs; declared `index=True` on the model for `create_all`). A unique
+  index was rejected: a provider repeating an id would then make the second
+  confirmed push fail to save, where today the webhook refuses the ambiguous
+  id and the push still records what the ERP returned.
+
+**Rejected.**
+
+- *Matching `state_data["erp_reference"]` instead.* It falls back to the
+  `"UNKNOWN"` placeholder and is unindexed JSON; the column holds only the
+  ERP's real id (§302).
+- *Taking the newest of several matches.* Recency says nothing about which
+  invoice the ERP meant.
+
+**Cost.** A provider that reports a bill under an id no confirmed push
+recorded (or two invoices sharing one) still has those events dropped
+silently; they are visible only in the ERP. That is the same outcome as before
+for them, and correct for everyone else.
+
+Tests: `tests/test_erp_webhook_transitions.py` (an unusable id never opens the
+tenant DB, signed or not; a forged delivery never reaches the lookup; over a
+real DB, one match moves with and without a recorded realm, two invoices
+carrying the id are both left alone, an id pushed to another realm matches
+nothing, and a forged delivery moves nothing). Migration 0132 is held by
+`tests/test_migration_model_index_parity.py` and `tests/test_alembic_revision_ids.py`.
+
+## 418. A bulk approve is a review decision: `POST /bulk/status → approved` skips a row not in `ready_for_review` (closes the §305 follow-up, round 12, 2026-11-14)
+
+**Context.** §305 put the four single review doors (in-app approve / reject,
+email, Slack, Teams) on one predicate, `review.awaiting_review`, and left
+`POST /api/invoices/bulk/status` with `status=approved` able to move a `new`
+draft (and a `pending` row the reader was still on) straight to `approved`,
+through the same approve gates. Segregation and the money limits held there;
+the review stage did not. Whether that was a manager's deliberate direct
+approval or a hole was left as a product call in `docs/followups.md`.
+
+**Decision.** It is a hole. The bulk `approved` branch calls
+`review.refuse_unless_in_review` for each row before the version check and
+before `approve_invoice`, and reports a refusal as that row's skip through
+`_refused_skip`: code `invoice_not_in_review`, the four doors' own code and
+sentence, so the web list and every locale already state it
+(`frontend/src/lib/api/codedRefusals.ts` → `refusal.invoiceNotInReview`). An
+approval by a person now always follows a review stage, whichever door it came
+through. The check answers before the stale-version skip: being a draft is the
+fact the approver needs, not that its version was not bound.
+
+**What else moves an invoice to `approved` without review, and why it stays.**
+
+- `/complete`'s amount floor (`settings.approval.auto_approve_below`,
+  `new → approved` as "system (below threshold)") and extraction's
+  auto-approve (`pending → approved`, `decide_auto_approve`) are org policy
+  that removes the review step on purpose, under their own gates (segregation,
+  the once-approved rule of §379, an entry-only caller never firing either).
+  They are not a person deciding an invoice, so this rule does not reach them;
+  `approved_by` names the system on both.
+- The exception agents (`gl_coding`, `amount_mismatch`, `missing_po`,
+  `multi_po_split`) already re-check `ready_for_review` under the row lock
+  before `approve_invoice`.
+- `workflow_engine.VALID_TRANSITIONS` keeps `new → approved` and
+  `pending → approved`: the two policies above walk them. The edge is not the
+  door; the doors are.
+
+**Rejected.**
+
+- *Keeping `new → approved` in bulk as a manager's direct approval.* It is the
+  one path where a person signs an invoice nobody submitted for review, and the
+  web picker never offered it (`VALID_TRANSITIONS` on the client has no
+  `new → approved`), so only the API and the mobile sheet could reach it.
+- *Calling `refuse_unless_in_review` inside `approve_invoice` itself.* Every
+  caller already checks first (the single door, the three message doors, the
+  agents), so it would change no outcome today while breaking the service-level
+  tests that drive `approve_invoice` with bare namespaces. The doors-check
+  pattern is the established one; a new approval door must call it, as the bulk
+  one now does.
+
+**Cost.** A script that bulk-approved drafts now gets them back as skips and
+has to submit them first (`ready_for_review`), which runs `/complete`'s
+required-field check.
+
+Tests: `tests/test_bulk_status_controls.py` (`new`, `pending` and `rejected`
+rows skipped with `invoice_not_in_review` beside a `ready_for_review` row that
+still lands; the skip answers before the version check);
+`frontend/src/lib/api/codedRefusals.test.ts` (the skip row localizes in every
+shipped locale).
+
+## 419. The outbound-host guard resolves httpx through imports, and an `org_host_client` adopter's checked URL must trace to its per-org key (§334 / §339 / §345 follow-up, 2026-11-14)
+
+**Context.** Two gaps in `tests/test_url_safety.py`, recorded in
+`docs/followups.md` and triggered by §406's change to that file.
+`_plain_client_calls` counted only the literal `httpx.AsyncClient(...)` /
+`httpx.Client(...)` spelling, so `import httpx as h`, `from httpx import
+AsyncClient [as X]`, `from httpx import Client` and the module-level helpers
+(`httpx.get`, `httpx.post`, `httpx.stream`, each of which opens a plain
+`httpx.Client`) built an unpinned client in a guarded module without moving the
+count. And the `org_host_client` adopter check passed as long as the factory was
+called, whatever URL it was handed: `org_host_client(_BASE_URL, ...)` followed
+by a request to the per-org `base_url` would have vetted a constant and passed.
+
+**Decision.**
+
+- **Every spelling counts.** `_module_bindings` reads a module's imports
+  (module-wide, including those inside functions) to find each local name bound
+  to `httpx` or to one of its attributes, and `_plain_client_calls` counts any
+  call that resolves to `AsyncClient`, `Client`, `request`, `stream` or a verb
+  helper. The same resolution names `url_safety`'s factories, so the adopter
+  checks and the "no blocking `pinned_client` in a coroutine" guard also see
+  `url_safety.pinned_client(...)` and aliased imports, not only the bare name.
+- **The checked URL traces to the per-org key.** `_ORG_HOST_MODULES` now maps
+  each module to the config key its host is read from (`gateway_url`,
+  `base_url`, `webhook_url`). `_config_keys` follows the URL argument of every
+  `org_host_client` call through locals, `self` attributes assigned anywhere in
+  the class, `self` helper methods' returns, `or` fallbacks, f-strings, `str()`
+  and string methods, down to `config.get("<key>")` / `cfg[...]` /
+  `self.config.get(...)`. The key must be among what it reaches; a constant, a
+  `settings.*` value, or a `.get` on anything but the adapter's config reaches
+  nothing.
+- **Bespoke adopters stay in the guarded set.** `pinned_async_client` takes no
+  URL: it vets whatever it is asked to dial. So for `_ORG_HOST_BESPOKE` the
+  check is that each module still imports `url_safety` (which keeps it under
+  the plain-client count) and still calls a pinned factory.
+
+The stricter guard found no unguarded client in `backend/app`: no module
+spells httpx any other way today. Each new form was proved by a scratch module
+under `app/services/` (the count test fails on it) and by rewriting the
+Clearbit and PEPPOL adopters to vet `_BASE_URL` / `settings.peppol_gateway_url`
+(the trace test fails on each); both were reverted. The resolver and the
+tracer have their own table tests
+(`test_plain_client_count_resolves_every_import_spelling`,
+`test_config_key_tracer_follows_only_the_per_org_value`).
+
+**Rejected.**
+
+- *Tracing the request URL as well as the factory's.* The client is pinned, so
+  a request to any host is vetted at connect anyway; the up-front check exists
+  for a clean refusal, and the factory's argument is the thing that can be
+  pointed at the wrong value.
+- *A data-flow library (or running the code) instead of an AST walk.* The
+  adopters use a handful of shapes and the guard has to run in a unit test with
+  no I/O. A shape the tracer cannot follow fails closed (the key is not
+  reached), so an unusual adopter gets a failing test, not a silent pass.
+- *Counting bare references to `httpx.AsyncClient` (a factory passed around
+  uncalled).* Type annotations use the same name throughout the adapters;
+  counting them would bury the signal. Nothing in `app/` passes the class as a
+  value today.
+
+## 420. The invoice's approvers may not clear its `po_mismatch` or `quality_hold` in the queue (widens §169 at the operator's call; closes a `docs/followups.md` entry, round 12, 2026-11-14)
+
+**The gap.** Since §389 a goods receipt, and since §401 a passing inspection,
+that an invoice's approver records after approving no longer lifts the
+invoice's hold. The queue was open: `exception_lifecycle.segregation_refusal`
+refused only the implicated set and the raiser (§169), so the same approver
+could resolve or dismiss the held `po_mismatch` / `quality_hold` by hand, on
+their own word rather than on an independent receipt or inspection. §389 and
+§401 bound an approver who did not use the queue, not one set on it. §169 had
+deliberately left approvers able to clear, so closing this needed that policy
+widened; the operator made that call.
+
+**Decision.** A third refusal axis, for `po_mismatch` and `quality_hold` only
+(`exception_lifecycle.APPROVER_SEGREGATED_TYPES`), naming the invoice's
+approvers: `approval_chain.approver_ids`, the approval of record
+(`Invoice.approved_by_user_id`, migration 0129) ∪ every level approval on the
+invoice's workflow chain. Its code is `segregation_approver`, with its own
+sentence on the 403 and its own translation on web and mobile, because the
+reader has to be told which of their duties collides: "a user involved in
+creating this invoice" is wrong for an approver.
+
+Everything else mirrors §169 / §170 exactly:
+
+- `resolve` / `dismiss` only. `escalate` stays open: an escalated hold still
+  blocks the run, and it is the refused approver's exit.
+- `settings.exceptions.require_segregation: false` lifts this axis with the
+  other two; the approval step's own `require_segregation` does not govern the
+  queue, for §169's reason. That matches §389, where the queue's opt-out
+  already lifted the reverse-order receipt rule.
+- NULL permissive: an invoice nobody has approved, or one approved before
+  migration 0129 whose approval names nobody, refuses nobody on this axis.
+- Every door `segregation_refusal` serves reads it: the single and bulk
+  resolve (bulk as a per-row `skipped` reason), the queue's per-row verdicts
+  (list and detail), the payments queue's `clear_refusal`, `clearance_stands`
+  (an approver's own earlier clearance no longer suppresses a re-raise, as
+  §367 / §374 do for a decider implicated later), and the agent coordinator.
+
+**Why only those two types.** They are the holds a receipt or an inspection
+evidences, and the point of §389 / §401 is that the approver cannot supply
+that evidence for their own invoice. A `duplicate`, `fraud_flag`,
+`line_total_mismatch` or `payment_reconciliation` is not lifted by a receipt
+or an inspection, and an AP manager approving an invoice and then judging its
+duplicate flag is not the conflict this closes. Widening to every blocking
+type would be a second policy nobody asked for.
+
+**The chain is read, not just the row.** The followup noted that
+`approved_by_user_id` lets the pure predicate read the approval of record
+without I/O. A level approver is still an approver, in §389's set and here, so
+the predicate takes the invoice's `WorkflowInstance` as an optional argument.
+The doors that judge a page at once batch it in one query
+(`workflow_instances_for`, only for `po_mismatch` / `quality_hold` rows), the
+single-row doors fetch it (`workflow_instance_for`, no query for any other
+type), and `record_decision` loads it itself when a caller did not pass one
+and the decision is in scope, for the reason it already loads the invoice: a
+control that weakens when an optional argument is omitted is the
+omission-reads-as-oversight failure. A caller that omits it from a *verdict*
+reads the approval of record alone, never nothing.
+
+**The agent judges against who had approved before the run.** Agents inherit
+the triggering human's refusal (§170), so a run triggered by someone who had
+already approved the invoice escalates. But the `po_mismatch` resolvers
+(amount, missing PO, multi-PO split) themselves approve the invoice on the
+triggering human's behalf, and only then is the row resolved through
+`record_decision`. Judged on the row after the apply, every auto-resolution
+would be refused, and as a bare 403 after the savepoint, the regression §170's
+handler exists to prevent. So the coordinator reads `approver_ids` before the
+apply and passes that set to both the pre-check and `record_decision`
+(`approvers=`). This is not an exemption: that resolve rests on the re-match
+no longer finding the mismatch (`decision.refound`) and on no implicated
+receipt, approvers included, lifting the hold (`_receipts_implicated`, §389),
+the same evidence the PO-match auto-close would have closed the row on. The
+human's word is not involved. `quality_hold` has no resolver.
+
+**Rejected.**
+
+- *Reading only `approved_by_user_id`.* Cheaper, but it leaves a level
+  approver of a multi-level chain free to clear the hold their own level
+  signed, and it would disagree with §389's set about who an approver is.
+- *Refusing the approval instead of the clearance* (an approver may not
+  approve an invoice whose hold they cleared). The hold is the fail-closed
+  side, as §389 chose. Refusing approval would let the clearance stand and
+  release the payment whenever someone else approved.
+- *Exempting `via="agent"` from the approver axis.* That would let an approver
+  who triggers the run clear their own hold through the agent, the laundering
+  route §170 closed.
+
+**Cost.** A manager who both approves invoices and works the queue can no
+longer close the PO or inspection hold on an invoice they approved, and a hold
+they cleared before approving comes back at the next refresh after they
+approve. Either a colleague clears it or the evidence arrives from someone
+else (a receipt or inspection recorded by another user lifts it in that
+request). A one-person AP team has the per-org opt-out, as for §169.
+
+Tests: `backend/tests/test_exception_resolve_segregation.py` (the predicate on
+the approval of record and on a chain level approver, escalate open, the type
+scope, the opt-out, axis order, `clearance_stands`, the single-row 403 and
+verdicts, bulk per-row with a chain, the payments queue's `clear_refusal`);
+`backend/tests/test_exception_agent_queue_segregation.py` (an approver's run
+escalates; the run's own approval does not refuse its resolve);
+`backend/tests/test_queue_action_verdicts.py` (verdict / resolve parity);
+`frontend/src/lib/api/codedRefusals.test.ts` and
+`mobile/test/l10n/coded_refusal_messages_test.dart` (the code is stated).
+
+## 421. `invoice.approval_recalled` names no person, like `invoice.approved` (§414 amendment, round 12, 2026-11-15)
+
+**Context.** §414 added `invoice.approval_recalled` with a `recalled_by_user_id`
+field: the recaller's opaque control-plane id. No other outbound event names a
+person, and `backend/docs/public-api.md` promised PII-free payloads.
+
+**Decision.** The field is removed before the event ships. The payload is
+`invoice.approved`'s fields plus `recalled_from`; who recalled and why stay in
+the tenant's audit trail (`invoice.approval_recalled` audit row), where access
+is governed by RBAC and retention, not copied to every subscriber endpoint.
+
+**Why.** Data minimisation: an integrator that acted on an approval needs to
+know it was withdrawn and what state the invoice is in, not by whom. An opaque
+id is still personal data once a subscriber can map it (they can via
+`/api/v1` users), and a new person reference in a third-party-bound payload
+would need the ROPA and DPA flow-down reviewed. Parity with `invoice.approved`
+keeps the catalogue's rule simple: events describe documents, not people.
+
+**Rejected.** Keeping the id (§414's original choice): convenient for an
+integrator wanting to notify the recaller, but no integrator has asked, and
+adding a field later is non-breaking while removing one is breaking.
+`test_webhook_event_catalogue.py` now asserts no `user` field in the recall
+payload.
+
+## 422. An approval re-judges the holds its approver cleared first, in the same transaction (amends §420, round-12 money-path review, 2026-11-15)
+
+**The gap.** §420 refuses an invoice's approvers clearing its `po_mismatch` /
+`quality_hold`, but only in one order. In the other, X resolves the open hold
+while X is not yet an approver (allowed), then X approves. Approval gates on no
+blocking exception, `review.approve_invoice` refreshes warnings only when
+corrections are sent, and the payment run reads only open and escalated rows
+(`payment_runs.blocking_exception_types`), so the invoice entered a run and was
+paid on X's word alone. §420's **Cost** paragraph says such a hold "comes back
+at the next refresh after they approve". That is wrong: no refresh is
+guaranteed between the approval and a run. This entry corrects it; §420's body
+is left as written.
+
+**Decision.** Every site that stamps an approver re-judges the invoice's closed
+`po_mismatch` / `quality_hold` rows in the same transaction, right after the
+stamp: `review.approve_invoice` after `advance_approval_chain` (each chain
+level) and after `record_final_approval` (the single and bulk approve, the
+email / Slack / Teams / mobile doors and the exception agents all go through
+it; bulk since §418), `/complete`'s amount floor, and extraction's
+auto-approve. The helper is `invoice_warnings.reraise_holds_cleared_by_an_approver`.
+A closed row is a candidate only when a person decided it and its stamp still
+equals the invoice's current fingerprint, and `_ensure_exception` raises it
+again with the row's own finding. That is the question the detector's
+suppression already asks (§366 / §367): `_ensure_exception` raises nothing
+while an open row of the type holds the invoice, and nothing while some
+clearance of that finding still stands (`exception_lifecycle.clearance_stands`,
+which reads the approver axis since §420). A colleague's clearance therefore
+survives the approval, and only the new approver's own clearance is undone.
+`backend/tests/test_exception_resolve_segregation.py` pins each stamping site
+by AST, so a new one cannot skip the re-judge.
+
+**Why not run `refresh_warnings` inside the approval.** It would work for the
+plain case, but it re-runs every detector in the middle of an approval, and the
+PO match is the one that matters here. The multi-PO split resolver writes its
+`po_match` by hand and then approves. A re-match there reads its combined
+reference as an unknown PO and marks the row the agent is deciding `refound`,
+so the coordinator escalates a resolve it had judged correctly against the
+approvers from before its run (§420). The re-judge runs no detector. A
+stale-stamped clearance suppresses nothing, so the next refresh judges the new
+facts with no help from it. A row an agent or a detector closed has no stamp
+(`_bind_fingerprint_to_decision`), so the re-judge never touches one.
+
+**The agent's own resolve stands.** An agent's apply approves while the row it
+is deciding is still open, so the re-judge raises nothing beside it, even when
+the triggering human holds an older clearance stamped as the invoice hashes
+now. The coordinator then resolves that row, judged against the approvers from
+before the run (§420), and the resolve is not undone.
+
+**Rejected.**
+
+- *Refusing the approval* to someone who cleared the hold. §420 rejected this
+  already: refusing the approval would leave the clearance standing, and it
+  would release the payment as soon as anyone else approved.
+- *Re-checking at the payment run.* The run would have to re-ask
+  `clearance_stands` of every closed row, for every invoice, on every build,
+  and the queue would show the hold as clear until someone built a run. Raising
+  the hold at the approval keeps "an open row blocks" as the one rule the queue
+  and the builder share (§319).
+
+**Cost.** None beyond §420's: a manager who cleared a hold and then approved
+the invoice finds the hold open again at once, for a colleague to clear or for
+independent evidence to lift. On `/complete`'s floor the re-judge rarely finds
+a candidate: the floor approves a `new` invoice, and the refresh on `new`
+clears `po_match`, so an earlier clearance's stamp no longer matches.
+
+Tests: `backend/tests/test_exception_resolve_segregation.py` (clear then
+approve: the hold is back and the run builder 409s on it, for both types; a
+colleague's clearance survives the approval; a chain level approver re-raises;
+an agent run that approves still resolves its own row with no second hold; the
+AST pin on every stamping site).
+
+## 423. A document-id webhook match trusts a pre-realm push only under the push's own legacy rule (§417 amendment, round 12, 2026-11-14)
+
+**Context.** §417 let `POST /api/erp/webhook/{erp_type}` name its invoice by
+`erp_document_id`, scoped to the realm the push recorded, but judged an
+invoice whose push recorded **no** realm by the id alone. Every other reader
+of a pre-realm (NULL) link — the push (`services/erp`), the payment
+write-back (`erp_payment_writeback`) and the PO receipt push — trusts it only
+while `erp_link_realm.legacy_links_trusted(erp_config, realm)` holds: the
+realm migration 0115 recorded for the tenant is still the one it is connected
+to (§284, §356). The round's money-path review found the gap. ERP document ids
+are small per-ERP numbers, not UUIDs: invoice A pushed to NetSuite before
+realms were recorded keeps `erp_document_id = "1042"`; the tenant moves to
+Business Central; a correctly signed BC `Paid` for BC's own bill 1042 matched
+A and moved it `posted_in_erp → paid`, so the payment queue never paid the
+supplier.
+
+**Decision.**
+
+- `api/erp_webhook._invoice_id_by_document` matches an invoice whose push
+  recorded the current realm, and a NULL-realm invoice **only when
+  `legacy_links_trusted(erp_config, realm)`** — the same helper, called the
+  same way, as the push. Once the tenant has connected anywhere else, a
+  pre-realm invoice is no candidate at all, so it neither matches nor makes a
+  current-realm bill with the same id ambiguous.
+- A connection that names no realm (`mock`, an OAuth ERP with no completed
+  consent) matches nothing. §417 let it match NULL-realm invoices; with no
+  company to attribute an id to, no id can be trusted.
+- §408's order and the rest of §417 are unchanged: the lookup still runs only
+  after the signature verifies, every refusal is the same silent 204, and two
+  candidates are still refused.
+
+**Why.** §417's "judged by the id alone, as §392's correlation path judges
+it" carried the correlation path's reasoning to an id that does not share its
+property: a correlation id is our UUID and cannot collide across ERPs, a
+document id is theirs and routinely does. One legacy rule for every reader of
+a NULL realm keeps the webhook from being the single door where a company
+switch is ignored.
+
+**Rejected.** Never matching NULL-realm invoices: a tenant that never changed
+company would lose every document-id delivery for invoices pushed before
+migration 0115, which the push itself still treats as live. Matching them only
+when no realm-stamped candidate exists: that still lets another ERP's bill
+1042 move A whenever the new ERP has not yet been pushed a 1042 of ours.
+
+Pinned in `backend/tests/test_erp_webhook_transitions.py`
+(`test_a_pre_realm_push_is_matched_only_while_its_legacy_realm_is_trusted`,
+`test_a_pre_realm_push_and_a_current_one_sharing_an_id_resolve_to_the_current`,
+`test_a_document_id_matches_nothing_when_no_company_can_be_named`).
+
+## 424. The hand-link search is offered on a per-vendor verdict, and a vendor already linked in the connected company cannot search (§415 follow-up, round 12, 2026-11-14)
+
+**Context.** §415 shipped `search_available` on `GET /api/vendors/{id}/erp-links`:
+whether the connected ERP can be searched at all, the same answer for every
+vendor. A vendor already linked in the connected company was therefore still
+offered **Find this vendor in the ERP**, and every Link it pressed was refused
+`vendor_erp_link_exists`, including the second one, right after a link it had
+just made. That is the page restating half of the endpoint's rule, the drift
+issue #575 retired (`frontend/docs/ui-patterns.md` § Whether to offer an
+action).
+
+**Decision.**
+
+- **The read answers a verdict, not a capability.** `search_available` is
+  replaced by `search_refusal`: `null`, or the coded refusal
+  `vendor_erp_search_unavailable` / `vendor_erp_link_exists`, computed by
+  `vendor_erp_manual_link.search_refusal`, which the search and the link both
+  raise from. The link and unlink responses carry the vendor's new verdict, so
+  the panel closes the moment a link lands and reopens when that company's
+  link is cleared. The page explains `vendor_erp_link_exists` (unlinking is
+  something the reader can do, in the same panel) and hides on anything else.
+- **The search refuses a vendor already linked here.** Its only purpose is
+  the link, which would be refused; a search that answers candidates nobody can
+  link is the dead end the panel just stopped offering.
+- **The link refuses it before reading the record from the ERP**, and again
+  under the locks as before, so a refused link costs no provider call.
+
+**Rejected.** Keeping `search_available` beside the verdict: a second signal
+the page could read instead (ui-patterns: never add a second check beside the
+verdict). Hiding the panel without a reason for a linked vendor: the reader
+would not know why the search they used yesterday is gone, nor that Unlink is
+the way back to it.
+
+**Enforced by** `backend/tests/test_vendor_erp_manual_link.py` (verdict / search
+/ link parity per link state, the refused link reads nothing, unlink reopens it)
+and `frontend/tests-e2e/vendors/erp-unlink.spec.ts` (the panel is gone after a
+link; a refused vendor gets the sentence or nothing).
+
+## 425. An unattended approval asks the PO match first, and a PO-match hold sends the invoice to review (closes a `docs/known-issues.md` entry, round 13, 2026-11-15)
+
+**The gap.** `POST /api/invoices/{id}/complete` auto-approves an invoice under
+the approval step's `auto_approve_below` floor straight from `new`, and
+`refresh_warnings` skips the PO match on `new` as an unentered draft. So an
+invoice citing a PO that did not exist came back `approved` with no match run
+and no `po_mismatch` raised (found by round 12's §422 lane). Extraction's
+auto-approve had the other half of the gap: its refresh runs on the `pending`
+invoice, so the match ran and the hold was raised, but the auto-approve read no
+exception and approved anyway, leaving an `approved` invoice with an open hold
+for the run builder to catch.
+
+**Decision.** The operator's recommended default from PR #716: match first,
+and hold on failure (fail closed).
+
+- `/complete` passes `refresh_warnings(..., match_po_on_new=True)` when it is
+  taking a `new` invoice out through approval, so the match runs whether the
+  floor fires or the invoice goes to review (the reviewer now sees the match
+  too). The `new → done` close of a workflow with no approval step is unchanged.
+- Both unattended doors, the floor and extraction's auto-approve, ask
+  `invoice_warnings.po_match_hold_refusal` **before** `record_final_approval`.
+  It refuses on an open or escalated `po_mismatch` / `quality_hold` (the same
+  `payment_runs.blocking_exception_types` predicate the run builder reads), and
+  on a clearance of one that stamping the would-be approver would undo: the
+  caller cleared the hold while not its approver (§420 allows that), and §422's
+  re-judge right after the stamp would raise it again. That second question is
+  §422's own, asked with the would-be approver added to the approver set
+  (`exception_lifecycle.clearance_stands(..., approvers=...)`), so the
+  unattended doors never leave an `approved` invoice with a hold open.
+- A refusal lands the invoice at `ready_for_review` with
+  `auto_approve_suppressed: "po_match_hold"` or
+  `"po_match_hold_cleared_by_approver"` on the audit row (extraction's
+  `invoice.extraction_completed`, `/complete`'s `invoice.submitted_for_review`).
+  The caller's clearance is left standing for the human reviewer, whose own
+  approval then re-judges it as §422 says.
+- An invoice with no PO reference has no such row; the floor behaves as before.
+
+**Rejected.**
+
+- *Sending every invoice that cites a PO to review.* The other option PR #716
+  named. It is simpler but gives up the floor for every PO-backed invoice,
+  including the clean matches the floor exists for.
+- *Stamping, re-judging, then undoing the stamp if a hold came back.*
+  `record_final_approval` is the one writer of the approval fields (§389), and
+  an undo would be a second writer whose mistakes leave `approved_by` on an
+  invoice nobody approved. Asking first keeps the stamp a one-way act.
+- *Gating the human approval doors on open holds too.* §422 already chose for
+  those: a person approves with the hold visible, and the hold stops the run.
+  This entry is about the doors with no person in them.
+
+**Cost.** A PO-backed invoice under the floor whose match fails now needs a
+person, which is the point. `/complete` runs the matcher on every PO-citing
+invoice it submits for review, one more query set per submit.
+
+**Enforced by** `backend/tests/test_invoice_complete_auto_approve.py` (an
+unknown and an over-billed PO hold the invoice at review with an open
+`po_mismatch` and no stamp; a clean match approves; no PO is unchanged; a
+hold the caller cleared sends the invoice to review with the clearance left
+standing; the predicate on an extracted invoice; an AST pin that both doors ask
+before they stamp) and `backend/tests/test_extraction_reextract_options.py`
+(extraction lands at review on either refusal, with nothing stamped).
+
+## 426. A payment the ERP reported on several rails is booked only by its row's one-click; `record-outside` refuses it, and the queue's dialog records through the row (§396 / §413 follow-up, round 13, 2026-11-15)
+
+**The gap.** A live `paid_not_recorded` row keeps how the ERP says the payment
+was split rail by rail (§396), and its one-click books that split (§413). The
+payment queue's "Record as paid" posted `POST /api/payments/record-outside`
+instead, which books the one rail the person picks and the figure the invoice
+owes, and `_complete` then resolved the row on the way. A cheque-plus-card
+payment was closed as one rail with no `rail_breakdown`, so the card part
+landed on the payer's 1099-NEC, and the queue's dialog never showed the split
+it was dropping.
+
+**The rule.**
+
+- **One door books a kept split: the row's own one-click.** A person's record
+  by any other door (`record-outside`, the run-level record) of an invoice
+  holding a live `paid_not_recorded` row whose kept breakdown stands is refused
+  with 409 `external_payment_erp_split`, `params.exception_id` the row
+  (`external_payment.erp_split_refusal`). It runs after the live-claim
+  refusals (§309) and before anything is written or audited. The one-click
+  passes the row in `answering_exception_ids`, so it is never refused by
+  itself; an ERP-sourced record carries its own parts and is not gated.
+- **"Stands" is the §413 verdict, now in one place.** `erp_status_sync.
+  kept_split_stands` (moved from `api/exceptions._kept_split_stands`) is the
+  exception row's `erp_payment_split_stands`, the queue row's
+  `erp_reported_payment.split_stands`, and the refusal's test. A row whose
+  breakdown does not stand (one rail, parts that do not add up, none) leaves
+  the person's rail as the record, so `record-outside` still books it and
+  closes the row, as §319 has it.
+- **The queue's dialog records through the row.** Its `erp_reported_payment`
+  carries the stated figure, the kept parts and `split_stands`. The dialog
+  shows the ERP's figure beside the amount owed and the split through the
+  shared `ErpPaymentSplit` component (the `/exceptions` markup, extracted, with
+  the three-state note in `erpReport.splitNoteKey`). Where the split stands it
+  shows no picker and posts `record-erp-payment` with no `method`, exactly as
+  `/exceptions` does, so the payment, its audit (`method_stated: null`) and
+  the row's resolve happen in one transaction. A refusal with this code (a
+  queue read before the row kept its split) links to `/exceptions?id=<row>`.
+- **`record_outside_refusal` does not carry the new code.** The queue's action
+  is no longer `record-outside` alone, and folding the code in would disable
+  the very button that books the split.
+
+**Rejected.** Teaching `record-outside` to read the row and book its split:
+it would need the one-click's whole rule set (the ERP's stated figure over the
+invoice's, §386; the read-back of an unstated one, §393; the no-rail rule,
+§413) a second time, and two doors applying one rule drift. Refusing every
+live row at `record-outside`: it would reverse §319's "any door answers the
+row" for the rows a person's rail does describe, with no 1099 consequence to
+justify it.
+
+**Enforced by** `backend/tests/test_erp_status_sync.py` (the refusal names the
+row and writes nothing; a row whose split does not stand still records; the
+queue carries the figure, parts and the same verdict; refused, then booked
+through the row, the 1099 reports the cheque part only; the run-level refusal),
+`frontend/src/lib/types/erpReport.test.ts`, `codedRefusals.test.ts`, and
+`frontend/tests-e2e/payments/erp-reported-payment.spec.ts` (the queue dialog
+shows the split and books it through the row with no rail sent; a refused
+record links to the exception).
+
+**Amendment (round-13 gate).** The two refusals met in a dead end. An invoice
+in a draft run that also holds a `paid_not_recorded` row whose split stands was
+refused by the run-level record (`external_payment_erp_split`, since only the
+row books the split) and by the row's one-click (`external_payment_in_run`,
+since a run holds it), and neither sentence said how out. A draft run gives up
+an invoice only by being cancelled, so both refusals now say to cancel the run
+first, then record the invoice from its exception, in one shared sentence
+(`external_payment.SPLIT_IN_RUN_MESSAGE`, `refusal.externalPaymentErpSplitInRun`
+in every locale), and both carry `params.payment_run_id` and
+`params.exception_id`. The run-level refusal adds the run
+(`run_payment_refusal` passes it to `erp_split_refusal`); the in-run refusal
+adds the row only for a person's record (`source="user"`) over a split that
+stands, so the ERP-sync path and an in-run refusal with no such row are
+unchanged. Neither refusal moves: the run still holds the invoice until a
+person cancels it, which is the decision the sentence hands them. Tests:
+`backend/tests/test_erp_status_sync.py` (both doors refused with the hint,
+nothing written; cancel, then the row books the split; an in-run refusal with no
+standing split keeps its own params; `erp_split_refusal` exempts only the row it
+answers; `source="erp"` is not held by it) and
+`frontend/src/lib/api/codedRefusals.test.ts`.
+
+## 427. An outbound webhook event is sent after the change it announces commits, and the emitter takes the session (closes a `docs/followups.md` entry, §414 / §421 follow-up, round 13, 2026-11-15)
+
+**The gap.** `transition_invoice` called the webhook emitters inline, and
+`emit_event` commits the `WebhookDelivery` row in its own control-plane
+session. The delivery was therefore durable while the tenant transaction that
+changed the status was still open: a rollback (a failed chain step, a refused
+bulk row, a failed commit) left a subscriber told of an `invoice.approved`,
+`invoice.approval_recalled` or `payment.settled` that never happened, and a
+receiver that read the invoice back on receipt could see the old status.
+`exception.raised` from `exception_service.create_exception` had the same shape:
+the event named an exception row the caller could still roll back.
+
+**Decision.** The typed emitters in `services/webhooks/dispatch.py` take the
+caller's session as a required keyword (`db=`), build the payload at once, and
+queue the `emit_event` call on `services/post_commit` — the `Session.info`
+queue and `after_commit` hook the notification email / chat legs (§46) and the
+ERP auto-send already use. A rolled-back transaction drops the event; a
+rolled-back savepoint drops only the events queued inside it (§304), so a bulk
+approve emits one event per invoice it actually approved, after the outer
+commit. The payload is built at queue time, so it is the state the transaction
+committed, not whatever the instance holds when the job runs. Delivery rows,
+the `(subscription_id, event_id)` dedupe and the per-transition occurrence ids
+are unchanged.
+
+**Why at the emitter.** The follow-up proposed queuing in `transition_invoice`.
+Putting it in the emitters covers both sources (the engine and
+`create_exception`) with one mechanism, and the required `db=` keyword makes a
+new event source state its transaction: `db=None` is the explicit "nothing to
+wait for" case and emits immediately, so it cannot be reached by omission.
+
+**Rejected.** A third deferral mechanism (an outbox table, or a webhook-own
+`Session.info` key like `erp_send`'s): `post_commit` already has the right
+savepoint and dispatch-scope semantics, and the durable backstop for a lost
+emit attempt is unchanged. An outbox would make the emit itself durable across
+a crash between commit and emit; that window existed before as the gap between
+the delivery commit and the tenant commit, in the worse direction, and no
+integrator has needed it.
+
+**Trade-off.** An emit now runs after the request's commit, on a task (or
+inline under a dispatcher's scope, where the control pool is free by then);
+a process that dies in that instant loses the event, where before it could
+announce one that never happened. Missing an event is recoverable through the
+`/api/v1` pull surface; a false one is not.
+
+**Enforced by** `backend/tests/test_outbound_webhooks.py`
+(`test_a_committed_approval_emits_once_after_the_commit`,
+`test_a_rolled_back_approval_emits_nothing`,
+`test_a_bulk_approval_emits_one_event_per_committed_invoice`) and
+`backend/tests/test_outbound_webhooks_exception.py::test_a_rolled_back_exception_emits_nothing`.
+
+## 428. A push stranded at `sending_to_erp` is re-driven or failed by the auto-send sweep; a spent push fails coded; a direct ERP's save is its fence (§410, §411 follow-ups, round 13, 2026-11-15)
+
+Three gaps round 12 left open, all around a push that sits at `sending_to_erp`
+with nothing that will ever move it.
+
+**A new push gets a full retry budget.** `send_to_erp_internal` resumes from
+`state_data.erp_retries`, which only `retry_erp` reset. A send from `approved`
+inherited whatever the invoice's last push left, so a push that failed three
+times, then had its approval recalled and re-approved (§374), was sent with no
+attempts left. That was the path the follow-up called unknown. `start_erp_send`
+now resets the counter on every new push, through the one helper `retry_erp`
+uses (`erp.reset_erp_push_budget`). Only the counter: the outcome-unknown flag,
+the pending job and the orphan keys describe what may already be in the ERP,
+and the next attempt must still read them.
+
+**No attempt left is a final failure.** A job that still arrives spent (a
+redelivery after the last attempt, a re-drive of one) used to return without
+an attempt or a transition. After the §410 gate, so a spent redelivery for a
+recalled invoice is still only skipped, it lands at `failed` with
+`invoice.erp_failed` coded `erp_retries_exhausted`. The refusal's params carry
+`possibly_posted: true` when an earlier attempt may have left the bill, as the
+export gate's do (§286), and the row carries the flag and any known orphan as
+a failed attempt's does, so whoever retries looks in the ERP first. An
+unreadable counter is read as spent rather than guessed at.
+
+**A stranded push is the sweep's second pass.** `start_erp_send` commits
+`→ sending_to_erp` and then dispatches; a death in between leaves no job.
+`erp_auto_send_sweep` now also takes invoices at `sending_to_erp` whose latest
+entry into it (by its transition's audit row) is older than the delay with no
+`invoice.erp_*` row since, and decides each under the invoice row lock from the
+instance's attempt stamp (`erp_outcome_unknown_at`, committed before every
+adapter call, §409):
+
+- *No attempt since the transition, inside the window* → re-dispatched through
+  `dispatch_erp(inline=True)`, so it lands in `send_to_erp_internal` with the
+  same §410 gate, the correlation-id idempotency key and the possibly-posted
+  state handed to the adapter. It cannot post twice: in Lambda mode the FIFO
+  queue's per-invoice message group runs it after any original message, which
+  then finds the invoice moved and skips; in local mode the original job is a
+  task started at the commit, and one that has stamped no attempt within the
+  delay died with its process.
+- *No attempt, outside the window* → `failed`, coded `erp_push_interrupted`.
+  The window is the §411 lookback and the ERP's live-from moment (below). A
+  push stranded for a day may have been keyed into the ERP by hand, and the
+  idempotency key cannot see a hand-keyed bill; a push started before the
+  current ERP was saved was meant for another one. Neither is sent on nobody's
+  say-so; at `failed` a person can retry it.
+- *An attempt began and nothing ended it* (a local worker that died mid-call)
+  → left while the attempt is inside the lookback, since it may still be
+  running or be redelivered by SQS; past it, failed the same way, and flagged
+  possibly posted. Rejected: re-driving it after the delay. An adapter call can
+  outlive five minutes (a Lambda runs up to fifteen, Merge.dev waits for a
+  sync), and two live attempts would rest on the idempotency key alone.
+
+The re-drive writes no audit row of its own: no transition happens, and an
+`invoice.erp_*` row would become the "latest ERP entry" the invoice panels
+read (§410's reason). The push's own outcome rows are the record; the sweep
+logs and counts (`pushes_redriven`, `pushes_interrupted`). A row that is left
+stays a candidate, so the cap could hold it; the lookback releases it, as
+§411's argues for its own skipped rows.
+
+**`settings.erp.configured_at`.** §411 fenced an OAuth ERP's recovery on
+`connected_at`; a directly configured ERP had no such moment. `PATCH
+/api/organization` now stamps `configured_at` when a save names a different
+ERP, destination (`catalog.same_connection`, the condition the sealed secrets
+follow, as `catalog.secrets_to_drop` does) or link realm (`connection_realm`, so an
+Intacct entity change counts, §412), keeps the stored stamp otherwise, and
+never takes one from the request. The sweep's floor is the later of the two
+moments, for approvals and for stranded pushes alike. A block saved before
+this change has no stamp and keeps the lookback alone; that window closed at
+its save.
+
+Tests: `tests/test_erp_push_flow.py` (spent push failed coded, with and without
+possibly-posted; a spent push for a moved invoice still skipped; a new send
+from `approved` resets the counter and keeps the ERP state; the interrupted
+exit), `tests/test_erp_auto_send_sweep.py` (re-drive; an earlier push's stamp
+ignored; too fresh and answered left; an in-flight attempt left; the three
+interrupted cases; the end-to-end re-drive through the local dispatcher landing
+once; the `configured_at` fence and the later-of-two rule),
+`tests/test_erp_catalog.py` (stamped on a first save, kept and unforgeable on a
+same-connection save, restamped on a destination, ERP or realm change), and
+`frontend/src/lib/api/erpRefusals.test.ts` (both codes in every locale, with
+the possibly-posted note).
+
+**Amendment (round-13 gate).** Two corrections to the stranded-push pass.
+
+*An attempt is read from a signal a clean failure cannot erase.* The pass took
+`erp.OUTCOME_UNKNOWN_AT_KEY` as proof that an attempt began, but `_call_erp`
+drops that key when an attempt ends `not_posted` and nothing earlier was
+unknown. During the 2 s / 4 s backoff between attempts the push therefore read
+as never attempted, and once its entry was older than the delay the sweep
+re-drove it beside its own sleeping job: two `send_to_erp_internal` loops, both
+able to post. `_call_erp` now commits a dedicated `erp.ATTEMPT_STARTED_AT_KEY`
+with its pre-call write and never clears it, and the sweep also counts
+`erp_retries` other than 0 as an attempt of this push (every new push resets it
+to 0 in the transaction that enters `sending_to_erp`, and only a finished
+attempt raises it). With no stamp to date it (a row from before the key), such
+an attempt is dated at the push's entry, its earliest possible moment, so the
+lookback still releases it. The cost: a local job that dies mid-backoff is no
+longer re-driven; it is left until the lookback and then failed
+`erp_push_interrupted` (possibly-posted when the state says so) for a person,
+which is the fail-closed side. The module docstring's "nothing new can post a
+bill twice" was also too strong for local mode, where the re-drive infers from
+the missing stamp that the original task died; it now says that is an
+inference and names the correlation-id idempotency lookup as what stops a
+second bill if the task was only slow.
+
+*A push with no entry row fails closed.* `_stranded_query` used to drop an
+invoice at `sending_to_erp` with no audit row recording that entry (a
+Lambda-shipped audit row that never landed, a database restored without it), because its start was
+NULL, so the sweep never saw it. There is no timestamp that provably is the
+transition time (`invoices.updated_at` is only an upper bound), so such a push
+is never re-driven: its attempts cannot be told from an earlier push's. It is
+selected once the invoice row has been untouched for the delay (so a push whose
+audit row is merely still in flight is not taken), left while the attempt
+stamp is inside the lookback, and otherwise failed `erp_push_interrupted` for
+a person, through the same `fail_interrupted_erp_send`. Rejected: falling back
+to `updated_at` as the start, which would re-drive pushes whose real start was
+outside the window. Tests: `tests/test_erp_auto_send_sweep.py` (the sweep run
+inside a real backoff after a `not_posted` attempt leaves the push and the job
+lands it once; `erp_retries` alone counts; a push with no entry row fails
+closed, and is left while its row is fresh or its attempt stamp is recent).
+
+## 429. Mobile offers Approve / Reject from the per-invoice verdict, on the detail screen and per row of the approvals queue; the Approvals tab stays on the permission (closes two `docs/followups.md` entries, round 13, 2026-11-15)
+
+**Context.** The mobile detail screen and the approvals swipe offered Approve /
+Reject to anyone holding `invoice.approve` (`AuthStore.canApproveInvoice`), so
+the uploader, a non-named approver and an ap_manager over the CFO limit met a
+control that could only 403 — the restated rule issue #575 removed from the
+web. Separately, the mobile bulk sheet offered Approved for any selection and
+`BulkResult` kept bare ids (in fact it stringified the `{id, reason, code,
+params}` skip objects), so since §418 a bulk approve of drafts said "N
+skipped" with no reason.
+
+**Decision.**
+
+- The detail screen reads `GET /api/invoices/{id}/review-actions` once for an
+  invoice in review or holding an approval and offers Approve, Reject and
+  Recall from its `approve` / `reject` / `recall_approval` verdicts
+  (`ActionVerdict`), the web modal's rules: hidden on `role_not_permitted` and
+  `invoice_not_in_review`, disabled beside the localized reason otherwise,
+  nothing while unanswered.
+- The approvals queue asks the same read **per row**, keyed by id and
+  `updated_at`, and swipes a row to approve only on an allowed verdict, stating
+  a refusal under the row. One GET per queued row is the cost; the queue is one
+  server-filtered page of `ready_for_review` invoices, and the alternative —
+  keep swiping and let the POST refuse — is exactly the offer-then-403 the
+  verdict exists to prevent. A failed read stays unanswered until
+  pull-to-refresh rather than being re-asked on every rebuild.
+- The **Approvals tab** stays gated on `canApproveInvoice`. It is not a
+  per-invoice decision but "does this user review invoices at all", which is
+  the permission the server itself states on `/auth/me`; every row of a user
+  without it would be `role_not_permitted`. So `canApproveInvoice` keeps that
+  one caller, documented as tab-only.
+- Bulk status keeps each skip as `BulkSkip {id, code, params, reason}` and,
+  when a batch skips rows, lists each in a dialog (invoice number + the reason
+  through `coded_refusal_messages.dart`, else the server's English). Approved
+  is offered only when every selected row is loaded and `ready_for_review`, as
+  the web picker's `commonTransitions` does.
+
+**Rejected.** A list-level verdict field on `GET /api/invoices` (one read for
+the whole queue): a backend change outside this lane, and `review_refusals`
+runs per-invoice chain gates that would make every list read pay for them.
+Worth revisiting if the queue's per-row reads show up as a cost.
+
+Tests: `mobile/test/screens/invoice_detail_screen_test.dart`,
+`mobile/test/screens/approvals_screen_test.dart`,
+`mobile/test/screens/invoices_screen_test.dart` (picker + skip dialog),
+`mobile/test/stores/invoice_store_test.dart`,
+`mobile/test/l10n/coded_refusal_messages_test.dart`.
+
+## 432. A balanced NACHA file debits an offset account kept in the settings JSONB, masked on read, not sealed (closes a `docs/followups.md` entry, round 13, 2026-11-15)
+
+**Context.** `services/nacha.py` wrote credits only (service class 220), the
+unbalanced file most ODFIs expect from a corporate originator (§251). Some
+banks require a balanced file: an offsetting debit to the originator's own
+account for the batch total. That needs the customer's own account number,
+which is banking data, so where it lives and who sees it is the design call.
+
+**Decision.**
+
+- **Three optional keys on `settings.payments.nacha`**: `offset_routing`
+  (ABA, checksum-validated), `offset_account` (≤ 17 alphanumerics after spaces
+  and dashes go) and `offset_account_type` (`checking` | `savings`). **All or
+  none**: any one holding a value asks for a balanced file, and the save 422s
+  naming the missing ones (`nacha.originator_problems`, field names only).
+  Validated through the existing settings writer, `PATCH /api/organization`,
+  like the rest of the block.
+- **With them** the batch header and batch control say service class **200**,
+  and the batch ends with the offsetting debit: transaction code **27**
+  (checking) or **37** (savings), individual ID `OFFSET`, the company name as
+  receiver, the next trace number. The entry/addenda count, the entry hash
+  (the offset routing's first eight digits) and the total debit in both
+  control records include it. **A batch total above one entry's
+  $99,999,999.99 is offset by several debits** rather than refused: a run that
+  exports unbalanced today must not become unexportable for asking to balance.
+- **Without them the file is byte-identical** to the credits-only one, pinned
+  by a SHA-256 of a fixed build taken before the change.
+- **Plain in the JSONB, not sealed in `provider_credentials`.** The sealed
+  store is for credentials, values that let their holder act as the tenant
+  against a third party (`SECRET_FIELDS`). An account number authenticates
+  nothing, and the payee account numbers in the very same file live in
+  `Vendor.bank_details` as plain JSONB. Sealing this one would make it the
+  only account number in the product behind KMS, and route the NACHA export
+  through a credential read (and its "store unavailable" failure) for no
+  protection the vendor numbers lack.
+- **But masked on every read, admins included.** It follows the
+  `utils/bank_masking` rule: `GET /api/organization` shows `****6789`
+  (`org_settings_view._with_masked_nacha_offset`; non-admins never see the
+  payments block). The writer keeps the stored number when a save sends it
+  blank or sends the mask back (`nacha.carry_offset_account`), so the settings
+  page never needs the full number; clearing the routing and type clears it.
+- **Never a value in a log, an error body or an audit row.** The 422 names
+  fields; `NachaOffset.__repr__` leaves the account out; the settings audit
+  `organization.provider_config_updated` adds `nacha_changed` (the block's
+  changed key names); the export's `payment_run.nacha_exported` adds
+  `balanced: bool`. The file itself carries the number, as it carries the
+  vendors'.
+
+**Rejected.** Sealing it as a payments secret (above). A separate settings
+endpoint for the offset: the block already has one audited, validated writer,
+and a second door for half of it is how the other blocks grew drift. Refusing
+a batch total above one entry's maximum: the split is what NACHA permits and
+costs nothing. A per-entry offset (one debit per credit): banks that want a
+balanced file want one offset per batch, and per-entry debits multiply what
+the customer reconciles on its own statement.
+
+**Enforced by** `backend/tests/test_nacha.py` (the byte-identical digest; the
+balanced file's records, controls and block padding; the savings debit code;
+the split debit; the all-or-none rule; the masked read, the blank re-save that
+keeps the number and the audit row; the 422 that echoes no value; a balanced
+export end to end) and `frontend/src/lib/types/paymentExecution.test.ts` (the
+form's mirror of the rule and the account types).
+
+**Amendment (round-13 gate).** `carry_offset_account` kept the stored number
+whenever a save sent it blank or masked, even when the same save changed
+`offset_routing` or `offset_account_type`; the next balanced file then debited
+the old number at the new bank. An account number belongs to its bank and
+type, so it is now carried only when the save names the same routing number
+(whitespace aside) and the same type. Otherwise the save is refused 422,
+`payments.nacha.offset_account must be re-entered: offset_routing or
+offset_account_type changed.`, naming the field and never the number, and
+nothing is written (`nacha.OffsetAccountReentryRequired`, raised by the carry
+and answered in `PATCH /api/organization`). Rejected: clearing the number
+and letting the half-filled-offset 422 answer, whose sentence would not say
+why a field the admin never touched is suddenly invalid. Tests:
+`backend/tests/test_nacha.py` (a new routing, a new type or both, with the
+number blank, absent or masked, refused; a re-entered number saved; the same
+routing spaced differently still carried; the PATCH refused, unechoed and
+unwritten).
+
+## 433. A multi-PO split's POs live in their own column, `invoices.split_po_ids`, which no warning refresh rewrites (closes a §267 / §404 follow-up, round 13, 2026-11-15)
+
+**The gap.** The multi-PO split agent (`multi_po_split_v1`) links one invoice to
+several POs by writing a combined `po_number` ("PO-A,PO-B") and a `po_match`
+snapshot naming the set in `po_ids`. The approval door's evidence sets — who
+received the goods (§267), who inspected them (§404), and the reverse order's
+receiving conflict that `receipts_clear_hold` reads (§389) — took the
+invoice's POs from that `po_number` and that snapshot. But `refresh_warnings`
+rewrites `po_match` on every later edit, and the combined reference resolves to
+no PO, so after any refresh the sets named no PO at all: a receiver of one leg
+could approve, after a recall for instance, and a receipt the approver typed
+in on one leg was not a conflict.
+
+**Decision.**
+
+- **The split's links are a column the matcher never writes.**
+  `invoices.split_po_ids` (JSONB, stringified UUIDs like
+  `segregation_actor_ids`, migration 0133) has one writer, the split resolver's
+  `apply`, which unions the set it links into what is there. Nothing clears it:
+  a later `po_number` edit or a recall leaves it, because a PO the invoice was
+  once linked to by the agent is still goods it was approved against, and
+  refusing one more receiver is the safe error the receiver set already takes
+  for same-numbered sibling POs.
+- **`approval_chain._invoice_po_ids` reads it** (through `_linked_po_ids`,
+  with the stored match's single `po_id`), and no longer reads
+  `po_match.po_ids`: one durable source instead of a snapshot that is right
+  until the next edit. Every evidence set reads `_invoice_po_ids`, so the
+  receiver rule, the inspector rule and the reverse order all see the split.
+  `po_match` keeps its `po_ids` for the modal only.
+- **Backfill** from `po_match.po_ids` where it is still present, then — for a
+  split already refreshed — from the split agent's own `auto_resolved`
+  decision, whose `changes.po_number.new` still records the combined reference;
+  each number resolves to every PO of that number in the invoice's entity, with
+  no vendor filter (the vendor may have changed since; over-naming refuses one
+  more receiver, never fewer).
+
+**Rejected.** A link table (`invoice_po_links`): FKs and a row per link buy
+nothing a read needs here — the only reader wants the ids for a batch of
+invoices it already has loaded, and a JSONB list on the row costs no extra
+query (the bulk approve lookups stay at two and three statements). Teaching
+the matcher to preserve `po_ids` on refresh: the matcher would then own a
+field it never computes, and any future rewrite of `po_match` (a re-extract, a
+new match shape) would reopen the hole silently. Teaching the single-PO matcher
+to match a split: a separate, larger change (the split would stop re-raising
+`no_po` on refresh); it does not need the segregation fix to wait for it.
+
+**Enforced by** `backend/tests/test_approval_receiver_segregation.py` (a leg's
+receiver is refused after a refresh rewrote `po_match`; the reverse-order
+conflict and `receipts_clear_hold`; the inspector),
+`backend/tests/test_exception_agents_multi_po_split.py` (the agent writes the
+set and it survives a refresh) and
+`backend/tests/test_migration_0133_invoice_split_po_ids.py` (model parity,
+both backfills, re-runs, control-plane no-op).
+
+## 434. A line on no report is its creator's, and only its creator may put it on a report (§241 follow-up, round 13, 2026-11-15)
+
+§241 made a report's lines its owner's, but a line on no report had no owner:
+`expenses` recorded no creator, any `admin` / `ap_manager` / `ap_clerk` could
+rewrite a colleague's loose line, and attaching adopted it. A manager could edit
+a clerk's line and the clerk would attach and submit it unaware; the approver ≠
+owner check held, but the line's real author was not in the set it read.
+
+Migration 0134 adds `expenses.created_by_user_id` (tenant, nullable, no FK),
+stamped with the authenticated caller on both create paths and pinned at every
+`Expense(...)` site by `tests/test_expense_creator_stamping.py`. Three rules
+read it (`services/expense_controls.py`):
+
+1. **A loose line is its creator's.** Changing a claim field, replacing the
+   receipt or deleting it is refused to anyone else (403
+   `expense_not_creator`). The gate is the line-level twin of §241's owner gate,
+   and it leaves open what §241 left open: GL coding and card reconciliation
+   are not authorship.
+2. **Only a line its creator owns may go onto a report** (403
+   `expense_report_foreign_line`, `params.expense_id`), on the attach endpoint
+   and on a `PATCH` that moves the line. Refusing the attach, rather than
+   letting it through and recording the creator on the report, is what makes
+   §241's choice hold: every line on a report is its owner's, so the owner is
+   the complete author set. The rule compares the creator with the report's
+   owner, not the caller; the owner gate already makes them equal.
+3. **The SoD set reads the line creators anyway.** `report_line_creators`
+   feeds `segregation_actor_ids`, so a line whose recorded creator is not the
+   owner refuses that person as approver or rejecter. Under rule 2 the set is
+   empty for every new report. It is read so the fraud control keys on what
+   the rows record, not on a gate having held, and it costs one pass over lines
+   already loaded.
+
+**A card-minted line belongs to whoever minted it.** `/create-expense` stamps
+the caller. A card transaction names no cardholder user, so any other choice is
+inferred, and §141 says a fraud control's inputs must be observed. The cost is
+that a reconciler cannot mint a line for a colleague to attach. The colleague
+holds the same role (`CARD_CREATE_EXPENSE_ROLES` is the author set), so they can
+mint it themselves.
+
+**NULL means "no recorded creator" and is permissive, as §141 reads a NULL
+invoice uploader.** Existing rows are not backfilled. The `expense.created`
+audit row is not local in lambda audit mode, and before 0134 attaching adopted
+lines, so a report's owner is no better a proxy. A guessed creator would block a
+real owner from their own line or put an unobserved name in the SoD set. A NULL
+loose line keeps the pre-0134 rules: any author role may edit it and any report
+owner may attach it. The attach does not stamp it either, since that would be
+the guess again. Failing closed was rejected. Nobody could edit, attach or
+delete an existing loose line, so every one would be stranded until someone
+changed the database by hand, and that is an outage, not a control. The residue
+is the set of loose lines that existed at deploy, and it only shrinks.
+
+Mobile does not ship expenses, so the two codes are localized in the web app's
+six locales only.
+
+## 435. An invoice has one payment schedule for every reader: its latest row (closes a `docs/followups.md` entry, round 14, 2026-11-17)
+
+Readers that join schedules onto invoices (the payment queue page, its
+early-pay savings rollup, the dashboard's discount-capture tile) join
+`services/payment_schedules.latest_schedules()`, a `DISTINCT ON (invoice_id)`
+alias ordered by `LATEST_SCHEDULE_ORDER`, never the `payment_schedules` table.
+The forecast, the discount sweep and ROI already took this row through the
+same rule. Joining the table listed an invoice once per schedule row (twice on
+a page, shifting later pages against a `total` that counted it once) and
+counted its discount once per row in both aggregates.
+
+The dashboard's earlier "two schedules on different terms is two rows" reading
+is withdrawn: a superseded schedule is history, not a second discount.
+
+The read-side fix was chosen over a unique index on
+`payment_schedules.invoice_id` because it needs no migration and no product
+call on whether schedule history is kept. If one schedule per invoice becomes
+the write-side model, the index can follow without touching the readers.
+`tests/test_payment_schedule_latest.py` pins each reader with two rows per
+invoice and fails any direct `.join(PaymentSchedule, …)` under `app/`.
+
+## 436. A PO that records no currency is given one only by an operator's assertion, and only where it is still NULL (§197 follow-up, round 14, 2026-11-17)
+
+§197 left every PO without a requisition behind it at NULL, and with no PO edit
+route that NULL was permanent unless an ERP re-sync stated a code, so the
+matcher reported `unknown` forever and the agents escalated every invoice on
+such a PO. `scripts/backfill_po_currency.py` takes the answer from someone who
+knows it. The operator names one tenant, optionally narrowed by entity,
+`po_number` prefix or created-before date, and asserts an ISO 4217 code. The
+code must be on `ISO_4217_CURRENCIES`; the no-currency and testing codes are
+refused.
+
+The tool infers nothing: the org-currency proxy stays rejected for §197's
+reason. It writes only NULL rows, by compare-and-swap, so a code a source
+stated is never overwritten; an ERP re-sync remains the only correction for a
+recorded code. The dry run, the default, reports the codes the named set
+already records, because a set already holding another code is the visible
+sign that it was drawn too wide.
+
+`--apply` re-matches every unpaid invoice citing a stamped PO in the same
+transaction, through the ordinary `refresh_warnings`. That is safe as a normal
+refresh rather than the ERP sync's hold-only mode: `unknown` already compared
+at face value, which is what `same` compares, so a stamp can only keep a
+finding or add the `different` mismatch hold, never remove one. `paid` /
+`done` invoices are skipped, as the sync skips them.
+
+A `PATCH` route was the alternative and was not built: it would re-price one
+PO at a time, while the problem's real shape is "these 4,000 rows were all
+USD". Each applied run writes one PII-free `purchase_order.currency_backfilled`
+audit row with the asserted code, scope, counts and PO ids. The PO row carries
+no "asserted" marker, so that audit row is the provenance.
+
+## 437. A multi-PO split is matched against its legs, and the split agent re-matches through the matcher (closes a §433 follow-up, round 14, 2026-11-17)
+
+**Gap.** The combined `po_number` ("PO-A,PO-B") resolved to no PO, so every
+warning refresh after a split re-raised a `no_po` `po_mismatch`.
+
+**Decision.** `match_invoice_to_po` reads the legs from `split_po_ids` while
+every number in `po_number` names a PO in that set, under the single lookup's
+own entity, vendor and newest-per-number filters. Otherwise the reference is
+matched as written, so a person's edit of it wins. The 2-way check runs on the
+combined total, and any cancelled, unissued, unverifiable or other-currency leg
+holds the whole invoice. The 3- and 4-way checks run per leg and are never
+pooled, because an over-received leg would hide a short one. The auto-close
+vets every leg's receipts and inspections, and `refresh_invoices_citing_pos`
+also finds splits by leg id, so a receipt on one leg re-matches the split.
+
+The split agent drops its hand-written `po_match` snapshot, re-matches through
+`refresh_warnings` as `missing_po_v1` does, and approves only on a clean
+`matched` read as the split. A split with a short-received leg therefore now
+escalates where it used to auto-approve.
+
+**Rejected.** Pooling quantities across legs, since it masks a short leg.
+Keying the split on `split_po_ids` alone, since the column is append-only and
+would override a person's edit of the reference. New per-leg warning codes,
+since six locales would need strings for wording only.
+
+**Enforced by** `test_po_match_exception_reconciliation.py` § multi-PO split,
+`test_exception_agents_multi_po_split.py` and
+`test_approval_receiver_segregation.py`.
+
+## 438. The browser OAuth connect is tested inside each provider's existing spec file (closes a `docs/followups.md` entry, round 14, 2026-11-17)
+
+fake-erp already stubbed authorize, token exchange with refresh rotation and
+revoke for Xero, Sage and Blackbaud, and each adapter's spec already connected
+through the real OAuth flow, but by `page.request`. Nothing proved the nonce
+cookie crossing from `<slug>.localhost` to the API host, the browser following
+the redirect chain, or the panel showing the result. Each spec now also
+connects once through the Organization page (`connectOAuthThroughPanel`) and
+asserts the hop order: fake-erp authorize, `/api/erp/oauth/callback`, the
+tenant's `/organization?erp_connected=<provider>`.
+
+The browser test lives in the provider's existing file, not a new one.
+fake-erp's OAuth state is one consent per provider app: a new code exchange
+rotates the refresh token and `/__oauth/{key}/revoke` clears every issued
+token. A second file on the same provider app could race the Blackbaud and
+Sage token-lifecycle tests under several local workers. Tests within a file
+run in order, so one file per provider app keeps the isolation
+`tools/fake-erp/README.md` relies on.
+
+## 439. Mobile record-only mode reads the web's server signals and restates none (§251 follow-up, round 14, 2026-11-17)
+
+`GET /payments/execution-mode` decides whether the Pay tab offers Execute, and
+fails closed while the mode is unknown (loading, failed, offline, an unknown
+value), as the web does. A queue row's `record_outside_refusal` decides its
+"Record as paid", deliberately not `blocked`, since a run refuses an
+unverified vendor and recording does not (#566). A run's
+`actions.record_outside` from `GET /runs/{id}` decides whether the record form
+is offered at all. Recording is offered in both modes, as on the web and in
+§251, where a processor tenant can still record a cheque.
+
+The runs list carries no verdicts, so the mobile run menu shows its record
+entry for `draft` / `exported` runs only, and the dialog defers to the
+verdict before showing a form. Neither dialog sends an amount; the server sets
+the figure.
+
+## 440. Overdue AP is carried into the cash forecast's first period, as its own slice (closes a `docs/followups.md` entry, round 14, 2026-11-17)
+
+`api/analytics._commitment_rows` dropped every open invoice whose effective
+due date was before today. The forecast, `/cash_position`, the what-if, every
+copilot planning tool, the assistant's `get_payment_forecast` and the
+shortfall sweep therefore overstated cash by exactly the AP the business was
+already late paying, its most certain outflow.
+
+Such rows are now kept and flagged `overdue`. `services/analytics.bucket_outflows`
+times them on today and reports them on `overdue_amount` / `overdue_count`,
+outside `committed_amount` / `pending_amount`, so
+`scheduled = committed + pending + overdue`. Past-due invoices still in review
+count as overdue too. The due-date bound moved into SQL at the future edge
+only. No what-if scenario times an overdue row before today.
+
+`compute_plan_id` now hashes `PLAN_DERIVATION_VERSION`
+(`v2-overdue-in-first-period`), so a `plan_id` minted under the old derivation
+gets the stale-plan 409 instead of letting `/draft-run` return a run staged
+from the old set of invoices. `get_payment_forecast` now reads
+`_commitment_rows` rather than its own query, which also fixes its
+cross-currency raw sum.
+
+**Rejected.** Folding overdue rows into `committed`, which presents a late
+bill as on schedule. Inferring overdue from `due_date < today` inside the
+bucketer, which would move the settled payments the plan-vs-actual side
+buckets through the same function. Counting only committed rows, which keeps
+silently dropping past-due invoices still in review.
+
+The followup named this a product call. It was made in the round's plan, by
+the round coordinator, on the shape the followup itself proposed, and is open
+to the operator's revision. See `backend/docs/analytics.md` § Overdue AP is
+carried into the first period.
+
+## 441. The requisition form links a budget through a currency-filtered picker, with an advisory overspend check (closes a `docs/followups.md` entry, round 14, 2026-11-17)
+
+`ui/BudgetPicker` asks `GET /budgets?currency=` for only the budgets the
+requisition's currency may link; filtering on the client would make the
+picker's count describe budgets it hides. The overspend pre-check
+(`checkBudget()`) is advisory: it warns and the save proceeds, matching
+"`would_overspend` is advisory" in `procurement-budgets.md`. It runs only on
+drafts, since a submitted requisition is already counted in `committed`. A
+budget/requisition currency mismatch is refused in the form rather than
+compared at face value, mirroring `_resolve_links`' 422.
+
+The picker is limited to the budget-read roles (admin, ap_manager, cfo); an
+ap_clerk raises requisitions unlinked. On edit, `budget_id` is sent only when
+the picker changed it, so a clerk's edit never clears a manager's link.
+
+## 442. A recurring template's GL code is judged again at every generation; a code the chart has since dropped is not stamped (closes a §199 follow-up, round 14, 2026-11-17)
+
+§199 refused a bad code when a template was written but not afterwards, so an
+account retired after a template was authored was stamped onto every invoice
+the template raised. Of the three shapes §199 filed, (a) was taken, chosen in
+the round's plan by the round coordinator and open to the operator's revision.
+
+`recurring_invoices.generate_one`, the one primitive behind both
+`generate-now` and the sweep, checks `template.gl_account` through
+`gl_chart.load_invoice_chart` against the template's own entity. If the chart
+refuses it (retired, unknown, or another entity's), the invoice is raised with
+`gl_account = NULL` and the `gl_codes_not_in_chart` warning, and the
+`invoice.created` audit row records the dropped code. Generation is never
+refused over it: the sweep has no human to ask, and a missed rent invoice is
+the worse failure.
+
+The template keeps its code, since silently rewriting a standing instruction
+would be the auto-clear §199 rejected. Instead every template response carries
+`gl_account_off_chart`, and `GET /api/recurring` and `/summary` take a
+`gl_off_chart` filter and count, so the page badges the templates and filters
+to all of them. The list reads the flag through `gl_chart.gl_code_off_chart`,
+a correlated-SQL twin of `InvoiceChart.judge`, because a whole-set filter must
+run before pagination; `tests/test_gl_code_entity_chart.py` pins the two to
+the same verdict matrix. The warning's sentence was reworded to name no source
+("GL code(s) not in the active chart of accounts, left uncoded"), since it now
+has two writers.
+
+**Rejected.** (b) an exception item per period, which is noise for one
+standing configuration fault. (c) pausing the template, which turns a coding
+gap into a missed payable.
+
+## 443. Every invite and admin reset sends a set-password link (§283 follow-up, round 14, 2026-11-17)
+
+§283's mechanism now covers admin Invite User, admin Reset password and
+partner child provisioning (employee tokens, `/login/reset-password`), and the
+supplier-portal invite and reset: a second token family, `portal:pwreset:`,
+valued `<slug>:<vendor_user_id>#<gen>`, redeemed at `/portal/reset-password`
+and refused unspent on another tenant's host.
+
+The account is left with no password (a reset clears it at once), and the
+link goes only to the account's own address, never into a response: whoever
+holds it chooses the password, so returning it would be the temporary password
+under another name. Admin and portal flows mint and send before commit and
+fail closed (503 `set_password_link_unavailable`, 502
+`set_password_email_failed`). Partner provisioning is best-effort, because the
+tenant database already exists and cannot be unwound, and reports
+`set_password_email_sent`.
+
+A per-subject generation counter makes a reset supersede every earlier link
+and any redemption kill its siblings, so no 72-hour link
+(`FEOH_SET_PASSWORD_LINK_TTL_HOURS`) outlives the password it was for.
+`provisioned_by_user_id` still stamps on portal invite and reset and is not
+cleared by redemption: AP still chooses the invited address.
+
+**Rejected.** Returning the link to the admin, since it is a credential. A
+separate store or endpoint per flow, which would be a second implementation of
+guarantees the reset token already has tested. Leaving the old password valid
+until the link is used, since a reset of a compromised account must cut it off
+immediately.
+
+## 444. BYOK extraction keys and the OIDC client secret are sealed in `provider_credentials` (closes two §264–§268 follow-ups, round 14, 2026-11-17)
+
+Migration 0135 moves both out of the settings JSONB, an existing sealed value
+winning, and strips the plaintext. Extraction is a generic credential block,
+written only through `PUT /api/organization/credentials/extraction` and read
+only through `byok_extraction_config`, which ignores a plaintext key left in
+the JSONB and never opens the store for a platform-mode org. A provider switch
+drops the key with an audited `extraction_provider_changed` row, because
+`claude_vision` and `openai_vision` share the `api_key` slot and keeping it
+would send one vendor's key to the other.
+
+`sso` is a dedicated-writer block (`DEDICATED_WRITER_BLOCKS`): written only by
+`PUT /organization/sso` and opened only by the OIDC callback after it consumes
+its single-use state. `settings.sso.client_secret_configured: true` is written
+in the same transaction, so the per-login completeness check (`is_sso_only`)
+stays synchronous and never unseals. Making that check async across its
+callers was rejected: it runs on every password sign-in. A marker without a
+sealed secret fails closed at the callback (400, or 503 when the store cannot
+open it).
+
+## 445. A multi-PO split's combined PO total exists only when every leg is in one currency (amends §437, round 15, 2026-11-18)
+
+When any leg's currency differs from the invoice's, or the legs' known codes
+disagree with each other, the match is `different` and `po_total` is null: no
+sum across currencies is a figure. Before this, a USD 600 leg and a EUR 400
+leg stored `po_total: 1000.00` labelled EUR, and the invoice modal showed
+"€1,000.00". The `po_currency_mismatch` hold still raises. Per-leg totals,
+each with its own code, stay in `details.legs`.
+
+A split whose legs are {code, NULL} is §197 applied to a sum: it compares at
+face value as `unknown`, and `multi_po_split_v1` refuses to auto-approve it.
+
+## 446. The PO currency backfill re-matches through the receipt path's lookup, matching only (amends §436, round 15, 2026-11-18)
+
+The backfill found invoices by `po_number` alone, so a multi-PO split whose
+leg it stamped was never re-matched and its dry run under-counted. It also
+refreshed unlocked, where a receipt's re-match takes invoices `FOR UPDATE` to
+serialise with approval (§267, §389). It now calls
+`refresh_invoices_citing_pos(lock_invoices=True, best_effort=False,
+skip_settled=True, matching_only=True)`, and the dry run counts the same
+`invoices_citing_pos` query, so the count is exactly what `--apply` touches.
+
+`matching_only` runs `refresh_po_match_only`. A currency stamp moves only the
+PO side of the match, so re-running duplicate detection, the vendor-history
+fraud rules and an opted-in LLM anomaly check per invoice costs work, and
+possibly money, for no new answer. Every warning those checks wrote is kept.
+
+The ERP PO sync keeps the full refresh. It also brings time- and
+history-dependent warnings up to date (`past_due`, the vendor-average check,
+the reporting-currency lock, the LLM check), and dropping that would be a
+silent behaviour change rather than a pure cost saving. It can opt in with
+`matching_only=True` if that trade is accepted.
+
+## 447. A BYOK extraction provider switch that would drop the stored key is refused while the new key is blank (amends §444, round 15, 2026-11-18)
+
+§444 drops the sealed key when the provider changes. The organization page
+still showed the key field as "stored" after a switch, so an admin who
+changed Claude to OpenAI and saved with the field blank lost the key, with a
+success toast. The field now reads as stored only while the dropdown names
+the provider the key was saved for. A switch shows a hint that saving drops
+the key, and a blank save after a switch is refused with the field marked and
+focused, as the ERP panel refuses a missing required secret. A confirmation
+was rejected because a keyless BYOK setup is never what the admin intends.
+Ollama, which needs no key, is not blocked.
+
+Platform-mode saves resend the saved provider, so a provider picked in BYOK
+mode and then hidden cannot drop the key either. The extraction, cards and
+payments panels show one toast, after both the settings PATCH and the
+credential PUT settle.
+
+## 448. Mobile record dialogs announce once, pre-fill from the ERP and book a standing split (amends §439, round 15, 2026-11-18)
+
+A refusal is announced once, through `A11y.announce`, the app's convention;
+the error line is no longer also a live region, which TalkBack read twice.
+The run dialog's load failure and server refusal now announce explicitly.
+
+The record dialog pre-fills from a row's `erp_reported_payment` by the web's
+rules: a method only if it can be recorded outside FeohLedger, the reference
+trimmed, and the ERP's date unless missing or in the future. When the server
+says an ERP split stands, the dialog books it through
+`POST /api/exceptions/{id}/record-erp-payment` with no method of its own. The
+NACHA bank file stays web-only by design, since it hands over bank account
+numbers. The record-only note is one sentence, inside each tab's scrolling
+list.
+
+## 449. A /cfo figure that includes overdue AP names it where the total is shown (amends §440, round 15, 2026-11-18)
+
+After §440 the KPI row's Committed and Pipeline no longer summed to Projected
+outflow. An "Overdue (owed now)" card appears when there is overdue AP, the
+cash-position row that carries it says so, and each what-if card states the
+overdue amount it includes, so the visible parts always sum to their
+headline.
+
+The `--danger` / `--accent` pair cannot be told apart by hue (1.13:1 dark,
+1.02:1 light). Stacked-bar segments are separated by a 2px `--surface` line,
+and overdue is hatched, so each segment is at least 3:1 against its separator
+and the split never depends on colour alone.
+
+## 450. An approver sees a submitted requisition's budget headroom as it stands (amends §441, round 15, 2026-11-18)
+
+The overspend warning told a requester that an approver would see it, and
+nothing showed it. A submitted, pending or approved requisition now shows a
+read-only headroom line from `GET /budgets/{id}/spend`, which already counts
+the requisition, never `/budgets/check` with its total, which would count it
+twice. It shows nothing when the budget is in another currency.
+
+The draft pre-check keeps its last settled result for the same budget, marked
+`aria-busy`, while a new check runs, so a screen reader hears only settled
+results, not "Checking…" on every pause in typing.
+
+## 451. Suppliers reset a lost password themselves, without being able to lock anyone out (round 15, 2026-11-18)
+
+`POST /api/portal/auth/forgot-password` mints the existing tenant-bound
+portal token at the forgot-password lifetime. Unlike the AP team's reset
+(§443) it clears nothing, supersedes no earlier link and never re-stamps
+`provisioned_by_user_id`. Anyone can submit an address, so it must not be able
+to lock a supplier out, and no AP actor chose where the link goes.
+
+It answers the same for a known and an unknown address. Budgets of 5 an hour
+per IP and 3 an hour per tenant and address are checked before the lookup.
+The mint, the email and the audit row, which only a matching address
+triggers, run on a detached task, so response time does not reveal whether
+the account exists. The employee route still awaits that work on the known
+branch, a timing leak recorded in `docs/followups.md`.
+
+The supplier's set-password redemption no longer answers 500 when the session
+revoke after it fails: the password is already set and the link spent, so the
+failure is logged by vendor-user id and the response stands.
+
+## 452. The operator's tenant tooling gives the first admin a set-password link, not a password (extends §443, round 15, 2026-11-18)
+
+`scripts/create_tenant.py` creates the first admin with no password and
+emails the same link "Invite User" sends, printing only the address and
+expiry. It refuses before creating anything when there is no tenant URL to
+build the link on. If the tenant exists but the email failed it exits 3 and
+says the admin can use Forgot password once mail works. There is
+deliberately no option to print the link instead: the CLI runs on the VM,
+often through SSM, whose output is retained, so a printed link would be a live
+single-use credential in a log (CodeQL `py/clear-text-logging-sensitive-data`).
+A tenant whose mail does not work yet waits for mail; an operator re-send is
+tracked in `docs/followups.md`.
+
+`deploy/add-tenant.sh` no longer generates or prints a password and refuses
+`--admin-password` and `--print-link`. `create_tenant.py` keeps `--admin-password` for local dev,
+because the documented setup uses it, and refuses it in a deployed
+environment. The day-one rehearsal reads the admin's link from Mailpit.
+
+## 453. `/draft-run` never stages an invoice whose currency is not recorded (round 15, 2026-11-18)
+
+`invoices.currency` is NOT NULL, but the invoice PATCH keeps `""` as its
+legacy "no currency" value. `/draft-run` read that blank as the reporting
+currency (`cur or run_currency`) and staged the invoice into a single-currency
+run that would pay it in a currency nobody recorded: the substitution
+§160/§196/§200 removed from the formatters, reaching a payment.
+
+Each payable invoice the route leaves out is now listed in
+`DraftRunResponse.skipped` with a code (`currency_unknown`, or
+`currency_not_run_currency` with `params.currency`). A plan with nothing
+stageable answers the coded 409 `draft_run_no_run_currency`, stated in six
+locales, and the plan card no longer reads every 409 as a stale plan.
+
+Rejected: defaulting a blank to the reporting currency, which is the bug; and
+refusing the whole draft run when any invoice lacks a currency, which lets one
+bad row block the plan's whole run. The same `or "USD"` substitution is still
+live in the run builder and at execution; that is recorded in
+`docs/followups.md`.
+
+§440's overdue staging is now pinned by a test and unchanged: an approved
+invoice already past due is staged, and one still in review is not. Whether a
+plan-driven run should cap how overdue an invoice may be is an open product
+question for the operator. A cap would be a `settings.cash_flow` integer
+applied before staging, folded into the plan's derivation so the plan and the
+run agree, with the forecast's overdue slice left uncapped.
+
+## 454. The operator re-sends a first admin's set-password link, never to an account with a password (extends §452, round 16, 2026-11-18)
+
+`scripts/create_tenant.py --resend-link --slug <slug> --admin-email <addr>`
+(`deploy/add-tenant.sh <slug> --admin-email <addr> --resend-link`) provisions
+nothing. It finds the tenant's admin (`tenant_provisioning.resend_link_target`),
+bumps the account's link generation as an admin reset does, so every earlier
+link stops working, then mints and emails a fresh one. It prints only a masked
+address (`a***@acme.test`) and writes `user.set_password_link_resent` (actor
+NULL, no address) to the tenant's audit trail. It exits 2 without touching the
+token store when the tenant or account does not exist, the account is not an
+active system admin of that tenant, or no tenant URL is configured, and 3 when
+the generation bump, mint or send fails. The workspace-ready email has one
+builder, `set_password_links.workspace_admin_email`, which partner child
+provisioning uses too. The re-sent copy adds that the link replaces any earlier
+one.
+
+An admin who already has a password is refused, and there is no `--force`. The
+re-send exists for an account whose first link never arrived, which by
+definition has no password. An account with a password is recovered by its
+holder through Forgot password, which now works because mail does, or by
+another admin's reset in the app, which is audited against a named actor. A
+`--force` would have the server operator clear a customer's working password
+from a shell, with no named actor and no step-up. That is a takeover
+primitive the product deliberately keeps behind RBAC and the out-rank guard
+(§276, §443).
+
+**Rejected.** Picking the admin without `--admin-email` (for example, the
+tenant's oldest admin). The operator typed that address when provisioning, and
+naming it means a tenant with several admins cannot be sent the wrong one.
+Printing the link, for the reasons §452 gives.
+
+## 455. A badge whose tooltip carries information says it in text too, through one component (round 16, 2026-11-18)
+
+`/recurring`'s "Not generating" badge put the skipped-period count, the period
+and the reason only in a `title`, which a keyboard, a touch screen and a screen
+reader never reach. §442's GL off-chart badge beside it had been fixed in round
+15 by hand: the code in the pill, the reason in a visually-hidden span, the
+tooltip kept for the pointer user. Two badges with the same three-part markup
+is the point at which guard rail 9 asks for a component, so both now render
+`ui/ExplainedBadge` (`label` visible, `explanation` visually hidden and as the
+`title`).
+
+Extracting it found a defect in the round-15 markup. The hidden span opened
+with a literal space (`> {reason}</span>`), and Svelte 5 trims whitespace at
+the edge of an element's children, so the text a screen reader read was "GL
+6800 needs re-codingGL 6800 is not…", one run-on word. The component writes the
+space as an expression (``{` ${explanation}`}``), and both its vitest and the
+e2e spec assert the badge's whole text, so a regression to the literal form
+fails.
+
+Considered and rejected: showing the skip reason as visible text in the row.
+The status column is narrow and already holds up to three pills; the reason is
+a sentence, and the visible pill already names the problem. The visually-hidden
+text gives assistive technology the same information the tooltip gives a
+mouse, which is what WCAG 1.3.1 and 4.1.2 ask for. The i18n key keeps its name
+`recurring.skip.title`; renaming it in six locales would be churn with no
+reader-facing change.
+
+## 456. Forgot-password work only a known address does runs detached, on both routes (round 16, 2026-11-18)
+
+`POST /api/auth/forgot-password` sent its email on a detached task but awaited
+the org lookup, the reset-token mint and the `auth.password_reset.requested`
+audit row first, and only a known, active address took those steps. The
+response time therefore still said whether the account existed. The route now
+does the user lookup and nothing else; the rest runs on a detached task with
+its own control-plane session, the shape §451 gave the supplier route. A token
+store failure is logged by user id and answered with the same 200, as on the
+portal.
+
+Both routes now spawn through one registry, `app/utils/detached_tasks.py`.
+Each had its own copy, and tests drained a module's private set or yielded in
+a loop until mail appeared. Tests await `drain_detached()`, the real
+completion signal. The lifespan shutdown drains it too, bounded at five
+seconds before the auth-audit drain, because a stopping process could
+otherwise drop a reset link mid-send. Any work still running at the deadline
+is cancelled and logged with a count.
+
+Rejected: loading the org with the user in one join. That keeps the query
+count equal, but the mint and the audit write would still be awaited only for
+a match. Padding the unknown branch with dummy work was also rejected: it
+tracks Redis and tenant-DB latency only roughly, so it masks the leak rather
+than removing it.
+
+A workspace closure also forgets its suppliers' set-password links now.
+`credential_cleanup.forget_portal_links(slug)` deletes every `portal:pwreset:`
+token whose stored value is bound to the slug, plus the generation counter of
+each supplier those tokens name. The closure already requires every portal
+account to be deleted, so these are links that outlived their rows. A counter
+is keyed by the supplier id alone, so only a link ties it to a tenant. A
+counter with no remaining link is left to its own TTL: it is a number under a
+random id whose row is gone. Re-keying the counters by slug was rejected. A
+counter that reads as `0` under a new key would revive any link superseded at
+generation 0.
+
+The test TOTP secrets were 16 base32 characters, which is 80 bits. pyotp 2.12
+refuses anything under 112 bits, and the lock pins 2.10, so the tests passed
+in CI and failed in any fresh venv. `verify_totp` swallows the error, so on
+2.12 a refusal test could also pass for the wrong reason. Every such literal is now
+32 characters (160 bits, pyotp's `random_base32` default). The followup
+suggested 16 characters, which would not have been enough.
+
+## 457. A payment run refuses an invoice that records no currency, on every surface (extends §453, round 16, 2026-11-18)
+
+§453 stopped `/draft-run` staging an invoice whose currency is blank, but the
+run builder (`invoices[iid].currency or "USD"`) and dispatch
+(`normalize_currency_code(...) or "USD"`) still read the blank as USD. A manual
+`POST /api/payments/runs`, or an invoice blanked by a PATCH while a draft run
+waited for sign-off, was staged and paid in a currency nobody recorded.
+
+A blank currency is now a per-invoice refusal, `currency_unknown`, in
+`payment_runs.run_refusal_reasons`, so the builder's 409 (prefixed
+`currency_unknown:`) and the queue's `blocked_reason` come from one predicate,
+and the queue's SQL selectable set has its twin (`_queue_currency_unknown`).
+It is refused on every rail, so it ranks with `vendor_not_active`, above the
+card-rail pin. The mixed-currency 422 leaves a blank out rather than counting
+it as a second currency. `dispatch_preflight` refuses it before the processor
+call (retry-safe), which covers rail dispatch, the NACHA export and
+paid-outside close-out; `/retry-failed` skips it; `POST /api/payments` 409s;
+`/corridor-quotes` refuses to price it; and the card mint refuses it before the
+provider call. Both `or "USD"`s are gone, the adapter payload carries the
+normalised code, and `prepare_international_payment` raises rather than
+defaulting a blank to the home currency.
+
+Rejected: reading the blank as the org's home or reporting currency, which is
+the same substitution with a different default; and fixing only the builder,
+which leaves the window between booking and dispatch open. Stopping the
+invoice PATCH writing `""` at all is the longer-term fix and stays in
+`docs/followups.md`. The builder's refusals are still plain strings rather
+than `{code, params}` bodies; the code travels as the detail's prefix and as
+the queue's `blocked_reason`, which is what the web and mobile queues label.
+
+## 458. A split's currency mismatch with a malformed invoice code names every leg's code (amends §445, round 16, 2026-11-18)
+
+A split whose legs' codes disagree is `different` even when the invoice's own
+code is malformed (§445), and `po_currency_mismatch` then read "Invoice is in
+ but PO … is in EUR": a blank, and one leg's code standing for the whole PO.
+That is its own code, `po_currency_mismatch_invoice_currency_unknown` (with a
+PO-match issue twin), not a fallback word in a param: a word in a sentence
+selects the code (`backend/docs/invoice-warnings.md`). It names every code the
+legs record, in one `text` param (`poCurrencies`, "USD, EUR"), because no
+single code is honest about a split that spans several. The hold is unchanged.
+
+## 459. A plan-driven run stages every approved overdue invoice; no age cap (closes §453's open question, round 16, 2026-11-18)
+
+§453 left open whether `/draft-run` should cap how overdue an approved invoice
+may be before a cash plan stages it. It does not. An approved invoice that is
+long past due is the one a payables team most needs to pay, and a cap would
+drop it from the plan silently, with no row saying why. A sum that should not be
+paid is a question for the controls that already state it: a payment-blocking
+exception, a vendor block, a compliance hold or a recall (§374), each audited
+and each shown on the queue. An age threshold is none of those.
+
+Rejected: a `settings.cash_flow` cap left off by default, which adds a setting
+with no case that the existing holds do not cover better; and a 90-day default,
+which would change behaviour for every tenant to hide its oldest debts. The
+operator delegated the call to the round coordinator.
+
+## 460. An invoice edit may change the currency, never clear it (extends §457, round 17, 2026-11-18)
+
+`PATCH /api/invoices/{id}` took `currency` as `BlankableCurrencyCode`, which
+kept a blank as `""` and wrote it to the NOT NULL column as "no currency". §457
+made every money path refuse that value, but each new reader still had to know
+the sentinel, and an explicit `null` reached the `setattr` and failed the
+NOT NULL constraint as a 500.
+
+The PATCH now refuses both in the handler, through `api/refusals.invoice_currency`:
+a blank or `null` is 422 `invoice_currency_required`, and a code that is not
+three ASCII letters is 422 `invoice_currency_invalid` with `params.value`. The
+schema field is a raw `str | None` so the refusal is coded rather than
+Pydantic's validation list, and `BlankableCurrencyCode`, whose only user was
+this field, is gone. `statement_currency` and `invoice_currency` share one
+helper. The other writers already refused a blank: create takes `CurrencyCode`,
+the CSV importer `_parse_currency`, and approve-with-corrections does not take a
+currency. No web or mobile screen edits an invoice's currency, so the codes are
+not in the clients' registries; a client that adds one registers them then.
+
+A PATCH that leaves `currency` out is not checked, so a row already holding
+`""` stays editable. Refusing every edit until the currency is fixed would
+block the notes, coding and vendor clean-up AP does on exactly those rows, and
+the money paths already refuse to pay them (§457). The user can fix the
+currency in the same PATCH whenever they know it.
+
+Rejected: making the column nullable here. That is the larger "currency
+unknown" follow-up (a tenant migration, the upload creating rows with NULL, and
+every reader failing closed on NULL), and it stays in `docs/followups.md` along
+with the rows already blank.
+
+## 461. Payment-run SoD / CFO sign-off and the sign-in MFA wrong code are coded refusals (round 17, 2026-11-18)
+
+**Context.** §238 coded the refusals a user acts on, but three stayed English
+(`docs/followups.md`). Two are closed here. The payment run's maker-checker
+(`payment_run_segregation`) and CFO wait (`payment_run_awaiting_cfo`) already
+had codes, because the run dialog's `actions` verdicts carry them. But the POSTs
+behind those verdicts (approve, execute, resume, retry-failed, record-outside,
+the NACHA export) still answered with the plain sentence. That was deliberate
+then: "every client, mobile included, reads it as text". The standalone
+`POST /api/payments` CFO refusal had no code at all. The sign-in challenge's
+wrong TOTP code was a bare `401 "Invalid code"`, the same sentence §238 had
+already coded on enroll-verify.
+
+**Decision.** `payment_controls._segregation`, `_segregation_for` and
+`_awaiting_cfo` are `ActionRefusal(coded=True)`, so each endpoint raises the
+same `{code, message, params}` its verdict ships, and `check_run_segregation`
+(the `/resume` gate) raises through `_segregation(...).http()`. The standalone
+payment's CFO refusal is `payment_cfo_required`. The plain-text concern no
+longer holds: web's `formatApiDetail` and mobile's `ApiClient.errorMessage`
+both render an object `detail` by its `message`, so a client that cannot
+localize a code still shows the server's sentence. Both web and mobile now
+localize these codes. On mobile, `PaymentQueueStore` keeps the refused body for
+the Pay tab.
+
+The sign-in MFA wrong code (`POST /api/auth/mfa/verify`, and the portal's
+`/mfa/challenge` twin, which had the same bare sentence) carries
+`MFA_CODE_INVALID_DETAIL` and **stays a 401**. The followup asked for this to
+be checked against the login throttle and each client's 401 handling. Neither
+gives a reason to move it:
+
+- The per-account `auth_mfa` failure budget records the miss before the raise,
+  whatever the status.
+- Web's `request()` only ends a session on a 401 when a token was sent, and
+  none exists at this step.
+- Mobile ends a session only when it presented a token, and on this 401 it
+  shows the localized sentence (`AuthStore.errorDetail`).
+
+A 401 is also the truthful status: no session exists yet. §238's enroll-verify
+move to 400 was about a signed-in session being torn down, which cannot happen
+here.
+
+**Not done.** The bulk status change's per-row skip reasons
+(`api/invoices._skip_reason`) and the email-OTP miss ("Invalid or expired
+code") stay in `docs/followups.md`.
+
+## 462. The ERP push refuses an invoice with no payable currency (round 17, 2026-11-18)
+
+**Problem.** `services/erp._build_payload` sent `currency=invoice.currency or
+"USD"`. An invoice whose currency was blank, whitespace-only or malformed was
+booked in the ERP as a USD bill, where a bookkeeper can pay it directly. §457
+removed that substitution from every payment surface (`currency_unknown`), but
+the ERP export gate (§286, §309, and the vendor hold) did not judge the
+currency, so the ERP was a way round it.
+
+**Decision.** The export gate refuses such an invoice with the coded refusal
+`currency_blocks_erp_export`, judged by `payment_runs.payable_currency_code`,
+the same predicate the run gate uses, so the two cannot disagree about what a
+payable currency is. It runs where the other export refusals run: in
+`erp._call_erp` before any adapter is built (so a push queued by the workflow's
+own advance is stopped too) and at `/complete`, `/send-to-erp` and
+`/retry-erp` with a 409 before their transition. It is checked last, so the
+earlier refusals keep their precedence. The payload carries the predicate's
+normalised code and never substitutes one. Params carry only
+`possibly_posted`; the stored value is free text and is never echoed.
+
+**Rejected.** Defaulting to the org's base currency instead of USD: still a
+guess about which currency the debt is in, and it books a liability in it.
+Letting the adapter refuse (QuickBooks already answers an unknown code with
+`currency_unknown`): not every adapter checks, and the bill is then refused
+only after an ERP round trip.
+
+## 463. A white-label accent is cached per workspace and painted before first paint (round 18, 2026-11-18)
+
+**Problem.** `brand.svelte.ts` reads `GET /api/organization/branding` only after
+`/auth/me`, so after a sign-in or reload a branded tenant's primary buttons,
+active sidebar row and pressed chips painted the platform blue for a round trip.
+
+**Decision.** Cache the two applied values (`--accent`, `--accent-strong`) in
+the origin's `localStorage` under `feoh_brand_accent:<getTenantStorageKey()>`
+(`stores/brandAccentCache.ts`), apply them from `app.html`'s
+`<script id="accent-boot">` beside the theme script, and again in
+`ensureLoaded()` for the in-app sign-in that runs no pre-paint script. The
+fetched branding is authoritative: it overwrites or removes the entry.
+`reset()` clears it.
+
+- **Not the shared theme cookie.** That cookie is scoped to the platform apex so
+  every workspace sees it; one tenant's colour would paint another's.
+- **How the inline script finds the key without `PUBLIC_PLATFORM_DOMAINS`.**
+  `getTenantStorageKey()` is the slug, which `classifyHost` always takes from
+  the hostname's first label, or the whole hostname on a vanity host. The script
+  tries both. Storage is per origin and only the store writes it, with the
+  origin's own key, so at most one of the two can exist; there is no need to
+  repeat `classifyHost` in the inline script or template the domains into it.
+- **Validated on read, twice.** Storage is writable by anything on the origin
+  and the value lands in a CSS custom property, so the store and the script
+  each accept only the two props and only 3- or 6-digit hex literals.
+  `brandAccentCache.test.ts` runs the script against the store's reads.
+- **Written only after a successful read; a failed read keeps it.** Writing
+  before the first read would cache the empty default and erase a good entry on
+  a transient failure, and wiping the painted colour on a failed read would
+  bring back the flash this removes.
+- **No CSP hash to update:** the frontend ships no CSP (`infra/frontend.tf`,
+  SvelteKit hydration uses inline scripts).
+
+## 464. A payment or card key goes with its provider, and an unopenable block can be cleared (round 18, 2026-11-18)
+
+**The drop.** Changing `settings.payments.provider` or `settings.cards.provider`
+left the old provider's sealed `api_key` / `client_secret` / webhook key in
+`provider_credentials`, and the next call sent it to the new provider's host.
+The ERP block (§271) and the extraction block (§444) already drop their secrets
+when a save points them somewhere new; the rail blocks now do the same.
+`provider_credentials.rail_secrets_to_drop(block, before, after)` is the pure
+rule. A key belongs to a provider in one environment, so the block's own secrets
+go when the save changes:
+
+- the provider (stripped, blank = none);
+- the `sandbox` flag, read with the default the adapters apply when it is absent
+  (`true` for payments, `false` for cards). Column, Increase, Dwolla, Checkeeper,
+  Lithic and Nium pick their host from it, and a sandbox key on a production
+  host, or the reverse, is the same mistake on a smaller scale;
+- for a card block with no provider, the `region`, because
+  `card_adapters/dispatcher` then picks the issuer from it.
+
+A `payments.providers[]` entry's secrets are stored as
+`providers.<provider>.<field>`, which is already keyed by provider. They go when
+that entry is removed or its own `sandbox` changes. `PATCH /api/organization`
+clears only the paths that are actually stored, through `update_secrets`, in the
+save's transaction, audited first as `organization.credentials_updated` with
+reason `payments_provider_changed` / `cards_provider_changed`.
+
+The rule over-drops on purpose in two cases. A card block that resolved its
+issuer by region and is then saved naming that same issuer explicitly loses its
+key. So does a Modern Treasury or Stripe block whose `sandbox` flag is flipped,
+even though those two pick the environment by key rather than by host. In both
+cases the admin types the key again, in the same save. Working out "the same
+issuer" would mean copying the dispatcher's credential-dependent fallback into
+a pure rule. A rule that wrongly keeps a key sends it to the wrong host.
+Rejected: comparing the whole configuration, as the generic connection test
+does. That would drop keys on every threshold or NACHA edit in the payments
+block, which holds both rail configuration and AP policy.
+
+**The reset.** `update_secrets` opens the stored row so it can merge into it. A
+row that can no longer be opened (KMS key disabled, or a changed dev
+`FEOH_SECRET_KEY`) therefore made every save of that block a 503, and that
+includes a `clear` and the PATCH drop above. `DELETE
+/api/organization/credentials/{block}` (`provider_credentials.reset_block`)
+deletes the row without opening it, naming what it held from its
+`secret_fields`. It is admin-only, holds the org row lock, and is audited first
+(`organization.credentials_updated`, reason `reset_without_opening`); if that
+audit row cannot be written, nothing is removed. It is deliberately not limited
+to rows that fail to open. Checking that would mean calling KMS on a path meant
+for when KMS is the problem, and removing all of a block's keys is an action an
+admin may take anyway. For `erp` it also removes the OAuth tokens sealed in the
+same row. They cannot be revoked at the provider without being opened, so the
+connection reads as "reconnect" (`erp_oauth` treats a missing refresh token as
+not connected). The organization page has no per-block "remove all" control to
+attach this to, since each secret field has its own "remove the stored value",
+so the action is API-only for now; the button is tracked in `docs/followups.md`.
+
+## 465. Every bulk-status skip is coded, and the email-OTP miss too (round 19, 2026-11-18)
+
+**Context.** The last English-only refusals entry in `docs/followups.md` (§238,
+narrowed by §387 and §461) named the bulk status change's per-row skips and the
+sign-in challenge's email-OTP miss. Two of its three skips were already closed:
+§387 had coded the stale-version skip (`invoice_stale_approval`) and the blank
+submit (`invoice_required_fields_missing`). What was left was the fallback,
+`api/invoices._skip_reason`: a refusal reaching `_refused_skip` without
+`{code, message, params}` became a row with only an English `reason`. Every
+refusal `approve_invoice`, `reject_invoice`, `resubmit_invoice` and
+`transition_invoice` raise for a bulk row is coded today, so the fallback was
+unreachable in practice. But that held only by the services' discipline, and
+the next uncoded refusal added to any of them would surface English-only in a
+translated list.
+
+**Decision.**
+- `_refused_skip` no longer has an uncoded exit. An uncoded refusal (a plain
+  string, or a structured detail that is not `{code, message, params}`, such
+  as the GL-chart refusal's shape) becomes `invoice_bulk_refused` with
+  `params.status` set to the target the row could not reach. The refusal's
+  own sentence (`utils/http.detail_text`), or the branch's fallback label,
+  stays as the English `reason`. `_skip_reason` is gone.
+- Web (`codedRefusals.ts`) and mobile (`coded_refusal_messages.dart`) state it
+  as "This invoice could not be changed to {status}", with the status named by
+  its label. An unknown status falls back to the server's sentence.
+- The trade-off: a code-aware client shows that generic sentence even in
+  English, and the server's more specific one stays in `reason`. That is
+  deliberate. A row is either stated in the reader's language or it isn't,
+  and a refusal specific enough to need its own sentence should get its own
+  code at the service that raises it.
+- The email-OTP miss (`POST /api/auth/mfa/verify` with `method=email`, and the
+  portal's `/mfa/challenge`) is `mfa_email_code_invalid`
+  (`api/refusals.MFA_EMAIL_CODE_INVALID_DETAIL`), "Invalid or expired code".
+  It is not `mfa_code_invalid`, because its sentence also covers an expired
+  code. It folds a wrong code and an expired one together, as before. It stays
+  a 401 for §461's reasons.
+
+**Guards.** `tests/test_bulk_status_controls.py::test_an_uncoded_refusal_is_still_a_coded_skip`
+(plain, structured and unreadable details) and the endpoint-codes pin;
+`tests/test_mfa.py::test_verify_mfa_email_code_miss_is_coded`;
+`codedRefusals.test.ts` (the reverse pin now counts five endpoint codes, plus
+the label test) and the mobile `coded_refusal_messages_test.dart`.
+
+## 466. An invoice with no currency clears no approval limit and matches no contract (round 19, 2026-11-18)
+
+Rounds 16 and 17 (§453, §457, §460, §462) stopped the payment rails, the ERP
+push and the invoice PATCH from reading a blank currency as USD. The approval
+gates still did it in two places. `currency_conversion.reporting_amount_at_locked_rate`
+read `currency or reporting_currency`, so a NULL code was treated as already in
+the reporting currency and compared against `max_invoice_amount` and
+`require_cfo_above` at face value. `review._enforce_approval_thresholds` also
+substituted `"USD"` for its structuring aggregate, summing the vendor's USD
+spend against a figure in an unknown currency. That is §196's substitution
+inside an approval gate.
+
+**Decision.** The locked-rate helper judges the code with the shared predicate,
+`payment_runs.payable_currency_code`, so NULL, blank, whitespace-only and
+malformed codes all mean "no currency". Such an amount is `unconverted`. Every
+consumer already reads that as fail-closed (§160's `GateAmount`): both approval
+gates fire, auto-approve does not, chain bands apply every level, and the
+payment-run and standalone-payment CFO gates demand a CFO. Fixing the one helper
+covers all of them, rather than adding a check at each of ten call sites. The
+refusal reuses the existing coded shape (`approval_max_amount_exceeded` /
+`approval_cfo_required`, `params.expressible: false`, `params.currency: null`).
+Its English note now says the invoice "records no currency", because "could not
+be expressed in USD" invites the reader to look for a missing FX rate. The
+structuring aggregate and the extraction auto-approve aggregate are skipped for
+a code-less invoice. There is no currency to scope them to, and the gate fails
+closed regardless.
+
+**Contract compliance.** A code-less invoice matches no contract currency, so
+it is not summed into a USD contract's spend or measured against its limit.
+That leaves no finding to warn on, which already happens to an invoice whose
+currency differs from the contract's. A dedicated finding for both cases needs
+a new warning code across six web locales and the mobile catalogue, so it is
+tracked in `docs/followups.md`. The approval gate and the payment rails both
+refuse a code-less invoice, so it cannot be paid in the meantime.
+
+**Displays.** Assignment and escalation notifications, chat messages, vendor
+notices, the audit summary (template and LLM prompt) and the LLM fraud adapters
+state the figure bare and pass `null` to a model, never `USD`. That matches
+`formatMoney`, which renders a missing code as a bare number. `InvoiceContext`
+and `ChatMessage` now default `currency` to `None`. The old `"USD"` default
+silently dollarised any caller that omitted it.
+
+**NACHA.** The file preflight's USD check now uses the same predicate, so
+` usd ` is USD there as it is in the run builder.
+
+**Left alone.** Reporting-currency defaults (`cashflow`, `budget_service`,
+`adaptive_workflows`, `tax_1099`) read the org's reporting currency, not an
+invoice's. `adaptive_workflows` does call the locked-rate helper, and its
+code-less rows now come back `unconverted`. That keeps them out of the
+threshold statistics, which is the direction its docstring asks for.
+
+## 467. A supplier cannot flip a dead purchase order, and closed counts as dead (round 23, 2026-11-18)
+
+**Problem.** The supplier portal offered "Create invoice" on every PO it
+listed, and `POST /api/portal/purchase-orders/{id}/flip` minted an invoice for
+`po.total` from a cancelled, voided or closed order — a payable against spend
+nobody committed.
+
+**Decision.** The flip refuses a PO in `models/procurement.DEAD_PO_STATUSES`
+with a coded 409 `po_not_invoiceable`, from one gate
+(`api/portal.po_flip_refusal`) that also ships per row as `flip_verdict`, and
+the page reads that verdict instead of a status list (issue #575).
+
+**Why the dead set, not the matcher's.** `UNMATCHABLE_PO_STATUSES` (§394)
+leaves `closed` matchable because the invoice being matched can itself be what
+closed the order. A flip is different: it creates a NEW invoice for the PO's
+WHOLE total, so on a closed (fully billed) order it is a second bill.
+`DEAD_PO_STATUSES` is the existing single definition of "no longer a live
+commitment" (budget commitments and the open-PO accrual read it), and is
+exactly what a flip bills against. No new list was added.
+
+**Replay first.** The gate runs after the per-PO idempotency short-circuit, so
+a retry of a flip that succeeded (and closed the PO) gets its invoice back, not
+a refusal.
+
+Tests: `backend/tests/test_portal_self_service.py` (each dead status refused
+with the coded detail and verdict, the replay after closing, the unvouched
+total's verdict); `frontend/src/lib/types/purchaseOrder.test.ts`;
+`frontend/tests-e2e/portal/portal.spec.ts` (a closed PO offers no control).
+
+## 468. A supplier cannot flip a purchase order they have already invoiced (round 24, 2026-11-18)
+
+**Problem.** §467 stopped the flip on a dead PO, but an `open` PO is often
+already billed: the supplier submitted an ordinary invoice through the portal
+(or AP keyed theirs) and the ERP has not synced the order to `closed` yet. A
+flip then minted a second invoice for the whole `po.total`. Nothing downstream
+caught it: the flipped invoice has an empty `invoice_number`, so number-based
+duplicate detection (`services/invoice_warnings`) has nothing to match, and PO
+matching compares an invoice with the PO, not with what is already invoiced
+against it.
+
+**Decision.** The flip refuses with a coded 409 `po_already_invoiced` while a
+live invoice of the caller's own vendor cites the PO, from the same gate
+(`api/portal.po_flip_refusal`) that ships per row as `flip_verdict`.
+"Cites" is what the matcher resolves by: the PO's number within the invoice's
+entity, or the PO's id among a split's `split_po_ids`. "Live" is every status
+but `rejected`. From `new` to `done` an invoice is, or can still become, a
+payable, and `failed` is either a stalled extraction or an approved bill whose
+ERP push is retried. A rejected invoice bills nothing while it stays rejected,
+and a supplier whose bill was rejected needs a way to bill again.
+
+**Why refuse, not bill the remainder.** Flipping only the unbilled remainder
+was considered. It would need a trustworthy "already billed" figure: invoice
+amounts include tax and freight the PO total may not, currencies can differ,
+credit memos reduce what was billed, and line-level remainders need quantity
+matching the portal does not do. A wrong remainder is a wrong payable with no
+document behind it. The flip is a convenience for billing a whole order. A
+partial bill is the supplier's own invoice, which carries a number the
+duplicate detector and PO matching then check. So the refusal tells them to
+submit one.
+
+**Order and replay.** The check runs after the per-PO idempotency
+short-circuit. A flipped invoice cites its own PO, so without that order a
+retry would be refused by the invoice it created. The row stops offering
+"Create invoice" once the flip went through, and a replay still returns the
+invoice. The dead-PO refusal comes first (a closed order is not open for
+anything) and the unvouched-total one last, because its advice to submit an
+invoice is wrong once the order is billed.
+
+**Vendor scoping.** Only the caller's vendor's invoices are read, and the
+refusal carries no params. Another supplier's invoice citing the same number
+neither blocks the flip nor shows up in the verdict. An invoice with no
+`vendor_id` yet (unresolved email intake) is not counted. Counting it would
+mean matching on a number another supplier may have written.
+
+**Left open.** The reverse order is not refused: a supplier who flips and then
+submits an ordinary invoice for the same PO. Partial and corrective invoices
+against one PO are legitimate there, so it is a review-side check, not a
+portal refusal. Tracked in `docs/followups.md`.
+
+Tests: `backend/tests/test_portal_self_service.py` (live statuses refused with
+the coded detail and verdict, a split leg, a rejected or foreign-vendor invoice
+not blocking, the flipped PO's verdict and its replay);
+`frontend/src/lib/types/purchaseOrder.test.ts`.
+
+## 469. A PO billed past its total across invoices is a review warning, and a rejected flip still counts as invoiced (round 25, 2026-11-19)
+
+**Problem.** §468 refused a flip of a PO the vendor had already invoiced, and
+left the reverse order open: after a flip, a portal submit, an emailed invoice
+or AP keying for the same order passed every check. The flipped invoice has no
+number for duplicate detection to match, and PO matching compares one invoice
+with the PO, not with what other invoices already bill against it. Separately,
+§468 counted a rejected invoice as not billing, which is right for the
+supplier's ordinary invoice but not for the PO's own flip. The flip's
+`po-flip:<po_id>` marker is unique in every status (migration 0024), so after a
+rejection the row offered "Create invoice" while the endpoint could only replay
+the rejected invoice.
+
+**Decision 1: an over-billing warning, not a hold.**
+`invoice_warnings._refresh_po_overbilling`, run inside the PO match, sums the
+other invoices billing the matched PO and adds `po_billed_beyond_total`
+(type `po_overbilled`, severity `warning`) when they and this invoice exceed
+the PO total by more than the match rule's tolerance. Its `currency` param is
+the normalised ISO code, not the invoice's raw field. A sibling is any other
+invoice in every status but `rejected`, in the PO's currency, that:
+
+- last matched this PO (`po_match->>'po_id'` is its id);
+- or was linked to it by a multi-PO split (`split_po_ids` holds its id). The
+  split counts at its whole amount, because its amount cannot be attributed to
+  one leg and overcounting is the safe direction;
+- or is not matched to any PO yet (a `new` invoice, or one reopened to `new`)
+  and cites the PO's number within the PO's entity, naming the PO's vendor or
+  no vendor.
+
+So another vendor's invoice citing the same number does not count: it bills
+that vendor's order. The flip refusal (`api/portal._pos_already_invoiced`) is
+vendor-scoped and reads the number and the split legs only; this rule is wider
+because AP reads it and any bill matched to the order counts. The sum is exact
+`Decimal`. It runs only on a single-PO match whose total is trustworthy and in
+the invoice's own currency. A cancelled, unissued, unvouched or other-currency
+PO already raises its own finding.
+
+Why not a payment-blocking `po_mismatch`: the sum crosses invoices, and their
+changes (a credit memo, a corrective re-bill, a sibling rejected or reopened
+after this refresh) do not re-run this invoice's warnings. A hold would go
+stale both ways: it would hold a legitimate bill after its sibling was rejected,
+or miss a sibling reopened later. A hold would also need a re-match of every
+sibling on each status change, which no transition does today. Why its own
+type: the invoice modal shows `po_mismatch` warnings only through the PO-match
+panel's `issues`, and this finding is not one of them. `refresh_po_match_only`
+rebuilds the new type together with the match, so a PO-only refresh neither
+duplicates it nor keeps a stale copy.
+
+**It departs from §249, and closes the gap that leaves.** §249's principle is
+that a finding which means the invoice could over-pay is a hold, not a note.
+This one means exactly that, and is still a warning, for the staleness reason
+above: a hold that cannot be kept true would refuse legitimate bills and give
+false comfort on the rest. A warning alone, though, would let an invoice be
+approved and paid with no person reading it. So the warning stops every
+unattended approval instead: `invoice_warnings.po_match_hold_refusal` answers
+`po_overbilled` (`UNATTENDED_APPROVAL_PO_OVERBILLED`) when the freshly
+refreshed invoice carries it, which sends extraction's auto-approve and
+`/complete`'s `auto_approve_below` floor to `ready_for_review` with
+`auto_approve_suppressed: "po_overbilled"` on the audit row, as §425 does for
+a hold. An exception agent's approval is no person reading it either: the
+coordinator unwinds an apply that approved an invoice carrying the warning and
+escalates. A person approving is the review §468 called for, at the moment the
+figure is current.
+
+**Decision 2: a rejected flip still counts as "already invoiced".**
+`_pos_already_invoiced` counts a rejected invoice when its `reference_number`
+is that PO's own flip marker, and counts it for that PO only, so a flip
+edited to cite another PO cannot mark that one invoiced. A rejected flip is
+reopened, not replaced: the
+supplier's `/resubmit`, or AP moving it `rejected → new`. A second flip beside
+it is impossible (the unique marker) and would also be wrong: reopening the
+first would double-bill the order. So `flip_verdict` and the endpoint now
+agree. The verdict refuses with `po_already_invoiced`, and a retry still
+replays the rejected invoice with its status, as §468's replay order requires.
+Reopening changes nothing for the flip gate: the invoice is live again and
+still counts. A supplier's ORDINARY rejected invoice keeps §468's rule. It
+does not block a flip, and if that invoice is reopened after a flip, the
+over-billing warning from Decision 1 surfaces the second bill.
+
+**Left alone.** Credit memos are not netted off the billed sum. The warning
+names the figure and the reviewer judges it, which is a further reason it is
+not a hold.
+
+Tests: `backend/tests/test_po_matching_critical_path.py` (flip then a second
+bill warns with exact params; rejecting the flip clears it, reopening brings
+it back; two halves and an other-currency invoice do not warn; the tolerance
+boundary to the cent; one warning after two PO-only refreshes; a split leg
+counts; another vendor's same-numbered PO does not);
+`backend/tests/test_invoice_complete_auto_approve.py` and
+`backend/tests/test_extraction_reextract_options.py` (both unattended doors
+land at review with `po_overbilled`); `backend/tests/test_exception_agents.py`
+(the agent unwind);
+`backend/tests/test_portal_self_service.py` (a rejected flip's verdict, its
+replay, and the reopened flip's verdict, with one invoice throughout).
+
+## 470. Invoices billing past what was received of a PO is the same review warning (round 26, 2026-11-19)
+
+**Problem.** §469 made the amount leg cumulative and left the receipt leg
+per-invoice. The matcher measures ONE invoice against the received slice of
+the PO (`received_value`, `po_total × received / ordered`, §249), so with
+400.00 of a 1000.00 PO received, two invoices of 400.00 each fit it: neither
+raised the `billed_beyond_receipt` hold, and together they asked for twice
+what had arrived.
+
+**Decision: the same warning, not a hold.**
+`invoice_warnings._refresh_po_overbilling` measures the same siblings §469
+defined (matched PO id, split legs at their whole amount, an unmatched
+invoice by number within the PO's entity and vendor; every status but
+`rejected`; the PO's currency) against `received_value` at the match rule's
+tolerance, and adds `po_billed_beyond_receipt` (type `po_overbilled`,
+severity `warning`; params `billedAmount`, `poNumber`, `receivedValue`,
+`currency`). The comparison is exact `Decimal`; only the displayed
+`receivedValue` is rounded to the cent, since one unit of three received is
+a non-terminating share. It runs only:
+
+- on a SHORT receipt, the one case where the matcher sets `received_value`.
+  A full receipt's slice is the whole PO, which the total check measures.
+- when this invoice alone fits what arrived. If it does not, the matcher's
+  `billed_beyond_receipt` has already raised the payment-blocking
+  `po_mismatch` (§249), and a second sentence would add nothing.
+- when the total check did not fire. Past the whole PO, no receipt can cure
+  the bill, so only `po_billed_beyond_total` is written.
+
+Sharing the type gives it §469's consequences with no new wiring:
+`po_match_hold_refusal` answers `po_overbilled`, so extraction's
+auto-approve and `/complete`'s floor send the invoice to review; the
+exception-agent coordinator unwinds an approval that leaves it standing; and
+`refresh_po_match_only` rebuilds it rather than appending.
+
+**Why not a hold, against §249.** §249 holds a finding that means the
+invoice could over-pay, and this one does. It is still a warning for §469's
+reason, plus one that is sharper here. §469's reason: the sum crosses
+invoices, and a sibling rejected, reopened or credited does not re-run this
+invoice's warnings, so a hold would go stale both ways. The receipt side is
+better served than the amount side, because recording or cancelling a goods
+receipt re-matches every invoice citing the PO in the same transaction
+(`refresh_invoices_citing_pos`), so the delivery that covers the bills drops
+the finding at once. The sibling side is not. The sharper reason: the
+finding cannot say which bill is the excess one. Each invoice sees the
+others, so every bill on the PO carries it. A payment-blocking hold would
+stop the legitimate first bill along with the second, and clearing a
+`po_mismatch` is an SoD-gated sign-off (§169–§170) that the first bill's
+approver would then need for an invoice that was never wrong. A warning that
+stops every unattended approval puts a person in front of the figure on
+every bill, which is the review the finding asks for.
+
+**Left alone.** Receipts are still valued pro rata across the PO's lines, so
+receiving the cheap lines of a mixed order overstates the received value for
+both the per-invoice hold and this warning. That is the narrowed
+`docs/followups.md` entry: value receipts per line in the matcher's
+`received_value`, which both read. Credit memos are not netted, as in §469.
+
+**Amended (round 26 gate): a hold past approval, and the implicated
+receipt.** A money-path review found the warning-only rule open after
+approval. Two receipts of 4 units (800.00 of a 1000.00 PO) and two bills of
+400.00, both approved with no finding; the second receipt is cancelled
+(§262 allows it). The re-match finds each bill alone within 400.00, so no
+per-invoice hold, only this warning, which no reviewer will read again and
+nothing on the payment path reads. A run would pay 800.00 for 400.00
+received. So:
+
+- **Past approval, a new or worse finding is a hold.** On an invoice outside
+  `PRE_APPROVAL_STATUSES`, `_refresh_po_match` raises the payment-blocking
+  `po_mismatch` with the warning's own sentence, through the same
+  `_ensure_exception` the per-invoice receipt leg uses. The run builder and
+  every dispatch refuse it, and clearing it is the SoD-gated sign-off
+  (§169–§170, §420). §249's principle wins here because the staleness reason
+  is weakest: the event that raises it (a receipt cancelled) re-matches every
+  bill on the PO in the same transaction, and the hold, once raised, closes
+  on the refresh that no longer finds it.
+- **Only when new or worse since the last refresh**
+  (`_beyond_receipt_worsened`): no such finding before, less received, more
+  billed, another PO or currency, or an unreadable old figure (fail closed).
+  An approver who signed off with the unchanged warning in front of them was
+  the review the warning asked for; holding that bill would make their
+  approval need a second sign-off for nothing new. The cost: a figure that
+  worsens and recovers to its old value between two refreshes is not
+  re-held. Once raised, any open `po_mismatch` is kept found while the
+  finding stands (`_open_po_mismatch_hold`; any row, because
+  `_ensure_exception` folds a finding into the row already open), so repeated
+  refreshes keep one row.
+- **Clearing follows the existing rule.** The refresh that no longer finds it
+  closes it through `_close_cleared_po_exceptions`, which keeps it while a
+  live manual receipt on the PO was typed in by someone implicated in the
+  invoice, by nobody known, or by an approver (`receipts_clear_hold`, §262,
+  §389).
+- **An implicated receipt stops unattended approval.** Before approval no row
+  exists for that rule to hold, so a receipt typed in by the uploader could
+  make the warning (or the per-invoice hold) vanish before anyone read it.
+  `po_match_hold_refusal` now answers `po_receipt_implicated`
+  (`UNATTENDED_APPROVAL_PO_RECEIPT_IMPLICATED`) while
+  `receipts_clear_hold` is False for the matched PO ids, lifted by
+  `settings.exceptions.require_segregation: false` as the auto-close's
+  rule is. A NULL recorder on a manual receipt counts as unknown, as it
+  already did there; a receipt with no `source` (an ERP or pre-entry row) is
+  trusted.
+- **Runs.** A new run refuses the invoice (`run_refusal_reasons`). A draft
+  run's payment is refused before money moves, at rail dispatch, NACHA export
+  and the paid-elsewhere close-out (`payment_runs.dispatch_preflight`,
+  `invoice_blocked:po_mismatch`, retry-safe). A NACHA file already exported
+  has gone with the customer's upload; the hold cannot recall it and only
+  puts the invoice in the exception queue.
+- **The total leg gets no post-approval hold.** A PO total rarely moves after
+  approval, and §469's warning already covers that leg.
+- **Wording.** The sentence now states every live bill on the PO, this one
+  included (`totalBilled`), against the value received; it used to read as
+  if the received value were part of what the others billed.
+
+Tests: `backend/tests/test_po_matching_critical_path.py` (two 400.00
+invoices against 400.00 received both warn with exact params and neither is
+held alone; the 5 % boundary to the cent; 3 of 7 units with two 225.00 bills
+does not warn; past the total only the total finding; one of three units
+received named as 333.33; two PO-only refreshes keep one finding, unattended
+approval answers `po_overbilled`, and a receipt for the rest of the delivery
+clears both on the next refresh; through `create_goods_receipt` /
+`cancel_goods_receipt`, a receipt cancelled after approval holds both bills,
+a run refuses them, a refresh keeps one row and a new receipt lifts it; an
+implicated recorder's receipt does not; `po_receipt_implicated` and its
+opt-out; an approval over the unchanged warning raises no hold; the
+new-or-worse comparison).
+
+Tests: `backend/tests/test_po_matching_critical_path.py` (two 400.00 invoices
+against 400.00 received both warn with exact params and neither is held
+alone; the 5 % boundary to the cent; past the total only the total finding;
+one of three units received named as 333.33; two PO-only refreshes keep one
+finding, unattended approval answers `po_overbilled`, and a receipt for the
+rest of the delivery clears both on the next refresh).
+
+## 471. The dashboard counts overdue and due-soon AP over the whole book, by the /cfo card's predicate (round 27, 2026-11-19)
+
+The mobile dashboard had no overdue figure, and its "Upcoming" card read
+`upcoming_payments`, which the server caps at ten rows ordered by due date.
+Overdue rows sort first, so a count read off that list stops at ten, and a
+due-soon count read off it can be zero in a week when invoices fall due.
+`GET /api/dashboard` now serves `overdue_count` / `overdue_total` and
+`due_soon_count` / `due_soon_total`, counted in SQL over the whole book and
+scoped to the selected entity.
+
+**One predicate, the /cfo card's.** `services/open_ap_due.py` holds the
+population, the effective due date (the latest payment schedule's, else the
+invoice's own) and "overdue" (strictly before today). The cash-flow forecast
+(`api/analytics._commitment_rows`, and with it the /cfo "Overdue (owed now)"
+card, §449) and the dashboard both read it. So `overdue_count` equals the
+forecast's `totals.overdue_count`, and a test pins that equality.
+
+**In-review invoices count as overdue.** The population is open AP plus the
+in-review pipeline (`new`, `pending`, `ready_for_review`), which is what the
+/cfo card counts with the forecast's default `include_pending=true`. An
+invoice still in review past its due date is still late. Leaving it out
+would make the two surfaces disagree, and it would hide the invoices most
+likely to need chasing.
+
+**Totals are face value, per currency.** Each `*_total` is a list of
+`{currency, amount, count}`, grouped on the invoice's own code and never
+converted. A count of invoices owed now should not depend on whether each
+one has a rate lock, and a converted total that is partly face value needs
+its own disclosure (§35). A row with no code groups under `null`, and a
+client renders it without a symbol rather than a guessed one (§160). The
+mobile card shows one compact figure per currency (`€1K · $2.1K`).
+
+**`due_soon_*` lets "Upcoming" mean due soon.** The brief asked only for the
+overdue pair, but the capped list also counted overdue rows as "Upcoming",
+and it could not answer "due this week" either. `due_soon_*` is the same
+population, due today through seven days out. Mobile's Upcoming card reads
+it. A payload or cache without the fields shows the legacy figure and no
+Overdue card, never a `0` that nobody reported.
+
+**Left alone.** The web dashboard still renders its own upcoming list; it
+could read these fields and was not changed in this round. The mobile
+Overdue card does not tap through, because `GET /api/payments/queue` has no
+overdue filter and lists approved invoices only. That is tracked in
+`docs/followups.md`.
+
+Tests: `backend/tests/test_dashboard_aggregates.py` § 5 (fifteen overdue
+against the ten-row list, equality with the forecast, schedule dates winning
+both ways, in-review in, rejected, paid and undated out, per-currency
+totals, entity scope); `mobile/test/screens/dashboard_screen_test.dart`
+(overdue and due-soon cards, zero, absent fields, offline cache,
+currency-less group).
+
+## 472. A contract limit the invoice's currency cannot measure is a finding, and a not-to-exceed one stops unattended approval (round 28, 2026-11-19)
+
+**Problem.** `contract_compliance.evaluate_contract_compliance` measures
+cumulative spend against `spend_limit` only when the invoice's currency
+(`payment_runs.payable_currency_code`) is the contract's. An invoice in
+another currency, or in none (§466), skipped the check and raised nothing, so
+a not-to-exceed contract said nothing about it. A code-less invoice cannot be
+approved or paid (§466), but a foreign-currency one could be, unattended, with
+nobody told that the cap was never checked.
+
+**Decision 1: a finding, never a conversion.** When the contract has a
+`spend_limit` and a valid currency, an invoice in another currency gets
+`contract_currency_mismatch` (params `invoiceCurrency`, `contractNumber`,
+`contractCurrency`, all `text`), and one with no valid currency gets
+`contract_currency_mismatch_invoice_currency_unknown`. Both are type
+`contract_noncompliant`, built through `invoice_warning_catalog.warning`, with
+severity `error` when `not_to_exceed` and `warning` otherwise, as the
+spend-limit codes' severity follows it. Nothing is converted. A rate fetched
+or guessed here would decide whether a contractual cap is passed, which is
+§196's substitution in another place. The figure stays out of the sum, as
+before. Two codes, not a param, because a missing currency is a different
+sentence (the `po_currency_mismatch` pattern). A contract with no limit raises
+neither: there is nothing unmeasured.
+
+**Decision 2: a not-to-exceed `error` stops every unattended approval, and
+the measured breach does too.** §469 stopped the unattended doors for
+`po_overbilled` because a finding that means the invoice could over-pay must
+have a person read it before approval, even when it cannot be a hold. A
+not-to-exceed contract is the customer's statement that spend past the cap
+needs a decision. An amount the cap cannot measure is exactly that case: it may
+be within the cap or past it, and nobody can say which without a rate we
+refuse to guess. So `invoice_warnings.has_contract_cap_warning` (an `error`
+`contract_noncompliant` finding, which only a not-to-exceed contract's
+spend-limit codes carry) makes `po_match_hold_refusal` answer `contract_cap`
+(`UNATTENDED_APPROVAL_CONTRACT_CAP`). Extraction's auto-approve and
+`/complete`'s floor then land at `ready_for_review` with
+`auto_approve_suppressed: "contract_cap"`, and the exception-agent coordinator
+unwinds an apply that approved such an invoice and escalates
+(`_ContractCap`), as it does for `po_overbilled`.
+
+This also covers `contract_spend_limit_exceeded_not_to_exceed`. It was an
+`error` with no consequence on any unattended door. Wiring only the currency
+finding would have stopped an unmeasurable invoice while still auto-approving
+one that measurably breached the cap, which is backwards. The function is
+named for the PO match, but both doors and the floor already ask it, so the
+contract answer lives there rather than as a second question at each door.
+
+**Why not a hold.** §469's reasons hold here too. The spend sum crosses
+invoices, and a sibling rejected or relinked does not re-run this invoice's
+warnings, so a payment-blocking hold would go stale both ways.
+`contract_noncompliant` is not in `PAYMENT_BLOCKING_EXCEPTION_TYPES` and stays
+out. A non-not-to-exceed contract keeps its advisory meaning: the finding is a
+`warning` and stops nothing.
+
+**Left alone.** A contract whose own stored currency is invalid (the API
+validates it, so only an old or hand-edited row) raises no currency finding.
+The prior-spend query still compares the raw `contract.currency`.
+
+Tests: `backend/tests/test_contracts.py` (other currency and no currency, each
+with `not_to_exceed` on and off, with exact params and no spend query; the
+same currency unchanged, over and under the limit; no limit, no finding;
+`has_contract_cap_warning` reads only an `error`; through the real link route,
+`po_match_hold_refusal` answers `contract_cap` for a not-to-exceed contract and
+nothing otherwise); `backend/tests/test_exception_agents.py` (the agent
+unwind).
+
+## 473. An invoice records "currency unknown" as NULL, and the upload creates it that way (closes two followups; extends §453, §457, §460; round 28, 2026-11-19)
+
+`invoices.currency` was NOT NULL with a column default of `"USD"`. `POST
+/api/invoices/upload` and the supplier-portal submit created the row as USD
+before anything had read the document, and an extraction that found no code
+(§308 fills it from a printed code when there is one) left it there: the
+default §160/§196/§200 forbid. Rows blanked by the invoice PATCH before §460
+held `""` instead, a sentinel every money path had to know.
+
+Migration 0136 (tenant) drops NOT NULL and turns every value that is blank
+after trimming whitespace into NULL, so NULL is the one spelling of unknown.
+The upload and the portal submit pass `currency=None`. No code is backfilled
+or removed: a row the old upload stamped USD cannot be told apart from a real
+USD invoice, and guessing either way manufactures a refusal or a currency
+nobody recorded (§141).
+
+The column default is gone, because a SQLAlchemy column `default` also
+replaces an explicit `None` at INSERT, which turned the upload's NULL back into
+USD (the migration test caught it). `Invoice.__init__` keeps `"USD"` only for
+a construction that does not mention `currency` at all, which about a hundred
+test fixtures rely on. `tests/test_invoice_currency_explicit.py` pins that
+every `Invoice(...)` under `app/` names its currency, so that fallback never
+labels a real document.
+
+Readers. Every money-path refusal already went through
+`payment_runs.payable_currency_code`, which answers `None` for NULL, blank and
+malformed alike, and `api/payments._queue_currency_unknown` coalesces NULL, so
+`currency_unknown` fires unchanged on the run builder, the payment queue,
+`POST /api/payments`, dispatch, `/draft-run` and the card mint, and the
+approval gates read the amount as inexpressible (§466). The tests now drive
+those refusals with NULL as well as the legacy blanks. Five readers stamped
+USD on an unknown currency and now do not: the statistical-anomaly history
+(an unknown-currency invoice has no comparable history, so it is not scored),
+the `invoice.*` and `exception.raised` webhook payloads (`currency: null`), the
+invoice-register CSV (a blank cell) and the assistant's invoice and
+pending-approval rows. The response schemas that carry an invoice's currency
+(`InvoiceResponse`, the credit-memo picker's eligible invoice, the supplier
+portal's invoice list, the public `V1Invoice`) are `str | None`, so a NULL row
+reads back as `null` rather than a 500, and the published v1 OpenAPI says so.
+The invoice PATCH is unchanged (§460): leaving `currency` out edits an unknown
+row, and an explicit `null` or blank is still the coded 422.
+
+Rejected: keeping `""` as the sentinel and only fixing the upload, which keeps
+two spellings of unknown; and backfilling a code from the org's home or
+reporting currency, which is the substitution with a different default.
+
+Amended in the round 28 gate review. **Rollups.** An unknown currency (NULL,
+blank or malformed, judged by `payment_runs.payable_currency_code`, and in SQL
+by `currency_conversion.invoice_currency_key_sql` with the same trim set and
+pattern) is never the reporting currency. Every invoice rollup groups such
+rows under a `None` key and counts each in `unconverted_count`, whatever lock
+it carries; `materialize_reporting_amount` never locks one and clears a 1:1
+lock written before this decision; the payment-amount resolver behind the
+1099, risk and cash-flow totals reads it as not expressible; and the
+unrealized-FX report counts it without valuing it. **More doors closed.** Email
+intake creates its invoice with `currency=None`; inbound PEPPOL never guesses
+one (UBL requires `DocumentCurrencyCode`: a missing or short code fails the
+structural validator and books no invoice, and a code that passes it but is
+not an ISO shape, such as `ÉUR`, is recorded as NULL — corrected in the round
+29 gate review, which found the first half was a rejection, not a NULL); a PO flip on a PO with no currency
+books NULL; an invoice warning carries an unknown currency as `""`, which both
+clients render as bare digits; the supplier portal's payment list, the
+email-approval page, the virtual-card email and the workflow builder's context
+omit the code instead of saying USD; and an invoice-scoped discount offer on
+such an invoice is refused (`discount_offer_currency_required`, superseded in
+round 31 below) unless the caller names a currency.
+`tests/test_invoice_currency_explicit.py` also refuses a literal or
+`or`-defaulted currency, `Invoice(**kwargs)` and `module.Invoice(...)` at an
+application construction site. `InvoiceCreate` still defaulted `currency` to
+USD for an API caller that omitted it; closed in round 31 below.
+
+Amended in the round 29 gate review. **A credit takes no unknown-currency
+invoice.** A linked credit-memo create and `POST /credit-memos/{id}/apply` on
+an invoice whose currency is unknown (NULL, blank or malformed, by
+`payable_currency_code`) are refused with 409
+`credit_memo_invoice_currency_unknown`, whether or not the caller names a
+currency, until the invoice's own currency is set; both eligible-invoice
+pickers leave such an invoice out (`invoice_currency_key_sql` is not NULL).
+The round 28 form admitted the create once the caller named a currency
+(`credit_memo_currency_required` otherwise, now gone): that compared a EUR
+memo with a balance in no stated currency, and since the run builder refuses
+the invoice as `currency_unknown` until someone sets a code, the applied EUR
+credit then all but decided which code that would be. This supersedes the
+"blank invoice currency admitted" clause of the currency leg in §202 for
+create, apply and both pickers. §214's edit guard keeps its legacy-blank
+admission, which now only ever covers a credit applied before this amendment.
+
+Amended in round 31. **A create states its currency.** `POST /api/invoices`
+no longer defaults an omitted `currency` to USD: an omitted, null or blank code
+is the coded 422 `invoice_currency_required`, a malformed one
+`invoice_currency_invalid`, through the PATCH's own
+`refusals.invoice_currency(..., creating=True)` (§460). The field is raw on the
+schema so the refusal is coded rather than Pydantic's list; every pytest and
+Playwright caller that leaned on the default now names USD, and the web form
+already refused a blank field. **A discount offer takes no unknown-currency
+invoice either.** An invoice-scoped offer on an invoice whose currency is
+unknown (by `payable_currency_code`) is the 409
+`discount_offer_invoice_currency_unknown` whether or not the caller names a
+currency, for the reason the credit memo is (round 29 above): a EUR offer on a
+balance in no stated currency cannot be proved to price it, and once accepted
+it would all but decide the invoice's code. `discount_offer_currency_required`
+is gone. **An offer's own unknown code is unconvertible.** `build_opportunity`
+read `offer.currency or "USD"`; it now carries `iso_currency_or_none`, and the
+optimizer treats `None` as unconvertible whatever the reporting currency (even
+for a caller that passes none), so the offer keeps its currency-free ROI but
+joins no total and never spends a cash budget. Persisted offers are NOT NULL,
+so this only reaches a legacy malformed row.
+
+**Settings: only UNSET falls back.** `settings.payments.home_currency` that is
+set but not a code used to read as USD on the payment path: `"EURO"` paid a
+USD→EUR leg at a real FX lock, and a GBP org that typed `"GBR"` paid a USD
+invoice as domestic and skipped the international KYC.
+`international_payments.resolve_home_currency` now falls back to
+`DEFAULT_HOME_CURRENCY` only for an unset value (absent, null, blank) and
+raises `HomeCurrencyInvalidError` (`home_currency_invalid`) for a malformed
+one, the rule `expense_policy.threshold_currency_for` already applies.
+`_execute_single_payment` resolves it once, before the card and processor
+legs, and fails the payment `international_payment_error:
+home_currency_invalid` (retry-safe: no order exists yet);
+`prepare_international_payment` refuses it; the card mint skips the invoice as
+`card_skip_home_currency_invalid`. `PATCH /api/organization` validates the
+field on write (422 `organization_home_currency_invalid`; blank stores null),
+so only a row written before that check, or by hand, reaches the refusal.
+`currency_conversion.resolve_reporting_currency` applies the same rule to each
+rung: unset falls through, set returns its code, set-but-malformed answers
+`""`, a currency nothing is denominated in, so every amount reads as
+unconverted — never a garbled code passed on (rungs 1 and 3 did) and never a
+fall-through to a currency the org did not choose (rung 2 did).
+`payment_controls.cfo_approval_decision` carries such a reporting currency as
+`None`, not a `USD` label, and requires sign-off (`amount_not_expressible`).
+Rejected: raising from `resolve_reporting_currency`, which has 56 callers and
+backs every dashboard; `""` fails closed without a 500.
+
+**Three more readers.** SYSPRO's `po_is_foreign` compares a header with the
+local currency under SYSPRO's own code rule first (`$` is valid there and not
+ISO), so `$` against `$` is local; only a label matching neither rule is
+unknown. Bank reconciliation's settlement pair, and its SQL mirror, read a
+whitespace-only `source_currency` as no FX stamp (`reconciliation_currency`),
+so the currency check is not skipped on it. An expense pre-approval with no
+currency is unknown rather than USD and covers nothing.
+
+## 474. An employee access token with no `org` claim is refused, not trusted to a later lookup (round 30, 2026-11-19)
+
+`tenant.get_tenant` cross-checks the JWT's `org` claim against the tenant the
+`X-Tenant-Slug` header resolves. It used to let an employee token *without* an
+`org` claim through, on the reasoning that the user lookup afterwards would
+fail closed. It does not: `get_current_user` finds the account by `sub` alone
+and never compares its organisation with the resolved tenant. A signed token
+with no `org` would therefore open whichever tenant the header named.
+
+Not exploitable today: every access token we mint carries `org`, and the only
+same-key tokens without it (the MFA challenge tokens) are refused by
+`get_current_user`. Forging a claim-less token needs the signing key. But the
+skip turned the tenant chokepoint into a check that depends on how tokens
+happen to be minted elsewhere, and `organization_close.py` had already grown
+its own compensating check because of it.
+
+**Decision:** `get_tenant` refuses an employee token with no `org` claim (absent, or present but empty) with
+the same 403 `token_tenant_mismatch` as a mismatched one. The MFA challenge
+token types stay exempt, because they are scoped to the challenge flow, never
+to tenant data. The chokepoint now stands on its own.
+
+Rejected: comparing the user's organisation inside `get_current_user` instead.
+That moves the tenant rule out of the one place the invariant names
+(root CLAUDE.md, Project invariants), and every other dependency that reads
+the tenant would still trust the header.
+
+Tests: `tests/test_tenant_auth_sweep.py` sweeps every tenant-resolving
+employee route with a cross-tenant token and with a claim-less one, through the
+production dependency chain. `tests/test_portal_cross_vendor.py` covers every
+by-id portal route, so one supplier gets the same 404 for another's id as for
+an unknown one. `tests/test_tenant_isolation.py` pins the refusal and the MFA
+exemption.
+
+## 475. An email address is unique without regard to case in the database, and the migration refuses rather than picks a winner (closes a followup; round 32, 2026-11-20)
+
+The app already stored `utils/emails.normalize_email(...)` and matched every
+identity lookup on `lower(email)` (`docs/authentication.md` § An email address
+is matched without regard to case). The database still held a plain,
+case-sensitive `UNIQUE(email)` on `users` (control plane) and `vendor_users`
+(each tenant). So rows written before normalization kept their mixed case, a
+pair differing only in case could exist, a create that passed the app's check
+and lost a race could still land a case variant, and the `lower(email)` lookups
+on login, forgot-password, SSO JIT and SCIM could not use the btree.
+
+**Decision:** migration 0138 replaces the plain constraint on both tables with
+a unique index on `lower(email)` (`uq_users_email_lower`,
+`uq_vendor_users_email_lower`), after lower-casing and trimming every stored
+address. The models declare the same index, so `create_all` builds it for a
+fresh control plane or tenant. `email_matches` already compares exactly that
+expression, so every identity lookup becomes an index probe with no code
+change. One revision serves both databases, the precedent 0059 set: the `users`
+half is gated on `plans` (the control-plane probe 0117 uses), the
+`vendor_users` half on that table existing.
+
+**When two rows share a normalized address, the migration refuses**
+(`EmailCaseCollision`) before changing anything on any table. The message
+names the table, the database and the counts. It never names an address,
+because migration output lands in CI and deploy logs and an address is PII. It
+points at an id-only query (`backend/docs/database.md` § Email case
+collisions). Which account keeps the address is an operator's call: one of the
+pair may hold the roles, the password or the SSO link, and a migration cannot
+know which is real.
+
+Admin create, SCIM create and the supplier-portal invite now flush inside a
+savepoint. A create that loses the race to the index gets the same 409 its
+pre-check gives (coded `email_in_this_workspace` / `email_in_other_workspace`,
+SCIM `uniqueness`, the portal's "already exists"), never a 500. SSO JIT already
+did this. Renames get the same treatment: admin `PATCH /users/{id}` and SCIM
+`PUT` / `PATCH /Users/{id}` flush inside a savepoint, so a rename onto an
+address a concurrent writer just took is the same 409, not a 500.
+
+Rejected:
+
+- **Merging or renaming the losing row in the migration** (oldest wins, or most
+  roles wins). Every heuristic picks wrong for some tenant, and it does so
+  silently, on the login table.
+- **A `citext` column.** It needs the extension in every tenant DB and changes
+  the column type every query and schema reads. The expression index gives the
+  same guarantee on the existing `varchar`.
+- **Building the index `CONCURRENTLY`.** Both tables are small, and a
+  concurrent build cannot run inside the migration's transaction. Then a
+  refusal could no longer roll the normalization back with it.
+- **Dropping `exact_email_first`.** After 0138 it decides nothing. It stays on
+  the single-row lookups only so a second match can never 500 a login.
+
+Tests: `tests/test_migration_0138_email_lower_unique.py` (the refusal names no
+address and changes nothing; normalization; constraint swap; idempotence; each
+half only where its table lives; model parity).
+`tests/test_email_identity_case.py` covers the index refusing a case-variant
+insert, and admin create, SCIM create and the portal invite each losing the
+race and getting their 409.
+
+## 476. An `Invoice` built without a currency is NULL; fixtures name theirs (closes the last §473 followup; round 32, 2026-11-20)
+
+§473 removed the `invoices.currency` column default but kept a constructor
+fallback: `Invoice.__init__` set `"USD"` whenever a construction did not
+mention `currency`, because about a hundred test fixtures relied on it. No
+application site reached it, yet it was still a default currency in the model,
+the substitution §160/§196/§200 forbid, one forgotten keyword away from
+labelling a real document.
+
+The override is gone. An omitted `currency` is now NULL, the same "unknown" as
+`currency=None`. Every fixture, seed and script construction under
+`backend/tests/` and `backend/scripts/` names its currency, almost always the
+`"USD"` it already got, so no test changes meaning. A helper that built from
+`**kwargs` takes a `currency` parameter and names it at the call (its callers
+still override it). The seeds' tax-exclusive header no longer carries the code
+inside its kwargs dict. The extraction golden harness starts its invoice with
+`currency=None`, as the upload does (§473), rather than the old USD
+placeholder.
+
+`tests/test_invoice_currency_explicit.py` now also scans `tests/` and
+`scripts/`, follows `Invoice` imported under an alias, and refuses a
+construction there that omits `currency`. Fixtures may state a literal code;
+only a test whose subject is the omission itself may omit it, declared with its
+reason. It also asserts that the model has no column, server or constructor
+default (`Invoice().currency is None`), so a default cannot come back without
+failing a test that says why.
+
+Rejected: keeping the fallback and only guarding `app/` (the §473 state),
+which leaves a default in the model for the next non-`app` caller, such as a
+script, to reach; and a column `default`, which also overwrites an explicit
+`None` at INSERT (§473).
+
+## 477. A sanctions false positive is adjudicated once, for that exact result, under its own permission (closes a §333 followup; round 33, 2026-11-20)
+
+**Context.** §333 refuses the ERP push on a stored `match` / `review` screen,
+and dispatch and `/compliance/release` re-screen live, so a vendor the provider
+keeps flagging wrongly could be neither paid nor booked, and nothing recorded a
+human's finding that the hit is not this vendor.
+
+**Decision.** `sanctions_adjudications` (migration 0139) records who, when, why
+(required, 3–2000 characters) and WHICH result: provider, verdict, list name
+and `fingerprint`, a sha256 over those plus the matched entry
+(`services/sanctions_adjudication.screen_fingerprint`: an adapter's own
+`raw_response.match_fingerprint` — entry id + list version — when it sets one,
+else the raw response minus per-call keys such as request ids and timestamps;
+only the hash is stored, never match details). An active row covers a screen
+only when provider and fingerprint are equal, so a fresh screen of the same
+match stays cleared and a new or different hit (another entry, another list, a
+`review` escalating to `match`, a republished list version) holds again.
+
+- The stored screen (`screen_vendor_record`) keeps
+  `vendors.screening_adjudication_id` in step and, on a covered `match`, neither
+  re-sets the sticky block nor revokes cards; `VendorPayability.sanctions_hold`
+  (the run gate and the ERP push) lifts the `match` / `review` hold only while
+  it is set. The live screen (`check_payment_compliance`) reads a covered result
+  as clear, adverse-media hold included.
+- **The sticky `payments_blocked` flag is not lifted.** It may carry a manual
+  reason and it is `vendor.block`'s to lift, so clearing a `match` takes two
+  signatures (adjudicator, then unblocker). `admin` holds both permissions, so
+  `/unblock` refuses (403 `vendor_unblock_adjudicator`) the adjudicator of the
+  adjudication covering a stored `match`: the two signatures are two people.
+- **Permission `vendor.sanctions.adjudicate`, default admin + cfo.** Not
+  `ap_manager`: that role onboards vendors, approves their bank details and
+  executes runs, so clearing the sanctions hold too would put the whole payee
+  path in one role. Never `ap_clerk`; the grant guard's subset rule already
+  stops a user-manager handing it out without holding it.
+- **Segregation:** refused (403 `sanctions_adjudication_segregation`) for the
+  vendor's onboarder (`vendors.onboarded_by_user_id`, stamped by create and both
+  CSV imports from 0139; not backfilled — NULL reads "no onboarder known", as
+  §141) and for the latest applied bank change's requester, the AP user who
+  provisioned the portal login that requested it, and its approver.
+- Stamp and revocation each write `vendor.sanctions_adjudicated` /
+  `vendor.sanctions_adjudication_revoked` plus a status-change row
+  `vendor.screening_clearance_changed` (`from` / `to`). Revocation needs the
+  same permission and no segregation (it only tightens). A merge leaves a
+  duplicate's adjudications on the duplicate: a judgement of one record's
+  screen is not transferred.
+
+**Review fixes (same round).**
+
+- *The stamp covers the screen the reviewer saw.* The request carries
+  `sanctions_check_id` (the queue row's `latest_check_id`); under the vendor
+  row lock a different latest stored screen answers 409
+  `sanctions_adjudication_stale_screen`. The queue and `latest_stored_screen`
+  agree: both read the newest non-`pre_payment` check, since the dispatch
+  gate's rows do not update the vendor.
+- *Changed inputs owe a fresh judgement (bound by hash, chosen over "treat a
+  bank-change re-screen as uncovered").* Every screen stores
+  `raw_response.screened_inputs`, a sha256 over the name, tax id, bank country,
+  beneficial owners and the id of the latest applied bank change (never the
+  account number), and the fingerprint (scheme v2) includes it. A later
+  identity edit or bank change, by anyone including the adjudicator, makes the
+  same hit a new result, so segregation holds in both orders. The hash was
+  chosen because it also covers the live pre-payment screen and edits that
+  arrive by paths with no re-screen check type of their own (enrichment, ERP
+  sync); a check-type rule would have missed those and been undone by the next
+  periodic re-screen of unchanged-looking inputs.
+- *Revoking a `match` re-applies the match.* When the revoked row covered a
+  stored `match`, revoke sets the sticky block and closes the vendor's live
+  cards (`vendor_screening.apply_sanctions_match`) in the same transaction, so
+  a card issued while the stamp stood does not outlive it.
+- *No hidden adjudication.* Revoke ends every active row of the vendor, the
+  queue lists them all (`active_adjudications`), and the live screen honours
+  only the vendor's pointer row (`vendors.screening_adjudication_id`).
+
+**Rejected.** Rewriting `screening_status` to `clear` (the stored status would
+stop saying what the provider said); clearing by vendor rather than by result
+(a new hit would ride an old judgement); lifting the block in the same click.
+
+**Tests.** `test_sanctions_adjudication.py`,
+`test_sanctions_adjudication_verdicts.py` (queue verdict ↔ endpoint parity),
+`test_permissions.py`, `test_sod_endpoint_wiring.py`, `test_vendor_merge.py`.
+
+## 478. A white-label accent is derived per theme, not set per theme (closes the §289 accent-as-text followup; round 33, 2026-11-20)
+
+A tenant's `accent_color` was written inline on `<html>` as `--accent`, so it
+beat both palettes. `--accent` is also small text (links, the active tab, armed
+row actions), and no colour clears 4.5:1 on both palettes' text surfaces: to
+reach it on the light `--bg` (#f4f5f8) a colour needs relative luminance below
+about 0.16, and on the dark `--surface` (#181a23) above about 0.22. So one inline
+value always failed WCAG 1.4.3 in one theme. The platform's own dark accent
+`#638cff` is 2.86:1 on the light `--bg`, and nothing measured a brand accent as
+text in either theme.
+
+Decision: keep one tenant setting and derive the colour shown in each theme.
+`stores/brandTheme.ts` `themeAccent(color, theme)` returns the colour unchanged
+when it clears 4.5:1 on that theme's `--bg` and `--surface` (the two surfaces
+the platform accent is held to in `tokenPairing.test.ts`). Otherwise it returns
+the least mix of the colour toward black (Light) or white (Dark) that does,
+found by bisection on the byte-rounded colour. A linear mix with black or white
+keeps the hue. The store writes the results as `--brand-accent-dark` and
+`--brand-accent-light`, never `--accent`, and each palette in `src/app.css`
+reads its own (`--accent: var(--brand-accent-dark, #638cff)`, and
+`var(--brand-accent-light, #2c4fc4)` in both light copies). `--accent-strong`
+stays one inline value, because its contract (white text on it) does not depend
+on the theme. The `/organization` Branding panel reports the colour as text in
+both themes while it is typed, with the shade shown in place of a failing one
+(`accentTextContrast`). The accent cache and the `accent-boot` script carry the
+new props. An entry cached before this change holds `--accent`, which both drop,
+so that workspace's next cold load paints the platform accent once.
+
+Rejected: a per-theme tenant setting (`accent_color_light`). It needs a schema,
+API, partner-modal and mobile change, and it still lets a tenant save an
+illegible light accent: the advisory alone would not fix 1.4.3. Nothing in
+`docs/white-label.md` or §28 asks for per-theme brand control. A tenant whose
+brand needs an exact light shade can still pick a colour that clears 4.5:1 in
+Light; it is then shown unchanged there. Also rejected: CSS `light-dark()` in
+the inline value, which also needs two colours and would put a non-hex string
+in the cache and the boot script, which validate hex; and refusing a failing
+colour, which §28 already rejected for the strong accent.
+
+## 479. An offer's status writers lock its row before checking it, and the wait is not bounded (round 33, 2026-11-20)
+
+`POST /api/discounts/offers/{id}/accept` and `/decline` (and the supplier
+portal's pair) loaded the offer with a plain `SELECT`, so two concurrent
+decisions both passed the `offered` check, the last commit won and two audit
+rows recorded two decisions. They now read the row `FOR UPDATE` with
+`populate_existing` (`discount_offers.lock_offer`) before the refusal check, the
+lock the auto-capture sweep (`_claim_if_still_offered`), the copilot enact and
+settlement capture already took. The second request waits and gets the 409.
+
+The wait is plain, not `bounded_lock_wait` (§233). §233 bounds a lock a holder
+may keep across a processor call; no holder of an offer's lock does, and
+settlement capture, the one writer reached from a payment path, runs after the
+processor call in a transaction committed per payment. A bound would add a
+named refusal and a savepoint for a wait that is one short transaction.
+
+A re-sent accept stays a 409 (`discount_offer_not_open`) rather than becoming a
+200 replay of the same tier. Accepting moves no money, so there is no second
+effect to suppress, and a 200 for "same tier" would need the endpoint to
+distinguish a retry from a second person choosing the same tier.
+`backend/docs/dynamic-discounting.md` § Concurrency.
+
+## 480. A plan change makes the provider's subscription match the plan, immediately in both directions, and a deployed environment refuses a paid plan nobody can charge for (closes the live-Stripe followup; issue #746, 2026-11-21)
+
+`change_plan` only repointed our `Subscription` row: the org's features
+unlocked and nothing was charged, and the AI-overage meter events the platform
+already reported had no subscription to land on. With a live provider a plan
+change now runs a provider leg (`services/billing/provider_sync.py`) between
+provisioning and the locked write: onto a paid plan it requires a default card
+and creates the Stripe subscription (base + metered overage price), paid → paid
+amends its items, paid → free cancels it. Six choices, each with the
+alternative it beat:
+
+1. **A card is required before the subscription, not collected by it.** The
+   create sends `payment_behavior=error_if_incomplete`, so a declined first
+   charge creates nothing and the API answers 402 `billing_payment_declined`
+   with our row untouched. `allow_incomplete` (Stripe's default) would have
+   created an `incomplete` subscription we would either have to unlock features
+   for (free again) or track through a second state machine. The price is that
+   a card demanding 3-D Secure on every charge cannot upgrade; the SetupIntent
+   is created with `usage=off_session`, which authenticates up front, and that is
+   what normally lets the later off-session charge through. Without a card the
+   refusal is 409 `payment_method_required` and the SPA routes the user to the
+   card form, then retries the change.
+2. **Downgrades are immediate, not at period end.** The plan change already
+   applied at once and prorated, and entitlements drop at once on our side;
+   `cancel_at_period_end` would bill the rest of the month for features the org
+   no longer has, or need a pending-plan state our row does not model. The
+   cancel sends `prorate=true` (unused time credited to the customer's Stripe
+   balance — a cash refund stays a dashboard action) and `invoice_now=true`
+   (without it the period's metered overage, already reported, would never be
+   invoiced). The row's provider id is cleared so the cancel's own
+   `customer.subscription.deleted` webhook cannot cancel the now-free row.
+   Paid → paid uses `always_invoice` for the same reason: "applies immediately"
+   is what the picker promises.
+3. **Anchored on the 1st (UTC) by an explicit `billing_cycle_anchor`
+   timestamp**, not `billing_cycle_anchor_config[day_of_month]`: the timestamp
+   leaves no reading of time zone to Stripe, and §255's reason for the anchor —
+   an overage event lands on the invoice of the month it was counted in — is a
+   UTC calendar-month rule. The first invoice prorates now → the 1st. Our
+   recorded proration is computed over that same calendar month, as a
+   day-granular estimate; Stripe's invoice is the charge of record. A self-serve
+   upgrade from Free gets no trial: the customer chose to pay.
+4. **The provider calls stay outside the row lock, serialised by a lease.**
+   `backend/docs/billing.md` § Concurrency moved provisioning out of the
+   locked window so a webhook or the dunning sweep is never parked behind a
+   Stripe round trip; the
+   provider leg follows the same rule. Two live changes for one org would then
+   interleave their Stripe calls, so a ten-minute lease (sized to the slowest
+   change, which the locked write re-checks it still holds) on
+   `settings.billing.plan_change_lease`, written under `lock_organization` and
+   committed before the first call, refuses the second
+   (`plan_change_in_progress`). A Postgres advisory lock was the alternative; an
+   `AsyncSession` does not keep one connection across the provisioning commit,
+   so a session-level lock could be taken and released on different
+   connections. The `mock` path takes no lease — it has no external effect.
+5. **Idempotency is a key per change plus adoption.** Keys are
+   `<row id>-<row updated_at>-<target plan>-<default card>`: a retry of one
+   change replays, the next change of the same row does not, and neither does a
+   retry with a new card after a decline (Stripe replays a stored 402 for 24 h,
+   and a decline leaves our row untouched, so a key without the card would
+   refuse the replacement card too) (a key per org and plan would have
+   replayed a canceled subscription on Free → Growth → Free → Growth inside 24
+   h). Because Stripe's idempotency only lasts 24 h and a crash can land between
+   Stripe's create and our commit, the create first looks for a live
+   subscription on the customer and adopts it — the only guard that holds past
+   the window. For the same 24-h reason prices are now found account-wide by
+   `lookup_key` before being created: the per-org cache alone minted a new
+   product and price for every org provisioned on a later day.
+6. **A deployed environment on `mock` refuses paid plans**
+   (`billing_not_configured`), read off the RESOLVED adapter so an unregistered
+   `FEOH_BILLING_PROVIDER` that falls back to `mock` is refused too, and keyed
+   on `settings.is_deployed` — the discriminator `payment_execution_mode`
+   already uses to refuse the `mock` payment processor, not a second mechanism.
+   Without it, production handed out every paid feature for one click. Moving
+   down to a free plan is never refused, and local dev keeps `mock` end to end
+   (guard rail 7).
+
+The webhook keeps the row in sync rather than driving it: the status comes only
+from `customer.subscription.*` events (an invoice event's object is the
+invoice, whose id and status were being read as the subscription's), invoice
+events move status along two narrow edges (`invoice.paid` past_due → active,
+`invoice.payment_failed` active → past_due), the provider's billing window is
+copied onto the row, and `canceled` is terminal. Every request pins
+`Stripe-Version` (`FEOH_BILLING_STRIPE_API_VERSION`) because those shapes —
+the window per subscription item, the invoice's subscription under `parent` —
+are exactly what changed in Stripe's 2025 versions.
+
+Where Stripe and our row could part ways, the review closed the gaps rather
+than trusting one webhook: the cancel to Free detaches the provider id in its
+own committed write BEFORE the DELETE, and the webhook reads its row
+`FOR UPDATE`, so the cancel's own `customer.subscription.deleted` cannot cancel
+the now-free row; leaving a paid plan whose row lost its id finds the customer's
+live subscription and cancels it; an org whose provider resolves to `mock` while
+its row carries a provider id cannot be moved (Stripe would keep billing); and
+the dunning sweep cancels a live-billed row only once the provider has canceled
+it, since canceling ours alone revoked the plan while Stripe kept charging. One
+gap is left, tracked in `docs/followups.md`: a subscription a crashed change
+created and never recorded is healed only by the org's next plan change.
+
+Left to verify in Stripe test mode, recorded here when seen: whether swapping a
+meter-backed price mid-period with `always_invoice` invoices the usage already
+accrued at the old price or bills the whole period at the new one at its end.
+Either way the reported units are right; only which price they meet differs.
+`backend/docs/billing.md` § The provider leg, § What the operator configures in
+Stripe; `backend/tests/test_billing_stripe_subscriptions.py`.
+
+## 481. A Sage Business Cloud Accounting supplier set Inactive syncs inactive: `is_active` is read, and only an explicit `false` counts (issue #743, 2026-11-21)
+
+The v3.1 adapter read a contact's activity from `gdpr_obfuscated` and
+`deleted_at` alone, on the belief that Sage has no archive flag. A live pass
+against a real UK business showed otherwise: a supplier whose Account Status
+was set to Inactive in Sage's UI came back with `"is_active": false` (and no
+`deleted_at`), and FeohLedger synced it as an active payee. The same read
+explained a refused create, so a bill to that supplier was not coded
+`vendor_inactive` either.
+
+Both reads now request `is_active`, and one helper,
+`sage_accounting._contact_inactive`, decides for the vendor sync and the
+refusal alike: `is_active is False`, `gdpr_obfuscated` or `deleted_at` is
+inactive. An absent `is_active` is "don't know" and keeps the contact active,
+the rule every refusal read in this adapter follows (an unreadable answer is
+never "inactive"); inferring inactive from a missing field would deactivate
+every supplier of a business whose response omits it.
+
+The same pass showed Sage cutting a 108-character name at its 100-character
+limit and keeping the trailing space, so a contact's name (and its
+`displayed_as` fallback) is stripped before it is stored.
+
+A second live push, to the inactive supplier, showed what the push did: the
+idempotency lookup, the ledger read, a `POST /purchase_invoices` Sage answered
+422, then the post-mortem reads, which asked the contact only for `deleted_at`
+and `gdpr_obfuscated` and so recorded `bill_refused`. Two changes follow. The
+contact is now read before the create, and one `_contact_inactive` calls
+inactive is refused `vendor_inactive` with no POST: a refusal Sage will make
+anyway is cheaper and clearer stated up front, and it does not depend on a 422
+body nobody has captured. That read decides only on a positive answer; a 404
+or an unreadable one lets the create go ahead, and the post-mortem (which now
+reads `is_active` too) explains its refusal, so a contact deactivated between
+the two reads still comes back `vendor_inactive (HTTP 422)`. The up-front
+refusal is the plain `erp_refusal`, not `not_posted`, like the adapter's other
+refusals made after its first request.
+
+fake-erp's Sage double carries `is_active` on every contact (default `true`),
+lists an inactive supplier (`sage-contact-5`), takes `POST
+/sage/v3.1/__set-contact {"id", "is_active"}` so a test can deactivate one,
+and answers a create naming an inactive contact with 422. The status is what
+real Sage returned; its error code and message are assumed, and the adapter
+never reads them. `backend/docs/erp-integration.md` § Sage
+Business Cloud Accounting; `backend/tests/test_erp_sage_accounting_adapter.py`.
+
+## 482. Nothing is charged for a plan change until the customer confirms the provider's own price, and the org's plan is read from its live subscription (issue #746, 2026-11-21)
+
+In test mode the operator picked Growth with no card on file; the change was
+refused 409 `payment_method_required` and shown as a red error panel, and
+once the card was saved the page retried the change by itself and Stripe
+charged a prorated $14.80 the operator had never seen. Two defects: the SPA
+treated "save a card" as consent to the charge, and nothing anywhere showed
+the amount before it was taken. The fix makes the plan dialog one flow —
+pick → add a card (only when a paid plan needs one, as a step, not an error) →
+review → confirm → result — and makes the server refuse any charge the
+customer did not see. Choices, each with the one it beat:
+
+1. **The figures are the provider's, asked for in advance.** `POST
+   /api/billing/change-plan/preview` (same `admin, cfo` gate as the change)
+   answers what is due today, any credit, what recurs and from when, as exact
+   decimal strings. The live adapter prices the exact call the change will make
+   with `POST /v1/invoices/create_preview`: a new subscription with its
+   items, `create_prorations` and the same anchor on the 1st (the endive
+   preview takes `billing_cycle_anchor` as `{type: timestamp, timestamp}`); a
+   paid → paid swap with the same item form (one builder,
+   `stripe_billing._item_swap_form`), `always_invoice` and a
+   `proration_date`; a move to Free as `cancel_now` with
+   `create_prorations`. What recurs is a second preview in
+   `preview_mode=recurring` (Stripe prices no prorations in that mode). Our
+   own day-granular `compute_proration` was the alternative: it is an
+   estimate (§480) and it disagreed with Stripe's second-granular invoice, so
+   showing it would have shown the wrong number. The `mock` adapter prices
+   with it deterministically, which is honest there because the mock moves no
+   money. An adapter that cannot preview (the base default) cannot have a
+   change confirmed at all (`billing_not_configured`).
+2. **The confirm carries the quote, and the server holds the charge to it.**
+   `POST /change-plan` now requires `proration_date` (the preview's pricing
+   instant, Unix seconds), `expected_amount_due` (a decimal string; a JSON
+   number is a 422) and `currency`. With a live provider `change_plan` refuses
+   409 `plan_change_preview_stale` — before anything is charged — when the
+   quote is missing, older than **ten minutes** (`plan_preview.PREVIEW_TTL`),
+   stamped more than 30 s in the future, or from another UTC calendar month,
+   and, after taking the org's lease, re-asks the provider at the same
+   instant and refuses if it now wants **more** than the customer confirmed or
+   a different currency. The SPA then shows a fresh preview to confirm. Ten
+   minutes is long enough to read and press Confirm — the card form comes
+   before the review, and the SPA re-previews after it — and short enough that
+   the figure is still the provider's; the month rule exists because the
+   month decides a new subscription's anchor and the period a
+   `proration_date` must fall in. A signed, server-issued quote token was the
+   alternative; re-asking the provider proves the same thing (the figure is
+   still true) without a secret to manage, and it also catches a changed
+   balance or price.
+3. **Paid → paid charges exactly the preview.** The confirmed
+   `proration_date` is passed to the real `POST /v1/subscriptions/{id}`
+   (Stripe documents it for precisely this), so the invoice equals the
+   preview to the cent. A new subscription has no `proration_date` on create:
+   it is created "now", so its first invoice prorates a slightly shorter
+   stretch than the preview did — never more, and the confirm-time check
+   refuses outright if it would be. `backdate_start_date` was considered to
+   make the create exact and rejected: its proration rules differ by billing
+   mode and could not be verified against the preview's without a live test.
+   The `billing.plan_changed` audit row records what the customer confirmed
+   (`confirmed_amount_due`, `confirmed_currency`, `quote_proration_date`)
+   beside our day-granular estimate, which is now computed at the quote's
+   instant; the estimate is still not the provider's figure (it ignores the
+   customer's balance and is day-granular), which is why both are kept.
+   **What "never more" does not cover**, stated rather than implied: AI-read
+   overage accrued on the current plan is invoiced with the change (the
+   cancel's `invoice_now`, the swap's metered item), and meter events that land
+   after the confirm-time check, or that Stripe has not aggregated yet, add to
+   that invoice — the review says so whenever the current plan bills overage;
+   the customer's Stripe balance can move between the check and the charge;
+   and a downgrade's credit is not part of the quote (nothing is charged, so a
+   smaller credit at confirm is accepted). The quote is the client's statement
+   of what it showed: an admin calling the API directly can confirm any figure
+   at or above the price, which is consent rather than an attack, and is the
+   cost of choice 2's tokenless design.
+4. **Saving a card never changes the plan.** The auto-retry after a card is
+   saved is gone. The pending-plan stash (`utils/pendingPlanChange.ts`) is
+   kept only so a redirect-based card confirmation reopens the dialog at the
+   review step; the change still needs the Confirm click. The quote's
+   `proration_date` is part of the provider `Idempotency-Key`, so confirming
+   a fresh preview after a stale or declined one is a new request rather than
+   an idempotency conflict at Stripe, while a retry of the same confirmation
+   still replays.
+5. **The preview provisions, and only provisions.** Stripe can only price
+   items that exist, so the preview resolves-or-creates the customer and the
+   plan's prices (`provision_org_billing`, the same call the change makes) and
+   reports a missing card as `payment_method_required: true` instead of
+   refusing, so the SPA can ask for one. It creates no subscription and
+   charges nothing. The live preview needs the restricted key's **Invoices:
+   Write** permission (`create_preview` is a POST, which an Invoices: Read grant
+   is not expected to cover; to be confirmed in the key's request log on the
+   first test-mode preview) —
+   `backend/docs/billing.md` § What the operator configures in Stripe.
+
+**`organizations.plan` stops being read.** It is a free-text label set once at
+provisioning (callers passed values like "pro"), never written by a plan
+change, so a Growth org's `/api/organization` and its partner's child list
+still said "free". Keeping it in sync on every plan change was the
+alternative: the plan moves through `change_plan`, the webhook's
+cancellations, the dunning sweep and the seed's repair, and a fifth writer
+would have to remember a column nothing enforces. Reading the live
+subscription instead (`entitlements.live_plan_codes`, one query for a whole
+child list, Free when there is none — the reading `get_entitlements` already
+gives) leaves one source of truth. The column stays (dropping it is a
+migration for no reader) with a model comment saying it is not read;
+`ProvisionChildRequest.plan` is still accepted so no caller 422s. The web
+names a catalog tier through the existing `planTier.*` keys and shows any
+other plan code as is.
+
+`backend/docs/billing.md` § Plan change → The preview;
+`backend/tests/test_billing_stripe_subscriptions.py`,
+`backend/tests/test_billing_proration.py`, `backend/tests/test_partner_admin.py`,
+`frontend/tests-e2e/billing/billing.spec.ts`.
+
+## 483. A move to Free keeps the paid plan until the end of the period it was paid for, with no credit; paid → paid stays immediate (supersedes §480 choice 2 for paid → free; issue #746, 2026-11-21)
+
+In production test mode an org on Growth (paid $14.80 for 21 November – 1
+December) reviewed a move to Free and was told "$14.66 for the unused part of
+your current plan will be credited to your account and taken off future
+invoices." A Free workspace has no future invoices, so that credit could never
+be spent: §480 choice 2's immediate, prorated cancel stranded it. The operator
+chose the common SaaS rule — **the workspace keeps the paid plan until the
+period ends, then becomes Free; no credit, no refund** — and kept paid → paid
+immediate and prorated, because that credit (or charge) lands on the next
+invoice the org will pay. Choices, each with the one it beat:
+
+1. **Stripe ends the subscription; we do not.** The change sets
+   `cancel_at_period_end=true` (with `proration_behavior=none`, stated rather
+   than left to the default) and Stripe ends it at `current_period_end`,
+   sending `customer.subscription.deleted`. Stripe's docs say what that bills:
+   no proration or credit, and "for subscriptions that cancel at the end of the
+   period, the final invoice at the end of the period includes metered usage
+   from the last billing period" — so AI-read overage accrued before the end is
+   still invoiced (on the period's last invoice, where `invoice_now` used to put
+   it). The `cancel_at` enum (`max_period_end`) is the newer spelling in the
+   pinned `2026-11-18.endive` reference; the boolean was kept because it is
+   still current there, means exactly "at the period end", and is undone by
+   setting it back to `false`. A subscription schedule (phase to a free price,
+   then cancel) was the heavier alternative: two objects to keep in sync for a
+   move that is one flag.
+2. **Our row records the move; entitlements do not change until it happens.**
+   `subscriptions.pending_plan_id` + `pending_plan_effective_at` (migration
+   0140, control plane only) — the "pending-plan state our row does not model"
+   §480 named as the reason not to do this. The row stays `active` on the paid
+   plan, so every entitlement check, the meter and the summary keep reading the
+   plan the org paid for. A separate scheduled-changes table was rejected: one
+   live subscription has at most one pending move, and two columns beside the
+   row are what every reader already loads. Audited
+   `billing.plan_change_scheduled`.
+3. **The move is applied by whoever learns the period ended first, by one
+   function.** `scheduled_downgrade.apply_scheduled_downgrade` repoints the row
+   onto the free plan, live, without a provider id — the shape the immediate
+   cancel always left, so nothing downstream learns a new state. The webhook
+   calls it when an event would cancel a row that has a pending plan (instead
+   of canceling it, which would leave the org on no subscription); the dunning
+   sweep — already the owner of "a terminal webhook never came" — calls it when
+   the date has passed and Stripe says the subscription is canceled, or at once
+   for a row no live provider bills (`mock`). A separate sweep was rejected: it
+   would need its own enable flag, health entry and loop for a handful of rows a
+   month, and dunning already asks the provider before it touches a live row.
+   The sweep also drops a pending move the provider has renewed
+   (`cancel_at_period_end` false again) rather than move an org Stripe is still
+   billing for the paid plan.
+4. **Which moves wait.** Paid → free on an `active` or `trialing`
+   subscription. A `past_due` one moves at once (it has not paid for the period
+   it would keep), as does a live-provider row whose provider id was lost
+   (there is nothing to end later; `provider_sync` finds and cancels any stray,
+   §480). One predicate, `waits_for_period_end`, serves the preview and the
+   change, so the review never describes a different move than the confirm
+   makes.
+5. **Undo is first-class.** "Keep Growth" (`POST
+   /api/billing/scheduled-change/cancel`, admin/cfo) sets
+   `cancel_at_period_end=false` and clears the row, audited
+   `billing.scheduled_change_canceled`; idempotent, refused
+   `scheduled_change_already_due` once the date has passed. Choosing another
+   **paid** plan while a move is pending also clears it — in the same Stripe
+   request as the item swap (`cancel_at_period_end=false` beside
+   `always_invoice`), previewed with `subscription_details[cancel_at_period_end]=false`
+   and announced in the review ("This also cancels your move to Free on …").
+   Requiring Keep first and then a separate change was rejected as two
+   confirmations for one intent. The picker does not offer the pending free
+   plan again; re-confirming it is a no-op (`already_scheduled`) in any case.
+6. **The preview of a scheduled move asks Stripe nothing.** There is no
+   charge and no credit to price, so it answers `"0.00"` / `"0.00"`, nothing
+   recurring, and `effective_at` (Stripe's period end as last copied onto the
+   row; the row's own period on `mock`); the change records Stripe's answer to
+   the schedule call. The confirm still requires a current quote and holds it
+   to "nothing due". The review reads "You keep Growth until 1 December 2026,
+   then move to Free."; the button stays "Confirm".
+
+**Audit writes follow their caller's existing rule**, deliberately: the
+schedule, the Keep and the webhook's move use `dispatch_auth_audit` (fail-soft,
+written before the commit), as `change_plan` and every other webhook status
+change already do — a webhook that raised on an audit blip would 500, Stripe
+would redeliver, and the move would be retried against a row that already
+moved. The dunning sweep's move uses its raising `_record_audit`, as its
+cancellations do (§ the sweep's docstring): a failed audit there rolls the move
+back and the next tick retries it. Making the webhook's audit raising too is a
+change to the whole webhook path, not to this feature.
+
+The Terms (clause 5.5) now say the same: a change to a no-charge plan takes
+effect at the end of the period, as a cancellation already did under 5.8.
+Also in this change: the card-saved toast no longer says "Your subscription is
+now charged to this card." when no live provider subscription exists (a Free
+workspace adding a card on its way to an upgrade); it says "Card saved." there
+(`types/billing.ts::cardSavedMessageKey`).
+
+`backend/docs/billing.md` § A move to Free waits for the end of the paid
+period; `backend/tests/test_billing_stripe_subscriptions.py`,
+`backend/tests/test_migration_0140_subscription_pending_plan.py`,
+`frontend/tests-e2e/billing/billing.spec.ts`.
+
+## 484. A withdrawn advisory takes its ignores, its patch and its guard with it (amends §352; round 2026-11-21)
+
+**Found.** GitHub withdrew GHSA-gcqx-w48m-w2h4 (CVE-2026-93753, deepmerge
+`mergeObject()` prototype poisoning) as not describing a security
+vulnerability. `gh api /advisories/GHSA-gcqx-w48m-w2h4`, read 2026-11-21,
+returns `withdrawn_at: 2026-11-16T18:55:38Z` and the summary "Withdrawn
+Advisory: …". §352's drop condition (a fixed deepmerge release, or
+vite-plugin-svelte no longer depending on it) did not foresee a withdrawal,
+so all four pieces outlived it.
+
+**Decision.** Remove all four: `frontend/patches/deepmerge@4.3.1.patch` with
+its `pnpm.patchedDependencies` entry (the lockfile loses the `patch_hash`
+and nothing else), `pnpm.auditConfig.ignoreGhsas`, the `osv-scanner.toml`
+entry (its only one, so the file goes; `supply-chain-scan.yml` passes
+`--config` only when the file exists) and
+`frontend/src/lib/deepmergePatch.security.test.ts`. An ignore for a
+withdrawn ID suppresses nothing and only reads as an open exception. The
+patch was the remaining question, and it guards no real input here:
+vite-plugin-svelte 7.3.1 calls deepmerge only in `mergeConfigs`
+(`src/utils/options.js`), merging its defaults, `svelte.config.js` and the
+inline options from `vite.config.ts`, all repo-authored and read at build
+time. No request, upload or tenant value reaches it, and deepmerge is not in
+the shipped bundle. With the advisory gone, `pnpm audit` reports nothing
+without any ignore.
+
+**Rejected:** keeping the patch as hardening without the ignores. It would
+leave a local fork of a dependency, and a guard keyed to 4.3.1 that turns red
+on the next deepmerge release, to protect a build-time merge of our own
+config files. §352's method (a patch, a guard, then an ID-scoped ignore) still
+holds for the next advisory with no fixed release; `frontend/CLAUDE.md` keeps
+it as the rule.
+
+## 485. The overdue and due-soon population is one select every counting surface joins (closes a `docs/followups.md` entry, round 2026-11-21)
+
+§471 put the population (outflow statuses), the effective due date (latest
+payment schedule, else the invoice's own) and "overdue" in
+`services/open_ap_due`, but as parts. The dashboard's `overdue_and_due_soon`
+and the forecast's `commitment_rows` each assembled their own copy from
+them, and `overdue_invoice_ids` (behind `GET /api/invoices?overdue=true`) a
+third. The copies agreed only because they were written the same way.
+
+`open_ap_due_population(statuses)` is now the one select: a derived table of
+`invoice_id`, `effective_due` and the latest schedule's discount terms over
+the given statuses (default: the whole outflow population). The dashboard
+joins it and adds only its two windows (`is_overdue`, `is_due_soon`, the
+latter now named in the module with `DUE_SOON_DAYS`) and the entity scope;
+`overdue_invoice_ids` is it filtered by `is_overdue`; `commitment_rows`
+joins it with `COMMITTED_STATUSES` alone when `include_pending=false`.
+Entity scope still lands on the outer `Invoice`, amounts are still the
+invoice's `Numeric` columns, and nothing is loaded into Python: the cost is
+one join back to `invoices` on its primary key (no plan was measured).
+
+Chosen over aggregating the dashboard over `Invoice.id IN
+(overdue_invoice_ids(today))`, because due soon is the same population with
+another window: an `IN` set for each window would have left the population
+stated once for overdue and again for due soon.
+
+`backend/tests/test_open_ap_due_single_statement.py` fails any module under
+`app/` other than `open_ap_due` that names `OUTFLOW_STATUSES`,
+`latest_schedule_subquery` or `effective_due_date`, and any of the three
+counting surfaces that stops reading the shared select;
+`tests/test_dashboard_aggregates.py` still pins the list total, the dashboard
+count and the forecast count equal against Postgres.
+
+Left alone, and tracked in `docs/followups.md`: the web dashboard's ten-row
+`upcoming_payments` list, the payment queue's per-row `is_overdue` and the
+aging bands still time an invoice on its own `due_date`. Each needs a product
+call the count did not (an invoice whose payment completed before its
+`paid` sync-back; a row flag that must match the date it prints; aging's
+reconciliation with the AP balance). The exception SLA `is_overdue` is a
+different rule (an exception's `due_at`) and is not AP timing.
+
+## 486. One vendor per ERP record per company, enforced by a unique index; the migration refuses an existing pair (round 2026-11-21)
+
+`vendors.erp_vendor_id` had no unique index. Two vendors holding one record's
+id in one company made the vendor sync's lookup by id (`scalar_one_or_none` in
+`services/vendor_sync`) raise and abort every pull the tenant ran, and the push
+would post two payees' bills to one ERP supplier. The sync, the restore of kept
+links (§356), the hand-made link (§415) and the merge (§373) each already
+avoid making a second holder, but nothing below them held the line.
+
+Migration 0141 adds `uq_vendors_erp_link` on `vendors (organization_id,
+erp_link_realm, erp_vendor_id) NULLS NOT DISTINCT WHERE erp_vendor_id IS NOT
+NULL`, and the model declares it so `create_all` builds the same on a fresh
+tenant. `organization_id` leads because every lookup is scoped by it; in a
+database-per-tenant deployment it is constant, so it costs nothing.
+
+**A NULL realm is one company.** A no-realm sync looks a record up as
+`erp_link_realm IS NULL`, so two NULL-realm holders break it exactly as two
+named ones do; with plain NULL semantics the pre-0115 links would be the one
+place a duplicate survives. `NULLS NOT DISTINCT` (PostgreSQL 15+; compose, CI
+and RDS are all 16) says that directly. Rejected: a `COALESCE(erp_link_realm,
+'')` expression index, which needs a sentinel the realm format must never
+produce, and which the sync's `IS NULL` predicate cannot use. A NULL-realm link
+and a named one may share an id: they may be two companies' records, and a sync
+under the named one re-judges the NULL link by evidence (§284).
+
+**The migration refuses rather than de-links**, as 0138 did for email case
+collisions (§475). Which vendor keeps the link decides whose bills post to that
+ERP supplier; de-linking every holder would drop a link that is right for one
+of them and silently stop its pushes (`vendor_not_linked`), and keeping one by
+age or id is a guess. Both existing tools record the choice in the audit trail:
+a merge releases the same id held twice in one company (§373), and the unlink
+clears the stale holder (§375). The refusal names the database, the counts and
+at most ten vendor row ids, never a vendor name or the realm (which can carry an
+ERP base URL); `backend/docs/vendor-management.md` § Duplicate ERP links has
+the query that lists every group. `scripts/migrate_all_tenants.py` exits
+non-zero on it, so the deploy stops before new code serves that tenant.
+
+**The sync no longer aborts on a pair.** Code can still meet one on a tenant
+before 0141 (a local database, or a fan-out that stopped on the refusal while
+other code paths run). The lookup by id now reads every holder; with more than
+one it reports the record as a `duplicate_link` conflict, touches neither
+vendor, and syncs the rest of the pull. Choosing a holder there would be the
+same guess the migration declines.
+
+## 487. Delete on /intake, /requisitions and /experiments follows the endpoint's verdict, including where the old page rule was narrower (round 2026-11-21)
+
+The last web controls the §305 follow-up tracked as restating a server rule —
+intake and requisition Delete, experiment Stop / Conclude / Delete — now raise
+from one gate each (`services/procurement_controls.{intake,requisition}_delete_refusal`,
+`api/workflow_experiments.{stop,conclude,delete}_refusal`) and ship as each
+row's `actions`, pinned by the parity tests per role × row state.
+
+The verdict says what the endpoint does, and in two places that differs from
+what the page used to show:
+
+- **Requisition Delete** was offered only on `draft`. The endpoint has always
+  deleted any requisition that owns no PO and was not converted from an
+  intake, whatever its status (`backend/docs/procurement-requisitions.md`), so
+  the page now offers it on rejected, cancelled, submitted, pending and
+  approved rows too, and no longer offers it on a draft an intake was
+  converted into (which 409'd). Narrowing the endpoint to drafts would be a
+  separate policy change to who may discard a submitted request; this change
+  does not make it, because the rule is to stop the page and the endpoint from
+  disagreeing, not to pick a new rule while doing so.
+- **Experiment Conclude** was offered only on `running`. The endpoint also
+  concludes a `draft` (no assignments are taken after it), so a draft now
+  offers it, armed two-click like Delete because it is terminal. A
+  stopped draft that kept its assignments no longer offers the Delete that
+  409s (`experiment_has_assignments`).
+
+Conclude never refuses: a concluded row's repeat POST is an idempotent no-op
+answering the unchanged row. Its verdict is `experiment_already_concluded`
+anyway, the same shape as Start on a running experiment (nothing to offer),
+and the endpoint asks the same gate to decide the replay. The procurement
+delete 409s became coded (`intake_delete_converted`,
+`requisition_delete_converted`, `requisition_delete_from_intake`), the module's
+convention; the experiment ones stay plain strings with codes in the verdict,
+as `start_refusal` already did.
+
+## 488. Conclude refuses a draft that never ran; Delete is its exit (round 2026-11-21)
+
+§487 offered Conclude on any draft, because the endpoint concluded one. A
+fresh draft that never assigned an invoice therefore showed Start, Delete and
+Conclude together, and Conclude filed an experiment with no measurements as a
+finished result, permanently, beside the Delete that discards it.
+`conclude_refusal` now refuses that row with 409 `experiment_never_ran` ("delete
+it instead"), and the endpoint raises from the same gate; a concluded row's
+repeat stays the idempotent no-op. The rule is the complement of
+`delete_refusal`'s assignment check: a draft with no assignments can be
+deleted and not concluded, a stopped draft that kept its assignments can be
+concluded and not deleted, so each draft has exactly one exit. A running
+experiment with no assignments yet still concludes: it was live, and
+concluding it is how an operator ends a test that drew nothing. The message is
+a plain string like the module's other experiment refusals (§487), so no
+browser catalogue entry was added; the page hides a refused Conclude.
+
+## 489. A no-realm vendor sync takes the link lock too, rather than catching the unique violation (round 2026-11-21)
+
+§486's unique index made a second holder of one ERP record impossible, which
+turned a race that used to make a silent duplicate into a 500: two no-realm
+syncs (no `link_lock` was taken without a realm, §415) could both find no
+holder for a new record, both create a vendor, and the second failed
+`uq_vendors_erp_link` at flush. Two fixes were weighed. Catching that one
+index's violation and answering a coded 409 would tell the operator to retry
+a pull that did nothing wrong. Taking the same advisory lock for the no-realm
+company (key `vendor-erp-link:<org>:`, which no named realm can produce since
+`connection_realm` never returns an empty one) removes the race: the second
+pull waits, then sees the first one's committed vendor and reports it
+unchanged. Only the sync writes NULL-realm links (a hand-made link always
+names its company), so the lock serializes exactly the writers that can
+collide. The cost is that two no-realm pulls of one tenant run one after the
+other, which is what the named-realm case already does. Pinned in
+`tests/test_vendor_sync.py::test_two_no_realm_syncs_creating_one_record_serialize`.

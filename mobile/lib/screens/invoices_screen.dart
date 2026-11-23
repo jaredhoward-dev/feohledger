@@ -1,8 +1,11 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/scheduler.dart';
 
+import 'package:feohledger_mobile/api/endpoints.dart';
+import 'package:feohledger_mobile/l10n/coded_refusal_messages.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/l10n/invoice_status_labels.dart';
+import 'package:feohledger_mobile/l10n/load_error_messages.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/screens/capture_screen.dart';
 import 'package:feohledger_mobile/screens/invoice_detail_screen.dart';
@@ -12,14 +15,17 @@ import 'package:feohledger_mobile/stores/invoice_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/debouncer.dart';
 import 'package:feohledger_mobile/widgets/advanced_search_sheet.dart';
+import 'package:feohledger_mobile/widgets/async_list_body.dart';
 import 'package:feohledger_mobile/widgets/bulk_action_bar.dart';
 import 'package:feohledger_mobile/widgets/invoice_list_tile.dart';
 import 'package:feohledger_mobile/widgets/reject_reason_dialog.dart';
 
 /// Bulk status-change targets offered on mobile. A deliberately small, safe
 /// subset of the 12-state machine — the common manual moves an AP user makes in
-/// a batch. The backend validates each row's transition and skips invalid ones,
-/// so an option that doesn't apply to a given row is simply a no-op for it.
+/// a batch. The backend validates each row's transition and skips invalid ones
+/// with a coded reason the result dialog states. Approved is offered only when
+/// every selected row is awaiting review (`InvoiceStore.selectionAwaitingReview`,
+/// backend decisions §418), as the web picker does.
 const _bulkStatusTargets = <InvoiceStatus>[
   InvoiceStatus.readyForReview,
   InvoiceStatus.approved,
@@ -41,12 +47,27 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
 
   bool get _canBulk => AuthStore.instance.canBulkEditInvoices;
 
+  /// The last [InvoiceStore.searchClearedExternally] this screen acted on.
+  int _searchClearsSeen = 0;
+
   @override
   void initState() {
     super.initState();
+    _searchClearsSeen = InvoiceStore.instance.searchClearedExternally;
+    InvoiceStore.instance.addListener(_syncSearchBox);
     SchedulerBinding.instance.addPostFrameCallback((_) {
       InvoiceStore.instance.fetch();
     });
+  }
+
+  /// The dashboard's Overdue tap-through clears the store's search; the box
+  /// must not keep showing a query the list no longer applies.
+  void _syncSearchBox() {
+    final clears = InvoiceStore.instance.searchClearedExternally;
+    if (clears == _searchClearsSeen) return;
+    _searchClearsSeen = clears;
+    _searchDebouncer.cancel();
+    _searchController.clear();
   }
 
   @override
@@ -56,6 +77,7 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
     if (InvoiceStore.instance.selectionMode) {
       InvoiceStore.instance.exitSelectionMode();
     }
+    InvoiceStore.instance.removeListener(_syncSearchBox);
     _searchDebouncer.cancel();
     _searchController.dispose();
     super.dispose();
@@ -78,12 +100,23 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
                 child: ListenableBuilder(
                   listenable: InvoiceStore.instance,
                   builder: (context, _) {
-                    final current = InvoiceStore.instance.statusFilter;
+                    // The Overdue quick view selects its own chip, so no
+                    // status chip (not even All) reads as selected with it.
+                    final overdue = InvoiceStore.instance.overdueOnly;
+                    final current = overdue
+                        ? _overdueChipValue
+                        : InvoiceStore.instance.statusFilter;
                     return ListView(
                       scrollDirection: Axis.horizontal,
                       padding: const EdgeInsets.symmetric(horizontal: 12),
                       children: [
                         _filterChip(l.invoicesFilterAll, null, current),
+                        _filterChip(
+                          l.invoicesFilterOverdue,
+                          _overdueChipValue,
+                          current,
+                          onSelected: InvoiceStore.instance.setOverdueOnly,
+                        ),
                         _filterChip(l.invoicesFilterNew, 'new', current),
                         _filterChip(l.invoicesFilterPending, 'pending', current),
                         _filterChip(
@@ -105,34 +138,52 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
                   listenable: InvoiceStore.instance,
                   builder: (context, _) {
                     final store = InvoiceStore.instance;
+                    final loadError = store.loadError;
 
-                    if (store.loading && store.invoices.isEmpty) {
-                      return const Center(child: CircularProgressIndicator());
-                    }
-
-                    if (store.invoices.isEmpty) {
-                      return Center(child: Text(l.invoicesEmpty));
-                    }
-
-                    return RefreshIndicator(
+                    return AsyncListBody<Invoice>(
+                      items: store.invoices,
+                      loading: store.loading,
+                      // The fetch's failure only: a refused bulk action
+                      // leaves the list live (actionError), so it raises no
+                      // banner — and a failed load is never "No invoices".
+                      hasError: loadError != null,
+                      fromCache: store.fromCache,
+                      errorMessage: loadError == null
+                          ? ''
+                          : describeLoadError(
+                              l,
+                              loadError,
+                              l.invoicesLoadErrorPrefix,
+                            ),
                       onRefresh: store.fetch,
-                      child: ListView.separated(
-                        itemCount: store.invoices.length,
-                        separatorBuilder: (_, _) => const Divider(height: 1),
-                        itemBuilder: (context, index) {
-                          final invoice = store.invoices[index];
-                          return InvoiceListTile(
-                            invoice: invoice,
-                            selectionMode: store.selectionMode,
-                            selected: store.isSelected(invoice.id),
-                            onTap: store.selectionMode
-                                ? () => store.toggleSelected(invoice.id)
-                                : () => _openDetail(invoice),
-                            onLongPress: _canBulk && !store.selectionMode
-                                ? () => store.enterSelectionMode(invoice.id)
-                                : null,
-                          );
-                        },
+                      onLoadMore: store.loadMore,
+                      hasMore: store.hasMore,
+                      loadingMore: store.loadingMore,
+                      loadMoreFailed: store.loadMoreError != null,
+                      total: store.total,
+                      // A chip, search or advanced filter that matches nothing
+                      // says so, with the way back to every invoice.
+                      filteredEmpty: store.isFiltered
+                          ? FilteredEmptyState(
+                              message: l.invoicesFilteredEmpty,
+                              onShowAll: _clearAllFilters,
+                            )
+                          : null,
+                      empty: Text(
+                        l.invoicesEmpty,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 16),
+                      ),
+                      itemBuilder: (context, invoice) => InvoiceListTile(
+                        invoice: invoice,
+                        selectionMode: store.selectionMode,
+                        selected: store.isSelected(invoice.id),
+                        onTap: store.selectionMode
+                            ? () => store.toggleSelected(invoice.id)
+                            : () => _openDetail(invoice),
+                        onLongPress: _canBulk && !store.selectionMode
+                            ? () => store.enterSelectionMode(invoice.id)
+                            : null,
                       ),
                     );
                   },
@@ -255,16 +306,37 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
     );
   }
 
-  Widget _filterChip(String label, String? value, String? current) {
-    final selected = current == value;
+  /// Stands in for the Overdue quick view as the chip row's current value;
+  /// never a real status, so no status chip matches it.
+  static const _overdueChipValue = '__overdue__';
+
+  /// One chip of the row. A status chip selects [value] as the status
+  /// filter; a quick view (Overdue) passes its own [onSelected] and a
+  /// sentinel [value] that [current] holds while it is active.
+  Widget _filterChip(
+    String label,
+    String? value,
+    String? current, {
+    VoidCallback? onSelected,
+  }) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: FilterChip(
         label: Text(label),
-        selected: selected,
-        onSelected: (_) => InvoiceStore.instance.setStatusFilter(value),
+        selected: current == value,
+        onSelected: (_) => onSelected != null
+            ? onSelected()
+            : InvoiceStore.instance.setStatusFilter(value),
       ),
     );
+  }
+
+  /// The filtered-empty state's "Show all": the chip, the search box and the
+  /// advanced filters all clear, in one refetch.
+  void _clearAllFilters() {
+    _searchDebouncer.cancel();
+    _searchController.clear();
+    InvoiceStore.instance.clearAllFilters();
   }
 
   Future<void> _openAdvancedSearch() async {
@@ -347,6 +419,8 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
               ),
               const Divider(height: 1),
               for (final status in _bulkStatusTargets)
+                if (status != InvoiceStatus.approved ||
+                    InvoiceStore.instance.selectionAwaitingReview)
                 ListTile(
                   title: Text(
                     invoiceStatusLabel(
@@ -375,6 +449,12 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
       if (reason == null || !mounted) return;
     }
 
+    // The rows as listed, to name a skipped one by its number once the list
+    // has been refetched.
+    final numbers = {
+      for (final inv in InvoiceStore.instance.invoices)
+        inv.id: inv.invoiceNumber,
+    };
     setState(() => _busy = true);
     final result = await InvoiceStore.instance
         .bulkStatusSelected(target.value, reason: reason);
@@ -389,9 +469,66 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
             l.invoicesBulkMoved(result.count, invoiceStatusLabel(l, target)),
             result.skipped.length,
           );
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
     A11y.announce(context, message);
+    if (result == null || result.skipped.isEmpty) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
+      return;
+    }
+    // A skipped row says why, in the reader's language: "N skipped" alone
+    // left the user guessing which invoices stayed put and what to do.
+    await _showSkipped(message, result.skipped, numbers);
+  }
+
+  /// The bulk result [message] with one line per skipped row: its invoice
+  /// number and the server's reason, stated from its code
+  /// (`coded_refusal_messages.dart`), else the server's English.
+  Future<void> _showSkipped(
+    String message,
+    List<BulkSkip> skipped,
+    Map<String, String?> numbers,
+  ) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final dl = AppLocalizations.of(dialogContext);
+        return AlertDialog(
+          title: Text(message),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                for (final skip in skipped)
+                  ListTile(
+                    key: ValueKey('bulk-skip-${skip.id}'),
+                    contentPadding: EdgeInsets.zero,
+                    // A row with no invoice number is named as such, never
+                    // by its internal id: a UUID tells the reader nothing.
+                    title: Text(
+                      switch (numbers[skip.id]) {
+                        final n? when n.isNotEmpty => n,
+                        _ => dl.invoicesBulkSkipNoNumber,
+                      },
+                    ),
+                    subtitle: Text(
+                      localizeCodedRefusal(dl, skip.refusal) ??
+                          skip.reason ??
+                          dl.invoicesBulkSkipNoReason,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(dl.commonClose),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Future<void> _bulkExport() async {
@@ -455,10 +592,11 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
         filename: result.filename,
         mimeType: format == 'xml' ? 'application/xml' : 'text/csv',
       );
-    } catch (e) {
+    } catch (_) {
       if (!mounted) return;
-      final message =
-          AppLocalizations.of(context).invoicesBulkShareFailed('$e');
+      final l = AppLocalizations.of(context);
+      // The platform's exception text is a log line, not a sentence.
+      final message = l.invoicesBulkShareFailed(l.bulkUnknownError);
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(message)));
       A11y.announce(context, message);
@@ -480,7 +618,7 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
   /// The store's failure detail, or a localized "unknown error" when the
   /// failure carried none — never an empty string after the colon.
   String _storeError(AppLocalizations l) {
-    final error = InvoiceStore.instance.error;
+    final error = InvoiceStore.instance.actionError;
     return error == null || error.isEmpty ? l.bulkUnknownError : error;
   }
 

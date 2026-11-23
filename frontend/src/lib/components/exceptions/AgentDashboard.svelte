@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { formatRatioPercent } from '#lib/utils/percent.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	// Autonomous-exception-agent dashboard: resolution rate, escalation rate,
 	// accuracy (placeholder), plus the recent decision log. Read-only surface over
 	// GET /api/exceptions/agent-stats + /agent-decisions (admin/ap_manager-gated).
@@ -8,6 +10,7 @@
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
+	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import {
 		getAgentStats,
@@ -32,6 +35,7 @@
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 
 	const PAGE_SIZE = 20;
 
@@ -58,15 +62,16 @@
 
 	let hasMore = $derived(decisions.length < total);
 
-	// Action-badge tones reuse the exceptions palette (WCAG-passing siblings).
-	const ACTION_COLORS: Record<string, string> = {
-		auto_resolved: '#1fa86a',
-		escalated: '#f06464',
-		no_action: '#8a8fa0'
+	// Action-badge tones: palette tone NAMES, rendered as the tone's calibrated
+	// `-tint` / `-on-tint` pair so they hold in both themes (decisions §289).
+	const ACTION_TONES: Record<string, 'success' | 'danger' | 'muted'> = {
+		auto_resolved: 'success',
+		escalated: 'danger',
+		no_action: 'muted'
 	};
 
 	function pct(rate: number): string {
-		return `${(rate * 100).toFixed(1)}%`;
+		return formatRatioPercent(rate, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 	}
 
 	// Sequences every `loadDecisions` call — mount, action chip, load-more; one
@@ -271,8 +276,11 @@
 	// The three action chips ARE the three action labels, so they read the same
 	// keys the badge does — a chip saying one thing and the rows it filters
 	// another is the drift one shared map removes.
+	// FilterChips keys are strings; the "All" chip stands for no filter
+	// (`actionFilter === null`), which no `action_taken` value can collide with.
+	const ALL_ACTIONS = '';
 	const ACTION_CHIPS = $derived([
-		{ key: null, label: m('common.all') },
+		{ key: ALL_ACTIONS, label: m('common.all') },
 		{ key: 'auto_resolved', label: m('exceptions.agents.action.autoResolved') },
 		{ key: 'escalated', label: m('exceptions.agents.action.escalated') },
 		{ key: 'no_action', label: m('exceptions.agents.action.noAction') }
@@ -340,7 +348,7 @@
 			{/if}
 		</div>
 	{:else if loading}
-		<p class="dash-loading">{m('exceptions.agents.loading')}</p>
+		<LoadingState label={m('exceptions.agents.loading')} />
 	{/if}
 
 	<section class="log-section" data-testid="agent-run-panel">
@@ -349,7 +357,7 @@
 				<h2>{m('exceptions.agents.run.heading')}</h2>
 				<HelpTip term="exception-agent" />
 			</div>
-			<button class="filter-chip" onclick={loadCandidates} disabled={candidatesLoading}>
+			<button type="button" class="btn-secondary" onclick={loadCandidates} disabled={candidatesLoading}>
 				{candidatesLoading
 					? m('exceptions.agents.run.refreshing')
 					: m('exceptions.agents.run.refresh')}
@@ -364,11 +372,10 @@
 		<DataTable
 			columns={RUN_COLUMNS}
 			isEmpty={candidates.length === 0}
-			empty={candidatesLoading
-				? m('exceptions.agents.run.empty.loading')
-				: candidatesErrored
-					? m('exceptions.agents.run.empty.errored')
-					: m('exceptions.agents.run.empty.none')}
+			loading={candidatesLoading}
+			errored={candidatesErrored}
+			emptyErrored={m('exceptions.agents.run.empty.errored')}
+			empty={m('exceptions.agents.run.empty.none')}
 			colspan={6}
 		>
 			{#snippet body()}
@@ -419,18 +426,12 @@
 	<section class="log-section" data-testid="agent-decision-log">
 		<header class="log-head">
 			<h2>{m('exceptions.agents.log.heading')}</h2>
-			<nav class="filters" aria-label={m('exceptions.agents.log.filterAria')}>
-				{#each ACTION_CHIPS as chip (chip.key ?? 'all')}
-					<button
-						class="filter-chip"
-						class:active={actionFilter === chip.key}
-						aria-pressed={actionFilter === chip.key}
-						onclick={() => setActionFilter(chip.key)}
-					>
-						{chip.label}
-					</button>
-				{/each}
-			</nav>
+			<FilterChips
+				ariaLabel={m('exceptions.agents.log.filterAria')}
+				chips={ACTION_CHIPS}
+				active={actionFilter ?? ALL_ACTIONS}
+				onchange={(key) => setActionFilter(key === ALL_ACTIONS ? null : key)}
+			/>
 		</header>
 
 		<DataTable
@@ -448,12 +449,12 @@
 						<td>
 							<span
 								class="action-badge"
-								style="background:{ACTION_COLORS[d.action_taken] ?? '#888'}1f;color:{ACTION_COLORS[d.action_taken] ?? '#888'}"
+								style="background:var(--{ACTION_TONES[d.action_taken] ?? 'muted'}-tint);color:var(--{ACTION_TONES[d.action_taken] ?? 'muted'}-on-tint)"
 							>
 								{actionLabel(d.action_taken)}
 							</span>
 						</td>
-						<td class="mono right">{(d.confidence * 100).toFixed(0)}%</td>
+						<td class="mono right">{formatRatioPercent(d.confidence, { maximumFractionDigits: 0 })}</td>
 						<td class="muted-cell">{autonomyLabel(d.autonomy_level)}</td>
 						<td class="muted-cell change-cell" title={d.rationale ?? ''}>{changeSummary(d)}</td>
 					</tr>
@@ -461,19 +462,15 @@
 			{/snippet}
 		</DataTable>
 
-		{#if hasMore}
-			<div class="load-more-row">
-				<button class="btn-load-more" onclick={loadMore} disabled={loadingMore}>
-					{loadingMore
-						? m('common.loading')
-						: m('exceptions.agents.loadMore', { shown: decisions.length, total })}
-				</button>
-			</div>
-		{:else if total > 0}
-			<div class="load-more-row">
-				<span class="load-more-end">{m('exceptions.agents.showingAll', { total })}</span>
-			</div>
-		{/if}
+		<LoadMoreFooter
+			shown={decisions.length}
+			{total}
+			{hasMore}
+			loading={loadingMore}
+			onloadmore={loadMore}
+			moreKey="exceptions.agents.loadMore"
+			allKey="exceptions.agents.showingAll"
+		/>
 	</section>
 </div>
 
@@ -504,7 +501,7 @@
 				<span
 					class="action-badge"
 					data-testid="agent-run-action"
-					style="background:{ACTION_COLORS[runOutcome.decision.action_taken] ?? '#888'}1f;color:{ACTION_COLORS[runOutcome.decision.action_taken] ?? '#888'}"
+					style="background:var(--{ACTION_TONES[runOutcome.decision.action_taken] ?? 'muted'}-tint);color:var(--{ACTION_TONES[runOutcome.decision.action_taken] ?? 'muted'}-on-tint)"
 				>
 					{actionLabel(runOutcome.decision.action_taken)}
 				</span>
@@ -533,7 +530,7 @@
 				</div>
 				<div>
 					<dt>{m('exceptions.agents.col.confidence')}</dt>
-					<dd class="mono">{(runOutcome.decision.confidence * 100).toFixed(0)}%</dd>
+					<dd class="mono">{formatRatioPercent(runOutcome.decision.confidence, { maximumFractionDigits: 0 })}</dd>
 				</div>
 				<div>
 					<dt>{m('exceptions.agents.col.autonomy')}</dt>
@@ -589,11 +586,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 16px;
-	}
-
-	.dash-loading {
-		color: var(--text-muted);
-		font-size: 0.9rem;
 	}
 
 	.accuracy-card {

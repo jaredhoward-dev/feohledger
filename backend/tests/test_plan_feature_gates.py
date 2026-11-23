@@ -59,7 +59,7 @@ OIDC_READY = {
     "provider": "okta",
     "discovery_url": "https://idp.example.com/.well-known/openid-configuration",
     "client_id": "feoh",
-    "client_secret": "not-a-real-secret",
+    "client_secret_configured": True,
 }
 SAML_READY = {
     "enabled": True,
@@ -313,13 +313,20 @@ async def test_enabling_sso_needs_the_sso_feature(realdb):
 
 @pytest.mark.asyncio
 async def test_require_sso_needs_the_enforcement_feature(realdb):
+    # SSO-only needs an IdP block that resolves (§204), and the OIDC client
+    # secret is sealed (§444): `client_secret_configured` is only the stored
+    # marker, so the PUT carries the secret itself, as an admin's save does.
+    body = {
+        **{k: v for k, v in OIDC_READY.items() if k != "client_secret_configured"},
+        "client_secret": "not-a-real-secret",
+    }
     await realdb.subscribe("a", "growth")
     async with realdb.client(key="a") as c:
-        _assert_plan_refusal(await c.put(SSO_URL, json=OIDC_READY), FEATURE_SSO_ENFORCEMENT)
+        _assert_plan_refusal(await c.put(SSO_URL, json=body), FEATURE_SSO_ENFORCEMENT)
 
     await realdb.subscribe("a", "scale")
     async with realdb.client(key="a") as c:
-        resp = await c.put(SSO_URL, json=OIDC_READY)
+        resp = await c.put(SSO_URL, json=body)
     assert resp.status_code == 200, resp.text
     assert resp.json()["sso_only"] is True
     assert resp.json()["password_sign_in_closed"] is True
@@ -712,8 +719,8 @@ async def test_saving_a_live_erp_needs_the_erp_feature(realdb):
 async def test_free_connects_a_direct_erp_and_pushes_to_it(realdb, monkeypatch):
     """§281: Free is one direct ERP that imports and pushes. The save and the
     push both pass the gate on the Free plan itself."""
-    from app.api import workflow as workflow_api
     from app.models.invoice import InvoiceStatus
+    from app.services import erp_send
 
     dispatched: list[uuid.UUID] = []
 
@@ -721,7 +728,7 @@ async def test_free_connects_a_direct_erp_and_pushes_to_it(realdb, monkeypatch):
         dispatched.append(invoice_id)
 
     # The adapter call behind the push is not this test's subject; the gate is.
-    monkeypatch.setattr(workflow_api, "dispatch_erp", _record)
+    monkeypatch.setattr(erp_send, "dispatch_erp", _record)
 
     await realdb.subscribe("a", "free")
     async with realdb.client(key="a") as c:
@@ -1086,14 +1093,14 @@ async def _failed_invoice(realdb, prefix: str) -> uuid.UUID:
 
 
 def _record_dispatch(monkeypatch) -> list[uuid.UUID]:
-    from app.api import workflow as workflow_api
+    from app.services import erp_send
 
     dispatched: list[uuid.UUID] = []
 
     async def _record(invoice_id, *_args, **_kwargs):
         dispatched.append(invoice_id)
 
-    monkeypatch.setattr(workflow_api, "dispatch_erp", _record)
+    monkeypatch.setattr(erp_send, "dispatch_erp", _record)
     return dispatched
 
 
@@ -1216,10 +1223,12 @@ class _DedupRedis:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("plan", ["free", "canceled_scale"])
-async def test_the_erp_webhook_is_accepted_for_a_stored_merge_config(realdb, monkeypatch, plan):
+async def test_the_erp_webhook_is_accepted_for_a_stored_live_config(realdb, monkeypatch, plan):
     """The in-flight exemption (§258, §281): a push already sent before the
-    plan stopped covering Merge still has its status reported back. The
-    webhook is not plan-gated, so `sent_to_erp → posted_in_erp` applies."""
+    plan stopped covering the ERP still has its status reported back. The
+    webhook is not plan-gated, so `sent_to_erp → posted_in_erp` applies. A
+    direct ERP: the generic route answers only for the tenant's own adapter,
+    never Merge (§399), whose per-tenant route is not plan-gated either."""
     import hashlib
     import hmac
     import json
@@ -1237,7 +1246,7 @@ async def test_the_erp_webhook_is_accepted_for_a_stored_merge_config(realdb, mon
     monkeypatch.setattr(erp_webhook, "control_session_factory", realdb.control_sessionmaker())
 
     await _arrange(realdb, plan)
-    await _write_settings(realdb, erp=dict(MERGE_ERP))
+    await _write_settings(realdb, erp=dict(LIVE_ERP))
     await realdb.store_provider_secrets("a", "erp", {"webhook_signing_secret": secret})
 
     invoice_id = await _approved_invoice(realdb, "WH")
@@ -1258,7 +1267,7 @@ async def test_the_erp_webhook_is_accepted_for_a_stored_merge_config(realdb, mon
     signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     async with realdb.client(key="a", role=None) as c:
         resp = await c.post(
-            "/api/erp/webhook/merge_dev",
+            "/api/erp/webhook/netsuite",
             content=body,
             headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
         )

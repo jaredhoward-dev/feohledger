@@ -404,7 +404,7 @@ test.describe('accessibility — KPI pending affordance (WCAG 4.1.2 / 1.3.1)', (
 			await page.goto('/cfo');
 			await expect(page.getByRole('heading', { name: 'Cash Flow', exact: true })).toBeVisible();
 			// The page's own in-flight state, not a guess at timing.
-			await expect(page.locator('.workspace > .loading')).toBeVisible();
+			await expect(page.getByTestId('cfo-loading')).toBeVisible();
 
 			const row = page.getByTestId('forecast-kpi-row');
 			await expect(row).toBeVisible();
@@ -698,7 +698,9 @@ test.describe('accessibility — KPI pending affordance (WCAG 4.1.2 / 1.3.1)', (
 
 		try {
 			await page.goto('/billing');
-			const row = page.locator('.kpi-row').first();
+			// The extraction counters, not `AiUsagePanel`'s overage row, which
+			// now sits above them in the usage section.
+			const row = page.getByTestId('billing-usage-counts').locator('.kpi-row');
 			await expect(row.locator('.kpi').first()).toBeVisible();
 
 			// Two cards, not the empty-state's rebate-augmented row: `rebateGroups`

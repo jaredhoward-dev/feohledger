@@ -24,14 +24,17 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import settings
 from app.database import _make_tenant_url, control_session_factory
+from app.db_engine import create_async_engine
 from app.models.invoice import Invoice
 from app.models.organization import Organization
 from app.models.payment import Payment
+from app.services.invoice_warning_catalog import exception_finding
 from app.services.payment_adapters import PaymentStatus, SettlementReport, get_payment_adapter
+from app.services.payment_adapters.base import TERMINAL_STATUSES
 from app.services.payment_settlement_record import (
     SettlementCompletion,
     open_settlement_mismatch_exception,
@@ -242,7 +245,7 @@ async def _audit_reconcile_transition(
 
 
 #: Exception type opened when the backstop gives up on a still-in-flight
-#: payment. Payment-BLOCKING (``api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES``)
+#: payment. Payment-BLOCKING (``services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES``)
 #: — that is the whole point: aging a payment out to ``failed`` frees the
 #: invoice's live-payment slot, and nothing else stops the next run paying it
 #: again while the original may still be moving at the rail.
@@ -254,7 +257,7 @@ async def flag_payment_for_reconciliation(
     *,
     organization_id,
     payment: Payment,
-    description: str,
+    finding: dict,
     log_tag: str,
 ) -> None:
     """Open a de-duped ``payment_reconciliation`` exception on ``payment``'s invoice.
@@ -263,12 +266,14 @@ async def flag_payment_for_reconciliation(
     for it. ``failed`` is in ``LIVE_PAYMENT_TERMINAL_STATUSES``, so that row no
     longer holds the invoice's live-payment slot; this payment-blocking
     exception is what stops a fresh run paying the invoice a second time until a
-    human has reconciled the rail (``api/payments.PAYMENT_BLOCKING_EXCEPTION_TYPES``).
+    human has reconciled the rail (``services/payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES``).
 
     **De-duped** on an already-open/escalated ``payment_reconciliation`` for the
     invoice, so a tenant whose rail is down doesn't accumulate a row per sweep.
-    ``description`` must be **PII-free**: ids, ages and statuses — never the
-    vendor, the payee, or any bank field.
+    ``finding`` is the description as a catalogue finding
+    (``invoice_warning_catalog.exception_finding``, one of the
+    ``exception.payment_*`` codes — decisions §358), and must be **PII-free**:
+    ids, ages and statuses — never the vendor, the payee, or any bank field.
 
     Best-effort in the same sense as ``payment_erp_sync._flag_sync_failure``: a
     flagging failure must not lose the transition the caller just decided. It is
@@ -299,7 +304,9 @@ async def flag_payment_for_reconciliation(
             db,
             exception_type=AGED_OUT_EXCEPTION_TYPE,
             severity="error",
-            description=description,
+            description=finding["message"],
+            description_code=finding["code"],
+            description_params=finding["params"],
             status="open",
             # Raised by the system on an outcome nobody chose; no human's act
             # is what the flag asks to be reviewed.
@@ -334,12 +341,11 @@ async def _flag_aged_out_payment(
         db,
         organization_id=org.id,
         payment=payment,
-        description=(
-            f"Payment {payment.id} was still in flight after {hours:.1f}h and the "
-            f"reconciler marked it failed; the rail never confirmed, so the money "
-            f"may or may not have moved. The invoice is '{current_status}'. Confirm "
-            f"with the processor and void or re-pay — this invoice is blocked from "
-            f"a new payment run until this is resolved."
+        finding=exception_finding(
+            "payment_aged_out",
+            paymentId=payment.id,
+            hours=f"{hours:.1f}",
+            invoiceStatus=current_status,
         ),
         log_tag="payment-reconciler",
     )
@@ -549,11 +555,7 @@ async def _reconcile_tenant(org: Organization, now: datetime) -> dict[str, int]:
                     # Webhooks could have raced us — only accept terminal
                     # status updates from the poll. The async webhook path
                     # handles the in-flight transitions.
-                    if upstream in (
-                        PaymentStatus.completed,
-                        PaymentStatus.failed,
-                        PaymentStatus.cancelled,
-                    ):
+                    if upstream in TERMINAL_STATUSES:
                         # Resolve the settled figure BEFORE the lock. This is a
                         # live rail round trip, and running it under
                         # `SELECT ... FOR UPDATE` blocked `payment_webhook`'s own

@@ -125,6 +125,14 @@ Shows invoices in payable statuses (`approved`, `sent_to_erp`, `posted_in_erp`, 
 - Shows payment terms per invoice
 - Count shown in the tab badge
 
+An invoice sent to the ERP leaves this queue: a successful push ends at `done`,
+and the bill is paid from the ERP. The exception is an ERP with status sync on
+(QuickBooks, decisions §295; Xero, §386): there the push lands at `posted_in_erp`, which
+stays payable here, and a payment from either side is reflected in the other. With the workflow's **Auto-send on approval**
+switch on (and a live ERP connected) that happens moments after approval, so
+such an invoice never waits here (`docs/decisions.md` §304). Tenants that pay
+through FeohLedger runs keep the switch off.
+
 ### History Tab
 
 All payments across all methods in one table.
@@ -226,6 +234,17 @@ lifecycle with no second human. The control mirrors the invoice-approval
 `Organization.settings.payments.require_run_segregation: false` (any value other
 than an explicit `false` keeps the secure default). A legacy run with a NULL
 `initiated_by` is never blocked (nothing to compare against).
+
+**The refusal is coded on the wire.** Maker-checker (403
+`payment_run_segregation`, `params.step` on the record / bank-file steps) and
+the CFO-approval wait (403 `payment_run_awaiting_cfo`) answer every POST that
+raises them — approve, execute, resume, retry-failed, record-outside, the NACHA
+export — with `detail = {code, message, params}`, the same object the run
+dialog's `actions` verdict carries, so the web toast and the mobile Pay tab
+state it in the reader's language (`docs/decisions.md` §461). A standalone
+`POST /api/payments` above the CFO threshold, booked by someone without the CFO
+role, answers 403 `payment_cfo_required` the same way. Every client renders a
+code it does not know by its English `message`.
 
 ### A standalone payment can't be injected into a run
 
@@ -487,7 +506,7 @@ retry-safe for the same reason (no order exists at the processor):
   re-attempt it — and its own payability gate keeps skipping the row (as
   `invoice_not_payable`) until the ERP push completes and the invoice reaches
   the payable `posted_in_erp`.
-- `api/payments.SCHEDULABLE_INVOICE_STATUSES` — the statuses the three dispatch
+- `services/payment_gates.SCHEDULABLE_INVOICE_STATUSES` — the statuses the three dispatch
   legs transition to `payment_scheduled` — is now **derived** from
   `workflow_engine.VALID_TRANSITIONS` rather than restated as a literal, so it
   can never again name a status the state machine refuses. It is
@@ -528,7 +547,10 @@ wait is now bounded: `_lock_payment_invoice` takes the lock through
 `FEOH_PAYMENT_INVOICE_LOCK_TIMEOUT_MS` (default `5000`; `0` = wait forever).
 The direct card mint (`POST /api/cards/generate`) takes the same lock mode under
 the same bound, so a mint and a dispatch on one invoice run one after the other
-(`virtual-cards.md` § The direct mint locks before it checks).
+(`virtual-cards.md` § The direct mint locks before it checks). So does run
+creation (`POST /api/payments/runs` and the copilot's draft-run), through
+`payment_runs.lock_run_invoices`: it locks every invoice in the run, in id
+order, before any check reads one (§ The ERP is a third rail).
 
 - **The bound is scoped to the one locking statement.** It runs in a SAVEPOINT,
   sets `lock_timeout` with `SET LOCAL` semantics and restores the previous value
@@ -547,7 +569,9 @@ the same bound, so a mint and a dispatch on one invoice run one after the other
   - `POST {id}/void`, `POST {id}/settlement/accept` and
     `POST {id}/compliance/release` answer `409` with a detail starting
     `invoice_locked:` and change nothing (the release leaves the payment
-    `pending_compliance`, not `failed`, so the operator just retries).
+    `pending_compliance`, not `failed`, so the operator just retries);
+  - run creation answers the same `409 invoice_locked:` with no run and no
+    payment booked.
 - **What it does not bound.** The *other* invoice writers (send-to-erp,
   approve, `PATCH`, `payment_erp_sync`, `POST /api/payments`) still wait out a
   dispatch holding the lock across a processor call, for as long as that call
@@ -622,6 +646,80 @@ which only some processors honour.
 Pinned by `tests/test_payment_dispatch_db_error.py`, which injects a real
 Postgres error on the dispatch session after the processor call.
 
+### A dispatch attempt is marked, durably, before it starts
+
+The recovery above needs a live process. When the worker dies after
+`adapter.create_payment` returns and before the per-payment commit, nothing
+the attempt wrote survives: the row is still `pending` on an `executing` run,
+with no `provider_payment_id`. `/resume` re-sends it on the same
+`correlation_id`, which the processor dedupes. But if the resume refuses it
+before its own adapter call (`invoice_locked`, `invoice_not_payable`,
+`invoice_blocked:`, any pre-adapter reason), the row used to become `failed`
+with a retry-safe reason, and **Retry failed payments** sent it under a fresh
+idempotency key: a second order for an invoice the crashed pass may already
+have paid.
+
+`Payment.dispatch_attempted_at` (migration 0124) closes it:
+
+- **Stamped and committed before every attempt.** `_dispatch_payment_guarded`
+  (every dispatch path goes through it) writes the stamp and commits it
+  before the invoice lock, the gates and the processor call
+  (`_mark_dispatch_attempt`). A commit is the only durable record that
+  survives the process dying. A second connection can't write the row while
+  this transaction holds its `FOR UPDATE` lock, and a savepoint isn't durable.
+  At that point the attempt holds only the payment's row lock and has written
+  nothing else, so the commit gives nothing away. It does release the row lock,
+  so the row is re-locked and must still read the expected status **and carry
+  this attempt's stamp**. A concurrent dispatcher that got in between has
+  re-stamped it, so exactly one of them goes on to send. Each stamp is forced
+  past the one it replaces, so the comparison holds even when two hosts'
+  clocks disagree.
+- **Cleared in the transaction that records the outcome**, but only when
+  the row had no stamp when the attempt began. Then no earlier pass can have
+  reached the processor without leaving one, and the attempt's own reason and
+  handle tell the whole story, classified exactly as before. An ordinary
+  pre-adapter refusal is therefore still retry-safe.
+- **Kept for good when the row was already stamped.** The stamp then means an
+  earlier pass's outcome was never recorded. `classify_payment_failure`
+  answers IN_DOUBT for a stamped row whatever its reason, so `/retry-failed`
+  skips it (`needs_reconciliation`), `retryable_failures` leaves it out, and
+  a run with nothing else to retry is refused with `payment_run_nothing_to_retry`.
+  The run dialog therefore never offers the retry for it.
+- **A stamped row that leaves the live-payment slot is flagged.** When such a
+  row ends `failed` or `cancelled`, the payment-blocking
+  `payment_reconciliation` exception is opened, because those statuses free
+  the slot and a fresh run would otherwise pay the invoice again. This is one
+  rule (`_flag_if_dispatch_in_doubt`), applied at every writer that can get
+  there: the dispatch outcome, the run loop's `invoice_locked` refusal, and
+  `/compliance/dismiss`. The dismiss case covers a resume that lands on a
+  compliance hold. A human confirms with the processor and voids or re-pays.
+- **`invoice_locked` on `/compliance/release` commits before its 409**, so
+  the stamp it just cleared is not left behind by a rollback.
+
+**Accepted costs.** One extra commit per payment dispatched. Some rows get
+stamped and are reported in doubt even though nothing was ever sent:
+
+- a pass that crashed after stamping but before reaching the processor;
+- two dispatchers racing inside the stamp window, where the loser's stamp
+  makes the winner's row look previously attempted. The same applies when a
+  `/compliance/dismiss` wins the window against a `/compliance/release`: the
+  release backs off without clearing its stamp, and the dismissal flags the
+  row;
+- the migration's backfill.
+
+Each costs a human check. Missing one costs a second payment.
+
+**Backfill.** Migration 0124 stamps every `pending` payment on an `executing`
+run, because that is exactly what a crashed pass leaves behind, and nothing
+records which of them it reached. It stamps nothing else.
+
+Pinned by `tests/test_payment_dispatch_marker.py`. It kills the worker with a
+`BaseException` right after the mock processor accepts the order, then resumes
+it under a not-payable invoice and under a held invoice lock, and checks that
+`/retry-failed`, the run verdict and a fresh run all refuse. It also covers
+the dismissal flag, a release refused on the invoice lock, and a dispatcher
+losing the claim window.
+
 ### Why a payment failed, and retrying it
 
 `Payment.failure_reason` is written on every failure path — compliance refusal,
@@ -645,12 +743,32 @@ Now:
 
 **`/retry-failed` in one paragraph.** Accepted only on a `partial` / `failed`
 run (`draft` → use `/execute`; `executing` → use `/resume`). Same
-`payment.execute` permission, the same maker-checker `check_run_segregation`,
-and the same CFO-threshold gate as `/execute` — skipping any of those would
-make retry a way around all three. It books a second attempt for the failed
-payments it judges safe, then re-drives the run through the same
-`_dispatch_run_payments` loop, so anything already `completed` / `submitted` /
-`processing` / `pending_compliance` is never re-sent to the processor.
+`payment.execute` permission, the same maker-checker gate, and the same
+CFO-threshold gate as `/execute` — skipping any of those would make retry a way
+around all three. It books a second attempt for the failed payments it judges
+safe, then re-drives the run through the same `_dispatch_run_payments` loop, so
+anything already `completed` / `submitted` / `processing` /
+`pending_compliance` is never re-sent to the processor.
+
+**Every up-front refusal is one gate, and the run dialog reads it.**
+`payment_controls.run_retry_failed_refusal` decides, in order: the run's
+DERIVED status is not `partial` / `failed` (409 `payment_run_not_retryable`);
+the caller created the run (403 `payment_run_segregation`); the run is still
+awaiting CFO sign-off (403 `payment_run_awaiting_cfo`); none of its active
+failures is retry-safe (409 `payment_run_nothing_to_retry`). The endpoint
+raises from it, and `GET /runs/{id}` ships the same answer as
+`actions.retry_failed` (beside `approve` / `execute` / `cancel`), so the web run
+dialog's **Retry failed payments** control is offered exactly when the POST
+would accept it (`tests/test_payment_action_verdicts.py` asks both sides for
+every role × run state). The last refusal is new: a run whose every failure is
+in doubt used to be accepted, claimed (`→ executing`), audited
+`payment_run.retried` and dispatched with nothing to send, answering 200 with
+`payments_retried: 0`. Now nothing is claimed or written, and the reader is told
+to reconcile each payment with the processor. A run with at least one safe
+failure is still accepted, and its in-doubt ones are skipped as
+`needs_reconciliation` exactly as before. Processor resolution (record-only
+tenant, unsupported provider) stays a separate pre-flight the page reads from
+`GET /payments/execution-mode`, as for Execute.
 
 #### A retry books a NEW payment; it never re-arms the old one
 
@@ -695,6 +813,7 @@ for a human to void or reconcile — when any of these hold:
 | `adapter_error:*` (card leg) | The card provider may have minted a card we never recorded. |
 | `db_error_after_processor_call:*` | The processor answered, then a database error aborted the dispatch transaction. The reply's handle is restored onto the row (§ A database error mid-dispatch). |
 | `dispatch_db_error:*` | The same abort before the processor call. This pass sent nothing, but the row may be a `/resume` of an earlier pass that did and crashed before its commit. |
+| `dispatch_attempted_at` still set | An earlier dispatch pass may have reached the processor and died before recording it; the reason on the row is from a later pass (§ A dispatch attempt is marked, durably, before it starts). Outranks every reason, like `provider_payment_id`. |
 | blank / unrecognised reason | Fail-closed: a future adapter or a legacy row is not waved through. |
 
 Everything else — our own `compliance_refusal:` / `compliance_dismissed` /
@@ -727,6 +846,9 @@ re-sent.
 - `vendor_not_active` — the invoice's vendor is not `active` (unverified, rejected,
   deactivated or merged away since the run was built); the run builder's refusal of
   the same name, through `services/payment_runs.inactive_vendor_statuses`.
+- `currency_unknown` — the invoice's currency was blanked since the run was built;
+  the run builder's refusal of the same name. Dispatch would refuse it anyway, so
+  booking a fresh attempt would only add noise.
 - `net_amount_changed` — a credit memo applied while the payment sat `failed`
   (`credit_memos.py` refuses only a `paid` or `done` invoice, and never looks at
   an existing payment) means the failed row's `amount` is no longer what the
@@ -737,6 +859,18 @@ re-sent.
   booked with no longer applies today (its deadline passed), or one now applies
   that it was not booked with (§ An accepted early-payment discount is paid).
   Same rule as `net_amount_changed`: never re-priced here.
+- `erp_bill_not_open:<state>` / `erp_bill_unverified` / `erp_bill_void_pending` /
+  `erp_bill_unlinked:<why>` — the live read of the
+  invoice's QuickBooks bill immediately before the rail (decisions §296): the
+  ERP shows it paid, part-paid or deleted (a blocking `payment_reconciliation`
+  is opened with it, so the retry keeps skipping until a person clears it), or
+  the read failed and the item was held rather than paid blind (the retry just
+  re-reads), or only our own write-back paid it and its QuickBooks void is still
+  pending, or the bill can never be read under the current connection
+  (`unlinked`: no document id, no company, or another company — an
+  `erp_reconciliation` names the way out: record it as paid outside FeohLedger,
+  or re-post). All refused before any rail call, so all are retry-safe. A NACHA
+  export and `POST /api/cards/generate` run the same read.
 - `invoice_locked` is retry-safe and needs no skip rule: it only means another
   request held the invoice row past the bound when dispatch tried (§ Bounded
   wait for the invoice lock), so the retry simply re-attempts it.
@@ -754,8 +888,9 @@ re-sent.
   a claim on its invoice.
 
 `retryable_failures` on the run detail counts only failures the endpoint will
-actually re-attempt, so the retry button can never offer an action that could
-only be skipped.
+actually re-attempt (`api/payments.count_retryable_failures`), and the
+endpoint's `payment_run_nothing_to_retry` refusal reads the same count, so the
+retry control can never offer an action that could only be skipped.
 
 **Idempotency** comes from the run claim: the row is locked and flipped to
 `executing` before anything is booked, so a double-click blocks on the lock and
@@ -850,6 +985,49 @@ the money already moved on that rail, and an ACH run would move it again.
 
 The exit is cancelling the card, which vacates the slot the index and this gate
 share.
+
+#### The ERP is a third rail: a live payment or card refuses the push
+
+A bill in the ERP can be paid there, so pushing an invoice FeohLedger is
+already paying would let it be paid twice. Staging a run (a `pending` payment,
+the invoice still `approved`), an `exported` NACHA run and a minted card all
+leave the invoice sendable, so the ERP push asks the same two predicates the
+rails refuse each other with — `live_payment_invoices` and
+`live_card_invoice_ids` — and refuses with `payment_blocks_erp_export`
+(`params.claim` = `payment` / `virtual_card`): 409 at `/complete`,
+`/send-to-erp` and `/retry-erp`, and again at `services/erp._call_erp` before
+any adapter, so a push queued before the run was staged is stopped too. A
+voided, failed or cancelled payment and a cancelled card release it. With an
+ERP the supported order is push first, then pay: a payment against a
+`posted_in_erp` invoice never meets this gate. See `erp-integration.md`
+§ An invoice FeohLedger is already paying refuses the push, and decisions §309.
+
+**The run and the push serialise on the invoice row.** `/send-to-erp` holds the
+invoice `FOR UPDATE` across its gate and its `approved → sending_to_erp`
+transition. The run builder used to read its invoices with a plain SELECT, so a
+run staged in that window saw `approved` and no live payment and booked a
+`pending` payment beside the push (its payment insert's `FOR KEY SHARE` only
+waited for the send to commit). It now locks the run's invoices
+`FOR NO KEY UPDATE`, in id order, under the bounded wait above
+(`payment_runs.lock_run_invoices`) before any check, and every check after is a
+fresh statement:
+
+- send first: the run waits, then sees `sending_to_erp` and 409s
+  `not approved for payment`;
+- run first: the send waits, then its gate sees the live payment and 409s
+  `payment_blocks_erp_export`.
+
+The ERP side needs no extra predicate in the run builder: an in-flight or
+finished push has already moved the invoice off `PAYABLE_INVOICE_STATUSES` in
+the transaction that passed its gate. The same lock serialises two runs over one
+invoice (the second is refused on the first's live payment, not left to the
+unique index) and a run with a card mint or a dispatch. A copilot replay that
+waited on the lock re-checks `plan_id` after it, so it still returns the first
+request's run instead of 409ing on that run's payments.
+
+**Tests:** `tests/test_erp_export_blocking_exceptions.py` (the concurrency
+cases drive a real `/send-to-erp` and `POST /api/payments/runs` in parallel and
+wait on `pg_stat_activity`, not a sleep).
 
 ### Voiding a settled payment reverses the discount it captured
 
@@ -949,7 +1127,14 @@ card** only where a retry can work.
 `_execute_single_payment` parks a payment at `status="pending_compliance"`
 in two cases: the invoice has no screenable vendor at all, or
 `services/compliance.check_payment_compliance` itself returns a `hold`
-verdict (sanctions/KYC review required). Both cases open a
+verdict (sanctions/KYC review required). A screen result an
+`vendor.sanctions.adjudicate` holder has adjudicated as a false positive
+(decisions §477) is not a hold: the live screen reads the SAME result on the
+SAME inputs as clear, and the ERP push and run-gate read
+(`payment_runs.VendorPayability.sanctions_hold`) lift the stored `match` /
+`review` hold while `vendors.screening_adjudication_id` is set. The sticky
+`payments_blocked` flag is never lifted by it, and a new hit or a material
+vendor edit holds again. Both cases open a
 `payment_compliance_hold` Exception (`exception_type`, severity `error`)
 scoped to the invoice — deduplicated on `(invoice_id,
 "payment_compliance_hold", "open")` so a retried/resumed execution never
@@ -1029,10 +1214,121 @@ overwrite the same field and says why. The void now leaves `completed_at`
 alone whenever it is already set, records the void instant as
 `details.voided_at` on the append-only `payment.voided` audit row (alongside
 `details.settled_at`), and still stamps a terminal timestamp for a payment that
-never settled (`pending` / `submitted` / `processing` / `pending_compliance`),
-which has no settlement time to protect.
+never settled (`pending` with no run / `submitted` / `processing`), which has
+no settlement time to protect. (A run's `pending` leg and `pending_compliance`
+are no longer voidable — § Only money that has left can be voided.)
 
 **Tests:** `tests/test_payment_terminal_timestamps.py`.
+
+### Only money that has left can be voided
+
+`POST /api/payments/{id}/void` reverses money that has left, or is leaving,
+the rail: `submitted`, `processing`, `completed`. Everything else has a
+purpose-built exit and is refused (409, `payment_controls.payment_void_refusal`):
+
+- `voided` / `cancelled` — already terminal; `failed` — it never settled;
+- `pending_compliance` — nothing reached the processor; **Release** or
+  **Dismiss** resolve the hold *and* its `payment_compliance_hold` exception,
+  which a void used to leave open beside a re-queued invoice;
+- `pending` **on a run leg** — a leg of a run that has not been sent. On a
+  draft run the exit is **Cancel run** (which releases every leg; there is no
+  per-leg removal from a draft run); on an exported (NACHA) run it is **Bank
+  rejected the file** or **Record run as paid**. A per-leg void used to put the
+  invoice back in the queue while the uploaded bank file could still pay it — a
+  second payment of the same invoice.
+
+A `pending` payment with **no run** (booked by `POST /api/payments`) stays
+voidable: nothing will ever send it, it holds the invoice's one live-payment
+slot, and the void is its only undo.
+
+The History tab offers Void exactly when the row's `void_refusal` is `null` —
+the same function, so the button and the endpoint cannot disagree
+(`docs/decisions.md` §305; `tests/test_payment_action_verdicts.py`). The row's
+**Accept settlement** works the same way (`accept_settlement_refusal`, from
+`payment_controls.settlement_accept_refusal` — see § Settlement verification).
+
+### A payment records the payee it paid, and a void flags a re-payment to anyone else
+
+Every payment records, at the step that releases its money, the payee it pays:
+`payee_vendor_id` (the invoice's vendor then), `payee_bank_fingerprint` (a keyed
+HMAC of that vendor's whole `bank_details`, `v2:<key id>:<hex>`, never a number) and
+`payee_recorded_at` (migration 0128, `services/payee_stamp.py`, decisions §383).
+The steps that stamp it are the ones that move money:
+
+- the rail or card dispatch (`_execute_single_payment`), from the same read the
+  order is built from, once every refusal and compliance hold has passed and
+  immediately before the processor or card call. A held or refused attempt
+  records no payee; each attempt re-stamps; and the stamp is restored with the
+  order after a database error (`_ORDER_FIELDS`);
+- the NACHA export (`GET /runs/{id}/nacha`), once the file is certain; a
+  regenerated file re-stamps, since the latest file is the one the customer is
+  told to upload (if an earlier file was uploaded too, the record names only the
+  latest file's payee);
+- a payment recorded as paid outside FeohLedger (`external_payment._complete`:
+  the single and run-level records, and an ERP-reported payment). An entry of an
+  `exported` file keeps the payee its file carried; a file the bank rejected
+  (`/nacha/void`) paid nobody, and its stamp is replaced.
+
+The fingerprint covers the whole blob because the bank-change dual control
+treats any change to it as a bank change, and a key allowlist would miss the
+next key that steers money. It is keyed with its own secret,
+`FEOH_PAYEE_FINGERPRINT_KEY`, and the tenant id is in its message, so it cannot
+be brute-forced from a routing number, and one account paid by two tenants does
+not fingerprint alike. It is not keyed by `FEOH_SECRET_KEY`, which rotates every
+90 days and would turn each older void into a false flag. Each fingerprint names
+the key that made it (an id derived from the key), and the void recomputes it
+under that key, current or retired (`FEOH_PAYEE_FINGERPRINT_PREVIOUS_KEYS`), so
+a rotation through the keyring flags nothing (`docs/secrets-rotation.md`
+§ `FEOH_PAYEE_FINGERPRINT_KEY`). A fingerprint that cannot be recomputed does not
+match, and flags: its key is in neither setting (replaced instead of rotated), or
+there is none because the key was empty when the payment was stamped. A deployed
+environment refuses to boot without the key, so the second is local dev only. A
+card payment is fingerprinted too, so a bank change after it flags its void:
+noise, in the fail-closed direction.
+
+A merge also records, on each duplicate it retires for the first time, where it
+went and who merged it (`vendors.merged_into_vendor_id` / `merged_by_user_id` /
+`merged_at`, same migration), in the merge's own transaction.
+
+`POST /payments/{id}/void` returns a scheduled or paid invoice to `approved`,
+then asks `payee_stamp.flag_repayment_payee_change`. A re-payment would pay
+whoever the invoice names now, and two things change that while an invoice is
+paid without flagging it: a **vendor merge** moves paid invoices to the
+canonical vendor (§379), and a **bank change** skips paid invoices (§286). The
+void reads the invoice's vendor `FOR SHARE`, so a bank-change approval racing it
+is seen by whichever of the two runs second.
+
+| The voided payment | The invoice now | Flag (`fraud_flag`, blocks the run and the ERP push) | Raisers (one flag each; none can clear their own) |
+|---|---|---|---|
+| stamped | another vendor | `payee_changed_since_paid` | every steward on the merge chain from the paid vendor to the current one |
+| stamped | same vendor, other bank fingerprint, or one that cannot be recomputed (no fingerprint, or its key in neither setting) | `payee_changed_since_paid` | every approver of a bank change since the stamp |
+| stamped | same vendor, same fingerprint | none | |
+| unstamped (paid before 0128) | a merge into its vendor since the payment was booked | `payee_unrecorded_after_merge` | the stewards of those merges |
+| unstamped | a bank change approved since the payment was booked | `vendor_bank_changed` (`services/vendor_bank_change.reflag_voided_invoice_for_bank_change`) | every approver of those changes |
+
+The merge chain follows each retired vendor's own record; a merge from before
+0128 is read from its `vendor.merged` audit row (the earliest one naming the
+vendor a duplicate, so a re-run never re-attributes it). When no person can be
+named (bank details cleared by an erasure, an old merge whose audit row has not
+landed in `lambda` mode) the raiser is `NULL`: the stamped flag still blocks,
+and anyone outside the invoice's implicated set may clear it. For an
+**unstamped** payment the merge evidence for a pre-0128 merge is that audit row
+alone, so in `lambda` mode a lost row means no flag; every merge since 0128 is
+on the vendor itself. The clearing rules are the payment-blocking set's
+(`exception_lifecycle.segregation_refusal`, decisions §169). Flags are
+de-duplicated by finding **and raiser**: an open Positive Pay or detector
+`fraud_flag` no longer absorbs a payee-change flag, and a second approver's
+change gets its own row rather than one its approver could clear.
+
+Nothing is backfilled: today's details are exactly what cannot stand in for the
+ones an old payment paid (§141). `payments.payee_vendor_id` is not a
+`vendor_id` FK and a merge never moves it.
+
+**Tests:** `tests/test_payment_payee_stamp.py`,
+`tests/test_payment_dispatch_db_error.py` (the stamp survives a post-processor
+rollback, and is absent when nothing was sent),
+`tests/test_erp_export_blocking_exceptions.py` (the unstamped bank-change
+re-flag), `tests/test_migration_0128_payee_and_merge_stamp.py`.
 
 ### Payment processor adapters
 
@@ -1077,11 +1373,14 @@ block above is Modern Treasury's set. **The secret keys — `api_key`,
 envelope-encrypted in `provider_credentials`, written only through the audited
 `PUT /api/organization/credentials/payments` and merged back for the adapter by
 `provider_credentials.provider_config` (`backend/docs/erp-integration.md`
-§ Where the credentials live has the mechanism). **`program_type` and `sandbox` are not
-read by any payment adapter** — they belong to the card and extraction
-families. Both appeared here until 2026-09-17 and had propagated into
-`docs/founder-runbooks/payment-rails-onboarding.md` as live settings. Modern
-Treasury selects sandbox by credential set, not by flag.
+§ Where the credentials live has the mechanism). **`program_type` is not read by
+any payment adapter** — it belongs to the card and extraction families. **`sandbox`
+picks the host** for Column, Increase, Dwolla and Checkeeper (default `true`);
+Modern Treasury and Stripe select sandbox by credential set, not by flag. A save
+that changes `provider` or `sandbox` (or removes a `providers[]` entry, or
+changes its `sandbox`) drops the sealed keys it strands, audited, so a key is
+never sent to a provider or environment it was not typed for
+(`provider_credentials.rail_secrets_to_drop`, decisions §464).
 
 `tests/test_payment_adapter_doc_drift.py` pins the Methods column of the table
 above to each adapter's `supported_methods`, so a rail added or dropped in code
@@ -1272,7 +1571,16 @@ audit row carries the evidence.**
 **Both exits are reachable in the app**, not only over the API. `/payments` →
 History renders what the rail settled beside what AP authorized (a `Settled …`
 sub-line under the amount — the hold was previously invisible), and offers an
-**Accept settlement** row action gated on `payment.execute`. Its confirm dialog
+**Accept settlement** row action exactly when the row's
+`accept_settlement_refusal` is `null`. That verdict is `payment.execute` then
+`payment_controls.settlement_accept_refusal`, the one gate
+`/settlement/accept` raises from: the payment is `completed`
+(`payment_settlement_not_completed`), the recorded settlement does NOT cover the
+invoice (`payment_settlement_covered` — an unreported figure reads covered, so a
+payment no rail reported on is never offered it), and the invoice is still held
+at `payment_scheduled` (`payment_settlement_not_held`). The row used to offer
+the action wherever any figure was reported, and the dialog then fetched the
+invoice to discover whether anything was held. Its confirm dialog
 shows both figures, requires the `reason`, states that accepting declares the
 shortfall final and releases the invoice to `paid`, and — because only the
 server can decide coverage — reads the invoice's own status first so an invoice
@@ -1417,8 +1725,11 @@ pnpm stripe:up     # stripe/stripe-mock on :12111
 pnpm stripe:down   # stop it
 ```
 
-`FEOH_STRIPE_API_BASE` (empty = live Stripe) repoints the adapter's API base; a
-per-config `api_base` overrides it. stripe-mock returns canned fixtures from
+`FEOH_STRIPE_API_BASE` (empty = live Stripe) repoints the adapter's API base. It
+is operator config only: an `api_base` key in the org's `settings.payments` block
+is ignored, because any tenant admin writes that block and the sealed secret key
+rides on every request — honouring it sent the key to whatever host the admin
+named. stripe-mock returns canned fixtures from
 Stripe's OpenAPI spec — it validates request shape + response parsing
 (`create_payment`, `get_payment_status`, `test_connection`), not stateful flows
 or real webhooks. The seam is locked by `backend/tests/test_stripe_api_base.py`
@@ -1597,6 +1908,14 @@ converted, which is precisely what `unconverted_count` exists to prevent
 `reporting_amount_for_row`, which requires both columns. Pinned by
 `tests/test_payment_queue_reporting_lock.py`, whose last case fails if the
 queue ever restates the rule inline again.
+
+**One schedule per invoice.** The page and the savings rollup both join
+`services/payment_schedules.latest_schedules()` — each invoice's current
+schedule row, by the same `LATEST_SCHEDULE_ORDER` the cash forecast and the
+discount engine read — never the `payment_schedules` table. Joined to the
+table, an invoice carrying two schedule rows was listed twice (pushing the next
+invoice off its page, while `total` still counted it once) and its discount was
+summed twice in `total_savings`.
 
 **The row and the rollup round the same way.** Both compute
 `invoice.amount * discount_percent / 100` from the same `PaymentSchedule` row,
@@ -1810,14 +2129,16 @@ exception row, no notification, no persisted marker.
 
 Two things changed:
 
-- **Every failed leg opens a de-duped `erp_reconciliation` exception** naming
-  the payment, the run, and the retry endpoint, so the strand lands in the queue
-  an AP manager already works. `erp_reconciliation` is the type
-  `api/erp_webhook` already raises for "the ERP and our ledger disagree and a
-  human must reconcile" — the same situation, so no new taxonomy entry. The
-  description is PII-free (identifiers, the failure's exception *class*, the
-  invoice's current status) — never the raw error message, which can embed
-  partial account data.
+- **Every failed leg opens a de-duped `erp_reconciliation` exception**, so the
+  strand lands in the queue an AP manager already works. `erp_reconciliation` is
+  the type `api/erp_webhook` already raises for "the ERP and our ledger disagree
+  and a human must reconcile" — the same situation, so no new taxonomy entry.
+  Its description is the catalogue sentence `exception.erp_sync_back_failed`
+  (what happened, and to use **Retry ERP sync** on the run in Payments); the
+  payment and run ids, the failure's exception *class* and the invoice's status
+  ride `erp_report` (`kind: payment_sync_back_failed`) — never the raw error
+  message, which can embed partial account data
+  ([invoice-warnings.md](invoice-warnings.md) § ERP reconciliation sentences).
 - **Each leg commits on its own.** The loop used to run every payment inside one
   transaction with a single commit at the end; a leg that failed with a DB error
   poisoned that transaction, so the final commit raised, the outer handler
@@ -1836,8 +2157,12 @@ money — it only reports money that already moved. 409 when the run has no
 settled payment to sync.
 
 **It is reachable in the app**, not only over the API: `/payments` → Runs
-carries a **Retry ERP sync** row action gated on `payment.execute` (hidden on a
-`draft` / `cancelled` run, which can hold no settled payment), whose confirm
+carries a **Retry ERP sync** row action offered exactly when the row's
+`actions.sync_erp` is `null` — `payment.execute` then
+`payment_controls.run_sync_erp_refusal`, the gate the endpoint raises from (409
+`payment_run_nothing_settled` when the run has no settled ACTIVE payment; the
+page used to restate "not `draft` / `cancelled`", which offered it on a `failed`
+or `executing` run that could only 409), whose confirm
 names the run and says it moves no money, and whose result renders the real
 returned counts — leading with `transitioned`, with an explicit "nothing to
 recover" state when it is zero.
@@ -1917,8 +2242,11 @@ On a record-only tenant every dispatching endpoint — `/runs/{id}/execute`,
 claimed: the run stays `draft`, nothing is dispatched. The refusal lives in
 `api/payments._require_payment_adapter`, the chokepoint every dispatcher already
 resolves its adapter through (`tests/test_payment_execution_mode.py` pins that
-each one does). `GET /api/payments/execution-mode` tells the SPA which controls
-to show.
+each one does). `GET /api/payments/execution-mode` tells the SPA and the mobile
+app's Pay tab which controls to show; both hide Execute unless the mode reads
+`processor`, failing closed while it is unknown, and both offer "Record as paid"
+(the row's `record_outside_refusal`, the run detail's `actions.record_outside`)
+in either mode (`mobile/docs/feature-status.md` § Payment queue + runs).
 
 ### Recording a payment made outside FeohLedger
 
@@ -1951,9 +2279,20 @@ Controls (all in `services/external_payment.py`):
 - A **live virtual card**, an **applied credit that no longer pairs**, or
   **another live payment** (dispatched, or held in a run) refuses — each is a
   double-pay risk or an amount we can't state. An invoice inside a draft run is
-  refused with `external_payment_in_run` and pointed at the run-level record.
+  refused with `external_payment_in_run` and pointed at the run-level record,
+  or, when a kept ERP split also stands, told to cancel the run first (below).
 - A `pending` standalone payment FeohLedger booked but **never dispatched** is
   completed in place rather than left holding the live-payment slot.
+- A **payment the ERP reported on several rails** refuses (409
+  `external_payment_erp_split`, `params.exception_id` = the row): the invoice
+  holds a live `paid_not_recorded` row whose kept breakdown stands
+  (`erp_status_sync.kept_split_stands`, the row's `erp_payment_split_stands`),
+  and this endpoint books one rail. Only that row's one-click books the split
+  (`external_payment.erp_split_refusal`, after the live-claim refusals and
+  before anything is written; the run-level record is refused the same way).
+  Without it the card part landed on the payer's 1099 (decisions §426). A kept
+  row whose breakdown does not stand (one rail, or parts that do not add up)
+  is still recorded here at the person's rail, and `_complete` closes it.
 - The **amount** is what the invoice owes — net of applied credit memos and any
   accepted early-pay discount at `paid_on`. A stated `amount` must equal it
   (422 `external_payment_amount_mismatch`); partial payments aren't supported.
@@ -1990,11 +2329,42 @@ at all (#566). Two gates are deliberately left out of the field: the
 payable-status and live-payment gates, which the queue's own base filter
 already is, and segregation of duties, which depends on who records — the
 endpoint's coded 403 is what tells the creator a colleague must record it.
+Nor is `external_payment_erp_split`: the queue's "Record as paid" books such a
+row through its one-click instead (below), so the action stays offered.
+
+**Over a kept ERP split the queue's dialog is the `/exceptions` one.** A queue
+row's `erp_reported_payment` carries the row's stated figure
+(`amount` / `amount_currency`), its kept `payment_parts` and `split_stands`
+(the same `kept_split_stands` verdict). The dialog shows the ERP's figure beside
+the amount owed and the split through the shared `ErpPaymentSplit` component.
+Where `split_stands` is true it shows no rail picker and posts
+`POST /api/exceptions/{exception_id}/record-erp-payment` with no `method`, so
+the split is booked and audited exactly as from `/exceptions` (decisions
+§413, §426). Anywhere else it posts this endpoint as before; should that be
+refused with `external_payment_erp_split` (the queue was read before the row
+kept its split), the dialog links to `/exceptions?id=<row>`.
+
+**An invoice held by a draft run AND a standing split must leave the run
+first.** The run-level record refuses it (`external_payment_erp_split`, only the
+row books the split) and the row's one-click refuses it too
+(`external_payment_in_run`, a run holds it). Each refusal therefore says the
+same thing: cancel the run first (a draft run gives up its invoices only by
+being cancelled), then record the invoice from its exception. Both carry
+`params.payment_run_id` and `params.exception_id`, and the browser renders the
+shared `refusal.externalPaymentErpSplitInRun` sentence from either code when
+both are present. The in-run refusal adds `exception_id` only for a person's
+record over a split that stands; with no such row it keeps `payment_run_id`
+alone and its own sentence, since recording the whole run is then a way out
+(decisions §426, round-13 amendment).
 `tests/test_payment_queue_blocked.py` POSTs every kind of row and compares the
 endpoint's answer to the field.
 
 Audit: `payment.recorded_outside` (source `user` / `erp`, amount, currency,
-method, reference, paid-on date — never bank data) plus the invoice's
+method, reference, paid-on date — never bank data; and, when the ERP stated
+which rails paid how much, `rail_breakdown`, `rail_breakdown_status` and
+`method_stated`, decisions §396; such a payment's `method` is NULL when several
+rails paid it, so NULL there means "not stated" or "several rails", and
+`rail_breakdown` tells them apart) plus the invoice's
 `invoice.payment_scheduled` and `invoice.paid_outside` /
 `invoice.paid_via_erp_report` transitions.
 
@@ -2003,8 +2373,11 @@ method, reference, paid-on date — never bank data) plus the invoice's
 `GET /api/payments/runs/{id}/nacha?effective_date=&sec_code=CCD|PPD[&regenerate=true]`
 writes a NACHA ACH credit file (`services/nacha.py`) for a run, for the customer
 to upload to its own bank — it is the originator under its own bank agreement.
-One batch, credits only (service class 220), CCD by default (PPD for a consumer
-payee), unbalanced (no offsetting debit), padded to whole blocks of ten.
+One batch, CCD by default (PPD for a consumer payee), padded to whole blocks of
+ten. By default the batch is credits only (service class 220) and the file is
+unbalanced (no offsetting debit) — what most ODFIs expect from a corporate
+originator. A bank that requires a **balanced** file gets one when the offset
+account is configured (below): see § Balanced files.
 
 Uploading the file is the money moving, so the export is treated as the
 dispatch step:
@@ -2019,11 +2392,19 @@ dispatch step:
   re-staging all refuse — so a second file, a cancel-and-restage, or a later
   switch to processor mode can't pay the same suppliers again. A second file for
   an `exported` run needs `regenerate=true` (else 409 `nacha_already_exported`)
+  — and `regenerate=true` on a run with no exported file is refused (409
+  `nacha_nothing_to_regenerate`) rather than quietly exporting a first one —
   and carries the next file-ID modifier (A, B, C… — counted on
   `payment_runs.nacha_export_count`, migration 0106), so the bank's
   duplicate-file check can tell them apart. If the bank rejected the file,
   `POST /runs/{id}/nacha/void {reason}` (`payment.execute`, audited
-  `payment_run.nacha_export_voided`) returns the run to `draft`.
+  `payment_run.nacha_export_voided`) returns the run to `draft` — **on a
+  record-only tenant only** (409 `nacha_void_requires_record_only`, decisions
+  §362). On a tenant switched to processor mode since the export, the released
+  run could be executed, or cancelled and restaged, and the rail would pay the
+  suppliers the bank's file already paid; refusing the void keeps the claim
+  that all three doors refuse. The exits there are recording the run as paid,
+  or an admin switching back to record-only to release it.
 - **Every dispatch-time check runs** — `payment_runs.dispatch_preflight`, the
   same function `/execute` calls before each payment: still payable, no
   payment-blocking exception raised since staging (a BEC bank-detail swap's
@@ -2031,7 +2412,12 @@ dispatch step:
   vendor still active, no live card, applied credits still pairing, and the
   staged amount still exactly what the invoice owes on the effective date.
   A failure refuses the file as `nacha_payment_not_payable` with the
-  dispatcher's reason code.
+  dispatcher's reason code. The live ERP-bill read (decisions §296) comes last,
+  once every local check (here and below) has passed, and reads the file's
+  bills **concurrently** — at most `FEOH_ERP_DISPATCH_CHECK_CONCURRENCY` (4) at
+  once, each within the read timeout — because the run and every invoice lock
+  are held across the reads (`erp_status_sync.erp_bill_dispatch_refusals`;
+  the database work around the reads stays sequential on the one session).
 - Maker-checker and CFO sign-off apply, as for `/execute`.
 - The originator comes from `settings.payments.nacha`
   `{company_name ≤16, company_id (10 chars, as the bank assigned it — usually
@@ -2046,7 +2432,96 @@ dispatch step:
   effective date must be a business day (bank holidays are not checked).
   Anything else refuses the whole file naming the invoice — never the bank data.
 - Each export writes `payment_run.nacha_exported` with counts, total, SEC code,
-  effective date, file-ID modifier and the file's SHA-256 — not the file.
+  effective date, file-ID modifier, whether it is `balanced`, and the file's
+  SHA-256 — not the file.
+- **The run-level refusals are one gate**, `payment_controls.run_nacha_export_refusal`,
+  in order: the run's state (`nacha_already_exported`,
+  `nacha_nothing_to_regenerate`, `nacha_run_not_exportable`), record-only,
+  configured, maker-checker (`payment_run_segregation`, `params.step:
+  "nacha_export"`), CFO sign-off, something pending (`nacha_nothing_to_export`). Every
+  one answers with the coded detail. `GET /runs/{id}` ships the same answers as
+  `actions.nacha_export` / `actions.nacha_regenerate` (and the void's
+  `payment_controls.run_nacha_void_refusal` as `actions.nacha_void`), which the
+  run dialog's bank-file panel reads. The per-payment checks above stay in the
+  endpoint, so a `null` verdict can still meet a refusal that names an invoice.
+
+#### Balanced files — the offset account
+
+Three optional keys on `settings.payments.nacha` ask for a balanced file:
+`offset_routing` (the ABA of the customer's own account, checksum-validated),
+`offset_account` (its account number, ≤ 17 alphanumerics after spaces and
+dashes are dropped) and `offset_account_type` (`checking` | `savings`). All
+three or none: any one present makes the other two required, and the save 422s
+naming the missing fields (`nacha.originator_problems`, field names only).
+
+With them, the batch header and batch control carry **service class 200**
+(mixed), and after the credits the batch ends with an **offsetting debit** to
+that account for the batch total — transaction code **27** (checking) or **37**
+(savings), individual ID `OFFSET`, the company name as the receiver, the next
+trace number. One entry's amount field tops out at $99,999,999.99, so a larger
+batch total is split across as many debits as it needs. The controls count
+them like any entry: entry/addenda count and entry hash (its routing's first
+eight digits) include the offset, and total debits equal total credits in both
+the batch and file control records. Without the keys the output is
+byte-identical to the credits-only file (pinned by
+`tests/test_nacha.py::test_the_unbalanced_file_is_byte_identical`).
+
+The offset account number is the customer's own banking data (decisions
+§432). It is stored in the settings JSONB like a vendor's `bank_details`, not
+sealed with the provider credentials (it authenticates nothing), but it is
+**write-only on the way out**: `GET /api/organization` shows it as a last-4
+mask (`****6789`) to admins (non-admins never see the payments block), and a
+save that sends it blank or sends the mask back keeps the stored number
+(`nacha.carry_offset_account`), but only while the save names the same
+`offset_routing` (whitespace aside) and `offset_account_type`: a number belongs
+to its bank, so a save that changes either without re-entering the number is
+refused 422 (`payments.nacha.offset_account must be re-entered: offset_routing
+or offset_account_type changed.`, the field named, never the number) and
+nothing is written (round-13 amendment to §432). A save that clears the
+routing and type clears it too. It never enters a log line, an error body or an audit row: the
+settings audit (`organization.provider_config_updated`) names the changed keys
+under `nacha_changed`, never a value.
+
+**Verify before upload** — `POST /api/payments/runs/{id}/nacha/verify`
+(`payment.execute`, decisions §362). The export reads each bill when it builds
+the file, but the money moves when a person uploads it, possibly days later.
+Verify re-reads the ERP bill of every payment still `pending` in an `exported`
+run, under the run and invoice locks, concurrently as above:
+
+- every bill still open (or none posted to an ERP that reports payments back,
+  `erp_checked: false`) → `result: "verified"`, nothing changes;
+- a bill no longer open → that payment is taken out: `failed` with
+  `erp_bill_not_open:<state>` (what the rail dispatcher records for the same
+  verdict) and the blocking `payment_reconciliation` opened → `result:
+  "superseded"`: the downloaded file must not be uploaded. With payments
+  left the run stays `exported` and `regenerate=true` writes a file of only
+  those (next modifier); with none left the run is `cancelled`. The claim is
+  never released, so verify is available on a processor tenant too;
+- a read that fails → the payment is listed under `held` and left in, `result:
+  "held"` when nothing was taken out: verify again.
+
+Gate: `payment_controls.run_nacha_verify_refusal` (`nacha_verify_not_exported`,
+`nacha_nothing_to_verify`), shipped as `actions.nacha_verify`. No maker-checker
+or CFO gate — it only takes money out of the file. Idempotent: a payment taken
+out is no longer `pending`, so a second verify reads only what is left; the
+exception is de-duplicated. Each call audits `payment_run.nacha_verified`
+(result, counts, ids and reason codes, the file-ID modifier checked), and each
+payment taken out `payment.failed` (`source: "nacha_verify"`). The run dialog's
+bank-file panel offers **Verify before upload** from the verdict and keeps the
+result on screen. Not checked again: the local facts `dispatch_preflight` read
+at export — they cannot change the file already on disk, only a bill paid
+elsewhere makes it pay twice.
+
+**Where the panel applies** — `GET /runs/{id}`'s `bank_file_applies`
+(`payment_controls.run_bank_file_applies`, decisions §382): `true` on every run
+of a record-only tenant, and on a processor tenant only while the run's stored
+status is `exported` (a file exported before the switch). The dialog renders
+the panel from that and its controls from their own verdicts, never from the
+tenant's mode. On such a switched run Verify stays allowed; Download is hidden
+(`nacha_already_exported`); Regenerate (`nacha_requires_record_only`) and "Bank
+rejected the file" (`nacha_void_requires_record_only`) render disabled beside
+those refusals' sentences, so the reader learns why the run cannot be released.
+A processor tenant's draft has no file and gets no panel.
 
 Once the bank has taken the file, `POST /api/payments/runs/{id}/record-outside`
 `{reference, paid_on}` records every pending payment of the `exported` (or
@@ -2058,7 +2533,12 @@ leaves the process at once and a rollback can't recall it), runs the
 per-invoice gates, and refuses `external_payment_amount_changed` if what an
 invoice owes on `paid_on` is no longer the staged figure — booking the staged
 amount over a credit applied since would record both. One refusal refuses the
-whole run, naming the invoice. Locks are taken run → invoices → payments, the
+whole run, naming the invoice. The run-level refusals (status
+`payment_run_not_recordable`, maker-checker with `params.step:
+"record_outside"`, CFO sign-off, `payment_run_nothing_to_record`) are
+`payment_controls.run_record_outside_refusal`, which `GET /runs/{id}` ships as
+`actions.record_outside` for the run dialog's **Record run as paid**; the
+per-invoice ones are not in it. Locks are taken run → invoices → payments, the
 same invoice-before-payment order as the single record.
 
 ### The ERP reports an invoice paid that FeohLedger never paid
@@ -2075,12 +2555,110 @@ still holds its own claim on paying the invoice — a live payment, a draft or
 exported run, a live card (`erp_webhook.DOUBLE_PAY_REFUSALS`) — that claim
 proceeding would pay the supplier twice, so the flag is the **payment-blocking**
 `payment_reconciliation`, which `dispatch_preflight` refuses on; any other
-refusal opens the non-blocking `erp_reconciliation`. Both name the refusal code.
+refusal opens the non-blocking `erp_reconciliation`. Both carry a sentence for
+an AP user (what stopped it, what to do; no API path) and keep the payment in
+`exceptions.erp_report` (`kind: "paid_not_recorded"`: rail, reference, paid-on
+date and whether the ERP stated it, document and event ids, refusal code). A
+later report while the row is open refreshes those facts (never replacing a
+stated date or a document reference with less), and an invoice holds at most
+one live such row. When the ERP later reports the bill open, part-paid, deleted
+or voided, the row's payment is **withdrawn** (`kind: "paid_withdrawn"`): it
+stays open for a person but is never recorded.
+
+**Recording it later — never around the gates (decisions §319).**
+
+- *When the blocker clears.* Resolving or dismissing a payment-blocking
+  exception on the invoice (`exception_lifecycle.record_decision`, every door)
+  re-attempts a live, non-blocking `paid_not_recorded` row through
+  `erp_status_sync.retry_erp_reported_payments` → `record_erp_reported_payment`,
+  in the same transaction and with the same refusals. A refusal refreshes the
+  row's code and sentence; a double-pay refusal opens the blocking
+  `payment_reconciliation` as a first report would. The payment is dated from
+  the report, not from the clear. Escalating records nothing.
+- *In one click.* `POST /api/exceptions/{id}/record-erp-payment`
+  `{method, reference, paid_on, amount?}` (`payment.record_external`) records
+  the payment as a user record and resolves the row as the caller, in one
+  transaction. Every refusal comes before anything is written or audited (the
+  record runs first, with this row not counted as a blocker), so a refusal
+  leaves the row open and ships no audit row even in `lambda` audit mode. A blocking row (the double-pay
+  refusals) is only recorded this way, because it refuses `record-outside` on
+  itself; the caller then also needs the exception queue's role and must pass
+  its segregation rule. The recorder's segregation rule always applies.
+  `GET /api/exceptions` (and the detail) report the caller's verdict as
+  `record_erp_payment_refusal`. The record books the figure the row states
+  (`erp_report.amount` / `amount_currency`), and its kept breakdown
+  (`payment_parts`) when that adds up; the dialog shows both beside the
+  invoice's own amount. `method` may be omitted only where the row's
+  `erp_payment_split_stands` is true (the breakdown adds up exactly and spans
+  several rails, so it is the record whatever rail is named; the dialog shows
+  the split read only and sends none, and the audit's `method_stated` is
+  null). Anywhere else an omitted rail is 422 `erp_payment_method_required`,
+  since the person's rail is then the record (decisions §396, §413). The 201
+  body is the `Payment`, whose `rail_breakdown` (each part's rail or null and
+  amount) explains a split payment's `method: null`.
+- *Any other record.* Whichever door records the invoice paid, `_complete`
+  resolves its live `paid_not_recorded` rows (`via: payment_recorded`). A row
+  whose kept split stands is the exception: a person's record by any other
+  door is refused (`external_payment_erp_split`), so its split is only ever
+  booked by the one-click (decisions §426).
 Segregation of duties doesn't apply — there is no human actor. The payment is
-dated the day the report arrives, not the ERP's own payment date (the webhook
-carries none). `payment_erp_sync` skips `provider = "external"` payments, so a
-payment the customer made in its own ERP is never pushed back to it as a bill
-payment.
+dated by the ERP's own payment date and classified by its rail when the report
+states them — the generic webhook's optional `paid_on` / `payment_method`, or
+the paying BillPayment's `TxnDate` / `PayType` for QuickBooks (`CreditCard` →
+the `card` rail, off the payer's 1099) — validated, and falling back to the
+arrival date and NULL (reportable) only when absent (decisions §295).
+`payment_erp_sync` skips `provider = "external"` payments, so a payment the
+customer made in its own ERP is never pushed back to it as a bill payment.
+
+### QuickBooks: a bill paid there leaves the queue; a payment made here is written there
+
+Decisions §295 (`erp-integration.md` § QuickBooks status sync-back and payment
+write-back). With `FEOH_ERP_STATUS_SYNC_ENABLED` on, a QuickBooks push leaves
+the invoice payable at `posted_in_erp`. A bill then paid in QuickBooks reaches
+the path above and the invoice moves to `paid`, out of every run. A bill paid in
+QuickBooks while a FeohLedger payment is scheduled, part-paid there, or deleted
+there while payable here opens the payment-blocking `payment_reconciliation`,
+which the run builder and `dispatch_preflight` refuse on.
+
+The other direction: once `payment_erp_sync` moves a settled payment's invoice
+to `paid`, the payment is written back as a QuickBooks BillPayment against the
+bill (`services/erp_payment_writeback`) — after the commit, idempotent on the
+payment id, from the org's mapped pay-from account. A refusal never undoes the
+transition; it is audited (`payment.erp_post_failed`, coded) and flagged
+(`erp_reconciliation`), and `POST /api/payments/runs/{id}/sync-erp` retries it.
+A discount or credit taken here leaves the bill partly open in QuickBooks, which
+is flagged for the bookkeeper. An accepted short settlement
+(`/settlement/accept`) writes back what was settled. Voiding a settled payment
+voids its BillPayment; the intent is recorded in the void's own transaction
+(`erp_payment_voids_pending`) so the status-sync sweep finishes it if the
+process dies first. Voiding a payment the ERP REPORTED opens the blocking
+`payment_reconciliation` in the same transaction: the invoice is `approved`
+again while QuickBooks may still show the bill paid, and nothing about that
+bill would ever be reported again. A bill settled in QuickBooks by a vendor
+credit is never booked as a cash payment; it is flagged (blocking).
+
+### Xero: the same, matched by bill id and recorded at Xero's amount
+
+Decisions §386 (`erp-integration.md` § Xero status sync-back and payment
+write-back). Everything above holds for a Xero push, with three differences.
+The status-sync sweep is Xero's only automatic channel (no webhook here), and
+an admin can run its pass for the tenant on request (`POST
+/api/organization/erp/oauth/status-sync`). A bill paid wholly in cash in Xero is
+recorded at **the cash Xero shows**, not at what FeohLedger reckons is owed:
+when the two differ (a credit memo or an early-payment discount applied only
+here, a total changed in Xero) the record is refused `amount_mismatch`, and
+the payment-blocking `paid_not_recorded` exception keeps Xero's amount for a
+person to settle; its one-click record books that amount or nothing.
+And a payment written back is a Xero Payment from the mapped account at the
+exact amount that reached the supplier. Xero payments carry no discount, so an
+early-payment discount taken here leaves the bill open by the discount, flagged
+for the bookkeeper with the discount in the flag's `erp_report`; no credit note
+is created on their behalf.
+
+The new `card` rail (`schemas/payment.PaymentMethod.card`) is a company card used
+OUTSIDE FeohLedger's card programme: recordable as paid outside, reported by
+the ERP, excluded from the 1099 like `virtual_card`, and refused on a payment
+FeohLedger would dispatch (`PaymentCreate`).
 
 ### Nothing else moves money on a record-only tenant
 
@@ -2109,7 +2687,7 @@ minted virtual card is spendable, so it is a payment by another door.
 | `GET` | `/api/payments/queue` | List invoices ready for payment — paginated (`page` / `page_size`, default 20). Response carries the whole-set `total` / `selectable_total` / `blocked_total` / `by_currency` + per-row `blocked` / `blocked_reason` / `required_method` — the verdict of `payment_runs.run_refusal_reasons`, the SAME predicate set the run builder enforces. See § The payment queue is paginated and § Financial-integrity exception gate → The queue reports every refusal the run builder enforces. |
 | `GET` | `/api/payments/queue/ids` | "Select all N matching" resolver — `{ids, total, truncated, currency, by_currency}` for the whole selectable set, capped at 5000. Same RBAC as `/queue`. |
 | `GET` | `/api/payments/summary` | KPIs: total paid, pending, queue count, rebates — every money figure in the org's reporting currency, with `unconverted_payment_count` / `excluded_rebate_count` reporting what each had to leave out. `CardRebate` is a **tenant** table (`decisions.md` §57), so the rebate figure is read from the tenant session and joins `virtual_cards` for its currency + entity; there is no `control_db` dependency and no try/except fallback — a DB failure is a 500, not a confident `0`. See § The payments KPIs are denominated, not just summed. |
-| `POST` | `/api/payments/{id}/void` | Void a pending/completed payment. Reverses a `virtual_card` payment's card at the provider too, and reports whether it managed to via `void_card_outcome` + `void_card_disposition` — see § Voiding a card payment cancels the card. |
+| `POST` | `/api/payments/{id}/void` | Void a `submitted` / `processing` / `completed` payment, or a standalone `pending` one (no run) — `payment_controls.payment_void_refusal`, the gate the History row's `void_refusal` is read from, refuses everything else (§ Only money that has left can be voided). Reverses a `virtual_card` payment's card at the provider too, and reports whether it managed to via `void_card_outcome` + `void_card_disposition` — see § Voiding a card payment cancels the card. |
 | `POST` | `/api/payments/{id}/void/retry-card-cancel` | Re-attempt ONLY the card close for an already-`voided` card payment, when the void's best-effort leg left the card live. `payment.void`-gated, idempotent, audited `payment.void_card_cancel_retried`; moves no money and re-asks no rail. 409 unless the payment is `voided` **and** `virtual_card`. See § The outcome is on the response, and so is the remedy. |
 | `POST` | `/api/payments/{id}/compliance/release` | Re-run compliance-then-adapter for a payment stuck `pending_compliance`. `payment.execute`-gated, 409 outside that status. See § Sanctions / compliance hold resolution. |
 | `POST` | `/api/payments/{id}/compliance/dismiss` | Give up on a payment stuck `pending_compliance` — flips it to `failed` with a required `{reason}`, never reaches the adapter. `payment.void`-gated, 409 outside that status. See § Sanctions / compliance hold resolution. |
@@ -2118,7 +2696,8 @@ minted virtual card is spendable, so it is a payment by another door.
 | `POST` | `/api/payments/record-outside` | Record one invoice as paid outside FeohLedger (`payment.record_external`). 201 new / 200 idempotent replay. See § Recording a payment made outside FeohLedger. |
 | `POST` | `/api/payments/runs/{id}/record-outside` | Record a whole `exported` (or `draft`) run as paid through the customer's bank (`payment.record_external`). All-or-nothing; maker-checker + CFO sign-off; refuses a changed amount. |
 | `GET` | `/api/payments/runs/{id}/nacha` | NACHA ACH credit file for a run (`payment.execute`, record-only tenants only). Claims the run (`draft → exported`); a second file needs `regenerate=true`. Runs `dispatch_preflight`. Audited `payment_run.nacha_exported`. See § The bank file. |
-| `POST` | `/api/payments/runs/{id}/nacha/void` | The bank rejected the file: `exported → draft`, required `{reason}`, `payment.execute`, audited `payment_run.nacha_export_voided`. |
+| `POST` | `/api/payments/runs/{id}/nacha/void` | The bank rejected the file: `exported → draft`, required `{reason}`, `payment.execute`, record-only tenants only (`nacha_void_requires_record_only`, §362), audited `payment_run.nacha_export_voided`. |
+| `POST` | `/api/payments/runs/{id}/nacha/verify` | Verify before upload: re-read the file's ERP bills; a bill no longer open is taken out of the run (`failed`, blocking `payment_reconciliation`), the run stays `exported` (or `cancelled` with nothing left). `payment.execute`, idempotent, audited `payment_run.nacha_verified`. See § The bank file. |
 
 **Query parameters for `GET /api/payments`:**
 
@@ -2172,7 +2751,8 @@ invoices
   |       due_date, discount_date, discount_percent, payment_terms
   |
   |-- payments (invoice_id FK)
-          amount, method, status, reference
+          amount, method, status, reference,
+          payee_vendor_id, payee_bank_fingerprint, payee_recorded_at
           |-- payment_runs (payment_run_id FK)
                   status, total_amount, initiated_by, executed_at
 ```
@@ -2377,7 +2957,7 @@ section) and `tests/test_payment_create_cfo_gate.py`.
 
 Independently of the CFO threshold, `create_payment_run` refuses any invoice
 that still carries an **unresolved** (`open`/`escalated`) exception of a class
-listed in `payments.PAYMENT_BLOCKING_EXCEPTION_TYPES`. This gate (along with
+listed in `payment_gates.PAYMENT_BLOCKING_EXCEPTION_TYPES`. This gate (along with
 the payable-status check, credit-memo netting, and the CFO-threshold
 computation above) lives in `services/payment_runs.py::create_payment_run_for_invoices`
 — `POST /api/payments/runs` and the AI Cash-Flow Copilot's
@@ -2453,6 +3033,7 @@ types already did.
 |---------|-------------|--------------|
 | an unresolved (`open`/`escalated`) payment-blocking exception | the exception **type** (`duplicate` / `fraud_flag` / `line_total_mismatch` / `payment_reconciliation` / `quality_hold` / `po_mismatch`) | `blocked: true` |
 | the invoice's vendor is not `active` — unverified, inactive or rejected (`payment_runs.inactive_vendor_statuses`; `vendor-management.md` § Vendor Lifecycle). Refused on every rail, so it outranks the card-rail pin. `POST /api/payments` 409s; dispatch fails a payment whose vendor stopped being active after booking as `vendor_not_active:<status>`, before the processor call and retry-safe; `/retry-failed` skips it | `vendor_not_active` | `blocked: true` |
+| the invoice records no currency — `invoices.currency` NULL, the one spelling of unknown since migration 0136 (decisions §473), or a legacy blank, whitespace-only or malformed value written before it; `payment_runs.payable_currency_code` → `None` for all of them, and the invoice PATCH refuses a blank or `null` with the coded 422 `invoice_currency_required` (§460). Refused on every rail, so it outranks the card-rail pin. Never read as USD (decisions §453 and the round-16 entry after it): the builder's 409 is prefixed `currency_unknown:`, a blank is left out of the mixed-currency 422 (it is no currency, not a second one), `POST /api/payments` 409s the same way, `POST /api/payments/corridor-quotes` refuses to price it, and `card_issuance.issue_card_for_invoice` refuses to mint a card for it before the provider call (`POST /api/cards/generate` refuses it first by name, `card_skip_currency_unknown`). Dispatch (`dispatch_preflight`) fails a payment whose invoice was blanked after booking as `currency_unknown`, before the processor call and retry-safe, so the order is never sent in a currency nobody recorded; `/retry-failed` skips it | `currency_unknown` | `blocked: true` |
 | an applied credit memo's vendor or currency no longer matches the invoice (a background re-extraction rewrote it after the apply) — netting it would credit the wrong supplier or subtract across currencies (`services/applied_credit_integrity`, decisions §214). Checked before `fully_credited`, whose net is computed from that same credit. `POST /api/payments` refuses it with a 409, and dispatch fails a payment booked before the change as `applied_credit_mismatch:<vendor\|currency>`, before the processor call and retry-safe. `/retry-failed` skips it. | `applied_credit_mismatch` | `blocked: true` |
 | applied credit memos cover the whole invoice — a `$0` payment a real rail rejects as `failed` | `fully_credited` | `blocked: true` |
 | a live virtual card already claims the invoice (`POST /api/cards/generate` mints one with no `Payment` row behind it) | `live_virtual_card` | `blocked: false`, `required_method: "virtual_card"` |
@@ -2466,7 +3047,9 @@ SELECTION rather than of any one invoice.
 
 **A live payment is excluded, not marked.** `_queue_base_where()` drops any
 invoice with a **live** payment — `Payment.status NOT IN
-LIVE_PAYMENT_TERMINAL_STATUSES`, the SAME definition the builder's
+LIVE_PAYMENT_TERMINAL_STATUSES` (defined once in `models/payment`, where it
+also builds the `uq_payments_one_live_per_invoice` predicate), the SAME
+definition the builder's
 `live_payment_invoices` guard uses. It used to exclude only
 `Payment.status == "completed"`, so an invoice with a `submitted` /
 `processing` / `pending` payment — every real rail, ACH settles in 1-3 days —
@@ -2496,6 +3079,8 @@ and clear.
 | `blocked_reason` | the stable, PII-free reason code — set for a `required_method` row too, so the UI can say WHY the rail is pinned |
 | `required_method` | the one rail this invoice is still payable on, or `null` |
 | `record_outside_refusal` | a different question: the code `POST /api/payments/record-outside` would refuse this row with, or `null` — see § Recording a payment made outside FeohLedger |
+| `blocking_exception` | `{id, exception_type, clear_refusal}` of the open payment-blocking exception behind the row (the type `blocked_reason` names), or `null`. `clear_refusal` is `exception_lifecycle.segregation_refusal` for THIS caller resolving it (`segregation_implicated` / `segregation_raiser` / `segregation_approver`, decisions §420), so the page can say someone else must clear it (decisions §319) |
+| `erp_reported_payment` | `{exception_id, erp_name, method, reference, paid_on, amount, amount_currency, payment_parts, split_stands}` from the newest live `paid_not_recorded` exception on the invoice, or `null` — what "Record as paid" pre-fills and shows; `split_stands` true sends the record through that exception's one-click (decisions §426) |
 | `selectable_total` | rows "select all N matching" resolves (`/queue/ids`) — excludes blocked AND rail-pinned rows |
 | `blocked_total` | rows whose checkbox is disabled, i.e. exactly the `blocked` ones |
 

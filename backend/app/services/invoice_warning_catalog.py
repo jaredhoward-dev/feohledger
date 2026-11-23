@@ -49,6 +49,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
+from app.utils.currency_code import iso_currency_or_none
+
 #: What a placeholder holds, which is what the client needs to format it.
 #:
 #: ``money``    exact decimal digits; formatted with the warning's ``currency``
@@ -60,9 +62,12 @@ from typing import Literal
 #: ``text``     opaque — an identifier, a name, a sentence we cannot key
 ParamKind = Literal["text", "currency", "money", "number", "percent", "count", "date"]
 
-#: ISO 4217 fallback, matching `frontend/src/lib/utils/money.ts::DEFAULT_CURRENCY`
-#: and the `invoice.currency or "USD"` reads already in `invoice_warnings`.
-DEFAULT_CURRENCY = "USD"
+#: What a ``currency`` param carries when the invoice records no currency
+#: (NULL, blank or malformed — decisions §473): the empty string, which both
+#: clients' money formatters already render as bare digits with no symbol.
+#: Never a borrowed code: naming USD for an amount nobody recorded a currency
+#: for is the substitution §160/§196 forbid.
+UNKNOWN_CURRENCY = ""
 
 
 @dataclass(frozen=True)
@@ -185,14 +190,14 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
         "ai_reading_paused",
         "AI reading is paused: this month's "
         "{included, plural, one {# AI-read invoice is} other {# AI-read invoices are}} "
-        "used. Enter the details manually, or upgrade your plan on the Billing page.",
+        "used. Enter the details manually, or upgrade your plan under Settings → Subscription.",
         {"included": "count"},
     ),
     WarningSpec(
         "ai_spend_cap_reached",
         "ai_reading_paused",
         "AI reading is paused: this month's AI spending cap is reached. Enter the "
-        "details manually, or raise the cap on the Billing page.",
+        "details manually, or raise the cap under Settings → Subscription.",
         {},
     ),
     WarningSpec("unverified_vendor", "unverified_vendor", "Vendor is unverified", {}),
@@ -305,6 +310,40 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
     # kind would format it with the invoice's code and assert the PO is in it.
     # `poTotal` is a `number` for the reason the self-correction figures below
     # are (decisions §197).
+    # Cumulative: the OTHER live invoices citing the PO plus this one bill
+    # past its total (`invoice_warnings._refresh_po_overbilling`, decisions
+    # §469). Its own type so the modal lists it beside the other
+    # findings rather than leaving it to the PO-match panel's issues.
+    WarningSpec(
+        "po_billed_beyond_total",
+        "po_overbilled",
+        "Other invoices already bill {billedAmount} {currency} against PO {poNumber}, "
+        "whose total is {poTotal} {currency} — this invoice takes it past that total",
+        {
+            "billedAmount": "money",
+            "poNumber": "text",
+            "poTotal": "money",
+            "currency": "currency",
+        },
+    ),
+    # Cumulative, receipt leg: the same siblings plus this invoice bill past
+    # the received slice of the PO (`po_total × received / ordered`), though
+    # each fits it alone (decisions §470). Same type, so it stops
+    # every unattended approval as the total leg does; past approval it is
+    # also the sentence of the payment-blocking `po_mismatch` it raises.
+    # `totalBilled` includes this invoice: received is never part of billed.
+    WarningSpec(
+        "po_billed_beyond_receipt",
+        "po_overbilled",
+        "Invoices on PO {poNumber} bill {totalBilled} {currency}, this one included; "
+        "goods worth {receivedValue} {currency} have been received",
+        {
+            "totalBilled": "money",
+            "poNumber": "text",
+            "receivedValue": "money",
+            "currency": "currency",
+        },
+    ),
     WarningSpec(
         "po_amount_variance_po_currency_unknown",
         "po_mismatch",
@@ -327,6 +366,44 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
         "Invoice is in {invoiceCurrency} but PO {poNumber} is in {poCurrency} — "
         "the amounts were not compared",
         {"invoiceCurrency": "text", "poNumber": "text", "poCurrency": "text"},
+    ),
+    # The same finding when the invoice's own code is malformed, which only a
+    # multi-PO split whose legs disagree with each other can reach (decisions
+    # §445): neither the invoice nor any one PO has a code to print, so the
+    # sentence names every code the legs record. `poCurrencies` is `text` like
+    # the two codes above.
+    WarningSpec(
+        "po_currency_mismatch_invoice_currency_unknown",
+        "po_mismatch",
+        "The invoice records no valid currency and the POs behind {poNumber} are in "
+        "different currencies ({poCurrencies}) — the amounts were not compared",
+        {"poNumber": "text", "poCurrencies": "text"},
+    ),
+    # The PO was cancelled (or voided): it authorizes nothing, so the invoice
+    # was not matched against it.
+    WarningSpec(
+        "po_cancelled",
+        "po_mismatch",
+        "PO {poNumber} is cancelled — the invoice was not matched against it",
+        {"poNumber": "text"},
+    ),
+    # The ERP has not approved or issued the PO yet (decisions §394): it
+    # authorizes nothing, so the invoice was not matched against it.
+    WarningSpec(
+        "po_not_issued",
+        "po_mismatch",
+        "PO {poNumber} is not approved in the ERP yet — the invoice was not matched against it",
+        {"poNumber": "text"},
+    ),
+    # The PO's last ERP sync could not state its total exactly, so the total on
+    # record is not compared against (decisions §323). No figure is printed:
+    # the stale one is precisely what must not be presented as the PO's.
+    WarningSpec(
+        "po_total_unverifiable",
+        "po_mismatch",
+        "The total of PO {poNumber} could not be confirmed from the ERP on its last sync — "
+        "the amounts were not compared",
+        {"poNumber": "text"},
     ),
     WarningSpec(
         "po_partial_receipt",
@@ -470,6 +547,26 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
             "currency": "currency",
         },
     ),
+    # The invoice and the contract are in different currencies, or the invoice
+    # records none, so the cumulative spend was not measured against the limit
+    # (decisions §472): no rate is guessed to make the figures
+    # comparable. The codes are the finding, so both are `text`, as in
+    # `po_currency_mismatch`. Severity follows `not_to_exceed`, as the
+    # spend-limit codes' does.
+    WarningSpec(
+        "contract_currency_mismatch",
+        "contract_noncompliant",
+        "Invoice is in {invoiceCurrency} but contract {contractNumber} is in "
+        "{contractCurrency} — its spend limit was not checked",
+        {"invoiceCurrency": "text", "contractNumber": "text", "contractCurrency": "text"},
+    ),
+    WarningSpec(
+        "contract_currency_mismatch_invoice_currency_unknown",
+        "contract_noncompliant",
+        "The invoice records no valid currency, so the spend limit in "
+        "{contractCurrency} of contract {contractNumber} was not checked",
+        {"contractNumber": "text", "contractCurrency": "text"},
+    ),
     WarningSpec(
         "contract_gl_not_allowed",
         "contract_noncompliant",
@@ -509,6 +606,24 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
         "Line items total ({lineItemsTotal}) doesn't match invoice amount ({amount}).",
         {"lineItemsTotal": "number", "amount": "number"},
     ),
+    # The document contradicts itself about its currency, so `_apply_extraction`
+    # left the header money unread (`decisions.md` §308). The codes are `text`,
+    # not `currency`: a `currency` param only labels a `money` figure beside it
+    # and never reaches the sentence, and here the codes ARE the sentence.
+    WarningSpec(
+        "self_correction_currency_conflict",
+        "extraction_self_correction",
+        "Amounts are printed in {printedCurrency}, but the invoice currency reads "
+        "{fieldCurrency}. The amounts were left blank — enter them from the document.",
+        {"printedCurrency": "text", "fieldCurrency": "text"},
+    ),
+    WarningSpec(
+        "self_correction_currency_mixed",
+        "extraction_self_correction",
+        "Amounts are printed in more than one currency ({printedCurrencies}). "
+        "The amounts were left blank — enter them from the document.",
+        {"printedCurrencies": "text"},
+    ),
     WarningSpec(
         "self_correction_line_item_math",
         "extraction_self_correction",
@@ -529,7 +644,7 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
     WarningSpec(
         "gl_codes_not_in_chart",
         "gl_account_invalid",
-        "AI suggested GL code(s) not in active chart: {codes}",
+        "GL code(s) not in the active chart of accounts, left uncoded: {codes}",
         {"codes": "text"},
     ),
     WarningSpec(
@@ -584,6 +699,34 @@ PO_MATCH_ISSUE_SPECS: tuple[WarningSpec, ...] = (
         "Currency mismatch: invoice in {invoiceCurrency}, PO in {poCurrency} "
         "— amounts not compared",
         {"invoiceCurrency": "text", "poCurrency": "text"},
+    ),
+    # A multi-PO split whose legs disagree with each other while the invoice's
+    # own code is malformed (decisions §445): there is no invoice code to name,
+    # and no one PO code either, so the sentence names the legs' codes.
+    WarningSpec(
+        PO_MATCH_ISSUE_PREFIX + "currency_mismatch_invoice_currency_unknown",
+        PO_MATCH_ISSUE_TYPE,
+        "Currency mismatch: invoice records no valid currency, POs in {poCurrencies} "
+        "— amounts not compared",
+        {"poCurrencies": "text"},
+    ),
+    WarningSpec(
+        PO_MATCH_ISSUE_PREFIX + "po_cancelled",
+        PO_MATCH_ISSUE_TYPE,
+        "PO is cancelled — amounts not compared",
+        {},
+    ),
+    WarningSpec(
+        PO_MATCH_ISSUE_PREFIX + "po_not_issued",
+        PO_MATCH_ISSUE_TYPE,
+        "PO not approved in the ERP yet — amounts not compared",
+        {},
+    ),
+    WarningSpec(
+        PO_MATCH_ISSUE_PREFIX + "po_total_unverifiable",
+        PO_MATCH_ISSUE_TYPE,
+        "PO total not confirmed by the ERP on its last sync — amounts not compared",
+        {},
     ),
     # Both sides in one known currency — both figures are money in it.
     WarningSpec(
@@ -672,6 +815,454 @@ PO_MATCH_ISSUE_SPECS: tuple[WarningSpec, ...] = (
 #: catalogue finding. Never a template placeholder.
 FINDINGS_PARAM = "findings"
 
+#: The exception type ERP reconciliation sentences are bucketed under. A
+#: ``paid_not_recorded`` row is raised as ``payment_reconciliation`` for a
+#: double-pay refusal, but the bucket is only a label (nothing keys on it).
+ERP_RECONCILIATION_TYPE = "erp_reconciliation"
+
+#: Suffix of the twin of every sentence that names the ERP: the adapter has no
+#: product name (`erp_status_sync.erp_product_name` is None), so the sentence
+#: says "Your ERP" — a word, so its own code, never a spliced param.
+ERP_UNNAMED_SUFFIX = "_unnamed"
+
+#: What stopped FeohLedger recording the ERP's payment, and what the reader does
+#: about it — one clause per ``external_payment`` refusal code (the code minus
+#: its ``external_payment_`` prefix), ``other`` for any code not listed.
+ERP_UNRECORDED_REASONS: dict[str, str] = {
+    "blocking_exception": (
+        "another exception on this invoice is blocking payment. Clear that exception "
+        "and FeohLedger records the payment automatically."
+    ),
+    "in_run": (
+        "the invoice is also in a FeohLedger payment run, so the supplier could be paid "
+        "twice. Take it out of the run or cancel the run, then record the ERP's payment "
+        "from this exception."
+    ),
+    "payment_live": (
+        "FeohLedger has its own payment in progress for this invoice, so the supplier "
+        "could be paid twice. Void that payment if the ERP's payment is the real one, "
+        "then record the ERP's payment from this exception."
+    ),
+    "card_live": (
+        "a virtual card is still live for this invoice, so the supplier could be paid "
+        "twice. Cancel the card, then record the ERP's payment from this exception."
+    ),
+    "credit_conflict": (
+        "an applied credit memo no longer matches this invoice's supplier or currency, "
+        "so the amount owed can't be stated. Correct the credit memo, then record the "
+        "ERP's payment from this exception."
+    ),
+    "nothing_to_pay": (
+        "credit memos already cover the whole invoice, so there is no payment to record. "
+        "Check the bill in the ERP, then resolve this exception."
+    ),
+    "not_payable": (
+        "the invoice is not at a status that can be marked paid. Check the invoice, then "
+        "record the ERP's payment from this exception or resolve it."
+    ),
+    "amount_mismatch": (
+        "the amount it shows paid is not what this invoice owes in FeohLedger, after credit "
+        "memos and any early-payment discount. Check the bill and the invoice, correct the "
+        "one that is wrong, then record the ERP's payment from this exception or resolve it."
+    ),
+    "other": (
+        "FeohLedger refused to record it. Check the invoice, then record the ERP's payment "
+        "from this exception or resolve it."
+    ),
+}
+
+#: Sentences that open with the ERP's product name: bare name → the rest of the
+#: sentence after "<ERP> ". Each becomes two codes (named, ``_unnamed``).
+_ERP_NAMED_SENTENCES: dict[str, str] = {
+    **{
+        f"erp_paid_unrecorded_{reason}": (
+            f"reports this bill paid, but FeohLedger couldn't record that payment because {clause}"
+        )
+        for reason, clause in ERP_UNRECORDED_REASONS.items()
+    },
+    "erp_paid_withdrawn": (
+        "reported this bill paid, but no longer shows it paid. FeohLedger did not record "
+        "that payment. Check the bill in the ERP: if it is still owed, resolve this "
+        "exception and pay it as usual."
+    ),
+    "erp_paid_retry_failed": (
+        "reports this bill paid, but FeohLedger couldn't record that payment automatically. "
+        "Check the details, then record the ERP's payment from this exception."
+    ),
+    "erp_settled_short": (
+        "reports this bill paid, but FeohLedger's own payment for it settled for less than "
+        "AP authorized, so the invoice is held at Payment scheduled. Open the payment and "
+        "either accept the settled amount or void the payment."
+    ),
+    "erp_voided_after_post": (
+        "reports this bill voided or cancelled, but FeohLedger had already sent it on for "
+        "payment, so it was not cancelled here. Check whether a payment is on its way to "
+        "the supplier, and stop or recover it if the bill is really void."
+    ),
+    # The payment write-back (`erp_payment_writeback`, decisions §295). The
+    # refusal code, payment, run and bill are in `exceptions.erp_report`.
+    "erp_payment_writeback_failed": (
+        "did not record this invoice's payment, so the bill still shows as unpaid there "
+        "although the money was paid. Resolve what stopped it, then use Retry ERP sync on "
+        "the payment's run in Payments."
+    ),
+    "erp_payment_writeback_balance_open": (
+        "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
+        "there (a discount or credit taken in FeohLedger). Close the difference in the ERP."
+    ),
+    "erp_payment_void_writeback_failed": (
+        "still shows this bill paid by a payment that was voided in FeohLedger, because "
+        "voiding it in the ERP failed. Void that payment in the ERP so the books agree."
+    ),
+}
+
+#: Params a named sentence carries besides ``erp`` (both twins carry them).
+_ERP_NAMED_PARAMS: dict[str, dict[str, ParamKind]] = {
+    "erp_payment_writeback_balance_open": {"amount": "money", "currency": "currency"},
+}
+
+_DISPATCH_STOPPED_TAIL = (
+    " It was stopped before any money moved. Confirm what is still owed before paying "
+    "it; if a virtual card was already issued for this invoice, cancel it."
+)
+_UNLINKED_TAIL = (
+    ", so it will not pay it. Confirm in the ERP whether it is still owed, then record "
+    "it as paid outside FeohLedger or re-post it."
+)
+
+#: ERP sentences that do not name the product (QuickBooks status sync-back and
+#: the pre-dispatch bill check, decisions §295). Their machine detail — the
+#: bill, the event, the payment — is in ``exceptions.erp_report``.
+_ERP_UNNAMED_ONLY: dict[str, str] = {
+    "erp_credit_settlement": (
+        "The ERP shows this bill settled, at least in part by a vendor credit applied "
+        "there. FeohLedger will not pay it until someone confirms what is still owed."
+    ),
+    "erp_paid_while_scheduled": (
+        "The ERP shows this bill paid by a payment FeohLedger did not make, while a "
+        "FeohLedger payment is scheduled for it. Stop or void one of them before both "
+        "reach the supplier."
+    ),
+    "erp_paid_twice": (
+        "FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment "
+        "FeohLedger did not make — the supplier may have been paid twice. Recover one of "
+        "the payments."
+    ),
+    "erp_partly_paid_outside": (
+        "The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger "
+        "payment for the full amount would overpay it. Reconcile what is still owed "
+        "before paying."
+    ),
+    "erp_recorded_payment_withdrawn": (
+        "The ERP reported this bill paid, and FeohLedger recorded that payment, but the "
+        "ERP no longer shows it paid (the payment was deleted or voided there). Confirm "
+        "whether it is still owed."
+    ),
+    "erp_bill_deleted_blocking": (
+        "The bill this invoice was posted as has been deleted or voided in the ERP; "
+        "FeohLedger will not pay it until someone confirms it is still owed."
+    ),
+    "erp_bill_deleted": (
+        "The bill this invoice was posted as has been deleted or voided in the ERP. "
+        "Confirm the books still agree."
+    ),
+    "erp_bill_unlinked_no_document": (
+        "FeohLedger cannot check this invoice's bill in the ERP, because the ERP did not "
+        "say which bill it created when the invoice was posted" + _UNLINKED_TAIL
+    ),
+    "erp_bill_unlinked_no_company": (
+        "FeohLedger cannot check this invoice's bill in the ERP, because the posting did "
+        "not record which ERP company it went to" + _UNLINKED_TAIL
+    ),
+    "erp_bill_unlinked_other_company": (
+        "FeohLedger cannot check this invoice's bill in the ERP, because it was posted to "
+        "a different ERP company than the one now connected" + _UNLINKED_TAIL
+    ),
+    "erp_dispatch_stopped_paid": (
+        "FeohLedger was about to pay this invoice, but the ERP shows its bill already paid."
+        + _DISPATCH_STOPPED_TAIL
+    ),
+    "erp_dispatch_stopped_partially_paid": (
+        "FeohLedger was about to pay this invoice, but the ERP shows its bill partly paid."
+        + _DISPATCH_STOPPED_TAIL
+    ),
+    "erp_dispatch_stopped_deleted": (
+        "FeohLedger was about to pay this invoice, but the ERP shows its bill deleted or "
+        "voided." + _DISPATCH_STOPPED_TAIL
+    ),
+    "erp_dispatch_stopped_unconfirmed": (
+        "FeohLedger was about to pay this invoice, but the ERP could not confirm its bill "
+        "is still open and unpaid." + _DISPATCH_STOPPED_TAIL
+    ),
+    "erp_reported_payment_voided": (
+        "A payment the ERP reported was voided in FeohLedger, but the ERP may still show "
+        "the bill paid. FeohLedger will not pay it again until someone confirms the ERP's "
+        "payment is undone."
+    ),
+    # `payment_erp_sync`'s failed leg. It need not be the ERP that failed (the
+    # tenant may have none), so it never names one. The failure class, payment,
+    # run and the invoice's status are in `exceptions.erp_report`.
+    "erp_sync_back_failed": (
+        "This invoice's payment settled, but FeohLedger could not finish recording it, so "
+        "the invoice has not moved to Paid although the money has gone. Nothing retries "
+        "this automatically: use Retry ERP sync on the payment's run in Payments."
+    ),
+}
+
+#: ERP reconciliation descriptions (decisions §319): the sentence an AP user
+#: reads on a row `erp_status_sync` or `api/erp_webhook` opens. Built through
+#: `erp_status_sync.erp_finding` (the named / `_unnamed` pick) or
+#: `exception_finding` for the sentences that never name the product.
+ERP_RECONCILIATION_SPECS: tuple[WarningSpec, ...] = (
+    *(
+        spec
+        for name, rest in _ERP_NAMED_SENTENCES.items()
+        for spec in (
+            WarningSpec(
+                EXCEPTION_PREFIX + name,
+                ERP_RECONCILIATION_TYPE,
+                "{erp} " + rest,
+                {"erp": "text", **_ERP_NAMED_PARAMS.get(name, {})},
+            ),
+            WarningSpec(
+                EXCEPTION_PREFIX + name + ERP_UNNAMED_SUFFIX,
+                ERP_RECONCILIATION_TYPE,
+                "Your ERP " + rest,
+                dict(_ERP_NAMED_PARAMS.get(name, {})),
+            ),
+        )
+    ),
+    *(
+        WarningSpec(EXCEPTION_PREFIX + name, ERP_RECONCILIATION_TYPE, template, {})
+        for name, template in _ERP_UNNAMED_ONLY.items()
+    ),
+)
+
+#: The `type` of a compliance-hold reason: one entry of the hold exception's
+#: `params.findings`, never a description on its own.
+COMPLIANCE_HOLD_TYPE = "payment_compliance_hold"
+
+_PAYMENT_RECONCILE_TAIL = (
+    "Confirm with the processor and void or re-pay — this invoice is blocked from a "
+    "new payment run until this is resolved."
+)
+_SETTLEMENT_RECONCILE_TAIL = "reconcile with the processor before releasing this invoice."
+
+#: Descriptions the direct `exception_service.create_exception` callers write
+#: (decisions §358): extraction failure, Positive Pay returns, the bank-change
+#: flag, compliance holds, payments the reconciler or dispatch left in doubt,
+#: and settlement discrepancies. `tests/test_invoice_warning_catalog.py` holds
+#: every `create_exception` call under `app/` to passing a code.
+DIRECT_EXCEPTION_SPECS: tuple[WarningSpec, ...] = (
+    # `services/extraction.py`. The exception CLASS only: the message of a
+    # provider or parser error can quote the document, so it never reaches the
+    # row (it stays on the worker's log line and the audit row's details).
+    WarningSpec(
+        EXCEPTION_PREFIX + "extraction_failed",
+        "extraction_failed",
+        "Extraction failed: {errorClass}",
+        {"errorClass": "text"},
+    ),
+    # `api/positive_pay.py`. The verdict is a word, so it picks the code; the
+    # cheque number is the one param, and code + cheque number is the dedupe
+    # key (a row raised before §358 is matched on its English instead).
+    WarningSpec(
+        EXCEPTION_PREFIX + "positive_pay_altered_amount",
+        "fraud_flag",
+        "Positive Pay return: check {checkNumber} altered amount",
+        {"checkNumber": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "positive_pay_not_on_file",
+        "fraud_flag",
+        "Positive Pay return: check {checkNumber} not on issued file",
+        {"checkNumber": "text"},
+    ),
+    # `services/vendor_bank_change.flag_invoice_for_bank_change`.
+    WarningSpec(
+        EXCEPTION_PREFIX + "vendor_bank_changed",
+        "fraud_flag",
+        "Vendor bank details changed; verify before payment.",
+        {},
+    ),
+    # `services/payee_stamp.flag_repayment_payee_change`, raised by the void
+    # (decisions §383): the voided payment's recorded payee (vendor, bank
+    # fingerprint) is not who a re-payment would pay ...
+    WarningSpec(
+        EXCEPTION_PREFIX + "payee_changed_since_paid",
+        "fraud_flag",
+        "Payee changed since this invoice was last paid; verify before paying again.",
+        {},
+    ),
+    # ... or that payment predates the stamp and the vendor absorbed a merge
+    # since, so the invoice may have moved to another vendor's bank details.
+    WarningSpec(
+        EXCEPTION_PREFIX + "payee_unrecorded_after_merge",
+        "fraud_flag",
+        "Vendor merged since this invoice was last paid, and that payment recorded "
+        "no payee; verify before paying again.",
+        {},
+    ),
+    # `api/payments._open_compliance_hold_exception`: a FRAME over the hold's
+    # reasons (`params.findings`), always — even one reason, because each
+    # reason is a lower-case clause written to follow it.
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_hold_findings",
+        "payment_compliance_hold",
+        "Payment held for compliance review ({count, plural, one {# reason} other {# reasons}})",
+        {"count": "count"},
+    ),
+    # The reasons, from `services/compliance.check_payment_compliance` and the
+    # two no-screenable-vendor legs in `api/payments`.
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_no_screenable_vendor",
+        COMPLIANCE_HOLD_TYPE,
+        "no screenable vendor on invoice",
+        {},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_provider_unavailable",
+        COMPLIANCE_HOLD_TYPE,
+        "sanctions screening could not run: no adapter for configured provider '{provider}'",
+        {"provider": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_review_required",
+        COMPLIANCE_HOLD_TYPE,
+        "vendor screening returned review_required ({matchedList}) via {provider}",
+        {"matchedList": "text", "provider": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_review_required_unlisted",
+        COMPLIANCE_HOLD_TYPE,
+        "vendor screening returned review_required (see audit row) via {provider}",
+        {"provider": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_unrecognised_result",
+        COMPLIANCE_HOLD_TYPE,
+        "vendor screening returned an unrecognised result '{result}' via {provider}; "
+        "treating as review_required",
+        {"result": "text", "provider": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_adverse_media",
+        COMPLIANCE_HOLD_TYPE,
+        "vendor screening returned an adverse-media (negative news) hit via {provider}; "
+        "AP review required",
+        {"provider": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_adverse_media_unnamed_provider",
+        COMPLIANCE_HOLD_TYPE,
+        "vendor screening returned an adverse-media (negative news) hit via the configured "
+        "provider; AP review required",
+        {},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_aml_spend",
+        COMPLIANCE_HOLD_TYPE,
+        "trailing 12-month spend with vendor would reach {projected} {currency} "
+        "(threshold {threshold} {currency}); AP review required",
+        {"projected": "money", "threshold": "money", "currency": "currency"},
+    ),
+    # Some payments had no home-currency figure, so `projected` is a floor.
+    WarningSpec(
+        EXCEPTION_PREFIX + "compliance_aml_spend_partial",
+        COMPLIANCE_HOLD_TYPE,
+        "trailing 12-month spend with vendor would reach {projected} {currency} "
+        "(threshold {threshold} {currency}); AP review required — at least, on "
+        "{excluded, plural, one {# payment} other {# payments}} excluded for having no "
+        "figure in the home currency, so the real total is higher",
+        {
+            "projected": "money",
+            "threshold": "money",
+            "currency": "currency",
+            "excluded": "count",
+        },
+    ),
+    # `services/payment_reconciler.flag_payment_for_reconciliation`'s three
+    # callers. The payment id stays in the sentence: it is the only thing that
+    # says WHICH of the invoice's payments to chase.
+    WarningSpec(
+        EXCEPTION_PREFIX + "payment_aged_out",
+        "payment_reconciliation",
+        "Payment {paymentId} was still in flight after {hours}h and the reconciler marked "
+        "it failed; the rail never confirmed, so the money may or may not have moved. The "
+        "invoice is '{invoiceStatus}'. " + _PAYMENT_RECONCILE_TAIL,
+        {"paymentId": "text", "hours": "number", "invoiceStatus": "text"},
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "payment_dispatch_in_doubt",
+        "payment_reconciliation",
+        "Payment {paymentId} failed during dispatch ({failureCode}) after the processor may "
+        "already have accepted it, so the money may or may not have moved. "
+        + _PAYMENT_RECONCILE_TAIL,
+        {"paymentId": "text", "failureCode": "text"},
+    ),
+    # The payment's status is a word, so it picks the code (`failed` /
+    # `cancelled` — `api/payments.RETRYABLE_PAYMENT_STATUSES`).
+    *(
+        WarningSpec(
+            EXCEPTION_PREFIX + f"payment_dispatch_interrupted_{status}",
+            "payment_reconciliation",
+            f"Payment {{paymentId}} {verb}, but an earlier attempt to send it was "
+            "interrupted after it may already have reached the processor, so the money may "
+            "or may not have moved. " + _PAYMENT_RECONCILE_TAIL,
+            {"paymentId": "text"},
+        )
+        for status, verb in (("failed", "failed"), ("cancelled", "was cancelled"))
+    ),
+    # `services/payment_settlement.discrepancy_finding`. The two sides can be
+    # in different currencies (and either may be unknown), so the figures are
+    # bare `number`s beside their own codes as `text` — one `currency` param
+    # could only label one of them. MORE / LESS is a word, so it is the code.
+    WarningSpec(
+        EXCEPTION_PREFIX + "settlement_currency_mismatch",
+        "fraud_flag",
+        "Settlement currency mismatch: the processor reported {settledAmount} "
+        "{settledCurrency} but this payment authorizes {authorizedAmount} "
+        "{authorizedCurrency}. Money moved on a currency AP did not authorize — "
+        + _SETTLEMENT_RECONCILE_TAIL,
+        {
+            "settledAmount": "number",
+            "settledCurrency": "text",
+            "authorizedAmount": "number",
+            "authorizedCurrency": "text",
+        },
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "settlement_amount_over",
+        "fraud_flag",
+        "Settlement amount mismatch: the processor reported {settledAmount} "
+        "{settledCurrency}, MORE than the authorized {authorizedAmount} "
+        "{authorizedCurrency} (variance {variance}). Money moved at an amount AP did not "
+        "authorize — " + _SETTLEMENT_RECONCILE_TAIL,
+        {
+            "settledAmount": "number",
+            "settledCurrency": "text",
+            "authorizedAmount": "number",
+            "authorizedCurrency": "text",
+            "variance": "number",
+        },
+    ),
+    WarningSpec(
+        EXCEPTION_PREFIX + "settlement_amount_under",
+        "fraud_flag",
+        "Settlement amount mismatch: the processor reported {settledAmount} "
+        "{settledCurrency}, LESS than the authorized {authorizedAmount} "
+        "{authorizedCurrency} (variance {variance}). Money moved at an amount AP did not "
+        "authorize — " + _SETTLEMENT_RECONCILE_TAIL,
+        {
+            "settledAmount": "number",
+            "settledCurrency": "text",
+            "authorizedAmount": "number",
+            "authorizedCurrency": "text",
+            "variance": "number",
+        },
+    ),
+)
+
 #: Exception descriptions no warning states. `type` is the exception type the
 #: description belongs to (`exception_lifecycle.EXCEPTION_TYPES`).
 #:
@@ -703,6 +1294,8 @@ EXCEPTION_DESCRIPTION_SPECS: tuple[WarningSpec, ...] = (
         "other {# contract-compliance findings}}",
         {"count": "count"},
     ),
+    *ERP_RECONCILIATION_SPECS,
+    *DIRECT_EXCEPTION_SPECS,
 )
 
 #: Every sentence the catalogue declares, in generation order.
@@ -846,8 +1439,7 @@ def _coerce(kind: ParamKind, value: object) -> str | int:
     if kind == "money":
         return _money(value)
     if kind == "currency":
-        code = str(value or "").strip().upper()
-        return code if len(code) == 3 else DEFAULT_CURRENCY
+        return iso_currency_or_none(value) or UNKNOWN_CURRENCY
     if kind == "date":
         if isinstance(value, (date, datetime)):
             return value.isoformat()
@@ -901,7 +1493,7 @@ def exception_finding(code: str, /, **params: object) -> dict:
     return _finding(full, params)
 
 
-def exception_findings(frame: str, findings: list[dict]) -> dict:
+def exception_findings(frame: str, findings: list[dict], *, frame_single: bool = False) -> dict:
     """One exception description covering ``findings`` (warning dicts).
 
     A single finding IS the description — it needs no frame, and stating it in
@@ -913,13 +1505,17 @@ def exception_findings(frame: str, findings: list[dict]) -> dict:
     English string. ``message`` — the fallback, and what
     ``Exception.description`` stores — is the frame followed by each finding's
     own English.
+
+    ``frame_single`` frames a lone finding too, for findings that are clauses
+    written to follow their frame rather than sentences of their own (the
+    compliance-hold reasons).
     """
     if not findings:
         raise ValueError("exception_findings needs at least one finding")
     items = [
         {"code": f["code"], "params": dict(f["params"]), "message": f["message"]} for f in findings
     ]
-    if len(items) == 1:
+    if len(items) == 1 and not frame_single:
         return items[0]
     head = exception_finding(frame, count=len(items))
     head["params"][FINDINGS_PARAM] = items

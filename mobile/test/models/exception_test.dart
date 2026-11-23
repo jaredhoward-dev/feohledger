@@ -38,4 +38,74 @@ void main() {
       expect(ApException.fromJson(_json(true)).amount, isNull);
     });
   });
+
+  group('PoRematchClears reads only its own report', () {
+    test('the PO number and calendar day come through', () {
+      final r = PoRematchClears.fromErpReport({
+        'kind': 'po_rematch_clears',
+        'po_number': ' PO-7 ',
+        'observed_on': '2026-10-26',
+      })!;
+      expect(r.poNumber, 'PO-7');
+      expect(r.observedOn, DateTime(2026, 10, 26));
+    });
+
+    test('a missing or malformed field stays missing', () {
+      final r = PoRematchClears.fromErpReport({
+        'kind': 'po_rematch_clears',
+        'po_number': '',
+        'observed_on': '2026-10-26T00:00:00Z',
+      })!;
+      expect(r.poNumber, isNull);
+      expect(r.observedOn, isNull);
+    });
+
+    test('another kind, or no report, is null', () {
+      expect(
+        PoRematchClears.fromErpReport({'kind': 'paid_not_recorded'}),
+        isNull,
+      );
+      expect(PoRematchClears.fromErpReport(null), isNull);
+      expect(PoRematchClears.fromErpReport('po_rematch_clears'), isNull);
+    });
+  });
+
+  // `decision_refusals` (`api/exceptions.py::decision_refusals`): the queue
+  // and detail offer Resolve / Dismiss / Escalate from these.
+  group('ApException decision verdicts', () {
+    ApException row(Object? decisions) =>
+        ApException.fromJson({..._json(null), 'decision_refusals': decisions});
+
+    test('a manager on an open row may take all three', () {
+      final e = row({'resolve': null, 'dismiss': null, 'escalate': null});
+      expect(e.resolveVerdict.allowed, isTrue);
+      expect(e.dismissVerdict.allowed, isTrue);
+      expect(e.escalateVerdict.allowed, isTrue);
+    });
+
+    test('an implicated manager is refused clearing but may escalate', () {
+      const sod = {'code': 'segregation_implicated', 'message': 'm'};
+      final e = row({'resolve': sod, 'dismiss': sod, 'escalate': null});
+      expect(e.resolveVerdict.isOffered(hiddenCodes: kExceptionHiddenRefusals),
+          isTrue);
+      expect(e.resolveVerdict.allowed, isFalse);
+      expect(e.escalateVerdict.allowed, isTrue);
+    });
+
+    test('a terminal row or a role refusal offers nothing', () {
+      const state = {'code': 'exception_not_actionable', 'message': 'm'};
+      const role = {'code': 'role_not_permitted', 'message': 'm'};
+      for (final r in [state, role]) {
+        final e = row({'resolve': r, 'dismiss': r, 'escalate': r});
+        for (final v in [e.resolveVerdict, e.dismissVerdict, e.escalateVerdict]) {
+          expect(v.isOffered(hiddenCodes: kExceptionHiddenRefusals), isFalse);
+        }
+      }
+    });
+
+    test('no verdict fails closed', () {
+      expect(row(null).resolveVerdict.answered, isFalse);
+      expect(row(<String, dynamic>{}).escalateVerdict.answered, isFalse);
+    });
+  });
 }

@@ -309,33 +309,80 @@ def test_every_segregation_shim_states_both_attributes():
     ``test_invoice_uploader_stamping`` exists to prevent: an absent attribute on a
     fraud control reads as an oversight and behaves as an exemption. Every shim
     must answer, even when the answer is ``None``.
+
+    A shim is built inline at the call, returned by a same-module helper
+    (``expense_controls._segregation_subject``, shared by the raising check and
+    the ``violates_segregation`` verdict), or bound to a local in the calling
+    function first (``procurement_controls.requisition_approve_refusal``) — all
+    three are followed, and both entry points are scanned, since the getattr
+    default lives in the predicate.
     """
     import ast
     from pathlib import Path
 
+    def _is_namespace(node: ast.AST) -> bool:
+        return isinstance(node, ast.Call) and getattr(node.func, "id", None) == "SimpleNamespace"
+
     app_root = Path(__file__).resolve().parents[1] / "app"
-    offenders: list[str] = []
-    found = 0
+    offenders: set[str] = set()
+    shims: set[str] = set()
     for path in sorted(app_root.rglob("*.py")):
         tree = ast.parse(path.read_text())
         rel = path.relative_to(app_root.parent).as_posix()
+        # Same-module helpers whose body returns a SimpleNamespace shim.
+        helpers: dict[str, list[ast.Call]] = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                returned = [
+                    r.value
+                    for r in ast.walk(fn)
+                    if isinstance(r, ast.Return) and r.value is not None and _is_namespace(r.value)
+                ]
+                if returned:
+                    helpers[fn.name] = returned
+        # A shim bound to a local first (`subject = SimpleNamespace(...)`, then
+        # `violates_segregation(subject, ...)`), followed within its own function.
+        local_shims: dict[tuple[int, str], list[ast.Call]] = {}
+        call_scope: dict[int, int] = {}
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for inner in ast.walk(fn):
+                if isinstance(inner, ast.Call):
+                    call_scope[id(inner)] = id(fn)
+                if (
+                    isinstance(inner, ast.Assign)
+                    and _is_namespace(inner.value)
+                    and len(inner.targets) == 1
+                    and isinstance(inner.targets[0], ast.Name)
+                ):
+                    key = (id(fn), inner.targets[0].id)
+                    local_shims.setdefault(key, []).append(inner.value)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name != "check_segregation" or not node.args:
+            if name not in ("check_segregation", "violates_segregation") or not node.args:
                 continue
             subject = node.args[0]
-            if not (
-                isinstance(subject, ast.Call)
-                and getattr(subject.func, "id", None) == "SimpleNamespace"
+            if _is_namespace(subject):
+                candidates = [subject]
+            elif isinstance(subject, ast.Call) and getattr(subject.func, "id", None) in helpers:
+                candidates = helpers[subject.func.id]
+            elif (
+                isinstance(subject, ast.Name)
+                and (call_scope.get(id(node)), subject.id) in local_shims
             ):
+                candidates = local_shims[(call_scope[id(node)], subject.id)]
+            else:
                 continue  # a real Invoice — the model guarantees the attribute
-            found += 1
-            kwargs = {kw.arg for kw in subject.keywords}
-            if "segregation_actor_ids" not in kwargs:
-                offenders.append(f"{rel}:{subject.lineno}")
+            for shim in candidates:
+                where = f"{rel}:{shim.lineno}"
+                shims.add(where)
+                if "segregation_actor_ids" not in {kw.arg for kw in shim.keywords}:
+                    offenders.add(where)
+    found = len(shims)
 
     assert found >= 3, (
         f"expected the expense-report / requisition / pre-approval shims, found {found} — "
@@ -343,7 +390,7 @@ def test_every_segregation_shim_states_both_attributes():
     )
     assert not offenders, (
         "check_segregation(SimpleNamespace(...)) omits `segregation_actor_ids` at "
-        + ", ".join(offenders)
+        + ", ".join(sorted(offenders))
         + " — state it (None is a fine answer when the table records no editors) so "
         "the exemption is argued rather than inherited from a getattr default."
     )
@@ -814,3 +861,61 @@ def test_advance_records_actor_id_in_approvals():
     assert len(approvals) == 1
     assert approvals[0]["user_id"] == str(actor)
     assert "at" in approvals[0]
+
+
+# ---------------------------------------------------------------------------
+# approvers_in_force — the set the reverse-order receipt and inspection rules
+# measure a later recorder against (decisions §389, §401)
+# ---------------------------------------------------------------------------
+
+
+def _chain_with(*user_ids):
+    return {
+        "approval_levels": {
+            "levels": [{"name": "L1", "approvals": [{"user_id": str(u)} for u in user_ids]}]
+        }
+    }
+
+
+async def test_approvers_in_force_is_empty_when_segregation_is_opted_out():
+    """`require_segregation: false` is the opt-out §267 honours at approval, so
+    nobody is an approver in force — and no instance is even looked up."""
+    from app.services.approval_chain import approvers_in_force
+
+    invoice = SimpleNamespace(id=uuid.uuid4(), approved_by_user_id=uuid.uuid4())
+    db = _db_returning(_make_instance(state_data=_chain_with(uuid.uuid4())))
+
+    assert await approvers_in_force(db, invoice, {"require_segregation": False}) == frozenset()
+    db.execute.assert_not_awaited()
+
+
+async def test_approvers_in_force_includes_a_chain_level_approver():
+    """A level approver (signed while later levels are open) is in force beside
+    the approval of record; the given instance is used without a lookup."""
+    from app.services.approval_chain import approvers_in_force
+
+    stamped, level_approver = uuid.uuid4(), uuid.uuid4()
+    invoice = SimpleNamespace(id=uuid.uuid4(), approved_by_user_id=stamped)
+    db = _db_returning(None)
+
+    got = await approvers_in_force(
+        db, invoice, {}, instance=_make_instance(state_data=_chain_with(level_approver))
+    )
+
+    assert got == frozenset({str(stamped), str(level_approver)})
+    db.execute.assert_not_awaited()
+
+
+async def test_approvers_in_force_looks_up_the_instance_when_none_is_given():
+    """`instance=None` reads the invoice's workflow instance, so a chain-level
+    approver is still found by a caller that does not hold it."""
+    from app.services.approval_chain import approvers_in_force
+
+    level_approver = uuid.uuid4()
+    invoice = SimpleNamespace(id=uuid.uuid4(), approved_by_user_id=None)
+    db = _db_returning(_make_instance(state_data=_chain_with(level_approver)))
+
+    got = await approvers_in_force(db, invoice, {"require_segregation": True})
+
+    assert got == frozenset({str(level_approver)})
+    db.execute.assert_awaited_once()

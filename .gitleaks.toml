@@ -45,6 +45,9 @@ paths = [
     '''(?i)^docs/user-management\.md$''',
     '''(?i)^docs/authentication\.md$''',
     '''(?i)^backend/docs/api-reference\.md$''',
+    # Generated pytest-split timing baseline: parametrized test ids embed fake
+    # connection URLs from test parameters (see secret-scan.yml § Excluded paths).
+    '''^backend/\.test_durations$''',
 ]
 # Synthetic-credential regexes that may legitimately appear anywhere
 # in the codebase (fixtures + docs samples).
@@ -60,14 +63,6 @@ regexes = [
     '''Portal-Secret-\d+''',
     '''Right-Password-\d+''',
     '''Test-?Password-?\d*''',
-    # Synthetic `temporary_password` values in the mobile admin-user tests
-    # (mobile/test/stores/admin_user_store_test.dart,
-    # mobile/test/screens/admin_users_screen_test.dart). `POST /api/admin/users`
-    # returns a one-time temp password, so the mocked HTTP responses — and the
-    # assertions that read them back — have to carry a password-shaped literal.
-    # Allowlisted narrowly so a real credential in these files still trips.
-    '''Hunter2-temp-xyz''',
-    '''Temp-Pass-\d+''',
     # backend/tests/test_supplier_chat.py's deliberately secret-SHAPED chat
     # body. The test posts it and then asserts the audit row does NOT contain
     # it — proving message bodies stay out of the audit trail. The literal is

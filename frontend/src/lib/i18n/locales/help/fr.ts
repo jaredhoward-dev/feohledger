@@ -4,7 +4,7 @@ import type { HelpMessages } from '../../messages';
 // diagram labels under `help.*` — all of them but `help.pageLink` and
 // `help.tip.*`, which every page's chrome reads and so stay in the main
 // catalogue. Split out because it is ~9 KB gzipped per locale that only the
-// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureHelpCatalogue()` in store.svelte.ts;
+// /help routes and the ⓘ HelpTips need (decisions §261). Lazy-loaded by `ensureSlices('help')` in store.svelte.ts;
 // `satisfies HelpMessages` makes a missing or extra key a compile error.
 export const messages = {
 	'help.title': 'Centre d’aide',
@@ -63,7 +63,6 @@ export const messages = {
 	'help.note.role': 'Qui peut le faire',
 	'help.glossary.title': 'Glossaire',
 	'help.glossary.intro': 'Les termes de comptabilité fournisseurs utilisés dans {product}, et ce que chacun signifie ici.',
-	'help.glossary.topic': 'Thème',
 	'help.glossary.allTopics': 'Tous les thèmes',
 	'help.glossary.aliases': 'Aussi appelé :',
 	'help.glossary.related': 'Voir aussi :',
@@ -103,7 +102,7 @@ export const messages = {
 	'help.term.credit-memo': 'Avoir',
 	'help.term.credit-memo.short': 'Un document fournisseur qui réduit votre dette, imputé sur une facture ouverte du même fournisseur.',
 	'help.term.duplicate-invoice': 'Facture en doublon',
-	'help.term.duplicate-invoice.short': 'Une facture saisie deux fois. FeohLedger signale les doublons probables et bloque le paiement.',
+	'help.term.duplicate-invoice.short': 'Une facture saisie deux fois. FeohLedger signale les doublons probables et bloque le paiement et l\'envoi à l\'ERP jusqu\'à leur résolution.',
 	'help.term.purchase-order': 'Bon de commande',
 	'help.term.purchase-order.short': 'Votre commande formelle à un fournisseur : quoi, en quelle quantité et à quel prix.',
 	'help.term.goods-receipt': 'Réception de marchandises',
@@ -328,7 +327,7 @@ export const messages = {
 	'help.term.line-total-mismatch': 'Écart de total de lignes',
 	'help.term.line-total-mismatch.short': 'Les lignes d\'une facture ne correspondent pas à son total. Le paiement est bloqué jusqu\'à ce que quelqu\'un le résolve.',
 	'help.term.fraud-flag': 'Signalement de fraude',
-	'help.term.fraud-flag.short': 'Une exception levée quand une facture ou un paiement semble frauduleux. Le paiement est bloqué jusqu\'à sa résolution.',
+	'help.term.fraud-flag.short': 'Une exception levée quand une facture ou un paiement semble frauduleux. Le paiement et l\'envoi à l\'ERP sont bloqués jusqu\'à sa résolution.',
 	'help.term.expense-policy': 'Politique de dépenses',
 	'help.term.expense-policy.short': 'Vos règles sur ce que les employés peuvent déclarer (plafonds, justificatifs, pré-approbations), vérifiées sur chaque dépense.',
 	'help.term.spend-preapproval': 'Pré-approbation de dépense',

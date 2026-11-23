@@ -28,13 +28,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import false, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.expense import CorporateCardTransaction, Expense
 from app.models.virtual_card import VirtualCard
+from app.services.card_issuance import CARD_SPENT_STATUSES
 from app.services.vendor_matching import _normalize, _similarity
 from app.tenant import apply_entity_scope
+from app.utils.currency_code import iso_currency_or_none
 from app.utils.dates import utc_today
 
 # ±N-day window for the amount+date match (mirrors bank_reconciliation's
@@ -43,8 +45,9 @@ from app.utils.dates import utc_today
 # days). Money math stays Decimal; only the date window uses timedelta.
 _CARD_MATCH_WINDOW_DAYS = 5
 
-# VirtualCard statuses that represent realised spend worth reconciling.
-_CHARGED_STATUSES = ("charged", "completed")
+# VirtualCard statuses that represent realised spend worth reconciling — the
+# spent set `card_issuance` owns (issue #575).
+_CHARGED_STATUSES = tuple(sorted(CARD_SPENT_STATUSES))
 
 
 @dataclass(frozen=True)
@@ -84,9 +87,11 @@ async def suggest_matches(
     # transaction it exactly matched while `/match` would happily link it — the
     # candidate query and the control it stands in for disagreeing about the
     # same pair.
+    txn_currency = iso_currency_or_none(txn.currency)
     base = apply_entity_scope(select(Expense), Expense, entity_id).where(
         Expense.amount == txn.amount,
-        func.upper(Expense.currency) == (txn.currency or "").strip().upper(),
+        # A transaction with no usable code matches no expense.
+        func.upper(Expense.currency) == txn_currency if txn_currency else false(),
         Expense.card_transaction_id.is_(None),
     )
     rows = (await db.execute(base)).scalars().all()

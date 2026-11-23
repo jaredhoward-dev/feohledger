@@ -1,4 +1,5 @@
 <script lang="ts">
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	// Custom (ad-hoc) Report Builder. Pick a data source from the catalog, then
 	// choose dimensions / measures / filters — the whole builder is driven by
 	// `GET /api/reports/catalog`, never a hardcoded field list. Run renders a
@@ -29,13 +30,14 @@
 		SpecFilter,
 		SpecMeasure
 	} from '#lib/types/reports.ts';
-	import { AGG_LABELS, measureColumnKey } from '#lib/types/reports.ts';
+	import { fieldLabel, measureColumnKey, measureLabel, sourceLabel } from '#lib/types/reports.ts';
+	import { m } from '#lib/i18n/store.svelte.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
-	import { timeAgo } from '#lib/utils/time.ts';
+	import { formatDate, timeAgo } from '#lib/utils/time.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import DimensionEditor from '#lib/components/reports/DimensionEditor.svelte';
 	import MeasureEditor from '#lib/components/reports/MeasureEditor.svelte';
@@ -68,11 +70,16 @@
 	const sortOptions = $derived([
 		...dims.map((d) => ({
 			key: d.key,
-			label: source?.dimensions.find((c) => c.key === d.key)?.label ?? d.key
+			label: fieldLabel(m, d.key, source?.dimensions.find((c) => c.key === d.key)?.label)
 		})),
-		...measures.map((m) => ({
-			key: measureColumnKey(m),
-			label: `${AGG_LABELS[m.agg]} of ${source?.measures.find((c) => c.key === m.key)?.label ?? m.key}`
+		...measures.map((measure) => ({
+			key: measureColumnKey(measure),
+			label: measureLabel(
+				m,
+				measure.key,
+				measure.agg,
+				source?.measures.find((c) => c.key === measure.key)?.label
+			)
 		}))
 	]);
 
@@ -116,7 +123,7 @@
 			catalog = await getReportCatalog();
 			if (!sourceKey && catalog.sources[0]) selectSource(catalog.sources[0].key);
 		} catch (e) {
-			catalogError = e instanceof Error ? e.message : 'Failed to load the report catalog.';
+			catalogError = e instanceof Error ? e.message : m('reports.error.loadCatalog');
 		} finally {
 			catalogLoading = false;
 		}
@@ -129,7 +136,7 @@
 			const res = await listReports();
 			saved = res.reports;
 		} catch (e) {
-			savedError = e instanceof Error ? e.message : 'Failed to load saved reports.';
+			savedError = e instanceof Error ? e.message : m('reports.error.loadSaved');
 		} finally {
 			savedLoading = false;
 		}
@@ -175,7 +182,7 @@
 	function applyDefinition(def: ReportDefinition) {
 		sourceKey = def.data_source;
 		dims = def.dimensions.map((d) => ({ ...d }));
-		measures = def.measures.map((m) => ({ ...m }));
+		measures = def.measures.map((x) => ({ ...x }));
 		filters = def.filters.map((f) => ({ ...f }));
 		const s = def.sort[0];
 		sortKey = s?.key ?? '';
@@ -191,13 +198,16 @@
 		loadedSnapshot = JSON.stringify(specForCompare());
 	}
 
-	async function loadDefinition(id: string, { updateUrl = true } = {}) {
+	/** Resolves `true` once the definition is in the builder. */
+	async function loadDefinition(id: string, { updateUrl = true } = {}): Promise<boolean> {
 		try {
 			const def = await getReport(id);
 			applyDefinition(def);
 			if (updateUrl) setIdParam(id);
+			return true;
 		} catch (e) {
-			toast(e instanceof Error ? e.message : 'Failed to load that report.', 'error');
+			toast(e instanceof Error ? e.message : m('reports.error.loadReport'), 'error');
+			return false;
 		}
 	}
 
@@ -226,7 +236,7 @@
 					? await runSavedReport(loadedId, { page: atPage, page_size: PAGE_SIZE })
 					: await runReport(spec, { page: atPage, page_size: PAGE_SIZE });
 		} catch (e) {
-			runError = e instanceof Error ? e.message : 'Failed to run the report.';
+			runError = e instanceof Error ? e.message : m('reports.error.run');
 			result = null;
 		} finally {
 			running = false;
@@ -248,19 +258,22 @@
 				description: data.description || null
 			});
 			showSave = false;
-			toast('Report saved.', 'success');
+			toast(m('reports.toast.saved'), 'success');
 			applyDefinition(def);
 			setIdParam(def.id);
 			await loadSaved();
 		} catch (e) {
-			saveError = e instanceof Error ? e.message : 'Failed to save the report.';
+			saveError = e instanceof Error ? e.message : m('reports.error.save');
 		} finally {
 			savingReport = false;
 		}
 	}
 
+	// Held for the PATCH so a second click cannot send a second write.
+	let updating = $state(false);
 	async function updateLoaded() {
-		if (!loadedId) return;
+		if (!loadedId || updating) return;
+		updating = true;
 		try {
 			const def = await updateReport(loadedId, {
 				...spec,
@@ -268,10 +281,12 @@
 				description: loadedDescription || null
 			});
 			applyDefinition(def);
-			toast('Report updated.', 'success');
+			toast(m('reports.toast.updated'), 'success');
 			await loadSaved();
 		} catch (e) {
-			toast(e instanceof Error ? e.message : 'Failed to update the report.', 'error');
+			toast(e instanceof Error ? e.message : m('reports.error.update'), 'error');
+		} finally {
+			updating = false;
 		}
 	}
 
@@ -284,18 +299,19 @@
 		confirmDeleteId = null;
 		try {
 			await deleteReport(def.id);
-			toast('Report deleted.', 'success');
+			toast(m('reports.toast.deleted'), 'success');
 			if (loadedId === def.id) selectSource(sourceKey);
 			await loadSaved();
 		} catch (e) {
-			toast(e instanceof Error ? e.message : 'Failed to delete the report.', 'error');
+			toast(e instanceof Error ? e.message : m('reports.error.delete'), 'error');
 		}
 	}
 
 	// Run a saved report inline (loads it into the builder first, then runs).
 	async function runSaved(def: ReportDefinition) {
-		await loadDefinition(def.id);
-		await run(1);
+		// A failed load leaves the PREVIOUS spec in the builder; running on would
+		// put that report's figures on screen under the row the user clicked.
+		if (await loadDefinition(def.id)) await run(1);
 	}
 
 	async function exportSaved(id: string, format: 'csv' | 'pdf') {
@@ -310,16 +326,25 @@
 			a.remove();
 			URL.revokeObjectURL(url);
 		} catch (e) {
-			toast(e instanceof Error ? e.message : `Failed to export ${format.toUpperCase()}.`, 'error');
+			toast(e instanceof Error ? e.message : m('reports.error.export', { format: format.toUpperCase() }), 'error');
 		}
 	}
 
-	const SAVED_COLUMNS = [
-		{ label: 'Name' },
-		{ label: 'Source' },
-		{ label: 'Updated' },
+	// "3 days ago" is the scan; the exact moment rides in the cell's title.
+	const PRECISE_TIME: Intl.DateTimeFormatOptions = {
+		year: 'numeric',
+		month: 'short',
+		day: 'numeric',
+		hour: 'numeric',
+		minute: '2-digit'
+	};
+
+	const SAVED_COLUMNS = $derived([
+		{ label: m('reports.saved.col.name') },
+		{ label: m('reports.saved.col.source') },
+		{ label: m('reports.saved.col.updated') },
 		{ class: 'actions-col' }
-	];
+	]);
 
 	$effect(() => {
 		void (async () => {
@@ -337,44 +362,42 @@
 	}}
 />
 
-<PageHeader title="Report Builder">
+<PageHeader title={m('reports.title')}>
 	{#snippet actions()}
 		{#if canMutate}
-			<button class="btn-primary" onclick={openSave} disabled={!canRun}>Save report</button>
+			<button class="btn-primary" onclick={openSave} disabled={!canRun}>{m('reports.action.save')}</button>
 		{/if}
 	{/snippet}
 
 	<p class="lede">
-		Build an ad-hoc report: pick a data source, group by dimensions, add measures, and filter —
-		then run, save, and export. Read is open to your whole team.
+		{m('reports.lede')}
 	</p>
 
 	{#if catalogLoading}
-		<p class="muted">Loading catalog…</p>
+		<p class="muted">{m('reports.catalogLoading')}</p>
 	{:else if catalogError}
 		<!-- The catalog drives the WHOLE builder, so a failure has to replace it —
 		     but it was replaced by a bare paragraph fired from a single-shot,
 		     dependency-free `$effect`, leaving nothing on screen that could
-		     re-run the load. Same error-with-retry block `/admin/api-keys` uses. -->
-		<div class="state error" data-testid="catalog-error" role="alert">
-			<p>{catalogError}</p>
-			<button type="button" class="btn-cancel" onclick={loadCatalog}>Retry</button>
-		</div>
+		     re-run the load. -->
+		<LoadError message={catalogError} onretry={loadCatalog} testId="catalog-error" />
 	{:else if catalog}
 		<div class="builder">
 			<div class="field source-field">
-				<label for="report-source">Data source</label>
+				<label for="report-source">{m('reports.dataSource')}</label>
 				<select
 					id="report-source"
 					value={sourceKey}
 					onchange={(e) => selectSource(e.currentTarget.value)}
 				>
 					{#each catalog.sources as s (s.key)}
-						<option value={s.key}>{s.label}</option>
+						<option value={s.key}>{sourceLabel(m, s.key, s.label)}</option>
 					{/each}
 				</select>
 				{#if loadedId}
-					<span class="loaded-tag" data-testid="loaded-tag">Editing “{loadedName}”</span>
+					<span class="loaded-tag" data-testid="loaded-tag"
+						>{m('reports.editing', { name: loadedName })}</span
+					>
 				{/if}
 			</div>
 
@@ -385,16 +408,16 @@
 
 				{#if sortOptions.length}
 					<div class="sort-row">
-						<label for="report-sort">Sort by</label>
+						<label for="report-sort">{m('reports.sort.label')}</label>
 						<select id="report-sort" bind:value={sortKey}>
-							<option value="">— None —</option>
+							<option value="">{m('reports.sort.none')}</option>
 							{#each sortOptions as o (o.key)}
 								<option value={o.key}>{o.label}</option>
 							{/each}
 						</select>
-						<select aria-label="Sort direction" bind:value={sortDir} disabled={!sortKey}>
-							<option value="desc">Descending</option>
-							<option value="asc">Ascending</option>
+						<select aria-label={m('reports.sort.direction')} bind:value={sortDir} disabled={!sortKey}>
+							<option value="desc">{m('reports.sort.desc')}</option>
+							<option value="asc">{m('reports.sort.asc')}</option>
 						</select>
 					</div>
 				{/if}
@@ -406,23 +429,23 @@
 						onclick={() => run(1)}
 						disabled={!canRun || running}
 					>
-						{running ? 'Running…' : 'Run report'}
+						{running ? m('reports.action.running') : m('reports.action.run')}
 					</button>
 					{#if canMutate && loadedId}
-						<button class="btn-secondary" onclick={updateLoaded} disabled={running}
-							>Save changes</button
+						<button class="btn-cancel" onclick={updateLoaded} disabled={running || updating}
+							>{m('reports.action.saveChanges')}</button
 						>
 					{/if}
 					{#if loadedId}
-						<button class="btn-secondary" onclick={() => exportSaved(loadedId!, 'csv')}
-							>Export CSV</button
+						<button class="btn-cancel" onclick={() => exportSaved(loadedId!, 'csv')}
+							>{m('reports.action.exportCsv')}</button
 						>
-						<button class="btn-secondary" onclick={() => exportSaved(loadedId!, 'pdf')}
-							>Export PDF</button
+						<button class="btn-cancel" onclick={() => exportSaved(loadedId!, 'pdf')}
+							>{m('reports.action.exportPdf')}</button
 						>
 					{/if}
 					{#if !canRun}
-						<span class="muted small">Add at least one measure to run.</span>
+						<span class="muted small">{m('reports.needMeasure')}</span>
 					{/if}
 				</div>
 			{/if}
@@ -438,19 +461,17 @@
 
 		<!-- Saved reports -->
 		<section class="saved" data-testid="saved-reports">
-			<h2>Saved reports</h2>
+			<h2>{m('reports.saved.title')}</h2>
 			{#if savedError}
 				<!-- Not rendered ALONGSIDE the table: an error banner over "No saved
 				     reports yet." tells the reader two different things at once. -->
-				<div class="state error" data-testid="saved-error" role="alert">
-					<p>{savedError}</p>
-					<button type="button" class="btn-cancel" onclick={loadSaved}>Retry</button>
-				</div>
+				<LoadError message={savedError} onretry={loadSaved} testId="saved-error" />
 			{:else}
 			<DataTable
 				columns={SAVED_COLUMNS}
 				isEmpty={saved.length === 0}
-				empty={savedLoading ? 'Loading…' : 'No saved reports yet.'}
+				loading={savedLoading}
+				empty={m('reports.saved.empty')}
 			>
 				{#snippet body()}
 					{#each saved as def (def.id)}
@@ -461,27 +482,49 @@
 							}}
 						>
 							<td>
-								<RowLink onclick={() => loadDefinition(def.id)} ariaLabel="Load report {def.name}">
+								<RowLink onclick={() => loadDefinition(def.id)} ariaLabel={m('reports.saved.loadAria', { name: def.name })}>
 									{def.name}
 								</RowLink>
 								{#if def.description}
 									<div class="row-desc">{def.description}</div>
 								{/if}
 							</td>
-							<td>{catalog?.sources.find((s) => s.key === def.data_source)?.label ?? def.data_source}</td>
-							<td class="muted">{timeAgo(def.updated_at)}</td>
+							<td>
+								{sourceLabel(
+									m,
+									def.data_source,
+									catalog?.sources.find((s) => s.key === def.data_source)?.label
+								)}
+							</td>
+							<td class="muted" title={formatDate(def.updated_at, '', PRECISE_TIME)}>
+								{timeAgo(def.updated_at)}
+							</td>
 							<td class="actions">
-								<RowAction onclick={() => runSaved(def)} ariaLabel="Run report {def.name}">Run</RowAction>
-								<RowAction onclick={() => exportSaved(def.id, 'csv')} ariaLabel="Export {def.name} as CSV">CSV</RowAction>
-								<RowAction onclick={() => exportSaved(def.id, 'pdf')} ariaLabel="Export {def.name} as PDF">PDF</RowAction>
+								<RowAction
+									onclick={() => runSaved(def)}
+									ariaLabel={m('reports.saved.runAria', { name: def.name })}
+									>{m('reports.saved.run')}</RowAction
+								>
+								<RowAction
+									onclick={() => exportSaved(def.id, 'csv')}
+									ariaLabel={m('reports.saved.csvAria', { name: def.name })}
+									>{m('reports.saved.csv')}</RowAction
+								>
+								<RowAction
+									onclick={() => exportSaved(def.id, 'pdf')}
+									ariaLabel={m('reports.saved.pdfAria', { name: def.name })}
+									>{m('reports.saved.pdf')}</RowAction
+								>
 								{#if canMutate}
 									<RowAction
 										variant="danger"
 										armed={confirmDeleteId === def.id}
 										onclick={() => doDelete(def)}
-										ariaLabel="Delete report {def.name}"
+										ariaLabel={confirmDeleteId === def.id
+											? m('common.rowActionAria', { action: m('reports.saved.confirm'), name: def.name })
+											: m('reports.saved.deleteAria', { name: def.name })}
 									>
-										{confirmDeleteId === def.id ? 'Confirm' : 'Delete'}
+										{confirmDeleteId === def.id ? m('reports.saved.confirm') : m('reports.saved.delete')}
 									</RowAction>
 								{/if}
 							</td>
@@ -503,18 +546,6 @@
 />
 
 <style>
-	/* Error-with-retry block — same shape as `/admin/api-keys`. */
-	.state {
-		color: var(--text-muted);
-		padding: 0.75rem 0;
-	}
-	.state.error {
-		color: var(--danger);
-	}
-	.state.error p {
-		margin: 0 0 8px;
-	}
-
 	.lede {
 		color: var(--text-muted);
 		max-width: 80ch;
@@ -555,27 +586,6 @@
 		align-items: center;
 		gap: 10px;
 		flex-wrap: wrap;
-	}
-	.btn-secondary {
-		padding: 8px 16px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-		flex-shrink: 0;
-	}
-	.btn-secondary:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-	.btn-secondary:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
 	}
 	select {
 		padding: 7px 10px;

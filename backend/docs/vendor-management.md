@@ -59,6 +59,11 @@ so a status this build does not know (NULL included) is refused too:
 | `/retry-failed` | skipped with `vendor_not_active` |
 | `POST /api/cards/generate` | no card is minted for the invoice |
 | a card **already minted** | cancelled by the write that made the vendor un-payable — see § Leaving `active` cancels the vendor's live cards |
+| the ERP push (`/complete`, `/send-to-erp`, `/retry-erp`, auto-send, `_call_erp`) | refused (`vendor_blocks_erp_export`) for `rejected` or an unknown status, and for a vendor that is `payments_blocked` or whose last screen is `match` / `review` — but an **`unverified` or `inactive` vendor's approved bill still books**: it is a real debt, and only paying it needs a verified vendor. See [erp-integration.md](erp-integration.md) § A vendor the payment path will not pay refuses the push |
+
+`inactive_vendor_statuses` reads through `payment_runs.vendor_payability`, the
+one vendor read (status, `payments_blocked`, `screening_status`) the ERP push
+shares, so the two gates cannot read a vendor differently.
 
 Verifying the vendor (`POST /api/vendors/{id}/verify`) is the sign-off that
 releases its invoices — the gate reads the vendor's current status, never the
@@ -166,6 +171,13 @@ bank-detail record. When the same supplier exists both unstamped and under the
 invoice's own entity, the entity's own row wins (the candidate query orders it
 first).
 
+The CSV importers share the scope rather than restating it:
+`vendor_matching.scope_vendor_candidates` is the helper `_candidate_query`
+builds on, and `services/csv_import` applies it to its by-code and by-name
+lookups (no status filter there — an import has always resolved to an existing
+`inactive` / `rejected` record rather than minting a fresh stub beside it).
+See `csv-import.md` § Vendors resolve within the import's entity.
+
 `match_and_link_vendor` derives the entity from `invoice.entity_id`, so no
 caller passes it explicitly — including an inter-company **mirror** payable,
 which sits under the counterparty entity and therefore matches against the
@@ -212,6 +224,7 @@ The system can pull the vendor master list from the connected ERP. This ensures 
 |---|---|
 | ERP vendor not in local DB | Create new vendor with `source=erp_sync`, `status=active` |
 | ERP vendor matches by `erp_vendor_id` | Update fields if changed, update `erp_synced_at` |
+| Two local vendors hold that `erp_vendor_id` in this company (only before migration 0141) | Neither is touched; reported as a `duplicate_link` conflict (§ One vendor per ERP record per company) |
 | ERP vendor matches by name (no `erp_vendor_id` yet) | Link existing vendor to ERP, update fields |
 | Unverified vendor matches an ERP vendor by name | Auto-verify → set `status=active`, `source=erp_sync` |
 
@@ -221,7 +234,187 @@ The system can pull the vendor master list from the connected ERP. This ensures 
 
 Each synced vendor stores:
 - `erp_vendor_id` — the vendor's ID in the external ERP (for two-way mapping)
+- `erp_link_realm` — the ERP company that ID was issued in; the vendor's links
+  in other companies are kept in `vendor_erp_links` (decisions §284, §356)
 - `erp_synced_at` — timestamp of last sync
+
+**Merging vendors moves their ERP links.** `POST
+/api/enrichment/vendors/consolidation/merge` hands each duplicate's links (the
+row's and every kept one) to the canonical vendor in every company the
+canonical has no link in, so the merged vendor's bills still post and a later
+sync restores nothing onto the retired duplicate. Two different ids in one
+company refuse the merge 409 `vendor_merge_erp_link_conflict`; unlink the
+stale record (below) and merge again, or leave that duplicate out. Detail:
+[data-enrichment.md](data-enrichment.md) § `POST /api/enrichment/vendors/consolidation/merge`,
+[erp-integration.md](erp-integration.md); decisions §373.
+
+**A merge never changes the payee of an approved invoice still to be paid**
+(decisions §379). Such an invoice was signed for the duplicate's payee, and the
+payment run and the ERP push read the bank details of whichever vendor it
+names at the time, so re-pointed it would be paid to the canonical's account —
+which its approver never saw and no bank-change dual control covered. While
+any duplicate holds one (`approved`, `sending_to_erp`, `sent_to_erp`,
+`posted_in_erp`, `payment_scheduled`, or `failed` after an approval:
+`vendor_merge.approved_unpaid_clause`, `financially_locked` minus `paid` /
+`done`, the same population the bank-change flag covers) the merge is refused
+409 `vendor_merge_approved_unpaid`, `params.count` across every duplicate, with
+nothing written. The way through: let them be paid (a `paid` / `done`
+invoice's payee is history and is folded like every other row), or recall
+their approvals (`POST /api/invoices/{id}/recall-approval`, itself refused
+while a rail or the ERP holds the invoice). A recalled invoice moves with the
+merge and its next approval signs the canonical payee. A live virtual card on
+an approved invoice therefore refuses the merge too; cancel or settle the card
+first. An approval that lands while the merge runs is caught as well: the
+invoice reassignment skips such a row and a recount refuses the merge.
+
+### Linking a vendor to an ERP record by hand
+
+A sync links only the records the adapter's vendor walk lists. Xero's walk
+cannot see a contact that is already a **customer** and has had no bill and no
+PO from us (Xero sets `IsSupplier` only on a contact's first bill), so its first
+push would be refused `vendor_not_linked` for good. The vendor modal's ERP
+links panel therefore offers **Find this vendor in the ERP** to a `vendor.manage`
+holder while `GET /api/vendors/{id}/erp-links` answers `search_refusal: null` —
+`services/vendor_erp_manual_link`, decisions §415.
+
+`search_refusal` is a per-vendor verdict (`frontend/docs/ui-patterns.md` §
+Whether to offer an action), computed by `search_refusal()`, the gate both
+doors below raise from: `vendor_erp_search_unavailable` unless the stored
+settings select an adapter with `supports_vendor_search` (Xero today)
+connected to a named company and not needing a reconnect (read from the stored
+settings, no credential opened); else `vendor_erp_link_exists` when this vendor
+already holds a link in that company; else `null`. The link and unlink
+responses carry the vendor's new verdict, so the panel stops offering Link the
+moment a link lands (it states the `vendor_erp_link_exists` sentence in its
+place) and offers the search again once that company's link is cleared.
+
+- `POST /api/vendors/{id}/erp-links/search` `{"query": "<name>" | null}` reads
+  the ERP's whole contact list by name (the vendor's own when blank) and by the
+  vendor's stored tax number, which the server reads from the row: a tax number
+  never travels in a request or comes back. Each candidate states
+  `tax_id_matches` (separators and case aside), `active`, and
+  `linked_elsewhere` when another vendor already holds it in this company (a
+  flag, never the holder's id).
+  `truncated` when the ERP had more matches than one search reads. Reads only.
+  Refused like the verdict: 409 `vendor_erp_search_unavailable`, or
+  `vendor_erp_link_exists` for a vendor already linked in this company (there
+  is nothing to search for until that link is cleared).
+- `POST /api/vendors/{id}/erp-links/link` `{"erp_vendor_id"}` re-reads the
+  record from the ERP first: 404 `erp_vendor_not_found`, 409
+  `erp_vendor_inactive` (archived / erased). 409 `vendor_erp_link_exists` when
+  the vendor already holds a link in this company (on its row, kept for it, or
+  a row link naming no company): unlink first. 409 `erp_vendor_already_linked`
+  when another vendor holds the record here. 409
+  `vendor_erp_search_unavailable` when the ERP cannot be searched. The
+  verdict is checked before the record is read (no ERP round trip for a vendor
+  already linked here) and again under the vendor row lock and an advisory
+  lock on `(organization, realm)` that the vendor sync takes too.
+- **Only the link is written**, stamped with the connected company. A row link
+  from another company is kept for it (§356). The vendor's name and tax id stay
+  as keyed; a later sync that lists the record matches it by id and updates
+  them by the normal rules, and a sync that does not list it leaves the link
+  alone (a same-company link is never re-judged).
+- **Audited** as `vendor.erp_linked`, `details` `{realm, erp_vendor_id,
+  erp_name, tax_id_matches, kept?}`.
+
+### Unlinking a vendor from one ERP company
+
+`GET /api/vendors/{id}/erp-links` lists the vendor's links, one per company:
+the row link (`placement: row`, the company it was last synced in, `realm`
+null when none was recorded) and each kept link (`placement: kept`). `POST
+/api/vendors/{id}/erp-links/unlink` with `{"realm": "<adapter>:<company>"}` (or
+`null` for the unnamed row link, which must be asked for explicitly) clears the
+vendor's link in that company: the row link when it is that company's and the
+kept link for it, both if both exist (`services/vendor_erp_unlink`, decisions
+§375). It is the way through a merge refused `vendor_merge_erp_link_conflict`.
+
+- **`vendor.manage`** (admin / ap_manager by default), like every other edit to
+  the vendor master. The list is the vendor detail's readers.
+- **Refused while an invoice is in flight** to that company: 409
+  `vendor_erp_unlink_in_flight`, `params.invoices` the count, no invoice named.
+  In flight means `sending_to_erp` (in any company, since the push resolves
+  the link when it runs), `sent_to_erp` whose recorded `erp_realm` is that
+  company or is missing, and a `failed` push whose outcome is unknown
+  (`services/erp.possibly_posted`, any company). From `posted_in_erp` on, the
+  bill carries its own id and nothing reads the vendor's link for it again.
+- **404 `vendor_erp_link_not_found`** when the vendor holds no link there.
+- **Audited** as `vendor.erp_unlinked`, `details` `{realm, cleared: [{placement,
+  erp_vendor_id}]}`. Ids only.
+- **The consequence is visible**: the vendor's next push to that company is
+  refused `vendor_not_linked` before any HTTP call.
+- **A later sync follows the ordinary rules.** The unlink is not a "never link"
+  marker. Nothing is kept for that company any more, so nothing is restored;
+  the record is matched by id only if a vendor holds it; and it is adopted by
+  name only when the name is unique among the pulled records and among the
+  unlinked local vendors (an ambiguous name is reported as a conflict and links
+  nothing). A vendor still linked in that company is never a name candidate,
+  so a sync cannot put the stale record onto the vendor a merge kept. A record
+  that should never link again is made inactive in the ERP: inactive records
+  are never linked or created.
+
+The vendor modal's **ERP links** panel lists the links and offers an armed
+two-click **Unlink** per company to `vendor.manage` holders: a click anywhere
+else in the modal un-arms it. The table pans inside a named, focusable region
+(`role="region"`, `tabindex="0"`) rather than scrolling a 320px page sideways;
+`tests-e2e/vendors/erp-unlink.spec.ts` runs axe on it at desktop width and at
+320px.
+
+### One vendor per ERP record per company
+
+`uq_vendors_erp_link` (migration 0141, decisions §486) is a partial unique
+index on `vendors (organization_id, erp_link_realm, erp_vendor_id) NULLS NOT
+DISTINCT WHERE erp_vendor_id IS NOT NULL`: no two vendors hold one ERP record's
+id in one company. A NULL realm (a link from before migration 0115, or one a
+no-realm sync made) counts as one company, because the no-realm sync looks
+those links up as `erp_link_realm IS NULL`. The same id under two named
+companies, or under a named company and NULL, is allowed: QuickBooks numbers
+vendors per company, so those may be two records, and a sync under the named
+company re-judges the NULL link by evidence. Kept links (`vendor_erp_links`)
+are outside the index; the sync's restore and the hand-made link already
+refuse an id another vendor holds in that company.
+
+Before this index, two holders of one id made the sync's lookup by id raise
+and abort the whole pull. The sync now reports such a record instead
+(`conflicts`, reason `duplicate_link`, and "not updated" in the response
+message), leaves both vendors untouched, and syncs the rest. A record the
+pull lists twice is reported once (deduplicated on its ERP id), so the message
+counts records, not sightings. On a migrated tenant the index makes that
+unreachable; the check is for a tenant still before 0141.
+
+Every sync takes the link lock (`vendor_erp_manual_link.link_lock`, §415)
+before it reads a link, a no-realm sync included (under a key no named
+company can produce). Two no-realm pulls of one new record would otherwise
+both find no holder and both create a vendor, and the second would fail the
+index at flush with a 500; with the lock the second waits, then finds the
+first one's vendor and leaves it unchanged (decisions §489).
+
+#### Duplicate ERP links
+
+Migration 0141 **refuses** (`DuplicateErpVendorLink`, nothing changed) on a
+tenant where two or more vendors already share a link in one company, naming
+the database, the counts and at most ten vendor row ids, never a vendor name or
+the ERP company. `scripts/migrate_all_tenants.py` then exits non-zero and the
+deploy stops. To list every group in that tenant database:
+
+```sql
+SELECT erp_link_realm, erp_vendor_id, array_agg(id ORDER BY id) AS vendor_ids
+FROM vendors
+WHERE erp_vendor_id IS NOT NULL
+GROUP BY organization_id, erp_link_realm, erp_vendor_id
+HAVING count(*) > 1;
+```
+
+For each group, choose in the app which vendor keeps the link:
+
+- **One supplier, several vendor rows**: merge them (`POST
+  /api/enrichment/vendors/consolidation/merge`). The same id in the same
+  company is *released* from each duplicate, so the merge clears the group.
+- **Different suppliers**: unlink the stale record from every vendor but the
+  right one (`POST /api/vendors/{id}/erp-links/unlink`, `realm` as listed, or
+  `null` for a NULL realm).
+
+Then re-run the migration. It never chooses for you: which vendor the ERP's
+bills post to is the call a merge or an unlink records in the audit trail.
 
 ### Every changed vendor writes an audit row
 
@@ -279,8 +472,8 @@ written. Provisioning a supplier credential is the segregation-of-duties half
 that used to leave no trace: an account that can submit invoices and stage
 bank-detail changes could be created, used and deleted, and the trail would show
 only the deletion. `details` is `{"vendor_user_id": ...}` — never the supplier's
-login address, and never the temp password the invite email carries (the
-response body no longer carries one at all).
+login address, and never the set-password link the invite email carries (the
+response body carries no credential at all).
 
 The invite also stamps `vendor_users.provisioned_by_user_id` with the AP actor,
 and `POST /api/vendors/{id}/portal-users/{vendor_user_id}/reset-password`
@@ -403,7 +596,13 @@ that it changed plus a last-4 — never the number.
 | `POST` | `/api/vendors/{id}/verify` | Verify an unverified vendor → active |
 | `POST` | `/api/vendors/{id}/reject` | Reject a vendor → rejected (cancels its live, unbooked cards — § Leaving `active` cancels the vendor's live cards) |
 | `POST` | `/api/vendors/{id}/cancel-cards` | Retry the card leg on an un-payable vendor (`vendor.manage` or `vendor.block`; 409 on a payable vendor) |
+| `GET` | `/api/vendors/{id}/erp-links` | The vendor's ERP links, one per company (row + kept) |
+| `POST` | `/api/vendors/{id}/erp-links/unlink` | Clear the vendor's link in one ERP company (`vendor.manage`; 409 while an invoice is in flight there) — § Unlinking a vendor from one ERP company |
+| `POST` | `/api/vendors/{id}/erp-links/search` | Search the connected ERP's whole contact list for this vendor's record, by name and its tax number (`vendor.manage`) — § Linking a vendor to an ERP record by hand |
+| `POST` | `/api/vendors/{id}/erp-links/link` | Link the vendor to one ERP record in the connected company, re-read first (`vendor.manage`) — § Linking a vendor to an ERP record by hand |
 | `POST` | `/api/vendors/sync-erp` | Pull vendors from connected ERP |
+| `POST` | `/api/vendors/{id}/screening/adjudicate` | Record the stored `match` / `review` screen as a false positive, `{reason, sanctions_check_id}` required (`vendor.sanctions.adjudicate`; 409 when the id is no longer the latest stored screen) — § Adjudicating a sanctions false positive |
+| `POST` | `/api/vendors/{id}/screening/adjudication/revoke` | End every active adjudication, `{reason}` required (`vendor.sanctions.adjudicate`); returns the revoked rows |
 
 ### The paginated lists issue a fixed number of queries
 
@@ -465,6 +664,63 @@ also pins the specific statement that regressed.
 
 Unverified rows highlighted yellow. Rejected rows dimmed.
 
+## Adjudicating a sanctions false positive
+
+A vendor the screening provider keeps flagging wrongly would otherwise be
+neither payable (dispatch and `/compliance/release` re-screen live) nor
+bookable (the ERP push reads the stored screen, decisions §333). A reviewer
+holding `vendor.sanctions.adjudicate` records, from the screening review queue
+(`/vendors/screening`), that the vendor's stored `match` / `review` result is
+not this vendor (decisions §477):
+
+- **One result, not the vendor.** The row (`sanctions_adjudications`, migration
+  0139) keeps who, when, the required reason, the screen it judged, and the
+  result's identity: provider, verdict, list name and a sha256 fingerprint of
+  the matched entry (`services/sanctions_adjudication.screen_fingerprint`; an
+  adapter's own `raw_response.match_fingerprint` — entry id + list version —
+  when it sets one). Only the hash is stored, never match details.
+- **What respects it.** A later stored screen with the same provider and
+  fingerprint keeps `vendors.screening_adjudication_id` set and, on a `match`,
+  neither re-blocks nor revokes cards; the run gate and the ERP push
+  (`payment_runs.VendorPayability`) lift the `match` / `review` hold while it is
+  set; the live pre-payment screen reads the covered result as clear. A new or
+  different hit (another entry, another list, `review` → `match`, a republished
+  list version) is not covered and holds again.
+- **The sticky block stays.** A `match` set `payments_blocked`; lifting it is
+  still `POST /{id}/unblock` (`vendor.block`), and not by the adjudicator, so
+  clearing a match takes two people.
+- **Segregation.** Refused (403 `sanctions_adjudication_segregation`) for the
+  vendor's onboarder (`vendors.onboarded_by_user_id`, stamped by create and the
+  CSV imports since 0139) and for the latest applied bank change's requester,
+  the AP user who provisioned the portal login that requested it, and its
+  approver. Other refusals: `sanctions_adjudication_not_flagged`,
+  `sanctions_adjudication_already_cleared`, `sanctions_adjudication_no_screen`
+  (adjudicate), `sanctions_adjudication_not_active` (revoke).
+- **Audit.** `vendor.sanctions_adjudicated` / `vendor.sanctions_adjudication_revoked`
+  (adjudication id, check id, provider, verdict, list, fingerprint, reason) and
+  a status-change row `vendor.screening_clearance_changed` (`from` / `to`) for
+  each. Revoking re-arms both gates at once and needs no segregation.
+- **Queue verdicts.** Each review-queue row carries `latest_check_id` (the
+  stored screen it shows, never a `pre_payment` row), `adjudication` (the one
+  covering it), `active_adjudications` (every unrevoked one), and
+  `adjudicate_refusal` / `revoke_adjudication_refusal`, from the gates the two
+  endpoints raise.
+- **The stamp covers the screen the reviewer saw.** Adjudicate posts
+  `sanctions_check_id`; a newer stored screen answers 409
+  `sanctions_adjudication_stale_screen`.
+- **Changed inputs owe a new judgement.** The fingerprint includes a hash of the
+  screened inputs (name, tax id, bank country, owners, latest applied bank
+  change). Every material edit clears `screening_adjudication_id` before its
+  best-effort re-screen (`sanctions_adjudication.uncover_for_material_edit`,
+  run by `vendor_screening.screen_best_effort`), so a failed re-screen leaves
+  the vendor held.
+- **Revoke ends every active adjudication**; a revoked `match` re-sets the
+  sticky block and closes live cards in the same transaction. The adjudicator
+  of a covering match may not `/unblock` it (403 `vendor_unblock_adjudicator`).
+- **Web only.** The mobile app deliberately has no adjudication UI: it is a
+  compliance judgement with a written reason, made from the screening queue
+  on the web.
+
 ## Role Access
 
 | Action | Admin | AP Manager | AP Clerk | CFO |
@@ -477,14 +733,18 @@ Unverified rows highlighted yellow. Rejected rows dimmed.
 | Sync from ERP | Yes | Yes | No | No |
 | Delete vendor | Yes | Yes | No | No |
 | Block / unblock payments | Yes | Yes | No | No |
+| Unlink from an ERP company | Yes | Yes | No | No |
 | Approve a bank-detail change | Yes | Yes | No | No |
+| Adjudicate / revoke a sanctions false positive | Yes | No | No | Yes |
 
-Create / edit / verify / reject / sync / import / delete are all
+Create / edit / verify / reject / sync / import / delete / ERP unlink are all
 `require_permission(vendor.manage)`; block / unblock is `vendor.block`; a
 bank-change approval is `vendor.bank_change.approve` and refuses the proposer.
 `admin` and `ap_manager` hold all three by default, CFO and clerk none
 (`backend/app/api/permissions.py::ROLE_DEFAULT_PERMISSIONS`); a custom role can
-be granted any of them.
+be granted any of them. Adjudicating a sanctions false positive is
+`vendor.sanctions.adjudicate`, held by `admin` and `cfo` by default, not
+`ap_manager` (§ Adjudicating a sanctions false positive).
 
 ## Integration with Invoice Processing
 

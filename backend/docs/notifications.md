@@ -30,7 +30,17 @@ commits**, not inside it. `notify_event` and
 `vendor_notifications.notify_vendor_of_invoice_event` do their DB work
 (recipient load, preference gating, the in-app `Notification` rows) inline and
 then hand a closure to `services/post_commit.enqueue_post_commit`, which fires
-it from SQLAlchemy's `after_commit` event.
+it from SQLAlchemy's `after_commit` event. The outbound webhook emits from the
+same transition ride the same queue (`backend/docs/public-api.md` § Dispatch,
+`docs/decisions.md` §427), as does the ERP auto-send.
+
+**Savepoints are not commits.** SQLAlchemy fires `after_commit` when a SAVEPOINT
+is released and `after_rollback` when one rolls back. The queue ignores a
+release (the outer transaction is still open) and, on a savepoint rollback,
+drops only the jobs queued inside that savepoint. Before this, bulk approve
+(one savepoint per row) sent its emails at the first row's release, inside the
+open transaction, and a skipped row's rollback dropped whatever had been queued since
+(`docs/decisions.md` §304).
 
 Why it had to move: `transition_invoice` awaited the whole fan-out — one email
 per recipient, serially, then a chat POST with a 10-second `httpx` timeout —
@@ -80,6 +90,8 @@ transaction.
 | `invoice_paid` | `transition_invoice → paid` (payment webhook / ERP webhook / ERP-sync) | invoice uploader + every `ap_manager` in the org |
 | `chat_message` | supplier posts on the portal → every `ap_manager`; AP posts with @mentions → the mentioned AP users (poster excluded) | see below |
 | `ai_invoice_usage` | the org crosses 80% / 100% of its plan's monthly AI-read-invoice allowance, or its AI spending cap (`services/billing/ai_usage_notices.py`, checked after every billable read and by the `billing-ai-overage` sweep) | every org `admin` — once per threshold per UTC month, claimed under the org row lock (`billing.md` § Notices). `entity_type="billing"`, `entity_id` NULL |
+| `erp_connection_expiring` | the org's OAuth ERP connection (QuickBooks Online, Xero, …) is inside a refresh-token expiry lead (30 / 7 / 1 days by default), or the provider refused it and it needs reconnecting (`services/erp_connection_health.py`, sweep `erp-connection-health`, decisions §295) | every org `admin` — once per (reported expiry, lead), and once per lost connection; marker in `settings.erp.oauth`. `entity_type="organization"`, `entity_id` NULL |
+| `erp_call_quota` | the org passes 80% of its daily share of an ERP API quota several tenants share (Blackbaud's SKY platform key), uses all of it, or the provider says the subscription's quota is used (a 403 + `Retry-After`, or our own count of the key) — `services/erp_call_budget.py`, raised inline by the adapter's call, decisions §322 | every org `admin` (delivered by `erp_connection_health.notify_org_admins`) — once per notice per UTC day, claimed by a Redis SET NX and released when nobody could be told. `entity_type="organization"`, `entity_id` NULL |
 
 `ap_manager` recipients are resolved against the control plane via
 `notification_dispatch.resolve_role_user_ids(org_id, "ap_manager")`.
@@ -276,6 +288,13 @@ fires. Every refusal answers with one generic, value-free 422: FastAPI's default
 validation body echoes the offending `input`, so the URL field carries no
 Pydantic constraints and all checks run in the handler instead.
 
+At send time the adapters post through `url_safety.org_host_client` (the
+per-org host client, decisions §339; no dev loopback allowance), so the check
+and the connection cannot see two different DNS answers: the host is re-vetted
+inside the connect and the socket opens to the vetted IP. A refusal
+there is logged (event type only) and the post is skipped, like a refusal at
+the check.
+
 ### Wiring
 
 `notification_dispatch.notify_event` dispatches chat **after** the per-recipient
@@ -377,7 +396,9 @@ User-global, stored on the control-plane `users.notification_prefs` JSONB:
   "contract_renewal_due":     { "email": true, "in_app": true },
   "chat_message":             { "email": true, "in_app": true },
   "cash_shortfall_projected": { "email": true, "in_app": true },
-  "ai_invoice_usage":         { "email": true, "in_app": true }
+  "ai_invoice_usage":         { "email": true, "in_app": true },
+  "erp_connection_expiring":  { "email": true, "in_app": true },
+  "erp_call_quota":           { "email": true, "in_app": true }
 }
 ```
 
@@ -456,6 +477,13 @@ reset link, token or credential must set one that names none of them. The
 sign-in-code, password-reset, user-invite, supplier-invite, portal-reset and
 signup welcome senders do. Unset, the client previews the body as it always did.
 
+**The subject is one line, whatever a sender interpolates.** Subjects carry names
+nobody validated for control characters — an organisation name, a vendor name.
+`EmailMessage` folds every control character and line/paragraph separator in
+`subject` to a space on construction (`email_adapters/base.header_line`), so a
+line break can neither inject a header nor make the SMTP adapter's `email`
+policy refuse the message. Guard: `tests/test_smtp_email_adapter.py`.
+
 ## Localized email
 
 Outbound transactional email renders server-side, so the recipient's language is
@@ -528,6 +556,15 @@ Tenant table `notifications` (`models/notification.py`):
 - `title`, `body`, `read_at` (NULL = unread)
 - indexes: `(recipient_user_id)` and `(recipient_user_id, read_at)` for the
   unread-count query
+
+`entity_type` decides where the row opens in the web app: the bell and
+`/notifications` both resolve it through
+`frontend/src/lib/utils/notificationHref.ts` (`NOTIFICATION_ROUTES`), and a row
+whose type has no route there (or whose `entity_id` is missing for a
+record-scoped type) renders as plain text. A new `entity_type` passed to
+`notify_event` therefore needs an entry in that map:
+`notificationHref.test.ts` scans every `notify_event` call under
+`backend/app/services/` and fails when one is missing.
 
 ## API
 
@@ -663,6 +700,19 @@ adds no reachability — it hands the custom-domain resolver and the subdomain
 resolver a conflicting claim on one hostname, and lets one tenant claim a name
 another tenant's slug owns (or takes at the next signup). The refusal echoes no
 hostname, matching the endpoint's existing PII-free posture.
+
+## Sub-processor change notices (contractual, not a notification event)
+
+`services/subprocessor_notices.py` emails the DPA's 30-day sub-processor change
+notice (decisions §321, issue #427). It is deliberately **outside** everything
+above: it is not a `NOTIFICATION_EVENT_TYPES` member, writes no in-app row and
+never goes through `notify_event`, because per-user preferences must not be able
+to switch off a notice the DPA promises. It calls `get_email_adapter()` directly,
+once per active system-`admin` of each organisation, in English (the language of
+the DPA, decisions §174), with no tenant brand (the platform is the processor
+giving notice). Idempotency is the control-plane `subprocessor_notices` ledger,
+not a preference or a Redis key. The source is a change-log entry, not an app
+event: see `docs/sub-processors.md` § Maintenance for how to add one.
 
 ## Configuration & local-first
 

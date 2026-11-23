@@ -20,7 +20,10 @@ from fastapi import HTTPException
 # These tests drive the payment money paths over a hand-built `AsyncMock`
 # session, which cannot model the invoice lock's SAVEPOINT-scoped bound — see
 # the `mock_session_lock_wait` fixture in conftest.py.
-pytestmark = pytest.mark.usefixtures("mock_session_lock_wait")
+# `provider_store_from_settings`: the void reads the payments block through the
+# sealed-credential store, which a mocked session cannot answer — without it the
+# read fell through to the real control engine, bound to an earlier test's loop.
+pytestmark = pytest.mark.usefixtures("mock_session_lock_wait", "provider_store_from_settings")
 
 
 def _db_returning_scalar(value):
@@ -41,14 +44,23 @@ def _void_db(payment, invoice=None):
     separate `execute` (also `scalar_one_or_none`). The 404 path stops
     after the first query, so passing `payment=None` only needs the one
     result configured.
+
+    Voiding a COMPLETED payment then reads the invoice's workflow instance
+    (`erp_payment_writeback.record_pending_erp_void`, decisions §295) to
+    record any ERP write-back that must be voided too. The third result is
+    "no instance": an invoice never posted to an ERP, so nothing is recorded
+    and no ERP void is dispatched. The recorded case is pinned against a
+    real DB in test_erp_payment_writeback.py.
     """
     pay_res = MagicMock()
     pay_res.scalar_one_or_none = MagicMock(return_value=payment)
     inv_res = MagicMock()
     inv_res.scalar_one_or_none = MagicMock(return_value=invoice)
+    wf_res = MagicMock()
+    wf_res.scalar_one_or_none = MagicMock(return_value=None)
 
     session = AsyncMock()
-    session.execute = AsyncMock(side_effect=[pay_res, inv_res])
+    session.execute = AsyncMock(side_effect=[pay_res, inv_res, wf_res])
     return session
 
 
@@ -207,6 +219,11 @@ async def test_void_payment_returns_invoice_to_approved_via_transition_invoice()
             new_callable=AsyncMock,
             return_value=[],
         ),
+        # The re-payment payee check queries vendors, change requests and the
+        # audit trail, which this mock session doesn't model either; it is
+        # pinned against a real DB in test_payment_payee_stamp.py and
+        # test_erp_export_blocking_exceptions.py.
+        patch("app.api.payments.flag_repayment_payee_change", new_callable=AsyncMock),
     ):
         ti.return_value = invoice
         da.return_value = None
@@ -227,6 +244,10 @@ async def test_void_payment_returns_invoice_to_approved_via_transition_invoice()
 
     # And the payment.voided audit row is dispatched alongside.
     da.assert_awaited_once()
+
+    # Voiding a completed payment consulted the invoice's ERP state for a
+    # write-back to reverse, inside the void's own transaction.
+    assert db.execute.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -301,6 +322,11 @@ async def test_void_audit_records_real_previous_status_and_decimal_amount():
             new_callable=AsyncMock,
             return_value=[],
         ),
+        # The re-payment payee check queries vendors, change requests and the
+        # audit trail, which this mock session doesn't model either; it is
+        # pinned against a real DB in test_payment_payee_stamp.py and
+        # test_erp_export_blocking_exceptions.py.
+        patch("app.api.payments.flag_repayment_payee_change", new_callable=AsyncMock),
     ):
         ti.return_value = invoice
         da.return_value = None

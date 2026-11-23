@@ -2,7 +2,10 @@
 	import type { Snippet } from 'svelte';
 	import { asset } from '$app/paths';
 	import Atmosphere from '#lib/components/marketing/Atmosphere.svelte';
+	import ThemePicker from '#lib/components/ui/ThemePicker.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { TALLY_ORNAMENT, TALLY_ORNAMENT_SIZE } from '#lib/marketing/ornament.ts';
+	import { theme } from '#lib/stores/theme.svelte.ts';
 
 	/**
 	 * The split-screen frame every pre-auth employee page renders inside: the
@@ -41,8 +44,9 @@
 	 * - `panel` — the panel's page-specific content, rendered under the tagline.
 	 * - `panelOnMobile` — keep the panel (stacked under the form) below the
 	 *   desktop breakpoint. Signup takes it, because its panel says what happens
-	 *   after you press the button; sign-in's panel is brand only, and on a phone
-	 *   it would push the form's context below the fold for nothing.
+	 *   after you press the button; sign-in's panel is the tagline and three short
+	 *   proofs a returning user has already read, and on a phone it would push
+	 *   the form's context below the fold for nothing.
 	 */
 	interface Props {
 		children: Snippet;
@@ -56,11 +60,25 @@
 </script>
 
 <div class="auth-shell" class:panel-on-mobile={panelOnMobile}>
-	<div class="form-col">
+	<!-- The page's one `<main>` (WCAG 1.3.1 / 2.4.1): the root layout's public
+	     branch renders the slot bare, so without this the sign-in, signup and
+	     verify pages had no main landmark at all. Same id and `tabindex="-1"`
+	     as the app shell's and the portal's, so `ui/LoadError`'s focus fallback
+	     (`closest('main')`) has a target here too. No skip link: the form is
+	     first in DOM order, so there is no block to bypass. The brand panel is
+	     a sibling `<aside>`, outside it, because it is not the page's content. -->
+	<main id="main-content" tabindex="-1" class="form-col">
 		<div class="form-wrap">
 			{@render children()}
 		</div>
-	</div>
+		<!-- Outside .form-wrap so the shell's input and label styles never reach
+		     it. Here because these pages come before any account, and signup is
+		     on the apex: a theme picked now carries into the workspace it creates
+		     (docs/decisions.md §290). Last in DOM order, after the form. -->
+		<div class="theme-pick">
+			<ThemePicker name="auth-theme" />
+		</div>
+	</main>
 
 	<aside class="panel" aria-labelledby={panelHeadingId}>
 		<Atmosphere dense still />
@@ -80,9 +98,9 @@
 			     depicts, so an alt text would announce the same idea twice. -->
 			<img
 				class="panel-art"
-				src={asset('marketing/tally-split.webp')}
-				width="1100"
-				height="460"
+				src={asset(TALLY_ORNAMENT[theme.resolved])}
+				width={TALLY_ORNAMENT_SIZE.width}
+				height={TALLY_ORNAMENT_SIZE.height}
 				alt=""
 				decoding="async"
 				draggable="false"
@@ -102,30 +120,56 @@
 	/* ----------------------------- form column ---------------------------- */
 	.form-col {
 		display: flex;
+		flex-direction: column;
 		align-items: center;
 		justify-content: center;
+		gap: 36px;
 		padding: 48px 32px;
 	}
 	.form-wrap {
 		width: min(420px, 100%);
 	}
+	.theme-pick {
+		width: min(420px, 100%);
+	}
 
 	/* ------------------------------- panel -------------------------------- */
+	/* `overflow: hidden` is for the DECORATION only: the art below is drawn
+	   wider than the panel and bleeds off its right edge on purpose, and the
+	   backdrop's corners must follow the radius. Text must never reach that
+	   clip (issue #635 reported step 3 of signup's panel cut mid-word at
+	   ~1000px; a word too long for its line is the case that reproduces it).
+	   Two things keep it out: the panel has no height of its own (a grid item,
+	   sized by its content, so nothing is cut at the bottom), and every line
+	   in `.panel-inner` can wrap — `min-width: 0` down the flex chain and
+	   `overflow-wrap: anywhere`, which also lowers the min-content width, so
+	   even an unbroken token (a long compound word, an address) wraps inside
+	   the box instead of running under the clip. Guard:
+	   `tests-e2e/signup/panel-layout.spec.ts`. */
 	.panel {
 		position: relative;
 		overflow: hidden;
 		margin: 14px 14px 14px 0;
 		border-radius: 24px;
-		border: 1px solid rgba(226, 228, 234, 0.07);
-		background: linear-gradient(160deg, #141a2e 0%, #0d101a 70%);
+		border: 1px solid color-mix(in srgb, var(--text) 7%, transparent);
+		background: linear-gradient(
+			160deg,
+			color-mix(in srgb, var(--accent) 8%, var(--surface)) 0%,
+			var(--bg) 70%
+		);
 	}
 	.panel-inner {
 		position: relative;
 		z-index: 1;
 		height: 100%;
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
 		padding: 44px 48px 36px;
+		overflow-wrap: anywhere;
+	}
+	.panel-inner > * {
+		min-width: 0;
 	}
 	.tagline {
 		/* `margin-top: auto` replaces the removed brand block's `margin-bottom:
@@ -161,8 +205,8 @@
 		max-width: none;
 		height: auto;
 		margin: 28px -6% 0 auto;
-		filter: drop-shadow(0 24px 40px rgba(231, 185, 94, 0.13))
-			drop-shadow(0 8px 16px rgba(0, 0, 0, 0.5));
+		filter: drop-shadow(0 24px 40px color-mix(in srgb, var(--gilt) 13%, transparent))
+			drop-shadow(0 8px 16px var(--drop-shade));
 		animation: art-in 1s cubic-bezier(0.22, 1, 0.36, 1) 0.3s backwards;
 	}
 	@keyframes panel-in {
@@ -272,7 +316,7 @@
 		transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 	}
 	.form-wrap :global(:where(input:not([type='checkbox']):not([type='radio']):hover)) {
-		border-color: #3a3e4f;
+		border-color: var(--border-strong);
 	}
 	/* A focus RING, not only a border colour change (WCAG 2.4.7 Focus
 	   Visible): a 1px border shifting from #2a2d3a to the accent is exactly
@@ -281,7 +325,7 @@
 	.form-wrap :global(:where(input:not([type='checkbox']):not([type='radio']):focus)) {
 		outline: none;
 		border-color: var(--accent);
-		box-shadow: 0 0 0 4px rgba(99, 140, 255, 0.22);
+		box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent);
 	}
 	.form-wrap :global(:where(input[aria-invalid='true'])) {
 		border-color: var(--danger);
@@ -304,12 +348,12 @@
 		font-size: 0.95rem;
 		font-weight: 600;
 		cursor: pointer;
-		box-shadow: 0 14px 30px -14px rgba(99, 140, 255, 0.95);
+		box-shadow: 0 14px 30px -14px color-mix(in srgb, var(--accent) 95%, transparent);
 		transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
 	}
 	.form-wrap :global(:where(button[type='submit']:hover:not(:disabled))) {
 		transform: translateY(-1px);
-		box-shadow: 0 18px 34px -14px rgba(99, 140, 255, 1);
+		box-shadow: 0 18px 34px -14px color-mix(in srgb, var(--accent) 100%, transparent);
 	}
 	.form-wrap :global(:where(button[type='submit']:active:not(:disabled))) {
 		transform: translateY(0);
@@ -324,15 +368,35 @@
 		box-shadow: none;
 	}
 
+	/* Stacked, not a row: a banner that carries an action under its sentence
+	   (login's "go to your workspace" link) put it in a narrow column beside
+	   the text, which overflowed the box at 320px. A long unbroken token
+	   wraps rather than pushing past the edge. */
 	.form-wrap :global(:where(.error)) {
 		display: flex;
-		gap: 8px;
+		flex-direction: column;
+		gap: 6px;
+		overflow-wrap: anywhere;
 		padding: 11px 14px;
 		border-radius: 10px;
-		border: 1px solid rgba(248, 113, 113, 0.35);
+		border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
 		background: var(--danger-tint);
 		color: var(--danger-on-tint);
 		font-size: 0.86rem;
 		line-height: 1.45;
+	}
+
+	/* Information, not a failure: a notice the page shows on arrival (the MFA
+	   enrolment note, login's "you were signed out" reason). Accent tint, body
+	   text, announced politely by the page's `role="status"` region. */
+	.form-wrap :global(:where(.info)) {
+		padding: 11px 14px;
+		border-radius: 10px;
+		border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+		background: var(--accent-tint);
+		color: var(--text);
+		font-size: 0.85rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
 	}
 </style>

@@ -1,17 +1,19 @@
 import 'dart:convert';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/exceptions_screen.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/exception_store.dart';
+import 'package:feohledger_mobile/widgets/async_list_body.dart';
 import 'package:feohledger_mobile/widgets/bulk_action_bar.dart';
 import 'package:feohledger_mobile/widgets/exception_list_tile.dart';
 
@@ -49,7 +51,7 @@ Future<void> _loginThen(List<String> roles, MockClient screenClient) async {
 }
 
 Widget _localized(Widget home) => MaterialApp(
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      localizationsDelegates: appLocalizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: home,
     );
@@ -65,6 +67,9 @@ Map<String, dynamic> _exceptionJson(
   String status = 'open',
   String type = 'duplicate',
   String typeLabel = 'Duplicate Invoice',
+  // The caller's `decision_refusals`; defaults to a manager's (see
+  // [_managerDecisions]). `null` models a row that carries none.
+  Object? decisions = _managerDefault,
 }) =>
     {
       'id': id,
@@ -78,7 +83,29 @@ Map<String, dynamic> _exceptionJson(
       'status': status,
       'is_overdue': false,
       'created_at': '2026-01-01T12:00:00',
+      'decision_refusals': identical(decisions, _managerDefault)
+          ? _managerDecisions(status)
+          : decisions,
     };
+
+const _managerDefault = Object();
+
+const _notActionable = {
+  'code': 'exception_not_actionable',
+  'message': "Cannot resolve from 'resolved' status",
+  'params': <String, dynamic>{},
+};
+
+/// `decision_refusals` as `api/exceptions.py::decision_refusals` builds them
+/// for a reader holding the queue's role with no segregation conflict: every
+/// action accepted on an open or escalated row, the status refusal otherwise.
+Map<String, dynamic> _managerDecisions(String status) {
+  final actionable = status == 'open' || status == 'escalated';
+  return {
+    for (final a in ['resolve', 'dismiss', 'escalate'])
+      a: actionable ? null : _notActionable,
+  };
+}
 
 /// Pumps fixed bounded frames until [finder] is present (or the budget is
 /// exhausted). Never pumpAndSettle — a pending fetch leaves a spinner
@@ -141,6 +168,37 @@ void main() {
 
     expect(find.text('No exceptions'), findsOneWidget);
     expect(find.byType(ExceptionListTile), findsNothing);
+  });
+
+  testWidgets('a failed load shows Retry, not the queue-clear copy',
+      (tester) async {
+    var fail = true;
+    ApiClient().debugConfigure(
+      client: MockClient((req) async => fail
+          ? http.Response('boom', 500)
+          : _list([_exceptionJson('1', typeLabel: 'Duplicate Invoice')])),
+    );
+
+    await tester.pumpWidget(_localized(const ExceptionsScreen()));
+    await _pumpUntil(tester, find.widgetWithText(FilledButton, 'Retry'));
+
+    expect(
+      // A server that answered with a 500 is not a connection problem: the
+      // sentence carries its reason, not "check your connection".
+      find.text(
+        "Couldn't load exceptions: "
+        "The server couldn't complete the request (HTTP 500).",
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('No exceptions'), findsNothing);
+    expect(find.text('The exception queue is clear'), findsNothing);
+
+    // Retry refetches, and the rows replace the error.
+    fail = false;
+    await tester.tap(find.widgetWithText(FilledButton, 'Retry'));
+    await _pumpUntil(tester, find.byType(ExceptionListTile));
+    expect(find.byType(ExceptionListTile), findsOneWidget);
   });
 
   testWidgets('renders the status filter chips', (tester) async {
@@ -217,6 +275,71 @@ void main() {
     await _pumpUntilTrue(tester, () => sentAction != null);
 
     expect(sentAction, 'resolve');
+  });
+
+  // The queue swipes only in a direction `decision_refusals` accepts.
+  group('decision verdicts on the queue', () {
+    Future<void> pumpRow(WidgetTester tester, Object? decisions) async {
+      await _loginThen(
+        ['ap_manager'],
+        MockClient(
+          (req) async => _list([_exceptionJson('1', decisions: decisions)]),
+        ),
+      );
+      addTearDown(AuthStore.instance.logout);
+      await tester.pumpWidget(_localized(const ExceptionsScreen()));
+      await _pumpUntil(tester, find.byType(ExceptionListTile));
+    }
+
+    testWidgets('an accepted row swipes both ways', (tester) async {
+      await pumpRow(
+        tester,
+        {'resolve': null, 'dismiss': null, 'escalate': null},
+      );
+      expect(
+        tester.widget<Dismissible>(find.byType(Dismissible)).direction,
+        DismissDirection.horizontal,
+      );
+    });
+
+    testWidgets('a segregation refusal leaves no swipe, but the row can still '
+        'be selected and opened', (tester) async {
+      const sod = {
+        'code': 'segregation_implicated',
+        'message': 'm',
+        'params': <String, dynamic>{},
+      };
+      await pumpRow(tester, {'resolve': sod, 'dismiss': sod, 'escalate': null});
+      expect(find.byType(Dismissible), findsNothing);
+      expect(
+        tester.widget<ExceptionListTile>(find.byType(ExceptionListTile))
+            .onLongPress,
+        isNotNull,
+      );
+    });
+
+    for (final (name, decisions) in <(String, Object?)>[
+      (
+        'a role refusal',
+        {
+          'resolve': {'code': 'role_not_permitted', 'message': 'm'},
+          'dismiss': {'code': 'role_not_permitted', 'message': 'm'},
+          'escalate': {'code': 'role_not_permitted', 'message': 'm'},
+        },
+      ),
+      ('no verdict', null),
+    ]) {
+      testWidgets('$name leaves a read-only row', (tester) async {
+        await pumpRow(tester, decisions);
+        expect(find.byType(Dismissible), findsNothing);
+        expect(
+          tester
+              .widget<ExceptionListTile>(find.byType(ExceptionListTile))
+              .onLongPress,
+          isNull,
+        );
+      });
+    }
   });
 
   testWidgets('swiping a row right resolves the exception', (tester) async {
@@ -358,7 +481,7 @@ void main() {
         // Keyed so the second run mounts a fresh screen (and its fetch).
         key: ValueKey(locale),
         locale: locale,
-        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        localizationsDelegates: appLocalizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
         home: const ExceptionsScreen(),
       ));
@@ -388,5 +511,72 @@ void main() {
       other: await runFlow(const Locale('ja')),
       surface: 'ExceptionsScreen bulk flow',
     );
+  });
+
+  testWidgets('a load that never reached a server says check your connection',
+      (tester) async {
+    ApiClient().debugConfigure(
+      client: MockClient((req) async => throw http.ClientException('offline')),
+    );
+
+    await tester.pumpWidget(_localized(const ExceptionsScreen()));
+    await _pumpUntil(tester, find.widgetWithText(FilledButton, 'Retry'));
+
+    expect(
+      find.text(
+        "Couldn't reach FeohLedger. Check your connection and tap Retry.",
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('a failed resolve over a loaded list raises no stale banner',
+      (tester) async {
+    ApiClient().debugConfigure(
+      client: MockClient((req) async => req.method == 'POST'
+          ? http.Response(jsonEncode({'detail': 'Not permitted'}), 403,
+              headers: {'content-type': 'application/json'})
+          : _list([_exceptionJson('1')])),
+    );
+
+    await tester.pumpWidget(_localized(const ExceptionsScreen()));
+    await _pumpUntil(tester, find.byType(ExceptionListTile));
+
+    bool? ok;
+    ExceptionStore.instance.resolve('1').then((v) => ok = v);
+    await _pumpUntilTrue(tester, () => ok != null);
+
+    expect(ok, isFalse);
+    expect(ExceptionStore.instance.actionError, 'Not permitted');
+    expect(ExceptionStore.instance.loadError, isNull);
+    // The rows are live: the refusal is the action's, not the list's.
+    expect(find.byType(StaleDataBanner), findsNothing);
+    expect(find.byType(ExceptionListTile), findsOneWidget);
+  });
+
+  testWidgets('a status chip that filters every row out says so, and Show all '
+      'clears it', (tester) async {
+    ApiClient().debugConfigure(
+      client: MockClient((req) async =>
+          req.url.queryParameters['status'] == 'escalated'
+              ? _list([])
+              : _list([_exceptionJson('1')])),
+    );
+
+    await tester.pumpWidget(_localized(const ExceptionsScreen()));
+    await _pumpUntil(tester, find.byType(ExceptionListTile));
+
+    await tester.tap(find.widgetWithText(FilterChip, 'Escalated'));
+    await _pumpUntil(tester, find.text('No escalated exceptions'));
+
+    expect(find.text('No escalated exceptions'), findsOneWidget);
+    // Not the whole-queue "clear" copy: other statuses may hold rows.
+    expect(find.text('No exceptions'), findsNothing);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Show all'));
+    await _pumpUntil(tester, find.byType(ExceptionListTile));
+
+    expect(ExceptionStore.instance.statusFilter, isNull);
+    expect(find.byType(ExceptionListTile), findsOneWidget);
   });
 }

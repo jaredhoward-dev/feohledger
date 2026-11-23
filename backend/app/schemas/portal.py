@@ -6,6 +6,7 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from app.api.pagination import PageMeta
+from app.schemas.action_verdict import CodedRefusal
 from app.schemas.money import MoneyAmount, OptionalMoneyAmount
 from app.schemas.percent import PercentNumber
 
@@ -167,11 +168,11 @@ class PortalInviteResponse(BaseModel):
     in as it, stage a bank-detail change, approve their own request through the
     NULL `requested_by_user_id` short-circuit, then pay it).
 
-    The credential now leaves only through the email adapter, to the portal
-    user's own address. Local-first is unaffected: the dev default `console`
-    adapter renders the message, exactly as the tenant-signup welcome email
-    already relies on. See `backend/docs/supplier-portal.md` § Credential
-    delivery.
+    No credential exists to return: the account is left with no password and a
+    single-use set-password link leaves only through the email adapter, to the
+    portal user's own address (`docs/decisions.md` §283). Local-first is
+    unaffected: the dev default `console` adapter renders the message. See
+    `backend/docs/supplier-portal.md` § Operational notes.
     """
 
     user: PortalUserResponse
@@ -186,7 +187,7 @@ class PortalInvoiceListItem(BaseModel):
     id: str
     invoice_number: str
     amount: Decimal
-    currency: str
+    currency: str | None  # None = not yet known (extraction pending or found none)
     status: str
     invoice_date: date | None = None
     due_date: date | None = None
@@ -216,8 +217,9 @@ class PortalPaymentListItem(BaseModel):
     invoice_number: str
     amount: Decimal
     # The payment's currency, carried so the portal renders the supplier's own
-    # currency instead of falling back to USD. Sourced from the paid invoice.
-    currency: str = "USD"
+    # currency instead of falling back to USD. Sourced from the paid invoice;
+    # ``None`` when that invoice records none (decisions §473).
+    currency: str | None = None
     method: str | None = None
     status: str
     reference: str | None = None
@@ -237,13 +239,19 @@ class PortalPOListItem(BaseModel):
     id: str
     po_number: str
     status: str
-    total: Decimal
+    #: ``None`` while ``total_unverifiable`` — see ``PortalPODetail``.
+    total: Decimal | None
+    total_unverifiable: bool = False
     #: The PO's own code, or ``None`` when no source recorded one. This used to
     #: default to ``"USD"`` and the handler never set it, so every PO a
     #: supplier saw read as dollars whatever it was raised in (decisions §197).
     currency: str | None = None
     line_item_count: int = 0
     created_at: datetime
+    #: The verdict on flipping this PO into an invoice: ``None`` when
+    #: ``POST …/flip`` would mint one, else the coded refusal it would answer
+    #: with (``api/portal.po_flip_refusal``, issue #575).
+    flip_verdict: CodedRefusal | None = None
 
 
 class PortalPOListResponse(PageMeta):
@@ -262,10 +270,17 @@ class PortalPODetail(BaseModel):
     id: str
     po_number: str
     status: str
-    total: Decimal
+    #: ``None`` (and every line's ``unit_price`` / ``total`` too) while
+    #: ``total_unverifiable``: the buyer's ERP could not confirm this PO's total
+    #: at its last sync, so the stored figure is not one to show a supplier as
+    #: the PO's (decisions §323). The buyer's internal reason code is not sent.
+    total: Decimal | None
+    total_unverifiable: bool = False
     #: Labels ``total`` and every line figure; ``None`` renders bare.
     currency: str | None = None
     created_at: datetime
+    #: Same as ``PortalPOListItem.flip_verdict``.
+    flip_verdict: CodedRefusal | None = None
     line_items: list[PortalPOLineItem] = []
 
 

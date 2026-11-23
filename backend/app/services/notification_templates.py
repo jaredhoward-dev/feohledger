@@ -9,7 +9,7 @@ emails and log-adjacent in-app rows.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from app.models.notification import (
@@ -39,7 +39,10 @@ class InvoiceContext:
     invoice_number: str
     vendor_name: str
     amount: Decimal | None = None
-    currency: str = "USD"
+    # The invoice's own code (``payment_runs.payable_currency_code``), or None
+    # when it records none: the figure is then stated bare, never as dollars
+    # (decisions §160 / §196 / §466).
+    currency: str | None = None
     reason: str | None = None  # e.g. rejection reason — free text, no PII expected
     # Short, PII-free chat snippet (e.g. an author label like "from supplier").
     # NEVER the raw message body — see EVENT_CHAT_MESSAGE render branch.
@@ -57,6 +60,8 @@ def _money(ctx: InvoiceContext) -> str:
     if ctx.amount is None:
         return ""
     # Render exactly from the Decimal — never coerce currency through float.
+    if not ctx.currency:
+        return f" for {ctx.amount:,.2f}"
     return f" for {ctx.currency} {ctx.amount:,.2f}"
 
 
@@ -209,8 +214,8 @@ def render_ai_invoice_usage(
         body = (
             f"This month's AI-read invoice overage has reached your spending cap of {cap_text}. "
             "AI reading is paused until next month: new invoices are still created and wait "
-            "for manual entry, and approvals and payments are unaffected. Raise the cap on "
-            "the Billing page to resume AI reading now."
+            "for manual entry, and approvals and payments are unaffected. Raise the cap "
+            "under Settings → Subscription to resume AI reading now."
         )
     elif notice == AI_NOTICE_100:
         title = f"All {included:,} AI-read invoices for {period} are used"
@@ -218,12 +223,13 @@ def render_ai_invoice_usage(
             tail = (
                 "AI reading is now paused until next month: new invoices are still created "
                 "and wait for manual entry, and approvals and payments are unaffected. "
-                "Upgrade your plan on the Billing page to keep AI reading on."
+                "Upgrade your plan under Settings → Subscription to keep AI reading on."
             )
         else:
             tail = (
                 f"Each further AI-read invoice this month is billed at {currency} "
-                f"{overage_unit_price}. Set or review a monthly spending cap on the Billing page."
+                f"{overage_unit_price}. Set or review a monthly spending cap under "
+                "Settings → Subscription."
             )
         body = (
             f"Your organization has used all {included:,} AI-read invoices included "
@@ -234,7 +240,8 @@ def render_ai_invoice_usage(
         if pauses:
             tail = (
                 "When the allowance is used, AI reading pauses until next month and new "
-                "invoices wait for manual entry. Upgrade your plan on the Billing page to avoid it."
+                "invoices wait for manual entry. Upgrade your plan under "
+                "Settings → Subscription to avoid it."
             )
         else:
             tail = (
@@ -244,5 +251,97 @@ def render_ai_invoice_usage(
         body = (
             f"Your organization has used {used:,} of the {included:,} AI-read invoices "
             f"included this month. {tail}"
+        )
+    return RenderedNotification(title=title, body_text=body, body_html=_html(body))
+
+
+#: The ERP connection notices (decisions §295).
+ERP_NOTICE_EXPIRING = "expiring"
+ERP_NOTICE_RECONNECT = "reconnect_required"
+
+
+def render_erp_connection(
+    *,
+    notice: str,
+    erp_name: str,
+    expires_on: date | None = None,
+    days_left: int | None = None,
+    reason: str | None = None,
+) -> RenderedNotification:
+    """Render an ERP-connection notice: the consent expires soon, or the
+    connection is gone and needs an admin's consent again.
+
+    Names only the ERP (a fixed display name) and a date; nothing PII-bearing.
+    """
+    where = "Organization → ERP integration"
+    if notice == ERP_NOTICE_RECONNECT:
+        title = f"Reconnect {erp_name}: the connection has stopped working"
+        cause = (
+            "its authorization expired"
+            if reason == "refresh_token_expired"
+            else "it was disconnected or revoked in " + erp_name
+        )
+        body = (
+            f"FeohLedger can no longer reach {erp_name}: {cause}. Until an administrator "
+            f"reconnects it ({where} → Reconnect), invoices are not posted to {erp_name}, "
+            f"and bills paid there are not reflected here."
+        )
+    else:
+        when = expires_on.isoformat() if expires_on else "soon"
+        left = f" ({days_left} day{'s' if days_left != 1 else ''} left)" if days_left else ""
+        title = f"Your {erp_name} connection expires on {when}"
+        body = (
+            f"The authorization that lets FeohLedger reach {erp_name} expires on "
+            f"{when}{left}. Reconnect it before then ({where} → Reconnect) so posting "
+            f"bills and syncing payments keep working."
+        )
+    return RenderedNotification(title=title, body_text=body, body_html=_html(body))
+
+
+#: The ERP call-quota notices (``services/erp_call_budget``, decisions §322).
+ERP_QUOTA_WARNING = "warning"
+ERP_QUOTA_TENANT_BUDGET = "tenant_budget"
+ERP_QUOTA_SUBSCRIPTION = "subscription_quota"
+
+
+def render_erp_call_quota(
+    *,
+    notice: str,
+    erp_name: str,
+    used: int | None,
+    budget: int | None,
+    resets_at: datetime,
+) -> RenderedNotification:
+    """Render an ERP call-quota notice: this workspace is near or past its daily
+    share of the provider's API calls, or the provider says the subscription's
+    quota is used. Names only the ERP (a fixed display name), call counts and a
+    UTC time; nothing PII-bearing.
+    """
+    when = resets_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    held = (
+        f"Until then FeohLedger makes no further calls: invoices sent to {erp_name} are "
+        f"refused with a reason and can be retried after the reset, and syncs are refused "
+        f"the same way."
+    )
+    if notice == ERP_QUOTA_SUBSCRIPTION:
+        title = f"{erp_name} API calls are paused until {when}"
+        body = (
+            f"{erp_name} reports that the API subscription FeohLedger uses for your "
+            f"workspace has used its daily call quota. It resets at {when}. {held}"
+        )
+    elif notice == ERP_QUOTA_TENANT_BUDGET:
+        share = f"all {budget:,}" if budget else "all"
+        title = f"Your workspace has used today's {erp_name} API calls"
+        body = (
+            f"Your workspace has used {share} of the {erp_name} API calls it may make "
+            f"today. The allowance resets at {when}. {held}"
+        )
+    else:
+        counts = f"{used:,} of its {budget:,}" if used is not None and budget else "most of its"
+        title = f"Your workspace has used 80% of today's {erp_name} API calls"
+        body = (
+            f"Your workspace has made {counts} {erp_name} API calls for today. When the "
+            f"allowance is used, sends and syncs to {erp_name} are refused until it "
+            f"resets at {when}."
         )
     return RenderedNotification(title=title, body_text=body, body_html=_html(body))

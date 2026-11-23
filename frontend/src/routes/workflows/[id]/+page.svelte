@@ -6,15 +6,18 @@
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { workflowStore } from '#lib/stores/workflows.svelte.ts';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
-	import { api } from '#lib/api.ts';
+	import { api, ApiError } from '#lib/api.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import type { MoneyAmount } from '#lib/utils/money.ts';
 	import { isMoneyInput } from '#lib/utils/moneyInput.ts';
+	import { formatPercent } from '#lib/utils/percent.ts';
 	import ApprovalMatrixEditor from '#lib/components/modals/ApprovalMatrixEditor.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import WorkflowCanvas from '#lib/components/workflow-builder/WorkflowCanvas.svelte';
 	import StepPalette from '#lib/components/workflow-builder/StepPalette.svelte';
 	import ConditionBuilder from '#lib/components/workflow-builder/ConditionBuilder.svelte';
@@ -44,6 +47,9 @@
 	} from '#lib/types/workflow.ts';
 
 	let workflow = $state<WorkflowDefinition | null>(null);
+	// A failed load, stated in place. It used to be a toast over a "Loading…"
+	// line that never went away, and the toast said "not found" for a 500 too.
+	let loadError = $state<'not_found' | 'failed' | null>(null);
 	let steps = $state<WorkflowStep[]>([]);
 	let selectedIndex = $state<number>(0);
 	let saving = $state(false);
@@ -132,6 +138,7 @@
 
 	async function loadWorkflow(wfId: string) {
 		const token = loadSequence.start();
+		loadError = null;
 		try {
 			const wf = await workflowStore.getById(wfId);
 			// Superseded by a newer load, or by a local canvas edit.
@@ -141,15 +148,16 @@
 			nameInput = wf.name;
 			descInput = wf.description ?? '';
 			selectedIndex = 0;
-		} catch {
+		} catch (e) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
-			if (loadSequence.isCurrentRequest(token)) toast(m('workflows.builder.toast.notFound'), 'error');
+			if (loadSequence.isCurrentRequest(token)) {
+				loadError = e instanceof ApiError && e.status === 404 ? 'not_found' : 'failed';
+			}
 		}
 	}
 
 	let selectedStep = $derived(steps[selectedIndex] ?? null);
-
 
 	function makeStep(type: WorkflowStepType): WorkflowStep {
 		return {
@@ -292,8 +300,20 @@
 <svelte:window onclick={handleWindowClick} />
 
 <div class="workspace">
-	{#if !workflow}
-		<div class="loading">{m('common.loading')}</div>
+	{#if !workflow && loadError}
+		<!-- A missing workflow cannot be retried into existence, so it offers the
+		     way back to the list beside Retry. -->
+		<LoadError
+			message={loadError === 'not_found' ? m('workflows.builder.notFound') : m('workflows.builder.loadFailed')}
+			onretry={() => loadWorkflow(id)}
+			testId="workflow-load-error"
+		>
+			{#snippet actions()}
+				<a href="/workflows" class="btn-cancel back-to-list">{m('workflows.builder.aria.back')}</a>
+			{/snippet}
+		</LoadError>
+	{:else if !workflow}
+		<LoadingState />
 	{:else}
 		<header class="toolbar">
 			<div class="toolbar-left">
@@ -428,6 +448,9 @@
 										<label for="threshold">{m('workflows.builder.extraction.confidenceThreshold')}</label>
 										<HelpTip term="confidence-score" />
 									</div>
+									<!-- The threshold is a 0–1 ratio; formatPercent takes 0–100
+									     points, hence ×100. aria-valuetext so a screen reader
+									     announces "95%", not the raw "0.95". -->
 									<div class="range-row">
 										<input
 											id="threshold"
@@ -436,9 +459,10 @@
 											max="1"
 											step="0.01"
 											value={cfg.auto_approve_threshold}
+											aria-valuetext={formatPercent(Math.round(cfg.auto_approve_threshold * 100))}
 											oninput={(e) => updateStepConfig(selectedIndex, 'auto_approve_threshold', parseFloat(e.currentTarget.value))}
 										/>
-										<span class="range-value">{Math.round(cfg.auto_approve_threshold * 100)}%</span>
+										<span class="range-value">{formatPercent(Math.round(cfg.auto_approve_threshold * 100))}</span>
 									</div>
 									<p class="field-hint">
 										{m('workflows.builder.extraction.thresholdHint')}
@@ -692,6 +716,8 @@
 							</div>
 							{#if !cfg.auto_send_on_approval}
 								<p class="field-hint warning">{m('workflows.builder.erp.noAutoSendWarning')}</p>
+							{:else}
+								<p class="field-hint">{m('workflows.builder.erp.autoSendHint')}</p>
 							{/if}
 
 							{#if erpMethod === 'direct'}
@@ -806,10 +832,9 @@
 
 <style>
 	/* Page-specific styling; shared design-system CSS lives in app.css. */
-	.loading {
-		padding: 60px 20px;
-		text-align: center;
-		color: var(--text-muted);
+	/* `.btn-cancel` is a button recipe; on a link it must not underline. */
+	.back-to-list {
+		text-decoration: none;
 	}
 
 	/* Toolbar */
@@ -833,7 +858,7 @@
 		border-radius: 6px;
 		color: var(--text-muted);
 		text-decoration: none;
-		transition: all 0.15s;
+		transition: background-color 0.15s;
 	}
 
 	.back-link:hover {
@@ -892,8 +917,8 @@
 	}
 
 	.btn-toggle.active {
-		border-color: #1fa86a;
-		color: #1fa86a;
+		border-color: var(--success);
+		color: var(--success);
 	}
 
 	.btn-save {
@@ -1031,7 +1056,7 @@
 	.field input:focus,
 	.field select:focus {
 		border-color: var(--accent);
-		box-shadow: 0 0 0 2px rgba(99, 140, 255, 0.15);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
 	.field select {
@@ -1046,7 +1071,7 @@
 	}
 
 	.field-hint.warning {
-		color: #d4940a;
+		color: var(--warning);
 	}
 
 	.field-divider {
@@ -1108,7 +1133,7 @@
 	   The pairing here is `--text` over the composite, not a tint/on-tint
 	   pair. */
 	.chip-remove:hover {
-		background: rgba(99, 140, 255, 0.2);
+		background: color-mix(in srgb, var(--accent) 20%, transparent);
 		color: var(--text);
 	}
 
@@ -1152,7 +1177,7 @@
 	}
 
 	.approver-option:hover {
-		background: rgba(99, 140, 255, 0.08);
+		background: color-mix(in srgb, var(--accent) 8%, transparent);
 	}
 
 	.approver-name {
@@ -1261,12 +1286,20 @@
 		padding: 14px 20px;
 		border-top: 1px solid var(--border);
 		display: flex;
+		/* Wraps, so the footer's minimum width is its widest button, not all
+		   three buttons on one line. Unwrapped, that line set the config
+		   panel's min-content — and through the editor's single `1fr` column
+		   at narrow widths, the whole editor's — so a slightly wider system
+		   font scrolled /workflows/[id] sideways at 320px (WCAG 1.4.10). */
+		flex-wrap: wrap;
 		align-items: center;
 		justify-content: space-between;
+		gap: 8px;
 	}
 
 	.move-btns {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 6px;
 	}
 

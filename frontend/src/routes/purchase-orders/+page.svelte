@@ -1,32 +1,38 @@
 <script lang="ts">
 	import { api } from '#lib/api.ts';
+	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import LineDescription from '#lib/components/ui/LineDescription.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
-	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
+	import UnverifiedMoney from '#lib/components/ui/UnverifiedMoney.svelte';
+	import { poUnverifiableReasonKey } from '#lib/types/poUnverifiable.ts';
 	import { formatMoney } from '#lib/utils/money.ts';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { formatDate } from '#lib/utils/time.ts';
+	import { invoiceStatusLabelKey } from '#lib/types/invoice.ts';
+	import { poStatusLabel, poStatusTone } from '#lib/types/purchaseOrder.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { untrack } from 'svelte';
 
 	const COLUMNS = $derived([
-		{ label: m('purchaseOrders.col.poNumber') },
+		{ label: m('purchaseOrders.col.poNumber'), class: 'col-number' },
 		{ label: m('purchaseOrders.col.vendor') },
-		{ label: m('purchaseOrders.col.total'), class: 'right' },
-		{ label: m('purchaseOrders.col.status') },
-		{ label: m('purchaseOrders.col.lines') },
-		{ label: m('purchaseOrders.col.created') }
+		{ label: m('purchaseOrders.col.total'), class: 'right col-total' },
+		{ label: m('purchaseOrders.col.status'), class: 'col-status' },
+		{ label: m('purchaseOrders.col.lines'), class: 'col-lines' },
+		{ label: m('purchaseOrders.col.created'), class: 'col-created' }
 	]);
 
 	interface POLineItem {
@@ -45,7 +51,14 @@
 		po_number: string;
 		vendor_id: string | null;
 		vendor_name: string | null;
-		total: number;
+		/** `null` while `total_unverifiable_reason` is set — and so is every line's money. */
+		total: number | null;
+		/**
+		 * Set when the ERP's last sync could not price this PO (an
+		 * `erp_adapters.base.PoSkipReason` code): the stored figures are ones the
+		 * ERP no longer vouches for, so the API withholds them (decisions §323).
+		 */
+		total_unverifiable_reason: string | null;
 		/**
 		 * The PO's OWN currency — `total` and every line are in it. `null` when
 		 * no source recorded one (a PO older than migration 0099 with no
@@ -72,6 +85,11 @@
 		linked_invoices: POLinkedInvoice[];
 	}
 
+	/** The catalogued sentence for a `total_unverifiable_reason` code. */
+	function unverifiableReasonText(code: string | null): string {
+		return m(poUnverifiableReasonKey(code));
+	}
+
 	const PAGE_SIZE = 20;
 
 	let pos = $state<POListItem[]>([]);
@@ -79,23 +97,23 @@
 	let page = $state(1);
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// Set by a failed page-1 load, cleared by a successful one. A failed load
+	// renders `ui/LoadError` (with a Retry) in the table's place: on its own the
+	// toast faded and left the empty-state line claiming nothing matched — or,
+	// on a re-load, the previous filter's rows standing as this one's answer.
+	// A failed load-more keeps the rows already shown and only toasts.
+	let errored = $state(false);
 	let search = $state('');
-	let statusFilter = $state<'all' | 'open' | 'closed' | 'cancelled'>('all');
-	/**
-	 * Badge tone per PO status.
-	 *
-	 * `cancelled` keeps the tinted grey (`muted`) it had, distinct from the
-	 * flat `neutral` an unrecognised status falls back to — the old CSS drew
-	 * exactly that line (a `rgba(150,150,150,.15)` tint for cancelled, a bare
-	 * `--bg` fill for everything else), and it is worth keeping: a cancelled PO
-	 * is a decision somebody made, an unknown status is one nobody has told us
-	 * about. `PurchaseOrder.status` is a free-form column, hence the fallback.
-	 */
-	const STATUS_TONES: Record<string, BadgeTone> = {
-		open: 'accent',
-		closed: 'success',
-		cancelled: 'muted'
-	};
+	let statusFilter = $state<'all' | 'open' | 'unissued' | 'closed' | 'cancelled'>('all');
+	// The badge text is the shared PO status label (`poStatusLabel`), not the
+	// raw column value — `open` is a database token, "Open" is what a clerk
+	// reads, and `partially_received` / `received` / `voided` read as words
+	// too (a local 4-entry map showed them raw). Unknown values show as-is.
+	const statusLabel = (status: string) => poStatusLabel(status, m);
+	function invoiceStatusLabel(status: string): string {
+		const key = invoiceStatusLabelKey(status);
+		return key ? m(key) : status;
+	}
 
 	let syncing = $state(false);
 
@@ -173,6 +191,11 @@
 	) {
 		const token = fetchSequence.start();
 		loading = !opts.append;
+		// Cleared when a fresh load STARTS (as /credit-memos does) so Retry
+		// takes `LoadError` down while the request is out and a second
+		// failure re-announces it — cleared only on success, Retry looked
+		// like a no-op.
+		if (!opts.append) errored = false;
 		try {
 			const nextPage = opts.nextPage ?? 1;
 			const params = new URLSearchParams({
@@ -189,9 +212,11 @@
 			pos = opts.append ? appendUnique(pos, data.items) : data.items;
 			total = data.total;
 			page = nextPage;
+			errored = false;
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit`: only the newest request reports.
 			if (!fetchSequence.isCurrentRequest(token)) return;
+			if (!opts.append) errored = true;
 			toast(err instanceof Error ? err.message : m('purchaseOrders.toast.loadListFailed'), 'error');
 		} finally {
 			if (fetchSequence.isCurrentRequest(token)) loading = false;
@@ -262,6 +287,11 @@
 	let statusChips = $derived([
 		{ key: 'all', label: m('common.all'), count: allCount },
 		{ key: 'open', label: m('purchaseOrders.filter.open'), count: statusCounts.open },
+		{
+			key: 'unissued',
+			label: m('purchaseOrders.filter.unissued'),
+			count: statusCounts.unissued
+		},
 		{ key: 'closed', label: m('purchaseOrders.filter.closed'), count: statusCounts.closed },
 		{
 			key: 'cancelled',
@@ -295,8 +325,17 @@
 	async function syncFromErp() {
 		syncing = true;
 		try {
-			const result = await api.post<{ message: string }>('/api/purchase-orders/sync-erp', {});
-			toast(result.message, 'success');
+			const result = await api.post<{ message: string; unverifiable?: number }>(
+				'/api/purchase-orders/sync-erp',
+				{}
+			);
+			// POs the ERP still has but could not price exactly are no longer
+			// matched against (decisions §323) — say so, not just "synced".
+			if (result.unverifiable) {
+				toast(m('purchaseOrders.toast.unverifiable', { n: result.unverifiable }), 'warning');
+			} else {
+				toast(result.message, 'success');
+			}
 			// A sync imports POs, so the tallies moved too.
 			await Promise.all([loadPos({ search, status: statusFilter }), fetchCounts({ search })]);
 		} catch (err) {
@@ -331,10 +370,20 @@
 		<FilterChips chips={statusChips} bind:active={statusFilter} />
 	</div>
 
+	{#if errored}
+		<LoadError
+			message={m('purchaseOrders.empty.errored')}
+			onretry={() => loadPos({ search, status: statusFilter })}
+			testId="purchase-orders-error"
+		/>
+	{:else}
+	<div class="po-table">
 	<DataTable
+		fixed
 		columns={COLUMNS}
 		isEmpty={pos.length === 0}
-		empty={loading ? m('common.loading') : m('purchaseOrders.empty')}
+		{loading}
+		empty={m('purchaseOrders.empty')}
 	>
 		{#snippet body()}
 			{#each pos as po (po.id)}
@@ -353,26 +402,36 @@
 						</RowLink>
 					</td>
 					<td>{po.vendor_name ?? '—'}</td>
-					<td class="right mono" data-testid="po-total">{formatMoney(po.total, { currency: po.currency })}</td>
-					<td><Badge tone={STATUS_TONES[po.status] ?? 'neutral'} variant={po.status}>{po.status}</Badge></td>
+					<td class="right mono" data-testid="po-total">
+						<UnverifiedMoney
+							amount={po.total}
+							currency={po.currency}
+							unverified={!!po.total_unverifiable_reason}
+							label={m('purchaseOrders.total.unverifiable')}
+							title={unverifiableReasonText(po.total_unverifiable_reason)}
+							mono
+						/>
+					</td>
+					<td><Badge tone={poStatusTone(po.status)} variant={po.status}>{statusLabel(po.status)}</Badge></td>
 					<td class="muted">{po.line_items.length}</td>
 					<td class="muted">{formatDate(po.created_at)}</td>
 				</tr>
 			{/each}
 		{/snippet}
 	</DataTable>
-
-	{#if hasMore}
-		<div class="load-more-row">
-			<button class="btn-load-more" onclick={loadMore} disabled={loadingMore}>
-				{loadingMore ? m('common.loading') : m('purchaseOrders.loadMore', { shown: pos.length, total })}
-			</button>
-		</div>
-	{:else if total > 0}
-		<div class="load-more-row">
-			<span class="load-more-end">{m('purchaseOrders.showingAll', { total })}</span>
-		</div>
+	</div>
 	{/if}
+
+	<LoadMoreFooter
+		shown={pos.length}
+		{total}
+		{hasMore}
+		loading={loadingMore}
+		{errored}
+		onloadmore={loadMore}
+		moreKey="purchaseOrders.loadMore"
+		allKey="purchaseOrders.showingAll"
+	/>
 </PageHeader>
 
 <Modal
@@ -388,7 +447,7 @@
 				<HelpTip term="purchase-order" />
 				{#if detail}
 					<span class="po-number-badge">{detail.po_number}</span>
-					<Badge tone={STATUS_TONES[detail.status] ?? 'neutral'} variant={detail.status}>{detail.status}</Badge>
+					<Badge tone={poStatusTone(detail.status)} variant={detail.status}>{statusLabel(detail.status)}</Badge>
 				{/if}
 			</div>
 			<button class="close-btn" onclick={() => (detailId = null)} aria-label={m('purchaseOrders.modal.close')}>&times;</button>
@@ -397,13 +456,31 @@
 
 	<div class="modal-body">
 		{#if detailLoading}
-			<div class="loading">{m('common.loading')}</div>
+			<LoadingState />
 		{:else if detail}
 			<dl class="meta">
 				<dt>{m('purchaseOrders.modal.vendor')}</dt><dd>{detail.vendor_name ?? '—'}</dd>
-				<dt>{m('purchaseOrders.modal.total')}</dt><dd class="mono" data-testid="po-detail-total">{formatMoney(detail.total, { currency: detail.currency })}</dd>
+				<dt>{m('purchaseOrders.modal.total')}</dt>
+				<dd class="mono" data-testid="po-detail-total">
+					<UnverifiedMoney
+						amount={detail.total}
+						currency={detail.currency}
+						unverified={!!detail.total_unverifiable_reason}
+						label={m('purchaseOrders.total.unverifiable')}
+						mono
+					/>
+				</dd>
 				<dt>{m('purchaseOrders.modal.created')}</dt><dd>{formatDate(detail.created_at)}</dd>
 			</dl>
+			{#if detail.total_unverifiable_reason}
+				<!-- The reason in visible text, above the lines whose money is
+				     withheld for the same reason (decisions §323). -->
+				<p class="unverifiable-note" role="note" data-testid="po-unverifiable-note">
+					{m('purchaseOrders.modal.unverifiableNote', {
+						reason: unverifiableReasonText(detail.total_unverifiable_reason)
+					})}
+				</p>
+			{/if}
 
 			<h3>{m('purchaseOrders.modal.lineItems')}</h3>
 			<table class="line-table">
@@ -448,7 +525,7 @@
 							<td class="mono">{inv.invoice_number}</td>
 							<td>{inv.vendor_name ?? '—'}</td>
 							<td class="right mono">{formatMoney(inv.amount, { currency: inv.currency })}</td>
-							<td>{inv.status}</td>
+							<td>{invoiceStatusLabel(inv.status)}</td>
 						</tr>
 					{:else}
 						<tr><td colspan="4" class="empty">{m('purchaseOrders.modal.noLinkedInvoices')}</td></tr>
@@ -461,6 +538,29 @@
 
 <style>
 	/* Page-specific styling; shared design-system CSS lives in app.css. */
+
+	/* Column widths. The list is
+	   `table-layout: fixed` (DataTable's `fixed`): under `auto` the header
+	   cells were sized against the one "Loading…" row, then re-sized against
+	   the real rows, so every column slid sideways as the data landed. Fixed
+	   widths come from the header alone and hold from first paint. The
+	   predictable columns get widths sized to their widest content in the six
+	   locales (the badges pt-BR "PARCIALMENTE RECEBIDO" and "NÃO VERIFICÁVEL",
+	   the header de "POSITIONEN"); the text column carries none and takes the
+	   rest. The `min-width` keeps it
+	   readable: past it the table scrolls inside its region, which is what a
+	   phone gets (frontend/docs/ui-patterns.md § Data tables). DataTable
+	   renders these `<th>` from `columns`, so the selectors go through
+	   `:global` under a page-owned wrapper (the /vendors pattern). */
+	.po-table {
+		min-width: 0;
+	}
+	.po-table :global(table) { min-width: 1000px; }
+	.po-table :global(th.col-number) { width: 150px; }
+	.po-table :global(th.col-total) { width: 170px; }
+	.po-table :global(th.col-status) { width: 230px; }
+	.po-table :global(th.col-lines) { width: 120px; }
+	.po-table :global(th.col-created) { width: 130px; }
 	.btn-outline {
 		padding: 8px 16px;
 		border-radius: 6px;
@@ -544,6 +644,15 @@
 		border-bottom: 1px solid var(--border);
 	}
 
+	.unverifiable-note {
+		margin: 0 0 18px;
+		padding: 10px 12px;
+		border-left: 3px solid var(--warning);
+		background: var(--surface);
+		color: var(--text);
+		font-size: 0.85rem;
+	}
+
 	dt {
 		font-size: 0.75rem;
 		text-transform: uppercase;
@@ -592,12 +701,6 @@
 	.line-table .empty {
 		text-align: center;
 		padding: 40px;
-		color: var(--text-muted);
-	}
-
-	.loading {
-		padding: 40px;
-		text-align: center;
 		color: var(--text-muted);
 	}
 

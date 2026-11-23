@@ -2,12 +2,17 @@
 
 A deployed environment must refuse to start with a fail-open captcha, the
 log-only console email adapter, no provider-credential KMS key, or the
-well-known default / weak JWT signing key — both are silent
+well-known default / weak JWT signing key, or with the sub-processor
+change-notice sweep the published DPA relies on switched off — all silent
 misconfigurations that would otherwise ship to production. Local-dev / CI
 envs keep the convenient defaults.
 """
 
 from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -16,6 +21,8 @@ from app.config import Settings
 
 # A throwaway 32+ char key for the "good config" cases.
 _GOOD_KEY = "x" * 48
+# Its own key, distinct from the JWT key (decisions §383).
+_GOOD_FINGERPRINT_KEY = "f" * 48
 
 
 def test_deployed_env_refuses_default_secret_key():
@@ -25,6 +32,7 @@ def test_deployed_env_refuses_default_secret_key():
             email_provider="ses",
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
+            hcaptcha_sitekey="site-key",
             secret_key="change-me-in-production",
         )
 
@@ -36,6 +44,7 @@ def test_deployed_env_refuses_too_short_secret_key():
             email_provider="ses",
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
+            hcaptcha_sitekey="site-key",
             secret_key="short",
         )
 
@@ -46,7 +55,9 @@ def test_deployed_env_accepts_a_strong_secret_key():
         email_provider="ses",
         credential_kms_key_id="alias/test-app",
         hcaptcha_secret="hc",
+        hcaptcha_sitekey="site-key",
         secret_key=_GOOD_KEY,
+        subprocessor_notices_enabled=True,
     )
     assert s.secret_key == _GOOD_KEY
 
@@ -70,6 +81,7 @@ def test_deployed_env_refuses_lithic_live_key_with_sandbox_on():
             email_provider="ses",
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
+            hcaptcha_sitekey="site-key",
             secret_key=_GOOD_KEY,
             lithic_api_key="sk_live_abc",
             lithic_sandbox=True,
@@ -82,9 +94,11 @@ def test_deployed_env_accepts_lithic_live_key_with_sandbox_off():
         email_provider="ses",
         credential_kms_key_id="alias/test-app",
         hcaptcha_secret="hc",
+        hcaptcha_sitekey="site-key",
         secret_key=_GOOD_KEY,
         lithic_api_key="sk_live_abc",
         lithic_sandbox=False,
+        subprocessor_notices_enabled=True,
     )
     assert s.lithic_sandbox is False
 
@@ -96,6 +110,7 @@ def test_deployed_env_refuses_nium_creds_with_sandbox_on():
             email_provider="ses",
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
+            hcaptcha_sitekey="site-key",
             secret_key=_GOOD_KEY,
             nium_client_id="nium_live",
             nium_sandbox=True,
@@ -110,7 +125,9 @@ def test_deployed_env_without_card_keys_ignores_sandbox_flag():
         email_provider="ses",
         credential_kms_key_id="alias/test-app",
         hcaptcha_secret="hc",
+        hcaptcha_sitekey="site-key",
         secret_key=_GOOD_KEY,
+        subprocessor_notices_enabled=True,
     )
     assert s.lithic_sandbox is True  # default unchanged, but boot succeeds
 
@@ -133,6 +150,7 @@ def test_deployed_env_refuses_missing_credential_kms_key():
             environment="production",
             email_provider="ses",
             hcaptcha_secret="hc",
+            hcaptcha_sitekey="site-key",
             secret_key=_GOOD_KEY,
         )
 
@@ -143,6 +161,7 @@ def test_deployed_env_refuses_blank_credential_kms_key():
             environment="production",
             email_provider="ses",
             hcaptcha_secret="hc",
+            hcaptcha_sitekey="site-key",
             secret_key=_GOOD_KEY,
             credential_kms_key_id="   ",
         )
@@ -159,7 +178,10 @@ _DEPLOYED = {
     "environment": "production",
     "credential_kms_key_id": "alias/test-app",
     "hcaptcha_secret": "hc",
+    "hcaptcha_sitekey": "site-key",
     "secret_key": _GOOD_KEY,
+    "payee_fingerprint_key": _GOOD_FINGERPRINT_KEY,
+    "subprocessor_notices_enabled": True,
 }
 
 
@@ -185,3 +207,116 @@ def test_local_dev_keeps_the_console_email_adapter():
     # The local signup flow reads the welcome email's temporary password from
     # this log (docs/self-service-signup.md § Testing the flow locally).
     assert Settings(environment="development").email_provider == "console"
+
+
+# ── hCaptcha site key (deployed-env boot guard, #575) ─────────────────
+
+
+@pytest.mark.parametrize("sitekey", ["", "   "])
+def test_deployed_env_with_signup_open_refuses_a_missing_captcha_sitekey(sitekey):
+    # The secret alone verifies every signup server-side, but the widget only
+    # renders when /api/public-config hands the browser a site key: without
+    # one, every signup on a deployed stack fails the captcha. The post-deploy
+    # smoke check (deploy/smoke.sh) asserts the same thing from outside.
+    with pytest.raises(ValidationError, match="FEOH_HCAPTCHA_SITEKEY"):
+        Settings(**{**_DEPLOYED, "hcaptcha_sitekey": sitekey}, email_provider="ses")
+
+
+def test_deployed_env_with_signup_closed_needs_no_captcha_sitekey():
+    s = Settings(
+        **{**_DEPLOYED, "hcaptcha_secret": "", "hcaptcha_sitekey": ""},
+        email_provider="ses",
+        signup_enabled=False,
+    )
+    assert s.signup_enabled is False
+
+
+def test_local_dev_needs_no_captcha_sitekey():
+    assert Settings(environment="development").hcaptcha_sitekey == ""
+
+
+# ── Sub-processor change notices (deployed-env boot guard, decisions §321) ──
+
+
+@pytest.mark.parametrize("value", [False, None])
+def test_deployed_env_refuses_the_subprocessor_notice_sweep_off(value):
+    # The published DPA § 8 says change notices are emailed; with the sweep off
+    # nothing sends them and nothing says so. ``None`` = left unset (the default).
+    overrides = {k: v for k, v in _DEPLOYED.items() if k != "subprocessor_notices_enabled"}
+    if value is not None:
+        overrides["subprocessor_notices_enabled"] = value
+    with pytest.raises(ValidationError, match="FEOH_SUBPROCESSOR_NOTICES_ENABLED"):
+        Settings(**overrides, email_provider="ses")
+
+
+def test_deployed_env_accepts_the_subprocessor_notice_sweep_on():
+    assert Settings(**_DEPLOYED, email_provider="ses").subprocessor_notices_enabled is True
+
+
+def test_local_dev_keeps_the_subprocessor_notice_sweep_off():
+    # Off by default so a laptop, the test suite and CI never email a notice.
+    assert Settings(environment="development").subprocessor_notices_enabled is False
+
+
+# ── Payee bank-fingerprint key (deployed-env boot guard, decisions §383) ──
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "",  # unset: no fingerprint, every void flags
+        "   ",
+        "f" * 31,  # too short
+        "dev-payee-fingerprint-key-not-a-secret",  # the committed dev value
+        _GOOD_KEY,  # the JWT key itself, which rotates every 90 days
+    ],
+)
+def test_deployed_env_refuses_a_missing_weak_or_shared_fingerprint_key(key):
+    with pytest.raises(ValidationError, match="FEOH_PAYEE_FINGERPRINT_KEY"):
+        Settings(**{**_DEPLOYED, "payee_fingerprint_key": key}, email_provider="ses")
+
+
+def test_deployed_env_accepts_its_own_fingerprint_key():
+    s = Settings(**_DEPLOYED, email_provider="ses")
+    assert s.payee_fingerprint_key == _GOOD_FINGERPRINT_KEY
+
+
+def test_the_dev_fingerprint_key_constant_matches_the_committed_env():
+    # The guard refuses the value .env.development commits; the two must agree
+    # or the guard refuses nothing.
+    from app.config import _DEV_PAYEE_FINGERPRINT_KEY
+
+    committed = (Path(__file__).resolve().parents[1] / ".env.development").read_text()
+    assert f"FEOH_PAYEE_FINGERPRINT_KEY={_DEV_PAYEE_FINGERPRINT_KEY}\n" in committed
+
+
+def test_local_dev_runs_without_a_fingerprint_key():
+    s = Settings(environment="development", payee_fingerprint_key="")
+    assert s.payee_fingerprint_key == ""
+
+
+# ── The day-one rehearsal's env must boot (it is production-shaped) ──────
+
+
+def test_the_day_one_rehearsal_env_passes_every_deployed_boot_guard(monkeypatch):
+    # scripts/day-one/stack.sh writes the API's env for CI's production-shaped
+    # job; a new deployed-env refusal it does not satisfy only shows up there,
+    # as an API that never comes up. Build Settings from that exact heredoc.
+    stack = Path(__file__).resolve().parents[2] / "scripts" / "day-one" / "stack.sh"
+    body = re.search(r'cat >"\$STATE_DIR/api\.env" <<EOF\n(.*?)\nEOF', stack.read_text(), re.S)
+    assert body, "stack.sh no longer writes api.env with a heredoc"
+    env: dict[str, str] = {}
+    for n, line in enumerate(body.group(1).splitlines()):
+        key, _, value = line.partition("=")
+        # Each `openssl rand` is its own key, as in the real run: the payee
+        # fingerprint key is refused when it equals the JWT key.
+        value = value.replace("$(openssl rand -hex 32)", f"{n:02d}" * 32)
+        env[key] = re.sub(r"\$\{[A-Z_]+\}", "1", value)
+    assert env["FEOH_ENVIRONMENT"] == "production"
+    for key in [k for k in os.environ if k.startswith("FEOH_")]:
+        monkeypatch.delenv(key)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    s = Settings(_env_file=None)
+    assert s.is_deployed
+    assert s.subprocessor_notices_enabled is True

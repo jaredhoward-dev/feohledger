@@ -44,8 +44,13 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import RowLink from '#lib/components/ui/RowLink.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import { isAllowed } from '#lib/api/actionVerdicts.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { formatMoney } from '#lib/utils/money.ts';
+	import { formatPercent } from '#lib/utils/percent.ts';
 	import {
 		getApprovalPatterns,
 		getAnomalies,
@@ -67,7 +72,10 @@
 
 	// RBAC mirrors the backend exactly:
 	//   read   → _READ_ROLES            = admin | ap_manager | cfo
-	//   dismiss/route-apply → _WRITE_ROLES = admin | ap_manager
+	//   route-apply → _WRITE_ROLES = admin | ap_manager
+	//   dismiss → the row's `actions.dismiss` verdict (`dismiss_refusal`), never
+	//             restated here (`frontend/docs/ui-patterns.md` § Whether to
+	//             offer an action)
 	//   threshold apply → _THRESHOLD_APPLY_ROLES = admin (it edits a workflow
 	//                                              definition, like PATCH /workflows)
 	// Wait for `auth.user` before redirecting so we don't bounce ahead of /me
@@ -197,7 +205,7 @@
 				staleFrom = sent;
 				await loadThreshold();
 			} else {
-				toast(e instanceof Error ? e.message : m('adaptive.threshold.applyFailed'), 'error');
+				toast(errorMessage(e, m('adaptive.threshold.applyFailed')), 'error');
 			}
 		} finally {
 			applying = false;
@@ -259,7 +267,7 @@
 			);
 			await loadRouting();
 		} catch (e) {
-			toast(e instanceof Error ? e.message : m('adaptive.routing.applyFailed'), 'error');
+			toast(errorMessage(e, m('adaptive.routing.applyFailed')), 'error');
 		} finally {
 			routingApplying = false;
 		}
@@ -461,17 +469,17 @@
 			</div>
 
 			{#if suggestionsError}
-				<div class="state error" role="alert" data-testid="adaptive-suggestions-error">
-					<p>{suggestionsError}</p>
-					<button type="button" class="btn-cancel" onclick={loadSuggestions}
-						>{m('adaptive.retry')}</button
-					>
-				</div>
+				<LoadError
+					message={suggestionsError}
+					onretry={loadSuggestions}
+					testId="adaptive-suggestions-error"
+				/>
 			{:else}
 				<DataTable
 					columns={SUGGESTION_COLUMNS}
 					isEmpty={suggestions.length === 0}
-					empty={suggestionsLoading ? m('common.loading') : m('adaptive.suggestions.empty')}
+					loading={suggestionsLoading}
+					empty={m('adaptive.suggestions.empty')}
 				>
 					{#snippet body()}
 						{#each suggestions as s (s.id)}
@@ -481,14 +489,14 @@
 									{#if s.rationale}<span class="sub">{s.rationale}</span>{/if}
 								</td>
 								<td>{s.vendor_name}</td>
-								<td class="right mono">{s.confidence_pct}%</td>
+								<td class="right mono">{formatPercent(s.confidence_pct)}</td>
 								<td>
 									<Badge tone={SUGGESTION_TONES[s.status]} variant={s.status}>
 										{SUGGESTION_STATUS_LABELS[s.status]}
 									</Badge>
 								</td>
 								<td class="actions">
-									{#if canAct && s.status === 'open'}
+									{#if isAllowed(s.actions?.dismiss)}
 										<RowAction
 											variant="danger"
 											armed={armedDismissId === s.id}
@@ -589,14 +597,13 @@
 			</div>
 
 			{#if thresholdError}
-				<div class="state error" role="alert" data-testid="adaptive-threshold-error">
-					<p>{thresholdError}</p>
-					<button type="button" class="btn-cancel" onclick={loadThreshold}
-						>{m('adaptive.retry')}</button
-					>
-				</div>
+				<LoadError
+					message={thresholdError}
+					onretry={loadThreshold}
+					testId="adaptive-threshold-error"
+				/>
 			{:else if thresholdLoading && !threshold}
-				<p class="state">{m('common.loading')}</p>
+				<LoadingState />
 			{:else if threshold}
 				<p class="rationale" data-testid="adaptive-threshold-rationale">{threshold.rationale}</p>
 
@@ -679,11 +686,13 @@
 			{/if}
 
 			{#if routingError}
-				<div class="state error" role="alert" data-testid="adaptive-routing-error">
-					<p>{routingError}</p>
-				</div>
+				<LoadError
+					message={routingError}
+					onretry={loadRouting}
+					testId="adaptive-routing-error"
+				/>
 			{:else if routingLoading}
-				<p class="state">{m('common.loading')}</p>
+				<LoadingState />
 			{:else if routing}
 				{#if routing.insufficient_history || routing.candidates.length === 0}
 					<p class="state" data-testid="adaptive-routing-insufficient">
@@ -706,7 +715,7 @@
 									{#if Number(c.outcome_penalty) > 0}
 										{m('adaptive.routing.penalty', {
 											points: c.outcome_penalty,
-											pct: c.overturn_rate_pct,
+											pct: formatPercent(c.overturn_rate_pct),
 											n: c.outcome_sample_size
 										})}
 									{:else}
@@ -743,18 +752,18 @@
 			<p class="hint">{m('adaptive.patterns.intro')}</p>
 
 			{#if patternsError}
-				<div class="state error" role="alert" data-testid="adaptive-patterns-error">
-					<p>{patternsError}</p>
-					<button type="button" class="btn-cancel" onclick={loadPatterns}
-						>{m('adaptive.retry')}</button
-					>
-				</div>
+				<LoadError
+					message={patternsError}
+					onretry={loadPatterns}
+					testId="adaptive-patterns-error"
+				/>
 			{:else}
 				<h3>{m('adaptive.patterns.approvers')}</h3>
 				<DataTable
 					columns={APPROVER_COLUMNS}
 					isEmpty={(patterns?.approvers.length ?? 0) === 0}
-					empty={patternsLoading ? m('common.loading') : m('adaptive.patterns.emptyApprovers')}
+					loading={patternsLoading}
+					empty={m('adaptive.patterns.emptyApprovers')}
 				>
 					{#snippet body()}
 						{#each patterns?.approvers ?? [] as a (a.approver_id)}
@@ -762,7 +771,7 @@
 								<td>{a.approver_name ?? a.approver_id}</td>
 								<td class="right mono">{a.approved_count}</td>
 								<td class="right mono">{a.rejected_count}</td>
-								<td class="right mono">{a.approval_rate_pct}%</td>
+								<td class="right mono">{formatPercent(a.approval_rate_pct)}</td>
 								<td class="right mono">{a.median_time_to_approve_days}</td>
 								<td class="right mono">{a.sample_size}</td>
 							</tr>
@@ -795,14 +804,15 @@
 				<DataTable
 					columns={VENDOR_COLUMNS}
 					isEmpty={(patterns?.vendors.length ?? 0) === 0}
-					empty={patternsLoading ? m('common.loading') : m('adaptive.patterns.emptyVendors')}
+					loading={patternsLoading}
+					empty={m('adaptive.patterns.emptyVendors')}
 				>
 					{#snippet body()}
 						{#each patterns?.vendors ?? [] as v (v.vendor_name)}
 							<tr data-unconverted={v.unconverted_count}>
 								<td>{v.vendor_name}</td>
-								<td class="right mono">{v.approval_rate_pct}%</td>
-								<td class="right mono">{v.consistency_pct}%</td>
+								<td class="right mono">{formatPercent(v.approval_rate_pct)}</td>
+								<td class="right mono">{formatPercent(v.consistency_pct)}</td>
 								<td class="right mono">
 									<Money amount={v.avg_approved_amount} currency={orgCurrency.currency} mono />
 								</td>
@@ -826,12 +836,11 @@
 			<p class="hint">{m('adaptive.anomalies.intro')}</p>
 
 			{#if anomaliesError}
-				<div class="state error" role="alert" data-testid="adaptive-anomalies-error">
-					<p>{anomaliesError}</p>
-					<button type="button" class="btn-cancel" onclick={loadAnomalies}
-						>{m('adaptive.retry')}</button
-					>
-				</div>
+				<LoadError
+					message={anomaliesError}
+					onretry={loadAnomalies}
+					testId="adaptive-anomalies-error"
+				/>
 			{:else}
 				{#if anomalies}
 					<p class="hint">{m('adaptive.anomalies.scanned', { n: anomalies.total_scanned })}</p>
@@ -839,7 +848,8 @@
 				<DataTable
 					columns={ANOMALY_COLUMNS}
 					isEmpty={(anomalies?.flagged.length ?? 0) === 0}
-					empty={anomaliesLoading ? m('common.loading') : m('adaptive.anomalies.empty')}
+					loading={anomaliesLoading}
+					empty={m('adaptive.anomalies.empty')}
 				>
 					{#snippet body()}
 						{#each anomalies?.flagged ?? [] as a (a.invoice_id)}
@@ -933,7 +943,7 @@
 				<KpiCard
 					label={m('adaptive.feedback.overturnRate')}
 					value={feedback && !feedback.outcomes.insufficient_data
-						? `${feedback.outcomes.overturn_rate_pct}%`
+						? formatPercent(feedback.outcomes.overturn_rate_pct)
 						: null}
 					sub={feedback?.outcomes.insufficient_data
 						? m('adaptive.feedback.insufficientShort')
@@ -943,14 +953,13 @@
 			</div>
 
 			{#if feedbackError}
-				<div class="state error" role="alert" data-testid="adaptive-feedback-error">
-					<p>{feedbackError}</p>
-					<button type="button" class="btn-cancel" onclick={loadFeedback}
-						>{m('adaptive.retry')}</button
-					>
-				</div>
+				<LoadError
+					message={feedbackError}
+					onretry={loadFeedback}
+					testId="adaptive-feedback-error"
+				/>
 			{:else if feedbackLoading}
-				<p class="state">{m('common.loading')}</p>
+				<LoadingState />
 			{:else if feedback}
 				<h3>{m('adaptive.feedback.metrics')}</h3>
 				<ul class="metrics">
@@ -961,7 +970,7 @@
 									{m('adaptive.feedback.notMeasurable')}
 								</span>
 							{:else}
-								<span class="metric-value">{metric.value_pct}%</span>
+								<span class="metric-value">{formatPercent(metric.value_pct)}</span>
 							{/if}
 							<span class="sub">{metric.label}</span>
 						</li>
@@ -1093,13 +1102,6 @@
 		padding: 0.75rem 0;
 	}
 
-	.state.error {
-		color: var(--danger);
-	}
-
-	.state.error p {
-		margin: 0 0 8px;
-	}
 	/* The stale-value guard reads as a *changed* state, not a failure — same
 	   amber "a human needs to look" register the rest of the app uses. */
 	.state.changed {

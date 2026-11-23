@@ -28,6 +28,9 @@ Spend definitions (the contract the ``/spend`` + ``/check`` endpoints expose):
                     already counts for this budget, floored at zero
                     (``_po_relief_subquery``). Without that relief an invoiced
                     PO was counted twice — once here, once in ``actual``.
+                    A PO whose total the ERP could not confirm at its last
+                    sync (``total_unverifiable_reason``) is left out and
+                    counted on ``unverifiable_po_count`` (decisions §323).
                A converted requisition's amount is represented by its PO (leg 2),
                NOT by the requisition (leg 1) — the OPEN-COMMITMENT status list
                deliberately omits ``converted`` so the two legs never
@@ -85,9 +88,11 @@ from decimal import Decimal
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.invoice import Invoice
+from app.models.invoice import Invoice, InvoiceStatus
+from app.models.invoice_status import APPROVED_OR_BEYOND_STATUSES
 from app.models.procurement import (
     DEAD_PO_STATUSES,
+    PO_TOTAL_VOUCHED,
     Budget,
     BudgetDimension,
     PurchaseOrder,
@@ -120,15 +125,32 @@ _DIMENSION_MATCH_COLUMN = {
     BudgetDimension.project: Invoice.project,
 }
 
-# Invoice statuses that represent realised spend against a budget dimension.
-REALISED_INVOICE_STATUSES: tuple[str, ...] = (
-    "approved",
-    "sent_to_erp",
-    "posted_in_erp",
-    "payment_scheduled",
-    "paid",
-    "done",
-)
+# Invoice statuses that represent realised spend against a budget dimension:
+# every status a human-approved invoice can hold. This was a hand-listed copy
+# that left out `sending_to_erp`, so an invoice dropped out of `actual` (and
+# stopped relieving its PO) for as long as its ERP push was in flight or stuck
+# there (issue #575). It is the shared set now, not a copy of it.
+REALISED_INVOICE_STATUSES: tuple[str, ...] = tuple(s.value for s in APPROVED_OR_BEYOND_STATUSES)
+
+
+def realised_invoice_clause():
+    """The status half of "this invoice is realised spend", as SQL.
+
+    ``REALISED_INVOICE_STATUSES``, plus ``failed`` WITH evidence of approval. An
+    approved invoice whose ERP push failed sits at ``failed`` and is still
+    spend a human signed off; but ``failed`` is also where a failed EXTRACTION
+    lands, before any review, so the status alone proves nothing. The durable
+    ``Invoice.approval_date`` stamp (written on every approval path, never
+    cleared) is the evidence — the reading ``services/analytics`` takes for the
+    touchless rate (`decisions.md` §73) and ``api/vendors._bank_change_flag_statuses``
+    for the bank-change flag (§286). See §308.
+
+    One function because the ``actual`` leg and the PO-relief leg must admit
+    exactly the same invoices (``_realised_for_budget``)."""
+    return or_(
+        Invoice.status.in_(REALISED_INVOICE_STATUSES),
+        and_(Invoice.status == InvoiceStatus.failed, Invoice.approval_date.is_not(None)),
+    )
 
 
 @dataclass(frozen=True)
@@ -141,6 +163,11 @@ class _Leg:
 
     total: Decimal
     excluded: int
+    #: PO leg only: linked POs left out because the ERP's last sync could not
+    #: price them (``total_unverifiable_reason``, decisions §323). A count, kept
+    #: apart from ``excluded`` because the remedy differs — the ERP has to price
+    #: the PO, not someone re-denominate a row.
+    unverifiable: int = 0
 
 
 # What a budget with no matching rows on a leg contributes. The grouped leg
@@ -166,6 +193,10 @@ class BudgetSpend:
     # `committed` / `actual` describe PART of the linked activity; the reader
     # has to be told at the point of reading (`docs/decisions.md` §35).
     excluded_row_count: int = 0
+    # Linked open POs left out of `committed` because their total is one the
+    # ERP no longer vouches for (decisions §323). Same disclosure rule as
+    # `excluded_row_count`, its own count because the cause and the fix differ.
+    unverifiable_po_count: int = 0
 
 
 def _q(value) -> Decimal:
@@ -221,7 +252,11 @@ async def _collect_legs(db: AsyncSession, query) -> dict[uuid.UUID, _Leg]:
     A budget with no matching rows produces no group row at all (the joins are
     inner), so callers read through ``_ZERO_LEG`` rather than expecting a key."""
     rows = (await db.execute(query)).all()
-    return {bid: _Leg(_q(total), int(excluded or 0)) for bid, total, excluded in rows}
+    # The PO leg selects a fourth column, its unverifiable-PO count.
+    return {
+        bid: _Leg(_q(total), int(excluded or 0), int(rest[0] or 0) if rest else 0)
+        for bid, total, excluded, *rest in rows
+    }
 
 
 async def _committed_requisition_legs(
@@ -254,7 +289,7 @@ def _realised_for_budget() -> list:
     invoices. If the two could disagree, relief would either leave a double
     count standing or drop spend from both legs at once."""
     return [
-        Invoice.status.in_(REALISED_INVOICE_STATUSES),
+        realised_invoice_clause(),
         # Bound realised spend to the budget's own period so two budgets
         # tracking the same dimension in different periods don't both report
         # all-time spend. Only applied when BOTH bounds are set; a period-less
@@ -382,7 +417,7 @@ def _invoice_po_attribution(budget_ids: Sequence[uuid.UUID]):
         )
         .where(
             Invoice.po_number.in_(converted_numbers),
-            Invoice.status.in_(REALISED_INVOICE_STATUSES),
+            realised_invoice_clause(),
         )
         .subquery()
     )
@@ -406,9 +441,21 @@ async def _committed_po_legs(
     # one would hand the overspend back to the budget as headroom. The overage
     # is already in `actual`, where it belongs.
     open_commitment = func.greatest(PurchaseOrder.total - func.coalesce(relief.c.invoiced, 0), 0)
-    total, excluded = _leg_columns(open_commitment, PurchaseOrder.currency)
+    # A PO the ERP could not price at its last sync (decisions §323) is left
+    # out of the sum and counted on its own: its stored total is a figure
+    # nobody vouches for any more. Counted once — `unverifiable` wins over a
+    # currency mismatch, since even a re-denominated row would stay unpriced.
+    # `_leg_columns`' sum, over vouched POs only; its count is replaced below so
+    # a marked PO is not counted twice.
+    total, _ = _leg_columns(
+        case((PO_TOTAL_VOUCHED, open_commitment), else_=None), PurchaseOrder.currency
+    )
+    excluded = func.count().filter(
+        and_(PO_TOTAL_VOUCHED, (PurchaseOrder.currency == Budget.currency).isnot(True))
+    )
+    unverifiable = func.count().filter(PurchaseOrder.total_unverifiable_reason.is_not(None))
     query = (
-        select(Budget.id, total, excluded)
+        select(Budget.id, total, excluded, unverifiable)
         .select_from(Budget)
         .join(PurchaseRequisition, PurchaseRequisition.budget_id == Budget.id)
         .join(PurchaseOrder, PurchaseOrder.id == PurchaseRequisition.converted_po_id)
@@ -510,6 +557,7 @@ def _assemble_spend(budget: Budget, req: _Leg, po: _Leg, actual_leg: _Leg) -> Bu
         utilization_pct=utilization,
         currency=budget.currency,
         excluded_row_count=req.excluded + po.excluded + actual_leg.excluded,
+        unverifiable_po_count=po.unverifiable,
     )
 
 
@@ -581,6 +629,7 @@ class BudgetCurrencyRollup:
     utilization_pct: Decimal | None
     over_budget_count: int
     excluded_row_count: int
+    unverifiable_po_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -598,6 +647,8 @@ class BudgetRollup:
     by_currency: list[BudgetCurrencyRollup]
     excluded_row_count: int
     insufficient_data: bool
+    #: Whole-set total of ``BudgetSpend.unverifiable_po_count`` (decisions §323).
+    unverifiable_po_count: int = 0
 
 
 def _resolve_currency(code: str | None) -> str:
@@ -641,6 +692,7 @@ async def compute_budget_rollup(db: AsyncSession, budgets: Sequence[Budget]) -> 
                 "actual": Decimal(0),
                 "over_budget_count": 0,
                 "excluded_row_count": 0,
+                "unverifiable_po_count": 0,
             },
         )
         b["budget_count"] += 1
@@ -648,6 +700,7 @@ async def compute_budget_rollup(db: AsyncSession, budgets: Sequence[Budget]) -> 
         b["committed"] += spend.committed
         b["actual"] += spend.actual
         b["excluded_row_count"] += spend.excluded_row_count
+        b["unverifiable_po_count"] += spend.unverifiable_po_count
         if spend.remaining < 0:
             b["over_budget_count"] += 1
 
@@ -673,6 +726,7 @@ async def compute_budget_rollup(db: AsyncSession, budgets: Sequence[Budget]) -> 
                 utilization_pct=utilization,
                 over_budget_count=b["over_budget_count"],
                 excluded_row_count=b["excluded_row_count"],
+                unverifiable_po_count=b["unverifiable_po_count"],
             )
         )
 
@@ -681,4 +735,5 @@ async def compute_budget_rollup(db: AsyncSession, budgets: Sequence[Budget]) -> 
         by_currency=by_currency,
         excluded_row_count=sum(c.excluded_row_count for c in by_currency),
         insufficient_data=len(budgets) == 0,
+        unverifiable_po_count=sum(c.unverifiable_po_count for c in by_currency),
     )

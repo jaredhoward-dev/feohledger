@@ -18,6 +18,8 @@ Two layers:
     fixture) — the link + approval + AgentDecision + audit_log writes are real:
     a clean 2-PO split auto-resolves; ambiguous escalates; sum-outside-tolerance
     escalates; the invoice amount is never mutated; idempotent re-run is a no-op;
+    the linked PO set lands in ``split_po_ids`` and survives a warning refresh
+    that rewrites ``po_match`` (decisions §433);
     sub-threshold (undated) confidence escalates under ``balanced``.
 """
 
@@ -140,6 +142,9 @@ async def _seed_split(
     number: str,
     with_invoice_date: bool = True,
     po_currencies: list[str | None] | None = None,
+    link_vendor: bool = True,
+    vendor_name: str = "Initech Parts",
+    approved_once: bool = False,
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     """Create a vendor, ``len(po_totals)`` open POs under it, and an invoice in
     ``ready_for_review`` referencing a NON-EXISTENT po_number (so the live match
@@ -151,7 +156,7 @@ async def _seed_split(
 
     async with mk() as s:
         vendor = Vendor(
-            name="Initech Parts",
+            name=vendor_name,
             status="active",
             source="manual",
             organization_id=org_id,
@@ -178,9 +183,14 @@ async def _seed_split(
         inv = Invoice(
             organization_id=org_id,
             invoice_number=number,
-            vendor_name="Initech Parts",
-            vendor_id=vendor.id,
+            vendor_name=vendor_name,
+            vendor_id=vendor.id if link_vendor else None,
+            # A recalled invoice back in review keeps its approval stamps
+            # (decisions §374).
+            approved_by="Original Approver" if approved_once else None,
+            approval_date=date(2026, 11, 1) if approved_once else None,
             amount=invoice_amount,
+            currency="USD",
             invoice_date=date.today() if with_invoice_date else None,
             status=InvoiceStatus.ready_for_review,
             po_number=f"PO-DOES-NOT-EXIST-{number}",
@@ -239,10 +249,11 @@ async def test_clean_two_po_split_auto_resolves(realdb):
         assert set(inv.po_number.split(",")) == {"PO-INV-SPLIT-OK-0", "PO-INV-SPLIT-OK-1"}
         # Amount is NEVER touched — this resolver links, never adjusts money.
         assert inv.amount == Decimal("1000.00")
-        # A multi-PO snapshot is recorded for the modal.
-        assert inv.po_match["match_type"] == "multi-po-split"
-        assert inv.po_match["po_count"] == 2
-        assert inv.po_match["combined_po_total"] == "1000.00"
+        # `po_match` is the matcher's own read of the split, against its legs
+        # combined — the same thing the next warning refresh writes.
+        assert inv.po_match["status"] == "matched"
+        assert len(inv.po_match["po_ids"]) == 2
+        assert Decimal(str(inv.po_match["po_total"])) == Decimal("1000.00")
         # ...labelled with the currency every PO in the set was proven to share.
         assert inv.po_match["po_currency"] == "USD"
         assert inv.po_match["currency_check"] == "same"
@@ -270,6 +281,129 @@ async def test_clean_two_po_split_auto_resolves(realdb):
             .all()
         )
         assert "invoice.approved" in {a.action for a in audits}
+
+
+async def test_a_warning_refresh_after_the_split_keeps_its_po_set_and_raises_no_hold(realdb):
+    """Decisions §433: the split links the invoice to its POs in
+    `split_po_ids`, which no refresh rewrites — the approval door's receiver /
+    inspector rules read it. And the matcher reads the split from it too, so a
+    later edit's refresh matches the legs instead of re-raising the `no_po`
+    `po_mismatch` the agent just resolved on the combined reference."""
+    from app.models.procurement import PurchaseOrder
+    from app.services.invoice_warnings import refresh_warnings
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    actor_id = realdb.info("a").users["ap_manager"]
+    inv_id, _, exc_id = await _seed_split(
+        mk,
+        org_id,
+        invoice_amount=Decimal("1000.00"),
+        po_totals=[Decimal("600.00"), Decimal("400.00")],
+        number="INV-SPLIT-LINKS",
+    )
+    async with mk() as s:
+        exc = await s.get(APException, exc_id)
+        result = await run_agent(
+            s,
+            exception=exc,
+            actor_id=actor_id,
+            org_settings={"exception_agents": {"autonomy_level": "balanced"}},
+            actor_roles={"ap_manager"},
+        )
+        assert result.decision.action_taken == ACTION_AUTO_RESOLVED
+
+    async with mk() as s:
+        legs = {
+            str(i)
+            for i in (
+                await s.execute(
+                    select(PurchaseOrder.id).where(
+                        PurchaseOrder.po_number.like("PO-INV-SPLIT-LINKS-%")
+                    )
+                )
+            ).scalars()
+        }
+        inv = await s.get(Invoice, inv_id)
+        assert set(inv.split_po_ids) == legs
+        assert set(inv.po_match["po_ids"]) == legs
+
+        await refresh_warnings(s, inv, org_settings={})
+        await s.commit()
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert set(inv.split_po_ids) == legs  # the split's record did not move
+        assert inv.po_match["status"] == "matched"
+        assert set(inv.po_match["po_ids"]) == legs
+        rows = (
+            (
+                await s.execute(
+                    select(APException).where(
+                        APException.invoice_id == inv_id,
+                        APException.exception_type == "po_mismatch",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [r.id for r in rows] == [exc_id]  # only the one the agent resolved
+        assert rows[0].status == "resolved"
+
+
+async def test_a_split_with_a_leg_short_received_escalates(realdb):
+    """The agent approves only on the matcher's clean `matched`, read as the
+    split. Half of one leg's goods in, the invoice billed in full: the set's
+    totals sum, but the receipts do not cover it — a human looks."""
+    from app.models.procurement import GoodsReceipt, GRLineItem, POLineItem, PurchaseOrder
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    actor_id = realdb.info("a").users["ap_manager"]
+    inv_id, _, exc_id = await _seed_split(
+        mk,
+        org_id,
+        invoice_amount=Decimal("1000.00"),
+        po_totals=[Decimal("600.00"), Decimal("400.00")],
+        number="INV-SPLIT-SHORT",
+    )
+    async with mk() as s:
+        po = (
+            await s.execute(
+                select(PurchaseOrder).where(PurchaseOrder.po_number == "PO-INV-SPLIT-SHORT-0")
+            )
+        ).scalar_one()
+        s.add(POLineItem(po_id=po.id, description="Widget", quantity=Decimal("10")))
+        gr = GoodsReceipt(
+            gr_number=f"GR-{uuid.uuid4().hex[:8]}",
+            po_id=po.id,
+            status="received",
+            organization_id=org_id,
+        )
+        s.add(gr)
+        await s.flush()
+        s.add(GRLineItem(gr_id=gr.id, description="Widget", quantity_received=Decimal("5")))
+        await s.commit()
+
+    async with mk() as s:
+        exc = await s.get(APException, exc_id)
+        result = await run_agent(
+            s,
+            exception=exc,
+            actor_id=actor_id,
+            org_settings={"exception_agents": {"autonomy_level": "balanced"}},
+            actor_roles={"ap_manager"},
+        )
+        assert result.decision.action_taken == ACTION_ESCALATED
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.status == InvoiceStatus.ready_for_review
+        assert inv.amount == Decimal("1000.00")
+        # The link unwound with the approval it was for.
+        assert inv.po_number == "PO-DOES-NOT-EXIST-INV-SPLIT-SHORT"
+        assert inv.split_po_ids is None
 
 
 async def test_a_po_in_another_currency_never_joins_the_sum(realdb):
@@ -552,3 +686,45 @@ async def test_rerun_on_resolved_split_is_noop(realdb):
         assert len(decisions) == 1
         inv = await s.get(Invoice, inv_id)
         assert inv.status == InvoiceStatus.approved
+
+
+async def test_the_split_agent_never_sets_the_payee_of_a_once_approved_invoice(realdb):
+    """A recalled invoice (stamps kept) with no vendor linked, matching a clean
+    two-PO split under a vendor of the same name: the agent would fill
+    `vendor_id` from the first PO and approve. It escalates instead, with the
+    invoice unchanged (decisions §379)."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    actor_id = realdb.info("a").users["ap_manager"]
+    tag = uuid.uuid4().hex[:8]
+
+    inv_id, _corr, exc_id = await _seed_split(
+        mk,
+        org_id,
+        invoice_amount=Decimal("1000.00"),
+        po_totals=[Decimal("600.00"), Decimal("400.00")],
+        number=f"INV-SPLIT-PAYEE-{tag}",
+        link_vendor=False,
+        vendor_name=f"Split Payee {tag}",
+        approved_once=True,
+    )
+
+    org_settings = {"exception_agents": {"autonomy_level": "balanced"}}
+    async with mk() as s:
+        exc = await s.get(APException, exc_id)
+        result = await run_agent(
+            s,
+            exception=exc,
+            actor_id=actor_id,
+            org_settings=org_settings,
+            actor_roles={"ap_manager"},
+        )
+        assert result.decision.action_taken == ACTION_ESCALATED
+        assert "approved once" in result.decision.rationale
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.vendor_id is None
+        assert inv.po_number == f"PO-DOES-NOT-EXIST-INV-SPLIT-PAYEE-{tag}"
+        assert inv.status == InvoiceStatus.ready_for_review
+        assert (await s.get(APException, exc_id)).status == "escalated"

@@ -23,7 +23,9 @@ export type NotificationEventType =
 	| 'contract_renewal_due'
 	| 'chat_message'
 	| 'cash_shortfall_projected'
-	| 'ai_invoice_usage';
+	| 'ai_invoice_usage'
+	| 'erp_connection_expiring'
+	| 'erp_call_quota';
 
 export interface Notification {
 	id: string;
@@ -84,30 +86,9 @@ export function normalizePrefs(
 }
 
 /**
- * Display labels for each event type — English, data-driven, the same
- * convention as `chatNotifications.ts`'s `CHAT_EVENT_LABELS`.
- *
- * Used by the notification centre and the bell, neither of which is in the
- * i18n extraction slice yet. The `/profile` preference grid renders
- * `EVENT_LABEL_KEYS` instead; the roster guard pins the English catalogue
- * values to this map so the two spellings can never diverge.
- */
-export const EVENT_LABELS: Record<NotificationEventType, string> = {
-	invoice_assigned: 'Invoice assigned to me',
-	invoice_approved: 'Invoice approved',
-	invoice_rejected: 'Invoice rejected',
-	invoice_paid: 'Invoice paid',
-	contract_renewal_due: 'Contract renewal due',
-	chat_message: 'New supplier chat message',
-	cash_shortfall_projected: 'Projected cash shortfall',
-	ai_invoice_usage: 'AI-read invoice usage'
-};
-
-/**
- * The i18n key carrying each event's label, for surfaces that are inside the
- * extraction slice (the `/profile` preference grid). Split from `EVENT_LABELS`
- * rather than replacing it because the bell and centre are not extracted yet —
- * and kept honest by the roster guard, which asserts `en[key] === label`.
+ * The i18n key carrying each event's label — what every surface (the sidebar
+ * bell, the notification centre, the `/profile` preference grid) renders
+ * through `m()`. The roster guard holds it to `EVENT_ORDER`.
  */
 export const EVENT_LABEL_KEYS: Record<NotificationEventType, MessageKey> = {
 	invoice_assigned: 'profile.notifications.event.invoiceAssigned',
@@ -117,7 +98,9 @@ export const EVENT_LABEL_KEYS: Record<NotificationEventType, MessageKey> = {
 	contract_renewal_due: 'profile.notifications.event.contractRenewalDue',
 	chat_message: 'profile.notifications.event.chatMessage',
 	cash_shortfall_projected: 'profile.notifications.event.cashShortfallProjected',
-	ai_invoice_usage: 'profile.notifications.event.aiInvoiceUsage'
+	ai_invoice_usage: 'profile.notifications.event.aiInvoiceUsage',
+	erp_connection_expiring: 'profile.notifications.event.erpConnectionExpiring',
+	erp_call_quota: 'profile.notifications.event.erpCallQuota'
 };
 
 /**
@@ -134,5 +117,7 @@ export const EVENT_ORDER: NotificationEventType[] = [
 	'contract_renewal_due',
 	'chat_message',
 	'cash_shortfall_projected',
-	'ai_invoice_usage'
+	'ai_invoice_usage',
+	'erp_connection_expiring',
+	'erp_call_quota'
 ];

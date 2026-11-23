@@ -3,6 +3,8 @@
 	import { api } from '#lib/api.ts';
 	import { formatMoney } from '#lib/utils/money.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	interface RevealResponse {
 		last_four: string | null;
@@ -32,10 +34,10 @@
 		try {
 			card = await api.get<RevealResponse>(`/api/portal/cards/${token}`);
 		} catch (err) {
-			const e = err as { status?: number; message?: string; detail?: string } | null;
+			const e = err as { status?: number } | null;
 			error = {
 				status: e?.status ?? 0,
-				message: e?.detail ?? e?.message ?? m('portal.cards.loadFailed')
+				message: errorMessage(err, m('portal.cards.loadFailed'))
 			};
 		} finally {
 			loading = false;
@@ -69,7 +71,7 @@
 		<div class="brand">{m('portal.cards.brand')}</div>
 
 		{#if loading}
-			<p class="state">{m('portal.cards.loading')}</p>
+			<LoadingState label={m('portal.cards.loading')} />
 		{:else if error}
 			<div class="state error">
 				<h1>
@@ -175,10 +177,10 @@
 
 	.warning {
 		padding: 10px 12px;
-		background: rgba(212, 148, 10, 0.1);
-		border: 1px solid rgba(212, 148, 10, 0.3);
+		background: color-mix(in srgb, var(--warning) 10%, transparent);
+		border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
 		border-radius: 6px;
-		color: #d4940a;
+		color: var(--warning);
 		font-size: 0.85rem;
 		margin: 0 0 16px;
 	}
