@@ -1407,6 +1407,13 @@ describe('why /cards/generate minted nothing, and the CSV near-duplicate rows', 
 		['csv_vendor_name_required', {}, 'refusal.csvVendorNameRequired', {}],
 		['csv_invoice_number_required', {}, 'refusal.csvInvoiceNumberRequired', {}],
 		['csv_vendor_required', {}, 'refusal.csvVendorRequired', {}],
+		['csv_vendor_code_ambiguous', { value: 'DUP' }, 'refusal.csvVendorCodeAmbiguous', { value: 'DUP' }],
+		[
+			'csv_vendor_code_is_erp_number',
+			{ value: 'BC-7' },
+			'refusal.csvVendorCodeIsErpNumber',
+			{ value: 'BC-7' }
+		],
 		['csv_amount_invalid', { value: 'ten' }, 'refusal.csvAmountInvalid', { value: 'ten' }],
 		['csv_amount_invalid', { value: '' }, 'refusal.csvAmountMissing', {}],
 		['csv_currency_required', {}, 'refusal.csvCurrencyRequired', {}],

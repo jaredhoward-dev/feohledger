@@ -264,6 +264,8 @@ export const messages = {
 	'refusal.csvVendorNameRequired': "La columna name está vacía, por lo que este proveedor no se importó.",
 	'refusal.csvInvoiceNumberRequired': "La columna invoice_number está vacía, por lo que esta fila no se importó.",
 	'refusal.csvVendorRequired': "Esta fila no indica ningún proveedor, por lo que no se importó. Complete vendor_name o vendor_code.",
+	'refusal.csvVendorCodeAmbiguous': "El vendor_code {value} de esta fila lo tienen varios proveedores, por lo que no se importó. Asigne a cada uno un código distinto, o combínelos si son un mismo proveedor.",
+	'refusal.csvVendorCodeIsErpNumber': "El vendor_code {value} de esta fila es el número de un proveedor en su ERP, no un código de proveedor, por lo que no se importó. Si se refiere a ese proveedor, asígnelo como código del proveedor e importe de nuevo.",
 	'refusal.csvAmountMissing': "La columna amount está vacía, por lo que esta fila no se importó.",
 	'refusal.csvAmountInvalid': "El importe {value} no es un importe válido igual o mayor que cero, por lo que esta fila no se importó.",
 	'refusal.csvCurrencyRequired': "La columna currency está vacía, por lo que esta fila no se importó. Indique el código de moneda de tres letras de la fila, como USD o EUR; nunca se supone una moneda que falta.",
