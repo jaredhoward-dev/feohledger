@@ -168,8 +168,12 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   with its own loading / error / empty state and its own request sequence (a
   failing anomaly scan cannot blank the patterns a reader is looking at). The one
   write is **dismiss a suggestion** (`POST /suggestions/{id}/dismiss`, behind a
-  confirm dialog, gated on admin / ap_manager = the backend `_WRITE_ROLES`; a CFO
-  reads and is not offered it). **The two apply paths are deliberately absent** —
+  confirm dialog). It is offered from each row's `actions.dismiss`
+  (`_suggestion_actions`: `_WRITE_ROLES`, then `dismiss_refusal`'s status gate),
+  never a role or status check in the app: `null` offers it, any refusal
+  (`role_not_permitted` for a CFO, `workflow_suggestion_not_dismissable` for a
+  row already dismissed or applied) hides it, and a row with no verdict offers
+  nothing. **The two apply paths are deliberately absent** —
   `routing-suggestion/apply` reassigns a live approval and
   `threshold-recommendation/apply` raises the org-wide auto-approve threshold,
   which is a money-path control surface, and the latter's stale-value 409 needs a

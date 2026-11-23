@@ -2183,6 +2183,7 @@ void main() {
                 'status': 'open',
                 'created_at': '2026-03-01T10:00:00',
                 'dismissed_at': null,
+                'actions': {'dismiss': null},
               },
             ],
           });

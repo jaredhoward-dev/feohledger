@@ -34,7 +34,33 @@ Map<String, dynamic> _me(List<String> roles) => {
   'roles': roles,
 };
 
-Map<String, dynamic> _suggestion(String id, {String status = 'open'}) => {
+/// The row's `actions.dismiss` as `_suggestion_actions` serves it: `null`
+/// when the server would accept a dismiss now.
+const Object? _allowed = null;
+
+/// What a CFO's row carries — `_WRITE_ROLES` refused.
+const Map<String, dynamic> _roleRefused = {
+  'code': 'role_not_permitted',
+  'message': 'Your role does not permit this action.',
+  'params': <String, dynamic>{},
+};
+
+/// What a dismissed row carries — `dismiss_refusal`'s status gate.
+const Map<String, dynamic> _notDismissable = {
+  'code': 'workflow_suggestion_not_dismissable',
+  'message': 'A suggestion that is dismissed cannot be dismissed.',
+  'params': {'status': 'dismissed'},
+};
+
+/// Marks a suggestion served with no `actions` at all (an older backend).
+const Object _noActions = Object();
+
+Map<String, dynamic> _suggestion(
+  String id, {
+  String status = 'open',
+  Object? dismiss = _allowed,
+}) => {
+  if (!identical(dismiss, _noActions)) 'actions': {'dismiss': dismiss},
   'id': id,
   'kind': 'auto_approve_threshold',
   'vendor_id': 'v1',
@@ -140,7 +166,9 @@ MockClient _adaptiveClient({
         }, dismissStatus);
       }
       return _json({
-        'suggestions': [_suggestion('s1', status: 'dismissed')],
+        'suggestions': [
+          _suggestion('s1', status: 'dismissed', dismiss: _notDismissable),
+        ],
       });
     }
     if (path.endsWith('/approval-patterns')) {
@@ -271,9 +299,76 @@ void main() {
   testWidgets('a CFO reads the suggestions and is offered no dismiss', (
     tester,
   ) async {
-    // `_WRITE_ROLES` on the backend is admin | ap_manager; a CFO would get a
-    // 403, so the control is not rendered rather than rendered and refused.
-    await loginThen(['cfo'], _adaptiveClient());
+    // `_WRITE_ROLES` on the backend is admin | ap_manager; the CFO's row
+    // carries that refusal as its `actions.dismiss`, so the control is not
+    // rendered rather than rendered and refused.
+    await loginThen([
+      'cfo',
+    ], _adaptiveClient(suggestions: [_suggestion('s1', dismiss: _roleRefused)]));
+
+    await tester.pumpWidget(_localized(const AdaptiveScreen()));
+    await _pumpUntil(
+      tester,
+      find.text('Vendor Acme: 14/14 invoices approved unmodified'),
+    );
+
+    expect(find.text('Dismiss'), findsNothing);
+  });
+
+  testWidgets('a dismiss refused for its status is not offered', (
+    tester,
+  ) async {
+    // The verdict, not the role: an admin looking at an already-applied row
+    // gets `workflow_suggestion_not_dismissable` and no button.
+    await loginThen(
+      ['admin'],
+      _adaptiveClient(
+        suggestions: [
+          _suggestion(
+            's1',
+            status: 'applied',
+            dismiss: {
+              'code': 'workflow_suggestion_not_dismissable',
+              'message': 'A suggestion that is applied cannot be dismissed.',
+              'params': {'status': 'applied'},
+            },
+          ),
+        ],
+      ),
+    );
+
+    await tester.pumpWidget(_localized(const AdaptiveScreen()));
+    await _pumpUntil(
+      tester,
+      find.text('Vendor Acme: 14/14 invoices approved unmodified'),
+    );
+
+    expect(find.text('Dismiss'), findsNothing);
+  });
+
+  testWidgets('a stale row the server would dismiss offers Dismiss', (
+    tester,
+  ) async {
+    // `dismiss_refusal` accepts `open` and `stale`; the old status check
+    // offered only `open`. The verdict is what decides.
+    await loginThen([
+      'ap_manager',
+    ], _adaptiveClient(suggestions: [_suggestion('s1', status: 'stale')]));
+
+    await tester.pumpWidget(_localized(const AdaptiveScreen()));
+    await _pumpUntil(tester, find.text('Dismiss'));
+
+    expect(find.widgetWithText(TextButton, 'Dismiss'), findsOneWidget);
+  });
+
+  testWidgets('a row served without a verdict offers no dismiss', (
+    tester,
+  ) async {
+    // Fail closed: an admin whose role the backend admits still gets no
+    // control when the row carries no `actions` to say so.
+    await loginThen([
+      'admin',
+    ], _adaptiveClient(suggestions: [_suggestion('s1', dismiss: _noActions)]));
 
     await tester.pumpWidget(_localized(const AdaptiveScreen()));
     await _pumpUntil(

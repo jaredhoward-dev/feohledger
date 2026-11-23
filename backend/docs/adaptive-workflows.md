@@ -704,8 +704,11 @@ and its own request sequence, so a failing anomaly scan cannot blank the
 patterns a reader is looking at.
 
 **Read-first, and the omissions are the design.** The only write is
-`POST /suggestions/{id}/dismiss` (behind a confirm dialog, gated on
-`canDismissSuggestion` = `_WRITE_ROLES`, so a CFO reads and is not offered it).
+`POST /suggestions/{id}/dismiss` (behind a confirm dialog, offered only when
+the row's `actions.dismiss` verdict is `null`: the role gate and
+`dismiss_refusal`'s status gate both come from the server, so a CFO, or a row
+already dismissed or applied, is offered nothing, a `stale` row the server
+would dismiss is offered it, and a row with no `actions` offers nothing).
 Neither apply path is exposed: `routing-suggestion/apply` reassigns a live
 approval, `threshold-recommendation/apply` raises the org-wide threshold that
 decides which invoices skip human review, and the second one carries the
