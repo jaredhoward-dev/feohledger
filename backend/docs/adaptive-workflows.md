@@ -622,7 +622,7 @@ row highlighted), a create `Modal` (pick a definition — seeds both configs fro
 its live `steps_config` — set split %, primary metric, min sample, edit the two
 JSON configs), and per-row start / stop / conclude / delete actions offered by the row's
 `actions` verdicts (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`,
-the gates the endpoints raise from; decisions §485, §486). A draft offers
+the gates the endpoints raise from; decisions §487, §488). A draft offers
 exactly one way out: Delete while it has never assigned an invoice, Conclude
 once it has (a stopped draft keeps its assignments). Over `#lib/api/experiments.ts` (types in
 `#lib/types/experiments.ts`).

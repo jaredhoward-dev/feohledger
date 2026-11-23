@@ -100,7 +100,7 @@ it (that FK RESTRICTs, so the attempt used to surface as a `500`). Both answer a
 coded detail — `intake_delete_converted`, `requisition_delete_from_intake` —
 from the one gate in `services/procurement_controls.py` that also builds each
 row's `actions.delete`, so /intake and /requisitions offer Delete exactly where
-it succeeds (decisions §485).
+it succeeds (decisions §487).
 
 The pair is what keeps the idempotency above **real**. The dangling-link
 rebuild exists for a requisition that genuinely vanished; while the requisition

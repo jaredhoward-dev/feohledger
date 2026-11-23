@@ -2,7 +2,7 @@
 
 Why
 ---
-``docs/decisions.md`` §484. ``vendors.erp_vendor_id`` had no unique index, so
+``docs/decisions.md`` §486. ``vendors.erp_vendor_id`` had no unique index, so
 two vendors could hold one ERP record's id in one company. The vendor sync
 looks a pulled record up by that id (``services/vendor_sync``) with
 ``scalar_one_or_none``, which raises on two rows, so one such pair aborted

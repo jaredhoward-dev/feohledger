@@ -1012,7 +1012,7 @@ Where each verdict lives (backend gate → field):
 | Exception queue | `decision_refusals.{resolve,dismiss,escalate}` | `api/exceptions.actionable_refusal` + `exception_lifecycle.segregation_refusal` |
 | Credit memos | `actions.{apply,edit,void}` | `_assert_applicable` / `_assert_editable` / `_assert_voidable` |
 | Discount offers | `actions.{accept,decline}`, `capturable_tier_days` (the accept dialog's tiers) | `api/discounts.accept_refusal` / `.decline_refusal` |
-| Experiments | `actions.{start,stop,conclude,delete}` | `api/workflow_experiments.{start,stop,conclude,delete}_refusal`. Every refusal hides the control (`experiment_already_concluded` is the idempotent repeat, nothing to offer; decisions §485) |
+| Experiments | `actions.{start,stop,conclude,delete}` | `api/workflow_experiments.{start,stop,conclude,delete}_refusal`. Every refusal hides the control (`experiment_already_concluded` is the idempotent repeat, nothing to offer; decisions §487) |
 | Adaptive suggestions | `actions.dismiss` | `api/adaptive_workflows.dismiss_refusal` |
 | Vendors | `status_actions.{verify,reject}` | `api/vendors.vendor_status_refusal` |
 | Vendor modal (Find this vendor in the ERP) | `GET /api/vendors/{id}/erp-links` → `search_refusal` (also on the link / unlink responses) | `services/vendor_erp_manual_link.search_refusal`. `vendor_erp_link_exists` replaces the search with its sentence; any other refusal hides it (decisions §415) |

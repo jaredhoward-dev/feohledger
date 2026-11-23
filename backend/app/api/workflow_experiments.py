@@ -111,7 +111,7 @@ EXPERIMENT_NOT_STOPPABLE = "experiment_not_stoppable"
 EXPERIMENT_ALREADY_CONCLUDED = "experiment_already_concluded"
 #: Conclude refused: a `draft` with no assignments never measured anything, so
 #: concluding it would file an empty result as a finished experiment — delete
-#: it instead (409; decisions §486). It is exactly the row delete accepts.
+#: it instead (409; decisions §488). It is exactly the row delete accepts.
 EXPERIMENT_NEVER_RAN = "experiment_never_ran"
 #: Delete refused: only a `draft` experiment can be deleted (409).
 EXPERIMENT_NOT_DELETABLE = "experiment_not_deletable"
@@ -139,7 +139,7 @@ def conclude_refusal(exp: WorkflowExperiment) -> ActionRefusal | None:
     row's repeat is the idempotent no-op (the endpoint answers it with the
     unchanged row, so only the verdict sees that refusal); a draft that never
     assigned an invoice is refused with 409 ``experiment_never_ran`` — it has
-    no result to conclude, and Delete is its exit (decisions §486)."""
+    no result to conclude, and Delete is its exit (decisions §488)."""
     if exp.status == "concluded":
         return ActionRefusal(
             EXPERIMENT_ALREADY_CONCLUDED,

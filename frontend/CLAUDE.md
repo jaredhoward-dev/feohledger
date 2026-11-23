@@ -120,7 +120,7 @@ applying, and only then an ID-scoped ignore in `pnpm.auditConfig.ignoreGhsas`
 and the root `osv-scanner.toml`; an ignore without a patch, or a patch without
 the guard, is not enough (decisions §352). None is in place today: the one
 there was, deepmerge's GHSA-gcqx-w48m-w2h4, was withdrawn upstream and all
-four pieces went with it (decisions §482).
+four pieces went with it (decisions §484).
 
 Two Dependabot npm PRs (#344, #351) arrived with the lockfile's whole
 `overrides:` block deleted, red on every job that installs:

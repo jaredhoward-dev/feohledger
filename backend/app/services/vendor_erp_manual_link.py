@@ -173,7 +173,7 @@ async def link_lock(db: AsyncSession, organization_id: uuid.UUID, realm: str | N
     ``realm`` None is the no-realm company (links stamped NULL, one company to
     ``uq_vendors_erp_link``); only the sync writes there, and two no-realm
     pulls creating a vendor for one new record would otherwise both pass the
-    lookup and the second would fail the index at flush (decisions §487). Its
+    lookup and the second would fail the index at flush (decisions §489). Its
     key cannot collide with a named realm's: ``connection_realm`` never
     returns an empty realm."""
     key = f"vendor-erp-link:{organization_id}:{'' if realm is None else realm}"

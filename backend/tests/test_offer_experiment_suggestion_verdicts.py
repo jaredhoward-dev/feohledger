@@ -259,7 +259,7 @@ def test_a_fresh_draft_offers_start_and_delete_but_not_conclude():
     """A draft that never assigned an invoice has no result to conclude:
     concluding it filed an empty experiment as finished, beside the Delete that
     is its real exit. Start and Delete are offered; Conclude and Stop are not
-    (decisions §486)."""
+    (decisions §488)."""
     fresh = WorkflowExperiment(status="draft", assignments={})
     assert start_refusal(fresh) is None
     assert delete_refusal(fresh) is None

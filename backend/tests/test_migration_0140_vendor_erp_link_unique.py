@@ -1,4 +1,4 @@
-"""Migration 0140 — one vendor per ERP record per company (decisions §484).
+"""Migration 0140 — one vendor per ERP record per company (decisions §486).
 
 The realdb harness builds every tenant with ``create_all``, so
 ``uq_vendors_erp_link`` exists there without the revision running: the
