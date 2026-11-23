@@ -3544,6 +3544,12 @@ export const messages = {
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's
 	// "what happens next" steps and the login panel line.
 	'auth.shell.tagline': 'De la facture au paiement, chaque facture rapprochée.',
+	'auth.login.proof1Title': 'Lues, pas ressaisies',
+	'auth.login.proof1Body': 'Les factures arrivent par e-mail ou dépôt et reviennent imputées.',
+	'auth.login.proof2Title': 'Rapprochées avant paiement',
+	'auth.login.proof2Body': 'Commande, réception et contrôle qualité, vérifiés ligne par ligne.',
+	'auth.login.proof3Title': 'Chaque validation tracée',
+	'auth.login.proof3Body': 'Qui a validé, pour quel montant et quand — en journal inaltérable.',
 	'auth.shell.homeLink': 'Accueil FeohLedger',
 	'auth.login.panelBody': 'Extraction, validations, rapprochement et paiements — au même endroit.',
 	'auth.signup.nextHeading': 'Et ensuite ?',

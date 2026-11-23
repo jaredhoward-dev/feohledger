@@ -3541,6 +3541,12 @@ export const messages = {
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's
 	// "what happens next" steps and the login panel line.
 	'auth.shell.tagline': 'Da fatura ao pagamento, cada fatura conciliada.',
+	'auth.login.proof1Title': 'Lidas, não redigitadas',
+	'auth.login.proof1Body': 'As notas chegam por e-mail ou upload e voltam classificadas.',
+	'auth.login.proof2Title': 'Conferidas antes do pagamento',
+	'auth.login.proof2Body': 'Pedido, recebimento e inspeção, verificados em cada item.',
+	'auth.login.proof3Title': 'Cada aprovação registrada',
+	'auth.login.proof3Body': 'Quem aprovou, de quanto e quando — em registro imutável.',
 	'auth.shell.homeLink': 'Página inicial do FeohLedger',
 	'auth.login.panelBody': 'Extração, aprovações, conciliação e pagamentos — em um só lugar.',
 	'auth.signup.nextHeading': 'O que acontece depois',

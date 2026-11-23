@@ -13,6 +13,7 @@
 	import { loginNoticeKey, ownWorkspaceSignInUrl } from '#lib/api/sessionRejection.ts';
 	import { getApiBase, getTenantSlug, hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { SSO_PROVIDER_LABELS } from '#lib/types/ssoSettings.ts';
 	import {
 		nextFromParams,
@@ -58,6 +59,15 @@
 	// The page the user was sent here from (the auth wall, an ended session),
 	// already validated as a same-origin path; `null` means the dashboard.
 	const next = $derived(nextFromParams(page.url.searchParams));
+
+	// Typed as `MessageKey` pairs rather than built from a template literal:
+	// the catalogue's types are what turn a renamed or missing key into a
+	// compile error, and `as never` would have thrown that away to save a line.
+	const PROOFS: ReadonlyArray<{ title: MessageKey; body: MessageKey }> = [
+		{ title: 'auth.login.proof1Title', body: 'auth.login.proof1Body' },
+		{ title: 'auth.login.proof2Title', body: 'auth.login.proof2Body' },
+		{ title: 'auth.login.proof3Title', body: 'auth.login.proof3Body' }
+	];
 
 	// Shared with the `/organization` SSO panel's picker, so an admin can only
 	// pick a provider this page knows how to label.
@@ -266,7 +276,24 @@
 	{/if}
 
 	{#snippet panel()}
+		<!-- Three proofs, not one line. The shell gives signup a three-step list,
+		     so sign-in carrying a single sentence left a visibly emptier column
+		     on the identical layout — the panel had a tagline, a stray line, then
+		     a gap before the art. Three is the ceiling on purpose: this is a
+		     returning user's daily screen, and a wall of claims on the way to a
+		     password field is worse than the gap it fills. -->
 		<p class="panel-line">{m('auth.login.panelBody')}</p>
+		<ul class="proofs">
+			{#each PROOFS as proof (proof.title)}
+				<li>
+					<span class="proof-rule" aria-hidden="true"></span>
+					<span class="proof-text">
+						<strong>{m(proof.title)}</strong>
+						<span>{m(proof.body)}</span>
+					</span>
+				</li>
+			{/each}
+		</ul>
 	{/snippet}
 </AuthShell>
 
@@ -381,5 +408,69 @@
 		font-size: 1rem;
 		line-height: 1.6;
 		color: var(--text-muted);
+	}
+
+	.proofs {
+		margin: 26px 0 0;
+		padding: 0;
+		list-style: none;
+		display: flex;
+		flex-direction: column;
+		gap: 18px;
+		max-width: 40ch;
+	}
+
+	.proofs li {
+		display: flex;
+		gap: 14px;
+		align-items: flex-start;
+	}
+
+	/* A hairline rather than a dot, tick or icon. A tick would assert the
+	   reader has done something; an icon would need three more assets and a
+	   meaning each. The rule is a margin marker — it separates without
+	   claiming, which is the whole brief for a panel beside a password field.
+	   `--border` over an accent: this sits next to the one token a white-label
+	   tenant may override, and a row of accent bars would fight the brand
+	   rather than frame it. */
+	.proof-rule {
+		flex: none;
+		width: 2px;
+		align-self: stretch;
+		border-radius: 1px;
+		background: var(--border);
+	}
+
+	.proof-text {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
+	}
+
+	.proof-text strong {
+		font-size: 0.92rem;
+		font-weight: 600;
+		color: var(--text);
+	}
+
+	/* `--text-muted` on the panel gradient, not an opacity fade: the token is
+	   already contrast-calibrated, and dimming it further is exactly what
+	   `a11y/tokenPairing.test.ts` measures and rejects. */
+	.proof-text span {
+		font-size: 0.88rem;
+		line-height: 1.5;
+		color: var(--text-muted);
+	}
+
+	@media (max-width: 900px) {
+		/* The proofs are the first thing to go, before the tagline or the art,
+		   because they are the part a returning user has already read. Today
+		   AuthShell already hides sign-in's whole panel at its 960px breakpoint
+		   (sign-in does not pass `panelOnMobile`), so this only acts if that
+		   ever changes: the panel would come back without the proofs. */
+		.proofs {
+			display: none;
+		}
 	}
 </style>

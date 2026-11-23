@@ -3480,6 +3480,12 @@ export const messages = {
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's
 	// "what happens next" steps and the login panel line.
 	'auth.shell.tagline': '請求書から支払いまで、すべての請求を照合。',
+	'auth.login.proof1Title': '入力ではなく読み取り',
+	'auth.login.proof1Body': '請求書はメールまたはアップロードで届き、勘定科目付きで返ります。',
+	'auth.login.proof2Title': '支払う前に照合',
+	'auth.login.proof2Body': '発注・入荷・検収を、明細ごとに突き合わせます。',
+	'auth.login.proof3Title': 'すべての承認を記録',
+	'auth.login.proof3Body': '誰が、いくらで、いつ承認したか — 追記のみの記録として保持します。',
 	'auth.shell.homeLink': 'FeohLedger ホーム',
 	'auth.login.panelBody': 'データ抽出、承認、照合、支払いをひとつの場所で。',
 	'auth.signup.nextHeading': '次のステップ',

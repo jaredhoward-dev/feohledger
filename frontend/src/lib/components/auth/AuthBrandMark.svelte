@@ -22,8 +22,9 @@
 	 * no accessible name at all (WCAG 2.4.4, 4.1.2).
 	 *
 	 * This is the one place the rule lives — every auth page renders its mark
-	 * through here rather than deciding per page. The brand panel's mark in
-	 * `AuthShell` is NOT a link: it would be a second link to the same place.
+	 * through here rather than deciding per page. The brand panel in
+	 * `AuthShell` carries no mark at all: two marks on one screen read as a
+	 * template rather than a product.
 	 */
 	interface Props {
 		size?: number;

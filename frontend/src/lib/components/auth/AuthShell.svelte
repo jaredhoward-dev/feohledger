@@ -2,7 +2,6 @@
 	import type { Snippet } from 'svelte';
 	import { asset } from '$app/paths';
 	import Atmosphere from '#lib/components/marketing/Atmosphere.svelte';
-	import BrandMark from '#lib/components/ui/BrandMark.svelte';
 	import ThemePicker from '#lib/components/ui/ThemePicker.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { TALLY_ORNAMENT, TALLY_ORNAMENT_SIZE } from '#lib/marketing/ornament.ts';
@@ -45,8 +44,9 @@
 	 * - `panel` — the panel's page-specific content, rendered under the tagline.
 	 * - `panelOnMobile` — keep the panel (stacked under the form) below the
 	 *   desktop breakpoint. Signup takes it, because its panel says what happens
-	 *   after you press the button; sign-in's panel is brand only, and on a phone
-	 *   it would push the form's context below the fold for nothing.
+	 *   after you press the button; sign-in's panel is the tagline and three short
+	 *   proofs a returning user has already read, and on a phone it would push
+	 *   the form's context below the fold for nothing.
 	 */
 	interface Props {
 		children: Snippet;
@@ -83,11 +83,9 @@
 	<aside class="panel" aria-labelledby={panelHeadingId}>
 		<Atmosphere dense still />
 		<div class="panel-inner">
-			<div class="panel-brand">
-				<BrandMark size={30} />
-				<span class="panel-brand-name">FeohLedger</span>
-			</div>
-
+			<!-- No brand mark here. The form column already renders one beside its
+			     heading, and two marks on one screen read as a template rather
+			     than a product. The tagline carries the name's job instead. -->
 			<h2 id={panelHeadingId} class="tagline">{m('auth.shell.tagline')}</h2>
 
 			{#if panel}
@@ -173,20 +171,11 @@
 	.panel-inner > * {
 		min-width: 0;
 	}
-	.panel-brand {
-		display: inline-flex;
-		align-items: center;
-		gap: 10px;
-		margin-bottom: auto;
-	}
-	.panel-brand-name {
-		font-weight: 700;
-		font-size: 1.02rem;
-		letter-spacing: -0.01em;
-		color: var(--text);
-	}
 	.tagline {
-		margin: 48px 0 18px;
+		/* `margin-top: auto` replaces the removed brand block's `margin-bottom:
+		   auto` — without it the tagline sprang to the top of the column and
+		   left a void where the mark had been. */
+		margin: auto 0 18px;
 		max-width: 20ch;
 		font-size: clamp(1.8rem, 2.6vw, 2.5rem);
 		line-height: 1.12;

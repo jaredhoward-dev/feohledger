@@ -3719,6 +3719,17 @@ export const en = {
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's
 	// "what happens next" steps and the login panel line.
 	'auth.shell.tagline': 'Invoice to payment, every bill matched.',
+	// Sign-in's panel. Three short proofs rather than one orphan sentence: the
+	// shell gives signup a three-step list, so sign-in carrying a single line left
+	// a visibly emptier column on the same layout. Deliberately claims only what
+	// the product does — no numbers, no superlatives; this is a returning user's
+	// daily screen, not a pitch.
+	'auth.login.proof1Title': 'Read, not retyped',
+	'auth.login.proof1Body': 'Invoices arrive by email or upload and come back coded.',
+	'auth.login.proof2Title': 'Matched before it is paid',
+	'auth.login.proof2Body': 'Purchase order, receipt and inspection, checked against every line.',
+	'auth.login.proof3Title': 'Every approval on record',
+	'auth.login.proof3Body': 'Who signed, for how much, and when — kept append-only.',
 	'auth.shell.homeLink': 'FeohLedger home',
 	'auth.login.panelBody': 'Extraction, approvals, matching and payments — in one place.',
 	'auth.signup.nextHeading': 'What happens next',
