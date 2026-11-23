@@ -3933,11 +3933,12 @@
 	.pay-table :global(th.checkbox-col) { width: 40px; }
 	.pay-table :global(th.col-number) { width: 150px; }
 	.pay-table :global(th.col-amount) { width: 140px; }
+	.pay-queue :global(th.col-amount) { width: 132px; }
 	.pay-table :global(th.col-date) { width: 130px; }
 	.pay-table :global(th.col-count) { width: 130px; }
 	.pay-table :global(th.col-card) { width: 150px; }
 	.pay-table :global(th.col-method) { width: 150px; }
-	.pay-queue :global(th.col-date) { width: 175px; }
+	.pay-queue :global(th.col-date) { width: 170px; }
 	.pay-table :global(th.col-discount) { width: 120px; }
 	.pay-table :global(th.col-terms) { width: 135px; }
 	/* Holds the status pill plus, on a blocked row, a wrapping reason chip and
@@ -3951,7 +3952,7 @@
 	.pay-cards :global(th.col-status) { width: 150px; }
 	/* The queue's one actions cell holds "Compare routes" and "Record as
 	   paid"; the column is the longer of the two. */
-	.pay-queue :global(th.actions-col) { width: 250px; }
+	.pay-queue :global(th.actions-col) { width: 240px; }
 	.pay-history :global(th.actions-col) { width: 280px; }
 	.pay-runs :global(th.actions-col) { width: 300px; }
 	.pay-rebates :global(th.actions-col) { width: 250px; }
@@ -3962,8 +3963,12 @@
 		overflow-wrap: anywhere;
 	}
 	/* Each min-width is the fixed columns' sum plus ~110px per free-text
-	   column. The queue's fixed columns sum to 1280px and the history's to
-	   1150px, so both stay inside the 1388px region at 1666px. */
+	   column. The queue's fixed columns sum to 1257px and the history's to
+	   1150px, so both stay inside the 1388px region at 1666px. The queue's
+	   due date (170px) and amount (132px) are the widths /invoices holds the
+	   same headers to, measured in CI in every locale; together with a 240px
+	   actions cell they leave Vendor ~123px, which fits fr "FOURNISSEUR"
+	   (110px in CI's font, the round-35 run that found a 100px column). */
 	.pay-queue :global(table) { min-width: 1380px; }
 	.pay-history :global(table) { min-width: 1370px; }
 	.pay-runs :global(table) { min-width: 1160px; }
