@@ -42,7 +42,7 @@ services:
     # backend/docker-compose.yml, which is what CI starts — dev, CI and
     # production run one image, and backend/tests/test_container_supply_chain.py
     # fails if a bump moves one file without the other.
-    image: pgvector/pgvector:0.8.7-pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f
+    image: pgvector/pgvector:0.8.7-pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
     # Local-database mode only: deploy/lib.sh activates `localdb` when the sops
     # env leaves FEOH_DATABASE_URL unset. With an external database (RDS) this
     # container never starts — no wasted RAM, no second database to confuse.
@@ -76,7 +76,7 @@ services:
       retries: 12
 
   redis:
-    image: redis:7.4.12-alpine@sha256:c5d34a98396a4775e223c74e929162c35c5a2182901ba26b50ade939941ce14b
+    image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     restart: unless-stopped
     logging: *default-logging
     # AOF persistence: losing the blocklist would resurrect logged-out JWTs
@@ -160,7 +160,7 @@ services:
     # entrypoint — main.py with dotenv is local-dev only).
 
   caddy:
-    image: caddy:2.11.8-alpine@sha256:f6228111e5fafa1a5238258d0858e103f10599b8d1659a146e7726681a002bb9
+    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     restart: unless-stopped
     logging: *default-logging
     ports:
@@ -210,7 +210,7 @@ services:
     # and an anchor between the key and the ref would hide the postgres line
     # from it. It bumps both declarations together; tests/test_deploy_db_mode.py
     # fails if they ever differ.
-    image: pgvector/pgvector:0.8.7-pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f
+    image: pgvector/pgvector:0.8.7-pg16@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
     profiles: [tools]
     logging: *default-logging
     environment:
