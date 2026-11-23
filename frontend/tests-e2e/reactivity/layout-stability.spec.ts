@@ -242,13 +242,11 @@ const LIST_PAGES: ListPage[] = [
 
 /**
  * The fixed tables whose widths are sized to the longest locale
- * (frontend/docs/ui-patterns.md § Data tables). /payments' queue is not yet
- * held to it: its fixed columns, sized to fr/de, do not fit the 1388px region
- * a 1666px window gives — docs/followups.md § "The payment queue is sized to
- * English".
+ * (frontend/docs/ui-patterns.md § Data tables).
  */
 const LOCALE_SIZED = new Set([
 	'/invoices',
+	'/payments',
 	'/exceptions',
 	'/vendors',
 	'/purchase-orders',
@@ -269,6 +267,20 @@ const LOCALE_SIZED = new Set([
 	'/admin/api-keys',
 	'/admin/access-review'
 ]);
+
+/**
+ * Locale-sized tables a sidebar link does not open by itself: /payments' other
+ * tabs (the cards tab holds two tables). Held to the same per-locale check as
+ * the `LOCALE_SIZED` pages; `label` names the test. The e2e seed holds no
+ * virtual card or rebate, so those two are measured on their headers and
+ * empty row only; their badge widths rest on the page's own measurement.
+ */
+const LOCALE_SIZED_VIEWS: (ListPage & { fixedTable: string; label: string })[] = [
+	{ href: '/payments?tab=history', fixedTable: '.pay-history table', label: '/payments history' },
+	{ href: '/payments?tab=runs', fixedTable: '.pay-runs table', label: '/payments runs' },
+	{ href: '/payments?tab=cards', fixedTable: '.pay-rebates table', label: '/payments rebates' },
+	{ href: '/payments?tab=cards', fixedTable: '.pay-cards table', label: '/payments cards' }
+];
 
 /**
  * The locales whose strings run longest against the English widths: de and es
@@ -505,6 +517,21 @@ const WIDEST_ROW: Record<string, { pathname: string; patch: (row: Row) => Row; b
 		patch: (row) => ({ ...row, status: 'posted_in_erp' }),
 		badge: '.badge.posted_in_erp'
 	},
+	'/payments': {
+		pathname: '/api/payments/queue',
+		patch: (row) => ({ ...row, status: 'posted_in_erp' }),
+		badge: '.badge.posted_in_erp'
+	},
+	'/payments?tab=history': {
+		pathname: '/api/payments',
+		patch: (row) => ({ ...row, status: 'pending_compliance' }),
+		badge: '.badge.pending_compliance'
+	},
+	'/payments?tab=runs': {
+		pathname: '/api/payments/runs/',
+		patch: (row) => ({ ...row, status: 'executing' }),
+		badge: '.badge.executing'
+	},
 	'/exceptions': {
 		pathname: '/api/exceptions',
 		patch: (row) => ({ ...row, status: 'escalated' }),
@@ -579,9 +606,14 @@ const REFUSED_CHANGE_REQUEST = {
 
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
-		for (const { href, fixedTable } of LIST_PAGES) {
-			if (!fixedTable || !LOCALE_SIZED.has(href)) continue;
-			test(`${href} (${locale}): no header, badge or action cell overflows its column`, async ({
+		const tables = [
+			...LIST_PAGES.flatMap(({ href, fixedTable }) =>
+				fixedTable && LOCALE_SIZED.has(href) ? [{ href, fixedTable, label: href }] : []
+			),
+			...LOCALE_SIZED_VIEWS
+		];
+		for (const { href, fixedTable, label } of tables) {
+			test(`${label} (${locale}): no header, badge or action cell overflows its column`, async ({
 				page
 			}) => {
 				if (href === '/vendors/change-requests') {

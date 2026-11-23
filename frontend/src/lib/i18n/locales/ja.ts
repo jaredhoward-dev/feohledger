@@ -815,7 +815,6 @@ export const messages = {
 	'payments.col.discount': '割引',
 	'payments.col.terms': '支払条件',
 	'payments.col.status': 'ステータス',
-	'payments.col.routes': '送金経路',
 	'payments.status.pending': '保留中',
 	'payments.status.pendingCompliance': 'コンプライアンス保留',
 	'payments.status.submitted': '送信済み',
