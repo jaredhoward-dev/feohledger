@@ -29,6 +29,7 @@ _QUIET = {
     "unlinked": [],
     "deactivated": 0,
     "codes_cleared": 0,
+    "codes_rehomed": 0,
     "realm_adopted": 0,
     "restored": 0,
     "values_too_long": [],
@@ -95,7 +96,7 @@ async def test_sync_updates_changed_fields(realdb):
         s.add(
             Vendor(
                 name="Old Name",
-                code="OLD",
+                erp_vendor_code="OLD",
                 erp_vendor_id="ERP-7",
                 organization_id=org_id,
                 status="active",
@@ -116,7 +117,9 @@ async def test_sync_updates_changed_fields(realdb):
     async with mk() as s:
         v = (await s.execute(select(Vendor).where(Vendor.erp_vendor_id == "ERP-7"))).scalar_one()
     assert v.name == "New Name"
-    assert v.code == "NEW"
+    # The ERP's number lands in its own column; our code is never written
+    # (decisions §490).
+    assert (v.code, v.erp_vendor_code) == (None, "NEW")
 
 
 async def test_sync_unchanged_when_no_diff(realdb):
@@ -126,7 +129,7 @@ async def test_sync_unchanged_when_no_diff(realdb):
         s.add(
             Vendor(
                 name="Same Co",
-                code="SC",
+                erp_vendor_code="SC",
                 erp_vendor_id="ERP-3",
                 organization_id=org_id,
                 status="active",
@@ -238,10 +241,15 @@ async def test_a_value_too_long_for_its_column_is_dropped_never_aborts_the_sync(
             )
         ).scalar_one()
     assert rows["ERP-L1"].code == "OLD-CODE"
+    assert rows["ERP-L1"].erp_vendor_code is None
     long_fields = rows["ERP-L2"]
-    assert (long_fields.code, long_fields.phone, long_fields.tax_id) == (None, None, None)
+    assert (long_fields.erp_vendor_code, long_fields.phone, long_fields.tax_id) == (
+        None,
+        None,
+        None,
+    )
     assert long_fields.email == "ap@long.test"
-    assert rows["ERP-L3"].code == "FINE"
+    assert (rows["ERP-L3"].code, rows["ERP-L3"].erp_vendor_code) == (None, "FINE")
     # Field NAMES only on the append-only row, never the values.
     assert audit.details["values_too_long"] == ["code", "phone", "tax_id"]
     assert long_code not in str(audit.details)
@@ -278,9 +286,126 @@ async def test_sync_links_name_match_and_activates(realdb):
     assert len(rows) == 1
     v = rows[0]
     assert v.erp_vendor_id == "ERP-M"
-    assert v.code == "MV"
+    assert (v.code, v.erp_vendor_code) == (None, "MV")
     assert v.status == "active"
     assert v.source == "erp_sync"
+
+
+async def test_sync_never_writes_our_code_and_keeps_a_persons(realdb):
+    """Decisions §490: the ERP's number for a record never enters
+    ``Vendor.code``, the namespace CSV import resolves a row's vendor by. A
+    person's code survives the name link, a create leaves ``code`` empty, and
+    a person's vendor holding a code equal to ANOTHER record's ERP number keeps
+    it (the two namespaces may share a value; only ours is resolved by)."""
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add_all(
+            [
+                Vendor(
+                    name="Typed Co",
+                    code="T-1",
+                    organization_id=org_id,
+                    status="active",
+                    source="manual",
+                ),
+                Vendor(
+                    name="Person Co",
+                    code="V100",
+                    organization_id=org_id,
+                    status="active",
+                    source="manual",
+                ),
+            ]
+        )
+        await s.commit()
+
+    async with mk() as s:
+        result = await sync_vendors_from_erp(
+            s,
+            org_id,
+            [
+                {"erp_vendor_id": "E-1", "name": "Typed Co", "code": "ERP-9"},
+                {"erp_vendor_id": "E-2", "name": "Other Supplier", "code": "V100"},
+            ],
+        )
+        await s.commit()
+
+    assert result == _QUIET | {"created": 1, "updated": 1, "unchanged": 0, "conflicts": []}
+    async with mk() as s:
+        rows = {v.name: v for v in (await s.execute(select(Vendor))).scalars().all()}
+    assert (rows["Typed Co"].code, rows["Typed Co"].erp_vendor_code) == ("T-1", "ERP-9")
+    assert (rows["Other Supplier"].code, rows["Other Supplier"].erp_vendor_code) == (None, "V100")
+    assert (rows["Person Co"].code, rows["Person Co"].erp_vendor_code) == ("V100", None)
+
+
+async def test_first_sync_after_0142_rehomes_a_code_the_old_sync_wrote(realdb):
+    """A person's vendor the pre-§490 sync linked by name had its ``code``
+    overwritten with the ERP's number, which migration 0142 cannot tell from a
+    typed one. The first pull after it decides by evidence: ``code`` equal to
+    the ERP's number while ``erp_vendor_code`` is empty moves out, audited. A
+    code that differs is the person's and stays; and once ``erp_vendor_code``
+    is set, a person who types the number back in keeps it on later pulls."""
+    from app.models.workflow import AuditLog
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    async with mk() as s:
+        s.add_all(
+            [
+                Vendor(
+                    name="Overwritten Co",
+                    code="BC-77",
+                    erp_vendor_id="E-77",
+                    organization_id=org_id,
+                    status="active",
+                    source="manual",
+                ),
+                Vendor(
+                    name="Own Code Co",
+                    code="MINE",
+                    erp_vendor_id="E-78",
+                    organization_id=org_id,
+                    status="active",
+                    source="manual",
+                ),
+            ]
+        )
+        await s.commit()
+
+    pull = [
+        {"erp_vendor_id": "E-77", "name": "Overwritten Co", "code": "BC-77"},
+        {"erp_vendor_id": "E-78", "name": "Own Code Co", "code": "BC-78"},
+    ]
+    async with mk() as s:
+        result = await sync_vendors_from_erp(s, org_id, pull)
+        await s.commit()
+    assert result["codes_rehomed"] == 1
+
+    async with mk() as s:
+        rows = {v.erp_vendor_id: v for v in (await s.execute(select(Vendor))).scalars().all()}
+        audit = (
+            await s.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "vendor.synced_from_erp")
+                .where(AuditLog.entity_id == rows["E-77"].id)
+            )
+        ).scalar_one()
+    assert (rows["E-77"].code, rows["E-77"].erp_vendor_code) == (None, "BC-77")
+    assert (rows["E-78"].code, rows["E-78"].erp_vendor_code) == ("MINE", "BC-78")
+    assert audit.details["code_rehomed"] is True
+
+    # A person deliberately makes the ERP number our code too: kept from now on.
+    async with mk() as s:
+        v = await s.get(Vendor, rows["E-77"].id)
+        v.code = "BC-77"
+        await s.commit()
+    async with mk() as s:
+        again = await sync_vendors_from_erp(s, org_id, pull)
+        await s.commit()
+    assert again["codes_rehomed"] == 0
+    async with mk() as s:
+        assert (await s.get(Vendor, rows["E-77"].id)).code == "BC-77"
 
 
 async def test_sync_tenant_isolation(realdb):
@@ -416,7 +541,7 @@ async def test_sync_erp_endpoint_writes_an_audit_row_per_vendor(realdb):
     # writes them onto the vendor row; none may reach an append-only,
     # WORM-shipped store.
     for row in rows:
-        assert set(row.details) == {"change", "erp_vendor_id", "name", "code"}
+        assert set(row.details) == {"change", "erp_vendor_id", "name", "code", "erp_vendor_code"}
 
 
 async def test_sync_erp_endpoint_idempotent_second_run(realdb):

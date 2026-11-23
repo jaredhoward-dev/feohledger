@@ -264,6 +264,8 @@ export const messages = {
 	'refusal.csvVendorNameRequired': "La colonne name est vide ; ce fournisseur n’a donc pas été importé.",
 	'refusal.csvInvoiceNumberRequired': "La colonne invoice_number est vide ; cette ligne n’a donc pas été importée.",
 	'refusal.csvVendorRequired': "Cette ligne ne nomme aucun fournisseur ; elle n’a donc pas été importée. Renseignez vendor_name ou vendor_code.",
+	'refusal.csvVendorCodeAmbiguous': "Le vendor_code {value} de cette ligne est porté par plusieurs fournisseurs ; elle n’a donc pas été importée. Donnez à chacun un code distinct, ou fusionnez-les s’il s’agit d’un seul fournisseur.",
+	'refusal.csvVendorCodeIsErpNumber': "Le vendor_code {value} de cette ligne est le numéro d’un fournisseur dans votre ERP, pas un code fournisseur ; elle n’a donc pas été importée. S’il désigne ce fournisseur, définissez-le comme code du fournisseur et réimportez.",
 	'refusal.csvAmountMissing': "La colonne amount est vide ; cette ligne n’a donc pas été importée.",
 	'refusal.csvAmountInvalid': "Le montant {value} n’est pas un montant valide, nul ou positif ; cette ligne n’a donc pas été importée.",
 	'refusal.csvCurrencyRequired': "La colonne currency est vide ; cette ligne n’a donc pas été importée. Indiquez le code de devise à trois lettres de la ligne, par exemple USD ou EUR ; une devise manquante n’est jamais supposée.",

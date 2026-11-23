@@ -262,6 +262,8 @@ export const enRefusal = {
 	'refusal.csvVendorNameRequired': "The name column is empty, so this vendor was not imported.",
 	'refusal.csvInvoiceNumberRequired': "The invoice_number column is empty, so this row was not imported.",
 	'refusal.csvVendorRequired': "This row names no vendor, so it was not imported. Fill in vendor_name or vendor_code.",
+	'refusal.csvVendorCodeAmbiguous': "This row's vendor_code {value} is held by more than one vendor, so it was not imported. Give each vendor a distinct code, or merge them if they are one supplier.",
+	'refusal.csvVendorCodeIsErpNumber': "This row's vendor_code {value} is a vendor's number in your ERP, not a vendor code, so it was not imported. If it means that supplier, set it as the vendor's code and import again.",
 	'refusal.csvAmountMissing': "The amount column is empty, so this row was not imported.",
 	'refusal.csvAmountInvalid': "The amount {value} is not a valid amount of zero or more, so this row was not imported.",
 	'refusal.csvCurrencyRequired': "The currency column is empty, so this row was not imported. Enter the row's three-letter currency code, such as USD or EUR; a missing currency is never assumed.",

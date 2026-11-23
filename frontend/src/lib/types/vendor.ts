@@ -60,6 +60,8 @@ export interface Vendor {
 	source: string;
 	verified_by: string | null;
 	erp_vendor_id: string | null;
+	/** The ERP's number for the linked record; `code` is ours (decisions §490). */
+	erp_vendor_code?: string | null;
 	erp_synced_at: string | null;
 	invoice_count: number;
 	created_at: string;
