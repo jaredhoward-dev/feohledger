@@ -47,6 +47,9 @@ DO ANYTIME (parallel)
 ├── SSO break-glass           ← per-incident, when an SSO-only tenant's IdP breaks
 │     └── sso-break-glass.md
 │
+├── Breach notification       ← per-incident; fill in its contacts before launch
+│     └── breach-notification.md
+│
 └── Closed workspaces         ← recurring, the backup leg of a self-service closure
       └── workspace-closure.md
 ```
@@ -58,6 +61,11 @@ remove within the DPA's 60 days. Check the queue weekly.
 `sso-break-glass.md` is per-incident too: the verified, audited way to
 reopen password sign-in for a tenant whose required identity provider has
 stopped working. Read it before the first tenant turns **Require SSO** on.
+
+`breach-notification.md` is per-incident as well, but its § 0 contacts and
+the § 3a connected-platform table must be filled in and re-checked **before**
+anything happens: the shortest clocks in it are not GDPR's 72 hours but the
+24-hour reports Xero, Intuit and Shopify require from the app's developer.
 
 `custom-domain-provisioning.md` is the odd one out: it isn't a
 one-time launch step but a **per-customer procedure**, run each time a

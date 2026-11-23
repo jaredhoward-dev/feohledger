@@ -1497,22 +1497,28 @@ user-visible halves still open.
 ### Surfaced by registering the Xero developer app (2026-10-20; tracked 2026-11-21)
 
 Accepting the Xero Developer Platform Terms (updated 2025-12-04) puts two duties
-on the platform that nothing in the repo meets yet. These entries were written
+on the platform. The breach-notice one is now in the runbook (§ 3a), with
+the other platforms' rows that remain to be checked below; the acceptance
+record is still unmet. These entries were written
 when the app was registered and sat on an unpushed local branch until the
 2026-11-21 branch clean-up; re-checked against `main` that day (no Xero notice in
 the runbook, no acceptance record on signup).
 
-- [ ] **(c) The breach runbook has no 24-hour notice to Xero.** The Xero terms
-      require a security breach affecting Xero data to be reported to
-      `api@support.xero.com` within **24 hours**, which is tighter than any clock
-      [founder-runbooks/breach-notification.md](founder-runbooks/breach-notification.md)
-      tracks today (its earliest is the processor-to-controller "without undue
-      delay" leg, and GDPR's 72 hours). An incident responder working the runbook
-      would miss it. **Durable fix:** a "connected-platform notices" step in the
-      runbook's notification checklist, naming Xero's address and clock, shaped
-      so the other OAuth ERPs' terms (Intuit, Sage, Blackbaud) slot in beside it
-      once their notice duties are checked. **Trigger:** before the first tenant
-      connects a live Xero organisation.
+- [ ] **(c) The breach runbook's connected-platform table has unchecked
+      rows.** The Xero 24-hour notice is now step § 3a of
+      [founder-runbooks/breach-notification.md](founder-runbooks/breach-notification.md),
+      beside Intuit (24 h), Shopify (24 h), Sage (promptly, `cdo@sage.com`)
+      and Blackbaud (no duty found), each read from the platform's own terms
+      on 2026-11-22. Two gaps remain: Intuit § 9.3 names no reporting channel,
+      and the developer / API terms of Sage Intacct, Sage Accounting (South
+      Africa), NetSuite, Business Central, SYSPRO, Merge.dev, Square,
+      Lightspeed, Cin7 and WooCommerce have not been read for a notice duty,
+      so their row says "not yet checked". **Durable fix:** ask Intuit
+      developer support which channel it accepts for § 9.3 reports and record
+      it in the row; read each unchecked platform's terms and give it its own
+      row (duty, clock, channel, source, date). **Trigger:** before the first
+      tenant connects a live company on that platform through our app (the Intuit
+      channel first: its 24-hour clock already applies), and every six months for the rows already filled in.
 
 - [ ] **(c) Signup records no acceptance of our Terms or Privacy Policy.** The
       Xero terms require an app to have its own terms and privacy policy *and*
