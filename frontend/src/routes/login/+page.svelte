@@ -464,9 +464,11 @@
 	}
 
 	@media (max-width: 900px) {
-		/* The panel is secondary to the form on a narrow screen: the proofs are
-		   the first thing to go, before the tagline or the art, because they are
-		   the part a returning user has already read. */
+		/* The proofs are the first thing to go, before the tagline or the art,
+		   because they are the part a returning user has already read. Today
+		   AuthShell already hides sign-in's whole panel at its 960px breakpoint
+		   (sign-in does not pass `panelOnMobile`), so this only acts if that
+		   ever changes: the panel would come back without the proofs. */
 		.proofs {
 			display: none;
 		}
