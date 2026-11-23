@@ -74,22 +74,24 @@
 	const canMutate = $derived(auth.isManager);
 	const canRecordReceipt = $derived(auth.hasAnyRole(...RECEIPT_ENTRY_ROLES));
 
+	// Each `class` is the hook its column width hangs on (see the style block);
+	// the PO and Notes columns carry none and take the rest.
 	const COLUMNS = $derived([
-		{ label: m('goodsReceipts.col.grNumber') },
+		{ label: m('goodsReceipts.col.grNumber'), class: 'col-number' },
 		{ label: m('goodsReceipts.col.po') },
-		{ label: m('goodsReceipts.col.received') },
-		{ label: m('goodsReceipts.col.status') },
-		{ label: m('goodsReceipts.col.lines') },
-		{ label: m('goodsReceipts.col.created') }
+		{ label: m('goodsReceipts.col.received'), class: 'col-date' },
+		{ label: m('goodsReceipts.col.status'), class: 'col-status' },
+		{ label: m('goodsReceipts.col.lines'), class: 'col-lines' },
+		{ label: m('goodsReceipts.col.created'), class: 'col-date' }
 	]);
 
 	const INSPECTION_COLUMNS = $derived([
-		{ label: m('goodsReceipts.inspections.col.number') },
-		{ label: m('goodsReceipts.inspections.col.result') },
-		{ label: m('goodsReceipts.inspections.col.receipt') },
-		{ label: m('goodsReceipts.inspections.col.inspected') },
-		{ label: m('goodsReceipts.inspections.col.inspector') },
-		{ label: m('goodsReceipts.inspections.col.quantities') },
+		{ label: m('goodsReceipts.inspections.col.number'), class: 'col-number' },
+		{ label: m('goodsReceipts.inspections.col.result'), class: 'col-result' },
+		{ label: m('goodsReceipts.inspections.col.receipt'), class: 'col-receipt' },
+		{ label: m('goodsReceipts.inspections.col.inspected'), class: 'col-date' },
+		{ label: m('goodsReceipts.inspections.col.inspector'), class: 'col-inspector' },
+		{ label: m('goodsReceipts.inspections.col.quantities'), class: 'col-quantities' },
 		{ label: m('goodsReceipts.inspections.col.notes') }
 	]);
 
@@ -169,6 +171,11 @@
 	let inspections = $state<Inspection[]>([]);
 	let inspectionsLoaded = $state(false);
 	let inspectionsLoading = $state(false);
+	/** Set once the first page-1 load has answered, either way. Until then the
+	 *  tab draws DataTable's loading row rather than its "no inspections" line,
+	 *  so the first paint never claims an empty list it has not asked about
+	 *  (`inspectionsLoading` itself only turns on once the tab's effect runs). */
+	let inspectionsAttempted = $state(false);
 	let loadingMoreInspections = $state(false);
 	let inspectionsTotal = $state(0);
 	let inspectionsPage = $state(1);
@@ -342,6 +349,7 @@
 			if (inspectionSequence.isCurrentRequest(token)) {
 				inspectionsLoading = false;
 				loadingMoreInspections = false;
+				inspectionsAttempted = true;
 			}
 		}
 	}
@@ -613,7 +621,9 @@
 					testId="goods-receipts-error"
 				/>
 			{:else}
+			<div class="gr-table receipts-table">
 			<DataTable
+				fixed
 				columns={COLUMNS}
 				isEmpty={grs.length === 0}
 				{loading}
@@ -645,6 +655,7 @@
 					{/each}
 				{/snippet}
 			</DataTable>
+			</div>
 			{/if}
 
 			<LoadMoreFooter
@@ -674,10 +685,12 @@
 				<HelpTip term="four-way-match" />
 			</p>
 
+			<div class="gr-table inspections-table">
 			<DataTable
+				fixed
 				columns={INSPECTION_COLUMNS}
 				isEmpty={inspections.length === 0}
-				loading={inspectionsLoading}
+				loading={inspectionsLoading || !inspectionsAttempted}
 				empty={m('goodsReceipts.inspections.empty')}
 				colspan={7}
 			>
@@ -718,6 +731,7 @@
 					{/each}
 				{/snippet}
 			</DataTable>
+			</div>
 
 			<LoadMoreFooter
 				shown={inspections.length}
@@ -1065,6 +1079,35 @@
 		padding: 40px;
 		color: var(--text-muted);
 	}
+
+	/* Column widths. Both tabs' tables are `table-layout: fixed` (DataTable's
+	   `fixed`) and mounted from first paint with DataTable's loading row: under
+	   `auto` the columns were sized against "Loading…" and re-sized against the
+	   rows, sliding every column sideways when a page landed. Under `fixed` the
+	   widths come from the header alone and hold. Each predictable column is
+	   sized to its widest content in the six locales, with ~12% headroom over a
+	   local measurement because CI's font renders wider: a header to its
+	   longest word (es "INSPECCIONADA", de "WARENEINGANG"), Status to de
+	   "RÜCKGÄNGIG GEMACHT" (168px), Result to fr "ACCEPTATION PARTIELLE"
+	   (172px), the number columns to a mono "INS-2026-00001". PO (receipts) and
+	   Notes (inspections) carry no width and take the rest; past the
+	   `min-width` the table scrolls inside its region. Widths reach the
+	   DataTable-rendered `<th>` through `:global` under the page-owned wrapper
+	   (the /gl-accounts pattern). Guard: tests-e2e/reactivity/
+	   layout-stability.spec.ts (both tabs, de/es/fr/pt-BR/ja). */
+	.gr-table {
+		min-width: 0;
+	}
+	.receipts-table :global(table) { min-width: 960px; }
+	.inspections-table :global(table) { min-width: 1260px; }
+	.gr-table :global(th.col-number) { width: 160px; }
+	.gr-table :global(th.col-date) { width: 160px; }
+	.gr-table :global(th.col-status) { width: 240px; }
+	.gr-table :global(th.col-lines) { width: 140px; }
+	.gr-table :global(th.col-result) { width: 250px; }
+	.gr-table :global(th.col-receipt) { width: 190px; }
+	.gr-table :global(th.col-inspector) { width: 150px; }
+	.gr-table :global(th.col-quantities) { width: 160px; }
 
 	.notes {
 		max-width: 32ch;

@@ -219,6 +219,7 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/vendors', fixedTable: '.vendor-table table' },
 	{ href: '/purchase-orders', fixedTable: '.po-table table' },
 	{ href: '/gl-accounts', fixedTable: '.gl-table table' },
+	{ href: '/goods-receipts', fixedTable: '.receipts-table table' },
 	{ href: '/credit-memos' },
 	{ href: '/expenses' },
 	{ href: '/contracts' },
@@ -241,6 +242,18 @@ const LIST_PAGES: ListPage[] = [
 ];
 
 /**
+ * Second tabs of a measured page, each its own table: a sidebar link opens a
+ * page on its first tab, so `LIST_PAGES` alone would never measure these.
+ * Measured exactly like `LIST_PAGES`; not part of the sidebar classification
+ * (their pathname must be a `LIST_PAGES` page — the guard test checks).
+ */
+const TAB_PAGES: ListPage[] = [
+	{ href: '/goods-receipts?tab=inspections', fixedTable: '.inspections-table table' }
+];
+
+const MEASURED_PAGES: ListPage[] = [...LIST_PAGES, ...TAB_PAGES];
+
+/**
  * The fixed tables whose widths are sized to the longest locale
  * (frontend/docs/ui-patterns.md § Data tables). /payments' queue is not yet
  * held to it: its fixed columns, sized to fr/de, do not fit the 1388px region
@@ -253,6 +266,8 @@ const LOCALE_SIZED = new Set([
 	'/vendors',
 	'/purchase-orders',
 	'/gl-accounts',
+	'/goods-receipts',
+	'/goods-receipts?tab=inspections',
 	'/vendors/screening',
 	'/vendors/change-requests',
 	'/requisitions',
@@ -281,12 +296,10 @@ const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
  * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers twenty-six pages"): moving
+ * (docs/followups.md § "The layout-shift budget covers twenty-seven pages"): moving
  * one into `LIST_PAGES` is the whole change once its reason is fixed.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
-	'/goods-receipts':
-		'Unmeasured: the receipts and inspections tables are still table-layout: auto with unsized columns — see docs/followups.md',
 	'/discounts':
 		'Unmeasured: the warning banners and the optimizer panel above the offers table mount once the dashboard lands — see docs/followups.md',
 	'/audit':
@@ -401,9 +414,15 @@ test.describe('list pages stay within the layout-shift budget', () => {
 		for (const href of [...measured, ...Object.keys(NOT_LIST_PAGES)]) {
 			expect(NAV_HREFS, `${href} is no longer a sidebar destination`).toContain(href);
 		}
+		for (const { href } of TAB_PAGES) {
+			const pathname = new URL(href, 'http://x').pathname;
+			expect([...measured], `${href} is a tab of a page LIST_PAGES does not measure`).toContain(
+				pathname
+			);
+		}
 	});
 
-	for (const { href, fixedTable } of LIST_PAGES) {
+	for (const { href, fixedTable } of MEASURED_PAGES) {
 		test(`${href}: cumulative layout shift stays under ${CLS_BUDGET}`, async ({ page }) => {
 			await observeLayoutShifts(page);
 			await page.goto(START);
@@ -537,6 +556,11 @@ const WIDEST_ROW: Record<string, { pathname: string; patch: (row: Row) => Row; b
 			}
 		}),
 		badge: '.badge.needs-decision'
+	},
+	'/goods-receipts': {
+		pathname: '/api/goods-receipts',
+		patch: (row) => ({ ...row, status: 'reversed' }),
+		badge: '.badge.reversed'
 	}
 };
 
@@ -577,9 +601,28 @@ const REFUSED_CHANGE_REQUEST = {
 	}
 };
 
+/** One partially accepted inspection: the Result column's widest badge (fr
+ *  "ACCEPTATION PARTIELLE"). The lean e2e seed records no inspections, so the
+ *  tab's list is answered with this row rather than patched. */
+const PARTIAL_INSPECTION = {
+	id: '00000000-0000-4000-8000-000000000331',
+	inspection_number: 'INS-2026-00001',
+	po_id: null,
+	gr_id: '00000000-0000-4000-8000-000000000332',
+	gr_number: 'GR-2026-00001',
+	result: 'partial',
+	inspected_date: '2026-11-01',
+	inspector: 'Layout Fixture',
+	accepted_quantity: 8,
+	rejected_quantity: 2,
+	deviation_notes: 'Two cartons crushed in transit',
+	status: 'completed',
+	created_at: '2026-11-01T09:00:00Z'
+};
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
-		for (const { href, fixedTable } of LIST_PAGES) {
+		for (const { href, fixedTable } of MEASURED_PAGES) {
 			if (!fixedTable || !LOCALE_SIZED.has(href)) continue;
 			test(`${href} (${locale}): no header, badge or action cell overflows its column`, async ({
 				page
@@ -593,6 +636,17 @@ test.describe('fixed list tables fit their longest locale', () => {
 							route.fulfill({
 								json: { items: [REFUSED_CHANGE_REQUEST], total: 1, page: 1, page_size: 25 }
 							})
+					);
+				}
+				if (href === '/goods-receipts?tab=inspections') {
+					await page.route(
+						(url) => url.pathname === '/api/inspections',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({
+										json: { items: [PARTIAL_INSPECTION], total: 1, page: 1, page_size: 20 }
+									})
+								: route.fallback()
 					);
 				}
 				const widest = WIDEST_ROW[href];
@@ -610,6 +664,9 @@ test.describe('fixed list tables fit their longest locale', () => {
 					await expect(table.locator('.refusal-note')).toBeVisible();
 				}
 				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
+				if (href === '/goods-receipts?tab=inspections') {
+					await expect(table.locator('.badge.partial')).toBeVisible();
+				}
 				await nextFrames(page);
 
 				expect(await overflowingCells(table), `cells wider than their column on ${href}`).toEqual([]);

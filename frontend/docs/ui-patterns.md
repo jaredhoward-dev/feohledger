@@ -247,14 +247,17 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   /payments, /exceptions, /vendors, /purchase-orders, /gl-accounts, the
   screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
-  the users directory, /admin/entities, /admin/api-keys and
-  /admin/access-review are converted, the last three by mounting the table
-  from first paint with DataTable's own loading row rather than swapping a
+  the users directory, /admin/entities, /admin/api-keys,
+  /admin/access-review and both /goods-receipts tabs are converted,
+  /admin/entities, /admin/api-keys, /admin/access-review and the
+  inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string
   in any of the six locales, not the English one; `tests-e2e/reactivity/layout-stability.spec.ts` holds each to a
   cumulative layout shift under 0.1 with production-like API latency and
   checks a `fixed` table's header x positions. A new sidebar page fails that
-  spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`.
+  spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`; a page's second
+  tab with its own table goes in `TAB_PAGES` (`?tab=` href), since a sidebar
+  link only ever opens the first.
 - **Never make a `<td>` / `<th>` `display: flex` (or grid).** It stops being a
   table cell: the column no longer sizes it, so content overflows the table,
   and its border drifts out of line with the row. Lay out inline children with

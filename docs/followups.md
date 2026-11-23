@@ -1375,14 +1375,14 @@ covered the one page or shape it was written for. #646 / §318 closed the
 QuickBooks half with recorded shapes and a live check; these are the
 user-visible halves still open.
 
-- [ ] **(c) The layout-shift budget covers twenty-six pages.**
+- [ ] **(c) The layout-shift budget covers twenty-seven pages.**
       `tests-e2e/reactivity/layout-stability.spec.ts` is table-driven
-      (`LIST_PAGES`): the dashboard and twenty-five list pages are opened with
-      every API response delayed, held to a cumulative layout shift under 0.1,
-      and the twenty-one `fixed` tables also have their header columns' x
-      positions checked. Still in `NOT_LIST_PAGES`, each with its reason:
-      /goods-receipts (both tabbed tables still `table-layout: auto`, columns
-      unsized), /audit (the signature-verification panel sits below the
+      (`LIST_PAGES`, plus `TAB_PAGES` for a second tab's table): the dashboard
+      and twenty-six list pages are opened with every API response delayed,
+      held to a cumulative layout shift under 0.1, and the twenty-three
+      `fixed` tables (both /goods-receipts tabs included) also have their
+      header columns' x positions checked. Still in `NOT_LIST_PAGES`, each
+      with its reason: /audit (the signature-verification panel sits below the
       trail and moves down by the rows a run returns), /admin?tab=roles (the
       system-roles table has no loading row and grows to four rows, pushing
       the custom-roles section down), /admin/webhooks (the subscriptions
@@ -1393,8 +1393,8 @@ user-visible halves still open.
       and /tax (a loading placeholder is replaced by the box-allocation panel
       and the table). **Durable fix:** the /gl-accounts pattern (`fixed`,
       locale-sized `<th>` widths under a page wrapper, the table mounted from
-      first paint with DataTable's loading row) for goods receipts; reserve
-      the fixed four system-role rows on Roles; move the stacked section
+      first paint with DataTable's loading row) is what moved /goods-receipts
+      across; reserve the fixed four system-role rows on Roles; move the stacked section
       below a growing table (or give the upper table a reserved height) on
       /audit and /admin/webhooks; a partner fixture tenant for /admin/partner;
       reserve the late panels' space on /discounts and /tax; then move each
