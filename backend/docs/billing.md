@@ -490,6 +490,25 @@ them before the switch (`SELECT … FROM subscriptions JOIN plans … WHERE
 monthly_price > 0`) and either move them through `/billing` (card first) or
 create their subscriptions by hand.
 
+**Switching from test-mode to live keys strands every org that used test mode.**
+A test-mode run saves the sandbox's `stripe_customer_id`, plan and overage price
+ids in the org's `settings.billing`, and the subscription row keeps the
+sandbox's `external_subscription_id`. Nothing checks which mode an id came from,
+and the live account has none of them, so after the switch those orgs' previews,
+plan changes and receipts fail at Stripe (`resource_missing`). Before shipping
+the live keys, list the orgs whose `settings.billing` holds a Stripe id, move
+each to Free, and clear those ids, so the next paid upgrade starts fresh in live
+mode. The prices are re-resolved by `lookup_key` on the next upgrade and need no
+clean-up.
+
+**Test a date-bound event (period end, renewal) with a Stripe test clock, not by
+keeping test keys deployed until the date.** Test keys in production let anyone
+buy a paid plan with Stripe's public test card and decline every real card.
+Run the backend locally with the sandbox key, forward webhooks with
+`stripe listen --forward-to localhost:8000/api/billing/webhook/stripe_billing`,
+create a sandbox customer on a test clock (a customer can't join a clock after it
+is created), set the local org's `stripe_customer_id` to it, and advance the clock.
+
 ## Billing adapters (`services/billing_adapters/`)
 
 Same registry/decorator/dispatcher pattern as the email / PEPPOL / QMS families.
