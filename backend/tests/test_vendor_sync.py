@@ -129,7 +129,7 @@ async def test_sync_unchanged_when_no_diff(realdb):
         s.add(
             Vendor(
                 name="Same Co",
-                code="SC",
+                erp_vendor_code="SC",
                 erp_vendor_id="ERP-3",
                 organization_id=org_id,
                 status="active",
@@ -541,7 +541,7 @@ async def test_sync_erp_endpoint_writes_an_audit_row_per_vendor(realdb):
     # writes them onto the vendor row; none may reach an append-only,
     # WORM-shipped store.
     for row in rows:
-        assert set(row.details) == {"change", "erp_vendor_id", "name", "code"}
+        assert set(row.details) == {"change", "erp_vendor_id", "name", "code", "erp_vendor_code"}
 
 
 async def test_sync_erp_endpoint_idempotent_second_run(realdb):
