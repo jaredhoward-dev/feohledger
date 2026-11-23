@@ -1322,36 +1322,6 @@ scope (§260) — do not fold them into any of these.
       reviewer reporting they cannot act on an invoice assigned to an absent
       colleague.
 
-- [ ] **(c) Other pages still restate server predicates to decide whether to
-      offer an action.** Converted so far: payment queue record-outside (#573);
-      History Void / Release / Dismiss; run Approve / Execute / Cancel; invoice
-      Approve / Reject; exception Resolve / Dismiss / Escalate; credit-memo
-      Apply / Edit / Void; vendor Verify / Reject; bank-change Approve; run
-      Retry failed payments (§335); History Accept settlement, Runs Retry ERP
-      sync, and the run dialog's record-run-as-paid / NACHA download /
-      regenerate / bank-rejected (§344); `InvoiceModal`'s Submit / Complete and
-      Retry ERP (§347); expense reports' submit / approve / reject / attach and
-      card-transaction match / create-expense / unmatch / ignore (§348);
-      discount-offer accept / decline (and the accept dialog's tiers), experiment
-      start / stop / conclude / delete, adaptive-suggestion dismiss; intake and
-      requisition submit / approve / reject / convert / cancel / reopen / delete
-      (`actions`, `services/procurement_controls.py`). Every web control this
-      entry tracked now reads its verdict; what is left is mobile's. **Mobile** reads
-      the verdicts for the invoice detail's approve / reject / recall and the
-      approvals swipe (`GET /api/invoices/{id}/review-actions`), the payment
-      queue's record outside, the Runs tab's Approve as CFO / Execute / Cancel
-      (the run detail's `actions`, read per draft run), vendor verify / reject
-      (the list's `status_actions`) and exception resolve / dismiss / escalate
-      (`decision_refusals`). Still restating on mobile: adaptive-suggestion
-      dismiss (`canDismissSuggestion` + status — the row's `actions.dismiss`).
-      **Durable fix:** the backend half already ships (`api/adaptive_workflows.
-      dismiss_refusal`, pinned by `tests/test_offer_experiment_suggestion_verdicts.py`):
-      parse `actions.dismiss` into the mobile suggestion model and read it the
-      way the vendor list reads `status_actions`, with a widget test per verdict
-      (`frontend/docs/ui-patterns.md` § Whether to offer an action).
-      **Trigger:** the next change to any of those controls, or a report of a
-      button that 403s / 409s.
-
 ### Surfaced by the sidebar renames (2026-10-21, issue #635 #23, decisions §314)
 
 - [ ] **(c) Partner Admin shows to every admin, partner or not — needs a product

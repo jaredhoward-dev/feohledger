@@ -23,6 +23,8 @@
 ///   is a proposal; nothing here has changed a workflow.
 library;
 
+import 'package:feohledger_mobile/models/action_verdict.dart';
+
 /// One approver's decision record. `approverName` is joined from the control
 /// plane and may be null for a decision whose user row is gone.
 class ApproverPattern {
@@ -243,6 +245,9 @@ class AnomalyBatch {
 /// of persisting the row), `stale` is one whose condition stopped holding, and
 /// `applied` is reserved for the audited apply path — which mobile does not
 /// offer. [unknown] keeps a future status from being mis-rendered as open.
+/// Whether Dismiss is offered is NOT read from here but from the row's
+/// verdict ([WorkflowSuggestion.dismissVerdict]) — the server also dismisses
+/// a `stale` row, which a status check here once missed.
 enum SuggestionStatus {
   open('open'),
   dismissed('dismissed'),
@@ -280,6 +285,19 @@ class WorkflowSuggestion {
   final SuggestionStatus status;
   final DateTime? createdAt;
 
+  /// The row's `actions` as served (`api/adaptive_workflows.py::
+  /// _suggestion_actions` — `_WRITE_ROLES`, then `dismiss_refusal`, the gate
+  /// `POST /suggestions/{id}/dismiss` raises from): `{dismiss}`, `null` when
+  /// the server would accept it, else the coded refusal. `null` here when the
+  /// response carried no `actions` at all (an older backend), which offers
+  /// nothing.
+  final Map<String, dynamic>? actions;
+
+  /// Dismiss's verdict; [ActionVerdict.unanswered] without `actions`.
+  ActionVerdict get dismissVerdict => actions == null
+      ? ActionVerdict.unanswered
+      : ActionVerdict.fromVerdicts(actions!, 'dismiss');
+
   const WorkflowSuggestion({
     required this.id,
     required this.kind,
@@ -290,6 +308,7 @@ class WorkflowSuggestion {
     required this.confidencePct,
     required this.status,
     this.createdAt,
+    this.actions,
   });
 
   bool get isOpen => status == SuggestionStatus.open;
@@ -305,6 +324,9 @@ class WorkflowSuggestion {
       confidencePct: json['confidence_pct']?.toString() ?? '0',
       status: SuggestionStatus.fromString(json['status'] as String?),
       createdAt: DateTime.tryParse(json['created_at'] as String? ?? ''),
+      actions: json['actions'] is Map
+          ? Map<String, dynamic>.from(json['actions'] as Map)
+          : null,
     );
   }
 }
