@@ -417,9 +417,9 @@
 						</Badge>
 					</td>
 					<td class="actions">
-						<!-- Start reads the row's verdict (`actions.start`, from the
-						     endpoint's own `start_refusal`); Delete, Stop and Conclude
-						     still restate theirs (docs/followups.md). -->
+						<!-- Every row action reads the row's verdict (`actions.*`, from
+						     the endpoints' own `{start,stop,conclude,delete}_refusal`);
+						     every refusal hides its control. -->
 						{#if isAllowed(exp.actions?.start)}
 							<RowAction
 								variant="success"
@@ -429,7 +429,7 @@
 								onclick={() => doStart(exp)}
 							>{m('experiments.row.start')}</RowAction>
 						{/if}
-						{#if canMutate && exp.status === 'draft'}
+						{#if isAllowed(exp.actions?.delete)}
 							<RowAction
 								variant="danger"
 								armed={isArmed('delete', exp.id)}
@@ -443,13 +443,16 @@
 							>
 								{isArmed('delete', exp.id) ? m('experiments.row.confirm') : m('experiments.row.delete')}
 							</RowAction>
-						{:else if canMutate && exp.status === 'running'}
+						{/if}
+						{#if isAllowed(exp.actions?.stop)}
 							<RowAction
 								busy={isBusy('stop', exp.id)}
 								disabled={isHeld('stop', exp.id)}
 								ariaLabel={m('common.rowActionAria', { action: m('experiments.row.stop'), name: exp.name })}
 								onclick={() => doStop(exp)}
 							>{m('experiments.row.stop')}</RowAction>
+						{/if}
+						{#if isAllowed(exp.actions?.conclude)}
 							<RowAction
 								variant="danger"
 								armed={isArmed('conclude', exp.id)}

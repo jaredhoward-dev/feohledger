@@ -115,6 +115,7 @@ class RequisitionActions(BaseModel):
     convert: CodedRefusal | None
     cancel: CodedRefusal | None
     reopen: CodedRefusal | None
+    delete: CodedRefusal | None
 
 
 class RequisitionResponse(BaseModel):

@@ -43,6 +43,7 @@ from app.services.csv_import import (
     build_import_provenance,
     import_invoices_csv,
 )
+from app.services.open_ap_due import DUE_SOON_DAYS
 from app.utils.dates import utc_today
 
 TENANT = "a"
@@ -1053,6 +1054,57 @@ async def test_overdue_counts_the_whole_book_and_matches_the_cfo_card(realdb):
     # Due soon: due today, and the past-dated invoice rescheduled three days out.
     assert body["due_soon_count"] == 2
     assert body["due_soon_total"] == [{"currency": "USD", "amount": 2000.0, "count": 2}]
+
+
+@pytest.mark.asyncio
+async def test_due_soon_window_edges_and_a_twice_scheduled_invoice(realdb):
+    """`DUE_SOON_DAYS` out is inside the window and a day later is not, for
+    the due-soon count and for `upcoming_payments` alike (both read the one
+    constant). An invoice with two schedule rows is one invoice, timed by the
+    newer row and counted once at its full amount, not once per row."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    today = utc_today()
+    edge = today + timedelta(days=DUE_SOON_DAYS)
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        last_day = _inv(org_id, ent, status=InvoiceStatus.approved, due_date=edge)
+        day_after = _inv(
+            org_id, ent, status=InvoiceStatus.approved, due_date=edge + timedelta(days=1)
+        )
+        twice = _inv(
+            org_id,
+            ent,
+            status=InvoiceStatus.approved,
+            due_date=today + timedelta(days=60),
+            amount=Decimal("250.00"),
+        )
+        s.add_all([last_day, day_after, twice])
+        await s.flush()
+        then = datetime.now(UTC)
+        s.add_all(
+            [
+                # Older row: outside the window. Newer row: inside it.
+                PaymentSchedule(
+                    invoice_id=twice.id,
+                    due_date=today + timedelta(days=30),
+                    created_at=then - timedelta(days=1),
+                ),
+                PaymentSchedule(
+                    invoice_id=twice.id, due_date=today + timedelta(days=2), created_at=then
+                ),
+            ]
+        )
+        await s.commit()
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        body = (await c.get("/api/dashboard")).json()
+    assert body["due_soon_count"] == 2
+    assert body["due_soon_total"] == [{"currency": "USD", "amount": 1250.0, "count": 2}]
+    assert body["overdue_count"] == 0
+    upcoming = {p["id"] for p in body["upcoming_payments"]}
+    assert str(last_day.id) in upcoming
+    assert str(day_after.id) not in upcoming
 
 
 @pytest.mark.asyncio

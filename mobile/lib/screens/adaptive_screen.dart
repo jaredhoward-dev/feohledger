@@ -4,7 +4,6 @@ import 'package:flutter/scheduler.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/models/adaptive.dart';
 import 'package:feohledger_mobile/stores/adaptive_store.dart';
-import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/org_currency_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/money.dart';
@@ -41,8 +40,6 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
 
   /// True while a dismiss POST is in flight — guards against a double-tap.
   bool _submitting = false;
-
-  bool get _canDismiss => AuthStore.instance.canDismissSuggestion;
 
   @override
   void initState() {
@@ -218,9 +215,14 @@ class _AdaptiveScreenState extends State<AdaptiveScreen>
                 ],
               ),
             ),
-            // Dismiss is offered only on an open row and only to the roles the
-            // backend `_WRITE_ROLES` admits — a CFO reads and is not offered it.
-            if (_canDismiss && s.isOpen)
+            // Dismiss is offered only when the row's own `actions.dismiss`
+            // verdict says the server would accept it now: its role gate and
+            // its status gate are both computed server-side, so a CFO, or a
+            // row already dismissed or applied, is offered nothing — and so is
+            // a row served without a verdict (fail closed). Both refusals are
+            // ones the reader cannot act on, so they hide the control rather
+            // than explain it.
+            if (s.dismissVerdict.allowed)
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton.icon(

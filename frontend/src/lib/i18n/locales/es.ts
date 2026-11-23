@@ -824,7 +824,6 @@ export const messages = {
 	'payments.col.discount': 'Descuento',
 	'payments.col.terms': 'Condiciones',
 	'payments.col.status': 'Estado',
-	'payments.col.routes': 'Rutas',
 	'payments.status.pending': 'Pendiente',
 	'payments.status.pendingCompliance': 'Retención por cumplimiento',
 	'payments.status.submitted': 'Enviado',

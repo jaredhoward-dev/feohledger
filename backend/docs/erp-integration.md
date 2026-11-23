@@ -1813,7 +1813,11 @@ ambiguity, never a link to the exact spelling plus a second vendor for the
 other. A unique match links whatever the spelling, and the local vendor keeps
 its own. Otherwise neither is linked nor created
 and the response reports it (`conflicts`, reason `ambiguous_name`): linking the
-wrong "Acme" posts its bills to another supplier's ERP record. QuickBooks'
+wrong "Acme" posts its bills to another supplier's ERP record. One record is
+held by at most one vendor per company (`uq_vendors_erp_link`, migration 0141,
+decisions §486); a tenant still holding a pair from before it gets that record
+reported as `duplicate_link` and the rest of the pull synced
+(`vendor-management.md` § One vendor per ERP record per company). QuickBooks'
 `Vendor.AcctNum` is no longer mapped to our vendor `code`: on a QuickBooks
 vendor it is the company's account number *at* the vendor, not an identifier
 for the vendor — and the sync clears it from the `code` of vendors the old

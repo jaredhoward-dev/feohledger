@@ -8,6 +8,12 @@ global turnover) on top of whatever the breach itself costs. This runbook is the
 one-page procedure to run the moment you suspect a breach, so you're not
 improvising the process while the clock runs.
 
+**The 72 hours is not the shortest clock.** Three of the platforms FeohLedger
+connects to — Xero, Intuit (QuickBooks Online) and Shopify — require a report
+**within 24 hours** of discovering an incident, and Intuit's trigger is wider
+than "personal data". § 3a lists them; work it in parallel with the
+assessment, never after it.
+
 This is the personal-data-breach companion to the operational incident process
 in [`support-and-status.md`](./support-and-status.md) § "Incident communication
 runbook". An availability outage (site down) is *not* automatically a
@@ -40,6 +46,10 @@ External contacts to have on file:
 - **Cyber-insurance breach hotline** — see [`insurance.md`](./insurance.md);
   many policies *require* you to call them before notifying anyone, and they
   provide breach-counsel + forensics.
+- **Connected-platform security channels** — the Xero, Intuit, Sage and
+  Shopify reporting addresses in § 3a, and **which email address each of our
+  developer accounts is registered under** (Intuit and Xero send their replies
+  there). Check the table's "re-verify by" dates while you are here.
 - **Affected sub-processor(s)** contact — from
   [`../sub-processors.md`](../sub-processors.md) (a sub-processor breach is
   *your* breach to the controller; they owe you notice "without undue delay" per
@@ -58,7 +68,9 @@ The moment a credible signal arrives:
    start of the 72 hours. "Awareness" means a reasonable degree of certainty
    that a security incident compromising personal data has occurred — not
    certainty about full scope. Don't wait for a complete picture to start the
-   clock or you'll blow the deadline.
+   clock or you'll blow the deadline. The same timestamp starts the
+   **24-hour connected-platform clocks** in § 3a, which do not wait for the
+   § 2 assessment.
 2. **Open an incident record.** One canonical doc (timeline, decisions,
    evidence links). Every entry timestamped UTC.
 3. **Assign the Incident Lead + Technical Lead.** Page per
@@ -115,6 +127,59 @@ Stop the bleeding without destroying evidence:
 - **Patch** the root cause. Do **not** "code around" it (root `CLAUDE.md`
   rail 4) — fix the actual vulnerability.
 - Snapshot before destructive remediation so forensics survive.
+
+## 3a. Connected-platform notices — the 24-hour leg
+
+When FeohLedger is connected to an accounting or commerce platform through an
+app **registered under our own developer account**, that platform's developer
+terms bind us directly, and several of them set a reporting clock far shorter
+than GDPR's. These are contract duties to the platform, separate from the
+regulator (§ 4), the customer (§ 6) and data subjects (§ 6). Run this step
+from T+0, in parallel with § 2 and § 3.
+
+**Does a row apply?** Ask two questions for each platform below:
+
+1. **Could the incident touch that platform's data or our connection to it?**
+   Its OAuth tokens or client secret (sealed in the tenant's credential store,
+   `backend/docs/erp-integration.md`), bills, vendors or chart of accounts we
+   read from it, or the systems that hold them. When unsure, treat it as yes:
+   a report that turns out unnecessary costs an email; a missed one breaches
+   the terms and can get the app suspended for every tenant.
+2. **Whose app made the connection?** QuickBooks Online, Xero, Sage Business
+   Cloud Accounting and Blackbaud FE NXT connect through the **platform app**
+   (ours) unless a tenant saved **its own app's** client ID and secret on the
+   ERP Integration page. For a tenant's own app, and for Shopify (the tenant
+   creates the custom app in its own store admin and pastes us its token —
+   `backend/docs/commerce-integration.md`), the duty is the **tenant's**, not
+   ours. Tell that tenant in the § 6 controller notice, straight away, that
+   the platform's own clock is running for them.
+
+**Trigger differences that matter.** Intuit's "Security Incident" covers any
+event that compromises, or is reasonably likely to compromise, the
+confidentiality, integrity or availability of *systems used with the app* —
+so it can fire even when § 2 concludes there was no personal-data breach.
+Shopify counts *suspected* breaches of merchant data. Xero's trigger is a
+security issue affecting the app, unauthorised access to user data being the
+example it gives.
+
+| Platform | Notice duty | Clock | Channel | Notice must include | Source (checked) |
+|---|---|---|---|---|---|
+| **Xero** | Yes, to Xero | Immediately; **within 24 h of discovery** | `api@support.xero.com` (not `legalnotices@xero.com`, which is the general legal-notice address) | Description of the incident and your action plan to contain and mitigate it. You must also notify affected users and any regulators yourself, and may not name Xero in those notices without Xero's written OK | [Xero Developer Platform Terms](https://developer.xero.com/xero-developer-platform-terms-conditions), clause 15 (version of 4 Dec 2025; binds earlier developers from 2 Mar 2026). Checked 2026-11-22 |
+| **Intuit** (QuickBooks Online) | Yes, to Intuit | Without undue delay; **no later than 24 h after discovery** | Not named in § 9.3. Formal notices (§ 16.7) go by courier or registered mail to the Intuit contracting party, too slow for 24 h: before go-live, ask Intuit developer support which channel it accepts for § 9.3 reports and record it here | Detailed description of the incident and the data affected, and anything else Intuit reasonably asks. Intuit then sets a remediation deadline (Critical 7 days, High 30, Medium 90, from discovery), may require an approved third-party audit (§ 9.5), and directs any notice to users or regulators at our cost | [Intuit Developer Terms of Service](https://developer.intuit.com/app/developer/qbo/docs/legal-agreements/intuit-terms-of-service-for-intuit-developer-services), §§ 9.3–9.5, 16.7, 17 (version of 12 Nov 2026; binds existing developers from 12 Dec 2026). Checked 2026-11-22 |
+| **Shopify** | Yes, to Shopify, from whoever holds the app (today the merchant; see above) | Immediately; **within 24 h of becoming aware**; actual *or suspected* | Shopify Support via `https://help.shopify.com/questions/partners` | Then remedy, investigate, mitigate harm to Shopify and merchants, answer Shopify's questions, and report progress regularly | [Shopify API License and Terms of Use](https://www.shopify.com/legal/api-terms), § 6.2.10 (version of 7 Oct 2026). Checked 2026-11-22 |
+| **Sage** (Business Cloud Accounting, via Sage Developer Services) | Yes, to Sage | **Promptly** (no hour count) | Sage Cyber Defence Operations, `cdo@sage.com` | Details of the data breach (or of a vulnerability found in or reported to us) | [Sage Developer Services Licence Agreement](https://developer.sage.com/files/DeveloperServicesLicenseAgreement.pdf), clause 13.6 (version of June 2026). Checked 2026-11-22 |
+| **Blackbaud** (FE NXT, SKY API) | **None found.** The terms make the developer fully responsible for the security of data the app processes, with an indemnity, but set no reporting duty or clock | — | Formal notices: certified mail only | — | [SKY API Terms of Use](https://developer.blackbaud.com/skyapi/terms), "Application Security" and "Electronic Communications; Notices" (version of 18 Mar 2022). Checked 2026-11-22 |
+| Sage Intacct, Sage Accounting (South Africa), Oracle NetSuite, Microsoft Dynamics 365 Business Central, SYSPRO, Merge.dev, Square, Lightspeed, Cin7, WooCommerce | **Not yet checked** | — | — | — | Connected (`backend/docs/erp-integration.md`, `commerce-integration.md`); their developer or API terms have not been read for a notice duty. Do not assume there is none |
+
+**Re-verify by:** each platform reserves the right to change its terms on
+notice (Intuit rewrote its terms in November 2026). Re-read every row's
+source before the first tenant goes live on that platform, and at least every
+six months after; update the version and checked date when you do.
+
+**In the incident:** for each row that applies, send the notice inside its
+clock with what you know, mark what is still under investigation, and log
+the time sent in the incident record. A partial report on time beats a full
+one late, as in § 4.
 
 ## 4. The 72-hour notification to the supervisory authority (Art. 33)
 
@@ -213,7 +278,7 @@ guess thresholds.
 Don't close the incident at containment. Run a blameless post-mortem:
 
 1. **Timeline** — detection → awareness → containment → notification →
-   resolution, with the 72h clock annotated. Did we hit the deadline? If not,
+   resolution, with the 72h clock and any § 3a 24h clocks annotated. Did we hit the deadline? If not,
    why, and what changes the next time?
 2. **Root cause** — the actual vulnerability, fixed at source (not masked).
 3. **Scope, confirmed** — final data-subject / record counts from the audit
@@ -228,11 +293,12 @@ Don't close the incident at containment. Run a blameless post-mortem:
 
 ## Quick checklist (print this)
 
-- [ ] **T+0**: awareness timestamp recorded (UTC) — 72h clock started
+- [ ] **T+0**: awareness timestamp recorded (UTC) — 72h clock and the 24h platform clocks started
 - [ ] Incident record opened; Incident + Technical + Privacy leads assigned
 - [ ] Cyber-insurer breach hotline called (may gate further steps)
 - [ ] Audit trail pulled + preserved (WORM — tamper-evident scope evidence)
 - [ ] Personal-data-breach? + risk-to-rights? + HIGH-risk? assessed and documented
+- [ ] **Connected-platform notices sent within 24h** where our app is involved (§ 3a: Xero, Intuit, Shopify; Sage promptly); tenants on their own app told their clock is running
 - [ ] Containment done (access cut, credential rotated, root cause patched)
 - [ ] Affected **customers (controllers)** notified without undue delay (no 72h grace)
 - [ ] **Authority notified within 72h** (partial if needed; reasons logged if late)
@@ -245,6 +311,9 @@ Related: [`README.md`](./README.md) (runbook index),
 [`support-and-status.md`](./support-and-status.md) (operational incidents +
 on-call), [`insurance.md`](./insurance.md) (cyber/E&O),
 [`../sub-processors.md`](../sub-processors.md) (who else holds the data),
+[`../../backend/docs/erp-integration.md`](../../backend/docs/erp-integration.md)
+and [`../../backend/docs/commerce-integration.md`](../../backend/docs/commerce-integration.md)
+(which platforms we connect to, § 3a),
 [`../secrets-rotation.md`](../secrets-rotation.md) (credential rotation),
 [`../../backend/docs/audit-log-shipping.md`](../../backend/docs/audit-log-shipping.md)
 (WORM evidence).

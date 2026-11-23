@@ -532,6 +532,11 @@ const BUILDERS: Record<string, Builder> = {
 	// `services/procurement_controls.requisition_approve_refusal` — the
 	// requester or a material editor approving it (not the invoice sentence)
 	requisition_approval_segregation: fixed('refusal.requisitionApprovalSegregation'),
+	// `procurement_controls.{intake,requisition}_delete_refusal` — the delete
+	// 409s once a conversion links the row to spend downstream
+	intake_delete_converted: fixed('refusal.intakeDeleteConverted'),
+	requisition_delete_converted: fixed('refusal.requisitionDeleteConverted'),
+	requisition_delete_from_intake: fixed('refusal.requisitionDeleteFromIntake'),
 	requisition_status_refused: (p, t) => {
 		const status = str(p, 'status');
 		return status === null

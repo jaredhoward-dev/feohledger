@@ -27,7 +27,8 @@ const ALLOW_ALL = {
 	reject: null,
 	convert: null,
 	cancel: null,
-	reopen: null
+	reopen: null,
+	delete: null
 };
 
 function refused(code: string, params: Record<string, unknown> = {}) {
@@ -91,7 +92,16 @@ function row(page: Page, number: string) {
 	return page.locator('tbody tr', { hasText: number });
 }
 
-const CONTROLS = [/^Submit$/, /^Approve$/, /^Reject$/, /^Convert to PO$/, /^Reopen/, /^Cancel$/] as const;
+const CONTROLS = [
+	/^Submit$/,
+	/^Approve$/,
+	/^Reject$/,
+	/^Convert to PO$/,
+	/^Reopen/,
+	/^Cancel$/,
+	// Delete names its row ("Delete for REQ-…"), the /experiments arrangement.
+	/^Delete for REQ-/
+] as const;
 
 test.describe('/requisitions — controls follow the server verdict', () => {
 	test('an allowed verdict offers each control, even on a status the old rule refused', async ({

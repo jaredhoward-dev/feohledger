@@ -28,7 +28,15 @@ const row = {
 	started_at: '2024-01-01T00:00:00Z',
 	ended_at: null,
 	created_at: '2024-01-01T00:00:00Z',
-	updated_at: '2024-01-01T00:00:00Z'
+	updated_at: '2024-01-01T00:00:00Z',
+	// The row's verdicts (`api/workflow_experiments._experiment_actions`) as a
+	// running experiment carries them for an admin: Stop and Conclude offered.
+	actions: {
+		start: { code: 'experiment_not_startable', message: 'Only a draft experiment can be started.', params: { status: 'running' } },
+		stop: null,
+		conclude: null,
+		delete: { code: 'experiment_not_deletable', message: 'Only a draft experiment can be deleted.', params: { status: 'running' } }
+	}
 };
 
 test.describe('/experiments conclude', () => {

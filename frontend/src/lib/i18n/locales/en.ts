@@ -903,7 +903,6 @@ export const en = {
 	'payments.col.discount': 'Discount',
 	'payments.col.terms': 'Terms',
 	'payments.col.status': 'Status',
-	'payments.col.routes': 'Routes',
 
 	// Payment status labels — the History badge + its filter chips (#lib/types/payment.ts::PAYMENT_STATUS_LABEL_KEYS)
 	'payments.status.pending': 'Pending',

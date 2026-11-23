@@ -16269,6 +16269,9 @@ release or vite-plugin-svelte stops depending on it. The patch is keyed to
 4.3.1, so a resolved version that moves off it leaves the copy unpatched and
 the guard red, which is the prompt to re-check.
 
+*Amended by §484:* GitHub withdrew the advisory on 2026-11-16, so the patch,
+both ignores and the guard were removed.
+
 ## 353. An ERP name too long for its column is stored shortened and marked; vendor names are matched case and spacing aside (2026-11-12)
 
 **Found** while closing two §287 / §284 follow-ups. `vendors.name` and
@@ -24604,3 +24607,189 @@ workspace adding a card on its way to an upgrade); it says "Card saved." there
 period; `backend/tests/test_billing_stripe_subscriptions.py`,
 `backend/tests/test_migration_0140_subscription_pending_plan.py`,
 `frontend/tests-e2e/billing/billing.spec.ts`.
+
+## 484. A withdrawn advisory takes its ignores, its patch and its guard with it (amends §352; round 2026-11-21)
+
+**Found.** GitHub withdrew GHSA-gcqx-w48m-w2h4 (CVE-2026-93753, deepmerge
+`mergeObject()` prototype poisoning) as not describing a security
+vulnerability. `gh api /advisories/GHSA-gcqx-w48m-w2h4`, read 2026-11-21,
+returns `withdrawn_at: 2026-11-16T18:55:38Z` and the summary "Withdrawn
+Advisory: …". §352's drop condition (a fixed deepmerge release, or
+vite-plugin-svelte no longer depending on it) did not foresee a withdrawal,
+so all four pieces outlived it.
+
+**Decision.** Remove all four: `frontend/patches/deepmerge@4.3.1.patch` with
+its `pnpm.patchedDependencies` entry (the lockfile loses the `patch_hash`
+and nothing else), `pnpm.auditConfig.ignoreGhsas`, the `osv-scanner.toml`
+entry (its only one, so the file goes; `supply-chain-scan.yml` passes
+`--config` only when the file exists) and
+`frontend/src/lib/deepmergePatch.security.test.ts`. An ignore for a
+withdrawn ID suppresses nothing and only reads as an open exception. The
+patch was the remaining question, and it guards no real input here:
+vite-plugin-svelte 7.3.1 calls deepmerge only in `mergeConfigs`
+(`src/utils/options.js`), merging its defaults, `svelte.config.js` and the
+inline options from `vite.config.ts`, all repo-authored and read at build
+time. No request, upload or tenant value reaches it, and deepmerge is not in
+the shipped bundle. With the advisory gone, `pnpm audit` reports nothing
+without any ignore.
+
+**Rejected:** keeping the patch as hardening without the ignores. It would
+leave a local fork of a dependency, and a guard keyed to 4.3.1 that turns red
+on the next deepmerge release, to protect a build-time merge of our own
+config files. §352's method (a patch, a guard, then an ID-scoped ignore) still
+holds for the next advisory with no fixed release; `frontend/CLAUDE.md` keeps
+it as the rule.
+
+## 485. The overdue and due-soon population is one select every counting surface joins (closes a `docs/followups.md` entry, round 2026-11-21)
+
+§471 put the population (outflow statuses), the effective due date (latest
+payment schedule, else the invoice's own) and "overdue" in
+`services/open_ap_due`, but as parts. The dashboard's `overdue_and_due_soon`
+and the forecast's `commitment_rows` each assembled their own copy from
+them, and `overdue_invoice_ids` (behind `GET /api/invoices?overdue=true`) a
+third. The copies agreed only because they were written the same way.
+
+`open_ap_due_population(statuses)` is now the one select: a derived table of
+`invoice_id`, `effective_due` and the latest schedule's discount terms over
+the given statuses (default: the whole outflow population). The dashboard
+joins it and adds only its two windows (`is_overdue`, `is_due_soon`, the
+latter now named in the module with `DUE_SOON_DAYS`) and the entity scope;
+`overdue_invoice_ids` is it filtered by `is_overdue`; `commitment_rows`
+joins it with `COMMITTED_STATUSES` alone when `include_pending=false`.
+Entity scope still lands on the outer `Invoice`, amounts are still the
+invoice's `Numeric` columns, and nothing is loaded into Python: the cost is
+one join back to `invoices` on its primary key (no plan was measured).
+
+Chosen over aggregating the dashboard over `Invoice.id IN
+(overdue_invoice_ids(today))`, because due soon is the same population with
+another window: an `IN` set for each window would have left the population
+stated once for overdue and again for due soon.
+
+`backend/tests/test_open_ap_due_single_statement.py` fails any module under
+`app/` other than `open_ap_due` that names `OUTFLOW_STATUSES`,
+`latest_schedule_subquery` or `effective_due_date`, and any of the three
+counting surfaces that stops reading the shared select;
+`tests/test_dashboard_aggregates.py` still pins the list total, the dashboard
+count and the forecast count equal against Postgres.
+
+Left alone, and tracked in `docs/followups.md`: the web dashboard's ten-row
+`upcoming_payments` list, the payment queue's per-row `is_overdue` and the
+aging bands still time an invoice on its own `due_date`. Each needs a product
+call the count did not (an invoice whose payment completed before its
+`paid` sync-back; a row flag that must match the date it prints; aging's
+reconciliation with the AP balance). The exception SLA `is_overdue` is a
+different rule (an exception's `due_at`) and is not AP timing.
+
+## 486. One vendor per ERP record per company, enforced by a unique index; the migration refuses an existing pair (round 2026-11-21)
+
+`vendors.erp_vendor_id` had no unique index. Two vendors holding one record's
+id in one company made the vendor sync's lookup by id (`scalar_one_or_none` in
+`services/vendor_sync`) raise and abort every pull the tenant ran, and the push
+would post two payees' bills to one ERP supplier. The sync, the restore of kept
+links (§356), the hand-made link (§415) and the merge (§373) each already
+avoid making a second holder, but nothing below them held the line.
+
+Migration 0141 adds `uq_vendors_erp_link` on `vendors (organization_id,
+erp_link_realm, erp_vendor_id) NULLS NOT DISTINCT WHERE erp_vendor_id IS NOT
+NULL`, and the model declares it so `create_all` builds the same on a fresh
+tenant. `organization_id` leads because every lookup is scoped by it; in a
+database-per-tenant deployment it is constant, so it costs nothing.
+
+**A NULL realm is one company.** A no-realm sync looks a record up as
+`erp_link_realm IS NULL`, so two NULL-realm holders break it exactly as two
+named ones do; with plain NULL semantics the pre-0115 links would be the one
+place a duplicate survives. `NULLS NOT DISTINCT` (PostgreSQL 15+; compose, CI
+and RDS are all 16) says that directly. Rejected: a `COALESCE(erp_link_realm,
+'')` expression index, which needs a sentinel the realm format must never
+produce, and which the sync's `IS NULL` predicate cannot use. A NULL-realm link
+and a named one may share an id: they may be two companies' records, and a sync
+under the named one re-judges the NULL link by evidence (§284).
+
+**The migration refuses rather than de-links**, as 0138 did for email case
+collisions (§475). Which vendor keeps the link decides whose bills post to that
+ERP supplier; de-linking every holder would drop a link that is right for one
+of them and silently stop its pushes (`vendor_not_linked`), and keeping one by
+age or id is a guess. Both existing tools record the choice in the audit trail:
+a merge releases the same id held twice in one company (§373), and the unlink
+clears the stale holder (§375). The refusal names the database, the counts and
+at most ten vendor row ids, never a vendor name or the realm (which can carry an
+ERP base URL); `backend/docs/vendor-management.md` § Duplicate ERP links has
+the query that lists every group. `scripts/migrate_all_tenants.py` exits
+non-zero on it, so the deploy stops before new code serves that tenant.
+
+**The sync no longer aborts on a pair.** Code can still meet one on a tenant
+before 0141 (a local database, or a fan-out that stopped on the refusal while
+other code paths run). The lookup by id now reads every holder; with more than
+one it reports the record as a `duplicate_link` conflict, touches neither
+vendor, and syncs the rest of the pull. Choosing a holder there would be the
+same guess the migration declines.
+
+## 487. Delete on /intake, /requisitions and /experiments follows the endpoint's verdict, including where the old page rule was narrower (round 2026-11-21)
+
+The last web controls the §305 follow-up tracked as restating a server rule —
+intake and requisition Delete, experiment Stop / Conclude / Delete — now raise
+from one gate each (`services/procurement_controls.{intake,requisition}_delete_refusal`,
+`api/workflow_experiments.{stop,conclude,delete}_refusal`) and ship as each
+row's `actions`, pinned by the parity tests per role × row state.
+
+The verdict says what the endpoint does, and in two places that differs from
+what the page used to show:
+
+- **Requisition Delete** was offered only on `draft`. The endpoint has always
+  deleted any requisition that owns no PO and was not converted from an
+  intake, whatever its status (`backend/docs/procurement-requisitions.md`), so
+  the page now offers it on rejected, cancelled, submitted, pending and
+  approved rows too, and no longer offers it on a draft an intake was
+  converted into (which 409'd). Narrowing the endpoint to drafts would be a
+  separate policy change to who may discard a submitted request; this change
+  does not make it, because the rule is to stop the page and the endpoint from
+  disagreeing, not to pick a new rule while doing so.
+- **Experiment Conclude** was offered only on `running`. The endpoint also
+  concludes a `draft` (no assignments are taken after it), so a draft now
+  offers it, armed two-click like Delete because it is terminal. A
+  stopped draft that kept its assignments no longer offers the Delete that
+  409s (`experiment_has_assignments`).
+
+Conclude never refuses: a concluded row's repeat POST is an idempotent no-op
+answering the unchanged row. Its verdict is `experiment_already_concluded`
+anyway, the same shape as Start on a running experiment (nothing to offer),
+and the endpoint asks the same gate to decide the replay. The procurement
+delete 409s became coded (`intake_delete_converted`,
+`requisition_delete_converted`, `requisition_delete_from_intake`), the module's
+convention; the experiment ones stay plain strings with codes in the verdict,
+as `start_refusal` already did.
+
+## 488. Conclude refuses a draft that never ran; Delete is its exit (round 2026-11-21)
+
+§487 offered Conclude on any draft, because the endpoint concluded one. A
+fresh draft that never assigned an invoice therefore showed Start, Delete and
+Conclude together, and Conclude filed an experiment with no measurements as a
+finished result, permanently, beside the Delete that discards it.
+`conclude_refusal` now refuses that row with 409 `experiment_never_ran` ("delete
+it instead"), and the endpoint raises from the same gate; a concluded row's
+repeat stays the idempotent no-op. The rule is the complement of
+`delete_refusal`'s assignment check: a draft with no assignments can be
+deleted and not concluded, a stopped draft that kept its assignments can be
+concluded and not deleted, so each draft has exactly one exit. A running
+experiment with no assignments yet still concludes: it was live, and
+concluding it is how an operator ends a test that drew nothing. The message is
+a plain string like the module's other experiment refusals (§487), so no
+browser catalogue entry was added; the page hides a refused Conclude.
+
+## 489. A no-realm vendor sync takes the link lock too, rather than catching the unique violation (round 2026-11-21)
+
+§486's unique index made a second holder of one ERP record impossible, which
+turned a race that used to make a silent duplicate into a 500: two no-realm
+syncs (no `link_lock` was taken without a realm, §415) could both find no
+holder for a new record, both create a vendor, and the second failed
+`uq_vendors_erp_link` at flush. Two fixes were weighed. Catching that one
+index's violation and answering a coded 409 would tell the operator to retry
+a pull that did nothing wrong. Taking the same advisory lock for the no-realm
+company (key `vendor-erp-link:<org>:`, which no named realm can produce since
+`connection_realm` never returns an empty one) removes the race: the second
+pull waits, then sees the first one's committed vendor and reports it
+unchanged. Only the sync writes NULL-realm links (a hand-made link always
+names its company), so the lock serializes exactly the writers that can
+collide. The cost is that two no-realm pulls of one tenant run one after the
+other, which is what the named-realm case already does. Pinned in
+`tests/test_vendor_sync.py::test_two_no_realm_syncs_creating_one_record_serialize`.

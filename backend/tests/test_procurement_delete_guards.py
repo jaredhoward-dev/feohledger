@@ -116,7 +116,7 @@ async def test_delete_converted_requisition_is_409_not_a_stranded_po(realdb):
 
         resp = await c.delete(f"/api/requisitions/{rid}")
     assert resp.status_code == 409, resp.text
-    assert "converted" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "requisition_delete_converted"
 
     async with mk() as s:
         still_there = (
@@ -151,7 +151,7 @@ async def test_delete_requisition_converted_from_an_intake_is_409_not_500(realdb
         assert (await c.get(f"/api/requisitions/{rid}")).json()["status"] == "draft"
         resp = await c.delete(f"/api/requisitions/{rid}")
     assert resp.status_code == 409, resp.text
-    assert "intake" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "requisition_delete_from_intake"
 
 
 async def test_delete_unconverted_requisition_still_works(realdb):
@@ -177,7 +177,7 @@ async def test_delete_converted_intake_is_409(realdb):
 
         resp = await c.delete(f"/api/intake/{iid}")
     assert resp.status_code == 409, resp.text
-    assert "converted" in resp.json()["detail"].lower()
+    assert resp.json()["detail"]["code"] == "intake_delete_converted"
 
     async with mk() as s:
         row = (
@@ -191,6 +191,52 @@ async def test_delete_unconverted_intake_still_works(realdb):
         iid = (await c.post("/api/intake", json=_intake_payload())).json()["id"]
         assert (await c.delete(f"/api/intake/{iid}")).status_code == 204
         assert (await c.get(f"/api/intake/{iid}")).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 2b. Who may delete: intake is every system role, a requisition is not the CFO
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["admin", "ap_manager", "ap_clerk", "cfo"])
+async def test_every_system_role_may_delete_an_unconverted_intake(realdb, role):
+    """Intake is the non-PO spend ask, so anyone who may raise one may withdraw
+    it. The tuple is pinned too: there is no system role outside it today, so
+    the set itself is what a fifth role would have to be judged against."""
+    from app.api.intake import INTAKE_AUTHOR_ROLES
+
+    assert set(INTAKE_AUTHOR_ROLES) == {"admin", "ap_manager", "ap_clerk", "cfo"}
+    async with realdb.client(key=TENANT, role=role) as c:
+        iid = (await c.post("/api/intake", json=_intake_payload())).json()["id"]
+        assert (await c.delete(f"/api/intake/{iid}")).status_code == 204
+
+
+async def test_an_unauthenticated_intake_delete_is_refused(realdb):
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        iid = (await c.post("/api/intake", json=_intake_payload())).json()["id"]
+    async with realdb.client(key=TENANT, role=None) as c:
+        assert (await c.delete(f"/api/intake/{iid}")).status_code == 401
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        assert (await c.get(f"/api/intake/{iid}")).status_code == 200
+
+
+@pytest.mark.parametrize("role", ["admin", "ap_manager", "ap_clerk"])
+async def test_requisition_authors_may_delete_a_draft(realdb, role):
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        rid = (await c.post("/api/requisitions", json=_req_payload())).json()["id"]
+    async with realdb.client(key=TENANT, role=role) as c:
+        assert (await c.delete(f"/api/requisitions/{rid}")).status_code == 204
+
+
+async def test_the_cfo_may_not_delete_a_requisition(realdb):
+    """The CFO decides requisitions; deleting one is the author's door, and a
+    decider who could delete could remove what they were asked to judge."""
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        rid = (await c.post("/api/requisitions", json=_req_payload())).json()["id"]
+    async with realdb.client(key=TENANT, role="cfo") as c:
+        assert (await c.delete(f"/api/requisitions/{rid}")).status_code == 403
+    async with realdb.client(key=TENANT, role="ap_clerk") as c:
+        assert (await c.get(f"/api/requisitions/{rid}")).status_code == 200
 
 
 # ---------------------------------------------------------------------------

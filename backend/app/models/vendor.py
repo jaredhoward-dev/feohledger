@@ -35,6 +35,21 @@ class Vendor(Base, EntityMixin, TimestampMixin):
             "payments_blocked",
             postgresql_where=text("payments_blocked"),
         ),
+        # One vendor per ERP record per company (migration 0141, decisions
+        # §486): two rows holding one id made the vendor sync's lookup by id
+        # raise and abort the whole pull. NULLS NOT DISTINCT so a NULL realm
+        # (a pre-0115 link, or one a no-realm sync made) is one company too —
+        # the sync looks those up as `erp_link_realm IS NULL`. Partial: an
+        # unlinked vendor holds nothing.
+        Index(
+            "uq_vendors_erp_link",
+            "organization_id",
+            "erp_link_realm",
+            "erp_vendor_id",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+            postgresql_where=text("erp_vendor_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

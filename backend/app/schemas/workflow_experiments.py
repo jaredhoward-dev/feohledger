@@ -103,9 +103,10 @@ class ExperimentResponse(BaseModel):
     entity_id: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
-    # The caller's verdict on each row action — `{"start"}`, a coded refusal or
-    # `None` — from the endpoint's own gate (`api/workflow_experiments.
-    # start_refusal`, issue #575). The page offers Start by it.
+    # The caller's verdict on each row action — `{start, stop, conclude,
+    # delete}`, each a coded refusal or `None` — from the endpoint's own gate
+    # (`api/workflow_experiments.{start,stop,conclude,delete}_refusal`, issue
+    # #575). The page offers every row action by it.
     actions: dict | None = None
 
 

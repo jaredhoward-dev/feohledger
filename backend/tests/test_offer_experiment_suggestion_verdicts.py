@@ -6,8 +6,9 @@ verdict on each row action, and it says exactly what the endpoint answers
   page offered Accept / Decline on `status === 'offered'` and a manager-or-CFO
   role check, so an offer whose tier windows had all closed, or whose invoice
   was already paid, showed an Accept the endpoint refuses;
-* experiments — `actions.start`: `isAdmin && status === 'draft'`, a restated
-  copy of the start gate;
+* experiments — `actions.{start,stop,conclude,delete}`: `isAdmin` plus a
+  status check each, restated copies of the gates — Delete was offered on a
+  stopped draft that still holds assignments, which the endpoint 409s;
 * adaptive suggestions — `actions.dismiss`: the page offered Dismiss only on
   `open`, while the endpoint also accepted `stale` and overwrote an `applied`
   row with `dismissed` (now refused, `workflow_suggestion_not_dismissable`).
@@ -38,7 +39,16 @@ from app.api.discounts import (
     DISCOUNT_OFFER_NO_CAPTURABLE_TIER,
     DISCOUNT_OFFER_NOT_OPEN,
 )
-from app.api.workflow_experiments import EXPERIMENT_NOT_STARTABLE
+from app.api.workflow_experiments import (
+    EXPERIMENT_ALREADY_CONCLUDED,
+    EXPERIMENT_HAS_ASSIGNMENTS,
+    EXPERIMENT_NEVER_RAN,
+    EXPERIMENT_NOT_STARTABLE,
+    conclude_refusal,
+    delete_refusal,
+    start_refusal,
+    stop_refusal,
+)
 from app.models.adaptive_suggestion import WorkflowSuggestion
 from app.models.discount import DiscountOffer
 from app.models.entity import Entity
@@ -54,7 +64,7 @@ pytestmark = pytest.mark.asyncio
 
 def _assert_parity(verdict, resp, label):
     if verdict is None:
-        assert resp.status_code in (200, 201), (label, resp.text)
+        assert resp.status_code in (200, 201, 204), (label, resp.text)
         return
     assert resp.status_code in (403, 409, 422), (label, verdict, resp.text)
     detail = resp.json()["detail"]
@@ -188,7 +198,7 @@ async def test_capturable_tier_days_are_the_tiers_accept_takes_by_name(realdb):
 EXPERIMENT_STATES = ("draft", "running", "concluded")
 
 
-async def _experiment(realdb, status: str) -> uuid.UUID:
+async def _experiment(realdb, status: str, *, assignments: dict | None = None) -> uuid.UUID:
     org_id = realdb.info(TENANT).org_id
     async with realdb.sessionmaker(TENANT)() as s:
         entity_id = await _default_entity_id(s)
@@ -215,6 +225,7 @@ async def _experiment(realdb, status: str) -> uuid.UUID:
             status=status,
             started_at=datetime.now(UTC) if status != "draft" else None,
             ended_at=datetime.now(UTC) if status == "concluded" else None,
+            assignments=assignments or {},
         )
         s.add(exp)
         await s.commit()
@@ -242,6 +253,82 @@ async def test_the_experiment_verdict_matches_start(realdb, role):
         _assert_parity(verdict, resp, (role, state))
         if verdict is not None and verdict["code"] == EXPERIMENT_NOT_STARTABLE:
             assert verdict["params"] == {"status": state}
+
+
+def test_a_fresh_draft_offers_start_and_delete_but_not_conclude():
+    """A draft that never assigned an invoice has no result to conclude:
+    concluding it filed an empty experiment as finished, beside the Delete that
+    is its real exit. Start and Delete are offered; Conclude and Stop are not
+    (decisions §488)."""
+    fresh = WorkflowExperiment(status="draft", assignments={})
+    assert start_refusal(fresh) is None
+    assert delete_refusal(fresh) is None
+    assert stop_refusal(fresh) is not None
+    refusal = conclude_refusal(fresh)
+    assert refusal is not None
+    assert refusal.code == EXPERIMENT_NEVER_RAN
+    assert refusal.http_status == 409
+
+    # Once it has assigned an invoice (a stopped draft), Conclude is its exit
+    # and Delete is refused — exactly one of the two, never both or neither.
+    stopped = WorkflowExperiment(status="draft", assignments={str(uuid.uuid4()): "A"})
+    assert conclude_refusal(stopped) is None
+    assert delete_refusal(stopped) is not None
+
+
+#: Row states for the stop / conclude / delete verdicts: the three statuses,
+#: plus a `draft` that was stopped after assigning invoices (its assignments
+#: kept), which delete refuses and conclude accepts. A fresh `draft` is the
+#: reverse: delete accepts it and conclude refuses (`experiment_never_ran`).
+EXPERIMENT_ROW_STATES = ("draft", "stopped_with_assignments", "running", "concluded")
+
+
+async def _experiment_in(realdb, state: str) -> uuid.UUID:
+    if state == "stopped_with_assignments":
+        return await _experiment(realdb, "draft", assignments={str(uuid.uuid4()): "A"})
+    return await _experiment(realdb, state)
+
+
+async def _experiment_action(c, exp_id, action):
+    if action == "delete":
+        return await c.delete(f"/api/experiments/{exp_id}")
+    return await c.post(f"/api/experiments/{exp_id}/{action}")
+
+
+@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("action", ("stop", "conclude", "delete"))
+async def test_the_experiment_verdicts_match_stop_conclude_and_delete(realdb, role, action):
+    seen = set()
+    for state in EXPERIMENT_ROW_STATES:
+        exp_id = await _experiment_in(realdb, state)
+        async with realdb.client(key=TENANT, role=role) as c:
+            listed = await c.get("/api/experiments")
+            resp = await _experiment_action(c, exp_id, action)
+        if listed.status_code == 403:
+            # Not a reader (clerk): no row to judge, and every action is a write.
+            assert resp.status_code == 403
+            continue
+        rows = {e["id"]: e for e in listed.json()["experiments"]}
+        verdict = rows[str(exp_id)]["actions"][action]
+        if verdict is not None:
+            seen.add(verdict["code"])
+        if verdict is not None and verdict["code"] == EXPERIMENT_ALREADY_CONCLUDED:
+            # The idempotent repeat: 200, unchanged — not an action to offer.
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["status"] == "concluded"
+            continue
+        _assert_parity(verdict, resp, (role, state, action))
+        if verdict is not None and verdict["code"] == EXPERIMENT_HAS_ASSIGNMENTS:
+            assert verdict["params"] == {"count": 1}
+    if role == "admin":
+        expected = {
+            "stop": {"experiment_not_stoppable"},
+            "conclude": {EXPERIMENT_ALREADY_CONCLUDED, EXPERIMENT_NEVER_RAN},
+            "delete": {"experiment_not_deletable", EXPERIMENT_HAS_ASSIGNMENTS},
+        }[action]
+        assert expected <= seen, seen
+    elif role != "ap_clerk":
+        assert seen == {"role_not_permitted"}
 
 
 # ── Adaptive suggestions ───────────────────────────────────────────────────

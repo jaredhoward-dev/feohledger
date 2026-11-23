@@ -11,7 +11,12 @@ Three surfaces count or list overdue AP, and they must agree on the rows:
 * `GET /api/invoices?overdue=true` (with `/counts` and `/ids`), the list the
   mobile Overdue card opens (`overdue_invoice_ids`).
 
-All read this module, so the predicate is stated once:
+All read ONE select, `open_ap_due_population`, so the predicate is stated
+once: the population and its effective due date are built there and nowhere
+else, and each surface only adds its own window on `effective_due`
+(`is_overdue`, `is_due_soon`, the forecast's horizon).
+`tests/test_open_ap_due_single_statement.py` fails if a caller rebuilds the
+population from the parts.
 
 * **Population.** Committed AP (`OPEN_AP_STATUSES`, approved and still
   owed) plus the in-review pipeline (`IN_REVIEW_STATUSES`). The forecast's
@@ -23,13 +28,16 @@ All read this module, so the predicate is stated once:
   `NULL < today` is not true, so it is never overdue.
 * **Overdue.** Effective due date strictly before today (UTC). Due today is
   on time.
+* **Due soon.** Effective due date from today through `DUE_SOON_DAYS` out,
+  both ends inclusive. Disjoint from overdue by construction.
 """
 
 from __future__ import annotations
 
-from datetime import date
+from collections.abc import Sequence
+from datetime import date, timedelta
 
-from sqlalchemy import ColumnElement, Select, Subquery, func, select
+from sqlalchemy import ColumnElement, Select, Subquery, and_, func, select
 
 from app.models.invoice import Invoice
 from app.models.invoice_status import IN_REVIEW_STATUSES, OPEN_AP_STATUSES
@@ -42,6 +50,8 @@ COMMITTED_STATUSES: tuple[str, ...] = tuple(s.value for s in OPEN_AP_STATUSES)
 PENDING_STATUSES: tuple[str, ...] = tuple(s.value for s in IN_REVIEW_STATUSES)
 #: Everything the business may still have to pay.
 OUTFLOW_STATUSES: tuple[str, ...] = COMMITTED_STATUSES + PENDING_STATUSES
+#: "Due soon" runs from today through this many days out.
+DUE_SOON_DAYS = 7
 
 
 def latest_schedule_subquery() -> Subquery:
@@ -81,13 +91,48 @@ def is_overdue(effective_due: ColumnElement, today: date) -> ColumnElement:
     return effective_due < today
 
 
+def is_due_soon(effective_due: ColumnElement, today: date) -> ColumnElement:
+    """Falls due today through `DUE_SOON_DAYS` out. NULL (untimeable) is not."""
+    return and_(effective_due >= today, effective_due <= today + timedelta(days=DUE_SOON_DAYS))
+
+
+def open_ap_due_population(statuses: Sequence[str] = OUTFLOW_STATUSES) -> Subquery:
+    """THE open-AP population, one row per invoice, with its effective due date.
+
+    Columns: `invoice_id`, `effective_due` (`effective_due_date`, NULL when
+    untimeable), and the latest schedule's `discount_date` /
+    `discount_percent` for the forecast's discount slice.
+
+    `statuses` defaults to the whole outflow population; the forecast's
+    `include_pending=false` passes `COMMITTED_STATUSES`. Every surface named in
+    the module docstring joins this on `invoice_id` (inner join: the status
+    filter lives here) and applies only its own window and its own entity
+    scope to the outer `Invoice`, so none of them restates the population.
+
+    Unscoped and uncorrelated on purpose: it is a derived table, and the
+    caller's `apply_entity_scope` on the outer query narrows it.
+    """
+    latest = latest_schedule_subquery()
+    return (
+        select(
+            Invoice.id.label("invoice_id"),
+            effective_due_date(latest).label("effective_due"),
+            latest.c.discount_date.label("discount_date"),
+            latest.c.discount_percent.label("discount_percent"),
+        )
+        .outerjoin(latest, latest.c.invoice_id == Invoice.id)
+        .where(Invoice.status.in_(tuple(statuses)))
+        .correlate(None)
+        .subquery("open_ap_due")
+    )
+
+
 def overdue_invoice_ids(today: date) -> Select:
     """The ids of every overdue invoice as of `today`, over the whole book.
 
-    The set `GET /api/dashboard`'s `overdue_count` counts and the /cfo card's
-    overdue figure counts: the outflow population (`OUTFLOW_STATUSES`, the
-    in-review pipeline included), timed on the effective due date, strictly
-    before `today`. `GET /api/invoices?overdue=true` filters on it, so the
+    `open_ap_due_population` filtered by `is_overdue`: the set
+    `GET /api/dashboard`'s `overdue_count` counts and the /cfo card's overdue
+    figure counts. `GET /api/invoices?overdue=true` filters on it, so the
     mobile Overdue card opens a list with exactly the rows it counted.
 
     Uncorrelated (`correlate(None)`): a caller composes it as
@@ -96,13 +141,9 @@ def overdue_invoice_ids(today: date) -> Select:
     the subquery's FROM. The caller's own scope (entity, filters) narrows the
     outer query; this set is deliberately unscoped.
     """
-    latest = latest_schedule_subquery()
+    population = open_ap_due_population()
     return (
-        select(Invoice.id)
-        .outerjoin(latest, latest.c.invoice_id == Invoice.id)
-        .where(
-            Invoice.status.in_(OUTFLOW_STATUSES),
-            is_overdue(effective_due_date(latest), today),
-        )
+        select(population.c.invoice_id)
+        .where(is_overdue(population.c.effective_due, today))
         .correlate(None)
     )

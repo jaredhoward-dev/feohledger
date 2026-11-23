@@ -544,8 +544,10 @@
 	   cells were sized against the one "Loading…" row, then re-sized against
 	   the real rows, so every column slid sideways as the data landed. Fixed
 	   widths come from the header alone and hold from first paint. The
-	   predictable columns get widths sized to their widest content; the text
-	   column carries none and takes the rest. The `min-width` keeps it
+	   predictable columns get widths sized to their widest content in the six
+	   locales (the badges pt-BR "PARCIALMENTE RECEBIDO" and "NÃO VERIFICÁVEL",
+	   the header de "POSITIONEN"); the text column carries none and takes the
+	   rest. The `min-width` keeps it
 	   readable: past it the table scrolls inside its region, which is what a
 	   phone gets (frontend/docs/ui-patterns.md § Data tables). DataTable
 	   renders these `<th>` from `columns`, so the selectors go through
@@ -553,11 +555,11 @@
 	.po-table {
 		min-width: 0;
 	}
-	.po-table :global(table) { min-width: 860px; }
+	.po-table :global(table) { min-width: 1000px; }
 	.po-table :global(th.col-number) { width: 150px; }
-	.po-table :global(th.col-total) { width: 160px; }
-	.po-table :global(th.col-status) { width: 140px; }
-	.po-table :global(th.col-lines) { width: 80px; }
+	.po-table :global(th.col-total) { width: 170px; }
+	.po-table :global(th.col-status) { width: 230px; }
+	.po-table :global(th.col-lines) { width: 120px; }
 	.po-table :global(th.col-created) { width: 130px; }
 	.btn-outline {
 		padding: 8px 16px;

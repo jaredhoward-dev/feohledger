@@ -222,26 +222,50 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   the widest status's button set — they flow onto a second line rather than
   out of the table. Size the actions column for the common case in English
   and let the rest wrap; never widen it to the worst locale's full button row.
+  A single `RowAction` does not wrap inside itself, though, so the column is
+  never narrower than the widest *one* button in any locale. That is also why
+  two row actions share one actions cell rather than each taking a column
+  (the /payments queue's Compare routes and Record as paid).
   A note in an actions cell (the bank-change queue's separation-of-duties
   refusal) is `display: block; white-space: normal`, above the buttons.
   Guard: `tests-e2e/reactivity/layout-stability.spec.ts` opens each page in
-  its `LOCALE_SIZED` set under `de` and `es` and fails if a header, a
-  badge's cell or an action cell has `scrollWidth > clientWidth`; a new
-  fixed table joins that set.
+  its `LOCALE_SIZED` set under `de`, `es`, `fr`, `pt-BR` and `ja` and fails if
+  a header, a badge's cell or an action cell has `scrollWidth > clientWidth`;
+  a new fixed table joins that set. A page whose widest badge needs a row the
+  tenant may not hold (an escalated exception, a partially received PO) gets
+  a `WIDEST_ROW` entry there, which patches the first real row into it. A `SortableHeader` needs 14px more than its
+  word (the arrow and its gap), a `HelpTip` about 22px. **Measure, don't
+  guess:** render each candidate string in a browser with the cell's own font
+  metrics (`th`: 0.72rem/600, uppercase, 0.06em; `<Badge>`: 0.75rem/600,
+  uppercase, 0.03em, plus its 20px padding; `RowAction`: 0.8rem plus 26px of
+  chrome) and take the widest across the six catalogues, then round up to the
+  next 10px with at least 5px to spare. CI's fallback font renders wider than
+  a developer laptop's (the fr badge "COMPTABILISÉE DANS L'ERP" ≈191px
+  locally, ≈234px in CI), so a local measurement gets roughly a quarter more
+  on top, which is how /payments is sized. When the widths that gives no longer
+  leave the text columns room inside the 1388px region a 1666px window gives
+  (`tests-e2e/a11y/wide-layout.spec.ts`), a dense table runs 10px of
+  horizontal cell padding instead of 14px (/exceptions, /invoices,
+  /vendors, /payments) before anything else gives way. A page's other tabs
+  join the guard through its `LOCALE_SIZED_VIEWS` list (/payments' history,
+  runs, rebates and cards tables).
 - **A list page's table is `fixed`.** Under `table-layout: auto` the columns
   are sized against the "Loading…" row and then re-sized against the real
   rows, so every column slides sideways as the data lands. /invoices,
   /payments, /exceptions, /vendors, /purchase-orders, /gl-accounts, the
   screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
-  the users directory, /admin/entities, /admin/api-keys and
-  /admin/access-review are converted, the last three by mounting the table
-  from first paint with DataTable's own loading row rather than swapping a
+  the users directory, /admin/entities, /admin/api-keys,
+  /admin/access-review and both /goods-receipts tabs are converted,
+  /admin/entities, /admin/api-keys, /admin/access-review and the
+  inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string
   in any of the six locales, not the English one; `tests-e2e/reactivity/layout-stability.spec.ts` holds each to a
   cumulative layout shift under 0.1 with production-like API latency and
   checks a `fixed` table's header x positions. A new sidebar page fails that
-  spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`.
+  spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`; a page's second
+  tab with its own table goes in `TAB_PAGES` (`?tab=` href), since a sidebar
+  link only ever opens the first.
 - **Never make a `<td>` / `<th>` `display: flex` (or grid).** It stops being a
   table cell: the column no longer sizes it, so content overflows the table,
   and its border drifts out of line with the row. Lay out inline children with
@@ -999,7 +1023,7 @@ Where each verdict lives (backend gate → field):
 | Exception queue | `decision_refusals.{resolve,dismiss,escalate}` | `api/exceptions.actionable_refusal` + `exception_lifecycle.segregation_refusal` |
 | Credit memos | `actions.{apply,edit,void}` | `_assert_applicable` / `_assert_editable` / `_assert_voidable` |
 | Discount offers | `actions.{accept,decline}`, `capturable_tier_days` (the accept dialog's tiers) | `api/discounts.accept_refusal` / `.decline_refusal` |
-| Experiments | `actions.start` | `api/workflow_experiments.start_refusal` |
+| Experiments | `actions.{start,stop,conclude,delete}` | `api/workflow_experiments.{start,stop,conclude,delete}_refusal`. Every refusal hides the control (`experiment_already_concluded` is the idempotent repeat, nothing to offer; decisions §487) |
 | Adaptive suggestions | `actions.dismiss` | `api/adaptive_workflows.dismiss_refusal` |
 | Vendors | `status_actions.{verify,reject}` | `api/vendors.vendor_status_refusal` |
 | Vendor modal (Find this vendor in the ERP) | `GET /api/vendors/{id}/erp-links` → `search_refusal` (also on the link / unlink responses) | `services/vendor_erp_manual_link.search_refusal`. `vendor_erp_link_exists` replaces the search with its sentence; any other refusal hides it (decisions §415) |
@@ -1007,8 +1031,8 @@ Where each verdict lives (backend gate → field):
 | Screening review queue | `adjudicate_refusal`, `revoke_adjudication_refusal` | `services/sanctions_adjudication.adjudicate_refusal`, `.revoke_refusal` (decisions §477). `role_not_permitted` hides the control; `sanctions_adjudication_segregation` disables Adjudicate beside its sentence; `already_cleared` / `not_active` pick which of the two is shown |
 | Expense reports (list + detail) | `actions.{submit,approve,reject,compose}` | `services/expense_controls.report_{submit,approve,reject,compose}_refusal` |
 | Expense card transactions | `actions.{match,create_expense,unmatch,ignore}` | `services/expense_controls.card_txn_{link,unmatch,ignore}_refusal` |
-| Intake | `actions.{submit,approve,reject,convert,cancel,reopen}` | `services/procurement_controls.intake_transition_refusal` / `.intake_convert_refusal`. Every refusal hides the control; a row that already names its requisition shows the link instead of Convert (which would only replay it) |
-| Requisitions | `actions.{submit,approve,reject,convert,cancel,reopen}` | `services/procurement_controls.requisition_{transition,approve,convert}_refusal`. `requisition_approval_segregation` shows Approve disabled with its reason above it (`RowAction reason`, `approve-refusal-<id>`); every other refusal hides the control; a converted row with its PO hides Convert |
+| Intake | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.intake_transition_refusal` / `.intake_convert_refusal` / `.intake_delete_refusal`. Every refusal hides the control; a row that already names its requisition shows the link instead of Convert (which would only replay it) |
+| Requisitions | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.requisition_{transition,approve,convert,delete}_refusal`. `requisition_approval_segregation` shows Approve disabled with its reason above it (`RowAction reason`, `approve-refusal-<id>`); every other refusal hides the control; a converted row with its PO hides Convert |
 
 Each is pinned by a backend parity test that, for every seeded role and row
 state, asks both sides — the verdict and the real POST — and fails unless they

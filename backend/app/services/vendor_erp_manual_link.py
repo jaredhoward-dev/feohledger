@@ -162,19 +162,22 @@ async def search_refusal(
     return await vendor_link_exists_refusal(db, vendor, realm)
 
 
-async def link_lock(db: AsyncSession, organization_id: uuid.UUID, realm: str) -> None:
+async def link_lock(db: AsyncSession, organization_id: uuid.UUID, realm: str | None) -> None:
     """Take the transaction-scoped lock every writer that can add a new
     holder of a record in ``realm`` holds: this module's link, and
-    ``services/vendor_sync`` (which links records by id and by name). An
-    unlink only clears a link and a merge only moves an existing holder's,
-    so neither takes it. Released at commit or rollback."""
-    await db.execute(
-        select(
-            func.pg_advisory_xact_lock(
-                func.hashtextextended(f"vendor-erp-link:{organization_id}:{realm}", 0)
-            )
-        )
-    )
+    ``services/vendor_sync`` (which links records by id and by name, and
+    creates a vendor for a record nobody holds). An unlink only clears a link
+    and a merge only moves an existing holder's, so neither takes it.
+    Released at commit or rollback.
+
+    ``realm`` None is the no-realm company (links stamped NULL, one company to
+    ``uq_vendors_erp_link``); only the sync writes there, and two no-realm
+    pulls creating a vendor for one new record would otherwise both pass the
+    lookup and the second would fail the index at flush (decisions §489). Its
+    key cannot collide with a named realm's: ``connection_realm`` never
+    returns an empty realm."""
+    key = f"vendor-erp-link:{organization_id}:{'' if realm is None else realm}"
+    await db.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(key, 0))))
 
 
 def _norm_tax(value: str | None) -> str:

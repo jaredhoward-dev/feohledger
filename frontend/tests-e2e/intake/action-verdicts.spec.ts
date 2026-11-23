@@ -7,8 +7,8 @@ import type { Page, Route } from '@playwright/test';
  * status or role rule (frontend/docs/ui-patterns.md § Whether to offer an
  * action).
  *
- * Every refusal those gates give is about the row's status or the reader's
- * role, so the page explains none of them: a refused control is HIDDEN, and a
+ * Every refusal those gates give is about the row's status (Delete: a
+ * conversion it produced) or the reader's role, so the page explains none of them: a refused control is HIDDEN, and a
  * row whose verdict has not arrived offers nothing (fail closed). The status
  * here is deliberately one that the old restated rule would have answered the
  * other way, so a page that went back to reading `status` fails.
@@ -27,7 +27,8 @@ const ALLOW_ALL = {
 	reject: null,
 	convert: null,
 	cancel: null,
-	reopen: null
+	reopen: null,
+	delete: null
 };
 
 function refused(code: string, params: Record<string, unknown> = {}) {
@@ -90,7 +91,8 @@ const CONTROLS = [
 	/^Reject$/,
 	/^Convert to requisition$/,
 	/^Reopen/,
-	/^Cancel$/
+	/^Cancel$/,
+	/^Delete$/
 ] as const;
 
 test.describe('/intake — controls follow the server verdict', () => {

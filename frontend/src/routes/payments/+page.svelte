@@ -763,6 +763,12 @@
 		return !!auth.user && auth.can(PERM_PAYMENT_RECORD_EXTERNAL);
 	}
 
+	/** The queue's actions column is drawn when the caller holds either of
+	 *  its two row actions (compare routes, record as paid). */
+	function hasQueueActions(): boolean {
+		return canCompareRoutes() || canRecordOutside();
+	}
+
 	function canRecordRow(item: QueueItem): boolean {
 		return canRecordOutside() && !item.record_outside_refusal;
 	}
@@ -2417,7 +2423,7 @@
 			isEmpty={queue.length === 0}
 			loading={queueLoading}
 			empty={m('payments.queue.empty')}
-			colspan={8 + (canCompareRoutes() ? 1 : 0) + (canRecordOutside() ? 1 : 0)}
+			colspan={8 + (hasQueueActions() ? 1 : 0)}
 		>
 			{#snippet header()}
 				<tr>
@@ -2429,11 +2435,11 @@
 					<th class="col-discount">{m('payments.col.discount')} <HelpTip term="dynamic-discounting" /></th>
 					<th class="col-terms">{m('payments.col.terms')}</th>
 					<th class="col-queue-status">{m('payments.col.status')}</th>
-					{#if canCompareRoutes()}
-						<th class="right col-routes">{m('payments.col.routes')}</th>
-					{/if}
-					{#if canRecordOutside()}
-						<!-- Row action: record a payment made outside FeohLedger. -->
+					{#if hasQueueActions()}
+						<!-- Row actions: compare routes, record a payment made outside
+						     FeohLedger. One cell for both, so neither needs a fixed
+						     column of its own (a fixed table wraps a cell's buttons
+						     onto a second row instead of overprinting). -->
 						<th class="actions-col"></th>
 					{/if}
 				</tr>
@@ -2539,47 +2545,47 @@
 								</span>
 							{/if}
 						</td>
-						{#if canCompareRoutes()}
-							<!-- Advisory: opening this prices the invoice across the
-							     org's configured processors. It selects nothing and
-							     moves nothing — offered on a BLOCKED row too, because
-							     seeing what a payment would cost is not paying it. -->
-							<td class="right">
-								<RowAction
-									ariaLabel={m('payments.quotes.openAria', {
-										action: m('payments.quotes.open'),
-										invoice: item.invoice_number
-									})}
-									onclick={() => openQuotes(item)}
-								>
-									{m('payments.quotes.open')}
-								</RowAction>
-							</td>
-						{/if}
-						{#if canRecordOutside()}
+						{#if hasQueueActions()}
 							<td class="actions record-cell">
-								<!-- Shown on every row, disabled with its reason when the
-								     server would refuse it whoever records — hiding it left
-								     the operator hunting for an action that was not there. -->
-								<RowAction
-									ariaLabel={m('payments.recordOutside.actionAria', {
-										invoice: item.invoice_number
-									})}
-									disabled={!canRecordRow(item)}
-									describedby={canRecordRow(item) ? undefined : `record-why-${item.id}`}
-									title={canRecordRow(item) ? undefined : recordRefusalText(item)}
-									onclick={() => openRecordOutside(item)}
-								>
-									{m('payments.recordOutside.action')}
-								</RowAction>
-								{#if !canRecordRow(item)}
-									<span
-										class="visually-hidden"
-										id="record-why-{item.id}"
-										data-testid="queue-record-refusal"
+								{#if canCompareRoutes()}
+									<!-- Advisory: opening this prices the invoice across the
+									     org's configured processors. It selects nothing and
+									     moves nothing — offered on a BLOCKED row too, because
+									     seeing what a payment would cost is not paying it. -->
+									<RowAction
+										ariaLabel={m('payments.quotes.openAria', {
+											action: m('payments.quotes.open'),
+											invoice: item.invoice_number
+										})}
+										onclick={() => openQuotes(item)}
 									>
-										{recordRefusalText(item)}
-									</span>
+										{m('payments.quotes.open')}
+									</RowAction>
+								{/if}
+								{#if canRecordOutside()}
+									<!-- Shown on every row, disabled with its reason when the
+									     server would refuse it whoever records — hiding it left
+									     the operator hunting for an action that was not there. -->
+									<RowAction
+										ariaLabel={m('payments.recordOutside.actionAria', {
+											invoice: item.invoice_number
+										})}
+										disabled={!canRecordRow(item)}
+										describedby={canRecordRow(item) ? undefined : `record-why-${item.id}`}
+										title={canRecordRow(item) ? undefined : recordRefusalText(item)}
+										onclick={() => openRecordOutside(item)}
+									>
+										{m('payments.recordOutside.action')}
+									</RowAction>
+									{#if !canRecordRow(item)}
+										<span
+											class="visually-hidden"
+											id="record-why-{item.id}"
+											data-testid="queue-record-refusal"
+										>
+											{recordRefusalText(item)}
+										</span>
+									{/if}
 								{/if}
 							</td>
 						{/if}
@@ -3886,48 +3892,88 @@
 	   `auto` the header cells were sized against the one "Loading…" row and
 	   then re-sized against the real rows, so every column slid sideways as
 	   the data landed. Fixed widths come from the header alone, so they hold
-	   from first paint. The predictable columns (checkbox, numbers, money,
-	   dates, badges, actions) get widths sized to their widest content; the
-	   free-text columns (vendor, reference, run, period) carry none and share
-	   what is left. The `min-width` keeps those readable: past it the table
-	   scrolls inside its region (frontend/docs/ui-patterns.md § Data tables),
-	   which is what a phone gets. The `<th>` render from this page's snippets,
+	   from first paint. The `<th>` render from this page's snippets,
 	   DataTable's `columns`, and SortableHeader alike, so the selectors go
-	   through `:global` under a page-owned wrapper (the /vendors pattern). */
+	   through `:global` under a page-owned wrapper (the /vendors pattern; a
+	   scoped `th` selector never reaches a SortableHeader's cell).
+
+	   Each predictable column is sized to its widest content in the six
+	   locales, measured, plus a quarter for CI's wider fallback font (the fr
+	   badge "COMPTABILISÉE DANS L'ERP" measures ~191px here and ~234px in CI):
+	   a header to its longest word, since a fixed header wraps (de
+	   "FÄLLIGKEITSDATUM", "KONDITIONEN", "RECHNUNGS-NR.", pt-BR "PAGAMENTOS");
+	   a status column to its longest badge, which does not (queue: fr
+	   "COMPTABILISÉE DANS L'ERP"; history: es "RETENCIÓN POR CUMPLIMIENTO";
+	   runs: fr "EXÉCUTION EN COURS"; rebates: es "CONFIRMADO"); an actions
+	   column to its longest single button, since a fixed table wraps a cell's
+	   buttons onto a second row (queue: fr "Enregistrer comme payée"; history:
+	   de "Zahlungseingang akzeptieren"; runs: pt-BR "Repetir sincronização com
+	   o ERP"; rebates: de "Als ausgezahlt markieren"). The method and card
+	   pills carry a processor name and card digits, not a closed set, so they
+	   wrap inside their column instead. The free-text columns (vendor,
+	   reference, run, period) carry no width and share what is left; past the
+	   `min-width` the table scrolls inside its region
+	   (frontend/docs/ui-patterns.md § Data tables), which is what a phone
+	   gets. Cells run 10px of horizontal padding instead of the global 14px
+	   (the /invoices arrangement): that is what keeps the queue and the
+	   history inside the 1388px region a 1666px window gives
+	   (tests-e2e/a11y/wide-layout.spec.ts). Held per locale by
+	   tests-e2e/reactivity/layout-stability.spec.ts (`LOCALE_SIZED`). */
 	.pay-table {
 		min-width: 0;
 	}
+	.pay-table :global(th),
+	.pay-table :global(td) {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+	/* The checkbox hugs its box (the rule below, restated: this one would
+	   otherwise win on specificity). */
+	.pay-table :global(.checkbox-col) { padding-right: 4px; }
 	.pay-table :global(th.checkbox-col) { width: 40px; }
-	.pay-table :global(th.col-number) { width: 140px; }
+	.pay-table :global(th.col-number) { width: 150px; }
 	.pay-table :global(th.col-amount) { width: 140px; }
-	.pay-table :global(th.col-date) { width: 120px; }
-	.pay-table :global(th.col-status) { width: 140px; }
-	.pay-table :global(th.col-count) { width: 100px; }
+	.pay-queue :global(th.col-amount) { width: 132px; }
+	.pay-table :global(th.col-date) { width: 130px; }
+	.pay-table :global(th.col-count) { width: 130px; }
 	.pay-table :global(th.col-card) { width: 150px; }
 	.pay-table :global(th.col-method) { width: 150px; }
+	.pay-queue :global(th.col-date) { width: 170px; }
 	.pay-table :global(th.col-discount) { width: 120px; }
-	.pay-table :global(th.col-terms) { width: 100px; }
+	.pay-table :global(th.col-terms) { width: 135px; }
 	/* Holds the status pill plus, on a blocked row, a wrapping reason chip and
 	   the link to its exception. */
-	.pay-table :global(th.col-queue-status) { width: 190px; }
-	/* "Compare routes" and "Record as paid" are sized for their longest
-	   locale (fr: "Comparer les routes", "Enregistrer comme payée"): the
-	   RowAction never wraps, so a narrower column spills the button out of
-	   its cell. Label + 26px button chrome + 28px cell padding. */
-	.pay-table :global(th.col-routes) { width: 180px; }
-	.pay-queue :global(th.actions-col) { width: 215px; }
-	.pay-history :global(th.actions-col) { width: 260px; }
-	.pay-runs :global(th.actions-col) { width: 190px; }
-	.pay-rebates :global(th.actions-col) { width: 150px; }
+	.pay-table :global(th.col-queue-status) { width: 270px; }
+	.pay-history :global(th.col-status) { width: 300px; }
+	.pay-runs :global(th.col-status) { width: 220px; }
+	.pay-rebates :global(th.col-status) { width: 160px; }
+	/* Card statuses render raw today (docs/followups.md § "Virtual-card
+	   statuses render untranslated"); resize this when they get labels. */
+	.pay-cards :global(th.col-status) { width: 150px; }
+	/* The queue's one actions cell holds "Compare routes" and "Record as
+	   paid"; the column is the longer of the two. */
+	.pay-queue :global(th.actions-col) { width: 240px; }
+	.pay-history :global(th.actions-col) { width: 280px; }
+	.pay-runs :global(th.actions-col) { width: 300px; }
+	.pay-rebates :global(th.actions-col) { width: 250px; }
 	.pay-cards :global(th.actions-col) { width: 130px; }
-	/* The fixed queue columns sum to 1245px; 1385 leaves the vendor 140px and
-	   still fits the 1388px region the 1666px layout gives the table
-	   (tests-e2e/a11y/wide-layout.spec.ts: at 1666px a table fits outright). */
-	.pay-queue :global(table) { min-width: 1385px; }
-	.pay-history :global(table) { min-width: 1250px; }
-	.pay-runs :global(table) { min-width: 960px; }
-	.pay-rebates :global(table) { min-width: 820px; }
-	.pay-cards :global(table) { min-width: 1100px; }
+	.pay-table :global(.badge.method-badge),
+	.pay-table :global(.badge.card-badge) {
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+	/* Each min-width is the fixed columns' sum plus ~110px per free-text
+	   column. The queue's fixed columns sum to 1257px and the history's to
+	   1150px, so both stay inside the 1388px region at 1666px. The queue's
+	   due date (170px) and amount (132px) are the widths /invoices holds the
+	   same headers to, measured in CI in every locale; together with a 240px
+	   actions cell they leave Vendor ~123px, which fits fr "FOURNISSEUR"
+	   (110px in CI's font, the round-35 run that found a 100px column). */
+	.pay-queue :global(table) { min-width: 1380px; }
+	.pay-history :global(table) { min-width: 1370px; }
+	.pay-runs :global(table) { min-width: 1160px; }
+	.pay-rebates :global(table) { min-width: 940px; }
+	.pay-cards :global(table) { min-width: 1110px; }
 
 	/* --- Queue selection & payment --- */
 

@@ -191,6 +191,7 @@ export interface RequisitionActions {
 	convert: ActionRefusal;
 	cancel: ActionRefusal;
 	reopen: ActionRefusal;
+	delete: ActionRefusal;
 }
 
 export interface RequisitionListResponse {

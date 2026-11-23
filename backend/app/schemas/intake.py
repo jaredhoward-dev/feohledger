@@ -87,6 +87,7 @@ class IntakeActions(BaseModel):
     convert: CodedRefusal | None
     cancel: CodedRefusal | None
     reopen: CodedRefusal | None
+    delete: CodedRefusal | None
 
 
 class IntakeRequestResponse(BaseModel):

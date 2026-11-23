@@ -162,8 +162,12 @@ traceability. The conversion is audited (`requisition.converted_to_po`).
   bought twice. Guarding it here closes that at the application layer instead
   of relying on the FK's `ON DELETE` mode never changing.
 
-An ordinary `draft` (or rejected / cancelled) requisition still deletes
-normally — the guard is narrow by design.
+Every other requisition still deletes, whatever its status — the guard is
+narrow by design. Both refusals are coded (`requisition_delete_converted`,
+`requisition_delete_from_intake`) and come from
+`services/procurement_controls.requisition_delete_refusal`, the gate each row's
+`actions.delete` is built from, so /requisitions offers Delete exactly where it
+succeeds (it used to restate `status === 'draft'`; decisions §487).
 
 ## Endpoints
 

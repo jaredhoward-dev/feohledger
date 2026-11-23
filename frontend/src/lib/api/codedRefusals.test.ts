@@ -420,6 +420,18 @@ describe('codedRefusalText', () => {
 		expect(codedRefusalText('intake_status_refused', {}, enT)).toBeNull();
 	});
 
+	it('states each procurement delete refusal in its own sentence', () => {
+		expect(codedRefusalText('intake_delete_converted', {}, enT)).toBe(
+			EN_ALL['refusal.intakeDeleteConverted']
+		);
+		expect(codedRefusalText('requisition_delete_converted', {}, enT)).toBe(
+			EN_ALL['refusal.requisitionDeleteConverted']
+		);
+		expect(codedRefusalText('requisition_delete_from_intake', {}, enT)).toBe(
+			EN_ALL['refusal.requisitionDeleteFromIntake']
+		);
+	});
+
 	it('says a requisition, not an invoice, when its requester or editor would approve it', () => {
 		const text = codedRefusalText('requisition_approval_segregation', {}, enT);
 		expect(text).toBe(EN_ALL['refusal.requisitionApprovalSegregation']);

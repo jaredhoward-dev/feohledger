@@ -112,8 +112,9 @@ Existing fields stay: `pipeline`, `vendor_spend`, `aging`,
   was a partial slice of a month — sometimes a seventh, stub bucket of a
   fortnight's data — that reads as a spend collapse and shifts every single day
   as the window slides.
-- `upcoming_payments` — the (at most ten) unpaid invoices due within seven days
-  or overdue. Each row's `amount` is the invoice's **face** amount, in the
+- `upcoming_payments` — the (at most ten) unpaid invoices due within
+  `open_ap_due.DUE_SOON_DAYS` (seven) days or overdue, the same constant
+  `due_soon_count` reads, so the two windows cannot drift. Each row's `amount` is the invoice's **face** amount, in the
   row's own `currency` (the invoice's) — not a reporting figure. Label each row
   with that code, never with `reporting.reporting_currency` or the org's: the
   row carried no code until `docs/decisions.md` §200, so the web dashboard
@@ -1091,7 +1092,10 @@ AP the business was already late paying. Probed: USD 1,000 due yesterday + USD
 The rule now:
 
 - `commitment_rows` keeps the row, flags it `overdue: True` and leaves its real
-  `due_date` alone. The SQL bound is on the future edge only.
+  `due_date` alone. The SQL bound is on the future edge only. The row set, its
+  effective due date and the flag come from `services/open_ap_due`
+  (`open_ap_due_population`, `is_overdue`), the select the dashboard's
+  `overdue_*` and `GET /api/invoices?overdue=true` join too.
 - `services/analytics.bucket_outflows` times a flagged row on **today** — it
   cannot leave in the past — so it lands in the period containing today, the
   forecast's first. It counts in `scheduled_amount` and `count` and on its own

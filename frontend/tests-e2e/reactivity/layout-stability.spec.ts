@@ -219,6 +219,7 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/vendors', fixedTable: '.vendor-table table' },
 	{ href: '/purchase-orders', fixedTable: '.po-table table' },
 	{ href: '/gl-accounts', fixedTable: '.gl-table table' },
+	{ href: '/goods-receipts', fixedTable: '.receipts-table table' },
 	{ href: '/credit-memos' },
 	{ href: '/expenses' },
 	{ href: '/contracts' },
@@ -241,13 +242,30 @@ const LIST_PAGES: ListPage[] = [
 ];
 
 /**
- * The fixed tables whose widths are sized to the longest locale (round 32's
- * and round 33's conversions; frontend/docs/ui-patterns.md § Data tables). The six earlier
- * fixed tables (/invoices, /payments, /exceptions, /vendors, /purchase-orders,
- * /gl-accounts) were sized to English and are not yet held to it —
- * docs/followups.md § "Six fixed list tables are sized to English".
+ * Second tabs of a measured page, each its own table: a sidebar link opens a
+ * page on its first tab, so `LIST_PAGES` alone would never measure these.
+ * Measured exactly like `LIST_PAGES`; not part of the sidebar classification
+ * (their pathname must be a `LIST_PAGES` page — the guard test checks).
+ */
+const TAB_PAGES: ListPage[] = [
+	{ href: '/goods-receipts?tab=inspections', fixedTable: '.inspections-table table' }
+];
+
+const MEASURED_PAGES: ListPage[] = [...LIST_PAGES, ...TAB_PAGES];
+
+/**
+ * The fixed tables whose widths are sized to the longest locale
+ * (frontend/docs/ui-patterns.md § Data tables).
  */
 const LOCALE_SIZED = new Set([
+	'/invoices',
+	'/payments',
+	'/exceptions',
+	'/vendors',
+	'/purchase-orders',
+	'/gl-accounts',
+	'/goods-receipts',
+	'/goods-receipts?tab=inspections',
 	'/vendors/screening',
 	'/vendors/change-requests',
 	'/requisitions',
@@ -265,18 +283,35 @@ const LOCALE_SIZED = new Set([
 	'/admin/access-review'
 ]);
 
-/** The locales whose strings run longest against the English widths. */
-const OVERFLOW_LOCALES = ['de', 'es'] as const;
+/**
+ * Locale-sized tables a sidebar link does not open by itself: /payments' other
+ * tabs (the cards tab holds two tables). Held to the same per-locale check as
+ * the `LOCALE_SIZED` pages; `label` names the test. The e2e seed holds no
+ * virtual card or rebate, so those two are measured on their headers and
+ * empty row only; their badge widths rest on the page's own measurement.
+ */
+const LOCALE_SIZED_VIEWS: (ListPage & { fixedTable: string; label: string })[] = [
+	{ href: '/payments?tab=history', fixedTable: '.pay-history table', label: '/payments history' },
+	{ href: '/payments?tab=runs', fixedTable: '.pay-runs table', label: '/payments runs' },
+	{ href: '/payments?tab=cards', fixedTable: '.pay-rebates table', label: '/payments rebates' },
+	{ href: '/payments?tab=cards', fixedTable: '.pay-cards table', label: '/payments cards' }
+];
+
+/**
+ * The locales whose strings run longest against the English widths: de and es
+ * for most headers and buttons, and the ones the widest badges come from
+ * (fr "COMPTABILISÉE DANS L'ERP"; pt-BR "PARCIALMENTE RECEBIDO", "PRECISA DE
+ * UMA DECISÃO", "COMPARTILHADA"; ja "エスカレーション済み").
+ */
+const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
  * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers twenty-six pages"): moving
+ * (docs/followups.md § "The layout-shift budget covers twenty-seven pages"): moving
  * one into `LIST_PAGES` is the whole change once its reason is fixed.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
-	'/goods-receipts':
-		'Unmeasured: the receipts and inspections tables are still table-layout: auto with unsized columns — see docs/followups.md',
 	'/discounts':
 		'Unmeasured: the warning banners and the optimizer panel above the offers table mount once the dashboard lands — see docs/followups.md',
 	'/audit':
@@ -391,9 +426,15 @@ test.describe('list pages stay within the layout-shift budget', () => {
 		for (const href of [...measured, ...Object.keys(NOT_LIST_PAGES)]) {
 			expect(NAV_HREFS, `${href} is no longer a sidebar destination`).toContain(href);
 		}
+		for (const { href } of TAB_PAGES) {
+			const pathname = new URL(href, 'http://x').pathname;
+			expect([...measured], `${href} is a tab of a page LIST_PAGES does not measure`).toContain(
+				pathname
+			);
+		}
 	});
 
-	for (const { href, fixedTable } of LIST_PAGES) {
+	for (const { href, fixedTable } of MEASURED_PAGES) {
 		test(`${href}: cumulative layout shift stays under ${CLS_BUDGET}`, async ({ page }) => {
 			await observeLayoutShifts(page);
 			await page.goto(START);
@@ -481,6 +522,91 @@ async function overflowingCells(table: Locator): Promise<string[]> {
 	});
 }
 
+/**
+ * The row each page's widest badge needs, which the shard's tenant need not
+ * hold: the page's real list response, with its first row turned into that
+ * row. Patching a real row keeps the response's shape the backend's own.
+ * `badge` is the badge that must then be on screen, so a tenant with no row
+ * to patch fails here instead of passing without measuring anything.
+ */
+type Row = Record<string, unknown>;
+const WIDEST_ROW: Record<string, { pathname: string; patch: (row: Row) => Row; badge: string }> = {
+	'/invoices': {
+		pathname: '/api/invoices',
+		patch: (row) => ({ ...row, status: 'posted_in_erp' }),
+		badge: '.badge.posted_in_erp'
+	},
+	'/payments': {
+		pathname: '/api/payments/queue',
+		patch: (row) => ({ ...row, status: 'posted_in_erp' }),
+		badge: '.badge.posted_in_erp'
+	},
+	'/payments?tab=history': {
+		pathname: '/api/payments',
+		patch: (row) => ({ ...row, status: 'pending_compliance' }),
+		badge: '.badge.pending_compliance'
+	},
+	'/payments?tab=runs': {
+		pathname: '/api/payments/runs/',
+		patch: (row) => ({ ...row, status: 'executing' }),
+		badge: '.badge.executing'
+	},
+	'/exceptions': {
+		pathname: '/api/exceptions',
+		patch: (row) => ({ ...row, status: 'escalated' }),
+		badge: '.badge.badge-escalated'
+	},
+	'/vendors': {
+		pathname: '/api/vendors',
+		patch: (row) => ({ ...row, status: 'unverified', screening_status: 'review', source: 'erp_sync' }),
+		badge: '.badge.unverified'
+	},
+	'/purchase-orders': {
+		pathname: '/api/purchase-orders',
+		patch: (row) => ({
+			...row,
+			status: 'partially_received',
+			total: null,
+			total_unverifiable_reason: 'unpriceable'
+		}),
+		badge: '.badge.partially_received'
+	},
+	'/gl-accounts': {
+		pathname: '/api/gl-accounts',
+		patch: (row) => ({
+			...row,
+			entity_id: null,
+			erp_account_id: null,
+			erp_link_candidates: {
+				reason: 'duplicate_code',
+				accounts: [{ erp_account_id: 'erp-layout-1', code: '6000', name: 'Layout fixture' }]
+			}
+		}),
+		badge: '.badge.needs-decision'
+	},
+	'/goods-receipts': {
+		pathname: '/api/goods-receipts',
+		patch: (row) => ({ ...row, status: 'reversed' }),
+		badge: '.badge.reversed'
+	}
+};
+
+/** Answer `pathname` with the backend's own list, its first row patched. */
+async function patchFirstRow(page: Page, pathname: string, patch: (row: Row) => Row) {
+	await page.route(
+		(url) => url.pathname === pathname,
+		async (route) => {
+			if (route.request().method() !== 'GET') return route.fallback();
+			const response = await route.fetch();
+			const body = await response.json();
+			// /api/gl-accounts is a bare array; every other list is `{ items }`.
+			const rows: Row[] = Array.isArray(body) ? body : body.items;
+			if (rows.length > 0) rows[0] = patch(rows[0]);
+			await route.fulfill({ response, json: body });
+		}
+	);
+}
+
 /** One pending bank change the caller may not approve: the row that carries
  *  the separation-of-duties note above its buttons. */
 const REFUSED_CHANGE_REQUEST = {
@@ -502,11 +628,35 @@ const REFUSED_CHANGE_REQUEST = {
 	}
 };
 
+/** One partially accepted inspection: the Result column's widest badge (fr
+ *  "ACCEPTATION PARTIELLE"). The lean e2e seed records no inspections, so the
+ *  tab's list is answered with this row rather than patched. */
+const PARTIAL_INSPECTION = {
+	id: '00000000-0000-4000-8000-000000000331',
+	inspection_number: 'INS-2026-00001',
+	po_id: null,
+	gr_id: '00000000-0000-4000-8000-000000000332',
+	gr_number: 'GR-2026-00001',
+	result: 'partial',
+	inspected_date: '2026-11-01',
+	inspector: 'Layout Fixture',
+	accepted_quantity: 8,
+	rejected_quantity: 2,
+	deviation_notes: 'Two cartons crushed in transit',
+	status: 'completed',
+	created_at: '2026-11-01T09:00:00Z'
+};
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
-		for (const { href, fixedTable } of LIST_PAGES) {
-			if (!fixedTable || !LOCALE_SIZED.has(href)) continue;
-			test(`${href} (${locale}): no header, badge or action cell overflows its column`, async ({
+		const tables = [
+			...MEASURED_PAGES.flatMap(({ href, fixedTable }) =>
+				fixedTable && LOCALE_SIZED.has(href) ? [{ href, fixedTable, label: href }] : []
+			),
+			...LOCALE_SIZED_VIEWS
+		];
+		for (const { href, fixedTable, label } of tables) {
+			test(`${label} (${locale}): no header, badge or action cell overflows its column`, async ({
 				page
 			}) => {
 				if (href === '/vendors/change-requests') {
@@ -520,6 +670,19 @@ test.describe('fixed list tables fit their longest locale', () => {
 							})
 					);
 				}
+				if (href === '/goods-receipts?tab=inspections') {
+					await page.route(
+						(url) => url.pathname === '/api/inspections',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({
+										json: { items: [PARTIAL_INSPECTION], total: 1, page: 1, page_size: 20 }
+									})
+								: route.fallback()
+					);
+				}
+				const widest = WIDEST_ROW[href];
+				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
 				await page.goto(href);
 				await expect(page.locator('html')).toHaveAttribute('lang', locale);
@@ -531,6 +694,10 @@ test.describe('fixed list tables fit their longest locale', () => {
 				await expect(table.locator('[data-testid="table-empty"] [role="status"]')).toHaveCount(0);
 				if (href === '/vendors/change-requests') {
 					await expect(table.locator('.refusal-note')).toBeVisible();
+				}
+				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
+				if (href === '/goods-receipts?tab=inspections') {
+					await expect(table.locator('.badge.partial')).toBeVisible();
 				}
 				await nextFrames(page);
 
