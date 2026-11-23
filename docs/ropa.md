@@ -23,7 +23,7 @@ transfer mechanism changes.
 | Recipients / sub-processors (who else touches the data) | [`docs/sub-processors.md`](sub-processors.md) — internal working copy; the published register is `/legal/sub-processors` |
 | Retention periods (how the windows are enforced) | [`backend/docs/retention.md`](../backend/docs/retention.md) |
 | International transfers / data residency | [`docs/data-residency.md`](data-residency.md) |
-| Breach notification procedure | [`docs/founder-runbooks/breach-notification.md`](founder-runbooks/breach-notification.md) |
+| Breach notification procedure | [`docs/founder-runbooks/breach-notification.md`](founder-runbooks/breach-notification.md) — GDPR Art. 33's 72 hours to the authority, the processor's "without undue delay" to each controller, and the 24-hour notices the connected platforms' developer terms require (its § 3a) |
 | Cookie / non-essential consent | `frontend/src/lib/components/ConsentBanner.svelte` (banner) |
 
 Retention windows below are summarized from
