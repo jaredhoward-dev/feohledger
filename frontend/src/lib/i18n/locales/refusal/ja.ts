@@ -265,6 +265,7 @@ export const messages = {
 	'refusal.csvInvoiceNumberRequired': "invoice_number 列が空のため、この行はインポートされませんでした。",
 	'refusal.csvVendorRequired': "この行には仕入先が指定されていないため、インポートされませんでした。vendor_name または vendor_code を入力してください。",
 	'refusal.csvVendorCodeAmbiguous': "vendor_code {value} は 1 つの仕入先を特定できません。複数の仕入先がこのコードを持っているか、仕入先がリンクされている ERP レコード ID です。この行はインポートされませんでした。他の仕入先が持っていないコードを設定するか、同じ仕入先であれば統合してください。",
+	'refusal.csvVendorCodeIsErpLink': "仕入先 {name} は作成されませんでした。コード {value} は、仕入先 {vendor} がリンクされている ERP レコード ID です。この仕入先には別のコードを設定してください。",
 	'refusal.csvAmountMissing': "amount 列が空のため、この行はインポートされませんでした。",
 	'refusal.csvAmountInvalid': "金額 {value} は 0 以上の有効な金額ではないため、この行はインポートされませんでした。",
 	'refusal.csvCurrencyRequired': "currency 列が空のため、この行はインポートされませんでした。この行の 3 文字の通貨コード (USD、EUR など) を入力してください。通貨が空欄の場合に推定されることはありません。",

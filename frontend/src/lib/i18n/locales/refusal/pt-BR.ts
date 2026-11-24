@@ -265,6 +265,7 @@ export const messages = {
 	'refusal.csvInvoiceNumberRequired': "A coluna invoice_number está vazia, por isso esta linha não foi importada.",
 	'refusal.csvVendorRequired': "Esta linha não indica nenhum fornecedor, por isso não foi importada. Preencha vendor_name ou vendor_code.",
 	'refusal.csvVendorCodeAmbiguous': "O vendor_code {value} não identifica um único fornecedor: mais de um fornecedor o possui, ou é o ID de registro do ERP pelo qual um fornecedor está vinculado. Esta linha não foi importada. Dê ao fornecedor um código que nenhum outro possua, ou mescle os fornecedores se forem o mesmo.",
+	'refusal.csvVendorCodeIsErpLink': "O fornecedor {name} não foi criado: o código {value} é o ID de registro do ERP pelo qual o fornecedor {vendor} está vinculado. Dê ao fornecedor um código diferente.",
 	'refusal.csvAmountMissing': "A coluna amount está vazia, por isso esta linha não foi importada.",
 	'refusal.csvAmountInvalid': "O valor {value} não é um valor válido igual ou maior que zero, por isso esta linha não foi importada.",
 	'refusal.csvCurrencyRequired': "A coluna currency está vazia, por isso esta linha não foi importada. Informe o código de moeda de três letras da linha, como USD ou EUR; uma moeda ausente nunca é presumida.",

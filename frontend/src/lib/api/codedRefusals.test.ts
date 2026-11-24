@@ -1413,6 +1413,12 @@ describe('why /cards/generate minted nothing, and the CSV near-duplicate rows', 
 			'refusal.csvVendorCodeAmbiguous',
 			{ value: 'V001' }
 		],
+		[
+			'csv_vendor_code_is_erp_link',
+			{ value: '77', name: 'Acme Corp', vendor: 'Seventy Seven' },
+			'refusal.csvVendorCodeIsErpLink',
+			{ value: '77', name: 'Acme Corp', vendor: 'Seventy Seven' }
+		],
 		['csv_amount_invalid', { value: 'ten' }, 'refusal.csvAmountInvalid', { value: 'ten' }],
 		['csv_amount_invalid', { value: '' }, 'refusal.csvAmountMissing', {}],
 		['csv_currency_required', {}, 'refusal.csvCurrencyRequired', {}],
@@ -1469,6 +1475,9 @@ describe('why /cards/generate minted nothing, and the CSV near-duplicate rows', 
 		expect(codedRefusalText('csv_status_invalid', {}, enT)).toBeNull();
 		expect(codedRefusalText('csv_status_not_importable', { status: 3 }, enT)).toBeNull();
 		expect(codedRefusalText('csv_status_records_history', {}, enT)).toBeNull();
+		expect(
+			codedRefusalText('csv_vendor_code_is_erp_link', { value: '77', name: 'Acme Corp' }, enT)
+		).toBeNull();
 	});
 });
 
