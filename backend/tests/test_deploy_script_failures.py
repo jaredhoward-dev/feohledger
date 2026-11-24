@@ -340,8 +340,32 @@ def _erasure(tmp_path: Path, queue: str) -> Deploy:
     return d
 
 
+def _night(days_ago: int) -> str:
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=days_ago)).date().isoformat()
+
+
+def _nights(*days_ago: int) -> str:
+    """A `CommonPrefixes[].Prefix` text answer: tab-separated date prefixes."""
+    return "\\t".join(f"pg/{_night(n)}/" for n in days_ago) + "\\n"
+
+
+def _listing(database: str) -> str:
+    """The rule pattern that matches only the erase listing (every version and
+    delete marker) of ``database`` — not its dump-dates listing, not a delete."""
+    return f"/{database}.dump')]][]"
+
+
+def _dates(database: str) -> str:
+    """The rule pattern for the dump-dates listing (versions only) of ``database``."""
+    return f"/{database}.dump')].Key"
+
+
 def _run_erasure(d: Deploy, *args: str) -> subprocess.CompletedProcess[str]:
-    # After the test's own rules, so a test's rule for a call wins.
+    # After the test's own rules, so a test's rule for a call wins. By default
+    # the nightly backups are current (last night and the two before).
+    d.rule("aws", "--delimiter", 0, _nights(10, 2, 1, 0))
     d.rule("aws", "send-command", 0, "cmd-1\\n")
     d.rule("aws", "--query Status", 0, "Success\\n")
     d.rule("aws", "StandardOutputContent", 0, d.queue)  # type: ignore[attr-defined]
@@ -359,7 +383,7 @@ def _run_erasure(d: Deploy, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _queue(*entries: tuple[str, str, str | None]) -> str:
+def _queue(*entries: tuple[str, str, str | None], age: int = 30, total: int | None = None) -> str:
     import json
 
     owed = [
@@ -367,13 +391,15 @@ def _queue(*entries: tuple[str, str, str | None]) -> str:
             "organization_id": org,
             "slug": slug,
             "database": f"feoh_{slug}",
-            "age_days": 3,
+            "closed_on": _night(age),
+            "age_days": age,
             "blocked": b,
         }
         for org, slug, b in entries
     ]
+    body = {"owed": owed, "total": len(owed) if total is None else total}
     # printf %b in the stub: no backslashes in the JSON, and no `|` (the rule separator).
-    return "booting\\nFEOH_ERASURE " + json.dumps({"owed": owed}) + "\\n"
+    return "booting\\nFEOH_ERASURE " + json.dumps(body) + "\\n"
 
 
 def _not_masked(result: subprocess.CompletedProcess[str], *values: str) -> list[str]:
@@ -390,8 +416,8 @@ def _not_masked(result: subprocess.CompletedProcess[str], *values: str) -> list[
 
 def test_erasure_check_writes_counts_and_names_nothing(tmp_path: Path) -> None:
     summary = (
-        '{"blocked": 1, "oldest_age_days": 50, "overdue": 1, "overdue_after_days": 45, '
-        '"owed": 3, "ready": 2}'
+        '{"blocked": 1, "cool_off_days": 7, "cooling": 0, "oldest_age_days": 50, "overdue": 1, '
+        '"overdue_after_days": 45, "owed": 3, "ready": 2}'
     )
     d = _erasure(tmp_path, f"FEOH_ERASURE {summary}\\n")
 
@@ -400,7 +426,7 @@ def test_erasure_check_writes_counts_and_names_nothing(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert (d.root / "github_output").read_text() == "ready=2\nblocked=1\noverdue=1\n"
     assert d.called("--document-name feohledger-backup-erasure-summary")
-    assert not d.called("s3api")
+    assert not d.called("s3api"), "the check role has no S3 access"
 
 
 def test_erasure_check_fails_on_a_summary_it_cannot_read(tmp_path: Path) -> None:
@@ -416,7 +442,7 @@ def test_erasure_deletes_every_version_verifies_and_marks(tmp_path: Path) -> Non
     d = _erasure(tmp_path, _queue((ORG, "acme", None)))
     listing = "pg/2026-11-01/feoh_acme.dump\\tv1\\npg/2026-11-02/feoh_acme.dump\\tv2\\n"
     # The first listing finds two versions; the re-listing after the deletes, none.
-    d.rule("aws", "/feoh_acme.dump", 0, listing, once=True)
+    d.rule("aws", _listing("feoh_acme"), 0, listing, once=True)
 
     result = _run_erasure(d, "erase")
 
@@ -436,8 +462,8 @@ def test_erasure_deletes_every_version_verifies_and_marks(tmp_path: Path) -> Non
 
 def test_erasure_that_leaves_a_version_behind_is_not_marked(tmp_path: Path) -> None:
     d = _erasure(tmp_path, _queue((ORG, "acme", None), (ORG_B, "beta", None)))
-    d.rule("aws", "/feoh_acme.dump", 0, "pg/2026-11-01/feoh_acme.dump\\tv1\\n")
-    d.rule("aws", "/feoh_beta.dump", 0, "pg/2026-11-01/feoh_beta.dump\\tv9\\n", once=True)
+    d.rule("aws", _listing("feoh_acme"), 0, "pg/2026-11-01/feoh_acme.dump\\tv1\\n")
+    d.rule("aws", _listing("feoh_beta"), 0, "pg/2026-11-01/feoh_beta.dump\\tv9\\n", once=True)
 
     result = _run_erasure(d, "erase")
 
@@ -452,7 +478,7 @@ def test_erasure_that_leaves_a_version_behind_is_not_marked(tmp_path: Path) -> N
 
 def test_erasure_that_cannot_delete_is_not_marked(tmp_path: Path) -> None:
     d = _erasure(tmp_path, _queue((ORG, "acme", None)))
-    d.rule("aws", "/feoh_acme.dump", 0, "pg/2026-11-01/feoh_acme.dump\\tv1\\n", once=True)
+    d.rule("aws", _listing("feoh_acme"), 0, "pg/2026-11-01/feoh_acme.dump\\tv1\\n", once=True)
     d.rule("aws", "delete-object", 254, "An error occurred (AccessDenied)\\n")
 
     result = _run_erasure(d, "erase")
@@ -468,7 +494,9 @@ def test_erasure_skips_a_blocked_workspace_and_fails_for_a_human(tmp_path: Path)
 
     assert result.returncode != 0
     assert "slug_in_use" in result.stderr
-    assert not d.called("s3api")
+    # Only the bucket-wide freshness listing ran; nothing of this tenant's.
+    assert not d.called("feoh_acme")
+    assert not d.called("delete-object")
     assert not d.called("mark-cleared")
 
 
@@ -477,14 +505,26 @@ def test_erasure_refuses_a_database_name_that_is_not_a_tenant_dump(tmp_path: Pat
     import json
 
     queue = "FEOH_ERASURE " + json.dumps(
-        {"owed": [{"organization_id": ORG, "slug": "x", "database": "feohledger", "blocked": None}]}
+        {
+            "owed": [
+                {
+                    "organization_id": ORG,
+                    "slug": "x",
+                    "database": "feohledger",
+                    "closed_on": _night(30),
+                    "age_days": 30,
+                    "blocked": None,
+                }
+            ]
+        }
     )
     d = _erasure(tmp_path, queue + "\\n")
 
     result = _run_erasure(d, "erase")
 
     assert result.returncode != 0
-    assert not d.called("s3api")
+    assert not d.called("feohledger.dump")
+    assert not d.called("delete-object")
     assert not d.called("mark-cleared")
 
 
@@ -914,3 +954,119 @@ def test_portability_guard_catches(line: str) -> None:
 )
 def test_portability_guard_allows(line: str) -> None:
     assert not any(re.search(p, line) for p in _GNU_ISMS), line
+
+
+# The checks the VM cannot influence (decisions §490): a compromised VM could
+# list a live tenant as owed, so the job checks the bucket itself first.
+
+
+def test_erasure_refuses_everything_when_backups_are_stale(tmp_path: Path) -> None:
+    """(a) No recent night means a live tenant cannot be told from a removed one."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    d.rule("aws", "--delimiter", 0, _nights(9, 4, 3))
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "older than 2 days" in result.stderr
+    assert not d.called("delete-object")
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_refuses_everything_without_a_nightly_prefix(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    d.rule("aws", "--delimiter", 0, "None\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert not d.called("delete-object")
+
+
+def test_erasure_fails_red_on_a_tenant_dumped_after_its_removal(tmp_path: Path) -> None:
+    """(b) backup.sh dumps every feoh_* database nightly; a dump dated after
+    the closure means the database was there to dump — a forged entry naming a
+    live tenant, or a removal that failed. Never erased, never marked."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=30))
+    d.rule(
+        "aws",
+        _dates("feoh_acme"),
+        0,
+        f"pg/{_night(31)}/feoh_acme.dump\\tpg/{_night(0)}/feoh_acme.dump\\n",
+    )
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "AFTER its recorded removal" in result.stderr
+    assert not d.called("delete-object")
+    assert not d.called("mark-cleared")
+    assert not _not_masked(result, ORG, "acme", "feoh_acme")
+
+
+def test_erasure_defers_a_tenant_still_in_the_newest_nights(tmp_path: Path) -> None:
+    """(b) A dump on or before the closure, but in one of the newest three
+    nights: a restore window. Deferred — not a failure, not marked."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=8))
+    d.rule(
+        "aws",
+        _dates("feoh_acme"),
+        0,
+        f"pg/{_night(9)}/feoh_acme.dump\\tpg/{_night(2)}/feoh_acme.dump\\n",
+    )
+    # Freshness: nights 10, 2, 1, 0 — and a closure dated 8 days ago, so the
+    # night 2 days ago would be "after" it. Make the entry's closure match it.
+    d.queue = _queue((ORG, "acme", None), age=8).replace(_night(8), _night(2))  # type: ignore[attr-defined]
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode == 0, result.stderr
+    assert "deferred" in result.stdout and "Deferred: 1" in result.stdout
+    assert not d.called("delete-object")
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_defers_a_removal_inside_the_cool_off(tmp_path: Path) -> None:
+    """(c) A week's cool-off for a mistaken removal."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=3))
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode == 0, result.stderr
+    assert "deferred until 7" in result.stdout
+    assert not d.called("delete-object")
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_erases_once_out_of_the_recent_nights(tmp_path: Path) -> None:
+    """Dumps only from before the newest three nights, and older than the
+    cool-off: erased."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=10))
+    d.rule("aws", _dates("feoh_acme"), 0, f"pg/{_night(10)}/feoh_acme.dump\\n")
+    d.rule("aws", _listing("feoh_acme"), 0, f"pg/{_night(10)}/feoh_acme.dump\\tv1\\n", once=True)
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode == 0, result.stderr
+    assert d.called(f"--key pg/{_night(10)}/feoh_acme.dump --version-id v1")
+    assert d.called(f"OrganizationId={ORG},RunId=987")
+
+
+def test_the_cool_off_matches_the_backend(tmp_path: Path) -> None:
+    """The daily check counts an entry as ready only past
+    `workspace_closure.ERASURE_COOL_OFF`; the erase job defers by the same
+    number, or it would ask for approvals it then refuses."""
+    from app.services.workspace_closure import ERASURE_COOL_OFF
+
+    script = (DEPLOY / "backup-erasure.sh").read_text()
+    assert f"COOL_OFF_DAYS={ERASURE_COOL_OFF.days}\n" in script
+
+
+def test_erasure_says_when_the_queue_is_longer_than_one_batch(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), total=73))
+    d.rule("aws", _listing("feoh_acme"), 0, "", once=True)
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode == 0, result.stderr
+    assert "73 workspace(s) are owed; this run takes the oldest 1" in result.stdout

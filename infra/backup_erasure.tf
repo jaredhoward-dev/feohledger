@@ -10,8 +10,11 @@
 #   feohledger-backup-erasure-check  the daily `check` job, no environment,
 #       trusted for refs/heads/main only. May run ONE document on the VM: the
 #       read-only `summary`, which prints counts. No S3 at all.
-#   feohledger-backup-erasure        the `erase` job, in the `production`
-#       environment (required reviewer), trusted for that environment only.
+#   feohledger-backup-erasure        the `erase` job, in its own
+#       `backup-erasure` environment (required reviewer, `main` only), trusted
+#       for that environment only. Not `production`: aws-deploy.yml and
+#       aws-oidc-preflight.yml run in it and can be dispatched from any branch,
+#       so its subject would let any approved run of them assume this role.
 #       Runs the read-only `owed` document and the `mark-cleared` document, may
 #       list object versions under `pg/` only, may delete versions of
 #       `pg/*/feoh_*.dump` only, and is explicitly denied the shared
@@ -43,7 +46,7 @@ locals {
   # role is not owned here, the #449 gotcha), and a wrong subject fails silently
   # at the first AssumeRoleWithWebIdentity.
   backup_erasure_check_sub = "${var.github_oidc_sub_prefix}:ref:refs/heads/main"
-  backup_erasure_erase_sub = "${var.github_oidc_sub_prefix}:environment:production"
+  backup_erasure_erase_sub = "${var.github_oidc_sub_prefix}:environment:backup-erasure"
 
   # Every per-tenant dump, and the one dump no erasure may touch. The `_` is
   # what keeps the first from matching the second; the Deny below does not rely
@@ -162,10 +165,10 @@ data "aws_iam_policy_document" "backup_erasure_trust" {
       variable = "token.actions.githubusercontent.com:aud"
       values   = ["sts.amazonaws.com"]
     }
-    # Only a job in the `production` environment, which waits for its
-    # required reviewer before it gets a token at all. Restricting that
-    # environment's deployment branches to main is an owner setting
-    # (README.md § Backup erasure).
+    # Only a job in the dedicated `backup-erasure` environment, which waits
+    # for its required reviewer before it gets a token at all and which only
+    # `main` may deploy to (both owner settings, README.md § Backup erasure).
+    # Never `production`: other workflows share it.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
@@ -183,7 +186,7 @@ resource "aws_iam_role" "backup_erasure_check" {
 
 resource "aws_iam_role" "backup_erasure" {
   name                 = "${var.project}-backup-erasure"
-  description          = "backup-erasure.yml erase job (production environment, approved): delete removed tenants' backup dump versions."
+  description          = "backup-erasure.yml erase job (backup-erasure environment, approved): delete removed tenants' backup dump versions."
   assume_role_policy   = data.aws_iam_policy_document.backup_erasure_trust.json
   max_session_duration = 3600
 }
@@ -200,7 +203,9 @@ data "aws_iam_policy_document" "backup_erasure_check" {
   }
 
   # No resource type exists for GetCommandInvocation (deploy.tf has the
-  # reasoning); it reads a command whose id the caller already holds.
+  # reasoning); it reads a command whose id the caller already holds. Accepted
+  # for both roles (decisions §490): ids are not guessable and neither role
+  # can list commands.
   statement {
     sid       = "ReadTheCommandResult"
     actions   = ["ssm:GetCommandInvocation"]

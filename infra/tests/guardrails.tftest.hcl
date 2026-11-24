@@ -864,9 +864,29 @@ run "backup_erasure_roles_trust_exactly_one_subject_each" {
       "${c.variable}=${join(",", c.values)}"
       ]) == toset([
       "token.actions.githubusercontent.com:aud=sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub=repo:example-owner@1/feohledger@2:environment:production",
+      "token.actions.githubusercontent.com:sub=repo:example-owner@1/feohledger@2:environment:backup-erasure",
     ])
-    error_message = "The erase role must trust exactly the STS audience and the production environment's subject — the job a required reviewer approves."
+    error_message = "The erase role must trust exactly the STS audience and the dedicated backup-erasure environment's subject — the job a required reviewer approves."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for c in one(data.aws_iam_policy_document.backup_erasure_trust.statement).condition : [
+        for v in c.values : !strcontains(v, "production")
+      ]
+      if c.variable == "token.actions.githubusercontent.com:sub"
+    ]))
+    error_message = "The erase role must never trust the shared production environment: other workflows, dispatchable from any branch, run in it."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for c in one(data.aws_iam_policy_document.backup_erasure_trust.statement).condition : [
+        for v in c.values : endswith(v, ":environment:backup-erasure")
+      ]
+      if c.variable == "token.actions.githubusercontent.com:sub"
+    ]))
+    error_message = "The erase role's subject must end in :environment:backup-erasure."
   }
 
   assert {

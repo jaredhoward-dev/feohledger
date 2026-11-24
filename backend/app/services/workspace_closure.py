@@ -1153,6 +1153,18 @@ async def mark_backups_cleared(organization_id: uuid.UUID, *, operator: str) -> 
 #: stopping the erasure.
 ERASURE_OVERDUE_AFTER = timedelta(days=45)
 
+#: A removal this recent is not erased yet: a cool-off for a mistaken removal,
+#: well inside the 45-day alarm and the DPA's 60 days. The erase job enforces
+#: the same number (`deploy/backup-erasure.sh`, `COOL_OFF_DAYS`); the daily
+#: check counts such entries as cooling rather than ready, so no approval is
+#: asked for until one can act.
+ERASURE_COOL_OFF = timedelta(days=7)
+
+#: At most this many entries per `owed --json`, oldest first: SSM keeps only
+#: the first ~24,000 characters of a command's output, and a truncated list
+#: would not parse. The queue drains across daily runs.
+ERASURE_BATCH = 50
+
 #: An organisation with the closed workspace's slug exists again. The slug hold
 #: (`utils/slug.ensure_slug_not_held`) should make that impossible while backups
 #: are owed; if it ever happens, erasing `feoh_<slug>.dump` would erase the new
@@ -1179,6 +1191,10 @@ class OwedErasure:
     @property
     def overdue(self) -> bool:
         return self.age_days >= ERASURE_OVERDUE_AFTER.days
+
+    @property
+    def cooling(self) -> bool:
+        return self.age_days < ERASURE_COOL_OFF.days
 
 
 async def owed_backup_erasures(now: datetime | None = None) -> list[OwedErasure]:

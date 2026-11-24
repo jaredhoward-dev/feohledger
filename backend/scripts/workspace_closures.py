@@ -39,6 +39,8 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(1, str(Path(__file__).resolve().parent.parent))
 
 from app.services.workspace_closure import (
+    ERASURE_BATCH,
+    ERASURE_COOL_OFF,
     ERASURE_OVERDUE_AFTER,
     closures_owing_backups,
     mark_backups_cleared,
@@ -90,24 +92,29 @@ async def _owed(*, detail: bool) -> int:
     owed = await owed_backup_erasures()
     if detail:
         # Identifiers: read only by the approved erase job, which masks every
-        # one before it uses any.
+        # one before it uses any. Oldest first, at most ERASURE_BATCH of them
+        # (SSM's output cap); `total` says how many are owed in all.
         payload: dict = {
+            "total": len(owed),
             "owed": [
                 {
                     "organization_id": str(e.organization_id),
                     "slug": e.slug,
                     "database": e.database,
+                    "closed_on": e.closed_at.date().isoformat(),
                     "age_days": e.age_days,
                     "blocked": e.blocked,
                 }
-                for e in owed
-            ]
+                for e in owed[:ERASURE_BATCH]
+            ],
         }
     else:
         # Counts only: the daily check prints these to a PUBLIC workflow log.
         payload = {
             "owed": len(owed),
-            "ready": sum(1 for e in owed if e.blocked is None),
+            "ready": sum(1 for e in owed if e.blocked is None and not e.cooling),
+            "cooling": sum(1 for e in owed if e.blocked is None and e.cooling),
+            "cool_off_days": ERASURE_COOL_OFF.days,
             "blocked": sum(1 for e in owed if e.blocked is not None),
             "overdue": sum(1 for e in owed if e.overdue),
             "oldest_age_days": max((e.age_days for e in owed), default=0),

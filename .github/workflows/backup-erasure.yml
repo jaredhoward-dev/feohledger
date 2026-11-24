@@ -16,11 +16,16 @@ name: Backup erasure
 #          VM, which prints counts. A queue entry older than 45 days, or one
 #          blocked for a human, fails `attention` red — which emails the owner
 #          well inside the DPA's 60 days.
-#   erase  (`production` environment: a required reviewer approves it) assumes
-#          `feohledger-backup-erasure`, trusted for that environment only. It
+#   erase  (its OWN `backup-erasure` environment: a required reviewer approves
+#          it, and only `main` may deploy to it) assumes
+#          `feohledger-backup-erasure`, trusted for that environment only —
+#          not `production`, which other workflows share. It
 #          reads the queue, deletes every version and delete marker of each
 #          workspace's pg/*/feoh_<slug>.dump, re-lists to prove none is left,
-#          and marks the row cleared. Its role may list versions under `pg/`
+#          and marks the row cleared. Before deleting anything it checks the
+#          bucket itself — backups are current, the tenant is not still being
+#          dumped, the removal is a week old — so a forged queue entry from a
+#          compromised VM is refused. Its role may list versions under `pg/`
 #          only, delete versions of `feoh_*.dump` only, and never the shared
 #          control-plane dump (infra/backup_erasure.tf).
 #
@@ -99,9 +104,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     if: needs.check.result == 'success' && needs.check.outputs.ready != '0'
-    # MUST match the erase role's trust policy (`:environment:production`), and
-    # carries the required reviewer: nothing below runs until it is approved.
-    environment: production
+    # MUST match the erase role's trust policy (`:environment:backup-erasure`),
+    # and carries the required reviewer: nothing below runs until it is
+    # approved. Its own environment, restricted to `main`: `production` is
+    # shared with workflows that can be dispatched from any branch, so trusting
+    # its subject would hand this role to any approved run of any of them.
+    environment: backup-erasure
     timeout-minutes: 60
     # One erasure at a time; never cancel one mid-deletion. On this job, not
     # the workflow: an erase waiting days for its reviewer must not hold back
@@ -129,8 +137,9 @@ jobs:
 
       - name: Erase, verify, mark cleared
         env:
-          # Environment secrets: the instance id is not public, and the bucket
-          # name embeds the account id.
+          # The bucket and role ARN are `backup-erasure` environment secrets (the
+          # bucket name embeds the account id); the instance id is the
+          # repository secret the check job reads too.
           INSTANCE_ID: ${{ secrets.VM_INSTANCE_ID }}
           BACKUP_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
         run: deploy/backup-erasure.sh erase

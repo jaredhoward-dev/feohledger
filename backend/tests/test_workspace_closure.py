@@ -837,8 +837,9 @@ def test_the_cli_lists_owed_closures(monkeypatch, capsys):
 
 def test_the_overdue_mark_leaves_room_inside_the_dpa_window():
     """The daily check fails red at this age; the DPA promises 60 days, so it
-    must fire with time left to act."""
+    must fire with time left to act — and the cool-off ends well before it."""
     assert timedelta(days=30) <= workspace_closure.ERASURE_OVERDUE_AFTER < timedelta(days=60)
+    assert workspace_closure.ERASURE_COOL_OFF <= workspace_closure.ERASURE_OVERDUE_AFTER / 3
 
 
 def _owed(slug: str, *, age: int = 3, blocked: str | None = None):
@@ -874,7 +875,10 @@ def test_the_summary_counts_and_names_no_workspace(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert _erasure_line(out) == {
         "owed": 3,
-        "ready": 2,
+        # The two-day-old one is cooling off: no approval is asked for yet.
+        "ready": 1,
+        "cooling": 1,
+        "cool_off_days": workspace_closure.ERASURE_COOL_OFF.days,
         "blocked": 1,
         "overdue": 1,
         "oldest_age_days": 50,
@@ -891,12 +895,14 @@ def test_the_detail_lists_what_the_erase_job_deletes(monkeypatch, capsys):
     monkeypatch.setattr(cli, "owed_backup_erasures", AsyncMock(return_value=owed))
 
     assert cli.main(["owed", "--json"]) == 0
-    listed = _erasure_line(capsys.readouterr().out)["owed"]
-    assert listed == [
+    line = _erasure_line(capsys.readouterr().out)
+    assert line["total"] == 2
+    assert line["owed"] == [
         {
             "organization_id": str(owed[0].organization_id),
             "slug": "gone-trial",
             "database": "feoh_gone-trial",
+            "closed_on": "2026-11-01",
             "age_days": 3,
             "blocked": None,
         },
@@ -904,10 +910,29 @@ def test_the_detail_lists_what_the_erase_job_deletes(monkeypatch, capsys):
             "organization_id": str(owed[1].organization_id),
             "slug": "dbstill",
             "database": "feoh_dbstill",
+            "closed_on": "2026-11-01",
             "age_days": 3,
             "blocked": "database_exists",
         },
     ]
+
+
+def test_the_detail_is_capped_to_one_batch_oldest_first(monkeypatch, capsys):
+    """SSM keeps only ~24,000 characters of output; a truncated list would not
+    parse. The oldest ERASURE_BATCH go now, the rest on later runs."""
+    cli = _load_cli()
+    n = workspace_closure.ERASURE_BATCH + 7
+    owed = [_owed(f"gone-{i:03d}-trial-with-a-long-name", age=n - i) for i in range(n)]
+    monkeypatch.setattr(cli, "owed_backup_erasures", AsyncMock(return_value=owed))
+
+    assert cli.main(["owed", "--json"]) == 0
+    out = capsys.readouterr().out
+    line = _erasure_line(out)
+    assert line["total"] == n
+    assert [e["slug"] for e in line["owed"]] == [
+        e.slug for e in owed[: workspace_closure.ERASURE_BATCH]
+    ]
+    assert len(out) < 24_000
 
 
 def test_owed_needs_a_form():

@@ -89,6 +89,6 @@ output "backup_erasure_check_role_arn" {
 }
 
 output "backup_erasure_role_arn" {
-  description = "Role the backup-erasure workflow's approved erase job assumes (backup_erasure.tf) — the AWS_BACKUP_ERASURE_ROLE_ARN secret on the production environment."
+  description = "Role the backup-erasure workflow's approved erase job assumes (backup_erasure.tf) — the AWS_BACKUP_ERASURE_ROLE_ARN secret on the backup-erasure environment."
   value       = aws_iam_role.backup_erasure.arn
 }
