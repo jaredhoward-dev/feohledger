@@ -1,6 +1,7 @@
 import type { Locator, Page } from '@playwright/test';
 
 import { NAV } from '#lib/nav.ts';
+import { CARD_STATUSES } from '#lib/types/payment.ts';
 
 import { expect, test } from '../fixtures/helpers';
 import { exceptionSummary } from '../exceptions/summary';
@@ -287,8 +288,10 @@ const LOCALE_SIZED = new Set([
  * Locale-sized tables a sidebar link does not open by itself: /payments' other
  * tabs (the cards tab holds two tables). Held to the same per-locale check as
  * the `LOCALE_SIZED` pages; `label` names the test. The e2e seed holds no
- * virtual card or rebate, so those two are measured on their headers and
- * empty row only; their badge widths rest on the page's own measurement.
+ * virtual card or rebate: the cards table is answered with `CARD_PER_STATUS`
+ * below, so its status badges are measured; the rebates table is measured on
+ * its header and empty row only, its badge width resting on the page's own
+ * measurement.
  */
 const LOCALE_SIZED_VIEWS: (ListPage & { fixedTable: string; label: string })[] = [
 	{ href: '/payments?tab=history', fixedTable: '.pay-history table', label: '/payments history' },
@@ -647,6 +650,27 @@ const PARTIAL_INSPECTION = {
 	created_at: '2026-11-01T09:00:00Z'
 };
 
+/** One virtual card per `CardStatus`: the cards table's status column holds
+ *  the widest label in each locale (de "ABGESCHLOSSEN", es "COMPLETADA", ja
+ *  "キャンセル済み", …), and which status is widest differs by locale, so every
+ *  status is on screen rather than one picked for one catalogue. The lean e2e
+ *  seed issues no cards, so the tab's list is answered with these rows rather
+ *  than patched. */
+const CARD_PER_STATUS = CARD_STATUSES.map((status, i) => ({
+	id: `00000000-0000-4000-8000-00000000034${i}`,
+	invoice_id: '00000000-0000-4000-8000-000000000350',
+	card_provider: 'lithic',
+	last_four: '4242',
+	amount_limit: 1250,
+	amount_charged: status === 'charged' || status === 'completed' ? 1250 : null,
+	currency: 'USD',
+	status,
+	expires_at: '2026-12-31T00:00:00Z',
+	created_at: '2026-11-01T09:00:00Z',
+	vendor_name: 'Layout Fixture Supplies',
+	invoice_number: `INV-LAYOUT-${i}`
+}));
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
 		const tables = [
@@ -681,6 +705,17 @@ test.describe('fixed list tables fit their longest locale', () => {
 								: route.fallback()
 					);
 				}
+				if (label === '/payments cards') {
+					await page.route(
+						(url) => url.pathname === '/api/cards',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({
+										json: { items: CARD_PER_STATUS, total: CARD_PER_STATUS.length }
+									})
+								: route.fallback()
+					);
+				}
 				const widest = WIDEST_ROW[href];
 				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
@@ -698,6 +733,11 @@ test.describe('fixed list tables fit their longest locale', () => {
 				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
 				if (href === '/goods-receipts?tab=inspections') {
 					await expect(table.locator('.badge.partial')).toBeVisible();
+				}
+				if (label === '/payments cards') {
+					for (const status of CARD_STATUSES) {
+						await expect(table.locator(`.badge.${status}`)).toBeVisible();
+					}
 				}
 				await nextFrames(page);
 
