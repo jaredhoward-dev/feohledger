@@ -1,6 +1,13 @@
 import type { APIRequestContext } from '@playwright/test';
 
-import { currentTenantSlug, expect, signInAndWait, tenantBase, test } from '../fixtures/helpers';
+import {
+	currentTenantSlug,
+	expect,
+	signInAndWait,
+	tenantBase,
+	tenantPsql,
+	test
+} from '../fixtures/helpers';
 import { SERVICES, skipUnlessReachable } from '../fixtures/services';
 import {
 	FAKE_ERP_BASE,
@@ -8,6 +15,7 @@ import {
 	deleteInvoice,
 	erpFailureFromAudit,
 	erpReferenceFromAudit,
+	glErpLinks,
 	sendToErpAndAwaitTerminal,
 	setErpSettings,
 	syncErpGlAccounts,
@@ -33,12 +41,17 @@ import {
  *      decimal STRING (the fake refuses a numeric `txnAmount`, as Intacct
  *      does), the synced vendor id, our bill number, an idempotency reference,
  *      and state `posted` (the fake, like Intacct, makes a bill created
- *      without `state` a draft that books nothing).
+ *      without `state` a draft that books nothing). The chart sync links
+ *      account 6100 by its record key (`key:61`, decisions §492) and the
+ *      bill's line references it `{"key": "61"}`.
  *   3. Fail closed — an unlinked vendor is refused before anything is posted.
  *   4. A create Intacct refuses (a closed period) is the coded `bill_refused`.
  *   5. PO sync — purchasing documents import with exact totals, mapped states
  *      and currency (the fake 400s a query naming a field the object lacks,
  *      such as the `txnTotal` the adapter once asked for).
+ *   6. A legacy link (the account NUMBER, as stored before §492) posts by
+ *      `{"id": "6100"}`, and the next chart sync re-keys that same row to
+ *      `key:61`, recorded in `link_changes`.
  */
 
 const INTACCT_ERP_CONFIG = {
@@ -109,8 +122,58 @@ test.describe('/erp sage_intacct adapter against fake-erp', () => {
 			// The idempotency key the adapter looks a retry up by.
 			expect(bill.referenceNumber).toBeTruthy();
 			expect(bill.state).toBe('posted');
+			// Linked by the record key, and the line names the account by it.
+			expect(await glErpLinks(page, '6100')).toContain('key:61');
+			const refs = (bill.lines as Array<{ glAccount: Record<string, string> }>).map(
+				(l) => l.glAccount
+			);
+			expect(refs.length).toBeGreaterThan(0);
+			expect(refs).toEqual(refs.map(() => ({ key: '61' })));
 		} finally {
 			await deleteInvoice(page, inv.id);
+		}
+	});
+
+	test('a legacy number-keyed link posts by id, then the next sync re-keys it', async ({
+		page,
+		request
+	}) => {
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		// Put 6100's link back the way it was stored before §492: the account
+		// NUMBER, in the same company (realm untouched).
+		tenantPsql(
+			"UPDATE gl_accounts SET erp_account_id = '6100' " +
+				"WHERE code = '6100' AND erp_account_id = 'key:61'"
+		);
+		expect(await glErpLinks(page, '6100')).toContain('6100');
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-INTACCT-LEGACY',
+			invoiceDate: '2026-10-02',
+			dueDate: '2026-11-01',
+			amount: '310.40',
+			vendor: 'Fake Intacct Vendor A',
+			glAccount: '6100'
+		});
+		try {
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('done');
+			const bill = await intacctBill(request, await erpReferenceFromAudit(page, inv.id));
+			const refs = (bill.lines as Array<{ glAccount: Record<string, string> }>).map(
+				(l) => l.glAccount
+			);
+			expect(refs.length).toBeGreaterThan(0);
+			expect(refs).toEqual(refs.map(() => ({ id: '6100' })));
+
+			// The first keyed pull re-links that same row by code, on the record.
+			const changes = await syncErpGlAccounts(page);
+			expect(changes).toContainEqual({ code: '6100', from: '6100', to: 'key:61' });
+			const links = await glErpLinks(page, '6100');
+			expect(links).toContain('key:61');
+			expect(links).not.toContain('6100');
+		} finally {
+			await deleteInvoice(page, inv.id);
+			// Leave the row keyed even if an assertion above failed first.
+			await syncErpGlAccounts(page);
 		}
 	});
 

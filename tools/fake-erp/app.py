@@ -1735,6 +1735,7 @@ async def intacct_create_bill(request: Request) -> dict:
     by_key = {a["key"]: a for a in INTACCT_GL_FIXTURES}
     by_id = {a["id"]: a for a in INTACCT_GL_FIXTURES}
     total = Decimal(0)
+    stored_lines: list[dict] = []
     for line in lines:
         ref = line.get("glAccount") or {}
         account = by_key.get(ref["key"]) if "key" in ref else by_id.get(ref.get("id"))
@@ -1746,6 +1747,11 @@ async def intacct_create_bill(request: Request) -> dict:
         if not isinstance(amount, str):
             raise _intacct_error(422, "invalidAmount", "txnAmount must be a decimal string.")
         total += Decimal(amount)
+        # The reference exactly as the client sent it. Intacct reads a line
+        # back naming the account by both key and id; the fake keeps the
+        # request's own form so a spec can tell which one FeohLedger posted by
+        # (a `key:` link → {"key"}, a legacy number link → {"id"}, §492).
+        stored_lines.append({"glAccount": dict(ref), "txnAmount": amount})
     state = _intacct_state()
     state["next_key"] += 1
     key = str(state["next_key"])
@@ -1761,6 +1767,7 @@ async def intacct_create_bill(request: Request) -> dict:
         "dueDate": body.get("dueDate"),
         "totalTxnAmount": str(total),
         "totalTxnAmountDue": str(total),
+        "lines": stored_lines,
     }
     return {"ia::result": {"key": key, "id": key, "href": f"/objects/accounts-payable/bill/{key}"}}
 
