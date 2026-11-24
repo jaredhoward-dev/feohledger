@@ -24793,3 +24793,203 @@ names its company), so the lock serializes exactly the writers that can
 collide. The cost is that two no-realm pulls of one tenant run one after the
 other, which is what the named-realm case already does. Pinned in
 `tests/test_vendor_sync.py::test_two_no_realm_syncs_creating_one_record_serialize`.
+
+## 490. Backup erasure runs in an approval-gated GitHub Actions job; nothing the VM can trigger deletes a backup (#757)
+
+`deploy/remove-tenant.sh` deleted a removed tenant's nightly dumps
+(`pg/<date>/feoh_<slug>.dump`, every version and delete marker) from the VM, but
+the VM role cannot list versions or delete in the backup bucket, deliberately
+(`infra/compute.tf`, Sid `Backups`), so every production removal failed at the
+listing (#757, first diagnosed in `docs/known-issues.md` 2026-10-18).
+Self-service closures (§306) already queued "backups owed" rows that an
+operator cleared by hand. `/legal/dpa` § 13 promises the dumps go within 60
+days.
+
+**The principle: nothing the VM can trigger on its own may delete a backup.**
+A compromised VM that can erase backups can erase all of them, and then the
+backups are no protection against the compromise they exist for. So:
+
+- **One queue.** Every removal leaves a `workspace_closures` row. A
+  self-service closure already did; `scripts/delete_tenant.py` (behind
+  `remove-tenant.sh`) now records one before it deletes anything and completes
+  it after. Reusing the table is honest because it already means "a workspace
+  removed, and whether its backups are cleared", and it brings the slug hold
+  with it (`utils/slug.ensure_slug_not_held`), which the operator path needed
+  anyway: erasure deletes by slug, and a new workspace under the same slug
+  would share `feoh_<slug>.dump`. The one thing that did not fit is the
+  requester: nobody signed in to the API asked for an operator removal, so
+  `requested_by_user_id` became nullable (migration 0142, safe idempotent DDL,
+  no-op downgrade) rather than carry an invented user, and the row's
+  `step_up_proof` reads `operator`. An operator finishing an unfinished
+  self-service closure keeps the administrator as the requester.
+  `remove-tenant.sh` no longer touches S3 and no longer prints a backup
+  deletion; it says the backups are owed to the workflow.
+- **`.github/workflows/backup-erasure.yml`**, daily and on dispatch, with no
+  inputs (the repo and its logs are public). Its `check` job, outside any
+  environment, assumes `feohledger-backup-erasure-check` (trust: `aud` plus the
+  exact `sub` of `refs/heads/main`), which may run only the read-only
+  `summary` SSM document on the app VM: counts, no identifiers. An entry 45
+  days old (`workspace_closure.ERASURE_OVERDUE_AFTER`, two weeks inside the
+  DPA's 60) or blocked for a human fails a separate `attention` job red, which
+  emails the owner. Entries younger than a 7-day cool-off
+  (`ERASURE_COOL_OFF`) count as cooling, not ready, so no approval is asked
+  for until one can act. The `erase` job runs in its own `backup-erasure`
+  environment — a required reviewer approves it before it gets a token, and
+  only `main` may deploy to it — and assumes `feohledger-backup-erasure`
+  (trust: the exact `:environment:backup-erasure` subject AND
+  `token.actions.githubusercontent.com:ref = refs/heads/main`, a GitHub
+  condition key the IAM User Guide documents for `AssumeRoleWithWebIdentity`
+  trust policies). Its first step, before any AWS credential, reads the
+  environment back through the API (`actions: read`) and refuses unless it
+  has a required reviewer and deploys from `main` only (a custom policy of
+  exactly `main`, or protected branches) and does not let administrators
+  bypass its rules (`can_admins_bypass`, which GitHub sets to true by
+  default), and unless the run's ref is `main`
+  — so the owner settings the role relies on are checked on every run rather
+  than assumed. Not `production`:
+  `aws-deploy.yml` and `aws-oidc-preflight.yml` also run there and can be
+  dispatched from any branch, so trusting that subject would hand the role to
+  an approved run of any of them, from any branch. It reads the queue (at most
+  `ERASURE_BATCH` = 50 entries, oldest first, because SSM keeps only ~24,000
+  characters of output; the rest drain on later runs) through the `owed`
+  document, masks every slug,
+  organisation id and database name before using any, and per workspace lists
+  every version and delete marker under `pg/` (the same separately-filtered,
+  `/`-anchored listing `remove-tenant.sh` used, whose comments record the
+  JMESPath projection trap), deletes each by version id, re-lists and requires
+  none left, and only then marks the row through the `mark-cleared` document,
+  whose parameters SSM refuses unless they are a UUID and a run number. A
+  failure on one workspace leaves it owed and fails the job at the end. A
+  workspace whose slug a live organisation holds again, or whose database
+  still exists, is refused rather than erased.
+- **The VM does not get to choose alone.** The `owed` list comes from the VM,
+  and a compromised VM could name a live tenant; a reviewer approving the job
+  cannot see slugs (the log is public) and would approve blind. So before
+  deleting anything the job checks the bucket itself, which the VM cannot
+  rewrite for past nights because it cannot delete there: (a) the newest
+  nightly prefix `pg/<YYYY-MM-DD>/` (`backup.sh`'s UTC date; it dumps every
+  `feoh_*` database every night) must be at most 2 days old, or nothing is
+  erased and the run fails — otherwise "not dumped lately" proves nothing;
+  (b) a dump of an owed database dated after its recorded closure means the
+  database was still there to dump — a forged entry or a failed removal — and
+  fails the run red without erasing; (c) a 7-day cool-off, measured from the
+  closure date (the job computes the age itself; the VM's `age_days` is
+  ignored) and from the newest stored dump of that database in the bucket —
+  bucket truth — so both must be a week old. Deferred is not a failure. The
+  VM's `blocked` code is allowlisted (`slug_in_use`, `database_exists`);
+  anything else fails red without being echoed, since a newline in it would
+  be a workflow command in the log. Erasable entries fill the 50-entry batch
+  before blocked ones, so blocked rows cannot starve the queue, and their
+  full count still turns the run red. What remains: a VM compromised for long
+  enough could stop dumping a live tenant for at least 7 nights and then
+  forge an entry dated before that, and a reviewer who approves without
+  looking would let it through. The nightly backup heartbeat, the freshness
+  check and the red alarm on any post-closure dump make that harder and
+  visible; they do not close it. The dates in the bucket's keys are the VM's
+  too, so they are parsed strictly: a nightly prefix dated in the future or
+  not a real date refuses the whole run, and an unparseable dump date refuses
+  its entry — none of them may read as "old enough".
+- **The alarm cannot die silently.** GitHub disables a public repo's
+  scheduled workflows after 60 days without repository activity, and a
+  disabled, disarmed or broken workflow also stops the daily check and with it
+  the 45-day red run. So the check job publishes a heartbeat
+  (`FeohLedger/BackupErasure` `CheckRan`, and the `Overdue` count) under a
+  `cloudwatch:PutMetricData` grant conditioned on that namespace, and two
+  CloudWatch alarms on the existing alerts topic fire when no heartbeat has
+  arrived for two days (`treat_missing_data = breaching`) or `Overdue` is above
+  zero. They are created only once the owner arms them
+  (`backup_erasure_alarms_enabled`) after the workflow's first green check,
+  so they never email about a check that was not meant to run yet. Failing to
+  publish fails the check.
+- **The erase role's S3 grant** is `s3:ListBucketVersions` on the bucket only
+  with `s3:prefix = pg/` (plus an explicit Deny for any other prefix or none),
+  `s3:DeleteObjectVersion` on `pg/*/feoh_*.dump` only, and an explicit Deny of
+  every delete on `pg/*/feohledger.dump`, the shared control-plane dump. No
+  Get, Put or `DeleteObject` (on a versioned bucket that only adds a delete
+  marker). The backup bucket has no Object Lock and no MFA delete, so a
+  versioned delete is permanent. The VM role is unchanged. Guarded in
+  `infra/tests/guardrails.tftest.hcl`.
+
+The role can still delete any tenant's dumps, live or not; the approval, the
+dedicated environment restricted to `main` (owner settings) and the bucket
+checks above are what stand between it and a mistake. Restricting the
+environment to `main` is what stops a workflow edited on a branch from reaching
+the role after an approval. The IAM User Guide's GitHub condition-key list
+(<https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html>,
+read 2026-11-24) includes `ref`, now used, and also `job_workflow_ref` and
+`workflow`. Pinning the role to this workflow file was considered and not
+done in this change: the page describes `job_workflow_ref` for reusable
+workflows, its value for an ordinary job was not verified, and a wrong value
+fails the handshake closed.
+
+**Accepted residuals.** Every count the daily check and the overdue alarm see
+comes from the VM; a compromised VM can report an empty queue and suppress
+both. It can equally decline to record a removal at all; the backups it hides
+are then not erased late but simply not erased, which no check outside the VM
+can know is owed. The check role trusts any workflow on `main`; it can
+only run the read-only `summary` document, which prints counts, so a workflow
+merged to `main` gains nothing it could not read from the public run log.
+`ssm:GetCommandInvocation` is granted on `*` to both roles because SSM defines
+no resource type for it; command ids are not guessable and neither role can
+list commands. The public run log reveals that some workspace was removed
+recently (an `erase` job waiting for approval, "Erased N of M"): counts only,
+never which, and a cost of running the erasure in the open.
+
+**Rejected:**
+
+- **Leaving `github_oidc_sub_prefix` required with no default.** Every plan of
+  `infra/` would fail with Terraform's bare "No value for required variable";
+  it defaults to null so its validation fails instead, with the `gh api`
+  command that reads the value.
+- **Inferring "no backup store" from an empty `BACKUP_S3_BUCKET`.** It would
+  record the backups cleared and release the slug on a misread env;
+  `remove-tenant.sh` needs the operator's explicit `--no-backup-store`.
+- **Give the VM role `ListBucketVersions` + `DeleteObjectVersion`.** Simplest,
+  and exactly the capability the principle forbids.
+- **A manual split: the VM deletes the data, the operator deletes the dumps from
+  a laptop SSO session.** Keeps the principle but leaves a legal deadline on a
+  human remembering a second step, with no record that it ran under review;
+  it is how the five test workspaces were cleared on 2026-11-22, and kept only
+  as the break-glass path in the runbook.
+- **Age-out only** (the 90-day lifecycle). The DPA promises 60 days; ICO
+  guidance accepts backups put "beyond use" until overwritten if that is
+  stated, but changing a published promise to fit the tooling is the wrong
+  way round when the tooling can be fixed.
+- **Crypto-shredding with a per-tenant KMS key.** Durable in principle, but a
+  large change to backup and restore, KMS key deletion has a mandatory 7–30
+  day waiting period, and it does nothing for the dumps already written under
+  the shared key.
+- **S3 lifecycle deletion by tag** (the VM tags a removed tenant's dumps and a
+  lifecycle rule expires them). The VM would need tagging rights, and a
+  compromised VM could tag every dump.
+
+**Residues the DPA already states, unchanged:** the shared control-plane dump
+(not selectively editable, ages out on the 90-day cycle), RDS automated
+backups on the RDS path (whole-instance, kept for the retention window), and
+audit events already shipped to write-once archival. `/legal/dpa` § 13's text
+still matches: it promises the backup objects go within 60 days, and the
+superseded-version residue it discloses is now conservative, since every
+version is deleted. No legal wording changed.
+
+Sources (as recorded 2026-11-24):
+<https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html>
+(ListBucketVersions supports `s3:prefix`);
+<https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html>
+(a plain delete on a versioned bucket adds a marker; a permanent delete needs
+the version id);
+<https://docs.github.com/en/actions/reference/security/oidc> (the `sub`
+format for branches and environments);
+<https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments>
+(required reviewers, deployment-branch restrictions);
+<https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/individual-rights/individual-rights/right-to-erasure/>
+("beyond use");
+<https://docs.aws.amazon.com/kms/latest/developerguide/deleting-keys.html>
+(the 7–30 day key-deletion window).
+Read 2026-11-24 for the pre-merge hardening:
+<https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html>
+(GitHub condition keys for trust policies, `ref` among them);
+<https://docs.github.com/en/rest/deployments/environments> (the environment's
+`protection_rules` and `deployment_branch_policy`);
+<https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps>
+(`GET …/environments/{name}` and its deployment-branch-policies need Actions:
+read).

@@ -1462,23 +1462,116 @@ def _load_delete_tenant_cli():
     return cli
 
 
-@pytest.mark.parametrize(
-    ("error", "code"),
-    [
-        # The ONE code remove-tenant.sh reads as "already gone, carry on".
-        (tenant_deletion.TenantNotFound("no organisation with slug 'x'"), 4),
-        # Every other refusal stops it before it deletes the backups.
-        (TenantDeletionError("'x' is a partner organisation with 2 child tenant(s)"), 2),
-    ],
-)
-async def test_the_cli_exit_code_tells_not_found_from_a_refusal(monkeypatch, capsys, error, code):
+async def test_the_cli_exit_code_tells_a_refusal_from_not_found(monkeypatch, capsys):
+    """Every refusal but not-found stops remove-tenant.sh before it changes anything."""
     cli = _load_delete_tenant_cli()
+    error = TenantDeletionError("'x' is a partner organisation with 2 child tenant(s)")
     monkeypatch.setattr(cli, "plan_tenant_deletion", AsyncMock(side_effect=error))
     monkeypatch.setattr(cli, "delete_tenant", AsyncMock(side_effect=AssertionError("deleted")))
     monkeypatch.setattr("sys.argv", ["delete_tenant.py", "--slug", "x", "--dry-run"])
 
-    assert await cli.main() == code
+    assert await cli.main() == 2
     assert str(error) in capsys.readouterr().err
+
+
+def _record(*, cleared: bool):
+    from datetime import UTC, datetime
+
+    from app.models.workspace_closure import CLOSURE_COMPLETED, WorkspaceClosure
+
+    return WorkspaceClosure(
+        organization_id=uuid.uuid4(),
+        slug="x",
+        status=CLOSURE_COMPLETED,
+        started_at=datetime(2026, 11, 1, tzinfo=UTC),
+        completed_at=datetime(2026, 11, 1, tzinfo=UTC),
+        backups_cleared_at=datetime(2026, 11, 2, tzinfo=UTC) if cleared else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("record", "code", "says"),
+    [
+        # Removed and on record: the ONE code remove-tenant.sh reads as
+        # "already removed, nothing to do".
+        (_record(cleared=False), 4, "still owed"),
+        (_record(cleared=True), 4, "erased 2026-11-02"),
+        # No organisation and no record: most likely a typo; it refuses.
+        (None, 5, "no removal of it on record"),
+    ],
+)
+async def test_the_cli_reports_what_became_of_a_missing_slug(
+    monkeypatch, capsys, record, code, says
+):
+    cli = _load_delete_tenant_cli()
+    monkeypatch.setattr(
+        cli,
+        "plan_tenant_deletion",
+        AsyncMock(side_effect=tenant_deletion.TenantNotFound("no organisation with slug 'x'")),
+    )
+    monkeypatch.setattr(cli, "latest_closure_for_slug", AsyncMock(return_value=record))
+    monkeypatch.setattr(cli, "delete_tenant", AsyncMock(side_effect=AssertionError("deleted")))
+    monkeypatch.setattr("sys.argv", ["delete_tenant.py", "--slug", "x", "--dry-run"])
+
+    assert await cli.main() == code
+    assert says in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("flags", "cleared_by"), [([], None), (["--no-backup-store"], "no-backup-store")]
+)
+async def test_the_cli_records_the_removal_around_the_deletion(monkeypatch, flags, cleared_by):
+    """Recorded BEFORE anything is deleted (a run that dies part-way is on the
+    queue and holds the slug) and completed after; the backups stay owed to the
+    erasure workflow unless the deployment has no backup store (§490)."""
+    cli = _load_delete_tenant_cli()
+    org_id = uuid.uuid4()
+    order: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "plan_tenant_deletion",
+        AsyncMock(return_value=_FakePlan(org_id, "x", "X", "feoh_x", True, {})),
+    )
+    monkeypatch.setattr(cli, "_print_plan", lambda _plan: None)
+    monkeypatch.setattr(cli, "format_confirmation", lambda _result: "")
+    result = object()
+
+    async def started(org, slug):
+        order.append(f"started {org} {slug}")
+
+    async def deleted(slug):
+        order.append("deleted")
+        return result
+
+    completed = AsyncMock(side_effect=lambda *a, **k: order.append("completed"))
+    monkeypatch.setattr(cli, "record_operator_removal_started", started)
+    monkeypatch.setattr(cli, "delete_tenant", deleted)
+    monkeypatch.setattr(cli, "record_operator_removal_completed", completed)
+    monkeypatch.setattr("sys.argv", ["delete_tenant.py", "--slug", "x", "--yes", *flags])
+
+    assert await cli.main() == 0
+    assert order == [f"started {org_id} x", "deleted", "completed"]
+    completed.assert_awaited_once_with(org_id, result, backups_cleared_by=cleared_by)
+
+
+async def test_a_refused_deletion_is_not_recorded_complete(monkeypatch):
+    cli = _load_delete_tenant_cli()
+    monkeypatch.setattr(
+        cli,
+        "plan_tenant_deletion",
+        AsyncMock(return_value=_FakePlan(uuid.uuid4(), "x", "X", "feoh_x", True, {})),
+    )
+    monkeypatch.setattr(cli, "_print_plan", lambda _plan: None)
+    monkeypatch.setattr(cli, "record_operator_removal_started", AsyncMock())
+    monkeypatch.setattr(
+        cli, "delete_tenant", AsyncMock(side_effect=TenantDeletionError("refused mid-way"))
+    )
+    completed = AsyncMock()
+    monkeypatch.setattr(cli, "record_operator_removal_completed", completed)
+    monkeypatch.setattr("sys.argv", ["delete_tenant.py", "--slug", "x", "--yes"])
+
+    assert await cli.main() == 2
+    completed.assert_not_awaited()
 
 
 async def test_the_cli_refuses_to_delete_without_confirmation(monkeypatch):
@@ -1503,6 +1596,7 @@ async def test_the_cli_fails_when_the_deletion_itself_refuses(monkeypatch):
         AsyncMock(return_value=_FakePlan(uuid.uuid4(), "x", "X", "feoh_x", True, {})),
     )
     monkeypatch.setattr(cli, "_print_plan", lambda _plan: None)
+    monkeypatch.setattr(cli, "record_operator_removal_started", AsyncMock())
     monkeypatch.setattr(
         cli, "delete_tenant", AsyncMock(side_effect=TenantDeletionError("refused mid-way"))
     )

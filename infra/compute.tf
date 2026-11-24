@@ -164,7 +164,11 @@ data "aws_iam_policy_document" "app_permissions" {
   }
 
   # backup.sh streams dumps up and restore.sh streams them back; neither
-  # deletes — the lifecycle rule expires old dumps.
+  # deletes — the lifecycle rule expires old dumps. Deliberately no delete and
+  # no ListBucketVersions here: nothing the VM can trigger on its own may
+  # delete a backup, so a compromised VM cannot wipe the history. A removed
+  # tenant's dumps are erased by the approval-gated backup-erasure workflow
+  # under its own role (backup_erasure.tf, docs/decisions.md §490).
   statement {
     sid       = "Backups"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"]

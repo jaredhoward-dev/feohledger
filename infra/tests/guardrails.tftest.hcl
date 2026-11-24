@@ -17,7 +17,10 @@
 # that each alarm pages and emails, that the phone subscription exists only
 # when a number is set, and the certificate-expiry backstop; and the
 # certificate canary (canary.tf): what it fetches, its pinned runtime, its
-# paging alarm and its artifacts bucket's baseline.
+# paging alarm and its artifacts bucket's baseline; and backup erasure
+# (backup_erasure.tf): each role trusts exactly one subject, runs only its own
+# documents on only the app VM, deletes only per-tenant dump versions, never the
+# control-plane dump, and the VM role still cannot delete a backup.
 
 mock_provider "aws" {
   # A mocked policy document renders a random string, which the KMS key and
@@ -59,6 +62,13 @@ mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = {
       account_id = "000000000000"
+    }
+  }
+
+  # The backup-erasure roles trust this provider by ARN.
+  mock_data "aws_iam_openid_connect_provider" {
+    defaults = {
+      arn = "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"
     }
   }
 }
@@ -149,6 +159,31 @@ override_resource {
   override_during = plan
   values = {
     arn = "arn:aws:ssm:us-east-1:000000000000:document/feohledger-vm-deploy"
+  }
+}
+
+# The backup-erasure grants (backup_erasure.tf) name these documents exactly.
+override_resource {
+  target          = aws_ssm_document.backup_erasure_summary
+  override_during = plan
+  values = {
+    arn = "arn:aws:ssm:us-east-1:000000000000:document/feohledger-backup-erasure-summary"
+  }
+}
+
+override_resource {
+  target          = aws_ssm_document.backup_erasure_owed
+  override_during = plan
+  values = {
+    arn = "arn:aws:ssm:us-east-1:000000000000:document/feohledger-backup-erasure-owed"
+  }
+}
+
+override_resource {
+  target          = aws_ssm_document.backup_erasure_mark_cleared
+  override_during = plan
+  values = {
+    arn = "arn:aws:ssm:us-east-1:000000000000:document/feohledger-backup-erasure-mark-cleared"
   }
 }
 
@@ -244,6 +279,7 @@ variables {
   budget_alert_emails       = ["ops@feohledger.test"]
   alert_emails              = ["ops@feohledger.test"]
   db_master_password        = "testonlynotarealdbpassword"
+  github_oidc_sub_prefix    = "repo:example-owner@1/feohledger@2"
 }
 
 run "budget_alerts_every_address_on_actual_and_forecast" {
@@ -788,6 +824,302 @@ run "deploy_document_takes_only_a_commit_sha" {
     condition     = element(one(jsondecode(aws_ssm_document.deploy.content).mainSteps).inputs.runCommand, -1) == "exit $rc"
     error_message = "The document must exit with deploy.sh's status, or a failed deploy reports success."
   }
+}
+
+# ── Backup erasure (backup_erasure.tf, docs/decisions.md §490) ──────────────
+
+run "backup_erasure_roles_trust_exactly_one_subject_each" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for c in one(data.aws_iam_policy_document.backup_erasure_check_trust.statement).condition :
+      c.test == "StringEquals"
+    ])
+    error_message = "The check role's trust must use StringEquals only — a StringLike would let a wildcard subject in."
+  }
+
+  assert {
+    condition = toset([
+      for c in one(data.aws_iam_policy_document.backup_erasure_check_trust.statement).condition :
+      "${c.variable}=${join(",", c.values)}"
+      ]) == toset([
+      "token.actions.githubusercontent.com:aud=sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub=repo:example-owner@1/feohledger@2:ref:refs/heads/main",
+    ])
+    error_message = "The check role must trust exactly the STS audience and main's subject — no pull request, branch or environment job."
+  }
+
+  assert {
+    condition = alltrue([
+      for c in one(data.aws_iam_policy_document.backup_erasure_trust.statement).condition :
+      c.test == "StringEquals"
+    ])
+    error_message = "The erase role's trust must use StringEquals only."
+  }
+
+  assert {
+    condition = toset([
+      for c in one(data.aws_iam_policy_document.backup_erasure_trust.statement).condition :
+      "${c.variable}=${join(",", c.values)}"
+      ]) == toset([
+      "token.actions.githubusercontent.com:aud=sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub=repo:example-owner@1/feohledger@2:environment:backup-erasure",
+      "token.actions.githubusercontent.com:ref=refs/heads/main",
+    ])
+    error_message = "The erase role must trust exactly the STS audience, the dedicated backup-erasure environment's subject — the job a required reviewer approves — and the main branch."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for c in one(data.aws_iam_policy_document.backup_erasure_trust.statement).condition : [
+        for v in c.values : !strcontains(v, "production")
+      ]
+      if c.variable == "token.actions.githubusercontent.com:sub"
+    ]))
+    error_message = "The erase role must never trust the shared production environment: other workflows, dispatchable from any branch, run in it."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for c in one(data.aws_iam_policy_document.backup_erasure_trust.statement).condition : [
+        for v in c.values : endswith(v, ":environment:backup-erasure")
+      ]
+      if c.variable == "token.actions.githubusercontent.com:sub"
+    ]))
+    error_message = "The erase role's subject must end in :environment:backup-erasure."
+  }
+
+  assert {
+    condition     = one(one(data.aws_iam_policy_document.backup_erasure_trust.statement).principals).identifiers == toset(["arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"])
+    error_message = "The erase role must trust GitHub's OIDC provider and nothing else."
+  }
+}
+
+run "backup_erasure_roles_run_only_their_documents_on_only_the_app_vm" {
+  command = plan
+
+  assert {
+    condition = toset(flatten([
+      for s in data.aws_iam_policy_document.backup_erasure_check.statement : tolist(s.resources)
+      if contains(s.actions, "ssm:SendCommand")
+    ])) == toset([aws_instance.app.arn, aws_ssm_document.backup_erasure_summary.arn])
+    error_message = "The check role may send only the read-only summary document, to only the app VM."
+  }
+
+  assert {
+    condition = toset(flatten([
+      for s in data.aws_iam_policy_document.backup_erasure.statement : tolist(s.resources)
+      if contains(s.actions, "ssm:SendCommand")
+      ])) == toset([
+      aws_instance.app.arn,
+      aws_ssm_document.backup_erasure_owed.arn,
+      aws_ssm_document.backup_erasure_mark_cleared.arn,
+    ])
+    error_message = "The erase role may send only the owed and mark-cleared documents, to only the app VM — never AWS-RunShellScript."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in concat(
+        tolist(data.aws_iam_policy_document.backup_erasure_check.statement),
+        tolist(data.aws_iam_policy_document.backup_erasure.statement),
+      ) :
+      !contains(tolist(s.resources), "*") || toset(s.actions) == toset(["ssm:GetCommandInvocation"])
+    ])
+    error_message = "Only the read-only ssm:GetCommandInvocation, which has no resource type, may be granted on \"*\"."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.backup_erasure_check.statement :
+      alltrue([for a in s.actions : !startswith(a, "s3:")])
+    ])
+    error_message = "The check role must have no S3 access at all."
+  }
+
+  assert {
+    condition     = keys(jsondecode(aws_ssm_document.backup_erasure_mark_cleared.content).parameters) == ["OrganizationId", "RunId"]
+    error_message = "mark-cleared takes exactly an organisation id and a run id."
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ssm_document.backup_erasure_mark_cleared.content).parameters.OrganizationId.allowedPattern == "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      && jsondecode(aws_ssm_document.backup_erasure_mark_cleared.content).parameters.RunId.allowedPattern == "^[0-9]{1,20}$"
+    )
+    error_message = "SSM must refuse anything but a UUID and a run number before a shell exists."
+  }
+
+  assert {
+    condition = alltrue([
+      for d in [aws_ssm_document.backup_erasure_summary, aws_ssm_document.backup_erasure_owed] :
+      !can(jsondecode(d.content).parameters)
+    ])
+    error_message = "The read-only documents take no parameter at all."
+  }
+}
+
+run "backup_erasure_deletes_only_tenant_dump_versions_never_the_control_plane_dump" {
+  command = plan
+
+  assert {
+    condition = toset(flatten([
+      for s in data.aws_iam_policy_document.backup_erasure.statement : s.actions
+      if s.effect != "Deny" && anytrue([for a in s.actions : startswith(a, "s3:")])
+    ])) == toset(["s3:ListBucketVersions", "s3:DeleteObjectVersion"])
+    error_message = "The erase role may only list versions and delete versions — no Get, Put or DeleteObject (a delete marker, which erases nothing)."
+  }
+
+  assert {
+    condition = flatten([
+      for s in data.aws_iam_policy_document.backup_erasure.statement : tolist(s.resources)
+      if s.effect != "Deny" && contains(s.actions, "s3:DeleteObjectVersion")
+    ]) == ["arn:aws:s3:::feohledger-backups-test/pg/*/feoh_*.dump"]
+    error_message = "Version deletes are allowed on per-tenant dumps only."
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.backup_erasure.statement :
+      s.effect == "Deny"
+      && contains(s.actions, "s3:DeleteObjectVersion")
+      && contains(s.actions, "s3:DeleteObject")
+      && contains(tolist(s.resources), "arn:aws:s3:::feohledger-backups-test/pg/*/feohledger.dump")
+    ])
+    error_message = "The shared control-plane dump must be explicitly denied to every delete."
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.backup_erasure.statement :
+      s.effect != "Deny" && contains(s.actions, "s3:ListBucketVersions")
+      && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "s3:prefix" && toset(c.values) == toset(["pg/"])])
+    ])
+    error_message = "Listing versions is allowed only with the prefix pg/."
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.backup_erasure.statement :
+      s.effect == "Deny" && contains(s.actions, "s3:ListBucketVersions")
+      && anytrue([for c in s.condition : c.test == "StringNotEquals" && c.variable == "s3:prefix" && toset(c.values) == toset(["pg/"])])
+    ])
+    error_message = "A version listing with any other prefix, or none, must be explicitly denied."
+  }
+
+  # By action rather than by resource: some of the VM role's resources (the
+  # sops key, the RDS resource id) are unknown at plan time, and no statement
+  # of it needs either action anywhere.
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.app_permissions.statement :
+      alltrue([for a in s.actions : !contains(["s3:DeleteObjectVersion", "s3:ListBucketVersions", "s3:*"], a)])
+    ])
+    error_message = "The VM role must stay unable to list or delete object versions (decisions §490): nothing the VM triggers may delete a backup."
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.app_permissions.statement :
+      !contains(s.actions, "s3:DeleteObject")
+      if s.sid == "Backups" || s.sid == "ListDataBuckets"
+    ])
+    error_message = "The VM role's backup-bucket statements must grant no delete."
+  }
+}
+
+run "backup_erasure_check_role_may_only_publish_its_own_heartbeat" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for st in data.aws_iam_policy_document.backup_erasure_check_metrics.statement :
+      toset(st.actions) == toset(["cloudwatch:PutMetricData"])
+      && anytrue([for c in st.condition : c.test == "StringEquals" && c.variable == "cloudwatch:namespace" && toset(c.values) == toset(["FeohLedger/BackupErasure"])])
+    ])
+    error_message = "The check role may publish metrics only into the FeohLedger/BackupErasure namespace."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.backup_erasure_check_metrics.role == "feohledger-backup-erasure-check"
+    error_message = "The metrics grant belongs to the check role, not the erase role."
+  }
+}
+
+run "backup_erasure_alarms_stay_off_until_armed" {
+  command = plan
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat) == 0 && length(aws_cloudwatch_metric_alarm.backup_erasure_overdue) == 0
+    error_message = "The erasure alarms must not exist before the owner arms them: the heartbeat would page about a check that was never meant to run yet."
+  }
+}
+
+run "backup_erasure_alarms_catch_a_silent_schedule_and_an_overdue_erasure" {
+  command = plan
+
+  variables {
+    backup_erasure_alarms_enabled = true
+  }
+
+  assert {
+    condition = (
+      one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).namespace == "FeohLedger/BackupErasure"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).metric_name == "CheckRan"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).treat_missing_data == "breaching"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).comparison_operator == "LessThanThreshold"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).period * one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).evaluation_periods <= 172800
+    )
+    error_message = "The heartbeat alarm must fire on a missing CheckRan within two days — missing data is the failure it exists for."
+  }
+
+  assert {
+    condition = (
+      one(aws_cloudwatch_metric_alarm.backup_erasure_overdue).metric_name == "Overdue"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_overdue).comparison_operator == "GreaterThanThreshold"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_overdue).threshold == 0
+    )
+    error_message = "The overdue alarm must fire on any erasure owed 45+ days."
+  }
+
+  assert {
+    condition = alltrue([
+      for a in [one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat), one(aws_cloudwatch_metric_alarm.backup_erasure_overdue)] :
+      toset(a.alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+    ])
+    error_message = "Both alarms email through the existing operator alerts topic."
+  }
+}
+
+run "rejects_a_sub_prefix_with_a_suffix" {
+  command = plan
+
+  variables {
+    github_oidc_sub_prefix = "repo:example-owner@1/feohledger@2:environment:production"
+  }
+
+  expect_failures = [var.github_oidc_sub_prefix]
+}
+
+run "rejects_a_sub_prefix_with_a_trailing_colon" {
+  command = plan
+
+  variables {
+    github_oidc_sub_prefix = "repo:example-owner@1/feohledger@2:"
+  }
+
+  expect_failures = [var.github_oidc_sub_prefix]
+}
+
+run "rejects_an_unset_sub_prefix_with_instructions" {
+  command = plan
+
+  variables {
+    github_oidc_sub_prefix = null
+  }
+
+  expect_failures = [var.github_oidc_sub_prefix]
 }
 
 # ── SPA on S3 + CloudFront (frontend.tf) ─────────────────────────────────────

@@ -25,6 +25,7 @@ infra/
 ├── canary.tf                    # hourly Synthetics canary validating api.'s Let's Encrypt certificate (pages under 14 days) + its artifacts bucket and role
 ├── canary/api-certificate/      # the canary's script (index.js), zipped at plan time into .build/ (gitignored)
 ├── deploy.tf                    # release deploys: the SSM command document that runs deploy.sh --ref, + the deploy role's grant to run it
+├── backup_erasure.tf            # backup erasure (decisions §490): two OIDC roles (daily check; approved erase) + three SSM documents on the VM
 ├── frontend.tf                  # the SPA: private S3 bucket + CloudFront (OAC, SPA router, headers, logs, alarms) + the deploy role's publish grant
 ├── cloudfront/spa-router.js     # the CloudFront Function: built files pass through, routes become /index.html
 ├── outputs.tf                   # exports for downstream modules
@@ -273,6 +274,105 @@ reviewer, and sends SSM Run Command to the VM, which runs
    Until then a release skips the deploy job rather than failing it.
 6. **Publish a release** (or run `Deploy to the VM` by hand from `main`) and
    approve it; the run's log ends with the tail of `deploy.sh`'s output.
+
+## Backup erasure
+
+`/legal/dpa` § 13 promises a removed tenant's backup dumps go within 60 days.
+Nothing the VM can trigger on its own may delete a backup — the VM role
+(`compute.tf`, Sid `Backups`) has no delete and no `ListBucketVersions` on the
+backup bucket, so a compromised VM cannot wipe the backup history
+(`../docs/decisions.md` §490). Every removal (a self-service closure, or
+`deploy/remove-tenant.sh`) leaves a `workspace_closures` row, and
+`.github/workflows/backup-erasure.yml` clears them. `backup_erasure.tf` holds
+its AWS pieces, which this module owns outright (unlike the deploy role):
+
+- **`feohledger-backup-erasure-check`** — assumed by the daily `check` job (no
+  environment). Trusts exactly `<prefix>:ref:refs/heads/main` with
+  `aud = sts.amazonaws.com`. May `ssm:SendCommand` only the read-only
+  `feohledger-backup-erasure-summary` document on only the app instance, plus
+  `ssm:GetCommandInvocation`, and `cloudwatch:PutMetricData` only into the
+  `FeohLedger/BackupErasure` namespace (its heartbeat, step 8). No S3.
+- **`feohledger-backup-erasure`** — assumed by the `erase` job, which runs in
+  its own `backup-erasure` environment and so waits for its required reviewer.
+  Trusts exactly `<prefix>:environment:backup-erasure` **and**
+  `token.actions.githubusercontent.com:ref = refs/heads/main` — never
+  `production`, which `aws-deploy.yml` and `aws-oidc-preflight.yml` share and
+  which they can reach from any branch. Before it asks for a token, the job
+  reads the environment back and refuses unless it has a required reviewer and
+  deploys from `main` only and does not let administrators bypass it, so step 4
+  below is checked on every run. May send only the
+  `feohledger-backup-erasure-owed` (read-only) and
+  `feohledger-backup-erasure-mark-cleared` documents, whose parameters SSM
+  refuses unless they are a UUID and a run number. On S3:
+  `s3:ListBucketVersions` on the backup bucket only with `s3:prefix = pg/` (and
+  an explicit Deny for any other prefix or none), `s3:DeleteObjectVersion` on
+  `pg/*/feoh_*.dump` only, and an explicit Deny of every delete on
+  `pg/*/feohledger.dump`, the shared control-plane dump. No Get, Put or
+  `DeleteObject`.
+
+The backup bucket has no Object Lock and no MFA delete, so a delete by version
+id is permanent. Because the queue comes from the VM, the erase job also checks
+the bucket before deleting (newest night ≤ 2 days old; nothing dumped after the
+recorded closure; a 7-day cool-off from both the closure date and the newest
+stored dump), so a
+forged entry naming a live tenant is refused (`../docs/decisions.md` §490).
+`github_oidc_sub_prefix` has no default: once this is merged, every `plan` of
+this module needs it set, whatever the plan is for. `<prefix>` is `var.github_oidc_sub_prefix` — read it, never
+build it from the slug (§ The deploy role is not owned here).
+
+**One-time operator steps**, in order:
+
+1. **Ship the backend and scripts** in a normal release, so the VM has
+   migration 0142, `deploy/backup-erasure-queue.sh` and
+   `scripts/workspace_closures.py owed`.
+2. **Set the subject prefix** in the private tfvars:
+   `gh api repos/jaredhoward-dev/feohledger/actions/oidc/customization/sub --jq .sub_claim_prefix`,
+   then add `github_oidc_sub_prefix = "<that value>"` with
+   `AWS_PROFILE=feohledger sops ~/github/infra-secrets/feohledger/prod.tfvars.sops`.
+   The variable has no default, so every plan fails until it is set.
+3. **Plan and apply** as in § Applying (with the database password, § Workload
+   stack step 3). The plan should add exactly the three
+   `aws_ssm_document.backup_erasure_*`, `aws_iam_role.backup_erasure` and
+   `aws_iam_role.backup_erasure_check`, and their three `aws_iam_role_policy`
+   (`backup_erasure`, `backup_erasure_check`, `backup_erasure_check_metrics`)
+   — no alarms until step 8 — and change nothing else.
+4. **Create the `backup-erasure` environment** (Settings → Environments → New
+   environment → `backup-erasure`): **Required reviewers** on (yourself;
+   leave prevent-self-review off while you are the only reviewer), and
+   **Deployment branches and tags** → Selected branches and tags → `main` only,
+   and **untick "Allow administrators to bypass configured protection rules"**
+   (GitHub ticks it by default; with it, an admin or a leaked admin token skips
+   the reviewer). Its subject is the same from any branch, so the branch rule is
+   what stops a workflow edited on a branch from reaching the erase role after
+   an approval. Do this before step 6: a workflow that names an environment
+   which does not exist makes GitHub create it with no rules at all. The erase
+   job reads all three settings back on every run and refuses unless they hold.
+5. **Give the workflow its secrets.** The check job is outside any environment,
+   so it reads repository secrets; the erase job reads the `backup-erasure`
+   environment's (and the repository's). Secrets, not variables: role ARNs and
+   the bucket name embed the account id, and these logs are public.
+   - `gh secret set AWS_BACKUP_ERASURE_CHECK_ROLE_ARN --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backup_erasure_check_role_arn)"`
+   - `gh secret set VM_INSTANCE_ID --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw app_instance_id)"` (the repository-level copy both jobs read; the `production` one stays for deploys)
+   - `gh secret set AWS_BACKUP_ERASURE_ROLE_ARN --env backup-erasure --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backup_erasure_role_arn)"`
+   - `gh secret set BACKUP_S3_BUCKET --env backup-erasure --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backups_bucket)"`
+6. **Arm the workflow**:
+   `gh variable set BACKUP_ERASURE_ENABLED --repo jaredhoward-dev/feohledger --body true`.
+   Until then the daily run skips.
+7. **Run it once** (`gh workflow run backup-erasure.yml --repo jaredhoward-dev/feohledger`),
+   check the `check` job's counts, and approve `erase` if it waits.
+8. **Arm the alarms** once that check is green: set
+   `backup_erasure_alarms_enabled = true` in the private tfvars and plan/apply.
+   That creates two CloudWatch alarms on the existing `alerts` topic (email):
+   `…-backup-erasure-heartbeat`, when the daily check has not published its
+   `FeohLedger/BackupErasure` `CheckRan` metric for two days — GitHub disables
+   a public repo's schedules after 60 days without repository activity, and a
+   disabled or broken schedule would otherwise also silence the 45-day alarm —
+   and `…-backup-erasure-overdue`, when its `Overdue` count is above zero. The
+   check publishes in `vars.AWS_REGION` (default `us-east-1`); the alarms live
+   in this module's region, so the two must agree, or the heartbeat alarm
+   fires. Armed earlier, the heartbeat alarm emails about a check that was
+   never meant to run yet. If the workflow is ever disarmed on purpose, set it
+   back to false too.
 
 ## Frontend on CloudFront
 

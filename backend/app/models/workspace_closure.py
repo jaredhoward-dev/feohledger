@@ -11,9 +11,16 @@ authorized it, and what the deletion removed.
 It also carries the one step the application cannot do itself: the per-tenant
 backup dumps live in the operator's backup bucket, which the API has no access
 to, and `/legal/dpa` § 13 promises they go within 60 days. `backups_cleared_at`
-is NULL until an operator runs `deploy/remove-tenant.sh <slug>` (whose backup
-leg runs on a tenant that is already gone) and marks the row with
-`scripts/workspace_closures.py` — that listing is the operator's work queue.
+is NULL until the approval-gated `backup-erasure` GitHub Actions workflow has
+deleted every version of the tenant's dumps and marked the row through
+`scripts/workspace_closures.py mark-cleared` (`docs/decisions.md` §490). Nothing
+the VM can run deletes a backup; this table is the queue that workflow reads.
+
+An operator removal (`scripts/delete_tenant.py`, behind
+`deploy/remove-tenant.sh`) writes a row here too, so every removed tenant is in
+that one queue and its slug is held by the same rule. It has no requesting
+user: `requested_by_user_id` and `requested_by_roles` are NULL and
+`step_up_proof` is `operator` (`OPERATOR_PROOF`).
 
 No foreign keys, on purpose: both the organisation and the requesting user are
 deleted by the closure this row describes. No email, name or company name:
@@ -36,6 +43,11 @@ CLOSURE_STARTED = "started"
 #: The tenant database, documents and control-plane rows are gone.
 CLOSURE_COMPLETED = "completed"
 
+#: `step_up_proof` of a removal an operator ran on the VM
+#: (`scripts/delete_tenant.py`): no API session asked for it, so there is no
+#: requesting user and no step-up; the authority is shell access to the VM.
+OPERATOR_PROOF = "operator"
+
 
 class WorkspaceClosure(Base):
     __tablename__ = "workspace_closures"
@@ -48,7 +60,9 @@ class WorkspaceClosure(Base):
         UUID(as_uuid=True), nullable=False, unique=True
     )
     slug: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    requested_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # NULL on an operator removal (`OPERATOR_PROOF`), which no user requested
+    # (migration 0142).
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     # The requester's role NAMES at the moment of the closure (e.g. ["admin"]),
     # because the user row they would be read from is deleted by it. Names
     # only: no address, no display name, no source IP — the IP is on the
@@ -56,7 +70,7 @@ class WorkspaceClosure(Base):
     requested_by_roles: Mapped[list | None] = mapped_column(JSONB)
     # `api/auth.require_sensitive_step_up`'s answer: totp | passkey |
     # mfa_off_local (the local-dev skip, named so it is never mistaken for a
-    # verified proof).
+    # verified proof) — or `operator` for an operator removal.
     step_up_proof: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     started_at: Mapped[datetime] = mapped_column(
@@ -71,9 +85,10 @@ class WorkspaceClosure(Base):
     # that happens, so this is where the failure is recorded.
     last_failure: Mapped[str | None] = mapped_column(String(64))
     last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Set by an operator once the tenant's backup objects are deleted (see the
-    # module docstring). NULL on a completed closure = still owed.
+    # Set once the tenant's backup objects are deleted (see the module
+    # docstring). NULL on a completed closure = still owed.
     backups_cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Who did: the operator identifier `scripts/workspace_closures.py
-    # mark-cleared --operator` requires (a handle or ticket, not an address).
+    # Who did: the identifier `scripts/workspace_closures.py mark-cleared
+    # --operator` requires — `github-actions-run-<run id>` from the erasure
+    # workflow, or a handle or ticket for a hand-run clear; never an address.
     backups_cleared_by: Mapped[str | None] = mapped_column(String(100))

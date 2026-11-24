@@ -14,6 +14,15 @@ Nothing here is undoable from the application. The confirmation is therefore
 deliberately awkward — the operator types the slug back — and ``--dry-run``
 prints the same inventory without touching anything.
 
+It does NOT delete the tenant's nightly backup dumps: nothing the VM runs may
+(``docs/decisions.md`` §490). Instead every deletion records a
+``workspace_closures`` row before it starts — the same queue a self-service
+closure writes — and the approval-gated ``backup-erasure`` workflow erases the
+dumps and marks that row. The row also holds the slug
+(``utils/slug.ensure_slug_not_held``) until then, because a new workspace under
+it would share the dumps' name. ``--no-backup-store`` is for a deployment with
+no backup bucket at all: the row is recorded with its backups already cleared.
+
 Usage:
     python scripts/delete_tenant.py --slug acme --dry-run
     python scripts/delete_tenant.py --slug acme --confirm acme
@@ -38,12 +47,43 @@ from app.services.tenant_deletion import (
     format_confirmation,
     plan_tenant_deletion,
 )
+from app.services.workspace_closure import (
+    latest_closure_for_slug,
+    record_operator_removal_completed,
+    record_operator_removal_started,
+)
 
-#: No organisation has the slug. Distinct from 2 (any other refusal) and from
-#: an exception's 1, because `deploy/remove-tenant.sh` treats exactly this one as
-#: "the live data is already gone" and carries on with the backups — every
-#: other failure has to stop it before it deletes them.
+#: No organisation has the slug, and a removal of it is on record: the live
+#: data is already gone. Distinct from 2 (any other refusal) and from an
+#: exception's 1, because `deploy/remove-tenant.sh` treats exactly this one as
+#: "already removed" — every other failure has to stop it.
 EXIT_NOT_FOUND = 4
+#: No organisation has the slug and no removal of it was ever recorded: most
+#: likely a typo. `deploy/remove-tenant.sh` refuses on it.
+EXIT_NO_RECORD = 5
+
+#: `backups_cleared_by` for a removal on a deployment with no backup store.
+NO_BACKUP_STORE = "no-backup-store"
+
+
+async def _report_missing(slug: str) -> int:
+    """Say what became of a slug with no organisation: whether its removal is
+    on record, and whether its backups are erased yet."""
+    record = await latest_closure_for_slug(slug)
+    if record is None:
+        print(f"delete_tenant: no organisation with slug {slug!r}, and no removal of it on record.")
+        return EXIT_NO_RECORD
+    when = (record.completed_at or record.started_at).date().isoformat()
+    if record.backups_cleared_at is not None:
+        backups = f"erased {record.backups_cleared_at.date().isoformat()}"
+    else:
+        backups = "still owed: erased by the approval-gated backup-erasure workflow"
+    print(
+        f"No organisation with slug {slug!r}: removed {when} "
+        f"(organisation {record.organization_id})."
+    )
+    print(f"Backups:           {backups}")
+    return EXIT_NOT_FOUND
 
 
 def _print_plan(plan) -> None:
@@ -80,13 +120,18 @@ async def main() -> int:
         help="Skip the typed confirmation. For a wrapper that already confirmed "
         "(deploy/remove-tenant.sh does).",
     )
+    parser.add_argument(
+        "--no-backup-store",
+        action="store_true",
+        help="This deployment keeps no backup dumps (no BACKUP_S3_BUCKET): record the "
+        "removal with nothing owed to the backup-erasure workflow.",
+    )
     args = parser.parse_args()
 
     try:
         plan = await plan_tenant_deletion(args.slug)
-    except TenantNotFound as exc:
-        print(f"delete_tenant: {exc}", file=sys.stderr)
-        return EXIT_NOT_FOUND
+    except TenantNotFound:
+        return await _report_missing(args.slug)
     except TenantDeletionError as exc:
         print(f"delete_tenant: {exc}", file=sys.stderr)
         return 2
@@ -107,11 +152,21 @@ async def main() -> int:
         )
         return 3
 
+    # Recorded BEFORE anything is deleted, so a run that dies part-way is on
+    # the queue (`workspace_closures.py list`) and holds the slug.
+    await record_operator_removal_started(plan.organization_id, plan.slug)
+
     try:
         result = await delete_tenant(args.slug)
     except TenantDeletionError as exc:
         print(f"delete_tenant: {exc}", file=sys.stderr)
         return 2
+
+    await record_operator_removal_completed(
+        plan.organization_id,
+        result,
+        backups_cleared_by=NO_BACKUP_STORE if args.no_backup_store else None,
+    )
 
     print()
     print(format_confirmation(result))
