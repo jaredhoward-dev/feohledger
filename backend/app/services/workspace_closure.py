@@ -1224,7 +1224,10 @@ async def record_operator_removal_started(org_id: uuid.UUID, slug: str) -> None:
 
     A row already there is kept as it is: it is a self-service closure that
     did not finish, and the operator is finishing it, so who asked for it stays
-    the administrator who did.
+    the administrator who did. The reverse is not symmetrical: if an operator
+    removal dies before its deletion and the administrator then closes the
+    workspace themselves, `_record_started` rewrites the row as theirs, since
+    the closure that completed is the one they asked for.
     """
     async with control_session_factory() as s:
         stmt = (

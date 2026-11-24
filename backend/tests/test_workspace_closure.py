@@ -1025,6 +1025,19 @@ async def test_an_operator_finishing_a_self_service_closure_keeps_its_requester(
     assert row.step_up_proof == "totp"
 
 
+async def test_a_self_service_closure_after_a_failed_operator_removal_is_the_admins(realdb, trial):
+    """An operator removal that died before deleting leaves its row; the
+    administrator's own closure then completes and owns it."""
+    org_id = trial["result"].organization_id
+    await workspace_closure.record_operator_removal_started(org_id, trial["slug"])
+    assert (await _close(realdb, trial["slug"])).status_code == 200
+
+    row = await _closure_row(realdb, org_id)
+    assert row.status == CLOSURE_COMPLETED
+    assert row.requested_by_user_id == trial["result"].user_id
+    assert row.step_up_proof != OPERATOR_PROOF
+
+
 async def test_the_latest_record_answers_for_a_removed_slug(realdb, trial):
     assert await workspace_closure.latest_closure_for_slug(trial["slug"]) is None
     assert (await _close(realdb, trial["slug"])).status_code == 200

@@ -42,11 +42,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  # One erasure at a time; never cancel one mid-deletion.
-  group: backup-erasure
-  cancel-in-progress: false
-
 jobs:
   check:
     name: Count owed erasures
@@ -108,6 +103,14 @@ jobs:
     # carries the required reviewer: nothing below runs until it is approved.
     environment: production
     timeout-minutes: 60
+    # One erasure at a time; never cancel one mid-deletion. On this job, not
+    # the workflow: an erase waiting days for its reviewer must not hold back
+    # the next daily check, whose `attention` job is what turns an entry
+    # crossing 45 days red. A newer waiting erase replaces an older one, which
+    # loses nothing — it re-reads the queue when it is approved.
+    concurrency:
+      group: backup-erasure-erase
+      cancel-in-progress: false
     permissions:
       id-token: write # OIDC: assume the erase role, no long-lived keys
       contents: read
