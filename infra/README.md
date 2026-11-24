@@ -333,8 +333,9 @@ build it from the slug (§ The deploy role is not owned here).
 3. **Plan and apply** as in § Applying (with the database password, § Workload
    stack step 3). The plan should add exactly the three
    `aws_ssm_document.backup_erasure_*`, `aws_iam_role.backup_erasure` and
-   `aws_iam_role.backup_erasure_check`, and their two `aws_iam_role_policy` —
-   and change nothing else.
+   `aws_iam_role.backup_erasure_check`, and their three `aws_iam_role_policy`
+   (`backup_erasure`, `backup_erasure_check`, `backup_erasure_check_metrics`)
+   — no alarms until step 8 — and change nothing else.
 4. **Create the `backup-erasure` environment** (Settings → Environments → New
    environment → `backup-erasure`): **Required reviewers** on (yourself;
    leave prevent-self-review off while you are the only reviewer), and
