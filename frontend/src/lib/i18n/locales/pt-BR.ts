@@ -2969,6 +2969,7 @@ export const messages = {
 	'goodsReceipts.tabs.inspections': 'Inspeções',
 	'goodsReceipts.inspections.hint': 'Uma inspeção de qualidade é a quarta etapa da conciliação com o pedido de compra: «aprovada» deixa a conciliação inalterada, «reprovada» bloqueia a fatura com uma retenção de qualidade e uma aceitação parcial registra quanto foi de fato aceito. Se a inspeção é obrigatória antes do pagamento é resolvido por fatura — regra do fornecedor, depois regra da categoria (conta contábil) e depois o padrão da organização — portanto nem sempre é exigida.',
 	'goodsReceipts.inspections.empty': 'Nenhuma inspeção de qualidade registrada.',
+	'goodsReceipts.inspections.empty.errored': "Não foi possível carregar as inspeções de qualidade.",
 	'goodsReceipts.inspections.loadMore': 'Carregar mais ({shown} de {total})',
 	'goodsReceipts.inspections.showingAll':
 		'{total, plural, one {Mostrando # inspeção} other {Mostrando as # inspeções}}',

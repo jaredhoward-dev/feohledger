@@ -2915,6 +2915,7 @@ export const messages = {
 	'goodsReceipts.tabs.inspections': '検査',
 	'goodsReceipts.inspections.hint': '品質検査は発注照合の4番目の要素です。合格なら照合は変わらず、不合格なら品質保留で請求書がブロックされ、一部受入なら実際に受け入れた数量が記録されます。支払前に検査が必須かどうかは請求書ごとに決まり（仕入先ルール → 品目（勘定科目）ルール → 組織の既定値）、常に必須というわけではありません。',
 	'goodsReceipts.inspections.empty': '品質検査は登録されていません。',
+	'goodsReceipts.inspections.empty.errored': "品質検査を読み込めませんでした。",
 	'goodsReceipts.inspections.loadMore': 'さらに読み込む（{total}件中{shown}件）',
 	'goodsReceipts.inspections.showingAll': '{total, plural, other {#件すべての検査を表示中}}',
 	'goodsReceipts.inspections.col.number': '検査番号',

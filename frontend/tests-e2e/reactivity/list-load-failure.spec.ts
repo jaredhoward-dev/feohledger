@@ -116,6 +116,16 @@ const CASES: Case[] = [
 		notShown: /No goods receipts\./,
 		shown: /Could not load goods receipts/
 	},
+	// The Inspections tab on the same page only toasted its failure and left
+	// "No quality inspections recorded." standing; it now renders `ui/LoadError`.
+	{
+		name: 'quality inspections (inspections tab)',
+		retry: true,
+		route: '/goods-receipts?tab=inspections',
+		apiPathname: '/api/inspections',
+		notShown: /No quality inspections recorded/,
+		shown: /Could not load quality inspections/
+	},
 	{
 		name: 'requisitions',
 		retry: true,
@@ -357,6 +367,12 @@ const RETRY_CASES: RetryCase[] = [
 		route: '/payments?tab=history',
 		apiPathname: '/api/payments',
 		errorText: /Could not load payments/
+	},
+	{
+		name: 'quality inspections (goods-receipts inspections tab)',
+		route: '/goods-receipts?tab=inspections',
+		apiPathname: '/api/inspections',
+		errorText: /Could not load quality inspections/
 	}
 ];
 

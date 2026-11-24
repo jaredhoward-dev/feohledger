@@ -2970,6 +2970,7 @@ export const messages = {
 	'goodsReceipts.tabs.inspections': 'Prüfungen',
 	'goodsReceipts.inspections.hint': 'Eine Qualitätsprüfung ist die vierte Stufe des Bestellabgleichs: „Bestanden“ lässt den Abgleich unverändert, „Nicht bestanden“ sperrt die Rechnung mit einer Qualitätssperre, und eine Teilannahme hält fest, wie viel tatsächlich angenommen wurde. Ob vor der Zahlung eine Prüfung erforderlich ist, wird je Rechnung aufgelöst — Lieferantenregel, dann Warengruppenregel (Sachkonto), dann Organisationsstandard — sie ist also nicht immer Pflicht.',
 	'goodsReceipts.inspections.empty': 'Keine Qualitätsprüfungen erfasst.',
+	'goodsReceipts.inspections.empty.errored': "Qualitätsprüfungen konnten nicht geladen werden.",
 	'goodsReceipts.inspections.loadMore': 'Mehr laden ({shown} von {total})',
 	'goodsReceipts.inspections.showingAll':
 		'{total, plural, one {Alle # Prüfung wird angezeigt} other {Alle # Prüfungen werden angezeigt}}',
