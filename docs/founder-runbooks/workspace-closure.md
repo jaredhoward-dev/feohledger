@@ -36,10 +36,18 @@ them.
   organisations that exist, and the backup bucket's access logs.
 - At most 50 workspaces per run, erasable ones first, oldest first; the rest
   follow on later runs.
-- **If it refuses the environment** ("no required reviewer", "any branch"),
-  someone changed the `backup-erasure` environment's settings: put back the
-  required reviewer and the `main`-only branch rule (`infra/README.md`
-  § Backup erasure step 4) before approving anything.
+- **If it refuses the environment** ("no required reviewer", "any branch",
+  "bypass"), someone changed the `backup-erasure` environment's settings: put
+  back the required reviewer, the `main`-only branch rule and the unticked
+  administrator bypass (`infra/README.md` § Backup erasure step 4) before
+  approving anything.
+- **The `backup-erasure-heartbeat` alarm** (email) means the daily check has
+  not run for two days. Most likely GitHub disabled the schedule after 60 days
+  without repository activity: re-enable it with
+  `gh workflow enable backup-erasure.yml --repo jaredhoward-dev/feohledger` and
+  run it once. Otherwise read the last run. Until it runs again nothing warns
+  you before the 60-day deadline. **`backup-erasure-overdue`** is the 45-day
+  alarm from AWS's side.
 - **Once approved**, for each owed workspace it deletes every version and every
   delete marker of `pg/*/feoh_<slug>.dump`, lists the bucket again and requires
   none to be left, and only then marks the row cleared
@@ -90,6 +98,29 @@ The erase job refuses a workspace, for a human to decide, when:
   next run erases the dumps.
 
 The public log names neither; `list` on the VM shows which organisation it is.
+
+## After restoring the control plane
+
+Restoring an older control-plane dump (`deploy/restore.sh`) rolls
+`workspace_closures` back to that night:
+
+- **Rows cleared since then read owed again** (`backups_cleared_at` is lost).
+  The erase job finds those dumps already gone, re-lists to empty and marks
+  them cleared again: nothing is deleted twice. The overdue alarm may fire for
+  them first; approve the run.
+- **Removals since then are forgotten**: their closure rows are gone and their
+  organisation rows are back. A restore of tenant databases from the same night
+  may bring their data back too. That is data the customer was told is deleted.
+  Remove each one again with `deploy/remove-tenant.sh <slug>` (which records a
+  fresh closure), and do not re-open it.
+- **The erase job cannot be led into deleting a live tenant by this.** An owed
+  row whose organisation exists again is `slug_in_use`; one whose database is
+  back is `database_exists` (both blocked, red); and any tenant dumped after its
+  recorded removal goes red without being touched.
+
+After any restore: run `scripts/workspace_closures.py list`, compare it with the
+removals you made since the dump's night (the runbook's own record, the
+erasure workflow's past runs), and redo each forgotten one.
 
 ## When the workflow cannot run
 

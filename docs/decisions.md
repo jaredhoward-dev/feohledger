@@ -24842,7 +24842,9 @@ backups are no protection against the compromise they exist for. So:
   trust policies). Its first step, before any AWS credential, reads the
   environment back through the API (`actions: read`) and refuses unless it
   has a required reviewer and deploys from `main` only (a custom policy of
-  exactly `main`, or protected branches), and unless the run's ref is `main`
+  exactly `main`, or protected branches) and does not let administrators
+  bypass its rules (`can_admins_bypass`, which GitHub sets to true by
+  default), and unless the run's ref is `main`
   — so the owner settings the role relies on are checked on every run rather
   than assumed. Not `production`:
   `aws-deploy.yml` and `aws-oidc-preflight.yml` also run there and can be
@@ -24883,7 +24885,22 @@ backups are no protection against the compromise they exist for. So:
   forge an entry dated before that, and a reviewer who approves without
   looking would let it through. The nightly backup heartbeat, the freshness
   check and the red alarm on any post-closure dump make that harder and
-  visible; they do not close it.
+  visible; they do not close it. The dates in the bucket's keys are the VM's
+  too, so they are parsed strictly: a nightly prefix dated in the future or
+  not a real date refuses the whole run, and an unparseable dump date refuses
+  its entry — none of them may read as "old enough".
+- **The alarm cannot die silently.** GitHub disables a public repo's
+  scheduled workflows after 60 days without repository activity, and a
+  disabled, disarmed or broken workflow also stops the daily check and with it
+  the 45-day red run. So the check job publishes a heartbeat
+  (`FeohLedger/BackupErasure` `CheckRan`, and the `Overdue` count) under a
+  `cloudwatch:PutMetricData` grant conditioned on that namespace, and two
+  CloudWatch alarms on the existing alerts topic fire when no heartbeat has
+  arrived for two days (`treat_missing_data = breaching`) or `Overdue` is above
+  zero. They are created only once the owner arms them
+  (`backup_erasure_alarms_enabled`) after the workflow's first green check,
+  so they never email about a check that was not meant to run yet. Failing to
+  publish fails the check.
 - **The erase role's S3 grant** is `s3:ListBucketVersions` on the bucket only
   with `s3:prefix = pg/` (plus an explicit Deny for any other prefix or none),
   `s3:DeleteObjectVersion` on `pg/*/feoh_*.dump` only, and an explicit Deny of
@@ -24905,7 +24922,11 @@ done in this change: the page describes `job_workflow_ref` for reusable
 workflows, its value for an ordinary job was not verified, and a wrong value
 fails the handshake closed.
 
-**Accepted residuals.** The check role trusts any workflow on `main`; it can
+**Accepted residuals.** Every count the daily check and the overdue alarm see
+comes from the VM; a compromised VM can report an empty queue and suppress
+both. It can equally decline to record a removal at all; the backups it hides
+are then not erased late but simply not erased, which no check outside the VM
+can know is owed. The check role trusts any workflow on `main`; it can
 only run the read-only `summary` document, which prints counts, so a workflow
 merged to `main` gains nothing it could not read from the public run log.
 `ssm:GetCommandInvocation` is granted on `*` to both roles because SSM defines
@@ -24916,6 +24937,10 @@ never which, and a cost of running the erasure in the open.
 
 **Rejected:**
 
+- **Leaving `github_oidc_sub_prefix` required with no default.** Every plan of
+  `infra/` would fail with Terraform's bare "No value for required variable";
+  it defaults to null so its validation fails instead, with the `gh api`
+  command that reads the value.
 - **Inferring "no backup store" from an empty `BACKUP_S3_BUCKET`.** It would
   record the backups cleared and release the slug on a misread env;
   `remove-tenant.sh` needs the operator's explicit `--no-backup-store`.

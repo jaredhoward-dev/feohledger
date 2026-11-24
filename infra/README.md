@@ -290,7 +290,8 @@ its AWS pieces, which this module owns outright (unlike the deploy role):
   environment). Trusts exactly `<prefix>:ref:refs/heads/main` with
   `aud = sts.amazonaws.com`. May `ssm:SendCommand` only the read-only
   `feohledger-backup-erasure-summary` document on only the app instance, plus
-  `ssm:GetCommandInvocation`. No S3.
+  `ssm:GetCommandInvocation`, and `cloudwatch:PutMetricData` only into the
+  `FeohLedger/BackupErasure` namespace (its heartbeat, step 8). No S3.
 - **`feohledger-backup-erasure`** — assumed by the `erase` job, which runs in
   its own `backup-erasure` environment and so waits for its required reviewer.
   Trusts exactly `<prefix>:environment:backup-erasure` **and**
@@ -298,7 +299,8 @@ its AWS pieces, which this module owns outright (unlike the deploy role):
   `production`, which `aws-deploy.yml` and `aws-oidc-preflight.yml` share and
   which they can reach from any branch. Before it asks for a token, the job
   reads the environment back and refuses unless it has a required reviewer and
-  deploys from `main` only, so step 4 below is checked on every run. May send only the
+  deploys from `main` only and does not let administrators bypass it, so step 4
+  below is checked on every run. May send only the
   `feohledger-backup-erasure-owed` (read-only) and
   `feohledger-backup-erasure-mark-cleared` documents, whose parameters SSM
   refuses unless they are a UUID and a run number. On S3:
@@ -336,9 +338,14 @@ build it from the slug (§ The deploy role is not owned here).
 4. **Create the `backup-erasure` environment** (Settings → Environments → New
    environment → `backup-erasure`): **Required reviewers** on (yourself;
    leave prevent-self-review off while you are the only reviewer), and
-   **Deployment branches and tags** → Selected branches and tags → `main` only.
-   Its subject is the same from any branch, so the branch rule is what stops a
-   workflow edited on a branch from reaching the erase role after an approval.
+   **Deployment branches and tags** → Selected branches and tags → `main` only,
+   and **untick "Allow administrators to bypass configured protection rules"**
+   (GitHub ticks it by default; with it, an admin or a leaked admin token skips
+   the reviewer). Its subject is the same from any branch, so the branch rule is
+   what stops a workflow edited on a branch from reaching the erase role after
+   an approval. Do this before step 6: a workflow that names an environment
+   which does not exist makes GitHub create it with no rules at all. The erase
+   job reads all three settings back on every run and refuses unless they hold.
 5. **Give the workflow its secrets.** The check job is outside any environment,
    so it reads repository secrets; the erase job reads the `backup-erasure`
    environment's (and the repository's). Secrets, not variables: role ARNs and
@@ -352,6 +359,19 @@ build it from the slug (§ The deploy role is not owned here).
    Until then the daily run skips.
 7. **Run it once** (`gh workflow run backup-erasure.yml --repo jaredhoward-dev/feohledger`),
    check the `check` job's counts, and approve `erase` if it waits.
+8. **Arm the alarms** once that check is green: set
+   `backup_erasure_alarms_enabled = true` in the private tfvars and plan/apply.
+   That creates two CloudWatch alarms on the existing `alerts` topic (email):
+   `…-backup-erasure-heartbeat`, when the daily check has not published its
+   `FeohLedger/BackupErasure` `CheckRan` metric for two days — GitHub disables
+   a public repo's schedules after 60 days without repository activity, and a
+   disabled or broken schedule would otherwise also silence the 45-day alarm —
+   and `…-backup-erasure-overdue`, when its `Overdue` count is above zero. The
+   check publishes in `vars.AWS_REGION` (default `us-east-1`); the alarms live
+   in this module's region, so the two must agree, or the heartbeat alarm
+   fires. Armed earlier, the heartbeat alarm emails about a check that was
+   never meant to run yet. If the workflow is ever disarmed on purpose, set it
+   back to false too.
 
 ## Frontend on CloudFront
 
