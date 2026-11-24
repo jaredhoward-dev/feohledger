@@ -372,13 +372,65 @@ async def _find_vendor(
     return (await db.execute(query.limit(1))).scalars().first()
 
 
+# How far a merge chain (A merged into B, B later merged into C) is followed
+# before it is treated as broken. Real chains are one or two hops; the cap only
+# guarantees termination on a corrupted record.
+_MERGE_CHAIN_MAX_HOPS = 16
+
+
+@dataclass
+class _CodeClaimant:
+    """One supplier a CSV ``code`` names, after merges are followed.
+
+    ``vendor`` is the surviving record. ``by_code`` is True when it, or a
+    duplicate merged into it, holds the value as ``Vendor.code`` rather than
+    only as ``Vendor.erp_vendor_id``. ``unresolved`` marks a merged-away vendor
+    whose survivor could not be reached (missing, another org, a cycle, or a
+    chain past the cap): it is kept as its own claimant so nothing silently
+    lands on it, and the invoice resolver refuses it.
+    """
+
+    vendor: Vendor
+    by_code: bool
+    unresolved: bool = False
+
+
+async def _merge_survivor(
+    db: AsyncSession, organization_id: uuid.UUID, vendor: Vendor
+) -> Vendor | None:
+    """The vendor ``vendor`` was finally merged into, or None if unreachable.
+
+    Follows ``merged_into_vendor_id`` hop by hop, within the org, with a
+    visited set and a hop cap, so a chain or a corrupted cycle terminates.
+    """
+    seen: set[uuid.UUID] = {vendor.id}
+    current = vendor
+    for _ in range(_MERGE_CHAIN_MAX_HOPS):
+        target_id = current.merged_into_vendor_id
+        if target_id is None:
+            return current
+        if target_id in seen:
+            return None
+        seen.add(target_id)
+        current = (
+            await db.execute(
+                select(Vendor).where(
+                    Vendor.id == target_id, Vendor.organization_id == organization_id
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            return None
+    return None
+
+
 async def _vendors_claiming_code(
     db: AsyncSession,
     organization_id: uuid.UUID,
     entity_id: uuid.UUID | None,
     code: str,
-) -> list[Vendor]:
-    """Up to two vendors in scope that a CSV ``code`` could mean.
+) -> list[_CodeClaimant]:
+    """The distinct suppliers in scope that a CSV ``code`` could mean.
 
     A vendor claims ``code`` if it holds it as ``Vendor.code`` (typed by a
     person, written by an import, or the ERP's vendor number the sync writes
@@ -387,6 +439,12 @@ async def _vendors_claiming_code(
     among claimants: one claimant is the answer, two is a refusal (decisions
     §491). Scoped like :func:`_find_vendor`, so another subsidiary's supplier
     is never a claimant.
+
+    A merged-away duplicate (``merged_into_vendor_id`` set) keeps its code but
+    is not a claimant in its own right: it stands for its survivor, so A plus
+    B-merged-into-A holding the same code is ONE claimant, A — the refusal's
+    own advice ("merge them") then actually clears it — and a code only a
+    retired duplicate still holds resolves to the vendor it was merged into.
     """
     query = scope_vendor_candidates(
         select(Vendor).where(
@@ -395,7 +453,21 @@ async def _vendors_claiming_code(
         ),
         entity_id,
     )
-    return list((await db.execute(query.limit(2))).scalars().all())
+    claimants: dict[uuid.UUID, _CodeClaimant] = {}
+    for vendor in (await db.execute(query)).scalars().all():
+        by_code = vendor.code == code
+        unresolved = False
+        survivor: Vendor | None = vendor
+        if vendor.merged_into_vendor_id is not None:
+            survivor = await _merge_survivor(db, organization_id, vendor)
+            if survivor is None:
+                survivor, unresolved = vendor, True
+        existing = claimants.get(survivor.id)
+        if existing is None:
+            claimants[survivor.id] = _CodeClaimant(survivor, by_code, unresolved)
+        else:
+            existing.by_code = existing.by_code or by_code
+    return list(claimants.values())
 
 
 def _ambiguous_code(code: str) -> ImportRowError:
@@ -519,7 +591,7 @@ async def import_vendors_csv(
                 result.errors.append(error)
                 result.skipped += 1
                 continue
-            existing = claimants[0] if claimants else None
+            existing = claimants[0].vendor if claimants else None
         if existing is None:
             existing = await _find_vendor(
                 db, organization_id, entity_id, func.lower(Vendor.name) == name.lower()
@@ -961,14 +1033,22 @@ async def _resolve_or_create_vendor(
     or to another vendor's ERP record id — are refused, never settled by the
     entity precedence the name lookup uses; and a code that is only some
     vendor's ERP record id is refused too, rather than resolved by name or
-    minted as a stub that would then share it (decisions §491).
+    minted as a stub that would then share it (decisions §491). A code held by
+    a merged-away duplicate resolves to its survivor; one whose survivor cannot
+    be reached is refused rather than landing on the retired record.
+
+    A code no vendor claims falls through to the name lookup, which may land
+    the row on a same-named vendor holding a DIFFERENT code. That is accepted
+    on purpose for now (decisions §491, consequences).
     """
     if vendor_code:
         claimants = await _vendors_claiming_code(db, organization_id, entity_id, vendor_code)
-        if len(claimants) > 1 or (claimants and claimants[0].code != vendor_code):
+        if len(claimants) > 1 or (
+            claimants and (not claimants[0].by_code or claimants[0].unresolved)
+        ):
             return None, _ambiguous_code(vendor_code)
         if claimants:
-            return claimants[0], None
+            return claimants[0].vendor, None
 
     if vendor_name:
         vendor = await _find_vendor(
