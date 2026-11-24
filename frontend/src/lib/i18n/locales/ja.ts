@@ -831,7 +831,7 @@ export const messages = {
 	'payments.cardStatus.completed': '完了',
 	'payments.cardStatus.expired': '期限切れ',
 	'payments.cardStatus.cancelled': 'キャンセル済み',
-	'payments.cardStatus.declined': '拒否',
+	'payments.cardStatus.declined': '決済拒否',
 	'payments.method.ach': 'ACH',
 	'payments.method.wire': '電信送金',
 	'payments.method.check': '小切手',
