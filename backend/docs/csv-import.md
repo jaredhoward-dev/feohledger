@@ -212,9 +212,17 @@ importers resolve a code only when it names exactly one vendor in scope
   minted, and the name match wins even when that vendor holds a different
   code (`Acme Ltd,ACME-2` lands on `Acme Ltd`/`ACME-1`); this is accepted on
   purpose for migrations from a system with other codes (decisions §491).
-- **Vendor import.** A file row whose `code` one vendor claims (as its code or
-  its ERP record id) is that vendor and is skipped as a duplicate; a code two
-  vendors claim refuses the row with the same code.
+- **Vendor import.** A file row whose `code` one vendor holds as its `code`,
+  or holds only as its ERP record id under the *same* name (trimmed,
+  case-insensitive; a duplicate merged into it counts), is that vendor and is
+  skipped quietly as a duplicate. A row whose `code` is only the ERP record id
+  a vendor of *another* name is linked by is not created either — it would
+  share that link — but it is reported, not skipped quietly, as
+  `csv_vendor_code_is_erp_link` (`params: {value, name, vendor}`): `Acme
+  Corp,77` against "Seventy Seven" linked by ERP id 77 says Acme Corp was not
+  created and to give it a different code (decisions §493). It is a row error
+  counted in `skipped`, like every other row not imported. A code two vendors
+  claim refuses the row as `csv_vendor_code_ambiguous`.
 
 The importers only read codes: no vendor's `code` or ERP link is changed, so a
 person-typed code is never moved or reinterpreted. To clear a refusal, give the
@@ -239,6 +247,7 @@ the web import modal (`ImportCsvModal.svelte`, shared by `/vendors` and
 | `csv_invoice_number_required` | invoices | — | `invoice_number` is blank. |
 | `csv_vendor_required` | invoices | — | Both `vendor_name` and `vendor_code` are blank. |
 | `csv_vendor_code_ambiguous` | invoices, vendors | `value` | The code does not name exactly one vendor (§ A vendor code must name one vendor). |
+| `csv_vendor_code_is_erp_link` | vendors | `value`, `name`, `vendor` | The code is only the ERP record id a differently-named vendor is linked by; the row is not created (§ A vendor code must name one vendor). |
 | `csv_amount_invalid` | invoices | `value` | `amount` is blank, unparseable, negative or too wide (§ Amount range). |
 | `csv_currency_required` | invoices, card feed | — | `currency` is blank or missing. |
 | `csv_currency_invalid` | invoices, card feed | `value` | `currency` is not a three-letter code. |
