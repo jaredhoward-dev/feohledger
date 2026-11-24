@@ -74,13 +74,21 @@ own account setup requires a project or a transaction code we were not given,
 it answers 400 and the invoice fails visibly (``invalid_request``) — the fix is
 the tenant config, never a guessed value.
 
-**Accounts are addressed by number.** The AP API names a distribution's account
-by ``account_number`` (``01-5000-00``), never by the GL API's ``account_id``,
-so :meth:`list_gl_accounts` stores the account number as ``erp_account_id`` and
-the line's ``gl_account_erp_id`` is posted as-is. That link follows a
-renumbering rather than the account (decisions §492; keying by ``account_id``
-needs an id → number read per post, a tracked followup). Accounts with
-``prevent_data_entry`` set are not synced: a bill coded to one cannot post.
+**Accounts are linked by id, posted by number** (decisions §494). The AP API
+names a distribution's account only by ``account_number`` (``01-5000-00``), and
+a number is what an accountant renumbers, so :meth:`list_gl_accounts` links
+each account by the GL API's stable ``account_id``, stored as ``id:<id>``
+(:data:`GL_ID_PREFIX`; the prefix keeps it apart from a number link, as
+Intacct's ``key:`` does, §492). At post time :meth:`_resolve_accounts` turns
+each ``id:`` link into the account's CURRENT number from ONE walk of the chart
+listing per push (stopping once every linked id is found, counted in the
+push's call reserve), never a read per line. A linked id the chart no longer
+holds, or an account closed to data entry (``prevent_data_entry``), refuses the
+push ``account_inactive`` (``params.accounts`` = our GL codes) before the
+create, so nothing is half-posted. A bare number link from before §494 still
+posts as-is until the next chart sync re-keys it (``services/gl_account_sync``
+rule 2, recorded in ``link_changes``). Accounts with ``prevent_data_entry`` set
+are synced ``active=False``.
 
 **Asynchronous create.** ``POST /invoices`` is deprecated in favour of
 ``POST /invoices/process``, which queues a background job and returns a
@@ -226,6 +234,9 @@ JOB_FAILED = "job_failed"
 PERIOD_CLOSED = "period_closed"
 VENDOR_INACTIVE = "vendor_inactive"
 IDEMPOTENCY_LOOKUP_INCOMPLETE = "idempotency_lookup_incomplete"
+#: An ``id:`` link the chart no longer holds, or an account closed to data
+#: entry (decisions §494). The shared code QuickBooks and Intacct use.
+ACCOUNT_INACTIVE = "account_inactive"
 
 #: Background-process status codes (``BackgroundProcessStatus.status``).
 _JOB_COMPLETED = 5
@@ -246,7 +257,9 @@ FISCAL_YEAR_CACHE_SECONDS = 900.0
 #: Fiscal-year ``status`` values that take no posting.
 _CLOSED_YEAR_STATUSES = frozenset({"Closed", "Purged"})
 
-#: List page size and :meth:`_pages`' default cap (10 × 100 rows). The chart,
+#: List page size and :meth:`_pages`' default cap (10 × 100 rows).
+#: :data:`CHART_RESOLVE_MAX_PAGES` (below) is the post-time chart walk's cap: the
+#: sync's own bound, so any account a sync could link can be resolved. The chart,
 #: vendor and PO listings read up to ``SYNC_LISTING_MAX_ROWS`` and raise past it
 #: (``_sync_rows``). The idempotency search reads ListInvoices' maximum page
 #: (500): once unnarrowed, then up to 4 pages narrowed to the invoice's date.
@@ -254,6 +267,7 @@ _PAGE_SIZE = 100
 _MAX_PAGES = 10
 _LOOKUP_PAGE_SIZE = 500
 _LOOKUP_MAX_PAGES = 4
+CHART_RESOLVE_MAX_PAGES = sync_listing_pages(_PAGE_SIZE)
 
 #: ``VendorStatus`` values that are not a payee FeohLedger may pay. ``OnHold``
 #: still takes an invoice in FE NXT, but FE NXT holds its payments, so paying
@@ -276,19 +290,45 @@ def lookup_dates(payload: InvoicePayload) -> list[date]:
     return dates
 
 
-def push_call_reserve(pending_job: bool, lookup_windows: int = 1) -> int:
+def push_call_reserve(pending_job: bool, lookup_windows: int = 1, chart_pages: int = 0) -> int:
     """The most SKY calls one :meth:`BlackbaudFeNxtAdapter.post_invoice` can make.
 
     The call budget is asked for this much before the first call, so a push
     it lets start is never cut off half way (after the create, a refused call
     would leave the job unconfirmed). Derived from the same constants the
     push reads: the lookup (one page, then up to ``_LOOKUP_MAX_PAGES``
-    narrowed, per date searched), the fiscal years, the create, the 400's
-    vendor read, and the job watch — twice when an earlier attempt's job is
-    read first.
+    narrowed, per date searched), the fiscal years, the chart walk that
+    resolves ``id:`` links (``chart_pages``, 0 when the bill has none), the
+    create, the 400's vendor read, and the job watch — twice when an earlier
+    attempt's job is read first.
     """
     calls = 1 + _LOOKUP_MAX_PAGES * max(1, lookup_windows) + 1 + 1 + 1 + job_watch_calls()
+    calls += chart_pages
     return calls + (job_watch_calls() if pending_job else 0)
+
+
+#: FE NXT GL links are ``id:<account_id>`` (decisions §494). A link from
+#: before then holds the bare account number; the prefix keeps the two apart
+#: (account id ``61`` and an account numbered ``61`` are different accounts).
+GL_ID_PREFIX = "id:"
+
+
+def gl_link_id(account_id: object) -> str:
+    """The ``erp_account_id`` our chart stores for the account with ``account_id``."""
+    return f"{GL_ID_PREFIX}{account_id}"
+
+
+def linked_account_id(erp_account_id: object) -> str | None:
+    """The FE NXT ``account_id`` an ``id:`` link names, or None for a number link."""
+    value = str(erp_account_id)
+    return value[len(GL_ID_PREFIX) :] if value.startswith(GL_ID_PREFIX) else None
+
+
+def account_codes(payload: InvoicePayload) -> dict[str, str]:
+    """Our GL code for each FE NXT link the payload references."""
+    pairs = [(payload.gl_account_erp_id, payload.gl_account)]
+    pairs += [(li.gl_account_erp_id, li.gl_account) for li in payload.line_items]
+    return {str(erp_id): code for erp_id, code in pairs if erp_id and code}
 
 
 #: ``(api base, environment id)`` → ``(expires at, fiscal years | None)``.
@@ -781,6 +821,76 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
             return False
         return resp.status_code == 200 and _field(resp, "vendor_status") == "Inactive"
 
+    async def _resolve_accounts(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        body: dict,
+        payload: InvoicePayload,
+    ) -> ErpPostResult | None:
+        """Rewrite each ``id:`` distribution account to its current number.
+
+        One walk of ``GET /generalledger/v1/accounts`` for the whole push,
+        stopping at the page that holds the last id it needs (the map is built
+        once and every distribution reads it — never a read per line). None
+        when every account resolved and ``body`` now names them by number; a
+        failed result otherwise, before anything is created: a refused page is
+        an ordinary failure (retryable when the answer could change), and a
+        linked id the chart does not hold, or one closed to data entry, is the
+        coded ``account_inactive`` naming our GL codes. A bare number link
+        (from before §494, not yet re-keyed by a sync) is posted as-is.
+        """
+        wanted = {
+            account_id
+            for dist in body["distributions"]
+            if (account_id := linked_account_id(dist["account_number"])) is not None
+        }
+        if not wanted:
+            return None
+        numbers: dict[str, str] = {}
+        closed: set[str] = set()
+        for page in range(CHART_RESOLVE_MAX_PAGES):
+            query = {"limit": str(_PAGE_SIZE), "offset": str(page * _PAGE_SIZE)}
+            resp = await client.get(f"{self._base()}{GL}/accounts", params=query, headers=headers)
+            if resp.status_code != 200:
+                return ErpPostResult(
+                    success=False,
+                    message=failure_message("chart read", resp),
+                    retryable=failure_reason(resp) == "rate_limited"
+                    or erp_status_retryable(resp.status_code),
+                )
+            rows = _field(resp, "value")
+            batch = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+            for raw in batch:
+                account_id = raw.get("account_id")
+                number = raw.get("account_number")
+                if account_id is None or str(account_id) not in wanted or not number:
+                    continue
+                numbers[str(account_id)] = str(number)
+                if raw.get("prevent_data_entry"):
+                    closed.add(str(account_id))
+            count = _field(resp, "count")
+            read = page * _PAGE_SIZE + len(batch)
+            if (
+                wanted <= set(numbers)
+                or len(batch) < _PAGE_SIZE
+                or (isinstance(count, int) and read >= count)
+            ):
+                break
+        unusable = (wanted - set(numbers)) | closed
+        if unusable:
+            codes = account_codes(payload)
+            result = erp_refusal(PROVIDER, ACCOUNT_INACTIVE)
+            result.refusal_params = {
+                "accounts": sorted({codes.get(gl_link_id(a), gl_link_id(a)) for a in unusable})
+            }
+            return result
+        for dist in body["distributions"]:
+            account_id = linked_account_id(dist["account_number"])
+            if account_id is not None:
+                dist["account_number"] = numbers[account_id]
+        return None
+
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         try:
             self.subscription_key()
@@ -790,8 +900,13 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
         if isinstance(body, str):
             return erp_preflight_refusal(PROVIDER, body)
 
+        id_linked = any(linked_account_id(d["account_number"]) for d in body["distributions"])
         refusal = await self.call_budget().check(
-            reserve=push_call_reserve(bool(payload.pending_job_id), len(lookup_dates(payload)))
+            reserve=push_call_reserve(
+                bool(payload.pending_job_id),
+                len(lookup_dates(payload)),
+                CHART_RESOLVE_MAX_PAGES if id_linked else 0,
+            )
         )
         if refusal is not None:
             return self._budget_refusal(refusal, payload)
@@ -829,6 +944,12 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
                 # Checked after the lookup, so an invoice an earlier attempt
                 # already posted is reported, not refused.
                 return erp_refusal(PROVIDER, PERIOD_CLOSED)
+
+            # Last before the create: an invoice an earlier attempt posted is
+            # reported above whatever the chart says now.
+            unresolved = await self._resolve_accounts(client, headers, body, payload)
+            if unresolved is not None:
+                return unresolved
 
             try:
                 resp = await client.post(
@@ -1008,7 +1129,13 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
         return vendors
 
     async def list_gl_accounts(self) -> list[GLAccountPayload]:
-        """The chart, keyed by account number (what AP distributions take).
+        """The chart, linked by ``account_id`` (``id:<id>``, decisions §494).
+
+        The code is the account number our users see and post; the link is
+        the id a renumbering keeps, resolved back to the number at post time
+        (:meth:`_resolve_accounts`). An account returned without an id gets
+        no link (the sync reports ``missing_erp_id``) rather than a number
+        fallback that would mix the two forms.
 
         FE NXT's account ``class`` is a net-asset class (``Unrestricted Net
         Assets``), not an account type, so ``account_type`` stays None rather
@@ -1021,11 +1148,16 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
             number = raw.get("account_number")
             if not number:
                 continue
+            account_id = raw.get("account_id")
             accounts.append(
                 GLAccountPayload(
                     code=str(number),
                     name=str(raw.get("description") or number),
-                    erp_account_id=str(number),
+                    erp_account_id=(
+                        gl_link_id(account_id)
+                        if account_id is not None and not isinstance(account_id, bool)
+                        else ""
+                    ),
                     active=not raw.get("prevent_data_entry"),
                 )
             )
