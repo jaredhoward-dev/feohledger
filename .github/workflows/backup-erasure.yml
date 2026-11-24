@@ -1,0 +1,133 @@
+name: Backup erasure
+
+# Deletes the nightly backup dumps of removed workspaces (docs/decisions.md
+# §490). `/legal/dpa` § 13 promises a tenant's backups go within 60 days of its
+# removal; every removal — a self-service closure or deploy/remove-tenant.sh —
+# leaves a `workspace_closures` row on the control plane, and this workflow is
+# what clears them.
+#
+# The principle: nothing the VM can trigger on its own may delete a backup. The
+# VM role cannot delete from the backup bucket at all, so a compromised VM
+# cannot wipe the backup history. Deletion happens only here, in a job a human
+# approves, under a role only that job can assume:
+#
+#   check  (no environment, daily) assumes `feohledger-backup-erasure-check`,
+#          trusted for main only. It may run ONE read-only SSM document on the
+#          VM, which prints counts. A queue entry older than 45 days, or one
+#          blocked for a human, fails `attention` red — which emails the owner
+#          well inside the DPA's 60 days.
+#   erase  (`production` environment: a required reviewer approves it) assumes
+#          `feohledger-backup-erasure`, trusted for that environment only. It
+#          reads the queue, deletes every version and delete marker of each
+#          workspace's pg/*/feoh_<slug>.dump, re-lists to prove none is left,
+#          and marks the row cleared. Its role may list versions under `pg/`
+#          only, delete versions of `feoh_*.dump` only, and never the shared
+#          control-plane dump (infra/backup_erasure.tf).
+#
+# This repo is public and so is this log. No input is taken, and the job
+# prints counts only: deploy/backup-erasure.sh masks every slug, organisation
+# id and database name before it uses one, and never prints SSM output.
+#
+# Armed by the repository variable BACKUP_ERASURE_ENABLED=true once the owner
+# steps in infra/README.md § Backup erasure are done — until then the daily run
+# skips instead of failing.
+
+on:
+  schedule:
+    # Daily, 07:17 UTC: after the VM's nightly backup (deploy/README.md), off
+    # the top of the hour when scheduled runs queue.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One erasure at a time; never cancel one mid-deletion.
+  group: backup-erasure
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Count owed erasures
+    runs-on: ubuntu-latest
+    # The check role trusts refs/heads/main only; from any other ref the
+    # handshake would fail anyway, so skip rather than fail.
+    if: vars.BACKUP_ERASURE_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+    permissions:
+      id-token: write # OIDC: assume the check role, no long-lived keys
+      contents: read
+    outputs:
+      ready: ${{ steps.count.outputs.ready }}
+      blocked: ${{ steps.count.outputs.blocked }}
+      overdue: ${{ steps.count.outputs.overdue }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          # Repository secrets: this job is outside any environment. Secrets,
+          # not variables, because a role ARN carries the account id.
+          role-to-assume: ${{ secrets.AWS_BACKUP_ERASURE_CHECK_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          mask-aws-account-id: true
+
+      - name: Count the queue on the VM
+        id: count
+        env:
+          INSTANCE_ID: ${{ secrets.VM_INSTANCE_ID }}
+        run: deploy/backup-erasure.sh check
+
+  attention:
+    name: Erasure overdue or blocked
+    runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.result == 'success' && (needs.check.outputs.overdue != '0' || needs.check.outputs.blocked != '0')
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail red so the owner is emailed
+        env:
+          OVERDUE: ${{ needs.check.outputs.overdue }}
+          BLOCKED: ${{ needs.check.outputs.blocked }}
+        run: |
+          echo "::error::${OVERDUE} owed backup erasure(s) are 45+ days old (the DPA allows 60) and ${BLOCKED} are blocked for a human. Approve the pending erase job, or see docs/founder-runbooks/workspace-closure.md § The erasure workflow."
+          exit 1
+
+  erase:
+    name: Erase owed backups
+    runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.result == 'success' && needs.check.outputs.ready != '0'
+    # MUST match the erase role's trust policy (`:environment:production`), and
+    # carries the required reviewer: nothing below runs until it is approved.
+    environment: production
+    timeout-minutes: 60
+    permissions:
+      id-token: write # OIDC: assume the erase role, no long-lived keys
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKUP_ERASURE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          mask-aws-account-id: true
+
+      - name: Erase, verify, mark cleared
+        env:
+          # Environment secrets: the instance id is not public, and the bucket
+          # name embeds the account id.
+          INSTANCE_ID: ${{ secrets.VM_INSTANCE_ID }}
+          BACKUP_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+        run: deploy/backup-erasure.sh erase

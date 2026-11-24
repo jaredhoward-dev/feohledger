@@ -82,3 +82,13 @@ output "frontend_distribution_domain" {
   description = "The distribution's own *.cloudfront.net hostname, for testing a publish before frontend_on_cloudfront moves DNS."
   value       = aws_cloudfront_distribution.frontend.domain_name
 }
+
+output "backup_erasure_check_role_arn" {
+  description = "Role the backup-erasure workflow's daily check job assumes (backup_erasure.tf) — the AWS_BACKUP_ERASURE_CHECK_ROLE_ARN repository secret."
+  value       = aws_iam_role.backup_erasure_check.arn
+}
+
+output "backup_erasure_role_arn" {
+  description = "Role the backup-erasure workflow's approved erase job assumes (backup_erasure.tf) — the AWS_BACKUP_ERASURE_ROLE_ARN secret on the production environment."
+  value       = aws_iam_role.backup_erasure.arn
+}

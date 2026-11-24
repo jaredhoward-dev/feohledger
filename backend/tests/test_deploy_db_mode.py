@@ -288,6 +288,7 @@ COMPOSE_SCRIPTS = [
     "restore.sh",
     "add-tenant.sh",
     "remove-tenant.sh",
+    "backup-erasure-queue.sh",
     "compose.sh",
     "psql.sh",
     "db-role-cutover.sh",

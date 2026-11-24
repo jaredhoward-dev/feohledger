@@ -4,8 +4,8 @@ fails — and the few steps it deliberately skips are skipped visibly (#575).
 `decrypt-env.sh`, `deploy.sh`, `publish-frontend.sh` and `smoke-frontend.sh`
 have their own files (`test_deploy_decrypt_env.py`, `test_deploy_release.py`,
 `test_frontend_publish.py`); this one covers the rest: `add-tenant.sh`,
-`remove-tenant.sh`, `backup.sh`, `restore.sh`, `compose.sh`, `psql.sh` and
-`bootstrap-vm.sh`.
+`remove-tenant.sh`, `backup-erasure-queue.sh`, `backup-erasure.sh`, `backup.sh`,
+`restore.sh`, `compose.sh`, `psql.sh` and `bootstrap-vm.sh`.
 
 Same shape as those files: the real script, copied with `lib.sh` into a scratch
 `deploy/`, runs against stubs placed first on PATH. One stub serves every tool
@@ -165,8 +165,10 @@ def test_add_tenant_refuses_without_an_env_or_an_app_domain(tmp_path: Path, env)
 
 
 # ── remove-tenant.sh ─────────────────────────────────────────────────────────
-
-BACKUP_LISTING = "pg/2026-10-01/feoh_acme.dump\\tv1\\n"
+#
+# Since docs/decisions.md §490 it never touches the backup bucket: the VM may
+# not delete a backup. delete_tenant.py records the removal, and the
+# approval-gated backup-erasure workflow erases the dumps.
 
 
 @pytest.mark.parametrize(
@@ -178,27 +180,24 @@ BACKUP_LISTING = "pg/2026-10-01/feoh_acme.dump\\tv1\\n"
 )
 def test_remove_tenant_stops_when_the_inventory_fails(tmp_path: Path, rc: int, why: str) -> None:
     """The #575 silent-skip finding: ANY failed inventory used to be read as
-    "already deleted", and the run went on to delete the backups of a tenant
-    whose live data was still there, then printed the customer's confirmation.
-    Only exit 4 (no such organisation) means that now."""
+    "already deleted". Only exit 4 (removed, on record) means that now."""
     d = _deploy(tmp_path, "remove-tenant.sh")
     d.env_file(LOCAL_ENV)
     d.rule("docker", "delete_tenant.py --slug acme --dry-run", rc)
-    d.rule("aws", "list-object-versions", 0, BACKUP_LISTING)
 
     result = d.run("acme", "--yes")
 
     assert result.returncode != 0, why
     assert "inventory failed" in result.stderr
-    assert not d.called("delete-object"), "backups were deleted"
     assert not d.called("--yes"), "the tenant deletion ran"
     assert "removed." not in result.stdout
 
 
-def test_remove_tenant_with_nothing_left_anywhere_is_refused(tmp_path: Path) -> None:
+def test_remove_tenant_with_nothing_on_record_is_refused(tmp_path: Path) -> None:
+    """Exit 5: no organisation and no removal on record — most likely a typo."""
     d = _deploy(tmp_path, "remove-tenant.sh")
     d.env_file(LOCAL_ENV)
-    d.rule("docker", "--dry-run", 4)
+    d.rule("docker", "--dry-run", 5)
 
     result = d.run("acme", "--yes")
 
@@ -206,21 +205,18 @@ def test_remove_tenant_with_nothing_left_anywhere_is_refused(tmp_path: Path) -> 
     assert "nothing found" in result.stderr
 
 
-def test_remove_tenant_already_deleted_skips_the_data_leg_visibly(tmp_path: Path) -> None:
-    """The one deliberate skip: an organisation already gone (exit 4) leaves
-    the backup leg to finish, and says it skipped the data."""
+def test_remove_tenant_already_removed_stops_cleanly(tmp_path: Path) -> None:
+    """Exit 4: removed and on record. There is no backup leg left to finish
+    here, so it says so and changes nothing."""
     d = _deploy(tmp_path, "remove-tenant.sh")
     d.env_file(LOCAL_ENV)
     d.rule("docker", "--dry-run", 4)
-    d.rule("aws", "list-object-versions", 0, BACKUP_LISTING, once=True)
 
     result = d.run("acme", "--yes")
 
     assert result.returncode == 0, result.stderr
-    assert "already deleted, or never existed" in result.stdout
-    assert "tenant data already deleted — skipping" in result.stdout
+    assert "already removed" in result.stdout
     assert not d.called("delete_tenant.py --slug acme --yes")
-    assert d.called("delete-object")
 
 
 def test_remove_tenant_never_touches_caddy(tmp_path: Path) -> None:
@@ -231,7 +227,6 @@ def test_remove_tenant_never_touches_caddy(tmp_path: Path) -> None:
     d.env_file(LOCAL_ENV)
     vanity = "shop.acmecorp.com {\n\timport vanity\n}\n"
     (d.dir / "tenants.caddy").write_text(vanity)
-    d.rule("aws", "list-object-versions", 0, BACKUP_LISTING, once=True)
 
     result = d.run("acme", "--yes")
 
@@ -241,28 +236,266 @@ def test_remove_tenant_never_touches_caddy(tmp_path: Path) -> None:
     assert "vanity domain" in result.stdout
 
 
-def test_remove_tenant_keeps_the_backups_when_the_data_deletion_fails(tmp_path: Path) -> None:
+def test_remove_tenant_never_deletes_a_backup(tmp_path: Path) -> None:
+    """Nothing the VM can trigger on its own may delete a backup (§490): no AWS
+    call at all, the removal queued for the erasure workflow, and no line that
+    reads as a backup deletion confirmed."""
+    d = _deploy(tmp_path, "remove-tenant.sh")
+    d.env_file(LOCAL_ENV)
+
+    result = d.run("acme", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert not d.called("aws ")
+    assert d.called("delete_tenant.py --slug acme --yes")
+    assert not d.called("--no-backup-store")
+    assert "backup-erasure workflow" in result.stdout
+    assert "removed from s3://" not in result.stdout
+    assert "verified empty" not in result.stdout
+
+
+def test_remove_tenant_without_a_backup_store_owes_nothing(tmp_path: Path) -> None:
+    d = _deploy(tmp_path, "remove-tenant.sh")
+    d.env_file("POSTGRES_PASSWORD=x\nAPP_DOMAIN=app.example.com\n")
+
+    result = d.run("acme", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert d.called("delete_tenant.py --slug acme --yes --no-backup-store")
+    assert "no backup store configured" in result.stdout
+
+
+def test_remove_tenant_stops_when_the_data_deletion_fails(tmp_path: Path) -> None:
     d = _deploy(tmp_path, "remove-tenant.sh")
     d.env_file(LOCAL_ENV)
     d.rule("docker", "delete_tenant.py --slug acme --yes", 1)
-    d.rule("aws", "list-object-versions", 0, BACKUP_LISTING)
 
     result = d.run("acme", "--yes")
 
     assert result.returncode != 0
-    assert not d.called("delete-object")
+    assert "removed." not in result.stdout
 
 
-def test_remove_tenant_stops_when_the_backup_listing_fails(tmp_path: Path) -> None:
-    d = _deploy(tmp_path, "remove-tenant.sh")
+# ── backup-erasure-queue.sh (the VM's half, run by the SSM documents) ─────────
+
+ORG = "0b5e8f9a-1c2d-4e3f-8a9b-0c1d2e3f4a5b"
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("summary",), "workspace_closures.py owed --summary"),
+        (("owed",), "workspace_closures.py owed --json"),
+        (
+            ("mark-cleared", ORG, "12345"),
+            f"workspace_closures.py mark-cleared {ORG} --operator github-actions-run-12345",
+        ),
+    ],
+)
+def test_erasure_queue_runs_the_closures_script_in_the_api(
+    tmp_path: Path, args: tuple[str, ...], expected: str
+) -> None:
+    d = _deploy(tmp_path, "backup-erasure-queue.sh")
     d.env_file(LOCAL_ENV)
-    d.rule("aws", "list-object-versions", 255)
 
-    result = d.run("acme", "--yes")
+    result = d.run(*args)
+
+    assert result.returncode == 0, result.stderr
+    assert d.called("exec -T api python scripts/" + expected)
+    assert not d.called("aws ")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("mark-cleared", "acme", "12345"),
+        ("mark-cleared", ORG.upper(), "12345"),
+        ("mark-cleared", ORG, "12a"),
+        ("mark-cleared", ORG),
+        ("summary", "extra"),
+        ("delete",),
+    ],
+)
+def test_erasure_queue_refuses_anything_else(tmp_path: Path, args: tuple[str, ...]) -> None:
+    d = _deploy(tmp_path, "backup-erasure-queue.sh")
+    d.env_file(LOCAL_ENV)
+
+    result = d.run(*args)
 
     assert result.returncode != 0
-    assert "Refusing to report the backups as deleted" in result.stderr
-    assert not d.called("delete_tenant.py --slug acme --yes")
+    assert not d.called("workspace_closures.py")
+
+
+# ── backup-erasure.sh (the runner's half, .github/workflows/backup-erasure.yml) ──
+
+
+ORG_B = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
+
+
+def _erasure(tmp_path: Path, queue: str) -> Deploy:
+    """The runner script against stubbed `aws`: every SSM command succeeds and
+    returns ``queue`` as its output, unless a test adds a rule first."""
+    d = _deploy(tmp_path, "backup-erasure.sh", "aws")
+    d.queue = queue  # type: ignore[attr-defined]
+    return d
+
+
+def _run_erasure(d: Deploy, *args: str) -> subprocess.CompletedProcess[str]:
+    # After the test's own rules, so a test's rule for a call wins.
+    d.rule("aws", "send-command", 0, "cmd-1\\n")
+    d.rule("aws", "--query Status", 0, "Success\\n")
+    d.rule("aws", "StandardOutputContent", 0, d.queue)  # type: ignore[attr-defined]
+    out = d.root / "github_output"
+    out.write_text("")
+    return d.run(
+        *args,
+        extra_env={
+            "INSTANCE_ID": "i-0123",
+            "BACKUP_BUCKET": "feoh-backups",
+            "GITHUB_RUN_ID": "987",
+            "GITHUB_OUTPUT": str(out),
+            "SSM_POLL_SECONDS": "0",
+        },
+    )
+
+
+def _queue(*entries: tuple[str, str, str | None]) -> str:
+    import json
+
+    owed = [
+        {
+            "organization_id": org,
+            "slug": slug,
+            "database": f"feoh_{slug}",
+            "age_days": 3,
+            "blocked": b,
+        }
+        for org, slug, b in entries
+    ]
+    # printf %b in the stub: no backslashes in the JSON, and no `|` (the rule separator).
+    return "booting\\nFEOH_ERASURE " + json.dumps({"owed": owed}) + "\\n"
+
+
+def _not_masked(result: subprocess.CompletedProcess[str], *values: str) -> list[str]:
+    """Lines that show a value without a preceding ::add-mask:: of it."""
+    masked: set[str] = set()
+    leaks = []
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.startswith("::add-mask::"):
+            masked.add(line.removeprefix("::add-mask::"))
+            continue
+        leaks += [f"{v}: {line}" for v in values if v in line and v not in masked]
+    return leaks
+
+
+def test_erasure_check_writes_counts_and_names_nothing(tmp_path: Path) -> None:
+    summary = (
+        '{"blocked": 1, "oldest_age_days": 50, "overdue": 1, "overdue_after_days": 45, '
+        '"owed": 3, "ready": 2}'
+    )
+    d = _erasure(tmp_path, f"FEOH_ERASURE {summary}\\n")
+
+    result = _run_erasure(d, "check")
+
+    assert result.returncode == 0, result.stderr
+    assert (d.root / "github_output").read_text() == "ready=2\nblocked=1\noverdue=1\n"
+    assert d.called("--document-name feohledger-backup-erasure-summary")
+    assert not d.called("s3api")
+
+
+def test_erasure_check_fails_on_a_summary_it_cannot_read(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, "Traceback (most recent call last)\\n")
+
+    result = _run_erasure(d, "check")
+
+    assert result.returncode != 0
+    assert (d.root / "github_output").read_text() == ""
+
+
+def test_erasure_deletes_every_version_verifies_and_marks(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    listing = "pg/2026-11-01/feoh_acme.dump\\tv1\\npg/2026-11-02/feoh_acme.dump\\tv2\\n"
+    # The first listing finds two versions; the re-listing after the deletes, none.
+    d.rule("aws", "/feoh_acme.dump", 0, listing, once=True)
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode == 0, result.stderr
+    assert d.called("--key pg/2026-11-01/feoh_acme.dump --version-id v1")
+    assert d.called("--key pg/2026-11-02/feoh_acme.dump --version-id v2")
+    assert d.called("--document-name feohledger-backup-erasure-mark-cleared --instance-ids i-0123")
+    assert d.called(f"--parameters OrganizationId={ORG},RunId=987")
+    assert "2 object version(s) removed" in result.stdout
+    # Listing is always under exactly `pg/` — the only prefix the role may list.
+    lists = [c for c in d.calls() if "list-object-versions" in c]
+    assert lists and all("--prefix pg/ " in c for c in lists)
+    for value in (ORG, "acme", "feoh_acme"):
+        assert f"::add-mask::{value}" in result.stdout.splitlines()
+    assert not _not_masked(result, ORG, "acme", "feoh_acme")
+
+
+def test_erasure_that_leaves_a_version_behind_is_not_marked(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), (ORG_B, "beta", None)))
+    d.rule("aws", "/feoh_acme.dump", 0, "pg/2026-11-01/feoh_acme.dump\\tv1\\n")
+    d.rule("aws", "/feoh_beta.dump", 0, "pg/2026-11-01/feoh_beta.dump\\tv9\\n", once=True)
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "still present" in result.stderr
+    assert not d.called(f"OrganizationId={ORG},")
+    # One workspace's failure does not stop the next.
+    assert d.called(f"OrganizationId={ORG_B},")
+    assert "Erased 1 of 2" in result.stdout
+    assert not _not_masked(result, ORG, ORG_B, "acme", "beta")
+
+
+def test_erasure_that_cannot_delete_is_not_marked(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    d.rule("aws", "/feoh_acme.dump", 0, "pg/2026-11-01/feoh_acme.dump\\tv1\\n", once=True)
+    d.rule("aws", "delete-object", 254, "An error occurred (AccessDenied)\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_skips_a_blocked_workspace_and_fails_for_a_human(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", "slug_in_use")))
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "slug_in_use" in result.stderr
+    assert not d.called("s3api")
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_refuses_a_database_name_that_is_not_a_tenant_dump(tmp_path: Path) -> None:
+    """`feohledger` is the shared control-plane dump; IAM denies it too."""
+    import json
+
+    queue = "FEOH_ERASURE " + json.dumps(
+        {"owed": [{"organization_id": ORG, "slug": "x", "database": "feohledger", "blocked": None}]}
+    )
+    d = _erasure(tmp_path, queue + "\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert not d.called("s3api")
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_with_a_failed_mark_reports_failure(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    d.rule("aws", "send-command --document-name feohledger-backup-erasure-mark-cleared", 254)
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "marking the closure cleared failed" in result.stderr
 
 
 # ── backup.sh ────────────────────────────────────────────────────────────────

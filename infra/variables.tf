@@ -284,3 +284,15 @@ variable "frontend_on_cloudfront" {
   type        = bool
   default     = false
 }
+
+variable "github_oidc_sub_prefix" {
+  description = "The OIDC subject prefix this repository presents to AWS, e.g. repo:<owner>@<id>/<repo>@<id> on GitHub's immutable subject claims. The backup-erasure roles (backup_erasure.tf) trust exactly <prefix>:ref:refs/heads/main and <prefix>:environment:production. Read it, never build it from the slug: gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix (README.md § The deploy role is not owned here). Set it in the private prod.tfvars.sops."
+  type        = string
+
+  validation {
+    # repo:<owner>/<repo>, either form, and no `:` after the first: the
+    # suffix (`:ref:…`, `:environment:…`) is appended per role.
+    condition     = can(regex("^repo:[^:/[:space:]]+/[^:/[:space:]]+$", var.github_oidc_sub_prefix))
+    error_message = "github_oidc_sub_prefix must be the bare repo:<owner>/<repo> prefix the sub_claim_prefix API returns, with no :ref: or :environment: suffix."
+  }
+}

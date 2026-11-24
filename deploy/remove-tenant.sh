@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
-# Remove a tenant end-to-end from the minimal single-VM stack: destroy its
-# documents, database and control-plane records, then delete its backup
-# objects.
+# Remove a tenant from the minimal single-VM stack: destroy its documents,
+# database and control-plane records, and put its backup dumps on the queue
+# that the approval-gated backup-erasure workflow clears.
 #
 # This is the deletion `/legal/dpa` § 13 and clause 10 of the Terms promise a
 # customer within 60 days of termination. It is the inverse of add-tenant.sh and
 # the most destructive script in the repo — nothing it does can be undone from
 # the application.
 #
-# Order matters and is not the obvious one:
+# It does NOT delete backups, and cannot (docs/decisions.md §490). Nothing the
+# VM can trigger on its own may delete a backup: the VM role (infra/compute.tf,
+# Sid `Backups`) has no delete on the backup bucket, so a compromised VM cannot
+# wipe the backup history. Instead scripts/delete_tenant.py records the removal
+# in `workspace_closures` before it deletes anything — the same queue a
+# self-service closure writes — and .github/workflows/backup-erasure.yml, in a
+# job a human approves and under a role only that job can assume, deletes every
+# version and delete marker of pg/*/feoh_<slug>.dump, verifies none is left and
+# marks the row cleared. The row also holds the slug until then
+# (utils/slug.ensure_slug_not_held): a new workspace under it would share the
+# dumps' name. Its daily check fails the workflow red if an owed erasure passes
+# 45 days, inside the DPA's 60.
 #
-#   1. scripts/delete_tenant.py   — the tenant DB, then documents, then the
-#      control-plane rows (see that module for why THAT order).
-#   2. Backup objects             — last, because until the live data is gone
-#      the backups are still the thing you would restore from if a step failed.
+# So the confirmation this prints covers the live data only. Send the customer
+# the backup confirmation once `scripts/workspace_closures.py list` no longer
+# shows the organisation (docs/founder-runbooks/workspace-closure.md).
 #
 # There is no web step. Since docs/decisions.md §364 the VM serves only the
 # API: <slug>.<APP_DOMAIN> is CloudFront's wildcard, which serves the same
@@ -61,87 +71,42 @@ DB_NAME="feoh_${SLUG}"
 
 BUCKET="${BACKUP_S3_BUCKET:-}"
 [ -n "$BUCKET" ] || BUCKET=$(feoh_env BACKUP_S3_BUCKET)
-
-# Same region fallback as backup.sh: on EC2 the CLI infers it from IMDS, off-EC2
-# there is none, so take what the sops env already carries.
-if [ -z "${AWS_DEFAULT_REGION:-}" ] && [ -z "${AWS_REGION:-}" ]; then
-	REGION=$(feoh_env AWS_REGION)
-	[ -z "$REGION" ] || export AWS_DEFAULT_REGION="$REGION"
-fi
+# With no backup store there is nothing for the erasure workflow to do, and
+# the removal is recorded with its backups already cleared.
+BACKUP_FLAGS=()
+[ -n "$BUCKET" ] || BACKUP_FLAGS=(--no-backup-store)
 
 # --- 0. Show what is about to go, from the application's own inventory -------
 
-# A missing organisation is not necessarily a typo: the backup leg below
-# depends only on the SLUG, so a run that destroyed the tenant and then
-# failed on backups has to be re-runnable to finish the job. Refusing here would
-# make the one leg most likely to need a retry the one that cannot have it.
-# A genuine typo is caught at the end of this section, where nothing at all is
-# found to remove.
+# Only delete_tenant.py's exit 4 means "already removed": no organisation has
+# the slug and its removal is on record. It prints that record, including
+# whether the backups are erased yet, and there is nothing left for this script
+# to do. Exit 5 is no organisation AND no record — most likely a typo.
 #
-# Only delete_tenant.py's "no such organisation" (exit 4) means that. Any other
-# failure — the api container down, the database unreachable, a partner org
-# refused — used to be read the same way, and the run went on to delete the
-# backups of a tenant whose live data was still there, then print the
-# confirmation the customer is sent.
+# Any other failure — the api container down, the database unreachable, a
+# partner org refused — stops the run before it changes anything. (Before
+# §490 any failure here was once read as "already deleted", and the run went on
+# to delete the backups of a tenant whose live data was still there.)
 echo "==> inventory"
-TENANT_PRESENT=1
 INVENTORY_RC=0
 "${COMPOSE[@]}" exec -T api python scripts/delete_tenant.py --slug "$SLUG" --dry-run || INVENTORY_RC=$?
 case "$INVENTORY_RC" in
 0) ;;
 4)
-	TENANT_PRESENT=0
-	echo "    No organisation with that slug — already deleted, or never existed."
-	echo "    Continuing: the backup leg below keys off the slug alone."
+	echo
+	echo "Tenant ${SLUG} was already removed; nothing to do here."
+	echo "Its backups are the backup-erasure workflow's (see 'Backups' above)."
+	exit 0
 	;;
+5) die "nothing found for slug '$SLUG' — no organisation and no removal on record. Check the spelling." ;;
 *) die "the tenant inventory failed (delete_tenant.py exit ${INVENTORY_RC}, error above) — nothing was changed." ;;
 esac
 
-# Every version and delete marker of this tenant's nightly dumps, across every
-# date prefix. Listed ONCE, here, at the top level — not from inside the delete
-# loop's process substitution, where `die` would exit only the subshell and the
-# script would sail on reporting a success it had not verified.
-#
-# `--output text` keeps jq out of the dependency list: the VM installs docker,
-# git, cronie, awscli and sops, and nothing else.
-list_backup_versions() {
-	# Each list is filtered SEPARATELY and the results flattened after. The
-	# obvious shape — `[Versions, DeleteMarkers][][?ends_with(...)]` — parses
-	# fine, runs fine, and matches NOTHING: the filter binds to the flattened
-	# projection rather than to its elements. Verified against real S3
-	# semantics; the failure is silent, so it would have reported "removed 0
-	# version(s)" while leaving every backup in place, under a confirmation
-	# saying the backups were deleted.
-	#
-	# The `/` in the suffix is load-bearing too: without it `feoh_acme.dump`
-	# would also match a tenant named `not-acme`, and `feohledger.dump` — the
-	# shared control-plane dump — must never match at all.
-	#
-	# stderr is NOT swallowed. An AWS failure (throttling, wrong region, a
-	# missing permission) has to look different from "no backups exist",
-	# because this script's whole output is evidence that a legal deletion
-	# obligation was met.
-	local listing
-	if ! listing=$(aws s3api list-object-versions --bucket "$BUCKET" --prefix "pg/" \
-		--query "[Versions[?ends_with(Key, '/${DB_NAME}.dump')], DeleteMarkers[?ends_with(Key, '/${DB_NAME}.dump')]][][].[Key,VersionId]" \
-		--output text); then
-		die "listing backup objects in s3://${BUCKET} failed (see the AWS error above). Refusing to report the backups as deleted. Fix the cause and re-run — this script is re-runnable."
-	fi
-	printf '%s\n' "$listing" | grep -v '^None' | grep . || true
-}
-
-BACKUP_VERSIONS=""
-BACKUP_COUNT=0
 if [ -n "$BUCKET" ]; then
-	BACKUP_VERSIONS=$(list_backup_versions)
-	BACKUP_COUNT=$(printf '%s\n' "$BACKUP_VERSIONS" | grep -c . || true)
-	echo "Backup objects:    ${BACKUP_COUNT} version(s) of pg/*/${DB_NAME}.dump in s3://${BUCKET}"
+	echo "Backup objects:    pg/*/${DB_NAME}.dump — queued for the approval-gated backup-erasure"
+	echo "                   workflow (not deleted from this VM, docs/decisions.md §490)"
 else
-	echo "Backup objects:    BACKUP_S3_BUCKET is not set — no backup store to clean."
-fi
-
-if [ "$TENANT_PRESENT" -eq 0 ] && [ "$BACKUP_COUNT" -eq 0 ]; then
-	die "nothing found for slug '$SLUG' — no organisation and no backups. Check the spelling."
+	echo "Backup objects:    BACKUP_S3_BUCKET is not set — no backup store; nothing will be owed."
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -154,48 +119,25 @@ fi
 
 if [ "$ASSUME_YES" -ne 1 ]; then
 	echo
-	echo "This destroys the tenant's documents, database, control-plane records"
-	echo "and backups. It cannot be undone."
+	echo "This destroys the tenant's documents, database and control-plane records,"
+	echo "and queues its backups for erasure. It cannot be undone."
 	printf "Type the slug (%s) to confirm: " "$SLUG"
 	read -r TYPED
 	[ "$TYPED" = "$SLUG" ] || die "confirmation did not match — nothing was changed."
 fi
 
-# --- 2. Documents, database, control plane ---------------------------------
+# --- 2. Documents, database, control plane, and the owed-backups record ------
 
-if [ "$TENANT_PRESENT" -eq 1 ]; then
-	echo "==> deleting tenant data"
-	"${COMPOSE[@]}" exec -T api python scripts/delete_tenant.py --slug "$SLUG" --yes
-else
-	echo "==> tenant data already deleted — skipping"
-fi
+echo "==> deleting tenant data"
+"${COMPOSE[@]}" exec -T api python scripts/delete_tenant.py --slug "$SLUG" --yes "${BACKUP_FLAGS[@]}"
 
-# --- 3. Backups -------------------------------------------------------------
-
-BACKUP_RESULT="no backup store configured"
 if [ -n "$BUCKET" ]; then
-	echo "==> deleting backup objects from s3://${BUCKET}"
-	REMOVED=0
-	while IFS=$'\t' read -r KEY VERSION; do
-		[ -n "$KEY" ] || continue
-		aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" >/dev/null
-		REMOVED=$((REMOVED + 1))
-	done < <(printf '%s\n' "$BACKUP_VERSIONS")
-	echo "    removed ${REMOVED} object version(s)"
-
-	# Re-list and require it to be empty. The confirmation this script prints is
-	# the customer's evidence under DPA § 13, so it must rest on a verification
-	# rather than on a loop having run — a loop that iterated zero times looks
-	# exactly like a loop that had nothing to do.
-	LEFTOVER=$(list_backup_versions)
-	if [ -n "$LEFTOVER" ]; then
-		echo "$LEFTOVER" >&2
-		die "backup objects for ${DB_NAME} still present after deletion (listed above). The confirmation has NOT been printed; re-run once the cause is fixed."
-	fi
-	BACKUP_RESULT="${REMOVED} version(s) of pg/*/${DB_NAME}.dump removed from s3://${BUCKET}, verified empty"
+	BACKUP_RESULT="owed — the approval-gated backup-erasure workflow erases them (not confirmed here)"
+else
+	BACKUP_RESULT="no backup store configured"
 fi
 
-# --- 4. The written confirmation, and what it does not cover ----------------
+# --- 3. The written confirmation, and what it does not cover ----------------
 
 cat <<-EOF
 
@@ -228,7 +170,8 @@ if [ "$DB_MODE" = external ]; then
 fi
 cat <<-EOF
 
-	Send the customer the confirmation printed above under "Tenant deletion".
+	Send the customer the confirmation printed above under "Tenant deletion",
+	and the backup confirmation once the backup-erasure workflow has cleared it.
 
 	If this tenant had a vanity domain, remove its block from deploy/tenants.caddy
 	and reload Caddy (docs/founder-runbooks/custom-domain-provisioning.md
