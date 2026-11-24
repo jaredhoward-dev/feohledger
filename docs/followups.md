@@ -1487,21 +1487,24 @@ when the app was registered and sat on an unpushed local branch until the
 2026-11-21 branch clean-up; re-checked against `main` that day (no Xero notice in
 the runbook, no acceptance record on signup).
 
-- [ ] **(c) The breach runbook's connected-platform table has unchecked
-      rows.** The Xero 24-hour notice is now step § 3a of
-      [founder-runbooks/breach-notification.md](founder-runbooks/breach-notification.md),
-      beside Intuit (24 h), Shopify (24 h), Sage (promptly, `cdo@sage.com`)
-      and Blackbaud (no duty found), each read from the platform's own terms
-      on 2026-11-22. Two gaps remain: Intuit § 9.3 names no reporting channel,
-      and the developer / API terms of Sage Intacct, Sage Accounting (South
-      Africa), NetSuite, Business Central, SYSPRO, Merge.dev, Square,
-      Lightspeed, Cin7 and WooCommerce have not been read for a notice duty,
-      so their row says "not yet checked". **Durable fix:** ask Intuit
-      developer support which channel it accepts for § 9.3 reports and record
-      it in the row; read each unchecked platform's terms and give it its own
-      row (duty, clock, channel, source, date). **Trigger:** before the first
-      tenant connects a live company on that platform through our app (the Intuit
-      channel first: its 24-hour clock already applies), and every six months for the rows already filled in.
+- [ ] **(c) The breach runbook's connected-platform table has open
+      channels and one unread agreement.** § 3a of
+      [founder-runbooks/breach-notification.md](founder-runbooks/breach-notification.md)
+      now has a row per connected platform, filled from the platform's own
+      terms on 2026-11-22 and 2026-11-24. Three gaps remain:
+      Intuit § 9.3 names no reporting channel; Merge.dev's MSA § 3.2 ("promptly
+      notify") names none either, and its formal notices go by courier or
+      certified mail; and Sage Intacct's developer terms are not publicly
+      reachable (the Web Services licence comes through Sage's partner
+      programme, and the Sage Developer Services Licence Agreement PDF
+      answered 403, so whether it covers Intacct is unconfirmed — the row
+      falls back to the Sage row as a precaution). **Durable fix:** ask Intuit
+      developer support and Merge which channel each accepts for those
+      reports, and get the Intacct developer agreement from Sage, then record
+      each in its row (duty, clock, channel, source, date). **Trigger:** before
+      the first tenant connects a live company on that platform through our
+      app (the Intuit channel first: its 24-hour clock already applies), and
+      every six months for the rows already filled in.
 
 - [ ] **(c) Signup records no acceptance of our Terms or Privacy Policy.** The
       Xero terms require an app to have its own terms and privacy policy *and*
