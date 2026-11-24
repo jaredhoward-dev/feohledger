@@ -293,9 +293,12 @@ its AWS pieces, which this module owns outright (unlike the deploy role):
   `ssm:GetCommandInvocation`. No S3.
 - **`feohledger-backup-erasure`** — assumed by the `erase` job, which runs in
   its own `backup-erasure` environment and so waits for its required reviewer.
-  Trusts exactly `<prefix>:environment:backup-erasure` — never `production`,
-  which `aws-deploy.yml` and `aws-oidc-preflight.yml` share and which they can
-  reach from any branch. May send only the
+  Trusts exactly `<prefix>:environment:backup-erasure` **and**
+  `token.actions.githubusercontent.com:ref = refs/heads/main` — never
+  `production`, which `aws-deploy.yml` and `aws-oidc-preflight.yml` share and
+  which they can reach from any branch. Before it asks for a token, the job
+  reads the environment back and refuses unless it has a required reviewer and
+  deploys from `main` only, so step 4 below is checked on every run. May send only the
   `feohledger-backup-erasure-owed` (read-only) and
   `feohledger-backup-erasure-mark-cleared` documents, whose parameters SSM
   refuses unless they are a UUID and a run number. On S3:
@@ -308,8 +311,11 @@ its AWS pieces, which this module owns outright (unlike the deploy role):
 The backup bucket has no Object Lock and no MFA delete, so a delete by version
 id is permanent. Because the queue comes from the VM, the erase job also checks
 the bucket before deleting (newest night ≤ 2 days old; nothing dumped after the
-recorded closure; not in the newest three nights; a 7-day cool-off), so a
-forged entry naming a live tenant is refused (`../docs/decisions.md` §490). `<prefix>` is `var.github_oidc_sub_prefix` — read it, never
+recorded closure; a 7-day cool-off from both the closure date and the newest
+stored dump), so a
+forged entry naming a live tenant is refused (`../docs/decisions.md` §490).
+`github_oidc_sub_prefix` has no default: once this is merged, every `plan` of
+this module needs it set, whatever the plan is for. `<prefix>` is `var.github_oidc_sub_prefix` — read it, never
 build it from the slug (§ The deploy role is not owned here).
 
 **One-time operator steps**, in order:

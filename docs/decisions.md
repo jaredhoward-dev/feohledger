@@ -24836,7 +24836,15 @@ backups are no protection against the compromise they exist for. So:
   for until one can act. The `erase` job runs in its own `backup-erasure`
   environment — a required reviewer approves it before it gets a token, and
   only `main` may deploy to it — and assumes `feohledger-backup-erasure`
-  (trust: the exact `:environment:backup-erasure` subject). Not `production`:
+  (trust: the exact `:environment:backup-erasure` subject AND
+  `token.actions.githubusercontent.com:ref = refs/heads/main`, a GitHub
+  condition key the IAM User Guide documents for `AssumeRoleWithWebIdentity`
+  trust policies). Its first step, before any AWS credential, reads the
+  environment back through the API (`actions: read`) and refuses unless it
+  has a required reviewer and deploys from `main` only (a custom policy of
+  exactly `main`, or protected branches), and unless the run's ref is `main`
+  — so the owner settings the role relies on are checked on every run rather
+  than assumed. Not `production`:
   `aws-deploy.yml` and `aws-oidc-preflight.yml` also run there and can be
   dispatched from any branch, so trusting that subject would hand the role to
   an approved run of any of them, from any branch. It reads the queue (at most
@@ -24862,13 +24870,20 @@ backups are no protection against the compromise they exist for. So:
   erased and the run fails — otherwise "not dumped lately" proves nothing;
   (b) a dump of an owed database dated after its recorded closure means the
   database was still there to dump — a forged entry or a failed removal — and
-  fails the run red without erasing; a dump on or before the closure in any of
-  the newest three nights defers the entry (a restore window); (c) a closure
-  younger than 7 days is deferred (a cool-off for a mistaken removal, well
-  inside the 45-day alarm). Deferred is not a failure. What remains: a VM
-  compromised for long enough could stop dumping a victim for three nights
-  and then forge an entry with a matching date; the reviewer, the cool-off and
-  the red alarm on any post-closure dump narrow that, they do not close it.
+  fails the run red without erasing; (c) a 7-day cool-off, measured from the
+  closure date (the job computes the age itself; the VM's `age_days` is
+  ignored) and from the newest stored dump of that database in the bucket —
+  bucket truth — so both must be a week old. Deferred is not a failure. The
+  VM's `blocked` code is allowlisted (`slug_in_use`, `database_exists`);
+  anything else fails red without being echoed, since a newline in it would
+  be a workflow command in the log. Erasable entries fill the 50-entry batch
+  before blocked ones, so blocked rows cannot starve the queue, and their
+  full count still turns the run red. What remains: a VM compromised for long
+  enough could stop dumping a live tenant for at least 7 nights and then
+  forge an entry dated before that, and a reviewer who approves without
+  looking would let it through. The nightly backup heartbeat, the freshness
+  check and the red alarm on any post-closure dump make that harder and
+  visible; they do not close it.
 - **The erase role's S3 grant** is `s3:ListBucketVersions` on the bucket only
   with `s3:prefix = pg/` (plus an explicit Deny for any other prefix or none),
   `s3:DeleteObjectVersion` on `pg/*/feoh_*.dump` only, and an explicit Deny of
@@ -24882,10 +24897,13 @@ The role can still delete any tenant's dumps, live or not; the approval, the
 dedicated environment restricted to `main` (owner settings) and the bucket
 checks above are what stand between it and a mistake. Restricting the
 environment to `main` is what stops a workflow edited on a branch from reaching
-the role after an approval. Pinning the role to the workflow file as well (a
-`job_workflow_ref` condition) was considered and not used: whether AWS STS
-evaluates that GitHub claim as a condition key is unconfirmed, and a condition
-STS ignores or rejects would either do nothing or break the handshake.
+the role after an approval. The IAM User Guide's GitHub condition-key list
+(<https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html>,
+read 2026-11-24) includes `ref`, now used, and also `job_workflow_ref` and
+`workflow`. Pinning the role to this workflow file was considered and not
+done in this change: the page describes `job_workflow_ref` for reusable
+workflows, its value for an ordinary job was not verified, and a wrong value
+fails the handshake closed.
 
 **Accepted residuals.** The check role trusts any workflow on `main`; it can
 only run the read-only `summary` document, which prints counts, so a workflow
@@ -24898,6 +24916,9 @@ never which, and a cost of running the erasure in the open.
 
 **Rejected:**
 
+- **Inferring "no backup store" from an empty `BACKUP_S3_BUCKET`.** It would
+  record the backups cleared and release the slug on a misread env;
+  `remove-tenant.sh` needs the operator's explicit `--no-backup-store`.
 - **Give the VM role `ListBucketVersions` + `DeleteObjectVersion`.** Simplest,
   and exactly the capability the principle forbids.
 - **A manual split: the VM deletes the data, the operator deletes the dumps from
@@ -24939,3 +24960,11 @@ format for branches and environments);
 ("beyond use");
 <https://docs.aws.amazon.com/kms/latest/developerguide/deleting-keys.html>
 (the 7–30 day key-deletion window).
+Read 2026-11-24 for the pre-merge hardening:
+<https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html>
+(GitHub condition keys for trust policies, `ref` among them);
+<https://docs.github.com/en/rest/deployments/environments> (the environment's
+`protection_rules` and `deployment_branch_policy`);
+<https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps>
+(`GET …/environments/{name}` and its deployment-branch-policies need Actions:
+read).
