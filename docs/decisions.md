@@ -25143,3 +25143,48 @@ push, when Intacct's reference object takes the key directly.
 
 **Unverified.** The bill line's `{"glAccount": {"key": …}}` form is checked
 against the fake ERP only; a sandbox push confirms it (followups entry).
+
+## 493. A vendor-import row whose code is an unrelated vendor's ERP link is a row error, not a quiet skip (round 37)
+
+§491 made the vendor importer dedup a file row against any one vendor claiming
+its `code`, as `Vendor.code` or as `Vendor.erp_vendor_id`. A row whose code
+matched only another-named vendor's ERP record id — `Acme Corp,77` against
+"Seventy Seven", linked by ERP id 77 — was counted in `skipped` with no
+message, so the user never learned Acme Corp was not created, and nothing
+suggested the code was the problem.
+
+**Decision.** `import_vendors_csv` still does not create that row (a new
+vendor would share the existing vendor's ERP identifier, the collision §491
+exists to prevent), but reports it as the coded row error
+`csv_vendor_code_is_erp_link` (`params: {value, name, vendor}`), counted in
+`skipped`, naming the row's supplier, the code and the linked vendor, and
+saying to give the supplier a different code. A true duplicate stays a quiet
+skip: the code held as `Vendor.code` (the existing dedup priority, whatever
+the name), or held only as the ERP record id by a vendor of the same name
+(trimmed, case-insensitive). "Same name" includes a duplicate merged into the
+claimant: `_CodeClaimant.names` carries the survivor's name and every merged
+duplicate's that claimed the code through it, so a row named after a retired
+duplicate is not misreported as unrelated.
+
+**Why an error row, not a separate non-fatal notice.** `ImportResult.errors`
+is already the list of rows that were not imported and why — the near-duplicate
+invoice number (§77) is the precedent: a row neither imported nor silently
+skipped is reported there, coded (§372). This row is not imported and the user
+has to act (change the code), so it is that kind of row. A new `notices` field
+would add a second schema field and a second list in `CsvImportErrors.svelte`
+for one case, while the existing renderer, localization (`codedRefusals.ts`)
+and fallback-to-English already apply unchanged.
+
+**Rejected.** *Falling through to the name lookup and creating the vendor*:
+that mints a second holder of the ERP id, the collision §491 refuses.
+*Reporting every ERP-id match, same name included*: a file exported from the
+ERP the vendor is linked by carries that id and means that vendor (§491's own
+rejected alternative); flagging the ordinary re-import is noise that hides the
+real case. *Comparing names fuzzily* (`vendor_matching`): a near-name would
+silence the notice exactly where the payee question is open; an exact
+case-insensitive match is the only one that says "same supplier" with no guess.
+
+Pinned in `backend/tests/test_csv_import.py` (quiet skip for a same-named ERP
+link and for a code held as `code` under another name; the coded row error for
+an unrelated-named ERP link; the Postgres collision test covers both against
+real rows) and `frontend/src/lib/api/codedRefusals.test.ts`.

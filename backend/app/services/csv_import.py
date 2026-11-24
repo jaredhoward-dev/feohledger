@@ -234,6 +234,14 @@ CSV_VENDOR_REQUIRED = "csv_vendor_required"
 #: by precedence, by name, or minted as a stub sharing the code (decisions
 #: §491). Params: `value`.
 CSV_VENDOR_CODE_AMBIGUOUS = "csv_vendor_code_ambiguous"
+#: A vendor-import row whose `code` one vendor claims only as the ERP record id
+#: it is linked by (`Vendor.erp_vendor_id`), under a different name. The row is
+#: not created — a new vendor would share that vendor's ERP identifier — and,
+#: unlike a true duplicate (same name, or the code held as `Vendor.code`), it
+#: is not skipped quietly: nothing says the row and that vendor are one
+#: supplier (decisions §493). Params: `value` (the code), `name` (the row's
+#: supplier), `vendor` (the linked vendor's name).
+CSV_VENDOR_CODE_IS_ERP_LINK = "csv_vendor_code_is_erp_link"
 #: An `amount` that is blank, unparseable, negative or wider than
 #: `Numeric(15, 2)`. Params: `value`.
 CSV_AMOUNT_INVALID = "csv_amount_invalid"
@@ -384,7 +392,10 @@ class _CodeClaimant:
 
     ``vendor`` is the surviving record. ``by_code`` is True when it, or a
     duplicate merged into it, holds the value as ``Vendor.code`` rather than
-    only as ``Vendor.erp_vendor_id``. ``unresolved`` marks a merged-away vendor
+    only as ``Vendor.erp_vendor_id``. ``names`` holds the case-folded names of
+    the survivor and of every duplicate that claimed the value through it, so
+    the vendor importer can tell a same-named duplicate from an unrelated
+    supplier (decisions §493). ``unresolved`` marks a merged-away vendor
     whose survivor could not be reached (missing, another org, a cycle, or a
     chain past the cap): it is kept as its own claimant so nothing silently
     lands on it, and the invoice resolver refuses it.
@@ -393,6 +404,7 @@ class _CodeClaimant:
     vendor: Vendor
     by_code: bool
     unresolved: bool = False
+    names: set[str] = field(default_factory=set)
 
 
 async def _merge_survivor(
@@ -464,10 +476,17 @@ async def _vendors_claiming_code(
                 survivor, unresolved = vendor, True
         existing = claimants.get(survivor.id)
         if existing is None:
-            claimants[survivor.id] = _CodeClaimant(survivor, by_code, unresolved)
+            existing = claimants[survivor.id] = _CodeClaimant(survivor, by_code, unresolved)
+            existing.names.add(_folded_name(survivor.name))
         else:
             existing.by_code = existing.by_code or by_code
+        existing.names.add(_folded_name(vendor.name))
     return list(claimants.values())
+
+
+def _folded_name(name: str | None) -> str:
+    """A vendor name as the importers compare it: trimmed, case-folded."""
+    return (name or "").strip().lower()
 
 
 def _ambiguous_code(code: str) -> ImportRowError:
@@ -552,7 +571,9 @@ async def import_vendors_csv(
     """Upsert vendors from CSV. Dedup priority: code > case-insensitive name.
     ``code`` dedups against a vendor's code or its ERP record id, and a code
     two vendors claim refuses the row (``csv_vendor_code_ambiguous``,
-    decisions §491).
+    decisions §491). A code one vendor claims only as its ERP record id, under
+    another name, is reported (``csv_vendor_code_is_erp_link``) rather than
+    skipped quietly as a duplicate (decisions §493).
 
     ``entity_id`` (multi-entity Phase 2) is the entity new vendors land under —
     the selected entity or the tenant default, resolved at the endpoint. Dedup
@@ -591,7 +612,28 @@ async def import_vendors_csv(
                 result.errors.append(error)
                 result.skipped += 1
                 continue
-            existing = claimants[0].vendor if claimants else None
+            if claimants:
+                claimant = claimants[0]
+                # The code is only the ERP record id an unrelated-named vendor
+                # is linked by: the row is not created (it would share that
+                # link), but it is not a duplicate either, so it says so
+                # rather than counting as a quiet skip (decisions §493).
+                if not claimant.by_code and _folded_name(name) not in claimant.names:
+                    result.errors.append(
+                        _coded(
+                            i,
+                            CSV_VENDOR_CODE_IS_ERP_LINK,
+                            f"vendor {name!r} was not created: code {code!r} is the ERP "
+                            f"record id vendor {claimant.vendor.name!r} is linked by; give "
+                            "the supplier a different code",
+                            value=code,
+                            name=name,
+                            vendor=claimant.vendor.name,
+                        )
+                    )
+                    result.skipped += 1
+                    continue
+                existing = claimant.vendor
         if existing is None:
             existing = await _find_vendor(
                 db, organization_id, entity_id, func.lower(Vendor.name) == name.lower()

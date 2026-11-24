@@ -1069,6 +1069,17 @@ const BUILDERS: Record<string, Builder> = {
 		const value = str(p, 'value');
 		return value === null ? null : t('refusal.csvVendorCodeAmbiguous', { value });
 	},
+	// A vendor-import row whose code is only the ERP record id another-named
+	// vendor is linked by: not created, and named rather than skipped quietly
+	// (decisions §493).
+	csv_vendor_code_is_erp_link: (p, t) => {
+		const value = str(p, 'value');
+		const name = str(p, 'name');
+		const vendor = str(p, 'vendor');
+		return value === null || name === null || vendor === null
+			? null
+			: t('refusal.csvVendorCodeIsErpLink', { value, name, vendor });
+	},
 	csv_amount_invalid: (p, t) => {
 		if (typeof p.value !== 'string') return null;
 		const value = str(p, 'value');

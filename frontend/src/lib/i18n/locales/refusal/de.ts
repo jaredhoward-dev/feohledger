@@ -265,6 +265,7 @@ export const messages = {
 	'refusal.csvInvoiceNumberRequired': "Die Spalte invoice_number ist leer, daher wurde diese Zeile nicht importiert.",
 	'refusal.csvVendorRequired': "Diese Zeile nennt keinen Lieferanten und wurde daher nicht importiert. Füllen Sie vendor_name oder vendor_code aus.",
 	'refusal.csvVendorCodeAmbiguous': "Der vendor_code {value} bezeichnet nicht genau einen Lieferanten: Mehrere Lieferanten führen ihn, oder er ist die ERP-Datensatz-ID, über die ein Lieferant verknüpft ist. Diese Zeile wurde nicht importiert. Geben Sie dem Lieferanten einen Code, den kein anderer führt, oder führen Sie die Lieferanten zusammen, wenn es derselbe ist.",
+	'refusal.csvVendorCodeIsErpLink': "Der Lieferant {name} wurde nicht angelegt: Der Code {value} ist die ERP-Datensatz-ID, über die der Lieferant {vendor} verknüpft ist. Geben Sie dem Lieferanten einen anderen Code.",
 	'refusal.csvAmountMissing': "Die Spalte amount ist leer, daher wurde diese Zeile nicht importiert.",
 	'refusal.csvAmountInvalid': "Der Betrag {value} ist kein gültiger Betrag von null oder mehr, daher wurde diese Zeile nicht importiert.",
 	'refusal.csvCurrencyRequired': "Die Spalte currency ist leer, daher wurde diese Zeile nicht importiert. Geben Sie den dreistelligen Währungscode der Zeile an, etwa USD oder EUR; eine fehlende Währung wird nie angenommen.",
