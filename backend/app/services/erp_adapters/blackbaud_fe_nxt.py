@@ -77,7 +77,9 @@ the tenant config, never a guessed value.
 **Accounts are addressed by number.** The AP API names a distribution's account
 by ``account_number`` (``01-5000-00``), never by the GL API's ``account_id``,
 so :meth:`list_gl_accounts` stores the account number as ``erp_account_id`` and
-the line's ``gl_account_erp_id`` is posted as-is. Accounts with
+the line's ``gl_account_erp_id`` is posted as-is. That link follows a
+renumbering rather than the account (decisions §493; keying by ``account_id``
+needs an id → number read per post, a tracked followup). Accounts with
 ``prevent_data_entry`` set are not synced: a bill coded to one cannot post.
 
 **Asynchronous create.** ``POST /invoices`` is deprecated in favour of
