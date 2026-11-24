@@ -463,7 +463,7 @@ def _stmt_aware_db(
 
 @pytest.mark.asyncio
 async def test_import_vendors_reuses_existing_by_code():
-    existing = MagicMock(id=uuid.uuid4(), name="Acme", code="V001")
+    existing = MagicMock(id=uuid.uuid4(), name="Acme", code="V001", merged_into_vendor_id=None)
     db = _stmt_aware_db(vendor_by_code=existing)
     result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,V001\n")
     assert result.skipped == 1
@@ -482,7 +482,7 @@ async def test_import_vendors_reuses_existing_by_name_when_no_code():
 
 @pytest.mark.asyncio
 async def test_import_invoices_reuses_existing_vendor_by_code():
-    vendor = MagicMock(id=uuid.uuid4(), name="Acme", code="V001")
+    vendor = MagicMock(id=uuid.uuid4(), name="Acme", code="V001", merged_into_vendor_id=None)
     db = _stmt_aware_db(vendor_by_code=vendor)  # invoice dedup → None, so not skipped
     csv_text = "invoice_number,vendor_name,vendor_code,amount,currency\nINV-1,Acme,V001,100,EUR\n"
     result = await import_invoices_csv(db, uuid.uuid4(), csv_text)
@@ -503,7 +503,13 @@ async def test_import_invoices_reuses_existing_vendor_by_code():
 
 
 def _vendor(code, erp_vendor_id=None, name="Acme"):
-    return MagicMock(id=uuid.uuid4(), name=name, code=code, erp_vendor_id=erp_vendor_id)
+    return MagicMock(
+        id=uuid.uuid4(),
+        name=name,
+        code=code,
+        erp_vendor_id=erp_vendor_id,
+        merged_into_vendor_id=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -1812,3 +1818,105 @@ async def test_csv_vendor_code_collisions_are_refused_and_move_nothing(realdb):
     assert coll_3.vendor_id == linked_id
     # No vendor was minted and no code or ERP link moved.
     assert after == before
+
+
+async def test_csv_vendor_code_held_by_a_merged_duplicate_names_its_survivor(realdb):
+    """Against Postgres (decisions §491). Two vendors holding `V001` are
+    refused — and the refusal says to merge them. Once B is merged into A
+    (`vendor_merge.merge_vendors`, which keeps B's code), the same row resolves
+    to A: a merged-away duplicate stands for its survivor rather than claiming
+    the code in its own right. A code ONLY a merged duplicate still holds
+    resolves to the vendor it was merged into, never to the retired record; and
+    one whose merge chain cannot be followed (here, a corrupted self-merge) is
+    refused rather than landing on the retired vendor."""
+    from sqlalchemy import select
+
+    from app.models.vendor import Vendor
+    from app.services.vendor_merge import merge_vendors
+
+    org_id, entity_a, _entity_b = await _two_entities(realdb)
+    actor = realdb.info("a").users["ap_manager"]
+    mk = realdb.sessionmaker("a")
+
+    def _v(name, code):
+        return Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name=name,
+            code=code,
+            status="active",
+            source="manual",
+        )
+
+    async with mk() as s:
+        a, b = _v("Acme Ltd", "V001"), _v("Acme Limited", "V001")
+        c, d = _v("Beta Co", "B-1"), _v("Beta Company", "B-OLD")
+        broken = _v("Orphan Co", "ORPH")
+        s.add_all([a, b, c, d, broken])
+        await s.commit()
+        a_id, b_id, c_id, d_id = a.id, b.id, c.id, d.id
+        broken.status = "inactive"
+        broken.merged_into_vendor_id = broken.id  # a cycle: never followable
+        await s.commit()
+
+    header = "invoice_number,vendor_name,vendor_code,amount,currency,status\n"
+
+    async with mk() as s:
+        res = await import_invoices_csv(
+            s,
+            org_id,
+            header + "MRG-1,Acme Ltd,V001,10.00,USD,new\n",
+            entity_id=entity_a,
+            actor_id=actor,
+        )
+        await s.commit()
+    assert [e["code"] for e in res.to_dict()["errors"]] == ["csv_vendor_code_ambiguous"]
+
+    async with mk() as s:
+        await merge_vendors(
+            s, canonical_vendor_id=a_id, duplicate_vendor_ids=[b_id], merged_by_user_id=actor
+        )
+        await merge_vendors(
+            s, canonical_vendor_id=c_id, duplicate_vendor_ids=[d_id], merged_by_user_id=actor
+        )
+        await s.commit()
+
+    async with mk() as s:
+        res = await import_invoices_csv(
+            s,
+            org_id,
+            header
+            + "MRG-2,Acme Ltd,V001,10.00,USD,new\n"
+            + "MRG-3,Beta Company,B-OLD,20.00,USD,new\n"
+            + "MRG-4,Orphan Co,ORPH,30.00,USD,new\n",
+            entity_id=entity_a,
+            actor_id=actor,
+        )
+        await s.commit()
+    assert [(e["row"], e["code"]) for e in res.to_dict()["errors"]] == [
+        (4, "csv_vendor_code_ambiguous")
+    ]
+    assert res.imported == 2
+
+    async with mk() as s:
+        by_number = {
+            inv.invoice_number: inv.vendor_id
+            for inv in (
+                await s.execute(
+                    select(Invoice).where(Invoice.invoice_number.in_(["MRG-2", "MRG-3"]))
+                )
+            ).scalars()
+        }
+        res_v = await import_vendors_csv(
+            s, org_id, "name,code\nAcme Again,V001\nBeta Again,B-OLD\n", entity_id=entity_a
+        )
+        await s.commit()
+        minted = (
+            (await s.execute(select(Vendor).where(Vendor.name.in_(["Acme Again", "Beta Again"]))))
+            .scalars()
+            .all()
+        )
+    assert by_number == {"MRG-2": a_id, "MRG-3": c_id}
+    # The vendor importer dedups on the survivor too: nothing refused, nothing minted.
+    assert (res_v.imported, res_v.skipped, res_v.errors) == (0, 2, [])
+    assert minted == []

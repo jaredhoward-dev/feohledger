@@ -25017,6 +25017,19 @@ either column (the ERP number is in `code`, the record id in
 goes toward a refusal naming the fix — give the supplier a distinct code, or
 merge the vendors — never toward a payee chosen by order.
 
+A claimant is a *supplier*, not a row. `vendor_merge.merge_vendors` retires a
+duplicate (`inactive`, `merged_into_vendor_id`) but leaves its `code` in
+place, so a merged-away vendor stands for its survivor: the lookup follows
+`merged_into_vendor_id` to the end of the chain (a visited set and a hop cap
+end a corrupted cycle) and de-duplicates, so A and B-merged-into-A both
+holding `V001` are one claimant, A — following the refusal's own advice
+clears it — and a code only a retired duplicate still holds resolves to the
+vendor it was merged into, never to the retired record. A survivor that
+cannot be reached (missing, another org, a cycle) leaves the duplicate as its
+own claimant, which the invoice importer refuses. "Holds it as its code" is
+true of the survivor when it or any duplicate merged into it holds the value
+as `code`.
+
 **Why no migration, and no separate ERP-number column.** The reverted round-35
 attempt (merge `be1382f8`, its own "§490" never landed; reverted by
 `5910848f`) moved the ERP number into
@@ -25049,13 +25062,26 @@ vendor holds*: a file exported from the same ERP carries that number and means
 that vendor; refusing it would break the ordinary case to guard against a
 collision that is not there.
 
+**Accepted for now: a code no vendor claims falls back to the name.** When a
+row's `vendor_code` matches no vendor, the invoice importer resolves by
+`vendor_name`, and that can land the row on a same-named vendor holding a
+*different* code (`Acme Ltd,ACME-2` resolves to the vendor `Acme Ltd` whose
+code is `ACME-1`). That is deliberate for now: a migration from a system whose
+codes differ from ours is the ordinary first import, and refusing every such
+row would refuse the whole file. The risk is two distinct suppliers that share
+a name, where the code was the only thing telling them apart; the row then
+lands on the wrong payee without a word. Whether to refuse when the name
+match's own code is non-null and differs is an open operator decision, not
+settled here.
+
 **Cost.** Two vendors that genuinely are one supplier under two subsidiaries,
 each holding the same code, now refuse code-only rows in an import scoped to
 one of them where the own-entity row used to win. The refusal names the fix,
 and `vendor_name` without a code still resolves by the name precedence. Pinned
 in `backend/tests/test_csv_import.py` (refusal per collision shape, resolution
-of a single claimant, vendor-import refusal and ERP-id dedup, and a Postgres
-test that the importers move no code or link).
+of a single claimant, vendor-import refusal and ERP-id dedup, a Postgres
+test that the importers move no code or link, and one that a merged duplicate's
+code resolves to its survivor).
 
 ## 492. GL links hold the ERP's record id, not the account number, where the ERP has one (round 36)
 
@@ -25088,7 +25114,15 @@ refused or, if the freed number was reused, posted to the wrong account.
   sync runs, the bare link keeps posting by number. One case cannot be
   recovered: an account renumbered *before* the first keyed pull leaves its
   old row on a dead number (exactly as before this change), because nothing
-  records which key the old number belonged to.
+  records which key the old number belonged to. Its sibling is the *reused*
+  number: 6100 renumbered to 6150 and a new account then created as 6100,
+  both before the first keyed pull. Rule 2 matches the old row by its code
+  (6100) and re-keys it to the NEW account's key. That is no regression — the
+  bare link already posted by number to that same new account — but the row
+  now names a different account than the one its history was coded to. The
+  re-link is recorded in the sync audit row's `link_changes`; an operator
+  should read `link_changes` after the first keyed sync and recode any row
+  re-keyed this way.
 - **SYSPRO keeps `GlCode`.** `GenMaster` has no surrogate key: the ledger
   code is the primary key, APSTIN distributions take only it, and SYSPRO's GL
   code change program rewrites the code on every record instead of moving a

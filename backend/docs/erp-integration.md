@@ -1817,6 +1817,15 @@ the number:
   chart sync re-links that row by code to the key (one `link_changes` entry
   per row, in the audit row). An account Intacct returns with no key is
   reported `missing_erp_id`, never keyed by its number.
+  Two cases the re-link cannot get right, both only when the ERP changed
+  before the first keyed pull. An account renumbered first (6100 → 6150)
+  leaves its old row on a dead number, as before §492: nothing records which
+  key the old number belonged to. A number renumbered *and reused* (6100 →
+  6150, then a new account created as 6100) re-keys the old row to the NEW
+  account's key by code. That is no regression — the bare link already posted
+  to that account by number — but it is a row now naming a different account
+  than its history: read the sync audit row's `link_changes` after the first
+  keyed sync and recode any such row.
 - **`syspro`** keeps `GlCode`: `GenMaster` has no surrogate key — the ledger
   code IS the primary key, AP distributions (APSTIN) take only it, and SYSPRO
   renumbers through its GL code change program, which rewrites the code on

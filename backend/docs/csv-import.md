@@ -208,6 +208,10 @@ importers resolve a code only when it names exactly one vendor in scope
   ERP record id, refuse the row as `csv_vendor_code_ambiguous` (`params:
   {value}`). The row is not resolved by name instead and no stub is minted:
   either would guess, or create a third holder of the code.
+  A code that *no* vendor claims falls back to `vendor_name` before a stub is
+  minted, and the name match wins even when that vendor holds a different
+  code (`Acme Ltd,ACME-2` lands on `Acme Ltd`/`ACME-1`); this is accepted on
+  purpose for migrations from a system with other codes (decisions §491).
 - **Vendor import.** A file row whose `code` one vendor claims (as its code or
   its ERP record id) is that vendor and is skipped as a duplicate; a code two
   vendors claim refuses the row with the same code.
@@ -215,7 +219,10 @@ importers resolve a code only when it names exactly one vendor in scope
 The importers only read codes: no vendor's `code` or ERP link is changed, so a
 person-typed code is never moved or reinterpreted. To clear a refusal, give the
 supplier a code no other vendor holds, or merge the vendors if they are one
-supplier. Pinned in `tests/test_csv_import.py`.
+supplier. A merged-away vendor keeps its code but claims it for its survivor
+(followed through `merged_into_vendor_id`), so after the merge the code
+resolves to the surviving vendor, and a code only the retired duplicate still
+holds resolves there too. Pinned in `tests/test_csv_import.py`.
 
 ## Every row error is coded
 

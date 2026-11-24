@@ -245,7 +245,9 @@ Backs `erp_adapters/sage_intacct.py` (`FEOH_ERP_INTACCT_API_BASE`).
   `glAccount` names its account by record `key` or number `id`, as
   FeohLedger's links do since decisions §492); a non-string
   `txnAmount` is refused. `GET` / `DELETE /objects/accounts-payable/bill/{key}`
-  (only a posted / draft / declined bill deletes).
+  (only a posted / draft / declined bill deletes). A bill read back carries
+  `lines[].glAccount` exactly as it was sent (`{"key"}` or `{"id"}`) — real
+  Intacct names both — so a spec can tell which form FeohLedger posted by.
 - `POST /workflows/accounts-payable/bill/reverse` — `{key, reverseDate}`
   reverses a posted bill; the date must be after its posting date.
 - Errors are `{"ia::result": {"ia::error": {...}}, "ia::meta": {...}}`, the

@@ -233,14 +233,29 @@ export async function syncErpVendors(page: Page): Promise<void> {
 	expect(resp.status(), 'vendor sync').toBe(200);
 }
 
+/** One `link_changes` entry of a chart sync: a row whose `erp_account_id` moved. */
+export type GlLinkChange = { code: string; from: string | null; to: string | null };
+
 /** Pull the configured ERP's chart (`POST /api/gl-accounts/sync-erp`) — the
  *  only writer of `gl_accounts.erp_account_id`, which NetSuite's expense lines
- *  are posted against. Idempotent. */
-export async function syncErpGlAccounts(page: Page): Promise<void> {
+ *  are posted against. Idempotent. Returns the sync's `link_changes`. */
+export async function syncErpGlAccounts(page: Page): Promise<GlLinkChange[]> {
 	const resp = await page.request.post(`${API_BASE}/api/gl-accounts/sync-erp`, {
 		headers: await authedTenantHeaders(page)
 	});
 	expect(resp.status(), 'GL account sync').toBe(200);
+	return ((await resp.json()) as { link_changes: GlLinkChange[] }).link_changes;
+}
+
+/** The tenant's `erp_account_id` for each GL row of `code` (`GET /api/gl-accounts`). */
+export async function glErpLinks(page: Page, code: string): Promise<Array<string | null>> {
+	const list = await page.request.get(`${API_BASE}/api/gl-accounts`, {
+		headers: await authedTenantHeaders(page)
+	});
+	expect(list.status(), 'GL account list').toBe(200);
+	return ((await list.json()) as Array<{ code: string; erp_account_id: string | null }>)
+		.filter((a) => a.code === code)
+		.map((a) => a.erp_account_id);
 }
 
 /** A PO as `GET /api/purchase-orders` lists it. */
