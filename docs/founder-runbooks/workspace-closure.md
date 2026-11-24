@@ -20,11 +20,21 @@ them.
 
 - **Every day** its `check` job counts the queue on the VM and prints counts
   only (the log is public). Nothing is deleted.
-- **When anything is owed**, its `erase` job waits for your approval (it runs
-  in the `production` environment). GitHub emails you about the pending
+- **When anything is owed and past its 7-day cool-off**, its `erase` job waits
+  for your approval (it runs in the `backup-erasure` environment, `main`
+  only). GitHub emails you about the pending
   deployment. Approve it in the run's page, or with
   `gh run list --workflow backup-erasure.yml --repo jaredhoward-dev/feohledger`
   and the run's **Review deployments** button.
+- **Before deleting, it checks the bucket itself**, because the queue comes
+  from the VM: the newest nightly backup must be at most 2 days old (else it
+  erases nothing and goes red); a workspace still in one of the newest three
+  nightly backups is **deferred** (a restore window), as is one removed under 7
+  days ago; and a workspace backed up **after** its recorded removal goes red
+  and is not touched — either the removal failed or the queue entry is forged.
+  Treat that as a possible VM compromise: check `list` on the VM against the
+  organisations that exist, and the backup bucket's access logs.
+- At most 50 workspaces per run, oldest first; the rest follow on later runs.
 - **Once approved**, for each owed workspace it deletes every version and every
   delete marker of `pg/*/feoh_<slug>.dump`, lists the bucket again and requires
   none to be left, and only then marks the row cleared

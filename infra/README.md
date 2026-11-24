@@ -292,8 +292,10 @@ its AWS pieces, which this module owns outright (unlike the deploy role):
   `feohledger-backup-erasure-summary` document on only the app instance, plus
   `ssm:GetCommandInvocation`. No S3.
 - **`feohledger-backup-erasure`** — assumed by the `erase` job, which runs in
-  the `production` environment and so waits for its required reviewer. Trusts
-  exactly `<prefix>:environment:production`. May send only the
+  its own `backup-erasure` environment and so waits for its required reviewer.
+  Trusts exactly `<prefix>:environment:backup-erasure` — never `production`,
+  which `aws-deploy.yml` and `aws-oidc-preflight.yml` share and which they can
+  reach from any branch. May send only the
   `feohledger-backup-erasure-owed` (read-only) and
   `feohledger-backup-erasure-mark-cleared` documents, whose parameters SSM
   refuses unless they are a UUID and a run number. On S3:
@@ -304,7 +306,10 @@ its AWS pieces, which this module owns outright (unlike the deploy role):
   `DeleteObject`.
 
 The backup bucket has no Object Lock and no MFA delete, so a delete by version
-id is permanent. `<prefix>` is `var.github_oidc_sub_prefix` — read it, never
+id is permanent. Because the queue comes from the VM, the erase job also checks
+the bucket before deleting (newest night ≤ 2 days old; nothing dumped after the
+recorded closure; not in the newest three nights; a 7-day cool-off), so a
+forged entry naming a live tenant is refused (`../docs/decisions.md` §490). `<prefix>` is `var.github_oidc_sub_prefix` — read it, never
 build it from the slug (§ The deploy role is not owned here).
 
 **One-time operator steps**, in order:
@@ -322,19 +327,20 @@ build it from the slug (§ The deploy role is not owned here).
    `aws_ssm_document.backup_erasure_*`, `aws_iam_role.backup_erasure` and
    `aws_iam_role.backup_erasure_check`, and their two `aws_iam_role_policy` —
    and change nothing else.
-4. **Give the workflow its secrets.** The check job is outside any environment,
-   so it reads repository secrets; the erase job reads the `production`
-   environment's. Secrets, not variables: role ARNs and the bucket name embed
-   the account id, and these logs are public.
+4. **Create the `backup-erasure` environment** (Settings → Environments → New
+   environment → `backup-erasure`): **Required reviewers** on (yourself;
+   leave prevent-self-review off while you are the only reviewer), and
+   **Deployment branches and tags** → Selected branches and tags → `main` only.
+   Its subject is the same from any branch, so the branch rule is what stops a
+   workflow edited on a branch from reaching the erase role after an approval.
+5. **Give the workflow its secrets.** The check job is outside any environment,
+   so it reads repository secrets; the erase job reads the `backup-erasure`
+   environment's (and the repository's). Secrets, not variables: role ARNs and
+   the bucket name embed the account id, and these logs are public.
    - `gh secret set AWS_BACKUP_ERASURE_CHECK_ROLE_ARN --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backup_erasure_check_role_arn)"`
-   - `gh secret set VM_INSTANCE_ID --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw app_instance_id)"` (the repository-level copy; the `production` one stays)
-   - `gh secret set AWS_BACKUP_ERASURE_ROLE_ARN --env production --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backup_erasure_role_arn)"`
-   - `gh secret set BACKUP_S3_BUCKET --env production --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backups_bucket)"`
-5. **Restrict the `production` environment to `main`** (Settings →
-   Environments → production → Deployment branches and tags → Selected branches
-   and tags → `main`). Its subject is the same from any branch, so this is what
-   stops a workflow edited on a branch from reaching the erase role (or the
-   deploy role) after an approval. Keep the required reviewer.
+   - `gh secret set VM_INSTANCE_ID --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw app_instance_id)"` (the repository-level copy both jobs read; the `production` one stays for deploys)
+   - `gh secret set AWS_BACKUP_ERASURE_ROLE_ARN --env backup-erasure --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backup_erasure_role_arn)"`
+   - `gh secret set BACKUP_S3_BUCKET --env backup-erasure --repo jaredhoward-dev/feohledger --body "$(AWS_PROFILE=feohledger terraform -chdir=infra output -raw backups_bucket)"`
 6. **Arm the workflow**:
    `gh variable set BACKUP_ERASURE_ENABLED --repo jaredhoward-dev/feohledger --body true`.
    Until then the daily run skips.

@@ -24831,10 +24831,18 @@ backups are no protection against the compromise they exist for. So:
   `summary` SSM document on the app VM: counts, no identifiers. An entry 45
   days old (`workspace_closure.ERASURE_OVERDUE_AFTER`, two weeks inside the
   DPA's 60) or blocked for a human fails a separate `attention` job red, which
-  emails the owner. The `erase` job runs in the `production` environment, so a
-  required reviewer approves it before it gets a token, and assumes
-  `feohledger-backup-erasure` (trust: the exact `:environment:production`
-  subject). It reads the queue through the `owed` document, masks every slug,
+  emails the owner. Entries younger than a 7-day cool-off
+  (`ERASURE_COOL_OFF`) count as cooling, not ready, so no approval is asked
+  for until one can act. The `erase` job runs in its own `backup-erasure`
+  environment — a required reviewer approves it before it gets a token, and
+  only `main` may deploy to it — and assumes `feohledger-backup-erasure`
+  (trust: the exact `:environment:backup-erasure` subject). Not `production`:
+  `aws-deploy.yml` and `aws-oidc-preflight.yml` also run there and can be
+  dispatched from any branch, so trusting that subject would hand the role to
+  an approved run of any of them, from any branch. It reads the queue (at most
+  `ERASURE_BATCH` = 50 entries, oldest first, because SSM keeps only ~24,000
+  characters of output; the rest drain on later runs) through the `owed`
+  document, masks every slug,
   organisation id and database name before using any, and per workspace lists
   every version and delete marker under `pg/` (the same separately-filtered,
   `/`-anchored listing `remove-tenant.sh` used, whose comments record the
@@ -24844,6 +24852,23 @@ backups are no protection against the compromise they exist for. So:
   failure on one workspace leaves it owed and fails the job at the end. A
   workspace whose slug a live organisation holds again, or whose database
   still exists, is refused rather than erased.
+- **The VM does not get to choose alone.** The `owed` list comes from the VM,
+  and a compromised VM could name a live tenant; a reviewer approving the job
+  cannot see slugs (the log is public) and would approve blind. So before
+  deleting anything the job checks the bucket itself, which the VM cannot
+  rewrite for past nights because it cannot delete there: (a) the newest
+  nightly prefix `pg/<YYYY-MM-DD>/` (`backup.sh`'s UTC date; it dumps every
+  `feoh_*` database every night) must be at most 2 days old, or nothing is
+  erased and the run fails — otherwise "not dumped lately" proves nothing;
+  (b) a dump of an owed database dated after its recorded closure means the
+  database was still there to dump — a forged entry or a failed removal — and
+  fails the run red without erasing; a dump on or before the closure in any of
+  the newest three nights defers the entry (a restore window); (c) a closure
+  younger than 7 days is deferred (a cool-off for a mistaken removal, well
+  inside the 45-day alarm). Deferred is not a failure. What remains: a VM
+  compromised for long enough could stop dumping a victim for three nights
+  and then forge an entry with a matching date; the reviewer, the cool-off and
+  the red alarm on any post-closure dump narrow that, they do not close it.
 - **The erase role's S3 grant** is `s3:ListBucketVersions` on the bucket only
   with `s3:prefix = pg/` (plus an explicit Deny for any other prefix or none),
   `s3:DeleteObjectVersion` on `pg/*/feoh_*.dump` only, and an explicit Deny of
@@ -24853,10 +24878,23 @@ backups are no protection against the compromise they exist for. So:
   versioned delete is permanent. The VM role is unchanged. Guarded in
   `infra/tests/guardrails.tftest.hcl`.
 
-The role can still delete any tenant's dumps, live or not; the approval is
-what stands between it and a mistake, and the `production` environment's
-deployment branches must be restricted to `main` (an owner setting) so a
-workflow edited on a branch cannot reach it after an approval.
+The role can still delete any tenant's dumps, live or not; the approval, the
+dedicated environment restricted to `main` (owner settings) and the bucket
+checks above are what stand between it and a mistake. Restricting the
+environment to `main` is what stops a workflow edited on a branch from reaching
+the role after an approval. Pinning the role to the workflow file as well (a
+`job_workflow_ref` condition) was considered and not used: whether AWS STS
+evaluates that GitHub claim as a condition key is unconfirmed, and a condition
+STS ignores or rejects would either do nothing or break the handshake.
+
+**Accepted residuals.** The check role trusts any workflow on `main`; it can
+only run the read-only `summary` document, which prints counts, so a workflow
+merged to `main` gains nothing it could not read from the public run log.
+`ssm:GetCommandInvocation` is granted on `*` to both roles because SSM defines
+no resource type for it; command ids are not guessable and neither role can
+list commands. The public run log reveals that some workspace was removed
+recently (an `erase` job waiting for approval, "Erased N of M"): counts only,
+never which, and a cost of running the erasure in the open.
 
 **Rejected:**
 
