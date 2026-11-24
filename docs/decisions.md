@@ -24993,3 +24993,56 @@ Read 2026-11-24 for the pre-merge hardening:
 <https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps>
 (`GET …/environments/{name}` and its deployment-branch-policies need Actions:
 read).
+
+## 493. GL links hold the ERP's record id, not the account number, where the ERP has one (round 36)
+
+**Context.** `docs/followups.md` (c) "Vendor linking has two gaps of its own",
+part (2): Sage Intacct, SYSPRO and Blackbaud FE NXT stored the business
+account NUMBER as `gl_accounts.erp_account_id`. The chart sync matches by that
+id first (`services/gl_account_sync` rule 1, §284), and a number is exactly
+what an accountant renumbers: after a renumbering the old row's link pointed
+at a number the ERP no longer had (dead), and the new number arrived as a new
+account — a second row for the same account, and the old row's invoices
+refused or, if the freed number was reused, posted to the wrong account.
+
+**Decision.**
+
+- **Sage Intacct links by the GLACCOUNT record key** (`RECORDNO`, the `key`
+  the REST query already returns), stored as `key:<key>`
+  (`sage_intacct.GL_KEY_PREFIX`). The prefix is load-bearing: a number-keyed
+  link from before this change and a record key are both digit strings, so
+  without it a row linked to account NUMBER 61 would be matched by rule 1 to
+  whichever account has RECORD KEY 61. A bill line references a key link
+  `{"key": …}`, and the `account_inactive` read-back filters by key; a bare
+  link posts `{"id": …}` as before. An account returned without a key gets no
+  id (the sync reports `missing_erp_id`) rather than a number fallback that
+  would mix the two forms.
+- **Existing links need no migration.** The first keyed pull finds no row
+  with the new id, falls to rule 2 (by code — the row's code IS the old
+  number), sees the row's old link is not a live id, and re-links that same
+  row to the key, recorded in `link_changes` and so in the sync's audit row.
+  Rule 0's realm logic is untouched: the realm is the same company. Until that
+  sync runs, the bare link keeps posting by number. One case cannot be
+  recovered: an account renumbered *before* the first keyed pull leaves its
+  old row on a dead number (exactly as before this change), because nothing
+  records which key the old number belonged to.
+- **SYSPRO keeps `GlCode`.** `GenMaster` has no surrogate key: the ledger
+  code is the primary key, APSTIN distributions take only it, and SYSPRO's GL
+  code change program rewrites the code on every record instead of moving a
+  record. There is no stable id to key by.
+- **Blackbaud FE NXT is not changed here.** Its GL API has a stable
+  `account_id`, but AP distributions accept only `account_number`, so keying
+  by id means resolving id → current number on every post (one more read per
+  distinct account, inside FE NXT's call budget, and a coded refusal when the
+  read fails). That is sized and left as the narrowed followup.
+
+**Rejected.** *A raw key with a sync-side "legacy id" map* (the payload
+naming each account's old number so the sync re-keys by it): the collision
+above makes "this link is a number" undecidable from the value alone. *A
+migration rewriting stored numbers to keys*: a migration cannot call the ERP,
+and the sync already re-links by code with an audit trail. *Re-reading the
+key → number at post time for Intacct*: an extra call per account on every
+push, when Intacct's reference object takes the key directly.
+
+**Unverified.** The bill line's `{"glAccount": {"key": …}}` form is checked
+against the fake ERP only; a sandbox push confirms it (followups entry).
