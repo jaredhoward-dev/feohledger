@@ -26,6 +26,7 @@ from app.services.erp_adapters.base import GLAccountPayload
 from app.services.erp_adapters.dynamics_365_bc import _bc_account_to_payload
 from app.services.erp_adapters.netsuite import _netsuite_account_to_payload
 from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
+from app.services.erp_adapters.sage_intacct import gl_link_id
 from app.services.erp_record_names import SHORTENED_MARK, fit_name
 from app.services.gl_account_sync import (
     AMBIGUOUS_LEGACY,
@@ -595,3 +596,89 @@ async def test_endpoint_reports_conflicts_by_code_never_as_updated(realdb, qbo_c
         ).scalar_one()
     assert row.details["conflicts"] == body["conflicts"]
     assert row.details["adapter"] == "merge_dev"
+
+
+# ---------------------------------------------------------------------------
+# Sage Intacct links by record key, not account number (decisions §493)
+# ---------------------------------------------------------------------------
+
+_INTACCT_REALM = "intacct:ACMECO"
+
+
+async def _intacct_sync(realdb, accounts):
+    async with realdb.sessionmaker(TENANT)() as s:
+        result = await sync_chart_from_erp(
+            s,
+            organization_id=realdb.info(TENANT).org_id,
+            entity_id=None,
+            accounts=accounts,
+            realm=_INTACCT_REALM,
+        )
+        await s.commit()
+    return result
+
+
+def _intacct(key: str, number: str) -> GLAccountPayload:
+    return GLAccountPayload(code=number, name=f"Account {number}", erp_account_id=gl_link_id(key))
+
+
+async def test_an_intacct_renumbering_updates_the_keyed_row_and_creates_no_duplicate(realdb):
+    """Account 6100 renumbered to 6150 in Intacct: its record key is the same,
+    so our row is matched by id, keeps its code (invoices record it) and
+    reports the drift — no second row for 6150, and bills still post to it."""
+    row_id = await _add(
+        realdb,
+        code="6100",
+        name="Account 6100",
+        erp_account_id="key:61",
+        erp_link_realm=_INTACCT_REALM,
+    )
+    result = await _intacct_sync(realdb, [_intacct("61", "6150")])
+
+    assert (result.created, result.linked) == (0, 0)
+    assert result.code_drift == [{"code": "6100", "erp_code": "6150"}]
+    assert result.link_changes == []
+    chart = await _rows(realdb)
+    assert list(chart) == ["6100"]
+    assert (chart["6100"].id, chart["6100"].erp_account_id) == (row_id, "key:61")
+
+
+async def test_a_number_keyed_intacct_link_is_rekeyed_once_and_recorded(realdb):
+    """A link from before §493 holds the bare number. The first keyed pull
+    re-links the row by code to the account's record key — the same row, no
+    duplicate — and records the move in ``link_changes`` for the audit row; a
+    second pull changes nothing."""
+    row_id = await _add(
+        realdb,
+        code="6100",
+        name="Account 6100",
+        erp_account_id="6100",
+        erp_link_realm=_INTACCT_REALM,
+    )
+    pull = [_intacct("61", "6100"), _intacct("62", "6200")]
+    result = await _intacct_sync(realdb, pull)
+
+    assert (result.created, result.linked, result.conflicts) == (1, 1, [])
+    assert result.link_changes == [{"code": "6100", "from": "6100", "to": "key:61"}]
+    chart = await _rows(realdb)
+    assert sorted(chart) == ["6100", "6200"]
+    assert (chart["6100"].id, chart["6100"].erp_account_id) == (row_id, "key:61")
+    assert chart["6100"].erp_link_realm == _INTACCT_REALM
+
+    again = await _intacct_sync(realdb, pull)
+    assert (again.created, again.linked, again.link_changes) == (0, 0, [])
+
+
+async def test_a_legacy_number_link_is_never_mistaken_for_an_equal_record_key(realdb):
+    """Account number 61 and record key 61 are different accounts here. The
+    prefixed key keeps them apart: the row linked by the NUMBER 61 is re-keyed
+    to the account numbered 61 (key 7), never matched by id to key 61."""
+    await _add(
+        realdb, code="61", name="Account 61", erp_account_id="61", erp_link_realm=_INTACCT_REALM
+    )
+    result = await _intacct_sync(realdb, [_intacct("61", "6100"), _intacct("7", "61")])
+
+    assert result.code_drift == []
+    chart = await _rows(realdb)
+    assert chart["61"].erp_account_id == "key:7"
+    assert chart["6100"].erp_account_id == "key:61"

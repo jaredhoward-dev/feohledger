@@ -231,7 +231,8 @@ Backs `erp_adapters/sage_intacct.py` (`FEOH_ERP_INTACCT_API_BASE`).
   usable afterwards.
 - `POST /services/core/query` — `accounts-payable/vendor` (`V-ACME`,
   `V-BETA`, and `V-GONE` with `status: inactive`), `general-ledger/account`
-  (`6100`, `6200`, `2000`, and `6900` inactive),
+  (numbers `6100`, `6200`, `2000`, and `6900` inactive, record keys `61`, `62`,
+  `20`, `69`),
   `purchasing/document::Purchase Order` (`PO-INTACCT-401` 1250.00 pending,
   `PO-INTACCT-402` 980.50 closed, as `totalInTxnCurrency` / `txnCurrency`) and
   the created bills; `$eq` filters, `orderBy`, `start` / `size` paging with
@@ -240,7 +241,9 @@ Backs `erp_adapters/sage_intacct.py` (`FEOH_ERP_INTACCT_API_BASE`).
 - `POST /objects/accounts-payable/bill` → 201 key `5001`, `5002`, …. Like
   Intacct, a bill created without `state` is a **`draft`**; `createdDate` and
   `dueDate` are required (400); an unknown or inactive vendor / GL account, or a
-  `createdDate` before 2020-01-01 (a closed period), is a 422; a non-string
+  `createdDate` before 2020-01-01 (a closed period), is a 422 (a line's
+  `glAccount` names its account by record `key` or number `id`, as
+  FeohLedger's links do since decisions §493); a non-string
   `txnAmount` is refused. `GET` / `DELETE /objects/accounts-payable/bill/{key}`
   (only a posted / draft / declined bill deletes).
 - `POST /workflows/accounts-payable/bill/reverse` — `{key, reverseDate}`

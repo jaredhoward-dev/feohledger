@@ -1730,10 +1730,14 @@ async def intacct_create_bill(request: Request) -> dict:
     lines = body.get("lines") or []
     if not lines:
         raise _intacct_error(422, "noLines", "A bill needs at least one line.")
-    accounts = {a["id"]: a for a in INTACCT_GL_FIXTURES}
+    # A reference names an account by its record `key` or its number `id`
+    # (FeohLedger links by key since decisions §493; older links by number).
+    by_key = {a["key"]: a for a in INTACCT_GL_FIXTURES}
+    by_id = {a["id"]: a for a in INTACCT_GL_FIXTURES}
     total = Decimal(0)
     for line in lines:
-        account = accounts.get((line.get("glAccount") or {}).get("id"))
+        ref = line.get("glAccount") or {}
+        account = by_key.get(ref["key"]) if "key" in ref else by_id.get(ref.get("id"))
         if account is None:
             raise _intacct_error(422, "invalidRequest", "Invalid GL account.", "BL01001973")
         if account.get("status") != "active":

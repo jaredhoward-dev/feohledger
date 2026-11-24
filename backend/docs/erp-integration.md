@@ -1795,12 +1795,37 @@ apart from the summary. A collision is never counted as `updated`.
 | `xero` | `Code` (accounts without one skipped) | Xero refuses a second account with the same code. |
 | `sage_accounting` | `nominal_code` | Unique per business ledger. |
 | `sage_accounting_za` | `ID` | The record id. |
-| `sage_intacct` | `id` (ACCOUNTNO) | The account's key. |
+| `sage_intacct` | `id` (ACCOUNTNO) | Unique account number. The link (`erp_account_id`) is the record key, `key:<RECORDNO>` (below). |
 | `syspro` | `GlCode` | The `GenMaster` key. |
 | `blackbaud_fe_nxt` | `account_number` | Unique in the FE NXT chart. |
 
 The sync's collision refusal is the backstop for an adapter that gets this
 wrong: a repeatable key leaves accounts unlinked, it never merges them.
+
+**The link is the ERP's own record id where it has one** (decisions §493). A
+row matched by `erp_account_id` keeps its link through a renumbering in the
+ERP (rule 1: name refreshed, new number reported as `code_drift`, no second
+row), so `erp_account_id` must be a surrogate key, not the business number.
+Most adapters already send one (QuickBooks `Id`, Xero `AccountID`, Business
+Central `id`, NetSuite internal id, Sage `id` / `ID`). Of the three that sent
+the number:
+
+- **`sage_intacct`** links by the GLACCOUNT record key, stored `key:<key>` so
+  it can never be mistaken for a bare number-keyed link from before §493 (key
+  `61` and account `61` are both digit strings). A bill line references it
+  `{"key": …}`; a link still holding a number posts `{"id": …}` until the next
+  chart sync re-links that row by code to the key (one `link_changes` entry
+  per row, in the audit row). An account Intacct returns with no key is
+  reported `missing_erp_id`, never keyed by its number.
+- **`syspro`** keeps `GlCode`: `GenMaster` has no surrogate key — the ledger
+  code IS the primary key, AP distributions (APSTIN) take only it, and SYSPRO
+  renumbers through its GL code change program, which rewrites the code on
+  every record rather than moving a record to a new code. There is no stable
+  id to key by.
+- **`blackbaud_fe_nxt`** still keys by `account_number`. The GL API exposes
+  an `account_id`, but AP distributions take only `account_number`, so an
+  id-keyed link needs a per-post id → number read (and its call budget);
+  tracked in `docs/followups.md`.
 
 **Vendors** (`services/vendor_sync`) already matched by `erp_vendor_id` first.
 The name fallback — adopting a manually created, unlinked vendor of the same

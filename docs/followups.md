@@ -1197,15 +1197,18 @@ scope (§260) — do not fold them into any of these.
       (Merge.dev's half — account `status` and the GL parent id — landed
       2026-10-26 with the Contacts vendor fix; Sage Accounting UK's
       out-of-chart ledgers are emitted inactive since decisions §390.)
-- [ ] **(c) GL accounts of three ERPs link by the account number.** (Two
+- [ ] **(c) Blackbaud FE NXT GL accounts link by the account number.** (Two
       vendors sharing one `erp_vendor_id` is closed by `uq_vendors_erp_link`,
       migration 0141, decisions §486; a CSV vendor code colliding with an
-      ERP-written code is refused, decisions §491.) Sage Intacct, SYSPRO and
-      Blackbaud FE NXT link GL accounts by the business account number, not a
-      surrogate key, so a renumbering in the ERP follows the number. **Durable
-      fix:** each of the three adapters keyed by the ERP's own record id where
-      its API exposes one. **Trigger:** the next change to one of those three
-      adapters' chart listings.
+      ERP-written code is refused, decisions §491; Sage Intacct links by record
+      key and SYSPRO has no surrogate key, decisions §493.) FE NXT links GL
+      accounts by the business account number, so a renumbering in the ERP
+      follows the number; and Intacct's `{"glAccount": {"key": …}}` bill line
+      is checked against the fake ERP only. **Durable fix:** FE NXT keyed by
+      the GL API's `account_id`, resolved to the current `account_number` at
+      post time (AP distributions take only the number); one sandbox Intacct
+      push by key. **Trigger:** the next change to FE NXT's chart listing or
+      distributions, or the first Intacct sandbox session.
 - [ ] **(c) A mock sync still treats pre-0115 links as its own.** A no-realm
       pull (`mock`, or an OAuth ERP with no consent) leaves rows tied to a
       named realm alone (decisions §287), but a pre-0115 link is NULL-realm,
