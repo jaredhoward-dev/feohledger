@@ -1,61 +1,92 @@
-# Closed workspaces — removing the backups a self-service closure leaves
+# Closed workspaces — erasing the backups every removal leaves
 
-**When you need this**: weekly, and whenever someone asks whether a closed
-workspace is fully gone. An administrator can close an unused workspace from
+**When you need this**: when the `Backup erasure` workflow asks for an approval
+or goes red, and whenever someone asks whether a closed workspace is fully gone.
+
+A workspace is removed in one of two ways: its administrator closes it from
 **Organization → Close workspace** (`POST /api/organization/close`,
-`docs/decisions.md` §306). The app deletes the workspace's documents, its
-database and its control-plane rows itself. It cannot delete the nightly
-**backup dumps**: they live in the backup bucket, which the API has no access to.
+`docs/decisions.md` §306), or you remove it with `deploy/remove-tenant.sh
+<slug>`. Either way the workspace's documents, database and control-plane rows
+are deleted then and there. Its nightly **backup dumps** are not: nothing on the
+VM may delete a backup (`docs/decisions.md` §490), so a compromised VM cannot
+wipe the backup history.
 
-`/legal/dpa` § 13 promises those go within **60 days** of the customer's
-instruction, and a self-service closure is that instruction. So every closure
-is a task for you, and the app keeps the list.
+`/legal/dpa` § 13 promises those dumps go within **60 days**. Every removal
+leaves a `workspace_closures` row that says so, and the **`Backup erasure`**
+GitHub Actions workflow (`.github/workflows/backup-erasure.yml`) works through
+them.
 
-## The queue
+## The erasure workflow
+
+- **Every day** its `check` job counts the queue on the VM and prints counts
+  only (the log is public). Nothing is deleted.
+- **When anything is owed**, its `erase` job waits for your approval (it runs
+  in the `production` environment). GitHub emails you about the pending
+  deployment. Approve it in the run's page, or with
+  `gh run list --workflow backup-erasure.yml --repo jaredhoward-dev/feohledger`
+  and the run's **Review deployments** button.
+- **Once approved**, for each owed workspace it deletes every version and every
+  delete marker of `pg/*/feoh_<slug>.dump`, lists the bucket again and requires
+  none to be left, and only then marks the row cleared
+  (`backups_cleared_by = github-actions-run-<run id>`). A workspace that fails
+  anywhere is not marked and the job goes red; the next run tries it again.
+- **The `attention` job goes red** when an owed erasure is 45 days old (inside
+  the DPA's 60) or one is blocked. A red run emails you.
+
+To run it now rather than wait for the schedule:
 
 ```bash
-# on the VM (or anywhere with the control-plane database URL)
+gh workflow run backup-erasure.yml --repo jaredhoward-dev/feohledger
+```
+
+## The queue, by hand
+
+```bash
+# on the VM (aws ssm start-session --target <app_instance_id> --profile feohledger)
 docker compose … exec -T api python scripts/workspace_closures.py list
 ```
 
-prints every completed closure whose backups you have not yet marked removed,
-oldest first. The oldest is closest to the 60-day deadline.
+prints every removed workspace whose backups are not yet cleared, oldest first,
+with its organisation id, and closures that began and never finished.
 
-## For each slug
+**Telling the customer.** `remove-tenant.sh` prints the written confirmation of
+the live-data deletion. Send the backup confirmation once `list` no longer
+shows the organisation (the row reads cleared).
 
-1. **Remove the backups** with the operator deletion script, which already
-   handles a tenant that no longer exists:
+**Until a row is cleared the slug stays taken**, and for 90 days from the
+removal regardless (`utils/slug.CLOSED_SLUG_COOLDOWN`): a new workspace under
+it would get the same `feoh_<slug>` database name — so erasing the old dumps
+would erase the new tenant's — and old bookmarks, IdP redirect URIs and invite
+emails would point at it. The hold is in `provision_tenant`, so
+`scripts/create_tenant.py` and `deploy/add-tenant.sh` refuse a held slug too
+(exit 2).
 
-   ```bash
-   deploy/remove-tenant.sh <slug>
-   ```
+## When the workflow says "blocked"
 
-   It finds no organisation (the closure removed it), says so, and continues
-   with the backup leg, which keys off the slug alone. It removes every version
-   of `pg/*/feoh_<slug>.dump` in the backup bucket. (There is no host block to
-   remove: since `docs/decisions.md` §364 tenant hosts are CloudFront's.)
+The erase job refuses a workspace, for a human to decide, when:
 
-   If it stops with **"nothing found for slug"**, there was nothing to remove:
-   the workspace was closed before its first nightly backup. Go to step 2.
+- **`slug_in_use`** — an organisation holds the slug again. The hold above should
+  make that impossible; erasing would delete the live tenant's backups. Find out
+  how the slug was reused before doing anything.
+- **`database_exists`** — the tenant database still exists although its
+  organisation is gone, so tonight's backup would dump it again. A removal drops
+  the database first, so something recreated it (a restore, say). Find out what,
+  drop it once you are sure nothing live is in it (`deploy/psql.sh`), and the
+  next run erases the dumps.
 
-2. **Mark it done**:
+The public log names neither; `list` on the VM shows which organisation it is.
 
-   ```bash
-   docker compose … exec -T api python scripts/workspace_closures.py mark-cleared <organization-id> --operator <your-handle>
-   ```
+## When the workflow cannot run
 
-   The organisation id `list` printed, not the slug, and `--operator` (required)
-   is recorded on the row with the time — a handle or a ticket reference, not an
-   email address. Exit code 4 means no
-   finished closure of that organisation is still owed (already marked,
-   mistyped, or a workspace that still exists — check `list`).
-
-   **Until you do this the slug stays taken**, and for 90 days from the
-   closure regardless (`utils/slug.CLOSED_SLUG_COOLDOWN`): a new workspace under
-   it would get the same `feoh_<slug>` database name, and old bookmarks, IdP
-   redirect URIs and invite emails would point at it. The hold is in
-   `provision_tenant`, so `scripts/create_tenant.py` and `deploy/add-tenant.sh`
-   refuse a held slug too (exit 2).
+If the erasure workflow is broken and the 60 days are close, the dumps can be
+removed from an operator SSO session (`AWS_PROFILE=feohledger`) with the same
+listing the job uses (`deploy/backup-erasure.sh`, `list_versions`: each list
+filtered separately, the `/`-anchored suffix), re-listed to empty, then marked
+with `scripts/workspace_closures.py mark-cleared <organization-id> --operator
+<your-handle>`. Exit code 4 means no finished closure of that organisation is
+still owed (already marked, mistyped, or a workspace that still exists — check
+`list`). Fix the workflow afterwards; it is the record that the deletion
+happened under review.
 
 ## An ERP grant the closure could not revoke
 
@@ -116,9 +147,10 @@ written confirmation names the step in each case.
 ## What stays, on purpose
 
 - **The `workspace_closures` row** — organisation id, slug, the requesting
-  user's id (which no longer resolves), the step-up proof, what was removed and
-  when. It holds no address or name. It is the record that the customer asked
-  for the deletion and that it happened, and it is what this queue reads.
+  user's id (which no longer resolves; none for a removal you ran, whose proof
+  reads `operator`), the step-up proof, what was removed and when, and who
+  cleared the backups. It holds no address or name. It is the record that the
+  deletion was asked for and that it happened, and it is what this queue reads.
 - **Audit events already shipped to write-once archival.** Where audit shipping
   is on, the closure ships the workspace's whole trail, including its
   `organization.closing` event, before it deletes anything. Those copies cannot
@@ -132,10 +164,10 @@ A closure that failed part-way answers the administrator with "did not finish,
 try again", and a retry by them completes it. If they have given up, `list`
 shows it under "began and did not finish", with the exception class of the
 last failure. The database goes first, so a failed drop leaves the workspace
-whole; a failure after the drop leaves a workspace that is already unusable. Finish it with the ordinary operator deletion
-(`deploy/remove-tenant.sh <slug>`, which is idempotent), then set the row's
-status yourself only after confirming nothing is left
-(`scripts/delete_tenant.py --slug <slug> --dry-run` exits 4).
+whole; a failure after the drop leaves a workspace that is already unusable.
+Finish it with the ordinary operator deletion (`deploy/remove-tenant.sh
+<slug>`, which is idempotent): it completes the same row, keeping the
+administrator as its requester, and the backups join the erasure queue.
 
 ## When a customer asks support to close a workspace the page refused
 
@@ -143,5 +175,5 @@ The page refuses any workspace holding records that must be kept (approved
 invoices, payments, other users, a paid subscription and the rest of the list
 in `docs/user-management.md`). That is the ordinary DPA deletion: confirm the
 request is from the customer, offer the export the DPA promises, then
-`deploy/remove-tenant.sh <slug>`. Loop in the CISO before deleting a workspace
-with financial records.
+`deploy/remove-tenant.sh <slug>`; its backups join the erasure queue like a
+closure's. Loop in the CISO before deleting a workspace with financial records.

@@ -50,7 +50,7 @@ DO ANYTIME (parallel)
 ├── Breach notification       ← per-incident; fill in its contacts before launch
 │     └── breach-notification.md
 │
-└── Closed workspaces         ← recurring, the backup leg of a self-service closure
+└── Closed workspaces         ← recurring: approve the backup-erasure workflow for every removed workspace
       └── workspace-closure.md
 ```
 

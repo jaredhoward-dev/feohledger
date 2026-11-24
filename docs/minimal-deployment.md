@@ -403,7 +403,10 @@ Two layers on the RDS path, one in container mode:
   guards baked in: 90-day expiry (`backup_retention_days`), noncurrent-version
   cleanup, and incomplete-multipart reaping — no manual lifecycle rule to
   remember. Set `BACKUP_S3_BUCKET` from the `backups_bucket` output; the
-  instance profile already has the access.
+  instance profile already has the access — to write and read, never to
+  delete. A removed tenant's dumps are erased by the approval-gated
+  `backup-erasure` workflow under its own role, not from the VM
+  (`infra/README.md` § Backup erasure, `docs/decisions.md` §490).
 - Optional heartbeat: set `BACKUP_PING_URL` (healthchecks.io-style) in the
   sops env and `backup.sh` pings it after every successful run — silence
   means backups stopped, noticed before a restore needs them.

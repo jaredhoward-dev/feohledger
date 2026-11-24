@@ -5,10 +5,9 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Eight entries are open**: the run builder reading
+**Seven entries are open**: the run builder reading
 a missing invoice currency as USD (found 2026-10-21), the app rendering nothing when browser
-storage is blocked (found 2026-10-20), the remove-tenant backup deletion the
-VM's IAM role refuses (found 2026-10-18),
+storage is blocked (found 2026-10-20),
 the expense-report Attach dead end found while
 writing the help centre, the `all`-mode approval-chain segregation deadlock,
 the legal-contents smooth-scroll race and the e2e cleanup race directly below,
@@ -18,7 +17,9 @@ floor approving an invoice whose PO was never matched, found and struck on
 calling an endpoint Merge does not publish, found and struck on 2026-10-26, sits
 struck at the top. The payment mock tests that failed locally in one pytest
 process, found and struck on 2026-10-31, sit struck above the run-builder
-entry. The paid-plan features no
+entry. The remove-tenant backup deletion the VM's IAM role refused, found
+2026-10-18, was struck on 2026-11-24 (#757, decisions §490) and sits struck in
+place. The paid-plan features no
 route enforced and the direct ERP adapters posting bills without the ERP's
 vendor and account ids were struck on 2026-10-07 and 2026-10-08, but this line
 went on counting them as open — it said "seven" over five. The assistant
@@ -264,7 +265,15 @@ that installs the throwing getter and asserts the notice renders.
 
 ---
 
-## `remove-tenant.sh` cannot delete a tenant's backup versions under the VM's IAM role
+## ~~`remove-tenant.sh` cannot delete a tenant's backup versions under the VM's IAM role~~ — FIXED 2026-11-24
+
+**Resolution (#757, `docs/decisions.md` §490).** Neither recommendation below
+was taken as written. The VM role stays unable to delete backups, and the
+backup leg left `remove-tenant.sh` entirely — but not for a hand-run laptop
+step: every removal is now recorded in `workspace_closures`, and the
+approval-gated `.github/workflows/backup-erasure.yml` erases the dumps under a
+role only its approved job can assume (`infra/backup_erasure.tf`), verifies
+none is left, and marks the row. The original diagnosis stands below.
 
 **Found 2026-10-18** (#566), reading `deploy/remove-tenant.sh` against
 `infra/compute.tf`. Not yet hit: no tenant has been terminated in production.
