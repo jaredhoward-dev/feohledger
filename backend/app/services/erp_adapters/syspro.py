@@ -1071,7 +1071,7 @@ class SysproAdapter(ErpAdapter):
 
     async def list_gl_accounts(self) -> list[GLAccountPayload]:
         """The chart, keyed by ``GlCode``: ``GenMaster`` has no surrogate key
-        (the code is its primary key; decisions §493). A ledger code on hold
+        (the code is its primary key; decisions §492). A ledger code on hold
         (``AccOnHldFlag``) or a control account (``ControlAccFlag``) is
         emitted ``active=False``: AP Invoice Posting refuses both on a
         manually entered distribution, so neither may be offered for coding."""

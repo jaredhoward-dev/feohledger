@@ -243,7 +243,7 @@ Backs `erp_adapters/sage_intacct.py` (`FEOH_ERP_INTACCT_API_BASE`).
   `dueDate` are required (400); an unknown or inactive vendor / GL account, or a
   `createdDate` before 2020-01-01 (a closed period), is a 422 (a line's
   `glAccount` names its account by record `key` or number `id`, as
-  FeohLedger's links do since decisions §493); a non-string
+  FeohLedger's links do since decisions §492); a non-string
   `txnAmount` is refused. `GET` / `DELETE /objects/accounts-payable/bill/{key}`
   (only a posted / draft / declined bill deletes).
 - `POST /workflows/accounts-payable/bill/reverse` — `{key, reverseDate}`

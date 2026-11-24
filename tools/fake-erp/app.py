@@ -1731,7 +1731,7 @@ async def intacct_create_bill(request: Request) -> dict:
     if not lines:
         raise _intacct_error(422, "noLines", "A bill needs at least one line.")
     # A reference names an account by its record `key` or its number `id`
-    # (FeohLedger links by key since decisions §493; older links by number).
+    # (FeohLedger links by key since decisions §492; older links by number).
     by_key = {a["key"]: a for a in INTACCT_GL_FIXTURES}
     by_id = {a["id"]: a for a in INTACCT_GL_FIXTURES}
     total = Decimal(0)

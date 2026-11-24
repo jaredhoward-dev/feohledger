@@ -1802,7 +1802,7 @@ apart from the summary. A collision is never counted as `updated`.
 The sync's collision refusal is the backstop for an adapter that gets this
 wrong: a repeatable key leaves accounts unlinked, it never merges them.
 
-**The link is the ERP's own record id where it has one** (decisions §493). A
+**The link is the ERP's own record id where it has one** (decisions §492). A
 row matched by `erp_account_id` keeps its link through a renumbering in the
 ERP (rule 1: name refreshed, new number reported as `code_drift`, no second
 row), so `erp_account_id` must be a surrogate key, not the business number.
@@ -1811,7 +1811,7 @@ Central `id`, NetSuite internal id, Sage `id` / `ID`). Of the three that sent
 the number:
 
 - **`sage_intacct`** links by the GLACCOUNT record key, stored `key:<key>` so
-  it can never be mistaken for a bare number-keyed link from before §493 (key
+  it can never be mistaken for a bare number-keyed link from before §492 (key
   `61` and account `61` are both digit strings). A bill line references it
   `{"key": …}`; a link still holding a number posts `{"id": …}` until the next
   chart sync re-links that row by code to the key (one `link_changes` entry

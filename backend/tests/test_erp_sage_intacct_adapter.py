@@ -238,7 +238,7 @@ def test_bill_body_posts_against_erp_ids_with_exact_decimal_strings():
 
 
 def test_a_record_key_link_posts_by_key_and_a_legacy_number_link_by_id():
-    """A §493 link (``key:61``) references the account by its record key, so a
+    """A §492 link (``key:61``) references the account by its record key, so a
     bill still reaches it after a renumbering; a number-keyed link the chart
     sync has not re-keyed yet posts by number, as before."""
     lines = [
@@ -979,12 +979,12 @@ def test_list_gl_accounts_emits_inactive_accounts_inactive():
 
 
 def test_list_gl_accounts_keys_by_record_key_so_a_renumbering_keeps_the_link():
-    """Decisions §493: the account NUMBER (``id``) is what an accountant
+    """Decisions §492: the account NUMBER (``id``) is what an accountant
     renumbers; the record ``key`` is not. Two pulls of one account before and
     after a renumbering carry the same link id, so the chart sync matches our
     row by id (rule 1) and reports the new number as ``code_drift`` instead of
     creating a second row. The key is prefixed so it can never be mistaken
-    for a bare number-keyed link from before §493 (key 61 vs account 61)."""
+    for a bare number-keyed link from before §492 (key 61 vs account 61)."""
     before, after = FakeIntacct(), FakeIntacct()
     before.query_rows["general-ledger/account"] = [[{"key": "61", "id": "6100", "name": "A"}]]
     after.query_rows["general-ledger/account"] = [[{"key": "61", "id": "6150", "name": "A"}]]

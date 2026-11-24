@@ -599,7 +599,7 @@ async def test_endpoint_reports_conflicts_by_code_never_as_updated(realdb, qbo_c
 
 
 # ---------------------------------------------------------------------------
-# Sage Intacct links by record key, not account number (decisions §493)
+# Sage Intacct links by record key, not account number (decisions §492)
 # ---------------------------------------------------------------------------
 
 _INTACCT_REALM = "intacct:ACMECO"
@@ -644,7 +644,7 @@ async def test_an_intacct_renumbering_updates_the_keyed_row_and_creates_no_dupli
 
 
 async def test_a_number_keyed_intacct_link_is_rekeyed_once_and_recorded(realdb):
-    """A link from before §493 holds the bare number. The first keyed pull
+    """A link from before §492 holds the bare number. The first keyed pull
     re-links the row by code to the account's record key — the same row, no
     duplicate — and records the move in ``link_changes`` for the audit row; a
     second pull changes nothing."""

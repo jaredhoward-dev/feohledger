@@ -25057,7 +25057,7 @@ in `backend/tests/test_csv_import.py` (refusal per collision shape, resolution
 of a single claimant, vendor-import refusal and ERP-id dedup, and a Postgres
 test that the importers move no code or link).
 
-## 493. GL links hold the ERP's record id, not the account number, where the ERP has one (round 36)
+## 492. GL links hold the ERP's record id, not the account number, where the ERP has one (round 36)
 
 **Context.** `docs/followups.md` (c) "Vendor linking has two gaps of its own",
 part (2): Sage Intacct, SYSPRO and Blackbaud FE NXT stored the business
