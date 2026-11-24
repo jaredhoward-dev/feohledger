@@ -18,8 +18,10 @@ name: Backup erasure
 #          well inside the DPA's 60 days.
 #   erase  (its OWN `backup-erasure` environment: a required reviewer approves
 #          it, and only `main` may deploy to it) assumes
-#          `feohledger-backup-erasure`, trusted for that environment only —
-#          not `production`, which other workflows share. It
+#          `feohledger-backup-erasure`, trusted for that environment and
+#          refs/heads/main only — not `production`, which other workflows
+#          share. Its first step reads the environment back and refuses unless
+#          it still has a required reviewer and the main-only rule. It
 #          reads the queue, deletes every version and delete marker of each
 #          workspace's pg/*/feoh_<slug>.dump, re-lists to prove none is left,
 #          and marks the row cleared. Before deleting anything it checks the
@@ -122,11 +124,21 @@ jobs:
     permissions:
       id-token: write # OIDC: assume the erase role, no long-lived keys
       contents: read
+      actions: read # GET the backup-erasure environment's settings (the guard below)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: deploy
+
+      # Before any AWS credential: the role is only as safe as this
+      # environment's settings (a required reviewer, deployments from main
+      # only), which nothing else enforces, so read them back and refuse
+      # unless they hold — and refuse any ref but main.
+      - name: Refuse unless the environment is locked down
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: deploy/backup-erasure.sh environment-guard
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0

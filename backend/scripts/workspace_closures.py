@@ -92,10 +92,14 @@ async def _owed(*, detail: bool) -> int:
     owed = await owed_backup_erasures()
     if detail:
         # Identifiers: read only by the approved erase job, which masks every
-        # one before it uses any. Oldest first, at most ERASURE_BATCH of them
-        # (SSM's output cap); `total` says how many are owed in all.
+        # one before it uses any. At most ERASURE_BATCH of them (SSM's output
+        # cap): the erasable ones first, oldest first, so blocked entries can
+        # never starve the queue; blocked ones fill any room left. `total` and
+        # `blocked_total` count the whole queue, listed or not.
+        batch = [e for e in owed if e.blocked is None] + [e for e in owed if e.blocked]
         payload: dict = {
             "total": len(owed),
+            "blocked_total": sum(1 for e in owed if e.blocked is not None),
             "owed": [
                 {
                     "organization_id": str(e.organization_id),
@@ -105,7 +109,7 @@ async def _owed(*, detail: bool) -> int:
                     "age_days": e.age_days,
                     "blocked": e.blocked,
                 }
-                for e in owed[:ERASURE_BATCH]
+                for e in batch[:ERASURE_BATCH]
             ],
         }
     else:

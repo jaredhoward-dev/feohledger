@@ -255,14 +255,39 @@ def test_remove_tenant_never_deletes_a_backup(tmp_path: Path) -> None:
 
 
 def test_remove_tenant_without_a_backup_store_owes_nothing(tmp_path: Path) -> None:
+    """Only when the operator says so: --no-backup-store releases the slug."""
+    d = _deploy(tmp_path, "remove-tenant.sh")
+    d.env_file("POSTGRES_PASSWORD=x\nAPP_DOMAIN=app.example.com\n")
+
+    result = d.run("acme", "--yes", "--no-backup-store")
+
+    assert result.returncode == 0, result.stderr
+    assert d.called("delete_tenant.py --slug acme --yes --no-backup-store")
+    assert "no backup store configured" in result.stdout
+
+
+def test_remove_tenant_never_infers_no_backup_store(tmp_path: Path) -> None:
+    """An empty BACKUP_S3_BUCKET is a misread env until the operator says
+    otherwise; inferring it would record the backups cleared and release the
+    slug while dumps still exist."""
     d = _deploy(tmp_path, "remove-tenant.sh")
     d.env_file("POSTGRES_PASSWORD=x\nAPP_DOMAIN=app.example.com\n")
 
     result = d.run("acme", "--yes")
 
-    assert result.returncode == 0, result.stderr
-    assert d.called("delete_tenant.py --slug acme --yes --no-backup-store")
-    assert "no backup store configured" in result.stdout
+    assert result.returncode != 0
+    assert "--no-backup-store" in result.stderr
+    assert not d.called("delete_tenant.py")
+
+
+def test_remove_tenant_refuses_no_backup_store_beside_a_bucket(tmp_path: Path) -> None:
+    d = _deploy(tmp_path, "remove-tenant.sh")
+    d.env_file(LOCAL_ENV)
+
+    result = d.run("acme", "--yes", "--no-backup-store")
+
+    assert result.returncode != 0
+    assert not d.called("delete_tenant.py")
 
 
 def test_remove_tenant_stops_when_the_data_deletion_fails(tmp_path: Path) -> None:
@@ -1004,26 +1029,151 @@ def test_erasure_fails_red_on_a_tenant_dumped_after_its_removal(tmp_path: Path) 
     assert not _not_masked(result, ORG, "acme", "feoh_acme")
 
 
-def test_erasure_defers_a_tenant_still_in_the_newest_nights(tmp_path: Path) -> None:
-    """(b) A dump on or before the closure, but in one of the newest three
-    nights: a restore window. Deferred — not a failure, not marked."""
-    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=8))
-    d.rule(
-        "aws",
-        _dates("feoh_acme"),
-        0,
-        f"pg/{_night(9)}/feoh_acme.dump\\tpg/{_night(2)}/feoh_acme.dump\\n",
+def test_erasure_ignores_the_vms_age_and_counts_from_the_closure_date(tmp_path: Path) -> None:
+    """(c) The cool-off is computed here from `closed_on`; an `age_days` the VM
+    inflates buys nothing."""
+    d = _erasure(
+        tmp_path, _queue((ORG, "acme", None), age=3).replace('"age_days": 3', '"age_days": 99')
     )
-    # Freshness: nights 10, 2, 1, 0 — and a closure dated 8 days ago, so the
-    # night 2 days ago would be "after" it. Make the entry's closure match it.
-    d.queue = _queue((ORG, "acme", None), age=8).replace(_night(8), _night(2))  # type: ignore[attr-defined]
 
     result = _run_erasure(d, "erase")
 
     assert result.returncode == 0, result.stderr
-    assert "deferred" in result.stdout and "Deferred: 1" in result.stdout
+    assert "removed 3 day(s) ago; deferred" in result.stdout
     assert not d.called("delete-object")
     assert not d.called("mark-cleared")
+
+
+def test_erasure_catches_dumps_withheld_for_fewer_than_seven_nights(tmp_path: Path) -> None:
+    """A compromised VM backdates a live tenant's closure and stops dumping it:
+    the bucket's newest dump of it is still after the claimed closure, and
+    inside the cool-off. Red, untouched."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=99))
+    d.rule("aws", _dates("feoh_acme"), 0, f"pg/{_night(4)}/feoh_acme.dump\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "AFTER its recorded removal" in result.stderr
+    assert not d.called("delete-object")
+    assert not d.called("mark-cleared")
+
+
+def test_erasure_refuses_a_closure_date_in_the_future(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=-3))
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert not d.called("delete-object")
+
+
+def test_erasure_never_echoes_an_unknown_blocked_code(tmp_path: Path) -> None:
+    """A VM not running our code could put a workflow command in `blocked`."""
+    import json
+
+    entry = json.loads(_queue((ORG, "acme", None)).split("FEOH_ERASURE ")[1].split("\\n")[0])
+    entry["owed"][0]["blocked"] = "x\n::warning::injected"
+    # json.dumps writes the newline as `\\n`; double the backslash so the
+    # stub's printf %b hands the script that JSON escape, not a raw newline.
+    queue = json.dumps(entry).replace("\\n", "\\\\n")
+    d = _erasure(tmp_path, "FEOH_ERASURE " + queue + "\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "injected" not in result.stdout + result.stderr
+    assert "unknown blocked code" in result.stderr
+    assert not d.called("delete-object")
+
+
+def test_erasure_fails_for_blocked_entries_beyond_the_batch(tmp_path: Path) -> None:
+    """Blocked entries are listed after the erasable ones and may fall outside
+    the batch; their count still turns the run red for a human."""
+    import json
+
+    body = json.loads(_queue((ORG, "acme", None), age=10).split("FEOH_ERASURE ")[1].split("\\n")[0])
+    body["blocked_total"] = 2
+    body["total"] = 3
+    d = _erasure(tmp_path, "FEOH_ERASURE " + json.dumps(body) + "\\n")
+    d.rule("aws", _listing("feoh_acme"), 0, "", once=True)
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "Blocked: 2" in result.stdout
+    assert d.called(f"OrganizationId={ORG},RunId=987"), "the erasable one still goes"
+
+
+# ── environment-guard: the erase job's settings, read back before any AWS call ──
+
+
+ENV_OK = (
+    '{"protection_rules": [{"type": "required_reviewers", "reviewers": [{"type": "User"}]}], '
+    '"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}'
+)
+
+
+def _guard(
+    tmp_path: Path, env_json: str, policies: str = "branch:main", ref: str = "refs/heads/main"
+):
+    d = _deploy(tmp_path, "backup-erasure.sh", "gh")
+    d.rule("gh", "deployment-branch-policies", 0, policies + "\\n")
+    d.rule("gh", "environments/backup-erasure", 0, env_json + "\\n")
+    return d, d.run(
+        "environment-guard",
+        extra_env={"INSTANCE_ID": "i-0123", "GITHUB_REPOSITORY": "o/r", "GITHUB_REF": ref},
+    )
+
+
+def test_environment_guard_passes_a_locked_down_environment(tmp_path: Path) -> None:
+    d, result = _guard(tmp_path, ENV_OK)
+    assert result.returncode == 0, result.stderr
+    assert d.called("api repos/o/r/environments/backup-erasure")
+
+
+def test_environment_guard_accepts_protected_branches_only(tmp_path: Path) -> None:
+    env = ENV_OK.replace(
+        '"protected_branches": false, "custom_branch_policies": true',
+        '"protected_branches": true, "custom_branch_policies": false',
+    )
+    _, result = _guard(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("env", "policies", "ref", "why"),
+    [
+        (ENV_OK, "branch:main", "refs/heads/feature", "not main"),
+        (
+            ENV_OK.replace('"reviewers": [{"type": "User"}]', '"reviewers": []'),
+            "branch:main",
+            "refs/heads/main",
+            "no reviewer",
+        ),
+        (
+            '{"protection_rules": [], "deployment_branch_policy": '
+            '{"protected_branches": false, "custom_branch_policies": true}}',
+            "branch:main",
+            "refs/heads/main",
+            "no rule",
+        ),
+        (
+            '{"protection_rules": [{"type": "required_reviewers", '
+            '"reviewers": [{"type": "User"}]}], "deployment_branch_policy": null}',
+            "branch:main",
+            "refs/heads/main",
+            "any branch",
+        ),
+        (ENV_OK, "branch:main,branch:release/*", "refs/heads/main", "a second branch"),
+        (ENV_OK, "tag:main", "refs/heads/main", "a tag pattern"),
+    ],
+)
+def test_environment_guard_refuses(
+    tmp_path: Path, env: str, policies: str, ref: str, why: str
+) -> None:
+    _, result = _guard(tmp_path, env, policies, ref)
+    assert result.returncode != 0, why
 
 
 def test_erasure_defers_a_removal_inside_the_cool_off(tmp_path: Path) -> None:

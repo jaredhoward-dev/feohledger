@@ -32,7 +32,12 @@
 # block in tenants.caddy is removed by hand (custom-domain-provisioning.md
 # § Rollback), and this script says so at the end.
 #
-# Usage: remove-tenant.sh <slug> [--dry-run] [--yes]
+# --no-backup-store is for a deployment that keeps no backups at all: the
+# removal is recorded with nothing owed, which releases the slug after its
+# cooldown. It is never inferred — an empty BACKUP_S3_BUCKET without it is an
+# error, since a misread env would otherwise quietly drop an owed erasure.
+#
+# Usage: remove-tenant.sh <slug> [--dry-run] [--yes] [--no-backup-store]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -44,17 +49,18 @@ die() {
 	exit 1
 }
 usage() {
-	die "usage: remove-tenant.sh <slug> [--dry-run] [--yes]"
+	die "usage: remove-tenant.sh <slug> [--dry-run] [--yes] [--no-backup-store]"
 }
 
 SLUG="${1:-}"
 [ -n "$SLUG" ] || usage
 shift
-DRY_RUN=0 ASSUME_YES=0
+DRY_RUN=0 ASSUME_YES=0 NO_BACKUP_STORE=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--dry-run) DRY_RUN=1 && shift ;;
 	--yes) ASSUME_YES=1 && shift ;;
+	--no-backup-store) NO_BACKUP_STORE=1 && shift ;;
 	*) usage ;;
 	esac
 done
@@ -72,9 +78,15 @@ DB_NAME="feoh_${SLUG}"
 BUCKET="${BACKUP_S3_BUCKET:-}"
 [ -n "$BUCKET" ] || BUCKET=$(feoh_env BACKUP_S3_BUCKET)
 # With no backup store there is nothing for the erasure workflow to do, and
-# the removal is recorded with its backups already cleared.
+# the removal is recorded with its backups already cleared — but only when the
+# operator says so. The two must agree.
 BACKUP_FLAGS=()
-[ -n "$BUCKET" ] || BACKUP_FLAGS=(--no-backup-store)
+if [ "$NO_BACKUP_STORE" -eq 1 ]; then
+	[ -z "$BUCKET" ] || die "--no-backup-store, but BACKUP_S3_BUCKET is set: this deployment keeps backups. Drop the flag."
+	BACKUP_FLAGS=(--no-backup-store)
+elif [ -z "$BUCKET" ]; then
+	die "BACKUP_S3_BUCKET is not set. If this deployment really keeps no backups, re-run with --no-backup-store; otherwise fix deploy/.env."
+fi
 
 # --- 0. Show what is about to go, from the application's own inventory -------
 

@@ -174,6 +174,16 @@ data "aws_iam_policy_document" "backup_erasure_trust" {
       variable = "token.actions.githubusercontent.com:sub"
       values   = [local.backup_erasure_erase_sub]
     }
+    # And only from main. An environment job's `sub` names the environment,
+    # not the branch, so this is the AWS-side half of the environment's
+    # main-only branch rule (an owner setting the job also reads back before
+    # it asks for a token). `ref` is a documented GitHub condition key for
+    # AssumeRoleWithWebIdentity (IAM User Guide, condition keys for OIDC).
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:ref"
+      values   = ["refs/heads/main"]
+    }
   }
 }
 

@@ -28,10 +28,14 @@
 #   (b) backup.sh dumps EVERY feoh_* database every night. A dump of an owed
 #       database dated AFTER its closure means it was still there to dump: a
 #       forged entry or a removal that failed. Refused, and the run fails.
-#       A dump in any of the newest RECENT_NIGHTS prefixes (dated on or before
-#       the closure) is deferred: a restore window for a mistaken removal.
-#   (c) a closure younger than COOL_OFF_DAYS is deferred (a cool-off; the
-#       same number as workspace_closure.ERASURE_COOL_OFF).
+#   (c) a cool-off of COOL_OFF_DAYS (the same number as
+#       workspace_closure.ERASURE_COOL_OFF), measured twice: from the closure
+#       date — computed here, the VM's own `age_days` is ignored — and from
+#       the NEWEST stored dump of the database in the bucket. The second is
+#       bucket truth: to get a live tenant erased, a compromised VM must have
+#       withheld its dumps for COOL_OFF_DAYS nights, which (a) and the nightly
+#       heartbeat make visible. Either too recent: deferred, a restore window
+#       for a mistaken removal.
 # Deferred is not a failure: the entry stays owed and a later run erases it,
 # well inside the 45-day alarm.
 #
@@ -57,7 +61,6 @@ MARK_DOCUMENT=${MARK_DOCUMENT:-feohledger-backup-erasure-mark-cleared}
 SSM_POLL_SECONDS=${SSM_POLL_SECONDS:-5}
 SSM_WAIT_SECONDS=${SSM_WAIT_SECONDS:-600}
 MAX_BACKUP_AGE_DAYS=2
-RECENT_NIGHTS=3
 COOL_OFF_DAYS=7
 GITHUB_OUTPUT=${GITHUB_OUTPUT:-/dev/null}
 GITHUB_STEP_SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
@@ -68,6 +71,10 @@ UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 # and the erase role is denied it in IAM as well.
 DATABASE_RE='^feoh_[a-z0-9]+(-[a-z0-9]+)*$'
 DATE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+# The only `blocked` codes the queue emits (workspace_closure.ERASURE_BLOCKED_*).
+# Anything else came from a VM that is not running our code, and is never
+# echoed: a newline in it would be a workflow command in this log.
+BLOCKED_RE='^(slug_in_use|database_exists)$'
 
 [ -n "${INSTANCE_ID:-}" ] || die "INSTANCE_ID is not set (the VM_INSTANCE_ID secret)."
 
@@ -251,7 +258,7 @@ erase() {
 
 	# (a) Backups are running: the newest night is recent. Without that, the
 	# "still being dumped" check in (b) proves nothing, so nothing is erased.
-	local dates newest today recent
+	local dates newest today
 	dates=$(nightly_dates) || die "could not list the nightly backup dates (AWS error above); nothing erased."
 	newest=$(printf '%s\n' "$dates" | grep . | tail -1 || true)
 	[ -n "$newest" ] || die "no nightly backup prefix under pg/; nothing erased."
@@ -259,17 +266,20 @@ erase() {
 	if [ "$(days_between "$newest" "$today")" -gt "$MAX_BACKUP_AGE_DAYS" ]; then
 		die "the newest nightly backup is older than ${MAX_BACKUP_AGE_DAYS} days, so a live tenant could not be told from a removed one; nothing erased. Fix backup.sh first."
 	fi
-	recent=$(printf '%s\n' "$dates" | grep . | tail -"$RECENT_NIGHTS")
 	echo "Newest nightly backup: $(days_between "$newest" "$today") day(s) old."
 
-	local i org database blocked closed age dumps after erased=0 failed=0 skipped=0 deferred=0
+	local i org database blocked closed age dumps after last erased=0 failed=0 skipped=0 deferred=0
 	for ((i = 0; i < total; i++)); do
 		org=$(jq -r ".owed[$i].organization_id" <<<"$json")
 		database=$(jq -r ".owed[$i].database" <<<"$json")
 		blocked=$(jq -r ".owed[$i].blocked // empty" <<<"$json")
 		closed=$(jq -r ".owed[$i].closed_on // empty" <<<"$json")
-		age=$(jq -r ".owed[$i].age_days // empty" <<<"$json")
 		echo "Workspace $((i + 1)) of ${total}:"
+		if [ -n "$blocked" ] && ! [[ "$blocked" =~ $BLOCKED_RE ]]; then
+			echo "::error::  an unknown blocked code (not echoed); not erased." >&2
+			failed=$((failed + 1))
+			continue
+		fi
 		if [ -n "$blocked" ]; then
 			# A live organisation holds the slug, or the database still exists:
 			# erasing now would hit live backups or be undone tonight. A human
@@ -279,7 +289,8 @@ erase() {
 			continue
 		fi
 		if ! [[ "$org" =~ $UUID_RE ]] || ! [[ "$database" =~ $DATABASE_RE ]] ||
-			! [[ "$closed" =~ $DATE_RE ]] || ! is_count "$age"; then
+			! [[ "$closed" =~ $DATE_RE ]] || ! age=$(days_between "$closed" "$today" 2>/dev/null) ||
+			[ "$age" -lt 0 ]; then
 			echo "  not a well-formed queue entry; not erased." >&2
 			failed=$((failed + 1))
 			continue
@@ -297,15 +308,16 @@ erase() {
 			failed=$((failed + 1))
 			continue
 		fi
-		# (c) Cool-off.
+		# (c) Cool-off, from the closure date the VM recorded...
 		if [ "$age" -lt "$COOL_OFF_DAYS" ]; then
 			echo "  removed ${age} day(s) ago; deferred until ${COOL_OFF_DAYS}."
 			deferred=$((deferred + 1))
 			continue
 		fi
-		# (b) Restore window: still in one of the newest nights.
-		if printf '%s\n' "$dumps" | grep -qxF -f <(printf '%s\n' "$recent" | grep .); then
-			echo "  still in one of the newest ${RECENT_NIGHTS} nightly backups; deferred."
+		# ...and from the bucket: its newest stored dump must be as old.
+		last=$(printf '%s\n' "$dumps" | grep . | tail -1 || true)
+		if [ -n "$last" ] && [ "$(days_between "$last" "$today")" -lt "$COOL_OFF_DAYS" ]; then
+			echo "  backed up within the last ${COOL_OFF_DAYS} nights; deferred."
 			deferred=$((deferred + 1))
 			continue
 		fi
@@ -316,6 +328,12 @@ erase() {
 			failed=$((failed + 1))
 		fi
 	done
+
+	# Blocked entries beyond the batch still need a human.
+	local blocked_total
+	blocked_total=$(jq '.blocked_total // 0' <<<"$json")
+	is_count "$blocked_total" || die "the queue is not the expected shape."
+	[ "$blocked_total" -le "$skipped" ] || skipped=$blocked_total
 
 	local line="Erased ${erased} of ${total} owed workspace(s): ${REMOVED_VERSIONS} object version(s) removed. Deferred: ${deferred}. Failed: ${failed}. Blocked: ${skipped}."
 	echo "$line"
@@ -329,8 +347,39 @@ erase() {
 	fi
 }
 
+# environment-guard: the erase job's first step, before any AWS credential.
+# Its role is only as safe as the `backup-erasure` environment's settings —
+# a required reviewer, and deployment from `main` only — and nothing else
+# enforces those, so the job reads them back and refuses unless they hold.
+# Needs GH_TOKEN with `actions: read` (GET …/environments/{name} and its
+# deployment-branch-policies are listed under the Actions permission).
+environment_guard() {
+	local repo=${GITHUB_REPOSITORY:-} envname=backup-erasure env_json reviewers protected custom policies
+	[ "${GITHUB_REF:-}" = refs/heads/main ] || die "the erase job runs from main only."
+	[ -n "$repo" ] || die "GITHUB_REPOSITORY is not set."
+	env_json=$(gh api "repos/${repo}/environments/${envname}") ||
+		die "could not read the ${envname} environment's settings."
+	reviewers=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers // [] | length)] | add // 0' <<<"$env_json")
+	if ! is_count "$reviewers" || [ "$reviewers" -lt 1 ]; then
+		die "the ${envname} environment has no required reviewer (infra/README.md § Backup erasure)."
+	fi
+	protected=$(jq -r '.deployment_branch_policy.protected_branches // empty' <<<"$env_json")
+	custom=$(jq -r '.deployment_branch_policy.custom_branch_policies // empty' <<<"$env_json")
+	if [ "$custom" = true ]; then
+		policies=$(gh api "repos/${repo}/environments/${envname}/deployment-branch-policies" \
+			--jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")') ||
+			die "could not read the ${envname} environment's branch policies."
+		[ "$policies" = "branch:main" ] ||
+			die "the ${envname} environment must allow deployments from the main branch only."
+	elif [ "$protected" != true ]; then
+		die "the ${envname} environment allows deployments from any branch; restrict it to main (infra/README.md § Backup erasure)."
+	fi
+	echo "The ${envname} environment requires ${reviewers} reviewer(s) and deploys from main only."
+}
+
 case "${1:-}" in
 check) check ;;
 erase) erase ;;
-*) die "usage: backup-erasure.sh check | erase" ;;
+environment-guard) environment_guard ;;
+*) die "usage: backup-erasure.sh check | erase | environment-guard" ;;
 esac

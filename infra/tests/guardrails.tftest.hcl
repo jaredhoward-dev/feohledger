@@ -865,8 +865,9 @@ run "backup_erasure_roles_trust_exactly_one_subject_each" {
       ]) == toset([
       "token.actions.githubusercontent.com:aud=sts.amazonaws.com",
       "token.actions.githubusercontent.com:sub=repo:example-owner@1/feohledger@2:environment:backup-erasure",
+      "token.actions.githubusercontent.com:ref=refs/heads/main",
     ])
-    error_message = "The erase role must trust exactly the STS audience and the dedicated backup-erasure environment's subject — the job a required reviewer approves."
+    error_message = "The erase role must trust exactly the STS audience, the dedicated backup-erasure environment's subject — the job a required reviewer approves — and the main branch."
   }
 
   assert {

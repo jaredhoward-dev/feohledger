@@ -897,6 +897,7 @@ def test_the_detail_lists_what_the_erase_job_deletes(monkeypatch, capsys):
     assert cli.main(["owed", "--json"]) == 0
     line = _erasure_line(capsys.readouterr().out)
     assert line["total"] == 2
+    assert line["blocked_total"] == 1
     assert line["owed"] == [
         {
             "organization_id": str(owed[0].organization_id),
@@ -933,6 +934,25 @@ def test_the_detail_is_capped_to_one_batch_oldest_first(monkeypatch, capsys):
         e.slug for e in owed[: workspace_closure.ERASURE_BATCH]
     ]
     assert len(out) < 24_000
+
+
+def test_the_batch_takes_erasable_entries_before_blocked_ones(monkeypatch, capsys):
+    """Blocked entries are oldest first too; at the front of the batch they
+    could hold the queue still forever."""
+    cli = _load_cli()
+    blocked = [
+        _owed(f"held-{i:03d}", age=100, blocked=workspace_closure.ERASURE_BLOCKED_SLUG_IN_USE)
+        for i in range(workspace_closure.ERASURE_BATCH)
+    ]
+    ready = [_owed("gone-trial", age=10)]
+    monkeypatch.setattr(cli, "owed_backup_erasures", AsyncMock(return_value=blocked + ready))
+
+    assert cli.main(["owed", "--json"]) == 0
+    line = _erasure_line(capsys.readouterr().out)
+    assert line["owed"][0]["slug"] == "gone-trial"
+    assert len(line["owed"]) == workspace_closure.ERASURE_BATCH
+    assert line["blocked_total"] == workspace_closure.ERASURE_BATCH
+    assert line["total"] == workspace_closure.ERASURE_BATCH + 1
 
 
 def test_owed_needs_a_form():

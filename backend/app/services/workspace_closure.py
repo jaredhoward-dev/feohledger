@@ -1160,9 +1160,9 @@ ERASURE_OVERDUE_AFTER = timedelta(days=45)
 #: asked for until one can act.
 ERASURE_COOL_OFF = timedelta(days=7)
 
-#: At most this many entries per `owed --json`, oldest first: SSM keeps only
-#: the first ~24,000 characters of a command's output, and a truncated list
-#: would not parse. The queue drains across daily runs.
+#: At most this many entries per `owed --json`, erasable ones first, oldest
+#: first: SSM keeps only the first ~24,000 characters of a command's output,
+#: and a truncated list would not parse. The queue drains across daily runs.
 ERASURE_BATCH = 50
 
 #: An organisation with the closed workspace's slug exists again. The slug hold

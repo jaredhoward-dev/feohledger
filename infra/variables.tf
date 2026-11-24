@@ -286,7 +286,7 @@ variable "frontend_on_cloudfront" {
 }
 
 variable "github_oidc_sub_prefix" {
-  description = "The OIDC subject prefix this repository presents to AWS, e.g. repo:<owner>@<id>/<repo>@<id> on GitHub's immutable subject claims. The backup-erasure roles (backup_erasure.tf) trust exactly <prefix>:ref:refs/heads/main and <prefix>:environment:production. Read it, never build it from the slug: gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix (README.md § The deploy role is not owned here). Set it in the private prod.tfvars.sops."
+  description = "The OIDC subject prefix this repository presents to AWS, e.g. repo:<owner>@<id>/<repo>@<id> on GitHub's immutable subject claims. The backup-erasure roles (backup_erasure.tf) trust exactly <prefix>:ref:refs/heads/main (the check job) and <prefix>:environment:backup-erasure (the erase job). Read it, never build it from the slug: gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix (README.md § The deploy role is not owned here). Set it in the private prod.tfvars.sops."
   type        = string
 
   validation {
