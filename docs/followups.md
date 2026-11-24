@@ -1370,16 +1370,6 @@ user-visible halves still open.
       reserve the late panels' space on /discounts and /tax; then move each
       into `LIST_PAGES`. **Trigger:** the next polish pass on any of those
       pages.
-- [ ] **(c) Virtual-card statuses render untranslated.** The /payments cards
-      table prints `card.status` raw (`created`, `active`, `declined`, …) in
-      its badge, in every locale, where every other status on the page goes
-      through a label key. **Durable fix:** a `CARD_STATUS_LABEL_KEYS` map
-      beside `CARD_STATUS_TONES` with six-locale catalogue entries (the
-      `paymentStatusLabelKey` pattern), then re-measure the cards status
-      column (150px today, sized to the raw English) and add the cards tab a
-      `WIDEST_ROW` entry in `layout-stability.spec.ts` once the e2e seed
-      holds a card. **Trigger:** the next change to the cards tab, or a
-      locale report against it.
 - [ ] **(c) A failed inspections load on /goods-receipts shows only a toast.**
       The inspections tab's load error raises a toast and leaves an empty
       table, so the page reads as "no inspections" with no Retry, where the

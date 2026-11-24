@@ -209,6 +209,88 @@ export function runStatusLabelKey(status: string): MessageKey | null {
 	return RUN_STATUS_LABEL_KEYS[status as PaymentRunStatus] ?? null;
 }
 
+/**
+ * Every status a virtual card can carry — backend
+ * `services/card_adapters/base.CardStatus`, the one vocabulary
+ * `virtual_cards.status` is written from (issuance, the provider webhooks,
+ * cancel, and the adapters' status sync).
+ */
+export type CardStatus =
+	| 'created'
+	| 'sent'
+	| 'active'
+	| 'charged'
+	| 'completed'
+	| 'expired'
+	| 'cancelled'
+	| 'declined';
+
+export const CARD_STATUSES: CardStatus[] = [
+	'created',
+	'sent',
+	'active',
+	'charged',
+	'completed',
+	'expired',
+	'cancelled',
+	'declined'
+];
+
+/**
+ * Badge tone per virtual-card status, for the `/payments` cards table.
+ *
+ * Six of the eight once had no CSS rule and rendered untinted — only
+ * `completed` and `cancelled` happened to collide with a payment-status class
+ * name. `sent` / `active` share `accent` and `charged` / `completed` share
+ * `success`: neither pair was visually distinguished before, so this collapses
+ * nothing that existed. It moved here from the page with
+ * {@link CARD_STATUS_LABEL_KEYS} so the two are read off one union and the
+ * label guard in `paymentStatus.test.ts` can reach both.
+ */
+export const CARD_STATUS_TONES: Record<CardStatus, BadgeTone> = {
+	created: 'neutral',
+	sent: 'accent',
+	active: 'accent',
+	charged: 'success',
+	completed: 'success',
+	expired: 'muted',
+	cancelled: 'muted',
+	declined: 'danger'
+};
+
+/** `CardItem.status` is a bare string on the wire; an unknown one goes flat. */
+export function cardStatusTone(status: string): BadgeTone {
+	return CARD_STATUS_TONES[status as CardStatus] ?? 'neutral';
+}
+
+/**
+ * The i18n key carrying each card status' label — never the English string.
+ *
+ * The cards table printed `card.status` raw (`created`, `declined`, …) in every
+ * locale, beside a rebates table and three other tabs whose every status is
+ * keyed. Their own `payments.cardStatus.*` keys rather than the payment-status
+ * ones because the participle agrees with "card", whose gender differs from
+ * "payment" in es and fr (es *tarjeta cancelada* vs *pago cancelado*), and
+ * because a card has states (`charged`, `declined`) a payment does not. `Record<CardStatus, MessageKey>` makes a new status a compile
+ * error; `paymentStatus.test.ts` proves every key is in the catalogue.
+ */
+export const CARD_STATUS_LABEL_KEYS: Record<CardStatus, MessageKey> = {
+	created: 'payments.cardStatus.created',
+	sent: 'payments.cardStatus.sent',
+	active: 'payments.cardStatus.active',
+	charged: 'payments.cardStatus.charged',
+	completed: 'payments.cardStatus.completed',
+	expired: 'payments.cardStatus.expired',
+	cancelled: 'payments.cardStatus.cancelled',
+	declined: 'payments.cardStatus.declined'
+};
+
+/** The key for a card status, or `null` for one this build doesn't know (the
+ *  caller renders the raw value rather than a blank badge). */
+export function cardStatusLabelKey(status: string): MessageKey | null {
+	return CARD_STATUS_LABEL_KEYS[status as CardStatus] ?? null;
+}
+
 // UK domestic bank rails (bacs / faster_payments / chaps). A same-currency
 // GBP payment to a GB vendor stays inside the UK banking system (sort code +
 // account number — no IBAN, no SWIFT, no FX); the backend corridor selector

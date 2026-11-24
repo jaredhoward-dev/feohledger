@@ -1,15 +1,25 @@
 import { describe, it, expect } from 'vitest';
 import {
+	CARD_STATUSES,
+	CARD_STATUS_LABEL_KEYS,
+	CARD_STATUS_TONES,
 	PAYMENT_RUN_STATUSES,
 	PAYMENT_STATUSES,
 	PAYMENT_STATUS_LABEL_KEYS,
 	RUN_STATUS_LABEL_KEYS,
 	RUN_STATUS_TONES,
 	paymentStatusLabelKey,
+	cardStatusLabelKey,
+	cardStatusTone,
 	runStatusLabelKey,
 	type PaymentStatus
 } from './payment';
 import { EN_ALL } from '#lib/i18n/allMessages.ts';
+import { messages as de } from '#lib/i18n/locales/de.ts';
+import { messages as es } from '#lib/i18n/locales/es.ts';
+import { messages as fr } from '#lib/i18n/locales/fr.ts';
+import { messages as ja } from '#lib/i18n/locales/ja.ts';
+import { messages as ptBR } from '#lib/i18n/locales/pt-BR.ts';
 
 /**
  * Drift guard: the frontend payment-status vocabulary must cover every status
@@ -166,5 +176,68 @@ describe('RUN_STATUS_LABEL_KEYS', () => {
 		// `PaymentRun.status` is a bare string on the wire; the caller renders the
 		// raw value rather than a blank badge for a rung this build does not know.
 		expect(runStatusLabelKey('some_future_rollup')).toBeNull();
+	});
+});
+
+/**
+ * Drift guard: the virtual-card vocabulary must cover every status the backend
+ * can write to `virtual_cards.status`, and every one must reach the cards
+ * table's badge as a translated label.
+ *
+ * The badge printed `card.status` raw in every locale until round 36. Source
+ * (backend): `services/card_adapters/base.py::CardStatus` — issuance writes
+ * `created`, the provider webhooks `charged` / `completed`, cancel
+ * `cancelled`, and the adapters' status sync maps the provider's own states
+ * onto the rest.
+ */
+describe('CARD_STATUS_LABEL_KEYS', () => {
+	// Mirrors `CardStatus`. Extend BOTH this list and the maps when the backend
+	// adds a member — this list is the assertion, not a restatement of the map.
+	const BACKEND_CARD_STATUSES = [
+		'created',
+		'sent',
+		'active',
+		'charged',
+		'completed',
+		'expired',
+		'cancelled',
+		'declined'
+	];
+
+	it('covers exactly the statuses the backend can write', () => {
+		expect([...CARD_STATUSES].sort()).toEqual([...BACKEND_CARD_STATUSES].sort());
+	});
+
+	it('names a real, non-empty key for every status in every locale', () => {
+		// The non-English catalogues are `satisfies Messages`, so a missing key
+		// is already a compile error; this catches an empty or untranslated one.
+		const locales = { de, es, fr, ja, 'pt-BR': ptBR } as Record<string, Record<string, string>>;
+		for (const status of CARD_STATUSES) {
+			const key = CARD_STATUS_LABEL_KEYS[status];
+			expect(Object.keys(EN_ALL), `${status} -> "${key}" is not in the catalogue`).toContain(key);
+			expect(EN_ALL[key].trim().length).toBeGreaterThan(0);
+			for (const [locale, catalogue] of Object.entries(locales)) {
+				expect(catalogue[key]?.trim(), `${locale} has no label for card status ${status}`).toBeTruthy();
+				expect(catalogue[key], `${locale} renders card status ${status} raw`).not.toBe(status);
+			}
+		}
+	});
+
+	it('never uses the raw enum value as its own label', () => {
+		for (const status of CARD_STATUSES) {
+			expect(EN_ALL[CARD_STATUS_LABEL_KEYS[status]]).not.toBe(status);
+		}
+	});
+
+	it('labels every status the tone map tints', () => {
+		for (const status of Object.keys(CARD_STATUS_TONES)) {
+			expect(cardStatusLabelKey(status), `${status} has a tone but no label`).toBeTruthy();
+		}
+	});
+
+	it('falls an unknown status back to the raw value and a flat tone', () => {
+		expect(cardStatusLabelKey('some_future_state')).toBeNull();
+		expect(cardStatusTone('some_future_state')).toBe('neutral');
+		expect(cardStatusTone('declined')).toBe('danger');
 	});
 });

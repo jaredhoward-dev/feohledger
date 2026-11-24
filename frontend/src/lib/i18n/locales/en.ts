@@ -914,6 +914,16 @@ export const en = {
 	'payments.status.cancelled': 'Cancelled',
 	'payments.status.voided': 'Voided',
 
+	// Virtual-card status labels — the cards table badge (#lib/types/payment.ts::CARD_STATUS_LABEL_KEYS). Their own keys: the participle agrees with "card", not "payment".
+	'payments.cardStatus.created': 'Created',
+	'payments.cardStatus.sent': 'Sent',
+	'payments.cardStatus.active': 'Active',
+	'payments.cardStatus.charged': 'Charged',
+	'payments.cardStatus.completed': 'Completed',
+	'payments.cardStatus.expired': 'Expired',
+	'payments.cardStatus.cancelled': 'Cancelled',
+	'payments.cardStatus.declined': 'Declined',
+
 	// Payment rail labels (#lib/types/payment.ts). BACS / Faster Payments / CHAPS are UK scheme NAMES and stay verbatim in every locale, like ACH.
 	'payments.method.ach': 'ACH',
 	'payments.method.wire': 'Wire',

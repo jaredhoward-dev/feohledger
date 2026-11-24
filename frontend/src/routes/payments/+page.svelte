@@ -9,6 +9,8 @@
 		PAYMENT_STATUS_TONES,
 		runStatusLabelKey,
 		runStatusTone,
+		cardStatusLabelKey,
+		cardStatusTone,
 		voidCardOutcomeLabelKey
 	} from '#lib/types/payment.ts';
 	import { paymentStore } from '#lib/stores/payments.svelte.ts';
@@ -24,7 +26,6 @@
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import StatusBadge from '#lib/components/ui/StatusBadge.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
-	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
@@ -1556,31 +1557,13 @@
 		invoice_number: string | null;
 	}
 
-	/**
-	 * Badge tone per virtual-card status (`card_adapters/base.CardStatus`).
-	 *
-	 * Six of the eight had no CSS rule and rendered untinted — only
-	 * `completed` and `cancelled` happened to collide with a payment-status
-	 * class name. Same bare-string caveat as the runs map above.
-	 *
-	 * `sent` / `active` share `accent` and `charged` / `completed` share
-	 * `success`: neither pair was visually distinguished before, so this
-	 * collapses nothing that existed.
-	 */
-	const CARD_STATUS_TONES: Record<string, BadgeTone> = {
-		created: 'neutral',
-		sent: 'accent',
-		active: 'accent',
-		charged: 'success',
-		completed: 'success',
-		expired: 'muted',
-		cancelled: 'muted',
-		declined: 'danger'
+	// Tone and label per virtual-card status live in `#lib/types/payment`
+	// (`CARD_STATUS_TONES` / `CARD_STATUS_LABEL_KEYS`); an unrecognised value
+	// renders raw and flat rather than blank.
+	const cardLabel = (s: string) => {
+		const key = cardStatusLabelKey(s);
+		return key ? m(key) : s;
 	};
-
-	function cardTone(status: string): BadgeTone {
-		return CARD_STATUS_TONES[status] ?? 'neutral';
-	}
 
 	const CARDS_PAGE_SIZE = 20;
 	let cards = $state<CardItem[]>([]);
@@ -3023,7 +3006,7 @@
 								? formatCurrency(card.amount_charged, card.currency)
 								: '—'}
 						</td>
-						<td><Badge tone={cardTone(card.status)} variant={card.status}>{card.status}</Badge></td>
+						<td><Badge tone={cardStatusTone(card.status)} variant={card.status}>{cardLabel(card.status)}</Badge></td>
 						<td class="muted">{formatDate(card.expires_at)}</td>
 						<td class="actions">
 							{#if card.status === 'created' || card.status === 'sent' || card.status === 'active'}
@@ -3818,7 +3801,7 @@
 	/* Every pill on this page is `<Badge>`; the tone per status lives in
 	   `PAYMENT_STATUS_TONES` / `RUN_STATUS_TONES` in `#lib/types/payment`
 	   (shared with `RunDetailModal`, which badges the same two vocabularies)
-	   and in the page-local `CARD_STATUS_TONES`, which has no second caller.
+	   and `CARD_STATUS_TONES` beside them.
 	   What stays here is placement and the one emphasis the palette has no
 	   tone for.
 
@@ -3904,7 +3887,8 @@
 	   "FÄLLIGKEITSDATUM", "KONDITIONEN", "RECHNUNGS-NR.", pt-BR "PAGAMENTOS");
 	   a status column to its longest badge, which does not (queue: fr
 	   "COMPTABILISÉE DANS L'ERP"; history: es "RETENCIÓN POR CUMPLIMIENTO";
-	   runs: fr "EXÉCUTION EN COURS"; rebates: es "CONFIRMADO"); an actions
+	   runs: fr "EXÉCUTION EN COURS"; rebates: es "CONFIRMADO"; cards: de
+	   "ABGESCHLOSSEN"); an actions
 	   column to its longest single button, since a fixed table wraps a cell's
 	   buttons onto a second row (queue: fr "Enregistrer comme payée"; history:
 	   de "Zahlungseingang akzeptieren"; runs: pt-BR "Repetir sincronização com
@@ -3947,9 +3931,7 @@
 	.pay-history :global(th.col-status) { width: 300px; }
 	.pay-runs :global(th.col-status) { width: 220px; }
 	.pay-rebates :global(th.col-status) { width: 160px; }
-	/* Card statuses render raw today (docs/followups.md § "Virtual-card
-	   statuses render untranslated"); resize this when they get labels. */
-	.pay-cards :global(th.col-status) { width: 150px; }
+	.pay-cards :global(th.col-status) { width: 200px; }
 	/* The queue's one actions cell holds "Compare routes" and "Record as
 	   paid"; the column is the longer of the two. */
 	.pay-queue :global(th.actions-col) { width: 240px; }
@@ -3973,7 +3955,7 @@
 	.pay-history :global(table) { min-width: 1370px; }
 	.pay-runs :global(table) { min-width: 1160px; }
 	.pay-rebates :global(table) { min-width: 940px; }
-	.pay-cards :global(table) { min-width: 1110px; }
+	.pay-cards :global(table) { min-width: 1160px; }
 
 	/* --- Queue selection & payment --- */
 
