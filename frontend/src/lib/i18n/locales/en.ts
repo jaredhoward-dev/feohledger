@@ -3135,6 +3135,7 @@ export const en = {
 	'goodsReceipts.tabs.inspections': 'Inspections',
 	'goodsReceipts.inspections.hint': 'A quality inspection is the fourth leg of PO matching: a pass leaves the match alone, a fail blocks the invoice with a quality hold, and a partial acceptance records how much was actually accepted. Whether an inspection is required before payment is resolved per invoice — the vendor rule, then the commodity (GL) rule, then the organization default — so it is not always mandatory.',
 	'goodsReceipts.inspections.empty': 'No quality inspections recorded.',
+	'goodsReceipts.inspections.empty.errored': "Could not load quality inspections.",
 	'goodsReceipts.inspections.loadMore': 'Load more ({shown} of {total})',
 	'goodsReceipts.inspections.showingAll':
 		'{total, plural, one {Showing all # inspection} other {Showing all # inspections}}',

@@ -2966,6 +2966,7 @@ export const messages = {
 	'goodsReceipts.tabs.inspections': 'Inspecciones',
 	'goodsReceipts.inspections.hint': 'Una inspección de calidad es la cuarta pata del cotejo con la orden de compra: «aprobada» deja el cotejo igual, «rechazada» bloquea la factura con una retención de calidad y una aceptación parcial registra cuánto se aceptó realmente. Que la inspección sea obligatoria antes del pago se resuelve por factura — regla del proveedor, luego regla de la categoría (cuenta contable) y luego el valor por defecto de la organización — así que no siempre lo es.',
 	'goodsReceipts.inspections.empty': 'No hay inspecciones de calidad registradas.',
+	'goodsReceipts.inspections.empty.errored': "No se pudieron cargar las inspecciones de calidad.",
 	'goodsReceipts.inspections.loadMore': 'Cargar más ({shown} de {total})',
 	'goodsReceipts.inspections.showingAll':
 		'{total, plural, one {Mostrando # inspección} other {Mostrando las # inspecciones}}',

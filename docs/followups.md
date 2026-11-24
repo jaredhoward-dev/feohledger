@@ -1380,15 +1380,6 @@ user-visible halves still open.
       `WIDEST_ROW` entry in `layout-stability.spec.ts` once the e2e seed
       holds a card. **Trigger:** the next change to the cards tab, or a
       locale report against it.
-- [ ] **(c) A failed inspections load on /goods-receipts shows only a toast.**
-      The inspections tab's load error raises a toast and leaves an empty
-      table, so the page reads as "no inspections" with no Retry, where the
-      receipts tab and the other list pages render `ui/LoadError` in the
-      table. Found while sizing the tab (round 35). **Durable fix:** the
-      `LoadError` + Retry state the receipts tab uses, with its message keys
-      in all six locales, and an e2e case that answers `/api/inspections`
-      with a 500. **Trigger:** the next change to the inspections tab, or a
-      report of an inspection list that came back empty.
 - [ ] **(c) No scripted "first customer" release rehearsal.** The 2026-10-22
       walkthrough — sign up, connect QuickBooks, sync the chart and vendors,
       enter an invoice, approve it, push it, pay the bill in QuickBooks, watch

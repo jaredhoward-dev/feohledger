@@ -177,6 +177,13 @@
 	 *  (`inspectionsLoading` itself only turns on once the tab's effect runs). */
 	let inspectionsAttempted = $state(false);
 	let loadingMoreInspections = $state(false);
+	/** The inspections tab's twin of `errored`: a failed page-1 load renders
+	 *  `ui/LoadError` (with a Retry) in the table's place. It used to only
+	 *  toast and leave the table on "No quality inspections recorded.", so an
+	 *  outage read as a tenant with no inspections — and nothing to press once
+	 *  the toast faded. Cleared when a fresh load starts, for the same reason
+	 *  `loadGRs` clears `errored` there. */
+	let inspectionsErrored = $state(false);
 	let inspectionsTotal = $state(0);
 	let inspectionsPage = $state(1);
 	/** Inspections for the receipt whose detail modal is open, fetched with
@@ -331,7 +338,10 @@
 		const nextPage = opts.nextPage ?? 1;
 		const token = inspectionSequence.start();
 		if (opts.append) loadingMoreInspections = true;
-		else inspectionsLoading = true;
+		else {
+			inspectionsLoading = true;
+			inspectionsErrored = false;
+		}
 		try {
 			const data = await listInspections({ page: nextPage, pageSize: PAGE_SIZE });
 			if (!inspectionSequence.canCommit(token)) return;
@@ -339,8 +349,10 @@
 			inspectionsTotal = data.total;
 			inspectionsPage = nextPage;
 			inspectionsLoaded = true;
+			inspectionsErrored = false;
 		} catch (err) {
 			if (!inspectionSequence.isCurrentRequest(token)) return;
+			if (!opts.append) inspectionsErrored = true;
 			toast(
 				err instanceof Error ? err.message : m('goodsReceipts.inspections.toast.loadFailed'),
 				'error'
@@ -685,6 +697,13 @@
 				<HelpTip term="four-way-match" />
 			</p>
 
+			{#if inspectionsErrored}
+				<LoadError
+					message={m('goodsReceipts.inspections.empty.errored')}
+					onretry={() => refreshInspections()}
+					testId="inspections-error"
+				/>
+			{:else}
 			<div class="gr-table inspections-table">
 			<DataTable
 				fixed
@@ -732,12 +751,14 @@
 				{/snippet}
 			</DataTable>
 			</div>
+			{/if}
 
 			<LoadMoreFooter
 				shown={inspections.length}
 				total={inspectionsTotal}
 				hasMore={hasMoreInspections}
 				loading={loadingMoreInspections}
+				errored={inspectionsErrored}
 				onloadmore={loadMoreInspections}
 				moreKey="goodsReceipts.inspections.loadMore"
 				allKey="goodsReceipts.inspections.showingAll"

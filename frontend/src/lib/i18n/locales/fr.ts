@@ -2969,6 +2969,7 @@ export const messages = {
 	'goodsReceipts.tabs.inspections': 'Inspections',
 	'goodsReceipts.inspections.hint': 'Une inspection qualité est le quatrième volet du rapprochement avec la commande : « conforme » laisse le rapprochement inchangé, « non conforme » bloque la facture par une retenue qualité, et une acceptation partielle enregistre la quantité réellement acceptée. Le caractère obligatoire de l’inspection avant paiement est résolu facture par facture — règle fournisseur, puis règle de catégorie (compte général), puis valeur par défaut de l’organisation — elle n’est donc pas toujours exigée.',
 	'goodsReceipts.inspections.empty': 'Aucune inspection qualité enregistrée.',
+	'goodsReceipts.inspections.empty.errored': "Impossible de charger les inspections qualité.",
 	'goodsReceipts.inspections.loadMore': 'Charger plus ({shown} sur {total})',
 	'goodsReceipts.inspections.showingAll':
 		'{total, plural, one {Affichage de # inspection} other {Affichage des # inspections}}',
