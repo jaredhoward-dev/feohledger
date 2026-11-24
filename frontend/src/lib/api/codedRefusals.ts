@@ -1062,6 +1062,13 @@ const BUILDERS: Record<string, Builder> = {
 	csv_vendor_name_required: fixed('refusal.csvVendorNameRequired'),
 	csv_invoice_number_required: fixed('refusal.csvInvoiceNumberRequired'),
 	csv_vendor_required: fixed('refusal.csvVendorRequired'),
+	// A `vendor_code` two vendors claim (a code, or an ERP record id), or only
+	// an ERP record id: the payee would be a guess, so the row is refused
+	// (decisions §491).
+	csv_vendor_code_ambiguous: (p, t) => {
+		const value = str(p, 'value');
+		return value === null ? null : t('refusal.csvVendorCodeAmbiguous', { value });
+	},
 	csv_amount_invalid: (p, t) => {
 		if (typeof p.value !== 'string') return null;
 		const value = str(p, 'value');
