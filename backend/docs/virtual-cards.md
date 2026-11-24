@@ -169,7 +169,7 @@ money-state transition still lands.
 | Invoice | Invoice number (link) |
 | Amount | Card limit |
 | Charged | Actual charge (blank if not yet charged) |
-| Status | Created / Sent / Active / Charged / Completed / Expired |
+| Status | Created / Sent / Active / Charged / Completed / Expired / Cancelled / Declined — a translated label per `CardStatus` (`frontend/src/lib/types/payment.ts::CARD_STATUS_LABEL_KEYS`, guarded in `paymentStatus.test.ts`) |
 | Created | Date created |
 
 **Card Actions**
