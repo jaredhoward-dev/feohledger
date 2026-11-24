@@ -286,13 +286,20 @@ variable "frontend_on_cloudfront" {
 }
 
 variable "github_oidc_sub_prefix" {
-  description = "The OIDC subject prefix this repository presents to AWS, e.g. repo:<owner>@<id>/<repo>@<id> on GitHub's immutable subject claims. The backup-erasure roles (backup_erasure.tf) trust exactly <prefix>:ref:refs/heads/main (the check job) and <prefix>:environment:backup-erasure (the erase job). Read it, never build it from the slug: gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix (README.md § The deploy role is not owned here). Set it in the private prod.tfvars.sops."
+  description = "The OIDC subject prefix this repository presents to AWS, e.g. repo:<owner>@<id>/<repo>@<id> on GitHub's immutable subject claims. The backup-erasure roles (backup_erasure.tf) trust exactly <prefix>:ref:refs/heads/main (the check job) and <prefix>:environment:backup-erasure (the erase job). Read it, never build it from the slug (README.md § The deploy role is not owned here). Set it in the private prod.tfvars.sops. Defaults to null only so that an unset value fails with the validation message below, which says how to read it, rather than Terraform's bare 'No value for required variable'."
   type        = string
+  default     = null
 
   validation {
     # repo:<owner>/<repo>, either form, and no `:` after the first: the
     # suffix (`:ref:…`, `:environment:…`) is appended per role.
-    condition     = can(regex("^repo:[^:/[:space:]]+/[^:/[:space:]]+$", var.github_oidc_sub_prefix))
-    error_message = "github_oidc_sub_prefix must be the bare repo:<owner>/<repo> prefix the sub_claim_prefix API returns, with no :ref: or :environment: suffix."
+    condition     = var.github_oidc_sub_prefix != null && can(regex("^repo:[^:/[:space:]]+/[^:/[:space:]]+$", var.github_oidc_sub_prefix))
+    error_message = "Set github_oidc_sub_prefix (in prod.tfvars.sops) to the bare repo:<owner>/<repo> subject prefix, no trailing colon and no :ref: / :environment: suffix. Read it with: gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix  (for this repo: gh api repos/jaredhoward-dev/feohledger/actions/oidc/customization/sub --jq .sub_claim_prefix). README.md § Backup erasure."
   }
+}
+
+variable "backup_erasure_alarms_enabled" {
+  description = "Create the backup-erasure heartbeat and overdue alarms (backup_erasure.tf). Leave false until BACKUP_ERASURE_ENABLED is set and the workflow's check job has run once, or the heartbeat alarm emails about a check that was never meant to run yet (README.md § Backup erasure)."
+  type        = bool
+  default     = false
 }

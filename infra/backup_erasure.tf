@@ -51,6 +51,11 @@ locals {
   # Every per-tenant dump, and the one dump no erasure may touch. The `_` is
   # what keeps the first from matching the second; the Deny below does not rely
   # on it.
+  # The check job's heartbeat (CheckRan) and overdue count (Overdue): the
+  # alarms below catch a schedule GitHub disabled or a workflow that stopped
+  # running, which would otherwise silence the 45-day alarm with no signal.
+  backup_erasure_metric_namespace = "FeohLedger/BackupErasure"
+
   backup_tenant_dumps_arn  = "${aws_s3_bucket.backups.arn}/pg/*/feoh_*.dump"
   backup_control_dumps_arn = "${aws_s3_bucket.backups.arn}/pg/*/feohledger.dump"
 }
@@ -223,9 +228,31 @@ data "aws_iam_policy_document" "backup_erasure_check" {
   }
 }
 
+data "aws_iam_policy_document" "backup_erasure_check_metrics" {
+  # PutMetricData has no resource type; the namespace condition key is what
+  # scopes it, so the role can write this workflow's heartbeat and nothing
+  # else a CloudWatch alarm reads.
+  statement {
+    sid       = "PublishTheErasureHeartbeat"
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = [local.backup_erasure_metric_namespace]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "backup_erasure_check_metrics" {
+  name   = "backup-erasure-check-metrics"
+  role   = aws_iam_role.backup_erasure_check.name
+  policy = data.aws_iam_policy_document.backup_erasure_check_metrics.json
+}
+
 resource "aws_iam_role_policy" "backup_erasure_check" {
   name   = "backup-erasure-check"
-  role   = aws_iam_role.backup_erasure_check.id
+  role   = aws_iam_role.backup_erasure_check.name
   policy = data.aws_iam_policy_document.backup_erasure_check.json
 }
 
@@ -297,6 +324,52 @@ data "aws_iam_policy_document" "backup_erasure" {
 
 resource "aws_iam_role_policy" "backup_erasure" {
   name   = "backup-erasure"
-  role   = aws_iam_role.backup_erasure.id
+  role   = aws_iam_role.backup_erasure.name
   policy = data.aws_iam_policy_document.backup_erasure.json
+}
+
+# ── Alarms: the erasure must not stop silently ──────────────────────────────
+#
+# GitHub disables scheduled workflows in a public repo after 60 days without
+# repository activity, and a broken or disarmed workflow also stops the daily
+# check — and with it the red run that flags an erasure 45 days old. These two
+# alarms watch from AWS instead. Off until var.backup_erasure_alarms_enabled:
+# armed before the workflow has run once, the heartbeat alarm would page
+# about a check that was never meant to run yet (README.md § Backup erasure).
+
+resource "aws_cloudwatch_metric_alarm" "backup_erasure_heartbeat" {
+  count = var.backup_erasure_alarms_enabled ? 1 : 0
+
+  alarm_name          = "${var.project}-${var.environment}-backup-erasure-heartbeat"
+  alarm_description   = "The backup-erasure workflow's daily check has not run for two days: GitHub may have disabled the schedule (60 days without repository activity), the BACKUP_ERASURE_ENABLED variable or a secret changed, or the check is failing. Until it runs, nothing warns before the DPA's 60-day backup deletion deadline. Re-enable / fix .github/workflows/backup-erasure.yml. docs/founder-runbooks/workspace-closure.md."
+  namespace           = local.backup_erasure_metric_namespace
+  metric_name         = "CheckRan"
+  statistic           = "Sum"
+  period              = 86400
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  # No datapoint is exactly the failure this alarm exists for.
+  treat_missing_data = "breaching"
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "backup_erasure_overdue" {
+  count = var.backup_erasure_alarms_enabled ? 1 : 0
+
+  alarm_name          = "${var.project}-${var.environment}-backup-erasure-overdue"
+  alarm_description   = "A removed workspace's backups have been owed for 45+ days; /legal/dpa § 13 allows 60. Approve the pending erase job of .github/workflows/backup-erasure.yml, or see docs/founder-runbooks/workspace-closure.md."
+  namespace           = local.backup_erasure_metric_namespace
+  metric_name         = "Overdue"
+  statistic           = "Maximum"
+  period              = 86400
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  # A missing day is the heartbeat alarm's to report.
+  treat_missing_data = "notBreaching"
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
 }

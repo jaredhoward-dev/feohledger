@@ -452,6 +452,27 @@ def test_erasure_check_writes_counts_and_names_nothing(tmp_path: Path) -> None:
     assert (d.root / "github_output").read_text() == "ready=2\nblocked=1\noverdue=1\n"
     assert d.called("--document-name feohledger-backup-erasure-summary")
     assert not d.called("s3api"), "the check role has no S3 access"
+    # The heartbeat the CloudWatch alarms watch, with the overdue count.
+    assert d.called(
+        "cloudwatch put-metric-data --namespace FeohLedger/BackupErasure --metric-data "
+        "MetricName=CheckRan,Value=1,Unit=Count MetricName=Overdue,Value=1,Unit=Count"
+    )
+
+
+def test_erasure_check_fails_when_the_heartbeat_cannot_be_published(tmp_path: Path) -> None:
+    """A check that ran but could not say so would let the heartbeat alarm
+    fire with no red run to explain it — so it goes red itself."""
+    summary = (
+        '{"blocked": 0, "cool_off_days": 7, "cooling": 0, "oldest_age_days": 0, "overdue": 0, '
+        '"overdue_after_days": 45, "owed": 0, "ready": 0}'
+    )
+    d = _erasure(tmp_path, f"FEOH_ERASURE {summary}\\n")
+    d.rule("aws", "put-metric-data", 254)
+
+    result = _run_erasure(d, "check")
+
+    assert result.returncode != 0
+    assert "heartbeat" in result.stderr
 
 
 def test_erasure_check_fails_on_a_summary_it_cannot_read(tmp_path: Path) -> None:
@@ -1110,7 +1131,8 @@ def test_erasure_fails_for_blocked_entries_beyond_the_batch(tmp_path: Path) -> N
 
 ENV_OK = (
     '{"protection_rules": [{"type": "required_reviewers", "reviewers": [{"type": "User"}]}], '
-    '"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}'
+    '"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}, '
+    '"can_admins_bypass": false}'
 )
 
 
@@ -1220,3 +1242,90 @@ def test_erasure_says_when_the_queue_is_longer_than_one_batch(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     assert "73 workspace(s) are owed; this run takes the oldest 1" in result.stdout
+
+
+def test_erasure_refuses_everything_on_a_future_dated_night(tmp_path: Path) -> None:
+    """The VM writes the keys. A night dated in the future would pass any
+    "fresh enough" test, so it is a forgery signal: nothing is erased."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    d.rule("aws", "--delimiter", 0, _nights(30, 20) + "pg/2099-01-01/\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "dated in the future" in result.stderr
+    assert not d.called("delete-object")
+
+
+def test_erasure_refuses_everything_on_a_night_that_is_not_a_date(tmp_path: Path) -> None:
+    d = _erasure(tmp_path, _queue((ORG, "acme", None)))
+    d.rule("aws", "--delimiter", 0, _nights(1, 0) + "pg/9999-99-99/\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert "not a real date" in result.stderr
+    assert not d.called("delete-object")
+    assert "Traceback" not in result.stderr
+
+
+def test_erasure_refuses_a_dump_whose_night_is_not_a_date(tmp_path: Path) -> None:
+    """Fail closed: an unparseable night must never read as "old enough"."""
+    d = _erasure(tmp_path, _queue((ORG, "acme", None), age=30))
+    d.rule("aws", _dates("feoh_acme"), 0, "pg/0000-00-00/feoh_acme.dump\\n")
+
+    result = _run_erasure(d, "erase")
+
+    assert result.returncode != 0
+    assert not d.called("delete-object")
+    assert not d.called("mark-cleared")
+
+
+@pytest.mark.parametrize(
+    ("bypass", "why"),
+    [("true", "admins may bypass"), (None, "the field is missing")],
+)
+def test_environment_guard_refuses_an_admin_bypass(tmp_path: Path, bypass, why) -> None:
+    env = ENV_OK.replace(
+        '"can_admins_bypass": false', f'"can_admins_bypass": {bypass}' if bypass else '"x": 0'
+    )
+    _, result = _guard(tmp_path, env)
+    assert result.returncode != 0, why
+    assert "bypass" in result.stderr
+
+
+def test_environment_guard_refuses_a_missing_environment_cleanly(tmp_path: Path) -> None:
+    d = _deploy(tmp_path, "backup-erasure.sh", "gh")
+    d.rule("gh", "environments/backup-erasure", 1, '{"message":"Not Found","status":"404"}\\n')
+
+    result = d.run(
+        "environment-guard",
+        extra_env={
+            "INSTANCE_ID": "i-0123",
+            "GITHUB_REPOSITORY": "o/r",
+            "GITHUB_REF": "refs/heads/main",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "Create it first" in result.stderr
+
+
+def test_environment_guard_refuses_a_404_on_the_branch_policies(tmp_path: Path) -> None:
+    """The policies endpoint answers 404 when the policy is null; that is a
+    refusal with our message, not a crash."""
+    d = _deploy(tmp_path, "backup-erasure.sh", "gh")
+    d.rule("gh", "deployment-branch-policies", 1, '{"message":"Not Found"}\\n')
+    d.rule("gh", "environments/backup-erasure", 0, ENV_OK + "\\n")
+
+    result = d.run(
+        "environment-guard",
+        extra_env={
+            "INSTANCE_ID": "i-0123",
+            "GITHUB_REPOSITORY": "o/r",
+            "GITHUB_REF": "refs/heads/main",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "branch policies" in result.stderr

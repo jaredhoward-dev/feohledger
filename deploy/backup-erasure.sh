@@ -61,6 +61,7 @@ MARK_DOCUMENT=${MARK_DOCUMENT:-feohledger-backup-erasure-mark-cleared}
 SSM_POLL_SECONDS=${SSM_POLL_SECONDS:-5}
 SSM_WAIT_SECONDS=${SSM_WAIT_SECONDS:-600}
 MAX_BACKUP_AGE_DAYS=2
+METRIC_NAMESPACE=FeohLedger/BackupErasure
 COOL_OFF_DAYS=7
 GITHUB_OUTPUT=${GITHUB_OUTPUT:-/dev/null}
 GITHUB_STEP_SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
@@ -147,6 +148,12 @@ check() {
 		echo "blocked=${blocked}"
 		echo "overdue=${overdue}"
 	} >>"$GITHUB_OUTPUT"
+	# The heartbeat the CloudWatch alarms watch (infra/backup_erasure.tf): a
+	# schedule GitHub disabled, or a check that stopped running, would
+	# otherwise also silence the 45-day alarm. Failing to publish fails the job.
+	aws cloudwatch put-metric-data --namespace "$METRIC_NAMESPACE" --metric-data \
+		"MetricName=CheckRan,Value=1,Unit=Count" "MetricName=Overdue,Value=${overdue},Unit=Count" ||
+		die "could not publish the erasure heartbeat to CloudWatch."
 	{
 		echo "### Backup erasure queue"
 		echo
@@ -193,8 +200,18 @@ dump_dates() {
 
 # Days from <earlier YYYY-MM-DD> to <later YYYY-MM-DD>. In python3, not
 # `date -d`: deploy scripts stay portable (test_deploy_script_failures).
+# Fails, printing nothing, on anything that is not a real calendar date — the
+# VM writes the keys these come from, so every caller treats a failure as a
+# refusal, never as "not too recent".
 days_between() {
-	python3 -c 'import sys, datetime as d; f = d.date.fromisoformat; print((f(sys.argv[2]) - f(sys.argv[1])).days)' "$1" "$2"
+	python3 -c '
+import sys, datetime as d
+try:
+    f = d.date.fromisoformat
+    print((f(sys.argv[2]) - f(sys.argv[1])).days)
+except ValueError:
+    sys.exit(1)
+' "$1" "$2"
 }
 
 # erase_one <database> <organisation id>: 0 when every version is gone and the
@@ -263,12 +280,20 @@ erase() {
 	newest=$(printf '%s\n' "$dates" | grep . | tail -1 || true)
 	[ -n "$newest" ] || die "no nightly backup prefix under pg/; nothing erased."
 	today=$(date -u +%F)
-	if [ "$(days_between "$newest" "$today")" -gt "$MAX_BACKUP_AGE_DAYS" ]; then
+	local newest_age
+	# A prefix the VM dated in the future, or not a real date, would pass any
+	# "recent enough" test; the VM writes these keys, so that is a forgery
+	# signal, not a fresh backup.
+	newest_age=$(days_between "$newest" "$today") ||
+		die "a nightly prefix under pg/ is not a real date; nothing erased."
+	[ "$newest_age" -ge 0 ] ||
+		die "a nightly prefix under pg/ is dated in the future; nothing erased. Something other than backup.sh wrote it."
+	if [ "$newest_age" -gt "$MAX_BACKUP_AGE_DAYS" ]; then
 		die "the newest nightly backup is older than ${MAX_BACKUP_AGE_DAYS} days, so a live tenant could not be told from a removed one; nothing erased. Fix backup.sh first."
 	fi
-	echo "Newest nightly backup: $(days_between "$newest" "$today") day(s) old."
+	echo "Newest nightly backup: ${newest_age} day(s) old."
 
-	local i org database blocked closed age dumps after last erased=0 failed=0 skipped=0 deferred=0
+	local i org database blocked closed age dumps after last last_age erased=0 failed=0 skipped=0 deferred=0
 	for ((i = 0; i < total; i++)); do
 		org=$(jq -r ".owed[$i].organization_id" <<<"$json")
 		database=$(jq -r ".owed[$i].database" <<<"$json")
@@ -289,7 +314,7 @@ erase() {
 			continue
 		fi
 		if ! [[ "$org" =~ $UUID_RE ]] || ! [[ "$database" =~ $DATABASE_RE ]] ||
-			! [[ "$closed" =~ $DATE_RE ]] || ! age=$(days_between "$closed" "$today" 2>/dev/null) ||
+			! [[ "$closed" =~ $DATE_RE ]] || ! age=$(days_between "$closed" "$today") ||
 			[ "$age" -lt 0 ]; then
 			echo "  not a well-formed queue entry; not erased." >&2
 			failed=$((failed + 1))
@@ -316,10 +341,17 @@ erase() {
 		fi
 		# ...and from the bucket: its newest stored dump must be as old.
 		last=$(printf '%s\n' "$dumps" | grep . | tail -1 || true)
-		if [ -n "$last" ] && [ "$(days_between "$last" "$today")" -lt "$COOL_OFF_DAYS" ]; then
-			echo "  backed up within the last ${COOL_OFF_DAYS} nights; deferred."
-			deferred=$((deferred + 1))
-			continue
+		if [ -n "$last" ]; then
+			if ! last_age=$(days_between "$last" "$today"); then
+				echo "  a stored dump's night is not a real date; not erased." >&2
+				failed=$((failed + 1))
+				continue
+			fi
+			if [ "$last_age" -lt "$COOL_OFF_DAYS" ]; then
+				echo "  backed up within the last ${COOL_OFF_DAYS} nights; deferred."
+				deferred=$((deferred + 1))
+				continue
+			fi
 		fi
 		if erase_one "$database" "$org"; then
 			echo "  erased and marked cleared."
@@ -357,8 +389,14 @@ environment_guard() {
 	local repo=${GITHUB_REPOSITORY:-} envname=backup-erasure env_json reviewers protected custom policies
 	[ "${GITHUB_REF:-}" = refs/heads/main ] || die "the erase job runs from main only."
 	[ -n "$repo" ] || die "GITHUB_REPOSITORY is not set."
-	env_json=$(gh api "repos/${repo}/environments/${envname}") ||
-		die "could not read the ${envname} environment's settings."
+	# A missing environment is a 404, which gh reports on stderr in its own
+	# words; ours is the message that says what to do.
+	env_json=$(gh api "repos/${repo}/environments/${envname}" 2>/dev/null) ||
+		die "could not read the ${envname} environment (missing, or the token lacks actions: read). Create it first (infra/README.md § Backup erasure)."
+	# GitHub creates environments with admins allowed to bypass their rules,
+	# which would let an admin — or a leaked admin token — skip the reviewer.
+	[ "$(jq -r '.can_admins_bypass' <<<"$env_json")" = false ] ||
+		die "the ${envname} environment lets administrators bypass its protection rules; untick that (infra/README.md § Backup erasure)."
 	reviewers=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers // [] | length)] | add // 0' <<<"$env_json")
 	if ! is_count "$reviewers" || [ "$reviewers" -lt 1 ]; then
 		die "the ${envname} environment has no required reviewer (infra/README.md § Backup erasure)."
@@ -367,7 +405,7 @@ environment_guard() {
 	custom=$(jq -r '.deployment_branch_policy.custom_branch_policies // empty' <<<"$env_json")
 	if [ "$custom" = true ]; then
 		policies=$(gh api "repos/${repo}/environments/${envname}/deployment-branch-policies" \
-			--jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")') ||
+			--jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")' 2>/dev/null) ||
 			die "could not read the ${envname} environment's branch policies."
 		[ "$policies" = "branch:main" ] ||
 			die "the ${envname} environment must allow deployments from the main branch only."

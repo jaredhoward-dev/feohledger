@@ -1029,6 +1029,99 @@ run "backup_erasure_deletes_only_tenant_dump_versions_never_the_control_plane_du
   }
 }
 
+run "backup_erasure_check_role_may_only_publish_its_own_heartbeat" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for st in data.aws_iam_policy_document.backup_erasure_check_metrics.statement :
+      toset(st.actions) == toset(["cloudwatch:PutMetricData"])
+      && anytrue([for c in st.condition : c.test == "StringEquals" && c.variable == "cloudwatch:namespace" && toset(c.values) == toset(["FeohLedger/BackupErasure"])])
+    ])
+    error_message = "The check role may publish metrics only into the FeohLedger/BackupErasure namespace."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.backup_erasure_check_metrics.role == "feohledger-backup-erasure-check"
+    error_message = "The metrics grant belongs to the check role, not the erase role."
+  }
+}
+
+run "backup_erasure_alarms_stay_off_until_armed" {
+  command = plan
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat) == 0 && length(aws_cloudwatch_metric_alarm.backup_erasure_overdue) == 0
+    error_message = "The erasure alarms must not exist before the owner arms them: the heartbeat would page about a check that was never meant to run yet."
+  }
+}
+
+run "backup_erasure_alarms_catch_a_silent_schedule_and_an_overdue_erasure" {
+  command = plan
+
+  variables {
+    backup_erasure_alarms_enabled = true
+  }
+
+  assert {
+    condition = (
+      one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).namespace == "FeohLedger/BackupErasure"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).metric_name == "CheckRan"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).treat_missing_data == "breaching"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).comparison_operator == "LessThanThreshold"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).period * one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat).evaluation_periods <= 172800
+    )
+    error_message = "The heartbeat alarm must fire on a missing CheckRan within two days — missing data is the failure it exists for."
+  }
+
+  assert {
+    condition = (
+      one(aws_cloudwatch_metric_alarm.backup_erasure_overdue).metric_name == "Overdue"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_overdue).comparison_operator == "GreaterThanThreshold"
+      && one(aws_cloudwatch_metric_alarm.backup_erasure_overdue).threshold == 0
+    )
+    error_message = "The overdue alarm must fire on any erasure owed 45+ days."
+  }
+
+  assert {
+    condition = alltrue([
+      for a in [one(aws_cloudwatch_metric_alarm.backup_erasure_heartbeat), one(aws_cloudwatch_metric_alarm.backup_erasure_overdue)] :
+      toset(a.alarm_actions) == toset(["arn:aws:sns:us-east-1:000000000000:feohledger-prod-alerts"])
+    ])
+    error_message = "Both alarms email through the existing operator alerts topic."
+  }
+}
+
+run "rejects_a_sub_prefix_with_a_suffix" {
+  command = plan
+
+  variables {
+    github_oidc_sub_prefix = "repo:example-owner@1/feohledger@2:environment:production"
+  }
+
+  expect_failures = [var.github_oidc_sub_prefix]
+}
+
+run "rejects_a_sub_prefix_with_a_trailing_colon" {
+  command = plan
+
+  variables {
+    github_oidc_sub_prefix = "repo:example-owner@1/feohledger@2:"
+  }
+
+  expect_failures = [var.github_oidc_sub_prefix]
+}
+
+run "rejects_an_unset_sub_prefix_with_instructions" {
+  command = plan
+
+  variables {
+    github_oidc_sub_prefix = null
+  }
+
+  expect_failures = [var.github_oidc_sub_prefix]
+}
+
 # ── SPA on S3 + CloudFront (frontend.tf) ─────────────────────────────────────
 
 run "frontend_bucket_is_never_public_and_only_this_distribution_reads_it" {

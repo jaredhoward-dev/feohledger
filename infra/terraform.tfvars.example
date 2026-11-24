@@ -79,6 +79,9 @@ alert_emails = ["alerts@example.com"]
 # the slug (this repo uses immutable subject claims, so it carries numeric ids):
 #   gh api repos/<owner>/feohledger/actions/oidc/customization/sub --jq .sub_claim_prefix
 github_oidc_sub_prefix = "repo:REPLACE@0000000/feohledger@0000000"
+# The heartbeat + overdue alarms. Leave false until BACKUP_ERASURE_ENABLED is set
+# and the workflow's check job has run green once (README.md § Backup erasure step 8).
+# backup_erasure_alarms_enabled = true
 
 # --- Secrets ------------------------------------------------------------------
 # Never in a tfvars. The one secret, the RDS master password, is an ephemeral

@@ -13,7 +13,10 @@ name: Backup erasure
 #
 #   check  (no environment, daily) assumes `feohledger-backup-erasure-check`,
 #          trusted for main only. It may run ONE read-only SSM document on the
-#          VM, which prints counts. A queue entry older than 45 days, or one
+#          VM, which prints counts, and publishes a CloudWatch heartbeat
+#          (infra/backup_erasure.tf alarms on it): GitHub disables a public
+#          repo's schedules after 60 days without activity, and that must not
+#          silence the 45-day alarm. A queue entry older than 45 days, or one
 #          blocked for a human, fails `attention` red — which emails the owner
 #          well inside the DPA's 60 days.
 #   erase  (its OWN `backup-erasure` environment: a required reviewer approves
