@@ -176,7 +176,11 @@ The CSV importers share the scope rather than restating it:
 builds on, and `services/csv_import` applies it to its by-code and by-name
 lookups (no status filter there — an import has always resolved to an existing
 `inactive` / `rejected` record rather than minting a fresh stub beside it).
-See `csv-import.md` § Vendors resolve within the import's entity.
+See `csv-import.md` § Vendors resolve within the import's entity. By code, they
+never use the entity precedence: a code that two vendors in scope claim (as
+`code`, which also carries the ERP's vendor number the sync writes, or as
+`erp_vendor_id`) is refused, not resolved — `csv-import.md` § A vendor code
+must name one vendor, decisions §491.
 
 `match_and_link_vendor` derives the entity from `invoice.entity_id`, so no
 caller passes it explicitly — including an inter-company **mirror** payable,

@@ -24993,3 +24993,66 @@ Read 2026-11-24 for the pre-merge hardening:
 <https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps>
 (`GET …/environments/{name}` and its deployment-branch-policies need Actions:
 read).
+
+## 491. A CSV vendor code resolves only when one vendor claims it; no ERP-number column (round 36)
+
+CSV import resolved an invoice row's `vendor_code` by `Vendor.code`, with the
+entity's own row winning over an unstamped one. The ERP sync writes its vendor
+number (BC No., NetSuite `entityid`, Intacct `VENDORID`, SYSPRO `Supplier`, FE
+NXT `ui_defined_id`, Sage `reference`) into that same column, so a code a person
+chose for one supplier could equal the number the ERP gave another, and the row
+— the payable — landed on whichever won the order. The same held for a code
+equal to the ERP record id (`erp_vendor_id`) another vendor is linked by: a QBO
+export's vendor id is such a value.
+
+**Decision.** `services/csv_import._vendors_claiming_code` lists the vendors in
+scope that claim a code, as their `code` or their `erp_vendor_id`, and both
+importers act only on exactly one claimant. The invoice importer resolves when
+the one claimant holds the value as its `code`; two claimants, or a value that
+is only some vendor's ERP record id, refuse the row as
+`csv_vendor_code_ambiguous` (`value`), without falling back to the name or
+minting a stub that would add a third holder. The vendor importer dedups on
+either column (the ERP number is in `code`, the record id in
+`erp_vendor_id`), and refuses a row whose code two vendors claim. Every error
+goes toward a refusal naming the fix — give the supplier a distinct code, or
+merge the vendors — never toward a payee chosen by order.
+
+**Why no migration, and no separate ERP-number column.** The reverted round-35
+attempt (merge `be1382f8`, its own "§490" never landed; reverted by
+`5910848f`) moved the ERP number into
+a new `erp_vendor_code` column and resolved by `code` alone. Its review found
+three faults, and each came from the move, not from the goal: (1) a code held
+as one vendor's `code` and another's `erp_vendor_code` still resolved to the
+first without a word, because the namespaces were split but resolution looked
+in one; (2) the migration moved codes on sync-created rows, but QuickBooks,
+Xero, NetSuite-without-entityid and FE NXT send no number, so a code on such a
+row may have been typed by a person, and moving it made it a permanent ERP
+number with no audit row; (3) the ERP number disappeared from `/vendors`, the
+vendor modal, mobile and search, which all read `code`. What prevents the wrong
+payee is refusing when a code names two vendors, and that needs to know only
+*that* two vendors claim it, not *who wrote* each claim. With both namespaces
+still in `code` (plus `erp_vendor_id`), one lookup sees every collision, no
+code moves (so no person-typed code is ever reinterpreted and there is no
+evidence question to get wrong), and every display that shows the ERP number
+today keeps showing it.
+
+**Rejected.** *Telling ERP-written from person-typed codes through the audit
+trail and refusing only cross-namespace collisions*: the sync's
+`vendor.synced_from_erp` row arrived well after the sync itself (#384), so
+codes written before it carry no marker, and the evidence is missing exactly
+where the data is oldest; and a collision between two person-typed codes is
+just as much a guess. *Keeping the
+entity precedence for codes*: entity-stamped person vendors and unstamped
+sync-created ones are precisely the pair that collides, so precedence would
+resolve the dangerous case silently. *Refusing a code that only one ERP-linked
+vendor holds*: a file exported from the same ERP carries that number and means
+that vendor; refusing it would break the ordinary case to guard against a
+collision that is not there.
+
+**Cost.** Two vendors that genuinely are one supplier under two subsidiaries,
+each holding the same code, now refuse code-only rows in an import scoped to
+one of them where the own-entity row used to win. The refusal names the fix,
+and `vendor_name` without a code still resolves by the name precedence. Pinned
+in `backend/tests/test_csv_import.py` (refusal per collision shape, resolution
+of a single claimant, vendor-import refusal and ERP-id dedup, and a Postgres
+test that the importers move no code or link).
