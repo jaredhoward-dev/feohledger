@@ -42,6 +42,14 @@ def _result(value):
     result = MagicMock()
     result.scalar_one_or_none = MagicMock(return_value=value)
     result.scalars.return_value.first.return_value = value
+    result.scalars.return_value.all.return_value = [] if value is None else [value]
+    return result
+
+
+def _rows(values):
+    """A fake `Result` answering several rows through `scalars().all()`."""
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = list(values)
     return result
 
 
@@ -424,13 +432,23 @@ async def test_import_invoices_dedupes_existing_invoice():
 # ---------------------------------------------------------------------------
 
 
-def _stmt_aware_db(*, vendor_by_code=None, vendor_by_name=None, invoice_existing=None):
+def _stmt_aware_db(
+    *, vendor_by_code=None, vendor_by_name=None, invoice_existing=None, code_claimants=None
+):
+    """``code_claimants`` answers the importers' by-code lookup (a vendor's code
+    or ERP record id, `_vendors_claiming_code`); it defaults to the one
+    ``vendor_by_code``."""
+    if code_claimants is None:
+        code_claimants = [] if vendor_by_code is None else [vendor_by_code]
+
     async def execute_fake(_stmt):
         s = str(_stmt).lower()
         if "invoice" in s and "invoice_number" in s:
             return _result(invoice_existing)
         if "lower(vendors.name)" in s:
             return _result(vendor_by_name)
+        if "vendors.erp_vendor_id" in s:
+            return _rows(code_claimants)
         if "vendors.code" in s:
             return _result(vendor_by_code)
         return _result(None)
@@ -445,7 +463,7 @@ def _stmt_aware_db(*, vendor_by_code=None, vendor_by_name=None, invoice_existing
 
 @pytest.mark.asyncio
 async def test_import_vendors_reuses_existing_by_code():
-    existing = MagicMock(id=uuid.uuid4(), name="Acme")
+    existing = MagicMock(id=uuid.uuid4(), name="Acme", code="V001")
     db = _stmt_aware_db(vendor_by_code=existing)
     result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,V001\n")
     assert result.skipped == 1
@@ -464,7 +482,7 @@ async def test_import_vendors_reuses_existing_by_name_when_no_code():
 
 @pytest.mark.asyncio
 async def test_import_invoices_reuses_existing_vendor_by_code():
-    vendor = MagicMock(id=uuid.uuid4(), name="Acme")
+    vendor = MagicMock(id=uuid.uuid4(), name="Acme", code="V001")
     db = _stmt_aware_db(vendor_by_code=vendor)  # invoice dedup → None, so not skipped
     csv_text = "invoice_number,vendor_name,vendor_code,amount,currency\nINV-1,Acme,V001,100,EUR\n"
     result = await import_invoices_csv(db, uuid.uuid4(), csv_text)
@@ -476,6 +494,82 @@ async def test_import_invoices_reuses_existing_vendor_by_code():
     # should have found by code.
     assert [type(o).__name__ for o in db.added] == ["Invoice", "AuditLog"]
     assert db.added[0].vendor_id == vendor.id
+
+
+# A CSV `vendor_code` names a payee only when exactly one vendor in scope
+# claims it as its code (decisions §491). The ERP sync writes its vendor
+# number into `Vendor.code`, so "one vendor's code is another vendor's ERP
+# number" is two holders of one code — refused, never settled by precedence.
+
+
+def _vendor(code, erp_vendor_id=None, name="Acme"):
+    return MagicMock(id=uuid.uuid4(), name=name, code=code, erp_vendor_id=erp_vendor_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "claimants",
+    [
+        # A person's code, and the number an ERP sync wrote onto another vendor.
+        pytest.param(lambda: [_vendor("V001"), _vendor("V001", erp_vendor_id="56")], id="code"),
+        # A person's code, and the ERP record id another vendor is linked by.
+        pytest.param(lambda: [_vendor("V001"), _vendor("BC-9", erp_vendor_id="V001")], id="erp-id"),
+        # No vendor holds it as a code; it is only an ERP record id.
+        pytest.param(lambda: [_vendor(None, erp_vendor_id="V001")], id="erp-id-only"),
+    ],
+)
+async def test_import_invoices_refuses_a_vendor_code_that_names_no_single_vendor(
+    claimants, stub_refresh_warnings
+):
+    by_name = _vendor(None, name="Acme")
+    db = _stmt_aware_db(code_claimants=claimants(), vendor_by_name=by_name)
+    csv_text = "invoice_number,vendor_name,vendor_code,amount,currency\nINV-1,Acme,V001,100,EUR\n"
+    result = await import_invoices_csv(db, uuid.uuid4(), csv_text)
+
+    assert (result.imported, result.skipped) == (0, 1)
+    # Not resolved by name, and no stub minted to share the code.
+    assert db.added == []
+    (err,) = result.to_dict()["errors"]
+    assert err["row"] == 2
+    assert (err["code"], err["params"]) == ("csv_vendor_code_ambiguous", {"value": "V001"})
+
+
+@pytest.mark.asyncio
+async def test_import_invoices_resolves_a_code_one_vendor_holds_and_is_linked_by(
+    stub_refresh_warnings,
+):
+    """One vendor holding the code as both its code and its ERP record id is
+    one claimant, not a collision."""
+    vendor = _vendor("V001", erp_vendor_id="V001")
+    db = _stmt_aware_db(code_claimants=[vendor])
+    csv_text = "invoice_number,vendor_name,vendor_code,amount,currency\nINV-1,Acme,V001,100,EUR\n"
+    result = await import_invoices_csv(db, uuid.uuid4(), csv_text)
+    assert result.imported == 1, result.to_dict()
+    assert db.added[0].vendor_id == vendor.id
+
+
+@pytest.mark.asyncio
+async def test_import_vendors_refuses_a_code_two_vendors_claim():
+    db = _stmt_aware_db(code_claimants=[_vendor("V001"), _vendor("BC-9", erp_vendor_id="V001")])
+    result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,V001\n")
+    assert (result.imported, result.skipped) == (0, 1)
+    assert db.added == []
+    (err,) = result.to_dict()["errors"]
+    assert (err["row"], err["code"], err["params"]) == (
+        2,
+        "csv_vendor_code_ambiguous",
+        {"value": "V001"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_import_vendors_dedups_on_an_erp_record_id():
+    """A file row whose code is the ERP record id an existing vendor is linked
+    by is that vendor, not a new one that would share the identifier."""
+    db = _stmt_aware_db(code_claimants=[_vendor(None, erp_vendor_id="V001", name="Other")])
+    result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,V001\n")
+    assert (result.imported, result.skipped, result.errors) == (0, 1, [])
+    assert db.added == []
 
 
 @pytest.mark.asyncio
@@ -1620,3 +1714,101 @@ async def test_an_exact_repeat_only_another_entity_holds_is_refused_not_dropped(
             )
         ).scalar_one()
     assert count == 2
+
+
+async def test_csv_vendor_code_collisions_are_refused_and_move_nothing(realdb):
+    """Against Postgres (decisions §491). Entity A holds a person-typed code
+    `ACME-1`; a shared vendor carries the same value as the number an ERP sync
+    wrote into its code; a third is linked by ERP record id `77`, which a
+    person also typed as another vendor's code. Every row naming one of those
+    codes is refused — even though entity precedence would have picked A's —
+    and no vendor's code or ERP link changes: the importer only reads codes."""
+    from sqlalchemy import select
+
+    from app.models.vendor import Vendor
+
+    org_id, entity_a, _entity_b = await _two_entities(realdb)
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        person = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="Acme Ltd",
+            code="ACME-1",
+            status="active",
+            source="manual",
+        )
+        synced = Vendor(
+            organization_id=org_id,
+            entity_id=None,
+            name="Acme Holdings",
+            code="ACME-1",
+            erp_vendor_id="guid-1",
+            status="active",
+            source="erp_sync",
+        )
+        linked = Vendor(
+            organization_id=org_id,
+            entity_id=None,
+            name="Seventy Seven",
+            code="SS",
+            erp_vendor_id="77",
+            status="active",
+            source="erp_sync",
+        )
+        typed_77 = Vendor(
+            organization_id=org_id,
+            entity_id=entity_a,
+            name="Typed Co",
+            code="77",
+            status="active",
+            source="manual",
+        )
+        s.add_all([person, synced, linked, typed_77])
+        await s.commit()
+        linked_id = linked.id
+        before = {
+            v.id: (v.code, v.erp_vendor_id)
+            for v in (
+                await s.execute(select(Vendor).where(Vendor.organization_id == org_id))
+            ).scalars()
+        }
+
+    async with mk() as s:
+        res = await import_invoices_csv(
+            s,
+            org_id,
+            "invoice_number,vendor_name,vendor_code,amount,currency,status\n"
+            "COLL-1,Acme Ltd,ACME-1,10.00,USD,new\n"
+            "COLL-2,Typed Co,77,20.00,USD,new\n"
+            "COLL-3,Seventy Seven,SS,30.00,USD,new\n",
+            entity_id=entity_a,
+            actor_id=realdb.info("a").users["ap_manager"],
+        )
+        await s.commit()
+    errors = res.to_dict()["errors"]
+    assert [(e["row"], e["code"]) for e in errors] == [
+        (2, "csv_vendor_code_ambiguous"),
+        (3, "csv_vendor_code_ambiguous"),
+    ]
+    assert res.imported == 1  # `SS` names exactly one vendor
+
+    async with mk() as s:
+        res_v = await import_vendors_csv(
+            s, org_id, "name,code\nAcme Ltd,ACME-1\nSeventy,77\n", entity_id=entity_a
+        )
+        await s.commit()
+        after = {
+            v.id: (v.code, v.erp_vendor_id)
+            for v in (
+                await s.execute(select(Vendor).where(Vendor.organization_id == org_id))
+            ).scalars()
+        }
+        coll_3 = (
+            await s.execute(select(Invoice).where(Invoice.invoice_number == "COLL-3"))
+        ).scalar_one()
+    assert (res_v.imported, res_v.skipped) == (0, 2)
+    assert [e["code"] for e in res_v.to_dict()["errors"]] == ["csv_vendor_code_ambiguous"] * 2
+    assert coll_3.vendor_id == linked_id
+    # No vendor was minted and no code or ERP link moved.
+    assert after == before
