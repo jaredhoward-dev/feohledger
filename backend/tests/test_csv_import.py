@@ -503,13 +503,16 @@ async def test_import_invoices_reuses_existing_vendor_by_code():
 
 
 def _vendor(code, erp_vendor_id=None, name="Acme"):
-    return MagicMock(
+    vendor = MagicMock(
         id=uuid.uuid4(),
-        name=name,
         code=code,
         erp_vendor_id=erp_vendor_id,
         merged_into_vendor_id=None,
     )
+    # `name` is MagicMock's own constructor argument (the mock's repr), so the
+    # attribute is set after construction.
+    vendor.name = name
+    return vendor
 
 
 @pytest.mark.asyncio
@@ -569,13 +572,41 @@ async def test_import_vendors_refuses_a_code_two_vendors_claim():
 
 
 @pytest.mark.asyncio
-async def test_import_vendors_dedups_on_an_erp_record_id():
-    """A file row whose code is the ERP record id an existing vendor is linked
-    by is that vendor, not a new one that would share the identifier."""
-    db = _stmt_aware_db(code_claimants=[_vendor(None, erp_vendor_id="V001", name="Other")])
-    result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,V001\n")
+@pytest.mark.parametrize("row_name", ["Acme Corp", "  acme CORP "])
+async def test_import_vendors_dedups_quietly_on_an_erp_record_id_of_the_same_supplier(row_name):
+    """A file row whose code is the ERP record id an existing vendor of the
+    same name is linked by is that vendor: a quiet duplicate skip, no notice."""
+    db = _stmt_aware_db(code_claimants=[_vendor(None, erp_vendor_id="V001", name="Acme Corp")])
+    result = await import_vendors_csv(db, uuid.uuid4(), f"name,code\n{row_name},V001\n")
     assert (result.imported, result.skipped, result.errors) == (0, 1, [])
     assert db.added == []
+
+
+@pytest.mark.asyncio
+async def test_import_vendors_reports_a_code_that_is_an_unrelated_vendors_erp_link():
+    """`Acme Corp,77` against "Seventy Seven" linked by ERP id 77: the row is
+    not created (it would share the link) and, not being a duplicate, it says
+    why instead of counting as a silent skip (decisions §493)."""
+    db = _stmt_aware_db(code_claimants=[_vendor(None, erp_vendor_id="77", name="Seventy Seven")])
+    result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,77\n")
+    assert (result.imported, result.skipped) == (0, 1)
+    assert db.added == []
+    (err,) = result.to_dict()["errors"]
+    assert (err["row"], err["code"], err["params"]) == (
+        2,
+        "csv_vendor_code_is_erp_link",
+        {"value": "77", "name": "Acme Corp", "vendor": "Seventy Seven"},
+    )
+    assert "Acme Corp" in err["message"] and "Seventy Seven" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_import_vendors_skips_quietly_a_code_held_as_a_code_under_another_name():
+    """A code another vendor holds as its own `code` is a true duplicate by
+    code (the existing dedup priority), whatever the row's name: no notice."""
+    db = _stmt_aware_db(code_claimants=[_vendor("77", erp_vendor_id="77", name="Seventy Seven")])
+    result = await import_vendors_csv(db, uuid.uuid4(), "name,code\nAcme Corp,77\n")
+    assert (result.imported, result.skipped, result.errors) == (0, 1, [])
 
 
 @pytest.mark.asyncio
@@ -1801,7 +1832,13 @@ async def test_csv_vendor_code_collisions_are_refused_and_move_nothing(realdb):
 
     async with mk() as s:
         res_v = await import_vendors_csv(
-            s, org_id, "name,code\nAcme Ltd,ACME-1\nSeventy,77\n", entity_id=entity_a
+            s,
+            org_id,
+            "name,code\nAcme Ltd,ACME-1\nSeventy,77\n"
+            # Only `synced`'s ERP record id: same name is a quiet duplicate,
+            # another name is reported, never minted (decisions §493).
+            "acme holdings,guid-1\nAcme Corp,guid-1\n",
+            entity_id=entity_a,
         )
         await s.commit()
         after = {
@@ -1813,8 +1850,17 @@ async def test_csv_vendor_code_collisions_are_refused_and_move_nothing(realdb):
         coll_3 = (
             await s.execute(select(Invoice).where(Invoice.invoice_number == "COLL-3"))
         ).scalar_one()
-    assert (res_v.imported, res_v.skipped) == (0, 2)
-    assert [e["code"] for e in res_v.to_dict()["errors"]] == ["csv_vendor_code_ambiguous"] * 2
+    assert (res_v.imported, res_v.skipped) == (0, 4)
+    assert [(e["row"], e["code"]) for e in res_v.to_dict()["errors"]] == [
+        (2, "csv_vendor_code_ambiguous"),
+        (3, "csv_vendor_code_ambiguous"),
+        (5, "csv_vendor_code_is_erp_link"),
+    ]
+    assert res_v.to_dict()["errors"][2]["params"] == {
+        "value": "guid-1",
+        "name": "Acme Corp",
+        "vendor": "Acme Holdings",
+    }
     assert coll_3.vendor_id == linked_id
     # No vendor was minted and no code or ERP link moved.
     assert after == before
