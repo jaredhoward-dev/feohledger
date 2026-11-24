@@ -65,9 +65,10 @@ customer takes at the provider, because deleting our copy of a credential does
 not end the access it was given.
 
 **What this does not reach** is disclosed rather than quietly omitted, because
-the DPA discloses it too: backup objects (the deploy script removes the
-per-tenant dumps; the shared control-plane dump is not selectively editable and
-ages out on the 90-day retention cycle), and any audit event already shipped to
+the DPA discloses it too: backup objects (the approval-gated `backup-erasure`
+workflow removes the per-tenant dumps, off the VM, decisions §490; the shared
+control-plane dump is not selectively editable and ages out on the 90-day
+retention cycle), and any audit event already shipped to
 a write-once archive, which cannot be deleted before its retention expires.
 """
 
@@ -102,8 +103,9 @@ class TenantNotFound(TenantDeletionError):
     """No organisation has the slug: already deleted, or never existed.
 
     Its own type because it is the one refusal a caller may treat as "nothing
-    left to do here" — ``deploy/remove-tenant.sh`` finishes the backup and Caddy
-    legs on it — where every other refusal must stop the run.
+    left to do here" — ``scripts/delete_tenant.py`` reports the removal on
+    record for it, and ``deploy/remove-tenant.sh`` stops cleanly — where every
+    other refusal must stop the run.
     """
 
 
@@ -686,7 +688,8 @@ def format_confirmation(result: TenantDeletionResult) -> str:
     lines += [
         "",
         "  Not reached by this step, as disclosed in /legal/dpa § 13:",
-        "    - per-tenant backup dumps (deploy/remove-tenant.sh removes these);",
+        "    - per-tenant backup dumps, erased within the same 60 days by a separate,",
+        "      approval-gated step (docs/decisions.md §490), confirmed when it runs;",
         "    - the shared control-plane dump, which is not selectively editable",
         "      and ages out on the ordinary backup retention cycle;",
         "    - audit events already shipped to write-once archival, which cannot",

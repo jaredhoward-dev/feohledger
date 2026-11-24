@@ -46,7 +46,12 @@ from app.models import Base
 from app.models.organization import Organization
 from app.models.user import User
 from app.models.workflow import AuditLog
-from app.models.workspace_closure import CLOSURE_COMPLETED, CLOSURE_STARTED, WorkspaceClosure
+from app.models.workspace_closure import (
+    CLOSURE_COMPLETED,
+    CLOSURE_STARTED,
+    OPERATOR_PROOF,
+    WorkspaceClosure,
+)
 from app.services import tenant_deletion, workspace_closure
 from app.services.tenant_provisioning import CONTROL_TABLES, provision_tenant
 from tests.conftest import TenantInfo
@@ -823,6 +828,208 @@ def test_the_cli_lists_owed_closures(monkeypatch, capsys):
     assert "gone-trial" in out and "2026-10-20" in out
     # An unfinished closure is surfaced to the operator, with its failure.
     assert "stuck-trial" in out and "RuntimeError" in out
+
+
+# ---------------------------------------------------------------------------
+# The erasure workflow's queue, and the operator removal that joins it (§490)
+# ---------------------------------------------------------------------------
+
+
+def test_the_overdue_mark_leaves_room_inside_the_dpa_window():
+    """The daily check fails red at this age; the DPA promises 60 days, so it
+    must fire with time left to act."""
+    assert timedelta(days=30) <= workspace_closure.ERASURE_OVERDUE_AFTER < timedelta(days=60)
+
+
+def _owed(slug: str, *, age: int = 3, blocked: str | None = None):
+    return workspace_closure.OwedErasure(
+        organization_id=uuid.uuid4(),
+        slug=slug,
+        database=f"feoh_{slug}",
+        closed_at=datetime(2026, 11, 1, tzinfo=UTC),
+        age_days=age,
+        blocked=blocked,
+    )
+
+
+def _erasure_line(out: str) -> dict:
+    import json
+
+    lines = [ln for ln in out.splitlines() if ln.startswith("FEOH_ERASURE ")]
+    assert len(lines) == 1, out
+    return json.loads(lines[0].removeprefix("FEOH_ERASURE "))
+
+
+def test_the_summary_counts_and_names_no_workspace(monkeypatch, capsys):
+    """The daily check prints this to a PUBLIC workflow log."""
+    cli = _load_cli()
+    owed = [
+        _owed("gone-trial", age=50),
+        _owed("other-trial", age=2),
+        _owed("held-slug", age=10, blocked=workspace_closure.ERASURE_BLOCKED_SLUG_IN_USE),
+    ]
+    monkeypatch.setattr(cli, "owed_backup_erasures", AsyncMock(return_value=owed))
+
+    assert cli.main(["owed", "--summary"]) == 0
+    out = capsys.readouterr().out
+    assert _erasure_line(out) == {
+        "owed": 3,
+        "ready": 2,
+        "blocked": 1,
+        "overdue": 1,
+        "oldest_age_days": 50,
+        "overdue_after_days": workspace_closure.ERASURE_OVERDUE_AFTER.days,
+    }
+    for e in owed:
+        assert e.slug not in out
+        assert str(e.organization_id) not in out
+
+
+def test_the_detail_lists_what_the_erase_job_deletes(monkeypatch, capsys):
+    cli = _load_cli()
+    owed = [_owed("gone-trial"), _owed("dbstill", blocked="database_exists")]
+    monkeypatch.setattr(cli, "owed_backup_erasures", AsyncMock(return_value=owed))
+
+    assert cli.main(["owed", "--json"]) == 0
+    listed = _erasure_line(capsys.readouterr().out)["owed"]
+    assert listed == [
+        {
+            "organization_id": str(owed[0].organization_id),
+            "slug": "gone-trial",
+            "database": "feoh_gone-trial",
+            "age_days": 3,
+            "blocked": None,
+        },
+        {
+            "organization_id": str(owed[1].organization_id),
+            "slug": "dbstill",
+            "database": "feoh_dbstill",
+            "age_days": 3,
+            "blocked": "database_exists",
+        },
+    ]
+
+
+def test_owed_needs_a_form():
+    cli = _load_cli()
+    with pytest.raises(SystemExit):
+        cli.main(["owed"])
+    with pytest.raises(SystemExit):
+        cli.main(["owed", "--summary", "--json"])
+
+
+async def test_a_closed_workspace_is_ready_for_the_erase_job(realdb, trial):
+    assert (await _close(realdb, trial["slug"])).status_code == 200
+    owed = {e.organization_id: e for e in await workspace_closure.owed_backup_erasures()}
+    entry = owed[trial["result"].organization_id]
+    assert entry.slug == trial["slug"]
+    assert entry.database == trial["result"].db_name
+    assert entry.blocked is None
+    assert entry.age_days == 0 and not entry.overdue
+
+    later = datetime.now(UTC) + workspace_closure.ERASURE_OVERDUE_AFTER
+    owed = {e.organization_id: e for e in await workspace_closure.owed_backup_erasures(later)}
+    assert owed[trial["result"].organization_id].overdue
+
+
+async def test_an_owed_erasure_whose_slug_is_live_again_is_blocked(realdb, trial):
+    """Erasing `feoh_<slug>.dump` while a live workspace holds the slug would
+    erase that workspace's backups. The hold should prevent it; if it ever
+    fails, the queue says so instead of handing the slug to the erase job."""
+    ghost = uuid.uuid4()
+    async with realdb.control_sessionmaker()() as s:
+        s.add(
+            WorkspaceClosure(
+                organization_id=ghost,
+                slug=trial["slug"],
+                step_up_proof=OPERATOR_PROOF,
+                status=CLOSURE_COMPLETED,
+                completed_at=datetime.now(UTC),
+            )
+        )
+        await s.commit()
+    try:
+        owed = {e.organization_id: e for e in await workspace_closure.owed_backup_erasures()}
+        assert owed[ghost].blocked == workspace_closure.ERASURE_BLOCKED_SLUG_IN_USE
+    finally:
+        async with realdb.control_sessionmaker()() as s:
+            await s.execute(
+                delete(WorkspaceClosure).where(WorkspaceClosure.organization_id == ghost)
+            )
+            await s.commit()
+
+
+async def test_an_operator_removal_joins_the_queue_and_holds_the_slug(realdb, trial):
+    """`scripts/delete_tenant.py`'s path: recorded before the deletion, owed
+    after it, with no invented requester."""
+    from app.utils import slug as slug_mod
+
+    org_id = trial["result"].organization_id
+    await workspace_closure.record_operator_removal_started(org_id, trial["slug"])
+    row = await _closure_row(realdb, org_id)
+    assert row.status == CLOSURE_STARTED
+    # Still live: an unfinished removal for the operator, not yet owed.
+    assert org_id in {r.organization_id for r in await workspace_closure.unfinished_closures()}
+    assert org_id not in {
+        r.organization_id for r in await workspace_closure.closures_owing_backups()
+    }
+
+    result = await tenant_deletion.delete_tenant(trial["slug"])
+    await workspace_closure.record_operator_removal_completed(org_id, result)
+
+    row = await _closure_row(realdb, org_id)
+    assert row.status == CLOSURE_COMPLETED
+    assert row.step_up_proof == OPERATOR_PROOF
+    assert row.requested_by_user_id is None and row.requested_by_roles is None
+    assert row.database_dropped is True
+    assert row.backups_cleared_at is None
+    owed = {e.organization_id: e for e in await workspace_closure.owed_backup_erasures()}
+    assert owed[org_id].blocked is None
+    async with realdb.control_sessionmaker()() as s:
+        with pytest.raises(slug_mod.SlugHeld):
+            await slug_mod.ensure_slug_available(trial["slug"], s)
+
+    assert (
+        await workspace_closure.mark_backups_cleared(org_id, operator="github-actions-run-1") == 1
+    )
+    assert org_id not in {e.organization_id for e in await workspace_closure.owed_backup_erasures()}
+
+
+async def test_an_operator_removal_with_no_backup_store_owes_nothing(realdb, trial):
+    org_id = trial["result"].organization_id
+    await workspace_closure.record_operator_removal_started(org_id, trial["slug"])
+    result = await tenant_deletion.delete_tenant(trial["slug"])
+    await workspace_closure.record_operator_removal_completed(
+        org_id, result, backups_cleared_by="no-backup-store"
+    )
+    row = await _closure_row(realdb, org_id)
+    assert row.backups_cleared_by == "no-backup-store"
+    assert row.backups_cleared_at is not None
+    assert org_id not in {
+        r.organization_id for r in await workspace_closure.closures_owing_backups()
+    }
+
+
+async def test_an_operator_finishing_a_self_service_closure_keeps_its_requester(realdb, trial):
+    org_id = trial["result"].organization_id
+    await workspace_closure._record_started(
+        org_id, trial["slug"], trial["result"].user_id, "totp", ["admin"]
+    )
+    await workspace_closure.record_operator_removal_started(org_id, trial["slug"])
+    result = await tenant_deletion.delete_tenant(trial["slug"])
+    await workspace_closure.record_operator_removal_completed(org_id, result)
+
+    row = await _closure_row(realdb, org_id)
+    assert row.status == CLOSURE_COMPLETED
+    assert row.requested_by_user_id == trial["result"].user_id
+    assert row.step_up_proof == "totp"
+
+
+async def test_the_latest_record_answers_for_a_removed_slug(realdb, trial):
+    assert await workspace_closure.latest_closure_for_slug(trial["slug"]) is None
+    assert (await _close(realdb, trial["slug"])).status_code == 200
+    record = await workspace_closure.latest_closure_for_slug(trial["slug"])
+    assert record.organization_id == trial["result"].organization_id
 
 
 async def test_guarded_tables_stay_locked_until_the_database_is_dropped(realdb, trial, monkeypatch):

@@ -68,7 +68,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, exists, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
@@ -86,6 +86,7 @@ from app.models.user import User
 from app.models.workspace_closure import (
     CLOSURE_COMPLETED,
     CLOSURE_STARTED,
+    OPERATOR_PROOF,
     WorkspaceClosure,
 )
 from app.services import audit_log_shipper, tenant_deletion
@@ -1059,12 +1060,15 @@ async def _delete(slug: str, session: AsyncSession) -> tenant_deletion.TenantDel
 
 
 async def closures_owing_backups() -> list[WorkspaceClosure]:
-    """Closures whose backup dumps an operator has not yet removed.
+    """Closures — self-service or operator removals — whose backup dumps are
+    not yet deleted.
 
     `/legal/dpa` § 13 commits to deleting a tenant's backup objects within 60
-    days; the API cannot reach the backup bucket, so each row here is owed a
-    `deploy/remove-tenant.sh <slug>` run (its backup leg works on a tenant that
-    is already gone). Oldest first — the oldest is closest to that deadline.
+    days; the API cannot reach the backup bucket and the VM may not delete from
+    it, so each row here is owed a run of the approval-gated `backup-erasure`
+    workflow (`docs/decisions.md` §490), which reads this list through
+    `owed_backup_erasures`. Oldest first — the oldest is closest to that
+    deadline.
 
     A `started` row whose organisation no longer exists is listed too: the
     completion is written in the same transaction as the control-plane delete,
@@ -1094,7 +1098,8 @@ async def closures_owing_backups() -> list[WorkspaceClosure]:
 async def unfinished_closures() -> list[WorkspaceClosure]:
     """Closures that began and have not finished while their workspace still
     exists — typically one whose database is already dropped and whose admin
-    has not retried. The operator finishes them (`deploy/remove-tenant.sh`)."""
+    has not retried. The operator finishes them (`deploy/remove-tenant.sh`, whose
+    `scripts/delete_tenant.py` then records the closure complete)."""
     org_exists = exists().where(Organization.id == WorkspaceClosure.organization_id)
     async with control_session_factory() as s:
         return list(
@@ -1136,3 +1141,159 @@ async def mark_backups_cleared(organization_id: uuid.UUID, *, operator: str) -> 
         )
         await s.commit()
         return result.rowcount or 0
+
+
+# ---------------------------------------------------------------------------
+# The erasure workflow's view of the queue (decisions §490)
+# ---------------------------------------------------------------------------
+
+#: How old an owed backup erasure may get before the daily check of the
+#: `backup-erasure` workflow fails, which emails the repository owner.
+#: `/legal/dpa` § 13 allows 60 days; 45 leaves two weeks to clear whatever is
+#: stopping the erasure.
+ERASURE_OVERDUE_AFTER = timedelta(days=45)
+
+#: An organisation with the closed workspace's slug exists again. The slug hold
+#: (`utils/slug.ensure_slug_not_held`) should make that impossible while backups
+#: are owed; if it ever happens, erasing `feoh_<slug>.dump` would erase the new
+#: tenant's backups, so the workflow refuses and a human decides.
+ERASURE_BLOCKED_SLUG_IN_USE = "slug_in_use"
+#: The tenant database still exists. The nightly backup would dump it again
+#: after the erasure, so there is nothing final to erase yet.
+ERASURE_BLOCKED_DATABASE_EXISTS = "database_exists"
+
+
+@dataclass(frozen=True)
+class OwedErasure:
+    """One closure owed a backup erasure, as the workflow needs it."""
+
+    organization_id: uuid.UUID
+    slug: str
+    #: The tenant database name, and so the dump's: `pg/<date>/<database>.dump`.
+    database: str
+    closed_at: datetime
+    age_days: int
+    #: None when the workflow may erase; else an `ERASURE_BLOCKED_*` code.
+    blocked: str | None
+
+    @property
+    def overdue(self) -> bool:
+        return self.age_days >= ERASURE_OVERDUE_AFTER.days
+
+
+async def owed_backup_erasures(now: datetime | None = None) -> list[OwedErasure]:
+    """`closures_owing_backups`, each with the dump name the workflow deletes
+    and whether it may delete it yet. Oldest first."""
+    now = now or datetime.now(UTC)
+    owed: list[OwedErasure] = []
+    for row in await closures_owing_backups():
+        database = f"{settings.tenant_db_prefix}{row.slug}"
+        async with control_session_factory() as s:
+            slug_in_use = (
+                await s.execute(select(Organization.id).where(Organization.slug == row.slug))
+            ).first() is not None
+        if slug_in_use:
+            blocked: str | None = ERASURE_BLOCKED_SLUG_IN_USE
+        elif await _database_exists(database):
+            blocked = ERASURE_BLOCKED_DATABASE_EXISTS
+        else:
+            blocked = None
+        closed_at = row.completed_at or row.started_at
+        owed.append(
+            OwedErasure(
+                organization_id=row.organization_id,
+                slug=row.slug,
+                database=database,
+                closed_at=closed_at,
+                age_days=max(0, (now - closed_at).days),
+                blocked=blocked,
+            )
+        )
+    return owed
+
+
+# ---------------------------------------------------------------------------
+# An operator removal joins the same queue (scripts/delete_tenant.py)
+# ---------------------------------------------------------------------------
+
+
+async def record_operator_removal_started(org_id: uuid.UUID, slug: str) -> None:
+    """Record an operator removal BEFORE it deletes anything, committed on its
+    own — the same reason as `_record_started`: a run that dies part-way leaves
+    a row an operator sees (`unfinished_closures`) and a re-run finishes.
+
+    A row already there is kept as it is: it is a self-service closure that
+    did not finish, and the operator is finishing it, so who asked for it stays
+    the administrator who did.
+    """
+    async with control_session_factory() as s:
+        stmt = (
+            insert(WorkspaceClosure)
+            .values(
+                id=uuid.uuid4(),
+                organization_id=org_id,
+                slug=slug,
+                requested_by_user_id=None,
+                requested_by_roles=None,
+                step_up_proof=OPERATOR_PROOF,
+                status=CLOSURE_STARTED,
+            )
+            .on_conflict_do_nothing(index_elements=[WorkspaceClosure.organization_id])
+        )
+        await s.execute(stmt)
+        await s.commit()
+
+
+async def record_operator_removal_completed(
+    org_id: uuid.UUID,
+    result: tenant_deletion.TenantDeletionResult,
+    *,
+    backups_cleared_by: str | None = None,
+) -> None:
+    """Mark the removal complete once `delete_tenant` returned.
+
+    Not in the deletion's own transaction (the CLI deletes through
+    `delete_tenant`'s), so a failure here leaves the row `started` with its
+    organisation gone — which `closures_owing_backups` still lists, so the
+    backups are owed either way.
+
+    ``backups_cleared_by`` marks the backups cleared at the same time. Only for
+    a deployment with no backup store at all (`deploy/remove-tenant.sh` without
+    `BACKUP_S3_BUCKET`), where there is nothing for the workflow to erase.
+    """
+    values: dict = {
+        "status": CLOSURE_COMPLETED,
+        "completed_at": datetime.now(UTC),
+        "documents_removed": result.objects_deleted,
+        "database_dropped": result.database_dropped,
+        "control_rows_removed": sum(result.control_rows_deleted.values()),
+        "last_failure": None,
+        "last_failure_at": None,
+    }
+    if backups_cleared_by:
+        values["backups_cleared_at"] = datetime.now(UTC)
+        values["backups_cleared_by"] = backups_cleared_by[:100]
+    async with control_session_factory() as s:
+        await s.execute(
+            update(WorkspaceClosure)
+            .where(
+                WorkspaceClosure.organization_id == org_id,
+                WorkspaceClosure.status == CLOSURE_STARTED,
+            )
+            .values(**values)
+        )
+        await s.commit()
+
+
+async def latest_closure_for_slug(slug: str) -> WorkspaceClosure | None:
+    """The most recent closure or removal recorded under ``slug``, for the
+    operator CLI to say what became of a tenant that no longer exists."""
+    async with control_session_factory() as s:
+        return (
+            await s.execute(
+                select(WorkspaceClosure)
+                .where(WorkspaceClosure.slug == slug)
+                .order_by(WorkspaceClosure.started_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
