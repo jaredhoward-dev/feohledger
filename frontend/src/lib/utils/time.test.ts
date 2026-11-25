@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { formatDate, formatDueIn, formatMonth, formatPeriod, timeAgo } from './time';
 import { setActiveFormatLocale } from '#lib/i18n/formatLocale.ts';
 
@@ -93,6 +93,59 @@ describe('formatPeriod', () => {
 	it('renders a day key (YYYY-MM-DD) with the day-of-month', () => {
 		setActiveFormatLocale('en-US');
 		expect(formatPeriod('2026-06-20')).toBe('Jun 20, 26');
+	});
+
+	// CLDR 49 (ICU 79, Node 26) added a year-elision apostrophe to English's
+	// short-year patterns; CLDR <= 48 (CI's Node 24) has none. The runtime's
+	// ICU decides which shape `formatToParts` returns, so these two cases feed
+	// each shape in explicitly and pin the assembled label for both — the
+	// tests above then hold on whichever ICU runs them.
+	const PARTS_CLDR_49: Record<string, Intl.DateTimeFormatPart[]> = {
+		month: [
+			{ type: 'month', value: 'Jun' },
+			{ type: 'literal', value: ' \u2019' },
+			{ type: 'year', value: '26' }
+		],
+		day: [
+			{ type: 'month', value: 'Jun' },
+			{ type: 'literal', value: ' ' },
+			{ type: 'day', value: '20' },
+			{ type: 'literal', value: ', \u2019' },
+			{ type: 'year', value: '26' }
+		]
+	};
+
+	it('drops the CLDR 49 year-elision apostrophe from a month key', () => {
+		setActiveFormatLocale('en-US');
+		const spy = vi
+			.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts')
+			.mockReturnValue(PARTS_CLDR_49.month);
+		try {
+			expect(formatPeriod('2026-06')).toBe('Jun 26');
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it('drops the CLDR 49 year-elision apostrophe from a day key', () => {
+		setActiveFormatLocale('en-US');
+		const spy = vi
+			.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts')
+			.mockReturnValue(PARTS_CLDR_49.day);
+		try {
+			expect(formatPeriod('2026-06-20')).toBe('Jun 20, 26');
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it('keeps every literal that does not precede the year', () => {
+		setActiveFormatLocale('pt-BR');
+		// pt-BR: "jun. de 26" — the " de " literal is the locale's own and stays.
+		expect(formatPeriod('2026-06')).toBe('jun. de 26');
+		setActiveFormatLocale('ja-JP');
+		// ja: year first, so the "年" / "月" literals follow parts, never precede the year.
+		expect(formatPeriod('2026-06')).toBe('26年6月');
 	});
 
 	it('follows the active locale', () => {
