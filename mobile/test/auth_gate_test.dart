@@ -305,9 +305,9 @@ void main() {
       expect(find.byType(LegalAcceptScreen), findsOneWidget);
 
       required = false;
-      expect(await AuthStore.instance.acceptLegalDocuments(),
-          LegalAcceptOutcome.accepted);
+      final accepting = AuthStore.instance.acceptLegalDocuments();
       await pumpFrames(tester);
+      expect(await accepting, LegalAcceptOutcome.accepted);
 
       expect(find.byType(InvoiceDetailScreen), findsOneWidget);
       expect(find.byType(LegalAcceptScreen), findsNothing);
