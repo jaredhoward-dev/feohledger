@@ -36,8 +36,19 @@
 	import { formatDate } from '#lib/utils/time.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 
 	const PAGE_SIZE = 20;
+	/** The exact instant behind a date cell, for its tooltip — formatted in the
+	 *  reader's locale, as the queue's Age / Due cells do, never the raw ISO
+	 *  string off the wire. */
+	const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
+		month: 'short',
+		day: 'numeric',
+		year: 'numeric',
+		hour: 'numeric',
+		minute: '2-digit'
+	};
 
 	let stats = $state<AgentStats | null>(null);
 	let decisions = $state<AgentDecision[]>([]);
@@ -45,6 +56,14 @@
 	let page = $state(1);
 	let loading = $state(true);
 	let loadingMore = $state(false);
+	// The decision log's OWN fetch state, apart from the mount-wide `loading`
+	// (which also covers the KPI stats). An action chip re-reads the log alone,
+	// and before these the table had no in-flight state for it, and a failed
+	// read left the previous chip's rows under the newly pressed chip (or, on
+	// mount, "No agent decisions yet" — an all-clear nobody had checked), with
+	// a toast as the only sign and no way to retry.
+	let decisionsLoading = $state(true);
+	let decisionsErrored = $state(false);
 	let actionFilter = $state<string | null>(null);
 
 	// --- The run action -------------------------------------------------------
@@ -163,6 +182,10 @@
 		const nextPage = opts.nextPage ?? 1;
 		const token = decisionsSequence.start();
 		if (opts.append) loadingMore = true;
+		else {
+			decisionsLoading = true;
+			decisionsErrored = false;
+		}
 		try {
 			const data = await getAgentDecisions({
 				actionTaken: actionFilter ?? undefined,
@@ -177,9 +200,20 @@
 		} catch {
 			// `isCurrentRequest`, not `canCommit`: only the newest request reports.
 			if (!decisionsSequence.isCurrentRequest(token)) return;
-			if (!opts.append) toast(m('exceptions.agents.logLoadFailed'), 'error');
+			// A failed first page is stated in place with a Retry (below), and
+			// the rows go with it: they belong to whatever chip was pressed
+			// before. A failed Load more keeps its rows, so only a toast says so.
+			if (opts.append) toast(m('exceptions.agents.logLoadFailed'), 'error');
+			else {
+				decisions = [];
+				total = 0;
+				decisionsErrored = true;
+			}
 		} finally {
-			if (decisionsSequence.isCurrentRequest(token)) loadingMore = false;
+			if (decisionsSequence.isCurrentRequest(token)) {
+				loadingMore = false;
+				decisionsLoading = false;
+			}
 		}
 	}
 
@@ -381,7 +415,7 @@
 			{#snippet body()}
 				{#each candidates as exc (exc.id)}
 					<tr>
-						<td class="muted-cell" title={exc.created_at}>{formatDate(exc.created_at)}</td>
+						<td class="muted-cell" title={formatDate(exc.created_at, '', DATETIME_OPTS)}>{formatDate(exc.created_at)}</td>
 						<td>{typeLabel(exc.exception_type, exc.type_label)}</td>
 						<td class="mono">{exc.invoice_number ?? '—'}</td>
 						<td class="muted-cell">{exc.vendor_name ?? '—'}</td>
@@ -434,16 +468,24 @@
 			/>
 		</header>
 
+		{#if decisionsErrored}
+			<LoadError
+				message={m('exceptions.agents.logLoadFailed')}
+				onretry={() => loadDecisions()}
+				testId="agent-log-load-error"
+			/>
+		{:else}
 		<DataTable
 			columns={COLUMNS}
-			isEmpty={decisions.length === 0 && !loading}
+			isEmpty={decisions.length === 0}
+			loading={decisionsLoading}
 			empty={m('exceptions.agents.log.empty')}
 			colspan={7}
 		>
 			{#snippet body()}
 				{#each decisions as d (d.id)}
 					<tr>
-						<td class="muted-cell" title={d.created_at}>{formatDate(d.created_at)}</td>
+						<td class="muted-cell" title={formatDate(d.created_at, '', DATETIME_OPTS)}>{formatDate(d.created_at)}</td>
 						<td class="mono">{d.agent_type}</td>
 						<td class="muted-cell">{typeLabel(d.exception_type)}</td>
 						<td>
@@ -461,6 +503,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		{/if}
 
 		<LoadMoreFooter
 			shown={decisions.length}

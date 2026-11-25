@@ -698,6 +698,14 @@
 	const erpShowSplit = $derived(spansSeveralRails(erpParts));
 	// The split is the record over any rail picked: the picker becomes a fact.
 	const erpSplitStands = $derived(erpShowSplit && resolveTarget?.erp_payment_split_stands === true);
+	/** The "record the ERP's payment" panel sits ABOVE the note in the resolve
+	 *  dialog; when it shows, the dialog opens at its start (the focus trap's
+	 *  default) rather than skipping a keyboard reader past it to the note. */
+	const erpPanelShown = $derived(
+		!!resolveTarget &&
+			isErpPaidReport(resolveTarget.erp_report) &&
+			isOffered(resolveTarget.record_erp_payment_refusal)
+	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
 
@@ -875,6 +883,20 @@
 				.filter((e) => e.decision_refusals && Object.values(e.decision_refusals).some(isAllowed))
 				.map((e) => e.id)
 		)
+	);
+
+	/**
+	 * How many rows "Select all N matching" would select: the open + escalated
+	 * rows within the current filters, which is what `GET /api/exceptions/ids`
+	 * resolves (`selectAllMatching` sends `status=open,escalated` under All).
+	 * Under the All chip that is NOT `total`: `total` counts the resolved and
+	 * dismissed rows too, so the button promised "Select all 45" and then
+	 * selected 15, and offered itself even when every selectable row was
+	 * already selected. The status tallies honour every filter but status, so
+	 * open + escalated is that set's size; null while it is unknown.
+	 */
+	let selectableMatchingCount = $derived(
+		statusFilter === 'all' ? (summary ? summary.open + summary.escalated : null) : total
 	);
 
 	let allSelected = $derived(
@@ -1142,11 +1164,11 @@
 		}}
 	>
 		{#snippet actions()}
-			{#if allSelected && !selectedAllMatching && total > selectableIds.size}
+			{#if allSelected && !selectedAllMatching && selectableMatchingCount !== null && selectableMatchingCount > selectableIds.size}
 				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total })}
+						: m('common.selectAllMatching', { total: selectableMatchingCount })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
@@ -1170,9 +1192,15 @@
 	{#if errored && exceptions.length === 0 && !loading}
 		<!-- "Could not load exceptions. Try again." used to sit in the empty row
 		     with nothing to try again WITH; the reader had to reload the page. -->
+		<!-- Retry re-reads the chip tallies too: whatever failed the list most
+		     likely failed them, and the chips and the Queue tab count stayed
+		     uncounted after a successful retry until the next filter change. -->
 		<LoadError
 			message={m('exceptions.empty.errored')}
-			onretry={() => loadExceptions()}
+			onretry={() => {
+				loadExceptions();
+				loadSummary();
+			}}
 			testId="exceptions-load-error"
 		/>
 	{:else}
@@ -1380,7 +1408,7 @@
 				{refusalNote(resolveTarget)}
 			</p>
 		{/if}
-		{#if isErpPaidReport(resolveTarget.erp_report) && isOffered(resolveTarget.record_erp_payment_refusal)}
+		{#if erpPanelShown}
 			<!-- The payment the ERP reported, pre-filled, recorded in one step.
 			     Resolving this exception and recording the payment happen in one
 			     transaction server-side, so neither can land without the other. -->
@@ -1479,7 +1507,7 @@
 					bind:value={resolutionText}
 					placeholder={m('exceptions.resolveModal.notePlaceholder')}
 					maxlength="500"
-					autofocus
+					data-autofocus={erpPanelShown ? undefined : true}
 				/>
 			</label>
 			{#if decisionRefused}
@@ -1554,7 +1582,7 @@
 				bind:value={resolutionText}
 				placeholder={m('exceptions.bulkModal.notePlaceholder')}
 				maxlength="500"
-				autofocus
+				data-autofocus
 			/>
 		</label>
 		<div class="modal-footer">
