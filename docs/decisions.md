@@ -28310,3 +28310,46 @@ the partial-reversal rule. `tests/test_payment_void_card_retry.py`: a void
 after a lapsed authorization cancels the card. `tests/test_mock_card_simulator.py`:
 `lapse=` sends the authorization then its lapse; bad / combined options are
 refused; the CLI's `--settle` / `--reverse` / `--expire` are exclusive.
+
+## 547. The admin's on-request status-sync pass runs for a stored-credential ERP that reports back (§536 / §541 follow-up, round 46)
+
+**Problem.** §536 left "check payments now" (`POST
+/api/organization/erp/oauth/status-sync`, §386) OAuth-only:
+`status_sync_now_refusal` read only `settings.erp.oauth.provider`, so a
+NetSuite tenant, reached with stored credentials and no connection block, was
+always refused `status_sync_unsupported`, even opted in (§541). Its only
+channel was the sweep, every few hours, and no e2e spec could drive a pass
+without a test-only backdoor.
+
+**Decision.** The refusal selects the tenant the way the sweep does
+(`run_status_sync_once`): by the adapter `dispatcher.resolve_adapter_key`
+names, which must be in `status_sync_adapter_keys()`. When that adapter is an
+OAuth ERP (`erp_oauth.load_providers()`), the connection block is judged
+exactly as before (`status_sync_unsupported` for a block of an ERP that does
+not report back, `status_sync_needs_reconnect`); otherwise there is no block
+to judge. Either way the last word is `reports_status_back` on the resolved
+adapter, so NetSuite's opt-in and the deployment switch decide, as for every
+other reader. RBAC (admin), audit-first, the four-an-hour limit, one pass at a
+time and the 202 are unchanged; the audit rows' `provider` falls back to
+`settings.erp.type` (`status_sync_provider`). Generic over the capability:
+another stored-credential adapter that turns `supports_status_sync` on (a
+Business Central lane is adding one) needs no change here.
+
+**Rejected.** A separate NetSuite route: the pass, its refusals and its limits
+are the same, and a second route would be a second place to keep them in
+step. Keying on "no OAuth block" rather than on the resolved adapter: an OAuth
+block survives a switch of ERP (§270), so a NetSuite tenant that once
+connected QuickBooks would have been judged by the stale block.
+
+**Not done.** The ERP panel's "Check payments now" button is still drawn only
+for an OAuth connection (`ErpConnectionPanel.svelte`), so a NetSuite admin
+reaches the pass through the API until the panel offers it.
+
+Tests: `backend/tests/test_erp_status_sync.py` (an opted-in NetSuite tenant's
+pass runs, moves the invoice, keeps the direct mark and audits `netsuite`;
+opted out, `"off"` or a stray value is `status_sync_unsupported`, and
+`status_sync_off` with the switch off; `type: netsuite` under Merge.dev is
+refused; the existing QuickBooks / Xero refusals unchanged),
+`backend/tests/test_erp_oauth.py` (the endpoint: 202 and audited for NetSuite
+opted in, 409 without the opt-in, 403 for every non-admin role).
+End to end: `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts`.
