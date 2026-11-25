@@ -3162,7 +3162,8 @@ behavioural suites cover (`test_slack_approvals`, `test_webhook_security`,
 | `POST /auth/sso/callback` | Server-minted single-use `state`, then the IdP's signed, nonce-bound ID token. |
 | `POST /auth/saml/acs`, `POST /auth/saml/exchange` | Server-minted single-use RelayState + python3-saml's signed-assertion verification; the exchange leg consumes a one-time handoff code. |
 | `POST /signup/complete` | The emailed `EmailVerification` token, taken `FOR UPDATE` and consumed so two calls can't double-provision a tenant. |
-| `POST /cards/webhook/{provider}`, `POST /erp/webhook/{erp_type}` | Per-tenant webhook signing secret (HMAC over the raw body) + Redis dedupe on the provider event id. |
+| `POST /cards/webhook/{provider}` | Per-tenant card webhook secret, checked the way each provider authenticates (Lithic Standard-Webhooks HMAC over `id.timestamp.body` + 5-minute window; Nium `x-partner-key`, which Nium documents in place of a signature; decisions §555) + Redis dedupe on the provider's delivery id (`webhook-id` / `x-request-id`). |
+| `POST /erp/webhook/{erp_type}` | Per-tenant webhook signing secret (HMAC over the raw body) + Redis dedupe on the provider event id. |
 | `POST /payments/webhook/{tenant_slug}/{provider}`, `POST /billing/webhook/{provider}` | The adapter's `parse_webhook` verifies the processor HMAC, then event-id dedupe. |
 | `POST /email-intake/inbound/{provider}` | Process-level HMAC over the raw body plus the opaque per-tenant token in the recipient address. |
 | `POST /peppol/inbound/{organization_id}` | Access Point HMAC; dedupe is the DB `uq_peppol_message_id` index. |
