@@ -597,7 +597,7 @@ live in `services/expense_preapproval_cover.py`:
 The pre-approval responses carry `drawn_amount` and `remaining_amount` (NULL
 unless approved); each expense carries `preapproval_id` /
 `preapproval_drawn_amount`. The **Pre-approvals** tab shows a Remaining column
-(with the drawn amount, or "Used up"), and a covered line a "Pre-approved" badge.
+(with the drawn amount, or "Used up"), and a covered line a muted "Pre-approved · <amount>" chip showing the drawn amount as text, in the line's currency (decisions §568).
 
 Report submit runs **one pass per entity** over its lines rather than one pass
 with a merged policy list — `evaluate_report` applies every policy handed to it

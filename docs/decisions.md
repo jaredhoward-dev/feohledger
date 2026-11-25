@@ -29826,3 +29826,25 @@ the 600 + 400 case best-fit misses; the search bound and step cap fall back to
 best-fit; FX before the draw by a spy; a pre-approval decided away between the
 candidate query and the lock covers nothing — verified to fail without the
 re-read).
+
+## 568. The pre-approval chip states its amount as text, and mobile shows the assignee note and the rescheduled date (§563 / §564 / §565 refinements, round 48)
+
+**What changed.** The round-48 UI review found three gaps in what the round had
+just shipped. §563's "Pre-approved" badge named the drawn amount only in a
+`title` on a span that cannot take focus, so keyboard, touch and screen-reader
+users could not reach it; it now reads "Pre-approved · <amount>" as text (the
+line's currency, through `formatMoney`), in the `muted` tone so the report's
+status stays the one green signal, from one shared `ui/ExpenseStatusCell.svelte`
+used by both expense tables. §564's assignee note was web-only; the phone app
+now parses `assigned_to` / `assigned_to_id` and shows the same note above the
+decision buttons, carried into their semantics hint. §565 said mobile "does not
+yet show the rescheduled from line"; it now reads `own_due_date` and shows it on
+the payment-queue tile and in the tile's semantics label.
+
+**Also.** The invoice modal's decision area shows a loading line while the
+review verdict loads, rather than the old "Assigned to X for review." text that
+then switched; the assignee note is tied to Approve and Reject through
+`aria-describedby`.
+
+§563, §564 and §565 are left as written (the log is append-only); this entry
+supersedes their statements about the badge's `title` and mobile.
