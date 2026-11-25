@@ -29,10 +29,43 @@ test.describe('partner link provisioning (admin)', () => {
 		await expect(page.getByTestId('link-code-panel')).toBeVisible();
 
 		// The dev signing key is set in .env.development.
-		await page.getByRole('button', { name: 'Generate link code' }).click();
-		const minted = page.getByTestId('minted-link-code');
-		await expect(minted).toBeVisible({ timeout: 10_000 });
-		await expect(minted.locator('.code-value')).not.toBeEmpty();
+		const generate = page.getByRole('button', { name: 'Generate link code' });
+		await generate.click();
+		// Shown once in the shared SecretReveal dialog: focus moves into it, the
+		// copy is acknowledged, and the code leaves the page on Done.
+		const dialog = page.getByRole('dialog', { name: 'New link code' });
+		await expect(dialog).toBeVisible();
+		const minted = dialog.getByTestId('minted-link-code');
+		await expect(minted).not.toBeEmpty();
+		await expect(dialog.locator(':focus')).toHaveCount(1);
+		await dialog.getByRole('button', { name: 'Done' }).click();
+		await expect(page.getByTestId('minted-link-code')).toHaveCount(0);
+		await expect(generate).toBeFocused();
+	});
+
+	test('a refused mint is stated from its code, not the server English', async ({ page }) => {
+		await page.route(
+			(url) => url.pathname === '/api/organization/partner-link-code',
+			(route) =>
+				route.fulfill({
+					status: 503,
+					json: {
+						detail: {
+							code: 'partner_linking_disabled',
+							message: 'server English',
+							params: {}
+						}
+					}
+				})
+		);
+		await page.goto('/organization?section=partner-link');
+		const generate = page.getByRole('button', { name: 'Generate link code' });
+		await generate.click();
+		const sentence =
+			'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.';
+		await expect(page.getByTestId('partner-link-failure')).toHaveText(sentence);
+		await expect(generate).toHaveAccessibleDescription(sentence);
+		await expect(page.getByTestId('minted-link-code')).toHaveCount(0);
 	});
 
 	test('a workspace that is not a partner cannot redeem a code', async ({ page }) => {
