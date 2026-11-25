@@ -1,6 +1,6 @@
 import { expectNoA11yViolations } from '../a11y/axe-helper';
 import { expect, NO_TENANT_BASE, test } from '../fixtures/helpers';
-import { captchaEvent, fillSignupForm, stubCaptcha } from './captchaStub';
+import { acceptSignupTerms, captchaEvent, fillSignupForm, stubCaptcha } from './captchaStub';
 
 /**
  * The signup form enforces the server's rules before the server has to, and
@@ -256,6 +256,7 @@ test.describe('coded refusals, read in German', () => {
 		await page.locator('#signup-slug').fill(FORM.slug);
 		await page.locator('#signup-name').fill(FORM.name);
 		await page.locator('#signup-email').fill(FORM.email);
+		await acceptSignupTerms(page);
 		await expect(page.locator('small.hint.ok')).toBeVisible();
 		const submit = page.locator('form.signup-form button[type="submit"]');
 		const send = async () => {
@@ -342,6 +343,7 @@ test.describe('coded refusals, read in German', () => {
 		await page.locator('#signup-slug').fill(FORM.slug);
 		await page.locator('#signup-name').fill(FORM.name);
 		await page.locator('#signup-email').fill(FORM.email);
+		await acceptSignupTerms(page);
 		await expect(page.locator('small.hint.ok')).toBeVisible();
 		await captchaEvent(page, 'solve', 't');
 		await page.locator('form.signup-form button[type="submit"]').click();
@@ -376,6 +378,7 @@ test.describe('coded refusals, read in German', () => {
 		await page.locator('#signup-slug').fill(FORM.slug);
 		await page.locator('#signup-name').fill(FORM.name);
 		await page.locator('#signup-email').fill(FORM.email);
+		await acceptSignupTerms(page);
 		await expect(page.locator('small.hint.ok')).toBeVisible();
 		await captchaEvent(page, 'solve', 't');
 		await page.locator('form.signup-form button[type="submit"]').click();

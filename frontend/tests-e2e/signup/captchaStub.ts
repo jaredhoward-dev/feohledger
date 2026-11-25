@@ -141,6 +141,14 @@ export async function fillSignupForm(
 	await page.getByLabel('Workspace URL').fill(slug);
 	await page.getByLabel('Your name').fill(name);
 	await page.getByLabel('Email').fill(email);
-	// The required Terms / Privacy accept box (decisions §495).
-	await page.getByRole('checkbox', { name: /I agree to the Terms of Service/ }).check();
+	await acceptSignupTerms(page);
+}
+
+/**
+ * Tick the signup form's required Terms / Privacy accept box (decisions §495).
+ * By id, so a spec running the page in another locale can use it too: every
+ * path that submits the form goes through here rather than its own click.
+ */
+export async function acceptSignupTerms(page: Page): Promise<void> {
+	await page.locator('#signup-legal-accept').check();
 }
