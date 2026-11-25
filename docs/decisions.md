@@ -29432,6 +29432,95 @@ return); `test_qbo_status_sync_adapter.py` (a re-sync with a changed amount
 posts no second BillPayment); `test_provider_credentials.py` (the `whsec_`
 refusal and the per-provider acceptance).
 
+## 563. An approved pre-approval is a budget the lines it covers draw down; submit draws under a row lock, reject hands it back, nothing is backfilled (closes the expense-management followup; round 48)
+
+**The defect.** `_approved_preapproval_amount` returned the largest approved
+estimate matching a line, and the policy engine compared it to each line on its
+own (`covered >= amount`). Since cover was scoped to the requester a colleague's
+approval could no longer be borrowed, but one employee's "500 USD, travel"
+approval still cleared the blocking `preapproval_required` on any number of
+400 USD travel lines, across any number of reports, indefinitely — the
+split-to-evade shape an approval limit exists to stop.
+
+**The product call (delegated by the operator): a running budget bounded by
+the estimate.** Not single-use: a trip is several receipts, and a single-use
+approval would refuse the second legitimate line of the very trip it approved.
+Not time-boxed: the model has no validity window, and inventing one (30 days?
+the trip dates?) needs an input nobody has entered, so an approved estimate
+stays usable until it is spent. What it may never do is cover more than it says.
+
+**Mechanism.** `expenses.preapproval_id` (FK, indexed) and
+`expenses.preapproval_drawn_amount` (`NUMERIC(15,2)`), migration 0149, tenant
+fan-out. A pre-approval's remaining balance is its `estimated_amount` minus the
+sum of those draws. A consumption table was the alternative; a line is covered
+by at most one pre-approval at a time, so two columns on the line say the same
+thing with no extra join, and a deleted line takes its draw with it. The rules
+live in one module, `services/expense_preapproval_cover.py`:
+
+- **Submit draws; nothing else does.** Report submit evaluates the lines once
+  with no cover; each line that raises `preapproval_required` is linked to one
+  pre-approval with enough left (one raised for this report first, then the
+  oldest decision) and records its whole amount as the draw. A line no balance
+  covers stays unlinked, the second evaluation raises `preapproval_required` for
+  it, and the 422 rolls back every draw the submit made, including those that
+  fit. A line is never split across two estimates: "partly pre-approved" is not
+  a state an approver can read.
+- **Which statuses consume.** Submitted and approved (and reimbursed) lines —
+  the ones a link exists on. A draft draws nothing: drawing at draft would let an
+  abandoned draft hold balance a real claim needs, and the draft's own flags are
+  advisory until submit anyway. **Report reject** returns lines to draft and
+  clears their draws in the same transaction. A line can only be deleted off an
+  unlocked report, where it no longer draws.
+- **Only lines that need cover draw.** A line under every
+  `requires_preapproval_above` is not charged to the budget. Charging every line
+  in the category would let a run of small receipts exhaust the estimate the one
+  large line needed, and refuse it. Splitting one large claim into several
+  sub-threshold lines is the threshold's own evasion, not this one, and is
+  unchanged.
+- **Concurrency.** Before reading any balance, submit locks every candidate
+  pre-approval `FOR UPDATE`, ordered by id so two submits never deadlock; the
+  drawn sums are read after the lock, so under READ COMMITTED the second of two
+  concurrent submits sees the first's committed draw. Without the lock both read
+  the same remainder and both draw it; the regression test was run with the lock
+  removed and failed three times out of three.
+- **Currency.** Unchanged and load-bearing: cover requires the pre-approval's
+  currency to equal the line's (a NULL or unusable code matches nothing, §473),
+  so the draw is in one currency and is a plain `Decimal` subtraction. No FX: a
+  line in another currency is never covered, the fail-closed answer.
+- **The advisory flags read the remaining balance.**
+  `_approved_preapproval_amount` (now delegating to `advisory_cover`) returns a
+  linked line's own draw, otherwise the largest remaining balance among its
+  candidates, so a draft written after the estimate is spent says
+  `preapproval_required` before submit. Submit re-decides under the lock; the
+  stored flag of a draft that was clean when written is not re-run when another
+  report spends the balance, which is why submit, not the flag, is the gate.
+
+**Existing lines: no backfill.** A line submitted before 0149 has no recorded
+cover. Assigning one now — by date, by category, by largest estimate — would
+either refuse a later line on a draw nobody made or absolve one with a balance
+nobody checked; the same refusal to manufacture a proxy as §141. Pre-existing
+lines draw nothing, and every approved pre-approval started 0149 with its whole
+estimate. That is the one window in which an old approval can still cover
+something an earlier report already used it for, and it closes as the estimate
+is drawn.
+
+**Surface.** Pre-approval responses carry `drawn_amount` and
+`remaining_amount` (NULL unless approved; one grouped query per list page);
+expense responses carry `preapproval_id` and `preapproval_drawn_amount`. The
+Pre-approvals tab shows a Remaining column with the drawn amount beneath it (or
+"Used up"), and a covered line a "Pre-approved" badge whose title names the
+amount, in six locales. RBAC is unchanged: no new route, no new permission.
+
+**Tests.** `backend/tests/test_expense_preapproval_drawdown.py` (a second
+400 line against a 500 estimate is refused across reports; two lines on one
+report share it and a refused submit draws nothing; reject releases and a later
+claim uses the balance; a draft written after exhaustion is flagged; a EUR line
+against a USD estimate is never covered; two concurrent submits leave exactly
+one draw; a line with no recorded draw consumes nothing; the list and a pending
+row's NULL remaining), `test_migration_0149_expense_preapproval_draw.py`,
+`frontend/src/lib/types/expense.test.ts` (`preapprovalBalance`,
+`drawsPreapproval`), `tests-e2e/expenses/preapproval-drawdown.spec.ts`.
+
 ## 564. Assignment is routing, not authority: the invoice modal offers Approve / Reject on the server's verdict alone and names the assignee in a note (followups "(c) The invoice modal still hides Approve / Reject…", round 48)
 
 **Context.** After issue #575 moved the invoice modal onto the
@@ -29488,81 +29577,6 @@ themselves, with the assignment left in place. Frontend:
 `tests-e2e/invoices/review-verdict.spec.ts` (buttons and note shown, approve
 accepted). Docs: `backend/docs/workflow-design.md` § Who Can Review,
 `docs/authentication.md` § delegation, the approve-invoices help guide.
-
-## 567. The Merge read-back sweep takes deletions from the listing and reads a long feed in narrowing windows (§540 follow-up, round 48)
-
-**Context.** The `merge-readback` sweep (§540) had two holes, tracked in
-`docs/followups.md`. (1) It learned a bill's state only from the single read
-`GET /invoices/{id}`, and dropped a 404 as "not found, not gone": so if Merge
-answers 404 for a record deleted in the ERP, the deletion reached FeohLedger
-only by the `Invoice.removed` webhook, the very channel the sweep backs up.
-(2) A feed longer than `SYNC_LISTING_MAX_ROWS` since the cursor raised
-`ErpListingIncomplete` (truncated) on every tick, so the tenant never moved
-again.
-
-**What Merge documents** (read 2026-11-25):
-
-* `remote_was_deleted` on the Invoice model: "Indicates whether or not this
-  object has been deleted in the third party platform", with full-coverage
-  deletion detection a premium add-on (https://docs.merge.dev/accounting/invoices/).
-* `include_deleted_data` is a list parameter on `GET /accounting/v1/invoices`;
-  the docs do not say whether deleted rows are left out without it, nor
-  whether a deletion moves `modified_at` (https://docs.merge.dev/openapi/accounting.json).
-* The retrieve endpoint documents only a 200; nothing says what it answers for
-  a record deleted in the ERP.
-* `modified_after` / `modified_before`: objects "synced by Merge after / before
-  this date time". `page_size` at most 100, a `next` cursor, and "all query
-  parameters, aside from `cursor` and `page_size`, [must] remain consistent
-  across pagination". No ordering of results is documented
-  (https://docs.merge.dev/basics/pagination/).
-* `{common_model}.removed` webhooks exist, and Merge says to "implement polling
-  and don't rely entirely on notification webhooks"
-  (https://docs.merge.dev/merge-unified/reading-data/webhooks/merge-webhooks.md).
-
-**Decision (1).** `MergeDevAdapter.bill_change_feed(since, until)` returns the
-feed's bills and, separately, the ones the invoice listing reports
-`remote_was_deleted` (asked with `include_deleted_data=true`, as before).
-`changed_bills` stays the base contract, the feed's `bills`. The sweep keeps
-the listed deletions in its cursor (`deleted`, beside `pending`) and still
-reads each bill first: a 200 is applied as read, so a bill restored since the
-listing is not flagged; a 404 for a bill the listing called deleted applies
-`deleted`, exactly as the webhook does for a 404 on an `Invoice.removed`
-delivery (§399); a 404 for any other bill is still not read as gone. A 404 is
-never the evidence; Merge's own `remote_was_deleted` is. Passing
-`include_deleted_data` on the single read was the alternative the follow-up
-named; it was not taken because the docs do not list it as a retrieve
-parameter, and an ignored parameter would have looked like a fix.
-
-**Decision (2).** The cursor gains `window_minutes`. A truncated listing moves
-nothing but halves the span it asked into `window_minutes` (by the same
-compare-and-swap) and ends the tenant's pass; the next tick asks
-`(since, since + window)` with `modified_before`. A completed window moves
-`through` to its end and doubles the window; the one that reaches now asks with
-no bound and drops the key. Merge documents no page order, so no part of a
-truncated listing can be kept: narrowing is the only way to make it whole. A
-window in the past is asked from its end less one second (Merge's filters are
-whole seconds), not less the overlap of §543, which covers a mark set at our
-own clock's now; the mark's listing time is kept as `listed_at` when it
-differs, and the next listing starts at the earlier of the two, so a window
-always advances. At one minute the window narrows no further and the tenant
-fails each tick, logged, as before; more than `SYNC_LISTING_MAX_ROWS` changes
-synced in one minute is a case for a person. One listing a tick, checked
-against the call budget first, as before.
-
-**Not done.** Neither behaviour has been run against a real Merge sandbox; the
-fake ERP models the open case (a 404 on retrieve for a bill the listing still
-carries deleted, set by `__set-status` `retrieve_gone`) rather than a
-documented one. The cursor's new keys are written only while they say
-something, so an existing cursor reads unchanged.
-
-**Tests.** `backend/tests/test_merge_readback_sweep.py` (a listed deletion is
-flagged when the read 404s; a listed deletion that reads open is not; a bare
-404 flags nothing; a listed deletion survives a failed read in the cursor;
-re-applying flags once; a long feed advances window by window across ticks and
-reads each bill once; a truncated listing narrows the window and moves nothing
-else; a failed window does not advance; the narrowest window fails);
-`test_merge_dev_adapter.py` (the feed's `deleted` and `modified_before`, no
-bound without `until`, a naive `until` refused before any call).
 
 ## 565. Every per-row overdue flag, date shown and aging band reads `open_ap_due`'s effective due date; a paid-out invoice is not owed (§485 follow-up, round 48)
 
@@ -29701,91 +29715,77 @@ shared), `test_adapter_contract_integrity.py`. The in-process fake loader
 moved to `tests/fake_erp_module.py` so both adapter suites use it; no fake-erp
 route was needed.
 
-## 563. An approved pre-approval is a budget the lines it covers draw down; submit draws under a row lock, reject hands it back, nothing is backfilled (closes the expense-management followup; round 48)
+## 567. The Merge read-back sweep takes deletions from the listing and reads a long feed in narrowing windows (§540 follow-up, round 48)
 
-**The defect.** `_approved_preapproval_amount` returned the largest approved
-estimate matching a line, and the policy engine compared it to each line on its
-own (`covered >= amount`). Since cover was scoped to the requester a colleague's
-approval could no longer be borrowed, but one employee's "500 USD, travel"
-approval still cleared the blocking `preapproval_required` on any number of
-400 USD travel lines, across any number of reports, indefinitely — the
-split-to-evade shape an approval limit exists to stop.
+**Context.** The `merge-readback` sweep (§540) had two holes, tracked in
+`docs/followups.md`. (1) It learned a bill's state only from the single read
+`GET /invoices/{id}`, and dropped a 404 as "not found, not gone": so if Merge
+answers 404 for a record deleted in the ERP, the deletion reached FeohLedger
+only by the `Invoice.removed` webhook, the very channel the sweep backs up.
+(2) A feed longer than `SYNC_LISTING_MAX_ROWS` since the cursor raised
+`ErpListingIncomplete` (truncated) on every tick, so the tenant never moved
+again.
 
-**The product call (delegated by the operator): a running budget bounded by
-the estimate.** Not single-use: a trip is several receipts, and a single-use
-approval would refuse the second legitimate line of the very trip it approved.
-Not time-boxed: the model has no validity window, and inventing one (30 days?
-the trip dates?) needs an input nobody has entered, so an approved estimate
-stays usable until it is spent. What it may never do is cover more than it says.
+**What Merge documents** (read 2026-11-25):
 
-**Mechanism.** `expenses.preapproval_id` (FK, indexed) and
-`expenses.preapproval_drawn_amount` (`NUMERIC(15,2)`), migration 0149, tenant
-fan-out. A pre-approval's remaining balance is its `estimated_amount` minus the
-sum of those draws. A consumption table was the alternative; a line is covered
-by at most one pre-approval at a time, so two columns on the line say the same
-thing with no extra join, and a deleted line takes its draw with it. The rules
-live in one module, `services/expense_preapproval_cover.py`:
+* `remote_was_deleted` on the Invoice model: "Indicates whether or not this
+  object has been deleted in the third party platform", with full-coverage
+  deletion detection a premium add-on (https://docs.merge.dev/accounting/invoices/).
+* `include_deleted_data` is a list parameter on `GET /accounting/v1/invoices`;
+  the docs do not say whether deleted rows are left out without it, nor
+  whether a deletion moves `modified_at` (https://docs.merge.dev/openapi/accounting.json).
+* The retrieve endpoint documents only a 200; nothing says what it answers for
+  a record deleted in the ERP.
+* `modified_after` / `modified_before`: objects "synced by Merge after / before
+  this date time". `page_size` at most 100, a `next` cursor, and "all query
+  parameters, aside from `cursor` and `page_size`, [must] remain consistent
+  across pagination". No ordering of results is documented
+  (https://docs.merge.dev/basics/pagination/).
+* `{common_model}.removed` webhooks exist, and Merge says to "implement polling
+  and don't rely entirely on notification webhooks"
+  (https://docs.merge.dev/merge-unified/reading-data/webhooks/merge-webhooks.md).
 
-- **Submit draws; nothing else does.** Report submit evaluates the lines once
-  with no cover; each line that raises `preapproval_required` is linked to one
-  pre-approval with enough left (one raised for this report first, then the
-  oldest decision) and records its whole amount as the draw. A line no balance
-  covers stays unlinked, the second evaluation raises `preapproval_required` for
-  it, and the 422 rolls back every draw the submit made, including those that
-  fit. A line is never split across two estimates: "partly pre-approved" is not
-  a state an approver can read.
-- **Which statuses consume.** Submitted and approved (and reimbursed) lines —
-  the ones a link exists on. A draft draws nothing: drawing at draft would let an
-  abandoned draft hold balance a real claim needs, and the draft's own flags are
-  advisory until submit anyway. **Report reject** returns lines to draft and
-  clears their draws in the same transaction. A line can only be deleted off an
-  unlocked report, where it no longer draws.
-- **Only lines that need cover draw.** A line under every
-  `requires_preapproval_above` is not charged to the budget. Charging every line
-  in the category would let a run of small receipts exhaust the estimate the one
-  large line needed, and refuse it. Splitting one large claim into several
-  sub-threshold lines is the threshold's own evasion, not this one, and is
-  unchanged.
-- **Concurrency.** Before reading any balance, submit locks every candidate
-  pre-approval `FOR UPDATE`, ordered by id so two submits never deadlock; the
-  drawn sums are read after the lock, so under READ COMMITTED the second of two
-  concurrent submits sees the first's committed draw. Without the lock both read
-  the same remainder and both draw it; the regression test was run with the lock
-  removed and failed three times out of three.
-- **Currency.** Unchanged and load-bearing: cover requires the pre-approval's
-  currency to equal the line's (a NULL or unusable code matches nothing, §473),
-  so the draw is in one currency and is a plain `Decimal` subtraction. No FX: a
-  line in another currency is never covered, the fail-closed answer.
-- **The advisory flags read the remaining balance.**
-  `_approved_preapproval_amount` (now delegating to `advisory_cover`) returns a
-  linked line's own draw, otherwise the largest remaining balance among its
-  candidates, so a draft written after the estimate is spent says
-  `preapproval_required` before submit. Submit re-decides under the lock; the
-  stored flag of a draft that was clean when written is not re-run when another
-  report spends the balance, which is why submit, not the flag, is the gate.
+**Decision (1).** `MergeDevAdapter.bill_change_feed(since, until)` returns the
+feed's bills and, separately, the ones the invoice listing reports
+`remote_was_deleted` (asked with `include_deleted_data=true`, as before).
+`changed_bills` stays the base contract, the feed's `bills`. The sweep keeps
+the listed deletions in its cursor (`deleted`, beside `pending`) and still
+reads each bill first: a 200 is applied as read, so a bill restored since the
+listing is not flagged; a 404 for a bill the listing called deleted applies
+`deleted`, exactly as the webhook does for a 404 on an `Invoice.removed`
+delivery (§399); a 404 for any other bill is still not read as gone. A 404 is
+never the evidence; Merge's own `remote_was_deleted` is. Passing
+`include_deleted_data` on the single read was the alternative the follow-up
+named; it was not taken because the docs do not list it as a retrieve
+parameter, and an ignored parameter would have looked like a fix.
 
-**Existing lines: no backfill.** A line submitted before 0149 has no recorded
-cover. Assigning one now — by date, by category, by largest estimate — would
-either refuse a later line on a draw nobody made or absolve one with a balance
-nobody checked; the same refusal to manufacture a proxy as §141. Pre-existing
-lines draw nothing, and every approved pre-approval started 0149 with its whole
-estimate. That is the one window in which an old approval can still cover
-something an earlier report already used it for, and it closes as the estimate
-is drawn.
+**Decision (2).** The cursor gains `window_minutes`. A truncated listing moves
+nothing but halves the span it asked into `window_minutes` (by the same
+compare-and-swap) and ends the tenant's pass; the next tick asks
+`(since, since + window)` with `modified_before`. A completed window moves
+`through` to its end and doubles the window; the one that reaches now asks with
+no bound and drops the key. Merge documents no page order, so no part of a
+truncated listing can be kept: narrowing is the only way to make it whole. A
+window in the past is asked from its end less one second (Merge's filters are
+whole seconds), not less the overlap of §543, which covers a mark set at our
+own clock's now; the mark's listing time is kept as `listed_at` when it
+differs, and the next listing starts at the earlier of the two, so a window
+always advances. At one minute the window narrows no further and the tenant
+fails each tick, logged, as before; more than `SYNC_LISTING_MAX_ROWS` changes
+synced in one minute is a case for a person. One listing a tick, checked
+against the call budget first, as before.
 
-**Surface.** Pre-approval responses carry `drawn_amount` and
-`remaining_amount` (NULL unless approved; one grouped query per list page);
-expense responses carry `preapproval_id` and `preapproval_drawn_amount`. The
-Pre-approvals tab shows a Remaining column with the drawn amount beneath it (or
-"Used up"), and a covered line a "Pre-approved" badge whose title names the
-amount, in six locales. RBAC is unchanged: no new route, no new permission.
+**Not done.** Neither behaviour has been run against a real Merge sandbox; the
+fake ERP models the open case (a 404 on retrieve for a bill the listing still
+carries deleted, set by `__set-status` `retrieve_gone`) rather than a
+documented one. The cursor's new keys are written only while they say
+something, so an existing cursor reads unchanged.
 
-**Tests.** `backend/tests/test_expense_preapproval_drawdown.py` (a second
-400 line against a 500 estimate is refused across reports; two lines on one
-report share it and a refused submit draws nothing; reject releases and a later
-claim uses the balance; a draft written after exhaustion is flagged; a EUR line
-against a USD estimate is never covered; two concurrent submits leave exactly
-one draw; a line with no recorded draw consumes nothing; the list and a pending
-row's NULL remaining), `test_migration_0149_expense_preapproval_draw.py`,
-`frontend/src/lib/types/expense.test.ts` (`preapprovalBalance`,
-`drawsPreapproval`), `tests-e2e/expenses/preapproval-drawdown.spec.ts`.
+**Tests.** `backend/tests/test_merge_readback_sweep.py` (a listed deletion is
+flagged when the read 404s; a listed deletion that reads open is not; a bare
+404 flags nothing; a listed deletion survives a failed read in the cursor;
+re-applying flags once; a long feed advances window by window across ticks and
+reads each bill once; a truncated listing narrows the window and moves nothing
+else; a failed window does not advance; the narrowest window fails);
+`test_merge_dev_adapter.py` (the feed's `deleted` and `modified_before`, no
+bound without `until`, a naive `until` refused before any call).
