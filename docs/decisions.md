@@ -28431,3 +28431,46 @@ unique ids and catalogued events; the spec carries it unchanged with
 catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
 example whose `data` keys are its model's fields; the report's filter picks
 only affected subscriptions and the types they lack.
+
+## 549. "Check payments now" is drawn for a stored-credential ERP by the status read's verdict; a refusal hides it (§547 follow-up, round 46)
+
+**Problem.** §547 let an opted-in NetSuite tenant run the on-request pass,
+but the ERP panel drew the button only for a live OAuth connection, and
+`GET /api/organization/erp/oauth/status` answered a tenant with no connection
+block before reading the verdict, so `status_sync_available` was always false
+for it. A NetSuite admin reached the pass only through the API.
+
+**Decision.** The status read computes `status_sync_now_refusal` once and
+states it in both branches, so the verdict is the tenant's, not the
+connection's (an OAuth ERP without a block reads `status_sync_unsupported`,
+which the panel never showed, since it requires a live connection). The panel
+draws **Check payments now** for a non-OAuth ERP when
+`storedErpStatusSyncNowOffered` holds: the selected ERP is the one the saved
+configuration names (an unsaved dropdown choice is not what the pass reads)
+and the server says available. The status is re-read after every save, not
+only an OAuth one, so turning NetSuite's opt-in on draws the button. The
+POST, its RBAC (admin; a non-admin sees the admin-only hint and no read),
+codes, audit and limit are unchanged.
+
+**A refusal hides the button rather than disabling it beside a
+`RefusalNote`.** The OAuth panel already hides it on every refusal, and the
+two codes a stored-credential ERP can get, `status_sync_off` (the
+deployment switch) and `status_sync_unsupported` (an ERP that does not
+report back, or NetSuite without its opt-in), are configuration states no
+click resolves. A disabled button with "does not report its bills' payments
+back" on every Sage Intacct or Business Central panel would be noise, and the
+code does not distinguish "NetSuite, opted out" from "cannot", so a sentence
+pointing at the opt-in would have to restate the rule in the browser.
+
+**The e2e spec's rate limit.** The on-request pass is limited to four an
+hour per tenant, and `netsuite-status-sync.spec.ts` runs two. CI's `erp-e2e`
+job, like every e2e job, runs with `FEOH_RATE_LIMIT_ENABLED=false`, which
+`frontend/tests-e2e/README.md` requires locally too, so a retry or re-run is
+never answered 429; the spec now says so, and names that switch if it does
+meet a 429. Raising the limit, or adding a test-only limiter reset, was not
+needed. The spec starts each pass with the panel's button.
+
+Tests: `backend/tests/test_erp_oauth.py` (the verdict with no connection
+block: available opted in, `status_sync_unsupported` opted out,
+`status_sync_off` with the switch off), `frontend/src/lib/types/erpConnection.test.ts`
+(`storedErpStatusSyncNowOffered`), `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts`.
