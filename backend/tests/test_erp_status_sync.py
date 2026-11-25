@@ -2527,3 +2527,54 @@ async def test_an_erp_sourced_record_is_not_held_by_a_kept_split(realdb):
     assert recorded.created
     [booked] = await _payments(realdb, inv_id)
     assert booked.amount == Decimal("250.00") and booked.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# a flag is deduplicated by its kind, never by its type alone (decisions §535)
+# ---------------------------------------------------------------------------
+
+
+async def _unrelated_live_row(realdb, inv_id, exception_type: str, kind: str) -> uuid.UUID:
+    exc_id = uuid.uuid4()
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            APException(
+                id=exc_id,
+                organization_id=realdb.info("a").org_id,
+                invoice_id=inv_id,
+                exception_type=exception_type,
+                severity="error",
+                status="open",
+                description="Another report.",
+                erp_report={"kind": kind},
+            )
+        )
+        await s.commit()
+    return exc_id
+
+
+async def test_paid_twice_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    """A leftover write-back flag of the same type does not stand in for
+    "the supplier was paid twice": the report would never come again."""
+    inv_id, corr = await _seed(realdb, status=InvoiceStatus.paid)
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            Payment(
+                invoice_id=inv_id,
+                amount=Decimal("250.00"),
+                method="ach",
+                status="completed",
+                provider="mock",
+            )
+        )
+        await s.commit()
+    await _unrelated_live_row(realdb, inv_id, "erp_reconciliation", "payment_writeback_failed")
+
+    report = _report(corr, ErpBillState.paid, external_payment_ids=("9",))
+    assert (await _apply(realdb, report)).action == "double_payment_flagged"
+    codes = sorted(r.description_code or "" for r in await _exceptions(realdb, inv_id))
+    assert codes == ["", "exception.erp_paid_twice"]
+
+    # The same report again (the sweep re-reads the bill) is one row of its kind.
+    await _apply(realdb, report)
+    assert len(await _exceptions(realdb, inv_id)) == 2

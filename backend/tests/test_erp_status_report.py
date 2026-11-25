@@ -10,8 +10,8 @@ on real Postgres, apart from either channel:
 * a void after posting opens one `erp_reconciliation` row, not a transition;
 * `payment_scheduled` + `paid`: moves only over a completed payment that
   covers the invoice; a short settlement is held (settled-short row); no
-  completed payment — ours still in flight, or a live card — is held behind
-  one blocking `payment_reconciliation` (decisions §533);
+  completed payment — ours still in flight, or none on file — is held behind
+  one blocking `payment_reconciliation` (decisions §533, §535);
 * every flag is deduplicated by its kind: a live row of the same kind
   suppresses it (and the outcome is `NOOP`, so nothing is counted or
   committed), an unrelated live row of the same type never does (§533);
@@ -294,17 +294,26 @@ async def test_paid_over_a_short_settlement_is_held_once(realdb):
     assert len(await _exceptions(realdb, inv_id)) == 1
 
 
-@pytest.mark.parametrize("claim", ["none", "pending", "processing", "live_card"])
+@pytest.mark.parametrize("claim", ["none", "pending", "processing", "card_row_no_payment"])
 async def test_paid_with_no_completed_payment_is_held_behind_a_blocking_row(realdb, claim):
-    """Our rail payment has not completed (or a live card holds the invoice, or
-    nothing at all is on file), yet the ERP shows the bill paid: paid there by
-    someone else. Moving to `paid` would hide the double payment."""
+    """Our rail payment has not completed (or nothing at all is on file), yet
+    the ERP shows the bill paid. Moving to `paid` would hide a possible double
+    payment, so it is held.
+
+    The hold keys on "no completed `Payment`" alone. `card_row_no_payment`
+    pins only that an active `VirtualCard` row, which books no `Payment`,
+    does not change that: the outcome is the same with or without the card,
+    so this case does NOT show the card is recognised as a claim. Neither real
+    card shape reaches this branch (decisions §535): a `/cards/generate` card
+    leaves the invoice `approved` / `posted_in_erp`, where an ERP `paid` is
+    refused `external_payment_card_live`; a run's card leg books a completed
+    `Payment` with no `settled_amount`, which coverage treats as covering."""
     from app.models.virtual_card import VirtualCard
 
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
     if claim in ("pending", "processing"):
         await _payment(realdb, inv_id, status=claim)
-    elif claim == "live_card":
+    elif claim == "card_row_no_payment":
         async with realdb.sessionmaker(TENANT)() as s:
             s.add(
                 VirtualCard(
@@ -324,7 +333,7 @@ async def test_paid_with_no_completed_payment_is_held_behind_a_blocking_row(real
     assert await _erp_status_rows(realdb, inv_id) == []
     [exc] = await _exceptions(realdb, inv_id)
     assert exc.exception_type == "payment_reconciliation"
-    assert exc.description_code == "exception.erp_paid_while_scheduled"
+    assert exc.description_code == "exception.erp_paid_while_payment_in_flight"
     assert exc.raised_by_user_id is None
     assert exc.erp_report["kind"] == "paid_while_scheduled"
     assert await _blocked(realdb, inv_id)

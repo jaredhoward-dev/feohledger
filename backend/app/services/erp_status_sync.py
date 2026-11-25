@@ -265,22 +265,21 @@ async def open_erp_reconciliation_exception(
     org_id,
     finding: dict,
     exception_type: str = ERP_RECONCILIATION_EXCEPTION_TYPE,
-    erp_report: dict | None = None,
-    same_kind: bool = False,
+    erp_report: dict,
 ) -> bool:
     """Open ONE reconciliation exception for human review, PII-free.
 
-    **Idempotent**: skipped when an open or escalated exception of the same type
-    already exists for the invoice, so distinct ERP events (or a webhook and the
-    sweep reporting the same change) never pile up duplicates. Returns whether
-    one was opened.
+    **Idempotent by kind**: skipped only while an open or escalated exception
+    of the same type AND the same ``erp_report["kind"]`` exists for the
+    invoice, so a repeated report of one fact (a webhook redelivery, the sweep
+    and a webhook reporting the same change, a retried leg) never piles up
+    duplicates. Returns whether one was opened.
 
-    With ``same_kind`` only a live row of the same type AND the same
-    ``erp_report["kind"]`` skips it (decisions §533). The generic webhook and
-    the status polling sweep report each change once (an event id, a recorded
-    read), so a report swallowed by an UNRELATED live row of the same type is
-    never repeated: once a person resolves that row, nothing would block the
-    run for the fact this report carried.
+    Never by type alone (decisions §533, §535): most reports come once (an
+    event id, a recorded read, a write-back that fails once per payment), so
+    one swallowed by an UNRELATED live row of the same type is never repeated —
+    once a person resolves that row, nothing would block the run, or tell
+    anyone, for the fact this report carried. Every caller states a kind.
 
     A ``paid_not_recorded`` report goes through :func:`_keep_erp_paid_report`
     instead, which keeps at most ONE live such row per invoice and refreshes it.
@@ -293,7 +292,8 @@ async def open_erp_reconciliation_exception(
     machine detail, as data (decisions §319). Every caller passes a catalogue
     finding, the QuickBooks write-back's included (``erp_payment_writeback``).
     """
-    if (erp_report or {}).get("kind") == ERP_REPORT_PAID_NOT_RECORDED:
+    kind = erp_report["kind"]
+    if kind == ERP_REPORT_PAID_NOT_RECORDED:
         return await _keep_erp_paid_report(
             db,
             invoice,
@@ -302,8 +302,7 @@ async def open_erp_reconciliation_exception(
             exception_type=exception_type,
             erp_report=erp_report,
         )
-    kind = (erp_report or {}).get("kind") if same_kind else None
-    if await _live_of_type(db, invoice.id, exception_type, kind=kind):
+    if await live_erp_report_of_kind(db, invoice.id, exception_type, kind):
         return False
     await _create_reconciliation(
         db,
@@ -316,19 +315,20 @@ async def open_erp_reconciliation_exception(
     return True
 
 
-async def _live_of_type(
-    db: AsyncSession, invoice_id: uuid.UUID, exception_type: str, *, kind: str | None = None
+async def live_erp_report_of_kind(
+    db: AsyncSession, invoice_id: uuid.UUID, exception_type: str, kind: str
 ) -> bool:
-    """Is an open or escalated exception of ``exception_type`` live on the
-    invoice — of that ``erp_report["kind"]`` too, when one is given?"""
-    query = select(func.count()).where(
-        APException.invoice_id == invoice_id,
-        APException.exception_type == exception_type,
-        APException.status.in_(("open", "escalated")),
+    """Is an open or escalated exception of ``exception_type`` AND
+    ``erp_report["kind"]`` live on the invoice? The one dedupe rule for ERP
+    reconciliation rows (decisions §533, §535)."""
+    existing = await db.execute(
+        select(func.count()).where(
+            APException.invoice_id == invoice_id,
+            APException.exception_type == exception_type,
+            APException.status.in_(("open", "escalated")),
+            APException.erp_report["kind"].astext == kind,
+        )
     )
-    if kind is not None:
-        query = query.where(APException.erp_report["kind"].astext == kind)
-    existing = await db.execute(query)
     return (existing.scalar() or 0) > 0
 
 
@@ -377,10 +377,10 @@ async def _keep_erp_paid_report(
       is refused BY it (its own type blocks the record), which says nothing new
       about why, so its refusal and sentence stand unless the new refusal is
       itself a double-pay one; its payment facts are refreshed.
-    * A new double-pay refusal over a live non-blocking row opens the blocking
-      row — the run must stop — and closes the non-blocking one as superseded.
-      If an older blocker of that type with no ERP facts is already open, the
-      run is stopped anyway: the non-blocking row is refreshed instead.
+    * A new double-pay refusal opens the blocking row — the run must stop —
+      and closes any live non-blocking one as superseded. An unrelated live
+      blocker of that type never stands in for it: once a person resolves
+      that row for its own fact, the run would be free to pay (§535).
     * Otherwise the live non-blocking row is refreshed, or a row is opened.
 
     Two live rows would each offer to record the same payment, and a stale one
@@ -400,7 +400,7 @@ async def _keep_erp_paid_report(
             _set_finding(row, finding)
         await _supersede(db, invoice, others)
         return False
-    if new_blocking and not await _live_of_type(db, invoice.id, exception_type):
+    if new_blocking:
         await _supersede(db, invoice, others)
         await _create_reconciliation(
             db,
@@ -417,16 +417,14 @@ async def _keep_erp_paid_report(
         _set_finding(row, finding)
         await _supersede(db, invoice, others[1:])
         return False
-    # The facts ride a row of their own, never swallowed by the per-type dedupe
-    # other ERP rows use. Non-blocking even for a double-pay refusal here: we
-    # only reach this with one when a blocker of that type is already open,
-    # which stops the run on its own.
+    # The facts ride a row of their own, never swallowed by an unrelated row
+    # of the same type. Only a non-blocking refusal reaches here.
     await _create_reconciliation(
         db,
         invoice,
         org_id=org_id,
         finding=finding,
-        exception_type=ERP_RECONCILIATION_EXCEPTION_TYPE,
+        exception_type=exception_type,
         erp_report=erp_report,
     )
     return True
@@ -1010,7 +1008,8 @@ async def hold_unconfirmed_erp_payment(
     and nothing may book it at FeohLedger's own figure. Through
     :func:`open_erp_reconciliation_exception`, so a live non-blocking row is
     closed as superseded and its facts ride the blocking one (or, when an
-    older blocker of that type is already open, it is refreshed in place).
+    older blocking ``paid_not_recorded`` row is already open, it is refreshed
+    in place).
     The sentence says the record did not happen automatically and points at
     the one-click record, which reads the bill again.
     """

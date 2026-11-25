@@ -56,17 +56,17 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import settings
 from app.database import _make_tenant_url
 from app.db_engine import create_async_engine
-from app.models.exception import Exception as APException
 from app.models.invoice import Invoice
 from app.models.organization import Organization
 from app.models.payment import Payment
 from app.services.credential_crypto import CredentialCryptoError
+from app.services.erp_status_sync import live_erp_report_of_kind
 from app.services.exception_service import create_exception
 from app.services.invoice_warning_catalog import exception_finding
 from app.services.payment_settlement import settlement_coverage
@@ -529,9 +529,11 @@ async def _flag_sync_failure(
     sync, so without a row the strand is invisible forever. Best-effort — a
     flagging failure must not stop the remaining legs from syncing.
 
-    **De-duped** on an already-open/escalated ``erp_reconciliation`` for the
-    invoice, so a repeated retry doesn't pile up rows (and so an ERP-void
-    reconciliation raised by ``api/erp_webhook`` isn't duplicated either).
+    **De-duped by kind** on an already-open/escalated ``erp_reconciliation``
+    carrying ``erp_report.kind`` ``payment_sync_back_failed``, so a repeated
+    retry doesn't pile up rows — but an unrelated live row of that type (an
+    ERP void raised by ``api/erp_webhook``, a void write-back failure) never
+    swallows it: each is a different fact a person must clear (§535).
 
     **PII-free**: the sentence is a catalogue code for an AP user
     (``exception.erp_sync_back_failed``); the payment and run ids, the failure's
@@ -545,16 +547,12 @@ async def _flag_sync_failure(
         if invoice_id is None:
             return
 
-        existing = (
-            await db.execute(
-                select(func.count()).where(
-                    APException.invoice_id == invoice_id,
-                    APException.exception_type == ERP_SYNC_FAILURE_EXCEPTION_TYPE,
-                    APException.status.in_(("open", "escalated")),
-                )
-            )
-        ).scalar() or 0
-        if existing:
+        # The one ERP dedupe rule: a live row of this KIND, never any row of
+        # the type, so an unrelated live `erp_reconciliation` (a void
+        # write-back, an ERP void) never swallows the strand (§535).
+        if await live_erp_report_of_kind(
+            db, invoice_id, ERP_SYNC_FAILURE_EXCEPTION_TYPE, ERP_REPORT_SYNC_BACK_FAILED
+        ):
             return
 
         invoice = await db.get(Invoice, invoice_id)

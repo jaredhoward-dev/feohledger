@@ -549,9 +549,10 @@ async def test_scheduled_to_paid_is_held_while_our_payment_is_in_flight(fake_red
     """`payment_scheduled → paid` is a canonical edge, but with NO completed
     payment on file the ERP's `paid` is not ours: `payment_erp_sync` writes
     nothing back to a generic ERP, so the bill was paid there while our rail
-    payment (or a live card) is still in flight. Moving to `paid` would hide
-    the double payment, so the invoice is held behind ONE blocking
-    `payment_reconciliation` exception and not transitioned (decisions §533)."""
+    payment is still in flight. Moving to `paid` could hide a double payment,
+    so the invoice is held behind ONE blocking `payment_reconciliation`
+    exception and not transitioned (decisions §533), in words that never tell
+    anyone to void a payment the route cannot attribute (§535)."""
     from app.models.exception import Exception as APException
     from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
 
@@ -575,7 +576,7 @@ async def test_scheduled_to_paid_is_held_while_our_payment_is_in_flight(fake_red
     exc = added[0]
     assert exc.exception_type == "payment_reconciliation"
     assert exc.exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES
-    assert exc.description_code == "exception.erp_paid_while_scheduled"
+    assert exc.description_code == "exception.erp_paid_while_payment_in_flight"
     assert exc.erp_report == {
         "kind": "paid_while_scheduled",
         "erp_type": "generic",

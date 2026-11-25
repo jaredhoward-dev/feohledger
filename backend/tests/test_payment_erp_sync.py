@@ -551,6 +551,40 @@ async def test_failed_leg_exception_is_deduped_across_retries(realdb):
     assert len(rows) == 1
 
 
+async def test_failed_leg_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    """The dedupe is by kind (decisions §535): an unrelated live
+    `erp_reconciliation` (a void write-back that failed earlier) does not
+    stand in for the strand — nothing re-invokes this sync, so a swallowed
+    strand is invisible once that row is resolved."""
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id = await _seed_run(realdb, "a")
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            APException(
+                organization_id=realdb.info("a").org_id,
+                invoice_id=invoice_id,
+                exception_type="erp_reconciliation",
+                severity="error",
+                status="open",
+                description="Another report.",
+                erp_report={"kind": "payment_void_writeback_failed"},
+            )
+        )
+        await s.commit()
+
+    with patch(
+        "app.services.workflow_engine.transition_invoice",
+        AsyncMock(side_effect=RuntimeError("erp exploded")),
+    ):
+        await _sync_payments(run_id, realdb.info("a").org_id)
+
+    rows = await _open_erp_reconciliation_rows(realdb, "a", invoice_id)
+    assert sorted(r.erp_report["kind"] for r in rows) == [
+        "payment_sync_back_failed",
+        "payment_void_writeback_failed",
+    ]
+
+
 async def test_failed_leg_does_not_discard_a_sibling_leg_that_already_synced(realdb):
     """Regression: one failing leg used to roll back the WHOLE run.
 

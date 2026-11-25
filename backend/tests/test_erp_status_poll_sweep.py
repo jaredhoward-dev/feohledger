@@ -13,7 +13,7 @@ connection names none and is polled for nothing, §533):
   action, marked `source: poll`; a missed `paid` on a scheduled payment moves
   it to `paid` only when our payment completed and covers it, holds behind the
   settled-short exception when it settled short, and holds behind a blocking
-  `erp_paid_while_scheduled` exception while it is still in flight (§533);
+  `erp_paid_while_payment_in_flight` exception while it is still in flight (§533);
 * an unchanged status writes nothing to the trail, and a void after posting
   opens one exception that a later tick does not re-open after it is resolved;
 * a bill the ERP shows settled with no payment behind it (§303), or part paid
@@ -306,15 +306,16 @@ async def test_a_missed_paid_over_a_short_settlement_is_held(realdb, erp_reads):
     assert exc.erp_report["shortfall"] == "234.56"
 
 
-@pytest.mark.parametrize("claim", ["payment_in_flight", "live_card"])
+@pytest.mark.parametrize("claim", ["payment_in_flight", "card_row_no_payment"])
 async def test_a_paid_read_while_our_payment_is_in_flight_is_held_and_blocked(
     realdb, erp_reads, claim
 ):
-    """The ERP shows the bill paid while FeohLedger's own payment (or a live
-    virtual card, which books no `Payment`) has not completed: someone paid it
-    in the ERP, and our rail is paying it too. Never moved to `paid` — that
-    would hide the double payment — but held behind a blocking exception
-    (decisions §533)."""
+    """The ERP shows the bill paid while no FeohLedger payment has completed.
+    Never moved to `paid` — that could hide a double payment — but held behind
+    a blocking exception (decisions §533). The hold keys on "no completed
+    `Payment`" alone: `card_row_no_payment` pins only that an active card row
+    (which books no `Payment`) does not change that, not that the card is
+    recognised as a claim (§535)."""
     from app.models.virtual_card import VirtualCard
     from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
     from app.services.payment_runs import blocked_invoice_ids
@@ -324,7 +325,7 @@ async def test_a_paid_read_while_our_payment_is_in_flight_is_held_and_blocked(
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
     if claim == "payment_in_flight":
         await _payment(realdb, inv_id, status="processing")
-    else:
+    else:  # card_row_no_payment
         async with realdb.sessionmaker(TENANT)() as s:
             s.add(
                 VirtualCard(
@@ -349,7 +350,7 @@ async def test_a_paid_read_while_our_payment_is_in_flight_is_held_and_blocked(
     [exc] = await _exceptions(realdb, inv_id)
     assert exc.exception_type == "payment_reconciliation"
     assert exc.exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES
-    assert exc.description_code == "exception.erp_paid_while_scheduled"
+    assert exc.description_code == "exception.erp_paid_while_payment_in_flight"
     assert exc.raised_by_user_id is None
     assert exc.erp_report == {
         "kind": "paid_while_scheduled",
@@ -841,10 +842,97 @@ async def test_a_bill_pushed_before_the_erp_went_live_is_not_polled(realdb, erp_
     assert asked == [] and result.invoices_polled == 0
 
 
+async def _card(realdb, inv_id) -> None:
+    from app.models.virtual_card import VirtualCard
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        s.add(
+            VirtualCard(
+                invoice_id=inv_id,
+                organization_id=realdb.info(TENANT).org_id,
+                card_provider="mock",
+                provider_card_id=f"card-{inv_id.hex[:8]}",
+                amount_limit=Decimal("1234.56"),
+                currency="USD",
+                status="active",
+            )
+        )
+        await s.commit()
+
+
+async def test_a_paid_read_for_a_voided_back_approved_invoice_is_recorded(realdb, erp_reads):
+    """A payment void returns the invoice to `approved` with its ERP bill and
+    realm intact. The ERP then shows the bill paid (the webhook dropped): the
+    sweep reads it and records the ERP's payment, so no run pays it again
+    (decisions §535)."""
+    from app.models.invoice_status import PAYABLE_STATUSES
+
+    reads, asked = erp_reads
+    await _write_erp(realdb, GENERIC_ERP)
+    inv_id = await _seed(realdb, InvoiceStatus.approved)
+    await _payment(realdb, inv_id, status="voided")
+    doc = await _doc(realdb, inv_id)
+    reads[doc] = ErpInvoiceStatus.paid
+
+    result = await sweep.run_status_poll_sweep_once()
+
+    assert doc in asked
+    assert result.invoices_applied == 1 and result.invoice_failures == 0
+    assert await _status(realdb, inv_id) == InvoiceStatus.paid
+    assert InvoiceStatus.paid not in PAYABLE_STATUSES
+    async with realdb.sessionmaker(TENANT)() as s:
+        rows = await s.execute(
+            select(Payment).where(Payment.invoice_id == inv_id, Payment.status == "completed")
+        )
+        [recorded] = list(rows.scalars())
+    assert recorded.provider == "external"
+
+
+async def test_a_paid_read_for_an_approved_invoice_with_a_live_card_is_refused_and_blocked(
+    realdb, erp_reads
+):
+    """The same read while a live card still holds the invoice: recording it
+    is refused (the card could still be charged), and the refusal is the
+    payment-BLOCKING row the run builder refuses on (§319, §535)."""
+    from app.services.payment_runs import blocked_invoice_ids
+
+    reads, _ = erp_reads
+    await _write_erp(realdb, GENERIC_ERP)
+    inv_id = await _seed(realdb, InvoiceStatus.approved)
+    await _card(realdb, inv_id)
+    doc = await _doc(realdb, inv_id)
+    reads[doc] = ErpInvoiceStatus.paid
+
+    await sweep.run_status_poll_sweep_once()
+
+    assert await _status(realdb, inv_id) == InvoiceStatus.approved
+    [exc] = await _exceptions(realdb, inv_id)
+    assert exc.exception_type == "payment_reconciliation"
+    assert exc.erp_report["kind"] == "paid_not_recorded"
+    assert exc.erp_report["refusal_code"] == "external_payment_card_live"
+    async with realdb.sessionmaker(TENANT)() as s:
+        assert await blocked_invoice_ids(s, [inv_id]) == {inv_id}
+
+
+async def test_an_approved_invoice_never_pushed_is_not_polled(realdb, erp_reads):
+    """`approved` is polled only for a bill in the ERP: a direct-schedule
+    invoice with no document id is never read."""
+    _, asked = erp_reads
+    await _write_erp(realdb, GENERIC_ERP)
+    inv_id = await _seed(realdb, InvoiceStatus.approved)
+    async with realdb.sessionmaker(TENANT)() as s:
+        await s.execute(update(Invoice).where(Invoice.id == inv_id).values(erp_document_id=None))
+        await s.commit()
+
+    await sweep.run_status_poll_sweep_once()
+
+    assert asked == []
+
+
 async def test_closed_invoices_are_not_polled(realdb, erp_reads):
     _, asked = erp_reads
     await _write_erp(realdb, GENERIC_ERP)
-    for status in (InvoiceStatus.done, InvoiceStatus.paid, InvoiceStatus.approved):
+    for status in (InvoiceStatus.done, InvoiceStatus.paid, InvoiceStatus.failed):
         await _seed(realdb, status)
 
     await sweep.run_status_poll_sweep_once()
