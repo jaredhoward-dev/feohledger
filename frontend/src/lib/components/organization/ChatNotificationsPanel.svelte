@@ -218,6 +218,12 @@
 		margin-top: 14px;
 	}
 
+	@media (max-width: 600px) {
+		.form-grid {
+			grid-template-columns: 1fr;
+		}
+	}
+
 	label {
 		display: flex;
 		flex-direction: column;
