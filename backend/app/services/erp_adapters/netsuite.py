@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, quote, urlsplit
 
@@ -34,16 +34,23 @@ from joserfc.jwk import ECKey, RSAKey
 
 from app.config import settings
 from app.services.erp_adapters.base import (
+    BILL_NOT_IN_ERP,
+    BILL_PAYMENT_VOIDED,
+    PAYMENT_ACCOUNT_NOT_MAPPED,
+    PAYMENT_EXCEEDS_BALANCE,
     POSTED_TOTAL_MISMATCH,
     POSTED_TOTAL_UNCONFIRMED,
     VENDOR_NOT_LINKED,
     ErpAdapter,
+    ErpBillReport,
+    ErpBillState,
     ErpInvoiceStatus,
     ErpListingIncomplete,
     ErpPostResult,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
+    PaymentPayload,
     PoLinePayload,
     PoListing,
     PoPayload,
@@ -144,6 +151,38 @@ _BILL_LINKS_QUERY = (
     "FROM NextTransactionLineLink WHERE previousdoc = {id}"
 )
 
+#: Status sync-back (decisions §536): every transaction applied to a bill,
+#: with the applied transaction's own external id and date, so our write-backs
+#: (``externalId`` ``feohledger-payment-<id>``) are told from a person's
+#: payments and a person's payment is dated. ``nexttype`` is the applied
+#: transaction's type: ``VendPymt`` is cash; anything else (``VendCred``, a
+#: journal) moved no money. Column names are from the SuiteQL Records Catalog
+#: as this adapter already reads them (``_BILL_LINKS_QUERY``); the join to
+#: ``transaction`` is NOT verified against a live account (#654).
+_BILL_APPLIED_QUERY = (
+    "SELECT l.previousdoc, l.nextdoc, l.nexttype, l.foreignamount, "
+    "t.externalid, t.trandate "
+    "FROM NextTransactionLineLink l JOIN transaction t ON t.id = l.nextdoc "
+    "WHERE l.previousdoc = {id}"
+)
+#: The keyset poll standing in for a change feed (``changed_bills``): vendor
+#: bills modified since the window, and the bills of transactions applied
+#: since then. ``{since}`` is ``YYYY-MM-DD HH24:MI:SS``, built by the adapter.
+_CHANGED_BILLS_QUERY = (
+    "SELECT id FROM transaction WHERE type = 'VendBill' AND lastmodifieddate >= "
+    "TO_DATE('{since}', 'YYYY-MM-DD HH24:MI:SS') ORDER BY id"
+)
+_CHANGED_APPLIED_QUERY = (
+    "SELECT DISTINCT l.previousdoc FROM NextTransactionLineLink l "
+    "JOIN transaction t ON t.id = l.nextdoc WHERE t.lastmodifieddate >= "
+    "TO_DATE('{since}', 'YYYY-MM-DD HH24:MI:SS') ORDER BY l.previousdoc"
+)
+#: SuiteQL compares in the account's time zone, which is not known here.
+_CHANGE_WINDOW_MARGIN = timedelta(days=1)
+_CURRENCY_BY_ID_QUERY = "SELECT id, symbol, isinactive FROM currency WHERE id = {id}"
+#: Our write-back's ``externalId`` and memo (decisions §536).
+_PAYMENT_EXTERNAL_ID_PREFIX = "feohledger-payment-"
+
 #: A NetSuite internal id: an integer. Only such ids are spliced into SuiteQL.
 _INTERNAL_ID_RE = re.compile(r"^[0-9]{1,18}$")
 
@@ -156,6 +195,8 @@ BILL_REFUSED = "bill_refused"
 #: The bill is in NetSuite but NetSuite does not show it posted: Pending
 #: Approval under the account's approval routing, or a status we cannot read.
 BILL_NOT_POSTED = "bill_not_posted"
+#: The payment write-back's currency is not the bill's, or either states none.
+CURRENCY_MISMATCH = "currency_mismatch"
 #: The bill is in NetSuite but was rejected or cancelled there: it will never
 #: post, and a retry finds it again, so a person removes or re-enters it.
 BILL_REJECTED = "bill_rejected"
@@ -345,6 +386,10 @@ class NetSuiteAdapter(ErpAdapter):
     """
 
     erp_type = "netsuite"
+    #: Bills sync back and our payments are written back (decisions §536).
+    #: A bill carries our marker (its ``externalId`` is the invoice's
+    #: correlation id), so it is matched by that, as QuickBooks' are.
+    supports_status_sync = True
 
     def _auth_method(self) -> str:
         """The configured sign-in method. Absent is TBA; anything else that is
@@ -1096,6 +1141,287 @@ class NetSuiteAdapter(ErpAdapter):
             resp = await self._send(client, "DELETE", url)
         return resp.status_code == 204
 
+    # -- status sync-back + payment write-back (decisions §295, §536) -------
+
+    async def _bill_links(self, bill_id: str) -> list[dict] | None:
+        """Every transaction applied to ``bill_id`` with what identifies it
+        (``_BILL_APPLIED_QUERY``), or None when that could not be read whole.
+        Only rows naming this bill as their ``previousdoc`` are kept: the fake
+        and a widened query may answer more."""
+        rows = await self._suiteql_facts(_BILL_APPLIED_QUERY.format(id=bill_id))
+        if rows is None:
+            return None
+        return [r for r in rows if str(r.get("previousdoc", "")) == bill_id]
+
+    async def _currency_code(self, currency_id: str | None) -> str | None:
+        """The ISO code of NetSuite currency ``currency_id`` (``symbol``), or
+        None when it is not stated or cannot be read. The bill's
+        ``currency.refName`` is the currency's NAME ("US Dollar"), never taken
+        for a code."""
+        if not currency_id or not _INTERNAL_ID_RE.fullmatch(currency_id):
+            return None
+        rows = await self._suiteql_facts(_CURRENCY_BY_ID_QUERY.format(id=currency_id))
+        for row in rows or []:
+            if str(row.get("id")) == currency_id:
+                return iso_currency_or_none(row.get("symbol"))
+        return None
+
+    async def _bill_for_status(self, bill_id: str) -> tuple[str, dict | None]:
+        """``("found", record)``, ``("gone", None)`` on NetSuite's positive
+        ``NONEXISTENT_ID``, else raises :class:`NetSuiteStatusReadError`: a bill
+        that could not be read is never read as gone or as open (a transport
+        failure raises as itself)."""
+        url = f"{self._base_url()}/vendorBill/{quote(bill_id, safe='')}"
+        # A transport failure propagates as itself: the dispatch check reads
+        # it as NetSuite unreachable, not as something about this one bill.
+        async with self._client(timeout=15) as client:
+            resp = await self._send(client, "GET", url)
+        if resp.status_code == 404 and _netsuite_error_code(resp) == "NONEXISTENT_ID":
+            return "gone", None
+        if resp.status_code != 200:
+            raise NetSuiteStatusReadError(resp.status_code)
+        record = _exact_record(resp)
+        if record is None:
+            raise NetSuiteStatusReadError(resp.status_code)
+        return "found", record
+
+    async def bill_report(self, bill_id: str) -> ErpBillReport:
+        """Where the vendorBill stands in NetSuite (:func:`report_from_bill`).
+
+        ``deleted`` only on NetSuite's own ``NONEXISTENT_ID`` or a bill it
+        shows Voided / Cancelled. A failed read of the bill or of what was
+        applied to it raises (never "gone", never "open")."""
+        bill_id = str(bill_id)
+        if not _INTERNAL_ID_RE.fullmatch(bill_id):
+            raise NetSuiteStatusReadError(0)
+        found, record = await self._bill_for_status(bill_id)
+        if found == "gone":
+            return ErpBillReport(bill_id=bill_id, state=ErpBillState.deleted)
+        links = await self._bill_links(bill_id)
+        if links is None:
+            raise NetSuiteStatusReadError(0)
+        currency = await self._currency_code(_ref_id(record.get("currency")))
+        return report_from_bill(record, bill_id, links, currency)
+
+    async def changed_bills(self, since: datetime) -> list[str]:
+        """Bills changed since ``since``, by a keyset poll: NetSuite publishes
+        no change feed a REST integration can subscribe to, so two SuiteQL
+        reads stand in for one. Vendor bills whose ``lastmodifieddate`` is at
+        or after the window (``_CHANGED_BILLS_QUERY``), and the bill every
+        transaction applied to a bill since then names
+        (``_CHANGED_APPLIED_QUERY``: a payment or credit applied).
+
+        The window is widened by a day: SuiteQL compares ``lastmodifieddate``
+        in the account's time zone, which this adapter does not know, so a UTC
+        stamp could start the window up to 14 hours late. Reading a few more
+        bills costs reads; the sweep only reads back bills an invoice was
+        pushed as (``_bills_we_posted``).
+
+        Past :data:`SYNC_LISTING_MAX_ROWS` either read is
+        :class:`ErpListingIncomplete` (truncated), and the sweep reads back
+        every payable bill instead. A read that FAILED raises
+        :class:`NetSuiteStatusReadError`, so the pass fails and its mark stays
+        put, rather than being taken for a full reconciliation."""
+        window = (since.astimezone(UTC) - _CHANGE_WINDOW_MARGIN).strftime("%Y-%m-%d %H:%M:%S")
+        out: list[str] = []
+        for query, column, name in (
+            (_CHANGED_BILLS_QUERY, "id", "vendorBill"),
+            (_CHANGED_APPLIED_QUERY, "previousdoc", "NextTransactionLineLink"),
+        ):
+            try:
+                rows = await self._suiteql(query.format(since=window), collection=name)
+            except ErpListingIncomplete as exc:
+                if exc.gap is ListingGap.truncated:
+                    raise
+                raise NetSuiteStatusReadError(0) from None
+            out.extend(
+                str(r.get(column))
+                for r in rows
+                if _INTERNAL_ID_RE.fullmatch(str(r.get(column) or ""))
+            )
+        return list(dict.fromkeys(out))
+
+    async def _our_payment(self, payment_id: str) -> tuple[int, dict | None]:
+        """The vendorPayment :meth:`post_payment` created for ``payment_id``,
+        by its ``externalId`` (``eid:``, NetSuite keeps it unique per record
+        type). ``(200, record)`` / ``(200, None)`` on ``NONEXISTENT_ID`` /
+        ``(status, None)`` when the lookup could not be made."""
+        external_id = _payment_external_id(payment_id)
+        url = f"{self._base_url()}/vendorPayment/eid:{quote(external_id, safe='')}"
+        async with self._client(timeout=15) as client:
+            resp = await self._send(client, "GET", url)
+        if resp.status_code == 404:
+            return (200, None) if _netsuite_error_code(resp) == "NONEXISTENT_ID" else (404, None)
+        if resp.status_code != 200:
+            return resp.status_code, None
+        record = _exact_record(resp)
+        if (
+            record is None
+            or not _INTERNAL_ID_RE.fullmatch(str(record.get("id") or ""))
+            or str(record.get("externalId") or "").lower() != external_id.lower()
+        ):
+            return 502, None
+        return 200, record
+
+    async def post_payment(self, payload: PaymentPayload) -> ErpPostResult:
+        """Apply a FeohLedger payment to its bill as a NetSuite vendorPayment.
+
+        Idempotent on ``payload.payment_id`` in two layers, like the bill push:
+        the payment carries ``externalId = feohledger-payment-<id>``, looked up
+        (``eid:``) before anything is created, and NetSuite refuses a second
+        record with the same external id, so even two racing attempts create
+        one payment. A create refused after the lookup missed is looked up
+        once more before it is reported refused.
+
+        Refused before any write: no mapped pay-from account, a bill gone or
+        voided in NetSuite or not approved there (``bill_not_in_erp`` /
+        ``bill_not_posted``), another currency than the bill's or either side
+        stating none (``currency_mismatch``), or more than the bill still has
+        open (``payment_exceeds_balance``, open = ``total`` less everything
+        applied to it). The amount posted is exactly what reached the
+        supplier; no discount is booked (``disc`` is never sent), so an
+        early-payment discount taken here leaves the bill partly open in
+        NetSuite and the write-back flags it (``bill_balance_after``).
+        """
+        if not payload.bill_id or not _INTERNAL_ID_RE.fullmatch(str(payload.bill_id)):
+            return erp_preflight_refusal("NetSuite", BILL_NOT_IN_ERP)
+        account_id = str(payload.pay_from_account_erp_id or "")
+        if not _INTERNAL_ID_RE.fullmatch(account_id):
+            return erp_preflight_refusal("NetSuite", PAYMENT_ACCOUNT_NOT_MAPPED)
+        bill_id = str(payload.bill_id)
+        try:
+            status, ours = await self._our_payment(payload.payment_id)
+            if status != 200:
+                return erp_http_failure("NetSuite", status)
+            if ours is not None:
+                if _netsuite_bill_status(ours) == "voided" or _is_true(ours.get("voided")):
+                    return erp_refusal("NetSuite", BILL_PAYMENT_VOIDED)
+                return ErpPostResult(
+                    success=True,
+                    erp_document_id=str(ours["id"]),
+                    message="Already in NetSuite (idempotent: found by externalId)",
+                    bill_balance_after=await self._open_balance(bill_id),
+                )
+            found, bill = await self._bill_for_status(bill_id)
+            if found == "gone":
+                return _nothing_posted(erp_refusal("NetSuite", BILL_NOT_IN_ERP))
+            state = _netsuite_bill_status(bill)
+            if state in ("voided", "cancelled"):
+                return _nothing_posted(erp_refusal("NetSuite", BILL_NOT_IN_ERP))
+            if _netsuite_posting_state(bill) != "posted":
+                return _nothing_posted(erp_refusal("NetSuite", BILL_NOT_POSTED))
+            bill_currency_id = _ref_id(bill.get("currency"))
+            bill_currency = await self._currency_code(bill_currency_id)
+            if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):
+                return _nothing_posted(erp_refusal("NetSuite", CURRENCY_MISMATCH))
+            links = await self._bill_links(bill_id)
+            if links is None:
+                return erp_http_failure("NetSuite", 502)
+            due = _open_amount(bill, links)
+            if due is None or payload.amount <= 0 or payload.amount > due:
+                return _nothing_posted(erp_refusal("NetSuite", PAYMENT_EXCEEDS_BALANCE))
+            vendor_id = _ref_id(bill.get("entity"))
+            if vendor_id is None:
+                return erp_http_failure("NetSuite", 502)
+            body = {
+                "externalId": _payment_external_id(payload.payment_id),
+                "entity": {"id": vendor_id},
+                "account": {"id": account_id},
+                "currency": {"id": bill_currency_id},
+                "tranDate": payload.paid_on.isoformat(),
+                "memo": _payment_memo(payload.payment_id),
+                "apply": {
+                    "items": [{"doc": {"id": bill_id}, "apply": True, "amount": payload.amount}]
+                },
+            }
+            async with self._client(timeout=30) as client:
+                resp = await self._send(
+                    client,
+                    "POST",
+                    f"{self._base_url()}/vendorPayment",
+                    content=dumps_exact_json(body),
+                    headers={"Content-Type": "application/json"},
+                )
+            if resp.status_code not in (200, 201, 204):
+                # A duplicate externalId (a racing attempt got there first) is
+                # a refusal that DID leave our payment: look once more.
+                status, ours = await self._our_payment(payload.payment_id)
+                if status == 200 and ours is not None:
+                    return ErpPostResult(
+                        success=True,
+                        erp_document_id=str(ours["id"]),
+                        message="Already in NetSuite (idempotent: found by externalId)",
+                        bill_balance_after=await self._open_balance(bill_id),
+                    )
+                failed = erp_http_failure("NetSuite", resp.status_code)
+                failed.not_posted = status == 200 and not erp_status_retryable(resp.status_code)
+                return failed
+            location = resp.headers.get("Location", "")
+            payment_erp_id = location.rsplit("/", 1)[-1] if location else ""
+            if not _INTERNAL_ID_RE.fullmatch(payment_erp_id):
+                return ErpPostResult(
+                    success=False, message="NetSuite post failed: bill_payment_unconfirmed"
+                )
+            return ErpPostResult(
+                success=True,
+                erp_document_id=payment_erp_id,
+                message="Bill payment posted to NetSuite",
+                bill_balance_after=await self._open_balance(bill_id),
+            )
+        except NetSuiteStatusReadError as exc:
+            return erp_http_failure("NetSuite", exc.status_code or 502)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message="NetSuite post failed: network_error")
+
+    async def _open_balance(self, bill_id: str) -> Decimal | None:
+        """What NetSuite shows still open on the bill now, or None when that
+        cannot be read (the write-back then flags nothing on a guess)."""
+        try:
+            found, bill = await self._bill_for_status(bill_id)
+        except (NetSuiteStatusReadError, httpx.HTTPError):
+            return None
+        if found == "gone":
+            return None
+        links = await self._bill_links(bill_id)
+        return None if links is None else _open_amount(bill, links)
+
+    async def void_payment(self, payload: PaymentPayload) -> ErpPostResult:
+        """Remove the vendorPayment :meth:`post_payment` wrote for this payment.
+
+        "Ours" is the same definition ``post_payment`` uses: the record whose
+        ``externalId`` is ours. The REST record service has no void action, so
+        the payment is deleted (``DELETE /vendorPayment/{id}``), which reverses
+        its application to the bill. None found, or one already voided in
+        NetSuite, is a success with nothing to do. NetSuite refusing the delete
+        (a reconciled payment, a closed period) is returned, and the caller
+        flags it for a person."""
+        try:
+            status, ours = await self._our_payment(payload.payment_id)
+            if status != 200:
+                return erp_http_failure("NetSuite", status)
+            if (
+                ours is None
+                or _netsuite_bill_status(ours) == "voided"
+                or _is_true(ours.get("voided"))
+            ):
+                return ErpPostResult(success=True, message="No bill payment of ours to void")
+            payment_erp_id = str(ours["id"])
+            async with self._client(timeout=30) as client:
+                resp = await self._send(
+                    client,
+                    "DELETE",
+                    f"{self._base_url()}/vendorPayment/{quote(payment_erp_id, safe='')}",
+                )
+            if resp.status_code != 204:
+                return erp_http_failure("NetSuite", resp.status_code)
+            return ErpPostResult(
+                success=True,
+                erp_document_id=payment_erp_id,
+                message="Bill payment deleted in NetSuite",
+            )
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message="NetSuite void failed: network_error")
+
     def _suiteql_url(self) -> str:
         """SuiteQL lives beside the record API: ``.../services/rest/query/v1``."""
         return f"{self._rest_root()}/query/v1/suiteql"
@@ -1670,3 +1996,141 @@ def _netsuite_account_to_payload(raw: dict) -> GLAccountPayload | None:
         erp_account_id=str(account_id),
         active=str(raw.get("isinactive", "F")).upper() != "T",
     )
+
+
+# -- status sync-back (decisions §295, §536) ----------------------------------
+
+
+class NetSuiteStatusReadError(RuntimeError):
+    """A status-sync read NetSuite did not answer whole (PII-free: a status)."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+        super().__init__(f"NetSuite status read failed: {status_code}")
+
+
+def _payment_external_id(payment_id: str) -> str:
+    return f"{_PAYMENT_EXTERNAL_ID_PREFIX}{str(payment_id).lower()}"
+
+
+def _payment_memo(payment_id: str) -> str:
+    return f"FeohLedger payment {str(payment_id).lower()}"
+
+
+def _nothing_posted(result: ErpPostResult) -> ErpPostResult:
+    """A refusal decided on reads alone: nothing was written to NetSuite."""
+    result.not_posted = True
+    return result
+
+
+def _is_ours(link: dict) -> bool:
+    return str(link.get("externalid") or "").lower().startswith(_PAYMENT_EXTERNAL_ID_PREFIX)
+
+
+def _applied_amounts(links: list[dict]) -> list[Decimal] | None:
+    """Each link's amount as a magnitude, or None when one is unreadable or
+    the signs disagree (a payment and its reversal are not cash)."""
+    raw = [_netsuite_decimal(r.get("foreignamount")) for r in links]
+    if any(a is None for a in raw):
+        return None
+    if raw and not (all(a > 0 for a in raw) or all(a < 0 for a in raw)):
+        return None
+    return [abs(a) for a in raw]
+
+
+def _open_amount(bill: dict, links: list[dict]) -> Decimal | None:
+    """``total`` less everything applied to the bill, or None when that is
+    not a figure we can vouch for (no total, unreadable or mixed-sign links,
+    more applied than the total)."""
+    total = _netsuite_decimal(bill.get("total"))
+    amounts = _applied_amounts(links)
+    if total is None or amounts is None or total <= 0:
+        return None
+    due = total - sum(amounts, Decimal(0))
+    return due if due >= 0 else None
+
+
+def report_from_bill(
+    bill: dict, bill_id: str, links: list[dict], currency: str | None
+) -> ErpBillReport:
+    """One NetSuite vendorBill as the status sync reads it (decisions §536).
+
+    * ``deleted``: NetSuite shows it Voided or Cancelled.
+    * ``open`` / ``partially_paid`` / ``paid``: from ``total`` less what is
+      applied to it, which must agree with the status NetSuite shows (Open
+      with something still open; Paid In Full with nothing). Anything else,
+      Pending Approval or Rejected included, is ``unknown``: the dispatch
+      check holds on it and the sweep leaves the invoice alone.
+
+    Cash is a ``VendPymt`` applied to the bill; ours carries our external
+    id. A vendor credit, a journal, or any other applied transaction moved no
+    money, so a bill it helped settle is ``settled_by_credit`` (§303). The
+    cash a person applied is stated exactly (``paid_amount``) only for a bill
+    paid wholly by them in cash, in the bill's currency as NetSuite's
+    ``currency`` record states it (None when that could not be read, which the
+    sync refuses rather than compare a bare figure).
+    """
+    found = str(bill.get("id") or bill_id)
+    marker = str(bill.get("externalId") or "").strip() or None
+
+    def report(state: ErpBillState, **kw) -> ErpBillReport:
+        return ErpBillReport(bill_id=found, state=state, correlation_id=marker, **kw)
+
+    status = _netsuite_bill_status(bill)
+    if status in ("voided", "cancelled"):
+        return report(ErpBillState.deleted)
+    total = _netsuite_decimal(bill.get("total"))
+    due = _open_amount(bill, links)
+    if total is None or due is None or _netsuite_posting_state(bill) != "posted":
+        return report(ErpBillState.unknown)
+    if due == 0:
+        state = ErpBillState.paid if status == "paidinfull" else ErpBillState.unknown
+    elif status != "open":
+        state = ErpBillState.unknown
+    elif due < total:
+        state = ErpBillState.partially_paid
+    else:
+        state = ErpBillState.open
+    if state is ErpBillState.unknown:
+        return report(state)
+    amounts = _applied_amounts(links) or []
+    rows = list(zip(links, amounts, strict=True))
+    ours = [a for r, a in rows if str(r.get("nexttype")) == "VendPymt" and _is_ours(r)]
+    cash = [(r, a) for r, a in rows if str(r.get("nexttype")) == "VendPymt" and not _is_ours(r)]
+    credited = sum((a for r, a in rows if str(r.get("nexttype")) != "VendPymt"), Decimal(0))
+    ours_applied = sum(ours, Decimal(0))
+    taken_off = total - due
+    reduced_outside = taken_off > ours_applied
+    outside = taken_off - ours_applied if reduced_outside else Decimal(0)
+    cash_applied = sum((a for _, a in cash), Decimal(0))
+    settled_by_credit = reduced_outside and (credited > 0 or cash_applied < outside)
+    dates = [d for d in (_iso_date(r.get("trandate")) for r, _ in cash) if d is not None]
+    return report(
+        state,
+        paid_on=max(dates) if dates else None,
+        external_payment_ids=tuple(
+            dict.fromkeys(str(r.get("nextdoc")) for r, _ in cash if r.get("nextdoc"))
+        ),
+        paid_only_by_us=bool(ours) and not reduced_outside,
+        reduced_outside=reduced_outside,
+        settled_by_credit=settled_by_credit,
+        our_payment_applied=bool(ours),
+        reduced_outside_amount=outside,
+        paid_amount=(
+            cash_applied
+            if state is ErpBillState.paid and reduced_outside and not settled_by_credit and not ours
+            else None
+        ),
+        paid_currency=currency,
+    )
+
+
+def _iso_date(value: object) -> date | None:
+    """A SuiteQL date. SuiteQL renders dates in the account's format; only an
+    ISO ``YYYY-MM-DD`` (optionally with a time) is read, anything else is
+    "not stated" rather than guessed (``M/D/YYYY`` and ``D/M/YYYY`` collide)."""
+    text = str(value or "").strip()[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None

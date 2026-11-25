@@ -141,9 +141,9 @@ class ErpAdapter:
         ...
 
     # Status sync-back + payment write-back (decisions §295). Only an adapter
-    # with `supports_status_sync = True` implements them (QuickBooks Online
-    # today); the base raises NotImplementedError and every caller checks the
-    # flag first.
+    # with `supports_status_sync = True` implements them (QuickBooks Online,
+    # Xero, NetSuite); the base answers fail-closed (refused / `unknown`) and
+    # every caller checks the flag first.
     supports_status_sync: bool = False
     async def bill_report(self, bill_id: str) -> ErpBillReport: ...
     async def bills_for_payment(self, payment_id: str) -> list[str]: ...
@@ -417,8 +417,8 @@ source's unseal budget was spent (§408, §525) — with the same silent 204 as 
 forgery, so the ERP never redelivers it. The `erp-status-poll` sweep
 (`services/erp_status_poll_sweep`, `FEOH_ERP_STATUS_POLL_SWEEP_ENABLED`, off by
 default) is the backstop. For every tenant whose adapter is not Merge.dev and
-has no status sync of its own (QuickBooks Online and Xero have theirs, next two
-sections), it calls
+has no status sync of its own (QuickBooks Online, Xero and NetSuite have
+theirs, § QuickBooks / Xero / NetSuite status sync-back), it calls
 `get_invoice_status(erp_document_id)` for invoices at `approved`,
 `sent_to_erp`, `posted_in_erp` or `payment_scheduled` that carry an ERP
 document id, least recently polled first and at most
@@ -704,6 +704,68 @@ Tests: `backend/tests/test_xero_status_sync_adapter.py` (the adapter against a
 stateful Xero double), the Xero section of `test_erp_status_sync.py` (real
 rows), and `test_erp_oauth.py` § status sync on request. Fake surface:
 `tools/fake-erp/README.md` § Xero.
+
+### NetSuite status sync-back and payment write-back
+
+Decisions §536 extends §295 to NetSuite (`NetSuiteAdapter.supports_status_sync`),
+the first ERP reached with stored credentials rather than an OAuth consent.
+With `FEOH_ERP_STATUS_SYNC_ENABLED` on, a confirmed NetSuite push lands at
+`posted_in_erp`, and §296's dispatch-time read, §309's live-claim refusals and
+§386's recorded-cash rule apply unchanged.
+
+- **Matching.** The bill's `externalId` is the invoice's correlation id (the
+  push's idempotency key), so a report carries it as `correlation_id` and is
+  matched like QuickBooks' (`bills_match_by_reference` stays False). A bill
+  NetSuite answers `NONEXISTENT_ID` for, or shows Voided / Cancelled, is
+  `deleted`.
+- **`bill_report`.** Reads the vendorBill, every transaction applied to it
+  (SuiteQL `NextTransactionLineLink` joined to `transaction` for the applied
+  record's `externalid` and `trandate`) and the bill currency's ISO `symbol`.
+  Open = `total` − everything applied, which must agree with the status
+  (Open with something open, Paid In Full with nothing); Pending Approval,
+  Rejected, mixed-sign or unreadable links are `unknown`. A `VendPymt` whose
+  `externalid` starts `feohledger-payment-` is our write-back; any other
+  `VendPymt` is a person's cash; anything else (`VendCred`, a journal) is a
+  credit (§303). `paid_amount` / `paid_currency` are stated only for a bill
+  paid wholly in a person's cash. The rail is not read (not stated, so the
+  payment counts as 1099-reportable).
+- **`changed_bills`.** NetSuite offers REST no change feed, so a keyset poll:
+  vendor bills with `lastmodifieddate` in the window, plus the bills of
+  transactions applied in it. The window is widened by a day because SuiteQL
+  compares in the account's time zone. A truncated read is a full
+  reconciliation; a failed one fails the pass with its mark unmoved.
+- **`post_payment`.** A `vendorPayment` (`entity` = the bill's vendor,
+  `account` = the mapped pay-from account, the bill's `currency`,
+  `apply.items[] = {doc, apply: true, amount}`) at the exact Decimal that
+  reached the supplier, with `externalId feohledger-payment-<payment id>`:
+  looked up by `eid:` first, and NetSuite's per-type externalId uniqueness
+  makes a racing second create fail; a refused create is looked up once more.
+  Refused before any write: no account, bill gone or voided
+  (`bill_not_in_erp`), not approved (`bill_not_posted`), another currency or
+  none stated (`currency_mismatch`), more than is open
+  (`payment_exceeds_balance`). No `disc` is sent: an early-payment discount
+  leaves the bill open by the discount and is flagged
+  (`bill_balance_after`), as for QuickBooks and Xero.
+- **`void_payment`.** Deletes our vendorPayment (REST has no void); none, or
+  one NetSuite shows voided, is success. A refused delete is flagged.
+- **Sweep selection.** `run_status_sync_once` selects a tenant by its OAuth
+  connection's provider or by `settings.erp.type`, then keeps it only when
+  `dispatcher.resolve_adapter_key` names a status-sync adapter (a `type`
+  left under Merge.dev is not swept). A credentials-based ERP has no
+  `settings.erp.oauth` block, so its mark lives in
+  `settings.erp_status_sync = {realm, through}` (written under the org row
+  lock, read only while `realm` is the configured account's). The admin's
+  on-request pass (`POST /api/organization/erp/oauth/status-sync`) is still
+  OAuth-only, and NetSuite has no webhook; the sweep is its only channel.
+- **Not verified live (#654).** The `vendorPayment` body and `eid:` /
+  `DELETE` on it, the `NextTransactionLineLink` join and its `foreignamount`
+  sign, `transaction.lastmodifieddate` / `TO_DATE`, and whether applying or
+  deleting a payment moves the bill's `lastmodifieddate`. Everything is
+  against fake-erp, which encodes this reading.
+
+Tests: `backend/tests/test_netsuite_status_sync_adapter.py` (the adapter
+against fake-erp in process), `test_erp_status_sync.py` § NetSuite sweep
+(tenant selection, the mark, another account's mark, Merge leftovers).
 
 ### Live QuickBooks contract check
 
