@@ -28044,3 +28044,65 @@ the cursor is read by the next tick (and, as the control, not with no overlap);
 the second listing asks from `through − 10 min`.
 `tests/test_sweep_health.py`: every sweep's enabled flag, parametrized over the
 registry, is what its health snapshot reads.
+
+## 548. Changes within the public contract are announced in one dated list; subscriptions are never changed for a customer (§542 follow-up, round 46)
+
+**Problem.** §542 changed what a webhook subscriber receives: after a payment
+void (`POST /api/payments/{id}/void`) it now gets `payment.voided`, no longer
+`invoice.approved`, and the ERP bill void (new in the same release) sends
+`invoice.erp_bill_voided`. A receiver that re-queued a bill, or undid a
+settlement, on the `invoice.approved` that followed a void now hears nothing
+unless it subscribes to `payment.voided`. The contract had no way to tell it:
+`public-api.md` listed a changelog as later work, `info.version` tracks the
+path prefix (`v1`), the `Deprecation` / `Sunset` headers are for retiring a
+version, and there is no email path to API-key holders or webhook owners. Two
+of the six events (`payment.settled`, `payment.voided`) and the ERP void event
+also had no payload example in the doc.
+
+**Decision.**
+
+1. **One dated list, published three ways.** `app/api/v1_changelog.py::
+   PUBLIC_API_CHANGES` (newest first; id, date, title, detail, `affects`,
+   `subscribe_to`) is published as `info.x-changelog` in
+   `/api/v1/openapi.json` (an OpenAPI `x-` extension, so a client generator
+   ignores it), rendered under **Changes** on `/api/v1/docs`, and written out
+   in `backend/docs/public-api.md` § Changes. `info.version` is not bumped: it
+   names the path prefix, and a change within `v1` is announced, not
+   versioned. The versioning policy now says so. The first entry is
+   `2026-11-25-void-events`. There is no public developer page in the SPA; the
+   API's own docs page is the published one.
+2. **Every event has a payload example built from its model.** The doc gains
+   examples for `payment.settled`, `payment.voided` and
+   `invoice.erp_bill_voided`, with the fields `_invoice_fields` and the
+   `WebhookInvoiceData` / `WebhookInvoiceErpBillVoidedData` models send. The
+   occurrence-id paragraph no longer gives the payment void as a second
+   approval.
+3. **Existing subscriptions are not changed; the operator is told whom to
+   tell.** A subscription's `event_types` is an explicit, non-empty JSONB list
+   the customer chose (no "all events" value). Adding `payment.voided` to it on
+   deploy would send a type their receiver never asked for (a receiver that
+   4xxs unknown types dead-letters, and a receiver acting on any event may act
+   wrongly) and would rewrite customer configuration with no precedent: no
+   earlier event (`invoice.approval_recalled`, §414) was auto-subscribed.
+   Emailing API-key holders is not a convention either: the one customer
+   notice sweep (§321) is contractual, needs a ledger for idempotency, and goes
+   to admins under the DPA. So `scripts/public_api_change_report.py` lists,
+   read-only, the active subscriptions an entry `affects` that lack its
+   `subscribe_to` types, by organisation slug and subscription id (no URL,
+   name or contact), and the operator reaches those organisations directly. It
+   sends nothing and writes nothing, so it needs no dry run.
+
+**Rejected.** *Bump `info.version` (e.g. `v1.1`)*: the policy ties it to the
+path prefix, and a generator keyed on it would treat a note as a new version.
+*A data migration adding `payment.voided` to every `invoice.approved`
+subscription*: see 3. *An automatic or opt-out email to API-key holders*: no
+convention, no ledger, and the key holder is not necessarily who runs the
+receiver.
+
+**Guard.** `tests/test_public_api_changelog.py`: the list is newest first with
+unique ids and catalogued events; the spec carries it unchanged with
+`info.version` still `v1`; the docs page renders each entry; `public-api.md`
+§ Changes has exactly the same entries by date, title and id; the doc's
+catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
+example whose `data` keys are its model's fields; the report's filter picks
+only affected subscriptions and the types they lack.
