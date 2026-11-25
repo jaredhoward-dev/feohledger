@@ -691,13 +691,42 @@ async def _plan_vendor_user(
         ],
     }
     sections = [
+        # What the supplier did on the trail: their sign-ins, factor changes,
+        # the Privacy Policy acknowledgement (`portal.legal.accepted`) and
+        # whatever else they authored. The employee plan's shape (action,
+        # target, when — no `details`, which may describe someone else), plus
+        # the one detail that is the subject's own: the client IP the portal
+        # recorded for the request they made. Rows with no actor (a failed
+        # sign-in against their address) are not theirs to receive: whoever
+        # made that attempt is not established, and its IP is that person's.
+        _Section(
+            name="audit_events",
+            query=select(
+                AuditLog.id,
+                AuditLog.action,
+                AuditLog.entity_type,
+                AuditLog.entity_id,
+                AuditLog.details["ip"].astext.label("ip"),
+                AuditLog.created_at,
+            )
+            .where(AuditLog.actor_id == subject_id, AuditLog.organization_id == organization_id)
+            .order_by(AuditLog.created_at.desc(), AuditLog.id),
+            serialize=lambda r: {
+                "id": str(r.id),
+                "action": r.action,
+                "entity_type": r.entity_type,
+                "entity_id": str(r.entity_id) if r.entity_id else None,
+                "ip": r.ip,
+                "created_at": _jsonable(r.created_at),
+            },
+        ),
         _Section(
             name="chat_messages",
             query=select(*_CHAT_COLUMNS)
             .where(SupplierChatMessage.author_user_id == subject_id)
             .order_by(SupplierChatMessage.created_at, SupplierChatMessage.id),
             serialize=_chat_message_entry,
-        )
+        ),
     ]
     return _BundlePlan(head=head, documents=documents, sections=sections)
 
