@@ -2787,26 +2787,44 @@ The supplier portal has its own TOTP MFA (with an email-OTP backup) for `VendorU
 
 ## Delegation / Out-of-Office
 
-Any user can set a delegate who receives their approval assignments while they are away.
+A user who holds `invoice.approve` can set a delegate who receives their approval assignments while they are away.
 
-- **Set a delegate:** `POST /api/auth/delegation` with `{delegate_to_id, until}` — `until` is an ISO datetime after which delegation automatically expires.
-- **Check status:** `GET /api/auth/delegation` — returns the current delegation (delegate user, expiry) or empty if none is active.
-- **Clear:** `DELETE /api/auth/delegation` — removes the delegation immediately.
+- **Set a delegate:** `POST /api/auth/delegation` with `{delegate_to_id, until}` — `until` is an ISO datetime after which delegation automatically expires. Caller must hold `invoice.approve` (`403` otherwise).
+- **Check status:** `GET /api/auth/delegation` — returns the current delegation (delegate user, expiry) or empty if none is active. Open to every signed-in user.
+- **Clear:** `DELETE /api/auth/delegation` — removes the delegation immediately. Open to every signed-in user, so someone who has since lost `invoice.approve` can still end a stale one.
 - **Who can be named:** `GET /api/auth/delegation/candidates` — the active
   colleagues in the caller's organization, other than the caller, who hold
-  `invoice.approve` (id and display name only). It and `POST` share one
-  eligibility test (`api/auth._can_approve`), so the picker never offers someone
-  the write refuses.
+  `invoice.approve` (id and display name only). Gated on `invoice.approve`
+  like the write (`403` otherwise): it is a roster of every approver in the
+  organization. It, `POST` and routing share one eligibility predicate
+  (`services/delegation.is_eligible_delegate`), so the picker never offers
+  someone the write refuses.
 
 **The screen** is **Profile → Out of office** (`/profile?section=delegation`,
-`frontend/src/lib/components/profile/DelegationPanel.svelte`): every signed-in
-employee sees it, because the endpoint is gated on sign-in alone. There is one
+`frontend/src/lib/components/profile/DelegationPanel.svelte`), for employees
+who hold `invoice.approve`. There is one
 delegation per person and it starts when saved — the model has an end
 (`delegate_until`) but no start date, so the panel asks only for the last day
 away and the delegation ends at the start of the following day in the reader's
 time zone.
 
-When a reviewer is OOO (has an active, non-expired delegation), approval assignments auto-route to their delegate. The audit trail records both the original assignee (`WorkflowStep.original_assigned_to`) and the delegate who actually performed the action.
+When a reviewer is OOO (has an active, non-expired delegation), approval assignments auto-route to their delegate — on every assignment path: the manual `POST /api/invoices/{id}/assign` and smart routing's `POST /api/adaptive/routing-suggestion/apply`, both through `review.assign_reviewer`. The audit trail records both the original assignee (`WorkflowStep.original_assigned_to`, the `invoice.assigned_for_review` row's `delegated_from`) and the delegate who actually performed the action.
+
+**Routing re-checks the delegate every time** (decisions §511). The original
+reviewer keeps the assignment, and the audit row carries no `delegated_from`,
+when:
+
+- the delegate fails the eligibility predicate *today* — deactivated, moved out
+  of the organization, or without `invoice.approve` (a role edit, a SCIM push,
+  or a delegation saved before the write checked it); or
+- the delegate could not approve *this* invoice: `review.delegate_refusal` runs
+  the approval endpoint's own gates for them (`review.review_refusals`) —
+  segregation of duties (they uploaded or keyed it, recorded its goods receipt
+  or inspection), the max-amount and CFO gates, a named-approver step or chain
+  level.
+
+A named approver's delegate is accepted at approval time
+(`check_level_approver`) only under the same predicate.
 
 **Delegation is routing, not a privilege grant.** The delegate acts as
 themselves: their own roles, their own approval limits (the step's max-amount
@@ -2824,6 +2842,11 @@ A delegate who holds no `invoice.approve` (an ap_clerk) is refused
 (decisions §511): an invoice routed to them would sit with someone who can
 never act on it.
 
+**A delegation does not reach `parallel_mode: "all"` chain levels.** The
+delegate's approval is recorded under the delegate's own id and never satisfies
+the delegator's slot, so an `all` level still waits for the delegator
+(`docs/known-issues.md`; the operator decision is in `docs/followups.md`).
+
 What `POST` refuses, and why (each a coded refusal — `delegation_invalid_id`,
 `delegation_self`, `delegation_until_invalid`, `delegation_until_past`,
 `delegation_delegate_not_found`, `delegation_delegate_cannot_approve` — stated
@@ -2833,7 +2856,8 @@ in the reader's language by `frontend/src/lib/api/authRefusals.ts`):
 |---|---|
 | `delegate_to_id` that isn't a UUID, or an unparseable `until` | `422`. Both used to escape the handler as a bare `ValueError`, i.e. a 500 on ordinary bad input. |
 | `until` already in the past | `422` — it would leave the caller believing they are out of office while `resolve_assignee`'s `delegate_until > now` test never fires. |
-| A **deactivated** delegate | `404` (same opaque answer as unknown / other-org). `review.assign_reviewer` reassigns the invoice unconditionally, so approvals would land on an account that can never sign in and the invoice would sit owned by nobody. |
+| A **deactivated** delegate | `404` (same opaque answer as unknown / other-org). Approvals would land on an account that can never sign in and the invoice would sit owned by nobody; routing re-checks this too, for a delegate deactivated after the save. |
+| A caller without `invoice.approve` | `403` — the write and the candidate list are approver-only. |
 | A delegate without `invoice.approve` | `422` `delegation_delegate_cannot_approve` — the routed invoice would be stranded. |
 | `until` with no timezone | Accepted, interpreted as **UTC**. A naive value handed to the `timestamptz` column is read in the DB *session's* timezone, while every consumer compares against `now(UTC)` — so the same wall-clock string meant a different expiry depending on server config. |
 

@@ -808,6 +808,19 @@ or is a sibling of a fix that needs its own pass.
       **Trigger:** the next change that touches more than one panel of
       `frontend/src/routes/organization/+page.svelte`.
 
+### Surfaced by the out-of-office delegation review (2026-11-24, decisions §511)
+
+- [ ] **(c) A delegate's approval does not fill an `all`-mode slot.** It is
+      recorded under the delegate's id, and an `all` level needs every named
+      approver's own id, so a delegation does nothing there
+      (`docs/known-issues.md`). **Durable fix:** an operator decision between
+      counting a delegate's approval toward the delegator's slot (both ids on
+      the approval record and the audit row, the delegate still under their
+      own segregation and limits) and documenting that an `all` level means
+      those exact people (the Out of office panel saying so). **Trigger:**
+      that decision, or the first customer with an `all`-mode level who sets a
+      delegation.
+
 ### Surfaced by the approval recall (2026-11-13, decisions §374)
 
 - [ ] **(c) A recalled invoice's PEPPOL transmission and inter-company mirror

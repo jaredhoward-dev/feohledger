@@ -1207,6 +1207,7 @@ async def apply_routing_suggestion(
         reviewer_id=reviewer_id,
         reviewer_name=reviewer.full_name,
         control_db=ctrl_db,
+        org_settings=org.settings,
     )
     # The tenant-DB session commits in the get_tenant_db dependency teardown on a
     # clean return (mirrors the manual assign endpoint, which also relies on it).

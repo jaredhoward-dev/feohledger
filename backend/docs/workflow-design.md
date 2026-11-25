@@ -340,7 +340,7 @@ than `.get(key, {})`: the latter hands `None` to a caller that immediately calls
 `.get("levels", …)` on it, which is an `AttributeError` on the approval path
 rather than a routing decision.
 
-**Named-approver enforcement**: a non-empty `approver_ids` on the current level is a hard allow-list, enforced by `approval_chain.check_level_approver` before the approval is recorded — the endpoint's role-based RBAC gate (`require_permission(PERM_INVOICE_APPROVE)`, held by any `ap_manager`/`cfo`/`admin`) only confirms the actor holds an approving role, not that they are one of the named approvers, so this is a separate, additional check. An empty `approver_ids` list is unrestricted (any actor who cleared RBAC may approve, matching legacy behaviour). A named approver's active delegate (`User.delegate_to_id` / `delegate_until`) is also authorized. A non-authorized actor gets a 403 and the approval is not recorded.
+**Named-approver enforcement**: a non-empty `approver_ids` on the current level is a hard allow-list, enforced by `approval_chain.check_level_approver` before the approval is recorded — the endpoint's role-based RBAC gate (`require_permission(PERM_INVOICE_APPROVE)`, held by any `ap_manager`/`cfo`/`admin`) only confirms the actor holds an approving role, not that they are one of the named approvers, so this is a separate, additional check. An empty `approver_ids` list is unrestricted (any actor who cleared RBAC may approve, matching legacy behaviour). A named approver's active delegate (`User.delegate_to_id` / `delegate_until`) is also authorized, while the delegate passes `services/delegation.is_eligible_delegate`. A non-authorized actor gets a 403 and the approval is not recorded.
 
 The single-level strategy `"specific"` applies the same named-approver check (`approver_ids`, or the deprecated single `approver_id`) without the multi-level chain machinery — useful when a step needs exactly one or a small fixed set of eligible people but no sequential levels.
 
@@ -446,7 +446,8 @@ Users can designate a delegate who receives their approval assignments while the
 
 - `User.delegate_to_id` — FK to the delegate user (control plane).
 - `User.delegate_until` — datetime after which delegation expires.
-- `assign_reviewer()` checks delegation and reassigns to the delegate when active.
+- `assign_reviewer()` checks delegation and reassigns to the delegate when active — on every assignment path (manual `POST /api/invoices/{id}/assign` and smart routing's apply both pass `control_db`). It follows the delegation only when the delegate passes `services/delegation.is_eligible_delegate` today (active, same org, holds `invoice.approve`) and `review.delegate_refusal` finds no approval gate that would refuse them on this invoice (segregation, money gates, named approvers); otherwise the original reviewer keeps it and the audit row has no `delegated_from` (decisions §511).
+- `parallel_mode: "all"` levels: a delegate's approval is recorded under the delegate's id and never fills the delegator's slot, so delegation does not help there (`docs/known-issues.md`).
 - `WorkflowStep.original_assigned_to` records the intended user so the audit trail shows both the original assignee and the delegate.
 - The delegate acts as themselves: their own roles and approval limits, and their own segregation-of-duties set — routing confers no privilege, and a delegate must already hold `invoice.approve` (decisions §511). Full rules: `docs/authentication.md` § Delegation / Out-of-Office.
 - Set by each user on **Profile → Out of office** (`/profile?section=delegation`).
@@ -456,8 +457,8 @@ API:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/auth/delegation` | Check current delegation status |
-| `GET` | `/api/auth/delegation/candidates` | Who may be named: active same-org colleagues holding `invoice.approve`, not the caller |
-| `POST` | `/api/auth/delegation` | Set delegate: `{delegate_to_id, until}` |
+| `GET` | `/api/auth/delegation/candidates` | Who may be named: active same-org colleagues holding `invoice.approve`, not the caller. Caller needs `invoice.approve` |
+| `POST` | `/api/auth/delegation` | Set delegate: `{delegate_to_id, until}`. Caller needs `invoice.approve` |
 | `DELETE` | `/api/auth/delegation` | Clear delegation |
 
 ### Endpoints
