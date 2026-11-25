@@ -1604,6 +1604,7 @@ export const messages = {
 	'contracts.empty': 'フィルターに一致する契約はありません。',
 	'contracts.empty.errored': '契約を読み込めませんでした。もう一度お試しください。',
 	'contracts.notFound': '契約が見つかりません',
+	'contracts.deepLink.loadFailed': 'リンク先の契約を読み込めませんでした。もう一度お試しください。',
 	'contracts.selectRowAria': '契約{number}を選択',
 	'contracts.row.open': '契約{number}を開く',
 	'contracts.overSpendLimit': '支出上限超過',

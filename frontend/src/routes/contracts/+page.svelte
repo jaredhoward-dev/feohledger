@@ -36,6 +36,7 @@
 	import { type MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { formatCount } from '#lib/utils/count.ts';
+	import { ApiError } from '#lib/api.ts';
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
@@ -135,8 +136,17 @@
 		return params;
 	}
 
-	// Reflect the live filter state into the URL. EVERY read in here is
-	// untracked, `page.url` included, because syncUrl() is a WRITER called
+	// Reflect the live filter state — and the open contract's `?id=` — into
+	// the URL. It is the route's ONLY `replaceState` caller and builds the
+	// query from component state, reading `page.url` for the pathname alone:
+	// SvelteKit's shallow `replaceState` never updates `page.url`, so a writer
+	// that rebuilt from it worked off the URL of the last REAL navigation. On
+	// a deep-linked arrival that put the closed contract's `?id=` back on
+	// every later filter change (a reload re-opened it) and made closing the
+	// modal revert the filters to the ones the link carried (the /invoices
+	// and /recurring single-writer shape).
+	//
+	// EVERY read in here is untracked, because syncUrl() is a WRITER called
 	// from the filter `$effect`s below — not a source of dependencies:
 	//   - the URL read would self-trigger the effect that writes it via
 	//     replaceState (Svelte effect_update_depth_exceeded);
@@ -148,19 +158,17 @@
 	//     reading them directly, so nothing here needs to be tracked.
 	function syncUrl() {
 		untrack(() => {
-			const url = new URL(page.url.href);
-			if (statusFilter !== 'all') url.searchParams.set('status', statusFilter);
-			else url.searchParams.delete('status');
-			if (search.trim()) url.searchParams.set('search', search.trim());
-			else url.searchParams.delete('search');
+			const params = new URLSearchParams();
+			if (deepLinkId) params.set('id', deepLinkId);
+			if (statusFilter !== 'all') params.set('status', statusFilter);
+			const s = search.trim();
+			if (s) params.set('search', s);
 			if (sortField) {
-				url.searchParams.set('sort', sortField);
-				url.searchParams.set('order', sortOrder);
-			} else {
-				url.searchParams.delete('sort');
-				url.searchParams.delete('order');
+				params.set('sort', sortField);
+				params.set('order', sortOrder);
 			}
-			replaceState(`${url.pathname}${url.search}`, {});
+			const qs = params.toString();
+			replaceState(`${page.url.pathname}${qs ? `?${qs}` : ''}`, {});
 		});
 	}
 
@@ -295,35 +303,82 @@
 	// instead, so a vendor on page 40 is one query away and nothing is fetched
 	// until the form is opened.
 
-	// Deep-link: `/contracts?id=<uuid>` opens that contract's detail modal.
+	// Deep-link: `/contracts?id=<uuid>` opens that contract's detail modal,
+	// and opening one from a row writes its `?id=` too, so a reload or a
+	// copied link lands back on it. The READ is `page.url` (a deep link
+	// arrives by real navigation); the live value is mirrored into
+	// `deepLinkId`, which `syncUrl()` serialises.
+	let deepLinkId = $state<string | null>(page.url.searchParams.get('id'));
 	let deepLinkLoaded = $state<string | null>(null);
+	// The deep-linked contract that could not be fetched for a reason other
+	// than "it does not exist". Only a 404 may say "not found"; a 500 or an
+	// offline backend is a failed load, stated in place with a Retry.
+	let deepLinkFailedId = $state<string | null>(null);
+
+	function openDeepLink(id: string) {
+		deepLinkFailedId = null;
+		getContract(id)
+			.then((c) => {
+				// Don't open a modal for a link the user has since left.
+				if (deepLinkId === id) editing = c;
+			})
+			.catch((err) => {
+				if (deepLinkId !== id) return;
+				if (err instanceof ApiError && err.status === 404) {
+					toast(m('contracts.notFound'), 'error');
+					// Nothing will ever open for this id, so drop it from the URL:
+					// left there, a reload re-runs the lookup and re-toasts.
+					deepLinkId = null;
+					syncUrl();
+				} else {
+					deepLinkFailedId = id;
+				}
+			});
+	}
+
 	$effect(() => {
 		const id = page.url.searchParams.get('id');
-		if (!id || deepLinkLoaded === id) return;
-		deepLinkLoaded = id;
-		getContract(id)
-			.then((c) => (editing = c))
-			.catch(() => toast(m('contracts.notFound'), 'error'));
+		if (!id) {
+			untrack(() => {
+				deepLinkId = null;
+				deepLinkLoaded = null;
+				deepLinkFailedId = null;
+			});
+			return;
+		}
+		if (untrack(() => deepLinkLoaded) === id) return;
+		untrack(() => {
+			deepLinkId = id;
+			deepLinkLoaded = id;
+			openDeepLink(id);
+		});
 	});
 
 	async function openDetail(c: Contract) {
+		deepLinkId = c.id;
+		deepLinkFailedId = null;
+		syncUrl();
 		// Fetch the full record so the spend summary + line items are present
 		// (the list payload omits the heavier `spend` block on some backends).
+		let full: Contract;
 		try {
-			editing = await getContract(c.id);
+			full = await getContract(c.id);
 		} catch {
-			editing = c;
+			full = c;
 		}
+		// Closed (or another row opened) while the fetch was out.
+		if (deepLinkId === c.id) editing = full;
 	}
 
 	function closeModal() {
 		editing = null;
 		showCreate = false;
-		const url = new URL(page.url.href);
-		if (url.searchParams.has('id')) {
-			url.searchParams.delete('id');
-			replaceState(`${url.pathname}${url.search}`, {});
-			deepLinkLoaded = null;
+		if (deepLinkId) {
+			// Through the single writer, so filters changed since the modal
+			// opened survive the close. `deepLinkLoaded` keeps the id so the
+			// effect does not re-open it off the unchanged `page.url`.
+			deepLinkId = null;
+			syncUrl();
 		}
 	}
 
@@ -350,6 +405,14 @@
 		<SearchBox bind:value={search} placeholder={m('contracts.search.placeholder')} ariaLabel={m('contracts.search.aria')} />
 		<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 	</div>
+
+	{#if deepLinkFailedId}
+		<LoadError
+			message={m('contracts.deepLink.loadFailed')}
+			onretry={() => deepLinkFailedId && openDeepLink(deepLinkFailedId)}
+			testId="contracts-deeplink-error"
+		/>
+	{/if}
 
 	{#if contractStore.errored}
 		<LoadError

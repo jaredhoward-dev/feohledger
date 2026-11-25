@@ -108,4 +108,72 @@ test.describe('/contracts — URL state and selection', () => {
 			page.getByRole('checkbox', { name: 'Select contract E2E-CTR-1' })
 		).toBeChecked();
 	});
+
+	test('opening a row writes ?id= and a reload re-opens it', async ({ page }) => {
+		await mockList(page);
+		await mockDetail(page);
+		await page.goto('/contracts');
+		await page.getByRole('button', { name: 'Open contract E2E-CTR-2' }).click();
+		await expect(dialog(page)).toBeVisible();
+		await expect(page).toHaveURL(new RegExp(`[?&]id=${contract(2).id}`));
+
+		await page.reload();
+		await expect(dialog(page)).toBeVisible();
+		await expect(dialog(page)).toContainText('E2E-CTR-2');
+	});
+
+	test('closing a deep-linked contract keeps later filters and never re-writes its ?id=', async ({
+		page
+	}) => {
+		await mockList(page);
+		await mockDetail(page);
+		await page.goto(`/contracts?id=${contract(1).id}`);
+		await expect(dialog(page)).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(dialog(page)).toBeHidden();
+		await expect(page).not.toHaveURL(/[?&]id=/);
+
+		await page.getByRole('button', { name: 'Draft', exact: true }).click();
+		await expect(page).toHaveURL(/[?&]status=draft/);
+		await expect(page).not.toHaveURL(/[?&]id=/);
+
+		await page.reload();
+		await expect(page.getByRole('button', { name: 'Draft', exact: true })).toHaveAttribute(
+			'aria-pressed',
+			'true'
+		);
+		await expect(page.getByRole('button', { name: 'Open contract E2E-CTR-1' })).toBeVisible();
+		await expect(dialog(page)).toBeHidden();
+	});
+
+	test('a deep link that fails to load says so with a Retry, not "not found"', async ({
+		page
+	}) => {
+		await mockList(page);
+		let fail = true;
+		await mockDetail(page, () => (fail ? 500 : 200));
+		await page.goto(`/contracts?id=${contract(3).id}`);
+
+		const error = page.getByTestId('contracts-deeplink-error');
+		await expect(error).toContainText('Couldn’t load the linked contract');
+		await expect(page.getByText('Contract not found')).toHaveCount(0);
+		await expect(page).toHaveURL(new RegExp(`[?&]id=${contract(3).id}`));
+
+		fail = false;
+		await error.getByRole('button', { name: 'Retry' }).click();
+		await expect(dialog(page)).toBeVisible();
+		await expect(error).toBeHidden();
+	});
+
+	test('a deep link to a missing contract says "not found" and leaves the URL', async ({
+		page
+	}) => {
+		await mockList(page);
+		await mockDetail(page, () => 404);
+		await page.goto(`/contracts?id=${contract(4).id}`);
+		await expect(page.getByText('Contract not found')).toBeVisible();
+		await expect(page).not.toHaveURL(/[?&]id=/);
+		await expect(page.getByTestId('contracts-deeplink-error')).toHaveCount(0);
+	});
 });
