@@ -24,6 +24,10 @@
 
 	let email = $state('');
 	let error = $state('');
+	// True while `error` is about the address itself (the one the field's
+	// `aria-invalid` may claim); a captcha or server error describes the
+	// field without calling its value wrong.
+	let addressInvalid = $state(false);
 	let submitting = $state(false);
 	// The address the confirmation names; `null` while the form is showing.
 	let sentTo = $state<string | null>(null);
@@ -37,9 +41,11 @@
 		event.preventDefault();
 		if (submitting) return;
 		error = '';
+		addressInvalid = false;
 		const address = email.trim();
 		if (!input?.checkValidity() || !address) {
 			error = m('marketing.findWorkspace.lookup.invalid');
+			addressInvalid = true;
 			input?.focus();
 			return;
 		}
@@ -74,6 +80,7 @@
 	async function again() {
 		sentTo = null;
 		error = '';
+		addressInvalid = false;
 		captchaToken = null;
 		await tick();
 		input?.focus();
@@ -90,7 +97,7 @@
 			<!-- Inserted with its text, so it is announced on arrival; no standing
 			     empty alert region beside the address form's own. -->
 			{#if error}
-				<div class="error" role="alert">{error}</div>
+				<div class="error" id="lookup-error" role="alert">{error}</div>
 			{/if}
 
 			<label>
@@ -104,7 +111,12 @@
 					autocomplete="email"
 					autocapitalize="off"
 					spellcheck="false"
-					oninput={() => (error = '')}
+					aria-invalid={addressInvalid ? 'true' : undefined}
+					aria-describedby={error ? 'lookup-error' : undefined}
+					oninput={() => {
+						error = '';
+						addressInvalid = false;
+					}}
 				/>
 			</label>
 

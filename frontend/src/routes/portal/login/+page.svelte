@@ -209,9 +209,13 @@
 			<h1>{portalBrand.productName}</h1>
 			<p class="subtitle">{m('portal.login.subtitle')}</p>
 
-			{#if storageBlocked}
-				<div class="error storage-blocked" role="status">{m('auth.login.storageBlocked')}</div>
-			{/if}
+			<!-- Always in the DOM, so the notice set on mount is announced, and
+			     neutral information rather than a failure — as on /login. -->
+			<div role="status" aria-live="polite">
+				{#if storageBlocked}
+					<div class="info storage-blocked">{m('auth.login.storageBlocked')}</div>
+				{/if}
+			</div>
 			<div role="alert" aria-live="assertive">
 				{#if error}
 					<div class="error">{error}</div>
@@ -330,6 +334,18 @@
 		padding: 10px 14px;
 		border-radius: 4px;
 		font-size: 0.85rem;
+	}
+	/* Information, not a failure: the storage notice. The same accent-tint
+	   recipe as AuthShell's `.info`, which this page does not mount. */
+	.info {
+		background: var(--accent-tint);
+		border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+		color: var(--text);
+		padding: 10px 14px;
+		border-radius: 4px;
+		font-size: 0.85rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
 	}
 	label {
 		display: flex;
