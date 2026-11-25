@@ -164,10 +164,14 @@ on resume (§498). Supplier-portal users acknowledge the Privacy Policy only
 `GET /api/portal/auth/me` reports `legal_acceptance_required` and the portal
 layout draws the same blocking step (§500); a stale version there is the
 coded 422 `privacy_acknowledgement_required`, the portal twin of
-`legal_acceptance_required`. API callers are not prompted, and no server-side
-gate refuses an unaccepted user, so the flag is enforced only by the web,
-mobile and portal screens (`docs/authentication.md` § Terms and Privacy
-acceptance, `docs/followups.md`).
+`legal_acceptance_required`. The server enforces it too (§505): until they
+accept, every other request from that employee is a 403 coded
+`legal_acceptance_required` (a supplier: `privacy_acknowledgement_required`),
+except `/me`, the accept endpoint, change-password and logout. **So a user
+with nothing on record cannot work, through any client or a script holding
+their JWT, until they accept on the web or mobile.** `/api/v1` API keys are
+not gated (no person to accept). Detail: `docs/authentication.md` § Terms and
+Privacy acceptance.
 
 ### An address can belong to only one workspace
 

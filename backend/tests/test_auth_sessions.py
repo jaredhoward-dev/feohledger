@@ -118,7 +118,7 @@ async def test_get_current_user_stashes_the_requesting_jti():
     """`user.session_jti` is what lets the session routes tell the caller's own
     entry apart from the rest — without it "sign out everywhere else" would
     sign the caller out too."""
-    from app.api.deps import get_current_user
+    from app.api.deps import get_authenticated_user
 
     jti = str(uuid.uuid4())
     token = jwt_hs256.encode(
@@ -137,7 +137,7 @@ async def test_get_current_user_stashes_the_requesting_jti():
     db.execute = AsyncMock(return_value=result)
 
     with patch("app.api.deps.is_token_blocked", AsyncMock(return_value=False)):
-        user = await get_current_user(authorization=f"Bearer {token}", db=db)
+        user = await get_authenticated_user(authorization=f"Bearer {token}", db=db)
 
     assert user.session_jti == jti
 

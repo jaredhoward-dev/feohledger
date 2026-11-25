@@ -18,9 +18,9 @@ from app.api.deps import (
     create_access_token,
     create_vendor_access_token,
     decode_token,
-    get_current_user,
+    get_authenticated_user,
 )
-from app.api.portal_deps import get_current_vendor_user
+from app.api.portal_deps import get_authenticated_vendor_user
 
 # ---------- JWT shape + isolation -----------------------------------------
 
@@ -47,7 +47,7 @@ async def test_get_current_user_rejects_vendor_token():
     that's the whole point of separating the two surfaces."""
     token = create_vendor_access_token(uuid.uuid4(), uuid.uuid4())
     with pytest.raises(HTTPException) as exc:
-        await get_current_user(authorization=f"Bearer {token}", db=AsyncMock())
+        await get_authenticated_user(authorization=f"Bearer {token}", db=AsyncMock())
     assert exc.value.status_code == 401
 
 
@@ -56,14 +56,14 @@ async def test_get_current_vendor_user_rejects_employee_token():
     """Symmetry: an employee token must not unlock the supplier portal."""
     token = create_access_token(uuid.uuid4(), uuid.uuid4())
     with pytest.raises(HTTPException) as exc:
-        await get_current_vendor_user(authorization=f"Bearer {token}", db=AsyncMock())
+        await get_authenticated_vendor_user(authorization=f"Bearer {token}", db=AsyncMock())
     assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_get_current_vendor_user_rejects_missing_auth():
     with pytest.raises(HTTPException) as exc:
-        await get_current_vendor_user(authorization=None, db=AsyncMock())
+        await get_authenticated_vendor_user(authorization=None, db=AsyncMock())
     assert exc.value.status_code == 401
 
 
@@ -89,7 +89,9 @@ async def test_get_current_vendor_user_resolves_active_user(monkeypatch):
     monkeypatch.setattr("app.api.portal_deps.is_token_blocked", _not_blocked)
 
     tenant = SimpleNamespace(id=org_id)
-    resolved = await get_current_vendor_user(authorization=f"Bearer {token}", tenant=tenant, db=db)
+    resolved = await get_authenticated_vendor_user(
+        authorization=f"Bearer {token}", tenant=tenant, db=db
+    )
     assert resolved is fake_vu
 
 
@@ -110,7 +112,7 @@ async def test_get_current_vendor_user_rejects_inactive(monkeypatch):
     monkeypatch.setattr("app.api.portal_deps.is_token_blocked", _not_blocked)
 
     with pytest.raises(HTTPException) as exc:
-        await get_current_vendor_user(authorization=f"Bearer {token}", db=db)
+        await get_authenticated_vendor_user(authorization=f"Bearer {token}", db=db)
     assert exc.value.status_code == 401
 
 
@@ -124,7 +126,7 @@ async def test_get_current_vendor_user_rejects_revoked_token(monkeypatch):
     monkeypatch.setattr("app.api.portal_deps.is_token_blocked", _blocked)
 
     with pytest.raises(HTTPException) as exc:
-        await get_current_vendor_user(authorization=f"Bearer {token}", db=AsyncMock())
+        await get_authenticated_vendor_user(authorization=f"Bearer {token}", db=AsyncMock())
     assert exc.value.status_code == 401
 
 

@@ -1513,27 +1513,26 @@ the runbook, no acceptance record on signup).
       app (the Intuit channel first: its 24-hour clock already applies), and
       every six months for the rows already filled in.
 
-- [ ] **(c) The Terms / Privacy re-prompt exists on the web, mobile and the supplier portal, and nothing gates an unaccepted user.**
-      Acceptance is required and recorded on signup and on a set-password
-      link (`legal_acceptances`, decisions §495). `GET /api/auth/me` returns
-      `legal_acceptance_required` and `POST /api/auth/legal-acceptance`
-      records it; the web app now draws a blocking accept step in place of
-      the app shell while the flag is true (`layout/LegalAcceptStep`,
-      decisions §497), and the seed and the e2e user helper record acceptance
-      for the accounts they create. The mobile app asks too (decisions §498),
-      and the supplier portal asks the Privacy Policy alone at set-password
-      (§499) and after sign-in (portal `/me` flag + a blocking step in the
-      portal layout, §500). Still open: the flag is advisory server-side, so
-      API callers are never asked. **Durable fix:** a server-side gate that
-      refuses an unaccepted user (a coded `legal_acceptance_required`; the
-      portal's twin coded `privacy_acknowledgement_required`) on everything
-      but `/me`, the accept / acknowledge endpoints, sign-out and the legal
-      pages. Decide there whether `/api/v1` API-key callers are in scope (the
-      key's creator accepted; a key is not a person). A mobile build older
-      than a version bump can then only sign out until it is updated (its
-      Accept is refused, §498), so plan a bump's app release before or with
-      it. **Trigger:** before the first version bump of either document and
-      before the Xero app goes to production.
+- [ ] **(c) The Terms / Privacy gate (§505) has three loose ends: the token-link approval channels, a mid-session 403 in the clients, and mobile push after accepting.**
+      The server refuses an employee or supplier who owes an acceptance
+      (403 `legal_acceptance_required` / `privacy_acknowledgement_required`,
+      decisions §505). Still open: (1) the Slack / Teams approval buttons and
+      the emailed approve link act for a person on a single-use action token,
+      not a JWT, so an unaccepted approver can still approve through them;
+      (2) the web API client and the mobile `ApiClient` state a 403 with that
+      code as an ordinary error rather than flipping to the accept step — it
+      only matters after a version bump in an open session, which the next
+      `/me` (page load, app resume) already catches; (3) mobile registers its
+      push token on sign-in, which the gate now refuses for an unaccepted
+      user, and does not retry after Accept. **Durable fix:** (1) check
+      `legal_acceptance.requires_acceptance` for the acting user in the
+      action-token redeemers and refuse with the same code; (2) on that code
+      from any call, set the user's flag (web: a handler `api.ts` calls into
+      the auth store; mobile: the same into `AuthStore`); (3) call
+      `PushService.registerWithBackend()` when `legalAcceptanceRequired`
+      clears in `AuthGate._onAuthChanged`. **Trigger:** before the first
+      version bump of either document and before the Xero app goes to
+      production.
 - [ ] **(c) Counsel: are supplier-portal users bound by any terms of use, and is a Privacy Policy acknowledgement the right record?**
       The published Terms bind only the customer organisation ("a Supplier User
       is not our customer", `/legal/terms` §2; the customer answers for them,

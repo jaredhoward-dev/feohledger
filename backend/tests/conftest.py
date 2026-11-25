@@ -823,8 +823,10 @@ async def _ensure_test_tenants() -> dict:
     from app.config import settings as cfg
     from app.database import _make_tenant_url
     from app.models import Base
+    from app.models.legal_acceptance import LegalAcceptance
     from app.models.organization import Organization
     from app.models.user import Role, User, UserRole
+    from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
     from app.services.tenant_provisioning import (
         CONTROL_TABLES,
         _create_postgres_database,
@@ -979,6 +981,25 @@ async def _ensure_test_tenants() -> dict:
                         users[role_name] = uid
                     else:
                         users[role_name] = u.id
+                # Every call, not only on creation: a test of the unaccepted
+                # path drops a harness user's rows, and the next test must
+                # find the account past the Terms / Privacy gate (§505).
+                for uid in users.values():
+                    for document, version in CURRENT_LEGAL_VERSIONS.items():
+                        await s.execute(
+                            pg_insert(LegalAcceptance)
+                            .values(
+                                id=uuid.uuid4(),
+                                user_id=uid,
+                                organization_id=org_id,
+                                document=document,
+                                version=version,
+                                source="seed",
+                            )
+                            .on_conflict_do_nothing(
+                                constraint="uq_legal_acceptances_user_doc_version"
+                            )
+                        )
                 await s.commit()
             tenants[key] = TenantInfo(slug=slug, db_name=db_name, org_id=org_id, users=users)
 
@@ -1474,6 +1495,77 @@ def pytest_configure(config) -> None:
         "(e.g. plan('scale')); without it they hold no subscription, i.e. read as free. "
         "See RealDB.subscribe and docs/decisions.md §258.",
     )
+    config.addinivalue_line(
+        "markers",
+        "legal_unaccepted: users and portal users the test creates start with NO Terms / "
+        "Privacy acceptance on record, so they meet the server-side gate (decisions §505). "
+        "Without it, _test_users_accept_the_legal_versions records the versions in force "
+        "for every one, as scripts/seed.py does for fixture accounts.",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _test_users_accept_the_legal_versions(request):
+    """Record the Terms / Privacy versions in force for every employee and
+    portal user a test inserts, the way `scripts/seed.py` and the e2e helper
+    do for fixture accounts (decisions §497, §500), so the server-side gate
+    (§505) refuses only the users a test means it to. A test of the
+    unaccepted path opts out with `@pytest.mark.legal_unaccepted`.
+
+    A mapper `after_insert` hook writes the row on the inserting connection,
+    so it lands in the same database and transaction as the user (the
+    control plane for `User`, the tenant for `VendorUser`). Mock-only tests
+    never flush, so this costs them nothing.
+    """
+    if request.node.get_closest_marker("legal_unaccepted") is not None:
+        yield
+        return
+    from sqlalchemy import event
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from app.models.legal_acceptance import LegalAcceptance
+    from app.models.user import User
+    from app.models.vendor_user import VendorUser
+    from app.models.vendor_user_legal_acceptance import VendorUserLegalAcceptance
+    from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
+    from app.services.portal_legal_acceptance import current_portal_versions
+
+    def _user_accepts(_mapper, connection, target) -> None:
+        for document, version in CURRENT_LEGAL_VERSIONS.items():
+            connection.execute(
+                pg_insert(LegalAcceptance)
+                .values(
+                    id=uuid.uuid4(),
+                    user_id=target.id,
+                    organization_id=target.organization_id,
+                    document=document,
+                    version=version,
+                    source="seed",
+                )
+                .on_conflict_do_nothing(constraint="uq_legal_acceptances_user_doc_version")
+            )
+
+    def _vendor_user_acknowledges(_mapper, connection, target) -> None:
+        for document, version in current_portal_versions().items():
+            connection.execute(
+                pg_insert(VendorUserLegalAcceptance)
+                .values(
+                    id=uuid.uuid4(),
+                    vendor_user_id=target.id,
+                    document=document,
+                    version=version,
+                    source="seed",
+                )
+                .on_conflict_do_nothing(constraint="uq_vendor_user_legal_acceptances_doc_version")
+            )
+
+    event.listen(User, "after_insert", _user_accepts)
+    event.listen(VendorUser, "after_insert", _vendor_user_acknowledges)
+    try:
+        yield
+    finally:
+        event.remove(User, "after_insert", _user_accepts)
+        event.remove(VendorUser, "after_insert", _vendor_user_acknowledges)
 
 
 @pytest_asyncio.fixture

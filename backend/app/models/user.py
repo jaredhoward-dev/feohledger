@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, query_expression, relationship
 
 from app.models.base import Base, TimestampMixin
 
@@ -150,3 +150,12 @@ class User(Base, TimestampMixin):
     # populates so `require_permission` / `/auth/me` read it without recomputing
     # or re-querying. Defaults to an empty frozenset on a freshly-built User.
     effective_permissions: frozenset[str] = frozenset()
+
+    # How many of the legal documents in force (`legal_acceptance.
+    # CURRENT_LEGAL_VERSIONS`) this user has accepted at their current version.
+    # NOT a column: loaded only by the auth resolver, which folds the count into
+    # the query that already reads the user (`with_expression`), so the Terms /
+    # Privacy gate costs no extra round trip (decisions §505). `None` wherever
+    # the user was loaded any other way; `legal_acceptance.requires_acceptance`
+    # then counts with a query of its own.
+    legal_current_acceptances: Mapped[int | None] = query_expression()

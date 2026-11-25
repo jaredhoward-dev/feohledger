@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, with_expression
 
 from app.config import settings
 from app.database import get_control_db, get_tenant_engine
@@ -93,10 +93,19 @@ def decode_token(token: str) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
-async def get_current_user(
+async def get_authenticated_user(
     authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_control_db),
 ) -> User:
+    """Resolve the employee access token to its user, WITHOUT the Terms /
+    Privacy gate.
+
+    Only the routes an unaccepted user needs to reach their accept step
+    depend on this directly (`LEGAL_GATE_EXEMPT_ROUTES`); everything else goes
+    through `get_current_user`, which adds the gate. A new route on this
+    dependency fails `tests/test_legal_acceptance_gate.py` until it is listed
+    there with its reason (decisions §505).
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
@@ -128,8 +137,20 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked"
         )
 
+    # Local import: the service imports `app.api.refusals`, and deps stays
+    # import-light for the Lambda paths.
+    from app.services.legal_acceptance import current_acceptances_count
+
+    # The count of current Terms / Privacy acceptances rides on this query
+    # (`with_expression`), so the gate in `get_current_user` costs no extra
+    # round trip.
     result = await db.execute(
-        select(User).where(User.id == user_id).options(selectinload(User.roles))
+        select(User)
+        .where(User.id == user_id)
+        .options(
+            selectinload(User.roles),
+            with_expression(User.legal_current_acceptances, current_acceptances_count()),
+        )
     )
     user = result.scalar_one_or_none()
     if user is None or not user.is_active:
@@ -151,6 +172,52 @@ async def get_current_user(
     # blocklist/type checks already done above. `None` for a legacy token
     # minted before the claim existed.
     user.session_jti = jti
+    return user
+
+
+#: (method, path) of every route that resolves the caller through
+#: `get_authenticated_user` and so is NOT behind the Terms / Privacy gate — the
+#: minimum the accept step needs (decisions §505). `/auth/logout` is not here
+#: because it reads the token itself and never resolves a user; the SSO / SAML
+#: callbacks, login, MFA and password-reset routes issue tokens rather than
+#: take one. Pinned against the app's routes by
+#: `tests/test_legal_acceptance_gate.py`.
+LEGAL_GATE_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # The accept step reads the flag here, and the shell's account load.
+        ("GET", "/api/auth/me"),
+        # The accept step's own write.
+        ("POST", "/api/auth/legal-acceptance"),
+        # The forced password change runs before the accept step (§497), so a
+        # user who owes both must be able to finish it first.
+        ("POST", "/api/auth/change-password"),
+    }
+)
+
+
+async def get_current_user(
+    user: User = Depends(get_authenticated_user),
+    db: AsyncSession = Depends(get_control_db),
+) -> User:
+    """The authenticated employee, refused while they owe a Terms / Privacy
+    acceptance (decisions §505).
+
+    Every employee route depends on this (directly or through `require_roles`
+    / `require_permission` / `get_tenant`), so it is the one place the gate
+    lives: a 403 coded `legal_acceptance_required`, which the web and mobile
+    apps answer with their accept step. Exempt routes depend on
+    `get_authenticated_user` instead and are listed in
+    `LEGAL_GATE_EXEMPT_ROUTES`. Machine callers never reach here: the
+    `/api/v1` API-key routes, SCIM's bearer token and the webhooks use their
+    own authentication.
+    """
+    from app.services import legal_acceptance
+
+    if await legal_acceptance.requires_acceptance(db, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=legal_acceptance.acceptance_refusal(),
+        )
     return user
 
 

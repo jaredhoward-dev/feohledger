@@ -61,10 +61,11 @@ from app.api.deps import (
     ROLE_AP_MANAGER,
     ROLE_CFO,
     get_api_key_principal,
+    get_authenticated_user,
     get_current_user,
     require_roles,
 )
-from app.api.portal_deps import get_current_vendor_user
+from app.api.portal_deps import get_authenticated_vendor_user, get_current_vendor_user
 from app.api.scim import get_scim_tenant
 from app.main import app
 from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
@@ -81,8 +82,14 @@ from tests.permission_gates import permission_gate_sets
 # dependency tree IS the auth guarantee — and a renamed closure changes nothing.
 PRIMARY_AUTH_DEPENDENCIES: frozenset[Callable] = frozenset(
     {
-        get_current_user,  # employee JWT
-        get_current_vendor_user,  # supplier-portal JWT (typ=vendor)
+        get_current_user,  # employee JWT, behind the Terms / Privacy gate (§505)
+        get_current_vendor_user,  # supplier-portal JWT (typ=vendor), same gate
+        # The same two resolvers without the gate: only the routes an
+        # unaccepted user needs to reach their accept step
+        # (`LEGAL_GATE_EXEMPT_ROUTES`, `PORTAL_LEGAL_GATE_EXEMPT_ROUTES`,
+        # pinned in `tests/test_legal_acceptance_gate.py`).
+        get_authenticated_user,
+        get_authenticated_vendor_user,
         get_api_key_principal,  # programmatic /api/v1 X-API-Key
     }
 )

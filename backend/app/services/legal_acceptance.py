@@ -9,10 +9,13 @@ visitor ticks always names the version the backend will record and demand.
 
 Bump a version here when the published document changes in a way users must
 agree to again: every user whose newest acceptance is older is then reported
-by ``GET /api/auth/me`` → ``legal_acceptance_required``. That flag is advisory
-today: no client screen reads it and no server-side gate refuses the user yet
-(§495; the re-prompt screen is in ``docs/followups.md``). A typo fix on the page
-is not a new version.
+by ``GET /api/auth/me`` → ``legal_acceptance_required``, the web and mobile
+apps draw their accept step (§497, §498), and ``api/deps.get_current_user``
+refuses every other employee request with a 403 coded
+``legal_acceptance_required`` until they accept (§505). A mobile build older
+than the bump can then only sign out (its Accept is refused), so ship a bump
+with, or after, an app release carrying the new versions. A typo fix on the
+page is not a new version.
 
 The client sends back the versions it showed; the server refuses anything but
 the current ones (``legal_acceptance_required``), so a stale tab cannot record
@@ -26,12 +29,13 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.refusals import coded_refusal
 from app.models.legal_acceptance import LegalAcceptance
+from app.models.user import User
 
 #: document → version in force (its published effective date, YYYY-MM-DD).
 CURRENT_LEGAL_VERSIONS: dict[str, str] = {
@@ -51,6 +55,10 @@ LEGAL_ACCEPTANCE_REQUIRED = "legal_acceptance_required"
 
 
 def acceptance_refusal() -> dict:
+    """The coded refusal for a stale accept (422) and for the gate (403, §505).
+
+    One code for both: either way the client's answer is its accept step.
+    """
     return coded_refusal(
         LEGAL_ACCEPTANCE_REQUIRED,
         "Please accept the current Terms of Service and Privacy Policy to continue.",
@@ -63,6 +71,41 @@ def accepts_current(terms_version: str | None, privacy_version: str | None) -> b
         terms_version == CURRENT_LEGAL_VERSIONS["terms"]
         and privacy_version == CURRENT_LEGAL_VERSIONS["privacy"]
     )
+
+
+def current_acceptances_count():
+    """Correlated count of the user's acceptances of the versions in force.
+
+    Loaded into ``User.legal_current_acceptances`` by the auth resolver's own
+    user query (``with_expression``), so the gate adds no round trip. The
+    (user, document, version) unique index serves it.
+    """
+    return (
+        select(func.count())
+        .select_from(LegalAcceptance)
+        .where(
+            LegalAcceptance.user_id == User.id,
+            or_(
+                *(
+                    and_(LegalAcceptance.document == doc, LegalAcceptance.version == ver)
+                    for doc, ver in CURRENT_LEGAL_VERSIONS.items()
+                )
+            ),
+        )
+        .scalar_subquery()
+    )
+
+
+async def requires_acceptance(db: AsyncSession, user: User) -> bool:
+    """True while ``user`` has not accepted every document version in force.
+
+    Reads the count the auth resolver folded into its query when present, and
+    asks the database only for a user loaded some other way.
+    """
+    count = getattr(user, "legal_current_acceptances", None)
+    if count is None:
+        return bool(await missing_documents(db, user.id))
+    return count < len(CURRENT_LEGAL_VERSIONS)
 
 
 async def missing_documents(db: AsyncSession, user_id: uuid.UUID) -> list[str]:
