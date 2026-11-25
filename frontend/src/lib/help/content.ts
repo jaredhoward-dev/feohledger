@@ -7,7 +7,6 @@
 // passes m(), and vitest can drive it with the English catalogue.
 
 import type { MessageKey } from '#lib/i18n/messages.ts';
-import { NAV } from '#lib/nav.ts';
 import { GLOSSARY } from './glossary.ts';
 import { CONCEPT_GUIDES } from './guides/concepts.ts';
 import { INVOICE_GUIDES } from './guides/invoices.ts';
@@ -16,6 +15,7 @@ import { SETUP_GUIDES } from './guides/setup.ts';
 import { START_GUIDES } from './guides/start.ts';
 import { VENDOR_GUIDES } from './guides/vendors.ts';
 import { plainText, type InlinePart } from './inline.ts';
+import { navPageFor } from './navPages.ts';
 import { PAGE_HELP } from './pages.ts';
 import { termHref, termKey, termShortKey } from './terms.ts';
 import type { GlossaryCategory, GlossaryEntry, Guide, GuideKind, HelpRole } from './types.ts';
@@ -104,24 +104,7 @@ export const termFor = (id: string): GlossaryEntry | undefined => termsById.get(
 // The app's pages, for [[page:…]] links and the page directory
 // ---------------------------------------------------------------------------
 
-export interface NavPage {
-	href: string;
-	labelKey: MessageKey;
-	roles?: string[];
-	permissions?: string[];
-	/** The group's label key, for a page folded into a sidebar group. */
-	groupKey?: MessageKey;
-}
-
-/** Every sidebar destination, in sidebar order. */
-export const NAV_PAGES: NavPage[] = NAV.flatMap((e) =>
-	e.kind === 'link'
-		? [{ href: e.href, labelKey: e.labelKey, roles: e.roles, permissions: e.permissions }]
-		: e.children.map((c) => ({ href: c.href, labelKey: c.labelKey, roles: c.roles, permissions: c.permissions, groupKey: e.labelKey }))
-);
-
-const navByHref = new Map(NAV_PAGES.map((p) => [p.href, p]));
-export const navPageFor = (href: string): NavPage | undefined => navByHref.get(href);
+export { NAV_PAGES, navPageFor, type NavPage } from './navPages.ts';
 
 export { pageHelpFor, pageHelpHref } from './routeHelp.ts';
 

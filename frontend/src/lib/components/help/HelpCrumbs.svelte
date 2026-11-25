@@ -6,10 +6,13 @@
 	import { m } from '#lib/i18n/store.svelte.ts';
 
 	let {
+		home,
 		trail,
 		current,
 		currentLang
 	}: {
+		/** The first crumb. Default: the help centre; the supplier portal's help passes its own. */
+		home?: { href: string; label: string };
 		trail: { href: string; label: string }[];
 		current: string;
 		/** `lang` of the current page's title, when it is English help prose. */
@@ -19,7 +22,7 @@
 
 <nav class="crumbs" aria-label={m('help.crumbs')}>
 	<ol>
-		<li><a href="/help">{m('help.title')}</a></li>
+		<li><a href={home?.href ?? '/help'}>{home?.label ?? m('help.title')}</a></li>
 		{#each trail as t (t.href + t.label)}
 			<li><a href={t.href}>{t.label}</a></li>
 		{/each}
