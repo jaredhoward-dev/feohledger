@@ -46,6 +46,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import EmailIntakePanel from '#lib/components/organization/EmailIntakePanel.svelte';
 	import ChatNotificationsPanel from '#lib/components/organization/ChatNotificationsPanel.svelte';
 	import CustomDomainsPanel from '#lib/components/organization/CustomDomainsPanel.svelte';
 	import ResidencyPanel from '#lib/components/organization/ResidencyPanel.svelte';
@@ -1872,89 +1873,22 @@
 				{/if}
 
 				{#if section === 'email-intake'}
-					<section class="card" id="org-email-intake">
-						<div class="help-row">
-							<h2>{m('org.section.emailIntake')}</h2>
-							<HelpTip term="email-intake" />
-						</div>
-						<p class="card-hint">{m('org.emailIntake.hint')}</p>
-
-						{#if !userLoaded || loadingIntake}
-							<LoadingState label={m('org.emailIntake.loading')} />
-						{:else if readOnly}
-							<!-- GET is admin-only. Say that, rather than firing a request
-							     that 403s and rendering a load failure nobody can act on. -->
-							<p class="card-hint" data-testid="email-intake-admin-only">
-								{m('org.emailIntake.adminOnly')}
-							</p>
-						{:else if intakeError}
-							<LoadError message={intakeError} onretry={loadEmailIntake} testId="email-intake-error" />
-						{:else if intakeUnavailable}
-							<!-- Proven: a token exists and the server still renders no
-							     address, which only happens when the platform has no
-							     intake domain. No rotate control here — it would mint
-							     another token that still addresses nothing. -->
-							<p class="intake-unavailable" data-testid="email-intake-unavailable">
-								{m('org.emailIntake.unavailable')}
-							</p>
-						{:else if intakeUnprovisioned}
-							<p class="card-hint" data-testid="email-intake-unprovisioned">
-								{m('org.emailIntake.notProvisioned')}
-							</p>
-							<button
-								type="button"
-								class="btn-save-section"
-								disabled={rotatingIntake}
-								onclick={generateIntakeAddress}
-							>
-								{rotatingIntake
-									? m('org.emailIntake.generating')
-									: m('org.emailIntake.generate')}
-							</button>
-						{:else}
-							<p class="intake-address-label">{m('org.emailIntake.addressLabel')}</p>
-							<div class="intake-address-row">
-								<code class="intake-address mono" data-testid="email-intake-address"
-									>{intakeAddress}</code
-								>
-								<button
-									type="button"
-									class="btn-save-section"
-									aria-label={intakeCopied ? undefined : m('org.emailIntake.copyAria')}
-									onclick={copyIntakeAddress}
-								>
-									{intakeCopied ? m('org.emailIntake.copied') : m('org.emailIntake.copy')}
-								</button>
-							</div>
-							<p class="card-hint">{m('org.emailIntake.secretHint')}</p>
-
-							{#if confirmRotateIntake}
-								<p class="intake-rotate-warning" role="alert" data-testid="email-intake-rotate-warning">
-									{m('org.emailIntake.rotateWarning')}
-								</p>
-							{/if}
-							<span class="intake-rotate">
-								<button
-									type="button"
-									class="btn-remove-domain"
-									class:armed={confirmRotateIntake}
-									disabled={rotatingIntake}
-									aria-label={rotatingIntake
-										? undefined
-										: confirmRotateIntake
-											? m('org.emailIntake.rotateConfirmAria')
-											: m('org.emailIntake.rotateAria')}
-									onclick={rotateIntakeAddress}
-								>
-									{rotatingIntake
-										? m('org.emailIntake.rotating')
-										: confirmRotateIntake
-											? m('org.emailIntake.rotateConfirm')
-											: m('org.emailIntake.rotate')}
-								</button>
-							</span>
-						{/if}
-					</section>
+					<EmailIntakePanel
+						{readOnly}
+						{userLoaded}
+						loading={loadingIntake}
+						loadError={intakeError}
+						onretry={loadEmailIntake}
+						unavailable={intakeUnavailable}
+						unprovisioned={intakeUnprovisioned}
+						address={intakeAddress}
+						copied={intakeCopied}
+						oncopy={copyIntakeAddress}
+						rotating={rotatingIntake}
+						confirmRotate={confirmRotateIntake}
+						ongenerate={generateIntakeAddress}
+						onrotate={rotateIntakeAddress}
+					/>
 				{/if}
 
 				{#if section === 'residency'}
@@ -2224,56 +2158,6 @@
 		color: var(--muted-on-tint);
 	}
 
-	.intake-address-label {
-		font-size: 0.72rem;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--text-muted);
-		margin: 0 0 6px;
-	}
-
-	.intake-address-row {
-		display: flex;
-		align-items: stretch;
-		gap: 8px;
-		margin-bottom: 12px;
-	}
-
-	.intake-address {
-		flex: 1;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 8px 12px;
-		font-size: 0.9rem;
-		word-break: break-all;
-		/* One click selects the whole address — it is copied by hand whenever
-		   the clipboard API is unavailable. */
-		user-select: all;
-	}
-
-	/* The armed rotate's explanation. Tinted-badge recipe: the -tint
-	   background with its matching -on-tint text, never the base token. */
-	.intake-rotate-warning {
-		margin: 0 0 10px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--warning-tint);
-		color: var(--warning-on-tint);
-	}
-
-	/* "This deployment has no intake domain" — a standing fact about the
-	   install, not something the reader did wrong. */
-	.intake-unavailable {
-		margin: 0;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--muted-tint);
-		color: var(--muted-on-tint);
-	}
-
 	.card {
 		background: var(--surface);
 		border: 1px solid var(--border);
@@ -2294,247 +2178,5 @@
 		font-size: 0.82rem;
 		color: var(--text-muted);
 		margin: 0 0 14px;
-	}
-
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
-	.full-width {
-		grid-column: 1 / -1;
-	}
-
-	/* Per-field explanation sitting OUTSIDE the <label> (it is referenced by
-	   aria-describedby instead), so it describes the control without being
-	   swallowed into its accessible name. */
-	.field-hint {
-		font-size: 0.78rem;
-		color: var(--text-muted);
-		margin: 6px 0 0;
-		line-height: 1.5;
-	}
-
-	label {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
-
-	/* The field label only (the first span of a <label>). */
-	label > span:first-child {
-		font-size: 0.78rem;
-		font-weight: 500;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-	}
-
-	.btn-remove-domain {
-		flex-shrink: 0;
-		padding: 4px 12px;
-		font-size: 0.82rem;
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		background: transparent;
-		color: var(--text);
-		cursor: pointer;
-	}
-
-	.btn-remove-domain:hover:not(:disabled),
-	.btn-remove-domain.armed {
-		/* --danger-strong, not --danger: this armed state is a fill carrying
-		   white text, and the old #e5484d fallback was 3.91:1. */
-		border-color: var(--danger-strong);
-		color: #fff;
-		background: var(--danger-strong);
-	}
-
-	.btn-remove-domain:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-
-	.domain-add {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
-
-	.domain-add input {
-		flex: 1;
-	}
-
-	/* "Enabled for a real provider but no webhook stored" — the adapter fails
-	   closed and posts nothing, so this is a live misconfiguration, not an
-	   error the user just caused. Tinted-badge recipe: the -tint background
-	   with its matching -on-tint text, never the base token. */
-	.chat-warning {
-		margin: 4px 0 12px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--warning-tint);
-		color: var(--warning-on-tint);
-	}
-
-	.chat-subhead {
-		margin: 20px 0 4px;
-		font-size: 0.95rem;
-		font-weight: 600;
-		color: var(--text);
-	}
-
-	.chat-events {
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		padding: 12px 14px;
-		margin: 14px 0 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-
-	.chat-events legend {
-		padding: 0 6px;
-		font-size: 0.82rem;
-		font-weight: 600;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	.chat-events .card-hint {
-		margin: 0 0 4px;
-	}
-
-	.chat-webhook-status {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		margin: 8px 0 12px;
-		flex-wrap: wrap;
-	}
-
-	.chat-webhook-set {
-		font-size: 0.88rem;
-		color: var(--text);
-	}
-
-	/* The TEXT-entry recipe, carved away from the three controls it also
-	   reached but was never written for. Svelte scopes this to
-	   `.card.svelte-x input:where(.svelte-x)`, which outranks the global
-	   control base in `app.css`.
-
-	   checkbox/radio: `background:` is a SHORTHAND — it reset
-	   `background-image`, the drawn tick, so the twelve `.switch-row` toggles
-	   rendered identically checked and unchecked.
-
-	   color: adding those two `:not()`s took this selector from 0-0-1 to
-	   0-2-1, which TIES `.color-field input[type='color']` (also 0-2-1) — and
-	   on a tie the later rule wins, so `width: 100%` started beating the
-	   swatch's own `width: 40px`. The branding swatch grew to the full 478px
-	   column and squeezed its sibling hex field to 22px, under the WCAG 2.2 AA
-	   SC 2.5.8 24px floor (caught by `tests-e2e/a11y/axe.spec.ts`). A native
-	   colour swatch is not a text entry: it wants neither this padding nor
-	   this width, so it is carved out rather than out-specified. */
-	input:not([type='checkbox']):not([type='radio']):not([type='color']),
-	select,
-	textarea {
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 8px 10px;
-		font-size: 0.88rem;
-		color: var(--text);
-		font-family: inherit;
-		width: 100%;
-		box-sizing: border-box;
-	}
-
-	textarea {
-		resize: vertical;
-	}
-
-	/* Same carve-out: `outline: none` here would strip the checkbox/radio
-	   focus ring `app.css` draws for them (WCAG 2.4.7). */
-	input:not([type='checkbox']):not([type='radio']):focus,
-	select:focus,
-	textarea:focus {
-		outline: none;
-		border-color: var(--accent);
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
-	}
-
-	.section-footer {
-		display: flex;
-		/* Same reason as `.erp-test-row` (now in ExtractionPanel): this row
-		   carries a Save button, an optional Test button and an optional result message, all of them
-		   `white-space: nowrap`. Without a wrap the row cannot shrink below its
-		   own max-content width and pushes the whole document sideways at 320px
-		   — WCAG 1.4.10. The `gap` replaces the spacing the buttons used to get
-		   for free from sitting on one line. */
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
-	}
-
-	.btn-save-section {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: none;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.btn-save-section:hover:not(:disabled) {
-		opacity: 0.85;
-	}
-
-	.btn-save-section:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	label.switch-row {
-		flex-direction: row;
-		align-items: center;
-		gap: 10px;
-		font-size: 0.9rem;
-		color: var(--text);
-		cursor: pointer;
-	}
-
-	label.switch-row span {
-		font-size: 0.9rem;
-		font-weight: 400;
-		color: var(--text);
-		text-transform: none;
-		letter-spacing: normal;
-	}
-
-	label.switch-row input[type='checkbox'] {
-		width: 16px;
-		height: 16px;
-		accent-color: var(--accent);
-		cursor: pointer;
-		flex-shrink: 0;
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
 	}
 </style>
