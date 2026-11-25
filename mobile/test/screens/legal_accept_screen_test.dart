@@ -16,6 +16,7 @@ import 'package:feohledger_mobile/legal_versions.generated.dart';
 import 'package:feohledger_mobile/screens/legal_accept_screen.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
+import 'package:feohledger_mobile/widgets/external_link.dart';
 
 http.Response _json(Object body, [int status = 200]) => http.Response(
       jsonEncode(body),
