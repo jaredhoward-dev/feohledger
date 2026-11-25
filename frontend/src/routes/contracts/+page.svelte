@@ -255,6 +255,13 @@
 			searchEffectRan = true;
 			return;
 		}
+		// A "select all N matching" set was resolved against the OLD term, so
+		// it no longer describes anything on screen; drop out of matching mode
+		// now (before the debounced fetch lands) so the prune effect narrows
+		// `selected` to what the new search shows. Left set, a bulk Terminate
+		// went to every contract the previous filter matched (/invoices does
+		// the same).
+		selectedAllMatching = false;
 		clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {
 			syncUrl();
@@ -272,6 +279,8 @@
 
 	$effect(() => {
 		statusFilter;
+		// Same as the search effect: a status change invalidates the matching set.
+		selectedAllMatching = false;
 		syncUrl();
 		// See the debounce effect above: swallow the rejection, the store's
 		// `errored` flag is what the UI reads.
