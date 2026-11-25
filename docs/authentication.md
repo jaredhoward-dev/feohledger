@@ -313,6 +313,15 @@ the lost race; `tests/test_migration_0138_email_lower_unique.py` the migration.
 
 `GET /api/auth/me` — returns the authenticated user's profile including their roles (e.g. `["admin", "ap_manager"]`). Used by the frontend layout to validate the session on page load and determine role-based UI visibility.
 
+It also reports `is_partner`: whether the operator has granted the workspace
+the partner (reseller) capability (`organizations.is_partner`, decisions
+§574). It is a property of the workspace, reported to every role; the nav's
+Partner Admin row and `/admin/partner` read it. Every `/api/partner` route
+requires it after the admin role: an admin of a workspace without it gets a
+coded 403 `partner_capability_required` (a non-admin still gets the role's
+plain 403 first). Attach and provision re-check it under the partner's row
+lock, so an operator revoke and a new child link serialize (decisions §578).
+
 `PATCH /api/auth/me` — self-service endpoint for updating name and password (requires current password).
 
 ### Terms and Privacy acceptance
