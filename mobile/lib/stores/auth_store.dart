@@ -78,6 +78,11 @@ class AuthStore extends ChangeNotifier with SequencedFetch {
   bool get loggedIn => _user != null;
 
   bool _acceptingLegal = false;
+
+  /// The request token of the accept that set [_acceptingLegal], so a stale
+  /// accept resolving after a newer one started never lowers the newer one's
+  /// flag.
+  int? _acceptToken;
   String? _legalError;
 
   /// The signed-in user has not accepted the Terms / Privacy versions in force
@@ -368,9 +373,13 @@ class AuthStore extends ChangeNotifier with SequencedFetch {
   /// `ApiClient`. A newer refresh or an acceptance supersedes this one
   /// ([SequencedFetch]), so a `/me` read that started before the user accepted
   /// cannot put the accept screen back after it.
+  ///
+  /// It never supersedes an acceptance already in flight: the accept's own
+  /// response is the fresher profile, and taking a newer token here would
+  /// discard it and leave the accept screen stuck "accepting".
   Future<void> refreshProfile() async {
     final current = _user;
-    if (current == null) return;
+    if (current == null || _acceptingLegal) return;
     final token = nextRequestToken();
     try {
       final fresh = await AuthApi.me();
@@ -391,6 +400,7 @@ class AuthStore extends ChangeNotifier with SequencedFetch {
     if (_user == null || _acceptingLegal) return LegalAcceptOutcome.failed;
     final token = nextRequestToken();
     _acceptingLegal = true;
+    _acceptToken = token;
     _legalError = null;
     notifyListeners();
     try {
@@ -398,13 +408,13 @@ class AuthStore extends ChangeNotifier with SequencedFetch {
         termsVersion: kTermsVersion,
         privacyVersion: kPrivacyVersion,
       );
-      if (!isCurrentRequest(token)) return LegalAcceptOutcome.failed;
+      if (!isCurrentRequest(token)) return _supersededAccept(token);
       _user = fresh;
       _acceptingLegal = false;
       notifyListeners();
       return LegalAcceptOutcome.accepted;
     } catch (e) {
-      if (!isCurrentRequest(token)) return LegalAcceptOutcome.failed;
+      if (!isCurrentRequest(token)) return _supersededAccept(token);
       _acceptingLegal = false;
       if (_isStaleVersionRefusal(e)) {
         notifyListeners();
@@ -414,6 +424,18 @@ class AuthStore extends ChangeNotifier with SequencedFetch {
       notifyListeners();
       return LegalAcceptOutcome.failed;
     }
+  }
+
+  /// A newer request (a sign-out's [reset]) took the sequence while the accept
+  /// was in flight. Its response is discarded, but the in-flight flag it set
+  /// must still come down: left up, the screen stays on its busy state and the
+  /// guard at the top of [acceptLegalDocuments] refuses every retry.
+  LegalAcceptOutcome _supersededAccept(int token) {
+    if (_acceptingLegal && _acceptToken == token) {
+      _acceptingLegal = false;
+      notifyListeners();
+    }
+    return LegalAcceptOutcome.failed;
   }
 
   static bool _isStaleVersionRefusal(Object e) {

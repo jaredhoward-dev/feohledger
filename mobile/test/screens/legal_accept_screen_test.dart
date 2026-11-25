@@ -1,4 +1,5 @@
 // The blocking Terms / Privacy accept step (decisions §495, §498).
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:material_ui/material_ui.dart';
@@ -40,7 +41,7 @@ void main() {
   /// Signs in a user whose `/me` requires acceptance; [onAccept] answers the
   /// `POST /api/auth/legal-acceptance`.
   Future<void> signIn(
-    http.Response Function() onAccept,
+    FutureOr<http.Response> Function() onAccept,
   ) async {
     FlutterSecureStorage.setMockInitialValues({});
     AuthStore.instance.reset();
@@ -66,16 +67,43 @@ void main() {
     expect(AuthStore.instance.legalAcceptanceRequired, isTrue);
   }
 
-  Future<void> pump(WidgetTester tester, {UrlOpener? opener}) async {
+  Future<void> pump(
+    WidgetTester tester, {
+    UrlOpener? opener,
+    Locale? locale,
+    double textScale = 1,
+  }) async {
     await tester.pumpWidget(
       MaterialApp(
+        locale: locale,
         localizationsDelegates: appLocalizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
+        builder: (context, child) => MediaQuery(
+          data: MediaQuery.of(context)
+              .copyWith(textScaler: TextScaler.linear(textScale)),
+          child: child!,
+        ),
         home: LegalAcceptScreen(opener: opener),
       ),
     );
     await tester.pump();
   }
+
+  Future<void> meetsEveryGuideline(WidgetTester tester) async {
+    await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+    await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
+    await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+    await expectLater(tester, meetsGuideline(textContrastGuideline));
+  }
+
+  /// The notice is announced by `A11y.announce`; a live region on it as well
+  /// would read the same text twice.
+  Finder liveRegionIn(Finder notice) => find.descendant(
+        of: notice,
+        matching: find.byWidgetPredicate(
+          (w) => w is Semantics && (w.properties.liveRegion ?? false),
+        ),
+      );
 
   Finder acceptButton() => find.widgetWithText(FilledButton, 'Accept');
 
@@ -166,6 +194,100 @@ void main() {
     expect(find.byKey(const Key('legal-accept-error')), findsOneWidget);
     expect(find.text('Too many requests'), findsOneWidget);
     expect(acceptButton(), findsOneWidget);
+    expect(liveRegionIn(find.byKey(const Key('legal-accept-error'))),
+        findsNothing);
+  });
+
+  testWidgets('error state: 48dp targets, labels and contrast hold',
+      (tester) async {
+    final handle = tester.ensureSemantics();
+    await tester.runAsync(
+      () => signIn(() => _json({'detail': 'Too many requests'}, 429)),
+    );
+    await pump(tester);
+
+    await tester.tap(find.byKey(const Key('legal-accept-checkbox')));
+    await tester.pump();
+    await tester.runAsync(() async {
+      await tester.tap(acceptButton());
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+    await tester.pump();
+    expect(find.byKey(const Key('legal-accept-error')), findsOneWidget);
+
+    await meetsEveryGuideline(tester);
+    handle.dispose();
+  });
+
+  testWidgets('busy: the Accept button keeps an accessible name and the '
+      'guidelines hold', (tester) async {
+    final handle = tester.ensureSemantics();
+    final held = Completer<http.Response>();
+    await tester.runAsync(() => signIn(() => held.future));
+    await pump(tester);
+
+    await tester.tap(find.byKey(const Key('legal-accept-checkbox')));
+    await tester.pump();
+    await tester.tap(find.byType(FilledButton));
+    await tester.pump();
+    expect(AuthStore.instance.acceptingLegal, isTrue);
+
+    // Only a spinner is on the button now; its label is the button's name.
+    expect(
+      tester.getSemantics(find.byType(FilledButton)),
+      containsSemantics(label: 'Loading…', isButton: true),
+    );
+    await meetsEveryGuideline(tester);
+
+    held.complete(_json(_me(required: false)));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 50)),
+    );
+    await tester.pump();
+    expect(AuthStore.instance.acceptingLegal, isFalse);
+    handle.dispose();
+  });
+
+  testWidgets('the out-of-date notice fits at 200% text in German',
+      (tester) async {
+    tester.view.physicalSize = const Size(390 * 3, 844 * 3);
+    tester.view.devicePixelRatio = 3;
+    addTearDown(tester.view.reset);
+    await tester.runAsync(
+      () => signIn(
+        () => _json({
+          'detail': {
+            'code': 'legal_acceptance_required',
+            'message': 'outdated',
+          },
+        }, 422),
+      ),
+    );
+    await pump(tester, locale: const Locale('de'), textScale: 2);
+    expect(tester.takeException(), isNull);
+
+    // At this size the column scrolls; bring each control on screen to tap.
+    await tester.ensureVisible(find.byKey(const Key('legal-accept-checkbox')));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('legal-accept-checkbox')));
+    await tester.pump();
+    await tester.ensureVisible(find.byType(FilledButton));
+    await tester.pump();
+    await tester.runAsync(() async {
+      await tester.tap(find.byType(FilledButton));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+    await tester.pump();
+
+    final notice = find.byKey(const Key('legal-app-outdated'));
+    expect(notice, findsOneWidget);
+    expect(tester.takeException(), isNull, reason: 'no RenderFlex overflow');
+    await tester.scrollUntilVisible(
+      find.widgetWithText(TextButton, 'Abmelden'),
+      200,
+    );
+    expect(tester.takeException(), isNull);
+    expect(liveRegionIn(notice), findsNothing);
   });
 
   testWidgets('Sign out ends the session', (tester) async {

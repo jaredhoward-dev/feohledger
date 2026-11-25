@@ -6,7 +6,6 @@ import 'package:material_ui/material_ui.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'package:feohledger_mobile/api/endpoints.dart';
-import 'package:feohledger_mobile/screens/invoice_detail_screen.dart';
 
 /// Push notification service — Firebase Cloud Messaging.
 ///
@@ -20,10 +19,37 @@ class PushService {
   PushService._();
 
   /// Root navigator key, wired into `MaterialApp.navigatorKey` in main.dart.
-  /// `_handleMessageTap` runs as a top-level FCM callback outside the widget
-  /// tree (no `BuildContext` of its own), so this is the only way it can
-  /// push a route when a user taps a background/terminated notification.
   static final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+  /// The invoice a tapped notification asked to open, held until the root
+  /// `AuthGate` can show it.
+  ///
+  /// This service never pushes a route itself. A tap can arrive while the app
+  /// is booting, signed out, biometric-locked or on the blocking Terms /
+  /// Privacy accept step (decisions §498) — pushing an invoice detail from
+  /// here put an approvable invoice on top of that step, and the server does
+  /// not gate on the flag. The gate is the one place that knows whether the
+  /// app shell is reachable, so it opens the link then, and only then.
+  final ValueNotifier<String?> pendingInvoiceLink = ValueNotifier<String?>(null);
+
+  /// Record the deep link a notification's [data] carries (`invoice_id`).
+  /// The FCM tap handlers call this; tests call it directly, since a unit test
+  /// cannot build a `RemoteMessage` delivery.
+  void openFromNotification(Map<String, dynamic> data) {
+    final invoiceId = data['invoice_id'];
+    if (invoiceId is! String || invoiceId.isEmpty) {
+      debugPrint('[push] Tap carried no invoice_id — nothing to navigate to');
+      return;
+    }
+    pendingInvoiceLink.value = invoiceId;
+  }
+
+  /// The gate takes the link as it opens it, so it opens once.
+  String? takePendingInvoiceLink() {
+    final id = pendingInvoiceLink.value;
+    pendingInvoiceLink.value = null;
+    return id;
+  }
 
   bool _initialized = false;
   String? _fcmToken;
@@ -91,6 +117,12 @@ class PushService {
       // Handle background message taps (app was in background)
       FirebaseMessaging.onMessageOpenedApp.listen(_handleMessageTap);
 
+      // A tap that launched the app from terminated never reaches
+      // onMessageOpenedApp; it is delivered once here. Held like any other
+      // until the gate can open it.
+      final initial = await FirebaseMessaging.instance.getInitialMessage();
+      if (initial != null) _handleMessageTap(initial);
+
       _initialized = true;
       debugPrint('[push] Push notifications initialized');
     } catch (e) {
@@ -129,24 +161,8 @@ class PushService {
   }
 
   void _handleMessageTap(RemoteMessage message) {
-    debugPrint('[push] Message tapped: ${message.data}');
-
-    final invoiceId = message.data['invoice_id'] as String?;
-    if (invoiceId == null || invoiceId.isEmpty) {
-      debugPrint('[push] Tap carried no invoice_id — nothing to navigate to');
-      return;
-    }
-
-    final navigator = navigatorKey.currentState;
-    if (navigator == null) {
-      // No live Navigator (e.g. a cold start still on the splash screen) —
-      // this is a best-effort deep link, not a guaranteed one.
-      debugPrint('[push] No navigator available yet — dropping deep link');
-      return;
-    }
-    navigator.push(
-      MaterialPageRoute(builder: (_) => InvoiceDetailScreen(invoiceId: invoiceId)),
-    );
+    debugPrint('[push] Message tapped');
+    openFromNotification(message.data);
   }
 
   /// Best-effort registration of [token] for this device's [platform] with

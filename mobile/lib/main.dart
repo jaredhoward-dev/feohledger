@@ -6,6 +6,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/home_screen.dart';
+import 'package:feohledger_mobile/screens/invoice_detail_screen.dart';
 import 'package:feohledger_mobile/screens/legal_accept_screen.dart';
 import 'package:feohledger_mobile/screens/login_screen.dart';
 import 'package:feohledger_mobile/services/biometric_service.dart';
@@ -112,6 +113,7 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     AuthStore.instance.addListener(_onAuthChanged);
+    PushService.instance.pendingInvoiceLink.addListener(_openPendingDeepLink);
     _boot();
   }
 
@@ -119,7 +121,44 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     AuthStore.instance.removeListener(_onAuthChanged);
+    PushService.instance.pendingInvoiceLink
+        .removeListener(_openPendingDeepLink);
     super.dispose();
+  }
+
+  /// The app shell is what [build] renders right now — the same conditions,
+  /// in one place, so a deep link can never open where the shell could not.
+  bool get _shellReachable =>
+      !_booting &&
+      !_biometricLocked &&
+      AuthStore.instance.loggedIn &&
+      !AuthStore.instance.legalAcceptanceRequired;
+
+  /// Open a notification's deep link once the shell is reachable. Every
+  /// route-opening entry point from outside the tree (a notification tap,
+  /// background or cold start) lands in [PushService.pendingInvoiceLink] and
+  /// is opened here, so booting, sign-in, the biometric lock and the Terms /
+  /// Privacy accept step (decisions §498) all hold it rather than letting an
+  /// approvable invoice open on top of them. Re-run on every change that can
+  /// make the shell reachable.
+  void _openPendingDeepLink() {
+    if (!_shellReachable ||
+        PushService.instance.pendingInvoiceLink.value == null) {
+      return;
+    }
+    // Deferred to the end of the frame: this can run inside
+    // notifyListeners(), mid-build, where pushing a route asserts.
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_shellReachable) return;
+      final invoiceId = PushService.instance.takePendingInvoiceLink();
+      if (invoiceId == null) return;
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => InvoiceDetailScreen(invoiceId: invoiceId),
+        ),
+      );
+    });
+    SchedulerBinding.instance.ensureVisualUpdate();
   }
 
   /// Back in the foreground: re-read the profile, so a Terms / Privacy version
@@ -146,6 +185,7 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
       _booting = false;
       _biometricLocked = locked;
     });
+    _openPendingDeepLink();
   }
 
   void _onAuthChanged() {
@@ -159,6 +199,11 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
     // Push init ran before any session existed, so its device registration
     // could not authenticate; send it now that one does.
     if (signedIn) unawaited(PushService.instance.registerWithBackend());
+    // A link held for a session that has just ended is not the next one's.
+    if (signedOut) PushService.instance.takePendingInvoiceLink();
+    // Signing in, or accepting the Terms / Privacy, can make the shell
+    // reachable; a held deep link opens then.
+    _openPendingDeepLink();
     if (!signedOut && !newlyRequired) return;
     // The gate itself is the FIRST route, so a session that ends (or meets the
     // Terms / Privacy accept step) while the user is inside a pushed route
@@ -177,6 +222,7 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
   void _onSignedIn() {
     if (!_biometricLocked) return;
     setState(() => _biometricLocked = false);
+    _openPendingDeepLink();
   }
 
   @override
