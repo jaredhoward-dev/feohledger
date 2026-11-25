@@ -4,7 +4,6 @@
 	import { api, ApiError } from '#lib/api.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
-	import Badge from '#lib/components/ui/Badge.svelte';
 	import SecretReveal from '#lib/components/ui/SecretReveal.svelte';
 	import SecretField from '#lib/components/ui/SecretField.svelte';
 	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
@@ -21,12 +20,10 @@
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
 	import { normalizeCurrencyCode, currencyCodeProblem } from '#lib/utils/currencyCode.ts';
 	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
-	import { planCodeLabel } from '#lib/types/planFeatures.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
-	import { formatDate } from '#lib/utils/time.ts';
 	import {
 		getChatNotifications,
 		revokeChatWebhook,
@@ -50,7 +47,6 @@
 	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { errorMessage } from '#lib/utils/apiError.ts';
-	import SetupChecklist from '#lib/components/ui/SetupChecklist.svelte';
 	import { setupStepDone, setupStepHref, type SetupStepId } from '#lib/utils/onboarding.ts';
 	import type { OnboardingResponse } from '#lib/types/analytics.ts';
 	import ErpConnectionPanel from '#lib/components/organization/ErpConnectionPanel.svelte';
@@ -61,6 +57,10 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import SecurityPanel from '#lib/components/organization/SecurityPanel.svelte';
+	import PlanPanel from '#lib/components/organization/PlanPanel.svelte';
+	import DataSyncPanel from '#lib/components/organization/DataSyncPanel.svelte';
+	import GettingStartedPanel from '#lib/components/organization/GettingStartedPanel.svelte';
 	import InvoiceDefaultsPanel from '#lib/components/organization/InvoiceDefaultsPanel.svelte';
 	import type {
 		CompanyFields,
@@ -1131,10 +1131,6 @@
 		}
 	}
 
-	// `org.plan` is the live subscription's plan code (decisions §482); a
-	// negotiated plan the client has no name for shows its code.
-	const planLabel = (plan: string): string => planCodeLabel(plan, m);
-
 	// ── White-label branding ────────────────────────────────────────────
 	import { brand } from '#lib/stores/brand.svelte.ts';
 	import {
@@ -1987,19 +1983,7 @@
 			     left behind. The server still enforces admin on every write. -->
 			<fieldset class="sections" disabled={readOnly}>
 				{#if section === 'getting-started'}
-					<section class="getting-started card">
-						<h2 id="org-getting-started-heading">{m('org.gettingStarted.title')}</h2>
-						<p class="card-hint">{m('org.gettingStarted.intro')}</p>
-						<!-- These were `#org-*` anchors into one long scroll. They now name
-						     the panel that owns each step directly; the old anchors still
-						     resolve, via `LEGACY_HASH_SECTIONS`, for the copies of them
-						     that exist outside this repo. -->
-						<SetupChecklist
-							steps={gettingStartedSteps}
-							labelledby="org-getting-started-heading"
-							testId="org-getting-started-steps"
-						/>
-					</section>
+					<GettingStartedPanel steps={gettingStartedSteps} />
 				{/if}
 
 				{#if section === 'company'}
@@ -3051,34 +3035,13 @@
 				{/if}
 
 				{#if section === 'security'}
-					<section class="card">
-						<h2>{m('org.section.security')}</h2>
-						<p class="card-hint">
-							{m('org.security.hint')}
-						</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="security-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<label class="switch-row">
-								<input type="checkbox" bind:checked={mfaRequired} />
-								<span>{m('org.security.requireMfa')}</span>
-							</label>
-
-							{#if mfaRequired && !mfaEnforcementActive}
-								<p class="mfa-enforcement-warning" role="alert" data-testid="mfa-enforcement-inactive">
-									{m('org.security.mfaEnforcementInactive')}
-								</p>
-							{/if}
-
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingSecurity} onclick={saveSecurity}>
-									{savingSecurity ? m('org.common.saving') : m('org.security.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<SecurityPanel
+						bind:mfaRequired
+						enforcementActive={mfaEnforcementActive}
+						{readOnly}
+						saving={savingSecurity}
+						onsave={saveSecurity}
+					/>
 				{/if}
 
 				{#if section === 'sso'}
@@ -3500,64 +3463,11 @@
 				{/if}
 
 				{#if section === 'data-sync'}
-					<!-- Data Sync is a SIGNPOST, not a second set of sync buttons.
-					     Each of the three ERP-synced data sets now has its own page
-					     carrying its own Sync-from-ERP action gated on `auth.isManager`
-					     — `/gl-accounts` (new), `/purchase-orders`, `/vendors` — which
-					     matches every one of those endpoints' real gate
-					     (admin | ap_manager). The two buttons that used to live here
-					     were admin-only by virtue of this route's nav gate, said nothing
-					     about which entity's chart they would write into, and reported
-					     into a bare <span> with no list to refresh; the vendors row had
-					     already been a link for exactly that reason. Three links is one
-					     vocabulary for one fact (decisions §153's objection to a panel
-					     growing a second shape, and §161 for the call).
-					     It keeps its place because this is where the ERP connection is
-					     configured, so "now where do I pull it?" is asked here. -->
-					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.dataSync')}</h2>
-							<HelpTip term="erp-sync" />
-						</div>
-						<p class="card-hint">{m('org.dataSync.hint')}</p>
-
-						<div class="sync-grid">
-							<div class="sync-item">
-								<div class="sync-info">
-									<span class="sync-name">{m('org.dataSync.coa')}</span>
-									<span class="sync-desc">{m('org.dataSync.coaDesc')}</span>
-								</div>
-								<a href="/gl-accounts" class="btn-outline">{m('org.dataSync.manageCoa')}</a>
-							</div>
-
-							<div class="sync-item">
-								<div class="sync-info">
-									<span class="sync-name">{m('org.dataSync.pos')}</span>
-									<span class="sync-desc">{m('org.dataSync.posDesc')}</span>
-								</div>
-								<a href="/purchase-orders" class="btn-outline">{m('org.dataSync.managePos')}</a>
-							</div>
-
-							<div class="sync-item">
-								<div class="sync-info">
-									<span class="sync-name">{m('org.dataSync.vendors')}</span>
-									<span class="sync-desc">{m('org.dataSync.vendorsDesc')}</span>
-								</div>
-								<a href="/vendors" class="btn-outline">{m('org.dataSync.manageVendors')}</a>
-							</div>
-						</div>
-					</section>
+					<DataSyncPanel />
 				{/if}
 
 				{#if section === 'plan'}
-					<section class="card plan-card">
-						<h2>{m('org.section.plan')}</h2>
-						<div class="plan-info">
-							<Badge tone="accent" variant="plan-badge">{planLabel(org.plan)}</Badge>
-							<span class="plan-slug">{m('org.plan.tenant')} <code>{org.slug}</code></span>
-							<span class="plan-date">{m('org.plan.created', { date: formatDate(org.created_at, '—', { month: 'long', day: 'numeric', year: 'numeric' }) })}</span>
-						</div>
-					</section>
+					<PlanPanel {org} />
 				{/if}
 
 				{#if section === 'match-rules'}
@@ -3736,12 +3646,6 @@
 	/* A hint under the provider picker it qualifies, not at the top of a card. */
 	.card-hint.after-control {
 		margin-top: 10px;
-	}
-
-	/* First-time-admin wayfinding — links jump to the sections a new tenant
-	   configures first. Purely a shortcut; nothing is hidden. */
-	.getting-started {
-		border-color: var(--accent);
 	}
 
 	.form-grid {
@@ -4065,33 +3969,6 @@
 		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
-	.plan-card h2 {
-		margin-bottom: 12px;
-	}
-
-	.plan-info {
-		display: flex;
-		align-items: center;
-		gap: 16px;
-	}
-
-	.plan-slug {
-		font-size: 0.82rem;
-		color: var(--text-muted);
-	}
-
-	.plan-slug code {
-		background: var(--bg);
-		padding: 2px 6px;
-		border-radius: 3px;
-		font-size: 0.8rem;
-	}
-
-	.plan-date {
-		font-size: 0.82rem;
-		color: var(--text-muted);
-	}
-
 	.section-footer {
 		display: flex;
 		/* Same reason as `.erp-test-row` below: this row carries a Save button, an
@@ -4181,81 +4058,6 @@
 		color: var(--danger);
 	}
 
-	.sync-grid {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		margin-top: 14px;
-	}
-
-	.sync-item {
-		display: flex;
-		align-items: center;
-		/* The description and its action cannot share a line at 320px, so the
-		   action drops below the description instead of pushing the document
-		   sideways (WCAG 1.4.10). */
-		flex-wrap: wrap;
-		gap: 12px;
-		padding: 10px 12px;
-		background: var(--bg);
-		border-radius: 6px;
-	}
-
-	.sync-info {
-		flex: 1;
-		/* `flex: 1` leaves `min-width: auto`, so this column refuses to shrink
-		   below its longest word plus the action beside it. Zero lets it give
-		   way and the text wrap. */
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-
-	.sync-name {
-		font-size: 0.88rem;
-		font-weight: 500;
-		color: var(--text);
-	}
-
-	.sync-desc {
-		font-size: 0.78rem;
-		color: var(--text-muted);
-	}
-
-	.btn-outline {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		/* Deliberately NOT `white-space: nowrap` (unlike `.btn-test`, whose label
-		   is two short words). These labels name their destination — "Manage on
-		   Chart of Accounts page" is 265px — so a nowrap label is wider than a
-		   320px viewport's whole content column and no amount of wrapping the
-		   ROW can rescue it: the item would still overflow on its own line.
-		   Letting the label wrap is what makes the page reflow (WCAG 1.4.10).
-		   At every width where the label fits, shrink-to-fit keeps it on one
-		   line, so nothing changes above ~460px. */
-		text-decoration: none;
-		display: inline-block;
-		text-align: center;
-	}
-
-	.btn-outline:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.btn-outline:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
 	label.switch-row {
 		flex-direction: row;
 		align-items: center;
@@ -4279,13 +4081,6 @@
 		accent-color: var(--accent);
 		cursor: pointer;
 		flex-shrink: 0;
-	}
-
-	.mfa-enforcement-warning {
-		color: var(--warning-on-tint);
-		font-size: 0.82rem;
-		font-weight: 600;
-		margin: 8px 0 0;
 	}
 
 	/* --- Fraud detection panel --- */
