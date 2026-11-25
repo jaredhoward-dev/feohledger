@@ -31,7 +31,7 @@
 	} from '#lib/types/exception.ts';
 	import type { ExceptionSeverity } from '#lib/types/exception.ts';
 	import type { ExceptionSummary } from '#lib/types/exceptionSummary.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import AgentDashboard from '#lib/components/exceptions/AgentDashboard.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { formatMoney, type MoneyAmount } from '#lib/utils/money.ts';
@@ -172,7 +172,7 @@
 	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
 		const status = params.get('status') ?? '';
 		const severity = params.get('severity') ?? '';
-		const sort = params.get('sort') ?? '';
+		const sort = sortFromUrl(params, SORT_KEYS, 'desc');
 		return {
 			view: (params.get('view') === 'agents' ? 'agents' : 'queue') as 'queue' | 'agents',
 			status: STATUS_KEYS.includes(status) ? status : 'open',
@@ -182,8 +182,8 @@
 			// with no chip pressed.
 			severity: (EXCEPTION_SEVERITIES as readonly string[]).includes(severity) ? severity : 'all',
 			search: params.get('search') ?? '',
-			sortField: SORT_KEYS.includes(sort) ? sort : null,
-			sortOrder: (params.get('order') === 'asc' ? 'asc' : 'desc') as SortOrder
+			sortField: sort.field,
+			sortOrder: sort.order
 		};
 	}
 	const initialUrlState = readUrlState(pageStore.url.searchParams);
@@ -611,8 +611,12 @@
 		await loadExceptions({ append: true, nextPage: page + 1 });
 	}
 
+	// The filter query the committed `summary` was read for.
+	let summaryParams: string | null = null;
+
 	async function loadSummary() {
 		const token = summarySequence.start();
+		let params = '';
 		try {
 			// The SAME filters the table was just loaded with — search included,
 			// via `appliedSearch` — so every chip counts the set on screen. This
@@ -620,14 +624,20 @@
 			// carried OPEN-only tallies while the operator was looking at
 			// Escalated / Resolved / All; with a search box that gap would have
 			// been every chip counting the tenant above a one-row table.
-			const params = filterParams(untrack(() => appliedSearch));
+			params = String(filterParams(untrack(() => appliedSearch)));
 			const data = await api.get<Summary>(`/api/exceptions/summary?${params}`);
 			// The chip counts drive the filter UI — an older summary landing
 			// last would relabel the chips with pre-resolve tallies.
 			if (!summarySequence.canCommit(token)) return;
 			summary = data;
+			summaryParams = params;
 		} catch {
-			/* non-critical */
+			// Non-critical, but another filter's tallies must not stand in for
+			// these: "Select all N matching" would offer the old N.
+			if (summarySequence.isCurrentRequest(token) && params !== summaryParams) {
+				summary = null;
+				summaryParams = null;
+			}
 		}
 	}
 
@@ -889,10 +899,8 @@
 	 * How many rows "Select all N matching" would select: the open + escalated
 	 * rows within the current filters, which is what `GET /api/exceptions/ids`
 	 * resolves (`selectAllMatching` sends `status=open,escalated` under All).
-	 * Under the All chip that is NOT `total`: `total` counts the resolved and
-	 * dismissed rows too, so the button promised "Select all 45" and then
-	 * selected 15, and offered itself even when every selectable row was
-	 * already selected. The status tallies honour every filter but status, so
+	 * Under the All chip that is NOT `total`, which counts resolved and
+	 * dismissed rows too. The status tallies honour every filter but status, so
 	 * open + escalated is that set's size; null while it is unknown.
 	 */
 	let selectableMatchingCount = $derived(
@@ -1168,7 +1176,7 @@
 				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total: selectableMatchingCount })}
+						: m('common.selectAllMatching', { total: formatCount(selectableMatchingCount) })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>

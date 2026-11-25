@@ -199,10 +199,8 @@ export function commonTransitions(
  *
  * Tallied from `GET /api/invoices/counts`, which takes the list's population
  * filters and ignores `status` — so an active status filter narrows the sum to
- * its own statuses here. The list's `total` counts the system-managed rows
- * too, so offering it ("Select all 30 matching") then selecting 25 was a count
- * that disagreed with the action it named. `null` when the tallies are not
- * loaded, so the caller can fall back rather than read a zero.
+ * its own statuses here. `null` when the tallies are not loaded, so the caller
+ * can fall back rather than read a zero.
  */
 export function selectableMatchingTotal(
 	counts: Record<string, number>,

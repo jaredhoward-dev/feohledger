@@ -2277,6 +2277,7 @@ export const messages = {
 	'expenses.cards.kpi.unmatched': 'Non rapprochées',
 	'expenses.cards.kpi.matched': 'Rapprochées',
 	'expenses.cards.kpi.transactions': 'Transactions',
+	'expenses.cards.kpi.scope': 'Toutes les transactions',
 	'expenses.cards.col.date': 'Date',
 	'expenses.cards.col.merchant': 'Commerçant',
 	'expenses.cards.col.card': 'Carte',
@@ -2908,6 +2909,8 @@ export const messages = {
 	'purchaseOrders.row.view': 'Voir le bon de commande {number}',
 	'purchaseOrders.toast.loadListFailed': 'Échec du chargement des bons de commande',
 	'purchaseOrders.toast.loadFailed': 'Échec du chargement du bon de commande',
+	'purchaseOrders.toast.notFound': 'Bon de commande introuvable',
+	'purchaseOrders.modal.loadFailed': 'Impossible de charger ce bon de commande. Réessayez.',
 	'purchaseOrders.toast.syncFailed': 'Échec de la synchronisation ERP',
 	'purchaseOrders.toast.unverifiable':
 		'L’ERP n’a pas pu confirmer le total de {n, plural, one {# commande existante} other {# commandes existantes}} — les factures qui {n, plural, one {la citent sont retenues} other {les citent sont retenues}} jusqu’à ce qu’une synchronisation le confirme',

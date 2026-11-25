@@ -176,4 +176,47 @@ test.describe('/contracts — URL state and selection', () => {
 		await expect(page).not.toHaveURL(/[?&]id=/);
 		await expect(page.getByTestId('contracts-deeplink-error')).toHaveCount(0);
 	});
+
+	// The backend 422s a sort key outside its allowlist; read raw, a stale link
+	// would fail every load, Retry included.
+	test('an unknown sort in the URL falls back to the default order', async ({ page }) => {
+		await mockList(page);
+		const listRequest = page.waitForRequest((r) => {
+			const url = new URL(r.url());
+			return url.pathname === '/api/contracts';
+		});
+		await page.goto('/contracts?sort=not_a_column&order=desc');
+		expect(new URL((await listRequest).url()).searchParams.has('sort')).toBe(false);
+
+		await expect(page.getByRole('button', { name: 'Open contract E2E-CTR-2' })).toBeVisible();
+		await expect(page.getByTestId('contracts-error')).toHaveCount(0);
+	});
+
+	// A client-side navigation to the same route (the sidebar row's shape, via
+	// an in-page link so the nav group's open state does not matter) and Back
+	// must re-read the URL: the filters were seeded at mount only.
+	test('a same-route navigation and Back re-apply the URL', async ({ page }) => {
+		await mockList(page);
+		const draftChip = page.getByRole('button', { name: 'Draft', exact: true });
+		await page.goto('/contracts?status=draft');
+		await expect(draftChip).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByRole('button', { name: 'Open contract E2E-CTR-2' })).toBeHidden();
+
+		await page.evaluate(() => {
+			const a = document.createElement('a');
+			a.href = '/contracts';
+			a.id = 'e2e-same-route';
+			a.textContent = 'same route';
+			document.body.appendChild(a);
+		});
+		await page.locator('#e2e-same-route').click();
+		await expect(page).toHaveURL(/\/contracts$/);
+		await expect(draftChip).toHaveAttribute('aria-pressed', 'false');
+		await expect(page.getByRole('button', { name: 'Open contract E2E-CTR-2' })).toBeVisible();
+
+		await page.goBack();
+		await expect(page).toHaveURL(/[?&]status=draft/);
+		await expect(draftChip).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByRole('button', { name: 'Open contract E2E-CTR-2' })).toBeHidden();
+	});
 });

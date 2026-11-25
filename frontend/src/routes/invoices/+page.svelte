@@ -47,7 +47,7 @@
 	import { afterNavigate, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 
 	// Search + the quick status chips are URL-backed (`?search=&status=`)
 	// alongside `assigned_to_id`, sort and the `?id=` deep link, so a reload /
@@ -58,6 +58,11 @@
 	//
 	// `readUrlState` is the one READER of those params, used at mount and again
 	// by the `afterNavigate` hook below for a navigation that reuses this page.
+	const SORTABLE_FIELDS = ['invoice_number', 'vendor_name', 'amount', 'due_date', 'status'] as const;
+	function sortStateFromUrl(params: Pick<URLSearchParams, 'get'>) {
+		const { field, order } = sortFromUrl(params, SORTABLE_FIELDS, 'desc');
+		return { sortField: field, sortOrder: order };
+	}
 	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
 		return {
 			search: params.get('search') ?? '',
@@ -65,8 +70,7 @@
 				.split(',')
 				.filter((s): s is InvoiceStatus => (INVOICE_STATUSES as readonly string[]).includes(s)),
 			assignedToId: params.get('assigned_to_id') ?? '',
-			sortField: params.get('sort'),
-			sortOrder: (params.get('order') === 'asc' ? 'asc' : 'desc') as SortOrder
+			...sortStateFromUrl(params)
 		};
 	}
 	const initialUrlState = readUrlState(page.url.searchParams);
@@ -558,9 +562,7 @@
 	/**
 	 * Open an invoice from its row, and record it as `?id=` through the single
 	 * writer — the same param a deep link arrives on — so a reload, a copied
-	 * address or a new tab opens the invoice the user was looking at. A row
-	 * open used to leave the URL as it was, so a reload dropped the modal and
-	 * there was no address to share for it.
+	 * address or a new tab opens the invoice the user was looking at.
 	 *
 	 * Only `deepLinkId` is set, never `deepLinkLoaded`: `replaceState` does not
 	 * move `page.url`, so the deep-link effect does not run for this write, and
@@ -685,9 +687,8 @@
 
 	// The Change Status popover is a keyboard surface too: opening it moves
 	// focus to its picker (it renders above the bar, away from the trigger),
-	// and Escape closes it and hands focus back to the trigger. Before, it
-	// opened with focus left on the trigger and only an outside click closed
-	// it — a keyboard user had no way to dismiss it (WCAG 2.1.1, 2.4.3).
+	// and Escape closes it and hands focus back to the trigger (WCAG 2.1.1,
+	// 2.4.3).
 	$effect(() => {
 		if (showBulkStatusSelect && bulkStatusSelect) bulkStatusSelect.focus();
 	});
@@ -733,11 +734,9 @@
 	);
 
 	// What "Select all N matching" would select: the filtered set minus its
-	// system-managed rows, which `GET /api/invoices/ids` excludes. The list's
-	// `total` counts those too, so offering it named a figure the action then
-	// fell short of, and with every row already loaded it still offered the
-	// button whenever one of them was system-managed — a click that selected
-	// nothing new. Falls back to `total` only while the tallies are missing.
+	// system-managed rows, which `GET /api/invoices/ids` excludes (the list's
+	// `total` counts them). Offered only past the loaded page. Falls back to
+	// `total` only while the tallies are missing.
 	let matchingSelectableTotal = $derived(
 		selectableMatchingTotal(invoiceStore.statusCounts, activeStatuses) ?? invoiceStore.total
 	);

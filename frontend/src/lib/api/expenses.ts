@@ -67,10 +67,8 @@ export interface ExpenseListParams {
 
 /** Paginated list envelope returned by every list endpoint
  *  (`{items, total, page, page_size}` — see frontend/CLAUDE.md § Pagination).
- *  Every list helper here keeps the whole envelope for Load-More. The policy +
- *  pre-approval helpers used to unwrap to `.items` on the belief that those
- *  tabs did not paginate — but the server does (20 rows by default), so row
- *  21 onward was unreachable and nothing on screen said so. */
+ *  Every list helper here keeps the whole envelope for Load-More: the server
+ *  pages every list (20 rows by default), policies and pre-approvals included. */
 export interface Paginated<T> {
 	items: T[];
 	total: number;

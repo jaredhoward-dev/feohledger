@@ -309,9 +309,11 @@ one again to flip direction:
   `searchParams.get('sort')`: the URL is editable and outlives a renamed
   column, and an unknown key 422s every load, Retry included, leaving the page
   on its load error with nothing on screen to undo it. `sortFromUrl` keeps only
-  a field the page offers as a header and reads any `order` but `desc` as
-  ascending. `/vendors` uses it (guard: `tests-e2e/vendors/sort.spec.ts`);
-  the other sortable lists still read the raw param.
+  a field the page offers as a header; a missing or unknown `order` reads as
+  the page's default direction (third argument, `asc` unless given). Every
+  sortable list uses it (guards: the unknown-sort cases in
+  `tests-e2e/{vendors,invoices}/sort.spec.ts` and
+  `tests-e2e/contracts/url-state.spec.ts`).
 - `null` field = the backend's own default order; only send `sort`/`order`
   in `buildParams()` when `sortField` is set (`untrack()` the read the same
   way `search` is — `buildParams()` is called from filter effects too).
@@ -493,6 +495,16 @@ builder, `GET /api/payments/queue/ids`) — the "select all N matching"
 affordance on each resolves the whole filtered set via that resource's
 `GET .../ids` sibling endpoint (`getVendorIds`/`getContractIds`/`getExpenseIds`)
 rather than only the currently-loaded page.
+
+**"Select all N matching" counts only the rows the action can select.** N is
+the size of the set `GET .../ids` will return, never a `total` that includes
+rows whose checkbox is disabled: `/invoices` subtracts the system-managed
+statuses (`selectableMatchingTotal`), `/exceptions` counts open + escalated
+under All, the payments queue uses the server's `selectable_total`. When the
+tallies behind N are missing or describe another filter (a failed counts
+read), fall back or withhold the button rather than offer the old N. Offer it
+only when N exceeds what is already selected, and format N with
+`formatCount`.
 
 ### Pagination + Load more
 

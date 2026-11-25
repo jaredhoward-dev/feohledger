@@ -29,7 +29,7 @@ function po(n: number, status = 'open') {
 const json = (route: Route, body: unknown, status = 200) =>
 	route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 
-async function mockApi(page: Page) {
+async function mockApi(page: Page, detailStatus: () => number = () => 200) {
 	const listRequests: URL[] = [];
 	await page.route('**/api/purchase-orders?*', async (route) => {
 		const url = new URL(route.request().url());
@@ -43,6 +43,8 @@ async function mockApi(page: Page) {
 	);
 	await page.route(/\/api\/purchase-orders\/[0-9a-f-]{36}$/, async (route) => {
 		const id = new URL(route.request().url()).pathname.split('/').pop()!;
+		const code = detailStatus();
+		if (code !== 200) return json(route, { detail: 'boom' }, code);
 		return json(route, { ...po(Number(id.slice(-12))), id, linked_invoices: [] });
 	});
 	return listRequests;
@@ -94,5 +96,64 @@ test.describe('/purchase-orders — URL state', () => {
 		await mockApi(page);
 		await page.goto(`/purchase-orders?id=${po(2).id}`);
 		await expect(modal(page)).toContainText('E2E-URL-PO-2');
+	});
+
+	/**
+	 * A client-side navigation to the same route (the sidebar row's shape, via
+	 * an in-page link so the test does not depend on the nav group's open
+	 * state) and Back must re-read the URL: the state was seeded at mount.
+	 */
+	test('a same-route navigation and Back re-apply the URL', async ({ page }) => {
+		const listRequests = await mockApi(page);
+		const closedChip = page.getByRole('button', { name: /^Closed/ });
+		await page.goto('/purchase-orders?status=closed&search=URL-PO');
+		await expect(closedChip).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByRole('button', { name: 'View purchase order E2E-URL-PO-1' })).toBeHidden();
+
+		listRequests.length = 0;
+		await page.evaluate(() => {
+			const a = document.createElement('a');
+			a.href = '/purchase-orders';
+			a.id = 'e2e-same-route';
+			a.textContent = 'same route';
+			document.body.appendChild(a);
+		});
+		await page.locator('#e2e-same-route').click();
+		await expect(page).toHaveURL(/\/purchase-orders$/);
+		await expect(closedChip).toHaveAttribute('aria-pressed', 'false');
+		await expect(page.getByPlaceholder('Search PO number...')).toHaveValue('');
+		await expect(page.getByRole('button', { name: 'View purchase order E2E-URL-PO-1' })).toBeVisible();
+		expect(listRequests.at(-1)?.searchParams.has('status')).toBe(false);
+
+		await page.goBack();
+		await expect(page).toHaveURL(/[?&]status=closed/);
+		await expect(closedChip).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByPlaceholder('Search PO number...')).toHaveValue('URL-PO');
+		await expect(page.getByRole('button', { name: 'View purchase order E2E-URL-PO-1' })).toBeHidden();
+	});
+
+	test('a deep link that fails to load says so with a Retry and keeps ?id=', async ({ page }) => {
+		let fail = true;
+		await mockApi(page, () => (fail ? 500 : 200));
+		await page.goto(`/purchase-orders?id=${po(3).id}`);
+
+		const error = page.getByTestId('purchase-orders-detail-error');
+		await expect(error).toContainText('Couldn’t load this purchase order');
+		await expect(page.getByText('Purchase order not found')).toHaveCount(0);
+		await expect(page).toHaveURL(new RegExp(`[?&]id=${po(3).id}`));
+
+		fail = false;
+		await error.getByRole('button', { name: 'Retry' }).click();
+		await expect(modal(page)).toContainText('E2E-URL-PO-3');
+		await expect(error).toBeHidden();
+		await expect(page).toHaveURL(new RegExp(`[?&]id=${po(3).id}`));
+	});
+
+	test('a deep link to a missing PO says "not found" and drops ?id=', async ({ page }) => {
+		await mockApi(page, () => 404);
+		await page.goto(`/purchase-orders?id=${po(4).id}`);
+		await expect(page.getByText('Purchase order not found')).toBeVisible();
+		await expect(page).not.toHaveURL(/[?&]id=/);
+		await expect(modal(page)).toBeHidden();
 	});
 });

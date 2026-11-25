@@ -60,4 +60,13 @@ describe('sortFromUrl', () => {
 	it('is the default order when the URL carries no sort', () => {
 		expect(read('')).toEqual({ field: null, order: 'asc' });
 	});
+
+	it('falls back to the page default direction when one is given', () => {
+		const params = new URLSearchParams('sort=code&order=sideways');
+		expect(sortFromUrl(params, FIELDS, 'desc')).toEqual({ field: 'code', order: 'desc' });
+		expect(sortFromUrl(new URLSearchParams('sort=code&order=asc'), FIELDS, 'desc')).toEqual({
+			field: 'code',
+			order: 'asc'
+		});
+	});
 });

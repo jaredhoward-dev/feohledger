@@ -94,3 +94,74 @@ test.describe('/exceptions — resolve dialogs open on the note field', () => {
 		await expect(modal.locator('input[type="text"]')).toBeFocused();
 	});
 });
+
+/**
+ * When the "record the ERP's payment" panel shows, it sits ABOVE the note, so
+ * the dialog opens on its first control (the focus trap's default) rather than
+ * skipping a keyboard reader past the panel to the note.
+ */
+test('single-row Resolve with the ERP payment panel opens on the first control', async ({
+	page
+}) => {
+	const erpRow = {
+		...row(3),
+		invoice_id: '00000000-0000-4000-9500-0000000000aa',
+		exception_type: 'payment_reconciliation',
+		type_label: 'Payment Reconciliation',
+		erp_report: {
+			kind: 'paid_not_recorded',
+			erp_type: 'quickbooks_online',
+			erp_document_id: 'BILL-FOCUS',
+			event_id: null,
+			method: 'ach',
+			reference: 'BILL-FOCUS',
+			paid_on: '2026-10-01',
+			paid_on_reported: true,
+			amount: '100.00',
+			amount_currency: 'USD',
+			payment_parts: null,
+			refusal_code: 'external_payment_in_run'
+		},
+		erp_name: 'QuickBooks Online',
+		record_erp_payment_refusal: null
+	};
+	await page.route('**/api/exceptions/summary*', (route) =>
+		route.fulfill({
+			json: exceptionSummary({
+				open: 1,
+				by_type: { payment_reconciliation: 1 },
+				by_severity: { error: 1 }
+			})
+		})
+	);
+	await page.route(
+		(url) => url.pathname === '/api/exceptions',
+		(route) => route.fulfill({ json: { items: [erpRow], total: 1, page: 1, page_size: 20 } })
+	);
+	await page.goto('/exceptions');
+	await page
+		.getByRole('row')
+		.filter({ hasText: 'E2E-FOCUS-3' })
+		.getByRole('button', { name: 'Resolve' })
+		.click();
+
+	const modal = resolveDialog(page);
+	await expect(modal.getByTestId('erp-payment-panel')).toBeVisible();
+	// The focus trap's first visible control, in DOM order — not the note.
+	await expect
+		.poll(() =>
+			modal.evaluate((dialog) => {
+				const first = [
+					...dialog.querySelectorAll<HTMLElement>(
+						'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+					)
+				].find((el) => el.offsetWidth > 0 || el.offsetHeight > 0);
+				return !!first && first === document.activeElement;
+			})
+		)
+		.toBe(true);
+	await expect(
+		modal.getByTestId('exception-resolve-form').locator('input[type="text"]')
+	).not.toBeFocused();
+});
+

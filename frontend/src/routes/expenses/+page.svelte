@@ -102,7 +102,7 @@
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { normalizeMoneyInput } from '#lib/utils/moneyInput.ts';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { formatCount } from '#lib/utils/count.ts';
 
 	const canCreate = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk'));
@@ -123,8 +123,7 @@
 	type Tab = 'expenses' | 'reports' | 'policies' | 'preapprovals' | 'cards';
 	const TABS: readonly Tab[] = ['expenses', 'reports', 'policies', 'preapprovals', 'cards'];
 	// A `?tab=` this page has no panel for (a typo, a stale bookmark) opens the
-	// default tab. It used to be cast straight to `Tab`, so the page rendered a
-	// tablist with nothing selected over an empty panel, and no control said why.
+	// default tab rather than a tablist with nothing selected.
 	function parseTab(raw: string | null): Tab {
 		return TABS.includes(raw as Tab) ? (raw as Tab) : 'expenses';
 	}
@@ -138,8 +137,10 @@
 	let statusFilter = $state<string>(page.url.searchParams.get('status') ?? 'all');
 	// Column sort (expenses tab only) — URL-backed via the same `syncUrl()`
 	// below. `null` field = the backend's own default order (most-recent first).
-	let sortField = $state<string | null>(page.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((page.url.searchParams.get('order') as SortOrder) ?? 'desc');
+	const SORTABLE_FIELDS = ['expense_date', 'merchant', 'category', 'amount', 'status'] as const;
+	const initialSort = sortFromUrl(page.url.searchParams, SORTABLE_FIELDS, 'desc');
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// --- Modal + selection state ---
 	let showCreate = $state(false);
@@ -853,8 +854,7 @@
 		return list.map((v) => policyViolationText(v, m)).join('; ');
 	}
 
-	// …and so does `?tab=policies` for a reader without the Policies tab: its
-	// panel used to render under a tablist that did not offer it.
+	// …and so does `?tab=policies` for a reader without the Policies tab.
 	$effect(() => {
 		if (tab === 'policies' && !canManagePolicies) untrack(() => switchTab('expenses'));
 	});
@@ -878,9 +878,8 @@
 		return p.threshold_currency ?? orgCurrency.currency;
 	}
 
-	// Paged like the reports list. This tab and pre-approvals used to read only
-	// the first page the server sent (20 rows) with no footer, so a 21st policy
-	// existed, still applied to every submit, and could not be found here.
+	// Paged like the reports list: the server pages policies too, and every
+	// policy applies to every submit, so each must be reachable here.
 	const POLICIES_PAGE_SIZE = 50;
 	let policies = $state<ExpensePolicy[]>([]);
 	let policiesLoading = $state(false);
@@ -1128,10 +1127,9 @@
 	let matchTxn = $state<CorporateCardTransaction | null>(null);
 	let matchSuggestions = $state<CardMatchSuggestion[]>([]);
 	let matchLoading = $state(false);
-	// A failed suggestions read is stated in the dialog with a Retry. It used to
-	// toast and then fall through to the empty branch, so the dialog said "No
-	// candidate expenses … Try Create expense instead" about a list it never got
-	// — steering the user to mint a second expense for a charge that had one.
+	// A failed suggestions read is stated in the dialog with a Retry, never as
+	// "No candidate expenses … Try Create expense instead": that would steer
+	// the user to mint a second expense for a charge that may have one.
 	let matchErrored = $state(false);
 	const matchSequence = createRequestSequencer();
 
@@ -1141,12 +1139,10 @@
 	]);
 
 	// The KPI row counts the WHOLE card feed, from the server's own `total` for
-	// each reconciliation status. The two status cards used to count the LOADED
-	// page (50 rows) while "Transactions" beside them was the server's total, so
-	// a feed of 300 unmatched charges read "Unmatched 50"; and under the Matched
-	// chip "Unmatched" read 0 because no unmatched row was loaded. `null` until
-	// the counts land (or if they fail): `KpiCard` draws its dash, never a zero
-	// nobody counted.
+	// each reconciliation status, not the loaded page. `null` until the counts
+	// land (or if they fail): `KpiCard` draws its dash, never a zero nobody
+	// counted. Three `page_size=1` reads until a counts endpoint exists
+	// (docs/followups.md).
 	let cardCounts = $state<{ all: number; unmatched: number; matched: number } | null>(null);
 	const cardCountsSequence = createRequestSequencer();
 
@@ -1860,10 +1856,12 @@
 		{/if}
 	{:else if tab === 'cards'}
 		<!-- ===================== Cards tab (WF4) ===================== -->
+		<!-- The three cards count the whole feed while the table follows the
+		     reconciliation chip, so each says so in its sub line. -->
 		<div class="kpi-row">
-			<KpiCard value={unmatchedCount} label={m('expenses.cards.kpi.unmatched')} highlight={unmatchedCount ? 'red' : null} />
-			<KpiCard value={matchedCount} label={m('expenses.cards.kpi.matched')} highlight={matchedCount ? 'green' : null} />
-			<KpiCard value={cardCounts?.all ?? null} label={m('expenses.cards.kpi.transactions')} />
+			<KpiCard value={unmatchedCount} label={m('expenses.cards.kpi.unmatched')} sub={m('expenses.cards.kpi.scope')} highlight={unmatchedCount ? 'red' : null} />
+			<KpiCard value={matchedCount} label={m('expenses.cards.kpi.matched')} sub={m('expenses.cards.kpi.scope')} highlight={matchedCount ? 'green' : null} />
+			<KpiCard value={cardCounts?.all ?? null} label={m('expenses.cards.kpi.transactions')} sub={m('expenses.cards.kpi.scope')} />
 		</div>
 
 		{#if cardImportResult}
@@ -2001,7 +1999,7 @@
 				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total: expenseStore.total })}
+						: m('common.selectAllMatching', { total: formatCount(expenseStore.total) })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>

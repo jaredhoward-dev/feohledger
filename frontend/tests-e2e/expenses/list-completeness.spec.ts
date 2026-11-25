@@ -4,7 +4,7 @@ import type {
 	ExpensePolicy,
 	ExpensePreapproval
 } from '#lib/types/expense.ts';
-import { expect, test } from '../fixtures/helpers';
+import { expect, signInAndWait, test } from '../fixtures/helpers';
 
 /**
  * /expenses: every list and count on the page describes the set the server
@@ -233,4 +233,24 @@ test('an unknown ?tab= opens the Expenses tab', async ({ page }) => {
 		'true'
 	);
 	await expect(page.locator('#expenses-panel-expenses')).toBeVisible();
+});
+
+test.describe('?tab=policies without the Policies tab', () => {
+	// The clerk signs in fresh: opt out of the default admin storage state.
+	test.use({ storageState: { cookies: [], origins: [] } });
+
+	test('a clerk lands on the Expenses tab, not a panel the tablist omits', async ({
+		page,
+		tenantClerk
+	}) => {
+		await signInAndWait(page, tenantClerk);
+		await page.goto('/expenses?tab=policies');
+		await expect(page.getByRole('tab', { name: 'Expenses', exact: true })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
+		await expect(page.locator('#expenses-panel-expenses')).toBeVisible();
+		await expect(page.getByRole('tab', { name: 'Policies', exact: true })).toHaveCount(0);
+		await expect(page).not.toHaveURL(/[?&]tab=policies/);
+	});
 });

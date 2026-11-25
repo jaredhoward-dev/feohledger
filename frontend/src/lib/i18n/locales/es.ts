@@ -2275,6 +2275,7 @@ export const messages = {
 	'expenses.cards.kpi.unmatched': 'Sin conciliar',
 	'expenses.cards.kpi.matched': 'Conciliadas',
 	'expenses.cards.kpi.transactions': 'Transacciones',
+	'expenses.cards.kpi.scope': 'Todas las transacciones',
 	'expenses.cards.col.date': 'Fecha',
 	'expenses.cards.col.merchant': 'Comercio',
 	'expenses.cards.col.card': 'Tarjeta',
@@ -2905,6 +2906,8 @@ export const messages = {
 	'purchaseOrders.row.view': 'Ver orden de compra {number}',
 	'purchaseOrders.toast.loadListFailed': 'Error al cargar las órdenes de compra',
 	'purchaseOrders.toast.loadFailed': 'Error al cargar la orden de compra',
+	'purchaseOrders.toast.notFound': 'Orden de compra no encontrada',
+	'purchaseOrders.modal.loadFailed': 'No se pudo cargar esta orden de compra. Inténtalo de nuevo.',
 	'purchaseOrders.toast.syncFailed': 'Error en la sincronización del ERP',
 	'purchaseOrders.toast.unverifiable':
 		'El ERP no pudo confirmar el total de {n, plural, one {# pedido existente} other {# pedidos existentes}}; las facturas que {n, plural, one {lo citan} other {los citan}} quedan retenidas hasta que una sincronización lo confirme',
