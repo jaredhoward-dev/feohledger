@@ -216,6 +216,8 @@ export const messages = {
 	'audit.action.organization.erp_token_revoked': "ERPトークンを失効",
 	'audit.action.organization.exception_agent_autonomy_updated': "例外エージェントの自律レベルを変更",
 	'audit.action.organization.fraud_rule_updated': "不正チェックを切り替え",
+	'audit.action.organization.match_rule_updated': "発注書照合ルールを変更",
+	'audit.action.organization.match_rule_removed': "発注書照合ルールを削除",
 	'audit.action.organization.provider_config_updated': "プロバイダー設定を更新",
 	'audit.action.organization.residency_updated': "データ所在地を更新",
 	'audit.action.organization.scim_token_minted': "SCIMトークンを発行",

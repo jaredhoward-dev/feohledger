@@ -216,6 +216,8 @@ export const messages = {
 	'audit.action.organization.erp_token_revoked': "Token del ERP revocado",
 	'audit.action.organization.exception_agent_autonomy_updated': "Autonomía de los agentes de excepciones cambiada",
 	'audit.action.organization.fraud_rule_updated': "Comprobación de fraude cambiada",
+	'audit.action.organization.match_rule_updated': "Regla de conciliación con OC cambiada",
+	'audit.action.organization.match_rule_removed': "Regla de conciliación con OC quitada",
 	'audit.action.organization.provider_config_updated': "Configuración del proveedor actualizada",
 	'audit.action.organization.residency_updated': "Residencia de datos actualizada",
 	'audit.action.organization.scim_token_minted': "Token SCIM emitido",

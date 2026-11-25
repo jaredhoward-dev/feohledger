@@ -264,7 +264,7 @@ export const CONCEPT_GUIDES: Guide[] = [
 					},
 					{
 						type: 'p',
-						text: 'The [[match-tolerance]] is 5% unless your organization has changed it, and it can be set tighter for particular vendors or GL accounts. An invoice and a PO in different currencies are never treated as a match, because comparing euros with dollars at face value would mean nothing.'
+						text: 'The [[match-tolerance]] is 5% unless your organization has changed it, and an administrator can set a different one for particular vendors or GL accounts under {ui:org.section.matchRules}. An invoice and a PO in different currencies are never treated as a match, because comparing euros with dollars at face value would mean nothing.'
 					}
 				]
 			},

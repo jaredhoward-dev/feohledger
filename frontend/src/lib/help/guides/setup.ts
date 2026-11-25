@@ -312,7 +312,7 @@ export const SETUP_GUIDES: Guide[] = [
 				blocks: [
 					{
 						type: 'p',
-						text: 'Under {ui:org.rail.payments}, pick the payment provider that moves money when a payment run is executed, and set the CFO sign-off threshold. A [[payment-run]] above that total waits for someone with the CFO role to sign it off and cannot be executed until they do. That is the [[cfo-gate]]. {ui:org.section.cards} turns on virtual cards for invoice payments.'
+						text: 'Under {ui:org.rail.payments}, pick the payment provider that moves money when a payment run is executed, and set the CFO sign-off threshold. A [[payment-run]] above that total waits for someone with the CFO role to sign it off and cannot be executed until they do. That is the [[cfo-gate]]. {ui:org.section.cards} turns on virtual cards for invoice payments. {ui:org.section.matchRules} sets how far an invoice may differ from its purchase order and still match (the [[match-tolerance]]) and whether a [[quality-inspection]] must be recorded first, for the whole organization and per vendor or GL account. A vendor rule comes first, then the invoice’s GL account, then the organization setting, each setting on its own. A rule looser than the organization is marked, and every change is recorded in the audit trail.'
 					}
 				]
 			},

@@ -26132,3 +26132,41 @@ migration for a feature nobody has asked for; the panel says the delegation
 starts when saved. Restricting who may *delegate* to approvers would restate a
 rule the endpoint does not hold; a non-approver's delegation is harmless, since
 nothing routes to them.
+
+## 512. PO match rules get one audited writer and an organization panel, not a vendor-page field (round 41)
+
+**Problem.** `settings.matching` — the organization's PO-match tolerance and
+inspection requirement, and the per-vendor / per-commodity (header GL account)
+overrides `services/matching_rules` resolves — had no screen and no writer but
+the generic `PATCH /api/organization`, which writes no audit row and replaces
+the block whole. Widening a vendor's tolerance lets more of its invoices pass
+the PO match with no `po_mismatch` exception, so it is a money-path control
+changed with no record of who changed it.
+
+**Decision.** `api/organization_match_rules.py` owns the whole block:
+`GET /api/organization/match-rules`, `PUT …/organization`, `PUT`/`DELETE
+…/vendors/{id}` and `…/commodities/{gl_code}`. Admin only (the §502 rule: every
+`/organization` writer is admin-only, and loosening a match is a control over
+the people whose invoices it lets through). Each write takes the org row lock
+and records `organization.match_rule_updated` / `_removed` first (503 and
+nothing saved otherwise). A tolerance must be 0–100 with at most two places and
+is stored as its exact decimal string; the vendor or GL code must exist. The
+generic PATCH refuses any change to the block. Reads go through the resolver's
+own coercions, so the screen shows what the match applies, not what is stored.
+
+**Where the screen lives: one `/organization` panel** (`?section=match-rules`,
+under Money), not a field on each vendor's page. Precedence is per field across
+three layers, and the only way to read it correctly is to see the organization
+setting, the GL rules and the vendor rules together; a vendor page would show
+one layer and hide the GL rule that also applies. GL rules have no natural home
+page at all. The panel marks a rule looser than the organization and removes a
+rule only on a second click.
+
+**Rejected.** *Auditing the generic PATCH of `matching`*: it would keep the
+whole-block replacement, so saving the org tolerance could silently drop every
+vendor rule (§502's reasoning). *Refusing a rule looser than the organization*:
+a vendor with known freight variance is a legitimate reason, and the post-
+approval re-judge already takes the strictest rule across GL codes
+(`strictest_rule_for_any_commodity`); the screen flags it instead. *Recording
+created-by / created-at on each rule*: the audit rows already hold who and when,
+and a name copied into settings would be one more place erasure has to reach.

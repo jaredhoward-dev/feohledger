@@ -216,6 +216,8 @@ export const messages = {
 	'audit.action.organization.erp_token_revoked': "ERP-Token widerrufen",
 	'audit.action.organization.exception_agent_autonomy_updated': "Autonomie der Ausnahme-Agenten geändert",
 	'audit.action.organization.fraud_rule_updated': "Betrugsprüfung umgeschaltet",
+	'audit.action.organization.match_rule_updated': "Bestellabgleich-Regel geändert",
+	'audit.action.organization.match_rule_removed': "Bestellabgleich-Regel entfernt",
 	'audit.action.organization.provider_config_updated': "Anbietereinstellungen aktualisiert",
 	'audit.action.organization.residency_updated': "Datenresidenz aktualisiert",
 	'audit.action.organization.scim_token_minted': "SCIM-Token ausgestellt",

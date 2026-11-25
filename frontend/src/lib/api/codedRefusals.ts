@@ -50,6 +50,7 @@
  */
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import { formatMoney } from '#lib/utils/money.ts';
+import { formatPercent } from '#lib/utils/percent.ts';
 import { invoiceStatusLabelKey } from '#lib/types/invoice.ts';
 import { paymentStatusLabelKey } from '#lib/types/payment.ts';
 import { exceptionTypeFallback, exceptionTypeLabelKey } from '#lib/types/exception.ts';
@@ -368,6 +369,27 @@ const BUILDERS: Record<string, Builder> = {
 	po_not_invoiceable: fixed('refusal.poNotInvoiceable'),
 	// …and on an open PO this supplier has already invoiced (decisions §468).
 	po_already_invoiced: fixed('refusal.poAlreadyInvoiced'),
+	// `api/organization_match_rules.py` — the PO match rules panel's saves
+	// (decisions §512). The range is the server's, sent as exact decimal
+	// strings in percentage points and stated here, never restated.
+	match_tolerance_invalid: fixed('refusal.matchToleranceInvalid'),
+	match_tolerance_out_of_range: (params, t) => {
+		const min = moneyStr(params, 'min');
+		const max = moneyStr(params, 'max');
+		if (min === null || max === null) return null;
+		return t('refusal.matchToleranceOutOfRange', {
+			min: formatPercent(min, { maximumFractionDigits: 2 }),
+			max: formatPercent(max, { maximumFractionDigits: 2 })
+		});
+	},
+	match_tolerance_too_precise: (params, t) => {
+		const places = params.places;
+		if (typeof places !== 'number' || !Number.isInteger(places) || places < 0) return null;
+		return t('refusal.matchToleranceTooPrecise', { places });
+	},
+	match_rule_empty: fixed('refusal.matchRuleEmpty'),
+	match_rule_vendor_not_found: fixed('refusal.matchRuleVendorNotFound'),
+	match_rule_gl_account_not_found: fixed('refusal.matchRuleGlAccountNotFound'),
 	// `services/approval_chain.py`
 	approval_segregation: fixed('refusal.approvalSegregation'),
 	approval_segregation_receiver: fixed('refusal.approvalSegregationReceiver'),

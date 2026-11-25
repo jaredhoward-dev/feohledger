@@ -216,6 +216,8 @@ export const messages = {
 	'audit.action.organization.erp_token_revoked': "Jeton ERP révoqué",
 	'audit.action.organization.exception_agent_autonomy_updated': "Autonomie des agents d’exceptions modifiée",
 	'audit.action.organization.fraud_rule_updated': "Contrôle antifraude modifié",
+	'audit.action.organization.match_rule_updated': "Règle de rapprochement BC modifiée",
+	'audit.action.organization.match_rule_removed': "Règle de rapprochement BC supprimée",
 	'audit.action.organization.provider_config_updated': "Paramètres du prestataire mis à jour",
 	'audit.action.organization.residency_updated': "Résidence des données mise à jour",
 	'audit.action.organization.scim_token_minted': "Jeton SCIM émis",

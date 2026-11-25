@@ -16,6 +16,7 @@ from app.api.deps import (
     require_roles,
 )
 from app.api.organization_controls import AUDIT_UNWRITABLE_DETAIL, guard_owned_keys
+from app.api.organization_match_rules import guard_matching_block
 from app.api.refusals import coded_refusal, credential_block_unopenable_detail
 from app.config import settings
 from app.database import get_control_db
@@ -399,6 +400,8 @@ async def update_organization(
         # Two single keys have their own audited writer
         # (`api/organization_controls`); carry them, refuse a change.
         guard_owned_keys(body.settings, org.settings)
+        # `settings.matching` has its own audited writer (decisions §512).
+        guard_matching_block(body.settings, org.settings)
 
         # Saving a LIVE ERP adapter is plan-gated, and one routed through
         # Merge.dev is Scale-only (decisions §258, §281). Only
