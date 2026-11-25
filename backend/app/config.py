@@ -481,11 +481,17 @@ class Settings(BaseSettings):
     # `lookback_hours`), keeps those we pushed, reads at most `batch_size` back
     # a tick and applies each with the webhook's own reconciler. Stops a
     # tenant's pass at the ERP call budget. Off by default like every sweep
-    # that calls out.
+    # that calls out. Each listing asks from `through − overlap_minutes`, not
+    # `through` itself: `through` is our own clock at the last listing's start,
+    # and a bill Merge stamps a little earlier (clock skew, or Merge's own lag
+    # syncing the ERP) would otherwise fall between two listings for good.
+    # Re-reading a bill in the overlap is harmless: the reconciler is
+    # idempotent (decisions §544).
     merge_readback_sweep_enabled: bool = False
     merge_readback_sweep_interval_seconds: int = Field(default=900, ge=60)
     merge_readback_sweep_lookback_hours: int = Field(default=48, ge=1)
     merge_readback_sweep_batch_size: int = Field(default=50, ge=1)
+    merge_readback_sweep_overlap_minutes: int = Field(default=10, ge=0)
 
     # Commerce / inventory sync (decisions §273, `services/commerce_sync.py`).
     # OPERATOR-only override that points EVERY commerce adapter at one fake

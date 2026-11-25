@@ -460,6 +460,20 @@ def test_every_enabled_flag_is_a_real_settings_attribute():
         assert hasattr(settings, flag), f"{name} maps to a non-existent setting {flag!r}"
 
 
+@pytest.mark.parametrize("name", ALL_SWEEPS)
+def test_each_sweeps_enabled_flag_is_what_its_snapshot_reads(name, monkeypatch):
+    """Per sweep, its mapped flag is the one the health report reads: off reads
+    `disabled`, on a never-started sweep reads `not_started`. Parametrized over
+    the whole registry, so a new sweep (merge-readback, §540) is covered the
+    moment it is added, not by a test someone has to remember to write."""
+    flag = SWEEP_ENABLED_FLAGS[name]
+    monkeypatch.setattr(sweep_health, "_SWEEPS", {})
+    monkeypatch.setattr(settings, flag, False)
+    assert sweep_health.snapshot_of(name).state == STATE_DISABLED
+    monkeypatch.setattr(settings, flag, True)
+    assert sweep_health.snapshot_of(name).state == STATE_NOT_STARTED
+
+
 def _lifespan_task_names() -> set[str]:
     """Every `start_sweep(..., name="…")` / `create_task(..., name="…")` string
     in app/main.py's lifespan. Both call shapes are scanned so the guard

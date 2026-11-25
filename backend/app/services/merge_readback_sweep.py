@@ -7,7 +7,7 @@ source's unseal budget is spent for a tenant whose data key is cold (decisions
 forged one and Merge never redelivers it, so a void in the ERP was never
 flagged. This sweep is the backstop: it asks each Merge tenant's change feed
 (``MergeDevAdapter.changed_bills``) for the bills changed since a stored
-cursor, keeps those an invoice here was pushed as (``_bills_we_posted``, the
+cursor, keeps those an invoice here was pushed as (``bills_we_posted``, the
 webhook's own pre-read filter), reads each back (``bill_report``) and applies
 it with ``erp_status_sync.apply_bill_report`` — the reconciler the webhook and
 the QuickBooks / Xero status sync use. One reconciler, three channels: a bill
@@ -15,7 +15,9 @@ means the same here whichever carried it.
 
 **The cursor** is the tenant's ``Organization.settings["erp_merge_readback"]``:
 ``through`` (the moment the last listing started; the next one asks Merge for
-changes after it) and ``pending`` (bills of that listing not yet applied). The
+changes after ``through`` less ``FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES``,
+so a bill stamped just before our mark by a skewed clock or a lagging sync is
+still listed — decisions §544) and ``pending`` (bills of that listing not yet applied). The
 QuickBooks / Xero sync keeps its mark in ``settings.erp.oauth``, but a Merge
 connection has no OAuth block, and a key inside ``settings.erp`` would ride
 into the adapter config and the connection's realm. A first pass (no cursor)
@@ -137,7 +139,7 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
     from app.services.erp_adapters.dispatcher import MERGE_DEV_ADAPTER_KEY, resolve_adapter_key
     from app.services.erp_adapters.merge_dev import MergeBillNotFound
     from app.services.erp_link_realm import connection_realm
-    from app.services.erp_status_sync import _bills_we_posted, apply_bill_report
+    from app.services.erp_status_sync import apply_bill_report, bills_we_posted
 
     public = (org.settings or {}).get("erp")
     if not isinstance(public, dict) or not public:
@@ -169,14 +171,20 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
             result.tenants_deferred += 1
             return
         lookback = timedelta(hours=settings.merge_readback_sweep_lookback_hours)
-        since = _parse(through) or (now - lookback)
+        # Ask from a margin before the stored mark: it is our clock at the
+        # last listing's start, and a bill Merge stamped just before it (skew,
+        # or Merge's own lag behind the ERP) would otherwise never be listed.
+        # The overlap is re-read, which the reconciler makes harmless (§544).
+        last = _parse(through)
+        overlap = timedelta(minutes=settings.merge_readback_sweep_overlap_minutes)
+        since = (last - overlap) if last is not None else (now - lookback)
         try:
             changed = await adapter.changed_bills(since)
         except ErpCallBudgetExhausted:
             result.tenants_deferred += 1
             return
         result.bills_listed += len(changed)
-        pending = await _bills_we_posted(factory, changed, realm, by_reference=True)
+        pending = await bills_we_posted(factory, changed, realm, by_reference=True)
         through = now.isoformat()
 
     done = 0

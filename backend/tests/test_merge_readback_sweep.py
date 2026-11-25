@@ -52,6 +52,7 @@ def _enabled(monkeypatch):
     monkeypatch.setattr(settings, "merge_readback_sweep_enabled", True)
     monkeypatch.setattr(settings, "merge_readback_sweep_batch_size", 50)
     monkeypatch.setattr(settings, "merge_readback_sweep_lookback_hours", 48)
+    monkeypatch.setattr(settings, "merge_readback_sweep_overlap_minutes", 10)
 
 
 def _bill(bill_id: str, status: str = "OPEN") -> dict:
@@ -258,9 +259,65 @@ async def test_two_ticks_flag_once_and_the_second_asks_from_the_first(realdb, me
     later = NOW + timedelta(minutes=15)
     await sweep.run_merge_readback_once(now=later)
 
-    assert merge.since == [NOW - timedelta(hours=48), NOW]
+    # The second listing asks from the first's start less the overlap (§544).
+    assert merge.since == [NOW - timedelta(hours=48), NOW - timedelta(minutes=10)]
     assert len(await _exceptions(realdb, inv_id)) == 1
     assert (await _cursor(realdb))["through"] == later.isoformat()
+
+
+async def test_a_bill_stamped_just_before_the_cursor_is_still_read(realdb, merge, monkeypatch):
+    """The stored mark is OUR clock at the last listing's start. A bill whose
+    change Merge stamped a little before it (clock skew, or Merge's own lag
+    syncing the ERP) but did not list in time must still be read: the next
+    listing asks from the mark less the overlap (decisions §544)."""
+    await _merge_tenant(realdb)
+    inv_id, bill = await _pushed(realdb)
+    merge.bills[bill] = _bill(bill, "VOID")
+    # Merge's feed honours `since`: it lists a bill only if Merge stamped it
+    # after the asked moment. This change is stamped 3 minutes before our mark
+    # and only became visible to Merge's listing after the first tick.
+    stamped = NOW - timedelta(minutes=3)
+    visible: dict[str, datetime] = {}
+
+    async def _changed(self, since):
+        merge.since.append(since)
+        return [b for b, at in visible.items() if at > since]
+
+    monkeypatch.setattr(MergeDevAdapter, "changed_bills", _changed)
+
+    await sweep.run_merge_readback_once(now=NOW)
+    assert merge.read == [] and await _exceptions(realdb, inv_id) == []
+
+    visible[bill] = stamped
+    await sweep.run_merge_readback_once(now=NOW + timedelta(minutes=15))
+
+    assert merge.read == [bill]
+    [row] = await _exceptions(realdb, inv_id)
+    assert row.erp_report["erp_document_id"] == bill
+
+
+async def test_with_no_overlap_the_late_stamped_bill_would_be_missed(realdb, merge, monkeypatch):
+    """The control for the test above: the margin is what reads it."""
+    monkeypatch.setattr(settings, "merge_readback_sweep_overlap_minutes", 0)
+    await _merge_tenant(realdb)
+    _inv_id, bill = await _pushed(realdb)
+    visible: dict[str, datetime] = {}
+
+    async def _changed(self, since):
+        merge.since.append(since)
+        return [b for b, at in visible.items() if at > since]
+
+    monkeypatch.setattr(MergeDevAdapter, "changed_bills", _changed)
+
+    await sweep.run_merge_readback_once(now=NOW)
+    visible[bill] = NOW - timedelta(minutes=3)
+    await sweep.run_merge_readback_once(now=NOW + timedelta(minutes=15))
+
+    assert merge.read == []
+
+
+async def test_the_overlap_defaults_to_ten_minutes():
+    assert Settings.model_fields["merge_readback_sweep_overlap_minutes"].default == 10
 
 
 async def test_a_resolved_flag_is_not_reopened_by_the_next_tick(realdb, merge):
