@@ -182,8 +182,12 @@ def _kms_generate(context: dict[str, str]) -> tuple[bytes, bytes, str]:
     return resp["Plaintext"], resp["CiphertextBlob"], resp.get("KeyId") or key_id
 
 
+def _dek_cache_key(wrapped: bytes, context: dict[str, str]) -> bytes:
+    return hashlib.sha256(wrapped + _aad(context)).digest()
+
+
 def _kms_unwrap(wrapped: bytes, context: dict[str, str]) -> bytes:
-    cache_key = hashlib.sha256(wrapped + _aad(context)).digest()
+    cache_key = _dek_cache_key(wrapped, context)
     now = time.monotonic()
     with _dek_cache_lock:
         hit = _dek_cache.get(cache_key)
@@ -199,6 +203,27 @@ def _kms_unwrap(wrapped: bytes, context: dict[str, str]) -> bytes:
             _dek_cache.clear()
         _dek_cache[cache_key] = (now + _DEK_CACHE_TTL_SECONDS, dek)
     return dek
+
+
+def opens_from_cache(envelope: Envelope, context: dict[str, str]) -> bool:
+    """Would opening ``envelope`` now be served by the DEK cache, with no KMS call?
+
+    Side-effect free: it reads the cache under its lock and neither refreshes
+    an entry's age nor evicts one, so asking cannot keep a key warm. True only
+    for a KMS envelope whose data key is cached and unexpired; a local
+    envelope is False (local unwraps are never cached — and costing nothing,
+    they are dev-only). The answer is a moment's: the entry may expire, or
+    the cache be cleared at its bound, before the caller opens the envelope,
+    so it may decide what an opening is WORTH (the ERP webhooks' unseal
+    budget, decisions §527), never whether it is allowed.
+    """
+    if envelope.key_provider != KEY_PROVIDER_KMS:
+        return False
+    cache_key = _dek_cache_key(envelope.wrapped_key, context)
+    now = time.monotonic()
+    with _dek_cache_lock:
+        hit = _dek_cache.get(cache_key)
+        return hit is not None and hit[0] > now
 
 
 def clear_dek_cache() -> None:

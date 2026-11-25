@@ -322,7 +322,16 @@ misconfigured tenant never spends the others' budget. There is no per-tenant
 budget: anyone who knows a slug could spend it and drop that tenant's genuine
 deliveries, for no KMS saving. A spent budget opens nothing and is the same
 silent 204 as every other rejection, logged with the slug and adapter (never
-the address). Genuine deliveries are never counted. Redis unreachable fails
+the address) — except an opening the in-process DEK cache would serve, which
+costs no KMS call and goes ahead (decisions §527): the route then asks
+`provider_credentials.stored_block_opens_from_cache` (the row's wrapped key
+only, through `credential_crypto.opens_from_cache`, which respects the cache's
+TTL and neither warms nor evicts an entry). So a provider whose shared address
+spent its budget at stale-secret tenants still verifies every tenant opened in
+that process in the last five minutes; a cold tenant (or a local-provider row,
+never cached) is still refused. A failure on a cache-served opening is still
+counted, which keeps a source failing across warm tenants cut off from cold
+ones. Genuine deliveries are never counted. Redis unreachable fails
 open: a genuine delivery then verifies and meets the dedup claim's 503, so the
 provider redelivers. The budget follows `FEOH_RATE_LIMIT_ENABLED` (off in
 local dev). A distributed caller with many addresses is still bounded only by

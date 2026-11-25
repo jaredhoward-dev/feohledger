@@ -113,18 +113,17 @@ def _unseal_source_key(request: Request) -> str:
     return auth_identity_key(str(resolve_client_ip(request) or "unknown"))
 
 
-async def _unseal_budget_open(request: Request, tenant_slug: str, adapter_key: str) -> bool:
-    """May this delivery open a tenant's sealed key? (decisions §525)
+async def _unseal_budget_open(request: Request) -> bool:
+    """Has this delivery's source unseal budget left? (decisions §525)
 
     Read-only: nothing is counted here, only by
     :func:`_record_unverified_unseal` once an opened key has failed to verify a
-    delivery, so a genuine sender never spends the budget. Refused when the
+    delivery, so a genuine sender never spends the budget. Spent when the
     source address has failed against
     ``erp_webhook_unverified_tenants_per_source_limit`` DISTINCT tenants in
     the window: cycling across tenants is the only way past the DEK cache to a
-    KMS ``Decrypt`` per request. The caller answers a refusal with the same
-    silent 204 as every other rejection, so the budget is no slug oracle; it
-    is logged (slug and adapter only, never the address).
+    KMS ``Decrypt`` per request. A spent budget still lets through an opening
+    the DEK cache would serve (:func:`_tenant_webhook_config`, decisions §527).
 
     Redis unreachable FAILS OPEN, as the public API's per-key limiter does:
     the budget guards KMS cost, not correctness, and a genuine delivery that
@@ -132,21 +131,14 @@ async def _unseal_budget_open(request: Request, tenant_slug: str, adapter_key: s
     so the provider redelivers. Failing closed would drop that delivery with a
     204 instead.
     """
-    source_key = _unseal_source_key(request)
     try:
         await check_auth_failures(
             _UNSEAL_SOURCE_SCOPE,
-            source_key,
+            _unseal_source_key(request),
             limit=settings.erp_webhook_unverified_tenants_per_source_limit,
             window_seconds=settings.erp_webhook_unverified_window_seconds,
         )
     except RateLimitExceeded:
-        logger.warning(
-            "ERP webhook dropped: unverified-delivery budget spent by the source "
-            "for tenant '%s' (%s)",
-            tenant_slug,
-            adapter_key,
-        )
         return False
     except Exception as exc:  # noqa: BLE001 — Redis unreachable: fail open
         logger.warning("ERP webhook: unseal budget unavailable (%s)", exc.__class__.__name__)
@@ -187,10 +179,16 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str, request:
     3. a webhook key is stored at all — the row's path NAMES, no decrypt
        (``provider_credentials.stored_secret_paths``);
     4. the source still has unseal budget
-       (:func:`_unseal_budget_open`, decisions §525);
+       (:func:`_unseal_budget_open`, decisions §525) — or, once it is spent,
+       the opening would be served by the in-process DEK cache, which costs
+       no KMS call and so is not what the budget bounds
+       (``provider_credentials.stored_block_opens_from_cache``, decisions
+       §527);
     5. only then the block is opened (``provider_config``). The caller counts
        an opening whose key then fails the signature
-       (:func:`_record_unverified_unseal`).
+       (:func:`_record_unverified_unseal`) — a cache-served one too, so a
+       source failing across warm tenants still spends its budget for the
+       cold ones.
 
     The caller has already refused a request whose signature header could
     never verify (absent, or not the route's digest shape), so a request
@@ -229,7 +227,15 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str, request:
                 adapter_key,
             )
             return None
-        if not await _unseal_budget_open(request, tenant_slug, adapter_key):
+        if not await _unseal_budget_open(request) and not (
+            await provider_credentials.stored_block_opens_from_cache(org, "erp", db=ctrl_db)
+        ):
+            logger.warning(
+                "ERP webhook dropped: unverified-delivery budget spent by the source "
+                "for tenant '%s' (%s)",
+                tenant_slug,
+                adapter_key,
+            )
             return None
         try:
             erp_config = await provider_config(org, "erp", db=ctrl_db) or {}
