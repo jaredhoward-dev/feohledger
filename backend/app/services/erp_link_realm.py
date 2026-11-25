@@ -51,7 +51,9 @@ is never kept for a return (:func:`names_company`), since it names no company to
 return to. A no-realm pull works only on unlinked rows and its own
 ``UNNAMED_REALM`` links; a NULL link is left alone like a named one. Links a
 mock sync made between 0115 and §496 are NULL and cannot be told from pre-0115
-ones, so they are left NULL: nothing records which pull made them.
+ones, so they are left NULL: nothing records which pull made them. The push
+still trusts them like pre-0115 links (:func:`legacy_links_trusted`); that
+open risk and its proposed fix are in ``docs/followups.md`` (§496).
 
 **Links made before migration 0115 carry no realm (NULL).** The migration
 recorded, per organization, the realm its ERP config named at that moment

@@ -1207,6 +1207,21 @@ scope (§260) — do not fold them into any of these.
       `{"glAccount": {"key": …}}` bill line is checked against the fake ERP
       only. **Durable fix:** one sandbox Intacct push by key. **Trigger:** the
       first Intacct sandbox session.
+- [ ] **(c) A NULL link a mock sync made after 0115 can still be posted to a
+      real company.** §496 stamps every link a no-realm pull makes from now on
+      `"mock"`, but links a mock sync made between migration 0115 and that
+      change are NULL, indistinguishable from pre-0115 links, and were not
+      backfilled. The push trusts a NULL link via `legacy_links_trusted`
+      whenever the tenant is back on the company `legacy_link_realm`
+      snapshotted, so such a tenant reconnecting its real ERP can post a
+      fixture id (a GL account `"5000"`, a vendor `"57"`) to the real company
+      until the next named sync re-judges the row. Left as is on purpose: it is
+      an operator call. **Durable fix:** when an org's audit trail shows any
+      no-realm sync after 0115, drop its `legacy_link_realm` snapshot, so its
+      NULL links need a named sync's evidence before they post or pay; that
+      withdraws trust without inventing per-row provenance (§141).
+      **Trigger:** an operator decision, and in any case before any tenant
+      that ran on `mock` after 0115 reconnects a real ERP.
 
 ### Surfaced by the cross-workspace identity fixes (2026-10-20, decisions §291)
 

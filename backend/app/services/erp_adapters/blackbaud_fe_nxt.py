@@ -80,9 +80,11 @@ a number is what an accountant renumbers, so :meth:`list_gl_accounts` links
 each account by the GL API's stable ``account_id``, stored as ``id:<id>``
 (:data:`GL_ID_PREFIX`; the prefix keeps it apart from a number link, as
 Intacct's ``key:`` does, §492). At post time :meth:`_resolve_accounts` turns
-each ``id:`` link into the account's CURRENT number from ONE walk of the chart
-listing per push (stopping once every linked id is found, counted in the
-push's call reserve), never a read per line. A linked id the chart no longer
+each ``id:`` link into the account's CURRENT number: a bill linking at most
+:data:`CHART_RESOLVE_PER_ID_MAX` distinct ids reads ``GET /accounts/{id}`` once
+per id; a bill linking more walks the chart listing once (stopping once every
+linked id is found). Either way the push's call reserve counts the path it
+takes, and it is never a read per line. A linked id the chart no longer
 holds, or an account closed to data entry (``prevent_data_entry``), refuses the
 push ``account_inactive`` (``params.accounts`` = our GL codes) before the
 create, so nothing is half-posted. A bare number link from before §494 still
@@ -268,6 +270,15 @@ _MAX_PAGES = 10
 _LOOKUP_PAGE_SIZE = 500
 _LOOKUP_MAX_PAGES = 4
 CHART_RESOLVE_MAX_PAGES = sync_listing_pages(_PAGE_SIZE)
+#: A push linking at most this many distinct ``id:`` accounts reads each one
+#: (``GET /accounts/{id}``) instead of walking the chart (decisions §494). The
+#: walk's cost depends on where the ids sit in a chart that can hold thousands
+#: of accounts (one call per 100 rows), so it must reserve its whole cap
+#: (:data:`CHART_RESOLVE_MAX_PAGES`); a per-id read costs, and reserves, exactly
+#: one call per id. Five covers the usual bill (one to three accounts) and never
+#: costs more than walking to the chart's 500th account; a bill linking more
+#: walks, which on a typical chart is the cheaper of the two.
+CHART_RESOLVE_PER_ID_MAX = 5
 
 #: ``VendorStatus`` values that are not a payee FeohLedger may pay. ``OnHold``
 #: still takes an invoice in FE NXT, but FE NXT holds its payments, so paying
@@ -290,6 +301,15 @@ def lookup_dates(payload: InvoicePayload) -> list[date]:
     return dates
 
 
+def chart_resolve_calls(linked_ids: int) -> int:
+    """The most calls :meth:`BlackbaudFeNxtAdapter._resolve_accounts` makes for
+    a push linking ``linked_ids`` distinct ``id:`` accounts: one read per id up
+    to :data:`CHART_RESOLVE_PER_ID_MAX`, the chart walk's cap past it, 0 for none."""
+    if linked_ids <= CHART_RESOLVE_PER_ID_MAX:
+        return linked_ids
+    return CHART_RESOLVE_MAX_PAGES
+
+
 def push_call_reserve(pending_job: bool, lookup_windows: int = 1, chart_pages: int = 0) -> int:
     """The most SKY calls one :meth:`BlackbaudFeNxtAdapter.post_invoice` can make.
 
@@ -297,8 +317,8 @@ def push_call_reserve(pending_job: bool, lookup_windows: int = 1, chart_pages: i
     it lets start is never cut off half way (after the create, a refused call
     would leave the job unconfirmed). Derived from the same constants the
     push reads: the lookup (one page, then up to ``_LOOKUP_MAX_PAGES``
-    narrowed, per date searched), the fiscal years, the chart walk that
-    resolves ``id:`` links (``chart_pages``, 0 when the bill has none), the
+    narrowed, per date searched), the fiscal years, the account reads that
+    resolve ``id:`` links (``chart_pages``, :func:`chart_resolve_calls`), the
     create, the 400's vendor read, and the job watch — twice when an earlier
     attempt's job is read first.
     """
@@ -322,6 +342,15 @@ def linked_account_id(erp_account_id: object) -> str | None:
     """The FE NXT ``account_id`` an ``id:`` link names, or None for a number link."""
     value = str(erp_account_id)
     return value[len(GL_ID_PREFIX) :] if value.startswith(GL_ID_PREFIX) else None
+
+
+def linked_account_ids(body: dict) -> set[str]:
+    """The distinct FE NXT ``account_id`` values the body's distributions link."""
+    return {
+        account_id
+        for dist in body["distributions"]
+        if (account_id := linked_account_id(dist["account_number"])) is not None
+    }
 
 
 def account_codes(payload: InvoicePayload) -> dict[str, str]:
@@ -830,53 +859,86 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
     ) -> ErpPostResult | None:
         """Rewrite each ``id:`` distribution account to its current number.
 
-        One walk of ``GET /generalledger/v1/accounts`` for the whole push,
-        stopping at the page that holds the last id it needs (the map is built
-        once and every distribution reads it — never a read per line). None
+        At most :data:`CHART_RESOLVE_PER_ID_MAX` distinct ids: one
+        ``GET /generalledger/v1/accounts/{id}`` each (a 404 is an id the chart
+        no longer holds). More: one walk of ``GET /generalledger/v1/accounts``,
+        stopping at the page that holds the last id it needs. Either way the map
+        is built once and every distribution reads it — never a read per line
+        (:func:`chart_resolve_calls` is what the push reserves for it). None
         when every account resolved and ``body`` now names them by number; a
-        failed result otherwise, before anything is created: a refused page is
-        an ordinary failure (retryable when the answer could change), and a
-        linked id the chart does not hold, or one closed to data entry, is the
-        coded ``account_inactive`` naming our GL codes. A bare number link
-        (from before §494, not yet re-keyed by a sync) is posted as-is.
+        failed result otherwise, before anything is created: a refused or
+        unreadable read is an ordinary failure (retryable when the answer could
+        change), and a linked id the chart does not hold, or one closed to data
+        entry, is the coded ``account_inactive`` naming our GL codes. A bare
+        number link (from before §494, not yet re-keyed by a sync) is posted
+        as-is.
         """
-        wanted = {
-            account_id
-            for dist in body["distributions"]
-            if (account_id := linked_account_id(dist["account_number"])) is not None
-        }
+        wanted = linked_account_ids(body)
         if not wanted:
             return None
         numbers: dict[str, str] = {}
         closed: set[str] = set()
-        for page in range(CHART_RESOLVE_MAX_PAGES):
-            query = {"limit": str(_PAGE_SIZE), "offset": str(page * _PAGE_SIZE)}
-            resp = await client.get(f"{self._base()}{GL}/accounts", params=query, headers=headers)
-            if resp.status_code != 200:
-                return ErpPostResult(
-                    success=False,
-                    message=failure_message("chart read", resp),
-                    retryable=failure_reason(resp) == "rate_limited"
-                    or erp_status_retryable(resp.status_code),
+
+        def take(raw: object) -> None:
+            if not isinstance(raw, dict):
+                return
+            account_id = raw.get("account_id")
+            number = raw.get("account_number")
+            if account_id is None or str(account_id) not in wanted or not number:
+                return
+            numbers[str(account_id)] = str(number)
+            if raw.get("prevent_data_entry"):
+                closed.add(str(account_id))
+
+        def refused(resp: httpx.Response) -> ErpPostResult:
+            return ErpPostResult(
+                success=False,
+                message=failure_message("chart read", resp),
+                retryable=failure_reason(resp) == "rate_limited"
+                or erp_status_retryable(resp.status_code),
+            )
+
+        if len(wanted) <= CHART_RESOLVE_PER_ID_MAX:
+            for account_id in sorted(wanted):
+                resp = await client.get(
+                    f"{self._base()}{GL}/accounts/{quote(account_id, safe='')}", headers=headers
                 )
-            rows = _field(resp, "value")
-            batch = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
-            for raw in batch:
-                account_id = raw.get("account_id")
-                number = raw.get("account_number")
-                if account_id is None or str(account_id) not in wanted or not number:
-                    continue
-                numbers[str(account_id)] = str(number)
-                if raw.get("prevent_data_entry"):
-                    closed.add(str(account_id))
-            count = _field(resp, "count")
-            read = page * _PAGE_SIZE + len(batch)
-            if (
-                wanted <= set(numbers)
-                or len(batch) < _PAGE_SIZE
-                or (isinstance(count, int) and read >= count)
-            ):
-                break
+                if resp.status_code == 404:
+                    continue  # gone from the chart: refused below, with any other
+                if resp.status_code != 200:
+                    return refused(resp)
+                try:
+                    account = _json(resp)
+                except ValueError:
+                    account = None
+                if not isinstance(account, dict) or str(account.get("account_id")) != account_id:
+                    # A 200 we cannot read says nothing about the account:
+                    # a plain failure, never an account_inactive verdict.
+                    return ErpPostResult(
+                        success=False,
+                        message="Blackbaud FE NXT chart read returned an unreadable account",
+                    )
+                take(account)
+        else:
+            for page in range(CHART_RESOLVE_MAX_PAGES):
+                query = {"limit": str(_PAGE_SIZE), "offset": str(page * _PAGE_SIZE)}
+                resp = await client.get(
+                    f"{self._base()}{GL}/accounts", params=query, headers=headers
+                )
+                if resp.status_code != 200:
+                    return refused(resp)
+                rows = _field(resp, "value")
+                batch = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+                for raw in batch:
+                    take(raw)
+                count = _field(resp, "count")
+                read = page * _PAGE_SIZE + len(batch)
+                if (
+                    wanted <= set(numbers)
+                    or len(batch) < _PAGE_SIZE
+                    or (isinstance(count, int) and read >= count)
+                ):
+                    break
         unusable = (wanted - set(numbers)) | closed
         if unusable:
             codes = account_codes(payload)
@@ -900,12 +962,11 @@ class BlackbaudFeNxtAdapter(OAuthErpAdapter):
         if isinstance(body, str):
             return erp_preflight_refusal(PROVIDER, body)
 
-        id_linked = any(linked_account_id(d["account_number"]) for d in body["distributions"])
         refusal = await self.call_budget().check(
             reserve=push_call_reserve(
                 bool(payload.pending_job_id),
                 len(lookup_dates(payload)),
-                CHART_RESOLVE_MAX_PAGES if id_linked else 0,
+                chart_resolve_calls(len(linked_account_ids(body))),
             )
         )
         if refusal is not None:

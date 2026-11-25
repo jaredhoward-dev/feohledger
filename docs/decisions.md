@@ -25206,25 +25206,42 @@ new number.
   and without it a row linked to account NUMBER 7 would be matched by rule 1 to
   whichever account has id 7. An account with no `account_id` gets no link
   (`missing_erp_id`), never a number fallback.
-- **The push resolves id → current number from ONE chart walk.**
-  `_resolve_accounts` reads `GET /generalledger/v1/accounts` 100 a page,
-  builds the id → number map once for the whole push and rewrites every
-  `id:` distribution from it, stopping at the page that holds the last id it
-  needs. It runs after the idempotency lookup and the period check (an invoice
-  an earlier attempt posted is reported whatever the chart says now) and
-  immediately before the create, so nothing is half-posted.
-- **Call budget.** A push with an `id:` distribution reserves
-  `CHART_RESOLVE_MAX_PAGES` more calls (the sync's own bound,
-  `sync_listing_pages(100)`), so any account a sync could link can be
-  resolved and the push still never runs out of budget part-way (§322). The
-  reserve is a check, not a spend: the walk usually stops after one page. A
-  legacy number-only push reserves and reads nothing extra.
+- **The push resolves id → current number once per push, by the cheaper
+  bounded path.** `_resolve_accounts` builds the id → number map once and
+  rewrites every `id:` distribution from it (never a read per line). A push
+  linking at most `CHART_RESOLVE_PER_ID_MAX` (5) distinct ids reads
+  `GET /generalledger/v1/accounts/{account_id}` once per id; a 404 there is an
+  id the chart no longer holds. A push linking more walks
+  `GET /generalledger/v1/accounts` 100 a page, stopping at the page that
+  holds the last id it needs. Either path runs after the idempotency lookup
+  and the period check (an invoice an earlier attempt posted is reported
+  whatever the chart says now) and immediately before the create, so nothing
+  is half-posted.
+- **Why the split, and why 5.** A walk's cost is where the ids sit in the
+  chart, one call per 100 accounts, and nonprofit charts run to thousands
+  (fund × department × natural account): an id near the end of a 4,000-row
+  chart costs 40 calls on a 2,500/day platform-key share, and because the
+  position is unknown up front the walk must reserve its whole cap, which
+  refuses pushes once the day's share runs low. A per-id read costs and
+  reserves exactly one call per id. Most bills code to one to three accounts;
+  at 5 the per-id path never costs more than walking to the 500th account,
+  and past it a bill with many accounts is better served by one walk (on a
+  chart under 100 rows per id it is cheaper, and its cost no longer grows
+  with the line count).
+- **Call budget.** The push reserves what its path can cost
+  (`chart_resolve_calls`): the distinct id count on the per-id path,
+  `CHART_RESOLVE_MAX_PAGES` (the sync's own bound, `sync_listing_pages(100)`,
+  so any account a sync could link can be resolved) on the walk, nothing for a
+  legacy number-only push. Either way the push never runs out of budget
+  part-way (§322).
 - **A linked id the chart no longer holds, or one closed to data entry
   (`prevent_data_entry`), refuses `account_inactive`** with our GL codes in
   `params.accounts`, non-retryable, before the create — the existing shared
   code and message ("inactive or deleted there … recode, then retry"), so no
-  new refusal code or translation. A chart page SKY refuses is an uncoded
-  failure, retryable for a rate limit or a 5xx.
+  new refusal code or translation. A chart page or account read SKY refuses
+  (other than the per-id 404) is an uncoded failure, retryable for a rate
+  limit or a 5xx, and a 200 whose account cannot be read is an uncoded
+  retryable failure too, never an `account_inactive` verdict.
 - **Existing links need no migration** — exactly §492's route: the first
   id-keyed pull falls to `services/gl_account_sync` rule 2 by code, finds the
   row's number link is not a live id, and re-links that same row, recorded in
@@ -25232,17 +25249,21 @@ new number.
   read. The two cases §492 names (renumbered, or renumbered and reused, before
   the first keyed pull) apply unchanged; read `link_changes` after it.
 
-**Rejected.** *A read per distinct account* (`GET /accounts/{id}`): one call
-per account per push on a quota every platform-key tenant shares; one walk
-that stops early costs one call for a typical chart. *Caching the map across
+**Rejected.** *Always one walk* (this entry's first form): cheap on a small
+chart but up to 100 calls on a large one, and its 100-call reserve refused
+pushes near the end of a tenant's day. *Always a read per distinct account*:
+a many-line bill would cost one call per account where one page might do.
+*Caching the map across
 pushes*: a renumbering between pushes would post to the old number, the very
 drift this fixes; the fiscal-year cache is safe only because a stale value
 refuses rather than misposts. *Resolving at sync time and storing the number
 beside the id*: still stale by the next push after a renumbering.
 
 **Unverified.** Checked against the fake ERP and mocked SKY responses only;
-the real `ListAccounts` page size and the `account_id` type are as the SKY
-schema documents them.
+the real `ListAccounts` page size, the `account_id` type, and the single
+account read (`GET /generalledger/v1/accounts/{account_id}` answering the same
+`account_id` / `account_number` / `prevent_data_entry` fields as a list row,
+404 for an unknown id) are as the SKY schema documents them.
 
 ## 495. Signup and set-password record acceptance of the Terms and Privacy versions in force (round 37)
 
@@ -25318,7 +25339,7 @@ Terms. *Erasing the rows on DSAR*: removes the only evidence of the contract
 the erased person's employer still holds us to. *Requiring acceptance on every
 password reset*: holds up account recovery for a step the re-prompt covers.
 
-## 496. A no-realm sync stamps its links `"mock"`; NULL means only pre-0115, and existing NULL links are not backfilled (closes a `docs/followups.md` entry, round 37)
+## 496. A no-realm sync stamps its links `"mock"`; NULL means only pre-0115, and existing NULL links are not backfilled (round 37; the existing rows' risk stays open in `docs/followups.md`)
 
 **Context.** §287 made a pull that names no company (`mock`, or an OAuth ERP
 with no consent) leave alone every row tied to a named realm. But it still
@@ -25362,6 +25383,16 @@ next named sync judges them as pre-0115 links (which is what the push already
 assumes). On a dev database seeded before this change, a mock vendor sync
 reports the seeded links `unverified_link` until it is re-seeded. `scripts/seed.py`
 now stamps its fixture links `"mock"`.
+
+**What this leaves open.** The stamp closes the risk for links made from now
+on, not for those rows. A NULL link a mock sync made after 0115 is still
+trusted by the push through `legacy_links_trusted` whenever the tenant is back
+on the company 0115 snapshotted, so a fixture id (a GL account `"5000"`) can
+still be posted to that real company until the next named sync re-judges the
+row. The behaviour is unchanged here because withdrawing trust is an operator
+call; the proposed fix (drop an org's `legacy_link_realm` snapshot when its
+audit trail shows any no-realm sync after 0115) and its trigger are tracked in
+`docs/followups.md` § Surfaced by reviewing the QuickBooks live-test fixes.
 
 **Rejected.** *Treating `"mock"` links like NULL in a named sync* (loose
 legacy evidence): a fixture id says nothing about a real company, so the strict

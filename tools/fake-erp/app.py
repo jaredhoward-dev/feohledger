@@ -3797,6 +3797,16 @@ async def blackbaud_accounts(request: Request) -> dict:
     return _blackbaud_page(request, BLACKBAUD_ACCOUNT_FIXTURES)
 
 
+@blackbaud.get("/generalledger/v1/accounts/{account_id}")
+async def blackbaud_account(request: Request, account_id: int) -> dict:
+    """One account, as a list row (the push's per-id read, decisions §494)."""
+    _require_blackbaud_auth(request)
+    for account in BLACKBAUD_ACCOUNT_FIXTURES:
+        if account["account_id"] == account_id:
+            return copy.deepcopy(account)
+    raise ProviderError(404, {"Error": "The specified record could not be found."})
+
+
 @blackbaud.get("/accountspayable/v1/invoices")
 async def blackbaud_list_invoices(request: Request) -> dict:
     _require_blackbaud_auth(request)

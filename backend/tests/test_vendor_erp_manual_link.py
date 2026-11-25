@@ -23,6 +23,7 @@ from app.models.organization import Organization
 from app.models.vendor import Vendor, VendorErpLink
 from app.models.workflow import AuditLog
 from app.services.erp_adapters.base import ErpAdapter, VendorPayload, VendorSearchResult
+from app.services.erp_link_realm import UNNAMED_REALM
 from app.services.vendor_erp_manual_link import (
     ERP_VENDOR_ALREADY_LINKED,
     ERP_VENDOR_INACTIVE,
@@ -247,6 +248,27 @@ async def test_link_keeps_a_row_link_from_another_company(realdb):
     assert await _row(mk, vid) == ((realm, CUSTOMER.erp_vendor_id), {old: "57"})
     [audit] = await _audits(mk, vid)
     assert audit["kept"] == {"realm": old, "erp_vendor_id": "57"}
+    assert audit["replaced"] == {"realm": old, "erp_vendor_id": "57"}
+
+
+async def test_link_over_a_mock_link_names_the_replaced_link_in_the_audit_row(realdb):
+    """A no-realm (``"mock"``) row link is overwritten and kept nowhere (§496):
+    the audit row is its only trace, so it names both ids."""
+    mk = realdb.sessionmaker("a")
+    realm = _realm()
+    vid = await _vendor(
+        mk, realdb.info("a").org_id, name="Fixture Co", erp_vendor_id="57", realm=UNNAMED_REALM
+    )
+    with _patched(_Erp([CUSTOMER]), realm):
+        r = await _post(
+            realdb, f"/api/vendors/{vid}/erp-links/link", {"erp_vendor_id": CUSTOMER.erp_vendor_id}
+        )
+    assert r.status_code == 200, r.text
+    assert await _row(mk, vid) == ((realm, CUSTOMER.erp_vendor_id), {})
+    [audit] = await _audits(mk, vid)
+    assert audit["erp_vendor_id"] == CUSTOMER.erp_vendor_id
+    assert audit["replaced"] == {"realm": UNNAMED_REALM, "erp_vendor_id": "57"}
+    assert "kept" not in audit
 
 
 async def test_link_refuses_a_vendor_already_linked_in_this_company(realdb):

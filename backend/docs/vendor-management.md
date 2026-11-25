@@ -319,7 +319,9 @@ place) and offers the search again once that company's link is cleared.
   them by the normal rules, and a sync that does not list it leaves the link
   alone (a same-company link is never re-judged).
 - **Audited** as `vendor.erp_linked`, `details` `{realm, erp_vendor_id,
-  erp_name, tax_id_matches, kept?}`.
+  erp_name, tax_id_matches, kept?, replaced?}`. `replaced` names the row link
+  the new one overwrote (`{realm, erp_vendor_id}`) whether or not it was kept:
+  a no-realm (`"mock"`) link is kept nowhere (§496), so this is its only trace.
 
 ### Unlinking a vendor from one ERP company
 

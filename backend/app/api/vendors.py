@@ -2042,8 +2042,10 @@ async def link_vendor_erp_record(
     company (unlink it first, §375); 409 `erp_vendor_already_linked` when
     another vendor holds the record here; 409 `vendor_erp_search_unavailable`.
     A row link from another company is kept for it (§356). Writes
-    `vendor.erp_linked` naming the realm, the record, its ERP name and
-    whether its tax number matched. Only the link changes: the vendor's own
+    `vendor.erp_linked` naming the realm, the record, its ERP name,
+    whether its tax number matched, and the row link it replaced
+    (`replaced`, kept or not: a no-realm link is kept nowhere, §496).
+    Only the link changes: the vendor's own
     fields stay as keyed until a sync that lists the record updates them.
     The response carries the vendor's new `search_refusal`
     (`vendor_erp_link_exists` now), so the panel stops offering Link."""
@@ -2077,6 +2079,7 @@ async def link_vendor_erp_record(
             "erp_name": result.erp_name,
             "tax_id_matches": result.tax_id_matches,
             **({"kept": result.kept} if result.kept else {}),
+            **({"replaced": result.replaced} if result.replaced else {}),
         },
     )
     await db.commit()
