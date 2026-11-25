@@ -591,7 +591,9 @@ test.describe('legal pages', () => {
 		await page.goto(`${WEB_ORIGIN}/signup`);
 		const box = page.getByRole('checkbox', { name: /I agree to the Terms of Service/ });
 		await expect(box).not.toBeChecked();
-		await expect(box).toHaveAttribute('required', '');
+		// Required by the page's own check (aria-required), not the browser's
+		// native `required` bubble — signup/form-rules.spec.ts pins why.
+		await expect(box).toHaveAttribute('aria-required', 'true');
 		const consent = page.locator('.legal-consent');
 		await expect(consent.getByRole('link', { name: 'Terms of Service' })).toHaveAttribute(
 			'href',
