@@ -26894,3 +26894,64 @@ specificity against `app.css`'s control base and reaches every `.card` in the
 app; scoped copies are the existing `organization/` pattern (`LineTotalCheckPanel`)
 and keep each panel's look provably identical. *Fewer, bigger props by passing
 the whole page state*: it would re-couple every panel to every other.
+
+## 527. A spent ERP webhook unseal budget still lets through an opening the DEK cache would serve, and still counts its failure (§525 follow-up, round 44)
+
+**Problem.** §525's per-source budget was checked before every unseal on
+`/api/erp/webhook/{erp_type}` and `/api/erp/webhook/merge_dev/{slug}`. A
+provider that delivers every tenant's events from a few shared addresses and
+fails to verify at ten tenants in a window (stale secrets after a rotation)
+spent its budget, and then every tenant's genuine deliveries from those
+addresses were dropped with the silent 204 until the window rolled. The budget
+exists to bound KMS `Decrypt` calls, and an opening whose data key is already
+in the in-process DEK cache makes none.
+
+**Decision.**
+
+- **Only a cache-missing opening is gated.** When the source's budget is spent,
+  `_tenant_webhook_config` asks `provider_credentials.stored_block_opens_from_cache`
+  (one select of the row's wrapped key and provider, no decrypt), which asks
+  `credential_crypto.opens_from_cache`: True only for a KMS envelope whose data
+  key is cached under the same encryption context and unexpired. It reads under
+  the cache lock and neither refreshes an entry's age nor evicts one, so asking
+  cannot keep a key warm; a stale entry is left for the next opening to replace.
+  A local-provider envelope is never cached, so it is never exempt (dev keeps
+  §525's behaviour exactly). The question is asked only when the budget is
+  spent, so the common path pays no extra query.
+- **A failure on a cache-served opening is still recorded.** Recording keeps
+  the cycling signal: a source failing across warm tenants keeps refreshing its
+  window and stays cut off from the cold ones, which is where a KMS call would
+  be spent. Not recording would let such a source's budget lapse while it went
+  on failing, and buy nothing, because the exemption does not read the budget
+  at all. A genuine provider is unaffected either way: its verified deliveries
+  are never counted, and its warm tenants open regardless of the count.
+- **Nothing before verification differs.** A refusal is the same silent 204,
+  logged (moved from `_unseal_budget_open` to its caller, since the refusal is
+  now decided there) with the slug and adapter, never the address. The cache
+  check depends only on this process's own past openings, which the caller
+  cannot observe beyond the response time §408 already accepts. Redis down
+  still fails open before the cache is consulted.
+
+**What remains.** The answer is a moment's: an entry can expire, or the cache
+be cleared at its 512-key bound, between the check and the opening, so one
+opening per such race can reach KMS ungated — bounded and not steerable by the
+caller. The cache is per process, so a tenant cold in the worker that receives
+a delivery is still refused while the budget is spent; the recovery sweeps in
+`docs/followups.md` remain the backstop for those.
+
+*Rejected: exempting by a separate per-tenant "recently verified" marker in
+Redis* — it would be a second cache of a fact the DEK cache already holds
+exactly, and could say "warm" for a process where the opening would call KMS.
+*Rejected: not recording cache-served failures*, for the reason above.
+*Rejected: exempting local-provider rows* (they cost no KMS call either): it
+would turn the budget off wherever tests and local dev exercise it.
+
+**Tests.** `tests/test_merge_webhook.py`: a spent budget still lets a warm
+tenant's genuine delivery verify and be applied, while a cold tenant from the
+same address is refused unopened and logged without the address; an entry past
+its TTL is not exempt; a local row is never exempt; a wrong signature at a warm
+tenant still records against the source. `tests/test_webhook_security.py`: the
+generic route, warm / cold / past the TTL. `tests/test_provider_credentials.py`:
+the predicate against a fake KMS (no call, no warming or refresh, the context
+scoped, the TTL), false for a local envelope, and the row-level spelling on real
+Postgres.
