@@ -1097,6 +1097,7 @@ AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml   # decrypts → $EDITOR �
   where money goes uses `ExactMoneyInput` (a JSON number is already a float by
   the time pydantic sees it).
 - **No dotenv in Lambda paths** — `main.py` imports dotenv for local dev; Lambda entry points must not.
+- **Due dates: read the effective one.** Every per-row overdue flag, shown due date or aging band reads `services/open_ap_due` (`effective_due_of` / `current_schedule_due`, banded by `aging_band`; counts through `open_ap_due_population`), never `Invoice.due_date` alone: a payment schedule moves the date (decisions §565, §569, `docs/analytics.md`). `tests/test_open_ap_due_single_statement.py` is the guard.
 - **Tenant isolation** — always resolve tenant via dependency injection (`get_tenant_db()`), never hardcode DB names.
 - **Row locking** — use `get_invoice_for_update()` for any status transition to prevent race conditions.
 - **No row lock held across a third-party call.** Lock, write a committed marker, call with no lock, re-lock and check the marker is still yours (the ERP bill void, decisions §545, §550; `services/post_commit.py` for best-effort legs).
