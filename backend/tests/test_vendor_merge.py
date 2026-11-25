@@ -1122,7 +1122,7 @@ async def test_a_recall_clears_the_way_and_the_next_approval_signs_the_canonical
 
 
 def test_a_mock_link_the_canonical_row_cannot_take_is_released_not_kept():
-    """§497: a no-realm pull's ``UNNAMED_REALM`` link names no company, so no
+    """§496: a no-realm pull's ``UNNAMED_REALM`` link names no company, so no
     sync would ever restore it from ``vendor_erp_links``. When the canonical's
     row is taken it is dropped (``released``), never filed as kept; when the
     row is free it moves there like any row link."""

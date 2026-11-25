@@ -42,7 +42,7 @@ are not filtered under ``None`` — refusing them would only replace the
 ``not_connected`` refusal with a misleading ``vendor_not_linked``.
 
 **A link a no-realm pull makes is stamped** :data:`UNNAMED_REALM` (``"mock"``),
-never left NULL (docs/decisions.md §497), so NULL means only "made before
+never left NULL (docs/decisions.md §496), so NULL means only "made before
 migration 0115". The stamp has no ``:``, and every realm
 :func:`connection_realm` returns does, so it can never equal a real company's
 realm: under a named realm such a link is simply another company's (refused at
@@ -50,7 +50,7 @@ the push, re-judged by the strict between-companies evidence at a sync), and it
 is never kept for a return (:func:`names_company`), since it names no company to
 return to. A no-realm pull works only on unlinked rows and its own
 ``UNNAMED_REALM`` links; a NULL link is left alone like a named one. Links a
-mock sync made between 0115 and §497 are NULL and cannot be told from pre-0115
+mock sync made between 0115 and §496 are NULL and cannot be told from pre-0115
 ones, so they are left NULL: nothing records which pull made them.
 
 **Links made before migration 0115 carry no realm (NULL).** The migration

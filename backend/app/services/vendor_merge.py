@@ -313,7 +313,7 @@ def _plan_erp_links(
       named link: it conflicts with any link of a different id on the other
       side, in any realm (reported as realm ``None``);
     * otherwise the link moves to the canonical — except that a no-realm
-      pull's ``UNNAMED_REALM`` link, which can only live on a row (§497), is
+      pull's ``UNNAMED_REALM`` link, which can only live on a row (§496), is
       ``released`` when the canonical's row is taken.
 
     Any conflict refuses the whole merge — before a single row is written —
@@ -371,7 +371,7 @@ def _plan_erp_links(
                 plan.records.append({**record, "placed": "row"})
             elif not names_company(realm):
                 # A no-realm pull's link names no company to keep it for
-                # (§497): with the canonical's row taken, it is dropped.
+                # (§496): with the canonical's row taken, it is dropped.
                 plan.records.append({**record, "placed": "released"})
             else:
                 plan.kept.append((realm, erp_id))

@@ -16,7 +16,7 @@ Two rules keep that safe, and both live here:
   vendor is unlinked in B and the push refuses it ``vendor_not_linked``.
 * **Only a link with a named realm is kept** (:func:`keep_link`,
   ``erp_link_realm.names_company``). A NULL-realm link (made before migration
-  0115, or by a sync with no realm before §497) records nothing about which
+  0115, or by a sync with no realm before §496) records nothing about which
   company issued it; filing it under a guessed company is the manufactured
   evidence §141 refuses. A no-realm pull's ``UNNAMED_REALM`` link names no
   company either, and no sync ever restores under it. Both are dropped exactly

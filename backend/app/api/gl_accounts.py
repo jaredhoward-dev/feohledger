@@ -636,7 +636,7 @@ async def confirm_gl_account_erp_link(
 
     chosen = offered[body.erp_account_id]
     account.erp_account_id = body.erp_account_id
-    # Never NULL, which is reserved for pre-0115 links (decisions §497).
+    # Never NULL, which is reserved for pre-0115 links (decisions §496).
     account.erp_link_realm = link_stamp(realm)
     account.erp_link_confirmed_at = datetime.now(UTC)
     account.erp_link_confirmed_by = user.id

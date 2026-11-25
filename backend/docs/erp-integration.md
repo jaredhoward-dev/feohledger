@@ -1689,7 +1689,7 @@ account whose code such a row holds is refused `code_taken`. It works only on
 unlinked rows and the links such a sync made itself.
 
 **A no-realm sync stamps its links `"mock"`** (`erp_link_realm.UNNAMED_REALM`,
-decisions §497), never NULL, so NULL means only "made before migration 0115".
+decisions §496), never NULL, so NULL means only "made before migration 0115".
 Every real realm is `<adapter>:<identity>`; the stamp has no `:`, so it can
 never equal one. What follows from that:
 
@@ -1704,7 +1704,7 @@ never equal one. What follows from that:
   in `gl_account_erp_links` / `vendor_erp_links`. A merge drops one the
   canonical's row cannot take.
 - A GL decision confirmed under no realm is stamped `"mock"` too.
-- Links a mock sync made between 0115 and §497 are NULL and cannot be told from
+- Links a mock sync made between 0115 and §496 are NULL and cannot be told from
   pre-0115 ones, so they were not backfilled: a no-realm sync now leaves them
   alone, and a named sync judges them as pre-0115 links. Seeded demo data is
   stamped `"mock"` (`scripts/seed.py`).
@@ -1748,7 +1748,7 @@ restored link), and the message adds "N restored". Three rules hold:
   always comes back, since it may share its account with the row named after
   it, the one share a person can make.
 - **Only a named realm is kept.** A NULL-realm link (pre-0115, or made by a
-  no-realm sync before §497) or a `"mock"` one names no company, so it is
+  no-realm sync before §496) or a `"mock"` one names no company, so it is
   judged by rule 0 as before. A no-realm sync neither keeps nor restores.
   Nothing was backfilled.
 - **The push never reads a kept state.** It posts the row's own link, live in
@@ -1921,7 +1921,7 @@ ambiguous. Three rules hold:
   (`unlinked`, `kept: false`) instead of restored. A link from another company
   is not adopted onto an id a vendor already holds here.
 - **Only a named realm is kept.** A NULL-realm link (pre-0115, or made by a
-  no-realm sync before §497) or a `"mock"` one names no company, so it is
+  no-realm sync before §496) or a `"mock"` one names no company, so it is
   dropped as before. A no-realm sync
   neither keeps nor restores anything. No link was backfilled: the ones earlier
   syncs dropped appear only in audit rows, which are history, not live links.

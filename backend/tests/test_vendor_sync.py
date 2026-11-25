@@ -98,7 +98,7 @@ async def test_sync_updates_changed_fields(realdb):
                 name="Old Name",
                 code="OLD",
                 erp_vendor_id="ERP-7",
-                # A link an earlier no-realm pull made (decisions §497).
+                # A link an earlier no-realm pull made (decisions §496).
                 erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
@@ -131,7 +131,7 @@ async def test_sync_unchanged_when_no_diff(realdb):
                 name="Same Co",
                 code="SC",
                 erp_vendor_id="ERP-3",
-                # A link an earlier no-realm pull made (decisions §497).
+                # A link an earlier no-realm pull made (decisions §496).
                 erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
@@ -161,7 +161,7 @@ async def test_sync_does_not_null_out_existing_fields(realdb):
                 name="Keep Email",
                 email="keep@vendor.test",
                 erp_vendor_id="ERP-K",
-                # A link an earlier no-realm pull made (decisions §497).
+                # A link an earlier no-realm pull made (decisions §496).
                 erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
@@ -199,7 +199,7 @@ async def test_a_value_too_long_for_its_column_is_dropped_never_aborts_the_sync(
                 name="Has Code",
                 code="OLD-CODE",
                 erp_vendor_id="ERP-L1",
-                # A link an earlier no-realm pull made (decisions §497).
+                # A link an earlier no-realm pull made (decisions §496).
                 erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
@@ -830,7 +830,7 @@ def _linked(org_id, name: str, erp_id: str, realm: str | None) -> Vendor:
 async def test_the_database_refuses_a_second_holder_of_one_record_in_one_company(realdb, realm):
     """A NULL realm is one company too (NULLS NOT DISTINCT): pre-0115 links
     stay unique among themselves, as do a no-realm pull's ``UNNAMED_REALM``
-    ("mock") links (decisions §497)."""
+    ("mock") links (decisions §496)."""
     from sqlalchemy.exc import IntegrityError
 
     mk = realdb.sessionmaker("a")
@@ -882,7 +882,7 @@ async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_o
     org_id = realdb.info("a").org_id
     async with mk() as s:
         await s.execute(text("DROP INDEX uq_vendors_erp_link"))
-        # What a pull under `realm` stamps (decisions §497).
+        # What a pull under `realm` stamps (decisions §496).
         first = _linked(org_id, "Twin Supply", "ERP-TWIN", link_stamp(realm))
         second = _linked(org_id, "Twin Supply Ltd", "ERP-TWIN", link_stamp(realm))
         s.add_all([first, second])

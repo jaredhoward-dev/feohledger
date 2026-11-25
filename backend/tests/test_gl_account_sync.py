@@ -119,7 +119,7 @@ async def _rows(realdb) -> dict[str, GLAccount]:
 
 async def _add(realdb, **kwargs) -> uuid.UUID:
     # These syncs name no company (`_sync` passes no realm), so a link stands
-    # for one an earlier such pull made: stamped UNNAMED_REALM (decisions §497).
+    # for one an earlier such pull made: stamped UNNAMED_REALM (decisions §496).
     # A NULL (pre-0115) link is one a no-realm pull leaves alone.
     if kwargs.get("erp_account_id") is not None:
         kwargs.setdefault("erp_link_realm", UNNAMED_REALM)

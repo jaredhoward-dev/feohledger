@@ -224,7 +224,7 @@ def test_a_null_realm_link_is_trusted_only_while_the_snapshot_still_names_the_co
 
 
 def test_a_no_realm_pull_stamps_a_sentinel_no_company_realm_can_equal():
-    """§497: NULL is reserved for pre-0115 links, so a link a pull that names no
+    """§496: NULL is reserved for pre-0115 links, so a link a pull that names no
     company makes is stamped ``UNNAMED_REALM``. Every real realm is
     ``<adapter>:<identity>``; the sentinel has no ``:``, so it can never be one."""
     assert link_stamp(None) == UNNAMED_REALM
@@ -829,7 +829,7 @@ async def test_a_pull_with_no_realm_leaves_every_named_company_link_alone(realdb
     )
     depreciation = chart["Depreciation"]
     assert (depreciation.erp_account_id, depreciation.erp_link_candidates) == (None, pending)
-    # The fixture's own accounts land beside them, stamped as no company's (§497).
+    # The fixture's own accounts land beside them, stamped as no company's (§496).
     assert (chart["Brand New"].erp_account_id, chart["Brand New"].erp_link_realm) == (
         "500",
         UNNAMED_REALM,
@@ -860,7 +860,7 @@ async def test_a_vendor_pull_with_no_realm_leaves_named_company_links_alone(real
 
 
 async def test_a_pull_with_no_realm_leaves_a_pre_migration_chart_link_alone(realdb):
-    """§497: a pre-0115 (NULL) link may be a real company's, so a mock pull
+    """§496: a pre-0115 (NULL) link may be a real company's, so a mock pull
     neither re-judges nor adopts it — its colliding code is ``code_taken`` and
     its id is not matched — while the links the mock makes are stamped and are
     its own on the next mock pull."""
@@ -934,7 +934,7 @@ async def test_a_named_chart_sync_judges_a_mock_link_as_another_companys(realdb)
 
 
 async def test_a_vendor_pull_with_no_realm_leaves_a_pre_migration_link_alone(realdb):
-    """§497: a mock pull of fixture "57" no longer adopts the vendor a pre-0115
+    """§496: a mock pull of fixture "57" no longer adopts the vendor a pre-0115
     link holds on "57" — nor creates a second payee for it. It is reported
     ``unverified_link`` and the NULL link is left for a named sync to judge."""
     acme_id = await _add(realdb, Vendor, name="Acme", erp_vendor_id="57", source="erp_sync")
@@ -1229,7 +1229,7 @@ async def test_a_link_from_another_company_is_not_adopted_onto_an_id_held_here(r
 @pytest.mark.parametrize("fixture_realm", [UNNAMED_REALM, None])
 async def test_a_restore_replaces_a_link_that_names_no_company(realdb, fixture_realm):
     """A no-realm (mock) sync linked Acme to a fixture id after its production
-    link was kept — stamped ``UNNAMED_REALM`` since §497, NULL before it. Back
+    link was kept — stamped ``UNNAMED_REALM`` since §496, NULL before it. Back
     on production, the kept link wins and the fixture link, which names no
     company, is dropped and audited, not kept."""
     acme_id = await _add(
@@ -1545,7 +1545,7 @@ async def test_the_confirm_endpoint_refuses_anything_but_an_offered_candidate(
 
 
 async def test_a_confirmation_under_no_realm_is_stamped_not_null(realdb, restore_settings):
-    """§497: a decision a mock pull offered (candidates' realm None) is
+    """§496: a decision a mock pull offered (candidates' realm None) is
     confirmed onto the ``UNNAMED_REALM`` stamp, never NULL, which only a
     pre-0115 link may carry."""
     await _set_erp(realdb, {"type": "mock", "integration_method": "direct"})

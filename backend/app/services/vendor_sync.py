@@ -40,7 +40,7 @@ pull changes nothing.
 OAuth ERP with no consent): it leaves every vendor linked under a NAMED realm
 exactly as it is — never re-judged, unlinked, matched by its id or updated —
 and works only on unlinked vendors and the links such a pull made, which it
-stamps ``erp_link_realm.UNNAMED_REALM`` (docs/decisions.md §497). A pre-0115
+stamps ``erp_link_realm.UNNAMED_REALM`` (docs/decisions.md §496). A pre-0115
 (NULL-realm) link is left alone too: it may name a real company, so a pulled
 record whose id one holds is reported ``unverified_link`` rather than matched
 or created again; the next sync under a named realm re-judges it by evidence.
@@ -128,7 +128,7 @@ async def sync_vendors_from_erp(
 
     ``realm`` is the connection the pull came from
     (``erp_link_realm.connection_realm``); every link this writes is stamped
-    with it (``UNNAMED_REALM`` when None, §497), and links from any other realm
+    with it (``UNNAMED_REALM`` when None, §496), and links from any other realm
     are re-judged first (module docstring).
 
     **Inactive records** (``active`` False) are never created or linked as a
@@ -147,7 +147,7 @@ async def sync_vendors_from_erp(
     two local vendors already hold that record in this company, so neither was
     updated — only on a tenant not yet at migration 0141; ``unverified_link``:
     a pull that names no company found the record's id held by a pre-0115
-    link, so it neither adopted that vendor nor created one, §497), unlinked:
+    link, so it neither adopted that vendor nor created one, §496), unlinked:
     names whose link this run dropped, deactivated / codes_cleared / realm_adopted / restored: int,
     values_too_long: {"name", "erp_vendor_id", "fields"} per record with a
     field too long to store (:data:`_BOUNDED_FIELDS`; field NAMES only),
@@ -184,7 +184,7 @@ async def sync_vendors_from_erp(
     deactivated = 0
     codes_cleared = 0
     realm_adopted = 0
-    # What every link this pull makes is stamped with (never NULL, §497).
+    # What every link this pull makes is stamped with (never NULL, §496).
     stamp = link_stamp(realm)
     # Pulled ids a pre-0115 link holds, under a pull that names no company.
     unverified: list[dict] = []
@@ -339,7 +339,7 @@ async def sync_vendors_from_erp(
         if not holders and realm is None:
             # A pre-0115 link holding this id may be this record or a real
             # company's: a pull that names no company can say neither, so it
-            # neither adopts that vendor nor makes a second one (§497).
+            # neither adopts that vendor nor makes a second one (§496).
             legacy_holder = (
                 await db.execute(
                     select(Vendor.id).where(
@@ -549,7 +549,7 @@ async def _restore_kept_links(
     another vendor already holds here, or one two kept links claim — either
     would make two payees one ERP supplier. A link the row holds that names no
     company (a pre-0115 NULL one, or a no-realm pull's ``UNNAMED_REALM`` one,
-    §497) is dropped for the restored one and audited ``unlinked``: there is no
+    §496) is dropped for the restored one and audited ``unlinked``: there is no
     company to keep it for.
     """
     kept = (

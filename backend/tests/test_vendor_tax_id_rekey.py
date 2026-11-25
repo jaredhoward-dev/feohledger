@@ -48,7 +48,7 @@ async def _seed_verified_vendor(realdb, *, tax_id="12-3456789", name="Rekey Co")
                 tax_id=tax_id,
                 tin_verified_at=datetime.now(UTC),
                 erp_vendor_id=f"erp-{vendor_id}",
-                # Linked by an earlier no-realm pull, like the ones below (§497).
+                # Linked by an earlier no-realm pull, like the ones below (§496).
                 erp_link_realm=UNNAMED_REALM,
             )
         )

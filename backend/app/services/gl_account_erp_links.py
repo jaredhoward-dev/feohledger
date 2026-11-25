@@ -17,7 +17,7 @@ rule 0, in this order, on a pull with a named realm:
 
 * :func:`keep_states` files each row's state from another named company under
   that company. A NULL-realm link (pre-0115, or made by a no-realm pull before
-  §497) names no company, so filing it under one would be the manufactured
+  §496) names no company, so filing it under one would be the manufactured
   evidence §141 refuses; it is never kept. Nor is a no-realm pull's
   ``UNNAMED_REALM`` link (``erp_link_realm.names_company``): no sync restores
   under it.

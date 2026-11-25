@@ -83,7 +83,7 @@ realm — a link stamped with one, or a pending decision offered under one: it
 never re-judges, unlinks, matches by id, re-links by code or refreshes them,
 and a pulled account whose code such a row holds is refused ``code_taken``. It
 works only on unlinked rows and the links a no-realm pull made, which it stamps
-``erp_link_realm.UNNAMED_REALM`` (docs/decisions.md §497). A pre-0115
+``erp_link_realm.UNNAMED_REALM`` (docs/decisions.md §496). A pre-0115
 (NULL-realm) link is left alone exactly like a named one: it may name a real
 company, and the next sync under a named realm re-judges it by evidence. Under
 a named realm an ``UNNAMED_REALM`` link is another company's: judged by the
@@ -243,7 +243,7 @@ async def sync_chart_from_erp(
     passes (rules 0, 3, 4) cover the whole organization. See the module
     docstring."""
     result = ChartSyncResult(realm=realm)
-    # What every link this pull makes is stamped with (never NULL, §497).
+    # What every link this pull makes is stamped with (never NULL, §496).
     stamp = link_stamp(realm)
 
     # -- the pull, reduced to one candidate per code ------------------------

@@ -171,7 +171,7 @@ async def link_lock(db: AsyncSession, organization_id: uuid.UUID, realm: str | N
     Released at commit or rollback.
 
     ``realm`` None is the no-realm company (links stamped ``UNNAMED_REALM``
-    since decisions §497, one company to ``uq_vendors_erp_link``); only the
+    since decisions §496, one company to ``uq_vendors_erp_link``); only the
     sync writes there, and two no-realm
     pulls creating a vendor for one new record would otherwise both pass the
     lookup and the second would fail the index at flush (decisions §489). Its
@@ -347,7 +347,7 @@ async def link_vendor_to_erp_record(
     if vendor.erp_vendor_id:
         # A link from another company (the None / same-realm cases were refused
         # above): kept for it, so a switch back restores it (§356) — unless it
-        # is a no-realm pull's, which names no company to return to (§497).
+        # is a no-realm pull's, which names no company to return to (§496).
         held = {"realm": vendor.erp_link_realm, "erp_vendor_id": vendor.erp_vendor_id}
         if await keep_link(db, vendor):
             kept = held
