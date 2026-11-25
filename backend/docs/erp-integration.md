@@ -260,7 +260,7 @@ After sending an invoice to the ERP, the system needs to know when the ERP has p
 | Method | How it works | When to use |
 |---|---|---|
 | **Webhook** | ERP calls our endpoint when status changes | Preferred — real-time, no polling cost |
-| **Polling** | Background job checks ERP for status every N minutes | Fallback for ERPs without webhook support — **designed, not built** for the generic case (below); QuickBooks Online has its change-data-capture sweep (§295), and Xero its `If-Modified-Since` sweep (§386) |
+| **Polling** | Background job checks ERP for status every N minutes | Fallback for ERPs without webhook support, and the backstop for a dropped generic delivery — the `erp-status-poll` sweep (§528, below); QuickBooks Online has its change-data-capture sweep (§295), and Xero its `If-Modified-Since` sweep (§386) |
 
 **Webhook endpoint:** `POST /api/erp/webhook/{erp_type}` (the generic shape
 below). QuickBooks, Xero and Merge.dev have their own routes, since none of them
@@ -407,22 +407,45 @@ integration that omits a per-delivery `event_id` instead hits
 path, which is the correct trade-off: no dedup at all beats false dedup on a
 different event.
 
-**Polling job — not built.** Every adapter implements
-`get_invoice_status(erp_document_id)` (and fake-erp's `__set-status` /
-`__set-balance` hooks can drive it), but **nothing under `app/` calls it**: there is
-no background sweep, so an ERP without a webhook never reports a status change
-back, and nothing times a stuck `sent_to_erp` invoice out. The webhook above is the
-only inbound path today. The intended design was a sweep every few minutes over
-`sent_to_erp` invoices that transitions on a changed status and fails one stuck
-past a timeout. The adapters' reads are ready for it: since decisions §303 `paid`
-means the ERP's own paid status or a payment it records, never a zero balance
-alone, and a bill with nothing owing but no visible payment reads
-`settled_no_payment` (for a person, never recorded). Tracked in
-`docs/followups.md` ("A bill paid in an ERP other than QuickBooks or Xero
-never reaches FeohLedger"). QuickBooks Online and Xero are the exceptions:
-QuickBooks' status comes back through its own webhook and a change-data-capture
-sweep, Xero's through its invoice webhook and the same sweep reading its
-`If-Modified-Since` listings (next two sections).
+**Polling job (decisions §528).** The generic route drops a delivery it
+cannot verify — the tenant's ERP credentials could not be opened, or the
+source's unseal budget was spent (§408, §525) — with the same silent 204 as a
+forgery, so the ERP never redelivers it. The `erp-status-poll` sweep
+(`services/erp_status_poll_sweep`, `FEOH_ERP_STATUS_POLL_SWEEP_ENABLED`, off by
+default) is the backstop. For every tenant whose adapter is not Merge.dev and
+has no status sync of its own (QuickBooks Online and Xero have theirs, next two
+sections; the mock adapter is polled, so it runs locally), it calls
+`get_invoice_status(erp_document_id)` for invoices at `sent_to_erp`,
+`posted_in_erp` or `payment_scheduled`, least recently polled first and at most
+`FEOH_ERP_STATUS_POLL_SWEEP_BATCH_SIZE` per tenant a tick. A bill is asked
+about only under the connection that issued it: the push's recorded realm must
+be the current one (the by-document rule, §417 / §423), and the push must have
+been confirmed after the ERP went live (§428) when that moment is known.
+
+- **One transition.** What it reads is applied through
+  `services/erp_status_report.apply_erp_status_report`, the very function the
+  webhook calls, as the webhook's own words: `open` → `posted`, `paid` →
+  `paid`, `cancelled` → `cancelled`. The audit rows are the webhook's, with
+  `source: poll` on a transition. `draft`, `partially_paid`, `unknown` and
+  `settled_no_payment` have no webhook equivalent and are not applied (since
+  §303 `paid` is the ERP's own paid status or a payment it records, never a
+  zero balance alone).
+- **Only a change.** The last status read is kept in the latest workflow
+  instance's `state_data["erp_status_poll"]`; a read equal to it applies
+  nothing, so an unchanged `open` bill costs one call and no trail row, and a
+  "voided after posting" exception a person resolved is not re-opened.
+- **Idempotent across replicas.** The ERP is read outside any transaction;
+  the result is applied under the invoice row lock after asking again whether
+  the invoice is still a candidate with the same document id, and the record
+  is written in the same transaction.
+- **Budget and credentials.** Before each read the connection's call budget
+  (`call_budget().usage()`) is asked; a pause, or a read refused with
+  `ErpCallBudgetExhausted`, ends the tenant's pass. A tenant whose credentials
+  cannot be opened is logged (`[erp-status-poll] the ERP credentials of org …
+  could not be opened`) and skipped.
+- **Not polled.** `done`, `paid` and `failed` invoices: nothing more is paid
+  here, and polling every closed bill forever is unbounded. A void reported
+  for a `done` invoice therefore still arrives only by webhook.
 
 **A paid report may carry the ERP's own payment date and rail.** The generic
 body accepts optional `paid_on` (`YYYY-MM-DD`) and `payment_method` (a
@@ -2577,7 +2600,7 @@ Scale (§256, §281).
 | Webhook endpoint | Done |
 | ERP config UI in org settings | Done (catalogue-driven, write-only secrets) |
 | Post-ERP statuses (posted_in_erp, payment_scheduled, paid) | Done |
-| Polling job for status sync | Planned |
+| Polling job for status sync | Done — `erp-status-poll` sweep, § Polling job (decisions §528) |
 | OAuth authorization-code connect flow (`services/erp_oauth`) | Done — § Connecting an OAuth ERP |
 | QuickBooks Online direct adapter | Done (Phases 1–2) — `quickbooks-online-adapter.md`; webhooks and BillPayment write-back still scoped |
 | Remaining direct adapters (SAP, Epicor, etc.) | Use Merge.dev |

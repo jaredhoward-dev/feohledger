@@ -699,7 +699,7 @@ async def test_erp_webhook_whitelists_audit_details_no_pii(fake_redis):
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
     ):
         await erp_webhook(
             erp_type="generic",

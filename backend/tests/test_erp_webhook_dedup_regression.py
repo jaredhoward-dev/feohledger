@@ -143,7 +143,7 @@ async def _post(*, org, invoice, status_value, correlation_id, erp_document_id, 
             "app.api.erp_webhook.async_sessionmaker",
             return_value=_tenant_session_factory(invoice),
         ),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
     ):
         await erp_webhook(
             erp_type="generic",
@@ -251,7 +251,7 @@ async def test_event_id_omitted_from_body_defaults_to_none_not_a_fallback():
             "app.api.erp_webhook.async_sessionmaker",
             return_value=_tenant_session_factory(invoice),
         ),
-        patch("app.api.erp_webhook.transition_invoice", AsyncMock(return_value=invoice)),
+        patch("app.services.erp_status_report.transition_invoice", AsyncMock(return_value=invoice)),
         patch("app.api.erp_webhook.is_event_already_processed", _fake_dedup),
     ):
         await erp_webhook(

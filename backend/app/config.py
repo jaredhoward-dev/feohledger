@@ -461,6 +461,18 @@ class Settings(BaseSettings):
     erp_budget_retry_sweep_interval_seconds: int = Field(default=900, ge=60)
     erp_budget_retry_sweep_lookback_hours: int = Field(default=48, ge=1)
     erp_budget_retry_sweep_batch_size: int = Field(default=50, ge=1)
+    # Status polling (decisions §528, `services/erp_status_poll_sweep`): the
+    # backstop for the generic per-tenant ERP webhook, which drops a delivery
+    # it cannot verify (credentials unopenable, unseal budget spent, §408 /
+    # §525). Asks the adapter `get_invoice_status` for each bill still at
+    # `sent_to_erp` / `posted_in_erp` / `payment_scheduled`, least recently
+    # polled first, at most `batch_size` per tenant a tick, and applies a
+    # changed status through the webhook's own transition. Not for Merge.dev,
+    # QuickBooks or Xero (their own paths). Stops a tenant's pass at the ERP
+    # call budget. Off by default like every sweep that calls out.
+    erp_status_poll_sweep_enabled: bool = False
+    erp_status_poll_sweep_interval_seconds: int = Field(default=900, ge=60)
+    erp_status_poll_sweep_batch_size: int = Field(default=50, ge=1)
 
     # Commerce / inventory sync (decisions §273, `services/commerce_sync.py`).
     # OPERATOR-only override that points EVERY commerce adapter at one fake

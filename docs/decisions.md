@@ -27048,3 +27048,59 @@ outrank the panels' own rules by the page's hash class, and depend on the
 panels only ever rendering inside the page. *A `FormGrid` wrapper component*:
 thirteen panels' markup would change for three layout rules, and its scoped
 `.form-grid` would still not reach `.full-width` children or the footer.
+
+## 528. A dropped generic ERP webhook is backstopped by a status polling sweep that applies the webhook's own transition (§408 / §525 follow-up, round 44)
+
+**Problem.** The generic per-tenant ERP webhook (`POST /api/erp/webhook/{erp_type}`)
+answers a delivery it cannot verify with the same silent 204 as a forgery: when
+the tenant's ERP credentials cannot be opened (a KMS outage past the DEK cache,
+a corrupted row) or the source's unseal budget is spent (§525). The ERP never
+redelivers, and the route had no polling backstop, so the status change was
+lost. Every adapter already implemented `get_invoice_status`, but nothing called
+it (`backend/docs/erp-integration.md` § Polling job was "not built").
+
+**Decision.** A sweep, `services/erp_status_poll_sweep` (`erp-status-poll`,
+`FEOH_ERP_STATUS_POLL_SWEEP_ENABLED`, off by default; interval 15 min, batch 50
+per tenant), reads each candidate bill's status and applies it through
+`services/erp_status_report.apply_erp_status_report`, the function the webhook's
+transition was moved into. One function, two channels: the edge a status takes
+(screened by `VALID_TRANSITIONS`), the §319 withdrawal, the #517 ERP-paid
+record, the settlement-coverage hold and the voided-after-post exception cannot
+drift apart.
+
+* **Candidates.** Tenants whose adapter is not Merge.dev (own route and
+  read-back) and has no `supports_status_sync` (QuickBooks Online and Xero have
+  `erp-status-sync`); the mock adapter is polled, so it runs locally (guard rail
+  7). Invoices at `sent_to_erp`, `posted_in_erp` or `payment_scheduled` with an
+  ERP document id, under the current realm (the §417 / §423 by-document rule)
+  and, when the ERP's go-live moment is known, with an `invoice.erp_confirmed`
+  row after it (§428) — an id another ERP issued is never read against this one.
+* **Words.** `open` → `posted`, `paid` → `paid`, `cancelled` → `cancelled`, the
+  generic webhook's own. `draft`, `partially_paid`, `unknown` and
+  `settled_no_payment` have no webhook equivalent and are not applied.
+* **Only a change.** The last status read and its moment are kept in the latest
+  workflow instance's `state_data["erp_status_poll"]`. A read equal to it applies
+  nothing; the moment orders the next tick (least recently polled first), so a
+  capped batch reaches every bill in turn.
+* **Idempotent across replicas.** The read is made outside any transaction; the
+  apply re-asks candidacy (same document id) under the invoice row lock and
+  writes the record in the same transaction. A second replica finds the record
+  or the invoice moved on.
+* **Budget.** The connection's `call_budget().usage()` is read before each
+  status read, and a read refused with `ErpCallBudgetExhausted` ends the
+  tenant's pass, as the §521 sweep does.
+* **Credentials.** A tenant whose block cannot be opened is logged as an error
+  and skipped; the others carry on.
+
+**Rejected.** *Polling `done` / `paid` / `failed` invoices* (the webhook does act
+on a void reported for a `done` invoice): it would read every closed bill forever,
+with no bound; a `done` bill is the ERP's to pay, so nothing here moves money on
+it. *Applying every read each tick* (relying on the exception's
+open-or-escalated idempotency): a "voided after posting" exception a person
+resolved would be re-opened every 15 minutes. *A separate status map for the
+poll*: the point is that both channels take the same edge. *A timeout that fails
+a `sent_to_erp` invoice* (the original sketch): for every adapter the poll
+covers, a confirmed push moves to `done` in the same transaction as
+`sent_to_erp`, so the state is never durable there; the transition is still
+polled in case it is. *Holding the row lock across the ERP call*: a slow ERP
+would hold the invoice for the call's duration.

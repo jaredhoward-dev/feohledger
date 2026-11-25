@@ -228,6 +228,7 @@ async def lifespan(app: FastAPI):
     from app.services.erp_auto_send_sweep import run_auto_send_sweep_loop
     from app.services.erp_budget_retry_sweep import run_budget_retry_sweep_loop
     from app.services.erp_connection_health import run_connection_health_loop
+    from app.services.erp_status_poll_sweep import run_status_poll_sweep_loop
     from app.services.erp_status_sync import run_status_sync_loop
     from app.services.extraction_reaper import run_reaper_loop
     from app.services.payment_reconciler import run_reconciler_loop
@@ -390,6 +391,13 @@ async def lifespan(app: FastAPI):
     if settings.erp_budget_retry_sweep_enabled:
         budget_retry_task = start_sweep(run_budget_retry_sweep_loop(), name="erp-budget-retry")
 
+    # ERP status polling (decisions §528): the backstop for the generic ERP
+    # webhook, which drops a delivery it cannot verify. Reads each sent bill's
+    # status and applies a change through the webhook's own transition.
+    status_poll_task: asyncio.Task | None = None
+    if settings.erp_status_poll_sweep_enabled:
+        status_poll_task = start_sweep(run_status_poll_sweep_loop(), name="erp-status-poll")
+
     try:
         yield
     finally:
@@ -415,6 +423,7 @@ async def lifespan(app: FastAPI):
             subprocessor_notices_task,
             auto_send_task,
             budget_retry_task,
+            status_poll_task,
         ):
             if task is not None:
                 task.cancel()

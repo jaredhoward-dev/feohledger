@@ -208,7 +208,7 @@ async def _post(
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
     ):
         result = await erp_webhook(
             erp_type=erp_type,
@@ -284,7 +284,7 @@ async def test_a_bill_unpaid_again_withdraws_the_erp_payment_kept_earlier(fake_r
         id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=InvoiceStatus.posted_in_erp
     )
     withdraw = AsyncMock(return_value=1)
-    with patch("app.api.erp_webhook.withdraw_erp_paid_reports", withdraw):
+    with patch("app.services.erp_status_report.withdraw_erp_paid_reports", withdraw):
         result, db, transition_calls = await _post(
             org=org, invoice=invoice, status_value=erp_status, event_id=f"ev_{erp_status}"
         )
@@ -304,8 +304,8 @@ async def test_a_paid_report_never_withdraws(fake_redis):
     )
     withdraw = AsyncMock(return_value=0)
     with (
-        patch("app.api.erp_webhook.withdraw_erp_paid_reports", withdraw),
-        patch("app.api.erp_webhook._record_erp_reported_payment", AsyncMock()),
+        patch("app.services.erp_status_report.withdraw_erp_paid_reports", withdraw),
+        patch("app.services.erp_status_report._record_erp_reported_payment", AsyncMock()),
     ):
         await _post(org=org, invoice=invoice, status_value="Paid", event_id="ev_paid_again")
     withdraw.assert_not_awaited()
@@ -406,7 +406,7 @@ async def test_erp_paid_for_an_invoice_feohledger_never_paid_is_recorded(fake_re
     invoice = SimpleNamespace(id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=current)
 
     recorded = AsyncMock()
-    with patch("app.api.erp_webhook._record_erp_reported_payment", recorded):
+    with patch("app.services.erp_status_report._record_erp_reported_payment", recorded):
         result, db, transition_calls = await _post(
             org=org, invoice=invoice, status_value="Paid", event_id=f"ev_paid_{current.value}"
         )
@@ -444,7 +444,7 @@ async def test_a_merge_held_key_never_unlocks_the_generic_route(fake_redis, erp_
         id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=InvoiceStatus.posted_in_erp
     )
     recorded = AsyncMock()
-    with patch("app.api.erp_webhook._record_erp_reported_payment", recorded):
+    with patch("app.services.erp_status_report._record_erp_reported_payment", recorded):
         result, db, transition_calls = await _post(
             org=org,
             invoice=invoice,
@@ -481,7 +481,7 @@ async def test_an_erp_type_that_is_not_the_tenants_own_adapter_is_a_silent_204(f
         id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=InvoiceStatus.posted_in_erp
     )
     recorded = AsyncMock()
-    with patch("app.api.erp_webhook._record_erp_reported_payment", recorded):
+    with patch("app.services.erp_status_report._record_erp_reported_payment", recorded):
         result, db, transition_calls = await _post(
             org=org,
             invoice=invoice,
@@ -823,7 +823,7 @@ async def test_dedup_claim_released_when_transition_raises(fake_redis):
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _boom),
+        patch("app.services.erp_status_report.transition_invoice", _boom),
     ):
         result = await erp_webhook(
             erp_type="generic",
@@ -874,7 +874,7 @@ async def test_invoice_fetch_uses_row_lock(fake_redis):
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
         patch(
             "app.api.erp_webhook.get_invoice_for_update", AsyncMock(return_value=invoice)
         ) as locked_fetch,
