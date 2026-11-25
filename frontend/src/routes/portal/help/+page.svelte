@@ -7,13 +7,49 @@
 	 * Guide titles and summaries are English prose (`lang="en"` under another
 	 * locale, behind EnglishNotice); the chrome, the term names and their
 	 * one-line definitions are catalogue text in the reader's language.
+	 *
+	 * The search field (decisions §517) narrows both lists in place, best
+	 * match first, through `portalSearch.ts` — never content.ts, which would
+	 * ship every employee guide to suppliers. The text is kept in `?q=` so a
+	 * reload or a shared link keeps the search; it replaces the history entry
+	 * rather than adding one per keystroke.
 	 */
+	import { afterNavigate, replaceState } from '$app/navigation';
+	import { page } from '$app/state';
 	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
 	import { PORTAL_GLOSSARY, PORTAL_GUIDES } from '#lib/help/portal.ts';
+	import { searchPortalHelp } from '#lib/help/portalSearch.ts';
 	import { guideHref, termKey, termShortKey } from '#lib/help/terms.ts';
 	import EnglishNotice from '#lib/components/help/EnglishNotice.svelte';
+	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 
 	const englishLang = $derived(currentLocale() === 'en' ? undefined : 'en');
+
+	let q = $state(page.url.searchParams.get('q') ?? '');
+	const query = $derived(q.trim());
+	const hits = $derived(query ? searchPortalHelp(query, m) : null);
+	const guides = $derived(hits ? hits.flatMap((h) => (h.kind === 'guide' ? [h.guide] : [])) : PORTAL_GUIDES);
+	const terms = $derived(hits ? hits.flatMap((h) => (h.kind === 'term' ? [h.term.id] : [])) : PORTAL_GLOSSARY);
+
+	// A navigation to this same page (the portal nav's Help link while a search
+	// is showing, Back / Forward) brings its own `?q=`. The shallow
+	// replaceState below fires no afterNavigate, so it cannot loop back here.
+	afterNavigate(({ from, to }) => {
+		if (from?.route.id === to?.route.id) q = to?.url.searchParams.get('q') ?? '';
+	});
+
+	function syncUrl(value: string) {
+		const url = new URL(page.url.href);
+		const v = value.trim();
+		if (v) url.searchParams.set('q', v);
+		else url.searchParams.delete('q');
+		replaceState(url, page.state);
+	}
+
+	function clearSearch() {
+		q = '';
+		syncUrl('');
+	}
 </script>
 
 <div class="page" data-testid="portal-help">
@@ -23,29 +59,54 @@
 		<EnglishNotice />
 	</header>
 
-	<section aria-labelledby="portal-help-guides-h">
-		<h2 id="portal-help-guides-h">{m('portal.help.guides')}</h2>
-		<ul class="guides">
-			{#each PORTAL_GUIDES as g (g.id)}
-				<li>
-					<a href={guideHref(g.id, 'supplier')} lang={englishLang}>{g.title}</a>
-					<p lang={englishLang}>{g.summary}</p>
-				</li>
-			{/each}
-		</ul>
-	</section>
+	<div class="search" role="search">
+		<SearchBox
+			bind:value={q}
+			oninput={syncUrl}
+			ariaLabel={m('portal.help.searchLabel')}
+			placeholder={m('portal.help.searchPlaceholder')}
+			testid="portal-help-search"
+		/>
+		<!-- Always in the document, so the count is announced as it changes. -->
+		<p class="status" role="status" data-testid="portal-help-search-status">
+			{#if hits}
+				{hits.length ? m('portal.help.searchResults', { n: hits.length, q: query }) : m('portal.help.searchNone', { q: query })}
+			{/if}
+		</p>
+		{#if hits && !hits.length}
+			<button type="button" class="btn-cancel" onclick={clearSearch} data-testid="portal-help-search-clear"
+				>{m('portal.help.searchClear')}</button
+			>
+		{/if}
+	</div>
 
-	<section aria-labelledby="portal-help-terms-h">
-		<h2 id="portal-help-terms-h">{m('portal.help.glossary')}</h2>
-		<dl class="terms">
-			{#each PORTAL_GLOSSARY as id (id)}
-				<div id={id}>
-					<dt>{m(termKey(id))}</dt>
-					<dd>{m(termShortKey(id))}</dd>
-				</div>
-			{/each}
-		</dl>
-	</section>
+	{#if guides.length}
+		<section aria-labelledby="portal-help-guides-h">
+			<h2 id="portal-help-guides-h">{m('portal.help.guides')}</h2>
+			<ul class="guides">
+				{#each guides as g (g.id)}
+					<li>
+						<a href={guideHref(g.id, 'supplier')} lang={englishLang}>{g.title}</a>
+						<p lang={englishLang}>{g.summary}</p>
+					</li>
+				{/each}
+			</ul>
+		</section>
+	{/if}
+
+	{#if terms.length}
+		<section aria-labelledby="portal-help-terms-h">
+			<h2 id="portal-help-terms-h">{m('portal.help.glossary')}</h2>
+			<dl class="terms">
+				{#each terms as id (id)}
+					<div id={id}>
+						<dt>{m(termKey(id))}</dt>
+						<dd>{m(termShortKey(id))}</dd>
+					</div>
+				{/each}
+			</dl>
+		</section>
+	{/if}
 </div>
 
 <style>
@@ -58,6 +119,17 @@
 	.subtitle {
 		margin: 0;
 		color: var(--text-muted);
+	}
+	.search {
+		margin-top: 20px;
+	}
+	.status {
+		margin: 8px 0 0;
+		color: var(--text-muted);
+		font-size: 0.9rem;
+	}
+	.search .btn-cancel {
+		margin-top: 8px;
 	}
 	section {
 		margin-top: 28px;

@@ -385,6 +385,9 @@ Pill-shaped search input with a magnifier-glass SVG. Single component:
 />
 ```
 
+- `oninput` (optional) is called with the new text on every keystroke —
+  for writing it to the URL from the input event rather than from an
+  `$effect`, which would also run at mount (`routes/portal/help/+page.svelte`).
 - Debounce search before fetching (250–300ms is the convention; see
   `routes/admin/+page.svelte` and `routes/invoices/+page.svelte`).
 - Server-side filter via `?search=` param. Backend uses ILIKE on the
