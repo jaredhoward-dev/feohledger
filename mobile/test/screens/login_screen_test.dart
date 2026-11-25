@@ -92,7 +92,7 @@ void main() {
     // Only a spinner is on the button now; its label is the button's name.
     expect(
       tester.getSemantics(find.byType(FilledButton)),
-      containsSemantics(label: 'Loading…', isButton: true),
+      isSemantics(label: 'Loading…', isButton: true),
     );
 
     held.complete(http.Response('nope', 401));

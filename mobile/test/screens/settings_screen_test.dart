@@ -452,7 +452,7 @@ void main() {
       expect(find.text('Help'), findsOneWidget);
       expect(
         tester.getSemantics(find.bySemanticsLabel(helpLabel)),
-        containsSemantics(isLink: true, hasTapAction: true),
+        isSemantics(isLink: true, hasTapAction: true),
       );
     });
 

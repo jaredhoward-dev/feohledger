@@ -77,7 +77,7 @@ void main() {
             'full_name': 'Ada',
             'organization_id': 'org1',
             'roles': <dynamic>['ap_clerk'],
-            if (flag != null) 'legal_acceptance_required': flag,
+            'legal_acceptance_required': ?flag,
           };
       expect(User.fromJson(body(true)).legalAcceptanceRequired, isTrue);
       expect(User.fromJson(body(false)).legalAcceptanceRequired, isFalse);

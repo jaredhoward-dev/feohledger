@@ -354,14 +354,29 @@ async def test_me_reports_the_gap_and_the_acknowledgement_closes_it(realdb, fake
 
 @pytest.mark.asyncio
 async def test_every_profile_response_carries_the_flag(realdb, fake_redis):
-    """PATCH /me answers with the same profile the portal stores; it must not
-    drop the flag (or the locale) and so clear the step without a record."""
+    """PATCH /me answers with the same profile the portal stores, so it must
+    carry the flag (and the locale) exactly as GET /me does.
+
+    PATCH /me is not on the gate's exempt list (decisions §505): while the
+    acknowledgement is owed it is refused with the step's code and changes
+    nothing, and GET /me — exempt — still reports the gap. Once acknowledged,
+    PATCH answers the very profile GET /me does."""
     vendor_id, vu_id = await _signed_in_supplier(realdb)
     async with _portal_client(realdb, vu_id, vendor_id) as c:
+        before = (await c.get(ME)).json()
+        assert before["legal_acceptance_required"] is True
+
+        refused = await c.patch(ME, json={"locale": "de"})
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["detail"]["code"] == "privacy_acknowledgement_required"
+        assert (await c.get(ME)).json() == before
+
+        assert (await c.post(ACK, json=ACK_PRIVACY)).status_code == 200
         patched = await c.patch(ME, json={"locale": "de"})
         assert patched.status_code == 200, patched.text
-        assert patched.json()["legal_acceptance_required"] is True
+        assert patched.json()["legal_acceptance_required"] is False
         assert patched.json()["locale"] == "de"
+        assert patched.json() == (await c.get(ME)).json()
 
 
 @pytest.mark.asyncio
