@@ -87,11 +87,11 @@
 			<h2 id="lookup-heading">{m('marketing.findWorkspace.lookup.heading')}</h2>
 			<p class="sub">{m('marketing.findWorkspace.lookup.intro')}</p>
 
-			<div role="alert" aria-live="assertive">
-				{#if error}
-					<div class="error">{error}</div>
-				{/if}
-			</div>
+			<!-- Inserted with its text, so it is announced on arrival; no standing
+			     empty alert region beside the address form's own. -->
+			{#if error}
+				<div class="error" role="alert">{error}</div>
+			{/if}
 
 			<label>
 				<span>{m('marketing.findWorkspace.lookup.label')}</span>
