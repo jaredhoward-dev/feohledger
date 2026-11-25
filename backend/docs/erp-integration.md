@@ -2542,11 +2542,23 @@ holder of `payment.void` can name that bill and void it:
   bill on our contact with our invoice number; two on one key, a bill on
   another contact or at a status the filter did not ask for, raise
   `XeroBillLookupAmbiguous`, a refused read `XeroRequestError`; both are 502
-  `erp_lookup_failed`) (decisions §566, §569). Every other adapter answers 409 `erp_lookup_unsupported`; their
-  lookups live inside `post_invoice` with client state and are wired one at a
-  time.
+  `erp_lookup_failed`) (decisions §566, §569), **Sage Accounting** (the
+  push's window, `_supplier_day_invoices`: the supplier's purchase invoices
+  dated on the invoice date, every page, matched on our
+  `FeohLedger <correlation id>` marker in `notes` as a whole token; the
+  status is read as `get_invoice_status` reads it, and the currency from the
+  invoice's `currency` link) and **Sage Accounting ZA** (the push's
+  `_find_existing` window, matched on `Reference` equal to our correlation id;
+  currency None, since the API names currencies only by numeric id)
+  (decisions §576). Both Sage lookups raise, never answer "none", on a window
+  they cannot read whole, two bills carrying our marker, or a live bill with
+  the supplier's number but not our marker (ours with the marker edited away
+  is not knowable from someone else's). Every other adapter answers 409
+  `erp_lookup_unsupported`; their lookups live inside `post_invoice` with
+  client state and are wired one at a time.
 - **A key that is not unique to one invoice is checked against the tenant.**
-  The mock, QuickBooks and NetSuite keys carry the invoice's correlation id
+  The mock, QuickBooks, NetSuite, Sage and Sage ZA keys carry the invoice's
+  correlation id
   (`invoices.correlation_id` is unique), so a found bill is this invoice's
   push or nothing. Xero's carries nothing of ours (an ACCPAY bill has no field
   for it), so its class sets `bill_lookup_key_shared` and
@@ -3622,6 +3634,7 @@ complete its consent flow. A ZA Sage adapter is separate work.
 | `list_pos` | — | base default `[]`: the v3.1 Accounting API has no purchase-order resource at all, on any plan |
 | `post_invoice` | `POST purchase_invoices` | below |
 | `get_invoice_status` | `GET purchase_invoices/{id}?show_payments_allocations=true` | DRAFT → draft; UNPAID/DISPUTED → open; PAID → paid only with a `contact_payment` allocation, else `settled_no_payment` (a credit note sets PAID too); PART_PAID → partially_paid on the same test, else open; VOID → cancelled (decisions §303, §390) |
+| `find_posted_bill` | `GET purchase_invoices` (the push's window, every page, `attributes` plus `currency`), then `GET purchase_invoices/{id}` for the status | the orphan-bill lookup (decisions §576): the live invoice carrying our `notes` marker, or none; raises on a window it cannot read whole, two carrying it, or a live namesake without it |
 | `void_invoice` | `DELETE purchase_invoices/{id}` | DRAFT deleted; unpaid UNPAID/DISPUTED voided with `void_reason`; anything with a payment allocated → `False`. The Swagger documents no parameter on the purchase DELETE, so whether Sage honours `void_reason` there is unverified (#654) |
 
 **Plan: Accounting Start cannot post.** The Swagger's Endpoint Availability
@@ -3735,6 +3748,7 @@ made while posting a bill stop at 10 pages.
 |---|---|
 | `post_invoice` | refuse pre-flight without a numeric `vendor_erp_id` (SupplierId) / numeric GL account ids, without an invoice date and a due date (`missing_dates` — both Required in Sage), with an invoice number over 100 characters (`doc_number_too_long`), or in a non-home currency → `SupplierInvoice/Get` idempotency lookup (integers and dates only, every page) → `Supplier/Get/{id}` (`Active`, + `Company/Get/{id}` currency check) → `Account/Get` + `TaxType/Get` → `SupplierInvoice/Save?useSystemDocumentNumber=false` |
 | `get_invoice_status` | `SupplierInvoice/Get/{id}` — `AmountDue` 0 ⇒ paid with Sage's `Paid` flag and a non-zero `Total`, else `settled_no_payment` (decisions §303); below `Total` ⇒ partially paid, else open |
+| `find_posted_bill` | `SupplierInvoice/Get`, the push's window (every page) — the orphan-bill lookup (decisions §576): the invoice whose `Reference` is our correlation id, or none; raises on a window it cannot read whole, a row without an ID, two carrying our Reference, or the supplier's number under another Reference. Status from the row as `get_invoice_status` reads it; currency None. The bill it names cannot be voided from FeohLedger (no delete, below) |
 | `void_invoice` | Always `False`, with no call. API 2.0.0 has **no** `SupplierInvoice/Delete` (the Help method list for SupplierInvoice is Get, Get/{id}, Save, Calculate, Email and Export). Reversing an invoice is a `SupplierReturn` allocated against it, which is an accountant's decision (decisions §303), so it is left to a person in Sage |
 | `list_vendors` / `list_gl_accounts` / `list_pos` | `Supplier/Get` (`Active` → `active`) / `Account/Get` (`Active` → `active`; category → asset/liability/equity/revenue/expense, unknown → unclassified) / `PurchaseOrder/Get` (`currency` left NULL — decisions §197; vendor linked by `SupplierId`, the supplier `ID` `list_vendors` stamps, before `SupplierName`; `Status` read by word since the real strings are unconfirmed (#654): cancel → cancelled, complete / closed / invoiced / processed → closed, draft / approval → unissued (decisions §394), else open) |
 | `test_connection` | `Company/Get` answers *and* lists the configured `company_id` |
