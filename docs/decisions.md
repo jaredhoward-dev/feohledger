@@ -26423,3 +26423,56 @@ for a case the hold's sentence already states; the status stays the amount
 and quantity legs'. *Valuing over-received units on a line*: units nobody
 ordered cover nothing that was ordered.
 
+## 521. A push the ERP call budget refused is re-sent by a sweep after the reset, through the retry path (round 42)
+
+**Problem.** A push to an ERP whose API quota several tenants share (Blackbaud's
+SKY API) is refused before any call when the org's share of the day, or the
+subscription's quota, is used (`erp_call_budget_exhausted`, §322). The invoice
+lands at `failed` with `params.reason` and `params.retry_after` (the next 00:00
+UTC). Nothing was sent, yet someone had to retry each invoice by hand after the
+reset (#651 follow-up).
+
+**Decision.** A sweep, `services/erp_budget_retry_sweep` (`erp-budget-retry`,
+`FEOH_ERP_BUDGET_RETRY_SWEEP_ENABLED`, off by default), re-sends after the
+reset. A candidate is an invoice still `failed` whose latest `invoice.erp_failed`
+row carries that refusal with a readable `retry_after` that has passed, refused
+within a 48 h lookback and after the ERP went live (the §428 fence), with no
+audit row after the refusal but reads of the trail. It goes through
+`erp_send.start_erp_send(retry=True)` — the `POST /{id}/retry-erp` path, so the
+status, plan and export gates all apply — earliest `retry_after` first, actor
+NULL, the `invoice.erp_retried` row marked `trigger: erp_call_budget_reset` and
+the refusal's `retry_after`. A gate refusal is recorded once as
+`invoice.erp_budget_resend_refused`, which ends the candidacy: a person decides.
+
+* **"Unchanged since" is read off the trail, failing closed.** Any row after
+  the refusal except `audit.viewed` / `audit.exported` (an edit, a comment, an
+  exception, a later failure for another reason) means a person has the
+  invoice. An unknown action counts as a change, which only leaves the status
+  quo (retry by hand).
+* **Stopping at the budget is a read, then an outcome.** Before each re-send the
+  connection's own `call_budget().usage()` is read (read-only: no notice is
+  sent); a paused share, quota or cool-down ends the tenant's pass. In local
+  dispatch the push runs to completion first, so one the budget refused again
+  ends the pass too. In Lambda mode only the pre-check brakes; an over-eager
+  dispatch is refused before any call, exactly as the first time, and waits
+  for the next reset, so the cost is churn, not a half-done bill.
+* **Idempotent by the invoice row lock.** The candidate is asked again under
+  the lock, and only if its latest refusal is still the row selected is it sent;
+  the transition to `sending_to_erp` happens under that same lock. A gate
+  refusal is recorded only after the question is asked again under a fresh
+  lock, so two replicas record one (subject to the §411 caveat for
+  `FEOH_AUDIT_MODE=lambda`, where the row lands late). `start_erp_send`'s plan
+  gate therefore runs with the row lock held — one control-plane read, accepted
+  so nothing can move the invoice between the question and the transition.
+
+**Rejected.** *Deferring the push instead of failing it* (the original ask): a
+new "waiting for quota" status is a state-machine change, a migration and a UI
+for every list, for a case a sweep closes without any. *No lookback*: turning
+the sweep on would push month-old refusals someone may have keyed into the ERP
+by hand. *Re-sending `rate_limited` refusals only, or excluding them*: the code,
+not the reason, is the test — every reason means "nothing was sent, wait until
+`retry_after`", and a `rate_limited` one that exhausted the backoff is as safe
+to re-send after its moment as a used share. *A cross-request advisory lock for
+the pass*: the row lock already serialises per invoice, which is all a double
+send could happen on, as in §411.
+

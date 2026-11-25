@@ -3506,8 +3506,24 @@ Request rules worth knowing:
   `erp_call_budget_exhausted` with `params.reason` (`tenant_budget`,
   `subscription_quota`, `rate_limited`) and `params.retry_after`. Only
   `rate_limited` is retryable by the backoff; the others fail the invoice with
-  the reason, and the operator retries after the reset (an automatic re-send
-  at the reset is an open follow-up). A sync listing is refused call by call
+  the reason. **After the reset the call-budget re-send sweep sends them
+  again** (`services/erp_budget_retry_sweep`, sweep `erp-budget-retry`,
+  `FEOH_ERP_BUDGET_RETRY_SWEEP_ENABLED`, off by default, decisions §521): an
+  invoice still `failed` whose latest `invoice.erp_failed` row carries this
+  refusal, whose `retry_after` has passed, refused within
+  `FEOH_ERP_BUDGET_RETRY_SWEEP_LOOKBACK_HOURS` (48 h) and after the ERP went
+  live (`configured_at` / `connected_at`), with nothing on its trail since but
+  reads of the trail, is retried through `erp_send.start_erp_send(retry=True)`
+  (status, plan and export gates), earliest `retry_after` first. The
+  `invoice.erp_retried` row carries `trigger: erp_call_budget_reset` and the
+  refusal's `retry_after`, actor NULL; a gate that refuses is recorded once as
+  `invoice.erp_budget_resend_refused` and the invoice is left to a person.
+  Before each re-send the connection's own budget is read (`usage()`, no
+  notice): a paused share, quota or cool-down ends the tenant's pass, as does
+  (local dispatch) a re-send the budget refused again. Decided under the
+  invoice row lock, so two replicas send once. Without the sweep, or for a
+  refusal it does not take, `POST /{id}/retry-erp` after the reset still works.
+  A sync listing is refused call by call
   (`ErpCallBudgetExhausted` → a coded 429 with `Retry-After`, nothing synced);
   a status read is `unknown`; a PO sync is refused the same way. Org admins get an
   `erp_call_quota` notice once a day each at 80% of the share, when the share

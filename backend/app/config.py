@@ -449,6 +449,18 @@ class Settings(BaseSettings):
     erp_auto_send_sweep_delay_seconds: int = Field(default=300, ge=60)
     erp_auto_send_sweep_lookback_hours: int = Field(default=24, ge=1)
     erp_auto_send_sweep_batch_size: int = Field(default=100, ge=1)
+    # Call-budget re-send (decisions §521, `services/erp_budget_retry_sweep`): a
+    # push refused before any call because the org's share of a shared ERP
+    # quota was used (`erp_call_budget_exhausted`, §322) is re-sent once its
+    # `retry_after` has passed, through `erp_send.start_erp_send` (plan and
+    # export gates), earliest `retry_after` first, stopping for the tenant as
+    # soon as its share is used again. Only an invoice still `failed` with that
+    # refusal as the last row on its trail, refused within the lookback and
+    # after the ERP went live. Off by default like every sweep that calls out.
+    erp_budget_retry_sweep_enabled: bool = False
+    erp_budget_retry_sweep_interval_seconds: int = Field(default=900, ge=60)
+    erp_budget_retry_sweep_lookback_hours: int = Field(default=48, ge=1)
+    erp_budget_retry_sweep_batch_size: int = Field(default=50, ge=1)
 
     # Commerce / inventory sync (decisions §273, `services/commerce_sync.py`).
     # OPERATOR-only override that points EVERY commerce adapter at one fake

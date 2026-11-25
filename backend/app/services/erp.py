@@ -375,9 +375,13 @@ async def retry_erp(
     invoice: Invoice,
     *,
     actor_id: uuid.UUID | None = None,
+    details: dict | None = None,
 ) -> None:
     """Prepare a failed ERP push for retry. Only valid if the invoice was
     previously approved.
+
+    ``details``: fixed literals for the ``invoice.erp_retried`` row (the
+    call-budget re-send sweep marks its retry, decisions §521).
 
     Resets the retry counter and transitions to sending_to_erp; the actual
     ERP call is the caller's job via `dispatch_erp` (which resolves the
@@ -412,6 +416,7 @@ async def retry_erp(
         InvoiceStatus.sending_to_erp,
         actor_id=actor_id,
         action_name="invoice.erp_retried",
+        details=details,
     )
     await db.commit()
 

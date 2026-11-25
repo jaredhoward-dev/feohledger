@@ -160,6 +160,7 @@ export const enAudit = {
 	'audit.action.invoice.deleted': "Invoice deleted",
 	'audit.action.invoice.edited': "Invoice edited",
 	'audit.action.invoice.erp_auto_send_refused': "Automatic ERP send held back",
+	'audit.action.invoice.erp_budget_resend_refused': "ERP re-send after the call allowance reset held back",
 	'audit.action.invoice.erp_confirmed': "ERP confirmed",
 	'audit.action.invoice.erp_failed': "ERP send failed",
 	'audit.action.invoice.erp_retried': "ERP send retried",

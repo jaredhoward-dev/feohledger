@@ -157,6 +157,7 @@ export const messages = {
 	'audit.action.invoice.deleted': "請求書を削除",
 	'audit.action.invoice.edited': "請求書を編集",
 	'audit.action.invoice.erp_auto_send_refused': "ERPへの自動送信を保留",
+	'audit.action.invoice.erp_budget_resend_refused': "呼び出し枠のリセット後のERP再送信を保留",
 	'audit.action.invoice.erp_confirmed': "ERPが確認",
 	'audit.action.invoice.erp_failed': "ERP送信失敗",
 	'audit.action.invoice.erp_retried': "ERP送信を再試行",
