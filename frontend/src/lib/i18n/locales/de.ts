@@ -3953,6 +3953,7 @@ export const messages = {
 	'audit.denied': 'Sie haben keine Berechtigung, das Audit-Protokoll anzuzeigen. Diese Konsole ist auf Administratoren und CFOs beschränkt.',
 	'audit.downloadCsv': 'CSV herunterladen',
 	'audit.empty': 'Keine Audit-Einträge für diese Abfrage.',
+	'audit.notRun': 'Führen Sie eine Abfrage aus, um den Audit-Trail anzuzeigen.',
 	'audit.error.downloadFailed': 'Download fehlgeschlagen.',
 	'audit.error.enterInvoiceId': 'Geben Sie eine Rechnungs-ID ein.',
 	'audit.error.queryFailed': 'Abfrage fehlgeschlagen.',

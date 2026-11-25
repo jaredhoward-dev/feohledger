@@ -4132,6 +4132,7 @@ export const en = {
 	'audit.denied': 'You do not have permission to view the audit trail. This console is limited to admins and CFOs.',
 	'audit.downloadCsv': 'Download CSV',
 	'audit.empty': 'No audit entries for this query.',
+	'audit.notRun': 'Run a query to see the audit trail.',
 	'audit.error.downloadFailed': 'Download failed.',
 	'audit.error.enterInvoiceId': 'Enter an invoice ID.',
 	'audit.error.queryFailed': 'Query failed.',

@@ -3954,6 +3954,7 @@ export const messages = {
 	'audit.denied': 'Vous n\'avez pas l\'autorisation de consulter le journal d\'audit. Cette console est réservée aux administrateurs et aux directeurs financiers.',
 	'audit.downloadCsv': 'Télécharger le CSV',
 	'audit.empty': 'Aucune entrée d\'audit pour cette requête.',
+	'audit.notRun': 'Lancez une requête pour afficher la piste d\'audit.',
 	'audit.error.downloadFailed': 'Échec du téléchargement.',
 	'audit.error.enterInvoiceId': 'Saisissez un ID de facture.',
 	'audit.error.queryFailed': 'Échec de la requête.',

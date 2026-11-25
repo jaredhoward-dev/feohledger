@@ -3949,6 +3949,7 @@ export const messages = {
 	'audit.denied': 'Você não tem permissão para ver a trilha de auditoria. Este console é limitado a administradores e diretores financeiros.',
 	'audit.downloadCsv': 'Baixar CSV',
 	'audit.empty': 'Nenhuma entrada de auditoria para esta consulta.',
+	'audit.notRun': 'Execute uma consulta para ver a trilha de auditoria.',
 	'audit.error.downloadFailed': 'Falha no download.',
 	'audit.error.enterInvoiceId': 'Informe um ID de fatura.',
 	'audit.error.queryFailed': 'Falha na consulta.',
