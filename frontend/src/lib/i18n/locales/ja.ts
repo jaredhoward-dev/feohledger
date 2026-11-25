@@ -3484,7 +3484,9 @@ export const messages = {
 	'auth.signup.email': 'メールアドレス',
 	'auth.signup.submit': '確認メールを送信',
 	'auth.signup.submitting': '確認メールを送信しています…',
-	'auth.signup.legalConsent': 'ワークスペースを作成すると、{terms}および{privacy}に同意したものとみなされます。これには、読み込む取引先データおよび請求書データを規定する{dpa}が含まれます。',
+	'auth.signup.legalConsent': '{terms}および{privacy}に同意します。これには、ワークスペースに読み込む取引先データおよび請求書データを規定する{dpa}が含まれます。',
+	'auth.legal.acceptLabel': '{terms}および{privacy}に同意します。',
+	'auth.legal.acceptRequired': '利用規約とプライバシーポリシーに同意するには、チェックボックスをオンにしてください。',
 	'auth.signup.footerPre': 'すでにワークスペースをお持ちですか？',
 	'auth.signup.footerPost': 'にアクセスしてサインインしてください。',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

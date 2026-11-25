@@ -3724,7 +3724,9 @@ export const en = {
 	'auth.signup.email': 'Email',
 	'auth.signup.submit': 'Send verification email',
 	'auth.signup.submitting': 'Sending verification…',
-	'auth.signup.legalConsent': 'By creating a workspace you agree to the {terms} and the {privacy}, including the {dpa} that governs supplier and invoice data you load into it.',
+	'auth.signup.legalConsent': 'I agree to the {terms} and the {privacy}, including the {dpa} that governs supplier and invoice data I load into the workspace.',
+	'auth.legal.acceptLabel': 'I agree to the {terms} and the {privacy}.',
+	'auth.legal.acceptRequired': 'Tick the box to accept the Terms of Service and Privacy Policy.',
 	'auth.signup.footerPre': 'Already have a workspace? Visit ',
 	'auth.signup.footerPost': ' to sign in.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

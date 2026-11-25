@@ -142,6 +142,7 @@ export const messages = {
 	'refusal.signupLinkInvalid': "この確認リンクは無効か、有効期限が切れています。もう一度サインアップしてください。",
 	'refusal.signupUnavailable': "ワークスペースの作成は一時的に利用できません。しばらくしてからもう一度お試しください。",
 	'refusal.signupProvisioningFailed': "ワークスペースの作成中に問題が発生しました。サポートにお問い合わせください。",
+	'refusal.legalAcceptanceRequired': "続行するには、現行の利用規約とプライバシーポリシーに同意してください。",
 	// The shared limiter's 429 (`services/rate_limit.py`, `rate_limited`): the wait,
 	// rounded up to the largest whole unit, never which limit tripped.
 	'refusal.rateLimitedSeconds': "試行回数が多すぎます。{n, plural, other {#秒}}待ってから、もう一度お試しください。",

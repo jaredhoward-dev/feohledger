@@ -153,6 +153,7 @@ test.describe('/signup — form', () => {
 		await page.getByPlaceholder('acme').fill(slug);
 		await page.getByLabel('Your name').fill(name);
 		await page.getByLabel('Email').fill(email);
+		await page.getByRole('checkbox', { name: /I agree to the Terms of Service/ }).check();
 	}
 
 	test('"what happens next" promises a set-password link, not a temporary password', async ({
