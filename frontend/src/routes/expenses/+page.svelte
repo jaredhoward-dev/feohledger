@@ -121,7 +121,14 @@
 
 	// --- Tabs ---
 	type Tab = 'expenses' | 'reports' | 'policies' | 'preapprovals' | 'cards';
-	let tab = $state<Tab>((page.url.searchParams.get('tab') as Tab) ?? 'expenses');
+	const TABS: readonly Tab[] = ['expenses', 'reports', 'policies', 'preapprovals', 'cards'];
+	// A `?tab=` this page has no panel for (a typo, a stale bookmark) opens the
+	// default tab. It used to be cast straight to `Tab`, so the page rendered a
+	// tablist with nothing selected over an empty panel, and no control said why.
+	function parseTab(raw: string | null): Tab {
+		return TABS.includes(raw as Tab) ? (raw as Tab) : 'expenses';
+	}
+	let tab = $state<Tab>(parseTab(page.url.searchParams.get('tab')));
 
 	// --- Expenses tab filter state (URL-backed) ---
 	let search = $state(page.url.searchParams.get('search') ?? '');
@@ -846,6 +853,12 @@
 		return list.map((v) => policyViolationText(v, m)).join('; ');
 	}
 
+	// …and so does `?tab=policies` for a reader without the Policies tab: its
+	// panel used to render under a tablist that did not offer it.
+	$effect(() => {
+		if (tab === 'policies' && !canManagePolicies) untrack(() => switchTab('expenses'));
+	});
+
 	function switchTab(next: Tab) {
 		tab = next;
 		closeReport();
@@ -865,9 +878,17 @@
 		return p.threshold_currency ?? orgCurrency.currency;
 	}
 
+	// Paged like the reports list. This tab and pre-approvals used to read only
+	// the first page the server sent (20 rows) with no footer, so a 21st policy
+	// existed, still applied to every submit, and could not be found here.
+	const POLICIES_PAGE_SIZE = 50;
 	let policies = $state<ExpensePolicy[]>([]);
 	let policiesLoading = $state(false);
 	let policiesErrored = $state(false);
+	let policiesTotal = $state(0);
+	let policiesPage = $state(1);
+	let policiesLoadingMore = $state(false);
+	let policiesHasMore = $derived(policies.length < policiesTotal);
 	let showPolicyCreate = $state(false);
 	let editingPolicy = $state<ExpensePolicy | null>(null);
 	let confirmDeletePolicyId = $state<string | null>(null);
@@ -877,29 +898,38 @@
 	// races even the tab's first load.
 	const policiesSequence = createRequestSequencer();
 
-	async function loadPolicies() {
+	async function loadPolicies(opts: { append?: boolean } = {}) {
+		const nextPage = opts.append ? policiesPage + 1 : 1;
 		const token = policiesSequence.start();
-		policiesLoading = true;
-		policiesErrored = false;
+		if (opts.append) policiesLoadingMore = true;
+		else {
+			policiesLoading = true;
+			policiesErrored = false;
+		}
 		try {
-			const loaded = await listPolicies();
+			const res = await listPolicies({ page: nextPage, page_size: POLICIES_PAGE_SIZE });
 			// Superseded by a newer load, or by a local create/edit/delete.
 			if (!policiesSequence.canCommit(token)) return;
-			policies = loaded;
+			policies = opts.append ? appendUnique(policies, res.items) : res.items;
+			policiesTotal = res.total;
+			policiesPage = nextPage;
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!policiesSequence.isCurrentRequest(token)) return;
-			// Superseded by a local edit: the rows on screen are that edit's,
-			// so keep them and toast. Otherwise nothing trustworthy is on
-			// screen and the table gives way to LoadError.
-			if (policiesSequence.wasSupersededByEdit(token)) {
+			// Superseded by a local edit, or a failed load-more: the rows on
+			// screen are still true, so keep them and toast. Otherwise nothing
+			// trustworthy is on screen and the table gives way to LoadError.
+			if (opts.append || policiesSequence.wasSupersededByEdit(token)) {
 				toast(err instanceof Error ? err.message : m('expenses.policies.toast.loadFailed'), 'error');
 			} else {
 				policiesErrored = true;
 			}
 		} finally {
-			if (policiesSequence.isCurrentRequest(token)) policiesLoading = false;
+			if (policiesSequence.isCurrentRequest(token)) {
+				policiesLoading = false;
+				policiesLoadingMore = false;
+			}
 		}
 	}
 
@@ -911,7 +941,10 @@
 		policiesSequence.supersedeInFlight();
 		const idx = policies.findIndex((x) => x.id === p.id);
 		if (idx >= 0) policies = policies.map((x) => (x.id === p.id ? p : x));
-		else policies = [p, ...policies];
+		else {
+			policies = [p, ...policies];
+			policiesTotal += 1;
+		}
 	}
 
 	async function deletePolicy(id: string) {
@@ -919,6 +952,7 @@
 			await apiDeletePolicy(id);
 			policiesSequence.supersedeInFlight();
 			policies = policies.filter((p) => p.id !== id);
+			policiesTotal = Math.max(policiesTotal - 1, 0);
 			toast(m('expenses.policies.toast.deleted'), 'success');
 		} catch (err) {
 			toast(err instanceof Error ? err.message : m('expenses.toast.deleteFailed'), 'error');
@@ -928,9 +962,15 @@
 	}
 
 	// ======================== Pre-approvals tab ========================
+	// Paged like policies above, for the same reason.
+	const PREAPPROVALS_PAGE_SIZE = 50;
 	let preapprovals = $state<ExpensePreapproval[]>([]);
 	let preapprovalsLoading = $state(false);
 	let preapprovalsErrored = $state(false);
+	let preapprovalsTotal = $state(0);
+	let preapprovalsPage = $state(1);
+	let preapprovalsLoadingMore = $state(false);
+	let preapprovalsHasMore = $derived(preapprovals.length < preapprovalsTotal);
 	let preapprovalStatus = $state<string>(page.url.searchParams.get('pa_status') ?? 'all');
 	let showNewPreapproval = $state(false);
 	let paBusy = $state(false);
@@ -954,28 +994,44 @@
 	// `approvePa` / `rejectPa` rewrite a row in place with no fetch of their own.
 	const preapprovalsSequence = createRequestSequencer();
 
-	async function loadPreapprovals() {
+	async function loadPreapprovals(opts: { append?: boolean } = {}) {
+		const nextPage = opts.append ? preapprovalsPage + 1 : 1;
 		const token = preapprovalsSequence.start();
-		preapprovalsLoading = true;
-		preapprovalsErrored = false;
+		if (opts.append) preapprovalsLoadingMore = true;
+		else {
+			preapprovalsLoading = true;
+			preapprovalsErrored = false;
+		}
 		try {
-			const params = preapprovalStatus !== 'all' ? { status: preapprovalStatus } : {};
-			const loaded = await listPreapprovals(params);
+			// Untracked: this is called from the tab's `$effect`, which declares
+			// `preapprovalStatus` itself; a load-more must not become a dependency.
+			const status = untrack(() => preapprovalStatus);
+			const res = await listPreapprovals({
+				...(status !== 'all' ? { status } : {}),
+				page: nextPage,
+				page_size: PREAPPROVALS_PAGE_SIZE
+			});
 			// Superseded by a newer load, or by a local approve/reject.
 			if (!preapprovalsSequence.canCommit(token)) return;
-			preapprovals = loaded;
+			preapprovals = opts.append ? appendUnique(preapprovals, res.items) : res.items;
+			preapprovalsTotal = res.total;
+			preapprovalsPage = nextPage;
 		} catch (err) {
 			// `isCurrentRequest`, not `canCommit`: a load superseded by a local
 			// edit still failed, and no newer load is coming to report it.
 			if (!preapprovalsSequence.isCurrentRequest(token)) return;
-			// Same split as policies: a local approve/reject owns the rows.
-			if (preapprovalsSequence.wasSupersededByEdit(token)) {
+			// Same split as policies: a local approve/reject (or the rows a
+			// failed load-more already had) owns what is on screen.
+			if (opts.append || preapprovalsSequence.wasSupersededByEdit(token)) {
 				toast(err instanceof Error ? err.message : m('expenses.preapprovals.toast.loadFailed'), 'error');
 			} else {
 				preapprovalsErrored = true;
 			}
 		} finally {
-			if (preapprovalsSequence.isCurrentRequest(token)) preapprovalsLoading = false;
+			if (preapprovalsSequence.isCurrentRequest(token)) {
+				preapprovalsLoading = false;
+				preapprovalsLoadingMore = false;
+			}
 		}
 	}
 
@@ -1072,18 +1128,46 @@
 	let matchTxn = $state<CorporateCardTransaction | null>(null);
 	let matchSuggestions = $state<CardMatchSuggestion[]>([]);
 	let matchLoading = $state(false);
+	// A failed suggestions read is stated in the dialog with a Retry. It used to
+	// toast and then fall through to the empty branch, so the dialog said "No
+	// candidate expenses … Try Create expense instead" about a list it never got
+	// — steering the user to mint a second expense for a charge that had one.
+	let matchErrored = $state(false);
+	const matchSequence = createRequestSequencer();
 
 	const RECON_CHIPS = $derived([
 		{ key: 'all', label: m('common.all') },
 		...RECONCILIATION_STATUSES.map((s) => ({ key: s, label: reconStatusLabel(s) }))
 	]);
 
-	const unmatchedCount = $derived(
-		cardTxns.filter((t) => t.reconciliation_status === 'unmatched').length
-	);
-	const matchedCount = $derived(
-		cardTxns.filter((t) => t.reconciliation_status === 'matched').length
-	);
+	// The KPI row counts the WHOLE card feed, from the server's own `total` for
+	// each reconciliation status. The two status cards used to count the LOADED
+	// page (50 rows) while "Transactions" beside them was the server's total, so
+	// a feed of 300 unmatched charges read "Unmatched 50"; and under the Matched
+	// chip "Unmatched" read 0 because no unmatched row was loaded. `null` until
+	// the counts land (or if they fail): `KpiCard` draws its dash, never a zero
+	// nobody counted.
+	let cardCounts = $state<{ all: number; unmatched: number; matched: number } | null>(null);
+	const cardCountsSequence = createRequestSequencer();
+
+	async function loadCardCounts() {
+		const token = cardCountsSequence.start();
+		try {
+			const [all, unmatched, matched] = await Promise.all([
+				listCardTransactions({ page_size: 1 }),
+				listCardTransactions({ reconciliation_status: 'unmatched', page_size: 1 }),
+				listCardTransactions({ reconciliation_status: 'matched', page_size: 1 })
+			]);
+			if (!cardCountsSequence.canCommit(token)) return;
+			cardCounts = { all: all.total, unmatched: unmatched.total, matched: matched.total };
+		} catch {
+			// Non-fatal, like the expenses tab's rollup: the cards fall back to
+			// their dash and the table keeps its own error state.
+			if (cardCountsSequence.isCurrentRequest(token)) cardCounts = null;
+		}
+	}
+	const unmatchedCount = $derived(cardCounts?.unmatched ?? null);
+	const matchedCount = $derived(cardCounts?.matched ?? null);
 
 	// Like reports, the cards tab has no local-mutation helper — import / sync /
 	// match / unmatch / ignore all re-fetch through `loadCardTxns()` — so it
@@ -1098,6 +1182,9 @@
 		else {
 			cardsLoading = true;
 			cardsErrored = false;
+			// Every fresh load follows a filter flip or a mutation (import, sync,
+			// match, unmatch, ignore, create expense) — each can move the counts.
+			void loadCardCounts();
 		}
 		try {
 			const params = reconFilter !== 'all' ? { reconciliation_status: reconFilter } : {};
@@ -1180,20 +1267,33 @@
 
 	async function openMatchPicker(txn: CorporateCardTransaction) {
 		matchTxn = txn;
+		await loadMatchSuggestions(txn);
+	}
+
+	async function loadMatchSuggestions(txn: CorporateCardTransaction) {
+		// Sequenced: closing the picker and opening it on another row while the
+		// first read is in flight must not land the first row's suggestions.
+		const token = matchSequence.start();
 		matchSuggestions = [];
+		matchErrored = false;
 		matchLoading = true;
 		try {
-			matchSuggestions = await cardMatchSuggestions(txn.id);
-		} catch (err) {
-			toast(err instanceof Error ? err.message : m('expenses.cards.toast.suggestionsFailed'), 'error');
+			const loaded = await cardMatchSuggestions(txn.id);
+			if (!matchSequence.canCommit(token)) return;
+			matchSuggestions = loaded;
+		} catch {
+			if (matchSequence.isCurrentRequest(token)) matchErrored = true;
 		} finally {
-			matchLoading = false;
+			if (matchSequence.isCurrentRequest(token)) matchLoading = false;
 		}
 	}
 
 	function closeMatchPicker() {
+		matchSequence.start();
 		matchTxn = null;
 		matchSuggestions = [];
+		matchErrored = false;
+		matchLoading = false;
 	}
 
 	async function confirmMatch(expenseId: string) {
@@ -1683,6 +1783,17 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		<LoadMoreFooter
+			shown={policies.length}
+			total={policiesTotal}
+			hasMore={policiesHasMore}
+			loading={policiesLoadingMore}
+			disabled={policiesLoading}
+			onloadmore={() => loadPolicies({ append: true })}
+			moreKey="expenses.policies.loadMore"
+			allKey="expenses.policies.showingAll"
+			testId="expense-policies-load-more"
+		/>
 		{/if}
 	{:else if tab === 'preapprovals'}
 		<!-- ==================== Pre-approvals tab ==================== -->
@@ -1735,13 +1846,24 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		<LoadMoreFooter
+			shown={preapprovals.length}
+			total={preapprovalsTotal}
+			hasMore={preapprovalsHasMore}
+			loading={preapprovalsLoadingMore}
+			disabled={preapprovalsLoading}
+			onloadmore={() => loadPreapprovals({ append: true })}
+			moreKey="expenses.preapprovals.loadMore"
+			allKey="expenses.preapprovals.showingAll"
+			testId="expense-preapprovals-load-more"
+		/>
 		{/if}
 	{:else if tab === 'cards'}
 		<!-- ===================== Cards tab (WF4) ===================== -->
 		<div class="kpi-row">
 			<KpiCard value={unmatchedCount} label={m('expenses.cards.kpi.unmatched')} highlight={unmatchedCount ? 'red' : null} />
 			<KpiCard value={matchedCount} label={m('expenses.cards.kpi.matched')} highlight={matchedCount ? 'green' : null} />
-			<KpiCard value={cardsTotal} label={m('expenses.cards.kpi.transactions')} />
+			<KpiCard value={cardCounts?.all ?? null} label={m('expenses.cards.kpi.transactions')} />
 		</div>
 
 		{#if cardImportResult}
@@ -1978,6 +2100,12 @@
 		<div class="match-picker">
 			{#if matchLoading}
 				<LoadingState label={m('expenses.match.loading')} />
+			{:else if matchErrored}
+				<LoadError
+					message={m('expenses.cards.toast.suggestionsFailed')}
+					onretry={() => matchTxn && loadMatchSuggestions(matchTxn)}
+					testId="expense-match-error"
+				/>
 			{:else if matchSuggestions.length === 0}
 				<p class="muted">{m('expenses.match.empty')}</p>
 			{:else}
