@@ -166,6 +166,41 @@ async def test_an_active_vendor_may_be_rejected_from_its_row(realdb):
     assert rows[str(vendor_id)]["status_actions"]["reject"] is None
 
 
+async def test_one_row_re_read_by_id_carries_its_new_verdict_and_filter_membership(realdb):
+    """`GET /api/vendors?id=` is how /vendors re-reads a row after a single-row
+    Verify / Reject without reloading page 1 over the reviewer's loaded pages
+    (decisions §506): the one row, in the list shape with its fresh verdict,
+    and an empty page once it has left the active filter."""
+    vendor_id = await _vendor(realdb, status="unverified")
+    other_id = await _vendor(realdb, status="unverified")
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        assert (await c.post(f"/api/vendors/{vendor_id}/verify")).status_code == 200
+
+        body = (await c.get("/api/vendors", params={"id": str(vendor_id)})).json()
+        assert body["total"] == 1
+        [row] = body["items"]
+        assert row["id"] == str(vendor_id)
+        assert row["status"] == "active"
+        assert "invoice_count" in row
+        # Verify is now refused (not unverified); Reject is still offered.
+        assert row["status_actions"]["verify"]["code"] == "vendor_status_not_allowed"
+        assert row["status_actions"]["reject"] is None
+
+        # Under the reviewer's Unverified filter the row has left the set.
+        gone = (
+            await c.get("/api/vendors", params={"id": str(vendor_id), "status": "unverified"})
+        ).json()
+        assert gone["items"] == [] and gone["total"] == 0
+
+        # The filter narrows to that one row, never a neighbour.
+        still = (
+            await c.get("/api/vendors", params={"id": str(other_id), "status": "unverified"})
+        ).json()
+        assert [r["id"] for r in still["items"]] == [str(other_id)]
+
+        assert (await c.get("/api/vendors", params={"id": "not-a-uuid"})).status_code == 422
+
+
 # ── Exception resolve / dismiss / escalate ────────────────────────────────
 
 

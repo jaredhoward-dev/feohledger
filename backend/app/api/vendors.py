@@ -453,6 +453,7 @@ async def list_vendors(
     search: str | None = None,
     status_filter: str | None = Query(None, alias="status"),
     source: str | None = None,
+    vendor_id: uuid.UUID | None = Query(None, alias="id"),
     sort: SortParams = Depends(sort_params),
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(_VENDOR_READ),
@@ -464,6 +465,15 @@ async def list_vendors(
         status_filter=status_filter,
         source=source,
     )
+    # `?id=` narrows the SAME filtered, entity-scoped set to one row: the
+    # /vendors page re-reads a row this way after a single-row Verify / Reject,
+    # so the server says both what the row now is (its list shape, with the
+    # `status_actions` verdict and invoice tally) and whether it still matches
+    # the reviewer's filters — an empty page means it left them (decisions
+    # §506). Not part of `_vendor_list_filters`: `/ids` and `/counts` describe
+    # the whole filtered set and have no use for it.
+    if vendor_id is not None:
+        query = query.where(Vendor.id == vendor_id)
 
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar() or 0
