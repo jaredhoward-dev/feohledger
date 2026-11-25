@@ -5352,6 +5352,7 @@ export const messages = {
 	'glAccounts.erpLink.intro': "Die Synchronisierung hat mehr als ein ERP-Konto gefunden, das diese Zeile meinen könnte, und daher keines verknüpft. Auf {code} kontierte Rechnungen werden auf das gewählte Konto gebucht. Ihre Wahl wird im Prüfprotokoll festgehalten.",
 	'glAccounts.erpLink.introLinked': "Diese Zeile ist mit dem ERP-Konto {current} verknüpft, doch vor einer Aktualisierung hat die Synchronisierung auch andere ERP-Konten unter {code} geführt, sodass die Zeile sie vermischt haben könnte. Auf {code} kontierte Rechnungen werden weiter auf {current} gebucht, bis Sie es bestätigen oder ein anderes wählen. Ihre Wahl wird im Prüfprotokoll festgehalten.",
 	'glAccounts.erpLink.optionId': "ERP-ID {id}",
+	'glAccounts.erpLink.currentLink': "Aktuelle Verknüpfung",
 	'glAccounts.erpLink.confirm': "Mit diesem Konto verknüpfen",
 	'glAccounts.erpLink.toast.linked': "{code} ist jetzt mit {erpCode} verknüpft.",
 	'glAccounts.erpLink.toast.failed': "Das Konto konnte nicht verknüpft werden",

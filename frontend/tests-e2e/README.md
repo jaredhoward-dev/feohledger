@@ -219,7 +219,7 @@ a child its list didn't know about, in a spec whose subject is not teardown.
 `fixtures/helpers.ts::deleteInvoicesWhere(predicate, slug?)` owns the whole
 child graph: second-level children first (workflow steps, chat messages, bank
 transactions and virtual cards hanging off payments), then every direct child,
-then the invoices. `predicate` is the WHERE body, so scope by id,
+then the invoices. It runs as ONE transaction that first locks the matching invoices (`SELECT … FOR UPDATE`), so a backend worker still writing a child either lands before the teardown reads the graph or fails cleanly after it (decisions §523). `predicate` is the WHERE body, so scope by id,
 `invoice_number LIKE`, `vendor_id`, `recurring_template_id` — anything.
 
 ```ts

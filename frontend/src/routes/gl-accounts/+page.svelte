@@ -447,12 +447,15 @@
 							</td>
 						{/if}
 						<td class="mono muted">
+							<!-- A linked row the sync questions (§524) still posts to its
+							     id, so the id stays visible beside the badge. -->
+							{#if acct.erp_account_id || !needsErpDecision(acct)}
+								<span class="erp-id">{acct.erp_account_id ?? '—'}</span>
+							{/if}
 							{#if needsErpDecision(acct)}
 								<Badge tone="warning" variant="needs-decision">
 									{m('glAccounts.erpLink.needsDecision')}
 								</Badge>
-							{:else}
-								{acct.erp_account_id ?? '—'}
 							{/if}
 						</td>
 						{#if showStatus}
