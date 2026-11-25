@@ -1,5 +1,14 @@
+import type { Page } from '@playwright/test';
+
 import type { EligibleInvoice } from '#lib/types/creditMemo.ts';
-import { expect, invoicePicker, NO_TENANT_BASE, test, vendorPicker } from '../fixtures/helpers';
+import {
+	acceptConsent,
+	expect,
+	invoicePicker,
+	NO_TENANT_BASE,
+	test,
+	vendorPicker
+} from '../fixtures/helpers';
 import { expectNoA11yViolations } from './axe-helper';
 
 /**
@@ -69,6 +78,8 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['security', 'Security'],
 	['sso', 'Single Sign-On'],
 	['fraud', 'Fraud Detection'],
+	['line-total-check', 'Line-total check'],
+	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
 	['plan', 'Plan'],
 	['close', 'Close this workspace']
@@ -161,6 +172,23 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 				// another on the same page ("Webhooks" vs "Webhook deliveries").
 				await expect(page.getByRole('heading', { name: ready, exact: true })).toBeVisible();
 			}
+			await expectNoA11yViolations(page);
+		});
+	}
+
+	// The two single-setting panels draw their heading before their setting
+	// arrives, so the ORG_PANELS entries above may scan the loading frame. These
+	// wait for the loaded form (its save button) and scan that.
+	for (const [slug, testId] of [
+		['line-total-check', 'line-total'],
+		['exception-agents', 'agent-autonomy']
+	] as const) {
+		test(`organization settings → ${slug}, loaded form, has no axe violations`, async ({
+			page
+		}) => {
+			await page.goto(`/organization?section=${slug}`);
+			await expect(page.locator('aside.sidebar').first()).toBeVisible();
+			await expect(page.getByTestId(`${testId}-save`)).toBeVisible();
 			await expectNoA11yViolations(page);
 		});
 	}
@@ -342,6 +370,82 @@ test.describe('accessibility — Terms / Privacy accept step (WCAG 2.2 AA)', () 
 			await box.check();
 			await page.getByRole('button', { name: 'Accept and continue' }).click();
 			await expect(step.getByRole('button', { name: 'Reload page' })).toBeVisible();
+			await expectNoA11yViolations(page);
+		});
+	}
+});
+
+/**
+ * The supplier portal's Privacy Policy step (`layout/LegalAcceptStep` with
+ * `documents="privacy"`, decisions §500), forced the way
+ * `tests-e2e/portal/legal-reprompt.spec.ts` forces it: the real portal `/me`
+ * with `legal_acceptance_required` switched on, so the seeded supplier's
+ * acknowledgement row is never touched. Scanned twice, because the step draws
+ * the tenant's mark in place of ours: once on the platform brand and once with
+ * a white-label logo (the public `GET /api/portal/branding` answered here, so
+ * the worker tenant's brand is not written). Each scan also covers the
+ * unticked-box error state.
+ */
+const PORTAL_SUPPLIER = { email: 'supplier@portal.test', password: 'demo' };
+const PORTAL_AXE_LOGO = 'https://cdn.e2e.test/axe-portal-logo.png';
+
+async function portalSignInForAxe(page: Page): Promise<void> {
+	await acceptConsent(page);
+	await page.goto('/portal/login');
+	await page.locator('input[type="email"]').fill(PORTAL_SUPPLIER.email);
+	await page.locator('input[type="password"]').fill(PORTAL_SUPPLIER.password);
+	await page.locator('button[type="submit"]').click();
+	await expect(page).toHaveURL(/\/portal\/?$/);
+}
+
+test.describe('accessibility — supplier portal Privacy step (WCAG 2.2 AA)', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+
+	for (const branded of [false, true]) {
+		test(`portal Privacy step${branded ? ' with a white-label logo' : ''}, and its unticked error, has no axe violations`, async ({
+			page
+		}) => {
+			if (branded) {
+				await page.route(
+					(url) => url.pathname === '/api/portal/branding',
+					(route) =>
+						route.fulfill({
+							json: {
+								product_name: 'Axe Portal Brand',
+								logo_url: PORTAL_AXE_LOGO,
+								accent_color: '',
+								accent_strong_color: '',
+								support_url: '',
+								legal_url: ''
+							}
+						})
+				);
+			}
+			await page.route(
+				(url) => url.pathname === '/api/portal/auth/me',
+				async (route) => {
+					const real = await route.fetch();
+					const body = (await real.json()) as Record<string, unknown>;
+					await route.fulfill({
+						response: real,
+						json: { ...body, legal_acceptance_required: true }
+					});
+				}
+			);
+			await portalSignInForAxe(page);
+
+			const step = page.locator('[data-testid="legal-accept-step"]');
+			await expect(step).toBeVisible();
+			await expect(page.getByRole('main')).toHaveCount(1);
+			if (branded) {
+				await expect(step.locator(`img[src="${PORTAL_AXE_LOGO}"]`)).toBeVisible();
+			}
+			await expectNoA11yViolations(page);
+
+			await page.getByRole('button', { name: 'Confirm and continue' }).click();
+			await expect(
+				page.getByRole('checkbox', { name: /I have read the Privacy Policy/ })
+			).toHaveAttribute('aria-invalid', 'true');
 			await expectNoA11yViolations(page);
 		});
 	}
