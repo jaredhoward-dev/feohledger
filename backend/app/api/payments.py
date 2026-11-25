@@ -13,7 +13,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import case, exists, func, not_, or_, select
+from sqlalchemy import case, exists, func, not_, or_, select, true
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,7 +105,7 @@ from app.services.nacha import (
     originator_from_settings,
     originator_problems,
 )
-from app.services.open_ap_due import effective_due_by_invoice, is_overdue
+from app.services.open_ap_due import current_schedule_due, effective_due_of, is_overdue
 from app.services.payee_stamp import flag_repayment_payee_change, stamp_payee
 from app.services.payment_adapters import (
     PaymentAdapter,
@@ -169,7 +169,7 @@ from app.services.payment_runs import (
     rollup_payment_statuses,
     run_refusal_reasons,
 )
-from app.services.payment_schedules import latest_schedules
+from app.services.payment_schedules import current_schedule_of_row, latest_schedules
 from app.services.payment_settlement_record import (
     SettlementCompletion,
     open_settlement_mismatch_exception,
@@ -561,8 +561,8 @@ async def list_payments(
 # that row is mid-flight in the ERP push and must reach ``posted_in_erp`` (via
 # the ERP-confirmation webhook) before a payment can be scheduled against it.
 def _queue_order(effective_due) -> tuple:
-    """Soonest EFFECTIVE due date first (`open_ap_due.effective_due_by_invoice`:
-    the current payment schedule's, else the invoice's own), the date each row
+    """Soonest EFFECTIVE due date first (`open_ap_due.effective_due_of`: the
+    current payment schedule's, else the invoice's own), the date each row
     shows and flags overdue on, so a rescheduled invoice sorts where its date
     reads (decisions §565). Untimeable rows last; `id` breaks ties."""
     return (effective_due.asc().nulls_last(), Invoice.id.asc())
@@ -1009,29 +1009,32 @@ async def payment_queue(
     today = utc_today()
 
     # The invoice's CURRENT schedule, at most one per invoice
-    # (`payment_schedules.latest_schedules`). A bare outer join to the table
+    # (`payment_schedules.current_schedule_of_row`). A bare outer join to the table
     # listed an invoice once per schedule row — twice on one page, and the
     # duplicate shifted every later page's offset away from `total`.
-    current_schedule = latest_schedules()
+    # Lateral, so only the queue's own invoices are probed, not every schedule
+    # in the tenant (decisions §569).
+    current_schedule = current_schedule_of_row()
     # The row's date and overdue flag are the EFFECTIVE due date the overdue
     # count reads (`open_ap_due`, decisions §565), computed in this SELECT so
-    # the date printed and the flag beside it cannot disagree.
-    timed = effective_due_by_invoice()
+    # the date printed and the flag beside it cannot disagree. Derived from the
+    # current schedule already joined above (`effective_due_of`), not a second
+    # lookup of the same row (decisions §569).
+    effective_due = effective_due_of(current_schedule.due_date)
     page_q = (
         apply_entity_scope(
             select(
                 Invoice,
                 current_schedule,
-                timed.c.effective_due,
-                is_overdue(timed.c.effective_due, today),
+                effective_due,
+                is_overdue(effective_due, today),
             )
-            .outerjoin(current_schedule, current_schedule.invoice_id == Invoice.id)
-            .outerjoin(timed, timed.c.invoice_id == Invoice.id)
+            .outerjoin(current_schedule, true())
             .where(*_queue_base_where()),
             Invoice,
             entity_id,
         )
-        .order_by(*_queue_order(timed.c.effective_due))
+        .order_by(*_queue_order(effective_due))
         .offset(pagination.offset)
         .limit(pagination.limit)
     )
@@ -1256,16 +1259,16 @@ async def payment_queue_ids(
         )
     ).scalar() or 0
 
-    timed = effective_due_by_invoice()
+    # The same order as the queue's pages (`_queue_order` on the effective due
+    # date), so "select all N" resolves the rows in the order they were shown.
+    current = current_schedule_due()
     ids_q = (
         apply_entity_scope(
-            select(Invoice.id)
-            .outerjoin(timed, timed.c.invoice_id == Invoice.id)
-            .where(*_queue_selectable_where()),
+            select(Invoice.id).outerjoin(current, true()).where(*_queue_selectable_where()),
             Invoice,
             entity_id,
         )
-        .order_by(*_queue_order(timed.c.effective_due))
+        .order_by(*_queue_order(effective_due_of(current.c.sched_due)))
         .limit(MAX_SELECT_ALL_IDS)
     )
     ids = [str(row) for row in (await db.execute(ids_q)).scalars().all()]

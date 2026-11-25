@@ -34,9 +34,11 @@ population from the parts.
   both ends inclusive. Disjoint from overdue by construction.
 
 Two per-row readers keep a population of their own but time each row by the
-same effective date, through `effective_due_by_invoice`: the payment queue
-(its date, `is_overdue` and order) and the aging bands (`aging_band`, over
-the AP balance's population so they reconcile with it, F-4). Decisions §565.
+same effective date, `effective_due_of`: the payment queue (its date,
+`is_overdue` and order, off the current schedule it already joins; its
+select-all ids through `current_schedule_due`) and the aging bands
+(`aging_band` over `current_schedule_due`, on the AP balance's population
+so they reconcile with it, F-4). Decisions §565, §569.
 """
 
 from __future__ import annotations
@@ -44,7 +46,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import date, timedelta
 
-from sqlalchemy import ColumnElement, Select, Subquery, and_, case, exists, func, not_, select
+from sqlalchemy import (
+    ColumnElement,
+    Lateral,
+    Select,
+    Subquery,
+    and_,
+    case,
+    exists,
+    func,
+    not_,
+    select,
+)
 
 from app.models.invoice import Invoice
 from app.models.invoice_status import IN_REVIEW_STATUSES, OPEN_AP_STATUSES
@@ -84,13 +97,19 @@ def latest_schedule_subquery() -> Subquery:
     )
 
 
-def effective_due_date(latest_schedule: Subquery) -> ColumnElement:
-    """The latest schedule's due date, else the invoice's own (NULL if neither).
+def effective_due_of(schedule_due: ColumnElement) -> ColumnElement:
+    """THE effective-due rule: the current schedule's due date, else the
+    invoice's own (NULL if neither). Every other helper here is this applied to
+    some way of reaching the current schedule; a reader that already joins the
+    current schedule row (the payment queue, `payment_schedules.latest_schedules`)
+    passes its `due_date` here rather than looking the schedule up again."""
+    return func.coalesce(schedule_due, Invoice.due_date)
 
-    `latest_schedule` is `latest_schedule_subquery()`, outer-joined on
-    `invoice_id`.
-    """
-    return func.coalesce(latest_schedule.c.sched_due, Invoice.due_date)
+
+def effective_due_date(latest_schedule: Subquery) -> ColumnElement:
+    """`effective_due_of` over `latest_schedule_subquery()`, outer-joined on
+    `invoice_id`."""
+    return effective_due_of(latest_schedule.c.sched_due)
 
 
 def is_overdue(effective_due: ColumnElement, today: date) -> ColumnElement:
@@ -147,26 +166,31 @@ def open_ap_due_population(statuses: Sequence[str] = OUTFLOW_STATUSES) -> Subque
     )
 
 
-def effective_due_by_invoice() -> Subquery:
-    """Every invoice's effective due date, whatever its status: columns
-    `invoice_id` and `effective_due` (the same `effective_due_date` the
-    population carries).
+def current_schedule_due() -> Lateral:
+    """The outer invoice row's CURRENT schedule due date, as a LATERAL subquery
+    with one column, `sched_due`: at most one row (`LATEST_SCHEDULE_ORDER`,
+    `LIMIT 1`), none when the invoice has no schedule. Outer-join it
+    `ON true` after `invoices` and time the row by
+    `effective_due_of(lateral.c.sched_due)`.
 
     For the per-row readers that keep their own population and must still
-    time a row exactly as the count does: the payment queue's row (date shown,
-    `is_overdue`, order) and the aging bands, whose population is the AP
-    balance's (F-4). Outer-join it on `invoice_id`; uncorrelated, so it keeps
-    its own `Invoice` inside a query on `Invoice`.
+    time a row exactly as the count does: the select-all ids behind the payment
+    queue and the aging bands, whose population is the AP balance's (F-4).
+
+    Lateral, correlated on the outer `Invoice`, on purpose (decisions §569): it
+    used to be an uncorrelated `invoices LEFT JOIN DISTINCT ON (all schedules)`,
+    which Postgres cannot narrow by the caller's status filter or LIMIT, so
+    every aging call and queue page sorted every schedule in the tenant and
+    scanned `invoices` a second time. Correlated, it is one probe of
+    `ix_payment_schedules_invoice_current` per invoice the caller's own WHERE
+    keeps, and the `LIMIT` keeps the planner from inlining it.
     """
-    latest = latest_schedule_subquery()
     return (
-        select(
-            Invoice.id.label("invoice_id"),
-            effective_due_date(latest).label("effective_due"),
-        )
-        .outerjoin(latest, latest.c.invoice_id == Invoice.id)
-        .correlate(None)
-        .subquery("invoice_effective_due")
+        select(PaymentSchedule.due_date.label("sched_due"))
+        .where(PaymentSchedule.invoice_id == Invoice.id)
+        .order_by(*LATEST_SCHEDULE_ORDER)
+        .limit(1)
+        .lateral("current_schedule_due")
     )
 
 

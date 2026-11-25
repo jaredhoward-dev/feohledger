@@ -87,9 +87,9 @@ Existing fields stay: `pipeline`, `vendor_spend`, `aging`,
   the contrast.
 - `aging` — open-invoice exposure bucketed by **days past the effective due
   date** (the current payment schedule's, else the invoice's own:
-  `open_ap_due.effective_due_by_invoice` banded by `open_ap_due.aging_band`,
-  so a row sits in a past-due band exactly when the overdue count would count
-  it; decisions §565):
+  `open_ap_due.effective_due_of` over the correlated `current_schedule_due`,
+  banded by `open_ap_due.aging_band`, so a row sits in a past-due band exactly when the overdue count would count
+  it; decisions §565, §569):
   `current` (not yet due), `days_30` (1-30), `days_60` (31-60), `days_90`
   (61-90), `days_90_plus` (90+). The same five buckets back the
   `aging_snapshot` CSV export and the emailed scheduled report — which, having
