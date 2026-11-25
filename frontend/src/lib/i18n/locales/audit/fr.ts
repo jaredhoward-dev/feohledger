@@ -219,6 +219,7 @@ export const messages = {
 	'audit.action.organization.provider_config_updated': "Paramètres du prestataire mis à jour",
 	'audit.action.organization.residency_updated': "Résidence des données mise à jour",
 	'audit.action.organization.scim_token_minted': "Jeton SCIM émis",
+	'audit.action.organization.scim_token_revoked': "Jeton SCIM révoqué",
 	'audit.action.organization.sso_only_lifted': "Connexion SSO exclusive levée",
 	'audit.action.organization.sso_updated': "Paramètres SSO mis à jour",
 	'audit.action.partner.child_attached': "Espace client rattaché",
