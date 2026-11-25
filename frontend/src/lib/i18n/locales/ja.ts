@@ -3422,6 +3422,7 @@ export const messages = {
 	'auth.login.forgotPassword': 'パスワードをお忘れですか？',
 	'auth.login.signedOutOtherWorkspace': "セッションが別のワークスペースのものだったため、サインアウトされました。ここで、またはご自身のワークスペースのページでサインインしてください。",
 	'auth.login.workspaceClosed': "このワークスペースは閉鎖され、そのアカウントは削除されました。それらのメールアドレスは別のワークスペースで使用できるようになりました。",
+	'auth.login.storageBlocked': "お使いのブラウザがこのサイトによるデータの保存をブロックしているため、サインインした状態を維持できません。ブラウザの設定でこのサイトのサイトデータ（Cookie とサイトストレージ）を許可してから、ページを再読み込みしてください。",
 	'auth.login.goToOwnWorkspace': "ご自身のワークスペースのサインインページへ",
 	'auth.login.devAccounts.heading': '開発用アカウント',
 	'auth.login.devAccounts.hint': 'ローカル開発専用です。シード済みのアカウントを選ぶとフォームに入力されます。',

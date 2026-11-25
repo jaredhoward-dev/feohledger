@@ -8,6 +8,8 @@
 	import { safePortalNextPath, withPortalNext } from '#lib/utils/postLoginRedirect.ts';
 	import { page } from '$app/state';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { onMount } from 'svelte';
+	import { storageAvailable } from '#lib/utils/safeStorage.ts';
 
 	// Prefilled from `?email=` — the set-password page's "Go to sign in" link
 	// passes the account it just set a password for.
@@ -15,6 +17,12 @@
 	let password = $state('');
 	let error = $state('');
 	let loading = $state(false);
+	// The portal token lives in localStorage too: where the browser blocks it,
+	// say so instead of a sign-in that silently does not last (decisions §514).
+	let storageBlocked = $state(false);
+	onMount(() => {
+		storageBlocked = !storageAvailable();
+	});
 
 	// MFA second-factor step. When login returns a challenge, we swap the
 	// password form for the code form (stashing the challenge token). The vendor
@@ -201,6 +209,9 @@
 			<h1>{portalBrand.productName}</h1>
 			<p class="subtitle">{m('portal.login.subtitle')}</p>
 
+			{#if storageBlocked}
+				<div class="error storage-blocked" role="status">{m('auth.login.storageBlocked')}</div>
+			{/if}
 			<div role="alert" aria-live="assertive">
 				{#if error}
 					<div class="error">{error}</div>

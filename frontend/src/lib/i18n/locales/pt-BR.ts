@@ -3483,6 +3483,7 @@ export const messages = {
 	'auth.login.forgotPassword': 'Esqueceu a senha?',
 	'auth.login.signedOutOtherWorkspace': "Você foi desconectado porque sua sessão pertencia a outro espaço de trabalho. Entre aqui ou pela página do seu próprio espaço de trabalho.",
 	'auth.login.workspaceClosed': "Este espaço de trabalho foi encerrado e suas contas foram excluídas. Os endereços de e-mail delas agora podem ser usados em outro espaço de trabalho.",
+	'auth.login.storageBlocked': "Seu navegador está impedindo que este site armazene dados, por isso você não consegue permanecer conectado. Permita os dados de sites (cookies e armazenamento do site) para este site nas configurações do navegador e recarregue a página.",
 	'auth.login.goToOwnWorkspace': "Ir para a página de login do seu espaço de trabalho",
 	'auth.login.devAccounts.heading': 'Contas de desenvolvimento',
 	'auth.login.devAccounts.hint': 'Somente para desenvolvimento local. Escolha uma conta de teste para preencher o formulário.',
