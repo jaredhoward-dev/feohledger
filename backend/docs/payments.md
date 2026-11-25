@@ -2733,7 +2733,11 @@ payment id, from the org's mapped pay-from account. A refusal never undoes the
 transition; it is audited (`payment.erp_post_failed`, coded) and flagged
 (`erp_reconciliation`), and `POST /api/payments/runs/{id}/sync-erp` retries it.
 A discount or credit taken here leaves the bill partly open in QuickBooks, which
-is flagged for the bookkeeper. An accepted short settlement
+is flagged for the bookkeeper — unless the org opted in to booking early-payment
+discounts as a vendor credit applied to the bill
+(`settings.erp.book_discount_as_credit`, decisions §575; `erp-integration.md`
+§ Early-payment discount booked as a vendor credit). A credit that cannot be
+booked leaves the same flag, with its refusal code. An accepted short settlement
 (`/settlement/accept`) writes back what was settled. Voiding a settled payment
 voids its BillPayment; the intent is recorded in the void's own transaction
 (`erp_payment_voids_pending`) so the status-sync sweep finishes it if the
@@ -2759,7 +2763,8 @@ And a payment written back is a Xero Payment from the mapped account at the
 exact amount that reached the supplier. Xero payments carry no discount, so an
 early-payment discount taken here leaves the bill open by the discount, flagged
 for the bookkeeper with the discount in the flag's `erp_report`; no credit note
-is created on their behalf.
+is created on their behalf unless the org opted in (decisions §575), in which
+case an ACCPAYCREDIT credit note to the chosen account is allocated to the bill.
 
 The new `card` rail (`schemas/payment.PaymentMethod.card`) is a company card used
 OUTSIDE FeohLedger's card programme: recordable as paid outside, reported by
