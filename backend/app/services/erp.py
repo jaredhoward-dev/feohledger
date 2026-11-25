@@ -964,6 +964,12 @@ async def _call_erp(
     line_items = await _fetch_line_items(db, invoice.id)
     refs = await _resolve_erp_refs(db, invoice, line_items, config)
     payload = _build_payload(invoice, line_items, refs)
+    # An adapter whose bill key is a supplier + number (Xero) must not adopt a
+    # bill on a key another invoice shares: it may be that invoice's. One rule
+    # with the orphan-bill lookup; no query for any other adapter (§572).
+    from app.services.erp_bill_void import shared_lookup_keys
+
+    payload.bill_key_shared = invoice.id in await shared_lookup_keys(db, {"erp": config}, [invoice])
     payload.pending_job_id = state.get(PENDING_JOB_KEY)
     payload.outcome_unknown_since = prior_unknown_at
     # Strictly `is True`: a row written before the key existed records no

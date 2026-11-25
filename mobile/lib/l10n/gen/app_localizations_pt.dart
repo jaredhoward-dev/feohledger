@@ -2531,6 +2531,11 @@ class AppLocalizationsPt extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return 'O $provider já tem uma fatura deste fornecedor com este número, e outra fatura no FeohLedger tem o mesmo fornecedor e número, então essa fatura não foi vinculada a esta e nenhuma segunda foi criada. Verifique no $provider a qual fatura ela pertence. Se o número desta fatura estiver errado, corrija-o e tente novamente; caso contrário, pergunte a um administrador como proceder.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'Esta fatura tem uma exceção aberta ($type). Resolva-a ou descarte-a em Exceções e, depois, envie a fatura ao ERP.';
   }
@@ -7667,6 +7672,11 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String erpRefusalPaymentsScopeMissing(String provider) {
     return 'O $provider foi conectado antes de o FeohLedger pedir permissão para lançar pagamentos, então este pagamento não é lançado lá. Reconecte o $provider nas configurações da organização para concedê-la e depois lance o pagamento no $provider ou tente de novo.';
+  }
+
+  @override
+  String erpRefusalBillKeyShared(String provider) {
+    return 'O $provider já tem uma fatura deste fornecedor com este número, e outra fatura no FeohLedger tem o mesmo fornecedor e número, então essa fatura não foi vinculada a esta e nenhuma segunda foi criada. Verifique no $provider a qual fatura ela pertence. Se o número desta fatura estiver errado, corrija-o e tente novamente; caso contrário, pergunte a um administrador como proceder.';
   }
 
   @override

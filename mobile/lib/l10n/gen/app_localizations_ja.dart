@@ -2384,6 +2384,11 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider には既にこの仕入先とこの請求書番号の請求書があり、FeohLedger の別の請求書にも同じ仕入先と番号があるため、その請求書をこの請求書に紐付けず、2 件目も作成しませんでした。$provider でその請求書がどの請求書のものか確認してください。この請求書の番号が誤っている場合は修正して再試行し、そうでない場合は管理者に対応方法を確認してください。';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'この請求書には未解決の例外（$type）があります。「例外」で解決または却下してから、ERP に送信してください。';
   }

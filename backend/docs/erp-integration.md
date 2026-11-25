@@ -2577,7 +2577,8 @@ holder of `payment.void` can name that bill and void it:
   a lookup the server refuses. What it cannot rule out is a bill someone keyed
   by hand in Xero for the same supplier invoice: the push already adopts such a
   bill at the approved total, and the lookup shows its number, total and status
-  for the person voiding to judge. Only an
+  for the person voiding to judge. The push applies the same check before
+  adopting a bill it finds (`erp_bill_key_shared`, decisions §572). Only an
   invoice at `failed`, naming no bill, whose state is `possibly_posted` is
   looked up (409 `erp_lookup_not_failed`). A lookup that cannot finish is 502
   `erp_lookup_failed`, never "none". Answers `{found, bill: {erp_document_id,
@@ -3507,6 +3508,19 @@ time Xero refuses the payments listing, and the settings panel shows it
   `Reference` is ACCREC-only in Xero, so no bill field can carry our
   correlation id; the create also sends `Idempotency-Key: <correlation_id>`
   (Xero replays the original response).
+- **A found bill is adopted only on a key no other invoice shares** (decisions
+  §572). The key is the supplier's invoice number, not one FeohLedger invoice,
+  so `services/erp._call_erp` asks `erp_bill_void.shared_lookup_keys` — the
+  orphan-bill lookup's own rule (same number trimmed and case-folded, same
+  vendor or a vendor carrying the same contact, any status) — and passes the
+  answer as `payload.bill_key_shared`. When it is set and the lookup finds a
+  live bill, the push refuses `erp_bill_key_shared` (non-retryable, never
+  `not_posted`: an earlier attempt of ours may have made that bill) whatever
+  its total: the bill is not adopted and no second one is created. With no
+  bill on the key the push creates as usual, so a number shared with a
+  rejected or done invoice blocks nothing until a bill is actually there. A
+  person checks in Xero which invoice the bill is for; FeohLedger has no
+  action yet to confirm "that bill is this invoice's" (followups).
 - **The posted total is checked, on the bill read back.** After the create the
   adapter `GET`s `Invoices/{id}`. Xero computes `Total` from the lines and
   their tax types; a `Total` other than `amount` voids (AUTHORISED) or deletes

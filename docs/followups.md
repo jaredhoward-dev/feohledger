@@ -1364,21 +1364,24 @@ user-visible halves still open.
 
 ### Surfaced by round 48 (2026-11-25, round PR #772, decisions §563–§570)
 
-- [ ] **(c) The Xero push still adopts an existing bill on a shared
-      supplier + number key.** §566 / §569 refuse the orphan-bill *lookup and
-      void* while another invoice shares the key (contact the lookup sends,
-      row or kept link, same number), but the push's own idempotency check
-      (`xero._find_existing_bill`) still takes the first bill matching
-      supplier + number, so a push can adopt another invoice's bill as its
-      own and record it posted. Not refused at push time because that would
-      also block a legitimate push whose number appears on another
-      rejected / done invoice from the same supplier. **Durable fix:** refuse
-      adoption (not the push) when `shared_lookup_keys` says the key is
-      shared: create a new bill only after a person confirms, or carry a
-      FeohLedger marker Xero preserves (a `Reference` suffix verified on a
-      live org) so adoption keys on something unique. **Trigger:** the first
-      Xero tenant with two invoices sharing a supplier invoice number, or the
-      live Xero contract test confirming a preserved marker field.
+- [ ] **(c) A Xero push refused `erp_bill_key_shared` has no in-app way to
+      take the bill as its own.** §572 stops the push adopting a bill found on
+      a supplier + number another invoice shares (the push and the orphan
+      lookup now apply one rule, `shared_lookup_keys`), and nothing is created
+      beside it. But when the found bill really is this invoice's (an earlier
+      attempt's lost response, the sharer a rejected duplicate), retries keep
+      refusing: the only exits are correcting the invoice number or clearing
+      the sharer. **Durable fix:** carry a FeohLedger marker Xero preserves on
+      ACCPAY bills so adoption keys on something unique. Xero's OpenAPI
+      (`XeroAPI/Xero-OpenAPI` `xero_accounting.yaml`, read 2026-11-25) marks
+      `Reference` "ACCREC only" and describes `Url` only as a source-document
+      link, with no statement that it is kept on bills or filterable; the
+      invoices reference page did not render for an automated fetch that day.
+      Failing that, a `payment.void`-gated "this bill is this invoice's" action
+      that records the confirmation and finishes the push. **Trigger:** the
+      first `erp_bill_key_shared` refusal a tenant cannot clear by renumbering,
+      or the live Xero contract test (`pnpm test:erp:xero-live`) showing a
+      marker field survives a round trip on an ACCPAY bill.
 
 ### Surfaced by round 12 (2026-11-15, round PR #716, decisions §410–§421)
 

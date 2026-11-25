@@ -2098,7 +2098,12 @@ async def test_a_success_stamps_the_bill_and_its_deep_link_on_the_invoice():
 
     inv = _invoice()
     config = {"type": "xero", "integration_method": "direct"}
-    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+    # Xero's shared-key check (§572) is proven against a real tenant in
+    # `test_erp_orphan_bill.py`; nothing shares this invoice's key here.
+    with (
+        patch("app.services.erp.get_erp_adapter", return_value=_Adapter()),
+        patch("app.services.erp_bill_void.shared_lookup_keys", AsyncMock(return_value=set())),
+    ):
         await _call_erp(_line_items_db([]), inv, config, instance=_instance(state_data={}))
     assert inv.erp_document_id == bill
     assert inv.erp_document_url == (

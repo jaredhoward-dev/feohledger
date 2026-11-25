@@ -2508,6 +2508,11 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider already has a bill with this supplier and invoice number, and another invoice in FeohLedger has the same supplier and number, so that bill wasn\'t linked to this invoice and no second bill was created. Check in $provider which invoice the bill is for. If this invoice\'s number is wrong, correct it and retry; otherwise ask an administrator how to proceed.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'This invoice has an open $type exception. Resolve or dismiss it in Exceptions, then send it to the ERP.';
   }

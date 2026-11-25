@@ -30029,3 +30029,59 @@ namesake without our marker raises; two carrying our marker raise; every
 unreadable window raises; a payload the push would refuse raises before any
 call), `test_erp_orphan_bill.py` (both offer the lookup, neither key is shared,
 the served verdict offers it, `shared_lookup_keys` makes no query for Sage).
+
+## 572. The Xero push adopts a found bill only on a key no other invoice shares; otherwise it refuses `erp_bill_key_shared` (§566 / §569 follow-up, round 49)
+
+**Context.** Xero's pre-create idempotency lookup (`_find_existing_bill`) keys
+on supplier + supplier invoice number and adopted the first live bill at the
+approved total as this invoice's own. §566 / §569 already refuse the orphan
+*lookup* while another invoice in the tenant shares that key, because the bill
+could be that invoice's; the push did not ask, so it could record another
+invoice's bill as posted. Refusing the push whenever the key is shared was
+rejected in §569: a supplier's number on a rejected or done invoice would block
+a legitimate push with no bill in Xero at all.
+
+**Decision.**
+
+- **Refuse adoption, not the push.** `services/erp._call_erp` asks
+  `erp_bill_void.shared_lookup_keys` for the invoice being pushed (the same
+  function, so the push and the lookup apply one rule: same number trimmed
+  and case-folded, same vendor or a vendor carrying the same contact, any
+  status) and sets `InvoicePayload.bill_key_shared`. It returns at once with no
+  query for any adapter whose class does not set `bill_lookup_key_shared`, so
+  only Xero pays the read. The Xero push, finding a live bill on the key while
+  the flag is set, refuses with the new registered code `erp_bill_key_shared`
+  whatever the bill's total; with no bill on the key it creates as before.
+- **Fail closed, and say nothing was settled.** The refusal is non-retryable
+  and is the plain `erp_refusal`, not `erp_preflight_refusal`: the lookup ran,
+  and an earlier attempt of ours may have created that very bill, so the push
+  stays possibly-posted rather than claiming nothing is in Xero. No second bill
+  is created beside it. The message (six web locales, mobile ARBs) tells the
+  reader to check in Xero which invoice the bill is for, correct this
+  invoice's number if it is wrong, and otherwise ask an administrator.
+- **No marker yet.** Xero's OpenAPI (`XeroAPI/Xero-OpenAPI`
+  `xero_accounting.yaml`, read 2026-11-25) documents `Reference` as "ACCREC
+  only" and `Url` only as a source-document link, with nothing saying either
+  is kept on an ACCPAY bill or can be filtered on; the invoices reference page
+  (https://developer.xero.com/documentation/api/accounting/invoices) did not
+  render for an automated fetch that day. §566's reasons against writing an
+  unverified marker stand, so the follow-up keeps the marker (and, failing
+  it, a person's "this bill is this invoice's" action) with the live Xero
+  contract test as its trigger.
+
+**Residual.** When the found bill is this invoice's own and the sharer is, say,
+a rejected duplicate, the push keeps refusing until a person renumbers one of
+the two invoices; there is no in-app confirmation yet (followups, round 48
+item (c), narrowed). A bill keyed by hand in Xero on an unshared key is still
+adopted at the approved total, as §566 states.
+
+**Tests.** `test_erp_xero_adapter.py` (a shared key with a bill on it refuses
+`erp_bill_key_shared` at the approved total and at another, not `not_posted`,
+no PUT; a shared key with no bill still creates; the unshared adoption and the
+different-total refusal unchanged), `test_erp_orphan_bill.py` (`_call_erp`
+resolves the real Xero class from the config and hands the adapter
+`bill_key_shared` true or false against a real tenant; a mock config asks no
+query), `test_erp_push_flow.py` (the Xero-config stamping test states its key
+is unshared), `test_erp_refusal_codes.py`, and the web / mobile catalogue
+parity tests (`erpRefusals.test.ts`, `erp_refusal_messages_test.dart`) by
+registry.

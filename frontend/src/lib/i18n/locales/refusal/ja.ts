@@ -389,6 +389,7 @@ export const messages = {
 	'erpRefusal.paymentExceedsBalance': "{provider} 上の請求書の未払残高がこの支払いより少ないため、記録すると過払いになります。{provider} で支払済みの額を確認してください。",
 	'erpRefusal.billPaymentVoided': "この支払いは {provider} に記録された後、そこで取り消されたため、再度記録はしません。請求書が支払済みかどうかは {provider} で判断してください。",
 	'erpRefusal.paymentsScopeMissing': "{provider} は FeohLedger が支払い記録の権限を求める前に接続されたため、この支払いはそこに記録されません。組織設定で {provider} に再接続して権限を付与してから、{provider} で支払いを記録するか、再試行してください。",
+	'erpRefusal.billKeyShared': "{provider} には既にこの仕入先とこの請求書番号の請求書があり、FeohLedger の別の請求書にも同じ仕入先と番号があるため、その請求書をこの請求書に紐付けず、2 件目も作成しませんでした。{provider} でその請求書がどの請求書のものか確認してください。この請求書の番号が誤っている場合は修正して再試行し、そうでない場合は管理者に対応方法を確認してください。",
 	'erpRefusal.exceptionBlocksExport': "この請求書には未解決の例外（{type}）があります。「例外」で解決または却下してから、ERP に送信してください。",
 	'erpRefusal.exceptionBlocksExportPossiblyPosted': "この請求書には未解決の例外（{type}）があり、以前の送信で ERP に請求書が既に作成されている可能性があります。支払われる前に ERP を確認し、「例外」で例外を解決または却下してください。",
 	'erpRefusal.paymentBlocksExport': "FeohLedger はこの請求書を既に支払い中です（有効な支払いがあります）。ERP に送信する前に、その支払いバッチを取り消すか支払いを無効にしてください。",

@@ -3873,6 +3873,12 @@ abstract class AppLocalizations {
   /// **'{provider} was connected before FeohLedger asked for permission to record payments, so this payment isn\'t recorded there. Reconnect {provider} in Organization settings to grant it, then record the payment in {provider} or retry.'**
   String erpRefusalPaymentsScopeMissing(String provider);
 
+  /// No description provided for @erpRefusalBillKeyShared.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} already has a bill with this supplier and invoice number, and another invoice in FeohLedger has the same supplier and number, so that bill wasn\'t linked to this invoice and no second bill was created. Check in {provider} which invoice the bill is for. If this invoice\'s number is wrong, correct it and retry; otherwise ask an administrator how to proceed.'**
+  String erpRefusalBillKeyShared(String provider);
+
   /// No description provided for @erpRefusalExceptionBlocksExport.
   ///
   /// In en, this message translates to:
