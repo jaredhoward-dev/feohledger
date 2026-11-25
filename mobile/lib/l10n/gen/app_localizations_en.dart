@@ -857,6 +857,14 @@ class AppLocalizationsEn extends AppLocalizations {
       'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.';
 
   @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

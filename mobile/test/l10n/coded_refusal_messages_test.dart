@@ -93,6 +93,25 @@ void main() {
     );
   });
 
+  test('Partner Admin and the link-code mint are stated (decisions §574)', () {
+    expect(codedRefusalCodes, contains('partner_capability_required'));
+    expect(codedRefusalCodes, contains('partner_linking_disabled'));
+    for (final l in [en, de]) {
+      expect(
+        localizeCodedRefusal(l, refusal('partner_capability_required')),
+        l.codedRefusalPartnerCapabilityRequired,
+      );
+      expect(
+        localizeCodedRefusal(l, refusal('partner_linking_disabled')),
+        l.codedRefusalPartnerLinkingDisabled,
+      );
+    }
+    expect(
+      de.codedRefusalPartnerLinkingDisabled,
+      isNot(en.codedRefusalPartnerLinkingDisabled),
+    );
+  });
+
   test('the fixed sentences are stated in the reader\'s language', () {
     expect(
       localizeCodedRefusal(de, refusal('approval_segregation')),

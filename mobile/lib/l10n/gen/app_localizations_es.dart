@@ -862,6 +862,14 @@ class AppLocalizationsEs extends AppLocalizations {
       'Esta factura es una factura espejo entre empresas del grupo: sus importes se copiaron de la factura de origen de la otra entidad. Elimine esta factura espejo y corrija la factura original; después vuelva a enrutarla.';
 
   @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Este espacio de trabajo no está configurado como socio. FeohLedger habilita la Administración de socios bajo solicitud — contacta con soporte si revendes o gestionas otros espacios de trabajo.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'La vinculación con socios aún no está habilitada en esta plataforma, así que no se puede generar un código de vinculación. Contacta con soporte.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

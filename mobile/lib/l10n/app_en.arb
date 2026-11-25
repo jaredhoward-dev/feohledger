@@ -568,6 +568,14 @@
   "@codedRefusalRecallIsMirror": {
     "description": "Coded refusal `invoice_recall_is_mirror`: the invoice is itself an inter-company mirror."
   },
+  "codedRefusalPartnerCapabilityRequired": "This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.",
+  "@codedRefusalPartnerCapabilityRequired": {
+    "description": "Coded refusal `partner_capability_required`: an admin of a workspace the operator has not made a partner opened a Partner Admin action."
+  },
+  "codedRefusalPartnerLinkingDisabled": "Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.",
+  "@codedRefusalPartnerLinkingDisabled": {
+    "description": "Coded refusal `partner_linking_disabled`: the link-code mint is off because the platform has no signing key configured."
+  },
   "invoicesBulkRejectTitle": "Reject {count, plural, one {{count} invoice} other {{count} invoices}}",
   "@invoicesBulkRejectTitle": {
     "description": "Title of the reason prompt shown before bulk-rejecting the selected invoices.",

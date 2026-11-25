@@ -866,6 +866,14 @@ class AppLocalizationsFr extends AppLocalizations {
       'Cette facture est une facture miroir intragroupe : ses montants sont copiés de la facture d\'origine de l\'autre entité. Supprimez cette facture miroir et corrigez la facture d\'origine, puis acheminez-la à nouveau.';
 
   @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Cet espace de travail n\'est pas configuré comme partenaire. FeohLedger active l\'Administration partenaire sur demande — contactez le support si vous revendez ou gérez d\'autres espaces de travail.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'La liaison avec un partenaire n\'est pas encore activée sur cette plateforme ; aucun code de liaison ne peut donc être généré. Contactez le support.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

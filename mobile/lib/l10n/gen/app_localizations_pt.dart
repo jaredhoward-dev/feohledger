@@ -862,6 +862,14 @@ class AppLocalizationsPt extends AppLocalizations {
       'Esta fatura é uma fatura espelho entre empresas do grupo: seus valores foram copiados da fatura de origem da outra entidade. Elimine esta fatura espelho e corrija a fatura original; depois encaminhe-a novamente.';
 
   @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Este espaço de trabalho não está configurado como parceiro. A FeohLedger ativa a Administração de parceiros mediante pedido — contacte o suporte se revende ou gere outros espaços de trabalho.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'A ligação a parceiros ainda não está ativada nesta plataforma, pelo que não é possível gerar um código de ligação. Contacte o suporte.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,
@@ -6020,6 +6028,14 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get codedRefusalRecallIsMirror =>
       'Esta fatura é uma fatura espelho entre empresas do grupo: seus valores foram copiados da fatura de origem da outra entidade. Exclua esta fatura espelho e corrija a fatura original; depois roteie-a novamente.';
+
+  @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Este espaço de trabalho não está configurado como parceiro. A FeohLedger habilita a Administração de parceiros mediante solicitação — entre em contato com o suporte se você revende ou gerencia outros espaços de trabalho.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'A vinculação com parceiros ainda não está habilitada nesta plataforma, então nenhum código de vínculo pode ser gerado. Entre em contato com o suporte.';
 
   @override
   String invoicesBulkRejectTitle(int count) {

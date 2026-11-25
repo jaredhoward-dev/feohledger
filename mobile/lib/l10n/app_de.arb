@@ -216,6 +216,8 @@
   "codedRefusalRecallMirrorUnsigned": "Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit hat die genehmigten Beträge übernommen. Löschen Sie die Spiegelrechnung (sie ist noch nicht genehmigt), nehmen Sie dann diese Genehmigung zurück und leiten Sie die Rechnung nach der erneuten Genehmigung wieder weiter.",
   "codedRefusalRecallMirrorProgressed": "Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit ist dort bereits genehmigt oder wird bezahlt. Korrigieren Sie beide Seiten mit je einer Gutschrift; diese Genehmigung kann nicht zurückgenommen werden.",
   "codedRefusalRecallIsMirror": "Diese Rechnung ist eine konzerninterne Spiegelrechnung: Ihre Beträge stammen aus der Ursprungsrechnung der anderen Einheit. Löschen Sie diese Spiegelrechnung, korrigieren Sie die Ursprungsrechnung und leiten Sie sie erneut weiter.",
+  "codedRefusalPartnerCapabilityRequired": "Dieser Arbeitsbereich ist nicht als Partner eingerichtet. Die Partner-Verwaltung wird von FeohLedger auf Anfrage freigeschaltet — wenden Sie sich an den Support, wenn Sie andere Arbeitsbereiche weiterverkaufen oder verwalten.",
+  "codedRefusalPartnerLinkingDisabled": "Die Partner-Verknüpfung ist auf dieser Plattform noch nicht aktiviert, daher kann kein Verknüpfungscode erstellt werden. Wenden Sie sich an den Support.",
   "invoicesBulkRejectTitle": "{count, plural, one {{count} Rechnung} other {{count} Rechnungen}} ablehnen",
   "commonDelete": "Löschen",
   "bulkSelectedCount": "{count, plural, one {{count} ausgewählt} other {{count} ausgewählt}}",

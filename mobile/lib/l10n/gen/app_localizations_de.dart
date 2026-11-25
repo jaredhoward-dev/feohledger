@@ -862,6 +862,14 @@ class AppLocalizationsDe extends AppLocalizations {
       'Diese Rechnung ist eine konzerninterne Spiegelrechnung: Ihre Beträge stammen aus der Ursprungsrechnung der anderen Einheit. Löschen Sie diese Spiegelrechnung, korrigieren Sie die Ursprungsrechnung und leiten Sie sie erneut weiter.';
 
   @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Dieser Arbeitsbereich ist nicht als Partner eingerichtet. Die Partner-Verwaltung wird von FeohLedger auf Anfrage freigeschaltet — wenden Sie sich an den Support, wenn Sie andere Arbeitsbereiche weiterverkaufen oder verwalten.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'Die Partner-Verknüpfung ist auf dieser Plattform noch nicht aktiviert, daher kann kein Verknüpfungscode erstellt werden. Wenden Sie sich an den Support.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

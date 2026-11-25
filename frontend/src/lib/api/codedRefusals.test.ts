@@ -884,6 +884,29 @@ describe('recalling an approval (decisions §374)', () => {
 	});
 });
 
+describe('Partner Admin and the link code (decisions §574)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states the capability and linking-disabled refusals in all six locales', () => {
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			for (const [code, key] of [
+				['partner_capability_required', 'refusal.partnerCapabilityRequired'],
+				['partner_linking_disabled', 'refusal.partnerLinkingDisabled']
+			] as const) {
+				expect(cat[key], `${loc} ${key}`).toBeTruthy();
+				expect(codedRefusalText(code, {}, t)).toBe(cat[key]);
+			}
+		}
+		expect(CODED_REFUSAL_CODES).toContain('partner_capability_required');
+		expect(CODED_REFUSAL_CODES).toContain('partner_linking_disabled');
+		expect(localizeApiDetail(detail('partner_linking_disabled', {}), deT)).toBe(
+			de['refusal.partnerLinkingDisabled']
+		);
+	});
+});
+
 describe('voiding a flagged bill in the ERP (decisions §539, §542, §545)', () => {
 	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
 

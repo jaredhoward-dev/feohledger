@@ -39,6 +39,10 @@ export const messages = {
 	'refusal.recallMirrorUnsigned': "Cette facture a été acheminée en intragroupe, et sa facture miroir dans l'autre entité a repris les montants approuvés. Supprimez la facture miroir (elle n'est pas encore approuvée), retirez ensuite cette approbation, puis acheminez à nouveau la facture une fois réapprouvée.",
 	'refusal.recallMirrorProgressed': "Cette facture a été acheminée en intragroupe, et sa facture miroir dans l'autre entité y est déjà approuvée ou en cours de paiement. Corrigez les deux côtés par un avoir chacun ; cette approbation ne peut pas être retirée.",
 	'refusal.recallIsMirror': "Cette facture est une facture miroir intragroupe : ses montants sont copiés de la facture d'origine de l'autre entité. Supprimez cette facture miroir et corrigez la facture d'origine, puis acheminez-la à nouveau.",
+	'refusal.partnerCapabilityRequired':
+		'Cet espace de travail n\'est pas configuré comme partenaire. FeohLedger active l\'Administration partenaire sur demande — contactez le support si vous revendez ou gérez d\'autres espaces de travail.',
+	'refusal.partnerLinkingDisabled':
+		'La liaison avec un partenaire n\'est pas encore activée sur cette plateforme ; aucun code de liaison ne peut donc être généré. Contactez le support.',
 	'refusal.erpVoidNotFlagged': "Seul un signalement ouvert de doublon ou de fraude peut annuler la facture fournisseur dans l'ERP.",
 	'refusal.erpVoidNoBill': "FeohLedger ne connaît aucune facture fournisseur dans l'ERP à annuler pour cette facture.",
 	'refusal.erpVoidClaimed': "FeohLedger paie déjà cette facture. Annulez d'abord ce paiement ou cette carte.",
