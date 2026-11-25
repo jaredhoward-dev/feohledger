@@ -793,29 +793,6 @@ or is a sibling of a fix that needs its own pass.
       re-syncing the mirror after re-approval. **Trigger:** the first
       customer using PEPPOL send or inter-company routing who recalls.
 
-### Surfaced by the expense-management bug hunt (2026-10-05, round 2)
-
-- [ ] **(c) An approved pre-approval is never consumed, so one estimate covers
-      unlimited spend.** `_approved_preapproval_amount` (`api/expenses.py`)
-      returns the largest approved estimate that matches the line, and the
-      policy engine (`services/expense_policy.py`) compares it to
-      each line *individually* (`covered >= amount`). Now that cover is scoped to
-      the requester (`backend/docs/expense-management.md` § Pre-approval cover is
-      the requester's own) a colleague's request can no longer be borrowed, but
-      the same employee's single "500 USD, travel" approval still clears
-      `preapproval_required` on any number of 400 USD travel lines, across any
-      number of reports, indefinitely — the split-to-evade shape an approval
-      limit exists to stop. Not fixed in the same change because the honest fix
-      needs a data-model decision, not a query tweak.
-      **Durable fix:** link a covered expense to the pre-approval that covers it
-      (an `expenses.preapproval_id` FK, or a consumption row) and draw lines down
-      against `estimated_amount` in the pre-approval's currency at submit, under
-      a row lock on the pre-approval; a line the remaining balance cannot cover
-      raises `preapproval_required`. Decide with product whether a pre-approval is
-      single-use, a running budget, or time-boxed, and migrate (tenant fan-out).
-      **Trigger:** the next change to pre-approval cover or the policy engine's
-      `preapproval_required` rule, or a product call on pre-approval semantics.
-
 ### Surfaced by the PR #670 money-path review (2026-10-26, decisions §323)
 
 - [ ] **(c) A PO the ERP can never price has no documented way out.** A SYSPRO

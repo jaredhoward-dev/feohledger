@@ -29431,3 +29431,92 @@ unaffected card still cancels); `test_card_money_path_regression.py` (the
 return); `test_qbo_status_sync_adapter.py` (a re-sync with a changed amount
 posts no second BillPayment); `test_provider_credentials.py` (the `whsec_`
 refusal and the per-provider acceptance).
+
+## 563. An approved pre-approval is a budget the lines it covers draw down; submit draws under a row lock, reject hands it back, nothing is backfilled (closes the expense-management followup; round 48)
+
+**The defect.** `_approved_preapproval_amount` returned the largest approved
+estimate matching a line, and the policy engine compared it to each line on its
+own (`covered >= amount`). Since cover was scoped to the requester a colleague's
+approval could no longer be borrowed, but one employee's "500 USD, travel"
+approval still cleared the blocking `preapproval_required` on any number of
+400 USD travel lines, across any number of reports, indefinitely — the
+split-to-evade shape an approval limit exists to stop.
+
+**The product call (delegated by the operator): a running budget bounded by
+the estimate.** Not single-use: a trip is several receipts, and a single-use
+approval would refuse the second legitimate line of the very trip it approved.
+Not time-boxed: the model has no validity window, and inventing one (30 days?
+the trip dates?) needs an input nobody has entered, so an approved estimate
+stays usable until it is spent. What it may never do is cover more than it says.
+
+**Mechanism.** `expenses.preapproval_id` (FK, indexed) and
+`expenses.preapproval_drawn_amount` (`NUMERIC(15,2)`), migration 0149, tenant
+fan-out. A pre-approval's remaining balance is its `estimated_amount` minus the
+sum of those draws. A consumption table was the alternative; a line is covered
+by at most one pre-approval at a time, so two columns on the line say the same
+thing with no extra join, and a deleted line takes its draw with it. The rules
+live in one module, `services/expense_preapproval_cover.py`:
+
+- **Submit draws; nothing else does.** Report submit evaluates the lines once
+  with no cover; each line that raises `preapproval_required` is linked to one
+  pre-approval with enough left (one raised for this report first, then the
+  oldest decision) and records its whole amount as the draw. A line no balance
+  covers stays unlinked, the second evaluation raises `preapproval_required` for
+  it, and the 422 rolls back every draw the submit made, including those that
+  fit. A line is never split across two estimates: "partly pre-approved" is not
+  a state an approver can read.
+- **Which statuses consume.** Submitted and approved (and reimbursed) lines —
+  the ones a link exists on. A draft draws nothing: drawing at draft would let an
+  abandoned draft hold balance a real claim needs, and the draft's own flags are
+  advisory until submit anyway. **Report reject** returns lines to draft and
+  clears their draws in the same transaction. A line can only be deleted off an
+  unlocked report, where it no longer draws.
+- **Only lines that need cover draw.** A line under every
+  `requires_preapproval_above` is not charged to the budget. Charging every line
+  in the category would let a run of small receipts exhaust the estimate the one
+  large line needed, and refuse it. Splitting one large claim into several
+  sub-threshold lines is the threshold's own evasion, not this one, and is
+  unchanged.
+- **Concurrency.** Before reading any balance, submit locks every candidate
+  pre-approval `FOR UPDATE`, ordered by id so two submits never deadlock; the
+  drawn sums are read after the lock, so under READ COMMITTED the second of two
+  concurrent submits sees the first's committed draw. Without the lock both read
+  the same remainder and both draw it; the regression test was run with the lock
+  removed and failed three times out of three.
+- **Currency.** Unchanged and load-bearing: cover requires the pre-approval's
+  currency to equal the line's (a NULL or unusable code matches nothing, §473),
+  so the draw is in one currency and is a plain `Decimal` subtraction. No FX: a
+  line in another currency is never covered, the fail-closed answer.
+- **The advisory flags read the remaining balance.**
+  `_approved_preapproval_amount` (now delegating to `advisory_cover`) returns a
+  linked line's own draw, otherwise the largest remaining balance among its
+  candidates, so a draft written after the estimate is spent says
+  `preapproval_required` before submit. Submit re-decides under the lock; the
+  stored flag of a draft that was clean when written is not re-run when another
+  report spends the balance, which is why submit, not the flag, is the gate.
+
+**Existing lines: no backfill.** A line submitted before 0149 has no recorded
+cover. Assigning one now — by date, by category, by largest estimate — would
+either refuse a later line on a draw nobody made or absolve one with a balance
+nobody checked; the same refusal to manufacture a proxy as §141. Pre-existing
+lines draw nothing, and every approved pre-approval started 0149 with its whole
+estimate. That is the one window in which an old approval can still cover
+something an earlier report already used it for, and it closes as the estimate
+is drawn.
+
+**Surface.** Pre-approval responses carry `drawn_amount` and
+`remaining_amount` (NULL unless approved; one grouped query per list page);
+expense responses carry `preapproval_id` and `preapproval_drawn_amount`. The
+Pre-approvals tab shows a Remaining column with the drawn amount beneath it (or
+"Used up"), and a covered line a "Pre-approved" badge whose title names the
+amount, in six locales. RBAC is unchanged: no new route, no new permission.
+
+**Tests.** `backend/tests/test_expense_preapproval_drawdown.py` (a second
+400 line against a 500 estimate is refused across reports; two lines on one
+report share it and a refused submit draws nothing; reject releases and a later
+claim uses the balance; a draft written after exhaustion is flagged; a EUR line
+against a USD estimate is never covered; two concurrent submits leave exactly
+one draw; a line with no recorded draw consumes nothing; the list and a pending
+row's NULL remaining), `test_migration_0149_expense_preapproval_draw.py`,
+`frontend/src/lib/types/expense.test.ts` (`preapprovalBalance`,
+`drawsPreapproval`), `tests-e2e/expenses/preapproval-drawdown.spec.ts`.
