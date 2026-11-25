@@ -448,12 +448,15 @@ Users can designate a delegate who receives their approval assignments while the
 - `User.delegate_until` — datetime after which delegation expires.
 - `assign_reviewer()` checks delegation and reassigns to the delegate when active.
 - `WorkflowStep.original_assigned_to` records the intended user so the audit trail shows both the original assignee and the delegate.
+- The delegate acts as themselves: their own roles and approval limits, and their own segregation-of-duties set — routing confers no privilege, and a delegate must already hold `invoice.approve` (decisions §511). Full rules: `docs/authentication.md` § Delegation / Out-of-Office.
+- Set by each user on **Profile → Out of office** (`/profile?section=delegation`).
 
 API:
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/auth/delegation` | Check current delegation status |
+| `GET` | `/api/auth/delegation/candidates` | Who may be named: active same-org colleagues holding `invoice.approve`, not the caller |
 | `POST` | `/api/auth/delegation` | Set delegate: `{delegate_to_id, until}` |
 | `DELETE` | `/api/auth/delegation` | Clear delegation |
 
