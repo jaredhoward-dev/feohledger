@@ -121,6 +121,7 @@ export const enPortal = {
 	'portal.invoices.tableAria': 'Your invoices',
 	'portal.invoices.chatLoadFailed': 'The conversation could not be loaded.',
 	'portal.invoices.chatNotFound': 'We couldn’t find that invoice in your account.',
+	'portal.invoices.chatLinkFailed': 'We couldn’t open that conversation just now.',
 
 	// Portal payments (routes/portal/payments/+page.svelte)
 	'portal.payments.title': 'Payments',

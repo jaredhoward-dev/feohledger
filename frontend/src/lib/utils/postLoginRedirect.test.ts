@@ -8,6 +8,7 @@ import {
 	SSO_NEXT_KEY,
 	takeNextForSso,
 	withNext,
+	withPortalNext,
 	type NextStorage
 } from './postLoginRedirect.ts';
 
@@ -212,6 +213,23 @@ describe('safePortalNextPath', () => {
 			null
 		]) {
 			expect(safePortalNextPath(raw), String(raw)).toBeNull();
+		}
+	});
+});
+
+describe('withPortalNext', () => {
+	it('carries a portal destination through the forced password change', () => {
+		const id = '3f0c1f8e-6a1b-4c2d-9e8f-0123456789ab';
+		expect(withPortalNext('/portal/change-password', `/portal/invoices?chat=${id}`)).toBe(
+			`/portal/change-password?next=${encodeURIComponent(`/portal/invoices?chat=${id}`)}`
+		);
+	});
+
+	it('adds nothing for an absent, unsafe or non-portal destination', () => {
+		for (const raw of [null, undefined, '', '/invoices', '//evil.example/portal', '/portal/login']) {
+			expect(withPortalNext('/portal/change-password', raw), String(raw)).toBe(
+				'/portal/change-password'
+			);
 		}
 	});
 });

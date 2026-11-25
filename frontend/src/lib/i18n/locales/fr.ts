@@ -351,9 +351,9 @@ export const messages = {
 	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
 	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
 	'profile.delegation.heading': "Absence",
-	'profile.delegation.hint': "Pendant votre absence, les factures qui vous sont attribuées pour approbation sont envoyées à un collègue. La délégation commence dès l'enregistrement et se termine après le dernier jour choisi.",
+	'profile.delegation.hint': "Pendant votre absence, les nouvelles factures qui vous sont attribuées pour approbation vont à un collègue lorsqu'il peut les approuver ; sinon, elles restent chez vous. La délégation commence dès l'enregistrement et se termine après le dernier jour choisi.",
 	'profile.delegation.limits': "Votre délégué approuve en son propre nom : dans la limite de ses propres plafonds d'approbation, et jamais une facture qu'il a téléversée, dont il a réceptionné les marchandises ou qu'il a contrôlée. Vous pouvez toujours approuver ces factures vous aussi.",
-	'profile.delegation.statusOn': "Activée : les factures à approuver vont à {name} jusqu'au {date} inclus.",
+	'profile.delegation.statusOn': "Activée : les nouvelles factures à approuver vont à {name} jusqu'au {date} inclus lorsqu'il peut les approuver ; sinon, elles restent chez vous.",
 	'profile.delegation.statusOff': "Désactivée : les factures à approuver vous sont attribuées.",
 	'profile.delegation.statusEnded': "Désactivée : votre délégation à {name} a pris fin le {date}.",
 	'profile.delegation.delegate': "Délégué",
@@ -371,6 +371,8 @@ export const messages = {
 	'profile.delegation.endFailed': "Impossible de désactiver l'absence.",
 	'profile.delegation.delegateRequired': "Choisissez un délégué.",
 	'profile.delegation.lastDayRequired': "Choisissez votre dernier jour d'absence, aujourd'hui ou plus tard.",
+	'profile.delegation.approversOnly': "L’absence est réservée aux collègues qui approuvent des factures. Votre compte ne peut pas approuver, il n'y a donc rien à déléguer.",
+	'profile.delegation.clearEnded': "Effacer la délégation terminée",
 	'authRefusal.delegationInvalidId': "Ce délégué est introuvable. Choisissez un collègue dans la liste.",
 	'authRefusal.delegationSelf': "Vous ne pouvez pas vous déléguer vos propres approbations.",
 	'authRefusal.delegationUntilInvalid': "Choisissez un dernier jour d'absence valide.",

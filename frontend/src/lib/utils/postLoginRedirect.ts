@@ -179,3 +179,17 @@ export function safePortalNextPath(raw: unknown): string | null {
 	if (decoded === PORTAL_LOGIN || decoded.startsWith(`${PORTAL_LOGIN}/`)) return null;
 	return safe;
 }
+
+/**
+ * `path` with a portal destination appended as `?next=` — {@link withNext} for
+ * the supplier portal. The forced password change is a sign-in step like any
+ * other, so the portal sign-in and the portal layout pass the destination on
+ * through it, as the employee flow does through `/change-password`. An unsafe
+ * or non-portal `next` adds nothing.
+ */
+export function withPortalNext(path: string, next: string | null | undefined): string {
+	const safe = safePortalNextPath(next);
+	if (!safe) return path;
+	const sep = path.includes('?') ? '&' : '?';
+	return `${path}${sep}${new URLSearchParams({ [NEXT_PARAM]: safe }).toString()}`;
+}

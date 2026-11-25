@@ -5,7 +5,7 @@
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
 	import PasswordInput from '#lib/components/auth/PasswordInput.svelte';
 	import { goto } from '$app/navigation';
-	import { safePortalNextPath } from '#lib/utils/postLoginRedirect.ts';
+	import { safePortalNextPath, withPortalNext } from '#lib/utils/postLoginRedirect.ts';
 	import { page } from '$app/state';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
@@ -27,12 +27,14 @@
 	let emailSending = $state(false);
 
 	function afterAuth() {
+		// Back to the page the auth wall sent them from (`?next=`, portal pages
+		// only), else the portal home — through the forced password change
+		// first when there is one, which passes it on.
+		const next = page.url.searchParams.get('next');
 		if (portalAuth.user?.must_change_password) {
-			goto('/portal/change-password');
+			goto(withPortalNext('/portal/change-password', next));
 		} else {
-			// Back to the page the auth wall sent them from (`?next=`, portal
-			// pages only), else the portal home.
-			goto(safePortalNextPath(page.url.searchParams.get('next')) ?? '/portal');
+			goto(safePortalNextPath(next) ?? '/portal');
 		}
 	}
 

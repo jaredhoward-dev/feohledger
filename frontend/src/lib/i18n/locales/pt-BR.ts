@@ -352,9 +352,9 @@ export const messages = {
 	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
 	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
 	'profile.delegation.heading': "Ausência",
-	'profile.delegation.hint': "Enquanto você estiver fora, as faturas atribuídas a você para aprovação vão para um colega. Começa assim que você salva e termina após o último dia escolhido.",
+	'profile.delegation.hint': "Enquanto você estiver fora, as novas faturas atribuídas a você para aprovação vão para um colega quando ele pode aprová-las; caso contrário, ficam com você. Começa assim que você salva e termina após o último dia escolhido.",
 	'profile.delegation.limits': "Seu delegado aprova em nome próprio: dentro dos próprios limites de aprovação e nunca uma fatura que tenha enviado, cujas mercadorias tenha recebido ou que tenha inspecionado. Você também continua podendo aprovar essas faturas.",
-	'profile.delegation.statusOn': "Ativada: as faturas para sua aprovação vão para {name} até {date}, inclusive.",
+	'profile.delegation.statusOn': "Ativada: as novas faturas para sua aprovação vão para {name} até {date}, inclusive, quando ele pode aprová-las; caso contrário, ficam com você.",
 	'profile.delegation.statusOff': "Desativada: as faturas para sua aprovação vêm para você.",
 	'profile.delegation.statusEnded': "Desativada: sua delegação para {name} terminou em {date}.",
 	'profile.delegation.delegate': "Delegado",
@@ -372,6 +372,8 @@ export const messages = {
 	'profile.delegation.endFailed': "Não foi possível desativar a ausência.",
 	'profile.delegation.delegateRequired': "Escolha um delegado.",
 	'profile.delegation.lastDayRequired': "Escolha seu último dia fora, hoje ou depois.",
+	'profile.delegation.approversOnly': "Ausência é para colegas que aprovam faturas. Sua conta não pode aprovar, então não há nada a delegar.",
+	'profile.delegation.clearEnded': "Limpar a delegação encerrada",
 	'authRefusal.delegationInvalidId': "Esse delegado não foi encontrado. Escolha um colega da lista.",
 	'authRefusal.delegationSelf': "Você não pode delegar suas aprovações a si mesmo.",
 	'authRefusal.delegationUntilInvalid': "Escolha um último dia fora válido.",

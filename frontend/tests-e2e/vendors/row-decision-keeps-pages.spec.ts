@@ -50,6 +50,8 @@ function listRow(v: MockVendor) {
 type ListHooks = {
 	hold?: (url: URL) => Promise<void> | undefined;
 	fail?: (url: URL) => boolean;
+	/** Held before the Verify POST answers, so a spec can act mid-decision. */
+	holdDecision?: () => Promise<void> | undefined;
 };
 
 /** A promise a spec resolves by hand: `release()` lets the held response go. */
@@ -93,6 +95,8 @@ async function stubVendors(
 		}
 		const verify = url.pathname.match(/^\/api\/vendors\/([^/]+)\/verify$/);
 		if (verify && method === 'POST') {
+			const heldDecision = hooks.holdDecision?.();
+			if (heldDecision) await heldDecision;
 			const v = vendors.find((x) => x.id === verify[1])!;
 			v.status = 'active';
 			return route.fulfill({ json: { ...v, source: 'manual', invoice_count: 0 } });
@@ -269,5 +273,66 @@ test.describe('/vendors row decision keeps loaded pages', () => {
 		await expect(row).not.toContainText('Couldn’t refresh this row');
 		await expect(row.getByRole('button', { name: 'Reject' })).toBeVisible();
 		await expect(page.locator('table tbody tr')).toHaveCount(20);
+	});
+
+	test('a filter change during a decision still lands the new filter\'s list', async ({
+		page
+	}) => {
+		// The filter's whole-list read is in flight when the decision patches
+		// the list. It used to be discarded as pre-decision, leaving the old
+		// filter's rows, total and page under the new filter's chip and URL.
+		const vendors = seed(45, 'unverified');
+		const target = vendors[4];
+		const decision = gate();
+		const filterRead = gate();
+		let heldFilterRead = false;
+		await stubVendors(page, vendors, {
+			holdDecision: () => decision.opened,
+			hold: (url) => {
+				if (
+					heldFilterRead ||
+					url.searchParams.get('status') !== 'unverified' ||
+					url.searchParams.has('id')
+				)
+					return undefined;
+				heldFilterRead = true;
+				return filterRead.opened;
+			}
+		});
+		await page.goto('/vendors');
+		await expect(page.locator('.btn-load-more')).toContainText('20 of 45');
+
+		// Verify a row; its POST is held.
+		const verifyRequested = page.waitForRequest((r) => r.url().includes(`${target.id}/verify`));
+		await page
+			.locator('table tbody tr', { hasText: target.name })
+			.getByRole('button', { name: 'Verify' })
+			.click();
+		await verifyRequested;
+
+		// Change the filter while the decision is out; its list read is held.
+		const filterRequested = page.waitForRequest(
+			(r) =>
+				new URL(r.url()).searchParams.get('status') === 'unverified' &&
+				!new URL(r.url()).searchParams.has('id')
+		);
+		await page.locator('.filter-chip', { hasText: /^Unverified/ }).click();
+		await filterRequested;
+
+		// The decision lands (patching the list), then the filter's read does.
+		const reread = page.waitForResponse(
+			(r) => new URL(r.url()).searchParams.get('id') === target.id
+		);
+		decision.release();
+		await reread;
+		filterRead.release();
+
+		// The list is the new filter's: a full first page of the 44 still
+		// unverified, the decided vendor gone, and the URL agrees.
+		await expect(page.locator('.btn-load-more')).toContainText('20 of 44');
+		await expect(page.locator('table tbody tr')).toHaveCount(20);
+		await expect(page.locator('table tbody tr', { hasText: target.name })).toHaveCount(0);
+		await expect(page.locator('table tbody tr', { hasText: vendors[20].name })).toBeVisible();
+		expect(new URL(page.url()).searchParams.get('status')).toBe('unverified');
 	});
 });

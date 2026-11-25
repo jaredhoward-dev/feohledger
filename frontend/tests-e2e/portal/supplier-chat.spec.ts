@@ -247,12 +247,72 @@ test.describe('/portal supplier chat — vendor surface', () => {
 		const chat = page.locator('[data-testid="supplier-chat"]');
 		await expect(chat.locator('[data-testid="chat-msg"]', { hasText: 'Could you send the delivery note?' })).toBeVisible();
 		await expect(page.getByRole('button', { name: /INV-LINK-1/ })).toHaveAttribute('aria-expanded', 'true');
+		// The link was followed to reply: the composer has focus.
+		await expect(chat.locator('[data-testid="chat-input"]')).toBeFocused();
+	});
+
+	test('a chat link whose invoice read fails (not a 404) says the read failed, and Retry opens it', async ({
+		page,
+	}) => {
+		// The invoice is not on the loaded page, so the link reads it alone. A
+		// 500 there is a failed read, not "not in your account".
+		const id = '7d3f2a10-4b5c-4d6e-8f70-998877665544';
+		const invoice = {
+			id,
+			invoice_number: 'INV-LINK-500',
+			amount: '75.00',
+			currency: 'USD',
+			status: 'ready_for_review',
+			invoice_date: '2026-11-01',
+			due_date: '2026-12-01',
+			submitted_at: '2026-11-02T10:00:00Z',
+			file_url: null,
+			rejection_reason: null,
+			waiting_on: 'review',
+			waiting_on_days: 1,
+		};
+		let failRead = true;
+		await page.route(
+			(url) => url.pathname === '/api/portal/invoices',
+			(route) => route.fulfill({ json: { items: [], total: 0, page: 1, page_size: 25 } }),
+		);
+		await page.route(
+			(url) => url.pathname === `/api/portal/invoices/${id}`,
+			(route) =>
+				failRead
+					? route.fulfill({ status: 500, json: { detail: 'boom' } })
+					: route.fulfill({ json: invoice }),
+		);
+		await page.route(
+			(url) => url.pathname === `/api/portal/invoices/${id}/chat`,
+			(route) =>
+				route.request().method() === 'GET'
+					? route.fulfill({ json: { invoice_id: id, status: 'open', messages: [] } })
+					: route.fallback(),
+		);
+		await portalSignIn(page);
+		await page.goto(`/portal/invoices?chat=${id}`);
+
+		const failed = page.getByTestId('portal-chat-link-failed');
+		await expect(failed).toContainText('We couldn’t open that conversation just now.');
+		await expect(page.getByTestId('portal-chat-link-not-found')).toHaveCount(0);
+
+		failRead = false;
+		await failed.getByRole('button', { name: 'Retry' }).click();
+		await expect(failed).toHaveCount(0);
+		const chat = page.locator('[data-testid="supplier-chat"]');
+		await expect(chat.locator('[data-testid="chat-input"]')).toBeFocused();
+		await expect(page.getByRole('button', { name: /INV-LINK-500/ })).toHaveAttribute(
+			'aria-expanded',
+			'true',
+		);
 	});
 
 	test('a chat link to an invoice that is not the supplier’s says so', async ({ page }) => {
 		await portalSignIn(page);
 		await page.goto(`/portal/invoices?chat=${crypto.randomUUID()}`);
-		await expect(page.locator('.error[role="alert"]')).toContainText('We couldn’t find that invoice in your account.');
+		await expect(page.getByTestId('portal-chat-link-not-found')).toContainText('We couldn’t find that invoice in your account.');
+		await expect(page.getByTestId('portal-chat-link-failed')).toHaveCount(0);
 		await expect(page.locator('[data-testid="supplier-chat"]')).toHaveCount(0);
 	});
 });

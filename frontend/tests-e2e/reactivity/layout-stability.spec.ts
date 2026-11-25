@@ -625,7 +625,15 @@ const WIDEST_ROW: Record<string, { pathname: string; patch: (row: Row) => Row; b
 	},
 	'/vendors': {
 		pathname: '/api/vendors',
-		patch: (row) => ({ ...row, status: 'unverified', screening_status: 'review', source: 'erp_sync' }),
+		// `status_actions` offers Verify + Reject, so the row carries its full
+		// set of buttons (and a Verify to put it in the refresh-failed state).
+		patch: (row) => ({
+			...row,
+			status: 'unverified',
+			screening_status: 'review',
+			source: 'erp_sync',
+			status_actions: { verify: null, reject: null }
+		}),
 		badge: '.badge.unverified'
 	},
 	'/purchase-orders': {
@@ -1035,6 +1043,26 @@ test.describe('fixed list tables fit their longest locale', () => {
 					await expect(table.locator('.refusal-note')).toBeVisible();
 				}
 				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
+				if (href === '/vendors') {
+					// A decided row whose re-read failed carries a note + Retry in
+					// its actions cell — the longest thing that cell holds in de /
+					// fr. Reach that state with nothing written: the Verify is
+					// stubbed, and the one-row re-read (`?id=`) fails.
+					await page.route(
+						(url) => /^\/api\/vendors\/[^/]+\/verify$/.test(url.pathname),
+						(route) =>
+							route.fulfill({
+								json: { id: route.request().url().split('/').at(-2), status: 'active' }
+							})
+					);
+					await page.route(
+						(url) => url.pathname === '/api/vendors' && url.searchParams.has('id'),
+						(route) => route.fulfill({ status: 500, json: { detail: 'layout fixture' } })
+					);
+					const first = table.locator('tbody tr').first();
+					await first.locator('td.actions button.variant-success').click();
+					await expect(first.locator('.row-refresh-failed')).toBeVisible();
+				}
 				if (href === '/goods-receipts?tab=inspections') {
 					await expect(table.locator('.badge.partial')).toBeVisible();
 				}

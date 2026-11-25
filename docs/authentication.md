@@ -2801,8 +2801,15 @@ A user who holds `invoice.approve` can set a delegate who receives their approva
   someone the write refuses.
 
 **The screen** is **Profile → Out of office** (`/profile?section=delegation`,
-`frontend/src/lib/components/profile/DelegationPanel.svelte`), for employees
-who hold `invoice.approve`. There is one
+`frontend/src/lib/components/profile/DelegationPanel.svelte`): approvers only.
+The profile rail offers the section, and `?section=delegation` opens it, only
+when `auth.can('invoice.approve')` — `POST` and the candidate list answer 403
+without that permission, and a non-approver opening the link lands on the
+default section. `GET` and `DELETE` stay open, so someone whose grant was
+removed while a delegation was on record still sees it in the panel (if they
+reach it) with only an End button, and the rest reads as approvers-only rather
+than as a load failure. The panel says new invoices go to the delegate when the
+delegate can approve them and otherwise stay with the delegator. There is one
 delegation per person and it starts when saved — the model has an end
 (`delegate_until`) but no start date, so the panel asks only for the last day
 away and the delegation ends at the start of the following day in the reader's
