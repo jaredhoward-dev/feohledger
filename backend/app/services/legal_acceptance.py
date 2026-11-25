@@ -8,9 +8,11 @@ writes ``frontend/src/lib/legal/legalVersions.generated.ts`` from this dict and
 visitor ticks always names the version the backend will record and demand.
 
 Bump a version here when the published document changes in a way users must
-agree to again: every user whose newest acceptance is older then meets the
-blocking re-prompt on their next page load (``GET /api/auth/me`` →
-``legal_acceptance_required``). A typo fix on the page is not a new version.
+agree to again: every user whose newest acceptance is older is then reported
+by ``GET /api/auth/me`` → ``legal_acceptance_required``. That flag is advisory
+today: no client screen reads it and no server-side gate refuses the user yet
+(§495; the re-prompt screen is in ``docs/followups.md``). A typo fix on the page
+is not a new version.
 
 The client sends back the versions it showed; the server refuses anything but
 the current ones (``legal_acceptance_required``), so a stale tab cannot record

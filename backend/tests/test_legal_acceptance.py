@@ -5,14 +5,18 @@ without acceptance of the versions in force and records it against the admin it
 provisions; a set-password link (an account with no password yet) carries the
 acceptance and a forgot-password reset of a password account is not held up;
 `/me` reports `legal_acceptance_required` and `POST /auth/legal-acceptance`
-clears it; the DSAR export carries the rows; a workspace deletion keeps them.
+clears it (rate-limited per account); a repeat acceptance keeps the first
+`accepted_at`; the DSAR export carries the rows; a DSAR erasure and a workspace
+deletion keep them.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import delete, select
@@ -320,8 +324,60 @@ async def test_a_version_bump_reopens_the_gap(realdb, monkeypatch):
         await _drop_rows(realdb, admin_id)
 
 
+async def test_the_accept_endpoint_is_rate_limited_per_account(realdb):
+    from app.api import auth as auth_mod
+    from app.services.rate_limit import RateLimitExceeded
+
+    admin_id = realdb.info("a").users["admin"]
+    await _drop_rows(realdb, admin_id)
+    limiter = AsyncMock(side_effect=RateLimitExceeded(30))
+    try:
+        with patch("app.api.auth.check_rate_limit", new=limiter):
+            async with realdb.client(key="a", role="admin") as c:
+                resp = await c.post("/api/auth/legal-acceptance", json=ACCEPT_CURRENT)
+        assert resp.status_code == 429, resp.text
+        limiter.assert_awaited_once_with(
+            "auth_legal_acceptance",
+            limit=auth_mod.LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE,
+            window_seconds=60,
+            subject=str(admin_id),
+        )
+        # Refused before anything was written.
+        assert await _rows_for(realdb, admin_id) == []
+    finally:
+        await _drop_rows(realdb, admin_id)
+
+
 # ---------------------------------------------------------------------------
-# DSAR export
+# Append-only record
+# ---------------------------------------------------------------------------
+
+
+async def test_a_repeat_acceptance_keeps_one_row_and_the_first_accepted_at(realdb):
+    user_id = await _user(realdb, password=None)
+    first = datetime(2026, 11, 21, 9, 0, tzinfo=UTC)
+    try:
+        for when, source in ((first, "signup"), (first + timedelta(days=3), "reprompt")):
+            async with realdb.control_sessionmaker()() as s:
+                await legal_acceptance.record_acceptances(
+                    s,
+                    user_id=user_id,
+                    organization_id=realdb.info("a").org_id,
+                    versions=CURRENT_LEGAL_VERSIONS,
+                    source=source,
+                    accepted_at=when,
+                )
+                await s.commit()
+        rows = await _rows_for(realdb, user_id)
+        assert len(rows) == 2  # one per document, not one per call
+        assert {r.accepted_at for r in rows} == {first}
+        assert {r.source for r in rows} == {"signup"}
+    finally:
+        await _drop_user(realdb, user_id)
+
+
+# ---------------------------------------------------------------------------
+# DSAR export + erasure
 # ---------------------------------------------------------------------------
 
 
@@ -351,6 +407,39 @@ async def test_the_dsar_export_carries_the_acceptances(realdb):
             )
         exported = plan.head["legal_acceptances"]
         assert {(e["document"], e["version"], e["source"]) for e in exported} == {
+            ("terms", CURRENT_LEGAL_VERSIONS["terms"], "signup"),
+            ("privacy", CURRENT_LEGAL_VERSIONS["privacy"], "signup"),
+        }
+    finally:
+        await _drop_user(realdb, user_id)
+
+
+async def test_a_dsar_erasure_keeps_the_acceptances(realdb):
+    """§495: the rows are the evidence a contract was formed, kept under
+    Art. 17(3)(e); once the user row is redacted they identify no one."""
+    from app.services.privacy_erasure import erase_user
+
+    user_id = await _user(realdb, password=None)
+    org_id = realdb.info("a").org_id
+    try:
+        async with realdb.control_sessionmaker()() as s:
+            await legal_acceptance.record_acceptances(
+                s,
+                user_id=user_id,
+                organization_id=org_id,
+                versions=CURRENT_LEGAL_VERSIONS,
+                source="signup",
+            )
+            await s.commit()
+        async with realdb.control_sessionmaker()() as s:
+            result = await erase_user(subject_id=user_id, organization_id=org_id, control_db=s)
+            await s.commit()
+        assert not result.already_erased
+        async with realdb.control_sessionmaker()() as s:
+            erased = await s.get(User, user_id)
+            assert erased.email.startswith("erased+")
+        rows = await _rows_for(realdb, user_id)
+        assert {(r.document, r.version, r.source) for r in rows} == {
             ("terms", CURRENT_LEGAL_VERSIONS["terms"], "signup"),
             ("privacy", CURRENT_LEGAL_VERSIONS["privacy"], "signup"),
         }

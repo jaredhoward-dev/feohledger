@@ -10,8 +10,8 @@ survives every republish.
 Written by ``services/legal_acceptance.record_acceptances`` from exactly three
 places: signup completion (the acceptance was given on the signup form and
 carried on the verification row), the set-password / reset-password step, and
-``POST /api/auth/legal-acceptance`` (the blocking re-prompt after a version
-changes).
+``POST /api/auth/legal-acceptance`` (the re-prompt's backend, for when a version
+changes; its client screen is not built yet).
 
 No foreign keys, deliberately, like ``workspace_closures``: the row is evidence
 of a contract being formed and must outlive the user row an erasure redacts or

@@ -25272,9 +25272,27 @@ nothing, so there was no evidence any customer agreed, nor to which text.
   carry it, checked before the token is consumed so a refusal leaves the link
   usable; the check endpoint says whether to show the box. A forgot-password
   reset of an account that already has a password is not held up — its owner
-  meets the re-prompt after signing in. `GET /api/auth/me` reports
-  `legal_acceptance_required` and `POST /api/auth/legal-acceptance` records
-  it (the re-prompt's backend; its SPA screen is a followup).
+  is left to the re-prompt after signing in (not built yet; see below).
+  `GET /api/auth/me` reports `legal_acceptance_required` and
+  `POST /api/auth/legal-acceptance` records it (the re-prompt's backend,
+  rate-limited per account; its screen is a followup).
+- **`/complete` records what `/start` validated, never the current version.**
+  The versions come off the verification row, with the moment the form was
+  submitted as `accepted_at`. If a version is bumped between the two calls the
+  row still names the text the visitor actually saw; writing
+  `CURRENT_LEGAL_VERSIONS` there instead would record acceptance of a text
+  nobody showed them, which is false evidence. A verification carrying no
+  acceptance (created before this) records none.
+- **Enforcement scope today: signup and a first password set only.** Those are
+  the only two places that refuse without acceptance. `legal_acceptance_required`
+  on `/me` is advisory: nothing in the web app or the mobile app reads it yet,
+  and no server-side check refuses an unaccepted user, so existing users, SSO /
+  SCIM users, a forgot-password reset of a password account, mobile and API
+  callers are not yet prompted or gated. The server gate waits for the accept
+  screen on purpose: a gate with no screen to clear it would lock out every
+  mobile, SSO and API user with no way to accept. Order and triggers:
+  `docs/followups.md` (the re-prompt entry); the retention horizon is a
+  separate entry there.
 - **Storage.** Control-plane `legal_acceptances` (migration 0143): user id,
   organisation id, document, version, `accepted_at`, and the control used
   (`signup` / `set_password` / `reprompt`). Append-only, unique per (user,
@@ -25285,10 +25303,12 @@ nothing, so there was no evidence any customer agreed, nor to which text.
   workspace deletion exempts the table (`CONTROL_TABLES_EXEMPT`). They are
   the evidence a contract was formed, retained for the establishment or
   defence of legal claims (GDPR Art. 17(3)(e)), and once the user row is
-  redacted or deleted they identify no one. The DSAR export carries them
-  (`legal_acceptances`, a counted section).
+  redacted or deleted they identify no one. No horizon is set yet (a CISO /
+  Security Analyst decision, tracked in `docs/followups.md`). The DSAR export
+  carries them (`legal_acceptances`, a counted section).
 - **No backfill.** Nobody accepted anything before this; an invented row
-  would be false evidence. Existing users meet the re-prompt.
+  would be false evidence. Existing users are reported by `/me`'s flag and
+  meet the re-prompt once its screen exists.
 
 **Rejected.** *Browsewrap* (the sentence beside the button): not an accept
 control, and records nothing. *Versions owned by the frontend*: the backend
