@@ -59,6 +59,7 @@
 		type InvoiceActionVerdicts
 	} from '#lib/api/invoices.ts';
 	import { isAllowed, isOffered, refusalText } from '#lib/api/actionVerdicts.ts';
+	import RefusalNote from '#lib/components/ui/RefusalNote.svelte';
 	import { assignedElsewhere } from '#lib/utils/reviewAssignment.ts';
 	import RecallApprovalModal from '#lib/components/modals/RecallApprovalModal.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
@@ -3042,6 +3043,36 @@
 				{/if}
 
 					<div class="footer-right">
+						{#if (canSubmit && (submitRefusal || awaitingApprover)) || (resubmitOffered && resubmitRefusal) || (recallOffered && recallRefusal)}
+							<!-- Why a footer action is refused, on its own line ABOVE the
+							     buttons (ui/RefusalNote, ui-patterns § Showing the reason);
+							     each refused button names its note in aria-describedby. -->
+							<div class="footer-refusals">
+								{#if canSubmit && submitRefusal}
+									<!-- The server's reason Submit would be refused (an ERP export
+									     gate, a clerk past the entry window), localized from its
+									     code, instead of a 409 after the click. -->
+									<RefusalNote id="submit-refusal" reason={refusalText(submitRefusal, m)} testid="submit-refusal" />
+								{:else if canSubmit && awaitingApprover}
+									<!-- The one reason Submit is disabled that the reader can fix
+									     here: say so rather than leaving it greyed. -->
+									<RefusalNote
+										id="approver-required-hint"
+										reason={m('invoices.modal.approverRequiredHint')}
+										testid="approver-required-hint"
+									/>
+								{/if}
+								{#if resubmitOffered && resubmitRefusal}
+									<RefusalNote id="resubmit-refusal" reason={refusalText(resubmitRefusal, m)} testid="resubmit-refusal" />
+								{/if}
+								{#if recallOffered && recallRefusal}
+									<!-- Why the approval can't be taken back, from the server's
+									     verdict: a bill the ERP may hold, a rail paying it, a
+									     PEPPOL transmission or an inter-company pair. -->
+									<RefusalNote id="recall-refusal" reason={refusalText(recallRefusal, m)} testid="recall-refusal" />
+								{/if}
+							</div>
+						{/if}
 						<button type="button" class="btn-cancel" onclick={onclose}>{m('common.cancel')}</button>
 						{#if canExtract || extracting}
 							<button type="button" class="btn-secondary" disabled={extracting} onclick={handleExtract}>
@@ -3097,20 +3128,6 @@
 							>
 								{submitting ? m('invoices.modal.submitting') : submitLabel}
 							</button>
-							{#if submitRefusal}
-								<!-- The server's reason Submit would be refused (an ERP export
-								     gate, a clerk past the entry window), localized from its
-								     code, instead of a 409 after the click. -->
-								<p class="approver-hint" id="submit-refusal" data-testid="submit-refusal">
-									{refusalText(submitRefusal, m)}
-								</p>
-							{:else if awaitingApprover}
-								<!-- The one reason Submit is disabled that the reader can fix
-								     here: say so beside the button rather than leaving it greyed. -->
-								<p class="approver-hint" id="approver-required-hint" data-testid="approver-required-hint">
-									{m('invoices.modal.approverRequiredHint')}
-								</p>
-							{/if}
 						{/if}
 						{#if resubmitOffered}
 							<button
@@ -3123,11 +3140,6 @@
 							>
 								{resubmitting ? m('invoices.modal.submitting') : m('invoices.modal.submit.resubmit')}
 							</button>
-							{#if resubmitRefusal}
-								<p class="approver-hint" id="resubmit-refusal" data-testid="resubmit-refusal">
-									{refusalText(resubmitRefusal, m)}
-								</p>
-							{/if}
 						{/if}
 						{#if recallOffered}
 							<button
@@ -3140,13 +3152,6 @@
 							>
 								{m('invoices.modal.recall.open')}
 							</button>
-							{#if recallRefusal}
-								<!-- Why the approval can't be taken back, from the server's
-								     verdict: a bill the ERP may hold, or a rail paying it. -->
-								<p class="approver-hint" id="recall-refusal" data-testid="recall-refusal">
-									{refusalText(recallRefusal, m)}
-								</p>
-							{/if}
 						{/if}
 					</div>
 				</footer>
@@ -3778,19 +3783,13 @@
 	/* Shown in place of the picker when there is no reviewer to offer —
 	   explains what Submit will do rather than leaving a bare disabled button. */
 	.approver-note,
-	.approver-hint {
-		margin: 0;
-		max-width: 320px;
-		font-size: 0.78rem;
-		line-height: 1.35;
-		color: var(--text-muted);
-	}
-
-	/* Its own line under the buttons, right-aligned beside Submit. */
-	.approver-hint {
+	/* The refused footer actions' reasons: one full-width line above the
+	   buttons, right-aligned over them. */
+	.footer-refusals {
 		flex-basis: 100%;
-		max-width: none;
-		text-align: right;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
 	}
 
 	/* E-invoice section + its format dropdown */

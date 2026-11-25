@@ -108,10 +108,16 @@ test.describe('invoice modal — recall an approval', () => {
 		const id = await createApproved(page, number, { erpBill: true });
 		const modal = await openWithVerdict(page, id, number);
 
-		await expect(modal.getByTestId('recall-approval')).toBeDisabled();
-		await expect(modal.getByTestId('recall-refusal')).toHaveText(
-			"The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can't be recalled from FeohLedger."
-		);
+		const recall = modal.getByTestId('recall-approval');
+		const reason = modal.getByTestId('recall-refusal');
+		const sentence =
+			"The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can't be recalled from FeohLedger.";
+		await expect(recall).toBeDisabled();
+		await expect(reason).toHaveText(sentence);
+		// The shared RefusalNote: named by the button, on its own line above it.
+		await expect(recall).toHaveAccessibleDescription(sentence);
+		const [noteBox, buttonBox] = await Promise.all([reason.boundingBox(), recall.boundingBox()]);
+		expect(noteBox!.y + noteBox!.height).toBeLessThanOrEqual(buttonBox!.y);
 	});
 
 	test('an invoice already sent over PEPPOL disables Recall and says why', async ({ page }) => {
