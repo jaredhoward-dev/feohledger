@@ -63,7 +63,9 @@ def mock_card_event(
 
 def sign_mock_card_event(secret: str, raw_body: bytes) -> str:
     """The hex HMAC-SHA256 the webhook checks (``webhook_security
-    .verify_hmac_sha256``), the same scheme as a real provider's delivery."""
+    .verify_hmac_sha256``) in ``Webhook-Signature``. The mock's own scheme:
+    Lithic and Nium each authenticate their deliveries their own way
+    (decisions §555), and neither is this."""
     return hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
 
 
