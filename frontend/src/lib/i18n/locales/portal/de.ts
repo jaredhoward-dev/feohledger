@@ -23,6 +23,7 @@ export const messages = {
 	'portal.nav.notifications': 'Benachrichtigungen',
 	'portal.shell.logOut': 'Abmelden',
 	'portal.shell.footerSupport': 'Support',
+	'portal.privacyAck.support': 'Fragen? Support kontaktieren',
 	'portal.shell.footerLegal': 'Rechtliches',
 	'portal.shell.footerPlatformLegal': 'Datenschutz & Bedingungen',
 	'portal.login.subtitle': 'Melden Sie sich an, um Rechnungen einzureichen und Zahlungen einzusehen',

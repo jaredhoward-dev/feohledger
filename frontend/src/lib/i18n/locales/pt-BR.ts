@@ -91,7 +91,7 @@ export const messages = {
 	'shell.legalAccept.continue': 'Aceitar e continuar',
 	'shell.legalAccept.continuing': 'Salvando…',
 	'shell.legalAccept.failed': 'Sua aceitação não foi salva. Tente novamente.',
-	'shell.privacyAck.heading': 'Confirme que leu nossa política de privacidade',
+	'shell.privacyAck.heading': 'Confirme que leu a política de privacidade da plataforma',
 	'shell.privacyAck.body': 'Antes de continuar, leia a política de privacidade vigente, que explica como a plataforma trata os dados que você informa aqui. Se preferir não fazer isso, saia.',
 	'shell.privacyAck.continue': 'Confirmar e continuar',
 	'shell.privacyAck.failed': 'Sua confirmação não foi salva. Tente novamente.',

@@ -89,7 +89,7 @@ export const messages = {
 	'shell.legalAccept.continue': 'Aceptar y continuar',
 	'shell.legalAccept.continuing': 'Guardando…',
 	'shell.legalAccept.failed': 'No se guardó tu aceptación. Inténtalo de nuevo.',
-	'shell.privacyAck.heading': 'Confirma que has leído nuestra política de privacidad',
+	'shell.privacyAck.heading': 'Confirma que has leído la política de privacidad de la plataforma',
 	'shell.privacyAck.body': 'Antes de continuar, lee la política de privacidad vigente, que explica cómo trata la plataforma los datos que introduces aquí. Si prefieres no hacerlo, cierra sesión.',
 	'shell.privacyAck.continue': 'Confirmar y continuar',
 	'shell.privacyAck.failed': 'No se guardó tu confirmación. Inténtalo de nuevo.',

@@ -24,6 +24,7 @@ export const enPortal = {
 	'portal.nav.notifications': 'Notifications',
 	'portal.shell.logOut': 'Log out',
 	'portal.shell.footerSupport': 'Support',
+	'portal.privacyAck.support': 'Questions? Contact support',
 	'portal.shell.footerLegal': 'Legal',
 	'portal.shell.footerPlatformLegal': 'Privacy & terms',
 

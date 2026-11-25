@@ -26,6 +26,7 @@ export const messages = {
 	'portal.nav.notifications': '通知',
 	'portal.shell.logOut': 'ログアウト',
 	'portal.shell.footerSupport': 'サポート',
+	'portal.privacyAck.support': 'ご不明な点はサポートへお問い合わせください',
 	'portal.shell.footerLegal': '法的情報',
 	'portal.shell.footerPlatformLegal': 'プライバシーと利用規約',
 

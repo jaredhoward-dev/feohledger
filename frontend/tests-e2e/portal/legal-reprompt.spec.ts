@@ -26,7 +26,7 @@ import { PRIVACY_VERSION } from '#lib/legal/legalVersions.generated.ts';
 const PORTAL_EMAIL = 'supplier@portal.test';
 const PORTAL_PASSWORD = 'demo';
 const STEP = '[data-testid="legal-accept-step"]';
-const HEADING = 'Confirm you have read our Privacy Policy';
+const HEADING = "Confirm you have read the platform's Privacy Policy";
 const ACK_BOX = /I have read the Privacy Policy/;
 const CONTINUE = 'Confirm and continue';
 
@@ -183,6 +183,64 @@ test.describe('Supplier portal — Privacy Policy re-prompt', () => {
 			'Too many attempts. Wait 45 seconds and try again.'
 		);
 		await expect(page.locator('.portal-header')).toHaveCount(0);
+	});
+
+	test('a tenant with a product name and no logo is named on the step, with its support link', async ({
+		page
+	}) => {
+		const SUPPORT = 'https://support.e2e.test/help';
+		// The public brand read answered here, so the worker tenant's brand is
+		// never written.
+		await page.route(
+			(url) => url.pathname === '/api/portal/branding',
+			(route) =>
+				route.fulfill({
+					json: {
+						product_name: 'Monogram Payables',
+						logo_url: '',
+						accent_color: '',
+						accent_strong_color: '',
+						support_url: SUPPORT,
+						legal_url: ''
+					}
+				})
+		);
+		await forceStep(page);
+		await portalSignIn(page);
+
+		const step = page.locator(STEP);
+		await expect(step.getByTestId('legal-step-product')).toHaveText('Monogram Payables');
+		// The heading names the platform's policy, not the tenant's.
+		await expect(page.getByRole('heading', { level: 1, name: HEADING })).toBeVisible();
+		const support = step.getByRole('link', { name: 'Questions? Contact support' });
+		await expect(support).toHaveAttribute('href', SUPPORT);
+		await expect(support).toHaveAttribute('target', '_blank');
+	});
+
+	test('on the platform brand the step shows no product name and no support link', async ({
+		page
+	}) => {
+		await page.route(
+			(url) => url.pathname === '/api/portal/branding',
+			(route) =>
+				route.fulfill({
+					json: {
+						product_name: '',
+						logo_url: '',
+						accent_color: '',
+						accent_strong_color: '',
+						support_url: '',
+						legal_url: ''
+					}
+				})
+		);
+		await forceStep(page);
+		await portalSignIn(page);
+
+		const step = page.locator(STEP);
+		await expect(page.getByRole('heading', { level: 1, name: HEADING })).toBeVisible();
+		await expect(step.getByTestId('legal-step-product')).toHaveCount(0);
+		await expect(step.getByTestId('legal-step-support')).toHaveCount(0);
 	});
 
 	test('Log out leaves the step for the portal sign-in page', async ({ page }) => {
