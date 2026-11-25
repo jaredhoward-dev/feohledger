@@ -875,6 +875,35 @@ describe('recalling an approval (decisions §374)', () => {
 	});
 });
 
+describe('voiding a flagged bill in the ERP (decisions §539, §542)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states every refusal the void door and its verdict answer with, in all six locales', () => {
+		const codes: [string, string][] = [
+			['erp_void_not_flagged', 'refusal.erpVoidNotFlagged'],
+			['erp_void_no_bill', 'refusal.erpVoidNoBill'],
+			['erp_void_claimed', 'refusal.erpVoidClaimed'],
+			['erp_void_bill_paid', 'refusal.erpVoidBillPaid'],
+			['erp_void_bill_settled', 'refusal.erpVoidBillSettled'],
+			['erp_void_draft_only', 'refusal.erpVoidDraftOnly'],
+			['erp_void_unsupported', 'refusal.erpVoidUnsupported'],
+			['erp_void_rejected', 'refusal.erpVoidRejected'],
+			['erp_void_failed', 'refusal.erpVoidFailed'],
+			['erp_void_unconfirmed', 'refusal.erpVoidUnconfirmed']
+		];
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			for (const [code, key] of codes) {
+				expect(cat[key], `${loc} ${key}`).toBeTruthy();
+				expect(codedRefusalText(code, {}, t)).toBe(cat[key]);
+			}
+		}
+		// An unconfirmed void must not claim nothing changed.
+		expect(en['refusal.erpVoidUnconfirmed']).not.toMatch(/nothing was changed/i);
+	});
+});
+
 describe('the ERP send refused because of the vendor', () => {
 	it('states the 409 the send doors answer with, per hold', () => {
 		expect(
