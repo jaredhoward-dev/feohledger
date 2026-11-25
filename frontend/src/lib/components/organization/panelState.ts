@@ -34,6 +34,31 @@ export interface InvoiceDefaultsFields {
 	defaultCostCenter: string;
 }
 
+/** Organization → Branding (white-label, `settings.brand`). See docs/white-label.md. */
+export interface BrandingFields {
+	productName: string;
+	logoUrl: string;
+	accentColor: string;
+	accentStrongColor: string;
+	supportUrl: string;
+	legalUrl: string;
+	/**
+	 * Per-tenant base URL stamped into outbound emails (approval links, portal
+	 * invites, signup confirmations). Empty ⇒ the platform default. `{slug}` in
+	 * the value is optional: substituted when present, used verbatim when not.
+	 * See docs/white-label.md § Tenant URL.
+	 */
+	tenantUrlTemplate: string;
+	/**
+	 * Deliberately a SEPARATE field from the one above: this value is
+	 * registered at the customer's IdP, so changing it is an operator-sequenced
+	 * migration (add the new URI at the IdP first, verify a real login, then
+	 * remove the old one) rather than a preference. Folding the two would mean
+	 * fixing invite links silently breaks SSO.
+	 */
+	ssoCallbackBaseUrl: string;
+}
+
 /**
  * Organization → Virtual cards (`settings.cards`). `apiKey` / `clientSecret`
  * are write-only credentials: they start empty and hold only what the admin

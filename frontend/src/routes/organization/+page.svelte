@@ -57,6 +57,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import BrandingPanel from '#lib/components/organization/BrandingPanel.svelte';
 	import CardsPanel from '#lib/components/organization/CardsPanel.svelte';
 	import SecurityPanel from '#lib/components/organization/SecurityPanel.svelte';
 	import PlanPanel from '#lib/components/organization/PlanPanel.svelte';
@@ -65,6 +66,7 @@
 	import InvoiceDefaultsPanel from '#lib/components/organization/InvoiceDefaultsPanel.svelte';
 	import {
 		cardAutoProvider,
+		type BrandingFields,
 		type CardsFields,
 		type CompanyFields,
 		type InvoiceDefaultsFields
@@ -642,14 +644,14 @@
 				| Record<string, unknown>
 				| undefined;
 			if (brandCfg) {
-				brandProductName = (brandCfg.product_name as string) || '';
-				brandLogoUrl = (brandCfg.logo_url as string) || '';
-				brandAccentColor = (brandCfg.accent_color as string) || '';
-				brandAccentStrongColor = (brandCfg.accent_strong_color as string) || '';
-				brandSupportUrl = (brandCfg.support_url as string) || '';
-				brandLegalUrl = (brandCfg.legal_url as string) || '';
-				brandTenantUrlTemplate = (brandCfg.tenant_url_template as string) || '';
-				brandSsoCallbackBaseUrl = (brandCfg.sso_callback_base_url as string) || '';
+				branding.productName = (brandCfg.product_name as string) || '';
+				branding.logoUrl = (brandCfg.logo_url as string) || '';
+				branding.accentColor = (brandCfg.accent_color as string) || '';
+				branding.accentStrongColor = (brandCfg.accent_strong_color as string) || '';
+				branding.supportUrl = (brandCfg.support_url as string) || '';
+				branding.legalUrl = (brandCfg.legal_url as string) || '';
+				branding.tenantUrlTemplate = (brandCfg.tenant_url_template as string) || '';
+				branding.ssoCallbackBaseUrl = (brandCfg.sso_callback_base_url as string) || '';
 			}
 		} catch {
 			// In place, not a toast: the toast faded and left the loading line.
@@ -1114,31 +1116,17 @@
 
 	// ── White-label branding ────────────────────────────────────────────
 	import { brand } from '#lib/stores/brand.svelte.ts';
-	import {
-		accentStrongContrast,
-		accentTextContrast,
-		THEME_NAMES
-	} from '#lib/stores/brandTheme.ts';
-	import { formatRatio, WCAG_AA_NORMAL } from '#lib/a11y/contrast.ts';
-	import FieldWarning from '#lib/components/ui/FieldWarning.svelte';
 
-	let brandProductName = $state('');
-	let brandLogoUrl = $state('');
-	let brandAccentColor = $state('');
-	let brandAccentStrongColor = $state('');
-	let brandSupportUrl = $state('');
-	let brandLegalUrl = $state('');
-	// Per-tenant base URL stamped into outbound emails (approval links, portal
-	// invites, signup confirmations). Empty ⇒ the platform default below.
-	// `{slug}` in the value is optional: substituted when present, used
-	// verbatim when not. See docs/white-label.md § Tenant URL.
-	let brandTenantUrlTemplate = $state('');
-	// Deliberately a SEPARATE field from the one above: this value is registered
-	// at the customer's IdP, so changing it is an operator-sequenced migration
-	// (add the new URI at the IdP first, verify a real login, then remove the
-	// old one) rather than a preference. Folding the two would mean fixing
-	// invite links silently breaks SSO.
-	let brandSsoCallbackBaseUrl = $state('');
+	let branding = $state<BrandingFields>({
+		productName: '',
+		logoUrl: '',
+		accentColor: '',
+		accentStrongColor: '',
+		supportUrl: '',
+		legalUrl: '',
+		tenantUrlTemplate: '',
+		ssoCallbackBaseUrl: ''
+	});
 	let savingBranding = $state(false);
 
 	// The PLATFORM default (`FEOH_TENANT_URL_TEMPLATE`), read from the public
@@ -1146,18 +1134,6 @@
 	// actually resolves to rather than describing it in the abstract. The org
 	// override is what we save; this is only ever displayed.
 	let platformTenantUrlTemplate = $state('');
-
-	/** Resolve a `{slug}` template against this tenant. */
-	function resolveTenantUrl(template: string): string {
-		const t = (template || '').trim();
-		if (!t) return '';
-		return t.replace(/\{slug\}/g, org?.slug ?? '');
-	}
-
-	const defaultTenantUrl = $derived(resolveTenantUrl(platformTenantUrlTemplate));
-	const effectiveTenantUrl = $derived(
-		resolveTenantUrl(brandTenantUrlTemplate) || defaultTenantUrl
-	);
 
 	async function loadPlatformTenantUrl() {
 		try {
@@ -1170,42 +1146,24 @@
 	}
 
 	const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
-	// Default accent tokens (mirror src/app.css :root) so the color pickers show
-	// the live default when the org hasn't set one — without writing it back.
-	const DEFAULT_ACCENT = '#638cff';
-	const DEFAULT_ACCENT_STRONG = '#3f5fd6';
-
-	// The strong accent is written straight into the `--accent-strong` custom
-	// property, whose one contract is that white text sits on it. Warn while
-	// the field is still being edited; the backend accepts any valid hex and
-	// the brand is the tenant's call, so this advises rather than blocks.
-	const accentStrongRatio = $derived(accentStrongContrast(brandAccentStrongColor));
-	const accentStrongFails = $derived(
-		accentStrongRatio !== null && accentStrongRatio < WCAG_AA_NORMAL
-	);
-	// `accent_color` is also small text (links, the active tab), and no colour
-	// reads at 4.5:1 on both palettes' surfaces. Each theme shows the least
-	// shade of it that does (`themeAccent`, decisions §478); say so per theme,
-	// with the shade, so the change to the brand is never silent.
-	const accentText = $derived(accentTextContrast(brandAccentColor));
 
 	async function saveBranding() {
 		// Client-side validation mirroring the backend BrandConfig guards, so a
 		// typo surfaces inline instead of as a 422.
-		if (brandAccentColor.trim() && !HEX_RE.test(brandAccentColor.trim())) {
+		if (branding.accentColor.trim() && !HEX_RE.test(branding.accentColor.trim())) {
 			toast(m('org.branding.toast.accentInvalid'), 'error');
 			return;
 		}
-		if (brandAccentStrongColor.trim() && !HEX_RE.test(brandAccentStrongColor.trim())) {
+		if (branding.accentStrongColor.trim() && !HEX_RE.test(branding.accentStrongColor.trim())) {
 			toast(m('org.branding.toast.accentStrongInvalid'), 'error');
 			return;
 		}
 		for (const [label, val] of [
-			[m('org.branding.label.logoUrl'), brandLogoUrl],
-			[m('org.branding.label.supportUrl'), brandSupportUrl],
-			[m('org.branding.label.legalUrl'), brandLegalUrl],
-			[m('org.branding.label.tenantUrl'), brandTenantUrlTemplate],
-			[m('org.branding.label.ssoCallback'), brandSsoCallbackBaseUrl],
+			[m('org.branding.label.logoUrl'), branding.logoUrl],
+			[m('org.branding.label.supportUrl'), branding.supportUrl],
+			[m('org.branding.label.legalUrl'), branding.legalUrl],
+			[m('org.branding.label.tenantUrl'), branding.tenantUrlTemplate],
+			[m('org.branding.label.ssoCallback'), branding.ssoCallbackBaseUrl],
 		] as const) {
 			if (val.trim() && !/^https?:\/\//i.test(val.trim())) {
 				toast(m('org.branding.toast.urlInvalid', { label }), 'error');
@@ -1215,19 +1173,19 @@
 		savingBranding = true;
 		try {
 			await api.put('/api/organization/branding', {
-				product_name: brandProductName.trim(),
-				logo_url: brandLogoUrl.trim(),
-				accent_color: brandAccentColor.trim(),
-				accent_strong_color: brandAccentStrongColor.trim(),
-				support_url: brandSupportUrl.trim(),
-				legal_url: brandLegalUrl.trim(),
-				tenant_url_template: brandTenantUrlTemplate.trim(),
+				product_name: branding.productName.trim(),
+				logo_url: branding.logoUrl.trim(),
+				accent_color: branding.accentColor.trim(),
+				accent_strong_color: branding.accentStrongColor.trim(),
+				support_url: branding.supportUrl.trim(),
+				legal_url: branding.legalUrl.trim(),
+				tenant_url_template: branding.tenantUrlTemplate.trim(),
 				// Sent explicitly on every save. The backend carries an OMITTED
 				// value forward precisely so a client that doesn't know about this
 				// field can't wipe an IdP-registered callback; since this panel
 				// does know about it, sending the current value keeps "clear the
 				// box and save" working as the documented rollback.
-				sso_callback_base_url: brandSsoCallbackBaseUrl.trim(),
+				sso_callback_base_url: branding.ssoCallbackBaseUrl.trim(),
 			});
 			// Refresh the live brand store so the sidebar logo/name + theme update
 			// without a reload.
@@ -1976,152 +1934,13 @@
 				{/if}
 
 				{#if section === 'branding'}
-					<section class="card" id="org-branding">
-						<h2>{m('org.section.branding')}</h2>
-						<p class="card-hint">
-							{m('org.branding.hint')}
-						</p>
-						<div class="form-grid">
-							<label>
-								<span>{m('org.branding.productName')}</span>
-								<input
-									type="text"
-									bind:value={brandProductName}
-									placeholder={m('org.branding.productNamePlaceholder')}
-									maxlength="120"
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.logoUrl')}</span>
-								<input
-									type="url"
-									bind:value={brandLogoUrl}
-									placeholder={m('org.branding.logoUrlPlaceholder')}
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.accentColor')}</span>
-								<span class="color-field">
-									<input
-										type="color"
-										aria-label={m('org.branding.accentColorPicker')}
-										value={brandAccentColor.trim() || DEFAULT_ACCENT}
-										oninput={(e) => (brandAccentColor = e.currentTarget.value)}
-									/>
-									<input
-										type="text"
-										bind:value={brandAccentColor}
-										placeholder={DEFAULT_ACCENT}
-									/>
-								</span>
-								{#each THEME_NAMES as theme (theme)}
-									{@const verdict = accentText?.[theme]}
-									<FieldWarning
-										show={!!verdict && !verdict.meetsAA}
-										testId={`accent-text-contrast-${theme}`}
-										message={m(
-											theme === 'light'
-												? 'org.branding.accentTextLight'
-												: 'org.branding.accentTextDark',
-											{
-												ratio: verdict ? formatRatio(verdict.ratio) : '',
-												applied: verdict?.applied ?? ''
-											}
-										)}
-									/>
-								{/each}
-							</label>
-							<label>
-								<span>{m('org.branding.accentStrong')}</span>
-								<span class="color-field">
-									<input
-										type="color"
-										aria-label={m('org.branding.accentStrongPicker')}
-										value={brandAccentStrongColor.trim() || DEFAULT_ACCENT_STRONG}
-										oninput={(e) => (brandAccentStrongColor = e.currentTarget.value)}
-									/>
-									<input
-										type="text"
-										bind:value={brandAccentStrongColor}
-										placeholder={DEFAULT_ACCENT_STRONG}
-									/>
-								</span>
-								<FieldWarning
-									show={accentStrongFails}
-									testId="accent-strong-contrast-warning"
-									message={m('common.contrastWarning', {
-										ratio: accentStrongRatio === null ? '' : formatRatio(accentStrongRatio)
-									})}
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.supportUrl')}</span>
-								<input
-									type="url"
-									bind:value={brandSupportUrl}
-									placeholder={m('org.branding.supportUrlPlaceholder')}
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.legalUrl')}</span>
-								<input
-									type="url"
-									bind:value={brandLegalUrl}
-									placeholder={m('org.branding.legalUrlPlaceholder')}
-								/>
-							</label>
-							<div class="full-width">
-								<label>
-									<span>{m('org.branding.tenantUrl')}</span>
-									<input
-										type="text"
-										bind:value={brandTenantUrlTemplate}
-										placeholder={defaultTenantUrl || m('org.branding.tenantUrlPlaceholder')}
-										autocomplete="off"
-										spellcheck="false"
-										aria-describedby="brand-tenant-url-hint"
-									/>
-								</label>
-								<p class="field-hint" id="brand-tenant-url-hint">
-									{m('org.branding.tenantUrlHint')}
-									<span class="tenant-url-effective" data-testid="tenant-url-effective">
-										{#if brandTenantUrlTemplate.trim()}
-											{m('org.branding.tenantUrlEffective', { url: effectiveTenantUrl })}
-										{:else if defaultTenantUrl}
-											{m('org.branding.tenantUrlDefault', { url: defaultTenantUrl })}
-										{:else}
-											{m('org.branding.tenantUrlDefaultUnknown')}
-										{/if}
-									</span>
-								</p>
-							</div>
-							<div class="full-width">
-								<label>
-									<span>{m('org.branding.ssoCallback')}</span>
-									<input
-										type="text"
-										bind:value={brandSsoCallbackBaseUrl}
-										placeholder={m('org.branding.ssoCallbackPlaceholder')}
-										autocomplete="off"
-										spellcheck="false"
-										aria-describedby="brand-sso-callback-hint"
-									/>
-								</label>
-								<p class="field-hint sso-callback-hint" id="brand-sso-callback-hint">
-									<strong>{m('org.branding.ssoCallbackWarning')}</strong>
-									{m('org.branding.ssoCallbackHint')}
-								</p>
-							</div>
-						</div>
-						<p class="card-hint">
-							{m('org.branding.strongHint')}
-						</p>
-						<div class="section-footer">
-							<button class="btn-save-section" disabled={savingBranding} onclick={saveBranding}>
-								{savingBranding ? m('org.common.saving') : m('org.branding.save')}
-							</button>
-						</div>
-					</section>
+					<BrandingPanel
+						bind:fields={branding}
+						slug={org?.slug ?? ''}
+						{platformTenantUrlTemplate}
+						saving={savingBranding}
+						onsave={saveBranding}
+					/>
 				{/if}
 
 				{#if section === 'custom-domains'}
@@ -3539,45 +3358,19 @@
 		line-height: 1.5;
 	}
 
-	.tenant-url-effective {
-		display: block;
-		color: var(--text);
-	}
-
 	label {
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
 	}
 
-	/* The field label only — not the .color-field wrapper span (reset below). */
+	/* The field label only (the first span of a <label>). */
 	label > span:first-child {
 		font-size: 0.78rem;
 		font-weight: 500;
 		color: var(--text-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.03em;
-	}
-
-	/* Branding color picker: native swatch + hex text input side by side. */
-	.color-field {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		text-transform: none;
-		letter-spacing: normal;
-	}
-
-	.color-field input[type='color'] {
-		width: 40px;
-		height: 36px;
-		padding: 2px;
-		flex-shrink: 0;
-		cursor: pointer;
-	}
-
-	.color-field input[type='text'] {
-		flex: 1;
 	}
 
 	/* Custom domains */
