@@ -7,6 +7,7 @@ import type { MessageKey } from '#lib/i18n/messages.ts';
 vi.mock('#lib/i18n/store.svelte.ts', () => ({ hasMessage: () => false }));
 
 const { DYNAMIC_ACTION_TEMPLATES, auditActionKey, auditActionLabel } = await import('./auditActions');
+const { INVOICE_TIMELINE_LABEL_KEYS, invoiceTimelineActionLabel } = await import('./invoiceTimelineActions');
 
 /**
  * Roster guard: every `AuditLog.action` token the backend writes has a label
@@ -159,6 +160,46 @@ describe('audit action roster', () => {
 		for (const t of tokens) {
 			expect(EN[`audit.action.${t}`]?.trim().length, `${t} has a blank label`).toBeGreaterThan(0);
 		}
+	});
+});
+
+describe('invoice timeline labels', () => {
+	// The invoice modal's Activity timeline shows every audit row correlated to
+	// the invoice (its own events plus the exception, chat and ERP rows keyed to
+	// it), so it must label the same vocabulary /audit does (decisions §522).
+	const t = (key: MessageKey) => EN[key] ?? key;
+
+	it('every backend action token renders labelled, never raw', () => {
+		const raw = tokens.filter((tok) => invoiceTimelineActionLabel(tok, t, hasEn) === tok);
+		expect(raw, 'the invoice timeline would show these tokens raw').toEqual([]);
+	});
+
+	it('labels the ERP events it once showed raw', () => {
+		expect(invoiceTimelineActionLabel('invoice.erp_failed', t, hasEn)).toBe('ERP send failed');
+		expect(invoiceTimelineActionLabel('invoice.erp_retried', t, hasEn)).toBe('ERP send retried');
+		expect(invoiceTimelineActionLabel('invoice.erp_budget_resend_refused', t, hasEn)).not.toBe(
+			'invoice.erp_budget_resend_refused'
+		);
+	});
+
+	it('prefers the invoice-voice override, each of which names a real key', () => {
+		for (const [tok, key] of Object.entries(INVOICE_TIMELINE_LABEL_KEYS)) {
+			expect(EN[key]?.trim().length, `${tok} → ${key}`).toBeGreaterThan(0);
+			expect(invoiceTimelineActionLabel(tok, t, hasEn)).toBe(EN[key]);
+		}
+	});
+
+	it('overrides only tokens the backend writes', () => {
+		// A literal token, or one an f-string template builds (`audit.viewed`
+		// comes from `{entity_type}.viewed`).
+		const shapes = templates.map((tpl) => new RegExp(`^${tpl.replace(/\{[^}]*\}/g, '[a-z_]+').replaceAll('.', '\\.')}$`));
+		const written = (tok: string) => tokens.includes(tok) || shapes.some((re) => re.test(tok));
+		const stale = Object.keys(INVOICE_TIMELINE_LABEL_KEYS).filter((tok) => !written(tok));
+		expect(stale, 'override for a token no backend code writes').toEqual([]);
+	});
+
+	it('renders an unknown token raw', () => {
+		expect(invoiceTimelineActionLabel('something.new_and_unlabelled', t, hasEn)).toBe('something.new_and_unlabelled');
 	});
 });
 
