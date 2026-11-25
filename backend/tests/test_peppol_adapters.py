@@ -505,7 +505,11 @@ async def test_mock_lookup_answers_what_its_send_produced():
             None,
             "rejected",
         ),
-        (_FakeResponse({}, 404), "not_found", None, None),
+        (_FakeResponse({"status": "not_found"}, 404), "not_found", None, None),
+        # A bare 404 is what a gateway WITHOUT this route answers for every
+        # key: never read as "not found" (that resends a delivered document).
+        (_FakeResponse({}, 404), "unknown", None, "gateway_error:404"),
+        (_FakeResponse(None, 404, raise_json=True), "unknown", None, "gateway_error:404"),
         (_FakeResponse({}, 503), "unknown", None, "gateway_error:503"),
         (_FakeResponse({"status": "queued"}), "unknown", None, "gateway_status_unknown"),
         (_FakeResponse(None, raise_json=True), "unknown", None, "gateway_status_unknown"),
