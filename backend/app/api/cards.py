@@ -112,6 +112,7 @@ def _classify_card_event(event_type: str) -> tuple[bool, bool]:
             "refund",
             "cancel",
             "expire",
+            "expiry",
         )
     )
     if is_decline_or_reversal:
@@ -119,6 +120,85 @@ def _classify_card_event(event_type: str) -> tuple[bool, bool]:
     is_auth = "authorization" in et or "auth" in et
     is_settled = "transaction" in et or "settlement" in et
     return is_auth, is_settled
+
+
+#: The statuses a settlement completes: an authorized card, or an unspent one
+#: whose clearing arrives after its authorization lapsed (decisions §544).
+_SETTLEABLE_CARD_STATUSES = frozenset({"charged", "created", "sent", "active"})
+
+#: What a lapsed authorization is, by kind (`_classify_card_lapse`).
+CARD_LAPSE_REVERSAL = "reversal"
+CARD_LAPSE_EXPIRY = "expiry"
+CARD_LAPSE_DECLINE = "decline"
+
+#: The status a card returns to when its authorization lapses (decisions §544).
+#: The vendor demonstrably holds the card (they presented it), which is what
+#: `active` means; every reader treats `created` / `sent` / `active` alike (live,
+#: unspent), and the `card.charged` audit row keeps the status it left.
+CARD_LAPSED_STATUS = "active"
+
+
+def _classify_card_lapse(event_type: str) -> str | None:
+    """Which lapse of an authorization an event reports, or None.
+
+    Decisions §544. A *reversal* (the merchant or the network released the hold)
+    or an *expiry* (the hold aged out uncaptured) releases the card's
+    authorization; a *decline* is a refused attempt. Everything else the
+    decline / reversal family covers in `_classify_card_event` — a refund, a
+    return, a cancel, a reversal of a SETTLEMENT — is a post-settlement or
+    non-authorization event, not a lapse, and returns None: a refund or
+    chargeback is a different flow and never un-charges a card.
+    """
+    et = (event_type or "").lower()
+    if not et:
+        return None
+    if "settlement" in et or any(kw in et for kw in ("refund", "return", "chargeback")):
+        return None
+    if any(kw in et for kw in ("reversal", "reversed", "void")):
+        return CARD_LAPSE_REVERSAL
+    if "expire" in et or "expiry" in et:
+        return CARD_LAPSE_EXPIRY
+    if "decline" in et:
+        return CARD_LAPSE_DECLINE
+    return None
+
+
+#: Lithic's `card_transaction.updated` names no outcome; the transaction's
+#: `status` does (https://docs.lithic.com/docs/transactions, checked
+#: 2026-11-25). Mapped onto the names the classifiers read. An unknown status
+#: maps to "" (inert), never to the event name, which `_classify_card_event`
+#: would read as a settlement ("transaction").
+_LITHIC_STATUS_EVENTS = {
+    "PENDING": "authorization",
+    "SETTLED": "settlement",
+    "VOIDED": "authorization.reversal",
+    "EXPIRED": "authorization.expired",
+    "DECLINED": "authorization.declined",
+}
+_LITHIC_TRANSACTION_EVENT = "card_transaction.updated"
+
+
+def _lithic_event_type(body: dict) -> str:
+    """The event name the classifiers read for a Lithic delivery."""
+    event_type = body.get("type") or body.get("event_type") or ""
+    if str(event_type).lower() != _LITHIC_TRANSACTION_EVENT:
+        return str(event_type)
+    return _LITHIC_STATUS_EVENTS.get(str(body.get("status") or "").upper(), "")
+
+
+def _lithic_event_id(body: dict):
+    """The dedupe key for a Lithic delivery. A `card_transaction.updated` body
+    is the transaction itself, whose `token` is the same on every update of it
+    (pending, settled, voided...), so keyed on the token alone the settlement
+    or the reversal of an authorization would be deduped as a replay of it.
+    Without an explicit `event_id`, an update is keyed by token AND status:
+    each stage applies once, and a retry of one stage is still a replay."""
+    if body.get("event_id"):
+        return body["event_id"]
+    event_type = str(body.get("type") or body.get("event_type") or "").lower()
+    if event_type == _LITHIC_TRANSACTION_EVENT and body.get("token") and body.get("status"):
+        return f"{body['token']}:{str(body['status']).upper()}"
+    return body.get("token") or body.get("id")
 
 
 def _normalize_charge_amount(
@@ -154,6 +234,18 @@ def _normalize_charge_amount(
             return fallback
     converted = minor_units_to_decimal(amount, currency)
     return fallback if converted is None else converted
+
+
+def _is_partial_reversal(provider: str, amount, card: VirtualCard) -> bool:
+    """True when a reversal names a figure below the card's authorized one, so
+    part of the hold stands. Lithic reports a reversal by the transaction's
+    `VOIDED` status, which it sets only once nothing is held, so a Lithic
+    reversal is always whole. A reversal with no usable figure is read as
+    whole, as is one on a card with no authorized figure to compare."""
+    if provider == "lithic" or card.amount_charged is None:
+        return False
+    reversed_amount = _normalize_charge_amount(provider, amount, None, card.currency)
+    return reversed_amount is not None and 0 < reversed_amount < card.amount_charged
 
 
 def resolve_rebate_base(
@@ -1130,15 +1222,18 @@ async def card_webhook(provider: str, request: Request):
     # Normalize by provider
     if provider == "lithic":
         card_token = body.get("card_token") or body.get("card", {}).get("token")
-        event_type = body.get("type", "")
-        event_id = body.get("event_id") or body.get("token") or body.get("id")
+        event_type = _lithic_event_type(body)
+        event_id = _lithic_event_id(body)
         amount = body.get("amount", 0)
         merchant = body.get("merchant", {}).get("descriptor")
     elif provider == "nium":
         card_token = body.get("cardHashId")
-        event_type = body.get("eventType", "")
+        # Nium's documented card webhooks name themselves in `template` (e.g.
+        # `CARD_TRANSACTION_REVERSAL_WEBHOOK`) and carry `transactionAmount`
+        # (decisions §544); `eventType` / `amount` are read first as before.
+        event_type = body.get("eventType") or body.get("template") or ""
         event_id = body.get("webhookId") or body.get("eventId") or body.get("id")
-        amount = body.get("amount", 0)
+        amount = body.get("amount") or body.get("transactionAmount") or 0
         merchant = body.get("merchantName")
     elif provider == MOCK_WEBHOOK_PROVIDER and not settings.is_deployed:
         # The local equivalent of a provider's charge (guard rail 7, decisions
@@ -1239,9 +1334,13 @@ async def card_webhook(provider: str, request: Request):
 
                 # Update card based on event (declines / reversals excluded).
                 is_auth, is_settled = _classify_card_event(event_type)
+                lapse = _classify_card_lapse(event_type)
 
                 from app.services.audit_dispatch import dispatch_audit
-                from app.services.payment_settlement_record import record_card_spend
+                from app.services.payment_settlement_record import (
+                    CARD_SETTLED_STATUS,
+                    record_card_spend,
+                )
 
                 # The run payment this charge pays, once written (§537).
                 spent_payment = None
@@ -1275,7 +1374,76 @@ async def card_webhook(provider: str, request: Request):
                             "amount_charged": str(card.amount_charged),
                         },
                     )
-                elif is_settled and card.status == "charged":
+                elif lapse is not None and card.status == "charged":
+                    if lapse == CARD_LAPSE_DECLINE:
+                        # A decline is a refused attempt; nothing ties it to the
+                        # hold this card already carries (a second try at a
+                        # single-use card is declined while the first stands),
+                        # so it never releases one (decisions §544).
+                        logger.info("Card webhook: decline on an authorized card left as is")
+                    elif lapse == CARD_LAPSE_REVERSAL and _is_partial_reversal(
+                        provider, amount, card
+                    ):
+                        # Part of the hold remains: the card is still authorized.
+                        logger.info("Card webhook: partial reversal left the card authorized")
+                    else:
+                        # The hold is gone and no money moved: the card is
+                        # unspent again, so a void or a reissue may close it.
+                        # Nothing was written onto the run's card leg at the
+                        # authorization (§543), so there is nothing to undo
+                        # there and no payment sync to re-dispatch.
+                        released = card.amount_charged
+                        card.status = CARD_LAPSED_STATUS
+                        card.amount_charged = None
+                        card.charged_at = None
+                        card.merchant_name = None
+                        await dispatch_audit(
+                            db,
+                            correlation_id=card.correlation_id or uuid.uuid4(),
+                            organization_id=card.organization_id,
+                            actor_id=None,
+                            action="card.authorization_lapsed",
+                            entity_type="virtual_card",
+                            entity_id=card.id,
+                            details={
+                                "last_four": card.last_four,
+                                "from": "charged",
+                                "to": CARD_LAPSED_STATUS,
+                                "lapse": lapse,
+                                "released_amount": (
+                                    str(released) if released is not None else None
+                                ),
+                            },
+                        )
+                elif lapse in (CARD_LAPSE_REVERSAL, CARD_LAPSE_EXPIRY) and (
+                    card.status == CARD_SETTLED_STATUS
+                ):
+                    # Money already moved: a reversal after settlement is a
+                    # refund or a chargeback, a different flow. The card, its
+                    # rebate and the run's recorded figure are left untouched;
+                    # the event is kept on the trail for a person to act on.
+                    logger.warning("Card webhook: reversal on a settled card left untouched")
+                    await dispatch_audit(
+                        db,
+                        correlation_id=card.correlation_id or uuid.uuid4(),
+                        organization_id=card.organization_id,
+                        actor_id=None,
+                        action="card.reversal_after_settlement",
+                        entity_type="virtual_card",
+                        entity_id=card.id,
+                        details={
+                            "last_four": card.last_four,
+                            "status": card.status,
+                            "lapse": lapse,
+                        },
+                    )
+                elif is_settled and card.status in _SETTLEABLE_CARD_STATUSES:
+                    # `charged` is the usual case. An unspent card settles too:
+                    # a clearing can arrive after its authorization expired or
+                    # was reversed (a force post), and since §544 a lapse returns
+                    # the card to `active`, so refusing it would drop money
+                    # that moved. A cancelled card is never settled here.
+                    settled_from = card.status
                     card.status = "completed"
                     # The SETTLED figure is the rebate base, not the authorized
                     # one. A card network's settlement routinely differs from the
@@ -1338,7 +1506,7 @@ async def card_webhook(provider: str, request: Request):
                         entity_id=card.id,
                         details={
                             "last_four": card.last_four,
-                            "from": "charged",
+                            "from": settled_from,
                             "to": "completed",
                             "rebate_amount": str(rebate_amount),
                             "rebate_rate": str(rebate_rate),

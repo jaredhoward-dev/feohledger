@@ -26,10 +26,14 @@ MOCK_WEBHOOK_PROVIDER = "mock"
 #: nothing a deployed handler would accept. A tenant secret, when set, is used
 #: instead, exactly as a real provider's delivery is checked.
 MOCK_WEBHOOK_LOCAL_SECRET = "feohledger-mock-card-webhook-local-only"
-#: The two events a mock card can be sent: the charge and its settlement, named
+#: The events a mock card can be sent: the charge and its settlement, named
 #: so the webhook's own ``_classify_card_event`` reads them as Lithic's are.
 MOCK_EVENT_AUTHORIZATION = "authorization"
 MOCK_EVENT_SETTLEMENT = "settlement"
+#: An authorization's lapse (decisions §544): the merchant reversed the hold, or
+#: it aged out uncaptured. Either returns an authorized card to unspent.
+MOCK_EVENT_REVERSAL = "authorization.reversal"
+MOCK_EVENT_EXPIRY = "authorization.expired"
 
 
 def mock_card_event(

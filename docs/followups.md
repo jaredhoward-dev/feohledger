@@ -1388,19 +1388,6 @@ user-visible halves still open.
 
 ### Surfaced by round 45 (2026-11-25, round PR #771, decisions §536–§543)
 
-- [ ] **(c) A card whose authorization is reversed or expires stays `charged`.**
-      Since decisions §543 only a settled charge counts on a run's card leg, so
-      the money is safe (the leg reads `in_flight`), but the card webhook still
-      ignores reversal / expiry / decline events, so the `VirtualCard` row keeps
-      the `charged` status and authorized figure the authorization set. A stuck
-      `charged` card may refuse a later void or reissue that expects an
-      uncharged card. **Durable fix:** map each provider's reversal / expiry /
-      decline event (Lithic, Nium, mock) back to the pre-authorization status,
-      clearing the authorized figure, with an audit row, deduped by event id
-      like the other card events. **Trigger:** the first void or reissue refused
-      on a card whose authorization lapsed, or the next change to the card
-      webhook's event mapping.
-
 - [ ] **(c) The flagged-bill ERP void holds row locks across its ERP calls.**
       `POST /api/exceptions/{id}/void-erp-bill` locks the invoice, the flag
       and the workflow instance FOR UPDATE, then reads the bill and voids it

@@ -8,10 +8,14 @@ Without `--settle` only the authorization is sent: the card reads `charged`
 and the run's leg stays in flight (an authorization is a hold, not money
 moved). With `--settle` the handler records the settled charge on the run
 payment and re-dispatches the payment sync, which moves a fully charged
-invoice to `paid`.
+invoice to `paid`. With `--reverse` (or `--expire`) the authorization is
+followed by its reversal (or expiry) instead: the hold lapses, the card returns
+to `active` with no charged figure (decisions §544), and a void or a reissue
+can close it.
 
     python scripts/simulate_card_charge.py --tenant acme --card <card id or token>
     python scripts/simulate_card_charge.py --tenant acme --card <id> --amount 120.00 --settle
+    python scripts/simulate_card_charge.py --tenant acme --card <id> --reverse
 
 Local only: refused when FEOH_ENVIRONMENT is a deployed one, for a tenant whose
 card provider is not `mock`, and for a card that is not a mock card
@@ -51,7 +55,12 @@ async def _run(args: argparse.Namespace) -> int:
 
     try:
         result = await simulate_mock_card_charge(
-            app, slug=args.tenant, card_ref=args.card, amount=args.amount, settle=args.settle
+            app,
+            slug=args.tenant,
+            card_ref=args.card,
+            amount=args.amount,
+            settle=args.settle,
+            lapse=args.lapse,
         )
     except MockCardSimulationRefused as exc:
         print(f"refused: {exc.code}", file=sys.stderr)
@@ -70,10 +79,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--amount", type=_amount, default=None, help="charge in major units (default: the limit)"
     )
-    parser.add_argument(
+    outcome = parser.add_mutually_exclusive_group()
+    outcome.add_argument(
         "--settle",
         action="store_true",
         help="also send the settlement event (what takes a card-paid invoice to paid)",
+    )
+    outcome.add_argument(
+        "--reverse",
+        dest="lapse",
+        action="store_const",
+        const="reversal",
+        help="follow the authorization with its reversal (the card returns to active)",
+    )
+    outcome.add_argument(
+        "--expire",
+        dest="lapse",
+        action="store_const",
+        const="expiry",
+        help="follow the authorization with its expiry (the card returns to active)",
     )
     return asyncio.run(_run(parser.parse_args(argv)))
 

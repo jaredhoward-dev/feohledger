@@ -330,6 +330,49 @@ async def test_a_spent_card_is_reported_final_not_retryable(realdb):
     assert result.void_card_disposition == "not_closed_final"
 
 
+@pytest.mark.parametrize("lapse", ["reversal", "expiry"])
+async def test_a_card_whose_authorization_lapsed_is_closed_by_the_void(realdb, lapse):
+    """Decisions §544: an authorization that is reversed or expires releases
+    the card, so the void closes it instead of reporting it spent. Driven
+    through the real signed webhook by the mock card simulator."""
+    from app.services import mock_card_simulator as sim
+    from tests.test_mock_card_simulator import _app, _cards
+
+    info = realdb.info(TENANT)
+    org_id = info.org_id
+    mk = realdb.sessionmaker(TENANT)
+    amount = Decimal("100.00")
+    await _cards(realdb)
+
+    inv = await _seed_invoice(mk, org_id, amount=amount)
+    _run_id, pay_id = await _seed_payment(
+        mk, org_id, inv, amount=amount, creator_id=info.users["ap_manager"]
+    )
+    async with mk() as s:
+        card = _card(
+            inv, org_id, provider_card_id=f"mock_card_{uuid.uuid4().hex[:12]}", amount=amount
+        )
+        card.payment_id = pay_id
+        s.add(card)
+        await s.commit()
+        card_id, token = card.id, card.provider_card_id
+
+    with _ambient_patches():
+        charged = await sim.simulate_mock_card_charge(_app(), slug=info.slug, card_ref=token)
+        assert charged.card_status == "charged"
+        lapsed = await sim.simulate_mock_card_charge(
+            _app(), slug=info.slug, card_ref=token, lapse=lapse
+        )
+        assert lapsed.card_status == "active"
+        result = await _void(realdb, pay_id, org_id, info.users["admin"])
+
+    assert result.void_card_outcome == "card_cancelled"
+    assert result.void_card_disposition == "closed"
+    async with mk() as s:
+        card = (await s.execute(select(VirtualCard).where(VirtualCard.id == card_id))).scalar_one()
+    assert card.status == "cancelled"
+
+
 async def test_a_card_payment_with_no_linked_card_reports_no_card(realdb):
     """`no_card` is its own verdict — there is nothing to close and nothing to
     chase, so the dialog must not raise an alarm about a card that never was."""

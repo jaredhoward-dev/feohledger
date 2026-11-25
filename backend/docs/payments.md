@@ -1547,9 +1547,12 @@ run (`dispatch_payment_sync` only schedules the pass on the running loop, after
 the commit, so no ERP latency reaches the issuer's response), which is what moves the skipped invoice to `paid` — or holds it short,
 with `/settlement/accept` and `/void` as the exits. A card no run payment owns
 (`/cards/generate`) has no payment to write. A reversed, expired or declined
-authorization needs no undo: it never counted. The card itself stays `charged`
-(the webhook leaves a card untouched on those events), so the leg stays
-`in_flight` until a settlement arrives or a person voids the payment.
+authorization needs no undo on the payment: it never counted, and nothing is
+re-dispatched. Since decisions §544 a reversal or expiry returns the card
+itself to `active` with no charged figure (a `card.authorization_lapsed` audit
+row), so a void or a reissue can close it; a decline leaves a `charged` card
+as it is. The leg stays `in_flight` throughout, and a clearing that arrives
+after the hold lapsed still settles the card and records the leg.
 
 ##### A figure the column cannot hold
 
