@@ -438,6 +438,158 @@ async def test_the_generic_route_no_longer_reads_merges_shape():
 
 
 # ---------------------------------------------------------------------------
+# the unseal budget for deliveries that do not verify (decisions §525)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unseal_budget(monkeypatch):
+    """The limiter on, with a small budget: 2 distinct tenants per source."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    monkeypatch.setattr(settings, "erp_webhook_unverified_tenants_per_source_limit", 2)
+    return settings
+
+
+def _tenant(name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(), slug=name, db_name=f"feoh_{name}", settings={"erp": MERGE_ERP}
+    )
+
+
+async def _deliver_from(source: str, org, signature: str, body: bytes):
+    """One delivery from ``source`` to ``org``'s URL, with the unseal as a
+    spy. Returns (response, opened, apply)."""
+    from app.api.erp_webhook import merge_webhook
+
+    opened = AsyncMock(return_value=MERGE_ERP)
+    apply = AsyncMock(return_value="unchanged")
+    req = _request(body, {"X-Merge-Webhook-Signature": signature})
+    req.client.host = source
+    with (
+        patch("app.api.erp_webhook.control_session_factory", _ctrl(org)),
+        patch("app.api.erp_webhook.provider_config", opened),
+        patch("app.api.erp_webhook.is_event_already_processed", AsyncMock(return_value=False)),
+        patch.object(erp_merge_webhook, "apply_merge_event", apply),
+    ):
+        response = await merge_webhook(org.slug, req)
+    return response, opened, apply
+
+
+async def test_a_source_cycling_tenants_is_cut_off_with_the_same_204(unseal_budget, caplog):
+    """The source axis counts DISTINCT tenants, not attempts: an address
+    whose deliveries for one misconfigured tenant keep failing never spends
+    its budget, while one cycling signatures across tenants (the only way past
+    the DEK cache to a KMS Decrypt per request) is cut off after two. The
+    refusal answers exactly as an unknown slug would, logged without the
+    address, and binds that address only."""
+    import logging
+
+    body = _delivery()
+    wrong = _sign(body, "nobodys-key")
+    acme, globex, initech = _tenant("acme"), _tenant("globex"), _tenant("initech")
+
+    for _ in range(5):  # one tenant, many failures: still one tenant
+        _response, opened, _apply = await _deliver_from("198.51.100.7", acme, wrong, body)
+        opened.assert_awaited_once()
+    _response, opened, _apply = await _deliver_from("198.51.100.7", globex, wrong, body)
+    opened.assert_awaited_once()
+
+    with caplog.at_level(logging.WARNING, logger="app.api.erp_webhook"):
+        response, opened, _apply = await _deliver_from("198.51.100.7", initech, wrong, body)
+    assert response is None
+    opened.assert_not_awaited()  # a third distinct tenant from that address
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("budget spent by the source" in m and "'initech'" in m for m in messages)
+    assert not any("198.51.100.7" in m for m in messages)
+
+    # The same tenant from another address still opens.
+    _response, opened, _apply = await _deliver_from("192.0.2.44", initech, wrong, body)
+    opened.assert_awaited_once()
+
+
+async def test_wrong_signatures_at_a_tenant_never_stop_its_genuine_deliveries(unseal_budget):
+    """There is no per-tenant budget to spend: however many wrong signatures
+    a caller who knows the slug sends, from however many addresses, the
+    tenant's genuine delivery still opens its key and is applied (§525)."""
+    org = _tenant("acme")
+    body = _delivery()
+    for n in range(50):
+        _response, opened, _apply = await _deliver_from(
+            f"198.51.100.{n}", org, _sign(body, "forged"), body
+        )
+        opened.assert_awaited_once()
+    _response, opened, apply = await _deliver_from("203.0.113.9", org, _sign(body), body)
+    opened.assert_awaited_once()
+    apply.assert_awaited_once()
+
+
+async def test_a_verified_delivery_spends_no_budget(unseal_budget):
+    """Only an opening that verified nothing counts, so a provider address
+    delivering for many tenants never limits itself."""
+    for name in ("acme", "globex", "initech", "umbrella"):
+        body = _delivery()
+        _response, opened, apply = await _deliver_from(
+            "198.51.100.7", _tenant(name), _sign(body), body
+        )
+        opened.assert_awaited_once()
+        apply.assert_awaited_once()
+
+
+async def test_a_key_that_cannot_be_opened_spends_the_budget_too(unseal_budget):
+    """A failed opening still cost the KMS call the budget is there to bound."""
+    from app.api.erp_webhook import merge_webhook
+    from app.services.credential_crypto import CredentialCryptoError
+
+    body = _delivery()
+    failing = AsyncMock(side_effect=CredentialCryptoError("kms"))
+    for name in ("acme", "globex", "initech"):
+        req = _request(body, {"X-Merge-Webhook-Signature": _sign(body)})
+        req.client.host = "198.51.100.7"
+        with (
+            patch("app.api.erp_webhook.control_session_factory", _ctrl(_tenant(name))),
+            patch("app.api.erp_webhook.provider_config", failing),
+        ):
+            assert await merge_webhook(name, req) is None
+    assert failing.await_count == 2  # the third tenant was refused before opening
+
+
+async def test_the_budget_fails_open_when_redis_is_unreachable(unseal_budget, monkeypatch):
+    """The budget guards KMS cost, not correctness: without Redis a genuine
+    delivery is still verified, and the dedup claim's own 503 then asks the
+    provider to redeliver, where failing closed would have dropped it."""
+
+    async def _down():
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr("app.services.rate_limit.get_redis", _down)
+    body = _delivery()
+    response, opened, apply = await _deliver_from(
+        "198.51.100.7", _tenant("acme"), _sign(body), body
+    )
+    assert response is None
+    opened.assert_awaited_once()
+    apply.assert_awaited_once()
+    # And a failed one records nothing, without raising.
+    response, opened, _apply = await _deliver_from(
+        "198.51.100.7", _tenant("acme"), _sign(body, "wrong"), body
+    )
+    assert response is None
+    opened.assert_awaited_once()
+
+
+async def test_the_budget_is_off_with_the_master_switch(unseal_budget):
+    unseal_budget.rate_limit_enabled = False
+    body = _delivery()
+    for name in ("acme", "globex", "initech", "umbrella"):
+        _response, opened, _apply = await _deliver_from(
+            "198.51.100.7", _tenant(name), _sign(body, "wrong"), body
+        )
+        opened.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # the delivery → the reconciler's report
 # ---------------------------------------------------------------------------
 

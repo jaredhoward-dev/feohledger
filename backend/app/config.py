@@ -1014,6 +1014,22 @@ class Settings(BaseSettings):
     # truncates a real one.
     erp_webhook_max_bytes: int = 4 * 1024 * 1024
 
+    # Unseal budget on the two per-tenant ERP webhooks (`/api/erp/webhook/
+    # {erp_type}` and `/webhook/merge_dev/{slug}`, decisions §525). Each of
+    # them opens a tenant's sealed key BEFORE the signature can be checked;
+    # repeat openings of one tenant hit the DEK cache, so only a caller cycling
+    # well-formed signatures across tenants forces a KMS Decrypt per request.
+    # The budget is DISTINCT tenants a source address has failed against in
+    # the window; only deliveries that fail to verify after an unseal count (a
+    # genuine sender never does, and a provider's shared IPs serving one
+    # misconfigured tenant never trip it). No per-tenant budget: it would let
+    # anyone who knows a slug drop that tenant's genuine deliveries. A spent
+    # budget skips the unseal and is the same silent 204 as every other
+    # rejection, logged. Composes with `rate_limit_enabled`; fails open when
+    # Redis is unreachable. No secret.
+    erp_webhook_unverified_window_seconds: int = 600
+    erp_webhook_unverified_tenants_per_source_limit: int = 10
+
     # Email-intake inbound webhook (`POST /api/email-intake/inbound/{provider}`,
     # public, HMAC-gated). Same memory-exhaustion guard as the ERP webhook above
     # — email provider payloads (incl. base64 attachments) can legitimately run
