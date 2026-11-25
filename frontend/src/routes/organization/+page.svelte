@@ -50,6 +50,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import ResidencyPanel from '#lib/components/organization/ResidencyPanel.svelte';
 	import SsoPanel from '#lib/components/organization/SsoPanel.svelte';
 	import PaymentsPanel from '#lib/components/organization/PaymentsPanel.svelte';
 	import FraudRulesPanel from '#lib/components/organization/FraudRulesPanel.svelte';
@@ -70,6 +71,7 @@
 		type ExtractionFields,
 		type NachaFields,
 		type PaymentsFields,
+		type ResidencyAlignment,
 		type SsoFields,
 		type FraudRules,
 		type InvoiceDefaultsFields
@@ -1281,12 +1283,6 @@
 	// see whether the platform is physically honouring it yet. Nothing on this
 	// panel blocks; the region never moves data by itself.
 	// See docs/data-residency.md.
-	interface ResidencyAlignment {
-		status: string; // "aligned" | "misaligned" | "unknown"
-		aligned: boolean | null; // null ⇔ status "unknown" — never read as yes
-		deployed_region: string | null;
-		reason: string | null;
-	}
 	interface ResidencyResponse {
 		region: string;
 		default_region: string;
@@ -1294,15 +1290,6 @@
 		placement: Record<string, string>;
 		alignment: ResidencyAlignment;
 	}
-
-	// Region tokens come from the server; their display names are ours.
-	const REGION_LABEL_KEYS: Record<string, MessageKey> = {
-		us: 'org.residency.region.us',
-		eu: 'org.residency.region.eu',
-		uk: 'org.residency.region.uk',
-		ca: 'org.residency.region.ca',
-		au: 'org.residency.region.au'
-	};
 
 	let residencyRegion = $state(''); // the select's bound value
 	let residencySavedRegion = $state(''); // last persisted effective region
@@ -1313,14 +1300,6 @@
 	let loadingResidency = $state(true);
 	let residencyError = $state('');
 	let savingResidency = $state(false);
-
-	// An unmapped token renders as itself rather than vanishing — the server
-	// owns the supported set, so a region added there stays selectable here.
-	function regionLabel(token: string | null): string {
-		if (!token) return '';
-		const key = REGION_LABEL_KEYS[token];
-		return key ? m(key) : token.toUpperCase();
-	}
 
 	function applyResidency(data: ResidencyResponse) {
 		residencyRegion = data.region;
@@ -1363,23 +1342,6 @@
 			savingResidency = false;
 		}
 	}
-
-	const alignmentMessage = $derived.by(() => {
-		const a = residencyAlignment;
-		if (!a) return '';
-		if (a.status === 'aligned') {
-			return m('org.residency.alignment.aligned', { region: regionLabel(a.deployed_region) });
-		}
-		if (a.status === 'misaligned') {
-			return m('org.residency.alignment.misaligned', {
-				configured: regionLabel(residencySavedRegion),
-				deployed: regionLabel(a.deployed_region)
-			});
-		}
-		return a.reason === 'deployed_region_unrecognised'
-			? m('org.residency.alignment.unknownUnrecognised')
-			: m('org.residency.alignment.unknownUnset');
-	});
 
 	async function removeCustomDomain(host: string) {
 		// Two-click arm/confirm so a stray click can't drop a live domain.
@@ -2169,59 +2131,18 @@
 				{/if}
 
 				{#if section === 'residency'}
-					<section class="card">
-						{@render residencyIntro()}
-
-						{#if loadingResidency}
-							<LoadingState label={m('org.residency.loading')} />
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.residency.regionLabel')}</span>
-									<select bind:value={residencyRegion}>
-										{#each residencyRegions as token (token)}
-											<option value={token}>
-												{token === residencyDefault
-													? m('org.residency.regionDefault', { region: regionLabel(token) })
-													: regionLabel(token)}
-											</option>
-										{/each}
-									</select>
-								</label>
-							</div>
-
-							{#if residencyPlacement.db_cluster}
-								<p class="card-hint residency-placement">
-									{m('org.residency.placement', {
-										cluster: residencyPlacement.db_cluster,
-										bucket: residencyPlacement.s3_bucket ?? ''
-									})}
-								</p>
-							{/if}
-
-							{#if residencyAlignment}
-								<div
-									class="residency-alignment"
-									class:ok={residencyAlignment.status === 'aligned'}
-									class:warn={residencyAlignment.status === 'misaligned'}
-								>
-									<strong>{m('org.residency.alignment.title')}</strong>
-									<p>{alignmentMessage}</p>
-									<p class="residency-advisory">{m('org.residency.alignment.advisory')}</p>
-								</div>
-							{/if}
-
-							<div class="section-footer">
-								<button
-									class="btn-save-section"
-									disabled={savingResidency || residencyRegion === residencySavedRegion}
-									onclick={saveResidency}
-								>
-									{savingResidency ? m('org.common.saving') : m('org.residency.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<ResidencyPanel
+						bind:region={residencyRegion}
+						intro={residencyIntro}
+						loading={loadingResidency}
+						savedRegion={residencySavedRegion}
+						defaultRegion={residencyDefault}
+						regions={residencyRegions}
+						placement={residencyPlacement}
+						alignment={residencyAlignment}
+						saving={savingResidency}
+						onsave={saveResidency}
+					/>
 				{/if}
 
 				{#if section === 'extraction'}
@@ -2605,50 +2526,6 @@
 	.domain-name {
 		font-size: 0.9rem;
 		word-break: break-all;
-	}
-
-	.residency-placement {
-		font-family: var(--font-mono);
-		margin: 12px 0 0;
-	}
-
-	/* Advisory verdict box. Tinted-badge recipe: each tone takes its own
-	   -tint background with the matching -on-tint text (never the base token,
-	   which lands under 4.5:1 once composited over the tint). Unknown — the
-	   deliberately non-committal state — is the muted default. */
-	.residency-alignment {
-		margin-top: 14px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--muted-tint);
-		color: var(--muted-on-tint);
-	}
-
-	.residency-alignment.ok {
-		background: var(--success-tint);
-		color: var(--success-on-tint);
-	}
-
-	.residency-alignment.warn {
-		background: var(--warning-tint);
-		color: var(--warning-on-tint);
-	}
-
-	.residency-alignment strong {
-		display: block;
-		margin-bottom: 4px;
-	}
-
-	.residency-alignment p {
-		margin: 0;
-	}
-
-	/* Inherits the box's calibrated colour — a muted token here would be
-	   judged against the bare surface, not the tint it actually sits on. */
-	.residency-advisory {
-		margin-top: 6px;
-		font-size: 0.78rem;
 	}
 
 	.btn-remove-domain {

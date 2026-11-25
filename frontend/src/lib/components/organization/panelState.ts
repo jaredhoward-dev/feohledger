@@ -209,3 +209,11 @@ export interface SsoFields {
 	idpSloUrl: string;
 	spEntityId: string;
 }
+
+/** Organization → Data residency: the backend's advisory configured-vs-deployed verdict. */
+export interface ResidencyAlignment {
+	status: string; // "aligned" | "misaligned" | "unknown"
+	aligned: boolean | null; // null ⇔ status "unknown" — never read as yes
+	deployed_region: string | null;
+	reason: string | null;
+}
