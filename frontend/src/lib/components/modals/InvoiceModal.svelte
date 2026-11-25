@@ -59,6 +59,7 @@
 		type InvoiceActionVerdicts
 	} from '#lib/api/invoices.ts';
 	import { isAllowed, isOffered, refusalText } from '#lib/api/actionVerdicts.ts';
+	import { assignedElsewhere } from '#lib/utils/reviewAssignment.ts';
 	import RecallApprovalModal from '#lib/components/modals/RecallApprovalModal.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { listInvoiceChart } from '#lib/api/glAccounts.ts';
@@ -699,16 +700,12 @@
 			verdictsFailed = false;
 		}
 	});
-	// The assignee clause is presentation, not a server rule: the endpoint
-	// accepts any approver, and docs/followups.md tracks deciding whether
-	// assignment should be enforced there or dropped here.
-	let isAssignedElsewhere = $derived(
-		!!invoice.assigned_to_id && invoice.assigned_to_id !== auth.user?.id
-	);
+	// Assignment is routing, not authority (decisions §564): the verdict alone
+	// decides whether Approve / Reject are offered. When the invoice is someone
+	// else's, the footer says so beside the buttons instead of hiding them.
+	let assignedTo = $derived(assignedElsewhere(invoice, auth.user?.id));
 	let canReview = $derived(
-		isReadyForReview &&
-			!isAssignedElsewhere &&
-			(isOffered(verdicts?.approve) || isOffered(verdicts?.reject))
+		isReadyForReview && (isOffered(verdicts?.approve) || isOffered(verdicts?.reject))
 	);
 	// The reason to show beside a DISABLED Approve — never for
 	// `role_not_permitted`, where the button is not rendered at all.
@@ -2949,6 +2946,17 @@
 							<div class="review-title">{m('invoices.modal.review.title')}</div>
 							<HelpTip term="segregation-of-duties" />
 						</div>
+						{#if assignedTo}
+							<!-- Non-blocking: any approver the server accepts may act; this
+							     only keeps them from taking a colleague's invoice unawares. -->
+							<p class="review-assigned-hint review-assigned-note" data-testid="review-assigned-elsewhere">
+								{#if assignedTo.name}
+									{m('invoices.modal.review.assignedElsewherePre')}<strong>{assignedTo.name}</strong>{m('invoices.modal.review.assignedElsewherePost')}
+								{:else}
+									{m('invoices.modal.review.assignedElsewhereUnnamed')}
+								{/if}
+							</p>
+						{/if}
 						{#if showRejectForm}
 							<div class="reject-form">
 								<textarea
@@ -4521,6 +4529,10 @@
 		font-size: 0.78rem;
 		color: var(--text-muted);
 		margin: 0;
+	}
+
+	.review-assigned-note {
+		margin-bottom: 0.5rem;
 	}
 
 	.review-refusal {

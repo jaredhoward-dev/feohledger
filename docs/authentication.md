@@ -2856,6 +2856,14 @@ delegate of a named approver on a `specific` step or chain level. The delegator
 stays authorized too. Only invoice approval routes this way — exception
 assignment and expense reports do not read the delegation.
 
+**Assignment itself is routing too** (decisions §564). No approval gate reads
+`Invoice.assigned_to_id`: an approver the invoice is not assigned to may approve
+or reject it whenever the gates above accept them, and the invoice modal offers
+the buttons on the `review-actions` verdict alone, with a non-blocking "Assigned
+to *X*" note. Where a step does restrict who may decide — a `specific` step's
+`approver_ids`, a chain level's approvers — that list is the gate
+(`approval_not_named_approver`), not the assignee.
+
 A delegate who holds no `invoice.approve` (an ap_clerk) is refused
 (decisions §511): an invoice routed to them would sit with someone who can
 never act on it.

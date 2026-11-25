@@ -244,7 +244,7 @@ export const INVOICE_GUIDES: Guide[] = [
 					{
 						type: 'note',
 						tone: 'role',
-						text: 'AP managers, CFOs and admins can approve. AP clerks never see the approve buttons. If an invoice is assigned to someone else, you\'ll see who instead of the buttons.'
+						text: 'AP managers, CFOs and admins can approve. AP clerks never see the approve buttons. If an invoice is assigned to someone else, you still get the buttons, with a note naming who it is assigned to, so check with them before you act.'
 					}
 				]
 			},

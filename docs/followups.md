@@ -1242,22 +1242,6 @@ scope (§260) — do not fold them into any of these.
       group the closure can poll empty. **Trigger:** the first deployment that
       runs `FEOH_AUDIT_MODE=lambda` and wants self-service closure.
 
-### Surfaced by the UI action-verdict pass (2026-10-21, issue #575 § One rule, one place, decisions §305)
-
-- [ ] **(c) The invoice modal still hides Approve / Reject from a reviewer the
-      invoice is not assigned to, and the server accepts them.** The modal's
-      `isAssignedElsewhere` clause in `InvoiceModal.svelte` is the one
-      restated rule left beside the `review-actions` verdict: `POST
-      /api/invoices/{id}/approve|reject` accept any holder of `invoice.approve`
-      who passes the approval gates, assignment or not. So the page and the
-      server disagree in the safe direction (a working control is hidden, none
-      that 403s is shown). **Durable fix:** a product call — either enforce
-      assignment server-side (a new gate in `review._identity_gates`, which
-      `review_refusals` then reports) or drop the clause and let any qualified
-      approver act. **Trigger:** the next change to reviewer assignment, or a
-      reviewer reporting they cannot act on an invoice assigned to an absent
-      colleague.
-
 ### Surfaced by the sidebar renames (2026-10-21, issue #635 #23, decisions §314)
 
 - [ ] **(c) Partner Admin shows to every admin, partner or not — needs a product
