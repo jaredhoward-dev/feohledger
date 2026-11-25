@@ -236,7 +236,7 @@ void main() {
     // Only a spinner is on the button now; its label is the button's name.
     expect(
       tester.getSemantics(find.byType(FilledButton)),
-      containsSemantics(label: 'Loading…', isButton: true),
+      isSemantics(label: 'Loading…', isButton: true),
     );
     await meetsEveryGuideline(tester);
 
@@ -334,7 +334,7 @@ void main() {
     // The checkbox is named by the sentence it accepts.
     expect(
       tester.getSemantics(find.byKey(const Key('legal-accept-checkbox'))),
-      containsSemantics(
+      isSemantics(
         label: 'I have read and accept the Terms of Service and the Privacy '
             'Policy.',
         hasCheckedState: true,
@@ -351,7 +351,7 @@ void main() {
       tester.getSemantics(
         find.bySemanticsLabel('Privacy Policy, opens in your browser'),
       ),
-      containsSemantics(isLink: true, hasTapAction: true),
+      isSemantics(isLink: true, hasTapAction: true),
     );
 
     await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
