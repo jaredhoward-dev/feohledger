@@ -95,7 +95,9 @@
 	}
 </script>
 
-<div class="legal-step" data-testid="legal-accept-step">
+<!-- `<main>`: the step stands in for the app shell, whose `<main>` is not
+     mounted, so without one the page has no main landmark (WCAG 1.3.1). -->
+<main class="legal-step" data-testid="legal-accept-step">
 	<form class="panel" onsubmit={submit} novalidate>
 		<BrandMark size={36} />
 		<h1 bind:this={heading} tabindex="-1">{m('shell.legalAccept.heading')}</h1>
@@ -120,7 +122,7 @@
 			</button>
 		</div>
 	</form>
-</div>
+</main>
 
 <style>
 	.legal-step {
