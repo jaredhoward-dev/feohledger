@@ -225,6 +225,7 @@ async def lifespan(app: FastAPI):
     from app.services.contract_renewal import run_renewal_loop
     from app.services.discount_auto_trigger import run_discount_optimization_loop
     from app.services.erp_auto_send_sweep import run_auto_send_sweep_loop
+    from app.services.erp_budget_retry_sweep import run_budget_retry_sweep_loop
     from app.services.erp_connection_health import run_connection_health_loop
     from app.services.erp_status_sync import run_status_sync_loop
     from app.services.extraction_reaper import run_reaper_loop
@@ -381,6 +382,13 @@ async def lifespan(app: FastAPI):
     if settings.erp_auto_send_sweep_enabled:
         auto_send_task = start_sweep(run_auto_send_sweep_loop(), name="erp-auto-send")
 
+    # Call-budget re-send (decisions §521): a push refused before any call
+    # because the org's share of a shared ERP quota was used is re-sent once
+    # the allowance has reset. Disabled by default. Books a bill in the ERP.
+    budget_retry_task: asyncio.Task | None = None
+    if settings.erp_budget_retry_sweep_enabled:
+        budget_retry_task = start_sweep(run_budget_retry_sweep_loop(), name="erp-budget-retry")
+
     try:
         yield
     finally:
@@ -405,6 +413,7 @@ async def lifespan(app: FastAPI):
             connection_health_task,
             subprocessor_notices_task,
             auto_send_task,
+            budget_retry_task,
         ):
             if task is not None:
                 task.cancel()

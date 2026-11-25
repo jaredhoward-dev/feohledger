@@ -157,6 +157,7 @@ export const messages = {
 	'audit.action.invoice.deleted': "Fatura excluída",
 	'audit.action.invoice.edited': "Fatura editada",
 	'audit.action.invoice.erp_auto_send_refused': "Envio automático ao ERP retido",
+	'audit.action.invoice.erp_budget_resend_refused': "Reenvio ao ERP após a redefinição da cota de chamadas retido",
 	'audit.action.invoice.erp_confirmed': "ERP confirmado",
 	'audit.action.invoice.erp_failed': "Falha no envio ao ERP",
 	'audit.action.invoice.erp_retried': "Envio ao ERP repetido",

@@ -157,6 +157,7 @@ export const messages = {
 	'audit.action.invoice.deleted': "Rechnung gelöscht",
 	'audit.action.invoice.edited': "Rechnung bearbeitet",
 	'audit.action.invoice.erp_auto_send_refused': "Automatische ERP-Übertragung zurückgehalten",
+	'audit.action.invoice.erp_budget_resend_refused': "Erneute ERP-Übertragung nach Zurücksetzen des Aufrufkontingents zurückgehalten",
 	'audit.action.invoice.erp_confirmed': "ERP bestätigt",
 	'audit.action.invoice.erp_failed': "ERP-Übertragung fehlgeschlagen",
 	'audit.action.invoice.erp_retried': "ERP-Übertragung wiederholt",
