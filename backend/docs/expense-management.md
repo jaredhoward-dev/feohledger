@@ -296,7 +296,7 @@ string-Decimal amounts — never PII.
 | POST | `/api/expense-reports/{id}/expenses` | Attach (or `detach: true`) expense ids; recomputes `total_amount`. Owner only — of the target, and of any report a line is moved off (**403** `expense_report_not_owner`) — and every line attached must have been created by the target's owner (**403** `expense_report_foreign_line`, `params.expense_id`; a pre-0134 line with no recorded creator is exempt). Each id is looked up in this tenant's `expenses` table, so a cross-tenant/unknown id is a 404. Detaching nulls `report_id` (the expense outlives the report). Composition is only mutable while the **target** report is a `draft` (**409** otherwise), and an expense can't be moved off a **locked** source report (**409**) — terminal `rejected`/`cancelled` reports stay detachable so their expenses can be re-reported. Every attached/detached line's `policy_violations` is re-evaluated, as every other expense write does: the attach locks a conversion that may resolve a threshold comparison, and it sets the line's owner, which pre-approval cover depends on (a report-currency change re-evaluates its lines for the same reason). |
 | POST | `/api/expense-reports/{id}/submit` | **(WF3)** `draft → submitted`. Runs the policy engine over the report's expenses; if any BLOCKING violation (missing required receipt, or required pre-approval absent) is present, returns **422** with `{ detail: { code: "expense_report_policy_blocked", message, params: { count }, violations: [...] } }` and does NOT transition. A line with no rate locked into the report currency is refused first, **422** `expense_report_lines_unconverted` with `params: { count, currency }` and `expense_ids`. Each line that needs a pre-approval is drawn down against one with enough left, under a row lock (§ Pre-approval cover is drawn down); a line none can cover is `preapproval_required`, and the 422 rolls every draw back. On success stamps `submitted_at` and moves every child expense to `submitted`. Invalid source status → 422. RBAC `admin`/`ap_manager`/`ap_clerk`, and **only the owner** — anyone else is **403** `expense_report_not_owner`, checked before the status guard. Audited `expense_report.submitted`. |
 | POST | `/api/expense-reports/{id}/approve` | **(WF3)** `submitted → approved`. Segregation of duties: the approver must differ from the report's `employee_user_id` (reuses `approval_chain.check_segregation` → **403**) — the complete author set, because only the owner can compose, edit or submit a report. CFO gate: when `total_amount` exceeds `Organization.settings.expense_approval.cfo_threshold` (default `5000`, Decimal math), only `cfo`/`admin` may approve (else 403, coded `expense_cfo_required` with params `amount` — the report total in the reporting currency, `null` when it could not be expressed — `currency`, `limit` — `null` for a malformed or non-finite threshold — and `report_currency`; the SoD 403 is `approval_segregation`). Stamps `approved_at` + `approved_by` (the approver's user id) and moves child expenses to `approved`. Invalid source status → 422. RBAC `admin`/`ap_manager`/`cfo`. Gates: `expense_controls.report_approve_refusal` (the row's `actions.approve`). Audited `expense_report.approved`. |
-| POST | `/api/expense-reports/{id}/reject` | **(WF3)** `submitted → rejected`. Body `{ reason? }`. Returns each child expense to `draft` so they can be corrected and re-reported (`rejected` is terminal for the report row), and clears each line's pre-approval draw so the balance is handed back (decisions §563). Invalid source status → 422. **The report's owner is refused** (403 `expense_report_self_reject`, the same segregation rule as approve under its own sentence) — the decider is never the submitting employee, for reject as for approve; the endpoint used to accept it, so an owner with a manager role could record a review decision on their own claim and unlock its lines, and only the page stopped it. RBAC `admin`/`ap_manager` — deliberately NARROWER than approve, which also allows `cfo`. The frontend used one predicate for both, so a CFO saw no Approve button on exactly the over-threshold reports the CFO gate escalates TO them; the two are now split there as well. Audited `expense_report.rejected`. |
+| POST | `/api/expense-reports/{id}/reject` | **(WF3)** `submitted → rejected`. Body `{ reason? }`. Returns each child expense to `draft` so they can be corrected and re-reported (`rejected` is terminal for the report row), and clears each line's pre-approval draw so the balance is handed back (decisions §563), listing what it released in the audit row's `released` (§570). Invalid source status → 422. **The report's owner is refused** (403 `expense_report_self_reject`, the same segregation rule as approve under its own sentence) — the decider is never the submitting employee, for reject as for approve; the endpoint used to accept it, so an owner with a manager role could record a review decision on their own claim and unlock its lines, and only the page stopped it. RBAC `admin`/`ap_manager` — deliberately NARROWER than approve, which also allows `cfo`. The frontend used one predicate for both, so a CFO saw no Approve button on exactly the over-threshold reports the CFO gate escalates TO them; the two are now split there as well. Audited `expense_report.rejected`. |
 
 **Every report write that checks the report's status locks the report row.**
 `submit` / `approve` / `reject`, and every composition or content change gated on
@@ -542,12 +542,30 @@ live in `services/expense_preapproval_cover.py`:
 
 - **Submit draws.** Report submit first evaluates the lines with no cover; each
   line that raises `preapproval_required` is linked to ONE approved
-  pre-approval with enough left (one raised for this report first, then the
-  oldest decision) and records the draw: `expenses.preapproval_id` +
+  pre-approval with enough left and records the draw: `expenses.preapproval_id` +
   `preapproval_drawn_amount` (migration 0149). A line no balance can cover
   stays unlinked, the second pass raises `preapproval_required` for it, and the
   422 rolls every draw back. A line is covered whole or not at all — never split
   across two estimates.
+- **Which line goes where** (`assign_cover`, decisions §570). Lines are taken
+  largest first, and each takes the candidate that fits with the *smallest*
+  balance left over (best-fit decreasing); among equal fits, one raised for this
+  report first, then the oldest decision. So a 500 line takes the 500 estimate
+  raised for the report and a 300 line the 300 category match, in whichever
+  order they were entered. If that still leaves a line out and the report has
+  **at most 8** lines needing cover, an exact search (capped at 20,000 steps)
+  looks for an assignment that covers every line — e.g. estimates 600 + 400
+  against lines 300, 300, 200, 200, where best-fit puts a 300 in the 400 and
+  strands a 200. **Limit:** past 8 lines, or when the step cap runs out, best-fit's
+  answer stands, so a large report can be refused a line some other assignment
+  would have covered; the employee splits the report or asks for the estimate
+  the refusal names. The result is deterministic for the same lines and balances.
+- **Audited.** The `expense_report.submitted` row's details carry `draws`, and
+  the `expense_report.rejected` row's `released`: each
+  `{expense_id, preapproval_id, amount, currency}` with the amount an exact
+  decimal string, written in the same transaction as the columns. The columns
+  are mutable (reject wipes them); the audit trail is what records that a draw
+  existed.
 - **Only lines that need cover draw.** A line under every
   `requires_preapproval_above` is not charged to the budget, so small receipts
   cannot exhaust the estimate the large one needs.
@@ -561,7 +579,11 @@ live in `services/expense_preapproval_cover.py`:
   currency, or a pre-approval with no currency, is never covered (fail closed).
 - **Concurrency.** Every candidate pre-approval is locked `FOR UPDATE` in id
   order before any balance is read, so two reports submitted at once cannot both
-  draw the last remainder — the second waits, then sees the first's draw.
+  draw the last remainder — the second waits, then sees the first's draw. The
+  locked rows are re-read (`populate_existing`) and one no longer `approved`
+  under the lock covers nothing. The report's reporting-currency total (an FX
+  call) is locked **before** the draw, so a slow rate provider never holds the
+  pre-approval locks other submits wait on (§570).
 - **Advisory flags read the remaining balance.** `_approved_preapproval_amount`
   returns a linked line's own draw, otherwise the largest *remaining* balance, so
   a draft line written after the estimate is spent shows `preapproval_required`
