@@ -40,6 +40,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.api.v1_changelog import changelog_spec
 from app.config import settings
 from app.models.webhook import WEBHOOK_EVENT_TYPES
 from app.schemas.webhook_events import (
@@ -86,10 +87,15 @@ def build_public_openapi(app: FastAPI) -> dict[str, Any]:
             "Authenticated with a per-organization API key sent in the "
             "`X-API-Key` header (NOT the SPA session JWT). The key resolves to "
             "its organization and tenant data — there is no tenant header to "
-            "swap. See backend/docs/public-api.md for the deprecation policy."
+            "swap. See backend/docs/public-api.md for the deprecation policy. "
+            "Changes within v1 are listed, dated and newest first, in "
+            "`info.x-changelog`."
         ),
         routes=app.routes,
     )
+    # Dated change notes within `v1` (`api/v1_changelog`). `info.version` tracks
+    # the path prefix and is not bumped for them.
+    full["info"]["x-changelog"] = changelog_spec()
 
     # 1. Keep only the public-surface paths, dropping the meta endpoints.
     public_paths: dict[str, Any] = {
@@ -386,6 +392,7 @@ def render_docs_html(spec: dict[str, Any]) -> str:
     ]
     if info.get("description"):
         parts.append(f"<p>{_esc(info['description'])}</p>")
+    parts.append(_render_changes(info.get("x-changelog") or []))
 
     # The spec URL first — it is the actual contract; this page is a reading aid.
     spec_url = f"{_PUBLIC_PATH_PREFIX}/openapi.json"
@@ -436,6 +443,22 @@ def render_docs_html(spec: dict[str, Any]) -> str:
     parts.append(_render_schemas((spec.get("components") or {}).get("schemas") or {}))
     parts.append("</body></html>")
     return "".join(p for p in parts if p)
+
+
+def _render_changes(changes: list[Any]) -> str:
+    """The dated change notes (``info.x-changelog``), newest first."""
+    if not changes:
+        return ""
+    parts = ["<h2>Changes</h2>"]
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        parts.append(f"<h3>{_esc(change.get('date'))}: {_esc(change.get('title'))}</h3>")
+        parts.append(f"<p>{_esc(change.get('detail'))}</p>")
+        if change.get("subscribe_to"):
+            events = ", ".join(f"<code>{_esc(e)}</code>" for e in change["subscribe_to"])
+            parts.append(f'<p class="muted">Subscribe to: {events}</p>')
+    return "".join(parts)
 
 
 def _render_parameters(parameters: list[Any]) -> str:
