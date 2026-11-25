@@ -30438,3 +30438,86 @@ without waiting and is refused; a recall holding the lock makes the queued
 send refuse with nothing reserved or sent), `test_invoice_recall_approval.py`
 (the new precedence rows; a claimed mirror's recall and delete agree),
 `test_erp_payment_writeback.py` (the PATCH 422s and the 200).
+
+## 580. A stuck PEPPOL `sending` row is audited and settled from the Access Point; deleting an invoice is refused while an ERP reversal is unfinished or once it went out over PEPPOL (§573 / §577 / §578 follow-up, round 49)
+
+**A `sending` row could be stuck for good, unaudited.** Since §578 the
+reservation commits before the AS4 call and the outcome (with the only audit
+row) commits after it. A process that dies between the two — a deploy, a
+crash, a transmit that raised — left the row `sending` permanently: every
+resend answered `already_sent`, the recall was refused
+(`invoice_recall_peppol_transmitted`) for good, and the trail did not say a
+send had started.
+
+- The reservation's transaction now writes **`invoice.peppol_send_started`**
+  (actor, `business_message_id`, provider, `receiver_scheme`, doc type; never
+  the receiver value), so a stuck row is visible in the trail.
+- **`PeppolAdapter.lookup_transmission(business_message_id)`** asks the Access
+  Point what became of the document under our idempotency key:
+  `sent` / `delivered` / `failed` / `not_found` / `unknown`. The mock answers
+  `sent` with the MessageId its send derives (its send never fails and keeps no
+  state). `as4_gateway` reads `GET {gateway}/as4/outbound/{key}`, the generic
+  gateway shape its send already uses (`/as4/outbound`); 404 is `not_found`,
+  a transport error, another error status or an unrecognised status is
+  `unknown`. Unverified against a real gateway: none is contracted yet.
+- **`peppol_send.settle_stale_sending`**, run by the operator script
+  **`scripts/settle_peppol_sending.py`**, refuses a row younger than
+  `STALE_SENDING_AFTER` (30 minutes: far past the adapter's 20 s timeout, so
+  it cannot race the send it settles), refuses if the org's provider is no
+  longer the one the row went through, asks the AP with no lock held, then,
+  under the row lock and only if still `sending`, writes
+  `invoice.peppol_send_settled` (no actor; outcome, key, reason) and records
+  the answer: `sent` / `delivered` with the AP's MessageId, or `failed` for
+  the AP's `failed` or `not_found` (the document never reached the AP; the
+  resend reuses the key). **An `unknown` or unsupported lookup changes
+  nothing**: a row is never marked failed without the AP's answer. Exit
+  codes 0 / 1 (no tenant or no `sending` row) / 2 (too recent) / 3 (AP not
+  asked or no answer).
+
+**Rejected: an admin-only endpoint.** A tenant admin cannot judge whether a
+transmission left, and the tool is for the rare crash a deploy causes; the
+repo's operator actions of that kind (`set_partner_capability.py`,
+`sso_break_glass.py`) are audited scripts with refusal exit codes. **Rejected:
+a sweep that settles automatically.** It would need the same AP answer, and a
+deploy-time crash is rare enough that a person looking at it is cheaper than a
+loop on every tenant; the started-without-outcome audit row makes it findable.
+
+**Delete discarded an unfinished ERP reversal.** A voided payment returns the
+invoice to `approved`, which is deletable, while
+`WorkflowInstance.state_data` can still hold `erp_payment_voids_pending`,
+`erp_discount_credit_voids_pending` or `erp_discount_credits_pending` (§577)
+for it. The cascade deleted the instance, so the BillPayment or discount
+credit stood in the ERP with nothing left to finish or report it. `DELETE
+/api/invoices/{id}` now refuses 409 coded **`invoice_delete_erp_reversal_pending`**
+while any of the three holds an entry (an empty key does not count), read
+under the invoice row lock; `POST /bulk/delete` skips the row. Waiting for the
+status-sync sweep (or resolving the ERP exception it raised) is the way out.
+
+**Delete erased sent PEPPOL transmissions.** The cascade deleted every
+`PeppolTransmission`, including `sent` ones — the local record of a
+legally significant e-invoice the receiver holds. Both doors now refuse coded
+**`invoice_delete_peppol_transmitted`** for any outbound transmission not
+`failed` (`sending` counts, its outcome unknown), the rule §573 applies to the
+recall: a transmitted e-invoice is corrected by a credit note, not erased. A
+`failed` transmission never left and is still cleared. Inbound rows (an
+e-invoice we received) are left as they were: §573 is about what we sent, and
+whether a received document may be deleted is a separate retention question
+this entry does not decide.
+
+**Order.** One helper, `api/invoices._delete_refusals`, names a live claim
+(`invoice_delete_claimed`, §577) first, then the ERP reversal, then PEPPOL: a
+claim is cleared by cancelling, a reversal finishes by itself, a transmission
+is never cleared. Bulk delete still answers bare skipped ids (`skipped:
+list[str]`, as §577 left it); stating each skip's code needs a response-shape
+change in web and mobile, not taken here. Mobile only bulk-deletes, so it
+needs no strings; web states both codes in all six locales and labels the two
+audit actions.
+
+**Tests.** `test_peppol_send.py` (started audit in the reservation, started +
+sent on a normal send, the settle's refusals and both settled outcomes, a
+resend after `not_found`), `test_peppol_adapters.py` (mock and gateway
+lookup), `test_operator_script_exit_codes.py` (the script fails closed with no
+control plane), `test_invoice_delete_cascade.py` (each pending key refused,
+empty key allowed, bulk skip; `sending` / `sent` / `delivered` refused,
+`failed` cleared, bulk skip, claim named first); web `codedRefusals.test.ts`,
+`auditActions.roster.test.ts`.

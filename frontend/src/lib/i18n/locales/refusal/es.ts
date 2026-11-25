@@ -62,6 +62,8 @@ export const messages = {
 	'refusal.cardBlocksRecall': "Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de retirar la aprobación.",
 	'refusal.paymentBlocksDelete': "FeohLedger ya está pagando esta factura: tiene un pago activo. Cancele su lote de pagos o anule el pago antes de eliminar la factura.",
 	'refusal.cardBlocksDelete': "Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de eliminar la factura.",
+	'refusal.erpReversalBlocksDelete': "Un pago de esta factura aún se está revirtiendo en el ERP, o su nota de crédito por descuento aún se está registrando allí. Espere a que la sincronización con el ERP lo termine, o resuelva la excepción del ERP de esta factura, antes de eliminar la factura.",
+	'refusal.peppolBlocksDelete': "Esta factura se envió por PEPPOL y es posible que el receptor la tenga. Emita una nota de crédito para anularla; la factura y su registro de transmisión no se pueden eliminar.",
 	'refusal.paymentRunSegregation': "Segregación de funciones: el usuario que creó esta remesa de pagos no puede también aprobarla ni ejecutarla. Debe hacerlo otro usuario.",
 	'refusal.paymentRunAwaitingCfo': "Esta remesa supera el umbral de aprobación del CFO de la organización y espera la aprobación de un usuario con el rol de CFO.",
 	'refusal.paymentCfoRequired': "Este pago supera el umbral de aprobación del CFO de su organización. Regístrelo mediante una remesa de pagos para que lo apruebe el CFO, o pida a un CFO que lo cree.",

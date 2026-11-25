@@ -62,6 +62,8 @@ export const messages = {
 	'refusal.cardBlocksRecall': "Une carte virtuelle a été émise pour payer cette facture. Annulez la carte avant de retirer l'approbation.",
 	'refusal.paymentBlocksDelete': "FeohLedger paie déjà cette facture : elle a un paiement actif. Annulez son lot de paiement ou le paiement avant de supprimer la facture.",
 	'refusal.cardBlocksDelete': "Une carte virtuelle a été émise pour payer cette facture. Annulez la carte avant de supprimer la facture.",
+	'refusal.erpReversalBlocksDelete': "Un paiement de cette facture est encore en cours d'annulation dans l'ERP, ou son avoir d'escompte y est encore en cours de comptabilisation. Attendez que la synchronisation ERP le termine, ou résolvez l'exception ERP de cette facture, avant de supprimer la facture.",
+	'refusal.peppolBlocksDelete': "Cette facture a été envoyée via PEPPOL, et le destinataire la détient peut-être. Émettez un avoir pour l'annuler ; la facture et son enregistrement de transmission ne peuvent pas être supprimés.",
 	'refusal.paymentRunSegregation': "Séparation des tâches : l'utilisateur qui a créé ce lot de paiements ne peut pas aussi l'approuver ou l'exécuter. Un autre utilisateur doit le faire.",
 	'refusal.paymentRunAwaitingCfo': "Ce lot dépasse le seuil d'approbation CFO de l'organisation et attend la validation d'un utilisateur ayant le rôle CFO.",
 	'refusal.paymentCfoRequired': "Ce paiement dépasse le seuil de validation CFO de votre organisation. Passez-le dans un lot de paiement pour approbation par le CFO, ou demandez à un CFO de le créer.",

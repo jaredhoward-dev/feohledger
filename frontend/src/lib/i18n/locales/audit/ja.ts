@@ -195,6 +195,8 @@ export const messages = {
 	'audit.action.invoice.payment_scheduled': "支払を予定",
 	'audit.action.invoice.peppol_received': "PEPPOLで受信",
 	'audit.action.invoice.peppol_send_failed': "PEPPOL送信失敗",
+	'audit.action.invoice.peppol_send_settled': "アクセスポイントの記録でPEPPOL送信を確定",
+	'audit.action.invoice.peppol_send_started': "PEPPOL送信開始",
 	'audit.action.invoice.peppol_sent': "PEPPOLで送信",
 	'audit.action.invoice.rejected': "請求書を却下",
 	'audit.action.invoice.resubmitted': "請求書を再提出",

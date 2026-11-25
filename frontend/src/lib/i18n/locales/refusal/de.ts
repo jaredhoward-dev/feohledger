@@ -62,6 +62,8 @@ export const messages = {
 	'refusal.cardBlocksRecall': "Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Genehmigung zurücknehmen.",
 	'refusal.paymentBlocksDelete': "FeohLedger bezahlt diese Rechnung bereits: Es gibt eine aktive Zahlung. Brechen Sie den Zahlungslauf ab oder stornieren Sie die Zahlung, bevor Sie die Rechnung löschen.",
 	'refusal.cardBlocksDelete': "Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Rechnung löschen.",
+	'refusal.erpReversalBlocksDelete': "Eine Zahlung zu dieser Rechnung wird im ERP noch storniert, oder ihre Skontogutschrift wird dort noch gebucht. Warten Sie, bis die ERP-Synchronisierung das abschließt, oder klären Sie die ERP-Ausnahme zu dieser Rechnung, bevor Sie die Rechnung löschen.",
+	'refusal.peppolBlocksDelete': "Diese Rechnung wurde über PEPPOL versendet, und der Empfänger hat sie möglicherweise. Stornieren Sie sie mit einer Gutschrift; die Rechnung und ihr Übermittlungsnachweis können nicht gelöscht werden.",
 	'refusal.paymentRunSegregation': "Funktionstrennung: Wer diesen Zahlungslauf erstellt hat, darf ihn nicht auch genehmigen oder ausführen. Das muss eine andere Person tun.",
 	'refusal.paymentRunAwaitingCfo': "Dieser Lauf überschreitet die CFO-Freigabeschwelle der Organisation und wartet auf die Freigabe durch einen Benutzer mit der CFO-Rolle.",
 	'refusal.paymentCfoRequired': "Diese Zahlung liegt über der CFO-Freigabeschwelle Ihrer Organisation. Buchen Sie sie über einen Zahlungslauf zur CFO-Freigabe oder bitten Sie einen CFO, sie anzulegen.",

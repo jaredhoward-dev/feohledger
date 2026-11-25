@@ -3,8 +3,9 @@
 Orchestrates one transmission of an invoice over the PEPPOL network:
 
     map → assert_valid(check_tax) → generate_ubl → resolve_participant →
-    INSERT PeppolTransmission('sending') → COMMIT (the reservation) →
-    adapter.send → update row → dispatch_audit → commit
+    INSERT PeppolTransmission('sending') + audit ``invoice.peppol_send_started``
+    → COMMIT (the reservation) → adapter.send → update row → dispatch_audit →
+    commit
 
 Reserve → commit → call → record (decisions §578). The route holds the
 invoice's row lock (`FOR UPDATE`) while it checks the invoice and this module
@@ -20,7 +21,10 @@ takes the lock (:func:`resolve_receiver`) and passes the adapter in.
 A ``send`` that raises (rather than returning a failed result, which every
 adapter does for transport errors) leaves the reservation ``sending``: whether
 the document left is unknown, and an unknown send counts as sent, exactly as
-an unknown ERP push does.
+an unknown ERP push does. So does a process that dies between the two commits.
+Such a row is settled by :func:`settle_stale_sending` (the operator script
+``scripts/settle_peppol_sending.py``), which asks the Access Point and never
+marks a row ``failed`` without its answer (decisions §580).
 
 Reuses the shipped ``e_invoice`` package wholesale (no UBL duplication) and the
 ``peppol_adapters`` family. Idempotency is enforced at the DATA layer by the
@@ -41,7 +45,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -63,6 +68,7 @@ from app.services.peppol_adapters import (
     ParticipantId,
     PeppolAdapter,
     PeppolSendError,
+    TransmissionLookup,
     TransmissionRequest,
     UnknownPeppolProviderError,
     get_peppol_adapter,
@@ -237,6 +243,24 @@ async def send_invoice_over_peppol(
         if racer is not None:
             return racer, True
         raise
+    # 7a. Audit the reservation in its own transaction (decisions §580): if the
+    # process dies before the outcome commit, the row stays `sending` and this
+    # is the trail's only record of who started the send and under which key.
+    await dispatch_audit(
+        db,
+        correlation_id=correlation_id,
+        organization_id=organization_id,
+        actor_id=actor_id,
+        action="invoice.peppol_send_started",
+        entity_type="invoice",
+        entity_id=invoice_id,
+        details={
+            "provider": adapter.provider_name,
+            "receiver_scheme": receiver_id.scheme,
+            "business_message_id": business_message_id,
+            "doc_type": PEPPOL_BIS_BILLING_DOCTYPE,
+        },
+    )
     # 7b. Commit the reservation: the slot is claimed durably and the caller's
     # invoice row lock is released before the network is touched (§578).
     await db.commit()
@@ -288,3 +312,147 @@ async def send_invoice_over_peppol(
     await db.commit()
     await db.refresh(transmission)
     return transmission, False
+
+
+# ---------------------------------------------------------------------------
+# Settling a `sending` row whose outcome was never recorded (decisions §580)
+# ---------------------------------------------------------------------------
+
+#: A ``sending`` row younger than this may still be in flight: its request is
+#: inside the adapter's timeout (20 s for ``as4_gateway``) or its outcome commit
+#: is a moment away. Settling it then would race the send it describes, so the
+#: settle refuses. Thirty minutes is far past any send and short enough that a
+#: stuck invoice is unblocked the same working session.
+STALE_SENDING_AFTER = timedelta(minutes=30)
+
+
+class SettleRefused(Exception):
+    """The ``sending`` row was left as it was. ``code`` is PII-free:
+
+    - ``no_sending_transmission`` — the invoice has no outbound row in ``sending``
+    - ``sending_too_recent`` — younger than :data:`STALE_SENDING_AFTER`
+    - ``provider_changed`` — the org's configured provider is not the one the
+      row was sent through, so its Access Point cannot be asked
+    - ``lookup_unsupported`` — the adapter cannot ask its Access Point
+    - ``lookup_inconclusive`` — the Access Point could not answer
+      (``detail`` carries its PII-free reason)
+    - ``already_settled`` — the send's own outcome commit landed meanwhile
+    """
+
+    def __init__(self, code: str, detail: str | None = None):
+        self.code = code
+        self.detail = detail
+        super().__init__(code if detail is None else f"{code}: {detail}")
+
+
+@dataclass
+class SettleResult:
+    transmission_id: uuid.UUID
+    status: str  # the row's new status: sent | delivered | failed
+    lookup_outcome: str  # the Access Point's answer, LOOKUP_OUTCOMES
+
+
+async def _sending_row(
+    db: AsyncSession, invoice_id: uuid.UUID, *, for_update: bool = False
+) -> PeppolTransmission | None:
+    stmt = select(PeppolTransmission).where(
+        PeppolTransmission.invoice_id == invoice_id,
+        PeppolTransmission.direction == _DIRECTION_OUTBOUND,
+        PeppolTransmission.status == "sending",
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def settle_stale_sending(
+    db: AsyncSession,
+    *,
+    invoice_id: uuid.UUID,
+    peppol_config: dict | None,
+    reason: str | None = None,
+    now: datetime | None = None,
+    min_age: timedelta = STALE_SENDING_AFTER,
+) -> SettleResult:
+    """Settle an invoice's stale ``sending`` transmission from the Access
+    Point's own record of it.
+
+    Asks the AP by the row's ``business_message_id`` (no lock held across the
+    network), then, under the row lock and still ``sending``: ``sent`` /
+    ``delivered`` record the AP's MessageId; ``failed`` or ``not_found`` mark
+    the row ``failed`` (a ``not_found`` document never reached the AP, and the
+    resend reuses the same key). Anything else refuses and changes nothing —
+    an unanswered row is never marked failed. The ``invoice.peppol_send_settled``
+    audit row is written in the same transaction, before the row changes; no
+    actor (an operator, not an app user).
+    """
+    now = now or datetime.now(UTC)
+    row = await _sending_row(db, invoice_id)
+    if row is None:
+        raise SettleRefused("no_sending_transmission")
+    if now - row.created_at < min_age:
+        raise SettleRefused("sending_too_recent")
+    try:
+        adapter = get_peppol_adapter(peppol_config)
+    except UnknownPeppolProviderError:
+        raise SettleRefused("provider_changed") from None
+    if adapter.provider_name != row.provider:
+        raise SettleRefused("provider_changed")
+    transmission_id = row.id
+    business_message_id = row.business_message_id
+    await db.rollback()  # hold nothing open across the network
+
+    try:
+        lookup: TransmissionLookup = await adapter.lookup_transmission(business_message_id)
+    except NotImplementedError:
+        raise SettleRefused("lookup_unsupported") from None
+    if lookup.outcome in ("sent", "delivered"):
+        new_status = lookup.outcome
+    elif lookup.outcome in ("failed", "not_found"):
+        new_status = "failed"
+    else:
+        raise SettleRefused("lookup_inconclusive", lookup.failure_reason)
+
+    row = await _sending_row(db, invoice_id, for_update=True)
+    if row is None or row.id != transmission_id:
+        await db.rollback()
+        raise SettleRefused("already_settled")
+    invoice = (
+        await db.execute(
+            select(Invoice.correlation_id, Invoice.organization_id).where(Invoice.id == invoice_id)
+        )
+    ).one()
+    failure_reason = None
+    if new_status == "failed":
+        failure_reason = lookup.failure_reason or (
+            "not_at_access_point" if lookup.outcome == "not_found" else "access_point_failed"
+        )
+    message_id = lookup.message_id if new_status != "failed" else None
+    await dispatch_audit(
+        db,
+        correlation_id=invoice.correlation_id,
+        organization_id=invoice.organization_id,
+        actor_id=None,
+        action="invoice.peppol_send_settled",
+        entity_type="invoice",
+        entity_id=invoice_id,
+        details={
+            "provider": row.provider,
+            "business_message_id": business_message_id,
+            "lookup_outcome": lookup.outcome,
+            "status": new_status,
+            "message_id": message_id,
+            "failure_reason": failure_reason,
+            "sending_since": row.created_at.isoformat(),
+            "reason": reason,
+        },
+    )
+    row.status = new_status
+    row.message_id = message_id
+    row.failure_reason = failure_reason
+    row.raw_response = lookup.raw_response
+    row.transmitted_at = now if new_status != "failed" else row.transmitted_at
+    await db.commit()
+    return SettleResult(
+        transmission_id=transmission_id, status=new_status, lookup_outcome=lookup.outcome
+    )

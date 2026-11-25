@@ -28,6 +28,7 @@ Same registry shape as `payment_adapters` / `card_adapters`:
 class MyAdapter(PeppolAdapter):
     async def resolve_participant(self, pid: ParticipantId) -> ParticipantCapability: ...
     async def send(self, request: TransmissionRequest) -> TransmissionResult: ...
+    async def lookup_transmission(self, business_message_id: str) -> TransmissionLookup: ...  # settle a stuck `sending` row (§580)
     async def test_connection(self) -> bool: ...
     def parse_inbound(self, headers, body): ...   # inbound: verify + parse an AS4 delivery
 ```
@@ -220,10 +221,48 @@ decisions §573). A `sending` row counts: its outcome is unknown — including a
 transmit that raised instead of returning a result, which leaves its row
 `sending`.
 
-A send writes a `invoice.peppol_sent` (or `invoice.peppol_send_failed`) audit
-row through `dispatch_audit` (`details` records provider, `receiver_scheme`,
-`message_id`, `doc_type` — **never** the receiver value / tax id). The
-idempotent short-circuit deliberately writes **no** duplicate audit row.
+A send writes two audit rows through `dispatch_audit`:
+`invoice.peppol_send_started` in the **reservation's** transaction (actor,
+`business_message_id`, provider, `receiver_scheme`, `doc_type`), then
+`invoice.peppol_sent` (or `invoice.peppol_send_failed`) with the outcome
+(`message_id`, `status`, `failure_reason`). Neither records the receiver value
+/ tax id. The idempotent short-circuit deliberately writes **no** duplicate
+audit row. Deleting an invoice with a transmission not `failed` is refused
+(409 `invoice_delete_peppol_transmitted`; bulk delete skips it): the row is the
+local record of the e-invoice the receiver holds (decisions §580).
+
+### Clearing a stuck `sending` row
+
+A process that dies between the reservation commit and the outcome commit (a
+deploy, a crash, a transmit that raised) leaves the row `sending` for good:
+every resend answers `already_sent` and the recall stays refused. The trail
+shows `invoice.peppol_send_started` with no outcome after it. An operator
+settles it from the Access Point's own record (decisions §580):
+
+```bash
+cd backend
+python scripts/settle_peppol_sending.py --slug acme --invoice <invoice-uuid> --reason "TICKET-123"
+```
+
+`peppol_send.settle_stale_sending` asks the AP by the row's
+`business_message_id` (`PeppolAdapter.lookup_transmission`; `as4_gateway`
+reads `GET {gateway}/as4/outbound/{business_message_id}`, the mock answers
+`sent` as its send would), then, under the row lock and only if the row is
+still `sending`, records the answer and writes `invoice.peppol_send_settled`
+(no actor; `lookup_outcome`, `status`, `message_id`, `reason`) in the same
+transaction:
+
+| AP answer | Row becomes | Exit |
+|-----------|-------------|------|
+| `sent` / `delivered` | that status, with the AP's MessageId | 0 |
+| `failed`, or no transmission under that key (`not_found`) | `failed` (`failure_reason` the AP's code, or `not_at_access_point`) — the invoice can be sent again and recalled | 0 |
+| no such tenant, or no `sending` row | unchanged | 1 |
+| row younger than `STALE_SENDING_AFTER` (30 min): it may still be in flight | unchanged | 2 |
+| AP unreachable / unconfigured / unrecognised answer, adapter cannot look up, or the org's provider is no longer the one the row went through | unchanged — a row is **never** marked `failed` without the AP's answer | 3 |
+
+The `as4_gateway` status path is this adapter's generic gateway shape, like
+`/as4/outbound`; map it to the contracted gateway's status endpoint when one
+is chosen.
 
 ## Reading an invoice's transmission state
 
@@ -399,10 +438,16 @@ real inbound signing secret (sops) to receive/transmit for real.
 
 - `tests/test_peppol_adapters.py` — ParticipantId parse/format + PII-free
   errors, mock resolve/send, registry fallback, gateway HTTP (stubbed,
-  no-network) incl. the no-key-fallback path, constants.
-- `tests/test_peppol_send.py` — happy path (row + one audit), idempotent
-  re-send (one adapter call), tax-invalid (no row), unknown receiver, failed-
-  then-retry, PII-not-in-logs.
+  no-network) incl. the no-key-fallback path, constants, and
+  `lookup_transmission` (mock and every gateway answer, §580).
+- `tests/test_peppol_send.py` — happy path (row + started / sent audit rows),
+  idempotent re-send (one adapter call), tax-invalid (no row), unknown
+  receiver, failed-then-retry, PII-not-in-logs; a send that dies after the
+  reservation (row `sending`, `invoice.peppol_send_started` only) and
+  `settle_stale_sending` (too recent, AP `sent`, AP `not_found` then a resend,
+  never `failed` on an inconclusive or unsupported lookup, provider changed).
+- `tests/test_invoice_delete_cascade.py` — delete refused (bulk skipped) with a
+  transmission not `failed`; a `failed` one is cleared with the invoice.
 - `tests/test_peppol_route.py` — 200 / already_sent / 404 / 400 / 422 / 403,
   the structured 422 body, and `GET /peppol-transmissions` (empty / populated
   / PII-free / clerk-readable / 404 / tenant- + entity-scoped).

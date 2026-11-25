@@ -198,6 +198,8 @@ export const enAudit = {
 	'audit.action.invoice.payment_scheduled': "Payment scheduled",
 	'audit.action.invoice.peppol_received': "Received over PEPPOL",
 	'audit.action.invoice.peppol_send_failed': "PEPPOL send failed",
+	'audit.action.invoice.peppol_send_settled': "PEPPOL send settled from the Access Point",
+	'audit.action.invoice.peppol_send_started': "PEPPOL send started",
 	'audit.action.invoice.peppol_sent': "Sent over PEPPOL",
 	'audit.action.invoice.rejected': "Invoice rejected",
 	'audit.action.invoice.resubmitted': "Invoice resubmitted",
