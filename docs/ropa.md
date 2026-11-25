@@ -111,6 +111,21 @@ holds the legal basis and we process under the
 | **Retention** | Session/blocklist entries expire with the token; the per-session IP + device record is torn down with the session it describes (revoke, logout, eviction, expiry) and never outlives the access-token lifetime; audit/security rows are append-only and retained per the audit-retention class. See [`backend/docs/retention.md`](../backend/docs/retention.md). |
 | **International transfers** | Per the customer's data-residency tier and any SSO provider's region; SCCs/IDTA where applicable. See [`docs/data-residency.md`](data-residency.md). |
 
+### 6. Bot protection on the public forms (hCaptcha)
+
+Not listed here before round 47, although hCaptcha has been engaged since signup shipped and, since decisions §553, on every deployment; added with §561.
+
+| Field | Detail |
+|-------|--------|
+| **Purpose** | Refuse automated abuse of the two public, email-sending forms: self-service signup (`POST /api/signup`) and the workspace lookup (`POST /api/workspace-lookup`, `/find-workspace`). Nowhere inside the signed-in application. |
+| **Our role** | Controller (the published Privacy Policy, § 8, lists the captcha provider among the recipients on our own controller side). |
+| **Legal basis** | Legitimate interests, Art. 6(1)(f): "our interest, and yours, in accounts that cannot be taken over" (Privacy Policy § 5, the row naming the captcha on the public signup and workspace-lookup forms). |
+| **Categories of data subjects** | Anyone submitting either form: prospective customers signing up, and customers' own users asking for their workspace address. |
+| **Categories of personal data** | The challenge token, the submitter's IP address (`remoteip`, sent by our server), and the browser signals hCaptcha's own in-page script collects — the same on both forms. Never the email address or anything else typed into the form. |
+| **Recipients / sub-processors** | hCaptcha (Intuition Machines, Inc.) — [`docs/sub-processors.md` § 21](sub-processors.md); published register `/legal/sub-processors`, change-log entry `2026-11-25-hcaptcha-workspace-lookup` (decisions §558). |
+| **Retention** | We store nothing from the check: the token is verified once (`utils/hcaptcha.py`) and discarded. hCaptcha's own retention is under its terms (DPA to be confirmed, sub-processors § 21). |
+| **International transfers** | United States (hCaptcha's processing location); transfer mechanism to be confirmed with its DPA. |
+
 ---
 
 ## Security measures (Art. 30(1)(g))
