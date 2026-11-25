@@ -2097,6 +2097,10 @@ async def get_me(
     return await _user_response(db, user, org)
 
 
+#: Generous for a person re-ticking the box; a loop posting it is not one.
+LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE = 10
+
+
 @router.post("/legal-acceptance", response_model=UserResponse)
 async def accept_legal_documents(
     body: LegalAcceptanceRequest,
@@ -2106,13 +2110,25 @@ async def accept_legal_documents(
 ):
     """Record the caller's acceptance of the Terms / Privacy versions in force.
 
-    The SPA's blocking re-prompt (`legal_acceptance_required` on `/me`) posts
-    here — a user who signed in through SSO or SCIM, one whose account predates
-    acceptance being collected, or anyone after a version bump. Only the
-    versions in force are accepted (422 `legal_acceptance_required` otherwise),
-    and re-accepting is harmless: the record is append-only and keeps its first
-    `accepted_at` (decisions §495).
+    The backend of the re-prompt (`legal_acceptance_required` on `/me`) for a
+    user who signed in through SSO or SCIM, one whose account predates
+    acceptance being collected, or anyone after a version bump. No client
+    screen posts here yet and nothing refuses an unaccepted user: the flag is
+    advisory until the accept screen exists (decisions §495, `docs/followups.md`).
+    Only the versions in force are accepted (422 `legal_acceptance_required`
+    otherwise), and re-accepting is harmless: the record is append-only and
+    keeps its first `accepted_at`.
     """
+    # Every call is a control-plane write plus, on a first acceptance, a shipped
+    # audit row, so cap it like the other auth writers. Keyed on the account:
+    # the caller is authenticated, and a per-IP bucket would lump an office's
+    # users together.
+    await check_rate_limit(
+        "auth_legal_acceptance",
+        limit=LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE,
+        window_seconds=60,
+        subject=str(user.id),
+    )
     if not legal_acceptance.accepts_current(
         body.accepted_terms_version, body.accepted_privacy_version
     ):
