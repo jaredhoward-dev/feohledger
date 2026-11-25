@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -131,8 +132,9 @@ async def _assert_discount_offer_linkable(
     offer row is locked, and no other non-void memo may already take it or any
     discount on this invoice (the partial unique index
     ``uq_credit_memos_discount_offer_live`` backs the per-offer half under a
-    race), nor any live payment booked with it — the run already takes that
-    discount, so a memo for it as well would deduct it twice.
+    race), and the invoice may hold no live payment: one booked with the
+    offer would deduct it twice, and one sent at the full amount would capture
+    savings nobody took when it settles.
 
     The deadline is deliberately NOT checked: a credit the supplier issued for
     the discount is a fact about what they agreed, whenever it is recorded.
@@ -187,16 +189,23 @@ async def _assert_discount_offer_linkable(
         raise _discount_offer_invalid(
             "Another credit memo already takes a discount on this invoice"
         )
-    booked = (
+    # Any live payment on the invoice refuses, not only one booked with this
+    # offer: a payment already sent at the full amount would otherwise settle
+    # and capture the offer through this memo, recording savings on money that
+    # left undiscounted. A staged one would fail dispatch anyway (its net moved).
+    live = (
         await db.execute(
             select(Payment.id).where(
-                Payment.discount_offer_id == offer.id,
+                Payment.invoice_id == invoice.id,
                 Payment.status.not_in(LIVE_PAYMENT_TERMINAL_STATUSES),
             )
         )
     ).first()
-    if booked is not None:
-        raise _discount_offer_invalid("A payment already takes this discount")
+    if live is not None:
+        raise _discount_offer_invalid(
+            "The invoice already has a payment in progress; a discount can only be "
+            "taken as a credit memo before it is paid"
+        )
 
 
 def _invoice_settled_detail(status: str) -> dict:
@@ -974,7 +983,18 @@ async def create_credit_memo(
         entity_id=vendor.entity_id,
     )
     db.add(memo)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # `uq_credit_memos_discount_offer_live`: the offer and invoice locks
+        # serialize linked creates, so this is a backstop, answered as the
+        # same coded refusal rather than a 500.
+        if body.discount_offer_id is None:
+            raise
+        await db.rollback()
+        raise _discount_offer_invalid(
+            "Another credit memo already takes a discount on this invoice"
+        ) from None
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),

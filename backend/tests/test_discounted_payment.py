@@ -489,13 +489,15 @@ async def test_a_return_credit_equal_to_the_savings_never_captures_a_lapsed_offe
 
 
 @pytest.mark.parametrize(
-    "variant", ["no_invoice", "wrong_amount", "other_invoice", "second_memo", "booked"]
+    "variant",
+    ["no_invoice", "wrong_amount", "other_invoice", "second_memo", "booked", "paid_in_full"],
 )
 async def test_a_memo_cannot_take_a_discount_it_is_not(realdb, variant):
     """The link is the proof, so it is refused unless the memo is exactly the
     discount: on the offer's own invoice, for the savings to the cent, the
-    only live discount memo on that invoice, and not a discount a live payment
-    already books (that would deduct it twice). Nothing is written on a
+    only live discount memo on that invoice, and with no live payment on the
+    invoice (one booked with the offer would deduct it twice; one sent at the
+    full amount would capture savings nobody took). Nothing is written on a
     refusal."""
     mk = realdb.sessionmaker(TENANT)
     org_id = realdb.info(TENANT).org_id
@@ -527,6 +529,13 @@ async def test_a_memo_cannot_take_a_discount_it_is_not(realdb, variant):
             await _create_run(realdb, invoice_id)
             payment = await _payment(mk, invoice_id)
             assert payment.discount_offer_id == uuid.UUID(offer_id)
+        elif variant == "paid_in_full":
+            # Deadline passed: the run books the full amount, no discount.
+            # Linking now would let that payment's settlement capture savings
+            # nobody took (money-path review, §520).
+            await _backdate(mk, offer_id, 30)
+            run = await _create_run(realdb, invoice_id)
+            assert run["total_amount"] == "1037.00"
         resp = await c.post("/api/credit-memos", json=body)
     assert resp.status_code == expected, resp.text
     if expected == 409:

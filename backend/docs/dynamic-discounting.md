@@ -498,7 +498,8 @@ unless the memo is exactly the discount: an invoice-scoped `accepted` offer
 with a tier, on the memo's own invoice, in the memo's currency, still priced on
 the invoice's amount, for its savings to the cent; the only live linked memo on
 that invoice (a partial unique index backs one per offer); and no live payment
-already booked with that offer. The deadline is not checked: a credit the
+on the invoice (one booked with the offer would deduct it twice, and one already
+sent at the full amount would capture savings nobody took when it settles). The deadline is not checked: a credit the
 supplier issued is what they agreed, whenever it is recorded. The link cannot
 be added or changed later (only an open, never-applied memo is editable, and a
 linked memo is applied at birth); voiding the memo frees the offer for the run

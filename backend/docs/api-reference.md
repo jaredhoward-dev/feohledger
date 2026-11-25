@@ -673,8 +673,8 @@ unless the memo is exactly the discount — 404 for an offer not on that invoice
 else 409 `credit_memo_discount_offer_invalid` for: no `invoice_id`; a
 vendor-scoped offer; an offer not `accepted` with a tier; another currency; an
 offer priced on an amount the invoice no longer has; an amount other than the
-savings to the cent; another live linked memo on the invoice; or a live payment
-already booked with the offer. The link is never editable (a linked memo is
+savings to the cent; another live linked memo on the invoice; or any live
+payment on the invoice. The link is never editable (a linked memo is
 applied at creation, and only an open memo is editable). Detail:
 `dynamic-discounting.md` § Taking a discount as a credit memo.
 

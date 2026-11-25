@@ -26281,8 +26281,11 @@ unless the memo is exactly the discount: an invoice-scoped `accepted` offer with
 a tier, on that invoice, in the memo's currency, still priced on the invoice's
 amount, for its savings to the cent; no other live linked memo on the invoice
 (one invoice takes one discount, matching the payment path's rule); and no live
-payment already booked with that offer (the run takes it, so a memo as well
-would deduct it twice). The deadline is not checked: a credit the supplier
+payment on the invoice at all. One booked with the offer would deduct it twice;
+one already sent at the full amount would, on settling, capture the offer
+through the memo for savings nobody took (a money-path review finding: the
+capture fallback trusts that a linked memo was netted, so the link must come
+before any payment). The deadline is not checked: a credit the supplier
 issued for the discount is what they agreed, whenever it is keyed. The link is
 not editable: a linked memo is born applied, and only open memos are editable.
 There is no screen for it. Since §250 the help has told users not to record
