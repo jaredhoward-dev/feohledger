@@ -73,10 +73,7 @@ def _trusted_proxy_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Net
     return tuple(nets)
 
 
-def _ip_in_trusted_proxy(ip: str) -> bool:
-    nets = _trusted_proxy_networks()
-    if not nets:
-        return False
+def _in_networks(ip: str, nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -84,28 +81,67 @@ def _ip_in_trusted_proxy(ip: str) -> bool:
     return any(addr in n for n in nets)
 
 
+def _ip_in_trusted_proxy(ip: str) -> bool:
+    nets = _trusted_proxy_networks()
+    if not nets:
+        return False
+    return _in_networks(ip, nets)
+
+
+def _parse_forwarded_entry(entry: str) -> str | None:
+    """One ``X-Forwarded-For`` element as a normalised address, or None.
+
+    Anything that is not an IP literal (``unknown``, an obfuscated ``_node``
+    identifier, a hostname, junk) yields None, so a malformed entry can never
+    become a rate-limit key."""
+    try:
+        return str(ipaddress.ip_address(entry.strip()))
+    except ValueError:
+        return None
+
+
 def resolve_client_ip(request: Request | None) -> str | None:
     """Resolve the originating client IP.
 
-    Only honours ``X-Forwarded-For`` when the connecting peer is in the
-    configured ``trusted_proxy_cidrs`` allowlist — otherwise a direct
-    attacker could rotate through arbitrary IPs by spoofing the header
-    and dodge per-IP rate limits.
+    ``X-Forwarded-For`` is read only when the socket peer is inside the
+    configured ``trusted_proxy_cidrs``; otherwise a direct caller could rotate
+    through arbitrary addresses by forging the header and dodge every per-IP
+    limit. With an empty value or ``none`` (decisions §553) no peer is trusted
+    and the socket peer is the client.
+
+    When the peer is trusted, the header is walked **from the right**: each
+    trusted proxy appends the address it received the request from, so the
+    rightmost entries are the hops we trust, and the first address that is
+    not inside ``trusted_proxy_cidrs`` is the client. Everything to its left
+    was written by that client and is ignored. This is what makes an
+    *appending* proxy safe (the AWS ALB appends to whatever the client sent,
+    so a forged leftmost entry survives into the header); a *replacing* proxy
+    (Caddy, for an untrusted client) leaves one entry and gives the same
+    answer. Entries that are not IP literals are skipped. If every entry is a
+    trusted address, the leftmost is the client (an internal caller behind the
+    proxy); a trusted peer with no usable entry keys on the peer itself
+    (decisions §558).
 
     This is the single shared resolver: every request-path caller that
-    records or keys on a client IP (limiter buckets, login/signup/SSO
-    audit rows, captcha verification) goes through here, so they all
-    agree on who the client is when the app sits behind a trusted proxy
-    (Caddy on the single-VM stack, the ALB on ECS).
+    records or keys on a client IP (limiter buckets, login/signup/SSO audit
+    rows, captcha verification) goes through here, so they all agree on who
+    the client is.
     """
     if request is None or request.client is None:
         return None
     peer = request.client.host
-    if _ip_in_trusted_proxy(peer):
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-    return peer
+    nets = _trusted_proxy_networks()
+    if not nets or not _in_networks(peer, nets):
+        return peer
+    # Several X-Forwarded-For headers are one list, in order (RFC 9110 §5.3).
+    raw = ",".join(request.headers.getlist("x-forwarded-for"))
+    hops = [ip for ip in (_parse_forwarded_entry(e) for e in raw.split(",")) if ip]
+    if not hops:
+        return peer
+    for ip in reversed(hops):
+        if not _in_networks(ip, nets):
+            return ip
+    return hops[0]
 
 
 def _client_ip(request: Request) -> str:
