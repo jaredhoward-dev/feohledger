@@ -342,7 +342,7 @@
 
 <svelte:window onclick={onWindowClick} />
 
-<section class="card" data-testid="commerce-panel">
+<section class="card org-panel" data-testid="commerce-panel">
 	<h2>{m('org.section.commerce')}</h2>
 	<p class="card-hint">{m('org.commerce.hint')}</p>
 
@@ -636,17 +636,6 @@
 		color: var(--danger);
 	}
 
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
-	.full-width {
-		grid-column: 1 / -1;
-	}
-
 	label {
 		display: flex;
 		flex-direction: column;
@@ -800,11 +789,5 @@
 
 	.test-result.failure {
 		color: var(--danger);
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
 	}
 </style>

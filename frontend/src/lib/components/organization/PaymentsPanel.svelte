@@ -60,7 +60,7 @@
 	const MODERN_TREASURY = 'Modern Treasury';
 </script>
 
-<section class="card" id="org-payments">
+<section class="card org-panel" id="org-payments">
 	<div class="help-row">
 		<h2>{m('org.section.payments')}</h2>
 		<HelpTip term="payment-rail" />
@@ -326,13 +326,6 @@
 		margin: 0 0 14px;
 	}
 
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
 	/* Per-field explanation sitting OUTSIDE the <label> (it is referenced by
 	   aria-describedby instead), so it describes the control without being
 	   swallowed into its accessible name. */
@@ -404,22 +397,6 @@
 		font-size: 0.95rem;
 		font-weight: 600;
 		color: var(--text);
-	}
-
-	.section-footer {
-		display: flex;
-		/* Same reason as `.erp-test-row` (now in ExtractionPanel): this row
-		   carries a Save button, an optional Test button and an optional result message, all of them
-		   `white-space: nowrap`. Without a wrap the row cannot shrink below its
-		   own max-content width and pushes the whole document sideways at 320px
-		   — WCAG 1.4.10. The `gap` replaces the spacing the buttons used to get
-		   for free from sitting on one line. */
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
 	}
 
 	.btn-save-section {
@@ -503,12 +480,5 @@
 		accent-color: var(--accent);
 		cursor: pointer;
 		flex-shrink: 0;
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
-
 	}
 </style>

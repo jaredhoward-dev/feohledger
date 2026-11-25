@@ -79,7 +79,7 @@
 	});
 </script>
 
-<section class="card">
+<section class="card org-panel">
 	{@render intro()}
 
 	{#if loading}
@@ -145,13 +145,6 @@
 		font-size: 0.82rem;
 		color: var(--text-muted);
 		margin: 0 0 14px;
-	}
-
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
 	}
 
 	label {
@@ -254,22 +247,6 @@
 		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
-	.section-footer {
-		display: flex;
-		/* Same reason as `.erp-test-row` (now in ExtractionPanel): this row
-		   carries a Save button, an optional Test button and an optional result message, all of them
-		   `white-space: nowrap`. Without a wrap the row cannot shrink below its
-		   own max-content width and pushes the whole document sideways at 320px
-		   — WCAG 1.4.10. The `gap` replaces the spacing the buttons used to get
-		   for free from sitting on one line. */
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
-	}
-
 	.btn-save-section {
 		padding: 8px 18px;
 		border-radius: 6px;
@@ -290,12 +267,5 @@
 	.btn-save-section:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
-
 	}
 </style>

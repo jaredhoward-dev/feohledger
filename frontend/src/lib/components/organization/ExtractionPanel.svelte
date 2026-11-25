@@ -62,7 +62,7 @@
 	];
 </script>
 
-<section class="card">
+<section class="card org-panel">
 	<div class="help-row">
 		<h2>{m('org.section.extraction')}</h2>
 		<HelpTip term="extraction" />
@@ -225,13 +225,6 @@
 		margin-top: 10px;
 	}
 
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
 	label {
 		display: flex;
 		flex-direction: column;
@@ -359,12 +352,5 @@
 
 	.test-result.failure {
 		color: var(--danger);
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
-
 	}
 </style>
