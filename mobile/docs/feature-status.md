@@ -208,7 +208,11 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   Accept posts the versions in `lib/legal_versions.generated.dart` to
   `POST /api/auth/legal-acceptance`; a coded 422 means this build is older than
   the documents in force and the screen says to update the app instead of
-  asking again (decisions §495, §498)
+  asking again (decisions §495, §498). Nothing else gets past it: a
+  notification deep link waits until it is cleared (see Push notifications),
+  and a resume's `/me` re-read never supersedes an accept already in flight.
+  Each notice is announced once, through `A11y.announce`, and the busy Accept
+  button keeps its name ("Loading…")
 - Camera OCR — snap photo or pick from gallery → upload → trigger AI extraction
 - File upload via file picker — pick a PDF / PNG / JPG / TIFF document on the device (`CameraCapture.pickDocument` → `file_picker`) and upload it through the same `/api/invoices/upload` extraction pipeline as the camera path. The capture screen offers Camera / Gallery / Choose file; PDFs preview as a document card (no inline bitmap), images preview inline
 - File viewer — the invoice detail screen previews the uploaded file (image thumbnail or a PDF card) and opens it full-screen via `InvoiceFileViewer`: images via `Image.network` (auth headers), PDFs fetched as bytes (`ApiClient.getBytes`, so the JWT + tenant headers are attached) and rendered with `pdfx`; loading / error / Retry states

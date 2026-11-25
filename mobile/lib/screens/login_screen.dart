@@ -190,13 +190,17 @@ class _LoginScreenState extends State<LoginScreen> {
                         style: FilledButton.styleFrom(
                           padding: const EdgeInsets.symmetric(vertical: 16),
                         ),
+                        // The spinner's label names the button while it is
+                        // busy; without one a screen reader announces a
+                        // nameless button.
                         child: auth.loading
-                            ? const SizedBox(
+                            ? SizedBox(
                                 height: 20,
                                 width: 20,
                                 child: CircularProgressIndicator(
                                   strokeWidth: 2,
                                   color: Colors.white,
+                                  semanticsLabel: l.commonLoading,
                                 ),
                               )
                             : Text(l.loginSignIn),

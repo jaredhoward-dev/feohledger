@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -71,6 +73,32 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Invalid credentials'), findsOneWidget);
+  });
+
+  testWidgets('busy: Sign In keeps an accessible name while it spins',
+      (tester) async {
+    final handle = tester.ensureSemantics();
+    final held = Completer<http.Response>();
+    ApiClient().debugConfigure(client: MockClient((req) => held.future));
+
+    await tester.pumpWidget(_host(const LoginScreen()));
+    await tester.enterText(
+        find.widgetWithText(TextFormField, 'Email'), 'demo@acme.com');
+    await tester.enterText(
+        find.widgetWithText(TextFormField, 'Password'), 'demo');
+    await tester.tap(find.widgetWithText(FilledButton, 'Sign In'));
+    await tester.pump();
+
+    // Only a spinner is on the button now; its label is the button's name.
+    expect(
+      tester.getSemantics(find.byType(FilledButton)),
+      containsSemantics(label: 'Loading…', isButton: true),
+    );
+
+    held.complete(http.Response('nope', 401));
+    await tester.pumpAndSettle();
+    expect(find.text('Invalid credentials'), findsOneWidget);
+    handle.dispose();
   });
 
   // The successful-login path navigates to the real HomeScreen (which spins an

@@ -160,12 +160,16 @@ class _LegalAcceptScreenState extends State<LegalAcceptScreen> {
                           style: FilledButton.styleFrom(
                             minimumSize: const Size.fromHeight(48),
                           ),
+                          // The spinner's label names the button while it
+                          // is busy; without one a screen reader announces a
+                          // nameless button.
                           child: busy
-                              ? const SizedBox(
+                              ? SizedBox(
                                   width: 20,
                                   height: 20,
                                   child: CircularProgressIndicator(
                                     strokeWidth: 2,
+                                    semanticsLabel: l.commonLoading,
                                   ),
                                 )
                               : Text(l.legalAcceptButton),
@@ -194,6 +198,10 @@ class _LegalAcceptScreenState extends State<LegalAcceptScreen> {
 
 /// An error notice in the theme's error container colours (AA in light and
 /// dark: the scheme pairs them).
+///
+/// Not a live region: the screen announces each notice through
+/// `A11y.announce` as it raises it (the funnel `mobile/CLAUDE.md` prescribes),
+/// and a live region too would read the same text twice.
 class _Notice extends StatelessWidget {
   final String text;
 
@@ -208,10 +216,7 @@ class _Notice extends StatelessWidget {
         color: scheme.errorContainer,
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Semantics(
-        liveRegion: true,
-        child: Text(text, style: TextStyle(color: scheme.onErrorContainer)),
-      ),
+      child: Text(text, style: TextStyle(color: scheme.onErrorContainer)),
     );
   }
 }
