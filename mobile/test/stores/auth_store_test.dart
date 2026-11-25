@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -448,6 +449,73 @@ void main() {
       expect(await store.acceptLegalDocuments(), LegalAcceptOutcome.failed);
       expect(store.legalError, 'Too many requests');
       expect(store.legalAcceptanceRequired, isTrue);
+    });
+
+    // A resume's refreshProfile() used to take a newer request token while an
+    // accept was in flight; the accept's response was then discarded without
+    // lowering `acceptingLegal`, so the screen stayed busy and the guard at
+    // the top of acceptLegalDocuments refused every retry.
+    test('a resume refresh during an in-flight accept neither strands it nor '
+        'discards its answer', () async {
+      final gate = Completer<http.Response>();
+      var meReads = 0;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          final path = req.url.path;
+          if (path == '/api/auth/login') {
+            return _json({'access_token': 'tok-123'});
+          }
+          if (path == '/api/auth/me') {
+            meReads++;
+            return _json(me(required: true));
+          }
+          if (path == '/api/auth/legal-acceptance') return gate.future;
+          return _json({});
+        }),
+      );
+      await store.login('demo@acme.com', 'demo', 'acme');
+      expect(store.legalAcceptanceRequired, isTrue);
+      final readsAtSignIn = meReads;
+
+      final accepting = store.acceptLegalDocuments();
+      expect(store.acceptingLegal, isTrue);
+
+      await store.refreshProfile(); // the app came back to the foreground
+      expect(meReads, readsAtSignIn,
+          reason: 'the accept response is the fresher profile');
+      expect(store.acceptingLegal, isTrue);
+
+      gate.complete(_json(me(required: false)));
+      expect(await accepting, LegalAcceptOutcome.accepted);
+      expect(store.acceptingLegal, isFalse);
+      expect(store.legalAcceptanceRequired, isFalse);
+    });
+
+    test('an accept superseded by sign-out lowers its busy flag, never the '
+        "next session's", () async {
+      final first = Completer<http.Response>();
+      await signInRequiringAcceptance((_) => first.future);
+      final stale = store.acceptLegalDocuments();
+      expect(store.acceptingLegal, isTrue);
+      store.reset(); // a 401 elsewhere ended the session mid-accept
+      expect(store.acceptingLegal, isFalse);
+
+      // The next session starts its own accept before the stale one answers.
+      final second = Completer<http.Response>();
+      await signInRequiringAcceptance((_) => second.future);
+      final current = store.acceptLegalDocuments();
+      expect(store.acceptingLegal, isTrue);
+
+      first.complete(_json(me(required: false)));
+      expect(await stale, LegalAcceptOutcome.failed);
+      expect(store.acceptingLegal, isTrue,
+          reason: "the stale answer must not lower the live accept's flag");
+      expect(store.legalAcceptanceRequired, isTrue);
+
+      second.complete(_json(me(required: false)));
+      expect(await current, LegalAcceptOutcome.accepted);
+      expect(store.acceptingLegal, isFalse);
+      expect(store.legalAcceptanceRequired, isFalse);
     });
 
     test('refreshProfile picks up a requirement raised after sign-in',
