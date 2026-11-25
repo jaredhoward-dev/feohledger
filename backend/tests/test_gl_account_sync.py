@@ -491,6 +491,98 @@ async def test_an_unlinked_row_a_legacy_code_names_twice_is_not_relinked(realdb)
     assert (await _rows(realdb))["Job Materials"].erp_account_id is None
 
 
+def _depreciation_rows(*, with_sub: bool = True) -> list[dict]:
+    """A top-level "Depreciation" (40) and, under "Truck" (38),
+    "Truck:Depreciation" (39): both keyed "Depreciation" before §284."""
+    rows = [
+        {"Id": "40", "Name": "Depreciation", "FullyQualifiedName": "Depreciation"},
+        {"Id": "38", "Name": "Truck", "FullyQualifiedName": "Truck"},
+    ]
+    if with_sub:
+        rows.append(
+            {
+                "Id": "39",
+                "Name": "Depreciation",
+                "FullyQualifiedName": "Truck:Depreciation",
+                "ParentRef": {"value": "38"},
+            }
+        )
+    return rows
+
+
+async def test_a_merged_row_linked_to_the_right_sounding_account_is_questioned(realdb):
+    """decisions §524: the merged row "Depreciation" landed on the top-level
+    account, whose current code IS "Depreciation". Nothing proves the link
+    wrong, so it keeps posting there — but it is no longer trusted silently:
+    the other account the old key named is recorded beside its own, and the
+    row needs a decision until a person confirms one."""
+    row_id = await _add(realdb, code="Depreciation", name="Depreciation", erp_account_id="40")
+    result = await _sync(realdb, await _qbo_payloads(_depreciation_rows()))
+
+    assert result.unlinked == []
+    assert all(c["code"] != "Depreciation" for c in result.conflicts)
+    assert all(change["code"] != "Depreciation" for change in result.link_changes)
+    chart = await _rows(realdb)
+    row = chart["Depreciation"]
+    assert row.id == row_id
+    assert row.erp_account_id == "40"
+    assert row.erp_link_candidates == {
+        "realm": None,
+        "reason": AMBIGUOUS_LEGACY,
+        "accounts": [
+            {"erp_account_id": "39", "code": "Truck:Depreciation", "name": "Truck:Depreciation"},
+            {"erp_account_id": "40", "code": "Depreciation", "name": "Depreciation"},
+        ],
+    }
+    # The sub-account gets its own row; nothing posts on a changed guess.
+    assert chart["Truck:Depreciation"].erp_account_id == "39"
+    async with realdb.sessionmaker(TENANT)() as s:
+        ids = await resolve_erp_account_ids(s, realdb.info(TENANT).org_id, None, ["Depreciation"])
+    assert ids == {"Depreciation": "40"}
+
+    # Asked again on every pull until a person answers...
+    again = await _sync(realdb, await _qbo_payloads(_depreciation_rows()))
+    assert again.unlinked == []
+    assert (await _rows(realdb))["Depreciation"].erp_link_candidates is not None
+
+
+async def test_a_confirmed_right_sounding_link_is_no_longer_questioned(realdb):
+    """...and a person's confirmation is the answer: rule 4 never re-asks it."""
+    from datetime import UTC, datetime
+
+    await _add(
+        realdb,
+        code="Depreciation",
+        name="Depreciation",
+        erp_account_id="40",
+        erp_link_confirmed_at=datetime.now(UTC),
+    )
+    await _sync(realdb, await _qbo_payloads(_depreciation_rows()))
+    row = (await _rows(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_candidates) == ("40", None)
+
+
+async def test_the_question_clears_when_the_other_account_leaves_the_erp(realdb):
+    """Once no other pulled account answers to the old key, nothing is left to
+    decide: the question is dropped and the link stays."""
+    await _add(realdb, code="Depreciation", name="Depreciation", erp_account_id="40")
+    await _sync(realdb, await _qbo_payloads(_depreciation_rows()))
+    assert (await _rows(realdb))["Depreciation"].erp_link_candidates is not None
+
+    await _sync(realdb, await _qbo_payloads(_depreciation_rows(with_sub=False)))
+    row = (await _rows(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_candidates) == ("40", None)
+
+
+async def test_a_row_no_other_account_shares_a_key_with_is_not_questioned(realdb):
+    """Only a key two pulled accounts share raises the question: a top-level
+    account whose name no sub-account repeats is trusted as before."""
+    await _add(realdb, code="Truck", name="Truck", erp_account_id="38")
+    await _sync(realdb, await _qbo_payloads(_depreciation_rows()))
+    row = (await _rows(realdb))["Truck"]
+    assert (row.erp_account_id, row.erp_link_candidates) == ("38", None)
+
+
 async def test_every_merged_row_in_scope_is_unlinked_not_just_the_preferred(realdb):
     """Multi-entity: a shared "Job Materials" and an entity's own override can
     both hold the merged link. Unlinking only the preferred one would leave the

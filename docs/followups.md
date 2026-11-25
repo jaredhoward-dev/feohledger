@@ -1171,23 +1171,6 @@ scope (§260) — do not fold them into any of these.
       pages, records completeness per run, and applies the absence-based rules
       (dead links, uniqueness counts) only once a run has read the whole
       collection. **Trigger:** the first tenant over the bound.
-- [ ] **(c) A collapsed QuickBooks row whose link landed on the right-sounding
-      account keeps it.** decisions §284's accepted residual: a pre-§284 row
-      that merged several accounts under one bare `Name`, and whose link landed
-      on the account whose current code equals that name (a top-level account
-      named like the sub-accounts, e.g. "Depreciation" over
-      "Truck:Depreciation"), looks exactly like a correct row, so rule 4 keeps
-      its link and invoices meant for a sub-account keep posting to the
-      top-level one. **Durable fix:** when a row's code is the legacy key of
-      more than one pulled account, keep its link but record the other
-      accounts as `erp_link_candidates` and badge the row "Needs a decision"
-      until a person confirms (`POST /api/gl-accounts/{id}/erp-link`), rather
-      than trusting it silently. **Trigger:** the next change to rule 4 in
-      `services/gl_account_sync`, or a report of a bill posted to a parent
-      account that meant a sub-account.
-      (Merge.dev's half — account `status` and the GL parent id — landed
-      2026-10-26 with the Contacts vendor fix; Sage Accounting UK's
-      out-of-chart ledgers are emitted inactive since decisions §390.)
 - [ ] **(c) Sage Intacct's key-referenced bill line is unconfirmed against
       Intacct.** (Two vendors sharing one `erp_vendor_id` is closed by
       `uq_vendors_erp_link`, migration 0141, decisions §486; a CSV vendor code

@@ -95,17 +95,18 @@ def _serialize(a: GLAccount) -> dict:
         # whether an edit reaches one subsidiary or all of them. Additive: the
         # picker callers read `id` / `code` / `name` and ignore it.
         "entity_id": str(a.entity_id) if a.entity_id else None,
-        # "Needs a decision": the ERP accounts the last sync found this
-        # unlinked row could mean and would not choose between
-        # (`services/gl_account_sync`, docs/decisions.md §284). A person picks
-        # one through `POST /{id}/erp-link`. The connection realm stays
+        # "Needs a decision": the ERP accounts the last sync found this row
+        # could mean and would not choose between (`services/gl_account_sync`,
+        # docs/decisions.md §284) — on an unlinked row, or on a linked one
+        # whose link rule 4 questions (§524; the link keeps posting). A person
+        # picks one through `POST /{id}/erp-link`. The connection realm stays
         # server-side.
         "erp_link_candidates": (
             {
                 "reason": a.erp_link_candidates.get("reason"),
                 "accounts": a.erp_link_candidates.get("accounts") or [],
             }
-            if a.erp_link_candidates and a.erp_account_id is None
+            if a.erp_link_candidates
             else None
         ),
         "erp_link_confirmed_at": (
@@ -566,8 +567,8 @@ async def confirm_gl_account_erp_link(
     entity_id: uuid.UUID | None = Depends(get_entity_id),
     control_db: AsyncSession = Depends(get_control_db),
 ):
-    """Say which ERP account an unlinked row means, among the ones the last
-    sync named (``erp_link_candidates``).
+    """Say which ERP account a row means, among the ones the last sync named
+    (``erp_link_candidates``).
 
     The sync refuses to guess when a row's code is a key several ERP accounts
     answer to — a pre-§284 QuickBooks row "Depreciation" may have meant the
@@ -576,9 +577,15 @@ async def confirm_gl_account_erp_link(
     can, so this is the way out: it links the row to the chosen candidate,
     marks the link confirmed so later syncs do not re-judge it by those rules,
     and audits the choice (``gl_account.erp_link_confirmed``). It never accepts
-    an id the sync did not offer, never re-points a row that is already linked
-    (unlinking is the sync's job), and refuses candidates gathered under a
-    different ERP connection — ids are per company.
+    an id the sync did not offer, never re-points a linked row the sync did
+    not question (unlinking is the sync's job), and refuses candidates
+    gathered under a different ERP connection — ids are per company.
+
+    A LINKED row with candidates is one rule 4 kept but questioned (§524):
+    its code is its account's current code and also a legacy key other
+    accounts shared, so it may have merged them. Confirming its own account
+    keeps the link and marks it confirmed; choosing another re-points it, and
+    the audit row records where its bills posted before (``from_erp_account_id``).
 
     The same editor rule as ``PATCH /{id}``: with an entity selected only that
     entity's own rows; a shared row from the consolidated view. Gate: admin |
@@ -587,7 +594,8 @@ async def confirm_gl_account_erp_link(
     The row is read ``FOR UPDATE``: two people confirming different candidates
     at once would otherwise both pass the "not linked yet" check and the last
     write would win, with two audit rows naming different accounts. Locked, the
-    second waits, then sees the first link and is refused 409. The connection
+    second waits, then sees the first decision (a link and no candidates) and
+    is refused 409. The connection
     is resolved first so the lock is never held across the credential decrypt.
     """
     try:
@@ -618,9 +626,9 @@ async def confirm_gl_account_erp_link(
                 "Switch to the consolidated view to edit it."
             ),
         )
-    if account.erp_account_id is not None:
-        raise HTTPException(status_code=409, detail="This account is already linked to the ERP.")
     pending = account.erp_link_candidates or {}
+    if account.erp_account_id is not None and not pending:
+        raise HTTPException(status_code=409, detail="This account is already linked to the ERP.")
     offered = {a.get("erp_account_id"): a for a in pending.get("accounts") or []}
     if body.erp_account_id not in offered:
         raise HTTPException(
@@ -635,6 +643,7 @@ async def confirm_gl_account_erp_link(
         )
 
     chosen = offered[body.erp_account_id]
+    previous = account.erp_account_id
     account.erp_account_id = body.erp_account_id
     # Never NULL, which is reserved for pre-0115 links (decisions §496).
     account.erp_link_realm = link_stamp(realm)
@@ -654,6 +663,10 @@ async def confirm_gl_account_erp_link(
             "code": account.code,
             "erp_account_id": body.erp_account_id,
             "erp_code": chosen.get("code"),
+            # The link a questioned row held until now (§524); None when the
+            # row was unlinked. Equal to `erp_account_id` when the person
+            # confirmed the account it already posted to.
+            "from_erp_account_id": previous,
             "reason": pending.get("reason"),
             "candidates": sorted(offered),
             "realm": realm,

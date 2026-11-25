@@ -5538,6 +5538,7 @@ export const en = {
 	'glAccounts.erpLink.chooseAria': "Choose ERP account for {code}",
 	'glAccounts.erpLink.title': "Which ERP account is {code}?",
 	'glAccounts.erpLink.intro': "The sync found more than one ERP account this row could mean, so it linked none. Invoices coded to {code} will post to the account you choose. Your choice is recorded in the audit trail.",
+	'glAccounts.erpLink.introLinked': "This row is linked to ERP account {current}, but before an update the sync keyed other ERP accounts by {code} too, so the row may have mixed them. Invoices coded to {code} keep posting to {current} until you confirm it or choose another. Your choice is recorded in the audit trail.",
 	'glAccounts.erpLink.optionId': "ERP id {id}",
 	'glAccounts.erpLink.confirm': "Link to this account",
 	'glAccounts.erpLink.toast.linked': "{code} is now linked to {erpCode}.",

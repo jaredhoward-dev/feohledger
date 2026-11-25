@@ -1554,6 +1554,70 @@ async def test_the_confirm_endpoint_refuses_anything_but_an_offered_candidate(
     assert (await _chart(realdb))["Depreciation"].erp_account_id is None
 
 
+async def test_a_questioned_link_is_confirmed_in_place(realdb, restore_settings):
+    """decisions §524: a merged row whose link landed on the top-level account
+    keeps posting there but needs a decision. Confirming its own account marks
+    it confirmed, clears the question, and audits where it posted before."""
+    await _set_erp(realdb, PROD_CFG)
+    row_id = await _add(
+        realdb, code="Depreciation", name="Depreciation", erp_account_id="40", erp_link_realm=PROD
+    )
+    await _sync(realdb, _depreciation_chart(), realm=PROD)
+
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        listed = (await c.get("/api/gl-accounts")).json()
+        questioned = next(a for a in listed if a["code"] == "Depreciation")
+        assert questioned["erp_account_id"] == "40"
+        assert [a["erp_account_id"] for a in questioned["erp_link_candidates"]["accounts"]] == [
+            "39",
+            "40",
+        ]
+        resp = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "40"})
+        again = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "39"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["erp_account_id"], body["erp_link_candidates"]) == ("40", None)
+    assert body["erp_link_confirmed_at"]
+    # Answered: a second person cannot re-point it on the stale question.
+    assert again.status_code == 409
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        audit = (
+            await s.execute(
+                select(AuditLog).where(AuditLog.action == "gl_account.erp_link_confirmed")
+            )
+        ).scalar_one()
+    assert (audit.details["from_erp_account_id"], audit.details["erp_account_id"]) == ("40", "40")
+
+    later = await _sync(realdb, _depreciation_chart(), realm=PROD)
+    assert later.unlinked == []
+    row = (await _chart(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_candidates) == ("40", None)
+
+
+async def test_a_questioned_link_is_repointed_to_the_chosen_sub_account(realdb, restore_settings):
+    """The row's invoices meant Truck:Depreciation: the person's choice moves
+    the link, and the audit row says where its bills posted until now."""
+    await _set_erp(realdb, PROD_CFG)
+    row_id = await _add(
+        realdb, code="Depreciation", name="Depreciation", erp_account_id="40", erp_link_realm=PROD
+    )
+    await _sync(realdb, _depreciation_chart(), realm=PROD)
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "39"})
+    assert resp.status_code == 200, resp.text
+    async with realdb.sessionmaker(TENANT)() as s:
+        audit = (
+            await s.execute(
+                select(AuditLog).where(AuditLog.action == "gl_account.erp_link_confirmed")
+            )
+        ).scalar_one()
+    assert (audit.details["from_erp_account_id"], audit.details["erp_account_id"]) == ("40", "39")
+    row = (await _chart(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_realm) == ("39", PROD)
+    assert row.erp_link_confirmed_at is not None
+
+
 async def test_a_confirmation_under_no_realm_is_stamped_not_null(realdb, restore_settings):
     """§496: a decision a mock pull offered (candidates' realm None) is
     confirmed onto the ``UNNAMED_REALM`` stamp, never NULL, which only a

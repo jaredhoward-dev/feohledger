@@ -1715,13 +1715,28 @@ badges it "Needs a decision" and counts such rows above the table; an admin or
 AP manager picks one with **Choose ERP account**
 (`POST /api/gl-accounts/{id}/erp-link`, audited `gl_account.erp_link_confirmed`).
 Only an id the last sync offered, under the same connection, is accepted, and
-only on an unlinked row. A confirmed link is exempt from rules 3 and 4 (it still
+only on an unlinked row or one rule 4 questioned (below). A confirmed link is
+exempt from rules 3 and 4 (it still
 leaves the row with its realm, kept for that company as below, and dies when
 the account leaves the ERP). The live case: an old
 row "Depreciation" when QuickBooks has a top-level "Depreciation" (40) and
 "Truck:Depreciation" (39). Picking 39 for the old row means the top-level
 account cannot also own the code "Depreciation" in that chart (it stays
 `code_taken`): pick the account the invoices coded to the row meant.
+
+**A link that looks right can still be questioned** (decisions §524). If that
+old row's link landed on the top-level account (40), its code is the account's
+current code and nothing proves it wrong, so rule 4 keeps the link and bills
+keep posting to 40. But "Truck:Depreciation" was also keyed "Depreciation"
+before §284, so the row may have merged the two: the sync records both
+accounts as its `erp_link_candidates` (reason `ambiguous_legacy`, its own
+account included) and the row shows "Needs a decision" beside its link, on
+every pull, until a person answers. Confirming 40 marks the link confirmed;
+choosing 39 re-points it; the audit row's `from_erp_account_id` says where its
+bills posted until then. The question drops by itself once no other pulled
+account answers to the old key. It is raised for every linked row whose code
+is a key another pulled account also had, so a row a post-§284 sync created
+under a top-level name asks once too: nothing on the row tells the two apart.
 
 **A GL account keeps its state for every company it was synced under**
 (decisions §376, `services/gl_account_erp_links`, migration 0127). A row's

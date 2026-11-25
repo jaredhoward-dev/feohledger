@@ -26749,3 +26749,47 @@ worker is done with this invoice", and a wait would be a sleep by another name.
 ledger to serve a test helper, and cascades would make a wrong production
 delete silently thorough. *`SERIALIZABLE`*: turns the race into a
 serialization failure the helper would then have to retry.
+
+## 524. A merged QuickBooks row linked to the right-sounding account keeps its link and is questioned (round 43)
+
+**Problem.** §284's accepted residual. Before §284 QuickBooks accounts were
+keyed by bare `Name`, so a row "Depreciation" may have merged the top-level
+"Depreciation" (40) and "Truck:Depreciation" (39) and been linked to whichever
+the old sync read last. Rule 4 unlinks such a row when its link is on 39 (the
+row's code is not 39's current code). When the link landed on 40, the row's
+code IS 40's current code and the row looks exactly like a correct one, so it
+kept posting there silently, including invoices meant for the sub-account.
+
+**Decision.** Rule 4 (`services/gl_account_sync`) now also looks at a linked,
+unconfirmed row whose code is its account's current code: when that code is a
+legacy key of any OTHER pulled account, the link is kept (nothing proves it
+wrong, and unlinking would refuse every push coded to the row) but the row
+gets `erp_link_candidates` (reason `ambiguous_legacy`, its own account and the
+others the key named). The end-of-sync refresh, which clears candidates on a
+linked row, skips rows questioned in this run; a later pull with no other
+account behind the key clears the question. The column, its CHECK in
+`gl_account_erp_links` (link and/or decision) and the keep/restore of §376
+already allowed a link and a decision together, so no migration.
+`POST /api/gl-accounts/{id}/erp-link` accepts a linked row only when it holds
+candidates: confirming its own account marks it confirmed, choosing another
+re-points it, and the audit row adds `from_erp_account_id`. A linked row with
+no candidates is still 409, which is also what a second confirmer sees after
+the first (the row lock is unchanged). The list API returns candidates on
+linked rows, `needsErpDecision` badges any row with candidates, and the dialog
+says the row is linked and keeps posting until someone chooses
+(`glAccounts.erpLink.introLinked`).
+
+**Accepted cost.** Nothing on a row says whether it predates §284: a link made
+then was adopted and stamped with its realm by its first post-0115 sync. So a
+row a post-§284 sync created for a top-level account whose name a sub-account
+repeats is questioned once too. It is one non-blocking confirmation (the link
+keeps posting meanwhile), after which rules 3 and 4 never re-ask.
+
+**Rejected.** *Unlinking the row like the sub-account case*: every invoice
+coded to the most likely account would be refused `account_not_linked` until a
+person answered, for a link that is usually right. *Questioning only links
+adopted from NULL realm in the same run*: would avoid the post-§284 noise but
+miss every tenant that already synced after §284, which is exactly who holds
+these rows. *Auto-confirming when no invoice is coded to the row*: the sync
+does not read invoices, and a later invoice would still be coded on a guess.
+
