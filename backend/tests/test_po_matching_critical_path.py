@@ -1162,6 +1162,80 @@ async def test_realdb_a_later_receipt_clears_the_finding_and_refresh_is_idempote
     assert refusal_after is None
 
 
+async def _server_order_with_cables_received(s, org_id, ent, number):
+    """A 1000.00 USD order of one 910.00 server and nine 10.00 cables, with
+    the nine cables received against their own line: 90.00 received, where
+    the proportional figure read 900.00 (decisions §519)."""
+    from app.models.procurement import GoodsReceipt, GRLineItem, POLineItem
+
+    po = await _add_po(s, org_id, ent, po_number=number, total="1000.00", currency="USD")
+    server = POLineItem(
+        po_id=po.id,
+        description="Server",
+        quantity=Decimal("1"),
+        unit_price=Decimal("910.00"),
+        total=Decimal("910.00"),
+    )
+    cables = POLineItem(
+        po_id=po.id,
+        description="Cable",
+        quantity=Decimal("9"),
+        unit_price=Decimal("10.00"),
+        total=Decimal("90.00"),
+    )
+    s.add_all([server, cables])
+    await s.flush()
+    gr = GoodsReceipt(
+        gr_number=f"GR-{uuid.uuid4().hex[:8]}",
+        po_id=po.id,
+        status="received",
+        organization_id=org_id,
+        entity_id=ent,
+    )
+    s.add(gr)
+    await s.flush()
+    s.add(
+        GRLineItem(
+            gr_id=gr.id,
+            po_line_item_id=cables.id,
+            description="Cable",
+            quantity_received=Decimal("9"),
+        )
+    )
+    await s.flush()
+    return po
+
+
+@pytest.mark.asyncio
+async def test_realdb_two_bills_past_the_cables_received_warn_at_the_lines_value(realdb):
+    """Two bills of 50.00 each fit the 90.00 of cables alone; together they
+    pass its 94.50 limit. Pro rata the receipt read 900.00 and neither the
+    sum nor a bill of 800.00 drew a finding."""
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    number = f"PO-RCPT-LINES-{uuid.uuid4().hex[:6]}"
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        await _server_order_with_cables_received(s, org_id, ent, number)
+        await _add_invoice(s, org_id, ent, po_number=number, amount="50.00")
+        inv = await _add_invoice(s, org_id, ent, po_number=number, amount="50.00")
+        await s.commit()
+
+        alone = await match_invoice_to_po(s, inv)
+        warnings = await _overbilling_codes(s, inv)
+
+    assert alone.received_value == Decimal("90.00")
+    assert alone.billed_beyond_receipt is False
+    assert alone.details["receipt_valuation"] == "per_line"
+    assert [w["code"] for w in warnings] == ["po_billed_beyond_receipt"]
+    assert warnings[0]["params"] == {
+        "totalBilled": "100.00",
+        "poNumber": number,
+        "receivedValue": "90.00",
+        "currency": "USD",
+    }
+
+
 # ===========================================================================
 # §470 amended: past approval the cumulative receipt finding is a
 # payment-blocking `po_mismatch`, and a receipt typed in by someone implicated

@@ -26377,3 +26377,49 @@ that drift apart. *Moving the aliases into a light module so portal terms
 match them*: they are written for the AP team's vocabulary (ERP terms,
 abbreviations), and the gain for ten terms is small.
 
+## 519. The receipt leg values receipts per PO line, cheapest first where a line names none (round 42)
+
+**Problem.** The "billed beyond receipt" check valued what arrived as
+`po_total × received / ordered` (§249), so nine 10.00 cables of an order for a
+910.00 server and those cables read as 900.00 received, and a 900.00 bill for
+the server passed both the per-invoice hold and the cumulative
+`po_billed_beyond_receipt` warning (§470). The quantity sums also hid a short
+line behind an over-received one: ten cables and no server read ten of ten,
+and the bill was never measured against a receipt at all.
+
+**Decision.** `po_matching._received_value` is the one valuation, and
+`MatchResult.received_value` stays the one figure the per-invoice hold, a
+split's legs and the cumulative warning read. Each goods line (ordered
+quantity > 0, value `total` else `quantity × unit_price`, value > 0) is worth
+its own unit value; a receipt line naming one of this PO's lines counts for it
+up to the quantity ordered on it; the covered share of the goods value is
+applied to `po_total`, so tax, freight lines and discounts the total carries
+scale with the goods rather than being received or not. The arithmetic is
+`Fraction`, turned into `Decimal` once. `received_value` is set whenever any
+goods value is outstanding, which now includes a short line beside an
+over-received one; `status` and the quantity fields keep their aggregate
+meaning there, and the existing `po_partial_receipt` sentence rides the hold.
+
+**A receipt line naming no line of this PO** (a free-text line, a row from
+before migration 0109, another PO's line) fills the cheapest outstanding units
+first. Nothing records which goods it was, and the lowest value it could have
+is the only one that never clears a bill on a guess. Its cost is a hold on a
+bill for goods that did arrive under an unlinked line, which a person can
+clear; the in-app receipt form always links lines, so this is legacy and
+import data.
+
+**An unpriced goods line keeps the proportional figure** for the whole PO
+(`details.receipt_valuation = "pro_rata"`, else `"per_line"`). Valuing its
+units at nothing would hold every partial bill on every ERP PO that sends
+quantities without prices, which nobody could act on; any other price is a
+guess. The fallback is exactly the pre-§519 figure, so such POs behave as
+before.
+
+**Rejected.** *Matching unlinked receipt lines by SKU or description*: a
+receipt naming a PO line is already the linked case, and a guessed pairing
+could clear a hold the lower bound keeps. *Making the hidden-short case
+`partial` with its own issue*: it needs a new catalogue code in six locales
+for a case the hold's sentence already states; the status stays the amount
+and quantity legs'. *Valuing over-received units on a line*: units nobody
+ordered cover nothing that was ordered.
+

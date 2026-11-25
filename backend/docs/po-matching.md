@@ -208,10 +208,10 @@ the contract, the requisitions) before `--apply`. Covered by
 
 ### The sync refreshes a PO's lines, never just its total
 
-The receipt-value check scales the PO total by received / ordered quantity, so
-a re-sync that moved the total and kept the old lines valued receipts wrongly:
-a PO amended from 10 × 10 to 20 × 10 kept 10 ordered units, and a 10-unit
-receipt was valued at the whole 200. When the adapter sends lines, the sync now
+The receipt-value check values a receipt by the PO's lines (their quantities
+and prices; § Short receipt), so a re-sync that moved the total and kept the
+old lines valued receipts wrongly: a PO amended from 10 × 10 to 20 × 10 kept 10
+ordered units, and a 10-unit receipt was valued at the whole 200. When the adapter sends lines, the sync now
 brings the stored ones in line (`api/purchase_orders._refresh_po_lines`,
 decisions §327), comparing at the column scales so the ERP's `3` and the stored
 `3.0000` are the same line:
@@ -446,28 +446,63 @@ amount leg opens the blocking row on its own figure.
 A short receipt (`received < ordered`) is routinely benign: goods in transit, or
 a split / blanket PO invoiced delivery by delivery. What the 3-way control must
 stop is **paying for what hasn't arrived**, so the matcher measures the invoice
-against the slice of the PO the received units cover —
-`received_value = po_total × received / ordered` — in exact Decimal, at the same
-match-rule tolerance as the amount leg. `MatchResult.billed_beyond_receipt` is
-`True` when the invoice exceeds `received_value` by more than the tolerance
+against what the received goods are worth of the PO total —
+`received_value`, from `po_matching._received_value` — in exact Decimal, at the
+same match-rule tolerance as the amount leg. `MatchResult.billed_beyond_receipt`
+is `True` when the invoice exceeds `received_value` by more than the tolerance
 (both are additive fields on the persisted `po_match`). Skipped when the
-currencies differ, which is already a mismatch with no figure.
+currencies differ or the PO total is unverifiable, each already a mismatch with
+no figure.
+
+**Receipts are valued per PO line** (decisions §519). Nine 10.00 cables of an
+order for a 910.00 server and those cables are worth 90.00, not the nine tenths
+of the order the quantity sums would say:
+
+| Input | Valued as |
+|---|---|
+| A goods line: ordered quantity > 0 and a positive value (`total`, else `quantity × unit_price`) | Each unit at the line's own unit value |
+| A receipt line naming one of this PO's lines (`gr_line_items.po_line_item_id`) | That line, up to the quantity ordered on it; units beyond cover nothing |
+| A receipt line naming no line of this PO (free text, pre-0109, another PO's line) | The **cheapest outstanding units first** — the lowest value it could have, so a bill is never held on goods the receipt proved arrived, and never cleared on a guess |
+| A line with no quantity (freight, a charge) or a value ≤ 0 (a free item, a discount) | Nothing to receive; what it adds to or takes off the total is spread over the goods, like tax |
+| `po_total` vs the goods lines' sum | The covered share of the goods value × `po_total`, so tax, freight and discounts in the total scale with the goods |
+
+The share is computed with `fractions.Fraction` and turned into `Decimal` once,
+so a non-terminating share (one of three units) is compared exactly; the
+cumulative warning names it to the cent. A **short line hidden by an
+over-received one** (ten cables in, no server) now measures the bill too: the
+quantity sums read ten of ten, so `status` and the quantity fields stay as they
+were (the receipt is not `partial` by quantity, no `partial_receipt` issue),
+but `received_value` is set and a bill beyond it holds. When every goods unit is
+in, `received_value` is unset even if a freight line was never "received".
+
+**One unpriced goods line** (no `total`, no `unit_price`) makes the PO
+unpriceable per line, and it keeps the proportional figure,
+`po_total × received / ordered`, on an aggregate short receipt only — exactly
+the figure before per-line valuation. Valuing its units at nothing would hold
+every bill on the PO; at anything else would be a guess.
+`po_match.details.receipt_valuation` says which was used (`per_line` /
+`pro_rata`, `null` with no receipt lines); a split carries it per leg in
+`details.legs`.
 
 So six of ten units in with the whole PO billed holds (`po_partial_receipt`
 warning + a payment-blocking `po_mismatch`), while four of ten in with four
 tenths billed is partial billing and holds nothing — the warnings still name
 both the amount variance and the short receipt.
 
-The proportional value assumes one unit price across the PO's lines (the
-matcher aggregates quantities, not priced lines), and it does not subtract
-what earlier invoices against the same PO already billed — a second invoice
-for the first shipment is caught by duplicate detection, not here.
+The per-invoice leg does not subtract what earlier invoices against the same
+PO already billed; the cumulative `po_billed_beyond_receipt` warning below
+does. A multi-PO split values each short leg the same way and counts every
+other leg at its whole total.
 
 Covered by `backend/tests/test_po_matching_cancelled_receipts.py` (matcher +
 end-to-end through `refresh_warnings` to the exception row),
 `backend/tests/test_po_matching_wiring.py` (the routing, with the matcher
-patched out) and `backend/tests/test_po_match_exception_reconciliation.py`
-(partial billing, the receipt-value boundary, and the auto-close).
+patched out), `backend/tests/test_po_match_exception_reconciliation.py`
+(partial billing, the receipt-value boundary, the auto-close, the cables bill
+held end to end and a split's legs valued per line) and
+`backend/tests/test_po_matching_algorithm.py` (per-line valuation: line caps,
+cheapest-first unlinked lines, tax and freight scaling, the exact
+non-terminating boundary, currency, the unpriced fallback).
 
 The 4-way leg runs **after** the 3-way GR block. It looks up the most recent
 `QualityInspection` in two steps: the matched receipt's own (`gr_id == gr.id`),
@@ -596,9 +631,9 @@ Reasoning: `docs/decisions.md` §469.
 #### And past what has been received
 
 The receipt leg has the same blind spot: it compares ONE invoice with the
-received slice of the PO (`received_value`, `po_total × received / ordered`),
-so with 400.00 of a 1000.00 PO received, two invoices of 400.00 each fit it.
-On a SHORT receipt the same refresh measures the same siblings plus this
+received slice of the PO (`received_value`, § Short receipt), so with 400.00
+of a 1000.00 PO received, two invoices of 400.00 each fit it. On a SHORT
+receipt the same refresh measures the same siblings plus this
 invoice against `received_value` at the same tolerance, and when they exceed
 it adds `po_billed_beyond_receipt` (type `po_overbilled`, severity `warning`),
 naming what every live bill on the PO comes to, this one included
@@ -651,8 +686,8 @@ and the currency code.
 - **The total leg gets no post-approval hold.** A PO total rarely moves after
   approval, and §469's warning already covers that leg.
 
-Receipts are still valued pro rata across the PO's lines, not per line; see
-`docs/followups.md`. Reasoning: `docs/decisions.md` §470.
+It reads the same per-line `received_value` (§ Short receipt, decisions §519).
+Reasoning: `docs/decisions.md` §470.
 
 ### Recording a goods receipt
 

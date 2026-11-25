@@ -417,9 +417,10 @@ def _line_key(content: tuple) -> str | None:
 async def _refresh_po_lines(db: AsyncSession, po: PurchaseOrder, payload_lines) -> str:
     """Bring ``po``'s stored lines in line with the ERP's, and say what happened.
 
-    The 3-way receipt-value check scales the total by received / ordered
-    quantity, so lines left from before an ERP amendment value a receipt wrongly
-    (decisions §327). Goods-receipt lines point at PO lines by id, so a line
+    The 3-way receipt-value check values a receipt by the PO's lines (their
+    quantities and prices, ``po_matching._received_value``), so lines left
+    from before an ERP amendment value a receipt wrongly (decisions §327,
+    §519). Goods-receipt lines point at PO lines by id, so a line
     something was received against is updated in place, never deleted. Returns
     ``unchanged``; ``refreshed``; or ``unpairable`` when a received line has no
     ERP line with its SKU (or description) left to pair with, in which case

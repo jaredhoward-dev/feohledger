@@ -327,7 +327,7 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
         },
     ),
     # Cumulative, receipt leg: the same siblings plus this invoice bill past
-    # the received slice of the PO (`po_total × received / ordered`), though
+    # the received slice of the PO (`MatchResult.received_value`), though
     # each fits it alone (decisions §470). Same type, so it stops
     # every unattended approval as the total leg does; past approval it is
     # also the sentence of the payment-blocking `po_mismatch` it raises.
