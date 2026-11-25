@@ -1114,6 +1114,7 @@ async def expense_summary(
     status_filter: str | None = Query(None, alias="status"),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Whole-set status counts + per-currency totals for the expenses KPI row.
@@ -1123,19 +1124,23 @@ async def expense_summary(
     The read gate matches the list's (all four roles) — a rollup exposes strictly
     less than the rows it summarises.
 
+    `attachable=true` narrows by the list's own `_attachable_by`, so a rollup
+    asked about the caller's attachable lines counts that set and no wider.
+
     Totals are grouped BY CURRENCY and serialised as exact decimal strings. They
     are never added across currencies and never FX-converted: an FX rate fetched
     on a read would make the figure non-deterministic, and a cross-currency SUM
     is a number denominated in nothing.
     """
+
+    def _scoped(query):
+        query = apply_entity_scope(query, Expense, entity_id)
+        return _attachable_by(query, user.id) if attachable else query
+
     status_rows = (
         await db.execute(
             _expense_list_filters(
-                apply_entity_scope(
-                    select(Expense.status, func.count()).select_from(Expense),
-                    Expense,
-                    entity_id,
-                ),
+                _scoped(select(Expense.status, func.count()).select_from(Expense)),
                 status_filter=status_filter,
                 report_id=report_id,
                 search=search,
@@ -1153,14 +1158,12 @@ async def expense_summary(
     currency_rows = (
         await db.execute(
             _expense_list_filters(
-                apply_entity_scope(
+                _scoped(
                     select(
                         currency_key,
                         func.coalesce(func.sum(Expense.amount), 0),
                         func.count(),
-                    ).select_from(Expense),
-                    Expense,
-                    entity_id,
+                    ).select_from(Expense)
                 ),
                 status_filter=status_filter,
                 report_id=report_id,

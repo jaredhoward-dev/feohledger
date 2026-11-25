@@ -522,6 +522,24 @@ async def test_select_all_ids_narrow_to_the_same_attachable_set(realdb):
     assert {mine, foreign, on_report} <= set(everything.json()["ids"])
 
 
+async def test_the_summary_counts_the_same_attachable_set(realdb):
+    """`/api/expenses/summary?attachable=true` counts exactly the lines the list
+    returns under the same flag, so a KPI over the picker's set never spans a
+    wider one (`test_whole_set_kpi_rollups`)."""
+    await _loose_line(realdb, "ap_clerk")
+    await _loose_line(realdb, "ap_manager")
+    await _clerk_draft_report(realdb)
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        narrowed = await c.get("/api/expenses/summary", params={"attachable": "true"})
+        everything = await c.get("/api/expenses/summary")
+    assert narrowed.status_code == 200, narrowed.text
+    expected = len(await _attachable_ids(realdb, "ap_clerk"))
+    assert narrowed.json()["total"] == expected
+    assert narrowed.json()["by_status"] == {"draft": expected}
+    assert sum(cur["count"] for cur in narrowed.json()["by_currency"]) == expected
+    assert everything.json()["total"] > expected
+
+
 async def test_mine_lists_only_the_callers_reports(realdb):
     """`/expense-reports?mine=true&status=draft` is the bulk "Add to report"
     target list: reports only their owner may compose."""
