@@ -2908,6 +2908,8 @@ export const messages = {
 	'purchaseOrders.row.view': 'Ver pedido de compra {number}',
 	'purchaseOrders.toast.loadListFailed': 'Falha ao carregar os pedidos de compra',
 	'purchaseOrders.toast.loadFailed': 'Falha ao carregar o pedido de compra',
+	'purchaseOrders.toast.notFound': 'Pedido de compra não encontrado',
+	'purchaseOrders.modal.loadFailed': 'Não foi possível carregar este pedido de compra. Tente novamente.',
 	'purchaseOrders.toast.syncFailed': 'Falha na sincronização com o ERP',
 	'purchaseOrders.toast.unverifiable':
 		'O ERP não conseguiu confirmar o total de {n, plural, one {# pedido existente} other {# pedidos existentes}} — as notas que {n, plural, one {o citam} other {os citam}} ficam retidas até que uma sincronização o confirme',

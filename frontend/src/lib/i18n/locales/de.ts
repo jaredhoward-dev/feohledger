@@ -2908,6 +2908,8 @@ export const messages = {
 	'purchaseOrders.row.view': 'Bestellung {number} anzeigen',
 	'purchaseOrders.toast.loadListFailed': 'Bestellungen konnten nicht geladen werden',
 	'purchaseOrders.toast.loadFailed': 'Bestellung konnte nicht geladen werden',
+	'purchaseOrders.toast.notFound': 'Bestellung nicht gefunden',
+	'purchaseOrders.modal.loadFailed': 'Diese Bestellung konnte nicht geladen werden. Versuchen Sie es erneut.',
 	'purchaseOrders.toast.syncFailed': 'ERP-Synchronisierung fehlgeschlagen',
 	'purchaseOrders.toast.unverifiable':
 		'Das ERP konnte die Summe {n, plural, one {# bestehenden Bestellung} other {von # bestehenden Bestellungen}} nicht bestätigen — Rechnungen dazu werden zurückgehalten, bis eine Synchronisierung sie bestätigt',

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api } from '#lib/api.ts';
+	import { api, ApiError } from '#lib/api.ts';
 	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
@@ -26,7 +26,7 @@
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { untrack } from 'svelte';
 	import { page as pageState } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { afterNavigate, replaceState } from '$app/navigation';
 
 	const COLUMNS = $derived([
 		{ label: m('purchaseOrders.col.poNumber'), class: 'col-number' },
@@ -105,17 +105,25 @@
 	// on a re-load, the previous filter's rows standing as this one's answer.
 	// A failed load-more keeps the rows already shown and only toasts.
 	let errored = $state(false);
-	// URL-backed: `?search=`, `?status=` and the open PO's `?id=` are read on
-	// load and written back by `syncUrl()`, so a reload, a copied link or a
-	// return to the page lands on the same filtered list and the same PO (they
-	// lived in component state only, and every reload reset the view).
+	// URL-backed: `?search=`, `?status=` and the open PO's `?id=` are read by
+	// `readUrlState` and written back by `syncUrl()`.
 	type StatusFilter = 'all' | 'open' | 'unissued' | 'closed' | 'cancelled';
 	const STATUS_FILTERS: readonly StatusFilter[] = ['all', 'open', 'unissued', 'closed', 'cancelled'];
 	function statusFromUrl(raw: string | null): StatusFilter {
 		return STATUS_FILTERS.includes(raw as StatusFilter) ? (raw as StatusFilter) : 'all';
 	}
-	let search = $state(pageState.url.searchParams.get('search') ?? '');
-	let statusFilter = $state<StatusFilter>(statusFromUrl(pageState.url.searchParams.get('status')));
+	// The one READER of this route's query string, used at mount and by
+	// `afterNavigate` for a navigation that reuses this page.
+	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
+		return {
+			search: params.get('search') ?? '',
+			status: statusFromUrl(params.get('status')),
+			id: params.get('id')
+		};
+	}
+	const initialUrlState = readUrlState(pageState.url.searchParams);
+	let search = $state(initialUrlState.search);
+	let statusFilter = $state<StatusFilter>(initialUrlState.status);
 	// The badge text is the shared PO status label (`poStatusLabel`), not the
 	// raw column value — `open` is a database token, "Open" is what a clerk
 	// reads, and `partially_received` / `received` / `voided` read as words
@@ -128,9 +136,12 @@
 
 	let syncing = $state(false);
 
-	let detailId = $state<string | null>(pageState.url.searchParams.get('id'));
+	let detailId = $state<string | null>(initialUrlState.id);
 	let detail = $state<PODetail | null>(null);
 	let detailLoading = $state(false);
+	// The open PO's fetch failed for a reason other than "it does not exist":
+	// stated in the dialog with a Retry, and `?id=` kept. Only a 404 drops it.
+	let detailFailed = $state(false);
 
 	let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -159,15 +170,18 @@
 		});
 	});
 
-	// A REAL navigation to `/purchase-orders?id=…` while the page is already
-	// mounted (a link elsewhere in the shell) opens that PO. `page.url` only
-	// changes on real navigation, so this never fights `syncUrl()`.
-	let lastUrlId: string | null = pageState.url.searchParams.get('id');
-	$effect(() => {
-		const id = pageState.url.searchParams.get('id');
-		if (id === lastUrlId) return;
-		lastUrlId = id;
-		untrack(() => (detailId = id));
+	// A navigation that REUSES this mounted page (a sidebar click to bare
+	// `/purchase-orders`, a link to `?id=…`, Back/Forward between two entries
+	// of this route) re-reads the URL; state seeded at mount would otherwise
+	// sit under a different address. `replaceState` is shallow and never fires
+	// this hook, so `syncUrl()` cannot loop through it. Only what changed is
+	// assigned, so each effect below refetches just its own part.
+	afterNavigate(({ from, to, type }) => {
+		if (type === 'enter' || !from || !to || from.route.id !== to.route.id) return;
+		const next = readUrlState(to.url.searchParams);
+		if (next.search !== search) search = next.search;
+		if (next.status !== statusFilter) statusFilter = next.status;
+		if (next.id !== detailId) detailId = next.id;
 	});
 
 	// A status chip is a discrete action, so it fetches immediately — it used
@@ -216,12 +230,11 @@
 	let detailEffectRan = false;
 	$effect(() => {
 		const id = detailId;
-		// Opening and closing the detail both land in the URL: closing (the
-		// ×, Escape, or a failed load) drops `?id=` so a reload does not
-		// re-open a PO the user already dismissed. Skipped on the mount run,
-		// where the URL already says what the state does.
+		// Opening and closing the detail both land in the URL. Skipped on the
+		// mount run, where the URL already says what the state does.
 		if (detailEffectRan) syncUrl();
 		detailEffectRan = true;
+		detailFailed = false;
 		if (!id) {
 			detail = null;
 			return;
@@ -361,14 +374,21 @@
 	async function loadDetail(id: string) {
 		const token = detailSequence.start();
 		detailLoading = true;
+		detailFailed = false;
 		try {
 			const data = await api.get<PODetail>(`/api/purchase-orders/${id}`);
 			if (!detailSequence.canCommit(token)) return;
 			detail = data;
 		} catch (err) {
 			if (!detailSequence.isCurrentRequest(token)) return;
-			toast(err instanceof Error ? err.message : m('purchaseOrders.toast.loadFailed'), 'error');
-			detailId = null;
+			if (err instanceof ApiError && err.status === 404) {
+				// Nothing will ever open for this id: drop it, or a reload re-toasts.
+				toast(m('purchaseOrders.toast.notFound'), 'error');
+				detailId = null;
+			} else {
+				detail = null;
+				detailFailed = true;
+			}
 		} finally {
 			if (detailSequence.isCurrentRequest(token)) detailLoading = false;
 		}
@@ -509,6 +529,12 @@
 	<div class="modal-body">
 		{#if detailLoading}
 			<LoadingState />
+		{:else if detailFailed}
+			<LoadError
+				message={m('purchaseOrders.modal.loadFailed')}
+				onretry={() => detailId && loadDetail(detailId)}
+				testId="purchase-orders-detail-error"
+			/>
 		{:else if detail}
 			<dl class="meta">
 				<dt>{m('purchaseOrders.modal.vendor')}</dt><dd>{detail.vendor_name ?? '—'}</dd>

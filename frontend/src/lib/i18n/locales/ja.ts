@@ -2858,6 +2858,8 @@ export const messages = {
 	'purchaseOrders.row.view': '発注書 {number} を表示',
 	'purchaseOrders.toast.loadListFailed': '発注書の読み込みに失敗しました',
 	'purchaseOrders.toast.loadFailed': '発注書の読み込みに失敗しました',
+	'purchaseOrders.toast.notFound': '発注書が見つかりません',
+	'purchaseOrders.modal.loadFailed': 'この発注書を読み込めませんでした。もう一度お試しください。',
 	'purchaseOrders.toast.syncFailed': 'ERP同期に失敗しました',
 	'purchaseOrders.toast.unverifiable':
 		'ERP で既存の発注 {n, plural, other {# 件}}の合計を確認できませんでした。同期で確認されるまで、これを参照する請求書は保留されます',

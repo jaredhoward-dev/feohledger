@@ -3074,6 +3074,8 @@ export const en = {
 	'purchaseOrders.row.view': 'View purchase order {number}',
 	'purchaseOrders.toast.loadListFailed': 'Failed to load purchase orders',
 	'purchaseOrders.toast.loadFailed': 'Failed to load PO',
+	'purchaseOrders.toast.notFound': 'Purchase order not found',
+	'purchaseOrders.modal.loadFailed': 'Couldn’t load this purchase order. Try again.',
 	'purchaseOrders.toast.syncFailed': 'ERP sync failed',
 	'purchaseOrders.toast.unverifiable':
 		'The ERP could not confirm the total of {n, plural, one {# existing PO} other {# existing POs}} — invoices citing {n, plural, one {it are} other {them are}} held until a sync confirms it',
