@@ -78,7 +78,12 @@ from app.models.vendor_statement_recon import (
 )
 from app.models.vendor_user import VendorUser
 from app.models.vendor_user_legal_acceptance import VendorUserLegalAcceptance
-from app.models.virtual_card import CardRebate, CardRevealToken, VirtualCard
+from app.models.virtual_card import (
+    CardRebate,
+    CardRevealToken,
+    CardTransactionEvent,
+    VirtualCard,
+)
 from app.models.webauthn_credential import WebAuthnCredential
 from app.models.webhook import WebhookDelivery, WebhookSubscription
 from app.models.workflow import AuditLog, WorkflowDefinition, WorkflowInstance, WorkflowStep
@@ -112,6 +117,7 @@ __all__ = [
     "BudgetDimension",
     "CardRebate",
     "CardRevealToken",
+    "CardTransactionEvent",
     "CashPlan",
     "CommerceInventorySync",
     "CommerceSkuMapping",

@@ -238,15 +238,35 @@ def _fake_tenant_session_factory(card):
     # MagicMock so the handler's `db.add(rebate)` call doesn't leak
     # an unawaited-coroutine RuntimeWarning.
     db.add = MagicMock()
-    db.execute = AsyncMock(return_value=result)
+    empty = MagicMock()
+    empty.scalar_one_or_none = MagicMock(return_value=None)
+    empty.scalar = MagicMock(return_value=None)
+
+    async def _execute(stmt, *args, **kwargs):
+        # Only the card lookup finds a row. Every other read — the per-card
+        # transaction memory (§554), an existing flag — finds nothing, as on a
+        # card with no history; answering those with the card itself would
+        # read it as a remembered lapse.
+        from app.models.virtual_card import VirtualCard
+
+        if not hasattr(card, "provider_card_id"):
+            return result  # a non-card row (the ERP tests): every read finds it
+        entities = [d.get("entity") for d in getattr(stmt, "column_descriptions", [])]
+        return result if VirtualCard in entities else empty
+
+    db.execute = AsyncMock(side_effect=_execute)
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
+    db.flush = AsyncMock()
     # Session.begin_nested() is synchronous and returns an async context
     # manager (the savepoint). A plain MagicMock supports the async-CM
     # protocol; leaving it as an AsyncMock child would return a coroutine
     # and blow up `async with db.begin_nested():` — the rebate savepoint the
     # settled-event path opens for the one-rebate-per-card backstop.
     db.begin_nested = MagicMock()
+    # No other row exists: `db.get` (the settlement's invoice read, §554) finds
+    # nothing, as a lookup of an unknown id does.
+    db.get = AsyncMock(return_value=None)
     factory = MagicMock()
     factory.return_value.__aenter__ = AsyncMock(return_value=db)
     factory.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -290,6 +310,9 @@ def _card_row(provider_card_id: str):
         # settlement reads it to write the charge onto a run's card leg
         # (decisions §543). None: a `/cards/generate` card, no run payment.
         payment_id=None,
+        # `VirtualCard.invoice_id` is non-nullable; a settlement reads the
+        # invoice to judge an overcharge (decisions §554).
+        invoice_id=uuid.uuid4(),
     )
 
 

@@ -236,10 +236,12 @@ test.describe('card webhook signature + dedup', () => {
 		try {
 			const body = JSON.stringify({
 				// Nium's documented approved-authorization webhook names itself
-				// in `template` and carries `transactionAmount` (decisions §549).
+				// in `template` and states its figure as a major-unit string in
+				// `transactionAmount`, beside `transactionCurrency` (decisions §549, §557).
 				template: 'CARD_POS_APPROVED_WEBHOOK',
 				cardHashId: niumToken,
-				transactionAmount: 50.5, // MAJOR units → $50.50
+				transactionAmount: '50.50', // MAJOR units → $50.50
+				transactionCurrency: 'USD',
 				merchantName: 'ACME VENDOR'
 			});
 			// Nium signs nothing; it sends the agreed partner key (decisions §555).

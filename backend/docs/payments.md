@@ -1575,7 +1575,15 @@ perhaps paid on another rail) records nothing on any payment: it writes
 `card.settled_after_cancel` and opens a payment-blocking
 `payment_reconciliation` exception on the invoice (decisions §549). Only a
 name in the provider's explicit event map is a stage at all (§549); anything
-else changes nothing.
+else changes nothing. A lapse
+delivered **before** its authorization is remembered per provider transaction
+and the late authorization is applied as lapsed, so the card stays unspent
+(decisions §554). A **further clearing** on a settled card (an incremental
+capture) adds to the card's figure and `record_card_spend` writes the new
+total onto the leg's `settled_amount`, once per clearing, with the payment
+sync re-dispatched; a total past the leg's amount opens one payment-blocking
+`payment_reconciliation` flag (kind `card_over_settled`), and a decrease (a
+refund) or a further Nium settlement is refused and only audited (§554).
 
 ##### A figure the column cannot hold
 

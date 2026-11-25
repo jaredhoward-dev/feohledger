@@ -102,7 +102,8 @@ async def test_settlement_posted_to_wrong_provider_path_does_not_settle_the_card
         {
             "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
             "cardHashId": token,
-            "amount": "250.00",
+            "authAmount": "250.00",
+            "authCurrency": "USD",
             "merchantName": "Attacker Merchant",
         }
     ).encode("utf-8")
@@ -136,7 +137,8 @@ async def test_settlement_posted_to_correct_provider_path_still_settles(realdb):
         {
             "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
             "cardHashId": token,
-            "amount": "250.00",
+            "authAmount": "250.00",
+            "authCurrency": "USD",
             "merchantName": "Real Merchant",
         }
     ).encode("utf-8")

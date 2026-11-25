@@ -736,8 +736,11 @@ float.
 | `card.cancel_failed` | vendor made un-payable, but the provider did not confirm the close — the card is **still live** | `last_four`, `vendor_id`, `trigger`, `outcome`, `status` |
 | `card.cancel_deferred_to_void` | vendor made un-payable, card is behind a live payment — left for the payment void | `last_four`, `vendor_id`, `trigger`, `payment_id` |
 | `card.charged` | authorization webhook applies a charge | `last_four`, `from`, `to`, `amount_charged` (string Decimal) |
-| `card.authorization_lapsed` | a reversal / expiry webhook releases a `charged` card's hold (decisions §544) | `last_four`, `from` (`charged`), `to` (`active`), `lapse` (`reversal` \| `expiry`), `released_amount` (string Decimal or null) |
+| `card.authorization_lapsed` | a reversal / expiry webhook releases a `charged` card's hold (decisions §544), or an authorization arrives after its own lapse (§554) | `last_four`, `from` (`charged`, or the unspent status out of order), `to` (`active`), `lapse` (`reversal` \| `expiry`), `released_amount` (string Decimal or null), `out_of_order` (`true`, out of order only) |
 | `card.reversal_after_settlement` | a reversal / expiry webhook arrives for a `completed` card — left untouched (refund / chargeback territory) | `last_four`, `status`, `lapse` |
+| `card.clearing_added` | a further clearing raised a settled card's total (decisions §554) | `last_four`, `cleared_amount`, `amount_charged`, `currency`, `rebate_amount` (string Decimals or null) |
+| `card.clearing_refused` | a further clearing on a settled card was not applied (decisions §554) | `last_four`, `reason` (`not_an_increase` \| `provider_single_settlement` \| `no_amount`), `cleared_amount`, `amount_charged`, `currency` |
+| `card.settlement_refused` | a settlement webhook stated no usable figure (absent, zero, unparseable, another currency) — the card and the run leg are left as they were (decisions §557) | `last_four`, `status`, `reason` (`no_amount`), `currency` |
 | `card.settled_after_cancel` | a settlement webhook arrives for a `cancelled` card — the card is left cancelled and a payment-blocking `payment_reconciliation` exception is opened on its invoice (decisions §549) | `last_four`, `status`, `settled_amount` (string Decimal or null), `currency`, `invoice_id` |
 | `card.settled` | settlement webhook completes + accrues the rebate | `last_four`, `from`, `to`, `rebate_amount`, `rebate_rate`, `rebate_base` (string Decimals), `rebate_base_source` (`settled` \| `charged` \| `unknown` — which figure the rebate priced off, see § Rebate base), `rebate_created` (bool — `false` if the one-per-card unique index skipped a duplicate) |
 | `card_rebate.confirmed` | `POST /rebates/{id}/confirm` (`pending` → `confirmed`) | `amount` (string Decimal), `from`, `to` |
@@ -1155,6 +1158,65 @@ A settlement is accepted on a `charged` card **or an unspent one**
 (`created` / `sent` / `active`): a clearing can arrive after its authorization
 expired (a force post), and money moved. `card.settled`'s `from` records which.
 
+**A lapse delivered before its authorization (decisions §554).** Out of
+order, a reversal or expiry finds an unspent card and no hold to release. It
+is remembered in `card_transaction_events` (kind `lapse`, migration 0148)
+under the provider's transaction id (`_card_transaction_id`: Lithic's
+transaction `token`, Nium's `rhaTransactionId` else `authCode` — an auth
+code is not unique per transaction, so it is the fallback — the mock's
+`transaction_id`); nothing on the card changes and no audit row is written
+yet. A remembered lapse is used up by the one authorization it is applied to
+(`consume_lapse`, kind `lapse_applied`): a later authorization carrying the
+same id is a live hold and charges the card. When the authorization of that same transaction arrives it is applied as
+already lapsed: the card stays (or returns to) `active` with no figure, the
+run leg stays `in_flight`, and one `card.authorization_lapsed` row is written
+with `out_of_order: true`. The provider **did** authorize, so
+`first_authorized_at` is stamped and a re-run refuses the card as
+`card_authorized_before` (§549); a lapse that is never followed by an
+authorization stamps nothing. A remembered partial reversal (a figure below
+the authorization's, Nium / mock only) leaves the late authorization standing,
+as it does in order. A lapse with no transaction id is only logged.
+
+**Further clearings on a settled card (decisions §554).** A transaction can
+clear more than once — Lithic: "there can be any permutation of Clearing,
+Return, Authorization Reversal, and Authorization Expiry messages on this same
+transaction" (<https://docs.lithic.com/docs/transaction-flow>, checked
+2026-11-25). Every applied clearing is recorded in `card_transaction_events`
+(kind `clearing`) under its own identity (`_clearing_key`: the newest Lithic
+financial event's `token` in `events`, else the transaction token and its
+cumulative figure; the delivery id for Nium and the mock), so each is applied
+once even past the Redis dedupe. On a `completed` card
+(`_record_further_clearing`):
+
+| Clearing | Result |
+|---|---|
+| Lithic, cumulative settled figure (`settled_amount`, else the deprecated `amount`) above `amount_charged` | the difference is added; `record_card_spend` writes the total onto the run payment; a `pending` rebate is re-based on the total at its rate; `card.clearing_added` (`cleared_amount`, `amount_charged`, `currency`, `rebate_amount`, string Decimals); the payment sync is re-dispatched once |
+| mock, positive figure | the same, the figure being this clearing's own |
+| a figure that does not raise the total (a Lithic `RETURN`, a negative mock clearing) | **refused**: card, payment and rebate stand; `card.clearing_refused` (`reason` `not_an_increase`) for the refund flow, as a reversal after settlement is |
+| Nium | **refused** (`provider_single_settlement`): Nium's documented card webhooks describe one `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture, so a second one cannot be told from a redelivery under a new id |
+| a replay of an applied clearing | nothing |
+
+Any settlement (the first included) whose card total exceeds what the card
+pays — the run payment's amount, else the invoice's, judged by
+`verify_settlement` — opens one payment-blocking `payment_reconciliation`
+exception (`exception.settlement_amount_over`, deduped by `erp_report.kind`
+`card_over_settled`; `payment_settlement_record.flag_card_over_settlement`).
+The money moved, so the figure is recorded; the flag is how a person learns of
+the overcharge, since over-settlement reads `covered`. While that flag is
+open, a further clearing does not open another or rewrite its figure: the
+newest total is on the card, the payment and the `card.clearing_added` rows.
+The `total:` clearing key (Lithic without `events`) is a convenience, not an
+identity: the delta is always `reported − amount_charged`, so a repeat or a
+return to an earlier total never adds twice. **Delivery dedupe and clearing
+identity are two layers (decisions §557):** the Redis dedupe keys on the
+delivery's `webhook-id` header (one per delivery, the same on every retry,
+§555), so a retry stops there; a second clearing is a new delivery with a new
+id and reaches this branch, where its own `events` token (or cumulative total)
+says whether it was already applied — which also catches a redelivery that
+outlived the Redis window. **Not verified:** that Lithic sends a
+`card_transaction.updated` per clearing (its docs say a webhook is sent "at
+each step in the transaction lifecycle").
+
 **A settlement on a `cancelled` card (decisions §549)** is the force post that
 arrives after AP voided the payment — reachable since §544, because a lapsed
 card is voidable, and another rail may since have paid the invoice. Lithic says
@@ -1192,7 +1254,7 @@ Each provider's map (`_CARD_EVENT_STAGES`):
   checked 2026-11-25): `CARD_POS_APPROVED_WEBHOOK` → authorization,
   `CARD_SETTLEMENT_DEBIT_WEBHOOK` → settlement,
   `CARD_TRANSACTION_REVERSAL_WEBHOOK` / `CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK`
-  → reversal (amount in `transactionAmount`), and the per-reason declines
+  → reversal, and the per-reason declines
   (`CARD_INSUFFICIENT_FUNDS_DECLINED_WEBHOOK`, `CARD_WRONG_EXPIRY_WEBHOOK`,
   `CARD_WRONG_CVV2_WEBHOOK`, `CARD_MISC_WEBHOOK` — "declined due to the
   Security and Risk policy set by Nium" — ...) → decline. `template` is the
@@ -1214,6 +1276,25 @@ charge amounts in **minor units** (cents — `150000` == `$1,500.00`), Nium in
 **major units** (`50.00` == `$50.00`). The handler divides Lithic amounts by
 100 and takes Nium amounts as-is, so a Nium charge is no longer recorded (and
 rebated) at 1/100th of its value.
+
+**Nium names its figure per template (`_NIUM_AMOUNT_FIELDS`, decisions §557,
+checked 2026-11-25):** `CARD_POS_APPROVED_WEBHOOK` → `transactionAmount` +
+`transactionCurrency`; `CARD_SETTLEMENT_DEBIT_WEBHOOK` → `authAmount` +
+`authCurrency` (it carries no `transactionAmount`);
+`CARD_TRANSACTION_REVERSAL_WEBHOOK` / `..._ADVICE_WEBHOOK` → `transactionAmount`
++ `transactionCurrency` (the `settlement-debit`, `pos-approved`,
+`transaction-reversal` and `transaction-reversal-advice` pages under
+<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events>).
+`amount` is no Nium field and is not read. A figure whose stated currency is
+not the card's is read as absent, never converted.
+
+**A settlement with no usable figure is refused (decisions §557).** Absent,
+zero or negative, unparseable, or in another currency: the card keeps its
+state and figure, nothing is written onto the run's card leg (it stays in
+flight, so the invoice never reaches `paid` on a guess), no rebate is minted,
+and a `card.settlement_refused` row (`reason: no_amount`) is left for a person
+to reconcile with the provider. The card's limit and its authorized hold are
+never stand-ins for what cleared.
 
 **Every rejection path returns `204` silently** (bad/missing/stale
 signature, wrong partner key, unknown card token, missing delivery id,
@@ -1332,6 +1413,10 @@ A rebate is earned on what actually **settled**. `resolve_rebate_base` in
 | present | any | the settled figure | `settled` |
 | absent | present | the authorized figure | `authorized` |
 | absent | absent | `0` | `unknown` |
+
+Since decisions §557 a settlement with no usable figure is refused before the
+rebate is computed, so the webhook only ever reaches the `settled` row; the
+other two rows remain the helper's contract for any other caller.
 
 The settlement branch previously read `card.amount_charged or
 card.amount_limit`, which was wrong twice over:
