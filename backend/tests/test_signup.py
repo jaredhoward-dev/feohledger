@@ -800,11 +800,25 @@ async def test_the_complete_response_is_never_cached_and_the_issuance_is_audited
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == "no-store"
     reset_token = _token_of(resp.json()["set_password_url"])
-    (row,) = audits
+    # Two rows, in order: the Terms / Privacy acceptance /start collected is
+    # recorded against the new admin (decisions §495), then the link issuance.
+    accepted, row = audits
+    assert accepted == {
+        "organization_id": org_id,
+        "actor_id": user_id,
+        "action": "auth.legal.accepted",
+        "entity_id": user_id,
+        "details": {
+            "versions": dict(CURRENT_LEGAL_VERSIONS),
+            "source": "signup",
+            "ip": "",
+        },
+    }
     assert row["action"] == "auth.password_reset.requested"
     assert row["organization_id"] == org_id and row["entity_id"] == user_id
     assert row["details"]["via"] == "signup"
-    assert reset_token not in repr(row) and email not in repr(row)
+    for audit in (accepted, row):
+        assert reset_token not in repr(audit) and email not in repr(audit)
 
 
 @pytest.mark.parametrize("locale", ["de", "fr", "es", "pt-BR", "ja"])
@@ -924,7 +938,12 @@ async def test_the_set_password_link_sets_the_password_once_and_survives_link_sc
             for _ in range(3):
                 check = await c.post("/api/auth/reset-password/check", json={"token": token})
                 assert check.status_code == 200, check.text
-                assert check.json() == {"email": login_email}
+                # The admin accepted the Terms / Privacy at /start, recorded at
+                # /complete, so this first password needs no accept box (§495).
+                assert check.json() == {
+                    "email": login_email,
+                    "legal_acceptance_required": False,
+                }
 
             first = await c.post(
                 "/api/auth/reset-password", json={"token": token, "new_password": chosen}

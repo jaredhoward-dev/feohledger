@@ -1354,7 +1354,17 @@ async def test_a_merged_row_in_another_entitys_chart_is_unlinked_too(realdb):
         s.add_all([a, b])
         await s.commit()
         a_id, b_id = a.id, b.id
-    await _add(realdb, code="Job Materials", name="B's", erp_account_id="1100", entity_id=b_id)
+    # The link an earlier no-realm pull made, so stamped UNNAMED_REALM (§496).
+    # A NULL (pre-0115) link is one such a pull leaves alone
+    # (test_a_pull_with_no_realm_leaves_a_pre_migration_chart_link_alone).
+    await _add(
+        realdb,
+        code="Job Materials",
+        name="B's",
+        erp_account_id="1100",
+        erp_link_realm=UNNAMED_REALM,
+        entity_id=b_id,
+    )
     accounts = [
         _acct("Job Expenses:Job Materials", "1000", legacy_codes=("Job Materials",)),
         _acct("Landscaping:Job Materials", "1100", legacy_codes=("Job Materials",)),
