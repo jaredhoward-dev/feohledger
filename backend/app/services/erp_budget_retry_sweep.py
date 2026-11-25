@@ -135,7 +135,6 @@ def _latest_refusal():
         select(AuditLog.id, AuditLog.created_at, AuditLog.details)
         .where(
             AuditLog.correlation_id == Invoice.correlation_id,
-            AuditLog.entity_id == Invoice.id,
             AuditLog.action == ERP_FAILED_ACTION,
         )
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
@@ -153,7 +152,6 @@ def _candidates_query(*, floor: datetime, invoice_id: uuid.UUID | None = None):
     refusal = _latest_refusal()
     touched_since = exists().where(
         AuditLog.correlation_id == Invoice.correlation_id,
-        AuditLog.entity_id == Invoice.id,
         AuditLog.created_at > refusal.c.created_at,
         not_(or_(*(AuditLog.action.endswith(s) for s in READ_ONLY_ACTION_SUFFIXES))),
     )

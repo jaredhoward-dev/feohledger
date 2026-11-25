@@ -117,7 +117,16 @@ async def _seed_failed(realdb) -> uuid.UUID:
     return inv_id
 
 
-async def _trail(realdb, inv_id, action: str, at: datetime, details: dict | None = None) -> None:
+async def _trail(
+    realdb,
+    inv_id,
+    action: str,
+    at: datetime,
+    details: dict | None = None,
+    *,
+    entity_type: str = "invoice",
+    entity_id: uuid.UUID | None = None,
+) -> None:
     async with realdb.sessionmaker(TENANT)() as s:
         inv = await s.get(Invoice, inv_id)
         s.add(
@@ -126,8 +135,8 @@ async def _trail(realdb, inv_id, action: str, at: datetime, details: dict | None
                 organization_id=inv.organization_id,
                 actor_id=None,
                 action=action,
-                entity_type="invoice",
-                entity_id=inv_id,
+                entity_type=entity_type,
+                entity_id=entity_id or inv_id,
                 details=details or {},
                 created_at=at,
             )
@@ -243,6 +252,28 @@ async def test_an_invoice_touched_since_the_refusal_is_left_to_a_person(
     await _write_erp(realdb, LIVE_ERP)
     inv_id = await _seed_refused(realdb)
     await _trail(realdb, inv_id, action, _ago(minutes=30), details)
+
+    result = await sweep.run_budget_retry_sweep_once()
+
+    assert result.invoices_resent == 0
+    assert dispatched == []
+
+
+async def test_an_exception_raised_on_the_invoice_since_the_refusal_is_a_change(realdb, dispatched):
+    """An exception's rows are filed under the invoice's correlation id but
+    against the exception row (``exception_lifecycle._audit``), so the check
+    reads the invoice's whole trail, not only rows naming the invoice."""
+    await _write_erp(realdb, LIVE_ERP)
+    inv_id = await _seed_refused(realdb)
+    await _trail(
+        realdb,
+        inv_id,
+        "exception.raised",
+        _ago(minutes=30),
+        {"exception_type": "po_mismatch"},
+        entity_type="exception",
+        entity_id=uuid.uuid4(),
+    )
 
     result = await sweep.run_budget_retry_sweep_once()
 
