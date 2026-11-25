@@ -1648,6 +1648,7 @@ export const messages = {
 	'contracts.bulk.updated': '{n, plural, one {# Vertrag aktualisiert} other {# Verträge aktualisiert}}',
 	'contracts.bulk.exported': '{n, plural, one {# Vertrag exportiert} other {# Verträge exportiert}}',
 	'contracts.bulk.updatedSkipped': '{n, plural, one {# Vertrag aktualisiert} other {# Verträge aktualisiert}}, {skipped} übersprungen',
+	'contracts.bulk.willSkip': '{skipped, plural, one {# ausgewählter Vertrag kann diese Aktion nicht ausführen und wird übersprungen.} other {# ausgewählte Verträge können diese Aktion nicht ausführen und werden übersprungen.}}',
 	'contracts.toast.selectedTruncated': "Die ersten {shown} von {total} Treffern ausgewählt – grenzen Sie die Filter ein, um den Rest auszuwählen.",
 	'contracts.toast.selectedAllMatching': "{n, plural, one {# passender Vertrag ausgewählt} other {Alle # passenden Verträge ausgewählt}}",
 	'contracts.toast.selectAllFailed': "Nicht alle Treffer konnten ausgewählt werden",

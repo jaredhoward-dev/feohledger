@@ -100,6 +100,8 @@ export const messages = {
 	'refusal.intakeDeleteConverted': "この受付は変換済みです。代わりに、変換先の購買依頼を取り消してください。",
 	'refusal.requisitionDeleteConverted': "この購買依頼は発注書に変換済みのため、削除できません。",
 	'refusal.requisitionDeleteFromIntake': "この購買依頼は受付から変換されたものです。代わりに取り消してください。",
+	'refusal.contractStatusRefused': "この契約のステータスが「{status}」の間は実行できません。",
+	'refusal.contractDeleteRefused': "ステータスが「{status}」の契約は削除できません。代わりに解約または取消を行ってください。",
 	'refusal.expenseReportLocked': "このレポートはステータスが{status}の間は合計金額がロックされているため、明細を変更できません。",
 	'refusal.expenseFxSourceMissing': "為替レートのソースが設定されていないため、この明細をレポートの通貨に換算できません。",
 	'refusal.expenseFxRateUnavailable': "{source}をレポート通貨{target}に換算する為替レートがありません。",

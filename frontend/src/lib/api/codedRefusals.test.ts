@@ -420,6 +420,18 @@ describe('codedRefusalText', () => {
 		expect(codedRefusalText('intake_status_refused', {}, enT)).toBeNull();
 	});
 
+	it("names a contract's status in its lifecycle and delete refusals (decisions §508)", () => {
+		expect(codedRefusalText('contract_status_refused', { status: 'expired', action: 'cancel' }, enT)).toContain(
+			EN_ALL['contracts.status.expired']
+		);
+		expect(codedRefusalText('contract_delete_refused', { status: 'active' }, enT)).toContain(
+			EN_ALL['contracts.status.active']
+		);
+		expect(codedRefusalText('contract_status_refused', { status: 'mystery' }, enT)).toContain('mystery');
+		expect(codedRefusalText('contract_status_refused', {}, enT)).toBeNull();
+		expect(codedRefusalText('contract_delete_refused', {}, enT)).toBeNull();
+	});
+
 	it('states each procurement delete refusal in its own sentence', () => {
 		expect(codedRefusalText('intake_delete_converted', {}, enT)).toBe(
 			EN_ALL['refusal.intakeDeleteConverted']

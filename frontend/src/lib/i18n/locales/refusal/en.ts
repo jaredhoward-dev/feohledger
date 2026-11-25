@@ -97,6 +97,8 @@ export const enRefusal = {
 	'refusal.intakeDeleteConverted': "This intake request has been converted; cancel the requisition it produced instead.",
 	'refusal.requisitionDeleteConverted': "This requisition has been converted to a PO, so it can't be deleted.",
 	'refusal.requisitionDeleteFromIntake': "This requisition was converted from an intake request, so cancel it instead.",
+	'refusal.contractStatusRefused': "That can't be done while this contract is {status}.",
+	'refusal.contractDeleteRefused': "A contract that is {status} can't be deleted. Terminate or cancel it instead.",
 	'refusal.expenseReportLocked': "This report's total is locked while it is {status}, so its lines can't be changed.",
 	'refusal.expenseFxSourceMissing': "No exchange-rate source is configured, so this line can't be converted into the report's currency.",
 	'refusal.expenseFxRateUnavailable': "No exchange rate is available to convert {source} into the report currency {target}.",

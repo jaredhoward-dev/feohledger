@@ -14,6 +14,7 @@
 		STATUS_TONES
 	} from '#lib/types/contract.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import { isAllowed } from '#lib/api/actionVerdicts.ts';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
@@ -93,12 +94,20 @@
 	const status = $derived(contract?.status ?? 'draft');
 	const spend = $derived(contract?.spend ?? null);
 
-	// Lifecycle gating mirrors the backend's legal transitions.
-	const canActivate = $derived(status === 'draft');
-	const canTerminate = $derived(status === 'active');
-	const canCancel = $derived(status === 'draft' || status === 'active');
-	const canRenew = $derived(status === 'active' || status === 'expired');
-	const canCreatePo = $derived(status === 'active');
+	// Which lifecycle buttons show is NOT decided here: every contract response
+	// carries the server's verdict on each action (`contract.actions`, built from
+	// the gates the endpoints raise from — backend `services/contract_controls`,
+	// decisions §508), read through `actionVerdicts.ts`. The modal used to
+	// restate the status rules, and its copy had drifted (no Activate or
+	// Terminate on an expired contract, no Create PO on a draft — all accepted
+	// by the server). Every refusal here is a status or role one, which hides
+	// the control rather than explaining it.
+	const actions = $derived(contract?.actions);
+	const canActivate = $derived(isAllowed(actions?.activate));
+	const canTerminate = $derived(isAllowed(actions?.terminate));
+	const canCancel = $derived(isAllowed(actions?.cancel));
+	const canRenew = $derived(isAllowed(actions?.renew));
+	const canCreatePo = $derived(isAllowed(actions?.create_po));
 
 	function addLine() {
 		lineItems = [
@@ -586,8 +595,9 @@
 			</div>
 		{/if}
 
-		<!-- Lifecycle actions (detail mode, admin/ap_manager only) -->
-		{#if !isCreate && canEdit}
+		<!-- Lifecycle actions (detail mode). Each shows only when its server
+		     verdict allows it — the verdict already folds in the role. -->
+		{#if !isCreate}
 			<div class="lifecycle-actions">
 				{#if canActivate}
 					<button type="button" class="btn-secondary" disabled={busy} onclick={() => runLifecycle(() => activateContract(contract!.id), m('contracts.modal.toast.activated'), m('contracts.modal.toast.activateFailed'))}>{m('contracts.modal.lifecycle.activate')}</button>

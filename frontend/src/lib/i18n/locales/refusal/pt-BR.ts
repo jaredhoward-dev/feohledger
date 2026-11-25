@@ -100,6 +100,8 @@ export const messages = {
 	'refusal.intakeDeleteConverted': "Este recebimento já foi convertido; cancele a requisição gerada a partir dele.",
 	'refusal.requisitionDeleteConverted': "A requisição foi convertida em pedido de compra; ela não pode ser excluída.",
 	'refusal.requisitionDeleteFromIntake': "A requisição foi gerada a partir de um recebimento; cancele-a em vez disso.",
+	'refusal.contractStatusRefused': "Não é possível enquanto este contrato estiver com status {status}.",
+	'refusal.contractDeleteRefused': "Um contrato com status {status} não pode ser excluído. Rescinda-o ou cancele-o.",
 	'refusal.expenseReportLocked': "O total deste relatório está bloqueado enquanto seu status for {status}, então suas linhas não podem ser alteradas.",
 	'refusal.expenseFxSourceMissing': "Nenhuma fonte de câmbio está configurada, então esta linha não pode ser convertida para a moeda do relatório.",
 	'refusal.expenseFxRateUnavailable': "Nenhuma taxa de câmbio está disponível para converter {source} para a moeda do relatório {target}.",

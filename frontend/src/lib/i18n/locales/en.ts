@@ -1792,6 +1792,7 @@ export const en = {
 	'contracts.bulk.updated': '{n, plural, one {# contract updated} other {# contracts updated}}',
 	'contracts.bulk.exported': '{n, plural, one {# contract exported} other {# contracts exported}}',
 	'contracts.bulk.updatedSkipped': '{n, plural, one {# contract updated} other {# contracts updated}}, {skipped} skipped',
+	'contracts.bulk.willSkip': '{skipped, plural, one {# selected contract can’t take this action and will be skipped.} other {# selected contracts can’t take this action and will be skipped.}}',
 	'contracts.toast.selectedTruncated': "Selected the first {shown} of {total} matching — narrow your filters to select the rest.",
 	'contracts.toast.selectedAllMatching': "{n, plural, one {Selected the # matching contract} other {Selected all # matching contracts}}",
 	'contracts.toast.selectAllFailed': "Failed to select all matching",

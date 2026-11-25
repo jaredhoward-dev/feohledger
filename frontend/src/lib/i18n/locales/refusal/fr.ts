@@ -100,6 +100,8 @@ export const messages = {
 	'refusal.intakeDeleteConverted': "Cette réception a été convertie ; annulez plutôt la demande d’achat qui en découle.",
 	'refusal.requisitionDeleteConverted': "La demande d’achat a été convertie en bon de commande ; elle ne peut pas être supprimée.",
 	'refusal.requisitionDeleteFromIntake': "La demande d’achat provient de la conversion d’une réception ; annulez-la plutôt.",
+	'refusal.contractStatusRefused': "Impossible tant que ce contrat est au statut {status}.",
+	'refusal.contractDeleteRefused': "Un contrat au statut {status} ne peut pas être supprimé. Résiliez-le ou annulez-le plutôt.",
 	'refusal.expenseReportLocked': "Le total de cette note de frais est verrouillé (statut : {status}) : ses lignes ne peuvent pas être modifiées.",
 	'refusal.expenseFxSourceMissing': "Aucune source de taux de change n’est configurée : cette ligne ne peut pas être convertie dans la devise de la note de frais.",
 	'refusal.expenseFxRateUnavailable': "Aucun taux de change n’est disponible pour convertir {source} dans la devise de la note de frais {target}.",
