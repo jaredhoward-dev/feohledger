@@ -19,13 +19,27 @@ import { deleteInvoicesWhere, expect, tenantPsql, test } from '../fixtures/helpe
 
 const MARKER = 'SELALL-INV-';
 
-function seedInvoices(n: number): void {
+function seedInvoices(n: number, status = 'new', from = 1): void {
 	tenantPsql(
 		`INSERT INTO invoices (id, correlation_id, organization_id, invoice_number, vendor_name, amount, currency, status, created_at, updated_at)
 		 SELECT gen_random_uuid(), gen_random_uuid(), (SELECT organization_id FROM invoices LIMIT 1),
-		        '${MARKER}' || g, 'SelAll Vendor', 100.00, 'USD', 'new', now(), now()
-		 FROM generate_series(1, ${n}) g`
+		        '${MARKER}' || g, 'SelAll Vendor', 100.00, 'USD', '${status}', now(), now()
+		 FROM generate_series(${from}, ${from + n - 1}) g`
 	);
+}
+
+/** Narrow the list to the seeded rows and wait for both the list and the
+ *  chip tallies the "matching" figure is computed from. */
+async function searchMarker(page: import('@playwright/test').Page): Promise<void> {
+	const q = `search=${encodeURIComponent(MARKER)}`;
+	const list = page.waitForResponse(
+		(r) => r.url().includes('/api/invoices?') && r.url().includes(q) && r.request().method() === 'GET'
+	);
+	const counts = page.waitForResponse(
+		(r) => r.url().includes('/api/invoices/counts') && r.url().includes(q)
+	);
+	await page.getByPlaceholder('Search invoices...').fill(MARKER);
+	await Promise.all([list, counts]);
 }
 
 function countRemaining(): number {
@@ -92,5 +106,48 @@ test.describe('/invoices "select all N matching" (acme admin)', () => {
 		// 20 that were ever rendered into the DOM. A pre-fix "select all"
 		// would have deleted only 20 and left 5 behind with no warning.
 		await expect.poll(() => countRemaining()).toBe(0);
+	});
+
+	test('the "matching" figure leaves out system-managed rows the selection cannot reach', async ({
+		page
+	}) => {
+		// 25 selectable + 5 paid: the list total is 30, but `/ids` excludes the
+		// paid rows (their checkboxes are disabled), so the offer must name 25.
+		// It used to name the list total — "Select all 30 matching" — and then
+		// select 25.
+		seedInvoices(25, 'new', 1);
+		seedInvoices(5, 'paid', 26);
+
+		await page.goto('/invoices');
+		await expect(page.locator('table tbody tr').first()).toBeVisible();
+		await searchMarker(page);
+		await expect(page.locator('table tbody tr')).toHaveCount(20);
+
+		await page.locator('th.checkbox-col input[type="checkbox"]').check();
+		const selectAllBtn = page.locator('.bulk-select-all-matching');
+		await expect(selectAllBtn).toContainText('25');
+		await expect(selectAllBtn).not.toContainText('30');
+
+		await selectAllBtn.click();
+		await expect(page.locator('.bulk-count')).toContainText('25 selected');
+	});
+
+	test('no "select all matching" offer when every matching row is already loaded', async ({
+		page
+	}) => {
+		// 3 selectable + 2 paid, all on one page: the header checkbox already
+		// selects everything selectable. The offer used to appear anyway
+		// (list total 5 > 3 selected) and its click selected nothing new.
+		seedInvoices(3, 'new', 1);
+		seedInvoices(2, 'paid', 4);
+
+		await page.goto('/invoices');
+		await expect(page.locator('table tbody tr').first()).toBeVisible();
+		await searchMarker(page);
+		await expect(page.locator('table tbody tr')).toHaveCount(5);
+
+		await page.locator('th.checkbox-col input[type="checkbox"]').check();
+		await expect(page.locator('.bulk-count')).toContainText('3 selected');
+		await expect(page.locator('.bulk-select-all-matching')).toHaveCount(0);
 	});
 });

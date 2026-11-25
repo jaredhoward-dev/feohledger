@@ -335,6 +335,15 @@ in deployed envs to enable renewal alerts.
 
 - `frontend/tests-e2e/contracts/contracts.spec.ts` — UI list render, API-driven
   create surfaced in the table, an activate reflected on the row.
+- `frontend/tests-e2e/contracts/url-state.spec.ts` — the list's URL state
+  (all intercepted, no writes): `?status=` / `?search=` / `?sort=` and the open
+  contract's `?id=` have ONE writer (`syncUrl()`), built from component state
+  because a shallow `replaceState` never updates `page.url`; opening a row
+  writes `?id=` so a reload re-opens it and closing scrubs it without reverting
+  later filters; a deep link that fails for any reason but `404` renders
+  `LoadError` with Retry rather than "Contract not found"; and a filter change
+  drops "select all N matching" back to the rows on screen, so a bulk action
+  never reaches the previous filter's set.
 - `frontend/tests-e2e/contracts/contracts-lifecycle.spec.ts` — the control
   paths, API-driven: each lifecycle transition (activate / terminate / cancel /
   renew) enforces its valid source state (`409` / `400` on an invalid one) and

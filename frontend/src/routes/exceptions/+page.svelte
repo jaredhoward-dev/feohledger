@@ -31,7 +31,7 @@
 	} from '#lib/types/exception.ts';
 	import type { ExceptionSeverity } from '#lib/types/exception.ts';
 	import type { ExceptionSummary } from '#lib/types/exceptionSummary.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import AgentDashboard from '#lib/components/exceptions/AgentDashboard.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { formatMoney, type MoneyAmount } from '#lib/utils/money.ts';
@@ -172,7 +172,7 @@
 	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
 		const status = params.get('status') ?? '';
 		const severity = params.get('severity') ?? '';
-		const sort = params.get('sort') ?? '';
+		const sort = sortFromUrl(params, SORT_KEYS, 'desc');
 		return {
 			view: (params.get('view') === 'agents' ? 'agents' : 'queue') as 'queue' | 'agents',
 			status: STATUS_KEYS.includes(status) ? status : 'open',
@@ -182,8 +182,8 @@
 			// with no chip pressed.
 			severity: (EXCEPTION_SEVERITIES as readonly string[]).includes(severity) ? severity : 'all',
 			search: params.get('search') ?? '',
-			sortField: SORT_KEYS.includes(sort) ? sort : null,
-			sortOrder: (params.get('order') === 'asc' ? 'asc' : 'desc') as SortOrder
+			sortField: sort.field,
+			sortOrder: sort.order
 		};
 	}
 	const initialUrlState = readUrlState(pageStore.url.searchParams);
@@ -611,8 +611,12 @@
 		await loadExceptions({ append: true, nextPage: page + 1 });
 	}
 
+	// The filter query the committed `summary` was read for.
+	let summaryParams: string | null = null;
+
 	async function loadSummary() {
 		const token = summarySequence.start();
+		let params = '';
 		try {
 			// The SAME filters the table was just loaded with — search included,
 			// via `appliedSearch` — so every chip counts the set on screen. This
@@ -620,14 +624,20 @@
 			// carried OPEN-only tallies while the operator was looking at
 			// Escalated / Resolved / All; with a search box that gap would have
 			// been every chip counting the tenant above a one-row table.
-			const params = filterParams(untrack(() => appliedSearch));
+			params = String(filterParams(untrack(() => appliedSearch)));
 			const data = await api.get<Summary>(`/api/exceptions/summary?${params}`);
 			// The chip counts drive the filter UI — an older summary landing
 			// last would relabel the chips with pre-resolve tallies.
 			if (!summarySequence.canCommit(token)) return;
 			summary = data;
+			summaryParams = params;
 		} catch {
-			/* non-critical */
+			// Non-critical, but another filter's tallies must not stand in for
+			// these: "Select all N matching" would offer the old N.
+			if (summarySequence.isCurrentRequest(token) && params !== summaryParams) {
+				summary = null;
+				summaryParams = null;
+			}
 		}
 	}
 
@@ -698,6 +708,14 @@
 	const erpShowSplit = $derived(spansSeveralRails(erpParts));
 	// The split is the record over any rail picked: the picker becomes a fact.
 	const erpSplitStands = $derived(erpShowSplit && resolveTarget?.erp_payment_split_stands === true);
+	/** The "record the ERP's payment" panel sits ABOVE the note in the resolve
+	 *  dialog; when it shows, the dialog opens at its start (the focus trap's
+	 *  default) rather than skipping a keyboard reader past it to the note. */
+	const erpPanelShown = $derived(
+		!!resolveTarget &&
+			isErpPaidReport(resolveTarget.erp_report) &&
+			isOffered(resolveTarget.record_erp_payment_refusal)
+	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
 
@@ -875,6 +893,18 @@
 				.filter((e) => e.decision_refusals && Object.values(e.decision_refusals).some(isAllowed))
 				.map((e) => e.id)
 		)
+	);
+
+	/**
+	 * How many rows "Select all N matching" would select: the open + escalated
+	 * rows within the current filters, which is what `GET /api/exceptions/ids`
+	 * resolves (`selectAllMatching` sends `status=open,escalated` under All).
+	 * Under the All chip that is NOT `total`, which counts resolved and
+	 * dismissed rows too. The status tallies honour every filter but status, so
+	 * open + escalated is that set's size; null while it is unknown.
+	 */
+	let selectableMatchingCount = $derived(
+		statusFilter === 'all' ? (summary ? summary.open + summary.escalated : null) : total
 	);
 
 	let allSelected = $derived(
@@ -1142,11 +1172,11 @@
 		}}
 	>
 		{#snippet actions()}
-			{#if allSelected && !selectedAllMatching && total > selectableIds.size}
+			{#if allSelected && !selectedAllMatching && selectableMatchingCount !== null && selectableMatchingCount > selectableIds.size}
 				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total })}
+						: m('common.selectAllMatching', { total: formatCount(selectableMatchingCount) })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
@@ -1170,9 +1200,15 @@
 	{#if errored && exceptions.length === 0 && !loading}
 		<!-- "Could not load exceptions. Try again." used to sit in the empty row
 		     with nothing to try again WITH; the reader had to reload the page. -->
+		<!-- Retry re-reads the chip tallies too: whatever failed the list most
+		     likely failed them, and the chips and the Queue tab count stayed
+		     uncounted after a successful retry until the next filter change. -->
 		<LoadError
 			message={m('exceptions.empty.errored')}
-			onretry={() => loadExceptions()}
+			onretry={() => {
+				loadExceptions();
+				loadSummary();
+			}}
 			testId="exceptions-load-error"
 		/>
 	{:else}
@@ -1380,7 +1416,7 @@
 				{refusalNote(resolveTarget)}
 			</p>
 		{/if}
-		{#if isErpPaidReport(resolveTarget.erp_report) && isOffered(resolveTarget.record_erp_payment_refusal)}
+		{#if erpPanelShown}
 			<!-- The payment the ERP reported, pre-filled, recorded in one step.
 			     Resolving this exception and recording the payment happen in one
 			     transaction server-side, so neither can land without the other. -->
@@ -1479,7 +1515,7 @@
 					bind:value={resolutionText}
 					placeholder={m('exceptions.resolveModal.notePlaceholder')}
 					maxlength="500"
-					autofocus
+					data-autofocus={erpPanelShown ? undefined : true}
 				/>
 			</label>
 			{#if decisionRefused}
@@ -1554,7 +1590,7 @@
 				bind:value={resolutionText}
 				placeholder={m('exceptions.bulkModal.notePlaceholder')}
 				maxlength="500"
-				autofocus
+				data-autofocus
 			/>
 		</label>
 		<div class="modal-footer">

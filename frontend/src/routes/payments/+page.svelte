@@ -102,7 +102,7 @@
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { kpiDisplayValue } from '#lib/utils/kpiValue.ts';
 	import { formatCount } from '#lib/utils/count.ts';
@@ -161,10 +161,11 @@
 			: 'all'
 	);
 
-	let sortField = $state<string | null>(page.url.searchParams.get('sort'));
-	// Only `asc` is honoured from the URL: a hand-edited `?order=` must not
-	// reach the API as an unknown direction.
-	let sortOrder = $state<SortOrder>(page.url.searchParams.get('order') === 'asc' ? 'asc' : 'desc');
+	// Only the history table's headers are read back (`sortFromUrl`).
+	const SORTABLE_FIELDS = ['method', 'amount', 'status', 'created_at'] as const;
+	const initialSort = sortFromUrl(page.url.searchParams, SORTABLE_FIELDS, 'desc');
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// WRITER — every read untracked, `page.url` included (issue #168 / the
 	// self-trigger on replaceState). Called from the tab/status effect, the
@@ -2249,7 +2250,7 @@
 						>
 							{selectingAllQueue
 								? m('common.loading')
-								: m('common.selectAllMatching', { total: queueSelectableTotal })}
+								: m('common.selectAllMatching', { total: formatCount(queueSelectableTotal) })}
 						</button>
 					{:else if selectedAllQueueMatching}
 						<span class="pay-bar-all-matching" data-testid="queue-all-matching-note"

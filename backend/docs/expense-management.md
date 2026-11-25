@@ -972,6 +972,15 @@ policy, an expense that violates it shows a badge, build + submit a report, a
 different manager approves → `approved`), and
 `frontend/tests-e2e/expenses/expense-cards.spec.ts` (WF4 — import a card CSV,
 re-import dedupes, sync virtual cards, match a txn to an expense, ignore one).
+`frontend/tests-e2e/expenses/list-completeness.spec.ts` (stubbed) holds the
+page's reading of the list contracts: the Policies and Pre-approvals tabs page
+through the server's set with the shared Load-more footer (they used to read
+only the first 20 rows, with nothing saying more existed); the Cards tab's
+Unmatched / Matched / Transactions cards are the server's `total` for each
+reconciliation status over the whole feed, whatever chip is active (they used
+to count the loaded page); a failed match-suggestions read is an error with
+Retry inside the picker, never "no candidates"; and an unknown `?tab=` opens
+the Expenses tab.
 
 ## Roadmap (WF2–WF4)
 

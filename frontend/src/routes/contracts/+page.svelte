@@ -32,12 +32,13 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { type MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { formatCount } from '#lib/utils/count.ts';
+	import { ApiError } from '#lib/api.ts';
 	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { afterNavigate, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import { formatDate } from '#lib/utils/time.ts';
 
@@ -56,9 +57,25 @@
 		...CONTRACT_STATUSES.map((s) => ({ key: s, label: statusLabel(s) }))
 	]);
 
-	// URL-backed filter state (mirrors the invoices page convention).
-	let search = $state(page.url.searchParams.get('search') ?? '');
-	let statusFilter = $state<string>(page.url.searchParams.get('status') ?? 'all');
+	// Column sort keys: the headers this table offers (`sortFromUrl`).
+	const SORTABLE_FIELDS = ['contract_number', 'status', 'end_date', 'total_value'] as const;
+
+	// The one READER of this route's query string, used at mount and by
+	// `afterNavigate` for a navigation that reuses this page. `?id=` is the
+	// deep-link effect's, off the same `page.url`.
+	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
+		const status = params.get('status') ?? '';
+		const sort = sortFromUrl(params, SORTABLE_FIELDS, 'desc');
+		return {
+			search: params.get('search') ?? '',
+			status: (CONTRACT_STATUSES as readonly string[]).includes(status) ? status : 'all',
+			sortField: sort.field,
+			sortOrder: sort.order
+		};
+	}
+	const initialUrlState = readUrlState(page.url.searchParams);
+	let search = $state(initialUrlState.search);
+	let statusFilter = $state<string>(initialUrlState.status);
 
 	// Modal state: null = create; a Contract = detail/edit.
 	// Three states, not two: a failed load must not read as "nothing matched".
@@ -68,11 +85,10 @@
 	let showCreate = $state(false);
 	let editing = $state<Contract | null>(null);
 
-	// Column sort — URL-backed (`?sort=&order=`), folded into the same
-	// syncUrl() the search/status filters already use. `null` field = the
-	// backend's own default order (most-recent first).
-	let sortField = $state<string | null>(page.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((page.url.searchParams.get('order') as SortOrder) ?? 'desc');
+	// Column sort — URL-backed (`?sort=&order=`) through `syncUrl()`. `null`
+	// field = the backend's own default order (most-recent first).
+	let sortField = $state<string | null>(initialUrlState.sortField);
+	let sortOrder = $state<SortOrder>(initialUrlState.sortOrder);
 
 	// --- Bulk selection ---
 	let selected = $state<Set<string>>(new Set());
@@ -135,8 +151,14 @@
 		return params;
 	}
 
-	// Reflect the live filter state into the URL. EVERY read in here is
-	// untracked, `page.url` included, because syncUrl() is a WRITER called
+	// Reflect the live filter state — and the open contract's `?id=` — into
+	// the URL. It is the route's ONLY `replaceState` caller and builds the
+	// query from component state, reading `page.url` for the pathname alone:
+	// SvelteKit's shallow `replaceState` never updates `page.url`, so a writer
+	// that rebuilt from it would write back a closed contract's `?id=` (the
+	// /invoices and /recurring single-writer shape).
+	//
+	// EVERY read in here is untracked, because syncUrl() is a WRITER called
 	// from the filter `$effect`s below — not a source of dependencies:
 	//   - the URL read would self-trigger the effect that writes it via
 	//     replaceState (Svelte effect_update_depth_exceeded);
@@ -148,21 +170,42 @@
 	//     reading them directly, so nothing here needs to be tracked.
 	function syncUrl() {
 		untrack(() => {
-			const url = new URL(page.url.href);
-			if (statusFilter !== 'all') url.searchParams.set('status', statusFilter);
-			else url.searchParams.delete('status');
-			if (search.trim()) url.searchParams.set('search', search.trim());
-			else url.searchParams.delete('search');
+			const params = new URLSearchParams();
+			if (deepLinkId) params.set('id', deepLinkId);
+			if (statusFilter !== 'all') params.set('status', statusFilter);
+			const s = search.trim();
+			if (s) params.set('search', s);
 			if (sortField) {
-				url.searchParams.set('sort', sortField);
-				url.searchParams.set('order', sortOrder);
-			} else {
-				url.searchParams.delete('sort');
-				url.searchParams.delete('order');
+				params.set('sort', sortField);
+				params.set('order', sortOrder);
 			}
-			replaceState(`${url.pathname}${url.search}`, {});
+			const qs = params.toString();
+			replaceState(`${page.url.pathname}${qs ? `?${qs}` : ''}`, {});
 		});
 	}
+
+	// A navigation that REUSES this mounted page (the sidebar row clicked on a
+	// filtered view, Back/Forward between two entries of this route) re-reads
+	// the URL; state seeded at mount would otherwise sit under a different
+	// address. `replaceState` is shallow and never fires this hook, so
+	// `syncUrl()` cannot loop through it. Only what changed is assigned: the
+	// status effect refetches with the new search and sort, a search alone goes
+	// through the debounce, and a sort alone fetches here (no effect tracks it).
+	afterNavigate(({ from, to, type }) => {
+		if (type === 'enter' || !from || !to || from.route.id !== to.route.id) return;
+		const next = readUrlState(to.url.searchParams);
+		const searchChanged = next.search !== search;
+		const sortChanged = next.sortField !== sortField || next.sortOrder !== sortOrder;
+		if (sortChanged) {
+			sortField = next.sortField;
+			sortOrder = next.sortOrder;
+		}
+		if (searchChanged) search = next.search;
+		if (next.status !== statusFilter) statusFilter = next.status;
+		else if (sortChanged && !searchChanged) {
+			contractStore.fetch(buildParams()).catch(() => {}); // noqa: raw-fetch-in-component — store method, routes through api client
+		}
+	});
 
 	function handleSort(field: string) {
 		const next = toggleSort({ field: sortField, order: sortOrder }, field);
@@ -255,6 +298,11 @@
 			searchEffectRan = true;
 			return;
 		}
+		// A "select all N matching" set was resolved against the OLD term, so
+		// it no longer describes anything on screen; drop out of matching mode
+		// now (before the debounced fetch lands) so the prune effect narrows
+		// `selected` to what the new search shows (/invoices does the same).
+		selectedAllMatching = false;
 		clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {
 			syncUrl();
@@ -272,6 +320,8 @@
 
 	$effect(() => {
 		statusFilter;
+		// Same as the search effect: a status change invalidates the matching set.
+		selectedAllMatching = false;
 		syncUrl();
 		// See the debounce effect above: swallow the rejection, the store's
 		// `errored` flag is what the UI reads.
@@ -286,35 +336,82 @@
 	// instead, so a vendor on page 40 is one query away and nothing is fetched
 	// until the form is opened.
 
-	// Deep-link: `/contracts?id=<uuid>` opens that contract's detail modal.
+	// Deep-link: `/contracts?id=<uuid>` opens that contract's detail modal,
+	// and opening one from a row writes its `?id=` too, so a reload or a
+	// copied link lands back on it. The READ is `page.url` (a deep link
+	// arrives by real navigation); the live value is mirrored into
+	// `deepLinkId`, which `syncUrl()` serialises.
+	let deepLinkId = $state<string | null>(page.url.searchParams.get('id'));
 	let deepLinkLoaded = $state<string | null>(null);
+	// The deep-linked contract that could not be fetched for a reason other
+	// than "it does not exist". Only a 404 may say "not found"; a 500 or an
+	// offline backend is a failed load, stated in place with a Retry.
+	let deepLinkFailedId = $state<string | null>(null);
+
+	function openDeepLink(id: string) {
+		deepLinkFailedId = null;
+		getContract(id)
+			.then((c) => {
+				// Don't open a modal for a link the user has since left.
+				if (deepLinkId === id) editing = c;
+			})
+			.catch((err) => {
+				if (deepLinkId !== id) return;
+				if (err instanceof ApiError && err.status === 404) {
+					toast(m('contracts.notFound'), 'error');
+					// Nothing will ever open for this id, so drop it from the URL:
+					// left there, a reload re-runs the lookup and re-toasts.
+					deepLinkId = null;
+					syncUrl();
+				} else {
+					deepLinkFailedId = id;
+				}
+			});
+	}
+
 	$effect(() => {
 		const id = page.url.searchParams.get('id');
-		if (!id || deepLinkLoaded === id) return;
-		deepLinkLoaded = id;
-		getContract(id)
-			.then((c) => (editing = c))
-			.catch(() => toast(m('contracts.notFound'), 'error'));
+		if (!id) {
+			untrack(() => {
+				deepLinkId = null;
+				deepLinkLoaded = null;
+				deepLinkFailedId = null;
+			});
+			return;
+		}
+		if (untrack(() => deepLinkLoaded) === id) return;
+		untrack(() => {
+			deepLinkId = id;
+			deepLinkLoaded = id;
+			openDeepLink(id);
+		});
 	});
 
 	async function openDetail(c: Contract) {
+		deepLinkId = c.id;
+		deepLinkFailedId = null;
+		syncUrl();
 		// Fetch the full record so the spend summary + line items are present
 		// (the list payload omits the heavier `spend` block on some backends).
+		let full: Contract;
 		try {
-			editing = await getContract(c.id);
+			full = await getContract(c.id);
 		} catch {
-			editing = c;
+			full = c;
 		}
+		// Closed (or another row opened) while the fetch was out.
+		if (deepLinkId === c.id) editing = full;
 	}
 
 	function closeModal() {
 		editing = null;
 		showCreate = false;
-		const url = new URL(page.url.href);
-		if (url.searchParams.has('id')) {
-			url.searchParams.delete('id');
-			replaceState(`${url.pathname}${url.search}`, {});
-			deepLinkLoaded = null;
+		if (deepLinkId) {
+			// Through the single writer, so filters changed since the modal
+			// opened survive the close. `deepLinkLoaded` keeps the id so the
+			// effect does not re-open it off the unchanged `page.url`.
+			deepLinkId = null;
+			syncUrl();
 		}
 	}
 
@@ -341,6 +438,14 @@
 		<SearchBox bind:value={search} placeholder={m('contracts.search.placeholder')} ariaLabel={m('contracts.search.aria')} />
 		<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 	</div>
+
+	{#if deepLinkFailedId}
+		<LoadError
+			message={m('contracts.deepLink.loadFailed')}
+			onretry={() => deepLinkFailedId && openDeepLink(deepLinkFailedId)}
+			testId="contracts-deeplink-error"
+		/>
+	{/if}
 
 	{#if contractStore.errored}
 		<LoadError
@@ -387,7 +492,7 @@
 								checked={selected.has(contract.id)}
 								onclick={(e) => e.stopPropagation()}
 								onchange={() => toggleSelect(contract.id)}
-								aria-label={`Select ${contract.contract_number}`}
+								aria-label={m('contracts.selectRowAria', { number: contract.contract_number })}
 							/>
 						</td>
 					{/if}
@@ -444,7 +549,7 @@
 					<button class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 						{selectingAllMatching
 							? m('common.loading')
-							: m('common.selectAllMatching', { total: contractStore.total })}
+							: m('common.selectAllMatching', { total: formatCount(contractStore.total) })}
 					</button>
 				{:else if selectedAllMatching}
 					<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>

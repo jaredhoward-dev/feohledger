@@ -52,4 +52,18 @@ test.describe('/vendors column sort (acme admin)', () => {
 		await statusAsc;
 		await expect(page).toHaveURL(/sort=status/);
 	});
+
+	// The URL is editable and outlives renames. An unknown `sort=` used to be
+	// sent as-is, the backend's allowlist 422'd it, and the page sat on its
+	// load error with a Retry that could only fail again.
+	test('an unknown sort in the URL falls back to the default order', async ({ page }) => {
+		const listRequest = page.waitForRequest((r) => r.url().includes('/api/vendors?'));
+		await page.goto('/vendors?sort=not_a_column&order=desc');
+		const url = new URL((await listRequest).url());
+		expect(url.searchParams.has('sort')).toBe(false);
+
+		await expect(page.locator('table tbody tr').first()).toBeVisible();
+		await expect(page.getByTestId('vendors-load-error')).toHaveCount(0);
+		await expect(page).not.toHaveURL(/sort=not_a_column/);
+	});
 });

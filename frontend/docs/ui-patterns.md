@@ -328,6 +328,15 @@ one again to flip direction:
 - The backend validates `sort=` against a per-endpoint allowlist
   (`backend/app/api/sorting.py`) — an out-of-list value is a 422, so only
   pass field keys the endpoint actually declares.
+- **Read the URL's sort through `sortFromUrl(params, fields)`**, not a bare
+  `searchParams.get('sort')`: the URL is editable and outlives a renamed
+  column, and an unknown key 422s every load, Retry included, leaving the page
+  on its load error with nothing on screen to undo it. `sortFromUrl` keeps only
+  a field the page offers as a header; a missing or unknown `order` reads as
+  the page's default direction (third argument, `asc` unless given). Every
+  sortable list uses it (guards: the unknown-sort cases in
+  `tests-e2e/{vendors,invoices}/sort.spec.ts` and
+  `tests-e2e/contracts/url-state.spec.ts`).
 - `null` field = the backend's own default order; only send `sort`/`order`
   in `buildParams()` when `sortField` is set (`untrack()` the read the same
   way `search` is — `buildParams()` is called from filter effects too).
@@ -492,10 +501,16 @@ per-currency money breakdown, so the pay-bar's subtotals + mixed-currency
 guard stay honest without holding every row); while in matching mode the
 prune effect is skipped and the money totals come from that backend
 breakdown, not the loaded page — mirrors `/invoices`' `selectedAllMatching`.
+Because the prune stands aside, a matching-mode selection must end when the
+filter it was made under changes (`/vendors` keys it on search + status;
+guard: `tests-e2e/vendors/bulk.spec.ts`), or the bar keeps counting, and a
+bulk action keeps acting on, rows the table no longer shows.
 
 Shipped on `/invoices`, `/expenses`, `/vendors` (bulk verify/reject via
 `POST /api/vendors/bulk/status`, bulk re-screen via `.../bulk/screen`, CSV
-export via `.../bulk/export`; gated to `vendor.manage`) and `/contracts`
+export via `.../bulk/export`; each action on its own endpoint's gate:
+verify/reject `vendor.manage`, re-screen admin | ap_manager, export admin |
+ap_manager | cfo, and the checkbox column only when one of them is held) and `/contracts`
 (bulk activate/terminate/cancel via `POST /api/contracts/bulk/status`,
 routed through the same `_transition` helper the single-row lifecycle
 buttons use; CSV export) and the `/payments` **Queue** tab (payment-run
@@ -503,6 +518,16 @@ builder, `GET /api/payments/queue/ids`) — the "select all N matching"
 affordance on each resolves the whole filtered set via that resource's
 `GET .../ids` sibling endpoint (`getVendorIds`/`getContractIds`/`getExpenseIds`)
 rather than only the currently-loaded page.
+
+**"Select all N matching" counts only the rows the action can select.** N is
+the size of the set `GET .../ids` will return, never a `total` that includes
+rows whose checkbox is disabled: `/invoices` subtracts the system-managed
+statuses (`selectableMatchingTotal`), `/exceptions` counts open + escalated
+under All, the payments queue uses the server's `selectable_total`. When the
+tallies behind N are missing or describe another filter (a failed counts
+read), fall back or withhold the button rather than offer the old N. Offer it
+only when N exceeds what is already selected, and format N with
+`formatCount`.
 
 ### Pagination + Load more
 

@@ -3,7 +3,7 @@
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { untrack } from 'svelte';
 	import { page as urlStore } from '$app/state';
 	import { replaceState } from '$app/navigation';
@@ -150,11 +150,9 @@
 	// read by the debounce effect — see the comment there.
 	let appliedSearch = $state((urlStore.url.searchParams.get('search') ?? '').trim());
 	// `?sort=&order=`; `null` = the backend's own default (newest first).
-	const urlSort = urlStore.url.searchParams.get('sort');
-	let sortField = $state<string | null>(urlSort && SORTABLE_FIELDS.includes(urlSort) ? urlSort : null);
-	let sortOrder = $state<SortOrder>(
-		urlStore.url.searchParams.get('order') === 'desc' ? 'desc' : 'asc'
-	);
+	const initialSort = sortFromUrl(urlStore.url.searchParams, SORTABLE_FIELDS);
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 	let applyTargetId = $state<string | null>(null);
 
 	const PAGE_SIZE = 20;

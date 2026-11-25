@@ -1,4 +1,4 @@
-import { deleteVendorsWhere, expect, tenantPsql, test } from '../fixtures/helpers';
+import { deleteVendorsWhere, expect, signInAndWait, tenantPsql, test } from '../fixtures/helpers';
 
 /**
  * /vendors bulk operations (issue #328, power-user/Medium): /vendors and
@@ -140,6 +140,37 @@ test.describe('/vendors bulk operations (acme admin)', () => {
 		await expect(page.locator('.bulk-count')).toContainText('25 selected');
 	});
 
+	// "All 25 matching" is a set the SEARCH matched, and it is kept apart from
+	// the per-page prune. Moving the filter used to leave it standing: the bar
+	// still read "25 selected" over a table of other vendors, and a bulk
+	// Reject would have stopped payments for rows no longer on screen.
+	test('select all matching ends when the filter changes', async ({ page }) => {
+		seedVendors(25, 'active');
+
+		await page.goto('/vendors');
+		await page.getByPlaceholder('Search vendors...').fill(MARKER);
+		await page.waitForResponse(
+			(r) => r.url().includes('/api/vendors?') && r.url().includes('search=')
+		);
+		await expect(page.locator('table tbody tr')).toHaveCount(20);
+
+		await page.locator('th.checkbox-col input[type="checkbox"]').check();
+		const idsResponse = page.waitForResponse((r) => r.url().includes('/api/vendors/ids'));
+		await page.getByRole('button', { name: /Select all \d+ matching/ }).click();
+		await idsResponse;
+		await expect(page.locator('.bulk-count')).toContainText('25 selected');
+
+		// Every seeded vendor is active, so Unverified narrows to none of them.
+		const filtered = page.waitForResponse(
+			(r) => r.url().includes('/api/vendors?') && r.url().includes('status=unverified')
+		);
+		await page.locator('.filter-chip', { hasText: /^Unverified/ }).click();
+		await filtered;
+
+		await expect(page.locator('.bulk-count')).toHaveCount(0);
+		await expect(page.getByRole('toolbar', { name: 'Bulk actions' })).toHaveCount(0);
+	});
+
 	// Bulk Reject stops payments and revokes live cards for every selected
 	// vendor, so it is the armed two-click the row Reject already is: the first
 	// click only arms, and nothing is posted until the confirm.
@@ -172,5 +203,40 @@ test.describe('/vendors bulk operations (acme admin)', () => {
 		expect(resp.status()).toBe(200);
 		expect(((await resp.json()) as { updated: number }).updated).toBe(2);
 		expect(posted).toBe(1);
+	});
+});
+
+// Each bulk action shows on its own endpoint's gate. A CFO is admitted by
+// `/bulk/export` (admin | ap_manager | cfo) but holds neither vendor.manage
+// (`/bulk/status`) nor a manager role (`/bulk/screen`). The whole bar used
+// to sit behind vendor.manage, so a CFO got row checkboxes that selected
+// into nothing and no way to export.
+test.describe('/vendors bulk operations (acme cfo)', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+	test.afterEach(() => purge());
+
+	test('a cfo gets Export and nothing the server would refuse', async ({ page, tenantCfo }) => {
+		seedVendors(2, 'unverified');
+		await signInAndWait(page, tenantCfo);
+
+		await page.goto('/vendors');
+		await page.getByPlaceholder('Search vendors...').fill(MARKER);
+		await page.waitForResponse(
+			(r) => r.url().includes('/api/vendors?') && r.url().includes('search=')
+		);
+		await expect(page.locator('table tbody tr')).toHaveCount(2);
+
+		await page.locator('th.checkbox-col input[type="checkbox"]').check();
+		const toolbar = page.getByRole('toolbar', { name: 'Bulk actions' });
+		await expect(toolbar).toBeVisible();
+		await expect(toolbar.getByRole('button', { name: 'Verify', exact: true })).toHaveCount(0);
+		await expect(toolbar.getByRole('button', { name: 'Reject', exact: true })).toHaveCount(0);
+		await expect(toolbar.getByRole('button', { name: 'Re-screen', exact: true })).toHaveCount(0);
+
+		const [download] = await Promise.all([
+			page.waitForEvent('download'),
+			toolbar.getByRole('button', { name: 'CSV', exact: true }).click()
+		]);
+		expect(download.suggestedFilename()).toBe('vendors-export.csv');
 	});
 });

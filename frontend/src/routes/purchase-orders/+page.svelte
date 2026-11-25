@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api } from '#lib/api.ts';
+	import { api, ApiError } from '#lib/api.ts';
 	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { appendUnique } from '#lib/utils/pagination.ts';
@@ -25,6 +25,8 @@
 	import { poStatusLabel, poStatusTone } from '#lib/types/purchaseOrder.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { untrack } from 'svelte';
+	import { page as pageState } from '$app/state';
+	import { afterNavigate, replaceState } from '$app/navigation';
 
 	const COLUMNS = $derived([
 		{ label: m('purchaseOrders.col.poNumber'), class: 'col-number' },
@@ -103,8 +105,25 @@
 	// on a re-load, the previous filter's rows standing as this one's answer.
 	// A failed load-more keeps the rows already shown and only toasts.
 	let errored = $state(false);
-	let search = $state('');
-	let statusFilter = $state<'all' | 'open' | 'unissued' | 'closed' | 'cancelled'>('all');
+	// URL-backed: `?search=`, `?status=` and the open PO's `?id=` are read by
+	// `readUrlState` and written back by `syncUrl()`.
+	type StatusFilter = 'all' | 'open' | 'unissued' | 'closed' | 'cancelled';
+	const STATUS_FILTERS: readonly StatusFilter[] = ['all', 'open', 'unissued', 'closed', 'cancelled'];
+	function statusFromUrl(raw: string | null): StatusFilter {
+		return STATUS_FILTERS.includes(raw as StatusFilter) ? (raw as StatusFilter) : 'all';
+	}
+	// The one READER of this route's query string, used at mount and by
+	// `afterNavigate` for a navigation that reuses this page.
+	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
+		return {
+			search: params.get('search') ?? '',
+			status: statusFromUrl(params.get('status')),
+			id: params.get('id')
+		};
+	}
+	const initialUrlState = readUrlState(pageState.url.searchParams);
+	let search = $state(initialUrlState.search);
+	let statusFilter = $state<StatusFilter>(initialUrlState.status);
 	// The badge text is the shared PO status label (`poStatusLabel`), not the
 	// raw column value — `open` is a database token, "Open" is what a clerk
 	// reads, and `partially_received` / `received` / `voided` read as words
@@ -117,15 +136,52 @@
 
 	let syncing = $state(false);
 
-	let detailId = $state<string | null>(null);
+	let detailId = $state<string | null>(initialUrlState.id);
 	let detail = $state<PODetail | null>(null);
 	let detailLoading = $state(false);
+	// The open PO's fetch failed for a reason other than "it does not exist":
+	// stated in the dialog with a Retry, and `?id=` kept. Only a 404 drops it.
+	let detailFailed = $state(false);
 
 	let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
+	// The route's ONLY `replaceState` caller. It builds the query from
+	// component state and reads `page.url` for the pathname alone: SvelteKit's
+	// shallow `replaceState` never updates `page.url`, so rebuilding from it
+	// would resurrect a closed PO's `?id=` (the /invoices single-writer shape).
+	// Every read is untracked — this is a writer called from effects.
+	function syncUrl() {
+		untrack(() => {
+			const params = new URLSearchParams();
+			if (detailId) params.set('id', detailId);
+			const q = search.trim();
+			if (q) params.set('search', q);
+			if (statusFilter !== 'all') params.set('status', statusFilter);
+			const qs = params.toString();
+			replaceState(`${pageState.url.pathname}${qs ? `?${qs}` : ''}`, {});
+		});
+	}
+
 	$effect(() => {
-		void loadPos();
-		void fetchCounts();
+		// Mount load carries the filters the URL arrived with.
+		untrack(() => {
+			void loadPos({ search, status: statusFilter });
+			void fetchCounts({ search });
+		});
+	});
+
+	// A navigation that REUSES this mounted page (a sidebar click to bare
+	// `/purchase-orders`, a link to `?id=…`, Back/Forward between two entries
+	// of this route) re-reads the URL; state seeded at mount would otherwise
+	// sit under a different address. `replaceState` is shallow and never fires
+	// this hook, so `syncUrl()` cannot loop through it. Only what changed is
+	// assigned, so each effect below refetches just its own part.
+	afterNavigate(({ from, to, type }) => {
+		if (type === 'enter' || !from || !to || from.route.id !== to.route.id) return;
+		const next = readUrlState(to.url.searchParams);
+		if (next.search !== search) search = next.search;
+		if (next.status !== statusFilter) statusFilter = next.status;
+		if (next.id !== detailId) detailId = next.id;
 	});
 
 	// A status chip is a discrete action, so it fetches immediately — it used
@@ -145,6 +201,7 @@
 			statusEffectRan = true;
 			return;
 		}
+		syncUrl();
 		void loadPos({ search: untrack(() => search), status: s });
 	});
 
@@ -157,6 +214,7 @@
 		}
 		if (searchTimer) clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {
+			syncUrl();
 			void loadPos({ search: q, status: untrack(() => statusFilter) });
 			// The tallies are search-scoped too — a chip count that ignored the
 			// active search would contradict the list under it.
@@ -169,12 +227,19 @@
 		};
 	});
 
+	let detailEffectRan = false;
 	$effect(() => {
-		if (!detailId) {
+		const id = detailId;
+		// Opening and closing the detail both land in the URL. Skipped on the
+		// mount run, where the URL already says what the state does.
+		if (detailEffectRan) syncUrl();
+		detailEffectRan = true;
+		detailFailed = false;
+		if (!id) {
 			detail = null;
 			return;
 		}
-		void loadDetail(detailId);
+		void loadDetail(id);
 	});
 
 	// Sequences every `loadPos` call (mount, chip, debounced search, load-more —
@@ -309,14 +374,21 @@
 	async function loadDetail(id: string) {
 		const token = detailSequence.start();
 		detailLoading = true;
+		detailFailed = false;
 		try {
 			const data = await api.get<PODetail>(`/api/purchase-orders/${id}`);
 			if (!detailSequence.canCommit(token)) return;
 			detail = data;
 		} catch (err) {
 			if (!detailSequence.isCurrentRequest(token)) return;
-			toast(err instanceof Error ? err.message : m('purchaseOrders.toast.loadFailed'), 'error');
-			detailId = null;
+			if (err instanceof ApiError && err.status === 404) {
+				// Nothing will ever open for this id: drop it, or a reload re-toasts.
+				toast(m('purchaseOrders.toast.notFound'), 'error');
+				detailId = null;
+			} else {
+				detail = null;
+				detailFailed = true;
+			}
 		} finally {
 			if (detailSequence.isCurrentRequest(token)) detailLoading = false;
 		}
@@ -457,6 +529,12 @@
 	<div class="modal-body">
 		{#if detailLoading}
 			<LoadingState />
+		{:else if detailFailed}
+			<LoadError
+				message={m('purchaseOrders.modal.loadFailed')}
+				onretry={() => detailId && loadDetail(detailId)}
+				testId="purchase-orders-detail-error"
+			/>
 		{:else if detail}
 			<dl class="meta">
 				<dt>{m('purchaseOrders.modal.vendor')}</dt><dd>{detail.vendor_name ?? '—'}</dd>
