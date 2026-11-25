@@ -28044,3 +28044,81 @@ the cursor is read by the next tick (and, as the control, not with no overlap);
 the second listing asks from `through − 10 min`.
 `tests/test_sweep_health.py`: every sweep's enabled flag, parametrized over the
 registry, is what its health snapshot reads.
+
+## 545. The ERP bill void calls the ERP with no row lock held, behind a committed marker (§542 follow-up, round 46)
+
+**Problem.** `POST /api/exceptions/{id}/void-erp-bill` held the invoice, flag
+and workflow-instance row locks across its ERP calls: the credential unseal,
+the status read (30 s), the deleted-bill report (30 s) and the void (45 s).
+§542 bounded them and deferred the split (followups (c)). A slow ERP stalled
+every other writer of that invoice (an ERP status webhook, the reconciliation
+sweep, a payment run) and held a pool connection, against the rule that no
+third party's latency is charged to a transaction holding row locks
+(`post_commit.py`).
+
+**Decision.** Three transactions (`services/erp_bill_void`):
+
+1. **`begin_void`, under the locks**: replay, `void_refusal` (permission, row,
+   bill, a live marker), the live-claim gate, then a marker on the new
+   `invoices.erp_void_pending` (`attempt_id`, `exception_id`, `document_id`,
+   `actor_id`, `reason`, `started_at`; migration 0146, tenant, idempotent),
+   committed.
+2. **`call_erp`, no lock and no session**: the adapter is opened and the §542
+   read / void runs unchanged (positive read only, converge on already gone,
+   `erp_void_unconfirmed`, draft-only scope).
+3. **Re-lock** in the same order. `finish_void` writes only if the marker is
+   still this attempt's (`attempt_id`) and the invoice still names the same
+   bill at `sent_to_erp` / `posted_in_erp`; otherwise `erp_void_in_progress` /
+   `erp_void_no_bill`, nothing written. After a refusal from step 2,
+   `abandon_void` clears the marker if it is still ours. The marker is cleared
+   on every outcome, `unconfirmed` included: the flag is still open, and a
+   retry converges (§542).
+
+**What the marker blocks.** While live (younger than
+`PENDING_STALE_AFTER_S` = 300 s, well past step 2's 105 s bound): a second
+click (409 `erp_void_in_progress`, the queue's verdict too) and clearing the
+flag it names (`record_decision` 409, `/bulk/resolve` per-row skip;
+`escalate` stays open). Keeping the flag open is what holds the invoice off
+every money path: the run builder, card mint, mark-paid, retry-failed, the
+queue and the ERP push all already refuse an invoice with an open
+`duplicate` / `fraud_flag` (`payment_runs.blocking_exception_types`), so none
+of them reads the marker. The recall refuses it as before (not `approved`, a
+bill on record). `exception_lifecycle.record_decision` asks
+`erp_bill_void.clear_refusal`, which locks the flag's row before a fresh
+column read of the marker, so it serializes with step 1 (invoice, then flag):
+either the clear sees the committed marker, or the void sees the flag already
+cleared and refuses `erp_void_not_flagged`.
+
+**Crash recovery: the endpoint, no sweep.** A process that dies between 1 and 3
+leaves a marker. While it is live the flag stays open (fail closed); once
+stale it blocks nothing, and the next click takes it over: the read finds the
+bill gone and converges, or open and voids it, which is what the person asked
+for. The flag can also be dismissed once the marker is stale; if the ERP did
+void the bill, paying the invoice then pays it once, since the ERP will not
+pay a voided bill. A sweep would only shorten a five-minute window in which
+nothing can pay the invoice.
+
+**Where the marker lives.** On the invoice, not in `state_data`: the invoice
+row is the one every writer locks first, the queue verdict already has it
+loaded, and `clear_refusal` reads it as a single column.
+
+**Rejected.** *An engine-level refusal of every transition while the marker
+stands*: the open flag already closes the money paths, and refusing the ERP
+status sync's own transitions mid-void would only make it fail and retry.
+*A new pseudo-type in `blocking_exception_types`*: the queue links each
+blocked row to the exception that blocks it, and a marker is not an
+exception. *Keeping the marker on `unconfirmed`*: it would block dismissing a
+false flag for five minutes while adding no protection the open flag does not
+give.
+
+**Guard.** `tests/test_erp_bill_void_from_flag.py`: mid-void, a second session
+takes the invoice, flag and workflow-instance locks `NOWAIT`, sees the
+committed marker and `blocked_invoice_ids` holding the invoice, and a second
+click, a dismiss and a bulk dismiss are refused `erp_void_in_progress` while
+escalate is open; a seeded live marker refuses the dismiss and the recall and
+keeps the run gate holding; a crashed attempt's marker refuses while fresh and
+converges once stale; a stale marker does not hold the flag; `finish_void`
+writes nothing for an attempt that no longer owns the marker; every refusal
+clears it; two concurrent clicks make one ERP call (now 201 + 409).
+`tests/test_migration_0146_invoice_erp_void_pending.py`; frontend
+`codedRefusals.test.ts` for the new code in all six locales.
