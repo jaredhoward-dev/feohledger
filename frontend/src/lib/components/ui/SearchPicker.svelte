@@ -55,6 +55,8 @@
 		label,
 		ariaLabel,
 		hint,
+		invalid = false,
+		errorId,
 		selectedLabel = null,
 		placeholder,
 		required = false,
@@ -91,6 +93,11 @@
 		 *  description beside the count line, never into its NAME — a hint
 		 *  folded into the label is re-read on every focus. */
 		hint?: string;
+		/** The field failed validation: sets `aria-invalid` on the input. */
+		invalid?: boolean;
+		/** Id of the caller's error message beside the field; read FIRST in the
+		 *  input's description (`docs/ui-patterns.md` § Field validation). */
+		errorId?: string;
 		/** The committed option's label when the form opened on an existing row.
 		 *  The option may sit on any page of the set, so the picker cannot look
 		 *  it up from the first page — the parent already has it. */
@@ -448,7 +455,8 @@
 			aria-haspopup="listbox"
 			aria-autocomplete="list"
 			aria-activedescendant={expanded && activeIndex >= 0 ? optionId(activeIndex) : undefined}
-			aria-describedby={hint ? `${countId} ${hintId}` : countId}
+			aria-describedby={[errorId, countId, hint ? hintId : null].filter(Boolean).join(' ')}
+			aria-invalid={invalid ? 'true' : undefined}
 			aria-labelledby={label ? labelId : undefined}
 			aria-label={label ? undefined : ariaLabel}
 			{placeholder}

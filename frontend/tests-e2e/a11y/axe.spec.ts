@@ -81,6 +81,7 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['sso', 'Single Sign-On'],
 	['scim', 'SCIM provisioning'],
 	['fraud', 'Fraud Detection'],
+	['match-rules', 'PO match rules'],
 	['line-total-check', 'Line-total check'],
 	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
@@ -195,6 +196,37 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 			await expectNoA11yViolations(page);
 		});
 	}
+
+	// The round-41 panels at phone width (390px): the match-rules panel with its
+	// rule form open (the scope radios, vendor picker and two-field row are
+	// what wrap), and the SCIM panel's loaded body. axe at that width, plus no
+	// sideways document scroll (WCAG 1.4.10; `reflow.spec.ts` walks every
+	// section at 320px with the panel closed).
+	test('organization settings → match-rules and scim at 390px have no axe violations', async ({
+		page
+	}) => {
+		await page.setViewportSize({ width: 390, height: 844 });
+		await page.goto('/organization?section=match-rules');
+		await expect(page.locator('aside.sidebar').first()).toBeVisible();
+		await expect(page.getByTestId('match-rules-org-save')).toBeVisible();
+		await page.getByTestId('match-rule-add').click();
+		await expect(page.getByTestId('match-rule-form')).toBeVisible();
+		await expectNoA11yViolations(page);
+		expect(
+			await page.evaluate(
+				() => document.documentElement.scrollWidth - document.documentElement.clientWidth
+			)
+		).toBeLessThanOrEqual(1);
+
+		await page.goto('/organization?section=scim');
+		await expect(page.getByTestId('scim-status')).toBeVisible();
+		await expectNoA11yViolations(page);
+		expect(
+			await page.evaluate(
+				() => document.documentElement.scrollWidth - document.documentElement.clientWidth
+			)
+		).toBeLessThanOrEqual(1);
+	});
 
 	// The SCIM panel's loaded body (its status line) and its one-time reveal
 	// dialog, whose token must be readable and copyable by keyboard.

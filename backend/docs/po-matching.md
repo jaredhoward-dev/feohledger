@@ -1044,7 +1044,7 @@ Money). Admin only, read and write, like every other `/organization` writer.
 
 | Route | Does |
 |-------|------|
-| `GET /api/organization/match-rules` | `{organization, built_in, vendor_rules[], commodity_rules[]}`. Each layer's `tolerance_pct` / `require_inspection` is the value the resolver applies there (through its own `_coerce_*`), or `null` when the layer does not set it and the next one decides. A stored value the resolver ignores reads `null`, never as a rule in force. Vendor rows carry `vendor_name` (`null` for a vendor that no longer exists), GL rows the chart's `gl_account_name` |
+| `GET /api/organization/match-rules` | `{organization, built_in, vendor_rules[], commodity_rules[]}`. Each layer's `tolerance_pct` / `require_inspection` is the value the resolver applies there (through its own `_coerce_*`), or `null` when the layer does not set it and the next one decides. A stored value the resolver ignores reads `null`, never as a rule in force. Each layer also carries `tolerance_out_of_range`: `true` when the stored tolerance is one the resolver applies but this router would refuse (outside 0–100 — an old write through the unaudited generic PATCH). It is reported as stored and never rewritten; the panel flags it and asks an admin to save a valid value. Vendor rows carry `vendor_name` (`null` for a vendor that no longer exists), GL rows the chart's `gl_account_name` |
 | `PUT …/organization` | Sets the organization layer; a `null` field falls back to the built-in (5 %, no inspection) |
 | `PUT` / `DELETE …/vendors/{vendor_id}` | Creates, replaces or removes one vendor's rule. The vendor must exist (404 `match_rule_vendor_not_found`) |
 | `PUT` / `DELETE …/commodities/{gl_code}` | The same for one header GL code, which must be in the chart (404 `match_rule_gl_account_not_found`) |
@@ -1066,9 +1066,15 @@ saved. A save that changes nothing writes nothing. The generic
 naming this router (`guard_matching_block`) and passes an unchanged copy.
 
 The screen lists both rule kinds with the organization setting and built-in
-beside them, marks a rule whose own tolerance is wider than the organization's
-(more of that vendor's invoices pass unflagged), and removes a rule only on a
-second click. Coverage: `backend/tests/test_organization_match_rules.py`,
+beside them, and marks a rule **looser than the organization** when it lets
+more of that vendor's invoices through unflagged: its own tolerance is wider
+than the organization's, or it sets inspection "Not required" where the
+organization (or the built-in) requires it, which skips the quality hold. An
+out-of-range stored tolerance is marked "Out of range" with a notice asking for
+a fix. It removes a rule only on a second click, which a click elsewhere
+cancels. A missing vendor / GL account on save is a field error on that picker;
+a failed GL-account list is an error with Retry; tolerances are pre-filled and
+hinted in the reader's decimal separator. Coverage: `backend/tests/test_organization_match_rules.py`,
 `frontend/src/lib/types/matchRules.test.ts`,
 `frontend/tests-e2e/organization/match-rules.spec.ts`.
 

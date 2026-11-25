@@ -14,7 +14,11 @@ generic PATCH refuses any change to the block (`guard_matching_block`).
 Every read goes through the resolver's own coercions (`_coerce_tolerance` /
 `_coerce_inspection`), so the screen shows exactly what the PO match applies —
 a stored value the resolver ignores reads back as "not set", never as a rule
-that is not in force.
+that is not in force. A stored tolerance the resolver DOES apply but this writer
+would refuse (outside 0–100: written by the generic PATCH before it was closed
+to this block) reads back as it is, with `tolerance_out_of_range: true`, so the
+panel can say so and ask for a fix. It is never rewritten silently: the PO match
+applies it until an admin saves a valid value.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.deps import ROLE_ADMIN, require_roles
+from app.api.organization_controls import AUDIT_UNWRITABLE_DETAIL
 from app.api.refusals import coded_refusal
 from app.database import get_control_db
 from app.models.gl_account import GL_CODE_MAX_LENGTH, GLAccount
@@ -65,10 +70,6 @@ COMMODITY_RULES = "commodity_rules"
 TOLERANCE_MIN = Decimal("0")
 TOLERANCE_MAX = Decimal("100")
 TOLERANCE_PLACES = 2
-
-AUDIT_UNWRITABLE_DETAIL = (
-    "The change could not be recorded in the audit trail, so it was not saved."
-)
 
 
 # ---------- validation (coded refusals) --------------------------------------
@@ -136,6 +137,10 @@ class MatchRuleBody(BaseModel):
 class MatchRuleOut(BaseModel):
     tolerance_pct: Decimal | None
     require_inspection: bool | None
+    #: The stored tolerance is applied by the PO match but lies outside the
+    #: 0–100 range this writer accepts (an old unaudited write). Reported, never
+    #: rewritten: the screen flags it and asks an admin to save a valid value.
+    tolerance_out_of_range: bool = False
 
     @field_serializer("tolerance_pct")
     def _ser_tol(self, v: Decimal | None) -> str | None:
@@ -194,6 +199,17 @@ def _effective(rule: dict) -> dict:
     }
 
 
+def tolerance_out_of_range(value: Decimal | None) -> bool:
+    """A tolerance the resolver applies that `parse_tolerance` would refuse."""
+    return value is not None and (value < TOLERANCE_MIN or value > TOLERANCE_MAX)
+
+
+def _view(rule: dict) -> dict:
+    """`_effective` plus the out-of-range flag, for the read model."""
+    eff = _effective(rule)
+    return {**eff, "tolerance_out_of_range": tolerance_out_of_range(eff["tolerance_pct"])}
+
+
 async def _read(org: Organization, tdb: AsyncSession) -> MatchRulesOut:
     block = _block(org.settings)
     vendor_rules = _rules(block, VENDOR_RULES)
@@ -220,20 +236,20 @@ async def _read(org: Organization, tdb: AsyncSession) -> MatchRulesOut:
             gl_names.setdefault(code, name)
 
     return MatchRulesOut(
-        organization=MatchRuleOut(**_effective(block)),
+        organization=MatchRuleOut(**_view(block)),
         built_in=BuiltInOut(
             tolerance_pct=DEFAULT_TOLERANCE_PCT, require_inspection=DEFAULT_REQUIRE_INSPECTION
         ),
         vendor_rules=sorted(
             (
-                VendorRuleOut(vendor_id=k, vendor_name=names.get(k), **_effective(v))
+                VendorRuleOut(vendor_id=k, vendor_name=names.get(k), **_view(v))
                 for k, v in vendor_rules.items()
             ),
             key=lambda r: ((r.vendor_name or "").casefold(), r.vendor_id),
         ),
         commodity_rules=sorted(
             (
-                CommodityRuleOut(gl_account=k, gl_account_name=gl_names.get(k), **_effective(v))
+                CommodityRuleOut(gl_account=k, gl_account_name=gl_names.get(k), **_view(v))
                 for k, v in commodity_rules.items()
             ),
             key=lambda r: r.gl_account,

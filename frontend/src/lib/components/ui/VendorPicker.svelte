@@ -40,6 +40,8 @@
 		fullWidth = false,
 		compact = false,
 		testid,
+		invalid = false,
+		errorId,
 		onselect
 	}: {
 		/** The chosen vendor's uuid — `''` for none. This is what the form submits. */
@@ -57,6 +59,10 @@
 		/** Narrow sizing for an inline row of controls. */
 		compact?: boolean;
 		testid?: string;
+		/** The field failed validation (`aria-invalid` on the input). */
+		invalid?: boolean;
+		/** Id of the caller's error message, read first in the description. */
+		errorId?: string;
 		/** Fired on every commit — the chosen option, or null when cleared. */
 		onselect?: (option: VendorOption | null) => void;
 	} = $props();
@@ -92,6 +98,8 @@
 	{fullWidth}
 	{compact}
 	{testid}
+	{invalid}
+	{errorId}
 	{onselect}
 >
 	{#snippet option(vendor)}

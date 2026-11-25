@@ -6,6 +6,8 @@ import {
 	isLooserThanOrganization,
 	organizationTolerance,
 	toleranceBody,
+	toleranceExample,
+	toleranceInput,
 	type MatchRules
 } from './matchRules.ts';
 
@@ -50,7 +52,12 @@ describe('compareDecimal', () => {
 		['10', '9.99', 1],
 		['0.5', '5', -1],
 		['05', '5', 0],
-		['1.005', '1.01', -1]
+		['1.005', '1.01', -1],
+		['-5', '5', -1],
+		['5', '-5', 1],
+		['-5', '-2', -1],
+		['-0', '0', 0],
+		['500', '100', 1]
 	])('%s vs %s', (a, b, expected) => {
 		expect(compareDecimal(a, b)).toBe(expected);
 	});
@@ -77,5 +84,55 @@ describe('organization tolerance and looser rules', () => {
 		expect(isLooserThanOrganization({ tolerance_pct: null, require_inspection: true }, r)).toBe(
 			false
 		);
+	});
+});
+
+describe('inspection loosening', () => {
+	it('flags a rule that drops inspection where the organization requires it', () => {
+		const r = rules('3');
+		r.organization.require_inspection = true;
+		expect(isLooserThanOrganization({ tolerance_pct: null, require_inspection: false }, r)).toBe(
+			true
+		);
+		// Requiring it, or inheriting, never loosens.
+		expect(isLooserThanOrganization({ tolerance_pct: null, require_inspection: true }, r)).toBe(
+			false
+		);
+		expect(isLooserThanOrganization({ tolerance_pct: '1', require_inspection: null }, r)).toBe(
+			false
+		);
+	});
+
+	it('reads the built-in when the organization sets no inspection', () => {
+		const r = rules('3');
+		// Built-in is false: "not required" matches it, so nothing loosens.
+		expect(isLooserThanOrganization({ tolerance_pct: null, require_inspection: false }, r)).toBe(
+			false
+		);
+		r.built_in.require_inspection = true;
+		expect(isLooserThanOrganization({ tolerance_pct: null, require_inspection: false }, r)).toBe(
+			true
+		);
+	});
+
+	it('a negative stored tolerance is not wider than the organization', () => {
+		expect(isLooserThanOrganization({ tolerance_pct: '-5', require_inspection: null }, rules('3'))).toBe(
+			false
+		);
+	});
+});
+
+describe('locale decimals', () => {
+	it('pre-fills and quotes the example in the reader\'s separator', () => {
+		expect(toleranceInput('2.5', 'de-DE')).toBe('2,5');
+		expect(toleranceInput('2.5', 'en-US')).toBe('2.5');
+		expect(toleranceInput('10', 'fr-FR')).toBe('10');
+		expect(toleranceInput(null, 'de-DE')).toBe('');
+		expect(toleranceExample('pt-BR')).toBe('2,5');
+		expect(toleranceExample('ja-JP')).toBe('2.5');
+	});
+
+	it('what it pre-fills reads back to the stored value', () => {
+		expect(toleranceBody(toleranceInput('2.5', 'de-DE'))).toBe('2.5');
 	});
 });

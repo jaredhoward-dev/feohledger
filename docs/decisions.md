@@ -26189,3 +26189,17 @@ approval re-judge already takes the strictest rule across GL codes
 (`strictest_rule_for_any_commodity`); the screen flags it instead. *Recording
 created-by / created-at on each rule*: the audit rows already hold who and when,
 and a name copied into settings would be one more place erasure has to reach.
+
+**Amendment (round 41 review).** *Looser* covers both knobs: a rule with
+`require_inspection: false` over an organization (or built-in) that requires
+inspection skips the quality hold, so it is flagged like a wider tolerance.
+*Out-of-range stored values*: the generic PATCH accepted tolerances such as
+`"-5"` or `"500"` before it was closed to this block, and the resolver still
+applies them. The read reports each layer's `tolerance_out_of_range` and the
+panel flags it with a prompt to save a valid value. Rewriting them
+automatically was rejected: it would change a money-path control with no
+admin's decision behind it, and clamping either way picks a policy nobody
+chose. The panel also follows the shared form conventions (picker field error,
+GL-list Retry, outside-click disarm, focus on open and close, locale decimal
+separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
+duplicated.
