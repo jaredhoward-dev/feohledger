@@ -63,6 +63,7 @@ from app.models.invoice import Invoice
 from app.models.invoice_status import IN_REVIEW_STATUSES, OPEN_AP_STATUSES
 from app.models.payment import Payment, PaymentSchedule
 from app.services.payment_schedules import LATEST_SCHEDULE_ORDER
+from app.services.payment_settlement_record import payment_covered_sql
 
 #: Approved and still owed: the firm AP commitment.
 COMMITTED_STATUSES: tuple[str, ...] = tuple(s.value for s in OPEN_AP_STATUSES)
@@ -123,15 +124,30 @@ def is_due_soon(effective_due: ColumnElement, today: date) -> ColumnElement:
 
 
 def paid_out() -> ColumnElement:
-    """The invoice carries a `completed` payment: the money has left.
+    """The invoice carries a `completed` payment that DISCHARGES it: the money
+    has left, in full.
 
-    One live payment per invoice (`payments`' partial unique index), so a
-    completed one settles the invoice in full; between that and the
-    `payment_scheduled → paid` sync-back the invoice is not owed, and counting
-    it would show a paid bill as overdue and project its outflow twice
-    (decisions §565). Correlated on `Invoice.id`.
+    One live payment per invoice (`payments`' partial unique index); between
+    its discharge and the `payment_scheduled → paid` sync-back the invoice is
+    not owed, and counting it would show a paid bill as overdue and project its
+    outflow twice (decisions §565).
+
+    `completed` alone is not that (decisions §569): a run's card leg is
+    `completed` the moment the card is MINTED, before the vendor charges it,
+    and a short or unstorable settlement is `completed` while the payment sync
+    holds the invoice. "Discharges" is `payment_settlement_record.payment_coverage`'s
+    `covered`, the verdict the payment sync and an ERP `paid` report act on,
+    through its SQL twin `payment_covered_sql`, so an uncharged card or a short
+    settlement leaves the invoice owed (at its face amount) on every overdue
+    surface and in the forecast. Correlated on `Invoice.id`.
     """
-    return exists(select(1).where(Payment.invoice_id == Invoice.id, Payment.status == "completed"))
+    return exists(
+        select(1).where(
+            Payment.invoice_id == Invoice.id,
+            Payment.status == "completed",
+            payment_covered_sql(),
+        )
+    )
 
 
 def open_ap_due_population(statuses: Sequence[str] = OUTFLOW_STATUSES) -> Subquery:
