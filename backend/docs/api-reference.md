@@ -19,7 +19,7 @@ Authorization: Bearer <jwt_token>
 - `/api/auth/login`, `/api/auth/mfa/challenge/email`, `/api/auth/mfa/verify` — pre-login flow, gated by password + challenge token
 - `/api/auth/sso/*` — OIDC handshake
 - `/api/scim/v2/*` — uses per-tenant SCIM bearer (validated inside the handler)
-- `/api/signup/*`, `/api/public-config`, `/api/health` — public
+- `/api/signup/*`, `/api/workspace-lookup`, `/api/public-config`, `/api/health` — public (`/api/workspace-lookup` is captcha'd and rate-limited per IP and per address, and answers every address alike; decisions §518)
 - `/api/cards/webhook/{provider}`, `/api/erp/webhook/{erp_type}` — provider-signed webhooks
 
 ### Tenant Routing
