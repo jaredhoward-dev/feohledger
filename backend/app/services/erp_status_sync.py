@@ -57,7 +57,7 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -983,7 +983,9 @@ async def read_back_unstated_figure(
         or realm != connection_realm(erp_config)
     ):
         return unconfirmed
-    adapter = _adapter_or_none(erp_config)
+    # The adapter reads with the stored credentials (`settings.erp` holds none
+    # of them), as `_bill_to_read`'s does.
+    adapter = _adapter_or_none(await _credentialed_erp(org) or {})
     if adapter is None:
         return unconfirmed
     report = await _read_bill(
@@ -1500,7 +1502,9 @@ async def erp_bill_dispatch_refusal(
     :func:`erp_bill_dispatch_refusals` is the same check over many invoices
     with the reads made concurrently.
     """
-    pending = await _bill_to_read(db, invoice=invoice, org=org, payment=payment)
+    pending = await _bill_to_read(
+        db, invoice=invoice, org=org, payment=payment, credentialed=_credentialed_once(org)
+    )
     if not isinstance(pending, _BillRead):
         return pending
     report = await _read_bill(pending, org.id)
@@ -1529,8 +1533,11 @@ async def erp_bill_dispatch_refusals(
     the reads not yet started; the ones already in flight finish or time out.
     """
     bound = max(1, int(concurrency or settings.erp_dispatch_check_concurrency))
+    credentialed = _credentialed_once(org)  # one credential read for the whole file
     staged = [
-        await _bill_to_read(db, invoice=invoice, org=org, payment=payment)
+        await _bill_to_read(
+            db, invoice=invoice, org=org, payment=payment, credentialed=credentialed
+        )
         for invoice, payment in items
     ]
     gate = asyncio.Semaphore(bound)
@@ -1562,16 +1569,37 @@ class _BillRead:
     state: dict
 
 
+def _credentialed_once(org: Organization) -> Callable[[], Awaitable[dict | None]]:
+    """:func:`_credentialed_erp` for ``org``, read at most once however many
+    bills ask (a NACHA file checks every item's)."""
+    read: list[dict | None] = []
+
+    async def credentialed() -> dict | None:
+        if not read:
+            read.append(await _credentialed_erp(org))
+        return read[0]
+
+    return credentialed
+
+
 async def _bill_to_read(
     db: AsyncSession,
     *,
     invoice: Invoice,
     org: Organization,
     payment: Payment | None,
+    credentialed: Callable[[], Awaitable[dict | None]],
 ) -> _BillRead | str | None:
     """The database half before the read: no bill to check (``None``), a
     verdict reached without reading (a refusal string — opening the unlinked
-    exception here), or the :class:`_BillRead` to read."""
+    exception here), or the :class:`_BillRead` to read.
+
+    ``settings.erp`` decides whether there is a bill and which company it is
+    in; the adapter that reads it is built from ``credentialed()``, the same
+    block with its sealed secrets merged in. A NetSuite connection's are
+    stored only there (``consumer_secret``, ``token_secret``, ``private_key``),
+    so an adapter built from ``settings.erp`` alone could never sign a read and
+    held every payment ``erp_bill_unverified``."""
     from app.services.erp_link_realm import connection_realm
 
     erp_config = (org.settings or {}).get("erp")
@@ -1609,7 +1637,7 @@ async def _bill_to_read(
             },
         )
         return f"{ERP_BILL_UNLINKED}:{unlinked}"
-    adapter = _adapter_or_none(erp_config)
+    adapter = _adapter_or_none(await credentialed() or {})
     if adapter is None:
         return ERP_BILL_UNVERIFIED
     return _BillRead(
@@ -1775,6 +1803,21 @@ async def _resolved_erp(org: Organization) -> dict | None:
 
     async with control_session_factory() as ctrl:
         return await provider_config(org, "erp", db=ctrl) or None
+
+
+async def _credentialed_erp(org: Organization) -> dict | None:
+    """:func:`_resolved_erp` for a read made before money moves: None when the
+    stored credentials cannot be opened (a KMS outage, a bad envelope), which
+    the caller holds as unverifiable, never pays past."""
+    try:
+        return await _resolved_erp(org)
+    except Exception as exc:  # noqa: BLE001 — unopenable credentials are "cannot read"
+        logger.warning(
+            "[erp-dispatch-check] ERP credentials for org %s unavailable: %s",
+            org.id,
+            exc.__class__.__name__,
+        )
+        return None
 
 
 async def bills_we_posted(

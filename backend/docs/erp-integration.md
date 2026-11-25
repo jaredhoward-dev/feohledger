@@ -574,7 +574,12 @@ Decisions §295; the phase-by-phase account is
   (`erp_status_sync.erp_bill_dispatch_refusal`, decisions §296): not open →
   refused `erp_bill_not_open:<state>` with the blocking
   `payment_reconciliation`; unreadable → held `erp_bill_unverified`, never paid
-  blind. The NACHA export runs the same read.
+  blind. The NACHA export runs the same read. The reading adapter is built
+  from `settings.erp` with its sealed secrets merged in (`provider_config`),
+  never from `settings.erp` alone: a stored-credential ERP (NetSuite, §536)
+  keeps its signing secrets only in the sealed store, and an adapter without
+  them held every payment `erp_bill_unverified`. Credentials that cannot be
+  opened hold the item the same way.
 
 ### Xero status sync-back and payment write-back
 
