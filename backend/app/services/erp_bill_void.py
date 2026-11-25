@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 #: The statuses an invoice holds a confirmed bill in the ERP in and nothing
 #: else holds it: from `payment_scheduled` on a FeohLedger payment does, and the
 #: live-claim gate answers for it. `failed` with a possibly-posted bill has no
-#: document id to void (the orphan lookup is its own follow-up).
+#: document id to void: the orphan section below names one first (§556).
 VOIDABLE_STATUSES = frozenset({InvoiceStatus.sent_to_erp, InvoiceStatus.posted_in_erp})
 
 #: `WorkflowInstance.state_data` key recording the void this module made:

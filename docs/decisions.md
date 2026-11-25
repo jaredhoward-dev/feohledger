@@ -28710,3 +28710,58 @@ blind.
 **Tests.** `backend/tests/test_erp_dispatch_check.py::test_a_netsuite_bill_is_read_with_its_stored_credentials`
 fails without the fix (the `NetSuiteConfigError` → `erp_bill_unverified` hold)
 and passes with it.
+
+## 556. The bill a failed push left in the ERP is named by the adapter's own read-only lookup and voided through the flag void's flow; keeping it is the retry (§286 / §539 / §545 follow-up, round 47)
+
+**Context.** A push that timed out or got a 5xx may have created the bill in the
+ERP. The retry gate's refusal says `possibly_posted: true` (§286), but nothing
+found or voided that bill, and the flag void (§539) needs a document id the
+invoice does not have.
+
+**Decision.**
+
+- **Name it with the push's own match.** `ErpAdapter.find_posted_bill(payload)`
+  is the pre-create idempotency lookup offered on its own, read-only, returning
+  a PII-free `FoundBill` (id, number, total, currency, status) or None, and
+  raising when it cannot finish (never "not posted"). `supports_bill_lookup`
+  on the class says which adapters offer it: the mock and QuickBooks Online
+  today. The others' lookups are entangled with `post_invoice`'s client and
+  header state; each is wired as its own change, and until then the action is
+  refused `erp_lookup_unsupported`. `GET /api/invoices/{id}/erp-orphan-bill`
+  runs it with no lock held, on a `failed` invoice that names no bill and is
+  `possibly_posted` (else `erp_lookup_not_failed`), and audits the lookup.
+- **One void flow, generalised at its entry.** `begin_orphan_void` /
+  `finish_orphan_void` are the flag void's steps 1 and 3 for an invoice with no
+  flag; step 2 is the same `call_erp` (positive status read, §542; whole-step
+  bound, §550) with one addition for an orphan: the lookup is run again and the
+  bill is voided only if it still names the id the person confirmed
+  (`erp_void_not_found`). The client's id alone never chooses what is voided.
+  Same marker (`invoices.erp_void_pending`), same staleness takeover, same
+  orphan record when the void cannot be recorded (on the invoice's trail, since
+  there may be no flag). Gated on `payment.void`, reason required.
+- **The invoice stays `failed`.** No transition: `failed` is not payable, and
+  nothing about the approval changed. The void is recorded under
+  `state_data["erp_orphan_bills_voided"]`, separate from the flag void's
+  `erp_bill_voided`, so neither replay can answer for the other. The
+  possibly-posted record is left as it is: voiding one bill does not prove
+  there is no other, so a later retry still runs its own lookup first.
+- **The retry door waits for a live void.** `start_erp_send` refuses
+  `erp_void_in_progress` while the marker is live, under the invoice lock:
+  otherwise a retry's lookup would find, and record as this invoice's, the
+  bill being voided.
+- **No adoption door.** There is no `failed → sent_to_erp` edge and none is
+  added: `retry-erp` already adopts the found bill (the push's lookup returns
+  it as success, `posted_total` checked). With a duplicate / fraud flag open
+  the retry is refused, which is correct: adopting a flagged bill would record
+  it as payable.
+
+**UI.** A shared `ErpOrphanBill` panel (find, found / none / refused / error,
+void behind a confirm with a reason) on a failed invoice in the invoice modal
+for holders of `payment.void`, and in a flag's dialog when the flag's own void
+is refused `erp_void_no_bill`.
+
+**Tests.** `backend/tests/test_erp_orphan_bill.py` (lookup found / none /
+unsupported / failed, RBAC, audit, the shared void with replay, a bill the
+lookup no longer names, a paid orphan, the retry door, the mock and QuickBooks
+lookups); `frontend/src/lib/api/erpOrphanBill.test.ts`;
+`frontend/tests-e2e/exceptions/void-erp-orphan-bill.spec.ts`.
