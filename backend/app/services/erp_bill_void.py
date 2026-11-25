@@ -492,6 +492,13 @@ async def _call_erp(org, attempt: VoidAttempt, phase: _Phase) -> ErpAnswer:
         raise _refused(ERP_VOID_BILL_PAID, http_status.HTTP_409_CONFLICT)
     if read == ErpInvoiceStatus.settled_no_payment:
         raise _refused(ERP_VOID_BILL_SETTLED, http_status.HTTP_409_CONFLICT)
+    if attempt.lookup_payload is not None:
+        # An orphan's id came from the client: only the lookup names it as
+        # this invoice's bill, so it runs BEFORE the already-gone answer too —
+        # else an id the ERP reports cancelled / deleted would be recorded as
+        # this invoice's voided bill without ever being shown to be it
+        # (decisions §560). A bill gone from the lookup is refused, not voided.
+        await _still_the_orphan(adapter, attempt)
     already_gone = read == ErpInvoiceStatus.cancelled
     if read in (None, ErpInvoiceStatus.unknown):
         already_gone = await _positively_gone(adapter, document_id)
@@ -499,8 +506,6 @@ async def _call_erp(org, attempt: VoidAttempt, phase: _Phase) -> ErpAnswer:
             raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY)
 
     if not already_gone:
-        if attempt.lookup_payload is not None:
-            await _still_the_orphan(adapter, attempt)
         if void_scope == BILL_VOID_DRAFT_ONLY and read != ErpInvoiceStatus.draft:
             raise _refused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT)
         phase.void_sent = True
@@ -843,17 +848,24 @@ _MESSAGES.update(
 LOOKUP_TIMEOUT_S = 45
 
 
+#: The verdict key the invoice's ``GET /review-actions`` and an exception row
+#: carry for the lookup (decisions §560): present only on a candidate.
+ORPHAN_LOOKUP_VERDICT_KEY = "erp_orphan_lookup_refusal"
+
+
+def may_be_orphan(inv: Invoice | None) -> bool:
+    """The half of :func:`orphan_candidate` the invoice row answers alone: a
+    failed push naming no bill. A caller loads the workflow instance (the
+    other half) only for these."""
+    return bool(inv is not None and inv.status in ORPHAN_VOID_STATUSES and not inv.erp_document_id)
+
+
 def orphan_candidate(inv: Invoice | None, instance) -> bool:
     """Is ``inv`` a failed push that may have left a bill in the ERP?"""
     from app.services.erp import possibly_posted
 
     state = getattr(instance, "state_data", None) if instance is not None else None
-    return bool(
-        inv is not None
-        and inv.status in ORPHAN_VOID_STATUSES
-        and not inv.erp_document_id
-        and possibly_posted(state)
-    )
+    return may_be_orphan(inv) and possibly_posted(state)
 
 
 def orphan_lookup_refusal(inv: Invoice | None, instance, user) -> dict | None:
@@ -880,6 +892,31 @@ def lookup_supported(org_settings: dict | None) -> bool:
     config = erp if isinstance(erp, dict) and erp else _LOCAL_ERP
     cls = adapter_class(resolve_adapter_key(config))
     return bool(cls is not None and getattr(cls, "supports_bill_lookup", False) is True)
+
+
+def orphan_lookup_verdict(inv: Invoice | None, instance, user, org_settings) -> dict | None:
+    """Everything ``GET /api/invoices/{id}/erp-orphan-bill`` answers before it
+    opens a credential, in its order: :func:`orphan_lookup_refusal`, then
+    :func:`lookup_supported`. The endpoint raises from this very function, so
+    the verdict the pages read cannot disagree with it. No ERP call."""
+    from app.api.refusals import coded_refusal
+
+    refused = orphan_lookup_refusal(inv, instance, user)
+    if refused is not None:
+        return refused
+    if not lookup_supported(org_settings):
+        return coded_refusal(ERP_LOOKUP_UNSUPPORTED, refusal_message(ERP_LOOKUP_UNSUPPORTED))
+    return None
+
+
+def orphan_lookup_verdicts(inv: Invoice | None, instance, user, org_settings) -> dict:
+    """``{ORPHAN_LOOKUP_VERDICT_KEY: verdict}`` on a failed push that may have
+    left a bill (:func:`orphan_candidate`), ``{}`` on anything else: an absent
+    verdict offers nothing, so the panel is not shown on an invoice the lookup
+    would refuse as ``erp_lookup_not_failed`` (decisions §560)."""
+    if not orphan_candidate(inv, instance):
+        return {}
+    return {ORPHAN_LOOKUP_VERDICT_KEY: orphan_lookup_verdict(inv, instance, user, org_settings)}
 
 
 async def lookup_payload(db: AsyncSession, org, invoice: Invoice):
@@ -993,7 +1030,11 @@ async def begin_orphan_void(
             if code == "role_not_permitted"
             else http_status.HTTP_409_CONFLICT,
         )
-    assert invoice is not None
+    if invoice is None:
+        # Unreachable while `orphan_lookup_refusal` refuses a missing invoice
+        # (`orphan_candidate`), but stated as a coded refusal rather than an
+        # assert, which `python -O` strips.
+        raise _refused(ERP_VOID_NO_BILL, http_status.HTTP_409_CONFLICT)
     if live_pending(invoice) is not None:
         raise _refused(ERP_VOID_IN_PROGRESS, http_status.HTTP_409_CONFLICT)
     claim = (await live_claims(db, [invoice.id])).get(invoice.id)

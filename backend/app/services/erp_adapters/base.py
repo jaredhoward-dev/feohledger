@@ -965,7 +965,7 @@ class ErpAdapter:
     #: True for an adapter whose push's pre-create idempotency lookup is also
     #: offered on its own, read-only, as :meth:`find_posted_bill`: how a person
     #: names the bill a timed-out push may have left in the ERP (decisions
-    #: §556). ``services/erp_orphan_bill`` reads it from the class.
+    #: §556). ``services/erp_bill_void`` reads it from the class.
     supports_bill_lookup: bool = False
 
     def __init__(self, config: dict):

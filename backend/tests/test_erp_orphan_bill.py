@@ -81,6 +81,54 @@ def test_the_lookup_verdict_checks_the_permission_first():
         assert orphan_lookup_refusal(inv, inst, _user())["code"] == "erp_lookup_not_failed"
 
 
+def test_the_served_verdict_is_absent_off_a_candidate_and_coded_on_one():
+    """`erp_orphan_lookup_refusal` (decisions §560): absent unless the invoice
+    is a failed push that may have left a bill, so no page offers the lookup
+    the server would refuse `erp_lookup_not_failed`; on a candidate, the role,
+    then the adapter, then null."""
+    from app.services.erp_bill_void import ORPHAN_LOOKUP_VERDICT_KEY as KEY
+    from app.services.erp_bill_void import orphan_lookup_verdicts
+
+    failed = SimpleNamespace(status=InvoiceStatus.failed, erp_document_id=None)
+    unknown = SimpleNamespace(state_data={"erp_outcome_unknown": True})
+    xero = {"erp": {"type": "xero", "integration_method": "direct"}}
+    with patch("app.api.deps.holds_any_permission", return_value=True):
+        assert orphan_lookup_verdicts(failed, unknown, _user(), None) == {KEY: None}
+        assert orphan_lookup_verdicts(failed, unknown, _user(), xero)[KEY]["code"] == (
+            "erp_lookup_unsupported"
+        )
+        # Never pushed / pushed cleanly / holds its own bill / no invoice: absent.
+        assert orphan_lookup_verdicts(failed, SimpleNamespace(state_data={}), _user(), None) == {}
+        assert orphan_lookup_verdicts(failed, None, _user(), None) == {}
+        approved = SimpleNamespace(status=InvoiceStatus.approved, erp_document_id=None)
+        assert orphan_lookup_verdicts(approved, unknown, _user(), None) == {}
+        own = SimpleNamespace(status=InvoiceStatus.failed, erp_document_id="B")
+        assert orphan_lookup_verdicts(own, unknown, _user(), None) == {}
+        assert orphan_lookup_verdicts(None, unknown, _user(), None) == {}
+    with patch("app.api.deps.holds_any_permission", return_value=False):
+        assert orphan_lookup_verdicts(failed, unknown, _user(), None)[KEY]["code"] == (
+            "role_not_permitted"
+        )
+        assert orphan_lookup_verdicts(failed, None, _user(), None) == {}
+
+
+async def test_an_orphan_void_without_an_invoice_is_a_coded_refusal():
+    """No bare assert: a missing invoice is refused, coded, under `-O` too."""
+    from app.services.erp_bill_void import VoidRefused, begin_orphan_void
+
+    with pytest.raises(VoidRefused) as refused:
+        await begin_orphan_void(
+            None,
+            invoice=None,
+            instance=None,
+            user=_user(),
+            reason="r",
+            document_id="B",
+            payload=None,
+        )
+    assert refused.value.code in {"role_not_permitted", "erp_void_no_bill"}
+
+
 def test_only_adapters_with_a_lookup_offer_it():
     from app.services.erp_adapters.base import ErpAdapter
     from app.services.erp_bill_void import lookup_supported
@@ -430,3 +478,147 @@ async def test_the_retry_door_refuses_while_the_void_is_calling_the_erp(realdb):
     assert res.json()["detail"]["code"] == "erp_void_in_progress"
     async with mk() as s:
         assert (await s.get(Invoice, inv_id)).status == InvoiceStatus.failed
+
+
+async def test_an_id_the_erp_reports_gone_is_still_identified_first(realdb):
+    """decisions §560: the id is the client's, so the lookup runs before the
+    already-gone answer. A cancelled bill the lookup does not name is refused
+    `erp_void_not_found` and nothing is recorded as this invoice's void."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="ORPH-009")
+    adapter = _Adapter(found=None, read=ErpInvoiceStatus.cancelled)
+    with _adapter(adapter):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(
+                f"/api/invoices/{inv_id}/void-erp-orphan-bill",
+                json={"erp_document_id": "SOMEONE-ELSES", "reason": "dup"},
+            )
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "erp_void_not_found"
+    assert adapter.lookups == 1
+    assert adapter.voided == []
+    assert await _audit(mk, inv_id, "invoice.erp_orphan_bill_voided") == []
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.erp_void_pending is None
+        inst = (
+            await s.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id == inv_id))
+        ).scalar_one()
+        assert "erp_orphan_bills_voided" not in inst.state_data
+
+
+async def test_a_gone_bill_the_lookup_still_names_is_recorded_without_a_void(realdb):
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="ORPH-010")
+    adapter = _Adapter(read=ErpInvoiceStatus.cancelled)
+    with _adapter(adapter):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(
+                f"/api/invoices/{inv_id}/void-erp-orphan-bill",
+                json={"erp_document_id": "ORPHAN-1", "reason": "dup"},
+            )
+    assert res.status_code == 201, res.text
+    assert adapter.lookups == 1
+    assert adapter.voided == []
+    rows = await _audit(mk, inv_id, "invoice.erp_orphan_bill_voided")
+    assert len(rows) == 1 and rows[0].details["already_gone"] is True
+
+
+@pytest.mark.parametrize("role", ["admin", "ap_manager", "ap_clerk", "cfo"])
+@pytest.mark.parametrize("supported", [True, False])
+async def test_the_served_verdict_agrees_with_the_lookup(realdb, role, supported):
+    """Parity (decisions §560): for each role, candidate and not, adapter with
+    and without a lookup, the verdict `GET /review-actions` serves is null
+    exactly when `GET /erp-orphan-bill` answers 200, carries the code it
+    refuses with otherwise, and is absent only where it refuses
+    `erp_lookup_not_failed` (or the role first)."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    candidate = await _seed(mk, info.org_id, number=f"ORPH-P-{uuid.uuid4().hex[:6]}")
+    clean = await _seed(mk, info.org_id, number=f"ORPH-P-{uuid.uuid4().hex[:6]}", unknown=False)
+    with (
+        _adapter(_Adapter()),
+        patch("app.services.erp_bill_void.lookup_supported", return_value=supported),
+    ):
+        async with realdb.client(key=TENANT, role=role) as c:
+            for inv_id in (candidate, clean):
+                verdicts = (await c.get(f"/api/invoices/{inv_id}/review-actions")).json()
+                res = await c.get(f"/api/invoices/{inv_id}/erp-orphan-bill")
+                # The permission dependency's 403 is the role refusal.
+                answered = (
+                    "role_not_permitted"
+                    if res.status_code == 403
+                    else (None if res.status_code == 200 else res.json()["detail"]["code"])
+                )
+                if "erp_orphan_lookup_refusal" not in verdicts:
+                    assert answered in {"erp_lookup_not_failed", "role_not_permitted"}, res.text
+                    continue
+                verdict = verdicts["erp_orphan_lookup_refusal"]
+                assert answered == (verdict["code"] if verdict else None), res.text
+    # The candidate always carries the key; the clean push never does.
+    async with realdb.client(key=TENANT, role=role) as c:
+        with patch("app.services.erp_bill_void.lookup_supported", return_value=supported):
+            assert (
+                "erp_orphan_lookup_refusal"
+                in (await c.get(f"/api/invoices/{candidate}/review-actions")).json()
+            )
+            assert (
+                "erp_orphan_lookup_refusal"
+                not in (await c.get(f"/api/invoices/{clean}/review-actions")).json()
+            )
+
+
+async def test_the_exception_row_carries_the_verdict_only_on_a_failed_push(realdb):
+    """A duplicate flag on a failed push that may have left a bill carries the
+    lookup verdict; one on a never-pushed invoice carries none, so the queue
+    shows no panel there (decisions §560)."""
+    from app.services.exception_service import create_exception
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    failed = await _seed(mk, info.org_id, number=f"ORPH-X-{uuid.uuid4().hex[:6]}")
+    never = await _seed(
+        mk,
+        info.org_id,
+        number=f"ORPH-X-{uuid.uuid4().hex[:6]}",
+        status=InvoiceStatus.ready_for_review,
+        unknown=False,
+    )
+    ids = {}
+    tag = uuid.uuid4().hex[:6]
+    async with mk() as s:
+        for inv_id in (failed, never):
+            (await s.get(Invoice, inv_id)).invoice_number = f"ORPH-X-{tag}-{inv_id.hex[:4]}"
+        await s.commit()
+    async with mk() as s:
+        for inv_id in (failed, never):
+            exc = await create_exception(
+                s,
+                exception_type="duplicate",
+                severity="error",
+                description="detector output",
+                organization_id=info.org_id,
+                invoice=await s.get(Invoice, inv_id),
+                raised_by_user_id=None,
+            )
+            ids[inv_id] = str(exc.id)
+        await s.commit()
+    async with realdb.client(key=TENANT, role="admin") as c:
+        detail = (await c.get(f"/api/exceptions/{ids[failed]}")).json()
+        assert detail["erp_orphan_lookup_refusal"] is None
+        assert (
+            "erp_orphan_lookup_refusal" not in (await c.get(f"/api/exceptions/{ids[never]}")).json()
+        )
+        listed = (await c.get("/api/exceptions", params={"search": f"ORPH-X-{tag}"})).json()
+        by_id = {row["id"]: row for row in listed["items"]}
+        assert set(by_id) == set(ids.values())
+        assert by_id[ids[failed]]["erp_orphan_lookup_refusal"] is None
+        assert "erp_orphan_lookup_refusal" not in by_id[ids[never]]
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        res = await c.get(f"/api/exceptions/{ids[failed]}")
+        # An ap_manager reads the queue but holds no `payment.void`: the row
+        # says so, and the page hides the panel on it (`isOffered`).
+        assert res.status_code == 200, res.text
+        assert res.json()["erp_orphan_lookup_refusal"]["code"] == "role_not_permitted"

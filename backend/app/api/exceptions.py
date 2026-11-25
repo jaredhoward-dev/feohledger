@@ -186,12 +186,22 @@ def _caller_verdicts(
     user: User,
     org_settings: dict | None,
     instance: WorkflowInstance | None = None,
+    orphan_instance: WorkflowInstance | None = None,
 ) -> dict:
     """The caller's verdicts on this row's actions, for the list and the detail:
     Resolve / Dismiss / Escalate (`decision_refusals`) and — only on a row that
     carries an ERP-reported payment — recording it in one click
-    (`record_erp_payment_refusal`)."""
-    from app.services.erp_bill_void import bill_void_scope, is_void_candidate, void_refusal
+    (`record_erp_payment_refusal`).
+
+    ``orphan_instance`` is the invoice's workflow instance, loaded only for a
+    duplicate / fraud flag whose invoice :func:`erp_bill_void.may_be_orphan`:
+    the lookup verdict reads its possibly-posted record (decisions §560)."""
+    from app.services.erp_bill_void import (
+        bill_void_scope,
+        is_void_candidate,
+        orphan_lookup_verdicts,
+        void_refusal,
+    )
 
     out = {"decision_refusals": decision_refusals(exc, inv, user, org_settings, instance)}
     # Only on a duplicate / fraud flag (decisions §539): the verdict on voiding
@@ -200,11 +210,25 @@ def _caller_verdicts(
         out["void_erp_bill_refusal"] = void_refusal(
             exc, inv, user, void_scope=bill_void_scope(org_settings)
         )
+        # The bill a failed push may have left (decisions §556, §560): absent
+        # unless the flag's invoice is such a push, so nothing is offered then.
+        out.update(orphan_lookup_verdicts(inv, orphan_instance, user, org_settings))
     if is_erp_paid_report(exc):
         out["record_erp_payment_refusal"] = record_erp_payment_refusal(
             exc, inv, user, org_settings, instance
         )
     return out
+
+
+async def _orphan_instances(db: AsyncSession, rows) -> dict:
+    """``{invoice_id: WorkflowInstance}`` for the rows whose orphan-lookup
+    verdict needs one (a duplicate / fraud flag on a failed push naming no
+    bill), in one query, and none when no row does."""
+    from app.services.erp_bill_void import is_void_candidate, may_be_orphan
+
+    return await workflow_instances_for(
+        db, [inv for exc, inv in rows if is_void_candidate(exc) and may_be_orphan(inv)]
+    )
 
 
 def _exception_dict(exc: APException, inv: Invoice | None) -> dict:
@@ -425,6 +449,7 @@ async def list_exceptions(
     instances = await workflow_instances_for(
         db, [inv for exc, inv in rows if needs_approval_chain(exc, inv)]
     )
+    orphan_instances = await _orphan_instances(db, rows)
 
     items = [
         {
@@ -432,7 +457,12 @@ async def list_exceptions(
             # The caller's verdict on Resolve / Dismiss / Escalate for this row,
             # from the gates the resolve endpoint runs (`decision_refusals`).
             **_caller_verdicts(
-                exc, inv, user, org.settings, instances.get(inv.id) if inv else None
+                exc,
+                inv,
+                user,
+                org.settings,
+                instances.get(inv.id) if inv else None,
+                orphan_instances.get(inv.id) if inv else None,
             ),
         }
         for exc, inv in rows
@@ -571,9 +601,10 @@ async def get_exception(
     # With the caller's verdicts, like a list row: the queue opens this row's
     # dialog from a deep link (`/exceptions?id=`) and offers its buttons from them.
     instance = await workflow_instance_for(db, exc, inv)
+    orphan_instance = (await _orphan_instances(db, [(exc, inv)])).get(inv.id) if inv else None
     return {
         **_exception_dict(exc, inv),
-        **_caller_verdicts(exc, inv, user, org.settings, instance),
+        **_caller_verdicts(exc, inv, user, org.settings, instance, orphan_instance),
     }
 
 
