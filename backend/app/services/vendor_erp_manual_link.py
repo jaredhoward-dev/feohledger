@@ -280,6 +280,10 @@ class ErpManualLinkResult:
     tax_id_matches: bool
     #: The row link from another company that was kept for it, if any.
     kept: dict | None
+    #: The row link this one replaced, ``{realm, erp_vendor_id}``, whether or
+    #: not it was kept: a no-realm (``"mock"``) link is overwritten and kept
+    #: nowhere (§496), so the audit row is its only trace.
+    replaced: dict | None = None
 
 
 async def link_vendor_to_erp_record(
@@ -343,14 +347,15 @@ async def link_vendor_to_erp_record(
             "Another vendor is already linked to that supplier record in this ERP company.",
             status_code=409,
         )
-    kept = None
+    kept = replaced = None
     if vendor.erp_vendor_id:
         # A link from another company (the None / same-realm cases were refused
         # above): kept for it, so a switch back restores it (§356) — unless it
         # is a no-realm pull's, which names no company to return to (§496).
-        held = {"realm": vendor.erp_link_realm, "erp_vendor_id": vendor.erp_vendor_id}
+        # Either way the audit row names it.
+        replaced = {"realm": vendor.erp_link_realm, "erp_vendor_id": vendor.erp_vendor_id}
         if await keep_link(db, vendor):
-            kept = held
+            kept = replaced
     vendor.erp_vendor_id = erp_vendor_id
     vendor.erp_link_realm = realm
     await db.flush()
@@ -361,4 +366,5 @@ async def link_vendor_to_erp_record(
         erp_name=record.name,
         tax_id_matches=bool(ours) and _norm_tax(record.tax_id) == ours,
         kept=kept,
+        replaced=replaced,
     )
