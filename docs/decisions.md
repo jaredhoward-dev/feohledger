@@ -27855,3 +27855,87 @@ through the real handler with and without a tenant secret (charge on the
 payment, sync dispatched), `--settle` settles and rebates, the local key is
 refused once the tenant has its own, and every refusal, including the
 webhook's mock branch while deployed.
+
+## 544. A run's card leg counts only a settled charge; the Merge read-back reads from its cursor less an overlap (§537 / §540 / §541 follow-up, round 45)
+
+**Problem 1.** §537 wrote the card's AUTHORIZED amount onto the run payment's
+`settled_amount` at the authorization event, and `payment_coverage` read a
+`charged` card as spent. An authorization alone therefore made the leg
+`covered`, and the payment sync (or an ERP `paid`) moved the invoice to `paid`.
+On the card networks an authorization is a hold on the card's open-to-buy, not
+money moved: it can be reversed by the merchant, expire uncaptured, or clear
+for a different amount, and only the clearing / settlement moves funds. The
+handler ignores reversal / expiry / decline events
+(`_classify_card_event`), so nothing would ever have taken that `paid` back.
+
+**Decision 1.** Only a settled charge counts. `record_card_spend` writes onto
+the payment only for a card in `completed` (`CARD_SETTLED_STATUS`, set by the
+settlement event), and the webhook calls it — and re-dispatches the payment
+sync — on the settlement only; the authorization still marks the card
+`charged` with its figure and an audit row, and writes nothing onto the
+payment. `payment_coverage` reads the card for every card leg: anything short
+of `completed` (uncharged, authorized, cancelled, or no card) is `in_flight`
+whatever figure the payment carries; `completed` judges the stamped figure,
+falling back to the card's `amount_charged`. `settlement_coverage` is
+unchanged: its `awaiting_card_spend` flag only decides what NO figure means,
+so the caller that must disregard a figure passes none.
+
+* *A reversed / expired / declined authorization* needs no undo, because it
+  never counted. The card stays `charged` (the webhook still leaves a card
+  untouched on those events), so the leg stays `in_flight` until a settlement
+  arrives or a person voids the payment; a later settlement still completes
+  it (the settlement branch takes a `charged` card).
+* *Existing rows.* §537 has not shipped (it is in this round's unmerged PR),
+  so no deployed payment carries an authorization-stamped figure. A local one
+  that does reads `in_flight` until its card settles, since the card, not the
+  payment, decides. Before §537 a card leg was `covered` at mint; invoices
+  already `paid` that way stay `paid` — neither this change nor §537 reopens a
+  closed invoice.
+* *Locally,* `pnpm simulate:card` without `--settle` now stops at the
+  authorization (the leg in flight); `--settle` reaches `paid`, as before.
+
+**Why not handle the reversal / expiry events instead** (record on auth, clear
+on reversal). It keeps an unsettled hold counting as paid in the window before
+the reversal arrives, and depends on every provider delivering a reversal for
+every hold that does not clear; a partial reversal would need its own
+arithmetic. Counting only the settlement is correct without any of that.
+
+**`dispatch_payment_sync` in the webhook.** It is `asyncio.create_task` on the
+running loop, after the commit: the provider's 204 never waits on the ERP. No
+`post_commit` move was needed; the comment at the call says so.
+
+**Problem 2.** The Merge read-back cursor (§540) stored `through` = our own
+clock at the listing's start, and the next listing asked Merge for changes
+strictly after it. A bill Merge stamped a little before that moment but listed
+late — clock skew, or Merge's own lag syncing the ERP (NetSuite's poll is
+widened by a day for the same reason) — fell between two listings for good.
+
+**Decision 2.** Each listing after the first asks from `through` less
+`FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES` (default 10, floor 0). The bills in
+the overlap are read again; `apply_bill_report` is idempotent and its flags
+dedupe while live, so that is harmless, with the residue §540 already accepted:
+a flag a person resolves within the overlap of the change that raised it can
+be opened once more. `erp_status_sync._bills_we_posted` is now
+`bills_we_posted`, since the Merge webhook and this sweep import it across
+modules.
+
+**Guard.** `tests/test_payment_settlement.py`: the `awaiting_card_spend`
+cases (no figure → `in_flight`; flag off → `covered`; unstorable →
+`uncertain`; a figure is judged on its amount). New
+`tests/test_payment_settlement_record.py`: `record_card_spend` golden cases
+(settled vs authorized, foreign currency, no owning payment, non-card /
+non-completed payment, no figure, re-run, the column's largest value, one past
+it) and `payment_coverage` per card status.
+`tests/test_card_money_path_regression.py`: authorization alone → `in_flight`,
+no write, no dispatch; settlement → figure written and one dispatch with the
+run and org; reversal / expiry / decline after an authorization → `in_flight`;
+an authorization-stamped figure does not count; a replayed settlement records
+and dispatches once. `tests/test_payment_erp_sync.py` and
+`tests/test_erp_status_report.py`: an authorized-only leg is skipped / held, a
+settled one reaches `paid`. `tests/test_mock_card_simulator.py`: the simulator
+without `--settle` leaves the leg in flight; with it, `covered`.
+`tests/test_merge_readback_sweep.py`: a bill Merge stamped three minutes before
+the cursor is read by the next tick (and, as the control, not with no overlap);
+the second listing asks from `through − 10 min`.
+`tests/test_sweep_health.py`: every sweep's enabled flag, parametrized over the
+registry, is what its health snapshot reads.
