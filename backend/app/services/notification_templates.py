@@ -345,3 +345,21 @@ def render_erp_call_quota(
             f"resets at {when}."
         )
     return RenderedNotification(title=title, body_text=body, body_html=_html(body))
+
+
+def render_erp_bill_flagged(
+    *, exception_type: str, invoice_number: str | None
+) -> RenderedNotification:
+    """Render the notice that a duplicate or fraud flag opened on an invoice
+    whose bill is already in the ERP (decisions §539). Names the invoice number
+    and the kind of flag; nothing PII-bearing, no amount or payee."""
+    what = "possible duplicate" if exception_type == "duplicate" else "possible fraud"
+    number = invoice_number or "an invoice"
+    title = f"Flagged as a {what}: invoice {number} is already in your ERP"
+    body = (
+        f"Invoice {number} was flagged as a {what} after its bill was posted to your ERP. "
+        "FeohLedger will not pay it while the flag is open, but the ERP can still pay the "
+        "bill. Review the flag in Exceptions: if it is real, void the bill in the ERP from "
+        "there; if not, dismiss it."
+    )
+    return RenderedNotification(title=title, body_text=body, body_html=_html(body))

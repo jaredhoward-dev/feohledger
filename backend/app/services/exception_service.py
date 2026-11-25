@@ -145,4 +145,10 @@ async def create_exception(
             exc.id,
         )
 
+    # A duplicate / fraud flag on an invoice whose bill is already in the ERP:
+    # tell the people who may void it there (decisions §539). Best-effort.
+    from app.services.erp_bill_void import notify_flag_on_posted_bill
+
+    await notify_flag_on_posted_bill(db, exception=exc, invoice=invoice)
+
     return exc

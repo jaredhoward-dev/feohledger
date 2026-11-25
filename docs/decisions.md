@@ -27678,3 +27678,88 @@ write-back yet.
 
 Tests: `backend/tests/test_netsuite_status_sync_adapter.py`,
 `test_erp_status_sync.py` § NetSuite sweep.
+
+## 539. A duplicate or fraud flag on a bill already in the ERP offers the ERP void, gated like a payment void (§286 / §309 follow-up, round 45)
+
+**Context.** §286 refuses the ERP push while a `duplicate` / `fraud_flag`
+(`payment_gates.ERP_EXPORT_BLOCKING_EXCEPTION_TYPES`) is open, but such a flag
+can open after the bill is posted (a Positive Pay return, a fraud rule re-run
+on an edit, a third copy entered later). Our payment run then refuses the
+invoice, while the ERP's own Bill Pay can still pay the bill, and nothing told
+anyone. `ErpAdapter.void_invoice` existed with no user-facing caller.
+
+**Decision.**
+
+1. **Notice on raise.** `exception_service.create_exception` calls
+   `erp_bill_void.notify_flag_on_posted_bill`. When the new row is one of
+   those two types and its invoice holds a confirmed bill
+   (`erp_document_id`, status `sent_to_erp` or `posted_in_erp`), it sends
+   `erp_bill_flagged` (new notification event, preference-gated like the
+   rest) to admins, AP managers and CFOs. The row is `entity_type
+   "exception"` and opens `/exceptions?id=`. The message names the invoice
+   number and kind of flag only. It is best-effort and never fails the raise.
+2. **The void is offered, never automatic.** The flag may be false, so the
+   void is a person's act: `POST /api/exceptions/{id}/void-erp-bill` with a
+   required `reason`. The queue carries `void_erp_bill_refusal` on every
+   duplicate / fraud row (list and detail). It is
+   `erp_bill_void.void_refusal`, the same gates the endpoint raises first.
+3. **Permission: `payment.void`.** Voiding the bill is how a payment out of
+   the ERP is stopped, which is the payment void's duty, so it takes that
+   permission (admin + cfo by default; an AP manager works the flag but does
+   not void). We considered and rejected two other gates. The ERP push's roles
+   would let the people who post bills also unpost them. The queue roles
+   alone would let an AP manager reverse money-path state the payment void
+   keeps from them. There is no step-up, because the payment void has none.
+   There is no segregation set either: voiding only takes a payable bill out
+   of reach, the reverse of the risk the segregation set guards.
+4. **Refusals, all before any write, each coded:** `role_not_permitted`.
+   `erp_void_not_flagged` covers the wrong type and a row that is not open or
+   escalated. `erp_void_no_bill` covers no document id and a status outside
+   the two. `erp_void_claimed` (`params.claim`) is a live FeohLedger payment
+   or card, read through `erp_export_gate.live_claims`. `erp_void_bill_paid`
+   means the adapter's `get_invoice_status` reads `paid` / `partially_paid`.
+   A void cannot undo a payment, so the order is "read, then void", and a
+   failed read is `erp_void_failed`, never a blind void.
+   `erp_void_unsupported` is an unknown adapter or `NotImplementedError`.
+   `erp_void_rejected` means the adapter answered False.
+   `erp_void_failed` (502) means the call raised.
+5. **Transition: `sent_to_erp` / `posted_in_erp → approved`**, two new edges
+   (`workflow_engine.ERP_VOID_EDGES`), walked only by
+   `ERP_VOID_ACTION = "invoice.erp_bill_voided"`. Any other action gets the
+   plain `invoice_transition_invalid`, so `POST /bulk/status` cannot use
+   them. The approval stands, and with the bill gone nothing holds the invoice
+   in the ERP any more. `approved` is where the payment void also lands, and
+   both gates keep holding the invoice there while the flag is open. We
+   rejected `done`: it is terminal and would say the bill was settled. We
+   rejected `failed`: it means a push failed, and `/retry-erp` would re-post
+   it. We rejected `rejected`: it is reachable only from review and would
+   erase the approval without a person withdrawing it.
+6. **What the void clears.** It clears `erp_document_id`, `erp_document_url`
+   and the push's `erp_reference` on the workflow state, and records
+   `erp_bill_voided` there (`document_id`, `exception_id`, time, actor). Any
+   other possibly-posted record (an unknown outcome, an orphan, a pending
+   job) stays, so `review.recall_refusal` still refuses where another bill
+   may exist. With none, the invoice's approval can now be recalled
+   (decisions §374).
+7. **Idempotent and audited.** The invoice is locked first, then the row
+   (the order every ERP writer takes them). A replay finds no document plus
+   this flag's `erp_bill_voided` record, answers 200 with
+   `replayed: true` and calls nothing. A fresh void answers 201. It writes
+   two append-only rows: the invoice transition row (`invoice.erp_bill_voided`)
+   and `exception.erp_bill_voided` on the flag. The flag stays open for a
+   person to decide.
+
+**Scope.** This is the "flag raised after the bill is posted" half of the
+follow-up. Finding an orphan bill after a refused or timed-out push, and a
+general invoice-level void door (`POST /api/invoices/{id}/void-erp`), remain
+open in `docs/followups.md`.
+
+**Guard.** `tests/test_erp_bill_void_from_flag.py` (edge walked by the void
+alone, verdict order, every refusal leaves the invoice and document unchanged,
+one adapter call across a replay, both audit rows, the flag stays open, the
+notice fires only for a posted bill and names no vendor);
+`tests/test_workflow_state_machine.py` (the back-edges allowlist);
+`tests/test_sod_endpoint_wiring.py` (`payment.void`);
+`tests/test_notification_templates.py`; frontend
+`notificationHref.test.ts`, `codedRefusals.test.ts`, the audit roster;
+`tests-e2e/exceptions/void-erp-bill.spec.ts`.

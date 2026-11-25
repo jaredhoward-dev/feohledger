@@ -106,6 +106,15 @@ describe('notificationHref', () => {
 		).toBe(`/contracts?id=${ID}`);
 	});
 
+	it('erp_bill_flagged opens the flag in the exception queue', () => {
+		expect(
+			notificationHref({ entity_type: 'exception', event_type: 'erp_bill_flagged', entity_id: ID })
+		).toBe(`/exceptions?id=${ID}`);
+		expect(
+			notificationHref({ entity_type: 'exception', event_type: 'erp_bill_flagged', entity_id: null })
+		).toBeNull();
+	});
+
 	it('a record-scoped row with no entity_id navigates nowhere', () => {
 		expect(notificationHref({ entity_type: 'invoice', event_type: 'invoice_paid', entity_id: null })).toBeNull();
 		expect(
@@ -139,7 +148,8 @@ describe('notificationHref', () => {
 			cash_shortfall_projected: 'cash_position',
 			ai_invoice_usage: 'billing',
 			erp_connection_expiring: 'organization',
-			erp_call_quota: 'organization'
+			erp_call_quota: 'organization',
+			erp_bill_flagged: 'exception'
 		};
 		expect(Object.keys(ENTITY).sort()).toEqual([...EVENT_ORDER].sort());
 		for (const event of EVENT_ORDER) {

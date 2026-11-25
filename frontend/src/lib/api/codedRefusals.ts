@@ -419,6 +419,15 @@ const BUILDERS: Record<string, Builder> = {
 	// sentence.
 	invoice_not_recallable: fixed('refusal.invoiceNotRecallable'),
 	invoice_recall_in_erp: fixed('refusal.invoiceRecallInErp'),
+	// `services/erp_bill_void` — `POST /api/exceptions/{id}/void-erp-bill` and
+	// the queue's `void_erp_bill_refusal` verdict (decisions §539).
+	erp_void_not_flagged: fixed('refusal.erpVoidNotFlagged'),
+	erp_void_no_bill: fixed('refusal.erpVoidNoBill'),
+	erp_void_claimed: fixed('refusal.erpVoidClaimed'),
+	erp_void_bill_paid: fixed('refusal.erpVoidBillPaid'),
+	erp_void_unsupported: fixed('refusal.erpVoidUnsupported'),
+	erp_void_rejected: fixed('refusal.erpVoidRejected'),
+	erp_void_failed: fixed('refusal.erpVoidFailed'),
 	invoice_recall_claimed: (params, t) => {
 		const claim = str(params, 'claim');
 		if (claim === 'payment') return t('refusal.paymentBlocksRecall');

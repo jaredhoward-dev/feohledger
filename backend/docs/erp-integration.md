@@ -2449,6 +2449,27 @@ naming a document the adapter merely found replaces the orphan and drops both,
 and a row from before the flag existed is read as not ours. Business Central is the one
 adapter that reads it today.
 
+## Voiding a flagged bill from the exception queue (decisions §539)
+
+`void_invoice` has one user-facing caller: `POST /api/exceptions/{id}/void-erp-bill`
+(`services/erp_bill_void.py`). When a `duplicate` / `fraud_flag` opens on an
+invoice whose bill is already posted (`sent_to_erp` / `posted_in_erp` with an
+`erp_document_id`), `create_exception` sends the `erp_bill_flagged` notice to
+admins, AP managers and CFOs; the flag's dialog then offers the void to a
+holder of `payment.void`. Never automatic: the flag may be false.
+
+The endpoint reads the bill first (`get_invoice_status`): `paid` /
+`partially_paid` is refused (`erp_void_bill_paid`), and a failed read is
+refused rather than voiding blind. An adapter that raises
+`NotImplementedError` is `erp_void_unsupported`; `False` is
+`erp_void_rejected` (each adapter's own rules for what it will void are in its
+table below). On success the document id, deep link and the push's
+`erp_reference` are cleared, the void is recorded on the workflow state, and
+the invoice walks `→ approved` by the void's own edge; any other
+possibly-posted record stays, so the recall (§374) still refuses where another
+bill may exist. A live FeohLedger payment or card refuses the void
+(`erp_void_claimed`).
+
 ## The invoice names its bill in the ERP
 
 A confirmed push stores the adapter's `erp_document_id` on
