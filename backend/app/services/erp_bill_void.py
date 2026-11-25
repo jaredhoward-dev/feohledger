@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 #: The statuses an invoice holds a confirmed bill in the ERP in and nothing
 #: else holds it: from `payment_scheduled` on a FeohLedger payment does, and the
 #: live-claim gate answers for it. `failed` with a possibly-posted bill has no
-#: document id to void (the orphan lookup is its own follow-up).
+#: document id to void: the orphan section below names one first (§556).
 VOIDABLE_STATUSES = frozenset({InvoiceStatus.sent_to_erp, InvoiceStatus.posted_in_erp})
 
 #: `WorkflowInstance.state_data` key recording the void this module made:
@@ -132,6 +132,9 @@ ERP_VOID_BILL_SETTLED = "erp_void_bill_settled"
 ERP_VOID_DRAFT_ONLY = "erp_void_draft_only"
 #: Another attempt to void this bill is calling the ERP right now (§545).
 ERP_VOID_IN_PROGRESS = "erp_void_in_progress"
+#: The adapter's lookup no longer names the bill the person chose to void: it
+#: is gone, or it is not the one our push created (decisions §556).
+ERP_VOID_NOT_FOUND = "erp_void_not_found"
 
 _MESSAGES = {
     ERP_VOID_NOT_FLAGGED: (
@@ -165,6 +168,10 @@ _MESSAGES = {
     ERP_VOID_IN_PROGRESS: (
         "This bill is being voided in the ERP right now. Wait a few minutes, then "
         "check the flag again."
+    ),
+    ERP_VOID_NOT_FOUND: (
+        "The ERP no longer shows this bill as the one this invoice's push created. "
+        "Look it up again."
     ),
 }
 
@@ -325,6 +332,10 @@ class VoidAttempt:
     attempt_id: str
     document_id: str
     invoice_status: InvoiceStatus
+    #: Set for the void of a bill a failed push left behind (decisions §556):
+    #: the payload the adapter's read-only lookup matches on. Step 2 re-runs
+    #: that lookup and voids only a bill it still names.
+    lookup_payload: object | None = None
 
 
 @dataclass(frozen=True)
@@ -488,6 +499,8 @@ async def _call_erp(org, attempt: VoidAttempt, phase: _Phase) -> ErpAnswer:
             raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY)
 
     if not already_gone:
+        if attempt.lookup_payload is not None:
+            await _still_the_orphan(adapter, attempt)
         if void_scope == BILL_VOID_DRAFT_ONLY and read != ErpInvoiceStatus.draft:
             raise _refused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT)
         phase.void_sent = True
@@ -506,6 +519,27 @@ async def _call_erp(org, attempt: VoidAttempt, phase: _Phase) -> ErpAnswer:
     return ErpAnswer(read="cancelled" if already_gone else read.value, already_gone=already_gone)
 
 
+async def _still_the_orphan(adapter, attempt: VoidAttempt) -> None:
+    """The positive identification an orphan void needs on top of the status
+    read (decisions §556): the adapter's own idempotency lookup, run again,
+    still names the bill the person saw. The id came from that lookup a moment
+    ago, but only this read says it is still the bill our push created and not
+    one someone has since keyed or replaced."""
+    from fastapi import status as http_status
+
+    try:
+        found = await asyncio.wait_for(
+            adapter.find_posted_bill(attempt.lookup_payload), STATUS_READ_TIMEOUT_S
+        )
+    except NotImplementedError:
+        raise _refused(ERP_VOID_UNSUPPORTED, http_status.HTTP_409_CONFLICT) from None
+    except Exception as exc_:  # noqa: BLE001 — never void a bill we cannot name
+        logger.warning("erp orphan void: lookup failed (%s)", exc_.__class__.__name__)
+        raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
+    if found is None or str(found.document_id) != attempt.document_id:
+        raise _refused(ERP_VOID_NOT_FOUND, http_status.HTTP_409_CONFLICT)
+
+
 def _ours(invoice: Invoice | None, attempt: VoidAttempt) -> bool:
     marker = getattr(invoice, "erp_void_pending", None)
     return isinstance(marker, dict) and marker.get("attempt_id") == attempt.attempt_id
@@ -513,7 +547,10 @@ def _ours(invoice: Invoice | None, attempt: VoidAttempt) -> bool:
 
 def _still_holds(invoice: Invoice, attempt: VoidAttempt) -> bool:
     """Does the invoice still hold the bill this attempt set out to void, at a
-    status a void may finish from?"""
+    status a void may finish from? For an orphan (decisions §556): still
+    `failed`, naming no bill of its own (a retry would have adopted one)."""
+    if attempt.lookup_payload is not None:
+        return invoice.status in ORPHAN_VOID_STATUSES and not invoice.erp_document_id
     return invoice.erp_document_id == attempt.document_id and invoice.status in VOIDABLE_STATUSES
 
 
@@ -536,7 +573,7 @@ async def record_orphaned_void(
     db: AsyncSession,
     *,
     attempt: VoidAttempt,
-    exception: APException,
+    exception: APException | None,
     invoice: Invoice | None,
     user,
     void_result: str,
@@ -572,23 +609,35 @@ async def record_orphaned_void(
         void_result,
         getattr(invoice, "id", None),
     )
-    await _write(
-        db,
-        exception=exception,
-        invoice=invoice,
-        action=ACTION_EXCEPTION_ERP_BILL_VOID_ORPHANED,
-        actor_id=user.id,
-        details={
-            "exception_id": str(exception.id),
-            "invoice_id": str(exception.invoice_id),
-            "erp_document_id": attempt.document_id,
-            "attempt_id": attempt.attempt_id,
-            "actor_id": str(user.id),
-            "void_result": void_result,
-            "invoice_status": status_now,
-            "marker_taken_over": invoice is not None and not _ours(invoice, attempt),
-        },
-    )
+    details = {
+        "exception_id": str(exception.id) if exception is not None else None,
+        "invoice_id": str(exception.invoice_id if exception is not None else invoice.id),
+        "erp_document_id": attempt.document_id,
+        "attempt_id": attempt.attempt_id,
+        "actor_id": str(user.id),
+        "void_result": void_result,
+        "invoice_status": status_now,
+        "marker_taken_over": invoice is not None and not _ours(invoice, attempt),
+    }
+    if exception is not None:
+        await _write(
+            db,
+            exception=exception,
+            invoice=invoice,
+            action=ACTION_EXCEPTION_ERP_BILL_VOID_ORPHANED,
+            actor_id=user.id,
+            details=details,
+        )
+    else:
+        # The void of a failed push's bill (decisions §556) has no flag: its
+        # trail is the invoice's.
+        await _audit_invoice(
+            db,
+            invoice,
+            action=ACTION_INVOICE_ERP_ORPHAN_VOID_ORPHANED,
+            actor_id=user.id,
+            details=details,
+        )
     if (
         invoice is not None
         and not _still_holds(invoice, attempt)
@@ -597,7 +646,7 @@ async def record_orphaned_void(
         await open_erp_reconciliation_exception(
             db,
             invoice,
-            org_id=exception.organization_id,
+            org_id=invoice.organization_id,
             finding=erp_finding("erp_voided_after_post", erp_type),
             exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
             erp_report={
@@ -607,7 +656,7 @@ async def record_orphaned_void(
                 "attempt_id": attempt.attempt_id,
                 "void_result": void_result,
                 "invoice_status": status_now,
-                "exception_id": str(exception.id),
+                "exception_id": str(exception.id) if exception is not None else None,
             },
         )
 
@@ -738,6 +787,317 @@ async def finish_void(
         },
     )
     return VoidOutcome(document_id=document_id, replayed=False, status=invoice.status.value)
+
+
+# ---------- the bill a failed push left in the ERP (decisions §556) ----------
+#
+# A push that timed out or got a 5xx may have created the bill anyway; the
+# gate's refusal of the retry says `possibly_posted: true` (§286). From the
+# failed invoice a person can run the adapter's read-only idempotency lookup
+# (`ErpAdapter.find_posted_bill`, the match its own push uses) to name that
+# bill, and void it through the SAME three steps as the flag's void: the
+# marker, `call_erp` with no lock (positive status read, plus the lookup run
+# again so only a bill it still names is voided), the finish or the orphan
+# record. The invoice stays `failed` — `failed` is not payable and nothing
+# about the approval changed — and the void is recorded on its workflow
+# state. Adopting the found bill instead is the existing retry: the push's
+# own lookup finds it and records it rather than create another.
+
+#: The invoice status an orphan bill is looked up and voided from.
+ORPHAN_VOID_STATUSES = frozenset({InvoiceStatus.failed})
+
+#: `WorkflowInstance.state_data` key: ``{document_id: record}`` for each bill
+#: a failed push left that this flow voided. A replay finds its record.
+ERP_ORPHAN_BILL_VOIDED_KEY = "erp_orphan_bills_voided"
+
+#: Audit actions on the invoice (no flag need be open).
+ACTION_INVOICE_ERP_ORPHAN_LOOKED_UP = "invoice.erp_orphan_bill_looked_up"
+ACTION_INVOICE_ERP_ORPHAN_VOIDED = "invoice.erp_orphan_bill_voided"
+ACTION_INVOICE_ERP_ORPHAN_VOID_ORPHANED = "invoice.erp_orphan_bill_void_orphaned"
+
+#: The invoice is not a failed push that may have left a bill in the ERP.
+ERP_LOOKUP_NOT_FAILED = "erp_lookup_not_failed"
+#: The connected ERP's adapter has no read-only lookup.
+ERP_LOOKUP_UNSUPPORTED = "erp_lookup_unsupported"
+#: The lookup could not finish (network, credentials, an incomplete listing):
+#: nothing is known either way.
+ERP_LOOKUP_FAILED = "erp_lookup_failed"
+
+_MESSAGES.update(
+    {
+        ERP_LOOKUP_NOT_FAILED: (
+            "Only an invoice whose ERP push failed, and may have left a bill in "
+            "the ERP, can be looked up there."
+        ),
+        ERP_LOOKUP_UNSUPPORTED: (
+            "The connected ERP can't be searched for this bill from FeohLedger. "
+            "Look for it in the ERP."
+        ),
+        ERP_LOOKUP_FAILED: (
+            "The ERP could not be searched just now, so nothing is known either way. Try again."
+        ),
+    }
+)
+
+#: Bound on the lookup call (and the credential unseal before it).
+LOOKUP_TIMEOUT_S = 45
+
+
+def orphan_candidate(inv: Invoice | None, instance) -> bool:
+    """Is ``inv`` a failed push that may have left a bill in the ERP?"""
+    from app.services.erp import possibly_posted
+
+    state = getattr(instance, "state_data", None) if instance is not None else None
+    return bool(
+        inv is not None
+        and inv.status in ORPHAN_VOID_STATUSES
+        and not inv.erp_document_id
+        and possibly_posted(state)
+    )
+
+
+def orphan_lookup_refusal(inv: Invoice | None, instance, user) -> dict | None:
+    """What ``GET /api/invoices/{id}/erp-orphan-bill`` answers before it calls
+    the ERP: the permission (``payment.void``, the void's own: only the people
+    who may act on the answer spend an ERP call on it) and the invoice."""
+    from app.api.deps import holds_any_permission
+    from app.api.permissions import PERM_PAYMENT_VOID
+    from app.api.refusals import coded_refusal, role_not_permitted
+
+    if not holds_any_permission(user, {PERM_PAYMENT_VOID}):
+        return role_not_permitted()
+    if not orphan_candidate(inv, instance):
+        return coded_refusal(ERP_LOOKUP_NOT_FAILED, refusal_message(ERP_LOOKUP_NOT_FAILED))
+    return None
+
+
+def lookup_supported(org_settings: dict | None) -> bool:
+    """Does the configured adapter's class offer the lookup? No credential is
+    opened."""
+    from app.services.erp_adapters.dispatcher import adapter_class, resolve_adapter_key
+
+    erp = (org_settings or {}).get("erp") if isinstance(org_settings, dict) else None
+    config = erp if isinstance(erp, dict) and erp else _LOCAL_ERP
+    cls = adapter_class(resolve_adapter_key(config))
+    return bool(cls is not None and getattr(cls, "supports_bill_lookup", False) is True)
+
+
+async def lookup_payload(db: AsyncSession, org, invoice: Invoice):
+    """The payload the push would send now, built as the push builds it, so
+    the lookup matches what the push's own idempotency check matches."""
+    from app.services.erp import _build_payload, _fetch_line_items, _resolve_erp_refs
+    from app.services.provider_credentials import provider_config
+
+    config = await provider_config(org, "erp") or dict(_LOCAL_ERP)
+    line_items = await _fetch_line_items(db, invoice.id)
+    refs = await _resolve_erp_refs(db, invoice, line_items, config)
+    return _build_payload(invoice, line_items, refs)
+
+
+async def find_orphan(org, payload):
+    """Step 2 of the lookup, no lock and no session: open the adapter and run
+    its read-only lookup. Returns the ``FoundBill`` or None; raises
+    :class:`VoidRefused` (``erp_lookup_unsupported`` / ``erp_lookup_failed``)."""
+    from fastapi import status as http_status
+
+    from app.services.erp_adapters import get_erp_adapter
+    from app.services.provider_credentials import provider_config
+
+    async def _run():
+        try:
+            config = await provider_config(org, "erp") or dict(_LOCAL_ERP)
+            adapter = get_erp_adapter(config)
+        except Exception:  # noqa: BLE001 — no adapter, nothing to search
+            raise _refused(ERP_LOOKUP_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
+        if getattr(adapter, "supports_bill_lookup", False) is not True:
+            raise _refused(ERP_LOOKUP_UNSUPPORTED, http_status.HTTP_409_CONFLICT)
+        try:
+            return await adapter.find_posted_bill(payload)
+        except NotImplementedError:
+            raise _refused(ERP_LOOKUP_UNSUPPORTED, http_status.HTTP_409_CONFLICT) from None
+        except Exception as exc_:  # noqa: BLE001 — unknown is never "not posted"
+            logger.warning("erp orphan lookup failed (%s)", exc_.__class__.__name__)
+            raise _refused(ERP_LOOKUP_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
+
+    try:
+        return await asyncio.wait_for(_run(), LOOKUP_TIMEOUT_S)
+    except TimeoutError:
+        raise _refused(ERP_LOOKUP_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
+
+
+async def _audit_invoice(
+    db: AsyncSession, invoice: Invoice, *, action: str, actor_id, details: dict
+) -> None:
+    from app.services.audit_dispatch import dispatch_audit
+
+    await dispatch_audit(
+        db,
+        correlation_id=invoice.correlation_id or uuid.uuid4(),
+        organization_id=invoice.organization_id,
+        actor_id=actor_id,
+        action=action,
+        entity_type="invoice",
+        entity_id=invoice.id,
+        details=details,
+    )
+
+
+async def record_lookup(db: AsyncSession, invoice: Invoice, *, user, found) -> None:
+    """The lookup's append-only row: who asked and what the ERP named (ids,
+    a total and a status, no vendor data)."""
+    await _audit_invoice(
+        db,
+        invoice,
+        action=ACTION_INVOICE_ERP_ORPHAN_LOOKED_UP,
+        actor_id=user.id,
+        details={
+            "found": found is not None,
+            "erp_document_id": found.document_id if found is not None else None,
+            "erp_status": found.status.value if found is not None else None,
+        },
+    )
+
+
+async def begin_orphan_void(
+    db: AsyncSession,
+    *,
+    invoice: Invoice | None,
+    instance,
+    user,
+    reason: str,
+    document_id: str,
+    payload,
+    exception_id: str | None = None,
+) -> VoidOutcome | VoidAttempt:
+    """Step 1 for a failed push's bill, under the invoice and instance locks:
+    the replay, the refusals, then the marker (the caller commits it). The
+    same marker as the flag's void, so the void-in-progress refusal, its
+    staleness takeover and the retry door's refusal all read one field."""
+    from fastapi import status as http_status
+
+    from app.services.erp_export_gate import live_claims
+
+    state = dict((getattr(instance, "state_data", None) or {}) if instance is not None else {})
+    previous = (state.get(ERP_ORPHAN_BILL_VOIDED_KEY) or {}).get(document_id)
+    if invoice is not None and isinstance(previous, dict):
+        return VoidOutcome(document_id=document_id, replayed=True, status=invoice.status.value)
+
+    verdict = orphan_lookup_refusal(invoice, instance, user)
+    if verdict is not None:
+        code = verdict["code"]
+        if code == ERP_LOOKUP_NOT_FAILED:
+            code = ERP_VOID_NO_BILL
+        raise _refused(
+            code,
+            http_status.HTTP_403_FORBIDDEN
+            if code == "role_not_permitted"
+            else http_status.HTTP_409_CONFLICT,
+        )
+    assert invoice is not None
+    if live_pending(invoice) is not None:
+        raise _refused(ERP_VOID_IN_PROGRESS, http_status.HTTP_409_CONFLICT)
+    claim = (await live_claims(db, [invoice.id])).get(invoice.id)
+    if claim is not None:
+        raise _refused(ERP_VOID_CLAIMED, http_status.HTTP_409_CONFLICT, claim=claim)
+
+    attempt = VoidAttempt(
+        attempt_id=str(uuid.uuid4()),
+        document_id=document_id,
+        invoice_status=invoice.status,
+        lookup_payload=payload,
+    )
+    invoice.erp_void_pending = {
+        "attempt_id": attempt.attempt_id,
+        "exception_id": exception_id,
+        "document_id": document_id,
+        "actor_id": str(user.id),
+        "reason": reason,
+        "source": "orphan",
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    return attempt
+
+
+async def finish_orphan_void(
+    db: AsyncSession,
+    *,
+    attempt: VoidAttempt,
+    answer: ErpAnswer,
+    invoice: Invoice | None,
+    instance,
+    user,
+    reason: str,
+    exception_id: str | None = None,
+    erp_type: str | None = None,
+) -> VoidOutcome:
+    """Step 3 for a failed push's bill, under the re-taken locks: the marker
+    must still be this attempt's and the invoice still `failed` with no bill
+    of its own; otherwise the orphan record (as the flag's void). Then the
+    void is recorded on the workflow state, an append-only
+    ``invoice.erp_orphan_bill_voided`` row is written and the marker cleared.
+    No transition: the invoice stays `failed`. The push's possibly-posted
+    record is left as it is — one bill voided does not prove there is no
+    other — so a retry's own lookup still runs first."""
+    from fastapi import status as http_status
+
+    if invoice is None or not _ours(invoice, attempt):
+        if not answer.already_gone and invoice is not None:
+            await record_orphaned_void(
+                db,
+                attempt=attempt,
+                exception=None,
+                invoice=invoice,
+                user=user,
+                void_result="voided",
+                erp_type=erp_type,
+            )
+        raise _refused(ERP_VOID_IN_PROGRESS, http_status.HTTP_409_CONFLICT)
+    if not _still_holds(invoice, attempt):
+        if not answer.already_gone:
+            await record_orphaned_void(
+                db,
+                attempt=attempt,
+                exception=None,
+                invoice=invoice,
+                user=user,
+                void_result="voided",
+                erp_type=erp_type,
+            )
+        invoice.erp_void_pending = None
+        raise _refused(ERP_VOID_NO_BILL, http_status.HTTP_409_CONFLICT)
+
+    now = datetime.now(UTC)
+    record = {
+        "document_id": attempt.document_id,
+        "exception_id": exception_id,
+        "voided_at": now.isoformat(),
+        "actor_id": str(user.id),
+        "already_gone": answer.already_gone,
+        "attempt_id": attempt.attempt_id,
+    }
+    invoice.erp_void_pending = None
+    if instance is not None:
+        state = dict(instance.state_data or {})
+        voided = dict(state.get(ERP_ORPHAN_BILL_VOIDED_KEY) or {})
+        voided[attempt.document_id] = record
+        state[ERP_ORPHAN_BILL_VOIDED_KEY] = voided
+        instance.state_data = state
+    await _audit_invoice(
+        db,
+        invoice,
+        action=ACTION_INVOICE_ERP_ORPHAN_VOIDED,
+        actor_id=user.id,
+        details={
+            "invoice_id": str(invoice.id),
+            "erp_document_id": attempt.document_id,
+            "exception_id": exception_id,
+            "erp_status_read": answer.read,
+            "already_gone": answer.already_gone,
+            "reason": reason,
+            "voided_at": now.isoformat(),
+        },
+    )
+    return VoidOutcome(document_id=attempt.document_id, replayed=False, status=invoice.status.value)
 
 
 async def notify_flag_on_posted_bill(

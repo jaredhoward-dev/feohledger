@@ -3,7 +3,8 @@
 import uuid
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +37,7 @@ from app.api.invoice_version import (
     STALE_APPROVAL_MESSAGE,
     matches_loaded_version,
 )
-from app.api.permissions import PERM_INVOICE_APPROVE
+from app.api.permissions import PERM_INVOICE_APPROVE, PERM_PAYMENT_VOID
 from app.api.refusals import coded_refusal
 from app.database import get_control_db
 from app.models.invoice import Invoice, InvoiceExtractionResult, InvoiceStatus
@@ -44,6 +45,7 @@ from app.models.organization import Organization
 from app.models.user import User
 from app.models.workflow import AuditLog, WorkflowInstance, WorkflowStep
 from app.schemas.invoice import InvoiceResponse
+from app.schemas.money import json_money_string
 from app.schemas.workflow import (
     ApproveRequest,
     AssignReviewerRequest,
@@ -857,6 +859,179 @@ async def retry_erp(
         "id": str(invoice.id),
         "correlation_id": str(invoice.correlation_id),
         "status": invoice.status.value,
+    }
+
+
+# ---------- The bill a failed push left in the ERP (decisions §556) ----------
+
+
+def _found_bill_dict(found) -> dict | None:
+    if found is None:
+        return None
+    return {
+        "erp_document_id": found.document_id,
+        "erp_document_number": found.document_number,
+        "amount": json_money_string(found.amount) if found.amount is not None else None,
+        "currency": found.currency,
+        "erp_status": found.status.value,
+    }
+
+
+async def _workflow_instance_locked(db: AsyncSession, invoice_id: uuid.UUID, *, lock: bool):
+    q = select(WorkflowInstance).where(WorkflowInstance.invoice_id == invoice_id)
+    if lock:
+        q = q.with_for_update().execution_options(populate_existing=True)
+    return (await db.execute(q)).scalar_one_or_none()
+
+
+@router.get("/{invoice_id}/erp-orphan-bill")
+async def lookup_erp_orphan_bill(
+    invoice_id: uuid.UUID,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    # The void's permission: only someone who may act on the answer spends an
+    # ERP call on it (`erp_bill_void.orphan_lookup_refusal`).
+    user: User = Depends(require_permission(PERM_PAYMENT_VOID)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Name the bill a failed push may have left in the ERP, by the adapter's
+    read-only idempotency lookup (the match its own push uses). Writes nothing
+    to the ERP; an append-only row records who looked and what was named.
+    ``found: false`` is the ERP's positive answer that it holds no such bill; a
+    lookup that cannot finish is 502 ``erp_lookup_failed``, never "none"."""
+    from app.services import erp_bill_void as ebv
+
+    await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
+    invoice = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
+    instance = await _workflow_instance_locked(db, invoice_id, lock=False)
+    refused = ebv.orphan_lookup_refusal(invoice, instance, user)
+    if refused is not None:
+        code = 403 if refused["code"] == "role_not_permitted" else 409
+        raise HTTPException(status_code=code, detail=refused)
+    if not ebv.lookup_supported(org.settings):
+        raise HTTPException(
+            status_code=409,
+            detail=coded_refusal(
+                ebv.ERP_LOOKUP_UNSUPPORTED, ebv.refusal_message(ebv.ERP_LOOKUP_UNSUPPORTED)
+            ),
+        )
+    payload = await ebv.lookup_payload(db, org, invoice)
+    # No lock is held across the ERP call; end the read transaction first.
+    await db.commit()
+    try:
+        found = await ebv.find_orphan(org, payload)
+    except ebv.VoidRefused as refused_:
+        raise HTTPException(status_code=refused_.status_code, detail=refused_.detail()) from None
+    await ebv.record_lookup(db, invoice, user=user, found=found)
+    await db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "found": found is not None,
+        "bill": _found_bill_dict(found),
+    }
+
+
+class VoidErpOrphanBillRequest(BaseModel):
+    """The bill the lookup named, and why it is being voided."""
+
+    erp_document_id: str = Field(..., min_length=1, max_length=255)
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/{invoice_id}/void-erp-orphan-bill")
+async def void_erp_orphan_bill(
+    invoice_id: uuid.UUID,
+    body: VoidErpOrphanBillRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_PAYMENT_VOID)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Void, in the ERP, the bill a failed push left there, through the flag
+    void's own three steps (``services/erp_bill_void``, decisions §545/§556):
+    under the invoice and instance locks the refusals and a committed marker;
+    with no lock the status read, the lookup run again (the bill must still be
+    the one it names) and the void on a positive read; then the locks again to
+    record it, or the orphan record. The invoice stays ``failed``. A replay of
+    a void of the same bill answers 200 ``replayed: true``; a fresh one 201."""
+    from app.services import erp_bill_void as ebv
+
+    await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
+    document_id = body.erp_document_id.strip()
+    reason = body.reason.strip()
+    if not reason or not document_id:
+        raise HTTPException(status_code=422, detail="A reason and the bill are required")
+
+    async def _lock():
+        inv = await get_invoice_for_update(db, invoice_id)
+        return inv, await _workflow_instance_locked(db, invoice_id, lock=True)
+
+    # The payload is read before any lock: it opens the ERP credentials.
+    unlocked = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
+    payload = await ebv.lookup_payload(db, org, unlocked)
+
+    invoice, instance = await _lock()
+    try:
+        started = await ebv.begin_orphan_void(
+            db,
+            invoice=invoice,
+            instance=instance,
+            user=user,
+            reason=reason,
+            document_id=document_id,
+            payload=payload,
+        )
+    except ebv.VoidRefused as refused:
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
+    if isinstance(started, ebv.VoidOutcome):
+        outcome = started
+    else:
+        await db.commit()
+        refusal = None
+        answer = None
+        try:
+            answer = await ebv.call_erp(org, started)
+        except ebv.VoidRefused as refused:
+            refusal = refused
+        erp_type = ebv.configured_erp_type(org.settings)
+        invoice, instance = await _lock()
+        try:
+            if refusal is not None:
+                if refusal.code == ebv.ERP_VOID_UNCONFIRMED and ebv.lost_its_invoice(
+                    invoice, started
+                ):
+                    await ebv.record_orphaned_void(
+                        db,
+                        attempt=started,
+                        exception=None,
+                        invoice=invoice,
+                        user=user,
+                        void_result="unconfirmed",
+                        erp_type=erp_type,
+                    )
+                ebv.abandon_void(invoice, started)
+                raise refusal
+            outcome = await ebv.finish_orphan_void(
+                db,
+                attempt=started,
+                answer=answer,
+                invoice=invoice,
+                instance=instance,
+                user=user,
+                reason=reason,
+                erp_type=erp_type,
+            )
+        except ebv.VoidRefused as refused:
+            await db.commit()
+            raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
+        await db.commit()
+        response.status_code = status.HTTP_201_CREATED
+    return {
+        "invoice_id": str(invoice_id),
+        "erp_document_id": outcome.document_id,
+        "invoice_status": outcome.status,
+        "replayed": outcome.replayed,
     }
 
 

@@ -14,6 +14,8 @@
 	import { INVOICE_FILE_ACCEPT } from '#lib/utils/invoiceFiles.ts';
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import ErpOrphanBill from '#lib/components/ErpOrphanBill.svelte';
+	import { orphanLookupOffered } from '#lib/api/erpOrphanBill.ts';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import {
@@ -2529,6 +2531,15 @@
 									{refusalText(retryRefusal, m)}
 								</p>
 							{/if}
+						{/if}
+						{#if orphanLookupOffered(invoice.status, auth.can('payment.void'))}
+							<!-- The bill this failed push may have left in the ERP
+							     (decisions §556): find it, then void or keep it. -->
+							<ErpOrphanBill
+								invoiceId={invoice.id}
+								idPrefix="invoice-erp-orphan"
+								onvoided={() => loadVerdicts()}
+							/>
 						{/if}
 					</div>
 				{/if}

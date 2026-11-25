@@ -21,6 +21,7 @@
 	import Tabs from '#lib/components/ui/Tabs.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
+	import ErpOrphanBill from '#lib/components/ErpOrphanBill.svelte';
 	import {
 		EXCEPTION_SEVERITIES,
 		exceptionSeverityLabelKey,
@@ -724,6 +725,14 @@
 	 *  note too, so it holds the note's autofocus back for the same reason. */
 	const voidPanelShown = $derived(
 		!!resolveTarget && isOffered(resolveTarget.void_erp_bill_refusal)
+	);
+	// The flag's invoice names no bill: its push may have failed after reaching
+	// the ERP (decisions §556). Offer the read-only lookup; the server says
+	// whether it is a failed push (`erp_lookup_not_failed` otherwise).
+	const orphanPanelShown = $derived(
+		voidPanelShown &&
+			!!resolveTarget?.invoice_id &&
+			resolveTarget?.void_erp_bill_refusal?.code === 'erp_void_no_bill'
 	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
@@ -1608,6 +1617,15 @@
 						{m('exceptions.erpVoid.open')}
 					</button>
 				</div>
+				{#if orphanPanelShown && resolveTarget.invoice_id}
+					<ErpOrphanBill
+						invoiceId={resolveTarget.invoice_id}
+						idPrefix="exception-erp-orphan"
+						onvoided={async () => {
+							if (resolveTarget) await refreshResolveTarget(resolveTarget.id);
+						}}
+					/>
+				{/if}
 			</section>
 		{/if}
 		<!-- `data-testid` is the e2e suite's handle on this dialog, so a spec

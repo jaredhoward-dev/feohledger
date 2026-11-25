@@ -9,6 +9,7 @@ from app.services.erp_adapters.base import (
     ErpAdapter,
     ErpInvoiceStatus,
     ErpPostResult,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     PoLinePayload,
@@ -234,13 +235,31 @@ _MOCK_VENDORS: list[VendorPayload] = [
 ]
 
 
+#: The bills this process's mock "ERP" holds, by the correlation id the push
+#: carried: what :meth:`MockAdapter.find_posted_bill` reads (decisions §556).
+#: In-memory, like the rest of the mock; a voided bill leaves it.
+_POSTED_BY_CORRELATION: dict[str, FoundBill] = {}
+
+
 @register_adapter("mock")
 class MockAdapter(ErpAdapter):
     erp_type = "mock"
+    supports_bill_lookup = True
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        await asyncio.sleep(0.05)
+        return _POSTED_BY_CORRELATION.get(payload.correlation_id)
 
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         await asyncio.sleep(0.1)  # simulate latency
         doc_id = f"MOCK-{uuid.uuid4().hex[:12].upper()}"
+        _POSTED_BY_CORRELATION[payload.correlation_id] = FoundBill(
+            document_id=doc_id,
+            document_number=doc_id,
+            amount=payload.amount,
+            currency=payload.currency,
+            status=ErpInvoiceStatus.open,
+        )
         return ErpPostResult(
             success=True,
             erp_document_id=doc_id,
@@ -254,6 +273,9 @@ class MockAdapter(ErpAdapter):
 
     async def void_invoice(self, erp_document_id: str) -> bool:
         await asyncio.sleep(0.05)
+        for key, bill in list(_POSTED_BY_CORRELATION.items()):
+            if bill.document_id == erp_document_id:
+                del _POSTED_BY_CORRELATION[key]
         return True
 
     async def list_gl_accounts(self) -> list[GLAccountPayload]:

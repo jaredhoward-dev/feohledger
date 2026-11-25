@@ -2524,6 +2524,43 @@ naming a document the adapter merely found replaces the orphan and drops both,
 and a row from before the flag existed is read as not ours. Business Central is the one
 adapter that reads it today.
 
+## Finding and voiding the bill a failed push left (decisions §556)
+
+A push that timed out or got a 5xx may have created the bill anyway: the retry
+gate's refusal says `possibly_posted: true` (§286). From the failed invoice, a
+holder of `payment.void` can name that bill and void it:
+
+- `GET /api/invoices/{id}/erp-orphan-bill` runs `ErpAdapter.find_posted_bill`,
+  the push's own pre-create idempotency match offered on its own and read-only
+  (GETs / queries only). Offered by `supports_bill_lookup` on the class: the
+  **mock** (bills it posted this process, by correlation id) and **QuickBooks
+  Online** (`_find_existing`: DocNumber + vendor + our `PrivateNote` marker).
+  Every other adapter answers 409 `erp_lookup_unsupported`; their lookups live
+  inside `post_invoice` with client state and are wired one at a time. Only an
+  invoice at `failed`, naming no bill, whose state is `possibly_posted` is
+  looked up (409 `erp_lookup_not_failed`). A lookup that cannot finish is 502
+  `erp_lookup_failed`, never "none". Answers `{found, bill: {erp_document_id,
+  erp_document_number, amount, currency, erp_status}}` and writes an
+  `invoice.erp_orphan_bill_looked_up` audit row.
+- `POST /api/invoices/{id}/void-erp-orphan-bill` (`{erp_document_id, reason}`)
+  voids it through the flag void's three steps (`begin_orphan_void` →
+  `call_erp` → `finish_orphan_void`): the same marker, the same positive status
+  read, and the lookup run again — the bill is voided only if the lookup still
+  names that id (else 409 `erp_void_not_found`). The invoice stays `failed`
+  (no transition: `failed` is not payable and the approval is unchanged); the
+  void is recorded under `state_data["erp_orphan_bills_voided"][document_id]`
+  (a replay answers 200 `replayed: true`) and audited
+  `invoice.erp_orphan_bill_voided`. The push's possibly-posted record is left:
+  one bill voided does not prove there is no other. A void sent but not
+  recordable writes `invoice.erp_orphan_bill_void_orphaned` (§550).
+- While the marker is live, `send-to-erp` / `retry-erp` answer 409
+  `erp_void_in_progress`: a push would otherwise adopt the bill being voided.
+- **Keeping the bill** needs no new door and no new edge: `failed → sent_to_erp`
+  does not exist, and `retry-erp` already adopts it — the push's own lookup
+  finds the bill and records it instead of creating another. While a
+  duplicate / fraud flag is open the retry is refused, which is right: adopting
+  a flagged bill would put it on record as payable.
+
 ## Voiding a flagged bill from the exception queue (decisions §539)
 
 `void_invoice` has one user-facing caller: `POST /api/exceptions/{id}/void-erp-bill`
