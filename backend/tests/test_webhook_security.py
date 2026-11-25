@@ -266,6 +266,8 @@ def _card_row(provider_card_id: str):
         amount_limit=100,
         amount_charged=None,
         charged_at=None,
+        # Stamped by the first authorization and never cleared (decisions §549).
+        first_authorized_at=None,
         merchant_name=None,
         organization_id=uuid.uuid4(),
         # The webhook writes a `card.charged`/`card.settled` audit row that reads
@@ -368,7 +370,9 @@ async def test_card_webhook_dedups_replayed_event(fake_redis):
     body_bytes = json.dumps(
         {
             "card_token": "card_token_abc",
-            "type": "transaction.settled",
+            # Lithic's real event, read by its status (decisions §549).
+            "type": "card_transaction.updated",
+            "status": "SETTLED",
             "amount": 5000,
             "event_id": "evt_dup_check",
         }
@@ -429,7 +433,9 @@ async def test_card_webhook_accepts_correctly_signed_first_delivery(fake_redis):
     body_bytes = json.dumps(
         {
             "card_token": "card_token_abc",
-            "type": "authorization",
+            # Lithic's real event, read by its status (decisions §549).
+            "type": "card_transaction.updated",
+            "status": "PENDING",
             "amount": 5000,
             "event_id": "evt_ok",
         }
@@ -470,7 +476,9 @@ async def test_card_webhook_releases_dedup_claim_when_commit_fails(fake_redis):
     body_bytes = json.dumps(
         {
             "card_token": "card_token_abc",
-            "type": "authorization",
+            # Lithic's real event, read by its status (decisions §549).
+            "type": "card_transaction.updated",
+            "status": "PENDING",
             "amount": 5000,
             "event_id": "evt_commit_fail",
         }

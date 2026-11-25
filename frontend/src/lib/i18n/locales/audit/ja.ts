@@ -53,6 +53,7 @@ export const messages = {
 	'audit.action.card.charged': "カード請求",
 	'audit.action.card.authorization_lapsed': "カードのオーソリ失効",
 	'audit.action.card.reversal_after_settlement': "決済済みカードへの取消",
+	'audit.action.card.settled_after_cancel': "取消後のカード請求",
 	'audit.action.card.details_viewed': "カード詳細を閲覧",
 	'audit.action.card.generated': "バーチャルカード発行",
 	'audit.action.card.reused': "バーチャルカード再利用",

@@ -53,6 +53,7 @@ export const messages = {
 	'audit.action.card.charged': "Carte débitée",
 	'audit.action.card.authorization_lapsed': "Autorisation de carte expirée",
 	'audit.action.card.reversal_after_settlement': "Annulation sur une carte réglée",
+	'audit.action.card.settled_after_cancel': "Carte débitée après annulation",
 	'audit.action.card.details_viewed': "Détails de carte consultés",
 	'audit.action.card.generated': "Carte virtuelle émise",
 	'audit.action.card.reused': "Carte virtuelle réutilisée",

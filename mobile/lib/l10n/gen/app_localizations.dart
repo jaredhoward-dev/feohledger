@@ -5944,6 +5944,12 @@ abstract class AppLocalizations {
     String paymentId,
   );
 
+  /// No description provided for @exceptionDescriptionCardSettledAfterCancel.
+  ///
+  /// In en, this message translates to:
+  /// **'The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour);
+
   /// No description provided for @exceptionDescriptionSettlementCurrencyMismatch.
   ///
   /// In en, this message translates to:

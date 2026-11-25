@@ -356,6 +356,7 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   },
   'exception.payment_dispatch_interrupted_failed': {'paymentId': 'text'},
   'exception.payment_dispatch_interrupted_cancelled': {'paymentId': 'text'},
+  'exception.card_settled_after_cancel': {'lastFour': 'text'},
   'exception.settlement_currency_mismatch': {
     'settledAmount': 'number',
     'settledCurrency': 'text',
@@ -1352,6 +1353,11 @@ String? _localizeWarningCode(
       return l.exceptionDescriptionPaymentDispatchInterruptedCancelled(
         paymentId,
       );
+    // The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.card_settled_after_cancel':
+      final lastFour = _text(p['lastFour'], currency);
+      if (lastFour == null) return null;
+      return l.exceptionDescriptionCardSettledAfterCancel(lastFour);
     // Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
     case 'exception.settlement_currency_mismatch':
       final settledAmount = _number(p['settledAmount'], currency);

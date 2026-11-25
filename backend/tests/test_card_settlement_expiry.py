@@ -32,11 +32,12 @@ from app.services.card_issuance import card_settlement_block
 _NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 
-def _card(*, status="active", limit="500.00", expires_at=None):
+def _card(*, status="active", limit="500.00", expires_at=None, first_authorized_at=None):
     return SimpleNamespace(
         status=status,
         amount_limit=Decimal(limit),
         expires_at=expires_at,
+        first_authorized_at=first_authorized_at,
     )
 
 
@@ -224,19 +225,44 @@ def test_no_reason_string_can_carry_card_data():
     for status in ("created", "active", "charged", "completed"):
         for expires_at in (None, _NOW - timedelta(days=1), _NOW + timedelta(days=1)):
             for limit in ("1.00", "500.00"):
-                card = _card(status=status, limit=limit, expires_at=expires_at)
-                card.last_four = "4242"
-                card.merchant_name = "Acme Fuel"
-                reason = card_settlement_block(card, Decimal("500.00"), now=_NOW)
-                if reason is not None:
-                    seen.add(reason)
-                    assert "4242" not in reason
-                    assert "Acme" not in reason
+                for authorized in (None, _NOW - timedelta(days=2)):
+                    card = _card(
+                        status=status,
+                        limit=limit,
+                        expires_at=expires_at,
+                        first_authorized_at=authorized,
+                    )
+                    card.last_four = "4242"
+                    card.merchant_name = "Acme Fuel"
+                    reason = card_settlement_block(card, Decimal("500.00"), now=_NOW)
+                    if reason is not None:
+                        seen.add(reason)
+                        assert "4242" not in reason
+                        assert "Acme" not in reason
     assert seen == {
         "card_already_charged",
+        "card_authorized_before",
         "card_expired",
         "card_already_issued_insufficient_limit",
     }
+
+
+@pytest.mark.parametrize("status", ["created", "sent", "active"])
+def test_an_unspent_card_authorized_before_is_refused(status):
+    """Decisions §549: a lapsed authorization returns the card to unspent
+    (§544), but a single-use card was closed at the provider by it. Refused
+    ahead of every other unspent-card reason, since no re-issue of the limit
+    or the expiry makes it chargeable again."""
+    card = _card(
+        status=status,
+        limit="1.00",
+        expires_at=_NOW - timedelta(days=1),
+        first_authorized_at=_NOW - timedelta(days=3),
+    )
+    assert card_settlement_block(card, Decimal("500.00"), now=_NOW) == "card_authorized_before"
+    # Spent still wins: the money that moved is the first fact.
+    card.status = "charged"
+    assert card_settlement_block(card, Decimal("500.00"), now=_NOW) == "card_already_charged"
 
 
 def test_the_money_path_never_injects_its_own_clock():
@@ -281,5 +307,16 @@ def test_a_card_limit_mismatch_is_retry_safe():
         classify_payment_failure(
             failure_reason="card_limit_exceeds_payment", provider_payment_id=None
         )
+        == RETRY_SAFE
+    )
+
+
+def test_a_card_authorized_before_is_retry_safe():
+    """Decisions §549: refused before anything moved; once the card is
+    cancelled the re-send mints a fresh one."""
+    from app.services.payment_runs import RETRY_SAFE, classify_payment_failure
+
+    assert (
+        classify_payment_failure(failure_reason="card_authorized_before", provider_payment_id=None)
         == RETRY_SAFE
     )

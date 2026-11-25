@@ -298,6 +298,11 @@ def card_settlement_block(card: VirtualCard, amount, *, now: datetime | None = N
       invoice advanced to `paid`, and the vendor was never paid at all: worse
       than the double-spend the status check exists to prevent, because there is
       no charge anywhere to reconcile against.
+    - **Authorized before.** A card whose authorization lapsed is back to
+      ``active`` (decisions §544) but was closed at the provider by that first
+      authorization if it is single-use, so nothing could charge it again.
+      Refused as ``card_authorized_before``, from the durable
+      ``first_authorized_at`` (decisions §549).
     - **Limit too small.** A live, unspent card that cannot cover this payable is
       not what settles it.
     - **Limit too large.** A card is spendable up to its limit, and nothing on
@@ -318,6 +323,14 @@ def card_settlement_block(card: VirtualCard, amount, *, now: datetime | None = N
     """
     if card.status in CARD_SPENT_STATUSES:
         return "card_already_charged"
+    if card.first_authorized_at is not None:
+        # Authorized once, then the hold lapsed (decisions §544), so the card
+        # reads unspent. But a single-use card is closed at the provider by its
+        # first authorization (Lithic's SINGLE_USE), so converging a payment
+        # onto it would leave the leg waiting for a charge nobody can make.
+        # Cancel it (the void still accepts it) and the next run mints a fresh
+        # one (decisions §549).
+        return "card_authorized_before"
     if card.expires_at is not None:
         # Both sides normalised to aware UTC: `expires_at` is a timezone-aware
         # column, but a row built in a test or by an adapter that dropped the

@@ -4078,6 +4078,11 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'Die Karte mit der Endung $lastFour wurde nach ihrer Stornierung belastet; diese Rechnung wurde also möglicherweise doppelt bezahlt. Prüfen Sie die Belastung beim Kartenanbieter und die übrigen Zahlungen dieser Rechnung und holen Sie die doppelte Zahlung zurück – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,
