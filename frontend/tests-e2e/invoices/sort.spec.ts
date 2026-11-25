@@ -74,4 +74,15 @@ test.describe('/invoices column sort (acme admin)', () => {
 		await reloadRequest;
 		await expect(page.locator('table tbody tr').first()).toBeVisible();
 	});
+
+	// The backend 422s a sort key outside its allowlist; read raw, a stale link
+	// would fail every load, Retry included.
+	test('an unknown sort in the URL falls back to the default order', async ({ page }) => {
+		const listRequest = page.waitForRequest((r) => r.url().includes('/api/invoices?'));
+		await page.goto('/invoices?sort=not_a_column&order=asc');
+		expect(new URL((await listRequest).url()).searchParams.has('sort')).toBe(false);
+
+		await expect(page.locator('table tbody tr').first()).toBeVisible();
+		await expect(page.getByTestId('invoices-load-error')).toHaveCount(0);
+	});
 });

@@ -31,7 +31,7 @@
 	} from '#lib/types/exception.ts';
 	import type { ExceptionSeverity } from '#lib/types/exception.ts';
 	import type { ExceptionSummary } from '#lib/types/exceptionSummary.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import AgentDashboard from '#lib/components/exceptions/AgentDashboard.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { formatMoney, type MoneyAmount } from '#lib/utils/money.ts';
@@ -172,7 +172,7 @@
 	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
 		const status = params.get('status') ?? '';
 		const severity = params.get('severity') ?? '';
-		const sort = params.get('sort') ?? '';
+		const sort = sortFromUrl(params, SORT_KEYS, 'desc');
 		return {
 			view: (params.get('view') === 'agents' ? 'agents' : 'queue') as 'queue' | 'agents',
 			status: STATUS_KEYS.includes(status) ? status : 'open',
@@ -182,8 +182,8 @@
 			// with no chip pressed.
 			severity: (EXCEPTION_SEVERITIES as readonly string[]).includes(severity) ? severity : 'all',
 			search: params.get('search') ?? '',
-			sortField: SORT_KEYS.includes(sort) ? sort : null,
-			sortOrder: (params.get('order') === 'asc' ? 'asc' : 'desc') as SortOrder
+			sortField: sort.field,
+			sortOrder: sort.order
 		};
 	}
 	const initialUrlState = readUrlState(pageStore.url.searchParams);

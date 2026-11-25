@@ -47,7 +47,7 @@
 	import { afterNavigate, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 
 	// Search + the quick status chips are URL-backed (`?search=&status=`)
 	// alongside `assigned_to_id`, sort and the `?id=` deep link, so a reload /
@@ -58,6 +58,11 @@
 	//
 	// `readUrlState` is the one READER of those params, used at mount and again
 	// by the `afterNavigate` hook below for a navigation that reuses this page.
+	const SORTABLE_FIELDS = ['invoice_number', 'vendor_name', 'amount', 'due_date', 'status'] as const;
+	function sortStateFromUrl(params: Pick<URLSearchParams, 'get'>) {
+		const { field, order } = sortFromUrl(params, SORTABLE_FIELDS, 'desc');
+		return { sortField: field, sortOrder: order };
+	}
 	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
 		return {
 			search: params.get('search') ?? '',
@@ -65,8 +70,7 @@
 				.split(',')
 				.filter((s): s is InvoiceStatus => (INVOICE_STATUSES as readonly string[]).includes(s)),
 			assignedToId: params.get('assigned_to_id') ?? '',
-			sortField: params.get('sort'),
-			sortOrder: (params.get('order') === 'asc' ? 'asc' : 'desc') as SortOrder
+			...sortStateFromUrl(params)
 		};
 	}
 	const initialUrlState = readUrlState(page.url.searchParams);

@@ -35,20 +35,20 @@ export function clearSort(current: SortState): SortState {
 
 /**
  * Read a page's sort back out of its URL (`?sort=&order=`), keeping only a
- * field the page actually offers as a sortable header. The URL is user-
- * editable and outlives renames: an unknown `sort=` passed straight through
- * is a 422 from the backend's allowlist, and a list page that fails its load
- * on every Retry is a dead end with no control on screen to undo it. An
- * unknown field falls back to the default order; any `order` other than
- * `desc` reads as ascending.
+ * field the page offers as a header: the URL is user-editable and outlives
+ * renames, and the backend 422s any key outside its allowlist, so a raw
+ * pass-through fails every load (Retry included). An unknown field falls back
+ * to the default order; a missing or unknown `order` reads as `defaultOrder`.
  */
 export function sortFromUrl(
 	params: Pick<URLSearchParams, 'get'>,
-	fields: readonly string[]
+	fields: readonly string[],
+	defaultOrder: SortOrder = 'asc'
 ): SortState {
 	const field = params.get('sort');
+	const order = params.get('order');
 	return {
 		field: field && fields.includes(field) ? field : null,
-		order: params.get('order') === 'desc' ? 'desc' : 'asc'
+		order: order === 'asc' || order === 'desc' ? order : defaultOrder
 	};
 }

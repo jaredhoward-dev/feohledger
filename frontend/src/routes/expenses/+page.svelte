@@ -102,7 +102,7 @@
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { normalizeMoneyInput } from '#lib/utils/moneyInput.ts';
 	import SortableHeader from '#lib/components/ui/SortableHeader.svelte';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { formatCount } from '#lib/utils/count.ts';
 
 	const canCreate = $derived(auth.hasAnyRole('admin', 'ap_manager', 'ap_clerk'));
@@ -138,8 +138,10 @@
 	let statusFilter = $state<string>(page.url.searchParams.get('status') ?? 'all');
 	// Column sort (expenses tab only) — URL-backed via the same `syncUrl()`
 	// below. `null` field = the backend's own default order (most-recent first).
-	let sortField = $state<string | null>(page.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((page.url.searchParams.get('order') as SortOrder) ?? 'desc');
+	const SORTABLE_FIELDS = ['expense_date', 'merchant', 'category', 'amount', 'status'] as const;
+	const initialSort = sortFromUrl(page.url.searchParams, SORTABLE_FIELDS, 'desc');
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// --- Modal + selection state ---
 	let showCreate = $state(false);

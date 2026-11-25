@@ -176,4 +176,19 @@ test.describe('/contracts — URL state and selection', () => {
 		await expect(page).not.toHaveURL(/[?&]id=/);
 		await expect(page.getByTestId('contracts-deeplink-error')).toHaveCount(0);
 	});
+
+	// The backend 422s a sort key outside its allowlist; read raw, a stale link
+	// would fail every load, Retry included.
+	test('an unknown sort in the URL falls back to the default order', async ({ page }) => {
+		await mockList(page);
+		const listRequest = page.waitForRequest((r) => {
+			const url = new URL(r.url());
+			return url.pathname === '/api/contracts';
+		});
+		await page.goto('/contracts?sort=not_a_column&order=desc');
+		expect(new URL((await listRequest).url()).searchParams.has('sort')).toBe(false);
+
+		await expect(page.getByRole('button', { name: 'Open contract E2E-CTR-2' })).toBeVisible();
+		await expect(page.getByTestId('contracts-error')).toHaveCount(0);
+	});
 });
