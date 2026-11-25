@@ -57,6 +57,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import PaymentsPanel from '#lib/components/organization/PaymentsPanel.svelte';
 	import FraudRulesPanel from '#lib/components/organization/FraudRulesPanel.svelte';
 	import ExtractionPanel from '#lib/components/organization/ExtractionPanel.svelte';
 	import BrandingPanel from '#lib/components/organization/BrandingPanel.svelte';
@@ -73,6 +74,8 @@
 		type CardsFields,
 		type CompanyFields,
 		type ExtractionFields,
+		type NachaFields,
+		type PaymentsFields,
 		type FraudRules,
 		type InvoiceDefaultsFields
 	} from '#lib/components/organization/panelState.ts';
@@ -86,10 +89,8 @@
 	} from '#lib/types/planFeatures.ts';
 	import {
 		NACHA_FIELD_LABEL_KEYS,
-		NACHA_OFFSET_ACCOUNT_TYPES,
 		nachaForSave,
-		nachaProblems,
-		type PaymentExecutionMode
+		nachaProblems
 	} from '#lib/types/paymentExecution.ts';
 
 	interface CompanyProfile {
@@ -280,8 +281,6 @@
 		}
 	}
 
-	// A product name, not copy: it reads the same in every locale.
-	const MODERN_TREASURY = 'Modern Treasury';
 	// Cards
 	let cardsFields = $state<CardsFields>({
 		enabled: false,
@@ -587,12 +586,12 @@
 				| undefined;
 			if (pmt) {
 				loadPaymentsExtras(pmt);
-				paymentsProvider = (pmt.provider as string) || 'mock';
+				paymentsFields.provider = (pmt.provider as string) || 'mock';
 				paymentsProgramType = (pmt.program_type as string) || 'byok';
-				paymentsOrgId = (pmt.org_id as string) || '';
-				paymentsOriginatingAccount = (pmt.originating_account_id as string) || '';
-				paymentsSandbox = (pmt.sandbox as boolean) ?? true;
-				paymentsCfoThreshold = (pmt.cfo_approval_above as number | null) ?? null;
+				paymentsFields.orgId = (pmt.org_id as string) || '';
+				paymentsFields.originatingAccount = (pmt.originating_account_id as string) || '';
+				paymentsFields.sandbox = (pmt.sandbox as boolean) ?? true;
+				paymentsFields.cfoThreshold = (pmt.cfo_approval_above as number | null) ?? null;
 			}
 			// Extraction
 			const extraction = (data.settings as unknown as Record<string, unknown>).extraction as Record<string, unknown> | undefined;
@@ -701,14 +700,18 @@
 	}
 
 	// Payments
-	let paymentsProvider = $state('mock');
+	// `mode` starts at "processor": see the execution-mode note below.
+	let paymentsFields = $state<PaymentsFields>({
+		mode: 'processor',
+		provider: 'mock',
+		apiKey: '',
+		orgId: '',
+		originatingAccount: '',
+		webhookSecret: '',
+		sandbox: true,
+		cfoThreshold: null
+	});
 	let paymentsProgramType = $state('byok'); // mock = no key; modern_treasury = byok keys
-	let paymentsApiKey = $state('');
-	let paymentsOrgId = $state('');
-	let paymentsOriginatingAccount = $state('');
-	let paymentsWebhookSecret = $state('');
-	let paymentsSandbox = $state(true);
-	let paymentsCfoThreshold = $state<number | null>(null);
 	let savingPayments = $state(false);
 
 	// --- Payment execution mode + NACHA bank file (issue #517) ----------------
@@ -718,17 +721,19 @@
 	// unless the admin changes it, rather than written as an explicit choice
 	// nobody made. An unknown stored value shows as record-only, which is what
 	// the server resolves it to (fail closed).
-	let paymentsMode = $state<PaymentExecutionMode>('processor');
 	let paymentsModeStored = $state<string | null>(null);
-	let nachaCompanyName = $state('');
-	let nachaCompanyId = $state('');
-	let nachaOdfiRouting = $state('');
-	let nachaBankName = $state('');
+	let nachaFields = $state<NachaFields>({
+		companyName: '',
+		companyId: '',
+		odfiRouting: '',
+		bankName: '',
+		offsetRouting: '',
+		offsetAccount: '',
+		offsetAccountType: ''
+	});
 	// The balanced-file offset account (decisions §432). The account number
 	// reads back masked (`****1234`), so the input starts blank with the mask as
 	// its placeholder; saving it blank keeps the stored number.
-	let nachaOffsetRouting = $state('');
-	let nachaOffsetAccount = $state('');
 	let nachaOffsetAccountMask = $state('');
 	// The stored offset's bank, while an account number is on file: a blank
 	// account is "keep it" only at that same bank (`nachaProblems`).
@@ -745,7 +750,6 @@
 					}
 				: null;
 	}
-	let nachaOffsetAccountType = $state('');
 	// Every OTHER key of the stored `settings.payments` block. The save is a
 	// shallow replace of the whole block, so a key this form does not manage —
 	// `require_run_segregation`, `home_currency`, anything newer than this
@@ -771,19 +775,19 @@
 		);
 		const mode = pmt.mode;
 		paymentsModeStored = typeof mode === 'string' ? mode : null;
-		paymentsMode =
+		paymentsFields.mode =
 			paymentsModeStored === null || paymentsModeStored === 'processor' ? 'processor' : 'record_only';
 		const nacha = (pmt.nacha ?? {}) as Record<string, unknown>;
-		nachaCompanyName = typeof nacha.company_name === 'string' ? nacha.company_name : '';
-		nachaCompanyId = typeof nacha.company_id === 'string' ? nacha.company_id : '';
-		nachaOdfiRouting = typeof nacha.odfi_routing === 'string' ? nacha.odfi_routing : '';
-		nachaBankName = typeof nacha.bank_name === 'string' ? nacha.bank_name : '';
-		nachaOffsetRouting = typeof nacha.offset_routing === 'string' ? nacha.offset_routing : '';
-		nachaOffsetAccount = '';
+		nachaFields.companyName = typeof nacha.company_name === 'string' ? nacha.company_name : '';
+		nachaFields.companyId = typeof nacha.company_id === 'string' ? nacha.company_id : '';
+		nachaFields.odfiRouting = typeof nacha.odfi_routing === 'string' ? nacha.odfi_routing : '';
+		nachaFields.bankName = typeof nacha.bank_name === 'string' ? nacha.bank_name : '';
+		nachaFields.offsetRouting = typeof nacha.offset_routing === 'string' ? nacha.offset_routing : '';
+		nachaFields.offsetAccount = '';
 		nachaOffsetAccountMask =
 			typeof nacha.offset_account === 'string' ? nacha.offset_account : '';
 		rememberNachaOnFile(nacha);
-		nachaOffsetAccountType =
+		nachaFields.offsetAccountType =
 			typeof nacha.offset_account_type === 'string' ? nacha.offset_account_type : '';
 	}
 	let testingPayments = $state(false);
@@ -796,11 +800,11 @@
 			paymentsTestResult = await api.post<{ success: boolean; message: string }>(
 				'/api/organization/test-payments',
 				{
-					provider: paymentsProvider,
-					api_key: paymentsApiKey,
-					org_id: paymentsOrgId,
-					originating_account_id: paymentsOriginatingAccount,
-					sandbox: paymentsSandbox,
+					provider: paymentsFields.provider,
+					api_key: paymentsFields.apiKey,
+					org_id: paymentsFields.orgId,
+					originating_account_id: paymentsFields.originatingAccount,
+					sandbox: paymentsFields.sandbox,
 				}
 			);
 		} catch (err) {
@@ -1017,13 +1021,13 @@
 
 	async function savePayments() {
 		const nacha = nachaForSave({
-			company_name: nachaCompanyName,
-			company_id: nachaCompanyId,
-			odfi_routing: nachaOdfiRouting,
-			bank_name: nachaBankName,
-			offset_routing: nachaOffsetRouting,
-			offset_account: nachaOffsetAccount,
-			offset_account_type: nachaOffsetAccountType
+			company_name: nachaFields.companyName,
+			company_id: nachaFields.companyId,
+			odfi_routing: nachaFields.odfiRouting,
+			bank_name: nachaFields.bankName,
+			offset_routing: nachaFields.offsetRouting,
+			offset_account: nachaFields.offsetAccount,
+			offset_account_type: nachaFields.offsetAccountType
 		});
 		if (nacha) {
 			// The server 422s the same fields (`services/nacha.originator_problems`);
@@ -1042,23 +1046,23 @@
 			}
 		}
 		// Re-send an absent mode as absent unless the admin chose one.
-		const sendMode = paymentsModeStored !== null || paymentsMode !== 'processor';
+		const sendMode = paymentsModeStored !== null || paymentsFields.mode !== 'processor';
 		savingPayments = true;
 		try {
 			await patchOrg({
 				payments: {
 					...paymentsExtras,
-					...(sendMode ? { mode: paymentsMode } : {}),
+					...(sendMode ? { mode: paymentsFields.mode } : {}),
 					nacha,
-					provider: paymentsProvider,
+					provider: paymentsFields.provider,
 					program_type: paymentsProgramType,
-					org_id: paymentsOrgId,
-					originating_account_id: paymentsOriginatingAccount,
-					sandbox: paymentsSandbox,
-					cfo_approval_above: paymentsCfoThreshold,
+					org_id: paymentsFields.orgId,
+					originating_account_id: paymentsFields.originatingAccount,
+					sandbox: paymentsFields.sandbox,
+					cfo_approval_above: paymentsFields.cfoThreshold,
 				},
 			});
-			if (sendMode) paymentsModeStored = paymentsMode;
+			if (sendMode) paymentsModeStored = paymentsFields.mode;
 			// The typed offset account number is now on file: show it as the
 			// server does, masked, and clear the input.
 			const savedNacha = (
@@ -1069,12 +1073,12 @@
 			nachaOffsetAccountMask =
 				typeof savedNacha?.offset_account === 'string' ? savedNacha.offset_account : '';
 			rememberNachaOnFile(savedNacha);
-			nachaOffsetAccount = '';
+			nachaFields.offsetAccount = '';
 			await saveSecrets('payments', {
-				api_key: paymentsApiKey,
-				webhook_secret: paymentsWebhookSecret
+				api_key: paymentsFields.apiKey,
+				webhook_secret: paymentsFields.webhookSecret
 			});
-			paymentsApiKey = paymentsWebhookSecret = '';
+			paymentsFields.apiKey = paymentsFields.webhookSecret = '';
 			toast(m('org.toast.sectionSaved', { section: m('org.section.paymentsSaved') }), 'success');
 			unopenable.payments = false;
 		} catch (err) {
@@ -2311,251 +2315,22 @@
 				{/if}
 
 				{#if section === 'payments'}
-					<section class="card" id="org-payments">
-						<div class="help-row">
-							<h2>{m('org.section.payments')}</h2>
-							<HelpTip term="payment-rail" />
-						</div>
-						<p class="card-hint">
-							{m('org.payments.hint')}
-						</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="payments-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.payments.mode')}</span>
-									<select
-										bind:value={paymentsMode}
-										aria-describedby="org-payments-mode-hint"
-										data-testid="payments-mode"
-									>
-										<option value="processor">{m('org.payments.modeProcessor')}</option>
-										<option value="record_only">{m('org.payments.modeRecordOnly')}</option>
-									</select>
-								</label>
-							</div>
-							<p class="card-hint" id="org-payments-mode-hint">
-								{m('org.payments.modeHint')}
-								<HelpTip term="record-only" />
-							</p>
-
-							{#if paymentsMode === 'record_only'}
-								<div class="help-row">
-									<h3 class="chat-subhead">{m('org.payments.nachaHeading')}</h3>
-									<HelpTip term="nacha-file" />
-								</div>
-								<p class="card-hint" id="org-payments-nacha-hint">{m('org.payments.nachaHint')}</p>
-								<div class="form-grid" data-testid="payments-nacha">
-									<label>
-										<span>{m('org.payments.nachaField.companyName')}</span>
-										<input
-											type="text"
-											bind:value={nachaCompanyName}
-											maxlength="16"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-									<label>
-										<span>{m('org.payments.nachaField.companyId')}</span>
-										<input
-											type="text"
-											bind:value={nachaCompanyId}
-											maxlength="10"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-									<label>
-										<span>{m('org.payments.nachaField.odfiRouting')}</span>
-										<input
-											type="text"
-											inputmode="numeric"
-											bind:value={nachaOdfiRouting}
-											maxlength="9"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-									<label>
-										<span>{m('org.payments.nachaField.bankName')}</span>
-										<input
-											type="text"
-											bind:value={nachaBankName}
-											maxlength="23"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-								</div>
-								<p class="card-hint" id="org-payments-nacha-offset-hint">
-									{m('org.payments.nachaOffsetHint')}
-								</p>
-								<div class="form-grid" data-testid="payments-nacha-offset">
-									<label>
-										<span>{m('org.payments.nachaField.offsetRouting')}</span>
-										<input
-											type="text"
-											inputmode="numeric"
-											bind:value={nachaOffsetRouting}
-											maxlength="9"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-offset-hint"
-										/>
-									</label>
-									<div>
-										<label>
-											<span>{m('org.payments.nachaField.offsetAccount')}</span>
-											<input
-												type="text"
-												bind:value={nachaOffsetAccount}
-												maxlength="20"
-												autocomplete="off"
-												placeholder={nachaOffsetAccountMask || undefined}
-												aria-describedby={nachaOffsetAccountMask
-													? 'org-payments-nacha-offset-hint org-payments-nacha-offset-onfile'
-													: 'org-payments-nacha-offset-hint'}
-											/>
-										</label>
-										<!-- The placeholder alone was the only sign an account is on
-										     file: it vanishes on focus and is no accessible
-										     description. Visible text outside the <label> (so it is
-										     not swallowed into the name), tied to the input. -->
-										{#if nachaOffsetAccountMask}
-											<p
-												class="field-hint"
-												id="org-payments-nacha-offset-onfile"
-												data-testid="payments-nacha-offset-onfile"
-											>
-												{m('org.payments.nachaOffsetOnFile', { mask: nachaOffsetAccountMask })}
-											</p>
-										{/if}
-									</div>
-									<label>
-										<!-- Named by its label text alone: a <select> inside its
-										     <label> otherwise takes the chosen option into its name
-										     ("Offset account type None"). -->
-										<span id="org-payments-nacha-offset-type-label"
-											>{m('org.payments.nachaField.offsetAccountType')}</span
-										>
-										<select
-											bind:value={nachaOffsetAccountType}
-											aria-labelledby="org-payments-nacha-offset-type-label"
-											aria-describedby="org-payments-nacha-offset-hint"
-										>
-											<option value="">{m('org.payments.nachaOffsetTypeNone')}</option>
-											{#each NACHA_OFFSET_ACCOUNT_TYPES as type (type)}
-												<option value={type}>
-													{type === 'savings'
-														? m('org.payments.nachaOffsetType.savings')
-														: m('org.payments.nachaOffsetType.checking')}
-												</option>
-											{/each}
-										</select>
-									</label>
-								</div>
-							{/if}
-
-							<div class="form-grid">
-								<label>
-									<span>{m('org.payments.provider')}</span>
-									<select bind:value={paymentsProvider}>
-										<option value="mock">{m('org.payments.providerMock')}</option>
-										<option value="modern_treasury">{MODERN_TREASURY}</option>
-									</select>
-								</label>
-							</div>
-
-							{#if paymentsProvider === 'modern_treasury'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.payments.orgId')}</span>
-										<input type="text" bind:value={paymentsOrgId} placeholder={'org_...'} />
-									</label>
-									<SecretField
-										id="payments-api-key"
-										label={m('org.payments.apiKey')}
-										bind:value={paymentsApiKey}
-										bind:clear={secretClear['payments.api_key']}
-										configured={isStored('payments', 'api_key')}
-										testId="payments-api-key"
-									/>
-									<label>
-										<span>{m('org.payments.originatingAccount')}</span>
-										<input type="text" bind:value={paymentsOriginatingAccount} placeholder={m('org.payments.originatingAccountPlaceholder')} />
-									</label>
-									<SecretField
-										id="payments-webhook-secret"
-										label={m('org.payments.webhookSecret')}
-										bind:value={paymentsWebhookSecret}
-										bind:clear={secretClear['payments.webhook_secret']}
-										configured={isStored('payments', 'webhook_secret')}
-										placeholder={m('org.payments.webhookSecretPlaceholder')}
-										testId="payments-webhook-secret"
-									/>
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={paymentsSandbox} />
-										<span>{m('org.payments.sandbox')}</span>
-									</label>
-								</div>
-								<p class="card-hint">
-									{m('org.payments.webhookHint')}
-									<code>{org.created_at ? `${window.location.origin.replace(window.location.host, org.slug + '.' + window.location.host)}/api/payments/webhook/${org.slug}/modern_treasury` : '...'}</code>
-								</p>
-							{/if}
-
-							<div class="form-grid">
-								<label>
-									<span>{m('org.payments.cfoThreshold', { currency: orgCurrency.label })}</span>
-									<input
-										type="number"
-										min="0"
-										step="100"
-										placeholder={m('org.payments.cfoThresholdPlaceholder')}
-										value={paymentsCfoThreshold ?? ''}
-										oninput={(e) => {
-											const v = (e.currentTarget as HTMLInputElement).value;
-											paymentsCfoThreshold = v ? parseFloat(v) : null;
-										}}
-									/>
-								</label>
-							</div>
-							<p class="card-hint">
-								{m('org.payments.cfoHint')}
-								<HelpTip term="cfo-gate" />
-								<HelpTip term="reporting-currency" />
-							</p>
-
-							{#if unopenable.payments && auth.isAdmin}
-								<CredentialResetPrompt
-									block="payments"
-									oncleared={(status) => onCredentialsCleared('payments', status)}
-								/>
-							{/if}
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingPayments} onclick={savePayments}>
-									{savingPayments ? m('org.common.saving') : m('org.payments.save')}
-								</button>
-								<button class="btn-test" disabled={testingPayments || paymentsProvider === 'mock'} onclick={testPayments}>
-									{testingPayments ? m('org.common.testing') : m('org.common.testConnection')}
-								</button>
-								<!-- Always mounted, so the result is announced when it arrives
-								     (WCAG 4.1.3): a live region inserted together with its text
-								     is not read by every screen reader. -->
-								<span
-									class="test-result"
-									role="status"
-									class:success={paymentsTestResult?.success === true}
-									class:failure={paymentsTestResult?.success === false}
-								>
-									{paymentsTestResult?.message ?? ''}
-								</span>
-							</div>
-						{/if}
-					</section>
+					<PaymentsPanel
+						bind:fields={paymentsFields}
+						bind:nacha={nachaFields}
+						bind:secretClear
+						offsetAccountMask={nachaOffsetAccountMask}
+						{org}
+						{readOnly}
+						{isStored}
+						unopenable={unopenable.payments ?? false}
+						oncleared={(status) => onCredentialsCleared('payments', status)}
+						saving={savingPayments}
+						onsave={savePayments}
+						testing={testingPayments}
+						testResult={paymentsTestResult}
+						ontest={testPayments}
+					/>
 				{/if}
 
 				{#if section === 'cards'}
@@ -3329,42 +3104,6 @@
 	.btn-save-section:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	.btn-test {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.btn-test:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.btn-test:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.test-result {
-		font-size: 0.85rem;
-		font-weight: 500;
-	}
-
-	.test-result.success {
-		color: var(--success);
-	}
-
-	.test-result.failure {
-		color: var(--danger);
 	}
 
 	label.switch-row {

@@ -1,4 +1,5 @@
 import { m } from '#lib/i18n/store.svelte.ts';
+import type { PaymentExecutionMode } from '#lib/types/paymentExecution.ts';
 
 /**
  * Field state of the `/organization` panels the page renders through a
@@ -151,4 +152,35 @@ export interface FraudRules {
 	stat_anomaly_sigma: number;
 	stat_anomaly_min_history: number;
 	personal_email_domains: string[];
+}
+
+/**
+ * Organization → Payments (`settings.payments`). `apiKey` / `webhookSecret`
+ * are write-only credentials, like every SecretField.
+ */
+export interface PaymentsFields {
+	mode: PaymentExecutionMode;
+	provider: string;
+	apiKey: string;
+	orgId: string;
+	originatingAccount: string;
+	webhookSecret: string;
+	sandbox: boolean;
+	cfoThreshold: number | null;
+}
+
+/**
+ * Organization → Payments → the record-only NACHA bank file
+ * (`settings.payments.nacha`, issue #517). The offset account number reads
+ * back masked, so `offsetAccount` starts blank; saving it blank keeps the
+ * stored number (decisions §432).
+ */
+export interface NachaFields {
+	companyName: string;
+	companyId: string;
+	odfiRouting: string;
+	bankName: string;
+	offsetRouting: string;
+	offsetAccount: string;
+	offsetAccountType: string;
 }
