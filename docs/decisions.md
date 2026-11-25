@@ -29970,3 +29970,62 @@ checked in full (white on `green.shade800`, about 5.1:1).
 `mobile/test/screens/invoice_detail_screen_test.dart` reads the button flag from
 the boundary's merged `getSemanticsData()` (what a screen reader is handed),
 not the boundary node alone.
+
+## 576. Sage Accounting and Sage Accounting ZA offer the orphan-bill lookup; their key is our correlation id, so it is not shared (§566 follow-up, round 49)
+
+**Context.** After §566 the orphan-bill lookup (`ErpAdapter.find_posted_bill`,
+§556) covered the mock, QuickBooks, Xero and NetSuite. The followups entry named
+Sage and Sage ZA among the adapters whose push lookup still lived inside
+`post_invoice`.
+
+**Decision.**
+
+- **Sage Accounting (v3.1)** offers it. The push's window (the supplier's
+  purchase invoices dated on the invoice date: `contact_id` +
+  `from_date`/`to_date`) moved into `_supplier_day_invoices`; the push still
+  stops at the first live namesake, as before. The lookup reads the whole
+  window and matches on the marker the push writes, `notes:
+  "FeohLedger <correlation id>"`, as a whole token, so `corr-1` never matches
+  `corr-10`'s notes (the push's own substring test is unchanged). The number,
+  total and currency come from the row; the status from `GET
+  purchase_invoices/{id}?show_payments_allocations=true`, the read
+  `get_invoice_status` makes, and a failed status read leaves a found bill
+  `unknown`, never a miss.
+- **Sage Accounting ZA** offers it on the push's own `_find_existing` window,
+  matched on `Reference == correlation id`, exactly as the push adopts. The
+  status is read from the row as `get_invoice_status` reads the record. The
+  currency is None: API 2.0.0 names a currency only by a numeric id. The bill
+  it names cannot be voided from FeohLedger (API 2.0.0 has no delete, §303),
+  so the lookup's value there is naming the bill for a person in Sage.
+- **Not shared.** Both keys carry the invoice's correlation id
+  (`invoices.correlation_id` is unique), so neither class sets
+  `bill_lookup_key_shared` and `shared_lookup_keys` answers empty with no
+  query; no Sage contact resolution was added to it.
+- **Raise, never "none", when it cannot tell.** Both raise on a payload the
+  push would refuse before any call (no linked supplier, no invoice date, no
+  correlation id), a page not answered 200 (a 401 or transport error in ZA), a
+  window past the page cap, a row with no id, two live bills carrying our
+  marker, and a live bill with the supplier's invoice number but not our
+  marker. That last is stricter than the push, which refuses it as a
+  duplicate: it may be our bill with the marker edited away in Sage, which the
+  lookup cannot tell from someone else's, so "none" would be a guess. The
+  person is told the ERP could not be searched (502 `erp_lookup_failed`) and
+  looks in Sage.
+
+**Verified vs not.** The v3.1 `PurchaseInvoice.currency` field (a `Base` link
+with `id` / `displayed_as` / `$path`) and the list endpoint's `attributes`
+parameter were checked on 2026-11-25 in Sage's published v3.1 Swagger as
+vendored in https://github.com/nook-io/python-sage/blob/HEAD/openapi.json
+(developer.sage.com blocks automated fetches). That the currency link's `id`
+is the ISO code is inferred from the push sending `currency_id` as one; any
+other value reads as None. Neither lookup was run against a live Sage company.
+No fake-erp route was needed: the existing Sage listing and detail routes
+serve both reads.
+
+**Tests.** `test_erp_sage_accounting_adapter.py` and
+`test_erp_sage_accounting_za_adapter.py` (found, read-only, the push's window;
+found past the first page; none; another invoice's bill never named, a
+namesake without our marker raises; two carrying our marker raise; every
+unreadable window raises; a payload the push would refuse raises before any
+call), `test_erp_orphan_bill.py` (both offer the lookup, neither key is shared,
+the served verdict offers it, `shared_lookup_keys` makes no query for Sage).

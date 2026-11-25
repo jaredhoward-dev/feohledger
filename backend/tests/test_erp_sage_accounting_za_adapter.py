@@ -1151,3 +1151,130 @@ def test_revoke_is_unsupported_and_calls_no_one():
     assert fake.requests == []
     assert SageAccountingZaAdapter.revokes_stored_access is False
     assert "password" in SageAccountingZaAdapter.provider_side_disconnect
+
+
+# ---------------------------------------------------------------------------
+# find_posted_bill — the orphan-bill lookup (decisions §556, §576)
+# ---------------------------------------------------------------------------
+
+
+def _lookup(fake: FakeSage, payload: InvoicePayload | None = None):
+    adapter = SageAccountingZaAdapter(CONFIG)
+    return _run(fake, lambda: adapter.find_posted_bill(payload or _payload()))
+
+
+def _only_gets(fake: FakeSage) -> None:
+    assert fake.requests and {r.method for r in fake.requests} == {"GET"}
+    assert all(p.startswith("SupplierInvoice/Get") for p in fake.paths())
+
+
+def test_the_lookup_is_offered_and_its_key_is_not_shared():
+    assert SageAccountingZaAdapter.supports_bill_lookup is True
+    assert SageAccountingZaAdapter.bill_lookup_key_shared is False
+
+
+def test_the_lookup_finds_our_push_by_its_reference_and_reads_only():
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=70, Reference="other", DocumentNumber="INV-0", Total=5, AmountDue=5),
+        _invoice(
+            ID=77, Reference=CORR, DocumentNumber="INV-1", Total=115.0, AmountDue=115.0, Paid=False
+        ),
+    ]
+    found = _lookup(fake)
+    assert found is not None
+    assert found.document_id == "77" and found.document_number == "INV-1"
+    assert found.amount == Decimal("115.0") and found.currency is None
+    assert found.status is ErpInvoiceStatus.open
+    _only_gets(fake)
+    # The push's own window: integers and dates only.
+    assert fake.requests[0].url.params["$filter"] == (
+        "SupplierId eq 12 and Date ge datetime'2026-01-01T00:00:00'"
+        " and Date lt datetime'2026-01-02T00:00:00'"
+    )
+
+
+def test_the_lookup_finds_our_push_past_the_first_page():
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=1000 + i, Reference=f"r{i}", DocumentNumber=f"X{i}", Total=1)
+        for i in range(100)
+    ] + [_invoice(ID=77, Reference=CORR, DocumentNumber="INV-1", Total=115.0, AmountDue=0)]
+    found = _lookup(fake)
+    assert found is not None and found.document_id == "77"
+
+
+def test_the_lookup_answers_none_when_the_window_holds_nothing_of_ours():
+    fake = FakeSage()
+    fake.invoices = [_invoice(ID=70, Reference="other", DocumentNumber="INV-0", Total=5)]
+    assert _lookup(fake) is None
+    _only_gets(fake)
+
+
+def test_the_lookup_never_names_another_invoices_bill():
+    """Same supplier, same day, same supplier number, another invoice's
+    correlation id in Reference: never named as ours, and never "none"
+    either (ours with its Reference edited is not knowable from it)."""
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(
+            ID=78,
+            Reference="9b2f3c1e-0000-4000-8000-000000000002",
+            DocumentNumber="INV-1",
+            Total=115,
+        )
+    ]
+    with pytest.raises(SageZaError):
+        _lookup(fake)
+    # A bill another invoice of ours pushed under another number is not ours.
+    fake.invoices = [
+        _invoice(ID=79, Reference=CORR + "0", DocumentNumber="INV-9", Total=115, AmountDue=115)
+    ]
+    assert _lookup(fake) is None
+
+
+def test_two_bills_carrying_our_reference_raise():
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=77, Reference=CORR, DocumentNumber="INV-1", Total=115, AmountDue=115),
+        _invoice(ID=80, Reference=CORR, DocumentNumber="INV-1", Total=115, AmountDue=115),
+    ]
+    with pytest.raises(SageZaError):
+        _lookup(fake)
+
+
+@pytest.mark.parametrize("status", [503, 429, 401])
+def test_a_lookup_sage_does_not_answer_raises_never_none(status):
+    fake = FakeSage()
+    fake.status["SupplierInvoice"] = status
+    with pytest.raises(SageZaError):
+        _lookup(fake)
+    assert fake.paths() == ["SupplierInvoice/Get"]
+
+
+def test_a_lookup_window_too_long_to_read_raises():
+    fake = FakeSage()
+    fake.invoices = [
+        _invoice(ID=1000 + i, Reference=f"r{i}", DocumentNumber=f"X{i}", Total=1)
+        for i in range(1001)
+    ]
+    with pytest.raises(SageZaError):
+        _lookup(fake)
+
+
+def test_a_row_without_an_id_raises():
+    fake = FakeSage()
+    fake.invoices = [_invoice(Reference=CORR, DocumentNumber="INV-1", Total=115)]
+    with pytest.raises(SageZaError):
+        _lookup(fake)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"vendor_erp_id": None}, {"vendor_erp_id": "V-1"}, {"invoice_date": None}],
+)
+def test_a_lookup_the_push_would_refuse_raises_before_any_call(overrides):
+    fake = FakeSage()
+    with pytest.raises(ValueError):
+        _lookup(fake, _payload(**overrides))
+    assert fake.requests == []

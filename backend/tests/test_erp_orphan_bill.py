@@ -103,6 +103,10 @@ def test_the_served_verdict_is_absent_off_a_candidate_and_coded_on_one():
         assert orphan_lookup_verdicts(failed, unknown, _user(), xero, key_shared=True)[KEY][
             "code"
         ] == ("erp_lookup_unsupported")
+        # Both Sage adapters offer it (§576): their key is our correlation id.
+        for sage in ("sage_accounting", "sage_accounting_za"):
+            erp = {"erp": {"type": sage, "integration_method": "direct"}}
+            assert orphan_lookup_verdicts(failed, unknown, _user(), erp) == {KEY: None}
         # Never pushed / pushed cleanly / holds its own bill / no invoice: absent.
         assert orphan_lookup_verdicts(failed, SimpleNamespace(state_data={}), _user(), None) == {}
         assert orphan_lookup_verdicts(failed, None, _user(), None) == {}
@@ -145,8 +149,9 @@ def test_only_adapters_with_a_lookup_offer_it():
         lookup_supported({"erp": {"type": "quickbooks_online", "integration_method": "direct"}})
         is True
     )
-    # Xero and NetSuite offer their push's own match too (decisions §566).
-    for erp in ("xero", "netsuite"):
+    # Xero and NetSuite offer their push's own match too (decisions §566), and
+    # both Sage adapters (§576).
+    for erp in ("xero", "netsuite", "sage_accounting", "sage_accounting_za"):
         assert lookup_supported({"erp": {"type": erp, "integration_method": "direct"}}) is True
     assert (
         lookup_supported({"erp": {"type": "dynamics_365_bc", "integration_method": "direct"}})
@@ -160,9 +165,21 @@ def test_only_xeros_key_is_marked_shared():
     other invoices (decisions §566)."""
     from app.services.erp_adapters.dispatcher import adapter_class
 
-    for key in ("mock", "quickbooks_online", "netsuite"):
+    for key in ("mock", "quickbooks_online", "netsuite", "sage_accounting", "sage_accounting_za"):
         assert getattr(adapter_class(key), "bill_lookup_key_shared", False) is False, key
     assert adapter_class("xero").bill_lookup_key_shared is True
+
+
+async def test_a_sage_key_is_never_checked_against_the_tenant():
+    """Both Sage keys carry our correlation id (§576), so no other invoice can
+    share one: `shared_lookup_keys` answers empty without a query."""
+    from app.services.erp_bill_void import shared_lookup_keys
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=AssertionError("no query")))
+    inv = SimpleNamespace(id=uuid.uuid4(), vendor_id=uuid.uuid4(), invoice_number="INV-1")
+    for sage in ("sage_accounting", "sage_accounting_za"):
+        settings = {"erp": {"type": sage, "integration_method": "direct"}}
+        assert await shared_lookup_keys(db, settings, [inv]) == set()
 
 
 async def test_the_mock_lookup_finds_what_it_posted_until_voided():

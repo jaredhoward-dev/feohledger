@@ -131,6 +131,7 @@ from app.services.erp_adapters.base import (
     ErpInvoiceStatus,
     ErpListingIncomplete,
     ErpPostResult,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
@@ -340,6 +341,10 @@ class SageAccountingZaAdapter(ErpAdapter):
     """Direct integration with Sage Business Cloud Accounting (South Africa)."""
 
     erp_type = "sage_accounting_za"
+    #: The push's idempotency lookup is offered on its own
+    #: (:meth:`find_posted_bill`, decisions §576). Its key is our correlation
+    #: id in ``Reference``, unique to one invoice, so it is not shared.
+    supports_bill_lookup = True
     # Nothing to revoke (decisions §400): every call sends the Sage user's own
     # login in HTTP Basic plus the integrator API key, and no token is ever
     # issued. The API's only token resource, `DELETE CoreTokens/Delete`, is
@@ -601,6 +606,59 @@ class SageAccountingZaAdapter(ErpAdapter):
             if len(batch) < _PAGE_SIZE or (total is not None and len(rows) >= total):
                 return rows
         return LOOKUP_INCOMPLETE
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The bill an earlier push of ``payload`` left in Sage, read-only
+        (decisions §556, §576): the push's own window (:meth:`_find_existing`,
+        this supplier's invoices dated on the invoice date), matched as the
+        push matches it, on ``Reference`` equal to our correlation id. That id is
+        unique per invoice (``invoices.correlation_id``), so the bill found is
+        this invoice's push or nothing, never another invoice's: the key is not
+        shared (:attr:`bill_lookup_key_shared` stays False).
+
+        Raises rather than answer "none" on anything it cannot read plainly: a
+        payload the push would refuse before any call (no linked supplier, no
+        invoice date, no correlation id), a 401 or transport error
+        (:class:`SageZaError`), a window it cannot read whole, a row without an
+        ID, more than one invoice carrying our Reference, or an invoice with
+        the supplier's number but not our Reference (our bill with its
+        Reference edited is not knowable from someone else's, and the push
+        refuses that window as a duplicate). The status is read from the row
+        as :meth:`get_invoice_status` reads the record. The currency is None:
+        the API reports a currency only as a numeric id, never an ISO code
+        (module docstring). GETs only."""
+        supplier_id = _int_id(payload.vendor_erp_id)
+        if supplier_id is None:
+            raise ValueError(VENDOR_NOT_LINKED)
+        if payload.invoice_date is None:
+            raise ValueError("sage za bill lookup: no invoice date")
+        correlation_id = str(payload.correlation_id or "").strip()
+        if not correlation_id:
+            raise ValueError("sage za bill lookup: no correlation id")
+        base = await self._base()
+        async with self._client(30) as client:
+            existing = await self._find_existing(client, base, supplier_id, payload.invoice_date)
+        if isinstance(existing, str):
+            raise SageZaError(f"{PROVIDER} bill lookup failed: {existing}")
+        if any(_int_id(row.get("ID")) is None for row in existing):
+            raise SageZaError(f"{PROVIDER} bill lookup failed: a row without an ID")
+        ours = [row for row in existing if row.get("Reference") == correlation_id]
+        if not ours:
+            if any(row.get("DocumentNumber") == payload.invoice_number for row in existing):
+                raise SageZaError(
+                    f"{PROVIDER} bill lookup failed: a namesake without our Reference"
+                )
+            return None
+        if len(ours) > 1:
+            raise SageZaError(f"{PROVIDER} bill lookup failed: more than one carries our Reference")
+        bill = ours[0]
+        return FoundBill(
+            document_id=str(_int_id(bill.get("ID"))),
+            document_number=str(bill.get("DocumentNumber") or "") or None,
+            amount=_decimal(bill.get("Total")),
+            currency=None,
+            status=map_invoice_status(bill),
+        )
 
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         supplier_id = _int_id(payload.vendor_erp_id)

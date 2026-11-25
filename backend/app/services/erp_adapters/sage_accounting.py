@@ -66,6 +66,7 @@ and ``backend/docs/erp-integration.md`` § Sage Business Cloud Accounting.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 from decimal import Decimal
 
@@ -77,6 +78,7 @@ from app.services.erp_adapters.base import (
     ErpInvoiceStatus,
     ErpListingIncomplete,
     ErpPostResult,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
@@ -105,6 +107,7 @@ from app.services.erp_adapters.oauth_base import (
 )
 from app.services.erp_adapters.posted_total import check_posted_total
 from app.services.erp_oauth import register_oauth_provider
+from app.utils.currency_code import iso_currency_or_none
 from app.utils.json_money import dumps_exact_json
 
 PROVIDER = "Sage Accounting"
@@ -220,6 +223,14 @@ _LEDGER_TYPE_MAP = {
 _PAGE_SIZE = 200  # Sage's maximum items_per_page
 _PAGE_CAP = 10
 _MARKER_PREFIX = "FeohLedger"
+#: What the push's pre-create lookup reads of each invoice in its window.
+_PUSH_LOOKUP_ATTRIBUTES = "vendor_reference,notes,total_amount,status,deleted_at"
+#: The orphan-bill lookup reads the currency too: ``currency`` is a link
+#: (``Base``: ``id`` / ``displayed_as`` / ``$path``) on ``PurchaseInvoice`` in
+#: Sage's published v3.1 Swagger (checked 2026-11-25 as vendored in
+#: https://github.com/nook-io/python-sage/blob/HEAD/openapi.json), and its id is
+#: the ISO code the push sends as ``currency_id``. Anything else reads as None.
+_BILL_LOOKUP_ATTRIBUTES = f"{_PUSH_LOOKUP_ATTRIBUTES},currency"
 
 
 def _api_base() -> str:
@@ -244,6 +255,26 @@ def _decimal(value) -> Decimal | None:
 
 def _marker(correlation_id: str) -> str:
     return f"{_MARKER_PREFIX} {correlation_id}"
+
+
+def _carries_marker(notes: object, correlation_id: str) -> bool:
+    """Whether ``notes`` holds our marker for ``correlation_id`` as a whole
+    token: ``FeohLedger corr-1`` never matches the notes of ``corr-10``."""
+    if not isinstance(notes, str):
+        return False
+    pattern = rf"(?<!\S){re.escape(_marker(correlation_id))}(?!\S)"
+    return re.search(pattern, notes) is not None
+
+
+def _live(row: dict) -> bool:
+    """Not voided and not deleted: the invoices a push's lookup counts."""
+    return (row.get("status") or {}).get("id") != "VOID" and not row.get("deleted_at")
+
+
+class SageBillLookupError(RuntimeError):
+    """:meth:`SageAccountingAdapter.find_posted_bill` could not name the bill
+    or say there is none (``erp_bill_void.find_orphan`` answers
+    ``erp_lookup_failed``). PII-free: names the reason, never a field value."""
 
 
 def _failure(resp) -> ErpPostResult:
@@ -275,6 +306,10 @@ class SageAccountingAdapter(OAuthErpAdapter):
 
     erp_type = "sage_accounting"
     oauth_provider = SAGE_ACCOUNTING_OAUTH
+    #: The push's idempotency lookup is offered on its own
+    #: (:meth:`find_posted_bill`, decisions §576). Its key is our correlation
+    #: marker in ``notes``, unique to one invoice, so it is not shared.
+    supports_bill_lookup = True
 
     @classmethod
     async def list_external_tenants(
@@ -319,22 +354,25 @@ class SageAccountingAdapter(OAuthErpAdapter):
 
     # -- post ---------------------------------------------------------------
 
-    async def _find_existing(self, client, headers, payload: InvoicePayload) -> dict | None:
-        """Pre-create idempotency lookup. Sage has no idempotency key, so this
-        is the only guard, and it fails closed (``_HttpFailure``) when it cannot
-        answer.
-
-        Scans this supplier's invoices dated on the invoice date (``contact_id``
-        + ``from_date``/``to_date`` are exact filters; ``search`` matches names
-        and references loosely) for a live one with our ``vendor_reference``.
-        """
+    async def _supplier_day_invoices(
+        self, client, headers, payload: InvoicePayload, *, attributes: str, stop=None
+    ) -> list[dict]:
+        """This supplier's invoices dated on the invoice date, page by page
+        (``contact_id`` + ``from_date``/``to_date`` are exact filters; ``search``
+        matches names and references loosely). ``stop(row)`` ends the walk at
+        the first row it accepts. Raises ``_HttpFailure`` on a page Sage does not
+        answer 200, and ``BillRefusal(LOOKUP_INCOMPLETE)`` past ``_PAGE_CAP``
+        pages: neither is ever read as "not there"."""
+        if payload.invoice_date is None:  # every caller refuses this first
+            raise ValueError("sage invoice lookup: no invoice date")
         params = {
             "contact_id": payload.vendor_erp_id,
             "from_date": payload.invoice_date.isoformat(),
             "to_date": payload.invoice_date.isoformat(),
-            "attributes": "vendor_reference,notes,total_amount,status,deleted_at",
+            "attributes": attributes,
             "items_per_page": _PAGE_SIZE,
         }
+        rows: list[dict] = []
         for page in range(1, _PAGE_CAP + 1):
             resp = await client.get(
                 f"{_api_base()}/purchase_invoices",
@@ -345,18 +383,89 @@ class SageAccountingAdapter(OAuthErpAdapter):
                 raise _HttpFailure(resp)
             body = _json(resp)
             for row in body.get("$items") or []:
-                status_id = (row.get("status") or {}).get("id")
-                if (
-                    row.get("vendor_reference") == payload.invoice_number
-                    and status_id != "VOID"
-                    and not row.get("deleted_at")
-                ):
-                    return row
+                rows.append(row)
+                if stop is not None and stop(row):
+                    return rows
             if not body.get("$next"):
-                return None
+                return rows
         # More than _PAGE_CAP pages of one supplier's invoices on one date is
         # not a lookup we can complete; refuse rather than risk a duplicate.
         raise BillRefusal(LOOKUP_INCOMPLETE)
+
+    async def _find_existing(self, client, headers, payload: InvoicePayload) -> dict | None:
+        """Pre-create idempotency lookup. Sage has no idempotency key, so this
+        is the only guard, and it fails closed (``_HttpFailure``) when it cannot
+        answer: the first live invoice of :meth:`_supplier_day_invoices` with
+        our ``vendor_reference``.
+        """
+
+        def namesake(row: dict) -> bool:
+            return _live(row) and row.get("vendor_reference") == payload.invoice_number
+
+        rows = await self._supplier_day_invoices(
+            client, headers, payload, attributes=_PUSH_LOOKUP_ATTRIBUTES, stop=namesake
+        )
+        return next((row for row in rows if namesake(row)), None)
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The bill an earlier push of ``payload`` left in Sage, read-only
+        (decisions §556, §576): the push's own window
+        (:meth:`_supplier_day_invoices`), matched on the marker the push writes
+        into ``notes`` (``FeohLedger <correlation id>``). The correlation id is
+        unique per invoice (``invoices.correlation_id``), so the bill found is
+        this invoice's push or nothing, never another invoice's: the key is
+        not shared (:attr:`bill_lookup_key_shared` stays False).
+
+        Raises rather than answer "none" on anything it cannot read plainly: a
+        payload the push would refuse before sending (no linked supplier, no
+        invoice date, no correlation id), a page Sage does not answer 200 or a
+        window past the page cap, more than one live invoice carrying our
+        marker, one with no id, or a live invoice with our supplier reference
+        but without our marker (our bill with its notes edited is not
+        knowable from someone else's, and the push refuses that window as a
+        duplicate). The status is read as :meth:`get_invoice_status` reads it
+        (payments and allocations); a read that fails leaves it ``unknown`` on
+        a bill that WAS found, never a miss. GETs only."""
+        if not payload.vendor_erp_id:
+            raise ValueError(VENDOR_NOT_LINKED)
+        if payload.invoice_date is None:
+            raise ValueError("sage bill lookup: no invoice date")
+        correlation_id = str(payload.correlation_id or "").strip()
+        if not correlation_id:
+            raise ValueError("sage bill lookup: no correlation id")
+        headers = await self._headers()
+        async with self.oauth_client(timeout=30) as client:
+            try:
+                rows = await self._supplier_day_invoices(
+                    client, headers, payload, attributes=_BILL_LOOKUP_ATTRIBUTES
+                )
+            except _HttpFailure as failure:
+                raise SageBillLookupError(
+                    f"lookup answered HTTP {failure.resp.status_code}"
+                ) from None
+            except BillRefusal as refusal:
+                raise SageBillLookupError(refusal.reason) from None
+            live = [row for row in rows if isinstance(row, dict) and _live(row)]
+            ours = [row for row in live if _carries_marker(row.get("notes"), correlation_id)]
+            if not ours:
+                if any(row.get("vendor_reference") == payload.invoice_number for row in live):
+                    raise SageBillLookupError("a live namesake without our marker")
+                return None
+            if len(ours) > 1:
+                raise SageBillLookupError("more than one live invoice carries our marker")
+            bill = ours[0]
+            bill_id = str(bill.get("id") or "").strip()
+            if not bill_id:
+                raise SageBillLookupError("the matched invoice has no id")
+            invoice = await self._get_invoice(client, headers, bill_id)
+        currency = bill.get("currency") if isinstance(bill.get("currency"), dict) else {}
+        return FoundBill(
+            document_id=bill_id,
+            document_number=bill.get("vendor_reference") or None,
+            amount=_decimal(bill.get("total_amount")),
+            currency=iso_currency_or_none(currency.get("id")),
+            status=ErpInvoiceStatus.unknown if invoice is None else map_invoice_status(invoice),
+        )
 
     async def _ledger_tax_rates(self, client, headers, account_ids: set[str]) -> dict[str, str]:
         """Each ledger account's default tax rate id, from the customer's chart."""
