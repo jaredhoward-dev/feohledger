@@ -322,6 +322,11 @@ export const messages = {
 	'org.erp.field.discount_credit_account': "割引クレジットの勘定",
 	'org.erp.help.discountCreditAccount': "割引を記帳する勘定科目表の勘定です。割引クレジットがオンの間は必須です。",
 	'org.erp.pickAccount': "勘定を選択",
+	'org.erp.glChart.loading': '勘定科目を読み込み中…',
+	'org.erp.glChart.loadFailed': '勘定科目表を読み込めませんでした。',
+	'org.erp.glChart.empty':
+		'まだ同期された勘定科目がありません。割引クレジットを計上できるのは、全エンティティで共有され ERP と連携された勘定科目のみです — まず勘定科目表を同期してください。',
+	'org.erp.glChart.openChart': '勘定科目表を開く',
 	'org.erp.help.sageZaUsername': 'Sage へのサインインに使うメールアドレスです。',
 	'org.erp.help.sageZaBaseUrl': 'Sage パートナーのエンドポイントを使う場合のみ入力します。空欄の場合は Sage の南アフリカ向け API を使用します。',
 	'org.erp.help.byoApp': 'ERP に独自のアプリを登録した場合のみ入力してください。',

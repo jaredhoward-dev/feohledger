@@ -323,6 +323,11 @@ export const messages = {
 	'org.erp.field.discount_credit_account': "Compte des avoirs d’escompte",
 	'org.erp.help.discountCreditAccount': "Le compte de votre plan comptable sur lequel l’escompte est comptabilisé. Obligatoire tant que les avoirs d’escompte sont activés.",
 	'org.erp.pickAccount': "Choisissez un compte",
+	'org.erp.glChart.loading': 'Chargement des comptes…',
+	'org.erp.glChart.loadFailed': 'Impossible de charger votre plan comptable.',
+	'org.erp.glChart.empty':
+		'Aucun compte synchronisé pour l\'instant. Seuls les comptes partagés entre entités et liés à votre ERP peuvent recevoir l\'avoir d\'escompte — synchronisez d\'abord votre plan comptable.',
+	'org.erp.glChart.openChart': 'Ouvrir le plan comptable',
 	'org.erp.help.sageZaUsername': 'L\'adresse e-mail avec laquelle vous vous connectez à Sage.',
 	'org.erp.help.sageZaBaseUrl': 'Uniquement pour un point de terminaison partenaire Sage. Laissez vide pour utiliser l\'API sud-africaine de Sage.',
 	'org.erp.help.byoApp': 'Uniquement si vous avez enregistré votre propre application auprès de l\'ERP.',

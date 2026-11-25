@@ -323,6 +323,11 @@ export const messages = {
 	'org.erp.field.discount_credit_account': "Konto für Skontogutschriften",
 	'org.erp.help.discountCreditAccount': "Das Konto in Ihrem Kontenplan, auf das das Skonto gebucht wird. Erforderlich, solange Skontogutschriften aktiv sind.",
 	'org.erp.pickAccount': "Konto auswählen",
+	'org.erp.glChart.loading': 'Konten werden geladen…',
+	'org.erp.glChart.loadFailed': 'Ihr Kontenplan konnte nicht geladen werden.',
+	'org.erp.glChart.empty':
+		'Noch keine Konten synchronisiert. Nur Konten, die für alle Einheiten gelten und mit Ihrem ERP verknüpft sind, können die Skontogutschrift aufnehmen — synchronisieren Sie zuerst Ihren Kontenplan.',
+	'org.erp.glChart.openChart': 'Kontenplan öffnen',
 	'org.erp.help.sageZaUsername': 'Die E-Mail-Adresse, mit der Sie sich bei Sage anmelden.',
 	'org.erp.help.sageZaBaseUrl': 'Nur für einen Sage-Partner-Endpunkt. Leer lassen, um die südafrikanische API von Sage zu verwenden.',
 	'org.erp.help.byoApp': 'Nur wenn Sie eine eigene App beim ERP registriert haben.',

@@ -724,18 +724,55 @@ export function callUsageLines(
 	return lines;
 }
 
+/** One synced chart row, as much of it as the account picker reads. */
+export type GlChartRow = {
+	code: string;
+	name: string;
+	/** `null` = shared across every entity (`types/glAccount.ts`). */
+	entity_id: string | null;
+	/** The account's id in the connected ERP; `null` = never linked. */
+	erp_account_id: string | null;
+};
+
 /**
- * The options of a `picker: 'gl_account'` field: every account of the chart as
- * `code — name`, sorted by code, and the stored code kept even when the chart
- * no longer lists it (or has not loaded yet), so opening the form never
- * silently clears a saved choice.
+ * The accounts a `picker: 'gl_account'` field may offer: the ones the payment
+ * write-back can resolve to an ERP account when it books the discount credit
+ * (decisions §575), which are exactly the ones saving accepts —
+ *
+ * - **shared** (`entity_id` null): the ERP connection is the org's, so the
+ *   account is resolved in the shared chart, never one subsidiary's override;
+ * - **ERP-linked** (`erp_account_id` set): the credit line names the ERP's own
+ *   account id, so an account that was only ever created here has nothing to
+ *   name.
+ *
+ * Deduplicated by code AFTER that filter, first row wins: the shared chart
+ * holds one row per code, so the dedupe only drops a repeated row, and the
+ * filter running first means an entity override of the same code can never
+ * displace the shared account it overrides.
+ */
+export function discountCreditAccounts<T extends GlChartRow>(chart: readonly T[] | null): T[] {
+	const out = new Map<string, T>();
+	for (const a of chart ?? []) {
+		if (a.entity_id !== null || !a.erp_account_id) continue;
+		if (!out.has(a.code)) out.set(a.code, a);
+	}
+	return [...out.values()];
+}
+
+/**
+ * The options of a `picker: 'gl_account'` field: every account
+ * {@link discountCreditAccounts} offers, as `code — name`, sorted by code, and
+ * the stored code kept even when the chart no longer offers it (or has not
+ * loaded yet), so opening the form never silently clears a saved choice.
  */
 export function glChartOptions(
-	chart: readonly { code: string; name: string }[] | null,
+	chart: readonly GlChartRow[] | null,
 	current: string | undefined
 ): { code: string; label: string }[] {
 	const out = new Map<string, string>();
-	for (const a of chart ?? []) out.set(a.code, a.name ? `${a.code} — ${a.name}` : a.code);
+	for (const a of discountCreditAccounts(chart)) {
+		out.set(a.code, a.name ? `${a.code} — ${a.name}` : a.code);
+	}
 	if (current && !out.has(current)) out.set(current, current);
 	return [...out.entries()]
 		.sort(([a], [b]) => a.localeCompare(b))

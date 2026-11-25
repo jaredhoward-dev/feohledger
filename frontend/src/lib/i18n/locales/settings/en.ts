@@ -329,6 +329,11 @@ export const enSettings = {
 	'org.erp.field.discount_credit_account': "Discount credit account",
 	'org.erp.help.discountCreditAccount': "The account in your chart the discount is booked to. Required while discount credits are on.",
 	'org.erp.pickAccount': "Choose an account",
+	'org.erp.glChart.loading': 'Loading accounts…',
+	'org.erp.glChart.loadFailed': 'Couldn\'t load your chart of accounts.',
+	'org.erp.glChart.empty':
+		'No accounts synced yet. Only accounts shared across entities and linked to your ERP can take the discount credit — sync your chart first.',
+	'org.erp.glChart.openChart': 'Open the chart of accounts',
 	'org.erp.help.sageZaUsername': 'The email address you sign in to Sage with.',
 	'org.erp.help.sageZaBaseUrl': 'Only for a Sage partner endpoint. Leave blank to use Sage\'s South African API.',
 	'org.erp.help.byoApp': 'Only if you registered your own app with the ERP.',

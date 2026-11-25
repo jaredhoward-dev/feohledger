@@ -323,6 +323,11 @@ export const messages = {
 	'org.erp.field.discount_credit_account': "Conta do crédito de desconto",
 	'org.erp.help.discountCreditAccount': "A conta do seu plano de contas na qual o desconto é lançado. Obrigatória enquanto os créditos de desconto estiverem ativados.",
 	'org.erp.pickAccount': "Escolha uma conta",
+	'org.erp.glChart.loading': 'Carregando contas…',
+	'org.erp.glChart.loadFailed': 'Não foi possível carregar seu plano de contas.',
+	'org.erp.glChart.empty':
+		'Nenhuma conta sincronizada ainda. Somente contas compartilhadas entre entidades e vinculadas ao seu ERP podem receber o crédito de desconto — sincronize seu plano de contas primeiro.',
+	'org.erp.glChart.openChart': 'Abrir o plano de contas',
 	'org.erp.help.sageZaUsername': 'O e-mail com que você entra no Sage.',
 	'org.erp.help.sageZaBaseUrl': 'Somente para um endpoint de parceiro da Sage. Deixe em branco para usar a API da Sage para a África do Sul.',
 	'org.erp.help.byoApp': 'Somente se você registrou seu próprio aplicativo no ERP.',
