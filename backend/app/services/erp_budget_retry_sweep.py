@@ -76,7 +76,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
-from sqlalchemy import exists, not_, select, true
+from sqlalchemy import exists, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.config import settings
@@ -97,8 +97,11 @@ BUDGET_RESEND_TRIGGER = "erp_call_budget_reset"
 BUDGET_RESEND_REFUSED_ACTION = "invoice.erp_budget_resend_refused"
 
 ERP_FAILED_ACTION = "invoice.erp_failed"
-#: Rows that read the trail without changing anything about the invoice.
-READ_ONLY_ACTIONS = ("audit.viewed", "audit.exported")
+#: Action suffixes of rows that read a record without changing it: ``log_access``
+#: writes ``<entity_type>.viewed`` and the auditor export ``audit.exported``
+#: (the same reads ``access_review`` discounts). Matched by suffix, so a read of
+#: the invoice or its trail never counts as the invoice having changed.
+READ_ONLY_ACTION_SUFFIXES = (".viewed", ".exported")
 
 
 @dataclass
@@ -152,7 +155,7 @@ def _candidates_query(*, floor: datetime, invoice_id: uuid.UUID | None = None):
         AuditLog.correlation_id == Invoice.correlation_id,
         AuditLog.entity_id == Invoice.id,
         AuditLog.created_at > refusal.c.created_at,
-        AuditLog.action.not_in(READ_ONLY_ACTIONS),
+        not_(or_(*(AuditLog.action.endswith(s) for s in READ_ONLY_ACTION_SUFFIXES))),
     )
     query = (
         select(Invoice.id, refusal.c.id.label("refusal_id"), refusal.c.details)

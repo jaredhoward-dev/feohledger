@@ -29,6 +29,7 @@ export const enAudit = {
 	'audit.action.auth.password_reset.completed': "Password reset completed",
 	'audit.action.auth.legal.accepted': "Terms and Privacy Policy accepted",
 	'audit.action.auth.password_reset.requested': "Password reset requested",
+	'audit.action.auth.workspace_lookup.emailed': "Workspace address emailed",
 	'audit.action.auth.saml.login.failure': "SAML sign-in failed",
 	'audit.action.auth.saml.login.success': "Signed in with SAML",
 	'audit.action.auth.scim.role_granted': "Role granted by SCIM",

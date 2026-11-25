@@ -26,6 +26,7 @@ export const messages = {
 	'audit.action.auth.password_reset.completed': "パスワード再設定完了",
 	'audit.action.auth.legal.accepted': "利用規約とプライバシーポリシーに同意",
 	'audit.action.auth.password_reset.requested': "パスワード再設定を要求",
+	'audit.action.auth.workspace_lookup.emailed': "ワークスペースのアドレスをメール送信",
 	'audit.action.auth.saml.login.failure': "SAMLサインイン失敗",
 	'audit.action.auth.saml.login.success': "SAMLでサインイン",
 	'audit.action.auth.scim.role_granted': "SCIMでロール付与",

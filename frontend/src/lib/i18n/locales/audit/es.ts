@@ -26,6 +26,7 @@ export const messages = {
 	'audit.action.auth.password_reset.completed': "Restablecimiento de contraseña completado",
 	'audit.action.auth.legal.accepted': "Términos y política de privacidad aceptados",
 	'audit.action.auth.password_reset.requested': "Restablecimiento de contraseña solicitado",
+	'audit.action.auth.workspace_lookup.emailed': "Dirección del espacio de trabajo enviada por correo",
 	'audit.action.auth.saml.login.failure': "Inicio de sesión SAML fallido",
 	'audit.action.auth.saml.login.success': "Sesión iniciada con SAML",
 	'audit.action.auth.scim.role_granted': "Rol concedido por SCIM",

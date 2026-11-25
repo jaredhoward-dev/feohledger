@@ -26,6 +26,7 @@ export const messages = {
 	'audit.action.auth.password_reset.completed': "Réinitialisation du mot de passe terminée",
 	'audit.action.auth.legal.accepted': "Conditions et politique de confidentialité acceptées",
 	'audit.action.auth.password_reset.requested': "Réinitialisation du mot de passe demandée",
+	'audit.action.auth.workspace_lookup.emailed': "Adresse de l’espace de travail envoyée par e-mail",
 	'audit.action.auth.saml.login.failure': "Échec de connexion SAML",
 	'audit.action.auth.saml.login.success': "Connexion SAML réussie",
 	'audit.action.auth.scim.role_granted': "Rôle accordé par SCIM",
