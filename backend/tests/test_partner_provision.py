@@ -388,3 +388,36 @@ async def test_provision_without_a_tenant_url_is_refused_before_creating(realdb,
         assert created is None
     finally:
         await _drop_provisioned(realdb, slug)
+
+
+@pytest.mark.asyncio
+async def test_provision_rechecks_the_capability_under_the_partner_lock(realdb, monkeypatch):
+    """Decisions §578: an operator revoke that commits after the route's
+    (unlocked) capability check but before the partner's row is locked is seen
+    by the re-read under that lock — refused coded, nothing provisioned."""
+    from app.api import partner as partner_api
+    from tests.partner_capability_helpers import set_is_partner
+
+    real_lock = partner_api.lock_organization
+
+    async def _revoked_meanwhile(db, org):
+        await set_is_partner(realdb, "a", False)  # the operator's revoke commits
+        return await real_lock(db, org)
+
+    monkeypatch.setattr(partner_api, "lock_organization", _revoked_meanwhile)
+    provisioned = []
+
+    async def _never(**kwargs):  # pragma: no cover - reaching it is the failure
+        provisioned.append(kwargs)
+        raise AssertionError("provisioned after the capability was revoked")
+
+    monkeypatch.setattr(partner_api, "provision_tenant", _never)
+    slug = _unique_slug()
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post(
+            "/api/partner/children/provision",
+            json={"name": "Late Co", "slug": slug, "admin_email": f"a@{slug}.test"},
+        )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "partner_capability_required"
+    assert provisioned == []

@@ -116,6 +116,17 @@ async def require_partner_capability(
     ``get_tenant`` chokepoint's org (JWT ``org`` claim cross-checked), so the
     flag read is the caller's own workspace's, never a header's choice.
     """
+    _require_partner(org)
+    return org
+
+
+def _require_partner(org: Organization) -> None:
+    """The coded 403 unless ``org`` holds the capability. Attach and provision
+    call it again on the row re-read under its lock: the dependency's read is
+    unlocked; an operator revoke (`services/partner_capability`)
+    counts children under the same row lock, so a link written after this check
+    is one the revoke either waited for and counted, or never saw because it
+    committed first and this re-read sees ``is_partner`` false (decisions §578)."""
     if not org.is_partner:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -124,7 +135,32 @@ async def require_partner_capability(
                 "This workspace is not set up as a partner.",
             ),
         )
-    return org
+
+
+async def _lock_partner_and_child(
+    db: AsyncSession, partner: Organization, child_id: uuid.UUID
+) -> tuple[Organization, Organization | None]:
+    """Lock the partner's row and the child's in ONE statement, in id order.
+
+    The partner's lock is what serializes a link with an operator revoke; the
+    child's with another partner adopting it. One fixed order (by id, never
+    "the caller's first") means two attaches naming each other's org cannot
+    deadlock (decisions §578)."""
+    rows = (
+        (
+            await db.execute(
+                select(Organization)
+                .where(Organization.id.in_([partner.id, child_id]))
+                .order_by(Organization.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {row.id: row for row in rows}
+    return by_id[partner.id], by_id.get(child_id)
 
 
 class ChildTenantSummary(BaseModel):
@@ -417,6 +453,14 @@ async def provision_child(
 
     admin_name = body.admin_name or f"{body.name} Admin"
 
+    # Lock the partner's row for the rest of this transaction and re-check the
+    # capability under it, so an operator revoke (which counts children under the
+    # same lock) cannot commit between this check and the parent link below
+    # (decisions §578). Held across provisioning: the new tenant is born
+    # parented, or not at all.
+    org = await lock_organization(db, org)
+    _require_partner(org)
+
     # provision_tenant owns the orphan-DB rollback: if the control-plane insert
     # or tenant-table creation fails after CREATE DATABASE, it drops the DB it
     # created. We never half-create. A slug that raced past the pre-check trips
@@ -572,7 +616,12 @@ async def attach_child(
             detail="This link code has already been used.",
         )
 
-    child = await db.get(Organization, child_id)
+    # Lock both rows (one statement, id order) and re-check the capability under
+    # the partner's lock: an operator revoke counts children under that same
+    # lock, so it either waits for this link and refuses, or commits first and
+    # this re-read refuses (decisions §578).
+    org, child = await _lock_partner_and_child(db, org, child_id)
+    _require_partner(org)
     if child is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
