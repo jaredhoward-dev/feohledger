@@ -117,6 +117,9 @@
 		status: string;
 		applied_at: string | null;
 		applied_by: string | null;
+		/** The accepted discount offer this memo takes, when it is one
+		 *  (`POST /api/credit-memos` with `discount_offer_id`; decisions §520). */
+		discount_offer_id: string | null;
 		created_at: string;
 		/** The CALLER's verdict on the row's three actions — each `null` when
 		 *  its endpoint would accept them, else the coded refusal

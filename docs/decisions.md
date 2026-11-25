@@ -26522,6 +26522,75 @@ for a case the hold's sentence already states; the status stays the amount
 and quantity legs'. *Valuing over-received units on a line*: units nobody
 ordered cover nothing that was ordered.
 
+## 520. A credit memo is the discount only when it names the offer (migration 0145, round 42)
+
+§250 read an applied credit memo for exactly an accepted offer's savings as
+the discount already taken, because the pre-0104 workaround produced exactly
+such memos. Nothing recorded which memos those were, so a return credit that
+happened to equal the savings suppressed the discount (the buyer paid one
+discount too much), and the settlement's amount-match fallback, which captured
+any accepted offer whose discounted payoff equalled the payment, then recorded
+that offer as captured: realized savings on the dashboard for a discount nobody
+took. The same fallback fired with no deduction at all, once the deadline had
+passed and the run paid net of an equal return credit.
+
+**A link, not a reason.** `credit_memos.discount_offer_id` is a nullable FK to
+`discount_offers` (`ON DELETE SET NULL`, as `payments.discount_offer_id`), with
+a partial unique index allowing one non-void memo per offer. A typed reason
+(`kind = 'discount'`) was rejected: it says a memo is *a* discount but not
+*which* offer, and the capture leg needs the offer to mark captured and to
+re-check currency; inferring the offer from the invoice would reintroduce a
+guess when an invoice carries two accepted offers.
+
+**Who sets it.** No code books a discount as a memo; since §250 the run deducts
+it. The only "path that books a discount as a memo" is a person creating one,
+so `POST /api/credit-memos` takes an optional `discount_offer_id` and is the
+only writer. It requires `invoice_id` (the memo is created applied) and refuses
+unless the memo is exactly the discount: an invoice-scoped `accepted` offer with
+a tier, on that invoice, in the memo's currency, still priced on the invoice's
+amount, for its savings to the cent; no other live linked memo on the invoice
+(one invoice takes one discount, matching the payment path's rule); and no live
+payment on the invoice at all. One booked with the offer would deduct it twice;
+one already sent at the full amount would, on settling, capture the offer
+through the memo for savings nobody took (a money-path review finding: the
+capture fallback trusts that a linked memo was netted, so the link must come
+before any payment). The deadline is not checked: a credit the supplier
+issued for the discount is what they agreed, whenever it is keyed. The link is
+not editable: a linked memo is born applied, and only open memos are editable.
+There is no screen for it. Since §250 the help has told users not to record
+such memos, and a screen would invite the double entry the run already
+prevents.
+
+**Where the amount match was used, and what replaces it.**
+`discount_capture.applicable_discounts` now skips the deduction only for an
+invoice with an applied memo that names an offer. The capture fallback
+(`capture_offers_for_settled_payment`, for a payment that booked no discount)
+captures only the offer such a memo names, for the memo's amount, stamped with
+the payment so a void reverses exactly it. A payment with no linked memo
+captures nothing. Nothing else in the code compared a memo amount with savings.
+
+**Pre-0145 rows: NULL, and nothing is inferred.** Every memo written before the
+migration is an ordinary credit. Backfilling by amount would write the guess
+into the data. For a return credit that is the right answer, and that is what
+this fixes. For an old workaround memo it has two effects. First, if its
+invoice is still unpaid and the accepted offer's deadline has not passed, the
+run deducts the discount again and short-pays the supplier by it. This needs a
+memo recorded against the help text in force since §250, on an offer whose
+window (normally days) is still open at deploy, so the exposure is small and
+ends with those deadlines. The run screen shows the offer beside the invoice,
+and voiding the run or the payment is the remedy. Second, such an invoice paid
+from now on with no discount booked leaves the offer `accepted`, which
+under-reports savings rather than inventing them. That trade was chosen over
+keeping the amount match for old rows: it would keep the defect for every
+existing return credit, and "created before 0145" is the calendar cutoff §250
+already rejected.
+
+Rejected: keeping the amount match as a tie-breaker behind the link (it is the
+bug); refusing a run when an unlinked memo equals the savings (the ambiguity
+§250 found nothing could resolve; the link now resolves it at the source);
+linking through `PATCH` (it would let an applied money record change meaning
+after the fact).
+
 ## 521. A push the ERP call budget refused is re-sent by a sweep after the reset, through the retry path (round 42)
 
 **Problem.** A push to an ERP whose API quota several tenants share (Blackbaud's

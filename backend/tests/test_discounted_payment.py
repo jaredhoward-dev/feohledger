@@ -19,8 +19,9 @@ here, against real Postgres rows and the real HTTP surface:
 * a deadline that passes while the run waits fails the payment retry-safe as
   `discount_changed` before any adapter call — never a silent re-price — and
   `/retry-failed` will not re-send it;
-* a discount already taken through a credit memo (the old way) is not
-  deducted a second time;
+* a discount taken through a credit memo that names the offer is not
+  deducted a second time, while a return credit that merely equals the
+  savings is an ordinary credit and suppresses nothing (decisions §520);
 * an offer that cannot be honoured (expired, other currency, base amount no
   longer the invoice's, vendor-scoped) pays the invoice in full.
 
@@ -387,27 +388,33 @@ async def test_voiding_a_discounted_payment_reverses_its_own_capture(realdb):
 # --------------------------------------------------------------------------- #
 
 
-async def test_a_discount_already_taken_by_credit_memo_is_not_deducted_again(realdb):
-    """The documented way to pay a discount before 0104 was an applied credit
-    memo for the savings (and the in-app help said so). That memo is already
-    in the net, so the offer must not come off a second time (short-paying the
-    supplier by the discount); the settlement still captures it through the
-    amount match. Whenever the memo was recorded: guessing the other way on an
-    amount coincidence would short-pay the supplier."""
+async def _memo(c, vendor_id: str, invoice_id: str, amount: str, **extra):
+    return await c.post(
+        "/api/credit-memos",
+        json={
+            "memo_number": f"CM-{uuid.uuid4().hex[:6]}",
+            "vendor_id": vendor_id,
+            "amount": amount,
+            "invoice_id": invoice_id,
+            **extra,
+        },
+    )
+
+
+async def test_a_discount_taken_by_a_linked_credit_memo_is_not_deducted_again(realdb):
+    """A credit memo that NAMES the offer (`discount_offer_id`, decisions §520)
+    is the discount taken: it is already in the net, so the offer must not
+    come off a second time (short-paying the supplier by the discount), and
+    the settlement captures the offer through the memo, for the memo's
+    amount, stamped with the payment."""
     mk = realdb.sessionmaker(TENANT)
     vendor_id, invoice_id = await _seed_invoice(mk, realdb.info(TENANT).org_id)
     async with realdb.client(key=TENANT, role="ap_manager") as c:
         offer_id = await _accepted_offer(c, invoice_id)
-        memo = await c.post(
-            "/api/credit-memos",
-            json={
-                "memo_number": f"CM-{uuid.uuid4().hex[:6]}",
-                "vendor_id": vendor_id,
-                "amount": "20.74",
-                "invoice_id": invoice_id,
-            },
-        )
+        memo = await _memo(c, vendor_id, invoice_id, "20.74", discount_offer_id=offer_id)
         assert memo.status_code == 201, memo.text
+        assert memo.json()["discount_offer_id"] == offer_id
+        assert memo.json()["status"] == "applied"
 
     run = await _create_run(realdb, invoice_id)
     assert run["total_amount"] == "1016.26"
@@ -419,6 +426,131 @@ async def test_a_discount_already_taken_by_credit_memo_is_not_deducted_again(rea
         offer = await s.get(DiscountOffer, uuid.UUID(offer_id))
         assert offer.status == "captured"
         assert offer.captured_amount == Decimal("20.74")
+        assert offer.captured_by_payment_id == payment.id
+        created = (
+            await s.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "credit_memo.created",
+                    AuditLog.entity_id == uuid.UUID(memo.json()["id"]),
+                )
+            )
+        ).scalar_one()
+        assert created.details["discount_offer_id"] == offer_id
+
+
+async def test_a_return_credit_equal_to_the_savings_does_not_suppress_the_discount(realdb):
+    """The defect §520 closes: §250 read ANY applied memo for exactly the
+    savings as the discount already taken. A return credit that happens to
+    equal the savings is an ordinary credit — both come off, the payment books
+    the offer itself, and the settlement captures it through that booking, not
+    through the memo."""
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, invoice_id = await _seed_invoice(mk, realdb.info(TENANT).org_id)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        offer_id = await _accepted_offer(c, invoice_id)
+        memo = await _memo(c, vendor_id, invoice_id, "20.74", reason="Returned goods")
+        assert memo.status_code == 201, memo.text
+        assert memo.json()["discount_offer_id"] is None
+
+    run = await _create_run(realdb, invoice_id)
+    # 1037.00 - 20.74 (return) - 20.74 (2% discount on the 1037.00 base).
+    assert run["total_amount"] == "995.52"
+    payment = await _payment(mk, invoice_id)
+    assert payment.discount_offer_id == uuid.UUID(offer_id)
+    assert payment.discount_amount == Decimal("20.74")
+
+    await _execute(realdb, run["id"])
+    async with mk() as s:
+        offer = await s.get(DiscountOffer, uuid.UUID(offer_id))
+        assert offer.status == "captured"
+        assert offer.captured_by_payment_id == payment.id
+
+
+async def test_a_return_credit_equal_to_the_savings_never_captures_a_lapsed_offer(realdb):
+    """The capture half of the same defect: once the deadline has passed the
+    run pays net of the return credit — exactly the old discounted payoff —
+    and the amount-match fallback used to record the offer as captured. With
+    no memo naming the offer, nothing is captured."""
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, invoice_id = await _seed_invoice(mk, realdb.info(TENANT).org_id)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        offer_id = await _accepted_offer(c, invoice_id)
+        memo = await _memo(c, vendor_id, invoice_id, "20.74", reason="Returned goods")
+        assert memo.status_code == 201, memo.text
+    await _backdate(mk, offer_id, 30)
+
+    run = await _create_run(realdb, invoice_id)
+    assert run["total_amount"] == "1016.26"
+    await _execute(realdb, run["id"])
+    async with mk() as s:
+        offer = await s.get(DiscountOffer, uuid.UUID(offer_id))
+        assert offer.status == "accepted"
+        assert offer.captured_amount is None
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["no_invoice", "wrong_amount", "other_invoice", "second_memo", "booked", "paid_in_full"],
+)
+async def test_a_memo_cannot_take_a_discount_it_is_not(realdb, variant):
+    """The link is the proof, so it is refused unless the memo is exactly the
+    discount: on the offer's own invoice, for the savings to the cent, the
+    only live discount memo on that invoice, and with no live payment on the
+    invoice (one booked with the offer would deduct it twice; one sent at the
+    full amount would capture savings nobody took). Nothing is written on a
+    refusal."""
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    vendor_id, invoice_id = await _seed_invoice(mk, org_id)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        offer_id = await _accepted_offer(c, invoice_id)
+        body = {
+            "memo_number": f"CM-{uuid.uuid4().hex[:6]}",
+            "vendor_id": vendor_id,
+            "amount": "20.74",
+            "invoice_id": invoice_id,
+            "discount_offer_id": offer_id,
+        }
+        expected = 409
+        if variant == "no_invoice":
+            body.pop("invoice_id")
+        elif variant == "wrong_amount":
+            body["amount"] = "20.73"
+        elif variant == "other_invoice":
+            _, other_invoice = await _seed_invoice(mk, org_id)
+            other_offer = await _accepted_offer(c, other_invoice)
+            body["discount_offer_id"] = other_offer
+            expected = 404
+        elif variant == "second_memo":
+            second_offer = await _accepted_offer(c, invoice_id)
+            first = await _memo(c, vendor_id, invoice_id, "20.74", discount_offer_id=second_offer)
+            assert first.status_code == 201, first.text
+        elif variant == "booked":
+            await _create_run(realdb, invoice_id)
+            payment = await _payment(mk, invoice_id)
+            assert payment.discount_offer_id == uuid.UUID(offer_id)
+        elif variant == "paid_in_full":
+            # Deadline passed: the run books the full amount, no discount.
+            # Linking now would let that payment's settlement capture savings
+            # nobody took (money-path review, §520).
+            await _backdate(mk, offer_id, 30)
+            run = await _create_run(realdb, invoice_id)
+            assert run["total_amount"] == "1037.00"
+        resp = await c.post("/api/credit-memos", json=body)
+    assert resp.status_code == expected, resp.text
+    if expected == 409:
+        assert resp.json()["detail"]["code"] == "credit_memo_discount_offer_invalid"
+    async with mk() as s:
+        linked = (
+            (
+                await s.execute(
+                    select(CreditMemo).where(CreditMemo.discount_offer_id == uuid.UUID(offer_id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert linked == []
 
 
 @pytest.mark.parametrize("variant", ["currency", "base", "vendor_scope", "no_tier"])

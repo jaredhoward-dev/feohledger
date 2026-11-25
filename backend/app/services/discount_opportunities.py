@@ -116,8 +116,8 @@ async def capture_discount_offers(
     now: datetime,
     invoice: Invoice | None = None,
 ) -> None:
-    """Recognize `payment` settling its invoice at a discounted payoff and
-    capture any matching `accepted` `DiscountOffer` — the wiring
+    """Recognize `payment` settling an invoice that took an accepted discount
+    and capture that `DiscountOffer` — the wiring
     `discount_offers.mark_captured` was missing (issue #280): without a
     caller, `captured_amount`/`captured_at` never got set and the
     captured-savings KPI always read 0 even when discounts were genuinely
@@ -131,14 +131,14 @@ async def capture_discount_offers(
     `payment.invoice_id` for any future caller that doesn't. No invoice found
     is a no-op (nothing to match against). A payment BOOKED with a discount
     (`Payment.discount_offer_id`, migration 0104) captures exactly that offer
-    for exactly `Payment.discount_amount`; one booked without falls back to the
-    exact-payoff match, which is how a discount taken the old way — through a
-    credit memo — is still recognized (see
-    `discount_capture.capture_offer_for_settled_payment`).
+    for exactly `Payment.discount_amount`; one booked without captures the
+    offer an applied credit memo on the invoice names
+    (`CreditMemo.discount_offer_id`, decisions §520) — never one matched on an
+    amount (see `discount_capture.capture_offer_for_settled_payment`).
 
     NOT called when the settlement verifier flagged a discrepancy — the
-    payoff match runs against OUR authorized amount, which a divergent
-    settlement has just contradicted. See the call site in `payment_webhook`.
+    capture rests on OUR authorized amount, which a divergent settlement has
+    just contradicted. See the call site in `payment_webhook`.
 
     Best-effort, like the vendor card-notify email below: this labels a
     payment that already, definitely settled with a bookkeeping fact

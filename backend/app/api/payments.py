@@ -6266,13 +6266,13 @@ async def payment_webhook(tenant_slug: str, provider: str, request: Request):
             # the synchronous leg of `_execute_single_payment` — ACH/wire sit
             # `submitted`/`processing` until the processor calls back. This is
             # the settlement moment for those payments, so it's also where an
-            # accepted discount offer paid at its discounted payoff gets
-            # recognized (mirrors the synchronous completion leg's call) —
+            # accepted discount offer the payment took (booked on it, or via a
+            # linked credit memo) gets recognized (mirrors the synchronous completion leg's call) —
             # unless the settlement itself didn't reconcile.
             if payment.status == "completed":
                 if completion is not None and completion.is_discrepancy:
-                    # Flag, and do NOT capture the discount: the payoff match
-                    # runs against `payment.amount` — OUR authorized figure,
+                    # Flag, and do NOT capture the discount: the capture rests
+                    # on `payment.amount` — OUR authorized figure,
                     # which the rail has just contradicted — so capturing here
                     # would permanently mark savings realized on a number in
                     # dispute and misreport them to the CFO.

@@ -909,13 +909,6 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       non-clerk preparer role, add a non-sensitive permission tier the
       role-grant guards exempt, and move entry onto it. **Trigger:** the first
       customer asking for a custom preparer role.
-- [ ] **(c) Nothing links a credit memo to a discount offer.** An applied memo
-      equal to an accepted offer's savings is read as the discount already
-      taken (decisions §250), so a return credit that happens to equal the
-      savings suppresses the discount and the offer is then recorded as
-      captured. **Durable fix:** `credit_memos.discount_offer_id` (or a typed
-      reason) and drop the amount match. **Trigger:** the next credit-memo or
-      discounting change.
 - [ ] **(c) An early-payment discount taken here is never booked in the ERP.**
       The write-back posts the exact amount that reached the supplier
       (QuickBooks and Xero; §295, §386), and neither ERP's payment carries a

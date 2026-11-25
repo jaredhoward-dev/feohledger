@@ -538,7 +538,7 @@ def reverse_capture(offer) -> Decimal:
     voided the invoice goes back to ``approved`` and nothing was paid, so
     nothing was saved — the offer returns to the state it was in before the
     payment (the discount is still agreed; it is simply not yet taken), which
-    is also what lets a re-payment at the discounted payoff capture it again.
+    is also what lets a re-payment that takes the discount capture it again.
 
     Raises ``ValueError`` if the offer is not currently ``captured``.
     """
