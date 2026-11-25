@@ -305,6 +305,13 @@ one again to flip direction:
 - The backend validates `sort=` against a per-endpoint allowlist
   (`backend/app/api/sorting.py`) — an out-of-list value is a 422, so only
   pass field keys the endpoint actually declares.
+- **Read the URL's sort through `sortFromUrl(params, fields)`**, not a bare
+  `searchParams.get('sort')`: the URL is editable and outlives a renamed
+  column, and an unknown key 422s every load, Retry included, leaving the page
+  on its load error with nothing on screen to undo it. `sortFromUrl` keeps only
+  a field the page offers as a header and reads any `order` but `desc` as
+  ascending. `/vendors` uses it (guard: `tests-e2e/vendors/sort.spec.ts`);
+  the other sortable lists still read the raw param.
 - `null` field = the backend's own default order; only send `sort`/`order`
   in `buildParams()` when `sortField` is set (`untrack()` the read the same
   way `search` is — `buildParams()` is called from filter effects too).

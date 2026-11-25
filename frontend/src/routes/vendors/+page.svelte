@@ -6,7 +6,7 @@
 	import type { MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { tick, untrack } from 'svelte';
 	// Aliased: this page already has a local `page` variable for the loaded
 	// vendor-list page number (below) — `$app/state`'s page is the URL/route
@@ -222,8 +222,12 @@
 	// Column sort — URL-backed (`?sort=&order=`) so it survives a reload/share,
 	// mirroring the /expenses `syncUrl()` pattern (see `syncSortUrl` below).
 	// `null` field = the backend's own default order (name ascending).
-	let sortField = $state<string | null>(urlStore.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((urlStore.url.searchParams.get('order') as SortOrder) ?? 'asc');
+	// Only the headers this table offers are read back: an edited or stale
+	// `?sort=` passed straight through 422s every load, Retry included.
+	const SORTABLE_FIELDS = ['name', 'code', 'status'] as const;
+	const initialSort = sortFromUrl(urlStore.url.searchParams, SORTABLE_FIELDS);
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// --- Bulk selection ---
 	let selected = $state<Set<string>>(new Set());

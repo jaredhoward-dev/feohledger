@@ -32,3 +32,20 @@ export function toggleSort(current: SortState, field: string): SortState {
 export function clearSort(current: SortState): SortState {
 	return { field: null, order: current.order };
 }
+
+/**
+ * Read a page's sort back out of its URL (`?sort=&order=`), keeping only a
+ * field the page actually offers as a sortable header. The URL is user-
+ * editable and outlives renames: an unknown `sort=` passed straight through
+ * is a 422 from the backend's allowlist, and a list page that fails its load
+ * on every Retry is a dead end with no control on screen to undo it. An
+ * unknown field falls back to the default order; any `order` other than
+ * `desc` reads as ascending.
+ */
+export function sortFromUrl(params: URLSearchParams, fields: readonly string[]): SortState {
+	const field = params.get('sort');
+	return {
+		field: field && fields.includes(field) ? field : null,
+		order: params.get('order') === 'desc' ? 'desc' : 'asc'
+	};
+}
