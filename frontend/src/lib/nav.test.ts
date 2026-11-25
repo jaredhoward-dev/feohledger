@@ -19,6 +19,7 @@ import {
 	PERM_VENDOR_BLOCK,
 	PERM_VENDOR_MANAGE
 } from './types/admin';
+import { NAV_PAGES, navPageFor } from './help/navPages';
 
 const links = NAV.filter((e): e is NavLink => e.kind === 'link');
 const link = (href: string): NavLink => links.find((l) => l.href === href)!;
@@ -372,6 +373,24 @@ test('canSee: a capability is ANDed on top of the role gate, and fails closed', 
 	expect(canSee(['admin'], () => false, undefined, undefined, 'partner', partner)).toBe(false);
 	// A row with no capability ignores the check.
 	expect(canSee(['admin'], hasAdmin, undefined, undefined, undefined, notPartner)).toBe(true);
+});
+
+test('help pages carry the capability gate, so help never links Partner Admin to a non-partner', () => {
+	const page = navPageFor('/admin/partner')!;
+	expect(page.capability).toBe('partner');
+	const hasAdmin = (...r: string[]) => r.includes('admin');
+	const partner = (c: OrgCapability) => c === 'partner';
+	const notPartner = () => false;
+	// The call shape both help routes use.
+	expect(canSee(page.roles, hasAdmin, page.permissions, undefined, page.capability, notPartner)).toBe(false);
+	expect(canSee(page.roles, hasAdmin, page.permissions, undefined, page.capability, partner)).toBe(true);
+	// Every sidebar row's capability survives the flattening, not just this one.
+	const navCaps = NAV.flatMap((e) =>
+		e.kind === 'link' ? [[e.href, e.capability]] : e.children.map((c) => [c.href, c.capability])
+	);
+	for (const [href, cap] of navCaps) {
+		expect(NAV_PAGES.find((p) => p.href === href)?.capability, href as string).toBe(cap);
+	}
 });
 
 test('Partner Admin shows only to an admin of a partner workspace', () => {
