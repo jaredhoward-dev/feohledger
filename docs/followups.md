@@ -1359,21 +1359,18 @@ user-visible halves still open.
       with its reason: /admin?tab=roles (the system-roles table has no
       loading row and grows to four rows, pushing the custom-roles section
       down), /admin/partner (the e2e tenant is not a partner, so the children
-      table never renders), /adaptive, /discounts (warning banners mount
-      above the offers table once the dashboard lands, and the capture-rate
-      card's reason line grows the KPI row) and /tax (a loading placeholder
-      is replaced by the box-allocation panel and the table, and the toolbar's
-      chips mount with the report). **Durable fix:** the /gl-accounts pattern
+      table never renders) and /adaptive. /discounts and /tax are measured
+      and locale-sized (KPI qualifier lines reserved with `KpiCard
+      reserveSub`, /discounts' currency notes in a one-line slot, /tax's
+      toolbar and table drawn from first paint with the box-allocation panel
+      below the table). **Durable fix:** the /gl-accounts pattern
       (`fixed`, locale-sized `<th>` widths under a page wrapper, the table
       mounted from first paint with DataTable's loading row) is what moved
       /goods-receipts, /audit and /admin/webhooks across (the last two also
       reserve the upper table's height, scrolling under a sticky header);
       reserve the fixed four system-role rows on Roles; a partner fixture
-      tenant for /admin/partner; on /tax mount the toolbar and table from
-      first paint and move the box-allocation panel below the table; on
-      /discounts reserve the banners' slot and the KPI cards' reason line;
-      then move each into `LIST_PAGES`. **Trigger:** the next polish pass on
-      any of those pages.
+      tenant for /admin/partner; then move each into `LIST_PAGES`.
+      **Trigger:** the next polish pass on any of those pages.
 - [ ] **(c) No scripted "first customer" release rehearsal.** The 2026-10-22
       walkthrough — sign up, connect QuickBooks, sync the chart and vendors,
       enter an invoice, approve it, push it, pay the bill in QuickBooks, watch
