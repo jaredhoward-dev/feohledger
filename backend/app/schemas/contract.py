@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.api.pagination import PageMeta
 from app.models.contract import ContractType
+from app.schemas.action_verdict import CodedRefusal
 from app.schemas.currency import CurrencyCode, OptionalCurrencyCode
 from app.schemas.money import MoneyAmount, OptionalMoneyAmount
 
@@ -116,6 +117,21 @@ class ContractSpendSummary(BaseModel):
     over_limit: bool
 
 
+class ContractActions(BaseModel):
+    """The caller's verdict on a contract's lifecycle actions, each the coded
+    refusal the endpoint would answer with or ``None`` — computed by the
+    endpoints' own gates (``services/contract_controls``, through
+    ``api/contracts.contract_action_refusals``; decisions §508). Required, not
+    defaulted: every contract response carries it, mutations included."""
+
+    activate: CodedRefusal | None
+    terminate: CodedRefusal | None
+    cancel: CodedRefusal | None
+    renew: CodedRefusal | None
+    create_po: CodedRefusal | None
+    delete: CodedRefusal | None
+
+
 class ContractResponse(BaseModel):
     id: str
     contract_number: str
@@ -145,6 +161,7 @@ class ContractResponse(BaseModel):
     spend: ContractSpendSummary | None = None
     created_at: str
     updated_at: str
+    actions: ContractActions
 
 
 class ContractListResponse(PageMeta):
