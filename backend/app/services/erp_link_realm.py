@@ -76,6 +76,7 @@ from app.services.erp_adapters.dispatcher import MOCK_ADAPTER_KEY, resolve_adapt
 __all__ = [
     "LEGACY_REALM_KEY",
     "UNNAMED_REALM",
+    "bill_realm_clause",
     "connection_realm",
     "legacy_links_trusted",
     "link_is_live",
@@ -179,6 +180,28 @@ def link_is_live(link_realm: str | None, realm: str | None, *, trust_legacy: boo
     if link_realm is None:
         return trust_legacy
     return link_realm == realm
+
+
+def bill_realm_clause(recorded_realm, erp_config: Any):
+    """Which pushed bills a status report about a bill id may name, as a SQL
+    filter on the push's recorded realm (``state_data["erp_realm"]``), or None
+    when none may: the connection names no company (``mock``, an OAuth ERP with
+    no completed consent), so no id can be attributed to one.
+
+    A bill counts when its push recorded the realm the tenant is connected to
+    now, and a pre-realm (NULL) push only while :func:`legacy_links_trusted`
+    holds (decisions §417, §423). ERP document ids are small per-ERP numbers,
+    so a bill another ERP issued must never be read against this one. The one
+    statement of the rule for every reader of a bill by its ERP id: the generic
+    webhook's document-id lookup and the status polling sweep (§533).
+    """
+    realm = connection_realm(erp_config)
+    if realm is None:
+        return None
+    clause = recorded_realm == realm
+    if legacy_links_trusted(erp_config, realm):
+        clause = or_(clause, recorded_realm.is_(None))
+    return clause
 
 
 def live_link_clause(column, realm: str | None, *, trust_legacy: bool):

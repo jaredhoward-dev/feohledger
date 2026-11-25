@@ -14,31 +14,40 @@ carried it.
 **Which tenants.** Every tenant whose ERP block selects an adapter that is not
 Merge.dev (its deliveries go to its own route, and its read-back is separate)
 and does not report status itself (``supports_status_sync``: QuickBooks Online
-and Xero, which have the ``erp-status-sync`` sweep). The mock adapter is
-polled, so the sweep runs on a laptop (guard rail 7); it always reads ``open``.
+and Xero, which have the ``erp-status-sync`` sweep), and whose connection names
+a company (below). The mock adapter names none, so a laptop tenant on it polls
+nothing; the sweep still runs and is off by default (guard rail 7).
 
 **Which invoices.** One with an ERP document id at a status a webhook could
 still move: :data:`POLLED_STATUSES`. ``done`` / ``paid`` / ``failed`` are not
 polled: nothing more can be paid here, and polling every closed invoice for
 ever would be unbounded. A bill is asked about only under the connection that
-issued it: the push's recorded realm must be the tenant's current one (the
-webhook's by-document rule, §417 / §423), and when the ERP went live is known
-(§428) the push must have been confirmed after it, so an id another ERP issued
-is never read against this one.
+issued it: ``erp_link_realm.bill_realm_clause``, the webhook's own by-document
+rule (§417 / §423, shared since §533) — the push's recorded realm must be the
+tenant's current one, a pre-realm (NULL) push counts only while
+``legacy_links_trusted`` holds, and a connection that names no company
+(``mock``, an OAuth ERP with no consent) polls nothing. When the ERP went live is
+known (§428) the push must have been confirmed after it too, so an id another
+ERP issued is never read against this one.
 
 **What counts as a change.** ``open`` → ``posted``, ``paid`` → ``paid`` and
-``cancelled`` → ``cancelled``, the generic webhook's own words. ``draft``,
-``partially_paid`` and ``unknown`` have no webhook equivalent and are not
-applied. ``settled_no_payment`` (nothing owing, no payment behind it: a credit
-applied or a write-off in the ERP) is never a payment (§303): the invoice is
-not moved, and a blocking ``payment_reconciliation`` exception is opened so no
-payment run pays a bill the ERP already shows settled (§532). The webhook has
-no word for that status, so this is the sweep's own branch, not
-``apply_erp_status_report``'s. The last status read is kept in the latest
-workflow instance's ``state_data["erp_status_poll"]`` with the moment, and a
-report is applied (or the exception opened) only when the status differs from
-the one recorded: so a resolved exception is not re-opened every tick, and an
-unchanged ``open`` bill costs one call and no write but the moment.
+``cancelled`` → ``cancelled``, the generic webhook's own words; a ``paid`` read
+for a ``payment_scheduled`` invoice whose payment has not completed is held
+behind a blocking exception there, not moved (§533). ``draft`` and ``unknown``
+have no webhook equivalent and are not applied. Two reads are never a payment
+and have no webhook word, so they are the sweep's own branch: the invoice is not
+moved, and a blocking ``payment_reconciliation`` exception is opened so no
+payment run pays the bill in full — ``settled_no_payment`` (nothing owing, no
+payment behind it: a credit applied or a write-off in the ERP, §303, §532) and
+``partially_paid`` (part paid in the ERP, which FeohLedger never writes back to
+on this route, §533). The last status read is kept in the latest workflow
+instance's ``state_data["erp_status_poll"]`` with the moment, and a report is
+applied (or the exception opened) only when the status differs from the one
+recorded: so a resolved exception is not re-opened every tick, and an
+unchanged ``open`` bill costs one call and no write but the moment. Every flag
+is deduplicated by its ``erp_report["kind"]``, not just its type (§533): an
+unrelated live row of the same type never swallows it, so the recorded read
+always stands for a flag that was raised.
 
 **Fair, and stops at the budget.** Each tick takes, per tenant, at most
 ``FEOH_ERP_STATUS_POLL_SWEEP_BATCH_SIZE`` invoices, least recently polled
@@ -67,7 +76,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import exists, or_, select, true
+from sqlalchemy import exists, false, select, true
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -82,12 +91,16 @@ from app.services.erp_status_report import (
     ERP_STATUS_MAP,
     EXCEPTION_OPENED,
     NOOP,
+    WITHDRAWN,
     apply_erp_status_report,
 )
 from app.services.erp_status_sync import (
+    ERP_PAID_RECORDABLE,
+    ERP_REPORT_PARTLY_PAID,
     ERP_REPORT_SETTLED_NO_PAYMENT,
     PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
     open_erp_reconciliation_exception,
+    withdraw_erp_paid_reports,
 )
 from app.services.invoice_warning_catalog import exception_finding
 from app.services.sweep_health import SWEEP_ERP_STATUS_POLL, run_sweep_loop
@@ -102,11 +115,20 @@ POLLED_STATUSES = (
 )
 
 #: What the adapter read → the generic webhook's status word. A status with no
-#: entry has no webhook equivalent and is not applied.
+#: entry has no webhook equivalent and is not applied through the webhook's
+#: transition (``POLL_FLAGS`` are the sweep's own).
 POLLED_STATUS_WORDS: dict[ErpInvoiceStatus, str] = {
     ErpInvoiceStatus.open: "posted",
     ErpInvoiceStatus.paid: "paid",
     ErpInvoiceStatus.cancelled: "cancelled",
+}
+
+#: Reads that are never a payment and have no webhook word: the
+#: ``erp_report["kind"]`` and catalogue sentence of the blocking
+#: ``payment_reconciliation`` each opens (§532, §533).
+POLL_FLAGS: dict[ErpInvoiceStatus, tuple[str, str]] = {
+    ErpInvoiceStatus.settled_no_payment: (ERP_REPORT_SETTLED_NO_PAYMENT, "erp_settled_no_payment"),
+    ErpInvoiceStatus.partially_paid: (ERP_REPORT_PARTLY_PAID, "erp_partly_paid_outside"),
 }
 
 #: ``erp_type`` recorded on what the sweep applies, and the ``source`` marker
@@ -170,17 +192,14 @@ def _candidates_query(
 ):
     """``(invoice id, document id)`` of every invoice the sweep may poll, least
     recently polled first."""
-    from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+    from app.services.erp_link_realm import bill_realm_clause
 
     instance = _latest_instance()
-    recorded_realm = instance.c.state_data["erp_realm"].astext
-    realm = connection_realm(erp_config)
-    if realm is None:
-        realm_clause = recorded_realm.is_(None)
-    elif legacy_links_trusted(erp_config, realm):
-        realm_clause = or_(recorded_realm == realm, recorded_realm.is_(None))
-    else:
-        realm_clause = recorded_realm == realm
+    # The webhook's own by-document rule (§417 / §423 / §533): None means the
+    # connection names no company, so no bill can be attributed to it.
+    realm_clause = bill_realm_clause(instance.c.state_data["erp_realm"].astext, erp_config)
+    if realm_clause is None:
+        realm_clause = false()
     query = (
         select(Invoice.id, Invoice.erp_document_id)
         .select_from(Invoice)
@@ -263,9 +282,9 @@ async def _apply_one(
         previous = state.get(STATE_KEY) if isinstance(state.get(STATE_KEY), dict) else {}
         outcome = NOOP
         changed = previous.get("status") != read.value
-        if read is ErpInvoiceStatus.settled_no_payment and changed:
-            outcome = await _flag_settled_no_payment(
-                db, invoice, org_id=org.id, erp_type=erp_type, candidate=candidate
+        if read in POLL_FLAGS and changed:
+            outcome = await _flag_read(
+                db, invoice, read, org_id=org.id, erp_type=erp_type, candidate=candidate
             )
         elif word is not None and changed:
             outcome = await apply_erp_status_report(
@@ -291,34 +310,49 @@ async def _apply_one(
     return _UNCHANGED if outcome == NOOP else _APPLIED
 
 
-async def _flag_settled_no_payment(
+async def _flag_read(
     db: AsyncSession,
     invoice: Invoice,
+    read: ErpInvoiceStatus,
     *,
     org_id: uuid.UUID,
     erp_type: str,
     candidate: _Candidate,
 ) -> str:
-    """The ERP shows the bill settled with no payment behind it (§303): open a
-    payment-blocking ``payment_reconciliation`` exception for a person to say
-    what is still owed, and leave the invoice where it is — FeohLedger paid
-    nothing, so no transition and no payment is recorded (§532). Skipped while
-    one of that type is already live (``open_erp_reconciliation_exception``)."""
+    """The ERP shows the bill settled with no payment behind it (§303, §532) or
+    part paid (§533): open a payment-blocking ``payment_reconciliation``
+    exception for a person to say what is still owed, and leave the invoice
+    where it is — FeohLedger paid nothing, so no transition and no payment is
+    recorded. Skipped while one of the same KIND is live, never because an
+    unrelated row of that type is (``same_kind``, §533).
+
+    Neither read is a bill paid in full, so a payment the ERP reported earlier
+    that FeohLedger could not record is withdrawn first, as every non-``Paid``
+    report does (§319)."""
+    kind, sentence = POLL_FLAGS[read]
+    withdrawn = 0
+    if invoice.status in ERP_PAID_RECORDABLE:
+        withdrawn = await withdraw_erp_paid_reports(
+            db, invoice, erp_type=erp_type, erp_state=read.value
+        )
     opened = await open_erp_reconciliation_exception(
         db,
         invoice,
         org_id=org_id,
         exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
-        finding=exception_finding("erp_settled_no_payment"),
+        finding=exception_finding(sentence),
         erp_report={
-            "kind": ERP_REPORT_SETTLED_NO_PAYMENT,
+            "kind": kind,
             "erp_type": erp_type,
             "erp_document_id": candidate.erp_document_id,
             "source": POLL_SOURCE,
             "invoice_status": invoice.status.value,
         },
+        same_kind=True,
     )
-    return EXCEPTION_OPENED if opened else NOOP
+    if opened:
+        return EXCEPTION_OPENED
+    return WITHDRAWN if withdrawn else NOOP
 
 
 async def _sweep_tenant(org: Organization, *, result: StatusPollSweepResult) -> None:

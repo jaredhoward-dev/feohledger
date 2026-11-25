@@ -5,7 +5,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
@@ -775,15 +775,11 @@ async def _invoice_id_by_document(
     refused, never guessed between: the caller answers the same silent 204 as
     for no match.
     """
-    from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+    from app.services.erp_link_realm import bill_realm_clause
 
-    realm = connection_realm(erp_config)
-    if realm is None:
+    realm_clause = bill_realm_clause(WorkflowInstance.state_data["erp_realm"].astext, erp_config)
+    if realm_clause is None:
         return None
-    recorded = WorkflowInstance.state_data["erp_realm"].astext
-    realm_clause = recorded == realm
-    if legacy_links_trusted(erp_config, realm):
-        realm_clause = or_(realm_clause, recorded.is_(None))
     rows = (
         await db.execute(
             select(Invoice.id)

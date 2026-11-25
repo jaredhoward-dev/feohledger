@@ -414,21 +414,36 @@ forgery, so the ERP never redelivers it. The `erp-status-poll` sweep
 (`services/erp_status_poll_sweep`, `FEOH_ERP_STATUS_POLL_SWEEP_ENABLED`, off by
 default) is the backstop. For every tenant whose adapter is not Merge.dev and
 has no status sync of its own (QuickBooks Online and Xero have theirs, next two
-sections; the mock adapter is polled, so it runs locally), it calls
+sections), it calls
 `get_invoice_status(erp_document_id)` for invoices at `sent_to_erp`,
 `posted_in_erp` or `payment_scheduled`, least recently polled first and at most
 `FEOH_ERP_STATUS_POLL_SWEEP_BATCH_SIZE` per tenant a tick. A bill is asked
-about only under the connection that issued it: the push's recorded realm must
-be the current one (the by-document rule, §417 / §423), and the push must have
-been confirmed after the ERP went live (§428) when that moment is known.
+about only under the connection that issued it, by the webhook's own
+by-document rule — one function, `erp_link_realm.bill_realm_clause`, called by
+both (§417 / §423 / §533): the push's recorded realm must be the current one, a
+pre-realm (NULL) push counts only while `legacy_links_trusted` holds, and a
+connection that names no company (`mock`, an OAuth ERP with no consent) polls
+nothing, as the webhook matches nothing for it. The push must also have been
+confirmed after the ERP went live (§428) when that moment is known.
 
 - **One transition.** What it reads is applied through
   `services/erp_status_report.apply_erp_status_report`, the very function the
   webhook calls, as the webhook's own words: `open` → `posted`, `paid` →
   `paid`, `cancelled` → `cancelled`. The audit rows are the webhook's, with
-  `source: poll` on a transition. `draft`, `partially_paid` and `unknown`
-  have no webhook equivalent and are not applied (since §303 `paid` is the
-  ERP's own paid status or a payment it records, never a zero balance alone).
+  `source: poll` on a transition. `draft` and `unknown` have no webhook
+  equivalent and are not applied (since §303 `paid` is the ERP's own paid
+  status or a payment it records, never a zero balance alone).
+- **Paid while our payment is in flight (§533, webhook and sweep alike).** A
+  `paid` report for a `payment_scheduled` invoice moves it to `paid` only over
+  a `completed` payment whose settlement covers it; one that settled short is
+  held behind the settled-short `erp_reconciliation` row, as before. With no
+  completed payment — our rail payment still pending or processing, or a live
+  virtual card, which books no `Payment` — the ERP's `paid` cannot be ours
+  (`payment_erp_sync` writes nothing back to these adapters), so someone paid
+  the bill in the ERP while we are paying it too. The invoice is not moved; one
+  payment-blocking `payment_reconciliation` opens (code
+  `exception.erp_paid_while_scheduled`, the QuickBooks sync's own sentence,
+  `erp_report.kind` `paid_while_scheduled`).
 - **Settled with no payment (§532).** `settled_no_payment` — nothing owing in
   the ERP and no payment behind it (a credit applied, a write-off) — is never
   a payment (§303), and the invoice is not moved. The sweep opens one
@@ -436,11 +451,26 @@ been confirmed after the ERP went live (§428) when that moment is known.
   `exception.erp_settled_no_payment`, `erp_report.kind` `settled_no_payment`,
   with the ERP, document id, `source: poll` and the invoice's status), so no
   payment run pays a bill the ERP already shows settled until a person says
-  what is still owed. It goes through
-  `erp_status_sync.open_erp_reconciliation_exception`, so it is skipped while a
-  `payment_reconciliation` is already live on the invoice. This branch lives in
-  the sweep, not `apply_erp_status_report`: the generic webhook has no word for
-  the status.
+  what is still owed. This branch lives in the sweep, not
+  `apply_erp_status_report`: the generic webhook has no word for the status.
+- **Part paid (§533).** `partially_paid` is the same kind of fact: the ERP
+  shows part of the bill paid or credited there, and this route never writes a
+  payment back, so a run for the full amount would overpay. The invoice is not
+  moved; one blocking `payment_reconciliation` opens with the QuickBooks sync's
+  sentence `exception.erp_partly_paid_outside` (`erp_report.kind`
+  `partly_paid`, `source: poll`). Both reads first withdraw a payment the ERP
+  reported earlier that FeohLedger could not record (§319): neither is a bill
+  paid in full.
+- **Deduplicated by kind (§533).** Every row this route and the sweep open goes
+  through `erp_status_sync.open_erp_reconciliation_exception` with
+  `same_kind=True`: it is skipped only while a live row of the same type AND
+  `erp_report.kind` exists. An unrelated live row of the same type (a
+  settled-short row beside a void, another report's `payment_reconciliation`)
+  never swallows it, because each change is reported once — the webhook by
+  event id, the sweep by its recorded read — and a swallowed report would be
+  gone once a person resolved the unrelated row. A report the dedupe skips
+  changed nothing: the outcome is `NOOP`, not counted as applied and, at the
+  webhook, not committed.
 - **Only a change.** The last status read is kept in the latest workflow
   instance's `state_data["erp_status_poll"]`; a read equal to it applies
   nothing, so an unchanged `open` bill costs one call and no trail row, and a
