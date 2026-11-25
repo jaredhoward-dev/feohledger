@@ -29789,3 +29789,99 @@ reads each bill once; a truncated listing narrows the window and moves nothing
 else; a failed window does not advance; the narrowest window fails);
 `test_merge_dev_adapter.py` (the feed's `deleted` and `modified_before`, no
 bound without `until`, a naive `until` refused before any call).
+
+## 569. Per-row due lookups are correlated; "paid out" means the payment discharges the invoice; the shared Xero key follows the contact the lookup sends (§565 / §566 follow-up, round 48)
+
+**Context.** Four review findings on round 48's own work.
+
+**Decision (1): the effective due date is reached per invoice.**
+`open_ap_due.effective_due_by_invoice` was an uncorrelated `invoices LEFT JOIN
+(DISTINCT ON over every payment_schedules row)`, outer-joined to queries that
+already filter by status. Postgres cannot push the caller's status filter or
+page LIMIT into a `DISTINCT ON` derived table, so every `aging()` call, every
+aging snapshot, every queue page and every select-all-ids read sorted every
+schedule in the tenant and scanned `invoices` a second time; the queue page
+did it twice, since it already joined `latest_schedules()`. The rule is now
+stated once as `effective_due_of(schedule_due)` (`coalesce(schedule due,
+Invoice.due_date)`); the aging bands and `/queue/ids` reach the schedule
+through `current_schedule_due()`, a LATERAL `LIMIT 1` correlated on the outer
+invoice, and the queue page through `payment_schedules.current_schedule_of_row()`
+(the same lateral as an entity alias) and derives its date from that row, with
+no second lookup. Tenant migration 0150 adds
+`ix_payment_schedules_invoice_current (invoice_id, created_at DESC, id DESC)`,
+`LATEST_SCHEDULE_ORDER` per invoice, so each probe is one index entry and the
+remaining `DISTINCT ON` readers (`latest_schedules`, the population) can read
+the index in order. `EXPLAIN` against `feoh_acme` with 3,000 invoices and
+9,000 schedules seeded in a rolled-back transaction:
+
+- before, all three: `Seq Scan on payment_schedules` → `Sort` → `Unique`,
+  hash-joined to a second `Seq Scan on invoices`, then to the filtered outer
+  invoices (the queue page: two such branches);
+- after, all three: the filtered outer invoices → `Nested Loop Left Join` →
+  `Limit` → `Index Scan using ix_payment_schedules_invoice_current`
+  (`invoice_id = invoices.id`); no whole-table sort, one `invoices` scan.
+
+`test_open_ap_due_single_statement.py` now requires `effective_due_of` and
+`current_schedule_due` in every per-row reader, fails a reader that writes the
+coalesce itself, and pins the lateral's shape. `/queue/ids` is pinned to the
+page's order end to end, since the two reach the current schedule by two
+routes.
+
+**Decision (2): `paid_out` is coverage, not `status == completed`.** §565's
+`paid_out()` dropped any invoice with a `completed` payment from the overdue
+counts, `?overdue=true`, the /cfo card and the forecast. A run's card leg is
+`completed` when the card is minted (§537), and a short or unstorable
+settlement is `completed` while the payment sync holds the invoice short of
+`paid` — `payment_coverage` calls the first `in_flight` and the second
+`short` / `uncertain`. So an uncharged card-paid invoice vanished from every
+overdue surface, and a 10,000 invoice settled at 9,500 hid what was still
+owed. `paid_out` now requires `payment_settlement_record.payment_covered_sql()`,
+the SQL twin of `payment_coverage(...).state == "covered"`. Persisting the
+verdict was the alternative: it needs a column written wherever coverage can
+change (the card webhook's settlement, both completion paths, `/settlement/accept`,
+a void), and a missed writer is silent drift; the twin is derived from the same
+rows on every read, and `tests/test_payment_coverage_sql_parity.py` runs both
+over twenty-five cases (rails full / short / tolerance / over / unstorable /
+currency, FX source leg, card legs minted / authorized / settled / short / no
+figure / unlinked / cancelled sibling). `card_leg_card` gains an `id`
+tie-break so the two pick the same card. A held invoice re-enters at its face
+amount, not the shortfall: the forecast and counts have no partial-payment
+model, and overstating what is owed is the conservative error.
+
+**Decision (3): the shared-key check is one bounded read, keyed on the
+contact the lookup sends.** `shared_lookup_keys` ran one correlated query per
+invoice, so a page of exceptions became N queries; and it compared only the
+vendor row's `erp_vendor_id`, while Xero's lookup sends the contact
+`vendor_erp_links.vendor_erp_ids` resolves in the connected company — a kept
+link when the row link belongs to another company (§284, §356). Another vendor
+holding that contact went unseen, so the orphan void could name its
+invoice's bill. The check now resolves each candidate's contact the way
+`erp._resolve_erp_refs` does, adds the row link (wider, as before), and refuses
+when any other invoice with the same number belongs to the same vendor or to a
+vendor holding one of those contacts as its row link or as a kept link in ANY
+company (errs wider). At most three statements for any number of candidates
+(their vendors, their kept links in the realm, every invoice carrying one of
+their numbers grouped per invoice with its vendor's kept links), pinned by a
+query-count test. **Not done:** the Xero push's own pre-create adoption
+(`_find_existing_bill`, which adopts a bill on the same key at the approved
+total) does not consult this check. Refusing the push on a shared key would
+also refuse every legitimate push whose number another rejected or done
+invoice of the supplier carries, which wants its own decision; it is reported
+for the follow-up list rather than added here.
+
+**Decision (4): an ambiguous Xero lookup is named as such.**
+`find_posted_bill` raised `XeroRequestError(200)` — "request failed: HTTP
+200" — for more than one bill on the key, or a bill with no id, another
+contact or an unrequested status. Those raise `XeroBillLookupAmbiguous` now.
+Still fail-closed: `erp_bill_void.find_orphan` answers `erp_lookup_failed`
+for any adapter exception, as before.
+
+**Tests.** `test_open_ap_due_single_statement.py`,
+`test_payment_queue_pagination.py` (ids in page order),
+`test_migration_0150_pay_schedule_current_idx.py`,
+`test_payment_coverage_sql_parity.py`, `test_dashboard_aggregates.py` (a
+minted-uncharged card leg and a short settlement stay overdue in the count,
+the list and the forecast; a settled card and a full settlement drop out),
+`test_erp_orphan_bill.py` (the kept-link sharer as row link and as kept link;
+the bounded statement count; the exception list and detail carry the
+shared-key refusal), `test_erp_xero_adapter.py`.
