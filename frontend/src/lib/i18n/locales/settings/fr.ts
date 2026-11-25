@@ -1062,7 +1062,7 @@ export const messages = {
 	'admin.partner.attach.aria': 'Rattacher un locataire enfant',
 	'admin.partner.attach.title': 'Rattacher un locataire enfant',
 	'admin.partner.attach.hint':
-		'Collez le code de liaison à usage unique que l\'administrateur du locataire enfant a généré pour vous. Il doit l\'avoir généré depuis sa propre page Administration partenaire — c\'est son consentement à être géré ici.',
+		'Collez le code de liaison à usage unique que l\'administrateur du locataire enfant a généré pour vous. Il le génère dans les paramètres de sa propre organisation, sous « {panel} » — c\'est son consentement à être géré ici.',
 	'admin.partner.attach.linkCode': 'Code de liaison',
 	'admin.partner.attach.linkCodePlaceholder': 'collez le code…',
 	'admin.partner.attach.attaching': 'Rattachement…',

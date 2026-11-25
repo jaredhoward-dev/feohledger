@@ -1062,7 +1062,7 @@ export const messages = {
 	'admin.partner.attach.aria': 'Vincular inquilino filho',
 	'admin.partner.attach.title': 'Vincular um inquilino filho',
 	'admin.partner.attach.hint':
-		'Cole o código de vínculo de uso único que o administrador do inquilino filho gerou para você. Ele deve tê-lo gerado a partir da própria página de Administração de parceiros — esse é o consentimento dele para ser gerenciado aqui.',
+		'Cole o código de vínculo de uso único que o administrador do inquilino filho gerou para você. Ele o gera nas configurações da própria organização, em “{panel}” — esse é o consentimento dele para ser gerenciado aqui.',
 	'admin.partner.attach.linkCode': 'Código de vínculo',
 	'admin.partner.attach.linkCodePlaceholder': 'cole o código…',
 	'admin.partner.attach.attaching': 'Vinculando…',

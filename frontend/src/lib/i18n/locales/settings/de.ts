@@ -1062,7 +1062,7 @@ export const messages = {
 	'admin.partner.attach.aria': 'Untermandant verknüpfen',
 	'admin.partner.attach.title': 'Einen Untermandanten verknüpfen',
 	'admin.partner.attach.hint':
-		'Fügen Sie den einmaligen Verknüpfungscode ein, den der Admin des Untermandanten für Sie erstellt hat. Er muss ihn auf seiner eigenen Partner-Verwaltungsseite erstellt haben — das ist seine Einwilligung, hier verwaltet zu werden.',
+		'Fügen Sie den einmaligen Verknüpfungscode ein, den der Admin des Untermandanten für Sie erstellt hat. Er erstellt ihn in seinen eigenen Organisationseinstellungen unter „{panel}“ — das ist seine Einwilligung, hier verwaltet zu werden.',
 	'admin.partner.attach.linkCode': 'Verknüpfungscode',
 	'admin.partner.attach.linkCodePlaceholder': 'Code einfügen…',
 	'admin.partner.attach.attaching': 'Wird verknüpft…',

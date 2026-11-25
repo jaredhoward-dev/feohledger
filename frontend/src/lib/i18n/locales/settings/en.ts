@@ -1079,7 +1079,7 @@ export const enSettings = {
 	'admin.partner.attach.aria': 'Attach child tenant',
 	'admin.partner.attach.title': 'Attach a child tenant',
 	'admin.partner.attach.hint':
-		'Paste the single-use link code the child tenant\'s admin generated for you. They must have generated it from their own Partner Admin page — that\'s their consent to being managed here.',
+		'Paste the single-use link code the child tenant\'s admin generated for you. They generate it in their own Organization settings, under “{panel}” — that\'s their consent to being managed here.',
 	'admin.partner.attach.linkCode': 'Link code',
 	'admin.partner.attach.linkCodePlaceholder': 'paste the code…',
 	'admin.partner.attach.attaching': 'Attaching…',

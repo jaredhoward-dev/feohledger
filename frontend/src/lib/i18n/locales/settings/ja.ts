@@ -1052,7 +1052,7 @@ export const messages = {
 	'admin.partner.attach.aria': '子テナントを接続',
 	'admin.partner.attach.title': '子テナントを接続',
 	'admin.partner.attach.hint':
-		'子テナントの管理者があなたのために生成した単回使用のリンクコードを貼り付けてください。相手は自身のパートナー管理ページからそれを生成している必要があります — それがここで管理されることへの同意です。',
+		'子テナントの管理者があなたのために生成した単回使用のリンクコードを貼り付けてください。相手は自身の組織設定の「{panel}」で生成します — それがここで管理されることへの同意です。',
 	'admin.partner.attach.linkCode': 'リンクコード',
 	'admin.partner.attach.linkCodePlaceholder': 'コードを貼り付け…',
 	'admin.partner.attach.attaching': '接続中…',

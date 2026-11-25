@@ -1062,7 +1062,7 @@ export const messages = {
 	'admin.partner.attach.aria': 'Vincular inquilino secundario',
 	'admin.partner.attach.title': 'Vincular un inquilino secundario',
 	'admin.partner.attach.hint':
-		'Pega el código de vinculación de un solo uso que el administrador del inquilino secundario generó para ti. Debe haberlo generado desde su propia página de Administración de socios — eso es su consentimiento para ser gestionado aquí.',
+		'Pega el código de vinculación de un solo uso que el administrador del inquilino secundario generó para ti. Lo genera en la configuración de su propia organización, en «{panel}» — eso es su consentimiento para ser gestionado aquí.',
 	'admin.partner.attach.linkCode': 'Código de vinculación',
 	'admin.partner.attach.linkCodePlaceholder': 'pega el código…',
 	'admin.partner.attach.attaching': 'Vinculando…',
