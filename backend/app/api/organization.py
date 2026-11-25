@@ -1,13 +1,15 @@
 """Organization settings endpoints."""
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.api.auth import require_sensitive_step_up
 from app.api.deps import (
     ROLE_ADMIN,
     ensure_live_erp_entitled,
@@ -22,6 +24,7 @@ from app.config import settings
 from app.database import get_control_db
 from app.models.organization import Organization
 from app.models.user import User
+from app.schemas.auth import STEP_UP_OPERATION_SCIM_TOKEN_MINT, MFAStepUpRequest
 from app.schemas.organization import (
     BrandConfig,
     CompanyProfile,
@@ -103,6 +106,15 @@ class SCIMTokenResponse(BaseModel):
 
     token: str
     bearer_hash_prefix: str  # first 8 hex chars, useful as a UI identifier
+
+
+class SCIMTokenMintRequest(BaseModel):
+    """Body of `POST /organization/sso/scim-token`. Optional as a whole: the
+    first call carries no proof, is answered `sensitive_step_up_required`, and
+    the SPA resends with one (decisions §510)."""
+
+    #: A second-factor proof (`code` or `assertion`; a password is ignored).
+    step_up: MFAStepUpRequest | None = None
 
 
 def _is_admin(user: User) -> bool:
@@ -1176,10 +1188,13 @@ async def test_erp_connection(
 
 @router.post("/sso/scim-token", response_model=SCIMTokenResponse)
 async def mint_scim_token(
+    response: Response,
+    body: SCIMTokenMintRequest | None = None,
     org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
     _entitled: User = Depends(require_entitlement(FEATURE_SCIM)),
     db: AsyncSession = Depends(get_control_db),
+    host: Annotated[str | None, Header()] = None,
 ):
     """Mint a fresh SCIM bearer token for this tenant.
 
@@ -1197,7 +1212,25 @@ async def mint_scim_token(
     rule). PII-free and secret-free: the digest prefix is a non-secret label
     that lets an operator tell which token is live without revealing it, and
     `rotated` says whether a live token was replaced.
+
+    Second-factor step-up first (`api/auth.require_sensitive_step_up`,
+    operation `scim_token_mint` — a code or a passkey, never the password),
+    exactly as closing the workspace asks: an admin JWT alone must not be
+    enough to mint a credential that can create users and grant roles. The
+    proof kind lands on the audit row as `step_up`. Revoke is deliberately NOT
+    gated — it only removes access, and a hijacked session revoking the token
+    costs an outage, not an account takeover (decisions §510).
+
+    The response carries `Cache-Control: no-store`: the plaintext must not
+    sit in a browser or proxy cache after the reveal dialog closes.
     """
+    proof = await require_sensitive_step_up(
+        user,
+        body.step_up if body else None,
+        db=db,
+        operation=STEP_UP_OPERATION_SCIM_TOKEN_MINT,
+        host=host,
+    )
     raw, digest = generate_scim_token()
 
     # Under the row lock, like every settings writer: an unlocked read here could
@@ -1210,13 +1243,19 @@ async def mint_scim_token(
             action="organization.scim_token_minted",
             entity_type="organization",
             entity_id=org.id,
-            details={"bearer_hash_prefix": digest[:8], "rotated": _scim_hash(org) is not None},
+            details={
+                "bearer_hash_prefix": digest[:8],
+                "rotated": _scim_hash(org) is not None,
+                "step_up": proof,
+            },
         )
     except Exception:
         await db.rollback()
         raise HTTPException(status_code=503, detail=AUDIT_UNWRITABLE_DETAIL) from None
     _set_scim_hash(org, digest)
     await db.commit()
+
+    response.headers["Cache-Control"] = "no-store"
 
     return SCIMTokenResponse(token=raw, bearer_hash_prefix=digest[:8])
 
@@ -1234,6 +1273,8 @@ async def revoke_scim_token(
     it minted out of circulation. Audited first (`organization.scim_token_revoked`,
     the prefix of the digest it removed), 503 with nothing changed when the row
     cannot be written. Revoking when no token is set is a no-op with no row.
+    No second-factor step-up, unlike the mint: revoking only takes access
+    away, and it must stay one click for an admin responding to a leak.
     """
     org = await lock_organization(db, org)
     previous = _scim_hash(org)

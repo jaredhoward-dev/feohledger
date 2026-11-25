@@ -13,12 +13,26 @@
 	 * refusal that `api.ts` already states in the reader's language, and this
 	 * panel shows it as is — it never restates the range.
 	 *
+	 * A stored tolerance outside 0–100 (an old unaudited write the PO match
+	 * still applies) comes back flagged `tolerance_out_of_range`; the panel
+	 * marks it and asks for a fix, and never rewrites it on its own.
+	 *
+	 * Form conventions (`frontend/docs/ui-patterns.md`): a missing vendor / GL
+	 * account is a field error on that picker (`aria-invalid`, focus moved
+	 * there); a failed GL-account list is an error with Retry, never an empty
+	 * select; the armed Remove disarms on a click anywhere else; opening the
+	 * rule form focuses its first field and closing it returns focus to the
+	 * Add / Edit control that opened it. Tolerances are pre-filled and hinted
+	 * in the reader's decimal notation (`toleranceInput` / `toleranceExample`).
+	 *
 	 * Admin-only end to end: `readOnly` renders the notice and makes no read.
 	 */
+	import { tick } from 'svelte';
 	import OrgSettingPanel from '#lib/components/organization/OrgSettingPanel.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import VendorPicker from '#lib/components/ui/VendorPicker.svelte';
 	import RowAction from '#lib/components/ui/RowAction.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import {
 		deleteCommodityMatchRule,
@@ -37,6 +51,8 @@
 		isLooserThanOrganization,
 		organizationTolerance,
 		toleranceBody,
+		toleranceExample,
+		toleranceInput,
 		type InspectionChoice,
 		type MatchRuleFields,
 		type MatchRules
@@ -85,6 +101,14 @@
 	let armed = $state<string | null>(null);
 	let glAccounts = $state<GlAccount[]>([]);
 	let glLoaded = false;
+	let glLoading = $state(false);
+	let glLoadFailed = $state(false);
+	/** The vendor / GL account was not chosen on submit (a field error). */
+	let targetError = $state<string | null>(null);
+	let formEl = $state<HTMLFormElement | null>(null);
+	let addButton = $state<HTMLButtonElement | null>(null);
+	/** The Add / Edit control that opened the form — where focus goes back. */
+	let formTrigger: HTMLElement | null = null;
 
 	const glCodes = $derived(
 		[...new Map(glAccounts.map((a) => [a.code, a])).values()].sort((a, b) =>
@@ -94,10 +118,16 @@
 	const ruleCount = $derived(
 		rules ? rules.vendor_rules.length + rules.commodity_rules.length : 0
 	);
+	const anyOutOfRange = $derived(
+		!!rules &&
+			[rules.organization, ...rules.vendor_rules, ...rules.commodity_rules].some(
+				(r) => r.tolerance_out_of_range
+			)
+	);
 
 	function apply(next: MatchRules) {
 		rules = next;
-		orgTolerance = next.organization.tolerance_pct ?? '';
+		orgTolerance = toleranceInput(next.organization.tolerance_pct);
 		orgInspection = inspectionChoice(next.organization.require_inspection);
 	}
 
@@ -119,13 +149,25 @@
 		void load();
 	});
 
+	/** Load the chart once. A failure keeps the LoadError (and the Retry the
+	 *  user pressed) mounted through the retry; when a retry succeeds, focus
+	 *  moves to the select that replaces it rather than falling to `<body>`. */
 	async function ensureGlAccounts() {
-		if (glLoaded) return;
-		glLoaded = true;
+		if (glLoaded || glLoading) return;
+		const retrying = glLoadFailed;
+		glLoading = true;
 		try {
 			glAccounts = await listGlAccounts({ active_only: true });
+			glLoaded = true;
+			glLoadFailed = false;
 		} catch {
-			glLoaded = false;
+			glLoadFailed = true;
+		} finally {
+			glLoading = false;
+		}
+		if (retrying && glLoaded) {
+			await tick();
+			formEl?.querySelector<HTMLElement>('[data-testid="match-rule-gl"]')?.focus();
 		}
 	}
 
@@ -154,6 +196,14 @@
 		}
 	}
 
+	/** Open the form and move focus to its first field (WCAG 2.4.3). */
+	async function showForm() {
+		formTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		formOpen = true;
+		await tick();
+		formEl?.querySelector<HTMLElement>('input:not([type="hidden"]), select')?.focus();
+	}
+
 	function openAdd() {
 		editing = null;
 		scope = 'vendor';
@@ -161,28 +211,48 @@
 		glCode = '';
 		ruleTolerance = '';
 		ruleInspection = 'inherit';
-		formOpen = true;
+		targetError = null;
 		void ensureGlAccounts();
+		void showForm();
 	}
 
 	function openEdit(kind: Scope, key: string, label: string, rule: MatchRuleFields) {
 		editing = { scope: kind, key, label };
 		scope = kind;
-		ruleTolerance = rule.tolerance_pct ?? '';
+		ruleTolerance = toleranceInput(rule.tolerance_pct);
 		ruleInspection = inspectionChoice(rule.require_inspection);
-		formOpen = true;
+		targetError = null;
+		void showForm();
 	}
 
-	function closeForm() {
+	/** Close the form and return focus to the control that opened it — the
+	 *  row's Edit, or (once the form is gone and it is back) Add rule. */
+	async function closeForm() {
 		formOpen = false;
 		editing = null;
+		targetError = null;
+		const back = formTrigger;
+		formTrigger = null;
+		await tick();
+		if (back?.isConnected && !(back as HTMLButtonElement).disabled) back.focus();
+		else addButton?.focus();
+	}
+
+	function clearTargetError() {
+		targetError = null;
 	}
 
 	async function saveRule(event: SubmitEvent) {
 		event.preventDefault();
 		const key = editing?.key ?? (scope === 'vendor' ? vendorId : glCode);
 		if (!key) {
-			toast(m('org.matchRules.pickTarget'), 'error');
+			targetError = m(scope === 'vendor' ? 'org.matchRules.pickVendor' : 'org.matchRules.pickGl');
+			await tick();
+			formEl
+				?.querySelector<HTMLElement>(
+					scope === 'vendor' ? '[data-testid="match-rule-vendor"]' : '[data-testid="match-rule-gl"]'
+				)
+				?.focus();
 			return;
 		}
 		const body = {
@@ -197,7 +267,7 @@
 					: await saveCommodityMatchRule(key, body)
 			);
 			toast(m('org.matchRules.ruleSaved'), 'success');
-			closeForm();
+			void closeForm();
 		} catch (err) {
 			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
@@ -218,14 +288,21 @@
 				kind === 'vendor' ? await deleteVendorMatchRule(key) : await deleteCommodityMatchRule(key)
 			);
 			toast(m('org.matchRules.ruleRemoved'), 'success');
-			if (editing?.key === key) closeForm();
+			if (editing?.key === key) void closeForm();
 		} catch (err) {
 			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
 		} finally {
 			removing = null;
 		}
 	}
+	/** The armed Remove disarms on a click anywhere outside a row action
+	 *  (`docs/ui-patterns.md` § armed-confirm; `routes/gl-accounts`). */
+	function disarmOnOutsideClick(e: MouseEvent) {
+		if (armed && !(e.target as HTMLElement | null)?.closest('.row-action')) armed = null;
+	}
 </script>
+
+<svelte:window onclick={disarmOnOutsideClick} />
 
 {#snippet ruleRow(kind: Scope, key: string, label: string, rule: MatchRuleFields)}
 	<tr data-testid="match-rule-row">
@@ -235,6 +312,9 @@
 		</td>
 		<td>
 			{tolerancePhrase(rule.tolerance_pct)}
+			{#if rule.tolerance_out_of_range}
+				<Badge tone="danger">{m('org.matchRules.outOfRange')}</Badge>
+			{/if}
 			{#if rules && isLooserThanOrganization(rule, rules)}
 				<Badge tone="warning">{m('org.matchRules.looser')}</Badge>
 			{/if}
@@ -274,6 +354,11 @@
 >
 	{#if rules}
 		<p class="precedence" id="{uid}-precedence">{m('org.matchRules.precedence')}</p>
+		{#if anyOutOfRange}
+			<p class="out-of-range-notice" data-testid="match-rules-out-of-range">
+				{m('org.matchRules.outOfRangeNotice')}
+			</p>
+		{/if}
 
 		<fieldset class="group" data-testid="match-rules-organization">
 			<legend>{m('org.matchRules.orgHeading')}</legend>
@@ -293,7 +378,10 @@
 						autocomplete="off"
 						bind:value={orgTolerance}
 						placeholder={formatPercent(rules.built_in.tolerance_pct, PCT)}
-						aria-describedby="{uid}-tol-hint"
+						aria-invalid={rules.organization.tolerance_out_of_range ? 'true' : undefined}
+						aria-describedby={rules.organization.tolerance_out_of_range
+							? `${uid}-org-tol-range ${uid}-tol-hint`
+							: `${uid}-tol-hint`}
 						disabled={orgSaving}
 						data-testid="match-rules-org-tolerance"
 					/>
@@ -315,7 +403,14 @@
 					</select>
 				</label>
 			</div>
-			<p id="{uid}-tol-hint" class="field-hint">{m('org.matchRules.toleranceHint')}</p>
+			{#if rules.organization.tolerance_out_of_range}
+				<p id="{uid}-org-tol-range" class="field-error" data-testid="match-rules-org-out-of-range">
+					{m('org.matchRules.orgOutOfRange')}
+				</p>
+			{/if}
+			<p id="{uid}-tol-hint" class="field-hint">
+				{m('org.matchRules.toleranceHint', { example: toleranceExample() })}
+			</p>
 			<button
 				type="button"
 				class="btn-secondary"
@@ -365,7 +460,13 @@
 		{/if}
 
 		{#if formOpen}
-			<form class="group" onsubmit={saveRule} data-testid="match-rule-form">
+			<form
+				class="group"
+				onsubmit={saveRule}
+				novalidate
+				bind:this={formEl}
+				data-testid="match-rule-form"
+			>
 				<fieldset>
 					<legend>
 						{editing
@@ -375,11 +476,23 @@
 					{#if !editing}
 						<div class="scope-choice" role="radiogroup" aria-label={m('org.matchRules.scopeLabel')}>
 							<label>
-								<input type="radio" name="{uid}-scope" value="vendor" bind:group={scope} />
+								<input
+									type="radio"
+									name="{uid}-scope"
+									value="vendor"
+									bind:group={scope}
+									onchange={clearTargetError}
+								/>
 								{m('org.matchRules.scope.vendor')}
 							</label>
 							<label>
-								<input type="radio" name="{uid}-scope" value="commodity" bind:group={scope} />
+								<input
+									type="radio"
+									name="{uid}-scope"
+									value="commodity"
+									bind:group={scope}
+									onchange={clearTargetError}
+								/>
 								{m('org.matchRules.scope.commodity')}
 							</label>
 						</div>
@@ -389,17 +502,41 @@
 								label={m('org.matchRules.vendorLabel')}
 								placeholder={m('org.matchRules.vendorPlaceholder')}
 								testid="match-rule-vendor"
+								invalid={!!targetError}
+								errorId={targetError ? `${uid}-target-error` : undefined}
+								onselect={clearTargetError}
+							/>
+						{:else if glLoadFailed}
+							<LoadError
+								message={m('org.matchRules.glLoadFailed')}
+								onretry={ensureGlAccounts}
+								retrying={glLoading}
+								testId="match-rule-gl-load-error"
 							/>
 						{:else}
 							<label for="{uid}-gl">
 								<span>{m('org.matchRules.glLabel')}</span>
-								<select id="{uid}-gl" bind:value={glCode} data-testid="match-rule-gl">
+								<select
+									id="{uid}-gl"
+									bind:value={glCode}
+									onchange={clearTargetError}
+									disabled={glLoading}
+									aria-busy={glLoading ? 'true' : undefined}
+									aria-invalid={targetError ? 'true' : undefined}
+									aria-describedby={targetError ? `${uid}-target-error` : undefined}
+									data-testid="match-rule-gl"
+								>
 									<option value="">{m('org.matchRules.glPlaceholder')}</option>
 									{#each glCodes as account (account.code)}
 										<option value={account.code}>{account.code} — {account.name}</option>
 									{/each}
 								</select>
 							</label>
+						{/if}
+						{#if targetError}
+							<p class="field-error" id="{uid}-target-error" data-testid="match-rule-target-error">
+								{targetError}
+							</p>
 						{/if}
 					{/if}
 					<div class="row">
@@ -429,13 +566,21 @@
 							</select>
 						</label>
 					</div>
-					<p id="{uid}-rule-tol-hint" class="field-hint">{m('org.matchRules.ruleToleranceHint')}</p>
+					<p id="{uid}-rule-tol-hint" class="field-hint">
+						{m('org.matchRules.ruleToleranceHint', { example: toleranceExample() })}
+					</p>
 				</fieldset>
 				<div class="form-actions">
 					<button type="submit" class="btn-primary" disabled={ruleSaving} data-testid="match-rule-save">
 						{ruleSaving ? m('org.common.saving') : m('org.matchRules.saveRule')}
 					</button>
-					<button type="button" class="btn-secondary" disabled={ruleSaving} onclick={closeForm}>
+					<button
+						type="button"
+						class="btn-secondary"
+						disabled={ruleSaving}
+						onclick={() => void closeForm()}
+						data-testid="match-rule-cancel"
+					>
 						{m('org.matchRules.cancel')}
 					</button>
 				</div>
@@ -445,7 +590,13 @@
 
 	{#snippet footer()}
 		{#if rules && !formOpen}
-			<button type="button" class="btn-primary" onclick={openAdd} data-testid="match-rule-add">
+			<button
+				type="button"
+				class="btn-primary"
+				bind:this={addButton}
+				onclick={openAdd}
+				data-testid="match-rule-add"
+			>
 				{m('org.matchRules.add')}
 			</button>
 		{/if}
@@ -453,6 +604,21 @@
 </OrgSettingPanel>
 
 <style>
+	.out-of-range-notice {
+		margin: 0 0 16px;
+		padding: 8px 12px;
+		border-radius: 6px;
+		background: var(--danger-tint);
+		color: var(--danger-on-tint);
+		font-size: 0.85rem;
+	}
+
+	.field-error {
+		font-size: 0.78rem;
+		color: var(--danger);
+		margin: 4px 0 8px;
+	}
+
 	.precedence {
 		margin: 0 0 16px;
 		font-size: 0.85rem;

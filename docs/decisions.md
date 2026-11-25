@@ -26101,6 +26101,25 @@ which is where an operator matches a token to its mint. *Keeping the
 post-commit audit*: a provisioning credential minted with no row is worse than
 a refused mint.
 
+**Amendment (round 41 review): mint and rotate demand a second-factor
+step-up; revoke does not.** An admin JWT alone could mint this token, and the
+token creates users and grants roles, so a stolen admin session became a
+standing provisioning credential that outlives the session. `POST` now calls
+`api/auth.require_sensitive_step_up` with its own operation,
+`scim_token_mint` (a current authenticator code or a passkey assertion, never
+the password; refused, not exempted, for an account with no second factor),
+exactly as closing the workspace does (§306), and the audit row records the
+proof as `step_up`. The panel drives it the same way as
+`CloseWorkspacePanel`: the first call is answered `sensitive_step_up_required`,
+`ui/StepUpPrompt` collects the proof and the panel resends. **Revoke stays
+ungated**: it only takes access away, a hijacked session revoking the token
+costs an outage rather than an account takeover, and an admin answering a
+leak must be able to retire it in one step. The mint response is
+`Cache-Control: no-store` (there is no global middleware that sets it), so the
+plaintext is not kept by a browser or proxy cache after the reveal closes.
+Generate and Revoke each replace the button that was pressed, so focus goes to
+the new primary action when their dialog closes.
+
 ## 511. Out-of-office delegation is a profile panel, and a delegate must already be able to approve (round 41)
 
 **Context.** `GET/POST/DELETE /api/auth/delegation` shipped with no screen
@@ -26219,3 +26238,17 @@ approval re-judge already takes the strictest rule across GL codes
 (`strictest_rule_for_any_commodity`); the screen flags it instead. *Recording
 created-by / created-at on each rule*: the audit rows already hold who and when,
 and a name copied into settings would be one more place erasure has to reach.
+
+**Amendment (round 41 review).** *Looser* covers both knobs: a rule with
+`require_inspection: false` over an organization (or built-in) that requires
+inspection skips the quality hold, so it is flagged like a wider tolerance.
+*Out-of-range stored values*: the generic PATCH accepted tolerances such as
+`"-5"` or `"500"` before it was closed to this block, and the resolver still
+applies them. The read reports each layer's `tolerance_out_of_range` and the
+panel flags it with a prompt to save a valid value. Rewriting them
+automatically was rejected: it would change a money-path control with no
+admin's decision behind it, and clamping either way picks a policy nobody
+chose. The panel also follows the shared form conventions (picker field error,
+GL-list Retry, outside-click disarm, focus on open and close, locale decimal
+separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
+duplicated.

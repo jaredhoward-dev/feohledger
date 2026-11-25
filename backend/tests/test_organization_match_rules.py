@@ -14,6 +14,8 @@ Covers:
     row is a 503 with nothing saved.
   * The generic `PATCH /api/organization` refuses a change to the block and
     passes an unchanged copy.
+  * A stored tolerance outside 0–100 (an old unaudited PATCH) reads back as
+    stored with `tolerance_out_of_range: true` and is never rewritten.
 
 `Organization.settings` is reset by the `realdb` harness before every test.
 """
@@ -28,7 +30,11 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.api.organization_match_rules import guard_matching_block, parse_tolerance
+from app.api.organization_match_rules import (
+    guard_matching_block,
+    parse_tolerance,
+    tolerance_out_of_range,
+)
 from app.models.gl_account import GLAccount
 from app.models.organization import Organization
 from app.models.vendor import Vendor
@@ -164,7 +170,11 @@ async def test_defaults_read_back_with_no_block(realdb):
         resp = await c.get(RULES)
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
-        "organization": {"tolerance_pct": None, "require_inspection": None},
+        "organization": {
+            "tolerance_pct": None,
+            "require_inspection": None,
+            "tolerance_out_of_range": False,
+        },
         "built_in": {"tolerance_pct": "5", "require_inspection": False},
         "vendor_rules": [],
         "commodity_rules": [],
@@ -184,6 +194,7 @@ async def test_vendor_rule_create_edit_delete_audits_and_reaches_the_resolver(re
                 "vendor_name": "Acme Supplies",
                 "tolerance_pct": "1.5",
                 "require_inspection": None,
+                "tolerance_out_of_range": False,
             }
         ]
         stored = await _settings(realdb)
@@ -228,13 +239,18 @@ async def test_commodity_rule_keeps_siblings_and_needs_a_chart_code(realdb):
         resp = await c.put(f"{RULES}/commodities/{code}", json={"require_inspection": True})
         assert resp.status_code == 200, resp.text
         body = resp.json()
-    assert body["organization"] == {"tolerance_pct": "4", "require_inspection": None}
+    assert body["organization"] == {
+        "tolerance_pct": "4",
+        "require_inspection": None,
+        "tolerance_out_of_range": False,
+    }
     assert body["commodity_rules"] == [
         {
             "gl_account": code,
             "gl_account_name": "Freight",
             "tolerance_pct": None,
             "require_inspection": True,
+            "tolerance_out_of_range": False,
         }
     ]
     assert (await _settings(realdb))["matching"] == {
@@ -273,9 +289,17 @@ async def test_organization_layer_round_trip(realdb):
             f"{RULES}/organization", json={"tolerance_pct": "3", "require_inspection": False}
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["organization"] == {"tolerance_pct": "3", "require_inspection": False}
+        assert resp.json()["organization"] == {
+            "tolerance_pct": "3",
+            "require_inspection": False,
+            "tolerance_out_of_range": False,
+        }
         back = await c.put(f"{RULES}/organization", json={})
-        assert back.json()["organization"] == {"tolerance_pct": None, "require_inspection": None}
+        assert back.json()["organization"] == {
+            "tolerance_pct": None,
+            "require_inspection": None,
+            "tolerance_out_of_range": False,
+        }
     rows = await _rows(realdb, "organization.match_rule_updated")
     assert [r.details["scope"] for r in rows] == ["organization", "organization"]
 
@@ -308,3 +332,44 @@ async def test_generic_patch_cannot_change_the_block(realdb):
         )
         assert same.status_code == 200, same.text
     assert (await _settings(realdb))["matching"] == {"tolerance_pct": "2"}
+
+
+@pytest.mark.parametrize(
+    ("value", "flagged"),
+    [
+        (None, False),
+        (Decimal("0"), False),
+        (Decimal("100"), False),
+        (Decimal("-5"), True),
+        (Decimal("500"), True),
+        (Decimal("100.01"), True),
+    ],
+)
+def test_tolerance_out_of_range_matches_the_writer_bounds(value, flagged):
+    assert tolerance_out_of_range(value) is flagged
+
+
+@pytest.mark.asyncio
+async def test_a_stored_out_of_range_tolerance_is_reported_not_rewritten(realdb):
+    """Old unaudited PATCHes could store values this writer refuses. The
+    resolver still applies them, so the read shows them as stored and flags
+    them — it neither hides them as "not set" nor rewrites them."""
+    vendor_id = await _vendor(realdb)
+    block = {
+        "tolerance_pct": "500",
+        "vendor_rules": {str(vendor_id): {"tolerance_pct": "-5"}},
+    }
+    await _seed_settings(realdb, {"matching": block})
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.get(RULES)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["organization"] == {
+        "tolerance_pct": "500",
+        "require_inspection": None,
+        "tolerance_out_of_range": True,
+    }
+    assert body["vendor_rules"][0]["tolerance_pct"] == "-5"
+    assert body["vendor_rules"][0]["tolerance_out_of_range"] is True
+    # Reading changed nothing.
+    assert (await _settings(realdb))["matching"] == block

@@ -25,7 +25,8 @@ export type StepUpOperation =
 	| 'passkey_register'
 	| 'passkey_delete'
 	| 'dsar_unmasked_export'
-	| 'workspace_close';
+	| 'workspace_close'
+	| 'scim_token_mint';
 
 /** Re-proof of account control, sent with any change to an existing second
  * factor. Any ONE of the three satisfies the server: the account password, a

@@ -9,10 +9,15 @@
 // exact decimal strings in percentage POINTS ("2.5" = 2.5%).
 
 import type { MessageKey } from '#lib/i18n/messages.ts';
+import { decimalSeparator } from '#lib/utils/quantity.ts';
 
 export interface MatchRuleFields {
 	tolerance_pct: string | null;
 	require_inspection: boolean | null;
+	/** The stored tolerance is applied by the PO match but lies outside the
+	 *  0–100 range the writer accepts (an old unaudited write). The server
+	 *  reports it and never rewrites it; the panel flags it for a fix. */
+	tolerance_out_of_range?: boolean;
 }
 
 export interface VendorMatchRule extends MatchRuleFields {
@@ -76,6 +81,25 @@ export function toleranceBody(text: string): string | null {
 }
 
 /**
+ * A stored dot-decimal tolerance as the reader writes it, to pre-fill a field
+ * ("2.5" → "2,5" in de / fr / es / pt-BR); blank for `null` (inherit). The
+ * separator is the shared one `utils/quantity.ts` reads from `Intl`, the same
+ * one `toleranceBody` accepts back.
+ */
+export function toleranceInput(
+	value: string | null,
+	locale: string | undefined = undefined
+): string {
+	if (value === null) return '';
+	return value.replace('.', decimalSeparator(locale));
+}
+
+/** "2.5" in the reader's notation — the example the tolerance hints quote. */
+export function toleranceExample(locale: string | undefined = undefined): string {
+	return `2${decimalSeparator(locale)}5`;
+}
+
+/**
  * The tolerance the organization layer resolves to: its own value, else the
  * built-in. This is the floor a vendor or commodity rule falls back to.
  */
@@ -83,8 +107,24 @@ export function organizationTolerance(rules: MatchRules): string {
 	return rules.organization.tolerance_pct ?? rules.built_in.tolerance_pct;
 }
 
-/** Exact comparison of two non-negative decimal strings (no float). */
+/** Exact comparison of two decimal strings (no float). Signed, because an
+ *  out-of-range stored tolerance ("-5") can reach it. */
 export function compareDecimal(a: string, b: string): number {
+	const negA = a.startsWith('-');
+	const negB = b.startsWith('-');
+	if (negA || negB) {
+		const magA = negA ? a.slice(1) : a;
+		const magB = negB ? b.slice(1) : b;
+		const zeroA = !/[1-9]/.test(magA);
+		const zeroB = !/[1-9]/.test(magB);
+		if (negA && negB) return compareMagnitude(magB, magA);
+		if (negA) return zeroA && zeroB ? 0 : -1;
+		return zeroA && zeroB ? 0 : 1;
+	}
+	return compareMagnitude(a, b);
+}
+
+function compareMagnitude(a: string, b: string): number {
 	const [ai, af = ''] = a.split('.');
 	const [bi, bf = ''] = b.split('.');
 	const intA = ai.replace(/^0+(?=\d)/, '');
@@ -98,12 +138,20 @@ export function compareDecimal(a: string, b: string): number {
 	return fa < fb ? -1 : 1;
 }
 
+/** The inspection requirement the organization layer resolves to. */
+export function organizationInspection(rules: MatchRules): boolean {
+	return rules.organization.require_inspection ?? rules.built_in.require_inspection;
+}
+
 /**
- * A rule's own tolerance is wider than the organization's: more of this
- * vendor's (or GL account's) invoices pass the PO match unflagged. The screen
- * says so beside the rule, since that is the direction that needs a reason.
+ * A rule loosens the match against the organization's: more of this vendor's
+ * (or GL account's) invoices pass unflagged. Either knob can do it — a wider
+ * tolerance, or `require_inspection: false` where the organization requires
+ * inspection (the invoice skips the quality hold). The screen says so beside
+ * the rule, since that is the direction that needs a reason.
  */
 export function isLooserThanOrganization(rule: MatchRuleFields, rules: MatchRules): boolean {
+	if (rule.require_inspection === false && organizationInspection(rules)) return true;
 	if (rule.tolerance_pct === null) return false;
 	return compareDecimal(rule.tolerance_pct, organizationTolerance(rules)) > 0;
 }

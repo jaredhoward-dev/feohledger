@@ -1101,8 +1101,10 @@ code or a passkey assertion (minted by `POST /auth/mfa/step-up/passkey` for that
 action's own operation), in every tenant — so the SSO-only case needs no special
 sentence, because the password is a proof here for nobody. Its callers are the
 unmasked-banking DSAR export (`POST /api/privacy/dsar` with `include_banking`,
-operation `dsar_unmasked_export`) and closing a workspace (`POST
-/api/organization/close`, operation `workspace_close`, decisions §306). Four
+operation `dsar_unmasked_export`), closing a workspace (`POST
+/api/organization/close`, operation `workspace_close`, decisions §306) and
+minting or rotating the SCIM token (`POST /api/organization/sso/scim-token`,
+operation `scim_token_mint`, decisions §510). Four
 coded refusals:
 `sensitive_step_up_required` (`403`, no factor proof sent — the SPA's cue to
 collect one and resend; not throttled, not audited as a failure),
@@ -2892,6 +2894,17 @@ Each tenant has its own SCIM bearer token. An admin manages it from
 
 Re-calling the endpoint rotates the token: the old hash is overwritten, so any IdP still using the previous token starts seeing 401s.
 
+**Minting and rotating demand a second-factor step-up** (decisions §510): the
+route calls `require_sensitive_step_up` with operation `scim_token_mint`, the
+same gate as closing the workspace (§306) — a current authenticator code or a
+passkey assertion in the body's `step_up`, never the password. With no proof
+the answer is `403 sensitive_step_up_required` and nothing is minted; the
+`/organization` SCIM panel then opens `ui/StepUpPrompt` and resends. An
+account with no second factor is refused (`sensitive_step_up_no_factor`), not
+exempted. The audit row records which proof verified (`step_up`), and the
+response is `Cache-Control: no-store`. Revoke needs no step-up: it only takes
+access away.
+
 `DELETE /api/organization/sso/scim-token` revokes it: both copies of the
 digest are cleared, so the IdP's next call is a 401. Revoke is admin-only but
 not plan-gated, so a tenant that has dropped to a plan without SCIM can still
@@ -2899,8 +2912,8 @@ take its token out of circulation; with no token set it is a no-op (decisions
 §510).
 
 Every mint / rotation writes an `organization.scim_token_minted` audit row into
-the tenant trail, carrying the 8-char digest prefix and `rotated` (whether a
-live token was replaced) and nothing else — never the token or its full digest.
+the tenant trail, carrying the 8-char digest prefix, `rotated` (whether a
+live token was replaced) and `step_up` (the proof kind) and nothing else — never the token or its full digest.
 A revoke writes `organization.scim_token_revoked` with the removed digest's
 prefix. Both rows are written **first**: a row that cannot be written is a 503
 with nothing minted or revoked (the `PUT /organization/sso` rule). This is a tenant-wide user-provisioning credential

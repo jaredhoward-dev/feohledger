@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test';
+import type { Page, Route } from '@playwright/test';
 import { API_BASE, authedTenantHeaders, expect, signInAndWait, test } from '../fixtures/helpers';
 
 /**
@@ -11,6 +11,11 @@ import { API_BASE, authedTenantHeaders, expect, signInAndWait, test } from '../f
  * What this spec holds is the page's side: the plaintext is shown once and is
  * gone after the dialog closes and after a reload, rotating and revoking each
  * ask first, and a non-admin gets the notice and no request at all.
+ *
+ * Minting demands a second factor (decisions §510). MFA is off in the e2e
+ * stack, where `require_sensitive_step_up` skips the gate, so the step-up
+ * test STUBS the mint to answer `sensitive_step_up_required` the way a
+ * deployed server does (the server half is in the pytest file above).
  *
  * Each test starts from no token. The SCIM provisioning spec mints its own
  * token per test, so leaving none behind costs it nothing.
@@ -108,6 +113,65 @@ test.describe('/organization — SCIM provisioning', () => {
 		expect((await revoked).status()).toBe(204);
 		await expect(panel.getByTestId('scim-status')).toHaveAttribute('data-configured', 'false');
 		await expect(panel.getByTestId('scim-generate')).toBeVisible();
+	});
+
+	test('generating asks for a second factor and resends with the proof', async ({ page }) => {
+		const posted: Record<string, unknown>[] = [];
+		await page.route(
+			(url) => url.pathname === TOKEN_PATH,
+			async (route: Route) => {
+				if (route.request().method() !== 'POST') return route.fallback();
+				const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;
+				posted.push(body);
+				if (!body.step_up) {
+					return route.fulfill({
+						status: 403,
+						contentType: 'application/json',
+						body: JSON.stringify({
+							detail: {
+								code: 'sensitive_step_up_required',
+								message: 'Confirm a current authenticator code or a registered passkey to continue.',
+								params: {}
+							}
+						})
+					});
+				}
+				return route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					headers: { 'Cache-Control': 'no-store' },
+					body: JSON.stringify({ token: 'scim_stubbed_token_value', bearer_hash_prefix: 'abcd1234' })
+				});
+			}
+		);
+		await page.goto('/organization?section=scim');
+		const panel = page.getByTestId('scim-panel');
+		await panel.getByTestId('scim-generate').click();
+
+		const prompt = page.getByRole('dialog', { name: 'Confirm it’s you' });
+		await expect(prompt).toBeVisible();
+		await expect(prompt).toContainText('A SCIM token can create users and grant roles.');
+		await prompt.getByTestId('step-up-code').fill('123456');
+		await prompt.getByRole('button', { name: 'Confirm' }).click();
+
+		const reveal = page.getByRole('dialog', { name: 'New SCIM token' });
+		await expect(reveal.getByTestId('scim-token-value')).toHaveText('scim_stubbed_token_value');
+		expect(posted).toEqual([{}, { step_up: { code: '123456' } }]);
+	});
+
+	test('the new primary action takes focus after Generate and after Revoke', async ({ page }) => {
+		await page.goto('/organization?section=scim');
+		const panel = page.getByTestId('scim-panel');
+
+		await panel.getByTestId('scim-generate').click();
+		await page.getByRole('dialog', { name: 'New SCIM token' }).getByRole('button', { name: 'Done' }).click();
+		// The Generate button is gone; focus lands on its replacement, not the page.
+		await expect(panel.getByTestId('scim-rotate')).toBeFocused();
+
+		await panel.getByTestId('scim-revoke').click();
+		await page.getByRole('dialog', { name: 'Revoke SCIM token' }).getByTestId('scim-confirm').click();
+		await expect(panel.getByTestId('scim-status')).toHaveAttribute('data-configured', 'false');
+		await expect(panel.getByTestId('scim-generate')).toBeFocused();
 	});
 
 	test('a non-admin sees the notice and the page asks the server nothing', async ({
