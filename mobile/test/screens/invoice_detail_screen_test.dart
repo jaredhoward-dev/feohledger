@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' show Tristate;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
@@ -365,9 +366,17 @@ void main() {
         'review-approve-semantics',
         'review-reject-semantics',
       ]) {
-        final data = tester.getSemantics(find.byKey(ValueKey(key)));
+        // The boundary node's own hint, and what a screen reader is handed
+        // for it: its data merged with the button node folded into it, which
+        // is where the button's flags live (the node alone carries only what
+        // the boundary itself states).
+        final node = tester.getSemantics(find.byKey(ValueKey(key)));
+        expect(node.hint, note, reason: key);
+        final data = node.getSemanticsData();
         expect(data.hint, note, reason: key);
         expect(data.flagsCollection.isButton, isTrue, reason: key);
+        expect(data.flagsCollection.isEnabled, Tristate.isTrue, reason: key);
+        expect(node.flagsCollection.isEnabled, Tristate.isTrue, reason: key);
       }
       handle.dispose();
     });

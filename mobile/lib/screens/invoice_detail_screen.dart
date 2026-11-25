@@ -744,7 +744,11 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
     // carries the note and that button's own refusal, the twin of the web
     // modal's `aria-describedby`; MergeSemantics folds the hint into the
     // button's own node (a bare `Semantics(hint:)` is no boundary, so the hint
-    // would bubble up to the bar instead).
+    // would bubble up to the bar instead). The button's own node is merged
+    // INTO that boundary and keeps its flags there, so the boundary states the
+    // enabled state too: it is the node a screen reader lands on, and a
+    // refused button is an inactive control, which WCAG 1.4.3 exempts from
+    // text contrast like every other disabled button here (decisions §571).
     final assignee = assignedElsewhere(inv, AuthStore.instance.user?.id);
     final assignedNote = assignee == null
         ? null
@@ -755,6 +759,9 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
       final parts = [?assignedNote, ?_refusalText(l, verdict)];
       return parts.isEmpty ? null : parts.join(' ');
     }
+
+    final rejectEnabled = !_submitting && _rejectVerdict.allowed;
+    final approveEnabled = !_submitting && _approveVerdict.allowed;
 
     return SafeArea(
       child: Padding(
@@ -791,11 +798,10 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
                       key: const ValueKey('review-reject-semantics'),
                       child: Semantics(
                         hint: hintFor(_rejectVerdict),
+                        enabled: rejectEnabled,
                         child: OutlinedButton.icon(
                           key: const ValueKey('review-reject'),
-                          onPressed: _submitting || !_rejectVerdict.allowed
-                              ? null
-                              : _reject,
+                          onPressed: rejectEnabled ? _reject : null,
                           icon: const Icon(Icons.close),
                           label: Text(l.invoiceDetailReject),
                           style: _rejectStyle(context),
@@ -810,12 +816,10 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
                       key: const ValueKey('review-approve-semantics'),
                       child: Semantics(
                         hint: hintFor(_approveVerdict),
+                        enabled: approveEnabled,
                         child: FilledButton.icon(
                           key: const ValueKey('review-approve'),
-                          onPressed:
-                              _submitting || !_approveVerdict.allowed
-                              ? null
-                              : _approve,
+                          onPressed: approveEnabled ? _approve : null,
                           icon: const Icon(Icons.check),
                           label: Text(l.invoiceDetailApprove),
                           // green.shade800 under a white label is ~5.1:1; the
