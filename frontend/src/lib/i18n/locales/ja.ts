@@ -365,6 +365,8 @@ export const messages = {
 	'profile.delegation.endFailed': "不在設定をオフにできませんでした。",
 	'profile.delegation.delegateRequired': "代理人を選択してください。",
 	'profile.delegation.lastDayRequired': "不在の最終日を今日以降で選択してください。",
+	'profile.delegation.approversOnly': "不在設定は請求書を承認する担当者向けです。あなたのアカウントには承認権限がないため、委任するものはありません。",
+	'profile.delegation.clearEnded': "終了した委任を削除",
 	'authRefusal.delegationInvalidId': "その代理人が見つかりません。一覧から同僚を選択してください。",
 	'authRefusal.delegationSelf': "自分自身に承認を委任することはできません。",
 	'authRefusal.delegationUntilInvalid': "有効な不在の最終日を選択してください。",

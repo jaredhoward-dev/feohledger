@@ -370,6 +370,8 @@ export const messages = {
 	'profile.delegation.endFailed': "No se pudo desactivar fuera de la oficina.",
 	'profile.delegation.delegateRequired': "Elige un delegado.",
 	'profile.delegation.lastDayRequired': "Elige tu último día fuera, hoy o más adelante.",
+	'profile.delegation.approversOnly': "Fuera de la oficina es para quienes aprueban facturas. Tu cuenta no puede aprobar, así que no hay nada que delegar.",
+	'profile.delegation.clearEnded': "Borrar la delegación finalizada",
 	'authRefusal.delegationInvalidId': "No se encontró ese delegado. Elige un compañero de la lista.",
 	'authRefusal.delegationSelf': "No puedes delegar tus aprobaciones en ti mismo.",
 	'authRefusal.delegationUntilInvalid': "Elige un último día fuera válido.",

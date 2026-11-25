@@ -371,6 +371,8 @@ export const messages = {
 	'profile.delegation.endFailed': "Impossible de désactiver l'absence.",
 	'profile.delegation.delegateRequired': "Choisissez un délégué.",
 	'profile.delegation.lastDayRequired': "Choisissez votre dernier jour d'absence, aujourd'hui ou plus tard.",
+	'profile.delegation.approversOnly': "L’absence est réservée aux collègues qui approuvent des factures. Votre compte ne peut pas approuver, il n'y a donc rien à déléguer.",
+	'profile.delegation.clearEnded': "Effacer la délégation terminée",
 	'authRefusal.delegationInvalidId': "Ce délégué est introuvable. Choisissez un collègue dans la liste.",
 	'authRefusal.delegationSelf': "Vous ne pouvez pas vous déléguer vos propres approbations.",
 	'authRefusal.delegationUntilInvalid': "Choisissez un dernier jour d'absence valide.",

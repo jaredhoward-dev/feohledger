@@ -372,6 +372,8 @@ export const messages = {
 	'profile.delegation.endFailed': "Não foi possível desativar a ausência.",
 	'profile.delegation.delegateRequired': "Escolha um delegado.",
 	'profile.delegation.lastDayRequired': "Escolha seu último dia fora, hoje ou depois.",
+	'profile.delegation.approversOnly': "Ausência é para colegas que aprovam faturas. Sua conta não pode aprovar, então não há nada a delegar.",
+	'profile.delegation.clearEnded': "Limpar a delegação encerrada",
 	'authRefusal.delegationInvalidId': "Esse delegado não foi encontrado. Escolha um colega da lista.",
 	'authRefusal.delegationSelf': "Você não pode delegar suas aprovações a si mesmo.",
 	'authRefusal.delegationUntilInvalid': "Escolha um último dia fora válido.",

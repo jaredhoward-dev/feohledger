@@ -410,6 +410,8 @@ export const en = {
 	'profile.delegation.endFailed': "Couldn't turn off out of office.",
 	'profile.delegation.delegateRequired': "Choose a delegate.",
 	'profile.delegation.lastDayRequired': "Choose your last day away, today or later.",
+	'profile.delegation.approversOnly': "Out of office is for colleagues who approve invoices. Your account can't approve, so there is nothing to hand over.",
+	'profile.delegation.clearEnded': "Clear the ended delegation",
 	'authRefusal.delegationInvalidId': "That delegate could not be found. Choose a colleague from the list.",
 	'authRefusal.delegationSelf': "You can't delegate your approvals to yourself.",
 	'authRefusal.delegationUntilInvalid': "Choose a valid last day away.",

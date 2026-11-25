@@ -3,19 +3,26 @@
 	 * Profile → Out of office: the caller's own approval delegation
 	 * (`GET/POST/DELETE /api/auth/delegation`, decisions §511).
 	 *
-	 * A personal setting, not an organization one — the endpoint writes the
-	 * caller's own row and is gated on sign-in alone, so every employee sees
-	 * this panel. Who may be named comes from `/api/auth/delegation/candidates`,
-	 * which shares the write's eligibility test, so the list never offers a
-	 * colleague the save would refuse. Refusals arrive coded and are stated in
-	 * the reader's language (`api/authRefusals.ts`).
+	 * A personal setting, not an organization one, and only for an approver:
+	 * the endpoints answer 403 to a caller without `invoice.approve` (there is
+	 * nothing of theirs to hand over), so the profile page offers this section
+	 * only when `auth.can('invoice.approve')`. A 403 that still arrives (the
+	 * grant was removed in another tab) is stated as that, not as a failure.
+	 * Who may be named comes from `/api/auth/delegation/candidates`, which
+	 * shares the write's eligibility test, so the list never offers a colleague
+	 * the save would refuse. Refusals arrive coded and are stated in the
+	 * reader's language (`api/authRefusals.ts`).
+	 *
+	 * The page owns the card and its heading (`profile/+page.svelte`); this
+	 * renders the card's body.
 	 */
-	import { onMount } from 'svelte';
-	import { api } from '#lib/api.ts';
+	import { onMount, tick } from 'svelte';
+	import { api, ApiError } from '#lib/api.ts';
 	import { authErrorMessage } from '#lib/api/authRefusals.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { formatDate } from '#lib/utils/time.ts';
 	import {
 		delegationState,
@@ -30,6 +37,7 @@
 	let candidates = $state<DelegateCandidate[]>([]);
 	let loaded = $state(false);
 	let loadError = $state<string | null>(null);
+	let forbidden = $state(false);
 	let busy = $state(false);
 
 	let delegateId = $state('');
@@ -38,9 +46,28 @@
 	let lastDayError = $state<string | null>(null);
 	let formError = $state<string | null>(null);
 
+	let delegateEl = $state<HTMLSelectElement | null>(null);
+	let lastDayEl = $state<HTMLInputElement | null>(null);
+	let statusEl = $state<HTMLParagraphElement | null>(null);
+
 	const today = localDay(new Date());
 	const status = $derived(delegationState(delegation));
 	const shownDay = $derived(formatDate(lastDayCovered(delegation?.until ?? null)));
+
+	// The live delegate stays named and selected even when they are no longer
+	// a candidate (their approval grant was removed since): the select would
+	// otherwise show "Choose a colleague" over a delegation that is still on.
+	// Saving them again is the server's call, and its coded refusal says why.
+	const options = $derived.by(() => {
+		const current = delegation?.delegate_to_id;
+		if (status !== 'active' || !current || candidates.some((c) => c.id === current)) {
+			return candidates;
+		}
+		return [
+			{ id: current, full_name: delegation?.delegate_to_name ?? '—' },
+			...candidates
+		];
+	});
 
 	function adoptCurrent(d: Delegation) {
 		delegation = d;
@@ -52,6 +79,7 @@
 
 	async function load() {
 		loadError = null;
+		forbidden = false;
 		try {
 			const [current, people] = await Promise.all([
 				api.get<Delegation>('/api/auth/delegation'),
@@ -60,10 +88,16 @@
 			candidates = people;
 			adoptCurrent(current);
 		} catch (err) {
-			loadError = authErrorMessage(err, m, 'profile.delegation.loadFailed');
+			if (err instanceof ApiError && err.status === 403) forbidden = true;
+			else loadError = authErrorMessage(err, m, 'profile.delegation.loadFailed');
 		} finally {
 			loaded = true;
 		}
+	}
+
+	function retryLoad() {
+		loaded = false;
+		void load();
 	}
 
 	onMount(load);
@@ -74,7 +108,14 @@
 		delegateError = delegateId ? null : m('profile.delegation.delegateRequired');
 		const until = lastDay && lastDay >= today ? untilAfterLastDay(lastDay) : null;
 		lastDayError = until ? null : m('profile.delegation.lastDayRequired');
-		if (delegateError || lastDayError || !until) return;
+		if (delegateError || lastDayError || !until) {
+			// A refused submit moves focus to the first field to fix, so the
+			// error is announced (it is first in that field's description) and
+			// the user is where they need to be (WCAG 3.3.1).
+			await tick();
+			(delegateError ? delegateEl : lastDayEl)?.focus();
+			return;
+		}
 
 		busy = true;
 		try {
@@ -99,7 +140,13 @@
 			delegation = { delegate_to_id: null, delegate_to_name: null, until: null, is_active: false };
 			delegateId = '';
 			lastDay = '';
+			delegateError = null;
+			lastDayError = null;
 			toast(m('profile.delegation.cleared'), 'success');
+			// End unmounts the button that had focus; the status line, which now
+			// reads "Off", takes it rather than <body> (WCAG 2.4.3).
+			await tick();
+			statusEl?.focus();
 		} catch (err) {
 			formError = authErrorMessage(err, m, 'profile.delegation.endFailed');
 		} finally {
@@ -108,17 +155,27 @@
 	}
 </script>
 
-<section class="card" aria-labelledby="delegation-heading" data-testid="delegation-panel">
-	<h2 id="delegation-heading">{m('profile.delegation.heading')}</h2>
+<div data-testid="delegation-panel">
 	<p class="hint">{m('profile.delegation.hint')}</p>
 	<p class="hint">{m('profile.delegation.limits')}</p>
 
 	{#if !loaded}
 		<LoadingState />
+	{:else if forbidden}
+		<p class="hint" data-testid="delegation-approvers-only">
+			{m('profile.delegation.approversOnly')}
+		</p>
 	{:else if loadError}
-		<p class="error" role="alert">{loadError}</p>
+		<LoadError message={loadError} onretry={retryLoad} testId="delegation-load-error" />
 	{:else}
-		<p class="status" class:on={status === 'active'} data-testid="delegation-status" aria-live="polite">
+		<p
+			class="status"
+			class:on={status === 'active'}
+			data-testid="delegation-status"
+			aria-live="polite"
+			tabindex="-1"
+			bind:this={statusEl}
+		>
 			{#if status === 'active'}
 				{m('profile.delegation.statusOn', {
 					name: delegation?.delegate_to_name ?? '—',
@@ -134,22 +191,42 @@
 			{/if}
 		</p>
 
-		{#if candidates.length === 0 && status !== 'active'}
+		{#if formError}
+			<p class="error" id="delegation-form-error" role="alert">{formError}</p>
+		{/if}
+
+		{#if options.length === 0}
 			<p class="hint" data-testid="delegation-no-candidates">
 				{m('profile.delegation.noCandidates')}
 			</p>
+			<!-- Nobody to name, but an ended delegation still on record can be
+			     cleared, so it does not read "ended" here indefinitely. -->
+			{#if status === 'ended'}
+				<div class="actions">
+					<button
+						type="button"
+						class="btn-secondary"
+						disabled={busy}
+						onclick={end}
+						data-testid="delegation-end"
+					>
+						{m('profile.delegation.clearEnded')}
+					</button>
+				</div>
+			{/if}
 		{:else}
 			<form onsubmit={save} novalidate aria-describedby={formError ? 'delegation-form-error' : undefined}>
 				<label>
 					<span>{m('profile.delegation.delegate')}</span>
 					<select
+						bind:this={delegateEl}
 						bind:value={delegateId}
 						aria-invalid={delegateError ? 'true' : undefined}
 						aria-describedby={delegateError ? 'delegation-delegate-error' : undefined}
 						data-testid="delegation-delegate"
 					>
 						<option value="" disabled>{m('profile.delegation.choose')}</option>
-						{#each candidates as c (c.id)}
+						{#each options as c (c.id)}
 							<option value={c.id}>{c.full_name}</option>
 						{/each}
 					</select>
@@ -160,13 +237,16 @@
 
 				<label>
 					<span>{m('profile.delegation.lastDay')}</span>
+					<!-- The error id comes FIRST in the description, so a screen
+					     reader reads what is wrong before the standing hint. -->
 					<input
+						bind:this={lastDayEl}
 						type="date"
 						min={today}
 						bind:value={lastDay}
 						aria-invalid={lastDayError ? 'true' : undefined}
 						aria-describedby={lastDayError
-							? 'delegation-last-day-hint delegation-last-day-error'
+							? 'delegation-last-day-error delegation-last-day-hint'
 							: 'delegation-last-day-hint'}
 						data-testid="delegation-last-day"
 					/>
@@ -176,18 +256,14 @@
 					<p class="field-error" id="delegation-last-day-error">{lastDayError}</p>
 				{/if}
 
-				{#if formError}
-					<p class="error" id="delegation-form-error" role="alert">{formError}</p>
-				{/if}
-
 				<div class="actions">
-					<button type="submit" disabled={busy} data-testid="delegation-save">
+					<button type="submit" class="btn-primary" disabled={busy} data-testid="delegation-save">
 						{status === 'active' ? m('profile.delegation.update') : m('profile.delegation.turnOn')}
 					</button>
 					{#if status !== 'none'}
 						<button
 							type="button"
-							class="secondary"
+							class="btn-secondary"
 							disabled={busy}
 							onclick={end}
 							data-testid="delegation-end"
@@ -199,24 +275,12 @@
 			</form>
 		{/if}
 	{/if}
-</section>
+</div>
 
 <style>
-	/* The profile page's card recipe; its rules are scoped to that page, so
-	   this panel carries its own copy rather than reaching in with :global. */
-	.card {
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 24px;
-	}
-
-	h2 {
-		margin: 0 0 12px;
-		font-size: 1rem;
-		font-weight: 600;
-	}
-
+	/* The card and its heading are the profile page's (`.card` there); this
+	   styles only the body. Buttons are the shared `.btn-primary` /
+	   `.btn-secondary` (app.css). */
 	.hint {
 		color: var(--text-muted);
 		font-size: 0.85rem;
@@ -278,9 +342,13 @@
 
 	.field-error,
 	.error {
-		margin: 0;
+		margin: 0 0 8px;
 		font-size: 0.82rem;
 		color: var(--danger-on-tint);
+	}
+
+	.field-error {
+		margin: 0;
 	}
 
 	.actions {
@@ -288,28 +356,5 @@
 		flex-wrap: wrap;
 		gap: 8px;
 		margin-top: 8px;
-	}
-
-	button {
-		padding: 9px 16px;
-		border-radius: 4px;
-		border: none;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.88rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	button:disabled {
-		opacity: 0.6;
-		cursor: not-allowed;
-	}
-
-	button.secondary {
-		background: transparent;
-		border: 1px solid var(--border);
-		color: var(--text);
 	}
 </style>

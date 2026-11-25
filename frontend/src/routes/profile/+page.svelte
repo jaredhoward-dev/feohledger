@@ -63,17 +63,23 @@
 		{ slug: 'appearance', labelKey: 'profile.appearance.heading' }
 	];
 
-	const SECTION_SLUGS = new Set(SECTIONS.map((s) => s.slug));
+	// Out of office hands over invoice approvals, so it is an approver's
+	// section only: `/api/auth/delegation*` answer 403 without
+	// `invoice.approve`, and the rail does not offer a panel that would.
+	const visibleSections = $derived(
+		SECTIONS.filter((s) => s.slug !== 'delegation' || auth.can('invoice.approve'))
+	);
 	const DEFAULT_SECTION = 'account';
 
-	// Unknown slug falls back rather than rendering an empty page.
+	// Unknown slug falls back rather than rendering an empty page — and so does
+	// a hidden one reached by URL (`?section=delegation` for a clerk).
 	const section = $derived.by(() => {
 		const slug = page.url.searchParams.get('section');
-		return slug && SECTION_SLUGS.has(slug) ? slug : DEFAULT_SECTION;
+		return slug && visibleSections.some((s) => s.slug === slug) ? slug : DEFAULT_SECTION;
 	});
 
 	const railGroups = $derived([
-		{ items: SECTIONS.map((s) => ({ slug: s.slug, label: m(s.labelKey) })) }
+		{ items: visibleSections.map((s) => ({ slug: s.slug, label: m(s.labelKey) })) }
 	]);
 
 	// Notification preferences
@@ -1096,7 +1102,10 @@
 			{/if}
 
 			{#if section === 'delegation'}
-				<DelegationPanel />
+				<section class="card" aria-labelledby="delegation-heading">
+					<h2 id="delegation-heading">{m('profile.delegation.heading')}</h2>
+					<DelegationPanel />
+				</section>
 			{/if}
 
 			{#if section === 'notifications'}

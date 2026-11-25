@@ -368,6 +368,8 @@ export const messages = {
 	'profile.delegation.endFailed': "Die Abwesenheit konnte nicht beendet werden.",
 	'profile.delegation.delegateRequired': "Wählen Sie eine Vertretung.",
 	'profile.delegation.lastDayRequired': "Wählen Sie Ihren letzten Abwesenheitstag, heute oder später.",
+	'profile.delegation.approversOnly': "Die Abwesenheit gibt es für Kolleginnen und Kollegen, die Rechnungen freigeben. Ihr Konto kann keine Rechnungen freigeben, daher gibt es nichts zu übergeben.",
+	'profile.delegation.clearEnded': "Beendete Vertretung entfernen",
 	'authRefusal.delegationInvalidId': "Diese Vertretung wurde nicht gefunden. Wählen Sie eine Person aus der Liste.",
 	'authRefusal.delegationSelf': "Sie können Ihre Freigaben nicht an sich selbst übertragen.",
 	'authRefusal.delegationUntilInvalid': "Wählen Sie einen gültigen letzten Abwesenheitstag.",
