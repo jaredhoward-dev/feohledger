@@ -106,6 +106,7 @@ export const messages = {
 	'audit.action.entity.updated': "Entidade atualizada",
 	'audit.action.exception.assigned': "Exceção atribuída",
 	'audit.action.exception.dismissed': "Exceção descartada",
+	'audit.action.exception.erp_bill_void_orphaned': "Anulação enviada ao ERP, mas não registrada aqui",
 	'audit.action.exception.erp_bill_voided': "Conta anulada no ERP a partir do alerta",
 	'audit.action.exception.escalated': "Exceção escalada",
 	'audit.action.exception.raised': "Exceção registrada",

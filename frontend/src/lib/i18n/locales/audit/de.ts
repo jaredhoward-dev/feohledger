@@ -106,6 +106,7 @@ export const messages = {
 	'audit.action.entity.updated': "Gesellschaft aktualisiert",
 	'audit.action.exception.assigned': "Ausnahme zugewiesen",
 	'audit.action.exception.dismissed': "Ausnahme verworfen",
+	'audit.action.exception.erp_bill_void_orphaned': "Stornierung an das ERP gesendet, hier aber nicht erfasst",
 	'audit.action.exception.erp_bill_voided': "Rechnung aus der Markierung im ERP storniert",
 	'audit.action.exception.escalated': "Ausnahme eskaliert",
 	'audit.action.exception.raised': "Ausnahme ausgelöst",
