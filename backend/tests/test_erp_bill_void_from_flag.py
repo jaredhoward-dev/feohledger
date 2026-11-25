@@ -19,6 +19,13 @@ it voids only on a positive `open` / `draft` read; a bill already gone
 converges without a second void; a void call that fails is unconfirmed; a
 draft-only ERP's posted bill is refused up front; the notice goes to holders
 of `payment.void`; two concurrent voids make one ERP call.
+
+Decisions §545 splits the void into three transactions: no row lock is held
+while the adapter is called (a second session locks the invoice, its flag and
+its workflow instance mid-call); the committed marker refuses a second click
+and the flag's clear (single and bulk), and keeps the payment gate holding the
+invoice; every outcome clears it; a marker left by a crashed attempt refuses
+while fresh and is taken over once stale.
 """
 
 from __future__ import annotations
@@ -184,6 +191,7 @@ class _Adapter:
         report=ErpBillState.unknown,
         scope=BILL_VOID_ANY,
         delay=0.0,
+        on_void=None,
     ):
         self.read = read
         self.voids = voids
@@ -193,6 +201,7 @@ class _Adapter:
         self.report = report
         self.bill_void_scope = scope
         self.delay = delay
+        self.on_void = on_void
         self.voided: list[str] = []
         self.void_calls = 0
 
@@ -210,6 +219,8 @@ class _Adapter:
             raise NotImplementedError
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.on_void is not None:
+            await self.on_void(doc)
         if self.void_raises is not None:
             raise self.void_raises
         self.voided.append(doc)
@@ -309,6 +320,7 @@ async def test_admin_voids_the_bill_once_and_a_replay_calls_nothing(realdb):
         inv = await s.get(Invoice, inv_id)
         assert inv.status == InvoiceStatus.approved
         assert inv.erp_document_id is None
+        assert inv.erp_void_pending is None
         inst = (
             await s.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id == inv_id))
         ).scalar_one()
@@ -372,6 +384,8 @@ async def test_the_erp_refusals_change_nothing(realdb, adapter, status_code, cod
         inv = await s.get(Invoice, inv_id)
         assert inv.status == InvoiceStatus.posted_in_erp
         assert inv.erp_document_id == "BILL-9"
+        # The attempt is over: its marker holds nothing (§545).
+        assert inv.erp_void_pending is None
     assert await _audit(mk, inv_id, "invoice.erp_bill_voided") == []
     if code not in ("erp_void_rejected", "erp_void_unsupported", "erp_void_unconfirmed"):
         assert adapter.void_calls == 0
@@ -478,8 +492,8 @@ async def test_the_void_announces_no_approval(realdb, monkeypatch):
 
 
 async def test_two_concurrent_voids_call_the_erp_once(realdb):
-    """The invoice row lock serializes them: the second waits for the first's
-    commit, then finds this flag's void recorded and replays."""
+    """The second finds the first's committed marker and is refused while the
+    first calls the ERP (§545); a click after the first finished replays."""
     info = realdb.info(TENANT)
     mk = realdb.sessionmaker(TENANT)
     inv_id = await _seed(mk, info.org_id, number="VOID-C1")
@@ -491,7 +505,9 @@ async def test_two_concurrent_voids_call_the_erp_once(realdb):
                 c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "x"}),
                 c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "x"}),
             )
-    assert sorted((a.status_code, b.status_code)) == [200, 201], (a.text, b.text)
+    assert sorted((a.status_code, b.status_code)) == [201, 409], (a.text, b.text)
+    loser = a if a.status_code == 409 else b
+    assert loser.json()["detail"]["code"] == "erp_void_in_progress"
     assert adapter.void_calls == 1
     assert len(await _audit(mk, inv_id, "invoice.erp_bill_voided")) == 1
 
@@ -592,3 +608,235 @@ async def test_a_failing_notice_does_not_abort_the_raise(realdb, monkeypatch):
         exc_id = await _flag(mk, info.org_id, posted)
     async with mk() as s:
         assert (await s.get(APException, exc_id)) is not None
+
+
+# ---------------------------------------------------------------------------
+# §545: three transactions, no row lock across the ERP
+# ---------------------------------------------------------------------------
+
+
+async def _set_marker(mk, inv_id, exc_id, *, age_s):
+    from datetime import UTC, datetime, timedelta
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        inv.erp_void_pending = {
+            "attempt_id": str(uuid.uuid4()),
+            "exception_id": str(exc_id),
+            "document_id": inv.erp_document_id,
+            "actor_id": str(uuid.uuid4()),
+            "reason": "crashed attempt",
+            "started_at": (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat(),
+        }
+        await s.commit()
+
+
+async def test_no_row_lock_is_held_while_the_erp_is_called(realdb):
+    """Mid-void, a second session takes the invoice, flag and workflow-instance
+    row locks NOWAIT; it sees the committed marker; the payment gate holds the
+    invoice; and a second click, a dismiss and a recall are all refused."""
+    from sqlalchemy import text
+
+    from app.services.payment_runs import blocked_invoice_ids
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-L1")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+    seen: dict = {}
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+
+        async def _mid_call(doc):
+            async with mk() as s:
+                for table, col, key in (
+                    ("invoices", "id", inv_id),
+                    ("exceptions", "id", exc_id),
+                    ("workflow_instances", "invoice_id", inv_id),
+                ):
+                    await s.execute(
+                        text(f"SELECT 1 FROM {table} WHERE {col} = :k FOR UPDATE NOWAIT"),
+                        {"k": key},
+                    )
+                marker = (
+                    await s.execute(select(Invoice.erp_void_pending).where(Invoice.id == inv_id))
+                ).scalar_one()
+                seen["marker"] = marker
+                seen["blocked"] = inv_id in await blocked_invoice_ids(s, [inv_id])
+                await s.rollback()
+            seen["again"] = await c.post(
+                f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "x"}
+            )
+            seen["dismiss"] = await c.post(
+                f"/api/exceptions/{exc_id}/resolve", json={"action": "dismiss", "resolution": "x"}
+            )
+            seen["bulk"] = await c.post(
+                "/api/exceptions/bulk/resolve",
+                json={"ids": [str(exc_id)], "action": "dismiss", "resolution": "x"},
+            )
+            seen["escalate"] = await c.post(
+                f"/api/exceptions/{exc_id}/resolve", json={"action": "escalate", "resolution": "x"}
+            )
+            seen["detail"] = await c.get(f"/api/exceptions/{exc_id}")
+
+        adapter = _Adapter(on_void=_mid_call)
+        with _adapter(adapter):
+            res = await c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "dup"})
+
+    assert res.status_code == 201, res.text
+    assert seen["marker"]["exception_id"] == str(exc_id)
+    assert seen["marker"]["document_id"] == "BILL-9"
+    assert seen["marker"]["reason"] == "dup"
+    assert seen["blocked"] is True
+    assert seen["again"].status_code == 409
+    assert seen["again"].json()["detail"]["code"] == "erp_void_in_progress"
+    assert seen["dismiss"].status_code == 409, seen["dismiss"].text
+    assert seen["dismiss"].json()["detail"]["code"] == "erp_void_in_progress"
+    assert seen["bulk"].json()["skipped"] == [{"id": str(exc_id), "reason": "erp_void_in_progress"}]
+    assert seen["escalate"].status_code == 200, seen["escalate"].text
+    assert seen["detail"].json()["void_erp_bill_refusal"]["code"] == "erp_void_in_progress"
+    assert adapter.void_calls == 1
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.status == InvoiceStatus.approved
+        assert inv.erp_void_pending is None
+        # The flag (escalated mid-call) is still a person's to decide.
+        assert (await s.get(APException, exc_id)).status == "escalated"
+
+
+async def test_the_marker_keeps_the_invoice_off_the_payment_and_recall_paths(realdb):
+    """While a void is in flight the flag cannot be cleared, so the run and
+    card gates (`blocked_invoice_ids`) keep holding the invoice; the recall and
+    the push doors refuse it by its status and its bill."""
+    from app.services.payment_runs import blocked_invoice_ids
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-L2")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+    await _set_marker(mk, inv_id, exc_id, age_s=5)
+    async with realdb.client(key=TENANT, role="admin") as c:
+        dismiss = await c.post(
+            f"/api/exceptions/{exc_id}/resolve", json={"action": "dismiss", "resolution": "x"}
+        )
+        recall = await c.post(
+            f"/api/invoices/{inv_id}/recall-approval", json={"reason": "fix figures"}
+        )
+        push = await c.post(f"/api/invoices/{inv_id}/send-to-erp")
+    assert dismiss.status_code == 409
+    assert dismiss.json()["detail"]["code"] == "erp_void_in_progress"
+    assert recall.status_code == 409, recall.text
+    assert push.status_code in (400, 409), push.text
+    async with mk() as s:
+        assert inv_id in await blocked_invoice_ids(s, [inv_id])
+        assert (await s.get(APException, exc_id)).status == "open"
+
+
+async def test_a_crashed_attempt_refuses_while_fresh_and_resumes_once_stale(realdb):
+    """Step 1 committed, then the process died: the marker refuses the retry
+    until it is past `PENDING_STALE_AFTER_S`, and the retry then takes it over,
+    reads the bill and converges (the ERP had voided it) without a second void."""
+    from app.services.erp_bill_void import PENDING_STALE_AFTER_S
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-K1")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+    gone = _Adapter(read=ErpInvoiceStatus.cancelled)
+
+    await _set_marker(mk, inv_id, exc_id, age_s=10)
+    with _adapter(gone):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            fresh = await c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "x"})
+    assert (fresh.status_code, fresh.json()["detail"]["code"]) == (409, "erp_void_in_progress")
+
+    await _set_marker(mk, inv_id, exc_id, age_s=PENDING_STALE_AFTER_S + 5)
+    with _adapter(gone):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            stale = await c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "x"})
+            dismiss_after = await c.post(
+                f"/api/exceptions/{exc_id}/resolve", json={"action": "dismiss", "resolution": "x"}
+            )
+    assert stale.status_code == 201, stale.text
+    assert gone.void_calls == 0
+    assert dismiss_after.status_code == 200, dismiss_after.text
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.status == InvoiceStatus.approved
+        assert inv.erp_document_id is None
+        assert inv.erp_void_pending is None
+    (row,) = await _audit(mk, inv_id, "invoice.erp_bill_voided")
+    assert row.details["already_gone"] is True
+
+
+async def test_a_stale_marker_does_not_hold_the_flag(realdb):
+    """Once stale, a marker blocks nothing: the flag can be decided either way
+    (the run gate is the open flag, so nothing paid it while it stood)."""
+    from app.services.erp_bill_void import PENDING_STALE_AFTER_S
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-K2")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+    await _set_marker(mk, inv_id, exc_id, age_s=PENDING_STALE_AFTER_S + 5)
+    async with realdb.client(key=TENANT, role="admin") as c:
+        detail = await c.get(f"/api/exceptions/{exc_id}")
+        res = await c.post(
+            f"/api/exceptions/{exc_id}/resolve", json={"action": "dismiss", "resolution": "x"}
+        )
+    assert detail.json()["void_erp_bill_refusal"] is None
+    assert res.status_code == 200, res.text
+
+
+async def test_the_finish_refuses_when_another_attempt_took_the_marker(realdb):
+    """Step 3 writes nothing unless the marker is still this attempt's."""
+    from app.services import erp_bill_void as ebv
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-K3")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+    await _set_marker(mk, inv_id, exc_id, age_s=1)
+    attempt = ebv.VoidAttempt(
+        attempt_id=str(uuid.uuid4()),
+        document_id="BILL-9",
+        invoice_status=InvoiceStatus.posted_in_erp,
+    )
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        exc = await s.get(APException, exc_id)
+        with pytest.raises(ebv.VoidRefused) as refused:
+            await ebv.finish_void(
+                s,
+                attempt=attempt,
+                answer=ebv.ErpAnswer(read="open", already_gone=False),
+                exception=exc,
+                invoice=inv,
+                instance=None,
+                user=SimpleNamespace(id=uuid.uuid4()),
+                reason="x",
+            )
+        assert refused.value.code == "erp_void_in_progress"
+        ebv.abandon_void(inv, attempt)  # not ours: left alone
+        assert inv.erp_void_pending is not None
+        assert inv.erp_document_id == "BILL-9"
+        assert inv.status == InvoiceStatus.posted_in_erp
+
+
+def test_live_pending_reads_age_and_shape():
+    from datetime import UTC, datetime, timedelta
+
+    from app.services.erp_bill_void import PENDING_STALE_AFTER_S, live_pending
+
+    now = datetime.now(UTC)
+
+    def inv(marker):
+        return SimpleNamespace(erp_void_pending=marker)
+
+    fresh = {"started_at": (now - timedelta(seconds=1)).isoformat()}
+    stale = {"started_at": (now - timedelta(seconds=PENDING_STALE_AFTER_S)).isoformat()}
+    assert live_pending(inv(fresh), now=now) == fresh
+    assert live_pending(inv(stale), now=now) is None
+    assert live_pending(inv(None), now=now) is None
+    assert live_pending(inv({"started_at": "garbage"}), now=now) is None
+    assert live_pending(inv({"started_at": "2026-11-25T00:00:00"}), now=now) is None

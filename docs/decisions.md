@@ -28045,67 +28045,183 @@ the second listing asks from `through − 10 min`.
 `tests/test_sweep_health.py`: every sweep's enabled flag, parametrized over the
 registry, is what its health snapshot reads.
 
-## 548. Changes within the public contract are announced in one dated list; subscriptions are never changed for a customer (§542 follow-up, round 46)
+## 544. A card whose authorization is reversed or expires returns to unspent; a decline or a post-settlement reversal does not (§543 follow-up, round 46)
 
-**Problem.** §542 changed what a webhook subscriber receives: after a payment
-void (`POST /api/payments/{id}/void`) it now gets `payment.voided`, no longer
-`invoice.approved`, and the ERP bill void (new in the same release) sends
-`invoice.erp_bill_voided`. A receiver that re-queued a bill, or undid a
-settlement, on the `invoice.approved` that followed a void now hears nothing
-unless it subscribes to `payment.voided`. The contract had no way to tell it:
-`public-api.md` listed a changelog as later work, `info.version` tracks the
-path prefix (`v1`), the `Deprecation` / `Sunset` headers are for retiring a
-version, and there is no email path to API-key holders or webhook owners. Two
-of the six events (`payment.settled`, `payment.voided`) and the ERP void event
-also had no payload example in the doc.
+**Problem.** §543 made only a settled charge count on a run's card leg, so a
+lapsed authorization never needed an undo on the payment. But the card webhook
+still ignored reversal / expiry / decline events, so the `VirtualCard` kept the
+`charged` status and authorized `amount_charged` after the hold lapsed. A
+payment void (`card_already_charged`, `not_closed_final`) and a re-run reusing
+the card (`card_settlement_block`) both refuse a spent card, so the card could
+never be closed or reused, though no money had moved. Two latent gaps sat
+beside it: Lithic's real event, `card_transaction.updated`, names no outcome
+(its body's `status` does) and contains "transaction", so `_classify_card_event`
+read every Lithic update, the authorization included, as a settlement; and
+Lithic's transaction `token` (our fallback dedupe key) is the same on every
+update, so a reversal would have been deduped as a replay of its authorization.
 
 **Decision.**
 
-1. **One dated list, published three ways.** `app/api/v1_changelog.py::
-   PUBLIC_API_CHANGES` (newest first; id, date, title, detail, `affects`,
-   `subscribe_to`) is published as `info.x-changelog` in
-   `/api/v1/openapi.json` (an OpenAPI `x-` extension, so a client generator
-   ignores it), rendered under **Changes** on `/api/v1/docs`, and written out
-   in `backend/docs/public-api.md` § Changes. `info.version` is not bumped: it
-   names the path prefix, and a change within `v1` is announced, not
-   versioned. The versioning policy now says so. The first entry is
-   `2026-11-25-void-events`. There is no public developer page in the SPA; the
-   API's own docs page is the published one.
-2. **Every event has a payload example built from its model.** The doc gains
-   examples for `payment.settled`, `payment.voided` and
-   `invoice.erp_bill_voided`, with the fields `_invoice_fields` and the
-   `WebhookInvoiceData` / `WebhookInvoiceErpBillVoidedData` models send. The
-   occurrence-id paragraph no longer gives the payment void as a second
-   approval.
-3. **Existing subscriptions are not changed; the operator is told whom to
-   tell.** A subscription's `event_types` is an explicit, non-empty JSONB list
-   the customer chose (no "all events" value). Adding `payment.voided` to it on
-   deploy would send a type their receiver never asked for (a receiver that
-   4xxs unknown types dead-letters, and a receiver acting on any event may act
-   wrongly) and would rewrite customer configuration with no precedent: no
-   earlier event (`invoice.approval_recalled`, §414) was auto-subscribed.
-   Emailing API-key holders is not a convention either: the one customer
-   notice sweep (§321) is contractual, needs a ledger for idempotency, and goes
-   to admins under the DPA. So `scripts/public_api_change_report.py` lists,
-   read-only, the active subscriptions an entry `affects` that lack its
-   `subscribe_to` types, by organisation slug and subscription id (no URL,
-   name or contact), and the operator reaches those organisations directly. It
-   sends nothing and writes nothing, so it needs no dry run.
+* *Reversal and expiry release the hold.* `_classify_card_lapse` names the
+  lapse. On a `charged` card the webhook sets `active`
+  (`CARD_LAPSED_STATUS`), clears `amount_charged`, `charged_at` and
+  `merchant_name`, and writes `card.authorization_lapsed` (`from`, `to`,
+  `lapse`, `released_amount` as a string Decimal). Same path as the other
+  card events: HMAC verified against the owning tenant's secret, deduped by
+  event id, silent 204 on every rejection, the card row locked.
+* *Why `active`, not the exact pre-authorization status.* Nothing stores it
+  except the `card.charged` audit row, which may have shipped to SQS in
+  `lambda` audit mode, and no code distinguishes `created` / `sent` / `active`:
+  all three are live and unspent to every reader (the dashboard's active-card
+  queries, `CARD_SPENT_STATUSES`, the void, `card_settlement_block`, vendor
+  revocation). The vendor demonstrably holds the card (they presented it),
+  which is what `active` means. No migration.
+* *A decline never releases a standing hold.* A second attempt at a
+  single-use card is declined while the first hold stands, and we keep no
+  per-authorization id to tie a decline to the hold. Releasing on a decline
+  would let a void cancel the payment while the first hold can still clear,
+  which could pay the invoice twice; keeping the card `charged` only leaves
+  the operator where they were before. Fail-closed: logged, card unchanged.
+* *A partial reversal leaves the card authorized.* A reversal carrying an
+  amount below `amount_charged` (`_is_partial_reversal`) leaves part of the
+  hold. Lithic sets `VOIDED` only when nothing is held, so a Lithic reversal
+  is always whole.
+* *A settled card is never touched.* A reversal or expiry on a `completed`
+  card is a refund or chargeback, a different flow: the card, its rebate and
+  the run's recorded figure stand, a warning is logged and a
+  `card.reversal_after_settlement` row records it for a person to act on (a
+  payment void and, if money came back, the refund flow). A *settlement*
+  reversal, refund, return or chargeback is not a lapse at all.
+* *The run's card leg stays `in_flight` throughout,* since the authorization
+  wrote nothing onto it (§543), and nothing re-dispatches a payment sync on a
+  lapse: there is nothing new for it to do.
+* *A clearing after the lapse still settles.* Networks allow a merchant's
+  clearing after the authorization expired (a force post). With the card
+  back at `active`, the settlement branch would have dropped money that moved,
+  so a settlement now completes a `charged` card or an unspent one (`created`
+  / `sent` / `active`, never `cancelled`); `card.settled`'s `from` records
+  which. The one-rebate-per-card index still holds.
+* *Provider mapping* (checked 2026-11-25).
+  Lithic: `card_transaction.updated` read by `status` — `PENDING`,
+  `SETTLED`, `VOIDED` ("no hold and no settled amount"), `EXPIRED`
+  ("Lithic has automatically expired the authorization"), `DECLINED`; any
+  other status is inert, never a settlement
+  (<https://docs.lithic.com/docs/transactions>,
+  <https://docs.lithic.com/docs/types-of-events>). Without an explicit
+  `event_id`, an update is deduped on `token:STATUS`, so each stage applies
+  once and a retry of one is still a replay. Nium: the reversal webhook's
+  `template` is `CARD_TRANSACTION_REVERSAL_WEBHOOK` with `transactionAmount`
+  (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>);
+  `template` and `transactionAmount` are now read when `eventType` /
+  `amount` are absent. **Not verified:** a Nium expiry or decline webhook
+  name (Nium documents that it expires unsettled authorizations, but no
+  webhook for it was found), and Lithic's delivery envelope (whether
+  `event_id` or only the `webhook-id` header carries the delivery id). The
+  classifier stays fail-closed: an unrecognised name changes nothing.
+  Mock: `authorization.reversal` / `authorization.expired`.
+* *Locally* (guard rail 7), `pnpm simulate:card -- --tenant acme --card <id>
+  --reverse` (or `--expire`) sends the authorization and then its lapse
+  through the real signed webhook; not combinable with `--settle`.
 
-**Rejected.** *Bump `info.version` (e.g. `v1.1`)*: the policy ties it to the
-path prefix, and a generator keyed on it would treat a note as a new version.
-*A data migration adding `payment.voided` to every `invoice.approved`
-subscription*: see 3. *An automatic or opt-out email to API-key holders*: no
-convention, no ledger, and the key holder is not necessarily who runs the
-receiver.
+**Why not store the pre-authorization status or the authorization id.** A
+column for either needs a tenant migration for a distinction nothing reads
+(the status) or for a per-provider id we do not yet parse reliably (the
+authorization). Tying declines and partial reversals to their authorization
+is the change that would need it; until then the fail-closed reading above
+holds.
 
-**Guard.** `tests/test_public_api_changelog.py`: the list is newest first with
-unique ids and catalogued events; the spec carries it unchanged with
-`info.version` still `v1`; the docs page renders each entry; `public-api.md`
-§ Changes has exactly the same entries by date, title and id; the doc's
-catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
-example whose `data` keys are its model's fields; the report's filter picks
-only affected subscriptions and the types they lack.
+**Guard.** New `tests/test_card_authorization_lapse.py` (real signed webhook,
+per provider): reversal and expiry → `active`, no figure, one audit row, leg
+`in_flight`, no dispatch; a decline leaves a `charged` card; a replayed
+reversal is deduped (it does not undo a later authorization); an unsigned one
+changes nothing; a reversal after settlement leaves the card, rebate and leg
+untouched with a `card.reversal_after_settlement` row; a partial reversal
+leaves the card authorized; a clearing after the lapse settles; a re-run's
+`card_settlement_block` refuses the authorized card and accepts the lapsed
+one. `tests/test_card_webhook_classification.py`: the lapse classifier, the
+Lithic status mapping (unknown status inert), the per-stage Lithic dedupe key,
+the partial-reversal rule. `tests/test_payment_void_card_retry.py`: a void
+after a lapsed authorization cancels the card. `tests/test_mock_card_simulator.py`:
+`lapse=` sends the authorization then its lapse; bad / combined options are
+refused; the CLI's `--settle` / `--reverse` / `--expire` are exclusive.
+
+## 545. The ERP bill void calls the ERP with no row lock held, behind a committed marker (§542 follow-up, round 46)
+
+**Problem.** `POST /api/exceptions/{id}/void-erp-bill` held the invoice, flag
+and workflow-instance row locks across its ERP calls: the credential unseal,
+the status read (30 s), the deleted-bill report (30 s) and the void (45 s).
+§542 bounded them and deferred the split (followups (c)). A slow ERP stalled
+every other writer of that invoice (an ERP status webhook, the reconciliation
+sweep, a payment run) and held a pool connection, against the rule that no
+third party's latency is charged to a transaction holding row locks
+(`post_commit.py`).
+
+**Decision.** Three transactions (`services/erp_bill_void`):
+
+1. **`begin_void`, under the locks**: replay, `void_refusal` (permission, row,
+   bill, a live marker), the live-claim gate, then a marker on the new
+   `invoices.erp_void_pending` (`attempt_id`, `exception_id`, `document_id`,
+   `actor_id`, `reason`, `started_at`; migration 0146, tenant, idempotent),
+   committed.
+2. **`call_erp`, no lock and no session**: the adapter is opened and the §542
+   read / void runs unchanged (positive read only, converge on already gone,
+   `erp_void_unconfirmed`, draft-only scope).
+3. **Re-lock** in the same order. `finish_void` writes only if the marker is
+   still this attempt's (`attempt_id`) and the invoice still names the same
+   bill at `sent_to_erp` / `posted_in_erp`; otherwise `erp_void_in_progress` /
+   `erp_void_no_bill`, nothing written. After a refusal from step 2,
+   `abandon_void` clears the marker if it is still ours. The marker is cleared
+   on every outcome, `unconfirmed` included: the flag is still open, and a
+   retry converges (§542).
+
+**What the marker blocks.** While live (younger than
+`PENDING_STALE_AFTER_S` = 300 s, well past step 2's 105 s bound): a second
+click (409 `erp_void_in_progress`, the queue's verdict too) and clearing the
+flag it names (`record_decision` 409, `/bulk/resolve` per-row skip;
+`escalate` stays open). Keeping the flag open is what holds the invoice off
+every money path: the run builder, card mint, mark-paid, retry-failed, the
+queue and the ERP push all already refuse an invoice with an open
+`duplicate` / `fraud_flag` (`payment_runs.blocking_exception_types`), so none
+of them reads the marker. The recall refuses it as before (not `approved`, a
+bill on record). `exception_lifecycle.record_decision` asks
+`erp_bill_void.clear_refusal`, which locks the flag's row before a fresh
+column read of the marker, so it serializes with step 1 (invoice, then flag):
+either the clear sees the committed marker, or the void sees the flag already
+cleared and refuses `erp_void_not_flagged`.
+
+**Crash recovery: the endpoint, no sweep.** A process that dies between 1 and 3
+leaves a marker. While it is live the flag stays open (fail closed); once
+stale it blocks nothing, and the next click takes it over: the read finds the
+bill gone and converges, or open and voids it, which is what the person asked
+for. The flag can also be dismissed once the marker is stale; if the ERP did
+void the bill, paying the invoice then pays it once, since the ERP will not
+pay a voided bill. A sweep would only shorten a five-minute window in which
+nothing can pay the invoice.
+
+**Where the marker lives.** On the invoice, not in `state_data`: the invoice
+row is the one every writer locks first, the queue verdict already has it
+loaded, and `clear_refusal` reads it as a single column.
+
+**Rejected.** *An engine-level refusal of every transition while the marker
+stands*: the open flag already closes the money paths, and refusing the ERP
+status sync's own transitions mid-void would only make it fail and retry.
+*A new pseudo-type in `blocking_exception_types`*: the queue links each
+blocked row to the exception that blocks it, and a marker is not an
+exception. *Keeping the marker on `unconfirmed`*: it would block dismissing a
+false flag for five minutes while adding no protection the open flag does not
+give.
+
+**Guard.** `tests/test_erp_bill_void_from_flag.py`: mid-void, a second session
+takes the invoice, flag and workflow-instance locks `NOWAIT`, sees the
+committed marker and `blocked_invoice_ids` holding the invoice, and a second
+click, a dismiss and a bulk dismiss are refused `erp_void_in_progress` while
+escalate is open; a seeded live marker refuses the dismiss and the recall and
+keeps the run gate holding; a crashed attempt's marker refuses while fresh and
+converges once stale; a stale marker does not hold the flag; `finish_void`
+writes nothing for an attempt that no longer owns the marker; every refusal
+clears it; two concurrent clicks make one ERP call (now 201 + 409).
+`tests/test_migration_0146_invoice_erp_void_pending.py`; frontend
+`codedRefusals.test.ts` for the new code in all six locales.
 
 ## 546. Business Central does not sync bills back: API v2.0 states no open amount and cannot post a vendor payment; its `Paid` reads `settled_no_payment` (§295 / §303 / §536 follow-up, round 46)
 
@@ -28211,106 +28327,6 @@ to "a person decides", so a wrong reading of `Paid` fails safe.
 - `test_bc_does_not_report_status_back`: no capability, a stray opt-in key
   changes nothing, and the write-back and void refuse without a call.
 
-## 544. A card whose authorization is reversed or expires returns to unspent; a decline or a post-settlement reversal does not (§543 follow-up, round 46)
-
-**Problem.** §543 made only a settled charge count on a run's card leg, so a
-lapsed authorization never needed an undo on the payment. But the card webhook
-still ignored reversal / expiry / decline events, so the `VirtualCard` kept the
-`charged` status and authorized `amount_charged` after the hold lapsed. A
-payment void (`card_already_charged`, `not_closed_final`) and a re-run reusing
-the card (`card_settlement_block`) both refuse a spent card, so the card could
-never be closed or reused, though no money had moved. Two latent gaps sat
-beside it: Lithic's real event, `card_transaction.updated`, names no outcome
-(its body's `status` does) and contains "transaction", so `_classify_card_event`
-read every Lithic update, the authorization included, as a settlement; and
-Lithic's transaction `token` (our fallback dedupe key) is the same on every
-update, so a reversal would have been deduped as a replay of its authorization.
-
-**Decision.**
-
-* *Reversal and expiry release the hold.* `_classify_card_lapse` names the
-  lapse. On a `charged` card the webhook sets `active`
-  (`CARD_LAPSED_STATUS`), clears `amount_charged`, `charged_at` and
-  `merchant_name`, and writes `card.authorization_lapsed` (`from`, `to`,
-  `lapse`, `released_amount` as a string Decimal). Same path as the other
-  card events: HMAC verified against the owning tenant's secret, deduped by
-  event id, silent 204 on every rejection, the card row locked.
-* *Why `active`, not the exact pre-authorization status.* Nothing stores it
-  except the `card.charged` audit row, which may have shipped to SQS in
-  `lambda` audit mode, and no code distinguishes `created` / `sent` / `active`:
-  all three are live and unspent to every reader (the dashboard's active-card
-  queries, `CARD_SPENT_STATUSES`, the void, `card_settlement_block`, vendor
-  revocation). The vendor demonstrably holds the card (they presented it),
-  which is what `active` means. No migration.
-* *A decline never releases a standing hold.* A second attempt at a
-  single-use card is declined while the first hold stands, and we keep no
-  per-authorization id to tie a decline to the hold. Releasing on a decline
-  would let a void cancel the payment while the first hold can still clear,
-  which could pay the invoice twice; keeping the card `charged` only leaves
-  the operator where they were before. Fail-closed: logged, card unchanged.
-* *A partial reversal leaves the card authorized.* A reversal carrying an
-  amount below `amount_charged` (`_is_partial_reversal`) leaves part of the
-  hold. Lithic sets `VOIDED` only when nothing is held, so a Lithic reversal
-  is always whole.
-* *A settled card is never touched.* A reversal or expiry on a `completed`
-  card is a refund or chargeback, a different flow: the card, its rebate and
-  the run's recorded figure stand, a warning is logged and a
-  `card.reversal_after_settlement` row records it for a person to act on (a
-  payment void and, if money came back, the refund flow). A *settlement*
-  reversal, refund, return or chargeback is not a lapse at all.
-* *The run's card leg stays `in_flight` throughout,* since the authorization
-  wrote nothing onto it (§543), and nothing re-dispatches a payment sync on a
-  lapse: there is nothing new for it to do.
-* *A clearing after the lapse still settles.* Networks allow a merchant's
-  clearing after the authorization expired (a force post). With the card
-  back at `active`, the settlement branch would have dropped money that moved,
-  so a settlement now completes a `charged` card or an unspent one (`created`
-  / `sent` / `active`, never `cancelled`); `card.settled`'s `from` records
-  which. The one-rebate-per-card index still holds.
-* *Provider mapping* (checked 2026-11-25).
-  Lithic: `card_transaction.updated` read by `status` — `PENDING`,
-  `SETTLED`, `VOIDED` ("no hold and no settled amount"), `EXPIRED`
-  ("Lithic has automatically expired the authorization"), `DECLINED`; any
-  other status is inert, never a settlement
-  (<https://docs.lithic.com/docs/transactions>,
-  <https://docs.lithic.com/docs/types-of-events>). Without an explicit
-  `event_id`, an update is deduped on `token:STATUS`, so each stage applies
-  once and a retry of one is still a replay. Nium: the reversal webhook's
-  `template` is `CARD_TRANSACTION_REVERSAL_WEBHOOK` with `transactionAmount`
-  (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>);
-  `template` and `transactionAmount` are now read when `eventType` /
-  `amount` are absent. **Not verified:** a Nium expiry or decline webhook
-  name (Nium documents that it expires unsettled authorizations, but no
-  webhook for it was found), and Lithic's delivery envelope (whether
-  `event_id` or only the `webhook-id` header carries the delivery id). The
-  classifier stays fail-closed: an unrecognised name changes nothing.
-  Mock: `authorization.reversal` / `authorization.expired`.
-* *Locally* (guard rail 7), `pnpm simulate:card -- --tenant acme --card <id>
-  --reverse` (or `--expire`) sends the authorization and then its lapse
-  through the real signed webhook; not combinable with `--settle`.
-
-**Why not store the pre-authorization status or the authorization id.** A
-column for either needs a tenant migration for a distinction nothing reads
-(the status) or for a per-provider id we do not yet parse reliably (the
-authorization). Tying declines and partial reversals to their authorization
-is the change that would need it; until then the fail-closed reading above
-holds.
-
-**Guard.** New `tests/test_card_authorization_lapse.py` (real signed webhook,
-per provider): reversal and expiry → `active`, no figure, one audit row, leg
-`in_flight`, no dispatch; a decline leaves a `charged` card; a replayed
-reversal is deduped (it does not undo a later authorization); an unsigned one
-changes nothing; a reversal after settlement leaves the card, rebate and leg
-untouched with a `card.reversal_after_settlement` row; a partial reversal
-leaves the card authorized; a clearing after the lapse settles; a re-run's
-`card_settlement_block` refuses the authorized card and accepts the lapsed
-one. `tests/test_card_webhook_classification.py`: the lapse classifier, the
-Lithic status mapping (unknown status inert), the per-stage Lithic dedupe key,
-the partial-reversal rule. `tests/test_payment_void_card_retry.py`: a void
-after a lapsed authorization cancels the card. `tests/test_mock_card_simulator.py`:
-`lapse=` sends the authorization then its lapse; bad / combined options are
-refused; the CLI's `--settle` / `--reverse` / `--expire` are exclusive.
-
 ## 547. The admin's on-request status-sync pass runs for a stored-credential ERP that reports back (§536 / §541 follow-up, round 46)
 
 **Problem.** §536 left "check payments now" (`POST
@@ -28353,3 +28369,65 @@ refused; the existing QuickBooks / Xero refusals unchanged),
 `backend/tests/test_erp_oauth.py` (the endpoint: 202 and audited for NetSuite
 opted in, 409 without the opt-in, 403 for every non-admin role).
 End to end: `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts`.
+
+## 548. Changes within the public contract are announced in one dated list; subscriptions are never changed for a customer (§542 follow-up, round 46)
+
+**Problem.** §542 changed what a webhook subscriber receives: after a payment
+void (`POST /api/payments/{id}/void`) it now gets `payment.voided`, no longer
+`invoice.approved`, and the ERP bill void (new in the same release) sends
+`invoice.erp_bill_voided`. A receiver that re-queued a bill, or undid a
+settlement, on the `invoice.approved` that followed a void now hears nothing
+unless it subscribes to `payment.voided`. The contract had no way to tell it:
+`public-api.md` listed a changelog as later work, `info.version` tracks the
+path prefix (`v1`), the `Deprecation` / `Sunset` headers are for retiring a
+version, and there is no email path to API-key holders or webhook owners. Two
+of the six events (`payment.settled`, `payment.voided`) and the ERP void event
+also had no payload example in the doc.
+
+**Decision.**
+
+1. **One dated list, published three ways.** `app/api/v1_changelog.py::
+   PUBLIC_API_CHANGES` (newest first; id, date, title, detail, `affects`,
+   `subscribe_to`) is published as `info.x-changelog` in
+   `/api/v1/openapi.json` (an OpenAPI `x-` extension, so a client generator
+   ignores it), rendered under **Changes** on `/api/v1/docs`, and written out
+   in `backend/docs/public-api.md` § Changes. `info.version` is not bumped: it
+   names the path prefix, and a change within `v1` is announced, not
+   versioned. The versioning policy now says so. The first entry is
+   `2026-11-25-void-events`. There is no public developer page in the SPA; the
+   API's own docs page is the published one.
+2. **Every event has a payload example built from its model.** The doc gains
+   examples for `payment.settled`, `payment.voided` and
+   `invoice.erp_bill_voided`, with the fields `_invoice_fields` and the
+   `WebhookInvoiceData` / `WebhookInvoiceErpBillVoidedData` models send. The
+   occurrence-id paragraph no longer gives the payment void as a second
+   approval.
+3. **Existing subscriptions are not changed; the operator is told whom to
+   tell.** A subscription's `event_types` is an explicit, non-empty JSONB list
+   the customer chose (no "all events" value). Adding `payment.voided` to it on
+   deploy would send a type their receiver never asked for (a receiver that
+   4xxs unknown types dead-letters, and a receiver acting on any event may act
+   wrongly) and would rewrite customer configuration with no precedent: no
+   earlier event (`invoice.approval_recalled`, §414) was auto-subscribed.
+   Emailing API-key holders is not a convention either: the one customer
+   notice sweep (§321) is contractual, needs a ledger for idempotency, and goes
+   to admins under the DPA. So `scripts/public_api_change_report.py` lists,
+   read-only, the active subscriptions an entry `affects` that lack its
+   `subscribe_to` types, by organisation slug and subscription id (no URL,
+   name or contact), and the operator reaches those organisations directly. It
+   sends nothing and writes nothing, so it needs no dry run.
+
+**Rejected.** *Bump `info.version` (e.g. `v1.1`)*: the policy ties it to the
+path prefix, and a generator keyed on it would treat a note as a new version.
+*A data migration adding `payment.voided` to every `invoice.approved`
+subscription*: see 3. *An automatic or opt-out email to API-key holders*: no
+convention, no ledger, and the key holder is not necessarily who runs the
+receiver.
+
+**Guard.** `tests/test_public_api_changelog.py`: the list is newest first with
+unique ids and catalogued events; the spec carries it unchanged with
+`info.version` still `v1`; the docs page renders each entry; `public-api.md`
+§ Changes has exactly the same entries by date, title and id; the doc's
+catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
+example whose `data` keys are its model's fields; the report's filter picks
+only affected subscriptions and the types they lack.

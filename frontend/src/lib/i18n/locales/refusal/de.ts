@@ -45,6 +45,7 @@ export const messages = {
 	'refusal.erpVoidUnconfirmed': "Das ERP hat die Stornierung nicht bestätigt. Prüfen Sie den Beleg im ERP, bevor Sie es erneut versuchen.",
 	'refusal.erpVoidBillSettled': "Das ERP zeigt für diesen Beleg nichts mehr offen, aber keine Zahlung (eine Gutschrift oder Ausbuchung). Prüfen Sie ihn im ERP.",
 	'refusal.erpVoidDraftOnly': "Das verbundene ERP kann einen Beleg aus FeohLedger nur stornieren, solange er dort ein Entwurf ist oder auf Genehmigung wartet. Kehren Sie diesen im ERP um.",
+	'refusal.erpVoidInProgress': "Dieser Beleg wird gerade im ERP storniert. Warten Sie einige Minuten und prüfen Sie die Markierung dann erneut.",
 	'refusal.paymentBlocksRecall': "FeohLedger bezahlt diese Rechnung bereits: Es gibt eine aktive Zahlung. Brechen Sie den Zahlungslauf ab oder stornieren Sie die Zahlung, bevor Sie die Genehmigung zurücknehmen.",
 	'refusal.cardBlocksRecall': "Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Genehmigung zurücknehmen.",
 	'refusal.paymentRunSegregation': "Funktionstrennung: Wer diesen Zahlungslauf erstellt hat, darf ihn nicht auch genehmigen oder ausführen. Das muss eine andere Person tun.",

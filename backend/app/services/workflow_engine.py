@@ -198,7 +198,7 @@ RECALL_EDGES: frozenset[tuple[InvoiceStatus, InvoiceStatus]] = frozenset(
 
 
 #: The audit action of the one transition allowed to walk :data:`ERP_VOID_EDGES`
-#: (`services/erp_bill_void.void_flagged_erp_bill`, decisions §539).
+#: (`services/erp_bill_void.finish_void`, decisions §539, §545).
 ERP_VOID_ACTION = "invoice.erp_bill_voided"
 
 #: `sent_to_erp` / `posted_in_erp → approved`: the bill was voided in the ERP,

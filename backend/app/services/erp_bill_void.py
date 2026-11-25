@@ -9,11 +9,33 @@ that from the exception: void the bill there (``ErpAdapter.void_invoice``) and
 walk the invoice back to ``approved``, where both gates still hold it until the
 flag is decided. Never automatic — the flag may be false.
 
-Two functions, one rule (issue #575): :func:`void_refusal` is what the queue
-shows and what the endpoint raises from before it calls anyone;
-:func:`void_flagged_erp_bill` does it. Gated like a payment void
-(``payment.void``), on a locked invoice, idempotent on a replay, audited
-append-only.
+One rule (issue #575): :func:`void_refusal` is what the queue shows and what
+the endpoint raises from before it calls anyone. Gated like a payment void
+(``payment.void``), idempotent on a replay, audited append-only.
+
+**Three steps, no row lock across the ERP (decisions §545).** The endpoint
+used to hold the invoice, flag and workflow-instance locks across both ERP
+calls, so a slow ERP stalled every other writer of that invoice for up to
+~105 s. Now:
+
+1. :func:`begin_void`, under the locks: every refusal that needs no ERP call,
+   then a durable "void in progress" marker on ``invoices.erp_void_pending``
+   (:func:`live_pending`), committed. While it is live a second click is
+   refused (``erp_void_in_progress``) and the flag it names cannot be cleared
+   (:func:`clear_refusal`), so every payment, card and push gate keeps holding
+   the invoice by its existing open-flag predicate.
+2. :func:`call_erp`, with no lock and no session: the read, and the void only
+   on a positive one (§542).
+3. Re-lock: :func:`finish_void` checks the marker is still this attempt's and
+   the invoice still holds the same bill, then walks it to ``approved``;
+   :func:`abandon_void` clears the marker after a refusal from step 2.
+
+A crash between 1 and 3 leaves a marker no one finishes. It stops being live
+after :data:`PENDING_STALE_AFTER_S` (well past the bound on step 2), and the
+same endpoint then takes it over: the read finds the bill gone and converges
+(§542), or open and voids it — what the person asked for. No sweep: a stale
+marker fails closed (the flag stays open, so nothing pays the invoice), and
+once stale it blocks nothing, the flag can be decided either way.
 """
 
 from __future__ import annotations
@@ -57,6 +79,12 @@ ACTION_EXCEPTION_ERP_BILL_VOIDED = "exception.erp_bill_voided"
 STATUS_READ_TIMEOUT_S = 30
 VOID_CALL_TIMEOUT_S = 45
 
+#: Seconds after which a void-in-progress marker no longer counts (decisions
+#: §545). Step 2 is bounded at the read, the deleted-bill report and the void
+#: (30 + 30 + 45 s), so a marker older than this belongs to an attempt that
+#: died between its commit and its finish; the endpoint then takes it over.
+PENDING_STALE_AFTER_S = 300
+
 # ---------- the coded refusals (`api/refusals.coded_refusal`) ----------
 
 #: The row is not an open/escalated `duplicate` / `fraud_flag` on an invoice.
@@ -82,6 +110,8 @@ ERP_VOID_BILL_SETTLED = "erp_void_bill_settled"
 #: The connected ERP can void only a draft / pending-approval bill, and this one
 #: is past that (`ErpAdapter.bill_void_scope`, §542).
 ERP_VOID_DRAFT_ONLY = "erp_void_draft_only"
+#: Another attempt to void this bill is calling the ERP right now (§545).
+ERP_VOID_IN_PROGRESS = "erp_void_in_progress"
 
 _MESSAGES = {
     ERP_VOID_NOT_FLAGGED: (
@@ -111,6 +141,10 @@ _MESSAGES = {
     ERP_VOID_DRAFT_ONLY: (
         "The connected ERP can void a bill from FeohLedger only while it is a draft or "
         "awaiting approval there. Reverse this one in the ERP."
+    ),
+    ERP_VOID_IN_PROGRESS: (
+        "This bill is being voided in the ERP right now. Wait a few minutes, then "
+        "check the flag again."
     ),
 }
 
@@ -183,6 +217,56 @@ def void_refusal(
         return coded_refusal(ERP_VOID_NO_BILL, refusal_message(ERP_VOID_NO_BILL))
     if _draft_only_refuses(void_scope, inv):
         return coded_refusal(ERP_VOID_DRAFT_ONLY, refusal_message(ERP_VOID_DRAFT_ONLY))
+    if live_pending(inv) is not None:
+        return coded_refusal(ERP_VOID_IN_PROGRESS, refusal_message(ERP_VOID_IN_PROGRESS))
+    return None
+
+
+def live_pending(inv, *, now: datetime | None = None) -> dict | None:
+    """The invoice's void-in-progress marker while it counts, else ``None``.
+
+    A marker counts until :data:`PENDING_STALE_AFTER_S` after it was written; a
+    malformed one (no parseable ``started_at``) does not count, since nothing
+    this module writes looks like that."""
+    marker = getattr(inv, "erp_void_pending", None)
+    return marker if _is_live(marker, now=now) else None
+
+
+def _is_live(marker, *, now: datetime | None = None) -> bool:
+    if not isinstance(marker, dict):
+        return False
+    try:
+        started = datetime.fromisoformat(str(marker.get("started_at")))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        return False
+    age = ((now or datetime.now(UTC)) - started).total_seconds()
+    return age < PENDING_STALE_AFTER_S
+
+
+async def clear_refusal(db: AsyncSession, exception: APException) -> str | None:
+    """``erp_void_in_progress`` when ``exception`` is the flag a live void of
+    its invoice's bill was started from, else ``None`` (decisions §545).
+
+    The flag is what holds the invoice off every payment, card and push gate
+    while the void's ERP calls run with no lock held; clearing it then would
+    let a run schedule an invoice whose bill is being voided. Race-free with
+    :func:`begin_void`: the flag's row is locked here first (the void locks the
+    invoice, then this row, and commits its marker before releasing it), then
+    the marker is read fresh from the invoice — a column read, not the
+    identity map — so either this sees the committed marker or the void sees
+    the flag already cleared and refuses ``erp_void_not_flagged``."""
+    from sqlalchemy import select
+
+    if not is_void_candidate(exception):
+        return None
+    await db.execute(select(APException.id).where(APException.id == exception.id).with_for_update())
+    marker = (
+        await db.execute(select(Invoice.erp_void_pending).where(Invoice.id == exception.invoice_id))
+    ).scalar_one_or_none()
+    if _is_live(marker) and marker.get("exception_id") == str(exception.id):
+        return ERP_VOID_IN_PROGRESS
     return None
 
 
@@ -214,53 +298,50 @@ class VoidOutcome:
     status: str
 
 
-async def void_flagged_erp_bill(
+@dataclass(frozen=True)
+class VoidAttempt:
+    """What step 1 committed, carried to steps 2 and 3."""
+
+    attempt_id: str
+    document_id: str
+    invoice_status: InvoiceStatus
+
+
+@dataclass(frozen=True)
+class ErpAnswer:
+    """What step 2 learned: the bill's read, and whether it was already gone
+    (no void sent) or voided now."""
+
+    read: str
+    already_gone: bool
+
+
+def _refused(code: str, status_code: int, **params) -> VoidRefused:
+    return VoidRefused(code, status_code, params)
+
+
+async def begin_void(
     db: AsyncSession,
     *,
-    org,
     exception: APException,
     invoice: Invoice | None,
     instance,
     user,
     reason: str,
-) -> VoidOutcome:
-    """Void ``invoice``'s bill in the ERP and walk it back to ``approved``.
-
-    The caller holds ``invoice`` (then ``exception``) locked FOR UPDATE, so two
-    clicks serialize: the second sees the first's result. Order:
+) -> VoidOutcome | VoidAttempt:
+    """Step 1, under the caller's locks (invoice, then flag, then instance).
 
     1. replay: the invoice no longer names a bill and its workflow state records
-       a void THIS exception made → the same answer, nothing called (idempotent);
-    2. :func:`void_refusal` (permission, row, bill);
+       a void THIS exception made → the same answer, nothing called;
+    2. :func:`void_refusal` (permission, row, bill, a live marker);
     3. no live FeohLedger payment or card (`erp_export_gate.live_claims`);
-    4. the adapter: unknown/unsupported → refused; a draft-only ERP's bill past
-       draft → refused; then the read, and only a positive one goes on (§542):
-       ``open`` / ``draft`` → ``void_invoice`` (False → rejected; raised or
-       timed out → ``erp_void_unconfirmed``, since the ERP may have acted);
-       ``cancelled``, or ``unknown`` with ``bill_report`` saying ``deleted`` →
-       the bill is already gone, so no void is sent and the rest below runs as
-       if it had been (a lost commit converges on retry); paid / part-paid /
-       settled with no payment / unreadable → refused. Every refusal comes
-       before any write here.
+    4. the marker, written on the invoice. The caller commits it.
 
-    On success, in the caller's transaction: the document id, its deep link and
-    the push's ``erp_reference`` are cleared (so `review.recall_refusal` no
-    longer finds a bill — any other possibly-posted record stays and keeps
-    refusing the recall), the void is recorded on the workflow state, the
-    invoice transitions ``→ approved`` (`workflow_engine.ERP_VOID_ACTION`, its
-    own audit row) and the exception gets an append-only
-    ``exception.erp_bill_voided`` row. The exception itself stays open: the
-    flag is still a person's to decide.
-    """
+    A marker past :data:`PENDING_STALE_AFTER_S` is overwritten: the attempt
+    that wrote it died, and this one finishes its work (§545)."""
     from fastapi import status as http_status
 
-    from app.services.credential_crypto import CredentialCryptoError
-    from app.services.erp_adapters import get_erp_adapter
-    from app.services.erp_adapters.base import BILL_VOID_DRAFT_ONLY, ErpInvoiceStatus
     from app.services.erp_export_gate import live_claims
-    from app.services.exception_lifecycle import _write
-    from app.services.provider_credentials import provider_config
-    from app.services.workflow_engine import ERP_VOID_ACTION, transition_invoice
 
     state = dict((getattr(instance, "state_data", None) or {}) if instance is not None else {})
     previous = state.get(ERP_BILL_VOIDED_KEY)
@@ -279,36 +360,64 @@ async def void_flagged_erp_bill(
     verdict = void_refusal(exception, invoice, user)
     if verdict is not None:
         code = verdict["code"]
-        raise VoidRefused(
+        raise _refused(
             code,
             http_status.HTTP_403_FORBIDDEN
             if code == "role_not_permitted"
             else http_status.HTTP_409_CONFLICT,
-            {},
         )
     assert invoice is not None  # bill_holder() above
 
     claim = (await live_claims(db, [invoice.id])).get(invoice.id)
     if claim is not None:
-        raise VoidRefused(ERP_VOID_CLAIMED, http_status.HTTP_409_CONFLICT, {"claim": claim})
+        raise _refused(ERP_VOID_CLAIMED, http_status.HTTP_409_CONFLICT, claim=claim)
+
+    attempt = VoidAttempt(
+        attempt_id=str(uuid.uuid4()),
+        document_id=invoice.erp_document_id,
+        invoice_status=invoice.status,
+    )
+    invoice.erp_void_pending = {
+        "attempt_id": attempt.attempt_id,
+        "exception_id": str(exception.id),
+        "document_id": attempt.document_id,
+        "actor_id": str(user.id),
+        "reason": reason,
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    return attempt
+
+
+async def call_erp(org, attempt: VoidAttempt) -> ErpAnswer:
+    """Step 2, with no row lock and no session: open the adapter, read the
+    bill, and void it only on a positive read (§542).
+
+    ``open`` / ``draft`` → ``void_invoice`` (False → rejected; raised or timed
+    out → ``erp_void_unconfirmed``, since the ERP may have acted);
+    ``cancelled``, or ``unknown`` with ``bill_report`` saying ``deleted`` → the
+    bill is already gone, so no void is sent (a lost commit converges on
+    retry); paid / part-paid / settled with no payment / unreadable → refused.
+    Opening the adapter (a KMS unseal) is here too, off the locks."""
+    from fastapi import status as http_status
+
+    from app.services.credential_crypto import CredentialCryptoError
+    from app.services.erp_adapters import get_erp_adapter
+    from app.services.erp_adapters.base import BILL_VOID_DRAFT_ONLY, ErpInvoiceStatus
+    from app.services.provider_credentials import provider_config
 
     try:
         config = await provider_config(org, "erp") or dict(_LOCAL_ERP)
         adapter = get_erp_adapter(config)
     except CredentialCryptoError:
-        raise VoidRefused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY, {}) from None
+        raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
     except Exception:  # noqa: BLE001 — an unknown adapter type cannot void anything
-        raise VoidRefused(ERP_VOID_UNSUPPORTED, http_status.HTTP_409_CONFLICT, {}) from None
+        raise _refused(ERP_VOID_UNSUPPORTED, http_status.HTTP_409_CONFLICT) from None
 
     void_scope = getattr(adapter, "bill_void_scope", None)
-    if _draft_only_refuses(void_scope, invoice):
-        raise VoidRefused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT, {})
+    if void_scope == BILL_VOID_DRAFT_ONLY and attempt.invoice_status == InvoiceStatus.posted_in_erp:
+        raise _refused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT)
 
-    # Void only on a positive read (decisions §542): `open` / `draft` proceed;
-    # `cancelled`, or a bill the ERP positively reports deleted, is a void that
-    # already happened (ours, whose commit was lost, or someone's in the ERP)
-    # and converges without a second call; anything else is refused.
-    document_id = invoice.erp_document_id
+    document_id = attempt.document_id
     try:
         read = await asyncio.wait_for(
             adapter.get_invoice_status(document_id), STATUS_READ_TIMEOUT_S
@@ -317,29 +426,91 @@ async def void_flagged_erp_bill(
         read = None
     except Exception as exc_:  # noqa: BLE001 — never void a bill whose state is unknown
         logger.warning("erp bill void: status read failed (%s)", exc_.__class__.__name__)
-        raise VoidRefused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY, {}) from None
+        raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
     if read in (ErpInvoiceStatus.paid, ErpInvoiceStatus.partially_paid):
-        raise VoidRefused(ERP_VOID_BILL_PAID, http_status.HTTP_409_CONFLICT, {})
+        raise _refused(ERP_VOID_BILL_PAID, http_status.HTTP_409_CONFLICT)
     if read == ErpInvoiceStatus.settled_no_payment:
-        raise VoidRefused(ERP_VOID_BILL_SETTLED, http_status.HTTP_409_CONFLICT, {})
+        raise _refused(ERP_VOID_BILL_SETTLED, http_status.HTTP_409_CONFLICT)
     already_gone = read == ErpInvoiceStatus.cancelled
     if read in (None, ErpInvoiceStatus.unknown):
         already_gone = await _positively_gone(adapter, document_id)
         if not already_gone:
-            raise VoidRefused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY, {})
+            raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY)
 
     if not already_gone:
         if void_scope == BILL_VOID_DRAFT_ONLY and read != ErpInvoiceStatus.draft:
-            raise VoidRefused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT, {})
+            raise _refused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT)
         try:
             voided = await asyncio.wait_for(adapter.void_invoice(document_id), VOID_CALL_TIMEOUT_S)
         except NotImplementedError:
-            raise VoidRefused(ERP_VOID_UNSUPPORTED, http_status.HTTP_409_CONFLICT, {}) from None
+            raise _refused(ERP_VOID_UNSUPPORTED, http_status.HTTP_409_CONFLICT) from None
         except Exception as exc_:  # noqa: BLE001 — the ERP may have voided it
             logger.warning("erp bill void: void call unconfirmed (%s)", exc_.__class__.__name__)
-            raise VoidRefused(ERP_VOID_UNCONFIRMED, http_status.HTTP_502_BAD_GATEWAY, {}) from None
+            raise _refused(ERP_VOID_UNCONFIRMED, http_status.HTTP_502_BAD_GATEWAY) from None
         if not voided:
-            raise VoidRefused(ERP_VOID_REJECTED, http_status.HTTP_409_CONFLICT, {})
+            raise _refused(ERP_VOID_REJECTED, http_status.HTTP_409_CONFLICT)
+
+    # A bill found already voided reads `cancelled` whichever way the ERP said
+    # so (a status read, or a report of it deleted).
+    return ErpAnswer(read="cancelled" if already_gone else read.value, already_gone=already_gone)
+
+
+def _ours(invoice: Invoice | None, attempt: VoidAttempt) -> bool:
+    marker = getattr(invoice, "erp_void_pending", None)
+    return isinstance(marker, dict) and marker.get("attempt_id") == attempt.attempt_id
+
+
+def abandon_void(invoice: Invoice | None, attempt: VoidAttempt) -> None:
+    """Step 3 after a refusal from step 2, under the re-taken invoice lock:
+    clear the marker if it is still this attempt's. Nothing else was written;
+    the flag stays open, and a retry starts over (an unconfirmed void then
+    converges, §542)."""
+    if invoice is not None and _ours(invoice, attempt):
+        invoice.erp_void_pending = None
+
+
+async def finish_void(
+    db: AsyncSession,
+    *,
+    attempt: VoidAttempt,
+    answer: ErpAnswer,
+    exception: APException,
+    invoice: Invoice | None,
+    instance,
+    user,
+    reason: str,
+) -> VoidOutcome:
+    """Step 3 after the ERP voided the bill (or it was already gone), under the
+    re-taken locks, in the caller's transaction.
+
+    The marker must still be this attempt's — one taken over after going stale
+    belongs to an attempt that will converge on its own read — and the invoice
+    must still hold the same bill at a voidable status; otherwise nothing here
+    is written (``erp_void_in_progress`` / ``erp_void_no_bill``, the marker
+    cleared in the second case so it cannot hold the flag).
+
+    Then: the document id, its deep link and the push's ``erp_reference`` are
+    cleared (so `review.recall_refusal` no longer finds a bill — any other
+    possibly-posted record stays and keeps refusing the recall), the void is
+    recorded on the workflow state, the invoice transitions ``→ approved``
+    (`workflow_engine.ERP_VOID_ACTION`, its own audit row), the exception gets
+    an append-only ``exception.erp_bill_voided`` row and the marker is cleared.
+    The exception itself stays open: the flag is still a person's to decide."""
+    from fastapi import status as http_status
+
+    from app.services.exception_lifecycle import _write
+    from app.services.workflow_engine import ERP_VOID_ACTION, transition_invoice
+
+    if invoice is None or not _ours(invoice, attempt):
+        raise _refused(ERP_VOID_IN_PROGRESS, http_status.HTTP_409_CONFLICT)
+    document_id = attempt.document_id
+    if invoice.erp_document_id != document_id or invoice.status not in VOIDABLE_STATUSES:
+        logger.warning(
+            "erp bill void: invoice %s changed while its bill was voided; not finished",
+            invoice.id,
+        )
+        invoice.erp_void_pending = None
+        raise _refused(ERP_VOID_NO_BILL, http_status.HTTP_409_CONFLICT)
 
     now = datetime.now(UTC)
     previous_status = invoice.status.value
@@ -348,11 +519,14 @@ async def void_flagged_erp_bill(
         "exception_id": str(exception.id),
         "voided_at": now.isoformat(),
         "actor_id": str(user.id),
-        "already_gone": already_gone,
+        "already_gone": answer.already_gone,
+        "attempt_id": attempt.attempt_id,
     }
     invoice.erp_document_id = None
     invoice.erp_document_url = None
+    invoice.erp_void_pending = None
     if instance is not None:
+        state = dict(instance.state_data or {})
         state.pop("erp_reference", None)
         state[ERP_BILL_VOIDED_KEY] = record
         instance.state_data = state
@@ -362,10 +536,8 @@ async def void_flagged_erp_bill(
         "exception_id": str(exception.id),
         "exception_type": exception.exception_type,
         "reason": reason,
-        # A bill found already voided reads `cancelled` whichever way the ERP
-        # said so (a status read, or a report of it deleted).
-        "erp_status_read": "cancelled" if already_gone else read.value,
-        "already_gone": already_gone,
+        "erp_status_read": answer.read,
+        "already_gone": answer.already_gone,
     }
     await transition_invoice(
         db,
@@ -386,7 +558,7 @@ async def void_flagged_erp_bill(
             "invoice_id": str(invoice.id),
             "erp_document_id": document_id,
             "previous_invoice_status": previous_status,
-            "already_gone": already_gone,
+            "already_gone": answer.already_gone,
             "reason": reason,
             "voided_at": now.isoformat(),
         },

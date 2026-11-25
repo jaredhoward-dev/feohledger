@@ -2550,6 +2550,35 @@ possibly-posted record stays, so the recall (§374) still refuses where another
 bill may exist. A live FeohLedger payment or card refuses the void
 (`erp_void_claimed`).
 
+**No row lock is held while the ERP answers (decisions §545).** The endpoint
+runs in three transactions. (1) Under the invoice, flag and workflow-instance
+locks: every refusal that needs no ERP call, then a void-in-progress marker on
+`invoices.erp_void_pending` (`attempt_id`, `exception_id`, `document_id`,
+`actor_id`, `reason`, `started_at`; migration 0146), committed. (2) With no lock
+held: the adapter is opened (the credential unseal included) and the read and
+void above run. (3) The same locks again: if the marker is still this
+attempt's and the invoice still holds the same bill at a voidable status, the
+void is finished as above and the marker cleared; after a refusal from (2) the
+marker is just cleared.
+
+While the marker is live (younger than `PENDING_STALE_AFTER_S`, 300 s; step 2
+is bounded at 105 s):
+
+- a second click answers 409 `erp_void_in_progress`, and the queue's verdict
+  says the same;
+- the flag it names cannot be resolved or dismissed (409 `erp_void_in_progress`
+  from `POST /exceptions/{id}/resolve`; a per-row skip with that reason from
+  `/bulk/resolve`; `escalate` stays open). The open flag is what keeps the
+  payment run, the card mint, mark-paid, retry-failed and the push refusing the
+  invoice, so they hold it with no change of their own. The recall refuses it
+  because it is not `approved` and still names its bill.
+
+A crash between (1) and (3) leaves the marker standing. Once stale it holds
+nothing, and the next click takes it over: the read finds the bill gone and
+converges (§542), or finds it open and voids it. No sweep is needed: a stale
+marker blocks nothing, and while it is live the open flag keeps every money
+path closed.
+
 ## The invoice names its bill in the ERP
 
 A confirmed push stores the adapter's `erp_document_id` on

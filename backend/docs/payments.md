@@ -541,6 +541,18 @@ so a new multi-invoice locker sorts too. Bulk delete never meets a run's
 payments at all: it skips any invoice with a live payment (`docs/decisions.md`
 §263).
 
+### An ERP bill void in flight holds the invoice through its flag
+
+`POST /api/exceptions/{id}/void-erp-bill` calls the ERP with no row lock held
+(decisions §545, `backend/docs/erp-integration.md` § Voiding a flagged bill).
+While it does, the invoice carries a committed `erp_void_pending` marker and
+the `duplicate` / `fraud_flag` it was started from cannot be resolved or
+dismissed. That open flag is what every payment path already refuses
+(`payment_runs.blocking_exception_types`: run creation, card mint, mark-paid,
+retry-failed, the queue), so no path here reads the marker itself. A crashed
+attempt's marker stops counting after 300 s and the next void click resumes
+it; while it counts, the flag stays open and the invoice stays unpayable.
+
 ### Bounded wait for the invoice lock
 
 Nothing in `app/` sets a session-wide `lock_timeout`, so a money path waiting on

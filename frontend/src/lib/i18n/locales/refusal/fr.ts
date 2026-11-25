@@ -45,6 +45,7 @@ export const messages = {
 	'refusal.erpVoidUnconfirmed': "L'ERP n'a pas confirmé l'annulation. Vérifiez la facture dans l'ERP avant de réessayer.",
 	'refusal.erpVoidBillSettled': "L'ERP n'indique plus rien de dû sur cette facture, mais aucun paiement (un avoir ou une passation en perte). Vérifiez-la dans l'ERP.",
 	'refusal.erpVoidDraftOnly': "L'ERP connecté ne peut annuler une facture depuis FeohLedger que tant qu'elle est un brouillon ou en attente d'approbation. Contrepassez celle-ci dans l'ERP.",
+	'refusal.erpVoidInProgress': "Cette facture est en cours d'annulation dans l'ERP. Patientez quelques minutes, puis vérifiez de nouveau le signalement.",
 	'refusal.paymentBlocksRecall': "FeohLedger paie déjà cette facture : elle a un paiement actif. Annulez son lot de paiement ou le paiement avant de retirer l'approbation.",
 	'refusal.cardBlocksRecall': "Une carte virtuelle a été émise pour payer cette facture. Annulez la carte avant de retirer l'approbation.",
 	'refusal.paymentRunSegregation': "Séparation des tâches : l'utilisateur qui a créé ce lot de paiements ne peut pas aussi l'approuver ou l'exécuter. Un autre utilisateur doit le faire.",

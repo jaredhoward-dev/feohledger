@@ -42,6 +42,7 @@ export const enRefusal = {
 	'refusal.erpVoidUnconfirmed': "The ERP did not confirm the void. Check the bill in the ERP before retrying.",
 	'refusal.erpVoidBillSettled': "The ERP shows nothing owing on this bill but no payment against it (a credit or a write-off). Check it in the ERP.",
 	'refusal.erpVoidDraftOnly': "The connected ERP can void a bill from FeohLedger only while it is a draft or awaiting approval there. Reverse this one in the ERP.",
+	'refusal.erpVoidInProgress': "This bill is being voided in the ERP right now. Wait a few minutes, then check the flag again.",
 	'refusal.paymentBlocksRecall': "FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before recalling the approval.",
 	'refusal.cardBlocksRecall': "A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.",
 	'refusal.paymentRunSegregation': "Segregation of duties: the user who created this payment run cannot also approve or execute it. A different user must.",
