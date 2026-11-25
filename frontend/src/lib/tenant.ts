@@ -16,6 +16,7 @@
  */
 import { PUBLIC_API_URL, PUBLIC_PLATFORM_DOMAINS, PUBLIC_SITE_URL } from '$app/env/public';
 import {
+	apexPageUrl,
 	classifyHost,
 	currentHostname,
 	parsePlatformDomains,
@@ -80,4 +81,11 @@ export function getTenantStorageKey(): string | null {
  *  of `PUBLIC_SITE_URL`. See `#lib/hostRouting.ts::sharedCookieDomainForHost`. */
 export function sharedCookieDomain(): string | null {
 	return sharedCookieDomainForHost(currentHostname(), PLATFORM_DOMAINS, PUBLIC_SITE_URL);
+}
+
+/** A page on the platform apex, for a link from a workspace host (the sign-in
+ *  page's "email me my workspace address"); `null` when the build declares no
+ *  `PUBLIC_SITE_URL`. See `#lib/hostRouting.ts::apexPageUrl`. */
+export function apexPage(path: string): string | null {
+	return apexPageUrl(PUBLIC_SITE_URL, path);
 }

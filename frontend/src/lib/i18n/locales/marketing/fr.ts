@@ -137,5 +137,16 @@ export const messages = {
 	'marketing.findWorkspace.noWorkspace': 'Nouveau sur {product} ? {create}',
 	'marketing.findWorkspace.panelHeading': 'Pourquoi nous demandons l’adresse',
 	'marketing.findWorkspace.panelBody':
-		'Chaque entreprise dispose de son propre espace de travail, avec sa propre connexion. Nous ne recherchons jamais un espace de travail à partir d’une adresse e-mail : personne ne peut donc se servir de cette page pour savoir où travaille quelqu’un.'
+		"Chaque entreprise dispose de son propre espace de travail, avec sa propre connexion. Cette page n’indique jamais à quel espace de travail appartient une adresse e-mail : si vous avez oublié le vôtre, nous l’envoyons à cette adresse, et personne ne peut donc se servir de cette page pour savoir où travaille quelqu’un.",
+	'marketing.findWorkspace.lookup.heading': "Vous avez oublié l’adresse de votre espace de travail ?",
+	'marketing.findWorkspace.lookup.intro': "Saisissez l’adresse e-mail avec laquelle vous vous connectez. Si elle correspond à un compte, nous lui envoyons un lien vers la page de connexion de son espace de travail.",
+	'marketing.findWorkspace.lookup.label': "Adresse e-mail",
+	'marketing.findWorkspace.lookup.submit': "M’envoyer l’adresse de mon espace de travail",
+	'marketing.findWorkspace.lookup.sending': "Envoi…",
+	'marketing.findWorkspace.lookup.invalid': "Saisissez une adresse e-mail valide.",
+	'marketing.findWorkspace.lookup.failed': "Nous n’avons pas pu l’envoyer. Vérifiez votre connexion et réessayez.",
+	'marketing.findWorkspace.lookup.sentHeading': "Consultez votre messagerie",
+	'marketing.findWorkspace.lookup.sent': "Si {email} correspond à un compte, nous lui avons envoyé un lien vers la page de connexion de son espace de travail. Cela peut prendre quelques minutes — pensez à vérifier vos courriers indésirables.",
+	'marketing.findWorkspace.lookup.again': "Utiliser une autre adresse",
+	'marketing.footer.findWorkspace': "Espace de travail oublié ?"
 } satisfies MarketingMessages;

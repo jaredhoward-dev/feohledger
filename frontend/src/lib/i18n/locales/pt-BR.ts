@@ -3500,6 +3500,7 @@ export const messages = {
 	'auth.login.ssoOnly': 'Este espaço de trabalho usa login único (SSO).',
 	'auth.login.or': 'ou',
 	'auth.login.signInWith': 'Entrar com {provider}',
+	'auth.login.findWorkspace': "Não tem certeza de que este é o seu espaço de trabalho? Receber o endereço por e-mail",
 	'auth.login.forgotPassword': 'Esqueceu a senha?',
 	'auth.login.signedOutOtherWorkspace': "Você foi desconectado porque sua sessão pertencia a outro espaço de trabalho. Entre aqui ou pela página do seu próprio espaço de trabalho.",
 	'auth.login.workspaceClosed': "Este espaço de trabalho foi encerrado e suas contas foram excluídas. Os endereços de e-mail delas agora podem ser usados em outro espaço de trabalho.",

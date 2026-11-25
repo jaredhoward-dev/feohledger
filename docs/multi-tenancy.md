@@ -35,16 +35,17 @@ domain — is offered back as a link to that host's `/login` rather than refused
 as a malformed name. If the config cannot be loaded it says so and offers Retry;
 it never guesses a host from the current URL.
 
-**There is deliberately no "enter your email, we'll find your workspace"
-lookup.** An unauthenticated endpoint that maps an email address to a workspace
-tells anyone who asks whether that person is a customer, and at which company —
+**The page never says which workspace an address belongs to.** An
+unauthenticated endpoint that answered an email address with a workspace would
+tell anyone who asks whether that person is a customer, and at which company —
 an account-enumeration oracle, the same disclosure the forgot-password flow is
-written to avoid. The address is in the welcome email and every notification a
-workspace sends, so the visitor already has it; a slug that names no workspace
-simply lands on a sign-in page that fails like any other. Adding such a lookup
-would need the same answer-for-everyone design as forgot-password (email the
-links, say the same thing whether or not anything matched) and a security
-review first.
+written to avoid. For a visitor who has forgotten the address, the page's
+second form, **Forgot your workspace address?** (`id="email"`,
+`WorkspaceLookupForm.svelte`), posts to `POST /api/workspace-lookup`, which
+answers every address the same way and emails the account's own sign-in page
+to that address only — forgot-password's design (decisions §518,
+[self-service-signup.md](self-service-signup.md) § Forgot your workspace). The
+landing footer and a failed sign-in on a workspace host link to it.
 
 ### 2. Frontend sends tenant header
 

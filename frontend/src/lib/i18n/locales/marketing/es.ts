@@ -136,5 +136,16 @@ export const messages = {
 	'marketing.findWorkspace.noWorkspace': '¿Nuevo en {product}? {create}',
 	'marketing.findWorkspace.panelHeading': 'Por qué te pedimos la dirección',
 	'marketing.findWorkspace.panelBody':
-		'Cada empresa tiene su propio espacio de trabajo, con su propio inicio de sesión. Nunca buscamos un espacio de trabajo a partir de un correo, así que nadie puede usar esta página para averiguar dónde trabaja alguien.'
+		"Cada empresa tiene su propio espacio de trabajo, con su propio inicio de sesión. Esta página nunca muestra a qué espacio de trabajo pertenece un correo: si olvidó el suyo, se lo enviamos a esa dirección, así que nadie puede usar esta página para averiguar dónde trabaja alguien.",
+	'marketing.findWorkspace.lookup.heading': "¿Olvidó la dirección de su espacio de trabajo?",
+	'marketing.findWorkspace.lookup.intro': "Introduzca el correo con el que inicia sesión. Si tiene una cuenta, le enviaremos un enlace a la página de inicio de sesión de su espacio de trabajo.",
+	'marketing.findWorkspace.lookup.label': "Correo electrónico",
+	'marketing.findWorkspace.lookup.submit': "Enviarme la dirección de mi espacio de trabajo",
+	'marketing.findWorkspace.lookup.sending': "Enviando…",
+	'marketing.findWorkspace.lookup.invalid': "Introduzca un correo electrónico válido.",
+	'marketing.findWorkspace.lookup.failed': "No pudimos enviarlo. Compruebe su conexión e inténtelo de nuevo.",
+	'marketing.findWorkspace.lookup.sentHeading': "Revise su correo",
+	'marketing.findWorkspace.lookup.sent': "Si {email} tiene una cuenta, le hemos enviado un enlace a la página de inicio de sesión de su espacio de trabajo. Puede tardar unos minutos; revise también la carpeta de spam.",
+	'marketing.findWorkspace.lookup.again': "Usar otra dirección",
+	'marketing.footer.findWorkspace': "¿Olvidó su espacio de trabajo?"
 } satisfies MarketingMessages;

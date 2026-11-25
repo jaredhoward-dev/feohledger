@@ -32,6 +32,17 @@ test.describe('login security', () => {
 		expect(token, 'failed login must not leave a token behind').toBeNull();
 	});
 
+	test('a failed sign-in offers "email me my workspace address" on the apex', async ({ page }) => {
+		// decisions §518: a refused sign-in may be the wrong workspace
+		// altogether; the link leads to the apex's lookup form.
+		await signIn(page, { email: 'noone@nowhere.test', password: 'wrong-password' });
+		await expect(page).toHaveURL(/\/login/);
+		const link = page.getByRole('alert').getByRole('link', {
+			name: 'Not sure this is your workspace? Email me my workspace address'
+		});
+		await expect(link).toHaveAttribute('href', /\/find-workspace#email$/);
+	});
+
 	test('wrong password and unknown email return the same status', async ({
 		request,
 		tenantAdmin

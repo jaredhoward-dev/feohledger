@@ -1244,26 +1244,6 @@ scope (§260) — do not fold them into any of these.
       tenants. Full plan, security risks and the
       cross-tenant test matrix: #614.
 
-### Surfaced by fixing signup's dead ends (2026-10-20, decisions §292)
-
-- [ ] **(c) There is no self-service "find my workspace" recovery.** A user
-      who forgets which workspace their account is in has no way back without
-      support: forgot-password only works on a workspace host (it needs the
-      tenant to build the reset link), and the apex has no sign-in page at
-      all. Signup now points an address that already has an account at its
-      workspace (§292), but only after the visitor has filled the form and
-      clicked a verification link — that is not a recovery path, and nobody
-      should have to start a signup to find a sign-in page. **Durable fix:**
-      an apex "Email me my workspace address" form — `POST
-      /api/workspace-lookup {email}`, public, captcha'd and rate-limited per
-      IP and per address like `/signup/start`, answering every address with
-      the same "if that address has an account, we've emailed it" response,
-      and emailing the account's own `tenant_urls.sign_in_url` (address
-      prefilled) only when one exists — linked from the apex landing page and
-      from the login page's error states. **Trigger:** the first support
-      request from someone who cannot find their workspace, or before signup
-      is advertised beyond the pilot.
-
 ### Surfaced by self-service workspace closure (2026-10-20, decisions §306)
 
 - [ ] **(c) An abandoned workspace is kept forever unless someone closes it.**
