@@ -884,6 +884,30 @@ describe('recalling an approval (decisions §374)', () => {
 	});
 });
 
+describe('deleting an invoice a rail holds (decisions §577)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states the live-payment and live-card refusals in all six locales', () => {
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			expect(cat['refusal.paymentBlocksDelete']).toBeTruthy();
+			expect(cat['refusal.cardBlocksDelete']).toBeTruthy();
+			expect(codedRefusalText('invoice_delete_claimed', { claim: 'payment' }, t)).toBe(
+				cat['refusal.paymentBlocksDelete']
+			);
+			expect(codedRefusalText('invoice_delete_claimed', { claim: 'virtual_card' }, t)).toBe(
+				cat['refusal.cardBlocksDelete']
+			);
+		}
+	});
+
+	it('falls back to the server sentence for a claim this build does not know', () => {
+		expect(codedRefusalText('invoice_delete_claimed', {}, enT)).toBeNull();
+		expect(codedRefusalText('invoice_delete_claimed', { claim: 'cheque' }, enT)).toBeNull();
+	});
+});
+
 describe('voiding a flagged bill in the ERP (decisions §539, §542, §545)', () => {
 	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
 
@@ -1682,7 +1706,8 @@ describe('the invoice bulk-status endpoint’s own skips (`api/invoices.bulk_sta
 		const codes = [...source.matchAll(/^INVOICE_[A-Z_]+ = "(invoice_[a-z_]+)"/gm)].map(
 			(x) => x[1]
 		);
-		expect(codes).toHaveLength(5);
+		// Five bulk-status skips, plus the delete door's claim (decisions §577).
+		expect(codes).toHaveLength(6);
 		for (const code of codes) {
 			expect(CODED_REFUSAL_CODES, `no sentence for "${code}"`).toContain(code);
 		}

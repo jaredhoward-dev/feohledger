@@ -53,6 +53,8 @@ export const enRefusal = {
 	'refusal.erpLookupFailed': "The ERP could not be searched just now, so nothing is known either way. Try again.",
 	'refusal.paymentBlocksRecall': "FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before recalling the approval.",
 	'refusal.cardBlocksRecall': "A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.",
+	'refusal.paymentBlocksDelete': "FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before deleting the invoice.",
+	'refusal.cardBlocksDelete': "A virtual card has been issued to pay this invoice. Cancel the card before deleting the invoice.",
 	'refusal.paymentRunSegregation': "Segregation of duties: the user who created this payment run cannot also approve or execute it. A different user must.",
 	'refusal.paymentRunAwaitingCfo': "This run exceeds the organization's CFO-approval threshold and is awaiting sign-off from a user with the CFO role.",
 	'refusal.paymentCfoRequired': "This payment is above your organization's CFO sign-off threshold. Book it through a payment run for CFO approval, or ask a CFO to create it.",

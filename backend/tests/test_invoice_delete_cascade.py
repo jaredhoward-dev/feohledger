@@ -61,9 +61,9 @@ async def _seed_invoice(mk, org_id, *, number: str) -> str:
 
 
 async def test_delete_invoice_with_virtual_card_succeeds(realdb):
-    """The exact live repro: an approved invoice with an auto-issued
-    virtual card (plus its own reveal token + rebate) must delete cleanly,
-    not 500."""
+    """The exact live repro: an approved invoice with a virtual card (plus its
+    own reveal token + rebate) must delete cleanly, not 500. The card is
+    cancelled: a live one refuses the delete (decisions §577, below)."""
     org_id = realdb.info(TENANT).org_id
     mk = realdb.sessionmaker(TENANT)
     invoice_id = await _seed_invoice(mk, org_id, number="DELCASC-CARD")
@@ -75,7 +75,7 @@ async def test_delete_invoice_with_virtual_card_succeeds(realdb):
             card_provider="mock",
             provider_card_id=f"card_{uuid.uuid4().hex[:8]}",
             amount_limit=Decimal("500.00"),
-            status="charged",
+            status="cancelled",
         )
         s.add(card)
         await s.flush()
@@ -334,7 +334,9 @@ async def test_delete_refuses_an_invoice_with_a_live_payment(realdb):
     async with realdb.client(key=TENANT, role="admin") as c:
         resp = await c.delete(f"/api/invoices/{inv_id}")
     assert resp.status_code == 409, resp.text
-    assert "payment run" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert detail["code"] == "invoice_delete_claimed"
+    assert detail["params"] == {"claim": "payment"}
     assert await _still_there(mk, inv_id)
 
 
@@ -351,4 +353,84 @@ async def test_bulk_delete_skips_an_invoice_with_a_live_payment(realdb):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"deleted": 1, "skipped": [paying]}
     assert await _still_there(mk, paying)
+    assert not await _still_there(mk, free)
+
+
+# ---------------------------------------------------------------------------
+# A live virtual card is a claim too (decisions §577): bearer-spendable for the
+# face amount, or already charged. The cascade deleted it with the invoice, so
+# the ledger lost a card that could still move (or had moved) money. Both doors
+# now refuse it, by the card rail's own predicate (`status <> 'cancelled'`);
+# cancelling the card is the way out.
+# ---------------------------------------------------------------------------
+
+
+async def _with_card(mk, org_id, invoice_id: str, status: str) -> uuid.UUID:
+    async with mk() as s:
+        card = VirtualCard(
+            organization_id=org_id,
+            invoice_id=uuid.UUID(invoice_id),
+            card_provider="mock",
+            provider_card_id=f"card_{uuid.uuid4().hex[:8]}",
+            amount_limit=Decimal("500.00"),
+            status=status,
+        )
+        s.add(card)
+        await s.commit()
+        return card.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("card_status", ["active", "charged"])
+async def test_delete_refuses_an_invoice_a_live_card_holds(realdb, card_status):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number=f"DEL-LIVE-CARD-{card_status}")
+    card_id = await _with_card(mk, org_id, inv_id, card_status)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "invoice_delete_claimed"
+    assert detail["params"] == {"claim": "virtual_card"}
+    assert await _still_there(mk, inv_id)
+    async with mk() as s:
+        assert (await s.execute(select(VirtualCard).where(VirtualCard.id == card_id))).first()
+    assert await _deletion_rows(mk, inv_id) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_goes_through_once_the_card_is_cancelled(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-LIVE-CARD-CANCEL")
+    card_id = await _with_card(mk, org_id, inv_id, "active")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        assert (await c.delete(f"/api/invoices/{inv_id}")).status_code == 409
+        async with mk() as s:
+            card = (
+                await s.execute(select(VirtualCard).where(VirtualCard.id == card_id))
+            ).scalar_one()
+            card.status = "cancelled"
+            await s.commit()
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 204, resp.text
+    assert not await _still_there(mk, inv_id)
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_skips_an_invoice_a_live_card_holds(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    carded = await _seed_invoice(mk, org_id, number="DEL-LIVE-CARD-B1")
+    free = await _seed_invoice(mk, org_id, number="DEL-LIVE-CARD-B2")
+    await _with_card(mk, org_id, carded, "active")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [carded, free]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": 1, "skipped": [carded]}
+    assert await _still_there(mk, carded)
     assert not await _still_there(mk, free)

@@ -449,6 +449,15 @@ const BUILDERS: Record<string, Builder> = {
 		if (claim === 'virtual_card') return t('refusal.cardBlocksRecall');
 		return null;
 	},
+	// `DELETE /api/invoices/{id}` — a live payment or virtual card holds the
+	// invoice (decisions §577). `params.claim` names the rail; an unknown one
+	// falls back to the server's sentence.
+	invoice_delete_claimed: (params, t) => {
+		const claim = str(params, 'claim');
+		if (claim === 'payment') return t('refusal.paymentBlocksDelete');
+		if (claim === 'virtual_card') return t('refusal.cardBlocksDelete');
+		return null;
+	},
 	// The state machine's own 409s (`services/workflow_engine.py`), reached
 	// through every door that transitions an invoice and through a
 	// `POST /bulk/status` row's skip. `params.status` / `params.target` are
