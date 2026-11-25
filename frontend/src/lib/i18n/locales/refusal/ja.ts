@@ -45,6 +45,7 @@ export const messages = {
 	'refusal.erpVoidUnconfirmed': "ERPから無効化の確認がありませんでした。再試行する前にERPで請求書を確認してください。",
 	'refusal.erpVoidBillSettled': "ERPではこの請求書の未払残高はありませんが、支払いの記録もありません（貸方票または償却）。ERPで確認してください。",
 	'refusal.erpVoidDraftOnly': "接続中のERPは、請求書が下書きまたは承認待ちの間のみFeohLedgerから無効化できます。この請求書はERPで取り消してください。",
+	'refusal.erpVoidInProgress': "この請求書は現在ERPで無効化処理中です。数分待ってから、フラグを再度確認してください。",
 	'refusal.paymentBlocksRecall': "FeohLedgerはすでにこの請求書を支払い中です（有効な支払いがあります）。承認を取り消す前に、支払いランを取り消すか、支払いを無効にしてください。",
 	'refusal.cardBlocksRecall': "この請求書の支払いにバーチャルカードが発行されています。承認を取り消す前に、カードを取り消してください。",
 	'refusal.paymentRunSegregation': "職務分掌: この支払いランを作成したユーザーは、承認または実行することはできません。別のユーザーが行う必要があります。",

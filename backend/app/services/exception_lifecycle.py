@@ -828,6 +828,19 @@ async def record_decision(
     ``approvers`` overrides the set read from them (:func:`segregation_refusal`);
     omitted, it is read from the row as it is now.
     """
+    if action in CLEARING_ACTIONS:
+        # A duplicate / fraud flag whose bill is being voided in the ERP right
+        # now holds the invoice off every payment, card and push gate while the
+        # void's ERP calls run with no lock held; it is not cleared until that
+        # attempt finishes (decisions §545). `escalate` stays open.
+        from app.services import erp_bill_void
+
+        pending = await erp_bill_void.clear_refusal(db, exception)
+        if pending is not None:
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail=coded_refusal(pending, erp_bill_void.refusal_message(pending)),
+            )
     if invoice is None and exception.invoice_id is not None:
         invoice = (
             await db.execute(select(Invoice).where(Invoice.id == exception.invoice_id))

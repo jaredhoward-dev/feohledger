@@ -45,6 +45,7 @@ export const messages = {
 	'refusal.erpVoidUnconfirmed': "O ERP não confirmou a anulação. Verifique a conta no ERP antes de tentar de novo.",
 	'refusal.erpVoidBillSettled': "O ERP não mostra saldo em aberto nesta conta, mas também nenhum pagamento (um crédito ou uma baixa). Verifique-a no ERP.",
 	'refusal.erpVoidDraftOnly': "O ERP conectado só anula uma conta pelo FeohLedger enquanto ela é um rascunho ou aguarda aprovação lá. Estorne esta no ERP.",
+	'refusal.erpVoidInProgress': "Esta conta está sendo anulada no ERP agora. Aguarde alguns minutos e verifique o alerta novamente.",
 	'refusal.paymentBlocksRecall': "O FeohLedger já está pagando esta fatura: ela tem um pagamento ativo. Cancele o lote de pagamento ou anule o pagamento antes de revogar a aprovação.",
 	'refusal.cardBlocksRecall': "Um cartão virtual foi emitido para pagar esta fatura. Cancele o cartão antes de revogar a aprovação.",
 	'refusal.paymentRunSegregation': "Segregação de funções: o usuário que criou este lote de pagamentos não pode também aprová-lo ou executá-lo. Outro usuário deve fazê-lo.",

@@ -875,7 +875,7 @@ describe('recalling an approval (decisions §374)', () => {
 	});
 });
 
-describe('voiding a flagged bill in the ERP (decisions §539, §542)', () => {
+describe('voiding a flagged bill in the ERP (decisions §539, §542, §545)', () => {
 	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
 
 	it('states every refusal the void door and its verdict answer with, in all six locales', () => {
@@ -889,7 +889,8 @@ describe('voiding a flagged bill in the ERP (decisions §539, §542)', () => {
 			['erp_void_unsupported', 'refusal.erpVoidUnsupported'],
 			['erp_void_rejected', 'refusal.erpVoidRejected'],
 			['erp_void_failed', 'refusal.erpVoidFailed'],
-			['erp_void_unconfirmed', 'refusal.erpVoidUnconfirmed']
+			['erp_void_unconfirmed', 'refusal.erpVoidUnconfirmed'],
+			['erp_void_in_progress', 'refusal.erpVoidInProgress']
 		];
 		for (const [loc, catalogue] of Object.entries(locales)) {
 			const t = translator(catalogue as typeof en, loc);

@@ -42,6 +42,7 @@ from app.services.erp_status_sync import (
 )
 from app.services.exception_lifecycle import (
     ACTIONABLE_STATUSES,
+    CLEARING_ACTIONS,
     EXCEPTION_SEVERITY_RANK,
     EXCEPTION_TYPE_LABELS,
     RESOLUTION_ACTIONS,
@@ -674,6 +675,14 @@ async def bulk_resolve(
         if refusal is not None:
             skipped.append({"id": str(exc.id), "reason": refusal})
             continue
+        # Likewise the flag of a bill being voided in the ERP right now (§545).
+        if body.action in CLEARING_ACTIONS:
+            from app.services.erp_bill_void import clear_refusal
+
+            pending = await clear_refusal(db, exc)
+            if pending is not None:
+                skipped.append({"id": str(exc.id), "reason": pending})
+                continue
         await record_decision(
             db,
             exception=exc,
@@ -984,65 +993,104 @@ async def void_erp_bill(
     holds, and walk the invoice back to ``approved``.
 
     Never automatic: a person who may void a payment decides, from the flag.
-    The invoice is locked, then the row, in the order every ERP writer takes
-    them. Every refusal comes before anything is written
-    (``erp_bill_void.void_flagged_erp_bill``). A replay of a void this flag
-    already made answers 200 with ``replayed: true`` and calls nothing; a fresh
-    void answers 201. The flag stays open: the payment run and the ERP push
-    still refuse the invoice until someone decides it.
+    Three transactions, so no row lock is held while the ERP answers
+    (decisions §545, ``services/erp_bill_void``): under the locks (invoice,
+    then the flag, then the workflow instance — the order every ERP writer
+    takes them) every refusal that needs no ERP call, then a void-in-progress
+    marker, committed; the ERP read and void with no lock held; then the same
+    locks again to finish, or to clear the marker after a refusal. A replay of
+    a void this flag already made answers 200 with ``replayed: true`` and calls
+    nothing; a fresh void answers 201; a click while another attempt is calling
+    the ERP answers 409 ``erp_void_in_progress``. The flag stays open: the
+    payment run and the ERP push still refuse the invoice until someone decides
+    it.
     """
-    from app.services.erp_bill_void import VoidRefused, void_flagged_erp_bill
+    from app.services import erp_bill_void as ebv
 
     scoped = apply_entity_scope(
         select(APException).where(APException.id == exception_id), APException, entity_id
     )
-    found = (await db.execute(scoped)).scalar_one_or_none()
-    if found is None:
-        raise HTTPException(status_code=404, detail="Exception not found")
-    invoice = None
-    if found.invoice_id is not None:
-        invoice = (
-            await db.execute(
-                select(Invoice)
-                .where(Invoice.id == found.invoice_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-    row = (
-        await db.execute(
-            scoped.with_for_update(of=APException).execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    if row is None or row.invoice_id != found.invoice_id:
-        raise HTTPException(status_code=404, detail="Exception not found")
 
-    # The invoice's own workflow instance (not `workflow_instance_for`, which
-    # reads it only for the approver axis): the void clears the push's
-    # `erp_reference` there and records itself, which is what makes a replay
-    # recognisable.
-    instance = None
-    if invoice is not None:
-        instance = (
+    async def _lock():
+        """The invoice, the flag and the invoice's own workflow instance, FOR
+        UPDATE and read fresh. The instance is the invoice's own (not
+        `workflow_instance_for`, which reads it only for the approver axis):
+        the void clears the push's `erp_reference` there and records itself,
+        which is what makes a replay recognisable."""
+        found = (await db.execute(scoped)).scalar_one_or_none()
+        if found is None:
+            raise HTTPException(status_code=404, detail="Exception not found")
+        inv = None
+        if found.invoice_id is not None:
+            inv = (
+                await db.execute(
+                    select(Invoice)
+                    .where(Invoice.id == found.invoice_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        locked = (
             await db.execute(
-                select(WorkflowInstance)
-                .where(WorkflowInstance.invoice_id == invoice.id)
-                .with_for_update()
+                scoped.with_for_update(of=APException).execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+        if locked is None or locked.invoice_id != found.invoice_id:
+            raise HTTPException(status_code=404, detail="Exception not found")
+        inst = None
+        if inv is not None:
+            inst = (
+                await db.execute(
+                    select(WorkflowInstance)
+                    .where(WorkflowInstance.invoice_id == inv.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        return locked, inv, inst
+
+    reason = body.reason.strip()
+
+    # 1. Under the locks: refuse, or commit the marker.
+    row, invoice, instance = await _lock()
     try:
-        outcome = await void_flagged_erp_bill(
-            db,
-            org=org,
-            exception=row,
-            invoice=invoice,
-            instance=instance,
-            user=user,
-            reason=body.reason.strip(),
+        started = await ebv.begin_void(
+            db, exception=row, invoice=invoice, instance=instance, user=user, reason=reason
         )
-    except VoidRefused as refused:
+    except ebv.VoidRefused as refused:
         raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
-    if not outcome.replayed:
+    if isinstance(started, ebv.VoidOutcome):
+        outcome = started
+    else:
+        await db.commit()
+
+        # 2. No lock held: the ERP.
+        refusal: ebv.VoidRefused | None = None
+        answer = None
+        try:
+            answer = await ebv.call_erp(org, started)
+        except ebv.VoidRefused as refused:
+            refusal = refused
+
+        # 3. The same locks again: finish, or clear the marker.
+        row, invoice, instance = await _lock()
+        try:
+            if refusal is not None:
+                ebv.abandon_void(invoice, started)
+                raise refusal
+            outcome = await ebv.finish_void(
+                db,
+                attempt=started,
+                answer=answer,
+                exception=row,
+                invoice=invoice,
+                instance=instance,
+                user=user,
+                reason=reason,
+            )
+        except ebv.VoidRefused as refused:
+            await db.commit()
+            raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
         await db.commit()
         response.status_code = http_status.HTTP_201_CREATED
     return {

@@ -45,6 +45,7 @@ export const messages = {
 	'refusal.erpVoidUnconfirmed': "El ERP no confirmó la anulación. Revise la factura en el ERP antes de reintentar.",
 	'refusal.erpVoidBillSettled': "El ERP no muestra nada pendiente en esta factura, pero tampoco un pago (un abono o una cancelación contable). Revísela en el ERP.",
 	'refusal.erpVoidDraftOnly': "El ERP conectado solo puede anular una factura desde FeohLedger mientras es un borrador o está pendiente de aprobación allí. Reviértala en el ERP.",
+	'refusal.erpVoidInProgress': "Esta factura se está anulando en el ERP ahora mismo. Espere unos minutos y vuelva a revisar la alerta.",
 	'refusal.paymentBlocksRecall': "FeohLedger ya está pagando esta factura: tiene un pago activo. Cancele su lote de pagos o anule el pago antes de retirar la aprobación.",
 	'refusal.cardBlocksRecall': "Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de retirar la aprobación.",
 	'refusal.paymentRunSegregation': "Segregación de funciones: el usuario que creó esta remesa de pagos no puede también aprobarla ni ejecutarla. Debe hacerlo otro usuario.",
