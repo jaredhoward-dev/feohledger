@@ -1,5 +1,6 @@
 import { api, ApiError, setToken, clearToken, hasToken } from '#lib/api.ts';
 import { sessionRejection } from '#lib/api/sessionRejection.ts';
+import { employeeAcceptanceRefusal } from '#lib/api/acceptanceRefusal.ts';
 import { rememberNextForSso } from '#lib/utils/postLoginRedirect.ts';
 import { ACCEPTED_LEGAL_VERSIONS } from '#lib/legal/acceptance.ts';
 import { performAuthentication, performRegistration } from '#lib/webauthn.ts';
@@ -317,6 +318,15 @@ function createAuthStore() {
 	 * `ApiError` for the caller to state: a 422 `legal_acceptance_required`
 	 * (the versions in force changed since this bundle loaded) or a 429.
 	 */
+	// Any call the server-side gate refused (403 `legal_acceptance_required`,
+	// decisions §505) — after a version bump in an open session — puts the
+	// accept step up, as a `/me` saying so would.
+	employeeAcceptanceRefusal.listen(() => {
+		if (user && !user.legal_acceptance_required) {
+			user = { ...user, legal_acceptance_required: true };
+		}
+	});
+
 	async function acceptLegal(): Promise<void> {
 		const me = await api.post<User>('/api/auth/legal-acceptance', ACCEPTED_LEGAL_VERSIONS);
 		// A `/me` still in flight was sent before the acceptance; its answer

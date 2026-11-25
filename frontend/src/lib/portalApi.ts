@@ -5,6 +5,8 @@
  */
 import { localizedApiError } from '#lib/api.ts';
 import type { ActionRefusal } from '#lib/api/actionVerdicts.ts';
+import { portalAcceptanceRefusal } from '#lib/api/acceptanceRefusal.ts';
+import { apiErrorCode } from '#lib/utils/apiError.ts';
 import { getApiBase, getTenantSlug } from '#lib/tenant.ts';
 
 // Resolved per request, not frozen at module load — see the note in
@@ -60,6 +62,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
+		// The Privacy acknowledgement gate's 403 puts the portal's step up
+		// (`api/acceptanceRefusal.ts`, decisions §505).
+		portalAcceptanceRefusal.notice(res.status, apiErrorCode(body.detail).code);
 		throw await localizedApiError(body, `API error ${res.status}`, res.status);
 	}
 
@@ -85,6 +90,9 @@ async function download(path: string): Promise<Blob> {
 	}
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
+		// The Privacy acknowledgement gate's 403 puts the portal's step up
+		// (`api/acceptanceRefusal.ts`, decisions §505).
+		portalAcceptanceRefusal.notice(res.status, apiErrorCode(body.detail).code);
 		throw await localizedApiError(body, `API error ${res.status}`, res.status);
 	}
 	return res.blob();

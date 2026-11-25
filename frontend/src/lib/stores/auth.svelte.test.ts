@@ -345,6 +345,22 @@ describe('auth.acceptLegal — the legal-acceptance state', () => {
 		expect(get).toHaveBeenCalledTimes(1);
 	});
 
+	it('a call the server-side gate refuses puts the step up on a loaded account (§505)', async () => {
+		const auth = await freshStore('tok');
+		const { employeeAcceptanceRefusal } = await import('#lib/api/acceptanceRefusal.ts');
+		get.mockResolvedValueOnce(ACCEPTED);
+		await auth.fetchUser();
+		expect(auth.user?.legal_acceptance_required).toBe(false);
+
+		// What `api.ts::endSessionIfRejected` does on any refused response.
+		employeeAcceptanceRefusal.notice(403, 'legal_acceptance_required');
+
+		expect(auth.user?.legal_acceptance_required).toBe(true);
+		expect(auth.user?.id).toBe(ALICE.id);
+		expect(auth.loggedIn).toBe(true);
+		expect(auth.userStatus).toBe('ready');
+	});
+
 	it('a refused accept throws for the step to state and leaves the step up', async () => {
 		const auth = await freshStore('tok');
 		get.mockResolvedValueOnce(UNACCEPTED);
