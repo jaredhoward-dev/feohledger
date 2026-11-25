@@ -29944,3 +29944,29 @@ the 600 + 400 case best-fit misses; the search bound and step cap fall back to
 best-fit; FX before the draw by a spy; a pre-approval decided away between the
 candidate query and the lock covers nothing — verified to fail without the
 re-read).
+
+## 571. The mobile decision buttons' merge boundary states the button's enabled state (§568 follow-up, round 48)
+
+**What changed.** §568 wrapped the phone's Approve / Reject in
+`MergeSemantics` so the assignee note and the refusal reach each button as its
+semantics hint. The button's own node (`ButtonStyleButton` is a semantics
+container) is merged into that boundary but stays a separate node holding its
+flags; the boundary itself carried only the hint. Flutter's
+`textContrastGuideline` skips a disabled node by the node's OWN `isEnabled`, so
+it checked the boundary, found the refused Approve's Material disabled text
+(2.24:1), and failed. Each boundary now states `enabled:` from the same
+expression as `onPressed` (`!_submitting && verdict.allowed`).
+
+**Why this and not the alternatives.** The boundary is the node a screen reader
+lands on, so it stating the control's state is the honest shape, and a refused
+button is an inactive control, which WCAG 1.4.3 exempts from text contrast,
+the exemption every other disabled button in the app already gets. Raising the
+disabled colour would have made a refused button look offered. Dropping the
+merge sends the hint up to the button bar (§568). An offered button is still
+checked in full (white on `green.shade800`, about 5.1:1).
+
+**Tests.** `mobile/test/a11y/accessibility_test.dart` asserts the boundary's
+`isEnabled` in both the allowed and refused cases;
+`mobile/test/screens/invoice_detail_screen_test.dart` reads the button flag from
+the boundary's merged `getSemanticsData()` (what a screen reader is handed),
+not the boundary node alone.

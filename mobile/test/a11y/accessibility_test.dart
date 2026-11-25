@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:ui' show Tristate;
 
 import 'package:flutter/semantics.dart' show SemanticsAction;
 import 'package:material_ui/material_ui.dart';
@@ -741,6 +742,17 @@ void main() {
         await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
         await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
         await expectLater(tester, meetsGuideline(textContrastGuideline));
+        // The boundary a screen reader lands on states the button's own
+        // state, so a refused Approve is announced (and contrast-exempt) as
+        // the inactive control it is, and an offered one is checked in full
+        // (decisions §571).
+        final approveNode = tester.getSemantics(
+          find.byKey(const ValueKey('review-approve-semantics')),
+        );
+        expect(
+          approveNode.flagsCollection.isEnabled,
+          approve == null ? Tristate.isTrue : Tristate.isFalse,
+        );
         handle.dispose();
       });
     }
