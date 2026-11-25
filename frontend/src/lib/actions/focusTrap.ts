@@ -154,6 +154,10 @@ export const focusTrap: Action<HTMLElement, FocusTrapParams | undefined> = (node
 			// host) shares the host's DOM, so its Escape bubbles here too: only
 			// the topmost dialog closes, never the one under it as well.
 			if (!ownsEscape(openModals, node)) return;
+			// Handled: stop it here. Closing this dialog can unmount it (and
+			// pop it off the stack) before the same event bubbles on to the
+			// host's trap, which would then find itself topmost and close too.
+			e.stopPropagation();
 			onEscape?.();
 			return;
 		}
