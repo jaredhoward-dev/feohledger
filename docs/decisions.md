@@ -26710,8 +26710,6 @@ can reach the timeline — an exception, chat or vendor-adjacent row can — and
 second vocabulary in six more locales would drift from the first. *Dropping the
 overrides* and using the console's labels throughout: it would reword the
 timeline's existing rows for no gain.
-||||||| f0e8dbf52
-
 
 ## 523. The e2e invoice teardown is one transaction that locks the invoices first (round 43)
 
