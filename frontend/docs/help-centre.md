@@ -90,8 +90,8 @@ this), `lifecycle` (the walkthrough), `diagram` (`{ id, caption }`).
 - **An invoice status** — place it in a `lifecycle.ts` stage (or as a branch);
   the test enumerates `INVOICE_STATUSES`.
 - **A diagram** — a component in `components/help/diagrams/`, an id in
-  `DIAGRAM_IDS`, a branch in `Diagram.svelte`, and a `diagram` block in at least
-  one guide. Inline SVG coloured from the `app.css` tokens (it follows the
+  `DIAGRAM_IDS`, a lazy `import()` in `Diagram.svelte`'s `DIAGRAMS` map, and a
+  `diagram` block in at least one guide. Inline SVG coloured from the `app.css` tokens (it follows the
   tenant's accent), every word from the catalogue, legible at 320px.
 
 ## Supplier portal help
@@ -165,6 +165,13 @@ literal ids (the invoice modal picks two-, three- or four-way by match type).
 small page directory only), and `HelpTip` needs only catalogue keys
 (`terms.ts`), fetching the guide index with a dynamic `import()` the first time
 any tip opens. `content.test.ts` § bundle boundaries pins both.
+
+Each guide diagram is its own lazy chunk (`Diagram.svelte`'s `DIAGRAMS` map of
+dynamic imports): a guide shows one or two of the eight, and bundled together
+they were ~12 KB on `/help/guides/[id]`, the route the web bundle budget gates.
+The guide page's `+page.ts` awaits `loadDiagrams` for the ids its guide uses, so
+SvelteKit has the drawing before the first frame and the a11y specs that wait
+on the guide's `<h1>` still measure it drawn.
 
 The glossary, help-route and diagram **strings** are their own lazy catalogue
 slice too (`src/lib/i18n/locales/help/<locale>.ts`, decisions §261): the /help

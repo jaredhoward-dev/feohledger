@@ -57,10 +57,16 @@ function purge(cardId: string): void {
 }
 
 function settleBody(eventId: string): string {
+	// Lithic's real clearing (decisions §549): a `card_transaction.updated`
+	// whose `status` is `SETTLED`, carrying the settled amount in cents — the
+	// same 1234.56 the card was charged, so the rebate base is unchanged.
 	return JSON.stringify({
+		type: 'card_transaction.updated',
+		token: `txn-${eventId}`,
 		card_token: TOKEN,
-		type: 'transaction.created',
-		event_id: eventId
+		status: 'SETTLED',
+		event_id: eventId,
+		amount: 123456
 	});
 }
 

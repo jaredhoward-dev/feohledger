@@ -4,6 +4,7 @@ import {
 	API_BASE,
 	authedTenantHeaders,
 	currentTenantSlug,
+	deleteInvoicesWhere,
 	expect,
 	signInAndWait,
 	tenantBase,
@@ -222,6 +223,10 @@ async function writeBack(paymentId: string): Promise<{ apply: { amount: unknown 
 }
 
 async function afterAllReset(browser: import('@playwright/test').Browser): Promise<void> {
+	// Everything this spec created hangs off its own `E2E-NSS-*` invoices: the
+	// helper takes their payments, exceptions and workflow rows, and the
+	// payment run that paid only them (scoped to this worker's tenant).
+	deleteInvoicesWhere(`invoice_number LIKE 'E2E-NSS-%'`);
 	// Other suites assume the seeded org has no ERP configured.
 	const context = await browser.newContext({ baseURL: tenantBase(currentTenantSlug()) });
 	const page = await context.newPage();
