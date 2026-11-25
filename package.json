@@ -76,7 +76,7 @@
 		"services:logs": "cd backend && docker compose --profile idp --profile aws --profile ai --profile payments --profile mail --profile erp --profile commerce logs -f",
 		"services:reset": "cd backend && docker compose --profile idp --profile aws --profile ai --profile payments --profile mail --profile erp --profile commerce down -v && docker compose --profile idp --profile aws --profile ai --profile payments --profile mail --profile erp --profile commerce up -d",
 
-		"//-- seed & migrate --": "Demo data + Alembic migrations. Need core services up (db:up) and the backend venv activated. seed creates 2 demo tenants; migrate:all = control plane + every per-tenant feoh_<slug> DB. simulate:card -- --tenant acme --card <id|token> [--amount 90.00] [--settle] charges a MOCK virtual card through the real signed card webhook (the issuer's charge, which a card-paid run waits for since decisions §537), refused deployed or off the mock provider (§541; backend/docs/virtual-cards.md). Docs: backend/docs/database.md.",
+		"//-- seed & migrate --": "Demo data + Alembic migrations. Need core services up (db:up) and the backend venv activated. seed creates 2 demo tenants; migrate:all = control plane + every per-tenant feoh_<slug> DB. simulate:card -- --tenant acme --card <id|token> [--amount 90.00] [--settle | --reverse | --expire] charges a MOCK virtual card through the real signed card webhook (the issuer's charge, which a card-paid run waits for since decisions §537), refused deployed or off the mock provider (§541; backend/docs/virtual-cards.md). Docs: backend/docs/database.md.",
 		"seed": "cd backend && python scripts/seed.py",
 		"seed:lean": "cd backend && python scripts/seed.py --lean",
 		"migrate": "cd backend && alembic upgrade head",

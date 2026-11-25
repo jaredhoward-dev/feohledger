@@ -23,6 +23,8 @@ from app.models.virtual_card import CardRebate, VirtualCard
 from app.services import mock_card_simulator as sim
 from app.services.card_adapters.mock_adapter import (
     MOCK_EVENT_AUTHORIZATION,
+    MOCK_EVENT_EXPIRY,
+    MOCK_EVENT_REVERSAL,
     MOCK_WEBHOOK_LOCAL_SECRET,
     mock_card_event,
     sign_mock_card_event,
@@ -239,6 +241,8 @@ async def test_a_card_that_is_not_a_mock_card_is_refused(realdb):
         ({"card_ref": "mock_card_missing"}, sim.REFUSED_NO_CARD),
         ({"card_ref": "tok", "amount": Decimal("0")}, sim.REFUSED_BAD_AMOUNT),
         ({"card_ref": "tok", "amount": Decimal("NaN")}, sim.REFUSED_BAD_AMOUNT),
+        ({"card_ref": "tok", "lapse": "refund"}, sim.REFUSED_BAD_LAPSE),
+        ({"card_ref": "tok", "lapse": "reversal", "settle": True}, sim.REFUSED_BAD_LAPSE),
     ],
 )
 async def test_unusable_requests_are_refused(realdb, kwargs, code):
@@ -252,3 +256,53 @@ async def test_unusable_requests_are_refused(realdb, kwargs, code):
 def test_the_event_amount_is_an_exact_decimal_string():
     body = mock_card_event("tok", event_type="authorization", amount=Decimal("0.10"))
     assert b'"amount":"0.10"' in body
+
+
+@pytest.mark.parametrize(
+    ("lapse", "event"), [("reversal", MOCK_EVENT_REVERSAL), ("expiry", MOCK_EVENT_EXPIRY)]
+)
+async def test_a_lapse_follows_the_authorization_and_frees_the_card(realdb, lapse, event):
+    """Decisions §544: ``--reverse`` / ``--expire`` send the authorization and
+    then its lapse. The card is unspent again (``active``, no charged figure),
+    the leg stays in flight and no payment sync is dispatched."""
+    from app.services.payment_settlement import COVERAGE_IN_FLIGHT
+    from app.services.payment_settlement_record import payment_coverage
+
+    await _cards(realdb)
+    card_id, token, pay_id = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        result = await sim.simulate_mock_card_charge(
+            _app(), slug=realdb.info(TENANT).slug, card_ref=token, lapse=lapse
+        )
+
+    assert result.events == (MOCK_EVENT_AUTHORIZATION, event)
+    assert result.card_status == "active" and result.amount_charged is None
+    async with realdb.sessionmaker(TENANT)() as s:
+        payment = await s.get(Payment, pay_id)
+        coverage = await payment_coverage(s, payment, "USD")
+    assert payment.settled_amount is None
+    assert coverage.state == COVERAGE_IN_FLIGHT
+    dispatched.assert_not_awaited()
+
+
+def test_the_cli_takes_one_outcome_at_most(capsys):
+    """``--settle``, ``--reverse`` and ``--expire`` are mutually exclusive."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "simulate_card_charge.py"
+    spec = importlib.util.spec_from_file_location("simulate_card_charge", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with patch.object(module, "_run", new=AsyncMock(return_value=0)) as run:
+        assert module.main(["--tenant", "acme", "--card", "c", "--reverse"]) == 0
+        assert run.await_args.args[0].lapse == "reversal"
+        assert module.main(["--tenant", "acme", "--card", "c", "--expire"]) == 0
+        assert run.await_args.args[0].lapse == "expiry"
+        assert module.main(["--tenant", "acme", "--card", "c"]) == 0
+        assert run.await_args.args[0].lapse is None
+    with pytest.raises(SystemExit):
+        module.main(["--tenant", "acme", "--card", "c", "--settle", "--reverse"])

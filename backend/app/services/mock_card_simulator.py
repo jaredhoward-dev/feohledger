@@ -14,8 +14,11 @@ ASGI app given. So the real handler verifies it, dedupes it and, on the
 settlement, writes the charge through ``record_card_spend`` and re-dispatches
 the run's payment sync, exactly as for a Lithic delivery. The authorization
 alone leaves the run's leg in flight (an authorization is not money moved,
-§543), so ``settle`` is what takes a card-paid invoice to ``paid``. Nothing
-here writes a card or a payment itself.
+§543), so ``settle`` is what takes a card-paid invoice to ``paid``. With
+``lapse`` (``reversal`` or ``expiry``) the authorization is followed by its
+reversal or expiry instead, which returns the card to unspent (``active``,
+decisions §544), so a void or a reissue after a lapsed hold can be tried
+locally. Nothing here writes a card or a payment itself.
 
 Refused (``MockCardSimulationRefused``, by code) in a deployed environment, for
 a tenant whose card provider is not ``mock``, and for a card that is not a mock
@@ -38,6 +41,8 @@ from app.models.organization import Organization
 from app.models.virtual_card import VirtualCard
 from app.services.card_adapters.mock_adapter import (
     MOCK_EVENT_AUTHORIZATION,
+    MOCK_EVENT_EXPIRY,
+    MOCK_EVENT_REVERSAL,
     MOCK_EVENT_SETTLEMENT,
     MOCK_WEBHOOK_LOCAL_SECRET,
     MOCK_WEBHOOK_PROVIDER,
@@ -51,6 +56,10 @@ REFUSED_PROVIDER_NOT_MOCK = "card_provider_not_mock"
 REFUSED_NO_CARD = "no_such_card"
 REFUSED_CARD_NOT_MOCK = "card_not_mock"
 REFUSED_BAD_AMOUNT = "invalid_amount"
+REFUSED_BAD_LAPSE = "invalid_lapse"
+
+#: ``lapse`` → the event that follows the authorization.
+LAPSE_EVENTS = {"reversal": MOCK_EVENT_REVERSAL, "expiry": MOCK_EVENT_EXPIRY}
 
 WEBHOOK_PATH = f"/api/cards/webhook/{MOCK_WEBHOOK_PROVIDER}"
 
@@ -91,12 +100,17 @@ async def simulate_mock_card_charge(
     card_ref: str,
     amount: Decimal | None = None,
     settle: bool = False,
+    lapse: str | None = None,
 ) -> SimulatedCharge:
     """Charge (and with ``settle``, settle) the mock card ``card_ref`` (its id
     or provider token) of tenant ``slug`` through the real card webhook.
-    ``amount`` defaults to the card's limit."""
+    ``amount`` defaults to the card's limit. ``lapse`` (``reversal`` /
+    ``expiry``, not with ``settle``) follows the authorization with its lapse
+    instead of a settlement."""
     if settings.is_deployed:
         raise MockCardSimulationRefused(REFUSED_DEPLOYED)
+    if lapse is not None and (lapse not in LAPSE_EVENTS or settle):
+        raise MockCardSimulationRefused(REFUSED_BAD_LAPSE)
     if amount is not None and (not amount.is_finite() or amount <= 0):
         raise MockCardSimulationRefused(REFUSED_BAD_AMOUNT)
     from app.services.provider_credentials import provider_config
@@ -128,7 +142,11 @@ async def simulate_mock_card_charge(
         card_id, token = card.id, card.provider_card_id
         figure = amount if amount is not None else card.amount_limit
 
-    events = [MOCK_EVENT_AUTHORIZATION] + ([MOCK_EVENT_SETTLEMENT] if settle else [])
+    events = [MOCK_EVENT_AUTHORIZATION]
+    if settle:
+        events.append(MOCK_EVENT_SETTLEMENT)
+    elif lapse is not None:
+        events.append(LAPSE_EVENTS[lapse])
     transport = httpx.ASGITransport(app=asgi_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
         for event_type in events:
