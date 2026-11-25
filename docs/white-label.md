@@ -846,8 +846,8 @@ backend 403s them regardless). Lists the partner's child tenants (`DataTable`,
 clickable rows) and opens a `Modal` to view/edit a child's brand (product name,
 logo URL, two accent colors, support + legal URLs) with the same client-side
 hex/URL validation as the org's own Branding panel, saving via `PUT
-/api/partner/children/{id}/branding`. A standalone org renders the empty
-"not a partner" state. API client: `frontend/src/lib/api/partner.ts` (types in
+/api/partner/children/{id}/branding`. A standalone org sees the children table
+with its empty row worded as the "not a partner" state (decisions §501). API client: `frontend/src/lib/api/partner.ts` (types in
 `frontend/src/lib/types/partner.ts`). Built from the shared `ui/` components.
 
 The page also carries the **provisioning** affordances: a **Generate link code**
