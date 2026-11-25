@@ -313,7 +313,7 @@ are lazy catalogue slices — `locales/help/`, `locales/settings/` (`org.*`,
 `orgSso.*`, `admin.*`, `billing.*`, `sweepHealth.*`), `locales/portal/` and
 `locales/marketing/` (the apex landing page, which awaits it itself) and
 `locales/audit/` (`/audit`'s action labels, `audit.action.*` /
-`audit.actionPattern.*`) —
+`audit.actionPattern.*`, also loaded by the invoice modal's timeline) —
 loaded by `ensureSlices()` from those routes' `+layout.ts` (decisions §261,
 §300). A new key under a slice prefix goes in the slice; a new route or shared
 component that renders slice keys must load the slice or keep the key in main.

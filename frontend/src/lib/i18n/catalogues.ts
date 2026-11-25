@@ -51,7 +51,8 @@ export const CATALOGUE_LOADERS: Record<Locale, () => Promise<Messages>> = {
 //              catalogue (`refusal.expenseReportForeignLine`).
 //   audit    — the /audit console's action labels (`audit.action.*`, one per
 //              AuditLog.action token, and `audit.actionPattern.*`). Loaded by
-//              /audit's `+layout.ts`. The console's own chrome (`audit.col.*`,
+//              /audit's `+layout.ts`, and by InvoiceModal itself for its
+//              Activity timeline, which opens on several routes (§522). The console's own chrome (`audit.col.*`,
 //              `audit.verify.*`, …) stays in the main catalogue.
 //
 // A route-scoped slice (settings, portal, marketing, audit) is lazy in EVERY locale, English

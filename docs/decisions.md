@@ -26675,3 +26675,38 @@ to re-send after its moment as a used share. *A cross-request advisory lock for
 the pass*: the row lock already serialises per invoice, which is all a double
 send could happen on, as in §411.
 
+## 522. The invoice timeline labels every audit action through the /audit catalogue (round 43)
+
+**Problem.** The invoice modal's Activity timeline lists every audit row
+correlated to the invoice — its own `invoice.*` events and the exception, chat
+and ERP rows keyed to it. It labelled them from a hand-kept map of about thirty
+tokens in `InvoiceModal.svelte`, so anything the map lacked rendered as its raw
+token: `invoice.erp_failed`, `invoice.erp_retried`,
+`invoice.erp_budget_resend_refused` (§521) and every other action outside the
+map. Nothing tied the map to what the backend writes, so each new
+action re-opened the gap.
+
+**Decision.** The timeline labels through
+`lib/types/invoiceTimelineActions.ts`: the modal's existing invoice-voice
+labels stay as overrides (`invoices.modal.action.*`, main catalogue — "Uploaded"
+reads better beside an invoice than the console's "Invoice uploaded"), and
+every other token falls through to `auditActionLabel`, the /audit console's
+`audit.action.*` / `audit.actionPattern.*` catalogue in all six locales. The
+modal loads that lazy slice itself (`ensureSlices('audit')`), since it opens on
+several routes; `slices.test.ts` accepts it as the slice's owner. A row drawn
+before the slice lands shows its token for that moment, then relabels.
+
+**Guard.** `auditActions.roster.test.ts`, which already harvests every action
+token from `backend/app` and fails on one with no `audit.action.*` label, now
+also fails if the timeline would render any harvested token raw, and if an
+override names a token no backend code writes (literal or f-string template).
+One roster serves both surfaces, so a new backend action cannot be labelled on
+/audit and missed on the invoice.
+
+**Rejected.** *Extending the modal's map with the missing tokens* (and a
+roster of "invoice-correlated" actions to test it against): correlation is
+per-row (`correlation_id`), not per-action, so no static list says which actions
+can reach the timeline — an exception, chat or vendor-adjacent row can — and a
+second vocabulary in six more locales would drift from the first. *Dropping the
+overrides* and using the console's labels throughout: it would reword the
+timeline's existing rows for no gain.

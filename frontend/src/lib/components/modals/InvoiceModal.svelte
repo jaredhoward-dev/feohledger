@@ -27,7 +27,8 @@
 	import Money from '#lib/components/ui/Money.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
-	import { m } from '#lib/i18n/store.svelte.ts';
+	import { ensureSlices, m } from '#lib/i18n/store.svelte.ts';
+	import { invoiceTimelineActionLabel } from '#lib/types/invoiceTimelineActions.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { erpRefusalText } from '#lib/api/erpRefusals.ts';
 	import { invoiceWarningText, poMatchIssueText } from '#lib/api/invoiceWarnings.ts';
@@ -166,44 +167,14 @@
 		return key ? m(key) : field;
 	}
 
-	const ACTION_LABEL_KEYS: Record<string, MessageKey> = {
-		'invoice.uploaded': 'invoices.modal.action.uploaded',
-		'invoice.submitted_for_review': 'invoices.modal.action.submittedForReview',
-		'invoice.approved': 'invoices.modal.action.approved',
-		'invoice.rejected': 'invoices.modal.action.rejected',
-		'invoice.resubmitted': 'invoices.modal.action.resubmitted',
-		'invoice.approval_recalled': 'invoices.modal.action.approvalRecalled',
-		'invoice.assigned_for_review': 'invoices.modal.action.assignedForReview',
-		'invoice.erp_submitted': 'invoices.modal.action.erpSubmitted',
-		'invoice.erp_auto_send_refused': 'invoices.modal.action.erpAutoSendRefused',
-		'invoice.extraction_dispatched': 'invoices.modal.action.extractionStarted',
-		'invoice.extraction_reset': 'invoices.modal.action.extractionReset',
-		'invoice.extraction_triggered': 'invoices.modal.action.extractionTriggered',
-		'invoice.extraction_completed': 'invoices.modal.action.extractionCompleted',
-		'invoice.extraction_failed': 'invoices.modal.action.extractionFailed',
-		'invoice.completed': 'invoices.modal.action.markedComplete',
-		'invoice.edited': 'invoices.modal.action.editedFields',
-		'invoice.file_attached': 'invoices.modal.action.fileAttached',
-		'invoice.file_replaced': 'invoices.modal.action.fileReplaced',
-		'invoice.file_deleted': 'invoices.modal.action.fileDeleted',
-		'audit.viewed': 'invoices.modal.action.auditViewed',
-		'audit.exported': 'invoices.modal.action.auditExported',
-		// Exception-queue events. They are correlation-keyed to the invoice
-		// (backend services/exception_lifecycle), so they arrive in this same
-		// timeline — a raised duplicate / fraud flag is why the invoice stalled,
-		// and clearing it is what let it move.
-		'exception.raised': 'invoices.modal.action.exceptionRaised',
-		'exception.resolved': 'invoices.modal.action.exceptionResolved',
-		'exception.escalated': 'invoices.modal.action.exceptionEscalated',
-		'exception.dismissed': 'invoices.modal.action.exceptionDismissed',
-		'exception.assigned': 'invoices.modal.action.exceptionAssigned',
-		'chat_message_posted': 'invoices.modal.action.chatPosted',
-		'chat_thread_resolved': 'invoices.modal.action.chatResolved',
-		'chat_thread_reopened': 'invoices.modal.action.chatReopened',
-	};
+	// Timeline labels: invoice-voice overrides, then the /audit console's
+	// catalogue, which covers every token the backend writes
+	// (`types/invoiceTimelineActions.ts`, decisions §522). That catalogue is
+	// a lazy slice the modal loads itself, since it opens on several routes;
+	// a row rendered before it lands shows its token, then relabels.
+	void ensureSlices('audit');
 	function actionLabel(action: string): string {
-		const key = ACTION_LABEL_KEYS[action];
-		return key ? m(key) : action;
+		return invoiceTimelineActionLabel(action, m);
 	}
 
 	let {
