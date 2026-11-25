@@ -5,6 +5,7 @@
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
 	import PasswordInput from '#lib/components/auth/PasswordInput.svelte';
 	import { goto } from '$app/navigation';
+	import { safePortalNextPath } from '#lib/utils/postLoginRedirect.ts';
 	import { page } from '$app/state';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
@@ -29,7 +30,9 @@
 		if (portalAuth.user?.must_change_password) {
 			goto('/portal/change-password');
 		} else {
-			goto('/portal');
+			// Back to the page the auth wall sent them from (`?next=`, portal
+			// pages only), else the portal home.
+			goto(safePortalNextPath(page.url.searchParams.get('next')) ?? '/portal');
 		}
 	}
 

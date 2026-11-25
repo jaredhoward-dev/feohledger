@@ -120,6 +120,7 @@ export const messages = {
 	'portal.invoices.fileDownloadFailed': 'Error al descargar',
 	'portal.invoices.tableAria': 'Sus facturas',
 	'portal.invoices.chatLoadFailed': 'No se pudo cargar la conversación.',
+	'portal.invoices.chatNotFound': 'No encontramos esa factura en su cuenta.',
 
 	// Pagos del portal (routes/portal/payments/+page.svelte)
 	'portal.payments.title': 'Pagos',

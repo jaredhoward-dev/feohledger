@@ -186,6 +186,75 @@ test.describe('/portal supplier chat — vendor surface', () => {
 		await expect(loadError).toHaveCount(0);
 		await expect(chat.locator('[data-testid="chat-input"]')).toBeVisible();
 	});
+
+	test('the AP-reply email link opens the conversation, through sign-in', async ({ page }) => {
+		// The email links to `/portal/invoices?chat=<id>`
+		// (`services/supplier_chat.portal_chat_path`). Stub the list and the
+		// thread (exact pathnames, tests-e2e/README.md § Stubbing) so the
+		// invoice is known; sign-in itself is real.
+		const id = '7d3f2a10-4b5c-4d6e-8f70-112233445566';
+		const invoice = {
+			id,
+			invoice_number: 'INV-LINK-1',
+			amount: '120.00',
+			currency: 'USD',
+			status: 'ready_for_review',
+			invoice_date: '2026-11-01',
+			due_date: '2026-12-01',
+			submitted_at: '2026-11-02T10:00:00Z',
+			file_url: null,
+			rejection_reason: null,
+			waiting_on: 'review',
+			waiting_on_days: 1,
+		};
+		await page.route(
+			(url) => url.pathname === '/api/portal/invoices',
+			(route) =>
+				route.fulfill({ json: { items: [invoice], total: 1, page: 1, page_size: 25 } }),
+		);
+		await page.route(
+			(url) => url.pathname === `/api/portal/invoices/${id}/chat`,
+			(route) =>
+				route.request().method() === 'GET'
+					? route.fulfill({
+							json: {
+								invoice_id: id,
+								status: 'open',
+								messages: [
+									{
+										id: 'm1',
+										author_role: 'ap_team',
+										author_name: 'AP Team',
+										body: 'Could you send the delivery note?',
+										attachments: [],
+										created_at: '2026-11-03T09:00:00Z',
+									},
+								],
+							},
+						})
+					: route.fallback(),
+		);
+
+		await acceptConsent(page);
+		await page.goto(`/portal/invoices?chat=${id}`);
+		// Signed out: the auth wall keeps the link as `next`.
+		await expect(page).toHaveURL(/\/portal\/login\?next=/);
+		await page.locator('input[type="email"]').fill(PORTAL_EMAIL);
+		await page.locator('input[type="password"]').fill(PORTAL_PASSWORD);
+		await page.locator('button[type="submit"]').click();
+
+		await expect(page).toHaveURL(new RegExp(`/portal/invoices\\?chat=${id}$`));
+		const chat = page.locator('[data-testid="supplier-chat"]');
+		await expect(chat.locator('[data-testid="chat-msg"]', { hasText: 'Could you send the delivery note?' })).toBeVisible();
+		await expect(page.getByRole('button', { name: /INV-LINK-1/ })).toHaveAttribute('aria-expanded', 'true');
+	});
+
+	test('a chat link to an invoice that is not the supplier’s says so', async ({ page }) => {
+		await portalSignIn(page);
+		await page.goto(`/portal/invoices?chat=${crypto.randomUUID()}`);
+		await expect(page.locator('.error[role="alert"]')).toContainText('We couldn’t find that invoice in your account.');
+		await expect(page.locator('[data-testid="supplier-chat"]')).toHaveCount(0);
+	});
 });
 
 /** Mint a control-plane admin bearer token via the AP login API. The AP app

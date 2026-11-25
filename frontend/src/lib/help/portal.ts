@@ -509,7 +509,7 @@ export const PORTAL_GUIDES: Guide[] = [
 				blocks: [
 					{
 						type: 'p',
-						text: 'When someone on the AP team writes, we may email the address in your company details to say there is a new message on the invoice. The email does not contain the message: sign in and open the invoice’s conversation to read it.'
+						text: 'When someone on the AP team writes, we may email the address in your company details to say there is a new message on the invoice. The email does not contain the message itself: select its link to open that invoice’s conversation. If you are not signed in, the portal asks you to sign in first and then takes you there.'
 					},
 					{
 						type: 'note',

@@ -5,6 +5,7 @@
 	import LegalAcceptStep from '#lib/components/layout/LegalAcceptStep.svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
+	import { safePortalNextPath } from '#lib/utils/postLoginRedirect.ts';
 	import { browser } from '$app/env';
 	import { hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -55,7 +56,10 @@
 			!isSetPasswordLink &&
 			!isForgotPassword
 		) {
-			goto('/portal/login');
+			// Carry the page they asked for through sign-in (an emailed deep
+			// link such as `/portal/invoices?chat=<id>` must land where it points).
+			const next = safePortalNextPath(`${path}${page.url.search}`);
+			goto(next ? `/portal/login?${new URLSearchParams({ next })}` : '/portal/login');
 			return;
 		}
 		if (portalAuth.loggedIn && !portalAuth.user) {

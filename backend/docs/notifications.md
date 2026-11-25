@@ -162,7 +162,8 @@ status):
 - **AP posts (any)** → the *supplier* gets a **direct portal-link email**
   (`notify_supplier_of_ap_message`), not an in-app/`notify_event` notification —
   `notify_event` only ever reaches control-plane Users, never a VendorUser. The
-  email carries `{base}/portal/invoices/{id}/chat`, is best-effort, PII-free
+  email carries `{base}/portal/invoices?chat={id}` (the portal invoice list,
+  which opens that conversation), is best-effort, PII-free
   (invoice number + vendor/org name only), and is gated on
   `notifications_enabled` explicitly.
 

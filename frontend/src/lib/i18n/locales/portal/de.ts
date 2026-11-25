@@ -111,6 +111,7 @@ export const messages = {
 	'portal.invoices.fileDownloadFailed': 'Download fehlgeschlagen',
 	'portal.invoices.tableAria': 'Ihre Rechnungen',
 	'portal.invoices.chatLoadFailed': 'Die Unterhaltung konnte nicht geladen werden.',
+	'portal.invoices.chatNotFound': 'Diese Rechnung wurde in Ihrem Konto nicht gefunden.',
 	'portal.payments.title': 'Zahlungen',
 	'portal.payments.loadFailed': 'Laden fehlgeschlagen',
 	'portal.payments.tableAria': 'Ihre Zahlungen',

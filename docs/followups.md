@@ -920,10 +920,6 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       `PORTAL_GUIDES` / `PORTAL_GLOSSARY`, and add a search field to
       `routes/portal/help/+page.svelte`. **Trigger:** the guide list no longer
       fits one screen, or a support question a guide already answers.
-      (The invoice-conversation guide tells suppliers to sign in rather than
-      follow the AP-reply email's link: that link,
-      `/portal/invoices/<id>/chat`, has no portal route —
-      `services/supplier_chat.notify_supplier_of_ap_message`.)
 - [ ] **(c) A custom role can't be granted invoice entry.** Entry is a role
       list by design (decisions §248). **Durable fix:** if a customer needs a
       non-clerk preparer role, add a non-sensitive permission tier the
