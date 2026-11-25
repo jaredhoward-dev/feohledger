@@ -1209,15 +1209,6 @@ scope (§260) — do not fold them into any of these.
       post time (AP distributions take only the number); one sandbox Intacct
       push by key. **Trigger:** the next change to FE NXT's chart listing or
       distributions, or the first Intacct sandbox session.
-- [ ] **(c) A mock sync still treats pre-0115 links as its own.** A no-realm
-      pull (`mock`, or an OAuth ERP with no consent) leaves rows tied to a
-      named realm alone (decisions §287), but a pre-0115 link is NULL-realm,
-      indistinguishable from a link the mock itself made, so a mock sync still
-      re-judges it against fixtures. **Durable fix:** stamp the links a no-realm
-      sync makes with an explicit sentinel realm (e.g. `"mock"`), so NULL means
-      only pre-0115 and a no-realm pull can leave it alone too. **Trigger:**
-      the next change to `services/erp_link_realm`, or a tenant that switches
-      to `mock` after 0115.
 
 ### Surfaced by the cross-workspace identity fixes (2026-10-20, decisions §291)
 

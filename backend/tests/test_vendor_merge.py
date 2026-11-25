@@ -1119,3 +1119,26 @@ async def test_a_recall_clears_the_way_and_the_next_approval_signs_the_canonical
         row = await s.get(Invoice, inv)
         assert row.vendor_id == canonical
         assert row.status == InvoiceStatus.ready_for_review
+
+
+def test_a_mock_link_the_canonical_row_cannot_take_is_released_not_kept():
+    """§497: a no-realm pull's ``UNNAMED_REALM`` link names no company, so no
+    sync would ever restore it from ``vendor_erp_links``. When the canonical's
+    row is taken it is dropped (``released``), never filed as kept; when the
+    row is free it moves there like any row link."""
+    from app.services.erp_link_realm import UNNAMED_REALM
+    from app.services.vendor_merge import _plan_erp_links
+
+    prod = "quickbooks_online:9130350000000000002"
+    canonical = Vendor(id=uuid.uuid4(), name="Acme", erp_vendor_id="57", erp_link_realm=prod)
+    dup = Vendor(
+        id=uuid.uuid4(), name="ACME", erp_vendor_id="ERP-V001", erp_link_realm=UNNAMED_REALM
+    )
+    plan = _plan_erp_links(canonical, [dup], [])
+    assert plan.row is None and plan.kept == []
+    assert [r["placed"] for r in plan.records] == ["released"]
+
+    free = Vendor(id=uuid.uuid4(), name="Acme")
+    plan = _plan_erp_links(free, [dup], [])
+    assert plan.row is not None and plan.row[:2] == (UNNAMED_REALM, "ERP-V001")
+    assert plan.kept == []

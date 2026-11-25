@@ -2225,6 +2225,11 @@ async def sync_vendors_from_erp_endpoint(
             f"; {reasons['duplicate_link']} not updated (more than one vendor is linked to it:"
             " merge them or unlink the stale one)"
         )
+    if reasons["unverified_link"]:
+        message += (
+            f"; {reasons['unverified_link']} skipped (a vendor holds that id from before"
+            " ERP companies were recorded: sync under a connected ERP company first)"
+        )
     if result["unlinked"]:
         message += f"; {len(result['unlinked'])} unlinked (linked under another ERP company)"
     if result["restored"]:

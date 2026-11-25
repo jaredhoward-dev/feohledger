@@ -27,6 +27,7 @@ from app.services.erp_adapters.dynamics_365_bc import _bc_account_to_payload
 from app.services.erp_adapters.netsuite import _netsuite_account_to_payload
 from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
 from app.services.erp_adapters.sage_intacct import gl_link_id
+from app.services.erp_link_realm import UNNAMED_REALM
 from app.services.erp_record_names import SHORTENED_MARK, fit_name
 from app.services.gl_account_sync import (
     AMBIGUOUS_LEGACY,
@@ -116,6 +117,11 @@ async def _rows(realdb) -> dict[str, GLAccount]:
 
 
 async def _add(realdb, **kwargs) -> uuid.UUID:
+    # These syncs name no company (`_sync` passes no realm), so a link stands
+    # for one an earlier such pull made: stamped UNNAMED_REALM (decisions §497).
+    # A NULL (pre-0115) link is one a no-realm pull leaves alone.
+    if kwargs.get("erp_account_id") is not None:
+        kwargs.setdefault("erp_link_realm", UNNAMED_REALM)
     async with realdb.sessionmaker(TENANT)() as s:
         row = GLAccount(organization_id=realdb.info(TENANT).org_id, **kwargs)
         s.add(row)

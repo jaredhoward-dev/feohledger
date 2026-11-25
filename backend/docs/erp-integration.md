@@ -1686,9 +1686,28 @@ OAuth ERP with no consent, have no realm. A sync under one leaves alone every
 row linked, or offered candidates, under a named realm: no re-judging,
 unlinking, id matching, re-linking by code or candidate refresh, and a pulled
 account whose code such a row holds is refused `code_taken`. It works only on
-unlinked rows and NULL-realm links. (A pre-0115 link is NULL-realm too, so a
-mock sync still treats it as its own; the next sync under a named realm
-re-judges it by evidence.)
+unlinked rows and the links such a sync made itself.
+
+**A no-realm sync stamps its links `"mock"`** (`erp_link_realm.UNNAMED_REALM`,
+decisions §497), never NULL, so NULL means only "made before migration 0115".
+Every real realm is `<adapter>:<identity>`; the stamp has no `:`, so it can
+never equal one. What follows from that:
+
+- A no-realm sync leaves a NULL (pre-0115) link alone like a named one: a GL
+  row's colliding code is `code_taken`, and a vendor record whose id a NULL link
+  holds is reported `unverified_link` (neither adopted nor created again). The
+  next sync under a named realm re-judges it by evidence, exactly as before.
+- Under a named realm a `"mock"` link is another company's: refused at the
+  push, judged by the between-companies evidence at a sync (the current code
+  for an account, a name or tax id unique in the pull for a vendor; never the
+  looser pre-0115 rule), recorded as a realm change when kept, and never filed
+  in `gl_account_erp_links` / `vendor_erp_links`. A merge drops one the
+  canonical's row cannot take.
+- A GL decision confirmed under no realm is stamped `"mock"` too.
+- Links a mock sync made between 0115 and §497 are NULL and cannot be told from
+  pre-0115 ones, so they were not backfilled: a no-realm sync now leaves them
+  alone, and a named sync judges them as pre-0115 links. Seeded demo data is
+  stamped `"mock"` (`scripts/seed.py`).
 
 **Needs a decision.** A row rule 3 or 4 left unlinked keeps the ERP accounts it
 could mean (`erp_link_candidates`, refreshed by every pull). `/gl-accounts`
@@ -1729,8 +1748,9 @@ restored link), and the message adds "N restored". Three rules hold:
   always comes back, since it may share its account with the row named after
   it, the one share a person can make.
 - **Only a named realm is kept.** A NULL-realm link (pre-0115, or made by a
-  no-realm sync) names no company, so it is judged by rule 0 as before. A
-  no-realm sync neither keeps nor restores. Nothing was backfilled.
+  no-realm sync before §497) or a `"mock"` one names no company, so it is
+  judged by rule 0 as before. A no-realm sync neither keeps nor restores.
+  Nothing was backfilled.
 - **The push never reads a kept state.** It posts the row's own link, live in
   the current realm, so after reconnecting to a company the chart needs one
   sync before its restored links post (unlike vendors below). A restored
@@ -1893,7 +1913,8 @@ ambiguous. Three rules hold:
   (`unlinked`, `kept: false`) instead of restored. A link from another company
   is not adopted onto an id a vendor already holds here.
 - **Only a named realm is kept.** A NULL-realm link (pre-0115, or made by a
-  no-realm sync) names no company, so it is dropped as before. A no-realm sync
+  no-realm sync before §497) or a `"mock"` one names no company, so it is
+  dropped as before. A no-realm sync
   neither keeps nor restores anything. No link was backfilled: the ones earlier
   syncs dropped appear only in audit rows, which are history, not live links.
 

@@ -92,6 +92,7 @@ from app.services.control_plane_bootstrap import SYSTEM_ROLE_DESCRIPTIONS
 from app.services.control_plane_bootstrap import (
     create_control_tables as bootstrap_control_tables,
 )
+from app.services.erp_link_realm import UNNAMED_REALM
 from app.services.tenant_provisioning import CONTROL_TABLES
 from app.utils.dates import utc_today
 from app.utils.passwords import pwd_context
@@ -660,6 +661,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V001",
+            erp_link_realm=UNNAMED_REALM,
             accepts_virtual_cards=True,
         )
         v_cloud = Vendor(
@@ -673,6 +675,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V002",
+            erp_link_realm=UNNAMED_REALM,
         )
         v_facility = Vendor(
             organization_id=org_id,
@@ -706,6 +709,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V005",
+            erp_link_realm=UNNAMED_REALM,
         )
         v_legal = Vendor(
             organization_id=org_id,
@@ -737,6 +741,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V008",
+            erp_link_realm=UNNAMED_REALM,
         )
         # Unverified vendor (AI-extracted from a recent invoice)
         v_unverified = Vendor(
@@ -815,6 +820,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                     status=status,
                     source=source,
                     erp_vendor_id=f"ERP-FV{seq:03d}" if source == "erp_sync" else None,
+                    erp_link_realm=UNNAMED_REALM if source == "erp_sync" else None,
                     accepts_virtual_cards=(i % 3 == 0),
                 )
             )
@@ -1399,6 +1405,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Cash and Cash Equivalents",
                 account_type="asset",
                 erp_account_id="1000",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1406,6 +1413,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Accounts Receivable",
                 account_type="asset",
                 erp_account_id="1200",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1413,6 +1421,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Fixed Assets - Equipment",
                 account_type="asset",
                 erp_account_id="1500",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1420,6 +1429,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Accounts Payable",
                 account_type="liability",
                 erp_account_id="2000",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1427,6 +1437,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Accrued Liabilities",
                 account_type="liability",
                 erp_account_id="2100",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1434,6 +1445,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Revenue - Services",
                 account_type="revenue",
                 erp_account_id="4000",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1441,6 +1453,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Office Supplies & Expenses",
                 account_type="expense",
                 erp_account_id="6100",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1448,6 +1461,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Software & Cloud Services",
                 account_type="expense",
                 erp_account_id="6200",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1455,6 +1469,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Facilities & Maintenance",
                 account_type="expense",
                 erp_account_id="6300",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1462,6 +1477,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Marketing & Advertising",
                 account_type="expense",
                 erp_account_id="6400",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1469,6 +1485,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Legal & Professional Fees",
                 account_type="expense",
                 erp_account_id="6500",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1476,6 +1493,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Meals & Entertainment",
                 account_type="expense",
                 erp_account_id="6600",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1483,6 +1501,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Shipping & Freight",
                 account_type="expense",
                 erp_account_id="6700",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1490,6 +1509,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Travel & Transportation",
                 account_type="expense",
                 erp_account_id="6800",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1497,6 +1517,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Payroll Expense",
                 account_type="expense",
                 erp_account_id="8000",
+                erp_link_realm=UNNAMED_REALM,
             ),
         ]
         session.add_all(gl_accounts)

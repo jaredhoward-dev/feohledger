@@ -170,8 +170,9 @@ async def link_lock(db: AsyncSession, organization_id: uuid.UUID, realm: str | N
     and a merge only moves an existing holder's, so neither takes it.
     Released at commit or rollback.
 
-    ``realm`` None is the no-realm company (links stamped NULL, one company to
-    ``uq_vendors_erp_link``); only the sync writes there, and two no-realm
+    ``realm`` None is the no-realm company (links stamped ``UNNAMED_REALM``
+    since decisions §497, one company to ``uq_vendors_erp_link``); only the
+    sync writes there, and two no-realm
     pulls creating a vendor for one new record would otherwise both pass the
     lookup and the second would fail the index at flush (decisions §489). Its
     key cannot collide with a named realm's: ``connection_realm`` never
@@ -344,10 +345,12 @@ async def link_vendor_to_erp_record(
         )
     kept = None
     if vendor.erp_vendor_id:
-        # A link from another named company (the None / same-realm cases were
-        # refused above): kept for it, so a switch back restores it (§356).
-        kept = {"realm": vendor.erp_link_realm, "erp_vendor_id": vendor.erp_vendor_id}
-        await keep_link(db, vendor)
+        # A link from another company (the None / same-realm cases were refused
+        # above): kept for it, so a switch back restores it (§356) — unless it
+        # is a no-realm pull's, which names no company to return to (§497).
+        held = {"realm": vendor.erp_link_realm, "erp_vendor_id": vendor.erp_vendor_id}
+        if await keep_link(db, vendor):
+            kept = held
     vendor.erp_vendor_id = erp_vendor_id
     vendor.erp_link_realm = realm
     await db.flush()

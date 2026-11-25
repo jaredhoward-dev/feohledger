@@ -39,9 +39,12 @@ from app.services.erp_adapters.base import (
 from app.services.erp_adapters.catalog import merge_erp_update
 from app.services.erp_link_realm import (
     LEGACY_REALM_KEY,
+    UNNAMED_REALM,
     connection_realm,
     legacy_links_trusted,
     link_is_live,
+    link_stamp,
+    names_company,
 )
 from app.services.gl_account_sync import (
     AMBIGUOUS_LEGACY,
@@ -218,6 +221,32 @@ def test_a_null_realm_link_is_trusted_only_while_the_snapshot_still_names_the_co
     assert not link_is_live(None, PROD, trust_legacy=False)
     assert not link_is_live(SANDBOX, PROD, trust_legacy=True)
     assert link_is_live(SANDBOX, None, trust_legacy=False)  # nothing nameable: unfiltered
+
+
+def test_a_no_realm_pull_stamps_a_sentinel_no_company_realm_can_equal():
+    """§497: NULL is reserved for pre-0115 links, so a link a pull that names no
+    company makes is stamped ``UNNAMED_REALM``. Every real realm is
+    ``<adapter>:<identity>``; the sentinel has no ``:``, so it can never be one."""
+    assert link_stamp(None) == UNNAMED_REALM
+    assert link_stamp(PROD) == PROD
+    assert ":" not in UNNAMED_REALM
+    for cfg in (
+        SANDBOX_CFG,
+        {"type": "mock", "integration_method": "direct"},
+        {"integration_method": "merge_dev"},
+        {"type": "netsuite", "integration_method": "direct", "account_id": "mock"},
+        INTACCT_CFG,
+    ):
+        realm = connection_realm(cfg)
+        assert realm is None or (":" in realm and realm != UNNAMED_REALM)
+    # Neither a pre-0115 link nor the sentinel names a company to keep it for.
+    assert not names_company(None)
+    assert not names_company(UNNAMED_REALM)
+    assert names_company(PROD)
+    # Under a named realm the sentinel is another company's, legacy trust or not:
+    # a fixture link is never posted to a real company.
+    assert not link_is_live(UNNAMED_REALM, PROD, trust_legacy=True)
+    assert link_is_live(UNNAMED_REALM, None, trust_legacy=False)
 
 
 def test_a_settings_save_never_sets_or_drops_the_snapshot_for_the_same_erp():
@@ -800,9 +829,12 @@ async def test_a_pull_with_no_realm_leaves_every_named_company_link_alone(realdb
     )
     depreciation = chart["Depreciation"]
     assert (depreciation.erp_account_id, depreciation.erp_link_candidates) == (None, pending)
-    # The fixture's own accounts land beside them, under no realm.
-    assert (chart["Brand New"].erp_account_id, chart["Brand New"].erp_link_realm) == ("500", None)
-    assert chart["Advertising"].erp_link_realm is None
+    # The fixture's own accounts land beside them, stamped as no company's (§497).
+    assert (chart["Brand New"].erp_account_id, chart["Brand New"].erp_link_realm) == (
+        "500",
+        UNNAMED_REALM,
+    )
+    assert chart["Advertising"].erp_link_realm == UNNAMED_REALM
     assert (result.unlinked, result.link_changes, result.code_drift) == ([], [], [])
     assert {(c["code"], c["reason"]) for c in result.conflicts} == {
         ("Office Supplies", CODE_TAKEN),
@@ -823,8 +855,154 @@ async def test_a_vendor_pull_with_no_realm_leaves_named_company_links_alone(real
     # The fixture's vendor is its own payee, not a rename of Acme.
     squeaky = vendors["Squeaky Kleen Car Wash"]
     assert squeaky.id != acme_id
-    assert (squeaky.erp_vendor_id, squeaky.erp_link_realm) == ("57", None)
+    assert (squeaky.erp_vendor_id, squeaky.erp_link_realm) == ("57", UNNAMED_REALM)
     assert (result["unlinked"], result["updated"], result["created"]) == ([], 0, 1)
+
+
+async def test_a_pull_with_no_realm_leaves_a_pre_migration_chart_link_alone(realdb):
+    """§497: a pre-0115 (NULL) link may be a real company's, so a mock pull
+    neither re-judges nor adopts it — its colliding code is ``code_taken`` and
+    its id is not matched — while the links the mock makes are stamped and are
+    its own on the next mock pull."""
+    await _add(realdb, code="Office Supplies", name="Office Supplies", erp_account_id="7")
+
+    first = await _sync(
+        realdb,
+        [_acct("Advertising", "7"), _acct("Office Supplies", "99"), _acct("Fixture", "500")],
+        realm=None,
+    )
+    chart = await _chart(realdb)
+    office = chart["Office Supplies"]
+    assert (office.name, office.erp_account_id, office.erp_link_realm) == (
+        "Office Supplies",
+        "7",
+        None,
+    )
+    assert (chart["Fixture"].erp_account_id, chart["Fixture"].erp_link_realm) == (
+        "500",
+        UNNAMED_REALM,
+    )
+    assert (first.realm_adopted, first.unlinked, first.link_changes) == (0, [], [])
+    assert ("Office Supplies", CODE_TAKEN) in {(c["code"], c["reason"]) for c in first.conflicts}
+
+    # The mock's own link is matched by its id and refreshed like any same-company link.
+    second = await _sync(realdb, [_acct("Fixture", "500", name="Fixture Renamed")], realm=None)
+    fixture = (await _chart(realdb))["Fixture"]
+    assert (fixture.name, fixture.erp_account_id, fixture.erp_link_realm) == (
+        "Fixture Renamed",
+        "500",
+        UNNAMED_REALM,
+    )
+    assert (second.unlinked, second.link_changes) == ([], [])
+
+
+async def test_a_named_chart_sync_judges_a_mock_link_as_another_companys(realdb):
+    """A real company's "500" is a different account from the mock's fixture
+    "500" unless it holds the row's current code. Adopted then (a recorded
+    realm change), unlinked otherwise — and never kept for a return, since the
+    sentinel names no company. A pre-0115 link beside it is adopted as before."""
+    await _add(
+        realdb, code="6100", name="Office", erp_account_id="500", erp_link_realm=UNNAMED_REALM
+    )
+    await _add(
+        realdb, code="Fixture", name="Fixture", erp_account_id="501", erp_link_realm=UNNAMED_REALM
+    )
+    await _add(realdb, code="6200", name="Rent", erp_account_id="8")
+    result = await _sync(
+        realdb,
+        [_acct("6100", "500"), _acct("Advertising", "501"), _acct("6200", "8")],
+        realm=PROD,
+    )
+    chart = await _chart(realdb)
+    assert (chart["6100"].erp_account_id, chart["6100"].erp_link_realm) == ("500", PROD)
+    assert (chart["Fixture"].erp_account_id, chart["Fixture"].erp_link_realm) == (None, None)
+    assert (chart["6200"].erp_account_id, chart["6200"].erp_link_realm) == ("8", PROD)
+    assert result.realm_adopted == 1  # only the pre-0115 one
+    assert {
+        "code": "6100",
+        "from": "500",
+        "to": "500",
+        "from_realm": UNNAMED_REALM,
+        "to_realm": PROD,
+    } in result.link_changes
+    assert "Fixture" in result.unlinked
+    assert result.kept == 0
+    async with realdb.sessionmaker(TENANT)() as s:
+        from app.models.gl_account import GLAccountErpLink
+
+        assert (await s.execute(select(func.count()).select_from(GLAccountErpLink))).scalar() == 0
+
+
+async def test_a_vendor_pull_with_no_realm_leaves_a_pre_migration_link_alone(realdb):
+    """§497: a mock pull of fixture "57" no longer adopts the vendor a pre-0115
+    link holds on "57" — nor creates a second payee for it. It is reported
+    ``unverified_link`` and the NULL link is left for a named sync to judge."""
+    acme_id = await _add(realdb, Vendor, name="Acme", erp_vendor_id="57", source="erp_sync")
+    result = await _vsync(
+        realdb,
+        [_vendor("57", "Squeaky Kleen Car Wash"), _vendor("57", "Squeaky Kleen Car Wash")],
+        realm=None,
+    )
+    vendors = await _vendors(realdb)
+    assert set(vendors) == {"Acme"}
+    acme = vendors["Acme"]
+    assert (acme.id, acme.erp_vendor_id, acme.erp_link_realm) == (acme_id, "57", None)
+    assert (result["created"], result["updated"], result["unlinked"]) == (0, 0, [])
+    assert result["conflicts"] == [
+        {"name": "Squeaky Kleen Car Wash", "reason": "unverified_link", "erp_vendor_ids": ["57"]}
+    ]
+    assert await _changes(realdb, acme_id) == []
+
+
+async def test_a_vendor_pull_with_no_realm_stamps_and_then_owns_its_links(realdb):
+    beta_id = await _add(realdb, Vendor, name="Beta", source="manual")
+    await _vsync(realdb, [_vendor("ERP-V001", "Beta"), _vendor("ERP-V002", "Gamma")], realm=None)
+    vendors = await _vendors(realdb)
+    assert (vendors["Beta"].id, vendors["Beta"].erp_link_realm) == (beta_id, UNNAMED_REALM)
+    assert (vendors["Gamma"].erp_vendor_id, vendors["Gamma"].erp_link_realm) == (
+        "ERP-V002",
+        UNNAMED_REALM,
+    )
+    again = await _vsync(realdb, [_vendor("ERP-V002", "Gamma Ltd")], realm=None)
+    assert (again["created"], again["updated"], again["conflicts"]) == (0, 1, [])
+    assert (await _vendors(realdb))["Gamma Ltd"].erp_link_realm == UNNAMED_REALM
+
+
+async def test_a_named_vendor_sync_judges_a_mock_link_as_another_companys(realdb):
+    """Between companies a name must be unique in the pull (§287); a mock link
+    is held to that rule, not the looser pre-0115 one, and is never kept."""
+    acme_id = await _add(
+        realdb,
+        Vendor,
+        name="Acme",
+        erp_vendor_id="57",
+        erp_link_realm=UNNAMED_REALM,
+        source="erp_sync",
+    )
+    beta_id = await _add(
+        realdb,
+        Vendor,
+        name="Beta",
+        erp_vendor_id="58",
+        erp_link_realm=UNNAMED_REALM,
+        source="erp_sync",
+    )
+    result = await _vsync(
+        realdb,
+        [_vendor("57", "Acme"), _vendor("58", "Beta"), _vendor("59", "Beta")],
+        realm=PROD,
+    )
+    vendors = await _vendors(realdb)
+    assert (vendors["Acme"].erp_vendor_id, vendors["Acme"].erp_link_realm) == ("57", PROD)
+    beta = vendors["Beta"]
+    assert (beta.id, beta.erp_vendor_id, beta.erp_link_realm) == (beta_id, None, None)
+    assert result["realm_adopted"] == 0
+    assert "Beta" in result["unlinked"]
+    assert await _kept(realdb) == set()
+    (acme_change,) = await _changes(realdb, acme_id)
+    assert acme_change["change"] == "realm_changed"
+    assert (acme_change["from_realm"], acme_change["to_realm"]) == (UNNAMED_REALM, PROD)
+    assert "kept" not in acme_change
 
 
 # ---------------------------------------------------------------------------
@@ -1048,11 +1226,20 @@ async def test_a_link_from_another_company_is_not_adopted_onto_an_id_held_here(r
     assert (change["change"], change["kept"]) == ("unlinked", True)
 
 
-async def test_a_restore_replaces_a_link_that_names_no_company(realdb):
+@pytest.mark.parametrize("fixture_realm", [UNNAMED_REALM, None])
+async def test_a_restore_replaces_a_link_that_names_no_company(realdb, fixture_realm):
     """A no-realm (mock) sync linked Acme to a fixture id after its production
-    link was kept. Back on production, the kept link wins and the fixture link,
-    which names no company, is dropped and audited, not kept."""
-    acme_id = await _add(realdb, Vendor, name="Acme", erp_vendor_id="ERP-V001", source="erp_sync")
+    link was kept — stamped ``UNNAMED_REALM`` since §497, NULL before it. Back
+    on production, the kept link wins and the fixture link, which names no
+    company, is dropped and audited, not kept."""
+    acme_id = await _add(
+        realdb,
+        Vendor,
+        name="Acme",
+        erp_vendor_id="ERP-V001",
+        erp_link_realm=fixture_realm,
+        source="erp_sync",
+    )
     await _add(realdb, VendorErpLink, vendor_id=acme_id, realm=PROD, erp_vendor_id="57")
 
     result = await _vsync(realdb, [_vendor("57", "Acme")], realm=PROD)
@@ -1062,8 +1249,12 @@ async def test_a_restore_replaces_a_link_that_names_no_company(realdb):
     assert await _kept(realdb) == set()
     changes = {d["change"]: d for d in await _changes(realdb, acme_id)}
     assert changes["unlinked"]["erp_vendor_id"] == "ERP-V001"
-    assert changes["unlinked"]["from_realm"] is None and "kept" not in changes["unlinked"]
-    assert (changes["restored"]["from_realm"], changes["restored"]["to_realm"]) == (None, PROD)
+    assert changes["unlinked"]["from_realm"] == fixture_realm
+    assert "kept" not in changes["unlinked"]
+    assert (changes["restored"]["from_realm"], changes["restored"]["to_realm"]) == (
+        fixture_realm,
+        PROD,
+    )
 
 
 async def test_a_pull_with_no_realm_neither_keeps_nor_restores(realdb):
@@ -1351,6 +1542,20 @@ async def test_the_confirm_endpoint_refuses_anything_but_an_offered_candidate(
         moved = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "40"})
     assert moved.status_code == 409
     assert (await _chart(realdb))["Depreciation"].erp_account_id is None
+
+
+async def test_a_confirmation_under_no_realm_is_stamped_not_null(realdb, restore_settings):
+    """§497: a decision a mock pull offered (candidates' realm None) is
+    confirmed onto the ``UNNAMED_REALM`` stamp, never NULL, which only a
+    pre-0115 link may carry."""
+    await _set_erp(realdb, {"type": "mock", "integration_method": "direct"})
+    row_id = await _add(realdb, code="Depreciation", name="Depreciation")
+    await _sync(realdb, _depreciation_chart(), realm=None)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        resp = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "40"})
+    assert resp.status_code == 200, resp.text
+    row = (await _chart(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_realm) == ("40", UNNAMED_REALM)
 
 
 async def _wait_for_lock_waiter(mk, *, timeout: float = 15.0) -> bool:

@@ -25143,3 +25143,56 @@ push, when Intacct's reference object takes the key directly.
 
 **Unverified.** The bill line's `{"glAccount": {"key": …}}` form is checked
 against the fake ERP only; a sandbox push confirms it (followups entry).
+
+## 497. A no-realm sync stamps its links `"mock"`; NULL means only pre-0115, and existing NULL links are not backfilled (closes a `docs/followups.md` entry, round 37)
+
+**Context.** §287 made a pull that names no company (`mock`, or an OAuth ERP
+with no consent) leave alone every row tied to a named realm. But it still
+wrote its own links with a NULL realm, which is also what every pre-0115 link
+carries, so a mock sync kept re-judging pre-0115 links against fixtures:
+matching a real company's "57" to fixture "57", renaming it, re-linking by
+code. Worse in the other direction: a NULL link a mock sync made is trusted at
+the push by `legacy_links_trusted` whenever the tenant is back on the company
+0115 snapshotted, so a fixture id could be posted to a real company.
+
+**Decision.** Every link a no-realm pull makes is stamped
+`erp_link_realm.UNNAMED_REALM` (`"mock"`, via `link_stamp(realm)`), in the
+chart sync, the vendor sync and the GL decision confirm. NULL now means only
+"made before migration 0115".
+
+- *No collision.* `connection_realm` always returns `<adapter>:<identity>`
+  (Merge.dev's is `merge_dev:`), so a value with no `:` can never equal a real
+  realm. `mock` itself never gets one (it returns None).
+- *A no-realm pull leaves NULL alone*, as it does a named realm: a GL row's
+  colliding code is `code_taken`; a vendor record whose id a NULL link holds is
+  reported `unverified_link` and neither adopted nor created as a second payee
+  (creating one would duplicate a payee on every tenant whose old mock links are
+  NULL). Named holders keep §287's behaviour.
+- *A named sync treats `"mock"` as another company's link*: refused at the push
+  (it is never `== realm`, and legacy trust is NULL-only), judged by the
+  between-companies evidence (current code; a name or tax id unique in the
+  pull), audited as a realm change. It is never kept for a return
+  (`names_company`): no sync ever restores under `"mock"`, so a kept row would
+  only be a dead record. A merge drops one the canonical's row cannot take.
+- *A named sync's treatment of NULL links is unchanged*: still re-judged with
+  the looser pre-0115 evidence (legacy key) and adopted (`realm_adopted`).
+
+**Existing NULL rows: no backfill.** Links a mock sync made between 0115 and
+now are NULL and look exactly like pre-0115 links. Nothing on the row records
+which pull made it. The org's `legacy_link_realm` snapshot says what was
+connected at 0115, not what made a given link. The sync audit rows record
+individual changes, not every link, and a pre-0115 tenant may have been on a
+real ERP before switching to mock. Any rule would invent provenance (§141).
+So no migration: from now on a no-realm sync leaves those rows alone, and the
+next named sync judges them as pre-0115 links (which is what the push already
+assumes). On a dev database seeded before this change, a mock vendor sync
+reports the seeded links `unverified_link` until it is re-seeded. `scripts/seed.py`
+now stamps its fixture links `"mock"`.
+
+**Rejected.** *Treating `"mock"` links like NULL in a named sync* (loose
+legacy evidence): a fixture id says nothing about a real company, so the strict
+between-companies rule fits. *A NULL-safe sentinel such as the empty string*:
+§489's lock key already uses an empty realm for "no company", and a readable
+value is easier in the vendor ERP-links table. *Backfilling from audit rows*:
+they are history, not a complete record of every link.
+
