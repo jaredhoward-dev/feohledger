@@ -419,6 +419,12 @@ const BUILDERS: Record<string, Builder> = {
 	// sentence.
 	invoice_not_recallable: fixed('refusal.invoiceNotRecallable'),
 	invoice_recall_in_erp: fixed('refusal.invoiceRecallInErp'),
+	// The document already went out over PEPPOL, or the invoice is paired
+	// inter-company (decisions §573).
+	invoice_recall_peppol_transmitted: fixed('refusal.recallPeppolTransmitted'),
+	invoice_recall_mirror_unsigned: fixed('refusal.recallMirrorUnsigned'),
+	invoice_recall_mirror_progressed: fixed('refusal.recallMirrorProgressed'),
+	invoice_recall_is_mirror: fixed('refusal.recallIsMirror'),
 	// `services/erp_bill_void` — `POST /api/exceptions/{id}/void-erp-bill` and
 	// the queue's `void_erp_bill_refusal` verdict (decisions §539).
 	erp_void_not_flagged: fixed('refusal.erpVoidNotFlagged'),

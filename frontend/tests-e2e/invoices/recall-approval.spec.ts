@@ -114,6 +114,27 @@ test.describe('invoice modal — recall an approval', () => {
 		);
 	});
 
+	test('an invoice already sent over PEPPOL disables Recall and says why', async ({ page }) => {
+		const number = `${PREFIX}-PEPPOL-${Date.now()}`;
+		const id = await createApproved(page, number);
+		// The transmission is the fixture (decisions §573); sending one needs the
+		// org's PEPPOL settings, which `einvoice-export.spec.ts` covers.
+		tenantPsql(
+			`INSERT INTO peppol_transmissions (id, invoice_id, direction, participant_scheme,` +
+				` participant_value, doc_type_id, process_id, business_message_id, status, provider,` +
+				` organization_id, entity_id)` +
+				` SELECT gen_random_uuid(), id, 'outbound', '9930', 'E2E-RECEIVER', 'dt', 'pr',` +
+				` replace(correlation_id::text, '-', ''), 'sent', 'mock', organization_id, entity_id` +
+				` FROM invoices WHERE id='${id}'`
+		);
+		const modal = await openWithVerdict(page, id, number);
+
+		await expect(modal.getByTestId('recall-approval')).toBeDisabled();
+		await expect(modal.getByTestId('recall-refusal')).toHaveText(
+			"This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can't be recalled."
+		);
+	});
+
 	test('an invoice in review is not offered Recall', async ({ page }) => {
 		const number = `${PREFIX}-REVIEW-${Date.now()}`;
 		const id = await createApproved(page, number);
