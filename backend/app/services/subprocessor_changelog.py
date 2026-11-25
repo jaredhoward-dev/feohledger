@@ -144,6 +144,33 @@ CHANGELOG: tuple[ChangelogEntry, ...] = (
             "own average cost."
         ),
     ),
+    # hCaptcha was engaged for everyone already (§ 2), on the sign-up form. From
+    # this release it also checks the workspace lookup on every deployment
+    # (decisions §553), so it receives the same data about a new group of
+    # people: customers' own users asking for their workspace address. That is
+    # "a change to what an existing provider receives" (§ 9), so a notice entry;
+    # short because the lookup is a public, email-sending endpoint that would
+    # otherwise run unprotected (decisions §558).
+    ChangelogEntry(
+        id="2026-11-25-hcaptcha-workspace-lookup",
+        published_on=date(2026, 11, 25),
+        change=(
+            "hCaptcha (§ 2) now also protects the public workspace lookup at /find-workspace, "
+            "the page that emails users their workspace address, on every deployment whether "
+            "sign-up is open or closed. On that form it receives what it receives on the "
+            "sign-up form: the browser signals its own script collects in the page, the "
+            "challenge token, and the IP address of the person submitting. It is not sent "
+            "what is typed into the form."
+        ),
+        notice=True,
+        effective_on=date(2026, 11, 25),
+        urgent_reason=(
+            "The workspace lookup is a public page that sends an email to any address typed "
+            "into it. Without a captcha it can be used to flood a person's inbox and to use up "
+            "the lookups an address is allowed, so the protection is applied from this "
+            "release rather than after 30 days."
+        ),
+    ),
 )
 
 

@@ -340,7 +340,8 @@
 		rows on the sub-processor register are therefore <em>available</em> rather than
 		<em>engaged</em>: the honest answer to "who are your sub-processors" is the three that
 		are engaged in every deployed environment — the infrastructure provider, Anthropic for
-		invoice extraction, and hCaptcha on the public signup form — plus whichever adapters
+		invoice extraction, and hCaptcha on the public signup and workspace-lookup forms — plus
+		whichever adapters
 		your tenant or the deployment has actually turned on. The register marks which is
 		which, and <a href="#ai-processing">Artificial intelligence and machine learning</a>
 		explains why extraction is not on the opt-in side of that line.
@@ -1532,7 +1533,8 @@
 		Service; <strong>Anthropic</strong>, which receives uploaded invoice documents for
 		extraction (see <a href="#ai-processing">Artificial intelligence and machine learning</a>);
 		and <strong>hCaptcha</strong>, which receives the IP address of anyone using the public
-		signup form and without which the Service refuses to start. Every other entry becomes
+		signup form or the public workspace lookup (which emails a user their workspace address)
+		and without which the Service refuses to start. Every other entry becomes
 		active only when a credential is configured. Local development runs entirely on a
 		contributor's own machine with no third party at all.
 	</p>

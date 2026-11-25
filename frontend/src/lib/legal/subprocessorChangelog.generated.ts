@@ -89,4 +89,13 @@ export const SUBPROCESSOR_CHANGES = [
 		effectiveLabel: null,
 		urgentReason: null,
 	},
+	{
+		id: '2026-11-25-hcaptcha-workspace-lookup',
+		publishedOn: '2026-11-25',
+		publishedLabel: '25 November 2026',
+		change: 'hCaptcha (§ 2) now also protects the public workspace lookup at /find-workspace, the page that emails users their workspace address, on every deployment whether sign-up is open or closed. On that form it receives what it receives on the sign-up form: the browser signals its own script collects in the page, the challenge token, and the IP address of the person submitting. It is not sent what is typed into the form.',
+		notice: true,
+		effectiveLabel: '25 November 2026',
+		urgentReason: 'The workspace lookup is a public page that sends an email to any address typed into it. Without a captcha it can be used to flood a person\'s inbox and to use up the lookups an address is allowed, so the protection is applied from this release rather than after 30 days.',
+	},
 ] as const satisfies readonly SubprocessorChange[];
