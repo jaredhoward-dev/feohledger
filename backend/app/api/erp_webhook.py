@@ -36,6 +36,13 @@ from app.services.erp_status_sync import (
 )
 from app.services.payment_settlement import settlement_coverage
 from app.services.provider_credentials import provider_config
+from app.services.rate_limit import (
+    RateLimitExceeded,
+    auth_identity_key,
+    check_auth_failures,
+    record_auth_failure,
+    resolve_client_ip,
+)
 from app.services.webhook_security import (
     extract_signature_header,
     is_event_already_processed,
@@ -94,8 +101,77 @@ def _retry_please() -> Response:
 # generic route and the Merge route alike.
 _WEBHOOK_KEY_PATH = "webhook_signing_secret"
 
+# The unseal budget (decisions §525): distinct tenants a source address has
+# failed against. There is deliberately no per-tenant budget: anyone who knows
+# a slug could spend it and drop the tenant's genuine deliveries, and it buys
+# no KMS protection, since repeat openings of one tenant hit the DEK cache.
+_UNSEAL_SOURCE_SCOPE = "erp_webhook_unseal_source"
 
-async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
+
+def _unseal_source_key(request: Request) -> str:
+    """The caller's address, digested so it is never a Redis key in the clear."""
+    return auth_identity_key(str(resolve_client_ip(request) or "unknown"))
+
+
+async def _unseal_budget_open(request: Request, tenant_slug: str, adapter_key: str) -> bool:
+    """May this delivery open a tenant's sealed key? (decisions §525)
+
+    Read-only: nothing is counted here, only by
+    :func:`_record_unverified_unseal` once an opened key has failed to verify a
+    delivery, so a genuine sender never spends the budget. Refused when the
+    source address has failed against
+    ``erp_webhook_unverified_tenants_per_source_limit`` DISTINCT tenants in
+    the window: cycling across tenants is the only way past the DEK cache to a
+    KMS ``Decrypt`` per request. The caller answers a refusal with the same
+    silent 204 as every other rejection, so the budget is no slug oracle; it
+    is logged (slug and adapter only, never the address).
+
+    Redis unreachable FAILS OPEN, as the public API's per-key limiter does:
+    the budget guards KMS cost, not correctness, and a genuine delivery that
+    verifies then reaches the dedup claim, which answers a 503 without Redis
+    so the provider redelivers. Failing closed would drop that delivery with a
+    204 instead.
+    """
+    source_key = _unseal_source_key(request)
+    try:
+        await check_auth_failures(
+            _UNSEAL_SOURCE_SCOPE,
+            source_key,
+            limit=settings.erp_webhook_unverified_tenants_per_source_limit,
+            window_seconds=settings.erp_webhook_unverified_window_seconds,
+        )
+    except RateLimitExceeded:
+        logger.warning(
+            "ERP webhook dropped: unverified-delivery budget spent by the source "
+            "for tenant '%s' (%s)",
+            tenant_slug,
+            adapter_key,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — Redis unreachable: fail open
+        logger.warning("ERP webhook: unseal budget unavailable (%s)", exc.__class__.__name__)
+    return True
+
+
+async def _record_unverified_unseal(request: Request, org) -> None:
+    """Count one opening of ``org``'s key that verified nothing: a signature
+    that failed against it, or a key that could not be opened. The source
+    records the TENANT as its member, so it counts distinct tenants — a
+    provider address serving one misconfigured tenant never spends the budget
+    of every other tenant behind it. Best effort: Redis down records nothing
+    (fails open, see :func:`_unseal_budget_open`)."""
+    try:
+        await record_auth_failure(
+            _UNSEAL_SOURCE_SCOPE,
+            _unseal_source_key(request),
+            window_seconds=settings.erp_webhook_unverified_window_seconds,
+            member=auth_identity_key(str(org.id)),  # digested like the source
+        )
+    except Exception as exc:  # noqa: BLE001 — Redis unreachable: fail open
+        logger.warning("ERP webhook: unseal budget unavailable (%s)", exc.__class__.__name__)
+
+
+async def _tenant_webhook_config(tenant_slug: object, adapter_key: str, request: Request):
     """``(org, erp_config)`` for a tenant whose webhook key may verify a
     delivery on ``adapter_key``'s route, else ``None`` (decisions §408).
 
@@ -110,7 +186,11 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
        method and type are configuration, never sealed);
     3. a webhook key is stored at all — the row's path NAMES, no decrypt
        (``provider_credentials.stored_secret_paths``);
-    4. only then the block is opened (``provider_config``).
+    4. the source still has unseal budget
+       (:func:`_unseal_budget_open`, decisions §525);
+    5. only then the block is opened (``provider_config``). The caller counts
+       an opening whose key then fails the signature
+       (:func:`_record_unverified_unseal`).
 
     The caller has already refused a request whose signature header could
     never verify (absent, or not the route's digest shape), so a request
@@ -149,9 +229,12 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
                 adapter_key,
             )
             return None
+        if not await _unseal_budget_open(request, tenant_slug, adapter_key):
+            return None
         try:
             erp_config = await provider_config(org, "erp", db=ctrl_db) or {}
         except CredentialCryptoError:
+            await _record_unverified_unseal(request, org)
             logger.error(
                 "ERP webhook dropped: the ERP credentials of tenant '%s' could not be opened (%s)",
                 tenant_slug,
@@ -393,12 +476,13 @@ async def merge_webhook(tenant_slug: str, request: Request):
     if not well_formed_base64url_sha256(signature):
         return
 
-    resolved = await _tenant_webhook_config(tenant_slug, merge_events.MERGE_PROVIDER)
+    resolved = await _tenant_webhook_config(tenant_slug, merge_events.MERGE_PROVIDER, request)
     if resolved is None:
-        return  # unknown, not on Merge, no key, or a key that cannot be opened
+        return  # unknown, not on Merge, no key, budget spent, or a key that cannot be opened
     org, erp_config = resolved
     signing_secret = erp_config.get(_WEBHOOK_KEY_PATH) or ""
     if not verify_hmac_sha256_base64url(signing_secret, raw_body, signature):
+        await _record_unverified_unseal(request, org)
         return
 
     try:
@@ -547,14 +631,15 @@ async def erp_webhook(
     # switch to another ERP drops every sealed secret, the webhook key
     # included (`erp_adapters/catalog.secrets_to_drop`), so a key stored for
     # one ERP never verifies another's route.
-    resolved = await _tenant_webhook_config(tenant_slug, erp_type)
+    resolved = await _tenant_webhook_config(tenant_slug, erp_type, request)
     if resolved is None:
-        return
+        return  # ... or the source's unseal budget spent (decisions §525)
     org, erp_config = resolved
 
     # Verify HMAC against the tenant's configured signing secret.
     signing_secret = erp_config.get(_WEBHOOK_KEY_PATH) or ""
     if not verify_hmac_sha256(signing_secret, raw_body, provided_sig):
+        await _record_unverified_unseal(request, org)
         return  # silent 204 on bad / missing signature
 
     # Dedup by event id. Cross-tenant key because event ids should be

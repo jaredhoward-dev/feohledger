@@ -26793,3 +26793,71 @@ miss every tenant that already synced after §284, which is exactly who holds
 these rows. *Auto-confirming when no invoice is coded to the row*: the sync
 does not read invoices, and a later invoice would still be coded on a guess.
 
+## 525. The per-tenant ERP webhooks budget the unseal for deliveries that do not verify, by the distinct tenants a source fails against, and fail open without Redis (§408 follow-up, round 43)
+
+**Context.** §408 put the opening of a tenant's sealed webhook key last on
+`/api/erp/webhook/{erp_type}` and `/api/erp/webhook/merge_dev/{slug}`, but a
+well-formed signature at a configured tenant still costs one unseal, since the
+key is what the signature is checked against. Repeat openings of ONE tenant
+hit the DEK cache (five minutes per data key per process), so the expensive
+shape is cycling: the cache holds 512 keys, and a caller cycling well-formed
+signatures across more configured tenants than that could force a KMS
+`Decrypt` per request, bounded only by KMS's own quota.
+
+**Decision.**
+
+- **Count only openings that verified nothing.** `api/erp_webhook` checks a
+  Redis budget just before the opening (`_unseal_budget_open`, step 4 of
+  `_tenant_webhook_config`) and records an opening only once its key has
+  failed the signature, or could not be opened (`_record_unverified_unseal`).
+  A genuine sender is never counted, however often it delivers. It reuses
+  `services/rate_limit`'s failure-budget pair (`check_auth_failures` /
+  `record_auth_failure`), whose keys are digests, so neither the caller's
+  address nor the org id is held in the clear.
+- **One axis: DISTINCT tenants per source address**
+  (`FEOH_ERP_WEBHOOK_UNVERIFIED_TENANTS_PER_SOURCE_LIMIT`, 10, over
+  `FEOH_ERP_WEBHOOK_UNVERIFIED_WINDOW_SECONDS`, 600). It counts tenants, not
+  attempts (`record_auth_failure(member=…)`, a sorted-set member held once):
+  cycling tenants is what defeats the cache, so tenants are what it counts,
+  and a provider that delivers every tenant's events from a few shared
+  addresses never spends the others' budget through one misconfigured tenant.
+- **A spent budget is the same silent 204**, logged as a warning with the slug
+  and adapter, never the address. Nothing before verification differs, so the
+  budget is no slug oracle.
+- **Redis unreachable fails open**, as the public API's per-key limiter does
+  (`docs/environment.md`, `FEOH_PUBLIC_API_RATE_LIMIT_PER_MINUTE`). The budget
+  guards KMS cost, not correctness; a genuine delivery then verifies and meets
+  the dedup claim, whose own Redis failure is the bodyless 503 that makes the
+  provider redeliver. Failing closed would answer that delivery with a 204 and
+  lose it. During the outage only KMS's quota bounds the unseals again, which
+  is where §408 left it.
+- **It follows `FEOH_RATE_LIMIT_ENABLED`**, the master switch every Redis
+  limiter honours (off in `.env.development` and the e2e jobs).
+
+**What remains, stated plainly.** A distributed caller with many source
+addresses, each staying under the per-source budget while cycling tenants, is
+still bounded only by KMS's own request quota. That stays in
+`docs/followups.md`, with the recovery sweeps for deliveries dropped while a
+key cannot be opened.
+
+*Rejected: a per-tenant budget* (failed unseals per tenant). It was in the
+first cut of this change and was removed before it landed. It adds a
+denial-of-service path that did not exist before: anyone who knows a slug
+(slugs are public subdomains) could send wrong signatures, spend the tenant's
+budget, and have its genuine deliveries dropped with a 204 for the rest of the
+window. And it buys no KMS protection: repeat openings of one tenant hit the
+DEK cache, so only cycling across tenants forces `Decrypt` calls, which the
+per-source axis already covers. *Rejected:* a global budget across all
+tenants, which would let one caller stop every tenant's webhooks.
+*Rejected:* counting every opening, verified or not, which would throttle a
+provider's own address. *Rejected:* checking the source before the slug lookup:
+the response is identical either way, and only the opening costs anything.
+
+**Tests.** `tests/test_merge_webhook.py`: an address cycling tenants is cut off
+with the same 204, logged without the address, while failures at one tenant
+never spend it and another address is unaffected; wrong signatures from many
+addresses never stop a tenant's genuine delivery; a verified delivery spends
+nothing; a key that cannot be opened spends the budget; Redis down fails open;
+the master switch turns it off. `tests/test_webhook_security.py`: the generic
+route shares the budget. `tests/conftest.py`'s fake sorted set now holds a
+member once, as Redis does.

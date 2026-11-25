@@ -858,6 +858,39 @@ async def test_erp_webhook_unknown_slug_answers_exactly_as_a_bad_signature(fake_
 
 
 @pytest.mark.asyncio
+async def test_erp_webhook_a_source_cycling_tenants_is_cut_off(fake_redis, monkeypatch):
+    """The generic route shares the Merge route's unseal budget (decisions
+    §525): once an address has failed against the budgeted number of distinct
+    tenants, the next tenant's key is not opened and the answer is the same
+    silent 204; a verified delivery before that spent nothing."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    monkeypatch.setattr(settings, "erp_webhook_unverified_tenants_per_source_limit", 2)
+    body = _erp_body(correlation_id="not-a-uuid")  # verified, then a silent 204
+
+    async def _from_one_address(org, secret):
+        from app.api.erp_webhook import erp_webhook
+
+        opened = AsyncMock(side_effect=lambda o, *_a, **_k: o.settings["erp"])
+        req = _fake_request(body, {"X-Webhook-Signature": _sign(secret, body)})
+        req.client.host = "198.51.100.7"
+        with (
+            patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
+            patch("app.api.erp_webhook.provider_config", opened),
+            patch("app.api.erp_webhook.get_tenant_engine") as engine,
+        ):
+            result = await erp_webhook(erp_type="generic", request=req)
+        engine.assert_not_called()
+        return result, opened.await_count
+
+    for _ in range(3):
+        assert await _from_one_address(_org_with_erp_secret("real"), "real") == (None, 1)
+    for expected in (1, 1, 0):
+        assert await _from_one_address(_org_with_erp_secret("real"), "guess") == (None, expected)
+
+
+@pytest.mark.asyncio
 async def test_erp_webhook_credentials_that_cannot_be_opened_are_a_silent_204(fake_redis):
     """Not a 503: the signature cannot be checked without the key, and a 503
     before it verifies would answer a configured slug differently (§408)."""

@@ -30,9 +30,11 @@ class _FakeSortedSet:
         self.store: dict[str, list[tuple[str, float]]] = {}
 
     def zadd(self, key, mapping) -> None:
-        self.store.setdefault(key, [])
+        # Redis semantics: a member is held once; re-adding it moves its score.
+        entries = self.store.setdefault(key, [])
         for member, score in mapping.items():
-            self.store[key].append((member, score))
+            entries[:] = [(m, s) for m, s in entries if m != member]
+            entries.append((member, score))
 
     def zremrangebyscore(self, key, low, high) -> None:
         if key in self.store:

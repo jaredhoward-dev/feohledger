@@ -307,6 +307,27 @@ redelivered (`docs/followups.md`). The QuickBooks and Xero routes verify against
 one platform key from the environment, never a tenant's sealed one, so none of
 this applies to them.
 
+**An unseal budget for deliveries that do not verify (decisions §525).** Just
+before the opening, both per-tenant routes check a Redis budget
+(`api/erp_webhook._unseal_budget_open`, reusing `services/rate_limit`'s
+failure-budget primitives), and count an opening that verified nothing — a
+wrong signature, or a key that could not be opened
+(`_record_unverified_unseal`). The budget is DISTINCT tenants one source
+address has failed against in a rolling window
+(`FEOH_ERP_WEBHOOK_UNVERIFIED_*`, `docs/environment.md`; default 10 per 10
+minutes). Repeat openings of one tenant hit the DEK cache, so cycling
+signatures across tenants is the only way to force a KMS `Decrypt` per
+request, and that is what it cuts off; a provider address serving one
+misconfigured tenant never spends the others' budget. There is no per-tenant
+budget: anyone who knows a slug could spend it and drop that tenant's genuine
+deliveries, for no KMS saving. A spent budget opens nothing and is the same
+silent 204 as every other rejection, logged with the slug and adapter (never
+the address). Genuine deliveries are never counted. Redis unreachable fails
+open: a genuine delivery then verifies and meets the dedup claim's 503, so the
+provider redelivers. The budget follows `FEOH_RATE_LIMIT_ENABLED` (off in
+local dev). A distributed caller with many addresses is still bounded only by
+KMS's own quota (`docs/followups.md`).
+
 The webhook handler:
 1. Validates the request (signature, API key, or IP whitelist)
 2. Dedupes by `event_id` (`services/webhook_security.is_event_already_processed`)

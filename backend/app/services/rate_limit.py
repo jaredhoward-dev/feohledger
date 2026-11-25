@@ -273,8 +273,17 @@ async def check_auth_failures(
         raise RateLimitExceeded(window_seconds)
 
 
-async def record_auth_failure(scope: str, identity_key: str, *, window_seconds: int) -> None:
-    """Record one failed authentication attempt against this identity."""
+async def record_auth_failure(
+    scope: str, identity_key: str, *, window_seconds: int, member: str | None = None
+) -> None:
+    """Record one failed authentication attempt against this identity.
+
+    ``member`` turns the budget into a count of DISTINCT things that failed:
+    a sorted set holds each member once, so re-recording one refreshes its
+    timestamp instead of adding to the count. The ERP webhooks use it to count
+    the tenants a source has failed against, not its attempts (decisions §525).
+    Without it every call is a new entry, as for a login.
+    """
     if not settings.rate_limit_enabled:
         return
 
@@ -284,7 +293,7 @@ async def record_auth_failure(scope: str, identity_key: str, *, window_seconds: 
     r = await get_redis()
     async with r.pipeline(transaction=True) as pipe:
         pipe.zremrangebyscore(key, 0, now - window_seconds)
-        pipe.zadd(key, {str(uuid.uuid4()): now})
+        pipe.zadd(key, {member if member is not None else str(uuid.uuid4()): now})
         pipe.expire(key, window_seconds)
         await pipe.execute()
 
