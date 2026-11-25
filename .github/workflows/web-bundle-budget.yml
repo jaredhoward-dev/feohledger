@@ -248,6 +248,17 @@ env:
   # main 89, refusal 14, audit 6, settings 28, help 10, portal 6,
   # marketing 4), largest chunk 89 KB (the ja main catalogue, 89,869 bytes
   # gzipped by gzip -6), 11 KB of per-chunk headroom.
+  # 2026-11-25 — no ceiling change. Round 46 measured 481 KB on CI (480.6
+  # locally, 491,123 bytes): round 45 had left it at 489,612, and round 46's
+  # keys added ~1.5 KB across main, refusal, settings and audit. The heaviest
+  # route, /help/guides/[id], bundled all eight guide diagrams (~12 KB) though
+  # a guide shows one or two; each is now a lazy chunk its page's load awaits
+  # (Diagram.svelte, routes/help/guides/[id]/+page.ts). Measured locally:
+  # gated 471 KB (shell 218, heaviest route 91 /help/guides/[id], next /help
+  # 89, main 92, refusal 16, settings 31, help 10, audit 7, portal 6,
+  # marketing 5), largest chunk 92. The help routes now sit within 2 KB of
+  # each other, so the next trim is the shell (218, up from 206 on
+  # 2026-11-19) or the 74 KB guide index every /help route loads.
   MAX_TOTAL_KB: 480
   MAX_LARGEST_CHUNK_KB: 100
 
