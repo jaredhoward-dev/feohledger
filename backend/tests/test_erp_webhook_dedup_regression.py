@@ -182,6 +182,7 @@ async def test_distinct_status_events_without_event_id_both_apply(fake_redis):
         currency="USD",
         status=InvoiceStatus.sent_to_erp,
         amount=None,
+        method="ach",  # not a card leg, which would read its card (§537)
         settled_amount=None,
         settled_currency=None,
         settled_amount_unstorable=False,

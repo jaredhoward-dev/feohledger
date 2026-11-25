@@ -40,7 +40,8 @@ from app.services.erp_status_sync import (
     record_erp_reported_payment as _record_erp_reported_payment,
 )
 from app.services.invoice_warning_catalog import exception_finding
-from app.services.payment_settlement import settlement_coverage
+from app.services.payment_settlement import COVERAGE_IN_FLIGHT
+from app.services.payment_settlement_record import payment_coverage
 from app.services.workflow_engine import VALID_TRANSITIONS, transition_invoice
 
 # Map ERP status strings to our internal status transitions.
@@ -185,7 +186,12 @@ async def apply_erp_status_report(
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if settling is None:
+        # A run's card leg is `completed` once its card is minted; uncharged,
+        # it is as in flight as a pending ACH (decisions §537).
+        coverage = (
+            None if settling is None else await payment_coverage(db, settling, invoice.currency)
+        )
+        if settling is None or coverage.state == COVERAGE_IN_FLIGHT:
             report = {
                 "kind": ERP_REPORT_PAID_WHILE_SCHEDULED,
                 "erp_type": erp_type,
@@ -204,15 +210,6 @@ async def apply_erp_status_report(
                 erp_report=report,
             )
             return HELD_PAID_WHILE_SCHEDULED if opened else NOOP
-        coverage = settlement_coverage(
-            settled_amount=settling.settled_amount,
-            settled_currency=settling.settled_currency,
-            target_amount=settling.amount,
-            target_currency=invoice.currency,
-            source_amount=settling.source_amount,
-            source_currency=settling.source_currency,
-            settled_amount_unstorable=settling.settled_amount_unstorable,
-        )
         if not coverage.completes_invoice:
             opened = await _open_erp_reconciliation_exception(
                 db,

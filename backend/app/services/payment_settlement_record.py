@@ -281,3 +281,108 @@ __all__ = [
     "record_completion",
     "record_settlement",
 ]
+
+
+# ── A run's virtual-card leg (decisions §537) ─────────────────────────────
+#
+# A run's card leg books a `completed` `Payment` the moment the card is MINTED
+# (`api/payments._execute_single_payment`), but money moves only when the vendor
+# charges the card — and the card webhook recorded that charge on the
+# `VirtualCard` row alone. With `settled_amount` NULL, `settlement_coverage`
+# failed OPEN, so the payment sync and an ERP `paid` report both closed the
+# invoice while the card was still spendable. These two functions are the whole
+# fix: the card's charge is written onto the payment it pays, and coverage of a
+# card leg asks the card when nothing has been written yet.
+
+CARD_LEG_METHOD = "virtual_card"
+
+
+async def card_leg_card(db: AsyncSession, payment: Payment):
+    """The card a run's card leg paid with, preferring one that was charged.
+
+    The card the leg minted names the payment (`virtual_cards.payment_id`); a
+    leg that converged onto an unlinked `/cards/generate` card links it too.
+    The invoice's still-unlinked card is read as a fallback, so a leg never
+    loses sight of the card that pays its invoice.
+    """
+    from sqlalchemy import case, or_
+
+    from app.models.virtual_card import VirtualCard
+    from app.services.card_issuance import CARD_SPENT_STATUSES
+
+    clauses = [VirtualCard.payment_id == payment.id]
+    if payment.invoice_id is not None:
+        clauses.append(
+            (VirtualCard.invoice_id == payment.invoice_id) & VirtualCard.payment_id.is_(None)
+        )
+    spent_first = case((VirtualCard.status.in_(CARD_SPENT_STATUSES), 0), else_=1)
+    return (
+        await db.execute(
+            select(VirtualCard)
+            .where(or_(*clauses))
+            .order_by(spent_first, VirtualCard.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency: str | None):
+    """``settlement_coverage`` for one payment, honest about a card leg.
+
+    Every caller that decides whether a payment discharges its invoice goes
+    through here — the payment sync (`payment_erp_sync`) and an ERP's `paid`
+    report (`erp_status_report`, webhook and poll alike) — so they cannot
+    disagree about a card leg.
+
+    A card leg with no figure on the payment reads its card: uncharged (or no
+    card found) is ``in_flight``, since nothing has moved; charged, the card's
+    ``amount_charged`` is the settled figure. A leg the card webhook already
+    stamped (:func:`record_card_spend`) is read off the payment like any rail.
+    """
+    from app.services.card_issuance import CARD_SPENT_STATUSES
+    from app.services.payment_settlement import settlement_coverage
+
+    settled = payment.settled_amount
+    settled_currency = payment.settled_currency
+    unstorable = bool(payment.settled_amount_unstorable)
+    awaiting = False
+    if payment.method == CARD_LEG_METHOD and settled is None and not unstorable:
+        card = await card_leg_card(db, payment)
+        if card is None or card.status not in CARD_SPENT_STATUSES:
+            awaiting = True
+        else:
+            settled, unstorable = persistable_settled_amount(card.amount_charged)
+            settled_currency = card.currency
+    return settlement_coverage(
+        settled_amount=settled,
+        settled_currency=settled_currency,
+        target_amount=payment.amount,
+        target_currency=invoice_currency,
+        source_amount=payment.source_amount,
+        source_currency=payment.source_currency,
+        settled_amount_unstorable=unstorable,
+        awaiting_card_spend=awaiting,
+    )
+
+
+async def record_card_spend(db: AsyncSession, card) -> Payment | None:
+    """Write a card's charge onto the run payment it pays; return that payment.
+
+    Called by the card webhook on the authorization and again on settlement
+    (whose figure replaces the authorized one), so ``payments.settled_amount``
+    of a card leg is what the vendor actually took. A short charge then holds
+    the invoice exactly as a short ACH does, and ``/settlement/accept`` and
+    ``/void`` are its exits. Returns ``None`` — nothing written — for a card no
+    run payment owns (``/cards/generate``), a non-card or non-completed payment,
+    or a charge with no amount.
+    """
+    if card.payment_id is None or card.amount_charged is None:
+        return None
+    payment = await db.get(Payment, card.payment_id)
+    if payment is None or payment.method != CARD_LEG_METHOD or payment.status != "completed":
+        return None
+    amount, unstorable = persistable_settled_amount(card.amount_charged)
+    payment.settled_amount = amount
+    payment.settled_currency = card.currency
+    payment.settled_amount_unstorable = unstorable
+    return payment

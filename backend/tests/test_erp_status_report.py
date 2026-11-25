@@ -12,6 +12,9 @@ on real Postgres, apart from either channel:
   covers the invoice; a short settlement is held (settled-short row); no
   completed payment — ours still in flight, or none on file — is held behind
   one blocking `payment_reconciliation` (decisions §533, §535);
+* a run's virtual-card leg (a `completed` payment booked at mint) counts only
+  what its card was charged: uncharged → the in-flight hold, card untouched;
+  charged in full → `paid`; charged short → settled-short hold (§537);
 * every flag is deduplicated by its kind: a live row of the same kind
   suppresses it (and the outcome is `NOOP`, so nothing is counted or
   committed), an unrelated live row of the same type never does (§533);
@@ -307,7 +310,7 @@ async def test_paid_with_no_completed_payment_is_held_behind_a_blocking_row(real
     card shape reaches this branch (decisions §535): a `/cards/generate` card
     leaves the invoice `approved` / `posted_in_erp`, where an ERP `paid` is
     refused `external_payment_card_live`; a run's card leg books a completed
-    `Payment` with no `settled_amount`, which coverage treats as covering."""
+    `Payment`, held below while its card is uncharged (decisions §537)."""
     from app.models.virtual_card import VirtualCard
 
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
@@ -348,6 +351,89 @@ async def test_paid_with_no_completed_payment_is_held_behind_a_blocking_row(real
     # A second report while it is live changes nothing.
     assert await _apply(realdb, inv_id, "paidInFull") == report.NOOP
     assert len(await _exceptions(realdb, inv_id)) == 1
+
+
+async def _card_leg(realdb, inv_id, *, card_status: str, charged: str | None) -> uuid.UUID:
+    """A run's card leg as `_execute_single_payment` books it: a `completed`
+    `virtual_card` payment with no settled figure, and the card it minted."""
+    from app.models.virtual_card import VirtualCard
+
+    pay_id = uuid.uuid4()
+    async with realdb.sessionmaker(TENANT)() as s:
+        s.add(
+            Payment(
+                id=pay_id,
+                invoice_id=inv_id,
+                amount=Decimal("500.00"),
+                method="virtual_card",
+                status="completed",
+                provider="mock",
+            )
+        )
+        await s.flush()
+        s.add(
+            VirtualCard(
+                invoice_id=inv_id,
+                payment_id=pay_id,
+                organization_id=realdb.info(TENANT).org_id,
+                card_provider="mock",
+                provider_card_id=f"card-{inv_id.hex[:8]}",
+                amount_limit=Decimal("500.00"),
+                amount_charged=Decimal(charged) if charged is not None else None,
+                currency="USD",
+                status=card_status,
+            )
+        )
+        await s.commit()
+    return pay_id
+
+
+@pytest.mark.parametrize("card_status", ["created", "sent", "active"])
+async def test_paid_over_an_uncharged_run_card_leg_is_held_and_the_card_left_alone(
+    realdb, card_status
+):
+    """The ERP shows the bill paid, but our card leg's card was never charged:
+    nothing of ours has moved, and the card is still spendable. Held behind
+    the in-flight row — never `paid`, and the card is not touched (§537)."""
+    from app.models.virtual_card import VirtualCard
+
+    inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
+    await _card_leg(realdb, inv_id, card_status=card_status, charged=None)
+
+    assert await _apply(realdb, inv_id, "paid") == report.HELD_PAID_WHILE_SCHEDULED
+    assert await _status(realdb, inv_id) == InvoiceStatus.payment_scheduled
+    [exc] = await _exceptions(realdb, inv_id)
+    assert exc.exception_type == "payment_reconciliation"
+    assert exc.description_code == "exception.erp_paid_while_payment_in_flight"
+    assert exc.erp_report["kind"] == "paid_while_scheduled"
+    assert await _blocked(realdb, inv_id)
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = (
+            await s.execute(select(VirtualCard).where(VirtualCard.invoice_id == inv_id))
+        ).scalar_one()
+        assert card.status == card_status
+
+
+@pytest.mark.parametrize("card_status", ["charged", "completed"])
+async def test_paid_over_a_run_card_leg_charged_in_full_moves_to_paid(realdb, card_status):
+    inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
+    await _card_leg(realdb, inv_id, card_status=card_status, charged="500.00")
+
+    assert await _apply(realdb, inv_id, "paid") == report.TRANSITIONED
+    assert await _status(realdb, inv_id) == InvoiceStatus.paid
+    assert await _exceptions(realdb, inv_id) == []
+
+
+async def test_paid_over_a_run_card_leg_charged_short_is_held_settled_short(realdb):
+    inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
+    pay_id = await _card_leg(realdb, inv_id, card_status="completed", charged="300.00")
+
+    assert await _apply(realdb, inv_id, "paid") == report.HELD_SETTLED_SHORT
+    assert await _status(realdb, inv_id) == InvoiceStatus.payment_scheduled
+    [exc] = await _exceptions(realdb, inv_id)
+    assert exc.erp_report["kind"] == "settled_short"
+    assert exc.erp_report["payment_id"] == str(pay_id)
+    assert exc.erp_report["shortfall"] == "200.00"
 
 
 async def test_paid_in_flight_is_not_swallowed_by_an_unrelated_blocking_row(realdb):
