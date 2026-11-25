@@ -68,6 +68,13 @@ class SessionManager {
     resetStores();
   }
 
+  /// A call was refused by the server-side Terms / Privacy gate (403
+  /// `legal_acceptance_required`, decisions §505): re-read the profile so
+  /// `AuthGate` puts the accept step in front of the shell. Called by
+  /// `ApiClient`, which cannot reach the stores itself.
+  static void legalAcceptanceRefused() =>
+      AuthStore.instance.legalAcceptanceRefused();
+
   /// Drop the in-memory state of every account-scoped store singleton.
   ///
   /// Every `ChangeNotifier` store singleton under `lib/stores/` belongs here —

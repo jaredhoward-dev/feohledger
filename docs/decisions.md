@@ -25848,6 +25848,17 @@ client, was never asked, and nothing refused them.
   button still works once the reviewer accepts. One shared check, so the
   three doors cannot drift (`tests/test_email_actions.py`,
   `test_slack_approvals.py`, `test_teams_approvals.py`).
+- **The clients answer the 403 with their accept step.** A session that
+  stays open across a version bump meets the 403 on its next call, not its
+  next `/me`. The web `api.ts` (through `endSessionIfRejected`, the hook every
+  client already calls on a refusal) and the portal `portalApi.ts` hand the
+  code to `api/acceptanceRefusal.ts`, whose listener in the auth store sets
+  the loaded account's flag, so the layout draws the step at once; the
+  mobile `ApiClient._failure` hands it to `AuthStore.legalAcceptanceRefused`,
+  which re-reads `/me` (once: a set flag means the step is already up). The
+  mobile push-device registration, refused at sign-in while the step is
+  owed, is sent when `AuthGate._onAuthChanged` sees the flag clear, and not
+  at a sign-in that already shows the step.
 - **Consequences.** Every existing user with no acceptance on record is
   refused everywhere but the step until they accept on the web or mobile.
   A mobile build older than a version bump can then only sign out (its Accept

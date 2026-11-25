@@ -380,6 +380,15 @@ names, right after the `invoice.approve` check and before the token's
 single-use claim, and refuses in its own style (the email page "Terms
 acceptance required", the chat reply `LEGAL_ACCEPTANCE_MESSAGE`) without
 spending the link or button, which works once the reviewer has accepted.
+A client that meets the 403 mid-session (a version bump while it stayed open)
+answers it with its accept step, not an error: the web's `api.ts` and the
+portal's `portalApi.ts` hand the code to their auth store
+(`api/acceptanceRefusal.ts`), which sets the loaded account's
+`legal_acceptance_required` so the layout draws `LegalAcceptStep`; the mobile
+`ApiClient` hands it to `AuthStore.legalAcceptanceRefused`, which re-reads
+`/me` so `AuthGate` shows `LegalAcceptScreen`. The mobile push-device
+registration, refused at sign-in while the step is owed, is sent again when
+the flag clears (`AuthGate._onAuthChanged`).
 **Existing users with nothing on record are blocked
 until they accept on the web or mobile, and a mobile build older than a
 version bump can only sign out — ship a bump with, or after, an app release

@@ -216,11 +216,28 @@ class ApiClient {
     }
   }
 
-  static ApiException _failure(http.Response response) => ApiException(
-        response.statusCode,
-        errorMessage(response),
-        detail: errorDetail(response),
-      );
+  /// The server-side Terms / Privacy gate's refusal (decisions §505):
+  /// `backend/app/services/legal_acceptance.py::LEGAL_ACCEPTANCE_REQUIRED`.
+  static const legalAcceptanceRequiredCode = 'legal_acceptance_required';
+
+  /// Every refused JSON call is built here, so this is where a 403 coded
+  /// [legalAcceptanceRequiredCode] — the documents changed while the session
+  /// stayed open — is handed to the session, which re-reads the profile so
+  /// `AuthGate` shows `LegalAcceptScreen`. The caller still gets the
+  /// exception; the gate replaces the screen it was on.
+  static ApiException _failure(http.Response response) {
+    final detail = errorDetail(response);
+    if (response.statusCode == 403 &&
+        detail is Map<String, dynamic> &&
+        detail['code'] == legalAcceptanceRequiredCode) {
+      SessionManager.legalAcceptanceRefused();
+    }
+    return ApiException(
+      response.statusCode,
+      errorMessage(response),
+      detail: detail,
+    );
+  }
 
   /// Auth + tenant headers for JSON requests.
   Map<String, String> get _headers {
@@ -352,7 +369,14 @@ class ApiClient {
       throw ApiException(401, 'Unauthorized');
     }
     if (response.statusCode >= 400) {
-      throw ApiException(response.statusCode, 'Failed to load file');
+      // Through [_failure] for its legal-gate hand-off; the message stays
+      // this file viewer's own.
+      final failure = _failure(response);
+      throw ApiException(
+        response.statusCode,
+        'Failed to load file',
+        detail: failure.detail,
+      );
     }
     return response.bodyBytes;
   }
