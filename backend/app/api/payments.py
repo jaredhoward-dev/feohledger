@@ -176,6 +176,7 @@ from app.services.payment_settlement_record import (
 )
 from app.services.provider_credentials import provider_config, settings_with_secrets
 from app.services.workflow_engine import (
+    PAYMENT_VOID_ACTION,
     get_invoice_for_update,
     transition_invoice,
 )
@@ -1915,7 +1916,9 @@ async def void_payment(
             invoice,
             InvoiceStatus.approved,
             actor_id=user.id,
-            action_name="invoice.voided_return_to_approved",
+            # Not an approval: no `invoice.approved` event or "approved" notice,
+            # `payment.voided` instead (decisions §542).
+            action_name=PAYMENT_VOID_ACTION,
             details={"void_reason": body.reason, "payment_id": str(payment.id)},
         )
         # Back in the queue, and a re-payment pays whoever the invoice names

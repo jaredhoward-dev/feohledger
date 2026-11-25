@@ -55,8 +55,10 @@ sending_to_erp ───> sent_to_erp              (ERP confirmed)
 sending_to_erp ───> failed                   (ERP rejected or timed out)
 sent_to_erp ──────> posted_in_erp            (ERP webhook confirms post)
 sent_to_erp ──────> done                     (terminal — workflow complete)
+sent_to_erp ──────> approved                 (bill voided in the ERP from a duplicate / fraud flag — POST /exceptions/{id}/void-erp-bill only, decisions §539)
 posted_in_erp ────> payment_scheduled        (payment run picks up the invoice)
 posted_in_erp ────> done                     (no payment step in workflow)
+posted_in_erp ────> approved                 (bill voided in the ERP, as above)
 payment_scheduled > paid                     (processor settles the payment)
 payment_scheduled > approved                 (void payment → back to queue)
 paid ─────────────> done                     (terminal)
@@ -70,7 +72,7 @@ A `failed` invoice that was approved before its push failed is still **financial
 
 The way back from that lock is **recalling the approval** (`POST /api/invoices/{id}/recall-approval`, decisions §374): `approved`, or `failed` after an approval, returns to `ready_for_review`, where the figures can be corrected and approved again. It is the only door that walks those two edges; `POST /bulk/status` reports such a row as a skip. See [Recall an approval](#recall-an-approval).
 
-`done` is terminal. The `payment_scheduled → approved` and `paid → approved` back-edges are the **void-payment** path (`POST /api/payments/{id}/void`): the invoice returns to the queue so it can be re-scheduled. Every transition above writes an audit-log row through `transition_invoice()`; nothing in the payment path mutates `invoice.status` directly.
+`done` is terminal. The `payment_scheduled → approved` and `paid → approved` back-edges are the **void-payment** path (`POST /api/payments/{id}/void`): the invoice returns to the queue so it can be re-scheduled. The `sent_to_erp → approved` and `posted_in_erp → approved` back-edges are the **ERP bill void** (`POST /api/exceptions/{id}/void-erp-bill`, `ERP_VOID_EDGES`, decisions §539); any other action is refused as an invalid edge. Neither void is an approval: `transition_invoice` matches their actions (`RETURN_TO_APPROVED_ACTIONS`) before the status, so they emit `payment.voided` / `invoice.erp_bill_voided` and no `invoice.approved` event or "approved" notice (decisions §542). Every transition above writes an audit-log row through `transition_invoice()`; nothing in the payment path mutates `invoice.status` directly.
 
 All transitions are enforced by a state machine in `services/workflow_engine.py`. Invalid transitions return `409 Conflict`. Authoritative graph: `VALID_TRANSITIONS` in that file.
 
@@ -553,8 +555,10 @@ an empty `vendor_id` from a purchase order escalate instead on such an invoice
 ([exception-agents.md](exception-agents.md)), and a vendor merge never moves an
 approved invoice still to be paid ([vendor-management.md](vendor-management.md)).
 
-A bill already in the ERP is not recalled here: correct or void it in the ERP
-(the `void-erp` action is a product call tracked in `docs/followups.md`).
+A bill already in the ERP is not recalled here: correct or void it in the ERP.
+A duplicate or fraud flag on such an invoice offers the ERP void from the flag
+(decisions §539, §542), after which the approval can be recalled; a general
+invoice-level void door is tracked in `docs/followups.md`.
 
 ## Stage 3: Send to ERP
 
@@ -957,6 +961,8 @@ Each entry records:
 | `invoice.rejected`             | Reviewer rejected               |
 | `invoice.resubmitted`         | Re-entered review after edits   |
 | `invoice.approval_recalled`   | Approval recalled back to review |
+| `invoice.erp_bill_voided`     | Bill voided in the ERP from a flag; back to `approved` (§539) |
+| `invoice.voided_return_to_approved` | Payment voided; back to `approved` |
 | `invoice.erp_submitted`       | ERP push initiated              |
 | `invoice.erp_confirmed`       | ERP confirmed receipt           |
 | `invoice.erp_failed`          | ERP push failed                 |

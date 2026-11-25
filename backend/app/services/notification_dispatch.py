@@ -202,6 +202,41 @@ async def resolve_role_user_ids(organization_id: uuid.UUID, role_name: str) -> l
         return [row[0] for row in result.all()]
 
 
+async def resolve_permission_user_ids(
+    organization_id: uuid.UUID, permission: str
+) -> list[uuid.UUID]:
+    """Return the ids of active users in an org whose EFFECTIVE permissions
+    (``api/permissions.effective_permissions``: system roles by the static map,
+    custom roles by their stored grant) include ``permission``.
+
+    For a notice that tells its reader to do something a permission gates, so
+    it reaches exactly the people the endpoint would let act — including a
+    custom role granted it, and not a system role whose default lacks it
+    (decisions §542). Runs against the control plane, like
+    :func:`resolve_role_user_ids`.
+    """
+    from sqlalchemy.orm import selectinload
+
+    from app.api.permissions import effective_permissions
+    from app.database import control_session_factory
+    from app.models.user import User
+
+    async with control_session_factory() as ctrl_db:
+        result = await ctrl_db.execute(
+            select(User)
+            .options(selectinload(User.roles))
+            .where(
+                User.organization_id == organization_id,
+                User.is_active == True,  # noqa: E712
+            )
+        )
+        return [
+            user.id
+            for user in result.scalars().all()
+            if permission in effective_permissions(user.roles)
+        ]
+
+
 async def notify_event(
     db: AsyncSession,
     *,

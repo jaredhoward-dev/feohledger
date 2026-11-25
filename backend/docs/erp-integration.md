@@ -2469,15 +2469,30 @@ adapter that reads it today.
 (`services/erp_bill_void.py`). When a `duplicate` / `fraud_flag` opens on an
 invoice whose bill is already posted (`sent_to_erp` / `posted_in_erp` with an
 `erp_document_id`), `create_exception` sends the `erp_bill_flagged` notice to
-admins, AP managers and CFOs; the flag's dialog then offers the void to a
-holder of `payment.void`. Never automatic: the flag may be false.
+every holder of `payment.void`; the flag's dialog then offers the void to
+them. Never automatic: the flag may be false.
 
-The endpoint reads the bill first (`get_invoice_status`): `paid` /
-`partially_paid` is refused (`erp_void_bill_paid`), and a failed read is
-refused rather than voiding blind. An adapter that raises
-`NotImplementedError` is `erp_void_unsupported`; `False` is
-`erp_void_rejected` (each adapter's own rules for what it will void are in its
-table below). On success the document id, deep link and the push's
+The endpoint reads the bill first (`get_invoice_status`, bounded at 30 s) and
+voids only on a positive read (decisions §542):
+
+| Read | Answer |
+|---|---|
+| `open` / `draft` | `void_invoice` (bounded at 45 s). `False` → `erp_void_rejected`; raised or timed out → 502 `erp_void_unconfirmed` (the ERP may have voided it: check before retrying) |
+| `cancelled`, or `unknown` with `bill_report` → `deleted` | already gone (ours, whose commit was lost, or someone's in the ERP): no void is sent, the rest runs as on a void, `erp_status_read: "cancelled"`, `already_gone: true` |
+| `paid` / `partially_paid` | `erp_void_bill_paid` |
+| `settled_no_payment` | `erp_void_bill_settled` |
+| `unknown`, not implemented, or the read raised | 502 `erp_void_failed` (nothing was written) |
+
+QuickBooks reads a deleted bill as `unknown` (its status read does not tell a
+404 from a deleted bill), which is why the service asks `bill_report`, whose
+`deleted` is every adapter's positive answer; Xero reads one as `cancelled`.
+`ErpAdapter.bill_void_scope` says which bills an adapter can void:
+**NetSuite: pending-approval bills only; Business Central: drafts only** (their
+REST APIs delete such a bill and have no void for a posted one). For those
+the queue refuses a bill at `posted_in_erp` up front, and the endpoint refuses
+any read but `draft`, both `erp_void_draft_only`. An adapter that raises
+`NotImplementedError` from `void_invoice` is `erp_void_unsupported` (each
+adapter's own rules for what it will void are in its table below). On success the document id, deep link and the push's
 `erp_reference` are cleared, the void is recorded on the workflow state, and
 the invoice walks `→ approved` by the void's own edge; any other
 possibly-posted record stays, so the recall (§374) still refuses where another

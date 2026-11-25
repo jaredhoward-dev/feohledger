@@ -206,7 +206,7 @@ before changing any router; the summaries below are only an index.
 | `/assistant`, `/cash-flow` | Conversational AP assistant; AI Cash-Flow Copilot (plans, draft runs, variance) |
 | `/workflows`, `/adaptive`, `/experiments` | Workflow definition CRUD + no-code builder; pattern learning; A/B testing of rules |
 | `/audit` | SOX auditor export + approval-signature verification (per-invoice and per-period) |
-| `/exceptions` | Exception queue, resolution, autonomous AI agents + decision log |
+| `/exceptions` | Exception queue, resolution, autonomous AI agents + decision log; `POST /{id}/void-erp-bill` voids a flagged invoice's bill in the ERP (`payment.void`, decisions §539) |
 | `/notifications` | In-app notification center, preferences, mobile push device tokens |
 | `/privacy`, `/retention-policy` | GDPR/CCPA DSAR + erasure; SOX per-record-class retention config |
 | `/dashboard` | KPI aggregates (pipeline, aging, spend, trends) |
@@ -264,11 +264,12 @@ new → pending → ready_for_review → approved → sending_to_erp → sent_to
                       ↕ rejected ↔ new                                   ↘                                  ↑
                                     failed → pending | sending_to_erp     approved ----------------- (direct schedule, no ERP)
                                                                           ↑ (void) ←──────────────────────────────┘
+sent_to_erp | posted_in_erp → approved   (ERP bill void from a duplicate / fraud flag only, decisions §539)
 ```
 
 Terminal state: `done`. Step types: `extraction`, `approval`, `erp_export`, `done`.
 Workflow definitions are snapshotted per-invoice — editing a definition does not affect in-flight invoices.
-The void-payment path (`POST /api/payments/{id}/void`) takes `payment_scheduled` or `paid` back to `approved` so the invoice re-enters the queue. The recall (`POST /api/invoices/{id}/recall-approval`, the only door for `approved` / `failed`-after-approval → `ready_for_review`) takes an approval back so frozen figures can be corrected, refused while a live payment / card or an ERP bill holds the invoice (`review.recall_refusal`, decisions §374). Authoritative graph: `backend/app/services/workflow_engine.py::VALID_TRANSITIONS`.
+The void-payment path (`POST /api/payments/{id}/void`) takes `payment_scheduled` or `paid` back to `approved` so the invoice re-enters the queue. The ERP bill void (`POST /api/exceptions/{id}/void-erp-bill`) walks `sent_to_erp` / `posted_in_erp → approved`; neither void announces an approval (`RETURN_TO_APPROVED_ACTIONS`, decisions §542). The recall (`POST /api/invoices/{id}/recall-approval`, the only door for `approved` / `failed`-after-approval → `ready_for_review`) takes an approval back so frozen figures can be corrected, refused while a live payment / card or an ERP bill holds the invoice (`review.recall_refusal`, decisions §374). Authoritative graph: `backend/app/services/workflow_engine.py::VALID_TRANSITIONS`.
 
 ### Data models
 

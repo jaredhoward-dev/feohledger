@@ -36,6 +36,7 @@ from app.config import settings
 from app.services.erp_adapters.base import (
     BILL_NOT_IN_ERP,
     BILL_PAYMENT_VOIDED,
+    BILL_VOID_DRAFT_ONLY,
     PAYMENT_ACCOUNT_NOT_MAPPED,
     PAYMENT_EXCEEDS_BALANCE,
     POSTED_TOTAL_MISMATCH,
@@ -400,6 +401,9 @@ class NetSuiteAdapter(ErpAdapter):
     #: a tenant that opted in (:meth:`status_sync_on`, §541): the calls are not
     #: yet proven against a real NetSuite account.
     supports_status_sync = True
+    #: ``void_invoice`` deletes a bill only while it is pending approval; REST
+    #: has no void for an approved one (decisions §542).
+    bill_void_scope = BILL_VOID_DRAFT_ONLY
 
     def status_sync_on(self) -> bool:
         """Status sync is a per-tenant opt-in for NetSuite (decisions §541):

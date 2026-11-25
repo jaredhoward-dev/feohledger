@@ -24,7 +24,9 @@ from app.models.webhook import (
     EVENT_EXCEPTION_RAISED,
     EVENT_INVOICE_APPROVAL_RECALLED,
     EVENT_INVOICE_APPROVED,
+    EVENT_INVOICE_ERP_BILL_VOIDED,
     EVENT_PAYMENT_SETTLED,
+    EVENT_PAYMENT_VOIDED,
 )
 
 _AMOUNT = "Invoice amount as an exact decimal string (never a float)."
@@ -35,8 +37,8 @@ _CURRENCY = (
 
 
 class WebhookInvoiceData(BaseModel):
-    """``invoice.approved`` / ``payment.settled``: the invoice that reached the
-    status, as it stood at the transition."""
+    """``invoice.approved`` / ``payment.settled`` / ``payment.voided``: the
+    invoice that reached the status, as it stood at the transition."""
 
     invoice_id: str = Field(description="The invoice's id.")
     invoice_number: str | None = Field(None, description="The supplier's invoice number.")
@@ -60,6 +62,16 @@ class WebhookInvoiceApprovalRecalledData(WebhookInvoiceData):
     )
 
 
+class WebhookInvoiceErpBillVoidedData(WebhookInvoiceData):
+    """``invoice.erp_bill_voided``: the invoice's bill was voided (or found
+    already voided) in the ERP from a duplicate or fraud flag, and the invoice
+    is back at ``approved`` (decisions §539, §542). This is NOT an approval: do
+    not post the invoice to the ERP again. The flag stays open, and FeohLedger
+    will not pay or re-post it until a person decides it."""
+
+    erp_document_id: str = Field(description="The ERP's id of the bill that was voided.")
+
+
 class WebhookExceptionData(BaseModel):
     """``exception.raised``: an AP exception was opened."""
 
@@ -80,7 +92,9 @@ class WebhookExceptionData(BaseModel):
 WEBHOOK_EVENT_DATA_MODELS: dict[str, type[BaseModel]] = {
     EVENT_INVOICE_APPROVED: WebhookInvoiceData,
     EVENT_INVOICE_APPROVAL_RECALLED: WebhookInvoiceApprovalRecalledData,
+    EVENT_INVOICE_ERP_BILL_VOIDED: WebhookInvoiceErpBillVoidedData,
     EVENT_PAYMENT_SETTLED: WebhookInvoiceData,
+    EVENT_PAYMENT_VOIDED: WebhookInvoiceData,
     EVENT_EXCEPTION_RAISED: WebhookExceptionData,
 }
 
@@ -91,7 +105,15 @@ WEBHOOK_EVENT_SUMMARIES: dict[str, str] = {
         "An invoice's approval was recalled; the invoice is back in review and "
         "not payable until approved again."
     ),
+    EVENT_INVOICE_ERP_BILL_VOIDED: (
+        "An invoice's bill was voided in the ERP from a duplicate or fraud flag; the "
+        "invoice is back at approved. Not an approval: do not post it again."
+    ),
     EVENT_PAYMENT_SETTLED: "An invoice was paid.",
+    EVENT_PAYMENT_VOIDED: (
+        "A payment on an invoice was voided; the invoice is back at approved, unpaid. "
+        "Not an approval."
+    ),
     EVENT_EXCEPTION_RAISED: "An AP exception was opened.",
 }
 

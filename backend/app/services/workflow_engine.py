@@ -212,6 +212,17 @@ ERP_VOID_EDGES: frozenset[tuple[InvoiceStatus, InvoiceStatus]] = frozenset(
     }
 )
 
+#: The audit action of the payment void's `payment_scheduled` / `paid →
+#: approved` (`POST /api/payments/{id}/void`).
+PAYMENT_VOID_ACTION = "invoice.voided_return_to_approved"
+
+#: Transitions that land on `approved` without anyone approving anything: the
+#: approval already stood and something downstream of it was undone. They do
+#: not announce an approval — no `invoice.approved` event, no "approved"
+#: notice — because an integrator that posts approved invoices to its ERP would
+#: post the bill again (decisions §542). Each has its own outbound event.
+RETURN_TO_APPROVED_ACTIONS = frozenset({ERP_VOID_ACTION, PAYMENT_VOID_ACTION})
+
 
 # ---------- the engine's refusals, coded ----------
 #
@@ -399,6 +410,7 @@ async def transition_invoice(
             target_status,
             actor_id=actor_id,
             details=details,
+            action_name=action_name,
         )
     except Exception:  # noqa: BLE001
         _log.exception("notification hook failed for invoice transition to %s", target_status.value)
@@ -419,6 +431,7 @@ async def transition_invoice(
             occurrence_id=occurrence_id,
             action_name=action_name,
             old_status=old_status,
+            details=details,
         )
     except Exception:  # noqa: BLE001 — a webhook emit must never break the transition
         _log.exception("webhook emit hook failed for invoice transition to %s", target_status.value)
@@ -433,6 +446,7 @@ async def _maybe_emit_webhook(
     occurrence_id: uuid.UUID | None = None,
     action_name: str | None = None,
     old_status: str | None = None,
+    details: dict | None = None,
 ) -> None:
     """Map an invoice status transition to an outbound webhook event + emit.
 
@@ -443,6 +457,11 @@ async def _maybe_emit_webhook(
     is matched on the action, not the resulting status, because
     `ready_for_review` is also where a resubmit or a fresh extraction lands.
     `exception.raised` is emitted from `exception_service.create_exception`.
+
+    The two returns to `approved` that approve nothing
+    (:data:`RETURN_TO_APPROVED_ACTIONS`) are matched on the action first and
+    never emit `invoice.approved` (decisions §542): the ERP bill void emits
+    `invoice.erp_bill_voided`, the payment void `payment.voided`.
 
     `occurrence_id` is the caller's per-transition id and becomes the event's
     dedupe key. Re-emitting the SAME transition (same id) still dedupes; a NEW
@@ -459,6 +478,19 @@ async def _maybe_emit_webhook(
             recalled_from=old_status,
             occurrence_id=occurrence_id,
         )
+    elif action_name == ERP_VOID_ACTION:
+        from app.services.webhooks import emit_invoice_erp_bill_voided
+
+        await emit_invoice_erp_bill_voided(
+            invoice,
+            db=db,
+            erp_document_id=str((details or {}).get("erp_document_id") or ""),
+            occurrence_id=occurrence_id,
+        )
+    elif action_name == PAYMENT_VOID_ACTION:
+        from app.services.webhooks import emit_payment_voided
+
+        await emit_payment_voided(invoice, db=db, occurrence_id=occurrence_id)
     elif target_status is InvoiceStatus.approved:
         from app.services.webhooks import emit_invoice_approved
 
@@ -476,8 +508,13 @@ async def _maybe_notify_transition(
     *,
     actor_id: uuid.UUID | None,
     details: dict | None,
+    action_name: str | None = None,
 ) -> None:
     """Map a status transition to a notification event + recipients and dispatch.
+
+    A return to `approved` that approves nothing (:data:`RETURN_TO_APPROVED_
+    ACTIONS`, a voided ERP bill or payment) sends no "approved" notice: nobody
+    approved anything (decisions §542).
 
     The "assigned" event is NOT handled here (assignment doesn't always change
     status) — it's fired explicitly from `review.assign_reviewer`.
@@ -505,6 +542,8 @@ async def _maybe_notify_transition(
     # "no notification," never an exception that aborts the transition.
     uploaded_by_id = getattr(invoice, "uploaded_by_id", None)
 
+    if action_name in RETURN_TO_APPROVED_ACTIONS:
+        return
     if target_status is InvoiceStatus.approved:
         event_type = EVENT_INVOICE_APPROVED
         if uploaded_by_id:

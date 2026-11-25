@@ -905,6 +905,11 @@ def sync_listing_pages(page_size: int) -> int:
     return -(-SYNC_LISTING_MAX_ROWS // page_size)
 
 
+#: :attr:`ErpAdapter.bill_void_scope` values.
+BILL_VOID_ANY = "any"
+BILL_VOID_DRAFT_ONLY = "draft_only"
+
+
 class ErpAdapter:
     """Base class for ERP integrations. Subclass and implement all methods."""
 
@@ -935,6 +940,14 @@ class ErpAdapter:
     #: True when :meth:`revoke_stored_access` calls the provider, so tenant
     #: deletion defers it past a closure's commit like an OAuth revoke.
     revokes_stored_access: bool = False
+    #: Which bills :meth:`void_invoice` can void (decisions §542):
+    #: ``BILL_VOID_ANY`` — any bill nothing has been paid on;
+    #: ``BILL_VOID_DRAFT_ONLY`` — only a bill the ERP still holds as a draft or
+    #: pending approval (``get_invoice_status`` reads ``draft``), because its
+    #: API can only delete one and offers no void for a posted bill.
+    #: ``services/erp_bill_void`` reads it from the class, so the exception
+    #: queue can say so before anyone presses the button.
+    bill_void_scope: str = BILL_VOID_ANY
 
     def __init__(self, config: dict):
         self.config = config

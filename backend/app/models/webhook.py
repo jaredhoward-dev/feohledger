@@ -48,13 +48,22 @@ EVENT_INVOICE_APPROVED = "invoice.approved"
 # An approval was taken back (`review.recall_approval`, decisions §374, §414):
 # an integrator that acted on `invoice.approved` has to hear it was withdrawn.
 EVENT_INVOICE_APPROVAL_RECALLED = "invoice.approval_recalled"
+# The invoice's bill was voided in the ERP from a duplicate / fraud flag and
+# the invoice is back at `approved` (decisions §539, §542). Not an approval: an
+# integrator that posts approved invoices must not post this one again.
+EVENT_INVOICE_ERP_BILL_VOIDED = "invoice.erp_bill_voided"
 EVENT_PAYMENT_SETTLED = "payment.settled"
+# A payment was voided (`POST /api/payments/{id}/void`) and the invoice is back
+# at `approved`, unpaid (decisions §542). Not a fresh approval.
+EVENT_PAYMENT_VOIDED = "payment.voided"
 EVENT_EXCEPTION_RAISED = "exception.raised"
 
 WEBHOOK_EVENT_TYPES = (
     EVENT_INVOICE_APPROVED,
     EVENT_INVOICE_APPROVAL_RECALLED,
+    EVENT_INVOICE_ERP_BILL_VOIDED,
     EVENT_PAYMENT_SETTLED,
+    EVENT_PAYMENT_VOIDED,
     EVENT_EXCEPTION_RAISED,
 )
 

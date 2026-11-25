@@ -190,13 +190,15 @@ def _caller_verdicts(
     Resolve / Dismiss / Escalate (`decision_refusals`) and — only on a row that
     carries an ERP-reported payment — recording it in one click
     (`record_erp_payment_refusal`)."""
-    from app.services.erp_bill_void import is_void_candidate, void_refusal
+    from app.services.erp_bill_void import bill_void_scope, is_void_candidate, void_refusal
 
     out = {"decision_refusals": decision_refusals(exc, inv, user, org_settings, instance)}
     # Only on a duplicate / fraud flag (decisions §539): the verdict on voiding
     # the invoice's bill in the ERP. Absent elsewhere, so nothing is offered.
     if is_void_candidate(exc):
-        out["void_erp_bill_refusal"] = void_refusal(exc, inv, user)
+        out["void_erp_bill_refusal"] = void_refusal(
+            exc, inv, user, void_scope=bill_void_scope(org_settings)
+        )
     if is_erp_paid_report(exc):
         out["record_erp_payment_refusal"] = record_erp_payment_refusal(
             exc, inv, user, org_settings, instance
