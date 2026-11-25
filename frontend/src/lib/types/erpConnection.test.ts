@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '#lib/i18n/locale.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import {
+	glChartOptions,
 	buildErpPayload,
 	buildErpSecretUpdate,
 	buildErpTestPayload,
@@ -952,5 +953,26 @@ describe('oauthScopeGapKeys', () => {
 				expect(messages[key], `${locale}: ${key}`).toContain('{erp}');
 			}
 		}
+	});
+});
+
+describe('glChartOptions (the discount credit account picker, decisions §575)', () => {
+	it('lists the chart by code with its name', () => {
+		const chart = [
+			{ code: '4900', name: 'Discounts received' },
+			{ code: '1010', name: 'Checking' }
+		];
+		expect(glChartOptions(chart, '')).toEqual([
+			{ code: '1010', label: '1010 — Checking' },
+			{ code: '4900', label: '4900 — Discounts received' }
+		]);
+	});
+
+	it('keeps a saved code the chart no longer lists, or before it loads', () => {
+		expect(glChartOptions(null, '4900')).toEqual([{ code: '4900', label: '4900' }]);
+		expect(glChartOptions([{ code: '1010', name: 'Checking' }], '4900').map((o) => o.code)).toEqual([
+			'1010',
+			'4900'
+		]);
 	});
 });

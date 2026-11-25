@@ -51,6 +51,12 @@ export interface ErpProviderField {
 	 * opened on an older connection does not silently switch it on save.
 	 */
 	stored_default?: string;
+	/**
+	 * Offer the value from a list the app already holds instead of free text:
+	 * `gl_account` is our synced chart, by code (the discount credit's
+	 * account, decisions §575). See `glChartOptions`.
+	 */
+	picker?: 'gl_account';
 }
 
 export interface ErpProvider {
@@ -716,4 +722,22 @@ export function callUsageLines(
 		lines.push(t(key, { erp, until: fmt.time(usage.paused_until) }));
 	}
 	return lines;
+}
+
+/**
+ * The options of a `picker: 'gl_account'` field: every account of the chart as
+ * `code — name`, sorted by code, and the stored code kept even when the chart
+ * no longer lists it (or has not loaded yet), so opening the form never
+ * silently clears a saved choice.
+ */
+export function glChartOptions(
+	chart: readonly { code: string; name: string }[] | null,
+	current: string | undefined
+): { code: string; label: string }[] {
+	const out = new Map<string, string>();
+	for (const a of chart ?? []) out.set(a.code, a.name ? `${a.code} — ${a.name}` : a.code);
+	if (current && !out.has(current)) out.set(current, current);
+	return [...out.entries()]
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([code, label]) => ({ code, label }));
 }
