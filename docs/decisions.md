@@ -27154,3 +27154,38 @@ but would re-open a resolved one every 15 minutes.
 not re-raised after a resolve or dismiss until the status changes away and
 back. `tests/test_invoice_warning_catalog.py` now counts the sweep (and
 `erp_status_report.py`, which the §528 move left out) as ERP producers.
+
+## 534. The timeline gates only the Activity list on its labels; prose spells a period's year (§529 / §531 refinements, round 44)
+
+**Problem.** §529 held the whole audit log back until the `audit` label slice
+landed, which also delayed the ERP status panel, built from the same rows and
+using no audit labels. Its `data-ready` sat on an element that mounted only
+once rows existed, so it read `true` on first render and an invoice with no
+activity gave no signal at all. Separately, §531's `formatPeriod` ("Jun 26")
+was also used in sentences and accessible names, where it reads as the 26th
+of June.
+
+**Decision.** `InvoiceModal.svelte` stores the rows the moment the fetch
+returns and tracks fetch-settled, fetch-failed and labels-ready separately.
+`invoiceTimelineActions.ts::activityTimelineView` (replacing
+`loadLabelledTimeline`) decides the Activity list's state: `loading` until the
+slice has landed, whatever the fetch did, which keeps §529's guarantee; then
+rows (kept through a refetch), else loading, a failed load with Retry, or an
+empty state. The `.activity-section` is always mounted and its `data-ready` is
+fetch-settled AND labels-ready with no fetch in flight. A period in prose, an
+`aria-label` or an SVG `<title>` goes through `utils/time.ts::formatPeriodLong`
+(`formatMonth` for a month key, a full date for a day/week key); dense axis,
+bar-row and table labels keep `formatPeriod`.
+
+**Guard.** `invoiceTimelineActions.test.ts` pins the four states and that no
+row is drawn before the labels. `tests-e2e/invoices/detail.spec.ts` creates an
+invoice (its `invoice.created` row has no invoice-voice override, so only the
+slice labels it), holds the slice's module until the audit-log response is
+in, asserts the list is loading and not ready meanwhile, then that it renders
+labelled with no raw token ever in the DOM. `time.test.ts` pins
+`formatPeriodLong`.
+
+**Rejected.** *Keeping `loadLabelledTimeline` and loading the ERP panel's rows
+separately*: two fetches of one endpoint for one modal. *Adding the apostrophe
+back for prose ("Jun ’26")*: §531 already rejected producing it; the full year
+is what a reader expects in a sentence.
