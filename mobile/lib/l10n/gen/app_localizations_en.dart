@@ -4059,6 +4059,11 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'The card ending $lastFour was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

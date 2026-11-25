@@ -4083,6 +4083,11 @@ class AppLocalizationsPt extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'O cartão com final $lastFour foi cobrado depois de cancelado, então esta fatura pode ter sido paga duas vezes. Confira a cobrança com o provedor do cartão e os outros pagamentos desta fatura e recupere o valor duplicado — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,
@@ -9190,6 +9195,11 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
     String paymentId,
   ) {
     return 'O pagamento $paymentId foi cancelado, mas uma tentativa anterior de envio foi interrompida depois de talvez já ter chegado ao processador, então o dinheiro pode ou não ter saído. Confirme com o processador e anule ou pague de novo — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'O cartão com final $lastFour foi cobrado depois de cancelado, então esta fatura pode ter sido paga duas vezes. Confira a cobrança com o provedor do cartão e os outros pagamentos desta fatura e recupere o valor duplicado — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
   }
 
   @override

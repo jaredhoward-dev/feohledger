@@ -319,21 +319,163 @@ async def test_a_clearing_after_the_hold_lapsed_still_settles(realdb):
     assert row.details["from"] == "active"
 
 
-async def test_a_run_may_reuse_a_card_whose_authorization_lapsed(realdb):
-    """The reissue side: a run re-executing the payable reuses the live card
-    unless it is spent. Charged it is refused (`card_already_charged`); after
-    the hold lapses it is unspent again and accepted."""
+async def test_a_run_refuses_a_card_whose_authorization_lapsed(realdb):
+    """The reissue side (decisions §549): a run re-executing the payable reuses
+    the live card unless it is spent. Charged it is refused
+    (`card_already_charged`); after the hold lapses it reads unspent, but a
+    single-use card was closed at the provider by that authorization, so it is
+    refused as `card_authorized_before` — from the durable
+    `first_authorized_at`, which the lapse does not clear."""
     from app.services.card_issuance import card_settlement_block
 
     card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
+    assert (await _card(realdb, card_id)).first_authorized_at is None
+    assert card_settlement_block(await _card(realdb, card_id), Decimal("100.00")) is None
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
         assert (
             await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
             == 204
         )
+        first = (await _card(realdb, card_id)).first_authorized_at
+        assert first is not None
         assert card_settlement_block(await _card(realdb, card_id), Decimal("100.00")) == (
             "card_already_charged"
         )
         assert await _post(realdb, "nium", _body("nium", token, "expiry")) == 204
+        # A second authorization keeps the FIRST moment.
+        assert (
+            await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
+            == 204
+        )
+        assert await _post(realdb, "nium", _body("nium", token, "reversal")) == 204
 
-    assert card_settlement_block(await _card(realdb, card_id), Decimal("100.00")) is None
+    card = await _card(realdb, card_id)
+    assert card.status == "active" and card.charged_at is None
+    assert card.first_authorized_at == first
+    assert card_settlement_block(card, Decimal("100.00")) == "card_authorized_before"
+
+
+async def _cancel(realdb, card_id) -> None:
+    """The card as a payment void leaves it: cancelled at the provider and here
+    (`test_payment_void_card_retry` drives the void itself)."""
+    async with realdb.sessionmaker(TENANT)() as s:
+        await s.execute(
+            VirtualCard.__table__.update()
+            .where(VirtualCard.id == card_id)
+            .values(status="cancelled")
+        )
+        await s.commit()
+
+
+async def _reconciliation_flags(realdb, card_id):
+    from app.models.exception import Exception as APException
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+        return list(
+            (
+                await s.execute(
+                    select(APException).where(
+                        APException.invoice_id == card.invoice_id,
+                        APException.exception_type == "payment_reconciliation",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.parametrize("provider", ["lithic", "nium", "mock"])
+async def test_a_clearing_on_a_cancelled_card_is_flagged_never_dropped(realdb, provider):
+    """Decisions §549: the hold lapsed, AP voided (card cancelled, invoice back
+    in the pool), another rail may have paid it, and the merchant's force post
+    on the old card clears. Before, no branch matched and the event vanished.
+    Now: the card stays cancelled with no spend, nothing is written onto the
+    payment and no sync runs, a `card.settled_after_cancel` row records the
+    amount (string Decimal, last four only) and ONE payment-blocking
+    `payment_reconciliation` flag stops the next run, however often it clears."""
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
+
+    card_id, pay_id, token = await _leg_with_card(realdb, provider)
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert (
+            await _post(realdb, provider, _body(provider, token, "authorization", amount="100.00"))
+            == 204
+        )
+        assert await _post(realdb, provider, _body(provider, token, "expiry")) == 204
+        await _cancel(realdb, card_id)
+        assert (
+            await _post(realdb, provider, _body(provider, token, "settlement", amount="100.00"))
+            == 204
+        )
+        # A second clearing (another delivery id) does not pile up flags.
+        assert (
+            await _post(realdb, provider, _body(provider, token, "settlement", amount="100.00"))
+            == 204
+        )
+    dispatched.assert_not_awaited()
+
+    card = await _card(realdb, card_id)
+    assert card.status == "cancelled" and card.amount_charged is None
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None and state == "in_flight"
+    async with realdb.sessionmaker(TENANT)() as s:
+        rebates = (
+            (await s.execute(select(CardRebate).where(CardRebate.virtual_card_id == card_id)))
+            .scalars()
+            .all()
+        )
+    assert rebates == []
+    assert await _audits(realdb, card_id, "card.settled") == []
+
+    rows = await _audits(realdb, card_id, "card.settled_after_cancel")
+    assert len(rows) == 2
+    details = rows[0].details
+    assert details["settled_amount"] == "100.00"  # string Decimal, never float
+    assert details["status"] == "cancelled" and details["last_four"] == card.last_four
+    assert token not in json.dumps(details)
+
+    (flag,) = await _reconciliation_flags(realdb, card_id)
+    assert "payment_reconciliation" in PAYMENT_BLOCKING_EXCEPTION_TYPES
+    assert flag.status == "open" and flag.raised_by_user_id is None
+    assert flag.description_code == "exception.card_settled_after_cancel"
+    assert flag.description_params == {"lastFour": card.last_four or "????"}
+    assert flag.erp_report["kind"] == "card_settled_after_cancel"
+    assert flag.erp_report["settled_amount"] == "100.00"
+    assert token not in json.dumps(flag.erp_report)
+
+
+@pytest.mark.parametrize(
+    "event_type", ["dispute_transaction.created", "three_ds_authentication.created"]
+)
+async def test_a_signed_lithic_event_that_is_no_card_stage_changes_nothing(realdb, event_type):
+    """Decisions §549: these carry a `card_token` and words the old substring
+    match read as a settlement ("transaction") or an authorization ("auth").
+    Signed and on an `active` card, they change nothing."""
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic")
+    body = json.dumps(
+        {
+            "type": event_type,
+            "event_id": str(uuid.uuid4()),
+            "token": f"obj_{token}",
+            "card_token": token,
+            "status": "SETTLED",
+            "amount": 10000,
+        }
+    ).encode("utf-8")
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post(realdb, "lithic", body) == 204
+    dispatched.assert_not_awaited()
+
+    card = await _card(realdb, card_id)
+    assert card.status == "active" and card.amount_charged is None
+    assert card.first_authorized_at is None
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None and state == "in_flight"
+    for action in ("card.charged", "card.settled", "card.authorization_lapsed"):
+        assert await _audits(realdb, card_id, action) == []

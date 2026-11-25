@@ -3890,6 +3890,11 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return '末尾 $lastFour のカードが取消後に請求されたため、この請求書は二重に支払われた可能性があります。カード発行会社でその請求を確認し、この請求書の他の支払いと照合して重複分を回収してください。解決するまで、この請求書は新しい支払実行の対象外です。';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

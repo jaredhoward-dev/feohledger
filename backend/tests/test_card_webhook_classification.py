@@ -4,7 +4,9 @@ Two bugs the pure helpers in `app.api.cards` close:
 
 1. A naive substring match (`"auth" in event_type`) treated a *declined* or
    *reversed* authorization as a real charge — flipping the card to `charged`
-   on money that never moved and minting a rebate on it.
+   on money that never moved and minting a rebate on it. Since decisions §549
+   every provider's names are read from an explicit map; anything unlisted is
+   no stage at all.
 
 2. Lithic webhook amounts are MINOR units (cents); Nium are MAJOR units. The
    handler divided BOTH by 100, recording 1/100th of every Nium charge.
@@ -16,59 +18,130 @@ from decimal import Decimal
 
 import pytest
 
-from app.api.cards import _classify_card_event, _normalize_charge_amount
+# ── Event classification: explicit per-provider maps (decisions §549) ──
+from app.api.cards import (  # noqa: E402
+    _card_event_stage,
+    _classify_card_event,
+    _classify_card_lapse,
+    _lithic_event_type,
+    _normalize_charge_amount,
+)
 
-# ── Event classification ──────────────────────────────────────────────
+_LITHIC_STAGES = {
+    "PENDING": "authorization",
+    "SETTLED": "settlement",
+    "VOIDED": "authorization.reversal",
+    "EXPIRED": "authorization.expired",
+    "DECLINED": "authorization.declined",
+}
+
+
+def _lithic_stage(body: dict) -> str:
+    return _card_event_stage("lithic", _lithic_event_type(body))
+
+
+@pytest.mark.parametrize(("status", "stage"), list(_LITHIC_STAGES.items()))
+def test_each_lithic_transaction_status_maps_to_its_stage(status, stage):
+    assert _lithic_stage({"type": "card_transaction.updated", "status": status}) == stage
 
 
 @pytest.mark.parametrize(
     "event_type",
     [
+        # Every one carries words the old substring match read as a stage.
+        "dispute_transaction.created",
+        "dispute_transaction.updated",
+        "card_transaction.enhanced_data.created",
+        "card_transaction.enhanced_data.updated",
+        "three_ds_authentication.created",
+        "three_ds_authentication.updated",
+        "card_authorization.challenge",
+        "settlement_report.updated",
+        "book_transfer_transaction.created",
+        "payment_transaction.updated",
+        # Our own names are not Lithic's: only `card_transaction.updated` is.
         "authorization",
-        "authorization.created",
-        "card.authorization",
-        "auth.approved",
+        "transaction.settled",
+        "",
     ],
 )
-def test_genuine_authorizations_classify_as_charge(event_type):
-    is_auth, is_settled = _classify_card_event(event_type)
-    assert is_auth is True
-    assert is_settled is False
-
-
-@pytest.mark.parametrize(
-    "event_type",
-    [
-        "authorization.decline",
-        "authorization.declined",
-        "authorization.reversal",
-        "authorization.reversed",
-        "transaction.voided",
-        "transaction.refund",
-        "transaction.return",
-        "card.cancelled",
-        "authorization.expired",
-    ],
-)
-def test_declines_and_reversals_are_neither_charge_nor_settlement(event_type):
-    # The core fix: a declined/reversed/voided event must NOT charge the card.
-    is_auth, is_settled = _classify_card_event(event_type)
-    assert is_auth is False, f"{event_type!r} must not be treated as a charge"
-    assert is_settled is False, f"{event_type!r} must not be treated as a settlement"
-
-
-@pytest.mark.parametrize(
-    "event_type",
-    ["transaction", "transaction.settled", "settlement.completed"],
-)
-def test_settlements_classify_as_settled(event_type):
-    is_auth, is_settled = _classify_card_event(event_type)
-    assert is_settled is True
-
-
-def test_empty_event_type_is_inert():
+def test_other_lithic_event_types_are_no_stage(event_type):
+    # Even with a status a card transaction would carry.
+    assert _lithic_stage({"type": event_type, "status": "SETTLED"}) == ""
     assert _classify_card_event("") == (False, False)
-    assert _classify_card_event(None) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("name", "stage"),
+    [
+        ("CARD_POS_APPROVED_WEBHOOK", "authorization"),
+        ("CARD_SETTLEMENT_DEBIT_WEBHOOK", "settlement"),
+        ("CARD_TRANSACTION_REVERSAL_WEBHOOK", "authorization.reversal"),
+        ("CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK", "authorization.reversal"),
+        ("CARD_INSUFFICIENT_FUNDS_DECLINED_WEBHOOK", "authorization.declined"),
+        ("CARD_WRONG_EXPIRY_WEBHOOK", "authorization.declined"),
+        # The `eventType` names this handler has always read.
+        ("authorization.approved", "authorization"),
+        ("transaction.settled", "settlement"),
+        ("authorization.reversal", "authorization.reversal"),
+        ("authorization.expired", "authorization.expired"),
+        ("authorization.declined", "authorization.declined"),
+    ],
+)
+def test_each_known_nium_name_maps_to_its_stage(name, stage):
+    assert _card_event_stage("nium", name) == stage
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Post-settlement money coming back: a refund flow, never a stage.
+        "CARD_SETTLEMENT_CREDIT_WEBHOOK",
+        "CARD_SETTLEMENT_REVERSAL_WEBHOOK",
+        "CARD_REFUND_APPROVAL_WEBHOOK",
+        "CARD_3DS_OTP_WEBHOOK",
+        "CARD_ADD_CARD_WEBHOOK",
+        "transaction",
+        "settlement.completed",
+        "transaction.refund",
+        "chargeback.created",
+        "",
+        None,
+    ],
+)
+def test_unlisted_nium_names_are_no_stage(name):
+    assert _card_event_stage("nium", name) == ""
+
+
+def test_each_mock_simulator_event_maps_to_its_stage():
+    from app.services.card_adapters.mock_adapter import (
+        MOCK_EVENT_AUTHORIZATION,
+        MOCK_EVENT_DECLINE,
+        MOCK_EVENT_EXPIRY,
+        MOCK_EVENT_REVERSAL,
+        MOCK_EVENT_SETTLEMENT,
+    )
+
+    assert _card_event_stage("mock", MOCK_EVENT_AUTHORIZATION) == "authorization"
+    assert _card_event_stage("mock", MOCK_EVENT_SETTLEMENT) == "settlement"
+    assert _card_event_stage("mock", MOCK_EVENT_REVERSAL) == "authorization.reversal"
+    assert _card_event_stage("mock", MOCK_EVENT_EXPIRY) == "authorization.expired"
+    assert _card_event_stage("mock", MOCK_EVENT_DECLINE) == "authorization.declined"
+    assert _card_event_stage("mock", "transaction.settled") == ""
+
+
+def test_an_unknown_provider_has_no_stages():
+    assert _card_event_stage("stripe", "authorization") == ""
+
+
+def test_stages_classify_exactly():
+    assert _classify_card_event("authorization") == (True, False)
+    assert _classify_card_event("settlement") == (False, True)
+    for stage in ("authorization.reversal", "authorization.expired", "authorization.declined"):
+        assert _classify_card_event(stage) == (False, False)
+    # A raw provider name is not a stage: no substring reading survives.
+    for raw in ("card_transaction.updated", "transaction.settled", "auth.approved", ""):
+        assert _classify_card_event(raw) == (False, False)
 
 
 # ── Amount normalization (provider unit semantics) ────────────────────
@@ -107,79 +180,34 @@ def test_normalized_amount_is_exact_decimal():
 
 
 @pytest.mark.parametrize(
-    ("event_type", "lapse"),
+    ("stage", "lapse"),
     [
         ("authorization.reversal", "reversal"),
-        ("authorization.reversed", "reversal"),
-        ("transaction.voided", "reversal"),
-        ("CARD_TRANSACTION_REVERSAL_WEBHOOK", "reversal"),  # Nium's template
         ("authorization.expired", "expiry"),
-        ("AUTHORIZATION_EXPIRY", "expiry"),
         ("authorization.declined", "decline"),
-        ("authorization.decline", "decline"),
     ],
 )
-def test_a_lapse_is_classified_by_kind(event_type, lapse):
-    from app.api.cards import _classify_card_lapse
-
-    assert _classify_card_lapse(event_type) == lapse
+def test_a_lapse_is_classified_by_kind(stage, lapse):
+    assert _classify_card_lapse(stage) == lapse
     # And it is never a charge or a settlement.
-    assert _classify_card_event(event_type) == (False, False)
+    assert _classify_card_event(stage) == (False, False)
 
 
 @pytest.mark.parametrize(
-    "event_type",
-    [
-        # Post-settlement: a refund / chargeback flow, never an un-charge.
-        "CARD_SETTLEMENT_REVERSAL_WEBHOOK",
-        "settlement.reversal",
-        "transaction.refund",
-        "transaction.return",
-        "chargeback.created",
-        "card.cancelled",
-        "authorization",
-        "settlement",
-        "",
-        None,
-    ],
+    "stage",
+    ["authorization", "settlement", "", "transaction.voided", "CARD_TRANSACTION_REVERSAL_WEBHOOK"],
 )
-def test_everything_else_is_not_a_lapse(event_type):
-    from app.api.cards import _classify_card_lapse
+def test_everything_else_is_not_a_lapse(stage):
+    # A raw provider name reaches the lapse reader only through its map.
+    assert _classify_card_lapse(stage) is None
 
-    assert _classify_card_lapse(event_type) is None
 
-
-@pytest.mark.parametrize(
-    ("status", "event_type"),
-    [
-        ("PENDING", "authorization"),
-        ("SETTLED", "settlement"),
-        ("VOIDED", "authorization.reversal"),
-        ("EXPIRED", "authorization.expired"),
-        ("DECLINED", "authorization.declined"),
-        ("pending", "authorization"),
-        ("BOUNCED", ""),
-        (None, ""),
-    ],
-)
-def test_lithic_transaction_updates_are_read_by_status(status, event_type):
-    """`card_transaction.updated` names no outcome; its `status` does. An
-    unknown status is inert — never the event name, which reads as a
-    settlement by substring."""
-    from app.api.cards import _lithic_event_type
-
-    body = {"type": "card_transaction.updated", "status": status}
-    assert _lithic_event_type(body) == event_type
-    assert _classify_card_event(_lithic_event_type({"type": "card_transaction.updated"})) == (
-        False,
-        False,
+def test_lithic_unknown_status_is_inert():
+    assert _lithic_event_type({"type": "card_transaction.updated", "status": "BOUNCED"}) == ""
+    assert _lithic_event_type({"type": "card_transaction.updated"}) == ""
+    assert _lithic_event_type({"type": "card_transaction.updated", "status": "pending"}) == (
+        "authorization"
     )
-
-
-def test_other_lithic_events_keep_their_name():
-    from app.api.cards import _lithic_event_type
-
-    assert _lithic_event_type({"type": "authorization"}) == "authorization"
     assert _lithic_event_type({}) == ""
 
 

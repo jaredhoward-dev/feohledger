@@ -4093,6 +4093,11 @@ class AppLocalizationsFr extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'La carte se terminant par $lastFour a été débitée après son annulation ; cette facture a donc pu être payée deux fois. Vérifiez le débit auprès du fournisseur de la carte et les autres paiements de cette facture, puis récupérez le doublon : cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

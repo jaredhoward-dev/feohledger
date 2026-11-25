@@ -53,6 +53,7 @@ export const messages = {
 	'audit.action.card.charged': "Tarjeta cargada",
 	'audit.action.card.authorization_lapsed': "Autorización de tarjeta caducada",
 	'audit.action.card.reversal_after_settlement': "Reversión en una tarjeta liquidada",
+	'audit.action.card.settled_after_cancel': "Tarjeta cobrada después de cancelarse",
 	'audit.action.card.details_viewed': "Datos de tarjeta consultados",
 	'audit.action.card.generated': "Tarjeta virtual emitida",
 	'audit.action.card.reused': "Tarjeta virtual reutilizada",

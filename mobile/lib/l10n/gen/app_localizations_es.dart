@@ -4084,6 +4084,11 @@ class AppLocalizationsEs extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'La tarjeta terminada en $lastFour recibió un cargo después de cancelarse, así que esta factura puede haberse pagado dos veces. Revise el cargo con el proveedor de la tarjeta y los demás pagos de esta factura, y recupere el duplicado: esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

@@ -93,7 +93,7 @@ Card Auto-Expires                (single-use, no further charges possible)
 | `created` | Card generated, not yet sent to vendor |
 | `sent` | Card details sent to vendor (email or portal) |
 | `active` | Vendor has the card, waiting for charge |
-| `charged` | Vendor charged the card (an authorization: a hold, not money moved); a reversal or expiry returns it to `active` (decisions §544) |
+| `charged` | Vendor charged the card (an authorization: a hold, not money moved); a reversal or expiry returns it to `active` (decisions §544), with `first_authorized_at` kept so no re-run reuses it (§549) |
 | `completed` | Charge settled, payment confirmed |
 | `expired` | Card expired without being charged (auto-expire after N days) |
 | `cancelled` | Card cancelled before use — manually, by a payment void, or because its vendor stopped being payable |
@@ -737,6 +737,7 @@ float.
 | `card.charged` | authorization webhook applies a charge | `last_four`, `from`, `to`, `amount_charged` (string Decimal) |
 | `card.authorization_lapsed` | a reversal / expiry webhook releases a `charged` card's hold (decisions §544) | `last_four`, `from` (`charged`), `to` (`active`), `lapse` (`reversal` \| `expiry`), `released_amount` (string Decimal or null) |
 | `card.reversal_after_settlement` | a reversal / expiry webhook arrives for a `completed` card — left untouched (refund / chargeback territory) | `last_four`, `status`, `lapse` |
+| `card.settled_after_cancel` | a settlement webhook arrives for a `cancelled` card — the card is left cancelled and a payment-blocking `payment_reconciliation` exception is opened on its invoice (decisions §549) | `last_four`, `status`, `settled_amount` (string Decimal or null), `currency`, `invoice_id` |
 | `card.settled` | settlement webhook completes + accrues the rebate | `last_four`, `from`, `to`, `rebate_amount`, `rebate_rate`, `rebate_base` (string Decimals), `rebate_base_source` (`settled` \| `charged` \| `unknown` — which figure the rebate priced off, see § Rebate base), `rebate_created` (bool — `false` if the one-per-card unique index skipped a duplicate) |
 | `card_rebate.confirmed` | `POST /rebates/{id}/confirm` (`pending` → `confirmed`) | `amount` (string Decimal), `from`, `to` |
 | `card_rebate.paid_out` | `POST /rebates/{id}/mark-paid` (`confirmed` → `paid_out`) | `amount` (string Decimal), `from`, `to` |
@@ -1044,7 +1045,12 @@ onto a card it did **not** mint, and is deliberately separate from
   a provider card the index then refuses to persist — an orphaned spendable card.
 - `card_settlement_block` answers *"can that card be what settles this
   payment?"* — `None` if yes, else a `Payment.failure_reason`. It rejects a
-  card in `CARD_SPENT_STATUSES` (`charged`/`completed`), an expired one, one
+  card in `CARD_SPENT_STATUSES` (`charged`/`completed`), an unspent one that
+  was authorized before (`card_authorized_before`, decisions §549: its hold
+  lapsed, but a single-use card is closed at the provider by its first
+  authorization, so a payment converged onto it would wait forever; read from
+  the durable `first_authorized_at`, which a lapse never clears; retry-safe
+  once the card is cancelled), an expired one, one
   whose `amount_limit` cannot cover the payable, and — `card_limit_exceeds_payment`
   — one whose limit is LARGER than the payment. Nothing on the card webhook
   compares a charge with `Payment.amount`, so converging a payment net of a
@@ -1106,36 +1112,59 @@ with no provider, `cards.region`) drops the sealed card secrets, audited
    is still spendable (decisions §537, §543; `backend/docs/payments.md` § A run's
    card leg counts what its card was charged).
 
-**Event classification (`_classify_card_event`)** decides whether a callback
-is a charging authorization or a settlement by substring, but excludes the
-non-charging variants FIRST: a `decline` / `reversal` / `void` / `refund` /
-`return` / `cancel` / `expire` / `expiry` event is neither — no charge and no
-rebate. (A naive `"auth" in event_type` match would otherwise flip the card to
-`charged` on a *declined* `authorization.decline`.)
+**Event classification (`_card_event_stage`, decisions §549)** reads each
+provider's event name from an explicit map (`_CARD_EVENT_STAGES`) onto one of
+five stages — `authorization`, `settlement`, `authorization.reversal`,
+`authorization.expired`, `authorization.declined` — matched exactly, never by
+substring. A name the provider's map does not list is no stage: nothing
+changes and the name (only) is logged at info. Substring matching read any
+name with "transaction" in it as a settlement, and since §544 a settlement
+completes an unspent card and records spend on the run's payment, so a
+Lithic `dispute_transaction.created`, `card_transaction.enhanced_data.*` or
+`three_ds_authentication.*` delivery carrying a `card_token` could have taken
+an invoice to `paid`. `_classify_card_event` / `_classify_card_lapse` then read
+the stage exactly.
 
-**An authorization that lapses (`_classify_card_lapse`, decisions §544).** Of
-those, a reversal (`reversal` / `reversed` / `void`) or an expiry (`expire` /
-`expiry`) on a `charged` card releases the hold: the card returns to `active`
+**An authorization that lapses (`_classify_card_lapse`, decisions §544).** A
+reversal or an expiry stage on a `charged` card releases the hold: the card returns to `active`
 (`CARD_LAPSED_STATUS` — the vendor holds the card; every reader treats
 `created` / `sent` / `active` alike), `amount_charged`, `charged_at` and
 `merchant_name` are cleared, and a `card.authorization_lapsed` row is written.
 Nothing was written onto the run's card leg at the authorization (§543), so
 the leg stays `in_flight` and no payment sync is dispatched. Then a payment
-void cancels the card instead of reporting `card_already_charged`, and a
-re-run may reuse it. What does **not** release a hold:
+void cancels the card instead of reporting `card_already_charged`. A re-run
+does **not** reuse it: `first_authorized_at`, stamped by the first
+authorization and never cleared, makes `card_settlement_block` refuse it as
+`card_authorized_before` (decisions §549). What does **not** release a hold:
 
 | Event | Card | Why |
 |---|---|---|
 | decline | `charged` stays `charged` | a refused attempt; nothing ties it to the standing hold (a second try at a single-use card is declined while the first stands) |
 | partial reversal (an amount below `amount_charged`) | `charged` stays `charged` | part of the hold remains (`_is_partial_reversal`; Lithic's `VOIDED` is always whole) |
 | reversal / expiry | `completed` untouched; `card.reversal_after_settlement` audit row, logged | money moved: it is a refund or chargeback, a different flow; the rebate and the run's recorded figure stand |
-| refund / return / chargeback / a *settlement* reversal | untouched | post-settlement, not a lapse |
+| refund / return / chargeback / a *settlement* reversal | untouched | post-settlement: no provider map lists it as a stage |
 
 A settlement is accepted on a `charged` card **or an unspent one**
 (`created` / `sent` / `active`): a clearing can arrive after its authorization
 expired (a force post), and money moved. `card.settled`'s `from` records which.
 
+**A settlement on a `cancelled` card (decisions §549)** is the force post that
+arrives after AP voided the payment — reachable since §544, because a lapsed
+card is voidable, and another rail may since have paid the invoice. Lithic says
+merchants can send force-post clearings it cannot decline. The card is **not**
+completed, no rebate accrues and nothing is written onto any payment (the leg
+it belonged to is void). In the webhook's transaction the handler writes
+`card.settled_after_cancel` and opens one payment-blocking
+`payment_reconciliation` exception on the card's invoice
+(`exception.card_settled_after_cancel`, deduped by `erp_report.kind`
+`card_settled_after_cancel` through `open_erp_reconciliation_exception`, §535),
+so no further run pays the invoice until a person reconciles the card. The
+invoice row is read, not locked (the card row is held, and the void takes the
+invoice first).
+
 **Provider event names** (checked 2026-11-25):
+
+Each provider's map (`_CARD_EVENT_STAGES`):
 
 - **Lithic** sends `card_transaction.updated`, whose body is the transaction;
   its `status` names the outcome (`PENDING` → authorization, `SETTLED` →
@@ -1144,15 +1173,25 @@ expired (a force post), and money moved. `card.settled`'s `from` records which.
   <https://docs.lithic.com/docs/transactions>,
   <https://docs.lithic.com/docs/types-of-events>. The transaction `token` is
   the same on every update, so without an explicit `event_id` an update is
-  deduped on `token:STATUS` (`_lithic_event_id`).
-- **Nium** names its reversal webhook in `template`:
-  `CARD_TRANSACTION_REVERSAL_WEBHOOK`, amount in `transactionAmount` —
-  <https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>.
-  No Nium expiry or decline webhook name could be verified; an `eventType`
-  carrying those words is still classified, and anything else is inert.
-- **Mock**: `authorization.reversal` / `authorization.expired`
-  (`MOCK_EVENT_REVERSAL` / `MOCK_EVENT_EXPIRY`), sent by `pnpm simulate:card
-  --reverse` / `--expire`.
+  deduped on `token:STATUS` (`_lithic_event_id`). Every other Lithic event
+  type (disputes, 3DS, enhanced data, tokenization...) is no stage. Cards are
+  minted `SINGLE_USE`, which Lithic closes "upon first successful
+  authorization" (<https://docs.lithic.com/docs/cards>, checked 2026-11-25).
+- **Nium** names its card webhooks in `template`
+  (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events>,
+  checked 2026-11-25): `CARD_POS_APPROVED_WEBHOOK` → authorization,
+  `CARD_SETTLEMENT_DEBIT_WEBHOOK` → settlement,
+  `CARD_TRANSACTION_REVERSAL_WEBHOOK` / `CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK`
+  → reversal (amount in `transactionAmount`), and the per-reason declines
+  (`CARD_INSUFFICIENT_FUNDS_DECLINED_WEBHOOK`, `CARD_WRONG_EXPIRY_WEBHOOK`, ...)
+  → decline. `CARD_SETTLEMENT_CREDIT_WEBHOOK` / `CARD_SETTLEMENT_REVERSAL_WEBHOOK`
+  are post-settlement and not listed. No Nium expiry webhook was found. The
+  lower-case `eventType` names this handler read before (`authorization.approved`,
+  `transaction.settled`, `authorization.reversal` / `.expired` / `.declined`)
+  are not in Nium's docs but stay listed, explicitly.
+- **Mock**: `authorization`, `settlement`, `authorization.reversal`,
+  `authorization.expired`, `authorization.declined` (`MOCK_EVENT_*`), sent by
+  `pnpm simulate:card` (`--settle` / `--reverse` / `--expire`).
 
 **Amount units differ by provider (`_normalize_charge_amount`)**: Lithic sends
 charge amounts in **minor units** (cents — `150000` == `$1,500.00`), Nium in

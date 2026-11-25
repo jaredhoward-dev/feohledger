@@ -344,6 +344,11 @@ _RETRY_SAFE_FAILURE_PREFIXES = (
     # pays (`card_issuance.card_settlement_block`) — refused before anything
     # moved; a re-send after the card is cancelled mints one at the right figure.
     "card_limit_exceeds_payment",
+    # A `virtual_card` payment met an existing card that was authorized once
+    # and whose hold then lapsed (decisions §549): single-use, so closed at the
+    # provider. Refused before anything moved; once the card is cancelled the
+    # re-send mints a fresh one.
+    "card_authorized_before",
     # The live read of the invoice's ERP bill, immediately before the rail
     # (decisions §296): the ERP shows it paid / part-paid / deleted
     # (`erp_bill_not_open:<state>`, with a blocking exception that keeps

@@ -331,6 +331,8 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.payment_dispatch_interrupted_failed': 'exceptions.description.paymentDispatchInterruptedFailed',
 	// Payment {paymentId} was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.
 	'exception.payment_dispatch_interrupted_cancelled': 'exceptions.description.paymentDispatchInterruptedCancelled',
+	// The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.
+	'exception.card_settled_after_cancel': 'exceptions.description.cardSettledAfterCancel',
 	// Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
 	'exception.settlement_currency_mismatch': 'exceptions.description.settlementCurrencyMismatch',
 	// Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, MORE than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.
@@ -499,6 +501,7 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.payment_dispatch_in_doubt': { paymentId: 'text', failureCode: 'text' },
 	'exception.payment_dispatch_interrupted_failed': { paymentId: 'text' },
 	'exception.payment_dispatch_interrupted_cancelled': { paymentId: 'text' },
+	'exception.card_settled_after_cancel': { lastFour: 'text' },
 	'exception.settlement_currency_mismatch': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text' },
 	'exception.settlement_amount_over': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text', variance: 'number' },
 	'exception.settlement_amount_under': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text', variance: 'number' },

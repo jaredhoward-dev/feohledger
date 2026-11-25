@@ -1228,6 +1228,20 @@ DIRECT_EXCEPTION_SPECS: tuple[WarningSpec, ...] = (
         )
         for status, verb in (("failed", "failed"), ("cancelled", "was cancelled"))
     ),
+    # `api/cards.card_webhook`: a clearing arrived on a card already cancelled
+    # (decisions §549) — a force post after a void, while another rail may
+    # have paid the invoice. The last four say WHICH card to chase; the amount
+    # is on the `card.settled_after_cancel` audit row and the exception's
+    # `erp_report`.
+    WarningSpec(
+        EXCEPTION_PREFIX + "card_settled_after_cancel",
+        "payment_reconciliation",
+        "The card ending {lastFour} was charged after it was cancelled, so this invoice "
+        "may have been paid twice. Check the charge with the card provider and the other "
+        "payments on this invoice, and recover the duplicate — this invoice is blocked "
+        "from a new payment run until this is resolved.",
+        {"lastFour": "text"},
+    ),
     # `services/payment_settlement.discrepancy_finding`. The two sides can be
     # in different currencies (and either may be unknown), so the figures are
     # bare `number`s beside their own codes as `text` — one `currency` param

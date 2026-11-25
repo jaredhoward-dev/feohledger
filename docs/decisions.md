@@ -28576,3 +28576,115 @@ refusal write no orphan row; the marker is SQL NULL (`IS NULL`) after a
 completed void and after a refusal. `tests/test_provider_credentials.py`: the
 KMS client's timeouts and retries. `tests/test_erp_status_sync.py`: a NetSuite
 tenant with a leftover QuickBooks OAuth block is audited as `netsuite`.
+
+## 549. A clearing on a cancelled card is flagged, a once-authorized card is never reused, and card events are read from an explicit per-provider map (§544 follow-up, round 46)
+
+**Problem 1 — a settlement on a cancelled card vanished.** Since §544 a lapsed
+card returns to `active`, so AP can void its payment (the card cancelled at the
+provider, the invoice back to `approved`) and another rail can pay the invoice.
+A merchant's force post on the old card can still clear afterwards — Lithic
+says merchants "can still send force-post clearings", which it cannot decline
+(<https://docs.lithic.com/docs/cards>, checked 2026-11-25). No webhook branch
+matched a `cancelled` card, so nothing was written and the provider got a 204:
+the vendor paid twice and no record of the second payment.
+
+**Decision 1.** A settlement for a `cancelled` card
+(`_record_settlement_after_cancel`) writes a `card.settled_after_cancel` audit
+row (`last_four`, `status`, `settled_amount` as a string Decimal, `currency`,
+`invoice_id`) and opens a payment-blocking `payment_reconciliation` exception
+on the card's invoice (`exception.card_settled_after_cancel`, six web locales
+and the mobile ARBs), both in the webhook's transaction. The exception goes
+through `erp_status_sync.open_erp_reconciliation_exception`, deduped by
+`erp_report.kind` = `card_settled_after_cancel` (§535): its `erp_report` holds
+the PII-free detail (card id, amount, currency), as it does for the other
+reconciliation rows. The card is never completed, no rebate accrues and no
+spend is written onto any payment: the leg it belonged to is void, and
+recording it there would reopen what AP closed. The invoice row is read, not
+locked: the card row is held, and the void takes the invoice before the card.
+**Not done:** a warning when a void follows an `expiry` lapse (the window in
+which a force post is most likely). The flag above catches the outcome; a
+pre-void warning would need the void to read the lapse kind, which only the
+audit row holds.
+
+**Problem 2 — a once-authorized single-use card could be reused.** Lithic
+cards are minted `SINGLE_USE` (`card_adapters/lithic.py`), which Lithic closes
+"upon first successful authorization" (same page). §544 resets a lapsed card to
+`active` and clears `charged_at`, so `card_settlement_block` let a re-run
+converge a payment onto a card nobody can charge, leaving the leg `in_flight`
+forever.
+
+**Decision 2.** A new nullable `virtual_cards.first_authorized_at` (migration
+0147, tenant fan-out, idempotent, backfilled from `charged_at`), stamped by the
+webhook's first authorization and never cleared. `card_settlement_block`
+refuses a card with it set as `card_authorized_before`, after the spent check
+and before the expiry / limit checks (none of those can make it chargeable
+again). It is retry-safe (`payment_runs._RETRY_SAFE_FAILURE_PREFIXES`): once the
+card is cancelled — the void still accepts it, since it reads unspent — the
+re-send mints a fresh one. Applied to every provider: a multi-use card that had
+a hold lapse is refused too, which fails closed (cancel and re-mint) rather
+than guess per provider. The frontend run builder does not surface
+`card_*` failure reasons as coded refusals, so no locale change there.
+
+*Why a column, not the `card.authorization_lapsed` audit row or `charged_at`.*
+The audit row ships to SQS in `lambda` audit mode, so it may not be in the
+tenant database. Keeping `charged_at` on a lapse would make one column mean
+two things (currently held vs. ever held) to every reader of it.
+
+**Problem 3 — substring classification.** `_lithic_event_type` mapped only
+`card_transaction.updated`; every other Lithic type kept its name and fell to
+substring matching, where `dispute_transaction.*`,
+`card_transaction.enhanced_data.*` (contain "transaction") read as settlements
+and `three_ds_authentication.*` ("auth") as an authorization. Since §544 a
+settlement completes even an unspent card and records its spend on the run's
+payment, so a signed dispute delivery could take an invoice to `paid`. Nium's
+`template` fallback had the same exposure.
+
+**Decision 3.** `_CARD_EVENT_STAGES` maps each provider's known names, exactly
+(case-folded), onto five stages: `authorization`, `settlement`,
+`authorization.reversal`, `authorization.expired`, `authorization.declined`.
+`_card_event_stage(provider, name)` returns `""` for anything unlisted, which
+changes nothing and is logged at info with the event name only;
+`_classify_card_event` / `_classify_card_lapse` read the stage exactly.
+Sources (checked 2026-11-25):
+
+* Lithic: only `card_transaction.updated`, by `status` (§544's map); every
+  other type on <https://docs.lithic.com/docs/types-of-events> is no stage.
+* Nium (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events>,
+  templates read from <https://docs.nium.com/llms-full.txt>):
+  `CARD_POS_APPROVED_WEBHOOK` → authorization, `CARD_SETTLEMENT_DEBIT_WEBHOOK`
+  → settlement, `CARD_TRANSACTION_REVERSAL_WEBHOOK` and
+  `CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK` → reversal, the per-reason
+  declines → decline. `CARD_SETTLEMENT_CREDIT_WEBHOOK` and
+  `CARD_SETTLEMENT_REVERSAL_WEBHOOK` are money coming back after settlement and
+  stay unlisted. The lower-case `eventType` names the handler read before
+  (`authorization.approved`, `transaction.settled`, `authorization.reversal` /
+  `.expired` / `.declined`) are not in Nium's docs; they stay listed, by name,
+  so an integration sending them is not silently dropped. **Not verified:**
+  whether Nium's approved-authorization webhook for a card-not-present
+  purchase is `CARD_POS_APPROVED_WEBHOOK` (the docs show POS and ATM only), and
+  any Nium expiry webhook.
+* Mock: the simulator's `MOCK_EVENT_*` names (a `MOCK_EVENT_DECLINE` added).
+
+`_LITHIC_TRANSACTION_EVENT` was renamed `_LITHIC_CARD_TXN_EVENT`: the
+frontend's audit-action roster harvests any constant whose name contains
+"ACTION", and read Lithic's event name as an unlabelled audit action.
+
+**Tracked, not fixed** (`docs/followups.md` § Surfaced by round 46): a lapse
+delivered before its authorization is inert and the late authorization leaves
+the card `charged` (fails closed); further clearings on an already-`completed`
+card (incremental captures) are ignored.
+
+**Guard.** `tests/test_card_authorization_lapse.py` (real signed webhook): a
+clearing on a cancelled card, per provider, leaves the card cancelled with no
+spend, rebate, payment figure or sync, writes `card.settled_after_cancel` per
+delivery, and opens exactly one flag with the catalogue code; a re-run refuses
+a lapsed card as `card_authorized_before`, `first_authorized_at` surviving a
+second authorization and lapse; a signed Lithic `dispute_transaction.created`
+and `three_ds_authentication.created` with a `card_token` change nothing on an
+`active` card. `tests/test_card_webhook_classification.py`: each known name
+per provider maps to its stage; Lithic's other types, unlisted Nium names and
+raw names are no stage. `tests/test_card_settlement_expiry.py`: the new reason
+in the closed vocabulary, its precedence, and that it is retry-safe.
+`tests/test_payment_void_card_retry.py` (unchanged) still voids a lapsed card.
+`tests/test_migration_0147_card_first_authorized_at.py`: add, backfill, no
+invention, idempotent, reversible, control plane untouched.
