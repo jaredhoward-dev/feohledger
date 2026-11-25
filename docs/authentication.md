@@ -342,7 +342,7 @@ included, is a `422` coded `legal_acceptance_required`.
 Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
 trail (`{versions, source, ip}`).
 
-**The re-prompt: the web and mobile apps ask; the supplier portal asks only at set-password; there is no server-side gate.**
+**The re-prompt: the web app, the mobile app and the supplier portal ask; there is no server-side gate.**
 `GET /api/auth/me` returns `legal_acceptance_required` (the user has not
 accepted the versions in force) and `POST /api/auth/legal-acceptance` records
 it (source `reprompt`; 10/min per account; audited only on a first
@@ -363,11 +363,8 @@ password account.
 Still **not gated**: the flag is advisory server-side. No gate refuses an
 unaccepted user, so an API caller is never asked, and neither is a user who
 opens neither the web nor the mobile app. Supplier-portal users are asked for
-the Privacy Policy only when they redeem a set-password link (below): a portal
-user who set a password before that, or any portal user after a Privacy Policy
-bump, is not re-prompted, because the portal has no re-prompt after sign-in
-yet. The server gate waits for that portal screen on purpose: without it, a
-gate would lock those users out with no way to accept (the re-prompt entry in
+the Privacy Policy at set-password and after sign-in (below, decisions §500).
+The server-side gate is the one piece left (the re-prompt entry in
 `docs/followups.md`).
 
 **The mobile app asks** (decisions §498). When `/me` says
@@ -411,8 +408,27 @@ table `vendor_user_legal_acceptances` (migration 0144: vendor-user id,
 document, version, time, source), written in the redemption's transaction;
 each one writes `portal.legal.accepted` `{versions, source, ip}` to the
 tenant's auth trail. A forgot-password reset of a portal account that already
-has a password is not held up, and portal users who set a password before
-this are not asked (no portal re-prompt yet, `docs/followups.md`). The rows
+has a password is not held up at the link; it is asked after sign-in instead.
+
+**The portal asks after sign-in too** (decisions §500). `GET
+/api/portal/auth/me` returns `legal_acceptance_required` while the vendor user
+has not acknowledged the Privacy Policy version in force (`services/
+portal_legal_acceptance.missing_documents`): a supplier who set a password
+before §499, or anyone after a version bump. While it is true the portal
+layout draws the same `layout/LegalAcceptStep` as the web app, with
+`documents="privacy"` (Privacy Policy copy and box, the tenant's white-label
+mark), in place of the portal shell, after the forced password change; *Log
+out* is the only other way on. `portalAuth.acknowledgeLegal()` posts the
+version the build carries (`ACKNOWLEDGED_PORTAL_VERSIONS`) to `POST
+/api/portal/auth/legal-acknowledgement`, which records it for the vendor user
+the portal JWT names (source `reprompt`; 10/min per vendor user; tenant DB
+only), audits a first acknowledgement as `portal.legal.accepted`, and answers
+with the profile, so the page the supplier asked for renders. A stale build's
+version is the coded 422 `privacy_acknowledgement_required` (the box offers a
+reload); a 429 is stated in the step's alert. The seed records the
+acknowledgement for every seeded portal user (source `seed`), on the
+already-seeded path too, so the demo supplier and the portal e2e specs do not
+meet the step. The rows
 are kept through a DSAR erasure of the vendor user and carried by its export
 (with the `portal.legal.accepted` audit row and its IP, which the erasure
 leaves in place); a workspace deletion drops them with the tenant database.

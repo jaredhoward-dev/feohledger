@@ -667,8 +667,9 @@ names its bill in the ERP).
 
 The emailed single-use set-password token is the credential
 (`docs/authentication.md` § Terms and Privacy acceptance). A supplier
-acknowledges the **Privacy Policy only** — never the Terms — and only here, at
-set-password (decisions §499); there is no portal re-prompt after sign-in.
+acknowledges the **Privacy Policy only** — never the Terms — here, at
+set-password (decisions §499), and after sign-in when `/api/portal/auth/me`
+says `legal_acceptance_required` (below, decisions §500).
 
 | Method | Path                                    | Description |
 |--------|-----------------------------------------|-------------|
@@ -683,6 +684,8 @@ caller's own `vendor_id`; cross-vendor IDs return 404. See
 
 | Method | Path                                    | Description |
 |--------|-----------------------------------------|-------------|
+| `GET`  | `/api/portal/auth/me`                   | The signed-in vendor user + vendor summary; `legal_acceptance_required` is true while the Privacy Policy version in force is unacknowledged (decisions §500) |
+| `POST` | `/api/portal/auth/legal-acknowledgement` | `{accepted_privacy_version}` — records the acknowledgement for the JWT's vendor user (source `reprompt`) and answers with the profile; `422` `privacy_acknowledgement_required` for any other version; 10/min per vendor user; audited `portal.legal.accepted` on a first acknowledgement |
 | `GET`  | `/api/portal/invoices`                  | Vendor-scoped invoice list |
 | `GET`  | `/api/portal/invoices/{id}`             | Get one (404 cross-vendor) |
 | `GET`  | `/api/portal/invoices/{id}/einvoice`    | UBL 2.1 XML download (vendor-scoped; 404 cross-vendor; soft tax warnings logged only, never 422'd to the supplier). |
