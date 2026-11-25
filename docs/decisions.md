@@ -27391,3 +27391,82 @@ a voided-back `approved` invoice whose ERP shows `paid` is recorded and
 leaves the run nothing to pay; with a live card it is refused behind a
 blocking row; an `approved` invoice with no document is never read. The three
 in-flight hold tests assert the new code.
+
+## 536. NetSuite's bills sync back: a keyset poll, matched by our marker, written back at the exact amount (§295 / §386 follow-up, round 45)
+
+**Context.** §295 status sync-back covered QuickBooks and, since §386, Xero.
+Every other ERP closed a push at `done`, so a bill paid there never reached
+FeohLedger (`docs/followups.md`, "A bill paid in an ERP other than QuickBooks
+or Xero"). The round extended it to one more adapter.
+
+**Why NetSuite, not Business Central.** NetSuite was closer: its adapter
+already reads what settled a bill (`_paid_or_settled`, §303, cash versus
+credit from `NextTransactionLineLink`), its bills carry our marker (the push's
+`externalId` is the correlation id) and its records take an `externalId` that
+NetSuite keeps unique per type, which is the write-back's idempotency key for
+free. Business Central's API v2.0 pays a bill only through a vendor payment
+journal that must then be posted, and its `purchaseInvoice` states no open
+amount we could check a write-back against. fake-erp already modelled
+NetSuite's records and SuiteQL, so the new calls extend it.
+
+**Decision.** `NetSuiteAdapter.supports_status_sync = True`; with
+`FEOH_ERP_STATUS_SYNC_ENABLED` on, a confirmed NetSuite push lands at
+`posted_in_erp` and §296 / §309 / §386 apply unchanged. Detail:
+`backend/docs/erp-integration.md` § NetSuite status sync-back.
+
+- **Read.** A bill is matched by its marker (`bills_match_by_reference`
+  False). Open = `total` − every applied transaction, and it must agree with
+  NetSuite's status; anything else (Pending Approval, Rejected, mixed signs,
+  an unreadable link) is `unknown`, so the dispatch check holds. Cash is a
+  `VendPymt`; ours carries `externalId feohledger-payment-<id>`; any other
+  applied type is credit (§303). `paid_amount` is the exact cash a person
+  applied, only for a bill paid wholly by them in cash, in the currency
+  NetSuite's `currency.symbol` states (the bill's `refName` is a name, never
+  taken for a code). The rail is not read (not stated: 1099-reportable).
+- **Changes.** No REST change feed, so a SuiteQL keyset poll on
+  `lastmodifieddate` of bills and of transactions applied to bills, the
+  window widened by a day for the account's unknown time zone. A failed read
+  fails the pass (mark unmoved), a truncated one is a full reconciliation.
+- **Write-back.** A `vendorPayment` at the exact Decimal that reached the
+  supplier, never above what is open, refused before any write on no account,
+  a gone / voided / unapproved bill or a currency that differs or is unstated.
+  Idempotent by `eid:` lookup before the create, NetSuite's externalId
+  uniqueness against a race, and a second lookup when a create is refused. No
+  `disc` is sent: a discount stays open and is flagged, as for QuickBooks and
+  Xero. `void_payment` deletes ours (REST has no void).
+- **Sweep tenant selection** (this lane owns `erp_status_sync`). A
+  credentials-based ERP has no `settings.erp.oauth` block, so the sweep now
+  selects by the OAuth provider OR `settings.erp.type`, then keeps a tenant
+  only when `dispatcher.resolve_adapter_key` names a status-sync adapter. Its
+  mark lives in `settings.erp_status_sync = {realm, through}`, written under
+  the org row lock only while the stored configuration still names that
+  realm, and read only for it, so pointing the configuration at another
+  account starts with a full reconciliation. `erp-status-poll` already skips
+  any adapter with `supports_status_sync`, so it stops polling NetSuite
+  tenants with no change there (`pollable_adapter`).
+
+**Rejected.** Reading `amountremaining` from the bill: not a field we could
+verify on the REST vendorBill, while `total` and the applied links are what
+the adapter already reads. Treating a write-back someone deleted in NetSuite
+as Xero does (`bill_payment_voided`): REST lists no deleted records, so a
+deleted write-back is not findable and a retry would post again. Accepted
+residual, narrow (a write-back is retried only until it first succeeds).
+
+**Not verified (#654).** The vendor docs could not be fetched this round
+(Oracle's REST API Browser and help pages returned no usable page,
+2026-11-25), so these are this adapter's reading, encoded in fake-erp, not
+Oracle's confirmed shapes: the `vendorPayment` body (`apply.items[]` with
+`doc` / `apply` / `amount`), `GET vendorPayment/eid:` and `DELETE` on it, the
+`NextTransactionLineLink` → `transaction` join and the sign of
+`foreignamount`, `transaction.lastmodifieddate` with `TO_DATE`, and whether
+applying or deleting a payment moves a bill's `lastmodifieddate`. Each fails
+closed: an unexpected answer is an `unknown` bill, a failed pass, or a refused
+write-back, never a payment recorded or posted. Status sync stays off by
+default; turn it on for a NetSuite tenant only after a sandbox pass.
+
+**Not done.** No NetSuite webhook, the admin's on-request pass stays
+OAuth-only, and no Playwright spec under `tests-e2e/erp/` drives the
+write-back yet.
+
+Tests: `backend/tests/test_netsuite_status_sync_adapter.py`,
+`test_erp_status_sync.py` § NetSuite sweep.

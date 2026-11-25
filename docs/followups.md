@@ -1035,7 +1035,13 @@ scope (§260) — do not fold them into any of these.
       document it. **Trigger:** the first BC customer with approval workflows.
 - [ ] **(c) A bill paid in an ERP other than QuickBooks or Xero never reaches
       FeohLedger.** Status sync-back (§295) covers adapters with
-      `supports_status_sync`: QuickBooks, and Xero since §386. For every other
+      `supports_status_sync`: QuickBooks, Xero since §386, and NetSuite since
+      §536 (a SuiteQL keyset poll; its REST shapes are not yet verified
+      against an account, #654, and it has no webhook or on-request pass).
+      Business Central, Sage Accounting (and its ZA edition), Sage Intacct,
+      SYSPRO and Blackbaud remain; the sweep now selects an OAuth tenant by
+      its connection and a credentials-based one by `settings.erp.type`, so
+      each needs only its adapter. For every other
       ERP a push still closes at `done`, and `done` is terminal, so the ERP's
       later payment cannot be recorded. The webhook's `Paid` and "record
       payment made outside" both skip a `done` invoice. The adapter reads are
