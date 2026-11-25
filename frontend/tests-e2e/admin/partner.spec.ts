@@ -29,9 +29,12 @@ test.describe('/admin/partner (admin)', () => {
 		await page.goto('/admin/partner');
 		await expect(page.getByRole('heading', { name: 'Partner Admin' })).toBeVisible();
 
-		// The seed tenant administers no children, so the page resolves to the
-		// empty "not a partner" state rather than a child table.
-		await expect(page.getByTestId('partner-empty')).toBeVisible({ timeout: 10_000 });
+		// The seed tenant administers no children, so the children table settles
+		// on its empty row, worded as the "not a partner" state (decisions §501).
+		await expect(page.getByTestId('table-empty')).toHaveText(
+			/does not administer any child tenants yet/,
+			{ timeout: 10_000 }
+		);
 
 		// The backend GET confirms the same: is_partner false, no children.
 		const token = await page.evaluate(() => localStorage.getItem('auth_token'));

@@ -125,6 +125,10 @@ def _vendor_user(**overrides):
         mfa_secret=None,
         mfa_enabled=False,
         mfa_enrolled_at=None,
+        # Every profile response carries the email language (decisions §500:
+        # `_portal_me_response` is the one builder), so the fake has it as a
+        # real VendorUser row does.
+        locale=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

@@ -637,3 +637,180 @@ def test_the_settle_margin_is_minutes_not_seconds():
     from app.services.erp_adapters.merge_dev import SYNC_SETTLE_MARGIN
 
     assert SYNC_SETTLE_MARGIN >= timedelta(minutes=5)
+
+
+# ---------------------------------------------------------------------------
+# the change feed and the payment → bill read (decisions §504; Merge's
+# Accounting OpenAPI spec read 2026-11-24)
+# ---------------------------------------------------------------------------
+
+
+def _page(results: list[dict], next_cursor: str | None = None) -> MagicMock:
+    return _resp(200, {"next": next_cursor, "previous": None, "results": results})
+
+
+def _routed(pages: dict[str, list[MagicMock]]):
+    """A ``client.get`` answering each collection's pages in order."""
+    calls: list[tuple[str, dict]] = []
+
+    async def get(url, params=None, headers=None):
+        path = url.rsplit("/", 1)[-1]
+        calls.append((path, dict(params or {})))
+        return pages[path].pop(0)
+
+    return get, calls
+
+
+def _pay(pid: str, *lines, type_: str | None = "ACCOUNTS_PAYABLE") -> dict:
+    return {"id": pid, "type": type_, "applied_to_lines": list(lines)}
+
+
+def _line(bill: str, kind: str = "INVOICE") -> dict:
+    return {"related_object_id": bill, "related_object_type": kind, "applied_amount": "10.00"}
+
+
+def test_changed_bills_reads_both_feeds_across_cursors_and_dedupes():
+    since = datetime(2026, 11, 20, 9, 30, tzinfo=UTC)
+    get, calls = _routed(
+        {
+            "invoices": [
+                _page([{"id": "b1", "type": "ACCOUNTS_PAYABLE"}], next_cursor="c2"),
+                _page(
+                    [
+                        {"id": "b2", "type": "ACCOUNTS_PAYABLE", "remote_was_deleted": True},
+                        # Merge's filter let a receivable through: not a bill.
+                        {"id": "ar1", "type": "ACCOUNTS_RECEIVABLE"},
+                    ]
+                ),
+            ],
+            "payments": [
+                _page(
+                    [
+                        _pay("p1", _line("b1"), _line("b3")),
+                        _pay("p2", _line("cn1", "CREDIT_NOTE"), _line("je1", "JOURNAL_ENTRY")),
+                        _pay("p3", _line("ar2"), type_="ACCOUNTS_RECEIVABLE"),
+                        # An unexpanded line is a bare id: nothing we can type.
+                        _pay("p4", "line-id-only"),
+                    ]
+                )
+            ],
+        }
+    )
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        bills = _run(MergeDevAdapter(_ADAPTER).changed_bills(since))
+    assert bills == ["b1", "b2", "b3"]
+    first_invoices, second_invoices, payments = calls
+    assert first_invoices[1] == {
+        "modified_after": "2026-11-20T09:30:00Z",
+        "include_deleted_data": "true",
+        "page_size": "100",
+        "type": "ACCOUNTS_PAYABLE",
+    }
+    assert second_invoices[1]["cursor"] == "c2"
+    assert payments[0] == "payments"
+    assert payments[1]["expand"] == "applied_to_lines"
+    assert payments[1]["modified_after"] == "2026-11-20T09:30:00Z"
+
+
+def test_changed_bills_states_since_in_utc():
+    from datetime import timedelta, timezone
+
+    since = datetime(2026, 11, 20, 11, 30, tzinfo=timezone(timedelta(hours=2)))
+    get, calls = _routed({"invoices": [_page([])], "payments": [_page([])]})
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        assert _run(MergeDevAdapter(_ADAPTER).changed_bills(since)) == []
+    assert {c[1]["modified_after"] for c in calls} == {"2026-11-20T09:30:00Z"}
+
+
+def test_changed_bills_refuses_a_naive_since_before_any_call():
+    """A naive datetime would be read as the host's local time; refuse it
+    rather than shift the change window by the server's UTC offset."""
+    get, calls = _routed({"invoices": [_page([])], "payments": [_page([])]})
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        with pytest.raises(ValueError, match="timezone-aware"):
+            _run(MergeDevAdapter(_ADAPTER).changed_bills(datetime(2026, 11, 20, 9, 30)))
+    assert calls == []
+
+
+@pytest.mark.parametrize("failing", ["invoices", "payments"])
+@pytest.mark.parametrize("status", [401, 429, 500])
+def test_changed_bills_never_returns_part_of_a_listing(failing, status):
+    from app.services.erp_adapters.base import ErpListingIncomplete
+
+    pages = {
+        "invoices": [_page([{"id": "b1", "type": "ACCOUNTS_PAYABLE"}], next_cursor="c2")],
+        "payments": [_page([_pay("p1", _line("b2"))], next_cursor="c2")],
+    }
+    pages[failing].append(_resp(status))
+    if failing == "payments":
+        pages["invoices"].append(_page([]))
+    get, _ = _routed(pages)
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        with pytest.raises(ErpListingIncomplete):
+            _run(MergeDevAdapter(_ADAPTER).changed_bills(datetime(2026, 11, 1, tzinfo=UTC)))
+
+
+def test_changed_bills_past_the_row_cap_is_truncated_not_partial():
+    from app.services.erp_adapters.base import ErpListingIncomplete, ListingGap
+
+    async def get(url, params=None, headers=None):
+        return _page([{"id": "b", "type": "ACCOUNTS_PAYABLE"}], next_cursor="more")
+
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        with pytest.raises(ErpListingIncomplete) as exc:
+            _run(MergeDevAdapter(_ADAPTER).changed_bills(datetime(2026, 11, 1, tzinfo=UTC)))
+    assert exc.value.gap is ListingGap.truncated
+
+
+def test_bills_for_payment_reads_the_payments_invoice_lines():
+    with patch("httpx.AsyncClient") as cm:
+        client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(
+            return_value=_resp(
+                200, _pay("p1", _line("b1"), _line("b1"), _line("cn", "CREDIT_NOTE"))
+            )
+        )
+        assert _run(MergeDevAdapter(_ADAPTER).bills_for_payment("p1")) == ["b1"]
+    assert client.get.await_args.args[0].endswith("/payments/p1")
+    assert client.get.await_args.kwargs["params"] == {"expand": "applied_to_lines"}
+
+
+@pytest.mark.parametrize(
+    "answer", [_resp(404), _resp(500), _resp(200, {"id": "other", "applied_to_lines": []})]
+)
+def test_bills_for_payment_never_reads_an_unreadable_payment_as_applied_to_none(answer):
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = AsyncMock(return_value=answer)
+        with pytest.raises(RuntimeError):
+            _run(MergeDevAdapter(_ADAPTER).bills_for_payment("p1"))
+
+
+def test_merge_takes_no_payment_write_back_so_its_pushes_close_at_done():
+    """Merge's Payment has no memo / reference field and no DELETE (decisions
+    §504): a write-back could not be found again before a retry, told apart
+    from a person's payment, or reversed. Until that changes, Merge is not a
+    status-sync adapter, so a push is never left payable here."""
+    from app.services.erp_adapters.base import PaymentPayload
+    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+
+    adapter = MergeDevAdapter(_ADAPTER)
+    assert adapter.supports_status_sync is False
+    assert "merge_dev" not in status_sync_adapter_keys()
+    payload = PaymentPayload(
+        payment_id="pay-1",
+        bill_id="b1",
+        amount=Decimal("10.00"),
+        currency="USD",
+        paid_on=date(2026, 11, 20),
+        pay_from_account_erp_id="acct",
+    )
+    with patch("httpx.AsyncClient") as cm:
+        for write in (adapter.post_payment, adapter.void_payment):
+            result = _run(write(payload))
+            assert result.success is False and result.retryable is False
+    cm.assert_not_called()

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:material_ui/material_ui.dart';
@@ -14,6 +15,7 @@ import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/login_screen.dart';
 import 'package:feohledger_mobile/screens/settings_screen.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
+import 'package:feohledger_mobile/widgets/external_link.dart';
 
 http.Response _json(Object body, [int status = 200]) => http.Response(
       jsonEncode(body),
@@ -39,9 +41,25 @@ MockClient _happyClient({
   String fullName = 'Demo User',
   String email = 'demo@acme.com',
   List<String> roles = const ['admin'],
+  String tenantUrlTemplate = 'https://{slug}.feohledger.com',
+  _PublicConfigHook? publicConfig,
 }) {
   return MockClient((req) async {
     final path = req.url.path;
+    if (req.method == 'GET' && path == '/api/public-config') {
+      if (publicConfig != null) {
+        publicConfig.calls += 1;
+        await publicConfig.gate?.future;
+        if (publicConfig.status != 200) {
+          return _json({'detail': 'boom'}, publicConfig.status);
+        }
+      }
+      return _json({
+        'hcaptcha_sitekey': '',
+        'tenant_url_template': tenantUrlTemplate,
+        'signup_enabled': true,
+      });
+    }
     if (req.method == 'POST' && path == '/api/auth/login') {
       return _json({'access_token': 'tok-123'});
     }
@@ -55,14 +73,32 @@ MockClient _happyClient({
   });
 }
 
+/// How `GET /api/public-config` answers in a test that needs to control it:
+/// held until [gate] completes, refused with [status], and counted.
+class _PublicConfigHook {
+  final Completer<void>? gate;
+  final int status;
+  int calls = 0;
+
+  _PublicConfigHook({this.gate, this.status = 200});
+}
+
 /// Drive a real login so the screen renders behind an authenticated user.
 Future<void> _loginAs({
   String fullName = 'Demo User',
   String email = 'demo@acme.com',
   List<String> roles = const ['admin'],
+  String tenantUrlTemplate = 'https://{slug}.feohledger.com',
+  _PublicConfigHook? publicConfig,
 }) async {
   ApiClient().debugConfigure(
-    client: _happyClient(fullName: fullName, email: email, roles: roles),
+    client: _happyClient(
+      fullName: fullName,
+      email: email,
+      roles: roles,
+      tenantUrlTemplate: tenantUrlTemplate,
+      publicConfig: publicConfig,
+    ),
   );
   final result = await AuthStore.instance.login(email, 'demo', 'acme');
   expect(result.isSuccess, isTrue);
@@ -115,10 +151,10 @@ void main() {
   // Localization delegates are required now that the screen reads
   // AppLocalizations; with no explicit `locale` the default is `en`, so the
   // existing English assertions below still hold.
-  Widget wrap() => const MaterialApp(
+  Widget wrap({UrlOpener? opener}) => MaterialApp(
         localizationsDelegates: appLocalizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
-        home: SettingsScreen(),
+        home: SettingsScreen(opener: opener),
       );
 
   testWidgets('renders the logged-in user name, email and role chips',
@@ -227,13 +263,20 @@ void main() {
   // shown to a role the API refuses is a guaranteed 403 on first paint, and a
   // row hidden from a role the API admits is a dead end.
 
-  /// Scroll the settings list to the bottom so every lazily-built row is in the
-  /// tree before asserting on what is and isn't there.
-  Future<void> scrollToBottom(WidgetTester tester) async {
-    for (var i = 0; i < 6; i++) {
-      await tester.drag(find.byType(ListView), const Offset(0, -300));
-      await tester.pumpAndSettle();
-    }
+  /// Bring the Procurement and Administration sections into the built part of
+  /// the list before asserting on what is and isn't there.
+  ///
+  /// Not "scroll to the bottom": the list builds rows near the viewport only,
+  /// and rows below Administration (Help, biometric unlock, Sign Out) are tall enough
+  /// that the bottom of the list leaves both sections scrolled out of the tree
+  /// — which fails a `findsOneWidget` and, worse, passes a `findsNothing`
+  /// vacuously. Pinning the Procurement header to the top of the viewport
+  /// keeps it and everything up to the end of Administration built.
+  Future<void> scrollToSections(WidgetTester tester) async {
+    final procurement = find.text('Procurement');
+    await tester.scrollUntilVisible(procurement, 200);
+    await tester.ensureVisible(procurement);
+    await tester.pumpAndSettle();
   }
 
   testWidgets('every role gets Procurement → Quality Inspections',
@@ -242,9 +285,11 @@ void main() {
     // point is not role-gated; the record affordance inside the screen is.
     for (final roles in [['ap_clerk'], ['cfo'], ['admin']]) {
       await _loginAs(roles: roles);
+      // A fresh screen per role, so each pass scrolls from the top.
+      await tester.pumpWidget(const SizedBox());
       await tester.pumpWidget(wrap());
       await tester.pump();
-      await scrollToBottom(tester);
+      await scrollToSections(tester);
 
       expect(find.text('Procurement'), findsOneWidget, reason: '$roles');
       expect(
@@ -293,7 +338,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(find.text('Administration'), findsOneWidget);
     expect(find.widgetWithText(ListTile, 'User Management'), findsOneWidget);
@@ -317,7 +362,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(find.text('Administration'), findsOneWidget);
     expect(
@@ -336,7 +381,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(
       find.widgetWithText(ListTile, 'Adaptive Workflows'),
@@ -352,7 +397,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(find.text('Administration'), findsNothing);
     expect(
@@ -392,5 +437,151 @@ void main() {
       findsNothing,
       reason: 'the screen must not navigate — the AuthGate re-routes',
     );
+  });
+
+  // Help (decisions §503): the row opens the web help centre of the signed-in
+  // workspace in the browser — `{slug}` in the platform's published tenant URL
+  // template, plus `/help` — and is announced as a link that leaves the app.
+  group('Help row', () {
+    const helpLabel = 'Help, Guides for your workspace, opened in your browser';
+
+    Future<void> showHelpRow(WidgetTester tester) async {
+      final row = find.byKey(const Key('settings-help'));
+      await tester.scrollUntilVisible(row, 200);
+      await tester.ensureVisible(row);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('every role gets it, announced as a link', (tester) async {
+      await _loginAs(roles: ['ap_clerk']);
+      await tester.pumpWidget(wrap());
+      await tester.pump();
+      await showHelpRow(tester);
+
+      expect(find.text('Help'), findsOneWidget);
+      expect(
+        tester.getSemantics(find.bySemanticsLabel(helpLabel)),
+        isSemantics(isLink: true, hasTapAction: true),
+      );
+    });
+
+    testWidgets("tapping opens the workspace's /help in the browser",
+        (tester) async {
+      await _loginAs();
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(opened, [Uri.parse('https://acme.feohledger.com/help')]);
+      expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('a template with no safe https URL opens nothing and says so',
+        (tester) async {
+      // The local-dev default; the app launches https only (ExternalLink).
+      await _loginAs(tenantUrlTemplate: 'http://{slug}.localhost:7777');
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(opened, isEmpty);
+      expect(
+        find.text(
+          "Couldn't open the help centre. Sign in to your workspace on the "
+          'web and open Help there.',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a browser that refuses the URL gets the same message',
+        (tester) async {
+      await _loginAs();
+      await tester.pumpWidget(wrap(opener: (_) async => false));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SnackBar), findsOneWidget);
+    });
+
+    testWidgets('a failed public-config read opens nothing and says so',
+        (tester) async {
+      final config = _PublicConfigHook(status: 500);
+      await _loginAs(publicConfig: config);
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(config.calls, 1);
+      expect(opened, isEmpty);
+      expect(
+        find.text(
+          "Couldn't open the help centre. Sign in to your workspace on the "
+          'web and open Help there.',
+        ),
+        findsOneWidget,
+      );
+      // Settled: the row is back to its link icon, ready for another try.
+      expect(find.byKey(const Key('settings-help-busy')), findsNothing);
+      expect(find.byIcon(Icons.open_in_new), findsOneWidget);
+    });
+
+    testWidgets('a second tap while the first resolves is ignored, and the '
+        'row shows progress meanwhile', (tester) async {
+      final gate = Completer<void>();
+      final config = _PublicConfigHook(gate: gate);
+      await _loginAs(publicConfig: config);
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pump();
+      expect(find.byKey(const Key('settings-help-busy')), findsOneWidget);
+      expect(find.byIcon(Icons.open_in_new), findsNothing);
+      expect(
+        find.bySemanticsLabel('Help, Loading…'),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pump();
+
+      gate.complete();
+      await tester.pumpAndSettle();
+
+      expect(config.calls, 1);
+      expect(opened, [Uri.parse('https://acme.feohledger.com/help')]);
+      expect(find.byKey(const Key('settings-help-busy')), findsNothing);
+      expect(find.byType(SnackBar), findsNothing);
+    });
   });
 }

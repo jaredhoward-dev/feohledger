@@ -55,3 +55,45 @@ export function isOffered(refusal: ActionRefusal | undefined): boolean {
 export function isAllowed(refusal: ActionRefusal | undefined): boolean {
 	return refusal === null;
 }
+
+/** How a bulk action would land over a selection, from the rows' verdicts. */
+export interface BulkVerdictTally {
+	/** Selected rows whose verdict accepts the action. */
+	allowed: number;
+	/** Selected rows whose verdict refuses it — the server will skip them. */
+	refused: number;
+	/** Selected ids with no loaded row (a "select all N matching" beyond the
+	 *  pages fetched): the server decides, so they neither hide the action nor
+	 *  count as skips. */
+	unknown: number;
+}
+
+/**
+ * Tally one bulk action over the selected ids, reading each loaded row's
+ * verdict (`verdictOf`) — the bulk counterpart of {@link isAllowed}, so a bulk
+ * bar offers an action only when some selected row would take it
+ * (`offersBulk`) and can say up front how many the server will skip
+ * (decisions §507). Never restates the rule: a row is allowed exactly when its
+ * own verdict is `null`.
+ */
+export function tallyBulkVerdicts<R extends { id: string }>(
+	selectedIds: Iterable<string>,
+	rows: readonly R[],
+	verdictOf: (row: R) => ActionRefusal | undefined
+): BulkVerdictTally {
+	const byId = new Map(rows.map((r) => [r.id, r]));
+	const tally: BulkVerdictTally = { allowed: 0, refused: 0, unknown: 0 };
+	for (const id of selectedIds) {
+		const row = byId.get(id);
+		if (!row) tally.unknown += 1;
+		else if (isAllowed(verdictOf(row))) tally.allowed += 1;
+		else tally.refused += 1;
+	}
+	return tally;
+}
+
+/** Whether a bulk action is worth offering: some selected row would take it,
+ *  or some selected row's verdict is not loaded (the server will decide). */
+export function offersBulk(tally: BulkVerdictTally): boolean {
+	return tally.allowed > 0 || tally.unknown > 0;
+}

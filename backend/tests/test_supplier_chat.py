@@ -593,7 +593,7 @@ async def test_ap_message_emails_supplier_with_portal_link(realdb, monkeypatch):
     assert len(sent) == 1
     msg = sent[0]
     assert msg.to == "supplier@example.com"
-    assert f"/portal/invoices/{invoice_id}/chat" in msg.body_text
+    assert f"/portal/invoices?chat={invoice_id}" in msg.body_text
     # PII-free: invoice number present, raw message body absent.
     assert "INV-EMAIL-1" in msg.body_text
     assert "ping" not in msg.body_text

@@ -3,7 +3,8 @@
 	import AuthShell from '#lib/components/auth/AuthShell.svelte';
 	import AuthBrandMark from '#lib/components/auth/AuthBrandMark.svelte';
 	import Spinner from '#lib/components/ui/Spinner.svelte';
-	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
+	import LegalAcceptCheckbox from '#lib/components/auth/LegalAcceptCheckbox.svelte';
+	import { ACCEPTED_LEGAL_VERSIONS } from '#lib/legal/acceptance.ts';
 	import IconMail from '~icons/material-symbols/mark-email-unread-outline';
 	import IconCheck from '~icons/material-symbols/check-circle';
 	import IconClose from '~icons/material-symbols/cancel';
@@ -15,7 +16,6 @@
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { theme } from '#lib/stores/theme.svelte.ts';
 	import type { ResolvedTheme } from '#lib/theme.ts';
-	import { legalTitle } from '#lib/legal/pages.ts';
 	import type { PublicConfig } from '#lib/types/publicConfig.ts';
 	import {
 		WORKSPACE_ADDRESS_MAX,
@@ -46,6 +46,13 @@
 	let slug = $state('');
 	let adminName = $state('');
 	let adminEmail = $state('');
+	// The required Terms / Privacy accept box (decisions §495).
+	let legalAccepted = $state(false);
+	let legalError = $state('');
+	// The server refused the (necessarily ticked) box: this tab's bundled
+	// versions are stale, and only a reload fetches the current ones.
+	let legalVersionsChanged = $state(false);
+	let legalBox: LegalAcceptCheckbox | undefined = $state();
 	let captchaToken = $state<string | null>(null);
 	let captchaSitekey = $state<string>('');
 	// hCaptcha's API has loaded (its explicit-mode onload fired).
@@ -447,6 +454,11 @@
 			document.getElementById(FIELD_INPUT_IDS.slug)?.focus();
 			return;
 		}
+		if (!legalAccepted) {
+			legalError = m('auth.legal.acceptRequired');
+			legalBox?.focus();
+			return;
+		}
 		if (captchaSitekey && !captchaToken) {
 			error = captchaLoadFailed
 				? m('auth.signup.captchaBlockedSubmit')
@@ -462,7 +474,9 @@
 				admin_email: adminEmail,
 				captcha_token: captchaToken,
 				// The verification and welcome emails are written in it.
-				locale: currentLocale()
+				locale: currentLocale(),
+				// The versions the accept box names (decisions §495).
+				...ACCEPTED_LEGAL_VERSIONS
 			});
 			sentTo = adminEmail;
 			// The submit button had focus, and it has just been removed from the
@@ -474,6 +488,16 @@
 			successHeading?.focus();
 		} catch (err) {
 			discardCaptchaToken();
+			if (err instanceof ApiError && err.code === 'legal_acceptance_required') {
+				// Submit only gets here with the box ticked, so the refusal means
+				// the Terms / Privacy versions changed since the page loaded. Say
+				// so beside the box, with the reload — not a banner asking for a
+				// tick that is already there.
+				legalVersionsChanged = true;
+				await tick();
+				legalBox?.focus();
+				return;
+			}
 			error = (await showRefusal(err)) ?? '';
 		} finally {
 			submitting = false;
@@ -667,6 +691,23 @@
 				{/if}
 			</div>
 
+			<!--
+				Contract formation happens here — this button creates a tenant and
+				binds the signer's organisation — so the terms it forms under are a
+				required box ticked at the point of assent, not a sentence beside the
+				button: `/legal/terms` says acceptance is by clicking an accept
+				control, and what was accepted is recorded (decisions §495).
+			-->
+			<LegalAcceptCheckbox
+				bind:this={legalBox}
+				id="signup-legal-accept"
+				bind:checked={legalAccepted}
+				error={legalError}
+				versionsChanged={legalVersionsChanged}
+				withDpa
+				onchange={() => (legalError = '')}
+			/>
+
 			{#if captchaSitekey}
 				{#if captchaLoadFailed}
 					<!-- Where the widget would have been, and announced on arrival:
@@ -692,33 +733,6 @@
 			>
 				{submitting ? m('auth.signup.submitting') : m('auth.signup.submit')}
 			</button>
-
-			<!--
-				Contract formation happens here — this button creates a tenant and
-				binds the signer's organisation — so the terms it forms under have
-				to be presented at the point of assent rather than only from a
-				footer elsewhere. It sits below the button so the button stays the
-				page's primary target, and above the existing footer note so the
-				last thing read before submitting is what submitting agrees to.
-
-				The sentence is translated; the three link LABELS are the document
-				titles from `lib/legal/pages.ts`, which are English on purpose —
-				the documents themselves are (`frontend/CLAUDE.md` § i18n,
-				`docs/decisions.md` §174), and naming one in French would promise a
-				French text that does not exist. Taking the titles from the
-				registry rather than typing them keeps the link text and the page's
-				own `<h1>` the same string.
-			-->
-			<p class="legal-consent">
-				<LinkedMessage
-					text={m('auth.signup.legalConsent')}
-					links={{
-						terms: { href: '/legal/terms', label: legalTitle('/legal/terms') },
-						privacy: { href: '/legal/privacy', label: legalTitle('/legal/privacy') },
-						dpa: { href: '/legal/dpa', label: legalTitle('/legal/dpa') }
-					}}
-				/>
-			</p>
 
 			<p class="footer">
 				{m('auth.signup.footerPre')}<code>{tenantExampleHost}</code>{m('auth.signup.footerPost')}
@@ -828,16 +842,6 @@
 	}
 
 	/* ------------------------------ fine print ----------------------------- */
-	.legal-consent {
-		margin: 2px 0 0;
-		font-size: 0.8rem;
-		line-height: 1.55;
-		color: var(--text-muted);
-		text-align: center;
-	}
-	.legal-consent :global(a) {
-		color: var(--accent-on-tint);
-	}
 	.footer {
 		margin: 0;
 		padding-top: 16px;

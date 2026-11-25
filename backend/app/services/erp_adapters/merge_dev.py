@@ -46,11 +46,26 @@ Checked against the same spec, read 2026-11-14 (decisions §405):
   organisation, and only the customer can regenerate them: the webhook guide
   (https://docs.merge.dev/merge-unified/reading-data/webhooks/merge-webhooks)
   says the signature key "can be regenerated".
+
+Checked against the same spec, read 2026-11-24 (decisions §504):
+
+* ``GET /invoices`` and ``GET /payments`` take ``modified_after`` (Merge's own
+  ``modified_at``, "synced by Merge after this date time"),
+  ``include_deleted_data``, ``page_size`` (at most 100) and a ``cursor``, so
+  :meth:`MergeDevAdapter.changed_bills` is a change feed of whole listings;
+* a ``Payment`` is ``POST`` / ``GET`` / ``PATCH`` only: there is no ``DELETE``
+  or void, and neither ``Payment`` nor ``PaymentRequest`` has a memo or
+  reference field, so a payment written through Merge can carry no marker
+  telling it from a person's. A write-back could therefore be neither found
+  again before a retry (``Idempotency-Key`` is a 24-hour beta) nor reversed,
+  and a bill it paid would read as paid outside FeohLedger. ``post_payment`` /
+  ``void_payment`` stay the base refusals and ``supports_status_sync`` stays
+  False.
 """
 
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import httpx
@@ -407,6 +422,29 @@ def settled_by_credit(record: dict) -> bool:
     return bool(
         _ids(record.get("applied_credit_notes")) or _ids(record.get("applied_vendor_credits"))
     )
+
+
+def payment_bill_ids(payment: dict) -> tuple[str, ...]:
+    """The bills a Merge Payment is applied to: the ``related_object_id`` of
+    each expanded ``applied_to_lines`` row whose ``related_object_type`` is
+    ``INVOICE``. A receivable payment (``type: ACCOUNTS_RECEIVABLE``) applies
+    to no bill, and a line left as a bare id (not expanded) names nothing we
+    can type, so it is skipped rather than guessed."""
+    if str(payment.get("type") or "").upper() == "ACCOUNTS_RECEIVABLE":
+        return ()
+    lines = payment.get("applied_to_lines")
+    if not isinstance(lines, list):
+        return ()
+    out: list[str] = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        if str(line.get("related_object_type") or "").upper() != "INVOICE":
+            continue
+        related = line.get("related_object_id")
+        if isinstance(related, str) and related:
+            out.append(related)
+    return tuple(out)
 
 
 def _merge_record_inactive(raw: dict, inactive_status: str) -> bool:
@@ -914,8 +952,9 @@ class MergeDevAdapter(ErpAdapter):
         """The bill as Merge has it now, for the webhook
         (``erp_merge_webhook``). Raises :class:`MergeBillNotFound` on a 404 and
         another error on anything unreadable — never reads as gone.
-        ``supports_status_sync`` stays False: Merge takes no payment write-back,
-        so a push still closes at ``done``."""
+        ``supports_status_sync`` stays False (decisions §504): Merge's Payment
+        can carry no marker of ours and cannot be deleted, so no write-back can
+        be idempotent or reversible, and a push still closes at ``done``."""
         base = self._base()
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f"{base}/invoices/{bill_id}", headers=self._headers())
@@ -927,6 +966,60 @@ class MergeDevAdapter(ErpAdapter):
         if report is None or report.bill_id != str(bill_id):
             raise RuntimeError(f"{PROVIDER} bill read failed: unreadable body")
         return report
+
+    async def changed_bills(self, since: datetime) -> list[str]:
+        """Bills Merge has changed since ``since``: every ``ACCOUNTS_PAYABLE``
+        invoice ``GET /invoices?modified_after=`` lists, plus each bill a
+        payment ``GET /payments?modified_after=`` lists is applied to, so a
+        payment applied or deleted reads as a change of its bill whether or not
+        the bill's own ``modified_at`` moved (Xero's shape, decisions §386).
+        ``modified_after`` is Merge's own sync time (``modified_at``), so it is
+        a change feed, not the ERP's edit time. ``include_deleted_data`` keeps
+        a bill or payment deleted in the ERP in the listing.
+
+        The whole listing or a raise (:class:`ErpListingIncomplete`): a page
+        Merge refuses, an unreadable body, or more than
+        :data:`SYNC_LISTING_MAX_ROWS` rows. Bills only — the reports themselves
+        are read by :meth:`bill_report`. Not swept yet: the status-sync sweep
+        reads only adapters with ``supports_status_sync``, which Merge does
+        not have (decisions §504).
+
+        ``since`` must be timezone-aware: ``astimezone`` would read a naive one
+        as the host's local time and shift the window by its UTC offset, so a
+        naive ``since`` is a :class:`ValueError`, not a guess."""
+        if since.tzinfo is None or since.utcoffset() is None:
+            raise ValueError("changed_bills needs a timezone-aware `since`")
+        stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        common = {"modified_after": stamp, "include_deleted_data": "true", "page_size": "100"}
+        invoices = await self._list_complete("invoices", {**common, "type": "ACCOUNTS_PAYABLE"})
+        bills = [
+            r.get("id")
+            for r in invoices
+            # The filter is Merge's; a receivable it lists anyway is not a bill.
+            if str(r.get("type") or "ACCOUNTS_PAYABLE").upper() == "ACCOUNTS_PAYABLE"
+        ]
+        payments = await self._list_complete("payments", {**common, "expand": "applied_to_lines"})
+        for payment in payments:
+            bills.extend(payment_bill_ids(payment))
+        return list(dict.fromkeys(b for b in bills if isinstance(b, str) and b))
+
+    async def bills_for_payment(self, payment_id: str) -> list[str]:
+        """The bills a Merge Payment is applied to (``GET /payments/{id}``,
+        ``applied_to_lines`` expanded). Raises on anything but a readable
+        answer for this payment: "couldn't read" is never "applies to none"."""
+        base = self._base()
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{base}/payments/{payment_id}",
+                params={"expand": "applied_to_lines"},
+                headers=self._headers(),
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(f"{PROVIDER} payment read failed: HTTP {resp.status_code}")
+        body = _json_body(resp)
+        if body.get("id") != str(payment_id):
+            raise RuntimeError(f"{PROVIDER} payment read failed: unreadable body")
+        return list(dict.fromkeys(payment_bill_ids(body)))
 
     async def void_invoice(self, erp_document_id: str) -> bool:
         # Merge's unified API has no void or delete for an invoice.

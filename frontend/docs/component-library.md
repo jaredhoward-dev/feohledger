@@ -16,6 +16,9 @@ Grouped into subfolders by role. Import with the full path, e.g.
 - `RichText.svelte` — renders help prose's inline markup (`{ui:key}`, `[[term]]`, `[[guide:…]]`, `[[page:…]]`, bold, emphasis) as elements; never `{@html}`. UI labels carry the UI's `lang` inside English prose.
 - `HelpNav.svelte` / `HelpCrumbs.svelte` — the help shell's disclosure contents list and the subpage breadcrumb.
 - `InvoiceLifecycle.svelte` — the invoice-lifecycle walkthrough: a tab list of stages (arrow keys / Home / End) over `lib/help/lifecycle.ts`, with real `StatusBadge`s.
+- `GuideToc.svelte` — a guide's "On this page" list (`sections`, `englishLang`), rendered only past one section; in-page anchors, so no `audience`. The employee guide page restyles its `.toc` into a sticky rail on a wide column. Shared by `/help/guides/[id]` and `/portal/help/[id]`.
+- `GuideTerms.svelte` — a guide's "Terms" `<dl>`: each glossary id's name (linked through `termHref(id, audience)`) and one-liner. Takes `terms` and `audience` (`'employee'` default / `'supplier'`); renders nothing for an empty list. Shared by both guide pages.
+- `GuideRelated.svelte` — a guide's "Related guides" list (title linked through `guideHref(id, audience)`, then summary). Takes the resolved `guides` — each page resolves ids against its own index, so a supplier's page never loads the employee one — plus `englishLang` and `audience`. Shared by both guide pages.
 - `EnglishNotice.svelte` — the translated "guides are in English for now" notice; renders only under a non-English locale.
 - `diagrams/Diagram.svelte` — dispatches a guide's `diagram` block to its inline-SVG illustration (tokens for colour, catalogue for every word).
 
@@ -318,6 +321,7 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
 - `AuthCallback.svelte` — the whole page an identity provider returns to: the OIDC `/login/sso-callback` and the SAML bridge `/login/saml-callback` are each this, given what to read from the URL and which endpoint trades it for a session. `<AuthCallback required={['code', 'state']} missingKey exchange />`. Rendered through `AuthCard`; an IdP `?error=` is stated in words (`utils/idpCallbackError.ts`), never as the protocol code, which stays as support detail only when it looks like one. Owns the post-sign-in hop (`takeNextForSso` → `setToken` → `/change-password` or the stashed `next`). Guard: `tests-e2e/auth/sso-callback-idp-error.spec.ts`, `sso-callback-refusal.spec.ts`.
 - `PasswordInput.svelte` — every password field a person types into to sign in or change a password, employee and supplier: label, input and a show-password toggle. `<PasswordInput id label bind:value autocomplete="current-password"|"new-password" required? minlength? error? describedBy? announce? bind:input? oninput? onblur? />`. The toggle is a `type="button"` outside the `<label>` with a **constant** name ("Show password") and `aria-pressed` for the state, 40px square (WCAG 2.5.8), Edge's own reveal eye hidden. Password managers keep working because `autocomplete` / `name` stay on the one input whose `type` flips, and the field returns to `type=password` when its form submits. `error` renders beside the field and sets `aria-invalid`; it is first in `aria-describedby`, before `describedBy`. `announce` makes the error a polite live region — only for an error that appears while focus is elsewhere (the confirmation's mismatch on blur); an error found on submit is read by focusing the field. Used by `/login`, `/change-password`, `/login/reset-password`, `/profile`'s Password card, `/portal/login` and `/portal/change-password`. Field chrome comes from `AuthShell`'s `:where()` rules; a page outside `AuthShell` styles the field through `:global(:where(.password-field …))` so the component's own rules (the toggle's room) still win. `passwordAutocomplete.test.ts` requires a literal allowed `autocomplete` at every call site.
 - `NewPasswordFields.svelte` — "New password" + its rules checklist + "Confirm new password", for `/change-password`, `/login/reset-password`, `/profile`'s Password card and `/portal/change-password` (the portal's `POST /api/portal/auth/change-password` runs the same `validate_password_complexity`, so the same rules hold). `<NewPasswordFields bind:this idPrefix newLabel confirmLabel bind:newPassword bind:confirmPassword bind:serverError? />`. The rules (`#lib/utils/passwordRules.ts`, mirroring the backend's complexity check) are linked to the new field by `aria-describedby`, each with a spoken met / not-yet state. The page keeps Submit enabled and calls `validate(focus = true)` on submit — it marks every bad field and focuses the first; `focusNew()` after a server 422 set into `serverError`, which clears on edit; `reset()` returns it to untouched for a form that stays on screen after a save and clears its values. The mismatch also shows once the confirmation is blurred non-empty, then follows each keystroke.
+- `LegalAcceptCheckbox.svelte` — the required "I agree to the Terms of Service and Privacy Policy" box wherever an account is formed or first entered: `/signup` (`withDpa`, which names the DPA too) and `SetPasswordLink` when `reset-password/check` says `legal_acceptance_required`. `<LegalAcceptCheckbox bind:checked id error? withDpa? onchange? />`, plus `focus()` for a submit that found it unticked. The whole sentence is the label; the link labels are the documents' English titles (`lib/legal/pages.ts`). Once ticked the page sends `ACCEPTED_LEGAL_VERSIONS` from `lib/legal/acceptance.ts`, which reads `lib/legal/legalVersions.generated.ts` — written by `pnpm gen:legal-versions` from `backend/app/services/legal_acceptance.py`, never by hand; `pnpm check:legal-versions` (CI's Backend lint job) fails on drift, and `lib/legal/acceptance.test.ts` refuses a version later than the legal set's `LAST_UPDATED`. The backend refuses any other value (422 `legal_acceptance_required`, `docs/decisions.md` §495). No in-app re-prompt uses it yet (`docs/followups.md`).
 - `AuthBrandMark.svelte` — the mark at the top of a pre-auth form column. `<AuthBrandMark size? />` (default 40). On the platform apex (`!hasTenantContext()`) it is a link to `/` named `auth.shell.homeLink` ("FeohLedger home"); on a workspace subdomain (where `/` only redirects to `/login`) and on a vanity host (where a link to FeohLedger marketing would break the partner's white-label) it is the plain decorative `BrandMark`. The rule lives here, not per page — render this rather than a bare `BrandMark` in a form's head. `AuthShell`'s panel mark stays a plain `BrandMark` so the page never carries two home links. Used by signup, sign-in, the MFA step, `/verify` and `AuthCard` (so the SSO / SAML callbacks too). Guard: `tests-e2e/signup/brand-link.spec.ts`.
 **`layout/`** — the shared left side panel:
 - `Sidebar.svelte` — collapsed/expanded nav + profile popover. **At 700px and
@@ -384,6 +388,25 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   in its titled shape with Log out as its `actions`; this component owns only the
   brand frame, the loading line and keeping the panel up through a retry. `<AccountLoadState status={auth.userStatus} onretry onlogout />`.
   `docs/authentication.md` § When the account cannot be loaded.
+- `LegalAcceptStep.svelte` — the blocking Terms / Privacy re-prompt the root
+  layout draws in the shell's place while `auth.user.legal_acceptance_required`
+  (decisions §497): `auth/LegalAcceptCheckbox`, *Accept and continue*, *Log
+  out*, focus on its `<h1>`. A full page, not a modal, so nothing behind it
+  mounts and the URL survives; a 422 on a ticked box shows the box's
+  documents-changed reload state, anything else (the 429) an alert. A 403
+  `legal_acceptance_required` from any call sets the flag too
+  (`api/acceptanceRefusal.ts`; the portal's `privacy_acknowledgement_required`
+  likewise), so the step comes up mid-session (decisions §505).
+  `<LegalAcceptStep onaccept={() => auth.acceptLegal()} onlogout={() => auth.logout()} />`.
+  Also takes `documents` (`"terms_privacy"` by default; `"privacy"` for the
+  Privacy Policy copy, the box's `privacy` form and the
+  `privacy_acknowledgement_required` stale-versions code) and an optional
+  `mark` snippet drawn in place of our wordmark. The supplier-portal layout
+  draws it with `documents="privacy"`, the tenant's white-label mark,
+  `onaccept={portalAuth.acknowledgeLegal}` and its own logout handler
+  (`portalAuth.logout`) while the portal user's
+  `legal_acceptance_required` is true (decisions §500).
+  `docs/authentication.md` § Terms and Privacy acceptance.
 - `NotificationBell.svelte` — bell + unread badge in the sidebar header with a
   recent-notifications popover (replaced the old Notifications nav row; the full
   `/notifications` page is the "View all" link). The popover is a `role="dialog"`
@@ -431,6 +454,19 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   type-the-slug confirmation enables the destructive button, `ui/StepUpPrompt` collects a second
   factor when the server asks, and success clears the token and navigates to
   `/login?reason=workspace_closed`. Admin-only hint for everyone else.
+- `OrgSettingPanel.svelte` — the frame of a single-setting Organization panel (the Line-total
+  check and Exception agents panels): the titled `.card`, its intro line, the admin-only notice and
+  the async states around the form the caller passes as `children` — `ui/LoadingState` while
+  `loading`, `ui/LoadError` with `onretry` when `loadFailed`. Props: `title`, `intro`, `testId`
+  (prefix of `{testId}-panel`, `-admin-only`, `-loading`, `-load-error`), `readOnly`, `loading`,
+  `loadFailed`, `loadFailedMessage`, `onretry`, and an optional `footer` snippet for the save row,
+  whose button is the global `.btn-primary`. The multi-step connection panels (ERP, Commerce) keep
+  their own frames.
+- `ScimTokenPanel.svelte` — the Organization → SCIM provisioning panel (decisions §510), on the
+  `OrgSettingPanel` frame. Props: `readOnly`, `userLoaded`. Shows whether a SCIM bearer token is set
+  and the SCIM base URL (`utils/scim.scimBaseUrl`); Generate / Rotate / Revoke (`utils/scim.scimActions`
+  decides which, by token state and the `scim` plan feature) with a confirm `ui/Modal` before Rotate and
+  Revoke. The minted plaintext is shown once through `ui/SecretReveal` and dropped on close.
 - `ErpConnectionPanel.svelte` — the Organization → ERP panel, rendered entirely from the backend ERP
   catalogue (`GET /api/organization/erp/providers`). Props: `stored` (`settings.erp` as
   `GET /api/organization` serves it — configuration only), `readOnly`, `userLoaded`, `entitled` (the

@@ -50,6 +50,7 @@
  */
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import { formatMoney } from '#lib/utils/money.ts';
+import { formatPercent } from '#lib/utils/percent.ts';
 import { invoiceStatusLabelKey } from '#lib/types/invoice.ts';
 import { paymentStatusLabelKey } from '#lib/types/payment.ts';
 import { exceptionTypeFallback, exceptionTypeLabelKey } from '#lib/types/exception.ts';
@@ -74,6 +75,7 @@ import { vendorStatusLabelKey } from '#lib/types/vendor.ts';
 import { expenseReportStatusLabelKey } from '#lib/types/expense.ts';
 import { intakeStatusLabelKey } from '#lib/types/intake.ts';
 import { requisitionStatusLabelKey } from '#lib/types/requisition.ts';
+import { contractStatusLabelKey } from '#lib/types/contract.ts';
 
 type Translate = (key: MessageKey, params?: Record<string, string | number>) => string;
 type Params = Record<string, unknown>;
@@ -367,6 +369,27 @@ const BUILDERS: Record<string, Builder> = {
 	po_not_invoiceable: fixed('refusal.poNotInvoiceable'),
 	// …and on an open PO this supplier has already invoiced (decisions §468).
 	po_already_invoiced: fixed('refusal.poAlreadyInvoiced'),
+	// `api/organization_match_rules.py` — the PO match rules panel's saves
+	// (decisions §512). The range is the server's, sent as exact decimal
+	// strings in percentage points and stated here, never restated.
+	match_tolerance_invalid: fixed('refusal.matchToleranceInvalid'),
+	match_tolerance_out_of_range: (params, t) => {
+		const min = moneyStr(params, 'min');
+		const max = moneyStr(params, 'max');
+		if (min === null || max === null) return null;
+		return t('refusal.matchToleranceOutOfRange', {
+			min: formatPercent(min, { maximumFractionDigits: 2 }),
+			max: formatPercent(max, { maximumFractionDigits: 2 })
+		});
+	},
+	match_tolerance_too_precise: (params, t) => {
+		const places = params.places;
+		if (typeof places !== 'number' || !Number.isInteger(places) || places < 0) return null;
+		return t('refusal.matchToleranceTooPrecise', { places });
+	},
+	match_rule_empty: fixed('refusal.matchRuleEmpty'),
+	match_rule_vendor_not_found: fixed('refusal.matchRuleVendorNotFound'),
+	match_rule_gl_account_not_found: fixed('refusal.matchRuleGlAccountNotFound'),
 	// `services/approval_chain.py`
 	approval_segregation: fixed('refusal.approvalSegregation'),
 	approval_segregation_receiver: fixed('refusal.approvalSegregationReceiver'),
@@ -543,6 +566,26 @@ const BUILDERS: Record<string, Builder> = {
 			? null
 			: t('refusal.requisitionStatusRefused', {
 					status: statusLabel(status, requisitionStatusLabelKey, t)
+				});
+	},
+	// `services/contract_controls.py` — a contract lifecycle action (activate /
+	// terminate / cancel / renew / create PO) its status does not allow, and a
+	// delete of a contract that is neither draft nor cancelled; the /contracts
+	// rows' `actions` verdicts are read from the same gates (decisions §507)
+	contract_status_refused: (p, t) => {
+		const status = str(p, 'status');
+		return status === null
+			? null
+			: t('refusal.contractStatusRefused', {
+					status: statusLabel(status, contractStatusLabelKey, t)
+				});
+	},
+	contract_delete_refused: (p, t) => {
+		const status = str(p, 'status');
+		return status === null
+			? null
+			: t('refusal.contractDeleteRefused', {
+					status: statusLabel(status, contractStatusLabelKey, t)
 				});
 	},
 	// …and the endpoints' own refusals that are not in a row's verdict
@@ -825,6 +868,13 @@ const BUILDERS: Record<string, Builder> = {
 	signup_link_invalid: fixed('refusal.signupLinkInvalid'),
 	signup_unavailable: fixed('refusal.signupUnavailable'),
 	signup_provisioning_failed: fixed('refusal.signupProvisioningFailed'),
+	// `services/legal_acceptance.acceptance_refusal` — signup, a set-password
+	// link and the re-prompt, without the Terms / Privacy versions in force.
+	legal_acceptance_required: fixed('refusal.legalAcceptanceRequired'),
+	// `services/portal_legal_acceptance.acknowledgement_refusal` — a supplier-
+	// portal set-password link without the Privacy Policy version in force
+	// (decisions §499; suppliers are not asked to accept the Terms).
+	privacy_acknowledgement_required: fixed('refusal.privacyAcknowledgementRequired'),
 	// `api/payments.py::_refuse_record_only` — every dispatching endpoint on a
 	// tenant whose payments are recorded, never sent. `params.reason` says why
 	// the mode resolved so; the sentence is the same for every reason.
@@ -1062,6 +1112,24 @@ const BUILDERS: Record<string, Builder> = {
 	csv_vendor_name_required: fixed('refusal.csvVendorNameRequired'),
 	csv_invoice_number_required: fixed('refusal.csvInvoiceNumberRequired'),
 	csv_vendor_required: fixed('refusal.csvVendorRequired'),
+	// A `vendor_code` two vendors claim (a code, or an ERP record id), or only
+	// an ERP record id: the payee would be a guess, so the row is refused
+	// (decisions §491).
+	csv_vendor_code_ambiguous: (p, t) => {
+		const value = str(p, 'value');
+		return value === null ? null : t('refusal.csvVendorCodeAmbiguous', { value });
+	},
+	// A vendor-import row whose code is only the ERP record id another-named
+	// vendor is linked by: not created, and named rather than skipped quietly
+	// (decisions §493).
+	csv_vendor_code_is_erp_link: (p, t) => {
+		const value = str(p, 'value');
+		const name = str(p, 'name');
+		const vendor = str(p, 'vendor');
+		return value === null || name === null || vendor === null
+			? null
+			: t('refusal.csvVendorCodeIsErpLink', { value, name, vendor });
+	},
 	csv_amount_invalid: (p, t) => {
 		if (typeof p.value !== 'string') return null;
 		const value = str(p, 'value');

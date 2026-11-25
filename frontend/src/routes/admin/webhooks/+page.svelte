@@ -64,10 +64,10 @@
 	let SUB_COLUMNS = $derived([
 		{ label: m('admin.webhooks.sub.col.name') },
 		{ label: m('admin.webhooks.sub.col.targetUrl') },
-		{ label: m('admin.webhooks.sub.col.events') },
-		{ label: m('admin.webhooks.sub.col.secret') },
-		{ label: m('admin.webhooks.sub.col.created') },
-		{ label: m('admin.webhooks.sub.col.status') },
+		{ label: m('admin.webhooks.sub.col.events'), class: 'col-events' },
+		{ label: m('admin.webhooks.sub.col.secret'), class: 'col-secret' },
+		{ label: m('admin.webhooks.sub.col.created'), class: 'col-created' },
+		{ label: m('admin.webhooks.sub.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -337,10 +337,10 @@
 	let DELIVERY_COLUMNS = $derived([
 		{ label: m('admin.webhooks.delivery.col.event') },
 		{ label: m('admin.webhooks.delivery.col.eventId') },
-		{ label: m('admin.webhooks.delivery.col.attempts') },
-		{ label: m('admin.webhooks.delivery.col.response') },
-		{ label: m('admin.webhooks.delivery.col.lastAttempt') },
-		{ label: m('admin.webhooks.delivery.col.status') },
+		{ label: m('admin.webhooks.delivery.col.attempts'), class: 'col-attempts' },
+		{ label: m('admin.webhooks.delivery.col.response'), class: 'col-response' },
+		{ label: m('admin.webhooks.delivery.col.lastAttempt'), class: 'col-last' },
+		{ label: m('admin.webhooks.delivery.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -491,15 +491,23 @@
 
 	<section aria-labelledby="subs-heading">
 		<h2 id="subs-heading" class="section-heading">{m('admin.webhooks.subscriptions')}</h2>
-		{#if subsLoading}
-			<p class="state" data-testid="webhooks-loading">{m('admin.webhooks.loadingSubs')}</p>
-		{:else if subsError}
+		<!-- Mounted from first paint with DataTable's loading row, in a region of
+		     reserved height that scrolls under a sticky header: the table used to
+		     replace a loading line and grow by its rows, pushing the deliveries
+		     section below it down as the data landed. A refetch after create /
+		     rotate / delete keeps the rows on screen rather than blanking them. -->
+		{#if subsError}
 			<LoadError message={subsError} onretry={loadSubs} testId="webhooks-error" />
 		{:else}
+			<div class="subs-table" data-testid="webhooks-subs">
 			<DataTable
+				fixed
+				stickyHeader
 				columns={SUB_COLUMNS}
 				isEmpty={subs.length === 0}
+				loading={subsLoading && subs.length === 0}
 				empty={m('admin.webhooks.subsEmpty')}
+				ariaLabel={m('admin.webhooks.subscriptions')}
 			>
 				{#snippet body()}
 					{#each subs as sub (sub.id)}
@@ -588,6 +596,7 @@
 					{/each}
 				{/snippet}
 			</DataTable>
+			</div>
 		{/if}
 	</section>
 
@@ -600,15 +609,17 @@
 			onchange={setStatusFilter}
 		/>
 
-		{#if deliveriesLoading}
-			<p class="state" data-testid="deliveries-loading">{m('admin.webhooks.loadingDeliveries')}</p>
-		{:else if deliveriesError}
+		{#if deliveriesError}
 			<LoadError message={deliveriesError} onretry={loadDeliveries} testId="deliveries-error" />
 		{:else}
+			<div class="deliveries-table">
 			<DataTable
+				fixed
 				columns={DELIVERY_COLUMNS}
-				isEmpty={deliveries.length === 0}
+				isEmpty={deliveries.length === 0 || deliveriesLoading}
+				loading={deliveriesLoading}
 				empty={m('admin.webhooks.deliveriesEmpty')}
+				ariaLabel={m('admin.webhooks.deliveries')}
 			>
 				{#snippet body()}
 					{#each deliveries as d (d.id)}
@@ -637,6 +648,7 @@
 					{/each}
 				{/snippet}
 			</DataTable>
+			</div>
 		{/if}
 	</section>
 </PageHeader>
@@ -895,9 +907,45 @@
 		font-size: 1.05rem;
 	}
 
-	.state {
-		color: var(--text-muted);
-		padding: 0.75rem 0;
+	/* Both tables are `fixed` (DataTable's `fixed`): under `auto` the header
+	   cells were sized against the loading row and re-sized against the real
+	   rows. Widths are sized to the widest string in the six locales,
+	   measured with each cell's own font metrics (frontend/docs/ui-patterns.md
+	   § Data tables): headers fr "ÉVÉNEMENTS" / "D'ÉVÉNEMENT", de "GEHEIMNIS",
+	   pt-BR "TENTATIVAS"; badges es "INACTIVO", de "FEHLGESCHLAGEN"; the
+	   widest single button fr "Renouveler le secret", de "Wird erneut
+	   zugestellt…". The text columns carry no width and share the rest; the
+	   `min-width` keeps them readable, past which the table scrolls in its
+	   region. DataTable renders the `<th>`, so the selectors go through
+	   `:global` under a page-owned wrapper (the /gl-accounts pattern). */
+	.subs-table,
+	.deliveries-table {
+		min-width: 0;
+	}
+	/* The subscriptions table sits ABOVE the deliveries section, so its
+	   height is reserved rather than grown: about five rows, then it scrolls
+	   inside its own region under the sticky header. Data landing (or a
+	   sixth webhook) then never moves the deliveries section. The region is
+	   already a keyboard tab stop (DataTable), so the scroll is reachable. */
+	.subs-table :global(.grid-container) {
+		height: 20rem;
+		overflow-y: auto;
+	}
+	.subs-table :global(table) { min-width: 1200px; }
+	.subs-table :global(th.col-events) { width: 200px; }
+	.subs-table :global(th.col-secret) { width: 170px; }
+	.subs-table :global(th.col-created) { width: 130px; }
+	.subs-table :global(th.col-status) { width: 150px; }
+	/* Rotate secret + Delete on one line in English; other locales wrap. */
+	.subs-table :global(th.actions-col) { width: 260px; }
+	.deliveries-table :global(table) { min-width: 1300px; }
+	.deliveries-table :global(th.col-attempts) { width: 140px; }
+	.deliveries-table :global(th.col-response) { width: 140px; }
+	.deliveries-table :global(th.col-last) { width: 160px; }
+	.deliveries-table :global(th.col-status) { width: 220px; }
+	.deliveries-table :global(th.actions-col) { width: 260px; }
+	.deliveries-table td.mono {
+		overflow-wrap: anywhere;
 	}
 
 	.mono {
@@ -924,15 +972,21 @@
 	   caller owns: the placement, and the escape from the surrounding `.mono`
 	   cell (a monospace secret prefix is the point of that cell; the pill's
 	   prose is not). Font-family inherits into the badge. */
+	/* Its own line under the prefix, and allowed to wrap: the pill's text
+	   (fr "Secret précédent jusqu’à 14:30", ≈280px) is wider than the fixed
+	   secret column, and a nowrap badge would overprint the next one. */
 	.overlap-pill-wrap {
-		display: inline-flex;
-		margin-left: 6px;
+		display: flex;
+		margin-top: 4px;
 		font-family:
 			-apple-system,
 			BlinkMacSystemFont,
 			'Segoe UI',
 			Roboto,
 			sans-serif;
+	}
+	.overlap-pill-wrap :global(.badge) {
+		white-space: normal;
 	}
 
 	.field-hint {

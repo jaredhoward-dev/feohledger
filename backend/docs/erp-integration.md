@@ -1686,9 +1686,28 @@ OAuth ERP with no consent, have no realm. A sync under one leaves alone every
 row linked, or offered candidates, under a named realm: no re-judging,
 unlinking, id matching, re-linking by code or candidate refresh, and a pulled
 account whose code such a row holds is refused `code_taken`. It works only on
-unlinked rows and NULL-realm links. (A pre-0115 link is NULL-realm too, so a
-mock sync still treats it as its own; the next sync under a named realm
-re-judges it by evidence.)
+unlinked rows and the links such a sync made itself.
+
+**A no-realm sync stamps its links `"mock"`** (`erp_link_realm.UNNAMED_REALM`,
+decisions §496), never NULL, so NULL means only "made before migration 0115".
+Every real realm is `<adapter>:<identity>`; the stamp has no `:`, so it can
+never equal one. What follows from that:
+
+- A no-realm sync leaves a NULL (pre-0115) link alone like a named one: a GL
+  row's colliding code is `code_taken`, and a vendor record whose id a NULL link
+  holds is reported `unverified_link` (neither adopted nor created again). The
+  next sync under a named realm re-judges it by evidence, exactly as before.
+- Under a named realm a `"mock"` link is another company's: refused at the
+  push, judged by the between-companies evidence at a sync (the current code
+  for an account, a name or tax id unique in the pull for a vendor; never the
+  looser pre-0115 rule), recorded as a realm change when kept, and never filed
+  in `gl_account_erp_links` / `vendor_erp_links`. A merge drops one the
+  canonical's row cannot take.
+- A GL decision confirmed under no realm is stamped `"mock"` too.
+- Links a mock sync made between 0115 and §496 are NULL and cannot be told from
+  pre-0115 ones, so they were not backfilled: a no-realm sync now leaves them
+  alone, and a named sync judges them as pre-0115 links. Seeded demo data is
+  stamped `"mock"` (`scripts/seed.py`).
 
 **Needs a decision.** A row rule 3 or 4 left unlinked keeps the ERP accounts it
 could mean (`erp_link_candidates`, refreshed by every pull). `/gl-accounts`
@@ -1729,8 +1748,9 @@ restored link), and the message adds "N restored". Three rules hold:
   always comes back, since it may share its account with the row named after
   it, the one share a person can make.
 - **Only a named realm is kept.** A NULL-realm link (pre-0115, or made by a
-  no-realm sync) names no company, so it is judged by rule 0 as before. A
-  no-realm sync neither keeps nor restores. Nothing was backfilled.
+  no-realm sync before §496) or a `"mock"` one names no company, so it is
+  judged by rule 0 as before. A no-realm sync neither keeps nor restores.
+  Nothing was backfilled.
 - **The push never reads a kept state.** It posts the row's own link, live in
   the current realm, so after reconnecting to a company the chart needs one
   sync before its restored links post (unlike vendors below). A restored
@@ -1795,12 +1815,58 @@ apart from the summary. A collision is never counted as `updated`.
 | `xero` | `Code` (accounts without one skipped) | Xero refuses a second account with the same code. |
 | `sage_accounting` | `nominal_code` | Unique per business ledger. |
 | `sage_accounting_za` | `ID` | The record id. |
-| `sage_intacct` | `id` (ACCOUNTNO) | The account's key. |
+| `sage_intacct` | `id` (ACCOUNTNO) | Unique account number. The link (`erp_account_id`) is the record key, `key:<RECORDNO>` (below). |
 | `syspro` | `GlCode` | The `GenMaster` key. |
-| `blackbaud_fe_nxt` | `account_number` | Unique in the FE NXT chart. |
+| `blackbaud_fe_nxt` | `account_number` | Unique in the FE NXT chart. The link (`erp_account_id`) is the GL API's `account_id`, `id:<account_id>` (below). |
 
 The sync's collision refusal is the backstop for an adapter that gets this
 wrong: a repeatable key leaves accounts unlinked, it never merges them.
+
+**The link is the ERP's own record id where it has one** (decisions §492). A
+row matched by `erp_account_id` keeps its link through a renumbering in the
+ERP (rule 1: name refreshed, new number reported as `code_drift`, no second
+row), so `erp_account_id` must be a surrogate key, not the business number.
+Most adapters already send one (QuickBooks `Id`, Xero `AccountID`, Business
+Central `id`, NetSuite internal id, Sage `id` / `ID`). Of the three that sent
+the number:
+
+- **`sage_intacct`** links by the GLACCOUNT record key, stored `key:<key>` so
+  it can never be mistaken for a bare number-keyed link from before §492 (key
+  `61` and account `61` are both digit strings). A bill line references it
+  `{"key": …}`; a link still holding a number posts `{"id": …}` until the next
+  chart sync re-links that row by code to the key (one `link_changes` entry
+  per row, in the audit row). An account Intacct returns with no key is
+  reported `missing_erp_id`, never keyed by its number.
+  Two cases the re-link cannot get right, both only when the ERP changed
+  before the first keyed pull. An account renumbered first (6100 → 6150)
+  leaves its old row on a dead number, as before §492: nothing records which
+  key the old number belonged to. A number renumbered *and reused* (6100 →
+  6150, then a new account created as 6100) re-keys the old row to the NEW
+  account's key by code. That is no regression — the bare link already posted
+  to that account by number — but it is a row now naming a different account
+  than its history: read the sync audit row's `link_changes` after the first
+  keyed sync and recode any such row.
+- **`syspro`** keeps `GlCode`: `GenMaster` has no surrogate key — the ledger
+  code IS the primary key, AP distributions (APSTIN) take only it, and SYSPRO
+  renumbers through its GL code change program, which rewrites the code on
+  every record rather than moving a record to a new code. There is no stable
+  id to key by.
+- **`blackbaud_fe_nxt`** links by the GL API's `account_id`, stored
+  `id:<account_id>` for the same reason Intacct's carries `key:` (decisions
+  §494). AP distributions take only `account_number`, so the push resolves
+  each `id:` link to the account's **current** number once per push (never a
+  read per line): one `GET /generalledger/v1/accounts/{account_id}` per
+  distinct id when the bill links at most 5 (`CHART_RESOLVE_PER_ID_MAX`; a 404
+  is an id gone from the chart), otherwise one walk of
+  `GET /generalledger/v1/accounts` (stopping at the page holding the last id
+  it needs). The push's call reserve is the path's own cost: the id count, or
+  the walk's page cap. It refuses `account_inactive`
+  (`params.accounts` = our GL codes) before the create when a linked id is no
+  longer in the chart or is closed to data entry. A link still holding a
+  number posts by that number, with no chart read, until the next chart sync
+  re-links the row by code to the id (`link_changes`, as for Intacct; the same
+  two renumbered-before-the-first-keyed-pull cases apply). An account FE NXT
+  returns with no `account_id` is reported `missing_erp_id`.
 
 **Vendors** (`services/vendor_sync`) already matched by `erp_vendor_id` first.
 The name fallback — adopting a manually created, unlinked vendor of the same
@@ -1859,7 +1925,8 @@ ambiguous. Three rules hold:
   (`unlinked`, `kept: false`) instead of restored. A link from another company
   is not adopted onto an id a vendor already holds here.
 - **Only a named realm is kept.** A NULL-realm link (pre-0115, or made by a
-  no-realm sync) names no company, so it is dropped as before. A no-realm sync
+  no-realm sync before §496) or a `"mock"` one names no company, so it is
+  dropped as before. A no-realm sync
   neither keeps nor restores anything. No link was backfilled: the ones earlier
   syncs dropped appear only in audit rows, which are history, not live links.
 
@@ -2638,6 +2705,27 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   tenant slug. Nor does it accept the generic shape for a Merge tenant under
   any `erp_type`: Merge holds that key, and the generic route trusts the body
   (§ Webhook endpoint above).
+- **No status sync, and why (decisions §504).** Read against the same spec on
+  2026-11-24: Merge's `Payment` is `POST` / `GET` / `PATCH` only (no `DELETE`
+  or void), and neither `Payment` nor `PaymentRequest` has a memo or reference
+  field. A payment written back through Merge could therefore carry no marker
+  of ours, so (a) a retry after an unknown outcome cannot find it again (the
+  `Idempotency-Key` header is a beta Merge enables per customer and keeps
+  24 hours), (b) the bill report cannot tell it from a person's payment, so
+  every write-back would read back as "paid outside FeohLedger", and (c) a
+  FeohLedger void cannot reverse it. `post_payment` / `void_payment` stay the
+  base refusals, `supports_status_sync` stays False, and a push still closes at
+  `done`. The read side is in place for when that changes:
+  `MergeDevAdapter.changed_bills(since)` walks `GET /invoices?type=
+  ACCOUNTS_PAYABLE&modified_after=` and `GET /payments?modified_after=&expand=
+  applied_to_lines` (`include_deleted_data=true`, 100 a page, `cursor`), a
+  payment naming its bills through `applied_to_lines` rows of type `INVOICE`,
+  whole or `ErpListingIncomplete`; `bills_for_payment` reads one payment the
+  same way. `modified_after` is Merge's own sync time, so it is a change feed.
+  Two more things stand between that and a sweep: the sweep selects tenants by
+  their OAuth block (`settings.erp.oauth.provider`), which a Merge tenant has
+  none of, and `bill_report` states no `paid_amount`, so an ERP payment would be
+  recorded at the figure owed here (`docs/followups.md`).
 
 ## Sage Intacct direct adapter (`sage_intacct`)
 
@@ -3308,11 +3396,11 @@ so every tenant on the platform key draws on one bucket — see *Call budget* be
 
 | Operation | Call |
 |---|---|
-| `post_invoice` | pre-flight refusals → `GET /accountspayable/v1/invoices?search_text=<number>&limit=500` (narrowed by `from_date`/`to_date` only when that page is full) → `GET /generalledger/v1/fiscalyears` (cached 15 min per environment) → `POST /accountspayable/v1/invoices/process` (on a 400, `GET /vendors/{id}`) → `GET …/backgroundProcess/{id}/status` (≤ 5 reads, backing off 1, 2, 4, 8 s) → `…/result` |
+| `post_invoice` | pre-flight refusals → `GET /accountspayable/v1/invoices?search_text=<number>&limit=500` (narrowed by `from_date`/`to_date` only when that page is full) → `GET /generalledger/v1/fiscalyears` (cached 15 min per environment) → only when a distribution is `id:`-linked (§494): `GET /generalledger/v1/accounts/{account_id}` once per distinct id when there are ≤ 5, else `GET /generalledger/v1/accounts`, 100 a page, until every linked id is found → `POST /accountspayable/v1/invoices/process` (on a 400, `GET /vendors/{id}`) → `GET …/backgroundProcess/{id}/status` (≤ 5 reads, backing off 1, 2, 4, 8 s) → `…/result` |
 | `get_invoice_status` | `GET /accountspayable/v1/invoices/{id}`: `Pending` draft, `Approved` open (a zero balance stays open until FE NXT says `Paid`, decisions §303), `PartiallyPaid`, `Paid`, `Deleted` cancelled |
 | `void_invoice` | not automated (`False`): the AP API has no invoice delete, and cancelling a posted payable is an adjustment in an open period |
 | `list_vendors` / `list_pos` | `GET /accountspayable/v1/vendors` / `/purchaseorders`, 100 a page; vendors up to `SYNC_LISTING_MAX_ROWS` (else `ErpListingIncomplete`), with `vendor_status` `Inactive` **and `OnHold`** emitted `active=False`; POs read whole the same way (`list_pos_report`; a failed page, a transport error or more than `SYNC_LISTING_MAX_ROWS` raises `ErpListingIncomplete`, never an empty or partial list), linked to their vendor by `vendor_id` (`PoPayload.vendor_erp_id`); template POs dropped; a `DeletedOrder` comes through `cancelled` when it carries a total (so a row synced earlier stops counting as an open commitment) and is dropped, never marked, when it does not; any other PO with no usable `order_total` skipped and named in `skipped` as `unpriceable` (§323); PO `currency` stays NULL |
-| `list_gl_accounts` | `GET /generalledger/v1/accounts`, keyed by `account_number` (what AP distributions take), up to `SYNC_LISTING_MAX_ROWS`; `prevent_data_entry` accounts emitted `active=False`; `account_type` unclassified (FE NXT's `class` is a net-asset class) |
+| `list_gl_accounts` | `GET /generalledger/v1/accounts`, coded by `account_number` and linked by `account_id` (`id:<id>`, §494; no id → no link), up to `SYNC_LISTING_MAX_ROWS`; `prevent_data_entry` accounts emitted `active=False`; `account_type` unclassified (FE NXT's `class` is a net-asset class) |
 | `test_connection` | an `environment_id` was captured at consent + `GET /accountspayable/v1/vendors?limit=1` |
 
 Request rules worth knowing:
@@ -3410,7 +3498,10 @@ Request rules worth knowing:
   may take it past `FEOH_ERP_BLACKBAUD_DAILY_CALL_QUOTA`. A 429 or a quota
   403 records its `Retry-After` as a cool-down for the whole key. A push asks
   for its worst case first (`push_call_reserve`: 14 calls, 6 more when it
-  reads an earlier job, 4 more per extra date searched) and then runs to the
+  reads an earlier job, 4 more per extra date searched, and
+  `CHART_RESOLVE_MAX_PAGES` — the sync's own 100-page bound — more when a
+  distribution is `id:`-linked, though the walk stops once every id is found,
+  usually after one page) and then runs to the
   end, so its refusal always comes before the first call:
   `erp_call_budget_exhausted` with `params.reason` (`tenant_budget`,
   `subscription_quota`, `rate_limited`) and `params.retry_after`. Only
@@ -3436,8 +3527,11 @@ Request rules worth knowing:
   `ap_account_not_configured`, `currency_not_configured`, `currency_mismatch`,
   `invoice_date_missing`, `due_date_missing`, `amount_not_positive`,
   `duplicate_invoice_number`, `idempotency_lookup_incomplete`,
-  `period_closed`, `vendor_inactive`, `job_failed`, `job_unconfirmed`,
-  `erp_call_budget_exhausted`.
+  `period_closed`, `vendor_inactive`, `account_inactive` (an `id:` link the
+  chart no longer holds, or closed to data entry; §494), `job_failed`,
+  `job_unconfirmed`, `erp_call_budget_exhausted`. A chart page SKY refuses
+  while resolving `id:` links fails the push uncoded before the create
+  (retryable for a rate limit or a 5xx).
 
 Tests: `backend/tests/test_erp_blackbaud_adapter.py`, and end to end through the
 real OAuth connect `frontend/tests-e2e/erp/blackbaud-fe-nxt.spec.ts`. fake-erp

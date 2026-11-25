@@ -22,6 +22,19 @@ class ForgotPasswordResponse(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str = Field(..., min_length=1)
     new_password: str = Field(..., max_length=128)
+    # The Terms / Privacy versions the page showed beside its accept checkbox.
+    # Required (the versions in force, exactly) when the check response said
+    # `legal_acceptance_required` — an admin-created user's first password, or
+    # anyone who has not accepted the current versions (decisions §495).
+    accepted_terms_version: str | None = Field(default=None, max_length=32)
+    accepted_privacy_version: str | None = Field(default=None, max_length=32)
+
+
+class LegalAcceptanceRequest(BaseModel):
+    """The versions the accept step showed; only the versions in force pass."""
+
+    accepted_terms_version: str | None = Field(default=None, max_length=32)
+    accepted_privacy_version: str | None = Field(default=None, max_length=32)
 
 
 class ResetPasswordCheckRequest(BaseModel):
@@ -35,6 +48,10 @@ class ResetPasswordCheckResponse(BaseModel):
     and the sign-in link the page offers afterwards."""
 
     email: str
+    # True when this account has not accepted the Terms of Service and Privacy
+    # Policy versions in force: the page then shows the required accept
+    # checkbox, and redeeming without it is refused (decisions §495).
+    legal_acceptance_required: bool = False
 
 
 class ResetPasswordResponse(BaseModel):
@@ -98,6 +115,11 @@ class UserResponse(BaseModel):
     # outbound email copy only — NOT in-app UI (the frontend's per-device locale
     # picker owns that). See docs/notifications.md § Localized email.
     locale: str | None = None
+    # The caller has not accepted the Terms of Service / Privacy Policy versions
+    # in force (`services/legal_acceptance.CURRENT_LEGAL_VERSIONS`): the SPA
+    # shows its blocking accept step until `POST /api/auth/legal-acceptance`
+    # records it (decisions §495).
+    legal_acceptance_required: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -219,13 +241,15 @@ class WebAuthnAuthFinishRequest(BaseModel):
 # The closed set of operations a step-up can authorize: the four factor changes
 # (`api/auth._require_mfa_step_up`) plus the sensitive actions gated by
 # `api/auth.require_sensitive_step_up` — the unmasked-banking DSAR export and
-# closing the workspace (`api/organization_close`). A step-up assertion is
+# closing the workspace (`api/organization_close`) and minting / rotating the
+# SCIM provisioning token (`api/organization.mint_scim_token`). A step-up assertion is
 # bound to exactly one of these (it selects the Redis challenge slot), so an
 # assertion obtained for one can't be replayed against another. Keep in
 # lockstep with the `operation=` literals at those call sites and with the
 # pattern below.
 STEP_UP_OPERATION_DSAR_UNMASKED = "dsar_unmasked_export"
 STEP_UP_OPERATION_WORKSPACE_CLOSE = "workspace_close"
+STEP_UP_OPERATION_SCIM_TOKEN_MINT = "scim_token_mint"
 STEP_UP_OPERATIONS = (
     "totp_enroll",
     "totp_disable",
@@ -233,6 +257,7 @@ STEP_UP_OPERATIONS = (
     "passkey_delete",
     STEP_UP_OPERATION_DSAR_UNMASKED,
     STEP_UP_OPERATION_WORKSPACE_CLOSE,
+    STEP_UP_OPERATION_SCIM_TOKEN_MINT,
 )
 
 
@@ -250,7 +275,7 @@ class WebAuthnStepUpStartRequest(BaseModel):
         ...,
         pattern=(
             "^(totp_enroll|totp_disable|passkey_register|passkey_delete"
-            "|dsar_unmasked_export|workspace_close)$"
+            "|dsar_unmasked_export|workspace_close|scim_token_mint)$"
         ),
     )
 

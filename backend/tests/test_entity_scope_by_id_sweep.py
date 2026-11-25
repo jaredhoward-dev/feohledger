@@ -543,3 +543,201 @@ async def test_card_inspection_suggestion_and_exception_routes_are_entity_scoped
         own = {"X-Entity-ID": default_id}
         assert (await c.get(f"/api/inspections/{inspection_id}", headers=own)).status_code == 200
         assert (await c.get(f"/api/inspections/{inspection_id}")).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Bulk endpoints that take ids (decisions §509): an out-of-scope id is treated
+# exactly as a missing one, and the consolidated view still reaches every row.
+# ---------------------------------------------------------------------------
+
+
+def _invoice(org_id, entity_id, number: str) -> Invoice:
+    return Invoice(
+        invoice_number=number,
+        vendor_name="Acme Supplies",
+        amount=Decimal("250.00"),
+        currency="USD",
+        status=InvoiceStatus.new,
+        organization_id=org_id,
+        entity_id=entity_id,
+    )
+
+
+async def test_invoice_bulk_export_is_entity_scoped(realdb):
+    async with realdb.client(key=TENANT, role="admin") as c:
+        org_id, mk, default_id, other_id, dflt = await _setup(realdb, c, "bulkexp")
+        tag = _tag()
+        theirs = await _add(mk, _invoice(org_id, dflt, f"INV-OUT-{tag}"))
+        mine = await _add(mk, _invoice(org_id, uuid.UUID(other_id), f"INV-IN-{tag}"))
+        scoped = {"X-Entity-ID": other_id}
+
+        mixed = await c.post(
+            "/api/invoices/bulk/export",
+            json={"ids": [str(theirs), str(mine)], "format": "json"},
+            headers=scoped,
+        )
+        only_out = await c.post(
+            "/api/invoices/bulk/export", json={"ids": [str(theirs)]}, headers=scoped
+        )
+        missing = await c.post(
+            "/api/invoices/bulk/export", json={"ids": [str(uuid.uuid4())]}, headers=scoped
+        )
+        consolidated = await c.post(
+            "/api/invoices/bulk/export", json={"ids": [str(theirs), str(mine)], "format": "json"}
+        )
+
+    assert mixed.status_code == 200, mixed.text
+    assert [r["invoice_number"] for r in mixed.json()] == [f"INV-IN-{tag}"]
+    assert only_out.status_code == 404
+    assert only_out.json() == missing.json()
+    assert consolidated.status_code == 200, consolidated.text
+    assert sorted(r["invoice_number"] for r in consolidated.json()) == [
+        f"INV-IN-{tag}",
+        f"INV-OUT-{tag}",
+    ]
+
+
+@pytest.mark.parametrize(
+    "path, extra",
+    [
+        ("/api/invoices/bulk/export", {}),
+        ("/api/invoices/bulk/delete", {}),
+        ("/api/invoices/bulk/status", {"status": "ready_for_review"}),
+        ("/api/vendors/bulk/export", {}),
+    ],
+)
+async def test_bulk_id_lists_reject_a_malformed_id_with_422(realdb, path, extra):
+    """The ids are parsed by the schema, so a malformed one is a 422, not the
+    500 an in-handler `uuid.UUID(...)` raised."""
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post(path, json={"ids": ["not-a-uuid"], **extra})
+    assert resp.status_code == 422, resp.text
+
+
+async def test_vendor_bulk_export_is_entity_scoped(realdb):
+    async with realdb.client(key=TENANT, role="admin") as c:
+        org_id, mk, default_id, other_id, dflt = await _setup(realdb, c, "venexp")
+        tag = _tag()
+        theirs = await _add(
+            mk, Vendor(name=f"Out Vendor {tag}", organization_id=org_id, entity_id=dflt)
+        )
+        mine = await _add(
+            mk,
+            Vendor(name=f"In Vendor {tag}", organization_id=org_id, entity_id=uuid.UUID(other_id)),
+        )
+        # Unstamped vendors stay reachable from every entity, as on the by-id routes.
+        shared = await _add(
+            mk, Vendor(name=f"Shared Vendor {tag}", organization_id=org_id, entity_id=None)
+        )
+        scoped = {"X-Entity-ID": other_id}
+        ids = [str(theirs), str(mine), str(shared)]
+
+        mixed = await c.post("/api/vendors/bulk/export", json={"ids": ids}, headers=scoped)
+        only_out = await c.post(
+            "/api/vendors/bulk/export", json={"ids": [str(theirs)]}, headers=scoped
+        )
+        missing = await c.post(
+            "/api/vendors/bulk/export", json={"ids": [str(uuid.uuid4())]}, headers=scoped
+        )
+        consolidated = await c.post("/api/vendors/bulk/export", json={"ids": ids})
+
+    assert mixed.status_code == 200, mixed.text
+    assert f"In Vendor {tag}" in mixed.text
+    assert f"Shared Vendor {tag}" in mixed.text
+    assert f"Out Vendor {tag}" not in mixed.text
+    assert only_out.status_code == 404
+    assert only_out.json() == missing.json()
+    assert consolidated.status_code == 200, consolidated.text
+    for name in ("In Vendor", "Out Vendor", "Shared Vendor"):
+        assert f"{name} {tag}" in consolidated.text
+
+
+async def test_vendor_bulk_status_and_screen_are_entity_scoped(realdb):
+    """`bulk/status` and `bulk/screen` resolved each id on the primary key
+    alone; an out-of-scope id is now skipped as "not found", as an unknown id
+    is, and the row is left untouched."""
+    async with realdb.client(key=TENANT, role="admin") as c:
+        org_id, mk, default_id, other_id, dflt = await _setup(realdb, c, "venbulk")
+        theirs = await _add(
+            mk,
+            Vendor(
+                name=f"Out Vendor {_tag()}",
+                organization_id=org_id,
+                entity_id=dflt,
+                status="unverified",
+            ),
+        )
+        mine = await _add(
+            mk,
+            Vendor(
+                name=f"In Vendor {_tag()}",
+                organization_id=org_id,
+                entity_id=uuid.UUID(other_id),
+                status="unverified",
+            ),
+        )
+        unknown = str(uuid.uuid4())
+        scoped = {"X-Entity-ID": other_id}
+
+        status = await c.post(
+            "/api/vendors/bulk/status",
+            json={"ids": [str(theirs), str(mine), unknown], "status": "active"},
+            headers=scoped,
+        )
+        screen = await c.post(
+            "/api/vendors/bulk/screen",
+            json={"ids": [str(theirs), unknown]},
+            headers=scoped,
+        )
+
+    assert status.status_code == 200, status.text
+    body = status.json()
+    assert body["updated"] == 1
+    reasons = {s["id"]: s["reason"] for s in body["skipped"]}
+    assert reasons == {str(theirs): "not found", unknown: "not found"}
+    assert screen.status_code == 200, screen.text
+    assert screen.json()["screened"] == 0
+    assert {s["id"]: s["reason"] for s in screen.json()["skipped"]} == {
+        str(theirs): "not found",
+        unknown: "not found",
+    }
+    assert (await _reload(mk, Vendor, theirs)).status == "unverified"
+    assert (await _reload(mk, Vendor, mine)).status == "active"
+
+
+async def test_workflow_bulk_delete_is_entity_scoped(realdb):
+    async with realdb.client(key=TENANT, role="admin") as c:
+        org_id, mk, default_id, other_id, dflt = await _setup(realdb, c, "wfbulk")
+        steps = {"steps": [{"type": "approval"}]}
+        theirs = await _add(
+            mk,
+            WorkflowDefinition(
+                name=f"Out WF {_tag()}",
+                steps_config=steps,
+                organization_id=org_id,
+                entity_id=dflt,
+                is_active=False,
+            ),
+        )
+        mine = await _add(
+            mk,
+            WorkflowDefinition(
+                name=f"In WF {_tag()}",
+                steps_config=steps,
+                organization_id=org_id,
+                entity_id=uuid.UUID(other_id),
+                is_active=False,
+            ),
+        )
+        resp = await c.post(
+            "/api/workflows/bulk-delete",
+            json={"workflow_ids": [str(theirs), str(mine)]},
+            headers={"X-Entity-ID": other_id},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["deleted"] == [str(mine)]
+    assert [(f["workflow_id"], f["reason"]) for f in body["failed"]] == [(str(theirs), "not_found")]
+    assert await _reload(mk, WorkflowDefinition, theirs) is not None
+    assert await _reload(mk, WorkflowDefinition, mine) is None

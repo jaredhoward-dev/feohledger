@@ -8,7 +8,14 @@ import { en as enMain } from '../i18n/locales/en';
 import { enRefusal } from '../i18n/locales/refusal/en';
 import { interpolate } from '../i18n/interpolate';
 import type { MessageKey } from '../i18n/messages';
-import { ROLE_NOT_PERMITTED, isAllowed, isOffered, refusalText } from './actionVerdicts';
+import {
+	ROLE_NOT_PERMITTED,
+	isAllowed,
+	isOffered,
+	offersBulk,
+	refusalText,
+	tallyBulkVerdicts
+} from './actionVerdicts';
 
 const en = { ...enMain, ...enRefusal };
 
@@ -107,5 +114,30 @@ describe('refusalText', () => {
 
 	it('is empty for no refusal', () => {
 		expect(refusalText(null, t)).toBe('');
+	});
+});
+
+describe('tallyBulkVerdicts (decisions §507)', () => {
+	const refusal = { code: 'contract_status_refused', message: 'no', params: {} };
+	const rows = [
+		{ id: 'a', v: null },
+		{ id: 'b', v: refusal },
+		{ id: 'c', v: undefined }
+	] as const;
+	const of = (r: (typeof rows)[number]) => r.v;
+
+	it('counts allowed, refused (incl. an unanswered verdict) and unloaded ids', () => {
+		expect(tallyBulkVerdicts(['a', 'b', 'c', 'zz'], rows, of)).toEqual({
+			allowed: 1,
+			refused: 2,
+			unknown: 1
+		});
+	});
+
+	it('offers an action only when some selected row takes it or is not loaded', () => {
+		expect(offersBulk(tallyBulkVerdicts(['b', 'c'], rows, of))).toBe(false);
+		expect(offersBulk(tallyBulkVerdicts(['a', 'b'], rows, of))).toBe(true);
+		expect(offersBulk(tallyBulkVerdicts(['b', 'zz'], rows, of))).toBe(true);
+		expect(offersBulk(tallyBulkVerdicts([], rows, of))).toBe(false);
 	});
 });

@@ -39,6 +39,7 @@ from sqlalchemy import delete, select
 from app.models.organization import Organization
 from app.models.signup import EmailVerification
 from app.models.user import User, UserRole
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
 
 pytestmark = pytest.mark.asyncio
 
@@ -82,6 +83,9 @@ def _signup_body(slug: str, email: str) -> dict:
         "admin_name": "Shape Tester",
         "admin_email": email,
         "captcha_token": "ignored-in-dev",
+        # Accepted, so a refusal here can only be the address's (decisions §495).
+        "accepted_terms_version": CURRENT_LEGAL_VERSIONS["terms"],
+        "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
     }
 
 

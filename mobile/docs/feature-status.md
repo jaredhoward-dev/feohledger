@@ -189,6 +189,15 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   analytics read recomputed server-side on every call
 - Role-based bottom navigation
 - Settings (profile, tenant info, logout)
+- **Help** — Settings → Help opens the web help centre (`/help`) of the
+  signed-in workspace in the browser; the app holds no copy of the guides. The
+  address is the platform's tenant URL template from `GET /api/public-config`
+  with the session's tenant slug substituted (`lib/utils/tenant_web_url.dart`,
+  the mobile half of the backend's `tenant_base_url`), resolved on tap and
+  opened only when it is an absolute `https` URL; otherwise, or when no browser
+  takes it, a snackbar says to open Help from the web. The row is one link
+  semantics node ("Help, Guides for your workspace, opened in your browser").
+  Every role gets it (decisions §503)
 - JWT in secure storage (iOS Keychain / Android Keystore)
 - MFA challenge login — when `POST /api/auth/login` returns an MFA challenge
   (instead of a `TokenResponse`), `AuthStore.login` reports `mfaRequired` and the
@@ -200,10 +209,26 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   error and keep the user on the screen to retry. An org-enforced un-enrolled
   user (`must_enroll`) gets an email-only flow plus a banner to finish
   authenticator setup in the web app (enrollment + passkeys are web-only)
+- Terms / Privacy accept step — when `GET /api/auth/me` says
+  `legal_acceptance_required` (after sign-in, on session restore, or on app
+  resume, which re-reads `/me`), `AuthGate` shows `LegalAcceptScreen` instead
+  of the shell: links to the published `/legal/terms` and `/legal/privacy`
+  pages (opened in the browser), a required checkbox, Accept and Sign out.
+  Accept posts the versions in `lib/legal_versions.generated.dart` to
+  `POST /api/auth/legal-acceptance`; a coded 422 means this build is older than
+  the documents in force and the screen says to update the app instead of
+  asking again (decisions §495, §498). Nothing else gets past it: a
+  notification deep link waits until it is cleared (see Push notifications),
+  and a resume's `/me` re-read never supersedes an accept already in flight.
+  A call the server-side gate refuses mid-session (403
+  `legal_acceptance_required`, decisions §505) re-reads `/me` through
+  `AuthStore.legalAcceptanceRefused`, so the step comes up then too.
+  Each notice is announced once, through `A11y.announce`, and the busy Accept
+  button keeps its name ("Loading…")
 - Camera OCR — snap photo or pick from gallery → upload → trigger AI extraction
 - File upload via file picker — pick a PDF / PNG / JPG / TIFF document on the device (`CameraCapture.pickDocument` → `file_picker`) and upload it through the same `/api/invoices/upload` extraction pipeline as the camera path. The capture screen offers Camera / Gallery / Choose file; PDFs preview as a document card (no inline bitmap), images preview inline
 - File viewer — the invoice detail screen previews the uploaded file (image thumbnail or a PDF card) and opens it full-screen via `InvoiceFileViewer`: images via `Image.network` (auth headers), PDFs fetched as bytes (`ApiClient.getBytes`, so the JWT + tenant headers are attached) and rendered with `pdfx`; loading / error / Retry states
-- Push notifications — Firebase Cloud Messaging (foreground + background), no-op if Firebase not configured. The device's FCM registration — since firebase_messaging 17 its Firebase Installation ID (FID), from `register()` + `onRegistered`, which replaced the deprecated `getToken()` / `onTokenRefresh` — is registered with the backend (`POST /api/notifications/device-token`, best-effort — a failure is logged and swallowed) whenever `onRegistered` fires and again on every sign-in (`PushService.registerWithBackend`, called by the auth gate, because push init runs before session restore and `onRegistered` fires only when the identifier changes) — see `backend/docs/notifications.md` § Push device tokens; registration only, no server-side push-SENDING adapter exists yet. Tapping a background/terminated notification deep-links to `InvoiceDetailScreen` for `message.data['invoice_id']` via `PushService.navigatorKey` (a `GlobalKey<NavigatorState>` wired into `MaterialApp.navigatorKey` in `main.dart`, since the FCM tap callback runs outside the widget tree with no `BuildContext` of its own); a missing id or an unmounted navigator no-ops rather than crashing
+- Push notifications — Firebase Cloud Messaging (foreground + background), no-op if Firebase not configured. The device's FCM registration — since firebase_messaging 17 its Firebase Installation ID (FID), from `register()` + `onRegistered`, which replaced the deprecated `getToken()` / `onTokenRefresh` — is registered with the backend (`POST /api/notifications/device-token`, best-effort — a failure is logged and swallowed) whenever `onRegistered` fires and again on every sign-in (`PushService.registerWithBackend`, called by the auth gate, because push init runs before session restore and `onRegistered` fires only when the identifier changes) — or, when the sign-in meets the Terms / Privacy accept step, which the server's gate refuses the registration behind, when that step clears (decisions §505) — see `backend/docs/notifications.md` § Push device tokens; registration only, no server-side push-SENDING adapter exists yet. Tapping a background notification (`onMessageOpenedApp`) or one that launched the app from terminated (`getInitialMessage`) deep-links to `InvoiceDetailScreen` for `message.data['invoice_id']` — but `PushService` never pushes a route itself: it holds the id in `PushService.pendingInvoiceLink`, and the root `AuthGate` opens it only once the app shell is reachable (booted, signed in, not biometric-locked, and no Terms / Privacy acceptance required, decisions §498). A link that arrives behind any of those waits there and opens when the gate clears; signing out drops it; a missing id holds nothing. Before this, a tap pushed the detail straight onto the root navigator, over the accept step
 - Offline mode — SQLite cache for dashboard and invoice list, serves cached data on network failure; **scoped to the signed-in `(tenant, user)`** and torn down on logout (see Session lifetime + offline-cache scoping)
 - Biometric login — Face ID / fingerprint / device PIN, toggle in settings, checked on app launch
 

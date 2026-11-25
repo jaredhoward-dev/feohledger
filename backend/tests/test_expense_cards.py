@@ -13,6 +13,7 @@ import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
 from app.models.entity import Entity
@@ -658,6 +659,111 @@ async def test_list_filters_by_status(realdb):
         ).json()
     assert ignored["total"] == 1
     assert unmatched["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GET /counts — the Cards tab's KPI row
+# ---------------------------------------------------------------------------
+
+
+async def _add_card_row(
+    realdb, *, status: str, txn_date: date, entity_id=None, virtual_card_id=None, key="a"
+) -> None:
+    org_id = realdb.info(key).org_id
+    async with realdb.sessionmaker(key)() as s:
+        s.add(
+            CorporateCardTransaction(
+                organization_id=org_id,
+                entity_id=entity_id or await _default_entity_id(s),
+                txn_date=txn_date,
+                merchant="Stub",
+                amount=Decimal("10.00"),
+                currency="USD",
+                external_txn_id=f"cnt-{uuid.uuid4().hex[:10]}",
+                reconciliation_status=status,
+                virtual_card_id=virtual_card_id,
+            )
+        )
+        await s.commit()
+
+
+async def test_counts_match_the_list_and_zero_fill(realdb):
+    for _ in range(3):
+        await _add_card_row(realdb, status="unmatched", txn_date=date(2026, 6, 1))
+    await _add_card_row(realdb, status="ignored", txn_date=date(2026, 6, 2))
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        resp = await c.get("/api/corporate-card-transactions/counts")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Every status is present — `matched` as an explicit zero.
+        assert body == {"total": 4, "by_status": {"unmatched": 3, "matched": 0, "ignored": 1}}
+        for status, n in body["by_status"].items():
+            listed = await c.get(
+                f"/api/corporate-card-transactions?reconciliation_status={status}&page_size=1"
+            )
+            assert listed.json()["total"] == n, status
+        assert (await c.get("/api/corporate-card-transactions?page_size=1")).json()[
+            "total"
+        ] == body["total"]
+
+
+async def test_counts_apply_population_filters_but_not_status(realdb):
+    await _add_card_row(realdb, status="unmatched", txn_date=date(2026, 5, 31))
+    await _add_card_row(realdb, status="unmatched", txn_date=date(2026, 6, 10))
+    await _add_card_row(realdb, status="matched", txn_date=date(2026, 6, 11))
+    await _add_card_row(realdb, status="matched", txn_date=date(2026, 7, 1))
+    async with realdb.client(key="a", role="cfo") as c:
+        window = "date_from=2026-06-01&date_to=2026-06-30"
+        body = (await c.get(f"/api/corporate-card-transactions/counts?{window}")).json()
+        assert body == {"total": 2, "by_status": {"unmatched": 1, "matched": 1, "ignored": 0}}
+        # A status filter is the tallied dimension: ignored, never applied.
+        filtered = (
+            await c.get(
+                f"/api/corporate-card-transactions/counts?{window}&reconciliation_status=matched"
+            )
+        ).json()
+        assert filtered == body
+        listed = (await c.get(f"/api/corporate-card-transactions?{window}")).json()
+        assert listed["total"] == body["total"]
+        # virtual_card_id narrows exactly as the list's does.
+        none = (
+            await c.get(f"/api/corporate-card-transactions/counts?virtual_card_id={uuid.uuid4()}")
+        ).json()
+        assert none["total"] == 0
+
+
+async def test_counts_rbac_and_tenant_isolation(realdb):
+    await _add_card_row(realdb, status="unmatched", txn_date=date(2026, 6, 1))
+    async with realdb.client(key="a", role=None) as c:
+        assert (await c.get("/api/corporate-card-transactions/counts")).status_code == 401
+    for role in ("admin", "ap_manager", "ap_clerk", "cfo"):
+        async with realdb.client(key="a", role=role) as c:
+            assert (await c.get("/api/corporate-card-transactions/counts")).status_code == 200
+    async with realdb.client(key="b", role="admin") as c:
+        assert (await c.get("/api/corporate-card-transactions/counts")).json()["total"] == 0
+
+
+@pytest.mark.plan("scale")
+async def test_counts_are_entity_scoped_like_the_list(realdb):
+    async with realdb.client(key="a", role="admin") as c:
+        r = await c.post("/api/entities", json={"name": "Card Sub", "slug": "card-sub"})
+        assert r.status_code == 201, r.text
+        other_id = r.json()["id"]
+        default_id = next(e["id"] for e in (await c.get("/api/entities")).json() if e["is_default"])
+    await _add_card_row(realdb, status="unmatched", txn_date=date(2026, 6, 1))
+    await _add_card_row(
+        realdb, status="matched", txn_date=date(2026, 6, 1), entity_id=uuid.UUID(other_id)
+    )
+    async with realdb.client(key="a", role="admin") as c:
+        c.headers["X-Entity-ID"] = default_id
+        own = (await c.get("/api/corporate-card-transactions/counts")).json()
+        assert own == {"total": 1, "by_status": {"unmatched": 1, "matched": 0, "ignored": 0}}
+        assert (await c.get("/api/corporate-card-transactions")).json()["total"] == 1
+        c.headers["X-Entity-ID"] = other_id
+        sub = (await c.get("/api/corporate-card-transactions/counts")).json()
+        assert sub == {"total": 1, "by_status": {"unmatched": 0, "matched": 1, "ignored": 0}}
+        del c.headers["X-Entity-ID"]
+        assert (await c.get("/api/corporate-card-transactions/counts")).json()["total"] == 2
 
 
 # ---------------------------------------------------------------------------

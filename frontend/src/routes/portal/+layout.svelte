@@ -2,8 +2,10 @@
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 	import { portalBrand } from '#lib/stores/portalBrand.svelte.ts';
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
+	import LegalAcceptStep from '#lib/components/layout/LegalAcceptStep.svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
+	import { safePortalNextPath, withPortalNext } from '#lib/utils/postLoginRedirect.ts';
 	import { browser } from '$app/env';
 	import { hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -54,7 +56,10 @@
 			!isSetPasswordLink &&
 			!isForgotPassword
 		) {
-			goto('/portal/login');
+			// Carry the page they asked for through sign-in (an emailed deep
+			// link such as `/portal/invoices?chat=<id>` must land where it points).
+			const next = safePortalNextPath(`${path}${page.url.search}`);
+			goto(next ? `/portal/login?${new URLSearchParams({ next })}` : '/portal/login');
 			return;
 		}
 		if (portalAuth.loggedIn && !portalAuth.user) {
@@ -66,7 +71,13 @@
 			portalAuth.user?.must_change_password &&
 			path !== '/portal/change-password'
 		) {
-			goto('/portal/change-password');
+			// Keep the destination: from the sign-in page it is that page's own
+			// `?next=`, anywhere else the page being left.
+			const next =
+				path === '/portal/login'
+					? page.url.searchParams.get('next')
+					: `${path}${page.url.search}`;
+			goto(withPortalNext('/portal/change-password', next));
 		}
 	});
 
@@ -120,6 +131,51 @@
 			<a href="/legal">{m('portal.shell.footerPlatformLegal')}</a>
 		</footer>
 	</div>
+{:else if portalAuth.loggedIn && portalAuth.user && !portalAuth.user.must_change_password && portalAuth.user.legal_acceptance_required}
+	<!--
+		The Privacy Policy re-prompt (docs/decisions.md §500), in the shell's
+		place like the employee step (§497): no portal page mounts behind it, so
+		none of their reads run before the supplier has acknowledged, and the URL
+		is left alone, so the page they asked for renders the moment the flag
+		clears. The forced password change comes first (its route is standalone,
+		above). The tenant's white-label mark stands in for ours, as in the header.
+	-->
+	<LegalAcceptStep
+		documents="privacy"
+		onaccept={portalAuth.acknowledgeLegal}
+		onlogout={handleLogout}
+	>
+		{#snippet mark()}
+			{#if portalBrand.mark.kind === 'logo'}
+				<img
+					class="step-logo"
+					src={portalBrand.logoUrl}
+					alt={portalBrand.productName}
+					draggable="false"
+				/>
+			{:else if portalBrand.mark.kind === 'platform'}
+				<BrandMark size={36} />
+			{:else}
+				<!-- A product name with no logo: the name itself is the mark, so the
+				     step says whose portal this is (the heading names the platform's
+				     policy, not the tenant's). Not a heading: the <h1> follows. -->
+				<p class="step-product" data-testid="legal-step-product">{portalBrand.productName}</p>
+			{/if}
+		{/snippet}
+		{#snippet footer()}
+			{#if portalBrand.supportUrl}
+				<!-- A supplier unsure what they are agreeing to has no AP colleague
+				     to ask; the tenant's own support URL, as in the shell footer. -->
+				<a
+					class="step-support"
+					href={portalBrand.supportUrl}
+					target="_blank"
+					rel="noopener noreferrer"
+					data-testid="legal-step-support">{m('portal.privacyAck.support')}</a
+				>
+			{/if}
+		{/snippet}
+	</LegalAcceptStep>
 {:else if portalAuth.loggedIn && portalAuth.user && !portalAuth.user.must_change_password}
 	<div class="portal-shell">
 		<!-- WCAG 2.4.1 Bypass Blocks. -->
@@ -178,6 +234,10 @@
 					aria-current={page.url.pathname.startsWith('/portal/notifications') ? 'page' : undefined}
 					>{m('portal.nav.notifications')}</a
 				>
+				<a href="/portal/help" class:active={page.url.pathname.startsWith('/portal/help')}
+					aria-current={page.url.pathname.startsWith('/portal/help') ? 'page' : undefined}
+					>{m('portal.nav.help')}</a
+				>
 			</nav>
 			<div class="user">
 				<span>{portalAuth.user.full_name}</span>
@@ -228,6 +288,30 @@
 		color: var(--text-muted);
 	}
 
+	.step-logo {
+		max-height: 36px;
+		max-width: 160px;
+		object-fit: contain;
+		align-self: flex-start;
+	}
+
+	.step-product {
+		margin: 0;
+		font-size: 1rem;
+		font-weight: 600;
+		color: var(--text);
+		overflow-wrap: anywhere;
+	}
+
+	/* 24px tall: a standalone link is a target (WCAG 2.5.8). */
+	.step-support {
+		align-self: flex-start;
+		display: inline-flex;
+		align-items: center;
+		min-height: 24px;
+		font-size: 0.85rem;
+	}
+
 	.portal-shell {
 		min-height: 100vh;
 		display: flex;
@@ -240,7 +324,7 @@
 		flex: 1;
 	}
 
-	/* Wraps rather than overflows: seven nav links plus the brand and the
+	/* Wraps rather than overflows: eight nav links plus the brand and the
 	   user block are far wider than a phone, and a no-wrap row pushed Log out
 	   off-screen at 390px (WCAG 1.4.10 Reflow). No breakpoint needed. */
 	.portal-header {

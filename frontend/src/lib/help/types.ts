@@ -24,6 +24,16 @@ export type HelpRole = SystemRole;
 export type GuideKind = 'start' | 'howto' | 'concept';
 
 /**
+ * Who reads a guide, which decides where it is published and where its links
+ * point. `employee` guides live in the help centre at `/help` (the default);
+ * `supplier` guides live in the supplier portal at `/portal/help`, where a
+ * vendor user has no employee session — so their glossary and guide links
+ * stay inside the portal (`terms.ts`) and they never join `GUIDES`
+ * (docs/decisions.md §508).
+ */
+export type HelpAudience = 'employee' | 'supplier';
+
+/**
  * Inline markup, parsed by `inline()` in ./inline.ts — no HTML, so nothing is
  * ever `{@html}` (frontend/CLAUDE.md § Sanitization):
  *
@@ -81,6 +91,8 @@ export interface Guide {
 	/** One or two sentences, for lists and search. */
 	summary: string;
 	kind: GuideKind;
+	/** Where the guide is published. Omitted = `employee` (the /help centre). */
+	audience?: HelpAudience;
 	/**
 	 * Who the guide is for. Drives the landing page's "for your role" list and
 	 * the "Who this is for" line. Omitted = everyone.

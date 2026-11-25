@@ -45,6 +45,7 @@ from app.db_engine import create_async_engine
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
 from app.models.user import User
+from app.services import legal_acceptance
 from app.services import review as review_svc
 from app.services.email_action_token import (
     ACTION_APPROVE,
@@ -82,6 +83,27 @@ def may_approve(reviewer: User) -> bool:
     the three surfaces can't drift.
     """
     return PERM_INVOICE_APPROVE in effective_permissions(reviewer.roles or ())
+
+
+#: What every token door says to a reviewer who owes a Terms / Privacy
+#: acceptance (decisions §505): the accept step lives in the app.
+LEGAL_ACCEPTANCE_MESSAGE = (
+    "Please sign in to the app and accept the current Terms of Service and "
+    "Privacy Policy before approving or rejecting invoices."
+)
+
+
+async def owes_legal_acceptance(ctrl_db: AsyncSession, reviewer: User) -> bool:
+    """Does the reviewer named in an action token owe a Terms / Privacy
+    acceptance?
+
+    The email link and the Slack / Teams buttons act for a person on a signed
+    token, not a JWT, so they never reach ``get_current_user``'s gate; each
+    door asks this right after :func:`may_approve` and refuses as that check
+    does, before the token's single-use claim, so the link still works once
+    the reviewer has accepted (decisions §505). Shared so the three doors
+    cannot drift."""
+    return await legal_acceptance.requires_acceptance(ctrl_db, reviewer)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +292,8 @@ async def email_action_perform(
             "Your account is not permitted to approve or reject invoices. Please "
             "contact your administrator.",
         )
+    if await owes_legal_acceptance(ctrl_db, reviewer):
+        return _info_page("Terms acceptance required", LEGAL_ACCEPTANCE_MESSAGE)
 
     # Single-use consume on the token jti — claim it BEFORE mutating, release it
     # if the action turns out not to be applicable / permitted so the reviewer

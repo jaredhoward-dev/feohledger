@@ -22,8 +22,15 @@ export const enPortal = {
 	'portal.nav.discounts': 'Discounts',
 	'portal.nav.company': 'Company',
 	'portal.nav.notifications': 'Notifications',
+	'portal.nav.help': 'Help',
+
+	// Supplier portal — help (routes/portal/help/, decisions §508)
+	'portal.help.subtitle': 'Guides and answers for suppliers using this portal.',
+	'portal.help.guides': 'Guides',
+	'portal.help.glossary': 'Terms',
 	'portal.shell.logOut': 'Log out',
 	'portal.shell.footerSupport': 'Support',
+	'portal.privacyAck.support': 'Questions? Contact support',
 	'portal.shell.footerLegal': 'Legal',
 	'portal.shell.footerPlatformLegal': 'Privacy & terms',
 
@@ -113,6 +120,8 @@ export const enPortal = {
 	'portal.invoices.fileDownloadFailed': 'Download failed',
 	'portal.invoices.tableAria': 'Your invoices',
 	'portal.invoices.chatLoadFailed': 'The conversation could not be loaded.',
+	'portal.invoices.chatNotFound': 'We couldn’t find that invoice in your account.',
+	'portal.invoices.chatLinkFailed': 'We couldn’t open that conversation just now.',
 
 	// Portal payments (routes/portal/payments/+page.svelte)
 	'portal.payments.title': 'Payments',

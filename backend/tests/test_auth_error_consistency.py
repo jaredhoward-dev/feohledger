@@ -336,11 +336,11 @@ async def test_portal_login_does_not_echo_password_in_detail():
 async def test_unauthenticated_protected_request_has_generic_detail():
     """The 401 from `get_current_user` must not name internal
     concepts ("JWT", "bearer") that help a fuzzer."""
-    from app.api.deps import get_current_user
+    from app.api.deps import get_authenticated_user
 
     db = AsyncMock()
     with pytest.raises(HTTPException) as exc:
-        await get_current_user(authorization=None, db=db)
+        await get_authenticated_user(authorization=None, db=db)
     detail = (exc.value.detail or "").lower()
     assert exc.value.status_code == 401
     assert "jwt" not in detail
@@ -352,12 +352,12 @@ async def test_unauthenticated_protected_request_does_not_leak_token_value():
     """If a caller sends a malformed Authorization, the response
     must not include that value (defence against an integrator
     accidentally pasting their token into a screenshot)."""
-    from app.api.deps import get_current_user
+    from app.api.deps import get_authenticated_user
 
     fake_token = "Bearer SENSITIVE_LEAKABLE_VALUE_12345"
     db = AsyncMock()
     with pytest.raises(HTTPException) as exc:
-        await get_current_user(authorization=fake_token, db=db)
+        await get_authenticated_user(authorization=fake_token, db=db)
     assert "SENSITIVE_LEAKABLE_VALUE_12345" not in (exc.value.detail or "")
 
 

@@ -34,6 +34,7 @@ from sqlalchemy import select
 
 from app.models.user import User
 from app.models.workflow import AuditLog
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
 from app.utils.detached_tasks import drain_detached
 from app.utils.passwords import pwd_context
 from tests.conftest import role_email
@@ -177,6 +178,7 @@ async def test_forgot_password_happy_path_and_old_password_stops_working(
 
 
 @pytest.mark.asyncio
+@pytest.mark.legal_unaccepted  # the set-password link must carry acceptance (§495)
 async def test_a_passwordless_sso_user_can_set_a_password_once_the_plan_drops_sso(
     realdb, fake_redis, monkeypatch
 ):
@@ -221,8 +223,25 @@ async def test_a_passwordless_sso_user_can_set_a_password_once_the_plan_drops_ss
         assert len(sent) == 1
         token = sent[0].body_text.split("token=")[1].split("\n")[0].strip()
         new_password = "BrandNewPassw0rd!42"
-        reset = await c.post(
+        # No password yet, so this link SETS the account's first one: its page
+        # shows the Terms / Privacy box (decisions §495) and redeeming it
+        # without the versions in force is refused, leaving the token usable.
+        check = await c.post("/api/auth/reset-password/check", json={"token": token})
+        assert check.status_code == 200, check.text
+        assert check.json() == {"email": email, "legal_acceptance_required": True}
+        unaccepted = await c.post(
             "/api/auth/reset-password", json={"token": token, "new_password": new_password}
+        )
+        assert unaccepted.status_code == 422, unaccepted.text
+        assert unaccepted.json()["detail"]["code"] == "legal_acceptance_required"
+        reset = await c.post(
+            "/api/auth/reset-password",
+            json={
+                "token": token,
+                "new_password": new_password,
+                "accepted_terms_version": CURRENT_LEGAL_VERSIONS["terms"],
+                "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
+            },
         )
         assert reset.status_code == 200, reset.text
         signed_in = await _login(c, email, new_password)
@@ -478,7 +497,9 @@ async def test_check_refuses_a_deactivated_account_without_spending_the_token(re
     async with realdb.client(key=TENANT, role=None) as c:
         live = await c.post("/api/auth/reset-password/check", json={"token": token})
         assert live.status_code == 200
-        assert live.json() == {"email": email}
+        # The account has a password, so this is a reset, not a set: no
+        # accept box (decisions §495). The refusal below carries no flag at all.
+        assert live.json() == {"email": email, "legal_acceptance_required": False}
 
         mk = realdb.control_sessionmaker()
         async with mk() as s:

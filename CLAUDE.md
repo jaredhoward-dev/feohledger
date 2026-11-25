@@ -82,6 +82,8 @@ pnpm gen:pricing              # regenerate the public pricing page's plan module
 pnpm check:pricing            # its drift guard (same CI job; see frontend/docs/component-library.md § marketing)
 pnpm gen:subprocessor-changelog # regenerate /legal/sub-processors § 10 from backend subprocessor_changelog.py — the same entries the customer notice sweep emails (decisions §321)
 pnpm check:subprocessor-changelog # its drift guard; also refuses a notice entry with < 30 days and no reason (same CI job)
+pnpm gen:legal-versions       # regenerate the Terms / Privacy versions from backend legal_acceptance.py into the frontend module AND mobile/lib/legal_versions.generated.dart (decisions §495, §498)
+pnpm check:legal-versions     # its drift guard over both generated files (CI's Backend lint job)
 pnpm gen:icons                # re-render every web + mobile icon from the brand-mark masters (Inkscape + ImageMagick 7; docs/decisions.md §173)
 pnpm check:icons              # its guard: masters match assets/logo-render/gen_svg.py, every raster sized + opaque (CI's Brand assets job)
 pnpm gen:illustrations        # rewrite the empty-state illustration data module from assets/illustrations/gen_empty_states.py (check:illustrations is its CI guard; decisions §181)
@@ -172,7 +174,7 @@ before changing any router; the summaries below are only an index.
 
 | Prefix | Purpose |
 |--------|---------|
-| `/auth` | Login, logout, profile, MFA (TOTP + passkey), step-up, per-account failure budgets |
+| `/auth` | Login, logout, profile, MFA (TOTP + passkey), step-up, per-account failure budgets, Terms / Privacy acceptance (`/me` flag advisory; no gate yet, decisions §495) |
 | `/auth/sso`, `/auth/saml` | OIDC + SAML 2.0 SSO — config, authorize, callback/ACS, JIT provision |
 | `/scim/v2` | SCIM 2.0 user provisioning (Okta/Entra/Authentik), per-tenant bearer auth |
 | `/portal`, `/portal/auth` | Supplier portal — VendorUser auth, invoice submit/resubmit, payments, self-service, MFA |
@@ -211,7 +213,7 @@ before changing any router; the summaries below are only an index.
 | `/commerce` | Commerce platform connection (admin), location + SKU mapping, per-receipt inventory push status + retry |
 | `/erp`, `/email-intake`, `/peppol` | Inbound webhooks — ERP status (incl. QuickBooks CloudEvents, `/erp/webhook/quickbooks`, Xero invoices, `/erp/webhook/xero`, and Merge.dev per tenant, `/erp/webhook/merge_dev/{slug}`), email-to-invoice, PEPPOL AS4 receive |
 | `/approvals/slack`, `/approvals/teams` | Interactive approval from a chat message — public, HMAC + single-use action token |
-| `/organization/email-intake`, `/signup` | Per-tenant intake address; self-service tenant signup |
+| `/organization/email-intake`, `/signup` | Per-tenant intake address; self-service tenant signup (requires Terms / Privacy acceptance) |
 | `/v1`, `/api-keys`, `/webhooks` | Public Developer API (`X-API-Key`) + published OpenAPI; API-key mgmt; outbound webhooks |
 | `/health` | Health check (public, static) + `GET /health/sweeps` (admin-gated) |
 
@@ -269,8 +271,8 @@ The void-payment path (`POST /api/payments/{id}/void`) takes `payment_scheduled`
 
 ### Data models
 
-**Control plane**: Organization, User, Role, UserRole, AssistantUsage, ApiKey, ApiKeyUsage, Plan, Subscription, WebhookSubscription, WebhookDelivery, WebAuthnCredential, WorkspaceClosure, SubprocessorNotice
-**Tenant-scoped**: Entity, Invoice, InvoiceLineItem, InvoiceExtractionResult, Vendor, VendorChangeRequest, PurchaseOrder, POLineItem, GoodsReceipt, GRLineItem, QualityInspection, GLAccount, PaymentRun, PaymentSchedule, Payment, VirtualCard, CardRebate, ExtractionUsage, WorkflowDefinition, WorkflowInstance, WorkflowStep, AuditLog, Exception, AgentDecision, Notification, Contract, ContractLineItem, SupplierChatThread, SupplierChatMessage, ExpenseReport, Expense, ExpensePolicy, CorporateCardTransaction, ExpensePreapproval, DiscountOffer, RecurringInvoiceTemplate, VendorStatementReconciliation, VendorStatementReconLine, WorkflowExperiment, CashPlan, CommerceInventorySync, CommerceSkuMapping, SanctionsAdjudication
+**Control plane**: Organization, User, Role, UserRole, AssistantUsage, ApiKey, ApiKeyUsage, Plan, Subscription, WebhookSubscription, WebhookDelivery, WebAuthnCredential, WorkspaceClosure, SubprocessorNotice, LegalAcceptance
+**Tenant-scoped**: Entity, Invoice, InvoiceLineItem, InvoiceExtractionResult, Vendor, VendorChangeRequest, PurchaseOrder, POLineItem, GoodsReceipt, GRLineItem, QualityInspection, GLAccount, PaymentRun, PaymentSchedule, Payment, VirtualCard, CardRebate, ExtractionUsage, WorkflowDefinition, WorkflowInstance, WorkflowStep, AuditLog, Exception, AgentDecision, Notification, Contract, ContractLineItem, SupplierChatThread, SupplierChatMessage, ExpenseReport, Expense, ExpensePolicy, CorporateCardTransaction, ExpensePreapproval, DiscountOffer, RecurringInvoiceTemplate, VendorStatementReconciliation, VendorStatementReconLine, WorkflowExperiment, CashPlan, CommerceInventorySync, CommerceSkuMapping, SanctionsAdjudication, VendorUserLegalAcceptance
 
 **Multi-entity**: business tables (Invoice, Vendor, PurchaseOrder, GoodsReceipt, Payment, PaymentRun, CreditMemo, Exception, GLAccount, WorkflowDefinition, VirtualCard) carry a nullable `entity_id` FK (`EntityMixin`) to the tenant-local `Entity` (subsidiary). Every tenant has one `is_default` Entity; rows backfill to it (GLAccount stays NULL = shared chart). Phase 2 + 2b scope reads/writes (incl. the dashboard + CFO analytics) by the `X-Entity-ID` header (`app/tenant.py` → `get_entity_id` / `get_write_entity_id` / `apply_entity_scope`) with a sidebar entity switcher. Phase 3 wires the entity-level chart of accounts (shared NULL ∪ entity) into the AI extraction GL catalog + bulk-recode validation and selects the entity's own `WorkflowDefinition` (shared fallback; one default per `(org, entity)` via `uq_workflow_definitions_one_default`, migration 0050). Phase 4 adds inter-company invoice routing (`counterparty_entity_id` / `intercompany_mirror_id`, migration 0051) + cross-entity consolidated reporting (`GET /analytics/by-entity`). Multi-entity is **complete** (Phases 1–4). See `docs/multi-entity.md`.
 

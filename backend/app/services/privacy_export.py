@@ -82,12 +82,14 @@ from app.models.data_subject_request import (
 )
 from app.models.expense import Expense, ExpenseReport
 from app.models.invoice import Invoice
+from app.models.legal_acceptance import LegalAcceptance
 from app.models.notification import Notification
 from app.models.payment import Payment
 from app.models.supplier_chat import SupplierChatMessage, SupplierChatThread
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.models.vendor_user import VendorUser
+from app.models.vendor_user_legal_acceptance import VendorUserLegalAcceptance
 from app.models.virtual_card import VirtualCard
 from app.models.webauthn_credential import WebAuthnCredential
 from app.models.workflow import AuditLog
@@ -135,6 +137,7 @@ DSAR_COUNTED_SECTIONS: tuple[str, ...] = (
     "roles",
     "push_devices",
     "passkeys",
+    "legal_acceptances",
     "audit_events",
     "notifications",
     "expense_reports",
@@ -499,6 +502,18 @@ async def _plan_user(
         .all()
     )
 
+    acceptances = (
+        (
+            await control_db.execute(
+                select(LegalAcceptance)
+                .where(LegalAcceptance.user_id == subject_id)
+                .order_by(LegalAcceptance.accepted_at, LegalAcceptance.document)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     documents = await collect_subject_documents(
         subject_type=SUBJECT_USER,
         subject_id=subject_id,
@@ -554,6 +569,17 @@ async def _plan_user(
                 "_note": "credential_id / public_key withheld (authenticator material)",
             }
             for c in passkeys
+        ],
+        # Which versions of our Terms of Service and Privacy Policy the subject
+        # accepted, when, and through which control (decisions §495).
+        "legal_acceptances": [
+            {
+                "document": a.document,
+                "version": a.version,
+                "accepted_at": _jsonable(a.accepted_at),
+                "source": a.source,
+            }
+            for a in acceptances
         ],
     }
 
@@ -619,6 +645,18 @@ async def _plan_vendor_user(
     if vu is None:
         raise SubjectNotFound("vendor_user not found")
 
+    acknowledgements = (
+        (
+            await tenant_db.execute(
+                select(VendorUserLegalAcceptance)
+                .where(VendorUserLegalAcceptance.vendor_user_id == subject_id)
+                .order_by(VendorUserLegalAcceptance.accepted_at, VendorUserLegalAcceptance.document)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     documents = await collect_subject_documents(
         subject_type=SUBJECT_VENDOR_USER,
         subject_id=subject_id,
@@ -639,15 +677,56 @@ async def _plan_vendor_user(
             "notification_prefs": vu.notification_prefs,
             "created_at": _jsonable(vu.created_at),
         },
+        # Which version of our Privacy Policy the supplier acknowledged, when,
+        # and through which control (decisions §499) — the same section name
+        # as the employee's Terms / Privacy acceptances, so it is counted.
+        "legal_acceptances": [
+            {
+                "document": a.document,
+                "version": a.version,
+                "accepted_at": _jsonable(a.accepted_at),
+                "source": a.source,
+            }
+            for a in acknowledgements
+        ],
     }
     sections = [
+        # What the supplier did on the trail: their sign-ins, factor changes,
+        # the Privacy Policy acknowledgement (`portal.legal.accepted`) and
+        # whatever else they authored. The employee plan's shape (action,
+        # target, when — no `details`, which may describe someone else), plus
+        # the one detail that is the subject's own: the client IP the portal
+        # recorded for the request they made. Rows with no actor (a failed
+        # sign-in against their address) are not theirs to receive: whoever
+        # made that attempt is not established, and its IP is that person's.
+        _Section(
+            name="audit_events",
+            query=select(
+                AuditLog.id,
+                AuditLog.action,
+                AuditLog.entity_type,
+                AuditLog.entity_id,
+                AuditLog.details["ip"].astext.label("ip"),
+                AuditLog.created_at,
+            )
+            .where(AuditLog.actor_id == subject_id, AuditLog.organization_id == organization_id)
+            .order_by(AuditLog.created_at.desc(), AuditLog.id),
+            serialize=lambda r: {
+                "id": str(r.id),
+                "action": r.action,
+                "entity_type": r.entity_type,
+                "entity_id": str(r.entity_id) if r.entity_id else None,
+                "ip": r.ip,
+                "created_at": _jsonable(r.created_at),
+            },
+        ),
         _Section(
             name="chat_messages",
             query=select(*_CHAT_COLUMNS)
             .where(SupplierChatMessage.author_user_id == subject_id)
             .order_by(SupplierChatMessage.created_at, SupplierChatMessage.id),
             serialize=_chat_message_entry,
-        )
+        ),
     ]
     return _BundlePlan(head=head, documents=documents, sections=sections)
 

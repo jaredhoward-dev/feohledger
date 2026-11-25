@@ -2655,7 +2655,7 @@ async def bulk_delete(
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    ids = [uuid.UUID(i) for i in body.ids]
+    ids = body.ids
     # The same treatment `bulk/status` has: scoped to the selected entity like
     # the single-invoice DELETE, and row-locked in id order so the status and
     # live-payment reads below cannot come from a row a concurrent approval is
@@ -2840,7 +2840,7 @@ async def bulk_status_change(
             detail="A rejection reason is required when bulk-rejecting invoices.",
         )
 
-    ids = [uuid.UUID(i) for i in body.ids]
+    ids = body.ids
     # The version of each row the approver saw, keyed by invoice id. Only the
     # `approved` target reads it (`api/invoice_version.py`); once supplied, a
     # row missing from it is skipped like a stale one — the client opted in,
@@ -3108,9 +3108,18 @@ async def bulk_export(
     body: BulkExportRequest,
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(get_current_user),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    ids = [uuid.UUID(i) for i in body.ids]
-    result = await db.execute(select(Invoice).where(Invoice.id.in_(ids)))
+    """Export a hand-picked set of invoices as CSV, JSON or XML.
+
+    Scoped to the caller's entity selector, as the list, `bulk/delete`,
+    `bulk/status` and every single-invoice read are: an id in another entity is
+    dropped exactly as a nonexistent id is, so the export is no oracle for a
+    sibling subsidiary's ids, and an all-out-of-scope selection is the same 404
+    as an all-missing one (decisions §509)."""
+    result = await db.execute(
+        apply_entity_scope(select(Invoice), Invoice, entity_id).where(Invoice.id.in_(body.ids))
+    )
     invoices = result.scalars().all()
 
     if not invoices:

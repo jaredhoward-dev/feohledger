@@ -102,7 +102,11 @@ even though the frontend is a static site.
    approve/reject endpoints, so the email door is never weaker than the app
    door — and never narrower either: a custom role granting `invoice.approve`
    works here exactly as it does in the app. For the four system roles it
-   resolves identically to `admin` / `ap_manager` / `cfo`.
+   resolves identically to `admin` / `ap_manager` / `cfo`. A reviewer who
+   still owes the current Terms / Privacy acceptance
+   (`email_actions.owes_legal_acceptance`, shared with Slack and Teams) is
+   refused here too, before the claim, so the link works once they accept in
+   the app (decisions §505).
 4. **Claim the token's pair** in Redis (`SET NX EX` on `ActionToken.consume_key`)
    — single-use per *message*, see below. A replay shows
    "already used".

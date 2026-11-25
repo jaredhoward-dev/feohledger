@@ -1730,10 +1730,15 @@ async def intacct_create_bill(request: Request) -> dict:
     lines = body.get("lines") or []
     if not lines:
         raise _intacct_error(422, "noLines", "A bill needs at least one line.")
-    accounts = {a["id"]: a for a in INTACCT_GL_FIXTURES}
+    # A reference names an account by its record `key` or its number `id`
+    # (FeohLedger links by key since decisions §492; older links by number).
+    by_key = {a["key"]: a for a in INTACCT_GL_FIXTURES}
+    by_id = {a["id"]: a for a in INTACCT_GL_FIXTURES}
     total = Decimal(0)
+    stored_lines: list[dict] = []
     for line in lines:
-        account = accounts.get((line.get("glAccount") or {}).get("id"))
+        ref = line.get("glAccount") or {}
+        account = by_key.get(ref["key"]) if "key" in ref else by_id.get(ref.get("id"))
         if account is None:
             raise _intacct_error(422, "invalidRequest", "Invalid GL account.", "BL01001973")
         if account.get("status") != "active":
@@ -1742,6 +1747,11 @@ async def intacct_create_bill(request: Request) -> dict:
         if not isinstance(amount, str):
             raise _intacct_error(422, "invalidAmount", "txnAmount must be a decimal string.")
         total += Decimal(amount)
+        # The reference exactly as the client sent it. Intacct reads a line
+        # back naming the account by both key and id; the fake keeps the
+        # request's own form so a spec can tell which one FeohLedger posted by
+        # (a `key:` link → {"key"}, a legacy number link → {"id"}, §492).
+        stored_lines.append({"glAccount": dict(ref), "txnAmount": amount})
     state = _intacct_state()
     state["next_key"] += 1
     key = str(state["next_key"])
@@ -1757,6 +1767,7 @@ async def intacct_create_bill(request: Request) -> dict:
         "dueDate": body.get("dueDate"),
         "totalTxnAmount": str(total),
         "totalTxnAmountDue": str(total),
+        "lines": stored_lines,
     }
     return {"ia::result": {"key": key, "id": key, "href": f"/objects/accounts-payable/bill/{key}"}}
 
@@ -3786,6 +3797,16 @@ async def blackbaud_accounts(request: Request) -> dict:
     return _blackbaud_page(request, BLACKBAUD_ACCOUNT_FIXTURES)
 
 
+@blackbaud.get("/generalledger/v1/accounts/{account_id}")
+async def blackbaud_account(request: Request, account_id: int) -> dict:
+    """One account, as a list row (the push's per-id read, decisions §494)."""
+    _require_blackbaud_auth(request)
+    for account in BLACKBAUD_ACCOUNT_FIXTURES:
+        if account["account_id"] == account_id:
+            return copy.deepcopy(account)
+    raise ProviderError(404, {"Error": "The specified record could not be found."})
+
+
 @blackbaud.get("/accountspayable/v1/invoices")
 async def blackbaud_list_invoices(request: Request) -> dict:
     _require_blackbaud_auth(request)
@@ -3873,6 +3894,12 @@ async def blackbaud_create_invoice(request: Request) -> dict:
         "balance": str(body["amount"]),
         "status": body.get("approval_status") or "Pending",
         "post_status": body.get("post_status") or "NotYetPosted",
+        # Each distribution's account as sent, so a spec can read back which
+        # account number an id-linked GL account resolved to (§494).
+        "distributions": [
+            {"account_number": d["account_number"], "type_code": d["type_code"]}
+            for d in body["distributions"]
+        ],
     }
     state["next_job"] += 1
     state["jobs"][state["next_job"]] = invoice_id

@@ -12,6 +12,11 @@ class SignupStartRequest(BaseModel):
     # form sends the visitor's UI locale. Any unsupported / absent value falls
     # back to English (normalize_locale) — never a refusal.
     locale: str | None = Field(default=None, max_length=16)
+    # The Terms of Service and Privacy Policy versions the form showed beside
+    # its required accept checkbox (`services/legal_acceptance`, decisions
+    # §495). Anything but the versions in force is refused, absent included.
+    accepted_terms_version: str | None = Field(default=None, max_length=32)
+    accepted_privacy_version: str | None = Field(default=None, max_length=32)
 
 
 class SignupStartResponse(BaseModel):

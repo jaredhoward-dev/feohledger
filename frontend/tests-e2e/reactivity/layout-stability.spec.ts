@@ -1,6 +1,7 @@
 import type { Locator, Page } from '@playwright/test';
 
 import { NAV } from '#lib/nav.ts';
+import { CARD_STATUSES } from '#lib/types/payment.ts';
 
 import { expect, test } from '../fixtures/helpers';
 import { exceptionSummary } from '../exceptions/summary';
@@ -234,11 +235,18 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/vendor-statements', fixedTable: '.recon-table table' },
 	{ href: '/positive-pay', fixedTable: '.ppay-table table' },
 	{ href: '/experiments', fixedTable: '.experiment-table table' },
+	{ href: '/adaptive', fixedTable: '.suggestions-table table' },
 	{ href: '/workflows', fixedTable: '.wf-table table' },
 	{ href: '/admin?tab=users', fixedTable: '.users-table table' },
+	{ href: '/admin?tab=roles', fixedTable: '.system-roles table' },
 	{ href: '/admin/entities', fixedTable: '.entities-table table' },
 	{ href: '/admin/api-keys', fixedTable: '.keys-table table' },
-	{ href: '/admin/access-review', fixedTable: '.review-table table' }
+	{ href: '/admin/access-review', fixedTable: '.review-table table' },
+	{ href: '/admin/webhooks', fixedTable: '.subs-table table' },
+	{ href: '/audit', fixedTable: '.audit-trail table' },
+	{ href: '/discounts', fixedTable: '.offers-table table' },
+	{ href: '/tax', fixedTable: '.tax-table table' },
+	{ href: '/admin/partner', fixedTable: '.partner-table table' }
 ];
 
 /**
@@ -276,25 +284,44 @@ const LOCALE_SIZED = new Set([
 	'/vendor-statements',
 	'/positive-pay',
 	'/experiments',
+	'/adaptive',
 	'/workflows',
 	'/admin?tab=users',
+	'/admin?tab=roles',
 	'/admin/entities',
 	'/admin/api-keys',
-	'/admin/access-review'
+	'/admin/access-review',
+	'/admin/webhooks',
+	'/audit',
+	'/discounts',
+	'/tax',
+	'/admin/partner'
 ]);
 
 /**
  * Locale-sized tables a sidebar link does not open by itself: /payments' other
  * tabs (the cards tab holds two tables). Held to the same per-locale check as
  * the `LOCALE_SIZED` pages; `label` names the test. The e2e seed holds no
- * virtual card or rebate, so those two are measured on their headers and
- * empty row only; their badge widths rest on the page's own measurement.
+ * virtual card or rebate: the cards table is answered with `CARD_PER_STATUS`
+ * below, so its status badges are measured; the rebates table is measured on
+ * its header and empty row only, its badge width resting on the page's own
+ * measurement.
  */
 const LOCALE_SIZED_VIEWS: (ListPage & { fixedTable: string; label: string })[] = [
 	{ href: '/payments?tab=history', fixedTable: '.pay-history table', label: '/payments history' },
 	{ href: '/payments?tab=runs', fixedTable: '.pay-runs table', label: '/payments runs' },
 	{ href: '/payments?tab=cards', fixedTable: '.pay-rebates table', label: '/payments rebates' },
-	{ href: '/payments?tab=cards', fixedTable: '.pay-cards table', label: '/payments cards' }
+	{ href: '/payments?tab=cards', fixedTable: '.pay-cards table', label: '/payments cards' },
+	{
+		href: '/admin/webhooks',
+		fixedTable: '.deliveries-table table',
+		label: '/admin/webhooks deliveries'
+	},
+	{
+		href: '/admin?tab=roles',
+		fixedTable: '.custom-roles table',
+		label: '/admin?tab=roles custom roles'
+	}
 ];
 
 /**
@@ -307,24 +334,11 @@ const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
- * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers twenty-seven pages"): moving
- * one into `LIST_PAGES` is the whole change once its reason is fixed.
+ * A list page belongs in `LIST_PAGES`, not here: a page whose table the e2e
+ * tenant cannot fill is measured against a fixture (`PAGE_FIXTURES`), as
+ * /admin/partner is.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
-	'/discounts':
-		'Unmeasured: the warning banners and the optimizer panel above the offers table mount once the dashboard lands — see docs/followups.md',
-	'/audit':
-		'Unmeasured: the trail is a query result, and the signature-verification panel below the table moves down by the height of the rows a run returns — see docs/followups.md',
-	'/adaptive': 'Unmeasured list page — see docs/followups.md',
-	'/tax':
-		'Unmeasured: a loading placeholder stands where the box-allocation panel and the table mount once the report lands — see docs/followups.md',
-	'/admin?tab=roles':
-		'Unmeasured: the system-roles table shows no loading row and grows from its empty row to the four system roles, pushing the custom-roles section down — see docs/followups.md',
-	'/admin/partner':
-		'Unmeasured: the e2e tenant is not a partner, so the page settles on its "not a partner" state and the children table never renders — see docs/followups.md',
-	'/admin/webhooks':
-		'Unmeasured: the subscriptions table replaces a loading line and grows by its rows, pushing the deliveries section down — see docs/followups.md',
 	'/assistant': 'A conversation, not a list',
 	'/cfo': 'Charts and KPI cards, not a list',
 	'/cash-flow': 'A planning workspace, not a list',
@@ -410,6 +424,56 @@ async function headerXs(table: Locator): Promise<number[]> {
 	return table.locator('thead th').evaluateAll((ths) => ths.map((th) => th.getBoundingClientRect().x));
 }
 
+/** /admin/partner's children table: a partner with one child per plan tier,
+ *  one carrying a 63-character slug (the longest a slug may be) and one with
+ *  no brand name (the "—" cell). The e2e tenant is not a partner, so without
+ *  this the page settles on its empty row and no child row is measured. */
+const PARTNER_OVERVIEW = {
+	organization_id: '00000000-0000-4000-8000-000000000430',
+	name: 'Layout Fixture Partner',
+	is_partner: true,
+	children: [
+		{
+			id: '00000000-0000-4000-8000-000000000431',
+			name: 'Layout Fixture Subsidiary Holdings International',
+			slug: 'layout-fixture-subsidiary-holdings-international-and-partners-x',
+			plan: 'growth',
+			product_name: 'Layout Fixture Accounts Payable Suite'
+		},
+		{
+			id: '00000000-0000-4000-8000-000000000432',
+			name: 'Layout Fixture Retail',
+			slug: 'layout-fixture-retail',
+			plan: 'scale',
+			product_name: ''
+		},
+		{
+			id: '00000000-0000-4000-8000-000000000433',
+			name: 'Layout Fixture Startup',
+			slug: 'layout-fixture-startup',
+			plan: 'free',
+			product_name: 'Fixture AP'
+		}
+	]
+};
+
+/**
+ * Responses a measured page needs that the e2e tenant cannot give, answered
+ * by route interception for both the layout-shift budget and the per-locale
+ * check (the latter answers more pages' lists inline below).
+ */
+const PAGE_FIXTURES: Record<string, (page: Page) => Promise<void>> = {
+	'/admin/partner': async (page) => {
+		await page.route(
+			(url) => url.pathname === '/api/partner',
+			(route) =>
+				route.request().method() === 'GET'
+					? route.fulfill({ json: PARTNER_OVERVIEW })
+					: route.fallback()
+		);
+	}
+};
+
 test.describe('list pages stay within the layout-shift budget', () => {
 	test('every sidebar page is classified as a measured list page or not', () => {
 		const measured = new Set(LIST_PAGES.map((p) => p.href));
@@ -436,6 +500,9 @@ test.describe('list pages stay within the layout-shift budget', () => {
 
 	for (const { href, fixedTable } of MEASURED_PAGES) {
 		test(`${href}: cumulative layout shift stays under ${CLS_BUDGET}`, async ({ page }) => {
+			// Registered before `delayApi`, so the delay (the later route, run
+			// first) still holds the fixture's answer behind the gate.
+			await PAGE_FIXTURES[href]?.(page);
 			await observeLayoutShifts(page);
 			await page.goto(START);
 			await expect(page.locator('h1').first()).toBeVisible();
@@ -558,7 +625,15 @@ const WIDEST_ROW: Record<string, { pathname: string; patch: (row: Row) => Row; b
 	},
 	'/vendors': {
 		pathname: '/api/vendors',
-		patch: (row) => ({ ...row, status: 'unverified', screening_status: 'review', source: 'erp_sync' }),
+		// `status_actions` offers Verify + Reject, so the row carries its full
+		// set of buttons (and a Verify to put it in the refresh-failed state).
+		patch: (row) => ({
+			...row,
+			status: 'unverified',
+			screening_status: 'review',
+			source: 'erp_sync',
+			status_actions: { verify: null, reject: null }
+		}),
 		badge: '.badge.unverified'
 	},
 	'/purchase-orders': {
@@ -647,6 +722,205 @@ const PARTIAL_INSPECTION = {
 	created_at: '2026-11-01T09:00:00Z'
 };
 
+/** One virtual card per `CardStatus`: the cards table's status column holds
+ *  the widest label in each locale (de "ABGESCHLOSSEN", es "COMPLETADA", ja
+ *  "キャンセル済み", …), and which status is widest differs by locale, so every
+ *  status is on screen rather than one picked for one catalogue. The lean e2e
+ *  seed issues no cards, so the tab's list is answered with these rows rather
+ *  than patched. */
+const CARD_PER_STATUS = CARD_STATUSES.map((status, i) => ({
+	id: `00000000-0000-4000-8000-00000000034${i}`,
+	invoice_id: '00000000-0000-4000-8000-000000000350',
+	card_provider: 'lithic',
+	last_four: '4242',
+	amount_limit: 1250,
+	amount_charged: status === 'charged' || status === 'completed' ? 1250 : null,
+	currency: 'USD',
+	status,
+	expires_at: '2026-12-31T00:00:00Z',
+	created_at: '2026-11-01T09:00:00Z',
+	vendor_name: 'Layout Fixture Supplies',
+	invoice_number: `INV-LAYOUT-${i}`
+}));
+
+/** /admin/webhooks' widest rows: a paused subscription (es "INACTIVO") whose
+ *  rotation overlap is live, so the secret cell holds its pill (fr "Secret
+ *  précédent jusqu’à …", which wraps in its column), and one delivery per
+ *  status (de "FEHLGESCHLAGEN"), the failed and dead ones carrying the
+ *  Redeliver button. The e2e seed holds no webhook, so both lists are
+ *  answered with these rows. */
+const WEBHOOK_SUBS = [
+	{
+		id: '00000000-0000-4000-8000-000000000361',
+		name: 'Layout Fixture ERP',
+		target_url: 'https://hooks.example.com/layout-fixture/receiver',
+		event_types: ['invoice.approved', 'payment.sent'],
+		secret_prefix: 'whsec_lay',
+		active: false,
+		created_at: '2026-11-01T09:00:00Z',
+		updated_at: '2026-11-01T09:00:00Z',
+		previous_secret_expires_at: '2099-12-31T23:00:00Z'
+	}
+];
+const WEBHOOK_DELIVERIES = ['pending', 'delivered', 'failed', 'dead'].map((status, i) => ({
+	id: `00000000-0000-4000-8000-00000000037${i}`,
+	subscription_id: WEBHOOK_SUBS[0].id,
+	event_id: `00000000-0000-4000-8000-00000000038${i}`,
+	event_type: 'invoice.approved',
+	status,
+	attempt_count: 3,
+	response_code: 500,
+	next_attempt_at: null,
+	last_attempt_at: '2026-11-01T09:00:00Z',
+	created_at: '2026-11-01T09:00:00Z'
+}));
+
+/** /adaptive's widest suggestion rows: one per status (pt-BR "DESATUALIZADA"),
+ *  the open and stale ones carrying their Dismiss button (the backend's
+ *  `dismiss_refusal` verdicts). The e2e seed need not hold a
+ *  suggestion, so the list is answered with these rows. */
+const SUGGESTION_PER_STATUS = (['open', 'dismissed', 'applied', 'stale'] as const).map(
+	(status, i) => ({
+		id: `00000000-0000-4000-8000-00000000039${i}`,
+		kind: 'auto_approve_threshold',
+		vendor_id: '00000000-0000-4000-8000-000000000400',
+		vendor_name: 'Layout Fixture Supplies International',
+		title: 'Auto-approve invoices from this vendor under the usual amount',
+		rationale: 'Every one of the last 40 invoices was approved unchanged.',
+		payload: {},
+		confidence_pct: '97.5',
+		status,
+		created_at: '2026-11-01T09:00:00Z',
+		dismissed_at: null,
+		actions: {
+			dismiss:
+				status === 'open' || status === 'stale'
+					? null
+					: {
+							code: 'workflow_suggestion_not_dismissable',
+							message: `A suggestion that is ${status} cannot be dismissed.`,
+							params: { status }
+						}
+		}
+	})
+);
+
+/** A custom role for /admin?tab=roles' second table, appended to the real
+ *  roles list (the e2e seed holds only the four system roles), so its Edit /
+ *  Delete actions cell is on screen. */
+const CUSTOM_ROLE = {
+	id: '00000000-0000-4000-8000-000000000410',
+	name: 'Layout Fixture Reviewer',
+	description: 'Reviews vendor bank changes',
+	is_system: false,
+	permissions: ['vendor.bank_change.approve', 'vendor.block']
+};
+
+/** One discount offer per status: the status column holds the widest badge in
+ *  each locale (de "ANGENOMMEN", …), and the open offer carries Accept and
+ *  Decline, the widest action cell. The lean e2e seed holds no offer, so the
+ *  list is answered with these rows rather than patched. */
+const DISCOUNT_STATUSES = ['offered', 'accepted', 'captured', 'declined', 'expired'] as const;
+const DISCOUNT_PER_STATUS = DISCOUNT_STATUSES.map((status, i) => ({
+	id: `00000000-0000-4000-8000-00000000039${i}`,
+	scope: 'invoice',
+	invoice_id: `00000000-0000-4000-8000-00000000040${i}`,
+	vendor_id: '00000000-0000-4000-8000-000000000410',
+	source: 'supplier',
+	status,
+	tiers: [
+		{ days: 10, percent: 2 },
+		{ days: 20, percent: 1 }
+	],
+	base_amount: '12500.00',
+	currency: 'USD',
+	valid_from: '2026-11-01',
+	valid_until: '2099-12-31',
+	accepted_tier: status === 'accepted' || status === 'captured' ? { days: 10, percent: 2 } : null,
+	accepted_at: null,
+	captured_amount: status === 'captured' ? '250.00' : null,
+	captured_at: null,
+	financing_provider: null,
+	notes: null,
+	created_at: '2026-11-01T09:00:00Z',
+	updated_at: '2026-11-01T09:00:00Z',
+	vendor_name: 'Layout Fixture Supplies',
+	invoice_number: `INV-LAYOUT-D${i}`,
+	actions:
+		status === 'offered'
+			? { accept: null, decline: null }
+			: {
+					accept: { code: 'offer_not_open', message: 'Not open.' },
+					decline: { code: 'offer_not_open', message: 'Not open.' }
+				},
+	capturable_tier_days: status === 'offered' ? [10, 20] : []
+}));
+
+/** One 1099 vendor per badge in each of /tax's three badge columns: eligible
+ *  with a W-9 and a verified TIN, then ineligible with no W-9 and a TIN on
+ *  file but unverified (de "NICHT VERIFIZIERT"), then no TIN at all. The lean
+ *  e2e seed pays no 1099 vendor, so the report is answered with these rows. */
+const TAX_ROW = {
+	tax_classification: 'individual',
+	w9_received_date: null,
+	ytd_paid: '1500.00',
+	over_threshold: true,
+	payment_count: 3,
+	card_paid: '0.00',
+	card_payment_count: 0,
+	box_allocations: [],
+	unmapped_paid: '0.00',
+	unmapped_payment_count: 0,
+	box_unallocated: '0.00',
+	required_forms: ['1099-NEC']
+};
+const TAX_REPORT = {
+	year: 2026,
+	threshold_usd: '600',
+	currency: 'USD',
+	vendor_count_total: 3,
+	vendor_count_eligible_over_threshold: 1,
+	vendor_count_over_threshold_without_w9: 0,
+	total_reportable: '1500.00',
+	total_reportable_usd: '1500.00',
+	total_card_excluded: '0.00',
+	box_allocations: [],
+	total_unmapped: '0.00',
+	box_unallocated: '0.00',
+	box_allocation_reconciled: true,
+	generated_at: '2026-11-01T09:00:00Z',
+	rows: [
+		{
+			...TAX_ROW,
+			vendor_id: '00000000-0000-4000-8000-000000000421',
+			vendor_name: 'Layout Fixture Eligible',
+			tax_id: '12-3456789',
+			is_1099_eligible: true,
+			w9_received_date: '2026-01-15',
+			w9_on_file: true,
+			tin_verified: true
+		},
+		{
+			...TAX_ROW,
+			vendor_id: '00000000-0000-4000-8000-000000000422',
+			vendor_name: 'Layout Fixture Unverified',
+			tax_id: '98-7654321',
+			is_1099_eligible: false,
+			w9_on_file: false,
+			tin_verified: false
+		},
+		{
+			...TAX_ROW,
+			vendor_id: '00000000-0000-4000-8000-000000000423',
+			vendor_name: 'Layout Fixture No TIN',
+			tax_id: null,
+			is_1099_eligible: true,
+			w9_on_file: false,
+			tin_verified: false
+		}
+	]
+};
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
 		const tables = [
@@ -681,6 +955,79 @@ test.describe('fixed list tables fit their longest locale', () => {
 								: route.fallback()
 					);
 				}
+				if (label === '/payments cards') {
+					await page.route(
+						(url) => url.pathname === '/api/cards',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({
+										json: { items: CARD_PER_STATUS, total: CARD_PER_STATUS.length }
+									})
+								: route.fallback()
+					);
+				}
+				if (href === '/admin/webhooks') {
+					await page.route(
+						(url) => url.pathname === '/api/webhooks',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: WEBHOOK_SUBS })
+								: route.fallback()
+					);
+					await page.route(
+						(url) => url.pathname === '/api/webhooks/deliveries',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: WEBHOOK_DELIVERIES })
+								: route.fallback()
+					);
+				}
+				if (href === '/adaptive') {
+					await page.route(
+						(url) => url.pathname === '/api/adaptive/suggestions',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: { suggestions: SUGGESTION_PER_STATUS } })
+								: route.fallback()
+					);
+				}
+				if (label === '/admin?tab=roles custom roles') {
+					await page.route(
+						(url) => url.pathname === '/api/admin/roles',
+						async (route) => {
+							if (route.request().method() !== 'GET') return route.fallback();
+							const response = await route.fetch();
+							const roles = await response.json();
+							await route.fulfill({ response, json: [...roles, CUSTOM_ROLE] });
+						}
+					);
+				}
+				if (href === '/discounts') {
+					await page.route(
+						(url) => url.pathname === '/api/discounts/offers',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({
+										json: {
+											items: DISCOUNT_PER_STATUS,
+											total: DISCOUNT_PER_STATUS.length,
+											page: 1,
+											page_size: 20
+										}
+									})
+								: route.fallback()
+					);
+				}
+				if (href === '/tax') {
+					await page.route(
+						(url) => url.pathname === '/api/tax/1099-report',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: TAX_REPORT })
+								: route.fallback()
+					);
+				}
+				await PAGE_FIXTURES[href]?.(page);
 				const widest = WIDEST_ROW[href];
 				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
@@ -696,8 +1043,61 @@ test.describe('fixed list tables fit their longest locale', () => {
 					await expect(table.locator('.refusal-note')).toBeVisible();
 				}
 				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
+				if (href === '/vendors') {
+					// A decided row whose re-read failed carries a note + Retry in
+					// its actions cell — the longest thing that cell holds in de /
+					// fr. Reach that state with nothing written: the Verify is
+					// stubbed, and the one-row re-read (`?id=`) fails.
+					await page.route(
+						(url) => /^\/api\/vendors\/[^/]+\/verify$/.test(url.pathname),
+						(route) =>
+							route.fulfill({
+								json: { id: route.request().url().split('/').at(-2), status: 'active' }
+							})
+					);
+					await page.route(
+						(url) => url.pathname === '/api/vendors' && url.searchParams.has('id'),
+						(route) => route.fulfill({ status: 500, json: { detail: 'layout fixture' } })
+					);
+					const first = table.locator('tbody tr').first();
+					await first.locator('td.actions button.variant-success').click();
+					await expect(first.locator('.row-refresh-failed')).toBeVisible();
+				}
 				if (href === '/goods-receipts?tab=inspections') {
 					await expect(table.locator('.badge.partial')).toBeVisible();
+				}
+				if (href === '/admin/webhooks') {
+					await expect(page.getByTestId('overlap-pill')).toBeVisible();
+					await expect(page.locator('.deliveries-table .badge.dead')).toBeVisible();
+				}
+				if (href === '/adaptive') {
+					for (const { status } of SUGGESTION_PER_STATUS) {
+						await expect(table.locator(`.badge.${status}`)).toBeVisible();
+					}
+					await expect(table.locator('td.actions button')).toHaveCount(2);
+				}
+				if (label === '/admin?tab=roles custom roles') {
+					await expect(table.locator('td.actions button')).toHaveCount(2);
+				}
+				if (href === '/discounts') {
+					for (const status of DISCOUNT_STATUSES) {
+						await expect(table.locator(`.badge.${status}`)).toBeVisible();
+					}
+				}
+				if (href === '/tax') {
+					await expect(table.locator('.badge.chip-warn')).toHaveCount(4);
+				}
+				if (href === '/admin/partner') {
+					await expect(table.locator('tbody tr')).toHaveCount(PARTNER_OVERVIEW.children.length);
+					// Arm the first Detach: its confirm label is the widest thing an
+					// actions cell holds (fr "Confirmer le détachement").
+					await table.locator('td.actions button').first().click();
+					await expect(table.locator('td.actions button.armed')).toHaveCount(1);
+				}
+				if (label === '/payments cards') {
+					for (const status of CARD_STATUSES) {
+						await expect(table.locator(`.badge.${status}`)).toBeVisible();
+					}
 				}
 				await nextFrames(page);
 

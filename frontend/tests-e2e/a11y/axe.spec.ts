@@ -1,5 +1,16 @@
+import type { Page } from '@playwright/test';
+
 import type { EligibleInvoice } from '#lib/types/creditMemo.ts';
-import { expect, invoicePicker, NO_TENANT_BASE, test, vendorPicker } from '../fixtures/helpers';
+import {
+	acceptConsent,
+	API_BASE,
+	authedTenantHeaders,
+	expect,
+	invoicePicker,
+	NO_TENANT_BASE,
+	test,
+	vendorPicker
+} from '../fixtures/helpers';
 import { expectNoA11yViolations } from './axe-helper';
 
 /**
@@ -68,7 +79,11 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['cards', 'Virtual Cards'],
 	['security', 'Security'],
 	['sso', 'Single Sign-On'],
+	['scim', 'SCIM provisioning'],
 	['fraud', 'Fraud Detection'],
+	['match-rules', 'PO match rules'],
+	['line-total-check', 'Line-total check'],
+	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
 	['plan', 'Plan'],
 	['close', 'Close this workspace']
@@ -164,6 +179,105 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 			await expectNoA11yViolations(page);
 		});
 	}
+
+	// The two single-setting panels draw their heading before their setting
+	// arrives, so the ORG_PANELS entries above may scan the loading frame. These
+	// wait for the loaded form (its save button) and scan that.
+	for (const [slug, testId] of [
+		['line-total-check', 'line-total'],
+		['exception-agents', 'agent-autonomy']
+	] as const) {
+		test(`organization settings → ${slug}, loaded form, has no axe violations`, async ({
+			page
+		}) => {
+			await page.goto(`/organization?section=${slug}`);
+			await expect(page.locator('aside.sidebar').first()).toBeVisible();
+			await expect(page.getByTestId(`${testId}-save`)).toBeVisible();
+			await expectNoA11yViolations(page);
+		});
+	}
+
+	// Profile → Out of office, loaded and with a refused submit's field errors
+	// showing — at desktop width and at the 390px phone width. The worker admin
+	// holds `invoice.approve`, so the section is offered; its two reads are
+	// stubbed (off, one candidate) so the form is there to refuse, and nothing
+	// is saved.
+	for (const width of [1280, 390]) {
+		test(`profile → out of office at ${width}px, loaded and with field errors, has no axe violations`, async ({
+			page
+		}) => {
+			await page.route(
+				(url) => url.pathname === '/api/auth/delegation',
+				(route) =>
+					route.request().method() === 'GET'
+						? route.fulfill({
+								json: { delegate_to_id: null, delegate_to_name: null, until: null, is_active: false }
+							})
+						: route.fallback()
+			);
+			await page.route(
+				(url) => url.pathname === '/api/auth/delegation/candidates',
+				(route) => route.fulfill({ json: [{ id: 'axe-candidate', full_name: 'Axe Candidate' }] })
+			);
+			await page.setViewportSize({ width, height: 900 });
+			await page.goto('/profile?section=delegation');
+			const panel = page.getByTestId('delegation-panel');
+			await expect(panel.getByTestId('delegation-status')).toBeVisible();
+			await expectNoA11yViolations(page);
+			await panel.getByTestId('delegation-save').click();
+			await expect(panel.getByLabel('Delegate')).toHaveAttribute('aria-invalid', 'true');
+			await expectNoA11yViolations(page);
+		});
+	}
+
+	// The round-41 panels at phone width (390px): the match-rules panel with its
+	// rule form open (the scope radios, vendor picker and two-field row are
+	// what wrap), and the SCIM panel's loaded body. axe at that width, plus no
+	// sideways document scroll (WCAG 1.4.10; `reflow.spec.ts` walks every
+	// section at 320px with the panel closed).
+	test('organization settings → match-rules and scim at 390px have no axe violations', async ({
+		page
+	}) => {
+		await page.setViewportSize({ width: 390, height: 844 });
+		await page.goto('/organization?section=match-rules');
+		await expect(page.locator('aside.sidebar').first()).toBeVisible();
+		await expect(page.getByTestId('match-rules-org-save')).toBeVisible();
+		await page.getByTestId('match-rule-add').click();
+		await expect(page.getByTestId('match-rule-form')).toBeVisible();
+		await expectNoA11yViolations(page);
+		expect(
+			await page.evaluate(
+				() => document.documentElement.scrollWidth - document.documentElement.clientWidth
+			)
+		).toBeLessThanOrEqual(1);
+
+		await page.goto('/organization?section=scim');
+		await expect(page.getByTestId('scim-status')).toBeVisible();
+		await expectNoA11yViolations(page);
+		expect(
+			await page.evaluate(
+				() => document.documentElement.scrollWidth - document.documentElement.clientWidth
+			)
+		).toBeLessThanOrEqual(1);
+	});
+
+	// The SCIM panel's loaded body (its status line) and its one-time reveal
+	// dialog, whose token must be readable and copyable by keyboard.
+	test('organization settings → scim, loaded and with the token dialog open, has no axe violations', async ({
+		page
+	}) => {
+		// Start from no token, so the panel offers Generate.
+		const cleared = await page.request.delete(`${API_BASE}/api/organization/sso/scim-token`, {
+			headers: await authedTenantHeaders(page)
+		});
+		expect(cleared.status()).toBe(204);
+		await page.goto('/organization?section=scim');
+		await expect(page.getByTestId('scim-status')).toBeVisible();
+		await expectNoA11yViolations(page);
+		await page.getByTestId('scim-generate').click();
+		await expect(page.getByTestId('scim-token-value')).toBeVisible();
+		await expectNoA11yViolations(page);
+	});
 
 	test('vendor-statement create modal (open state) has no axe violations', async ({ page }) => {
 		// The modal, not the list, is where this surface's interactive controls
@@ -287,6 +401,159 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 	});
 });
 
+/**
+ * The Terms / Privacy accept step (`layout/LegalAcceptStep`, decisions §497),
+ * forced the way `tests-e2e/auth/legal-reprompt.spec.ts` forces it: the real
+ * `/me` with `legal_acceptance_required` switched on, so the worker admin's
+ * acceptance rows are never touched. The accept POST is stubbed with the
+ * versions-changed 422, which no live backend gives on demand. Scanned in the
+ * two states that add markup — the unticked-box error and the versions-changed
+ * alert — at desktop width and at 390px, the phone width it must hold at.
+ * The step replaces the app shell, so it also has to carry the page's one
+ * `<main>` itself; axe's landmark rules are best-practice, not WCAG-tagged, so
+ * that is asserted directly.
+ */
+test.describe('accessibility — Terms / Privacy accept step (WCAG 2.2 AA)', () => {
+	for (const width of [1280, 390]) {
+		test(`accept step, unticked error and versions changed, at ${width}px, has no axe violations`, async ({
+			page
+		}) => {
+			await page.setViewportSize({ width, height: 900 });
+			await page.route(
+				(url) => url.pathname === '/api/auth/me',
+				async (route) => {
+					const real = await route.fetch();
+					const body = (await real.json()) as Record<string, unknown>;
+					await route.fulfill({ response: real, json: { ...body, legal_acceptance_required: true } });
+				}
+			);
+			await page.route(
+				(url) => url.pathname === '/api/auth/legal-acceptance',
+				(route) =>
+					route.fulfill({
+						status: 422,
+						json: {
+							detail: {
+								code: 'legal_acceptance_required',
+								message: 'Please accept the current Terms of Service and Privacy Policy to continue.',
+								params: {}
+							}
+						}
+					})
+			);
+			await page.goto('/');
+			const step = page.locator('[data-testid="legal-accept-step"]');
+			await expect(step).toBeVisible();
+			await expect(page.getByRole('main')).toHaveCount(1);
+
+			// Unticked: the box is marked and the error is stated.
+			await page.getByRole('button', { name: 'Accept and continue' }).click();
+			const box = page.getByRole('checkbox', { name: /I agree to the Terms of Service/ });
+			await expect(box).toHaveAttribute('aria-invalid', 'true');
+			await expectNoA11yViolations(page);
+
+			// Ticked and refused as stale: the documents-changed alert and its reload.
+			await box.check();
+			await page.getByRole('button', { name: 'Accept and continue' }).click();
+			await expect(step.getByRole('button', { name: 'Reload page' })).toBeVisible();
+			await expectNoA11yViolations(page);
+		});
+	}
+});
+
+/**
+ * The supplier portal's Privacy Policy step (`layout/LegalAcceptStep` with
+ * `documents="privacy"`, decisions §500), forced the way
+ * `tests-e2e/portal/legal-reprompt.spec.ts` forces it: the real portal `/me`
+ * with `legal_acceptance_required` switched on, so the seeded supplier's
+ * acknowledgement row is never touched. Scanned twice, because the step draws
+ * the tenant's mark in place of ours: once on the platform brand and once with
+ * a white-label logo (the public `GET /api/portal/branding` answered here, so
+ * the worker tenant's brand is not written). Each scan also covers the
+ * unticked-box error state.
+ */
+const PORTAL_SUPPLIER = { email: 'supplier@portal.test', password: 'demo' };
+const PORTAL_AXE_LOGO = 'https://cdn.e2e.test/axe-portal-logo.png';
+
+async function portalSignInForAxe(page: Page): Promise<void> {
+	await acceptConsent(page);
+	await page.goto('/portal/login');
+	await page.locator('input[type="email"]').fill(PORTAL_SUPPLIER.email);
+	await page.locator('input[type="password"]').fill(PORTAL_SUPPLIER.password);
+	await page.locator('button[type="submit"]').click();
+	await expect(page).toHaveURL(/\/portal\/?$/);
+}
+
+test.describe('accessibility — supplier portal Privacy step (WCAG 2.2 AA)', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+
+	for (const branded of [false, true]) {
+		test(`portal Privacy step${branded ? ' with a white-label logo' : ''}, and its unticked error, has no axe violations`, async ({
+			page
+		}) => {
+			if (branded) {
+				await page.route(
+					(url) => url.pathname === '/api/portal/branding',
+					(route) =>
+						route.fulfill({
+							json: {
+								product_name: 'Axe Portal Brand',
+								logo_url: PORTAL_AXE_LOGO,
+								accent_color: '',
+								accent_strong_color: '',
+								support_url: '',
+								legal_url: ''
+							}
+						})
+				);
+			}
+			await page.route(
+				(url) => url.pathname === '/api/portal/auth/me',
+				async (route) => {
+					const real = await route.fetch();
+					const body = (await real.json()) as Record<string, unknown>;
+					await route.fulfill({
+						response: real,
+						json: { ...body, legal_acceptance_required: true }
+					});
+				}
+			);
+			await portalSignInForAxe(page);
+
+			const step = page.locator('[data-testid="legal-accept-step"]');
+			await expect(step).toBeVisible();
+			await expect(page.getByRole('main')).toHaveCount(1);
+			if (branded) {
+				await expect(step.locator(`img[src="${PORTAL_AXE_LOGO}"]`)).toBeVisible();
+			}
+			await expectNoA11yViolations(page);
+
+			await page.getByRole('button', { name: 'Confirm and continue' }).click();
+			await expect(
+				page.getByRole('checkbox', { name: /I have read the Privacy Policy/ })
+			).toHaveAttribute('aria-invalid', 'true');
+			await expectNoA11yViolations(page);
+		});
+	}
+});
+
+test.describe('accessibility — supplier portal help (WCAG 2.2 AA)', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+
+	// The supplier help (decisions §508): the landing (guides + the glossary a
+	// guide's term links land on) and a guide with every block type a supplier
+	// guide uses — steps, a list, tip and caution notes, the terms and
+	// related-guide blocks.
+	for (const path of ['/portal/help', '/portal/help/portal-getting-started']) {
+		test(`${path} has no axe violations`, async ({ page }) => {
+			await portalSignInForAxe(page);
+			await page.goto(path);
+			await expect(page.locator('h1')).toBeVisible();
+			await expectNoA11yViolations(page);
+		});
+	}
+});
+
 test.describe('accessibility — public surfaces on the no-tenant origin (WCAG 2.2 AA)', () => {
 	test.use({ storageState: { cookies: [], origins: [] }, baseURL: NO_TENANT_BASE });
 
@@ -365,13 +632,18 @@ test.describe('accessibility — unauthenticated surfaces (WCAG 2.2 AA)', () => 
 		page
 	}) => {
 		// A real token needs the invite email (backend tests mint one); a
-		// stubbed check renders the live form, the state with the most to scan.
+		// stubbed check renders the live form, the state with the most to scan —
+		// an invite's, with the Privacy Policy box (decisions §499).
 		await page.route(
 			(url) => url.pathname === '/api/portal/auth/reset-password/check',
-			(route) => route.fulfill({ json: { email: 'supplier@vendor.example' } })
+			(route) =>
+				route.fulfill({
+					json: { email: 'supplier@vendor.example', legal_acceptance_required: true }
+				})
 		);
 		await page.goto('/portal/reset-password?token=axe-scan-token');
 		await expect(page.locator('input[type="password"]').first()).toBeVisible();
+		await expect(page.getByRole('checkbox', { name: /I have read the Privacy Policy/ })).toBeVisible();
 		await expectNoA11yViolations(page);
 	});
 

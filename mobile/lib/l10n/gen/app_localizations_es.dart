@@ -2,7 +2,6 @@
 
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
-
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -2785,6 +2784,17 @@ class AppLocalizationsEs extends AppLocalizations {
       'Patrones de aprobación, anomalías, sugerencias';
 
   @override
+  String get settingsHelp => 'Ayuda';
+
+  @override
+  String get settingsHelpHint =>
+      'Guías para su espacio de trabajo, se abren en el navegador';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'No se pudo abrir el centro de ayuda. Inicie sesión en su espacio de trabajo en la web y abra Ayuda allí.';
+
+  @override
   String get inspectionsTitle => 'Inspecciones de calidad';
 
   @override
@@ -4621,7 +4631,8 @@ class AppLocalizationsEs extends AppLocalizations {
   @override
   String payRunCreatedPlain(String cfo) {
     String _temp0 = intl.Intl.selectLogic(cfo, {
-      'required': 'Lote de pago creado. Se requiere la aprobación del director financiero antes de ejecutarlo.',
+      'required':
+          'Lote de pago creado. Se requiere la aprobación del director financiero antes de ejecutarlo.',
       'other': 'Lote de pago creado.',
     });
     return '$_temp0';
@@ -5050,4 +5061,45 @@ class AppLocalizationsEs extends AppLocalizations {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => 'Términos y privacidad';
+
+  @override
+  String get legalAcceptHeading => 'Revise nuestros términos actualizados';
+
+  @override
+  String get legalAcceptIntro =>
+      'Para seguir usando FeohLedger, acepte los Términos del servicio y la Política de privacidad vigentes. Cada uno se abre en su navegador.';
+
+  @override
+  String get legalTermsLink => 'Términos del servicio';
+
+  @override
+  String get legalPrivacyLink => 'Política de privacidad';
+
+  @override
+  String get legalLinkHint => 'se abre en su navegador';
+
+  @override
+  String get legalLinkFailed =>
+      'No se pudo abrir la página. Visítela en un navegador.';
+
+  @override
+  String get legalAcceptCheckbox =>
+      'He leído y acepto los Términos del servicio y la Política de privacidad.';
+
+  @override
+  String get legalAcceptButton => 'Aceptar';
+
+  @override
+  String get legalAcceptSignOut => 'Cerrar sesión';
+
+  @override
+  String get legalAcceptTickRequired =>
+      'Marque la casilla para aceptar los Términos del servicio y la Política de privacidad.';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'Esta versión de la app muestra unos Términos o una Política de privacidad anteriores a los vigentes, por lo que no puede registrar su aceptación. Actualice la app desde su tienda de aplicaciones o acepte en la aplicación web y vuelva a iniciar sesión.';
 }

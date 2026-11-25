@@ -1,13 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
 import 'package:feohledger_mobile/api/endpoints.dart';
 import 'package:feohledger_mobile/config.dart';
 import 'package:feohledger_mobile/l10n/ambient_localizations.dart';
+import 'package:feohledger_mobile/legal_versions.generated.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/models/mfa_challenge.dart';
 import 'package:feohledger_mobile/models/user.dart';
 import 'package:feohledger_mobile/services/session.dart';
+import 'package:feohledger_mobile/utils/sequenced_fetch.dart';
 
 /// Outcome of [AuthStore.login] / [AuthStore.completeMfa].
 enum LoginOutcome {
@@ -35,7 +39,27 @@ class LoginResult {
   bool get isSuccess => outcome == LoginOutcome.success;
 }
 
-class AuthStore extends ChangeNotifier {
+/// Outcome of [AuthStore.acceptLegalDocuments].
+enum LegalAcceptOutcome {
+  /// Recorded; the profile was refreshed and no longer requires acceptance.
+  accepted,
+
+  /// The server refused the versions this build carries (422
+  /// `legal_acceptance_required`): the Terms or Privacy Policy changed after
+  /// the app was built. Asking again would send the same versions, so the
+  /// screen says to update the app instead (decisions §498).
+  appOutdated,
+
+  /// Anything else (429, transport, 5xx): [AuthStore.legalError] holds the
+  /// app's standard message for it.
+  failed,
+}
+
+/// The coded refusal `POST /api/auth/legal-acceptance` answers a stale version
+/// with (`backend/app/services/legal_acceptance.LEGAL_ACCEPTANCE_REQUIRED`).
+const kLegalAcceptanceRequiredCode = 'legal_acceptance_required';
+
+class AuthStore extends ChangeNotifier with SequencedFetch {
   static final AuthStore instance = AuthStore._();
   AuthStore._();
 
@@ -54,6 +78,25 @@ class AuthStore extends ChangeNotifier {
   /// fallback. Cleared with [error].
   Object? get errorDetail => _errorDetail;
   bool get loggedIn => _user != null;
+
+  bool _acceptingLegal = false;
+
+  /// The request token of the accept that set [_acceptingLegal], so a stale
+  /// accept resolving after a newer one started never lowers the newer one's
+  /// flag.
+  int? _acceptToken;
+  String? _legalError;
+
+  /// The signed-in user has not accepted the Terms / Privacy versions in force
+  /// (`/me`'s `legal_acceptance_required`). `AuthGate` shows the blocking
+  /// accept screen instead of the app shell while this holds (§498).
+  bool get legalAcceptanceRequired => _user?.legalAcceptanceRequired ?? false;
+
+  /// A `POST /api/auth/legal-acceptance` is in flight.
+  bool get acceptingLegal => _acceptingLegal;
+
+  /// The standard error text for a [LegalAcceptOutcome.failed] accept.
+  String? get legalError => _legalError;
 
   bool get isAdmin => _user?.isAdmin ?? false;
   bool get isManager => _user?.isManager ?? false;
@@ -158,6 +201,11 @@ class AuthStore extends ChangeNotifier {
     _loading = false;
     _error = null;
     _errorDetail = null;
+    _acceptingLegal = false;
+    _legalError = null;
+    // A profile refresh still in flight belongs to the session that just
+    // ended; bumping the sequence drops its answer.
+    nextRequestToken();
     notifyListeners();
   }
 
@@ -318,6 +366,94 @@ class AuthStore extends ChangeNotifier {
       );
     }
     _user = user;
+  }
+
+  /// Re-read `GET /api/auth/me` for the signed-in user — on app resume, so a
+  /// Terms / Privacy version bump (or an acceptance made on the web) reaches a
+  /// session that stayed open. Best-effort: a transport failure keeps the
+  /// profile already held, and a 401 has already ended the session inside
+  /// `ApiClient`. A newer refresh or an acceptance supersedes this one
+  /// ([SequencedFetch]), so a `/me` read that started before the user accepted
+  /// cannot put the accept screen back after it.
+  ///
+  /// It never supersedes an acceptance already in flight: the accept's own
+  /// response is the fresher profile, and taking a newer token here would
+  /// discard it and leave the accept screen stuck "accepting".
+  Future<void> refreshProfile() async {
+    final current = _user;
+    if (current == null || _acceptingLegal) return;
+    final token = nextRequestToken();
+    try {
+      final fresh = await AuthApi.me();
+      if (!isCurrentRequest(token) || _user?.id != current.id) return;
+      _user = fresh;
+      notifyListeners();
+    } catch (_) {
+      // Keep the held profile; see above.
+    }
+  }
+
+  /// A call was refused by the server-side Terms / Privacy gate (403
+  /// `legal_acceptance_required`, decisions §505) — the documents changed
+  /// while this session stayed open. Re-read the profile, whose flag then puts
+  /// `LegalAcceptScreen` up. Once the flag is already set the step is showing,
+  /// so a burst of refused calls costs one `/me`, not one each.
+  void legalAcceptanceRefused() {
+    if (_user == null || legalAcceptanceRequired) return;
+    unawaited(refreshProfile());
+  }
+
+  /// Accept the Terms of Service and Privacy Policy versions this build was
+  /// generated with (`lib/legal_versions.generated.dart`, from the backend's
+  /// `CURRENT_LEGAL_VERSIONS`). On success the profile is replaced by the
+  /// response, whose `legal_acceptance_required` is false, so `AuthGate`
+  /// moves on to the app shell.
+  Future<LegalAcceptOutcome> acceptLegalDocuments() async {
+    if (_user == null || _acceptingLegal) return LegalAcceptOutcome.failed;
+    final token = nextRequestToken();
+    _acceptingLegal = true;
+    _acceptToken = token;
+    _legalError = null;
+    notifyListeners();
+    try {
+      final fresh = await AuthApi.acceptLegalDocuments(
+        termsVersion: kTermsVersion,
+        privacyVersion: kPrivacyVersion,
+      );
+      if (!isCurrentRequest(token)) return _supersededAccept(token);
+      _user = fresh;
+      _acceptingLegal = false;
+      notifyListeners();
+      return LegalAcceptOutcome.accepted;
+    } catch (e) {
+      if (!isCurrentRequest(token)) return _supersededAccept(token);
+      _acceptingLegal = false;
+      if (_isStaleVersionRefusal(e)) {
+        notifyListeners();
+        return LegalAcceptOutcome.appOutdated;
+      }
+      _legalError = describeApiError(e);
+      notifyListeners();
+      return LegalAcceptOutcome.failed;
+    }
+  }
+
+  /// A newer request (a sign-out's [reset]) took the sequence while the accept
+  /// was in flight. Its response is discarded, but the in-flight flag it set
+  /// must still come down: left up, the screen stays on its busy state and the
+  /// guard at the top of [acceptLegalDocuments] refuses every retry.
+  LegalAcceptOutcome _supersededAccept(int token) {
+    if (_acceptingLegal && _acceptToken == token) {
+      _acceptingLegal = false;
+      notifyListeners();
+    }
+    return LegalAcceptOutcome.failed;
+  }
+
+  static bool _isStaleVersionRefusal(Object e) {
+    if (e is! ApiException || e.statusCode != 422) return false;
+    final detail = e.detail;
+    return detail is Map && detail['code'] == kLegalAcceptanceRequiredCode;
   }
 
   /// Sign out. The local teardown (offline cache + every store singleton) runs

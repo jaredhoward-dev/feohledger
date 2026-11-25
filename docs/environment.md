@@ -85,6 +85,18 @@ not ports. Resolved in `frontend/tests-e2e/fixtures/env.ts`; the full recipe
 (including what stays shared — the databases and the opt-in Docker services) is
 in `frontend/tests-e2e/README.md` § Running from a worktree.
 
+## Mobile (`--dart-define`)
+
+The Flutter app reads no env file; build-time values are `--dart-define`s,
+declared in `mobile/lib/config.dart` (layout: `mobile/docs/project-structure.md`).
+
+| Define | Default | Purpose |
+|--------|---------|---------|
+| `FEOH_PUBLIC_WEB_URL` | `https://feohledger.com` | Origin of the public site whose `/legal/terms` and `/legal/privacy` the accept screen links to (decisions §498). Must be `https`: `ExternalLink` renders anything else as plain text, so an `http` value leaves the screen with no working link |
+
+The API base URL and tenant are entered on the login screen, not defined at
+build time.
+
 ## Backend (`backend/.env`)
 
 | Variable              | Default                                                                  | Description                      |

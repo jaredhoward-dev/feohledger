@@ -3,6 +3,7 @@ import { getSelectedEntityId } from '#lib/entity.ts';
 import { apiErrorCode, formatApiDetail } from '#lib/utils/apiError.ts';
 import { localizeApiDetail } from '#lib/api/codedRefusals.ts';
 import { AssistantBudgetError, assistantBudgetError } from '#lib/api/assistantBudget.ts';
+import { employeeAcceptanceRefusal } from '#lib/api/acceptanceRefusal.ts';
 import {
 	loginPathFor,
 	revokeRejectedSession,
@@ -123,9 +124,16 @@ export function hasToken(): boolean {
  * — `request()`, the blob downloads, the SSE stream and `api/expenses.ts`'s
  * hand-rolled submit — so none of them can leave a dead session behind a
  * screen where every call fails.
+ *
+ * Being the one hook every client calls on a refusal, it also hands the
+ * Terms / Privacy gate's 403 `legal_acceptance_required` to the auth store
+ * (`api/acceptanceRefusal.ts`, decisions §505), which puts the accept step up;
+ * that refusal does not end the session.
  */
 export function endSessionIfRejected(status: number, detail: unknown): boolean {
-	const rejection = sessionRejection(status, apiErrorCode(detail).code);
+	const code = apiErrorCode(detail).code;
+	employeeAcceptanceRefusal.notice(status, code);
+	const rejection = sessionRejection(status, code);
 	if (!rejection) return false;
 	// A token for another workspace is still live there — revoke it on the
 	// server too, best-effort, before forgetting it here.

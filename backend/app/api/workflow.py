@@ -531,9 +531,14 @@ async def assign_reviewer(
     body: AssignReviewerRequest,
     db: AsyncSession = Depends(get_tenant_db),
     control_db: AsyncSession = Depends(get_control_db),
+    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
+    """Assign the invoice for review. An out-of-office reviewer's assignment goes
+    to their delegate when ``review.assign_reviewer`` finds the delegate
+    eligible today and able to clear this invoice; otherwise the named
+    reviewer keeps it (decisions §511)."""
     await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
     invoice = await get_invoice_for_update(db, invoice_id)
     if invoice.status != InvoiceStatus.ready_for_review:
@@ -583,6 +588,8 @@ async def assign_reviewer(
         actor_id=user.id,
         reviewer_id=reviewer_id,
         reviewer_name=reviewer.full_name,
+        control_db=control_db,
+        org_settings=org.settings,
     )
     return InvoiceResponse.from_db(invoice)
 

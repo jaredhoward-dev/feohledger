@@ -31,6 +31,12 @@ describe('authRefusalText', () => {
 	it('pins every code the backend emits — a rename on either side fails here', () => {
 		// The literals `api/auth.py` and `api/portal_auth.py` pass to `coded_refusal`.
 		expect([...AUTH_REFUSAL_CODES].sort()).toEqual([
+			'delegation_delegate_cannot_approve',
+			'delegation_delegate_not_found',
+			'delegation_invalid_id',
+			'delegation_self',
+			'delegation_until_invalid',
+			'delegation_until_past',
 			'passkey_not_registered',
 			'passkey_wrong_host',
 			'portal_step_up_failed',
@@ -53,7 +59,13 @@ describe('authRefusalText', () => {
 		['sensitive_step_up_required', 'authRefusal.sensitiveStepUpRequired'],
 		['sensitive_step_up_failed', 'authRefusal.sensitiveStepUpFailed'],
 		['sensitive_step_up_no_factor', 'authRefusal.sensitiveStepUpNoFactor'],
-		['sensitive_step_up_unavailable', 'authRefusal.sensitiveStepUpUnavailable']
+		['sensitive_step_up_unavailable', 'authRefusal.sensitiveStepUpUnavailable'],
+		['delegation_invalid_id', 'authRefusal.delegationInvalidId'],
+		['delegation_self', 'authRefusal.delegationSelf'],
+		['delegation_until_invalid', 'authRefusal.delegationUntilInvalid'],
+		['delegation_until_past', 'authRefusal.delegationUntilPast'],
+		['delegation_delegate_not_found', 'authRefusal.delegationDelegateNotFound'],
+		['delegation_delegate_cannot_approve', 'authRefusal.delegationDelegateCannotApprove']
 	] as const)('maps %s to %s', (code, key) => {
 		const { t, calls } = recorder();
 		const out = authRefusalText({ code, params: {}, message: 'server English' }, t);

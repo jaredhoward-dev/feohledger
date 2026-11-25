@@ -92,6 +92,9 @@ from app.services.control_plane_bootstrap import SYSTEM_ROLE_DESCRIPTIONS
 from app.services.control_plane_bootstrap import (
     create_control_tables as bootstrap_control_tables,
 )
+from app.services.erp_link_realm import UNNAMED_REALM
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS, record_acceptances
+from app.services.portal_legal_acceptance import record_acknowledgement
 from app.services.tenant_provisioning import CONTROL_TABLES
 from app.utils.dates import utc_today
 from app.utils.passwords import pwd_context
@@ -351,6 +354,62 @@ async def ensure_seed_plan_entitled(
     return True
 
 
+#: ``legal_acceptances.source`` for the rows below. Not one of the service's
+#: ``SOURCE_*`` controls on purpose: no person ticked a box for a fixture
+#: account, and the row should say so rather than borrow a control's name.
+SEED_LEGAL_SOURCE = "seed"
+
+
+async def ensure_seeded_users_accepted_legal(
+    session: AsyncSession, organization_ids: list[uuid.UUID]
+) -> None:
+    """Record acceptance of the Terms / Privacy versions in force for every
+    user of the seeded orgs, so the web app's blocking re-prompt
+    (``legal_acceptance_required`` on ``/me``, decisions §495, §497) does not
+    stand between the demo logins / every e2e spec and the app.
+
+    Through ``legal_acceptance.record_acceptances``, the one writer, so a
+    re-run is a no-op (``ON CONFLICT DO NOTHING``) and a version bump is
+    picked up by re-running the seed. Runs on the already-seeded path too,
+    the same backfill shape as :func:`ensure_demo_billing_baseline`. Only
+    fixture accounts in seeded orgs: this is not the backfill §495 refuses
+    for real users. Caller commits.
+    """
+    rows = (
+        await session.execute(
+            select(User.id, User.organization_id).where(User.organization_id.in_(organization_ids))
+        )
+    ).all()
+    for user_id, org_id in rows:
+        await record_acceptances(
+            session,
+            user_id=user_id,
+            organization_id=org_id,
+            versions=CURRENT_LEGAL_VERSIONS,
+            source=SEED_LEGAL_SOURCE,
+        )
+
+
+async def ensure_seeded_portal_users_acknowledged_privacy(session: AsyncSession) -> None:
+    """Record the Privacy Policy acknowledgement in force for every supplier-portal
+    user in this TENANT database, so the portal's blocking re-prompt
+    (``legal_acceptance_required`` on ``/portal/auth/me``, decisions §499, §500)
+    does not stand between the demo supplier login / every portal e2e spec and
+    the portal.
+
+    The tenant twin of :func:`ensure_seeded_users_accepted_legal`: through
+    ``portal_legal_acceptance.record_acknowledgement``, the one writer, with
+    :data:`SEED_LEGAL_SOURCE`, so a re-run is a no-op and a version bump is
+    picked up by re-running the seed. Runs on the already-seeded path too.
+    Fixture accounts only. Caller commits.
+    """
+    vendor_user_ids = (await session.execute(select(VendorUser.id))).scalars().all()
+    for vendor_user_id in vendor_user_ids:
+        await record_acknowledgement(
+            session, vendor_user_id=vendor_user_id, source=SEED_LEGAL_SOURCE
+        )
+
+
 async def ensure_demo_billing_baseline(session: AsyncSession) -> None:
     """Bind the two demo tenants to their seeded plans (:data:`ACME_PLAN_CODE`
     / :data:`TECHFLOW_PLAN_CODE`) and repair an already-seeded control plane.
@@ -386,8 +445,12 @@ async def seed_control_plane():
             # its own `continue`). Without this, a demo tenant stuck on a plan
             # that grants no `public_api` could never be repaired by re-running
             # the seed.
-            print("  Control plane already seeded — refreshing billing baseline only.")
+            print(
+                "  Control plane already seeded — refreshing billing baseline "
+                "and legal acceptances only."
+            )
             await ensure_demo_billing_baseline(session)
+            await ensure_seeded_users_accepted_legal(session, [ACME_ORG_ID, TECH_ORG_ID])
             await session.commit()
             return
 
@@ -539,6 +602,7 @@ async def seed_control_plane():
         # FROM. Which plan each demo tenant lands on, and why they differ, is
         # documented on ACME_PLAN_CODE / TECHFLOW_PLAN_CODE above.
         await ensure_demo_billing_baseline(session)
+        await ensure_seeded_users_accepted_legal(session, [ACME_ORG_ID, TECH_ORG_ID])
 
         await session.commit()
         print(
@@ -645,6 +709,10 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
         result = await session.execute(text("SELECT count(*) FROM vendors"))
         if result.scalar() > 0:
             print(f"  {tenant_label} tenant already seeded. Skipping.")
+            # Except the portal acknowledgement: a tenant seeded before §500
+            # (or before a Privacy Policy bump) is repaired by re-running.
+            await ensure_seeded_portal_users_acknowledged_privacy(session)
+            await session.commit()
             await engine.dispose()
             return
 
@@ -660,6 +728,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V001",
+            erp_link_realm=UNNAMED_REALM,
             accepts_virtual_cards=True,
         )
         v_cloud = Vendor(
@@ -673,6 +742,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V002",
+            erp_link_realm=UNNAMED_REALM,
         )
         v_facility = Vendor(
             organization_id=org_id,
@@ -706,6 +776,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V005",
+            erp_link_realm=UNNAMED_REALM,
         )
         v_legal = Vendor(
             organization_id=org_id,
@@ -737,6 +808,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
             status="active",
             source="erp_sync",
             erp_vendor_id="ERP-V008",
+            erp_link_realm=UNNAMED_REALM,
         )
         # Unverified vendor (AI-extracted from a recent invoice)
         v_unverified = Vendor(
@@ -815,6 +887,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                     status=status,
                     source=source,
                     erp_vendor_id=f"ERP-FV{seq:03d}" if source == "erp_sync" else None,
+                    erp_link_realm=UNNAMED_REALM if source == "erp_sync" else None,
                     accepts_virtual_cards=(i % 3 == 0),
                 )
             )
@@ -1399,6 +1472,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Cash and Cash Equivalents",
                 account_type="asset",
                 erp_account_id="1000",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1406,6 +1480,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Accounts Receivable",
                 account_type="asset",
                 erp_account_id="1200",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1413,6 +1488,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Fixed Assets - Equipment",
                 account_type="asset",
                 erp_account_id="1500",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1420,6 +1496,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Accounts Payable",
                 account_type="liability",
                 erp_account_id="2000",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1427,6 +1504,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Accrued Liabilities",
                 account_type="liability",
                 erp_account_id="2100",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1434,6 +1512,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Revenue - Services",
                 account_type="revenue",
                 erp_account_id="4000",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1441,6 +1520,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Office Supplies & Expenses",
                 account_type="expense",
                 erp_account_id="6100",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1448,6 +1528,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Software & Cloud Services",
                 account_type="expense",
                 erp_account_id="6200",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1455,6 +1536,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Facilities & Maintenance",
                 account_type="expense",
                 erp_account_id="6300",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1462,6 +1544,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Marketing & Advertising",
                 account_type="expense",
                 erp_account_id="6400",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1469,6 +1552,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Legal & Professional Fees",
                 account_type="expense",
                 erp_account_id="6500",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1476,6 +1560,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Meals & Entertainment",
                 account_type="expense",
                 erp_account_id="6600",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1483,6 +1568,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Shipping & Freight",
                 account_type="expense",
                 erp_account_id="6700",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1490,6 +1576,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Travel & Transportation",
                 account_type="expense",
                 erp_account_id="6800",
+                erp_link_realm=UNNAMED_REALM,
             ),
             GLAccount(
                 organization_id=org_id,
@@ -1497,6 +1584,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 name="Payroll Expense",
                 account_type="expense",
                 erp_account_id="8000",
+                erp_link_realm=UNNAMED_REALM,
             ),
         ]
         session.add_all(gl_accounts)
@@ -1830,6 +1918,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
 
         await seed_extras(session, org_id)
 
+        await ensure_seeded_portal_users_acknowledged_privacy(session)
         await session.commit()
         total_invoices = len(invoices) + len(filler_invoices) + len(realistic_invoices)
         total_vendors = len(all_vendors) + len(filler_vendors_list)
@@ -1956,6 +2045,11 @@ async def seed_e2e_control_plane(roles: dict[str, "Role"]) -> list[tuple[str, uu
             await ensure_seed_plan_entitled(
                 session, organization_id=e2e_org_id, plan_code=E2E_PLAN_CODE
             )
+        # Every worker user, including those of a tenant seeded before this
+        # existed (the `continue` above): the step would block every spec.
+        await ensure_seeded_users_accepted_legal(
+            session, [e2e_org_id for _db, e2e_org_id, _label in created]
+        )
 
         await session.commit()
 
@@ -2004,6 +2098,9 @@ async def seed_tenant_lean(db_name: str, org_id: uuid.UUID, tenant_label: str):
             result = await session.execute(text("SELECT count(*) FROM vendors"))
             if result.scalar() > 0:
                 print(f"  {tenant_label} tenant already seeded. Skipping.")
+                # Except the portal acknowledgement (see `seed_tenant`).
+                await ensure_seeded_portal_users_acknowledged_privacy(session)
+                await session.commit()
                 return
 
             # Production-shaped (#575 § 2): the two vendors that own invoices
@@ -2374,6 +2471,7 @@ async def seed_tenant_lean(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 ]
             )
 
+            await ensure_seeded_portal_users_acknowledged_privacy(session)
             await session.commit()
             print(f"  Seeded lean fixtures for {tenant_label} (incl. 1 portal user)")
     finally:

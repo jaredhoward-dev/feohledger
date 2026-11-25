@@ -420,6 +420,18 @@ describe('codedRefusalText', () => {
 		expect(codedRefusalText('intake_status_refused', {}, enT)).toBeNull();
 	});
 
+	it("names a contract's status in its lifecycle and delete refusals (decisions §507)", () => {
+		expect(codedRefusalText('contract_status_refused', { status: 'expired', action: 'cancel' }, enT)).toContain(
+			EN_ALL['contracts.status.expired']
+		);
+		expect(codedRefusalText('contract_delete_refused', { status: 'active' }, enT)).toContain(
+			EN_ALL['contracts.status.active']
+		);
+		expect(codedRefusalText('contract_status_refused', { status: 'mystery' }, enT)).toContain('mystery');
+		expect(codedRefusalText('contract_status_refused', {}, enT)).toBeNull();
+		expect(codedRefusalText('contract_delete_refused', {}, enT)).toBeNull();
+	});
+
 	it('states each procurement delete refusal in its own sentence', () => {
 		expect(codedRefusalText('intake_delete_converted', {}, enT)).toBe(
 			EN_ALL['refusal.intakeDeleteConverted']
@@ -945,7 +957,9 @@ describe('the self-service signup refusals (issue #635 finding 18)', () => {
 		['signup_email_send_failed', 'refusal.signupEmailSendFailed'],
 		['signup_link_invalid', 'refusal.signupLinkInvalid'],
 		['signup_unavailable', 'refusal.signupUnavailable'],
-		['signup_provisioning_failed', 'refusal.signupProvisioningFailed']
+		['signup_provisioning_failed', 'refusal.signupProvisioningFailed'],
+		['legal_acceptance_required', 'refusal.legalAcceptanceRequired'],
+		['privacy_acknowledgement_required', 'refusal.privacyAcknowledgementRequired']
 	];
 
 	it.each(FIXED)('%s is stated in the reader\'s language', (code, key) => {
@@ -1407,6 +1421,18 @@ describe('why /cards/generate minted nothing, and the CSV near-duplicate rows', 
 		['csv_vendor_name_required', {}, 'refusal.csvVendorNameRequired', {}],
 		['csv_invoice_number_required', {}, 'refusal.csvInvoiceNumberRequired', {}],
 		['csv_vendor_required', {}, 'refusal.csvVendorRequired', {}],
+		[
+			'csv_vendor_code_ambiguous',
+			{ value: 'V001' },
+			'refusal.csvVendorCodeAmbiguous',
+			{ value: 'V001' }
+		],
+		[
+			'csv_vendor_code_is_erp_link',
+			{ value: '77', name: 'Acme Corp', vendor: 'Seventy Seven' },
+			'refusal.csvVendorCodeIsErpLink',
+			{ value: '77', name: 'Acme Corp', vendor: 'Seventy Seven' }
+		],
 		['csv_amount_invalid', { value: 'ten' }, 'refusal.csvAmountInvalid', { value: 'ten' }],
 		['csv_amount_invalid', { value: '' }, 'refusal.csvAmountMissing', {}],
 		['csv_currency_required', {}, 'refusal.csvCurrencyRequired', {}],
@@ -1463,6 +1489,9 @@ describe('why /cards/generate minted nothing, and the CSV near-duplicate rows', 
 		expect(codedRefusalText('csv_status_invalid', {}, enT)).toBeNull();
 		expect(codedRefusalText('csv_status_not_importable', { status: 3 }, enT)).toBeNull();
 		expect(codedRefusalText('csv_status_records_history', {}, enT)).toBeNull();
+		expect(
+			codedRefusalText('csv_vendor_code_is_erp_link', { value: '77', name: 'Acme Corp' }, enT)
+		).toBeNull();
 	});
 });
 
@@ -1767,5 +1796,36 @@ describe('/draft-run with nothing stageable in the run currency', () => {
 		[{ run_currency: 'USD', currencies: ['EUR'] }]
 	] as [Record<string, unknown>][])('params %j fall back to the server English', (params) => {
 		expect(codedRefusalText('draft_run_no_run_currency', params, enT)).toBeNull();
+	});
+});
+
+describe('PO match rule refusals (decisions §512)', () => {
+	it('states the server range through the percent formatter', () => {
+		expect(codedRefusalText('match_tolerance_out_of_range', { min: '0', max: '100' }, enT)).toBe(
+			'The tolerance must be between 0% and 100%.'
+		);
+		setActiveFormatLocale('de');
+		// German puts a (narrow) no-break space before the sign.
+		const de = codedRefusalText('match_tolerance_out_of_range', { min: '0', max: '100' }, deT);
+		expect(de?.replace(/[\u00a0\u202f]/g, ' ')).toBe(
+			'Die Toleranz muss zwischen 0 % und 100 % liegen.'
+		);
+	});
+
+	it('falls back to the server sentence on malformed params', () => {
+		expect(codedRefusalText('match_tolerance_out_of_range', { min: 0 }, enT)).toBeNull();
+		expect(codedRefusalText('match_tolerance_too_precise', { places: '2' }, enT)).toBeNull();
+	});
+
+	it('names the precision and the fixed sentences', () => {
+		expect(codedRefusalText('match_tolerance_too_precise', { places: 2 }, enT)).toBe(
+			'The tolerance can have at most 2 decimal places.'
+		);
+		expect(localizeApiDetail(detail('match_rule_empty'), enT)).toBe(
+			'Set a tolerance, an inspection requirement, or both.'
+		);
+		expect(localizeApiDetail(detail('match_rule_gl_account_not_found'), enT)).toBe(
+			'That GL account is not in the chart of accounts.'
+		);
 	});
 });

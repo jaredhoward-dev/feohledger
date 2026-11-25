@@ -11,11 +11,14 @@ skip-and-report partial-success contract with the sibling bulk endpoints.
 
 import uuid
 
+import pytest
 from sqlalchemy import select
 
 from app.models.contract import Contract
+from app.models.entity import Entity
 from app.models.vendor import Vendor
 from app.models.workflow import AuditLog
+from tests.entity_scope_probe import two_entities
 
 TENANT = "a"
 
@@ -195,3 +198,62 @@ async def test_bulk_export_unknown_ids_404(realdb):
     async with realdb.client(key=TENANT) as c:
         resp = await c.post("/api/contracts/bulk/export", json={"ids": [str(uuid.uuid4())]})
     assert resp.status_code == 404
+
+
+async def test_bulk_export_malformed_id_is_422(realdb):
+    async with realdb.client(key=TENANT) as c:
+        resp = await c.post("/api/contracts/bulk/export", json={"ids": ["not-a-uuid"]})
+    assert resp.status_code == 422
+
+
+async def _stamp_default_entity(mk, contract_id: str) -> None:
+    async with mk() as s:
+        default_id = (await s.execute(select(Entity.id).where(Entity.is_default))).scalar_one()
+        contract = await s.get(Contract, uuid.UUID(contract_id))
+        contract.entity_id = default_id
+        await s.commit()
+
+
+# Multi-entity is plan-gated (decisions §258): a second entity needs Scale.
+@pytest.mark.plan("scale")
+async def test_bulk_export_drops_contracts_outside_the_entity_selector(realdb):
+    """An id in another entity is dropped exactly as a nonexistent one: it is
+    left out of a mixed export, and a selection of only such ids is the same
+    404 an all-missing one gets (decisions §507)."""
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    vendor_id = await _add_vendor(mk, org_id, name="Scoped Export Vendor")
+    tag = uuid.uuid4().hex[:6]
+    in_scope = await _add_contract(mk, org_id, vendor_id, number=f"MSA-IN-{tag}")
+    out_of_scope = await _add_contract(mk, org_id, vendor_id, number=f"MSA-OUT-{tag}")
+    await _stamp_default_entity(mk, out_of_scope)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        _default_id, other_id = await two_entities(c, slug=f"cx-{tag}")
+        async with mk() as s:
+            contract = await s.get(Contract, uuid.UUID(in_scope))
+            contract.entity_id = uuid.UUID(other_id)
+            await s.commit()
+        scoped = {"X-Entity-ID": other_id}
+
+        mixed = await c.post(
+            "/api/contracts/bulk/export", json={"ids": [in_scope, out_of_scope]}, headers=scoped
+        )
+        only_out = await c.post(
+            "/api/contracts/bulk/export", json={"ids": [out_of_scope]}, headers=scoped
+        )
+        missing = await c.post(
+            "/api/contracts/bulk/export", json={"ids": [str(uuid.uuid4())]}, headers=scoped
+        )
+        consolidated = await c.post(
+            "/api/contracts/bulk/export", json={"ids": [in_scope, out_of_scope]}
+        )
+
+    assert mixed.status_code == 200, mixed.text
+    assert f"MSA-IN-{tag}" in mixed.text
+    assert f"MSA-OUT-{tag}" not in mixed.text
+    assert only_out.status_code == 404
+    assert only_out.json() == missing.json()
+    # The consolidated view (no selector) still sees both.
+    assert consolidated.status_code == 200, consolidated.text
+    assert f"MSA-IN-{tag}" in consolidated.text and f"MSA-OUT-{tag}" in consolidated.text

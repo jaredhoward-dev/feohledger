@@ -16,6 +16,8 @@ function createInvoiceStore() {
 	let total = $state(0);
 	let page = $state(1);
 	let statusCounts = $state<Record<string, number>>({});
+	// The population (`countsPopulation`) the committed `statusCounts` describe.
+	let countsKey: string | null = null;
 	let lastParams = $state<Record<string, string>>({});
 	// Did the most recent (non-append) load fail? The list empty-state reads
 	// this: without it a 500 / offline backend leaves `all` empty and the table
@@ -111,6 +113,16 @@ function createInvoiceStore() {
 		}
 	}
 
+	/** The params `/counts` filters on: everything but the status / sort / page. */
+	function countsPopulation(params?: Record<string, string>): string {
+		const ignored = new Set(['status', 'sort', 'order', 'page', 'page_size']);
+		return JSON.stringify(
+			Object.entries(params ?? {})
+				.filter(([k]) => !ignored.has(k))
+				.sort(([a], [b]) => a.localeCompare(b))
+		);
+	}
+
 	async function fetchCounts(params?: Record<string, string>) {
 		const token = countsSequence.start();
 		try {
@@ -127,8 +139,16 @@ function createInvoiceStore() {
 			);
 			if (!countsSequence.canCommit(token)) return;
 			statusCounts = res.counts;
+			countsKey = countsPopulation(params);
 		} catch {
-			// ignore — counts are non-critical
+			// Non-critical, so nothing is surfaced — but tallies for a different
+			// population must not stand in for this one: "Select all N matching"
+			// would offer the old filter's N. Empty reads as "not loaded".
+			if (!countsSequence.isCurrentRequest(token)) return;
+			if (countsPopulation(params) !== countsKey) {
+				statusCounts = {};
+				countsKey = null;
+			}
 		}
 	}
 

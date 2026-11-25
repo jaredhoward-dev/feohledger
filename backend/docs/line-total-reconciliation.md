@@ -83,9 +83,21 @@ runs in **every** status (a manually-entered draft carries lines from its first
 save). It no-ops when the invoice has no line totals at all, and it is
 best-effort: a failure is logged PII-free and never breaks saving an invoice.
 
-Gated by the `line_total_mismatch_enabled` rule (default `true` — set
-`settings.fraud_rules.line_total_mismatch_enabled: false` to opt out, like the
-other rules).
+Gated by the `line_total_mismatch_enabled` rule (default `true`). Unlike the
+other fraud rules it has its own audited writer, `PUT
+/api/organization/line-total-check` (`{enabled}`, admin-only, audited
+`organization.fraud_rule_updated` with old and new value, decisions §502), and
+its own panel, `/organization?section=line-total-check`. The generic `PATCH
+/api/organization` carries the stored value across a `fraud_rules` save and
+refuses a different one; the Fraud Detection form leaves the key out of its
+save. The switch applies from each invoice's next warning refresh.
+Turning it off stops new findings only: the next refresh drops the warning
+from the invoice, but an open or escalated `line_total_mismatch` exception
+stays open and keeps blocking the payment run until a person resolves or
+dismisses it (pinned in `tests/test_organization_controls.py`). A stored value
+is read for its truthiness, as the engine reads it, so a `0` / `null` reads
+off; the PUT rewrites any non-bool to a real one, and the generic `PATCH`
+accepts only a real bool for the key.
 
 ### Extraction's self-correction pass uses the same definition
 

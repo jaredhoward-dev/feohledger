@@ -76,6 +76,39 @@ test.describe('audit console (admin)', () => {
 		await expect(rows.nth(1).getByTestId('audit-action-token')).toHaveText('invoice.from_the_future');
 	});
 
+	test('the trail row says not-run, loading, empty or nothing — never a blank box', async ({
+		page
+	}) => {
+		// Held, then released, so the in-flight state is observable without a
+		// timer: the first run has no rows yet, and the reserved-height region
+		// used to sit blank until the response landed.
+		let release: () => void = () => {};
+		const held = new Promise<void>((resolve) => (release = resolve));
+		let outcome: 'empty' | 'fail' = 'empty';
+		await page.route('**/api/audit/export*', async (route) => {
+			if (outcome === 'fail') return route.fulfill({ status: 500, body: '{}' });
+			await held;
+			return route.fulfill({ json: [] });
+		});
+		await page.goto('/audit');
+		const trail = page.locator('.grid-container tbody');
+		await expect(trail).toContainText('Run a query to see the audit trail.');
+
+		await page.getByRole('button', { name: 'Run query' }).click();
+		await expect(trail.getByRole('status')).toHaveText('Loading…');
+		const exported = page.waitForResponse((r) => r.url().includes('/api/audit/export'));
+		release();
+		await exported;
+		await expect(trail).toContainText('No audit entries for this query.');
+
+		outcome = 'fail';
+		await page.getByRole('button', { name: 'Run query' }).click();
+		await expect(page.getByTestId('audit-query-error')).toBeVisible();
+		// A failed run is not a claim that the period had no activity.
+		await expect(trail).not.toContainText('No audit entries for this query.');
+		await expect(trail.locator('tr')).toHaveCount(0);
+	});
+
 	test('a failed query says so with a Retry, not an empty trail', async ({ page }) => {
 		let fail = true;
 		await page.route('**/api/audit/export*', (route) =>

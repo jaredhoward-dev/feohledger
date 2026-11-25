@@ -23,6 +23,16 @@
 		 */
 		sub?: string | null;
 		/**
+		 * Text whose space the `sub` line holds while `sub` is empty: drawn
+		 * invisible (and hidden from assistive tech), so a qualifier that only
+		 * the response can decide does not grow the card — and the whole KPI
+		 * row, and everything under it — when it lands. Pass the longest
+		 * wording `sub` takes; the reserve wraps at the card's own width in the
+		 * reader's locale, which is why it is text and not a fixed height
+		 * (frontend/docs/ui-patterns.md § Page layout).
+		 */
+		reserveSub?: string | null;
+		/**
 		 * The missing figure is still being fetched, as opposed to unavailable.
 		 * Only meaningful alongside a nullish `value`: it changes nothing that
 		 * is drawn (both render the same dash) and only what is *announced* —
@@ -38,7 +48,15 @@
 		helpTerm?: string;
 	};
 
-	let { value, label, highlight = null, sub = null, pending = false, helpTerm }: Props = $props();
+	let {
+		value,
+		label,
+		highlight = null,
+		sub = null,
+		reserveSub = null,
+		pending = false,
+		helpTerm
+	}: Props = $props();
 
 	const figure = $derived(kpiFigureState(value, pending));
 	const shown = $derived(kpiDisplayValue(value, pending));
@@ -78,6 +96,8 @@
 	{/if}
 	{#if sub}
 		<span class="kpi-sub">{sub}</span>
+	{:else if reserveSub}
+		<span class="kpi-sub kpi-sub-reserve" aria-hidden="true">{reserveSub}</span>
 	{/if}
 </div>
 
@@ -88,6 +108,9 @@
 	   this component used to carry a private copy of it. */
 	.kpi {
 		position: relative;
+	}
+	.kpi-sub-reserve {
+		visibility: hidden;
 	}
 	.kpi-label-row {
 		display: inline-flex;

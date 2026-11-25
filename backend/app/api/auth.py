@@ -11,13 +11,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import (
     create_access_token_with_jti,
     decode_token,
+    get_authenticated_user,
     get_current_user,
+    require_permission,
 )
-from app.api.permissions import effective_permissions
+from app.api.permissions import PERM_INVOICE_APPROVE, effective_permissions
 from app.api.refusals import (
     MFA_CHALLENGE_INVALID_DETAIL,
     MFA_CODE_INVALID_DETAIL,
@@ -35,6 +38,7 @@ from app.schemas.auth import (
     ChangePasswordRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
+    LegalAcceptanceRequest,
     LoginRequest,
     MFAChallengeResponse,
     MFADisableRequest,
@@ -60,11 +64,12 @@ from app.schemas.auth import (
     WebAuthnRegisterStartResponse,
     WebAuthnStepUpStartRequest,
 )
-from app.services import mfa, password_reset, webauthn, webauthn_rp
+from app.services import legal_acceptance, mfa, password_reset, webauthn, webauthn_rp
 from app.services.audit_dispatch import dispatch_auth_audit, queue_auth_audit
 from app.services.billing.entitlements import get_entitlements, has_entitlement
 from app.services.billing.plan_catalog import ALL_FEATURES
 from app.services.credential_upgrade import upgrade_password_hash
+from app.services.delegation import is_eligible_delegate
 from app.services.email_adapters import (
     EmailMessage,
     get_email_adapter,
@@ -312,6 +317,7 @@ async def _user_response(
         # extended with keys that mean nothing to the client.
         entitlements=sorted(f for f in ALL_FEATURES if has_entitlement(entitlements, f)),
         locale=user.locale,
+        legal_acceptance_required=bool(await legal_acceptance.missing_documents(db, user.id)),
     )
 
 
@@ -844,7 +850,26 @@ async def check_reset_token(
         user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
-    return ResetPasswordCheckResponse(email=user.email)
+    return ResetPasswordCheckResponse(
+        email=user.email,
+        legal_acceptance_required=await _set_password_needs_acceptance(db, user),
+    )
+
+
+async def _set_password_needs_acceptance(db: AsyncSession, user: User) -> bool:
+    """Does redeeming this link have to carry acceptance of our Terms / Privacy?
+
+    Only a SET-password — an account with no password yet: an admin-created
+    user, or one an admin reset — whose owner has not accepted the versions in
+    force (decisions §283, §495). That link is the account's front door, so the
+    accept control sits on it. A forgot-password reset of an account that
+    already has a password is not held up: its owner is left to the in-app
+    accept step after sign-in (`UserResponse.legal_acceptance_required`,
+    §497, §498), which the server-side gate holds them at (§505).
+    """
+    if user.hashed_password is not None:
+        return False
+    return bool(await legal_acceptance.missing_documents(db, user.id))
 
 
 @router.post("/reset-password", response_model=ResetPasswordResponse)
@@ -868,6 +893,22 @@ async def reset_password(
     except PasswordError as exc:
         raise HTTPException(status_code=422, detail=password_refusal(exc)) from exc
 
+    # A set-password link must carry acceptance of the Terms / Privacy versions
+    # in force (`_set_password_needs_acceptance`). Checked BEFORE the token is
+    # consumed, against the account the token names, so a refusal leaves the
+    # link usable once the box is ticked (decisions §495). The peek answers
+    # nothing the redemption below would not.
+    accepted = legal_acceptance.accepts_current(
+        body.accepted_terms_version, body.accepted_privacy_version
+    )
+    if not accepted:
+        peeked = await password_reset.peek_reset_token(body.token)
+        holder = None
+        if peeked is not None:
+            holder = (await db.execute(select(User).where(User.id == peeked))).scalar_one_or_none()
+        if holder is not None and await _set_password_needs_acceptance(db, holder):
+            raise HTTPException(status_code=422, detail=legal_acceptance.acceptance_refusal())
+
     user_id = await password_reset.consume_reset_token(body.token)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
@@ -879,7 +920,28 @@ async def reset_password(
 
     user.hashed_password = await hash_password(body.new_password)
     user.must_change_password = False
+    if accepted:
+        await legal_acceptance.record_acceptances(
+            db,
+            user_id=user.id,
+            organization_id=user.organization_id,
+            versions=legal_acceptance.CURRENT_LEGAL_VERSIONS,
+            source=legal_acceptance.SOURCE_SET_PASSWORD,
+        )
     await db.commit()
+
+    if accepted:
+        await dispatch_auth_audit(
+            organization_id=user.organization_id,
+            actor_id=user.id,
+            action="auth.legal.accepted",
+            entity_id=user.id,
+            details={
+                "versions": dict(legal_acceptance.CURRENT_LEGAL_VERSIONS),
+                "source": legal_acceptance.SOURCE_SET_PASSWORD,
+                "ip": _client_ip(request),
+            },
+        )
 
     # Force logout of every existing session — same posture as the
     # admin-triggered password reset (`api/admin.py::update_user`) and exactly
@@ -2033,9 +2095,71 @@ async def revoke_my_other_sessions(user: User = Depends(get_current_user)):
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_control_db),
 ):
+    org = await _load_user_org(db, user.organization_id)
+    return await _user_response(db, user, org)
+
+
+#: Generous for a person re-ticking the box; a loop posting it is not one.
+LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE = 10
+
+
+@router.post("/legal-acceptance", response_model=UserResponse)
+async def accept_legal_documents(
+    body: LegalAcceptanceRequest,
+    request: Request,
+    user: User = Depends(get_authenticated_user),
+    db: AsyncSession = Depends(get_control_db),
+):
+    """Record the caller's acceptance of the Terms / Privacy versions in force.
+
+    The backend of the re-prompt (`legal_acceptance_required` on `/me`) for a
+    user who signed in through SSO or SCIM, one whose account predates
+    acceptance being collected, or anyone after a version bump: the web and
+    mobile accept steps post here (§497, §498). Exempt from the server-side
+    gate that refuses an unaccepted user everywhere else (§505), since it is
+    how the gate is cleared.
+    Only the versions in force are accepted (422 `legal_acceptance_required`
+    otherwise), and re-accepting is harmless: the record is append-only and
+    keeps its first `accepted_at`.
+    """
+    # Every call is a control-plane write plus, on a first acceptance, a shipped
+    # audit row, so cap it like the other auth writers. Keyed on the account:
+    # the caller is authenticated, and a per-IP bucket would lump an office's
+    # users together.
+    await check_rate_limit(
+        "auth_legal_acceptance",
+        limit=LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE,
+        window_seconds=60,
+        subject=str(user.id),
+    )
+    if not legal_acceptance.accepts_current(
+        body.accepted_terms_version, body.accepted_privacy_version
+    ):
+        raise HTTPException(status_code=422, detail=legal_acceptance.acceptance_refusal())
+    missing = await legal_acceptance.missing_documents(db, user.id)
+    await legal_acceptance.record_acceptances(
+        db,
+        user_id=user.id,
+        organization_id=user.organization_id,
+        versions=legal_acceptance.CURRENT_LEGAL_VERSIONS,
+        source=legal_acceptance.SOURCE_REPROMPT,
+    )
+    await db.commit()
+    if missing:
+        await dispatch_auth_audit(
+            organization_id=user.organization_id,
+            actor_id=user.id,
+            action="auth.legal.accepted",
+            entity_id=user.id,
+            details={
+                "versions": dict(legal_acceptance.CURRENT_LEGAL_VERSIONS),
+                "source": legal_acceptance.SOURCE_REPROMPT,
+                "ip": _client_ip(request),
+            },
+        )
     org = await _load_user_org(db, user.organization_id)
     return await _user_response(db, user, org)
 
@@ -2167,7 +2291,7 @@ async def update_me(
 @router.post("/change-password", response_model=UserResponse)
 async def change_password(
     body: ChangePasswordRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_control_db),
 ):
     """Change password for the authenticated user.
@@ -2205,6 +2329,24 @@ class DelegationResponse(BaseModel):
     is_active: bool = False
 
 
+class DelegateCandidateResponse(BaseModel):
+    """Who the caller may name as their delegate: id and display name only,
+    the same minimal projection as `/api/invoices/assignable-reviewers`."""
+
+    id: str
+    full_name: str
+
+
+# The coded refusals `POST /api/auth/delegation` answers with, so `/profile`
+# states each in the reader's language (`frontend/src/lib/api/authRefusals.ts`).
+DELEGATION_INVALID_ID = "delegation_invalid_id"
+DELEGATION_SELF = "delegation_self"
+DELEGATION_UNTIL_INVALID = "delegation_until_invalid"
+DELEGATION_UNTIL_PAST = "delegation_until_past"
+DELEGATION_DELEGATE_NOT_FOUND = "delegation_delegate_not_found"
+DELEGATION_DELEGATE_CANNOT_APPROVE = "delegation_delegate_cannot_approve"
+
+
 @router.get("/delegation", response_model=DelegationResponse)
 async def get_delegation(
     db: AsyncSession = Depends(get_control_db),
@@ -2229,6 +2371,37 @@ async def get_delegation(
     )
 
 
+@router.get("/delegation/candidates", response_model=list[DelegateCandidateResponse])
+async def list_delegate_candidates(
+    db: AsyncSession = Depends(get_control_db),
+    user: User = Depends(require_permission(PERM_INVOICE_APPROVE)),
+):
+    """The colleagues `POST /api/auth/delegation` would accept as the caller's
+    delegate: exactly `delegation.is_eligible_delegate` (active, in the
+    caller's organization, not the caller, able to approve), the predicate the
+    write and routing read too.
+
+    Gated on `invoice.approve`, like the write: delegation is for people who
+    approve, and the list is a roster of every approver in the org — not
+    something to hand a clerk or a read-only role (decisions §511). It carries
+    only id and display name."""
+    rows = await db.execute(
+        select(User)
+        .options(selectinload(User.roles))
+        .where(
+            User.organization_id == user.organization_id,
+            User.is_active.is_(True),
+            User.id != user.id,
+        )
+        .order_by(User.full_name)
+    )
+    return [
+        DelegateCandidateResponse(id=str(candidate.id), full_name=candidate.full_name)
+        for candidate in rows.scalars().all()
+        if is_eligible_delegate(user, candidate)
+    ]
+
+
 def _parse_delegate_until(raw: str) -> datetime:
     """Parse the `until` instant, or raise a 422.
 
@@ -2250,12 +2423,15 @@ def _parse_delegate_until(raw: str) -> datetime:
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=422,
-            detail="`until` must be an ISO-8601 datetime.",
+            detail=coded_refusal(DELEGATION_UNTIL_INVALID, "`until` must be an ISO-8601 datetime."),
         ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     if parsed <= datetime.now(UTC):
-        raise HTTPException(status_code=422, detail="`until` must be in the future.")
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(DELEGATION_UNTIL_PAST, "`until` must be in the future."),
+        )
     return parsed
 
 
@@ -2263,23 +2439,38 @@ def _parse_delegate_until(raw: str) -> datetime:
 async def set_delegation(
     body: SetDelegateRequest,
     db: AsyncSession = Depends(get_control_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_INVOICE_APPROVE)),
 ):
     """Set out-of-office delegation — approvals route to delegate.
 
     Who receives your approval assignments is an access-control fact, so the
     change is audited (PII-free — ids and the window only). It is not a
-    privilege grant: the delegate still has to hold `invoice.approve` to act, so
-    delegating to a lower-privileged colleague routes work to them without
-    conferring anything.
+    privilege grant: the delegate acts with their own roles, limits and
+    segregation-of-duties set. And it is refused for a delegate who could not
+    approve at all (no `invoice.approve`): approvals routed to them would sit
+    with someone who can never act on them (decisions §511). The caller must
+    hold `invoice.approve` too — there is nothing of a non-approver's to hand
+    on. The same predicate (`delegation.is_eligible_delegate`) is re-read every
+    time routing follows the delegation, so one that goes stale later falls
+    back to the delegator instead of stranding the invoice.
+
+    Reading and clearing your own delegation stay open to every signed-in
+    user, so someone who has since lost `invoice.approve` can still see and
+    end a stale one.
     """
     try:
         delegate_id = uuid.UUID(body.delegate_to_id)
     except (TypeError, ValueError) as exc:
         # An unparseable id is a validation error, not a 500.
-        raise HTTPException(status_code=422, detail="`delegate_to_id` must be a UUID.") from exc
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(DELEGATION_INVALID_ID, "`delegate_to_id` must be a UUID."),
+        ) from exc
     if delegate_id == user.id:
-        raise HTTPException(status_code=422, detail="Cannot delegate to yourself.")
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(DELEGATION_SELF, "Cannot delegate to yourself."),
+        )
 
     until = _parse_delegate_until(body.until)
 
@@ -2288,10 +2479,26 @@ async def set_delegation(
     # `review.assign_reviewer` reassigns the invoice to them unconditionally, so
     # every routed approval would land on an account that can never open it, and
     # the invoice sits in the queue owned by nobody.
-    result = await db.execute(select(User).where(User.id == delegate_id))
+    result = await db.execute(
+        select(User).options(selectinload(User.roles)).where(User.id == delegate_id)
+    )
     delegate = result.scalar_one_or_none()
     if not delegate or delegate.organization_id != user.organization_id or not delegate.is_active:
-        raise HTTPException(status_code=404, detail="Delegate user not found.")
+        raise HTTPException(
+            status_code=404,
+            detail=coded_refusal(DELEGATION_DELEGATE_NOT_FOUND, "Delegate user not found."),
+        )
+    if not is_eligible_delegate(user, delegate):
+        # Exists, same org, active, not the caller (checked above): what is
+        # left of the shared predicate is the approve permission.
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(
+                DELEGATION_DELEGATE_CANNOT_APPROVE,
+                "That colleague cannot approve invoices, so approvals routed to them "
+                "could never be acted on.",
+            ),
+        )
 
     user.delegate_to_id = delegate_id
     user.delegate_until = until

@@ -87,7 +87,7 @@ export const START_GUIDES: Guide[] = [
 					{
 						type: 'list',
 						items: [
-							'{ui:shell.profileAndSecurity} is where you change your name, password and display {ui:profile.language.heading}, set up {ui:profile.mfa.heading} and {ui:profile.passkeys.heading}, see your {ui:profile.sessions.heading}, and choose your notifications. See [[guide:secure-your-account|Secure your account]].',
+							'{ui:shell.profileAndSecurity} is where you change your name, password and display {ui:profile.language.heading}, set up {ui:profile.mfa.heading} and {ui:profile.passkeys.heading}, see your {ui:profile.sessions.heading}, hand your approvals to a colleague while you are {ui:profile.delegation.heading}, and choose your notifications. See [[guide:secure-your-account|Secure your account]].',
 							'{ui:shell.legalAndPrivacy} opens the published privacy policy, terms and related documents.',
 							'**Help** opens this help centre.',
 							'{ui:shell.logOut} ends your session on this device.'

@@ -17,6 +17,7 @@ from sqlalchemy import func, select, text
 
 from app.models.vendor import Vendor
 from app.services.erp_adapters.base import ErpAdapter, VendorPayload
+from app.services.erp_link_realm import UNNAMED_REALM, link_stamp
 from app.services.vendor_erp_manual_link import (
     ERP_VENDOR_ALREADY_LINKED,
     ErpManualLinkError,
@@ -97,6 +98,8 @@ async def test_sync_updates_changed_fields(realdb):
                 name="Old Name",
                 code="OLD",
                 erp_vendor_id="ERP-7",
+                # A link an earlier no-realm pull made (decisions §496).
+                erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
                 source="erp_sync",
@@ -128,6 +131,8 @@ async def test_sync_unchanged_when_no_diff(realdb):
                 name="Same Co",
                 code="SC",
                 erp_vendor_id="ERP-3",
+                # A link an earlier no-realm pull made (decisions §496).
+                erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
                 source="erp_sync",
@@ -156,6 +161,8 @@ async def test_sync_does_not_null_out_existing_fields(realdb):
                 name="Keep Email",
                 email="keep@vendor.test",
                 erp_vendor_id="ERP-K",
+                # A link an earlier no-realm pull made (decisions §496).
+                erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
                 source="erp_sync",
@@ -192,6 +199,8 @@ async def test_a_value_too_long_for_its_column_is_dropped_never_aborts_the_sync(
                 name="Has Code",
                 code="OLD-CODE",
                 erp_vendor_id="ERP-L1",
+                # A link an earlier no-realm pull made (decisions §496).
+                erp_link_realm=UNNAMED_REALM,
                 organization_id=org_id,
                 status="active",
                 source="erp_sync",
@@ -817,10 +826,11 @@ def _linked(org_id, name: str, erp_id: str, realm: str | None) -> Vendor:
     )
 
 
-@pytest.mark.parametrize("realm", [None, "xero:dup-company"])
+@pytest.mark.parametrize("realm", [None, "mock", "xero:dup-company"])
 async def test_the_database_refuses_a_second_holder_of_one_record_in_one_company(realdb, realm):
-    """A NULL realm is one company too (NULLS NOT DISTINCT): the no-realm sync
-    looks those links up as ``erp_link_realm IS NULL``."""
+    """A NULL realm is one company too (NULLS NOT DISTINCT): pre-0115 links
+    stay unique among themselves, as do a no-realm pull's ``UNNAMED_REALM``
+    ("mock") links (decisions §496)."""
     from sqlalchemy.exc import IntegrityError
 
     mk = realdb.sessionmaker("a")
@@ -872,8 +882,9 @@ async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_o
     org_id = realdb.info("a").org_id
     async with mk() as s:
         await s.execute(text("DROP INDEX uq_vendors_erp_link"))
-        first = _linked(org_id, "Twin Supply", "ERP-TWIN", realm)
-        second = _linked(org_id, "Twin Supply Ltd", "ERP-TWIN", realm)
+        # What a pull under `realm` stamps (decisions §496).
+        first = _linked(org_id, "Twin Supply", "ERP-TWIN", link_stamp(realm))
+        second = _linked(org_id, "Twin Supply Ltd", "ERP-TWIN", link_stamp(realm))
         s.add_all([first, second])
         await s.flush()
 
@@ -899,7 +910,7 @@ async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_o
         for vendor, name in ((first, "Twin Supply"), (second, "Twin Supply Ltd")):
             await s.refresh(vendor)
             assert (vendor.name, vendor.code, vendor.erp_synced_at) == (name, None, None)
-            assert (vendor.erp_vendor_id, vendor.erp_link_realm) == ("ERP-TWIN", realm)
+            assert (vendor.erp_vendor_id, vendor.erp_link_realm) == ("ERP-TWIN", link_stamp(realm))
         await s.rollback()
 
     async with mk() as s:
@@ -911,18 +922,29 @@ async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_o
     assert index == 1
 
 
-async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
+@pytest.mark.parametrize(
+    ("held_as", "reason"),
+    [
+        # Links a no-realm pull made (decisions §496): two holders in one
+        # company, the duplicate a person resolves.
+        (UNNAMED_REALM, "duplicate_link"),
+        # Pre-0115 links: a pull that names no company cannot say whose "ERP-ECHO"
+        # they hold, so it reports them unverified instead (§496).
+        (None, "unverified_link"),
+    ],
+)
+async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb, held_as, reason):
     """A provider page overlap repeats a record two vendors hold: it is one
-    record, so one ``duplicate_link`` conflict, and the endpoint's message
-    counts it once ("1 not updated"), not once per sighting."""
+    record, so one conflict, and the endpoint's message counts it once
+    ("1 not updated"), not once per sighting — whichever reason it carries."""
     mk = realdb.sessionmaker("a")
     org_id = realdb.info("a").org_id
     async with mk() as s:
         await s.execute(text("DROP INDEX uq_vendors_erp_link"))
         s.add_all(
             [
-                _linked(org_id, "Echo Supply", "ERP-ECHO", None),
-                _linked(org_id, "Echo Supply Ltd", "ERP-ECHO", None),
+                _linked(org_id, "Echo Supply", "ERP-ECHO", held_as),
+                _linked(org_id, "Echo Supply Ltd", "ERP-ECHO", held_as),
             ]
         )
         await s.flush()
@@ -936,7 +958,7 @@ async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
         )
         await s.rollback()
     assert result["conflicts"] == [
-        {"name": "Echo Supply", "reason": "duplicate_link", "erp_vendor_ids": ["ERP-ECHO"]}
+        {"name": "Echo Supply", "reason": reason, "erp_vendor_ids": ["ERP-ECHO"]}
     ]
 
 
@@ -985,6 +1007,7 @@ async def test_sync_erp_endpoint_counts_each_conflict_reason_on_its_own(realdb, 
                 {"name": "Acme", "reason": "ambiguous_name", "erp_vendor_ids": ["1", "2"]},
                 {"name": "Beta", "reason": "ambiguous_name", "erp_vendor_ids": ["3"]},
                 {"name": "Twin", "reason": "duplicate_link", "erp_vendor_ids": ["4"]},
+                {"name": "Old", "reason": "unverified_link", "erp_vendor_ids": ["5"]},
             ],
             **_QUIET,
         }
@@ -999,6 +1022,8 @@ async def test_sync_erp_endpoint_counts_each_conflict_reason_on_its_own(realdb, 
         "; 2 not linked (the name matches more than one vendor)"
         "; 1 not updated (more than one vendor is linked to it:"
         " merge them or unlink the stale one)"
+        "; 1 skipped (a vendor holds that id from before"
+        " ERP companies were recorded: sync under a connected ERP company first)"
     )
 
 

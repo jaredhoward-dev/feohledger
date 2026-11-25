@@ -1,13 +1,15 @@
 """Organization settings endpoints."""
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.api.auth import require_sensitive_step_up
 from app.api.deps import (
     ROLE_ADMIN,
     ensure_live_erp_entitled,
@@ -15,11 +17,14 @@ from app.api.deps import (
     require_entitlement,
     require_roles,
 )
+from app.api.organization_controls import AUDIT_UNWRITABLE_DETAIL, guard_owned_keys
+from app.api.organization_match_rules import guard_matching_block
 from app.api.refusals import coded_refusal, credential_block_unopenable_detail
 from app.config import settings
 from app.database import get_control_db
 from app.models.organization import Organization
 from app.models.user import User
+from app.schemas.auth import STEP_UP_OPERATION_SCIM_TOKEN_MINT, MFAStepUpRequest
 from app.schemas.organization import (
     BrandConfig,
     CompanyProfile,
@@ -56,6 +61,7 @@ from app.services.provider_credentials import (
     update_secrets,
 )
 from app.services.sso import generate_scim_token
+from app.services.sso_settings import SCIM_BEARER_HASH_KEY
 from app.tenant import get_tenant, lock_organization, normalize_custom_domain
 from app.utils.currency_code import iso_currency_or_none
 from app.utils.tenant_urls import is_under_platform_domain
@@ -100,6 +106,15 @@ class SCIMTokenResponse(BaseModel):
 
     token: str
     bearer_hash_prefix: str  # first 8 hex chars, useful as a UI identifier
+
+
+class SCIMTokenMintRequest(BaseModel):
+    """Body of `POST /organization/sso/scim-token`. Optional as a whole: the
+    first call carries no proof, is answered `sensitive_step_up_required`, and
+    the SPA resends with one (decisions §510)."""
+
+    #: A second-factor proof (`code` or `assertion`; a password is ignored).
+    step_up: MFAStepUpRequest | None = None
 
 
 def _is_admin(user: User) -> bool:
@@ -394,6 +409,11 @@ async def update_organization(
                 ) from None
             body.settings["payments"] = {**incoming_payments, "nacha": carried}
         _validate_settings_patch(body.settings)
+        # Two single keys have their own audited writer
+        # (`api/organization_controls`); carry them, refuse a change.
+        guard_owned_keys(body.settings, org.settings)
+        # `settings.matching` has its own audited writer (decisions §512).
+        guard_matching_block(body.settings, org.settings)
 
         # Saving a LIVE ERP adapter is plan-gated, and one routed through
         # Merge.dev is Scale-only (decisions §258, §281). Only
@@ -1168,10 +1188,13 @@ async def test_erp_connection(
 
 @router.post("/sso/scim-token", response_model=SCIMTokenResponse)
 async def mint_scim_token(
+    response: Response,
+    body: SCIMTokenMintRequest | None = None,
     org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
     _entitled: User = Depends(require_entitlement(FEATURE_SCIM)),
     db: AsyncSession = Depends(get_control_db),
+    host: Annotated[str | None, Header()] = None,
 ):
     """Mint a fresh SCIM bearer token for this tenant.
 
@@ -1181,44 +1204,123 @@ async def mint_scim_token(
     hash is overwritten and any IdP still using the old token will start
     getting 401s, which is the desired behaviour.
 
-    Audited (`organization.scim_token_minted`). This token is a tenant-wide
-    user-provisioning credential — whoever holds it can create, rename and
-    deactivate accounts in this org, and grant roles through group mapping — so
-    minting or rotating it is exactly the access event an auditor expects to
-    find, and it is the one credential mint on the platform that wasn't
-    recording one (`api_key.created` and `webhook_subscription.created` both
-    do). PII-free and secret-free: the digest prefix is a non-secret label that
-    lets an operator tell which token is live without revealing it.
+    Audited FIRST (`organization.scim_token_minted`, decisions §510): this
+    token is a tenant-wide user-provisioning credential — whoever holds it can
+    create, rename and deactivate accounts in this org, and grant roles through
+    group mapping — so a mint with no row is worse than a refused one. A row
+    that cannot be written is a 503 with nothing minted (the `/organization/sso`
+    rule). PII-free and secret-free: the digest prefix is a non-secret label
+    that lets an operator tell which token is live without revealing it, and
+    `rotated` says whether a live token was replaced.
+
+    Second-factor step-up first (`api/auth.require_sensitive_step_up`,
+    operation `scim_token_mint` — a code or a passkey, never the password),
+    exactly as closing the workspace asks: an admin JWT alone must not be
+    enough to mint a credential that can create users and grant roles. The
+    proof kind lands on the audit row as `step_up`. Revoke is deliberately NOT
+    gated — it only removes access, and a hijacked session revoking the token
+    costs an outage, not an account takeover (decisions §510).
+
+    The response carries `Cache-Control: no-store`: the plaintext must not
+    sit in a browser or proxy cache after the reveal dialog closes.
     """
+    proof = await require_sensitive_step_up(
+        user,
+        body.step_up if body else None,
+        db=db,
+        operation=STEP_UP_OPERATION_SCIM_TOKEN_MINT,
+        host=host,
+    )
     raw, digest = generate_scim_token()
 
     # Under the row lock, like every settings writer: an unlocked read here could
     # write back a stale `sso` block over a concurrent `PUT /organization/sso`.
     org = await lock_organization(db, org)
+    try:
+        await record_auth_audit_or_raise(
+            organization_id=org.id,
+            actor_id=user.id,
+            action="organization.scim_token_minted",
+            entity_type="organization",
+            entity_id=org.id,
+            details={
+                "bearer_hash_prefix": digest[:8],
+                "rotated": _scim_hash(org) is not None,
+                "step_up": proof,
+            },
+        )
+    except Exception:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail=AUDIT_UNWRITABLE_DETAIL) from None
+    _set_scim_hash(org, digest)
+    await db.commit()
+
+    response.headers["Cache-Control"] = "no-store"
+
+    return SCIMTokenResponse(token=raw, bearer_hash_prefix=digest[:8])
+
+
+@router.delete("/sso/scim-token", status_code=204)
+async def revoke_scim_token(
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_roles(ROLE_ADMIN)),
+    db: AsyncSession = Depends(get_control_db),
+):
+    """Revoke this tenant's SCIM bearer token: the IdP's next call is a 401.
+
+    Deliberately NOT gated on the SCIM entitlement (decisions §510): a tenant
+    whose plan no longer includes SCIM must still be able to take a credential
+    it minted out of circulation. Audited first (`organization.scim_token_revoked`,
+    the prefix of the digest it removed), 503 with nothing changed when the row
+    cannot be written. Revoking when no token is set is a no-op with no row.
+    No second-factor step-up, unlike the mint: revoking only takes access
+    away, and it must stay one click for an admin responding to a leak.
+    """
+    org = await lock_organization(db, org)
+    previous = _scim_hash(org)
+    if previous is None:
+        return Response(status_code=204)
+    try:
+        await record_auth_audit_or_raise(
+            organization_id=org.id,
+            actor_id=user.id,
+            action="organization.scim_token_revoked",
+            entity_type="organization",
+            entity_id=org.id,
+            details={"bearer_hash_prefix": previous[:8]},
+        )
+    except Exception:
+        await db.rollback()
+        raise HTTPException(status_code=503, detail=AUDIT_UNWRITABLE_DETAIL) from None
+    _set_scim_hash(org, None)
+    await db.commit()
+    return Response(status_code=204)
+
+
+def _scim_hash(org: Organization) -> str | None:
+    """The live SCIM digest: the indexed column SCIM auth resolves on, or the
+    legacy settings mirror when only that one is populated."""
+    sso = (org.settings or {}).get("sso")
+    legacy = sso.get(SCIM_BEARER_HASH_KEY) if isinstance(sso, dict) else None
+    return org.scim_bearer_hash or legacy or None
+
+
+def _set_scim_hash(org: Organization, digest: str | None) -> None:
+    """Write (or, with None, remove) the digest in both places it lives."""
     settings_dict = dict(org.settings or {})
     sso = dict(settings_dict.get("sso") or {})
-    sso["scim_bearer_hash"] = digest
+    if digest is None:
+        sso.pop(SCIM_BEARER_HASH_KEY, None)
+    else:
+        sso[SCIM_BEARER_HASH_KEY] = digest
     settings_dict["sso"] = sso
     org.settings = settings_dict
     # Mutating a nested dict in-place doesn't mark JSONB dirty on its own.
     flag_modified(org, "settings")
-    # Mirror onto the indexed column — this is what SCIM auth resolves on
-    # since migration 0021. settings.sso.scim_bearer_hash stays populated
-    # for backward compat (logs, audit history) but is no longer authoritative.
+    # The indexed column is what SCIM auth resolves on since migration 0021;
+    # settings.sso.scim_bearer_hash is the backward-compat mirror (and what
+    # `GET /organization/sso`'s `scim_token_configured` reads).
     org.scim_bearer_hash = digest
-
-    await db.commit()
-
-    await dispatch_auth_audit(
-        organization_id=org.id,
-        actor_id=user.id,
-        action="organization.scim_token_minted",
-        entity_type="organization",
-        entity_id=org.id,
-        details={"bearer_hash_prefix": digest[:8]},
-    )
-
-    return SCIMTokenResponse(token=raw, bearer_hash_prefix=digest[:8])
 
 
 @router.post("/test-payments")

@@ -1,3 +1,4 @@
+import { PRIVACY_VERSION } from '#lib/legal/legalVersions.generated.ts';
 import { expect, test } from '../fixtures/helpers';
 
 // Signed out: the page is where a supplier with no password yet lands.
@@ -84,5 +85,97 @@ test.describe('/portal/reset-password', () => {
 			'href',
 			'/portal/login?email=supplier%40vendor.example'
 		);
+	});
+
+	test('a supplier with no password yet acknowledges the Privacy Policy, and is never asked to accept the Terms', async ({
+		page
+	}) => {
+		// An invited supplier's link is the account's front door, so the check
+		// says the box is required. A Supplier User is not a party to our Terms,
+		// so the box names the Privacy Policy alone and the redeem carries only
+		// its version (decisions §499).
+		const redeemed: Record<string, unknown>[] = [];
+		await page.route(
+			(url) => url.pathname === '/api/portal/auth/reset-password/check',
+			(route) =>
+				route.fulfill({
+					json: { email: 'supplier@vendor.example', legal_acceptance_required: true }
+				})
+		);
+		await page.route(
+			(url) => url.pathname === '/api/portal/auth/reset-password',
+			(route) => {
+				redeemed.push(route.request().postDataJSON());
+				return route.fulfill({ json: { detail: 'ok' } });
+			}
+		);
+		await page.goto('/portal/reset-password?token=stubbed-token&mode=set');
+
+		const box = page.getByRole('checkbox', { name: /I have read the Privacy Policy/ });
+		await expect(box).not.toBeChecked();
+		const consent = page.locator('.legal-consent');
+		await expect(consent.getByRole('link', { name: 'Privacy Policy' })).toHaveAttribute(
+			'href',
+			'/legal/privacy'
+		);
+		await expect(consent.getByRole('link', { name: 'Terms of Service' })).toHaveCount(0);
+
+		await page.getByLabel('New password', { exact: true }).fill('Supplier-Chosen9');
+		await page.getByLabel('Confirm new password', { exact: true }).fill('Supplier-Chosen9');
+		await page.getByRole('button', { name: 'Set password' }).click();
+		// Unticked: said beside the box, which takes focus; nothing is sent.
+		await expect(
+			page.getByText('Tick the box to confirm you have read the Privacy Policy.')
+		).toBeVisible();
+		await expect(box).toBeFocused();
+		expect(redeemed).toHaveLength(0);
+
+		await box.check();
+		await page.getByRole('button', { name: 'Set password' }).click();
+		await expect(page.getByText(/your password is set/i)).toBeVisible();
+		expect(redeemed).toEqual([
+			{
+				token: 'stubbed-token',
+				new_password: 'Supplier-Chosen9',
+				accepted_privacy_version: PRIVACY_VERSION
+			}
+		]);
+	});
+
+	test('a box the server still refuses after ticking offers a reload naming the Privacy Policy', async ({
+		page
+	}) => {
+		await page.route(
+			(url) => url.pathname === '/api/portal/auth/reset-password/check',
+			(route) =>
+				route.fulfill({
+					json: { email: 'supplier@vendor.example', legal_acceptance_required: true }
+				})
+		);
+		await page.route(
+			(url) => url.pathname === '/api/portal/auth/reset-password',
+			(route) =>
+				route.fulfill({
+					status: 422,
+					json: {
+						detail: {
+							code: 'privacy_acknowledgement_required',
+							message: 'Please confirm you have read the current Privacy Policy to continue.'
+						}
+					}
+				})
+		);
+		await page.goto('/portal/reset-password?token=stubbed-token&mode=set');
+		const box = page.getByRole('checkbox', { name: /I have read the Privacy Policy/ });
+		await page.getByLabel('New password', { exact: true }).fill('Supplier-Chosen9');
+		await page.getByLabel('Confirm new password', { exact: true }).fill('Supplier-Chosen9');
+		await box.check();
+		await page.getByRole('button', { name: 'Set password' }).click();
+
+		const message = page.locator('.legal-consent + [role="alert"]');
+		await expect(message).toContainText('The Privacy Policy changed since this page loaded.');
+		await expect(box).toBeChecked();
+		await expect(box).toBeFocused();
+		await expect(message.getByRole('button', { name: 'Reload page' })).toBeVisible();
 	});
 });

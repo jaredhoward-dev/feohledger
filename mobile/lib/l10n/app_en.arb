@@ -2219,6 +2219,9 @@
   "settingsAdminWorkflowsHint": "View workflow definitions and steps",
   "settingsAdaptive": "Adaptive Workflows",
   "settingsAdaptiveHint": "Approval patterns, anomalies, suggestions",
+  "settingsHelp": "Help",
+  "settingsHelpHint": "Guides for your workspace, opened in your browser",
+  "settingsHelpUnavailable": "Couldn't open the help centre. Sign in to your workspace on the web and open Help there.",
   "inspectionsTitle": "Quality Inspections",
   "inspectionsRecord": "Record inspection",
   "inspectionsEmpty": "No quality inspections recorded.",
@@ -4542,5 +4545,23 @@
         "type": "int"
       }
     }
+  },
+  "legalAcceptTitle": "Terms and Privacy",
+  "legalAcceptHeading": "Please review our updated terms",
+  "legalAcceptIntro": "To keep using FeohLedger, accept the current Terms of Service and Privacy Policy. Each opens in your browser.",
+  "legalTermsLink": "Terms of Service",
+  "legalPrivacyLink": "Privacy Policy",
+  "legalLinkHint": "opens in your browser",
+  "legalLinkFailed": "Could not open the page. Visit it in a browser instead.",
+  "legalAcceptCheckbox": "I have read and accept the Terms of Service and the Privacy Policy.",
+  "@legalAcceptCheckbox": {
+    "description": "Accept screen (decisions §498): the required checkbox's label; also its accessible name."
+  },
+  "legalAcceptButton": "Accept",
+  "legalAcceptSignOut": "Sign out",
+  "legalAcceptTickRequired": "Tick the box to accept the Terms of Service and Privacy Policy.",
+  "legalAcceptAppOutdated": "This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.",
+  "@legalAcceptAppOutdated": {
+    "description": "Accept screen: the server refused the versions this build carries (422 legal_acceptance_required), so the app is older than the Terms / Privacy in force."
   }
 }

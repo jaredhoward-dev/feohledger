@@ -6,7 +6,7 @@
 	import type { MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { tick, untrack } from 'svelte';
 	// Aliased: this page already has a local `page` variable for the loaded
 	// vendor-list page number (below) — `$app/state`'s page is the URL/route
@@ -222,10 +222,21 @@
 	// Column sort — URL-backed (`?sort=&order=`) so it survives a reload/share,
 	// mirroring the /expenses `syncUrl()` pattern (see `syncSortUrl` below).
 	// `null` field = the backend's own default order (name ascending).
-	let sortField = $state<string | null>(urlStore.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((urlStore.url.searchParams.get('order') as SortOrder) ?? 'asc');
+	// Only the headers this table offers are read back: an edited or stale
+	// `?sort=` passed straight through 422s every load, Retry included.
+	const SORTABLE_FIELDS = ['name', 'code', 'status'] as const;
+	const initialSort = sortFromUrl(urlStore.url.searchParams, SORTABLE_FIELDS);
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// --- Bulk selection ---
+	// Each bulk action shows on the gate its own endpoint uses, not one gate
+	// for the bar. `/bulk/status` is `require_permission(vendor.manage)`,
+	// `/bulk/screen` `require_roles(admin, ap_manager)` and `/bulk/export`
+	// `require_roles(admin, ap_manager, cfo)`.
+	const canBulkScreen = $derived(auth.isManager);
+	const canBulkExport = $derived(auth.isManager || auth.isCfo);
+	const canBulk = $derived(canManageVendors || canBulkScreen || canBulkExport);
 	let selected = $state<Set<string>>(new Set());
 	// True once "Select all N matching" has resolved the whole filtered set
 	// (not just the loaded page) into `selected` — mirrors the identical
@@ -330,44 +341,70 @@
 	// The chip counts fire alongside every list fetch, so they need their own
 	// sequencer for the same reason — see `fetchCounts`.
 	const countsSequence = createRequestSequencer();
+	// Bumped when a whole-list (not Load more) read is issued, and when a row
+	// decision patches the list — see `refreshVendorRow` for what each guards.
+	let listEpoch = 0;
+	let patchEpoch = 0;
+
+	// The list's active search / status / sort, as query params — shared by the
+	// page read and the one-row re-read after a Verify / Reject, so both ask
+	// the server about the same filtered set.
+	function listFilterParams(): URLSearchParams {
+		const params = new URLSearchParams();
+		// `untrack`: this is also called (via fetchVendors) from the
+		// statusFilter `$effect` above. A plain read of `search` here would make
+		// THAT effect depend on `search` too (Svelte tracks reads transitively
+		// through called functions), so every keystroke would re-fire it — an
+		// immediate, un-debounced fetch racing the dedicated debounce timer.
+		// `untrack` still reads the current value (the request still carries the
+		// live search term); it just stops that read from registering as a
+		// dependency of whichever effect calls this.
+		const currentSearch = untrack(() => search);
+		if (currentSearch.trim()) params.set('search', currentSearch.trim());
+		if (statusFilter !== 'all') params.set('status', statusFilter);
+		// Same `untrack` reasoning as `search` above, for the sort state.
+		const currentSort = untrack(() => sortField);
+		if (currentSort) {
+			params.set('sort', currentSort);
+			params.set('order', untrack(() => sortOrder));
+		}
+		return params;
+	}
 
 	async function fetchVendors(opts: { append?: boolean; nextPage?: number } = {}) {
 		const token = fetchSequence.start();
+		const patchesAtStart = patchEpoch;
 		if (!opts.append) {
+			listEpoch += 1;
 			loading = true;
 			loadErrored = false;
 		}
 		try {
 			const nextPage = opts.nextPage ?? 1;
-			const params = new URLSearchParams({
-				page: String(nextPage),
-				page_size: String(PAGE_SIZE)
-			});
-			// `untrack`: this function is also called from the statusFilter
-			// `$effect` above. A plain read of `search` here would make THAT
-			// effect depend on `search` too (Svelte tracks reads transitively
-			// through called functions), so every keystroke would re-fire it —
-			// an immediate, un-debounced fetch racing the dedicated debounce
-			// timer. `untrack` still reads the current value (the request still
-			// carries the live search term); it just stops that read from
-			// registering as a dependency of whichever effect calls this.
-			const currentSearch = untrack(() => search);
-			if (currentSearch.trim()) params.set('search', currentSearch.trim());
-			if (statusFilter !== 'all') params.set('status', statusFilter);
-			// Same `untrack` reasoning as `search` above: this function is also
-			// called from the status/search effects, and a plain read here would
-			// make THOSE effects depend on the sort state too.
-			const currentSort = untrack(() => sortField);
-			if (currentSort) {
-				params.set('sort', currentSort);
-				params.set('order', untrack(() => sortOrder));
-			}
+			const params = listFilterParams();
+			params.set('page', String(nextPage));
+			params.set('page_size', String(PAGE_SIZE));
 			const data = await api.get<{ items: Vendor[]; total: number }>(
 				`/api/vendors?${params}`
 			);
 			// Superseded by a newer fetch, or by a local edit.
 			if (!fetchSequence.canCommit(token)) return;
+			// A whole-list read issued before a row decision patched the list
+			// carries a pre-decision snapshot of that row, so it cannot land
+			// as is. It is still the ONLY read for the current filter / search
+			// / sort, though: dropping it left the previous filter's rows,
+			// total and page under the new filter's chips and URL. Ask again —
+			// the new read is issued after the patch, so it carries the
+			// decision, and it takes over the sequence (this call's `finally`
+			// then leaves `loading` to it). An append is not stale this way
+			// (see `refreshVendorRow`).
+			if (!opts.append && patchEpoch !== patchesAtStart) {
+				void fetchVendors({ nextPage: opts.nextPage });
+				return;
+			}
 			vendors = opts.append ? appendUnique(vendors, data.items) : data.items;
+			// A whole-list read carries every row's verdict afresh.
+			if (!opts.append && rowRefreshFailed.size) rowRefreshFailed = new Set();
 			total = data.total;
 			page = nextPage;
 			loadErrored = false;
@@ -448,12 +485,17 @@
 	// "select all N matching" affordance on /invoices and /expenses.
 	async function selectAllMatching() {
 		selectingAllMatching = true;
+		const key = filterKey;
 		try {
 			const params: { search?: string; status?: string } = {};
 			const currentSearch = search.trim();
 			if (currentSearch) params.search = currentSearch;
 			if (statusFilter !== 'all') params.status = statusFilter;
 			const res: MatchingIdsResponse = await getVendorIds(params);
+			// The filter moved while the ids were resolving: they answer a
+			// question the table is no longer asking.
+			if (key !== filterKey) return;
+			matchingKey = key;
 			selected = new Set(res.ids);
 			selectedAllMatching = true;
 			if (res.truncated) {
@@ -476,6 +518,16 @@
 		selectedAllMatching = false;
 		if (armed?.action === 'bulkReject') armed = null;
 	}
+
+	// "All N matching" names the set a search + status filter matched, and
+	// the prune effect above stands aside for it (most of those ids are off
+	// the loaded page), so nothing else retires it: the selection ends with
+	// the filter it was made under.
+	const filterKey = $derived(`${statusFilter}\u0000${search.trim()}`);
+	let matchingKey = '';
+	$effect(() => {
+		if (selectedAllMatching && filterKey !== matchingKey) untrack(clearSelection);
+	});
 
 	async function bulkVerify() {
 		bulkBusy = true;
@@ -567,10 +619,101 @@
 		}
 	}
 
+	// After a single-row Verify / Reject, re-read THAT row rather than page 1,
+	// so a reviewer working down pages added by Load more keeps them (decisions
+	// §506). `GET /api/vendors?id=` answers under the page's own filters: one
+	// row in the list shape, carrying the server's fresh `status_actions`
+	// verdict, or an empty page when the row has left the filter (it is then
+	// dropped and the "N matching" total falls by one). Nothing here decides
+	// which actions a status allows or which statuses a filter matches.
+	//
+	// The re-read is NOT on `fetchSequence`. Sharing it made the two cancel
+	// each other: a decision during a Load more retired the append (spinner
+	// stopped, nothing appeared), and a Load more during the re-read stopped
+	// the re-read committing (the decided row kept no actions). Each row gets
+	// its own sequencer, so two decisions on one row resolve latest-wins and
+	// nothing else touches it. The two remaining interactions are explicit:
+	// - a whole-list read issued after the re-read (a filter change) answers
+	//   for that row itself, so the re-read stands down (`listEpoch`);
+	// - a whole-list read issued before the decision carries a pre-decision
+	//   snapshot, so it is re-issued instead of landing (`patchEpoch`,
+	//   checked in `fetchVendors`) — not dropped, since it may be the only
+	//   read for a filter chosen while the decision was in flight. An append needs no guard: `appendUnique` keeps the
+	//   row already on screen, so the patched row's fresh data survives a
+	//   page that lands after it.
+	const rowSequences = new Map<string, ReturnType<typeof createRequestSequencer>>();
+	function rowSequence(id: string) {
+		let seq = rowSequences.get(id);
+		if (!seq) {
+			seq = createRequestSequencer();
+			rowSequences.set(id, seq);
+		}
+		return seq;
+	}
+	// Rows whose post-decision re-read failed. They show their new status with
+	// no actions (fail closed — the verdict they carried was for the old
+	// status) and an in-row "Couldn't refresh this row" + Retry, until a re-read
+	// or a whole-list read gives them a verdict.
+	let rowRefreshFailed = $state<Set<string>>(new Set());
+	function setRowRefreshFailed(id: string, failed: boolean) {
+		if (rowRefreshFailed.has(id) === failed) return;
+		const next = new Set(rowRefreshFailed);
+		if (failed) next.add(id);
+		else next.delete(id);
+		rowRefreshFailed = next;
+	}
+
+	async function refreshVendorRow(updated: Vendor) {
+		const id = updated.id;
+		// Until the server's answer lands the row shows its new status with
+		// its actions withheld (fail closed). Bumping `patchEpoch` first stops
+		// a whole-list read already in flight putting the old status back: it
+		// is re-issued rather than landed (see `fetchVendors`).
+		patchEpoch += 1;
+		vendors = vendors.map((v) =>
+			v.id === id ? { ...v, status: updated.status, status_actions: undefined } : v
+		);
+		await rereadVendorRow(id);
+	}
+
+	async function rereadVendorRow(id: string) {
+		const seq = rowSequence(id);
+		const token = seq.start();
+		const epoch = listEpoch;
+		const stillCurrent = () => seq.canCommit(token) && epoch === listEpoch;
+		setRowRefreshFailed(id, false);
+		try {
+			const params = listFilterParams();
+			params.set('id', id);
+			params.set('page_size', '1');
+			const data = await api.get<{ items: Vendor[]; total: number }>(`/api/vendors?${params}`);
+			if (!stillCurrent()) return;
+			const [row] = data.items;
+			if (row) {
+				vendors = vendors.map((v) => (v.id === id ? row : v));
+			} else if (vendors.some((v) => v.id === id)) {
+				vendors = vendors.filter((v) => v.id !== id);
+				total = Math.max(0, total - 1);
+				if (selected.has(id)) {
+					const next = new Set(selected);
+					next.delete(id);
+					selected = next;
+				}
+			}
+		} catch {
+			// The decision itself landed (its toast says so). The row stays
+			// fail-closed, and says why, with a way to ask again.
+			if (stillCurrent()) setRowRefreshFailed(id, true);
+		}
+		// The chip tallies are whole-set server counts; re-ask rather than
+		// shifting them by hand.
+		fetchCounts();
+	}
+
 	async function verifyVendor(id: string) {
 		try {
-			await api.post(`/api/vendors/${id}/verify`, {});
-			await fetchVendors();
+			const verified = await api.post<Vendor>(`/api/vendors/${id}/verify`, {});
+			await refreshVendorRow(verified);
 			toast(m('vendors.toast.verified'), 'success');
 		} catch (err) {
 			toast(errorMessage(err, m('vendors.toast.verifyFailed')), 'error');
@@ -591,7 +734,7 @@
 	async function rejectVendor(id: string) {
 		try {
 			const rejected = await rejectVendorRequest(id);
-			await fetchVendors();
+			await refreshVendorRow(rejected);
 			toast(m('vendors.toast.rejected'), 'success');
 			toastCardRevocations([rejected.card_revocation]);
 		} catch (err) {
@@ -772,14 +915,16 @@
 		filtered={!noActiveFilters}
 		emptyFiltered={m('vendors.empty')}
 		empty={m('vendors.empty.fresh')}
-		colspan={10}
+		colspan={canBulk ? 10 : 9}
 		fixed
 	>
 		{#snippet header()}
 			<tr>
-				<th class="checkbox-col">
-					<input type="checkbox" aria-label={m('vendors.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} />
-				</th>
+				{#if canBulk}
+					<th class="checkbox-col">
+						<input type="checkbox" aria-label={m('vendors.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} />
+					</th>
+				{/if}
 				<SortableHeader class="col-vendor" field="name" label={m('vendors.col.vendor')} active={sortField === 'name'} order={sortOrder} onsort={handleSort} onclear={handleClearSort} />
 				<SortableHeader class="col-code" field="code" label={m('vendors.col.code')} active={sortField === 'code'} order={sortOrder} onsort={handleSort} onclear={handleClearSort} />
 				<th scope="col" class="col-email">{m('vendors.col.email')}</th>
@@ -802,15 +947,17 @@
 							if (isRowOpenClick(e)) detailVendor = v;
 						}}
 					>
-						<td class="checkbox-col">
-							<input
-								type="checkbox"
-								checked={selected.has(v.id)}
-								onclick={(e) => e.stopPropagation()}
-								onchange={() => toggleSelect(v.id)}
-								aria-label={m('vendors.selectRowAria', { vendor: v.name })}
-							/>
-						</td>
+						{#if canBulk}
+							<td class="checkbox-col">
+								<input
+									type="checkbox"
+									checked={selected.has(v.id)}
+									onclick={(e) => e.stopPropagation()}
+									onchange={() => toggleSelect(v.id)}
+									aria-label={m('vendors.selectRowAria', { vendor: v.name })}
+								/>
+							</td>
+						{/if}
 						<td class="vendor-name">
 							<RowLink onclick={() => (detailVendor = v)} ariaLabel={m('vendors.row.openAria', { vendor: v.name })}>
 								{v.name}
@@ -863,6 +1010,24 @@
 					     it works too. -->
 					<td class="actions">
 						{#if canManageVendors}
+							{#if rowRefreshFailed.has(v.id)}
+								<!-- The post-decision re-read failed: no verdict for the
+								     new status yet, so no actions (fail closed) — say so
+								     and offer the re-read again. -->
+								<span class="row-refresh-failed">{m('vendors.row.refreshFailed')}</span>
+								<RowAction
+									ariaLabel={m('common.rowActionAria', {
+										action: m('vendors.row.refreshRetry'),
+										name: v.name
+									})}
+									onclick={(e) => {
+										e.stopPropagation();
+										rereadVendorRow(v.id);
+									}}
+								>
+									{m('vendors.row.refreshRetry')}
+								</RowAction>
+							{/if}
 							<!-- Offered exactly when the server's verdict allows it
 							     (`status_actions`, from the table `/verify`, `/reject`
 							     and bulk status share) — Reject used to be hidden on an
@@ -917,35 +1082,43 @@
 	/>
 	{/if}
 
-	{#if canManageVendors}
+	{#if canBulk}
 		<BulkBar count={selected.size} onclear={clearSelection}>
 			{#snippet actions()}
 				{#if allSelected && !selectedAllMatching && total > vendors.length}
 					<button class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 						{selectingAllMatching
 							? m('common.loading')
-							: m('common.selectAllMatching', { total })}
+							: m('common.selectAllMatching', { total: formatCount(total) })}
 					</button>
 				{:else if selectedAllMatching}
 					<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 				{/if}
-				<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
-				<RowAction
-					variant="danger"
-					armed={bulkRejectArmed}
-					disabled={bulkBusy}
-					onclick={() => {
-						if (bulkRejectArmed) {
-							armed = null;
-							bulkReject();
-						} else armed = { action: 'bulkReject' };
-					}}
-				>
-					{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
-				</RowAction>
-				<div class="bulk-divider"></div>
-				<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
-				<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
+				{#if canManageVendors}
+					<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
+					<RowAction
+						variant="danger"
+						armed={bulkRejectArmed}
+						disabled={bulkBusy}
+						onclick={() => {
+							if (bulkRejectArmed) {
+								armed = null;
+								bulkReject();
+							} else armed = { action: 'bulkReject' };
+						}}
+					>
+						{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
+					</RowAction>
+					{#if canBulkScreen || canBulkExport}
+						<div class="bulk-divider"></div>
+					{/if}
+				{/if}
+				{#if canBulkScreen}
+					<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
+				{/if}
+				{#if canBulkExport}
+					<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
+				{/if}
 			{/snippet}
 		</BulkBar>
 	{/if}
@@ -1148,6 +1321,19 @@
 	   a request, it does not change where money goes. */
 	.dual-control-hint {
 		margin: -4px 0 14px;
+		font-size: 0.8rem;
+		color: var(--text-muted);
+	}
+
+	/* The in-row note when a decided row's re-read failed (with its Retry).
+	   Its own line, wrapping like prose: inline beside Retry in the 300px
+	   actions column it ran past the column in de / fr and widened the table
+	   (guard: tests-e2e/reactivity/layout-stability.spec.ts, which puts a row
+	   in this state for every long locale). */
+	.row-refresh-failed {
+		display: block;
+		white-space: normal;
+		overflow-wrap: anywhere;
 		font-size: 0.8rem;
 		color: var(--text-muted);
 	}

@@ -13,6 +13,7 @@ import {
 } from '@playwright/test';
 
 import { API_BASE as _API_BASE, TENANT_ROOT_URL, WEB_ORIGIN, tenantOrigin } from './env';
+import { PRIVACY_VERSION, TERMS_VERSION } from '#lib/legal/legalVersions.generated.ts';
 
 // `frontend/package.json` is `"type": "module"`, so the CommonJS
 // `__dirname` global isn't defined here. Recover it from
@@ -630,10 +631,16 @@ export function controlPsql(query: string): string {
  * `mustChange` puts it in the state a legacy temporary-password account (or a
  * CLI-provisioned tenant admin) is in, which `/change-password`'s forced mode
  * serves. Scoped to the row the call created, as `controlPsql` requires.
+ *
+ * The account is also recorded as having accepted the Terms / Privacy versions
+ * in force (`recordLegalAcceptance`), as every seeded account is: otherwise
+ * signing in as it lands on the blocking accept step (decisions §497) instead
+ * of the page the spec drives. `acceptLegal: false` leaves it unaccepted, for
+ * the spec that exercises that step.
  */
 export async function createUserWithKnownPassword(
 	page: Page,
-	opts: { mustChange: boolean; emailPrefix?: string; roleNames?: string[] }
+	opts: { mustChange: boolean; emailPrefix?: string; roleNames?: string[]; acceptLegal?: boolean }
 ): Promise<{ id: string; email: string; password: string }> {
 	const admin = _currentWorkerAdmin();
 	const email = `${opts.emailPrefix ?? 'e2e-pw'}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}@test.local`;
@@ -647,7 +654,32 @@ export async function createUserWithKnownPassword(
 		`UPDATE users SET hashed_password = (SELECT hashed_password FROM users WHERE email = '${admin.email}'), ` +
 			`must_change_password = ${opts.mustChange ? 'true' : 'false'} WHERE id = '${body.id}'`
 	);
+	if (opts.acceptLegal !== false) recordLegalAcceptance(body.id);
 	return { id: body.id, email: body.email, password: admin.password };
+}
+
+/**
+ * Record that a user the spec created accepted the Terms / Privacy versions in
+ * force — the rows `scripts/seed.py` writes for every seeded account (through
+ * `legal_acceptance.record_acceptances`, source `seed`), written here in the
+ * same shape for an account created mid-run. `ON CONFLICT DO NOTHING` on the
+ * service's own unique key, so a repeat is harmless. The versions come from the
+ * generated module the app sends, which CI pins to the backend's.
+ */
+export function recordLegalAcceptance(userId: string): void {
+	const values = [
+		['terms', TERMS_VERSION],
+		['privacy', PRIVACY_VERSION]
+	]
+		.map(
+			([doc, version]) =>
+				`(gen_random_uuid(), '${userId}', (SELECT organization_id FROM users WHERE id = '${userId}'), '${doc}', '${version}', 'seed')`
+		)
+		.join(', ');
+	controlPsql(
+		`INSERT INTO legal_acceptances (id, user_id, organization_id, document, version, source) ` +
+			`VALUES ${values} ON CONFLICT ON CONSTRAINT uq_legal_acceptances_user_doc_version DO NOTHING`
+	);
 }
 
 /**

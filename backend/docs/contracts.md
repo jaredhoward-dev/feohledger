@@ -32,9 +32,20 @@ Lifecycle transitions are owned by dedicated endpoints (not `PATCH`):
 | `POST /{id}/activate` | `draft` / `expired` → `active` |
 | `POST /{id}/terminate` | `active` / `expired` → `terminated` |
 | `POST /{id}/cancel` | `draft` / `active` → `cancelled` |
-| `POST /{id}/renew` | any non-terminal → `active` (pushes `end_date` forward) |
+| `POST /{id}/renew` | any non-terminal → `active` (pushes `end_date` forward; a renewed draft is stamped `activated_at` as `activate` stamps it) |
 
-A transition from a disallowed source status is refused with `409`.
+A transition from a disallowed source status is refused with `409`
+`contract_status_refused` (`params.status`, `params.action`), and a delete of a
+contract that is neither `draft` nor `cancelled` with `409`
+`contract_delete_refused` (`params.status`). Each rule is one gate in
+`services/contract_controls.py`, which the endpoint raises from **and** every
+contract response's `actions.{activate,terminate,cancel,renew,create_po,delete}`
+verdict is read from (`null` = the endpoint would accept the caller, else that
+coded refusal; a caller outside admin / ap_manager gets `role_not_permitted`).
+The web modal's lifecycle buttons and the list's bulk "Change status" read those
+verdicts rather than restating the table above (decisions §507). `POST
+/bulk/status` routes each row through the same gate and reports a skip with its
+English sentence.
 
 ## Data model
 
@@ -255,7 +266,7 @@ Mounted at `/api/contracts`.
 | `POST /contracts/{id}/renew` | Extend `end_date`, re-activate, re-arm alert | mutate |
 | `POST /contracts/{id}/create-po` | Spawn a PO from the contract | mutate |
 | `POST /contracts/bulk/status` | Bulk activate/terminate/cancel over a hand-picked set (`{ids, action}`), routed through the same `_transition` helper the single-row endpoints use | mutate |
-| `POST /contracts/bulk/export` | CSV export of a hand-picked set (`{ids}`) | read |
+| `POST /contracts/bulk/export` | CSV export of a hand-picked set (`{ids}`), scoped to the entity selector (an out-of-scope id is dropped as not found) | read |
 
 Plus the invoice-side link endpoints (`POST /api/invoices/{id}/link-contract`
 and `/unlink-contract`, `admin` / `ap_manager` / `cfo`).
@@ -281,6 +292,15 @@ reason}]}`) rather than failing the whole batch — the same partial-success
 contract as `api/vendors.py::bulk_vendor_status` /
 `api/invoices.py::bulk_status_change`. `renew` is deliberately NOT a bulk
 action — it needs a per-contract `end_date`, which has no sane bulk default.
+
+Both bulk endpoints honour the caller's entity selector (`X-Entity-ID`) as the
+list, `GET /ids` and every single-row route do (decisions §507). `bulk/status`
+runs the single-row endpoints' entity check per row, so a contract in another
+entity is skipped as "Contract not found". `bulk/export` selects through the
+same scope, so such an id is dropped exactly as a nonexistent one is: left out
+of the CSV, and a selection of only such ids is the same `404 No contracts
+found`. With no selector (the consolidated view) both see every entity. The
+export's `ids` are parsed as UUIDs, so a malformed id is a `422`.
 See `backend/tests/test_contract_bulk_ops.py` and
 `backend/tests/test_list_sorting.py`.
 
@@ -335,6 +355,15 @@ in deployed envs to enable renewal alerts.
 
 - `frontend/tests-e2e/contracts/contracts.spec.ts` — UI list render, API-driven
   create surfaced in the table, an activate reflected on the row.
+- `frontend/tests-e2e/contracts/url-state.spec.ts` — the list's URL state
+  (all intercepted, no writes): `?status=` / `?search=` / `?sort=` and the open
+  contract's `?id=` have ONE writer (`syncUrl()`), built from component state
+  because a shallow `replaceState` never updates `page.url`; opening a row
+  writes `?id=` so a reload re-opens it and closing scrubs it without reverting
+  later filters; a deep link that fails for any reason but `404` renders
+  `LoadError` with Retry rather than "Contract not found"; and a filter change
+  drops "select all N matching" back to the rows on screen, so a bulk action
+  never reaches the previous filter's set.
 - `frontend/tests-e2e/contracts/contracts-lifecycle.spec.ts` — the control
   paths, API-driven: each lifecycle transition (activate / terminate / cancel /
   renew) enforces its valid source state (`409` / `400` on an invalid one) and

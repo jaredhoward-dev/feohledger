@@ -316,3 +316,84 @@ describe('a standalone loading block is a LoadingState (WCAG 4.1.3)', () => {
 		expect(source).toMatch(/m\('common\.loading'\)/);
 	});
 });
+
+/**
+ * The same SC, for the bulk-action bar. `ui/BulkBar.svelte` mounts its visible
+ * bar only once a row is selected, so a live region INSIDE the bar is inserted
+ * together with the first selection's text — and is often not announced: the
+ * first selection was silent. The bar's one `role="status"` region therefore
+ * sits at the component's top level, outside every `{#if}`, mounted from first
+ * paint whatever the selection; the count and the page's `note` go through it.
+ *
+ * And a page must not add a second live region inside the bar's snippets: it
+ * would be inserted with the bar (the original defect) and repeat what the
+ * bar's own region already says. A note goes in through BulkBar's `note` prop.
+ */
+const BULK_BAR = 'lib/components/ui/BulkBar.svelte';
+
+/** Live elements anywhere under `node`. */
+function liveElements(node: unknown, out: Element[] = []): Element[] {
+	if (node === null || typeof node !== 'object') return out;
+	if (Array.isArray(node)) {
+		node.forEach((n) => liveElements(n, out));
+		return out;
+	}
+	const record = node as Record<string, unknown>;
+	if (record.type === 'RegularElement' && isLive(record as unknown as Element)) {
+		out.push(record as unknown as Element);
+	}
+	for (const [key, value] of Object.entries(record)) if (key !== 'parent') liveElements(value, out);
+	return out;
+}
+
+/** Top-level `role="status"` elements of a component — mounted unconditionally. */
+function unconditionalStatus(source: string): Element[] {
+	const nodes = parse(source, { modern: true }).fragment.nodes as unknown[];
+	return branchElements({ nodes }).filter((el) => staticAttr(el, 'role') === 'status');
+}
+
+/** Live elements a page renders inside a `<BulkBar>`'s snippets. */
+function liveInsideBulkBar(source: string): Element[] {
+	if (!source.includes('<BulkBar')) return [];
+	const found: Element[] = [];
+	const visit = (node: unknown): void => {
+		if (node === null || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			node.forEach(visit);
+			return;
+		}
+		const record = node as Record<string, unknown>;
+		if (record.type === 'Component' && record.name === 'BulkBar') {
+			found.push(...liveElements(record.fragment));
+			return;
+		}
+		for (const [key, value] of Object.entries(record)) if (key !== 'parent') visit(value);
+	};
+	visit(parse(source, { modern: true }).fragment);
+	return found;
+}
+
+describe('the bulk bar announces from its first selection (WCAG 4.1.3)', () => {
+	it('the scanners tell the shapes apart', () => {
+		expect(unconditionalStatus(`<span role="status">{#if n}{n}{/if}</span>`)).toHaveLength(1);
+		expect(unconditionalStatus(`{#if n}<span role="status">{n}</span>{/if}`)).toEqual([]);
+		expect(
+			liveInsideBulkBar(`<BulkBar count={1}>{#snippet actions()}<span role="status">x</span>{/snippet}</BulkBar>`)
+		).toHaveLength(1);
+		expect(liveInsideBulkBar(`<BulkBar count={1} note={x}>{#snippet actions()}<span>x</span>{/snippet}</BulkBar>`)).toEqual([]);
+	});
+
+	it('BulkBar keeps one status region mounted outside the selection {#if}', () => {
+		const source = files.find((f) => f.path === BULK_BAR)?.source ?? '';
+		expect(unconditionalStatus(source)).toHaveLength(1);
+		// …and that is its only live region: the visible bar adds none.
+		expect(liveElements(parse(source, { modern: true }).fragment)).toHaveLength(1);
+	});
+
+	it('no page adds a live region inside the bulk bar', () => {
+		const offenders = files.flatMap(({ path, source }) =>
+			liveInsideBulkBar(source).map((el) => `${path}:${source.slice(0, el.start).split('\n').length}`)
+		);
+		expect(offenders, "pass the note through BulkBar's `note` prop instead").toEqual([]);
+	});
+});

@@ -2,7 +2,6 @@
 
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
-
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -2628,6 +2627,16 @@ class AppLocalizationsJa extends AppLocalizations {
   String get settingsAdaptiveHint => '承認パターン、異常、推奨';
 
   @override
+  String get settingsHelp => 'ヘルプ';
+
+  @override
+  String get settingsHelpHint => 'ワークスペースのガイドをブラウザで開きます';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'ヘルプセンターを開けませんでした。Web でワークスペースにサインインし、そこからヘルプを開いてください。';
+
+  @override
   String get inspectionsTitle => '品質検査';
 
   @override
@@ -4811,4 +4820,43 @@ class AppLocalizationsJa extends AppLocalizations {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => '利用規約とプライバシー';
+
+  @override
+  String get legalAcceptHeading => '更新された規約をご確認ください';
+
+  @override
+  String get legalAcceptIntro =>
+      'FeohLedger を引き続きご利用いただくには、現行の利用規約とプライバシーポリシーに同意してください。各文書はブラウザで開きます。';
+
+  @override
+  String get legalTermsLink => '利用規約';
+
+  @override
+  String get legalPrivacyLink => 'プライバシーポリシー';
+
+  @override
+  String get legalLinkHint => 'ブラウザで開きます';
+
+  @override
+  String get legalLinkFailed => 'ページを開けませんでした。ブラウザで直接開いてください。';
+
+  @override
+  String get legalAcceptCheckbox => '利用規約とプライバシーポリシーを読み、同意します。';
+
+  @override
+  String get legalAcceptButton => '同意する';
+
+  @override
+  String get legalAcceptSignOut => 'サインアウト';
+
+  @override
+  String get legalAcceptTickRequired =>
+      '利用規約とプライバシーポリシーに同意するには、チェックボックスをオンにしてください。';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'このバージョンのアプリは現在有効なものより古い利用規約またはプライバシーポリシーを表示しているため、同意を記録できません。アプリストアからアプリを更新するか、Web アプリで同意してから、もう一度サインインしてください。';
 }

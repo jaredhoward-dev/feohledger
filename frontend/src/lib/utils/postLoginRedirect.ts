@@ -154,3 +154,42 @@ export function takeNextForSso(storage: NextStorage | null = defaultStorage()): 
 		return null;
 	}
 }
+
+/** The supplier portal's sign-in page; a destination never points back at it. */
+const PORTAL_LOGIN = '/portal/login';
+
+/**
+ * {@link safeNextPath} for the supplier portal: the destination must also be a
+ * portal page (`/portal` or under it) other than its sign-in page, so a crafted
+ * `?next=` can never send a supplier into the employee app. Used by the portal
+ * layout's auth wall (which writes it) and the portal sign-in (which follows
+ * it), e.g. the AP-reply email's `/portal/invoices?chat=<id>` link.
+ */
+export function safePortalNextPath(raw: unknown): string | null {
+	const safe = safeNextPath(raw);
+	if (!safe) return null;
+	const path = new URL(safe, PROBE_ORIGIN).pathname;
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(path).toLowerCase();
+	} catch {
+		return null;
+	}
+	if (decoded !== '/portal' && !decoded.startsWith('/portal/')) return null;
+	if (decoded === PORTAL_LOGIN || decoded.startsWith(`${PORTAL_LOGIN}/`)) return null;
+	return safe;
+}
+
+/**
+ * `path` with a portal destination appended as `?next=` — {@link withNext} for
+ * the supplier portal. The forced password change is a sign-in step like any
+ * other, so the portal sign-in and the portal layout pass the destination on
+ * through it, as the employee flow does through `/change-password`. An unsafe
+ * or non-portal `next` adds nothing.
+ */
+export function withPortalNext(path: string, next: string | null | undefined): string {
+	const safe = safePortalNextPath(next);
+	if (!safe) return path;
+	const sep = path.includes('?') ? '&' : '?';
+	return `${path}${sep}${new URLSearchParams({ [NEXT_PARAM]: safe }).toString()}`;
+}

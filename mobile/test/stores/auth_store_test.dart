@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -6,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/legal_versions.generated.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
@@ -369,6 +371,174 @@ void main() {
         7,
         reason: 'a network blip must not destroy the offline cache',
       );
+    });
+  });
+
+  group('Terms / Privacy acceptance (decisions §498)', () {
+    Map<String, dynamic> me({required bool required}) =>
+        {..._meBody(['ap_clerk']), 'legal_acceptance_required': required};
+
+    Future<void> signInRequiringAcceptance(
+      Future<http.Response> Function(http.Request req) onAccept,
+    ) async {
+      var accepted = false;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          final path = req.url.path;
+          if (path == '/api/auth/login') {
+            return _json({'access_token': 'tok-123'});
+          }
+          if (path == '/api/auth/me') return _json(me(required: !accepted));
+          if (path == '/api/auth/legal-acceptance') {
+            final res = await onAccept(req);
+            accepted = res.statusCode == 200;
+            return res;
+          }
+          return _json({});
+        }),
+      );
+      expect((await store.login('demo@acme.com', 'demo', 'acme')).isSuccess,
+          isTrue);
+    }
+
+    test('/me requiring acceptance is exposed on the store', () async {
+      await signInRequiringAcceptance((_) async => _json(me(required: false)));
+      expect(store.legalAcceptanceRequired, isTrue);
+    });
+
+    test('accept posts the generated versions and clears the flag', () async {
+      Map<String, dynamic>? sent;
+      await signInRequiringAcceptance((req) async {
+        sent = jsonDecode(req.body) as Map<String, dynamic>;
+        return _json(me(required: false));
+      });
+
+      final outcome = await store.acceptLegalDocuments();
+
+      expect(outcome, LegalAcceptOutcome.accepted);
+      expect(sent, {
+        'accepted_terms_version': kTermsVersion,
+        'accepted_privacy_version': kPrivacyVersion,
+      });
+      expect(store.legalAcceptanceRequired, isFalse);
+      expect(store.legalError, isNull);
+    });
+
+    test('a coded 422 means the app is out of date, not a generic error',
+        () async {
+      await signInRequiringAcceptance(
+        (_) async => _json({
+          'detail': {
+            'code': 'legal_acceptance_required',
+            'message': 'Please accept the current Terms of Service and '
+                'Privacy Policy to continue.',
+          },
+        }, 422),
+      );
+
+      expect(await store.acceptLegalDocuments(), LegalAcceptOutcome.appOutdated);
+      expect(store.legalAcceptanceRequired, isTrue);
+      expect(store.legalError, isNull);
+    });
+
+    test('a 429 is the standard error', () async {
+      await signInRequiringAcceptance(
+        (_) async => _json({'detail': 'Too many requests'}, 429),
+      );
+
+      expect(await store.acceptLegalDocuments(), LegalAcceptOutcome.failed);
+      expect(store.legalError, 'Too many requests');
+      expect(store.legalAcceptanceRequired, isTrue);
+    });
+
+    // A resume's refreshProfile() used to take a newer request token while an
+    // accept was in flight; the accept's response was then discarded without
+    // lowering `acceptingLegal`, so the screen stayed busy and the guard at
+    // the top of acceptLegalDocuments refused every retry.
+    test('a resume refresh during an in-flight accept neither strands it nor '
+        'discards its answer', () async {
+      final gate = Completer<http.Response>();
+      var meReads = 0;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          final path = req.url.path;
+          if (path == '/api/auth/login') {
+            return _json({'access_token': 'tok-123'});
+          }
+          if (path == '/api/auth/me') {
+            meReads++;
+            return _json(me(required: true));
+          }
+          if (path == '/api/auth/legal-acceptance') return gate.future;
+          return _json({});
+        }),
+      );
+      await store.login('demo@acme.com', 'demo', 'acme');
+      expect(store.legalAcceptanceRequired, isTrue);
+      final readsAtSignIn = meReads;
+
+      final accepting = store.acceptLegalDocuments();
+      expect(store.acceptingLegal, isTrue);
+
+      await store.refreshProfile(); // the app came back to the foreground
+      expect(meReads, readsAtSignIn,
+          reason: 'the accept response is the fresher profile');
+      expect(store.acceptingLegal, isTrue);
+
+      gate.complete(_json(me(required: false)));
+      expect(await accepting, LegalAcceptOutcome.accepted);
+      expect(store.acceptingLegal, isFalse);
+      expect(store.legalAcceptanceRequired, isFalse);
+    });
+
+    test('an accept superseded by sign-out lowers its busy flag, never the '
+        "next session's", () async {
+      final first = Completer<http.Response>();
+      await signInRequiringAcceptance((_) => first.future);
+      final stale = store.acceptLegalDocuments();
+      expect(store.acceptingLegal, isTrue);
+      store.reset(); // a 401 elsewhere ended the session mid-accept
+      expect(store.acceptingLegal, isFalse);
+
+      // The next session starts its own accept before the stale one answers.
+      final second = Completer<http.Response>();
+      await signInRequiringAcceptance((_) => second.future);
+      final current = store.acceptLegalDocuments();
+      expect(store.acceptingLegal, isTrue);
+
+      first.complete(_json(me(required: false)));
+      expect(await stale, LegalAcceptOutcome.failed);
+      expect(store.acceptingLegal, isTrue,
+          reason: "the stale answer must not lower the live accept's flag");
+      expect(store.legalAcceptanceRequired, isTrue);
+
+      second.complete(_json(me(required: false)));
+      expect(await current, LegalAcceptOutcome.accepted);
+      expect(store.acceptingLegal, isFalse);
+      expect(store.legalAcceptanceRequired, isFalse);
+    });
+
+    test('refreshProfile picks up a requirement raised after sign-in',
+        () async {
+      var required = false;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (req.url.path == '/api/auth/login') {
+            return _json({'access_token': 'tok-123'});
+          }
+          if (req.url.path == '/api/auth/me') {
+            return _json(me(required: required));
+          }
+          return _json({});
+        }),
+      );
+      await store.login('demo@acme.com', 'demo', 'acme');
+      expect(store.legalAcceptanceRequired, isFalse);
+
+      required = true; // a version bump while the app was backgrounded
+      await store.refreshProfile();
+
+      expect(store.legalAcceptanceRequired, isTrue);
     });
   });
 }

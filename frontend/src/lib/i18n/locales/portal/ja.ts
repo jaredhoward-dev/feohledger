@@ -24,8 +24,15 @@ export const messages = {
 	'portal.nav.discounts': '割引',
 	'portal.nav.company': '会社情報',
 	'portal.nav.notifications': '通知',
+	'portal.nav.help': 'ヘルプ',
+
+	// Supplier portal — help (routes/portal/help/, decisions §508)
+	'portal.help.subtitle': 'このポータルを利用するサプライヤー向けのガイドと回答です。',
+	'portal.help.guides': 'ガイド',
+	'portal.help.glossary': '用語',
 	'portal.shell.logOut': 'ログアウト',
 	'portal.shell.footerSupport': 'サポート',
+	'portal.privacyAck.support': 'ご不明な点はサポートへお問い合わせください',
 	'portal.shell.footerLegal': '法的情報',
 	'portal.shell.footerPlatformLegal': 'プライバシーと利用規約',
 
@@ -111,6 +118,8 @@ export const messages = {
 	'portal.invoices.fileDownloadFailed': 'ダウンロードに失敗しました',
 	'portal.invoices.tableAria': '請求書一覧',
 	'portal.invoices.chatLoadFailed': '会話を読み込めませんでした。',
+	'portal.invoices.chatNotFound': 'お客様のアカウントにその請求書が見つかりませんでした。',
+	'portal.invoices.chatLinkFailed': '現在、その会話を開けませんでした。',
 
 	// ポータルの支払い (routes/portal/payments/+page.svelte)
 	'portal.payments.title': '支払い',

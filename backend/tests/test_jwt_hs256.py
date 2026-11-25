@@ -188,7 +188,7 @@ async def test_python_jose_access_token_resolves_through_get_current_user(fixtur
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from app.api.deps import get_current_user
+    from app.api.deps import get_authenticated_user
 
     fake_user = SimpleNamespace(
         id=uuid.UUID(USER_ID), is_active=True, organization_id=uuid.UUID(ORG_ID), roles=[]
@@ -198,7 +198,7 @@ async def test_python_jose_access_token_resolves_through_get_current_user(fixtur
     db = AsyncMock()
     db.execute = AsyncMock(return_value=result)
     with patch("app.api.deps.is_token_blocked", AsyncMock(return_value=False)):
-        user = await get_current_user(authorization=f"Bearer {JOSE_ACCESS}", db=db)
+        user = await get_authenticated_user(authorization=f"Bearer {JOSE_ACCESS}", db=db)
     assert user is fake_user
     assert user.session_jti == JOSE_ACCESS_CLAIMS["jti"]
 

@@ -314,3 +314,93 @@ describe('auth.logout during an in-flight /me', () => {
 		expect(auth.userStatus).toBe('idle');
 	});
 });
+
+// The Terms / Privacy re-prompt's state (decisions §497): the root layout draws
+// `LegalAcceptStep` while the loaded account's `legal_acceptance_required` is
+// true, so these pin what turns that flag on and off.
+describe('auth.acceptLegal — the legal-acceptance state', () => {
+	beforeEach(() => {
+		get.mockReset();
+		post.mockReset();
+		vi.stubGlobal('window', { location: { href: '' } });
+	});
+
+	const UNACCEPTED = { ...ALICE, legal_acceptance_required: true };
+	const ACCEPTED = { ...ALICE, legal_acceptance_required: false };
+
+	it('a /me that says required is held until accepting posts this build’s versions and takes the answer', async () => {
+		const { ACCEPTED_LEGAL_VERSIONS } = await import('#lib/legal/acceptance.ts');
+		const auth = await freshStore('tok');
+		get.mockResolvedValueOnce(UNACCEPTED);
+		await auth.fetchUser();
+		expect(auth.user?.legal_acceptance_required).toBe(true);
+
+		post.mockResolvedValueOnce(ACCEPTED);
+		await auth.acceptLegal();
+
+		expect(post).toHaveBeenCalledWith('/api/auth/legal-acceptance', ACCEPTED_LEGAL_VERSIONS);
+		expect(auth.user?.legal_acceptance_required).toBe(false);
+		expect(auth.userStatus).toBe('ready');
+		// No second /me: the endpoint's answer is the account.
+		expect(get).toHaveBeenCalledTimes(1);
+	});
+
+	it('a call the server-side gate refuses puts the step up on a loaded account (§505)', async () => {
+		const auth = await freshStore('tok');
+		const { employeeAcceptanceRefusal } = await import('#lib/api/acceptanceRefusal.ts');
+		get.mockResolvedValueOnce(ACCEPTED);
+		await auth.fetchUser();
+		expect(auth.user?.legal_acceptance_required).toBe(false);
+
+		// What `api.ts::endSessionIfRejected` does on any refused response.
+		employeeAcceptanceRefusal.notice(403, 'legal_acceptance_required');
+
+		expect(auth.user?.legal_acceptance_required).toBe(true);
+		expect(auth.user?.id).toBe(ALICE.id);
+		expect(auth.loggedIn).toBe(true);
+		expect(auth.userStatus).toBe('ready');
+	});
+
+	it('a refused accept throws for the step to state and leaves the step up', async () => {
+		const auth = await freshStore('tok');
+		get.mockResolvedValueOnce(UNACCEPTED);
+		await auth.fetchUser();
+
+		post.mockRejectedValueOnce(new ApiError('Versions changed', 422, 'legal_acceptance_required'));
+		await expect(auth.acceptLegal()).rejects.toMatchObject({
+			status: 422,
+			code: 'legal_acceptance_required'
+		});
+		expect(auth.user?.legal_acceptance_required).toBe(true);
+	});
+
+	it('a /me sent before the acceptance and answering after it cannot bring the step back', async () => {
+		const auth = await freshStore('tok');
+		get.mockResolvedValueOnce(UNACCEPTED);
+		await auth.fetchUser();
+
+		const stale = pendingMe();
+		const load = auth.fetchUser();
+		post.mockResolvedValueOnce(ACCEPTED);
+		await auth.acceptLegal();
+
+		stale.resolve(UNACCEPTED);
+		await load;
+
+		expect(auth.user?.legal_acceptance_required).toBe(false);
+		expect(auth.userStatus).toBe('ready');
+	});
+
+	it('logging out clears the account, and the step with it', async () => {
+		const auth = await freshStore('tok');
+		get.mockResolvedValueOnce(UNACCEPTED);
+		await auth.fetchUser();
+		post.mockResolvedValueOnce({});
+
+		await auth.logout();
+
+		expect(auth.user).toBeNull();
+		expect(auth.user?.legal_acceptance_required).toBeUndefined();
+		expect(auth.loggedIn).toBe(false);
+	});
+});

@@ -66,7 +66,9 @@
 	}
 </script>
 
-<div class="account-load" data-account-load={showPanel ? 'error' : 'loading'}>
+<!-- `<main>`: drawn in place of the app shell (and its `<main>`), so it
+     carries the page's main landmark itself (WCAG 1.3.1). -->
+<main class="account-load" data-account-load={showPanel ? 'error' : 'loading'}>
 	<p class="announcement" class:visually-hidden={showPanel} role="status">
 		{#if !showPanel}<BrandMark size={36} />{/if}
 		<span class="announcement-text">{announcement}</span>
@@ -91,7 +93,7 @@
 			</LoadError>
 		</div>
 	{/if}
-</div>
+</main>
 
 <style>
 	.account-load {

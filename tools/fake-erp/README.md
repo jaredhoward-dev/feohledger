@@ -231,7 +231,8 @@ Backs `erp_adapters/sage_intacct.py` (`FEOH_ERP_INTACCT_API_BASE`).
   usable afterwards.
 - `POST /services/core/query` — `accounts-payable/vendor` (`V-ACME`,
   `V-BETA`, and `V-GONE` with `status: inactive`), `general-ledger/account`
-  (`6100`, `6200`, `2000`, and `6900` inactive),
+  (numbers `6100`, `6200`, `2000`, and `6900` inactive, record keys `61`, `62`,
+  `20`, `69`),
   `purchasing/document::Purchase Order` (`PO-INTACCT-401` 1250.00 pending,
   `PO-INTACCT-402` 980.50 closed, as `totalInTxnCurrency` / `txnCurrency`) and
   the created bills; `$eq` filters, `orderBy`, `start` / `size` paging with
@@ -240,9 +241,13 @@ Backs `erp_adapters/sage_intacct.py` (`FEOH_ERP_INTACCT_API_BASE`).
 - `POST /objects/accounts-payable/bill` → 201 key `5001`, `5002`, …. Like
   Intacct, a bill created without `state` is a **`draft`**; `createdDate` and
   `dueDate` are required (400); an unknown or inactive vendor / GL account, or a
-  `createdDate` before 2020-01-01 (a closed period), is a 422; a non-string
+  `createdDate` before 2020-01-01 (a closed period), is a 422 (a line's
+  `glAccount` names its account by record `key` or number `id`, as
+  FeohLedger's links do since decisions §492); a non-string
   `txnAmount` is refused. `GET` / `DELETE /objects/accounts-payable/bill/{key}`
-  (only a posted / draft / declined bill deletes).
+  (only a posted / draft / declined bill deletes). A bill read back carries
+  `lines[].glAccount` exactly as it was sent (`{"key"}` or `{"id"}`) — real
+  Intacct names both — so a spec can tell which form FeohLedger posted by.
 - `POST /workflows/accounts-payable/bill/reverse` — `{key, reverseDate}`
   reverses a posted bill; the date must be after its posting date.
 - Errors are `{"ia::result": {"ia::error": {...}}, "ia::meta": {...}}`, the
@@ -439,9 +444,13 @@ non-empty `Bb-Api-Subscription-Key`, as the real gateway does.
   `139` `OnHold` — `vendor_status`), `GET /accountspayable/v1/vendors/{id}`
   (the `VendorDetail`), `/purchaseorders` (`1001` 1250.00 open, `1002` 980.50
   closed, `1003` with no `order_total`; each carries `vendor_id`),
-  `GET /generalledger/v1/accounts` (`01-5000-00`, `01-5100-00`, `01-2000-00`,
-  and `01-5900-00`, whose job fails) — `{"count", "value"}` with `limit` /
-  `offset` (limit capped at 500).
+  `GET /generalledger/v1/accounts` (`account_id` 1–4: `01-5000-00`,
+  `01-5100-00`, `01-2000-00`, and `01-5900-00`, whose job fails) —
+  `{"count", "value"}` with `limit` / `offset` (limit capped at 500), and
+  `GET /generalledger/v1/accounts/{account_id}` (one account, 404 when the
+  chart holds no such id). The backend links each by `account_id` (`id:1`,
+  decisions §494) and posts the number it reads here at push time (one read
+  per id for a bill linking ≤ 5 accounts, a walk of the list otherwise).
 - `GET /generalledger/v1/fiscalyears` — calendar years 2024–2030: FY 2024
   `Closed`, Jan–Mar 2025 periods `closed`, everything else open.
 - `GET /accountspayable/v1/invoices?search_text=` — matches invoice number,
@@ -455,7 +464,8 @@ non-empty `Bb-Api-Subscription-Key`, as the real gateway does.
   `backgroundProcess/{id}/status` → 5, `backgroundProcess/{id}/result` →
   `{"record_id"}` — except a create touching `01-5900-00`, whose job ends at 7
   (failed) with no record.
-  `GET /accountspayable/v1/invoices/{id}` returns `status` / `amount` / `balance`.
+  `GET /accountspayable/v1/invoices/{id}` returns `status` / `amount` / `balance`,
+  and `distributions` (each one's `account_number` and `type_code` as sent).
 - `POST /blackbaud/__set-status` — test hook `{"invoice_id", "status", "balance"}`.
 - `POST /blackbaud/__throttle` — test hook `{"status": 429|403, "retry_after": <s>,
   "count": <n>}`: the next `n` SKY calls answer SKY's rate-limit 429 or

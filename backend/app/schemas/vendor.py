@@ -1,3 +1,4 @@
+import uuid
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -492,7 +493,9 @@ class VendorBulkScreenResponse(BaseModel):
 
 
 class VendorBulkExportRequest(BaseModel):
-    ids: list[str] = Field(..., min_length=1)
+    # Parsed here, so a malformed id is a 422 rather than the 500 an
+    # in-handler `uuid.UUID(...)` raised (decisions §509).
+    ids: list[uuid.UUID] = Field(..., min_length=1)
 
 
 class VendorErpLinkItem(BaseModel):

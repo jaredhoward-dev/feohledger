@@ -4,9 +4,11 @@ import {
 	postLoginTarget,
 	rememberNextForSso,
 	safeNextPath,
+	safePortalNextPath,
 	SSO_NEXT_KEY,
 	takeNextForSso,
 	withNext,
+	withPortalNext,
 	type NextStorage
 } from './postLoginRedirect.ts';
 
@@ -186,5 +188,48 @@ describe('a provider client secret never rides through sign-in', () => {
 
 	it('refuses a bare root once the secret is gone', () => {
 		expect(safeNextPath('/?setup_intent_client_secret=s')).toBeNull();
+	});
+});
+
+describe('safePortalNextPath', () => {
+	it('keeps a portal page with its query (the AP-reply email deep link)', () => {
+		const id = '3f0c1f8e-6a1b-4c2d-9e8f-0123456789ab';
+		expect(safePortalNextPath(`/portal/invoices?chat=${id}`)).toBe(`/portal/invoices?chat=${id}`);
+		expect(safePortalNextPath('/portal')).toBe('/portal');
+	});
+
+	it('refuses anything outside the portal, the portal sign-in, and what safeNextPath refuses', () => {
+		for (const raw of [
+			'/invoices',
+			'/portalx',
+			'/portal-evil',
+			'/portal/login',
+			'/portal/login?next=/portal',
+			'/PORTAL/LOGIN',
+			'/%70ortal/login',
+			'//evil.example/portal',
+			'/portal/../invoices',
+			'https://evil.example/portal',
+			null
+		]) {
+			expect(safePortalNextPath(raw), String(raw)).toBeNull();
+		}
+	});
+});
+
+describe('withPortalNext', () => {
+	it('carries a portal destination through the forced password change', () => {
+		const id = '3f0c1f8e-6a1b-4c2d-9e8f-0123456789ab';
+		expect(withPortalNext('/portal/change-password', `/portal/invoices?chat=${id}`)).toBe(
+			`/portal/change-password?next=${encodeURIComponent(`/portal/invoices?chat=${id}`)}`
+		);
+	});
+
+	it('adds nothing for an absent, unsafe or non-portal destination', () => {
+		for (const raw of [null, undefined, '', '/invoices', '//evil.example/portal', '/portal/login']) {
+			expect(withPortalNext('/portal/change-password', raw), String(raw)).toBe(
+				'/portal/change-password'
+			);
+		}
 	});
 });

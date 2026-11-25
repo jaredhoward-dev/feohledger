@@ -23,6 +23,7 @@ import {
 } from './content.ts';
 import { inline } from './inline.ts';
 import { LIFECYCLE } from './lifecycle.ts';
+import { PORTAL_GLOSSARY, PORTAL_GUIDES, PORTAL_PAGES, portalGuideFor } from './portal.ts';
 import { DIAGRAM_IDS } from './types.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 
@@ -271,6 +272,128 @@ describe('help content — diagrams', () => {
 		for (const id of DIAGRAM_IDS) {
 			expect(used.has(id), `diagram ${id} is in no guide`).toBe(true);
 			expect(dispatcher.includes(`'${id}'`), `Diagram.svelte does not draw ${id}`).toBe(true);
+		}
+	});
+});
+
+describe('supplier portal help — the same checks, inside the portal', () => {
+	// The supplier guides (routes/portal/help/, decisions §508) are read by
+	// vendor users who cannot open /help, so on top of the help centre's checks
+	// every link they carry must stay inside the portal.
+	const sources: { where: string; text: string }[] = [];
+	for (const g of PORTAL_GUIDES) {
+		sources.push({ where: `portal guide ${g.id} summary`, text: g.summary });
+		for (const s of g.sections) {
+			sources.push({ where: `portal guide ${g.id} heading`, text: s.heading });
+			s.blocks.forEach((b, i) => {
+				const where = `portal guide ${g.id} › ${s.heading} › block ${i}`;
+				if (b.type === 'p' || b.type === 'note') sources.push({ where, text: b.text });
+				else if (b.type === 'steps' || b.type === 'list') b.items.forEach((t) => sources.push({ where, text: t }));
+				else if (b.type === 'diagram') sources.push({ where, text: b.caption });
+			});
+		}
+	}
+
+	it('are supplier guides, and no supplier guide is in the help centre', () => {
+		expect(PORTAL_GUIDES.length).toBeGreaterThan(0);
+		for (const g of PORTAL_GUIDES) expect(g.audience, g.id).toBe('supplier');
+		for (const g of GUIDES) expect(g.audience ?? 'employee', g.id).toBe('employee');
+		expect(PORTAL_GUIDES.filter((g) => g.kind === 'start')).toHaveLength(1);
+	});
+
+	it('have unique URL-safe ids, summaries, sections and distinct anchors', () => {
+		const ids = PORTAL_GUIDES.map((g) => g.id);
+		expect(new Set(ids).size).toBe(ids.length);
+		for (const g of PORTAL_GUIDES) {
+			expect(g.id).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+			expect(g.summary.length, `${g.id} summary`).toBeGreaterThan(0);
+			expect(g.summary.length, `${g.id} summary length`).toBeLessThanOrEqual(220);
+			expect(g.sections.length, `${g.id} sections`).toBeGreaterThan(0);
+			const anchors = g.sections.map((s) => headingId(s.heading));
+			expect(new Set(anchors).size, `${g.id} heading anchors`).toBe(anchors.length);
+			for (const s of g.sections) {
+				expect(s.blocks.length, `${g.id} › ${s.heading}`).toBeGreaterThan(0);
+				// Both blocks need employee-only pieces: the walkthrough imports the employee index.
+				for (const b of s.blocks) expect(b.type, `${g.id} › ${s.heading}`).not.toBe('lifecycle');
+			}
+		}
+	});
+
+	it("a guide's route is a portal page, and its terms and related guides are the portal's own", () => {
+		for (const route of Object.keys(PORTAL_PAGES)) expect(routeExists(route), route).toBe(true);
+		for (const g of PORTAL_GUIDES) {
+			if (g.route) expect(PORTAL_PAGES[g.route], `${g.id} route ${g.route}`).toBeDefined();
+			for (const t of g.terms ?? []) expect(PORTAL_GLOSSARY, `${g.id} term ${t}`).toContain(t);
+			for (const r of g.related ?? []) {
+				expect(portalGuideFor(r), `${g.id} related ${r}`).toBeDefined();
+				expect(r, `${g.id} relates to itself`).not.toBe(g.id);
+			}
+		}
+	});
+
+	it('every portal page a supplier works on has a guide that opens it', () => {
+		// The notification settings are two checkboxes, covered by a tip in
+		// "Track an invoice to payment" rather than a guide of their own.
+		const covered = new Set(PORTAL_GUIDES.map((g) => g.route));
+		const without = Object.keys(PORTAL_PAGES).filter((r) => r !== '/portal/notifications' && !covered.has(r));
+		expect(without, 'portal pages no supplier guide opens').toEqual([]);
+	});
+
+	it('the glossary is help-centre terms (translated: the glossary checks above), each used by a guide', () => {
+		expect(new Set(PORTAL_GLOSSARY).size).toBe(PORTAL_GLOSSARY.length);
+		for (const id of PORTAL_GLOSSARY) {
+			expect(termFor(id), id).toBeDefined();
+			expect(catalogue[termKey(id)], id).toBeTruthy();
+			expect(catalogue[termShortKey(id)], id).toBeTruthy();
+		}
+		// Every term on the page is one some supplier guide uses.
+		const used = new Set(PORTAL_GUIDES.flatMap((g) => g.terms ?? []));
+		for (const { text } of sources) for (const p of inline(text)) if (p.kind === 'term') used.add(p.id);
+		expect(PORTAL_GLOSSARY.filter((id) => !used.has(id)), 'glossary terms no supplier guide uses').toEqual([]);
+	});
+
+	it('parses with no stray markup, and every {ui:key} is a label with no parameters', () => {
+		for (const { where, text } of sources) {
+			for (const p of inline(text)) {
+				if (p.kind === 'text') expect(p.text, `${where}: unparsed markup`).not.toMatch(/\[\[|\]\]|\{ui:|\*\*/);
+				if (p.kind !== 'ui') continue;
+				expect(catalogue[p.key], `${where}: {ui:${p.key}} is not in en.ts`).toBeDefined();
+				expect(catalogue[p.key], `${where}: {ui:${p.key}} has a placeholder`).not.toMatch(/\{[a-zA-Z]/);
+			}
+		}
+	});
+
+	it('every link stays inside the portal', () => {
+		for (const { where, text } of sources) {
+			for (const p of inline(text)) {
+				if (p.kind === 'term') expect(PORTAL_GLOSSARY, `${where}: [[${p.id}]] is not on /portal/help`).toContain(p.id);
+				if (p.kind === 'guide') expect(portalGuideFor(p.id), `${where}: [[guide:${p.id}]]`).toBeDefined();
+				if (p.kind === 'page') {
+					expect(p.href, `${where}: [[page:${p.href}]] leaves the portal`).toMatch(/^\/portal(\/|$)/);
+					expect(routeExists(p.href), `${where}: [[page:${p.href}]] is not a route`).toBe(true);
+					// The sidebar labels an unlabelled link, and the portal has no sidebar entry in NAV.
+					expect(p.label, `${where}: [[page:${p.href}]] needs a label`).toBeDefined();
+				}
+			}
+		}
+	});
+
+	it('the portal help pages render without the employee guide index', () => {
+		// content.ts pulls every employee guide (and the settings-slice keys
+		// they name) into whatever route imports it. The supplier pages, and
+		// the shared renderers they use, reach help prose only through the
+		// light modules.
+		for (const file of [
+			'/src/routes/portal/help/+page.svelte',
+			'/src/routes/portal/help/[id]/+page.svelte',
+			'/src/lib/components/help/GuideSections.svelte',
+			'/src/lib/components/help/RichText.svelte',
+			'/src/lib/components/help/HelpCrumbs.svelte',
+			'/src/lib/components/help/EnglishNotice.svelte'
+		]) {
+			const src = SVELTE[file];
+			expect(src, file).toBeDefined();
+			expect(src, `${file} imports the employee help index`).not.toMatch(/#lib\/help\/(content|glossary|guides|lifecycle)|InvoiceLifecycle/);
 		}
 	});
 });

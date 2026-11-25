@@ -64,6 +64,9 @@ function createAdminStore() {
 	let errored = $state(false);
 	// The same, for the independent roles request.
 	let rolesErrored = $state(false);
+	// Whether a roles load has settled (either way) — until then the Roles tab
+	// shows DataTable's loading row rather than claiming there are no roles.
+	let rolesLoaded = $state(false);
 
 	// Users and roles are two independent lists loaded by two independent
 	// requests, so they get a sequencer each — a roles refresh must not mark an
@@ -160,6 +163,8 @@ function createAdminStore() {
 			// `rolesErrored` so a failed load says so instead of asserting "No
 			// system roles." on the page that decides who can do what.
 			if (rolesSequence.isCurrentRequest(token)) rolesErrored = true;
+		} finally {
+			if (rolesSequence.isCurrentRequest(token)) rolesLoaded = true;
 		}
 	}
 
@@ -300,6 +305,7 @@ function createAdminStore() {
 		get loading() { return loading; },
 		get errored() { return errored; },
 		get rolesErrored() { return rolesErrored; },
+		get rolesLoaded() { return rolesLoaded; },
 		get total() { return total; },
 		get page() { return page; },
 		get pageSize() { return pageSize; },

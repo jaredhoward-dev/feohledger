@@ -10,6 +10,22 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qs, urlsplit
 
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
+
+#: What a set-password page sends when its required accept box is ticked: an
+#: account with no password yet must accept the Terms / Privacy versions in
+#: force to redeem its link (decisions §495).
+ACCEPT_CURRENT = {
+    "accepted_terms_version": CURRENT_LEGAL_VERSIONS["terms"],
+    "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
+}
+
+#: What the supplier-portal set-password page sends when its required box is
+#: ticked: a portal account with no password yet must acknowledge the Privacy
+#: Policy version in force — and only that; suppliers are not asked to accept
+#: the Terms (decisions §499).
+ACK_PRIVACY = {"accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"]}
+
 _LINK = re.compile(r"https?://\S+/(?:login|portal)/reset-password\?\S+")
 
 

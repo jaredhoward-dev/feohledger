@@ -54,8 +54,8 @@
 	// $derived so the column headers re-render when the locale changes.
 	let COLUMNS = $derived([
 		{ label: m('admin.partner.col.tenant') },
-		{ label: m('admin.partner.col.slug') },
-		{ label: m('admin.partner.col.plan') },
+		{ label: m('admin.partner.col.slug'), class: 'col-slug' },
+		{ label: m('admin.partner.col.plan'), class: 'col-plan' },
 		{ label: m('admin.partner.col.brandName') },
 		{ label: '', class: 'actions-col' }
 	]);
@@ -361,18 +361,34 @@
 		{/if}
 	</section>
 
-	{#if loading}
-		<LoadingState testId="partner-loading" />
-	{:else if error}
+	<!-- The table is mounted from first paint with DataTable's own "Loading…"
+	     row: a loading block swapped for the table (or for a separate
+	     "not a partner" note) moved the page when the overview landed. A
+	     workspace that is not a partner administers no children by definition
+	     (`is_partner` is derived from having one), so that state is the
+	     table's empty row, worded for it — decisions §501. `fixed` plus the
+	     header widths below keep the columns from re-sizing against the real
+	     rows (frontend/docs/ui-patterns.md § Data tables;
+	     tests-e2e/reactivity/layout-stability.spec.ts). -->
+	{#if error}
 		<LoadError message={error} onretry={load} testId="partner-error" />
-	{:else if overview && !overview.is_partner}
-		<div class="state" data-testid="partner-empty">
-			<p>
-				{m('admin.partner.notPartner')}
-			</p>
-		</div>
-	{:else if overview}
-		<DataTable columns={COLUMNS} isEmpty={overview.children.length === 0} empty={m('admin.partner.empty')}>
+	{:else}
+		<!-- `wide` (the 1000px floor below) only while rows are on the way or
+		     present: the settled empty row is a sentence — for a workspace that
+		     is not a partner, the page's whole explanation — and a sentence
+		     centred in a 1000px table runs off a phone screen (WCAG 1.4.10;
+		     tests-e2e/a11y/reflow.spec.ts). Loading keeps the floor so the
+		     header does not move when rows land. -->
+		<div class="partner-table" class:wide={loading || children.length > 0}>
+		<DataTable
+			columns={COLUMNS}
+			fixed
+			{loading}
+			isEmpty={children.length === 0}
+			empty={overview && !overview.is_partner
+				? m('admin.partner.notPartner')
+				: m('admin.partner.empty')}
+		>
 			{#snippet body()}
 				{#each children as child (child.id)}
 					<tr
@@ -415,6 +431,7 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 	{/if}
 </PageHeader>
 
@@ -620,14 +637,34 @@
 		max-width: 720px;
 	}
 
-	.state {
-		color: var(--text-muted);
-		padding: 0.75rem 0;
+	/* Column widths for the `fixed` children table, each sized to its widest
+	   content in any locale ×1.25 (×1.1 for ja), rounded up to 10px: Slug
+	   holds a slug of up to 63 characters, which breaks anywhere rather than
+	   overprint Plan; Plan fits fr "Forfait"; the actions column fits the
+	   ARMED label, fr "Confirmer le détachement" (≈214px as drawn), so arming
+	   Detach does not overprint the cell — the unarmed es "Desvincular" needs
+	   only ≈126px. Tenant and Brand name share the rest, and the `min-width`
+	   keeps them readable (past it the table scrolls inside its region) —
+	   applied under `.wide` only, with the column widths (a fixed table is
+	   at least as wide as its columns), so the settled empty row's sentence
+	   reflows to the viewport instead.
+	   DataTable renders these `<th>` from `columns`, so the selectors go
+	   through `:global` under this page-owned wrapper (the /gl-accounts
+	   pattern). */
+	.partner-table {
+		min-width: 0;
 	}
+	.partner-table.wide :global(table) { min-width: 1000px; }
+	.partner-table.wide :global(th.col-slug) { width: 200px; }
+	.partner-table.wide :global(th.col-plan) { width: 110px; }
+	.partner-table.wide :global(th.actions-col) { width: 280px; }
 
 	.mono {
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 		font-size: 0.85rem;
+	}
+	td.mono {
+		overflow-wrap: anywhere;
 	}
 
 	.color-row {

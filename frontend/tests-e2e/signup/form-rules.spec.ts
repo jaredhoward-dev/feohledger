@@ -1,6 +1,6 @@
 import { expectNoA11yViolations } from '../a11y/axe-helper';
 import { expect, NO_TENANT_BASE, test } from '../fixtures/helpers';
-import { captchaEvent, fillSignupForm, stubCaptcha } from './captchaStub';
+import { acceptSignupTerms, captchaEvent, fillSignupForm, stubCaptcha } from './captchaStub';
 
 /**
  * The signup form enforces the server's rules before the server has to, and
@@ -256,6 +256,7 @@ test.describe('coded refusals, read in German', () => {
 		await page.locator('#signup-slug').fill(FORM.slug);
 		await page.locator('#signup-name').fill(FORM.name);
 		await page.locator('#signup-email').fill(FORM.email);
+		await acceptSignupTerms(page);
 		await expect(page.locator('small.hint.ok')).toBeVisible();
 		const submit = page.locator('form.signup-form button[type="submit"]');
 		const send = async () => {
@@ -342,6 +343,7 @@ test.describe('coded refusals, read in German', () => {
 		await page.locator('#signup-slug').fill(FORM.slug);
 		await page.locator('#signup-name').fill(FORM.name);
 		await page.locator('#signup-email').fill(FORM.email);
+		await acceptSignupTerms(page);
 		await expect(page.locator('small.hint.ok')).toBeVisible();
 		await captchaEvent(page, 'solve', 't');
 		await page.locator('form.signup-form button[type="submit"]').click();
@@ -376,6 +378,7 @@ test.describe('coded refusals, read in German', () => {
 		await page.locator('#signup-slug').fill(FORM.slug);
 		await page.locator('#signup-name').fill(FORM.name);
 		await page.locator('#signup-email').fill(FORM.email);
+		await acceptSignupTerms(page);
 		await expect(page.locator('small.hint.ok')).toBeVisible();
 		await captchaEvent(page, 'solve', 't');
 		await page.locator('form.signup-form button[type="submit"]').click();
@@ -387,5 +390,103 @@ test.describe('coded refusals, read in German', () => {
 		// Nothing was refused on a field: every field keeps its value, none is marked.
 		await expect(page.locator('#signup-slug')).toHaveValue(FORM.slug);
 		await expect(page.locator('[aria-invalid="true"]')).toHaveCount(0);
+	});
+});
+
+test.describe('the Terms / Privacy accept box', () => {
+	test('submitting unticked says so in the app\'s words, focuses the box and sends nothing', async ({
+		page
+	}) => {
+		// `aria-required`, not `required`: a native `required` on a form without
+		// `novalidate` let the browser block the submit first with its own
+		// bubble, in the browser's language, so the localized message, the
+		// `aria-invalid` and the alert never ran.
+		const { submissions } = await stubCaptcha(page);
+		await page.goto('/signup');
+		await page.getByLabel('Company name').fill(FORM.company);
+		await page.getByLabel('Workspace URL').fill(FORM.slug);
+		await page.getByLabel('Your name').fill(FORM.name);
+		await page.getByLabel('Email').fill(FORM.email);
+		await expect(page.locator('small.hint.ok')).toBeVisible();
+		const box = page.locator('#signup-legal-accept');
+		await expect(box).not.toHaveAttribute('required');
+		await expect(box).toHaveAttribute('aria-required', 'true');
+
+		await page.getByRole('button', { name: 'Send verification email' }).click();
+		await expect(page.locator('#signup-legal-accept-error')).toHaveText(
+			'Tick the box to accept the Terms of Service and Privacy Policy.'
+		);
+		await expect(page.locator('#signup-legal-accept-error')).toHaveAttribute('role', 'alert');
+		await expect(box).toHaveAttribute('aria-invalid', 'true');
+		await expect(box).toBeFocused();
+		expect(await box.evaluate((el) => (el as HTMLInputElement).validity.valid)).toBe(true);
+		expect(submissions).toHaveLength(0);
+	});
+
+	test('the consent sentence flows as one paragraph beside the box, not a stack of rows', async ({
+		page
+	}) => {
+		// AuthShell lays every form label out as a column flex; on this label
+		// that put each text run and link of the sentence on its own row.
+		await stubCaptcha(page);
+		await page.goto('/signup');
+		const consent = page.locator('.legal-consent');
+		const label = consent.locator('label');
+		await expect(label).toHaveCSS('display', 'block');
+		const labelBox = await label.boundingBox();
+		const terms = await consent.getByRole('link', { name: 'Terms of Service' }).boundingBox();
+		const privacy = await consent.getByRole('link', { name: 'Privacy Policy' }).boundingBox();
+		const lineHeight = await label.evaluate((el) => parseFloat(getComputedStyle(el).lineHeight));
+		expect(labelBox && terms && privacy).toBeTruthy();
+		// "I agree to the Terms of Service" is one line: the link continues the
+		// first line rather than starting a row of its own.
+		expect(Math.abs(terms!.y - labelBox!.y)).toBeLessThan(lineHeight / 2);
+		expect(terms!.x).toBeGreaterThan(labelBox!.x + 10);
+		// Privacy is on that line too, or the next one where the sentence wraps
+		// at a narrow width — stacked, it was the fourth row down.
+		expect(privacy!.y - labelBox!.y).toBeLessThan(lineHeight * 1.5);
+	});
+
+	test('a refused TICKED box (the documents changed since load) says so beside it, with a reload', async ({
+		page
+	}) => {
+		// The versions sent are built into the bundle; a tab opened before a
+		// deploy that bumped them is refused however often the box is ticked.
+		const { submissions } = await stubCaptcha(page, {
+			start: () => ({
+				status: 422,
+				json: {
+					detail: {
+						code: 'legal_acceptance_required',
+						message: 'Please accept the current Terms of Service and Privacy Policy to continue.'
+					}
+				}
+			})
+		});
+		await page.goto('/signup');
+		await fillSignupForm(page, FORM);
+		await expect(page.locator('small.hint.ok')).toBeVisible();
+		await captchaEvent(page, 'solve', 't');
+		await page.getByRole('button', { name: 'Send verification email' }).click();
+
+		const message = page.locator('#signup-legal-accept-error');
+		await expect(message).toContainText(
+			'The Terms of Service or Privacy Policy changed since this page loaded.'
+		);
+		await expect(message).toHaveAttribute('role', 'alert');
+		const box = page.locator('#signup-legal-accept');
+		await expect(box).toBeChecked();
+		await expect(box).toBeFocused();
+		await expect(box).toHaveAttribute('aria-describedby', 'signup-legal-accept-error');
+		// Not the top banner asking for a tick that is already there.
+		await expect(page.locator('.error')).toHaveCount(0);
+		expect(submissions).toHaveLength(1);
+
+		// The reload is the way forward: it fetches the current documents.
+		const reloaded = page.waitForEvent('load');
+		await message.getByRole('button', { name: 'Reload page' }).click();
+		await reloaded;
+		await expect(page.locator('#signup-legal-accept')).not.toBeChecked();
+		await expect(page.locator('#signup-legal-accept-error')).toHaveCount(0);
 	});
 });

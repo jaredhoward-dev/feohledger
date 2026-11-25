@@ -1,4 +1,5 @@
 <script lang="ts">
+	import LegalAcceptCheckbox from '#lib/components/auth/LegalAcceptCheckbox.svelte';
 	import { apiErrorMessage } from '#lib/utils/apiError.ts';
 	import { onMount, tick, type Snippet } from 'svelte';
 	import { page } from '$app/state';
@@ -27,16 +28,22 @@
 	 * and error this component derives.
 	 */
 	interface Props {
-		/** Read the token without spending it; resolves to the account email. */
-		check: (token: string) => Promise<{ email: string }>;
-		/** Spend the token, setting the new password. */
-		redeem: (token: string, newPassword: string) => Promise<unknown>;
+		/** Read the token without spending it; resolves to the account email, and
+		 *  whether redeeming must carry acceptance of our Terms / Privacy
+		 *  (an account with no password yet, decisions §495). */
+		check: (token: string) => Promise<{ email: string; legal_acceptance_required?: boolean }>;
+		/** Spend the token, setting the new password. `accepted` is true when the
+		 *  page showed the accept box and it was ticked. */
+		redeem: (token: string, newPassword: string, accepted: boolean) => Promise<unknown>;
 		/** Where "Go to sign in" points once the password is set. */
 		signInHref: (email: string) => string;
 		/** The sentence under a dead link: how to get a new one (omit for none). */
 		expiredHint?: string;
 		/** The way out of a dead link (a link to forgot-password, or nothing). */
 		recovery?: Snippet;
+		/** The documents the accept box names: the Terms and Privacy Policy
+		 *  (employees), or the Privacy Policy alone (suppliers, decisions §499). */
+		legalDocuments?: 'terms_privacy' | 'privacy';
 		/** True once the page knows whether this is an invite (`mode=set`). */
 		setMode?: boolean;
 		idPrefix?: string;
@@ -49,12 +56,24 @@
 		signInHref,
 		expiredHint,
 		recovery,
+		legalDocuments = 'terms_privacy',
 		setMode = $bindable(false),
 		idPrefix = 'reset',
 		chrome
 	}: Props = $props();
 
 	let token = $state('');
+	// The Terms / Privacy accept box: shown only when the check said this link
+	// must carry the acceptance (decisions §495).
+	let legalRequired = $state(false);
+	let legalAccepted = $state(false);
+	let legalError = $state('');
+	// The server refused a ticked box: this tab's bundled versions are stale.
+	let legalVersionsChanged = $state(false);
+	let legalBox: LegalAcceptCheckbox | undefined = $state();
+	let legalRequiredMessage = $derived(
+		m(legalDocuments === 'privacy' ? 'auth.legal.privacyAckRequired' : 'auth.legal.acceptRequired')
+	);
 	// `checking` until the token is read; `invalid` when it is unknown, used or
 	// expired; `ready` shows the form; `done` the confirmation.
 	// `unavailable` when the check itself failed (rate limit, outage) — the
@@ -110,6 +129,7 @@
 		try {
 			const res = await check(token);
 			accountEmail = res.email;
+			legalRequired = res.legal_acceptance_required === true;
 			phase = 'ready';
 		} catch (err) {
 			// Only a 400 means the link itself is dead. A rate limit or an outage
@@ -142,9 +162,14 @@
 		// Marks each bad field beside itself and focuses the first one — the
 		// same rules and messages as /change-password (NewPasswordFields).
 		if (!newFields?.validate()) return;
+		if (legalRequired && !legalAccepted) {
+			legalError = legalRequiredMessage;
+			legalBox?.focus();
+			return;
+		}
 		submitting = true;
 		try {
-			await redeem(token, newPassword);
+			await redeem(token, newPassword, legalRequired && legalAccepted);
 			phase = 'done';
 			// The submit button had focus, and it has just been removed from the
 			// DOM along with the form — which drops focus to <body> and leaves a
@@ -170,6 +195,26 @@
 				// explanation so it is announced (as the success branch does).
 				await tick();
 				invalidEl?.focus();
+			} else if (
+				err instanceof ApiError &&
+				err.status === 422 &&
+				(err.code === 'legal_acceptance_required' ||
+					err.code === 'privacy_acknowledgement_required')
+			) {
+				if (legalRequired && legalAccepted) {
+					// The box was ticked and still refused: the versions in force
+					// changed since the page loaded, and this tab can only ever send
+					// the ones built into it. Re-asking for the tick is a dead end;
+					// say what changed and offer the reload (it keeps the token).
+					legalVersionsChanged = true;
+				} else {
+					// The box was never shown: show it now and say why.
+					legalRequired = true;
+					legalAccepted = false;
+					legalError = apiErrorMessage(err, legalRequiredMessage);
+				}
+				await tick();
+				legalBox?.focus();
 			} else if (err instanceof ApiError && err.status === 422) {
 				newServerError = apiErrorMessage(err, m('auth.resetPassword.submitFailed'));
 				await tick();
@@ -215,6 +260,18 @@
 				bind:confirmPassword
 				bind:serverError={newServerError}
 			/>
+
+			{#if legalRequired}
+				<LegalAcceptCheckbox
+					bind:this={legalBox}
+					id="{idPrefix}-legal-accept"
+					documents={legalDocuments}
+					bind:checked={legalAccepted}
+					error={legalError}
+					versionsChanged={legalVersionsChanged}
+					onchange={() => (legalError = '')}
+				/>
+			{/if}
 
 			<!-- Enabled whatever is typed: a submit says what is wrong, beside
 			     the field (issue #635 #14). -->

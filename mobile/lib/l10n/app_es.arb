@@ -694,6 +694,9 @@
   "settingsAdminWorkflowsHint": "Ver definiciones de flujo y sus pasos",
   "settingsAdaptive": "Flujos adaptativos",
   "settingsAdaptiveHint": "Patrones de aprobación, anomalías, sugerencias",
+  "settingsHelp": "Ayuda",
+  "settingsHelpHint": "Guías para su espacio de trabajo, se abren en el navegador",
+  "settingsHelpUnavailable": "No se pudo abrir el centro de ayuda. Inicie sesión en su espacio de trabajo en la web y abra Ayuda allí.",
   "inspectionsTitle": "Inspecciones de calidad",
   "inspectionsRecord": "Registrar inspección",
   "inspectionsEmpty": "No hay inspecciones de calidad registradas.",
@@ -1148,5 +1151,17 @@
   "listRowVendorCode": "código {code}",
   "listRowVendorSource": "origen {source}",
   "listRowInvoiceCount": "{count, plural, one {{count} factura} other {{count} facturas}}",
-  "listRowInvoiceCountShort": "{count, plural, one {{count} fact.} other {{count} fact.}}"
+  "listRowInvoiceCountShort": "{count, plural, one {{count} fact.} other {{count} fact.}}",
+  "legalAcceptTitle": "Términos y privacidad",
+  "legalAcceptHeading": "Revise nuestros términos actualizados",
+  "legalAcceptIntro": "Para seguir usando FeohLedger, acepte los Términos del servicio y la Política de privacidad vigentes. Cada uno se abre en su navegador.",
+  "legalTermsLink": "Términos del servicio",
+  "legalPrivacyLink": "Política de privacidad",
+  "legalLinkHint": "se abre en su navegador",
+  "legalLinkFailed": "No se pudo abrir la página. Visítela en un navegador.",
+  "legalAcceptCheckbox": "He leído y acepto los Términos del servicio y la Política de privacidad.",
+  "legalAcceptButton": "Aceptar",
+  "legalAcceptSignOut": "Cerrar sesión",
+  "legalAcceptTickRequired": "Marque la casilla para aceptar los Términos del servicio y la Política de privacidad.",
+  "legalAcceptAppOutdated": "Esta versión de la app muestra unos Términos o una Política de privacidad anteriores a los vigentes, por lo que no puede registrar su aceptación. Actualice la app desde su tienda de aplicaciones o acepte en la aplicación web y vuelva a iniciar sesión."
 }

@@ -313,9 +313,175 @@ the lost race; `tests/test_migration_0138_email_lower_unique.py` the migration.
 
 `PATCH /api/auth/me` — self-service endpoint for updating name and password (requires current password).
 
+### Terms and Privacy acceptance
+
+`docs/decisions.md` §495. Accepting the Terms of Service and Privacy Policy is
+recorded per user in the control-plane `legal_acceptances` table (one row per
+document and version; append-only, the first `accepted_at` kept). The versions
+in force live in `backend/app/services/legal_acceptance.CURRENT_LEGAL_VERSIONS`;
+the client echoes back the versions it showed (`accepted_terms_version`,
+`accepted_privacy_version`), and anything but the current ones, absent
+included, is a `422` coded `legal_acceptance_required`.
+
+**Where acceptance is required today — two places only:**
+
+- **Signup.** `POST /api/signup/start` refuses without it and stores the
+  versions and submission time on the verification row; `/complete` records
+  exactly those against the admin it provisions (source `signup`), never the
+  versions current at `/complete`, so a bump in between cannot record a text
+  the visitor never saw.
+- **A first password set.** `POST /api/auth/reset-password` on a set-password
+  link (an account with **no** password: invited, admin-reset,
+  operator-provisioned) must carry the versions. The check runs **before** the
+  token is consumed, so a refusal leaves the link usable once the box is
+  ticked; `POST /api/auth/reset-password/check` returns
+  `legal_acceptance_required` so the page knows to show the box. A
+  forgot-password reset of an account that already has a password is not held
+  up.
+
+Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
+trail (`{versions, source, ip}`).
+
+**The re-prompt: the web app, the mobile app and the supplier portal ask, and the server refuses everything else until they do.**
+`GET /api/auth/me` returns `legal_acceptance_required` (the user has not
+accepted the versions in force) and `POST /api/auth/legal-acceptance` records
+it (source `reprompt`; 10/min per account; audited only on a first
+acceptance). The **web app** reads the flag (decisions §497): while it is true
+the root layout draws `layout/LegalAcceptStep` in place of the app shell — the
+shared `auth/LegalAcceptCheckbox`, *Accept and continue* and *Log out*, focus
+on its heading — so no page behind it mounts or fetches, and the URL is left
+as asked. `auth.acceptLegal()` posts the versions the build carries
+(`lib/legal/acceptance.ts`) and takes the account the endpoint answers with,
+so the page the user was going to renders at once. A 422 on a ticked box (the
+versions changed since the bundle loaded) switches the box to its "documents
+changed — reload" state; a 429 or any other failure is stated in an alert
+above the buttons. It runs after the forced password change, which keeps its
+own route. So on the web every signed-in employee is asked: existing users,
+SSO / SCIM users, anyone after a version bump, a forgot-password reset of a
+password account.
+
+**The server-side gate** (decisions §505). While the flag is true,
+`api/deps.get_current_user` answers every employee request with a **403 coded
+`legal_acceptance_required`**, except the routes the accept step needs
+(`LEGAL_GATE_EXEMPT_ROUTES`, which depend on `get_authenticated_user`
+directly): `GET /api/auth/me`, `POST /api/auth/legal-acceptance` and `POST
+/api/auth/change-password` (the forced change comes first). Logout never
+resolves a user, so it always works; login, MFA, set-password and the SSO /
+SAML callbacks issue tokens and are not gated, so an SSO user signs in and
+then meets the step. The current-acceptance count rides on the resolver's own
+user query, so the gate adds no round trip. The portal twin is
+`get_current_vendor_user` (403 `privacy_acknowledgement_required`; exempt:
+portal `/me`, `/legal-acknowledgement`, `/change-password`). Out of scope:
+`/api/v1` API keys (no person behind a key), SCIM, inbound webhooks and public
+pages. The Slack / Teams approval buttons and the emailed approve link act on a
+single-use action token rather than a JWT, so they never reach that resolver:
+each door asks `email_actions.owes_legal_acceptance` for the reviewer the token
+names, right after the `invoice.approve` check and before the token's
+single-use claim, and refuses in its own style (the email page "Terms
+acceptance required", the chat reply `LEGAL_ACCEPTANCE_MESSAGE`) without
+spending the link or button, which works once the reviewer has accepted.
+A client that meets the 403 mid-session (a version bump while it stayed open)
+answers it with its accept step, not an error: the web's `api.ts` and the
+portal's `portalApi.ts` hand the code to their auth store
+(`api/acceptanceRefusal.ts`), which sets the loaded account's
+`legal_acceptance_required` so the layout draws `LegalAcceptStep`; the mobile
+`ApiClient` hands it to `AuthStore.legalAcceptanceRefused`, which re-reads
+`/me` so `AuthGate` shows `LegalAcceptScreen`. The mobile push-device
+registration, refused at sign-in while the step is owed, is sent again when
+the flag clears (`AuthGate._onAuthChanged`).
+**Existing users with nothing on record are blocked
+until they accept on the web or mobile, and a mobile build older than a
+version bump can only sign out — ship a bump with, or after, an app release
+carrying the new versions.**
+
+**The mobile app asks** (decisions §498). When `/me` says
+`legal_acceptance_required` (after sign-in, on session restore, or on app
+resume: the app re-reads `/me` when it returns to the foreground) the Flutter
+`AuthGate` shows a blocking accept screen instead of the app shell: links to
+the published `/legal/terms` and `/legal/privacy` pages (opened in the
+browser), a required checkbox, Accept and Sign out. It sends the versions in
+`mobile/lib/legal_versions.generated.dart`, which `pnpm gen:legal-versions`
+writes from `CURRENT_LEGAL_VERSIONS` alongside the web module (one
+`check:legal-versions` guards both). An installed build keeps the versions it
+was built with, so after a bump its Accept is refused with the coded 422; the
+screen then tells the user to update the app (or accept on the web) instead of
+asking again.
+
+The seed (`scripts/seed.py`) records acceptance of the versions in force for
+every account it creates (source `seed` — no person ticked a box for a
+fixture), and `tests-e2e`'s `createUserWithKnownPassword` does the same for an
+account a spec creates (`acceptLegal: false` opts out), so neither the demo
+logins nor the e2e suite meet the step. After a version bump, re-run the seed.
+
+The employee rows (control-plane `legal_acceptances`) survive a DSAR erasure
+and a workspace deletion (evidence of the contract; no foreign keys), and the
+DSAR export carries them. They are not anonymous after erasure: the row keeps
+the user id, and the `auth.legal.accepted` audit row keeps `actor_id` and the
+client IP (`backend/docs/privacy.md` § Audit trail). The supplier-portal rows
+are tenant data and follow their own rules, below.
+
+**Supplier-portal users acknowledge the Privacy Policy only** (decisions
+§499). A Supplier User is not a party to our Terms — `/legal/terms` §2 says "a
+Supplier User is not our customer" and §3.4 puts their compliance on the
+customer — so the portal never presents the Terms. `POST
+/api/portal/auth/reset-password` on a set-password link (a portal account with
+no password: invited, or reset by the AP team) must carry
+`accepted_privacy_version`, the version in force; without it the answer is a
+`422` coded `privacy_acknowledgement_required`, checked before the token is
+consumed. `POST /api/portal/auth/reset-password/check` returns
+`legal_acceptance_required` so the page shows the box (the shared
+`LegalAcceptCheckbox` with `documents="privacy"`). The record is the tenant
+table `vendor_user_legal_acceptances` (migration 0144: vendor-user id,
+document, version, time, source), written in the redemption's transaction;
+each one writes `portal.legal.accepted` `{versions, source, ip}` to the
+tenant's auth trail. A forgot-password reset of a portal account that already
+has a password is not held up at the link; it is asked after sign-in instead.
+
+**The portal asks after sign-in too** (decisions §500). `GET
+/api/portal/auth/me` returns `legal_acceptance_required` while the vendor user
+has not acknowledged the Privacy Policy version in force (`services/
+portal_legal_acceptance.missing_documents`): a supplier who set a password
+before §499, or anyone after a version bump. While it is true the portal
+layout draws the same `layout/LegalAcceptStep` as the web app, with
+`documents="privacy"` (Privacy Policy copy and box, the tenant's white-label
+mark), in place of the portal shell, after the forced password change; *Log
+out* is the only other way on. `portalAuth.acknowledgeLegal()` posts the
+version the build carries (`ACKNOWLEDGED_PORTAL_VERSIONS`) to `POST
+/api/portal/auth/legal-acknowledgement`, which records it for the vendor user
+the portal JWT names (source `reprompt`; 10/min per vendor user; tenant DB
+only), audits a first acknowledgement as `portal.legal.accepted`, and answers
+with the profile, so the page the supplier asked for renders. A stale build's
+version is the coded 422 `privacy_acknowledgement_required` (the box offers a
+reload); a 429 is stated in the step's alert. The seed records the
+acknowledgement for every seeded portal user (source `seed`), on the
+already-seeded path too, so the demo supplier and the portal e2e specs do not
+meet the step. The rows
+are kept through a DSAR erasure of the vendor user and carried by its export
+(with the `portal.legal.accepted` audit row and its IP, which the erasure
+leaves in place); a workspace deletion drops them with the tenant database.
+
+Two edges of the set-password acknowledgement, documented rather than
+changed:
+
+- **Its audit row is best-effort, after the commit.** The acknowledgement row
+  is written in the redemption's transaction, but `portal.legal.accepted` is
+  dispatched after `commit()`, through the same helper as
+  `portal.password.changed` (`api/portal_auth._audit_portal_mfa_event`). So,
+  exactly like the password-set row, it is **skipped** for a legacy vendor
+  user with no `organization_id` (there is no tenant to route the row to), and
+  a dispatch failure is swallowed rather than failing a password the supplier
+  was told is set. For such an account the `vendor_user_legal_acceptances` row
+  is the only record.
+- **The unauthenticated check discloses the flag only to a link holder.**
+  `POST /api/portal/auth/reset-password/check` answers
+  `legal_acceptance_required` only for a token that is valid on that tenant;
+  every other token gets the same opaque 400 as the reset itself. So the flag
+  (whether the account has a password yet) reaches only someone holding a live
+  set-password link for that account, which already lets them set it.
+
 ### Protected routes
 
-All endpoints except the explicit allowlist (login flow, OIDC handshake, signup, webhooks, SCIM, health) require a valid Bearer token AND the right role. Authentication and role checks are enforced via FastAPI dependencies in `app/api/deps.py` (`get_current_user`, `require_roles`). See **Role-based access control** below for the full permission matrix.
+All endpoints except the explicit allowlist (login flow, OIDC handshake, signup, webhooks, SCIM, health) require a valid Bearer token AND the right role, and an employee who owes a Terms / Privacy acceptance is refused everywhere but the accept step's routes (above, decisions §505). Authentication and role checks are enforced via FastAPI dependencies in `app/api/deps.py` (`get_current_user`, `require_roles`). See **Role-based access control** below for the full permission matrix.
 
 ## Token Revocation (Blocklist)
 
@@ -522,6 +688,7 @@ Action names:
 | Self-service password change (`POST /auth/change-password`, incl. the forced first-login change; `PATCH /auth/me` with `password`) | `auth.password.changed` — PII-free, records `{via: "change_password" \| "profile", forced: <bool>}`; `forced` is true when it replaced a temporary password — no flow issues one any more (decisions §283), so only an account still holding a pre-§283 temp, or a CLI-provisioned tenant admin, can be forced. Written before the `auth.session.revoked` row the same change's forced logout writes, which is a side effect and not the event |
 | Supplier-portal password change (`POST /portal/auth/change-password`, incl. the forced first sign-in change) | `portal.password.changed` — the portal twin of `auth.password.changed`: PII-free, records `{via: "change_password", forced: <bool>}` (`forced` = it replaced a temp the AP team issued before the set-password links; a link redemption writes `{via: "set_password_link", forced: false}`), identifies the account by `actor_id`/`entity_id`, never by address. Written before the `portal.session.revoked` side-effect row |
 | Forgot-password link requested / redeemed (`POST /auth/forgot-password`, `POST /auth/reset-password`) | `auth.password_reset.requested` (`actor_id` null — the requester is unauthenticated) · `auth.password_reset.completed` (`actor_id` = the account) — both PII-free, recording only `{ip}`; never the token or the new password. `requested` is written only for an existing, active account with a tenant to route to |
+| Terms / Privacy acceptance recorded (signup `/complete`, a set-password redemption that carried it, `POST /auth/legal-acceptance` when something was missing) | `auth.legal.accepted` — `{versions: {terms, privacy}, source: "signup" \| "set_password" \| "reprompt", ip}`; actor and entity are the accepting user. The control-plane `legal_acceptances` row is the record; this is the trail entry (decisions §495) |
 | MFA challenge issued during login | `auth.mfa.challenge_issued` |
 | Successful MFA verify | `auth.mfa.verify.success` |
 | Failed MFA verify | `auth.mfa.verify.failure` |
@@ -530,6 +697,7 @@ Action names:
 | TOTP turned off (`/mfa/disable`) | `auth.mfa.disabled` (employee) · `portal.mfa.disabled` (supplier portal) — PII-free, records `{factor: "totp"}` |
 | Passkey registered (`/mfa/passkey/register/verify`) | `auth.mfa.passkey.registered` — PII-free, records `{factor: "passkey", credential, name, rp_id}`. `credential` is the API-visible passkey id (`webauthn_credentials.id`), never the authenticator's credential handle or its public key |
 | Passkey removed (`DELETE /mfa/passkey/{id}`) | `auth.mfa.passkey.removed` — same shape, so the removal row joins to the registration row on `credential` |
+| Supplier-portal Privacy Policy acknowledged (a set-password redemption that carried it; `POST /portal/auth/legal-acknowledgement` on a first acknowledgement — a repeat writes nothing) | `portal.legal.accepted` — `{versions: {privacy}, source: "set_password" \| "reprompt", ip}`; actor and entity are the vendor user. Best-effort, dispatched after the acknowledgement commits. The tenant `vendor_user_legal_acceptances` row is the record; this is the trail entry (decisions §499, §500). `scripts/seed.py`'s fixture acknowledgements (source `seed`) write the record only, no audit row |
 | Supplier-portal reset link requested (`POST /portal/auth/forgot-password`) | `portal.password_reset.requested` — the portal twin of `auth.password_reset.requested`: `actor_id` null, `{ip}` only, `entity_id` the vendor user; written only for an existing, active account in the requesting tenant. The redemption is the existing `portal.password.changed` `{via: "set_password_link"}` |
 | Failed supplier-portal password login | `portal.login.failure` — records `{ip, reason}` (`bad_password` \| `no_password` \| `inactive`) and identifies the account by `entity_id`, never by address (a supplier contact's email is third-party PII we don't restate on every guess). Queued off the response path, like its employee twin |
 | Successful supplier-portal password login | `portal.login.success` — PII-free, records `{ip, method: "password"}` and identifies the account by `actor_id`/`entity_id`, never by address (same rule as the failure row). **Awaited**, unlike the failure row: the account provably exists by then, so the tenant-DB round trip cannot become the account-existence oracle `queue_auth_audit` avoids. Written on BOTH sign-in paths: the password-only one, and `/portal/auth/mfa/challenge` once a second factor is enrolled (as `password+mfa:{factor}`, beside that stage's own `portal.mfa.verify.success`). One action is therefore the whole population — an earlier version wrote it only on the password path, which made the action a biased sample rather than a gap, silently omitting exactly the best-protected accounts. Mirrors the employee twin, which writes `auth.login.success` alongside `auth.mfa.verify.success` |
@@ -933,8 +1101,10 @@ code or a passkey assertion (minted by `POST /auth/mfa/step-up/passkey` for that
 action's own operation), in every tenant — so the SSO-only case needs no special
 sentence, because the password is a proof here for nobody. Its callers are the
 unmasked-banking DSAR export (`POST /api/privacy/dsar` with `include_banking`,
-operation `dsar_unmasked_export`) and closing a workspace (`POST
-/api/organization/close`, operation `workspace_close`, decisions §306). Four
+operation `dsar_unmasked_export`), closing a workspace (`POST
+/api/organization/close`, operation `workspace_close`, decisions §306) and
+minting or rotating the SCIM token (`POST /api/organization/sso/scim-token`,
+operation `scim_token_mint`, decisions §510). Four
 coded refusals:
 `sensitive_step_up_required` (`403`, no factor proof sent — the SPA's cue to
 collect one and resend; not throttled, not audited as a failure),
@@ -2619,25 +2789,85 @@ The supplier portal has its own TOTP MFA (with an email-OTP backup) for `VendorU
 
 ## Delegation / Out-of-Office
 
-Any user can set a delegate who receives their approval assignments while they are away.
+A user who holds `invoice.approve` can set a delegate who receives their approval assignments while they are away.
 
-- **Set a delegate:** `POST /api/auth/delegation` with `{delegate_to_id, until}` — `until` is an ISO datetime after which delegation automatically expires.
-- **Check status:** `GET /api/auth/delegation` — returns the current delegation (delegate user, expiry) or empty if none is active.
-- **Clear:** `DELETE /api/auth/delegation` — removes the delegation immediately.
+- **Set a delegate:** `POST /api/auth/delegation` with `{delegate_to_id, until}` — `until` is an ISO datetime after which delegation automatically expires. Caller must hold `invoice.approve` (`403` otherwise).
+- **Check status:** `GET /api/auth/delegation` — returns the current delegation (delegate user, expiry) or empty if none is active. Open to every signed-in user.
+- **Clear:** `DELETE /api/auth/delegation` — removes the delegation immediately. Open to every signed-in user, so someone who has since lost `invoice.approve` can still end a stale one.
+- **Who can be named:** `GET /api/auth/delegation/candidates` — the active
+  colleagues in the caller's organization, other than the caller, who hold
+  `invoice.approve` (id and display name only). Gated on `invoice.approve`
+  like the write (`403` otherwise): it is a roster of every approver in the
+  organization. It, `POST` and routing share one eligibility predicate
+  (`services/delegation.is_eligible_delegate`), so the picker never offers
+  someone the write refuses.
 
-When a reviewer is OOO (has an active, non-expired delegation), approval assignments auto-route to their delegate. The audit trail records both the original assignee (`WorkflowStep.original_assigned_to`) and the delegate who actually performed the action.
+**The screen** is **Profile → Out of office** (`/profile?section=delegation`,
+`frontend/src/lib/components/profile/DelegationPanel.svelte`): approvers only.
+The profile rail offers the section, and `?section=delegation` opens it, only
+when `auth.can('invoice.approve')` — `POST` and the candidate list answer 403
+without that permission, and a non-approver opening the link lands on the
+default section. `GET` and `DELETE` stay open, so someone whose grant was
+removed while a delegation was on record still sees it in the panel (if they
+reach it) with only an End button, and the rest reads as approvers-only rather
+than as a load failure. The panel says new invoices go to the delegate when the
+delegate can approve them and otherwise stay with the delegator. There is one
+delegation per person and it starts when saved — the model has an end
+(`delegate_until`) but no start date, so the panel asks only for the last day
+away and the delegation ends at the start of the following day in the reader's
+time zone.
 
-**Delegation is routing, not a privilege grant** — the delegate still needs
-`invoice.approve` to act on what lands in their queue, so delegating to a
-lower-privileged colleague confers nothing.
+When a reviewer is OOO (has an active, non-expired delegation), approval assignments auto-route to their delegate — on every assignment path: the manual `POST /api/invoices/{id}/assign` and smart routing's `POST /api/adaptive/routing-suggestion/apply`, both through `review.assign_reviewer`. The audit trail records both the original assignee (`WorkflowStep.original_assigned_to`, the `invoice.assigned_for_review` row's `delegated_from`) and the delegate who actually performed the action.
 
-What `POST` refuses, and why:
+**Routing re-checks the delegate every time** (decisions §511). The original
+reviewer keeps the assignment, and the audit row carries no `delegated_from`,
+when:
+
+- the delegate fails the eligibility predicate *today* — deactivated, moved out
+  of the organization, or without `invoice.approve` (a role edit, a SCIM push,
+  or a delegation saved before the write checked it); or
+- the delegate could not approve *this* invoice: `review.delegate_refusal` runs
+  the approval endpoint's own gates for them (`review.review_refusals`) —
+  segregation of duties (they uploaded or keyed it, recorded its goods receipt
+  or inspection), the max-amount and CFO gates, a named-approver step or chain
+  level.
+
+A named approver's delegate is accepted at approval time
+(`check_level_approver`) only under the same predicate.
+
+**Delegation is routing, not a privilege grant.** The delegate acts as
+themselves: their own roles, their own approval limits (the step's max-amount
+and CFO gates read the *acting* user's roles, `review._enforce_approval_thresholds`)
+and their own segregation-of-duties set (`approval_chain.check_segregation` is
+checked against the delegate's id — so they still cannot approve an invoice
+they uploaded, keyed, received goods for or inspected). What a delegation adds
+is routing: `review.assign_reviewer` hands the delegator's new assignments to
+the delegate, and `approval_chain.check_level_approver` accepts the active
+delegate of a named approver on a `specific` step or chain level. The delegator
+stays authorized too. Only invoice approval routes this way — exception
+assignment and expense reports do not read the delegation.
+
+A delegate who holds no `invoice.approve` (an ap_clerk) is refused
+(decisions §511): an invoice routed to them would sit with someone who can
+never act on it.
+
+**A delegation does not reach `parallel_mode: "all"` chain levels.** The
+delegate's approval is recorded under the delegate's own id and never satisfies
+the delegator's slot, so an `all` level still waits for the delegator
+(`docs/known-issues.md`; the operator decision is in `docs/followups.md`).
+
+What `POST` refuses, and why (each a coded refusal — `delegation_invalid_id`,
+`delegation_self`, `delegation_until_invalid`, `delegation_until_past`,
+`delegation_delegate_not_found`, `delegation_delegate_cannot_approve` — stated
+in the reader's language by `frontend/src/lib/api/authRefusals.ts`):
 
 | Input | Result |
 |---|---|
 | `delegate_to_id` that isn't a UUID, or an unparseable `until` | `422`. Both used to escape the handler as a bare `ValueError`, i.e. a 500 on ordinary bad input. |
 | `until` already in the past | `422` — it would leave the caller believing they are out of office while `resolve_assignee`'s `delegate_until > now` test never fires. |
-| A **deactivated** delegate | `404` (same opaque answer as unknown / other-org). `review.assign_reviewer` reassigns the invoice unconditionally, so approvals would land on an account that can never sign in and the invoice would sit owned by nobody. |
+| A **deactivated** delegate | `404` (same opaque answer as unknown / other-org). Approvals would land on an account that can never sign in and the invoice would sit owned by nobody; routing re-checks this too, for a delegate deactivated after the save. |
+| A caller without `invoice.approve` | `403` — the write and the candidate list are approver-only. |
+| A delegate without `invoice.approve` | `422` `delegation_delegate_cannot_approve` — the routed invoice would be stranded. |
 | `until` with no timezone | Accepted, interpreted as **UTC**. A naive value handed to the `timestamptz` column is read in the DB *session's* timezone, while every consumer compares against `now(UTC)` — so the same wall-clock string meant a different expiry depending on server config. |
 
 Setting and clearing a delegate each write a PII-free audit row
@@ -2652,7 +2882,9 @@ Automated user lifecycle — IdP pushes create/update/deactivate events to our S
 
 ### Per-tenant bearer auth
 
-Each tenant has its own SCIM bearer token. To generate one, the admin POSTs to `/api/organization/sso/scim-token` (no body). The backend:
+Each tenant has its own SCIM bearer token. An admin manages it from
+**Organization → Trust & compliance → SCIM provisioning** (`/organization?section=scim`,
+`ScimTokenPanel`), which calls the endpoints below. To generate one, the admin POSTs to `/api/organization/sso/scim-token` (no body). The backend:
 
 1. Mints a 43-char URL-safe token.
 2. SHA-256 hashes it.
@@ -2662,9 +2894,29 @@ Each tenant has its own SCIM bearer token. To generate one, the admin POSTs to `
 
 Re-calling the endpoint rotates the token: the old hash is overwritten, so any IdP still using the previous token starts seeing 401s.
 
+**Minting and rotating demand a second-factor step-up** (decisions §510): the
+route calls `require_sensitive_step_up` with operation `scim_token_mint`, the
+same gate as closing the workspace (§306) — a current authenticator code or a
+passkey assertion in the body's `step_up`, never the password. With no proof
+the answer is `403 sensitive_step_up_required` and nothing is minted; the
+`/organization` SCIM panel then opens `ui/StepUpPrompt` and resends. An
+account with no second factor is refused (`sensitive_step_up_no_factor`), not
+exempted. The audit row records which proof verified (`step_up`), and the
+response is `Cache-Control: no-store`. Revoke needs no step-up: it only takes
+access away.
+
+`DELETE /api/organization/sso/scim-token` revokes it: both copies of the
+digest are cleared, so the IdP's next call is a 401. Revoke is admin-only but
+not plan-gated, so a tenant that has dropped to a plan without SCIM can still
+take its token out of circulation; with no token set it is a no-op (decisions
+§510).
+
 Every mint / rotation writes an `organization.scim_token_minted` audit row into
-the tenant trail, carrying the 8-char digest prefix and nothing else — never the
-token or its full digest. This is a tenant-wide user-provisioning credential
+the tenant trail, carrying the 8-char digest prefix, `rotated` (whether a
+live token was replaced) and `step_up` (the proof kind) and nothing else — never the token or its full digest.
+A revoke writes `organization.scim_token_revoked` with the removed digest's
+prefix. Both rows are written **first**: a row that cannot be written is a 503
+with nothing minted or revoked (the `PUT /organization/sso` rule). This is a tenant-wide user-provisioning credential
 (its holder can create, rename and deactivate accounts, and grant roles through
 group mapping), so it is audited like the other credential mints
 (`api_key.created`, `webhook_subscription.created`).

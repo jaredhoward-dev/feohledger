@@ -888,6 +888,9 @@
   "settingsAdminWorkflowsHint": "ワークフロー定義とステップを表示",
   "settingsAdaptive": "適応型ワークフロー",
   "settingsAdaptiveHint": "承認パターン、異常、推奨",
+  "settingsHelp": "ヘルプ",
+  "settingsHelpHint": "ワークスペースのガイドをブラウザで開きます",
+  "settingsHelpUnavailable": "ヘルプセンターを開けませんでした。Web でワークスペースにサインインし、そこからヘルプを開いてください。",
   "inspectionsTitle": "品質検査",
   "inspectionsRecord": "検査を登録",
   "inspectionsEmpty": "品質検査は登録されていません。",
@@ -1342,5 +1345,17 @@
   "listRowVendorCode": "コード {code}",
   "listRowVendorSource": "ソース {source}",
   "listRowInvoiceCount": "{count, plural, other {請求書 {count} 件}}",
-  "listRowInvoiceCountShort": "{count, plural, other {{count} 件}}"
+  "listRowInvoiceCountShort": "{count, plural, other {{count} 件}}",
+  "legalAcceptTitle": "利用規約とプライバシー",
+  "legalAcceptHeading": "更新された規約をご確認ください",
+  "legalAcceptIntro": "FeohLedger を引き続きご利用いただくには、現行の利用規約とプライバシーポリシーに同意してください。各文書はブラウザで開きます。",
+  "legalTermsLink": "利用規約",
+  "legalPrivacyLink": "プライバシーポリシー",
+  "legalLinkHint": "ブラウザで開きます",
+  "legalLinkFailed": "ページを開けませんでした。ブラウザで直接開いてください。",
+  "legalAcceptCheckbox": "利用規約とプライバシーポリシーを読み、同意します。",
+  "legalAcceptButton": "同意する",
+  "legalAcceptSignOut": "サインアウト",
+  "legalAcceptTickRequired": "利用規約とプライバシーポリシーに同意するには、チェックボックスをオンにしてください。",
+  "legalAcceptAppOutdated": "このバージョンのアプリは現在有効なものより古い利用規約またはプライバシーポリシーを表示しているため、同意を記録できません。アプリストアからアプリを更新するか、Web アプリで同意してから、もう一度サインインしてください。"
 }

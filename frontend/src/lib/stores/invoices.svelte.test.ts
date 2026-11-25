@@ -144,3 +144,29 @@ describe('invoiceStore.loadMore', () => {
 		expect(store.loadMoreErrored).toBe(false);
 	});
 });
+
+describe('invoiceStore.statusCounts', () => {
+	const counts = (n: number) => ({ counts: { new: n, approved: 1 }, total: n + 1 });
+
+	it('drops the old filter\'s tallies when the read for a new filter fails', async () => {
+		const store = await freshStore();
+		get.mockResolvedValueOnce(counts(29));
+		await store.fetchCounts({ search: 'acme' });
+		expect(store.statusCounts).toEqual({ new: 29, approved: 1 });
+
+		get.mockRejectedValueOnce(new Error('offline'));
+		await store.fetchCounts({ search: 'globex' });
+		expect(store.statusCounts).toEqual({});
+	});
+
+	it('keeps them when a re-read of the same population fails', async () => {
+		const store = await freshStore();
+		get.mockResolvedValueOnce(counts(29));
+		await store.fetchCounts({ search: 'acme', status: 'new' });
+
+		get.mockRejectedValueOnce(new Error('offline'));
+		// A status / sort change is the same population: /counts ignores both.
+		await store.fetchCounts({ search: 'acme', status: 'approved', sort: 'amount' });
+		expect(store.statusCounts).toEqual({ new: 29, approved: 1 });
+	});
+});

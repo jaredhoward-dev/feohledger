@@ -22,6 +22,7 @@ const SECTIONS = [
 	['mfa', 'Two-factor authentication'],
 	['passkeys', 'Passkeys'],
 	['sessions', 'Signed-in devices'],
+	['delegation', 'Out of office'],
 	['notifications', 'Notifications'],
 	['language', 'Language'],
 	['appearance', 'Appearance']

@@ -18,6 +18,12 @@ test.describe('/invoices bulk bar (acme admin)', () => {
 
 	test('bulk bar appears after selecting a row', async ({ page }) => {
 		await expect(page.locator('.bulk-bar')).toHaveCount(0);
+		// The bar's live region exists, empty, before the bar does: a region
+		// inserted with its text is often not announced, so the first
+		// selection would be silent (WCAG 4.1.3).
+		const status = page.getByTestId('bulk-bar-status');
+		await expect(status).toHaveAttribute('role', 'status');
+		await expect(status).toHaveText('');
 		// Pick the first row whose checkbox is enabled (i.e. not system-
 		// managed). The seed always has at least one such row.
 		const enabledCheckbox = page
@@ -27,6 +33,7 @@ test.describe('/invoices bulk bar (acme admin)', () => {
 
 		await expect(page.locator('.bulk-bar')).toBeVisible();
 		await expect(page.locator('.bulk-count')).toContainText('1 selected');
+		await expect(status).toHaveText('1 selected');
 	});
 
 	test('Clear deselects everything and hides the bar', async ({ page }) => {
@@ -79,6 +86,30 @@ test.describe('/invoices bulk bar (acme admin)', () => {
 		// selected row's status can transition to per VALID_TRANSITIONS).
 		const optionCount = await dropdown.locator('option').count();
 		expect(optionCount).toBeGreaterThan(0);
+	});
+
+	test('Change Status popover takes focus and closes on Escape, back to its trigger', async ({
+		page
+	}) => {
+		await page
+			.locator('table tbody tr td.checkbox-col input[type="checkbox"]:not([disabled])')
+			.first()
+			.check();
+		const trigger = page.getByRole('button', { name: 'Change Status' });
+		await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+		await trigger.click();
+
+		// Opening moves focus into the popover, onto its picker.
+		const select = page.locator('.bulk-status-dropdown select');
+		await expect(select).toBeFocused();
+		await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+
+		// Escape dismisses it — before, only an outside click did — and focus
+		// returns to the trigger rather than dropping to the page.
+		await page.keyboard.press('Escape');
+		await expect(page.locator('.bulk-status-dropdown')).toHaveCount(0);
+		await expect(trigger).toBeFocused();
+		await expect(trigger).toHaveAttribute('aria-expanded', 'false');
 	});
 });
 

@@ -25,6 +25,12 @@ class User {
   /// Absent from the payload ⇒ empty ⇒ every such control hidden (fail closed).
   final List<String> permissions;
 
+  /// `GET /api/auth/me`'s `legal_acceptance_required`: the user has not
+  /// accepted the Terms / Privacy versions in force (decisions §495). True
+  /// routes the app to the blocking accept screen before the shell (§498).
+  /// Absent from the payload (an older backend) ⇒ false: nothing to accept.
+  final bool legalAcceptanceRequired;
+
   User({
     required this.id,
     required this.email,
@@ -32,6 +38,7 @@ class User {
     required this.organizationId,
     required this.roles,
     this.permissions = const [],
+    this.legalAcceptanceRequired = false,
   });
 
   factory User.fromJson(Map<String, dynamic> json) {
@@ -43,6 +50,7 @@ class User {
       roles: (json['roles'] as List<dynamic>).cast<String>(),
       permissions:
           (json['permissions'] as List<dynamic>?)?.cast<String>() ?? const [],
+      legalAcceptanceRequired: json['legal_acceptance_required'] == true,
     );
   }
 

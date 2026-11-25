@@ -237,6 +237,24 @@ def test_bill_body_posts_against_erp_ids_with_exact_decimal_strings():
     assert '"99999999999999.99"' in text and "e+" not in text.lower()
 
 
+def test_a_record_key_link_posts_by_key_and_a_legacy_number_link_by_id():
+    """A §492 link (``key:61``) references the account by its record key, so a
+    bill still reaches it after a renumbering; a number-keyed link the chart
+    sync has not re-keyed yet posts by number, as before."""
+    lines = [
+        LineItemPayload(
+            line_number=1, total=Decimal("60.10"), gl_account_erp_id="key:62", description="L"
+        ),
+        LineItemPayload(
+            line_number=2, total=Decimal("39.90"), gl_account_erp_id="6100", description="S"
+        ),
+    ]
+    fake = FakeIntacct()
+    _run(fake, lambda: SageIntacctAdapter(CONFIG).post_invoice(_payload(line_items=lines)))
+    body, _ = _create_json(fake)
+    assert [line["glAccount"] for line in body["lines"]] == [{"key": "62"}, {"id": "6100"}]
+
+
 def test_tiny_amount_is_never_exponent_notation():
     fake = FakeIntacct()
     _run(fake, lambda: SageIntacctAdapter(CONFIG).post_invoice(_payload(amount=Decimal("0.00001"))))
@@ -522,6 +540,29 @@ def test_a_refused_create_names_inactive_accounts_by_our_code():
     assert result.refusal_code == "account_inactive"
     assert result.refusal_params == {"accounts": ["Supplies"]}
     assert result.not_posted is True
+
+
+def test_a_refused_create_reads_a_key_linked_account_back_by_key():
+    fake = FakeIntacct()
+    fake.create_status = 422
+    fake.query_rows["accounts-payable/vendor"] = [[_ACTIVE_VENDOR]]
+    fake.query_rows["general-ledger/account"] = [
+        [{"key": "61", "id": "6150", "status": "inactive"}]
+    ]
+    result = _run(
+        fake,
+        lambda: SageIntacctAdapter(CONFIG).post_invoice(
+            _payload(gl_account="Supplies", gl_account_erp_id="key:61")
+        ),
+    )
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["Supplies"]}
+    [account_query] = [
+        json.loads(r.content)
+        for r in fake.of("POST", "/services/core/query")
+        if json.loads(r.content)["object"] == "general-ledger/account"
+    ]
+    assert account_query["filters"] == [{"$eq": {"key": "61"}}]
 
 
 def test_an_unreadable_reference_is_not_read_as_inactive():
@@ -825,19 +866,28 @@ def test_list_gl_accounts_classifies_only_what_intacct_states():
     fake.query_rows["general-ledger/account"] = [
         [
             {
+                "key": "61",
                 "id": "6100",
                 "name": "Supplies",
                 "accountType": "incomeStatement",
                 "normalBalance": "debit",
             },
             {
+                "key": "40",
                 "id": "4000",
                 "name": "Sales",
                 "accountType": "incomeStatement",
                 "normalBalance": "credit",
             },
-            {"id": "1000", "name": "Cash", "accountType": "balanceSheet", "normalBalance": "debit"},
             {
+                "key": "10",
+                "id": "1000",
+                "name": "Cash",
+                "accountType": "balanceSheet",
+                "normalBalance": "debit",
+            },
+            {
+                "key": "30",
                 "id": "3000",
                 "name": "Equity",
                 "accountType": "balanceSheet",
@@ -846,11 +896,11 @@ def test_list_gl_accounts_classifies_only_what_intacct_states():
         ]
     ]
     accounts = _run(fake, lambda: SageIntacctAdapter(CONFIG).list_gl_accounts())
-    assert [(a.erp_account_id, a.account_type) for a in accounts] == [
-        ("6100", "expense"),
-        ("4000", "revenue"),
-        ("1000", "asset"),
-        ("3000", None),
+    assert [(a.code, a.erp_account_id, a.account_type) for a in accounts] == [
+        ("6100", "key:61", "expense"),
+        ("4000", "key:40", "revenue"),
+        ("1000", "key:10", "asset"),
+        ("3000", "key:30", None),
     ]
 
 
@@ -917,12 +967,42 @@ def test_list_gl_accounts_emits_inactive_accounts_inactive():
     fake = FakeIntacct()
     fake.query_rows["general-ledger/account"] = [
         [
-            {"id": "6100", "name": "A", "status": "active"},
-            {"id": "6900", "name": "B", "status": "inactive"},
+            {"key": "61", "id": "6100", "name": "A", "status": "active"},
+            {"key": "69", "id": "6900", "name": "B", "status": "inactive"},
         ]
     ]
     accounts = _run(fake, SageIntacctAdapter(CONFIG).list_gl_accounts)
-    assert [(a.erp_account_id, a.active) for a in accounts] == [("6100", True), ("6900", False)]
+    assert [(a.erp_account_id, a.active) for a in accounts] == [
+        ("key:61", True),
+        ("key:69", False),
+    ]
+
+
+def test_list_gl_accounts_keys_by_record_key_so_a_renumbering_keeps_the_link():
+    """Decisions §492: the account NUMBER (``id``) is what an accountant
+    renumbers; the record ``key`` is not. Two pulls of one account before and
+    after a renumbering carry the same link id, so the chart sync matches our
+    row by id (rule 1) and reports the new number as ``code_drift`` instead of
+    creating a second row. The key is prefixed so it can never be mistaken
+    for a bare number-keyed link from before §492 (key 61 vs account 61)."""
+    before, after = FakeIntacct(), FakeIntacct()
+    before.query_rows["general-ledger/account"] = [[{"key": "61", "id": "6100", "name": "A"}]]
+    after.query_rows["general-ledger/account"] = [[{"key": "61", "id": "6150", "name": "A"}]]
+    [old] = _run(before, SageIntacctAdapter(CONFIG).list_gl_accounts)
+    [new] = _run(after, SageIntacctAdapter(CONFIG).list_gl_accounts)
+    assert (old.code, new.code) == ("6100", "6150")
+    assert old.erp_account_id == new.erp_account_id == "key:61"
+    [query] = after.of("POST", "/services/core/query")
+    assert "key" in json.loads(query.content)["fields"]
+
+
+def test_an_account_without_a_record_key_is_never_keyed_by_its_number():
+    """No key → no id: the sync reports it ``missing_erp_id`` rather than link
+    it by the number a renumbering moves."""
+    fake = FakeIntacct()
+    fake.query_rows["general-ledger/account"] = [[{"id": "6100", "name": "A"}]]
+    [account] = _run(fake, SageIntacctAdapter(CONFIG).list_gl_accounts)
+    assert account.code == "6100" and account.erp_account_id == ""
 
 
 def test_a_po_with_no_total_is_reported_skipped_never_synced_at_zero():

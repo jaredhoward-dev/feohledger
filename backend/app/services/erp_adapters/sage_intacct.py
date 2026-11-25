@@ -78,6 +78,15 @@ vendor and accounts are read back by id, and an inactive one is named
 (``vendor_inactive`` / ``account_inactive``); anything else is
 ``bill_refused``. Intacct's own error text is never read into a message.
 
+**GL accounts are linked by record key, not number** (decisions §492). An
+account's ``id`` is its business number, which Intacct lets an accountant
+change; its ``key`` (``RECORDNO``) never changes. :meth:`list_gl_accounts`
+keys each account ``key:<key>`` (:data:`GL_KEY_PREFIX`), so a renumbered
+account keeps its link and our row (the sync reports the new number as
+``code_drift``), and a bill line references it ``{"key": …}``. A link from
+before §492 holds the bare number: it still posts ``{"id": …}``, and the next
+chart sync re-links it to the key by code, recorded in ``link_changes``.
+
 Idempotency: our ``correlation_id`` rides in the bill's ``referenceNumber``,
 and ``post_invoice`` queries for it before creating anything.
 """
@@ -264,6 +273,28 @@ def map_bill_status(record: dict) -> ErpInvoiceStatus:
 async def _leave_in_place(_key: str) -> VoidOutcome:
     """The ``void_bill`` for a found bill: never touched, reported not voided."""
     return VoidOutcome.NOT_VOIDED
+
+
+#: Marks a GL link that holds an Intacct record ``key`` (decisions §492). A
+#: link written before §492 holds the account NUMBER (``id``) bare; the two
+#: forms must never be mistaken for each other, and both are digit strings
+#: (key ``61`` vs account ``61``), so the key carries this prefix.
+GL_KEY_PREFIX = "key:"
+
+
+def gl_link_id(key: object) -> str:
+    """The ``erp_account_id`` our chart stores for the account with ``key``."""
+    return f"{GL_KEY_PREFIX}{key}"
+
+
+def gl_reference(erp_account_id: str) -> dict[str, str]:
+    """The Intacct reference for a stored GL link: ``{"key": …}`` for a §492
+    link, ``{"id": …}`` for a number-keyed one the next chart sync has not
+    re-keyed yet (it still names the account by its current number)."""
+    erp_account_id = str(erp_account_id)
+    if erp_account_id.startswith(GL_KEY_PREFIX):
+        return {"key": erp_account_id[len(GL_KEY_PREFIX) :]}
+    return {"id": erp_account_id}
 
 
 def _account_codes(payload: InvoicePayload) -> dict[str, str]:
@@ -570,7 +601,7 @@ class SageIntacctAdapter(ErpAdapter):
             "dueDate": payload.due_date.isoformat(),  # type: ignore[union-attr]
             "currency": {"txnCurrency": payload.currency},
             "lines": [
-                {"glAccount": {"id": gl}, "txnAmount": _money(amount), "memo": memo}
+                {"glAccount": gl_reference(gl), "txnAmount": _money(amount), "memo": memo}
                 for gl, amount, memo in lines
             ],
         }
@@ -708,7 +739,7 @@ class SageIntacctAdapter(ErpAdapter):
                 client,
                 GL_ACCOUNT_OBJECT,
                 ["key", "id", "status"],
-                [{"$eq": {"id": account_id}}],
+                [{"$eq": gl_reference(account_id)}],
                 max_pages=1,
                 size=1,
             )
@@ -810,12 +841,17 @@ class SageIntacctAdapter(ErpAdapter):
             account_id = raw.get("id")
             if not account_id:
                 continue
+            key = raw.get("key")
             accounts.append(
                 GLAccountPayload(
                     code=str(account_id),
                     name=str(raw.get("name") or account_id),
                     account_type=_gl_account_type(raw),
-                    erp_account_id=str(account_id),
+                    # The record key, not the number (module docstring): an
+                    # account without one is reported ``missing_erp_id`` by
+                    # the sync rather than keyed by a number a renumbering
+                    # moves.
+                    erp_account_id=gl_link_id(key) if key else "",
                     active=_account_usable(raw),
                 )
             )

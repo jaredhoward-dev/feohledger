@@ -24,8 +24,15 @@ export const messages = {
 	'portal.nav.discounts': 'Descuentos',
 	'portal.nav.company': 'Empresa',
 	'portal.nav.notifications': 'Notificaciones',
+	'portal.nav.help': 'Ayuda',
+
+	// Supplier portal — help (routes/portal/help/, decisions §508)
+	'portal.help.subtitle': 'Guías y respuestas para los proveedores que usan este portal.',
+	'portal.help.guides': 'Guías',
+	'portal.help.glossary': 'Términos',
 	'portal.shell.logOut': 'Cerrar sesión',
 	'portal.shell.footerSupport': 'Soporte',
+	'portal.privacyAck.support': '¿Preguntas? Contacta con soporte',
 	'portal.shell.footerLegal': 'Legal',
 	'portal.shell.footerPlatformLegal': 'Privacidad y términos',
 
@@ -113,6 +120,8 @@ export const messages = {
 	'portal.invoices.fileDownloadFailed': 'Error al descargar',
 	'portal.invoices.tableAria': 'Sus facturas',
 	'portal.invoices.chatLoadFailed': 'No se pudo cargar la conversación.',
+	'portal.invoices.chatNotFound': 'No encontramos esa factura en su cuenta.',
+	'portal.invoices.chatLinkFailed': 'No pudimos abrir esa conversación en este momento.',
 
 	// Pagos del portal (routes/portal/payments/+page.svelte)
 	'portal.payments.title': 'Pagos',

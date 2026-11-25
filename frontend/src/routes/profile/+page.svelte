@@ -11,6 +11,7 @@
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
 	import ThemePicker from '#lib/components/ui/ThemePicker.svelte';
+	import DelegationPanel from '#lib/components/profile/DelegationPanel.svelte';
 	import { SUPPORTED_LOCALES, LOCALE_LABELS, type Locale } from '#lib/i18n/locale.ts';
 	import { currentLocale, setLocale, m } from '#lib/i18n/store.svelte.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
@@ -34,10 +35,10 @@
 	}
 
 	// ── Section navigation ────────────────────────────────────────────────
-	// Eight panels, all genuinely one subject ("my account"), so the rail is
+	// Nine panels, all genuinely one subject ("my account"), so the rail is
 	// FLAT — no group headings, which is what `ui/SettingsRail.svelte` renders
 	// when a group carries no label. `/organization` groups its fifteen because
-	// they are fifteen unrelated concerns; eight coherent ones do not need it.
+	// they are fifteen unrelated concerns; nine coherent ones do not need it.
 	//
 	// The reason to give this page a rail at all is not the section count but
 	// the three reads below: preferences, passkeys and signed-in devices each
@@ -56,22 +57,29 @@
 		{ slug: 'mfa', labelKey: 'profile.mfa.heading' },
 		{ slug: 'passkeys', labelKey: 'profile.passkeys.heading' },
 		{ slug: 'sessions', labelKey: 'profile.sessions.heading' },
+		{ slug: 'delegation', labelKey: 'profile.delegation.heading' },
 		{ slug: 'notifications', labelKey: 'profile.notifications.heading' },
 		{ slug: 'language', labelKey: 'profile.language.heading' },
 		{ slug: 'appearance', labelKey: 'profile.appearance.heading' }
 	];
 
-	const SECTION_SLUGS = new Set(SECTIONS.map((s) => s.slug));
+	// Out of office hands over invoice approvals, so it is an approver's
+	// section only: `/api/auth/delegation*` answer 403 without
+	// `invoice.approve`, and the rail does not offer a panel that would.
+	const visibleSections = $derived(
+		SECTIONS.filter((s) => s.slug !== 'delegation' || auth.can('invoice.approve'))
+	);
 	const DEFAULT_SECTION = 'account';
 
-	// Unknown slug falls back rather than rendering an empty page.
+	// Unknown slug falls back rather than rendering an empty page — and so does
+	// a hidden one reached by URL (`?section=delegation` for a clerk).
 	const section = $derived.by(() => {
 		const slug = page.url.searchParams.get('section');
-		return slug && SECTION_SLUGS.has(slug) ? slug : DEFAULT_SECTION;
+		return slug && visibleSections.some((s) => s.slug === slug) ? slug : DEFAULT_SECTION;
 	});
 
 	const railGroups = $derived([
-		{ items: SECTIONS.map((s) => ({ slug: s.slug, label: m(s.labelKey) })) }
+		{ items: visibleSections.map((s) => ({ slug: s.slug, label: m(s.labelKey) })) }
 	]);
 
 	// Notification preferences
@@ -1090,6 +1098,13 @@
 					{:else}
 						<div class="status disabled">{m('profile.sessions.none')}</div>
 					{/if}
+				</section>
+			{/if}
+
+			{#if section === 'delegation'}
+				<section class="card" aria-labelledby="delegation-heading">
+					<h2 id="delegation-heading">{m('profile.delegation.heading')}</h2>
+					<DelegationPanel />
 				</section>
 			{/if}
 

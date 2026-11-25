@@ -23,9 +23,12 @@ from sqlalchemy import select
 
 from app.models.gl_account import GL_CODE_MAX_LENGTH, GLAccount
 from app.services.erp_adapters.base import GLAccountPayload
+from app.services.erp_adapters.blackbaud_fe_nxt import gl_link_id as fe_nxt_link_id
 from app.services.erp_adapters.dynamics_365_bc import _bc_account_to_payload
 from app.services.erp_adapters.netsuite import _netsuite_account_to_payload
 from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
+from app.services.erp_adapters.sage_intacct import gl_link_id
+from app.services.erp_link_realm import UNNAMED_REALM
 from app.services.erp_record_names import SHORTENED_MARK, fit_name
 from app.services.gl_account_sync import (
     AMBIGUOUS_LEGACY,
@@ -115,6 +118,11 @@ async def _rows(realdb) -> dict[str, GLAccount]:
 
 
 async def _add(realdb, **kwargs) -> uuid.UUID:
+    # These syncs name no company (`_sync` passes no realm), so a link stands
+    # for one an earlier such pull made: stamped UNNAMED_REALM (decisions §496).
+    # A NULL (pre-0115) link is one a no-realm pull leaves alone.
+    if kwargs.get("erp_account_id") is not None:
+        kwargs.setdefault("erp_link_realm", UNNAMED_REALM)
     async with realdb.sessionmaker(TENANT)() as s:
         row = GLAccount(organization_id=realdb.info(TENANT).org_id, **kwargs)
         s.add(row)
@@ -595,3 +603,174 @@ async def test_endpoint_reports_conflicts_by_code_never_as_updated(realdb, qbo_c
         ).scalar_one()
     assert row.details["conflicts"] == body["conflicts"]
     assert row.details["adapter"] == "merge_dev"
+
+
+# ---------------------------------------------------------------------------
+# Sage Intacct links by record key, not account number (decisions §492)
+# ---------------------------------------------------------------------------
+
+_INTACCT_REALM = "intacct:ACMECO"
+
+
+async def _intacct_sync(realdb, accounts):
+    async with realdb.sessionmaker(TENANT)() as s:
+        result = await sync_chart_from_erp(
+            s,
+            organization_id=realdb.info(TENANT).org_id,
+            entity_id=None,
+            accounts=accounts,
+            realm=_INTACCT_REALM,
+        )
+        await s.commit()
+    return result
+
+
+def _intacct(key: str, number: str) -> GLAccountPayload:
+    return GLAccountPayload(code=number, name=f"Account {number}", erp_account_id=gl_link_id(key))
+
+
+async def test_an_intacct_renumbering_updates_the_keyed_row_and_creates_no_duplicate(realdb):
+    """Account 6100 renumbered to 6150 in Intacct: its record key is the same,
+    so our row is matched by id, keeps its code (invoices record it) and
+    reports the drift — no second row for 6150, and bills still post to it."""
+    row_id = await _add(
+        realdb,
+        code="6100",
+        name="Account 6100",
+        erp_account_id="key:61",
+        erp_link_realm=_INTACCT_REALM,
+    )
+    result = await _intacct_sync(realdb, [_intacct("61", "6150")])
+
+    assert (result.created, result.linked) == (0, 0)
+    assert result.code_drift == [{"code": "6100", "erp_code": "6150"}]
+    assert result.link_changes == []
+    chart = await _rows(realdb)
+    assert list(chart) == ["6100"]
+    assert (chart["6100"].id, chart["6100"].erp_account_id) == (row_id, "key:61")
+
+
+async def test_a_number_keyed_intacct_link_is_rekeyed_once_and_recorded(realdb):
+    """A link from before §492 holds the bare number. The first keyed pull
+    re-links the row by code to the account's record key — the same row, no
+    duplicate — and records the move in ``link_changes`` for the audit row; a
+    second pull changes nothing."""
+    row_id = await _add(
+        realdb,
+        code="6100",
+        name="Account 6100",
+        erp_account_id="6100",
+        erp_link_realm=_INTACCT_REALM,
+    )
+    pull = [_intacct("61", "6100"), _intacct("62", "6200")]
+    result = await _intacct_sync(realdb, pull)
+
+    assert (result.created, result.linked, result.conflicts) == (1, 1, [])
+    assert result.link_changes == [{"code": "6100", "from": "6100", "to": "key:61"}]
+    chart = await _rows(realdb)
+    assert sorted(chart) == ["6100", "6200"]
+    assert (chart["6100"].id, chart["6100"].erp_account_id) == (row_id, "key:61")
+    assert chart["6100"].erp_link_realm == _INTACCT_REALM
+
+    again = await _intacct_sync(realdb, pull)
+    assert (again.created, again.linked, again.link_changes) == (0, 0, [])
+
+
+async def test_a_legacy_number_link_is_never_mistaken_for_an_equal_record_key(realdb):
+    """Account number 61 and record key 61 are different accounts here. The
+    prefixed key keeps them apart: the row linked by the NUMBER 61 is re-keyed
+    to the account numbered 61 (key 7), never matched by id to key 61."""
+    await _add(
+        realdb, code="61", name="Account 61", erp_account_id="61", erp_link_realm=_INTACCT_REALM
+    )
+    result = await _intacct_sync(realdb, [_intacct("61", "6100"), _intacct("7", "61")])
+
+    assert result.code_drift == []
+    chart = await _rows(realdb)
+    assert chart["61"].erp_account_id == "key:7"
+    assert chart["6100"].erp_account_id == "key:61"
+
+
+# ---------------------------------------------------------------------------
+# Blackbaud FE NXT links by account_id, not account number (decisions §494)
+# ---------------------------------------------------------------------------
+
+_FE_NXT_REALM = "blackbaud_fe_nxt:p-env-123"
+
+
+async def _fe_nxt_sync(realdb, accounts):
+    async with realdb.sessionmaker(TENANT)() as s:
+        result = await sync_chart_from_erp(
+            s,
+            organization_id=realdb.info(TENANT).org_id,
+            entity_id=None,
+            accounts=accounts,
+            realm=_FE_NXT_REALM,
+        )
+        await s.commit()
+    return result
+
+
+def _fe_nxt(account_id: int, number: str) -> GLAccountPayload:
+    return GLAccountPayload(
+        code=number, name=f"Account {number}", erp_account_id=fe_nxt_link_id(account_id)
+    )
+
+
+async def test_an_fe_nxt_renumbering_updates_the_id_linked_row_and_creates_no_duplicate(realdb):
+    """01-5000-00 renumbered to 01-5050-00 in FE NXT: its account_id is the
+    same, so our row is matched by id, keeps its code and reports the drift —
+    no second row, and the push resolves the id to the new number."""
+    row_id = await _add(
+        realdb,
+        code="01-5000-00",
+        name="Account 01-5000-00",
+        erp_account_id="id:1",
+        erp_link_realm=_FE_NXT_REALM,
+    )
+    result = await _fe_nxt_sync(realdb, [_fe_nxt(1, "01-5050-00")])
+
+    assert (result.created, result.linked) == (0, 0)
+    assert result.code_drift == [{"code": "01-5000-00", "erp_code": "01-5050-00"}]
+    assert result.link_changes == []
+    chart = await _rows(realdb)
+    assert list(chart) == ["01-5000-00"]
+    assert (chart["01-5000-00"].id, chart["01-5000-00"].erp_account_id) == (row_id, "id:1")
+
+
+async def test_a_number_keyed_fe_nxt_link_is_rekeyed_once_and_recorded(realdb):
+    """A link from before §494 holds the bare number. The first id-keyed pull
+    re-links the same row by code and records it in ``link_changes``; a second
+    pull changes nothing."""
+    row_id = await _add(
+        realdb,
+        code="01-5000-00",
+        name="Account 01-5000-00",
+        erp_account_id="01-5000-00",
+        erp_link_realm=_FE_NXT_REALM,
+    )
+    pull = [_fe_nxt(1, "01-5000-00"), _fe_nxt(2, "01-5100-00")]
+    result = await _fe_nxt_sync(realdb, pull)
+
+    assert (result.created, result.linked, result.conflicts) == (1, 1, [])
+    assert result.link_changes == [{"code": "01-5000-00", "from": "01-5000-00", "to": "id:1"}]
+    chart = await _rows(realdb)
+    assert sorted(chart) == ["01-5000-00", "01-5100-00"]
+    assert (chart["01-5000-00"].id, chart["01-5000-00"].erp_account_id) == (row_id, "id:1")
+    assert chart["01-5000-00"].erp_link_realm == _FE_NXT_REALM
+
+    again = await _fe_nxt_sync(realdb, pull)
+    assert (again.created, again.linked, again.link_changes) == (0, 0, [])
+
+
+async def test_a_legacy_fe_nxt_number_is_never_mistaken_for_an_equal_account_id(realdb):
+    """An account numbered 7 and account_id 7 are different accounts here. The
+    prefix keeps them apart: the row linked by the NUMBER 7 is re-keyed to the
+    account numbered 7 (id 40), never matched by id to account_id 7."""
+    await _add(realdb, code="7", name="Account 7", erp_account_id="7", erp_link_realm=_FE_NXT_REALM)
+    result = await _fe_nxt_sync(realdb, [_fe_nxt(7, "01-5000-00"), _fe_nxt(40, "7")])
+
+    assert result.code_drift == []
+    chart = await _rows(realdb)
+    assert chart["7"].erp_account_id == "id:40"
+    assert chart["01-5000-00"].erp_account_id == "id:7"

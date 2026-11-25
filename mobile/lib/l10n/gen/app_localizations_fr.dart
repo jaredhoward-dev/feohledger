@@ -2,7 +2,6 @@
 
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
-
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -2786,6 +2785,17 @@ class AppLocalizationsFr extends AppLocalizations {
       'Schémas d’approbation, anomalies, suggestions';
 
   @override
+  String get settingsHelp => 'Aide';
+
+  @override
+  String get settingsHelpHint =>
+      'Guides pour votre espace de travail, ouverts dans votre navigateur';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'Impossible d’ouvrir le centre d’aide. Connectez-vous à votre espace de travail sur le web et ouvrez-y l’Aide.';
+
+  @override
   String get inspectionsTitle => 'Inspections qualité';
 
   @override
@@ -4636,7 +4646,8 @@ class AppLocalizationsFr extends AppLocalizations {
   @override
   String payRunCreatedPlain(String cfo) {
     String _temp0 = intl.Intl.selectLogic(cfo, {
-      'required': 'Lot de paiement créé. L\'approbation du directeur financier est requise avant l\'exécution.',
+      'required':
+          'Lot de paiement créé. L\'approbation du directeur financier est requise avant l\'exécution.',
       'other': 'Lot de paiement créé.',
     });
     return '$_temp0';
@@ -5064,4 +5075,46 @@ class AppLocalizationsFr extends AppLocalizations {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => 'Conditions et confidentialité';
+
+  @override
+  String get legalAcceptHeading =>
+      'Veuillez consulter nos conditions mises à jour';
+
+  @override
+  String get legalAcceptIntro =>
+      'Pour continuer à utiliser FeohLedger, acceptez les Conditions d’utilisation et la Politique de confidentialité en vigueur. Chacune s’ouvre dans votre navigateur.';
+
+  @override
+  String get legalTermsLink => 'Conditions d’utilisation';
+
+  @override
+  String get legalPrivacyLink => 'Politique de confidentialité';
+
+  @override
+  String get legalLinkHint => 's’ouvre dans votre navigateur';
+
+  @override
+  String get legalLinkFailed =>
+      'Impossible d’ouvrir la page. Consultez-la plutôt dans un navigateur.';
+
+  @override
+  String get legalAcceptCheckbox =>
+      'J’ai lu et j’accepte les Conditions d’utilisation et la Politique de confidentialité.';
+
+  @override
+  String get legalAcceptButton => 'Accepter';
+
+  @override
+  String get legalAcceptSignOut => 'Se déconnecter';
+
+  @override
+  String get legalAcceptTickRequired =>
+      'Cochez la case pour accepter les Conditions d’utilisation et la Politique de confidentialité.';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'Cette version de l’app affiche des Conditions ou une Politique de confidentialité antérieures à celles en vigueur ; elle ne peut donc pas enregistrer votre acceptation. Mettez l’app à jour depuis votre magasin d’applications, ou acceptez dans l’application web, puis reconnectez-vous.';
 }

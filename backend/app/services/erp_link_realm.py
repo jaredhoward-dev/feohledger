@@ -41,6 +41,20 @@ fixtures and it posts nowhere), or an OAuth ERP with no completed consent
 are not filtered under ``None`` — refusing them would only replace the
 ``not_connected`` refusal with a misleading ``vendor_not_linked``.
 
+**A link a no-realm pull makes is stamped** :data:`UNNAMED_REALM` (``"mock"``),
+never left NULL (docs/decisions.md §496), so NULL means only "made before
+migration 0115". The stamp has no ``:``, and every realm
+:func:`connection_realm` returns does, so it can never equal a real company's
+realm: under a named realm such a link is simply another company's (refused at
+the push, re-judged by the strict between-companies evidence at a sync), and it
+is never kept for a return (:func:`names_company`), since it names no company to
+return to. A no-realm pull works only on unlinked rows and its own
+``UNNAMED_REALM`` links; a NULL link is left alone like a named one. Links a
+mock sync made between 0115 and §496 are NULL and cannot be told from pre-0115
+ones, so they are left NULL: nothing records which pull made them. The push
+still trusts them like pre-0115 links (:func:`legacy_links_trusted`); that
+open risk and its proposed fix are in ``docs/followups.md`` (§496).
+
 **Links made before migration 0115 carry no realm (NULL).** The migration
 recorded, per organization, the realm its ERP config named at that moment
 (``settings.erp.legacy_link_realm``). The push trusts a NULL-realm link only
@@ -61,11 +75,18 @@ from app.services.erp_adapters.dispatcher import MOCK_ADAPTER_KEY, resolve_adapt
 
 __all__ = [
     "LEGACY_REALM_KEY",
+    "UNNAMED_REALM",
     "connection_realm",
     "legacy_links_trusted",
     "link_is_live",
+    "link_stamp",
     "live_link_clause",
+    "names_company",
 ]
+
+#: The ``erp_link_realm`` of a link made by a pull that names no company
+#: (``connection_realm`` None). No ``:``, so no real realm can equal it.
+UNNAMED_REALM = "mock"
 
 #: Adapters connected through OAuth: the consent's provider company id.
 _OAUTH_ADAPTERS = frozenset({"quickbooks_online", "xero", "sage_accounting", "blackbaud_fe_nxt"})
@@ -128,6 +149,20 @@ def connection_realm(erp_config: Any) -> str | None:
     # Stored whole (the columns are `text`): a shortened form would either
     # merge two companies' realms or need a digest of configuration values.
     return f"{key}:{identity}"
+
+
+def link_stamp(realm: str | None) -> str:
+    """The ``erp_link_realm`` a link made under connection ``realm`` is stamped
+    with: the realm itself, or :data:`UNNAMED_REALM` when it names no company.
+    Never NULL, which is reserved for pre-0115 links."""
+    return UNNAMED_REALM if realm is None else realm
+
+
+def names_company(link_realm: str | None) -> bool:
+    """Does a link stamped ``link_realm`` name an ERP company — one it can be
+    kept for and restored to? Not a pre-0115 link (NULL), not a no-realm pull's
+    (:data:`UNNAMED_REALM`)."""
+    return link_realm is not None and link_realm != UNNAMED_REALM
 
 
 def legacy_links_trusted(erp_config: Any, realm: str | None) -> bool:

@@ -176,7 +176,11 @@ The CSV importers share the scope rather than restating it:
 builds on, and `services/csv_import` applies it to its by-code and by-name
 lookups (no status filter there — an import has always resolved to an existing
 `inactive` / `rejected` record rather than minting a fresh stub beside it).
-See `csv-import.md` § Vendors resolve within the import's entity.
+See `csv-import.md` § Vendors resolve within the import's entity. By code, they
+never use the entity precedence: a code that two vendors in scope claim (as
+`code`, which also carries the ERP's vendor number the sync writes, or as
+`erp_vendor_id`) is refused, not resolved — `csv-import.md` § A vendor code
+must name one vendor, decisions §491.
 
 `match_and_link_vendor` derives the entity from `invoice.entity_id`, so no
 caller passes it explicitly — including an inter-company **mirror** payable,
@@ -315,7 +319,9 @@ place) and offers the search again once that company's link is cleared.
   them by the normal rules, and a sync that does not list it leaves the link
   alone (a same-company link is never re-judged).
 - **Audited** as `vendor.erp_linked`, `details` `{realm, erp_vendor_id,
-  erp_name, tax_id_matches, kept?}`.
+  erp_name, tax_id_matches, kept?, replaced?}`. `replaced` names the row link
+  the new one overwrote (`{realm, erp_vendor_id}`) whether or not it was kept:
+  a no-realm (`"mock"`) link is kept nowhere (§496), so this is its only trace.
 
 ### Unlinking a vendor from one ERP company
 

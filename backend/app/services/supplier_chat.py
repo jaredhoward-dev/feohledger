@@ -208,6 +208,23 @@ async def notify_ap_mentions(
     )
 
 
+#: The query parameter the supplier portal's invoice list reads to open one
+#: invoice's conversation (``frontend/src/routes/portal/invoices/+page.svelte``,
+#: ``CHAT_LINK_PARAM``). ``tests/test_supplier_chat.py`` pins the two together.
+PORTAL_CHAT_PARAM = "chat"
+
+
+def portal_chat_path(invoice_id: uuid.UUID) -> str:
+    """The portal page that opens ``invoice_id``'s conversation.
+
+    A query on the real invoice list, not a path of its own: the conversation
+    is an inline panel on ``/portal/invoices``, and the portal is a static app
+    with no page at ``/portal/invoices/<id>/chat`` (the link that used to be
+    sent here 404ed). Signed out, the portal's auth wall carries it through
+    sign-in as ``?next=``."""
+    return f"/portal/invoices?{PORTAL_CHAT_PARAM}={invoice_id}"
+
+
 async def notify_supplier_of_ap_message(
     db: AsyncSession,
     *,
@@ -231,7 +248,7 @@ async def notify_supplier_of_ap_message(
     base = tenant_base_url(org.slug, org.settings)
     if not base:
         return
-    link = f"{base}/portal/invoices/{invoice.id}/chat"
+    link = f"{base}{portal_chat_path(invoice.id)}"
 
     inv_ref = invoice.invoice_number or str(invoice.id)
     org_name = (org.settings or {}).get("company", {}).get("name") or org.name

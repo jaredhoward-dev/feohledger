@@ -26,6 +26,7 @@ from app.api.deps import (
     ROLE_CFO,
     get_current_user,
     get_org_id,
+    holds_any_role,
     require_roles,
 )
 from app.api.file_proxy import serve_owned_file
@@ -35,6 +36,7 @@ from app.api.pagination import (
     PaginationParams,
     pagination_params,
 )
+from app.api.refusals import role_not_permitted
 from app.api.sorting import SortParams, resolve_order_by, sort_params
 from app.models.contract import (
     Contract,
@@ -45,6 +47,7 @@ from app.models.procurement import POLineItem, PurchaseOrder, po_currency_code
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.schemas.contract import (
+    ContractActions,
     ContractBulkExportRequest,
     ContractBulkStatusRequest,
     ContractBulkStatusResponse,
@@ -59,6 +62,14 @@ from app.schemas.contract import (
 )
 from app.schemas.money import json_money
 from app.services.audit_dispatch import dispatch_audit
+from app.services.contract_controls import (
+    TRANSITION_TARGET,
+    ContractTransition,
+    contract_create_po_refusal,
+    contract_delete_refusal,
+    contract_renew_refusal,
+    contract_transition_refusal,
+)
 from app.services.contract_spend import compute_spend_summary
 from app.services.report_export import csv_safe_cell
 from app.services.storage import upload_contract_file
@@ -69,6 +80,7 @@ from app.tenant import (
     get_entity_id,
     get_tenant_db,
 )
+from app.utils.http import detail_text
 from app.utils.search import ilike_contains
 
 router = APIRouter(prefix="/contracts", tags=["contracts"])
@@ -94,8 +106,44 @@ _UPDATABLE_FIELDS = (
 )
 
 
+#: Who may change a contract: create, edit, upload, every lifecycle action,
+#: create a PO, delete. The read endpoints also admit ap_clerk and cfo.
+CONTRACT_MANAGE_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
+
+
+def contract_action_refusals(contract: Contract, user: User) -> ContractActions:
+    """What activate, terminate, cancel, renew, create-PO and delete would
+    answer ``user`` for this contract — each a coded refusal or ``None``
+    (decisions §507). Each is the endpoint's role predicate
+    (``holds_any_role`` over :data:`CONTRACT_MANAGE_ROLES`, which every one of
+    them requires) followed by the gate it raises from
+    (``services/contract_controls``), so /contracts and ``ContractModal`` read
+    the verdict instead of restating the status lists."""
+
+    def verdict(gate):
+        if not holds_any_role(user, CONTRACT_MANAGE_ROLES):
+            return role_not_permitted()
+        refusal = gate()
+        return refusal.verdict() if refusal is not None else None
+
+    return ContractActions(
+        activate=verdict(lambda: contract_transition_refusal(contract, "activate")),
+        terminate=verdict(lambda: contract_transition_refusal(contract, "terminate")),
+        cancel=verdict(lambda: contract_transition_refusal(contract, "cancel")),
+        renew=verdict(lambda: contract_renew_refusal(contract)),
+        create_po=verdict(lambda: contract_create_po_refusal(contract)),
+        delete=verdict(lambda: contract_delete_refusal(contract)),
+    )
+
+
+def _raise_if(refusal) -> None:
+    if refusal is not None:
+        raise refusal.http()
+
+
 def _to_response(
     contract: Contract,
+    user: User,
     *,
     vendor_name: str | None = None,
     spend: ContractSpendSummary | None = None,
@@ -143,6 +191,7 @@ def _to_response(
         spend=spend,
         created_at=contract.created_at.isoformat() if contract.created_at else "",
         updated_at=contract.updated_at.isoformat() if contract.updated_at else "",
+        actions=contract_action_refusals(contract, user),
     )
 
 
@@ -247,7 +296,7 @@ async def list_contracts(
         .limit(pagination.limit)
     )
     rows = (await db.execute(paged)).all()
-    items = [_to_response(c, vendor_name=name) for c, name in rows]
+    items = [_to_response(c, user, vendor_name=name) for c, name in rows]
     return ContractListResponse(
         items=items, total=total, page=pagination.page, page_size=pagination.page_size
     )
@@ -361,7 +410,7 @@ async def create_contract(
     )
     await db.commit()
     fresh = await _get_contract_or_404(db, contract.id)
-    return _to_response(fresh, vendor_name=vendor.name)
+    return _to_response(fresh, user, vendor_name=vendor.name)
 
 
 @router.get("/file/{file_key:path}")
@@ -394,7 +443,7 @@ async def get_contract(
     contract = await _get_contract_or_404(db, contract_id)
     vendor_name = await _vendor_name(db, contract.vendor_id)
     spend = await compute_spend_summary(db, contract)
-    return _to_response(contract, vendor_name=vendor_name, spend=spend)
+    return _to_response(contract, user, vendor_name=vendor_name, spend=spend)
 
 
 @router.patch("/{contract_id}", response_model=ContractResponse)
@@ -456,7 +505,7 @@ async def update_contract(
     contract = await _get_contract_or_404(db, contract.id)
     vendor_name = await _vendor_name(db, contract.vendor_id)
     spend = await compute_spend_summary(db, contract)
-    return _to_response(contract, vendor_name=vendor_name, spend=spend)
+    return _to_response(contract, user, vendor_name=vendor_name, spend=spend)
 
 
 @router.delete("/{contract_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -471,12 +520,7 @@ async def delete_contract(
     contract = await _get_contract_or_404(db, contract_id)
     # An active contract with recorded spend is part of the audit story —
     # terminate it instead of deleting. Only draft/cancelled contracts delete.
-    if contract.status not in (ContractStatus.draft, ContractStatus.cancelled):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot delete a contract in '{contract.status}' status — "
-            "terminate or cancel it instead",
-        )
+    _raise_if(contract_delete_refusal(contract))
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -522,41 +566,27 @@ async def upload_document(
     await db.commit()
     contract = await _get_contract_or_404(db, contract.id)
     vendor_name = await _vendor_name(db, contract.vendor_id)
-    return _to_response(contract, vendor_name=vendor_name)
+    return _to_response(contract, user, vendor_name=vendor_name)
 
 
 # --------------------------------------------------------------------------
 # Lifecycle transitions
 # --------------------------------------------------------------------------
 
-# Valid status moves. draft→active (sign), active→terminated/expired,
-# draft/active→cancelled. Renew is its own endpoint.
-_LIFECYCLE_TRANSITIONS: dict[str, set[ContractStatus]] = {
-    "activate": {ContractStatus.draft, ContractStatus.expired},
-    "terminate": {ContractStatus.active, ContractStatus.expired},
-    "cancel": {ContractStatus.draft, ContractStatus.active},
-}
-_LIFECYCLE_TARGET = {
-    "activate": ContractStatus.active,
-    "terminate": ContractStatus.terminated,
-    "cancel": ContractStatus.cancelled,
-}
+# The legal status moves live in `services/contract_controls` (the gate the
+# row's `actions` verdict is read from too). Renew is its own endpoint.
 
 
 async def _transition(
-    action: str,
+    action: ContractTransition,
     contract_id: uuid.UUID,
     db: AsyncSession,
     user: User,
     org_id: uuid.UUID,
 ) -> ContractResponse:
     contract = await _get_contract_or_404(db, contract_id)
-    if contract.status not in _LIFECYCLE_TRANSITIONS[action]:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot {action} a contract in '{contract.status}' status",
-        )
-    target = _LIFECYCLE_TARGET[action]
+    _raise_if(contract_transition_refusal(contract, action))
+    target = TRANSITION_TARGET[action]
     contract.status = target
     if target == ContractStatus.active and contract.activated_at is None:
         # Evidence the contract bound the parties; outlives a later cancel.
@@ -575,7 +605,7 @@ async def _transition(
     contract = await _get_contract_or_404(db, contract.id)
     vendor_name = await _vendor_name(db, contract.vendor_id)
     spend = await compute_spend_summary(db, contract)
-    return _to_response(contract, vendor_name=vendor_name, spend=spend)
+    return _to_response(contract, user, vendor_name=vendor_name, spend=spend)
 
 
 @router.post("/{contract_id}/activate", response_model=ContractResponse)
@@ -632,11 +662,7 @@ async def renew_contract(
     """
     await ensure_in_entity_scope(db, Contract, contract_id, entity_id, detail="Contract not found")
     contract = await _get_contract_or_404(db, contract_id)
-    if contract.status in (ContractStatus.terminated, ContractStatus.cancelled):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot renew a contract in '{contract.status}' status",
-        )
+    _raise_if(contract_renew_refusal(contract))
     if contract.end_date and body.end_date <= contract.end_date:
         raise HTTPException(
             status_code=400, detail="Renewal end_date must be after the current end_date"
@@ -647,6 +673,11 @@ async def renew_contract(
     if body.spend_limit is not None:
         contract.spend_limit = body.spend_limit
     contract.status = ContractStatus.active
+    if contract.activated_at is None:
+        # Renewing a draft puts it in force without passing through activate,
+        # so it is stamped here too — otherwise an in-force contract would
+        # carry no evidence of when it bound the parties (migration 0120).
+        contract.activated_at = datetime.now(UTC)
     contract.renewal_alert_sent_at = None
     await dispatch_audit(
         db,
@@ -662,15 +693,15 @@ async def renew_contract(
     contract = await _get_contract_or_404(db, contract.id)
     vendor_name = await _vendor_name(db, contract.vendor_id)
     spend = await compute_spend_summary(db, contract)
-    return _to_response(contract, vendor_name=vendor_name, spend=spend)
+    return _to_response(contract, user, vendor_name=vendor_name, spend=spend)
 
 
 def _bulk_skip_reason(exc: HTTPException, fallback: str) -> str:
     """The human-readable cause a bulk-status skip is reported with.
-    `_transition` raises `HTTPException`
-    with a plain-string `detail` (404 not found / 409 illegal starting
-    status), and that string IS the real cause."""
-    return exc.detail if isinstance(exc.detail, str) else fallback
+    `_transition` raises a plain-string 404 (not found) or the gate's coded
+    409 (illegal starting status, `services/contract_controls`), whose English
+    `message` IS the real cause."""
+    return detail_text(exc.detail) or fallback
 
 
 @router.post("/bulk/status", response_model=ContractBulkStatusResponse)
@@ -679,6 +710,7 @@ async def bulk_contract_status(
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)),
     org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Bulk activate / terminate / cancel over a hand-picked set of
     contracts — the bulk counterpart of the single-row lifecycle endpoints.
@@ -702,6 +734,10 @@ async def bulk_contract_status(
             continue
 
         try:
+            # The single-row endpoints' entity check, per row: a contract
+            # outside the caller's entity selector reads exactly as a missing
+            # one ("Contract not found"), as it does at `POST /{id}/activate`.
+            await ensure_in_entity_scope(db, Contract, cid, entity_id, detail="Contract not found")
             await _transition(body.action, cid, db, user, org_id)
         except HTTPException as exc:
             skipped.append(
@@ -720,13 +756,21 @@ async def bulk_export_contracts(
     body: ContractBulkExportRequest,
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Export a hand-picked set of contracts as CSV. Mirrors
     `api/vendors.py::bulk_export_vendors` / `api/invoices.py::bulk_export`'s
     CSV branch, including the CSV-formula-injection guard (CWE-1236) on
-    every cell."""
-    ids = [uuid.UUID(i) for i in body.ids]
-    result = await db.execute(select(Contract).where(Contract.id.in_(ids)))
+    every cell.
+
+    Scoped to the caller's entity selector, as the list and every single-row
+    read are: an id in another entity is dropped exactly as a nonexistent id
+    is, so the export is no oracle for a sibling subsidiary's ids, and an
+    all-out-of-scope selection is the same 404 as an all-missing one."""
+    query = apply_entity_scope(select(Contract), Contract, entity_id).where(
+        Contract.id.in_(body.ids)
+    )
+    result = await db.execute(query)
     contracts = result.scalars().all()
     if not contracts:
         raise HTTPException(status_code=404, detail="No contracts found")
@@ -785,11 +829,7 @@ async def create_po_from_contract(
     """
     await ensure_in_entity_scope(db, Contract, contract_id, entity_id, detail="Contract not found")
     contract = await _get_contract_or_404(db, contract_id)
-    if contract.status not in (ContractStatus.draft, ContractStatus.active):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot create a PO from a contract in '{contract.status}' status",
-        )
+    _raise_if(contract_create_po_refusal(contract))
 
     line_total = sum((li.total or Decimal(0)) for li in contract.line_items)
     if body.total is not None:

@@ -66,7 +66,7 @@ from app.schemas.signup import (
     SignupStartResponse,
     SlugCheckResponse,
 )
-from app.services import password_reset
+from app.services import legal_acceptance, password_reset
 from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.branding import get_brand_context
 from app.services.email_adapters import (
@@ -246,7 +246,13 @@ async def signup_start(
         window_seconds=3600,
     )
 
-    # 2. Input validation.
+    # 2. Input validation. Acceptance of the Terms and Privacy Policy in force
+    #    comes first: without it nothing else about the request matters, so no
+    #    per-address budget or captcha verification is spent on it.
+    if not legal_acceptance.accepts_current(
+        body.accepted_terms_version, body.accepted_privacy_version
+    ):
+        raise HTTPException(status_code=422, detail=legal_acceptance.acceptance_refusal())
     _validate_email_shape(body.admin_email)
     _validate_admin_name(body.admin_name)
     try:
@@ -306,6 +312,15 @@ async def signup_start(
             "ip": client_ip or "",
             "user_agent": request.headers.get("user-agent", ""),
             "locale": locale,
+            # What was accepted and when. Recorded against the admin user at
+            # /complete, once that user exists (decisions §495).
+            "legal_acceptance": {
+                "versions": {
+                    "terms": body.accepted_terms_version,
+                    "privacy": body.accepted_privacy_version,
+                },
+                "accepted_at": datetime.now(UTC).isoformat(),
+            },
         },
     )
     db.add(verification)
@@ -478,7 +493,20 @@ async def signup_complete(
     #    provision_tenant's own session — this row lives in a different
     #    session but is tracked on db here).
     verification.consumed_at = datetime.now(UTC)
+    accepted_versions = await _record_signup_acceptance(db, verification, provisioned)
     await db.flush()
+    if accepted_versions:
+        await dispatch_auth_audit(
+            organization_id=provisioned.organization_id,
+            actor_id=provisioned.user_id,
+            action="auth.legal.accepted",
+            entity_id=provisioned.user_id,
+            details={
+                "versions": accepted_versions,
+                "source": legal_acceptance.SOURCE_SIGNUP,
+                "ip": (verification.meta or {}).get("ip", ""),
+            },
+        )
 
     # 5. The set-password link: one single-use reset token, the same one the
     #    forgot-password flow mints, redeemed by the same page and endpoint.
@@ -543,6 +571,47 @@ async def signup_complete(
         set_password_url=set_password_url,
         sign_in_url=sign_in_url(verification.slug, email=verification.email),
     )
+
+
+async def _record_signup_acceptance(
+    db: AsyncSession, verification: EmailVerification, provisioned
+) -> dict[str, str]:
+    """Record the Terms / Privacy acceptance given on the signup form against
+    the admin user just provisioned, in the same transaction that consumes the
+    verification (decisions §495).
+
+    A verification created before acceptance was collected carries none; that
+    admin is not credited with an acceptance they never gave; `/me` reports
+    them as `legal_acceptance_required` instead. Returns what was recorded.
+
+    Deliberately the versions `/start` validated and stored, never
+    ``CURRENT_LEGAL_VERSIONS``: after a bump between the two calls, the current
+    version is a text this visitor was never shown, and recording it would be
+    false evidence (decisions §495).
+    """
+    given = (verification.meta or {}).get("legal_acceptance") or {}
+    versions = {
+        doc: ver
+        for doc, ver in (given.get("versions") or {}).items()
+        if doc in legal_acceptance.LEGAL_DOCUMENTS and isinstance(ver, str) and ver
+    }
+    if not versions:
+        return {}
+    accepted_at = None
+    if isinstance(given.get("accepted_at"), str):
+        try:
+            accepted_at = datetime.fromisoformat(given["accepted_at"])
+        except ValueError:
+            accepted_at = None
+    await legal_acceptance.record_acceptances(
+        db,
+        user_id=provisioned.user_id,
+        organization_id=provisioned.organization_id,
+        versions=versions,
+        source=legal_acceptance.SOURCE_SIGNUP,
+        accepted_at=accepted_at,
+    )
+    return versions
 
 
 async def _account_for(db: AsyncSession, address: str) -> User | None:

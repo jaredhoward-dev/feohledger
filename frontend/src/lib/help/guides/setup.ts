@@ -312,7 +312,7 @@ export const SETUP_GUIDES: Guide[] = [
 				blocks: [
 					{
 						type: 'p',
-						text: 'Under {ui:org.rail.payments}, pick the payment provider that moves money when a payment run is executed, and set the CFO sign-off threshold. A [[payment-run]] above that total waits for someone with the CFO role to sign it off and cannot be executed until they do. That is the [[cfo-gate]]. {ui:org.section.cards} turns on virtual cards for invoice payments.'
+						text: 'Under {ui:org.rail.payments}, pick the payment provider that moves money when a payment run is executed, and set the CFO sign-off threshold. A [[payment-run]] above that total waits for someone with the CFO role to sign it off and cannot be executed until they do. That is the [[cfo-gate]]. {ui:org.section.cards} turns on virtual cards for invoice payments. {ui:org.section.matchRules} sets how far an invoice may differ from its purchase order and still match (the [[match-tolerance]]) and whether a [[quality-inspection]] must be recorded first, for the whole organization and per vendor or GL account. A vendor rule comes first, then the invoice’s GL account, then the organization setting, each setting on its own. A rule looser than the organization is marked, and every change is recorded in the audit trail.'
 					}
 				]
 			},
@@ -324,7 +324,10 @@ export const SETUP_GUIDES: Guide[] = [
 						items: [
 							'{ui:org.section.security}: tick {ui:org.security.requireMfa}. People without a second factor are asked to set one up at their next sign-in.',
 							'{ui:orgSso.title}: let people sign in through your identity provider, over OpenID Connect or SAML. Copy the values under {ui:orgSso.register.title} into your provider, limit which email domains may create accounts, and once sign-in works you can tick {ui:orgSso.ssoOnly}. Every change here is recorded in the audit trail.',
+							'{ui:org.section.scim}: let your identity provider create, update and deactivate users for you. Click {ui:org.scim.generate}, then paste the token and the {ui:org.scim.endpointLabel} into your provider’s SCIM connector. The token is shown once: if it is lost, click {ui:org.scim.rotate}, which stops the old one at once. {ui:org.scim.revoke} disconnects the provider. Generating, rotating and revoking are each recorded in the audit trail.',
 							'{ui:org.section.fraud}: switch individual fraud checks on or off and tune their limits, such as round amounts, rush payments, or a large invoice from a brand-new vendor.',
+							'{ui:org.section.lineTotal}: turn on or off the check that an invoice’s line totals add up to its amount. While it is on, an invoice whose lines do not add up gets an [[exception]] that keeps it out of payment runs until someone resolves it. Every change is recorded in the audit trail.',
+							'{ui:org.section.agentAutonomy}: choose whether exception agents may fix an invoice and approve it on their own when they are confident enough. {ui:org.agentAutonomy.conservative} keeps every decision with a person. The higher levels let an agent correct an invoice’s amount, purchase order or GL account and approve it, but only with the roles of the person who ran it, so CFO sign-off and approval limits still apply. Every change of level is recorded in the audit trail.',
 							'{ui:org.section.dataResidency}: record the region where your data must live. This records the requirement and shows whether the deployment already runs there. It does not move any data by itself.'
 						]
 					},

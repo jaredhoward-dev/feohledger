@@ -7,6 +7,7 @@
 	import UnsavedChangesDialog from '#lib/components/ui/UnsavedChangesDialog.svelte';
 	import ConsentBanner from '#lib/components/ConsentBanner.svelte';
 	import AccountLoadState from '#lib/components/layout/AccountLoadState.svelte';
+	import LegalAcceptStep from '#lib/components/layout/LegalAcceptStep.svelte';
 	import { sidebar } from '#lib/stores/sidebar.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { brand } from '#lib/stores/brand.svelte.ts';
@@ -165,6 +166,7 @@
 			auth.loggedIn &&
 			!!auth.user &&
 			!auth.user.must_change_password &&
+			!auth.user.legal_acceptance_required &&
 			!page.url.pathname.startsWith(PORTAL_PREFIX);
 		if (active) {
 			brand.ensureLoadedAndApply();
@@ -180,6 +182,7 @@
 			auth.loggedIn &&
 			!!auth.user &&
 			!auth.user.must_change_password &&
+			!auth.user.legal_acceptance_required &&
 			!page.url.pathname.startsWith(PORTAL_PREFIX);
 		if (active) {
 			notificationStore.startPolling();
@@ -217,6 +220,11 @@
 	<Landing />
 {:else if page.url.pathname.startsWith('/login') || page.url.pathname === '/change-password'}
 	{@render children()}
+{:else if auth.loggedIn && auth.user && !auth.user.must_change_password && auth.user.legal_acceptance_required}
+	<!-- The Terms / Privacy re-prompt (decisions §497): in the shell's place,
+	     so no page behind it mounts or fetches. The URL is untouched, so
+	     accepting renders the page the user asked for. -->
+	<LegalAcceptStep onaccept={() => auth.acceptLegal()} onlogout={() => auth.logout()} />
 {:else if auth.loggedIn && auth.user && !auth.user.must_change_password}
 	<div class="app-shell">
 		<!-- WCAG 2.4.1 Bypass Blocks: first focusable element jumps past the

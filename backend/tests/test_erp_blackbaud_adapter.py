@@ -106,6 +106,9 @@ class FakeSky:
         self.fiscal_headers: dict[str, str] = {}
         # GET /accountspayable/v1/vendors/{id}: the VendorDetail, or 404.
         self.vendor: dict | None = None
+        # GET /generalledger/v1/accounts/{id}: answered from the chart
+        # collection (404 when it holds no such id), or this HTTP status.
+        self.account_http = 200
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -133,6 +136,14 @@ class FakeSky:
             return httpx.Response(
                 200, json={"count": len(self.fiscal_years), "value": self.fiscal_years}
             )
+        if path.startswith("/generalledger/v1/accounts/"):
+            if self.account_http != 200:
+                return httpx.Response(self.account_http, json={})
+            wanted = path.rsplit("/", 1)[1]
+            for row in self.collections.get("/generalledger/v1/accounts", []):
+                if str(row.get("account_id")) == wanted:
+                    return httpx.Response(200, json=row)
+            return httpx.Response(404, json={})
         if path.startswith("/accountspayable/v1/vendors/"):
             if self.vendor is None:
                 return httpx.Response(404, json={})
@@ -358,6 +369,200 @@ def test_per_line_debits_and_a_negative_line_flips_side():
         ("01-5100-00", 20, "Credit"),
         ("01-2000-00", 100, "Credit"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# GL links by account_id, posted by the current number (decisions §494)
+# ---------------------------------------------------------------------------
+
+_CHART = "/generalledger/v1/accounts"
+
+
+def _chart(fake: FakeSky, rows: list[dict], filler: int = 0) -> None:
+    """The GL chart: ``filler`` unrelated accounts first, then ``rows``."""
+    pad = [{"account_id": 1000 + i, "account_number": f"09-{i:04d}-00"} for i in range(filler)]
+    fake.collections[_CHART] = pad + rows
+
+
+def _account_reads(fake: FakeSky) -> list[str]:
+    """The ids read one by one (``GET /generalledger/v1/accounts/{id}``)."""
+    return [
+        r.url.path.rsplit("/", 1)[1]
+        for r in fake.requests
+        if r.method == "GET" and r.url.path.startswith(f"{_CHART}/")
+    ]
+
+
+def test_an_id_link_posts_by_the_accounts_current_number_from_one_read_per_id():
+    """Account 1 was renumbered 01-5000-00 → 01-5050-00 in FE NXT: the link
+    follows the account. A bill linking few ids reads each one once — never a
+    read per line, never the chart listing, wherever the ids sit in it."""
+    fake = FakeSky()
+    _chart(
+        fake,
+        [
+            {"account_id": 1, "account_number": "01-5050-00"},
+            {"account_id": 2, "account_number": "01-5100-00"},
+        ],
+        filler=3000,
+    )
+    lines = [
+        LineItemPayload(line_number=1, total=Decimal("60.00"), gl_account_erp_id="id:1"),
+        LineItemPayload(line_number=2, total=Decimal("30.00"), gl_account_erp_id="id:2"),
+        LineItemPayload(line_number=3, total=Decimal("10.00"), gl_account_erp_id="id:1"),
+    ]
+    assert _post(fake, line_items=lines).success
+    body, _ = _create_json(fake)
+    assert [(d["account_number"], d["type_code"]) for d in body["distributions"]] == [
+        ("01-5050-00", "Debit"),
+        ("01-5100-00", "Debit"),
+        ("01-5050-00", "Debit"),
+        ("01-2000-00", "Credit"),
+    ]
+    assert sorted(_account_reads(fake)) == ["1", "2"]
+    assert fake.of("GET", _CHART) == []
+    assert "id:" not in _create_json(fake)[1]
+
+
+def _many_lines(ids: list[int]) -> list[LineItemPayload]:
+    return [
+        LineItemPayload(line_number=n, total=Decimal("10.00"), gl_account_erp_id=f"id:{i}")
+        for n, i in enumerate(ids, start=1)
+    ]
+
+
+def test_a_bill_linking_more_ids_than_the_per_id_cap_walks_the_chart_once():
+    """Past ``CHART_RESOLVE_PER_ID_MAX`` distinct ids, one walk of the listing,
+    stopping at the page holding the last id it needs, not at the chart's end."""
+    ids = list(range(1, bb.CHART_RESOLVE_PER_ID_MAX + 2))
+    fake = FakeSky()
+    _chart(fake, [{"account_id": i, "account_number": f"01-{i:04d}-00"} for i in ids], filler=150)
+    fake.collections[_CHART] += [
+        {"account_id": 3000 + i, "account_number": f"08-{i:04d}-00"} for i in range(300)
+    ]
+    assert _post(fake, amount=Decimal(10 * len(ids)), line_items=_many_lines(ids)).success
+    body, _ = _create_json(fake)
+    debits = [d["account_number"] for d in body["distributions"] if d["type_code"] == "Debit"]
+    assert debits == [f"01-{i:04d}-00" for i in ids]
+    assert [r.url.params["offset"] for r in fake.of("GET", _CHART)] == ["0", "100"]
+    assert _account_reads(fake) == []
+
+
+@pytest.mark.parametrize("many", [False, True])
+def test_a_linked_id_gone_from_the_chart_refuses_before_the_create(many):
+    """A 404 on the per-id read, or an id the walk never meets."""
+    fake = FakeSky()
+    others = list(range(2, bb.CHART_RESOLVE_PER_ID_MAX + 3)) if many else []
+    _chart(fake, [{"account_id": i, "account_number": f"01-{i:04d}-00"} for i in [2, *others]])
+    lines = _many_lines([1, *others])
+    lines[0].gl_account = "6100"
+    result = _post(fake, gl_account="6100", amount=Decimal(10 * len(lines)), line_items=lines)
+    assert not result.success and not result.retryable
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6100"]}
+    assert result.message == "Blackbaud FE NXT post refused: account_inactive"
+    assert fake.of("POST", "/invoices/process") == []
+    if many:
+        assert _account_reads(fake) == []
+    else:
+        assert _account_reads(fake) == ["1"] and fake.of("GET", _CHART) == []
+
+
+def test_a_linked_account_closed_to_data_entry_refuses_before_the_create():
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 1, "account_number": "01-5000-00", "prevent_data_entry": True}])
+    result = _post(fake, gl_account="6100", gl_account_erp_id="id:1")
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6100"]}
+    assert fake.of("POST", "/invoices/process") == []
+
+
+def test_a_failed_chart_walk_creates_nothing_and_may_retry():
+    ids = list(range(1, bb.CHART_RESOLVE_PER_ID_MAX + 2))
+    fake = FakeSky()
+    _chart(fake, [{"account_id": i, "account_number": f"01-{i:04d}-00"} for i in ids])
+    fake.collection_fail_offset = 0
+    result = _post(fake, amount=Decimal(10 * len(ids)), line_items=_many_lines(ids))
+    assert not result.success and result.retryable
+    assert result.refusal_code is None
+    assert fake.of("POST", "/invoices/process") == []
+
+
+@pytest.mark.parametrize("status", [503, 429])
+def test_a_failed_per_id_read_creates_nothing_and_may_retry(status):
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 1, "account_number": "01-5000-00"}])
+    fake.account_http = status
+    result = _post(fake, gl_account_erp_id="id:1")
+    assert not result.success and result.retryable
+    assert result.refusal_code is None
+    assert fake.of("POST", "/invoices/process") == []
+
+
+def test_an_unreadable_per_id_read_is_a_failure_not_account_inactive():
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 1, "account_number": "01-5000-00"}])
+    real = fake.handler
+
+    def garbled(request):
+        if request.url.path.startswith(f"{_CHART}/"):
+            fake.requests.append(request)
+            return httpx.Response(200, content=b"<html>")
+        return real(request)
+
+    fake.handler = garbled
+    result = _post(fake, gl_account_erp_id="id:1")
+    assert not result.success and result.retryable
+    assert result.refusal_code is None
+    assert fake.of("POST", "/invoices/process") == []
+
+
+def test_a_legacy_number_link_posts_as_is_without_reading_the_chart():
+    """A link from before §494 holds the number; until the next chart sync
+    re-keys it, it posts by that number and costs no chart read."""
+    fake = FakeSky()
+    assert _post(fake, gl_account_erp_id="01-5000-00").success
+    body, _ = _create_json(fake)
+    assert body["distributions"][0]["account_number"] == "01-5000-00"
+    assert fake.of("GET", _CHART) == [] and _account_reads(fake) == []
+
+
+def test_the_push_reserve_counts_the_reads_its_path_can_make(monkeypatch):
+    """No ``id:`` link reserves nothing for the chart; a few reserve one call
+    per distinct id (exactly what the reads cost); many reserve the walk's cap."""
+    asked: list[int] = []
+    real_check = erp_call_budget.CallBudget.check
+
+    async def check(self, *, reserve=1, now=None):
+        asked.append(reserve)
+        return await real_check(self, reserve=reserve, now=now)
+
+    monkeypatch.setattr(erp_call_budget.CallBudget, "check", check)
+    many = list(range(1, bb.CHART_RESOLVE_PER_ID_MAX + 2))
+    fake = FakeSky()
+    _chart(fake, [{"account_id": i, "account_number": f"01-{i:04d}-00"} for i in many])
+    assert _post(fake, gl_account_erp_id="01-0001-00").success
+    lines = [
+        LineItemPayload(line_number=1, total=Decimal("60.00"), gl_account_erp_id="id:1"),
+        LineItemPayload(line_number=2, total=Decimal("30.00"), gl_account_erp_id="id:2"),
+        LineItemPayload(line_number=3, total=Decimal("10.00"), gl_account_erp_id="id:1"),
+    ]
+    assert _post(fake, invoice_number="INV-2", line_items=lines).success
+    two_id_reads = len(_account_reads(fake))
+    assert _post(
+        fake, invoice_number="INV-3", amount=Decimal(10 * len(many)), line_items=_many_lines(many)
+    ).success
+    assert asked == [
+        bb.push_call_reserve(False),
+        bb.push_call_reserve(False, 1, 2),
+        bb.push_call_reserve(False, 1, bb.CHART_RESOLVE_MAX_PAGES),
+    ]
+    assert bb.chart_resolve_calls(0) == 0
+    assert bb.chart_resolve_calls(bb.CHART_RESOLVE_PER_ID_MAX) == bb.CHART_RESOLVE_PER_ID_MAX
+    assert bb.chart_resolve_calls(bb.CHART_RESOLVE_PER_ID_MAX + 1) == bb.CHART_RESOLVE_MAX_PAGES
+    assert bb.CHART_RESOLVE_MAX_PAGES == SYNC_LISTING_MAX_ROWS // 100
+    # The two-id push made exactly the two reads it reserved for.
+    assert two_id_reads == 2
 
 
 def test_configured_project_codes_and_approval_are_sent():
@@ -994,18 +1199,23 @@ def test_inactive_and_on_hold_vendors_are_emitted_inactive():
     ]
 
 
-def test_list_gl_accounts_keys_by_number_and_emits_locked_accounts_inactive():
-    """A locked account still exists: dropping it made a row linked to it look
-    like a dead link, which a sync re-judging links unlinks (§284)."""
+def test_list_gl_accounts_links_by_id_and_emits_locked_accounts_inactive():
+    """Linked by the GL API's ``account_id`` (``id:<id>``, decisions §494),
+    coded by the number. A locked account still exists: dropping it made a
+    row linked to it look like a dead link, which a sync re-judging links
+    unlinks (§284). An account with no id gets no link — never a number
+    fallback that would mix the two forms."""
     fake = FakeSky()
     fake.collections["/generalledger/v1/accounts"] = [
         {"account_id": 1, "account_number": "01-5000-00", "description": "Supplies"},
         {"account_id": 2, "account_number": "01-1000-00", "prevent_data_entry": True},
+        {"account_number": "01-9000-00", "description": "No id"},
     ]
     accounts = _run(fake, lambda: BlackbaudFeNxtAdapter(CONFIG).list_gl_accounts())
     assert [(a.code, a.erp_account_id, a.name, a.account_type, a.active) for a in accounts] == [
-        ("01-5000-00", "01-5000-00", "Supplies", None, True),
-        ("01-1000-00", "01-1000-00", "01-1000-00", None, False),
+        ("01-5000-00", "id:1", "Supplies", None, True),
+        ("01-1000-00", "id:2", "01-1000-00", None, False),
+        ("01-9000-00", "", "No id", None, True),
     ]
 
 

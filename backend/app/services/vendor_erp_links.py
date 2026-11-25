@@ -14,10 +14,13 @@ Two rules keep that safe, and both live here:
   (:func:`vendor_erp_ids`): the row's link when it is live there, else the kept
   link for exactly that realm. A link ERP A set is never handed to ERP B — the
   vendor is unlinked in B and the push refuses it ``vendor_not_linked``.
-* **Only a link with a named realm is kept** (:func:`keep_link`). A NULL-realm
-  link (made before migration 0115, or by a sync with no realm) records nothing
-  about which company issued it; filing it under a guessed company is the
-  manufactured evidence §141 refuses. It is dropped exactly as before.
+* **Only a link with a named realm is kept** (:func:`keep_link`,
+  ``erp_link_realm.names_company``). A NULL-realm link (made before migration
+  0115, or by a sync with no realm before §496) records nothing about which
+  company issued it; filing it under a guessed company is the manufactured
+  evidence §141 refuses. A no-realm pull's ``UNNAMED_REALM`` link names no
+  company either, and no sync ever restores under it. Both are dropped exactly
+  as before.
 
 ``services/vendor_sync`` keeps the row's link before a sync under another
 company moves or drops it, and restores a kept link when a sync runs under that
@@ -38,7 +41,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.vendor import Vendor, VendorErpLink
-from app.services.erp_link_realm import link_is_live
+from app.services.erp_link_realm import link_is_live, names_company
 
 __all__ = ["keep_link", "vendor_erp_ids"]
 
@@ -93,13 +96,14 @@ async def vendor_erp_ids(
 
 async def keep_link(db: AsyncSession, vendor: Vendor) -> bool:
     """Keep ``vendor``'s current row link under its realm, before the caller
-    moves or drops it. Returns whether anything was kept: a NULL-realm link, or
-    no link, keeps nothing (module docstring).
+    moves or drops it. Returns whether anything was kept: a link that names no
+    company (NULL or ``UNNAMED_REALM``), or no link, keeps nothing (module
+    docstring).
 
     One kept link per ``(vendor, realm)``: a later one for the same company
     replaces the earlier, since the row only ever held one at a time.
     """
-    if not vendor.erp_vendor_id or vendor.erp_link_realm is None:
+    if not vendor.erp_vendor_id or not names_company(vendor.erp_link_realm):
         return False
     stmt = pg_insert(VendorErpLink).values(
         id=uuid.uuid4(),

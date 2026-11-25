@@ -24993,3 +24993,1262 @@ Read 2026-11-24 for the pre-merge hardening:
 <https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps>
 (`GET …/environments/{name}` and its deployment-branch-policies need Actions:
 read).
+
+## 491. A CSV vendor code resolves only when one vendor claims it; no ERP-number column (round 36)
+
+CSV import resolved an invoice row's `vendor_code` by `Vendor.code`, with the
+entity's own row winning over an unstamped one. The ERP sync writes its vendor
+number (BC No., NetSuite `entityid`, Intacct `VENDORID`, SYSPRO `Supplier`, FE
+NXT `ui_defined_id`, Sage `reference`) into that same column, so a code a person
+chose for one supplier could equal the number the ERP gave another, and the row
+— the payable — landed on whichever won the order. The same held for a code
+equal to the ERP record id (`erp_vendor_id`) another vendor is linked by: a QBO
+export's vendor id is such a value.
+
+**Decision.** `services/csv_import._vendors_claiming_code` lists the vendors in
+scope that claim a code, as their `code` or their `erp_vendor_id`, and both
+importers act only on exactly one claimant. The invoice importer resolves when
+the one claimant holds the value as its `code`; two claimants, or a value that
+is only some vendor's ERP record id, refuse the row as
+`csv_vendor_code_ambiguous` (`value`), without falling back to the name or
+minting a stub that would add a third holder. The vendor importer dedups on
+either column (the ERP number is in `code`, the record id in
+`erp_vendor_id`), and refuses a row whose code two vendors claim. Every error
+goes toward a refusal naming the fix — give the supplier a distinct code, or
+merge the vendors — never toward a payee chosen by order.
+
+A claimant is a *supplier*, not a row. `vendor_merge.merge_vendors` retires a
+duplicate (`inactive`, `merged_into_vendor_id`) but leaves its `code` in
+place, so a merged-away vendor stands for its survivor: the lookup follows
+`merged_into_vendor_id` to the end of the chain (a visited set and a hop cap
+end a corrupted cycle) and de-duplicates, so A and B-merged-into-A both
+holding `V001` are one claimant, A — following the refusal's own advice
+clears it — and a code only a retired duplicate still holds resolves to the
+vendor it was merged into, never to the retired record. A survivor that
+cannot be reached (missing, another org, a cycle) leaves the duplicate as its
+own claimant, which the invoice importer refuses. "Holds it as its code" is
+true of the survivor when it or any duplicate merged into it holds the value
+as `code`.
+
+**Why no migration, and no separate ERP-number column.** The reverted round-35
+attempt (merge `be1382f8`, its own "§490" never landed; reverted by
+`5910848f`) moved the ERP number into
+a new `erp_vendor_code` column and resolved by `code` alone. Its review found
+three faults, and each came from the move, not from the goal: (1) a code held
+as one vendor's `code` and another's `erp_vendor_code` still resolved to the
+first without a word, because the namespaces were split but resolution looked
+in one; (2) the migration moved codes on sync-created rows, but QuickBooks,
+Xero, NetSuite-without-entityid and FE NXT send no number, so a code on such a
+row may have been typed by a person, and moving it made it a permanent ERP
+number with no audit row; (3) the ERP number disappeared from `/vendors`, the
+vendor modal, mobile and search, which all read `code`. What prevents the wrong
+payee is refusing when a code names two vendors, and that needs to know only
+*that* two vendors claim it, not *who wrote* each claim. With both namespaces
+still in `code` (plus `erp_vendor_id`), one lookup sees every collision, no
+code moves (so no person-typed code is ever reinterpreted and there is no
+evidence question to get wrong), and every display that shows the ERP number
+today keeps showing it.
+
+**Rejected.** *Telling ERP-written from person-typed codes through the audit
+trail and refusing only cross-namespace collisions*: the sync's
+`vendor.synced_from_erp` row arrived well after the sync itself (#384), so
+codes written before it carry no marker, and the evidence is missing exactly
+where the data is oldest; and a collision between two person-typed codes is
+just as much a guess. *Keeping the
+entity precedence for codes*: entity-stamped person vendors and unstamped
+sync-created ones are precisely the pair that collides, so precedence would
+resolve the dangerous case silently. *Refusing a code that only one ERP-linked
+vendor holds*: a file exported from the same ERP carries that number and means
+that vendor; refusing it would break the ordinary case to guard against a
+collision that is not there.
+
+**Accepted for now: a code no vendor claims falls back to the name.** When a
+row's `vendor_code` matches no vendor, the invoice importer resolves by
+`vendor_name`, and that can land the row on a same-named vendor holding a
+*different* code (`Acme Ltd,ACME-2` resolves to the vendor `Acme Ltd` whose
+code is `ACME-1`). That is deliberate for now: a migration from a system whose
+codes differ from ours is the ordinary first import, and refusing every such
+row would refuse the whole file. The risk is two distinct suppliers that share
+a name, where the code was the only thing telling them apart; the row then
+lands on the wrong payee without a word. Whether to refuse when the name
+match's own code is non-null and differs is an open operator decision, not
+settled here.
+
+**Cost.** Two vendors that genuinely are one supplier under two subsidiaries,
+each holding the same code, now refuse code-only rows in an import scoped to
+one of them where the own-entity row used to win. The refusal names the fix,
+and `vendor_name` without a code still resolves by the name precedence. Pinned
+in `backend/tests/test_csv_import.py` (refusal per collision shape, resolution
+of a single claimant, vendor-import refusal and ERP-id dedup, a Postgres
+test that the importers move no code or link, and one that a merged duplicate's
+code resolves to its survivor).
+
+## 492. GL links hold the ERP's record id, not the account number, where the ERP has one (round 36)
+
+**Context.** `docs/followups.md` (c) "Vendor linking has two gaps of its own",
+part (2): Sage Intacct, SYSPRO and Blackbaud FE NXT stored the business
+account NUMBER as `gl_accounts.erp_account_id`. The chart sync matches by that
+id first (`services/gl_account_sync` rule 1, §284), and a number is exactly
+what an accountant renumbers: after a renumbering the old row's link pointed
+at a number the ERP no longer had (dead), and the new number arrived as a new
+account — a second row for the same account, and the old row's invoices
+refused or, if the freed number was reused, posted to the wrong account.
+
+**Decision.**
+
+- **Sage Intacct links by the GLACCOUNT record key** (`RECORDNO`, the `key`
+  the REST query already returns), stored as `key:<key>`
+  (`sage_intacct.GL_KEY_PREFIX`). The prefix is load-bearing: a number-keyed
+  link from before this change and a record key are both digit strings, so
+  without it a row linked to account NUMBER 61 would be matched by rule 1 to
+  whichever account has RECORD KEY 61. A bill line references a key link
+  `{"key": …}`, and the `account_inactive` read-back filters by key; a bare
+  link posts `{"id": …}` as before. An account returned without a key gets no
+  id (the sync reports `missing_erp_id`) rather than a number fallback that
+  would mix the two forms.
+- **Existing links need no migration.** The first keyed pull finds no row
+  with the new id, falls to rule 2 (by code — the row's code IS the old
+  number), sees the row's old link is not a live id, and re-links that same
+  row to the key, recorded in `link_changes` and so in the sync's audit row.
+  Rule 0's realm logic is untouched: the realm is the same company. Until that
+  sync runs, the bare link keeps posting by number. One case cannot be
+  recovered: an account renumbered *before* the first keyed pull leaves its
+  old row on a dead number (exactly as before this change), because nothing
+  records which key the old number belonged to. Its sibling is the *reused*
+  number: 6100 renumbered to 6150 and a new account then created as 6100,
+  both before the first keyed pull. Rule 2 matches the old row by its code
+  (6100) and re-keys it to the NEW account's key. That is no regression — the
+  bare link already posted by number to that same new account — but the row
+  now names a different account than the one its history was coded to. The
+  re-link is recorded in the sync audit row's `link_changes`; an operator
+  should read `link_changes` after the first keyed sync and recode any row
+  re-keyed this way.
+- **SYSPRO keeps `GlCode`.** `GenMaster` has no surrogate key: the ledger
+  code is the primary key, APSTIN distributions take only it, and SYSPRO's GL
+  code change program rewrites the code on every record instead of moving a
+  record. There is no stable id to key by.
+- **Blackbaud FE NXT is not changed here.** Its GL API has a stable
+  `account_id`, but AP distributions accept only `account_number`, so keying
+  by id means resolving id → current number on every post (one more read per
+  distinct account, inside FE NXT's call budget, and a coded refusal when the
+  read fails). That is sized and left as the narrowed followup.
+
+**Rejected.** *A raw key with a sync-side "legacy id" map* (the payload
+naming each account's old number so the sync re-keys by it): the collision
+above makes "this link is a number" undecidable from the value alone. *A
+migration rewriting stored numbers to keys*: a migration cannot call the ERP,
+and the sync already re-links by code with an audit trail. *Re-reading the
+key → number at post time for Intacct*: an extra call per account on every
+push, when Intacct's reference object takes the key directly.
+
+**Unverified.** The bill line's `{"glAccount": {"key": …}}` form is checked
+against the fake ERP only; a sandbox push confirms it (followups entry).
+
+## 493. A vendor-import row whose code is an unrelated vendor's ERP link is a row error, not a quiet skip (round 37)
+
+§491 made the vendor importer dedup a file row against any one vendor claiming
+its `code`, as `Vendor.code` or as `Vendor.erp_vendor_id`. A row whose code
+matched only another-named vendor's ERP record id — `Acme Corp,77` against
+"Seventy Seven", linked by ERP id 77 — was counted in `skipped` with no
+message, so the user never learned Acme Corp was not created, and nothing
+suggested the code was the problem.
+
+**Decision.** `import_vendors_csv` still does not create that row (a new
+vendor would share the existing vendor's ERP identifier, the collision §491
+exists to prevent), but reports it as the coded row error
+`csv_vendor_code_is_erp_link` (`params: {value, name, vendor}`), counted in
+`skipped`, naming the row's supplier, the code and the linked vendor, and
+saying to give the supplier a different code. A true duplicate stays a quiet
+skip: the code held as `Vendor.code` (the existing dedup priority, whatever
+the name), or held only as the ERP record id by a vendor of the same name
+(trimmed, case-insensitive). "Same name" includes a duplicate merged into the
+claimant: `_CodeClaimant.names` carries the survivor's name and every merged
+duplicate's that claimed the code through it, so a row named after a retired
+duplicate is not misreported as unrelated.
+
+**Why an error row, not a separate non-fatal notice.** `ImportResult.errors`
+is already the list of rows that were not imported and why — the near-duplicate
+invoice number (§77) is the precedent: a row neither imported nor silently
+skipped is reported there, coded (§372). This row is not imported and the user
+has to act (change the code), so it is that kind of row. A new `notices` field
+would add a second schema field and a second list in `CsvImportErrors.svelte`
+for one case, while the existing renderer, localization (`codedRefusals.ts`)
+and fallback-to-English already apply unchanged.
+
+**Rejected.** *Falling through to the name lookup and creating the vendor*:
+that mints a second holder of the ERP id, the collision §491 refuses.
+*Reporting every ERP-id match, same name included*: a file exported from the
+ERP the vendor is linked by carries that id and means that vendor (§491's own
+rejected alternative); flagging the ordinary re-import is noise that hides the
+real case. *Comparing names fuzzily* (`vendor_matching`): a near-name would
+silence the notice exactly where the payee question is open; an exact
+case-insensitive match is the only one that says "same supplier" with no guess.
+
+Pinned in `backend/tests/test_csv_import.py` (quiet skip for a same-named ERP
+link and for a code held as `code` under another name; the coded row error for
+an unrelated-named ERP link; the Postgres collision test covers both against
+real rows) and `frontend/src/lib/api/codedRefusals.test.ts`.
+
+## 494. Blackbaud FE NXT GL links hold `account_id`, resolved to the current number at post time (round 37)
+
+**Context.** §492 keyed Sage Intacct's GL links by record key and left FE NXT
+on the account number, narrowing its followup: FE NXT's GL API has a stable
+`account_id`, but AP distributions accept only `account_number`, so a renumbered
+account's row pointed at a number the ERP no longer had (or, if the number was
+reused, at another account), and the next sync created a second row for the
+new number.
+
+**Decision.**
+
+- **`list_gl_accounts` links each account as `id:<account_id>`**
+  (`blackbaud_fe_nxt.GL_ID_PREFIX`), coded by its number. The prefix does what
+  Intacct's `key:` does: a legacy number link and an id are both plain values,
+  and without it a row linked to account NUMBER 7 would be matched by rule 1 to
+  whichever account has id 7. An account with no `account_id` gets no link
+  (`missing_erp_id`), never a number fallback.
+- **The push resolves id → current number once per push, by the cheaper
+  bounded path.** `_resolve_accounts` builds the id → number map once and
+  rewrites every `id:` distribution from it (never a read per line). A push
+  linking at most `CHART_RESOLVE_PER_ID_MAX` (5) distinct ids reads
+  `GET /generalledger/v1/accounts/{account_id}` once per id; a 404 there is an
+  id the chart no longer holds. A push linking more walks
+  `GET /generalledger/v1/accounts` 100 a page, stopping at the page that
+  holds the last id it needs. Either path runs after the idempotency lookup
+  and the period check (an invoice an earlier attempt posted is reported
+  whatever the chart says now) and immediately before the create, so nothing
+  is half-posted.
+- **Why the split, and why 5.** A walk's cost is where the ids sit in the
+  chart, one call per 100 accounts, and nonprofit charts run to thousands
+  (fund × department × natural account): an id near the end of a 4,000-row
+  chart costs 40 calls on a 2,500/day platform-key share, and because the
+  position is unknown up front the walk must reserve its whole cap, which
+  refuses pushes once the day's share runs low. A per-id read costs and
+  reserves exactly one call per id. Most bills code to one to three accounts;
+  at 5 the per-id path never costs more than walking to the 500th account,
+  and past it a bill with many accounts is better served by one walk (on a
+  chart under 100 rows per id it is cheaper, and its cost no longer grows
+  with the line count).
+- **Call budget.** The push reserves what its path can cost
+  (`chart_resolve_calls`): the distinct id count on the per-id path,
+  `CHART_RESOLVE_MAX_PAGES` (the sync's own bound, `sync_listing_pages(100)`,
+  so any account a sync could link can be resolved) on the walk, nothing for a
+  legacy number-only push. Either way the push never runs out of budget
+  part-way (§322).
+- **A linked id the chart no longer holds, or one closed to data entry
+  (`prevent_data_entry`), refuses `account_inactive`** with our GL codes in
+  `params.accounts`, non-retryable, before the create — the existing shared
+  code and message ("inactive or deleted there … recode, then retry"), so no
+  new refusal code or translation. A chart page or account read SKY refuses
+  (other than the per-id 404) is an uncoded failure, retryable for a rate
+  limit or a 5xx, and a 200 whose account cannot be read is an uncoded
+  retryable failure too, never an `account_inactive` verdict.
+- **Existing links need no migration** — exactly §492's route: the first
+  id-keyed pull falls to `services/gl_account_sync` rule 2 by code, finds the
+  row's number link is not a live id, and re-links that same row, recorded in
+  `link_changes`. Until then a bare number link posts by number with no chart
+  read. The two cases §492 names (renumbered, or renumbered and reused, before
+  the first keyed pull) apply unchanged; read `link_changes` after it.
+
+**Rejected.** *Always one walk* (this entry's first form): cheap on a small
+chart but up to 100 calls on a large one, and its 100-call reserve refused
+pushes near the end of a tenant's day. *Always a read per distinct account*:
+a many-line bill would cost one call per account where one page might do.
+*Caching the map across
+pushes*: a renumbering between pushes would post to the old number, the very
+drift this fixes; the fiscal-year cache is safe only because a stale value
+refuses rather than misposts. *Resolving at sync time and storing the number
+beside the id*: still stale by the next push after a renumbering.
+
+**Unverified.** Checked against the fake ERP and mocked SKY responses only;
+the real `ListAccounts` page size, the `account_id` type, and the single
+account read (`GET /generalledger/v1/accounts/{account_id}` answering the same
+`account_id` / `account_number` / `prevent_data_entry` fields as a list row,
+404 for an unknown id) are as the SKY schema documents them.
+
+## 495. Signup and set-password record acceptance of the Terms and Privacy versions in force (round 37)
+
+**Problem.** `/legal/terms` says the Terms are accepted "by clicking an accept"
+control, and the Xero developer terms require users to agree to our own Terms
+and Privacy Policy. Signup showed a sentence beside the button and stored
+nothing, so there was no evidence any customer agreed, nor to which text.
+
+**Decision.**
+
+- **One owner for the versions.** `backend/app/services/legal_acceptance.py`
+  `CURRENT_LEGAL_VERSIONS` (`terms`, `privacy`), each the document's effective
+  date. The frontend reads `lib/legal/legalVersions.generated.ts`, written by
+  `pnpm gen:legal-versions`; `pnpm check:legal-versions` fails CI's Backend
+  lint job on drift (the `gen:pricing` shape, §253). The backend owns it
+  because it is the side that refuses and records; a vitest pins that no
+  version is later than the legal set's `LAST_UPDATED`.
+- **The client echoes the versions it showed; only the versions in force
+  pass.** An absent or stale value is a coded 422 `legal_acceptance_required`,
+  never a default, so a stale tab cannot record acceptance of text it never
+  displayed.
+- **Where.** Signup `/start` refuses without it and stores what was accepted
+  and when on the verification row; `/complete` writes the rows against the
+  admin it provisions, in the transaction that consumes the verification (the
+  user does not exist at `/start`). A set-password link (an account with **no
+  password**: admin-created, admin-reset, operator-provisioned — §283) must
+  carry it, checked before the token is consumed so a refusal leaves the link
+  usable; the check endpoint says whether to show the box. A forgot-password
+  reset of an account that already has a password is not held up — its owner
+  is left to the re-prompt after signing in (not built yet; see below).
+  `GET /api/auth/me` reports `legal_acceptance_required` and
+  `POST /api/auth/legal-acceptance` records it (the re-prompt's backend,
+  rate-limited per account; its screen is a followup).
+- **`/complete` records what `/start` validated, never the current version.**
+  The versions come off the verification row, with the moment the form was
+  submitted as `accepted_at`. If a version is bumped between the two calls the
+  row still names the text the visitor actually saw; writing
+  `CURRENT_LEGAL_VERSIONS` there instead would record acceptance of a text
+  nobody showed them, which is false evidence. A verification carrying no
+  acceptance (created before this) records none.
+- **Enforcement scope today: signup and a first password set only.** Those are
+  the only two places that refuse without acceptance. `legal_acceptance_required`
+  on `/me` is advisory: nothing in the web app or the mobile app reads it yet,
+  and no server-side check refuses an unaccepted user, so existing users, SSO /
+  SCIM users, a forgot-password reset of a password account, mobile and API
+  callers are not yet prompted or gated. The server gate waits for the accept
+  screen on purpose: a gate with no screen to clear it would lock out every
+  mobile, SSO and API user with no way to accept. Order and triggers:
+  `docs/followups.md` (the re-prompt entry); the retention horizon is a
+  separate entry there.
+- **Storage.** Control-plane `legal_acceptances` (migration 0143): user id,
+  organisation id, document, version, `accepted_at`, and the control used
+  (`signup` / `set_password` / `reprompt`). Append-only, unique per (user,
+  document, version), first `accepted_at` kept. No email, name, IP or user
+  agent: the IP is already on the tenant's `auth.legal.accepted` audit row,
+  like every auth event, so the table stays minimal.
+- **Retention: kept, not erased.** A DSAR erasure leaves the rows, and a
+  workspace deletion exempts the table (`CONTROL_TABLES_EXEMPT`). They are
+  the evidence a contract was formed, retained for the establishment or
+  defence of legal claims (GDPR Art. 17(3)(e)), and once the user row is
+  redacted or deleted they identify no one. No horizon is set yet (a CISO /
+  Security Analyst decision, tracked in `docs/followups.md`). The DSAR export
+  carries them (`legal_acceptances`, a counted section).
+- **No backfill.** Nobody accepted anything before this; an invented row
+  would be false evidence. Existing users are reported by `/me`'s flag and
+  meet the re-prompt once its screen exists.
+
+**Rejected.** *Browsewrap* (the sentence beside the button): not an accept
+control, and records nothing. *Versions owned by the frontend*: the backend
+could not refuse a stale value it did not know. *One set-level version*
+(`LAST_UPDATED`): a Cookie Notice edit would re-prompt every user for the
+Terms. *Erasing the rows on DSAR*: removes the only evidence of the contract
+the erased person's employer still holds us to. *Requiring acceptance on every
+password reset*: holds up account recovery for a step the re-prompt covers.
+
+## 496. A no-realm sync stamps its links `"mock"`; NULL means only pre-0115, and existing NULL links are not backfilled (round 37; the existing rows' risk stays open in `docs/followups.md`)
+
+**Context.** §287 made a pull that names no company (`mock`, or an OAuth ERP
+with no consent) leave alone every row tied to a named realm. But it still
+wrote its own links with a NULL realm, which is also what every pre-0115 link
+carries, so a mock sync kept re-judging pre-0115 links against fixtures:
+matching a real company's "57" to fixture "57", renaming it, re-linking by
+code. Worse in the other direction: a NULL link a mock sync made is trusted at
+the push by `legacy_links_trusted` whenever the tenant is back on the company
+0115 snapshotted, so a fixture id could be posted to a real company.
+
+**Decision.** Every link a no-realm pull makes is stamped
+`erp_link_realm.UNNAMED_REALM` (`"mock"`, via `link_stamp(realm)`), in the
+chart sync, the vendor sync and the GL decision confirm. NULL now means only
+"made before migration 0115".
+
+- *No collision.* `connection_realm` always returns `<adapter>:<identity>`
+  (Merge.dev's is `merge_dev:`), so a value with no `:` can never equal a real
+  realm. `mock` itself never gets one (it returns None).
+- *A no-realm pull leaves NULL alone*, as it does a named realm: a GL row's
+  colliding code is `code_taken`; a vendor record whose id a NULL link holds is
+  reported `unverified_link` and neither adopted nor created as a second payee
+  (creating one would duplicate a payee on every tenant whose old mock links are
+  NULL). Named holders keep §287's behaviour.
+- *A named sync treats `"mock"` as another company's link*: refused at the push
+  (it is never `== realm`, and legacy trust is NULL-only), judged by the
+  between-companies evidence (current code; a name or tax id unique in the
+  pull), audited as a realm change. It is never kept for a return
+  (`names_company`): no sync ever restores under `"mock"`, so a kept row would
+  only be a dead record. A merge drops one the canonical's row cannot take.
+- *A named sync's treatment of NULL links is unchanged*: still re-judged with
+  the looser pre-0115 evidence (legacy key) and adopted (`realm_adopted`).
+
+**Existing NULL rows: no backfill.** Links a mock sync made between 0115 and
+now are NULL and look exactly like pre-0115 links. Nothing on the row records
+which pull made it. The org's `legacy_link_realm` snapshot says what was
+connected at 0115, not what made a given link. The sync audit rows record
+individual changes, not every link, and a pre-0115 tenant may have been on a
+real ERP before switching to mock. Any rule would invent provenance (§141).
+So no migration: from now on a no-realm sync leaves those rows alone, and the
+next named sync judges them as pre-0115 links (which is what the push already
+assumes). On a dev database seeded before this change, a mock vendor sync
+reports the seeded links `unverified_link` until it is re-seeded. `scripts/seed.py`
+now stamps its fixture links `"mock"`.
+
+**What this leaves open.** The stamp closes the risk for links made from now
+on, not for those rows. A NULL link a mock sync made after 0115 is still
+trusted by the push through `legacy_links_trusted` whenever the tenant is back
+on the company 0115 snapshotted, so a fixture id (a GL account `"5000"`) can
+still be posted to that real company until the next named sync re-judges the
+row. The behaviour is unchanged here because withdrawing trust is an operator
+call; the proposed fix (drop an org's `legacy_link_realm` snapshot when its
+audit trail shows any no-realm sync after 0115) and its trigger are tracked in
+`docs/followups.md` § Surfaced by reviewing the QuickBooks live-test fixes.
+
+**Rejected.** *Treating `"mock"` links like NULL in a named sync* (loose
+legacy evidence): a fixture id says nothing about a real company, so the strict
+between-companies rule fits. *A NULL-safe sentinel such as the empty string*:
+§489's lock key already uses an empty realm for "no company", and a readable
+value is easier in the vendor ERP-links table. *Backfilling from audit rows*:
+they are history, not a complete record of every link.
+
+
+## 497. The web re-prompt is a full-page step in the shell's place, not a modal (round 38)
+
+**Context.** §495 added `legal_acceptance_required` on `/me` and
+`POST /api/auth/legal-acceptance`, but nothing in the web app read the flag, so
+existing, SSO / SCIM and post-bump users were never asked.
+
+**Decision.** While the flag is true, the root layout draws
+`layout/LegalAcceptStep` **instead of** the app shell, in the branch beside
+`layout/AccountLoadState`: the shared `auth/LegalAcceptCheckbox`, *Accept and
+continue* and *Log out* (the only other way on). `auth.acceptLegal()` posts the
+versions the bundle carries and takes the account the endpoint returns, so the
+flag clears without a second `/me` and the shell renders.
+
+- *Full page over a modal.* A modal over the shell would mount the page behind
+  it, which fires its reads (and, once the server gate of §495 exists, a
+  wall of refusals) before the user has accepted; it would also need its own
+  "cannot be dismissed" exceptions to `ui/Modal`'s Escape and backdrop
+  handling. In the shell's place nothing behind it mounts, and the URL is left
+  untouched, so "continue to where the user was going" needs no `?next=`: the
+  page at that address renders the moment the flag clears. It is the same
+  shape as the account-load panel, so the layout has one pattern for "signed
+  in, but not into the app yet".
+- *No route.* `/change-password` is a route because the forced change predates
+  the layout branch and owns a form other paths link to; the accept step has
+  no address of its own to bookmark or link, and a route would need the
+  redirect-and-return dance `tenantHostRoute` does for the password change.
+- *Order.* The forced password change comes first (its route renders
+  standalone); the step follows on the next app page.
+- *Side effects wait.* The branding load and the notification poll start only
+  once the flag is clear, like the forced change, so no app call runs behind
+  the step.
+- *Seeds.* `scripts/seed.py` records the versions in force for every account it
+  creates, source `seed` (no person ticked anything for a fixture, so the row
+  does not borrow a control's name); the e2e helper that creates accounts
+  mid-run does the same unless a spec opts out. This is not the backfill §495
+  refuses: those are fixture accounts in seeded orgs, not real users.
+
+**Rejected.** *A dismissible banner*: not an accept control and records
+nothing until clicked, the browsewrap §495 rejected. *Checking the flag in
+`tenantHostRoute` and redirecting to `/accept-terms`*: a second navigation to
+race the auth wall, and a route a signed-out visitor could land on.
+**Still open:** mobile, the supplier portal and the server-side gate
+(`docs/followups.md`).
+
+## 498. The Flutter app asks for Terms / Privacy acceptance, with versions generated from the backend (round 38)
+
+**Problem.** §495 added `legal_acceptance_required` on `/me` and `POST
+/api/auth/legal-acceptance`, but the mobile app ignored the flag, so a mobile
+user was never asked, and the server gate (`docs/followups.md`) cannot land
+while a client has no way to accept.
+
+**Decision.**
+
+- **A blocking screen at the root.** `AuthGate` (`mobile/lib/main.dart`)
+  renders `LegalAcceptScreen` instead of `HomeScreen` while the user's `/me`
+  says acceptance is required, so nothing of the app is reachable before it;
+  its only other exit is sign-out. The two documents are links to the
+  published web pages (`AppConfig.termsUrl` / `privacyUrl`, opened in the
+  browser through `ExternalLink`); the app holds no copy of either text. The
+  origin is `https://feohledger.com`, overridable per build with
+  `--dart-define=FEOH_PUBLIC_WEB_URL`.
+- **Asked on resume too.** The gate re-reads `/me` whenever the app returns to
+  the foreground (`AuthStore.refreshProfile`), so a version bump reaches a
+  session left open, and a newly raised requirement pops any pushed route so
+  the screen is not hidden under it. The refresh and the accept share one
+  `SequencedFetch` sequence: a `/me` read that started before the user
+  accepted cannot put the screen back after it.
+- **Versions generated, not copied.** `backend/scripts/gen_legal_versions.py`
+  writes `mobile/lib/legal_versions.generated.dart` beside the web module, and
+  its `--check` (`pnpm check:legal-versions`, CI's Backend lint job) covers
+  both. CI's backend path filter includes the Dart file, so a hand edit to it
+  alone still runs the check.
+- **A 422 means the build is stale.** An installed app keeps the versions it
+  was built with. After a bump its Accept is refused with the coded 422, and
+  sending again would send the same versions forever, so the screen states that
+  the app must be updated (or acceptance given on the web) and withdraws
+  Accept. A 429 or a transport failure is the app's standard error, and Accept
+  stays.
+
+**Rejected.** *Fetching the versions from the server at runtime*: it needs a
+new endpoint, and a client that echoes whatever the server calls current
+defeats §495's refusal, whose point is that a client only records what it
+knowingly shipped. It would spare an outdated build the update message; that
+was judged the smaller cost. *A hand-kept Dart constant*: two copies drift; the generator
+already exists for the web. *Rendering the documents in-app*: a second copy of
+the legal text to keep in sync in six languages, where the published pages are
+the contract.
+
+**Consequence for the server gate.** Once it lands, a mobile build older than a
+version bump can only sign out until updated, so a bump should ship with (or
+after) an app release carrying the new versions.
+
+## 499. Supplier-portal users acknowledge the Privacy Policy, not the Terms, recorded in a tenant table (round 38)
+
+**Problem.** §495 made employee signup and a first password set record
+acceptance of the Terms and Privacy Policy. A supplier-portal user is a tenant
+`VendorUser` with its own auth (`/portal/auth`); their set-password page was
+unchanged, so a supplier was never asked anything, and the control-plane
+`legal_acceptances` row, keyed by an employee `user_id`, cannot name them.
+
+**What the published documents say.** The Terms are "a binding agreement
+between the organisation that subscribes to or uses" the service and us
+(`/legal/terms` §1). §2 defines a Supplier User as "an individual from one of
+the Customer's suppliers or vendors who is given access to the supplier portal
+… A Supplier User is not our customer; access is granted by, and on the
+responsibility of, the Customer", and §3.4 says "The Customer must ensure that
+everyone it gives access complies with these Terms, and is responsible for
+their acts and omissions as if they were its own." §1 also says that "where no
+organisation is named, the individual accepting is the Customer and is
+personally bound". The Privacy Policy's section 3 is addressed to suppliers
+("If you are reading this because a company you invoice uses …, you are
+probably not our customer"), and §2 lists "supplier-portal accounts" among the
+data we hold as the customer's processor.
+
+**Decision.**
+
+- **Suppliers are not asked to accept the Terms.** They are not a party, the
+  customer answers for them, and a supplier "accepting" with no organisation
+  named would, read with §1, purport to make them the Customer. Presenting the
+  Terms would invent a contractual position the documents do not take.
+- **They acknowledge the Privacy Policy.** The box reads "I have read the
+  Privacy Policy" — a notice, not an agreement — and is required on the
+  portal's set-password link for an account with no password (invited, or
+  reset by the AP team), the same front door §495 uses. Its absence is a coded
+  422 `privacy_acknowledgement_required`, checked before the token is consumed
+  so a refusal leaves the link usable; the check endpoint reports
+  `legal_acceptance_required` so the page shows the box. A forgot-password
+  reset of an account that already has a password is not held up, as for
+  employees. The version comes from `CURRENT_LEGAL_VERSIONS["privacy"]`, so
+  there is still one owner of what is in force.
+- **Storage: a tenant table, `vendor_user_legal_acceptances`** (migration
+  0144, fanned out to every tenant; fresh tenants get it from `create_all`):
+  vendor-user id, document, version, `accepted_at`, source. Append-only,
+  unique per (vendor user, document, version), first `accepted_at` kept, no
+  foreign key, no name, email, IP or user agent (the IP is on the tenant's
+  `portal.legal.accepted` audit row). It lives beside the `vendor_users` row
+  it describes: a control-plane row would need a tenant-scoped id the control
+  plane cannot resolve, and the portal's whole auth runs on the tenant DB.
+  `document` stays a column so a future portal-terms document is a new value.
+- **Recorded in the redemption's transaction**, with the password, so no
+  portal account is entered through a link without the record of what it was
+  shown.
+- **Retention follows §495's reasoning where it applies.** A DSAR erasure of
+  the vendor user keeps the rows (once the vendor-user row is redacted they
+  identify no one, and they are the evidence the notice was shown); the
+  vendor-user DSAR export carries them as `legal_acceptances`. A workspace
+  deletion drops them with the tenant database: unlike the employee rows they
+  evidence no contract with us that outlives the customer, and the portal
+  accounts themselves go at offboarding (`docs/ropa.md`). Workspace closure
+  classifies the table under `vendor_users`, whose own guard blocks.
+- **No backfill**, as in §495.
+
+**Left open, honestly.** Whether the portal needs its own terms of use binding
+Supplier Users directly, and whether an acknowledgement kept through erasure
+fits a processor that is not the supplier's controller, are counsel's calls —
+tracked in `docs/followups.md`. Portal users who set a password before this
+are not asked until a portal re-prompt exists (the re-prompt entry there).
+
+**Rejected.** *The employee box (Terms + Privacy) on the portal*: makes a
+non-party "accept" a contract and, by §1, the Customer. *No record at all*:
+the Privacy Policy is written for suppliers and nothing showed it to them.
+*A control-plane row keyed by vendor-user id plus organisation*: the control
+plane would hold ids it cannot resolve or erase against, and the portal's
+auth never touches the control plane. *Reusing the `legal_acceptance_required`
+code*: its message asks for the Terms, which a supplier is not asked for.
+
+## 500. The supplier portal asks for the Privacy Policy acknowledgement after sign-in, with the web step reused (round 39)
+
+**Problem.** §499 asked suppliers to acknowledge the Privacy Policy only when
+they redeem a set-password link, so a portal user who set a password before
+it, or any portal user after a Privacy Policy bump, was never asked; and the
+server-side gate (§495) cannot land while a population has no screen to
+answer it on.
+
+**Decision.**
+
+- **Backend.** `GET /api/portal/auth/me` carries `legal_acceptance_required`
+  (from `portal_legal_acceptance.missing_documents`), and `POST
+  /api/portal/auth/legal-acknowledgement` records the version in force for the
+  vendor user the portal JWT names — the body carries only the version shown,
+  never an id — in the tenant `vendor_user_legal_acceptances`, source
+  `reprompt` (the employee endpoint's value: the same control, a different
+  population). Anything but the version in force is the coded 422
+  `privacy_acknowledgement_required`; 10/min per vendor user, like the
+  employee endpoint; a first acknowledgement is audited
+  `portal.legal.accepted` through the same helper as the set-password path; a
+  repeat writes nothing. That audit row is best-effort and dispatched after the
+  acknowledgement commits (`dispatch_auth_audit` swallows its own failure), as
+  on the set-password path: the acceptance table is the record of consent, and
+  an audit store outage must not refuse a supplier's acknowledgement. It
+  answers with the profile so the client needs no second `/me`.
+- **One profile builder.** Every route that answers with `PortalMeResponse`
+  (`/me`, `PATCH /me`, change-password, MFA verify / disable) goes through
+  `_portal_me_response`. The portal store replaces its copy of the user with
+  whichever of them answered, so a sibling that left the flag at its default
+  would have cleared the step with nothing recorded. The same fix restores
+  the `locale` the two MFA routes were dropping.
+- **Frontend: the web step, extended, not forked.** `layout/LegalAcceptStep`
+  takes `documents="privacy"` (Privacy Policy copy, the box's `privacy` form,
+  `privacy_acknowledgement_required` as the stale-versions code) and an
+  optional `mark` snippet, through which the portal shows the tenant's
+  white-label mark instead of ours (§173). The portal layout draws it in the
+  shell's place, for §497's reasons: nothing behind it mounts or fetches, the
+  URL is kept, and the page renders when the flag clears. The forced password
+  change comes first, as on the web. Its copy keys are `shell.privacyAck.*` in
+  the main catalogue, because a shared component renders them (§300).
+- **Seeds.** `scripts/seed.py` records the acknowledgement for every portal
+  user of each tenant it seeds (source `seed`), on the already-seeded path
+  too, so neither the demo supplier nor any portal e2e spec meets the step.
+
+**Rejected.** *A portal-only component wrapping `LegalAcceptCheckbox`*: a
+second copy of the step's focus, validation and error handling to drift from
+the first. *Gating server-side in the same change*: still blocked on API
+callers (`docs/followups.md`), and the portal step is what makes the portal
+half of it safe.
+
+## 501. /admin/partner's "not a partner" state is the children table's empty row (round 39)
+
+**Context.** /admin/partner was the last sidebar list page outside the
+layout-shift budget. It drew a `LoadingState` block, then swapped in either the
+children table or a separate "not a partner" note once `GET /api/partner`
+answered, so the page moved on every visit, whichever state it settled on.
+
+**Decision.** The children table is mounted from first paint (`fixed`, with
+DataTable's "Loading…" row) and the "not a partner" copy is that table's
+`empty` message when `is_partner` is false. `is_partner` is derived from
+administering at least one child (`backend/app/api/partner.py`), so a
+non-partner and a partner with no children are the same population: the empty
+row is the honest place for it, and it keeps the page still for both the
+standalone tenants that are most visitors and the partners. The column widths
+are sized to the longest locale, the actions column to the armed confirm
+label (fr "Confirmer le détachement"), so arming Detach never overprints. The
+layout spec answers `/api/partner` with a partner fixture (`PAGE_FIXTURES`)
+rather than seeding a partner tenant: the page needs nothing but that one
+response.
+
+**Rejected.** *Keeping the separate note and reserving its height*: the note
+and the table differ in height by the row count, so no fixed reservation fits
+both. *Seeding a real parent/child link in the e2e tenant*: it would change
+what every other partner spec sees (they assert the standalone state and the
+cross-tenant 404) for a measurement a route stub gives exactly.
+
+## 502. The line-total check and exception-agent autonomy get their own audited writers and panels; autonomy is admin-only (round 39)
+
+**Problem.** Both settings existed only as keys the generic `PATCH
+/api/organization` could write: `settings.fraud_rules.line_total_mismatch_enabled`
+and `settings.exception_agents.autonomy_level`. That PATCH writes no audit row
+for either block and replaces each top-level block whole, so turning off a
+payment-blocking check or letting agents approve invoices left no record of who
+did it, and any save of the block could change them as a side effect.
+
+**Decision.** `api/organization_controls.py` adds `GET/PUT
+/api/organization/line-total-check` and `GET/PUT
+/api/organization/exception-agents/autonomy`. Each PUT takes the org row lock,
+writes its audit row (`organization.fraud_rule_updated` /
+`organization.exception_agent_autonomy_updated`, `{setting, old, new}`) first
+through `record_auth_audit_or_raise` (503 and nothing saved without it, the
+`/organization/sso` rule), then sets the one key with the block's siblings
+carried. The generic PATCH carries both stored values across a block
+replacement and refuses a different value with a 422 naming the endpoint
+(`guard_owned_keys`), so there is one writer for each key. The two panels
+(`?section=line-total-check`, `?section=exception-agents`) are separate
+components; the Fraud Detection form drops the line-total key from its save so
+a stale copy never trips the refusal.
+
+**Who may change autonomy: admin only.** Above `conservative` an agent may set
+an invoice's amount to the PO total, link or split its PO, or fill its GL
+account, and then approve it. It does so with the roles of the person who ran
+it (admin or AP manager), never past the CFO gate, approval limits or
+segregation of duties. Raising autonomy therefore widens what an AP manager's
+click can approve without a second look, which is a control over the AP
+manager, so the AP manager does not hold it. The CFO does not either: every
+other `/organization` writer is admin-only and the page's read-only mode is
+built on that one rule; a CFO-only exception would be the one panel on the page
+where the rule differs. An org that wants finance sign-off can have its admin
+change the level on the CFO's instruction; the audit row shows who changed it.
+
+**Rejected.** *Auditing every generic PATCH of these blocks* (the
+`provider_config_updated` shape): it would record that something changed but
+keep the whole-block replacement, so a save of a sibling key could still flip
+either control. *Refusing the whole `exception_agents` block on PATCH*: its
+other keys (`amount_tolerance_pct`, `po_match_window_days`) have no other
+writer yet.
+
+**Amendment (round 39 gate-fix).** The line-total GET reads the stored value
+for its truthiness, exactly as `invoice_warnings` does: it first read anything
+but a stored `False` as on, so a stored `0` / `null` had the engine's check off
+while the endpoint said on, and `PUT {enabled:true}` was a no-op. The PUT also
+rewrites a stored value that reads the same but is not the canonical one (a
+`0` for `False`, an unknown autonomy level read as `conservative`), audited
+with the raw value under `stored`. `guard_owned_keys` now 422s a present
+`fraud_rules` / `exception_agents` that is not an object (`null` replaced the
+block unaudited; a string crashed every later read of it), and accepts the
+owned key only as a real bool / a known level, so `0 == False` no longer
+passes. Turning the check off stops new findings only: an open
+`line_total_mismatch` stays open and keeps blocking the payment run until a
+person clears it.
+
+## 503. Mobile Help opens the web help centre at the platform tenant URL, built from `/api/public-config` (round 39)
+
+**Problem.** The help centre (`/help`, `frontend/docs/help-centre.md`) serves
+the employee web app only; the mobile app had no help at all
+(`docs/followups.md`). The help lives on the workspace's own host, and the app
+knows only the tenant slug the user typed and the API base URL — neither is the
+web address of the workspace.
+
+**Decision.**
+
+- **A Settings → Help row that opens the web help in the browser**, through the
+  same `UrlOpener` seam `ExternalLink` uses, announced as one link node. The app
+  holds no copy of the guides, for the reason §498 gives for the legal pages:
+  one copy, six languages, kept by the web.
+- **The address is the backend's own rule, fed by the published template.**
+  `GET /api/public-config` already publishes `FEOH_TENANT_URL_TEMPLATE` (the
+  web signup page reads it); the app substitutes the session's slug exactly as
+  `utils/tenant_urls.py::tenant_base_url` does and appends `/help`
+  (`mobile/lib/utils/tenant_web_url.dart`). Resolved on tap, so a deployment's
+  template change needs no app release.
+- **Fail closed.** The slug must be slug-shaped (`slug.py`'s pattern) so no
+  typed value can change the host beyond its own label, and the result must be
+  an absolute `https` URL (`ExternalLink.safeUri`'s rule). Anything else, a
+  failed read, or a browser that refuses the URL ends in one snackbar telling
+  the user to open Help from the web. The local-dev default
+  (`http://{slug}.localhost:7777`) therefore opens nothing, by design.
+
+**Rejected.** *`AppConfig.publicWebUrl` + `/help`*: that origin is the public
+site, not a workspace; the help pages are tenant-scoped and role-aware. *A new
+`--dart-define` for the tenant template*: a second copy of deployment config the
+server already publishes. *Deriving it from the API base URL*: the API and the
+SPA are separate hosts (S3 + CloudFront vs the VM). *A per-tenant URL on
+`/api/auth/me`* (which would honour a tenant's vanity `tenant_url_template` or
+custom domain): a backend change for a cosmetic gain, since the platform
+subdomain serves the same workspace. **Consequence:** a white-label tenant's
+mobile users land on its platform subdomain, not its vanity host; the browser
+keeps a separate session per origin, so they may sign in there once. Revisit
+(add `web_url` to `/me`, built by `tenant_urls.sign_in_base_url`) if a
+white-label customer asks.
+
+## 504. Merge.dev reads its change feed but takes no payment write-back: its Payment can carry no marker of ours (round 39)
+
+**Context.** `docs/followups.md` (c) "a bill paid in an ERP other than
+QuickBooks or Xero never reaches FeohLedger" named Merge.dev as the next ERP to
+extend §295 to, as §386 did for Xero: a change feed (`GET
+/invoices?modified_after=`), a write-back (`POST /payments`), and then
+`supports_status_sync`. Merge's Accounting OpenAPI spec
+(<https://docs.merge.dev/openapi/accounting.json>, read 2026-11-24) was checked
+for each piece before building it.
+
+**What Merge supports.** `GET /invoices` and `GET /payments` take
+`modified_after` (Merge's `modified_at`, "synced by Merge after this date
+time"), `include_deleted_data`, `page_size` (at most 100) and a `cursor`; a
+Payment's `applied_to_lines` (expandable) names the invoices it is applied to.
+That is an honest change feed.
+
+**What it does not.** A `Payment` is `POST` / `GET` / `PATCH` only: no `DELETE`
+and no void. Neither `Payment` nor `PaymentRequest` has a memo, reference or
+any free-text field; `integration_params` is request-only and never echoed.
+Every guarantee §295 and §386 rest the write-back on needs a marker of ours on
+the ERP's payment:
+
+- *Idempotency.* QuickBooks and Xero find our earlier payment by its marker
+  before creating. Merge's `Idempotency-Key` is a beta enabled per customer and
+  kept 24 hours (§399), so after an unknown outcome nothing finds our payment
+  again. Matching by bill + amount + date would take a person's identical
+  payment for ours and write nothing.
+- *Telling ours from theirs.* `ErpBillReport.paid_only_by_us` and
+  `our_payment_applied` come from that marker. Without it every write-back reads
+  back as a payment made outside FeohLedger: the sweep would raise
+  `payment_reconciliation` (or `erp_paid_twice`) on every invoice we paid.
+- *Reversal.* A FeohLedger void must take our payment off the bill; Merge
+  cannot delete one, and a `PATCH` to zero is not a reversal an ERP books
+  consistently.
+
+**Decision.** `MergeDevAdapter.changed_bills` (both feeds, whole listing or
+`ErpListingIncomplete`, Xero's shape) and `bills_for_payment` are implemented.
+`post_payment` / `void_payment` stay the base class's refusals and
+`supports_status_sync` stays False, so a Merge push still closes at `done` and
+nothing is left payable here on the strength of a sync that cannot be complete
+(§295: landing at `posted_in_erp` without a guaranteed channel back is the
+double payment). The webhook (§399) is unchanged.
+
+**What is still between Merge and status sync**, kept in `docs/followups.md`:
+the marker (Merge adding a payment reference, or a per-integration
+`remote_fields` memo verified integration by integration against a linked
+account, #654); the sweep selecting tenants by `settings.erp.oauth.provider`,
+which a Merge tenant (API key + account token) has none of; and `bill_report`
+stating no `paid_amount` (Merge lists payment ids on the bill; the applied
+amounts need `expand=applied_payments`, unverified against a live account).
+
+Rejected: *storing the Merge payment id we created and treating it as the
+marker*. It covers only a create whose answer we read; the unknown outcome is
+exactly the case a marker exists for, and the bill report would need our
+payment ids passed into the adapter, a cross-layer change for one adapter.
+*Turning `supports_status_sync` on with the write-back refused*: the push would
+land payable, and FeohLedger's own payment would never reach the ERP, so the
+bill would stay open there and be paid again.
+
+## 505. The server refuses an employee or supplier who owes a Terms / Privacy acceptance (round 40)
+
+**Problem.** §495–§500 record acceptance and draw an accept step on the web,
+mobile and the supplier portal, but `legal_acceptance_required` was advisory:
+an API caller with an employee or portal JWT, or anyone who never opened a
+client, was never asked, and nothing refused them.
+
+**Decision.**
+
+- **One chokepoint per population.** `api/deps.get_current_user` (every
+  employee route, directly or through `require_roles` / `require_permission`)
+  now depends on `get_authenticated_user`, the old resolver, and answers a
+  user who has not accepted every version in `CURRENT_LEGAL_VERSIONS` with a
+  **403 coded `legal_acceptance_required`** — the code the accept endpoint's
+  422 already uses, so every client's answer is its accept step.
+  `api/portal_deps.get_current_vendor_user` does the same over
+  `get_authenticated_vendor_user`, with the portal's code
+  `privacy_acknowledgement_required` (§499).
+- **No extra round trip for employees.** The count of current acceptances is
+  folded into the resolver's own user query (`User.legal_current_acceptances`,
+  a `query_expression` loaded by `with_expression`); a user loaded any other
+  way falls back to `missing_documents`. The portal gate is one indexed read
+  of the tenant `vendor_user_legal_acceptances`.
+- **Exempt: the minimum the accept steps need**, listed in
+  `LEGAL_GATE_EXEMPT_ROUTES` / `PORTAL_LEGAL_GATE_EXEMPT_ROUTES` and pinned
+  against the app's routes by `tests/test_legal_acceptance_gate.py`:
+  `GET /me` (the flag), the accept / acknowledge endpoint, and
+  `change-password` (the forced change comes before the step, §497, §500).
+  Logout reads the token itself and never resolves a user. Login, MFA,
+  set-password and the SSO / SAML callbacks issue tokens rather than take
+  one, so an SSO user signs in normally and then meets the step like anyone
+  with an employee JWT. Branding and i18n need nothing: the web step loads no
+  branding until the flag clears (§497) and catalogues ship in the bundle;
+  `/api/public-config` and `/portal/branding` are public.
+- **Out of scope, by construction:** the `/api/v1` developer API
+  (`X-API-Key`; a key is not a person and has no one to accept — the key's
+  creator met the gate in the app that minted it), SCIM's bearer token, the
+  inbound webhooks (signed machine callers), and the public pages. None of
+  them reaches either resolver; the test pins that no API-key route does.
+  **The token doors** — the Slack / Teams approval buttons and the emailed
+  approve link — act for a person on a single-use action token, not a JWT,
+  so they do not reach either resolver. Each asks
+  `api/email_actions.owes_legal_acceptance` for the reviewer the token names,
+  right after the `invoice.approve` check and before the single-use claim,
+  and refuses in its own channel's style (the email confirm POST's info page,
+  the Slack / Teams ack text `LEGAL_ACCEPTANCE_MESSAGE`), so the link or
+  button still works once the reviewer accepts. One shared check, so the
+  three doors cannot drift (`tests/test_email_actions.py`,
+  `test_slack_approvals.py`, `test_teams_approvals.py`).
+- **The clients answer the 403 with their accept step.** A session that
+  stays open across a version bump meets the 403 on its next call, not its
+  next `/me`. The web `api.ts` (through `endSessionIfRejected`, the hook every
+  client already calls on a refusal) and the portal `portalApi.ts` hand the
+  code to `api/acceptanceRefusal.ts`, whose listener in the auth store sets
+  the loaded account's flag, so the layout draws the step at once; the
+  mobile `ApiClient._failure` hands it to `AuthStore.legalAcceptanceRefused`,
+  which re-reads `/me` (once: a set flag means the step is already up). The
+  mobile push-device registration, refused at sign-in while the step is
+  owed, is sent when `AuthGate._onAuthChanged` sees the flag clear, and not
+  at a sign-in that already shows the step.
+- **Consequences.** Every existing user with no acceptance on record is
+  refused everywhere but the step until they accept on the web or mobile.
+  A mobile build older than a version bump can then only sign out (its Accept
+  is refused, §498), so a bump must ship with, or after, an app release
+  carrying the new versions. Tests: the pytest harness records acceptance for
+  every user it inserts (`conftest._test_users_accept_the_legal_versions`,
+  the seed's shape), and a test of the unaccepted path opts out with
+  `@pytest.mark.legal_unaccepted`.
+
+**Rejected.** *A path allowlist checked inside one resolver*: needs the
+request in a function tests call directly, and hides the exemption from the
+dependency graph the RBAC sweep reads. *A per-router check*: the next router
+forgets it. *Gating `/api/v1`*: there is no person behind a key to accept, and
+refusing a key would break integrations for a step nobody can take.
+
+## 506. A row Verify / Reject on /vendors re-reads that one row through the list endpoint, not page 1 (round 40)
+
+**Context.** `verifyVendor` and `rejectVendor` refetched with `fetchVendors()`,
+which reloads page 1 only, so a reviewer working down pages added by Load more
+was thrown back to the first 20 rows after every decision. Patching the row
+from the `/verify` / `/reject` response was not enough: those return a plain
+`VendorResponse`, without the list row's `status_actions` verdict or its
+`invoice_count`, and they say nothing about whether the row still matches the
+reviewer's search and status filter.
+
+**Decision.** `GET /api/vendors` takes `?id=<uuid>`, which narrows the same
+filtered, entity-scoped query to one row. After a decision the page marks the
+row with its new status and no actions (fail closed while it asks), then
+re-reads it with its own search / status / sort plus `id`: one item is the
+row in the exact list shape, verdict included, and is patched in place; an
+empty page means it has left the filter, so it is dropped, removed from the
+selection, and the "N matching" total falls by one. The chip tallies are
+re-read from `GET /api/vendors/counts`, never shifted by hand. The re-read
+runs on the list's request sequencer, so a filter change issued meanwhile
+answers for itself.
+
+Why the list endpoint and not a richer `/verify` response (the other option
+the followup named): membership in the active filter is a server question
+(search spans name, code and email; status filters are comma lists; entity
+scope applies), and answering it in the client would restate those rules.
+One read through the list's own filter builder gives the row shape, the
+verdict and the membership answer from the code that already produces them.
+`?id=` stays out of `_vendor_list_filters`, since `/ids` and `/counts`
+describe the whole set.
+
+Accepted: under a `status` sort a re-read row keeps its place until the next
+full read, and a Load more already in flight when the decision lands is
+retired (the reviewer clicks it again), the same trade `applyVendorUpdate`
+already makes for a pre-edit read.
+
+## 507. Contract lifecycle buttons follow the endpoints' verdicts, including where the old page rule was narrower (round 40)
+
+`ContractModal` offered Activate / Terminate / Cancel / Renew / Create PO from
+its own copy of the status rules, and the copy had drifted from the endpoints:
+it hid Activate and Terminate on an `expired` contract and Create PO on a
+`draft`, all of which the server accepts. The list's bulk "Change status"
+offered all three actions whatever was selected and left the server to skip
+the rows that could not take it.
+
+Each rule is now one gate in `services/contract_controls.py`
+(`contract_transition_refusal`, `contract_renew_refusal`,
+`contract_create_po_refusal`, `contract_delete_refusal`). The endpoints raise
+from it, and every contract response carries
+`actions.{activate,terminate,cancel,renew,create_po,delete}`, built by
+`api/contracts.contract_action_refusals` from the route's role predicate and
+then the same gate (§487's shape, as for intake and requisitions). The 409s
+now answer with the coded `detail` the verdict carries (`contract_status_refused`
+with `params.status` and `params.action`; `contract_delete_refused` with
+`params.status`), its English `message` the sentence the routes always
+returned; no mobile screen reads contracts, and `bulk/status` reads the
+sentence through `utils/http.detail_text`, so its skip reasons are unchanged.
+
+**The page follows the endpoint, not the other way round**, as in §487: the
+expired contract's Activate and Terminate and the draft's Create PO are now
+offered. Narrowing the endpoints to the page's rule was rejected: re-activating
+an expired contract is documented behaviour (`backend/docs/contracts.md`), and
+nothing showed the draft-PO path to be wrong. Every contract refusal is a status
+or role one, so a refused action is hidden rather than explained.
+
+**Renewing a draft now stamps `activated_at`.** Renew moves any non-terminal
+contract to `active`; on a draft that put it in force without passing through
+activate, so the evidence of when it bound the parties (migration 0120) stayed
+NULL. Renew stamps it when unset, as activate does. Refusing renew on a draft
+was the alternative; it would change documented behaviour for no gain the
+stamp does not already give.
+
+**Bulk.** The bar tallies each action over the selection from the rows'
+verdicts (`actionVerdicts.tallyBulkVerdicts`): it offers an action only when a
+selected row allows it, or when a selected id is beyond the loaded pages (a
+"select all N matching"), where the server decides. It says before submit how
+many loaded rows will be skipped, and says no action fits rather than offering
+one. Skips on unloaded rows are still reported after the call, as before.
+
+**Both contract bulk endpoints honour the entity selector.** The sweep for
+this change found that `POST /contracts/bulk/status` and `/bulk/export` loaded
+their ids with no entity check, while the list, `GET /ids` and every single-row
+route are scoped, so a caller scoped to one subsidiary could move or export
+another's contracts by id. `bulk/status` now runs `ensure_in_entity_scope` per
+row, so an out-of-scope id is skipped as "Contract not found", the sentence
+`POST /{id}/activate` answers it with. `bulk/export` selects through
+`apply_entity_scope`, so an out-of-scope id is dropped exactly as a nonexistent
+one already was: left out of a mixed CSV, and an all-out-of-scope selection is
+the same 404 as an all-missing one, so neither endpoint tells a sibling
+entity's ids from missing ones. The export's `ids` are now `UUID`s in the
+schema, so a malformed id is a 422, not the 500 that `uuid.UUID(...)` in the
+handler raised. No other contract route takes a list of ids. The invoice and
+vendor bulk exports have the same unscoped select. They are outside this
+change; §509 closes them.
+
+Parity: `backend/tests/test_contract_action_verdicts.py` (each role × status ×
+action: verdict `None` exactly when the endpoint succeeds, otherwise its exact
+coded `detail`; the bulk-status entity skip); `backend/tests/test_contract_bulk_ops.py`
+(the export's entity scope and the 422);
+`frontend/tests-e2e/contracts/action-verdicts.spec.ts`.
+
+## 508. Supplier help is a portal page over the help centre's `Guide` shape, kept out of the employee index (round 40)
+
+**Problem.** The help centre (§244) is `/help`, behind the employee session.
+Suppliers — a separate audience who submit invoices, get paid, change bank
+details and take card payments — had no help at all (`docs/followups.md`), and
+cannot open `/help`: a vendor user holds a portal token, not an employee JWT.
+
+**Decision.**
+
+- **`/portal/help` inside the portal shell**, with a nav entry, a landing page
+  (the supplier guides, then a short glossary) and `/portal/help/<id>` per
+  guide. Five guides: getting started (invitation, Privacy acknowledgement,
+  sign-in, two-factor), submit and resubmit, track to payment, change bank
+  details, virtual-card payments.
+- **Same shape, one field more.** Supplier guides are `Guide`s with
+  `audience: 'supplier'` (omitted = `employee`), in `lib/help/portal.ts`, under
+  the same prose grammar and `{ui:key}` rule. They are *not* in `GUIDES`, so the
+  employee landing, search and role lists never show them and their links can
+  be held to the portal.
+- **Links follow the audience.** `terms.ts` gains `guideHref(id, audience)`
+  and an audience on `termHref`; `RichText` takes `audience`. A supplier's
+  `[[term]]` lands on `/portal/help#<id>`, `[[guide:…]]` on `/portal/help/<id>`,
+  and every `[[page:…]]` must be a labelled `/portal` route
+  (`content.test.ts` § supplier portal help).
+- **The glossary is a subset of the help centre's**, showing each term's
+  translated name and one-liner only (`PORTAL_GLOSSARY`): the long entries are
+  written for the AP team and link into `/help`. A term whose one-liner speaks
+  from the buyer's side ("your formal order to a supplier") is left out.
+- **One section renderer.** `components/help/GuideSections.svelte` renders a
+  guide's sections for both guide pages. The invoice-lifecycle walkthrough is a
+  snippet the employee page passes in, and `RichText` labels page links from
+  `navPages.ts` rather than `content.ts`, so no supplier page reaches the
+  employee guide index — which would ship every employee guide to suppliers and
+  oblige `/portal/help` to load the settings slice. `/portal/help` loads only
+  the help slice (the portal slice comes from `/portal`).
+- **English prose, as in the help centre** (§244): rendered `lang="en"` under
+  another locale behind `EnglishNotice`; the chrome, the `{ui:}` labels and the
+  glossary are in all six locales.
+
+**Rejected.** *Opening `/help` to vendor tokens*: the pages are role-aware and
+name employee controls; a supplier would see the AP team's procedures,
+including how bank changes are reviewed. *A second content type for the
+portal*: a fork of the shape, parser and tests, which drift apart. *Putting
+supplier guides in `GUIDES` with a filter*: every employee surface (landing,
+search, page directory, HelpTip further reading) would then need the filter,
+and one forgotten would show a supplier guide to the AP team. *A portal search
+box*: five guides fit on one page; revisit when the supplier set outgrows it.
+
+## 509. Every bulk endpoint that takes ids reaches exactly the rows its single-row routes do (round 40)
+
+**Context.** §507 scoped `POST /contracts/bulk/export` and left the invoice and
+vendor exports with the same unscoped `select(...).where(id.in_(ids))`. The
+sweep of every router's id-taking bulk endpoint found three more on the primary
+key alone: `POST /vendors/bulk/status`, `/vendors/bulk/screen` and
+`POST /workflows/bulk-delete`. A caller scoped to one subsidiary could export
+another's invoices or vendors, verify, reject or re-screen its vendors, or
+delete its workflow definitions, by holding the ids. The invoice and vendor
+exports also parsed the ids in the handler, so a malformed one was a 500.
+(`/invoices/bulk/status`, `/invoices/bulk/delete`, `/exceptions/bulk/resolve`
+and `/expenses/bulk-gl-code` were already scoped; `/admin/users/bulk-delete`
+is control-plane users, which carry no entity.)
+
+**Decision.** Each bulk endpoint resolves its ids with the entity rule of the
+single-row route it mirrors, not a rule of its own: `apply_entity_scope` on
+`Invoice` for the invoice export (as `bulk/status` and `bulk/delete`), and
+`include_shared=True` for vendors (`api/vendors._scoped_vendors`) and workflow
+definitions, because their by-id routes admit an unstamped vendor or a shared
+definition from every entity. A bulk call therefore can never reach a row the
+single-row route would 404, nor refuse one it would serve. An out-of-scope id
+is handled exactly as a missing id already was on each endpoint: left out of
+an export (an all-out-of-scope selection is the same 404), skipped as `not
+found` on vendor status / screen, failed as `not_found` on workflow
+bulk-delete. The `ids` of the invoice export, delete and status requests and
+the vendor export are `UUID`s in the schema, so a malformed id is a 422.
+
+**Rejected.** *The list's filter for vendors* (which leaves unstamped rows
+out): it would make the bulk export refuse a vendor that `GET /vendors/{id}`
+in the same scope returns. *A 422 for a malformed id on vendor status / screen
+and workflow bulk-delete*: those already skip-and-report a malformed id per
+row (`invalid id format`, `not_found`), a contract their clients and tests
+read; only the endpoints that 500'd changed.
+
+Tests: `backend/tests/test_entity_scope_by_id_sweep.py` (mixed selection,
+all-out-of-scope equals missing, the consolidated view sees every row, the
+malformed-id 422s, vendor status / screen and workflow bulk-delete skips).
+
+## 510. The SCIM bearer token gets a panel, an audit-first mint and a revoke that is not plan-gated (round 41)
+
+**Problem.** `POST /api/organization/sso/scim-token` had no screen, so the
+only way to connect an identity provider's SCIM connector was a hand-made API
+call. The mint wrote its audit row *after* commit, best-effort
+(`dispatch_auth_audit`), so a token could be minted with no record of who did
+it. And there was no way to retire a token short of rotating it: an org that
+stopped using SCIM, or whose plan no longer included it, kept a live
+provisioning credential it could not switch off.
+
+**Decision.** `organization/ScimTokenPanel.svelte` (`?section=scim`, after
+Single Sign-On) shows whether a token is set, the SCIM base URL, and Generate /
+Rotate / Revoke. The token is stored only as its sha256 digest
+(`services/sso.hash_scim_token`, in `organizations.scim_bearer_hash` and the
+`settings.sso` mirror), so "is one set" is all the panel can show after the
+mint; the plaintext appears once, in `ui/SecretReveal`, and is dropped from
+state when that dialog closes. Rotate and Revoke each confirm first, because
+both cut off the identity provider's current connection.
+
+The mint now writes `organization.scim_token_minted` FIRST through
+`record_auth_audit_or_raise` (503 with nothing minted when the row cannot be
+written, the `/organization/sso` and §502 rule), with `rotated` recording
+whether it replaced a live token. A new `DELETE
+/api/organization/sso/scim-token` clears both copies of the digest, audited
+first as `organization.scim_token_revoked` with the removed digest's prefix;
+with no token set it is a 204 no-op with no row.
+
+**Revoke is admin-only but not plan-gated.** Minting stays behind the `scim`
+feature (decisions §258). Revoking only takes access away, and the case that
+most needs it is the tenant whose plan dropped SCIM while a token it minted is
+still live; gating it would leave that credential un-retirable from the
+product. The panel offers Revoke without the plan and shows the upgrade notice
+in place of Generate / Rotate.
+
+**Rejected.** *Showing the digest prefix after reload*: `GET
+/api/organization/sso` does not return it, and the panel shows only what the
+read already serves; the prefix is in the reveal dialog and every audit row,
+which is where an operator matches a token to its mint. *Keeping the
+post-commit audit*: a provisioning credential minted with no row is worse than
+a refused mint.
+
+**Amendment (round 41 review): mint and rotate demand a second-factor
+step-up; revoke does not.** An admin JWT alone could mint this token, and the
+token creates users and grants roles, so a stolen admin session became a
+standing provisioning credential that outlives the session. `POST` now calls
+`api/auth.require_sensitive_step_up` with its own operation,
+`scim_token_mint` (a current authenticator code or a passkey assertion, never
+the password; refused, not exempted, for an account with no second factor),
+exactly as closing the workspace does (§306), and the audit row records the
+proof as `step_up`. The panel drives it the same way as
+`CloseWorkspacePanel`: the first call is answered `sensitive_step_up_required`,
+`ui/StepUpPrompt` collects the proof and the panel resends. **Revoke stays
+ungated**: it only takes access away, a hijacked session revoking the token
+costs an outage rather than an account takeover, and an admin answering a
+leak must be able to retire it in one step. The mint response is
+`Cache-Control: no-store` (there is no global middleware that sets it), so the
+plaintext is not kept by a browser or proxy cache after the reveal closes.
+Generate and Revoke each replace the button that was pressed, so focus goes to
+the new primary action when their dialog closes.
+
+## 511. Out-of-office delegation is a profile panel, and a delegate must already be able to approve (round 41)
+
+**Context.** `GET/POST/DELETE /api/auth/delegation` shipped with no screen
+(`docs/followups.md`, "Settings with a backend and no screen"). The endpoint is
+gated on sign-in alone and writes the CALLER's own row (`User.delegate_to_id` /
+`delegate_until`), so it is a personal setting, not an organization one. It
+accepted any active same-org colleague as delegate, on the reasoning that
+routing confers no privilege. True, but `review.assign_reviewer` hands the
+invoice to the delegate unconditionally, so naming an ap_clerk (no
+`invoice.approve`) parked every routed approval with someone who could never
+act on it: the dead end `GET /api/invoices/assignable-reviewers` already
+refuses to offer. Its refusals were bare English strings.
+
+**Decision.** The screen is **Profile → Out of office**, a personal setting, not
+an `/organization` panel, shown to employees who hold `invoice.approve` (below).
+`POST` now refuses a delegate without `invoice.approve` (`422`
+`delegation_delegate_cannot_approve`), and a new
+`GET /api/auth/delegation/candidates` lists exactly who it accepts. Every refusal is coded
+(`delegation_*`) and stated by `authRefusals.ts`. The model has an end and no
+start, so the panel offers no start date rather than invent one the server
+would ignore: it asks for the last day away and sends the start of the next day
+in the reader's time zone as `until`. Set and clear were already audited
+(`auth.delegation.set` / `.cleared`), so no new audit row was needed.
+
+**One eligibility predicate, re-read every time a delegation is followed.**
+`services/delegation.is_eligible_delegate` — exists, not the delegator, same
+organization, active, and holds `invoice.approve` through
+`effective_permissions` (so a custom role granted it qualifies) — is read by the
+write, the candidate list, `approval_chain.resolve_assignee` (routing) and
+`approval_chain._resolve_authorized_approvers` (a named approver's delegate
+clearing their level). A delegation is saved once and followed for days, and in
+between the delegate can be deactivated, lose `invoice.approve` (a role edit, a
+SCIM push), or — a row saved before this round — never have held it. Routing
+used to follow any stored delegation whose window was open, so each of those
+stranded the invoice. Now a delegate who fails the predicate is not followed:
+the original reviewer keeps the assignment (`(user_id, None)`), and the
+`invoice.assigned_for_review` row carries no `delegated_from`.
+
+**Per invoice, the approval path's own gates.** A delegate who passes the
+predicate can still be unable to clear one particular invoice: they uploaded or
+keyed it, recorded its goods receipt or inspection (`implicated_actors`,
+`receipt_recorders`, `inspection_recorders`, §141, §152, §267, §389, §401), the
+amount is over their limit or the CFO gate, or the step names other approvers.
+`review.assign_reviewer` asks `review.delegate_refusal`, which runs
+`review_refusals` — the verdict the invoice modal reads, built from the
+endpoint's gates in the endpoint's order — for the delegate, and keeps the
+original reviewer when it refuses. Nothing is restated, so a new gate reaches
+routing without a second edit.
+
+**Every assignment path follows it.** `POST /api/invoices/{id}/assign` called
+`assign_reviewer` without `control_db`, which skipped the delegation branch
+altogether, while the docs and this panel said new assignments go to the
+delegate. It now passes `control_db` and the tenant's settings (the money gates
+read them), as `POST /api/adaptive/routing-suggestion/apply` already did.
+
+**Only approvers may delegate.** The candidate list and the write are gated on
+`invoice.approve` (`require_permission`, `403` otherwise). The list is a roster
+of every approver in the organization, which a clerk or read-only role has no
+reason to read, and a non-approver has no approvals to hand on. Reading and
+clearing one's own delegation stay open to every signed-in user, so someone who
+has since lost the permission can still see and end a stale one; routing
+ignores it anyway, because nothing is routed to a non-approver.
+
+**Not fixed here: `parallel_mode: "all"` levels.** A delegate's approval is
+recorded under the delegate's id, and an `all` level is satisfied only when
+every listed approver's own id has approved, so a delegation cannot stand in
+for an `all`-level approver. Whether it should is an operator decision
+(`docs/known-issues.md`, `docs/followups.md`).
+
+**Rejected.** A start date (a scheduled delegation) would need a column and a
+migration for a feature nobody has asked for; the panel says the delegation
+starts when saved. *Leaving the delegation open to every employee*, on the
+reasoning that a non-approver's delegation is harmless: the delegation itself
+is, but the candidate list it needs discloses the whole approver roster.
+*Refusing the assignment when the delegate is ineligible*: the person doing the
+assigning did nothing wrong and the original reviewer can still act, so routing
+falls back rather than erroring. *Restating the segregation sets in routing*
+(as `approval_chain.escalation_ineligible` does for the escalation sweep): it
+covers segregation only, not the money gates or named approvers, and a second
+statement is the one that drifts.
+
+## 512. PO match rules get one audited writer and an organization panel, not a vendor-page field (round 41)
+
+**Problem.** `settings.matching` — the organization's PO-match tolerance and
+inspection requirement, and the per-vendor / per-commodity (header GL account)
+overrides `services/matching_rules` resolves — had no screen and no writer but
+the generic `PATCH /api/organization`, which writes no audit row and replaces
+the block whole. Widening a vendor's tolerance lets more of its invoices pass
+the PO match with no `po_mismatch` exception, so it is a money-path control
+changed with no record of who changed it.
+
+**Decision.** `api/organization_match_rules.py` owns the whole block:
+`GET /api/organization/match-rules`, `PUT …/organization`, `PUT`/`DELETE
+…/vendors/{id}` and `…/commodities/{gl_code}`. Admin only (the §502 rule: every
+`/organization` writer is admin-only, and loosening a match is a control over
+the people whose invoices it lets through). Each write takes the org row lock
+and records `organization.match_rule_updated` / `_removed` first (503 and
+nothing saved otherwise). A tolerance must be 0–100 with at most two places and
+is stored as its exact decimal string; the vendor or GL code must exist. The
+generic PATCH refuses any change to the block. Reads go through the resolver's
+own coercions, so the screen shows what the match applies, not what is stored.
+
+**Where the screen lives: one `/organization` panel** (`?section=match-rules`,
+under Money), not a field on each vendor's page. Precedence is per field across
+three layers, and the only way to read it correctly is to see the organization
+setting, the GL rules and the vendor rules together; a vendor page would show
+one layer and hide the GL rule that also applies. GL rules have no natural home
+page at all. The panel marks a rule looser than the organization and removes a
+rule only on a second click.
+
+**Rejected.** *Auditing the generic PATCH of `matching`*: it would keep the
+whole-block replacement, so saving the org tolerance could silently drop every
+vendor rule (§502's reasoning). *Refusing a rule looser than the organization*:
+a vendor with known freight variance is a legitimate reason, and the post-
+approval re-judge already takes the strictest rule across GL codes
+(`strictest_rule_for_any_commodity`); the screen flags it instead. *Recording
+created-by / created-at on each rule*: the audit rows already hold who and when,
+and a name copied into settings would be one more place erasure has to reach.
+
+**Amendment (round 41 review).** *Looser* covers both knobs: a rule with
+`require_inspection: false` over an organization (or built-in) that requires
+inspection skips the quality hold, so it is flagged like a wider tolerance.
+*Out-of-range stored values*: the generic PATCH accepted tolerances such as
+`"-5"` or `"500"` before it was closed to this block, and the resolver still
+applies them. The read reports each layer's `tolerance_out_of_range` and the
+panel flags it with a prompt to save a valid value. Rewriting them
+automatically was rejected: it would change a money-path control with no
+admin's decision behind it, and clamping either way picks a policy nobody
+chose. The panel also follows the shared form conventions (picker field error,
+GL-list Retry, outside-click disarm, focus on open and close, locale decimal
+separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
+duplicated.

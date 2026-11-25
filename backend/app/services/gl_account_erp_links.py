@@ -16,9 +16,11 @@ still open, instead of re-linking by code and asking again.
 rule 0, in this order, on a pull with a named realm:
 
 * :func:`keep_states` files each row's state from another named company under
-  that company. A NULL-realm link (pre-0115, or made by a no-realm pull) names
-  no company, so filing it under one would be the manufactured evidence §141
-  refuses; it is never kept.
+  that company. A NULL-realm link (pre-0115, or made by a no-realm pull before
+  §496) names no company, so filing it under one would be the manufactured
+  evidence §141 refuses; it is never kept. Nor is a no-realm pull's
+  ``UNNAMED_REALM`` link (``erp_link_realm.names_company``): no sync restores
+  under it.
 * :func:`restore_states` puts back the state kept for the pull's own company,
   and deletes it from the table. A restored link is then judged by the rules
   exactly as a link that never left the row: rules 3 and 4 re-judge it unless
@@ -40,6 +42,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.gl_account import GLAccount, GLAccountErpLink
+from app.services.erp_link_realm import names_company
 
 __all__ = ["Restore", "keep_states", "restore_states"]
 
@@ -50,7 +53,7 @@ _CHUNK = 1000
 def _states_to_keep(row: GLAccount, realm: str) -> dict[str, dict]:
     """``row``'s state in each named company other than ``realm``, by company."""
     states: dict[str, dict] = {}
-    if row.erp_account_id and row.erp_link_realm is not None and row.erp_link_realm != realm:
+    if row.erp_account_id and names_company(row.erp_link_realm) and row.erp_link_realm != realm:
         states[row.erp_link_realm] = {
             "erp_account_id": row.erp_account_id,
             "erp_link_confirmed_at": row.erp_link_confirmed_at,

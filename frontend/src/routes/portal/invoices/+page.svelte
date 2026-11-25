@@ -6,11 +6,12 @@
 		PORTAL_PAGE_SIZE,
 		type PortalInvoiceListItem,
 	} from '#lib/portalApi.ts';
+	import { ApiError } from '#lib/api.ts';
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
-	import { onMount, untrack } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import { formatDate } from '#lib/utils/time.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
@@ -359,7 +360,78 @@
 		}
 	}
 
-	onMount(refresh);
+	// The first-page read, shared by mount and a chat deep link (below), so
+	// the link waits for the list instead of racing it.
+	let firstLoad: Promise<void> | null = null;
+	onMount(() => {
+		firstLoad ??= refresh();
+	});
+
+	/* Deep link to an invoice's conversation: `?chat=<invoice id>`. The email
+	 * the supplier gets when the AP team writes on an invoice links here
+	 * (`backend/app/services/supplier_chat.portal_chat_path`, which a pytest
+	 * pins to this parameter name), and the portal layout carries it through
+	 * sign-in as `?next=`. Read on mount and on every same-route navigation;
+	 * an id the supplier does not own reads as not found, like any other
+	 * portal 404. */
+	const CHAT_LINK_PARAM = 'chat';
+	const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+	let linkedChatId: string | null = null;
+	// What went wrong opening the linked conversation. Only a 404 (or an id
+	// that cannot be one) means "not in your account"; any other failure is a
+	// failed read, said as such with a Retry — telling a supplier their
+	// invoice does not exist because the server blipped would be false.
+	let chatLinkError = $state<{ notFound: boolean } | null>(null);
+
+	async function openLinkedChat(invoiceId: string) {
+		chatLinkError = null;
+		await (firstLoad ??= refresh());
+		if (linkedChatId !== invoiceId) return;
+		if (!UUID_RE.test(invoiceId)) {
+			chatLinkError = { notFound: true };
+			return;
+		}
+		if (!items.some((inv) => inv.id === invoiceId)) {
+			// Older than the loaded page (or outside the current filter): show
+			// its row first. When its page loads later `appendUnique` drops the
+			// duplicate, so the count stays honest.
+			try {
+				const inv = await portalApi.get<PortalInvoice>(`/api/portal/invoices/${invoiceId}`);
+				if (linkedChatId !== invoiceId) return;
+				items = [inv, ...items];
+			} catch (err) {
+				if (linkedChatId === invoiceId) {
+					chatLinkError = { notFound: err instanceof ApiError && err.status === 404 };
+				}
+				return;
+			}
+		}
+		if (expandedId !== invoiceId) await toggleChat(invoiceId);
+		if (linkedChatId !== invoiceId) return;
+		await tick();
+		// `CSS.escape` although the id is UUID-checked above: the selector is
+		// built from a URL parameter, and the check is not what should keep it
+		// well-formed.
+		const row = document.querySelector<HTMLElement>(
+			`[data-chat-row="${CSS.escape(invoiceId)}"]`
+		);
+		row?.scrollIntoView({ block: 'nearest' });
+		// Arriving from an email to reply: focus the composer, or — when the
+		// thread failed to load and offers no composer — its Retry, so the
+		// keyboard and screen-reader user starts where the link pointed.
+		row?.querySelector<HTMLElement>('textarea.chat-input, button')?.focus();
+	}
+
+	function retryLinkedChat() {
+		if (linkedChatId) void openLinkedChat(linkedChatId);
+	}
+
+	$effect(() => {
+		const id = page.url.searchParams.get(CHAT_LINK_PARAM);
+		if (!id || id === linkedChatId) return;
+		linkedChatId = id;
+		untrack(() => openLinkedChat(id));
+	});
 </script>
 
 <div class="page">
@@ -391,6 +463,17 @@
 	/>
 
 	{#if error}<div class="error" role="alert">{error}</div>{/if}
+	{#if chatLinkError?.notFound}
+		<div class="error" role="alert" data-testid="portal-chat-link-not-found">
+			{m('portal.invoices.chatNotFound')}
+		</div>
+	{:else if chatLinkError}
+		<LoadError
+			message={m('portal.invoices.chatLinkFailed')}
+			onretry={retryLinkedChat}
+			testId="portal-chat-link-failed"
+		/>
+	{/if}
 	{#if message}<div class="msg" role="status" aria-live="polite">{message}</div>{/if}
 
 	<PortalListFilters
@@ -541,7 +624,7 @@
 					</tr>
 					{#if expandedId === inv.id}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<tr class="chat-row" onclick={(e) => e.stopPropagation()}>
+						<tr class="chat-row" data-chat-row={inv.id} onclick={(e) => e.stopPropagation()}>
 							<td colspan="7">
 								<SupplierChatThread
 									surface="vendor"

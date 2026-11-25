@@ -62,9 +62,30 @@ So:
   with the shared no-figure dash (`kpiDisplayValue`, or `<KpiCard>` with a
   nullish `value`) and `aria-busy` while pending, never `{#if summary}` around
   the whole strip (`/payments`).
+- **A KPI card's qualifier line is reserved, not added.** A `sub` line that
+  only the response decides (/discounts' "no offer has been captured or
+  missed yet", /tax's card-excluded total) grows its card, and a flex row
+  stretches every card to the tallest, so the whole row and the table under
+  it drop. Pass `<KpiCard reserveSub>` the longest wording it takes: drawn
+  invisible and `aria-hidden` while `sub` is empty, it wraps at the card's
+  own width in the reader's locale, so the card is as tall loading as loaded.
+- **A note that qualifies the figures above a table holds a one-line slot.**
+  /discounts' currency notes (and its dashboard error) sit in `.kpi-notes`
+  under the KPI row with a `min-height` of one line, so the common single
+  note lands without moving the offers table.
 - **A chip row whose roster comes from a response holds its place while that
   response is pending** — render it with just its "All" chip until the roster
   lands (`/exceptions`' type row).
+- **A table that grows above another section gets a reserved height.** When
+  a data-sized table is not the last thing on the page, its rows landing push
+  everything below it down. Give its scroll region a fixed `height` (about
+  five rows) with `overflow-y: auto` and DataTable's `stickyHeader`, under a
+  page wrapper: `/admin/webhooks`' subscriptions (above the deliveries) and
+  the `/audit` trail (above signature verification). A table whose rows are
+  a fixed set takes a `min-height` sized to them instead, with no inner
+  scroll: `/admin?tab=roles`' system roles (the four `SYSTEM_ROLES`, above
+  the custom roles). The last table on a page needs none — nothing below it
+  moves.
 - **Don't put data-sized controls inline beside fixed ones on a wrapping row.**
   `/invoices`' status chips depend on the active workflow and their width on
   the tallies; inline beside the search box the row fitted on one line at
@@ -255,17 +276,23 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   /payments, /exceptions, /vendors, /purchase-orders, /gl-accounts, the
   screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
-  the users directory, /admin/entities, /admin/api-keys,
-  /admin/access-review and both /goods-receipts tabs are converted,
-  /admin/entities, /admin/api-keys, /admin/access-review and the
-  inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
+  the users directory, both Roles tables, /admin/entities, /admin/api-keys,
+  /admin/access-review, /admin/webhooks (both tables), the /audit trail,
+  /adaptive's suggestions, both /goods-receipts tabs, the /discounts offers,
+  the /tax 1099 table and the /admin/partner children table are converted,
+  /admin/entities, /admin/api-keys, /admin/access-review, the Roles tab,
+  the inspections tab and /admin/partner by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string
   in any of the six locales, not the English one; `tests-e2e/reactivity/layout-stability.spec.ts` holds each to a
   cumulative layout shift under 0.1 with production-like API latency and
   checks a `fixed` table's header x positions. A new sidebar page fails that
   spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`; a page's second
   tab with its own table goes in `TAB_PAGES` (`?tab=` href), since a sidebar
-  link only ever opens the first.
+  link only ever opens the first. A page whose table the e2e tenant cannot
+  fill (/admin/partner: the tenant is not a partner) is answered there by a
+  `PAGE_FIXTURES` route stub, for both checks, rather than left unmeasured.
+  A page with a "you have none of these" state shows it as the table's own
+  empty row (DataTable's `empty`), not as a block swapped in for the table.
 - **Never make a `<td>` / `<th>` `display: flex` (or grid).** It stops being a
   table cell: the column no longer sizes it, so content overflows the table,
   and its border drifts out of line with the row. Lay out inline children with
@@ -305,6 +332,15 @@ one again to flip direction:
 - The backend validates `sort=` against a per-endpoint allowlist
   (`backend/app/api/sorting.py`) — an out-of-list value is a 422, so only
   pass field keys the endpoint actually declares.
+- **Read the URL's sort through `sortFromUrl(params, fields)`**, not a bare
+  `searchParams.get('sort')`: the URL is editable and outlives a renamed
+  column, and an unknown key 422s every load, Retry included, leaving the page
+  on its load error with nothing on screen to undo it. `sortFromUrl` keeps only
+  a field the page offers as a header; a missing or unknown `order` reads as
+  the page's default direction (third argument, `asc` unless given). Every
+  sortable list uses it (guards: the unknown-sort cases in
+  `tests-e2e/{vendors,invoices}/sort.spec.ts` and
+  `tests-e2e/contracts/url-state.spec.ts`).
 - `null` field = the backend's own default order; only send `sort`/`order`
   in `buildParams()` when `sortField` is set (`untrack()` the read the same
   way `search` is — `buildParams()` is called from filter effects too).
@@ -433,6 +469,18 @@ appears when one or more rows are selected:
 - `countLabel` overrides the count text when the page's noun takes a gender
   (`invoices.bulk.selected`); the `lead` snippet sits between the count and
   Clear, for the "select all N matching" button or its in-force note.
+- **The bar's one live region is mounted from first paint.** The visible bar
+  exists only while something is selected, so a live region inside it would
+  be inserted together with the first selection's text, and that is often not
+  announced: the first selection was silent. `BulkBar` therefore always
+  renders a visually hidden `role="status"` span (`data-testid="bulk-bar-status"`)
+  outside its `{#if count > 0}`: empty with nothing selected, "N selected"
+  (the `countLabel`) after. A page's own status sentence goes in through the
+  `note` prop and is spoken after the count; the page shows its visible copy
+  of it without a live role. Never put a `role="status"` / `aria-live` inside
+  the bar's snippets: it repeats the bar's region and is inserted with the bar.
+  `a11y/liveRegionAudit.test.ts` pins both; `tests-e2e/invoices/bulk.spec.ts`
+  and `tests-e2e/contracts/action-verdicts.spec.ts` check the region in a browser.
 - Delete is always armed-confirm (one click arms; outside-click or
   second click un-arms or commits). `BulkDeleteButton` does this.
   Pass `confirmLabel` (the armed label) from the catalogue too — its
@@ -469,10 +517,16 @@ per-currency money breakdown, so the pay-bar's subtotals + mixed-currency
 guard stay honest without holding every row); while in matching mode the
 prune effect is skipped and the money totals come from that backend
 breakdown, not the loaded page — mirrors `/invoices`' `selectedAllMatching`.
+Because the prune stands aside, a matching-mode selection must end when the
+filter it was made under changes (`/vendors` keys it on search + status;
+guard: `tests-e2e/vendors/bulk.spec.ts`), or the bar keeps counting, and a
+bulk action keeps acting on, rows the table no longer shows.
 
 Shipped on `/invoices`, `/expenses`, `/vendors` (bulk verify/reject via
 `POST /api/vendors/bulk/status`, bulk re-screen via `.../bulk/screen`, CSV
-export via `.../bulk/export`; gated to `vendor.manage`) and `/contracts`
+export via `.../bulk/export`; each action on its own endpoint's gate:
+verify/reject `vendor.manage`, re-screen admin | ap_manager, export admin |
+ap_manager | cfo, and the checkbox column only when one of them is held) and `/contracts`
 (bulk activate/terminate/cancel via `POST /api/contracts/bulk/status`,
 routed through the same `_transition` helper the single-row lifecycle
 buttons use; CSV export) and the `/payments` **Queue** tab (payment-run
@@ -480,6 +534,16 @@ builder, `GET /api/payments/queue/ids`) — the "select all N matching"
 affordance on each resolves the whole filtered set via that resource's
 `GET .../ids` sibling endpoint (`getVendorIds`/`getContractIds`/`getExpenseIds`)
 rather than only the currently-loaded page.
+
+**"Select all N matching" counts only the rows the action can select.** N is
+the size of the set `GET .../ids` will return, never a `total` that includes
+rows whose checkbox is disabled: `/invoices` subtracts the system-managed
+statuses (`selectableMatchingTotal`), `/exceptions` counts open + escalated
+under All, the payments queue uses the server's `selectable_total`. When the
+tallies behind N are missing or describe another filter (a failed counts
+read), fall back or withhold the button rather than offer the old N. Offer it
+only when N exceeds what is already selected, and format N with
+`formatCount`.
 
 ### Pagination + Load more
 
@@ -1033,6 +1097,7 @@ Where each verdict lives (backend gate → field):
 | Expense card transactions | `actions.{match,create_expense,unmatch,ignore}` | `services/expense_controls.card_txn_{link,unmatch,ignore}_refusal` |
 | Intake | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.intake_transition_refusal` / `.intake_convert_refusal` / `.intake_delete_refusal`. Every refusal hides the control; a row that already names its requisition shows the link instead of Convert (which would only replay it) |
 | Requisitions | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.requisition_{transition,approve,convert,delete}_refusal`. `requisition_approval_segregation` shows Approve disabled with its reason above it (`RowAction reason`, `approve-refusal-<id>`); every other refusal hides the control; a converted row with its PO hides Convert |
+| Contracts (detail modal + bulk bar) | `actions.{activate,terminate,cancel,renew,create_po,delete}` | `services/contract_controls` (decisions §507). Every contract refusal is a status or role one, so each hides its control; when all five lifecycle verdicts refuse, the modal renders no lifecycle block at all (no empty divider) |
 
 Each is pinned by a backend parity test that, for every seeded role and row
 state, asks both sides — the verdict and the real POST — and fails unless they
@@ -1041,7 +1106,7 @@ agree (`tests/test_payment_action_verdicts.py`,
 `tests/test_payment_queue_blocked.py`, `tests/test_expense_action_verdicts.py`,
 `tests/test_offer_experiment_suggestion_verdicts.py`,
 `tests/test_procurement_action_verdicts.py`, `tests/test_sanctions_adjudication_verdicts.py`,
-`tests/test_vendor_erp_manual_link.py`).
+`tests/test_vendor_erp_manual_link.py`, `tests/test_contract_action_verdicts.py`).
 A new verdict ships with one.
 
 Which refusals a page *explains* beside a disabled control, rather than hiding
@@ -1049,6 +1114,22 @@ the control, is a presentation choice keyed on the verdict's `code` — never a
 restated rule. The expenses page explains only `expense_cfo_required` (Approve
 stays visible, disabled, naming the CFO gate) and hides every other refusal,
 the reader's own report included.
+
+**A bulk bar reads the same verdicts.** Which actions a bulk bar offers comes
+from the selected rows' own verdicts, tallied by
+`actionVerdicts.ts::tallyBulkVerdicts(selected, loadedRows, verdictOf)` into
+`{allowed, refused, unknown}` — `unknown` being selected ids beyond the loaded
+pages ("select all N matching"), which only the server can judge.
+`offersBulk(tally)` is true when some row allows the action or some is unknown;
+an action it refuses is **not listed** in the bar's select (never a disabled
+option), and a selection no action fits says so in place of the select. The
+bar states up front how many the server will skip (`refused`), in a visible
+note the select's `aria-describedby` points at, and passes the same sentence
+to `BulkBar`'s `note` prop so the bar's one persistent live region speaks it
+after the count (see Bulk selection above). While `unknown > 0` that count is a floor, so it reads "at least N
+will be skipped" (`contracts.bulk.willSkipAtLeast`), never an exact number.
+/contracts is the reference (`routes/contracts/+page.svelte`, pinned in
+`tests-e2e/contracts/action-verdicts.spec.ts`).
 
 One documented mirror stands in for a missing verdict: the expense list ships no
 per-line refusal, so `/expenses` reads line ownership (decisions §434) through

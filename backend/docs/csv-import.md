@@ -40,7 +40,7 @@ export from the customer's existing system.
 | Column | Required | Notes |
 |---|---|---|
 | `name` | yes | Vendor display name |
-| `code` | no | Internal vendor code / ERP ID. Used for dedup first. |
+| `code` | no | Internal vendor code / ERP vendor number. Used for dedup first, against a vendor's `code` or the ERP record id it is linked by; a code two vendors claim refuses the row (§ A vendor code must name one vendor). |
 | `email` | no | AP contact email |
 | `phone` | no | |
 | `address` | no | |
@@ -65,7 +65,7 @@ should review them on the Vendors page before paying any invoices.
 |---|---|---|
 | `invoice_number` | yes | |
 | `vendor_name` | either | Resolved case-insensitive against the import entity's vendors (and unstamped ones) |
-| `vendor_code` | either | Tried first; falls back to name. Same scope |
+| `vendor_code` | either | Tried first; falls back to name only when no vendor claims it. Same scope. A code that does not name exactly one vendor refuses the row (§ A vendor code must name one vendor) |
 | `amount` | yes | Accepts `1234.56`, `"$1,234.56"`, `"1,000"` (quote if it contains commas!) |
 | `currency` | yes | Three-letter ISO 4217 code (`USD`, `eur`, ` GBP ` — case and spaces are normalized). **No default**: a blank cell, or no `currency` column, refuses the row (§ A blank currency refuses the row). |
 | `invoice_date` | no | `YYYY-MM-DD`, `MM/DD/YYYY`, `DD/MM/YYYY`, `YYYY/MM/DD` |
@@ -186,8 +186,51 @@ matching). The entity's own row wins over an unstamped one of the same name.
   be skipped when any subsidiary held it, leaving the importing entity with no
   vendor at all.
 - Either lookup used to raise `MultipleResultsFound` (a 500 for the whole file)
-  once the same supplier existed under two entities; the scoped lookup takes
-  the first row of a deterministic order instead.
+  once the same supplier existed under two entities; the scoped lookup by name
+  takes the first row of a deterministic order instead. By code it does not
+  pick: two holders refuse the row (§ A vendor code must name one vendor).
+
+## A vendor code must name one vendor
+
+A vendor's `code` holds what a person typed, what an import wrote, and — for a
+vendor an ERP sync created or linked — the ERP's own vendor number (BC No.,
+NetSuite `entityid`, Intacct `VENDORID`, …), which the sync writes there. Those
+namespaces can collide: a code a person chose for one supplier can equal the
+number the ERP gave another, or the ERP record id (`erp_vendor_id`) another
+vendor is linked by. Resolving such a code picks a payee by row order, so both
+importers resolve a code only when it names exactly one vendor in scope
+(decisions §491):
+
+- **Invoice import.** `vendor_code` resolves when exactly one vendor claims it,
+  as its `code` or its `erp_vendor_id`, and that vendor holds it as its `code`.
+  Two claimants — including one entity-stamped and one unstamped, which the
+  name lookup would settle by precedence — or a code that is only some vendor's
+  ERP record id, refuse the row as `csv_vendor_code_ambiguous` (`params:
+  {value}`). The row is not resolved by name instead and no stub is minted:
+  either would guess, or create a third holder of the code.
+  A code that *no* vendor claims falls back to `vendor_name` before a stub is
+  minted, and the name match wins even when that vendor holds a different
+  code (`Acme Ltd,ACME-2` lands on `Acme Ltd`/`ACME-1`); this is accepted on
+  purpose for migrations from a system with other codes (decisions §491).
+- **Vendor import.** A file row whose `code` one vendor holds as its `code`,
+  or holds only as its ERP record id under the *same* name (trimmed,
+  case-insensitive; a duplicate merged into it counts), is that vendor and is
+  skipped quietly as a duplicate. A row whose `code` is only the ERP record id
+  a vendor of *another* name is linked by is not created either — it would
+  share that link — but it is reported, not skipped quietly, as
+  `csv_vendor_code_is_erp_link` (`params: {value, name, vendor}`): `Acme
+  Corp,77` against "Seventy Seven" linked by ERP id 77 says Acme Corp was not
+  created and to give it a different code (decisions §493). It is a row error
+  counted in `skipped`, like every other row not imported. A code two vendors
+  claim refuses the row as `csv_vendor_code_ambiguous`.
+
+The importers only read codes: no vendor's `code` or ERP link is changed, so a
+person-typed code is never moved or reinterpreted. To clear a refusal, give the
+supplier a code no other vendor holds, or merge the vendors if they are one
+supplier. A merged-away vendor keeps its code but claims it for its survivor
+(followed through `merged_into_vendor_id`), so after the merge the code
+resolves to the surviving vendor, and a code only the retired duplicate still
+holds resolves there too. Pinned in `tests/test_csv_import.py`.
 
 ## Every row error is coded
 
@@ -203,6 +246,8 @@ the web import modal (`ImportCsvModal.svelte`, shared by `/vendors` and
 | `csv_vendor_name_required` | vendors | — | `name` is blank. |
 | `csv_invoice_number_required` | invoices | — | `invoice_number` is blank. |
 | `csv_vendor_required` | invoices | — | Both `vendor_name` and `vendor_code` are blank. |
+| `csv_vendor_code_ambiguous` | invoices, vendors | `value` | The code does not name exactly one vendor (§ A vendor code must name one vendor). |
+| `csv_vendor_code_is_erp_link` | vendors | `value`, `name`, `vendor` | The code is only the ERP record id a differently-named vendor is linked by; the row is not created (§ A vendor code must name one vendor). |
 | `csv_amount_invalid` | invoices | `value` | `amount` is blank, unparseable, negative or too wide (§ Amount range). |
 | `csv_currency_required` | invoices, card feed | — | `currency` is blank or missing. |
 | `csv_currency_invalid` | invoices, card feed | `value` | `currency` is not a three-letter code. |

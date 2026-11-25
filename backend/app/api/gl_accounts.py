@@ -25,7 +25,7 @@ from app.models.user import User
 from app.schemas.gl_account import GLAccountCreate, GLAccountErpLinkConfirm, GLAccountUpdate
 from app.services.audit_dispatch import dispatch_audit
 from app.services.credential_crypto import CredentialCryptoError
-from app.services.erp_link_realm import connection_realm
+from app.services.erp_link_realm import connection_realm, link_stamp
 from app.services.gl_account_sync import sync_chart_from_erp
 from app.services.provider_credentials import (
     CREDENTIALS_UNAVAILABLE_DETAIL,
@@ -636,7 +636,8 @@ async def confirm_gl_account_erp_link(
 
     chosen = offered[body.erp_account_id]
     account.erp_account_id = body.erp_account_id
-    account.erp_link_realm = realm
+    # Never NULL, which is reserved for pre-0115 links (decisions §496).
+    account.erp_link_realm = link_stamp(realm)
     account.erp_link_confirmed_at = datetime.now(UTC)
     account.erp_link_confirmed_by = user.id
     account.erp_link_candidates = None
