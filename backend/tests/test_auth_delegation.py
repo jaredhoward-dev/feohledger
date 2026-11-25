@@ -277,3 +277,27 @@ async def test_clearing_delegation_is_audited(delegation_users):
         assert row.delegate_until is None
 
     assert [a["action"] for a in audits] == ["auth.delegation.set", "auth.delegation.cleared"]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("get", "/api/auth/delegation/candidates", None),
+        ("post", "/api/auth/delegation", {"delegate_to_id": str(uuid.uuid4()), "until": "x"}),
+    ],
+)
+async def test_a_caller_without_invoice_approve_is_refused(realdb, method, path, body):
+    """Delegation is for people who approve: the candidate list is a roster of
+    every approver in the org (id + name), and a clerk has no approvals to hand
+    on. Both are gated on `invoice.approve`, ahead of any validation."""
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        resp = await (c.get(path) if method == "get" else c.post(path, json=body))
+    assert resp.status_code == 403, resp.text
+
+
+async def test_reading_and_clearing_your_own_delegation_stay_open(realdb):
+    """Someone who has since lost `invoice.approve` must still be able to see
+    and end a stale delegation of their own."""
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        assert (await c.get("/api/auth/delegation")).status_code == 200
+        assert (await c.delete("/api/auth/delegation")).status_code == 204

@@ -22,7 +22,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.refusals import coded_refusal
 from app.models.invoice import Invoice
-from app.models.user import User
 from app.models.workflow import WorkflowInstance
 
 logger = logging.getLogger(__name__)
@@ -662,18 +661,18 @@ async def resolve_assignee(
 ) -> tuple[uuid.UUID, uuid.UUID | None]:
     """Check if the target user is OOO and resolve to their delegate.
 
-    Returns (effective_assignee_id, original_id_or_none).
-    If no delegation is active, returns (user_id, None).
+    Returns (effective_assignee_id, original_id_or_none). If no delegation is in
+    force — or the stored delegate fails ``delegation.is_eligible_delegate``
+    today (deactivated, moved org, lost ``invoice.approve``, or saved before
+    that was checked) — returns (user_id, None): the original keeps it rather
+    than it being stranded with someone who can never act (decisions §511).
     """
-    result = await control_db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
+    from app.services.delegation import eligible_delegate_of
+
+    delegate = await eligible_delegate_of(user_id, control_db)
+    if delegate is None:
         return user_id, None
-
-    if user.delegate_to_id and user.delegate_until and user.delegate_until > datetime.now(UTC):
-        return user.delegate_to_id, user_id
-
-    return user_id, None
+    return delegate.id, user_id
 
 
 # ------------------------------------------------------------------
@@ -1266,7 +1265,9 @@ def escalation_ineligible(
 async def _resolve_authorized_approvers(approver_ids: list[str]) -> set[str]:
     """Expand a level's named `approver_ids` to include each id's active
     delegate, so a delegate can act in the delegator's place. Returns the
-    original ids plus every resolved delegate, all as strings."""
+    original ids plus every resolved delegate, all as strings. Through
+    :func:`resolve_assignee`, so only a delegate who passes
+    ``delegation.is_eligible_delegate`` today is added (decisions §511)."""
     from app.database import control_session_factory
 
     authorized = set(approver_ids)

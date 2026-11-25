@@ -1147,6 +1147,30 @@ async def resubmit_invoice(
     return invoice
 
 
+async def delegate_refusal(
+    db: AsyncSession,
+    invoice: Invoice,
+    delegate,
+    *,
+    org_settings: dict | None,
+) -> dict | None:
+    """What ``POST /approve`` would refuse ``delegate`` on ``invoice`` with, or
+    ``None`` if they could approve it — :func:`review_refusals` run for the
+    delegate, so routing reads the approval path's own gates (segregation:
+    implicated actors, receivers, inspectors; the max-amount and CFO gates; a
+    named-approver step or chain level) instead of restating them. A delegate
+    who would be refused is not handed the invoice (decisions §511).
+
+    ``delegate`` is a control-plane ``User`` with ``roles`` loaded; its
+    effective permissions are derived here, as ``get_current_user`` would.
+    """
+    from app.api.permissions import effective_permissions
+
+    delegate.effective_permissions = effective_permissions(delegate.roles)
+    verdict = await review_refusals(db, invoice, actor=delegate, org_settings=org_settings)
+    return verdict["approve"]
+
+
 async def assign_reviewer(
     db: AsyncSession,
     invoice: Invoice,
@@ -1155,26 +1179,34 @@ async def assign_reviewer(
     reviewer_id: uuid.UUID,
     reviewer_name: str,
     control_db: AsyncSession | None = None,
+    org_settings: dict | None = None,
 ) -> None:
+    """Assign ``invoice`` for review to ``reviewer_id`` — or, when that reviewer
+    is out of office, to their delegate (decisions §511).
+
+    The delegate is followed only when ``delegation.eligible_delegate_of``
+    passes them TODAY (active, same org, holds ``invoice.approve``) AND
+    :func:`delegate_refusal` finds nothing in this invoice's approval gates that
+    would refuse them (segregation of duties, the money gates, a named-approver
+    step). Otherwise the original reviewer keeps it and the audit row carries no
+    ``delegated_from``: an invoice routed to someone who can never approve it
+    sits owned by nobody. ``control_db`` is required for delegation to be
+    honoured at all; every HTTP caller passes it, with the tenant's
+    ``org_settings`` (the money gates read them).
+    """
     from app.services.audit_dispatch import dispatch_audit
 
-    # Check delegation — if reviewer is OOO, reassign to their delegate
     original_id = None
-    if control_db:
-        from app.services.approval_chain import resolve_assignee
+    if control_db is not None:
+        from app.services.delegation import eligible_delegate_of
 
-        effective_id, original_id = await resolve_assignee(reviewer_id, control_db)
-        if original_id:
-            # Delegation active — look up delegate's name
-            from app.models.user import User as UserModel
-
-            delegate_result = await control_db.execute(
-                select(UserModel).where(UserModel.id == effective_id)
-            )
-            delegate = delegate_result.scalar_one_or_none()
-            if delegate:
-                reviewer_id = effective_id
-                reviewer_name = delegate.full_name
+        delegate = await eligible_delegate_of(reviewer_id, control_db)
+        if delegate is not None and (
+            await delegate_refusal(db, invoice, delegate, org_settings=org_settings) is None
+        ):
+            original_id = reviewer_id
+            reviewer_id = delegate.id
+            reviewer_name = delegate.full_name
 
     invoice.assigned_to_id = reviewer_id
     invoice.assigned_to = reviewer_name

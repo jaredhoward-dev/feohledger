@@ -18,6 +18,7 @@ from app.api.deps import (
     decode_token,
     get_authenticated_user,
     get_current_user,
+    require_permission,
 )
 from app.api.permissions import PERM_INVOICE_APPROVE, effective_permissions
 from app.api.refusals import (
@@ -68,6 +69,7 @@ from app.services.audit_dispatch import dispatch_auth_audit, queue_auth_audit
 from app.services.billing.entitlements import get_entitlements, has_entitlement
 from app.services.billing.plan_catalog import ALL_FEATURES
 from app.services.credential_upgrade import upgrade_password_hash
+from app.services.delegation import is_eligible_delegate
 from app.services.email_adapters import (
     EmailMessage,
     get_email_adapter,
@@ -2345,17 +2347,6 @@ DELEGATION_DELEGATE_NOT_FOUND = "delegation_delegate_not_found"
 DELEGATION_DELEGATE_CANNOT_APPROVE = "delegation_delegate_cannot_approve"
 
 
-def _can_approve(candidate: User) -> bool:
-    """Whether `candidate` could act on an approval routed to them.
-
-    The one eligibility test for a delegate, read by both the candidate list
-    and `set_delegation`, so the picker can never offer someone the write would
-    refuse. Resolved through `effective_permissions`, so a custom role granted
-    `invoice.approve` qualifies and an ap_clerk does not (decisions §511).
-    """
-    return PERM_INVOICE_APPROVE in effective_permissions(candidate.roles)
-
-
 @router.get("/delegation", response_model=DelegationResponse)
 async def get_delegation(
     db: AsyncSession = Depends(get_control_db),
@@ -2383,12 +2374,17 @@ async def get_delegation(
 @router.get("/delegation/candidates", response_model=list[DelegateCandidateResponse])
 async def list_delegate_candidates(
     db: AsyncSession = Depends(get_control_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_INVOICE_APPROVE)),
 ):
     """The colleagues `POST /api/auth/delegation` would accept as the caller's
-    delegate: active, in the caller's organization, not the caller, and able to
-    approve (`_can_approve`). Readable by everyone who may delegate — any
-    signed-in employee — so it carries only id and display name."""
+    delegate: exactly `delegation.is_eligible_delegate` (active, in the
+    caller's organization, not the caller, able to approve), the predicate the
+    write and routing read too.
+
+    Gated on `invoice.approve`, like the write: delegation is for people who
+    approve, and the list is a roster of every approver in the org — not
+    something to hand a clerk or a read-only role (decisions §511). It carries
+    only id and display name."""
     rows = await db.execute(
         select(User)
         .options(selectinload(User.roles))
@@ -2402,7 +2398,7 @@ async def list_delegate_candidates(
     return [
         DelegateCandidateResponse(id=str(candidate.id), full_name=candidate.full_name)
         for candidate in rows.scalars().all()
-        if _can_approve(candidate)
+        if is_eligible_delegate(user, candidate)
     ]
 
 
@@ -2443,7 +2439,7 @@ def _parse_delegate_until(raw: str) -> datetime:
 async def set_delegation(
     body: SetDelegateRequest,
     db: AsyncSession = Depends(get_control_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_INVOICE_APPROVE)),
 ):
     """Set out-of-office delegation — approvals route to delegate.
 
@@ -2451,9 +2447,16 @@ async def set_delegation(
     change is audited (PII-free — ids and the window only). It is not a
     privilege grant: the delegate acts with their own roles, limits and
     segregation-of-duties set. And it is refused for a delegate who could not
-    approve at all (no `invoice.approve`): `review.assign_reviewer` would hand
-    them the invoice regardless, and it would sit with someone who can never
-    act on it (decisions §511).
+    approve at all (no `invoice.approve`): approvals routed to them would sit
+    with someone who can never act on them (decisions §511). The caller must
+    hold `invoice.approve` too — there is nothing of a non-approver's to hand
+    on. The same predicate (`delegation.is_eligible_delegate`) is re-read every
+    time routing follows the delegation, so one that goes stale later falls
+    back to the delegator instead of stranding the invoice.
+
+    Reading and clearing your own delegation stay open to every signed-in
+    user, so someone who has since lost `invoice.approve` can still see and
+    end a stale one.
     """
     try:
         delegate_id = uuid.UUID(body.delegate_to_id)
@@ -2485,7 +2488,9 @@ async def set_delegation(
             status_code=404,
             detail=coded_refusal(DELEGATION_DELEGATE_NOT_FOUND, "Delegate user not found."),
         )
-    if not _can_approve(delegate):
+    if not is_eligible_delegate(user, delegate):
+        # Exists, same org, active, not the caller (checked above): what is
+        # left of the shared predicate is the approve permission.
         raise HTTPException(
             status_code=422,
             detail=coded_refusal(

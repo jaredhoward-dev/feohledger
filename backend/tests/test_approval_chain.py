@@ -45,20 +45,48 @@ def _make_instance(*, state_data=None, steps_config_snapshot=None):
     )
 
 
+_ORG = uuid.uuid4()
+
+
 def _make_user(*, delegate_to_id=None, delegate_until=None):
     return SimpleNamespace(
         id=uuid.uuid4(),
+        organization_id=_ORG,
+        is_active=True,
+        roles=[],
         delegate_to_id=delegate_to_id,
         delegate_until=delegate_until,
     )
 
 
-def _db_returning(scalar_value):
-    """Build an AsyncMock session whose execute() returns scalar_value."""
+def _make_delegate(user_id, *, role="ap_manager", is_active=True, organization_id=_ORG):
+    """A control-plane delegate stand-in: a system role (resolved through the
+    static default-permissions map), active flag and org — what
+    ``delegation.is_eligible_delegate`` reads."""
+    return SimpleNamespace(
+        id=user_id,
+        organization_id=organization_id,
+        is_active=is_active,
+        roles=[SimpleNamespace(name=role, organization_id=None, permissions=None)],
+        delegate_to_id=None,
+        delegate_until=None,
+    )
+
+
+def _db_returning(*scalar_values):
+    """Build an AsyncMock session whose execute() returns the given values in
+    order (the delegator, then the delegate); one value is returned for every
+    call."""
     db = AsyncMock()
-    result = MagicMock()
-    result.scalar_one_or_none = MagicMock(return_value=scalar_value)
-    db.execute = AsyncMock(return_value=result)
+    results = []
+    for value in scalar_values:
+        result = MagicMock()
+        result.scalar_one_or_none = MagicMock(return_value=value)
+        results.append(result)
+    if len(results) == 1:
+        db.execute = AsyncMock(return_value=results[0])
+    else:
+        db.execute = AsyncMock(side_effect=results)
     return db
 
 
@@ -460,11 +488,59 @@ async def test_delegation_active():
     )
     user.id = user_id
 
-    db = _db_returning(user)
+    db = _db_returning(user, _make_delegate(delegate_id))
     effective_id, original_id = await resolve_assignee(user_id, db)
 
     assert effective_id == delegate_id
     assert original_id == user_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delegate_kwargs",
+    [
+        pytest.param({"is_active": False}, id="deactivated"),
+        pytest.param({"role": "ap_clerk"}, id="no-invoice-approve"),
+        pytest.param({"organization_id": uuid.uuid4()}, id="other-org"),
+    ],
+)
+async def test_delegation_to_an_ineligible_delegate_keeps_the_original(delegate_kwargs):
+    """Routing re-checks the delegate every time it follows a delegation
+    (decisions §511): one deactivated, moved out of the org, or without
+    `invoice.approve` — a pre-§511 row naming a clerk, or a role edit / SCIM
+    push since it was saved — would strand the invoice, so the original
+    reviewer keeps it."""
+    from app.services.approval_chain import resolve_assignee
+
+    delegate_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    user = _make_user(
+        delegate_to_id=delegate_id,
+        delegate_until=datetime.now(UTC) + timedelta(days=1),
+    )
+    user.id = user_id
+
+    db = _db_returning(user, _make_delegate(delegate_id, **delegate_kwargs))
+    effective_id, original_id = await resolve_assignee(user_id, db)
+
+    assert effective_id == user_id
+    assert original_id is None
+
+
+@pytest.mark.asyncio
+async def test_delegation_to_a_deleted_delegate_keeps_the_original():
+    from app.services.approval_chain import resolve_assignee
+
+    user_id = uuid.uuid4()
+    user = _make_user(
+        delegate_to_id=uuid.uuid4(),
+        delegate_until=datetime.now(UTC) + timedelta(days=1),
+    )
+    user.id = user_id
+
+    effective_id, original_id = await resolve_assignee(user_id, _db_returning(user, None))
+
+    assert (effective_id, original_id) == (user_id, None)
 
 
 @pytest.mark.asyncio
@@ -527,13 +603,11 @@ async def test_delegation_user_not_found():
 # ---------------------------------------------------------------------------
 
 
-def _ctrl_session_factory(user):
-    """A `control_session_factory`-shaped mock whose lookup returns `user`
-    (or None) for any `SELECT ... WHERE User.id == ...`."""
-    result = MagicMock()
-    result.scalar_one_or_none = MagicMock(return_value=user)
-    ctrl_db = AsyncMock()
-    ctrl_db.execute = AsyncMock(return_value=result)
+def _ctrl_session_factory(user, delegate=None):
+    """A `control_session_factory`-shaped mock whose first lookup returns `user`
+    (or None) and whose second — the delegate, when a delegation is in force —
+    returns `delegate`."""
+    ctrl_db = _db_returning(user) if delegate is None else _db_returning(user, delegate)
     factory = MagicMock()
     factory.return_value.__aenter__ = AsyncMock(return_value=ctrl_db)
     factory.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -595,8 +669,35 @@ async def test_check_level_approver_active_delegate_allowed():
     )
     delegating_user.id = named_approver_id
 
-    with patch("app.database.control_session_factory", _ctrl_session_factory(delegating_user)):
+    with patch(
+        "app.database.control_session_factory",
+        _ctrl_session_factory(delegating_user, _make_delegate(delegate)),
+    ):
         await check_level_approver([str(named_approver_id)], delegate)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_check_level_approver_ineligible_delegate_rejected():
+    """A delegate who has since lost `invoice.approve` does not stand in for
+    the named approver: the same predicate routing reads (decisions §511)."""
+    from app.services.approval_chain import check_level_approver
+
+    named_approver_id = uuid.uuid4()
+    delegate = uuid.uuid4()
+    delegating_user = _make_user(
+        delegate_to_id=delegate,
+        delegate_until=datetime.now(UTC) + timedelta(days=1),
+    )
+    delegating_user.id = named_approver_id
+
+    with patch(
+        "app.database.control_session_factory",
+        _ctrl_session_factory(delegating_user, _make_delegate(delegate, role="ap_clerk")),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await check_level_approver([str(named_approver_id)], delegate)
+
+    assert exc.value.status_code == 403
 
 
 @pytest.mark.asyncio
