@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -622,3 +622,33 @@ async def test_the_exception_row_carries_the_verdict_only_on_a_failed_push(reald
         # says so, and the page hides the panel on it (`isOffered`).
         assert res.status_code == 200, res.text
         assert res.json()["erp_orphan_lookup_refusal"]["code"] == "role_not_permitted"
+
+
+async def test_the_send_door_refuses_while_the_void_is_calling_the_erp(realdb):
+    """The first push, not only the retry: `/send-to-erp` from `approved` goes
+    through the same `start_erp_send`, and a live void marker (a flag void puts
+    the invoice back at `approved` while it calls the ERP, decisions §556)
+    refuses it before anything is dispatched."""
+    from datetime import UTC, datetime
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="ORPH-009", status=InvoiceStatus.approved)
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        inv.erp_void_pending = {
+            "attempt_id": "x",
+            "exception_id": None,
+            "document_id": "ORPHAN-1",
+            "source": "orphan",
+            "started_at": datetime.now(UTC).isoformat(),
+        }
+        await s.commit()
+    with patch("app.services.erp_send.dispatch_erp", new=AsyncMock()) as dispatched:
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(f"/api/invoices/{inv_id}/send-to-erp")
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "erp_void_in_progress"
+    dispatched.assert_not_awaited()
+    async with mk() as s:
+        assert (await s.get(Invoice, inv_id)).status == InvoiceStatus.approved
