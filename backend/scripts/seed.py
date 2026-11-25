@@ -94,6 +94,7 @@ from app.services.control_plane_bootstrap import (
 )
 from app.services.erp_link_realm import UNNAMED_REALM
 from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS, record_acceptances
+from app.services.portal_legal_acceptance import record_acknowledgement
 from app.services.tenant_provisioning import CONTROL_TABLES
 from app.utils.dates import utc_today
 from app.utils.passwords import pwd_context
@@ -386,6 +387,26 @@ async def ensure_seeded_users_accepted_legal(
             organization_id=org_id,
             versions=CURRENT_LEGAL_VERSIONS,
             source=SEED_LEGAL_SOURCE,
+        )
+
+
+async def ensure_seeded_portal_users_acknowledged_privacy(session: AsyncSession) -> None:
+    """Record the Privacy Policy acknowledgement in force for every supplier-portal
+    user in this TENANT database, so the portal's blocking re-prompt
+    (``legal_acceptance_required`` on ``/portal/auth/me``, decisions §499, §500)
+    does not stand between the demo supplier login / every portal e2e spec and
+    the portal.
+
+    The tenant twin of :func:`ensure_seeded_users_accepted_legal`: through
+    ``portal_legal_acceptance.record_acknowledgement``, the one writer, with
+    :data:`SEED_LEGAL_SOURCE`, so a re-run is a no-op and a version bump is
+    picked up by re-running the seed. Runs on the already-seeded path too.
+    Fixture accounts only. Caller commits.
+    """
+    vendor_user_ids = (await session.execute(select(VendorUser.id))).scalars().all()
+    for vendor_user_id in vendor_user_ids:
+        await record_acknowledgement(
+            session, vendor_user_id=vendor_user_id, source=SEED_LEGAL_SOURCE
         )
 
 
@@ -688,6 +709,10 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
         result = await session.execute(text("SELECT count(*) FROM vendors"))
         if result.scalar() > 0:
             print(f"  {tenant_label} tenant already seeded. Skipping.")
+            # Except the portal acknowledgement: a tenant seeded before §500
+            # (or before a Privacy Policy bump) is repaired by re-running.
+            await ensure_seeded_portal_users_acknowledged_privacy(session)
+            await session.commit()
             await engine.dispose()
             return
 
@@ -1893,6 +1918,7 @@ async def seed_tenant(db_name: str, org_id: uuid.UUID, tenant_label: str):
 
         await seed_extras(session, org_id)
 
+        await ensure_seeded_portal_users_acknowledged_privacy(session)
         await session.commit()
         total_invoices = len(invoices) + len(filler_invoices) + len(realistic_invoices)
         total_vendors = len(all_vendors) + len(filler_vendors_list)
@@ -2072,6 +2098,9 @@ async def seed_tenant_lean(db_name: str, org_id: uuid.UUID, tenant_label: str):
             result = await session.execute(text("SELECT count(*) FROM vendors"))
             if result.scalar() > 0:
                 print(f"  {tenant_label} tenant already seeded. Skipping.")
+                # Except the portal acknowledgement (see `seed_tenant`).
+                await ensure_seeded_portal_users_acknowledged_privacy(session)
+                await session.commit()
                 return
 
             # Production-shaped (#575 § 2): the two vendors that own invoices
@@ -2442,6 +2471,7 @@ async def seed_tenant_lean(db_name: str, org_id: uuid.UUID, tenant_label: str):
                 ]
             )
 
+            await ensure_seeded_portal_users_acknowledged_privacy(session)
             await session.commit()
             print(f"  Seeded lean fixtures for {tenant_label} (incl. 1 portal user)")
     finally:
