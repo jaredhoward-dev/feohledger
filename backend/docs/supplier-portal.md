@@ -595,6 +595,7 @@ Routes:
 | `/portal/discount-offers`     | Early-payment discount offers — accept / decline       |
 | `/portal/company`             | Contact (live) + bank/tax change requests (staged) + W-9/W-8 tax-form upload/download (live) + Security (MFA enroll/disable) |
 | `/portal/notifications`       | Email preferences (paid / rejected) — vendor-controlled |
+| `/portal/help`, `/portal/help/<id>` | **Supplier help** — guides (getting started, submit/resubmit, tracking payment, bank-detail changes, card payments) and a short glossary, in the help centre's `Guide` shape (`frontend/src/lib/help/portal.ts`; `frontend/docs/help-centre.md` § Supplier portal help, decisions §509). A behaviour change on this page set updates the guide that describes it |
 
 The portal company form makes the approval-gating visible: bank/tax changes
 show a "pending AP approval" banner (read from `GET /portal/company`'s

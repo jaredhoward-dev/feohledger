@@ -934,12 +934,16 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       **Durable fix:** a panel each in `/organization`, each with its own help
       guide step. **Trigger:** the first customer asking to change
       one, or SCIM onboarding for an enterprise tenant.
-- [ ] **(c) Help for the supplier portal.** The help centre covers the
-      employee web app (the mobile app links to it from Settings → Help,
-      decisions §503). Suppliers get none. **Durable fix:** a portal-side help
-      section (suppliers are a separate audience: submit, get paid, change bank
-      details, card payments) reusing the same content shapes and tests.
-      **Trigger:** the first supplier onboarding at volume.
+- [ ] **(c) Supplier help beyond the first five guides.** The supplier portal
+      has its own help at `/portal/help` (decisions §509): getting started,
+      submit and resubmit, track to payment, bank details, card payments.
+      Not yet covered: purchase-order flip, early-payment offers, W-9 / W-8
+      upload, supplier chat on an invoice, and a search box. **Durable fix:**
+      a guide each in `frontend/src/lib/help/portal.ts` (the tests already
+      hold every new one to the portal), and `searchHelp` over
+      `PORTAL_GUIDES` once there are too many for one page. **Trigger:** the
+      first supplier onboarding at volume, or a support question one of
+      those guides would have answered.
 - [ ] **(c) A custom role can't be granted invoice entry.** Entry is a role
       list by design (decisions §248). **Durable fix:** if a customer needs a
       non-clerk preparer role, add a non-sensitive permission tier the
