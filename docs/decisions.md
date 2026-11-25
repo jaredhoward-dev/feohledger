@@ -27763,3 +27763,95 @@ replicas flag once; a failed read and a capped batch keep bills pending and the
 next listing asks from the last; a failed listing, a paused budget and a
 refusing budget move nothing; unopenable credentials are skipped without the
 exception text; off by default, registered in `sweep_health` and `main`.
+
+## 541. NetSuite status sync is a per-tenant opt-in, off by default; a mock card is charged locally through the real card webhook (§536 / §537 follow-up, round 45)
+
+**Problem 1.** §536 set `NetSuiteAdapter.supports_status_sync = True`, but its
+NetSuite shapes (the `vendorPayment` body, `eid:` read and delete, the SuiteQL
+joins, `lastmodifieddate`) have not been run against a real account (#654). The
+only switch was the deployment-wide `FEOH_ERP_STATUS_SYNC_ENABLED`, so a
+deployment turning it on for QuickBooks or Xero would also have swept every
+NetSuite tenant, held their pushes at `posted_in_erp` instead of `done` (§296)
+and written payments into real NetSuite books with unverified shapes. Every
+reader read the class constant, so there was nowhere to say "not this tenant".
+
+**Decision 1.** Status sync is effective per tenant, through one predicate:
+`erp_adapters.base.reports_status_back(adapter)`, which asks
+`ErpAdapter.status_sync_on()`. The default is the class capability (QuickBooks
+Online and Xero unchanged); NetSuite overrides it to require
+`settings.erp.netsuite_status_sync` = `"on"` (the ERP form's choice) or `true`
+(set by hand); absent, `"off"` or anything else is off. Every reader goes
+through it: `status_sync_active` (the push's `posted_in_erp` vs `done`, and the
+payments queue's `erp_checked`), the sweep's tenant loop, `sync_bills`,
+`sync_org_now`, `status_sync_now_refusal`, `read_back_unstated_figure`, the
+write-back (`write_back_payment`, `_org_adapter`), `payment_erp_sync`'s
+write-back call, and the §528 poll sweep's `pollable_adapter`, so a NetSuite
+tenant without the opt-in is polled exactly as before §536.
+`dispatcher.status_sync_adapter_keys()` stays class-derived, as the candidate
+set the sweep's query selects from. The opt-in never overrides the deployment
+switch: both must be on.
+
+The ERP form gains the choice on NetSuite (**Payment status sync**, `off` /
+`on`, `off` first, a saved block without the key shown as `off`, not a
+destination so toggling it keeps the sealed secrets), with help text telling
+the admin to pass a NetSuite sandbox account first. A field in the catalogue
+rather than an operator-only key, because the person who knows whether the
+sandbox pass happened is the tenant's admin, and the warning is in front of
+them where they switch it.
+
+**Why not a second deployment flag** (`FEOH_ERP_NETSUITE_STATUS_SYNC_ENABLED`).
+It would still be all-or-nothing across tenants, and the verification that
+matters is per account (each NetSuite account's roles, features and
+customizations differ). **Why not drop `supports_status_sync` back to False.**
+The code is built and tested against the fake; removing the capability would
+leave no way to run the sandbox pass that #654 needs.
+
+**Problem 2.** §537 made a run's card leg count only what its card was charged,
+recorded by the card webhook. The mock card adapter has no issuer behind it,
+so on a laptop a card-paid invoice stayed at `payment_scheduled` for good: a
+guard-rail-7 regression.
+
+**Decision 2.** A local equivalent of the issuer's charge:
+`pnpm simulate:card` (`scripts/simulate_card_charge.py` →
+`services/mock_card_simulator.simulate_mock_card_charge`) builds the
+authorization, and with `--settle` the settlement, for one mock card (amount
+in major units as a decimal string, default the card's limit), signs it with
+the tenant's `webhook_signing_secret`, and POSTs it in process to
+`/api/cards/webhook/mock`. The real handler then verifies, dedupes, writes the
+charge through `record_card_spend` and re-dispatches the payment sync, so
+nothing in the simulator writes a card or a payment itself. The handler's
+`mock` branch exists only while `settings.is_deployed` is False; deployed, it
+is an unknown provider (silent 204). A tenant with no secret of its own is
+checked against the public `MOCK_WEBHOOK_LOCAL_SECRET`, reachable only through
+that undeployed branch and only for a card whose `card_provider` is `mock`;
+once a tenant sets a secret, only that secret verifies. The simulator refuses
+(by code) a deployed environment, a tenant whose resolved card provider is
+not `mock`, a card that is not a mock card, and a non-positive or non-finite
+amount.
+
+**Why not an authenticated `/api/cards/{id}/simulate-charge` endpoint.** It
+would add a money-moving route to the production surface, gated only by a
+runtime environment check; a CLI never ships a route. **Why through the
+webhook rather than calling `record_card_spend` directly.** The handler is
+what the issuer exercises: its signature, dedupe, status guards, rebate and
+audit rows and the payment-sync re-dispatch. A shortcut would test a path
+nothing real takes.
+
+No Playwright spec drives a card-paid run to `paid` (the card e2e specs post
+signed Lithic events against seeded rows), so none needed the simulator.
+
+**Guard.** `tests/test_erp_push_flow.py`: `status_sync_active` is False for
+NetSuite without the opt-in, `"off"` or a stray value, True with `"on"` / `true`,
+and False with the opt-in but the deployment switch off.
+`tests/test_netsuite_status_sync_adapter.py`: `status_sync_on` /
+`reports_status_back` per value. `tests/test_erp_status_sync.py`: a NetSuite
+tenant without the opt-in is not swept, `sync_bills` reads nothing and the
+write-back is skipped before any ERP call (the existing NetSuite sweep tests
+now opt in). `tests/test_erp_status_poll_sweep.py`: `pollable_adapter` and the
+sweep end to end poll a NetSuite tenant unless it opted in.
+`tests/test_erp_catalog.py`: the field, its values, default and help key.
+`tests/test_mock_card_simulator.py`: the simulator charges a mock run card leg
+through the real handler with and without a tenant secret (charge on the
+payment, sync dispatched), `--settle` settles and rebates, the local key is
+refused once the tenant has its own, and every refusal, including the
+webhook's mock branch while deployed.

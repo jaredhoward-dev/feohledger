@@ -88,6 +88,21 @@ reaches the deployed site.
 
 The seed script creates 2 organizations, 6 users, 4 roles, 10 vendors, and 10 invoices per tenant.
 
+### Paying by virtual card locally
+
+The demo tenants issue cards through the `mock` provider, which never charges
+them, and a payment run's card leg is paid only once its card is charged. To
+finish one, charge the card the way its issuer would (backend venv active):
+
+```bash
+pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token>
+```
+
+The card's `id` is in `GET /api/cards` (or `virtual_cards.id` in the tenant
+database). Add `--settle` for the settlement too, or `--amount 90.00` for a short charge.
+Details: [backend/docs/virtual-cards.md](../backend/docs/virtual-cards.md)
+§ Charging a mock card locally.
+
 ## What's Running Where
 
 | Service        | URL                       |
