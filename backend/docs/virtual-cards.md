@@ -740,6 +740,7 @@ float.
 | `card.reversal_after_settlement` | a reversal / expiry webhook arrives for a `completed` card — left untouched (refund / chargeback territory) | `last_four`, `status`, `lapse` |
 | `card.clearing_added` | a further clearing raised a settled card's total (decisions §554) | `last_four`, `cleared_amount`, `amount_charged`, `currency`, `rebate_amount` (string Decimals or null) |
 | `card.clearing_refused` | a further clearing on a settled card was not applied (decisions §554) | `last_four`, `reason` (`not_an_increase` \| `provider_single_settlement` \| `no_amount`), `cleared_amount`, `amount_charged`, `currency` |
+| `card.settlement_refused` | a settlement webhook stated no usable figure (absent, zero, unparseable, another currency) — the card and the run leg are left as they were (decisions §557) | `last_four`, `status`, `reason` (`no_amount`), `currency` |
 | `card.settled_after_cancel` | a settlement webhook arrives for a `cancelled` card — the card is left cancelled and a payment-blocking `payment_reconciliation` exception is opened on its invoice (decisions §549) | `last_four`, `status`, `settled_amount` (string Decimal or null), `currency`, `invoice_id` |
 | `card.settled` | settlement webhook completes + accrues the rebate | `last_four`, `from`, `to`, `rebate_amount`, `rebate_rate`, `rebate_base` (string Decimals), `rebate_base_source` (`settled` \| `charged` \| `unknown` — which figure the rebate priced off, see § Rebate base), `rebate_created` (bool — `false` if the one-per-card unique index skipped a duplicate) |
 | `card_rebate.confirmed` | `POST /rebates/{id}/confirm` (`pending` → `confirmed`) | `amount` (string Decimal), `from`, `to` |
@@ -1206,13 +1207,15 @@ open, a further clearing does not open another or rewrite its figure: the
 newest total is on the card, the payment and the `card.clearing_added` rows.
 The `total:` clearing key (Lithic without `events`) is a convenience, not an
 identity: the delta is always `reported − amount_charged`, so a repeat or a
-return to an earlier total never adds twice. **Not verified:** that
-Lithic sends a `card_transaction.updated` per clearing (its docs say a webhook
-is sent "at each step in the transaction lifecycle"), and that its delivery
-carries an `event_id`: without one, `_lithic_event_id` keys an update on
-`token:STATUS`, so a second `SETTLED` delivery is deduped as a replay before it
-reaches this branch (the event-id location is another lane's change this
-round).
+return to an earlier total never adds twice. **Delivery dedupe and clearing
+identity are two layers (decisions §557):** the Redis dedupe keys on the
+delivery's `webhook-id` header (one per delivery, the same on every retry,
+§555), so a retry stops there; a second clearing is a new delivery with a new
+id and reaches this branch, where its own `events` token (or cumulative total)
+says whether it was already applied — which also catches a redelivery that
+outlived the Redis window. **Not verified:** that Lithic sends a
+`card_transaction.updated` per clearing (its docs say a webhook is sent "at
+each step in the transaction lifecycle").
 
 **A settlement on a `cancelled` card (decisions §549)** is the force post that
 arrives after AP voided the payment — reachable since §544, because a lapsed
@@ -1251,7 +1254,7 @@ Each provider's map (`_CARD_EVENT_STAGES`):
   checked 2026-11-25): `CARD_POS_APPROVED_WEBHOOK` → authorization,
   `CARD_SETTLEMENT_DEBIT_WEBHOOK` → settlement,
   `CARD_TRANSACTION_REVERSAL_WEBHOOK` / `CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK`
-  → reversal (amount in `transactionAmount`), and the per-reason declines
+  → reversal, and the per-reason declines
   (`CARD_INSUFFICIENT_FUNDS_DECLINED_WEBHOOK`, `CARD_WRONG_EXPIRY_WEBHOOK`,
   `CARD_WRONG_CVV2_WEBHOOK`, `CARD_MISC_WEBHOOK` — "declined due to the
   Security and Risk policy set by Nium" — ...) → decline. `template` is the
@@ -1273,6 +1276,25 @@ charge amounts in **minor units** (cents — `150000` == `$1,500.00`), Nium in
 **major units** (`50.00` == `$50.00`). The handler divides Lithic amounts by
 100 and takes Nium amounts as-is, so a Nium charge is no longer recorded (and
 rebated) at 1/100th of its value.
+
+**Nium names its figure per template (`_NIUM_AMOUNT_FIELDS`, decisions §557,
+checked 2026-11-25):** `CARD_POS_APPROVED_WEBHOOK` → `transactionAmount` +
+`transactionCurrency`; `CARD_SETTLEMENT_DEBIT_WEBHOOK` → `authAmount` +
+`authCurrency` (it carries no `transactionAmount`);
+`CARD_TRANSACTION_REVERSAL_WEBHOOK` / `..._ADVICE_WEBHOOK` → `transactionAmount`
++ `transactionCurrency` (the `settlement-debit`, `pos-approved`,
+`transaction-reversal` and `transaction-reversal-advice` pages under
+<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events>).
+`amount` is no Nium field and is not read. A figure whose stated currency is
+not the card's is read as absent, never converted.
+
+**A settlement with no usable figure is refused (decisions §557).** Absent,
+zero or negative, unparseable, or in another currency: the card keeps its
+state and figure, nothing is written onto the run's card leg (it stays in
+flight, so the invoice never reaches `paid` on a guess), no rebate is minted,
+and a `card.settlement_refused` row (`reason: no_amount`) is left for a person
+to reconcile with the provider. The card's limit and its authorized hold are
+never stand-ins for what cleared.
 
 **Every rejection path returns `204` silently** (bad/missing/stale
 signature, wrong partner key, unknown card token, missing delivery id,
@@ -1391,6 +1413,10 @@ A rebate is earned on what actually **settled**. `resolve_rebate_base` in
 | present | any | the settled figure | `settled` |
 | absent | present | the authorized figure | `authorized` |
 | absent | absent | `0` | `unknown` |
+
+Since decisions §557 a settlement with no usable figure is refused before the
+rebate is computed, so the webhook only ever reaches the `settled` row; the
+other two rows remain the helper's contract for any other caller.
 
 The settlement branch previously read `card.amount_charged or
 card.amount_limit`, which was wrong twice over:

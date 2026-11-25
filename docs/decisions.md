@@ -28905,7 +28905,7 @@ and that its delivery carries an `event_id`: without one, `_lithic_event_id`
 keys an update on `token:STATUS`, so a second `SETTLED` delivery is deduped as
 a replay in Redis before this branch runs. That key is the provider-contract
 lane's this round; once the delivery id is read, this branch applies the
-clearing with no further change. Also unverified: that Nium's reversal repeats
+clearing with no further change. (Reconciled with §555 in §557: it is.) Also unverified: that Nium's reversal repeats
 its authorization's `authCode`.
 
 **Guard.** `tests/test_card_authorization_lapse.py`: per provider, a reversal /
@@ -29077,3 +29077,87 @@ unsupported / failed, RBAC, audit, the shared void with replay, a bill the
 lookup no longer names, a paid orphan, the retry door, the mock and QuickBooks
 lookups); `frontend/src/lib/api/erpOrphanBill.test.ts`;
 `frontend/tests-e2e/exceptions/void-erp-orphan-bill.spec.ts`.
+
+## 557. The card-order and card-contract lanes reconciled: delivery dedupe and clearing identity are separate layers; a Nium figure is read from the field its template documents, and a settlement with no usable figure is refused (§554 / §555 follow-up, round 47)
+
+**Reconciliation.** §554 (out-of-order lapses, further clearings, migration
+0148) was written against the old delivery id, Lithic's `token:STATUS`
+fallback; §555 replaced it with each provider's header (`webhook-id`,
+`x-request-id`). Merged, the two layers now do different jobs and neither
+double-records nor drops:
+
+* *Retry* — the same delivery again carries the same `webhook-id`, so the Redis
+  claim stops it before any state is read.
+* *A real second clearing* — a new delivery with a new id passes the claim and
+  reaches §554's branch, where its identity is the newest `CLEARING` /
+  `RETURN` / `RETURN_REVERSAL` token in Lithic's `events` (else the transaction
+  token plus its cumulative `settled_amount`), recorded in
+  `card_transaction_events`. A redelivery that outlives the Redis window is
+  still a no-op there. Nium and the mock key a clearing on the delivery id,
+  which for Nium is `x-request-id` — and a further Nium settlement is refused
+  anyway (§554).
+* `_card_transaction_id` reads Lithic's transaction only from `event_type`
+  (§555 dropped `type`), its `token`; Nium's `rhaTransactionId`, else
+  `authCode`. Nium's settlement page documents **no** `rhaTransactionId`
+  (only `authCode` / `originalAuthCode`), so a settlement is identified by the
+  auth code — harmless, since the transaction id only matches lapses to
+  authorizations, and clearings key on the delivery.
+* Tests: §554's `_body` helper signs through `_webhook_headers` (Standard
+  Webhooks for Lithic, `x-partner-key` for Nium) and uses `event_type`; its
+  out-of-order case no longer sends a Nium expiry (no such template, §555). The
+  handler-level fake in `test_webhook_security.py` now answers only the card
+  lookup with the card, so §554's transaction-memory reads find nothing rather
+  than the card itself. `test_a_lithic_retry_is_deduped_and_a_second_clearing_still_applies`
+  pins the two layers together.
+
+**Nium's settlement figure (found by §555).** The handler read `amount`, then
+`transactionAmount`; Nium documents neither on `CARD_SETTLEMENT_DEBIT_WEBHOOK`,
+whose figure is `authAmount` beside `authCurrency`, so a real Nium settlement
+read as "no amount" and was completed on the authorized hold (itself the
+card's limit when the authorization carried no figure either). Read per
+template from Nium's own pages (checked 2026-11-25), each a major-unit string
+taken as an exact `Decimal` (`api/cards._NIUM_AMOUNT_FIELDS`):
+
+| Template | Figure | Currency | Source |
+|---|---|---|---|
+| `CARD_POS_APPROVED_WEBHOOK` | `transactionAmount` | `transactionCurrency` | <https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/pos-approved> |
+| `CARD_SETTLEMENT_DEBIT_WEBHOOK` | `authAmount` | `authCurrency` | <https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/settlement-debit> |
+| `CARD_TRANSACTION_REVERSAL_WEBHOOK` | `transactionAmount` | `transactionCurrency` | <https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal> |
+| `CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK` | `transactionAmount` | `transactionCurrency` | <https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal-advice> |
+
+The approval's `authAmount` is not read: it has no currency field of its own
+on that page, and the reversal states `transactionAmount`, so reading the same
+field on both keeps §544's partial-reversal comparison like for like. A figure
+whose stated currency differs from the card's is read as absent, never
+converted. Declines are read for no figure.
+
+**A settlement with no usable figure is refused, for every provider.** Absent,
+zero or negative, unparseable, or in another currency: the card keeps its state
+and figure, nothing is written onto the run's card leg (it stays `in_flight`,
+so the invoice never reaches `paid` on a guess), no rebate, no `card.settled`
+row, no payment sync; one `card.settlement_refused` row (`reason: no_amount`)
+is left for a person. This replaces the earlier "rebate on the authorized
+figure" fallback for the webhook (the `resolve_rebate_base` table stands as the
+helper's contract): writing the hold, or the limit, onto the run payment's
+`settled_amount` is the guess the money invariants forbid, and a leg left in
+flight is the existing, visible state of an unsettled card. No payment-blocking
+exception is opened: the card is still `charged` (spent), so it cannot be
+voided and re-paid on another rail, and the leg cannot close — the unsafe
+direction is already shut. The cancelled-card branch (§549) and the further
+clearing branch (§554, `no_amount`) already refused or flagged an absent
+figure and are unchanged.
+
+**Not verified.** Nium's units are inferred from its examples (`"1.00"`,
+`"10.00"`); the pages do not say "major units". That the settlement's
+`authCurrency` is the card's currency rather than the merchant's has not been
+seen on a live Nium sandbox; if it is the merchant's, a cross-currency Nium
+settlement is refused (fail-closed) rather than misrecorded.
+
+**Tests.** `backend/tests/test_card_money_path_regression.py`: a settlement
+with no figure, zero, an unparseable figure or another currency is refused with
+one `card.settlement_refused` row and nothing else changed; a Nium settlement
+carrying only the undocumented `amount` is refused and the documented
+`authAmount` one completes at the exact figure; the Lithic retry / second
+clearing case above. Nium bodies in the card tests (and the e2e
+`webhook-security.spec.ts` approval) are shaped by the documented field per
+template (`NIUM_AMOUNT_FIELDS`).
