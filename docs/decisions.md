@@ -29236,3 +29236,30 @@ not what is typed into the form. `docs/sub-processors.md` § 21 says the same.
   The §498 rule still holds: a mobile build older than the bump can only sign
   out until it is updated, so this ships with or after a mobile release that
   carries it.
+
+## 559. The Cookie Notice names hCaptcha on the two pages that load it, as strictly necessary and outside the consent banner (§558 follow-up, round 47)
+
+The Cookie Notice said no third-party code ran on any page, but since §553
+hCaptcha's script loads on `/signup` and `/find-workspace` on every deployment.
+`/legal/cookies` now says so in § 1, § 3, § 4, § 6 and § 7, and § 8 has an
+`#hcaptcha` subsection: the two pages (and that it is on neither the sign-in
+page, the signed-in app, the portal nor the legal pages, per the imports of
+`HCaptcha.svelte`); that the script reads browser and device signals (an Art.
+5(3) access in itself); what it may store, from hCaptcha's own Cookie Policy
+(https://www.hcaptcha.com/privacy, last updated 2025-09-24, read 2026-11-25),
+which lists `__cf_bm`, `__cflb`, `INGRESSCOOKIE`, `hc_accessibility` and
+`hmt_id` but does not say which its embedded widget sets and calls its list
+possibly incomplete, so the page says "may set or read" and points to that
+policy rather than adding rows to our inventory table, which stays the app's
+own keys (`storageInventory.test.ts` cannot see a third party's storage); what
+hCaptcha receives, worded as in §558; purpose (security on two forms that email
+any typed address) and basis (legitimate interests, Art. 6(1)(f), as in the
+Privacy § 5 table). **The banner does not gate it, and the page says so:**
+`getConsent()` still has no caller, the banner's own copy limits it to optional
+storage, and the captcha is treated as strictly necessary to the form the
+visitor asked to use. No behaviour changed and no banner string changed. Not
+versioned: the Cookie Notice is not an accepted document (§495), and
+`LAST_UPDATED` is already 2026-11-25. *Open for the CISO / counsel, not settled
+here:* whether a third-party captcha that also reads device signals can rely on
+the strictly-necessary exemption in every jurisdiction served; if not, the fix
+is a consent or alternative path on those two forms, not a wording change.

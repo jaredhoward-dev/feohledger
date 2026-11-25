@@ -28,7 +28,7 @@
 
 <LegalPage
 	title="Cookie Notice"
-	intro="{OPERATOR.serviceName} sets one cookie, and only to remember your colour theme. This notice explains what else the app stores in your browser, why that storage is covered by the same law that governs cookies, and how to control the one category of it that is optional."
+	intro="{OPERATOR.serviceName} sets one cookie, and only to remember your colour theme. This notice explains what else the app stores in your browser, the one third-party security check that runs on two public forms, why that storage is covered by the same law that governs cookies, and how to control the one category of it that is optional."
 >
 	<h2 id="summary">1. In short</h2>
 	<p>
@@ -44,6 +44,13 @@
 		does not run any analytics or tracking code anywhere in the app today. The consent banner you may
 		see offers a category reserved for that kind of storage in case it is ever added — nothing is loaded
 		under it right now.
+	</p>
+	<p>
+		One piece of third-party code does run in your browser, on two public pages only: the sign-up
+		form and the workspace lookup (<code>/find-workspace</code>) load a security check from
+		<strong>hCaptcha</strong>, which tells people apart from automated abuse. It is not analytics or
+		tracking, it is not anywhere inside the signed-in app, and what it stores is hCaptcha's own
+		rather than part of the table below. <a href="#hcaptcha">Section 8</a> describes it.
 	</p>
 	<p>
 		For the wider picture of what personal data {OPERATOR.serviceName} holds and why, see the <a
@@ -72,7 +79,8 @@
 		This is the complete list. Nothing else is written to <code>localStorage</code> or
 		<code>sessionStorage</code>
 		by the {OPERATOR.serviceName} application, and the only cookie it sets is
-		<code>feoh_theme</code>.
+		<code>feoh_theme</code>. Anything hCaptcha's script stores on the two pages that load it is
+		set by hCaptcha, not by the application, and is covered in <a href="#hcaptcha">Section 8</a>.
 	</p>
 	<div class="table-scroll" tabindex="0" role="region" aria-labelledby="inventory">
 		<table>
@@ -248,7 +256,9 @@
 		The banner also shows a category for optional, non-essential storage, currently labelled
 		"Analytics (optional)." As of this notice, <strong>nothing is loaded under that category</strong
 		>: {OPERATOR.serviceName} runs no analytics, advertising, or tracking code of any kind, first-party
-		or third-party, on any page. The category exists so that consent can be collected before such code
+		or third-party, on any page. The only third-party code it loads is hCaptcha's security check on
+		the sign-up form and the workspace lookup, which is strictly necessary to those two forms and is
+		not under this category (<a href="#hcaptcha">Section 8</a>). The category exists so that consent can be collected before such code
 		is ever added — not because it is active today. If that changes, this notice and the banner will
 		both be updated in the same change that adds it, and the new storage will only ever be set for
 		someone who has actively accepted the category going forward, never retroactively for someone who
@@ -292,7 +302,8 @@
 		Nothing in the product changes if you choose "Reject non-essential." You can sign in, upload
 		and review invoices, run approvals, and use the supplier portal exactly as before, because
 		every piece of storage that makes those things work is in the strictly-necessary or functional
-		rows above, not behind your choice. The only storage your choice actually governs is whatever
+		rows above, not behind your choice. hCaptcha's check on the sign-up form and the workspace
+		lookup also runs whichever you choose, for the reason given in Section 8. The only storage your choice actually governs is whatever
 		might one day load under the optional category described in Section 4 — and since nothing
 		loads under it today, refusing is, honestly, a no-op recorded for the future. It will start
 		mattering, and will be honored, the day an optional category actually begins loading
@@ -307,7 +318,7 @@
 		(GPC) signal or the legacy <strong>Do Not Track</strong> (DNT) browser header — there is no code
 		in the app that reads either one. We say this plainly rather than claim support that doesn't exist.
 		In practice this has no effect on you today: nothing beyond strictly necessary and functional storage
-		is ever set, with or without a GPC/DNT signal present, so there is currently nothing for either signal
+		(hCaptcha's security check, Section 8, included) is ever set, with or without a GPC/DNT signal present, so there is currently nothing for either signal
 		to opt you out of. If an optional storage category is ever activated (Section 4), honoring GPC as
 		an automatic opt-out will be built as part of that same change, not added afterward.
 	</p>
@@ -327,8 +338,57 @@
 		from. If your organization has separately connected a third-party service of its own choosing
 		outside {OPERATOR.serviceName} — for example, its own marketing site, chat widget, or single
 		sign-on provider — that third party's own site or service may set its own cookies or storage
-		under its own domain, governed by its own notice. This document describes only what the {OPERATOR.serviceName}
-		application itself stores in your browser.
+		under its own domain, governed by its own notice. Apart from hCaptcha, described next, this
+		document describes only what the {OPERATOR.serviceName} application itself stores in your browser.
+	</p>
+
+	<h3 id="hcaptcha">hCaptcha on the sign-up form and the workspace lookup</h3>
+	<p>
+		<strong>Where it runs.</strong> Two public pages load hCaptcha's script, from
+		<code>hcaptcha.com</code>: the self-service sign-up form (<code>/signup</code>), and the
+		workspace lookup (<code>/find-workspace</code>), where someone who has forgotten their
+		workspace address asks for it to be emailed to them. The lookup is available on every
+		deployment, so hCaptcha is loaded there whether sign-up is open or closed. The script draws the
+		challenge in a frame served from hCaptcha's own domain. It is not loaded on the sign-in page,
+		anywhere inside the signed-in app, in the supplier portal, or on these legal pages.
+	</p>
+	<p>
+		<strong>What it reads and may store.</strong> While the form is open, hCaptcha's script reads
+		signals from your browser and device to judge whether a person is filling it in; its privacy
+		policy gives examples such as mouse movements, scroll position, key presses, browser type,
+		device type and operating system. Reading that information is itself covered by the ePrivacy
+		rule in Section 2. hCaptcha, not {OPERATOR.serviceName}, decides what it stores in your
+		browser, under its own domains, and {OPERATOR.serviceName} does not read it. hCaptcha's Cookie
+		Policy (part of its <a href="https://www.hcaptcha.com/privacy" rel="noopener noreferrer"
+			>Privacy Policy</a
+		>, last updated 24 September 2025, read 25 November 2026) lists cookies it uses for security
+		(<code>__cf_bm</code>, up to one day), load balancing and routing (for example
+		<code>__cflb</code> and <code>INGRESSCOOKIE</code>, up to 30 days), accessibility
+		(<code>hc_accessibility</code>) and anonymous statistics and accessibility support
+		(<code>hmt_id</code>, 30 days). It does not say which of these its script sets on a site that
+		embeds it, and it says its list may not be complete. So we can only say that opening either of
+		those two pages may let hCaptcha set or read cookies or similar storage in your browser for the
+		purposes its policy gives; for the exact items, hCaptcha's policy is the authority.
+	</p>
+	<p>
+		<strong>What hCaptcha receives.</strong> The signals its script collects in the page and, when
+		you submit the form, the challenge token and your IP address, which our server sends to
+		hCaptcha to check the token. It does not receive what you type into the form. The
+		<a href="/legal/sub-processors">sub-processor register</a> and the
+		<a href="/legal/privacy">Privacy Policy</a> say the same.
+	</p>
+	<p>
+		<strong>Why, and the consent banner.</strong> Both forms send an email to whatever address is
+		typed into them, so without a check anyone could use them to send email to strangers
+		automatically. The check is part of the form you asked to use, and the
+		form cannot be submitted without it, so we treat it as strictly necessary to that form rather
+		than as optional storage. The personal data involved is processed on the basis of legitimate
+		interests (Article 6(1)(f) GDPR), as the Privacy Policy states for account security. For the
+		same reason the consent banner does not control it: hCaptcha loads on those two pages whether
+		you chose "Reject non-essential", "Accept all", or nothing yet. If you would rather not run it,
+		do not use those two forms; your organization's administrator can give you your workspace
+		address instead. If a content blocker stops hCaptcha's script, the form says so and cannot be
+		submitted.
 	</p>
 
 	<h2 id="changes">9. Changes to this notice, and contact</h2>
