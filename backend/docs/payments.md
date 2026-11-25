@@ -952,6 +952,7 @@ assertion has to be true. Two honest failure states rather than a misleading
 |---|---|
 | `card_already_charged` | the occupying card is `charged`/`completed` — its funds already moved, under a *different* payment |
 | `card_authorized_before` | the occupying card is unspent again because its authorization lapsed (decisions §544), but it was authorized once (`first_authorized_at`), and a single-use card is closed at the provider by that. Retry-safe: cancel it (the void accepts it) and the re-send mints a fresh card (decisions §549) |
+| `card_settlement_refused` | a settlement on the occupying card was refused for stating no usable figure (decisions §562), so money may have moved on it although it reads unspent. Not retry-safe: the card can be neither cancelled by hand nor reused until a person reconciles it with the provider (the invoice also carries a blocking `card_settlement_refused` flag) |
 | `card_already_issued_insufficient_limit` | the card is live and unspent but its `amount_limit` is below this payment's amount |
 | `card_issuance_conflict` | the contended live-card slot was empty on re-read (the winner cancelled its card in between) — surfaced for AP rather than silently re-calling the provider |
 
@@ -1583,7 +1584,16 @@ capture) adds to the card's figure and `record_card_spend` writes the new
 total onto the leg's `settled_amount`, once per clearing, with the payment
 sync re-dispatched; a total past the leg's amount opens one payment-blocking
 `payment_reconciliation` flag (kind `card_over_settled`), and a decrease (a
-refund) or a further Nium settlement is refused and only audited (§554).
+refund) is refused and only audited (§554). A further Nium settlement, or one
+with no figure, is refused and also opens a blocking `card_clearing_refused`
+flag, and a change to a completed leg's `settled_amount` writes a
+`payment.settled_amount_changed` row on the payment (decisions §562). A
+**first** settlement with no usable figure (§557) leaves the card in its state
+but records a durable `settlement_refused` fact on it and opens a blocking
+`card_settlement_refused` flag: the card may read `active` after a lapse, and
+the fact is what stops a hand cancel (409 `card_cancel_settlement_refused`),
+the void's card leg (`card_already_charged`) and a run's reuse
+(`card_settlement_refused`) from treating it as unspent (§562).
 
 ##### A figure the column cannot hold
 

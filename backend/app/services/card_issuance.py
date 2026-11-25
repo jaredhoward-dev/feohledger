@@ -276,7 +276,13 @@ async def lock_invoices_for_mint(
     return [inv for inv in invoices if inv.vendor_id is None or inv.vendor_id in locked_vendors]
 
 
-def card_settlement_block(card: VirtualCard, amount, *, now: datetime | None = None) -> str | None:
+def card_settlement_block(
+    card: VirtualCard,
+    amount,
+    *,
+    now: datetime | None = None,
+    settlement_refused: bool = False,
+) -> str | None:
     """Why ``card`` cannot settle a payment of ``amount`` — ``None`` if it can.
 
     Only asked of a card this payment did NOT mint. Converging a payment onto a
@@ -313,6 +319,14 @@ def card_settlement_block(card: VirtualCard, amount, *, now: datetime | None = N
       Refused as ``card_limit_exceeds_payment`` before anything moves; cancel the
       card and the next run mints one for the booked amount.
 
+    - **Settlement refused.** A settlement on the card was refused for stating
+      no usable figure (decisions §562): money may have moved although the card
+      reads unspent. ``settlement_refused`` is
+      ``card_transaction_memory.settlement_refused`` for the card, read by the
+      caller (this function stays synchronous). Refused as
+      ``card_settlement_refused``; it is NOT retry-safe — the card stays until a
+      person has reconciled it with the provider.
+
     ``now`` is injectable so the expiry boundary is testable without freezing the
     clock; it defaults to the current UTC time. A card with no ``expires_at`` is
     treated as non-expiring — the column is nullable and several providers do not
@@ -323,6 +337,8 @@ def card_settlement_block(card: VirtualCard, amount, *, now: datetime | None = N
     """
     if card.status in CARD_SPENT_STATUSES:
         return "card_already_charged"
+    if settlement_refused:
+        return "card_settlement_refused"
     if card.first_authorized_at is not None:
         # Authorized once, then the hold lapsed (decisions §544), so the card
         # reads unspent. But a single-use card is closed at the provider by its

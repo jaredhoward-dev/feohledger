@@ -3895,6 +3895,16 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return '末尾 $lastFour のカードの決済は有効な金額がなかったため拒否されました。記録されないままカードで資金が動いた可能性があります。カード発行会社でその請求を確認してください。解決するまで、このカードは取消できず、この請求書は新しい支払実行の対象外です。';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return '末尾 $lastFour のカードへの追加請求が記録されていないため、この請求書への支払額は表示より多い可能性があります。カード発行会社でその請求を確認し、差額を記録してください。解決するまで、この請求書は新しい支払実行の対象外です。';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

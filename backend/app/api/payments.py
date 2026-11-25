@@ -1772,6 +1772,13 @@ async def _cancel_card_for_void(
         return "card_already_cancelled"
     if card.status in CARD_SPENT_STATUSES:
         return "card_already_charged"
+    from app.services import card_transaction_memory as card_memory
+
+    if await card_memory.settlement_refused(db, card):
+        # A refused settlement may have spent it although it reads unspent
+        # (decisions §562): treated as charged, so the card keeps the invoice's
+        # live-card slot and no other rail pays it until a person reconciles.
+        return "card_already_charged"
 
     outcome = await cancel_card_at_provider(
         card=card,
@@ -4309,7 +4316,13 @@ async def _execute_single_payment(
             # Converging marks this payment `completed` — money moved. Only do
             # that against a card that can actually be what moved it (unspent,
             # and big enough). See `card_settlement_block`.
-            block = card_settlement_block(card, payment.amount)
+            from app.services import card_transaction_memory as card_memory
+
+            block = card_settlement_block(
+                card,
+                payment.amount,
+                settlement_refused=await card_memory.settlement_refused(db, card),
+            )
             if block is not None:
                 payment.status = "failed"
                 payment.failure_reason = block

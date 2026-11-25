@@ -4089,6 +4089,16 @@ class AppLocalizationsEs extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Se rechazó una liquidación de la tarjeta terminada en $lastFour porque no indicaba un importe utilizable, así que puede haberse movido dinero en la tarjeta sin registrarse. Revise el cargo con el proveedor de la tarjeta: la tarjeta no se puede cancelar y esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'No se registró un cargo adicional en la tarjeta terminada en $lastFour, así que lo pagado por esta factura puede ser mayor de lo que se muestra. Revise el cargo con el proveedor de la tarjeta y registre la diferencia: esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

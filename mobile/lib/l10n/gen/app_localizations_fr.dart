@@ -4098,6 +4098,16 @@ class AppLocalizationsFr extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Un règlement sur la carte se terminant par $lastFour a été refusé car il n’indiquait aucun montant exploitable ; de l’argent a donc pu être débité sur la carte sans être enregistré. Vérifiez le débit auprès du fournisseur de la carte : la carte ne peut pas être annulée et cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Un débit supplémentaire sur la carte se terminant par $lastFour n’a pas été enregistré ; le montant payé pour cette facture peut donc dépasser celui affiché. Vérifiez le débit auprès du fournisseur de la carte et enregistrez l’écart : cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

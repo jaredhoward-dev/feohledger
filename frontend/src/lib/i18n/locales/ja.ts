@@ -772,6 +772,8 @@ export const messages = {
 	'exceptions.description.paymentDispatchInterruptedFailed': "支払い {paymentId} は失敗しましたが、以前の送信試行が決済代行会社に届いた可能性がある時点で中断されたため、資金が移動したかどうかは不明です。決済代行会社に確認し、取消または再支払いを行ってください。解決するまで、この請求書は新しい支払実行の対象外です。",
 	'exceptions.description.paymentDispatchInterruptedCancelled': "支払い {paymentId} はキャンセルされましたが、以前の送信試行が決済代行会社に届いた可能性がある時点で中断されたため、資金が移動したかどうかは不明です。決済代行会社に確認し、取消または再支払いを行ってください。解決するまで、この請求書は新しい支払実行の対象外です。",
 	'exceptions.description.cardSettledAfterCancel': "末尾 {lastFour} のカードが取消後に請求されたため、この請求書は二重に支払われた可能性があります。カード発行会社でその請求を確認し、この請求書の他の支払いと照合して重複分を回収してください。解決するまで、この請求書は新しい支払実行の対象外です。",
+	'exceptions.description.cardSettlementRefused': "末尾 {lastFour} のカードの決済は有効な金額がなかったため拒否されました。記録されないままカードで資金が動いた可能性があります。カード発行会社でその請求を確認してください。解決するまで、このカードは取消できず、この請求書は新しい支払実行の対象外です。",
+	'exceptions.description.cardClearingRefused': "末尾 {lastFour} のカードへの追加請求が記録されていないため、この請求書への支払額は表示より多い可能性があります。カード発行会社でその請求を確認し、差額を記録してください。解決するまで、この請求書は新しい支払実行の対象外です。",
 	'exceptions.description.settlementCurrencyMismatch': "決済通貨の不一致: 決済代行会社の報告は {settledAmount} {settledCurrency} ですが、この支払いの承認額は {authorizedAmount} {authorizedCurrency} です。承認されていない通貨で資金が移動しました。この請求書を解放する前に決済代行会社と照合してください。",
 	'exceptions.description.settlementAmountOver': "決済金額の不一致: 決済代行会社の報告は {settledAmount} {settledCurrency} で、承認額 {authorizedAmount} {authorizedCurrency} を上回っています（差異 {variance}）。承認されていない金額で資金が移動しました。この請求書を解放する前に決済代行会社と照合してください。",
 	'exceptions.description.settlementAmountUnder': "決済金額の不一致: 決済代行会社の報告は {settledAmount} {settledCurrency} で、承認額 {authorizedAmount} {authorizedCurrency} を下回っています（差異 {variance}）。承認されていない金額で資金が移動しました。この請求書を解放する前に決済代行会社と照合してください。",

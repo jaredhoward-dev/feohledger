@@ -333,6 +333,10 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.payment_dispatch_interrupted_cancelled': 'exceptions.description.paymentDispatchInterruptedCancelled',
 	// The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.
 	'exception.card_settled_after_cancel': 'exceptions.description.cardSettledAfterCancel',
+	// A settlement on the card ending {lastFour} was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.
+	'exception.card_settlement_refused': 'exceptions.description.cardSettlementRefused',
+	// A further charge on the card ending {lastFour} was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.
+	'exception.card_clearing_refused': 'exceptions.description.cardClearingRefused',
 	// Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
 	'exception.settlement_currency_mismatch': 'exceptions.description.settlementCurrencyMismatch',
 	// Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, MORE than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.
@@ -502,6 +506,8 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.payment_dispatch_interrupted_failed': { paymentId: 'text' },
 	'exception.payment_dispatch_interrupted_cancelled': { paymentId: 'text' },
 	'exception.card_settled_after_cancel': { lastFour: 'text' },
+	'exception.card_settlement_refused': { lastFour: 'text' },
+	'exception.card_clearing_refused': { lastFour: 'text' },
 	'exception.settlement_currency_mismatch': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text' },
 	'exception.settlement_amount_over': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text', variance: 'number' },
 	'exception.settlement_amount_under': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text', variance: 'number' },

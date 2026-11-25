@@ -4088,6 +4088,16 @@ class AppLocalizationsPt extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Uma liquidação do cartão com final $lastFour foi recusada por não informar um valor utilizável, então pode ter havido movimentação de dinheiro no cartão sem registro. Confira a cobrança com o provedor do cartão — o cartão não pode ser cancelado e esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Uma cobrança adicional no cartão com final $lastFour não foi registrada, então o valor pago nesta fatura pode ser maior que o exibido. Confira a cobrança com o provedor do cartão e registre a diferença — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,
@@ -9200,6 +9210,16 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
     return 'O cartão com final $lastFour foi cobrado depois de cancelado, então esta fatura pode ter sido paga duas vezes. Confira a cobrança com o provedor do cartão e os outros pagamentos desta fatura e recupere o valor duplicado — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Uma liquidação do cartão com final $lastFour foi recusada por não informar um valor utilizável, então pode ter havido movimentação de dinheiro no cartão sem registro. Confira a cobrança com o provedor do cartão — o cartão não pode ser cancelado e esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Uma cobrança adicional no cartão com final $lastFour não foi registrada, então o valor pago nesta fatura pode ser maior que o exibido. Confira a cobrança com o provedor do cartão e registre a diferença — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
   }
 
   @override

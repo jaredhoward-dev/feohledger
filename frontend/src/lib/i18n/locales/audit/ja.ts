@@ -256,6 +256,7 @@ export const messages = {
 	'audit.action.payment.failed': "支払失敗",
 	'audit.action.payment.recorded_outside': "FeohLedger外の支払を記録",
 	'audit.action.payment.retried': "支払を再試行",
+	'audit.action.payment.settled_amount_changed': "決済金額を変更",
 	'audit.action.payment.settlement_accepted': "決済を承認",
 	'audit.action.payment.void_card_cancel_retried': "無効化後のカード取消を再試行",
 	'audit.action.payment.voided': "支払を無効化",

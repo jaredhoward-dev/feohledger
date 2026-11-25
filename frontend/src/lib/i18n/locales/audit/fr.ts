@@ -256,6 +256,7 @@ export const messages = {
 	'audit.action.payment.failed': "Paiement échoué",
 	'audit.action.payment.recorded_outside': "Paiement enregistré hors de FeohLedger",
 	'audit.action.payment.retried': "Paiement relancé",
+	'audit.action.payment.settled_amount_changed': "Montant réglé modifié",
 	'audit.action.payment.settlement_accepted': "Règlement accepté",
 	'audit.action.payment.void_card_cancel_retried': "Annulation de carte relancée après annulation",
 	'audit.action.payment.voided': "Paiement annulé",

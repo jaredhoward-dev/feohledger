@@ -1797,6 +1797,25 @@ async def test_a_lithic_incremental_capture_adds_to_the_card_and_the_run_payment
         "event:c2",
     ]
     assert await _over_flags(realdb, card_id) == []
+    # The run payment's settled figure changed after it completed: that is a
+    # payment-state change with its own row on the payment (decisions §562).
+    async with realdb.sessionmaker(TENANT)() as s:
+        (changed,) = (
+            (
+                await s.execute(
+                    select(AuditLog).where(
+                        AuditLog.entity_id == pay_id,
+                        AuditLog.action == "payment.settled_amount_changed",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert changed.entity_type == "payment"
+    assert changed.details["from"] == "100.00" and changed.details["to"] == "150.00"
+    assert changed.details["currency"] == "USD"
+    assert token not in json.dumps(changed.details)
 
 
 async def test_a_lithic_retry_is_deduped_and_a_second_clearing_still_applies(realdb):
@@ -1939,6 +1958,31 @@ async def test_a_further_clearing_that_cannot_be_applied_is_refused_explicitly(
     (row,) = await _card_audits(realdb, card_id, "card.clearing_refused")
     assert row.details["reason"] == reason
     assert row.details["amount_charged"] == "100.00"
+
+    # A further clearing that may hide money moved (a Nium second settlement)
+    # reaches a person as a blocking reconciliation flag, not only an audit
+    # row; a decrease (a refund) is the refund flow's (decisions §562).
+    from tests.test_card_authorization_lapse import _reconciliation_flags
+
+    flags = await _reconciliation_flags(realdb, card_id)
+    if reason == "provider_single_settlement":
+        (flag,) = flags
+        assert flag.status == "open"
+        assert flag.erp_report["kind"] == "card_clearing_refused"
+        assert flag.erp_report["reason"] == reason
+        assert flag.description_code == "exception.card_clearing_refused"
+        assert token not in json.dumps(flag.erp_report)
+    else:
+        assert flags == []
+    async with realdb.sessionmaker(TENANT)() as s:
+        assert (
+            await s.execute(
+                select(AuditLog).where(
+                    AuditLog.entity_id == pay_id,
+                    AuditLog.action == "payment.settled_amount_changed",
+                )
+            )
+        ).scalars().all() == []
 
 
 async def test_a_lithic_partly_cleared_transaction_is_read_by_its_settled_amount(realdb):
