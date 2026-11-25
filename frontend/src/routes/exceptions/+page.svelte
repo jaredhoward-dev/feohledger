@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { page as pageStore } from '$app/state';
 	import { afterNavigate, replaceState } from '$app/navigation';
 	import { api } from '#lib/api.ts';
@@ -720,6 +720,11 @@
 			isErpPaidReport(resolveTarget.erp_report) &&
 			isOffered(resolveTarget.record_erp_payment_refusal)
 	);
+	/** The "void the bill in the ERP" panel (decisions §539) sits above the
+	 *  note too, so it holds the note's autofocus back for the same reason. */
+	const voidPanelShown = $derived(
+		!!resolveTarget && isOffered(resolveTarget.void_erp_bill_refusal)
+	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
 
@@ -759,14 +764,17 @@
 
 	// ---- Void the flagged bill in the ERP (decisions §539) ----
 	// A confirm dialog of its own: the void reaches into the customer's ERP and
-	// cannot be undone from here, so it is never one click from the queue.
+	// cannot be undone from here, so it is never one click from the queue. It
+	// STACKS on the flag's dialog rather than replacing it (the focus trap keeps
+	// a stack): Cancel / Escape closes only the confirm and the trap hands focus
+	// back to "Void the bill…", and `?id=` keeps naming the flag throughout.
 	let voidBillTarget = $state<ExceptionItem | null>(null);
 	let voidBillReason = $state('');
 	let voidingBill = $state(false);
 	let voidBillError = $state('');
+	let resolveNoteInput = $state<HTMLInputElement | null>(null);
 
 	function openVoidBill(target: ExceptionItem) {
-		resolveTarget = null;
 		voidBillTarget = target;
 		voidBillReason = '';
 		voidBillError = '';
@@ -781,8 +789,11 @@
 		try {
 			await api.post(`/api/exceptions/${target.id}/void-erp-bill`, { reason });
 			toast(m('exceptions.erpVoid.done', { invoice: target.invoice_number ?? '—' }), 'success');
+			// Back to the flag, which stays open until a person decides it (the
+			// panel says so): close only the confirm, then re-read the flag so
+			// its dialog shows the verdicts after the void.
 			voidBillTarget = null;
-			await Promise.all([loadExceptions(), loadSummary()]);
+			await Promise.all([refreshResolveTarget(target.id), loadExceptions(), loadSummary()]);
 		} catch (err) {
 			voidBillError = formatApiDetail(
 				err instanceof Error ? err.message : undefined,
@@ -791,6 +802,34 @@
 		} finally {
 			voidingBill = false;
 		}
+	}
+
+	/**
+	 * Re-read the open flag's row (the detail read carries the same verdicts as
+	 * a list row) and show it in the dialog, keeping the note being typed. A
+	 * failed read leaves the row as it was: the server still judges any click.
+	 *
+	 * The re-read usually disables "Void the bill…" (the bill is gone), which
+	 * the confirm's close had just returned focus to; a disabled control drops
+	 * focus without a `focusout`, so it moves to the note, the decision left.
+	 */
+	async function refreshResolveTarget(id: string) {
+		let fresh: ExceptionItem;
+		try {
+			fresh = await api.get<ExceptionItem>(`/api/exceptions/${encodeURIComponent(id)}`);
+		} catch {
+			return;
+		}
+		if (resolveTarget?.id !== id) return;
+		resolveTarget = fresh;
+		await tick();
+		const active = document.activeElement as HTMLElement | null;
+		const lost =
+			!active ||
+			active === document.body ||
+			!active.isConnected ||
+			(active as HTMLButtonElement).disabled === true;
+		if (lost && voidBillTarget === null) resolveNoteInput?.focus();
 	}
 
 	function openBulkResolve() {
@@ -1516,6 +1555,13 @@
 					{#if erpError}
 						<p class="modal-error" role="alert" data-testid="erp-payment-error">{erpError}</p>
 					{/if}
+					{#if resolveTarget.record_erp_payment_refusal}
+						<RefusalNote
+							id="erp-payment-refusal"
+							testid="erp-payment-refusal"
+							reason={refusalText(resolveTarget.record_erp_payment_refusal, m)}
+						/>
+					{/if}
 					<div class="modal-footer">
 						<button
 							type="submit"
@@ -1534,20 +1580,22 @@
 							{recordingErp ? m('exceptions.erpPayment.recording') : m('exceptions.erpPayment.record')}
 						</button>
 					</div>
-					{#if resolveTarget.record_erp_payment_refusal}
-						<p class="modal-hint" id="erp-payment-refusal" data-testid="erp-payment-refusal">
-							{refusalText(resolveTarget.record_erp_payment_refusal, m)}
-						</p>
-					{/if}
 				</form>
 			</section>
 		{/if}
-		{#if isOffered(resolveTarget.void_erp_bill_refusal)}
+		{#if voidPanelShown}
 			<!-- A duplicate / fraud flag on an invoice whose bill may already be in
 			     the ERP, where it can be paid past our gate (decisions §539). -->
 			<section class="erp-payment" data-testid="erp-void-panel" aria-labelledby="erp-void-title">
 				<h3 id="erp-void-title">{m('exceptions.erpVoid.title', { erp: erpName(resolveTarget) })}</h3>
 				<p class="modal-hint">{m('exceptions.erpVoid.intro', { erp: erpName(resolveTarget) })}</p>
+				{#if resolveTarget.void_erp_bill_refusal}
+					<RefusalNote
+						id="erp-void-refusal"
+						testid="erp-void-refusal"
+						reason={refusalText(resolveTarget.void_erp_bill_refusal, m)}
+					/>
+				{/if}
 				<div class="modal-footer">
 					<button
 						type="button"
@@ -1560,11 +1608,6 @@
 						{m('exceptions.erpVoid.open')}
 					</button>
 				</div>
-				{#if resolveTarget.void_erp_bill_refusal}
-					<p class="modal-hint" id="erp-void-refusal" data-testid="erp-void-refusal">
-						{refusalText(resolveTarget.void_erp_bill_refusal, m)}
-					</p>
-				{/if}
 			</section>
 		{/if}
 		<!-- `data-testid` is the e2e suite's handle on this dialog, so a spec
@@ -1580,7 +1623,8 @@
 					bind:value={resolutionText}
 					placeholder={m('exceptions.resolveModal.notePlaceholder')}
 					maxlength="500"
-					data-autofocus={erpPanelShown ? undefined : true}
+					bind:this={resolveNoteInput}
+					data-autofocus={erpPanelShown || voidPanelShown ? undefined : true}
 				/>
 			</label>
 			{#if decisionRefused}

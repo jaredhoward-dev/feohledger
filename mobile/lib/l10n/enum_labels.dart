@@ -100,5 +100,6 @@ String notificationEventLabel(AppLocalizations l, String eventType) =>
       'invoice_paid' => l.notificationEventInvoicePaid,
       'contract_renewal_due' => l.notificationEventContractRenewalDue,
       'chat_message' => l.notificationEventChatMessage,
+      'erp_bill_flagged' => l.notificationEventErpBillFlagged,
       _ => l.notificationEventOther,
     };

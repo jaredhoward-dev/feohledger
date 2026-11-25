@@ -8,8 +8,9 @@ class AppNotification {
   final String id;
   final String eventType;
 
-  /// `invoice` | `contract` (backend default `invoice`). Drives tap-navigation:
-  /// only an `invoice` row with an [entityId] deep-links to a detail screen.
+  /// `invoice` | `contract` | `exception` (backend default `invoice`). Drives
+  /// tap-navigation: an `invoice` or `exception` row with an [entityId]
+  /// deep-links to its detail screen.
   final String entityType;
   final String? entityId;
   final String title;
@@ -36,6 +37,11 @@ class AppNotification {
   /// types — e.g. `contract` — have no mobile detail screen yet, so they just
   /// mark read.)
   bool get linksToInvoice => entityType == 'invoice' && entityId != null;
+
+  /// Can this row deep-link to an exception detail screen on tap? The
+  /// `erp_bill_flagged` notice names the flag (decisions §539), the same row
+  /// the web opens at `/exceptions?id=`.
+  bool get linksToException => entityType == 'exception' && entityId != null;
 
   factory AppNotification.fromJson(Map<String, dynamic> json) {
     return AppNotification(

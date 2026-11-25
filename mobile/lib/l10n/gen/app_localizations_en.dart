@@ -4919,6 +4919,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get notificationEventChatMessage => 'New message';
 
   @override
+  String get notificationEventErpBillFlagged => 'Flag on a bill already in the ERP';
+
+  @override
   String get notificationEventOther => 'Notification';
 
   @override

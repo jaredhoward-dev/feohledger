@@ -1133,6 +1133,7 @@
   "notificationEventInvoicePaid": "Rechnung bezahlt",
   "notificationEventContractRenewalDue": "Vertragsverlängerung fällig",
   "notificationEventChatMessage": "Neue Nachricht",
+  "notificationEventErpBillFlagged": "Markierung einer bereits im ERP gebuchten Rechnung",
   "notificationEventOther": "Benachrichtigung",
   "notificationUnread": "Ungelesen",
   "relativeTimeJustNow": "gerade eben",

@@ -4397,6 +4397,10 @@
   "notificationEventInvoicePaid": "Invoice paid",
   "notificationEventContractRenewalDue": "Contract renewal due",
   "notificationEventChatMessage": "New message",
+  "notificationEventErpBillFlagged": "Flag on a bill already in the ERP",
+  "@notificationEventErpBillFlagged": {
+    "description": "A duplicate or fraud flag raised on an invoice whose bill is already in the ERP (event erp_bill_flagged)."
+  },
   "notificationEventOther": "Notification",
   "@notificationEventOther": {
     "description": "An event type this app version does not know."
