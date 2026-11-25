@@ -27530,3 +27530,72 @@ with the figure on the payment; a short charge holds and is acceptable.
 `tests/test_card_money_path_regression.py`: the signed webhook writes the
 authorized then the settled figure onto the run payment and dispatches the
 sync each time; a card no payment owns writes and dispatches nothing.
+
+## 538. The mock connection's bills are its own company's, `"mock:mock-company"`, so the poll sweep and the webhook read them under the one realm rule (§533 follow-up, round 45)
+
+**Context.** §533 made the `erp-status-poll` sweep and the generic webhook
+share `erp_link_realm.bill_realm_clause`, under which a connection that names
+no company attributes no bill. The mock connection named none
+(`connection_realm` None), so on a laptop the sweep polled nothing and could
+not be exercised end to end (guard rail 7), and its tests had to stand a
+`generic` ERP served by the mock adapter in for it.
+
+**Decision.** The mock gets a fixed company for its BILLS:
+`erp_link_realm.MOCK_BILL_REALM = "mock:mock-company"`, returned by a new
+`bill_realm(erp_config)` (the connection realm for every other adapter). The
+push records `bill_realm(config)` as `state_data["erp_realm"]` (so a push with
+no ERP configured, which goes through the mock, records it too), and
+`bill_realm_clause` reads the current realm through it. The rule itself is
+unchanged: the current realm, NULL only under `legacy_links_trusted`, nothing
+for a connection that names no company (no ERP configured, an OAuth ERP with no
+consent).
+
+- *Bills only, not links.* `connection_realm(mock)` stays None, so the push,
+  the syncs and the write-back treat the mock's vendor and account links
+  exactly as before (§496): its ids are fixtures and it posts nowhere, so
+  filtering them would only refuse every NULL fixture link at a local push and
+  turn on a write-back to the mock. A bill, by contrast, has one issuer, and the
+  realm is what lets a status report about its id be attributed.
+- *No collision.* `mock:` is the mock adapter's own key, so no real adapter's
+  realm can equal it, and it has a `:`, so it is never the link stamp
+  `UNNAMED_REALM` (`"mock"`). A bill recorded `"mock"` matches nothing.
+- *Every reader of a bill's realm checked.* The QuickBooks / Xero status sync,
+  the write-back (`bill_for_writeback`) and the vendor-unlink in-flight count
+  compare a bill's realm with a real connection's, which `MOCK_BILL_REALM`
+  never equals; under the mock the write-back still returns no bill. One reader
+  had to change: `record_pending_erp_void` queued a void for any bill with a
+  recorded realm, and a mock bill now has one, so a payment void on it would
+  leave a pending marker no sweep could ever clear (`void_written_payment`
+  skips it). It now skips `MOCK_BILL_REALM` too. Seed data (`scripts/seed.py`,
+  the e2e seeds) writes no pushed bills, so nothing there changes.
+
+**Existing NULL-realm mock bills: never trusted on the mock.** A mock push
+before this recorded `erp_realm` null, which looks exactly like a pre-realm
+push. On a mock tenant `bill_realm_clause` does not consult
+`legacy_links_trusted` at all: a NULL bill there may be a real ERP's from
+before realms were recorded (a tenant that switched to mock), and the mock's
+realm is no 0115 snapshot to trust it under. They are not backfilled, for
+§496's reason: nothing on the row says which push made it (§141). Such a bill
+stays unpolled and unmatched; re-pushing it, or re-seeding a dev database,
+records the realm. Under a real ERP these rows keep §423's rule unchanged.
+Their ids are `MOCK-<12 hex>`, which no real ERP issues, so a legacy-trusted
+match against one is not a practical risk; `docs/followups.md` item (c) is
+about NULL *links* posted to a real company and is unaffected.
+
+**Rejected.** *`connection_realm(mock)` returning a realm*: the link side
+(above) would change for every local push and sync, and the write-back would
+start writing to the mock. *Trusting NULL bills on the mock*: it widens the
+match to ids a real ERP may have issued. *A second clause for the mock in the
+sweep*: §533's "one rule" is kept; only the realm the mock reports changed.
+
+**Guard.** `tests/test_erp_link_realm.py`: `bill_realm` per adapter, and the
+clause matches nothing for a realm-less real adapter and never NULL on the mock
+whatever its snapshot. `tests/test_erp_push_flow.py`: a push through the mock
+(configured or defaulted) records `MOCK_BILL_REALM`.
+`tests/test_erp_status_poll_sweep.py` now runs against the real mock connection
+(the `generic` stand-in is kept only for the legacy-snapshot cases), polls a
+mock-pushed bill, and never a NULL or `"mock"`-stamped one.
+`tests/test_erp_webhook_transitions.py`: the mock route matches its bill by
+document id and leaves the NULL and stamp rows alone.
+`tests/test_erp_payment_writeback.py`: voiding a payment on a mock bill records
+no ERP void.

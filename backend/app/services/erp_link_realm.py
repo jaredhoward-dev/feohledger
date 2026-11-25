@@ -36,7 +36,8 @@ not disturbed. Migration 0131 stamped the links and bills of a connection that
 already had a location with that location, the only one anything recorded.
 
 ``None`` means "no company can be named": the ``mock`` adapter (its ids are
-fixtures and it posts nowhere), or an OAuth ERP with no completed consent
+fixtures and it posts nowhere; its BILLS are recorded under
+:data:`MOCK_BILL_REALM` instead, §538), or an OAuth ERP with no completed consent
 (which cannot post at all: ``OAuthErpAdapter.external_tenant_id`` raises). Links
 are not filtered under ``None`` — refusing them would only replace the
 ``not_connected`` refusal with a misleading ``vendor_not_linked``.
@@ -75,7 +76,9 @@ from app.services.erp_adapters.dispatcher import MOCK_ADAPTER_KEY, resolve_adapt
 
 __all__ = [
     "LEGACY_REALM_KEY",
+    "MOCK_BILL_REALM",
     "UNNAMED_REALM",
+    "bill_realm",
     "bill_realm_clause",
     "connection_realm",
     "legacy_links_trusted",
@@ -88,6 +91,17 @@ __all__ = [
 #: The ``erp_link_realm`` of a link made by a pull that names no company
 #: (``connection_realm`` None). No ``:``, so no real realm can equal it.
 UNNAMED_REALM = "mock"
+
+#: The company the ``mock`` adapter's bills live in (docs/decisions.md §538).
+#: The mock connection names no company for LINKS (``connection_realm`` None:
+#: its vendor and account ids are fixtures and it posts nowhere, so filtering
+#: them would only refuse every NULL fixture link at a local push), but its
+#: BILLS do have one issuer, the mock itself. A push through it records this
+#: realm, so the generic webhook and the status polling sweep attribute its
+#: bills under the one rule (:func:`bill_realm_clause`) like any real ERP's.
+#: ``mock:`` is the mock adapter's own key, so no real adapter's realm can
+#: equal it, and it is never a link stamp (:data:`UNNAMED_REALM` has no ``:``).
+MOCK_BILL_REALM = "mock:mock-company"
 
 #: Adapters connected through OAuth: the consent's provider company id.
 _OAUTH_ADAPTERS = frozenset({"quickbooks_online", "xero", "sage_accounting", "blackbaud_fe_nxt"})
@@ -182,24 +196,41 @@ def link_is_live(link_realm: str | None, realm: str | None, *, trust_legacy: boo
     return link_realm == realm
 
 
+def bill_realm(erp_config: Any) -> str | None:
+    """The realm a bill pushed under ``erp_config`` is recorded in
+    (``state_data["erp_realm"]``) and read back under: the connection's realm,
+    or :data:`MOCK_BILL_REALM` for the ``mock`` adapter (§538). None for an
+    absent config and an OAuth ERP with no completed consent: no company can be
+    named, and such a connection cannot post anyway."""
+    if not isinstance(erp_config, dict) or not erp_config:
+        return None
+    if resolve_adapter_key(erp_config) == MOCK_ADAPTER_KEY:
+        return MOCK_BILL_REALM
+    return connection_realm(erp_config)
+
+
 def bill_realm_clause(recorded_realm, erp_config: Any):
     """Which pushed bills a status report about a bill id may name, as a SQL
     filter on the push's recorded realm (``state_data["erp_realm"]``), or None
-    when none may: the connection names no company (``mock``, an OAuth ERP with
-    no completed consent), so no id can be attributed to one.
+    when none may: the connection names no company (an OAuth ERP with no
+    completed consent, no ERP configured), so no id can be attributed to one.
 
     A bill counts when its push recorded the realm the tenant is connected to
-    now, and a pre-realm (NULL) push only while :func:`legacy_links_trusted`
-    holds (decisions §417, §423). ERP document ids are small per-ERP numbers,
-    so a bill another ERP issued must never be read against this one. The one
-    statement of the rule for every reader of a bill by its ERP id: the generic
-    webhook's document-id lookup and the status polling sweep (§533).
+    now (:func:`bill_realm`: the ``mock`` connection's is
+    :data:`MOCK_BILL_REALM`, §538), and a pre-realm (NULL) push only while
+    :func:`legacy_links_trusted` holds (decisions §417, §423). The mock never
+    trusts one: a NULL bill on a mock tenant may be a real ERP's from before
+    realms were recorded, and the mock's realm is no 0115 snapshot. ERP
+    document ids are small per-ERP numbers, so a bill another ERP issued must
+    never be read against this one. The one statement of the rule for every
+    reader of a bill by its ERP id: the generic webhook's document-id lookup
+    and the status polling sweep (§533).
     """
-    realm = connection_realm(erp_config)
+    realm = bill_realm(erp_config)
     if realm is None:
         return None
     clause = recorded_realm == realm
-    if legacy_links_trusted(erp_config, realm):
+    if realm != MOCK_BILL_REALM and legacy_links_trusted(erp_config, realm):
         clause = or_(clause, recorded_realm.is_(None))
     return clause
 

@@ -1203,20 +1203,76 @@ async def test_a_pre_realm_push_and_a_current_one_sharing_an_id_resolve_to_the_c
     "erp_config",
     [
         {},
-        {"integration_method": "direct", "type": "mock"},
         {"integration_method": "direct", "type": "quickbooks_online"},
+        {"integration_method": "direct", "type": "sage_accounting"},
     ],
 )
 async def test_a_document_id_matches_nothing_when_no_company_can_be_named(erp_config):
-    """No connection realm (``mock``, an OAuth ERP with no consent) names no
-    company a document id could belong to: the lookup refuses before querying
-    (decisions §423)."""
+    """No connection realm (no ERP configured, an OAuth ERP with no consent)
+    names no company a document id could belong to: the lookup refuses before
+    querying (decisions §423). The mock is no longer one: its bills are its own
+    company's (§538, below)."""
     from app.api.erp_webhook import _invoice_id_by_document
 
     db = MagicMock()
     db.execute = AsyncMock()
     assert await _invoice_id_by_document(db, "1042", erp_config) is None
     db.execute.assert_not_awaited()
+
+
+async def _mock_tenant(realdb, *, legacy_realm=None):
+    """Tenant ``a`` on the mock ERP with its webhook key sealed (§538)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models.organization import Organization
+    from app.services.erp_link_realm import LEGACY_REALM_KEY
+
+    erp = {"type": "mock", "integration_method": "direct"}
+    if legacy_realm is not None:
+        erp[LEGACY_REALM_KEY] = legacy_realm
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        org.settings = {**(org.settings or {}), "erp": erp}
+        flag_modified(org, "settings")
+        await s.commit()
+    await realdb.store_provider_secrets("a", "erp", {"webhook_signing_secret": "erp-secret"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_realm", [None, "mock:mock-company"])
+async def test_a_document_id_matches_a_bill_the_mock_pushed_and_never_a_pre_realm_one(
+    realdb, monkeypatch, fake_redis, legacy_realm
+):
+    """§538: a mock push records ``MOCK_BILL_REALM``, so the mock's own webhook
+    route matches its bill by document id under the normal rule. A NULL-realm
+    bill on the same id is never trusted on the mock, whatever the snapshot
+    says: it may be a real ERP's from before realms were recorded. A link
+    stamp (``"mock"``) is never a bill's realm."""
+    from app.api import erp_webhook
+    from app.services.erp_link_realm import MOCK_BILL_REALM, UNNAMED_REALM, bill_realm
+
+    await _mock_tenant(realdb, legacy_realm=legacy_realm)
+    assert bill_realm({"type": "mock", "integration_method": "direct"}) == MOCK_BILL_REALM
+    legacy = await _pushed_invoice(realdb, "MOCK-7", realm=None)
+    stamp = await _pushed_invoice(realdb, "MOCK-8", realm=UNNAMED_REALM)
+    mocked = await _pushed_invoice(realdb, "MOCK-7", realm=MOCK_BILL_REALM)
+
+    monkeypatch.setattr(erp_webhook, "control_session_factory", realdb.control_sessionmaker())
+    for doc in ("MOCK-7", "MOCK-8"):
+        body = json.loads(_doc_only_body(doc))
+        body["tenant_slug"] = realdb.info("a").slug
+        raw = json.dumps(body).encode("utf-8")
+        assert (
+            await erp_webhook.erp_webhook(
+                erp_type="mock",
+                request=_fake_request(raw, {"X-Webhook-Signature": _sign("erp-secret", raw)}),
+            )
+            is None
+        )
+
+    assert await _invoice_status(realdb, mocked) == InvoiceStatus.posted_in_erp
+    assert await _invoice_status(realdb, legacy) == InvoiceStatus.sent_to_erp
+    assert await _invoice_status(realdb, stamp) == InvoiceStatus.sent_to_erp
 
 
 @pytest.mark.asyncio
