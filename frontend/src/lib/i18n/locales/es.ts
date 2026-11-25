@@ -84,6 +84,11 @@ export const messages = {
 	'shell.accountLoad.errorHeading': 'No pudimos cargar su cuenta',
 	'shell.accountLoad.errorBody':
 		'El servidor no respondió. Compruebe su conexión e inténtelo de nuevo, o cierre sesión y vuelva a iniciarla.',
+	'shell.legalAccept.heading': 'Revisa y acepta nuestros términos',
+	'shell.legalAccept.body': 'Antes de continuar, lee y acepta los términos del servicio y la política de privacidad vigentes. Si no estás de acuerdo, cierra sesión.',
+	'shell.legalAccept.continue': 'Aceptar y continuar',
+	'shell.legalAccept.continuing': 'Guardando…',
+	'shell.legalAccept.failed': 'No se guardó tu aceptación. Inténtalo de nuevo.',
 
 	// Common buttons / states
 	'common.save': 'Guardar',
