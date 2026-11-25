@@ -2,7 +2,9 @@
  * The bill a failed ERP push may have left in the ERP (decisions §556):
  * `GET /api/invoices/{id}/erp-orphan-bill` names it by the adapter's read-only
  * idempotency lookup, `POST /api/invoices/{id}/void-erp-orphan-bill` voids it
- * through the flag void's shared flow. Both gate on `payment.void`.
+ * through the flag void's shared flow. Both gate on `payment.void`. Whether
+ * to show the panel is the server's verdict `erp_orphan_lookup_refusal`
+ * (decisions §560), never a rule restated here.
  */
 /** The bill the lookup named: the ERP's ids, its total, where it stands. */
 export interface OrphanBill {
@@ -28,15 +30,6 @@ export type OrphanState =
   | { kind: "error"; message: string }
   | { kind: "none" }
   | { kind: "found"; bill: OrphanBill };
-
-/** Offered only on a failed push, to someone holding `payment.void`; the
- *  server's verdict on the rest (possibly posted, adapter) comes back coded. */
-export function orphanLookupOffered(
-  status: string | null | undefined,
-  canVoid: boolean,
-): boolean {
-  return canVoid && status === "failed";
-}
 
 /** The state a lookup answer (or its error) puts the panel in. A coded 409 /
  *  502 is a refusal shown beside the control; anything else is an error. */

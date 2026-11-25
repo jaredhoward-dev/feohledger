@@ -43,6 +43,11 @@ export type InvoiceActionVerdicts = {
 	 *  approval, no bill the ERP may hold, no live payment or virtual card
 	 *  (decisions §374). */
 	recall_approval: ActionRefusal;
+	/** `GET /erp-orphan-bill` ("Find it in the ERP") — `erp_bill_void.
+	 *  orphan_lookup_verdict`: `payment.void`, then an adapter with a lookup.
+	 *  Present only on a failed push that may have left a bill in the ERP
+	 *  (decisions §556 / §560); absent, nothing is offered. */
+	erp_orphan_lookup_refusal?: ActionRefusal;
 };
 
 /** `invoice_not_completable` — `/complete` from a status it does not advance

@@ -446,6 +446,24 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   Render it only when `spansSeveralRails(parts)`. Shared by the exception
   dialog and the payment queue's "Record as paid" (decisions §413, §426).
 
+### `erp/`
+
+- `ErpOrphanBill.svelte` — the bill a failed ERP push may have left in the ERP
+  (decisions §556, §560): **Find it in the ERP** (`GET /api/invoices/{id}/erp-orphan-bill`,
+  read-only), then **Void this bill…**, a stacked confirm `ui/Modal` with a
+  required reason (`POST /api/invoices/{id}/void-erp-orphan-bill`). Props:
+  `invoiceId`, `verdict` (the served `erp_orphan_lookup_refusal`: a refusal
+  disables Find with its `RefusalNote`), `idPrefix` (ids and test ids),
+  `invoiceHref` (a host with no Retry ERP Send of its own — the exception
+  dialog — links the keep hint there; otherwise the hint names the button by
+  `invoices.modal.erp.retrySend`), `onvoided`. Searching / found / none /
+  refused / voided render in one always-mounted `role="status"` region; an
+  uncoded failure is a `role="alert"` of its own. After a void focus moves to
+  Find and the "voided" line stays until the host remounts it. The host renders
+  it only when `isOffered(verdict)` and wraps it in `{#key invoiceId}`. Shared
+  by the invoice modal and the exception dialog;
+  `tests-e2e/exceptions/void-erp-orphan-bill.spec.ts`.
+
 ### `organization/`
 
 - `CloseWorkspacePanel.svelte` — the Organization → Close workspace panel (decisions §306). Props:

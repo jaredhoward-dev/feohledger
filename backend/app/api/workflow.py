@@ -616,7 +616,9 @@ async def review_actions(
     ``invoice_entry.manage_file_refusal`` the `/file` routes',
     ``invoice_entry.edit_financials_refusal`` what `PATCH` (on a financial
     field) and `PUT /line-items` would answer (decisions §370), and
-    ``review.recall_refusal`` `/recall-approval`'s (decisions §374). The modal offers
+    ``review.recall_refusal`` `/recall-approval`'s (decisions §374), and — on a
+    failed push that may have left a bill only — ``erp_orphan_lookup_refusal``,
+    what ``GET /erp-orphan-bill`` answers before it calls the ERP (§560). The modal offers
     an action exactly when its verdict is ``null`` and states the refusal
     otherwise, so it never restates a rule.
 
@@ -632,9 +634,19 @@ async def review_actions(
     workflow = await workflow_action_refusals(
         db, invoice, actor=user, org=org, control_db=control_db
     )
+    # The orphan-bill lookup (decisions §556, §560): present only on a failed
+    # push that may have left a bill; the instance is read only for those.
+    from app.services import erp_bill_void as ebv
+
+    orphan_instance = (
+        await _workflow_instance_locked(db, invoice_id, lock=False)
+        if ebv.may_be_orphan(invoice)
+        else None
+    )
     return {
         **review,
         **workflow,
+        **ebv.orphan_lookup_verdicts(invoice, orphan_instance, user, org.settings),
         "resubmit": resubmit_refusal(user, invoice),
         "manage_file": manage_file_refusal(user, invoice),
         "edit_financials": edit_financials_refusal(user, invoice),
@@ -904,17 +916,12 @@ async def lookup_erp_orphan_bill(
     await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
     invoice = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
     instance = await _workflow_instance_locked(db, invoice_id, lock=False)
-    refused = ebv.orphan_lookup_refusal(invoice, instance, user)
+    # The verdict `GET /review-actions` and the exception row serve
+    # (`erp_orphan_lookup_refusal`, decisions §560), raised from here.
+    refused = ebv.orphan_lookup_verdict(invoice, instance, user, org.settings)
     if refused is not None:
         code = 403 if refused["code"] == "role_not_permitted" else 409
         raise HTTPException(status_code=code, detail=refused)
-    if not ebv.lookup_supported(org.settings):
-        raise HTTPException(
-            status_code=409,
-            detail=coded_refusal(
-                ebv.ERP_LOOKUP_UNSUPPORTED, ebv.refusal_message(ebv.ERP_LOOKUP_UNSUPPORTED)
-            ),
-        )
     payload = await ebv.lookup_payload(db, org, invoice)
     # No lock is held across the ERP call; end the read transaction first.
     await db.commit()

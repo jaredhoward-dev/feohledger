@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { tabBoundaryTarget } from './focusTrap';
+import { ownsEscape, tabBoundaryTarget } from './focusTrap';
 
 /**
  * The dialog's Tab cycle with satellites (the toast region hosted inside an
@@ -55,5 +55,18 @@ describe('tabBoundaryTarget', () => {
 
 	it('nothing to cycle through returns null', () => {
 		expect(tabBoundaryTarget([], [], null, false)).toBeNull();
+	});
+});
+
+describe('ownsEscape', () => {
+	it('only the topmost of stacked dialogs closes on Escape', () => {
+		expect(ownsEscape(['host', 'confirm'], 'confirm')).toBe(true);
+		expect(ownsEscape(['host', 'confirm'], 'host')).toBe(false);
+		expect(ownsEscape(['host'], 'host')).toBe(true);
+	});
+
+	it('an unregistered trap always answers its own Escape', () => {
+		expect(ownsEscape(['host'], 'popover')).toBe(true);
+		expect(ownsEscape([], 'popover')).toBe(true);
 	});
 });
