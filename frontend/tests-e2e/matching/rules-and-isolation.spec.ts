@@ -1,5 +1,16 @@
 import { ACME_ADMIN, ACME_BASE, API_BASE, authToken, chartGlCode, expect, signInAndWait, tenantBase, tenantHeaders, tenantPsql, test } from '../fixtures/helpers';
-import { cleanup, createMatchedInvoice, createPo, recompute, tenantScope } from './setup';
+import {
+	cleanup,
+	createMatchedInvoice,
+	createPo,
+	readMatching,
+	recompute,
+	setMatching,
+	storedMatchingJson,
+	storeMatchingDirectly,
+	tenantScope,
+	type MatchingBlock
+} from './setup';
 
 /**
  * matching_rules per-vendor / per-commodity precedence + tenant isolation.
@@ -7,23 +18,22 @@ import { cleanup, createMatchedInvoice, createPo, recompute, tenantScope } from 
  * `services/matching_rules.resolve_match_rule` resolves tolerance_pct (and
  * require_inspection) per-field with precedence vendor → commodity → org →
  * default. These specs drive a single invoice through the real PATCH→matcher
- * path while flipping org settings, asserting the *applied* tolerance via
+ * path while setting the rules through their audited writer
+ * (`/api/organization/match-rules`, via `setup.setMatching`), asserting the *applied* tolerance via
  * `po_match.details.tolerance_pct`. The isolation block proves the matcher
  * only ever sees its own tenant's POs.
  */
 
 test.describe('matching_rules tolerance precedence (vendor > commodity > org)', () => {
 	const created: { invoiceIds: string[]; poIds: string[] } = { invoiceIds: [], poIds: [] };
-	let originalSettings: Record<string, unknown> = {};
+	let originalMatching: MatchingBlock = {};
 	let vendorId: string;
 
 	test.beforeAll(async ({ browser, tenantSlug }) => {
 		const ctx = await browser.newContext({ baseURL: tenantBase(tenantSlug) });
 		const page = await ctx.newPage();
 		await signInAndWait(page);
-		const headers = tenantHeaders(await authToken(page));
-		const resp = await page.request.get(`${API_BASE}/api/organization`, { headers });
-		originalSettings = ((await resp.json()) as { settings: Record<string, unknown> }).settings ?? {};
+		originalMatching = await readMatching(page);
 		await ctx.close();
 		// Pick a real vendor row to key the vendor rule on.
 		vendorId = tenantPsql('select id from vendors limit 1;').trim();
@@ -35,25 +45,9 @@ test.describe('matching_rules tolerance precedence (vendor > commodity > org)', 
 		const ctx = await browser.newContext({ baseURL: tenantBase(tenantSlug) });
 		const page = await ctx.newPage();
 		await signInAndWait(page);
-		const headers = { ...tenantHeaders(await authToken(page)), 'Content-Type': 'application/json' };
-		await page.request.patch(`${API_BASE}/api/organization`, {
-			headers,
-			data: { settings: { matching: null } }
-		});
+		await setMatching(page, originalMatching);
 		await ctx.close();
 	});
-
-	async function setMatching(
-		page: import('@playwright/test').Page,
-		matching: Record<string, unknown> | null
-	) {
-		const headers = { ...tenantHeaders(await authToken(page)), 'Content-Type': 'application/json' };
-		const resp = await page.request.patch(`${API_BASE}/api/organization`, {
-			headers,
-			data: { settings: { matching } }
-		});
-		expect(resp.ok()).toBe(true);
-	}
 
 	test('vendor rule wins over commodity + org for the same invoice', async ({ page }) => {
 		// Org=5%, commodity GL=3%, vendor=1%. The invoice carries BOTH the
@@ -106,9 +100,15 @@ test.describe('matching_rules tolerance precedence (vendor > commodity > org)', 
 
 	test('falls back to org default when neither vendor nor commodity matches', async ({ page }) => {
 		const gl = chartGlCode();
+		// A rule on ANOTHER account of the chart: the writer refuses a GL code
+		// the tenant does not have, so the non-matching rule is a real one.
+		const otherGl = tenantPsql(
+			`SELECT code FROM gl_accounts WHERE is_active AND entity_id IS NULL AND code <> '${gl}' ORDER BY code LIMIT 1`
+		).trim();
+		expect(otherGl, 'the worker tenant needs a second shared GL account').toBeTruthy();
 		await setMatching(page, {
 			tolerance_pct: 5.0,
-			commodity_rules: { '9999': { tolerance_pct: 1.0 } }
+			commodity_rules: { [otherGl]: { tolerance_pct: 1.0 } }
 		});
 
 		const { poId, poNumber } = createPo({ total: 1000, vendorId });
@@ -128,27 +128,40 @@ test.describe('matching_rules tolerance precedence (vendor > commodity > org)', 
 	});
 
 	test('malformed vendor rule is ignored, tolerance falls through (never raises)', async ({
-		page
+		page,
+		tenantSlug
 	}) => {
 		// A non-numeric tolerance on the vendor rule must be ignored per the
 		// resolver's fail-soft contract; the org default (5%) takes over.
-		await setMatching(page, {
-			tolerance_pct: 5.0,
-			vendor_rules: { [vendorId]: { tolerance_pct: 'not-a-number' } }
-		});
+		//
+		// The match-rules writer refuses such a value (decisions §512), so it is
+		// written straight into the control-plane row: what this proves is that
+		// the matcher survives bad data ALREADY stored (an old unaudited write),
+		// which no API path can produce any more. Restored in `finally`.
+		const before = storedMatchingJson(tenantSlug);
+		storeMatchingDirectly(
+			tenantSlug,
+			JSON.stringify({
+				tolerance_pct: '5.0',
+				vendor_rules: { [vendorId]: { tolerance_pct: 'not-a-number' } }
+			})
+		);
+		try {
+			const { poId, poNumber } = createPo({ total: 1000, vendorId });
+			created.poIds.push(poId);
+			const { invoiceId, poMatch } = await createMatchedInvoice(page, {
+				poNumber,
+				amount: 1040,
+				vendorId
+			});
+			created.invoiceIds.push(invoiceId);
 
-		const { poId, poNumber } = createPo({ total: 1000, vendorId });
-		created.poIds.push(poId);
-		const { invoiceId, poMatch } = await createMatchedInvoice(page, {
-			poNumber,
-			amount: 1040,
-			vendorId
-		});
-		created.invoiceIds.push(invoiceId);
-
-		// Resolver didn't blow up; org tolerance applied.
-		expect(poMatch!.details.tolerance_pct).toBeCloseTo(5.0, 4);
-		expect(poMatch!.status).toBe('matched');
+			// Resolver didn't blow up; org tolerance applied.
+			expect(poMatch!.details.tolerance_pct).toBeCloseTo(5.0, 4);
+			expect(poMatch!.status).toBe('matched');
+		} finally {
+			storeMatchingDirectly(tenantSlug, before);
+		}
 	});
 });
 

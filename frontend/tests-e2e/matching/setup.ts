@@ -28,6 +28,7 @@
 import {
 	API_BASE,
 	authToken,
+	controlPsql,
 	deleteInvoicesWhere,
 	tenantHeaders,
 	tenantPsql
@@ -272,4 +273,119 @@ export function cleanup(ids: {
 		sql(`delete from po_line_items where po_id = '${id}';`);
 		sql(`delete from purchase_orders where id = '${id}';`);
 	}
+}
+
+// ---------- settings.matching ------------------------------------------------
+//
+// The tolerance / inspection rules the matcher resolves (vendor → commodity →
+// organization → built-in) live in the control-plane `organizations.settings`
+// JSONB under `matching`. Their one writer is the audited
+// `/api/organization/match-rules` router (decisions §512): the generic
+// `PATCH /api/organization` refuses any change to the block, so a spec sets
+// rules the way an admin does.
+
+/** One layer of `settings.matching`: `null` / absent = inherits. */
+export type MatchLayer = {
+	tolerance_pct?: number | string | null;
+	require_inspection?: boolean | null;
+};
+
+/** The whole `settings.matching` block, in its stored shape. */
+export type MatchingBlock = MatchLayer & {
+	vendor_rules?: Record<string, MatchLayer>;
+	commodity_rules?: Record<string, MatchLayer>;
+};
+
+async function matchRulesRequest(
+	page: Page,
+	method: 'GET' | 'PUT' | 'DELETE',
+	path: string,
+	data?: MatchLayer
+): Promise<unknown> {
+	const headers = { ...tenantHeaders(await authToken(page)), 'Content-Type': 'application/json' };
+	const resp = await page.request.fetch(`${API_BASE}/api/organization/match-rules${path}`, {
+		method,
+		headers,
+		data
+	});
+	if (!resp.ok()) {
+		throw new Error(`${method} match-rules${path} → ${resp.status()}: ${await resp.text()}`);
+	}
+	return resp.json();
+}
+
+function layerBody(layer: MatchLayer | undefined): MatchLayer {
+	return {
+		tolerance_pct: layer?.tolerance_pct ?? null,
+		require_inspection: layer?.require_inspection ?? null
+	};
+}
+
+/** The org's stored `settings.matching` block (`{}` when none is set). */
+export async function readMatching(page: Page): Promise<MatchingBlock> {
+	const headers = tenantHeaders(await authToken(page));
+	const resp = await page.request.get(`${API_BASE}/api/organization`, { headers });
+	if (!resp.ok()) throw new Error(`GET /api/organization → ${resp.status()}`);
+	const body = (await resp.json()) as { settings?: { matching?: MatchingBlock | null } };
+	return body.settings?.matching ?? {};
+}
+
+/**
+ * Replace the org's whole `settings.matching` block with `block` (`null` = no
+ * rules at all) through the audited match-rules writer: rules the block does
+ * not name are removed, the organization layer and every named rule are PUT.
+ * Throws with the server's refusal if any write is refused.
+ */
+export async function setMatching(page: Page, block: MatchingBlock | null): Promise<void> {
+	const target = block ?? {};
+	const current = (await matchRulesRequest(page, 'GET', '')) as {
+		vendor_rules: { vendor_id: string }[];
+		commodity_rules: { gl_account: string }[];
+	};
+	for (const { vendor_id } of current.vendor_rules) {
+		if (!target.vendor_rules?.[vendor_id]) {
+			await matchRulesRequest(page, 'DELETE', `/vendors/${vendor_id}`);
+		}
+	}
+	for (const { gl_account } of current.commodity_rules) {
+		if (!target.commodity_rules?.[gl_account]) {
+			await matchRulesRequest(page, 'DELETE', `/commodities/${encodeURIComponent(gl_account)}`);
+		}
+	}
+	await matchRulesRequest(page, 'PUT', '/organization', layerBody(target));
+	for (const [vendorId, layer] of Object.entries(target.vendor_rules ?? {})) {
+		await matchRulesRequest(page, 'PUT', `/vendors/${vendorId}`, layerBody(layer));
+	}
+	for (const [gl, layer] of Object.entries(target.commodity_rules ?? {})) {
+		await matchRulesRequest(page, 'PUT', `/commodities/${encodeURIComponent(gl)}`, layerBody(layer));
+	}
+}
+
+/**
+ * The org's raw stored `settings.matching` JSON, read straight from the
+ * control plane (`'null'` when the block is absent) — the snapshot
+ * `storeMatchingDirectly` restores.
+ */
+export function storedMatchingJson(slug: string): string {
+	return (
+		controlPsql(
+			`SELECT COALESCE(settings -> 'matching', 'null'::jsonb) FROM organizations WHERE slug = '${slug}'`
+		).trim() || 'null'
+	);
+}
+
+/**
+ * Write `settings.matching` straight into the control-plane row, bypassing the
+ * writer. ONLY for proving the matcher tolerates stored data the writer would
+ * refuse (an old unaudited write); everything else goes through `setMatching`.
+ * `json` is a JSON document, e.g. a `storedMatchingJson` snapshot; `'null'`
+ * removes the block.
+ */
+export function storeMatchingDirectly(slug: string, json: string): void {
+	const literal = json.replace(/'/g, "''");
+	controlPsql(
+		json === 'null'
+			? `UPDATE organizations SET settings = COALESCE(settings, '{}'::jsonb) - 'matching' WHERE slug = '${slug}'`
+			: `UPDATE organizations SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{matching}', '${literal}'::jsonb) WHERE slug = '${slug}'`
+	);
 }
