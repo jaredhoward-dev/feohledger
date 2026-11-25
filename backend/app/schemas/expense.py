@@ -504,6 +504,15 @@ class CorporateCardTransactionListResponse(PageMeta):
     total: int
 
 
+class CorporateCardTransactionCounts(BaseModel):
+    """``GET /api/corporate-card-transactions/counts`` — the whole filtered
+    feed's size and its split by reconciliation status (every status present,
+    zero where none)."""
+
+    total: int
+    by_status: dict[str, int]
+
+
 # ---------------------------------------------------------------------------
 # Pre-approvals (defined for WF3 reuse — not wired in WF1)
 # ---------------------------------------------------------------------------
