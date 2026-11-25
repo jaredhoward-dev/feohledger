@@ -62,26 +62,31 @@ function purge(cardId: string): void {
 	tenantPsql(`DELETE FROM virtual_cards WHERE id = '${cardId}'`);
 }
 
-/** Lithic-shaped authorization charge event body. */
-function chargeBody(eventId: string): string {
+/** Lithic's real card event (decisions §549): `card_transaction.updated`,
+ *  whose body is the transaction itself and whose `status` says what
+ *  happened — `PENDING` is an approved authorization. Lithic sends no
+ *  `authorization.*` / `transaction.*` types, and the handler maps only the
+ *  documented names, so an invented name is (correctly) inert. */
+function lithicTxnBody(eventId: string, status: string, cardToken = TOKEN): string {
 	return JSON.stringify({
-		card_token: TOKEN,
-		type: 'authorization.created',
+		type: 'card_transaction.updated',
+		token: `txn-${eventId}`,
+		card_token: cardToken,
+		status,
 		event_id: eventId,
 		amount: 100000, // cents → $1000.00
 		merchant: { descriptor: 'ACME VENDOR' }
 	});
 }
 
-/** Lithic-shaped DECLINED authorization — must NOT charge the card. */
+/** Lithic authorization (status `PENDING`) — charges the card. */
+function chargeBody(eventId: string): string {
+	return lithicTxnBody(eventId, 'PENDING');
+}
+
+/** Lithic DECLINED authorization — must NOT charge the card. */
 function declineBody(eventId: string): string {
-	return JSON.stringify({
-		card_token: TOKEN,
-		type: 'authorization.decline',
-		event_id: eventId,
-		amount: 100000,
-		merchant: { descriptor: 'ACME VENDOR' }
-	});
+	return lithicTxnBody(eventId, 'DECLINED');
 }
 
 function sign(rawBody: string, secret = SECRET): string {
@@ -167,7 +172,7 @@ test.describe('card webhook HMAC + dedup', () => {
 		request
 	}) => {
 		// Regression: a naive `"auth" in event_type` substring match treated
-		// `authorization.decline` as a real charge, flipping the card to
+		// a declined authorization as a real charge, flipping the card to
 		// `charged` on money that never moved (and minting a rebate on it).
 		const cardId = seedCard();
 		try {
@@ -208,10 +213,12 @@ test.describe('card webhook HMAC + dedup', () => {
 		).trim();
 		try {
 			const body = JSON.stringify({
+				// Nium's documented approved-authorization webhook names itself
+				// in `template` and carries `transactionAmount` (decisions §549).
+				template: 'CARD_POS_APPROVED_WEBHOOK',
 				cardHashId: niumToken,
-				eventType: 'authorization',
 				webhookId: randomUUID(),
-				amount: 50.5, // MAJOR units → $50.50
+				transactionAmount: 50.5, // MAJOR units → $50.50
 				merchantName: 'ACME VENDOR'
 			});
 			const resp = await request.post(`${API_BASE}/api/cards/webhook/nium`, {
@@ -267,12 +274,7 @@ test.describe('card webhook HMAC + dedup', () => {
 	});
 
 	test('unknown card token is a silent 204 (no enumeration)', async ({ request }) => {
-		const body = JSON.stringify({
-			card_token: `no-such-card-${randomUUID()}`,
-			type: 'authorization.created',
-			event_id: randomUUID(),
-			amount: 5000
-		});
+		const body = lithicTxnBody(randomUUID(), 'PENDING', `no-such-card-${randomUUID()}`);
 		const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
 			headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sign(body) },
 			data: body
