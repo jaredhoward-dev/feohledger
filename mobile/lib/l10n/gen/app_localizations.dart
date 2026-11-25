@@ -5659,6 +5659,12 @@ abstract class AppLocalizations {
   /// **'The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.'**
   String get exceptionDescriptionErpCreditSettlement;
 
+  /// No description provided for @exceptionDescriptionErpSettledNoPayment.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.'**
+  String get exceptionDescriptionErpSettledNoPayment;
+
   /// No description provided for @exceptionDescriptionErpPaidWhileScheduled.
   ///
   /// In en, this message translates to:

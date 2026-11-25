@@ -3660,6 +3660,10 @@ class AppLocalizationsJa extends AppLocalizations {
       'ERP ではこの請求書が、少なくとも一部は ERP 側で適用された仕入先の貸方票で消し込まれています。未払い額を誰かが確認するまで、FeohLedger はこれを支払いません。';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'ERP ではこの請求書に未払い残高はありませんが、支払いの記録もありません（ERP 側で貸方票が適用されたか、残高が償却されています）。未払い額を誰かが確認するまで、FeohLedger はこれを支払いません。';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'ERP ではこの請求書が FeohLedger 以外の支払いで支払済みになっていますが、FeohLedger でも支払いが予定されています。両方が仕入先に届く前に、どちらかを停止または無効にしてください。';
 

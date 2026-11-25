@@ -3861,6 +3861,10 @@ class AppLocalizationsFr extends AppLocalizations {
       'Selon l\'ERP, cette facture est réglée, au moins en partie, par un avoir fournisseur appliqué dans l\'ERP. FeohLedger ne la paiera pas tant que quelqu\'un n\'aura pas confirmé ce qui reste dû.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Selon l\'ERP, plus rien n\'est dû sur cette facture, mais aucun paiement n\'y est rattaché : un avoir y a été appliqué ou le solde passé en perte. FeohLedger ne la paiera pas tant que quelqu\'un n\'aura pas confirmé ce qui reste dû.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Selon l\'ERP, cette facture a été payée par un paiement que FeohLedger n\'a pas effectué, alors qu\'un paiement FeohLedger est planifié pour elle. Arrêtez ou annulez l\'un des deux avant qu\'ils n\'atteignent tous deux le fournisseur.';
 

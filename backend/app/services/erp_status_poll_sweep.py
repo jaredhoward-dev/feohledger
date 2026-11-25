@@ -28,13 +28,17 @@ is never read against this one.
 
 **What counts as a change.** ``open`` → ``posted``, ``paid`` → ``paid`` and
 ``cancelled`` → ``cancelled``, the generic webhook's own words. ``draft``,
-``partially_paid``, ``unknown`` and ``settled_no_payment`` have no webhook
-equivalent and are not applied (a zero balance with no payment is never a
-payment, §303). The last status read is kept in the latest workflow
-instance's ``state_data["erp_status_poll"]`` with the moment, and a report is
-applied only when the status differs from the one recorded: so a resolved
-"voided after posting" exception is not re-opened every tick, and an unchanged
-``open`` bill costs one call and no write but the moment.
+``partially_paid`` and ``unknown`` have no webhook equivalent and are not
+applied. ``settled_no_payment`` (nothing owing, no payment behind it: a credit
+applied or a write-off in the ERP) is never a payment (§303): the invoice is
+not moved, and a blocking ``payment_reconciliation`` exception is opened so no
+payment run pays a bill the ERP already shows settled (§532). The webhook has
+no word for that status, so this is the sweep's own branch, not
+``apply_erp_status_report``'s. The last status read is kept in the latest
+workflow instance's ``state_data["erp_status_poll"]`` with the moment, and a
+report is applied (or the exception opened) only when the status differs from
+the one recorded: so a resolved exception is not re-opened every tick, and an
+unchanged ``open`` bill costs one call and no write but the moment.
 
 **Fair, and stops at the budget.** Each tick takes, per tenant, at most
 ``FEOH_ERP_STATUS_POLL_SWEEP_BATCH_SIZE`` invoices, least recently polled
@@ -74,7 +78,18 @@ from app.models.organization import Organization
 from app.models.workflow import AuditLog, WorkflowInstance
 from app.services.erp_adapters.base import ErpAdapter, ErpCallBudgetExhausted, ErpInvoiceStatus
 from app.services.erp_auto_send_sweep import _connected_at
-from app.services.erp_status_report import ERP_STATUS_MAP, NOOP, apply_erp_status_report
+from app.services.erp_status_report import (
+    ERP_STATUS_MAP,
+    EXCEPTION_OPENED,
+    NOOP,
+    apply_erp_status_report,
+)
+from app.services.erp_status_sync import (
+    ERP_REPORT_SETTLED_NO_PAYMENT,
+    PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+    open_erp_reconciliation_exception,
+)
+from app.services.invoice_warning_catalog import exception_finding
 from app.services.sweep_health import SWEEP_ERP_STATUS_POLL, run_sweep_loop
 
 logger = logging.getLogger(__name__)
@@ -247,7 +262,12 @@ async def _apply_one(
         state = dict(instance.state_data or {})
         previous = state.get(STATE_KEY) if isinstance(state.get(STATE_KEY), dict) else {}
         outcome = NOOP
-        if word is not None and previous.get("status") != read.value:
+        changed = previous.get("status") != read.value
+        if read is ErpInvoiceStatus.settled_no_payment and changed:
+            outcome = await _flag_settled_no_payment(
+                db, invoice, org_id=org.id, erp_type=erp_type, candidate=candidate
+            )
+        elif word is not None and changed:
             outcome = await apply_erp_status_report(
                 db,
                 invoice,
@@ -269,6 +289,36 @@ async def _apply_one(
         flag_modified(instance, "state_data")
         await db.commit()
     return _UNCHANGED if outcome == NOOP else _APPLIED
+
+
+async def _flag_settled_no_payment(
+    db: AsyncSession,
+    invoice: Invoice,
+    *,
+    org_id: uuid.UUID,
+    erp_type: str,
+    candidate: _Candidate,
+) -> str:
+    """The ERP shows the bill settled with no payment behind it (§303): open a
+    payment-blocking ``payment_reconciliation`` exception for a person to say
+    what is still owed, and leave the invoice where it is — FeohLedger paid
+    nothing, so no transition and no payment is recorded (§532). Skipped while
+    one of that type is already live (``open_erp_reconciliation_exception``)."""
+    opened = await open_erp_reconciliation_exception(
+        db,
+        invoice,
+        org_id=org_id,
+        exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        finding=exception_finding("erp_settled_no_payment"),
+        erp_report={
+            "kind": ERP_REPORT_SETTLED_NO_PAYMENT,
+            "erp_type": erp_type,
+            "erp_document_id": candidate.erp_document_id,
+            "source": POLL_SOURCE,
+            "invoice_status": invoice.status.value,
+        },
+    )
+    return EXCEPTION_OPENED if opened else NOOP
 
 
 async def _sweep_tenant(org: Organization, *, result: StatusPollSweepResult) -> None:

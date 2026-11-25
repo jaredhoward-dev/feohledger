@@ -257,6 +257,8 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_payment_void_writeback_failed_unnamed': 'exceptions.description.erpPaymentVoidWritebackFailedUnnamed',
 	// The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
 	'exception.erp_credit_settlement': 'exceptions.description.erpCreditSettlement',
+	// The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.
+	'exception.erp_settled_no_payment': 'exceptions.description.erpSettledNoPayment',
 	// The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
 	'exception.erp_paid_while_scheduled': 'exceptions.description.erpPaidWhileScheduled',
 	// FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.
@@ -458,6 +460,7 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_payment_void_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_void_writeback_failed_unnamed': {},
 	'exception.erp_credit_settlement': {},
+	'exception.erp_settled_no_payment': {},
 	'exception.erp_paid_while_scheduled': {},
 	'exception.erp_paid_twice': {},
 	'exception.erp_partly_paid_outside': {},
