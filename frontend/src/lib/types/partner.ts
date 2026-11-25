@@ -15,7 +15,8 @@ export interface ChildTenant {
 }
 
 /** The partner overview — the caller's own identity + its child tenants.
- *  `is_partner` is derived (true iff it administers >= 1 child). */
+ *  `is_partner` is the operator-granted capability (always true here: the
+ *  route requires it — decisions §574). */
 export interface PartnerOverview {
 	organization_id: string;
 	name: string;

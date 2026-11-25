@@ -3,7 +3,7 @@ import type { Locator, Page } from '@playwright/test';
 import { NAV } from '#lib/nav.ts';
 import { CARD_STATUSES } from '#lib/types/payment.ts';
 
-import { expect, test } from '../fixtures/helpers';
+import { expect, stubPartnerCapability, test } from '../fixtures/helpers';
 import { exceptionSummary } from '../exceptions/summary';
 
 /**
@@ -427,7 +427,8 @@ async function headerXs(table: Locator): Promise<number[]> {
 /** /admin/partner's children table: a partner with one child per plan tier,
  *  one carrying a 63-character slug (the longest a slug may be) and one with
  *  no brand name (the "—" cell). The e2e tenant is not a partner, so without
- *  this the page settles on its empty row and no child row is measured. */
+ *  this (and the capability stubbed on `/api/auth/me`) the page would not even
+ *  open, and no child row would be measured. */
 const PARTNER_OVERVIEW = {
 	organization_id: '00000000-0000-4000-8000-000000000430',
 	name: 'Layout Fixture Partner',
@@ -464,6 +465,8 @@ const PARTNER_OVERVIEW = {
  */
 const PAGE_FIXTURES: Record<string, (page: Page) => Promise<void>> = {
 	'/admin/partner': async (page) => {
+		// The page needs the operator-granted partner capability (decisions §574).
+		await stubPartnerCapability(page);
 		await page.route(
 			(url) => url.pathname === '/api/partner',
 			(route) =>

@@ -237,6 +237,8 @@ export const messages = {
 	'audit.action.organization.scim_token_minted': "SCIMトークンを発行",
 	'audit.action.organization.scim_token_revoked': "SCIMトークンを取り消し",
 	'audit.action.organization.sso_only_lifted': "SSO限定サインインを解除",
+	'audit.action.organization.partner_capability_granted': "パートナー機能を付与",
+	'audit.action.organization.partner_capability_revoked': "パートナー機能を取り消し",
 	'audit.action.organization.sso_updated': "SSO設定を更新",
 	'audit.action.partner.child_attached': "顧客ワークスペースを接続",
 	'audit.action.partner.child_detached': "顧客ワークスペースを切り離し",

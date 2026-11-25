@@ -9,7 +9,14 @@
 	import EntitySwitcher from '#lib/components/layout/EntitySwitcher.svelte';
 	import NotificationBell from '#lib/components/layout/NotificationBell.svelte';
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
-	import { NAV, entryHref, isEntryActive, isEntryVisible, type NavEntry } from '#lib/nav.ts';
+	import {
+		NAV,
+		entryHref,
+		isEntryActive,
+		isEntryVisible,
+		type NavEntry,
+		type OrgCapability
+	} from '#lib/nav.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { topModalDialog } from '#lib/actions/focusTrap.ts';
 
@@ -96,20 +103,22 @@
 	// change.
 	const has = (...roles: string[]) => auth.hasAnyRole(...roles);
 	const can = (perm: string) => auth.can(perm);
+	// The operator-granted workspace capabilities (`partner`, decisions §574).
+	const hasCapability = (c: OrgCapability) => auth.hasCapability(c);
 
 	// The primary nav (`#lib/nav`) is the single source of truth, shared with
 	// the per-page section sub-tab bar. High-traffic destinations are top-level
 	// links; the rest are folded into groups (Procurement / Billing / Insights /
 	// Settings) that open a sub-tabbed page. Filter to what this role/permission
 	// set can see.
-	let entries = $derived(NAV.filter((e) => isEntryVisible(e, has, can)));
+	let entries = $derived(NAV.filter((e) => isEntryVisible(e, has, can, hasCapability)));
 	let pathname = $derived(page.url.pathname);
 
 	// A group's row navigates to its first accessible child (links use their own
 	// href). `entries` already dropped groups with no visible child, so the
 	// fallback is unreachable.
 	function hrefFor(entry: NavEntry): string {
-		return entryHref(entry, has, can) ?? '#';
+		return entryHref(entry, has, can, hasCapability) ?? '#';
 	}
 </script>
 

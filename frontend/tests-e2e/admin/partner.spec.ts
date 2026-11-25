@@ -1,42 +1,49 @@
-import { API_BASE, currentTenantSlug, expect, signInAndWait, TENANT_ROOT_URL, test } from '../fixtures/helpers';
+import {
+	API_BASE,
+	currentTenantSlug,
+	expect,
+	sectionTabHrefs,
+	signInAndWait,
+	stubPartnerCapability,
+	TENANT_ROOT_URL,
+	test
+} from '../fixtures/helpers';
 
 /**
- * /admin/partner — Partner / reseller multi-tenant admin (admin only).
+ * /admin/partner — Partner / reseller multi-tenant admin.
  *
- * Surfaces the backend `/api/partner` endpoints
- * (`backend/app/api/partner.py`):
- *  - GET /api/partner                              → the caller's child tenants
- *  - GET /api/partner/children/{id}/branding       → read a child's brand
- *  - PUT /api/partner/children/{id}/branding       → push a child's brand
+ * Surfaces the backend `/api/partner` endpoints (`backend/app/api/partner.py`),
+ * every one of which requires the admin role AND the operator-granted partner
+ * capability (`Organization.is_partner`, decisions §574). The Partner Admin
+ * row and the page check the same two things (`#lib/nav.ts`), so they agree.
  *
- * The surface is admin-only and scoped to the caller's own children. The e2e
- * seed tenants have no parent/child link, so the default is the "not a partner"
- * empty state — exactly what an unrelated org should see. These specs assert the
- * admin reaches the page (real backend GET) and a non-admin is bounced + 403'd.
+ * No e2e tenant is a partner — the realistic default — so the "shown" side
+ * stubs the capability on `/api/auth/me` (`stubPartnerCapability`), and the
+ * real backend is asserted to refuse the unstubbed admin with the coded 403.
+ * The partner-side behaviour (children, branding, isolation) is held by the
+ * backend pytest suite against two real tenants.
  */
 
-test.describe('/admin/partner (admin)', () => {
-	// Deterministic explicit sign-in so the gated page is reliably authed.
+const SETTINGS_TAB = '/organization';
+
+test.describe('/admin/partner (admin of a workspace that is not a partner)', () => {
 	test.use({ storageState: { cookies: [], origins: [] } });
 
 	test.beforeEach(async ({ page }) => {
 		await signInAndWait(page);
 	});
 
-	test('admin loads the page; a standalone org shows the not-a-partner state', async ({
+	test('the Partner Admin row is hidden, the page bounces, and the API refuses', async ({
 		page
 	}) => {
+		await page.goto(SETTINGS_TAB);
+		await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+		expect(await sectionTabHrefs(page)).not.toContain('/admin/partner');
+
 		await page.goto('/admin/partner');
-		await expect(page.getByRole('heading', { name: 'Partner Admin' })).toBeVisible();
+		await page.waitForURL(TENANT_ROOT_URL, { timeout: 15_000 });
+		await expect(page.getByRole('heading', { name: 'Partner Admin' })).toHaveCount(0);
 
-		// The seed tenant administers no children, so the children table settles
-		// on its empty row, worded as the "not a partner" state (decisions §501).
-		await expect(page.getByTestId('table-empty')).toHaveText(
-			/does not administer any child tenants yet/,
-			{ timeout: 10_000 }
-		);
-
-		// The backend GET confirms the same: is_partner false, no children.
 		const token = await page.evaluate(() => localStorage.getItem('auth_token'));
 		const resp = await page.request.get(`${API_BASE}/api/partner`, {
 			headers: {
@@ -44,33 +51,45 @@ test.describe('/admin/partner (admin)', () => {
 				'X-Tenant-Slug': currentTenantSlug()
 			}
 		});
-		expect(resp.status()).toBe(200);
-		const body = (await resp.json()) as { is_partner: boolean; children: unknown[] };
-		expect(body.is_partner).toBe(false);
-		expect(body.children).toEqual([]);
+		expect(resp.status()).toBe(403);
+		const body = (await resp.json()) as { detail: { code: string } };
+		expect(body.detail.code).toBe('partner_capability_required');
 	});
+});
 
-	test('a non-child org id is an opaque 404 (cross-tenant isolation)', async ({ page }) => {
-		// Reading/pushing branding for an org this partner did NOT parent must be a
-		// 404 — never a window into another tenant. A random uuid stands in for an
-		// unrelated org id; it is the same opaque 404 as a real non-child.
-		const token = await page.evaluate(() => localStorage.getItem('auth_token'));
-		const headers = {
-			Authorization: `Bearer ${token}`,
-			'X-Tenant-Slug': currentTenantSlug(),
-			'Content-Type': 'application/json'
-		};
-		const strangerId = '00000000-0000-0000-0000-000000000abc';
-		const read = await page.request.get(
-			`${API_BASE}/api/partner/children/${strangerId}/branding`,
-			{ headers }
+test.describe('/admin/partner (admin of a partner workspace)', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+
+	test('the Partner Admin row is shown and the page opens', async ({ page }) => {
+		await stubPartnerCapability(page);
+		await page.route(
+			(url) => url.pathname === '/api/partner',
+			(route) =>
+				route.request().method() === 'GET'
+					? route.fulfill({
+							json: {
+								organization_id: '00000000-0000-4000-8000-000000000450',
+								name: 'Partner Fixture Workspace',
+								is_partner: true,
+								children: []
+							}
+						})
+					: route.fallback()
 		);
-		expect(read.status()).toBe(404);
-		const write = await page.request.put(
-			`${API_BASE}/api/partner/children/${strangerId}/branding`,
-			{ headers, data: { product_name: 'Hijacked' } }
-		);
-		expect(write.status()).toBe(404);
+		await signInAndWait(page);
+
+		await page.goto(SETTINGS_TAB);
+		await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+		expect(await sectionTabHrefs(page)).toContain('/admin/partner');
+
+		await page.goto('/admin/partner');
+		await expect(page.getByRole('heading', { name: 'Partner Admin' })).toBeVisible();
+		await expect(page.getByTestId('attach-child-btn')).toBeVisible();
+		await expect(page.getByTestId('table-empty')).toHaveText(/No child tenants/, {
+			timeout: 10_000
+		});
+		// Consenting to be adopted is no longer here: it is in Organization settings.
+		await expect(page.getByTestId('link-code-panel')).toHaveCount(0);
 	});
 });
 
