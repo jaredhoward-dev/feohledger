@@ -18,6 +18,7 @@ cryptography for the NetSuite OAuth 2.0 client-assertion signature check
 
 from __future__ import annotations
 
+import calendar
 import copy
 import itertools
 import json
@@ -269,6 +270,10 @@ def _fresh_state() -> dict[str, Any]:
         # record, and the same key with another body is a 400 — Merge's
         # documented `Idempotency-Key` (issue #143, decisions §399).
         "merge_idempotency": {},
+        # Bills whose single read answers 404 although the listing still
+        # carries them `remote_was_deleted` — what Merge's docs leave open for
+        # a deleted record (decisions §567); set by `__set-status`.
+        "merge_retrieve_gone": set(),
     }
 
 
@@ -349,6 +354,8 @@ async def set_status(body: dict) -> dict:
                 record[key] = list(body.get(key) or [])
         if "remote_was_deleted" in body:
             record["remote_was_deleted"] = bool(body["remote_was_deleted"])
+        if body.get("retrieve_gone") is True:
+            STATE["merge_retrieve_gone"].add(doc_id)
         if "paid_on_date" in body:
             record["paid_on_date"] = body["paid_on_date"]
         record["modified_at"] = _merge_now()
@@ -773,15 +780,70 @@ async def merge_create_invoice(request: Request) -> JSONResponse:
     return JSONResponse(encoded, status_code=201)
 
 
+def _merge_moment(value: str | None) -> float | None:
+    """A Merge timestamp (`...SSZ` or `...SS.fffffffffZ`) as epoch seconds."""
+    if not value:
+        return None
+    head, _, frac = value.rstrip("Z").partition(".")
+    try:
+        whole = calendar.timegm(time.strptime(head, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        raise ProviderError(400, {"detail": "invalid date time"}) from None
+    return whole + (float(f"0.{frac}") if frac.isdigit() else 0.0)
+
+
+def _merge_changed_filter(
+    rows: list[dict], modified_after: str | None, modified_before: str | None
+) -> list[dict]:
+    """Merge's `modified_after` / `modified_before`: objects "synced by Merge
+    after / before this date time" — its own `modified_at`."""
+    after, before = _merge_moment(modified_after), _merge_moment(modified_before)
+    out = []
+    for r in rows:
+        at = _merge_moment(r.get("modified_at"))
+        if after is not None and (at is None or at <= after):
+            continue
+        if before is not None and (at is None or at >= before):
+            continue
+        out.append(r)
+    return out
+
+
+def _merge_page(rows: list[dict], page_size: int | None, cursor: str | None) -> dict:
+    """`page_size` (at most 100, as Merge caps it) and an opaque `next`
+    cursor. With no `page_size` every row is one page, as the adapter's
+    pre-create lookup reads it."""
+    if page_size is None:
+        return {"next": None, "previous": None, "results": _merge_jsonable(rows)}
+    size = max(1, min(page_size, 100))
+    start = int(cursor) if cursor and cursor.isdigit() else 0
+    page = rows[start : start + size]
+    more = start + size < len(rows)
+    return {
+        "next": str(start + size) if more else None,
+        "previous": None,
+        "results": _merge_jsonable(page),
+    }
+
+
 @merge.get("/invoices")
 async def merge_list_invoices(
     request: Request,
     number: str | None = None,
     contact_id: str | None = None,
     type: str | None = None,
+    modified_after: str | None = None,
+    modified_before: str | None = None,
+    include_deleted_data: str | None = None,
+    page_size: int | None = None,
     cursor: str | None = None,
 ) -> dict:
-    """`number`, `contact_id` and `type` are exact filters, as in Merge's spec."""
+    """`number`, `contact_id` and `type` are exact filters, as in Merge's spec;
+    `modified_after` / `modified_before` bound Merge's `modified_at`. A bill
+    deleted in the ERP stays listed with `remote_was_deleted: true`; Merge's
+    docs do not say whether it is listed without `include_deleted_data`, so
+    the fake lists it either way and the read-back sweep always asks for it
+    (decisions §567)."""
     _require_merge_auth(request)
     rows = [
         r
@@ -790,7 +852,25 @@ async def merge_list_invoices(
         and (contact_id is None or r.get("contact") == contact_id)
         and (type is None or r.get("type") == type)
     ]
-    return {"next": None, "previous": None, "results": _merge_jsonable(rows)}
+    rows = _merge_changed_filter(rows, modified_after, modified_before)
+    return _merge_page(rows, page_size, cursor)
+
+
+@merge.get("/payments")
+async def merge_list_payments(
+    request: Request,
+    modified_after: str | None = None,
+    modified_before: str | None = None,
+    include_deleted_data: str | None = None,
+    expand: str | None = None,
+    page_size: int | None = None,
+    cursor: str | None = None,
+) -> dict:
+    """The fake writes no Merge Payment (FeohLedger writes none back, decisions
+    §504; a settled bill's `payments` are bare ids): an empty, well-formed
+    listing, so the change feed reads end to end."""
+    _require_merge_auth(request)
+    return _merge_page([], page_size, cursor)
 
 
 @merge.get("/sync-status")
@@ -833,7 +913,7 @@ async def merge_delete_account(request: Request) -> Response:
 async def merge_get_invoice(request: Request, invoice_id: str) -> dict:
     _require_merge_auth(request)
     record = STATE["merge_invoices"].get(invoice_id)
-    if record is None:
+    if record is None or invoice_id in STATE["merge_retrieve_gone"]:
         raise ProviderError(404, {"detail": "Not found."})
     return _merge_jsonable(record)
 
