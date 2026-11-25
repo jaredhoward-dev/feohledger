@@ -26921,3 +26921,31 @@ locally / add an engines check*: the repo already runs fine on Node 26; the
 drift is in CLDR, which also reaches users through their browser, so a toolchain
 pin would hide the defect rather than fix it. *Loosen the test to accept either
 shape*: the variance is the bug (guard rail 4).
+
+## 529. The invoice timeline waits for its label slice before drawing a row (round 44)
+
+**Problem.** §522 accepted that an Activity row drawn before the lazy `audit`
+slice landed would show its token (`invoice.erp_failed`) for a moment and then
+relabel. The modal fired `ensureSlices('audit')` and the audit-log fetch side by
+side, and the fetch usually won, so the flash was the common case on a cold
+modal, not a corner.
+
+**Decision.** `lib/types/invoiceTimelineActions.ts::loadLabelledTimeline`
+resolves the rows only once both the fetch and `ensureSlices('audit')` have
+settled, and `InvoiceModal.svelte`'s `loadAuditLog` assigns through it, so the
+list's existing "nothing until loaded" state covers the slice too. This
+supersedes §522's accepted residue. `ensureSlices` never rejects (a slice that
+cannot load falls back to English, or keeps what it had, and settles), so the
+wait cannot strand the timeline; a failed fetch rejects as before. The
+`.activity-section` carries `data-ready`, backed by `auditLoading`.
+
+**Guard.** `invoiceTimelineActions.test.ts` pins that the rows are withheld
+until the slice settles, whichever lands first. `tests-e2e/invoices/detail.spec.ts`
+records every `.activity-action` text the DOM ever holds while the modal opens
+and fails on any raw `invoice.` / `exception.` / `audit.` token.
+
+**Rejected.** *Preloading the `audit` slice app-wide*: it is the console's whole
+vocabulary in six locales, paid on every page for one modal. *Rendering a
+placeholder label until the slice lands*: still a relabel, just a different
+flash.
+

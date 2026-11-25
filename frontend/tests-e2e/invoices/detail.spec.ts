@@ -66,6 +66,45 @@ test.describe('/invoices invoice detail modal', () => {
 		);
 	});
 
+	test('Activity rows render labelled the first time, never as raw action tokens', async ({
+		page
+	}) => {
+		// decisions §529: the rows used to arrive before the lazy `audit` label
+		// slice, so a token like `invoice.erp_failed` showed for a moment and then
+		// relabelled. Record every `.activity-action` text the DOM ever holds from
+		// before the modal opens, so a transient raw token is caught even though it
+		// would be gone by the time a plain assertion looks.
+		await page.evaluate(() => {
+			const seen: string[] = [];
+			(window as unknown as { __activityTexts: string[] }).__activityTexts = seen;
+			const record = () => {
+				for (const el of document.querySelectorAll('.activity-action'))
+					seen.push(el.textContent ?? '');
+			};
+			new MutationObserver(record).observe(document.body, {
+				subtree: true,
+				childList: true,
+				characterData: true
+			});
+		});
+
+		await page.locator('table tbody tr').first().getByRole('button', { name: 'Edit' }).click();
+		const modal = page.locator('div.modal[role="dialog"]');
+		await expect(modal).toBeVisible();
+
+		const section = modal.locator('.activity-section');
+		await expect(section).toHaveAttribute('data-ready', 'true', { timeout: 10_000 });
+		await expect(section.locator('.activity-action').first()).toBeVisible();
+
+		const rawToken = /\b(?:invoice|exception|audit)\.[a-z_]+\b/;
+		await expect(section.locator('.activity-action').filter({ hasText: rawToken })).toHaveCount(0);
+		const seen = await page.evaluate(
+			() => (window as unknown as { __activityTexts: string[] }).__activityTexts
+		);
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.filter((t) => rawToken.test(t))).toEqual([]);
+	});
+
 	test('modal close button dismisses', async ({ page }) => {
 		await page.locator('table tbody tr').first().getByRole('button', { name: 'Edit' }).click();
 		const modal = page.locator('div.modal[role="dialog"]');
