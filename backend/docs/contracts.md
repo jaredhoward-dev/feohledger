@@ -32,9 +32,20 @@ Lifecycle transitions are owned by dedicated endpoints (not `PATCH`):
 | `POST /{id}/activate` | `draft` / `expired` → `active` |
 | `POST /{id}/terminate` | `active` / `expired` → `terminated` |
 | `POST /{id}/cancel` | `draft` / `active` → `cancelled` |
-| `POST /{id}/renew` | any non-terminal → `active` (pushes `end_date` forward) |
+| `POST /{id}/renew` | any non-terminal → `active` (pushes `end_date` forward; a renewed draft is stamped `activated_at` as `activate` stamps it) |
 
-A transition from a disallowed source status is refused with `409`.
+A transition from a disallowed source status is refused with `409`
+`contract_status_refused` (`params.status`, `params.action`), and a delete of a
+contract that is neither `draft` nor `cancelled` with `409`
+`contract_delete_refused` (`params.status`). Each rule is one gate in
+`services/contract_controls.py`, which the endpoint raises from **and** every
+contract response's `actions.{activate,terminate,cancel,renew,create_po,delete}`
+verdict is read from (`null` = the endpoint would accept the caller, else that
+coded refusal; a caller outside admin / ap_manager gets `role_not_permitted`).
+The web modal's lifecycle buttons and the list's bulk "Change status" read those
+verdicts rather than restating the table above (decisions §508). `POST
+/bulk/status` routes each row through the same gate and reports a skip with its
+English sentence.
 
 ## Data model
 

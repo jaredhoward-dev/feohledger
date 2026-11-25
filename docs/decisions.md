@@ -25798,3 +25798,50 @@ payment ids passed into the adapter, a cross-layer change for one adapter.
 *Turning `supports_status_sync` on with the write-back refused*: the push would
 land payable, and FeohLedger's own payment would never reach the ERP, so the
 bill would stay open there and be paid again.
+
+## 508. Contract lifecycle buttons follow the endpoints' verdicts, including where the old page rule was narrower (round 40)
+
+`ContractModal` offered Activate / Terminate / Cancel / Renew / Create PO from
+its own copy of the status rules, and the copy had drifted from the endpoints:
+it hid Activate and Terminate on an `expired` contract and Create PO on a
+`draft`, all of which the server accepts. The list's bulk "Change status"
+offered all three actions whatever was selected and left the server to skip
+the rows that could not take it.
+
+Each rule is now one gate in `services/contract_controls.py`
+(`contract_transition_refusal`, `contract_renew_refusal`,
+`contract_create_po_refusal`, `contract_delete_refusal`). The endpoints raise
+from it, and every contract response carries
+`actions.{activate,terminate,cancel,renew,create_po,delete}`, built by
+`api/contracts.contract_action_refusals` from the route's role predicate and
+then the same gate (§487's shape, as for intake and requisitions). The 409s
+now answer with the coded `detail` the verdict carries (`contract_status_refused`
+with `params.status` and `params.action`; `contract_delete_refused` with
+`params.status`), its English `message` the sentence the routes always
+returned; no mobile screen reads contracts, and `bulk/status` reads the
+sentence through `utils/http.detail_text`, so its skip reasons are unchanged.
+
+**The page follows the endpoint, not the other way round**, as in §487: the
+expired contract's Activate and Terminate and the draft's Create PO are now
+offered. Narrowing the endpoints to the page's rule was rejected: re-activating
+an expired contract is documented behaviour (`backend/docs/contracts.md`), and
+nothing showed the draft-PO path to be wrong. Every contract refusal is a status
+or role one, so a refused action is hidden rather than explained.
+
+**Renewing a draft now stamps `activated_at`.** Renew moves any non-terminal
+contract to `active`; on a draft that put it in force without passing through
+activate, so the evidence of when it bound the parties (migration 0120) stayed
+NULL. Renew stamps it when unset, as activate does. Refusing renew on a draft
+was the alternative; it would change documented behaviour for no gain the
+stamp does not already give.
+
+**Bulk.** The bar tallies each action over the selection from the rows'
+verdicts (`actionVerdicts.tallyBulkVerdicts`): it offers an action only when a
+selected row allows it, or when a selected id is beyond the loaded pages (a
+"select all N matching"), where the server decides. It says before submit how
+many loaded rows will be skipped, and says no action fits rather than offering
+one. Skips on unloaded rows are still reported after the call, as before.
+
+Parity: `backend/tests/test_contract_action_verdicts.py` (each role × status ×
+action: verdict `None` exactly when the endpoint succeeds, otherwise its exact
+coded `detail`); `frontend/tests-e2e/contracts/action-verdicts.spec.ts`.
