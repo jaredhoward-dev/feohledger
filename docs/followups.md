@@ -442,21 +442,6 @@ nobody re-reads outlives the thing it describes.
       in production, or before more than a handful of paid customers.
       Ref: [billing.md](../backend/docs/billing.md) § The provider leg.
 
-### Radio cards inside modals inherit the stacked form-label style
-
-- [ ] **A `<label>` used as a radio card in a modal renders as a centred
-      column of grey uppercase captions.** `src/app.css`'s modal rules style
-      every `<label>` in a dialog as a stacked form field. The billing plan
-      picker overrode that in its own styles (PR #751, `frontend/docs/ui-patterns.md`
-      § Modals), but other dialogs that wrap radios in a `<label>` likely show
-      the same broken layout: `components/modals/GlAccountErpLinkModal.svelte`
-      sets `display: flex` with no row direction; `RecordInspectionModal.svelte`,
-      `VendorStatementReconModal.svelte` and `ErpCompanyPicker.svelte` are unchecked.
-      **Durable fix:** one shared radio-card class in `app.css` (row layout,
-      sentence-case text, selected ring) that both the plan picker and these
-      dialogs use, with a screenshot or computed-style check per dialog.
-      **Trigger:** the next change to any of those dialogs, or the next UI round.
-
 ### One adapter family still ships code no caller reaches
 
 - [ ] **`services/financing_adapters` has no production caller.** The

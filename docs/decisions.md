@@ -26252,3 +26252,45 @@ chose. The panel also follows the shared form conventions (picker field error,
 GL-list Retry, outside-click disarm, focus on open and close, locale decimal
 separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
 duplicated.
+
+## 516. Radio choices in a dialog share one `.radio-card` class, and the stacked-field label rule skips choice labels (round 42)
+
+**Problem.** `app.css`'s `.modal label` makes every label in a dialog a
+stacked form field: column flex, each direct-child `<span>` a small uppercase
+muted caption. A `<label>` wrapping a radio rendered as a centred column of
+shouting captions. The `/billing` plan picker shipped that way and was patched
+locally (PR #751); six more radio groups had the same defect behind partial
+per-component overrides that set `display: flex` but never the direction or
+the span styles: the GL-account ERP link, the inspection result, the
+vendor-statement intake mode, the webhook rotation overlap and the discount
+accept tier (the followup named four suspects; two of them, the webhook and
+discount dialogs, it missed, and `ErpCompanyPicker` is not in a dialog at
+all). Every checkbox row in a dialog (`.checkbox-line`, `.checkbox-label`, …)
+was exposed to the same rule, saved only where its component reset it.
+
+**Decision.** Two changes in `app.css`. (1) The stacked-field recipe skips
+any `.radio-card` and any label whose direct child is its own checkbox or
+radio (`:where(:not(.radio-card, :has(> input[type='checkbox'], >
+input[type='radio'])))`). Every such label in the tree puts the control first,
+so none of them was a caption-over-input field; `:where()` keeps the selector
+at its old specificity so no component override changes rank. Such a label
+gets a row-flex default instead (control, then text, 8px apart), because six
+dialogs' `.checkbox-label` / `.sr-checkbox` rules set only `flex-direction:
+row` and took `display: flex` from the stacked rule. (2) One shared
+`.radio-card` (plus `.radio-card-group` for the stacking gap) owns the row
+layout, sentence-case text, the 24px minimum target, the selected state
+(`--accent` border + 1px ring via `:has(input:checked)`), the focus ring on
+the card and the disabled state (`--text-muted`, not opacity). Every radio
+group above uses it, the plan picker drops its local override (keeping only
+its price column and alignment), and `ErpCompanyPicker` adopts it too for one
+look. `src/lib/a11y/radioCard.test.ts` fails if a radio `<label>` inside a
+`<Modal>` or a `*Modal.svelte` lacks the class, and pins the class's layout,
+target size and AA contrast on `--surface` in both themes.
+
+**Rejected.** *A per-dialog computed-style Playwright check*: it covers only
+the dialogs a spec opens and needs a stack for each, while the cause is one
+shared selector a static scan reads completely. *Only excluding
+`.radio-card` from the stacked rule*: the checkbox rows would have kept
+depending on each component remembering to reset it. *Drawing the selection
+with an `--accent-tint` fill*: muted text on it is under 4.5:1 in the dark
+theme (the reason the plan picker used a ring).
