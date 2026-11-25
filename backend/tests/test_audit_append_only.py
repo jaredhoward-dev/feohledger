@@ -321,7 +321,8 @@ _TENANT_MUTATORS_WITHOUT_DIRECT_AUDIT: dict[tuple[str, str], str] = {
     ("app.api.exceptions", "void_erp_bill"): (
         "audits via erp_bill_void.finish_void: the invoice's "
         "transition_invoice row (invoice.erp_bill_voided) and the exception's "
-        "exception_lifecycle._write row (decisions §539, §542, §545)"
+        "exception_lifecycle._write row, or erp_bill_void.record_orphaned_void's "
+        "exception.erp_bill_void_orphaned row (decisions §539, §542, §545, §550)"
     ),
     ("app.api.goods_receipts", "cancel_receipt"): (
         "audits via services/goods_receipts.cancel_goods_receipt (`goods_receipt.cancelled`)"

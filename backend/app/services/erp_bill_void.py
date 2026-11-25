@@ -70,6 +70,16 @@ ERP_BILL_VOIDED_KEY = "erp_bill_voided"
 #: ``workflow_engine.ERP_VOID_ACTION``.
 ACTION_EXCEPTION_ERP_BILL_VOIDED = "exception.erp_bill_voided"
 
+#: The audit action when this attempt sent a void to the ERP but could not
+#: record it here: its marker had been taken over, or the invoice had moved on
+#: (decisions §550). The bill may be void in the ERP with nothing else here
+#: saying so.
+ACTION_EXCEPTION_ERP_BILL_VOID_ORPHANED = "exception.erp_bill_void_orphaned"
+
+#: ``erp_report["kind"]`` of the payment-blocking row an orphaned void opens
+#: when the invoice is payable here (decisions §550).
+ERP_REPORT_VOID_ORPHANED = "void_orphaned"
+
 #: Bounds, in seconds, on the two ERP calls made while the invoice, its flag and
 #: its workflow instance are row-locked (decisions §542). Each adapter's HTTP
 #: client already times out per request (15–30 s); these bound the whole call,
@@ -80,10 +90,20 @@ STATUS_READ_TIMEOUT_S = 30
 VOID_CALL_TIMEOUT_S = 45
 
 #: Seconds after which a void-in-progress marker no longer counts (decisions
-#: §545). Step 2 is bounded at the read, the deleted-bill report and the void
-#: (30 + 30 + 45 s), so a marker older than this belongs to an attempt that
-#: died between its commit and its finish; the endpoint then takes it over.
+#: §545). Step 2 as a whole is bounded at :data:`CALL_ERP_TIMEOUT_S`, so a
+#: marker older than this belongs to an attempt that died between its commit
+#: and its finish; the endpoint then takes it over.
 PENDING_STALE_AFTER_S = 300
+
+#: The bound on the WHOLE of step 2 (decisions §550): the credential unseal and
+#: the adapter's construction as well as the read, the deleted-bill report and
+#: the void. The per-call bounds above leave the unseal (a KMS call in a
+#: worker thread) unbounded here, and an attempt that outran
+#: :data:`PENDING_STALE_AFTER_S` could void a bill in the ERP after its marker
+#: stopped holding the flag. Half the staleness window, so step 2 has always
+#: given up long before its marker goes stale.
+CALL_ERP_TIMEOUT_S = 150
+assert CALL_ERP_TIMEOUT_S * 2 <= PENDING_STALE_AFTER_S
 
 # ---------- the coded refusals (`api/refusals.coded_refusal`) ----------
 
@@ -388,7 +408,37 @@ async def begin_void(
     return attempt
 
 
+@dataclass
+class _Phase:
+    """How far step 2 got: whether the void call has been started."""
+
+    void_sent: bool = False
+
+
 async def call_erp(org, attempt: VoidAttempt) -> ErpAnswer:
+    """Step 2, bounded as a whole at :data:`CALL_ERP_TIMEOUT_S` (decisions §550).
+
+    Running out before the void call started is ``erp_void_failed`` (nothing
+    was written to the ERP); after, ``erp_void_unconfirmed``. The timeout
+    cancels the coroutine, so no later step runs: a credential unseal already
+    in its worker thread cannot be cancelled and may finish afterwards, but
+    nothing awaits its result, so no void follows it."""
+    from fastapi import status as http_status
+
+    phase = _Phase()
+    try:
+        return await asyncio.wait_for(_call_erp(org, attempt, phase), CALL_ERP_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning(
+            "erp bill void: ERP step timed out (%s the void call)",
+            "after" if phase.void_sent else "before",
+        )
+        if phase.void_sent:
+            raise _refused(ERP_VOID_UNCONFIRMED, http_status.HTTP_502_BAD_GATEWAY) from None
+        raise _refused(ERP_VOID_FAILED, http_status.HTTP_502_BAD_GATEWAY) from None
+
+
+async def _call_erp(org, attempt: VoidAttempt, phase: _Phase) -> ErpAnswer:
     """Step 2, with no row lock and no session: open the adapter, read the
     bill, and void it only on a positive read (§542).
 
@@ -440,6 +490,7 @@ async def call_erp(org, attempt: VoidAttempt) -> ErpAnswer:
     if not already_gone:
         if void_scope == BILL_VOID_DRAFT_ONLY and read != ErpInvoiceStatus.draft:
             raise _refused(ERP_VOID_DRAFT_ONLY, http_status.HTTP_409_CONFLICT)
+        phase.void_sent = True
         try:
             voided = await asyncio.wait_for(adapter.void_invoice(document_id), VOID_CALL_TIMEOUT_S)
         except NotImplementedError:
@@ -458,6 +509,107 @@ async def call_erp(org, attempt: VoidAttempt) -> ErpAnswer:
 def _ours(invoice: Invoice | None, attempt: VoidAttempt) -> bool:
     marker = getattr(invoice, "erp_void_pending", None)
     return isinstance(marker, dict) and marker.get("attempt_id") == attempt.attempt_id
+
+
+def _still_holds(invoice: Invoice, attempt: VoidAttempt) -> bool:
+    """Does the invoice still hold the bill this attempt set out to void, at a
+    status a void may finish from?"""
+    return invoice.erp_document_id == attempt.document_id and invoice.status in VOIDABLE_STATUSES
+
+
+def lost_its_invoice(invoice: Invoice | None, attempt: VoidAttempt) -> bool:
+    """Can this attempt no longer record its void here: its marker taken over,
+    or the invoice moved on from the bill?"""
+    return invoice is None or not _ours(invoice, attempt) or not _still_holds(invoice, attempt)
+
+
+def configured_erp_type(org_settings: dict | None) -> str | None:
+    """The adapter key the org's ERP configuration resolves to, for naming the
+    ERP in a finding (the local default when none is configured)."""
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key
+
+    erp = (org_settings or {}).get("erp") if isinstance(org_settings, dict) else None
+    return resolve_adapter_key(erp if isinstance(erp, dict) and erp else _LOCAL_ERP)
+
+
+async def record_orphaned_void(
+    db: AsyncSession,
+    *,
+    attempt: VoidAttempt,
+    exception: APException,
+    invoice: Invoice | None,
+    user,
+    void_result: str,
+    erp_type: str | None,
+) -> None:
+    """This attempt sent the void to the ERP (``void_result`` ``voided``, or
+    ``unconfirmed`` when the ERP may have acted) but cannot record it here
+    (decisions §550): its marker went stale and was taken over, or the invoice
+    moved on (a person dismissed the flag once the marker was stale and a run
+    scheduled it). Nothing on the invoice is changed — what happened to it
+    since is someone's decision — but the void must not go unrecorded:
+
+    * an append-only ``exception.erp_bill_void_orphaned`` row on the flag,
+      naming the bill, the actor, the attempt and the invoice's status now;
+    * when the invoice no longer holds the bill and is payable here
+      (``PAYABLE_STATUSES``), a payment-blocking ``payment_reconciliation``
+      row (kind ``void_orphaned``, deduped by kind), since a payment against a
+      bill void in the ERP needs a person. An invoice still holding the same
+      bill, its marker taken over by a newer attempt, gets none: that attempt
+      reads the bill gone and converges, and the open flag holds it meanwhile."""
+    from app.models.invoice_status import PAYABLE_STATUSES
+    from app.services.erp_status_sync import (
+        PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        erp_finding,
+        open_erp_reconciliation_exception,
+    )
+    from app.services.exception_lifecycle import _write
+
+    status_now = invoice.status.value if invoice is not None else None
+    logger.warning(
+        "erp bill void: attempt %s %s bill on invoice %s but could not record it",
+        attempt.attempt_id,
+        void_result,
+        getattr(invoice, "id", None),
+    )
+    await _write(
+        db,
+        exception=exception,
+        invoice=invoice,
+        action=ACTION_EXCEPTION_ERP_BILL_VOID_ORPHANED,
+        actor_id=user.id,
+        details={
+            "exception_id": str(exception.id),
+            "invoice_id": str(exception.invoice_id),
+            "erp_document_id": attempt.document_id,
+            "attempt_id": attempt.attempt_id,
+            "actor_id": str(user.id),
+            "void_result": void_result,
+            "invoice_status": status_now,
+            "marker_taken_over": invoice is not None and not _ours(invoice, attempt),
+        },
+    )
+    if (
+        invoice is not None
+        and not _still_holds(invoice, attempt)
+        and invoice.status in PAYABLE_STATUSES
+    ):
+        await open_erp_reconciliation_exception(
+            db,
+            invoice,
+            org_id=exception.organization_id,
+            finding=erp_finding("erp_voided_after_post", erp_type),
+            exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+            erp_report={
+                "kind": ERP_REPORT_VOID_ORPHANED,
+                "erp_type": erp_type,
+                "erp_document_id": attempt.document_id,
+                "attempt_id": attempt.attempt_id,
+                "void_result": void_result,
+                "invoice_status": status_now,
+                "exception_id": str(exception.id),
+            },
+        )
 
 
 def abandon_void(invoice: Invoice | None, attempt: VoidAttempt) -> None:
@@ -479,6 +631,7 @@ async def finish_void(
     instance,
     user,
     reason: str,
+    erp_type: str | None = None,
 ) -> VoidOutcome:
     """Step 3 after the ERP voided the bill (or it was already gone), under the
     re-taken locks, in the caller's transaction.
@@ -487,7 +640,8 @@ async def finish_void(
     belongs to an attempt that will converge on its own read — and the invoice
     must still hold the same bill at a voidable status; otherwise nothing here
     is written (``erp_void_in_progress`` / ``erp_void_no_bill``, the marker
-    cleared in the second case so it cannot hold the flag).
+    cleared in the second case so it cannot hold the flag) but, when this
+    attempt sent the void, the orphan record (:func:`record_orphaned_void`).
 
     Then: the document id, its deep link and the push's ``erp_reference`` are
     cleared (so `review.recall_refusal` no longer finds a bill — any other
@@ -502,13 +656,33 @@ async def finish_void(
     from app.services.workflow_engine import ERP_VOID_ACTION, transition_invoice
 
     if invoice is None or not _ours(invoice, attempt):
+        if not answer.already_gone:
+            await record_orphaned_void(
+                db,
+                attempt=attempt,
+                exception=exception,
+                invoice=invoice,
+                user=user,
+                void_result="voided",
+                erp_type=erp_type,
+            )
         raise _refused(ERP_VOID_IN_PROGRESS, http_status.HTTP_409_CONFLICT)
     document_id = attempt.document_id
-    if invoice.erp_document_id != document_id or invoice.status not in VOIDABLE_STATUSES:
+    if not _still_holds(invoice, attempt):
         logger.warning(
             "erp bill void: invoice %s changed while its bill was voided; not finished",
             invoice.id,
         )
+        if not answer.already_gone:
+            await record_orphaned_void(
+                db,
+                attempt=attempt,
+                exception=exception,
+                invoice=invoice,
+                user=user,
+                void_result="voided",
+                erp_type=erp_type,
+            )
         invoice.erp_void_pending = None
         raise _refused(ERP_VOID_NO_BILL, http_status.HTTP_409_CONFLICT)
 
