@@ -1032,6 +1032,36 @@ def test_a_credit_note_created_but_not_allocated_is_allocated_on_retry(xero):
     assert len(xero.credit_notes) == 1 and bill["AmountDue"] == Decimal("0")
 
 
+def test_a_recorded_credit_note_is_read_by_id_and_never_created_again(xero):
+    """Decisions §579: with the id recorded, the retry reads THAT credit note
+    and allocates it; a number lookup that misses (Xero's ``where`` on
+    ``CreditNoteNumber`` is unconfirmed) can no longer lead to a second one."""
+    bill = _discounted_bill(xero)
+    xero.fail_allocation = True
+    failed = asyncio.run(_adapter().post_discount_credit(_credit()))
+    xero.fail_allocation = False
+    xero.replays.clear()  # no Idempotency-Key replay to lean on
+    retried = asyncio.run(
+        _adapter().post_discount_credit(_credit(credit_id=failed.erp_document_id))
+    )
+    assert retried.success and retried.erp_document_id == failed.erp_document_id
+    assert len(xero.sent("PUT", "/CreditNotes")) == 1
+    assert not [r for r in xero.sent("GET", "/CreditNotes") if "where" in str(r.url)][1:]
+    assert len(xero.credit_notes) == 1 and bill["AmountDue"] == Decimal("0")
+
+
+def test_a_recorded_credit_note_someone_voided_is_refused_not_rebooked(xero):
+    _discounted_bill(xero)
+    xero.fail_allocation = True
+    failed = asyncio.run(_adapter().post_discount_credit(_credit()))
+    xero.credit_notes[failed.erp_document_id]["Status"] = "VOIDED"
+    xero.fail_allocation = False
+    result = asyncio.run(_adapter().post_discount_credit(_credit(credit_id=failed.erp_document_id)))
+    assert not result.success and result.refusal_code == BILL_PAYMENT_VOIDED
+    assert result.erp_document_id == failed.erp_document_id
+    assert len(xero.sent("PUT", "/CreditNotes")) == 1
+
+
 def test_voiding_removes_the_allocation_then_voids_the_credit_note_once(xero):
     bill = _discounted_bill(xero)
     booked = asyncio.run(_adapter().post_discount_credit(_credit()))

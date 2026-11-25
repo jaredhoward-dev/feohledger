@@ -30521,3 +30521,96 @@ control plane), `test_invoice_delete_cascade.py` (each pending key refused,
 empty key allowed, bulk skip; `sending` / `sent` / `delivered` refused,
 `failed` cleared, bulk skip, claim named first); web `codedRefusals.test.ts`,
 `auditActions.roster.test.ts`.
+
+## 579. A recorded discount credit is finished by its record, never re-created; a void that races a credit attempt reverses it; retries are capped and audited on change (§575 / §577 re-review, round 49)
+
+A money-path re-review of §577's recovery found four gaps.
+
+**1. A write-back re-run ignored the record.** `write_back_payment` re-runs for
+an already-paid invoice (`POST /api/payments/runs/{id}/sync-erp`, a webhook
+re-dispatch). It rebuilt the credit from today's settings with `credit_id=None`,
+so QuickBooks created a second VendorCredit (VC-8) beside the recorded,
+unapplied VC-7. It also overwrote the record blindly, so a refusal before any
+write (`payment_exceeds_balance`, `not_posted`) dropped a record whose credit
+still stood. Now the payload comes from `state_data.erp_discount_credits_pending
+[payment id]` when one exists: the recorded `credit_id`, amount, date and
+accounts. The record is dropped only on a confirmed outcome, the credit applied
+or ours refused `bill_payment_voided`. A pre-write refusal keeps it.
+
+**2. A record with no known id was "recovered" by creating again.** A create
+answered with a 5xx, a network error or a 200 with no `Id` was saved with
+`credit_id: None`. The sweep then created again, relying on `requestid` /
+`Idempotency-Key` replay, which §577 lists as unconfirmed. The void found
+nothing through the bill and cleared both maps. Now a record with no id is
+never created again. Its attempt asks `ErpAdapter.find_discount_credit`, which
+only answers on a positive match: QuickBooks through the bill's applying
+BillPayment, Xero by our `CreditNoteNumber`, checked on our side. A match is
+applied by that id. A miss holds the record and opens
+`erp_discount_credit_stalled` (`erp_report.kind: discount_credit_stalled`,
+`reason: unidentified`, `discount_credit_marker: "FeohLedger discount <payment
+id>"`), a new catalogue code in every locale, web and mobile, which also does
+§577's pending-credit sentence follow-up. A void with such a record voids our
+payment, keeps the record, flags it and reports `FAILED`, never success.
+- **Not payment-blocking** (`erp_reconciliation`): the payment it belongs to
+  has already moved. A stray, unapplied credit is a bookkeeping fix in the ERP,
+  and holding a re-pay of the bill for it would delay the supplier for nothing.
+  The re-pay's own write-back already refuses to overpay a bill a person
+  applied the credit to (`payment_exceeds_balance`, flagged).
+- **Rejected: finding the QuickBooks credit by `VendorRef` + a `TxnDate`
+  window**, filtered by our marker on our side. §577's source (`Finance.xsd`)
+  confirms the fields, not that the query language filters VendorCredit on
+  them. An unconfirmed query that silently returned nothing would read as "no
+  credit", which is the failure being fixed. The person flag is the path until
+  a real company confirms the query.
+- Xero's `post_discount_credit` now honours `credit_id` as QuickBooks' does. It
+  reads that credit note by id, and one not ours, voided or deleted is refused
+  `bill_payment_voided`. A number lookup that misses can then never lead to a
+  second credit note.
+
+**3. Sweep vs void race.** The sweep read `Payment.status == completed`, rolled
+back and called the ERP. A void could commit (and run its reversal, finding
+nothing) in between, and the sweep then applied a credit to a voided payment's
+bill: it read $98 open for a voided payment, and a re-pay of $100 was refused.
+Now each attempt is two-phase, per record:
+- **Claim:** under the workflow instance's row lock, it re-reads the record and
+  the payment and writes `claimed_until` (`CREDIT_CLAIM_SECONDS`, 300 s), then
+  commits. A live claim, an `exhausted` record, or a payment no longer
+  `completed` whose credit id is known (its void reverses it) is skipped. The
+  tick and `sync_org_now` therefore never attempt one record at once, and a
+  dead process's claim lapses.
+- **Outcome:** under the lock again, it re-reads the payment. If the payment is
+  no longer `completed` and a credit id is now held, that id goes into
+  `erp_discount_credit_voids_pending`, the payment is put back in
+  `erp_payment_voids_pending`, and the credit record is dropped. The next pass
+  reverses the credit.
+- `record_pending_erp_void` now takes the same row lock and reads fresh, so the
+  void's write cannot overwrite a record committed beside it.
+- `void_written_payment` clears its markers compare-then-clear: a credit
+  re-armed while it was calling the ERP stays pending.
+
+**4. Audit growth.** The sweep wrote `payment.erp_discount_credit_failed` on
+every pass. The record now keeps `attempts`, `last_attempt` and `outcome` (the
+refusal code or the PII-free failure message). A new audit row is written only
+when the outcome changes, the credit posts, or the cap is reached
+(`retries_exhausted: true`). At **`MAX_CREDIT_ATTEMPTS` = 12** (three days at
+the default six-hour status-sync interval, write-back re-runs included) the
+record is marked `exhausted`, nothing calls the ERP for it again, and the
+stalled flag opens with `reason: retries_exhausted` and the credit id. The
+record stays, so a void still reverses the credit by that id. Rejected:
+exponential backoff. The sweep's own interval is already the spacing, and a cap
+plus a person matches how every other write-back failure ends here.
+
+**Tests.** `tests/test_erp_payment_writeback.py`:
+- a re-run applies the recorded VC-7 by id;
+- a pre-write refusal keeps the record;
+- a record with no id is looked up, not created, flagged once, and applied once
+  found;
+- the void reports failure over an unidentified credit;
+- a void committed during the sweep's call is re-armed with the credit;
+- the void's compare-then-clear keeps a re-armed credit;
+- a second pass during the first skips the claimed record;
+- a repeated failure is audited once and stops at the cap.
+
+`tests/test_xero_status_sync_adapter.py`: a recorded credit note is read by id
+and never created again, and one voided is refused. `tests/test_qbo_status_sync_adapter.py`:
+an unapplied credit is not found through the bill.

@@ -660,6 +660,34 @@ credit's id in `state_data.erp_discount_credit_voids_pending` before deleting
 anything, so a retry after the application was deleted still deletes the
 credit; the void-failed flag names it as `discount_credit_document_id`.
 
+**A recorded credit is finished, never booked again** (decisions §579). Every
+attempt at it — the sweep, or a write-back re-run (`POST
+/api/payments/runs/{id}/sync-erp`, a webhook re-dispatch) for an already-paid
+invoice — builds its payload from the record (its `credit_id`, amount and
+accounts), never from today's settings. The record is dropped only when the
+credit is applied or ours was refused `bill_payment_voided`; a refusal before
+any write (`payment_exceeds_balance`, `not_posted`) keeps it, since the credit
+it names still stands. A record with **no known id** (the create's answer was
+a 5xx, a network error, or a 200 with no `Id`) is never re-created on the
+providers' unconfirmed `requestid` / `Idempotency-Key` replay: the adapter's
+`find_discount_credit` is asked (QuickBooks: through the bill's applying
+BillPayment, so an unapplied credit is not found; Xero: by our
+`CreditNoteNumber`, matched on our side), and a miss holds the record and opens
+the non-blocking `erp_discount_credit_stalled` flag (`erp_report.kind:
+discount_credit_stalled`, `reason: unidentified`, `discount_credit_marker:
+"FeohLedger discount <payment id>"`) for a person to find it. QuickBooks
+VendorCredit is not queried by `VendorRef` / `TxnDate`: that filter is not in
+the schema §577 confirmed. Xero now honours `credit_id` too (reads that credit
+note by id; voided or not ours is `bill_payment_voided`). A void with such a
+record voids our payment but keeps the record, flags it, and reports failure.
+Each attempt is claimed per record (`claimed_until`), its outcome written under
+the instance lock after re-reading the payment — a void that committed during
+the call gets the credit id in `erp_discount_credit_voids_pending` and its void
+re-armed — and the void clears its markers compare-then-clear. The record keeps
+`attempts`, `last_attempt` and `outcome`; an unchanged outcome writes no new
+audit row, and at `MAX_CREDIT_ATTEMPTS` (12) it is `exhausted` and flagged
+(`reason: retries_exhausted`).
+
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
 (`vendor_credit_unconfirmed` / `credit_note_unconfirmed`).

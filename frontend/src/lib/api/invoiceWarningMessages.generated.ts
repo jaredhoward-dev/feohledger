@@ -255,6 +255,10 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_payment_void_writeback_failed': 'exceptions.description.erpPaymentVoidWritebackFailed',
 	// Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
 	'exception.erp_payment_void_writeback_failed_unnamed': 'exceptions.description.erpPaymentVoidWritebackFailedUnnamed',
+	// {erp} may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+	'exception.erp_discount_credit_stalled': 'exceptions.description.erpDiscountCreditStalled',
+	// Your ERP may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+	'exception.erp_discount_credit_stalled_unnamed': 'exceptions.description.erpDiscountCreditStalledUnnamed',
 	// The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
 	'exception.erp_credit_settlement': 'exceptions.description.erpCreditSettlement',
 	// The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.
@@ -467,6 +471,8 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_payment_writeback_balance_open_unnamed': { amount: 'money', currency: 'currency' },
 	'exception.erp_payment_void_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_void_writeback_failed_unnamed': {},
+	'exception.erp_discount_credit_stalled': { erp: 'text' },
+	'exception.erp_discount_credit_stalled_unnamed': {},
 	'exception.erp_credit_settlement': {},
 	'exception.erp_settled_no_payment': {},
 	'exception.erp_paid_while_scheduled': {},

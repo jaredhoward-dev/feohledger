@@ -3987,6 +3987,15 @@ class AppLocalizationsFr extends AppLocalizations {
       'Votre ERP affiche toujours cette facture comme payée par un paiement annulé dans FeohLedger, car son annulation dans l\'ERP a échoué. Annulez ce paiement dans l\'ERP pour que les comptes concordent.';
 
   @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp contient peut-être un avoir d\'escompte pour paiement anticipé que FeohLedger a créé pour le paiement de cette facture sans pouvoir l\'imputer ni l\'annuler automatiquement. Recherchez-y l\'avoir marqué « FeohLedger discount » avec l\'identifiant de ce paiement, puis imputez-le ou supprimez-le pour que l\'escompte ne soit compté qu\'une fois.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Votre ERP contient peut-être un avoir d\'escompte pour paiement anticipé que FeohLedger a créé pour le paiement de cette facture sans pouvoir l\'imputer ni l\'annuler automatiquement. Recherchez-y l\'avoir marqué « FeohLedger discount » avec l\'identifiant de ce paiement, puis imputez-le ou supprimez-le pour que l\'escompte ne soit compté qu\'une fois.';
+
+  @override
   String get exceptionDescriptionErpSyncBackFailed =>
       'Le paiement de cette facture a été réglé, mais FeohLedger n\'a pas pu finir de l\'enregistrer : la facture n\'est donc pas passée à « Payée » alors que l\'argent est parti. Rien ne le relance automatiquement : utilisez « Relancer la synchro ERP » sur le lot de paiement concerné, dans Paiements.';
 

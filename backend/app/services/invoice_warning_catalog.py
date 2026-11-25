@@ -914,6 +914,15 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
         "still shows this bill paid by a payment that was voided in FeohLedger, because "
         "voiding it in the ERP failed. Void that payment in the ERP so the books agree."
     ),
+    # A discount credit (decisions §575) FeohLedger cannot finish on its own:
+    # created but never identified, or retried until the cap (§579). The
+    # payment id and the credit's marker are in `exceptions.erp_report`.
+    "erp_discount_credit_stalled": (
+        "may hold an early-payment discount credit FeohLedger created for this invoice's "
+        "payment that it could not apply or reverse automatically. Find the credit marked "
+        "“FeohLedger discount” with this payment's id there, and apply or delete it so "
+        "the discount is counted once."
+    ),
 }
 
 #: Params a named sentence carries besides ``erp`` (both twins carry them).

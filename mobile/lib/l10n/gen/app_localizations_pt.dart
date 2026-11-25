@@ -3977,6 +3977,15 @@ class AppLocalizationsPt extends AppLocalizations {
       'Seu ERP ainda mostra esta fatura como paga por um pagamento que foi estornado no FeohLedger, porque o estorno no ERP falhou. Estorne esse pagamento no ERP para que os livros confiram.';
 
   @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp pode conter um crédito de desconto por pagamento antecipado que o FeohLedger criou para o pagamento desta fatura, mas não conseguiu aplicar nem estornar automaticamente. Procure lá o crédito marcado como “FeohLedger discount” com o id deste pagamento e aplique-o ou exclua-o para que o desconto seja contado uma única vez.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Seu ERP pode conter um crédito de desconto por pagamento antecipado que o FeohLedger criou para o pagamento desta fatura, mas não conseguiu aplicar nem estornar automaticamente. Procure lá o crédito marcado como “FeohLedger discount” com o id deste pagamento e aplique-o ou exclua-o para que o desconto seja contado uma única vez.';
+
+  @override
   String get exceptionDescriptionErpSyncBackFailed =>
       'O pagamento desta fatura foi liquidado, mas o FeohLedger não conseguiu concluir o registro, então a fatura não passou para “Paga”, embora o dinheiro já tenha saído. Nada tenta de novo automaticamente: use “Repetir sincronização com o ERP” no lote de pagamento correspondente, em Pagamentos.';
 
@@ -9143,6 +9152,15 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
       'Seu ERP ainda mostra esta fatura como paga por um pagamento que foi estornado no FeohLedger, porque o estorno no ERP falhou. Estorne esse pagamento no ERP para que os livros confiram.';
+
+  @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp pode conter um crédito de desconto por pagamento antecipado que o FeohLedger criou para o pagamento desta fatura, mas não conseguiu aplicar nem estornar automaticamente. Procure lá o crédito marcado como “FeohLedger discount” com o id deste pagamento e aplique-o ou exclua-o para que o desconto seja contado uma única vez.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Seu ERP pode conter um crédito de desconto por pagamento antecipado que o FeohLedger criou para o pagamento desta fatura, mas não conseguiu aplicar nem estornar automaticamente. Procure lá o crédito marcado como “FeohLedger discount” com o id deste pagamento e aplique-o ou exclua-o para que o desconto seja contado uma única vez.';
 
   @override
   String get exceptionDescriptionErpSyncBackFailed =>

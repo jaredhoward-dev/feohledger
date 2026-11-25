@@ -1346,11 +1346,26 @@ class XeroAdapter(OAuthErpAdapter):
                 bill = await self._read_bill(client, headers, payload.bill_id)
                 if str(bill.get("Status") or "").upper() in _GONE_STATUSES:
                     return _nothing_posted(erp_refusal(PROVIDER, BILL_NOT_IN_ERP))
-                ours = await self._our_credit_notes(client, headers, payload.payment_id)
+                if payload.credit_id:
+                    # A credit note an earlier attempt recorded (decisions
+                    # §577, §579): read THAT one by id, never look it up by
+                    # number again and create on a miss. Not ours, voided or
+                    # deleted is refused below as someone's decision.
+                    known = await self._read_credit_note(client, headers, str(payload.credit_id))
+                    mine = _discount_marker(known) == str(payload.payment_id).lower()
+                    ours = [known] if mine else []
+                    if not ours:
+                        refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
+                        refused.refusal_params = {"document": "discount_credit"}
+                        refused.erp_document_id = str(payload.credit_id)
+                        return refused
+                else:
+                    ours = await self._our_credit_notes(client, headers, payload.payment_id)
                 live = [c for c in ours if str(c.get("Status") or "").upper() not in _GONE_STATUSES]
                 if not live and ours:
                     refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
                     refused.refusal_params = {"document": "discount_credit"}
+                    refused.erp_document_id = str(ours[0].get("CreditNoteID"))
                     return refused
                 bill_currency = iso_currency_or_none(bill.get("CurrencyCode"))
                 if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):

@@ -5838,6 +5838,18 @@ abstract class AppLocalizations {
   /// **'Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.'**
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed;
 
+  /// No description provided for @exceptionDescriptionErpDiscountCreditStalled.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} may hold an early-payment discount credit FeohLedger created for this invoice\'s payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment\'s id there, and apply or delete it so the discount is counted once.'**
+  String exceptionDescriptionErpDiscountCreditStalled(String erp);
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditStalledUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP may hold an early-payment discount credit FeohLedger created for this invoice\'s payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment\'s id there, and apply or delete it so the discount is counted once.'**
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed;
+
   /// No description provided for @exceptionDescriptionErpSyncBackFailed.
   ///
   /// In en, this message translates to:

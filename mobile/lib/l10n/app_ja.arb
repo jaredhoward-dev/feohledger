@@ -1118,6 +1118,8 @@
   "exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed": "ご利用の ERP はこの請求書の支払いを記録しましたが、請求書にはまだ {amount} の未決済残高が表示されています（FeohLedger で適用した割引またはクレジット）。ERP で差額を解消してください。",
   "exceptionDescriptionErpPaymentVoidWritebackFailed": "{erp} では、FeohLedger で無効化された支払いによってこの請求書がまだ支払済みと表示されています。ERP での無効化に失敗したためです。帳簿を一致させるため、ERP でその支払いを無効化してください。",
   "exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed": "ご利用の ERP では、FeohLedger で無効化された支払いによってこの請求書がまだ支払済みと表示されています。ERP での無効化に失敗したためです。帳簿を一致させるため、ERP でその支払いを無効化してください。",
+  "exceptionDescriptionErpDiscountCreditStalled": "{erp} に、FeohLedger がこの請求書の支払いのために作成したものの、自動で適用または取り消しできなかった早期支払割引のクレジットが残っている可能性があります。そこで「FeohLedger discount」とこの支払いの ID が記載されたクレジットを探し、割引が一度だけ計上されるよう適用または削除してください。",
+  "exceptionDescriptionErpDiscountCreditStalledUnnamed": "ご利用の ERP に、FeohLedger がこの請求書の支払いのために作成したものの、自動で適用または取り消しできなかった早期支払割引のクレジットが残っている可能性があります。そこで「FeohLedger discount」とこの支払いの ID が記載されたクレジットを探し、割引が一度だけ計上されるよう適用または削除してください。",
   "exceptionDescriptionErpSyncBackFailed": "この請求書の支払いは決済されましたが、FeohLedger が記録を完了できなかったため、資金は出金済みにもかかわらず請求書は「支払済み」になっていません。自動では再試行されません。「支払い」でこの支払いの支払実行にある「ERP連携を再実行」を使用してください。",
   "exceptionDescriptionExtractionFailed": "抽出に失敗しました: {errorClass}",
   "exceptionDescriptionPositivePayAlteredAmount": "Positive Pay の返却: 小切手 {checkNumber} の金額が改ざんされています",

@@ -296,6 +296,8 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   },
   'exception.erp_payment_void_writeback_failed': {'erp': 'text'},
   'exception.erp_payment_void_writeback_failed_unnamed': {},
+  'exception.erp_discount_credit_stalled': {'erp': 'text'},
+  'exception.erp_discount_credit_stalled_unnamed': {},
   'exception.erp_credit_settlement': {},
   'exception.erp_settled_no_payment': {},
   'exception.erp_paid_while_scheduled': {},
@@ -1176,6 +1178,14 @@ String? _localizeWarningCode(
     // Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
     case 'exception.erp_payment_void_writeback_failed_unnamed':
       return l.exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed;
+    // {erp} may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+    case 'exception.erp_discount_credit_stalled':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpDiscountCreditStalled(erp);
+    // Your ERP may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+    case 'exception.erp_discount_credit_stalled_unnamed':
+      return l.exceptionDescriptionErpDiscountCreditStalledUnnamed;
     // The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
     case 'exception.erp_credit_settlement':
       return l.exceptionDescriptionErpCreditSettlement;

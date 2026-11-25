@@ -797,6 +797,263 @@ async def test_a_void_stopped_on_the_credit_retries_by_the_recorded_id(realdb):
     assert erp_payment_writeback.PENDING_VOID_CREDITS_KEY not in instance.state_data
 
 
+# ---------------------------------------------------------------------------
+# A recorded credit: re-runs, unknown ids, the void race, retries (§579)
+# ---------------------------------------------------------------------------
+
+
+def _unapplied(credit_id: str | None = "VC-7") -> ErpPostResult:
+    return ErpPostResult(
+        success=False,
+        erp_document_id=credit_id,
+        message="quickbooks_online post failed: vendor_credit_unconfirmed",
+    )
+
+
+async def _record(realdb, inv_id, pay_id) -> dict | None:
+    [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
+    return (instance.state_data.get(erp_payment_writeback.PENDING_CREDITS_KEY) or {}).get(
+        str(pay_id)
+    )
+
+
+async def _rerun(realdb, pay_id, adapter):
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        return await erp_payment_writeback.write_back_settled_payment(
+            realdb.info("a").org_id, pay_id
+        )
+
+
+async def _sweep(realdb, adapter) -> int:
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        return await erp_payment_writeback.resume_pending_credits(await _org(realdb))
+
+
+def _actions(rows, action: str) -> list:
+    return [r for r in rows if r.action == action]
+
+
+async def test_a_write_back_rerun_applies_the_recorded_credit_and_books_no_second(realdb):
+    """A manual `/sync-erp` or webhook re-dispatch of an already-paid invoice
+    finishes the credit the first attempt recorded (VC-7), by its id and its
+    recorded amount, rather than create another (VC-8)."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)
+    assert (await _record(realdb, inv_id, pay_id))["credit_id"] == "VC-7"
+
+    adapter.post_discount_credit.reset_mock()
+    adapter.post_discount_credit.return_value = ErpPostResult(
+        success=True, erp_document_id="VC-7", bill_balance_after=Decimal(0)
+    )
+    assert await _rerun(realdb, pay_id, adapter) == erp_payment_writeback.WROTE
+    (retry,) = adapter.post_discount_credit.await_args.args
+    # Applied by id: the adapter never reaches its create with an id in hand.
+    assert retry.credit_id == "VC-7" and retry.amount == Decimal("2.00")
+    assert retry.discount_account_erp_id == "88"
+    assert await _record(realdb, inv_id, pay_id) is None
+
+
+async def test_a_pre_write_refusal_on_a_rerun_keeps_the_record(realdb):
+    """VC-7 still stands whatever this attempt refused before writing; dropping
+    the record would leave it untracked for the sweep and the void."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)
+    refused = erp_preflight_refusal("quickbooks_online", "payment_exceeds_balance")
+    adapter.post_discount_credit.return_value = refused
+    await _rerun(realdb, pay_id, adapter)
+    record = await _record(realdb, inv_id, pay_id)
+    assert record["credit_id"] == "VC-7" and record["attempts"] == 2
+    assert record["outcome"] == "payment_exceeds_balance"
+    # The sweep's pass refuses the same way: also kept.
+    await _sweep(realdb, adapter)
+    assert (await _record(realdb, inv_id, pay_id))["credit_id"] == "VC-7"
+
+
+async def test_a_record_with_no_known_id_is_never_created_again(realdb):
+    """The create's answer was lost: a credit may stand that we cannot name.
+    The sweep looks it up and, not finding it, holds the record and tells a
+    person — it never calls the create again on an unconfirmed key replay."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied(None))
+    await _sync(realdb, run_id, adapter)
+    record = await _record(realdb, inv_id, pay_id)
+    assert record is not None and record["credit_id"] is None
+    [stalled] = [
+        r
+        for r in await _rows(realdb, APException, invoice_id=inv_id)
+        if r.erp_report["kind"] == erp_payment_writeback.ERP_REPORT_DISCOUNT_CREDIT_STALLED
+    ]
+    assert stalled.erp_report["reason"] == "unidentified"
+    assert stalled.erp_report["discount_credit_marker"] == f"FeohLedger discount {pay_id}"
+    assert stalled.description_code == "exception.erp_discount_credit_stalled"
+
+    adapter.post_discount_credit.reset_mock()
+    adapter.find_discount_credit.return_value = None
+    assert await _sweep(realdb, adapter) == 1
+    adapter.post_discount_credit.assert_not_awaited()
+    adapter.find_discount_credit.assert_awaited_once()
+    assert (await _record(realdb, inv_id, pay_id))["credit_id"] is None
+    flags = await _rows(realdb, APException, invoice_id=inv_id)
+    assert _kinds(flags).count(erp_payment_writeback.ERP_REPORT_DISCOUNT_CREDIT_STALLED) == 1
+
+    # Found by a positive match on a later pass: applied by THAT id.
+    adapter.find_discount_credit.return_value = "VC-9"
+    adapter.post_discount_credit.return_value = ErpPostResult(
+        success=True, erp_document_id="VC-9", bill_balance_after=Decimal(0)
+    )
+    assert await _sweep(realdb, adapter) == 0
+    (applied,) = adapter.post_discount_credit.await_args.args
+    assert applied.credit_id == "VC-9"
+    assert await _record(realdb, inv_id, pay_id) is None
+
+
+async def test_the_void_does_not_report_success_over_an_unidentified_credit(realdb):
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied(None))
+    await _sync(realdb, run_id, adapter)
+    async with realdb.sessionmaker("a")() as s:
+        (await s.get(Payment, pay_id)).status = "voided"
+        await s.commit()
+    adapter.find_discount_credit.return_value = None
+    adapter.void_discount_credit.return_value = ErpPostResult(
+        success=True, message="No discount credit of ours"
+    )
+    org_id = realdb.info("a").org_id
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        outcome = await erp_payment_writeback.void_written_payment(org_id, pay_id)
+    assert outcome == erp_payment_writeback.FAILED
+    # Our payment is voided; the credit we cannot name stays recorded, flagged.
+    adapter.void_payment.assert_awaited_once()
+    assert (await _record(realdb, inv_id, pay_id))["credit_id"] is None
+    flags = await _rows(realdb, APException, invoice_id=inv_id)
+    assert erp_payment_writeback.ERP_REPORT_DISCOUNT_CREDIT_STALLED in _kinds(flags)
+
+
+async def test_a_void_committed_during_the_sweeps_call_re_arms_the_void_with_the_credit(realdb):
+    """Sweep reads the payment `completed`, calls the ERP; a void commits (and
+    its reversal runs) meanwhile; the ERP applies the credit. The outcome,
+    written under the instance lock, re-reads the payment and hands the credit
+    to the void instead of leaving it applied to a voided payment's bill."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)
+
+    async def void_lands_meanwhile(payload):
+        async with realdb.sessionmaker("a")() as s:
+            payment = await s.get(Payment, pay_id)
+            invoice = await s.get(Invoice, inv_id)
+            payment.status = "voided"
+            assert await erp_payment_writeback.record_pending_erp_void(
+                s, invoice=invoice, payment=payment
+            )
+            await s.commit()
+        return ErpPostResult(success=True, erp_document_id="VC-7", bill_balance_after=Decimal(0))
+
+    adapter.post_discount_credit.side_effect = void_lands_meanwhile
+    await _sweep(realdb, adapter)
+    [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
+    state = instance.state_data
+    assert erp_payment_writeback.PENDING_CREDITS_KEY not in state
+    assert state[erp_payment_writeback.PENDING_VOID_CREDITS_KEY] == {str(pay_id): "VC-7"}
+    assert str(pay_id) in state[erp_payment_writeback.PENDING_VOIDS_KEY]
+
+    adapter.find_discount_credit.return_value = None
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        outcome = await erp_payment_writeback.void_written_payment(realdb.info("a").org_id, pay_id)
+    assert outcome == erp_payment_writeback.WROTE
+    (reversed_,) = adapter.void_discount_credit.await_args.args
+    assert reversed_.credit_id == "VC-7"
+
+
+async def test_a_void_finishing_meanwhile_leaves_a_re_armed_credit_pending(realdb):
+    """The void's own clear is compare-then-clear: a credit re-armed while it
+    was calling the ERP is not wiped with the credit it handled."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit()
+    await _sync(realdb, run_id, adapter)
+    async with realdb.sessionmaker("a")() as s:
+        payment = await s.get(Payment, pay_id)
+        payment.status = "voided"
+        await erp_payment_writeback.record_pending_erp_void(
+            s, invoice=await s.get(Invoice, inv_id), payment=payment
+        )
+        await s.commit()
+    adapter.find_discount_credit.return_value = None
+
+    async def credit_re_armed_meanwhile(payload):
+        async with realdb.sessionmaker("a")() as s:
+            await erp_payment_writeback._set_map_entry(
+                s, inv_id, erp_payment_writeback.PENDING_VOID_CREDITS_KEY, pay_id, "VC-8"
+            )
+            await s.commit()
+        return ErpPostResult(success=True, erp_document_id="BP-9")
+
+    adapter.void_payment.side_effect = credit_re_armed_meanwhile
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        await erp_payment_writeback.void_written_payment(realdb.info("a").org_id, pay_id)
+    [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
+    assert instance.state_data[erp_payment_writeback.PENDING_VOID_CREDITS_KEY] == {
+        str(pay_id): "VC-8"
+    }
+    assert str(pay_id) in instance.state_data[erp_payment_writeback.PENDING_VOIDS_KEY]
+
+
+async def test_a_record_claimed_by_one_pass_is_not_processed_by_another(realdb):
+    """The tick and `sync_org_now` at once: the second finds the first's claim
+    and leaves the record alone, so one credit sees one ERP attempt."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)
+    adapter.post_discount_credit.reset_mock()
+    inner: list[int] = []
+
+    async def second_pass_meanwhile(payload):
+        inner.append(await erp_payment_writeback.resume_pending_credits(await _org(realdb)))
+        return ErpPostResult(success=True, erp_document_id="VC-7", bill_balance_after=Decimal(0))
+
+    adapter.post_discount_credit.side_effect = second_pass_meanwhile
+    assert await _sweep(realdb, adapter) == 0
+    assert adapter.post_discount_credit.await_count == 1
+    assert inner == [1]  # it saw the record, claimed by the first, and skipped it
+    assert await _record(realdb, inv_id, pay_id) is None
+
+
+async def test_a_repeated_failure_is_audited_once_and_stops_at_the_cap(realdb, monkeypatch):
+    monkeypatch.setattr(erp_payment_writeback, "MAX_CREDIT_ATTEMPTS", 3)
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)  # attempt 1
+    adapter.post_discount_credit.reset_mock()
+    await _sweep(realdb, adapter)  # attempt 2: same outcome
+    rows = await _rows(realdb, AuditLog, entity_id=pay_id)
+    assert len(_actions(rows, "payment.erp_discount_credit_failed")) == 1
+    record = await _record(realdb, inv_id, pay_id)
+    assert record["attempts"] == 2 and record["last_attempt"]
+
+    await _sweep(realdb, adapter)  # attempt 3: the cap
+    record = await _record(realdb, inv_id, pay_id)
+    assert record["exhausted"] is True and record["credit_id"] == "VC-7"
+    rows = await _rows(realdb, AuditLog, entity_id=pay_id)
+    failed = _actions(rows, "payment.erp_discount_credit_failed")
+    assert len(failed) == 2 and any(r.details.get("retries_exhausted") for r in failed)
+    [stalled] = [
+        r
+        for r in await _rows(realdb, APException, invoice_id=inv_id)
+        if r.erp_report["kind"] == erp_payment_writeback.ERP_REPORT_DISCOUNT_CREDIT_STALLED
+    ]
+    assert stalled.erp_report["reason"] == "retries_exhausted"
+    assert stalled.erp_report["discount_credit_document_id"] == "VC-7"
+
+    await _sweep(realdb, adapter)  # past the cap: nothing calls the ERP
+    assert adapter.post_discount_credit.await_count == 2
+    rows = await _rows(realdb, AuditLog, entity_id=pay_id)
+    assert len(_actions(rows, "payment.erp_discount_credit_failed")) == 2
+    # The void still reverses it by the recorded id.
+    assert (await _record(realdb, inv_id, pay_id))["credit_id"] == "VC-7"
+
+
 @pytest.mark.parametrize(
     ("erp", "refused"),
     [

@@ -470,6 +470,14 @@ payment sync posts no amount today (`payment_erp_sync` logs and transitions); a
 real `post_payment` must send `discount_amount` beside `amount` so the ERP
 records the bill as settled with a discount taken rather than short-paid.
 
+With the org's opt-in (`settings.erp.book_discount_as_credit`, decisions §575)
+the payment write-back books `discount_amount` as a vendor credit applied to
+the bill. A credit that may stand unapplied is recorded on the workflow
+instance and finished by its recorded id, never booked twice; one whose id is
+unknown is held and flagged for a person, and a void that runs while a credit
+attempt is in flight gets that credit reversed (decisions §577, §579;
+[erp-integration.md](erp-integration.md)).
+
 **Cards.** A card is spendable up to its limit and nothing on the card webhook
 compares a charge with `Payment.amount`, so the `virtual_card` leg will not
 converge a payment onto an existing card whose limit differs from what the

@@ -311,7 +311,10 @@ unnamed (no `{erp}` twin; the adapter is in `erp_report`), with
 (`services/erp_payment_writeback`) and `services/payment_erp_sync`'s failed leg
 use the same family: `erp_payment_writeback_failed`,
 `erp_payment_writeback_balance_open` (`amount` money + `currency`),
-`erp_payment_void_writeback_failed`, and `erp_sync_back_failed` (no ERP name —
+`erp_payment_void_writeback_failed`, `erp_discount_credit_stalled` (a discount
+credit FeohLedger cannot finish alone, decisions §579; `erp_report.kind`
+`discount_credit_stalled` with `reason` and `discount_credit_marker`), and
+`erp_sync_back_failed` (no ERP name —
 the leg that failed need not be the ERP's, and the tenant may have none). Their
 `erp_report.kind` is `payment_writeback_failed` /
 `payment_writeback_balance_open` / `payment_void_writeback_failed` /
