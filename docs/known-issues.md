@@ -5,11 +5,13 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Seven entries are open**: the run builder reading
+**Eight entries are open**: the run builder reading
 a missing invoice currency as USD (found 2026-10-21), the app rendering nothing when browser
 storage is blocked (found 2026-10-20),
 the expense-report Attach dead end found while
 writing the help centre, the `all`-mode approval-chain segregation deadlock,
+an out-of-office delegation that cannot stand in on an `all`-mode level (found
+2026-11-24),
 the legal-contents smooth-scroll race and the e2e cleanup race directly below,
 and the `payments/` local-e2e flake near the bottom. The `/complete` amount
 floor approving an invoice whose PO was never matched, found and struck on
@@ -504,6 +506,33 @@ require an escalation target in their place (raise an exception row so a human
 picks one). Silently dropping them from the `all` requirement is the one option
 to rule out — it weakens a two-signature control to one. Trigger: the next
 change to approval-chain configuration or the workflow builder's chain step.
+
+## An out-of-office delegation cannot stand in on an `all`-mode chain level
+
+**Root cause.** A delegate's approval is recorded under the delegate's own id
+(`advance_approval_chain(instance, actor_id)` appends `{"user_id": actor}`),
+and a `parallel_mode: "all"` level is satisfied only when every id in its
+`approver_ids` has itself approved (`approval_chain._level_satisfied`).
+`check_level_approver` lets the active delegate of a named approver act on the
+level (decisions §511), but their signature never fills the delegator's slot.
+On an `any` level that is harmless — a distinct approver count is all it
+needs — but on an `all` level the delegation does nothing: the level still
+waits for the delegator, who is the person away.
+
+**Evidence.** Found by the round-41 money-path review of Profile → Out of office
+(2026-11-24, decisions §511). Pre-existing: the slot rule and the delegate
+expansion both predate the panel.
+
+**Blast radius.** Liveness, not a bypass — fails closed. An invoice on an `all`
+level waits until the delegator returns, an escalation substitutes them out, or
+an admin reworks it, while the delegator believes their approvals are covered.
+
+**Recommended fix.** An operator decision, tracked in `docs/followups.md`
+("A delegate's approval does not fill an `all`-mode slot"): either count a
+delegate's approval toward the delegator's slot, writing both ids on the
+approval record and the audit row, or document that an `all` level means those
+exact people and have the panel say so. Trigger: that decision, or the first
+customer with an `all`-mode level who sets a delegation.
 
 ## A contents-list jump on a legal page can be dropped while the focus scroll is still animating
 

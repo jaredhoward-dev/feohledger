@@ -26114,24 +26114,73 @@ invoice to the delegate unconditionally, so naming an ap_clerk (no
 act on it: the dead end `GET /api/invoices/assignable-reviewers` already
 refuses to offer. Its refusals were bare English strings.
 
-**Decision.** The screen is **Profile → Out of office**, shown to every signed-in
-employee because the endpoint accepts every one, not an `/organization` panel.
+**Decision.** The screen is **Profile → Out of office**, a personal setting, not
+an `/organization` panel, shown to employees who hold `invoice.approve` (below).
 `POST` now refuses a delegate without `invoice.approve` (`422`
 `delegation_delegate_cannot_approve`), and a new
-`GET /api/auth/delegation/candidates` lists exactly who it accepts; both read
-one predicate, `api/auth._can_approve`, through `effective_permissions`, so a
-custom role granted the permission qualifies. Every refusal is coded
+`GET /api/auth/delegation/candidates` lists exactly who it accepts. Every refusal is coded
 (`delegation_*`) and stated by `authRefusals.ts`. The model has an end and no
 start, so the panel offers no start date rather than invent one the server
 would ignore: it asks for the last day away and sends the start of the next day
 in the reader's time zone as `until`. Set and clear were already audited
 (`auth.delegation.set` / `.cleared`), so no new audit row was needed.
 
+**One eligibility predicate, re-read every time a delegation is followed.**
+`services/delegation.is_eligible_delegate` — exists, not the delegator, same
+organization, active, and holds `invoice.approve` through
+`effective_permissions` (so a custom role granted it qualifies) — is read by the
+write, the candidate list, `approval_chain.resolve_assignee` (routing) and
+`approval_chain._resolve_authorized_approvers` (a named approver's delegate
+clearing their level). A delegation is saved once and followed for days, and in
+between the delegate can be deactivated, lose `invoice.approve` (a role edit, a
+SCIM push), or — a row saved before this round — never have held it. Routing
+used to follow any stored delegation whose window was open, so each of those
+stranded the invoice. Now a delegate who fails the predicate is not followed:
+the original reviewer keeps the assignment (`(user_id, None)`), and the
+`invoice.assigned_for_review` row carries no `delegated_from`.
+
+**Per invoice, the approval path's own gates.** A delegate who passes the
+predicate can still be unable to clear one particular invoice: they uploaded or
+keyed it, recorded its goods receipt or inspection (`implicated_actors`,
+`receipt_recorders`, `inspection_recorders`, §141, §152, §267, §389, §401), the
+amount is over their limit or the CFO gate, or the step names other approvers.
+`review.assign_reviewer` asks `review.delegate_refusal`, which runs
+`review_refusals` — the verdict the invoice modal reads, built from the
+endpoint's gates in the endpoint's order — for the delegate, and keeps the
+original reviewer when it refuses. Nothing is restated, so a new gate reaches
+routing without a second edit.
+
+**Every assignment path follows it.** `POST /api/invoices/{id}/assign` called
+`assign_reviewer` without `control_db`, which skipped the delegation branch
+altogether, while the docs and this panel said new assignments go to the
+delegate. It now passes `control_db` and the tenant's settings (the money gates
+read them), as `POST /api/adaptive/routing-suggestion/apply` already did.
+
+**Only approvers may delegate.** The candidate list and the write are gated on
+`invoice.approve` (`require_permission`, `403` otherwise). The list is a roster
+of every approver in the organization, which a clerk or read-only role has no
+reason to read, and a non-approver has no approvals to hand on. Reading and
+clearing one's own delegation stay open to every signed-in user, so someone who
+has since lost the permission can still see and end a stale one; routing
+ignores it anyway, because nothing is routed to a non-approver.
+
+**Not fixed here: `parallel_mode: "all"` levels.** A delegate's approval is
+recorded under the delegate's id, and an `all` level is satisfied only when
+every listed approver's own id has approved, so a delegation cannot stand in
+for an `all`-level approver. Whether it should is an operator decision
+(`docs/known-issues.md`, `docs/followups.md`).
+
 **Rejected.** A start date (a scheduled delegation) would need a column and a
 migration for a feature nobody has asked for; the panel says the delegation
-starts when saved. Restricting who may *delegate* to approvers would restate a
-rule the endpoint does not hold; a non-approver's delegation is harmless, since
-nothing routes to them.
+starts when saved. *Leaving the delegation open to every employee*, on the
+reasoning that a non-approver's delegation is harmless: the delegation itself
+is, but the candidate list it needs discloses the whole approver roster.
+*Refusing the assignment when the delegate is ineligible*: the person doing the
+assigning did nothing wrong and the original reviewer can still act, so routing
+falls back rather than erroring. *Restating the segregation sets in routing*
+(as `approval_chain.escalation_ineligible` does for the escalation sweep): it
+covers segregation only, not the money gates or named approvers, and a second
+statement is the one that drifts.
 
 ## 512. PO match rules get one audited writer and an organization panel, not a vendor-page field (round 41)
 
