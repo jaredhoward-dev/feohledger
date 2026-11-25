@@ -4714,6 +4714,9 @@ class AppLocalizationsJa extends AppLocalizations {
   String get notificationEventChatMessage => '新しいメッセージ';
 
   @override
+  String get notificationEventErpBillFlagged => 'ERP登録済みの請求書へのフラグ';
+
+  @override
   String get notificationEventOther => '通知';
 
   @override

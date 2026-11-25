@@ -4951,6 +4951,9 @@ class AppLocalizationsPt extends AppLocalizations {
   String get notificationEventChatMessage => 'Nova mensagem';
 
   @override
+  String get notificationEventErpBillFlagged => 'Alerta em uma conta já lançada no ERP';
+
+  @override
   String get notificationEventOther => 'Notificação';
 
   @override
@@ -10056,6 +10059,9 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
 
   @override
   String get notificationEventChatMessage => 'Nova mensagem';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Alerta em uma conta já lançada no ERP';
 
   @override
   String get notificationEventOther => 'Notificação';

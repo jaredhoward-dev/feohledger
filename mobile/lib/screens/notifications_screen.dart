@@ -4,6 +4,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/l10n/load_error_messages.dart';
 import 'package:feohledger_mobile/models/notification.dart';
+import 'package:feohledger_mobile/screens/exception_detail_screen.dart';
 import 'package:feohledger_mobile/screens/invoice_detail_screen.dart';
 import 'package:feohledger_mobile/stores/notification_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
@@ -48,6 +49,12 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => InvoiceDetailScreen(invoiceId: n.entityId!),
+        ),
+      );
+    } else if (n.linksToException) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => ExceptionDetailScreen(exceptionId: n.entityId!),
         ),
       );
     }

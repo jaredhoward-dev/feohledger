@@ -1133,6 +1133,7 @@
   "notificationEventInvoicePaid": "Factura pagada",
   "notificationEventContractRenewalDue": "Renovación de contrato pendiente",
   "notificationEventChatMessage": "Mensaje nuevo",
+  "notificationEventErpBillFlagged": "Alerta sobre una factura ya registrada en el ERP",
   "notificationEventOther": "Notificación",
   "notificationUnread": "No leída",
   "relativeTimeJustNow": "justo ahora",

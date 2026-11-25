@@ -1327,6 +1327,7 @@
   "notificationEventInvoicePaid": "請求書が支払われました",
   "notificationEventContractRenewalDue": "契約更新期限",
   "notificationEventChatMessage": "新しいメッセージ",
+  "notificationEventErpBillFlagged": "ERP登録済みの請求書へのフラグ",
   "notificationEventOther": "通知",
   "notificationUnread": "未読",
   "relativeTimeJustNow": "たった今",

@@ -7118,6 +7118,12 @@ abstract class AppLocalizations {
   /// **'New message'**
   String get notificationEventChatMessage;
 
+  /// A duplicate or fraud flag raised on an invoice whose bill is already in the ERP (event erp_bill_flagged).
+  ///
+  /// In en, this message translates to:
+  /// **'Flag on a bill already in the ERP'**
+  String get notificationEventErpBillFlagged;
+
   /// An event type this app version does not know.
   ///
   /// In en, this message translates to:
