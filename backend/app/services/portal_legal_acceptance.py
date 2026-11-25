@@ -32,7 +32,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.refusals import coded_refusal
 from app.models.vendor_user_legal_acceptance import VendorUserLegalAcceptance
-from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS, SOURCE_SET_PASSWORD
+from app.services.legal_acceptance import (
+    CURRENT_LEGAL_VERSIONS,
+    SOURCE_SET_PASSWORD,
+)
+from app.services.legal_acceptance import (
+    SOURCE_REPROMPT as SOURCE_REPROMPT,  # the portal re-prompt's source (§500)
+)
 
 #: The documents a supplier-portal user is shown, in order (§499).
 PORTAL_LEGAL_DOCUMENTS: tuple[str, ...] = ("privacy",)
