@@ -1340,13 +1340,31 @@ user-visible halves still open.
       `sent_to_erp` / `posted_in_erp` / `payment_scheduled` from the tenant's
       ERP and applies a changed status through the webhook's own transition,
       so a dropped delivery is recovered on the next tick (a void reported for
-      a `done` invoice still arrives only by webhook). What remains is Merge.
-      **Durable fix:** a Merge bill read-back sweep over pushed bills — rather
-      than any response that differs before verification. **Trigger:** the
-      first `ERP webhook dropped: the ERP credentials of tenant … could not be
-      opened` error or a frequent `unverified-delivery budget spent` warning in
-      production for a Merge tenant, or a KMS throttling alarm on the
-      credential key.
+      a `done` invoice still arrives only by webhook). For Merge, the
+      `merge-readback` sweep has landed (decisions §540, `backend/docs/
+      erp-integration.md` § Merge.dev: idempotency, refusals, region and
+      webhook): with `FEOH_MERGE_READBACK_SWEEP_ENABLED` on, it lists each Merge
+      tenant's bills changed since a cursor (`settings.erp_merge_readback`),
+      reads back the ones we pushed and applies each through the webhook's own
+      `apply_bill_report`, so a missed `VOID` or `remote_was_deleted` bill is
+      flagged on the next tick. **What remains:** (1) a bill Merge answers 404
+      for is not read as gone by the sweep (only an `Invoice.removed` delivery
+      says that), so if Merge's detail read 404s a record deleted in the ERP
+      rather than returning it with `remote_was_deleted`, that deletion is
+      still caught only by the webhook — unverified against a real Merge
+      sandbox; (2) a change feed longer than `SYNC_LISTING_MAX_ROWS` since the
+      cursor fails the tenant's listing every tick (no full read-back fallback
+      as QuickBooks has, since a Merge push closes at `done` and every pushed
+      bill would be read), showing as a partial `merge-readback` run in sweep
+      health; (3) a distributed caller cycling tenants is still bounded only by
+      KMS's quota (§525). **Durable fix:** for (1), pass
+      `include_deleted_data=true` on `bill_report`'s detail read if Merge's
+      detail endpoint honours it, else carry the listing's
+      `remote_was_deleted` into the sweep; for (2), let the sweep page the feed
+      by `modified_after` windows and advance per window. **Trigger:** (1) the
+      first Merge sandbox run of the sweep against a bill deleted in the ERP;
+      (2) a `merge-readback` partial run with `ErpListingIncomplete` in
+      production; (3) a KMS throttling alarm on the credential key.
 
 ### Surfaced by round 44 (2026-11-25, round PR #771, decisions §527–§535)
 
