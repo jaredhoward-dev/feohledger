@@ -933,19 +933,6 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       non-clerk preparer role, add a non-sensitive permission tier the
       role-grant guards exempt, and move entry onto it. **Trigger:** the first
       customer asking for a custom preparer role.
-- [ ] **(c) The PO-match receipt leg values receipts pro rata.** The
-      "billed beyond received" check values receipts as `po_total × received /
-      ordered`, so receiving nine cheap cables of a 900 server order reads as
-      most of the value received (decisions §249). The leg is now cumulative:
-      invoices that together bill past that received value raise
-      `po_billed_beyond_receipt`, a review warning that stops every unattended
-      approval and, newly past approval, a payment-blocking `po_mismatch`
-      (§470), as `po_billed_beyond_total` warns for the PO
-      total (§469). Both inherit the pro-rata figure. **Durable fix:** value
-      receipts per PO line (cheapest-first as a lower bound) in the matcher's
-      `received_value`, which both the per-invoice hold and the cumulative
-      warning read. **Trigger:** the next PO-matching change, or the first
-      customer whose POs mix lines of very different unit prices.
 - [ ] **(c) Nothing links a credit memo to a discount offer.** An applied memo
       equal to an accepted offer's savings is read as the discount already
       taken (decisions §250), so a return credit that happens to equal the
