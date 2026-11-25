@@ -331,6 +331,14 @@ describe('supplier portal help — the same checks, inside the portal', () => {
 		}
 	});
 
+	it('every portal page a supplier works on has a guide that opens it', () => {
+		// The notification settings are two checkboxes, covered by a tip in
+		// "Track an invoice to payment" rather than a guide of their own.
+		const covered = new Set(PORTAL_GUIDES.map((g) => g.route));
+		const without = Object.keys(PORTAL_PAGES).filter((r) => r !== '/portal/notifications' && !covered.has(r));
+		expect(without, 'portal pages no supplier guide opens').toEqual([]);
+	});
+
 	it('the glossary is help-centre terms (translated: the glossary checks above), each used by a guide', () => {
 		expect(new Set(PORTAL_GLOSSARY).size).toBe(PORTAL_GLOSSARY.length);
 		for (const id of PORTAL_GLOSSARY) {

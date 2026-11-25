@@ -913,16 +913,15 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       **Durable fix:** a panel each in `/organization`, each with its own help
       guide step. **Trigger:** the first customer asking to change
       one, or SCIM onboarding for an enterprise tenant.
-- [ ] **(c) Supplier help beyond the first five guides.** The supplier portal
-      has its own help at `/portal/help` (decisions §508): getting started,
-      submit and resubmit, track to payment, bank details, card payments.
-      Not yet covered: purchase-order flip, early-payment offers, W-9 / W-8
-      upload, supplier chat on an invoice, and a search box. **Durable fix:**
-      a guide each in `frontend/src/lib/help/portal.ts` (the tests already
-      hold every new one to the portal), and `searchHelp` over
-      `PORTAL_GUIDES` once there are too many for one page. **Trigger:** the
-      first supplier onboarding at volume, or a support question one of
-      those guides would have answered.
+- [ ] **(c) A search box on the supplier help.** `/portal/help` has nine
+      guides (decisions §508; round 41 added PO flip, early-payment offers,
+      W-9 / W-8 and invoice conversations) on one page with no search.
+      `searchHelp` lives in `content.ts`, which the portal may not import
+      (it pulls in every employee guide). **Durable fix:** move the scorer
+      into a light module that takes the guide and term lists, call it with
+      `PORTAL_GUIDES` / `PORTAL_GLOSSARY`, and add a search field to
+      `routes/portal/help/+page.svelte`. **Trigger:** the guide list no longer
+      fits one screen, or a support question a guide already answers.
 - [ ] **(c) A custom role can't be granted invoice entry.** Entry is a role
       list by design (decisions §248). **Durable fix:** if a customer needs a
       non-clerk preparer role, add a non-sensitive permission tier the

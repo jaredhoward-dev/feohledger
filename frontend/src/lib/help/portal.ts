@@ -12,7 +12,9 @@
 // another UI locale, behind EnglishNotice); every control is named by
 // `{ui:key}`, so it reads in the supplier's language and a rename fails
 // content.test.ts. Every step here was checked against the portal routes
-// (routes/portal/) and backend/docs/supplier-portal.md — change them together.
+// (routes/portal/), the portal API (backend/app/api/portal.py) and
+// backend/docs/supplier-portal.md, dynamic-discounting.md and supplier-chat.md
+// — change them together.
 
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import type { Guide } from './types.ts';
@@ -138,7 +140,7 @@ export const PORTAL_GUIDES: Guide[] = [
 			}
 		],
 		terms: ['supplier-portal', 'mfa'],
-		related: ['portal-submit-invoice', 'portal-track-payment']
+		related: ['portal-submit-invoice', 'portal-track-payment', 'portal-chat']
 	},
 	{
 		id: 'portal-submit-invoice',
@@ -162,7 +164,7 @@ export const PORTAL_GUIDES: Guide[] = [
 					{
 						type: 'note',
 						tone: 'tip',
-						text: 'One invoice per file. If your customer sent you a purchase order, you can also create the invoice from that order’s row on [[page:/portal/purchase-orders|the purchase orders page]].'
+						text: 'One invoice per file. If your customer sent you a purchase order, you can also create the invoice from the order itself: see [[guide:portal-po-invoice|Create an invoice from a purchase order]].'
 					}
 				]
 			},
@@ -285,7 +287,7 @@ export const PORTAL_GUIDES: Guide[] = [
 			}
 		],
 		terms: ['bank-change-request'],
-		related: ['portal-track-payment', 'portal-getting-started']
+		related: ['portal-tax-form', 'portal-track-payment', 'portal-getting-started']
 	},
 	{
 		id: 'portal-card-payments',
@@ -327,6 +329,197 @@ export const PORTAL_GUIDES: Guide[] = [
 		],
 		terms: ['virtual-card'],
 		related: ['portal-track-payment']
+	},
+	{
+		id: 'portal-po-invoice',
+		audience: 'supplier',
+		kind: 'howto',
+		title: 'Create an invoice from a purchase order',
+		summary:
+			'Turn one of your customer’s purchase orders into an invoice in one step, and know when to submit your own invoice instead.',
+		route: '/portal/purchase-orders',
+		sections: [
+			{
+				heading: 'Create the invoice',
+				blocks: [
+					{
+						type: 'p',
+						text: '[[page:/portal/purchase-orders|The purchase orders page]] lists the orders your customer has issued to you, with each one’s lines, total and status.'
+					},
+					{
+						type: 'steps',
+						items: [
+							'Find the order and select {ui:portal.po.createInvoice} on its row.',
+							'The invoice is made from the whole order: every line, at the order’s quantities and prices, for its full total and in its currency.',
+							'You land on [[page:/portal/invoices|your invoices]], where the new invoice goes to your customer’s AP team for review like any other.'
+						]
+					},
+					{
+						type: 'note',
+						tone: 'tip',
+						text: 'Selecting it twice never makes two invoices. Once it is created, the order shows {ui:portal.po.refusal.alreadyInvoiced}.'
+					}
+				]
+			},
+			{
+				heading: 'When you cannot create one',
+				blocks: [
+					{
+						type: 'list',
+						items: [
+							'{ui:portal.po.refusal.alreadyInvoiced} — you have already billed this order, from here or with an invoice of your own. Submit an invoice for anything still owed instead.',
+							'{ui:portal.po.refusal.notInvoiceable} — the order was closed or cancelled, so there is nothing left to bill on it.',
+							'{ui:portal.po.totalUnverifiable} — your customer is re-checking the order’s total, so the button is unavailable. Submit your own invoice for it instead.'
+						]
+					},
+					{
+						type: 'note',
+						tone: 'caution',
+						text: 'Billing only part of an order, say for a partial delivery? Submit your own invoice for what you delivered, with the order number on it, rather than creating one from the order: that always bills the whole order.'
+					}
+				]
+			}
+		],
+		terms: ['invoice'],
+		related: ['portal-submit-invoice', 'portal-track-payment']
+	},
+	{
+		id: 'portal-early-payment',
+		audience: 'supplier',
+		kind: 'howto',
+		title: 'Accept an early-payment offer',
+		summary:
+			'Your customer may offer to pay you sooner in return for a small discount. Compare the tiers, then accept or decline.',
+		route: '/portal/discount-offers',
+		sections: [
+			{
+				heading: 'Reading an offer',
+				blocks: [
+					{
+						type: 'p',
+						text: 'Offers your customer makes you ([[dynamic-discounting]]) appear on [[page:/portal/discount-offers|the early-payment page]]. Each one covers either a single invoice or {ui:portal.discounts.scopeAll}.'
+					},
+					{
+						type: 'list',
+						items: [
+							'{ui:portal.discounts.col.tiers} — each tier is a deadline and a discount: be paid within that many days of the start of the offer for that percentage off.',
+							'{ui:portal.discounts.col.bestDiscount} and {ui:portal.discounts.col.youSave} — the best tier you can still get today, and how much it takes off.',
+							'{ui:portal.discounts.col.window} — the dates the offer is open. After the last one it shows {ui:discounts.status.expired} and can no longer be accepted.'
+						]
+					}
+				]
+			},
+			{
+				heading: 'Accept or decline',
+				blocks: [
+					{
+						type: 'steps',
+						items: [
+							'On an {ui:discounts.status.offered} offer, select {ui:portal.discounts.accept}.',
+							'If it has more than one tier, pick one under {ui:portal.discounts.dialog.chooseTier}. The best tier still open is chosen for you, and the dialog shows what you would save.',
+							'Select {ui:portal.discounts.dialog.accept}. The offer now shows {ui:discounts.status.accepted}.'
+						]
+					},
+					{
+						type: 'p',
+						text: 'Accepting moves no money by itself. Your customer still schedules the payment; if it is paid by the tier’s deadline, the discount is taken off it and the offer shows {ui:discounts.status.captured}. If the deadline is missed, you are paid the full amount.'
+					},
+					{
+						type: 'note',
+						tone: 'caution',
+						text: 'To turn an offer down, select {ui:portal.discounts.decline}, then {ui:portal.discounts.declineConfirm}. You cannot undo a decline or an accept from the portal, and an invoice that is already paid cannot take a discount.'
+					}
+				]
+			}
+		],
+		terms: ['dynamic-discounting'],
+		related: ['portal-track-payment']
+	},
+	{
+		id: 'portal-tax-form',
+		audience: 'supplier',
+		kind: 'howto',
+		title: 'Upload your W-9 or W-8',
+		summary: 'Give your customer the signed tax form they need for their US tax reporting, and replace it when it changes.',
+		route: '/portal/company',
+		sections: [
+			{
+				heading: 'Upload the form',
+				blocks: [
+					{
+						type: 'p',
+						text: 'US suppliers give their customer a signed W-9, and suppliers outside the US a W-8, so the customer can meet its 1099 and withholding obligations.'
+					},
+					{
+						type: 'steps',
+						items: [
+							'Open [[page:/portal/company|your company page]] and find {ui:portal.company.taxForm.title}.',
+							'Under {ui:portal.company.taxForm.formType}, choose {ui:portal.company.taxForm.optionW9} or {ui:portal.company.taxForm.optionW8}.',
+							'Under {ui:portal.company.taxForm.signedForm}, choose the file: a PDF, PNG, JPEG or TIFF of up to 25 MB.',
+							'Select {ui:portal.company.taxForm.upload}. The section then shows which form is on file and the date we received it.'
+						]
+					}
+				]
+			},
+			{
+				heading: 'Replacing it',
+				blocks: [
+					{
+						type: 'p',
+						text: 'Once a form is on file, select {ui:portal.company.taxForm.download} to check what your customer has, or upload a new one the same way and select {ui:portal.company.taxForm.replace}. The new form takes the old one’s place straight away.'
+					},
+					{
+						type: 'note',
+						tone: 'tip',
+						text: 'The form is a document, so it does not wait for approval. A change to the tax ID your customer holds for you does: request it under {ui:portal.company.tax.title}, as described in [[guide:portal-bank-details|Change your bank details]].'
+					}
+				]
+			}
+		],
+		related: ['portal-bank-details']
+	},
+	{
+		id: 'portal-chat',
+		audience: 'supplier',
+		kind: 'howto',
+		title: 'Message your customer about an invoice',
+		summary:
+			'Each invoice has its own conversation with your customer’s AP team. Ask a question, answer one, or send a file.',
+		route: '/portal/invoices',
+		sections: [
+			{
+				heading: 'Open an invoice’s conversation',
+				blocks: [
+					{
+						type: 'steps',
+						items: [
+							'Open [[page:/portal/invoices|your invoices]] and select the invoice number on its row. The conversation opens under the row; select the number again to close it.',
+							'Type your message, or select {ui:supplierChat.attach} to add a file: a PDF, PNG, JPEG, TIFF or XML of up to 25 MB.',
+							'Select {ui:supplierChat.send}.'
+						]
+					},
+					{
+						type: 'p',
+						text: 'Your customer’s AP managers are told when you write. Messages cannot be edited or deleted once sent, and both sides see the same conversation.'
+					}
+				]
+			},
+			{
+				heading: 'Replies',
+				blocks: [
+					{
+						type: 'p',
+						text: 'When someone on the AP team writes, we may email the address in your company details to say there is a new message on the invoice. The email does not contain the message itself: select its link to open that invoice’s conversation. If you are not signed in, the portal asks you to sign in first and then takes you there.'
+					},
+					{
+						type: 'note',
+						tone: 'tip',
+						text: 'The AP team can mark a conversation {ui:supplierChat.status.resolved} once a question is settled. You can still write in it. If your customer has turned conversations off, sending fails and says so.'
+					}
+				]
+			}
+		],
+		related: ['portal-submit-invoice', 'portal-track-payment']
 	}
 ];
 

@@ -60,6 +60,23 @@ test.describe('supplier portal help', () => {
 		await expect(page).toHaveURL(/\/portal\/company$/);
 	});
 
+	test('the purchase-order guide names the row button and opens the orders page', async ({ page }) => {
+		await portalSignIn(page);
+		await page.goto('/portal/help');
+
+		await page.getByRole('link', { name: 'Create an invoice from a purchase order' }).click();
+		await expect(page).toHaveURL(/\/portal\/help\/portal-po-invoice$/);
+		const guide = page.getByTestId('portal-help-guide');
+		await expect(
+			guide.getByRole('heading', { level: 1, name: 'Create an invoice from a purchase order' })
+		).toBeVisible();
+		// `{ui:portal.po.createInvoice}` renders the row button's own label.
+		await expect(guide.locator('strong.ui-label', { hasText: 'Create invoice' }).first()).toBeVisible();
+
+		await page.getByTestId('portal-help-open-page').click();
+		await expect(page).toHaveURL(/\/portal\/purchase-orders$/);
+	});
+
 	test('an unknown guide id says so, with a way back', async ({ page }) => {
 		await portalSignIn(page);
 		await page.goto('/portal/help/no-such-guide');

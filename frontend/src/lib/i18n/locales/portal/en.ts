@@ -120,6 +120,7 @@ export const enPortal = {
 	'portal.invoices.fileDownloadFailed': 'Download failed',
 	'portal.invoices.tableAria': 'Your invoices',
 	'portal.invoices.chatLoadFailed': 'The conversation could not be loaded.',
+	'portal.invoices.chatNotFound': 'We couldn’t find that invoice in your account.',
 
 	// Portal payments (routes/portal/payments/+page.svelte)
 	'portal.payments.title': 'Payments',

@@ -283,8 +283,19 @@ When an AP user posts, `notify_supplier_of_ap_message` sends a direct,
 best-effort email to `vendor.email`, modeled on
 `card_issuance._send_vendor_card_email`:
 
-- The link is built from `settings.tenant_url_template` (`{slug}` → org slug):
-  `{base}/portal/invoices/{invoice.id}/chat`.
+- The link is built from `settings.tenant_url_template` (`{slug}` → org slug)
+  plus `supplier_chat.portal_chat_path`: `{base}/portal/invoices?chat={invoice.id}`.
+  The conversation is an inline panel on the portal invoice list, which reads
+  `?chat=` on mount and on same-route navigation and opens that invoice's
+  thread (fetching the row via `GET /api/portal/invoices/{id}` when it is not
+  on the loaded page; an id the supplier does not own reads as not found).
+  Signed out, the portal layout's auth wall sends the supplier to
+  `/portal/login?next=…` and the sign-in returns them there
+  (`safePortalNextPath`: portal pages only). The link used to be
+  `/portal/invoices/{id}/chat`, which no portal route renders, so every one
+  404ed; `tests/test_supplier_chat_portal_link.py` pins the path to a real
+  SvelteKit page and the parameter to the one it reads, and
+  `tests-e2e/portal/supplier-chat.spec.ts` follows the link through sign-in.
 - Sent via `get_email_adapter().send(EmailMessage(...))` (`console` default
   locally — no network).
 - Skipped silently when `vendor.email` is absent or there's no tenant URL
