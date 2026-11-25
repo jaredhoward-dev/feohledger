@@ -50,6 +50,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import CustomDomainsPanel from '#lib/components/organization/CustomDomainsPanel.svelte';
 	import ResidencyPanel from '#lib/components/organization/ResidencyPanel.svelte';
 	import SsoPanel from '#lib/components/organization/SsoPanel.svelte';
 	import PaymentsPanel from '#lib/components/organization/PaymentsPanel.svelte';
@@ -1859,62 +1860,17 @@
 				{/if}
 
 				{#if section === 'custom-domains'}
-					<section class="card">
-						{@render customDomainsIntro()}
-
-						{#if loadingDomains}
-							<LoadingState label={m('org.customDomains.loading')} />
-						{:else}
-							{#if domainSaveError}
-								<p class="domain-error" role="alert" data-testid="custom-domain-error">
-									{domainSaveError}
-								</p>
-							{/if}
-							{#if customDomains.length === 0}
-								<p class="card-hint domain-empty">{m('org.customDomains.empty')}</p>
-							{:else}
-								<ul class="domain-list">
-									{#each customDomains as host (host)}
-										<li class="domain-row">
-											<span class="domain-name mono">{host}</span>
-											<span class="domain-remove">
-												<button
-													type="button"
-													class="btn-remove-domain"
-													class:armed={confirmRemoveDomain === host}
-													disabled={savingDomains}
-													aria-label={m('org.customDomains.removeAria', { host })}
-													onclick={() => removeCustomDomain(host)}
-												>
-													{confirmRemoveDomain === host ? m('org.customDomains.confirmRemove') : m('org.customDomains.remove')}
-												</button>
-											</span>
-										</li>
-									{/each}
-								</ul>
-							{/if}
-
-							<form
-								class="domain-add"
-								onsubmit={(e) => {
-									e.preventDefault();
-									addCustomDomain();
-								}}
-							>
-								<input
-									type="text"
-									bind:value={newDomain}
-									placeholder={m('org.customDomains.newPlaceholder')}
-									aria-label={m('org.customDomains.newAria')}
-									autocomplete="off"
-									spellcheck="false"
-								/>
-								<button type="submit" class="btn-save-section" disabled={savingDomains}>
-									{savingDomains ? m('org.customDomains.adding') : m('org.customDomains.add')}
-								</button>
-							</form>
-						{/if}
-					</section>
+					<CustomDomainsPanel
+						bind:newDomain
+						intro={customDomainsIntro}
+						domains={customDomains}
+						loading={loadingDomains}
+						saving={savingDomains}
+						saveError={domainSaveError}
+						confirmRemove={confirmRemoveDomain}
+						onremove={removeCustomDomain}
+						onadd={addCustomDomain}
+					/>
 				{/if}
 
 				{#if section === 'chat'}
@@ -2502,32 +2458,6 @@
 		letter-spacing: 0.03em;
 	}
 
-	/* Custom domains */
-	.domain-list {
-		list-style: none;
-		margin: 4px 0 16px;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-	}
-
-	.domain-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		padding: 8px 12px;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-	}
-
-	.domain-name {
-		font-size: 0.9rem;
-		word-break: break-all;
-	}
-
 	.btn-remove-domain {
 		flex-shrink: 0;
 		padding: 4px 12px;
@@ -2561,15 +2491,6 @@
 
 	.domain-add input {
 		flex: 1;
-	}
-
-	/* An in-panel save refusal (a domain add, an SSO save). A panel's failed
-	   LOAD is `ui/LoadError` instead, which carries the Retry this line had no
-	   room for. */
-	.domain-error {
-		color: var(--danger);
-		font-size: 0.88rem;
-		margin: 4px 0 12px;
 	}
 
 	/* "Enabled for a real provider but no webhook stored" — the adapter fails
@@ -2627,10 +2548,6 @@
 	.chat-webhook-set {
 		font-size: 0.88rem;
 		color: var(--text);
-	}
-
-	.domain-empty {
-		margin-bottom: 12px;
 	}
 
 	/* The TEXT-entry recipe, carved away from the three controls it also
