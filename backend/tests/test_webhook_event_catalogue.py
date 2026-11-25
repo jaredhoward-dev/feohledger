@@ -143,6 +143,10 @@ async def test_each_emitter_sends_exactly_its_models_fields(captured):
     await dispatch.emit_invoice_approved(inv, db=None, occurrence_id=uuid.uuid4())
     await dispatch.emit_invoice_approval_recalled(inv, db=None, recalled_from="approved")
     await dispatch.emit_payment_settled(inv, db=None, occurrence_id=uuid.uuid4())
+    await dispatch.emit_invoice_erp_bill_voided(
+        inv, db=None, erp_document_id="BILL-1", occurrence_id=uuid.uuid4()
+    )
+    await dispatch.emit_payment_voided(inv, db=None, occurrence_id=uuid.uuid4())
     await dispatch.emit_exception_raised(
         db=None,
         organization_id=inv.organization_id,
@@ -200,6 +204,8 @@ def engine_emits(monkeypatch):
     monkeypatch.setattr(webhooks_pkg, "emit_invoice_approved", _recorder("approved"))
     monkeypatch.setattr(webhooks_pkg, "emit_payment_settled", _recorder("settled"))
     monkeypatch.setattr(webhooks_pkg, "emit_invoice_approval_recalled", _recorder("recalled"))
+    monkeypatch.setattr(webhooks_pkg, "emit_invoice_erp_bill_voided", _recorder("erp_voided"))
+    monkeypatch.setattr(webhooks_pkg, "emit_payment_voided", _recorder("payment_voided"))
     monkeypatch.setattr(we, "dispatch_audit", AsyncMock())
     monkeypatch.setattr(we, "_maybe_notify_transition", AsyncMock())
     return calls
@@ -252,3 +258,44 @@ async def test_an_approval_still_emits_invoice_approved(engine_emits):
         MagicMock(), inv, InvoiceStatus.approved, action_name="invoice.approved"
     )
     assert [name for name, _ in engine_emits] == ["approved"]
+
+
+# ── A return to `approved` that approves nothing (decisions §542) ───────────
+
+
+@pytest.mark.parametrize(
+    ("from_status", "action", "expected"),
+    [
+        (InvoiceStatus.posted_in_erp, "invoice.erp_bill_voided", "erp_voided"),
+        (InvoiceStatus.sent_to_erp, "invoice.erp_bill_voided", "erp_voided"),
+        (InvoiceStatus.paid, "invoice.voided_return_to_approved", "payment_voided"),
+        (InvoiceStatus.payment_scheduled, "invoice.voided_return_to_approved", "payment_voided"),
+    ],
+)
+async def test_a_void_back_to_approved_does_not_announce_an_approval(
+    engine_emits, from_status, action, expected
+):
+    """The ERP bill void and the payment void both land on `approved`, but
+    nobody approved anything: an integrator that posts approved invoices to its
+    ERP would post the bill again. Each emits its own event instead."""
+    from app.services import workflow_engine as we
+
+    inv = _invoice(from_status)
+    await we.transition_invoice(
+        MagicMock(),
+        inv,
+        InvoiceStatus.approved,
+        actor_id=uuid.uuid4(),
+        action_name=action,
+        details={"erp_document_id": "BILL-7"},
+    )
+    assert [name for name, _ in engine_emits] == [expected]
+    if expected == "erp_voided":
+        assert engine_emits[0][1]["erp_document_id"] == "BILL-7"
+
+
+def test_the_payment_void_uses_the_engines_action():
+    from app.services import workflow_engine as we
+
+    assert we.PAYMENT_VOID_ACTION == "invoice.voided_return_to_approved"
+    assert we.RETURN_TO_APPROVED_ACTIONS == {we.ERP_VOID_ACTION, we.PAYMENT_VOID_ACTION}

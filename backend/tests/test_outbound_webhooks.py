@@ -671,11 +671,13 @@ def test_event_id_fits_the_column():
 
 @pytest.mark.asyncio
 async def test_transition_mints_a_new_occurrence_per_transition(monkeypatch):
-    """`approved` is reachable more than once for one invoice (void → re-approve).
+    """An invoice is approved more than once (recall → re-approve).
 
-    Each arrival must carry its own occurrence id, or the second one is
+    Each approval must carry its own occurrence id, or the second one is
     swallowed by the `(subscription_id, event_id)` dedupe index and the
-    customer's ERP is never told the invoice was voided and re-approved.
+    customer's ERP is never told the invoice was approved again. (A payment
+    void also lands on `approved`, but announces `payment.voided`, not an
+    approval — decisions §542.)
     """
     from unittest.mock import AsyncMock
 
@@ -704,8 +706,8 @@ async def test_transition_mints_a_new_occurrence_per_transition(monkeypatch):
     db = MagicMock()
 
     await we.transition_invoice(db, invoice, InvoiceStatus.approved, action_name="invoice.approved")
-    # `POST /api/payments/{id}/void` takes a paid invoice back to `approved`.
-    invoice.status = InvoiceStatus.paid
+    # Recalled and reviewed again (`approved → ready_for_review → approved`).
+    invoice.status = InvoiceStatus.ready_for_review
     await we.transition_invoice(db, invoice, InvoiceStatus.approved, action_name="invoice.approved")
 
     assert len(captured) == 2

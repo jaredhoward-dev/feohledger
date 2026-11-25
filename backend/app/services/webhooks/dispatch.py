@@ -47,7 +47,9 @@ from app.models.webhook import (
     EVENT_EXCEPTION_RAISED,
     EVENT_INVOICE_APPROVAL_RECALLED,
     EVENT_INVOICE_APPROVED,
+    EVENT_INVOICE_ERP_BILL_VOIDED,
     EVENT_PAYMENT_SETTLED,
+    EVENT_PAYMENT_VOIDED,
     WebhookDelivery,
     WebhookSubscription,
 )
@@ -55,6 +57,7 @@ from app.schemas.webhook_events import (
     WebhookExceptionData,
     WebhookInvoiceApprovalRecalledData,
     WebhookInvoiceData,
+    WebhookInvoiceErpBillVoidedData,
 )
 from app.services.billing.entitlements import get_entitlements, has_entitlement
 from app.services.billing.plan_catalog import FEATURE_PUBLIC_API
@@ -89,7 +92,7 @@ def _occurrence_key(occurrence_id) -> str:
     permanently undeliverable: the ``(subscription_id, event_id)`` unique index
     swallows the insert, and a conforming receiver deduping on
     ``X-Webhook-Event-Id`` would drop it even without the index. An invoice
-    genuinely reaches ``approved`` more than once (void → re-approve) and
+    genuinely reaches ``approved`` more than once (recall → re-approve) and
     ``paid`` more than once (void → re-pay), and the customer's ERP has to hear
     about each one.
 
@@ -113,7 +116,7 @@ async def emit_event(
     OCCURRENCE — combined with ``event_type`` it forms the per-event id used for
     dedupe, so re-emitting the same occurrence produces ONE delivery per
     subscription. It must NOT be a bare entity id for an event an entity can
-    raise more than once (an invoice can be approved, voided and re-approved);
+    raise more than once (an invoice can be approved, recalled and re-approved);
     ``_occurrence_key`` is the helper the typed emitters use.
     """
     if not settings.webhooks_enabled:
@@ -379,6 +382,47 @@ async def emit_invoice_approval_recalled(
             **_invoice_fields(invoice),
             recalled_from=recalled_from,
         ).model_dump(),
+    )
+
+
+async def emit_invoice_erp_bill_voided(
+    invoice, *, db, erp_document_id: str, occurrence_id=None
+) -> None:
+    """Emit ``invoice.erp_bill_voided`` when a flagged invoice's bill is voided
+    in the ERP and the invoice walks back to ``approved`` (decisions §539, §542).
+
+    Sent INSTEAD of ``invoice.approved``: the approval only stood, nobody gave
+    one, and an integrator that posts approved invoices to its ERP would
+    re-create the bill just voided, on a duplicate- or fraud-flagged invoice.
+    ``erp_document_id`` is the voided bill's ERP id (the invoice no longer
+    carries it). ``occurrence_id`` identifies THIS void.
+    """
+    await _emit_after_commit(
+        db,
+        organization_id=invoice.organization_id,
+        event_type=EVENT_INVOICE_ERP_BILL_VOIDED,
+        event_key=_occurrence_key(occurrence_id),
+        data=WebhookInvoiceErpBillVoidedData(
+            **_invoice_fields(invoice), erp_document_id=str(erp_document_id)
+        ).model_dump(),
+    )
+
+
+async def emit_payment_voided(invoice, *, db, occurrence_id=None) -> None:
+    """Emit ``payment.voided`` when ``POST /api/payments/{id}/void`` takes the
+    invoice back to ``approved`` (decisions §542).
+
+    Sent INSTEAD of ``invoice.approved``, for the reason
+    :func:`emit_invoice_erp_bill_voided` gives: the invoice was approved once,
+    and a receiver acting on approvals would act a second time. A receiver that
+    acted on ``payment.settled`` learns here that the payment did not stand.
+    """
+    await _emit_after_commit(
+        db,
+        organization_id=invoice.organization_id,
+        event_type=EVENT_PAYMENT_VOIDED,
+        event_key=_occurrence_key(occurrence_id),
+        data=WebhookInvoiceData(**_invoice_fields(invoice)).model_dump(),
     )
 
 
