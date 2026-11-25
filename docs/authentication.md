@@ -2821,7 +2821,7 @@ Automated user lifecycle — IdP pushes create/update/deactivate events to our S
 ### Per-tenant bearer auth
 
 Each tenant has its own SCIM bearer token. An admin manages it from
-**Organization → Security → SCIM provisioning** (`/organization?section=scim`,
+**Organization → Trust & compliance → SCIM provisioning** (`/organization?section=scim`,
 `ScimTokenPanel`), which calls the endpoints below. To generate one, the admin POSTs to `/api/organization/sso/scim-token` (no body). The backend:
 
 1. Mints a 43-char URL-safe token.
