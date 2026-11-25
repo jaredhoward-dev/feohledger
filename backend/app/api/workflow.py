@@ -643,10 +643,15 @@ async def review_actions(
         if ebv.may_be_orphan(invoice)
         else None
     )
+    shared = await ebv.shared_lookup_keys(
+        db, org.settings, [invoice] if ebv.orphan_candidate(invoice, orphan_instance) else []
+    )
     return {
         **review,
         **workflow,
-        **ebv.orphan_lookup_verdicts(invoice, orphan_instance, user, org.settings),
+        **ebv.orphan_lookup_verdicts(
+            invoice, orphan_instance, user, org.settings, key_shared=invoice.id in shared
+        ),
         "resubmit": resubmit_refusal(user, invoice),
         "manage_file": manage_file_refusal(user, invoice),
         "edit_financials": edit_financials_refusal(user, invoice),
@@ -918,11 +923,19 @@ async def lookup_erp_orphan_bill(
     instance = await _workflow_instance_locked(db, invoice_id, lock=False)
     # The verdict `GET /review-actions` and the exception row serve
     # (`erp_orphan_lookup_refusal`, decisions §560), raised from here.
-    refused = ebv.orphan_lookup_verdict(invoice, instance, user, org.settings)
+    shared = await ebv.shared_lookup_keys(
+        db, org.settings, [invoice] if ebv.orphan_candidate(invoice, instance) else []
+    )
+    refused = ebv.orphan_lookup_verdict(
+        invoice, instance, user, org.settings, key_shared=invoice.id in shared
+    )
     if refused is not None:
         code = 403 if refused["code"] == "role_not_permitted" else 409
         raise HTTPException(status_code=code, detail=refused)
-    payload = await ebv.lookup_payload(db, org, invoice)
+    try:
+        payload = await ebv.lookup_payload(db, org, invoice)
+    except ebv.VoidRefused as refused_:
+        raise HTTPException(status_code=refused_.status_code, detail=refused_.detail()) from None
     # No lock is held across the ERP call; end the read transaction first.
     await db.commit()
     try:
@@ -976,7 +989,10 @@ async def void_erp_orphan_bill(
 
     # The payload is read before any lock: it opens the ERP credentials.
     unlocked = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
-    payload = await ebv.lookup_payload(db, org, unlocked)
+    try:
+        payload = await ebv.lookup_payload(db, org, unlocked)
+    except ebv.VoidRefused as refused:
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
 
     invoice, instance = await _lock()
     try:

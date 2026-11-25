@@ -883,48 +883,116 @@ def orphan_lookup_refusal(inv: Invoice | None, instance, user) -> dict | None:
     return None
 
 
-def lookup_supported(org_settings: dict | None) -> bool:
-    """Does the configured adapter's class offer the lookup? No credential is
-    opened."""
+def _configured_adapter_class(org_settings: dict | None):
+    """The configured ERP adapter's class (the local mock when none is), or
+    None. No credential is opened."""
     from app.services.erp_adapters.dispatcher import adapter_class, resolve_adapter_key
 
     erp = (org_settings or {}).get("erp") if isinstance(org_settings, dict) else None
     config = erp if isinstance(erp, dict) and erp else _LOCAL_ERP
-    cls = adapter_class(resolve_adapter_key(config))
+    return adapter_class(resolve_adapter_key(config))
+
+
+def lookup_supported(org_settings: dict | None) -> bool:
+    """Does the configured adapter's class offer the lookup? No credential is
+    opened."""
+    cls = _configured_adapter_class(org_settings)
     return bool(cls is not None and getattr(cls, "supports_bill_lookup", False) is True)
 
 
-def orphan_lookup_verdict(inv: Invoice | None, instance, user, org_settings) -> dict | None:
+async def shared_lookup_keys(db: AsyncSession, org_settings: dict | None, invoices) -> set:
+    """The ids of ``invoices`` whose lookup key another invoice in this tenant
+    shares, when the configured adapter's key is not unique to one invoice
+    (``bill_lookup_key_shared``: Xero's supplier + number, decisions §566).
+    Empty, with no query, for every other adapter. A caller passes only the
+    invoices a verdict is served for (failed pushes that may have posted)."""
+    cls = _configured_adapter_class(org_settings)
+    if not invoices or getattr(cls, "bill_lookup_key_shared", False) is not True:
+        return set()
+    return {inv.id for inv in invoices if await _key_shared_with(db, inv)}
+
+
+async def _key_shared_with(db: AsyncSession, invoice: Invoice) -> bool:
+    """Does any OTHER invoice in this tenant carry ``invoice``'s number
+    (trimmed, case-folded: wider than the ERP's exact match, so it errs toward
+    refusing) from the same supplier — the same vendor row, or any vendor
+    linked to the same ERP contact? Any status counts: a rejected or done
+    invoice may still have a bill in the ERP. An invoice with no vendor shares
+    nothing; its lookup cannot run (the adapter refuses it unlinked)."""
+    from sqlalchemy import func, or_, select
+
+    from app.models.vendor import Vendor
+
+    if invoice.vendor_id is None:
+        return False
+    linked = select(Vendor.erp_vendor_id).where(Vendor.id == invoice.vendor_id).scalar_subquery()
+    suppliers = select(Vendor.id).where(
+        or_(Vendor.id == invoice.vendor_id, Vendor.erp_vendor_id == linked)
+    )
+    row = await db.execute(
+        select(Invoice.id)
+        .where(
+            Invoice.id != invoice.id,
+            func.lower(func.trim(Invoice.invoice_number))
+            == (invoice.invoice_number or "").strip().lower(),
+            Invoice.vendor_id.in_(suppliers),
+        )
+        .limit(1)
+    )
+    return row.first() is not None
+
+
+def orphan_lookup_verdict(
+    inv: Invoice | None, instance, user, org_settings, *, key_shared: bool = False
+) -> dict | None:
     """Everything ``GET /api/invoices/{id}/erp-orphan-bill`` answers before it
     opens a credential, in its order: :func:`orphan_lookup_refusal`, then
-    :func:`lookup_supported`. The endpoint raises from this very function, so
-    the verdict the pages read cannot disagree with it. No ERP call."""
+    :func:`lookup_supported`, then ``key_shared`` (the invoice is in
+    :func:`shared_lookup_keys`: the adapter's key could name another
+    invoice's bill, so the lookup is unsupported for it, decisions §566). The
+    endpoint raises from this very function, so the verdict the pages read
+    cannot disagree with it. No ERP call."""
     from app.api.refusals import coded_refusal
 
     refused = orphan_lookup_refusal(inv, instance, user)
     if refused is not None:
         return refused
-    if not lookup_supported(org_settings):
+    if not lookup_supported(org_settings) or key_shared:
         return coded_refusal(ERP_LOOKUP_UNSUPPORTED, refusal_message(ERP_LOOKUP_UNSUPPORTED))
     return None
 
 
-def orphan_lookup_verdicts(inv: Invoice | None, instance, user, org_settings) -> dict:
+def orphan_lookup_verdicts(
+    inv: Invoice | None, instance, user, org_settings, *, key_shared: bool = False
+) -> dict:
     """``{ORPHAN_LOOKUP_VERDICT_KEY: verdict}`` on a failed push that may have
     left a bill (:func:`orphan_candidate`), ``{}`` on anything else: an absent
     verdict offers nothing, so the panel is not shown on an invoice the lookup
     would refuse as ``erp_lookup_not_failed`` (decisions §560)."""
     if not orphan_candidate(inv, instance):
         return {}
-    return {ORPHAN_LOOKUP_VERDICT_KEY: orphan_lookup_verdict(inv, instance, user, org_settings)}
+    return {
+        ORPHAN_LOOKUP_VERDICT_KEY: orphan_lookup_verdict(
+            inv, instance, user, org_settings, key_shared=key_shared
+        )
+    }
 
 
 async def lookup_payload(db: AsyncSession, org, invoice: Invoice):
     """The payload the push would send now, built as the push builds it, so
-    the lookup matches what the push's own idempotency check matches."""
+    the lookup matches what the push's own idempotency check matches.
+
+    Raises :class:`VoidRefused` ``erp_lookup_unsupported`` for an invoice in
+    :func:`shared_lookup_keys` (decisions §566): the orphan void builds its
+    payload here too, so it can no more name another invoice's bill than the
+    lookup can."""
+    from fastapi import status as http_status
+
     from app.services.erp import _build_payload, _fetch_line_items, _resolve_erp_refs
     from app.services.provider_credentials import provider_config
 
+    if await shared_lookup_keys(db, org.settings, [invoice]):
+        raise _refused(ERP_LOOKUP_UNSUPPORTED, http_status.HTTP_409_CONFLICT)
     config = await provider_config(org, "erp") or dict(_LOCAL_ERP)
     line_items = await _fetch_line_items(db, invoice.id)
     refs = await _resolve_erp_refs(db, invoice, line_items, config)
