@@ -2820,7 +2820,9 @@ Automated user lifecycle — IdP pushes create/update/deactivate events to our S
 
 ### Per-tenant bearer auth
 
-Each tenant has its own SCIM bearer token. To generate one, the admin POSTs to `/api/organization/sso/scim-token` (no body). The backend:
+Each tenant has its own SCIM bearer token. An admin manages it from
+**Organization → Security → SCIM provisioning** (`/organization?section=scim`,
+`ScimTokenPanel`), which calls the endpoints below. To generate one, the admin POSTs to `/api/organization/sso/scim-token` (no body). The backend:
 
 1. Mints a 43-char URL-safe token.
 2. SHA-256 hashes it.
@@ -2830,9 +2832,18 @@ Each tenant has its own SCIM bearer token. To generate one, the admin POSTs to `
 
 Re-calling the endpoint rotates the token: the old hash is overwritten, so any IdP still using the previous token starts seeing 401s.
 
+`DELETE /api/organization/sso/scim-token` revokes it: both copies of the
+digest are cleared, so the IdP's next call is a 401. Revoke is admin-only but
+not plan-gated, so a tenant that has dropped to a plan without SCIM can still
+take its token out of circulation; with no token set it is a no-op (decisions
+§510).
+
 Every mint / rotation writes an `organization.scim_token_minted` audit row into
-the tenant trail, carrying the 8-char digest prefix and nothing else — never the
-token or its full digest. This is a tenant-wide user-provisioning credential
+the tenant trail, carrying the 8-char digest prefix and `rotated` (whether a
+live token was replaced) and nothing else — never the token or its full digest.
+A revoke writes `organization.scim_token_revoked` with the removed digest's
+prefix. Both rows are written **first**: a row that cannot be written is a 503
+with nothing minted or revoked (the `PUT /organization/sso` rule). This is a tenant-wide user-provisioning credential
 (its holder can create, rename and deactivate accounts, and grant roles through
 group mapping), so it is audited like the other credential mints
 (`api_key.created`, `webhook_subscription.created`).
