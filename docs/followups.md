@@ -1098,10 +1098,16 @@ scope (§260) — do not fold them into any of these.
       ERP a push still closes at `done`, and `done` is terminal, so the ERP's
       later payment cannot be recorded. The webhook's `Paid` and "record
       payment made outside" both skip a `done` invoice. The adapter reads are
-      honest about paid versus credited (§303). Merge.dev's webhook already
-      maps a Merge bill into `apply_bill_report` (§399), so its sweep would be
-      `GET /invoices?modified_after=` and its write-back Merge's `POST
-      /payments`.
+      honest about paid versus credited (§303). **Merge.dev** is part-way
+      (§504): its webhook maps a bill into `apply_bill_report` (§399) and
+      `changed_bills` / `bills_for_payment` read its change feed, but a Merge
+      Payment has no memo or reference field and no `DELETE`, so a write-back
+      can be neither found again, told from a person's payment, nor reversed.
+      Merge stays without status sync until it can carry a marker (a Merge
+      payment reference, or a `remote_fields` memo verified per integration on
+      a linked account, #654); then the sweep's tenant selection
+      (`settings.erp.oauth.provider`, which a Merge tenant lacks) and a
+      `paid_amount` from `expand=applied_payments` are the remaining pieces.
       **Durable fix:** extend §295 per adapter as §386 did for Xero: implement
       `bill_report` (and `changed_bills`, or a keyset poll where the ERP has no
       change feed) plus `post_payment` / `void_payment`, so

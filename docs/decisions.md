@@ -25567,3 +25567,62 @@ the Privacy Policy is written for suppliers and nothing showed it to them.
 plane would hold ids it cannot resolve or erase against, and the portal's
 auth never touches the control plane. *Reusing the `legal_acceptance_required`
 code*: its message asks for the Terms, which a supplier is not asked for.
+
+## 504. Merge.dev reads its change feed but takes no payment write-back: its Payment can carry no marker of ours (round 39)
+
+**Context.** `docs/followups.md` (c) "a bill paid in an ERP other than
+QuickBooks or Xero never reaches FeohLedger" named Merge.dev as the next ERP to
+extend §295 to, as §386 did for Xero: a change feed (`GET
+/invoices?modified_after=`), a write-back (`POST /payments`), and then
+`supports_status_sync`. Merge's Accounting OpenAPI spec
+(<https://docs.merge.dev/openapi/accounting.json>, read 2026-11-24) was checked
+for each piece before building it.
+
+**What Merge supports.** `GET /invoices` and `GET /payments` take
+`modified_after` (Merge's `modified_at`, "synced by Merge after this date
+time"), `include_deleted_data`, `page_size` (at most 100) and a `cursor`; a
+Payment's `applied_to_lines` (expandable) names the invoices it is applied to.
+That is an honest change feed.
+
+**What it does not.** A `Payment` is `POST` / `GET` / `PATCH` only: no `DELETE`
+and no void. Neither `Payment` nor `PaymentRequest` has a memo, reference or
+any free-text field; `integration_params` is request-only and never echoed.
+Every guarantee §295 and §386 rest the write-back on needs a marker of ours on
+the ERP's payment:
+
+- *Idempotency.* QuickBooks and Xero find our earlier payment by its marker
+  before creating. Merge's `Idempotency-Key` is a beta enabled per customer and
+  kept 24 hours (§399), so after an unknown outcome nothing finds our payment
+  again. Matching by bill + amount + date would take a person's identical
+  payment for ours and write nothing.
+- *Telling ours from theirs.* `ErpBillReport.paid_only_by_us` and
+  `our_payment_applied` come from that marker. Without it every write-back reads
+  back as a payment made outside FeohLedger: the sweep would raise
+  `payment_reconciliation` (or `erp_paid_twice`) on every invoice we paid.
+- *Reversal.* A FeohLedger void must take our payment off the bill; Merge
+  cannot delete one, and a `PATCH` to zero is not a reversal an ERP books
+  consistently.
+
+**Decision.** `MergeDevAdapter.changed_bills` (both feeds, whole listing or
+`ErpListingIncomplete`, Xero's shape) and `bills_for_payment` are implemented.
+`post_payment` / `void_payment` stay the base class's refusals and
+`supports_status_sync` stays False, so a Merge push still closes at `done` and
+nothing is left payable here on the strength of a sync that cannot be complete
+(§295: landing at `posted_in_erp` without a guaranteed channel back is the
+double payment). The webhook (§399) is unchanged.
+
+**What is still between Merge and status sync**, kept in `docs/followups.md`:
+the marker (Merge adding a payment reference, or a per-integration
+`remote_fields` memo verified integration by integration against a linked
+account, #654); the sweep selecting tenants by `settings.erp.oauth.provider`,
+which a Merge tenant (API key + account token) has none of; and `bill_report`
+stating no `paid_amount` (Merge lists payment ids on the bill; the applied
+amounts need `expand=applied_payments`, unverified against a live account).
+
+Rejected: *storing the Merge payment id we created and treating it as the
+marker*. It covers only a create whose answer we read; the unknown outcome is
+exactly the case a marker exists for, and the bill report would need our
+payment ids passed into the adapter, a cross-layer change for one adapter.
+*Turning `supports_status_sync` on with the write-back refused*: the push would
+land payable, and FeohLedger's own payment would never reach the ERP, so the
+bill would stay open there and be paid again.

@@ -128,7 +128,9 @@ Shows invoices in payable statuses (`approved`, `sent_to_erp`, `posted_in_erp`, 
 An invoice sent to the ERP leaves this queue: a successful push ends at `done`,
 and the bill is paid from the ERP. The exception is an ERP with status sync on
 (QuickBooks, decisions §295; Xero, §386): there the push lands at `posted_in_erp`, which
-stays payable here, and a payment from either side is reflected in the other. With the workflow's **Auto-send on approval**
+stays payable here, and a payment from either side is reflected in the other. Merge.dev is not one
+(§504): its Payment carries no marker of ours and cannot be deleted, so a write-back could be neither
+idempotent nor reversed, and its pushes still end at `done`. With the workflow's **Auto-send on approval**
 switch on (and a live ERP connected) that happens moments after approval, so
 such an invoice never waits here (`docs/decisions.md` §304). Tenants that pay
 through FeohLedger runs keep the switch off.

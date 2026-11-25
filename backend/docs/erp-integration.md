@@ -2705,6 +2705,27 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   tenant slug. Nor does it accept the generic shape for a Merge tenant under
   any `erp_type`: Merge holds that key, and the generic route trusts the body
   (§ Webhook endpoint above).
+- **No status sync, and why (decisions §504).** Read against the same spec on
+  2026-11-24: Merge's `Payment` is `POST` / `GET` / `PATCH` only (no `DELETE`
+  or void), and neither `Payment` nor `PaymentRequest` has a memo or reference
+  field. A payment written back through Merge could therefore carry no marker
+  of ours, so (a) a retry after an unknown outcome cannot find it again (the
+  `Idempotency-Key` header is a beta Merge enables per customer and keeps
+  24 hours), (b) the bill report cannot tell it from a person's payment, so
+  every write-back would read back as "paid outside FeohLedger", and (c) a
+  FeohLedger void cannot reverse it. `post_payment` / `void_payment` stay the
+  base refusals, `supports_status_sync` stays False, and a push still closes at
+  `done`. The read side is in place for when that changes:
+  `MergeDevAdapter.changed_bills(since)` walks `GET /invoices?type=
+  ACCOUNTS_PAYABLE&modified_after=` and `GET /payments?modified_after=&expand=
+  applied_to_lines` (`include_deleted_data=true`, 100 a page, `cursor`), a
+  payment naming its bills through `applied_to_lines` rows of type `INVOICE`,
+  whole or `ErpListingIncomplete`; `bills_for_payment` reads one payment the
+  same way. `modified_after` is Merge's own sync time, so it is a change feed.
+  Two more things stand between that and a sweep: the sweep selects tenants by
+  their OAuth block (`settings.erp.oauth.provider`), which a Merge tenant has
+  none of, and `bill_report` states no `paid_amount`, so an ERP payment would be
+  recorded at the figure owed here (`docs/followups.md`).
 
 ## Sage Intacct direct adapter (`sage_intacct`)
 
