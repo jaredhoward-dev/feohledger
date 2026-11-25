@@ -21,7 +21,7 @@
 	import Tabs from '#lib/components/ui/Tabs.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
-	import ErpOrphanBill from '#lib/components/ErpOrphanBill.svelte';
+	import ErpOrphanBill from '#lib/components/erp/ErpOrphanBill.svelte';
 	import {
 		EXCEPTION_SEVERITIES,
 		exceptionSeverityLabelKey,
@@ -124,6 +124,10 @@
 		 *  `POST /{id}/void-erp-bill`, voiding the invoice's bill in the ERP
 		 *  (decisions §539). Absent = not offered. */
 		void_erp_bill_refusal?: ActionRefusal;
+		/** The lookup for the bill a failed push may have left in the ERP
+		 *  (`erp_bill_void.orphan_lookup_verdicts`, decisions §556 / §560):
+		 *  present only on a duplicate / fraud flag whose invoice is such a push. */
+		erp_orphan_lookup_refusal?: ActionRefusal;
 		/** On a `paid_not_recorded` row stating a figure and a breakdown: the
 		 *  SERVER's judgement that the breakdown is booked whatever one rail a
 		 *  person names (it adds up exactly and spans several rails, decisions
@@ -726,13 +730,13 @@
 	const voidPanelShown = $derived(
 		!!resolveTarget && isOffered(resolveTarget.void_erp_bill_refusal)
 	);
-	// The flag's invoice names no bill: its push may have failed after reaching
-	// the ERP (decisions §556). Offer the read-only lookup; the server says
-	// whether it is a failed push (`erp_lookup_not_failed` otherwise).
+	// The flag's invoice is a failed push that may have left a bill in the ERP
+	// (decisions §556): the row carries the lookup's verdict only then, and
+	// `isOffered` hides it from a role that cannot act on it (§560).
 	const orphanPanelShown = $derived(
 		voidPanelShown &&
 			!!resolveTarget?.invoice_id &&
-			resolveTarget?.void_erp_bill_refusal?.code === 'erp_void_no_bill'
+			isOffered(resolveTarget?.erp_orphan_lookup_refusal)
 	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
@@ -1618,13 +1622,17 @@
 					</button>
 				</div>
 				{#if orphanPanelShown && resolveTarget.invoice_id}
-					<ErpOrphanBill
-						invoiceId={resolveTarget.invoice_id}
-						idPrefix="exception-erp-orphan"
-						onvoided={async () => {
-							if (resolveTarget) await refreshResolveTarget(resolveTarget.id);
-						}}
-					/>
+					{#key resolveTarget.invoice_id}
+						<ErpOrphanBill
+							invoiceId={resolveTarget.invoice_id}
+							verdict={resolveTarget.erp_orphan_lookup_refusal ?? null}
+							idPrefix="exception-erp-orphan"
+							invoiceHref="/invoices?id={resolveTarget.invoice_id}"
+							onvoided={async () => {
+								if (resolveTarget) await refreshResolveTarget(resolveTarget.id);
+							}}
+						/>
+					{/key}
 				{/if}
 			</section>
 		{/if}

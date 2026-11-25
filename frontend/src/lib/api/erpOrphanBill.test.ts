@@ -1,14 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { orphanLookupOffered, orphanStateFrom } from "./erpOrphanBill.ts";
-
-describe("orphanLookupOffered", () => {
-  it("is offered only on a failed push to a holder of payment.void", () => {
-    expect(orphanLookupOffered("failed", true)).toBe(true);
-    expect(orphanLookupOffered("failed", false)).toBe(false);
-    expect(orphanLookupOffered("approved", true)).toBe(false);
-    expect(orphanLookupOffered(undefined, true)).toBe(false);
-  });
-});
+import { orphanStateFrom } from "./erpOrphanBill.ts";
 
 describe("orphanStateFrom", () => {
   const bill = {

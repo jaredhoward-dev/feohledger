@@ -14,8 +14,7 @@
 	import { INVOICE_FILE_ACCEPT } from '#lib/utils/invoiceFiles.ts';
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
-	import ErpOrphanBill from '#lib/components/ErpOrphanBill.svelte';
-	import { orphanLookupOffered } from '#lib/api/erpOrphanBill.ts';
+	import ErpOrphanBill from '#lib/components/erp/ErpOrphanBill.svelte';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import {
@@ -2532,14 +2531,19 @@
 								</p>
 							{/if}
 						{/if}
-						{#if orphanLookupOffered(invoice.status, auth.can('payment.void'))}
+						{#if isOffered(verdicts?.erp_orphan_lookup_refusal)}
 							<!-- The bill this failed push may have left in the ERP
-							     (decisions §556): find it, then void or keep it. -->
-							<ErpOrphanBill
-								invoiceId={invoice.id}
-								idPrefix="invoice-erp-orphan"
-								onvoided={() => loadVerdicts()}
-							/>
+							     (decisions §556): find it, then void or keep it. Shown
+							     from the server's verdict alone (§560); keyed on the
+							     invoice so one invoice's bill never shows on another. -->
+							{#key invoice.id}
+								<ErpOrphanBill
+									invoiceId={invoice.id}
+									verdict={verdicts?.erp_orphan_lookup_refusal ?? null}
+									idPrefix="invoice-erp-orphan"
+									onvoided={() => loadVerdicts()}
+								/>
+							{/key}
 						{/if}
 					</div>
 				{/if}
