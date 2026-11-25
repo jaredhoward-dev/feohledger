@@ -203,6 +203,10 @@ ERP_PRODUCER_MODULES = (
     "app/api/erp_webhook.py",
     "app/services/erp_payment_writeback.py",
     "app/services/payment_erp_sync.py",
+    # The generic webhook's transition, shared with the polling sweep (§528).
+    "app/services/erp_status_report.py",
+    # The status polling sweep's `settled_no_payment` flag (decisions §532).
+    "app/services/erp_status_poll_sweep.py",
 )
 
 
