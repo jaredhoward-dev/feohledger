@@ -781,18 +781,6 @@ or is a sibling of a fix that needs its own pass.
       that decision, or the first customer with an `all`-mode level who sets a
       delegation.
 
-### Surfaced by the approval recall (2026-11-13, decisions §374)
-
-- [ ] **(c) A recalled invoice's PEPPOL transmission and inter-company mirror
-      keep the recalled figures.** `recall_refusal` does not ask whether the
-      approved invoice was already sent over PEPPOL (`POST {id}/peppol-send`)
-      or routed inter-company (`intercompany_mirror_id`); correcting it then
-      leaves the network holding the old document and the mirror its copied
-      amount and segregation set. **Durable fix:** a product call between
-      refusing the recall for a transmitted / routed invoice and re-sending /
-      re-syncing the mirror after re-approval. **Trigger:** the first
-      customer using PEPPOL send or inter-company routing who recalls.
-
 ### Surfaced by the PR #670 money-path review (2026-10-26, decisions §323)
 
 - [ ] **(c) A PO the ERP can never price has no documented way out.** A SYSPRO

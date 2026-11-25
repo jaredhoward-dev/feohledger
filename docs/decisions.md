@@ -29970,3 +29970,51 @@ checked in full (white on `green.shade800`, about 5.1:1).
 `mobile/test/screens/invoice_detail_screen_test.dart` reads the button flag from
 the boundary's merged `getSemanticsData()` (what a screen reader is handed),
 not the boundary node alone.
+
+## 573. A recall is refused once the invoice went out over PEPPOL or while it is paired inter-company (§374 follow-up, round 49)
+
+**Problem.** `review.recall_refusal` (§374) asked about the ERP, payments and
+cards, but not about the two other places an approved invoice's figures leave
+it: a PEPPOL transmission (`POST /api/invoices/{id}/peppol-send`) and an
+inter-company mirror (`intercompany_mirror_id`, §192). Correcting a recalled
+invoice then left the receiver's Access Point holding the old document and the
+mirror its copied amount and segregation set.
+
+**Decision.** Refuse, in the one rule both the door and `GET /review-actions`
+read, after the ERP check and before the live-claim check (neither can be
+cleared by cancelling a run, so they are named first):
+
+- **`invoice_recall_peppol_transmitted`** — any outbound transmission not
+  `failed` (`sending` counts: its outcome is unknown, as an unknown ERP push
+  counts). A transmitted e-invoice is corrected by a credit note and a new
+  document, the way the network and the receiver's books expect, never by
+  reopening the document sent. `POST /peppol-send` now takes the invoice row
+  lock, so a send and a recall serialize.
+- **`invoice_recall_is_mirror`** — the invoice is itself a mirror (read from
+  routing's `role: "mirror"` audit row, as migration 0100 does; the link is on
+  both rows). Its figures are the origin's; correct the origin.
+- **`invoice_recall_mirror_unsigned`** — an origin whose mirror is still in a
+  pre-approval status, never approved, and not claimed by a payment or card.
+  The way out is delete the mirror (which unlinks the origin), recall, and
+  route again after re-approval: routing copies the corrected figures and the
+  then-current implicated set, recaller included.
+- **`invoice_recall_mirror_progressed`** (`params.mirror_status`) — the
+  mirror was approved, moved past approval, or is being paid. Its copy has been
+  signed; a credit memo on each side corrects the pair.
+
+**Rejected: re-sync the mirror after re-approval.** Considered for an unsigned
+mirror. Between the recall and the re-approval the counterparty entity's
+reviewers work the mirror on their own; a re-sync at re-approval would have to
+lock both rows and refuse the origin's approval if the mirror had been signed
+meanwhile — a new refusal on the approve door for a rare case. Deleting and
+re-routing reuses two audited, row-locked doors and needs nothing new.
+
+**Clients.** Web (`codedRefusals.ts`, six locales) and mobile
+(`coded_refusal_messages.dart`, every ARB) state each code; the modal's Recall
+button is disabled with the sentence, as for the ERP refusal.
+
+**Tests.** `backend/tests/test_invoice_recall_approval.py` — each refusal and
+its precedence, a `failed` transmission allowing the recall, delete-the-mirror
+then recall succeeding, and verdict / door parity over all of them; web
+`codedRefusals.test.ts`; mobile `coded_refusal_messages_test.dart`; e2e
+`recall-approval.spec.ts` (PEPPOL-sent invoice).
