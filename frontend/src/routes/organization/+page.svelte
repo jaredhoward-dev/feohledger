@@ -57,6 +57,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import ExtractionPanel from '#lib/components/organization/ExtractionPanel.svelte';
 	import BrandingPanel from '#lib/components/organization/BrandingPanel.svelte';
 	import CardsPanel from '#lib/components/organization/CardsPanel.svelte';
 	import SecurityPanel from '#lib/components/organization/SecurityPanel.svelte';
@@ -66,9 +67,11 @@
 	import InvoiceDefaultsPanel from '#lib/components/organization/InvoiceDefaultsPanel.svelte';
 	import {
 		cardAutoProvider,
+		extractionProviderLabel,
 		type BrandingFields,
 		type CardsFields,
 		type CompanyFields,
+		type ExtractionFields,
 		type InvoiceDefaultsFields
 	} from '#lib/components/organization/panelState.ts';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
@@ -238,20 +241,24 @@
 		}
 	}
 	// Extraction
-	let extractionProgramType = $state('platform');
-	let extractionProvider = $state('claude_vision');
-	let extractionApiKey = $state('');
-	let extractionAwsKeyId = $state('');
-	let extractionAwsSecret = $state('');
-	let extractionAwsRegion = $state('us-east-1');
+	let extractionFields = $state<ExtractionFields>({
+		programType: 'platform',
+		provider: 'claude_vision',
+		apiKey: '',
+		awsKeyId: '',
+		awsSecret: '',
+		awsRegion: 'us-east-1',
+		ollamaUrl: 'http://localhost:11434',
+		ollamaModel: 'llama3.2-vision:11b',
+		keyInvalid: false
+	});
 	let savingExtraction = $state(false);
 	// The provider the stored key belongs to — as loaded, then as last saved
 	// (`null`: the block names none). A save that changes it drops the sealed
 	// key server-side (`extraction_secrets_to_drop`, decisions §444), so the
 	// key field reads "stored" only while the dropdown still shows this one.
 	let extractionSavedProvider = $state<string | null>(null);
-	let extractionKeyInvalid = $state(false);
-	const extractionProviderChanged = $derived(extractionProvider !== extractionSavedProvider);
+	const extractionProviderChanged = $derived(extractionFields.provider !== extractionSavedProvider);
 	const extractionKeyStored = (path: string): boolean =>
 		!extractionProviderChanged && isStored('extraction', path);
 	// A key is stored for the saved provider, and this save would drop it.
@@ -266,10 +273,6 @@
 			: provider === 'claude_vision' || provider === 'openai_vision'
 				? 'api_key'
 				: null;
-	const extractionProviderLabel = (provider: string): string =>
-		provider === 'ollama'
-			? m('org.extraction.providerOllama')
-			: (EXTRACTION_PROVIDERS.find((p) => p.value === provider)?.name ?? provider);
 	let testingExtraction = $state(false);
 	let extractionTestResult = $state<{ success: boolean; message: string } | null>(null);
 
@@ -278,13 +281,13 @@
 		extractionTestResult = null;
 		try {
 			extractionTestResult = await api.post<{ success: boolean; message: string }>('/api/organization/test-extraction', {
-				provider: extractionProgramType === 'platform' ? 'claude_vision' : extractionProvider,
-				api_key: extractionApiKey,
-				aws_access_key_id: extractionAwsKeyId,
-				aws_secret_access_key: extractionAwsSecret,
-				aws_region: extractionAwsRegion,
-				base_url: extractionOllamaUrl,
-				model: extractionOllamaModel,
+				provider: extractionFields.programType === 'platform' ? 'claude_vision' : extractionFields.provider,
+				api_key: extractionFields.apiKey,
+				aws_access_key_id: extractionFields.awsKeyId,
+				aws_secret_access_key: extractionFields.awsSecret,
+				aws_region: extractionFields.awsRegion,
+				base_url: extractionFields.ollamaUrl,
+				model: extractionFields.ollamaModel,
 			});
 		} catch (err) {
 			extractionTestResult = { success: false, message: errorMessage(err, m('org.toast.testFailed')) };
@@ -293,24 +296,8 @@
 		}
 	}
 
-	// Product names, not copy, except Ollama's "(local)" note, which is keyed
-	// (`extractionProviderLabel`).
-	const EXTRACTION_PROVIDERS = [
-		{ value: 'claude_vision', name: 'Claude Vision (Anthropic)' },
-		{ value: 'openai_vision', name: 'GPT-4V (OpenAI)' },
-		{ value: 'aws_textract', name: 'AWS Textract' },
-		{ value: 'ollama', name: 'Ollama' },
-	];
-	// Product and model names, not copy: they read the same in every locale.
+	// A product name, not copy: it reads the same in every locale.
 	const MODERN_TREASURY = 'Modern Treasury';
-	const OLLAMA_MODELS = [
-		{ value: 'llama3.2-vision:11b', name: 'Llama 3.2 Vision 11B' },
-		{ value: 'llama3.2-vision:90b', name: 'Llama 3.2 Vision 90B' },
-		{ value: 'llava:13b', name: 'LLaVA 13B' },
-		{ value: 'llava:34b', name: 'LLaVA 34B' }
-	];
-	let extractionOllamaUrl = $state('http://localhost:11434');
-	let extractionOllamaModel = $state('llama3.2-vision:11b');
 	// Cards
 	let cardsFields = $state<CardsFields>({
 		enabled: false,
@@ -626,18 +613,18 @@
 			// Extraction
 			const extraction = (data.settings as unknown as Record<string, unknown>).extraction as Record<string, unknown> | undefined;
 			if (extraction) {
-				extractionProgramType = (extraction.program_type as string) || 'platform';
-				extractionProvider = (extraction.provider as string) || 'claude_vision';
+				extractionFields.programType = (extraction.program_type as string) || 'platform';
+				extractionFields.provider = (extraction.provider as string) || 'claude_vision';
 				extractionSavedProvider =
 					typeof extraction.provider === 'string' && extraction.provider.trim()
 						? extraction.provider.trim()
 						: null;
 				// The BYOK key / AWS secret are sealed and never read back: their
 				// fields start empty ("leave blank to keep"), like every SecretField.
-				extractionAwsKeyId = (extraction.aws_access_key_id as string) || '';
-				extractionAwsRegion = (extraction.aws_region as string) || 'us-east-1';
-				extractionOllamaUrl = (extraction.base_url as string) || 'http://localhost:11434';
-				extractionOllamaModel = (extraction.model as string) || 'llama3.2-vision:11b';
+				extractionFields.awsKeyId = (extraction.aws_access_key_id as string) || '';
+				extractionFields.awsRegion = (extraction.aws_region as string) || 'us-east-1';
+				extractionFields.ollamaUrl = (extraction.base_url as string) || 'http://localhost:11434';
+				extractionFields.ollamaModel = (extraction.model as string) || 'llama3.2-vision:11b';
 			}
 			// Branding (white-label)
 			const brandCfg = (data.settings as unknown as Record<string, unknown>).brand as
@@ -918,16 +905,16 @@
 	}
 
 	async function saveExtraction() {
-		const byok = extractionProgramType === 'byok';
+		const byok = extractionFields.programType === 'byok';
 		// Platform mode hides the provider dropdown: resend the saved one, so a
 		// choice the admin can no longer see cannot drop the stored key.
-		const provider = byok ? extractionProvider : (extractionSavedProvider ?? extractionProvider);
+		const provider = byok ? extractionFields.provider : (extractionSavedProvider ?? extractionFields.provider);
 		// Refuse a switch that would leave BYOK keyless: the stored key goes
 		// with the old provider, so the new one's must be typed in this save.
 		const needed = byok ? extractionSecretPath(provider) : null;
-		const typed = { api_key: extractionApiKey, aws_secret_access_key: extractionAwsSecret };
+		const typed = { api_key: extractionFields.apiKey, aws_secret_access_key: extractionFields.awsSecret };
 		if (extractionSwitchDropsKey && needed && typed[needed].trim() === '') {
-			extractionKeyInvalid = true;
+			extractionFields.keyInvalid = true;
 			toast(
 				m('org.extraction.switchNeedsKey', { provider: extractionProviderLabel(provider) }),
 				'error'
@@ -937,7 +924,7 @@
 				?.focus();
 			return;
 		}
-		extractionKeyInvalid = false;
+		extractionFields.keyInvalid = false;
 		savingExtraction = true;
 		try {
 			// Configuration first: a save that switches provider drops the old
@@ -945,12 +932,12 @@
 			// must be written after it.
 			await patchOrg({
 				extraction: {
-					program_type: extractionProgramType,
+					program_type: extractionFields.programType,
 					provider,
-					aws_access_key_id: extractionAwsKeyId,
-					aws_region: extractionAwsRegion,
-					base_url: extractionOllamaUrl,
-					model: extractionOllamaModel,
+					aws_access_key_id: extractionFields.awsKeyId,
+					aws_region: extractionFields.awsRegion,
+					base_url: extractionFields.ollamaUrl,
+					model: extractionFields.ollamaModel,
 				},
 			});
 			extractionSavedProvider = provider;
@@ -958,7 +945,7 @@
 			// dropped a key the page still believes is there.
 			await loadCredentials();
 			await saveSecrets('extraction', typed);
-			extractionApiKey = extractionAwsSecret = '';
+			extractionFields.apiKey = extractionFields.awsSecret = '';
 			toast(
 				m('org.toast.sectionSaved', { section: m('org.section.extractionSaved') }),
 				'success'
@@ -2306,143 +2293,20 @@
 					     getting down to one. That key's declared non-admin consumer is the
 					     workflow builder's ERP hint, which still reads it.
 					     decisions §153. -->
-					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.extraction')}</h2>
-							<HelpTip term="extraction" />
-						</div>
-						<p class="card-hint">{m('org.extraction.hint')}</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="extraction-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.extraction.program')}</span>
-									<select bind:value={extractionProgramType}>
-										<option value="platform">{m('org.extraction.programPlatform')}</option>
-										<option value="byok">{m('org.extraction.programByok')}</option>
-									</select>
-								</label>
-								{#if extractionProgramType === 'byok'}
-									<label>
-										<span>{m('org.extraction.provider')}</span>
-										<select bind:value={extractionProvider}>
-											{#each EXTRACTION_PROVIDERS as p}
-												<option value={p.value}>{extractionProviderLabel(p.value)}</option>
-											{/each}
-										</select>
-									</label>
-								{:else}
-									<label>
-										<span>{m('org.extraction.provider')}</span>
-										<input type="text" value="Claude Vision (Anthropic)" disabled />
-									</label>
-								{/if}
-							</div>
-
-							{#if extractionProgramType === 'platform'}
-								<p class="card-hint after-control">{m('org.extraction.platformHint')}</p>
-							{:else if extractionProvider === 'claude_vision' || extractionProvider === 'openai_vision'}
-								<div class="form-grid">
-									<SecretField
-										id="extraction-api-key"
-										label={extractionProvider === 'claude_vision' ? m('org.extraction.anthropicKey') : m('org.extraction.openaiKey')}
-										bind:value={extractionApiKey}
-										bind:clear={secretClear['extraction.api_key']}
-										configured={extractionKeyStored('api_key')}
-										placeholder={'sk-...'}
-										testId="extraction-api-key"
-										required={extractionSwitchDropsKey}
-										invalid={extractionKeyInvalid}
-										oninput={() => (extractionKeyInvalid = false)}
-										describedBy={extractionSwitchDropsKey ? 'extraction-switch-hint' : undefined}
-									/>
-								</div>
-								{#if extractionSwitchDropsKey}
-									<p class="card-hint" id="extraction-switch-hint" data-testid="extraction-switch-hint">
-										{m('org.extraction.switchDropsKey', { provider: extractionProviderLabel(extractionProvider) })}
-									</p>
-								{/if}
-							{:else if extractionProvider === 'aws_textract'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.extraction.awsKeyId')}</span>
-										<input
-											type="text"
-											bind:value={extractionAwsKeyId}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<SecretField
-										id="extraction-aws-secret"
-										label={m('org.extraction.awsSecret')}
-										bind:value={extractionAwsSecret}
-										bind:clear={secretClear['extraction.aws_secret_access_key']}
-										configured={extractionKeyStored('aws_secret_access_key')}
-										testId="extraction-aws-secret"
-										required={extractionSwitchDropsKey}
-										invalid={extractionKeyInvalid}
-										oninput={() => (extractionKeyInvalid = false)}
-										describedBy={extractionSwitchDropsKey ? 'extraction-switch-hint' : undefined}
-									/>
-									<label>
-										<span>{m('org.extraction.awsRegion')}</span>
-										<input type="text" bind:value={extractionAwsRegion} placeholder={'us-east-1'} />
-									</label>
-								</div>
-								{#if extractionSwitchDropsKey}
-									<p class="card-hint" id="extraction-switch-hint" data-testid="extraction-switch-hint">
-										{m('org.extraction.switchDropsKey', { provider: extractionProviderLabel(extractionProvider) })}
-									</p>
-								{/if}
-							{:else if extractionProvider === 'ollama'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.extraction.ollamaUrl')}</span>
-										<input type="url" bind:value={extractionOllamaUrl} placeholder={'http://localhost:11434'} />
-									</label>
-									<label>
-										<span>{m('org.extraction.model')}</span>
-										<select bind:value={extractionOllamaModel}>
-											{#each OLLAMA_MODELS as model (model.value)}
-												<option value={model.value}>{model.name}</option>
-											{/each}
-										</select>
-									</label>
-								</div>
-								<p class="card-hint after-control">{m('org.extraction.ollamaHint')} <code>{`brew install ollama && ollama pull ${extractionOllamaModel}`}</code></p>
-							{/if}
-
-							{#if unopenable.extraction && auth.isAdmin}
-								<CredentialResetPrompt
-									block="extraction"
-									oncleared={(status) => onCredentialsCleared('extraction', status)}
-								/>
-							{/if}
-							<div class="erp-test-row">
-								<button class="btn-save-section" disabled={savingExtraction} onclick={saveExtraction}>
-									{savingExtraction ? m('org.common.saving') : m('org.extraction.save')}
-								</button>
-								<button class="btn-test" disabled={testingExtraction} onclick={testExtraction}>
-									{testingExtraction ? m('org.common.testing') : m('org.common.testConnection')}
-								</button>
-								<!-- Always mounted, so the result is announced when it arrives
-								     (WCAG 4.1.3): a live region inserted together with its text
-								     is not read by every screen reader. -->
-								<span
-									class="test-result"
-									role="status"
-									class:success={extractionTestResult?.success === true}
-									class:failure={extractionTestResult?.success === false}
-								>
-									{extractionTestResult?.message ?? ''}
-								</span>
-							</div>
-						{/if}
-					</section>
+					<ExtractionPanel
+						bind:fields={extractionFields}
+						bind:secretClear
+						{readOnly}
+						keyStored={extractionKeyStored}
+						switchDropsKey={extractionSwitchDropsKey}
+						unopenable={unopenable.extraction ?? false}
+						oncleared={(status) => onCredentialsCleared('extraction', status)}
+						saving={savingExtraction}
+						onsave={saveExtraction}
+						testing={testingExtraction}
+						testResult={extractionTestResult}
+						ontest={testExtraction}
+					/>
 				{/if}
 
 				{#if section === 'erp'}
@@ -3332,11 +3196,6 @@
 		margin: 0 0 14px;
 	}
 
-	/* A hint under the provider picker it qualifies, not at the top of a card. */
-	.card-hint.after-control {
-		margin-top: 10px;
-	}
-
 	.form-grid {
 		display: grid;
 		grid-template-columns: 1fr 1fr;
@@ -3634,8 +3493,8 @@
 
 	.section-footer {
 		display: flex;
-		/* Same reason as `.erp-test-row` below: this row carries a Save button, an
-		   optional Test button and an optional result message, all of them
+		/* Same reason as `.erp-test-row` (now in ExtractionPanel): this row
+		   carries a Save button, an optional Test button and an optional result message, all of them
 		   `white-space: nowrap`. Without a wrap the row cannot shrink below its
 		   own max-content width and pushes the whole document sideways at 320px
 		   — WCAG 1.4.10. The `gap` replaces the spacing the buttons used to get
@@ -3668,21 +3527,6 @@
 	.btn-save-section:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	.erp-test-row {
-		display: flex;
-		align-items: center;
-		/* Wraps because `.btn-test` is `white-space: nowrap` (142px) and sits
-		   beside a result message: without this the row could not shrink and
-		   pushed the whole page into a horizontal scrollbar at 320px — WCAG
-		   1.4.10, the same failure the section tab bar had. Caught when the
-		   reflow guard started visiting a grouped route. */
-		flex-wrap: wrap;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
 	}
 
 	.btn-test {

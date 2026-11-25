@@ -1,3 +1,5 @@
+import { m } from '#lib/i18n/store.svelte.ts';
+
 /**
  * Field state of the `/organization` panels the page renders through a
  * component (`docs/followups.md`, decisions §205).
@@ -100,3 +102,34 @@ export const CARD_REGIONS = [
 export function cardAutoProvider(region: string): string {
 	return CARD_REGIONS.find((r) => r.value === region)?.default_provider ?? 'nium';
 }
+
+/**
+ * Organization → AI extraction (`settings.extraction`). `apiKey` / `awsSecret`
+ * are write-only credentials, like every SecretField. `keyInvalid` marks the
+ * key field the page refused a provider switch for.
+ */
+export interface ExtractionFields {
+	programType: string;
+	provider: string;
+	apiKey: string;
+	awsKeyId: string;
+	awsSecret: string;
+	awsRegion: string;
+	ollamaUrl: string;
+	ollamaModel: string;
+	keyInvalid: boolean;
+}
+
+// Product names, not copy, except Ollama's "(local)" note, which is keyed
+// (`extractionProviderLabel`).
+export const EXTRACTION_PROVIDERS = [
+	{ value: 'claude_vision', name: 'Claude Vision (Anthropic)' },
+	{ value: 'openai_vision', name: 'GPT-4V (OpenAI)' },
+	{ value: 'aws_textract', name: 'AWS Textract' },
+	{ value: 'ollama', name: 'Ollama' }
+];
+
+export const extractionProviderLabel = (provider: string): string =>
+	provider === 'ollama'
+		? m('org.extraction.providerOllama')
+		: (EXTRACTION_PROVIDERS.find((p) => p.value === provider)?.name ?? provider);
