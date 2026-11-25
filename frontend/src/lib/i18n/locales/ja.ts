@@ -738,6 +738,9 @@ export const messages = {
 	'invoices.empty.fresh': 'まだ請求書がありません。アップロード、手動作成、またはCSVをインポートして未払いのAPを読み込んでください。',
 	'invoices.row.delete': '削除',
 	'invoices.row.confirm': '確認',
+	'invoices.row.selectAria': '請求書 {number} を選択',
+	'invoices.row.selectDraftAria': '下書きの請求書を選択',
+	'invoices.row.editDraftAria': '下書きの請求書を編集',
 	'invoices.loadMore': 'さらに読み込む（{total}件中{shown}件）',
 	'invoices.showingAll': '{total, plural, other {#件すべての請求書を表示中}}',
 

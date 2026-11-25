@@ -7,7 +7,7 @@
 		AdvancedSearchFilters,
 		InvoiceMatchingIdsResponse
 	} from '#lib/types/invoice.ts';
-	import { INVOICE_STATUSES, INVOICE_STATUS_LABEL_KEYS, EMPTY_ADVANCED_FILTERS, SYSTEM_MANAGED_STATUSES, IMMUTABLE_STATUSES, commonTransitions, ENTRY_BULK_STATUS_TARGETS, INVOICE_ENTRY_ROLES, INVOICE_IMPORT_ROLES, INVOICE_MANAGE_ROLES } from '#lib/types/invoice.ts';
+	import { INVOICE_STATUSES, INVOICE_STATUS_LABEL_KEYS, EMPTY_ADVANCED_FILTERS, SYSTEM_MANAGED_STATUSES, IMMUTABLE_STATUSES, commonTransitions, ENTRY_BULK_STATUS_TARGETS, INVOICE_ENTRY_ROLES, INVOICE_IMPORT_ROLES, INVOICE_MANAGE_ROLES, selectableMatchingTotal } from '#lib/types/invoice.ts';
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
@@ -555,6 +555,25 @@
 		if (invoiceStore.loadMoreErrored) toast(m('invoices.toast.loadMoreFailed'), 'error');
 	}
 
+	/**
+	 * Open an invoice from its row, and record it as `?id=` through the single
+	 * writer — the same param a deep link arrives on — so a reload, a copied
+	 * address or a new tab opens the invoice the user was looking at. A row
+	 * open used to leave the URL as it was, so a reload dropped the modal and
+	 * there was no address to share for it.
+	 *
+	 * Only `deepLinkId` is set, never `deepLinkLoaded`: `replaceState` does not
+	 * move `page.url`, so the deep-link effect does not run for this write, and
+	 * leaving `deepLinkLoaded` alone keeps a later real navigation to this same
+	 * `?id=` (the notification bell) able to open it.
+	 */
+	function openInvoice(invoice: Invoice) {
+		editing = invoice;
+		deepLinkFailedId = null;
+		deepLinkId = invoice.id;
+		syncUrl();
+	}
+
 	function closeInvoiceModal() {
 		editing = null;
 		if (deepLinkId) {
@@ -661,6 +680,23 @@
 	let bulkRejectReason = $state('');
 	let bulkNeedsReason = $derived(bulkStatusValue === 'rejected');
 	let showBulkStatusSelect = $state(false);
+	let bulkStatusTrigger = $state<HTMLButtonElement | null>(null);
+	let bulkStatusSelect = $state<HTMLSelectElement | null>(null);
+
+	// The Change Status popover is a keyboard surface too: opening it moves
+	// focus to its picker (it renders above the bar, away from the trigger),
+	// and Escape closes it and hands focus back to the trigger. Before, it
+	// opened with focus left on the trigger and only an outside click closed
+	// it — a keyboard user had no way to dismiss it (WCAG 2.1.1, 2.4.3).
+	$effect(() => {
+		if (showBulkStatusSelect && bulkStatusSelect) bulkStatusSelect.focus();
+	});
+	function onBulkStatusKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		e.preventDefault();
+		showBulkStatusSelect = false;
+		bulkStatusTrigger?.focus();
+	}
 
 	// True once "Select all N matching" has resolved the WHOLE filtered set
 	// (not just the loaded page) into `selected` — see `selectAllMatching()`
@@ -694,6 +730,22 @@
 
 	let allSelected = $derived(
 		selectableInvoices.length > 0 && selectableInvoices.every((inv) => selected.has(inv.id))
+	);
+
+	// What "Select all N matching" would select: the filtered set minus its
+	// system-managed rows, which `GET /api/invoices/ids` excludes. The list's
+	// `total` counts those too, so offering it named a figure the action then
+	// fell short of, and with every row already loaded it still offered the
+	// button whenever one of them was system-managed — a click that selected
+	// nothing new. Falls back to `total` only while the tallies are missing.
+	let matchingSelectableTotal = $derived(
+		selectableMatchingTotal(invoiceStore.statusCounts, activeStatuses) ?? invoiceStore.total
+	);
+	let offerSelectAllMatching = $derived(
+		allSelected &&
+			!selectedAllMatching &&
+			invoiceStore.hasMore &&
+			matchingSelectableTotal > selectableInvoices.length
 	);
 
 	let selectedStatuses = $derived.by(() => {
@@ -1046,7 +1098,7 @@
 					aria-pressed={activeStatuses.includes(s)}
 					onclick={() => toggleStatus(s)}
 				>
-					{m(INVOICE_STATUS_LABEL_KEYS[s])} <span class="count">{statusCount(s)}</span>
+					{m(INVOICE_STATUS_LABEL_KEYS[s])} <span class="count">{formatCount(statusCount(s))}</span>
 				</button>
 			{/each}
 			<HelpTip term="workflow" />
@@ -1059,11 +1111,11 @@
 		onclear={() => { selected = new Set(); selectedAllMatching = false; }}
 	>
 		{#snippet lead()}
-			{#if allSelected && !selectedAllMatching && invoiceStore.total > selectableInvoices.length}
+			{#if offerSelectAllMatching}
 				<button type="button" class="btn-secondary bulk-select-all-matching" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total: invoiceStore.total })}
+						: m('common.selectAllMatching', { total: formatCount(matchingSelectableTotal) })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
@@ -1088,7 +1140,10 @@
 					<span class="bulk-btn-wrap" title={validBulkTransitions.length === 0 ? m('invoices.bulk.noTransitions') : ''}>
 						<button
 							class="btn-secondary"
+							bind:this={bulkStatusTrigger}
 							disabled={bulkBusy || validBulkTransitions.length === 0}
+							aria-expanded={showBulkStatusSelect && validBulkTransitions.length > 0}
+							aria-controls="invoices-bulk-status-popover"
 							onclick={(e) => { e.stopPropagation(); showBulkStatusSelect = !showBulkStatusSelect; }}
 						>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
@@ -1096,8 +1151,15 @@
 						</button>
 					</span>
 					{#if showBulkStatusSelect && validBulkTransitions.length > 0}
-						<div class="bulk-status-dropdown">
-							<select bind:value={bulkStatusValue} aria-label={m('invoices.bulk.newStatusAria')}>
+						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+						<div
+							class="bulk-status-dropdown"
+							id="invoices-bulk-status-popover"
+							role="group"
+							aria-label={m('invoices.bulk.changeStatus')}
+							onkeydown={onBulkStatusKeydown}
+						>
+							<select bind:this={bulkStatusSelect} bind:value={bulkStatusValue} aria-label={m('invoices.bulk.newStatusAria')}>
 								{#each validBulkTransitions as s}
 									<option value={s}>{m(INVOICE_STATUS_LABEL_KEYS[s])}</option>
 								{/each}
@@ -1199,17 +1261,17 @@
 					class="clickable"
 					class:row-selected={selected.has(invoice.id)}
 					onclick={(e) => {
-						if (isRowOpenClick(e)) editing = invoice;
+						if (isRowOpenClick(e)) openInvoice(invoice);
 					}}
 				>
-					<td class="checkbox-col" title={SYSTEM_MANAGED_STATUSES.has(invoice.status) ? m('invoices.systemManagedTitle', { status: m(INVOICE_STATUS_LABEL_KEYS[invoice.status]) }) : ''}><input type="checkbox" aria-label={`Select invoice ${invoice.invoice_number}`} checked={selected.has(invoice.id)} disabled={SYSTEM_MANAGED_STATUSES.has(invoice.status)} onchange={() => toggleSelect(invoice.id)} /></td>
+					<td class="checkbox-col" title={SYSTEM_MANAGED_STATUSES.has(invoice.status) ? m('invoices.systemManagedTitle', { status: m(INVOICE_STATUS_LABEL_KEYS[invoice.status]) }) : ''}><input type="checkbox" aria-label={invoice.invoice_number ? m('invoices.row.selectAria', { number: invoice.invoice_number }) : m('invoices.row.selectDraftAria')} checked={selected.has(invoice.id)} disabled={SYSTEM_MANAGED_STATUSES.has(invoice.status)} onchange={() => toggleSelect(invoice.id)} /></td>
 					<td class="mono" title={invoice.invoice_number || undefined}>
 						<!-- Flex, so a long number gives way and its warning icon keeps
 						     its place (#575): `RowLink` ellipsizes, the icon never shrinks. -->
 						<span class="num-cell">
 						<RowLink
-							onclick={() => (editing = invoice)}
-							ariaLabel={`Edit invoice ${invoice.invoice_number || 'draft'}`}
+							onclick={() => openInvoice(invoice)}
+							ariaLabel={invoice.invoice_number ? m('invoices.modal.dialogLabel', { number: invoice.invoice_number }) : m('invoices.row.editDraftAria')}
 						>
 							{invoice.invoice_number || '—'}
 						</RowLink>

@@ -192,6 +192,33 @@ export function commonTransitions(
 }
 
 /**
+ * How many invoices "Select all N matching" would actually select: the rows
+ * the list's filters match, minus the {@link SYSTEM_MANAGED_STATUSES} ones
+ * `GET /api/invoices/ids?exclude_status=…` leaves out (their checkboxes are
+ * disabled, so no bulk action can reach them).
+ *
+ * Tallied from `GET /api/invoices/counts`, which takes the list's population
+ * filters and ignores `status` — so an active status filter narrows the sum to
+ * its own statuses here. The list's `total` counts the system-managed rows
+ * too, so offering it ("Select all 30 matching") then selecting 25 was a count
+ * that disagreed with the action it named. `null` when the tallies are not
+ * loaded, so the caller can fall back rather than read a zero.
+ */
+export function selectableMatchingTotal(
+	counts: Record<string, number>,
+	activeStatuses: readonly InvoiceStatus[]
+): number | null {
+	const keys = Object.keys(counts);
+	if (keys.length === 0) return null;
+	const scope = activeStatuses.length > 0 ? activeStatuses : (keys as InvoiceStatus[]);
+	let n = 0;
+	for (const s of new Set(scope)) {
+		if (!SYSTEM_MANAGED_STATUSES.has(s)) n += counts[s] ?? 0;
+	}
+	return n;
+}
+
+/**
  * Who may ENTER an invoice — mirror of `backend/app/api/invoice_entry.py`.
  *
  * `INVOICE_ENTRY_ROLES` gates create, upload, the source-file controls, field

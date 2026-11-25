@@ -746,6 +746,9 @@ export const messages = {
 	'invoices.empty.fresh': 'Aucune facture pour le moment. Téléversez-en une, créez-en une manuellement, ou importez un CSV pour charger vos créances ouvertes.',
 	'invoices.row.delete': 'Supprimer',
 	'invoices.row.confirm': 'Confirmer',
+	'invoices.row.selectAria': 'Sélectionner la facture {number}',
+	'invoices.row.selectDraftAria': 'Sélectionner le brouillon de facture',
+	'invoices.row.editDraftAria': 'Modifier le brouillon de facture',
 	'invoices.loadMore': 'Charger plus ({shown} sur {total})',
 	'invoices.showingAll': '{total, plural, one {Affichage de la # facture} other {Affichage des # factures}}',
 

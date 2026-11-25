@@ -259,6 +259,19 @@ function literalCopyAttrs(source: string): string[] {
 			const name = typeof attr.name === 'string' ? attr.name : '';
 			if (!COPY_ATTRS.has(name)) continue;
 			const value = attr.value;
+			// `aria-label={`Select invoice ${n}`}`: a template literal is an
+			// expression, but its fixed parts are English all the same — the
+			// /invoices row checkbox and row link shipped that way past the
+			// quoted-attribute check above.
+			const expr = (value as Record<string, unknown> | undefined)?.expression as
+				| Record<string, unknown>
+				| undefined;
+			if (!Array.isArray(value) && expr?.type === 'TemplateLiteral') {
+				const quasis = (expr.quasis as { value: { cooked?: string } }[]) ?? [];
+				const fixed = quasis.map((q) => q.value.cooked ?? '').join('…');
+				if (IS_COPY.test(fixed)) out.push(`${name}={\`${fixed}\`}`);
+				continue;
+			}
 			if (!Array.isArray(value) || value.length !== 1) continue;
 			const only = value[0] as Record<string, unknown> | undefined;
 			if (!only || only.type !== 'Text') continue;
@@ -411,6 +424,13 @@ describe('translated surfaces carry no literal copy', () => {
 		expect(textNodes(sample)).toEqual(['Your privacy choices', 'Accept all']);
 		// `title={m(…)}` is an ExpressionTag, so only the bare literal is named.
 		expect(literalCopyAttrs(sample)).toEqual(['aria-label="Cookie and privacy consent"']);
+		// A template literal's fixed parts are copy too; one that only joins
+		// values (`${a} ${b}`) is not.
+		expect(
+			literalCopyAttrs(
+				'<input aria-label={`Select invoice ${n}`} /><span title={`${a} · ${b}`}></span>'
+			)
+		).toEqual(['aria-label={`Select invoice …`}']);
 	});
 
 	it('detects the shared components\' copy props, in the template and the script', () => {
