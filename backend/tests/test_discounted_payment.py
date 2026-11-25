@@ -22,6 +22,9 @@ here, against real Postgres rows and the real HTTP surface:
 * a discount taken through a credit memo that names the offer is not
   deducted a second time, while a return credit that merely equals the
   savings is an ordinary credit and suppresses nothing (decisions §520);
+* under a race, two creates linking one offer, or two offers on one invoice,
+  write exactly one linked memo (the invoice and offer row locks), and the
+  partial unique index's IntegrityError is the same coded 409, never a 500;
 * an offer that cannot be honoured (expired, other currency, base amount no
   longer the invoice's, vendor-scoped) pays the invoice in full.
 
@@ -30,13 +33,14 @@ Runs against the opt-in `realdb` fixture.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.models.credit_memo import CreditMemo
 from app.models.discount import DiscountOffer
@@ -551,6 +555,191 @@ async def test_a_memo_cannot_take_a_discount_it_is_not(realdb, variant):
             .all()
         )
     assert linked == []
+
+
+# --------------------------------------------------------------------------- #
+# The link under a race: one discount per offer, one per invoice
+# --------------------------------------------------------------------------- #
+
+
+async def _wait_for_lock_waiter(mk, *, timeout: float = 15.0) -> bool:
+    """True once Postgres reports another backend in this database waiting on
+    a lock (False after `timeout`). Asked of `pg_stat_activity` from an
+    independent session, the real signal rather than a sleep, as
+    `test_payment_concurrency` and `test_credit_memos` do."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        async with mk() as s:
+            waiting = (
+                await s.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND pid <> pg_backend_pid() "
+                        "AND wait_event_type = 'Lock'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def _live_linked_memos(mk, invoice_id: str) -> list[CreditMemo]:
+    async with mk() as s:
+        return list(
+            (
+                await s.execute(
+                    select(CreditMemo).where(
+                        CreditMemo.invoice_id == uuid.UUID(invoice_id),
+                        CreditMemo.discount_offer_id.is_not(None),
+                        CreditMemo.status != "void",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _race_linked_creates(realdb, vendor_id, invoice_id, first_offer, second_offer):
+    """Two `POST /api/credit-memos` linking a discount on one invoice, each on
+    its own connection (the harness engine is NullPool). The first is parked
+    inside its transaction, after its memo is flushed and its invoice and offer
+    rows are locked, while the second starts; the second must then be WAITING
+    ON A LOCK (a plain read would not wait) before the first is let commit.
+    Deterministic by construction: the order is fixed, never a timing guess."""
+    from app.api import credit_memos as credit_memos_api
+
+    mk = realdb.sessionmaker(TENANT)
+    real_dispatch = credit_memos_api.dispatch_audit
+    parked = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _gated_dispatch(db, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            parked.set()
+            await release.wait()
+        return await real_dispatch(db, **kwargs)
+
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        with patch.object(credit_memos_api, "dispatch_audit", _gated_dispatch):
+            first = asyncio.create_task(
+                _memo(c, vendor_id, invoice_id, "20.74", discount_offer_id=first_offer)
+            )
+            second = None
+            try:
+                await asyncio.wait_for(parked.wait(), timeout=15)
+                second = asyncio.create_task(
+                    _memo(c, vendor_id, invoice_id, "20.74", discount_offer_id=second_offer)
+                )
+                queued = await _wait_for_lock_waiter(mk)
+            finally:
+                # Never leave the first racer parked holding its row locks: the
+                # harness's per-test TRUNCATE would queue behind it forever.
+                release.set()
+                results = await asyncio.gather(*[t for t in (first, second) if t is not None])
+    assert queued, "the second create did not wait on the first one's row lock"
+    return results
+
+
+async def test_two_concurrent_memos_cannot_take_one_offer_twice(realdb):
+    """The §520 race on one offer: two creates naming the same offer, the
+    second arriving while the first holds its locks. Exactly one memo is
+    written; the other is the coded 409. Two would short-pay the supplier by
+    the discount twice."""
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, invoice_id = await _seed_invoice(mk, realdb.info(TENANT).org_id)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        offer_id = await _accepted_offer(c, invoice_id)
+
+    won, lost = await _race_linked_creates(realdb, vendor_id, invoice_id, offer_id, offer_id)
+
+    assert won.status_code == 201, won.text
+    assert lost.status_code == 409, lost.text
+    assert lost.json()["detail"]["code"] == "credit_memo_discount_offer_invalid"
+    linked = await _live_linked_memos(mk, invoice_id)
+    assert [str(m.id) for m in linked] == [won.json()["id"]]
+    assert linked[0].discount_offer_id == uuid.UUID(offer_id)
+    assert linked[0].amount == Decimal("20.74")
+
+
+async def test_two_offers_on_one_invoice_cannot_both_be_taken_concurrently(realdb):
+    """One invoice takes one discount: two creates naming two different
+    accepted offers on the same invoice, racing. The partial unique index is
+    per offer and cannot see this, so the invoice row lock is what serializes
+    them; the second re-reads and refuses."""
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, invoice_id = await _seed_invoice(mk, realdb.info(TENANT).org_id)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        first_offer = await _accepted_offer(c, invoice_id)
+        second_offer = await _accepted_offer(c, invoice_id)
+
+    won, lost = await _race_linked_creates(realdb, vendor_id, invoice_id, first_offer, second_offer)
+
+    assert won.status_code == 201, won.text
+    assert lost.status_code == 409, lost.text
+    assert lost.json()["detail"]["code"] == "credit_memo_discount_offer_invalid"
+    linked = await _live_linked_memos(mk, invoice_id)
+    assert [str(m.id) for m in linked] == [won.json()["id"]]
+    assert linked[0].discount_offer_id == uuid.UUID(first_offer)
+
+
+async def test_the_unique_index_backstop_answers_the_coded_409(realdb, monkeypatch):
+    """If the locks and the pre-check ever let a second linked memo through,
+    `uq_credit_memos_discount_offer_live` refuses the insert, and the route
+    answers it as the same coded 409, not a 500, with nothing of the second
+    memo written: no row, no `credit_memo.created` audit row."""
+    from app.api import credit_memos as credit_memos_api
+
+    mk = realdb.sessionmaker(TENANT)
+    vendor_id, invoice_id = await _seed_invoice(mk, realdb.info(TENANT).org_id)
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        offer_id = await _accepted_offer(c, invoice_id)
+        first = await _memo(c, vendor_id, invoice_id, "20.74", discount_offer_id=offer_id)
+        assert first.status_code == 201, first.text
+
+        async def _no_precheck(db, **kwargs):
+            return None
+
+        monkeypatch.setattr(credit_memos_api, "_assert_discount_offer_linkable", _no_precheck)
+        number = f"CM-{uuid.uuid4().hex[:6]}"
+        resp = await c.post(
+            "/api/credit-memos",
+            json={
+                "memo_number": number,
+                "vendor_id": vendor_id,
+                "amount": "20.74",
+                "invoice_id": invoice_id,
+                "discount_offer_id": offer_id,
+            },
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "credit_memo_discount_offer_invalid"
+    async with mk() as s:
+        memos = (
+            (
+                await s.execute(
+                    select(CreditMemo).where(CreditMemo.invoice_id == uuid.UUID(invoice_id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [str(m.id) for m in memos] == [first.json()["id"]]
+        created = (
+            (await s.execute(select(AuditLog).where(AuditLog.action == "credit_memo.created")))
+            .scalars()
+            .all()
+        )
+    assert [a.entity_id for a in created] == [uuid.UUID(first.json()["id"])]
+    assert number not in {a.details["memo_number"] for a in created}
 
 
 @pytest.mark.parametrize("variant", ["currency", "base", "vendor_scope", "no_tier"])
