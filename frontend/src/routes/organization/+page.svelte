@@ -19,7 +19,7 @@
 	} from '#lib/types/providerCredentials.ts';
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
 	import { normalizeCurrencyCode, currencyCodeProblem } from '#lib/utils/currencyCode.ts';
-	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
+	import { m } from '#lib/i18n/store.svelte.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
@@ -57,14 +57,17 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import CardsPanel from '#lib/components/organization/CardsPanel.svelte';
 	import SecurityPanel from '#lib/components/organization/SecurityPanel.svelte';
 	import PlanPanel from '#lib/components/organization/PlanPanel.svelte';
 	import DataSyncPanel from '#lib/components/organization/DataSyncPanel.svelte';
 	import GettingStartedPanel from '#lib/components/organization/GettingStartedPanel.svelte';
 	import InvoiceDefaultsPanel from '#lib/components/organization/InvoiceDefaultsPanel.svelte';
-	import type {
-		CompanyFields,
-		InvoiceDefaultsFields
+	import {
+		cardAutoProvider,
+		type CardsFields,
+		type CompanyFields,
+		type InvoiceDefaultsFields
 	} from '#lib/components/organization/panelState.ts';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
@@ -307,45 +310,20 @@
 	let extractionOllamaUrl = $state('http://localhost:11434');
 	let extractionOllamaModel = $state('llama3.2-vision:11b');
 	// Cards
-	let cardsEnabled = $state(false);
-	let cardsProgramType = $state('platform');
-	let cardsProvider = $state('');
-	let cardsRegion = $state('US');
-	let cardsApiKey = $state('');
-	let cardsClientId = $state('');
-	let cardsClientSecret = $state('');
-	let cardsCustomerHashId = $state('');
-	let cardsWalletHashId = $state('');
-	let cardsExpiryDays = $state(30);
-	let cardsSandbox = $state(true);
+	let cardsFields = $state<CardsFields>({
+		enabled: false,
+		programType: 'platform',
+		provider: '',
+		region: 'US',
+		apiKey: '',
+		clientId: '',
+		clientSecret: '',
+		customerHashId: '',
+		walletHashId: '',
+		expiryDays: 30,
+		sandbox: true
+	});
 	let savingCards = $state(false);
-	// `value` is the stored card-program region (the backend keeps `UK`, not
-	// ISO's `GB`); `iso` is what Intl names in the reader's language.
-	const CARD_REGIONS = [
-		{ value: 'US', iso: 'US', eu: false, default_provider: 'lithic' },
-		{ value: 'UK', iso: 'GB', eu: false, default_provider: 'lithic' },
-		{ value: 'DE', iso: 'DE', eu: true, default_provider: 'lithic' },
-		{ value: 'FR', iso: 'FR', eu: true, default_provider: 'lithic' },
-		{ value: 'NL', iso: 'NL', eu: true, default_provider: 'lithic' },
-		{ value: 'ZA', iso: 'ZA', eu: false, default_provider: 'nium' },
-		{ value: 'AU', iso: 'AU', eu: false, default_provider: 'nium' },
-		{ value: 'SG', iso: 'SG', eu: false, default_provider: 'nium' },
-		{ value: 'HK', iso: 'HK', eu: false, default_provider: 'nium' },
-		{ value: 'IN', iso: 'IN', eu: false, default_provider: 'nium' },
-		{ value: 'CA', iso: 'CA', eu: false, default_provider: 'nium' },
-		{ value: 'AE', iso: 'AE', eu: false, default_provider: 'nium' },
-		{ value: 'JP', iso: 'JP', eu: false, default_provider: 'nium' },
-	];
-	const regionNames = $derived(new Intl.DisplayNames([currentLocale()], { type: 'region' }));
-	function cardRegionLabel(r: (typeof CARD_REGIONS)[number]): string {
-		const country = regionNames.of(r.iso) ?? r.value;
-		return r.eu ? m('org.cards.regionEu', { country }) : country;
-	}
-
-	let autoProvider = $derived(
-		CARD_REGIONS.find(r => r.value === cardsRegion)?.default_provider ?? 'nium'
-	);
-	let effectiveProvider = $derived(cardsProvider || autoProvider);
 	// ── Read-only mode for non-admins ───────────────────────────────────
 	// Every mutating endpoint behind this page is `require_roles(ROLE_ADMIN)`
 	// — the server is and stays the authority. What was missing was any
@@ -600,20 +578,20 @@
 			// Cards
 			const cards = (data.settings as unknown as Record<string, unknown>).cards as Record<string, unknown> | undefined;
 			if (cards) {
-				cardsEnabled = (cards.enabled as boolean) ?? false;
-				cardsProgramType = (cards.program_type as string) || 'platform';
-				cardsProvider = (cards.provider as string) || '';
-				cardsRegion = (cards.region as string) || 'US';
-				cardsClientId = (cards.client_id as string) || '';
-				cardsCustomerHashId = (cards.customer_hash_id as string) || '';
-				cardsWalletHashId = (cards.wallet_hash_id as string) || '';
-				cardsExpiryDays = (cards.default_expiry_days as number) || 30;
+				cardsFields.enabled = (cards.enabled as boolean) ?? false;
+				cardsFields.programType = (cards.program_type as string) || 'platform';
+				cardsFields.provider = (cards.provider as string) || '';
+				cardsFields.region = (cards.region as string) || 'US';
+				cardsFields.clientId = (cards.client_id as string) || '';
+				cardsFields.customerHashId = (cards.customer_hash_id as string) || '';
+				cardsFields.walletHashId = (cards.wallet_hash_id as string) || '';
+				cardsFields.expiryDays = (cards.default_expiry_days as number) || 30;
 				// A stored block with no `sandbox` key runs LIVE: the card adapters
 				// read `config.get("sandbox", False)`. Showing it as testing made the
 				// next save silently move the block to sandbox (and, since §464,
 				// drop its keys). A block never configured keeps the declared
 				// default above.
-				cardsSandbox = typeof cards.sandbox === 'boolean' ? cards.sandbox : false;
+				cardsFields.sandbox = typeof cards.sandbox === 'boolean' ? cards.sandbox : false;
 			}
 			// Security (MFA enforcement)
 			const mfaCfg = (data.settings as unknown as Record<string, unknown>).mfa as
@@ -997,19 +975,22 @@
 		try {
 			await patchOrg({
 				cards: {
-					enabled: cardsEnabled,
-					program_type: cardsProgramType,
-					provider: cardsProvider || autoProvider,
-					region: cardsRegion,
-					client_id: cardsClientId,
-					customer_hash_id: cardsCustomerHashId,
-					wallet_hash_id: cardsWalletHashId,
-					default_expiry_days: cardsExpiryDays,
-					sandbox: cardsSandbox,
+					enabled: cardsFields.enabled,
+					program_type: cardsFields.programType,
+					provider: cardsFields.provider || cardAutoProvider(cardsFields.region),
+					region: cardsFields.region,
+					client_id: cardsFields.clientId,
+					customer_hash_id: cardsFields.customerHashId,
+					wallet_hash_id: cardsFields.walletHashId,
+					default_expiry_days: cardsFields.expiryDays,
+					sandbox: cardsFields.sandbox,
 				},
 			});
-			await saveSecrets('cards', { api_key: cardsApiKey, client_secret: cardsClientSecret });
-			cardsApiKey = cardsClientSecret = '';
+			await saveSecrets('cards', {
+				api_key: cardsFields.apiKey,
+				client_secret: cardsFields.clientSecret
+			});
+			cardsFields.apiKey = cardsFields.clientSecret = '';
 			toast(m('org.toast.sectionSaved', { section: m('org.section.cardsSaved') }), 'success');
 			unopenable.cards = false;
 		} catch (err) {
@@ -2911,127 +2892,16 @@
 				{/if}
 
 				{#if section === 'cards'}
-					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.cards')}</h2>
-							<HelpTip term="virtual-card" />
-						</div>
-						<p class="card-hint">{m('org.cards.hint')}</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="cards-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.cards.enabled')}</span>
-									<select bind:value={cardsEnabled}>
-										<option value={false}>{m('org.cards.disabled')}</option>
-										<option value={true}>{m('org.cards.enabledOn')}</option>
-									</select>
-								</label>
-								<label>
-									<span>{m('org.cards.program')}</span>
-									<select bind:value={cardsProgramType}>
-										<option value="platform">{m('org.cards.programPlatform')}</option>
-										<option value="byok">{m('org.cards.programByok')}</option>
-									</select>
-								</label>
-								<label>
-									<span>{m('org.cards.region')}</span>
-									<select bind:value={cardsRegion}>
-										{#each CARD_REGIONS as r (r.value)}
-											<option value={r.value}>{cardRegionLabel(r)}</option>
-										{/each}
-									</select>
-								</label>
-								<label>
-									<span>{m('org.cards.expiryDays')}</span>
-									<input type="number" min="1" max="90" bind:value={cardsExpiryDays} />
-								</label>
-							</div>
-
-							{#if cardsEnabled && cardsProgramType === 'platform'}
-								<p class="card-hint after-control">{m('org.cards.platformHint', { provider: autoProvider === 'lithic' ? 'Lithic' : 'Nium' })}</p>
-							{/if}
-
-							{#if cardsEnabled && cardsProgramType === 'byok'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.cards.provider')}</span>
-										<select bind:value={cardsProvider}>
-											<option value="">{m('org.cards.providerAuto', { provider: autoProvider === 'lithic' ? 'Lithic' : 'Nium' })}</option>
-											<option value="lithic">{m('org.cards.providerLithic')}</option>
-											<option value="nium">{m('org.cards.providerNium')}</option>
-										</select>
-									</label>
-								</div>
-
-								{#if effectiveProvider === 'lithic'}
-									<div class="form-grid">
-										<SecretField
-											id="cards-api-key"
-											label={m('org.cards.lithicApiKey')}
-											bind:value={cardsApiKey}
-											bind:clear={secretClear['cards.api_key']}
-											configured={isStored('cards', 'api_key')}
-											placeholder={'api-key-...'}
-											testId="cards-api-key"
-										/>
-										<label>
-											<span>{m('org.cards.sandboxMode')}</span>
-											<select bind:value={cardsSandbox}>
-												<option value={true}>{m('org.cards.sandboxTesting')}</option>
-												<option value={false}>{m('org.cards.production')}</option>
-											</select>
-										</label>
-									</div>
-								{:else if effectiveProvider === 'nium'}
-									<div class="form-grid">
-										<label>
-											<span>{m('org.cards.clientId')}</span>
-											<input type="text" bind:value={cardsClientId} />
-										</label>
-										<SecretField
-											id="cards-client-secret"
-											label={m('org.cards.clientSecret')}
-											bind:value={cardsClientSecret}
-											bind:clear={secretClear['cards.client_secret']}
-											configured={isStored('cards', 'client_secret')}
-											testId="cards-client-secret"
-										/>
-										<label>
-											<span>{m('org.cards.customerHashId')}</span>
-											<input type="text" bind:value={cardsCustomerHashId} />
-										</label>
-										<label>
-											<span>{m('org.cards.walletHashId')}</span>
-											<input type="text" bind:value={cardsWalletHashId} />
-										</label>
-										<label>
-											<span>{m('org.cards.sandboxMode')}</span>
-											<select bind:value={cardsSandbox}>
-												<option value={true}>{m('org.cards.sandboxTesting')}</option>
-												<option value={false}>{m('org.cards.production')}</option>
-											</select>
-										</label>
-									</div>
-								{/if}
-							{/if}
-
-							{#if unopenable.cards && auth.isAdmin}
-								<CredentialResetPrompt
-									block="cards"
-									oncleared={(status) => onCredentialsCleared('cards', status)}
-								/>
-							{/if}
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingCards} onclick={saveCards}>
-									{savingCards ? m('org.common.saving') : m('org.cards.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<CardsPanel
+						bind:fields={cardsFields}
+						bind:secretClear
+						{readOnly}
+						{isStored}
+						unopenable={unopenable.cards ?? false}
+						oncleared={(status) => onCredentialsCleared('cards', status)}
+						saving={savingCards}
+						onsave={saveCards}
+					/>
 				{/if}
 
 				{#if section === 'security'}
