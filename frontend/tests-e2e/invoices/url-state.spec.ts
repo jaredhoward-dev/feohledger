@@ -150,6 +150,31 @@ test.describe('/invoices URL state', () => {
 		await expect(page).toHaveURL(/sort=amount/);
 	});
 
+	test('opening an invoice from its row records ?id=, so a reload reopens it', async ({
+		page
+	}) => {
+		await page.goto('/invoices?sort=amount&order=asc');
+		const firstLink = page.locator('table tbody tr').first().locator('.row-link');
+		await expect(firstLink).toBeVisible();
+		await firstLink.click();
+
+		const modal = page.locator('div.modal[role="dialog"][aria-label*="Edit invoice"]');
+		await expect(modal).toBeVisible();
+		// A row open used to leave the address untouched: nothing to reload or share.
+		await expect(page).toHaveURL(/[?&]id=[0-9a-f-]{36}/);
+		await expect(page).toHaveURL(/sort=amount/);
+		const label = await modal.getAttribute('aria-label');
+
+		await page.reload();
+		await expect(modal).toBeVisible();
+		await expect(modal).toHaveAttribute('aria-label', label ?? '');
+
+		await modal.getByRole('button', { name: 'Close' }).click();
+		await expect(modal).toBeHidden();
+		await expect(page).not.toHaveURL(/[?&]id=/);
+		await expect(page).toHaveURL(/sort=amount/);
+	});
+
 	/**
 	 * A navigation that REUSES the mounted page must re-read the URL.
 	 *

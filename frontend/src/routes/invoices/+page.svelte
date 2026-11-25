@@ -555,6 +555,25 @@
 		if (invoiceStore.loadMoreErrored) toast(m('invoices.toast.loadMoreFailed'), 'error');
 	}
 
+	/**
+	 * Open an invoice from its row, and record it as `?id=` through the single
+	 * writer — the same param a deep link arrives on — so a reload, a copied
+	 * address or a new tab opens the invoice the user was looking at. A row
+	 * open used to leave the URL as it was, so a reload dropped the modal and
+	 * there was no address to share for it.
+	 *
+	 * Only `deepLinkId` is set, never `deepLinkLoaded`: `replaceState` does not
+	 * move `page.url`, so the deep-link effect does not run for this write, and
+	 * leaving `deepLinkLoaded` alone keeps a later real navigation to this same
+	 * `?id=` (the notification bell) able to open it.
+	 */
+	function openInvoice(invoice: Invoice) {
+		editing = invoice;
+		deepLinkFailedId = null;
+		deepLinkId = invoice.id;
+		syncUrl();
+	}
+
 	function closeInvoiceModal() {
 		editing = null;
 		if (deepLinkId) {
@@ -1242,7 +1261,7 @@
 					class="clickable"
 					class:row-selected={selected.has(invoice.id)}
 					onclick={(e) => {
-						if (isRowOpenClick(e)) editing = invoice;
+						if (isRowOpenClick(e)) openInvoice(invoice);
 					}}
 				>
 					<td class="checkbox-col" title={SYSTEM_MANAGED_STATUSES.has(invoice.status) ? m('invoices.systemManagedTitle', { status: m(INVOICE_STATUS_LABEL_KEYS[invoice.status]) }) : ''}><input type="checkbox" aria-label={invoice.invoice_number ? m('invoices.row.selectAria', { number: invoice.invoice_number }) : m('invoices.row.selectDraftAria')} checked={selected.has(invoice.id)} disabled={SYSTEM_MANAGED_STATUSES.has(invoice.status)} onchange={() => toggleSelect(invoice.id)} /></td>
@@ -1251,7 +1270,7 @@
 						     its place (#575): `RowLink` ellipsizes, the icon never shrinks. -->
 						<span class="num-cell">
 						<RowLink
-							onclick={() => (editing = invoice)}
+							onclick={() => openInvoice(invoice)}
 							ariaLabel={invoice.invoice_number ? m('invoices.modal.dialogLabel', { number: invoice.invoice_number }) : m('invoices.row.editDraftAria')}
 						>
 							{invoice.invoice_number || '—'}
