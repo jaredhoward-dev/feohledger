@@ -77,7 +77,14 @@ const NETSUITE_ERP_CONFIG = {
 	bill_payment_bank_account: '6200'
 };
 const OPTED_IN = { ...NETSUITE_ERP_CONFIG, netsuite_status_sync: 'on' };
-const VENDOR = 'Fake NetSuite Vendor A';
+// Not netsuite.spec.ts's vendor (Vendor A). This spec leaves its bills
+// approved or beyond, so they are the vendor's history for the stat-anomaly
+// fraud rule: on Vendor A they set a mean of a few hundred, that spec's 2450.75
+// bills read as outliers with an open `fraud_flag`, and the ERP-export gate
+// (§286) refused their push 409 `exception_blocks_erp_export`. Each spec keeps
+// to its own vendor, as the QuickBooks and Xero status-sync specs keep to
+// their own figures.
+const VENDOR = 'Fake NetSuite Vendor B';
 
 /** The fake checks a TBA header's shape, not its signature: enough to read
  *  and delete a record the way a person in NetSuite would. */
