@@ -176,8 +176,20 @@ test.describe('/contracts — bulk Change status follows the selected rows’ ve
 	test('offers only the actions some selected row allows, and counts the skips', async ({
 		page
 	}) => {
+		// BulkBar's one live region is mounted, empty, before any selection,
+		// so the first selection's text lands in an existing region (4.1.3).
+		const status = page.getByTestId('bulk-bar-status');
+		await expect(status).toHaveAttribute('role', 'status');
+		await expect(status).toHaveText('');
 		await select(page, 'CT-V-0011');
+		await expect(status).toHaveText('1 selected');
 		await select(page, 'CT-V-0012');
+		// The skip note is spoken by that region, after the count — and only
+		// there: the visible copy in the bar carries no live role.
+		await expect(status).toHaveText(
+			'2 selected 1 selected contract can’t take this action and will be skipped.'
+		);
+		await expect(page.locator('[role="status"]', { hasText: 'will be skipped' })).toHaveCount(1);
 
 		const action = page.getByTestId('contracts-bulk-action');
 		await expect(action.locator('option')).toHaveText(['Activate', 'Cancel Contract']);
@@ -227,7 +239,7 @@ test.describe('/contracts — bulk skip count after "select all N matching"', ()
 		await expect(note).toHaveText(
 			'At least 1 selected contract can’t take this action and will be skipped.'
 		);
-		// The same live region throughout — it is never re-created.
+		// The described-by target survives the switch — it is never re-created.
 		await expect(page.getByTestId('contracts-bulk-action')).toHaveAttribute(
 			'aria-describedby',
 			'contracts-bulk-skip-note'

@@ -132,6 +132,16 @@
 	const bulkSkipUnknown = $derived(
 		effectiveBulkAction ? bulkTallies[effectiveBulkAction].unknown : 0
 	);
+	// Shown in the bar and spoken by BulkBar's live region after the count.
+	const bulkNote = $derived(
+		!effectiveBulkAction
+			? m('contracts.bulk.noTransitions')
+			: bulkSkipCount > 0
+				? m(bulkSkipUnknown > 0 ? 'contracts.bulk.willSkipAtLeast' : 'contracts.bulk.willSkip', {
+						skipped: bulkSkipCount
+					})
+				: ''
+	);
 
 	$effect(() => {
 		if (selectedAllMatching) return;
@@ -581,7 +591,7 @@
 	/>
 
 	{#if canManage}
-		<BulkBar count={selected.size} onclear={clearSelection}>
+		<BulkBar count={selected.size} onclear={clearSelection} note={bulkNote}>
 			{#snippet actions()}
 				{#if allSelected && !selectedAllMatching && contractStore.total > contractStore.all.length}
 					<button class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
@@ -608,13 +618,12 @@
 					</select>
 					<button class="btn-primary" disabled={bulkBusy} onclick={bulkStatusChange}>{m('contracts.bulk.changeStatus')}</button>
 				{/if}
-				<!-- ONE live region, rendered for as long as the bar is, whose
-				     text changes: a `role="status"` node created at the moment
-				     its message appears is often not announced. Empty, it is
-				     visually collapsed but stays in the accessibility tree. The
-				     skip count is a minimum ("at least") while some selected ids
-				     are beyond the loaded pages — their verdicts are unknown. -->
-				<span id="contracts-bulk-skip-note" class="bulk-skip-note" role="status" data-testid="contracts-bulk-skip-note">{#if !effectiveBulkAction}<span data-testid="contracts-bulk-no-action">{m('contracts.bulk.noTransitions')}</span>{:else if bulkSkipCount > 0}{m(bulkSkipUnknown > 0 ? 'contracts.bulk.willSkipAtLeast' : 'contracts.bulk.willSkip', { skipped: bulkSkipCount })}{/if}</span>
+				<!-- Visible copy only: BulkBar's own live region announces this note
+				     with the count, so this span carries no live role (two regions
+				     would read it twice). The skip count is a minimum ("at least")
+				     while some selected ids are beyond the loaded pages — their
+				     verdicts are unknown. -->
+				<span id="contracts-bulk-skip-note" class="bulk-skip-note" data-testid="contracts-bulk-skip-note">{#if !effectiveBulkAction}<span data-testid="contracts-bulk-no-action">{bulkNote}</span>{:else}{bulkNote}{/if}</span>
 				<div class="bulk-divider"></div>
 				<button class="btn-secondary" disabled={bulkBusy} onclick={bulkExport}>{m('contracts.bulk.exportCsv')}</button>
 			{/snippet}
@@ -673,16 +682,9 @@
 		font-size: 0.8rem;
 		color: var(--text-muted);
 	}
-	/* The live region is always present; while it says nothing it takes no
-	   room, but stays in the accessibility tree (no `display: none`) so the
-	   text it later gains is announced. */
+	/* Nothing to say, no room taken. */
 	.bulk-skip-note:empty {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		overflow: hidden;
-		clip-path: inset(50%);
-		white-space: nowrap;
+		display: none;
 	}
 	.bulk-all-matching-note {
 		font-size: 0.82rem;

@@ -6,6 +6,7 @@
 		count,
 		onclear,
 		countLabel,
+		note,
 		lead,
 		actions
 	}: {
@@ -15,6 +16,11 @@
 		 *  whose noun takes a gender, as `invoices.bulk.selected` does).
 		 *  Defaults to `common.nSelected`. */
 		countLabel?: string;
+		/** A sentence the bar's live region speaks after the count — a note
+		 *  the page also shows in the bar (the /contracts "will be skipped"
+		 *  count). Plain text: the page keeps its own visible copy, without a
+		 *  live role, so the note is announced once, here. */
+		note?: string;
 		/** Rendered between the count and Clear: the "select all N matching"
 		 *  affordance, or the note that says it is in force. */
 		lead?: Snippet;
@@ -43,6 +49,15 @@
 		};
 	});
 </script>
+
+<!-- The bar's ONE live region, mounted from first paint whatever the
+     selection: the bar below only exists once a row is selected, and a
+     `role="status"` node inserted together with its text is often not
+     announced — so the first selection was silent. This one is already in
+     the accessibility tree, empty, when its text arrives. -->
+<span class="visually-hidden" role="status" data-testid="bulk-bar-status"
+	>{#if count > 0}{countLabel ?? m('common.nSelected', { n: count })}{#if note}{' '}{note}{/if}{/if}</span
+>
 
 {#if count > 0}
 	<div
