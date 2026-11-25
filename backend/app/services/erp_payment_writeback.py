@@ -335,6 +335,18 @@ async def write_back_payment(
                 )
                 if credit.success and credit.bill_balance_after is not None:
                     balance_after = credit.bill_balance_after
+                # A credit that may stand in the ERP (created, its application
+                # failed or unconfirmed) is recorded so the sweep applies THAT
+                # one and nobody books a second (decisions §577).
+                credit_pending = not credit.success and not credit.not_posted
+                await _set_pending_credit(
+                    db,
+                    invoice.id,
+                    payment.id,
+                    _credit_marker(credit_payload, credit.erp_document_id)
+                    if credit_pending
+                    else None,
+                )
             if balance_after is not None and balance_after > 0:
                 await open_erp_reconciliation_exception(
                     db,
@@ -371,6 +383,17 @@ async def write_back_payment(
                                 )
                             }
                             if credit is not None and not credit.success
+                            else {}
+                        ),
+                        # The credit may already be in the ERP: name it, and
+                        # say a retry will apply it — booking another by hand
+                        # would take the discount twice (§577).
+                        **(
+                            {
+                                "discount_credit_pending": True,
+                                "discount_credit_document_id": credit.erp_document_id,
+                            }
+                            if credit is not None and not credit.success and not credit.not_posted
                             else {}
                         ),
                     ),
@@ -526,6 +549,177 @@ async def write_back_settled_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -
 PENDING_VOIDS_KEY = "erp_payment_voids_pending"
 
 
+#: ``WorkflowInstance.state_data`` key: payment id → a discount credit that may
+#: stand in the ERP unapplied (its create succeeded or is unknown, its
+#: application did not), with what the retry needs to apply it: the credit's
+#: ERP id when known, and the payload's PII-free fields (decisions §577). The
+#: status-sync sweep (:func:`resume_pending_credits`) finishes it.
+PENDING_CREDITS_KEY = "erp_discount_credits_pending"
+
+#: ``WorkflowInstance.state_data`` key: payment id → the ERP id of our discount
+#: credit, recorded BEFORE a void deletes anything, so a void that removed the
+#: credit's application but not the credit can find it on retry (§577).
+PENDING_VOID_CREDITS_KEY = "erp_discount_credit_voids_pending"
+
+
+def _credit_marker(payload: DiscountCreditPayload, credit_id: str | None) -> dict:
+    return {
+        "credit_id": str(credit_id) if credit_id else None,
+        "bill_id": payload.bill_id,
+        "amount": str(payload.amount),
+        "currency": payload.currency,
+        "credit_on": payload.credit_on.isoformat(),
+        "discount_account_erp_id": payload.discount_account_erp_id,
+        "pay_from_account_erp_id": payload.pay_from_account_erp_id,
+        "card": bool(payload.card),
+    }
+
+
+def _payload_from_marker(payment_id: str, marker: dict) -> DiscountCreditPayload:
+    from datetime import date
+
+    return DiscountCreditPayload(
+        payment_id=str(payment_id),
+        bill_id=str(marker["bill_id"]),
+        amount=Decimal(str(marker["amount"])),
+        currency=str(marker["currency"]),
+        credit_on=date.fromisoformat(str(marker["credit_on"])),
+        discount_account_erp_id=marker.get("discount_account_erp_id"),
+        pay_from_account_erp_id=marker.get("pay_from_account_erp_id"),
+        card=bool(marker.get("card")),
+        credit_id=marker.get("credit_id"),
+    )
+
+
+async def _set_map_entry(
+    db: AsyncSession, invoice_id: uuid.UUID, key: str, payment_id: uuid.UUID, value
+) -> None:
+    """Set (or, with ``value`` None, drop) ``state_data[key][payment_id]``
+    under the instance's row lock. Never commits."""
+    from sqlalchemy import select
+
+    from app.models.workflow import WorkflowInstance
+
+    instance = (
+        await db.execute(
+            select(WorkflowInstance)
+            .where(WorkflowInstance.invoice_id == invoice_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if instance is None:
+        return
+    state = dict(instance.state_data or {})
+    entries = dict(state.get(key) or {})
+    if value is None:
+        if str(payment_id) not in entries:
+            return
+        entries.pop(str(payment_id), None)
+    else:
+        entries[str(payment_id)] = value
+    if entries:
+        state[key] = entries
+    else:
+        state.pop(key, None)
+    instance.state_data = state
+
+
+async def _set_pending_credit(
+    db: AsyncSession, invoice_id: uuid.UUID, payment_id: uuid.UUID, marker: dict | None
+) -> None:
+    await _set_map_entry(db, invoice_id, PENDING_CREDITS_KEY, payment_id, marker)
+
+
+async def resume_pending_credits(org) -> int:
+    """Apply every discount credit a write-back left standing unapplied
+    (decisions §577), through the adapter's own path with the recorded credit
+    id. Called per org by the status-sync sweep. Returns how many are still
+    pending afterwards. A payment no longer ``completed`` is left to its void,
+    which reverses the credit; a credit someone deleted in the ERP is dropped
+    with an audited failure, never re-created."""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.database import get_tenant_engine
+    from app.models.workflow import WorkflowInstance
+    from app.services.erp_adapters.base import BILL_PAYMENT_VOIDED
+
+    found = await _org_adapter(org.id)
+    if found is None:
+        return 0
+    _org, _erp_config, adapter = found
+    if getattr(adapter, "supports_discount_credit", False) is not True:
+        return 0
+    factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
+    left = 0
+    async with factory() as db:
+        rows = (
+            await db.execute(
+                select(WorkflowInstance.invoice_id, WorkflowInstance.state_data).where(
+                    WorkflowInstance.state_data.has_key(PENDING_CREDITS_KEY)
+                )
+            )
+        ).all()
+        await db.rollback()
+        for invoice_id, state in rows:
+            for payment_id, marker in dict((state or {}).get(PENDING_CREDITS_KEY) or {}).items():
+                status = (
+                    await db.execute(
+                        select(Payment.status).where(Payment.id == uuid.UUID(payment_id))
+                    )
+                ).scalar_one_or_none()
+                await db.rollback()
+                if status != "completed":
+                    continue  # its void reverses the credit (by this id)
+                payload = _payload_from_marker(payment_id, marker)
+                try:
+                    credit = await adapter.post_discount_credit(payload)
+                except Exception as exc:  # noqa: BLE001 — an adapter bug is a failed retry
+                    credit = ErpPostResult(
+                        success=False, message=f"discount credit error: {exc.__class__.__name__}"
+                    )
+                invoice = await db.get(Invoice, invoice_id)
+                refusal = _refusal(credit)
+                gone = credit.refusal_code == BILL_PAYMENT_VOIDED
+                if credit.success or gone:
+                    await _set_pending_credit(db, invoice_id, uuid.UUID(payment_id), None)
+                elif credit.erp_document_id and credit.erp_document_id != marker.get("credit_id"):
+                    await _set_pending_credit(
+                        db,
+                        invoice_id,
+                        uuid.UUID(payment_id),
+                        {**marker, "credit_id": credit.erp_document_id},
+                    )
+                if invoice is not None:
+                    await dispatch_audit(
+                        db,
+                        correlation_id=invoice.correlation_id or invoice.id,
+                        organization_id=invoice.organization_id,
+                        actor_id=None,
+                        action=(
+                            "payment.erp_discount_credit_posted"
+                            if credit.success
+                            else "payment.erp_discount_credit_failed"
+                        ),
+                        entity_type="payment",
+                        entity_id=uuid.UUID(payment_id),
+                        details={
+                            "erp_type": adapter.erp_type,
+                            "bill_id": payload.bill_id,
+                            "erp_document_id": credit.erp_document_id or payload.credit_id,
+                            "discount_amount": str(payload.amount),
+                            "currency": payload.currency,
+                            "retry": True,
+                            **({} if credit.success else {"error": credit.message}),
+                            **({"refusal": refusal} if refusal else {}),
+                        },
+                    )
+                await db.commit()
+                if not (credit.success or gone):
+                    left += 1
+    return left
+
+
 async def record_pending_erp_void(db: AsyncSession, *, invoice: Invoice, payment: Payment) -> bool:
     """In ``POST /api/payments/{id}/void``'s transaction: note that this
     payment's write-back (if any) must be voided in the ERP. Only a FeohLedger
@@ -626,6 +820,14 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
             correlation = invoice.correlation_id or payment.correlation_id or invoice.id
             invoice_id = invoice.id
             run_id = payment.payment_run_id
+            # What an earlier attempt recorded of our discount credit (§577):
+            # the id a previous void stored before deleting anything, or the
+            # one an unapplied credit's write-back stored.
+            known_credit = ((state or {}).get(PENDING_VOID_CREDITS_KEY) or {}).get(
+                str(payment_id)
+            ) or (((state or {}).get(PENDING_CREDITS_KEY) or {}).get(str(payment_id)) or {}).get(
+                "credit_id"
+            )
             # Nothing held across the ERP call. A rollback expires the loaded
             # rows, so what is needed after it was read above.
             await db.rollback()
@@ -633,16 +835,36 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
             # it may have been booked while it was on. A failure stops here,
             # the marker stays, and the retry starts from the credit again.
             credit = None
+            credit_id = known_credit
             if getattr(adapter, "supports_discount_credit", False) is True:
-                credit = await adapter.void_discount_credit(
-                    DiscountCreditPayload(
-                        payment_id=str(payment_id),
-                        bill_id=bill_id,
-                        amount=Decimal(0),
-                        currency=payload.currency,
-                        credit_on=payload.paid_on,
-                    )
+                credit_payload = DiscountCreditPayload(
+                    payment_id=str(payment_id),
+                    bill_id=bill_id,
+                    amount=Decimal(0),
+                    currency=payload.currency,
+                    credit_on=payload.paid_on,
+                    credit_id=known_credit,
                 )
+                try:
+                    if credit_id is None:
+                        credit_id = await adapter.find_discount_credit(credit_payload)
+                except Exception as exc:  # noqa: BLE001 — unreadable: stop, retry later
+                    credit = ErpPostResult(
+                        success=False,
+                        message=f"discount credit lookup failed: {exc.__class__.__name__}",
+                    )
+                if credit is None:
+                    if credit_id and credit_id != known_credit:
+                        # Recorded BEFORE anything is deleted: once the
+                        # application goes, the bill no longer leads to it.
+                        await _set_map_entry(
+                            db, invoice_id, PENDING_VOID_CREDITS_KEY, payment_id, str(credit_id)
+                        )
+                        await db.commit()
+                    credit_payload.credit_id = credit_id
+                    credit = await adapter.void_discount_credit(credit_payload)
+                    if not credit.success and not credit.erp_document_id:
+                        credit.erp_document_id = credit_id
             if credit is not None and not credit.success:
                 result = credit
             else:
@@ -692,6 +914,8 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
             )
             if result.success:
                 await _clear_pending(db, invoice_id, payment_id)
+                await _set_map_entry(db, invoice_id, PENDING_VOID_CREDITS_KEY, payment_id, None)
+                await _set_pending_credit(db, invoice_id, payment_id, None)
             else:
                 await open_erp_reconciliation_exception(
                     db,
@@ -707,6 +931,16 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                         failure=refusal["code"] if refusal else "erp_void_failed",
                         refusal=refusal,
                         retryable=result.retryable,
+                        # Our credit, when the reversal stopped on it: with
+                        # its application deleted, only this id leads to it.
+                        **(
+                            {
+                                "document": "discount_credit",
+                                "discount_credit_document_id": credit.erp_document_id,
+                            }
+                            if credit is not None and result is credit
+                            else {}
+                        ),
                     ),
                 )
             await db.commit()

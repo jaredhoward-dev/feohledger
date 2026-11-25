@@ -623,12 +623,45 @@ the credit. QuickBooks' `bill_report` counts our discount application as ours
 `paid_only_by_us`; Xero's existing rule (a credit no larger than the discount
 our own payment took, beside our write-back) already reads it as ours.
 
-Shapes were taken from the providers' API references on 2026-11-25
-(<https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/vendorcredit>,
-<https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/billpayment>,
-<https://developer.xero.com/documentation/api/accounting/creditnotes>) and are
-exercised against `tools/fake-erp` and the adapter doubles only, not yet a real
-company; a read-back that is not what we wrote fails closed
+What was checked against a primary source, on 2026-11-25 (decisions §577; the
+two vendors' doc sites render client-side and could not be fetched, so their
+published schemas were read instead):
+
+- **Confirmed.** QuickBooks field names, from Intuit's entity schema
+  (`Finance.xsd` in
+  <https://github.com/intuit/QuickBooks-V3-Java-SDK>, commit 865ec279):
+  VendorCredit's VendorRef / TxnDate / PrivateNote / CurrencyRef / Line with
+  `AccountBasedExpenseLineDetail.AccountRef`, BillPayment's PayType /
+  CheckPayment / CreditCardPayment / TotalAmt / Line[].LinkedTxn, and
+  `VendorCredit` as a LinkedTxn type. Xero, from its OpenAPI spec
+  (<https://github.com/XeroAPI/Xero-OpenAPI/blob/master/xero_accounting.yaml>,
+  v20.1.0): `PUT CreditNotes` with Type `ACCPAYCREDIT`, line `AccountID`,
+  `Reference` ACCRECCREDIT-only, the `Idempotency-Key` header,
+  `PUT CreditNotes/{id}/Allocations`,
+  `DELETE CreditNotes/{id}/Allocations/{AllocationID}`, and `VOIDED` through
+  `POST CreditNotes/{id}`.
+- **Not confirmed (fail closed until a real company proves them).** QuickBooks
+  applying a credit by a TotalAmt-0 BillPayment linking the Bill and the
+  VendorCredit; `requestid` replaying a `vendorcredit` create; the
+  `vendorcredit?operation=delete` route. Xero keeping a supplied
+  `CreditNoteNumber` on an ACCPAYCREDIT, filtering `where` on it, and refusing
+  to void an allocated credit note.
+
+**A credit that may stand unapplied is recorded, not re-booked** (decisions
+§577). A credit failure that may have written leaves
+`state_data.erp_discount_credits_pending[<payment id>]` (the credit's ERP id
+when known, and the payload's ids and amount); the balance-open flag's
+`erp_report` then carries `discount_credit_pending: true` and
+`discount_credit_document_id`, meaning a retry will apply it and nobody should
+book another. The status-sync sweep (`resume_pending_credits`, after
+`resume_pending_voids`) re-posts with `credit_id`, and QuickBooks applies that
+credit by id rather than relying on `requestid` replay. A void records our
+credit's id in `state_data.erp_discount_credit_voids_pending` before deleting
+anything, so a retry after the application was deleted still deletes the
+credit; the void-failed flag names it as `discount_credit_document_id`.
+
+The code is exercised against `tools/fake-erp` and the adapter doubles only,
+not yet a real company; a read-back that is not what we wrote fails closed
 (`vendor_credit_unconfirmed` / `credit_note_unconfirmed`).
 
 ### Xero status sync-back and payment write-back

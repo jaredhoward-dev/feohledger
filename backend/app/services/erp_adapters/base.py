@@ -646,6 +646,11 @@ class DiscountCreditPayload:
     #: names a pay-from account: the payment's own (``PaymentPayload``).
     pay_from_account_erp_id: str | None = None
     card: bool = False
+    #: Our credit document already in the ERP, when an earlier attempt created
+    #: it (a create that stood while its application failed, decisions §577):
+    #: the retry applies THIS one, and a void deletes it by id when nothing on
+    #: the bill leads to it any more. None = none known.
+    credit_id: str | None = None
 
 
 @dataclass
@@ -1187,6 +1192,12 @@ class ErpAdapter:
         """Reverse the credit :meth:`post_discount_credit` booked. Success when
         nothing of ours is there. Default: nothing was ever booked."""
         return ErpPostResult(success=True, message="No discount credit to reverse")
+
+    async def find_discount_credit(self, payload: DiscountCreditPayload) -> str | None:
+        """The ERP id of our live credit for ``payload.payment_id``, or None.
+        Read before a void so the id is recorded before anything is deleted
+        (decisions §577). Raises when the ERP cannot be read. Default: none."""
+        return None
 
     async def bill_report(self, bill_id: str) -> ErpBillReport:
         """Where ``bill_id`` stands now. ``deleted`` only on the ERP's positive

@@ -56,6 +56,8 @@ export const messages = {
 	'refusal.erpLookupFailed': "現在ERPを検索できなかったため、どちらとも判断できません。もう一度お試しください。",
 	'refusal.paymentBlocksRecall': "FeohLedgerはすでにこの請求書を支払い中です（有効な支払いがあります）。承認を取り消す前に、支払いランを取り消すか、支払いを無効にしてください。",
 	'refusal.cardBlocksRecall': "この請求書の支払いにバーチャルカードが発行されています。承認を取り消す前に、カードを取り消してください。",
+	'refusal.paymentBlocksDelete': "FeohLedgerはすでにこの請求書を支払い中です（有効な支払いがあります）。請求書を削除する前に、支払いランを取り消すか、支払いを無効にしてください。",
+	'refusal.cardBlocksDelete': "この請求書の支払いにバーチャルカードが発行されています。請求書を削除する前に、カードを取り消してください。",
 	'refusal.paymentRunSegregation': "職務分掌: この支払いランを作成したユーザーは、承認または実行することはできません。別のユーザーが行う必要があります。",
 	'refusal.paymentRunAwaitingCfo': "このランは組織のCFO承認しきい値を超えているため、CFOロールを持つユーザーの承認を待っています。",
 	'refusal.paymentCfoRequired': "この支払いは組織のCFO承認しきい値を超えています。CFO承認のために支払いランで登録するか、CFOに作成を依頼してください。",

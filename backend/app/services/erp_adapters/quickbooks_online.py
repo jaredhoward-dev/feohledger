@@ -1251,17 +1251,23 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
 
     # -- early-payment discount as a vendor credit (decisions §575) ---------
     #
-    # Shapes, from Intuit's API reference (read 2026-11-25):
-    # * VendorCredit — https://developer.intuit.com/app/developer/qbo/docs/api/
-    #   accounting/all-entities/vendorcredit : VendorRef, Line[] of
-    #   AccountBasedExpenseLineDetail{AccountRef}, Amount, DetailType,
-    #   TxnDate, PrivateNote, CurrencyRef; delete = POST
-    #   vendorcredit?operation=delete {Id, SyncToken}.
-    # * BillPayment — https://developer.intuit.com/app/developer/qbo/docs/api/
-    #   accounting/all-entities/billpayment : a credit is applied to a bill by
-    #   a BillPayment whose Line[] links the Bill and the VendorCredit
-    #   (LinkedTxn TxnType "VendorCredit"), TotalAmt 0; delete = POST
-    #   billpayment?operation=delete {Id, SyncToken}.
+    # Shapes (decisions §577 records what was checked, and how). Confirmed on
+    # 2026-11-25 against Intuit's own entity schema, ``Finance.xsd`` in
+    # https://github.com/intuit/QuickBooks-V3-Java-SDK (branch develop, commit
+    # 865ec279; developer.intuit.com renders client-side and could not be
+    # fetched): VendorCredit extends PurchaseByVendor (VendorRef) and
+    # Transaction (TxnDate, PrivateNote, CurrencyRef, Line[]); its lines take
+    # AccountBasedExpenseLineDetail{AccountRef}; BillPayment carries VendorRef,
+    # PayType, CheckPayment{BankAccountRef} / CreditCardPayment{CCAccountRef},
+    # TotalAmt and Line[] with LinkedTxn, whose TxnType enum includes "Bill"
+    # and "VendorCredit".
+    # NOT confirmed from a primary page (keep fail-closed): that a TotalAmt-0
+    # BillPayment whose Line[] links the Bill and the VendorCredit is how the
+    # API applies a credit; that ``requestid`` replays a ``vendorcredit``
+    # create (Intuit documents it for creates generally); and the delete
+    # route, POST <entity>?operation=delete {Id, SyncToken}, for vendorcredit.
+    # Our credit is never queried by PrivateNote: it is found through the
+    # bill's LinkedTxn BillPayments and their marker.
     # What the code reads back is checked, and anything else fails closed: a
     # created record with no Id is "unconfirmed", never "booked".
 
@@ -1322,6 +1328,21 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 return refused
             vendor = {"value": str((bill.get("VendorRef") or {}).get("value"))}
             note = _discount_note(payload.payment_id)
+            if payload.credit_id:
+                # An earlier attempt created our credit and its application
+                # failed (decisions §577): apply THAT one, read by id, rather
+                # than lean on ``requestid`` replaying its create.
+                known = await self._our_vendor_credit(payload.credit_id, payload.payment_id)
+                if known is None:
+                    # Deleted, or no longer ours, in QuickBooks: someone
+                    # decided about it there; never book over that.
+                    refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
+                    refused.refusal_params = {"document": "discount_credit"}
+                    refused.erp_document_id = payload.credit_id
+                    return refused
+                return await self._apply_discount_credit(
+                    payload, bill, vendor, note, bill_currency, str(payload.credit_id)
+                )
             credit_body = {
                 "VendorRef": vendor,
                 "TxnDate": payload.credit_on.isoformat(),
@@ -1354,6 +1375,46 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 return ErpPostResult(
                     success=False, message=f"{PROVIDER} post failed: vendor_credit_unconfirmed"
                 )
+            return await self._apply_discount_credit(
+                payload, bill, vendor, note, bill_currency, str(credit_id)
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except QboRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+
+    async def _our_vendor_credit(self, credit_id: str, payment_id: str) -> dict | None:
+        """Our VendorCredit ``credit_id`` while it still carries our marker for
+        ``payment_id``; None when QuickBooks says it is gone or it is not ours.
+        Raises on any other answer."""
+        got = await self._request("GET", f"vendorcredit/{credit_id}", timeout=15)
+        if got.status_code == 200:
+            credit = _json(got).get("VendorCredit") or {}
+            if isinstance(credit, dict) and _discount_marker(credit) == str(payment_id).lower():
+                return credit
+            return None
+        if _object_not_found(got):
+            return None
+        raise QboRequestError(got.status_code)
+
+    async def _apply_discount_credit(
+        self,
+        payload: DiscountCreditPayload,
+        bill: dict,
+        vendor: dict,
+        note: str,
+        bill_currency: str,
+        credit_id: str,
+    ) -> ErpPostResult:
+        """Apply our VendorCredit ``credit_id`` to the bill with a $0
+        BillPayment. Every failure names the credit (``erp_document_id``): it
+        stands in QuickBooks unapplied, and the write-back records it so the
+        retry applies it and no one books a second (decisions §577)."""
+        try:
             account = {"value": str(payload.pay_from_account_erp_id)}
             apply_body: dict[str, Any] = {
                 "VendorRef": vendor,
@@ -1385,29 +1446,33 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 body=apply_body,
             )
             if resp.status_code != 200:
-                # The credit stands unapplied; a retry replays its create
-                # (same requestid) and applies it.
-                return self._payment_refusal(resp)
-            applied = _json(resp).get("BillPayment") or {}
-            if not isinstance(applied, dict) or applied.get("Id") is None:
-                return ErpPostResult(
+                # The credit stands unapplied; the write-back records its id
+                # and the retry applies it (decisions §577).
+                failed = self._payment_refusal(resp)
+            else:
+                applied = _json(resp).get("BillPayment") or {}
+                if isinstance(applied, dict) and applied.get("Id") is not None:
+                    after = await self._live_bill(str(bill.get("Id")))
+                    return ErpPostResult(
+                        success=True,
+                        erp_document_id=credit_id,
+                        message="Discount booked as a vendor credit in QuickBooks Online",
+                        bill_balance_after=_dec(after.get("Balance")) if after else None,
+                    )
+                failed = ErpPostResult(
                     success=False, message=f"{PROVIDER} post failed: vendor_credit_unconfirmed"
                 )
-            after = await self._live_bill(str(bill.get("Id")))
-            return ErpPostResult(
-                success=True,
-                erp_document_id=str(credit_id),
-                message="Discount booked as a vendor credit in QuickBooks Online",
-                bill_balance_after=_dec(after.get("Balance")) if after else None,
-            )
         except erp_oauth.ErpTokenRefreshError as exc:
-            return ErpPostResult(success=False, message=str(exc))
+            failed = ErpPostResult(success=False, message=str(exc))
         except erp_oauth.ErpNotConnectedError:
-            return erp_refusal(PROVIDER, NOT_CONNECTED)
+            failed = erp_refusal(PROVIDER, NOT_CONNECTED)
         except QboRequestError as exc:
-            return erp_http_failure(PROVIDER, exc.status_code)
+            failed = erp_http_failure(PROVIDER, exc.status_code)
         except httpx.HTTPError:
-            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+            failed = ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+        failed.erp_document_id = credit_id
+        failed.not_posted = False
+        return failed
 
     async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
         """Delete our credit's applying BillPayment, then the VendorCredit it
@@ -1419,40 +1484,46 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
         the application gone, the bill no longer leads to it."""
         try:
             bill = await self._live_bill(payload.bill_id) if payload.bill_id else None
-            if bill is None:
-                return ErpPostResult(success=True, message="No bill in QuickBooks Online")
-            record = await self._our_discount_credit(bill, payload.payment_id)
-            if record is None:
-                return ErpPostResult(success=True, message="No discount credit of ours")
-            credit_id = _credit_id(record)
-            resp = await self._request(
-                "POST",
-                "billpayment",
-                params={"operation": "delete"},
-                body={"Id": str(record.get("Id")), "SyncToken": str(record.get("SyncToken", "0"))},
-            )
-            if resp.status_code != 200:
-                return self._payment_refusal(resp)
+            record = await self._our_discount_credit(bill, payload.payment_id) if bill else None
+            if record is not None:
+                credit_id = _credit_id(record) or payload.credit_id
+                resp = await self._request(
+                    "POST",
+                    "billpayment",
+                    params={"operation": "delete"},
+                    body={
+                        "Id": str(record.get("Id")),
+                        "SyncToken": str(record.get("SyncToken", "0")),
+                    },
+                )
+                if resp.status_code != 200:
+                    refused = self._payment_refusal(resp)
+                    refused.erp_document_id = credit_id
+                    return refused
+            else:
+                # Nothing on the bill leads to a credit of ours any more — but
+                # an unapplied one, or one whose application an earlier void
+                # deleted before its own delete failed, is found by the id the
+                # write-back recorded (decisions §577).
+                credit_id = payload.credit_id
+                if not credit_id:
+                    return ErpPostResult(success=True, message="No discount credit of ours")
             if credit_id:
-                got = await self._request("GET", f"vendorcredit/{credit_id}", timeout=15)
-                if got.status_code == 200:
-                    credit = _json(got).get("VendorCredit") or {}
-                    if _discount_marker(credit) == str(payload.payment_id).lower():
-                        resp = await self._request(
-                            "POST",
-                            "vendorcredit",
-                            params={"operation": "delete"},
-                            body={
-                                "Id": str(credit_id),
-                                "SyncToken": str(credit.get("SyncToken", "0")),
-                            },
-                        )
-                        if resp.status_code != 200:
-                            refused = self._payment_refusal(resp)
-                            refused.erp_document_id = credit_id
-                            return refused
-                elif not _object_not_found(got):
-                    raise QboRequestError(got.status_code)
+                credit = await self._our_vendor_credit(str(credit_id), payload.payment_id)
+                if credit is not None:
+                    resp = await self._request(
+                        "POST",
+                        "vendorcredit",
+                        params={"operation": "delete"},
+                        body={
+                            "Id": str(credit_id),
+                            "SyncToken": str(credit.get("SyncToken", "0")),
+                        },
+                    )
+                    if resp.status_code != 200:
+                        refused = self._payment_refusal(resp)
+                        refused.erp_document_id = credit_id
+                        return refused
             return ErpPostResult(
                 success=True,
                 erp_document_id=credit_id,
@@ -1466,6 +1537,12 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
             return erp_http_failure(PROVIDER, exc.status_code)
         except httpx.HTTPError:
             return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
+
+    async def find_discount_credit(self, payload: DiscountCreditPayload) -> str | None:
+        """The VendorCredit our $0 BillPayment applies to the bill, if any."""
+        bill = await self._live_bill(payload.bill_id) if payload.bill_id else None
+        record = await self._our_discount_credit(bill, payload.payment_id) if bill else None
+        return _credit_id(record) if record is not None else None
 
     # -- reads -------------------------------------------------------------
 

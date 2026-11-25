@@ -56,6 +56,8 @@ export const messages = {
 	'refusal.erpLookupFailed': "No se pudo buscar en el ERP en este momento, así que no se sabe nada. Inténtelo de nuevo.",
 	'refusal.paymentBlocksRecall': "FeohLedger ya está pagando esta factura: tiene un pago activo. Cancele su lote de pagos o anule el pago antes de retirar la aprobación.",
 	'refusal.cardBlocksRecall': "Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de retirar la aprobación.",
+	'refusal.paymentBlocksDelete': "FeohLedger ya está pagando esta factura: tiene un pago activo. Cancele su lote de pagos o anule el pago antes de eliminar la factura.",
+	'refusal.cardBlocksDelete': "Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de eliminar la factura.",
 	'refusal.paymentRunSegregation': "Segregación de funciones: el usuario que creó esta remesa de pagos no puede también aprobarla ni ejecutarla. Debe hacerlo otro usuario.",
 	'refusal.paymentRunAwaitingCfo': "Esta remesa supera el umbral de aprobación del CFO de la organización y espera la aprobación de un usuario con el rol de CFO.",
 	'refusal.paymentCfoRequired': "Este pago supera el umbral de aprobación del CFO de su organización. Regístrelo mediante una remesa de pagos para que lo apruebe el CFO, o pida a un CFO que lo cree.",

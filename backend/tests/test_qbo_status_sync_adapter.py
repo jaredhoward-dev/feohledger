@@ -73,6 +73,12 @@ class _Qbo:
         self.next_id = 900
         self.vendor_credits: dict[str, dict] = {}
         self.fail_apply = False
+        self.fail_credit_delete = False
+        #: Whether a repeated ``requestid`` on a vendorcredit create replays the
+        #: first answer. Intuit documents replay for creates generally, not
+        #: for vendorcredit or for how long (decisions §577), so the retry
+        #: must not depend on it.
+        self.replay_credit_create = True
 
     def bill(self, bill_id="501", total="100.00", balance=None, note=f"FeohLedger {CORR}", **kw):
         self.bills[bill_id] = {
@@ -169,10 +175,12 @@ class _Qbo:
             return _resp(200, {"VendorCredit": record}) if record else _gone()
         body = json.loads(content, parse_float=Decimal)
         if (params or {}).get("operation") == "delete":
+            if self.fail_credit_delete:
+                return _resp(500, {"Fault": {"Error": [{"code": "6000"}]}})
             self.vendor_credits.pop(body["Id"])
             return _resp(200, {"VendorCredit": {"Id": body["Id"], "status": "Deleted"}})
         rid = (params or {}).get("requestid")
-        if rid in self.replays:
+        if self.replay_credit_create and rid in self.replays:
             return _resp(200, self.replays[rid])
         vid = f"vc-{len(self.vendor_credits) + 1}"
         self.vendor_credits[vid] = {**body, "Id": vid, "SyncToken": "0"}
@@ -987,14 +995,67 @@ def test_a_replay_of_the_discount_credit_books_nothing_twice():
 
 
 def test_a_credit_created_but_not_applied_is_applied_once_on_retry():
+    """The failed apply names the credit; the write-back records it and the
+    retry applies THAT credit by id. Intuit's ``requestid`` replay is not
+    relied on: the double here creates a fresh credit for a repeated key
+    (decisions §577)."""
     qbo = _Qbo()
+    qbo.replay_credit_create = False
     bill = _discounted(qbo)
     qbo.fail_apply = True
-    assert not _run(qbo, lambda: _adapter().post_discount_credit(_credit())).success
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not failed.success and not failed.not_posted
+    assert failed.erp_document_id == "vc-1"
     qbo.fail_apply = False
-    retried = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    retried = _run(
+        qbo, lambda: _adapter().post_discount_credit(_credit(credit_id=failed.erp_document_id))
+    )
     assert retried.success and retried.erp_document_id == "vc-1"
-    assert len(qbo.vendor_credits) == 1 and bill["Balance"] == 0
+    assert len(qbo.vendor_credits) == 1 and len(_bodies(qbo, "vendorcredit")) == 1
+    assert bill["Balance"] == 0
+
+
+def test_a_recorded_credit_someone_deleted_is_not_booked_again():
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    qbo.fail_apply = False
+    qbo.vendor_credits.clear()
+    retried = _run(qbo, lambda: _adapter().post_discount_credit(_credit(credit_id="vc-1")))
+    assert not retried.success and retried.refusal_code == BILL_PAYMENT_VOIDED
+    assert retried.refusal_params == {"document": "discount_credit"}
+    assert failed.erp_document_id == "vc-1" and len(_bodies(qbo, "vendorcredit")) == 1
+
+
+def test_a_void_that_deleted_the_application_but_not_the_credit_finishes_by_id():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    credit_id = _run(qbo, lambda: _adapter().find_discount_credit(_credit()))
+    assert credit_id == "vc-1"
+    qbo.fail_credit_delete = True
+    first = _run(qbo, lambda: _adapter().void_discount_credit(_credit(credit_id=credit_id)))
+    assert not first.success and first.erp_document_id == "vc-1"
+    # The application is gone, so the bill no longer leads to the credit…
+    assert _run(qbo, lambda: _adapter().find_discount_credit(_credit())) is None
+    assert "vc-1" in qbo.vendor_credits and bill["Balance"] == Decimal("2.00")
+    qbo.fail_credit_delete = False
+    # …and without the recorded id the retry would report success over it.
+    retried = _run(qbo, lambda: _adapter().void_discount_credit(_credit(credit_id=credit_id)))
+    assert retried.success and retried.erp_document_id == "vc-1"
+    assert qbo.vendor_credits == {}
+
+
+def test_an_unapplied_credit_is_deleted_by_its_recorded_id_on_void():
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    voided = _run(
+        qbo, lambda: _adapter().void_discount_credit(_credit(credit_id=failed.erp_document_id))
+    )
+    assert voided.success and qbo.vendor_credits == {}
 
 
 def test_voiding_deletes_the_application_and_the_credit_once():

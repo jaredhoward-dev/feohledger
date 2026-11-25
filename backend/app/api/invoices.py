@@ -111,11 +111,11 @@ from app.services.applied_credit_integrity import refuse_edit_stranding_applied_
 from app.services.audit_access import build_field_diff
 from app.services.audit_dispatch import dispatch_audit
 from app.services.csv_import import MAX_CSV_IMPORT_SIZE, import_invoices_csv
+from app.services.erp_export_gate import live_claims
 from app.services.gl_chart import refuse_gl_codes_outside_chart
 from app.services.gl_recode import RecodeFilter, bulk_recode_gl
 from app.services.invoice_warnings import reconcile_line_totals, refresh_warnings
 from app.services.open_ap_due import overdue_invoice_ids
-from app.services.payment_runs import live_payment_invoices
 from app.services.report_export import csv_safe_cell
 from app.services.storage import (
     invoice_file_display_name,
@@ -2439,15 +2439,29 @@ async def reopen_invoice_chat(
     return await _chat_thread_response(db, invoice)
 
 
-#: An `approved` invoice is not in `IMMUTABLE_STATUSES`, yet it can already sit
-#: in a payment run with a live `Payment` — one exported to the bank as a NACHA
-#: file, say. Deleting it cascades that payment away while the bank still pays
-#: it, so the ledger stops matching the money that moved. Its payment has to be
-#: cancelled or voided first, which is the audited way out of a run.
-LIVE_PAYMENT_DELETE_REFUSAL = (
-    "This invoice has a payment in a payment run. Cancel or void that payment "
-    "before deleting the invoice."
-)
+#: An `approved` invoice is not in `IMMUTABLE_STATUSES`, yet one of our rails
+#: can already be paying it: a live `Payment` in a run (exported to the bank as
+#: a NACHA file, say), or a live virtual card — bearer-spendable for the face
+#: amount, or already charged. Deleting the invoice cascaded either away while
+#: the money still moved, so the ledger stopped matching it (decisions §577).
+#: The claim has to be cancelled or voided first, which is the audited way out.
+#: "Live" is the rails' own predicate, read by `erp_export_gate.live_claims`, as
+#: the recall, close and ERP-push doors read it.
+INVOICE_DELETE_CLAIMED = "invoice_delete_claimed"
+_DELETE_CLAIM_MESSAGES = {
+    "payment": (
+        "FeohLedger is already paying this invoice: it has a live payment. Cancel its "
+        "payment run or void the payment before deleting the invoice."
+    ),
+    "virtual_card": (
+        "A virtual card has been issued to pay this invoice. Cancel the card before "
+        "deleting the invoice."
+    ),
+}
+
+
+def _delete_claim_refusal(claim: str) -> dict:
+    return coded_refusal(INVOICE_DELETE_CLAIMED, _DELETE_CLAIM_MESSAGES[claim], claim=claim)
 
 
 @router.delete("/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -2458,14 +2472,16 @@ async def delete_invoice(
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
-    # Row-locked: the status and live-payment reads below decide a hard delete,
+    # Row-locked: the status and live-claim reads below decide a hard delete,
     # and the lock is what serialises them against a payment run inserting a
-    # payment for this invoice (the FK takes a share lock on this row).
+    # payment for this invoice (the FK takes a share lock on this row) and the
+    # card mint, which locks the invoice row too.
     invoice = await get_invoice_for_update(db, invoice_id)
     if invoice.status in IMMUTABLE_STATUSES:
         raise HTTPException(status_code=409, detail="Cannot delete invoice in this status")
-    if await live_payment_invoices(db, [invoice.id]):
-        raise HTTPException(status_code=409, detail=LIVE_PAYMENT_DELETE_REFUSAL)
+    claim = (await live_claims(db, [invoice.id])).get(invoice.id)
+    if claim is not None:
+        raise HTTPException(status_code=409, detail=_delete_claim_refusal(claim))
     # Audit BEFORE the cascade: afterwards there is no row left to describe.
     # `_delete_invoice_cascade` deliberately does not touch `audit_log`, so this
     # row (and the invoice's whole prior trail) survives the delete — which is
@@ -2658,8 +2674,8 @@ async def bulk_delete(
     ids = body.ids
     # The same treatment `bulk/status` has: scoped to the selected entity like
     # the single-invoice DELETE, and row-locked in id order so the status and
-    # live-payment reads below cannot come from a row a concurrent approval is
-    # changing or a payment run is inserting a payment for. Without the scope,
+    # live-claim reads below cannot come from a row a concurrent approval is
+    # changing or a payment run (or card mint) is claiming. Without the scope,
     # another subsidiary's invoice could be deleted by id from a view that
     # never showed it.
     result = await db.execute(
@@ -2674,9 +2690,9 @@ async def bulk_delete(
     # reported as skipped rather than silently dropped from the count.
     found = {inv.id for inv in invoices}
     skipped: list[str] = [str(i) for i in ids if i not in found]
-    in_a_run = await live_payment_invoices(db, found)
+    claimed = await live_claims(db, found)
     for inv in invoices:
-        if inv.status in IMMUTABLE_STATUSES or inv.id in in_a_run:
+        if inv.status in IMMUTABLE_STATUSES or inv.id in claimed:
             skipped.append(str(inv.id))
         else:
             await _audit_invoice_deleted(db, inv, actor_id=user.id, bulk=True)
