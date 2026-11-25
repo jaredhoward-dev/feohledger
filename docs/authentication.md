@@ -342,7 +342,7 @@ included, is a `422` coded `legal_acceptance_required`.
 Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
 trail (`{versions, source, ip}`).
 
-**The re-prompt: the web and mobile apps ask; not yet the supplier portal or a server gate.**
+**The re-prompt: the web and mobile apps ask; the supplier portal asks only at set-password; there is no server-side gate.**
 `GET /api/auth/me` returns `legal_acceptance_required` (the user has not
 accepted the versions in force) and `POST /api/auth/legal-acceptance` records
 it (source `reprompt`; 10/min per account; audited only on a first
@@ -360,12 +360,15 @@ own route. So on the web every signed-in employee is asked: existing users,
 SSO / SCIM users, anyone after a version bump, a forgot-password reset of a
 password account.
 
-Still **not prompted or gated**: supplier-portal users and API
-callers, because the flag stays advisory server-side — no gate refuses an
-unaccepted user, and a web user who never opens the web app is never asked.
-The server gate waits for the portal screen on purpose: without
-them it would lock those users out with no way to accept. Order:
-`docs/followups.md`.
+Still **not gated**: the flag is advisory server-side. No gate refuses an
+unaccepted user, so an API caller is never asked, and neither is a user who
+opens neither the web nor the mobile app. Supplier-portal users are asked for
+the Privacy Policy only when they redeem a set-password link (below): a portal
+user who set a password before that, or any portal user after a Privacy Policy
+bump, is not re-prompted, because the portal has no re-prompt after sign-in
+yet. The server gate waits for that portal screen on purpose: without it, a
+gate would lock those users out with no way to accept (the re-prompt entry in
+`docs/followups.md`).
 
 **The mobile app asks** (decisions §498). When `/me` says
 `legal_acceptance_required` (after sign-in, on session restore, or on app
@@ -386,8 +389,12 @@ fixture), and `tests-e2e`'s `createUserWithKnownPassword` does the same for an
 account a spec creates (`acceptLegal: false` opts out), so neither the demo
 logins nor the e2e suite meet the step. After a version bump, re-run the seed.
 
-The rows survive a DSAR erasure and a workspace deletion (evidence of the
-contract; no foreign keys), and the DSAR export carries them.
+The employee rows (control-plane `legal_acceptances`) survive a DSAR erasure
+and a workspace deletion (evidence of the contract; no foreign keys), and the
+DSAR export carries them. They are not anonymous after erasure: the row keeps
+the user id, and the `auth.legal.accepted` audit row keeps `actor_id` and the
+client IP (`backend/docs/privacy.md` § Audit trail). The supplier-portal rows
+are tenant data and follow their own rules, below.
 
 **Supplier-portal users acknowledge the Privacy Policy only** (decisions
 §499). A Supplier User is not a party to our Terms — `/legal/terms` §2 says "a
@@ -406,8 +413,28 @@ each one writes `portal.legal.accepted` `{versions, source, ip}` to the
 tenant's auth trail. A forgot-password reset of a portal account that already
 has a password is not held up, and portal users who set a password before
 this are not asked (no portal re-prompt yet, `docs/followups.md`). The rows
-are kept through a DSAR erasure of the vendor user and carried by its export;
-a workspace deletion drops them with the tenant database.
+are kept through a DSAR erasure of the vendor user and carried by its export
+(with the `portal.legal.accepted` audit row and its IP, which the erasure
+leaves in place); a workspace deletion drops them with the tenant database.
+
+Two edges of the set-password acknowledgement, documented rather than
+changed:
+
+- **Its audit row is best-effort, after the commit.** The acknowledgement row
+  is written in the redemption's transaction, but `portal.legal.accepted` is
+  dispatched after `commit()`, through the same helper as
+  `portal.password.changed` (`api/portal_auth._audit_portal_mfa_event`). So,
+  exactly like the password-set row, it is **skipped** for a legacy vendor
+  user with no `organization_id` (there is no tenant to route the row to), and
+  a dispatch failure is swallowed rather than failing a password the supplier
+  was told is set. For such an account the `vendor_user_legal_acceptances` row
+  is the only record.
+- **The unauthenticated check discloses the flag only to a link holder.**
+  `POST /api/portal/auth/reset-password/check` answers
+  `legal_acceptance_required` only for a token that is valid on that tenant;
+  every other token gets the same opaque 400 as the reset itself. So the flag
+  (whether the account has a password yet) reaches only someone holding a live
+  set-password link for that account, which already lets them set it.
 
 ### Protected routes
 

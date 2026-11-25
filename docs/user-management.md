@@ -152,15 +152,18 @@ set_password_email_failed` and no account is created; with no tenant base URL to
 point a link at, the invite is a `503 set_password_link_unavailable` before
 anything is created (`backend/app/api/set_password_links.py`).
 
-**Existing users are asked on the web; mobile and API callers are not yet.**
+**Existing users are asked on the web and on mobile; API callers are not, and nothing gates.**
 Signup and a set-password link take acceptance as part of the form. Everyone
 else — users who existed before §495, SSO / SCIM-provisioned users (they never
 redeem a set-password link), users after a version bump — is reported by
 `GET /api/auth/me` (`legal_acceptance_required`) and, on signing in to the web
-app, meets a blocking accept step before any page (decisions §497). Mobile
-users and API callers are not yet prompted, and no server-side gate refuses an
-unaccepted user, so the flag is enforced only by the web screen
-(`docs/authentication.md` § Terms and Privacy acceptance, `docs/followups.md`).
+app, meets a blocking accept step before any page (decisions §497); the
+mobile app shows the same blocking step after sign-in, on session restore and
+on resume (§498). Supplier-portal users acknowledge the Privacy Policy only,
+and only when they redeem a set-password link (§499). API callers are not
+prompted, and no server-side gate refuses an unaccepted user, so the flag is
+enforced only by the web and mobile screens (`docs/authentication.md` § Terms
+and Privacy acceptance, `docs/followups.md`).
 
 ### An address can belong to only one workspace
 
@@ -330,7 +333,7 @@ Granular permissions / segregation of duties.
 |---|---|---|
 | GET | `/api/auth/me` | Get current user info |
 | PATCH | `/api/auth/me` | Update own name or password |
-| POST | `/api/auth/legal-acceptance` | Accept the Terms / Privacy versions in force (`/me`'s `legal_acceptance_required`). Backend only: no screen calls it yet |
+| POST | `/api/auth/legal-acceptance` | Accept the Terms / Privacy versions in force (`/me`'s `legal_acceptance_required`). Called by the web app's accept step and the mobile app's accept screen (decisions §497, §498) |
 | GET | `/api/auth/sessions` | List your own live sessions (device / IP / method, current one marked) |
 | DELETE | `/api/auth/sessions/:jti` | End one of your own sessions |
 | POST | `/api/auth/sessions/revoke-others` | Sign out everywhere except the current session |
