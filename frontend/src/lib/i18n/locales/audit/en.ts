@@ -219,6 +219,8 @@ export const enAudit = {
 	'audit.action.organization.erp_token_revoked': "ERP token revoked",
 	'audit.action.organization.exception_agent_autonomy_updated': "Exception-agent autonomy changed",
 	'audit.action.organization.fraud_rule_updated': "Fraud check switched",
+	'audit.action.organization.match_rule_updated': "PO match rule changed",
+	'audit.action.organization.match_rule_removed': "PO match rule removed",
 	'audit.action.organization.provider_config_updated': "Provider settings updated",
 	'audit.action.organization.residency_updated': "Data residency updated",
 	'audit.action.organization.scim_token_minted': "SCIM token issued",

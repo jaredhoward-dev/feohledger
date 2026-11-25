@@ -58,6 +58,7 @@
 	import CommerceConnectionPanel from '#lib/components/organization/CommerceConnectionPanel.svelte';
 	import CloseWorkspacePanel from '#lib/components/organization/CloseWorkspacePanel.svelte';
 	import LineTotalCheckPanel from '#lib/components/organization/LineTotalCheckPanel.svelte';
+	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
@@ -434,7 +435,9 @@
 				// The rail's own short label: the panel heading is "Payments (ACH /
 				// Wire / RTP)", which does not sit in a 200px column.
 				{ slug: 'payments', labelKey: 'org.rail.payments' },
-				{ slug: 'cards', labelKey: 'org.section.cards' }
+				{ slug: 'cards', labelKey: 'org.section.cards' },
+				// Its own audited writer (decisions §512).
+				{ slug: 'match-rules', labelKey: 'org.section.matchRules' }
 			]
 		},
 		{
@@ -3638,6 +3641,10 @@
 							<span class="plan-date">{m('org.plan.created', { date: formatDate(org.created_at, '—', { month: 'long', day: 'numeric', year: 'numeric' }) })}</span>
 						</div>
 					</section>
+				{/if}
+
+				{#if section === 'match-rules'}
+					<MatchRulesPanel {readOnly} {userLoaded} />
 				{/if}
 
 				{#if section === 'line-total-check'}

@@ -1798,3 +1798,34 @@ describe('/draft-run with nothing stageable in the run currency', () => {
 		expect(codedRefusalText('draft_run_no_run_currency', params, enT)).toBeNull();
 	});
 });
+
+describe('PO match rule refusals (decisions §512)', () => {
+	it('states the server range through the percent formatter', () => {
+		expect(codedRefusalText('match_tolerance_out_of_range', { min: '0', max: '100' }, enT)).toBe(
+			'The tolerance must be between 0% and 100%.'
+		);
+		setActiveFormatLocale('de');
+		// German puts a (narrow) no-break space before the sign.
+		const de = codedRefusalText('match_tolerance_out_of_range', { min: '0', max: '100' }, deT);
+		expect(de?.replace(/[\u00a0\u202f]/g, ' ')).toBe(
+			'Die Toleranz muss zwischen 0 % und 100 % liegen.'
+		);
+	});
+
+	it('falls back to the server sentence on malformed params', () => {
+		expect(codedRefusalText('match_tolerance_out_of_range', { min: 0 }, enT)).toBeNull();
+		expect(codedRefusalText('match_tolerance_too_precise', { places: '2' }, enT)).toBeNull();
+	});
+
+	it('names the precision and the fixed sentences', () => {
+		expect(codedRefusalText('match_tolerance_too_precise', { places: 2 }, enT)).toBe(
+			'The tolerance can have at most 2 decimal places.'
+		);
+		expect(localizeApiDetail(detail('match_rule_empty'), enT)).toBe(
+			'Set a tolerance, an inspection requirement, or both.'
+		);
+		expect(localizeApiDetail(detail('match_rule_gl_account_not_found'), enT)).toBe(
+			'That GL account is not in the chart of accounts.'
+		);
+	});
+});
