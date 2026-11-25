@@ -20,6 +20,12 @@ ACCEPT_CURRENT = {
     "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
 }
 
+#: What the supplier-portal set-password page sends when its required box is
+#: ticked: a portal account with no password yet must acknowledge the Privacy
+#: Policy version in force — and only that; suppliers are not asked to accept
+#: the Terms (decisions §499).
+ACK_PRIVACY = {"accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"]}
+
 _LINK = re.compile(r"https?://\S+/(?:login|portal)/reset-password\?\S+")
 
 

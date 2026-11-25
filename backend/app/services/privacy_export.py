@@ -89,6 +89,7 @@ from app.models.supplier_chat import SupplierChatMessage, SupplierChatThread
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.models.vendor_user import VendorUser
+from app.models.vendor_user_legal_acceptance import VendorUserLegalAcceptance
 from app.models.virtual_card import VirtualCard
 from app.models.webauthn_credential import WebAuthnCredential
 from app.models.workflow import AuditLog
@@ -644,6 +645,18 @@ async def _plan_vendor_user(
     if vu is None:
         raise SubjectNotFound("vendor_user not found")
 
+    acknowledgements = (
+        (
+            await tenant_db.execute(
+                select(VendorUserLegalAcceptance)
+                .where(VendorUserLegalAcceptance.vendor_user_id == subject_id)
+                .order_by(VendorUserLegalAcceptance.accepted_at, VendorUserLegalAcceptance.document)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     documents = await collect_subject_documents(
         subject_type=SUBJECT_VENDOR_USER,
         subject_id=subject_id,
@@ -664,6 +677,18 @@ async def _plan_vendor_user(
             "notification_prefs": vu.notification_prefs,
             "created_at": _jsonable(vu.created_at),
         },
+        # Which version of our Privacy Policy the supplier acknowledged, when,
+        # and through which control (decisions §499) — the same section name
+        # as the employee's Terms / Privacy acceptances, so it is counted.
+        "legal_acceptances": [
+            {
+                "document": a.document,
+                "version": a.version,
+                "accepted_at": _jsonable(a.accepted_at),
+                "source": a.source,
+            }
+            for a in acknowledgements
+        ],
     }
     sections = [
         _Section(

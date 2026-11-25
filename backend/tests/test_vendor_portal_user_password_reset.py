@@ -24,7 +24,13 @@ from sqlalchemy import select
 
 from app.models.vendor_user import VendorUser
 from app.models.workflow import AuditLog
-from tests.set_password_mail import capture_outbox, link_mode, link_token, set_password_link
+from tests.set_password_mail import (
+    ACK_PRIVACY,
+    capture_outbox,
+    link_mode,
+    link_token,
+    set_password_link,
+)
 from tests.test_session_management import FakeRedis
 
 TENANT = "a"
@@ -77,8 +83,12 @@ async def _invite_portal_user(client, vendor_id: str, email: str) -> dict:
 
 
 async def _set_password(anon_client, token: str, password: str):
+    """Redeem as the page does once its Privacy Policy box is ticked (§499) —
+    an invited account has no password yet, so the acknowledgement is required.
+    The refusal without it is `test_portal_legal_acceptance.py`'s."""
     return await anon_client.post(
-        "/api/portal/auth/reset-password", json={"token": token, "new_password": password}
+        "/api/portal/auth/reset-password",
+        json={"token": token, "new_password": password, **ACK_PRIVACY},
     )
 
 
