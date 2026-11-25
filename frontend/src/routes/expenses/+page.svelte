@@ -58,6 +58,7 @@
 		approveReport,
 		rejectReport,
 		listCardTransactions,
+		getCardTransactionCounts,
 		importCardCsv,
 		syncVirtualCards,
 		cardMatchSuggestions,
@@ -1138,24 +1139,24 @@
 		...RECONCILIATION_STATUSES.map((s) => ({ key: s, label: reconStatusLabel(s) }))
 	]);
 
-	// The KPI row counts the WHOLE card feed, from the server's own `total` for
-	// each reconciliation status, not the loaded page. `null` until the counts
-	// land (or if they fail): `KpiCard` draws its dash, never a zero nobody
-	// counted. Three `page_size=1` reads until a counts endpoint exists
-	// (docs/followups.md).
+	// The KPI row counts the WHOLE card feed — one grouped
+	// `GET /api/corporate-card-transactions/counts`, never the loaded page or
+	// the status chip (status is the dimension it counts). `null` until the
+	// counts land (or if they fail): `KpiCard` draws its dash, never a zero
+	// nobody counted.
 	let cardCounts = $state<{ all: number; unmatched: number; matched: number } | null>(null);
 	const cardCountsSequence = createRequestSequencer();
 
 	async function loadCardCounts() {
 		const token = cardCountsSequence.start();
 		try {
-			const [all, unmatched, matched] = await Promise.all([
-				listCardTransactions({ page_size: 1 }),
-				listCardTransactions({ reconciliation_status: 'unmatched', page_size: 1 }),
-				listCardTransactions({ reconciliation_status: 'matched', page_size: 1 })
-			]);
+			const counts = await getCardTransactionCounts();
 			if (!cardCountsSequence.canCommit(token)) return;
-			cardCounts = { all: all.total, unmatched: unmatched.total, matched: matched.total };
+			cardCounts = {
+				all: counts.total,
+				unmatched: counts.by_status.unmatched ?? 0,
+				matched: counts.by_status.matched ?? 0
+			};
 		} catch {
 			// Non-fatal, like the expenses tab's rollup: the cards fall back to
 			// their dash and the table keeps its own error state.

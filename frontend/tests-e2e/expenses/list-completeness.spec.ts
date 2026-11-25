@@ -172,6 +172,33 @@ test.describe('/expenses Cards tab', () => {
 				});
 			}
 		);
+		// The KPIs come from ONE counts read over the whole feed, never from
+		// the list's `total` (status is the dimension it counts).
+		let countsCalls = 0;
+		await page.route(
+			(url) => url.pathname === '/api/corporate-card-transactions/counts',
+			(route) => {
+				countsCalls += 1;
+				const tally = (s: string) => rows.filter((r) => r.reconciliation_status === s).length;
+				return route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({
+						total: rows.length,
+						by_status: { unmatched: tally('unmatched'), matched: tally('matched'), ignored: 0 }
+					})
+				});
+			}
+		);
+		const listSizeOneReads: string[] = [];
+		page.on('request', (req) => {
+			const url = new URL(req.url());
+			if (
+				url.pathname === '/api/corporate-card-transactions' &&
+				url.searchParams.get('page_size') === '1'
+			)
+				listSizeOneReads.push(url.search);
+		});
 		await page.goto('/expenses?tab=cards');
 
 		const kpi = (label: string) =>
@@ -188,6 +215,10 @@ test.describe('/expenses Cards tab', () => {
 		await expect(page.locator('[role="tabpanel"] table tbody tr')).toHaveCount(5);
 		await expect(kpi('Unmatched')).toHaveText('70');
 		await expect(kpi('Transactions')).toHaveText('75');
+		// One counts read per fresh load (the first, then the chip flip) and no
+		// `page_size=1` list reads standing in for it.
+		await expect.poll(() => countsCalls).toBe(2);
+		expect(listSizeOneReads).toEqual([]);
 	});
 
 	test('a failed suggestions read is an error with Retry, not "no candidates"', async ({

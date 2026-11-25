@@ -30,7 +30,7 @@ vi.mock('#lib/i18n/store.svelte.ts', async () => {
 	};
 });
 
-const { submitReport } = await import('#lib/api/expenses.ts');
+const { submitReport, getCardTransactionCounts } = await import('#lib/api/expenses.ts');
 const de = { ...deMain, ...deRefusal };
 
 const fetchMock = vi.fn();
@@ -168,6 +168,35 @@ describe('submitReport states a coded refusal in the reader’s language', () =>
 			status: 403,
 			code: 'expense_report_not_owner',
 			message: de['refusal.expenseReportNotOwner']
+		});
+	});
+});
+
+describe('getCardTransactionCounts', () => {
+	it('reads the counts route bare when unfiltered', async () => {
+		respond({ total: 3, by_status: { unmatched: 2, matched: 1, ignored: 0 } }, 200);
+		const counts = await getCardTransactionCounts();
+		expect(String(fetchMock.mock.calls[0][0])).toBe(
+			'http://api.test/api/corporate-card-transactions/counts'
+		);
+		expect(counts.by_status.matched).toBe(1);
+	});
+
+	it('passes only the population filters — status is what it counts', async () => {
+		respond({ total: 0, by_status: { unmatched: 0, matched: 0, ignored: 0 } }, 200);
+		await getCardTransactionCounts({
+			virtual_card_id: 'vc-1',
+			date_from: '2026-06-01',
+			date_to: '2026-06-30',
+			// A caller cannot slip the tallied dimension in through the type.
+			...({ reconciliation_status: 'matched' } as object)
+		});
+		const url = new URL(String(fetchMock.mock.calls[0][0]));
+		expect(url.pathname).toBe('/api/corporate-card-transactions/counts');
+		expect(Object.fromEntries(url.searchParams)).toEqual({
+			virtual_card_id: 'vc-1',
+			date_from: '2026-06-01',
+			date_to: '2026-06-30'
 		});
 	});
 });
