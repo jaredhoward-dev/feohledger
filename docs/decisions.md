@@ -25641,6 +25641,48 @@ both. *Seeding a real parent/child link in the e2e tenant*: it would change
 what every other partner spec sees (they assert the standalone state and the
 cross-tenant 404) for a measurement a route stub gives exactly.
 
+## 502. The line-total check and exception-agent autonomy get their own audited writers and panels; autonomy is admin-only (round 39)
+
+**Problem.** Both settings existed only as keys the generic `PATCH
+/api/organization` could write: `settings.fraud_rules.line_total_mismatch_enabled`
+and `settings.exception_agents.autonomy_level`. That PATCH writes no audit row
+for either block and replaces each top-level block whole, so turning off a
+payment-blocking check or letting agents approve invoices left no record of who
+did it, and any save of the block could change them as a side effect.
+
+**Decision.** `api/organization_controls.py` adds `GET/PUT
+/api/organization/line-total-check` and `GET/PUT
+/api/organization/exception-agents/autonomy`. Each PUT takes the org row lock,
+writes its audit row (`organization.fraud_rule_updated` /
+`organization.exception_agent_autonomy_updated`, `{setting, old, new}`) first
+through `record_auth_audit_or_raise` (503 and nothing saved without it, the
+`/organization/sso` rule), then sets the one key with the block's siblings
+carried. The generic PATCH carries both stored values across a block
+replacement and refuses a different value with a 422 naming the endpoint
+(`guard_owned_keys`), so there is one writer for each key. The two panels
+(`?section=line-total-check`, `?section=exception-agents`) are separate
+components; the Fraud Detection form drops the line-total key from its save so
+a stale copy never trips the refusal.
+
+**Who may change autonomy: admin only.** Above `conservative` an agent may set
+an invoice's amount to the PO total, link or split its PO, or fill its GL
+account, and then approve it. It does so with the roles of the person who ran
+it (admin or AP manager), never past the CFO gate, approval limits or
+segregation of duties. Raising autonomy therefore widens what an AP manager's
+click can approve without a second look, which is a control over the AP
+manager, so the AP manager does not hold it. The CFO does not either: every
+other `/organization` writer is admin-only and the page's read-only mode is
+built on that one rule; a CFO-only exception would be the one panel on the page
+where the rule differs. An org that wants finance sign-off can have its admin
+change the level on the CFO's instruction; the audit row shows who changed it.
+
+**Rejected.** *Auditing every generic PATCH of these blocks* (the
+`provider_config_updated` shape): it would record that something changed but
+keep the whole-block replacement, so a save of a sibling key could still flip
+either control. *Refusing the whole `exception_agents` block on PATCH*: its
+other keys (`amount_tolerance_pct`, `po_match_window_days`) have no other
+writer yet.
+
 ## 503. Mobile Help opens the web help centre at the platform tenant URL, built from `/api/public-config` (round 39)
 
 **Problem.** The help centre (`/help`, `frontend/docs/help-centre.md`) serves

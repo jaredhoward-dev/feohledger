@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 # ---------- Fraud rules: per-org tunable thresholds -----------------------
 #
 # Defaults are conservative — they should never fire on a healthy AP flow.
-# Org admins override via PATCH /api/organization with `settings.fraud_rules`.
+# Org admins override via PATCH /api/organization with `settings.fraud_rules`,
+# except `line_total_mismatch_enabled`, whose one writer is the audited
+# PUT /api/organization/line-total-check (api/organization_controls, §502).
 # Every rule key listed here is honored by `_fraud_config()`; unknown keys
 # are ignored so we can ship new rules without a settings migration.
 

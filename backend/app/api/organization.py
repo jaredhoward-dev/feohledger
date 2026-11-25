@@ -15,6 +15,7 @@ from app.api.deps import (
     require_entitlement,
     require_roles,
 )
+from app.api.organization_controls import guard_owned_keys
 from app.api.refusals import coded_refusal, credential_block_unopenable_detail
 from app.config import settings
 from app.database import get_control_db
@@ -394,6 +395,9 @@ async def update_organization(
                 ) from None
             body.settings["payments"] = {**incoming_payments, "nacha": carried}
         _validate_settings_patch(body.settings)
+        # Two single keys have their own audited writer
+        # (`api/organization_controls`); carry them, refuse a change.
+        guard_owned_keys(body.settings, org.settings)
 
         # Saving a LIVE ERP adapter is plan-gated, and one routed through
         # Merge.dev is Scale-only (decisions §258, §281). Only

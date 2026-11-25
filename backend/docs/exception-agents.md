@@ -664,7 +664,19 @@ the API maps to **409** (no second `AgentDecision` row, no status clobber).
 }
 ```
 
-Default (key absent) → `conservative` → everything escalates. No new env var:
+Default (key absent) → `conservative` → everything escalates.
+
+**`autonomy_level` has its own writer and screen** (decisions §502):
+`GET/PUT /api/organization/exception-agents/autonomy`, admin-only, validated
+against the three levels, audited `organization.exception_agent_autonomy_updated`
+with the old and new level — written first, so a row that cannot be written is a
+503 with nothing saved. The generic `PATCH /api/organization` carries the stored
+level across an `exception_agents` save and refuses a different one, so the
+other two keys stay editable there without becoming a second, unaudited way to
+raise autonomy. In the app it is `/organization?section=exception-agents`
+(`organization/AgentAutonomyPanel.svelte`), which states beside the choice what
+the higher levels let an agent do: change an invoice's amount, PO link or GL
+account and approve it, with the triggering user's roles. No new env var:
 the optional rationale LLM reuses `FEOH_ANTHROPIC_API_KEY` + `FEOH_EXTRACTION_MODEL`.
 
 One setting outside this block also governs an agent run:

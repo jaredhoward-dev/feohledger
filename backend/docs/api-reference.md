@@ -197,6 +197,10 @@ All three answer a bare `404` when `FEOH_SIGNUP_ENABLED` is off — before valid
 | `POST` | `/api/organization/test-erp`      | admin  | Test ERP connection (uses request body if provided, otherwise saved config) |
 | `POST` | `/api/organization/test-extraction` | admin  | Test AI extraction provider connection |
 | `POST` | `/api/organization/sso/scim-token` | admin  | Mint (or rotate) the per-tenant SCIM bearer. Returns `{token, bearer_hash_prefix}` ONCE. |
+| `GET` | `/api/organization/line-total-check` | admin | `{enabled}` — whether the line-total reconciliation check (`settings.fraud_rules.line_total_mismatch_enabled`) is on; absent reads on. |
+| `PUT` | `/api/organization/line-total-check` | admin | `{enabled: bool}` (strict). Audited `organization.fraud_rule_updated` (`old`/`new`) first; 503 and nothing saved if the row can't be written. Decisions §502. |
+| `GET` | `/api/organization/exception-agents/autonomy` | admin | `{autonomy_level}` in force; absent or unknown reads `conservative`. |
+| `PUT` | `/api/organization/exception-agents/autonomy` | admin | `{autonomy_level}`: `conservative` / `balanced` / `aggressive`. Audited `organization.exception_agent_autonomy_updated` (`old`/`new`) first; 503 and nothing saved if the row can't be written. Decisions §502. |
 
 ## Invoices
 

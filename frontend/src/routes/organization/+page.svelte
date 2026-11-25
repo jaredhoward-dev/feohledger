@@ -57,6 +57,9 @@
 	import ErpConnectionPanel from '#lib/components/organization/ErpConnectionPanel.svelte';
 	import CommerceConnectionPanel from '#lib/components/organization/CommerceConnectionPanel.svelte';
 	import CloseWorkspacePanel from '#lib/components/organization/CloseWorkspacePanel.svelte';
+	import LineTotalCheckPanel from '#lib/components/organization/LineTotalCheckPanel.svelte';
+	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
+	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
 	import {
 		FEATURE_ERP_INTEGRATIONS,
@@ -440,6 +443,9 @@
 				{ slug: 'security', labelKey: 'org.section.security' },
 				{ slug: 'sso', labelKey: 'orgSso.title' },
 				{ slug: 'fraud', labelKey: 'org.section.fraud' },
+				// Their own audited writers (decisions §502).
+				{ slug: 'line-total-check', labelKey: 'org.section.lineTotal' },
+				{ slug: 'exception-agents', labelKey: 'org.section.agentAutonomy' },
 				{ slug: 'residency', labelKey: 'org.section.dataResidency' }
 			]
 		},
@@ -1042,7 +1048,11 @@
 				.map((d) => d.trim().toLowerCase())
 				.filter((d) => d.length > 0);
 			const payload: FraudRules = { ...fraud, personal_email_domains: domains };
-			await patchSettings(m('org.section.fraudSaved'), { fraud_rules: payload });
+			// The line-total switch has its own panel and writer; the server
+			// carries its stored value across this save (decisions §502).
+			await patchSettings(m('org.section.fraudSaved'), {
+				fraud_rules: withoutOwnedFraudKeys(payload)
+			});
 			fraud = payload;
 		} catch (err) {
 			toast(errorMessage(err, m('org.toast.saveFailed')), 'error');
@@ -3628,6 +3638,14 @@
 							<span class="plan-date">{m('org.plan.created', { date: formatDate(org.created_at, '—', { month: 'long', day: 'numeric', year: 'numeric' }) })}</span>
 						</div>
 					</section>
+				{/if}
+
+				{#if section === 'line-total-check'}
+					<LineTotalCheckPanel {readOnly} {userLoaded} />
+				{/if}
+
+				{#if section === 'exception-agents'}
+					<AgentAutonomyPanel {readOnly} {userLoaded} />
 				{/if}
 
 				{#if section === 'close'}
