@@ -365,9 +365,9 @@
 
 	const SUGGESTION_COLUMNS = $derived([
 		{ label: m('adaptive.suggestions.col.suggestion') },
-		{ label: m('adaptive.suggestions.col.vendor') },
-		{ label: m('adaptive.suggestions.col.confidence'), class: 'right' },
-		{ label: m('adaptive.suggestions.col.status') },
+		{ label: m('adaptive.suggestions.col.vendor'), class: 'col-vendor' },
+		{ label: m('adaptive.suggestions.col.confidence'), class: 'right col-confidence' },
+		{ label: m('adaptive.suggestions.col.status'), class: 'col-status' },
 		{ class: 'actions-col' }
 	]);
 
@@ -475,11 +475,16 @@
 					testId="adaptive-suggestions-error"
 				/>
 			{:else}
+				<!-- `fixed`, locale-sized columns: under `auto` the columns were
+				     sized against the loading row and re-sized against the rows. -->
+				<div class="suggestions-table">
 				<DataTable
+					fixed
 					columns={SUGGESTION_COLUMNS}
 					isEmpty={suggestions.length === 0}
 					loading={suggestionsLoading}
 					empty={m('adaptive.suggestions.empty')}
+					ariaLabel={m('adaptive.suggestions.heading')}
 				>
 					{#snippet body()}
 						{#each suggestions as s (s.id)}
@@ -512,6 +517,7 @@
 						{/each}
 					{/snippet}
 				</DataTable>
+				</div>
 			{/if}
 		</div>
 
@@ -1025,6 +1031,26 @@
 </PageHeader>
 
 <style>
+	/* The suggestions table is `fixed` (DataTable's `fixed`), each width sized
+	   to the widest string in the six locales, measured with the cell's own
+	   font metrics ×1.25 for CI's fallback font (frontend/docs/ui-patterns.md
+	   § Data tables): headers fr "FOURNISSEUR", en "CONFIDENCE"; the status
+	   badge pt-BR "DESATUALIZADA" (≈154px → 200px); the Dismiss / Confirm
+	   button de "Bestätigen" (≈120px → 160px). Vendor names are data and
+	   wrap in their 220px. The suggestion column carries no width and takes
+	   the rest; the `min-width` keeps it readable, past which the table
+	   scrolls in its region. DataTable renders the `<th>`, so the selectors
+	   go through `:global` under a page-owned wrapper (the /gl-accounts
+	   pattern). */
+	.suggestions-table {
+		min-width: 0;
+	}
+	.suggestions-table :global(table) { min-width: 960px; }
+	.suggestions-table :global(th.col-vendor) { width: 220px; }
+	.suggestions-table :global(th.col-confidence) { width: 150px; }
+	.suggestions-table :global(th.col-status) { width: 200px; }
+	.suggestions-table :global(th.actions-col) { width: 160px; }
+
 	.lede {
 		color: var(--text-muted);
 		max-width: 70ch;
