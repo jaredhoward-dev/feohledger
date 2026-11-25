@@ -25319,7 +25319,7 @@ Terms. *Erasing the rows on DSAR*: removes the only evidence of the contract
 the erased person's employer still holds us to. *Requiring acceptance on every
 password reset*: holds up account recovery for a step the re-prompt covers.
 
-## 496. A no-realm sync stamps its links `"mock"`; NULL means only pre-0115, and existing NULL links are not backfilled (closes a `docs/followups.md` entry, round 37)
+## 496. A no-realm sync stamps its links `"mock"`; NULL means only pre-0115, and existing NULL links are not backfilled (round 37; the existing rows' risk stays open in `docs/followups.md`)
 
 **Context.** §287 made a pull that names no company (`mock`, or an OAuth ERP
 with no consent) leave alone every row tied to a named realm. But it still
@@ -25363,6 +25363,16 @@ next named sync judges them as pre-0115 links (which is what the push already
 assumes). On a dev database seeded before this change, a mock vendor sync
 reports the seeded links `unverified_link` until it is re-seeded. `scripts/seed.py`
 now stamps its fixture links `"mock"`.
+
+**What this leaves open.** The stamp closes the risk for links made from now
+on, not for those rows. A NULL link a mock sync made after 0115 is still
+trusted by the push through `legacy_links_trusted` whenever the tenant is back
+on the company 0115 snapshotted, so a fixture id (a GL account `"5000"`) can
+still be posted to that real company until the next named sync re-judges the
+row. The behaviour is unchanged here because withdrawing trust is an operator
+call; the proposed fix (drop an org's `legacy_link_realm` snapshot when its
+audit trail shows any no-realm sync after 0115) and its trigger are tracked in
+`docs/followups.md` § Surfaced by reviewing the QuickBooks live-test fixes.
 
 **Rejected.** *Treating `"mock"` links like NULL in a named sync* (loose
 legacy evidence): a fixture id says nothing about a real company, so the strict
