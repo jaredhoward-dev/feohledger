@@ -1,5 +1,6 @@
 import { portalApi, setPortalToken, clearPortalToken, hasPortalToken } from '#lib/portalApi.ts';
 import { ACKNOWLEDGED_PORTAL_VERSIONS } from '#lib/legal/acceptance.ts';
+import { portalAcceptanceRefusal } from '#lib/api/acceptanceRefusal.ts';
 
 interface PortalUser {
 	id: string;
@@ -96,6 +97,15 @@ function createPortalAuth() {
 			user = null;
 		}
 	}
+
+	// Any call the server-side gate refused (403
+	// `privacy_acknowledgement_required`, decisions §505) puts the step up, as
+	// a `/me` saying so would.
+	portalAcceptanceRefusal.listen(() => {
+		if (user && !user.legal_acceptance_required) {
+			user = { ...user, legal_acceptance_required: true };
+		}
+	});
 
 	// The portal re-prompt's submit: posts the Privacy Policy version this build
 	// carries and takes the profile the endpoint answers with, so the flag

@@ -393,7 +393,10 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   (decisions §497): `auth/LegalAcceptCheckbox`, *Accept and continue*, *Log
   out*, focus on its `<h1>`. A full page, not a modal, so nothing behind it
   mounts and the URL survives; a 422 on a ticked box shows the box's
-  documents-changed reload state, anything else (the 429) an alert.
+  documents-changed reload state, anything else (the 429) an alert. A 403
+  `legal_acceptance_required` from any call sets the flag too
+  (`api/acceptanceRefusal.ts`; the portal's `privacy_acknowledgement_required`
+  likewise), so the step comes up mid-session (decisions §505).
   `<LegalAcceptStep onaccept={() => auth.acceptLegal()} onlogout={() => auth.logout()} />`.
   Also takes `documents` (`"terms_privacy"` by default; `"privacy"` for the
   Privacy Policy copy, the box's `privacy` form and the

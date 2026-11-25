@@ -195,10 +195,15 @@ class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
     _wasLoggedIn = loggedIn;
     final legalRequired = AuthStore.instance.legalAcceptanceRequired;
     final newlyRequired = loggedIn && legalRequired && !_wasLegalRequired;
+    final legalCleared = loggedIn && _wasLegalRequired && !legalRequired;
     _wasLegalRequired = legalRequired;
     // Push init ran before any session existed, so its device registration
-    // could not authenticate; send it now that one does.
-    if (signedIn) unawaited(PushService.instance.registerWithBackend());
+    // could not authenticate; send it now that one does. The server refuses
+    // it while the Terms / Privacy are owed (decisions §505), so a sign-in
+    // that meets the accept step registers when the step clears instead.
+    if ((signedIn && !legalRequired) || legalCleared) {
+      unawaited(PushService.instance.registerWithBackend());
+    }
     // A link held for a session that has just ended is not the next one's.
     if (signedOut) PushService.instance.takePendingInvoiceLink();
     // Signing in, or accepting the Terms / Privacy, can make the shell

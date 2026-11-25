@@ -25838,9 +25838,27 @@ client, was never asked, and nothing refused them.
   creator met the gate in the app that minted it), SCIM's bearer token, the
   inbound webhooks (signed machine callers), and the public pages. None of
   them reaches either resolver; the test pins that no API-key route does.
-  **Not covered, and tracked in `docs/followups.md`:** the Slack / Teams
-  approval buttons and the emailed approve link act for a person on a
-  single-use action token, not a JWT, so they do not reach the gate either.
+  **The token doors** — the Slack / Teams approval buttons and the emailed
+  approve link — act for a person on a single-use action token, not a JWT,
+  so they do not reach either resolver. Each asks
+  `api/email_actions.owes_legal_acceptance` for the reviewer the token names,
+  right after the `invoice.approve` check and before the single-use claim,
+  and refuses in its own channel's style (the email confirm POST's info page,
+  the Slack / Teams ack text `LEGAL_ACCEPTANCE_MESSAGE`), so the link or
+  button still works once the reviewer accepts. One shared check, so the
+  three doors cannot drift (`tests/test_email_actions.py`,
+  `test_slack_approvals.py`, `test_teams_approvals.py`).
+- **The clients answer the 403 with their accept step.** A session that
+  stays open across a version bump meets the 403 on its next call, not its
+  next `/me`. The web `api.ts` (through `endSessionIfRejected`, the hook every
+  client already calls on a refusal) and the portal `portalApi.ts` hand the
+  code to `api/acceptanceRefusal.ts`, whose listener in the auth store sets
+  the loaded account's flag, so the layout draws the step at once; the
+  mobile `ApiClient._failure` hands it to `AuthStore.legalAcceptanceRefused`,
+  which re-reads `/me` (once: a set flag means the step is already up). The
+  mobile push-device registration, refused at sign-in while the step is
+  owed, is sent when `AuthGate._onAuthChanged` sees the flag clear, and not
+  at a sign-in that already shows the step.
 - **Consequences.** Every existing user with no acceptance on record is
   refused everywhere but the step until they accept on the web or mobile.
   A mobile build older than a version bump can then only sign out (its Accept
@@ -25948,7 +25966,7 @@ entity's ids from missing ones. The export's `ids` are now `UUID`s in the
 schema, so a malformed id is a 422, not the 500 that `uuid.UUID(...)` in the
 handler raised. No other contract route takes a list of ids. The invoice and
 vendor bulk exports have the same unscoped select. They are outside this
-change.
+change; §509 closes them.
 
 Parity: `backend/tests/test_contract_action_verdicts.py` (each role × status ×
 action: verdict `None` exactly when the endpoint succeeds, otherwise its exact
@@ -26003,3 +26021,41 @@ supplier guides in `GUIDES` with a filter*: every employee surface (landing,
 search, page directory, HelpTip further reading) would then need the filter,
 and one forgotten would show a supplier guide to the AP team. *A portal search
 box*: five guides fit on one page; revisit when the supplier set outgrows it.
+
+## 509. Every bulk endpoint that takes ids reaches exactly the rows its single-row routes do (round 40)
+
+**Context.** §507 scoped `POST /contracts/bulk/export` and left the invoice and
+vendor exports with the same unscoped `select(...).where(id.in_(ids))`. The
+sweep of every router's id-taking bulk endpoint found three more on the primary
+key alone: `POST /vendors/bulk/status`, `/vendors/bulk/screen` and
+`POST /workflows/bulk-delete`. A caller scoped to one subsidiary could export
+another's invoices or vendors, verify, reject or re-screen its vendors, or
+delete its workflow definitions, by holding the ids. The invoice and vendor
+exports also parsed the ids in the handler, so a malformed one was a 500.
+(`/invoices/bulk/status`, `/invoices/bulk/delete`, `/exceptions/bulk/resolve`
+and `/expenses/bulk-gl-code` were already scoped; `/admin/users/bulk-delete`
+is control-plane users, which carry no entity.)
+
+**Decision.** Each bulk endpoint resolves its ids with the entity rule of the
+single-row route it mirrors, not a rule of its own: `apply_entity_scope` on
+`Invoice` for the invoice export (as `bulk/status` and `bulk/delete`), and
+`include_shared=True` for vendors (`api/vendors._scoped_vendors`) and workflow
+definitions, because their by-id routes admit an unstamped vendor or a shared
+definition from every entity. A bulk call therefore can never reach a row the
+single-row route would 404, nor refuse one it would serve. An out-of-scope id
+is handled exactly as a missing id already was on each endpoint: left out of
+an export (an all-out-of-scope selection is the same 404), skipped as `not
+found` on vendor status / screen, failed as `not_found` on workflow
+bulk-delete. The `ids` of the invoice export, delete and status requests and
+the vendor export are `UUID`s in the schema, so a malformed id is a 422.
+
+**Rejected.** *The list's filter for vendors* (which leaves unstamped rows
+out): it would make the bulk export refuse a vendor that `GET /vendors/{id}`
+in the same scope returns. *A 422 for a malformed id on vendor status / screen
+and workflow bulk-delete*: those already skip-and-report a malformed id per
+row (`invalid id format`, `not_found`), a contract their clients and tests
+read; only the endpoints that 500'd changed.
+
+Tests: `backend/tests/test_entity_scope_by_id_sweep.py` (mixed selection,
+all-out-of-scope equals missing, the consolidated view sees every row, the
+malformed-id 422s, vendor status / screen and workflow bulk-delete skips).

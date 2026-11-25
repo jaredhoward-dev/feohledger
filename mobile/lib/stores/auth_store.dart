@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
@@ -389,6 +391,16 @@ class AuthStore extends ChangeNotifier with SequencedFetch {
     } catch (_) {
       // Keep the held profile; see above.
     }
+  }
+
+  /// A call was refused by the server-side Terms / Privacy gate (403
+  /// `legal_acceptance_required`, decisions §505) — the documents changed
+  /// while this session stayed open. Re-read the profile, whose flag then puts
+  /// `LegalAcceptScreen` up. Once the flag is already set the step is showing,
+  /// so a burst of refused calls costs one `/me`, not one each.
+  void legalAcceptanceRefused() {
+    if (_user == null || legalAcceptanceRequired) return;
+    unawaited(refreshProfile());
   }
 
   /// Accept the Terms of Service and Privacy Policy versions this build was

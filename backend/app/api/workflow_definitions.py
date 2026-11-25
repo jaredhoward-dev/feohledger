@@ -1016,12 +1016,15 @@ async def bulk_delete_workflows(
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(ROLE_ADMIN)),
     org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Best-effort delete of multiple workflows.
 
     Each id is processed independently. The same three guards apply
     per-id as the single-delete endpoint: default / active / has
-    instances.
+    instances. Scoped like that endpoint too (shared definitions included):
+    an id in another entity fails as `not_found`, exactly as an unknown id
+    does (decisions §509).
     """
     deleted: list[str] = []
     failed: list[BulkDeleteWorkflowFailure] = []
@@ -1034,7 +1037,12 @@ async def bulk_delete_workflows(
             continue
 
         result = await db.execute(
-            select(WorkflowDefinition).where(
+            apply_entity_scope(
+                select(WorkflowDefinition),
+                WorkflowDefinition,
+                entity_id,
+                include_shared=True,
+            ).where(
                 WorkflowDefinition.id == wf_uuid,
                 WorkflowDefinition.organization_id == org_id,
             )

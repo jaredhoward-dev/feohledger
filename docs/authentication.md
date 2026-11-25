@@ -373,9 +373,23 @@ user query, so the gate adds no round trip. The portal twin is
 `get_current_vendor_user` (403 `privacy_acknowledgement_required`; exempt:
 portal `/me`, `/legal-acknowledgement`, `/change-password`). Out of scope:
 `/api/v1` API keys (no person behind a key), SCIM, inbound webhooks and public
-pages. Not yet covered: the Slack / Teams approval buttons and the emailed
-approve link, which act on a single-use action token rather than a JWT
-(`docs/followups.md`). **Existing users with nothing on record are blocked
+pages. The Slack / Teams approval buttons and the emailed approve link act on a
+single-use action token rather than a JWT, so they never reach that resolver:
+each door asks `email_actions.owes_legal_acceptance` for the reviewer the token
+names, right after the `invoice.approve` check and before the token's
+single-use claim, and refuses in its own style (the email page "Terms
+acceptance required", the chat reply `LEGAL_ACCEPTANCE_MESSAGE`) without
+spending the link or button, which works once the reviewer has accepted.
+A client that meets the 403 mid-session (a version bump while it stayed open)
+answers it with its accept step, not an error: the web's `api.ts` and the
+portal's `portalApi.ts` hand the code to their auth store
+(`api/acceptanceRefusal.ts`), which sets the loaded account's
+`legal_acceptance_required` so the layout draws `LegalAcceptStep`; the mobile
+`ApiClient` hands it to `AuthStore.legalAcceptanceRefused`, which re-reads
+`/me` so `AuthGate` shows `LegalAcceptScreen`. The mobile push-device
+registration, refused at sign-in while the step is owed, is sent again when
+the flag clears (`AuthGate._onAuthChanged`).
+**Existing users with nothing on record are blocked
 until they accept on the web or mobile, and a mobile build older than a
 version bump can only sign out — ship a bump with, or after, an app release
 carrying the new versions.**

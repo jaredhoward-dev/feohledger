@@ -362,4 +362,93 @@ void main() {
       expect(PushService.instance.pendingInvoiceLink.value, isNull);
     });
   });
+  // Decisions §505: the server refuses an unaccepted user everywhere but the
+  // accept step. A refusal met mid-session puts the step up, and a push
+  // registration the gate refused at sign-in is sent again once it clears.
+  group('the server-side Terms / Privacy gate', () {
+    http.Response legalRefusal() => _json({
+          'detail': {
+            'code': 'legal_acceptance_required',
+            'message': 'Please accept the current Terms of Service and '
+                'Privacy Policy to continue.',
+            'params': <String, dynamic>{},
+          },
+        }, 403);
+
+    testWidgets('a call it refuses mid-session puts the accept screen up',
+        (tester) async {
+      FlutterSecureStorage.setMockInitialValues({
+        'auth_token': 'tok',
+        'tenant_slug': 'acme',
+      });
+      var required = false;
+      final home = _homeClient(legalRequired: () => required);
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (required && req.url.path == '/api/dashboard') {
+            return legalRefusal();
+          }
+          return home.send(req).then(http.Response.fromStream);
+        }),
+      );
+
+      await tester.pumpWidget(const APApp());
+      await pumpFrames(tester);
+      expect(find.byType(HomeScreen), findsOneWidget);
+
+      required = true; // the Terms were bumped while the session stayed open
+      await expectLater(
+        ApiClient().get('/dashboard'),
+        throwsA(isA<ApiException>()
+            .having((e) => e.statusCode, 'statusCode', 403)),
+      );
+      await pumpFrames(tester);
+
+      expect(find.byType(LegalAcceptScreen), findsOneWidget);
+      expect(find.byType(HomeScreen), findsNothing);
+      // Still signed in: the refusal is the accept step, not a logout.
+      expect(AuthStore.instance.loggedIn, isTrue);
+    });
+
+    testWidgets('the push registration it refused is sent once the user '
+        'accepts', (tester) async {
+      FlutterSecureStorage.setMockInitialValues({
+        'auth_token': 'tok',
+        'tenant_slug': 'acme',
+      });
+      PushService.instance.debugSetRegistration('fid-1');
+      addTearDown(() => PushService.instance.debugSetRegistration(null));
+      var required = true;
+      var refusedRegistrations = 0;
+      var acceptedRegistrations = 0;
+      final home = _homeClient(legalRequired: () => required);
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (req.url.path == '/api/notifications/device-token') {
+            if (required) {
+              refusedRegistrations++;
+              return legalRefusal();
+            }
+            acceptedRegistrations++;
+            return _json({});
+          }
+          return home.send(req).then(http.Response.fromStream);
+        }),
+      );
+
+      await tester.pumpWidget(const APApp());
+      await pumpFrames(tester);
+      expect(find.byType(LegalAcceptScreen), findsOneWidget);
+      expect(acceptedRegistrations, 0);
+
+      required = false;
+      final accepting = AuthStore.instance.acceptLegalDocuments();
+      await pumpFrames(tester);
+      expect(await accepting, LegalAcceptOutcome.accepted);
+
+      expect(acceptedRegistrations, 1);
+      // At most the one attempt a sign-in made before the flag was known.
+      expect(refusedRegistrations, lessThanOrEqualTo(1));
+    });
+  });
 }

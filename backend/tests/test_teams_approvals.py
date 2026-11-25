@@ -618,3 +618,35 @@ async def test_approve_action_refuses_when_the_invoice_changed_after_the_post(re
     assert resp.status_code == 200
     assert "changed after this message was sent" in resp.json()["text"]
     assert await _status(realdb, inv_id) == InvoiceStatus.ready_for_review
+
+
+# ---------------------------------------------------------------------------
+# A reviewer who owes a Terms / Privacy acceptance (decisions §505)
+# ---------------------------------------------------------------------------
+
+
+async def test_reviewer_owing_legal_acceptance_is_refused_without_spending_the_button(
+    realdb, teams_keys
+):
+    """The button acts for a person on a token, not a JWT, so it never meets
+    `get_current_user`'s gate; the endpoint refuses the same reviewer itself,
+    before the single-use claim, and the button works once they have accepted."""
+    from app.api.email_actions import LEGAL_ACCEPTANCE_MESSAGE
+    from tests.legal_gate_probe import acceptance_withdrawn
+
+    info = realdb.info("a")
+    inv_id = await _make_invoice(realdb, uploaded_by_id=info.users["admin"])
+    token = _teams_token(realdb, inv_id, action=ACTION_APPROVE)
+    body = _payload_body(token)
+
+    async with acceptance_withdrawn(realdb, info.users["ap_manager"]) as accept:
+        async with realdb.client(key="a", role=None) as c:
+            refused = await c.post(_INTERACTIVITY_URL, content=body, headers=_signed_headers(body))
+            assert refused.status_code == 200
+            assert refused.json()["text"] == LEGAL_ACCEPTANCE_MESSAGE
+            assert await _status(realdb, inv_id) == InvoiceStatus.ready_for_review
+
+            await accept()
+            resp = await c.post(_INTERACTIVITY_URL, content=body, headers=_signed_headers(body))
+    assert "approved" in resp.json()["text"].lower(), resp.text
+    assert await _status(realdb, inv_id) == InvoiceStatus.approved

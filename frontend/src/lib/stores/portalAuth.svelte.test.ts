@@ -65,6 +65,19 @@ describe('portalAuth.acknowledgeLegal — the Privacy Policy re-prompt', () => {
 		expect(get).toHaveBeenCalledTimes(1);
 	});
 
+	it('a call the server-side gate refuses puts the step up on a loaded profile (§505)', async () => {
+		const portalAuth = await freshStore();
+		const { portalAcceptanceRefusal } = await import('#lib/api/acceptanceRefusal.ts');
+		get.mockResolvedValueOnce({ ...SUPPLIER, legal_acceptance_required: false });
+		await portalAuth.fetchUser();
+
+		// What `portalApi.ts` does on any refused response.
+		portalAcceptanceRefusal.notice(403, 'privacy_acknowledgement_required');
+
+		expect(portalAuth.user?.legal_acceptance_required).toBe(true);
+		expect(portalAuth.user?.vendor_id).toBe(SUPPLIER.vendor_id);
+	});
+
 	it('a refused acknowledgement is thrown for the step to state and leaves the step up', async () => {
 		const portalAuth = await freshStore();
 		get.mockResolvedValueOnce({ ...SUPPLIER, legal_acceptance_required: true });
