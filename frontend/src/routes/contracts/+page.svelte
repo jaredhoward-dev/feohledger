@@ -32,13 +32,13 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { type MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { formatCount } from '#lib/utils/count.ts';
 	import { ApiError } from '#lib/api.ts';
 	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { afterNavigate, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import { formatDate } from '#lib/utils/time.ts';
 
@@ -57,9 +57,25 @@
 		...CONTRACT_STATUSES.map((s) => ({ key: s, label: statusLabel(s) }))
 	]);
 
-	// URL-backed filter state (mirrors the invoices page convention).
-	let search = $state(page.url.searchParams.get('search') ?? '');
-	let statusFilter = $state<string>(page.url.searchParams.get('status') ?? 'all');
+	// Column sort keys: the headers this table offers (`sortFromUrl`).
+	const SORTABLE_FIELDS = ['contract_number', 'status', 'end_date', 'total_value'] as const;
+
+	// The one READER of this route's query string, used at mount and by
+	// `afterNavigate` for a navigation that reuses this page. `?id=` is the
+	// deep-link effect's, off the same `page.url`.
+	function readUrlState(params: Pick<URLSearchParams, 'get'>) {
+		const status = params.get('status') ?? '';
+		const sort = sortFromUrl(params, SORTABLE_FIELDS, 'desc');
+		return {
+			search: params.get('search') ?? '',
+			status: (CONTRACT_STATUSES as readonly string[]).includes(status) ? status : 'all',
+			sortField: sort.field,
+			sortOrder: sort.order
+		};
+	}
+	const initialUrlState = readUrlState(page.url.searchParams);
+	let search = $state(initialUrlState.search);
+	let statusFilter = $state<string>(initialUrlState.status);
 
 	// Modal state: null = create; a Contract = detail/edit.
 	// Three states, not two: a failed load must not read as "nothing matched".
@@ -69,11 +85,10 @@
 	let showCreate = $state(false);
 	let editing = $state<Contract | null>(null);
 
-	// Column sort — URL-backed (`?sort=&order=`), folded into the same
-	// syncUrl() the search/status filters already use. `null` field = the
-	// backend's own default order (most-recent first).
-	let sortField = $state<string | null>(page.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((page.url.searchParams.get('order') as SortOrder) ?? 'desc');
+	// Column sort — URL-backed (`?sort=&order=`) through `syncUrl()`. `null`
+	// field = the backend's own default order (most-recent first).
+	let sortField = $state<string | null>(initialUrlState.sortField);
+	let sortOrder = $state<SortOrder>(initialUrlState.sortOrder);
 
 	// --- Bulk selection ---
 	let selected = $state<Set<string>>(new Set());
@@ -171,6 +186,29 @@
 			replaceState(`${page.url.pathname}${qs ? `?${qs}` : ''}`, {});
 		});
 	}
+
+	// A navigation that REUSES this mounted page (the sidebar row clicked on a
+	// filtered view, Back/Forward between two entries of this route) re-reads
+	// the URL; state seeded at mount would otherwise sit under a different
+	// address. `replaceState` is shallow and never fires this hook, so
+	// `syncUrl()` cannot loop through it. Only what changed is assigned: the
+	// status effect refetches with the new search and sort, a search alone goes
+	// through the debounce, and a sort alone fetches here (no effect tracks it).
+	afterNavigate(({ from, to, type }) => {
+		if (type === 'enter' || !from || !to || from.route.id !== to.route.id) return;
+		const next = readUrlState(to.url.searchParams);
+		const searchChanged = next.search !== search;
+		const sortChanged = next.sortField !== sortField || next.sortOrder !== sortOrder;
+		if (sortChanged) {
+			sortField = next.sortField;
+			sortOrder = next.sortOrder;
+		}
+		if (searchChanged) search = next.search;
+		if (next.status !== statusFilter) statusFilter = next.status;
+		else if (sortChanged && !searchChanged) {
+			contractStore.fetch(buildParams()).catch(() => {}); // noqa: raw-fetch-in-component — store method, routes through api client
+		}
+	});
 
 	function handleSort(field: string) {
 		const next = toggleSort({ field: sortField, order: sortOrder }, field);
