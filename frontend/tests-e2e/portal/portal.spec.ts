@@ -778,4 +778,78 @@ test.describe("/portal — must-change-password redirect", () => {
       tenantPsql(restore);
     }
   });
+
+  test("the page a sign-in was for survives the forced password change", async ({
+    page,
+  }) => {
+    // An emailed deep link reaches the sign-in as `?next=`; a forced change
+    // is a sign-in step, so it carries the destination on rather than
+    // dropping the supplier on the invoice list.
+    const restore = `UPDATE vendor_users SET must_change_password=false WHERE email='${PORTAL_EMAIL}'`;
+    tenantPsql(
+      `UPDATE vendor_users SET must_change_password=true WHERE email='${PORTAL_EMAIL}'`,
+    );
+    const next = "/portal/payments?status=paid";
+    try {
+      await acceptConsent(page);
+      await page.goto(`/portal/login?${new URLSearchParams({ next })}`);
+      await page.locator('input[type="email"]').fill(PORTAL_EMAIL);
+      await page.locator('input[type="password"]').fill(PORTAL_PASSWORD);
+      await page.locator('button[type="submit"]').click();
+
+      await expect(page).toHaveURL(
+        (url) =>
+          url.pathname === "/portal/change-password" &&
+          url.searchParams.get("next") === next,
+      );
+
+      // The save itself is stubbed (the shared seed password must not
+      // change): it answers the account with the flag cleared, which is
+      // what the real endpoint returns.
+      await page.route(
+        (url) => url.pathname === "/api/portal/auth/change-password",
+        async (route) => {
+          const me = await route.fetch({
+            url: route.request().url().replace("/change-password", "/me"),
+            method: "GET",
+          });
+          const body = await me.json();
+          await route.fulfill({ json: { ...body, must_change_password: false } });
+        },
+      );
+      await page.getByLabel("Current (temporary) password", { exact: true }).fill(PORTAL_PASSWORD);
+      await page.getByLabel("New password", { exact: true }).fill("Forced-Change-Next-9!");
+      await page.getByLabel("Confirm new password", { exact: true }).fill("Forced-Change-Next-9!");
+      await page.getByRole("button", { name: "Save password" }).click();
+
+      await expect(page).toHaveURL(
+        (url) =>
+          url.pathname === "/portal/payments" &&
+          url.searchParams.get("status") === "paid",
+      );
+    } finally {
+      tenantPsql(restore);
+    }
+  });
+
+  test("a non-portal next is not carried through the forced change", async ({
+    page,
+  }) => {
+    const restore = `UPDATE vendor_users SET must_change_password=false WHERE email='${PORTAL_EMAIL}'`;
+    tenantPsql(
+      `UPDATE vendor_users SET must_change_password=true WHERE email='${PORTAL_EMAIL}'`,
+    );
+    try {
+      await acceptConsent(page);
+      await page.goto(`/portal/login?${new URLSearchParams({ next: "//evil.example/portal" })}`);
+      await page.locator('input[type="email"]').fill(PORTAL_EMAIL);
+      await page.locator('input[type="password"]').fill(PORTAL_PASSWORD);
+      await page.locator('button[type="submit"]').click();
+      await expect(page).toHaveURL(
+        (url) => url.pathname === "/portal/change-password" && !url.searchParams.has("next"),
+      );
+    } finally {
+      tenantPsql(restore);
+    }
+  });
 });

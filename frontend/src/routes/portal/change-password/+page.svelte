@@ -5,6 +5,8 @@
 	import { ApiError } from '#lib/api.ts';
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
+	import { safePortalNextPath } from '#lib/utils/postLoginRedirect.ts';
 	import { tick } from 'svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
@@ -42,7 +44,9 @@
 		loading = true;
 		try {
 			await portalAuth.changePassword(currentPassword, newPassword);
-			goto('/portal/invoices');
+			// A forced change is a sign-in step: on to the page the sign-in was
+			// for (`?next=`, portal pages only), else the invoice list.
+			goto(safePortalNextPath(page.url.searchParams.get('next')) ?? '/portal/invoices');
 		} catch (err) {
 			if (err instanceof ApiError && err.status === 400) {
 				currentServerError = m('auth.changePassword.currentIncorrect');

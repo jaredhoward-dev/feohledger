@@ -5,7 +5,7 @@
 	import LegalAcceptStep from '#lib/components/layout/LegalAcceptStep.svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { safePortalNextPath } from '#lib/utils/postLoginRedirect.ts';
+	import { safePortalNextPath, withPortalNext } from '#lib/utils/postLoginRedirect.ts';
 	import { browser } from '$app/env';
 	import { hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -71,7 +71,13 @@
 			portalAuth.user?.must_change_password &&
 			path !== '/portal/change-password'
 		) {
-			goto('/portal/change-password');
+			// Keep the destination: from the sign-in page it is that page's own
+			// `?next=`, anywhere else the page being left.
+			const next =
+				path === '/portal/login'
+					? page.url.searchParams.get('next')
+					: `${path}${page.url.search}`;
+			goto(withPortalNext('/portal/change-password', next));
 		}
 	});
 
