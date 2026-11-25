@@ -846,6 +846,22 @@ class AppLocalizationsEs extends AppLocalizations {
       'Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de retirar la aprobación.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Esta factura ya se envió por PEPPOL y el receptor tiene el documento aprobado. Emita una nota de crédito y envíe una factura corregida; su aprobación no se puede retirar.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Esta factura se enrutó entre empresas del grupo y su factura espejo en la otra entidad copió los importes aprobados. Elimine la factura espejo (aún no está aprobada), retire después esta aprobación y vuelva a enrutar la factura cuando se apruebe de nuevo.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Esta factura se enrutó entre empresas del grupo y su factura espejo en la otra entidad ya está aprobada o se está pagando allí. Corrija ambos lados con una nota de crédito en cada uno; esta aprobación no se puede retirar.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Esta factura es una factura espejo entre empresas del grupo: sus importes se copiaron de la factura de origen de la otra entidad. Elimine esta factura espejo y corrija la factura original; después vuelva a enrutarla.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

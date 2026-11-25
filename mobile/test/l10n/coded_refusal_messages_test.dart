@@ -65,6 +65,26 @@ void main() {
       localizeCodedRefusal(en, refusal('invoice_recall_claimed', {'claim': 'virtual_card'})),
       en.codedRefusalCardBlocksRecall,
     );
+    // Sent over PEPPOL, or paired inter-company (backend decisions §573).
+    expect(
+      localizeCodedRefusal(de, refusal('invoice_recall_peppol_transmitted')),
+      de.codedRefusalRecallPeppolTransmitted,
+    );
+    expect(
+      localizeCodedRefusal(de, refusal('invoice_recall_mirror_unsigned')),
+      de.codedRefusalRecallMirrorUnsigned,
+    );
+    expect(
+      localizeCodedRefusal(
+        de,
+        refusal('invoice_recall_mirror_progressed', {'mirror_status': 'paid'}),
+      ),
+      de.codedRefusalRecallMirrorProgressed,
+    );
+    expect(
+      localizeCodedRefusal(de, refusal('invoice_recall_is_mirror')),
+      de.codedRefusalRecallIsMirror,
+    );
     // A claim this build does not know keeps the caller's generic failure.
     expect(localizeCodedRefusal(en, refusal('invoice_recall_claimed')), isNull);
     expect(

@@ -797,6 +797,22 @@ class AppLocalizationsJa extends AppLocalizations {
       'この請求書の支払いにバーチャルカードが発行されています。承認を取り消す前に、カードを取り消してください。';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'この請求書はすでにPEPPOLで送信されており、受信者が承認済みの文書を保持しています。クレジットノートを発行し、訂正した請求書を送信してください。承認を取り消すことはできません。';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'この請求書はグループ会社間で振り替えられており、相手先エンティティのミラー請求書が承認済みの金額を引き継いでいます。ミラー請求書（まだ承認されていません）を削除してからこの承認を取り消し、再承認後に請求書を再度振り替えてください。';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'この請求書はグループ会社間で振り替えられており、相手先エンティティのミラー請求書はすでに承認済みか支払い中です。双方でクレジットメモを発行して訂正してください。この承認を取り消すことはできません。';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'この請求書はグループ会社間のミラー請求書です。金額は相手先エンティティの元の請求書からコピーされています。このミラー請求書を削除し、元の請求書を訂正してから再度振り替えてください。';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     return '$count件の請求書を却下';
   }

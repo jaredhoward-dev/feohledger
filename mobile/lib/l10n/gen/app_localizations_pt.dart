@@ -846,6 +846,22 @@ class AppLocalizationsPt extends AppLocalizations {
       'Foi emitido um cartão virtual para pagar esta fatura. Cancele o cartão antes de revogar a aprovação.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Esta fatura já foi enviada pelo PEPPOL, e o destinatário tem o documento aprovado. Emita uma nota de crédito e envie uma fatura corrigida; a aprovação não pode ser revogada.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Esta fatura foi encaminhada entre empresas do grupo, e sua fatura espelho na outra entidade copiou os valores aprovados. Elimine a fatura espelho (ela ainda não foi aprovada), depois revogue esta aprovação e encaminhe a fatura novamente quando for reaprovada.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Esta fatura foi encaminhada entre empresas do grupo, e sua fatura espelho na outra entidade já foi aprovada ou está a ser paga lá. Corrija os dois lados com uma nota de crédito em cada um; esta aprovação não pode ser revogada.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Esta fatura é uma fatura espelho entre empresas do grupo: seus valores foram copiados da fatura de origem da outra entidade. Elimine esta fatura espelho e corrija a fatura original; depois encaminhe-a novamente.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,
@@ -5983,6 +5999,22 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get codedRefusalCardBlocksRecall =>
       'Um cartão virtual foi emitido para pagar esta fatura. Cancele o cartão antes de revogar a aprovação.';
+
+  @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Esta fatura já foi enviada pelo PEPPOL, e o destinatário tem o documento aprovado. Emita uma nota de crédito e envie uma fatura corrigida; a aprovação não pode ser revogada.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Esta fatura foi roteada entre empresas do grupo, e sua fatura espelho na outra entidade copiou os valores aprovados. Exclua a fatura espelho (ela ainda não foi aprovada), depois revogue esta aprovação e roteie a fatura novamente quando for reaprovada.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Esta fatura foi roteada entre empresas do grupo, e sua fatura espelho na outra entidade já foi aprovada ou está sendo paga lá. Corrija os dois lados com uma nota de crédito em cada um; esta aprovação não pode ser revogada.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Esta fatura é uma fatura espelho entre empresas do grupo: seus valores foram copiados da fatura de origem da outra entidade. Exclua esta fatura espelho e corrija a fatura original; depois roteie-a novamente.';
 
   @override
   String invoicesBulkRejectTitle(int count) {
