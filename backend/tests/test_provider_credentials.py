@@ -1265,3 +1265,20 @@ async def test_a_reset_that_cannot_be_audited_removes_nothing(realdb, monkeypatc
         resp = await c.delete(f"{URL}/erp")
     assert resp.status_code == 503
     assert len(await _rows(realdb)) == 1
+
+
+def test_the_kms_client_is_built_with_bounded_timeouts_and_retries(monkeypatch):
+    """boto's defaults (60 s connect, 60 s read, five legacy attempts) could hold
+    one unseal for minutes, past the ERP void's staleness rule (decisions §550).
+    Building the client makes no network call."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setattr(credential_crypto, "_kms_client_instance", None)
+    client = credential_crypto._kms_client()
+    try:
+        cfg = client.meta.config
+        assert cfg.connect_timeout == credential_crypto.KMS_CONNECT_TIMEOUT_S
+        assert cfg.read_timeout == credential_crypto.KMS_READ_TIMEOUT_S
+        assert cfg.retries["mode"] == "standard"
+        assert cfg.retries["total_max_attempts"] == credential_crypto.KMS_MAX_ATTEMPTS
+    finally:
+        monkeypatch.setattr(credential_crypto, "_kms_client_instance", None)
