@@ -351,9 +351,9 @@ export const messages = {
 	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
 	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
 	'profile.delegation.heading': "Absence",
-	'profile.delegation.hint': "Pendant votre absence, les nouvelles factures qui vous sont attribuées pour approbation vont à un collègue lorsqu'il peut les approuver ; sinon, elles restent chez vous. La délégation commence dès l'enregistrement et se termine après le dernier jour choisi.",
+	'profile.delegation.hint': "Pendant votre absence, les nouvelles factures qui vous sont attribuées pour approbation vont à une personne de votre équipe lorsque celle-ci peut les approuver ; sinon, elles restent chez vous. La délégation commence dès l'enregistrement et se termine après le dernier jour choisi.",
 	'profile.delegation.limits': "Votre délégué approuve en son propre nom : dans la limite de ses propres plafonds d'approbation, et jamais une facture qu'il a téléversée, dont il a réceptionné les marchandises ou qu'il a contrôlée. Vous pouvez toujours approuver ces factures vous aussi.",
-	'profile.delegation.statusOn': "Activée : les nouvelles factures à approuver vont à {name} jusqu'au {date} inclus lorsqu'il peut les approuver ; sinon, elles restent chez vous.",
+	'profile.delegation.statusOn': "Activée : les nouvelles factures à approuver vont à {name} jusqu'au {date} inclus lorsque cette personne peut les approuver ; sinon, elles restent chez vous.",
 	'profile.delegation.statusOff': "Désactivée : les factures à approuver vous sont attribuées.",
 	'profile.delegation.statusEnded': "Désactivée : votre délégation à {name} a pris fin le {date}.",
 	'profile.delegation.delegate': "Délégué",
