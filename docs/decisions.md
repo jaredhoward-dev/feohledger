@@ -26895,60 +26895,6 @@ app; scoped copies are the existing `organization/` pattern (`LineTotalCheckPane
 and keep each panel's look provably identical. *Fewer, bigger props by passing
 the whole page state*: it would re-couple every panel to every other.
 
-## 531. `formatPeriod` assembles its label from parts, so a CLDR update cannot change it (round 44)
-
-**Problem.** `formatPeriod` (the chart-axis label on `/cfo` and the cash-flow
-panels) returned `toLocaleDateString(locale, {month: 'short', year: '2-digit'})`
-verbatim. CLDR 49 (ICU 79, shipped in Node 26) changed English's short-year
-patterns to carry an elision apostrophe: "Jun ’26" and "Jun 20, ’26" where
-CLDR 47 / 48 (Node 20 / 24, CI's Node 24) say "Jun 26" and "Jun 20, 26".
-`time.test.ts` failed on a Node 26 machine and passed in CI. The code, not the
-machine, was the fragile part: browsers ship their own ICU, so the label would
-have changed per user as their browser updated, with no change of ours.
-
-**Decision.** Build the label from `Intl.DateTimeFormat.formatToParts` and strip
-`’` / `'` from the literal that directly precedes the `year` part. CLDR still
-owns order, month names and every other separator (pt-BR "jun. de 26", ja
-"26年6月", de "Juni 26" are unchanged on CLDR 47–49). The unit test feeds the
-CLDR 49 part shape through a `formatToParts` spy, so both shapes are pinned on
-whichever ICU runs the suite.
-
-**Rejected.** *Adopt the apostrophe everywhere*: it does disambiguate "Jun ’26"
-from the 26th of June, but `formatMonth` already exists for a standalone month
-label (full year), and producing the mark on older CLDR means hand-inserting a
-locale-specific character, which is worse than removing one. *Pin Node 24
-locally / add an engines check*: the repo already runs fine on Node 26; the
-drift is in CLDR, which also reaches users through their browser, so a toolchain
-pin would hide the defect rather than fix it. *Loosen the test to accept either
-shape*: the variance is the bug (guard rail 4).
-
-## 529. The invoice timeline waits for its label slice before drawing a row (round 44)
-
-**Problem.** §522 accepted that an Activity row drawn before the lazy `audit`
-slice landed would show its token (`invoice.erp_failed`) for a moment and then
-relabel. The modal fired `ensureSlices('audit')` and the audit-log fetch side by
-side, and the fetch usually won, so the flash was the common case on a cold
-modal, not a corner.
-
-**Decision.** `lib/types/invoiceTimelineActions.ts::loadLabelledTimeline`
-resolves the rows only once both the fetch and `ensureSlices('audit')` have
-settled, and `InvoiceModal.svelte`'s `loadAuditLog` assigns through it, so the
-list's existing "nothing until loaded" state covers the slice too. This
-supersedes §522's accepted residue. `ensureSlices` never rejects (a slice that
-cannot load falls back to English, or keeps what it had, and settles), so the
-wait cannot strand the timeline; a failed fetch rejects as before. The
-`.activity-section` carries `data-ready`, backed by `auditLoading`.
-
-**Guard.** `invoiceTimelineActions.test.ts` pins that the rows are withheld
-until the slice settles, whichever lands first. `tests-e2e/invoices/detail.spec.ts`
-records every `.activity-action` text the DOM ever holds while the modal opens
-and fails on any raw `invoice.` / `exception.` / `audit.` token.
-
-**Rejected.** *Preloading the `audit` slice app-wide*: it is the console's whole
-vocabulary in six locales, paid on every page for one modal. *Rendering a
-placeholder label until the slice lands*: still a relabel, just a different
-flash.
-
 ## 527. A spent ERP webhook unseal budget still lets through an opening the DEK cache would serve, and still counts its failure (§525 follow-up, round 44)
 
 **Problem.** §525's per-source budget was checked before every unseal on
@@ -27010,45 +26956,6 @@ the predicate against a fake KMS (no call, no warming or refresh, the context
 scoped, the TTL), false for a local envelope, and the row-level spelling on real
 Postgres.
 
-## 530. `/organization`'s panels share their form layout from `app.css`, under `.org-panel` (round 44)
-
-**Problem.** §526 gave each panel a scoped copy of the page's CSS. Thirteen
-panels carried the same `.form-grid` (with its ≤600px one-column rule),
-`.full-width` and `.section-footer`, and a copy had already drifted once: the
-Chat panel lost its phone rule (restored before this change), so its grid
-stayed two columns at 320px.
-
-**Decision.** Those rules are declared once in `src/app.css` as
-`.org-panel .form-grid` / `.full-width` / `.section-footer` plus the ≤600px
-rule, and a panel that uses them wears `class="card org-panel"` on its root
-`<section>`. That is the repo's existing mechanism (class-scoped globals in
-`app.css`, like `.modal label` and `.grid-container td`), at the narrowest
-scope: `.org-panel` appears nowhere else, and none of the three classes
-appears in markup nested inside one of these panels except `SearchPicker`'s
-`.full-width`, which sets the same `grid-column`. One namespace class keeps
-the specificity the scoped copies had (`.org-panel .form-grid` is 0-2-0, as
-`.form-grid.svelte-<hash>` was), so every element computes the same rules; no
-panel-local rule overrode these at equal specificity, so stylesheet order
-does not decide anything. `organization/sharedPanelCss.test.ts` refuses a
-scoped copy of a shared rule in any panel, requires `org-panel` on every panel
-using one, and pins the phone rule in `app.css`.
-
-**Not shared, deliberately.** The element rules (`label`, `label > span`, the
-text-entry `input` recipe) would, under `.org-panel`, reach the inputs of a
-`SecretField`, `CurrencyInput` or picker nested in a panel, which the scoped
-copies never touched. `.card`, `.card h2` and `.card-hint` are overridden by
-panel-local rules at equal specificity (`.getting-started`, `.field-gap`,
-`.domain-empty`), so a global copy would leave the result to stylesheet
-order. `OrgSettingPanel`'s `.section-footer` is a different rule (no rule
-line, no top padding) and it stays scoped, without `org-panel`. Those copies
-remain §526's.
-
-**Rejected.** *Rules in the page's `<style>` under `:global(...)`*: they would
-outrank the panels' own rules by the page's hash class, and depend on the
-panels only ever rendering inside the page. *A `FormGrid` wrapper component*:
-thirteen panels' markup would change for three layout rules, and its scoped
-`.form-grid` would still not reach `.full-width` children or the footer.
-
 ## 528. A dropped generic ERP webhook is backstopped by a status polling sweep that applies the webhook's own transition (§408 / §525 follow-up, round 44)
 
 **Problem.** The generic per-tenant ERP webhook (`POST /api/erp/webhook/{erp_type}`)
@@ -27104,3 +27011,96 @@ covers, a confirmed push moves to `done` in the same transaction as
 `sent_to_erp`, so the state is never durable there; the transition is still
 polled in case it is. *Holding the row lock across the ERP call*: a slow ERP
 would hold the invoice for the call's duration.
+
+## 529. The invoice timeline waits for its label slice before drawing a row (round 44)
+
+**Problem.** §522 accepted that an Activity row drawn before the lazy `audit`
+slice landed would show its token (`invoice.erp_failed`) for a moment and then
+relabel. The modal fired `ensureSlices('audit')` and the audit-log fetch side by
+side, and the fetch usually won, so the flash was the common case on a cold
+modal, not a corner.
+
+**Decision.** `lib/types/invoiceTimelineActions.ts::loadLabelledTimeline`
+resolves the rows only once both the fetch and `ensureSlices('audit')` have
+settled, and `InvoiceModal.svelte`'s `loadAuditLog` assigns through it, so the
+list's existing "nothing until loaded" state covers the slice too. This
+supersedes §522's accepted residue. `ensureSlices` never rejects (a slice that
+cannot load falls back to English, or keeps what it had, and settles), so the
+wait cannot strand the timeline; a failed fetch rejects as before. The
+`.activity-section` carries `data-ready`, backed by `auditLoading`.
+
+**Guard.** `invoiceTimelineActions.test.ts` pins that the rows are withheld
+until the slice settles, whichever lands first. `tests-e2e/invoices/detail.spec.ts`
+records every `.activity-action` text the DOM ever holds while the modal opens
+and fails on any raw `invoice.` / `exception.` / `audit.` token.
+
+**Rejected.** *Preloading the `audit` slice app-wide*: it is the console's whole
+vocabulary in six locales, paid on every page for one modal. *Rendering a
+placeholder label until the slice lands*: still a relabel, just a different
+flash.
+
+## 530. `/organization`'s panels share their form layout from `app.css`, under `.org-panel` (round 44)
+
+**Problem.** §526 gave each panel a scoped copy of the page's CSS. Thirteen
+panels carried the same `.form-grid` (with its ≤600px one-column rule),
+`.full-width` and `.section-footer`, and a copy had already drifted once: the
+Chat panel lost its phone rule (restored before this change), so its grid
+stayed two columns at 320px.
+
+**Decision.** Those rules are declared once in `src/app.css` as
+`.org-panel .form-grid` / `.full-width` / `.section-footer` plus the ≤600px
+rule, and a panel that uses them wears `class="card org-panel"` on its root
+`<section>`. That is the repo's existing mechanism (class-scoped globals in
+`app.css`, like `.modal label` and `.grid-container td`), at the narrowest
+scope: `.org-panel` appears nowhere else, and none of the three classes
+appears in markup nested inside one of these panels except `SearchPicker`'s
+`.full-width`, which sets the same `grid-column`. One namespace class keeps
+the specificity the scoped copies had (`.org-panel .form-grid` is 0-2-0, as
+`.form-grid.svelte-<hash>` was), so every element computes the same rules; no
+panel-local rule overrode these at equal specificity, so stylesheet order
+does not decide anything. `organization/sharedPanelCss.test.ts` refuses a
+scoped copy of a shared rule in any panel, requires `org-panel` on every panel
+using one, and pins the phone rule in `app.css`.
+
+**Not shared, deliberately.** The element rules (`label`, `label > span`, the
+text-entry `input` recipe) would, under `.org-panel`, reach the inputs of a
+`SecretField`, `CurrencyInput` or picker nested in a panel, which the scoped
+copies never touched. `.card`, `.card h2` and `.card-hint` are overridden by
+panel-local rules at equal specificity (`.getting-started`, `.field-gap`,
+`.domain-empty`), so a global copy would leave the result to stylesheet
+order. `OrgSettingPanel`'s `.section-footer` is a different rule (no rule
+line, no top padding) and it stays scoped, without `org-panel`. Those copies
+remain §526's.
+
+**Rejected.** *Rules in the page's `<style>` under `:global(...)`*: they would
+outrank the panels' own rules by the page's hash class, and depend on the
+panels only ever rendering inside the page. *A `FormGrid` wrapper component*:
+thirteen panels' markup would change for three layout rules, and its scoped
+`.form-grid` would still not reach `.full-width` children or the footer.
+
+## 531. `formatPeriod` assembles its label from parts, so a CLDR update cannot change it (round 44)
+
+**Problem.** `formatPeriod` (the chart-axis label on `/cfo` and the cash-flow
+panels) returned `toLocaleDateString(locale, {month: 'short', year: '2-digit'})`
+verbatim. CLDR 49 (ICU 79, shipped in Node 26) changed English's short-year
+patterns to carry an elision apostrophe: "Jun ’26" and "Jun 20, ’26" where
+CLDR 47 / 48 (Node 20 / 24, CI's Node 24) say "Jun 26" and "Jun 20, 26".
+`time.test.ts` failed on a Node 26 machine and passed in CI. The code, not the
+machine, was the fragile part: browsers ship their own ICU, so the label would
+have changed per user as their browser updated, with no change of ours.
+
+**Decision.** Build the label from `Intl.DateTimeFormat.formatToParts` and strip
+`’` / `'` from the literal that directly precedes the `year` part. CLDR still
+owns order, month names and every other separator (pt-BR "jun. de 26", ja
+"26年6月", de "Juni 26" are unchanged on CLDR 47–49). The unit test feeds the
+CLDR 49 part shape through a `formatToParts` spy, so both shapes are pinned on
+whichever ICU runs the suite.
+
+**Rejected.** *Adopt the apostrophe everywhere*: it does disambiguate "Jun ’26"
+from the 26th of June, but `formatMonth` already exists for a standalone month
+label (full year), and producing the mark on older CLDR means hand-inserting a
+locale-specific character, which is worse than removing one. *Pin Node 24
+locally / add an engines check*: the repo already runs fine on Node 26; the
+drift is in CLDR, which also reaches users through their browser, so a toolchain
+pin would hide the defect rather than fix it. *Loosen the test to accept either
+shape*: the variance is the bug (guard rail 4).

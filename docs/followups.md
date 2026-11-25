@@ -1333,16 +1333,20 @@ user-visible halves still open.
       from a few shared addresses and fails to verify at ten tenants in a
       window (stale secrets after a rotation, say) loses only the genuine
       deliveries of tenants whose data key is cold in that process (not
-      opened there in the last five minutes) until the window rolls. What
-      remains
-      is recovering the dropped events. **Durable fix:** the generic status polling sweep
-      (`backend/docs/erp-integration.md` § Polling job — not built) for the
-      generic route, and a Merge bill read-back sweep over pushed bills for
-      Merge — rather than any response that differs before verification.
-      **Trigger:** the first `ERP webhook dropped: the ERP credentials of
-      tenant … could not be opened` error or a frequent `unverified-delivery
-      budget spent` warning in production, a KMS throttling alarm on the credential key, or
-      the first customer relying on the generic route.
+      opened there in the last five minutes) until the window rolls. For the
+      generic route, the `erp-status-poll` sweep has landed (decisions §528,
+      `backend/docs/erp-integration.md` § Polling job): with
+      `FEOH_ERP_STATUS_POLL_SWEEP_ENABLED` on, it reads each bill at
+      `sent_to_erp` / `posted_in_erp` / `payment_scheduled` from the tenant's
+      ERP and applies a changed status through the webhook's own transition,
+      so a dropped delivery is recovered on the next tick (a void reported for
+      a `done` invoice still arrives only by webhook). What remains is Merge.
+      **Durable fix:** a Merge bill read-back sweep over pushed bills — rather
+      than any response that differs before verification. **Trigger:** the
+      first `ERP webhook dropped: the ERP credentials of tenant … could not be
+      opened` error or a frequent `unverified-delivery budget spent` warning in
+      production for a Merge tenant, or a KMS throttling alarm on the
+      credential key.
 
 ### Surfaced by round 12 (2026-11-15, round PR #716, decisions §410–§421)
 
