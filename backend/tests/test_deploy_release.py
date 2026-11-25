@@ -758,7 +758,8 @@ done
 # lookup needs one on every deployment, so decrypt-env.sh requires the pair and
 # smoke.sh refuses a public-config without it (docs/decisions.md §553).
 case "$url" in
-  */api/public-config) echo '{"signup_enabled": false, "hcaptcha_sitekey": "site-key-1"}' > "$out" ;;
+  */api/public-config)
+    echo '{"signup_enabled": false, "hcaptcha_sitekey": "site-key-1"}' > "$out" ;;
   *) echo "<!doctype html>" > "$out" ;;
 esac
 printf 200
