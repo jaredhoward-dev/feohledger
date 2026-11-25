@@ -770,8 +770,9 @@ async def _invoice_id_by_document(
     realm (``erp_link_realm.legacy_links_trusted``, decisions §423): ERP
     document ids are small per-ERP numbers, so once the tenant has connected
     elsewhere a NULL-realm invoice's "1042" says nothing about the new ERP's
-    bill 1042. With no realm at all (``mock``, an OAuth ERP with no consent)
-    no company can be named and nothing matches. Two or more candidates are
+    bill 1042. With no realm at all (an OAuth ERP with no consent) no company
+    can be named and nothing matches; the mock's bills are its own company's
+    (``erp_link_realm.bill_realm``, §538). Two or more candidates are
     refused, never guessed between: the caller answers the same silent 204 as
     for no match.
     """

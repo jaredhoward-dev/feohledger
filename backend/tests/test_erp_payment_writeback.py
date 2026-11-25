@@ -372,6 +372,23 @@ async def test_the_void_records_its_erp_void_and_the_sweep_finishes_it(realdb):
     assert erp_payment_writeback.PENDING_VOIDS_KEY not in instance.state_data
 
 
+async def test_voiding_a_payment_on_a_mock_pushed_bill_records_no_erp_void(realdb):
+    """A mock push records ``MOCK_BILL_REALM`` (§538), but nothing is ever
+    written back to the mock, so a void has nothing to undo there: no pending
+    marker that no sweep could ever clear."""
+    from app.services.erp_link_realm import MOCK_BILL_REALM
+
+    await _configure(realdb)
+    _, inv_id, pay_id = await _seed(realdb, realm=MOCK_BILL_REALM)
+    with patch("app.services.erp_payment_writeback.dispatch_void_writeback") as dispatched:
+        async with realdb.client(key="a", role="admin") as c:
+            resp = await c.post(f"/api/payments/{pay_id}/void", json={"reason": "wrong vendor"})
+    assert resp.status_code == 200, resp.text
+    dispatched.assert_not_called()
+    [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
+    assert erp_payment_writeback.PENDING_VOIDS_KEY not in instance.state_data
+
+
 async def test_an_accepted_short_settlement_writes_back_what_was_settled(realdb):
     await _configure(realdb)
     _, inv_id, pay_id = await _seed(realdb)

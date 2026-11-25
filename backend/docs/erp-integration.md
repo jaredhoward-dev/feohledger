@@ -357,7 +357,11 @@ matches nothing. An invoice pushed before realms were recorded counts only
 while the push's own legacy rule trusts it (`erp_link_realm.legacy_links_trusted`:
 the tenant is still on the realm migration 0115 recorded; decisions §423),
 because document ids are small per-ERP numbers that collide across ERPs; a
-connection that names no realm (`mock`) matches nothing. Two or more candidates are refused rather than guessed between, a
+connection that names no realm (no ERP configured, an OAuth ERP with no
+consent) matches nothing. The `mock` connection's bills are its own company's:
+a push through it records `erp_link_realm.MOCK_BILL_REALM`
+(`"mock:mock-company"`, `bill_realm`), so its route matches them like a real
+ERP's, and it never trusts a NULL-realm bill (decisions §538). Two or more candidates are refused rather than guessed between, a
 silent 204 like no match at all. The match is re-checked under the
 `get_invoice_for_update` row lock, so a confirmed re-push that replaced the bill
 in between is not acted on. A correlation id that is present still decides
@@ -423,8 +427,14 @@ about only under the connection that issued it, by the webhook's own
 by-document rule — one function, `erp_link_realm.bill_realm_clause`, called by
 both (§417 / §423 / §533): the push's recorded realm must be the current one, a
 pre-realm (NULL) push counts only while `legacy_links_trusted` holds, and a
-connection that names no company (`mock`, an OAuth ERP with no consent) polls
-nothing, as the webhook matches nothing for it. The push must also have been
+connection that names no company (an OAuth ERP with no consent) polls
+nothing, as the webhook matches nothing for it. **The mock is polled locally:**
+its pushes record `MOCK_BILL_REALM` (`erp_link_realm.bill_realm`), so with
+`FEOH_ERP_STATUS_POLL_SWEEP_ENABLED=true` a laptop tenant on the mock polls the
+bills it pushed (the mock always reads `open`, so a `sent_to_erp` bill moves to
+`posted_in_erp`). A NULL-realm bill is never polled on the mock, whatever the
+0115 snapshot says, since it may be a real ERP's from before realms were
+recorded (decisions §538). The push must also have been
 confirmed after the ERP went live (§428) when that moment is known.
 `approved` is polled because a payment void returns an invoice there with its
 bill and realm intact (§535): a dropped ERP `paid` must still be read, or the
@@ -1790,7 +1800,9 @@ NetSuite, Business Central, Sage Accounting (ZA), Sage Intacct, Merge.dev, Xero
 and QuickBooks Online.
 
 **A sync with no realm never touches another company's rows.** `mock`, and an
-OAuth ERP with no consent, have no realm. A sync under one leaves alone every
+OAuth ERP with no consent, have no realm for links (the mock's BILLS do —
+`MOCK_BILL_REALM`, decisions §538 — but its vendor and account ids are fixtures
+and filtering them would refuse every NULL fixture link at a local push). A sync under one leaves alone every
 row linked, or offered candidates, under a named realm: no re-judging,
 unlinking, id matching, re-linking by code or candidate refresh, and a pulled
 account whose code such a row holds is refused `code_taken`. It works only on

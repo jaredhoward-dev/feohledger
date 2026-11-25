@@ -39,7 +39,10 @@ from app.services.erp_adapters.base import (
 from app.services.erp_adapters.catalog import merge_erp_update
 from app.services.erp_link_realm import (
     LEGACY_REALM_KEY,
+    MOCK_BILL_REALM,
     UNNAMED_REALM,
+    bill_realm,
+    bill_realm_clause,
     connection_realm,
     legacy_links_trusted,
     link_is_live,
@@ -247,6 +250,47 @@ def test_a_no_realm_pull_stamps_a_sentinel_no_company_realm_can_equal():
     # a fixture link is never posted to a real company.
     assert not link_is_live(UNNAMED_REALM, PROD, trust_legacy=True)
     assert link_is_live(UNNAMED_REALM, None, trust_legacy=False)
+
+
+def test_the_mock_records_its_bills_under_its_own_company_and_no_other():
+    """§538: the mock names no company for LINKS (fixture ids, posts nowhere),
+    but its bills have one issuer, so a push records ``MOCK_BILL_REALM`` and the
+    webhook and the poll sweep attribute them under the one rule. No real
+    adapter's realm can equal it, nor can a link stamp."""
+    mock = {"type": "mock", "integration_method": "direct"}
+    assert connection_realm(mock) is None  # links: unchanged (§496)
+    assert bill_realm(mock) == MOCK_BILL_REALM
+    assert bill_realm({"integration_method": "direct"}) == MOCK_BILL_REALM  # blank type
+    assert MOCK_BILL_REALM.startswith("mock:") and MOCK_BILL_REALM != UNNAMED_REALM
+    for cfg in (SANDBOX_CFG, PROD_CFG, INTACCT_CFG, {"integration_method": "merge_dev"}):
+        assert bill_realm(cfg) == connection_realm(cfg) != MOCK_BILL_REALM
+    # Still nothing nameable: no ERP configured, an OAuth ERP with no consent.
+    assert bill_realm({}) is None and bill_realm(None) is None
+    assert bill_realm({"type": "quickbooks_online", "integration_method": "direct"}) is None
+
+
+def _clause_sql(erp_config) -> str | None:
+    from sqlalchemy import column
+
+    clause = bill_realm_clause(column("erp_realm"), erp_config)
+    if clause is None:
+        return None
+    return str(clause.compile(compile_kwargs={"literal_binds": True}))
+
+
+def test_the_bill_rule_never_widens_for_a_realm_less_real_adapter():
+    """A real adapter whose connection names no company still matches nothing,
+    and the mock never trusts a pre-realm (NULL) bill, whatever its snapshot."""
+    assert _clause_sql({}) is None
+    assert _clause_sql({"type": "xero", "integration_method": "direct"}) is None
+    assert _clause_sql({"type": "sage_accounting", "integration_method": "direct"}) is None
+    mock = {"type": "mock", "integration_method": "direct"}
+    for cfg in (mock, {**mock, LEGACY_REALM_KEY: MOCK_BILL_REALM}):
+        sql = _clause_sql(cfg)
+        assert sql == f"erp_realm = '{MOCK_BILL_REALM}'"
+    # A real realm keeps §423's legacy trust, and only under its own snapshot.
+    assert "IS NULL" in _clause_sql({**SANDBOX_CFG, LEGACY_REALM_KEY: SANDBOX})
+    assert "IS NULL" not in _clause_sql({**PROD_CFG, LEGACY_REALM_KEY: SANDBOX})
 
 
 def test_a_settings_save_never_sets_or_drops_the_snapshot_for_the_same_erp():

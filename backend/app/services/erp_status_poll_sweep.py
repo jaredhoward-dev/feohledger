@@ -15,8 +15,9 @@ carried it.
 Merge.dev (its deliveries go to its own route, and its read-back is separate)
 and does not report status itself (``supports_status_sync``: QuickBooks Online
 and Xero, which have the ``erp-status-sync`` sweep), and whose connection names
-a company (below). The mock adapter names none, so a laptop tenant on it polls
-nothing; the sweep still runs and is off by default (guard rail 7).
+a company (below). The mock adapter's bills name its own company
+(``erp_link_realm.MOCK_BILL_REALM``, §538), so a laptop tenant on it polls the
+bills it pushed; the sweep is off by default (guard rail 7).
 
 **Which invoices.** One with an ERP document id at a status a webhook could
 still move: :data:`POLLED_STATUSES`. ``done`` / ``paid`` / ``failed`` are not
@@ -25,8 +26,8 @@ ever would be unbounded. A bill is asked about only under the connection that
 issued it: ``erp_link_realm.bill_realm_clause``, the webhook's own by-document
 rule (§417 / §423, shared since §533) — the push's recorded realm must be the
 tenant's current one, a pre-realm (NULL) push counts only while
-``legacy_links_trusted`` holds, and a connection that names no company
-(``mock``, an OAuth ERP with no consent) polls nothing. When the ERP went live is
+``legacy_links_trusted`` holds (never on the mock, §538), and a connection that
+names no company (an OAuth ERP with no consent) polls nothing. When the ERP went live is
 known (§428) the push must have been confirmed after it too, so an id another
 ERP issued is never read against this one.
 

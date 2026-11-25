@@ -5,9 +5,11 @@ The generic per-tenant ERP webhook drops a delivery it cannot verify
 tenant's adapter for each sent bill's status and applies a change through the
 webhook's own transition (`services/erp_status_report`).
 
-Pinned here, on real Postgres, with the mock adapter's reads served for a
-directly connected `generic` ERP (a connection that names a company: the mock
-connection names none and is polled for nothing, §533):
+Pinned here, on real Postgres, against the real `mock` connection: its pushes
+record the mock's own company (`erp_link_realm.MOCK_BILL_REALM`, §538), so it is
+polled under the same realm rule as any real ERP. Only the legacy-realm cases
+need a connection with a real 0115 snapshot, and borrow a `generic` one served
+by the mock adapter:
 
 * a missed `open` moves `sent_to_erp → posted_in_erp` with the webhook's audit
   action, marked `source: poll`; a missed `paid` on a scheduled payment moves
@@ -50,14 +52,16 @@ from app.models.workflow import AuditLog, WorkflowInstance
 from app.services import erp_status_poll_sweep as sweep
 from app.services.erp_adapters.base import ErpCallBudgetExhausted, ErpInvoiceStatus
 from app.services.erp_adapters.mock_adapter import MockAdapter
+from app.services.erp_link_realm import MOCK_BILL_REALM
 
 TENANT = "a"
 MOCK_ERP = {"type": "mock", "integration_method": "direct"}
-#: A directly connected ERP whose connection names a company (realm
-#: ``generic:``); the ``_served_by_mock`` fixture answers its reads with the
-#: mock adapter.
+#: What a push through the mock records (§538).
+REALM = MOCK_BILL_REALM
+#: A directly connected ERP with a real realm (``generic:``), for the legacy
+#: (pre-realm) cases only; ``_served_by_mock`` answers its reads.
 GENERIC_ERP = {"type": "generic", "integration_method": "direct"}
-REALM = "generic:"
+GENERIC_REALM = "generic:"
 
 pytestmark = pytest.mark.plan("growth")
 
@@ -68,7 +72,7 @@ def _enabled(monkeypatch):
     monkeypatch.setattr(settings, "erp_status_poll_sweep_batch_size", 50)
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _served_by_mock(monkeypatch):
     """The ``generic`` ERP has no adapter in the registry; serve it with the
     mock adapter, so the realm-named connection is polled like a real one."""
@@ -235,7 +239,7 @@ async def _unrelated_exception(realdb, inv_id, exception_type: str) -> uuid.UUID
 
 
 async def test_a_missed_open_moves_sent_to_erp_to_posted(realdb, erp_reads):
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.sent_to_erp)
 
     result = await sweep.run_status_poll_sweep_once()
@@ -247,7 +251,7 @@ async def test_a_missed_open_moves_sent_to_erp_to_posted(realdb, erp_reads):
     assert row.actor_id is None
     assert row.details["source"] == "poll"
     assert row.details["erp_status"] == "posted"
-    assert row.details["erp_type"] == "generic"
+    assert row.details["erp_type"] == "mock"
     assert row.details["erp_document_id"] == await _doc(realdb, inv_id)
 
 
@@ -275,7 +279,7 @@ async def test_a_missed_paid_moves_a_scheduled_payment_to_paid_once_ours_complet
     realdb, erp_reads
 ):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
     await _payment(realdb, inv_id, status="completed", settled="1234.56")
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.paid
@@ -290,7 +294,7 @@ async def test_a_missed_paid_moves_a_scheduled_payment_to_paid_once_ours_complet
 
 async def test_a_missed_paid_over_a_short_settlement_is_held(realdb, erp_reads):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
     pay_id = await _payment(realdb, inv_id, status="completed", settled="1000.00")
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.paid
@@ -321,7 +325,7 @@ async def test_a_paid_read_while_our_payment_is_in_flight_is_held_and_blocked(
     from app.services.payment_runs import blocked_invoice_ids
 
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
     if claim == "payment_in_flight":
         await _payment(realdb, inv_id, status="processing")
@@ -354,7 +358,7 @@ async def test_a_paid_read_while_our_payment_is_in_flight_is_held_and_blocked(
     assert exc.raised_by_user_id is None
     assert exc.erp_report == {
         "kind": "paid_while_scheduled",
-        "erp_type": "generic",
+        "erp_type": "mock",
         "erp_document_id": doc,
         "event_id": None,
         "invoice_status": "payment_scheduled",
@@ -376,7 +380,7 @@ async def test_a_paid_read_while_our_payment_is_in_flight_is_held_and_blocked(
 
 async def test_an_unchanged_status_writes_nothing_to_the_trail(realdb, erp_reads):
     _, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
 
     first = await sweep.run_status_poll_sweep_once()
@@ -399,7 +403,7 @@ async def test_a_void_after_posting_opens_one_exception_not_reopened_once_resolv
     realdb, erp_reads
 ):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.cancelled
 
@@ -422,7 +426,7 @@ async def test_a_void_after_posting_opens_one_exception_not_reopened_once_resolv
 @pytest.mark.parametrize("read", [ErpInvoiceStatus.draft, ErpInvoiceStatus.unknown])
 async def test_a_status_with_no_webhook_equivalent_is_not_applied(realdb, erp_reads, read):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     reads[await _doc(realdb, inv_id)] = read
 
@@ -438,7 +442,7 @@ async def test_a_cancelled_read_is_not_swallowed_by_an_unrelated_open_row(realdb
     not stand in for the void: the void's own row opens, so resolving the
     other row leaves the void in front of a person (decisions §533)."""
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     unrelated = await _unrelated_exception(realdb, inv_id, "erp_reconciliation")
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.cancelled
@@ -455,7 +459,7 @@ async def test_a_cancelled_read_is_not_swallowed_by_an_unrelated_open_row(realdb
 async def test_a_deduplicated_void_is_not_counted_as_applied(realdb, erp_reads):
     """A void whose own row is already live changes nothing: counted unchanged."""
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     doc = await _doc(realdb, inv_id)
     reads[doc] = ErpInvoiceStatus.cancelled
@@ -484,7 +488,7 @@ async def test_settled_no_payment_opens_one_blocking_exception_and_leaves_the_in
     from app.services.payment_runs import blocked_invoice_ids
 
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, status)
     doc = await _doc(realdb, inv_id)
     reads[doc] = ErpInvoiceStatus.settled_no_payment
@@ -509,7 +513,7 @@ async def test_settled_no_payment_opens_one_blocking_exception_and_leaves_the_in
     assert exc.description_code == "exception.erp_settled_no_payment"
     assert exc.erp_report == {
         "kind": "settled_no_payment",
-        "erp_type": "generic",
+        "erp_type": "mock",
         "erp_document_id": doc,
         "source": "poll",
         "invoice_status": status.value,
@@ -523,7 +527,7 @@ async def test_settled_no_payment_opens_one_blocking_exception_and_leaves_the_in
 
 async def test_settled_no_payment_is_not_reraised_on_the_next_tick(realdb, erp_reads):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.settled_no_payment
 
@@ -540,7 +544,7 @@ async def test_settled_no_payment_is_not_reraised_once_closed_until_the_status_c
     realdb, erp_reads, closed_as
 ):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     doc = await _doc(realdb, inv_id)
     reads[doc] = ErpInvoiceStatus.settled_no_payment
@@ -579,7 +583,7 @@ async def test_settled_no_payment_is_not_swallowed_by_an_unrelated_blocking_row(
     from app.services.payment_runs import blocked_invoice_ids
 
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     unrelated = await _unrelated_exception(realdb, inv_id, "payment_reconciliation")
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.settled_no_payment
@@ -614,7 +618,7 @@ async def test_partially_paid_opens_one_blocking_exception_and_leaves_the_invoic
     from app.services.payment_runs import blocked_invoice_ids
 
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, status)
     doc = await _doc(realdb, inv_id)
     reads[doc] = ErpInvoiceStatus.partially_paid
@@ -630,7 +634,7 @@ async def test_partially_paid_opens_one_blocking_exception_and_leaves_the_invoic
     assert exc.raised_by_user_id is None
     assert exc.erp_report == {
         "kind": "partly_paid",
-        "erp_type": "generic",
+        "erp_type": "mock",
         "erp_document_id": doc,
         "source": "poll",
         "invoice_status": status.value,
@@ -653,7 +657,7 @@ async def test_partially_paid_opens_one_blocking_exception_and_leaves_the_invoic
 async def test_partially_paid_beside_settled_no_payment_each_open_their_own(realdb, erp_reads):
     """Two different facts, two rows: the kind, not the type, deduplicates."""
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     doc = await _doc(realdb, inv_id)
     reads[doc] = ErpInvoiceStatus.partially_paid
@@ -670,24 +674,47 @@ async def test_partially_paid_beside_settled_no_payment_each_open_their_own(real
 # ---------------------------------------------------------------------------
 
 
-async def test_a_connection_that_names_no_company_polls_nothing(realdb, erp_reads):
-    """The mock connection names no company, so — as the webhook's document-id
-    lookup matches nothing for it — no bill is attributed to it, whether its
-    push recorded no realm or one."""
+async def test_a_bill_the_mock_pushed_is_polled_under_its_own_company(realdb, erp_reads):
+    """What a push through the mock records (``bill_realm``, pinned at the push
+    in ``test_erp_push_flow.py``) is what the sweep polls under the one realm
+    rule, with no adapter stand-in: guard rail 7 end to end (§538)."""
+    from app.services.erp_link_realm import bill_realm
+
     _, asked = erp_reads
+    assert bill_realm(MOCK_ERP) == REALM
     await _write_erp(realdb, MOCK_ERP)
+    inv_id = await _seed(realdb, InvoiceStatus.sent_to_erp)
+
+    result = await sweep.run_status_poll_sweep_once()
+
+    assert asked == [await _doc(realdb, inv_id)] and result.invoices_polled == 1
+    assert await _status(realdb, inv_id) == InvoiceStatus.posted_in_erp
+
+
+@pytest.mark.parametrize("legacy_realm", [None, MOCK_BILL_REALM])
+async def test_a_pre_realm_bill_is_never_polled_on_the_mock(realdb, erp_reads, legacy_realm):
+    """A NULL-realm bill on a mock tenant may be a real ERP's from before realms
+    were recorded: the mock never trusts one, whatever the 0115 snapshot says
+    (§538). Nor is a link stamp (``"mock"``, no ``:``) ever a bill's realm."""
+    from app.services.erp_link_realm import LEGACY_REALM_KEY, UNNAMED_REALM
+
+    _, asked = erp_reads
+    erp = dict(MOCK_ERP)
+    if legacy_realm is not None:
+        erp[LEGACY_REALM_KEY] = legacy_realm
+    await _write_erp(realdb, erp)
     await _seed(realdb, InvoiceStatus.sent_to_erp, realm=None)
-    await _seed(realdb, InvoiceStatus.sent_to_erp, realm="mock")
+    await _seed(realdb, InvoiceStatus.sent_to_erp, realm=UNNAMED_REALM)
 
     result = await sweep.run_status_poll_sweep_once()
 
     assert asked == [] and result.invoices_polled == 0
 
 
-@pytest.mark.parametrize("pushed_realm", ["xero:tenant-1", "generic:other-company"])
+@pytest.mark.parametrize("pushed_realm", ["xero:tenant-1", "generic:", "mock:other-company"])
 async def test_a_bill_another_realm_issued_is_never_polled(realdb, erp_reads, pushed_realm):
     _, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     await _seed(realdb, InvoiceStatus.sent_to_erp, realm=pushed_realm)
 
     await sweep.run_status_poll_sweep_once()
@@ -697,10 +724,10 @@ async def test_a_bill_another_realm_issued_is_never_polled(realdb, erp_reads, pu
 
 @pytest.mark.parametrize(
     ("legacy_realm", "polled"),
-    [(None, False), ("netsuite:1234567", False), (REALM, True)],
+    [(None, False), ("netsuite:1234567", False), (GENERIC_REALM, True)],
 )
 async def test_a_pre_realm_bill_is_polled_only_while_its_legacy_realm_is_trusted(
-    realdb, erp_reads, legacy_realm, polled
+    realdb, erp_reads, _served_by_mock, legacy_realm, polled
 ):
     from app.services.erp_link_realm import LEGACY_REALM_KEY
 
@@ -734,7 +761,7 @@ def test_the_sweep_and_the_webhook_share_one_realm_rule():
 
 
 async def test_two_replicas_at_once_apply_once(realdb, erp_reads):
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.sent_to_erp)
 
     first, second = await asyncio.gather(
@@ -749,7 +776,7 @@ async def test_two_replicas_at_once_apply_once(realdb, erp_reads):
 
 async def test_two_replicas_reading_a_void_open_one_exception(realdb, erp_reads):
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
     reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.cancelled
 
@@ -770,7 +797,7 @@ async def test_a_tenant_whose_credentials_cannot_be_opened_is_skipped(
     from app.services.credential_crypto import CredentialCryptoError
 
     _, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.sent_to_erp)
 
     async def _sealed(org, block, *, db=None):
@@ -789,7 +816,7 @@ async def test_a_tenant_whose_credentials_cannot_be_opened_is_skipped(
 
 async def test_a_paused_budget_reads_nothing(realdb, erp_reads, monkeypatch):
     _, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.sent_to_erp)
 
     async def _paused(adapter):
@@ -805,7 +832,7 @@ async def test_a_paused_budget_reads_nothing(realdb, erp_reads, monkeypatch):
 
 async def test_a_read_the_budget_refuses_ends_the_pass(realdb, erp_reads):
     reads, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     first = await _seed(realdb, InvoiceStatus.sent_to_erp)
     second = await _seed(realdb, InvoiceStatus.sent_to_erp)
     refusal = ErpCallBudgetExhausted("mock", "tenant_budget", datetime.now(UTC))
@@ -822,7 +849,7 @@ async def test_a_read_the_budget_refuses_ends_the_pass(realdb, erp_reads):
 async def test_least_recently_polled_first_within_the_batch(realdb, erp_reads, monkeypatch):
     _, asked = erp_reads
     monkeypatch.setattr(settings, "erp_status_poll_sweep_batch_size", 1)
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     a = await _seed(realdb, InvoiceStatus.posted_in_erp)
     b = await _seed(realdb, InvoiceStatus.posted_in_erp)
 
@@ -834,7 +861,7 @@ async def test_least_recently_polled_first_within_the_batch(realdb, erp_reads, m
 
 async def test_a_bill_pushed_before_the_erp_went_live_is_not_polled(realdb, erp_reads):
     _, asked = erp_reads
-    await _write_erp(realdb, {**GENERIC_ERP, "configured_at": datetime.now(UTC).isoformat()})
+    await _write_erp(realdb, {**MOCK_ERP, "configured_at": datetime.now(UTC).isoformat()})
     await _seed(realdb, InvoiceStatus.sent_to_erp)  # confirmed an hour ago
 
     result = await sweep.run_status_poll_sweep_once()
@@ -868,7 +895,7 @@ async def test_a_paid_read_for_a_voided_back_approved_invoice_is_recorded(realdb
     from app.models.invoice_status import PAYABLE_STATUSES
 
     reads, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.approved)
     await _payment(realdb, inv_id, status="voided")
     doc = await _doc(realdb, inv_id)
@@ -897,7 +924,7 @@ async def test_a_paid_read_for_an_approved_invoice_with_a_live_card_is_refused_a
     from app.services.payment_runs import blocked_invoice_ids
 
     reads, _ = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.approved)
     await _card(realdb, inv_id)
     doc = await _doc(realdb, inv_id)
@@ -918,7 +945,7 @@ async def test_an_approved_invoice_never_pushed_is_not_polled(realdb, erp_reads)
     """`approved` is polled only for a bill in the ERP: a direct-schedule
     invoice with no document id is never read."""
     _, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.approved)
     async with realdb.sessionmaker(TENANT)() as s:
         await s.execute(update(Invoice).where(Invoice.id == inv_id).values(erp_document_id=None))
@@ -931,7 +958,7 @@ async def test_an_approved_invoice_never_pushed_is_not_polled(realdb, erp_reads)
 
 async def test_closed_invoices_are_not_polled(realdb, erp_reads):
     _, asked = erp_reads
-    await _write_erp(realdb, GENERIC_ERP)
+    await _write_erp(realdb, MOCK_ERP)
     for status in (InvoiceStatus.done, InvoiceStatus.paid, InvoiceStatus.failed):
         await _seed(realdb, status)
 

@@ -47,7 +47,7 @@ from app.models.invoice import Invoice
 from app.models.payment import Payment
 from app.services.audit_dispatch import dispatch_audit
 from app.services.erp_adapters.base import ErpAdapter, ErpPostResult, PaymentPayload
-from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+from app.services.erp_link_realm import MOCK_BILL_REALM, connection_realm, legacy_links_trusted
 from app.services.erp_status_sync import erp_finding, open_erp_reconciliation_exception
 from app.services.payment_methods import CARD_PAYMENT_METHODS
 from app.utils.dates import utc_today
@@ -420,7 +420,13 @@ async def record_pending_erp_void(db: AsyncSession, *, invoice: Invoice, payment
         await db.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id == invoice.id))
     ).scalar_one_or_none()
     state = dict((instance.state_data if instance else None) or {})
-    if instance is None or not state.get("erp_reference") or not state.get("erp_realm"):
+    # A mock bill is never written back (``bill_for_writeback`` reads the
+    # connection realm, which the mock lacks), so it has nothing to void and a
+    # marker would only stay pending for ever (§538).
+    recorded = state.get("erp_realm")
+    if instance is None or not state.get("erp_reference"):
+        return False
+    if recorded in (None, "", MOCK_BILL_REALM):
         return False
     pending = [str(p) for p in state.get(PENDING_VOIDS_KEY) or []]
     if str(payment.id) not in pending:
