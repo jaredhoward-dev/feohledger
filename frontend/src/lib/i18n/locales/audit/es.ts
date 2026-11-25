@@ -55,6 +55,7 @@ export const messages = {
 	'audit.action.card.clearing_refused': "Liquidación adicional de tarjeta rechazada",
 	'audit.action.card.authorization_lapsed': "Autorización de tarjeta caducada",
 	'audit.action.card.reversal_after_settlement': "Reversión en una tarjeta liquidada",
+	'audit.action.card.settlement_refused': "Liquidación de tarjeta rechazada: sin importe utilizable",
 	'audit.action.card.settled_after_cancel': "Tarjeta cobrada después de cancelarse",
 	'audit.action.card.details_viewed': "Datos de tarjeta consultados",
 	'audit.action.card.generated': "Tarjeta virtual emitida",

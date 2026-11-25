@@ -55,6 +55,7 @@ export const messages = {
 	'audit.action.card.clearing_refused': "Règlement supplémentaire de carte refusé",
 	'audit.action.card.authorization_lapsed': "Autorisation de carte expirée",
 	'audit.action.card.reversal_after_settlement': "Annulation sur une carte réglée",
+	'audit.action.card.settlement_refused': "Règlement de carte refusé : aucun montant exploitable",
 	'audit.action.card.settled_after_cancel': "Carte débitée après annulation",
 	'audit.action.card.details_viewed': "Détails de carte consultés",
 	'audit.action.card.generated': "Carte virtuelle émise",

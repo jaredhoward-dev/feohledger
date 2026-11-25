@@ -58,6 +58,7 @@ export const enAudit = {
 	'audit.action.card.clearing_refused': "Further card clearing refused",
 	'audit.action.card.authorization_lapsed': "Card authorization lapsed",
 	'audit.action.card.reversal_after_settlement': "Reversal on a settled card",
+	'audit.action.card.settlement_refused': "Card settlement refused: no usable amount",
 	'audit.action.card.settled_after_cancel': "Card charged after cancellation",
 	'audit.action.card.details_viewed': "Card details viewed",
 	'audit.action.card.generated': "Virtual card issued",

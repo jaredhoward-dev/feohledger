@@ -55,6 +55,7 @@ export const messages = {
 	'audit.action.card.clearing_refused': "Weitere Kartenabrechnung abgelehnt",
 	'audit.action.card.authorization_lapsed': "Kartenautorisierung verfallen",
 	'audit.action.card.reversal_after_settlement': "Stornierung einer abgerechneten Karte",
+	'audit.action.card.settlement_refused': "Kartenabrechnung abgelehnt: kein verwertbarer Betrag",
 	'audit.action.card.settled_after_cancel': "Karte nach Stornierung belastet",
 	'audit.action.card.details_viewed': "Kartendaten angezeigt",
 	'audit.action.card.generated': "Virtuelle Karte ausgegeben",
