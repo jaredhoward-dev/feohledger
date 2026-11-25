@@ -316,6 +316,38 @@ def _card_webhook_verified(
     return False
 
 
+#: Where each Nium template states its figure and that figure's currency
+#: (decisions §557). Nium names the amount differently per template, and the
+#: settlement's is not the authorization's: `CARD_SETTLEMENT_DEBIT_WEBHOOK`
+#: carries `authAmount` + `authCurrency` and no `transactionAmount`
+#: (https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/settlement-debit);
+#: `CARD_POS_APPROVED_WEBHOOK` carries `transactionAmount` + `transactionCurrency`
+#: (`authAmount` beside them has no currency of its own, .../pos-approved);
+#: `CARD_TRANSACTION_REVERSAL_WEBHOOK` and `..._REVERSAL_ADVICE_WEBHOOK` carry
+#: `transactionAmount` + `transactionCurrency` (.../transaction-reversal,
+#: .../transaction-reversal-advice). All checked 2026-11-25; every figure is a
+#: string in MAJOR units ("10.00", "1.00"). A decline moves nothing and is read
+#: for no figure. Nothing else is read: `amount` is no Nium field, and reading
+#: it first is what left a real settlement with no figure.
+_NIUM_AMOUNT_FIELDS: dict[str, tuple[str, str]] = {
+    "card_pos_approved_webhook": ("transactionAmount", "transactionCurrency"),
+    "card_settlement_debit_webhook": ("authAmount", "authCurrency"),
+    "card_transaction_reversal_webhook": ("transactionAmount", "transactionCurrency"),
+    "card_transaction_reversal_advice_webhook": ("transactionAmount", "transactionCurrency"),
+}
+
+
+def _nium_amount(body: dict):
+    """(raw figure, its stated currency) for a Nium delivery, read from the
+    fields its own template documents (`_NIUM_AMOUNT_FIELDS`), or (None, None)."""
+    fields = _NIUM_AMOUNT_FIELDS.get(str(body.get("template") or "").strip().lower())
+    if fields is None:
+        return None, None
+    amount_field, currency_field = fields
+    currency = str(body.get(currency_field) or "").strip().upper() or None
+    return body.get(amount_field), currency
+
+
 def _normalize_charge_amount(
     provider: str, amount, fallback: Decimal | None, currency: str | None = None
 ) -> Decimal | None:
@@ -1302,7 +1334,7 @@ def _card_transaction_id(provider: str, body: dict) -> str | None:
     * Mock: the simulator's `transaction_id`.
     """
     if provider == "lithic":
-        if str(body.get("type") or body.get("event_type") or "").lower() != _LITHIC_CARD_TXN_EVENT:
+        if str(body.get("event_type") or "").lower() != _LITHIC_CARD_TXN_EVENT:
             return None
         value = body.get("token")
     elif provider == "nium":
@@ -1590,13 +1622,15 @@ async def card_webhook(provider: str, request: Request):
         card_token = body.get("card_token") or body.get("card", {}).get("token")
         event_type = _lithic_event_type(body)
         amount = body.get("amount", 0)
+        amount_currency = None
         merchant = body.get("merchant", {}).get("descriptor")
     elif provider == "nium":
         card_token = body.get("cardHashId")
         # Nium's card webhooks name themselves in `template` and nowhere else
-        # (decisions §555); `amount` is read first as before (§544).
+        # (decisions §555), and state their figure in the field that template
+        # documents (§557).
         event_type = body.get("template") or ""
-        amount = body.get("amount") or body.get("transactionAmount") or 0
+        amount, amount_currency = _nium_amount(body)
         merchant = body.get("merchantName")
     elif provider == MOCK_WEBHOOK_PROVIDER and not settings.is_deployed:
         # The local equivalent of a provider's charge (guard rail 7, decisions
@@ -1608,6 +1642,7 @@ async def card_webhook(provider: str, request: Request):
         event_type = body.get("type", "")
         event_id = body.get("event_id")
         amount = body.get("amount", 0)
+        amount_currency = None
         merchant = (body.get("merchant") or {}).get("descriptor")
     else:
         return
@@ -1698,6 +1733,17 @@ async def card_webhook(provider: str, request: Request):
                 # commits; otherwise a rolled-back txn would strand the event
                 # id as "processed" and the retry would be deduped away.
                 claimed_event = str(event_id) if event_id else None
+
+                if (
+                    amount_currency is not None
+                    and card.currency
+                    and amount_currency != str(card.currency).upper()
+                ):
+                    # A figure in another currency is not this card's figure:
+                    # it is read as absent, never converted or taken as is
+                    # (decisions §557). A settlement without one is refused below.
+                    logger.warning("Card webhook: %s figure in another currency; unread", provider)
+                    amount = None
 
                 # Update card based on event. Only a name the provider's map
                 # lists is a stage; anything else changes nothing (§549).
@@ -1919,6 +1965,35 @@ async def card_webhook(provider: str, request: Request):
                 elif is_settled and card.status == "cancelled":
                     await _record_settlement_after_cancel(
                         db, card, _normalize_charge_amount(provider, amount, None, card.currency)
+                    )
+                elif (
+                    is_settled
+                    and card.status in _SETTLEABLE_CARD_STATUSES
+                    and (settled_reported is None or settled_reported <= 0)
+                ):
+                    # A clearing that states no usable figure (absent, zero or
+                    # negative, unparseable, another currency). Money may have moved, but
+                    # how much is unknown, and every stand-in — the card's limit,
+                    # its authorized hold — is a guess written onto the run's
+                    # payment and the rebate (decisions §557). Refused: the card
+                    # keeps its state, the run's card leg stays in flight (so the
+                    # invoice never reaches `paid` on it), and the refusal is on
+                    # the trail for a person to reconcile with the provider.
+                    logger.warning("Card webhook: settlement with no usable figure refused")
+                    await dispatch_audit(
+                        db,
+                        correlation_id=card.correlation_id or uuid.uuid4(),
+                        organization_id=card.organization_id,
+                        actor_id=None,
+                        action="card.settlement_refused",
+                        entity_type="virtual_card",
+                        entity_id=card.id,
+                        details={
+                            "last_four": card.last_four,
+                            "status": card.status,
+                            "reason": "no_amount",
+                            "currency": card.currency,
+                        },
                     )
                 elif is_settled and card.status in _SETTLEABLE_CARD_STATUSES:
                     # `charged` is the usual case. An unspent card settles too:

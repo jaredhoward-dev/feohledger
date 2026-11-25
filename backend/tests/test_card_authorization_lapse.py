@@ -27,6 +27,7 @@ from app.models.payment import Payment
 from app.models.virtual_card import CardRebate, VirtualCard
 from app.models.workflow import AuditLog
 from tests.test_card_money_path_regression import (
+    NIUM_AMOUNT_FIELDS,
     _card_row,
     _leg,
     _seed_invoice,
@@ -91,7 +92,12 @@ def _body(
             "merchantName": "Acme Fuel",
         }
         if amount is not None:
-            payload["transactionAmount" if outcome == "reversal" else "amount"] = amount
+            # The field Nium documents for this template, a string in major
+            # units (decisions §557).
+            field, currency_field = NIUM_AMOUNT_FIELDS.get(template, (None, None))
+            if field is not None:
+                payload[field] = str(amount)
+                payload[currency_field] = "USD"
     else:
         from app.services.card_adapters.mock_adapter import (
             MOCK_EVENT_AUTHORIZATION,
