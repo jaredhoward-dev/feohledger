@@ -2252,14 +2252,18 @@ async def status_sync_now_refusal(org: Organization) -> str | None:
 
 
 def status_sync_provider(org: Organization) -> str | None:
-    """The ERP an on-request pass reads, for its audit rows: the OAuth
-    connection's provider, else the configured ``settings.erp.type`` (an ERP
-    reached with stored credentials, NetSuite, has no connection block)."""
+    """The ERP an on-request pass reads, for its audit rows: the adapter the
+    configuration resolves to (``dispatcher.resolve_adapter_key``), as
+    :func:`status_sync_now_refusal` selects it. Never the OAuth block's
+    ``provider``: that block survives a switch of ERP (§270), so a NetSuite
+    tenant that once connected QuickBooks would be audited as QuickBooks
+    (decisions §550). ``None`` when no ERP is configured."""
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key
+
     erp_settings = (org.settings or {}).get("erp") or {}
-    if not isinstance(erp_settings, dict):
+    if not isinstance(erp_settings, dict) or not erp_settings:
         return None
-    oauth_meta = erp_settings.get("oauth") or {}
-    return oauth_meta.get("provider") or erp_settings.get("type") or None
+    return resolve_adapter_key(erp_settings)
 
 
 async def sync_org_now(org: Organization, *, now: datetime | None = None) -> StatusSyncResult:
