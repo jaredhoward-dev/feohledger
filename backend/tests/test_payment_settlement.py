@@ -19,12 +19,14 @@ import pytest
 
 from app.services.payment_settlement import (
     COVERAGE_COVERED,
+    COVERAGE_IN_FLIGHT,
     COVERAGE_SHORT,
     COVERAGE_UNCERTAIN,
     OUTCOME_AMOUNT_MISMATCH,
     OUTCOME_CURRENCY_MISMATCH,
     OUTCOME_MATCHED,
     OUTCOME_UNVERIFIED,
+    REASON_CARD_NOT_SPENT,
     REASON_NO_REPORTED_AMOUNT,
     REASON_NO_SETTLED_AMOUNT,
     REASON_REPORTED_AMOUNT_UNUSABLE,
@@ -601,6 +603,54 @@ def test_coverage_flag_defaults_off_so_every_existing_caller_is_unchanged():
         target_currency="USD",
     )
     assert c.state == COVERAGE_COVERED
+
+
+# ---------------------------------------------------------------------------
+# `awaiting_card_spend`: a run's card leg whose charge has not settled
+# (decisions §537, §544)
+# ---------------------------------------------------------------------------
+
+
+def _card_leg(**kw):
+    return settlement_coverage(
+        target_amount=Decimal("500.00"),
+        target_currency="USD",
+        **{"settled_currency": None, **kw},
+    )
+
+
+def test_no_figure_and_awaiting_card_spend_is_in_flight():
+    c = _card_leg(settled_amount=None, awaiting_card_spend=True)
+    assert (c.state, c.reason, c.shortfall) == (COVERAGE_IN_FLIGHT, REASON_CARD_NOT_SPENT, None)
+    assert c.completes_invoice is False
+
+
+def test_no_figure_and_not_awaiting_still_fails_open_to_covered():
+    """The amount-free-rail fail-open is untouched for every non-card caller."""
+    c = _card_leg(settled_amount=None, awaiting_card_spend=False)
+    assert (c.state, c.reason) == (COVERAGE_COVERED, REASON_NO_SETTLED_AMOUNT)
+    assert c.completes_invoice is True
+
+
+def test_an_unstorable_report_is_uncertain_even_while_awaiting_card_spend():
+    """Unstorable is checked first: a garbage figure is neither absent nor in
+    flight, and a person reconciles it."""
+    c = _card_leg(settled_amount=None, settled_amount_unstorable=True, awaiting_card_spend=True)
+    assert (c.state, c.reason) == (COVERAGE_UNCERTAIN, REASON_SETTLED_AMOUNT_UNSTORABLE)
+
+
+@pytest.mark.parametrize(
+    ("settled", "state"),
+    [("500.00", COVERAGE_COVERED), ("300.00", COVERAGE_SHORT)],
+)
+def test_a_figure_on_record_is_judged_on_the_amount_whatever_the_flag(settled, state):
+    """The flag only decides what NO figure means. A caller that must ignore a
+    figure (an authorization-only card leg, §544) passes None; the function
+    never second-guesses one it is given."""
+    c = _card_leg(settled_amount=Decimal(settled), settled_currency="USD", awaiting_card_spend=True)
+    assert c.state == state
+    if state == COVERAGE_SHORT:
+        assert c.shortfall == Decimal("200.00")
 
 
 # ---------------------------------------------------------------------------
