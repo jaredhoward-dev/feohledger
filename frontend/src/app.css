@@ -1504,6 +1504,51 @@ html.has-bulk-bar body {
 	font-style: normal;
 }
 
+/* --- /organization settings panels (lib/components/organization/) ---
+   The layout rules every panel's form shares, once instead of a scoped copy
+   per panel (one copy lost its phone rule; decisions §530). A panel opts in
+   with `class="card org-panel"` on its root <section>.
+
+   Namespaced under `.org-panel` so nothing outside a panel is reached, and
+   at exactly the specificity the scoped copies had: `.org-panel .form-grid`
+   is 0-2-0, as Svelte's `.form-grid.svelte-<hash>` was. So a panel's own
+   compound rule (`label.switch-row`, 0-2-1) still wins as before.
+
+   Only class rules live here. The element rules (`label`, the text-entry
+   `input` recipe) stay scoped in each panel: under `.org-panel` they would
+   reach the inputs of a SecretField / CurrencyInput / picker nested in the
+   panel, which the scoped copies never touched. `.card`, `.card h2` and
+   `.card-hint` stay scoped too: panel-local rules override them at equal
+   specificity (`.getting-started`, `.field-gap`), which a global copy
+   would leave to stylesheet order. `organization/sharedPanelCss.test.ts`
+   refuses a scoped copy of these rules in any panel. */
+.org-panel .form-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 14px;
+	margin-top: 14px;
+}
+.org-panel .full-width {
+	grid-column: 1 / -1;
+}
+/* Wraps at 320px (WCAG 1.4.10): the row carries a Save button, an optional
+   Test button and an optional result, all `white-space: nowrap`, so without
+   a wrap it cannot shrink below its max-content width. */
+.org-panel .section-footer {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-start;
+	gap: 12px;
+	margin-top: 16px;
+	padding-top: 14px;
+	border-top: 1px solid var(--border);
+}
+@media (max-width: 600px) {
+	.org-panel .form-grid {
+		grid-template-columns: 1fr;
+	}
+}
+
 /* --- KPI cards (KpiCard) --- */
 .kpi-row {
 	display: flex;

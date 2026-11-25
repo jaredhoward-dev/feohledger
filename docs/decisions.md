@@ -27009,3 +27009,42 @@ generic route, warm / cold / past the TTL. `tests/test_provider_credentials.py`:
 the predicate against a fake KMS (no call, no warming or refresh, the context
 scoped, the TTL), false for a local envelope, and the row-level spelling on real
 Postgres.
+
+## 530. `/organization`'s panels share their form layout from `app.css`, under `.org-panel` (round 44)
+
+**Problem.** §526 gave each panel a scoped copy of the page's CSS. Thirteen
+panels carried the same `.form-grid` (with its ≤600px one-column rule),
+`.full-width` and `.section-footer`, and a copy had already drifted once: the
+Chat panel lost its phone rule (restored before this change), so its grid
+stayed two columns at 320px.
+
+**Decision.** Those rules are declared once in `src/app.css` as
+`.org-panel .form-grid` / `.full-width` / `.section-footer` plus the ≤600px
+rule, and a panel that uses them wears `class="card org-panel"` on its root
+`<section>`. That is the repo's existing mechanism (class-scoped globals in
+`app.css`, like `.modal label` and `.grid-container td`), at the narrowest
+scope: `.org-panel` appears nowhere else, and none of the three classes
+appears in markup nested inside one of these panels except `SearchPicker`'s
+`.full-width`, which sets the same `grid-column`. One namespace class keeps
+the specificity the scoped copies had (`.org-panel .form-grid` is 0-2-0, as
+`.form-grid.svelte-<hash>` was), so every element computes the same rules; no
+panel-local rule overrode these at equal specificity, so stylesheet order
+does not decide anything. `organization/sharedPanelCss.test.ts` refuses a
+scoped copy of a shared rule in any panel, requires `org-panel` on every panel
+using one, and pins the phone rule in `app.css`.
+
+**Not shared, deliberately.** The element rules (`label`, `label > span`, the
+text-entry `input` recipe) would, under `.org-panel`, reach the inputs of a
+`SecretField`, `CurrencyInput` or picker nested in a panel, which the scoped
+copies never touched. `.card`, `.card h2` and `.card-hint` are overridden by
+panel-local rules at equal specificity (`.getting-started`, `.field-gap`,
+`.domain-empty`), so a global copy would leave the result to stylesheet
+order. `OrgSettingPanel`'s `.section-footer` is a different rule (no rule
+line, no top padding) and it stays scoped, without `org-panel`. Those copies
+remain §526's.
+
+**Rejected.** *Rules in the page's `<style>` under `:global(...)`*: they would
+outrank the panels' own rules by the page's hash class, and depend on the
+panels only ever rendering inside the page. *A `FormGrid` wrapper component*:
+thirteen panels' markup would change for three layout rules, and its scoped
+`.form-grid` would still not reach `.full-width` children or the footer.

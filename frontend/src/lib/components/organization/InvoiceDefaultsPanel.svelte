@@ -51,7 +51,7 @@
 	}
 </script>
 
-<section class="card" id="org-defaults">
+<section class="card org-panel" id="org-defaults">
 	<h2>{m('org.section.defaults')}</h2>
 	<p class="card-hint">{m('org.defaults.hint')} <HelpTip term="reporting-currency" /></p>
 	<div class="form-grid">
@@ -95,9 +95,10 @@
 </section>
 
 <style>
-	/* The page's panel recipe, copied rather than shared: Svelte scopes a
-	   page's <style> to the page, so a panel component carries the rules its
-	   own markup needs (the pattern every `organization/` panel follows). */
+	/* The page's panel recipe, copied: Svelte scopes a page's <style> to the
+	   page, so a panel carries the rules its own markup needs. The form layout
+	   (`.form-grid`, `.full-width`, `.section-footer`) is shared instead, from
+	   app.css under `.org-panel` (decisions §530). */
 	.card {
 		background: var(--surface);
 		border: 1px solid var(--border);
@@ -115,17 +116,6 @@
 		font-size: 0.82rem;
 		color: var(--text-muted);
 		margin: 0 0 14px;
-	}
-
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
-	.full-width {
-		grid-column: 1 / -1;
 	}
 
 	label {
@@ -170,17 +160,6 @@
 		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
 	}
 
-	/* Wraps at 320px (WCAG 1.4.10): see the page's `.section-footer`. */
-	.section-footer {
-		display: flex;
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
-	}
-
 	.btn-save-section {
 		padding: 8px 18px;
 		border-radius: 6px;
@@ -201,11 +180,5 @@
 	.btn-save-section:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
 	}
 </style>

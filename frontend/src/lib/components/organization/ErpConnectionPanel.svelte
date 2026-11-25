@@ -736,7 +736,7 @@
 	</div>
 {/snippet}
 
-<section class="card" data-testid="erp-panel">
+<section class="card org-panel" data-testid="erp-panel">
 	<div class="help-row">
 		<h2>{m('org.section.erp')}</h2>
 		<HelpTip term="erp-sync" />
@@ -1086,17 +1086,6 @@
 		color: var(--danger);
 	}
 
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
-	.full-width {
-		grid-column: 1 / -1;
-	}
-
 	label {
 		display: flex;
 		flex-direction: column;
@@ -1294,11 +1283,5 @@
 
 	.test-result.failure {
 		color: var(--danger);
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
 	}
 </style>

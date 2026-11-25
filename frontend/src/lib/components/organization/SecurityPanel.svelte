@@ -22,7 +22,7 @@
 	} = $props();
 </script>
 
-<section class="card">
+<section class="card org-panel">
 	<h2>{m('org.section.security')}</h2>
 	<p class="card-hint">
 		{m('org.security.hint')}
@@ -116,22 +116,6 @@
 		font-size: 0.82rem;
 		font-weight: 600;
 		margin: 8px 0 0;
-	}
-
-	.section-footer {
-		display: flex;
-		/* Same reason as `.erp-test-row` below: this row carries a Save button, an
-		   optional Test button and an optional result message, all of them
-		   `white-space: nowrap`. Without a wrap the row cannot shrink below its
-		   own max-content width and pushes the whole document sideways at 320px
-		   — WCAG 1.4.10. The `gap` replaces the spacing the buttons used to get
-		   for free from sitting on one line. */
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
 	}
 
 	.btn-save-section {
