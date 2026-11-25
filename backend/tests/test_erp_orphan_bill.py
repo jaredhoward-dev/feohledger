@@ -778,3 +778,115 @@ async def test_a_key_no_other_invoice_shares_is_looked_up(realdb):
     assert verdicts["erp_orphan_lookup_refusal"] is None
     assert res.status_code == 200, res.text
     assert res.json()["found"] is True and adapter.lookups == 1
+
+
+# ---------------------------------------------------------------------------
+# The shared-key check reads the contact the lookup sends (decisions §569)
+# ---------------------------------------------------------------------------
+
+_XERO_SETTINGS = {
+    "erp": {
+        "type": "xero",
+        "integration_method": "direct",
+        "oauth": {"external_tenant_id": "org-x"},
+    }
+}
+
+
+async def _kept(mk, org_id, vendor_id, *, realm, erp_id):
+    from app.models.vendor import VendorErpLink
+
+    async with mk() as s:
+        s.add(
+            VendorErpLink(
+                organization_id=org_id, vendor_id=vendor_id, realm=realm, erp_vendor_id=erp_id
+            )
+        )
+        await s.commit()
+
+
+@pytest.mark.parametrize("sharer", ["row_link", "kept_link"])
+async def test_the_shared_key_follows_the_contact_the_lookup_sends(realdb, sharer):
+    """V1's row link is D in another company, and C is the link kept for the
+    connected one, so the lookup sends ContactIDs=C. Another vendor holding C
+    (as its row link, or kept under any company) with an invoice of the same
+    number shares the key: reading only V1's row link (D) missed it, and the
+    lookup could have named, and the void voided, that invoice's bill."""
+    from app.services.erp_bill_void import shared_lookup_keys
+    from app.services.erp_link_realm import connection_realm
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    realm = connection_realm(_XERO_SETTINGS["erp"])
+    c_id = f"xero-c-{uuid.uuid4().hex[:8]}"
+    v1 = await _vendor(mk, info.org_id, erp_id=f"xero-d-{uuid.uuid4().hex[:8]}", realm="xero:org-y")
+    await _kept(mk, info.org_id, v1, realm=realm, erp_id=c_id)
+    if sharer == "row_link":
+        v2 = await _vendor(mk, info.org_id, erp_id=c_id, realm=realm)
+    else:
+        v2 = await _vendor(mk, info.org_id, erp_id=f"xero-e-{uuid.uuid4().hex[:8]}", realm=realm)
+        await _kept(mk, info.org_id, v2, realm="xero:org-z", erp_id=c_id)
+    number = f"INV-{uuid.uuid4().hex[:6]}"
+    await _seed(mk, info.org_id, number=number, vendor_id=v2, status=InvoiceStatus.done)
+    mine = await _seed(mk, info.org_id, number=number, vendor_id=v1)
+    lone = await _seed(mk, info.org_id, number=f"{number}-LONE", vendor_id=v1)
+    async with mk() as s:
+        invoices = [await s.get(Invoice, mine), await s.get(Invoice, lone)]
+        assert await shared_lookup_keys(s, _XERO_SETTINGS, invoices) == {mine}
+
+
+async def test_the_shared_key_check_is_a_bounded_number_of_queries(realdb):
+    """A page of exceptions asks for every failed push at once: the check is
+    the same handful of statements for one invoice as for many."""
+    from app.services.erp_bill_void import shared_lookup_keys
+    from tests.query_counter import QueryCounter
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    ids = []
+    for _ in range(6):
+        vendor = await _vendor(mk, info.org_id, erp_id=f"xero-q-{uuid.uuid4().hex[:8]}")
+        ids.append(
+            await _seed(mk, info.org_id, number=f"QC-{uuid.uuid4().hex[:6]}", vendor_id=vendor)
+        )
+    async with mk() as s:
+        invoices = [await s.get(Invoice, i) for i in ids]
+        with QueryCounter() as one:
+            await shared_lookup_keys(s, _XERO_SETTINGS, invoices[:1])
+        with QueryCounter() as many:
+            await shared_lookup_keys(s, _XERO_SETTINGS, invoices)
+    assert len(many) == len(one) <= 3
+
+
+async def test_the_exception_list_and_detail_carry_the_shared_key_refusal(realdb):
+    """The queue serves the same verdict the lookup gives: a duplicate flag on
+    a failed push whose key another invoice shares says
+    `erp_lookup_unsupported`, on the list row and the detail alike."""
+    from app.services.exception_service import create_exception
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    vendor = await _vendor(mk, info.org_id, erp_id=f"xero-contact-{uuid.uuid4().hex[:8]}")
+    tag = uuid.uuid4().hex[:6]
+    number = f"ORPH-S-{tag}"
+    failed = await _seed(mk, info.org_id, number=number, vendor_id=vendor)
+    await _seed(mk, info.org_id, number=number, vendor_id=vendor, status=InvoiceStatus.done)
+    async with mk() as s:
+        exc = await create_exception(
+            s,
+            exception_type="duplicate",
+            severity="error",
+            description="detector output",
+            organization_id=info.org_id,
+            invoice=await s.get(Invoice, failed),
+            raised_by_user_id=None,
+        )
+        exc_id = str(exc.id)
+        await s.commit()
+    with _adapter(_Adapter()), _shared_key():
+        async with realdb.client(key=TENANT, role="admin") as c:
+            detail = (await c.get(f"/api/exceptions/{exc_id}")).json()
+            listed = (await c.get("/api/exceptions", params={"search": number})).json()
+    assert detail["erp_orphan_lookup_refusal"]["code"] == "erp_lookup_unsupported"
+    row = next(r for r in listed["items"] if r["id"] == exc_id)
+    assert row["erp_orphan_lookup_refusal"]["code"] == "erp_lookup_unsupported"

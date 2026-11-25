@@ -905,41 +905,96 @@ async def shared_lookup_keys(db: AsyncSession, org_settings: dict | None, invoic
     shares, when the configured adapter's key is not unique to one invoice
     (``bill_lookup_key_shared``: Xero's supplier + number, decisions §566).
     Empty, with no query, for every other adapter. A caller passes only the
-    invoices a verdict is served for (failed pushes that may have posted)."""
+    invoices a verdict is served for (failed pushes that may have posted).
+
+    "Shares" is: another invoice of ANY status (a rejected or done one may
+    still have a bill in the ERP) with the same number, trimmed and case-folded
+    (wider than the ERP's exact match, so it errs toward refusing), from the
+    same supplier. The supplier is the invoice's vendor row, or any vendor that
+    could carry the same ERP contact: the contact the lookup itself sends
+    (``vendor_erp_links.vendor_erp_ids`` in the connection's realm, as
+    ``erp._resolve_erp_refs`` resolves it: the row link when live there, else a
+    kept link, §284 / §356) and the vendor row's own ``erp_vendor_id``,
+    matched against every other vendor's row link AND every kept link it holds
+    in any realm (decisions §569). An invoice with no vendor shares nothing;
+    its lookup cannot run (the adapter refuses it unlinked).
+
+    At most three queries whatever the page size: the candidates' vendors,
+    their kept links in the realm, and one grouped read of every invoice
+    carrying one of the candidates' numbers (decisions §569)."""
+    from sqlalchemy import func, select
+
+    from app.models.vendor import Vendor, VendorErpLink
+    from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+    from app.services.vendor_erp_links import vendor_erp_ids
+
     cls = _configured_adapter_class(org_settings)
     if not invoices or getattr(cls, "bill_lookup_key_shared", False) is not True:
         return set()
-    return {inv.id for inv in invoices if await _key_shared_with(db, inv)}
+    candidates = [inv for inv in invoices if inv.vendor_id is not None]
+    if not candidates:
+        return set()
 
-
-async def _key_shared_with(db: AsyncSession, invoice: Invoice) -> bool:
-    """Does any OTHER invoice in this tenant carry ``invoice``'s number
-    (trimmed, case-folded: wider than the ERP's exact match, so it errs toward
-    refusing) from the same supplier — the same vendor row, or any vendor
-    linked to the same ERP contact? Any status counts: a rejected or done
-    invoice may still have a bill in the ERP. An invoice with no vendor shares
-    nothing; its lookup cannot run (the adapter refuses it unlinked)."""
-    from sqlalchemy import func, or_, select
-
-    from app.models.vendor import Vendor
-
-    if invoice.vendor_id is None:
-        return False
-    linked = select(Vendor.erp_vendor_id).where(Vendor.id == invoice.vendor_id).scalar_subquery()
-    suppliers = select(Vendor.id).where(
-        or_(Vendor.id == invoice.vendor_id, Vendor.erp_vendor_id == linked)
-    )
-    row = await db.execute(
-        select(Invoice.id)
-        .where(
-            Invoice.id != invoice.id,
-            func.lower(func.trim(Invoice.invoice_number))
-            == (invoice.invoice_number or "").strip().lower(),
-            Invoice.vendor_id.in_(suppliers),
+    erp = (org_settings or {}).get("erp") if isinstance(org_settings, dict) else None
+    config = erp if isinstance(erp, dict) and erp else _LOCAL_ERP
+    realm = connection_realm(config)
+    trust_legacy = legacy_links_trusted(config, realm)
+    vendor_rows = (
+        await db.execute(
+            select(Vendor.id, Vendor.erp_vendor_id, Vendor.erp_link_realm).where(
+                Vendor.id.in_({inv.vendor_id for inv in candidates})
+            )
         )
-        .limit(1)
+    ).all()
+    # One organization per tenant DB; the kept-link read is scoped by it.
+    in_realm = (
+        await vendor_erp_ids(
+            db,
+            candidates[0].organization_id,
+            vendor_rows,
+            realm=realm,
+            trust_legacy=trust_legacy,
+        )
+        if vendor_rows
+        else {}
     )
-    return row.first() is not None
+    contacts: dict = {
+        row.id: {c for c in (in_realm.get(row.id), row.erp_vendor_id) if c} for row in vendor_rows
+    }
+
+    def number_key(inv) -> str:
+        return (inv.invoice_number or "").strip().lower()
+
+    key = func.lower(func.trim(Invoice.invoice_number))
+    sharers = (
+        await db.execute(
+            select(
+                Invoice.id,
+                key,
+                Invoice.vendor_id,
+                Vendor.erp_vendor_id,
+                func.array_remove(func.array_agg(VendorErpLink.erp_vendor_id), None),
+            )
+            .join(Vendor, Vendor.id == Invoice.vendor_id)
+            .outerjoin(VendorErpLink, VendorErpLink.vendor_id == Vendor.id)
+            .where(key.in_({number_key(inv) for inv in candidates}))
+            .group_by(Invoice.id, Vendor.id)
+        )
+    ).all()
+    by_number: dict[str, list] = {}
+    for row in sharers:
+        by_number.setdefault(row[1], []).append(row)
+
+    shared = set()
+    for inv in candidates:
+        mine = contacts.get(inv.vendor_id, set())
+        for other_id, _, other_vendor, other_row, other_kept in by_number.get(number_key(inv), []):
+            if other_id == inv.id:
+                continue
+            if other_vendor == inv.vendor_id or mine & ({other_row, *(other_kept or [])} - {None}):
+                shared.add(inv.id)
+                break
+    return shared
 
 
 def orphan_lookup_verdict(
