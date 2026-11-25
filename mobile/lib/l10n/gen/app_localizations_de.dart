@@ -3972,6 +3972,15 @@ class AppLocalizationsDe extends AppLocalizations {
       'Ihr ERP zeigt diese Rechnung weiterhin als bezahlt an – durch eine Zahlung, die in FeohLedger storniert wurde, deren Stornierung im ERP aber fehlgeschlagen ist. Stornieren Sie diese Zahlung im ERP, damit die Bücher übereinstimmen.';
 
   @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp enthält möglicherweise eine Skontogutschrift, die FeohLedger für die Zahlung dieser Rechnung erstellt hat, aber nicht automatisch verrechnen oder stornieren konnte. Suchen Sie dort die Gutschrift mit der Kennzeichnung „FeohLedger discount“ und der ID dieser Zahlung, und verrechnen oder löschen Sie sie, damit das Skonto nur einmal gezählt wird.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Ihr ERP enthält möglicherweise eine Skontogutschrift, die FeohLedger für die Zahlung dieser Rechnung erstellt hat, aber nicht automatisch verrechnen oder stornieren konnte. Suchen Sie dort die Gutschrift mit der Kennzeichnung „FeohLedger discount“ und der ID dieser Zahlung, und verrechnen oder löschen Sie sie, damit das Skonto nur einmal gezählt wird.';
+
+  @override
   String get exceptionDescriptionErpSyncBackFailed =>
       'Die Zahlung dieser Rechnung wurde abgewickelt, aber FeohLedger konnte die Erfassung nicht abschließen, daher steht die Rechnung noch nicht auf „Bezahlt“, obwohl das Geld geflossen ist. Nichts wiederholt dies automatisch: Verwenden Sie „ERP-Abgleich wiederholen“ beim Zahlungslauf dieser Zahlung unter Zahlungen.';
 

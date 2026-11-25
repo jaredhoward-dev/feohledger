@@ -3978,6 +3978,15 @@ class AppLocalizationsEs extends AppLocalizations {
       'Su ERP sigue mostrando esta factura como pagada mediante un pago que se anuló en FeohLedger, porque no se pudo anular en el ERP. Anule ese pago en el ERP para que los libros cuadren.';
 
   @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp puede tener un abono por descuento por pronto pago que FeohLedger creó para el pago de esta factura y que no pudo aplicar ni revertir automáticamente. Busque allí el abono marcado como «FeohLedger discount» con el id de este pago, y aplíquelo o elimínelo para que el descuento se cuente una sola vez.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Su ERP puede tener un abono por descuento por pronto pago que FeohLedger creó para el pago de esta factura y que no pudo aplicar ni revertir automáticamente. Busque allí el abono marcado como «FeohLedger discount» con el id de este pago, y aplíquelo o elimínelo para que el descuento se cuente una sola vez.';
+
+  @override
   String get exceptionDescriptionErpSyncBackFailed =>
       'El pago de esta factura se liquidó, pero FeohLedger no pudo terminar de registrarlo, así que la factura no ha pasado a «Pagada» aunque el dinero ya salió. Nada lo reintenta automáticamente: use «Reintentar sincronización ERP» en la ejecución de pago correspondiente, en Pagos.';
 

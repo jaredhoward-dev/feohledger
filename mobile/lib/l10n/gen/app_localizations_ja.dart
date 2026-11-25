@@ -3786,6 +3786,15 @@ class AppLocalizationsJa extends AppLocalizations {
       'ご利用の ERP では、FeohLedger で無効化された支払いによってこの請求書がまだ支払済みと表示されています。ERP での無効化に失敗したためです。帳簿を一致させるため、ERP でその支払いを無効化してください。';
 
   @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp に、FeohLedger がこの請求書の支払いのために作成したものの、自動で適用または取り消しできなかった早期支払割引のクレジットが残っている可能性があります。そこで「FeohLedger discount」とこの支払いの ID が記載されたクレジットを探し、割引が一度だけ計上されるよう適用または削除してください。';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'ご利用の ERP に、FeohLedger がこの請求書の支払いのために作成したものの、自動で適用または取り消しできなかった早期支払割引のクレジットが残っている可能性があります。そこで「FeohLedger discount」とこの支払いの ID が記載されたクレジットを探し、割引が一度だけ計上されるよう適用または削除してください。';
+
+  @override
   String get exceptionDescriptionErpSyncBackFailed =>
       'この請求書の支払いは決済されましたが、FeohLedger が記録を完了できなかったため、資金は出金済みにもかかわらず請求書は「支払済み」になっていません。自動では再試行されません。「支払い」でこの支払いの支払実行にある「ERP連携を再実行」を使用してください。';
 
