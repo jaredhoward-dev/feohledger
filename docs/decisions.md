@@ -30270,3 +30270,107 @@ namesake without our marker raises; two carrying our marker raise; every
 unreadable window raises; a payload the push would refuse raises before any
 call), `test_erp_orphan_bill.py` (both offer the lookup, neither key is shared,
 the served verdict offers it, `shared_lookup_keys` makes no query for Sage).
+
+## 577. §575's API shapes verified against published schemas; an unapplied or half-reversed discount credit is recorded by id; deleting an invoice a live virtual card holds is refused (round 49 verification)
+
+**Correction to §575's citation.** §575, the two adapters' comments and
+`backend/docs/erp-integration.md` said the shapes were read from Intuit's and
+Xero's reference pages on 2026-11-25. Those pages render client-side and were
+not fetched. §575 stands as written (append-only); this entry records what was
+actually checked, on 2026-11-25, and the comments and the doc now cite it.
+
+- **QuickBooks — confirmed** in Intuit's entity schema, `Finance.xsd` in
+  <https://github.com/intuit/QuickBooks-V3-Java-SDK> (branch `develop`, last
+  changed in commit 865ec279): VendorCredit = PurchaseByVendor (`VendorRef`) +
+  Transaction (`TxnDate`, `PrivateNote`, `CurrencyRef`, `DocNumber`, `Line`),
+  lines taking `AccountBasedExpenseLineDetail.AccountRef`; BillPayment's
+  `VendorRef`, `PayType`, `CheckPayment.BankAccountRef` /
+  `CreditCardPayment.CCAccountRef`, `TotalAmt`, `Line[].LinkedTxn`; `Bill` and
+  `VendorCredit` in the LinkedTxn type enum.
+- **QuickBooks — unconfirmed** (no primary page could be fetched; search
+  results only): that a TotalAmt-0 BillPayment linking the Bill and the
+  VendorCredit is how the API applies a credit; that `requestid` replays a
+  `vendorcredit` create, for how long, whether it guards two identical
+  requests in flight, and whether an error answer is replayed for the key's
+  life; `vendorcredit?operation=delete`. We never query a VendorCredit by
+  `PrivateNote`: ours is found through the bill's linked BillPayments, or by
+  the id we recorded (below).
+- **Xero — confirmed** in the published OpenAPI spec,
+  <https://github.com/XeroAPI/Xero-OpenAPI/blob/master/xero_accounting.yaml>
+  (v20.1.0, last changed in commit cad38324): `PUT CreditNotes` with Type
+  `ACCPAYCREDIT`, a line's `AccountID` (uuid) beside `AccountCode`,
+  `Reference` "ACCRECCREDIT only", the `Idempotency-Key` header (128 chars
+  max) on the creates, `PUT CreditNotes/{id}/Allocations` (`Amount`,
+  `Invoice.InvoiceID`, `Date`), `DELETE CreditNotes/{id}/Allocations/{AllocationID}`
+  (200, `IsDeleted: true`), `POST CreditNotes/{id}` with `VOIDED` in the status
+  enum.
+- **Xero — unconfirmed:** what Xero does with a supplied `CreditNoteNumber` on
+  an ACCPAYCREDIT (the spec describes the field for ACCRECCREDIT only; the
+  read-back fails closed if the number is not ours); that `where` filters on
+  it (the spec says only "Filter by an any element"); that an allocated
+  credit note cannot be voided (we remove ours first either way); and, as for
+  Intuit, the Idempotency-Key's lifetime, in-flight and error-replay
+  behaviour.
+- No code shape was wrong against these sources, so no shape changed. If a
+  provider replays an error for a repeated key, the apply retry below keeps
+  failing for that key's life; the marker and the flag stay, fail closed.
+
+**An unapplied credit is recorded and finished, never booked twice.** A
+QuickBooks VendorCredit created whose $0 BillPayment failed was returned with
+no id, nothing retried it (the payment write-back had succeeded), and
+`void_discount_credit` could not find a credit that no BillPayment links. Now
+the apply failure names the credit (`erp_document_id`, `not_posted` false);
+any credit failure that may have written leaves
+`state_data.erp_discount_credits_pending[payment id]` (the credit id when known
+and the payload's PII-free fields), and the balance-open flag's `erp_report`
+carries `discount_credit_pending: true` and `discount_credit_document_id` so a
+person sees a credit may already stand (Xero too). The status-sync sweep's
+`resume_pending_credits` (after `resume_pending_voids`) re-posts through the
+adapter with `DiscountCreditPayload.credit_id`: QuickBooks reads that credit by
+id and applies it rather than leaning on `requestid` replay; one deleted or no
+longer ours in QuickBooks is refused `bill_payment_voided`
+(`document: discount_credit`) and the marker is dropped, never re-created. A
+payment no longer `completed` is skipped: its void reverses the credit by the
+recorded id. Not done here: the flag's *sentence* still reads "close the
+difference in the ERP"; a pending-credit variant of
+`erp_payment_writeback_balance_open` needs a catalogue code, the generated web
+and mobile message maps and every locale — follow-up for the next round.
+
+**A void finds the credit again after a partial reversal.** If the void deleted
+our applying BillPayment but not the VendorCredit, the retry found nothing
+through the bill and reported success over a standing credit. Now the void
+first asks `ErpAdapter.find_discount_credit` and records the id in
+`state_data.erp_discount_credit_voids_pending[payment id]` (a map beside
+`erp_payment_voids_pending`, whose list format is unchanged) and commits,
+before the adapter deletes anything; the retry passes it as `credit_id` and
+QuickBooks deletes it by id. The void-failed flag's `erp_report` names it
+(`discount_credit_document_id`; `erp_document_id` there stays the bill). Both
+maps clear when the void succeeds.
+
+**Deleting an invoice a live virtual card holds is refused.** `DELETE
+/api/invoices/{id}` and `POST /bulk/delete` refused only a live payment. A card
+minted by `POST /api/cards/generate` books no Payment, `approved` is not
+immutable, and the cascade deleted the card, its reveal tokens and rebates
+without calling the issuer: the card stayed spendable (or its charge
+unrecorded) with no row left. Both doors now read `erp_export_gate.live_claims`
+— the rails' own predicates, as recall, close-to-done and the ERP push read
+them — and refuse with the coded `invoice_delete_claimed` (`params.claim`
+`payment` | `virtual_card`; bulk delete skips the row); cancelling the card or
+voiding the payment is the way out. A mirror a live payment or card holds is
+already `invoice_recall_mirror_progressed` for the origin's recall, and the
+delete door no longer lets it be deleted out of the way. No served delete
+verdict exists to align. Mobile only bulk-deletes and gets ids back, so it
+needs no strings; web states the code in all six locales.
+
+**Tests.** `tests/test_qbo_status_sync_adapter.py` (apply failure names the
+credit and the retry applies that one with `requestid` replay switched off in
+the double; a recorded credit someone deleted is refused, not re-created; a
+void that deleted the application but not the credit finishes by id; an
+unapplied credit is deleted by id); `tests/test_erp_payment_writeback.py`
+(marker and flag fields, the sweep applying by id and clearing, the sweep
+leaving a voided payment's credit to its void, a stopped void retrying by the
+recorded id, a pre-write refusal leaving no marker);
+`tests/test_invoice_delete_cascade.py` (live `active` / `charged` card
+refused on both doors, allowed once cancelled); `tests/test_invoice_recall_approval.py`
+(a mirror held by a payment or a card cannot be deleted out of the way, and the
+recall still says progressed); web `codedRefusals.test.ts`.
