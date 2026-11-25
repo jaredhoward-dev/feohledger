@@ -29023,81 +29023,6 @@ each documented name and the dropped ones. The contract table
 a correctly signed stale delivery. The e2e specs sign the real way
 (`frontend/tests-e2e/fixtures/cardWebhook.ts`).
 
-## 558. The client IP is read from the right of `X-Forwarded-For`; the legal pages name hCaptcha on the workspace lookup, with a short-notice change-log entry and a new Privacy version (§553 follow-up, round 47)
-
-**1. Client IP behind an appending proxy.** `resolve_client_ip` took the
-leftmost `X-Forwarded-For` entry whenever the socket peer was inside
-`FEOH_TRUSTED_PROXY_CIDRS`. That is only right behind a proxy that *replaces*
-the header. Caddy does (for a client it does not trust, which on the VM is
-every client), so the single-VM stack was safe. The AWS ALB *appends* (its
-default `xff_header_processing.mode`): a client that sends
-`X-Forwarded-For: 1.2.3.4` arrives as `1.2.3.4, <real address>`, so on ECS any
-caller could pick its own rate-limit key by rotating the first entry, and every
-per-IP limit (login, signup, workspace lookup, the ERP-webhook unseal budget,
-§525) stopped meaning anything.
-
-The resolver now uses the standard algorithm. If the socket peer is not
-trusted, the header is ignored and the peer is the client (an empty value and
-`none`, §553, trust no peer, so they still mean exactly that). If it is
-trusted, the entries (several header lines read as one list, RFC 9110 §5.3)
-are walked from the right, addresses inside the trusted list are skipped as
-proxy hops, and the first address outside it is the client: the one the
-outermost trusted proxy wrote, which the client cannot forge. If every entry is
-trusted, the leftmost is the client (an internal caller). Entries that are not
-IP literals (`unknown`, an obfuscated `_id`, `host:port`, junk) are skipped,
-and a trusted peer with no usable entry keys on itself, so junk never becomes a
-key. Addresses are normalised, so one IPv6 client is one bucket.
-
-Caddy's single replaced entry gives the same answer as before, so the VM's
-`172.28.0.0/16` default needs no change. On ECS, `FEOH_TRUSTED_PROXY_CIDRS` is
-the ALB's subnets or the VPC CIDR (`infra` `var.vpc_cidr`), and must never
-include a range real clients connect from: a client inside it would be read as
-a proxy hop (`docs/production-deployment.md`, `docs/environment.md`).
-
-*Rejected: a hop count (`FEOH_TRUSTED_PROXY_HOPS`, "take the Nth from the
-right")* instead of walking the CIDRs. It needs a second setting that must match
-the topology exactly, and it silently picks a proxy or a forged entry when a hop
-is added or removed. The CIDR list already describes the topology.
-
-Tests (`tests/test_rate_limit_security.py`): an ALB-appended header with forged
-leftmost entries (including one that looks like a trusted address) resolves to
-the real client, and rotating the forged entry does not open a new limiter
-bucket; Caddy's replaced header; several trusted hops; all hops trusted; two
-header lines; malformed entries; an untrusted peer ignores even an appended
-header; `none` (unchanged from §553). The old test that asserted the leftmost
-hop is replaced; it described the bug.
-
-**2. The legal pages said hCaptcha was on the signup form only.** Since §553 it
-is required on every deployment because the workspace lookup (`/find-workspace`,
-§518) verifies a captcha whether signup is open or not. `/legal/sub-processors`
-(§ 2 lead-in, the hCaptcha row and the paragraph after it), `/legal/privacy`
-(the § 5 lawful-basis table, § 8 twice) and `/legal/dpa` (two places) now name both
-forms. They state what hCaptcha receives, read from `utils/hcaptcha.py` and
-`HCaptcha.svelte`: the signals its own in-page script collects, then the token
-and the submitter's IP (`remoteip`) from our server, the same on both forms, and
-not what is typed into the form. `docs/sub-processors.md` § 21 says the same.
-
-- **A change-log notice entry** (`2026-11-25-hcaptcha-workspace-lookup`). The
-  provider and the kinds of data are unchanged, but it now receives them about
-  a new group of people, customers' own users, which is "a change to what an
-  existing provider receives" (register § 9, §321). It takes effect with this
-  release, under the DPA's security carve-out, with the reason stated: without
-  a captcha the lookup is a public page that emails any typed address.
-  *Rejected: a 30-day effective date*, because the boot guard (§553) applies
-  the captcha on the next deploy, so the date would be false unless the deploy
-  waited. An operator who prefers to wait can move `effective_on` and drop the
-  reason, and the generator accepts that.
-- **Privacy version `2026-11-25`** (was `2026-11-21`), so every user is asked
-  to accept again (§495, §505). This is the operator's decision: accuracy wins
-  over the re-prompt. Terms are unchanged. The DPA is not an accepted document
-  and has no version of its own. `LAST_UPDATED` in `lib/legal/operator.ts` moves
-  to the same date, as its docstring requires and the version vitest checks. It
-  is a stamp, not an operator fact; no fact changed. `pnpm gen:legal-versions`
-  regenerated the web module and `mobile/lib/legal_versions.generated.dart`.
-  The §498 rule still holds: a mobile build older than the bump can only sign
-  out until it is updated, so this ships with or after a mobile release that
-  carries it.
-
 ## 556. The bill a failed push left in the ERP is named by the adapter's own read-only lookup and voided through the flag void's flow; keeping it is the retry (§286 / §539 / §545 follow-up, round 47)
 
 **Context.** A push that timed out or got a 5xx may have created the bill in the
@@ -29236,3 +29161,78 @@ carrying only the undocumented `amount` is refused and the documented
 clearing case above. Nium bodies in the card tests (and the e2e
 `webhook-security.spec.ts` approval) are shaped by the documented field per
 template (`NIUM_AMOUNT_FIELDS`).
+
+## 558. The client IP is read from the right of `X-Forwarded-For`; the legal pages name hCaptcha on the workspace lookup, with a short-notice change-log entry and a new Privacy version (§553 follow-up, round 47)
+
+**1. Client IP behind an appending proxy.** `resolve_client_ip` took the
+leftmost `X-Forwarded-For` entry whenever the socket peer was inside
+`FEOH_TRUSTED_PROXY_CIDRS`. That is only right behind a proxy that *replaces*
+the header. Caddy does (for a client it does not trust, which on the VM is
+every client), so the single-VM stack was safe. The AWS ALB *appends* (its
+default `xff_header_processing.mode`): a client that sends
+`X-Forwarded-For: 1.2.3.4` arrives as `1.2.3.4, <real address>`, so on ECS any
+caller could pick its own rate-limit key by rotating the first entry, and every
+per-IP limit (login, signup, workspace lookup, the ERP-webhook unseal budget,
+§525) stopped meaning anything.
+
+The resolver now uses the standard algorithm. If the socket peer is not
+trusted, the header is ignored and the peer is the client (an empty value and
+`none`, §553, trust no peer, so they still mean exactly that). If it is
+trusted, the entries (several header lines read as one list, RFC 9110 §5.3)
+are walked from the right, addresses inside the trusted list are skipped as
+proxy hops, and the first address outside it is the client: the one the
+outermost trusted proxy wrote, which the client cannot forge. If every entry is
+trusted, the leftmost is the client (an internal caller). Entries that are not
+IP literals (`unknown`, an obfuscated `_id`, `host:port`, junk) are skipped,
+and a trusted peer with no usable entry keys on itself, so junk never becomes a
+key. Addresses are normalised, so one IPv6 client is one bucket.
+
+Caddy's single replaced entry gives the same answer as before, so the VM's
+`172.28.0.0/16` default needs no change. On ECS, `FEOH_TRUSTED_PROXY_CIDRS` is
+the ALB's subnets or the VPC CIDR (`infra` `var.vpc_cidr`), and must never
+include a range real clients connect from: a client inside it would be read as
+a proxy hop (`docs/production-deployment.md`, `docs/environment.md`).
+
+*Rejected: a hop count (`FEOH_TRUSTED_PROXY_HOPS`, "take the Nth from the
+right")* instead of walking the CIDRs. It needs a second setting that must match
+the topology exactly, and it silently picks a proxy or a forged entry when a hop
+is added or removed. The CIDR list already describes the topology.
+
+Tests (`tests/test_rate_limit_security.py`): an ALB-appended header with forged
+leftmost entries (including one that looks like a trusted address) resolves to
+the real client, and rotating the forged entry does not open a new limiter
+bucket; Caddy's replaced header; several trusted hops; all hops trusted; two
+header lines; malformed entries; an untrusted peer ignores even an appended
+header; `none` (unchanged from §553). The old test that asserted the leftmost
+hop is replaced; it described the bug.
+
+**2. The legal pages said hCaptcha was on the signup form only.** Since §553 it
+is required on every deployment because the workspace lookup (`/find-workspace`,
+§518) verifies a captcha whether signup is open or not. `/legal/sub-processors`
+(§ 2 lead-in, the hCaptcha row and the paragraph after it), `/legal/privacy`
+(the § 5 lawful-basis table, § 8 twice) and `/legal/dpa` (two places) now name both
+forms. They state what hCaptcha receives, read from `utils/hcaptcha.py` and
+`HCaptcha.svelte`: the signals its own in-page script collects, then the token
+and the submitter's IP (`remoteip`) from our server, the same on both forms, and
+not what is typed into the form. `docs/sub-processors.md` § 21 says the same.
+
+- **A change-log notice entry** (`2026-11-25-hcaptcha-workspace-lookup`). The
+  provider and the kinds of data are unchanged, but it now receives them about
+  a new group of people, customers' own users, which is "a change to what an
+  existing provider receives" (register § 9, §321). It takes effect with this
+  release, under the DPA's security carve-out, with the reason stated: without
+  a captcha the lookup is a public page that emails any typed address.
+  *Rejected: a 30-day effective date*, because the boot guard (§553) applies
+  the captcha on the next deploy, so the date would be false unless the deploy
+  waited. An operator who prefers to wait can move `effective_on` and drop the
+  reason, and the generator accepts that.
+- **Privacy version `2026-11-25`** (was `2026-11-21`), so every user is asked
+  to accept again (§495, §505). This is the operator's decision: accuracy wins
+  over the re-prompt. Terms are unchanged. The DPA is not an accepted document
+  and has no version of its own. `LAST_UPDATED` in `lib/legal/operator.ts` moves
+  to the same date, as its docstring requires and the version vitest checks. It
+  is a stamp, not an operator fact; no fact changed. `pnpm gen:legal-versions`
+  regenerated the web module and `mobile/lib/legal_versions.generated.dart`.
+  The §498 rule still holds: a mobile build older than the bump can only sign
+  out until it is updated, so this ships with or after a mobile release that
+  carries it.
