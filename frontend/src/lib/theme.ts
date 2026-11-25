@@ -36,6 +36,8 @@
  * correctly when they do.
  */
 
+import { storageArea } from '#lib/utils/safeStorage.ts';
+
 export type ThemeChoice = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
 
@@ -78,11 +80,7 @@ export function isThemeChoice(value: unknown): value is ThemeChoice {
  * what throws, so it cannot be done outside a `try`.
  */
 export function browserStorage(): Storage | null {
-	try {
-		return typeof window === 'undefined' ? null : window.localStorage;
-	} catch {
-		return null;
-	}
+	return storageArea('local');
 }
 
 /** `document.cookie`, or `''` where reading it throws (sandboxed frames, blocked site data). */

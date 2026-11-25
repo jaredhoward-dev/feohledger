@@ -11,8 +11,8 @@ import { describe, expect, test } from 'vitest';
  *
  * Nothing else would catch that. The notice is prose, the storage calls are
  * spread across `api.ts`, `portalApi.ts`, `entity.ts`, the i18n store, the
- * consent banner and the login flow, and a new `localStorage.setItem` is a
- * perfectly ordinary line of code to write.
+ * consent banner and the login flow, and a new `storageSet(...)` (or a raw
+ * `localStorage.setItem`) is a perfectly ordinary line of code to write.
  *
  * So: scan the source for storage keys, and require each one to appear in the
  * published notice. The test names the offending key, so the fix is obvious —
@@ -46,11 +46,15 @@ function sourceFiles(dir: string, acc: string[] = []): string[] {
 function declaredKeys(): Set<string> {
 	const keys = new Set<string>();
 	const direct = /(?:localStorage|sessionStorage)\.(?:get|set|remove)Item\(\s*'([^']+)'/g;
+	// The guarded helpers in `#lib/utils/safeStorage.ts` (decisions §514) are
+	// the usual door now; a literal key passed to one is a stored key too.
+	const helper = /storage(?:Get|Set|Remove)\(\s*'([^']+)'/g;
 	const hoisted = /const\s+(?:[A-Z_]*KEY)\s*=\s*'([^']+)'/g;
 
 	for (const file of sourceFiles(SRC)) {
 		const text = readFileSync(file, 'utf8');
 		for (const m of text.matchAll(direct)) keys.add(m[1]);
+		for (const m of text.matchAll(helper)) keys.add(m[1]);
 		for (const m of text.matchAll(hoisted)) keys.add(m[1]);
 	}
 	return keys;

@@ -3484,6 +3484,7 @@ export const messages = {
 	'auth.login.forgotPassword': 'Passwort vergessen?',
 	'auth.login.signedOutOtherWorkspace': "Sie wurden abgemeldet, weil Ihre Sitzung zu einem anderen Workspace gehörte. Melden Sie sich hier an oder auf der Seite Ihres eigenen Workspace.",
 	'auth.login.workspaceClosed': "Dieser Workspace wurde geschlossen und seine Konten gelöscht. Ihre E-Mail-Adressen können jetzt in einem anderen Workspace verwendet werden.",
+	'auth.login.storageBlocked': "Ihr Browser verhindert, dass diese Website Daten speichert, daher können Sie nicht angemeldet bleiben. Erlauben Sie in den Browsereinstellungen Websitedaten (Cookies und Websitespeicher) für diese Website und laden Sie die Seite dann neu.",
 	'auth.login.goToOwnWorkspace': "Zur Anmeldeseite Ihres Workspace",
 	'auth.login.devAccounts.heading': 'Entwicklungskonten',
 	'auth.login.devAccounts.hint': 'Nur für die lokale Entwicklung. Wählen Sie ein Seed-Konto, um das Formular auszufüllen.',

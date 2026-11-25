@@ -20,6 +20,7 @@
  *   degrades to "no cache", which is the old behaviour.
  */
 import { BRAND_ACCENT_PROPS, isValidHexColor } from '#lib/stores/brandTheme.ts';
+import { storageArea } from '#lib/utils/safeStorage.ts';
 
 export const ACCENT_CACHE_PREFIX = 'feoh_brand_accent:';
 
@@ -101,9 +102,5 @@ export function clearAccentCache(
 
 /** `window.localStorage`, or `null` where it is absent or the access throws. */
 export function browserStorage(): AccentStorage | null {
-	try {
-		return typeof window === 'undefined' ? null : window.localStorage;
-	} catch {
-		return null;
-	}
+	return storageArea('local');
 }

@@ -17,6 +17,8 @@
  * the node vitest config reaches all of it.
  */
 
+import { storageArea } from '#lib/utils/safeStorage.ts';
+
 /** The query parameter that carries the destination. */
 export const NEXT_PARAM = 'next';
 
@@ -114,13 +116,9 @@ export function withNext(path: string, next: string | null | undefined): string 
 export type NextStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 
 function defaultStorage(): NextStorage | null {
-	try {
-		return typeof sessionStorage === 'undefined' ? null : sessionStorage;
-	} catch {
-		// Storage blocked (privacy mode, sandboxed frame): the sign-in still
-		// works, it just lands on the dashboard.
-		return null;
-	}
+	// Storage blocked (privacy mode, sandboxed frame): the sign-in still
+	// works, it just lands on the dashboard.
+	return storageArea('session');
 }
 
 /**

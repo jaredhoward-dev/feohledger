@@ -3480,6 +3480,7 @@ export const messages = {
 	'auth.login.forgotPassword': '¿Olvidaste tu contraseña?',
 	'auth.login.signedOutOtherWorkspace': "Se cerró su sesión porque pertenecía a otro espacio de trabajo. Inicie sesión aquí o en la página de su propio espacio de trabajo.",
 	'auth.login.workspaceClosed': "Este espacio de trabajo se ha cerrado y sus cuentas se han eliminado. Sus direcciones de correo ya se pueden usar en otro espacio de trabajo.",
+	'auth.login.storageBlocked': "Su navegador impide que este sitio guarde datos, por lo que no puede mantener la sesión iniciada. Permita los datos de sitios (cookies y almacenamiento del sitio) para este sitio en la configuración del navegador y vuelva a cargar la página.",
 	'auth.login.goToOwnWorkspace': "Ir a la página de inicio de sesión de su espacio de trabajo",
 	'auth.login.devAccounts.heading': 'Cuentas de desarrollo',
 	'auth.login.devAccounts.hint': 'Solo para desarrollo local. Elija una cuenta de prueba para rellenar el formulario.',

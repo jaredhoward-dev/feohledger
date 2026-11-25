@@ -26253,6 +26253,46 @@ GL-list Retry, outside-click disarm, focus on open and close, locale decimal
 separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
 duplicated.
 
+## 514. Blocked browser storage reads as signed out, through one guarded helper, and sign-in says so (round 42)
+
+**Problem.** Where a browser blocks site data for the origin, merely reading
+`window.localStorage` throws a `SecurityError`. The auth stores call
+`hasToken()` / `hasPortalToken()` at module load, `ConsentBanner`'s
+`getConsent()` runs in the root layout, and none of those reads was guarded,
+so the throw escaped the boot path and `/login` never drew: a blank page and an
+uncaught error (`docs/known-issues.md`, found 2026-10-20). The theme, i18n and
+two `sessionStorage` stashes each carried their own `try`, and the three
+`browserStorage()` / `defaultStorage()` copies were the same function.
+
+**Decision.** `src/lib/utils/safeStorage.ts` is the one door to
+`localStorage` / `sessionStorage`: `storageArea(area)` (the store or `null`),
+`storageGet` / `storageSet` / `storageRemove` (an unavailable store reads as
+empty and drops writes; `storageSet` returns whether it landed) and
+`storageAvailable(area)`. Every access in the app goes through it, the old
+copies included. With storage blocked the app is signed out (no token), on the
+consolidated entity view and the negotiated locale. Both sign-in pages —
+`/login` and `/portal/login` — check `storageAvailable()` on mount and show
+`auth.login.storageBlocked` ("your browser is blocking this site from storing
+data, so you can't stay signed in…"), localized in all six locales. The Cookie
+Notice inventory guard learns the helper's call shape, so a key passed to it is
+still required on `/legal/cookies`.
+
+**No in-memory token fallback.** Holding the JWT in a module variable when
+storage is blocked would let a sign-in work until the next reload. Rejected:
+it is a second session store with its own lifetime and logout semantics, for
+a configuration the visitor can fix in one setting, and a session that dies
+on reload without warning is worse than the honest notice. The fail-closed
+reading — no storage, no session — is the smallest change, and the notice
+tells the visitor exactly what to change. A sign-in attempted anyway succeeds
+server-side and lands back on `/login` (the first API call carries no token),
+where the notice is still showing.
+
+**No write probe.** `storageAvailable` reaches the store and calls `getItem`;
+it does not write a probe key. A probe would be one more thing stored in the
+visitor's browser that the Cookie Notice would have to list, and the case it
+would add (a store that reads but refuses every write) is the old Safari
+private-mode quota, which current browsers no longer have.
+
 ## 516. Radio choices in a dialog share one `.radio-card` class, and the stacked-field label rule skips choice labels (round 42)
 
 **Problem.** `app.css`'s `.modal label` makes every label in a dialog a

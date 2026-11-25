@@ -3664,6 +3664,7 @@ export const en = {
 	'auth.login.forgotPassword': 'Forgot password?',
 	'auth.login.signedOutOtherWorkspace': "You were signed out because your session belonged to a different workspace. Sign in here, or on your own workspace's page.",
 	'auth.login.workspaceClosed': "This workspace has been closed and its accounts deleted. Their email addresses can now be used in another workspace.",
+	'auth.login.storageBlocked': "Your browser is blocking this site from storing data, so you can't stay signed in. Allow site data (cookies and site storage) for this site in your browser settings, then reload the page.",
 	'auth.login.goToOwnWorkspace': "Go to your workspace's sign-in page",
 	'auth.login.devAccounts.heading': 'Dev accounts',
 	'auth.login.devAccounts.hint': 'Local development only. Pick a seeded account to fill the form.',

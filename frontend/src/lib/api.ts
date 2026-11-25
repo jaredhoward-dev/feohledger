@@ -10,6 +10,7 @@ import {
 	sessionRejection
 } from '#lib/api/sessionRejection.ts';
 import { localeReady, m } from '#lib/i18n/store.svelte.ts';
+import { storageGet, storageRemove, storageSet } from '#lib/utils/safeStorage.ts';
 
 // Re-exported so callers that already import from `#lib/api` (e.g. the
 // hand-rolled fetch in `api/expenses.ts`) don't need a second import path.
@@ -96,17 +97,20 @@ export async function localizedApiError(
 	return apiErrorFromBody(body, fallback, status);
 }
 
-function getToken(): string | null {
-	if (typeof window === 'undefined') return null;
-	return localStorage.getItem('auth_token');
+// Through the guarded helpers: a browser that blocks site storage throws on
+// the bare `localStorage` read, and `hasToken()` runs at module load in the
+// auth store, so an unguarded read blanked the whole app (decisions §514).
+// No storage reads as signed out; a token that cannot be stored is dropped.
+export function getToken(): string | null {
+	return storageGet('auth_token');
 }
 
 export function setToken(token: string) {
-	localStorage.setItem('auth_token', token);
+	storageSet('auth_token', token);
 }
 
 export function clearToken() {
-	localStorage.removeItem('auth_token');
+	storageRemove('auth_token');
 }
 
 export function hasToken(): boolean {
