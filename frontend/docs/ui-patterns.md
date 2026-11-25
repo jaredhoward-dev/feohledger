@@ -62,6 +62,17 @@ So:
   with the shared no-figure dash (`kpiDisplayValue`, or `<KpiCard>` with a
   nullish `value`) and `aria-busy` while pending, never `{#if summary}` around
   the whole strip (`/payments`).
+- **A KPI card's qualifier line is reserved, not added.** A `sub` line that
+  only the response decides (/discounts' "no offer has been captured or
+  missed yet", /tax's card-excluded total) grows its card, and a flex row
+  stretches every card to the tallest, so the whole row and the table under
+  it drop. Pass `<KpiCard reserveSub>` the longest wording it takes: drawn
+  invisible and `aria-hidden` while `sub` is empty, it wraps at the card's
+  own width in the reader's locale, so the card is as tall loading as loaded.
+- **A note that qualifies the figures above a table holds a one-line slot.**
+  /discounts' currency notes (and its dashboard error) sit in `.kpi-notes`
+  under the KPI row with a `min-height` of one line, so the common single
+  note lands without moving the offers table.
 - **A chip row whose roster comes from a response holds its place while that
   response is pending** — render it with just its "All" chip until the roster
   lands (`/exceptions`' type row).
@@ -263,8 +274,9 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
   the users directory, /admin/entities, /admin/api-keys,
-  /admin/access-review, /admin/webhooks (both tables), the /audit trail and
-  both /goods-receipts tabs are converted,
+  /admin/access-review, /admin/webhooks (both tables), the /audit trail,
+  both /goods-receipts tabs, the /discounts offers and the /tax 1099 table
+  are converted,
   /admin/entities, /admin/api-keys, /admin/access-review and the
   inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string
