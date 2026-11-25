@@ -13,30 +13,30 @@
 
 /** `GET /api/auth/delegation`. */
 export interface Delegation {
-	delegate_to_id: string | null;
-	delegate_to_name: string | null;
-	until: string | null;
-	is_active: boolean;
+  delegate_to_id: string | null;
+  delegate_to_name: string | null;
+  until: string | null;
+  is_active: boolean;
 }
 
 /** One row of `GET /api/auth/delegation/candidates`. */
 export interface DelegateCandidate {
-	id: string;
-	full_name: string;
+  id: string;
+  full_name: string;
 }
 
 /** What the panel says about the caller's delegation right now. */
-export type DelegationState = 'none' | 'active' | 'ended';
+export type DelegationState = "none" | "active" | "ended";
 
 const ISO_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 /** `YYYY-MM-DD` for `d` in the reader's local calendar — the value shape a
  *  `<input type="date">` reads and writes. */
 export function localDay(d: Date): string {
-	const y = String(d.getFullYear()).padStart(4, '0');
-	const m = String(d.getMonth() + 1).padStart(2, '0');
-	const day = String(d.getDate()).padStart(2, '0');
-	return `${y}-${m}-${day}`;
+  const y = String(d.getFullYear()).padStart(4, "0");
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 /**
@@ -46,13 +46,18 @@ export function localDay(d: Date): string {
  * caller shows its own message rather than send a value the server would 422.
  */
 export function untilAfterLastDay(lastDay: string): string | null {
-	const match = ISO_DAY.exec(lastDay);
-	if (!match) return null;
-	const [y, m, d] = [Number(match[1]), Number(match[2]), Number(match[3])];
-	const day = new Date(y, m - 1, d);
-	// Reject rollovers such as 2026-02-30 → 2026-03-02.
-	if (day.getFullYear() !== y || day.getMonth() !== m - 1 || day.getDate() !== d) return null;
-	return new Date(y, m - 1, d + 1).toISOString();
+  const match = ISO_DAY.exec(lastDay);
+  if (!match) return null;
+  const [y, m, d] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const day = new Date(y, m - 1, d);
+  // Reject rollovers such as 2026-02-30 → 2026-03-02.
+  if (
+    day.getFullYear() !== y ||
+    day.getMonth() !== m - 1 ||
+    day.getDate() !== d
+  )
+    return null;
+  return new Date(y, m - 1, d + 1).toISOString();
 }
 
 /**
@@ -63,10 +68,10 @@ export function untilAfterLastDay(lastDay: string): string | null {
  * unparseable instant.
  */
 export function lastDayCovered(until: string | null): string | null {
-	if (!until) return null;
-	const end = new Date(until);
-	if (Number.isNaN(end.getTime())) return null;
-	return localDay(new Date(end.getTime() - 1));
+  if (!until) return null;
+  const end = new Date(until);
+  if (Number.isNaN(end.getTime())) return null;
+  return localDay(new Date(end.getTime() - 1));
 }
 
 /**
@@ -75,6 +80,6 @@ export function lastDayCovered(until: string | null): string | null {
  * closed (the server keeps the row, and `is_active` is false).
  */
 export function delegationState(d: Delegation | null): DelegationState {
-	if (!d || !d.delegate_to_id) return 'none';
-	return d.is_active ? 'active' : 'ended';
+  if (!d || !d.delegate_to_id) return "none";
+  return d.is_active ? "active" : "ended";
 }
