@@ -64,6 +64,7 @@ mobile/
 │   │   ├── money.dart           # THE money formatter — formatMoney (num) / formatMoneyString (exact decimal) / formatMoneyCompact + normalizeCurrencyCode; a figure is formatted with the currency its own payload names, and renders BARE when none can be proven (never a substituted `$`)
 │   │   ├── a11y.dart            # A11y.announce — screen-reader live-region announcements (SemanticsService, Directionality-aware)
 │   │   ├── debouncer.dart       # Trailing-edge debounce for search-as-you-type
+│   │   ├── review_assignment.dart # assignedElsewhere — whose an invoice is, for the note above Approve / Reject; routing, never authority (decisions §564; twin of the web's reviewAssignment.ts)
 │   │   ├── sequenced_fetch.dart # SequencedFetch mixin — per-store request sequence so a slow response can't overwrite a newer one
 │   │   └── paged_fetch.dart     # PagedFetch mixin (on SequencedFetch) + PagedList — a server-paged list's rows, `total`, `page`, `hasMore`, `loadMore` (appends, de-duplicated by key; a next page reuses the fetch's token, so a refetch discards it); offline-cached rows are unpaged. Adopted by InvoiceStore; other list stores adopt it as they convert
 │   ├── screens/
