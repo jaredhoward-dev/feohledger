@@ -79,8 +79,13 @@ records). Per subject type:
   credential id) and `documents`.
 - **vendor_user** — `profile` + the parent `vendor_id`, `legal_acceptances`
   (which Privacy Policy version they acknowledged on the portal, when and
-  through which control — kept by erasure, decisions §499), the
-  `chat_messages` they authored, and `documents`.
+  through which control — kept by erasure, decisions §499), `audit_events`
+  (the trail rows they authored — sign-ins, factor changes, the
+  `portal.legal.accepted` acknowledgement — as action, target and time plus
+  the client `ip` the portal recorded for that request; the rest of `details`
+  is withheld as for a `user`, and a failed sign-in against their address has
+  no actor and is not theirs), the `chat_messages` they authored, and
+  `documents`.
 - **vendor_contact** — `vendor` (name, code, email, phone, address, tax_id,
   **masked** bank_details + beneficial_owner_data, `banking_disclosure`), a
   summary of `related_invoices` / `related_payments` (id + **string-Decimal**
@@ -288,7 +293,7 @@ transactional rows.** We redact PII *text* fields and keep the money trail.
 | Subject type | Redacted | Preserved |
 |---|---|---|
 | `user` | email → tombstone, full_name, sso_provider/id, hashed_password, mfa_secret, locale; `device_tokens` emptied (the push registrations identify the subject's phone; like passkeys, cleared even on a re-run against an already-tombstoned subject); deactivated; **every `WebAuthnCredential` row deleted**; **every live session revoked** | row id, organization_id, role assignments, **every `audit_log` row authored** (the `actor_id` link stays — non-repudiation) |
-| `vendor_user` | email → tombstone, full_name, hashed_password, mfa_secret; deactivated; their supplier-authored chat attachments | row id, vendor link, the parent vendor's own documents (the company is a separate subject), the `vendor_user_legal_acceptances` rows (ids, document, version, time, control only — the evidence the Privacy Policy was shown, decisions §499) |
+| `vendor_user` | email → tombstone, full_name, hashed_password, mfa_secret; deactivated; their supplier-authored chat attachments | row id, vendor link, the parent vendor's own documents (the company is a separate subject), the `vendor_user_legal_acceptances` rows (ids, document, version, time, control only — the evidence the Privacy Policy was shown, decisions §499), **every `audit_log` row authored** (`actor_id` stays) |
 | `vendor_contact` | vendor email, phone, address, tax_id, bank_details, beneficial_owner_data; the vendor's portal users (as above); supplier-authored **chat message bodies** (free-text PII); the documents listed below | **`vendor.name`** (the legal payee, denormalised onto every Invoice's `vendor_name` money field), **every related Invoice / Payment amount + status + date**, the chat threads + AP-side messages, the `audit_log` |
 
 ### Passkeys and sessions
@@ -398,6 +403,15 @@ an existing `audit_log` row — it respects the migration-0022 immutability
 trigger (which rejects every DELETE and every UPDATE touching a column other than
 `shipped_at`). The financial/audit history of an erased subject's transactions
 therefore survives erasure intact.
+
+That also means a kept acceptance is **not anonymous** after erasure. The
+`legal_acceptances` / `vendor_user_legal_acceptances` row holds no name,
+address or IP, but it keeps the subject's id, and the audit row written for
+the same event — `auth.legal.accepted`, or `portal.legal.accepted` on the
+supplier portal, like every portal auth event — keeps `actor_id` and the
+client IP in `details`. Whether erasure should null that IP (which the
+immutability trigger above would first have to allow) is an open decision for
+the CISO, tracked in `docs/followups.md`.
 
 The audit `details` and the persisted `DataSubjectRequest` row are **PII-free**:
 they carry only the resolved subject UUID + type + non-identifying counts —

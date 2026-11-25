@@ -403,6 +403,25 @@ nobody re-reads outlives the thing it describes.
       **Trigger:** the first `notice=True` change-log entry, or the first
       non-zero value of either counter in production.
 
+- [ ] **An erased subject's legal-acceptance evidence still carries their IP.**
+      ⚠️ CISO DECISION NEEDED. (decisions §495, §499) Erasure keeps the
+      `legal_acceptances` / `vendor_user_legal_acceptances` rows (contract
+      evidence, GDPR Art. 17(3)(e)) and never touches `audit_log`. The rows
+      hold no IP, but the audit row for the same event —
+      `auth.legal.accepted` / `portal.legal.accepted` — keeps `actor_id` and
+      the raw client IP in `details`, so the evidence stays linkable to a
+      person after erasure (the docs used to claim it "identifies no one";
+      corrected in `backend/docs/privacy.md` § Audit trail). Whether the IP
+      is part of the evidence worth keeping, or should be nulled on erasure,
+      is the decision. **Durable fix, if nulled:** a narrowly-scoped
+      exception in the migration-0022 audit immutability trigger for
+      `details->'ip'` on those two actions, applied by
+      `services/privacy_erasure` for the subject's own rows, with a test that
+      the rest of the row is untouched — or stop writing the raw IP there and
+      record a truncated / hashed form instead. **Trigger:** the CISO's call,
+      or the first erasure request from a subject who accepted through either
+      control.
+
 ### A Stripe subscription our row never recorded is found only by the org's next plan change
 
 - [ ] **Nothing reconciles a provider subscription a crashed plan change left

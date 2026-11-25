@@ -15,7 +15,8 @@
 	import { get1099Report, file1099Batch } from '#lib/api/tax.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
-	import { m } from '#lib/i18n/store.svelte.ts';
+	import { hasMessage, m } from '#lib/i18n/store.svelte.ts';
+	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import type {
 		Box1099Allocation,
@@ -271,6 +272,16 @@
 		return isReportable(r) && !r.tin_verified;
 	}
 
+	// The W-9 box-3 classification, translated. The column is a free
+	// String(50) on the backend, but every writer offers only the ten values
+	// `VendorTaxModal` lists; a value outside them (a CSV import, an older
+	// row) is shown as stored rather than dropped.
+	function classificationLabel(value: string | null): string {
+		if (!value) return '—';
+		const key = `tax.classification.${value.toLowerCase()}`;
+		return hasMessage(key) ? m(key as MessageKey) : value;
+	}
+
 	// Display string for the IRS threshold, e.g. "$600". Derived so the
 	// snippet body (where `report` isn't narrowed) can use it safely.
 	let thresholdLabel = $derived(report ? `$${report.threshold_usd}` : '$600');
@@ -415,6 +426,31 @@
 	{#if error}
 		<LoadError message={error} onretry={load} testId="tax-load-error" />
 	{:else}
+		<!-- Reserved one-line notes slot (the `/discounts` `.kpi-notes` shape):
+		     always mounted with its own height, so a warning arriving with the
+		     report does not push the toolbar and table down under the reader
+		     (frontend/docs/ui-patterns.md § Page layout). The full per-box
+		     breakdown stays in the panel below the table. -->
+		<div class="tax-notes" data-testid="tax-notes">
+			{#if report && report.box_allocations.length > 0}
+				{#if !report.box_allocation_reconciled}
+					<p class="box-note warn" role="alert" data-testid="tax-box-unreconciled">
+						{m('tax.boxes.notReconciled', {
+							residual: formatMoney(report.box_unallocated, { currency: report.currency })
+						})}
+					</p>
+				{/if}
+				{#if isPositiveAmount(report.total_unmapped)}
+					<p class="box-note warn" data-testid="tax-box-unmapped">
+						{m('tax.boxes.unmapped', {
+							amount: formatMoney(report.total_unmapped, { currency: report.currency }),
+							box: report.box_allocations.find((b) => b.fallback)?.box ?? 'NEC-1'
+						})}
+					</p>
+				{/if}
+			{/if}
+		</div>
+
 		<div class="toolbar-row">
 			<FilterChips
 				chips={[
@@ -437,7 +473,10 @@
 					},
 					{
 						key: 'over_threshold',
-						label: m('tax.filter.overThreshold', { threshold: report?.threshold_usd ?? '—' }),
+						// No amount until the report brings one: "Over $—" reads as a figure.
+						label: report
+							? m('tax.filter.overThreshold', { threshold: report.threshold_usd })
+							: m('tax.filter.overThresholdPending'),
 						count: chipCount((r) => r.over_threshold)
 					},
 					{
@@ -474,9 +513,12 @@
 					<tr class:row-flag={isReportable(r) && !r.w9_on_file}>
 						<td class="vendor">
 							<span class="vendor-name">{r.vendor_name}</span>
-							{#if r.tax_classification}
-								<span class="classification">{r.tax_classification}</span>
-							{/if}
+							<!-- Folded under the name (see COLUMNS), so it says what it is:
+							     a screen reader otherwise reads "Acme LLC individual". -->
+							<span class="classification"
+								><span class="visually-hidden">{m('tax.col.classification')} </span
+								>{classificationLabel(r.tax_classification)}</span
+							>
 						</td>
 
 						<td class="center">
@@ -592,22 +634,12 @@
 						</li>
 					{/each}
 				</ul>
-				{#if isPositiveAmount(report.total_unmapped)}
-					<p class="box-note warn">
-						{m('tax.boxes.unmapped', {
-							amount: formatMoney(report.total_unmapped, { currency: report.currency }),
-							box: report.box_allocations.find((b) => b.fallback)?.box ?? 'NEC-1'
-						})}
-					</p>
-				{/if}
+				<!-- The two warnings about this split (unmapped spend, a residual
+				     that does not reconcile) sit in `.tax-notes` above the table,
+				     not here: below an unpaginated vendor list they were off the
+				     first view on exactly the tenants with the most to file. -->
 				{#if report.box_allocation_reconciled}
 					<p class="box-note">{m('tax.boxes.reconciled')}</p>
-				{:else}
-					<p class="box-note warn" role="alert">
-						{m('tax.boxes.notReconciled', {
-							residual: formatMoney(report.box_unallocated, { currency: report.currency })
-						})}
-					</p>
 				{/if}
 			</section>
 		{/if}
@@ -777,6 +809,17 @@
 
 	.box-note.warn {
 		color: var(--danger);
+	}
+
+	.tax-notes {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		min-height: 24px;
+	}
+
+	.tax-notes .box-note {
+		margin: 0;
 	}
 
 	.box-split {

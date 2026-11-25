@@ -63,6 +63,38 @@ def test_the_drift_guard_fails_on_a_stale_module(monkeypatch):
     assert mod.main(["--check"]) == 1
 
 
+def test_the_generated_dart_carries_the_versions_in_force():
+    mod = _gen_module()
+    dart = mod.render_dart()
+    assert f"const String kTermsVersion = '{CURRENT_LEGAL_VERSIONS['terms']}';" in dart
+    assert f"const String kPrivacyVersion = '{CURRENT_LEGAL_VERSIONS['privacy']}';" in dart
+    # And the committed file the mobile app builds from is exactly that.
+    committed = mod._repo_root() / mod.DART_OUTPUT_PATH
+    assert committed.read_text(encoding="utf-8") == dart
+
+
+def test_the_drift_guard_fails_when_only_the_dart_file_drifts(monkeypatch, tmp_path):
+    # A copy of the repo's two generated files, so the committed mobile file is
+    # never touched: the TypeScript one in sync, the Dart one hand-edited.
+    mod = _gen_module()
+    for rel, _ in mod.OUTPUTS:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True)
+        target.write_text((mod._repo_root() / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(mod, "_repo_root", lambda: tmp_path)
+    assert mod.main(["--check"]) == 0
+
+    dart = tmp_path / mod.DART_OUTPUT_PATH
+    dart.write_text(
+        dart.read_text(encoding="utf-8").replace(CURRENT_LEGAL_VERSIONS["privacy"], "2000-01-01"),
+        encoding="utf-8",
+    )
+    assert mod.main(["--check"]) == 1
+
+    dart.unlink()
+    assert mod.main(["--check"]) == 1
+
+
 def test_a_version_that_is_not_a_date_is_refused(monkeypatch):
     mod = _gen_module()
     monkeypatch.setitem(mod.CURRENT_LEGAL_VERSIONS, "privacy", "v2")

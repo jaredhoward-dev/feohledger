@@ -297,6 +297,47 @@ async def test_dsar_vendor_user_bundle(realdb):
     tenant_mk = realdb.sessionmaker("a")
     org_id = realdb.info("a").org_id
     _, vendor_user_id, _ = await _seed_vendor_with_records(tenant_mk, org_id)
+    # Their own trail rows — the Privacy Policy acknowledgement (with the IP the
+    # portal recorded) and a sign-in — plus two that are NOT theirs: a failed
+    # sign-in against their address (no actor) and an admin's row about them.
+    async with tenant_mk() as s:
+        s.add_all(
+            [
+                AuditLog(
+                    organization_id=org_id,
+                    actor_id=vendor_user_id,
+                    action="portal.legal.accepted",
+                    entity_type="vendor_user",
+                    entity_id=vendor_user_id,
+                    details={"ip": "203.0.113.7", "source": "set_password"},
+                ),
+                AuditLog(
+                    organization_id=org_id,
+                    actor_id=vendor_user_id,
+                    action="portal.login.success",
+                    entity_type="vendor_user",
+                    entity_id=vendor_user_id,
+                    details={"ip": "203.0.113.8", "method": "password"},
+                ),
+                AuditLog(
+                    organization_id=org_id,
+                    actor_id=None,
+                    action="portal.login.failure",
+                    entity_type="vendor_user",
+                    entity_id=vendor_user_id,
+                    details={"ip": "198.51.100.9", "reason": "bad_password"},
+                ),
+                AuditLog(
+                    organization_id=org_id,
+                    actor_id=realdb.info("a").users["admin"],
+                    action="vendor_user.deactivated",
+                    entity_type="vendor_user",
+                    entity_id=vendor_user_id,
+                    details={"by": "someone else"},
+                ),
+            ]
+        )
+        await s.commit()
 
     async with realdb.client(key="a", role="admin") as c:
         resp = await c.post(
@@ -310,6 +351,16 @@ async def test_dsar_vendor_user_bundle(realdb):
     assert body["data"]["profile"]["email"] == "portal@acmesupplies.test"
     assert body["data"]["profile"]["full_name"] == "Portal Person"
     _assert_record_counts_cover(body)
+
+    events = body["data"]["audit_events"]["items"]
+    by_action = {e["action"]: e for e in events}
+    assert set(by_action) == {"portal.legal.accepted", "portal.login.success"}
+    assert by_action["portal.legal.accepted"]["ip"] == "203.0.113.7"
+    assert by_action["portal.login.success"]["ip"] == "203.0.113.8"
+    # Only the subject's own IP, never the rest of `details`.
+    assert "details" not in by_action["portal.legal.accepted"]
+    assert "198.51.100.9" not in resp.text
+    assert body["record_counts"]["audit_events"] == 2
 
 
 async def test_dsar_unknown_subject_404(realdb):

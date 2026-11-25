@@ -287,6 +287,66 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 	});
 });
 
+/**
+ * The Terms / Privacy accept step (`layout/LegalAcceptStep`, decisions §497),
+ * forced the way `tests-e2e/auth/legal-reprompt.spec.ts` forces it: the real
+ * `/me` with `legal_acceptance_required` switched on, so the worker admin's
+ * acceptance rows are never touched. The accept POST is stubbed with the
+ * versions-changed 422, which no live backend gives on demand. Scanned in the
+ * two states that add markup — the unticked-box error and the versions-changed
+ * alert — at desktop width and at 390px, the phone width it must hold at.
+ * The step replaces the app shell, so it also has to carry the page's one
+ * `<main>` itself; axe's landmark rules are best-practice, not WCAG-tagged, so
+ * that is asserted directly.
+ */
+test.describe('accessibility — Terms / Privacy accept step (WCAG 2.2 AA)', () => {
+	for (const width of [1280, 390]) {
+		test(`accept step, unticked error and versions changed, at ${width}px, has no axe violations`, async ({
+			page
+		}) => {
+			await page.setViewportSize({ width, height: 900 });
+			await page.route(
+				(url) => url.pathname === '/api/auth/me',
+				async (route) => {
+					const real = await route.fetch();
+					const body = (await real.json()) as Record<string, unknown>;
+					await route.fulfill({ response: real, json: { ...body, legal_acceptance_required: true } });
+				}
+			);
+			await page.route(
+				(url) => url.pathname === '/api/auth/legal-acceptance',
+				(route) =>
+					route.fulfill({
+						status: 422,
+						json: {
+							detail: {
+								code: 'legal_acceptance_required',
+								message: 'Please accept the current Terms of Service and Privacy Policy to continue.',
+								params: {}
+							}
+						}
+					})
+			);
+			await page.goto('/');
+			const step = page.locator('[data-testid="legal-accept-step"]');
+			await expect(step).toBeVisible();
+			await expect(page.getByRole('main')).toHaveCount(1);
+
+			// Unticked: the box is marked and the error is stated.
+			await page.getByRole('button', { name: 'Accept and continue' }).click();
+			const box = page.getByRole('checkbox', { name: /I agree to the Terms of Service/ });
+			await expect(box).toHaveAttribute('aria-invalid', 'true');
+			await expectNoA11yViolations(page);
+
+			// Ticked and refused as stale: the documents-changed alert and its reload.
+			await box.check();
+			await page.getByRole('button', { name: 'Accept and continue' }).click();
+			await expect(step.getByRole('button', { name: 'Reload page' })).toBeVisible();
+			await expectNoA11yViolations(page);
+		});
+	}
+});
+
 test.describe('accessibility — public surfaces on the no-tenant origin (WCAG 2.2 AA)', () => {
 	test.use({ storageState: { cookies: [], origins: [] }, baseURL: NO_TENANT_BASE });
 

@@ -192,10 +192,13 @@ test.describe('/tax — 1099 box allocation (admin)', () => {
 		await expect(panel).toBeVisible({ timeout: 10_000 });
 		// The box that absorbed unmapped spend is tagged in the list…
 		await expect(panel.locator('.box-item').nth(0).locator('.box-fallback')).toBeVisible();
-		// …and the amount + destination box are spelled out beneath it.
-		const note = panel.locator('.box-note.warn');
+		// …and the amount + destination box are spelled out in the notes slot
+		// above the table, where a long vendor list cannot push it off view.
+		const note = page.getByTestId('tax-box-unmapped');
 		await expect(note).toContainText('$899.50');
 		await expect(note).toContainText('NEC-1');
+		await expect(page.getByTestId('tax-notes')).toContainText('$899.50');
+		await expect(panel.locator('.box-note.warn')).toHaveCount(0);
 	});
 
 	test('a residual that does not reconcile is raised as an alert', async ({ page }) => {
@@ -204,10 +207,16 @@ test.describe('/tax — 1099 box allocation (admin)', () => {
 			box_unallocated: '12.34'
 		});
 
-		const alert = page.locator('.box-panel [role="alert"]');
+		const alert = page.getByTestId('tax-notes').getByRole('alert');
 		await expect(alert).toBeVisible({ timeout: 10_000 });
 		await expect(alert).toContainText('$12.34');
 		await expect(alert).toContainText('Do not file');
+		// Raised once, and ABOVE the vendor table: below an unpaginated list it
+		// was off the first view on the tenants with the most vendors to file.
+		await expect(page.locator('.box-panel [role="alert"]')).toHaveCount(0);
+		const alertBox = await alert.boundingBox();
+		const tableBox = await page.locator('.tax-table').boundingBox();
+		expect(alertBox && tableBox && alertBox.y + alertBox.height <= tableBox.y).toBe(true);
 	});
 
 	test('a vendor row shows its own split, and the Unmapped box chip is the worklist', async ({

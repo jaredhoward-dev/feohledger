@@ -18,9 +18,12 @@ yet (``POST /api/portal/auth/reset-password``).
 
 No foreign key, deliberately, like ``legal_acceptances``: the row must survive
 a DSAR erasure of the vendor user (it is kept, §499) and a portal-user delete.
-No email, name, IP or user agent — the IP is on the tenant's
-``portal.legal.accepted`` audit row, like every portal auth event, and once
-the vendor-user row is redacted nothing here identifies anyone.
+No email, name, IP or user agent. That does NOT make the evidence anonymous
+after an erasure: the row keeps ``vendor_user_id``, and the tenant's
+``portal.legal.accepted`` audit row for the same event (like every portal auth
+event) keeps ``actor_id`` and the client IP in ``details``, and erasure leaves
+the audit trail as it is. Whether erasure should null that IP is an open
+decision for the CISO (``docs/followups.md``).
 """
 
 import uuid
