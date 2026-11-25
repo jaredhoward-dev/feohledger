@@ -1433,8 +1433,12 @@ class XeroAdapter(OAuthErpAdapter):
                         )
                     credit = await self._read_credit_note(client, headers, str(created_id))
                     if _discount_marker(credit) != str(payload.payment_id).lower():
+                        # Xero answered OUR create with this id: it is ours
+                        # whatever the read-back says, so the id is kept for
+                        # the record a void reverses it by (decisions §581).
                         return ErpPostResult(
                             success=False,
+                            erp_document_id=str(created_id),
                             message=f"{PROVIDER} post failed: credit_note_unconfirmed",
                         )
                 credit_id = str(credit.get("CreditNoteID"))
@@ -1488,17 +1492,30 @@ class XeroAdapter(OAuthErpAdapter):
         return None
 
     async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
-        """Remove our credit note's allocations, then void it. Found by its
-        number, as :meth:`post_discount_credit` finds it; none live is a
-        success with nothing to do, so a retry never voids twice."""
+        """Remove our credit note's allocations, then void it.
+
+        A recorded ``payload.credit_id`` is read BY ID and must carry our
+        marker: one not ours is refused, never reported done (decisions §581) —
+        the number lookup is not confirmed to find a note, and a miss there
+        must not erase the record of one that stands allocated. With no id the
+        note is found by its number, as :meth:`post_discount_credit` finds it.
+        None live (or ours already voided / deleted) is a success with nothing
+        to do, so a retry never voids twice."""
         try:
             headers = await self._headers()
             async with self.oauth_client(timeout=30) as client:
-                live = [
-                    c
-                    for c in await self._our_credit_notes(client, headers, payload.payment_id)
-                    if str(c.get("Status") or "").upper() not in _GONE_STATUSES
-                ]
+                if payload.credit_id:
+                    known = await self._read_credit_note(client, headers, str(payload.credit_id))
+                    if _discount_marker(known) != str(payload.payment_id).lower():
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=str(payload.credit_id),
+                            message=f"{PROVIDER} void failed: discount_credit_not_ours",
+                        )
+                    ours = [known]
+                else:
+                    ours = await self._our_credit_notes(client, headers, payload.payment_id)
+                live = [c for c in ours if str(c.get("Status") or "").upper() not in _GONE_STATUSES]
                 if not live:
                     return ErpPostResult(success=True, message="No discount credit of ours")
                 credit_id = str(live[0].get("CreditNoteID"))
