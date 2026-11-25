@@ -25833,3 +25833,51 @@ Accepted: under a `status` sort a re-read row keeps its place until the next
 full read, and a Load more already in flight when the decision lands is
 retired (the reviewer clicks it again), the same trade `applyVendorUpdate`
 already makes for a pre-edit read.
+
+## 509. Supplier help is a portal page over the help centre's `Guide` shape, kept out of the employee index (round 40)
+
+**Problem.** The help centre (§244) is `/help`, behind the employee session.
+Suppliers — a separate audience who submit invoices, get paid, change bank
+details and take card payments — had no help at all (`docs/followups.md`), and
+cannot open `/help`: a vendor user holds a portal token, not an employee JWT.
+
+**Decision.**
+
+- **`/portal/help` inside the portal shell**, with a nav entry, a landing page
+  (the supplier guides, then a short glossary) and `/portal/help/<id>` per
+  guide. Five guides: getting started (invitation, Privacy acknowledgement,
+  sign-in, two-factor), submit and resubmit, track to payment, change bank
+  details, virtual-card payments.
+- **Same shape, one field more.** Supplier guides are `Guide`s with
+  `audience: 'supplier'` (omitted = `employee`), in `lib/help/portal.ts`, under
+  the same prose grammar and `{ui:key}` rule. They are *not* in `GUIDES`, so the
+  employee landing, search and role lists never show them and their links can
+  be held to the portal.
+- **Links follow the audience.** `terms.ts` gains `guideHref(id, audience)`
+  and an audience on `termHref`; `RichText` takes `audience`. A supplier's
+  `[[term]]` lands on `/portal/help#<id>`, `[[guide:…]]` on `/portal/help/<id>`,
+  and every `[[page:…]]` must be a labelled `/portal` route
+  (`content.test.ts` § supplier portal help).
+- **The glossary is a subset of the help centre's**, showing each term's
+  translated name and one-liner only (`PORTAL_GLOSSARY`): the long entries are
+  written for the AP team and link into `/help`. A term whose one-liner speaks
+  from the buyer's side ("your formal order to a supplier") is left out.
+- **One section renderer.** `components/help/GuideSections.svelte` renders a
+  guide's sections for both guide pages. The invoice-lifecycle walkthrough is a
+  snippet the employee page passes in, and `RichText` labels page links from
+  `navPages.ts` rather than `content.ts`, so no supplier page reaches the
+  employee guide index — which would ship every employee guide to suppliers and
+  oblige `/portal/help` to load the settings slice. `/portal/help` loads only
+  the help slice (the portal slice comes from `/portal`).
+- **English prose, as in the help centre** (§244): rendered `lang="en"` under
+  another locale behind `EnglishNotice`; the chrome, the `{ui:}` labels and the
+  glossary are in all six locales.
+
+**Rejected.** *Opening `/help` to vendor tokens*: the pages are role-aware and
+name employee controls; a supplier would see the AP team's procedures,
+including how bank changes are reviewed. *A second content type for the
+portal*: a fork of the shape, parser and tests, which drift apart. *Putting
+supplier guides in `GUIDES` with a filter*: every employee surface (landing,
+search, page directory, HelpTip further reading) would then need the filter,
+and one forgotten would show a supplier guide to the AP team. *A portal search
+box*: five guides fit on one page; revisit when the supplier set outgrows it.

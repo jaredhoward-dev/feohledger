@@ -21,6 +21,12 @@ export const messages = {
 	'portal.nav.discounts': 'Skonti',
 	'portal.nav.company': 'Unternehmen',
 	'portal.nav.notifications': 'Benachrichtigungen',
+	'portal.nav.help': 'Hilfe',
+
+	// Supplier portal — help (routes/portal/help/, decisions §509)
+	'portal.help.subtitle': 'Anleitungen und Antworten für Lieferanten, die dieses Portal nutzen.',
+	'portal.help.guides': 'Anleitungen',
+	'portal.help.glossary': 'Begriffe',
 	'portal.shell.logOut': 'Abmelden',
 	'portal.shell.footerSupport': 'Support',
 	'portal.privacyAck.support': 'Fragen? Support kontaktieren',

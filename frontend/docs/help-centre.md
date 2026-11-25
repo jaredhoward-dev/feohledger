@@ -22,11 +22,13 @@ Content, all under `src/lib/help/`:
 |---|---|
 | `types.ts` | The shapes, the inline-markup grammar, `DIAGRAM_IDS` |
 | `guides/{start,invoices,payments,vendors,setup,concepts}.ts` | The guides, by area |
+| `portal.ts` | The supplier portal's guides, its glossary subset and its pages (see *Supplier portal help*) |
 | `glossary.ts` | Glossary ids, categories, the long English entries, aliases |
 | `pages.ts` | `PAGE_HELP` — one line + a guide per sidebar href |
 | `lifecycle.ts` | The invoice-lifecycle stages |
 | `content.ts` | Joins it all; search; `guidesForTerm` |
-| `routeHelp.ts`, `terms.ts` | The light lookups `PageHeader` / `HelpTip` use (see *Bundles* below) |
+| `routeHelp.ts`, `terms.ts` | The light lookups `PageHeader` / `HelpTip` use (see *Bundles* below); `terms.ts` also builds every term and guide href, per audience |
+| `navPages.ts` | The sidebar pages a `[[page:…]]` link is labelled from — its own module so `RichText` never imports `content.ts` |
 
 ## Translation: two halves
 
@@ -60,6 +62,8 @@ label in `**bold**` instead.
 ```
 
 Rendered by `components/help/RichText.svelte` as elements — never `{@html}`.
+A guide's sections go through `components/help/GuideSections.svelte`, which both
+guide pages (`/help/guides/[id]`, `/portal/help/[id]`) share.
 
 Blocks: `p`, `steps` (numbered things to do), `list`, `note` (`tip` / `caution`
 — a control that will stop you, saying *why* it exists / `role` — who may do
@@ -85,6 +89,32 @@ this), `lifecycle` (the walkthrough), `diagram` (`{ id, caption }`).
   `DIAGRAM_IDS`, a branch in `Diagram.svelte`, and a `diagram` block in at least
   one guide. Inline SVG coloured from the `app.css` tokens (it follows the
   tenant's accent), every word from the catalogue, legible at 320px.
+
+## Supplier portal help
+
+Suppliers cannot open `/help` (a vendor user has no employee session), so the
+portal has its own at **`/portal/help`** — a **Help** link in the portal nav,
+the supplier guides and a short glossary on one page, and
+`/portal/help/<id>` per guide. Reasoning: `docs/decisions.md` §509.
+
+- **Same shape, `audience: 'supplier'`.** A supplier guide is a `Guide` in
+  `lib/help/portal.ts` (`PORTAL_GUIDES`), with the same prose grammar and the
+  `{ui:key}` rule. It is **not** in `GUIDES`: the employee landing, search,
+  page directory and HelpTips never show it.
+- **Its links stay in the portal.** `RichText audience="supplier"` sends
+  `[[term]]` to `/portal/help#<id>` and `[[guide:…]]` to `/portal/help/<id>`.
+  A term must be in `PORTAL_GLOSSARY` (a subset of `glossary.ts` whose
+  translated one-liner reads true for a supplier — the page shows the name and
+  one-liner, never the employee long text); a guide must be a supplier guide;
+  a `[[page:…]]` must be a `/portal` route **with a label**; `route` must be a
+  key of `PORTAL_PAGES`. No `lifecycle` block (it needs the employee index).
+- **Bundle.** Nothing `/portal/help` imports may reach `content.ts`,
+  `glossary.ts`, `guides/` or `lifecycle.ts`: that would ship every employee
+  guide to suppliers and make the route load the settings slice. The route
+  loads only the help slice (the portal slice comes from `/portal`).
+- **Writing one.** Check every step against the portal route it describes and
+  `backend/docs/supplier-portal.md` — suppliers have no AP colleague to ask
+  when a guide is wrong. Name portal controls with `{ui:portal.…}`.
 
 ## HelpTips in the app
 
@@ -133,8 +163,15 @@ controls (`{ui:portal.…}`) needs `'portal'` added to that load —
   six locales; every `<HelpTip>` term exists and has further reading; the page
   directory covers the sidebar; every invoice status is in the lifecycle;
   every diagram is drawn and used; the bundle boundaries; search.
+  The **supplier portal help** block holds `PORTAL_GUIDES` to the same
+  reference checks plus the portal-only rules above, and pins that the portal
+  help pages never import the employee guide index.
 - `src/lib/help/inline.test.ts` — the markup parser, the page-help lookup, anchors.
 - `tests-e2e/help/help-centre.spec.ts` — the pages render, search, the
   role-chips, a guide's open-page button, the PageHeader link, a HelpTip by
   keyboard. `tests-e2e/a11y/reflow.spec.ts` picks the `/help` routes up off
   disk.
+- `tests-e2e/portal/help.spec.ts` — a supplier reaches `/portal/help` from the
+  nav, opens a guide, follows a term link to the portal glossary and the
+  guide's open-page button. `tests-e2e/a11y/axe.spec.ts` scans the landing and
+  a guide; `tests-e2e/portal/reflow.spec.ts` checks both at 390px.

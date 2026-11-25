@@ -51,7 +51,9 @@ test.describe('/portal lists reflow at 390px', () => {
 		expect(await pageScrollsSideways(page)).toBe(false);
 	});
 
-	for (const path of ['/portal/payments', '/portal/discount-offers']) {
+	// The supplier help pages carry no table, but long prose, a numbered-step
+	// list and the nav's eighth link (decisions §509).
+	for (const path of ['/portal/payments', '/portal/discount-offers', '/portal/help', '/portal/help/portal-bank-details']) {
 		test(`${path} does not scroll the page sideways`, async ({ page }) => {
 			await portalSignIn(page);
 			await page.goto(path);

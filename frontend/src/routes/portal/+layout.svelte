@@ -224,6 +224,10 @@
 					aria-current={page.url.pathname.startsWith('/portal/notifications') ? 'page' : undefined}
 					>{m('portal.nav.notifications')}</a
 				>
+				<a href="/portal/help" class:active={page.url.pathname.startsWith('/portal/help')}
+					aria-current={page.url.pathname.startsWith('/portal/help') ? 'page' : undefined}
+					>{m('portal.nav.help')}</a
+				>
 			</nav>
 			<div class="user">
 				<span>{portalAuth.user.full_name}</span>
@@ -310,7 +314,7 @@
 		flex: 1;
 	}
 
-	/* Wraps rather than overflows: seven nav links plus the brand and the
+	/* Wraps rather than overflows: eight nav links plus the brand and the
 	   user block are far wider than a phone, and a no-wrap row pushed Log out
 	   off-screen at 390px (WCAG 1.4.10 Reflow). No breakpoint needed. */
 	.portal-header {
