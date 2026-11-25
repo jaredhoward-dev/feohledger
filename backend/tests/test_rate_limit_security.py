@@ -115,11 +115,16 @@ def fake_redis(monkeypatch):
     return fake
 
 
-def _fake_request(ip: str = "203.0.113.1", forwarded: str | None = None):
+def _fake_request(ip: str = "203.0.113.1", forwarded: str | list[str] | None = None):
+    """A request from socket peer ``ip``. ``forwarded`` is one X-Forwarded-For
+    value, or a list of them sent as separate header lines."""
+    from starlette.datastructures import Headers
+
     req = MagicMock()
     req.client = MagicMock()
     req.client.host = ip
-    req.headers = {"x-forwarded-for": forwarded} if forwarded else {}
+    values = [forwarded] if isinstance(forwarded, str) else (forwarded or [])
+    req.headers = Headers(raw=[(b"x-forwarded-for", v.encode("latin-1")) for v in values])
     return req
 
 
@@ -298,18 +303,27 @@ async def test_rate_limit_uses_forwarded_for_when_proxy_is_trusted(fake_redis, _
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_picks_first_forwarded_for_hop(fake_redis, _trust_alb_proxy):
-    """``X-Forwarded-For: client, proxy1, proxy2`` — the limiter must
-    bucket on the leftmost (real client) value, not the rightmost
-    (most-trusted-proxy). A regression that flipped this would let an
-    attacker rotate proxies freely."""
-    from app.services.rate_limit import check_rate_limit
+async def test_rate_limit_ignores_a_forged_leftmost_hop_behind_an_appending_proxy(
+    fake_redis, _trust_alb_proxy
+):
+    """An ALB appends the address it received the request from to whatever
+    X-Forwarded-For the client sent. Rotating a forged leftmost entry must
+    not open a fresh bucket: the limiter keys on the rightmost untrusted
+    address, the one the ALB itself wrote (decisions §558)."""
+    from app.services.rate_limit import RateLimitExceeded, check_rate_limit
 
-    for _ in range(5):
+    for n in range(3):
         await check_rate_limit(
             "signup",
-            _fake_request(ip="10.0.0.5", forwarded="198.51.100.10, 10.0.0.1, 10.0.0.2"),
-            limit=5,
+            _fake_request(ip="10.0.0.5", forwarded=f"192.0.2.{n}, 198.51.100.10"),
+            limit=3,
+            window_seconds=3600,
+        )
+    with pytest.raises(RateLimitExceeded):
+        await check_rate_limit(
+            "signup",
+            _fake_request(ip="10.0.0.5", forwarded="192.0.2.99, 198.51.100.10"),
+            limit=3,
             window_seconds=3600,
         )
 
@@ -390,6 +404,99 @@ def test_resolve_client_ip_honours_xff_behind_trusted_proxy(_trust_alb_proxy):
 
     resolved = resolve_client_ip(_fake_request(ip="10.0.0.5", forwarded="198.51.100.10, 10.0.0.1"))
     assert resolved == "198.51.100.10"
+
+
+# The right-to-left walk (decisions §558). `_trust_alb_proxy` trusts 10.0.0.0/8.
+
+
+def test_resolve_client_ip_alb_appended_header_with_a_forged_leftmost_entry(_trust_alb_proxy):
+    """The ALB appends the client's real address to the header the client
+    sent, so the forged entries sit to its left and are never read."""
+    from app.services.rate_limit import resolve_client_ip
+
+    req = _fake_request(ip="10.0.0.5", forwarded="1.2.3.4, 5.6.7.8, 198.51.100.10")
+    assert resolve_client_ip(req) == "198.51.100.10"
+
+
+def test_resolve_client_ip_alb_appended_header_with_a_forged_trusted_looking_entry(
+    _trust_alb_proxy,
+):
+    """A client cannot pass itself off as a proxy hop: its own address is
+    untrusted, so the walk stops there before reaching anything it wrote."""
+    from app.services.rate_limit import resolve_client_ip
+
+    req = _fake_request(ip="10.0.0.5", forwarded="10.9.9.9, 198.51.100.10")
+    assert resolve_client_ip(req) == "198.51.100.10"
+
+
+def test_resolve_client_ip_caddy_replaced_header(monkeypatch):
+    """The single-VM stack: Caddy (on the pinned compose subnet) replaces an
+    untrusted client's X-Forwarded-For with that client's address alone."""
+    from app.config import settings
+    from app.services.rate_limit import resolve_client_ip
+
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "172.28.0.0/16")
+    assert resolve_client_ip(_fake_request(ip="172.28.0.3", forwarded="198.51.100.10")) == (
+        "198.51.100.10"
+    )
+
+
+def test_resolve_client_ip_skips_every_trusted_hop(monkeypatch):
+    """Client → external LB → Caddy → API: both proxies are trusted, so the
+    walk passes over each and lands on the first untrusted address."""
+    from app.config import settings
+    from app.services.rate_limit import resolve_client_ip
+
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "10.0.0.0/8,172.28.0.0/16")
+    req = _fake_request(ip="172.28.0.3", forwarded="192.0.2.7, 198.51.100.10, 10.0.1.20, 10.0.2.30")
+    assert resolve_client_ip(req) == "198.51.100.10"
+
+
+def test_resolve_client_ip_every_hop_trusted_takes_the_leftmost(_trust_alb_proxy):
+    """An internal caller behind the proxy: nothing untrusted in the chain,
+    so the originating (leftmost) address is the client."""
+    from app.services.rate_limit import resolve_client_ip
+
+    req = _fake_request(ip="10.0.0.5", forwarded="10.1.1.1, 10.2.2.2")
+    assert resolve_client_ip(req) == "10.1.1.1"
+
+
+def test_resolve_client_ip_reads_repeated_headers_as_one_list(_trust_alb_proxy):
+    """Two X-Forwarded-For lines are one list in order (RFC 9110 §5.3); the
+    forged first line must not win."""
+    from app.services.rate_limit import resolve_client_ip
+
+    req = _fake_request(ip="10.0.0.5", forwarded=["1.2.3.4", "198.51.100.10"])
+    assert resolve_client_ip(req) == "198.51.100.10"
+
+
+@pytest.mark.parametrize(
+    ("forwarded", "expected"),
+    [
+        # Junk, `unknown` and an RFC 7239-style obfuscated id are skipped.
+        ("not-an-ip, 198.51.100.10", "198.51.100.10"),
+        ("198.51.100.10, unknown", "198.51.100.10"),
+        ("198.51.100.10, _hidden, , 10.0.0.9", "198.51.100.10"),
+        # An address with a port is not an IP literal; skipped, never a key.
+        ("198.51.100.10, 203.0.113.9:443", "198.51.100.10"),
+        # IPv6 is normalised so one client is one bucket.
+        ("2001:DB8:0:0::1", "2001:db8::1"),
+        # Nothing usable at all: key on the trusted peer, never on junk.
+        ("garbage, , unknown", "10.0.0.5"),
+        ("", "10.0.0.5"),
+    ],
+)
+def test_resolve_client_ip_skips_malformed_entries(_trust_alb_proxy, forwarded, expected):
+    from app.services.rate_limit import resolve_client_ip
+
+    assert resolve_client_ip(_fake_request(ip="10.0.0.5", forwarded=forwarded)) == expected
+
+
+def test_resolve_client_ip_untrusted_peer_ignores_even_an_appended_header(_trust_alb_proxy):
+    from app.services.rate_limit import resolve_client_ip
+
+    req = _fake_request(ip="203.0.113.1", forwarded="1.2.3.4, 198.51.100.10")
+    assert resolve_client_ip(req) == "203.0.113.1"
 
 
 def test_auth_audit_ip_goes_through_the_shared_resolver(_trust_alb_proxy):

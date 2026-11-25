@@ -498,14 +498,21 @@ those:
 
 ## 21. Bot protection — hCaptcha (`utils/hcaptcha.py`)
 
-The only third party a visitor meets **before they are a customer at all**, and
-the only row here that is not an adapter. It sits on the public self-service
-signup form and nowhere else — it is not present anywhere inside the signed-in
-application.
+The only third party a visitor meets **before signing in**, and the only row
+here that is not an adapter. It sits on two public forms and nowhere else: the
+self-service signup form, and the workspace lookup (`/find-workspace`, the
+"email me my workspace address" form the apex's sign-in link leads to). The
+lookup is open on every deployment, signup open or closed (decisions §518,
+§553), so hCaptcha is engaged even on an invite-only deployment. It is not
+present anywhere inside the signed-in application. Both forms send it the same
+things (server side: `secret`, `response`, `remoteip`, nothing else); neither
+sends the email address or anything else typed into the form. Its reach to the
+lookup's users (customers' own staff) is the notice entry
+`2026-11-25-hcaptcha-workspace-lookup` in the change log (decisions §558).
 
 | Processor | Service | Data categories | Processing location | Active when configured | DPA / sub-processing status |
 |-----------|---------|-----------------|---------------------|------------------------|------------------------------|
-| **hCaptcha (Intuition Machines, Inc.)** | Bot protection on `POST /api/signup` and `POST /api/workspace-lookup`; server-side token verification against `hcaptcha.com/siteverify` | The **requester's IP address** (`remoteip`), the challenge token, and whatever browser signals hCaptcha's own in-page script collects. No invoice, vendor, payment or tax data | US | **Deployed — always** | DPA — to be confirmed |
+| **hCaptcha (Intuition Machines, Inc.)** | Bot protection on `POST /api/signup` and `POST /api/workspace-lookup`; server-side token verification against `hcaptcha.com/siteverify` | The **requester's IP address** (`remoteip`), the challenge token, and whatever browser signals hCaptcha's own in-page script collects — the same on both forms; never the email address or other form fields. No invoice, vendor, payment or tax data | US | **Deployed — always** | DPA — to be confirmed |
 
 > **Mandatory, not optional.** `config.py::_require_captcha_in_deployed_envs`
 > raises at boot if `FEOH_HCAPTCHA_SECRET` is unset in a deployed environment,

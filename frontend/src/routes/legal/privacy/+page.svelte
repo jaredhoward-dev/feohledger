@@ -371,7 +371,8 @@
 				<tr>
 					<td>
 						Keeping accounts secure: multi-factor authentication, passkeys, session records you
-						can review and revoke, rate limiting, and the captcha on the public signup form.
+						can review and revoke, rate limiting, and the captcha on the public signup and
+						workspace-lookup forms.
 					</td>
 					<td>
 						Legitimate interests, Article 6(1)(f) — our interest, and yours, in accounts that
@@ -566,7 +567,8 @@
 		infrastructure provider that hosts the service (AWS), <strong>Anthropic</strong>, which
 		receives uploaded invoice documents for extraction on any deployed instance (section 7
 		explains why), and <strong>hCaptcha</strong>, which receives the IP address of anyone using the
-		public signup form — the service refuses to start without it.
+		public signup form or the workspace lookup (the page that emails you your workspace address if
+		you have forgotten it) — the service refuses to start without it.
 	</p>
 
 	<p>
@@ -585,7 +587,8 @@
 		can receive customer personal data, what each receives, which are engaged today, and how
 		changes are notified. On our own controller side the recipients are the infrastructure provider
 		that hosts the service; the anti-abuse captcha provider, which sees your IP address and a
-		challenge token when you submit the public signup form; whichever provider a deployment sends
+		challenge token when you submit the public signup form or ask for your workspace address to be
+		emailed to you, but not what you typed into the form; whichever provider a deployment sends
 		account and service email through; and, once we bill through a payment provider rather than
 		our own records, that provider, which receives the customer organisation's name, a billing
 		contact email address and the plan. Every one of them is in the register.

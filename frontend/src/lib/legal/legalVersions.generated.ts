@@ -12,4 +12,4 @@
 export const TERMS_VERSION = '2026-11-21';
 
 /** Privacy Policy version in force (its effective date). */
-export const PRIVACY_VERSION = '2026-11-21';
+export const PRIVACY_VERSION = '2026-11-25';

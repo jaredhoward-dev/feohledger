@@ -106,7 +106,8 @@
 	<p>
 		These are in the path of the running service without anyone having to
 		switch them on: the hosting substrate, the provider that reads uploaded
-		invoices, and the bot-protection control on the public sign-up form.
+		invoices, and the bot-protection control on the two public forms that
+		send email: sign-up and the workspace lookup.
 	</p>
 
 	<p>
@@ -181,8 +182,8 @@
 				</tr>
 				<tr>
 					<th scope="row">hCaptcha (Intuition Machines, Inc.)</th>
-					<td>Bot protection on the public self-service sign-up form.</td>
-					<td>The IP address of the person completing the form, the challenge token, and the browser signals hCaptcha's own script collects in the page. No invoice, supplier or payment data.</td>
+					<td>Bot protection on the two public forms that send an email to the address typed into them: self-service sign-up, and the workspace lookup at <code>/find-workspace</code>, where someone who has forgotten their workspace address asks for it to be emailed to them.</td>
+					<td>The same on either form: the browser signals hCaptcha's own script collects in the page while the form is open, and, when the form is submitted, the challenge token and the IP address of the person submitting it, which our server sends to hCaptcha to check the token. We do not send hCaptcha what is typed into the form, such as the email address. No invoice, supplier or payment data.</td>
 					<td>United States</td>
 				</tr>
 			</tbody>
@@ -249,11 +250,14 @@
 	</p>
 
 	<p>
-		hCaptcha is the one third party a visitor meets before they are a customer
-		at all, so it is worth being plain about it: it is mandatory in any
-		deployed environment, the service will not start without it configured,
-		and it is on the sign-up form only. It is not present anywhere inside the
-		signed-in application.
+		hCaptcha is the one third party a visitor meets before signing in, so it
+		is worth being plain about it: it is mandatory in any deployed
+		environment, the service will not start without it configured, and it is
+		on two public pages only — the sign-up form, and the workspace lookup that
+		the sign-in link leads to when you do not know your workspace address. It
+		is on every deployment, whether sign-up is open or closed, because the
+		workspace lookup is always available. It is not present anywhere inside
+		the signed-in application.
 	</p>
 
 	<p>
