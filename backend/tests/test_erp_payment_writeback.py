@@ -706,3 +706,94 @@ def test_the_opt_in_needs_an_account(erp, refused):
     from app.services.erp_adapters.catalog import discount_credit_refusal
 
     assert (discount_credit_refusal({"type": "xero", **erp}) is not None) is refused
+
+
+# ── Saving the opt-in through PATCH /api/organization (decisions §575, §578) ──
+
+
+async def _add_gl(realdb, code: str, *, erp_id: str | None, realm: str | None = REALM) -> None:
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            GLAccount(
+                organization_id=realdb.info("a").org_id,
+                code=code,
+                name=f"Account {code}",
+                erp_account_id=erp_id,
+                erp_link_realm=realm if erp_id else None,
+            )
+        )
+        await s.commit()
+
+
+async def _save_erp(realdb, **erp_extra):
+    erp = {
+        "type": "quickbooks_online",
+        "integration_method": "direct",
+        "bill_payment_bank_account": "1010",
+        "bill_payment_card_account": "2050",
+        **erp_extra,
+    }
+    async with realdb.client(key="a", role="admin") as c:
+        return await c.patch("/api/organization", json={"settings": {"erp": erp}})
+
+
+async def _stored_discount_flag(realdb):
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        return ((org.settings or {}).get("erp") or {}).get("book_discount_as_credit")
+
+
+@pytest.mark.plan("scale")
+async def test_saving_the_opt_in_without_an_account_is_refused(realdb):
+    await _configure(realdb)
+    resp = await _save_erp(realdb, book_discount_as_credit="on")
+    assert resp.status_code == 422, resp.text
+    assert "discount_credit_account is required" in resp.json()["detail"]
+    assert await _stored_discount_flag(realdb) is None
+
+
+@pytest.mark.plan("scale")
+async def test_saving_the_opt_in_with_a_shared_linked_account_succeeds(realdb):
+    await _configure(realdb)
+    await _add_gl(realdb, "4910", erp_id="91")
+    resp = await _save_erp(realdb, book_discount_as_credit="on", discount_credit_account="4910")
+    assert resp.status_code == 200, resp.text
+    assert await _stored_discount_flag(realdb) == "on"
+
+
+@pytest.mark.plan("scale")
+@pytest.mark.parametrize(
+    "account",
+    ["unknown", "never_synced", "other_company", "entity_only"],
+)
+async def test_saving_the_opt_in_with_an_account_the_write_back_cannot_resolve_is_refused(
+    realdb, account
+):
+    """What `_resolve_account` would answer None for on an org-wide invoice is
+    refused at save time, so the form never turns on a credit every write-back
+    would refuse (decisions §578)."""
+    from app.models.entity import Entity
+
+    await _configure(realdb)
+    if account == "never_synced":
+        await _add_gl(realdb, "4920", erp_id=None)
+    elif account == "other_company":
+        await _add_gl(realdb, "4920", erp_id="92", realm="quickbooks_online:other-co")
+    elif account == "entity_only":
+        async with realdb.sessionmaker("a")() as s:
+            entity = (await s.execute(select(Entity).limit(1))).scalar_one()
+            s.add(
+                GLAccount(
+                    organization_id=realdb.info("a").org_id,
+                    entity_id=entity.id,
+                    code="4920",
+                    name="Entity discounts",
+                    erp_account_id="93",
+                    erp_link_realm=REALM,
+                )
+            )
+            await s.commit()
+    resp = await _save_erp(realdb, book_discount_as_credit="on", discount_credit_account="4920")
+    assert resp.status_code == 422, resp.text
+    assert "organization-wide GL account linked" in resp.json()["detail"]
+    assert await _stored_discount_flag(realdb) is None
