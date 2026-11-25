@@ -26059,3 +26059,44 @@ read; only the endpoints that 500'd changed.
 Tests: `backend/tests/test_entity_scope_by_id_sweep.py` (mixed selection,
 all-out-of-scope equals missing, the consolidated view sees every row, the
 malformed-id 422s, vendor status / screen and workflow bulk-delete skips).
+
+## 510. The SCIM bearer token gets a panel, an audit-first mint and a revoke that is not plan-gated (round 41)
+
+**Problem.** `POST /api/organization/sso/scim-token` had no screen, so the
+only way to connect an identity provider's SCIM connector was a hand-made API
+call. The mint wrote its audit row *after* commit, best-effort
+(`dispatch_auth_audit`), so a token could be minted with no record of who did
+it. And there was no way to retire a token short of rotating it: an org that
+stopped using SCIM, or whose plan no longer included it, kept a live
+provisioning credential it could not switch off.
+
+**Decision.** `organization/ScimTokenPanel.svelte` (`?section=scim`, after
+Single Sign-On) shows whether a token is set, the SCIM base URL, and Generate /
+Rotate / Revoke. The token is stored only as its sha256 digest
+(`services/sso.hash_scim_token`, in `organizations.scim_bearer_hash` and the
+`settings.sso` mirror), so "is one set" is all the panel can show after the
+mint; the plaintext appears once, in `ui/SecretReveal`, and is dropped from
+state when that dialog closes. Rotate and Revoke each confirm first, because
+both cut off the identity provider's current connection.
+
+The mint now writes `organization.scim_token_minted` FIRST through
+`record_auth_audit_or_raise` (503 with nothing minted when the row cannot be
+written, the `/organization/sso` and §502 rule), with `rotated` recording
+whether it replaced a live token. A new `DELETE
+/api/organization/sso/scim-token` clears both copies of the digest, audited
+first as `organization.scim_token_revoked` with the removed digest's prefix;
+with no token set it is a 204 no-op with no row.
+
+**Revoke is admin-only but not plan-gated.** Minting stays behind the `scim`
+feature (decisions §258). Revoking only takes access away, and the case that
+most needs it is the tenant whose plan dropped SCIM while a token it minted is
+still live; gating it would leave that credential un-retirable from the
+product. The panel offers Revoke without the plan and shows the upgrade notice
+in place of Generate / Rotate.
+
+**Rejected.** *Showing the digest prefix after reload*: `GET
+/api/organization/sso` does not return it, and the panel shows only what the
+read already serves; the prefix is in the reveal dialog and every audit row,
+which is where an operator matches a token to its mint. *Keeping the
+post-commit audit*: a provisioning credential minted with no row is worse than
+a refused mint.

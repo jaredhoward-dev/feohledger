@@ -149,6 +149,13 @@ boot, so it's reproducible. The blueprint creates:
 The app resolves the tenant from the token's sha256 (`Organization.scim_bearer_hash`),
 so `pnpm scim:seed` must run before a sync or every push 401s.
 
+`pnpm scim:seed` sets a fixed, known token so the blueprint can carry it. A
+real tenant's admin generates, rotates and revokes theirs in the app instead:
+**Organization → SCIM provisioning** (`/organization?section=scim`), which shows
+the new token once and afterwards only whether one is set. Generating one there
+replaces the seeded token, so re-run `pnpm scim:seed` (or paste the new token
+into the Authentik provider) before the next sync.
+
 ### How sync works
 
 Authentik runs a full sync on a schedule and a direct sync when an assigned user
