@@ -1367,6 +1367,7 @@ export const enSettings = {
 	'admin.privacy.count.roles': "{n, plural, one {# role} other {# roles}}",
 	'admin.privacy.count.pushDevices': "{n, plural, one {# push-notification device} other {# push-notification devices}}",
 	'admin.privacy.count.passkeys': "{n, plural, one {# passkey} other {# passkeys}}",
+	'admin.privacy.count.legalAcceptances': "{n, plural, one {# Terms or Privacy acceptance} other {# Terms or Privacy acceptances}}",
 	'admin.privacy.count.auditEvents': "{n, plural, one {# audited action} other {# audited actions}}",
 	'admin.privacy.count.notifications': "{n, plural, one {# notification} other {# notifications}}",
 	'admin.privacy.count.expenseReports': "{n, plural, one {# expense report} other {# expense reports}}",

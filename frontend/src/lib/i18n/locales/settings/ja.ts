@@ -1340,6 +1340,7 @@ export const messages = {
 	'admin.privacy.count.roles': "{n, plural, other {ロール # 件}}",
 	'admin.privacy.count.pushDevices': "{n, plural, other {プッシュ通知デバイス # 台}}",
 	'admin.privacy.count.passkeys': "{n, plural, other {パスキー # 件}}",
+	'admin.privacy.count.legalAcceptances': "{n, plural, other {規約・プライバシーへの同意 # 件}}",
 	'admin.privacy.count.auditEvents': "{n, plural, other {監査対象の操作 # 件}}",
 	'admin.privacy.count.notifications': "{n, plural, other {通知 # 件}}",
 	'admin.privacy.count.expenseReports': "{n, plural, other {経費精算書 # 件}}",

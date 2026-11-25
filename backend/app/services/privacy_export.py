@@ -136,6 +136,7 @@ DSAR_COUNTED_SECTIONS: tuple[str, ...] = (
     "roles",
     "push_devices",
     "passkeys",
+    "legal_acceptances",
     "audit_events",
     "notifications",
     "expense_reports",

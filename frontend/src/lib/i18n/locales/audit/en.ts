@@ -27,6 +27,7 @@ export const enAudit = {
 	'audit.action.auth.mfa.verify.success': "MFA check passed",
 	'audit.action.auth.password.changed': "Password changed",
 	'audit.action.auth.password_reset.completed': "Password reset completed",
+	'audit.action.auth.legal.accepted': "Terms and Privacy Policy accepted",
 	'audit.action.auth.password_reset.requested': "Password reset requested",
 	'audit.action.auth.saml.login.failure': "SAML sign-in failed",
 	'audit.action.auth.saml.login.success': "Signed in with SAML",

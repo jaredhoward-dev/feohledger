@@ -24,6 +24,7 @@ export const messages = {
 	'audit.action.auth.mfa.verify.success': "MFA-Prüfung bestanden",
 	'audit.action.auth.password.changed': "Passwort geändert",
 	'audit.action.auth.password_reset.completed': "Passwort zurückgesetzt",
+	'audit.action.auth.legal.accepted': "Nutzungsbedingungen und Datenschutzerklärung akzeptiert",
 	'audit.action.auth.password_reset.requested': "Passwort-Zurücksetzung angefordert",
 	'audit.action.auth.saml.login.failure': "SAML-Anmeldung fehlgeschlagen",
 	'audit.action.auth.saml.login.success': "Mit SAML angemeldet",
