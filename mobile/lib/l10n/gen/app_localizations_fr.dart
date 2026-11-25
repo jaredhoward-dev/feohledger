@@ -850,6 +850,22 @@ class AppLocalizationsFr extends AppLocalizations {
       'Une carte virtuelle a été émise pour payer cette facture. Annulez la carte avant de retirer l\'approbation.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Cette facture a déjà été envoyée via PEPPOL, et le destinataire détient le document approuvé. Émettez un avoir et envoyez une facture corrigée ; son approbation ne peut pas être retirée.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Cette facture a été acheminée en intragroupe, et sa facture miroir dans l\'autre entité a repris les montants approuvés. Supprimez la facture miroir (elle n\'est pas encore approuvée), retirez ensuite cette approbation, puis acheminez à nouveau la facture une fois réapprouvée.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Cette facture a été acheminée en intragroupe, et sa facture miroir dans l\'autre entité y est déjà approuvée ou en cours de paiement. Corrigez les deux côtés par un avoir chacun ; cette approbation ne peut pas être retirée.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Cette facture est une facture miroir intragroupe : ses montants sont copiés de la facture d\'origine de l\'autre entité. Supprimez cette facture miroir et corrigez la facture d\'origine, puis acheminez-la à nouveau.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

@@ -750,6 +750,10 @@ async def recall_approval(
     `invoice.approve`; 409
     ``invoice_not_recallable`` from any other status; 409
     ``invoice_recall_in_erp`` when the ERP may hold the bill; 409
+    ``invoice_recall_peppol_transmitted`` once the document went out over
+    PEPPOL; 409 ``invoice_recall_is_mirror`` / ``invoice_recall_mirror_unsigned``
+    / ``invoice_recall_mirror_progressed`` while the invoice is paired
+    inter-company (decisions §573); 409
     ``invoice_recall_claimed`` while a live payment or virtual card holds it.
     The permission is the approve and reject doors' (`invoice.approve`), so
     whoever may sign an approval may take one back; the predicate re-reads it

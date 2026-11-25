@@ -846,6 +846,22 @@ class AppLocalizationsDe extends AppLocalizations {
       'Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Genehmigung zurücknehmen.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Diese Rechnung wurde bereits über PEPPOL versendet, und der Empfänger hat das genehmigte Dokument. Stellen Sie eine Gutschrift aus und senden Sie eine korrigierte Rechnung; die Genehmigung kann nicht zurückgenommen werden.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit hat die genehmigten Beträge übernommen. Löschen Sie die Spiegelrechnung (sie ist noch nicht genehmigt), nehmen Sie dann diese Genehmigung zurück und leiten Sie die Rechnung nach der erneuten Genehmigung wieder weiter.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit ist dort bereits genehmigt oder wird bezahlt. Korrigieren Sie beide Seiten mit je einer Gutschrift; diese Genehmigung kann nicht zurückgenommen werden.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Diese Rechnung ist eine konzerninterne Spiegelrechnung: Ihre Beträge stammen aus der Ursprungsrechnung der anderen Einheit. Löschen Sie diese Spiegelrechnung, korrigieren Sie die Ursprungsrechnung und leiten Sie sie erneut weiter.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

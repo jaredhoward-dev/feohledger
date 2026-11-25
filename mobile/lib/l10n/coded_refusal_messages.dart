@@ -240,6 +240,10 @@ const codedRefusalCodes = <String>{
   'invoice_not_recallable',
   'invoice_recall_in_erp',
   'invoice_recall_claimed',
+  'invoice_recall_peppol_transmitted',
+  'invoice_recall_mirror_unsigned',
+  'invoice_recall_mirror_progressed',
+  'invoice_recall_is_mirror',
   'invoice_not_in_review',
   'invoice_bulk_not_found',
   'invoice_status_immutable',
@@ -329,6 +333,15 @@ String? localizeCodedRefusal(AppLocalizations l, Object? detail) {
       return l.codedRefusalInvoiceNotRecallable;
     case 'invoice_recall_in_erp':
       return l.codedRefusalInvoiceRecallInErp;
+    // Sent over PEPPOL, or paired inter-company (backend decisions §573).
+    case 'invoice_recall_peppol_transmitted':
+      return l.codedRefusalRecallPeppolTransmitted;
+    case 'invoice_recall_mirror_unsigned':
+      return l.codedRefusalRecallMirrorUnsigned;
+    case 'invoice_recall_mirror_progressed':
+      return l.codedRefusalRecallMirrorProgressed;
+    case 'invoice_recall_is_mirror':
+      return l.codedRefusalRecallIsMirror;
     case 'invoice_recall_claimed':
       return switch (_str(params, 'claim')) {
         'payment' => l.codedRefusalPaymentBlocksRecall,

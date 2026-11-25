@@ -526,7 +526,15 @@ An approved invoice's amount, payee, line items and document are frozen (§363,
    `invoice.approve` permission (403); `approved`, or `failed` once approved
    (409 `invoice_not_recallable`); no bill the ERP may hold — `erp_document_id`
    set, or `services/erp.possibly_posted` on the push's state (409
-   `invoice_recall_in_erp`); no live payment or virtual card,
+   `invoice_recall_in_erp`); no live (not `failed`) outbound PEPPOL
+   transmission — the network holds the approved document, which only a
+   credit note corrects (409 `invoice_recall_peppol_transmitted`, §573); not
+   paired inter-company — the invoice is itself a mirror (409
+   `invoice_recall_is_mirror`), or its mirror is unsigned (409
+   `invoice_recall_mirror_unsigned`: delete the mirror, recall, route again
+   once re-approved) or approved / being paid (409
+   `invoice_recall_mirror_progressed`, `params.mirror_status`: a credit memo
+   on each side), §573; no live payment or virtual card,
    `erp_export_gate.live_claims` (409 `invoice_recall_claimed`,
    `params.claim`). A payment run holds its invoices through those payment
    rows, so a staged, approved, exported or executed run refuses.

@@ -841,6 +841,22 @@ class AppLocalizationsEn extends AppLocalizations {
       'A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can\'t be recalled.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'This invoice has been routed inter-company, and its mirror under the other entity copied the approved figures. Delete the mirror (it hasn\'t been approved yet), then recall this approval, and route the invoice again once it is re-approved.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'This invoice has been routed inter-company, and its mirror under the other entity has already been approved or is being paid there. Correct the pair with a credit memo on each side; this approval can\'t be recalled.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,

@@ -203,6 +203,14 @@ non-empty `supported_doc_types`.
 | tax-invalid / not BIS 3.0 conformant | 422 (PII-free structured `[{loc, type, msg}]` list — see `e-invoicing.md` § The 422 body) |
 | role not permitted | 403 |
 
+The route takes the invoice **row lock** (`get_invoice_for_update`) before
+reading its status, so a send and an approval recall serialize: once a live
+(not `failed`) outbound transmission exists, the recall is refused with 409
+`invoice_recall_peppol_transmitted` — the receiver holds the approved
+document, and a transmitted e-invoice is corrected by a credit note and a new
+document, never by reopening the one sent (`services/review.recall_refusal`,
+decisions §573). A `sending` row counts: its outcome is unknown.
+
 A send writes a `invoice.peppol_sent` (or `invoice.peppol_send_failed`) audit
 row through `dispatch_audit` (`details` records provider, `receiver_scheme`,
 `message_id`, `doc_type` — **never** the receiver value / tax id). The

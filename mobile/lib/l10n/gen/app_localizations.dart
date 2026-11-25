@@ -1392,6 +1392,30 @@ abstract class AppLocalizations {
   /// **'A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.'**
   String get codedRefusalCardBlocksRecall;
 
+  /// Coded refusal `invoice_recall_peppol_transmitted`: the approved document was already sent over PEPPOL.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can't be recalled.'**
+  String get codedRefusalRecallPeppolTransmitted;
+
+  /// Coded refusal `invoice_recall_mirror_unsigned`: the inter-company mirror is unsigned; delete it first.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has been routed inter-company, and its mirror under the other entity copied the approved figures. Delete the mirror (it hasn't been approved yet), then recall this approval, and route the invoice again once it is re-approved.'**
+  String get codedRefusalRecallMirrorUnsigned;
+
+  /// Coded refusal `invoice_recall_mirror_progressed`: the inter-company mirror was approved or is being paid.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has been routed inter-company, and its mirror under the other entity has already been approved or is being paid there. Correct the pair with a credit memo on each side; this approval can't be recalled.'**
+  String get codedRefusalRecallMirrorProgressed;
+
+  /// Coded refusal `invoice_recall_is_mirror`: the invoice is itself an inter-company mirror.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.'**
+  String get codedRefusalRecallIsMirror;
+
   /// Title of the reason prompt shown before bulk-rejecting the selected invoices.
   ///
   /// In en, this message translates to:

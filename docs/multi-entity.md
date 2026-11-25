@@ -565,7 +565,16 @@ from its origin by the `role: mirror` routing audit row — the FK is set on bot
 rows and the entity columns are symmetric, so neither can — and covers every
 mirror short of `done` (`docs/decisions.md` §198).
 It is **idempotent** on `intercompany_mirror_id` — a second call returns the
-existing mirror, never a duplicate. Surfaced at `POST
+existing mirror, never a duplicate. **A paired invoice's approval cannot be
+recalled** (decisions §573): the mirror holds a copy of the origin's approved
+figures and segregation set, so correcting one side alone leaves the pair
+disagreeing. Recalling the mirror itself is refused
+(`invoice_recall_is_mirror`); recalling an origin whose mirror is unsigned is
+refused with the way out (`invoice_recall_mirror_unsigned`: delete the mirror,
+which unlinks the origin, recall, then route again once re-approved — routing
+copies the corrected figures and set afresh); once the mirror is approved or
+being paid, `invoice_recall_mirror_progressed` points to a credit memo on each
+side. Surfaced at `POST
 /api/invoices/{id}/route-intercompany` (admin / ap_manager; self-billing → 400).
 See `backend/docs/inter-company.md`.
 

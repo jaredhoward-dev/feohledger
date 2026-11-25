@@ -861,6 +861,14 @@ describe('recalling an approval (decisions §374)', () => {
 			expect(codedRefusalText('invoice_recall_claimed', { claim: 'payment' }, t)).toBe(
 				cat['refusal.paymentBlocksRecall']
 			);
+			for (const [code, key] of [
+				['invoice_recall_peppol_transmitted', 'refusal.recallPeppolTransmitted'],
+				['invoice_recall_mirror_unsigned', 'refusal.recallMirrorUnsigned'],
+				['invoice_recall_mirror_progressed', 'refusal.recallMirrorProgressed'],
+				['invoice_recall_is_mirror', 'refusal.recallIsMirror']
+			] as const) {
+				expect(codedRefusalText(code, { mirror_status: 'approved' }, t)).toBe(cat[key]);
+			}
 			expect(codedRefusalText('invoice_recall_claimed', { claim: 'virtual_card' }, t)).toBe(
 				cat['refusal.cardBlocksRecall']
 			);

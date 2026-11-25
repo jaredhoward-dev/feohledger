@@ -915,11 +915,11 @@ async def peppol_send(
     from app.services.peppol_adapters import ParticipantId, PeppolSendError
     from app.services.peppol_send import send_invoice_over_peppol
 
-    invoice = (
-        await db.execute(select(Invoice).where(Invoice.id == invoice_id))
-    ).scalar_one_or_none()
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    # Row-locked: the approval recall (`review.recall_refusal`) refuses once a
+    # transmission exists and locks this row too, so a send and a recall
+    # serialize — the send re-reads the status the recall left, and the recall
+    # sees the transmission the send wrote (decisions §573).
+    invoice = await get_invoice_for_update(db, invoice_id)
 
     # PEPPOL transmission is a compliance-significant outbound to a counterparty
     # (inserts a row, emits to the network, writes an audit row) — gate it on AP
