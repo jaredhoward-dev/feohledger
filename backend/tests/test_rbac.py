@@ -291,7 +291,7 @@ PUBLIC_BY_DESIGN: tuple[PublicProbe, ...] = (
         "POST",
         "/workspace-lookup",
         "/api/workspace-lookup",
-        "Self-service \"email me my workspace address\" (decisions §518) — reachable "
+        'Self-service "email me my workspace address" (decisions §518) — reachable '
         "by someone who, by definition, cannot find where they sign in. Same answer "
         "for every address; the lookup and send run detached after the response; "
         "bounded by the per-IP/per-address budgets and the captcha.",
