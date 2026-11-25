@@ -183,6 +183,12 @@ CASES = [
     # not be able to reject through the back door. Same permission as approve.
     ("/api/invoices/{invoice_id}/reject", "POST", _INVOICE_APPROVE),
     ("/api/invoices/{invoice_id}/recall-approval", "POST", _INVOICE_APPROVE),
+    # Out-of-office delegation hands the caller's approval assignments to a
+    # colleague, so only someone who holds the approve duty may set one, or
+    # list who could take it (decisions §511). Reading or clearing your own
+    # delegation stays open: neither grants anyone anything.
+    ("/api/auth/delegation", "POST", _INVOICE_APPROVE),
+    ("/api/auth/delegation/candidates", "GET", _INVOICE_APPROVE),
     # --- payment.execute: the routes that actually move money, or that decide
     # an already-moved payment's fate in AP's favour. These are the reason the
     # SoD layer exists at all, so they are pinned individually rather than left
