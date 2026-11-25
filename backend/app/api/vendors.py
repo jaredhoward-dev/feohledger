@@ -605,6 +605,14 @@ def vendor_status_actions(vendor, user: User) -> dict:
     return out
 
 
+def _scoped_vendors(entity_id: uuid.UUID | None):
+    """`select(Vendor)` narrowed to the caller's entity selector with the by-id
+    routes' rule (`include_shared`: an unstamped vendor is reachable from every
+    entity), for the bulk endpoints that take vendor ids. A bulk call reaches
+    exactly the rows the single-row routes do, never a sibling entity's."""
+    return apply_entity_scope(select(Vendor), Vendor, entity_id, include_shared=True)
+
+
 @router.post("/bulk/status", response_model=VendorBulkStatusResponse)
 async def bulk_vendor_status(
     body: VendorBulkStatusRequest,
@@ -612,6 +620,7 @@ async def bulk_vendor_status(
     org: Organization = Depends(get_tenant),
     user: User = Depends(require_permission(PERM_VENDOR_MANAGE)),
     org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Bulk verify / reject over a hand-picked set of vendors.
 
@@ -635,7 +644,11 @@ async def bulk_vendor_status(
             skipped.append(VendorBulkStatusSkip(id=raw, reason="invalid id format"))
             continue
 
-        vendor = (await db.execute(select(Vendor).where(Vendor.id == vid))).scalar_one_or_none()
+        # Out of the entity selector reads as "not found", as the single-row
+        # route's 404 does (decisions §509).
+        vendor = (
+            await db.execute(_scoped_vendors(entity_id).where(Vendor.id == vid))
+        ).scalar_one_or_none()
         if vendor is None:
             skipped.append(VendorBulkStatusSkip(id=raw, reason="not found"))
             continue
@@ -691,6 +704,7 @@ async def bulk_screen_vendors(
     org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)),
     org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Manually re-screen many vendors against the configured sanctions
     provider in one call.
@@ -711,7 +725,11 @@ async def bulk_screen_vendors(
             skipped.append(VendorBulkScreenSkip(id=raw, reason="invalid id format"))
             continue
 
-        vendor = (await db.execute(select(Vendor).where(Vendor.id == vid))).scalar_one_or_none()
+        # Out of the entity selector reads as "not found", as the single-row
+        # route's 404 does (decisions §509).
+        vendor = (
+            await db.execute(_scoped_vendors(entity_id).where(Vendor.id == vid))
+        ).scalar_one_or_none()
         if vendor is None:
             skipped.append(VendorBulkScreenSkip(id=raw, reason="not found"))
             continue
@@ -755,6 +773,7 @@ async def bulk_export_vendors(
     body: VendorBulkExportRequest,
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_CFO)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Export a hand-picked set of vendors as CSV.
 
@@ -764,9 +783,13 @@ async def bulk_export_vendors(
     banking-data-out-of-logs-and-exports invariant exists to keep off a
     laptop. Mirrors `api/invoices.py::bulk_export`'s CSV branch, including the
     CSV-formula-injection guard (CWE-1236) on every cell.
+
+    Scoped to the caller's entity selector with the by-id routes' rule (an
+    unstamped vendor stays reachable from every entity): an id in another
+    entity is dropped exactly as a nonexistent id is, and an all-out-of-scope
+    selection is the same 404 as an all-missing one (decisions §509).
     """
-    ids = [uuid.UUID(i) for i in body.ids]
-    result = await db.execute(select(Vendor).where(Vendor.id.in_(ids)))
+    result = await db.execute(_scoped_vendors(entity_id).where(Vendor.id.in_(body.ids)))
     vendors = result.scalars().all()
     if not vendors:
         raise HTTPException(status_code=404, detail="No vendors found")

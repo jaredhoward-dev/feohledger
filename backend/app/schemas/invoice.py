@@ -1,3 +1,4 @@
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -376,7 +377,9 @@ class InvoiceCountsResponse(BaseModel):
 
 
 class BulkDeleteRequest(BaseModel):
-    ids: list[str] = Field(..., min_length=1)
+    # Parsed here, so a malformed id is a 422 rather than the 500 an
+    # in-handler `uuid.UUID(...)` raised (decisions §509).
+    ids: list[uuid.UUID] = Field(..., min_length=1)
 
 
 class BulkDeleteResponse(BaseModel):
@@ -394,7 +397,7 @@ class BulkStatusRequest(BaseModel):
     whitelist — not this schema — is the gate.
     """
 
-    ids: list[str] = Field(..., min_length=1)
+    ids: list[uuid.UUID] = Field(..., min_length=1)
     status: InvoiceStatus
     # Required when `status` is `rejected`: the endpoint routes rejections
     # through `review.reject_invoice`, which records the reason on the audit row
@@ -438,7 +441,7 @@ class BulkStatusResponse(BaseModel):
 
 
 class BulkExportRequest(BaseModel):
-    ids: list[str] = Field(..., min_length=1)
+    ids: list[uuid.UUID] = Field(..., min_length=1)
     format: str = Field(default="csv", pattern=r"^(csv|json|xml)$")
 
 
