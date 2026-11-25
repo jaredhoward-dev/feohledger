@@ -30,7 +30,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.api.cards import _normalize_charge_amount
+from app.api.cards import _nium_amount, _normalize_charge_amount
 from app.services.card_adapters.base import VirtualCardPayload
 
 
@@ -65,6 +65,30 @@ def test_currency_is_optional():
     """A webhook body need not carry a currency; absent, the common exponent of
     2 applies — the old behaviour, so no existing caller changes."""
     assert _normalize_charge_amount("lithic", 150000, None) == Decimal("1500.00")
+
+
+@pytest.mark.parametrize(
+    ("stated", "expected"),
+    [
+        ("EUR", "EUR"),
+        (" eur ", "EUR"),
+        # Not a usable ISO 4217 code: read as no currency, which the settlement
+        # path refuses (decisions §557), never as a fourth spelling of one.
+        ("EURO", None),
+        ("€", None),
+        ("uß", None),
+        (978, None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_a_nium_currency_is_read_through_the_iso_owner(stated, expected):
+    body = {
+        "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
+        "authAmount": "10.00",
+        "authCurrency": stated,
+    }
+    assert _nium_amount(body) == ("10.00", expected)
 
 
 # ------------------------------------------------- the WRITE half (Lithic) ---
