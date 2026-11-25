@@ -1269,19 +1269,27 @@ class XeroAdapter(OAuthErpAdapter):
 
     # -- early-payment discount as a credit note (decisions §575) -----------
     #
-    # Shapes, from Xero's Accounting API reference (read 2026-11-25),
-    # https://developer.xero.com/documentation/api/accounting/creditnotes :
-    # * PUT CreditNotes {"CreditNotes": [{Type "ACCPAYCREDIT", Contact
-    #   {ContactID}, Date, Status "AUTHORISED", LineAmountTypes "NoTax",
-    #   CurrencyCode, CreditNoteNumber, LineItems [{Description, Quantity,
-    #   UnitAmount, AccountID}]}]}. ``Reference`` is ACCRECCREDIT-only, and an
-    #   ACCPAYCREDIT's ``CreditNoteNumber`` need not be unique, so our marker
-    #   rides the number.
-    # * PUT CreditNotes/{CreditNoteID}/Allocations {"Allocations": [{Amount,
-    #   Invoice {InvoiceID}, Date}]} — allocate to a bill.
-    # * DELETE CreditNotes/{CreditNoteID}/Allocations/{AllocationID}, then
-    #   POST CreditNotes/{CreditNoteID} {Status "VOIDED"}: Xero voids only a
-    #   credit note with no allocation left.
+    # Shapes, confirmed on 2026-11-25 against Xero's published OpenAPI spec,
+    # https://github.com/XeroAPI/Xero-OpenAPI/blob/master/xero_accounting.yaml
+    # (v20.1.0, commit cad38324; developer.xero.com renders client-side and
+    # could not be fetched) — decisions §577:
+    # * PUT CreditNotes (createCreditNotes, Idempotency-Key header)
+    #   {"CreditNotes": [{Type "ACCPAYCREDIT", Contact {ContactID}, Date,
+    #   Status "AUTHORISED", LineAmountTypes "NoTax", CurrencyCode,
+    #   CreditNoteNumber, LineItems [{Description, Quantity, UnitAmount,
+    #   AccountID (uuid)}]}]}. The spec marks ``Reference`` "ACCRECCREDIT
+    #   only", so our marker rides ``CreditNoteNumber``; what Xero does with a
+    #   supplied number on an ACCPAYCREDIT is not stated, so the read-back
+    #   checks it and fails closed.
+    # * GET CreditNotes?where=… — the spec's ``where`` is "Filter by an any
+    #   element"; that ``CreditNoteNumber`` filters is not separately stated.
+    # * PUT CreditNotes/{CreditNoteID}/Allocations (createCreditNoteAllocation)
+    #   {"Allocations": [{Amount, Invoice {InvoiceID}, Date}]}.
+    # * DELETE CreditNotes/{CreditNoteID}/Allocations/{AllocationID}
+    #   (deleteCreditNoteAllocations; 200 with IsDeleted true), then POST
+    #   CreditNotes/{CreditNoteID} (updateCreditNote) {Status "VOIDED"}. That
+    #   Xero refuses to void a credit note still allocated is not in the spec
+    #   (unconfirmed); removing ours first is safe either way.
     # A read-back that is not one credit note with our number fails closed.
 
     supports_discount_credit = True

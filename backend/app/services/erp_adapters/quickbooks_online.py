@@ -1251,17 +1251,23 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
 
     # -- early-payment discount as a vendor credit (decisions §575) ---------
     #
-    # Shapes, from Intuit's API reference (read 2026-11-25):
-    # * VendorCredit — https://developer.intuit.com/app/developer/qbo/docs/api/
-    #   accounting/all-entities/vendorcredit : VendorRef, Line[] of
-    #   AccountBasedExpenseLineDetail{AccountRef}, Amount, DetailType,
-    #   TxnDate, PrivateNote, CurrencyRef; delete = POST
-    #   vendorcredit?operation=delete {Id, SyncToken}.
-    # * BillPayment — https://developer.intuit.com/app/developer/qbo/docs/api/
-    #   accounting/all-entities/billpayment : a credit is applied to a bill by
-    #   a BillPayment whose Line[] links the Bill and the VendorCredit
-    #   (LinkedTxn TxnType "VendorCredit"), TotalAmt 0; delete = POST
-    #   billpayment?operation=delete {Id, SyncToken}.
+    # Shapes (decisions §577 records what was checked, and how). Confirmed on
+    # 2026-11-25 against Intuit's own entity schema, ``Finance.xsd`` in
+    # https://github.com/intuit/QuickBooks-V3-Java-SDK (branch develop, commit
+    # 865ec279; developer.intuit.com renders client-side and could not be
+    # fetched): VendorCredit extends PurchaseByVendor (VendorRef) and
+    # Transaction (TxnDate, PrivateNote, CurrencyRef, Line[]); its lines take
+    # AccountBasedExpenseLineDetail{AccountRef}; BillPayment carries VendorRef,
+    # PayType, CheckPayment{BankAccountRef} / CreditCardPayment{CCAccountRef},
+    # TotalAmt and Line[] with LinkedTxn, whose TxnType enum includes "Bill"
+    # and "VendorCredit".
+    # NOT confirmed from a primary page (keep fail-closed): that a TotalAmt-0
+    # BillPayment whose Line[] links the Bill and the VendorCredit is how the
+    # API applies a credit; that ``requestid`` replays a ``vendorcredit``
+    # create (Intuit documents it for creates generally); and the delete
+    # route, POST <entity>?operation=delete {Id, SyncToken}, for vendorcredit.
+    # Our credit is never queried by PrivateNote: it is found through the
+    # bill's LinkedTxn BillPayments and their marker.
     # What the code reads back is checked, and anything else fails closed: a
     # created record with no Id is "unconfirmed", never "booked".
 
