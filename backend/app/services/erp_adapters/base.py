@@ -967,6 +967,13 @@ class ErpAdapter:
     #: names the bill a timed-out push may have left in the ERP (decisions
     #: §556). ``services/erp_bill_void`` reads it from the class.
     supports_bill_lookup: bool = False
+    #: True for an adapter whose :meth:`find_posted_bill` matches on the
+    #: bill's supplier and number alone, with no marker unique to one invoice
+    #: on the bill (Xero: an ACCPAY bill has no field for our correlation id).
+    #: ``services/erp_bill_void`` then refuses the lookup while another
+    #: invoice in the tenant shares that supplier and number, so it can never
+    #: name that invoice's bill (decisions §566).
+    bill_lookup_key_shared: bool = False
 
     def __init__(self, config: dict):
         self.config = config

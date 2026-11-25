@@ -14,13 +14,9 @@ Decisions §398.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
-import sys
-import types
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -36,40 +32,16 @@ from app.services.erp_adapters.base import (
     LineItemPayload,
 )
 from app.services.erp_adapters.netsuite import NetSuiteAdapter
+from tests.fake_erp_module import load_fake_erp
 
-_FAKE_ERP = Path(__file__).resolve().parents[2] / "tools" / "fake-erp"
 API_BASE = "http://fake-erp.test/netsuite/services/rest/record/v1"
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
-
-
-def _load_fake_erp():
-    """fake-erp's app module, loaded once. It imports its sibling modules by
-    bare name, so its directory goes on the path; ``defusedxml`` (used only by
-    its Intacct / SYSPRO routes, never reached here) is not a backend
-    dependency, so a stand-in is registered when it is absent."""
-    if "fake_erp_app" in sys.modules:
-        return sys.modules["fake_erp_app"]
-    if str(_FAKE_ERP) not in sys.path:
-        sys.path.insert(0, str(_FAKE_ERP))
-    try:
-        import defusedxml  # noqa: F401
-    except ImportError:
-        stub = types.ModuleType("defusedxml")
-        stub.DefusedXmlException = type("DefusedXmlException", (ValueError,), {})
-        stub.ElementTree = types.ModuleType("defusedxml.ElementTree")
-        sys.modules["defusedxml"] = stub
-        sys.modules["defusedxml.ElementTree"] = stub.ElementTree
-    spec = importlib.util.spec_from_file_location("fake_erp_app", _FAKE_ERP / "app.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.fixture
 def fake(monkeypatch):
     """fake-erp, reset, as the adapter's only transport."""
-    module = _load_fake_erp()
+    module = load_fake_erp()
     module.STATE = module._fresh_state()
     monkeypatch.setattr(settings, "erp_netsuite_api_base", API_BASE)
     transport = httpx.ASGITransport(app=module.app)
@@ -903,3 +875,100 @@ def test_a_tba_block_missing_a_secret_fails_the_revoke_without_a_request(monkeyp
     adapter = NetSuiteAdapter({**_adapter().config, "token_secret": ""})
     assert asyncio.run(adapter.revoke_stored_access()) == REVOKE_FAILED
     assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# The orphan-bill lookup (decisions §556, §566): the push's `eid:` match, alone
+# ---------------------------------------------------------------------------
+
+
+def _recording(monkeypatch, fake) -> list[str]:
+    """Every request method the adapter sends to the fake, in order."""
+    methods: list[str] = []
+    transport = httpx.ASGITransport(app=fake.app)
+
+    async def record(request):
+        methods.append(request.method)
+
+    def client(*args, **kwargs):
+        kwargs.setdefault("transport", transport)
+        kwargs["event_hooks"] = {"request": [record]}
+        return _REAL_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(netsuite.httpx, "AsyncClient", client)
+    return methods
+
+
+def test_the_lookup_is_offered_without_the_status_sync_opt_in():
+    # It reads the bill by externalId, as every push does, and no status-sync
+    # call: the §541 opt-in does not gate it.
+    assert NetSuiteAdapter.supports_bill_lookup is True
+    assert NetSuiteAdapter.bill_lookup_key_shared is False
+    assert _adapter().status_sync_on() is False
+
+
+def test_the_lookup_finds_the_bill_its_push_left_and_writes_nothing(fake, monkeypatch):
+    posted = _run(_adapter().post_invoice(_payload()))
+    assert posted.success, posted.message
+    methods = _recording(monkeypatch, fake)
+
+    found = _run(_adapter().find_posted_bill(_payload()))
+
+    assert found is not None
+    assert found.document_id == posted.erp_document_id
+    assert found.document_number == "INV-NS-398"
+    assert found.amount == Decimal("100.00")
+    assert found.currency == "USD"
+    assert found.status == ErpInvoiceStatus.open
+    # GETs and SuiteQL reads (SuiteQL is a POST that changes nothing) only.
+    assert methods and set(methods) <= {"GET", "POST"}
+    assert "DELETE" not in methods and "PATCH" not in methods
+    assert len(fake.STATE["netsuite_bills"]) == 1
+
+
+def test_the_lookup_says_none_when_netsuite_holds_no_such_bill(fake):
+    assert _run(_adapter().find_posted_bill(_payload())) is None
+
+
+def test_the_lookup_never_names_another_invoices_bill(fake):
+    """The externalId is the invoice's correlation id (unique per invoice), so
+    a bill another invoice pushed — even the same supplier, number and amount
+    — is never this one's."""
+    other = _run(_adapter().post_invoice(_payload()))
+    assert other.success, other.message
+
+    mine = _payload(correlation_id="0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+    assert _run(_adapter().find_posted_bill(mine)) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _resp(404, {"o:errorDetails": [{"o:errorCode": "INVALID_RCRD_TYPE", "detail": "x"}]}),
+        _resp(500, {}),
+        _resp(401, {}),
+        # A 200 that is not plainly our bill: another externalId, or no id.
+        _resp(200, {"id": "7", "externalId": "someone-else", "total": 100}),
+        _resp(200, {"externalId": "5f0d3c1e-8a7b-4c2d-9e10-6b5a4f3e2d1c", "total": 100}),
+        _resp(200, text="not json"),
+    ],
+)
+def test_a_lookup_that_cannot_answer_raises_never_none(answer):
+    with patch("httpx.AsyncClient") as cm:
+        client = cm.return_value.__aenter__.return_value
+        client.get = AsyncMock(return_value=answer)
+        client.request = AsyncMock(return_value=answer)
+        with pytest.raises(netsuite.NetSuiteStatusReadError):
+            _run(_adapter().find_posted_bill(_payload()))
+        assert "/vendorBill/eid:" in client.get.await_args.args[0]
+
+
+def test_a_lookup_with_a_config_netsuite_cannot_take_raises():
+    adapter = NetSuiteAdapter({"account_id": "1234567"})  # no credentials
+    with pytest.raises(netsuite.NetSuiteConfigError):
+        _run(adapter.find_posted_bill(_payload()))
+
+
+def test_a_lookup_without_a_correlation_id_raises():
+    with pytest.raises(ValueError):
+        _run(_adapter().find_posted_bill(_payload(correlation_id="")))
