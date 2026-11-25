@@ -127,7 +127,10 @@ class OAuthStatusResponse(BaseModel):
     #: Whether ``POST /status-sync`` would run a pass now (decisions §392):
     #: the settings page shows its "check payments now" button only then.
     #: The verdict is ``erp_status_sync.status_sync_now_refusal``, the rule the
-    #: POST itself applies; False when it cannot be read.
+    #: POST itself applies; False when it cannot be read. Stated with or
+    #: without an OAuth connection: an ERP reached with stored credentials
+    #: whose bills report back (NetSuite, opted in) runs the pass too
+    #: (decisions §547, §549).
     status_sync_available: bool = False
     #: Why not, as the POST's 409 code (``status_sync_off`` /
     #: ``status_sync_unsupported`` / ``status_sync_needs_reconnect``); None when
@@ -265,13 +268,21 @@ async def oauth_status(
                 client_source=creds.source if creds else None,
             )
         )
-    common = {"redirect_uri": erp_oauth.callback_url(), "providers": providers}
+    # The on-request pass's verdict is the tenant's, not the connection's: an
+    # ERP reached with stored credentials (NetSuite, opted in) has no OAuth
+    # block and still runs it (decisions §547, §549).
+    sync_refusal, sync_readable = await _status_sync_verdict(org)
+    common = {
+        "redirect_uri": erp_oauth.callback_url(),
+        "providers": providers,
+        "status_sync_available": sync_readable and sync_refusal is None,
+        "status_sync_refusal": sync_refusal,
+    }
     if not isinstance(oauth, dict):
         provider = erp.get("type") if isinstance(erp, dict) else None
         known = provider in erp_oauth.OAUTH_PROVIDERS
         return OAuthStatusResponse(provider=provider if known else None, connected=False, **common)
     needs_reconnect = bool(oauth.get("needs_reconnect"))
-    sync_refusal, sync_readable = await _status_sync_verdict(org)
     return OAuthStatusResponse(
         provider=oauth.get("provider"),
         connected=not needs_reconnect,
@@ -287,8 +298,6 @@ async def oauth_status(
         ),
         connected_at=oauth.get("connected_at"),
         call_usage=await _call_usage(resolved),
-        status_sync_available=sync_readable and sync_refusal is None,
-        status_sync_refusal=sync_refusal,
         scope_gaps=[] if needs_reconnect else erp_oauth.scope_gaps(oauth),
         **common,
     )

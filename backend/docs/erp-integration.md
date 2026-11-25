@@ -626,7 +626,8 @@ differs:
   `status_sync_off` / `status_sync_unsupported` / `status_sync_needs_reconnect`).
   The ERP settings panel's "Check payments now" button calls it, shown only
   while `GET …/oauth/status` says `status_sync_available` (the same rule, its
-  `status_sync_refusal` naming the 409 code otherwise).
+  `status_sync_refusal` naming the 409 code otherwise; stated for a
+  stored-credential ERP too, decisions §549).
 - **Matched by the bill id, in every state.** `Reference` is ACCREC-only in
   Xero, so a bill carries no marker of ours. Its `InvoiceID` is a GUID Xero
   never reuses, so the report sets `match_by_reference` and the sync matches it
@@ -782,9 +783,11 @@ live-claim refusals and §386's recorded-cash rule apply unchanged.
   and the audit rows' `provider` is the configured `settings.erp.type` when
   there is no connection block. Generic over the capability: another
   stored-credential adapter that turns `supports_status_sync` on needs no
-  change here. The ERP panel's "Check payments now" button is still drawn
-  only for an OAuth connection, so for NetSuite the endpoint is reached
-  through the API.
+  change here. `GET …/oauth/status` states the tenant's verdict
+  (`status_sync_available` / `status_sync_refusal`) with or without a
+  connection block, and the ERP panel draws "Check payments now" on the saved
+  stored-credential ERP while it says available; a refusal hides it, as it
+  does for an OAuth connection (decisions §549).
 - **Not verified live (#654).** The `vendorPayment` body and `eid:` /
   `DELETE` on it, the `NextTransactionLineLink` join and its `foreignamount`
   sign, `transaction.lastmodifieddate` / `TO_DATE`, and whether applying or
@@ -795,9 +798,11 @@ Tests: `backend/tests/test_netsuite_status_sync_adapter.py` (the adapter
 against fake-erp in process), `test_erp_status_sync.py` § NetSuite sweep
 (tenant selection, the mark, another account's mark, Merge leftovers) and the
 on-request pass (opted in runs, opted out / under Merge refused),
-`test_erp_oauth.py` § status sync on request (NetSuite 202 / 409 / admin-only).
+`test_erp_oauth.py` § status sync on request (NetSuite 202 / 409 / admin-only,
+and the status read's verdict with no connection block).
 End to end: `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts` (a person's
-payment, a partial payment, a deleted write-back, a re-run, the opt-in off).
+payment, a partial payment, a deleted write-back, a re-run, each pass started
+with the panel's button; the opt-in off, where the panel offers none).
 
 ### Business Central: no status sync-back
 

@@ -487,7 +487,9 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   resets, and while calls are refused, why and until when (`erp-call-usage-paused`). No usage in
   the status (another ERP, or the counts unreadable) renders nothing (decisions §324). A connected
   ERP the server says can run an on-request status-sync pass (`status_sync_available` on
-  `GET …/oauth/status`, the POST's own rule) gets **Check payments now** (`erp-check-payments`,
+  `GET …/oauth/status`, the POST's own rule) gets **Check payments now** (`erp-check-payments`;
+  also the saved stored-credential ERP that reports back, NetSuite opted in, by the same verdict
+  through `storedErpStatusSyncNowOffered`, and hidden on any refusal, decisions §549;
   `POST …/oauth/status-sync`): the 202 says the check started or one was already running, and a
   refusal is the coded sentence in the reader's language (the 429 with how long to wait, a 409's
   `status_sync_*` reason, after which the status is read again so the button follows the new

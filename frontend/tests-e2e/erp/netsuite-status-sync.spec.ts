@@ -30,7 +30,9 @@ import {
  * §536, §541, §547). NetSuite has no webhook and no OAuth connection: the
  * tenant reaches it with stored credentials and opts in per tenant
  * (`settings.erp.netsuite_status_sync`), and a pass is the sweep's own,
- * triggered here the way an admin triggers it, through `POST
+ * triggered here the way an admin triggers it: the ERP panel's "Check
+ * payments now" button, drawn for a stored-credential ERP from the status
+ * read's verdict (§549), which posts `POST
  * /api/organization/erp/oauth/status-sync` (not OAuth-only since §547). The
  * pass runs after the 202; its end is the `organization.erp_status_synced`
  * audit row it writes, which the spec waits on (never a timer).
@@ -46,12 +48,16 @@ import {
  *      they were, and the deleted write-back is neither flagged nor posted
  *      again. REST lists no deleted record, so §536 accepts this residual: a
  *      write-back is retried only until it first succeeds.
- *   4. Without the opt-in a push closes at `done` as before §536, and the
- *      on-request pass is refused `status_sync_unsupported`.
+ *   4. Without the opt-in a push closes at `done` as before §536, the panel
+ *      offers no check, and the on-request pass is refused
+ *      `status_sync_unsupported`.
  *
- * The on-request pass is rate limited to four an hour per tenant; this spec
- * runs two, so a re-run within the hour on the same tenant is answered 429
- * on the third, which the spec reports by name.
+ * The on-request pass is rate limited to four an hour per tenant. The e2e
+ * backend runs with the limiter off (`FEOH_RATE_LIMIT_ENABLED=false`, which
+ * CI's `erp-e2e` job sets and `frontend/tests-e2e/README.md` requires
+ * locally), so a retry or a re-run is never answered 429. A backend started
+ * with the limiter on fails this spec on its third pass within the hour, and
+ * the assertion says why.
  *
  * Needs the backend started with `FEOH_ERP_STATUS_SYNC_ENABLED=true` (CI's
  * `erp-e2e` job sets it); the spec skips, saying so, when status sync is off.
@@ -105,19 +111,44 @@ type PassOutcome = {
 	invoices_changed?: number;
 };
 
-/** Ask for an on-request pass and wait for the audit row it ends with. */
+/** Open the ERP section and wait for its status read, which carries the
+ *  payment-check verdict the panel draws the button from (§549). */
+async function openErpPanel(page: Page): Promise<{ status_sync_refusal: string | null }> {
+	const statusRead = page.waitForResponse(
+		(r) =>
+			r.url().endsWith('/api/organization/erp/oauth/status') && r.request().method() === 'GET'
+	);
+	await page.goto('/organization?section=erp');
+	const resp = await statusRead;
+	expect(resp.status()).toBe(200);
+	await expect(page.getByTestId('erp-provider-select')).toHaveValue('netsuite');
+	return (await resp.json()) as { status_sync_refusal: string | null };
+}
+
+/** Ask for an on-request pass the way an admin does, with the panel's
+ *  button, and wait for the audit row the pass ends with. */
 async function checkNow(page: Page): Promise<PassOutcome> {
 	const before = syncedPasses();
-	const resp = await page.request.post(`${API_BASE}/api/organization/erp/oauth/status-sync`, {
-		headers: await authedTenantHeaders(page)
-	});
+	await openErpPanel(page);
+	const button = page.getByTestId('erp-check-payments');
+	await expect(button).toBeEnabled();
+	const answered = page.waitForResponse(
+		(r) =>
+			r.url().endsWith('/api/organization/erp/oauth/status-sync') &&
+			r.request().method() === 'POST'
+	);
+	await button.click();
+	const resp = await answered;
 	expect(
 		resp.status(),
 		resp.status() === 429
-			? 'this tenant has run four on-request passes this hour; re-run the spec on a fresh tenant'
+			? 'the on-request limiter is on: start the e2e backend with FEOH_RATE_LIMIT_ENABLED=false'
 			: await resp.text()
 	).toBe(202);
 	expect(((await resp.json()) as { started: boolean }).started).toBe(true);
+	await expect(page.getByTestId('erp-status')).toContainText(
+		'Checking Oracle NetSuite for payments made there.'
+	);
 	await expect
 		.poll(syncedPasses, { message: 'the on-request pass never finished' })
 		.toBeGreaterThan(before);
@@ -342,6 +373,12 @@ test.describe('/erp netsuite without the status-sync opt-in', () => {
 			glAccount: '6100'
 		});
 		expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('done');
+
+		// The panel offers no check: the status read states the POST's refusal,
+		// and a refused verdict hides the button (§549). The opted-in tests
+		// above are the positive control: the same read draws it.
+		expect((await openErpPanel(page)).status_sync_refusal).toBe('status_sync_unsupported');
+		await expect(page.getByTestId('erp-check-payments')).toHaveCount(0);
 
 		const resp = await page.request.post(`${API_BASE}/api/organization/erp/oauth/status-sync`, {
 			headers: await authedTenantHeaders(page)
