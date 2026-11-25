@@ -2259,6 +2259,91 @@ async def test_an_on_request_pass_refused_at_start_is_still_audited(realdb, monk
     assert row.details["refusal"] == "status_sync_off"
 
 
+async def test_an_on_request_pass_runs_for_an_opted_in_netsuite_tenant(realdb, monkeypatch):
+    """NetSuite has no OAuth connection block (decisions §536); its on-request
+    pass is selected the way the sweep selects it, by the adapter its
+    configuration resolves to, and runs the sweep's own pass: the invoice
+    moves, the mark is kept beside the configuration, and the outcome is
+    audited under the configured ERP's name (decisions §547)."""
+    from app.config import settings
+    from app.models.workflow import AuditLog
+
+    realm = await _configure_netsuite(realdb, "a", f"NOW{uuid.uuid4().hex[:6].upper()}")
+    inv_id, corr = await _seed(realdb, status=InvoiceStatus.posted_in_erp, realm=realm)
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert await erp_status_sync.status_sync_now_refusal(org) is None
+    assert erp_status_sync.status_sync_provider(org) == "netsuite"
+
+    fake = _FakeNetSuite(
+        _report(
+            corr,
+            ErpBillState.paid,
+            external_payment_ids=("7002",),
+            paid_amount=Decimal("250.00"),
+            paid_currency="USD",
+        )
+    )
+    org_id = realdb.info("a").org_id
+    erp_status_sync._now_running.add(org_id)
+    with patch.object(erp_status_sync, "_adapter_or_none", return_value=fake):
+        await erp_status_sync._sync_org_now_task(org_id, None)
+
+    assert (await _invoice(realdb, inv_id)).status == InvoiceStatus.paid
+    assert (await _org(realdb)).settings[erp_status_sync.DIRECT_MARK_KEY]["realm"] == realm
+    async with realdb.sessionmaker("a")() as s:
+        [row] = (
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.action == "organization.erp_status_synced")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert row.details["outcome"] == "completed", row.details
+    assert row.details["provider"] == "netsuite"
+    assert row.details["invoices_changed"] == 1
+
+
+@pytest.mark.parametrize("opt_in", [None, "off", "yes"])
+async def test_an_on_request_pass_is_refused_for_netsuite_without_the_opt_in(
+    realdb, monkeypatch, opt_in
+):
+    """The per-tenant opt-in (decisions §541) holds on request as in the sweep:
+    without it the ERP does not report back, with the existing code."""
+    from app.config import settings
+
+    await _configure_netsuite(realdb, "a", f"OFF{uuid.uuid4().hex[:6].upper()}")
+    async with realdb.control_sessionmaker()() as s:
+        row = await s.get(Organization, realdb.info("a").org_id)
+        erp = dict(row.settings["erp"])
+        if opt_in is None:
+            erp.pop("netsuite_status_sync")
+        else:
+            erp["netsuite_status_sync"] = opt_in
+        row.settings = {**row.settings, "erp": erp}
+        await s.commit()
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert await erp_status_sync.status_sync_now_refusal(org) == "status_sync_unsupported"
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    assert await erp_status_sync.status_sync_now_refusal(org) == "status_sync_off"
+
+
+async def test_an_on_request_pass_is_refused_for_a_netsuite_type_under_merge(realdb, monkeypatch):
+    """The dispatcher's rule decides the adapter, as in the sweep: ``type:
+    netsuite`` left under a Merge.dev integration is a Merge tenant."""
+    from app.config import settings
+
+    await _configure_netsuite(
+        realdb, "a", f"MRG{uuid.uuid4().hex[:6].upper()}", integration_method="merge_dev"
+    )
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert await erp_status_sync.status_sync_now_refusal(org) == "status_sync_unsupported"
+
+
 # ---------------------------------------------------------------------------
 # record-erp-payment with no rail named (decisions §413), the cases beside the
 # stated-figure ones above: a payment-BLOCKING row, and a legacy row whose

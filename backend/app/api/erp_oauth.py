@@ -782,6 +782,10 @@ async def oauth_status_sync_now(
     ERP's API allowance; one at a time per tenant (``started: false``). 409
     with a code when no pass can run: status sync off, an ERP that does not
     report back, a connection that needs reconnecting.
+
+    Not OAuth-only despite the prefix: an ERP reached with stored credentials
+    whose bills report back for this tenant (NetSuite with its opt-in, §541)
+    runs the same pass (decisions §547).
     """
     from app.services import erp_status_sync
     from app.services.rate_limit import check_rate_limit
@@ -797,9 +801,11 @@ async def oauth_status_sync_now(
         window_seconds=_STATUS_SYNC_NOW_WINDOW_SECONDS,
         subject=str(org.id),
     )
-    provider = (((org.settings or {}).get("erp") or {}).get("oauth") or {}).get("provider")
     await _record_or_503(
-        org.id, user.id, "organization.erp_status_sync_requested", {"provider": provider}
+        org.id,
+        user.id,
+        "organization.erp_status_sync_requested",
+        {"provider": erp_status_sync.status_sync_provider(org)},
     )
     started = await erp_status_sync.dispatch_sync_org_now(org.id, actor_id=user.id)
     return StatusSyncNowResponse(started=started)

@@ -2219,22 +2219,47 @@ STATUS_SYNC_NEEDS_RECONNECT = "status_sync_needs_reconnect"
 async def status_sync_now_refusal(org: Organization) -> str | None:
     """Why this tenant cannot run a status-sync pass on request, or None.
 
-    The same conditions the sweep skips a tenant on: status sync off, an ERP
-    whose bills do not report back (or a tenant that has switched away from
-    the one it connected), a connection that needs reconnecting."""
-    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+    The same conditions the sweep skips a tenant on (:func:`run_status_sync_once`):
+    status sync off, an ERP whose bills do not report back for this tenant (or
+    a tenant that has switched away from the one it connected), a connection
+    that needs reconnecting. An OAuth ERP is judged by its connection block;
+    an ERP reached with stored credentials (NetSuite) has none, and is
+    selected, as the sweep selects it, by the adapter its configuration
+    resolves to, its per-tenant opt-in (§541) read through
+    :func:`reports_status_back` like every other reader (decisions §547)."""
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key, status_sync_adapter_keys
+    from app.services.erp_oauth import load_providers
 
     if not settings.erp_status_sync_enabled:
         return STATUS_SYNC_OFF
-    oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
-    if oauth_meta.get("provider") not in status_sync_adapter_keys():
+    keys = status_sync_adapter_keys()
+    erp_settings = (org.settings or {}).get("erp") or {}
+    if not isinstance(erp_settings, dict):
         return STATUS_SYNC_UNSUPPORTED
-    if oauth_meta.get("needs_reconnect"):
-        return STATUS_SYNC_NEEDS_RECONNECT
+    key = resolve_adapter_key(erp_settings)
+    if key not in keys:
+        return STATUS_SYNC_UNSUPPORTED
+    if key in load_providers():
+        oauth_meta = erp_settings.get("oauth") or {}
+        if oauth_meta.get("provider") not in keys:
+            return STATUS_SYNC_UNSUPPORTED
+        if oauth_meta.get("needs_reconnect"):
+            return STATUS_SYNC_NEEDS_RECONNECT
     adapter = _adapter_or_none(await _resolved_erp(org) or {})
     if not reports_status_back(adapter):
         return STATUS_SYNC_UNSUPPORTED
     return None
+
+
+def status_sync_provider(org: Organization) -> str | None:
+    """The ERP an on-request pass reads, for its audit rows: the OAuth
+    connection's provider, else the configured ``settings.erp.type`` (an ERP
+    reached with stored credentials, NetSuite, has no connection block)."""
+    erp_settings = (org.settings or {}).get("erp") or {}
+    if not isinstance(erp_settings, dict):
+        return None
+    oauth_meta = erp_settings.get("oauth") or {}
+    return oauth_meta.get("provider") or erp_settings.get("type") or None
 
 
 async def sync_org_now(org: Organization, *, now: datetime | None = None) -> StatusSyncResult:
@@ -2285,9 +2310,7 @@ async def _sync_org_now_task(org_id: uuid.UUID, actor_id: uuid.UUID | None) -> N
         if org is None:
             details["outcome"] = "refused"
         else:
-            details["provider"] = (((org.settings or {}).get("erp") or {}).get("oauth") or {}).get(
-                "provider"
-            )
+            details["provider"] = status_sync_provider(org)
             refused = await status_sync_now_refusal(org)
             if refused is not None:
                 # Changed between the request and the task: nothing to read with.
