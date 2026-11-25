@@ -82,10 +82,12 @@ link it made posts nowhere. Such a pull leaves alone every row tied to a NAMED
 realm — a link stamped with one, or a pending decision offered under one: it
 never re-judges, unlinks, matches by id, re-links by code or refreshes them,
 and a pulled account whose code such a row holds is refused ``code_taken``. It
-works only on unlinked rows and NULL-realm links, which is all a no-realm pull
-can have written. (A pre-0115 link is NULL-realm too and indistinguishable from
-a ``mock`` one, so a mock sync still treats it as its own; the next sync under
-a named realm re-judges it by evidence.)
+works only on unlinked rows and the links a no-realm pull made, which it stamps
+``erp_link_realm.UNNAMED_REALM`` (docs/decisions.md §497). A pre-0115
+(NULL-realm) link is left alone exactly like a named one: it may name a real
+company, and the next sync under a named realm re-judges it by evidence. Under
+a named realm an ``UNNAMED_REALM`` link is another company's: judged by the
+between-companies evidence (its current code), never kept for a return.
 
 Nothing here commits; the caller audits and commits.
 """
@@ -101,6 +103,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.gl_account import GL_CODE_MAX_LENGTH, GLAccount
 from app.services.erp_adapters.base import GLAccountPayload
+from app.services.erp_link_realm import link_stamp
 from app.services.erp_record_names import fit_name
 from app.services.gl_account_erp_links import keep_states, restore_states
 
@@ -240,6 +243,8 @@ async def sync_chart_from_erp(
     passes (rules 0, 3, 4) cover the whole organization. See the module
     docstring."""
     result = ChartSyncResult(realm=realm)
+    # What every link this pull makes is stamped with (never NULL, §497).
+    stamp = link_stamp(realm)
 
     # -- the pull, reduced to one candidate per code ------------------------
     by_code: dict[str, list[GLAccountPayload]] = defaultdict(list)
@@ -354,8 +359,9 @@ async def sync_chart_from_erp(
         (module docstring)?"""
         if realm is not None:
             return False
-        pending_realm = (row.erp_link_candidates or {}).get("realm")
-        return row.erp_link_realm is not None or pending_realm is not None
+        if row.erp_account_id is not None and row.erp_link_realm != stamp:
+            return True  # a named company's link, or a pre-0115 one
+        return (row.erp_link_candidates or {}).get("realm") is not None
 
     # -- each company's state: kept, and this company's restored (§376) ----
     # Before rule 0, so a restored link is never judged as another company's,
@@ -404,7 +410,7 @@ async def sync_chart_from_erp(
     # recorded in `link_changes` (the audit row lists them all).
     dead: dict[uuid.UUID, str] = {}
     for row in all_rows:
-        if row.erp_account_id is None or row.erp_link_realm == realm or foreign(row):
+        if row.erp_account_id is None or row.erp_link_realm == stamp or foreign(row):
             continue
         acct = by_id.get(row.erp_account_id)
         legacy_ok = row.erp_link_realm is None
@@ -423,7 +429,7 @@ async def sync_chart_from_erp(
                 )
                 # A confirmation chose an account of the OTHER company.
                 _clear_confirmation(row)
-            row.erp_link_realm = realm
+            row.erp_link_realm = stamp
             continue
         dead[row.id] = row.erp_account_id
         row.erp_account_id = None
@@ -512,7 +518,7 @@ async def sync_chart_from_erp(
                 result.link_changes.append({"code": code, "from": before, "to": erp_id})
                 _clear_confirmation(row)
                 row.erp_account_id = erp_id
-                row.erp_link_realm = realm
+                row.erp_link_realm = stamp
                 row.erp_link_candidates = None
                 relinked.add(row.id)
                 result.linked += 1
@@ -534,7 +540,7 @@ async def sync_chart_from_erp(
                 organization_id=organization_id,
                 entity_id=entity_id,
                 erp_account_id=erp_id,
-                erp_link_realm=realm,
+                erp_link_realm=stamp,
             )
         )
         result.created += 1

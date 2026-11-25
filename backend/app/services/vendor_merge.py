@@ -98,6 +98,7 @@ from app.models.vendor_priors import VendorExtractionPrior
 from app.models.vendor_statement_recon import VendorStatementReconciliation
 from app.models.vendor_user import VendorUser
 from app.models.virtual_card import VirtualCard
+from app.services.erp_link_realm import names_company
 
 __all__ = [
     "VENDOR_FK_CHILDREN",
@@ -311,7 +312,9 @@ def _plan_erp_links(
     * a NULL-realm link names no company, so it may be the same company as any
       named link: it conflicts with any link of a different id on the other
       side, in any realm (reported as realm ``None``);
-    * otherwise the link moves to the canonical.
+    * otherwise the link moves to the canonical — except that a no-realm
+      pull's ``UNNAMED_REALM`` link, which can only live on a row (§497), is
+      ``released`` when the canonical's row is taken.
 
     Any conflict refuses the whole merge — before a single row is written —
     with every conflicting realm in ``params.realms`` (sorted, ``None`` last).
@@ -366,6 +369,10 @@ def _plan_erp_links(
                 plan.row = (realm, erp_id, dup)
                 row_free = False
                 plan.records.append({**record, "placed": "row"})
+            elif not names_company(realm):
+                # A no-realm pull's link names no company to keep it for
+                # (§497): with the canonical's row taken, it is dropped.
+                plan.records.append({**record, "placed": "released"})
             else:
                 plan.kept.append((realm, erp_id))
                 plan.records.append({**record, "placed": "kept"})
