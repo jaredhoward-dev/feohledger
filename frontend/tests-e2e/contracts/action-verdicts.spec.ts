@@ -4,7 +4,7 @@ import type { Page, Route } from '@playwright/test';
 /**
  * `/contracts` — the detail modal's lifecycle buttons and the bulk "Change
  * status" read each row's server verdict (`actions`, backend
- * `services/contract_controls`, decisions §508), never a restated status
+ * `services/contract_controls`, decisions §507), never a restated status
  * rule. The modal's old copy hid Activate / Terminate on an expired contract
  * and Create PO on a draft, all of which the server accepts; the bulk bar
  * offered all three actions whatever was selected.

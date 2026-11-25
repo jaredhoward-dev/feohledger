@@ -912,7 +912,7 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       guide step. **Trigger:** the first customer asking to change
       one, or SCIM onboarding for an enterprise tenant.
 - [ ] **(c) Supplier help beyond the first five guides.** The supplier portal
-      has its own help at `/portal/help` (decisions §509): getting started,
+      has its own help at `/portal/help` (decisions §508): getting started,
       submit and resubmit, track to payment, bank details, card payments.
       Not yet covered: purchase-order flip, early-payment offers, W-9 / W-8
       upload, supplier chat on an invoice, and a search box. **Durable fix:**

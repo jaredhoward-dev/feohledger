@@ -52,7 +52,7 @@ test.describe('/portal lists reflow at 390px', () => {
 	});
 
 	// The supplier help pages carry no table, but long prose, a numbered-step
-	// list and the nav's eighth link (decisions §509).
+	// list and the nav's eighth link (decisions §508).
 	for (const path of ['/portal/payments', '/portal/discount-offers', '/portal/help', '/portal/help/portal-bank-details']) {
 		test(`${path} does not scroll the page sideways`, async ({ page }) => {
 			await portalSignIn(page);

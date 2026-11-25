@@ -420,7 +420,7 @@ describe('codedRefusalText', () => {
 		expect(codedRefusalText('intake_status_refused', {}, enT)).toBeNull();
 	});
 
-	it("names a contract's status in its lifecycle and delete refusals (decisions §508)", () => {
+	it("names a contract's status in its lifecycle and delete refusals (decisions §507)", () => {
 		expect(codedRefusalText('contract_status_refused', { status: 'expired', action: 'cancel' }, enT)).toContain(
 			EN_ALL['contracts.status.expired']
 		);

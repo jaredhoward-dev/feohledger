@@ -5,5 +5,5 @@ import { ensureSlices } from '#lib/i18n/store.svelte.ts';
 // parent /portal layout already loads the portal slice. Deliberately NOT the
 // settings slice the employee /help loads: supplier guides name only portal,
 // auth and shell controls, and their pages never import the employee guide
-// index (decisions §509).
+// index (decisions §508).
 export const load = () => ensureSlices('help');

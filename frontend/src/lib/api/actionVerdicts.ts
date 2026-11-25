@@ -73,7 +73,7 @@ export interface BulkVerdictTally {
  * verdict (`verdictOf`) — the bulk counterpart of {@link isAllowed}, so a bulk
  * bar offers an action only when some selected row would take it
  * (`offersBulk`) and can say up front how many the server will skip
- * (decisions §508). Never restates the rule: a row is allowed exactly when its
+ * (decisions §507). Never restates the rule: a row is allowed exactly when its
  * own verdict is `null`.
  */
 export function tallyBulkVerdicts<R extends { id: string }>(

@@ -3,7 +3,7 @@
 	 * A guide's sections — heading, then its blocks (paragraphs, steps, lists,
 	 * notes, diagrams) — shared by the help centre's guide page and the supplier
 	 * portal's (`routes/portal/help/[id]`), so both read the same `Guide` shape
-	 * the same way (docs/decisions.md §509).
+	 * the same way (docs/decisions.md §508).
 	 *
 	 * The invoice-lifecycle walkthrough is a `lifecycle` snippet the employee
 	 * page passes in, not an import here: it reaches the whole employee guide

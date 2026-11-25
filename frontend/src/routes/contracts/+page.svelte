@@ -100,7 +100,7 @@
 	let bulkAction = $state<ContractBulkAction>('activate');
 
 	// Which bulk actions the bar offers comes from the selected rows' own
-	// server verdicts (`contract.actions`, decisions §508), never a restated
+	// server verdicts (`contract.actions`, decisions §507), never a restated
 	// status rule: an action shows only when some selected row would take it
 	// (or some selected id is beyond the loaded pages, where the server
 	// decides), and the bar says up front how many the server will skip.

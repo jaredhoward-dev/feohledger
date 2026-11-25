@@ -105,7 +105,7 @@ answers with the verdict's coded `detail` itself, its English kept as
 the intake and requisition lifecycle routes (their status 422s were plain
 strings before the gates moved to `services/procurement_controls.py`), and the
 contract lifecycle routes (their 409s, since `services/contract_controls.py`,
-decisions §508).
+decisions §507).
 
 | Read | Field | Endpoint(s) judged | Gate |
 |---|---|---|---|
@@ -130,7 +130,7 @@ decisions §508).
 | `GET /api/corporate-card-transactions` | `actions.{match,create_expense,unmatch,ignore}` | `POST /{id}/match`, `/create-expense`, `/unmatch`, `/ignore` | `services/expense_controls.card_txn_{link,unmatch,ignore}_refusal` (NOT match's expense-side refusals, which depend on the expense chosen) |
 | `GET /api/intake` (and every other `/api/intake` response, mutations included) | `actions.{submit,approve,reject,convert,cancel,reopen}` | `POST /intake/{id}/submit`, `/approve`, `/reject`, `/convert-to-requisition`, `/cancel`, `/reopen` | `services/procurement_controls.intake_transition_refusal` / `.intake_convert_refusal` — 422 `intake_status_refused` (`params.status`, `params.target`) for an edge `intake_service.VALID_TRANSITIONS` lacks; convert accepts `approved` and replays a `converted` intake |
 | `GET /api/requisitions` (and every other `/api/requisitions` response, mutations included) | `actions.{submit,approve,reject,convert,cancel,reopen}` | `POST /requisitions/{id}/submit`, `/approve`, `/reject`, `/convert-to-po`, `/cancel`, `/reopen` | `services/procurement_controls.requisition_transition_refusal` (422 `requisition_status_refused`), `.requisition_approve_refusal` (then 403 `requisition_approval_segregation` for the requester or a material editor — its own code, since the invoice `approval_segregation` sentence names an invoice), `.requisition_convert_refusal` (a requisition holding its PO replays it) |
-| `GET /api/contracts` (and every other `/api/contracts` response returning a contract, mutations included) | `actions.{activate,terminate,cancel,renew,create_po,delete}` | `POST /contracts/{id}/activate`, `/terminate`, `/cancel`, `/renew`, `/create-po`, `DELETE /contracts/{id}` (and `POST /contracts/bulk/status`, which skips a row with the same sentence) | `services/contract_controls.contract_{transition,renew,create_po,delete}_refusal` — 409 `contract_status_refused` (`params.status`, `params.action`) or `contract_delete_refused` (`params.status`); every route answers with that coded `detail` itself (decisions §508). The renew body's end-date check is a 400 on the request, not part of the verdict. Parity: `tests/test_contract_action_verdicts.py` |
+| `GET /api/contracts` (and every other `/api/contracts` response returning a contract, mutations included) | `actions.{activate,terminate,cancel,renew,create_po,delete}` | `POST /contracts/{id}/activate`, `/terminate`, `/cancel`, `/renew`, `/create-po`, `DELETE /contracts/{id}` (and `POST /contracts/bulk/status`, which skips a row with the same sentence) | `services/contract_controls.contract_{transition,renew,create_po,delete}_refusal` — 409 `contract_status_refused` (`params.status`, `params.action`) or `contract_delete_refused` (`params.status`); every route answers with that coded `detail` itself (decisions §507). The renew body's end-date check is a 400 on the request, not part of the verdict. Parity: `tests/test_contract_action_verdicts.py` |
 
 Two behaviour changes rode in with the shared gates (`docs/decisions.md` §305):
 `POST /api/invoices/{id}/approve|reject` refuse an invoice that is not

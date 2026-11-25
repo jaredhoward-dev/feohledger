@@ -277,7 +277,7 @@ describe('help content — diagrams', () => {
 });
 
 describe('supplier portal help — the same checks, inside the portal', () => {
-	// The supplier guides (routes/portal/help/, decisions §509) are read by
+	// The supplier guides (routes/portal/help/, decisions §508) are read by
 	// vendor users who cannot open /help, so on top of the help centre's checks
 	// every link they carry must stay inside the portal.
 	const sources: { where: string; text: string }[] = [];

@@ -43,7 +43,7 @@ contract response's `actions.{activate,terminate,cancel,renew,create_po,delete}`
 verdict is read from (`null` = the endpoint would accept the caller, else that
 coded refusal; a caller outside admin / ap_manager gets `role_not_permitted`).
 The web modal's lifecycle buttons and the list's bulk "Change status" read those
-verdicts rather than restating the table above (decisions §508). `POST
+verdicts rather than restating the table above (decisions §507). `POST
 /bulk/status` routes each row through the same gate and reports a skip with its
 English sentence.
 
@@ -294,7 +294,7 @@ contract as `api/vendors.py::bulk_vendor_status` /
 action — it needs a per-contract `end_date`, which has no sane bulk default.
 
 Both bulk endpoints honour the caller's entity selector (`X-Entity-ID`) as the
-list, `GET /ids` and every single-row route do (decisions §508). `bulk/status`
+list, `GET /ids` and every single-row route do (decisions §507). `bulk/status`
 runs the single-row endpoints' entity check per row, so a contract in another
 entity is skipped as "Contract not found". `bulk/export` selects through the
 same scope, so such an id is dropped exactly as a nonexistent one is: left out

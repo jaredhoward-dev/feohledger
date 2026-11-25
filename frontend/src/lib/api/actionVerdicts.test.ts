@@ -117,7 +117,7 @@ describe('refusalText', () => {
 	});
 });
 
-describe('tallyBulkVerdicts (decisions §508)', () => {
+describe('tallyBulkVerdicts (decisions §507)', () => {
 	const refusal = { code: 'contract_status_refused', message: 'no', params: {} };
 	const rows = [
 		{ id: 'a', v: null },

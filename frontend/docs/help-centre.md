@@ -95,7 +95,7 @@ this), `lifecycle` (the walkthrough), `diagram` (`{ id, caption }`).
 Suppliers cannot open `/help` (a vendor user has no employee session), so the
 portal has its own at **`/portal/help`** — a **Help** link in the portal nav,
 the supplier guides and a short glossary on one page, and
-`/portal/help/<id>` per guide. Reasoning: `docs/decisions.md` §509.
+`/portal/help/<id>` per guide. Reasoning: `docs/decisions.md` §508.
 
 - **Same shape, `audience: 'supplier'`.** A supplier guide is a `Guide` in
   `lib/help/portal.ts` (`PORTAL_GUIDES`), with the same prose grammar and the

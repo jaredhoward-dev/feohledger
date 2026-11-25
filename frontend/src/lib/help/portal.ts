@@ -1,4 +1,4 @@
-// Help for supplier-portal users, published at /portal/help (decisions §509).
+// Help for supplier-portal users, published at /portal/help (decisions §508).
 //
 // Suppliers are a separate audience from the employee help centre's: they
 // submit invoices, watch them get paid, change their bank details and take card

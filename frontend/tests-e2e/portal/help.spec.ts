@@ -3,7 +3,7 @@ import type { Page } from '@playwright/test';
 import { acceptConsent, expect, test } from '../fixtures/helpers';
 
 /**
- * Supplier-portal help (`/portal/help`, decisions §509).
+ * Supplier-portal help (`/portal/help`, decisions §508).
  *
  * A supplier cannot open the employee help centre at `/help`, so the portal
  * carries its own: supplier guides in the help centre's `Guide` shape,

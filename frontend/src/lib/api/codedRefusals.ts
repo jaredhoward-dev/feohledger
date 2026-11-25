@@ -549,7 +549,7 @@ const BUILDERS: Record<string, Builder> = {
 	// `services/contract_controls.py` — a contract lifecycle action (activate /
 	// terminate / cancel / renew / create PO) its status does not allow, and a
 	// delete of a contract that is neither draft nor cancelled; the /contracts
-	// rows' `actions` verdicts are read from the same gates (decisions §508)
+	// rows' `actions` verdicts are read from the same gates (decisions §507)
 	contract_status_refused: (p, t) => {
 		const status = str(p, 'status');
 		return status === null

@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * Help for supplier-portal users (decisions §509): the supplier guides,
+	 * Help for supplier-portal users (decisions §508): the supplier guides,
 	 * then a short glossary whose entries are the anchors a guide's
 	 * `[[term]]` links land on (`termHref(id, 'supplier')` → `/portal/help#<id>`).
 	 *

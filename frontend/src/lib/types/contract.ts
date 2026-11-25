@@ -167,7 +167,7 @@ export interface Contract {
 
 /** `ContractActions` (backend `api/contracts.contract_action_refusals`, from
  *  the gates in `services/contract_controls`): `null` = the endpoint would
- *  accept the caller, else its coded refusal (decisions §508). */
+ *  accept the caller, else its coded refusal (decisions §507). */
 export interface ContractActions {
 	activate: ActionRefusal;
 	terminate: ActionRefusal;

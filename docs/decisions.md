@@ -25891,7 +25891,7 @@ full read, and a Load more already in flight when the decision lands is
 retired (the reviewer clicks it again), the same trade `applyVendorUpdate`
 already makes for a pre-edit read.
 
-## 508. Contract lifecycle buttons follow the endpoints' verdicts, including where the old page rule was narrower (round 40)
+## 507. Contract lifecycle buttons follow the endpoints' verdicts, including where the old page rule was narrower (round 40)
 
 `ContractModal` offered Activate / Terminate / Cancel / Renew / Create PO from
 its own copy of the status rules, and the copy had drifted from the endpoints:
@@ -25956,7 +25956,7 @@ coded `detail`; the bulk-status entity skip); `backend/tests/test_contract_bulk_
 (the export's entity scope and the 422);
 `frontend/tests-e2e/contracts/action-verdicts.spec.ts`.
 
-## 509. Supplier help is a portal page over the help centre's `Guide` shape, kept out of the employee index (round 40)
+## 508. Supplier help is a portal page over the help centre's `Guide` shape, kept out of the employee index (round 40)
 
 **Problem.** The help centre (§244) is `/help`, behind the employee session.
 Suppliers — a separate audience who submit invoices, get paid, change bank

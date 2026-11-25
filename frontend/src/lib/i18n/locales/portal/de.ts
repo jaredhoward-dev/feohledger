@@ -23,7 +23,7 @@ export const messages = {
 	'portal.nav.notifications': 'Benachrichtigungen',
 	'portal.nav.help': 'Hilfe',
 
-	// Supplier portal — help (routes/portal/help/, decisions §509)
+	// Supplier portal — help (routes/portal/help/, decisions §508)
 	'portal.help.subtitle': 'Anleitungen und Antworten für Lieferanten, die dieses Portal nutzen.',
 	'portal.help.guides': 'Anleitungen',
 	'portal.help.glossary': 'Begriffe',

@@ -114,7 +114,7 @@ CONTRACT_MANAGE_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER)
 def contract_action_refusals(contract: Contract, user: User) -> ContractActions:
     """What activate, terminate, cancel, renew, create-PO and delete would
     answer ``user`` for this contract — each a coded refusal or ``None``
-    (decisions §508). Each is the endpoint's role predicate
+    (decisions §507). Each is the endpoint's role predicate
     (``holds_any_role`` over :data:`CONTRACT_MANAGE_ROLES`, which every one of
     them requires) followed by the gate it raises from
     (``services/contract_controls``), so /contracts and ``ContractModal`` read

@@ -24,7 +24,7 @@ export const enPortal = {
 	'portal.nav.notifications': 'Notifications',
 	'portal.nav.help': 'Help',
 
-	// Supplier portal — help (routes/portal/help/, decisions §509)
+	// Supplier portal — help (routes/portal/help/, decisions §508)
 	'portal.help.subtitle': 'Guides and answers for suppliers using this portal.',
 	'portal.help.guides': 'Guides',
 	'portal.help.glossary': 'Terms',

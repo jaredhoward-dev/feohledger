@@ -1,7 +1,7 @@
 """The gates for the contract lifecycle actions — activate / terminate / cancel /
 renew, create a PO from a contract, and delete. Each is the ONE definition its
 endpoint raises from and the row's ``actions`` verdict is read from (issue #575
-§ One rule, one place; ``docs/decisions.md`` §508), so the /contracts list and
+§ One rule, one place; ``docs/decisions.md`` §507), so the /contracts list and
 ``ContractModal`` stop restating the status lists. The page's old copy had
 already drifted: it hid Activate on an ``expired`` contract and Terminate on an
 ``expired`` one, both of which the endpoints accept, and hid Create PO on a

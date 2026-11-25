@@ -122,7 +122,7 @@ class ContractActions(BaseModel):
     """The caller's verdict on a contract's lifecycle actions, each the coded
     refusal the endpoint would answer with or ``None`` — computed by the
     endpoints' own gates (``services/contract_controls``, through
-    ``api/contracts.contract_action_refusals``; decisions §508). Required, not
+    ``api/contracts.contract_action_refusals``; decisions §507). Required, not
     defaulted: every contract response carries it, mutations included."""
 
     activate: CodedRefusal | None

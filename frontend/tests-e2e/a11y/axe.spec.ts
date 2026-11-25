@@ -454,7 +454,7 @@ test.describe('accessibility — supplier portal Privacy step (WCAG 2.2 AA)', ()
 test.describe('accessibility — supplier portal help (WCAG 2.2 AA)', () => {
 	test.use({ storageState: { cookies: [], origins: [] } });
 
-	// The supplier help (decisions §509): the landing (guides + the glossary a
+	// The supplier help (decisions §508): the landing (guides + the glossary a
 	// guide's term links land on) and a guide with every block type a supplier
 	// guide uses — steps, a list, tip and caution notes, the terms and
 	// related-guide blocks.

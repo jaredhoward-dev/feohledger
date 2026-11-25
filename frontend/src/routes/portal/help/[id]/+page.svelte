@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * One supplier guide (decisions §509): the same `Guide` shape and section
+	 * One supplier guide (decisions §508): the same `Guide` shape and section
 	 * renderer as the help centre's guide page (`GuideSections`), with its
 	 * links kept inside the portal (`audience="supplier"`). No role badges —
 	 * every portal user is a supplier — and the "Open …" button is always

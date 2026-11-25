@@ -216,7 +216,7 @@ async def _stamp_default_entity(mk, contract_id: str) -> None:
 async def test_bulk_export_drops_contracts_outside_the_entity_selector(realdb):
     """An id in another entity is dropped exactly as a nonexistent one: it is
     left out of a mixed export, and a selection of only such ids is the same
-    404 an all-missing one gets (decisions §508)."""
+    404 an all-missing one gets (decisions §507)."""
     mk = realdb.sessionmaker(TENANT)
     org_id = realdb.info(TENANT).org_id
     vendor_id = await _add_vendor(mk, org_id, name="Scoped Export Vendor")

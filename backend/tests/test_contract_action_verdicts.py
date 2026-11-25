@@ -1,5 +1,5 @@
 """Contract rows carry the caller's verdict on each lifecycle action, and it
-says exactly what the endpoint answers (decisions §508).
+says exactly what the endpoint answers (decisions §507).
 
 `actions.{activate,terminate,cancel,renew,create_po,delete}`. The web modal
 restated the status rules — and had drifted: it hid Activate and Terminate on
@@ -181,7 +181,7 @@ async def test_the_contract_verdicts_match_every_lifecycle_endpoint(realdb, role
 @pytest.mark.asyncio
 async def test_renewing_a_draft_stamps_activated_at(realdb):
     """Renew puts a draft in force without passing through activate, so it
-    stamps `activated_at` as activate does (decisions §508)."""
+    stamps `activated_at` as activate does (decisions §507)."""
     contract_id = await _contract(realdb, status="draft")
     async with realdb.client(key=TENANT, role="ap_manager") as c:
         resp = await c.post(f"/api/contracts/{contract_id}/renew", json={"end_date": "2099-12-31"})

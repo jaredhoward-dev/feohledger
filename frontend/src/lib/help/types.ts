@@ -29,7 +29,7 @@ export type GuideKind = 'start' | 'howto' | 'concept';
  * `supplier` guides live in the supplier portal at `/portal/help`, where a
  * vendor user has no employee session — so their glossary and guide links
  * stay inside the portal (`terms.ts`) and they never join `GUIDES`
- * (docs/decisions.md §509).
+ * (docs/decisions.md §508).
  */
 export type HelpAudience = 'employee' | 'supplier';
 

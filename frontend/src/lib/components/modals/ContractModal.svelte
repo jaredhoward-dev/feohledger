@@ -97,7 +97,7 @@
 	// Which lifecycle buttons show is NOT decided here: every contract response
 	// carries the server's verdict on each action (`contract.actions`, built from
 	// the gates the endpoints raise from — backend `services/contract_controls`,
-	// decisions §508), read through `actionVerdicts.ts`. The modal used to
+	// decisions §507), read through `actionVerdicts.ts`. The modal used to
 	// restate the status rules, and its copy had drifted (no Activate or
 	// Terminate on an expired contract, no Create PO on a draft — all accepted
 	// by the server). Every refusal here is a status or role one, which hides
