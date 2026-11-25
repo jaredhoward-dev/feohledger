@@ -243,7 +243,9 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/admin/api-keys', fixedTable: '.keys-table table' },
 	{ href: '/admin/access-review', fixedTable: '.review-table table' },
 	{ href: '/admin/webhooks', fixedTable: '.subs-table table' },
-	{ href: '/audit', fixedTable: '.audit-trail table' }
+	{ href: '/audit', fixedTable: '.audit-trail table' },
+	{ href: '/discounts', fixedTable: '.offers-table table' },
+	{ href: '/tax', fixedTable: '.tax-table table' }
 ];
 
 /**
@@ -289,7 +291,9 @@ const LOCALE_SIZED = new Set([
 	'/admin/api-keys',
 	'/admin/access-review',
 	'/admin/webhooks',
-	'/audit'
+	'/audit',
+	'/discounts',
+	'/tax'
 ]);
 
 /**
@@ -329,14 +333,10 @@ const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
  * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers thirty-one pages"): moving
+ * (docs/followups.md § "The layout-shift budget covers thirty-three pages"): moving
  * one into `LIST_PAGES` is the whole change once its reason is fixed.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
-	'/discounts':
-		'Unmeasured: the warning banners and the optimizer panel above the offers table mount once the dashboard lands — see docs/followups.md',
-	'/tax':
-		'Unmeasured: a loading placeholder stands where the box-allocation panel and the table mount once the report lands — see docs/followups.md',
 	'/admin/partner':
 		'Unmeasured: the e2e tenant is not a partner, so the page settles on its "not a partner" state and the children table never renders — see docs/followups.md',
 	'/assistant': 'A conversation, not a list',
@@ -755,6 +755,111 @@ const CUSTOM_ROLE = {
 	permissions: ['vendor.bank_change.approve', 'vendor.block']
 };
 
+/** One discount offer per status: the status column holds the widest badge in
+ *  each locale (de "ANGENOMMEN", …), and the open offer carries Accept and
+ *  Decline, the widest action cell. The lean e2e seed holds no offer, so the
+ *  list is answered with these rows rather than patched. */
+const DISCOUNT_STATUSES = ['offered', 'accepted', 'captured', 'declined', 'expired'] as const;
+const DISCOUNT_PER_STATUS = DISCOUNT_STATUSES.map((status, i) => ({
+	id: `00000000-0000-4000-8000-00000000039${i}`,
+	scope: 'invoice',
+	invoice_id: `00000000-0000-4000-8000-00000000040${i}`,
+	vendor_id: '00000000-0000-4000-8000-000000000410',
+	source: 'supplier',
+	status,
+	tiers: [
+		{ days: 10, percent: 2 },
+		{ days: 20, percent: 1 }
+	],
+	base_amount: '12500.00',
+	currency: 'USD',
+	valid_from: '2026-11-01',
+	valid_until: '2099-12-31',
+	accepted_tier: status === 'accepted' || status === 'captured' ? { days: 10, percent: 2 } : null,
+	accepted_at: null,
+	captured_amount: status === 'captured' ? '250.00' : null,
+	captured_at: null,
+	financing_provider: null,
+	notes: null,
+	created_at: '2026-11-01T09:00:00Z',
+	updated_at: '2026-11-01T09:00:00Z',
+	vendor_name: 'Layout Fixture Supplies',
+	invoice_number: `INV-LAYOUT-D${i}`,
+	actions:
+		status === 'offered'
+			? { accept: null, decline: null }
+			: {
+					accept: { code: 'offer_not_open', message: 'Not open.' },
+					decline: { code: 'offer_not_open', message: 'Not open.' }
+				},
+	capturable_tier_days: status === 'offered' ? [10, 20] : []
+}));
+
+/** One 1099 vendor per badge in each of /tax's three badge columns: eligible
+ *  with a W-9 and a verified TIN, then ineligible with no W-9 and a TIN on
+ *  file but unverified (de "NICHT VERIFIZIERT"), then no TIN at all. The lean
+ *  e2e seed pays no 1099 vendor, so the report is answered with these rows. */
+const TAX_ROW = {
+	tax_classification: 'individual',
+	w9_received_date: null,
+	ytd_paid: '1500.00',
+	over_threshold: true,
+	payment_count: 3,
+	card_paid: '0.00',
+	card_payment_count: 0,
+	box_allocations: [],
+	unmapped_paid: '0.00',
+	unmapped_payment_count: 0,
+	box_unallocated: '0.00',
+	required_forms: ['1099-NEC']
+};
+const TAX_REPORT = {
+	year: 2026,
+	threshold_usd: '600',
+	currency: 'USD',
+	vendor_count_total: 3,
+	vendor_count_eligible_over_threshold: 1,
+	vendor_count_over_threshold_without_w9: 0,
+	total_reportable: '1500.00',
+	total_reportable_usd: '1500.00',
+	total_card_excluded: '0.00',
+	box_allocations: [],
+	total_unmapped: '0.00',
+	box_unallocated: '0.00',
+	box_allocation_reconciled: true,
+	generated_at: '2026-11-01T09:00:00Z',
+	rows: [
+		{
+			...TAX_ROW,
+			vendor_id: '00000000-0000-4000-8000-000000000421',
+			vendor_name: 'Layout Fixture Eligible',
+			tax_id: '12-3456789',
+			is_1099_eligible: true,
+			w9_received_date: '2026-01-15',
+			w9_on_file: true,
+			tin_verified: true
+		},
+		{
+			...TAX_ROW,
+			vendor_id: '00000000-0000-4000-8000-000000000422',
+			vendor_name: 'Layout Fixture Unverified',
+			tax_id: '98-7654321',
+			is_1099_eligible: false,
+			w9_on_file: false,
+			tin_verified: false
+		},
+		{
+			...TAX_ROW,
+			vendor_id: '00000000-0000-4000-8000-000000000423',
+			vendor_name: 'Layout Fixture No TIN',
+			tax_id: null,
+			is_1099_eligible: true,
+			w9_on_file: false,
+			tin_verified: false
+		}
+	]
+};
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
 		const tables = [
@@ -836,6 +941,31 @@ test.describe('fixed list tables fit their longest locale', () => {
 						}
 					);
 				}
+				if (href === '/discounts') {
+					await page.route(
+						(url) => url.pathname === '/api/discounts/offers',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({
+										json: {
+											items: DISCOUNT_PER_STATUS,
+											total: DISCOUNT_PER_STATUS.length,
+											page: 1,
+											page_size: 20
+										}
+									})
+								: route.fallback()
+					);
+				}
+				if (href === '/tax') {
+					await page.route(
+						(url) => url.pathname === '/api/tax/1099-report',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: TAX_REPORT })
+								: route.fallback()
+					);
+				}
 				const widest = WIDEST_ROW[href];
 				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
@@ -866,6 +996,14 @@ test.describe('fixed list tables fit their longest locale', () => {
 				}
 				if (label === '/admin?tab=roles custom roles') {
 					await expect(table.locator('td.actions button')).toHaveCount(2);
+				}
+				if (href === '/discounts') {
+					for (const status of DISCOUNT_STATUSES) {
+						await expect(table.locator(`.badge.${status}`)).toBeVisible();
+					}
+				}
+				if (href === '/tax') {
+					await expect(table.locator('.badge.chip-warn')).toHaveCount(4);
 				}
 				if (label === '/payments cards') {
 					for (const status of CARD_STATUSES) {

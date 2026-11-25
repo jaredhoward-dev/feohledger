@@ -84,12 +84,12 @@
 
 	const OFFER_COLUMNS = $derived([
 		{ label: m('discounts.col.vendorInvoice') },
-		{ label: m('discounts.col.scope') },
-		{ label: m('discounts.col.tiers') },
-		{ label: m('discounts.col.base'), class: 'right' },
-		{ label: m('discounts.col.bestDiscount'), class: 'right' },
-		{ label: m('discounts.col.status') },
-		{ label: m('discounts.col.validUntil') },
+		{ label: m('discounts.col.scope'), class: 'col-scope' },
+		{ label: m('discounts.col.tiers'), class: 'col-tiers' },
+		{ label: m('discounts.col.base'), class: 'right col-base' },
+		{ label: m('discounts.col.bestDiscount'), class: 'right col-best' },
+		{ label: m('discounts.col.status'), class: 'col-status' },
+		{ label: m('discounts.col.validUntil'), class: 'col-valid' },
 		{ class: 'actions-col' }
 	]);
 
@@ -490,13 +490,16 @@
 			     `KpiCard` owns the glyph, so this card and the four beside it
 			     cannot drift apart. The reason line is still withheld during the
 			     load window — "no offer has been captured or missed yet" is a
-			     claim we cannot make before the response lands. -->
+			     claim we cannot make before the response lands — but its SPACE is
+			     held from first paint (`reserveSub`), so the line landing does not
+			     grow the row and drop the offers table under the reader. -->
 			<KpiCard
 				value={dashboard && !dashboard.insufficient_data
 					? formatPct(dashboard.capture_rate_pct ?? 0, 0)
 					: null}
 				label={m('discounts.kpi.captureRate')}
 				sub={dashboard?.insufficient_data ? m('discounts.kpi.captureRateUnknown') : null}
+				reserveSub={m('discounts.kpi.captureRateUnknown')}
 				pending={dashboardPending}
 			/>
 			<KpiCard
@@ -511,6 +514,17 @@
 				pending={dashboardPending}
 			/>
 		</div>
+
+		<!-- Notes on the KPI figures above, all decided by the dashboard
+		     response: the dashboard's own failure and the two currency notes.
+		     They stay beside the figures they qualify, in a slot that holds one
+		     line from first paint, so the common single note lands without
+		     moving the offers table (frontend/docs/ui-patterns.md § Page
+		     layout). -->
+		<div class="kpi-notes">
+		{#if error}
+			<LoadError message={error} onretry={() => loadDashboard()} testId="discounts-dashboard-error" />
+		{/if}
 
 		<!-- The dashboard half of the currency guard. `projected_savings` sums
 		     ONLY offers denominated in the reporting currency, so a non-zero
@@ -544,6 +558,7 @@
 				})}
 			</p>
 		{/if}
+		</div>
 
 		<!-- Optimize panel -->
 		<div class="opt-panel">
@@ -688,10 +703,6 @@
 		<!-- Status filter -->
 		<FilterChips chips={STATUS_CHIPS} bind:active={statusFilter} />
 
-		{#if error}
-			<LoadError message={error} onretry={() => loadDashboard()} testId="discounts-dashboard-error" />
-		{/if}
-
 		{#if offersError && !loading}
 			<LoadError
 				message={m('discounts.error.offers')}
@@ -699,7 +710,12 @@
 				testId="discounts-offers-error"
 			/>
 		{:else}
+			<!-- `fixed`, with locale-sized widths below: under `auto` the columns
+			     were sized against the "Loading…" row, then re-sized against the
+			     offers, sliding every column sideways as they landed. -->
+			<div class="offers-table">
 			<DataTable
+				fixed
 				columns={OFFER_COLUMNS}
 				isEmpty={!loading && offers.length === 0}
 				{loading}
@@ -772,6 +788,7 @@
 					{/each}
 				{/snippet}
 			</DataTable>
+			</div>
 		{/if}
 
 		<LoadMoreFooter
@@ -867,6 +884,37 @@
 		color: var(--warning);
 		font-weight: 600;
 	}
+
+	/* One line held from first paint for the notes under the KPI row (the
+	   HelpTip beside a note is 24px), so a note landing does not push the
+	   offers table down. */
+	.kpi-notes {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		min-height: 24px;
+	}
+
+	/* Offers table column widths. Fixed widths come from the header alone and
+	   hold from first paint. Each is the widest string in the six locales
+	   (measured in Chromium with the cell's own font, plus a quarter for CI's
+	   wider fallback font, ja plus a tenth): the badge de "ANGENOMMEN", the
+	   headers es "DESCUENTO", fr "JUSQU'AU", de "BEREICH", es "NIVELES"; the
+	   widest single button de "Bestätigen". Accept + Decline share one line in
+	   English; other locales wrap (td.actions wraps in a fixed table). The
+	   vendor / invoice column takes the rest; past the `min-width` the table
+	   scrolls inside its region. */
+	.offers-table {
+		min-width: 0;
+	}
+	.offers-table :global(table) { min-width: 1350px; }
+	.offers-table :global(th.col-scope) { width: 110px; }
+	.offers-table :global(th.col-tiers) { width: 160px; }
+	.offers-table :global(th.col-base) { width: 150px; }
+	.offers-table :global(th.col-best) { width: 150px; }
+	.offers-table :global(th.col-status) { width: 190px; }
+	.offers-table :global(th.col-valid) { width: 140px; }
+	.offers-table :global(th.actions-col) { width: 200px; }
 
 	/* --- Optimize panel --- */
 	.opt-panel {

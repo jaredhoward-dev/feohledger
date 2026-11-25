@@ -235,16 +235,26 @@
 		});
 	});
 
+	// A chip's count, or a dash while the first report is in flight: the chips
+	// are drawn from first paint so the table under them does not move, and a
+	// dash claims nothing about a set nobody has counted yet.
+	function chipCount(pred: (r: Vendor1099Row) => boolean): number | string {
+		return report ? report.rows.filter(pred).length : '—';
+	}
+
 	// $derived so the column headers re-render when the locale changes.
 	let COLUMNS = $derived([
+		// The vendor's tax classification is a second line under its name, not
+		// a column of its own: with the badge columns sized to their longest
+		// locale, a ninth column left the vendor name under 50px inside the
+		// 1388px region a 1666px window gives (tests-e2e/a11y/wide-layout).
 		{ label: m('tax.col.vendor') },
-		{ label: m('tax.col.classification') },
-		{ label: m('tax.col.1099'), class: 'center' },
-		{ label: m('tax.col.w9'), class: 'center' },
-		{ label: m('tax.col.tin'), class: 'center' },
-		{ label: m('tax.col.payments'), class: 'right' },
-		{ label: m('tax.col.ytdPaid'), class: 'right' },
-		{ label: m('tax.col.cardExcluded'), class: 'right' },
+		{ label: m('tax.col.1099'), class: 'center col-1099' },
+		{ label: m('tax.col.w9'), class: 'center col-w9' },
+		{ label: m('tax.col.tin'), class: 'center col-tin' },
+		{ label: m('tax.col.payments'), class: 'right col-payments' },
+		{ label: m('tax.col.ytdPaid'), class: 'right col-ytd' },
+		{ label: m('tax.col.cardExcluded'), class: 'right col-card' },
 		...(canManage ? [{ label: m('tax.col.actions'), class: 'actions-col' }] : [])
 	]);
 
@@ -389,93 +399,56 @@
 						amount: formatMoney(report.total_card_excluded, { currency: report.currency })
 					})
 				: null}
+			reserveSub={m('tax.kpi.cardExcludedSub', {
+				amount: formatMoney('100000', { currency: reportCurrency })
+			})}
 			pending={loading}
 		/>
 	</div>
 
+	<!-- The toolbar and the table are drawn from first paint — the table with
+	     DataTable's own loading row, the chips with a dash for each count — and
+	     the box-allocation panel sits BELOW the table: a loading card used to
+	     stand where all three mounted once the report landed, dropping the
+	     table under the reader on every visit
+	     (frontend/docs/ui-patterns.md § Page layout). -->
 	{#if error}
 		<LoadError message={error} onretry={load} testId="tax-load-error" />
-	{:else if loading && !report}
-		<div class="state-card" aria-busy="true">{m('tax.loadingReport', { year })}</div>
-	{:else if report}
-		{#if report.box_allocations.length > 0}
-			<section class="box-panel" aria-labelledby="box-panel-title">
-				<div class="help-row">
-					<h2 id="box-panel-title">{m('tax.boxes.title')}</h2>
-					<HelpTip term="form-1099" />
-				</div>
-				<p class="box-panel-sub">{m('tax.boxes.subtitle')}</p>
-				<ul class="box-list">
-					{#each report.box_allocations as b (b.box)}
-						<li class="box-item">
-							<span class="box-code">{b.box}</span>
-							<span class="box-label">
-								{b.label}
-								{#if b.fallback}
-									<span class="box-fallback">{m('tax.boxes.fallbackTag')}</span>
-								{/if}
-							</span>
-							<span class="box-count">{m('tax.boxes.paymentCount', { n: b.payment_count })}</span>
-							<span class="box-amount mono">
-								<Money amount={b.amount} currency={reportCurrency} />
-							</span>
-						</li>
-					{/each}
-				</ul>
-				{#if isPositiveAmount(report.total_unmapped)}
-					<p class="box-note warn">
-						{m('tax.boxes.unmapped', {
-							amount: formatMoney(report.total_unmapped, { currency: report.currency }),
-							box: report.box_allocations.find((b) => b.fallback)?.box ?? 'NEC-1'
-						})}
-					</p>
-				{/if}
-				{#if report.box_allocation_reconciled}
-					<p class="box-note">{m('tax.boxes.reconciled')}</p>
-				{:else}
-					<p class="box-note warn" role="alert">
-						{m('tax.boxes.notReconciled', {
-							residual: formatMoney(report.box_unallocated, { currency: report.currency })
-						})}
-					</p>
-				{/if}
-			</section>
-		{/if}
-
+	{:else}
 		<div class="toolbar-row">
 			<FilterChips
 				chips={[
-					{ key: 'all', label: m('common.all'), count: report.rows.length },
+					{ key: 'all', label: m('common.all'), count: chipCount(() => true) },
 					{
 						key: 'reportable',
 						label: m('tax.filter.reportable'),
-						count: report.rows.filter(isReportable).length
+						count: chipCount(isReportable)
 					},
 					{
 						key: 'missing_w9',
 						label: m('tax.filter.missingW9'),
-						count: report.rows.filter((r) => isReportable(r) && !r.w9_on_file).length,
-						alert: report.vendor_count_over_threshold_without_w9 > 0
+						count: chipCount((r) => isReportable(r) && !r.w9_on_file),
+						alert: (report?.vendor_count_over_threshold_without_w9 ?? 0) > 0
 					},
 					{
 						key: 'tin_unverified',
 						label: m('tax.filter.tinUnverified'),
-						count: report.rows.filter(needsTinVerification).length
+						count: chipCount(needsTinVerification)
 					},
 					{
 						key: 'over_threshold',
-						label: m('tax.filter.overThreshold', { threshold: report.threshold_usd }),
-						count: report.rows.filter((r) => r.over_threshold).length
+						label: m('tax.filter.overThreshold', { threshold: report?.threshold_usd ?? '—' }),
+						count: chipCount((r) => r.over_threshold)
 					},
 					{
 						key: 'card_excluded',
 						label: m('tax.filter.cardExcluded'),
-						count: report.rows.filter(hasCardExcluded).length
+						count: chipCount(hasCardExcluded)
 					},
 					{
 						key: 'unmapped',
 						label: m('tax.filter.unmapped'),
-						count: report.rows.filter(hasUnmappedSpend).length
+						count: chipCount(hasUnmappedSpend)
 					}
 				]}
 				bind:active={rowFilter}
@@ -486,18 +459,26 @@
 			<SearchBox bind:value={search} placeholder={m('tax.searchPlaceholder')} ariaLabel={m('tax.searchAria')} />
 		</div>
 
+		<div class="tax-table">
 		<DataTable
+			fixed
 			columns={COLUMNS}
+			loading={loading && !report}
 			isEmpty={filteredRows.length === 0}
-			filtered={report.rows.length > 0}
+			filtered={(report?.rows.length ?? 0) > 0}
 			emptyFiltered={m('tax.empty.noMatch')}
 			empty={m('tax.empty.noVendors')}
 		>
 			{#snippet body()}
 				{#each filteredRows as r (r.vendor_id)}
 					<tr class:row-flag={isReportable(r) && !r.w9_on_file}>
-						<td class="vendor">{r.vendor_name}</td>
-						<td class="muted">{r.tax_classification ?? '—'}</td>
+						<td class="vendor">
+							<span class="vendor-name">{r.vendor_name}</span>
+							{#if r.tax_classification}
+								<span class="classification">{r.tax_classification}</span>
+							{/if}
+						</td>
+
 						<td class="center">
 							{#if r.is_1099_eligible}
 								<Badge tone="success" variant="chip-on">{m('tax.chip.eligible')}</Badge>
@@ -575,7 +556,9 @@
 				{/each}
 			{/snippet}
 		</DataTable>
+		</div>
 
+		{#if report}
 		<p class="report-meta">
 			{m('tax.reportMeta', {
 				generated: formatDate(report.generated_at),
@@ -584,6 +567,51 @@
 			})}
 			{m('tax.reportMetaCard')}
 		</p>
+
+		{#if report.box_allocations.length > 0}
+			<section class="box-panel" aria-labelledby="box-panel-title">
+				<div class="help-row">
+					<h2 id="box-panel-title">{m('tax.boxes.title')}</h2>
+					<HelpTip term="form-1099" />
+				</div>
+				<p class="box-panel-sub">{m('tax.boxes.subtitle')}</p>
+				<ul class="box-list">
+					{#each report.box_allocations as b (b.box)}
+						<li class="box-item">
+							<span class="box-code">{b.box}</span>
+							<span class="box-label">
+								{b.label}
+								{#if b.fallback}
+									<span class="box-fallback">{m('tax.boxes.fallbackTag')}</span>
+								{/if}
+							</span>
+							<span class="box-count">{m('tax.boxes.paymentCount', { n: b.payment_count })}</span>
+							<span class="box-amount mono">
+								<Money amount={b.amount} currency={reportCurrency} />
+							</span>
+						</li>
+					{/each}
+				</ul>
+				{#if isPositiveAmount(report.total_unmapped)}
+					<p class="box-note warn">
+						{m('tax.boxes.unmapped', {
+							amount: formatMoney(report.total_unmapped, { currency: report.currency }),
+							box: report.box_allocations.find((b) => b.fallback)?.box ?? 'NEC-1'
+						})}
+					</p>
+				{/if}
+				{#if report.box_allocation_reconciled}
+					<p class="box-note">{m('tax.boxes.reconciled')}</p>
+				{:else}
+					<p class="box-note warn" role="alert">
+						{m('tax.boxes.notReconciled', {
+							residual: formatMoney(report.box_unallocated, { currency: report.currency })
+						})}
+					</p>
+				{/if}
+			</section>
+		{/if}
+		{/if}
 	{/if}
 </PageHeader>
 
@@ -796,14 +824,32 @@
 		background-color: var(--surface);
 	}
 
-	.state-card {
-		padding: 32px;
-		text-align: center;
-		color: var(--text-muted);
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 8px;
+	/* Column widths. The table is `table-layout: fixed`, so the widths come
+	   from the header alone and hold from first paint. Each is the widest
+	   string in the six locales, measured in Chromium with the cell's own font
+	   and padding, plus a quarter for CI's wider fallback font (ja plus a
+	   tenth), rounded up to 10px: the badges de "NICHT VERIFIZIERT",
+	   "BERECHTIGT", es "REGISTRADO"; the headers de "AUSGESCHLOSSEN", pt-BR
+	   "PAGAMENTOS"; the button de "Verwalten". Dense 10px cell padding, as on
+	   /vendors, leaves the vendor column ~230px inside the 1388px region a
+	   1666px window gives; past the `min-width` the table scrolls inside its
+	   region. */
+	.tax-table {
+		min-width: 0;
 	}
+	.tax-table :global(table) { min-width: 1380px; }
+	.tax-table :global(th),
+	.tax-table :global(td) {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+	.tax-table :global(th.col-1099) { width: 160px; }
+	.tax-table :global(th.col-w9) { width: 160px; }
+	.tax-table :global(th.col-tin) { width: 210px; }
+	.tax-table :global(th.col-payments) { width: 150px; }
+	.tax-table :global(th.col-ytd) { width: 150px; }
+	.tax-table :global(th.col-card) { width: 190px; }
+	.tax-table :global(th.actions-col) { width: 140px; }
 
 	.toolbar-row {
 		display: flex;
@@ -821,8 +867,15 @@
 		color: var(--text-muted);
 	}
 
-	.vendor {
+	.vendor-name {
+		display: block;
 		font-weight: 500;
+	}
+
+	.classification {
+		display: block;
+		font-size: 0.78rem;
+		color: var(--text-muted);
 	}
 
 	.row-flag {
