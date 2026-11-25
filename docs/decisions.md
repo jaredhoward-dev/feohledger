@@ -29236,3 +29236,46 @@ not what is typed into the form. `docs/sub-processors.md` § 21 says the same.
   The §498 rule still holds: a mobile build older than the bump can only sign
   out until it is updated, so this ships with or after a mobile release that
   carries it.
+
+## 561. A webhook verifier cannot raise on any header value, and a Lithic clearing without `events` is keyed by its delivery (§555 / §554 follow-up, round 47)
+
+**1. Verifiers fail closed at their boundary.** `verify_standard_webhook`
+checked the `webhook-timestamp` with `str.isdigit()`, which is True for `²` and
+Arabic-Indic digits; `int()` / `.encode("ascii")` then raised, as `int()` does
+past 4,300 digits. The card webhook verifies after it has found the card, so
+whatever a raising verifier does differently from an unknown card is an oracle
+for which card tokens exist. The card handler's broad `except` happened to turn
+it into a rollback and the same 204, but a verifier must not lean on every
+caller catching for it: one that does not answers 500. Now:
+
+- the timestamp must be 1-12 ASCII digits (`[0-9]{1,12}`, `fullmatch`);
+- the whole verifier is wrapped: any exception is logged by type only and is
+  False;
+- `verify_hmac_sha256` compares bytes, since `hmac.compare_digest` on two `str`
+  raises `TypeError` when either is non-ASCII; `verify_shared_header_token`
+  returns False on a lone surrogate. The base64 / base64url verifiers already
+  caught their decode errors.
+
+Tests (`tests/test_webhook_security.py`): superscript, Arabic-Indic, 13- and
+5,000-digit timestamps; non-ASCII, non-base64 and lone-surrogate signatures;
+every HMAC / shared-header verifier on the same inputs; and a Lithic delivery
+carrying each to a card that exists, which changes nothing, rolls nothing back
+and claims no dedupe key.
+
+**2. The Lithic fallback clearing key names the delivery.** Without `events`,
+§554 keyed a clearing by `total:{transaction}:{cumulative}`. A clearing to
+100.00, a `RETURN` to 80.00 and a clearing back to 100.00 then collided: the
+third was dropped unseen, and the refused return stood as the last word for the
+refund flow. The key is now `delivery:{webhook-id}:total:{transaction}:{cumulative}`.
+The delivery id is §555's dedupe id: a retry (same id) is still a replay, at
+Redis and at `card_transaction_events`; every other delivery is its own
+clearing, and the delta is still `reported − amount_charged`, so a repeated
+total adds nothing and is refused on the record (`not_an_increase`) instead of
+vanishing. The delivery id leads, so the 255-character clip never merges two
+deliveries. *Rejected: keeping the total and adding a sequence counter*, since
+nothing in a body without `events` orders two deliveries.
+
+Tests (`tests/test_card_money_path_regression.py`): clearing → return →
+clearing at the same total records three clearings and two refusals; a retry
+of one delivery is deduped while the same total under a new delivery is
+refused.
