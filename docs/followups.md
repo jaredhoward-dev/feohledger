@@ -911,13 +911,12 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       **Durable fix:** a panel each in `/organization`, each with its own help
       guide step. **Trigger:** the first customer asking to change
       one, or SCIM onboarding for an enterprise tenant.
-- [ ] **(c) Help for the mobile app and the supplier portal.** The help centre
-      covers the employee web app. Mobile users and suppliers get none.
-      **Durable fix:** a portal-side help section (suppliers are a separate
-      audience: submit, get paid, change bank details, card payments) reusing
-      the same content shapes and tests, and a Help row in the mobile app's
-      settings that opens the web help for the user's tenant. **Trigger:** the
-      first supplier onboarding at volume, or the first mobile-first customer.
+- [ ] **(c) Help for the supplier portal.** The help centre covers the
+      employee web app (the mobile app links to it from Settings → Help,
+      decisions §503). Suppliers get none. **Durable fix:** a portal-side help
+      section (suppliers are a separate audience: submit, get paid, change bank
+      details, card payments) reusing the same content shapes and tests.
+      **Trigger:** the first supplier onboarding at volume.
 - [ ] **(c) A custom role can't be granted invoice entry.** Entry is a role
       list by design (decisions §248). **Durable fix:** if a customer needs a
       non-clerk preparer role, add a non-sensitive permission tier the

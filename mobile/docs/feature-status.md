@@ -189,6 +189,15 @@ Parity direction is set in `frontend/CLAUDE.md` § Web vs Mobile feature parity.
   analytics read recomputed server-side on every call
 - Role-based bottom navigation
 - Settings (profile, tenant info, logout)
+- **Help** — Settings → Help opens the web help centre (`/help`) of the
+  signed-in workspace in the browser; the app holds no copy of the guides. The
+  address is the platform's tenant URL template from `GET /api/public-config`
+  with the session's tenant slug substituted (`lib/utils/tenant_web_url.dart`,
+  the mobile half of the backend's `tenant_base_url`), resolved on tap and
+  opened only when it is an absolute `https` URL; otherwise, or when no browser
+  takes it, a snackbar says to open Help from the web. The row is one link
+  semantics node ("Help, Guides for your workspace, opened in your browser").
+  Every role gets it (decisions §503)
 - JWT in secure storage (iOS Keychain / Android Keystore)
 - MFA challenge login — when `POST /api/auth/login` returns an MFA challenge
   (instead of a `TokenResponse`), `AuthStore.login` reports `mfaRequired` and the
