@@ -29431,3 +29431,60 @@ unaffected card still cancels); `test_card_money_path_regression.py` (the
 return); `test_qbo_status_sync_adapter.py` (a re-sync with a changed amount
 posts no second BillPayment); `test_provider_credentials.py` (the `whsec_`
 refusal and the per-provider acceptance).
+
+## 564. Assignment is routing, not authority: the invoice modal offers Approve / Reject on the server's verdict alone and names the assignee in a note (followups "(c) The invoice modal still hides Approve / Reject…", round 48)
+
+**Context.** After issue #575 moved the invoice modal onto the
+`GET /api/invoices/{id}/review-actions` verdict, one restated rule stayed beside
+it: `isAssignedElsewhere` hid Approve / Reject whenever `assigned_to_id` named
+someone other than the reader. `POST /api/invoices/{id}/approve|reject` have
+never read the assignee, so the page and the server disagreed (safely: a working
+control hidden, none that 403s shown). The visible cost was an invoice assigned
+to an absent colleague that no other approver could decide from the page, while
+the API, bulk approve and the assistant all could. The product call was
+delegated.
+
+**What the code showed.** Every place where "who may decide" is meant to be
+narrower than "holds `invoice.approve`" already has a server gate that the
+verdict reports: a `specific` step's `approver_ids` (`review._identity_gates` →
+`approval_chain.check_level_approver`, `approval_not_named_approver`), a chain
+level's approvers (`review._chain_level_gate`, same code; level reuse
+`approval_level_reuse`), and the active delegate of a named approver through the
+same check. Those lists are the authority; which listed approver an invoice is
+assigned to is round-robin routing. Escalation is per chain level
+(`approval_escalation` widens a level's `approver_ids`), not per assignee, so no
+SLA or escalation clock depends on the assignee acting. And §511 already reasons
+the same way about delegation: routing confers no privilege. Enforcing the
+assignee server-side would have added a gate with no owner in the approval
+config, stranded invoices behind an absent assignee (the very report the
+follow-up named as its trigger), and needed a reassign-first workaround for
+every colleague covering a queue.
+
+**Decision.** Assignment is routing, not authority. The modal drops the
+restated clause and offers Approve / Reject exactly as the verdict says. When
+the invoice is assigned to someone other than the reader it shows a
+non-blocking note above the buttons, "Assigned to *X* — you can still act as an
+approver." (`utils/reviewAssignment.assignedElsewhere`, a generic label when no
+name is stored), so nobody decides a colleague's invoice unawares. Readers the
+verdict hides the buttons from keep the existing "Assigned to *X* for review."
+line.
+
+**Not done, deliberately.** Acting on someone else's invoice does not reassign
+it and does not notify the assignee. Nothing waits on the assignee (above), the
+approval and rejection already notify the people those events notify, and the
+assignee's emailed / Slack / Teams Approve / Reject are bound to the review
+round and refused once the invoice leaves review (`refuse_unless_in_review`), so
+a stale message cannot act twice. If assignees later get a personal SLA, that
+is the trigger to notify them.
+
+**Tests.** `backend/tests/test_review_actions_parity.py`: the parity matrix gains
+four assigned-to-a-colleague rows (clean → accepted; uploaded by the caller →
+`approval_segregation`; over the step's cap → `approval_max_amount_exceeded`; a
+`specific` step naming the colleague → `approval_not_named_approver`), and
+`test_an_approver_the_invoice_is_not_assigned_to_can_decide_it` pins that an
+admin / ap_manager / cfo approves and rejects such an invoice, audited as
+themselves, with the assignment left in place. Frontend:
+`src/lib/utils/reviewAssignment.test.ts`; the Playwright case in
+`tests-e2e/invoices/review-verdict.spec.ts` (buttons and note shown, approve
+accepted). Docs: `backend/docs/workflow-design.md` § Who Can Review,
+`docs/authentication.md` § delegation, the approve-invoices help guide.

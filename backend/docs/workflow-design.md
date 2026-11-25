@@ -120,8 +120,8 @@ The approval step in the workflow definition supports three strategies:
 
 | Strategy | Behavior |
 |---|---|
-| **Manual** | When submitting for review, the user picks an approver from a dropdown. The selected user is assigned and sees Approve/Reject buttons on the invoice. |
-| **Specific** | One or more approvers are pre-configured in the workflow. Invoices are auto-assigned (round-robin). Only the assigned user sees the review buttons. |
+| **Manual** | When submitting for review, the user picks an approver from a dropdown. The selected user is assigned: the invoice lands in their queue and they are notified. Assignment routes the work; it does not restrict who may decide it (see **Who Can Review**). |
+| **Specific** | One or more approvers are pre-configured in the workflow. Invoices are auto-assigned (round-robin). Only a listed approver (or their active delegate) may approve — enforced server-side by `review._identity_gates` → `check_level_approver` and reported by the `review-actions` verdict (`approval_not_named_approver`); which listed approver is assigned is routing only. |
 | **Auto** | Invoices skip human review entirely and are auto-approved. |
 | **Chain** | Multi-level sequential approval. Each level defines a min/max amount range, approver list, and required approval count. All approvals at level N must complete before level N+1 begins. See **Multi-Level Approval Chains** below. |
 
@@ -129,9 +129,25 @@ Multiple approvers can be configured for the "specific" strategy via the workflo
 
 ### Who Can Review
 
-- If an invoice has an `assigned_to_id`, only that user sees Approve/Reject buttons in the modal.
-- If no one is assigned, any user with a non-clerk role can review.
-- AP Clerks never see review buttons regardless of assignment.
+**Assignment is routing, not authority** (decisions §564). `assigned_to_id`
+decides whose queue an invoice sits in and who is notified; it is not a gate.
+
+- `POST /api/invoices/{id}/approve|reject` accept any caller who passes the
+  server's gates: the `invoice.approve` permission, the review stage, segregation
+  of duties, the named approvers of a `specific` step or the current chain level
+  (with delegation), receiving / inspecting ≠ approving, and the max-amount and
+  CFO gates. None of them reads the assignee.
+- The invoice modal offers Approve / Reject exactly as
+  `GET /api/invoices/{id}/review-actions` says (disabled with the reason when a
+  gate refuses). When the invoice is assigned to someone other than the reader,
+  it adds a non-blocking note — "Assigned to *X* — you can still act as an
+  approver." — so nobody decides a colleague's invoice unawares.
+- Readers without `invoice.approve` (AP clerks by default) never see the
+  buttons; for them the footer shows only who the invoice is assigned to.
+- Acting on someone else's invoice does not reassign it and does not notify the
+  assignee: escalation is per chain level (`approval_escalation`), not per
+  assignee, and the assignee's emailed / Slack / Teams actions are bound to the
+  review round, so they are refused once the invoice has left review.
 
 ### Approval Thresholds
 
