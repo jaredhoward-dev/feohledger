@@ -506,6 +506,78 @@ def test_shared_header_token_is_exact_and_fails_closed():
     assert not verify_shared_header_token("k1", None)
 
 
+# Decisions §561: no header value may make a verifier RAISE. `str.isdigit`
+# accepts `²` and Arabic-Indic digits, which `int()` / `.encode("ascii")` then
+# raise on; Python refuses `int()` past 4,300 digits; `compare_digest` on two
+# `str` raises TypeError on a non-ASCII one. Every one is False, never an error.
+_HOSTILE_TIMESTAMPS = ["\u00b2", "\u0661\u0668\u0660\u0660", "1" * 5000, "1" * 13, "+1", " "]
+
+
+@pytest.mark.parametrize(
+    "ts_text",
+    _HOSTILE_TIMESTAMPS,
+    ids=["superscript", "arabic-indic", "5000-digits", "13-digits", "plus-sign", "blank"],
+)
+def test_standard_webhook_hostile_timestamp_is_false_not_an_error(ts_text):
+    from app.services.webhook_security import sign_standard_webhook, verify_standard_webhook
+
+    body = _lithic_body()
+    sig = sign_standard_webhook(_LITHIC_SECRET, "m", 1_800_000_000, body)
+    assert verify_standard_webhook(_LITHIC_SECRET, "m", ts_text, body, sig) is False
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "v1,\u00e9\u00e9\u00e9\u00e9",  # non-ASCII signature header
+        "v1,not base64!!",  # not base64
+        "v1,@@@@",
+        "v1,\udcff",  # a lone surrogate
+        "\u00e9" * 64,
+    ],
+    ids=["non-ascii", "not-base64", "symbols", "lone-surrogate", "no-version"],
+)
+def test_standard_webhook_hostile_signature_is_false_not_an_error(signature):
+    from app.services.webhook_security import verify_standard_webhook
+
+    ts = int(time.time())
+    assert verify_standard_webhook(_LITHIC_SECRET, "m", str(ts), _lithic_body(), signature) is False
+
+
+def test_standard_webhook_non_ascii_id_is_false_not_an_error():
+    from app.services.webhook_security import verify_standard_webhook
+
+    ts = str(int(time.time()))
+    assert verify_standard_webhook(_LITHIC_SECRET, "\udcff", ts, b"{}", "v1,AAAA") is False
+
+
+def test_standard_webhook_never_raises_on_an_unexpected_error():
+    """The boundary itself: whatever goes wrong inside is False."""
+    from app.services import webhook_security
+
+    with patch.object(webhook_security, "_verify_standard_webhook", side_effect=RuntimeError):
+        assert webhook_security.verify_standard_webhook("whsec_x", "m", "1", b"", "v1,x") is False
+
+
+@pytest.mark.parametrize(
+    "provided",
+    ["\u00e9" * 64, "\udcff", "\u0661" * 64],
+    ids=["non-ascii", "lone-surrogate", "arabic-indic"],
+)
+def test_hmac_and_shared_header_verifiers_never_raise(provided):
+    from app.services.webhook_security import (
+        verify_hmac_sha256,
+        verify_hmac_sha256_base64,
+        verify_hmac_sha256_base64url,
+        verify_shared_header_token,
+    )
+
+    assert verify_hmac_sha256("s", b"x", provided) is False
+    assert verify_hmac_sha256_base64("s", b"x", provided) is False
+    assert verify_hmac_sha256_base64url("s", b"x", provided) is False
+    assert verify_shared_header_token("s", provided) is False
+
+
 # --- Lithic through the handler ---------------------------------------------
 
 
@@ -562,6 +634,38 @@ async def test_lithic_unverifiable_delivery_is_a_silent_204_and_changes_nothing(
     assert result is None
     db.commit.assert_not_called()
     assert card.status == "created"
+    assert fake_redis.store == {}, "no dedup claim before verification"
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("webhook-timestamp", "\u00b2"),
+        ("webhook-timestamp", "\u0661\u0668\u0660\u0660\u0660\u0660\u0660\u0660\u0660\u0660"),
+        ("webhook-timestamp", "1" * 5000),
+        ("webhook-signature", "v1,\u00e9\u00e9\u00e9\u00e9"),
+        ("webhook-signature", "v1,not base64!!"),
+    ],
+    ids=["ts-superscript", "ts-arabic-indic", "ts-5000-digits", "sig-non-ascii", "sig-not-base64"],
+)
+@pytest.mark.asyncio
+async def test_lithic_hostile_header_on_a_known_card_is_the_unknown_card_answer(
+    fake_redis, header, value
+):
+    """Decisions §561: the verifier runs AFTER the card lookup, so a delivery
+    for a card that exists must be answered exactly as one for a card that
+    does not (204, nothing changed). A header that made the verifier raise
+    answered differently, telling a forger which card tokens exist."""
+    body = _lithic_body("PENDING")
+    headers = {**_lithic_headers(body), header: value}
+    card = _card_row("card_token_abc")
+    with patch("app.api.cards.logger") as log:
+        result, db = await _deliver("lithic", _LITHIC_SECRET, body, headers, card)
+    assert result is None  # FastAPI's 204 — the same as for an unknown card
+    db.commit.assert_not_called()
+    db.rollback.assert_not_called()  # failed closed, not caught as a crash
+    log.exception.assert_not_called()
+    assert card.status == "created" and card.amount_charged is None
     assert fake_redis.store == {}, "no dedup claim before verification"
 
 

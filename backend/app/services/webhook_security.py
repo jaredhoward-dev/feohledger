@@ -51,9 +51,11 @@ def verify_hmac_sha256(secret: str, raw_body: bytes, provided_hex: str | None) -
         return False
     try:
         expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        # Compared as bytes: `compare_digest` on two `str` raises TypeError when
+        # either holds a non-ASCII character, and a header can (decisions §561).
+        return hmac.compare_digest(expected.encode("ascii"), provided_hex.encode("utf-8"))
     except Exception:  # noqa: BLE001 — defensive: malformed input must fail closed
         return False
-    return hmac.compare_digest(expected, provided_hex)
 
 
 def verify_hmac_sha256_base64(secret: str, raw_body: bytes, provided_b64: str | None) -> bool:
@@ -143,6 +145,13 @@ STANDARD_WEBHOOK_TOLERANCE_SECONDS = 5 * 60
 _STANDARD_WEBHOOK_SECRET_PREFIX = "whsec_"
 
 
+#: A ``webhook-timestamp`` is ASCII digits only, at most 12 of them (seconds
+#: since the epoch fit in 10 until the year 2286). ``str.isdigit`` is not this:
+#: it accepts ``²`` and Arabic-Indic digits, which ``int`` / ``.encode("ascii")``
+#: then raise on (decisions §561).
+_STANDARD_WEBHOOK_TIMESTAMP = re.compile(r"[0-9]{1,12}")
+
+
 def verify_standard_webhook(
     secret: str,
     msg_id: str | None,
@@ -163,10 +172,40 @@ def verify_standard_webhook(
     rotation, any one of which may match).
 
     Fail closed: a missing header, a secret without the ``whsec_`` prefix or
-    whose key is not base64, a non-integer timestamp, one outside
-    ``tolerance_seconds`` of ``now`` (either direction), or no matching ``v1``
-    signature is False. Digests are compared in constant time.
+    whose key is not base64, a timestamp that is not 1-12 ASCII digits, one
+    outside ``tolerance_seconds`` of ``now`` (either direction), or no matching
+    ``v1`` signature is False. Digests are compared in constant time.
+
+    It NEVER raises, whatever the header values hold: the caller has already
+    looked the card up, so an exception escaping here would answer 500 where
+    an unknown card answers 204, telling a forger which tokens exist
+    (decisions §561). An unexpected error is logged by type only and is False.
     """
+    try:
+        return _verify_standard_webhook(
+            secret,
+            msg_id,
+            timestamp,
+            raw_body,
+            signature_header,
+            tolerance_seconds=tolerance_seconds,
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 — the verifier's boundary fails closed
+        logger.warning("Standard-Webhooks verification failed closed: %s", type(exc).__name__)
+        return False
+
+
+def _verify_standard_webhook(
+    secret: str,
+    msg_id: str | None,
+    timestamp: str | None,
+    raw_body: bytes,
+    signature_header: str | None,
+    *,
+    tolerance_seconds: int,
+    now: float | None,
+) -> bool:
     import time
 
     if not secret or not msg_id or not timestamp or not signature_header:
@@ -180,7 +219,7 @@ def verify_standard_webhook(
     if not key:
         return False
     ts_text = timestamp.strip()
-    if not ts_text.isdigit():
+    if not _STANDARD_WEBHOOK_TIMESTAMP.fullmatch(ts_text):
         return False
     current = time.time() if now is None else now
     if abs(current - int(ts_text)) > tolerance_seconds:
@@ -222,7 +261,10 @@ def verify_shared_header_token(expected: str, provided: str | None) -> bool:
     """
     if not expected or not provided:
         return False
-    return hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8"))
+    try:
+        return hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8"))
+    except (UnicodeError, TypeError):  # a lone surrogate: never a match, never a 500 (§561)
+        return False
 
 
 async def is_event_already_processed(
