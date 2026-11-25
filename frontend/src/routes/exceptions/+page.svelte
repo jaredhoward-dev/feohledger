@@ -611,8 +611,12 @@
 		await loadExceptions({ append: true, nextPage: page + 1 });
 	}
 
+	// The filter query the committed `summary` was read for.
+	let summaryParams: string | null = null;
+
 	async function loadSummary() {
 		const token = summarySequence.start();
+		let params = '';
 		try {
 			// The SAME filters the table was just loaded with — search included,
 			// via `appliedSearch` — so every chip counts the set on screen. This
@@ -620,14 +624,20 @@
 			// carried OPEN-only tallies while the operator was looking at
 			// Escalated / Resolved / All; with a search box that gap would have
 			// been every chip counting the tenant above a one-row table.
-			const params = filterParams(untrack(() => appliedSearch));
+			params = String(filterParams(untrack(() => appliedSearch)));
 			const data = await api.get<Summary>(`/api/exceptions/summary?${params}`);
 			// The chip counts drive the filter UI — an older summary landing
 			// last would relabel the chips with pre-resolve tallies.
 			if (!summarySequence.canCommit(token)) return;
 			summary = data;
+			summaryParams = params;
 		} catch {
-			/* non-critical */
+			// Non-critical, but another filter's tallies must not stand in for
+			// these: "Select all N matching" would offer the old N.
+			if (summarySequence.isCurrentRequest(token) && params !== summaryParams) {
+				summary = null;
+				summaryParams = null;
+			}
 		}
 	}
 
@@ -1168,7 +1178,7 @@
 				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total: selectableMatchingCount })}
+						: m('common.selectAllMatching', { total: formatCount(selectableMatchingCount) })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
