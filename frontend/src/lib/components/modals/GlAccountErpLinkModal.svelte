@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { confirmGlAccountErpLink } from '#lib/api/glAccounts.ts';
 	import { erpCandidateLabel, type GlAccount } from '#lib/types/glAccount.ts';
+	import Badge from '#lib/components/ui/Badge.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -25,7 +26,9 @@
 	const row = untrack(() => account);
 	const candidates = row.erp_link_candidates?.accounts ?? [];
 	/** The candidate the row already posts to, when the sync kept its link but
-	 *  questions it (§524); otherwise none. */
+	 *  questions it (§524); otherwise none. The backend always lists the current
+	 *  account among the candidates, so the fallback below only keeps the intro
+	 *  honest if that ever stops being true — it never renders as a card. */
 	const current = row.erp_account_id
 		? (candidates.find((c) => c.erp_account_id === row.erp_account_id) ?? {
 				erp_account_id: row.erp_account_id,
@@ -86,14 +89,23 @@
 		<fieldset class="radio-card-group">
 			<legend class="visually-hidden">{m('glAccounts.erpLink.title', { code: row.code })}</legend>
 			{#each candidates as candidate (candidate.erp_account_id)}
+				{@const isCurrent = candidate.erp_account_id === current?.erp_account_id}
+				<!-- The current link is tagged, never preselected (§284): confirming
+				     it is as deliberate a choice as picking another. -->
 				<label class="radio-card" data-testid="gl-erp-candidate">
 					<input
 						type="radio"
 						name="erp-candidate"
 						value={candidate.erp_account_id}
+						aria-describedby={isCurrent ? 'gl-erp-current-link' : undefined}
 						bind:group={chosen}
 					/>
 					<span class="label">{erpCandidateLabel(candidate)}</span>
+					{#if isCurrent}
+						<span id="gl-erp-current-link" data-testid="gl-erp-current-link">
+							<Badge tone="accent" variant="current-link">{m('glAccounts.erpLink.currentLink')}</Badge>
+						</span>
+					{/if}
 					<span class="id">{m('glAccounts.erpLink.optionId', { id: candidate.erp_account_id })}</span>
 				</label>
 			{/each}

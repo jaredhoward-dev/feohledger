@@ -5345,6 +5345,7 @@ export const messages = {
 	'glAccounts.erpLink.intro': "A sincronização encontrou mais de uma conta do ERP a que esta linha pode se referir, por isso não vinculou nenhuma. As faturas codificadas em {code} serão lançadas na conta que você escolher. Sua escolha fica registrada na trilha de auditoria.",
 	'glAccounts.erpLink.introLinked': "Esta linha está vinculada à conta do ERP {current}, mas antes de uma atualização a sincronização identificava também outras contas do ERP por {code}, então a linha pode tê-las misturado. As faturas codificadas em {code} continuam sendo lançadas em {current} até que você a confirme ou escolha outra. Sua escolha fica registrada na trilha de auditoria.",
 	'glAccounts.erpLink.optionId': "ID no ERP {id}",
+	'glAccounts.erpLink.currentLink': "Vínculo atual",
 	'glAccounts.erpLink.confirm': "Vincular a esta conta",
 	'glAccounts.erpLink.toast.linked': "{code} agora está vinculada a {erpCode}.",
 	'glAccounts.erpLink.toast.failed': "Não foi possível vincular a conta",

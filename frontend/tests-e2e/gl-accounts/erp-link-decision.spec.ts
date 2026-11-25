@@ -43,7 +43,7 @@ async function setErp(page: Page, erp: Record<string, unknown> | null) {
 	expect(r.ok(), await r.text()).toBe(true);
 }
 
-test.describe('/gl-accounts — an unlinked row waiting for a decision', () => {
+test.describe('/gl-accounts — a row waiting for a decision', () => {
 	test.beforeEach(async ({ page }) => {
 		await setErp(page, { type: 'mock', integration_method: 'direct' });
 	});
@@ -122,5 +122,81 @@ test.describe('/gl-accounts — an unlinked row waiting for a decision', () => {
 					`FROM gl_accounts WHERE code = '${code}'`
 			).trim()
 		).toBe('40|t|t');
+	});
+
+	// §524: a QuickBooks row the sync kept LINKED but questions — its code is
+	// its account's current code and also a legacy key another account shared.
+	// Bills still post to the linked id, so the table shows that id beside the
+	// badge, and confirming the same account keeps the link and clears it.
+	test('a linked row the sync questions keeps its id and confirms in place', async ({
+		page
+	}) => {
+		const code = `${PREFIX}L${Date.now().toString(36)}`;
+		const created = await page.request.post(`${API_BASE}/api/gl-accounts`, {
+			headers: await headers(page),
+			data: { code, name: 'Depreciation', account_type: 'expense' }
+		});
+		expect(created.ok(), await created.text()).toBe(true);
+		const candidates = {
+			realm: null,
+			reason: 'ambiguous_legacy',
+			accounts: [
+				{ erp_account_id: '9139', code: 'Truck:Depreciation', name: 'Truck:Depreciation' },
+				{ erp_account_id: '9140', code: 'Depreciation', name: 'Depreciation' }
+			]
+		};
+		tenantPsql(
+			`UPDATE gl_accounts SET erp_account_id = '9140', ` +
+				`erp_link_candidates = '${JSON.stringify(candidates)}'::jsonb ` +
+				`WHERE code = '${code}'`
+		);
+
+		await page.goto(`/gl-accounts?search=${encodeURIComponent(code)}`);
+		const row = page.locator('table tbody tr', {
+			has: page.locator('td.mono', { hasText: new RegExp(`^${code}$`) })
+		});
+		await expect(row.getByText('Needs a decision')).toBeVisible();
+		await expect(row.locator('.erp-id')).toHaveText('9140');
+		await expect(page.getByTestId('gl-erp-decisions')).toContainText(
+			'1 account needs a decision'
+		);
+
+		await row.getByRole('button', { name: `Choose ERP account for ${code}` }).click();
+		const modal = page.locator('div.modal[role="dialog"]', {
+			hasText: `Which ERP account is ${code}?`
+		});
+		await expect(modal).toBeVisible();
+		await expect(modal.locator('p.intro')).toContainText(
+			'This row is linked to ERP account Depreciation'
+		);
+		const options = modal.getByTestId('gl-erp-candidate');
+		await expect(options).toHaveCount(2);
+		// The current link is tagged, on its own card only, and still not
+		// preselected: confirming it is a choice too (§284).
+		await expect(modal.getByTestId('gl-erp-current-link')).toHaveCount(1);
+		await expect(options.nth(1).getByTestId('gl-erp-current-link')).toHaveText('Current link');
+		await expect(options.nth(1).getByRole('radio')).toHaveAccessibleDescription('Current link');
+		await expect(options.nth(1).getByRole('radio')).not.toBeChecked();
+		const confirm = modal.getByRole('button', { name: 'Link to this account' });
+		await expect(confirm).toBeDisabled();
+
+		await options.nth(1).getByRole('radio').check();
+		const linked = page.waitForResponse(
+			(r) => r.request().method() === 'POST' && r.url().includes('/erp-link')
+		);
+		await confirm.click();
+		const resp = await linked;
+		expect(resp.status()).toBe(200);
+		expect(resp.request().postDataJSON()).toEqual({ erp_account_id: '9140' });
+
+		await expect(modal).toBeHidden();
+		await expect(row.getByText('Needs a decision')).toHaveCount(0);
+		await expect(row.locator('.erp-id')).toHaveText('9140');
+		expect(
+			tenantPsql(
+				`SELECT erp_account_id, erp_link_confirmed_at IS NOT NULL, erp_link_candidates IS NULL ` +
+					`FROM gl_accounts WHERE code = '${code}'`
+			).trim()
+		).toBe('9140|t|t');
 	});
 });
