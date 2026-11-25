@@ -27154,3 +27154,110 @@ but would re-open a resolved one every 15 minutes.
 not re-raised after a resolve or dismiss until the status changes away and
 back. `tests/test_invoice_warning_catalog.py` now counts the sweep (and
 `erp_status_report.py`, which the §528 move left out) as ERP producers.
+
+## 533. The generic ERP route holds a `paid` it cannot attribute to us, polls by the webhook's realm rule, and dedupes its flags by kind (§303 / §417 / §423 / §528 / §532 follow-up, round 44)
+
+**Problem.** The round's money-path review of the `erp-status-poll` sweep
+(§528, §532) found four gaps, one of them in the shared transition and so in
+the generic webhook too.
+
+1. **A `paid` for a `payment_scheduled` invoice moved it to `paid` whenever no
+   `completed` payment was on file.** `services/erp_status_report` ran the
+   settlement-coverage hold only over a completed payment, and with none it
+   transitioned. But this route and the sweep serve adapters
+   `payment_erp_sync` writes nothing back to, so an ERP `paid` while our own
+   payment is still pending or processing (or a live virtual card, which books
+   no `Payment`, holds the invoice) means someone paid the bill in the ERP
+   while our rail pays it too. Moving to `paid` hid the double payment, fired
+   the `payment.settled` webhook, and let a later short settlement walk around
+   the coverage hold. `tests/test_erp_status_poll_sweep.py` pinned the bug: it
+   seeded no `Payment` and expected `paid`.
+2. **The sweep polled every NULL-realm bill of a realm-less connection.** It
+   restated the realm rule, and for a connection naming no company (`mock`, an
+   OAuth ERP with no consent) it matched invoices whose push recorded no realm —
+   the reverse of §423, under which the webhook's document-id lookup matches
+   nothing for such a connection and trusts a NULL-realm push only under
+   `legacy_links_trusted`.
+3. **§532's flag was swallowed by an unrelated row of the same type.**
+   `open_erp_reconciliation_exception` skips when any open or escalated row of
+   the *type* exists, while the sweep still recorded the read as handled. With
+   another report's `payment_reconciliation` live, `settled_no_payment` opened
+   nothing; once a person resolved that row, the unchanged read raised nothing
+   either, and a payment run could pay a bill the ERP shows settled. A
+   `cancelled` read beside an unrelated live `erp_reconciliation` (a
+   settled-short row) had the same gap, and a deduplicated void was still
+   counted `invoices_applied`.
+4. **`partially_paid` was dropped.** The ERP showing part of a bill paid there,
+   which this route never writes back, left a run free to pay the full amount.
+
+**Decision.**
+
+1. **Hold, never move, without a completed payment.** In
+   `apply_erp_status_report`, `payment_scheduled` + `paid` with no `completed`
+   payment opens one payment-blocking `payment_reconciliation` with
+   `exception_finding("erp_paid_while_scheduled")` — the QuickBooks sync's
+   sentence for the same fact (`apply_bill_report`) — `erp_report.kind`
+   `paid_while_scheduled` (plus the adapter, document id, event id, invoice
+   status, and `source: poll` from the sweep), and does not transition
+   (outcome `held_paid_while_scheduled`). A completed covering payment still
+   moves to `paid`; a completed short one still takes the settled-short hold.
+   This is the shared service, so the **generic webhook changes too**: its
+   test of an ERP `paid` with no payment on file now expects the hold. A live
+   card on a `payment_scheduled` invoice books no `Payment`, so it falls in the
+   same refusal (pinned in both new test files).
+2. **One realm rule, one function.** `erp_link_realm.bill_realm_clause` states
+   §417 / §423 once — the current realm, NULL only under
+   `legacy_links_trusted`, `None` (nothing matches) for a connection naming no
+   company — and both `api/erp_webhook._invoice_id_by_document` and the
+   sweep's candidate query call it. A tenant on the mock adapter is therefore
+   polled for nothing. Guard rail 7 still holds — the sweep runs locally and is
+   off by default — but it has nothing to read there: the mock adapter always
+   reads `open` and its bills belong to no company.
+3. **Dedupe by kind.** `open_erp_reconciliation_exception(..., same_kind=True)`
+   skips only when a live row of the same type AND `erp_report.kind` exists.
+   Every row the shared transition and the sweep open (`voided_after_post`,
+   `settled_short`, `paid_while_scheduled`, `settled_no_payment`,
+   `partly_paid`) passes it. A flag skipped by its own live row changed
+   nothing, so the outcome is `NOOP` (or `WITHDRAWN`): not counted as applied,
+   and not committed at the webhook.
+4. **`partially_paid` gets §532's treatment.** A changed read opens one
+   blocking `payment_reconciliation` with `exception_finding(
+   "erp_partly_paid_outside")` (QuickBooks' sentence, already in the catalogue
+   and every locale), `erp_report.kind` `partly_paid`, `source: poll`, at any
+   polled status — `sent_to_erp` included, so the bill is blocked before it
+   becomes payable. Like `settled_no_payment` it is the sweep's own branch
+   (the webhook has no word for it), and both first withdraw a payment the ERP
+   reported earlier that FeohLedger could not record (§319), since neither is a
+   bill paid in full.
+
+**Why kind, and not "record the read only when the flag opened".** Both stop
+the sweep losing the flag. Only deduping by kind fixes the webhook too: a
+delivery is deduped by its event id and never comes again, so a report the
+unrelated row swallowed is gone however the sweep records its reads. It is
+also the codebase's own precedent — `_keep_erp_paid_report` already keeps one
+row per invoice by `paid_not_recorded` kind, not by type. A second blocking row
+beside an unrelated one is not noise: each is a different fact a person must
+clear, and the run is refused until both are.
+
+**Rejected.** *Changing the helper's default to dedupe by kind for every
+caller*: the QuickBooks sync, the write-back and the sync-back failures share
+other kinds whose per-type skip is pinned by their own tests; they are left to
+their own review. *Moving `paid` over an in-flight payment and re-raising later*:
+nothing re-raises it once the invoice is `paid`, and the money-path readers
+treat `paid` as settled. *Keeping the mock adapter polled*: it would need a
+second realm rule, the one §423 retired.
+
+**Guard.** `tests/test_erp_status_report.py` (new) pins the service directly:
+each status → edge, the poll's audit marker, no-change and terminal no-ops, a
+paid with no completed payment (none, pending, processing, live card) held and
+blocking, covering → `paid`, short → held, kind dedupe on every flag including
+an unrelated live row of the same type, and the §319 withdrawal.
+`tests/test_erp_status_poll_sweep.py`: the three `paid` cases, the void and
+`settled_no_payment` beside unrelated rows (still blocked after the unrelated
+row is resolved), a deduped void not counted as applied, `partially_paid`
+flagged once per change, the realm rule (realm-less polls nothing, a foreign
+realm never, NULL only under `legacy_links_trusted`), and that the sweep and
+the webhook call the one predicate. `tests/test_erp_webhook_transitions.py`:
+the in-flight hold and its dedupe at the webhook. The unseal-budget
+exemption's cold and expired cases (§527) were already pinned in
+`test_merge_webhook.py` and `test_webhook_security.py`.

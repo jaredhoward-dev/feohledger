@@ -2078,6 +2078,12 @@ Execute Payment Run (response sent immediately)
   non-covering verdict opens an `erp_reconciliation` exception and leaves the
   invoice at `payment_scheduled` (silent 204) rather than flipping a
   short-paid invoice to `paid` and stranding `/settlement/accept` behind a 409.
+  With **no** `completed` payment at all (ours still pending or processing, or
+  a live virtual card) the ERP's `Paid` cannot be ours, so it never transitions:
+  it opens a payment-blocking `payment_reconciliation`
+  (`exception.erp_paid_while_scheduled`) — the webhook and the
+  `erp-status-poll` sweep alike, through `services/erp_status_report`
+  (decisions §533).
 - **A completed payment whose settlement doesn't cover the invoice is held
   here**, not marked `paid`, and counted separately in the sync's log line.
 - Sync runs async — **doesn't block** the payment run response
