@@ -50,7 +50,7 @@ from app.schemas.portal import (
     PortalTokenResponse,
     PortalUpdateProfileRequest,
 )
-from app.services import mfa, password_reset
+from app.services import mfa, password_reset, portal_legal_acceptance
 from app.services.audit_dispatch import dispatch_auth_audit, queue_auth_audit
 from app.services.credential_upgrade import upgrade_password_hash
 from app.services.email_adapters import EmailMessage, get_email_adapter, is_supported_locale
@@ -542,7 +542,24 @@ async def portal_check_reset_token(
     vu = await _vendor_user_for_link(db, vu_id)
     if vu is None:
         raise HTTPException(status_code=400, detail=_INVALID_PORTAL_LINK)
-    return ResetPasswordCheckResponse(email=vu.email)
+    return ResetPasswordCheckResponse(
+        email=vu.email,
+        legal_acceptance_required=await _set_password_needs_acknowledgement(db, vu),
+    )
+
+
+async def _set_password_needs_acknowledgement(db: AsyncSession, vu: VendorUser) -> bool:
+    """Does redeeming this link have to carry the Privacy Policy acknowledgement?
+
+    Only a SET-password — an account with no password yet: the AP team's
+    invite, or its reset (decisions §283) — whose owner has not acknowledged
+    the version in force (§499). That link is the portal account's front door,
+    so the box sits on it. A forgot-password reset of an account that already
+    has a password is not held up, as on the employee side (§495).
+    """
+    if vu.hashed_password is not None:
+        return False
+    return bool(await portal_legal_acceptance.missing_documents(db, vu.id))
 
 
 @router.post("/reset-password", response_model=ResetPasswordResponse)
@@ -565,6 +582,21 @@ async def portal_reset_password(
     except PasswordError as exc:
         raise HTTPException(status_code=422, detail=password_refusal(exc)) from exc
 
+    # A set-password link must carry the Privacy Policy acknowledgement
+    # (`_set_password_needs_acknowledgement`). Checked BEFORE the token is
+    # consumed, against the account the token names, so a refusal leaves the
+    # link usable once the box is ticked (decisions §499, as §495 does for
+    # employees). The peek answers nothing the redemption below would not.
+    acknowledged = portal_legal_acceptance.acknowledges_current(body.accepted_privacy_version)
+    if not acknowledged:
+        holder = await _vendor_user_for_link(
+            db, await password_reset.peek_portal_reset_token(body.token, slug)
+        )
+        if holder is not None and await _set_password_needs_acknowledgement(db, holder):
+            raise HTTPException(
+                status_code=422, detail=portal_legal_acceptance.acknowledgement_refusal()
+            )
+
     vu_id = await password_reset.consume_portal_reset_token(body.token, slug)
     vu = await _vendor_user_for_link(db, vu_id)
     if vu is None:
@@ -572,7 +604,22 @@ async def portal_reset_password(
 
     vu.hashed_password = await hash_password(body.new_password)
     vu.must_change_password = False
+    if acknowledged:
+        # Same transaction as the password: no account is entered through this
+        # link without the record of what it was shown.
+        await portal_legal_acceptance.record_acknowledgement(db, vendor_user_id=vu.id)
     await db.commit()
+
+    if acknowledged:
+        await _audit_portal_mfa_event(
+            vu,
+            action="portal.legal.accepted",
+            details={
+                "versions": portal_legal_acceptance.current_portal_versions(),
+                "source": portal_legal_acceptance.SOURCE_SET_PASSWORD,
+                "ip": resolve_client_ip(request),
+            },
+        )
 
     # After the commit, so a Redis failure cannot roll back a password the
     # supplier was told is set — and guarded, so it cannot 500 one either: the

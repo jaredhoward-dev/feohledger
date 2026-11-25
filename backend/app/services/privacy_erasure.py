@@ -41,7 +41,10 @@ is handled:
     (decisions §495). They are the evidence a contract was formed — retained
     for the establishment or defence of legal claims (GDPR Art. 17(3)(e)) —
     and hold only the user id, organisation id, document, version, time and
-    control, so once the user row is redacted they identify no one.
+    control, so once the user row is redacted they identify no one. A
+    supplier-portal user's ``vendor_user_legal_acceptances`` rows (tenant, the
+    Privacy Policy acknowledgement, decisions §499) are kept on the same
+    footing: the evidence the notice was shown, holding no name or address.
   * **Live sessions.** Access already stops on the next request (``is_active``
     is re-read by ``get_current_user``), but the issued JTI stays valid in Redis
     until its TTL. Erasure calls the EXISTING revocation path,

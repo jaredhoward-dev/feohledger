@@ -286,6 +286,10 @@ CLOSURE_ALLOWED: dict[str, str] = {
     "po_line_items": _covered_by("purchase_orders"),
     "requisition_line_items": _covered_by("purchase_requisitions"),
     "contract_line_items": _covered_by("contracts"),
+    # A portal user's Privacy Policy acknowledgements (decisions §499): any
+    # portal login blocks the closure, so rows here mean a supplier that was
+    # since deleted, and the acknowledgement goes with the rest of the tenant.
+    "vendor_user_legal_acceptances": _covered_by("vendor_users"),
     # Master and reference data: a trial plausibly holds it, and nothing in it is
     # a transaction that happened.
     "vendors": (

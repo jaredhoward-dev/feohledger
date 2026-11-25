@@ -257,6 +257,7 @@ export const messages = {
 	'audit.action.portal.mfa.step_up.failure': "サプライヤーポータルの再認証失敗",
 	'audit.action.portal.mfa.verify.failure': "サプライヤーポータルのMFA確認失敗",
 	'audit.action.portal.mfa.verify.success': "サプライヤーポータルのMFA確認成功",
+	'audit.action.portal.legal.accepted': "サプライヤーポータルでプライバシーポリシーの確認を記録",
 	'audit.action.portal.password.changed': "サプライヤーポータルのパスワード変更",
 	'audit.action.portal.password_reset.requested': "サプライヤーポータルのパスワード再設定を要求",
 	'audit.action.portal.session.revoked': "サプライヤーポータルのセッション失効",

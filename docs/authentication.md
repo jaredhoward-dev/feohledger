@@ -389,6 +389,26 @@ logins nor the e2e suite meet the step. After a version bump, re-run the seed.
 The rows survive a DSAR erasure and a workspace deletion (evidence of the
 contract; no foreign keys), and the DSAR export carries them.
 
+**Supplier-portal users acknowledge the Privacy Policy only** (decisions
+§499). A Supplier User is not a party to our Terms — `/legal/terms` §2 says "a
+Supplier User is not our customer" and §3.4 puts their compliance on the
+customer — so the portal never presents the Terms. `POST
+/api/portal/auth/reset-password` on a set-password link (a portal account with
+no password: invited, or reset by the AP team) must carry
+`accepted_privacy_version`, the version in force; without it the answer is a
+`422` coded `privacy_acknowledgement_required`, checked before the token is
+consumed. `POST /api/portal/auth/reset-password/check` returns
+`legal_acceptance_required` so the page shows the box (the shared
+`LegalAcceptCheckbox` with `documents="privacy"`). The record is the tenant
+table `vendor_user_legal_acceptances` (migration 0144: vendor-user id,
+document, version, time, source), written in the redemption's transaction;
+each one writes `portal.legal.accepted` `{versions, source, ip}` to the
+tenant's auth trail. A forgot-password reset of a portal account that already
+has a password is not held up, and portal users who set a password before
+this are not asked (no portal re-prompt yet, `docs/followups.md`). The rows
+are kept through a DSAR erasure of the vendor user and carried by its export;
+a workspace deletion drops them with the tenant database.
+
 ### Protected routes
 
 All endpoints except the explicit allowlist (login flow, OIDC handshake, signup, webhooks, SCIM, health) require a valid Bearer token AND the right role. Authentication and role checks are enforced via FastAPI dependencies in `app/api/deps.py` (`get_current_user`, `require_roles`). See **Role-based access control** below for the full permission matrix.
@@ -607,6 +627,7 @@ Action names:
 | TOTP turned off (`/mfa/disable`) | `auth.mfa.disabled` (employee) · `portal.mfa.disabled` (supplier portal) — PII-free, records `{factor: "totp"}` |
 | Passkey registered (`/mfa/passkey/register/verify`) | `auth.mfa.passkey.registered` — PII-free, records `{factor: "passkey", credential, name, rp_id}`. `credential` is the API-visible passkey id (`webauthn_credentials.id`), never the authenticator's credential handle or its public key |
 | Passkey removed (`DELETE /mfa/passkey/{id}`) | `auth.mfa.passkey.removed` — same shape, so the removal row joins to the registration row on `credential` |
+| Supplier-portal Privacy Policy acknowledged (a set-password redemption that carried it) | `portal.legal.accepted` — `{versions: {privacy}, source: "set_password", ip}`; actor and entity are the vendor user. The tenant `vendor_user_legal_acceptances` row is the record; this is the trail entry (decisions §499) |
 | Supplier-portal reset link requested (`POST /portal/auth/forgot-password`) | `portal.password_reset.requested` — the portal twin of `auth.password_reset.requested`: `actor_id` null, `{ip}` only, `entity_id` the vendor user; written only for an existing, active account in the requesting tenant. The redemption is the existing `portal.password.changed` `{via: "set_password_link"}` |
 | Failed supplier-portal password login | `portal.login.failure` — records `{ip, reason}` (`bad_password` \| `no_password` \| `inactive`) and identifies the account by `entity_id`, never by address (a supplier contact's email is third-party PII we don't restate on every guess). Queued off the response path, like its employee twin |
 | Successful supplier-portal password login | `portal.login.success` — PII-free, records `{ip, method: "password"}` and identifies the account by `actor_id`/`entity_id`, never by address (same rule as the failure row). **Awaited**, unlike the failure row: the account provably exists by then, so the tenant-DB round trip cannot become the account-existence oracle `queue_auth_audit` avoids. Written on BOTH sign-in paths: the password-only one, and `/portal/auth/mfa/challenge` once a second factor is enrolled (as `password+mfa:{factor}`, beside that stage's own `portal.mfa.verify.success`). One action is therefore the whole population — an earlier version wrote it only on the password path, which made the action a biased sample rather than a gap, silently omitting exactly the best-protected accounts. Mirrors the employee twin, which writes `auth.login.success` alongside `auth.mfa.verify.success` |

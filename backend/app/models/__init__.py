@@ -77,6 +77,7 @@ from app.models.vendor_statement_recon import (
     VendorStatementReconLine,
 )
 from app.models.vendor_user import VendorUser
+from app.models.vendor_user_legal_acceptance import VendorUserLegalAcceptance
 from app.models.virtual_card import CardRebate, CardRevealToken, VirtualCard
 from app.models.webauthn_credential import WebAuthnCredential
 from app.models.webhook import WebhookDelivery, WebhookSubscription
@@ -182,6 +183,7 @@ __all__ = [
     "VendorStatementReconciliation",
     "VendorStatementReconLine",
     "VendorUser",
+    "VendorUserLegalAcceptance",
     "VirtualCard",
     "WorkflowDefinition",
     "WorkflowExperiment",

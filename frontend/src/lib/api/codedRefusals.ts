@@ -828,6 +828,10 @@ const BUILDERS: Record<string, Builder> = {
 	// `services/legal_acceptance.acceptance_refusal` — signup, a set-password
 	// link and the re-prompt, without the Terms / Privacy versions in force.
 	legal_acceptance_required: fixed('refusal.legalAcceptanceRequired'),
+	// `services/portal_legal_acceptance.acknowledgement_refusal` — a supplier-
+	// portal set-password link without the Privacy Policy version in force
+	// (decisions §499; suppliers are not asked to accept the Terms).
+	privacy_acknowledgement_required: fixed('refusal.privacyAcknowledgementRequired'),
 	// `api/payments.py::_refuse_record_only` — every dispatching endpoint on a
 	// tenant whose payments are recorded, never sent. `params.reason` says why
 	// the mode resolved so; the sentence is the same for every reason.

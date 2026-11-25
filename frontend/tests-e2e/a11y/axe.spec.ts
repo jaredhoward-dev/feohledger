@@ -365,13 +365,18 @@ test.describe('accessibility — unauthenticated surfaces (WCAG 2.2 AA)', () => 
 		page
 	}) => {
 		// A real token needs the invite email (backend tests mint one); a
-		// stubbed check renders the live form, the state with the most to scan.
+		// stubbed check renders the live form, the state with the most to scan —
+		// an invite's, with the Privacy Policy box (decisions §499).
 		await page.route(
 			(url) => url.pathname === '/api/portal/auth/reset-password/check',
-			(route) => route.fulfill({ json: { email: 'supplier@vendor.example' } })
+			(route) =>
+				route.fulfill({
+					json: { email: 'supplier@vendor.example', legal_acceptance_required: true }
+				})
 		);
 		await page.goto('/portal/reset-password?token=axe-scan-token');
 		await expect(page.locator('input[type="password"]').first()).toBeVisible();
+		await expect(page.getByRole('checkbox', { name: /I have read the Privacy Policy/ })).toBeVisible();
 		await expectNoA11yViolations(page);
 	});
 

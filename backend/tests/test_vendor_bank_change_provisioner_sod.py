@@ -35,7 +35,7 @@ from app.api.deps import create_vendor_access_token
 from app.models.vendor import Vendor
 from app.models.vendor_change_request import VendorChangeRequest
 from app.models.vendor_user import VendorUser
-from tests.set_password_mail import link_token
+from tests.set_password_mail import ACK_PRIVACY, link_token
 from tests.test_session_management import FakeRedis
 
 TENANT = "a"
@@ -90,7 +90,7 @@ async def _redeem(realdb, message, password: str = ATTACKER_PASSWORD) -> None:
     async with realdb.client(key=TENANT, role=None) as anon:
         resp = await anon.post(
             "/api/portal/auth/reset-password",
-            json={"token": link_token(message), "new_password": password},
+            json={"token": link_token(message), "new_password": password, **ACK_PRIVACY},
         )
     assert resp.status_code == 200, resp.text
 

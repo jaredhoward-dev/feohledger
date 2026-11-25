@@ -3494,6 +3494,9 @@ export const messages = {
 	'auth.legal.acceptRequired': '利用規約とプライバシーポリシーに同意するには、チェックボックスをオンにしてください。',
 	'auth.legal.versionsChanged': 'このページを読み込んだ後に利用規約またはプライバシーポリシーが更新されました。ページを再読み込みして、最新の内容を確認し同意してください。',
 	'auth.legal.reload': 'ページを再読み込み',
+	'auth.legal.privacyAckLabel': '{privacy}を読みました。',
+	'auth.legal.privacyAckRequired': 'プライバシーポリシーを読んだことを確認するには、チェックボックスをオンにしてください。',
+	'auth.legal.privacyVersionsChanged': 'このページを読み込んだ後にプライバシーポリシーが更新されました。ページを再読み込みして、最新の内容を確認してください。',
 	'auth.signup.footerPre': 'すでにワークスペースをお持ちですか？',
 	'auth.signup.footerPost': 'にアクセスしてサインインしてください。',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

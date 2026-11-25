@@ -25493,3 +25493,77 @@ the contract.
 **Consequence for the server gate.** Once it lands, a mobile build older than a
 version bump can only sign out until updated, so a bump should ship with (or
 after) an app release carrying the new versions.
+
+## 499. Supplier-portal users acknowledge the Privacy Policy, not the Terms, recorded in a tenant table (round 38)
+
+**Problem.** §495 made employee signup and a first password set record
+acceptance of the Terms and Privacy Policy. A supplier-portal user is a tenant
+`VendorUser` with its own auth (`/portal/auth`); their set-password page was
+unchanged, so a supplier was never asked anything, and the control-plane
+`legal_acceptances` row, keyed by an employee `user_id`, cannot name them.
+
+**What the published documents say.** The Terms are "a binding agreement
+between the organisation that subscribes to or uses" the service and us
+(`/legal/terms` §1). §2 defines a Supplier User as "an individual from one of
+the Customer's suppliers or vendors who is given access to the supplier portal
+… A Supplier User is not our customer; access is granted by, and on the
+responsibility of, the Customer", and §3.4 says "The Customer must ensure that
+everyone it gives access complies with these Terms, and is responsible for
+their acts and omissions as if they were its own." §1 also says that "where no
+organisation is named, the individual accepting is the Customer and is
+personally bound". The Privacy Policy's section 3 is addressed to suppliers
+("If you are reading this because a company you invoice uses …, you are
+probably not our customer"), and §2 lists "supplier-portal accounts" among the
+data we hold as the customer's processor.
+
+**Decision.**
+
+- **Suppliers are not asked to accept the Terms.** They are not a party, the
+  customer answers for them, and a supplier "accepting" with no organisation
+  named would, read with §1, purport to make them the Customer. Presenting the
+  Terms would invent a contractual position the documents do not take.
+- **They acknowledge the Privacy Policy.** The box reads "I have read the
+  Privacy Policy" — a notice, not an agreement — and is required on the
+  portal's set-password link for an account with no password (invited, or
+  reset by the AP team), the same front door §495 uses. Its absence is a coded
+  422 `privacy_acknowledgement_required`, checked before the token is consumed
+  so a refusal leaves the link usable; the check endpoint reports
+  `legal_acceptance_required` so the page shows the box. A forgot-password
+  reset of an account that already has a password is not held up, as for
+  employees. The version comes from `CURRENT_LEGAL_VERSIONS["privacy"]`, so
+  there is still one owner of what is in force.
+- **Storage: a tenant table, `vendor_user_legal_acceptances`** (migration
+  0144, fanned out to every tenant; fresh tenants get it from `create_all`):
+  vendor-user id, document, version, `accepted_at`, source. Append-only,
+  unique per (vendor user, document, version), first `accepted_at` kept, no
+  foreign key, no name, email, IP or user agent (the IP is on the tenant's
+  `portal.legal.accepted` audit row). It lives beside the `vendor_users` row
+  it describes: a control-plane row would need a tenant-scoped id the control
+  plane cannot resolve, and the portal's whole auth runs on the tenant DB.
+  `document` stays a column so a future portal-terms document is a new value.
+- **Recorded in the redemption's transaction**, with the password, so no
+  portal account is entered through a link without the record of what it was
+  shown.
+- **Retention follows §495's reasoning where it applies.** A DSAR erasure of
+  the vendor user keeps the rows (once the vendor-user row is redacted they
+  identify no one, and they are the evidence the notice was shown); the
+  vendor-user DSAR export carries them as `legal_acceptances`. A workspace
+  deletion drops them with the tenant database: unlike the employee rows they
+  evidence no contract with us that outlives the customer, and the portal
+  accounts themselves go at offboarding (`docs/ropa.md`). Workspace closure
+  classifies the table under `vendor_users`, whose own guard blocks.
+- **No backfill**, as in §495.
+
+**Left open, honestly.** Whether the portal needs its own terms of use binding
+Supplier Users directly, and whether an acknowledgement kept through erasure
+fits a processor that is not the supplier's controller, are counsel's calls —
+tracked in `docs/followups.md`. Portal users who set a password before this
+are not asked until a portal re-prompt exists (the re-prompt entry there).
+
+**Rejected.** *The employee box (Terms + Privacy) on the portal*: makes a
+non-party "accept" a contract and, by §1, the Customer. *No record at all*:
+the Privacy Policy is written for suppliers and nothing showed it to them.
+*A control-plane row keyed by vendor-user id plus organisation*: the control
+plane would hold ids it cannot resolve or erase against, and the portal's
+auth never touches the control plane. *Reusing the `legal_acceptance_required`
+code*: its message asks for the Terms, which a supplier is not asked for.

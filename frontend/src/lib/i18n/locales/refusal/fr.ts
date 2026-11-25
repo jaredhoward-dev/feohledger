@@ -143,6 +143,7 @@ export const messages = {
 	'refusal.signupUnavailable': "La création d'espaces de travail est temporairement indisponible. Réessayez plus tard.",
 	'refusal.signupProvisioningFailed': "Un problème est survenu lors de la création de votre espace de travail. Contactez le support.",
 	'refusal.legalAcceptanceRequired': "Veuillez accepter les conditions d'utilisation et la politique de confidentialité en vigueur pour continuer.",
+	'refusal.privacyAcknowledgementRequired': "Veuillez confirmer que vous avez lu la politique de confidentialité en vigueur pour continuer.",
 	// The shared limiter's 429 (`services/rate_limit.py`, `rate_limited`): the wait,
 	// rounded up to the largest whole unit, never which limit tripped.
 	'refusal.rateLimitedSeconds': "Trop de tentatives. Patientez {n, plural, one {# seconde} other {# secondes}} avant de réessayer.",

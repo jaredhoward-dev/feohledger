@@ -41,6 +41,9 @@
 		expiredHint?: string;
 		/** The way out of a dead link (a link to forgot-password, or nothing). */
 		recovery?: Snippet;
+		/** The documents the accept box names: the Terms and Privacy Policy
+		 *  (employees), or the Privacy Policy alone (suppliers, decisions §499). */
+		legalDocuments?: 'terms_privacy' | 'privacy';
 		/** True once the page knows whether this is an invite (`mode=set`). */
 		setMode?: boolean;
 		idPrefix?: string;
@@ -53,6 +56,7 @@
 		signInHref,
 		expiredHint,
 		recovery,
+		legalDocuments = 'terms_privacy',
 		setMode = $bindable(false),
 		idPrefix = 'reset',
 		chrome
@@ -67,6 +71,9 @@
 	// The server refused a ticked box: this tab's bundled versions are stale.
 	let legalVersionsChanged = $state(false);
 	let legalBox: LegalAcceptCheckbox | undefined = $state();
+	let legalRequiredMessage = $derived(
+		m(legalDocuments === 'privacy' ? 'auth.legal.privacyAckRequired' : 'auth.legal.acceptRequired')
+	);
 	// `checking` until the token is read; `invalid` when it is unknown, used or
 	// expired; `ready` shows the form; `done` the confirmation.
 	// `unavailable` when the check itself failed (rate limit, outage) — the
@@ -156,7 +163,7 @@
 		// same rules and messages as /change-password (NewPasswordFields).
 		if (!newFields?.validate()) return;
 		if (legalRequired && !legalAccepted) {
-			legalError = m('auth.legal.acceptRequired');
+			legalError = legalRequiredMessage;
 			legalBox?.focus();
 			return;
 		}
@@ -191,7 +198,8 @@
 			} else if (
 				err instanceof ApiError &&
 				err.status === 422 &&
-				err.code === 'legal_acceptance_required'
+				(err.code === 'legal_acceptance_required' ||
+					err.code === 'privacy_acknowledgement_required')
 			) {
 				if (legalRequired && legalAccepted) {
 					// The box was ticked and still refused: the versions in force
@@ -203,7 +211,7 @@
 					// The box was never shown: show it now and say why.
 					legalRequired = true;
 					legalAccepted = false;
-					legalError = apiErrorMessage(err, m('auth.legal.acceptRequired'));
+					legalError = apiErrorMessage(err, legalRequiredMessage);
 				}
 				await tick();
 				legalBox?.focus();
@@ -257,6 +265,7 @@
 				<LegalAcceptCheckbox
 					bind:this={legalBox}
 					id="{idPrefix}-legal-accept"
+					documents={legalDocuments}
 					bind:checked={legalAccepted}
 					error={legalError}
 					versionsChanged={legalVersionsChanged}

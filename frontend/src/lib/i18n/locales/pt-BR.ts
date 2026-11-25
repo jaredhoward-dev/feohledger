@@ -3555,6 +3555,9 @@ export const messages = {
 	'auth.legal.acceptRequired': 'Marque a caixa para aceitar os termos de serviço e a política de privacidade.',
 	'auth.legal.versionsChanged': 'Os termos de serviço ou a política de privacidade mudaram depois que esta página foi carregada. Recarregue a página para ler e aceitar as versões vigentes.',
 	'auth.legal.reload': 'Recarregar página',
+	'auth.legal.privacyAckLabel': 'Li a {privacy}.',
+	'auth.legal.privacyAckRequired': 'Marque a caixa para confirmar que leu a política de privacidade.',
+	'auth.legal.privacyVersionsChanged': 'A política de privacidade mudou depois que esta página foi carregada. Recarregue a página para ler a versão vigente.',
 	'auth.signup.footerPre': 'Já tem um espaço de trabalho? Acesse ',
 	'auth.signup.footerPost': ' para entrar.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

@@ -3734,6 +3734,9 @@ export const en = {
 	'auth.legal.acceptRequired': 'Tick the box to accept the Terms of Service and Privacy Policy.',
 	'auth.legal.versionsChanged': 'The Terms of Service or Privacy Policy changed since this page loaded. Reload the page to read and accept the current versions.',
 	'auth.legal.reload': 'Reload page',
+	'auth.legal.privacyAckLabel': 'I have read the {privacy}.',
+	'auth.legal.privacyAckRequired': 'Tick the box to confirm you have read the Privacy Policy.',
+	'auth.legal.privacyVersionsChanged': 'The Privacy Policy changed since this page loaded. Reload the page to read the current version.',
 	'auth.signup.footerPre': 'Already have a workspace? Visit ',
 	'auth.signup.footerPost': ' to sign in.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

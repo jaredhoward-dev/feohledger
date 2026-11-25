@@ -1,6 +1,7 @@
 <script lang="ts">
 	import SetPasswordLink from '#lib/components/auth/SetPasswordLink.svelte';
 	import PortalAuthCard from '#lib/components/portal/PortalAuthCard.svelte';
+	import { ACKNOWLEDGED_PORTAL_VERSIONS } from '#lib/legal/acceptance.ts';
 	import { portalApi } from '#lib/portalApi.ts';
 	import { portalBrand } from '#lib/stores/portalBrand.svelte.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -10,7 +11,10 @@
 	// §283). Public — the token is the credential — and tenant-bound: the
 	// backend refuses a link minted for another tenant. The state machine is the
 	// employee reset page's (`SetPasswordLink`); the frame is the portal's own,
-	// so a white-label tenant's supplier never sees platform branding.
+	// so a white-label tenant's supplier never sees platform branding. An
+	// account with no password yet acknowledges our Privacy Policy here — the
+	// Privacy Policy alone, since a supplier is not a party to the Terms
+	// (decisions §499).
 	let setMode = $state(false);
 
 	const signInHref = (email: string) =>
@@ -28,10 +32,19 @@
 <SetPasswordLink
 	bind:setMode
 	idPrefix="portal-reset"
+	legalDocuments="privacy"
 	check={(token) =>
-		portalApi.post<{ email: string }>('/api/portal/auth/reset-password/check', { token })}
-	redeem={(token, new_password) =>
-		portalApi.post('/api/portal/auth/reset-password', { token, new_password })}
+		portalApi.post<{ email: string; legal_acceptance_required: boolean }>(
+			'/api/portal/auth/reset-password/check',
+			{ token }
+		)}
+	redeem={(token, new_password, accepted) =>
+		portalApi.post('/api/portal/auth/reset-password', {
+			token,
+			new_password,
+			// The Privacy Policy version the box named, once ticked (decisions §499).
+			...(accepted ? ACKNOWLEDGED_PORTAL_VERSIONS : {})
+		})}
 	{signInHref}
 	expiredHint={m('portal.resetPassword.expiredHint')}
 >

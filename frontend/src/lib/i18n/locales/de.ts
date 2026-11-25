@@ -3557,6 +3557,9 @@ export const messages = {
 	'auth.legal.acceptRequired': 'Setzen Sie das Häkchen, um die Nutzungsbedingungen und die Datenschutzerklärung zu akzeptieren.',
 	'auth.legal.versionsChanged': 'Die Nutzungsbedingungen oder die Datenschutzerklärung haben sich geändert, seit diese Seite geladen wurde. Laden Sie die Seite neu, um die aktuellen Fassungen zu lesen und zu akzeptieren.',
 	'auth.legal.reload': 'Seite neu laden',
+	'auth.legal.privacyAckLabel': 'Ich habe die {privacy} gelesen.',
+	'auth.legal.privacyAckRequired': 'Setzen Sie das Häkchen, um zu bestätigen, dass Sie die Datenschutzerklärung gelesen haben.',
+	'auth.legal.privacyVersionsChanged': 'Die Datenschutzerklärung hat sich geändert, seit diese Seite geladen wurde. Laden Sie die Seite neu, um die aktuelle Fassung zu lesen.',
 	'auth.signup.footerPre': 'Haben Sie bereits einen Arbeitsbereich? Besuchen Sie ',
 	'auth.signup.footerPost': ', um sich anzumelden.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's
