@@ -15,6 +15,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from app.services import erp_oauth
@@ -1097,3 +1098,94 @@ def test_the_discount_credit_refuses_before_writing(overrides, code):
     result = _run(qbo, lambda: _adapter().post_discount_credit(_credit(**overrides)))
     assert not result.success and result.refusal_code == code and result.not_posted
     assert not _bodies(qbo, "vendorcredit")
+
+
+# ---------------------------------------------------------------------------
+# decisions §582: what a failure says it left, and a recorded credit not ours
+
+
+def _failing(qbo: _Qbo, match, answer):
+    """Answer every call ``match(method, url)`` picks with ``answer`` (a
+    response, or an exception to raise) instead of the double's own."""
+    real = qbo.request
+
+    async def request(method, url, params=None, content=None, headers=None):
+        if match(method, url):
+            if isinstance(answer, BaseException):
+                qbo.calls.append({"method": method, "url": url, "params": params})
+                raise answer
+            return answer
+        return await real(method, url, params=params, content=content, headers=headers)
+
+    qbo.request = request
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [_resp(503, {}), httpx.ConnectError("down")],
+    ids=["bill_read_5xx", "network"],
+)
+def test_a_failure_before_the_credit_create_is_not_posted(answer):
+    """A transient failure reading the bill sent no create: ``not_posted``, so
+    the write-back drops its reservation and retries, instead of keeping a
+    ``credit_id: null`` record that stalls as "unidentified" (§582)."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    _failing(qbo, lambda m, u: m == "GET" and "/bill/" in u, answer)
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert not _bodies(qbo, "vendorcredit") and qbo.vendor_credits == {}
+
+
+def test_a_token_refresh_failure_before_the_create_is_not_posted():
+    qbo = _Qbo()
+    _discounted(qbo)
+    with patch.object(
+        QuickBooksOnlineAdapter,
+        "access_token",
+        AsyncMock(side_effect=erp_oauth.ErpTokenRefreshError("quickbooks_online", "unreachable")),
+    ):
+        result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert not _bodies(qbo, "vendorcredit")
+
+
+def test_a_create_whose_answer_is_lost_is_not_not_posted():
+    """Once the create is sent, a lost answer may stand in QuickBooks."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    _failing(
+        qbo,
+        lambda m, u: m == "POST" and u.endswith("/vendorcredit"),
+        httpx.ReadTimeout("lost"),
+    )
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and not result.not_posted
+
+
+def test_a_recorded_credit_that_is_not_ours_is_held_not_dropped_on_post():
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    qbo.fail_apply = False
+    qbo.vendor_credits["vc-1"]["PrivateNote"] = "someone else's credit"
+    retried = _run(qbo, lambda: _adapter().post_discount_credit(_credit(credit_id="vc-1")))
+    assert not retried.success and retried.refusal_code != BILL_PAYMENT_VOIDED
+    assert "discount_credit_not_ours" in retried.message and not retried.not_posted
+    assert retried.erp_document_id == failed.erp_document_id == "vc-1"
+    assert len(_bodies(qbo, "vendorcredit")) == 1
+
+
+def test_a_void_refuses_a_recorded_credit_that_is_not_ours():
+    """Before §582 a marker mismatch read as "gone", and the void reported
+    success over a credit it never deleted."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    qbo.vendor_credits["vc-1"]["PrivateNote"] = "someone else's credit"
+    result = _run(qbo, lambda: _adapter().void_discount_credit(_credit(credit_id="vc-1")))
+    assert not result.success and result.erp_document_id == "vc-1"
+    assert "discount_credit_not_ours" in result.message
+    assert "vc-1" in qbo.vendor_credits
