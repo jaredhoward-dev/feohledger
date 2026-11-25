@@ -26334,3 +26334,46 @@ shared selector a static scan reads completely. *Only excluding
 depending on each component remembering to reset it. *Drawing the selection
 with an `--accent-tint` fill*: muted text on it is under 4.5:1 in the dark
 theme (the reason the plan picker used a ring).
+
+## 517. The supplier help searches in place, through a scorer that takes its lists as arguments (round 42)
+
+**Problem.** `/portal/help` lists nine supplier guides and a ten-term glossary
+on one page with no search (`docs/followups.md`). The help centre's scorer,
+`searchHelp`, lived in `content.ts` and read `GUIDES` / `GLOSSARY` /
+`PAGE_HELP` directly, and the portal may not import `content.ts`: it would ship
+every employee guide to suppliers (§508).
+
+**Decision.**
+
+- **The scorer moves to `lib/help/search.ts`** and takes the guides, terms
+  and (optional) pages to search, plus a `pageLabel` for page titles and
+  unlabelled `[[page:…]]` links. It imports no content. `content.ts` keeps its
+  `searchHelp` export, now one call over the employee lists, so `/help/search`
+  is unchanged; `lib/help/portalSearch.ts` makes the same call over
+  `PORTAL_GUIDES`, `PORTAL_GLOSSARY` and `PORTAL_PAGES`.
+- **A portal term matches on its catalogue name and one-liner only.** That is
+  all the page shows, and the aliases and long text live in `glossary.ts`,
+  which the portal may not import either.
+- **The field filters the page in place**, best match first, rather than
+  opening a results page: there is one page of content and both of its lists
+  stay where the reader expects them. Filtering in the browser is right here,
+  unlike a list page's search (`frontend/docs/ui-patterns.md` § Search):
+  every guide is already in the bundle, so nothing can be hidden on a later
+  page. The count, or the no-match message, is an always-present
+  `role="status"` line; no match also offers **Clear search**. The text is
+  kept in `?q=` by `replaceState`, so a reload or a shared link keeps it
+  without a history entry per keystroke. The shared `SearchBox` gained an
+  optional `oninput` for this.
+- **The guard walks the import graph.** `search.test.ts` follows every static
+  runtime import from both `/portal/help` pages and fails if any reaches
+  `content.ts`, `glossary.ts`, `guides/` or `lifecycle.ts`. The older check
+  in `content.test.ts` reads only each file's own imports, so a component
+  that pulled one in would have passed it.
+
+**Rejected.** *Reusing `/help/search`'s results page*: it is behind the
+employee session, and a second results route for one page of content adds a
+navigation for nothing. *Copying the scorer into the portal*: two rankings
+that drift apart. *Moving the aliases into a light module so portal terms
+match them*: they are written for the AP team's vocabulary (ERP terms,
+abbreviations), and the gain for ten terms is small.
+

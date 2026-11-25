@@ -26,7 +26,9 @@ Content, all under `src/lib/help/`:
 | `glossary.ts` | Glossary ids, categories, the long English entries, aliases |
 | `pages.ts` | `PAGE_HELP` — one line + a guide per sidebar href |
 | `lifecycle.ts` | The invoice-lifecycle stages |
-| `content.ts` | Joins it all; search; `guidesForTerm` |
+| `content.ts` | Joins it all; `searchHelp` (the scorer over the employee lists); `guidesForTerm` |
+| `search.ts` | The search scorer, over whatever guides / terms / pages the caller passes — imports no content, so the supplier help can use it |
+| `portalSearch.ts` | `searchPortalHelp`: the scorer over `PORTAL_GUIDES` and `PORTAL_GLOSSARY` |
 | `routeHelp.ts`, `terms.ts` | The light lookups `PageHeader` / `HelpTip` use (see *Bundles* below); `terms.ts` also builds every term and guide href, per audience |
 | `navPages.ts` | The sidebar pages a `[[page:…]]` link is labelled from — its own module so `RichText` never imports `content.ts` |
 
@@ -119,9 +121,16 @@ the supplier guides and a short glossary on one page, and
   fails `content.test.ts` until it has a guide. Nine guides today: getting
   started, submit / resubmit, track to payment, bank details, card payments,
   invoice from a PO, early-payment offers, W-9 / W-8, invoice conversations.
-- **No search box yet.** `searchHelp` lives in `content.ts`, which the portal
-  may not import (above); the guides still fit one page. Tracked in
-  `docs/followups.md`.
+- **Search.** A search field at the top of `/portal/help` narrows the guides
+  and the glossary in place, best match first, through `portalSearch.ts` →
+  `search.ts` (the help centre's scorer, which takes its lists as arguments).
+  A term matches on its translated name and one-liner only — aliases and the
+  long text live in `glossary.ts`. The count (or the no-match message) is a
+  `role="status"` line that is always in the document; no match shows a
+  **Clear search** button. The text is kept in `?q=` (`replaceState`, one
+  history entry). Filtering in the browser is right here, unlike a list
+  page's search: every guide is already in the bundle. Reasoning:
+  `docs/decisions.md` §517.
 - **Writing one.** Check every step against the portal route it describes,
   the endpoint behind it in `backend/app/api/portal.py`, and
   `backend/docs/supplier-portal.md` (plus the feature's own doc) — suppliers
@@ -182,6 +191,13 @@ controls (`{ui:portal.…}`) needs `'portal'` added to that load —
   The **supplier portal help** block holds `PORTAL_GUIDES` to the same
   reference checks plus the portal-only rules above (coverage included), and
   pins that the portal help pages never import the employee guide index.
+- `src/lib/help/search.test.ts` — the scorer (`search.ts`) on its own and over
+  both callers' lists: `searchHelp` is the scorer over the employee content,
+  `searchPortalHelp` finds supplier guides and portal terms (and never an
+  employee one). It also walks the **whole static import graph** of both
+  `/portal/help` pages and fails if it reaches `content.ts`, `glossary.ts`,
+  `guides/` or `lifecycle.ts` — a direct-import check would miss a component
+  that pulls one in.
 - `src/lib/help/inline.test.ts` — the markup parser, the page-help lookup, anchors.
 - `tests-e2e/help/help-centre.spec.ts` — the pages render, search, the
   role-chips, a guide's open-page button, the PageHeader link, a HelpTip by
@@ -190,5 +206,7 @@ controls (`{ui:portal.…}`) needs `'portal'` added to that load —
 - `tests-e2e/portal/help.spec.ts` — a supplier reaches `/portal/help` from the
   nav, opens a guide, follows a term link to the portal glossary and the
   guide's open-page button; the purchase-order guide renders its row button's
-  label and opens `/portal/purchase-orders`. `tests-e2e/a11y/axe.spec.ts` scans the landing and
+  label and opens `/portal/purchase-orders`; the search field narrows the page,
+  announces its count, survives a reload via `?q=` and clears from its empty
+  state. `tests-e2e/a11y/axe.spec.ts` scans the landing and
   a guide; `tests-e2e/portal/reflow.spec.ts` checks both at 390px.

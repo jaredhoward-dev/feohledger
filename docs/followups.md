@@ -904,15 +904,6 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       **Durable fix:** a panel each in `/organization`, each with its own help
       guide step. **Trigger:** the first customer asking to change
       one, or SCIM onboarding for an enterprise tenant.
-- [ ] **(c) A search box on the supplier help.** `/portal/help` has nine
-      guides (decisions §508; round 41 added PO flip, early-payment offers,
-      W-9 / W-8 and invoice conversations) on one page with no search.
-      `searchHelp` lives in `content.ts`, which the portal may not import
-      (it pulls in every employee guide). **Durable fix:** move the scorer
-      into a light module that takes the guide and term lists, call it with
-      `PORTAL_GUIDES` / `PORTAL_GLOSSARY`, and add a search field to
-      `routes/portal/help/+page.svelte`. **Trigger:** the guide list no longer
-      fits one screen, or a support question a guide already answers.
 - [ ] **(c) A custom role can't be granted invoice entry.** Entry is a role
       list by design (decisions §248). **Durable fix:** if a customer needs a
       non-clerk preparer role, add a non-sensitive permission tier the
