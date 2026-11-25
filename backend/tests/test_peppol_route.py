@@ -8,13 +8,14 @@ route is on neither PUBLIC_BY_DESIGN nor ALTERNATE_AUTH.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date
 from decimal import Decimal
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.models.invoice import Invoice, InvoiceLineItem, InvoiceStatus
 from app.models.peppol_transmission import PeppolTransmission
@@ -363,3 +364,134 @@ async def test_transmissions_are_entity_scoped(realdb):
             headers={"X-Entity-ID": other_id},
         )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Send ↔ approval recall (decisions §573, §578): reserve → commit → call → record
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for_lock_waiter(mk, *, timeout: float = 15.0) -> bool:
+    """True once Postgres reports another backend in this tenant database
+    waiting on a lock — the server's own wait state, never a slept guess."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        async with mk() as s:
+            waiting = (
+                await s.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def _post_send(realdb, inv_id):
+    async with realdb.client(key="a", role="admin") as c:
+        return await c.post(f"/api/invoices/{inv_id}/peppol-send", json=_BODY)
+
+
+async def _post_recall(realdb, inv_id):
+    async with realdb.client(key="a", role="ap_manager") as c:
+        return await c.post(
+            f"/api/invoices/{inv_id}/recall-approval", json={"reason": "Amount keyed wrong"}
+        )
+
+
+async def _transmissions(mk, inv_id) -> list[PeppolTransmission]:
+    async with mk() as s:
+        return list(
+            (
+                await s.execute(
+                    select(PeppolTransmission).where(PeppolTransmission.invoice_id == inv_id)
+                )
+            ).scalars()
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_recall_during_the_transmit_sees_the_reservation_and_waits_on_no_lock(
+    realdb, monkeypatch
+):
+    """The send has committed its `sending` reservation and is out on the
+    network: the invoice's row lock is already released, so a recall neither
+    waits on the Access Point nor gets through — it reads the reservation and
+    refuses `invoice_recall_peppol_transmitted`."""
+    import app.services.peppol_adapters.mock_adapter as mock_mod
+
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed_invoice(mk, realdb.info("a").org_id)
+    on_the_wire, release = asyncio.Event(), asyncio.Event()
+    real_send = mock_mod.MockPeppolAdapter.send
+
+    async def _parked_send(self, request):
+        on_the_wire.set()
+        await release.wait()
+        return await real_send(self, request)
+
+    monkeypatch.setattr(mock_mod.MockPeppolAdapter, "send", _parked_send)
+    send_task = asyncio.create_task(_post_send(realdb, inv_id))
+    try:
+        await asyncio.wait_for(on_the_wire.wait(), timeout=15)
+        # Finishes while the transmit is still parked: no lock spans the network.
+        recall = await asyncio.wait_for(_post_recall(realdb, inv_id), timeout=15)
+    finally:
+        release.set()
+        sent = await send_task
+    assert recall.status_code == 409, recall.text
+    assert recall.json()["detail"]["code"] == "invoice_recall_peppol_transmitted"
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["status"] == "sent"
+    async with mk() as s:
+        assert (await s.get(Invoice, inv_id)).status == InvoiceStatus.approved
+
+
+@pytest.mark.asyncio
+async def test_a_recall_holding_the_lock_makes_the_queued_send_refuse(realdb, monkeypatch):
+    """The other order: the recall holds the invoice's row lock; the send
+    passes its unlocked pre-check, queues on the lock, then re-reads the status
+    the recall left and refuses — nothing is reserved or transmitted."""
+    import app.services.peppol_adapters.mock_adapter as mock_mod
+    from app.services import review
+
+    mk = realdb.sessionmaker("a")
+    inv_id = await _seed_invoice(mk, realdb.info("a").org_id)
+    lock_held, release = asyncio.Event(), asyncio.Event()
+    real_refusal = review.recall_refusal
+
+    async def _parked_refusal(*args, **kwargs):
+        verdict = await real_refusal(*args, **kwargs)
+        lock_held.set()  # the door locked the row before asking
+        await release.wait()
+        return verdict
+
+    sends = []
+    real_send = mock_mod.MockPeppolAdapter.send
+
+    async def _counting_send(self, request):
+        sends.append(request)
+        return await real_send(self, request)
+
+    monkeypatch.setattr(review, "recall_refusal", _parked_refusal)
+    monkeypatch.setattr(mock_mod.MockPeppolAdapter, "send", _counting_send)
+    recall_task = asyncio.create_task(_post_recall(realdb, inv_id))
+    try:
+        await asyncio.wait_for(lock_held.wait(), timeout=15)
+        send_task = asyncio.create_task(_post_send(realdb, inv_id))
+        queued = await _wait_for_lock_waiter(mk)
+    finally:
+        release.set()
+    recall, sent = await asyncio.gather(recall_task, send_task)
+    assert queued, "the send never queued behind the recall's row lock"
+    assert recall.status_code == 200, recall.text
+    assert sent.status_code == 422, sent.text
+    assert sent.json()["detail"] == "invoice_not_approved"
+    assert sends == []
+    assert await _transmissions(mk, inv_id) == []
