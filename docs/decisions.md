@@ -27391,3 +27391,76 @@ a voided-back `approved` invoice whose ERP shows `paid` is recorded and
 leaves the run nothing to pay; with a live card it is refused behind a
 blocking row; an `approved` invoice with no document is never read. The three
 in-flight hold tests assert the new code.
+
+## 537. A run's card leg counts what its card was charged; uncharged, it is in flight (§535 follow-up, round 45)
+
+**Problem.** A payment run's `virtual_card` leg books a `completed` `Payment`
+the moment the card is minted (`api/payments._execute_single_payment`), with a
+NULL `settled_amount`. The card webhook recorded the vendor's charge on the
+`VirtualCard` row only. `settlement_coverage` reads a NULL figure as `covered`
+— a deliberate fail-open for amount-free rails, which did move money — so the
+payment sync moved the invoice to `paid` at once, and an ERP `paid` (generic
+webhook or `erp-status-poll`) did the same. If the bill had in fact been paid
+in the ERP by someone else, the card was still spendable and nothing flagged
+it: a double payment hidden behind `paid` (§535's item 4). A card charged for
+less than the leg was likewise `paid` in full.
+
+**Root cause.** "`completed`" on a card leg means "card issued", and the one
+place the settled figure lives (`VirtualCard.amount_charged`) never reached the
+payment coverage reads. The data was dishonest at the source, and coverage had
+no way to tell "moved, figure unknown" from "nothing moved yet".
+
+**Decision.**
+
+1. **The charge is written onto the payment.** The card webhook's
+   authorization and settlement branches call
+   `payment_settlement_record.record_card_spend`, which stamps the run
+   payment's `settled_amount` / `settled_currency` from the card (the settled
+   figure replacing the authorized one), through `persistable_settled_amount`
+   like every rail. After the commit it re-dispatches the run's payment sync.
+   A card no run payment owns (`/cards/generate`) has nothing to write.
+2. **Coverage knows "not yet".** `settlement_coverage` gains a fourth state,
+   `in_flight`, taken only when `awaiting_card_spend` is set and no figure is
+   on record. `payment_settlement_record.payment_coverage(db, payment,
+   currency)` is the one async wrapper both money-moving callers use: for a
+   `virtual_card` payment with no figure it reads the card (`card_leg_card`:
+   the one naming the payment, else the invoice's unlinked one, charged
+   first) — uncharged or missing is `in_flight`, charged supplies
+   `amount_charged` as the figure (so rows charged before this change read
+   correctly without a backfill).
+3. **Each caller treats `in_flight` as the in-flight case it already had.**
+   `payment_erp_sync` skips the leg (released lock, counted `skipped`, as a
+   `submitted` ACH); the card webhook's re-dispatch moves it on.
+   `erp_status_report` takes §533's hold — one blocking
+   `payment_reconciliation`, `erp_paid_while_payment_in_flight`, kind
+   `paid_while_scheduled`, no transition — the same as no completed payment.
+   A full charge is `covered` → `paid`; a short one `short` → the
+   settled-short hold, and `/settlement/accept` is now offered on it.
+
+**Why not cancel the card on an ERP `paid`.** The generic route cannot tell an
+outside payment from a bookkeeper recording our own card payment (§535); a
+cancel on that guess could kill the only real payment, and a cancel is
+irreversible at the network. The blocking row puts the call before a person,
+whose exits — void the payment (which cancels the card provider-first) or
+resolve the row — already exist. **Why not leave the leg `processing` until
+the charge.** It is the more literal fix, but every reader of a card leg
+(converge, void, the run's status derivation, the payments list) keys on
+`completed`; changing the status is a migration-sized change to the money path
+for the same answer coverage now gives. **Why no migration.** The card already
+records the figure; `payment_coverage` reads it when the payment has none, so
+historical rows need no backfill.
+
+**Not changed.** `settlement_accept_refusal` stays synchronous and reads the
+payment only: an uncharged leg reads `covered` there and is refused, which is
+right (nothing to accept); a charged one carries its stamped figure.
+
+**Guard.** `tests/test_erp_status_report.py`: an uncharged run card leg
+(`created` / `sent` / `active`) + ERP `paid` is held behind one blocking
+`payment_reconciliation` with the card untouched; charged in full → `paid`;
+charged short → the settled-short hold with the shortfall.
+`tests/test_payment_erp_sync.py`: the uncharged leg is skipped and stays
+`payment_scheduled`; after `record_card_spend` a full charge reaches `paid`
+with the figure on the payment; a short charge holds and is acceptable.
+`tests/test_card_money_path_regression.py`: the signed webhook writes the
+authorized then the settled figure onto the run payment and dispatches the
+sync each time; a card no payment owns writes and dispatches nothing.

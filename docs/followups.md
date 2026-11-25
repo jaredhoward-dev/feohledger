@@ -1350,22 +1350,6 @@ user-visible halves still open.
 
 ### Surfaced by round 44 (2026-11-25, round PR #771, decisions §527–§535)
 
-- [ ] **(c) A run's card leg that was minted but not spent counts as paid
-      everywhere, so an ERP paid outside us leaves the card chargeable,
-      unflagged.** A payment run's virtual-card leg books a `completed`
-      `Payment` with a NULL `settled_amount`; `settlement_coverage` reads an
-      unreported settlement as covering (fail-open), so the payment sync and an
-      ERP `paid` report (generic webhook, `erp-status-poll`) both move the
-      invoice to `paid`. If the bill was in fact paid in the ERP by someone
-      else, the live card can still be charged by the supplier and nothing
-      flags it (decisions §535). **Durable fix:** coverage treats a card leg
-      with no spend recorded as in flight (so an ERP `paid` takes the
-      §533 in-flight hold), or an ERP `paid` for an invoice with a live run
-      card cancels the card (or opens a blocking row naming it) before the
-      invoice moves. **Trigger:** the next change to card settlement or
-      `settlement_coverage`, the first card-rail tenant on a generic ERP, or
-      any report of a card charged after the bill was paid in the ERP.
-
 ### Surfaced by round 12 (2026-11-15, round PR #716, decisions §410–§421)
 
 

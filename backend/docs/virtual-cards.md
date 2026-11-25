@@ -78,8 +78,8 @@ Vendor Charges Card              (at their payment terminal or online)
     |
     v
 Charge Posts                     (webhook from card provider)
-    - Payment status → completed
-    - Invoice status → paid
+    - Charged figure → the run payment's settled_amount
+    - Payment sync re-run → invoice paid (or held short)
     - Rebate earned → tracked
     |
     v
@@ -1056,7 +1056,16 @@ with no provider, `cards.region`) drops the sealed card secrets, audited
    cross-provider token collision is independently negligible),
 3. verifies the HMAC (`verify_hmac_sha256`) — missing/forged signature is rejected,
 4. dedupes by `event_id` (`is_event_already_processed`, Redis `SET NX`) so a re-delivery is a no-op,
-5. applies the state change + writes the audit row in a single committed transaction.
+5. applies the state change + writes the audit row in a single committed transaction,
+6. on a charge (authorization, then settlement) of a card a run's
+   `virtual_card` payment owns, writes the charged figure onto that payment's
+   `settled_amount` / `settled_currency` in the same transaction and, after the
+   commit, re-dispatches the run's payment sync. The run marks that payment
+   `completed` at mint, but until this charge the coverage check reads the leg
+   as `in_flight`: the invoice stays `payment_scheduled` and an ERP `paid`
+   report is held behind a blocking row rather than closing it while the card
+   is still spendable (decisions §537; `backend/docs/payments.md` § A run's
+   card leg counts what its card was charged).
 
 **Event classification (`_classify_card_event`)** decides whether a callback
 is a charging authorization or a settlement by substring, but excludes the
