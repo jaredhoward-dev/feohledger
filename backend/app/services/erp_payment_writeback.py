@@ -297,18 +297,26 @@ async def write_back_payment(
     correlation = invoice.correlation_id or payment.correlation_id or invoice.id
     credit_payload: DiscountCreditPayload | None = None
     credit: ErpPostResult | None = None
+    held = False
+    # A credit an earlier attempt left standing (decisions §577) is THE credit
+    # for this payment: a re-run (manual sync, a webhook re-dispatch) finishes
+    # that one by its recorded id and amount, never books a second (§579).
+    recorded = _pending_record(await _state_data(db, invoice.id), payment.id)
     try:
         payload = await build_payment_payload(
             db, payment=payment, invoice=invoice, bill_id=bill_id, erp_config=erp_config
         )
         if getattr(adapter, "supports_discount_credit", False) is True:
-            credit_payload = await build_discount_credit_payload(
-                db,
-                payment=payment,
-                invoice=invoice,
-                payment_payload=payload,
-                erp_config=erp_config,
-            )
+            if recorded is not None:
+                credit_payload = _payload_from_marker(str(payment.id), recorded)
+            else:
+                credit_payload = await build_discount_credit_payload(
+                    db,
+                    payment=payment,
+                    invoice=invoice,
+                    payment_payload=payload,
+                    erp_config=erp_config,
+                )
         # End the read transaction: no connection is held open across the ERP
         # call (the caller's session does not expire rows on commit).
         await db.commit()
@@ -318,12 +326,12 @@ async def write_back_payment(
     if result.success and credit_payload is not None:
         # Only after our payment stands on the bill: the credit is capped by
         # what the bill still has open AFTER it (the adapter refuses more).
-        try:
-            credit = await adapter.post_discount_credit(credit_payload)
-        except Exception as exc:  # noqa: BLE001 — an adapter bug is a failed credit
-            credit = ErpPostResult(
-                success=False, message=f"discount credit error: {exc.__class__.__name__}"
-            )
+        if recorded is None:
+            credit = await _call_credit(adapter, credit_payload)
+        elif await _claim_record(db, invoice.id, payment.id) is not None:
+            credit, held = await _call_recorded_credit(adapter, credit_payload, completed=True)
+        else:
+            credit_payload = None  # another process holds this record's claim
 
     try:
         if result.success:
@@ -348,43 +356,24 @@ async def write_back_payment(
             )
             balance_after = result.bill_balance_after
             credit_refusal = None
+            kept: dict | None = None
             if credit is not None:
                 credit_refusal = _refusal(credit)
-                await dispatch_audit(
-                    db,
-                    correlation_id=correlation,
-                    organization_id=invoice.organization_id,
-                    actor_id=None,
-                    action=(
-                        "payment.erp_discount_credit_posted"
-                        if credit.success
-                        else "payment.erp_discount_credit_failed"
-                    ),
-                    entity_type="payment",
-                    entity_id=payment.id,
-                    details={
-                        "erp_type": adapter.erp_type,
-                        "bill_id": bill_id,
-                        "erp_document_id": credit.erp_document_id,
-                        "discount_amount": str(credit_payload.amount),
-                        "currency": credit_payload.currency,
-                        **({} if credit.success else {"error": credit.message}),
-                        **({"refusal": credit_refusal} if credit_refusal else {}),
-                    },
-                )
                 if credit.success and credit.bill_balance_after is not None:
                     balance_after = credit.bill_balance_after
                 # A credit that may stand in the ERP (created, its application
-                # failed or unconfirmed) is recorded so the sweep applies THAT
-                # one and nobody books a second (decisions §577).
-                credit_pending = not credit.success and not credit.not_posted
-                await _set_pending_credit(
+                # failed or unconfirmed) stays recorded so the sweep finishes
+                # THAT one and nobody books a second (decisions §577, §579).
+                kept = await _record_credit_outcome(
                     db,
-                    invoice.id,
+                    adapter,
+                    invoice,
                     payment.id,
-                    _credit_marker(credit_payload, credit.erp_document_id)
-                    if credit_pending
-                    else None,
+                    credit_payload,
+                    credit,
+                    prior=recorded,
+                    held=held,
+                    payment_run_id=payment.payment_run_id,
                 )
             if balance_after is not None and balance_after > 0:
                 await open_erp_reconciliation_exception(
@@ -430,9 +419,9 @@ async def write_back_payment(
                         **(
                             {
                                 "discount_credit_pending": True,
-                                "discount_credit_document_id": credit.erp_document_id,
+                                "discount_credit_document_id": kept.get("credit_id"),
                             }
-                            if credit is not None and not credit.success and not credit.not_posted
+                            if kept is not None
                             else {}
                         ),
                     ),
@@ -630,24 +619,9 @@ def _payload_from_marker(payment_id: str, marker: dict) -> DiscountCreditPayload
     )
 
 
-async def _set_map_entry(
-    db: AsyncSession, invoice_id: uuid.UUID, key: str, payment_id: uuid.UUID, value
-) -> None:
-    """Set (or, with ``value`` None, drop) ``state_data[key][payment_id]``
-    under the instance's row lock. Never commits."""
-    from sqlalchemy import select
-
-    from app.models.workflow import WorkflowInstance
-
-    instance = (
-        await db.execute(
-            select(WorkflowInstance)
-            .where(WorkflowInstance.invoice_id == invoice_id)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if instance is None:
-        return
+def _write_entry(instance, key: str, payment_id: uuid.UUID, value) -> None:
+    """Set (or, with ``value`` None, drop) ``state_data[key][payment_id]`` on a
+    locked instance."""
     state = dict(instance.state_data or {})
     entries = dict(state.get(key) or {})
     if value is None:
@@ -663,25 +637,345 @@ async def _set_map_entry(
     instance.state_data = state
 
 
+async def _lock_instance(db: AsyncSession, invoice_id: uuid.UUID):
+    """The invoice's workflow instance under its row lock, read fresh."""
+    from sqlalchemy import select
+
+    from app.models.workflow import WorkflowInstance
+
+    return (
+        await db.execute(
+            select(WorkflowInstance)
+            .where(WorkflowInstance.invoice_id == invoice_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
+async def _set_map_entry(
+    db: AsyncSession, invoice_id: uuid.UUID, key: str, payment_id: uuid.UUID, value
+) -> None:
+    """Set (or, with ``value`` None, drop) ``state_data[key][payment_id]``
+    under the instance's row lock. Never commits."""
+    instance = await _lock_instance(db, invoice_id)
+    if instance is not None:
+        _write_entry(instance, key, payment_id, value)
+
+
 async def _set_pending_credit(
     db: AsyncSession, invoice_id: uuid.UUID, payment_id: uuid.UUID, marker: dict | None
 ) -> None:
     await _set_map_entry(db, invoice_id, PENDING_CREDITS_KEY, payment_id, marker)
 
 
+#: Attempts at one recorded discount credit (write-back re-runs and sweep
+#: passes together) before nothing calls the ERP for it again: 12, three days
+#: at the default six-hour status-sync interval. The record and its flag stay
+#: for a person (decisions §579).
+MAX_CREDIT_ATTEMPTS = 12
+#: How long one process's claim on a recorded credit holds off every other
+#: (the sweep's tick, ``sync_org_now``, a write-back re-run): longer than one
+#: attempt's ERP calls can take (a handful of 15–30 s requests). A claim left
+#: by a process that died lapses after it (decisions §579).
+CREDIT_CLAIM_SECONDS = 300
+#: ``erp_report["kind"]`` of the row a recorded credit opens when FeohLedger
+#: cannot finish it alone: no known id, or the attempts cap reached (§579).
+ERP_REPORT_DISCOUNT_CREDIT_STALLED = "discount_credit_stalled"
+#: The failure message's code when a recorded credit's id is unknown and the
+#: ERP lookup did not find it: nothing is created over it (§579).
+DISCOUNT_CREDIT_UNIDENTIFIED = "discount_credit_unidentified"
+
+
+def _pending_record(state: dict | None, payment_id) -> dict | None:
+    record = ((state or {}).get(PENDING_CREDITS_KEY) or {}).get(str(payment_id))
+    return dict(record) if isinstance(record, dict) else None
+
+
+def _claim_live(record: dict, now) -> bool:
+    from datetime import datetime
+
+    until = record.get("claimed_until")
+    if not until:
+        return False
+    try:
+        return datetime.fromisoformat(str(until)) > now
+    except ValueError:
+        return False
+
+
+async def _payment_row(db: AsyncSession, payment_id: uuid.UUID):
+    """``(status, payment_run_id)`` of the payment, or ``(None, None)``."""
+    from sqlalchemy import select
+
+    row = (
+        await db.execute(
+            select(Payment.status, Payment.payment_run_id).where(Payment.id == payment_id)
+        )
+    ).one_or_none()
+    return (row[0], row[1]) if row else (None, None)
+
+
+async def _claim_record(
+    db: AsyncSession, invoice_id: uuid.UUID, payment_id: uuid.UUID
+) -> tuple[dict | None, str | None]:
+    """Phase one of an attempt at a recorded credit: under the instance's row
+    lock, re-read the record and the payment, and claim the record for
+    :data:`CREDIT_CLAIM_SECONDS` — committed, so no lock is held across the
+    ERP call. ``(None, status)`` when there is nothing to do here: no record,
+    another process's live claim, the attempts cap reached, or a payment no
+    longer ``completed`` whose credit id is known (its void reverses it by
+    that id). Commits; never rolls back (a rollback would expire the caller's
+    loaded rows)."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    instance = await _lock_instance(db, invoice_id)
+    record = _pending_record(instance.state_data if instance else None, payment_id)
+    status, _run = await _payment_row(db, payment_id)
+    if (
+        record is None
+        or record.get("exhausted")
+        or _claim_live(record, now)
+        or (status != "completed" and record.get("credit_id"))
+    ):
+        await db.commit()
+        return None, status
+    until = (now + timedelta(seconds=CREDIT_CLAIM_SECONDS)).isoformat()
+    _write_entry(instance, PENDING_CREDITS_KEY, payment_id, {**record, "claimed_until": until})
+    await db.commit()
+    return record, status
+
+
+async def _call_credit(adapter: ErpAdapter, payload: DiscountCreditPayload) -> ErpPostResult:
+    try:
+        return await adapter.post_discount_credit(payload)
+    except Exception as exc:  # noqa: BLE001 — an adapter bug is a failed credit
+        return ErpPostResult(
+            success=False,
+            erp_document_id=payload.credit_id,
+            message=f"discount credit error: {exc.__class__.__name__}",
+        )
+
+
+async def _call_recorded_credit(
+    adapter: ErpAdapter, payload: DiscountCreditPayload, *, completed: bool
+) -> tuple[ErpPostResult, bool]:
+    """One attempt at a RECORDED credit, which never creates one: with no
+    known id the ERP is asked for ours by a lookup that can only say "found"
+    on a positive match (QuickBooks: through the bill's applying BillPayment;
+    Xero: by our ``CreditNoteNumber``, checked on our side). Not found is NOT
+    proof that none stands — the create's answer was lost — so the record is
+    held and a person told (``held`` True), never re-created on a provider's
+    unconfirmed request-key replay (decisions §579). For a payment no longer
+    ``completed`` the lookup only finds the id, for its void."""
+    if not payload.credit_id:
+        try:
+            found = await adapter.find_discount_credit(payload)
+        except Exception as exc:  # noqa: BLE001 — unreadable: try again next pass
+            return (
+                ErpPostResult(
+                    success=False,
+                    message=f"discount credit lookup failed: {exc.__class__.__name__}",
+                ),
+                False,
+            )
+        if not found:
+            return (
+                ErpPostResult(
+                    success=False,
+                    message=f"{adapter.erp_type} post failed: {DISCOUNT_CREDIT_UNIDENTIFIED}",
+                ),
+                True,
+            )
+        payload.credit_id = str(found)
+    if not completed:
+        return (
+            ErpPostResult(
+                success=False,
+                erp_document_id=payload.credit_id,
+                message=f"{adapter.erp_type} post failed: payment_not_completed",
+            ),
+            False,
+        )
+    return await _call_credit(adapter, payload), False
+
+
+async def _record_credit_outcome(
+    db: AsyncSession,
+    adapter: ErpAdapter,
+    invoice: Invoice,
+    payment_id: uuid.UUID,
+    payload: DiscountCreditPayload,
+    credit: ErpPostResult,
+    *,
+    prior: dict | None,
+    held: bool,
+    payment_run_id: uuid.UUID | None = None,
+) -> dict | None:
+    """Phase two of a credit attempt, under the instance's row lock: record
+    what the attempt left, audit it when its outcome changed, and flag what a
+    person must finish. Never commits. Returns the record kept (None = none).
+
+    * The payment is re-read under the lock: a void that committed while the
+      ERP was called has already run (or is about to run) its reversal without
+      this credit, so a credit id now held is written to
+      :data:`PENDING_VOID_CREDITS_KEY` and the payment's void re-armed in
+      :data:`PENDING_VOIDS_KEY` — the credit is reversed, never left applied
+      to the bill of a voided payment (decisions §579).
+    * The record is dropped only on a confirmed outcome: the credit applied,
+      or ours refused ``bill_payment_voided`` (someone decided in the ERP). A
+      refusal before any write (``not_posted``) keeps an earlier record: the
+      credit that attempt recorded still stands.
+    * A record with no known id, or one at :data:`MAX_CREDIT_ATTEMPTS`, opens
+      the ``discount_credit_stalled`` flag (deduped by kind).
+    """
+    from datetime import datetime
+
+    from app.services.erp_adapters.base import BILL_PAYMENT_VOIDED
+
+    now = datetime.now(UTC)
+    instance = await _lock_instance(db, invoice.id)
+    if instance is None:
+        return None
+    base = _pending_record(instance.state_data, payment_id) or prior
+    status, run_id = await _payment_row(db, payment_id)
+    run_id = run_id or payment_run_id
+    gone = credit.refusal_code == BILL_PAYMENT_VOIDED
+    credit_id = credit.erp_document_id or payload.credit_id or (base or {}).get("credit_id")
+    may_stand = not gone and (credit.success or not credit.not_posted or base is not None)
+    rearmed = False
+    if status != "completed" and may_stand and credit_id:
+        voids = [str(p) for p in (instance.state_data or {}).get(PENDING_VOIDS_KEY) or []]
+        if str(payment_id) not in voids:
+            voids.append(str(payment_id))
+        instance.state_data = {**(instance.state_data or {}), PENDING_VOIDS_KEY: voids}
+        _write_entry(instance, PENDING_VOID_CREDITS_KEY, payment_id, str(credit_id))
+        kept = None
+        rearmed = True
+        outcome = "void_rearmed"
+    elif credit.success and status == "completed":
+        kept, outcome = None, "posted"
+    elif gone or not may_stand:
+        kept = None
+        outcome = credit.refusal_code or "not_posted"
+    else:
+        attempts = int((base or {}).get("attempts") or 0) + 1
+        if held:
+            outcome = DISCOUNT_CREDIT_UNIDENTIFIED
+        else:
+            outcome = credit.refusal_code or credit.message or "failed"
+        kept = {
+            **_credit_marker(payload, credit_id),
+            "attempts": attempts,
+            "last_attempt": now.isoformat(),
+            "outcome": outcome,
+            **({"exhausted": True} if attempts >= MAX_CREDIT_ATTEMPTS else {}),
+        }
+    _write_entry(instance, PENDING_CREDITS_KEY, payment_id, kept)
+
+    newly_exhausted = bool(kept and kept.get("exhausted") and not (base or {}).get("exhausted"))
+    changed = base is None or base.get("outcome") != outcome or newly_exhausted
+    if credit.success or changed:
+        refusal = _refusal(credit)
+        await dispatch_audit(
+            db,
+            correlation_id=invoice.correlation_id or invoice.id,
+            organization_id=invoice.organization_id,
+            actor_id=None,
+            action=(
+                "payment.erp_discount_credit_posted"
+                if credit.success
+                else "payment.erp_discount_credit_failed"
+            ),
+            entity_type="payment",
+            entity_id=payment_id,
+            details={
+                "erp_type": adapter.erp_type,
+                "bill_id": payload.bill_id,
+                "erp_document_id": credit_id,
+                "discount_amount": str(payload.amount),
+                "currency": payload.currency,
+                **({"retry": True} if prior is not None else {}),
+                **({} if credit.success else {"error": credit.message}),
+                **({"refusal": refusal} if refusal else {}),
+                **({"attempts": kept["attempts"]} if kept else {}),
+                **({"retries_exhausted": True} if newly_exhausted else {}),
+                **({"void_rearmed": True} if rearmed else {}),
+            },
+        )
+    if kept is not None and (kept.get("credit_id") is None or kept.get("exhausted")):
+        await _open_stalled_flag(
+            db,
+            adapter,
+            invoice,
+            payment_id,
+            run_id,
+            payload.bill_id,
+            kept.get("credit_id"),
+            reason="retries_exhausted" if kept.get("exhausted") else "unidentified",
+            attempts=kept.get("attempts"),
+        )
+    return kept
+
+
+async def _open_stalled_flag(
+    db: AsyncSession,
+    adapter: ErpAdapter,
+    invoice: Invoice,
+    payment_id: uuid.UUID,
+    run_id: uuid.UUID | None,
+    bill_id: str,
+    credit_id: str | None,
+    *,
+    reason: str,
+    attempts: int | None = None,
+) -> None:
+    """The person-facing flag for a credit FeohLedger will not finish alone.
+    Not payment-blocking (``erp_reconciliation``): the payment it belongs to
+    has already moved, and a stray credit is an ERP bookkeeping fix — holding
+    a re-pay of the bill for it would delay the supplier for nothing the
+    re-pay's own write-back does not already check (decisions §579)."""
+    await open_erp_reconciliation_exception(
+        db,
+        invoice,
+        org_id=invoice.organization_id,
+        finding=erp_finding("erp_discount_credit_stalled", adapter.erp_type),
+        erp_report=_writeback_report(
+            ERP_REPORT_DISCOUNT_CREDIT_STALLED,
+            erp_type=adapter.erp_type,
+            payment_id=payment_id,
+            payment_run_id=run_id,
+            bill_id=bill_id,
+            reason=reason,
+            # What to look for in the ERP: QuickBooks' PrivateNote, Xero's
+            # CreditNoteNumber (decisions §575).
+            discount_credit_marker=f"FeohLedger discount {payment_id}",
+            discount_credit_document_id=credit_id,
+            attempts=attempts,
+        ),
+    )
+
+
 async def resume_pending_credits(org) -> int:
-    """Apply every discount credit a write-back left standing unapplied
-    (decisions §577), through the adapter's own path with the recorded credit
-    id. Called per org by the status-sync sweep. Returns how many are still
-    pending afterwards. A payment no longer ``completed`` is left to its void,
-    which reverses the credit; a credit someone deleted in the ERP is dropped
-    with an audited failure, never re-created."""
+    """Finish every discount credit a write-back left standing unapplied
+    (decisions §577, §579). Called per org by the status-sync sweep. Returns
+    how many are still recorded afterwards.
+
+    Two-phase, per record (``docs/background-sweeps.md`` § Locking): the
+    candidate records are read unlocked; each is then claimed under the
+    instance's row lock (:func:`_claim_record`), the ERP is called with no
+    lock held, and the outcome is written under the lock again
+    (:func:`_record_credit_outcome`), which re-reads the payment. A recorded
+    credit is never created again: one with a known id is applied by that id
+    (one deleted or no longer ours is dropped, audited), one with none is
+    looked up and otherwise held for a person. A payment no longer
+    ``completed`` is left to its void when the id is known."""
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database import get_tenant_engine
     from app.models.workflow import WorkflowInstance
-    from app.services.erp_adapters.base import BILL_PAYMENT_VOIDED
 
     found = await _org_adapter(org.id)
     if found is None:
@@ -694,69 +988,53 @@ async def resume_pending_credits(org) -> int:
     async with factory() as db:
         rows = (
             await db.execute(
-                select(WorkflowInstance.invoice_id, WorkflowInstance.state_data).where(
-                    WorkflowInstance.state_data.has_key(PENDING_CREDITS_KEY)
-                )
+                select(WorkflowInstance.invoice_id, WorkflowInstance.state_data)
+                .where(WorkflowInstance.state_data.has_key(PENDING_CREDITS_KEY))
+                .order_by(WorkflowInstance.invoice_id)
             )
         ).all()
-        await db.rollback()
-        for invoice_id, state in rows:
-            for payment_id, marker in dict((state or {}).get(PENDING_CREDITS_KEY) or {}).items():
-                status = (
-                    await db.execute(
-                        select(Payment.status).where(Payment.id == uuid.UUID(payment_id))
-                    )
-                ).scalar_one_or_none()
-                await db.rollback()
-                if status != "completed":
-                    continue  # its void reverses the credit (by this id)
-                payload = _payload_from_marker(payment_id, marker)
-                try:
-                    credit = await adapter.post_discount_credit(payload)
-                except Exception as exc:  # noqa: BLE001 — an adapter bug is a failed retry
-                    credit = ErpPostResult(
-                        success=False, message=f"discount credit error: {exc.__class__.__name__}"
-                    )
-                invoice = await db.get(Invoice, invoice_id)
-                refusal = _refusal(credit)
-                gone = credit.refusal_code == BILL_PAYMENT_VOIDED
-                if credit.success or gone:
-                    await _set_pending_credit(db, invoice_id, uuid.UUID(payment_id), None)
-                elif credit.erp_document_id and credit.erp_document_id != marker.get("credit_id"):
-                    await _set_pending_credit(
-                        db,
-                        invoice_id,
-                        uuid.UUID(payment_id),
-                        {**marker, "credit_id": credit.erp_document_id},
-                    )
-                if invoice is not None:
-                    await dispatch_audit(
-                        db,
-                        correlation_id=invoice.correlation_id or invoice.id,
-                        organization_id=invoice.organization_id,
-                        actor_id=None,
-                        action=(
-                            "payment.erp_discount_credit_posted"
-                            if credit.success
-                            else "payment.erp_discount_credit_failed"
-                        ),
-                        entity_type="payment",
-                        entity_id=uuid.UUID(payment_id),
-                        details={
-                            "erp_type": adapter.erp_type,
-                            "bill_id": payload.bill_id,
-                            "erp_document_id": credit.erp_document_id or payload.credit_id,
-                            "discount_amount": str(payload.amount),
-                            "currency": payload.currency,
-                            "retry": True,
-                            **({} if credit.success else {"error": credit.message}),
-                            **({"refusal": refusal} if refusal else {}),
-                        },
-                    )
-                await db.commit()
-                if not (credit.success or gone):
+        await db.commit()
+        candidates = [
+            (invoice_id, uuid.UUID(payment_id))
+            for invoice_id, state in rows
+            for payment_id in sorted((state or {}).get(PENDING_CREDITS_KEY) or {})
+        ]
+        for invoice_id, payment_id in candidates:
+            try:
+                if await _resume_one_credit(db, adapter, invoice_id, payment_id):
                     left += 1
+            except Exception as exc:  # noqa: BLE001 — one record never stops the rest
+                await db.rollback()
+                left += 1
+                logger.warning(
+                    "[payment-writeback] discount credit retry failed for payment %s: %s",
+                    payment_id,
+                    exc.__class__.__name__,
+                )
     return left
+
+
+async def _resume_one_credit(
+    db: AsyncSession, adapter: ErpAdapter, invoice_id: uuid.UUID, payment_id: uuid.UUID
+) -> bool:
+    """One recorded credit, claimed, attempted and recorded. Returns whether a
+    record is still there afterwards."""
+    record, status = await _claim_record(db, invoice_id, payment_id)
+    if record is None:
+        state = await _state_data(db, invoice_id)
+        await db.commit()
+        return _pending_record(state, payment_id) is not None
+    payload = _payload_from_marker(str(payment_id), record)
+    credit, held = await _call_recorded_credit(adapter, payload, completed=status == "completed")
+    invoice = await db.get(Invoice, invoice_id)
+    if invoice is None:
+        await db.commit()
+        return False
+    kept = await _record_credit_outcome(
+        db, adapter, invoice, payment_id, payload, credit, prior=record, held=held
+    )
+    await db.commit()
+    return kept is not None
 
 
 async def record_pending_erp_void(db: AsyncSession, *, invoice: Invoice, payment: Payment) -> bool:
@@ -771,8 +1049,17 @@ async def record_pending_erp_void(db: AsyncSession, *, invoice: Invoice, payment
 
     if payment.provider == EXTERNAL_PAYMENT_PROVIDER:
         return False  # never written back (payment_erp_sync skips them)
+    # Under the instance's row lock, read fresh: a discount-credit attempt
+    # records its outcome under the same lock and re-reads the payment there,
+    # so either it sees this void (and re-arms it with the credit it holds) or
+    # this void sees its record — never a lost write between them (§579).
     instance = (
-        await db.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id == invoice.id))
+        await db.execute(
+            select(WorkflowInstance)
+            .where(WorkflowInstance.invoice_id == invoice.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one_or_none()
     state = dict((instance.state_data if instance else None) or {})
     # A mock bill is never written back (``bill_for_writeback`` reads the
@@ -951,10 +1238,41 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                     ),
                 },
             )
+            unidentified = False
             if result.success:
-                await _clear_pending(db, invoice_id, payment_id)
-                await _set_map_entry(db, invoice_id, PENDING_VOID_CREDITS_KEY, payment_id, None)
-                await _set_pending_credit(db, invoice_id, payment_id, None)
+                # Compare, then clear, under the lock: a credit attempt that
+                # ran while this void was calling the ERP may have re-armed it
+                # with a credit this pass never saw — that one stays pending
+                # for the next pass. A recorded credit with no known id that
+                # nothing found may still stand: it stays recorded and flagged,
+                # and the void does not report success over it (§579).
+                instance = await _lock_instance(db, invoice_id)
+                current = dict((instance.state_data if instance else None) or {})
+                rearmed = (current.get(PENDING_VOID_CREDITS_KEY) or {}).get(str(payment_id))
+                record_now = _pending_record(current, payment_id)
+                if instance is not None and not (rearmed and rearmed != credit_id):
+                    await _clear_pending(db, invoice_id, payment_id)
+                    _write_entry(instance, PENDING_VOID_CREDITS_KEY, payment_id, None)
+                    unidentified = (
+                        credit is not None
+                        and not credit_id
+                        and record_now is not None
+                        and not record_now.get("credit_id")
+                    )
+                    if not unidentified:
+                        _write_entry(instance, PENDING_CREDITS_KEY, payment_id, None)
+                if unidentified:
+                    await _open_stalled_flag(
+                        db,
+                        adapter,
+                        invoice,
+                        payment_id,
+                        run_id,
+                        bill_id,
+                        None,
+                        reason="unidentified",
+                        attempts=record_now.get("attempts"),
+                    )
             else:
                 await open_erp_reconciliation_exception(
                     db,
@@ -983,7 +1301,7 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                     ),
                 )
             await db.commit()
-            return WROTE if result.success else FAILED
+            return WROTE if result.success and not unidentified else FAILED
     except Exception as exc:  # noqa: BLE001 — best-effort, after the void committed
         logger.warning(
             "[payment-writeback] void write-back failed for payment %s: %s",

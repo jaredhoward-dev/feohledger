@@ -1015,6 +1015,20 @@ def test_a_credit_created_but_not_applied_is_applied_once_on_retry():
     assert bill["Balance"] == 0
 
 
+def test_an_unapplied_credit_is_not_found_through_the_bill():
+    """Why a recorded credit with no known id goes to a person (decisions
+    §579): ``find_discount_credit`` reads the bill's applying BillPayments, so
+    a VendorCredit whose create answer was lost and that nothing applied is
+    never found there — a miss is not proof none stands, and the write-back
+    holds the record rather than create again."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert failed.erp_document_id == "vc-1" and "vc-1" in qbo.vendor_credits
+    assert _run(qbo, lambda: _adapter().find_discount_credit(_credit())) is None
+
+
 def test_a_recorded_credit_someone_deleted_is_not_booked_again():
     qbo = _Qbo()
     _discounted(qbo)
