@@ -14,6 +14,7 @@ import 'package:feohledger_mobile/screens/payment_queue_screen.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/payment_queue_store.dart';
+import 'package:feohledger_mobile/utils/dates.dart';
 
 /// Wraps a screen in a MaterialApp carrying the localization delegates so
 /// `AppLocalizations.of(context)` resolves (defaults to English).
@@ -291,6 +292,44 @@ void main() {
     // Two queue rows -> two vendor names rendered.
     expect(find.text('Vendor 1'), findsOneWidget);
     expect(find.text('Vendor 2'), findsOneWidget);
+  });
+
+  // `due_date` is the effective date (decisions §565); a row whose payment
+  // schedule moved it also says the invoice's own date, on screen and in the
+  // row's announcement, and a row whose two dates agree says nothing extra.
+  testWidgets('a rescheduled row says the date it moved from', (tester) async {
+    await loginThen(
+      ['ap_manager'],
+      _screenClient(
+        queue: [
+          {
+            ..._queueItem('1'),
+            'due_date': '2026-02-10',
+            'own_due_date': '2026-02-01',
+          },
+          {
+            ..._queueItem('2'),
+            'due_date': '2026-02-01',
+            'own_due_date': '2026-02-01',
+          },
+        ],
+      ),
+    );
+
+    await tester.pumpWidget(_localized(const PaymentQueueScreen()));
+    await _pumpUntil(tester, find.text('Vendor 1'));
+
+    final line = 'rescheduled from ${formatDate(DateTime(2026, 2, 1))}';
+    expect(
+      find.byKey(const ValueKey('pay-queue-rescheduled-1')),
+      findsOneWidget,
+    );
+    expect(find.text(line), findsOneWidget);
+    expect(find.byKey(const ValueKey('pay-queue-rescheduled-2')), findsNothing);
+    expect(
+      find.bySemanticsLabel(RegExp('Vendor 1.*${RegExp.escape(line)}')),
+      findsOneWidget,
+    );
   });
 
   testWidgets('selecting a row reveals the Create Run bar', (tester) async {

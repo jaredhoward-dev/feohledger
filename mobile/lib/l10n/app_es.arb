@@ -1169,5 +1169,8 @@
   "legalAcceptButton": "Aceptar",
   "legalAcceptSignOut": "Cerrar sesión",
   "legalAcceptTickRequired": "Marque la casilla para aceptar los Términos del servicio y la Política de privacidad.",
-  "legalAcceptAppOutdated": "Esta versión de la app muestra unos Términos o una Política de privacidad anteriores a los vigentes, por lo que no puede registrar su aceptación. Actualice la app desde su tienda de aplicaciones o acepte en la aplicación web y vuelva a iniciar sesión."
+  "legalAcceptAppOutdated": "Esta versión de la app muestra unos Términos o una Política de privacidad anteriores a los vigentes, por lo que no puede registrar su aceptación. Actualice la app desde su tienda de aplicaciones o acepte en la aplicación web y vuelva a iniciar sesión.",
+  "invoiceDetailAssignedElsewhere": "Asignada a {name}: aun así puede actuar como aprobador.",
+  "invoiceDetailAssignedElsewhereUnnamed": "Asignada a un compañero: aun así puede actuar como aprobador.",
+  "payQueueRescheduledFrom": "reprogramada desde el {date}"
 }

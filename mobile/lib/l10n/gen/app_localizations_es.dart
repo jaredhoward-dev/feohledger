@@ -5128,4 +5128,18 @@ class AppLocalizationsEs extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'Esta versión de la app muestra unos Términos o una Política de privacidad anteriores a los vigentes, por lo que no puede registrar su aceptación. Actualice la app desde su tienda de aplicaciones o acepte en la aplicación web y vuelva a iniciar sesión.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Asignada a $name: aun así puede actuar como aprobador.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Asignada a un compañero: aun así puede actuar como aprobador.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'reprogramada desde el $date';
+  }
 }
