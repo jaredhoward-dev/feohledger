@@ -44,14 +44,36 @@ function listRow(v: MockVendor) {
 	};
 }
 
+/** Per-request hooks for the list read: `hold` returns a promise the stub
+ *  awaits before answering (so a spec decides the order responses land in,
+ *  with no sleeps); `fail` answers a 500 instead. */
+type ListHooks = {
+	hold?: (url: URL) => Promise<void> | undefined;
+	fail?: (url: URL) => boolean;
+};
+
+/** A promise a spec resolves by hand: `release()` lets the held response go. */
+function gate() {
+	let release!: () => void;
+	const opened = new Promise<void>((resolve) => (release = resolve));
+	return { opened, release };
+}
+
 /** Stub the three endpoints over `vendors`; returns the list URLs requested. */
-async function stubVendors(page: Page, vendors: MockVendor[]): Promise<URL[]> {
+async function stubVendors(
+	page: Page,
+	vendors: MockVendor[],
+	hooks: ListHooks = {}
+): Promise<URL[]> {
 	const listReads: URL[] = [];
 	await page.route('**/api/vendors**', async (route) => {
 		const url = new URL(route.request().url());
 		const method = route.request().method();
 		if (url.pathname === '/api/vendors' && method === 'GET') {
 			listReads.push(url);
+			const held = hooks.hold?.(url);
+			if (held) await held;
+			if (hooks.fail?.(url)) return route.fulfill({ status: 500, json: { detail: 'boom' } });
 			const status = url.searchParams.get('status');
 			const id = url.searchParams.get('id');
 			const size = Number(url.searchParams.get('page_size') ?? 20);
@@ -145,5 +167,107 @@ test.describe('/vendors row decision keeps loaded pages', () => {
 		await expect(page.locator('table tbody tr', { hasText: vendors[39].name })).toBeVisible();
 		await expect(page.locator('.btn-load-more')).toContainText('39 of 44');
 		await expect(page.locator('.filter-chip', { hasText: 'Unverified' })).toContainText('44');
+	});
+
+	test('a decision while Load more is in flight keeps the appended page', async ({ page }) => {
+		const vendors = seed(45, 'unverified');
+		const page2 = gate();
+		await stubVendors(page, vendors, {
+			hold: (url) => (url.searchParams.get('page') === '2' ? page2.opened : undefined)
+		});
+		await page.goto('/vendors');
+		const loadMore = page.locator('.btn-load-more');
+		await expect(loadMore).toContainText('20 of 45');
+
+		const page2Requested = page.waitForRequest((r) => r.url().includes('page=2'));
+		await loadMore.click();
+		await page2Requested;
+
+		// Decide a page-1 row while page 2 is still held.
+		const target = vendors[4];
+		const row = page.locator('table tbody tr', { hasText: target.name });
+		const reread = page.waitForResponse(
+			(r) => new URL(r.url()).searchParams.get('id') === target.id
+		);
+		await row.getByRole('button', { name: 'Verify' }).click();
+		await reread;
+		await expect(row.getByRole('button', { name: 'Reject' })).toBeVisible();
+
+		// Page 2 now lands: it is appended, not dropped, and the decided row
+		// keeps its fresh verdict.
+		const page2Landed = page.waitForResponse((r) => r.url().includes('page=2'));
+		page2.release();
+		await page2Landed;
+		await expect(page.locator('table tbody tr')).toHaveCount(40);
+		await expect(page.locator('.btn-load-more')).toContainText('40 of 45');
+		await expect(row.getByRole('button', { name: 'Reject' })).toBeVisible();
+		await expect(row.getByRole('button', { name: 'Verify' })).toHaveCount(0);
+	});
+
+	test('Load more during the one-row re-read still lets the re-read commit', async ({
+		page
+	}) => {
+		const vendors = seed(45, 'unverified');
+		const target = vendors[4];
+		const rowRead = gate();
+		await stubVendors(page, vendors, {
+			hold: (url) => (url.searchParams.get('id') === target.id ? rowRead.opened : undefined)
+		});
+		await page.goto('/vendors');
+		const loadMore = page.locator('.btn-load-more');
+		await expect(loadMore).toContainText('20 of 45');
+
+		const row = page.locator('table tbody tr', { hasText: target.name });
+		const rereadRequested = page.waitForRequest(
+			(r) => new URL(r.url()).searchParams.get('id') === target.id
+		);
+		await row.getByRole('button', { name: 'Verify' }).click();
+		await rereadRequested;
+		// Withheld (fail closed) while the re-read is out.
+		await expect(row.getByRole('button', { name: 'Verify' })).toHaveCount(0);
+
+		// Load more lands in full while the re-read is still held.
+		const page2Landed = page.waitForResponse((r) => r.url().includes('page=2'));
+		await loadMore.click();
+		await page2Landed;
+		await expect(page.locator('table tbody tr')).toHaveCount(40);
+
+		// The re-read now lands and still commits its verdict.
+		const reread = page.waitForResponse(
+			(r) => new URL(r.url()).searchParams.get('id') === target.id
+		);
+		rowRead.release();
+		await reread;
+		await expect(row.getByRole('button', { name: 'Reject' })).toBeVisible();
+		await expect(page.locator('table tbody tr')).toHaveCount(40);
+	});
+
+	test('a failed re-read says so in the row and Retry restores its actions', async ({
+		page
+	}) => {
+		const vendors = seed(45, 'unverified');
+		const target = vendors[4];
+		let failRowRead = true;
+		await stubVendors(page, vendors, {
+			fail: (url) => url.searchParams.get('id') === target.id && failRowRead
+		});
+		await page.goto('/vendors');
+		await expect(page.locator('.btn-load-more')).toContainText('20 of 45');
+
+		const row = page.locator('table tbody tr', { hasText: target.name });
+		await row.getByRole('button', { name: 'Verify' }).click();
+
+		// Fail closed: the new status, no actions, and a note saying why.
+		await expect(row).toContainText('Couldn’t refresh this row');
+		await expect(row.getByRole('button', { name: 'Verify' })).toHaveCount(0);
+		await expect(row.getByRole('button', { name: /^Reject/ })).toHaveCount(0);
+		const retry = row.getByRole('button', { name: `Retry for ${target.name}` });
+		await expect(retry).toBeVisible();
+
+		failRowRead = false;
+		await retry.click();
+		await expect(row).not.toContainText('Couldn’t refresh this row');
+		await expect(row.getByRole('button', { name: 'Reject' })).toBeVisible();
+		await expect(page.locator('table tbody tr')).toHaveCount(20);
 	});
 });

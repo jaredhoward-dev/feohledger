@@ -341,6 +341,10 @@
 	// The chip counts fire alongside every list fetch, so they need their own
 	// sequencer for the same reason — see `fetchCounts`.
 	const countsSequence = createRequestSequencer();
+	// Bumped when a whole-list (not Load more) read is issued, and when a row
+	// decision patches the list — see `refreshVendorRow` for what each guards.
+	let listEpoch = 0;
+	let patchEpoch = 0;
 
 	// The list's active search / status / sort, as query params — shared by the
 	// page read and the one-row re-read after a Verify / Reject, so both ask
@@ -369,7 +373,9 @@
 
 	async function fetchVendors(opts: { append?: boolean; nextPage?: number } = {}) {
 		const token = fetchSequence.start();
+		const patchesAtStart = patchEpoch;
 		if (!opts.append) {
+			listEpoch += 1;
 			loading = true;
 			loadErrored = false;
 		}
@@ -381,9 +387,14 @@
 			const data = await api.get<{ items: Vendor[]; total: number }>(
 				`/api/vendors?${params}`
 			);
-			// Superseded by a newer fetch, or by a local edit.
+			// Superseded by a newer fetch, or by a local edit. A whole-list read
+			// is also stale once a row decision has patched the list since it
+			// was issued; an append is not (see `refreshVendorRow`).
 			if (!fetchSequence.canCommit(token)) return;
+			if (!opts.append && patchEpoch !== patchesAtStart) return;
 			vendors = opts.append ? appendUnique(vendors, data.items) : data.items;
+			// A whole-list read carries every row's verdict afresh.
+			if (!opts.append && rowRefreshFailed.size) rowRefreshFailed = new Set();
 			total = data.total;
 			page = nextPage;
 			loadErrored = false;
@@ -605,24 +616,66 @@
 	// verdict, or an empty page when the row has left the filter (it is then
 	// dropped and the "N matching" total falls by one). Nothing here decides
 	// which actions a status allows or which statuses a filter matches.
+	//
+	// The re-read is NOT on `fetchSequence`. Sharing it made the two cancel
+	// each other: a decision during a Load more retired the append (spinner
+	// stopped, nothing appeared), and a Load more during the re-read stopped
+	// the re-read committing (the decided row kept no actions). Each row gets
+	// its own sequencer, so two decisions on one row resolve latest-wins and
+	// nothing else touches it. The two remaining interactions are explicit:
+	// - a whole-list read issued after the re-read (a filter change) answers
+	//   for that row itself, so the re-read stands down (`listEpoch`);
+	// - a whole-list read issued before the decision carries a pre-decision
+	//   snapshot, so it stands down instead (`patchEpoch`, checked in
+	//   `fetchVendors`). An append needs no guard: `appendUnique` keeps the
+	//   row already on screen, so the patched row's fresh data survives a
+	//   page that lands after it.
+	const rowSequences = new Map<string, ReturnType<typeof createRequestSequencer>>();
+	function rowSequence(id: string) {
+		let seq = rowSequences.get(id);
+		if (!seq) {
+			seq = createRequestSequencer();
+			rowSequences.set(id, seq);
+		}
+		return seq;
+	}
+	// Rows whose post-decision re-read failed. They show their new status with
+	// no actions (fail closed — the verdict they carried was for the old
+	// status) and an in-row "Couldn't refresh this row" + Retry, until a re-read
+	// or a whole-list read gives them a verdict.
+	let rowRefreshFailed = $state<Set<string>>(new Set());
+	function setRowRefreshFailed(id: string, failed: boolean) {
+		if (rowRefreshFailed.has(id) === failed) return;
+		const next = new Set(rowRefreshFailed);
+		if (failed) next.add(id);
+		else next.delete(id);
+		rowRefreshFailed = next;
+	}
+
 	async function refreshVendorRow(updated: Vendor) {
 		const id = updated.id;
 		// Until the server's answer lands the row shows its new status with
-		// its actions withheld (fail closed) — the verdict it carried was for
-		// the old status. Retiring pre-edit reads first stops one of them
-		// putting the old status back.
-		fetchSequence.supersedeInFlight();
+		// its actions withheld (fail closed). Bumping `patchEpoch` first stops
+		// a whole-list read already in flight putting the old status back.
+		patchEpoch += 1;
 		vendors = vendors.map((v) =>
 			v.id === id ? { ...v, status: updated.status, status_actions: undefined } : v
 		);
-		const token = fetchSequence.start();
+		await rereadVendorRow(id);
+	}
+
+	async function rereadVendorRow(id: string) {
+		const seq = rowSequence(id);
+		const token = seq.start();
+		const epoch = listEpoch;
+		const stillCurrent = () => seq.canCommit(token) && epoch === listEpoch;
+		setRowRefreshFailed(id, false);
 		try {
 			const params = listFilterParams();
 			params.set('id', id);
 			params.set('page_size', '1');
 			const data = await api.get<{ items: Vendor[]; total: number }>(`/api/vendors?${params}`);
-			// A newer list read (a filter change) answers for itself.
-			if (!fetchSequence.canCommit(token)) return;
+			if (!stillCurrent()) return;
 			const [row] = data.items;
 			if (row) {
 				vendors = vendors.map((v) => (v.id === id ? row : v));
@@ -636,10 +689,9 @@
 				}
 			}
 		} catch {
-			// The decision itself landed (its toast says so); the row keeps its
-			// new status with no actions until the next list read.
-		} finally {
-			if (fetchSequence.isCurrentRequest(token)) loaded = true;
+			// The decision itself landed (its toast says so). The row stays
+			// fail-closed, and says why, with a way to ask again.
+			if (stillCurrent()) setRowRefreshFailed(id, true);
 		}
 		// The chip tallies are whole-set server counts; re-ask rather than
 		// shifting them by hand.
@@ -946,6 +998,24 @@
 					     it works too. -->
 					<td class="actions">
 						{#if canManageVendors}
+							{#if rowRefreshFailed.has(v.id)}
+								<!-- The post-decision re-read failed: no verdict for the
+								     new status yet, so no actions (fail closed) — say so
+								     and offer the re-read again. -->
+								<span class="row-refresh-failed">{m('vendors.row.refreshFailed')}</span>
+								<RowAction
+									ariaLabel={m('common.rowActionAria', {
+										action: m('vendors.row.refreshRetry'),
+										name: v.name
+									})}
+									onclick={(e) => {
+										e.stopPropagation();
+										rereadVendorRow(v.id);
+									}}
+								>
+									{m('vendors.row.refreshRetry')}
+								</RowAction>
+							{/if}
 							<!-- Offered exactly when the server's verdict allows it
 							     (`status_actions`, from the table `/verify`, `/reject`
 							     and bulk status share) — Reject used to be hidden on an
@@ -1241,6 +1311,13 @@
 		margin: -4px 0 14px;
 		font-size: 0.8rem;
 		color: var(--text-muted);
+	}
+
+	/* The in-row note when a decided row's re-read failed (with its Retry). */
+	.row-refresh-failed {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		margin-right: 6px;
 	}
 
 	.dual-control-hint a {

@@ -71,12 +71,12 @@ function json(route: Route, body: unknown) {
 	return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
-async function stubContracts(page: Page, items: Array<{ id: string }>) {
+async function stubContracts(page: Page, items: Array<{ id: string }>, total = items.length) {
 	await page.route('**/api/contracts**', async (route) => {
 		const req = route.request();
 		const path = new URL(req.url()).pathname;
 		if (req.method() === 'GET' && path === LIST) {
-			return json(route, { items, total: items.length, page: 1, page_size: 100 });
+			return json(route, { items, total, page: 1, page_size: 100 });
 		}
 		const one = items.find((c) => path === `${LIST}/${c.id}`);
 		if (req.method() === 'GET' && one) return json(route, one);
@@ -134,6 +134,21 @@ test.describe('/contracts — lifecycle controls follow the server verdict', () 
 			await expect(dialog.getByRole('button', { name })).toHaveCount(0);
 		}
 	});
+
+	test('every verdict refused renders no lifecycle block at all (no empty divider)', async ({
+		page
+	}) => {
+		await stubContracts(page, [
+			contract('c0000000-0000-4000-8000-000000000004', 'CT-V-0004', {
+				status: 'terminated',
+				actions: REFUSE_ALL
+			})
+		]);
+		const dialog = await openModal(page, 'CT-V-0004');
+		await expect(dialog.getByTestId('contract-lifecycle-actions')).toHaveCount(0);
+		// The footer still renders: only the empty action row is gone.
+		await expect(dialog.locator('.modal-footer')).toBeVisible();
+	});
 });
 
 test.describe('/contracts — bulk Change status follows the selected rows’ verdicts', () => {
@@ -176,5 +191,46 @@ test.describe('/contracts — bulk Change status follows the selected rows’ ve
 		await expect(page.getByTestId('contracts-bulk-action')).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Change Status' })).toHaveCount(0);
 		await expect(page.getByTestId('contracts-bulk-no-action')).toBeVisible();
+	});
+});
+
+test.describe('/contracts — bulk skip count after "select all N matching"', () => {
+	const A = 'c0000000-0000-4000-8000-000000000021';
+	const B = 'c0000000-0000-4000-8000-000000000022';
+	const C = 'c0000000-0000-4000-8000-000000000023';
+	const D = 'c0000000-0000-4000-8000-000000000024';
+
+	test('ids beyond the loaded rows make the skip count a minimum', async ({ page }) => {
+		// Two rows loaded of four matching: C and D's verdicts are unknown.
+		await stubContracts(
+			page,
+			[
+				contract(A, 'CT-V-0021', {
+					status: 'draft',
+					actions: { ...REFUSE_ALL, activate: null }
+				}),
+				contract(B, 'CT-V-0022', { status: 'terminated', actions: REFUSE_ALL })
+			],
+			4
+		);
+		// Registered after the stub, so it answers `/ids` first.
+		await page.route('**/api/contracts/ids*', (route) =>
+			json(route, { ids: [A, B, C, D], total: 4, truncated: false })
+		);
+		await page.goto('/contracts');
+		await expect(page.locator('tbody tr', { hasText: 'CT-V-0021' })).toBeVisible();
+
+		await page.getByRole('checkbox', { name: 'Select all contracts on this page' }).check();
+		const note = page.getByTestId('contracts-bulk-skip-note');
+		await expect(note).toHaveText('1 selected contract can’t take this action and will be skipped.');
+		await page.getByRole('button', { name: 'Select all 4 matching' }).click();
+		await expect(note).toHaveText(
+			'At least 1 selected contract can’t take this action and will be skipped.'
+		);
+		// The same live region throughout — it is never re-created.
+		await expect(page.getByTestId('contracts-bulk-action')).toHaveAttribute(
+			'aria-describedby',
+			'contracts-bulk-skip-note'
+		);
 	});
 });

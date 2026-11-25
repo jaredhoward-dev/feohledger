@@ -596,9 +596,12 @@
 		{/if}
 
 		<!-- Lifecycle actions (detail mode). Each shows only when its server
-		     verdict allows it — the verdict already folds in the role. -->
-		{#if !isCreate}
-			<div class="lifecycle-actions">
+		     verdict allows it — the verdict already folds in the role. When
+		     every verdict refuses (a CFO or clerk, a terminated / cancelled
+		     contract) the block is not rendered at all, so its divider and
+		     padding don't frame an empty row. -->
+		{#if !isCreate && (canActivate || canTerminate || canCancel || canRenew || canCreatePo)}
+			<div class="lifecycle-actions" data-testid="contract-lifecycle-actions">
 				{#if canActivate}
 					<button type="button" class="btn-secondary" disabled={busy} onclick={() => runLifecycle(() => activateContract(contract!.id), m('contracts.modal.toast.activated'), m('contracts.modal.toast.activateFailed'))}>{m('contracts.modal.lifecycle.activate')}</button>
 				{/if}
