@@ -7,6 +7,9 @@ not reached the ledger, so each adapter deletes a draft (BC ``Draft``, NetSuite
 ``Pending Approval``) and returns False for anything else, without a request
 that could change it. Sage Intacct's equivalent lives in
 ``test_erp_sage_intacct_adapter.py``.
+
+Also BC's status read (``Paid`` is ``settled_no_payment``) and its absence
+from status sync-back (decisions §546).
 """
 
 from __future__ import annotations
@@ -94,6 +97,64 @@ def test_bc_void_leaves_anything_but_a_draft_alone(bc, status):
         assert _run(bc.void_invoice("pi-1")) is False
     client.delete.assert_not_awaited()
     assert client.post.await_count == 1  # the token exchange; no bound action
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("Draft", ErpInvoiceStatus.draft),
+        ("Open", ErpInvoiceStatus.open),
+        # BC's `Paid` is the posted invoice's `Closed` flag: a credit memo
+        # applied in full closes it as surely as a payment, and API v2.0 shows
+        # neither the ledger entry nor what was applied (decisions §303, §546).
+        ("Paid", ErpInvoiceStatus.settled_no_payment),
+        ("Canceled", ErpInvoiceStatus.cancelled),
+        ("Corrective", ErpInvoiceStatus.unknown),
+        ("In Review", ErpInvoiceStatus.unknown),
+        ("", ErpInvoiceStatus.unknown),
+    ],
+)
+def test_bc_status_never_reads_a_closed_invoice_as_cash(bc, status, expected):
+    """The §528 poll records a ``paid`` read as a cash payment made outside
+    FeohLedger (1099-reportable). BC cannot say a closed invoice was paid in
+    cash, so it reads ``settled_no_payment`` and a person decides."""
+    with patch("httpx.AsyncClient") as cm:
+        client = cm.return_value.__aenter__.return_value
+        client.post = AsyncMock(return_value=_resp(200, {"access_token": "tok"}))
+        client.get = AsyncMock(return_value=_resp(200, {"id": "pi-1", "status": status}))
+        assert _run(bc.get_invoice_status("pi-1")) == expected
+
+
+def test_bc_does_not_report_status_back(bc):
+    """Status sync-back needs a bill's open amount and a way to post our
+    payment against it; BC's standard API v2.0 has neither (decisions §546).
+    A BC tenant stays on the push-closes-at-``done`` path and the §528 poll,
+    and a write-back is refused before any call."""
+    from datetime import date
+    from decimal import Decimal
+
+    from app.services.erp_adapters.base import PaymentPayload, reports_status_back
+
+    assert BusinessCentralAdapter.supports_status_sync is False
+    assert reports_status_back(bc) is False
+    assert (
+        reports_status_back(
+            BusinessCentralAdapter({**bc.config, "dynamics_365_bc_status_sync": "on"})
+        )
+        is False
+    )
+    payload = PaymentPayload(
+        payment_id="p-1",
+        bill_id="pi-1",
+        amount=Decimal("1.00"),
+        currency="USD",
+        paid_on=date(2026, 11, 25),
+    )
+    with patch("httpx.AsyncClient") as cm:
+        for call in (bc.post_payment, bc.void_payment):
+            result = _run(call(payload))
+            assert result.success is False and result.retryable is False
+        cm.assert_not_called()
 
 
 def test_bc_void_never_deletes_with_a_wildcard_etag(bc):

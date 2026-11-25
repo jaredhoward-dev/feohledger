@@ -2267,7 +2267,8 @@ def test_d365_status_corrective_and_blank_are_unknown(monkeypatch):
         ("Corrective", ErpInvoiceStatus.unknown),
         (" ", ErpInvoiceStatus.unknown),
         ("Canceled", ErpInvoiceStatus.cancelled),
-        ("Paid", ErpInvoiceStatus.paid),
+        # `Paid` is BC's `Closed` flag, credit memos included (decisions §546).
+        ("Paid", ErpInvoiceStatus.settled_no_payment),
     ):
         with patch("httpx.AsyncClient") as cm:
             client = cm.return_value.__aenter__.return_value

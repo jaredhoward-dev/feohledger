@@ -781,6 +781,37 @@ Tests: `backend/tests/test_netsuite_status_sync_adapter.py` (the adapter
 against fake-erp in process), `test_erp_status_sync.py` § NetSuite sweep
 (tenant selection, the mark, another account's mark, Merge leftovers).
 
+### Business Central: no status sync-back
+
+Decisions §546. Business Central is **not** a status-sync adapter
+(`supports_status_sync` stays False, and there is no per-tenant opt-in):
+its standard API v2.0 cannot do the two things §295 rests on. Checked
+2026-11-25 against Microsoft Learn and the API's own AL source
+(`microsoft/BCApps`, `src/Apps/W1/APIV2/app/src/pages/`):
+
+- **No open amount.** `purchaseInvoice` states `totalAmountIncludingTax` and a
+  `status`, but no remaining amount, and API v2.0 publishes no vendor ledger
+  entry. `Open` covers a part-paid invoice, so §296's dispatch read could not
+  tell "nothing taken off" from "half paid by a person", and `post_payment`
+  could not prove it is never above what is open.
+- **`Paid` is `Closed`.** The aggregator sets `Paid` whenever the posted
+  invoice's vendor ledger entry is closed, a credit memo applied in full
+  included. Nothing in v2.0 says what closed it, so the cash cannot be stated
+  (§303).
+- **No way to post our payment against the bill.** A `vendorPayment` line
+  carries `appliesToInvoiceId` and `externalDocumentNumber`, but
+  `vendorPaymentJournals` has no bound actions; the `post` action is on
+  `journals`, whose lines have no applies-to field and whose page is filtered
+  to the general journal template. A line we create stays unposted in BC.
+  `void_payment` is moot, since nothing would be posted; it keeps the base
+  refusal.
+
+What a BC tenant gets instead: the push closes at `done` as before; the §528
+poll sweep reads `get_invoice_status`, where BC's `Paid` is
+`settled_no_payment`, so it opens a payment-blocking reconciliation and never
+books a cash payment. Durable fix: `docs/followups.md`, "A bill paid in an
+ERP other than QuickBooks or Xero".
+
 ### Live QuickBooks contract check
 
 The QuickBooks counterpart of § Live Xero contract check, and of the recorded
@@ -1049,7 +1080,9 @@ POST /purchaseInvoices
 
 **Post (finalize):** `POST /purchaseInvoices({id})/Microsoft.NAV.post`
 
-**Status field:** `status` — `Draft`, `Open` (posted), `Paid`, `Canceled`
+**Status field:** `status` — `Draft`, `In Review`, `Open` (posted), `Paid` (the posted
+invoice's `Closed` flag: settled by anything, so read as `settled_no_payment`), `Canceled`,
+`Corrective`. No status sync-back: see § Business Central: no status sync-back.
 
 **Webhook support:** Business Central supports webhooks via subscriptions API:
 ```
@@ -3856,7 +3889,7 @@ period or an inactive vendor on the create or in the job, and whether
 | `list_gl_accounts` | `GET accounts` — `number` → code, `displayName` → name, `id` → `erp_account_id`, `category` Assets/Liabilities/Equity/Income/Cost of Goods Sold/Expense → asset/liability/equity/revenue/expense/expense (blank → unclassified). Heading / total accounts are skipped (BC refuses a line on one); blocked accounts, and Posting accounts with `directPosting: false` (control accounts — payables, bank, inventory — which refuse a purchase line), are emitted `active=False`. |
 | `list_pos` | `GET purchaseOrders?$expand=purchaseOrderLines` — total `totalAmountIncludingTax`; status `Draft` (unreleased) / `In Review` (pending approval) → unissued (decisions §394), `Open` and anything else → open; vendor linked by `vendorId` (the vendor GUID `list_vendors` stamps; BC's empty GUID is no vendor) before `vendorName`; `currencyCode` only when non-blank; `requestedReceiptDate` unless BC's blank `0001-01-01`; comment lines dropped |
 | `list_vendors` | `GET vendors?$expand=paymentTerm` — `payment_terms` is the term's `code` (`30 DAYS`), never the vendor's `paymentTermsId` GUID (no term, or no expansion, → None); `blocked` `Payment` or `All` → `active=False`, so the sync never makes a blocked vendor a payee and marks a linked one `inactive` |
-| `get_invoice_status` | `GET purchaseInvoices({id})` — `Draft` / `Open` / `Paid` / `Canceled`; `Corrective` (an invoice BC made by cancelling a posted credit memo — a live document, never one we pushed) and blank are `unknown` |
+| `get_invoice_status` | `GET purchaseInvoices({id})` — `Draft` / `Open` / `Canceled`; BC's `Paid` reads **`settled_no_payment`**, never `paid`: BC derives it from the posted invoice's `Closed` flag, which a credit memo closes as surely as a payment, and API v2.0 shows neither (decisions §303, §546); `Corrective` (an invoice BC made by cancelling a posted credit memo — a live document, never one we pushed) and blank are `unknown` |
 | `void_invoice` | `GET purchaseInvoices({id})`; a `Draft` is deleted (`DELETE` with `If-Match` = the etag just read — never `*`; a read with no etag returns `False` unsent); anything else returns `False` |
 
 **Lines post on `accountId`, not the No.** The chart sync is now the writer of

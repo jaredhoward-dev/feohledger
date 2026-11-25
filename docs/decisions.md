@@ -28106,3 +28106,107 @@ unique ids and catalogued events; the spec carries it unchanged with
 catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
 example whose `data` keys are its model's fields; the report's filter picks
 only affected subscriptions and the types they lack.
+
+## 546. Business Central does not sync bills back: API v2.0 states no open amount and cannot post a vendor payment; its `Paid` reads `settled_no_payment` (§295 / §303 / §536 follow-up, round 46)
+
+**Context.** Round 46 set out to extend §295 status sync-back and payment
+write-back to Business Central, in NetSuite's shape (§536) and opt-in per
+tenant like §541. §536 had already noted the two risks: BC pays a bill only
+through a vendor payment journal that must then be posted, and its
+`purchaseInvoice` states no open amount. Checking BC's published API before
+writing any code confirmed both, and found a third.
+
+**What the API offers** (all checked 2026-11-25):
+
+- `purchaseInvoice`
+  (<https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_purchaseinvoice>):
+  `totalAmountIncludingTax`, `currencyCode`, `lastModifiedDateTime` and
+  `status` (" ", Draft, In Review, Open, Paid, Canceled, Corrective). There is
+  **no remaining or open amount**. The bound actions are `post` only.
+- `vendorPayment`
+  (<https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_vendorpayment>):
+  `amount`, `appliesToInvoiceId`, `externalDocumentNumber`, `description`,
+  `comment`, under a `vendorPaymentJournal`, and it lists no bound actions.
+- `vendorPaymentJournal`
+  (<https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_vendorpaymentjournal>):
+  **no bound actions**. The API's AL source agrees: `APIV2VendorPaymJournals.Page.al`
+  in `microsoft/BCApps` (`src/Apps/W1/APIV2/app/src/pages/`) has an empty
+  `actions` block.
+- `journal`
+  (<https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_journal>):
+  has a bound `post` action, but `APIV2Journals.Page.al` filters its records to
+  the general journal template, so it does not reach a vendor payment batch.
+  Its `journalLine` lines
+  (<https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_journalline>)
+  have no applies-to field, so a payment posted there would not settle the
+  invoice.
+- `applyVendorEntry`
+  (<https://learn.microsoft.com/en-us/dynamics365/business-central/dev-itpro/api-reference/v2.0/resources/dynamics_applyvendorentry>)
+  has `remainingAmount`, but only as a navigation under a vendor payment
+  journal line (`APIV2ApplyVendorEntries.Page.al` errors without one). Reading
+  a bill's balance would mean writing a journal line first.
+- There is no `vendorLedgerEntry` resource in v2.0 (its Learn page is a 404).
+  `microsoft/reportsFinance/beta` has a read-only `vendorLedgerEntries` query,
+  but it is beta and states no remaining amount or application.
+- How `status` is derived: `PurchInvAggregator.Codeunit.al`
+  (`SetStatusOptionFromPurchaseInvoiceHeader`, in `microsoft/BCApps`
+  `src/Layers/W1/BaseApp/Integration/Entity/`) sets `Paid` exactly when the
+  posted invoice is `Closed`. A vendor ledger entry closes when anything is
+  applied to it in full, a credit memo included.
+
+**Decision 1: no status sync for BC.** `supports_status_sync` stays False, and
+there is no `settings.erp` opt-in or catalogue field. Each of §295's pieces
+fails on BC:
+
+- **`bill_report`**: `Open` can be part paid, so the report cannot say "open"
+  and also mean nothing was taken off. §296's dispatch read would then pay a
+  bill a person half-paid in BC. Reporting `unknown` instead would hold, or
+  flag, every BC payment.
+- **`post_payment`**: we cannot check "never more than is open", and the
+  journal line cannot be posted.
+- **`void_payment`**: has nothing to reverse.
+- **`paid_amount`**: cannot be stated, since closed is not cash.
+
+Shipping an opt-in that leads to any of these breaks a money invariant, not a
+fail-closed gap a sandbox pass could clear. `changed_bills` (a
+`lastModifiedDateTime` keyset poll would work) is not built on its own: with
+no `bill_report` to feed, it would be dead code.
+
+**Decision 2: BC's `Paid` reads `settled_no_payment`.** `get_invoice_status`
+mapped `Paid` to `paid`. The §528 poll sweep polls BC tenants and records a
+`paid` read through `record_erp_reported_payment` as cash paid outside
+FeohLedger (1099-reportable). That books a credit-memo closure as cash, which
+§303 forbids; BC was missing from §303's table. `Paid` now reads
+`settled_no_payment`, so the poll opens the blocking `payment_reconciliation`
+(§532) and a person records what happened. The flagged-bill void (§542) already
+refuses `settled_no_payment` (`erp_void_bill_settled`) as it refused `paid`.
+
+**Rejected.**
+- *Creating the journal line unposted and calling the write-back done*: the
+  bill stays open in BC, so a bookkeeper could pay it there again, and nothing
+  posted can be found or reversed by us.
+- *Reading `applyVendorEntries` through a scratch journal line*: a write for
+  every read, left behind in a customer's journal if anything fails.
+- *The beta `reportsFinance` query*: no remaining amount or application, and
+  beta.
+- *Posting via `journals` with a template filter*: not documented, and it
+  posts the whole batch, other people's lines included.
+
+**Durable fix** (tracked in `docs/followups.md`, "A bill paid in an ERP other
+than QuickBooks or Xero"): a FeohLedger per-tenant BC extension. It would
+publish a custom API page over Vendor Ledger Entry (remaining amount, and the
+applied entries with their document type, so cash is told from credit) and a
+bound action that posts a vendor payment batch of our own (with
+`externalDocumentNumber` carrying our marker). Alternatively, BC through
+Merge.dev once Merge carries a marker. **Trigger:** the first BC tenant who
+pays bills in BC and also wants FeohLedger to pay them.
+
+**Not verified live.** Everything above is from Microsoft's published docs and
+AL source; no BC sandbox was called. Decision 2 only moves a read from "cash"
+to "a person decides", so a wrong reading of `Paid` fails safe.
+
+**Guard.** `tests/test_erp_void_invoice.py`:
+- `test_bc_status_never_reads_a_closed_invoice_as_cash` covers every BC status
+  word.
+- `test_bc_does_not_report_status_back`: no capability, a stray opt-in key
+  changes nothing, and the write-back and void refuse without a call.
