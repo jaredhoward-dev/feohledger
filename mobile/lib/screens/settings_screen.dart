@@ -1,5 +1,6 @@
 import 'package:material_ui/material_ui.dart';
 
+import 'package:feohledger_mobile/api/endpoints.dart';
 import 'package:feohledger_mobile/config.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/adaptive_screen.dart';
@@ -11,9 +12,15 @@ import 'package:feohledger_mobile/screens/workflows_screen.dart';
 import 'package:feohledger_mobile/services/biometric_service.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
 import 'package:feohledger_mobile/stores/locale_store.dart';
+import 'package:feohledger_mobile/utils/tenant_web_url.dart';
+import 'package:feohledger_mobile/widgets/external_link.dart';
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key});
+  /// Opens the Help row's URL; injected by tests, defaults to
+  /// [openExternally] (the platform browser), as [ExternalLink] does.
+  final UrlOpener? opener;
+
+  const SettingsScreen({super.key, this.opener});
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -37,6 +44,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _bioAvailable = available;
         _bioEnabled = enabled;
       });
+    }
+  }
+
+  /// Opens the web help centre of the signed-in workspace in the browser
+  /// (decisions §503). The address is resolved on tap, from the platform's
+  /// published tenant URL template and the session's tenant slug — the app
+  /// holds no copy of the help content. Anything that leaves no safe https
+  /// URL, or a browser that refuses it, ends in one snackbar saying where
+  /// else to find Help.
+  Future<void> _openHelp() async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final failure = AppLocalizations.of(context).settingsHelpUnavailable;
+    bool opened = false;
+    try {
+      final template = await PublicConfigApi.tenantUrlTemplate();
+      final url = tenantHelpUrl(template, AppConfig.tenantSlug);
+      final uri = ExternalLink.safeUri(url);
+      if (uri != null) {
+        opened = await (widget.opener ?? openExternally)(uri);
+      }
+    } catch (_) {
+      opened = false;
+    }
+    if (!opened) {
+      messenger?.showSnackBar(SnackBar(content: Text(failure)));
     }
   }
 
@@ -212,6 +244,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
           ],
+
+          // Help — the web help centre for this workspace, in the browser. One
+          // semantics node with the link role, announced as "Help, Guides for
+          // your workspace, opened in your browser" (the ExternalLink shape),
+          // so a screen-reader user knows the row leaves the app.
+          const Divider(height: 32),
+          Semantics(
+            link: true,
+            label: '${l.settingsHelp}, ${l.settingsHelpHint}',
+            excludeSemantics: true,
+            onTap: _openHelp,
+            child: ListTile(
+              key: const Key('settings-help'),
+              leading: const Icon(Icons.help_outline),
+              title: Text(l.settingsHelp),
+              subtitle: Text(l.settingsHelpHint),
+              trailing: const Icon(Icons.open_in_new),
+              onTap: _openHelp,
+            ),
+          ),
 
           // Display language — a per-device choice (like the biometric toggle),
           // persisted locally via LocaleStore and never sent to the backend.

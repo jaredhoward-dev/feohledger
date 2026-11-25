@@ -25593,3 +25593,44 @@ and the table differ in height by the row count, so no fixed reservation fits
 both. *Seeding a real parent/child link in the e2e tenant*: it would change
 what every other partner spec sees (they assert the standalone state and the
 cross-tenant 404) for a measurement a route stub gives exactly.
+
+## 503. Mobile Help opens the web help centre at the platform tenant URL, built from `/api/public-config` (round 39)
+
+**Problem.** The help centre (`/help`, `frontend/docs/help-centre.md`) serves
+the employee web app only; the mobile app had no help at all
+(`docs/followups.md`). The help lives on the workspace's own host, and the app
+knows only the tenant slug the user typed and the API base URL — neither is the
+web address of the workspace.
+
+**Decision.**
+
+- **A Settings → Help row that opens the web help in the browser**, through the
+  same `UrlOpener` seam `ExternalLink` uses, announced as one link node. The app
+  holds no copy of the guides, for the reason §498 gives for the legal pages:
+  one copy, six languages, kept by the web.
+- **The address is the backend's own rule, fed by the published template.**
+  `GET /api/public-config` already publishes `FEOH_TENANT_URL_TEMPLATE` (the
+  web signup page reads it); the app substitutes the session's slug exactly as
+  `utils/tenant_urls.py::tenant_base_url` does and appends `/help`
+  (`mobile/lib/utils/tenant_web_url.dart`). Resolved on tap, so a deployment's
+  template change needs no app release.
+- **Fail closed.** The slug must be slug-shaped (`slug.py`'s pattern) so no
+  typed value can change the host beyond its own label, and the result must be
+  an absolute `https` URL (`ExternalLink.safeUri`'s rule). Anything else, a
+  failed read, or a browser that refuses the URL ends in one snackbar telling
+  the user to open Help from the web. The local-dev default
+  (`http://{slug}.localhost:7777`) therefore opens nothing, by design.
+
+**Rejected.** *`AppConfig.publicWebUrl` + `/help`*: that origin is the public
+site, not a workspace; the help pages are tenant-scoped and role-aware. *A new
+`--dart-define` for the tenant template*: a second copy of deployment config the
+server already publishes. *Deriving it from the API base URL*: the API and the
+SPA are separate hosts (S3 + CloudFront vs the VM). *A per-tenant URL on
+`/api/auth/me`* (which would honour a tenant's vanity `tenant_url_template` or
+custom domain): a backend change for a cosmetic gain, since the platform
+subdomain serves the same workspace. **Consequence:** a white-label tenant's
+mobile users land on its platform subdomain, not its vanity host; the browser
+keeps a separate session per origin, so they may sign in there once. Revisit
+(add `web_url` to `/me`, built by `tenant_urls.sign_in_base_url`) if a
+white-label customer asks.
+

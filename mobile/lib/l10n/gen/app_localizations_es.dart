@@ -2784,6 +2784,17 @@ class AppLocalizationsEs extends AppLocalizations {
       'Patrones de aprobación, anomalías, sugerencias';
 
   @override
+  String get settingsHelp => 'Ayuda';
+
+  @override
+  String get settingsHelpHint =>
+      'Guías para su espacio de trabajo, se abren en el navegador';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'No se pudo abrir el centro de ayuda. Inicie sesión en su espacio de trabajo en la web y abra Ayuda allí.';
+
+  @override
   String get inspectionsTitle => 'Inspecciones de calidad';
 
   @override

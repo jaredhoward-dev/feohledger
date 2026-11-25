@@ -4299,6 +4299,24 @@ abstract class AppLocalizations {
   /// **'Approval patterns, anomalies, suggestions'**
   String get settingsAdaptiveHint;
 
+  /// No description provided for @settingsHelp.
+  ///
+  /// In en, this message translates to:
+  /// **'Help'**
+  String get settingsHelp;
+
+  /// No description provided for @settingsHelpHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Guides for your workspace, opened in your browser'**
+  String get settingsHelpHint;
+
+  /// No description provided for @settingsHelpUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn't open the help centre. Sign in to your workspace on the web and open Help there.'**
+  String get settingsHelpUnavailable;
+
   /// No description provided for @inspectionsTitle.
   ///
   /// In en, this message translates to:

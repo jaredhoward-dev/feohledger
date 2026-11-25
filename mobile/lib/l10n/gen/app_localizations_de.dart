@@ -2770,6 +2770,17 @@ class AppLocalizationsDe extends AppLocalizations {
       'Freigabemuster, Auffälligkeiten, Vorschläge';
 
   @override
+  String get settingsHelp => 'Hilfe';
+
+  @override
+  String get settingsHelpHint =>
+      'Anleitungen für Ihren Arbeitsbereich, im Browser geöffnet';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'Das Hilfecenter konnte nicht geöffnet werden. Melden Sie sich im Web bei Ihrem Arbeitsbereich an und öffnen Sie dort die Hilfe.';
+
+  @override
   String get inspectionsTitle => 'Qualitätsprüfungen';
 
   @override

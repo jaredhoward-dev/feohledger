@@ -19,6 +19,21 @@ import 'package:feohledger_mobile/models/user.dart';
 import 'package:feohledger_mobile/models/vendor.dart';
 import 'package:feohledger_mobile/models/workflow.dart';
 
+/// `GET /api/public-config` — the deployment's non-secret config, public by
+/// design (`backend/app/main.py::public_config`).
+class PublicConfigApi {
+  static final _api = ApiClient();
+
+  /// The platform's tenant URL shape (`FEOH_TENANT_URL_TEMPLATE`, e.g.
+  /// `https://{slug}.feohledger.com`), or null when the deployment publishes
+  /// none. Read by the Settings → Help row (`utils/tenant_web_url.dart`).
+  static Future<String?> tenantUrlTemplate() async {
+    final data = await _api.get('/public-config');
+    final value = data['tenant_url_template'];
+    return value is String && value.trim().isNotEmpty ? value : null;
+  }
+}
+
 class AuthApi {
   static final _api = ApiClient();
 

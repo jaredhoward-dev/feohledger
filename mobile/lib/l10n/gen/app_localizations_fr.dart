@@ -2785,6 +2785,17 @@ class AppLocalizationsFr extends AppLocalizations {
       'Schémas d’approbation, anomalies, suggestions';
 
   @override
+  String get settingsHelp => 'Aide';
+
+  @override
+  String get settingsHelpHint =>
+      'Guides pour votre espace de travail, ouverts dans votre navigateur';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'Impossible d’ouvrir le centre d’aide. Connectez-vous à votre espace de travail sur le web et ouvrez-y l’Aide.';
+
+  @override
   String get inspectionsTitle => 'Inspections qualité';
 
   @override
