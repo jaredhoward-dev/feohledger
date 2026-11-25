@@ -1325,11 +1325,17 @@
 		color: var(--text-muted);
 	}
 
-	/* The in-row note when a decided row's re-read failed (with its Retry). */
+	/* The in-row note when a decided row's re-read failed (with its Retry).
+	   Its own line, wrapping like prose: inline beside Retry in the 300px
+	   actions column it ran past the column in de / fr and widened the table
+	   (guard: tests-e2e/reactivity/layout-stability.spec.ts, which puts a row
+	   in this state for every long locale). */
 	.row-refresh-failed {
+		display: block;
+		white-space: normal;
+		overflow-wrap: anywhere;
 		font-size: 0.8rem;
 		color: var(--text-muted);
-		margin-right: 6px;
 	}
 
 	.dual-control-hint a {
