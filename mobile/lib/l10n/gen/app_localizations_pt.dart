@@ -2,7 +2,6 @@
 
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
-
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -4623,7 +4622,8 @@ class AppLocalizationsPt extends AppLocalizations {
   @override
   String payRunCreatedPlain(String cfo) {
     String _temp0 = intl.Intl.selectLogic(cfo, {
-      'required': 'Lote de pagamento criado. É necessária a aprovação do CFO antes da execução.',
+      'required':
+          'Lote de pagamento criado. É necessária a aprovação do CFO antes da execução.',
       'other': 'Lote de pagamento criado.',
     });
     return '$_temp0';
@@ -5051,6 +5051,47 @@ class AppLocalizationsPt extends AppLocalizations {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => 'Termos e privacidade';
+
+  @override
+  String get legalAcceptHeading => 'Reveja os nossos termos atualizados';
+
+  @override
+  String get legalAcceptIntro =>
+      'Para continuar a usar o FeohLedger, aceite os Termos de Serviço e a Política de Privacidade em vigor. Cada um abre no seu navegador.';
+
+  @override
+  String get legalTermsLink => 'Termos de Serviço';
+
+  @override
+  String get legalPrivacyLink => 'Política de Privacidade';
+
+  @override
+  String get legalLinkHint => 'abre no seu navegador';
+
+  @override
+  String get legalLinkFailed =>
+      'Não foi possível abrir a página. Abra-a num navegador.';
+
+  @override
+  String get legalAcceptCheckbox =>
+      'Li e aceito os Termos de Serviço e a Política de Privacidade.';
+
+  @override
+  String get legalAcceptButton => 'Aceitar';
+
+  @override
+  String get legalAcceptSignOut => 'Terminar sessão';
+
+  @override
+  String get legalAcceptTickRequired =>
+      'Marque a caixa para aceitar os Termos de Serviço e a Política de Privacidade.';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'Esta versão da app mostra Termos ou uma Política de Privacidade anteriores aos que estão em vigor, por isso não pode registar a sua aceitação. Atualize a app na sua loja de aplicações, ou aceite na aplicação web, e inicie sessão novamente.';
 }
 
 /// The translations for Portuguese, as used in Brazil (`pt_BR`).
@@ -9669,7 +9710,8 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String payRunCreatedPlain(String cfo) {
     String _temp0 = intl.Intl.selectLogic(cfo, {
-      'required': 'Lote de pagamento criado. É necessária a aprovação do CFO antes da execução.',
+      'required':
+          'Lote de pagamento criado. É necessária a aprovação do CFO antes da execução.',
       'other': 'Lote de pagamento criado.',
     });
     return '$_temp0';
@@ -10097,4 +10139,45 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => 'Termos e privacidade';
+
+  @override
+  String get legalAcceptHeading => 'Revise nossos termos atualizados';
+
+  @override
+  String get legalAcceptIntro =>
+      'Para continuar usando o FeohLedger, aceite os Termos de Serviço e a Política de Privacidade vigentes. Cada um abre no seu navegador.';
+
+  @override
+  String get legalTermsLink => 'Termos de Serviço';
+
+  @override
+  String get legalPrivacyLink => 'Política de Privacidade';
+
+  @override
+  String get legalLinkHint => 'abre no seu navegador';
+
+  @override
+  String get legalLinkFailed =>
+      'Não foi possível abrir a página. Acesse-a em um navegador.';
+
+  @override
+  String get legalAcceptCheckbox =>
+      'Li e aceito os Termos de Serviço e a Política de Privacidade.';
+
+  @override
+  String get legalAcceptButton => 'Aceitar';
+
+  @override
+  String get legalAcceptSignOut => 'Sair';
+
+  @override
+  String get legalAcceptTickRequired =>
+      'Marque a caixa para aceitar os Termos de Serviço e a Política de Privacidade.';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'Esta versão do app mostra Termos ou uma Política de Privacidade anteriores aos vigentes, por isso não pode registrar sua aceitação. Atualize o app na sua loja de aplicativos, ou aceite no aplicativo web, e entre novamente.';
 }

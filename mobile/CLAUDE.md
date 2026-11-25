@@ -182,6 +182,7 @@ The mobile app talks to the same FastAPI backend as the web frontend:
 | Screen | API calls |
 |--------|-----------|
 | Login | `POST /api/auth/login`, `GET /api/auth/me` |
+| Terms / Privacy accept (blocking, decisions §498) | `GET /api/auth/me` (`legal_acceptance_required`; re-read on app resume), `POST /api/auth/legal-acceptance` (`accepted_terms_version` / `accepted_privacy_version` from `lib/legal_versions.generated.dart`; coded 422 → "update the app", 429 → standard error) |
 | MFA (second factor) | `POST /api/auth/mfa/verify` (totp/email → JWT), `POST /api/auth/mfa/challenge/email` (request email OTP) |
 | Dashboard | `GET /api/dashboard` |
 | Cash Flow | `GET /api/analytics/cashflow_forecast` + `GET /api/analytics/cash_position` (both `horizon_days` + `granularity`; CFO/admin) |

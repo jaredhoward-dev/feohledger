@@ -24,6 +24,7 @@ import 'package:http/testing.dart';
 import 'package:feohledger_mobile/api/api_client.dart';
 import 'package:feohledger_mobile/main.dart';
 import 'package:feohledger_mobile/screens/home_screen.dart';
+import 'package:feohledger_mobile/screens/legal_accept_screen.dart';
 import 'package:feohledger_mobile/screens/login_screen.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
 import 'package:feohledger_mobile/services/push_service.dart';
@@ -49,7 +50,8 @@ Map<String, dynamic> _dashboardBody() => {
 
 /// Answers every request the clerk-role home tabs make (dashboard, invoices,
 /// contracts) plus the auth profile load.
-MockClient _homeClient() => MockClient((req) async {
+MockClient _homeClient({bool Function()? legalRequired}) =>
+    MockClient((req) async {
       final path = req.url.path;
       if (path == '/api/auth/me') {
         return _json({
@@ -58,6 +60,7 @@ MockClient _homeClient() => MockClient((req) async {
           'full_name': 'Demo User',
           'organization_id': 'org1',
           'roles': ['ap_clerk'],
+          'legal_acceptance_required': legalRequired?.call() ?? false,
         });
       }
       if (path == '/api/dashboard') return _json(_dashboardBody());
@@ -195,5 +198,54 @@ void main() {
 
     expect(find.text('pushed detail'), findsNothing);
     expect(find.byType(LoginScreen), findsOneWidget);
+  });
+
+  // Decisions §498: nothing of the app is reachable until the Terms / Privacy
+  // in force are accepted.
+  testWidgets('a session whose /me requires acceptance renders the accept '
+      'screen, not the shell', (tester) async {
+    FlutterSecureStorage.setMockInitialValues({
+      'auth_token': 'tok',
+      'tenant_slug': 'acme',
+    });
+    ApiClient().debugConfigure(client: _homeClient(legalRequired: () => true));
+
+    await tester.pumpWidget(const APApp());
+    await pumpFrames(tester);
+
+    expect(find.byType(LegalAcceptScreen), findsOneWidget);
+    expect(find.byType(HomeScreen), findsNothing);
+  });
+
+  testWidgets('a requirement raised while backgrounded meets the user on '
+      'resume, above any pushed route', (tester) async {
+    FlutterSecureStorage.setMockInitialValues({
+      'auth_token': 'tok',
+      'tenant_slug': 'acme',
+    });
+    var required = false;
+    ApiClient().debugConfigure(
+      client: _homeClient(legalRequired: () => required),
+    );
+
+    await tester.pumpWidget(const APApp());
+    await pumpFrames(tester);
+    expect(find.byType(HomeScreen), findsOneWidget);
+
+    PushService.navigatorKey.currentState!.push(
+      MaterialPageRoute(
+        builder: (_) => const Scaffold(body: Text('pushed detail')),
+      ),
+    );
+    await pumpFrames(tester, frames: 10);
+
+    required = true; // the Terms were bumped while the app was away
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await pumpFrames(tester);
+
+    expect(find.text('pushed detail'), findsNothing);
+    expect(find.byType(LegalAcceptScreen), findsOneWidget);
+    expect(find.byType(HomeScreen), findsNothing);
   });
 }

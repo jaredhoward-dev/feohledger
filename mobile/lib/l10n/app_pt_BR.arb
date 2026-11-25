@@ -1342,5 +1342,17 @@
   "listRowVendorCode": "código {code}",
   "listRowVendorSource": "origem {source}",
   "listRowInvoiceCount": "{count, plural, one {{count} fatura} other {{count} faturas}}",
-  "listRowInvoiceCountShort": "{count, plural, one {{count} fat.} other {{count} fat.}}"
+  "listRowInvoiceCountShort": "{count, plural, one {{count} fat.} other {{count} fat.}}",
+  "legalAcceptTitle": "Termos e privacidade",
+  "legalAcceptHeading": "Revise nossos termos atualizados",
+  "legalAcceptIntro": "Para continuar usando o FeohLedger, aceite os Termos de Serviço e a Política de Privacidade vigentes. Cada um abre no seu navegador.",
+  "legalTermsLink": "Termos de Serviço",
+  "legalPrivacyLink": "Política de Privacidade",
+  "legalLinkHint": "abre no seu navegador",
+  "legalLinkFailed": "Não foi possível abrir a página. Acesse-a em um navegador.",
+  "legalAcceptCheckbox": "Li e aceito os Termos de Serviço e a Política de Privacidade.",
+  "legalAcceptButton": "Aceitar",
+  "legalAcceptSignOut": "Sair",
+  "legalAcceptTickRequired": "Marque a caixa para aceitar os Termos de Serviço e a Política de Privacidade.",
+  "legalAcceptAppOutdated": "Esta versão do app mostra Termos ou uma Política de Privacidade anteriores aos vigentes, por isso não pode registrar sua aceitação. Atualize o app na sua loja de aplicativos, ou aceite no aplicativo web, e entre novamente."
 }

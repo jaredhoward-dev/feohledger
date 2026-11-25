@@ -2,7 +2,6 @@
 
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
-
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -4595,7 +4594,8 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String payRunCreatedPlain(String cfo) {
     String _temp0 = intl.Intl.selectLogic(cfo, {
-      'required': 'Payment run created. CFO approval is required before it can be executed.',
+      'required':
+          'Payment run created. CFO approval is required before it can be executed.',
       'other': 'Payment run created.',
     });
     return '$_temp0';
@@ -5019,4 +5019,45 @@ class AppLocalizationsEn extends AppLocalizations {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => 'Terms and Privacy';
+
+  @override
+  String get legalAcceptHeading => 'Please review our updated terms';
+
+  @override
+  String get legalAcceptIntro =>
+      'To keep using FeohLedger, accept the current Terms of Service and Privacy Policy. Each opens in your browser.';
+
+  @override
+  String get legalTermsLink => 'Terms of Service';
+
+  @override
+  String get legalPrivacyLink => 'Privacy Policy';
+
+  @override
+  String get legalLinkHint => 'opens in your browser';
+
+  @override
+  String get legalLinkFailed =>
+      'Could not open the page. Visit it in a browser instead.';
+
+  @override
+  String get legalAcceptCheckbox =>
+      'I have read and accept the Terms of Service and the Privacy Policy.';
+
+  @override
+  String get legalAcceptButton => 'Accept';
+
+  @override
+  String get legalAcceptSignOut => 'Sign out';
+
+  @override
+  String get legalAcceptTickRequired =>
+      'Tick the box to accept the Terms of Service and Privacy Policy.';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.';
 }

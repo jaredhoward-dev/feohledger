@@ -342,18 +342,31 @@ included, is a `422` coded `legal_acceptance_required`.
 Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
 trail (`{versions, source, ip}`).
 
-**The re-prompt is backend-only so far.** `GET /api/auth/me` returns
-`legal_acceptance_required` (the user has not accepted the versions in force)
-and `POST /api/auth/legal-acceptance` records it (source `reprompt`; 10/min per
-account; audited only on a first acceptance). But the flag is **advisory**:
-nothing in the web app or the mobile app reads it, and no server-side gate
-refuses an unaccepted user. So these are **not yet prompted or gated**:
+**The re-prompt: the mobile app asks; the web app does not yet.** `GET
+/api/auth/me` returns `legal_acceptance_required` (the user has not accepted
+the versions in force) and `POST /api/auth/legal-acceptance` records it (source
+`reprompt`; 10/min per account; audited only on a first acceptance). The flag
+is still **advisory** server-side: no gate refuses an unaccepted user. So on
+the **web** (and through the API) these are **not yet prompted or gated**:
 existing users (nothing is backfilled), SSO / SCIM users (no password, never
 meet a set-password link), anyone after a version bump, a forgot-password reset
-of a password account, mobile users and API callers. The server gate waits for
-the accept screen on purpose: without one it would lock those users out with no
-way to accept. The screen, then mobile and the supplier portal, then the gate:
+of a password account, and API callers. The server gate waits for the accept
+screens on purpose: without them it would lock those users out with no way to
+accept. The web screen, the supplier portal, then the gate:
 `docs/followups.md`.
+
+**The mobile app asks** (decisions §498). When `/me` says
+`legal_acceptance_required` (after sign-in, on session restore, or on app
+resume: the app re-reads `/me` when it returns to the foreground) the Flutter
+`AuthGate` shows a blocking accept screen instead of the app shell: links to
+the published `/legal/terms` and `/legal/privacy` pages (opened in the
+browser), a required checkbox, Accept and Sign out. It sends the versions in
+`mobile/lib/legal_versions.generated.dart`, which `pnpm gen:legal-versions`
+writes from `CURRENT_LEGAL_VERSIONS` alongside the web module (one
+`check:legal-versions` guards both). An installed build keeps the versions it
+was built with, so after a bump its Accept is refused with the coded 422; the
+screen then tells the user to update the app (or accept on the web) instead of
+asking again.
 
 The rows survive a DSAR erasure and a workspace deletion (evidence of the
 contract; no foreign keys), and the DSAR export carries them.

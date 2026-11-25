@@ -7213,6 +7213,78 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'{count, plural, one {{count} inv} other {{count} inv}}'**
   String listRowInvoiceCountShort(int count);
+
+  /// No description provided for @legalAcceptTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Terms and Privacy'**
+  String get legalAcceptTitle;
+
+  /// No description provided for @legalAcceptHeading.
+  ///
+  /// In en, this message translates to:
+  /// **'Please review our updated terms'**
+  String get legalAcceptHeading;
+
+  /// No description provided for @legalAcceptIntro.
+  ///
+  /// In en, this message translates to:
+  /// **'To keep using FeohLedger, accept the current Terms of Service and Privacy Policy. Each opens in your browser.'**
+  String get legalAcceptIntro;
+
+  /// No description provided for @legalTermsLink.
+  ///
+  /// In en, this message translates to:
+  /// **'Terms of Service'**
+  String get legalTermsLink;
+
+  /// No description provided for @legalPrivacyLink.
+  ///
+  /// In en, this message translates to:
+  /// **'Privacy Policy'**
+  String get legalPrivacyLink;
+
+  /// No description provided for @legalLinkHint.
+  ///
+  /// In en, this message translates to:
+  /// **'opens in your browser'**
+  String get legalLinkHint;
+
+  /// No description provided for @legalLinkFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not open the page. Visit it in a browser instead.'**
+  String get legalLinkFailed;
+
+  /// Accept screen (decisions §498): the required checkbox's label; also its accessible name.
+  ///
+  /// In en, this message translates to:
+  /// **'I have read and accept the Terms of Service and the Privacy Policy.'**
+  String get legalAcceptCheckbox;
+
+  /// No description provided for @legalAcceptButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Accept'**
+  String get legalAcceptButton;
+
+  /// No description provided for @legalAcceptSignOut.
+  ///
+  /// In en, this message translates to:
+  /// **'Sign out'**
+  String get legalAcceptSignOut;
+
+  /// No description provided for @legalAcceptTickRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Tick the box to accept the Terms of Service and Privacy Policy.'**
+  String get legalAcceptTickRequired;
+
+  /// Accept screen: the server refused the versions this build carries (422 legal_acceptance_required), so the app is older than the Terms / Privacy in force.
+  ///
+  /// In en, this message translates to:
+  /// **'This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.'**
+  String get legalAcceptAppOutdated;
 }
 
 class _AppLocalizationsDelegate

@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:feohledger_mobile/api/api_client.dart';
+import 'package:feohledger_mobile/legal_versions.generated.dart';
 import 'package:feohledger_mobile/models/invoice.dart';
 import 'package:feohledger_mobile/services/offline_store.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
@@ -369,6 +370,107 @@ void main() {
         7,
         reason: 'a network blip must not destroy the offline cache',
       );
+    });
+  });
+
+  group('Terms / Privacy acceptance (decisions §498)', () {
+    Map<String, dynamic> me({required bool required}) =>
+        {..._meBody(['ap_clerk']), 'legal_acceptance_required': required};
+
+    Future<void> signInRequiringAcceptance(
+      Future<http.Response> Function(http.Request req) onAccept,
+    ) async {
+      var accepted = false;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          final path = req.url.path;
+          if (path == '/api/auth/login') {
+            return _json({'access_token': 'tok-123'});
+          }
+          if (path == '/api/auth/me') return _json(me(required: !accepted));
+          if (path == '/api/auth/legal-acceptance') {
+            final res = await onAccept(req);
+            accepted = res.statusCode == 200;
+            return res;
+          }
+          return _json({});
+        }),
+      );
+      expect((await store.login('demo@acme.com', 'demo', 'acme')).isSuccess,
+          isTrue);
+    }
+
+    test('/me requiring acceptance is exposed on the store', () async {
+      await signInRequiringAcceptance((_) async => _json(me(required: false)));
+      expect(store.legalAcceptanceRequired, isTrue);
+    });
+
+    test('accept posts the generated versions and clears the flag', () async {
+      Map<String, dynamic>? sent;
+      await signInRequiringAcceptance((req) async {
+        sent = jsonDecode(req.body) as Map<String, dynamic>;
+        return _json(me(required: false));
+      });
+
+      final outcome = await store.acceptLegalDocuments();
+
+      expect(outcome, LegalAcceptOutcome.accepted);
+      expect(sent, {
+        'accepted_terms_version': kTermsVersion,
+        'accepted_privacy_version': kPrivacyVersion,
+      });
+      expect(store.legalAcceptanceRequired, isFalse);
+      expect(store.legalError, isNull);
+    });
+
+    test('a coded 422 means the app is out of date, not a generic error',
+        () async {
+      await signInRequiringAcceptance(
+        (_) async => _json({
+          'detail': {
+            'code': 'legal_acceptance_required',
+            'message': 'Please accept the current Terms of Service and '
+                'Privacy Policy to continue.',
+          },
+        }, 422),
+      );
+
+      expect(await store.acceptLegalDocuments(), LegalAcceptOutcome.appOutdated);
+      expect(store.legalAcceptanceRequired, isTrue);
+      expect(store.legalError, isNull);
+    });
+
+    test('a 429 is the standard error', () async {
+      await signInRequiringAcceptance(
+        (_) async => _json({'detail': 'Too many requests'}, 429),
+      );
+
+      expect(await store.acceptLegalDocuments(), LegalAcceptOutcome.failed);
+      expect(store.legalError, 'Too many requests');
+      expect(store.legalAcceptanceRequired, isTrue);
+    });
+
+    test('refreshProfile picks up a requirement raised after sign-in',
+        () async {
+      var required = false;
+      ApiClient().debugConfigure(
+        client: MockClient((req) async {
+          if (req.url.path == '/api/auth/login') {
+            return _json({'access_token': 'tok-123'});
+          }
+          if (req.url.path == '/api/auth/me') {
+            return _json(me(required: required));
+          }
+          return _json({});
+        }),
+      );
+      await store.login('demo@acme.com', 'demo', 'acme');
+      expect(store.legalAcceptanceRequired, isFalse);
+
+      required = true; // a version bump while the app was backgrounded
+      await store.refreshProfile();
+
+      expect(store.legalAcceptanceRequired, isTrue);
     });
   });
 }

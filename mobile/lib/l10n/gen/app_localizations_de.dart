@@ -2,7 +2,6 @@
 
 // ignore: unused_import
 import 'package:intl/intl.dart' as intl;
-
 import 'app_localizations.dart';
 
 // ignore_for_file: type=lint
@@ -4622,7 +4621,8 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String payRunCreatedPlain(String cfo) {
     String _temp0 = intl.Intl.selectLogic(cfo, {
-      'required': 'Zahlungslauf erstellt. Vor der Ausführung ist eine CFO-Freigabe erforderlich.',
+      'required':
+          'Zahlungslauf erstellt. Vor der Ausführung ist eine CFO-Freigabe erforderlich.',
       'other': 'Zahlungslauf erstellt.',
     });
     return '$_temp0';
@@ -5057,4 +5057,46 @@ class AppLocalizationsDe extends AppLocalizations {
     );
     return '$_temp0';
   }
+
+  @override
+  String get legalAcceptTitle => 'Bedingungen und Datenschutz';
+
+  @override
+  String get legalAcceptHeading =>
+      'Bitte prüfen Sie unsere aktualisierten Bedingungen';
+
+  @override
+  String get legalAcceptIntro =>
+      'Um FeohLedger weiter zu nutzen, akzeptieren Sie die aktuellen Nutzungsbedingungen und die Datenschutzerklärung. Beide öffnen sich in Ihrem Browser.';
+
+  @override
+  String get legalTermsLink => 'Nutzungsbedingungen';
+
+  @override
+  String get legalPrivacyLink => 'Datenschutzerklärung';
+
+  @override
+  String get legalLinkHint => 'öffnet sich in Ihrem Browser';
+
+  @override
+  String get legalLinkFailed =>
+      'Die Seite konnte nicht geöffnet werden. Rufen Sie sie stattdessen in einem Browser auf.';
+
+  @override
+  String get legalAcceptCheckbox =>
+      'Ich habe die Nutzungsbedingungen und die Datenschutzerklärung gelesen und akzeptiere sie.';
+
+  @override
+  String get legalAcceptButton => 'Akzeptieren';
+
+  @override
+  String get legalAcceptSignOut => 'Abmelden';
+
+  @override
+  String get legalAcceptTickRequired =>
+      'Setzen Sie das Häkchen, um die Nutzungsbedingungen und die Datenschutzerklärung zu akzeptieren.';
+
+  @override
+  String get legalAcceptAppOutdated =>
+      'Diese App-Version zeigt ältere Nutzungsbedingungen oder eine ältere Datenschutzerklärung als die derzeit geltenden und kann Ihre Zustimmung daher nicht erfassen. Aktualisieren Sie die App über Ihren App Store oder stimmen Sie in der Web-App zu und melden Sie sich dann erneut an.';
 }

@@ -69,6 +69,22 @@ class AuthApi {
     return User.fromJson(data);
   }
 
+  /// `POST /api/auth/legal-acceptance` — record that the caller accepts the
+  /// Terms / Privacy versions the accept screen showed. Returns the refreshed
+  /// profile (`legal_acceptance_required` false). A version that is not the
+  /// one in force is a 422 coded `legal_acceptance_required`; 10/min per
+  /// account, then 429 (decisions §495, §498).
+  static Future<User> acceptLegalDocuments({
+    required String termsVersion,
+    required String privacyVersion,
+  }) async {
+    final data = await _api.post('/auth/legal-acceptance', {
+      'accepted_terms_version': termsVersion,
+      'accepted_privacy_version': privacyVersion,
+    });
+    return User.fromJson(data);
+  }
+
   static Future<void> logout() async {
     try {
       await _api.post('/auth/logout');
