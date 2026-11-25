@@ -17,7 +17,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
-from tests.set_password_mail import capture_outbox, link_mode, link_token
+from tests.set_password_mail import ACCEPT_CURRENT, capture_outbox, link_mode, link_token
 
 
 async def _user_by_email(realdb, email):
@@ -107,7 +107,7 @@ async def test_invite_link_sets_the_password_once_and_the_user_signs_in(realdb, 
 
             done = await anon.post(
                 "/api/auth/reset-password",
-                json={"token": token, "new_password": "OwnerChosen-Pass9"},
+                json={"token": token, "new_password": "OwnerChosen-Pass9", **ACCEPT_CURRENT},
             )
             assert done.status_code == 200, done.text
 

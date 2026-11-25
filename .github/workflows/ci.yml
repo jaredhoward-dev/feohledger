@@ -202,6 +202,12 @@ jobs:
       - name: Pricing page is in sync with the plan catalogue
         run: python scripts/gen_pricing_catalog.py --check
 
+      # The Terms / Privacy versions every accept control sends back are
+      # GENERATED from `app/services/legal_acceptance.py` (decisions.md §495);
+      # a bump without regenerating would have the backend refuse every signup.
+      - name: Legal document versions are in sync with the frontend
+        run: python scripts/gen_legal_versions.py --check
+
       # The published sub-processor change log (`/legal/sub-processors` § 10)
       # is GENERATED from `app/services/subprocessor_changelog.py`, the same
       # entries the customer-notice sweep emails (decisions.md §321, issue

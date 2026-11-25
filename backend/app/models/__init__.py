@@ -29,6 +29,7 @@ from app.models.gl_account import GLAccount, GLAccountErpLink
 from app.models.international_tax import IntlTaxRecord, TaxKind
 from app.models.invoice import Invoice, InvoiceExtractionResult, InvoiceLineItem
 from app.models.invoice_embedding import InvoiceEmbedding
+from app.models.legal_acceptance import LegalAcceptance
 from app.models.notification import Notification
 from app.models.organization import Organization
 from app.models.payment import Payment, PaymentRun, PaymentSchedule
@@ -100,6 +101,7 @@ __all__ = [
     "WebhookDelivery",
     "WorkspaceClosure",
     "SubprocessorNotice",
+    "LegalAcceptance",
     # Tenant-scoped models
     "AgentDecision",
     "AuditLog",

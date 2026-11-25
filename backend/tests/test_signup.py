@@ -36,7 +36,9 @@ from app.models.organization import Organization
 from app.models.signup import EmailVerification
 from app.models.user import User
 from app.services import password_reset
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
 from app.services.tenant_provisioning import ProvisioningResult
+from tests.set_password_mail import ACCEPT_CURRENT
 
 
 def _unique_slug() -> str:
@@ -145,6 +147,8 @@ def _start_body(slug: str, email: str | None = None) -> dict:
         "admin_name": "Jared Howard",
         "admin_email": email or f"{slug}@example.com",
         "captcha_token": "ignored-in-dev",
+        "accepted_terms_version": CURRENT_LEGAL_VERSIONS["terms"],
+        "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
     }
 
 
@@ -434,6 +438,7 @@ async def _seed_verification(
     email: str,
     consumed: bool = False,
     expired: bool = False,
+    accepted: bool = True,
 ) -> str:
     token = uuid.uuid4().hex + uuid.uuid4().hex  # 64 chars, >= schema min 16
     token = token[:60]
@@ -452,7 +457,19 @@ async def _seed_verification(
                     else datetime.now(UTC) + timedelta(hours=1)
                 ),
                 consumed_at=datetime.now(UTC) if consumed else None,
-                meta={},
+                # What /start now stores: the Terms / Privacy versions the form
+                # showed and when the box was ticked (decisions §495).
+                # `accepted=False` is a verification from before that.
+                meta=(
+                    {
+                        "legal_acceptance": {
+                            "versions": dict(CURRENT_LEGAL_VERSIONS),
+                            "accepted_at": "2026-11-24T09:00:00+00:00",
+                        }
+                    }
+                    if accepted
+                    else {}
+                ),
             )
         )
         await s.commit()
@@ -975,7 +992,10 @@ async def test_forgot_password_works_for_a_signup_admin_who_never_set_one(
             (msg,) = sent
             token = msg.body_text.split("token=")[1].split()[0]
             reset = await c.post(
-                "/api/auth/reset-password", json={"token": token, "new_password": "Recovered!2026"}
+                "/api/auth/reset-password",
+                # Still passwordless and never accepted: the link is its front
+                # door, so it carries the acceptance (decisions §495).
+                json={"token": token, "new_password": "Recovered!2026", **ACCEPT_CURRENT},
             )
             assert reset.status_code == 200, reset.text
             ok = await c.post(

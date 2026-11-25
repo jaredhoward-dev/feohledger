@@ -185,6 +185,14 @@ CONTROL_TABLES_EXEMPT: dict[str, str] = {
         "outlives the customer it was given to. Ids, dates and counts only — no "
         "address or name."
     ),
+    "legal_acceptances": (
+        "The record that this organisation's users accepted our Terms of Service "
+        "and Privacy Policy, which version and when (services/legal_acceptance.py, "
+        "decisions §495). It is the evidence a contract was formed, kept for "
+        "legal claims about it after the customer has gone. User and "
+        "organisation ids, document, version and time only — no address, name, "
+        "IP or user agent."
+    ),
 }
 
 
