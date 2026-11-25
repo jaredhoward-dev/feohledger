@@ -1777,7 +1777,7 @@ async def _resolved_erp(org: Organization) -> dict | None:
         return await provider_config(org, "erp", db=ctrl) or None
 
 
-async def _bills_we_posted(
+async def bills_we_posted(
     factory, bill_ids: list[str], realm: str | None, *, by_reference: bool = False
 ) -> list[str]:
     """The bills of ``bill_ids`` some invoice here was pushed as, under
@@ -1822,7 +1822,7 @@ async def sync_bills(org: Organization, bill_ids: list[str], *, event_id: str | 
     realm = connection_realm(erp_config)
     factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
     changed = 0
-    for bill_id in await _bills_we_posted(
+    for bill_id in await bills_we_posted(
         factory,
         list(dict.fromkeys(bill_ids)),
         realm,

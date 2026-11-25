@@ -117,11 +117,11 @@ async def apply_merge_event(org, erp_config: dict, event: MergeEvent) -> str:
     from app.services.erp_adapters import get_erp_adapter
     from app.services.erp_adapters.merge_dev import MergeBillNotFound
     from app.services.erp_link_realm import connection_realm
-    from app.services.erp_status_sync import _bills_we_posted, apply_bill_report
+    from app.services.erp_status_sync import apply_bill_report, bills_we_posted
 
     realm = connection_realm(erp_config)
     factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
-    if not await _bills_we_posted(factory, [event.bill_id], realm, by_reference=True):
+    if not await bills_we_posted(factory, [event.bill_id], realm, by_reference=True):
         return "unmatched"
     try:
         report = await get_erp_adapter(erp_config).bill_report(event.bill_id)

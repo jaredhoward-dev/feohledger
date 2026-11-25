@@ -1977,12 +1977,12 @@ async def test_a_xero_bill_only_a_realmless_push_names_is_never_read(realdb, mon
 
     factory = realdb.sessionmaker("a")
     realm = "quickbooks_online:any"
-    assert await erp_status_sync._bills_we_posted(factory, [XERO_BILL], realm) == [XERO_BILL]
+    assert await erp_status_sync.bills_we_posted(factory, [XERO_BILL], realm) == [XERO_BILL]
     assert (
-        await erp_status_sync._bills_we_posted(factory, [XERO_BILL], realm, by_reference=True) == []
+        await erp_status_sync.bills_we_posted(factory, [XERO_BILL], realm, by_reference=True) == []
     )
     assert (
-        await erp_status_sync._bills_we_posted(factory, [XERO_BILL], None, by_reference=True) == []
+        await erp_status_sync.bills_we_posted(factory, [XERO_BILL], None, by_reference=True) == []
     )
 
 
