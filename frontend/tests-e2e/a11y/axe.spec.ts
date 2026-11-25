@@ -196,6 +196,39 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 		});
 	}
 
+	// Profile → Out of office, loaded and with a refused submit's field errors
+	// showing — at desktop width and at the 390px phone width. The worker admin
+	// holds `invoice.approve`, so the section is offered; its two reads are
+	// stubbed (off, one candidate) so the form is there to refuse, and nothing
+	// is saved.
+	for (const width of [1280, 390]) {
+		test(`profile → out of office at ${width}px, loaded and with field errors, has no axe violations`, async ({
+			page
+		}) => {
+			await page.route(
+				(url) => url.pathname === '/api/auth/delegation',
+				(route) =>
+					route.request().method() === 'GET'
+						? route.fulfill({
+								json: { delegate_to_id: null, delegate_to_name: null, until: null, is_active: false }
+							})
+						: route.fallback()
+			);
+			await page.route(
+				(url) => url.pathname === '/api/auth/delegation/candidates',
+				(route) => route.fulfill({ json: [{ id: 'axe-candidate', full_name: 'Axe Candidate' }] })
+			);
+			await page.setViewportSize({ width, height: 900 });
+			await page.goto('/profile?section=delegation');
+			const panel = page.getByTestId('delegation-panel');
+			await expect(panel.getByTestId('delegation-status')).toBeVisible();
+			await expectNoA11yViolations(page);
+			await panel.getByTestId('delegation-save').click();
+			await expect(panel.getByLabel('Delegate')).toHaveAttribute('aria-invalid', 'true');
+			await expectNoA11yViolations(page);
+		});
+	}
+
 	// The SCIM panel's loaded body (its status line) and its one-time reveal
 	// dialog, whose token must be readable and copyable by keyboard.
 	test('organization settings → scim, loaded and with the token dialog open, has no axe violations', async ({
