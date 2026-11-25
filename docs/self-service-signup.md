@@ -24,20 +24,23 @@ pilot. With it off:
   "what happens next" panel) instead of a form every submit of which would fail.
   The landing page's calls to action still lead there, which is deliberate —
   see [decisions.md](decisions.md) §193.
-- **The hCaptcha secret stops being required.** The deployed-env boot check
-  (`config.py::_require_captcha_in_deployed_envs`) and `deploy/decrypt-env.sh`
-  demand `FEOH_HCAPTCHA_SECRET` only while signup is on: with nothing public
-  creating tenants there is nothing for a captcha to protect.
+- **The hCaptcha keys are still required.** Closing signup used to waive them;
+  since [decisions.md](decisions.md) §553 it does not: the public "email me my
+  workspace address" form (§ Forgot your workspace, below) is served whether
+  signup is open or not and verifies the same captcha, so the deployed-env
+  boot check (`config.py::_require_captcha_in_deployed_envs`) and
+  `deploy/decrypt-env.sh` demand both keys on every deployment.
 - A verification link already emailed while signup was open stays unconsumed;
   re-opening signup lets that visitor finish.
 
-**What production should set:** a deployment that takes self-service customers
-keeps the default (`true`) and **must** set `FEOH_HCAPTCHA_SECRET` and
-`FEOH_HCAPTCHA_SITEKEY` — it refuses to boot without either (the site key is
-what `/api/public-config` hands the widget; without it every signup fails the
-captcha), and the post-deploy smoke check confirms `public-config` serves it. A deployment
-whose tenants are provisioned by hand sets `FEOH_SIGNUP_ENABLED=false` and may
-leave both hCaptcha values empty.
+**What production should set:** every deployment **must** set
+`FEOH_HCAPTCHA_SECRET` and `FEOH_HCAPTCHA_SITEKEY` — it refuses to boot without
+either (the site key is what `/api/public-config` hands the widget; without it
+every workspace lookup and signup fails the captcha), and the post-deploy smoke
+check confirms `public-config` serves it. A deployment that takes self-service
+customers keeps signup on (the default); one whose tenants are provisioned by
+hand sets `FEOH_SIGNUP_ENABLED=false`, and still sets both keys for the
+workspace lookup (§553).
 
 The two hCaptcha values must come from the **same hCaptcha account**: the
 sitekey from the site's entry under *Sites*, the secret from *Settings →
@@ -89,7 +92,8 @@ A user who has forgotten which workspace they sign in on has no host to run forg
 
 - **One answer for everyone.** Every well-formed address that passes the budgets and the captcha gets `200 {"status": "accepted", "message": "If that address has an account, we've emailed it…"}`, and the page shows the same "if it has an account, we've emailed it" confirmation. The route never reads `users`: it spawns a detached task (`utils/detached_tasks.spawn_detached`, forgot-password's shape) and returns, so the lookup, the send and the audit row all happen after the response and its timing says nothing either.
 - **Only the mailbox learns the workspace.** The task finds the account (case- and padding-insensitive, like sign-in); none, or a deactivated one, ends silently. Otherwise it emails the account's own `tenant_urls.sign_in_url(..., email=..., prefer_custom_domain=True)` — the workspace's custom domain when it has one, as the wrong-workspace login refusal does (§288) — with the address prefilled, the workspace's name, and an "ignore this if it wasn't you" line. Subject and copy are `workspace_lookup.*` in the email catalogue, in the account's saved language, else the form's. The send is audited in the account's tenant as `auth.workspace_lookup.emailed` (`details.ip` only).
-- **Abuse controls are signup's machinery on their own budgets**: the same `check_rate_limit` per IP (`FEOH_WORKSPACE_LOOKUP_RATE_LIMIT_PER_HOUR`, default 5), then the shape check (`422` coded `signup_email_invalid`, `params.field: "email"`), then per address (`FEOH_WORKSPACE_LOOKUP_EMAIL_RATE_LIMIT_PER_HOUR`, default 3, keyed through `auth_identity_key`, so the address never becomes part of a Redis key and a known and an unknown address exhaust it identically), then the same `verify_captcha` (`400` coded `captcha_required` / `captcha_failed` / `captcha_unavailable`). The widget is the shared `HCaptcha.svelte` the signup form uses.
+- **Abuse controls are signup's machinery on their own budgets**, in this order: the same `check_rate_limit` per IP (`FEOH_WORKSPACE_LOOKUP_RATE_LIMIT_PER_HOUR`, default 5 — cheap, so a flood from one source is refused before any captcha call), then the shape check (`422` coded `signup_email_invalid`, `params.field: "email"`), then the same `verify_captcha` (`400` coded `captcha_required` / `captcha_failed` / `captcha_unavailable`), then per address (`FEOH_WORKSPACE_LOOKUP_EMAIL_RATE_LIMIT_PER_HOUR`, default 3, keyed through `auth_identity_key`, so the address never becomes part of a Redis key and a known and an unknown address exhaust it identically). **Only a solved captcha spends an address's budget** ([decisions.md](decisions.md) §553): with the address budget first, anyone could lock a stranger out of the flow for the hour with unsolved requests from rotating IPs. The widget is the shared `HCaptcha.svelte` the signup form uses.
+- **The captcha is required on every deployment.** The lookup is served whether signup is open or not, so a deployed environment refuses to boot without both hCaptcha keys regardless of `FEOH_SIGNUP_ENABLED` (`config.py::_require_captcha_in_deployed_envs`, §553). Local dev (`FEOH_ENVIRONMENT` unset) keeps running it with no captcha.
 - **The address is never logged**: a failed send logs the user id and the exception class only.
 
 Why this shape, and what was rejected: [decisions.md](decisions.md) §518.
@@ -167,7 +171,7 @@ self-service workspace closure.
 
 ## Abuse mitigations
 
-- **Captcha**: hCaptcha on `POST /signup/start`. Skipped locally when `FEOH_HCAPTCHA_SECRET` is empty — but a **deployed** env (`FEOH_ENVIRONMENT` not in `development`/`test`/`ci`/…) with signup on **refuses to boot** with the secret empty, so the gate can't silently fail open in production. The empty-secret skip logs at WARNING. To close signup, don't starve the captcha — set `FEOH_SIGNUP_ENABLED=false` (above), which also lifts the secret requirement.
+- **Captcha**: hCaptcha on `POST /signup/start`. Skipped locally when `FEOH_HCAPTCHA_SECRET` is empty — but a **deployed** env (`FEOH_ENVIRONMENT` not in `development`/`test`/`ci`/…) **refuses to boot** with the secret or the site key empty — signup open or closed, since the workspace lookup verifies the same captcha (§553) — so the gate can't silently fail open in production. The empty-secret skip logs at WARNING. To close signup, set `FEOH_SIGNUP_ENABLED=false` (above); it no longer lifts the captcha requirement.
 - **Rate limit (per IP)**: Redis sliding window keyed by IP+endpoint. `FEOH_SIGNUP_RATE_LIMIT_PER_HOUR` (default 5) caps `/signup/start` and `/signup/complete`; `/signup/slug-check` has its own higher cap (`FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR`, default 120) so it can't be scripted for namespace enumeration / control-plane DB amplification.
 - **A limit's refusal** is a `429` with `Retry-After` and the coded `rate_limited` detail (`params.retry_after_seconds`), which the signup page states in the visitor's language in its banner — "wait 30 minutes", rounded up — since it is about no one field. It names no limit and no count.
 - **Rate limit (per email)**: a second limiter keyed on the target address (`FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR`, default 3) caps verification-email volume to one victim — the per-IP limit alone can't stop an attacker rotating IPs to email-bomb an address. A "resend" also **replaces** any prior un-consumed verification for that email, so the table can't grow unbounded per address.
@@ -201,9 +205,9 @@ Adding a provider: copy `app/services/email_adapters/console_adapter.py`, implem
 | `FEOH_TENANT_URL_TEMPLATE` | `http://{slug}.localhost:7777` | `{slug}` is substituted in the welcome email and the set-password link; blank → `/signup/complete` answers 503 before provisioning. Must be `http(s)://{slug}<host>` with nothing before `{slug}` and no path: the signup form and `/find-workspace` read the host suffix from it (`lib/utils/workspaceAddress.ts::tenantHostSuffix`) and show none for any other shape |
 | `FEOH_SIGNUP_SET_PASSWORD_TTL_HOURS` | `72` | Lifetime of the signup admin's single-use set-password link (minimum 1). Longer than the 30-minute forgot-password link because nobody is waiting at the keyboard for it — see `docs/decisions.md` §283 |
 | `FEOH_ENVIRONMENT` | `development` | Deployment discriminator. Any value outside `development`/`dev`/`local`/`test`/`ci` is "deployed" and turns on the production safety guards (e.g. captcha must be configured). |
-| `FEOH_SIGNUP_ENABLED` | `true` | Master switch for `/api/signup/*`. `false` → every signup route 404s, `/signup` says signup is closed, and the hCaptcha secret is no longer required. See § Turning signup off. |
-| `FEOH_HCAPTCHA_SECRET` | *(empty)* | Empty skips verification — OK for local dev; a deployed env with signup on refuses to boot when empty. |
-| `FEOH_HCAPTCHA_SITEKEY` | *(empty)* | Exposed to the frontend via `/api/public-config` (alongside `signup_enabled`) |
+| `FEOH_SIGNUP_ENABLED` | `true` | Master switch for `/api/signup/*`. `false` → every signup route 404s and `/signup` says signup is closed; the hCaptcha keys stay required (the workspace lookup, §553). See § Turning signup off. |
+| `FEOH_HCAPTCHA_SECRET` | *(empty)* | Empty skips verification — OK for local dev; a deployed env refuses to boot when empty, signup open or closed (§553). |
+| `FEOH_HCAPTCHA_SITEKEY` | *(empty)* | Exposed to the frontend via `/api/public-config` (alongside `signup_enabled`); a deployed env refuses to boot when empty (§553) |
 | `FEOH_SIGNUP_RATE_LIMIT_PER_HOUR` | `5` | Per-IP cap on `/signup/start` (and `/signup/complete`) |
 | `FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR` | `3` | Per-email cap on verification sends (anti email-bombing) |
 | `FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR` | `120` | Per-IP cap on `/signup/slug-check` (anti-enumeration) |

@@ -259,7 +259,9 @@ redeploy can never pick up an upstream retag; bumps arrive as Dependabot
   rate limits and the login/signup audit rows key on the real client from
   Caddy's `X-Forwarded-For` — untrusted, every user would collapse into the
   proxy's container IP and the signup/login caps would throttle everyone
-  collectively.
+  collectively. A deployed API refuses to boot with it empty (`docs/decisions.md`
+  §553); compose's `:-` default also fills an empty value from the sops env, so
+  only a deliberate override changes it.
 - `caddy` — ports 80/443. `deploy/Caddyfile` (domains via env) has one site,
   `api.feohledger.com` → `reverse_proxy api:8000`, and a `vanity` snippet for
   customer domains, listed one block each in the per-VM, gitignored
@@ -288,11 +290,11 @@ Beyond the committed defaults, the deployed env sets at minimum:
 
 | Var | Value |
 |---|---|
-| `FEOH_ENVIRONMENT` | `production` (arms hCaptcha enforcement on signup, while signup is on) |
+| `FEOH_ENVIRONMENT` | `production` (arms the deployed boot checks, among them the hCaptcha pair and the `FEOH_TRUSTED_PROXY_CIDRS` decision) |
 | `FEOH_SECRET_KEY` | `openssl rand -hex 32` |
 | `FEOH_CREDENTIAL_KMS_KEY_ID` | `terraform output app_kms_key_alias` (e.g. `alias/feohledger-app-prod`) — the key that seals tenant ERP / payment / card credentials. **Required**: the API (and `alembic`) refuse to boot in production without it, and `deploy.sh` refuses first. Set it before the first deploy carrying migration 0110, which seals the existing credentials with it. The VM role already holds `kms:GenerateDataKey` + `kms:Decrypt` on that key (`infra/compute.tf`) |
-| `FEOH_SIGNUP_ENABLED` | `false` to keep self-service signup closed (every `/api/signup/*` route 404s and `/signup` says signup is closed) — the usual choice here, with tenants provisioned by `deploy/add-tenant.sh`. Leave it unset (on) only when you want public signup, and then set both hCaptcha keys |
-| `FEOH_HCAPTCHA_SECRET` / `FEOH_HCAPTCHA_SITEKEY` | **Both required while signup is on** — the API refuses to boot in production with either empty (no site key means no widget, so every signup fails the captcha), and `deploy.sh` refuses first. With `FEOH_SIGNUP_ENABLED=false` neither is needed. |
+| `FEOH_SIGNUP_ENABLED` | `false` to keep self-service signup closed (every `/api/signup/*` route 404s and `/signup` says signup is closed) — the usual choice here, with tenants provisioned by `deploy/add-tenant.sh`. Leave it unset (on) only when you want public signup. The hCaptcha keys are required either way (next row) |
+| `FEOH_HCAPTCHA_SECRET` / `FEOH_HCAPTCHA_SITEKEY` | **Both required, signup open or closed** — the public workspace lookup on `/find-workspace` verifies the captcha either way (`docs/decisions.md` §553). The API refuses to boot in production with either empty (no site key means no widget, so every lookup and signup fails the captcha), and `deploy.sh` refuses first. |
 | `FEOH_DATABASE_URL` | **RDS path:** `postgresql+asyncpg://feoh_app@<RDS endpoint>:5432/feohledger` — no password (IAM auth), the endpoint host name exactly as RDS reports it (verify-full checks the certificate against it, and the token is signed for it), no query string. Before `deploy/db-role-cutover.sh` (and on the break-glass path) it is the master's URL with its URL-safe password instead. Setting it is what selects the RDS path. **Container path:** leave unset — compose derives it from `POSTGRES_PASSWORD` |
 | `FEOH_DATABASE_IAM_AUTH` | **RDS path:** `"true"` with the password-less app-role URL above; `"false"` (or unset) only with a password URL. `decrypt-env.sh` refuses both together and neither. **Container path:** leave unset |
 | `PGSSLMODE` | **RDS path:** `verify-full` (required; with a password URL `require` / `verify-ca` warn, and with IAM auth anything but `verify-full` is refused). **Container path:** leave unset — the container serves no TLS |

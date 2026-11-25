@@ -175,13 +175,21 @@ FEOH_EMAIL_PROVIDER=ses
 FEOH_EMAIL_FROM=no-reply@feohledger.com
 FEOH_PUBLIC_URL=https://feohledger.com
 FEOH_TENANT_URL_TEMPLATE=https://{slug}.feohledger.com
-# Self-service signup: keep it on (the default) for a public SaaS, and set
-# both hCaptcha keys — the API refuses to boot without the secret while signup
-# is on. For an invite-only deployment whose tenants are provisioned by an
-# operator, set FEOH_SIGNUP_ENABLED=false instead and omit both keys.
+# Self-service signup: keep it on (the default) for a public SaaS; for an
+# invite-only deployment whose tenants are provisioned by an operator, set
+# FEOH_SIGNUP_ENABLED=false. Both hCaptcha keys are required EITHER WAY: the
+# public workspace lookup (/find-workspace) verifies the captcha whether signup
+# is open or not, and the API refuses to boot without them (decisions §553).
 FEOH_SIGNUP_ENABLED=true
 FEOH_HCAPTCHA_SECRET=<from hCaptcha dashboard>
 FEOH_HCAPTCHA_SITEKEY=<from hCaptcha dashboard>
+
+# Client IP behind the ALB — REQUIRED in production (refuses to boot empty,
+# decisions §553). The ALB's subnets (infra var.vpc_cidr), so per-IP limits and
+# audit rows see the real client from X-Forwarded-For; empty would collapse
+# every client into the ALB's address and make every per-IP limit global.
+# `none` only for an API clients reach with no proxy in front.
+FEOH_TRUSTED_PROXY_CIDRS=10.40.0.0/16
 ```
 
 See `docs/environment.md` for the full var list including extraction, ERP, and card platform keys.

@@ -128,8 +128,9 @@ loads its certificates:
 - Not the apex or a tenant subdomain: they are CloudFront's, and the release
   workflow checks them after the publish (`smoke-frontend.sh`).
 - `https://<API_DOMAIN>/api/public-config` — `signup_enabled` must match
-  `FEOH_SIGNUP_ENABLED` in `.env` (unset means on, as in the app), and while
-  signup is on `hcaptcha_sitekey` must be `FEOH_HCAPTCHA_SITEKEY`.
+  `FEOH_SIGNUP_ENABLED` in `.env` (unset means on, as in the app), and
+  `hcaptcha_sitekey` must be `FEOH_HCAPTCHA_SITEKEY`, signup open or closed
+  (the workspace lookup needs it, `docs/decisions.md` §553).
 
 It reports every failed check, not just the first, and exits 1; the deploy then
 fails. Run it by hand any time: `./smoke.sh --vm`. From elsewhere, through
