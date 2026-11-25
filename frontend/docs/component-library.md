@@ -519,8 +519,16 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   (`tests-e2e/organization/section-nav.spec.ts`). Loads, saves, connection tests, armed
   confirms and their window-click disarm stay in the page and come down as values and callbacks
   (`saving` / `onsave`, `testing` / `testResult` / `ontest`, …). The page renders every one inside
-  its single `<fieldset disabled={readOnly}>`, the whole read-only mode. Each carries a copy of the
-  page's panel CSS it uses (Svelte scopes a page's `<style>` to the page); `CustomDomainsPanel`
+  its single `<fieldset disabled={readOnly}>`, the whole read-only mode. The form layout every
+  panel shares — `.form-grid` with its ≤600px one-column rule, `.full-width`, `.section-footer` —
+  is declared **once** in `src/app.css` under `.org-panel`, and a panel that uses any of them
+  wears `class="card org-panel"` on its root `<section>` (decisions §530); a scoped copy is refused
+  by `organization/sharedPanelCss.test.ts`. The rest of the panel CSS each uses stays a scoped copy
+  (Svelte scopes a page's `<style>` to the page): the element rules (`label`, the text-entry
+  `input` recipe) because under a global namespace they would reach a nested `SecretField` or
+  picker's inputs, and `.card` / `.card h2` / `.card-hint` because panel-local rules override them
+  at equal specificity. `OrgSettingPanel` keeps its own, different `.section-footer` and no
+  `org-panel`. `CustomDomainsPanel`
   and `ResidencyPanel` take the page's `intro` snippet, shared with the load-failure branch the
   page renders outside the fieldset. `panelState.ts` also holds what a panel and the page's save
   both read: `CARD_REGIONS` / `cardAutoProvider`, `EXTRACTION_PROVIDERS` /
