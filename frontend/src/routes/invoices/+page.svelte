@@ -7,7 +7,7 @@
 		AdvancedSearchFilters,
 		InvoiceMatchingIdsResponse
 	} from '#lib/types/invoice.ts';
-	import { INVOICE_STATUSES, INVOICE_STATUS_LABEL_KEYS, EMPTY_ADVANCED_FILTERS, SYSTEM_MANAGED_STATUSES, IMMUTABLE_STATUSES, commonTransitions, ENTRY_BULK_STATUS_TARGETS, INVOICE_ENTRY_ROLES, INVOICE_IMPORT_ROLES, INVOICE_MANAGE_ROLES } from '#lib/types/invoice.ts';
+	import { INVOICE_STATUSES, INVOICE_STATUS_LABEL_KEYS, EMPTY_ADVANCED_FILTERS, SYSTEM_MANAGED_STATUSES, IMMUTABLE_STATUSES, commonTransitions, ENTRY_BULK_STATUS_TARGETS, INVOICE_ENTRY_ROLES, INVOICE_IMPORT_ROLES, INVOICE_MANAGE_ROLES, selectableMatchingTotal } from '#lib/types/invoice.ts';
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
@@ -696,6 +696,22 @@
 		selectableInvoices.length > 0 && selectableInvoices.every((inv) => selected.has(inv.id))
 	);
 
+	// What "Select all N matching" would select: the filtered set minus its
+	// system-managed rows, which `GET /api/invoices/ids` excludes. The list's
+	// `total` counts those too, so offering it named a figure the action then
+	// fell short of, and with every row already loaded it still offered the
+	// button whenever one of them was system-managed — a click that selected
+	// nothing new. Falls back to `total` only while the tallies are missing.
+	let matchingSelectableTotal = $derived(
+		selectableMatchingTotal(invoiceStore.statusCounts, activeStatuses) ?? invoiceStore.total
+	);
+	let offerSelectAllMatching = $derived(
+		allSelected &&
+			!selectedAllMatching &&
+			invoiceStore.hasMore &&
+			matchingSelectableTotal > selectableInvoices.length
+	);
+
 	let selectedStatuses = $derived.by(() => {
 		const statuses = new Set<InvoiceStatus>();
 		for (const inv of invoiceStore.all) {
@@ -1059,11 +1075,11 @@
 		onclear={() => { selected = new Set(); selectedAllMatching = false; }}
 	>
 		{#snippet lead()}
-			{#if allSelected && !selectedAllMatching && invoiceStore.total > selectableInvoices.length}
+			{#if offerSelectAllMatching}
 				<button type="button" class="btn-secondary bulk-select-all-matching" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total: invoiceStore.total })}
+						: m('common.selectAllMatching', { total: formatCount(matchingSelectableTotal) })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
