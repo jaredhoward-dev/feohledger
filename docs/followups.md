@@ -1041,10 +1041,22 @@ scope (§260) — do not fold them into any of these.
       since §541 it applies only to a tenant that opted in with
       `settings.erp.netsuite_status_sync`, off by default — a sandbox pass
       under #654 is what makes switching it on safe).
-      Business Central, Sage Accounting (and its ZA edition), Sage Intacct,
-      SYSPRO and Blackbaud remain; the sweep now selects an OAuth tenant by
-      its connection and a credentials-based one by `settings.erp.type`, so
-      each needs only its adapter. For every other
+      Sage Accounting (and its ZA edition), Sage Intacct, SYSPRO and
+      Blackbaud remain; the sweep now selects an OAuth tenant by its
+      connection and a credentials-based one by `settings.erp.type`, so each
+      needs only its adapter. **Business Central was assessed in round 46 and
+      cannot be built on its standard API v2.0** (§546): `purchaseInvoice`
+      states no open amount and v2.0 publishes no vendor ledger entry, so
+      `Open` cannot be told from part-paid; its `Paid` is the invoice's
+      `Closed` flag, credit memos included; and `vendorPaymentJournals` has
+      no `post` action, so a write-back would stay an unposted journal line.
+      Since §546 BC's `Paid` reads `settled_no_payment` (the §528 poll flags
+      it for a person, never books cash). BC's durable fix is a FeohLedger
+      per-tenant extension (a custom API page over Vendor Ledger Entry with
+      remaining amount and applied entries by document type, and a bound
+      action that posts our own vendor payment batch), or reading BC through
+      Merge.dev once Merge carries a marker; trigger: the first BC tenant who
+      pays bills in BC and wants FeohLedger to pay them too. For every other
       ERP a push still closes at `done`, and `done` is terminal, so the ERP's
       later payment cannot be recorded. The webhook's `Paid` and "record
       payment made outside" both skip a `done` invoice. The adapter reads are
