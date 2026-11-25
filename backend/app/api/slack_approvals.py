@@ -43,12 +43,14 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.email_actions import (
+    LEGAL_ACCEPTANCE_MESSAGE,
     _claim_jti,
     _load_reviewer,
     _release_jti,
     _resolve_org,
     _tenant_session,
     may_approve,
+    owes_legal_acceptance,
 )
 from app.config import settings
 from app.database import get_control_db
@@ -202,6 +204,11 @@ async def slack_interactivity(
     if not may_approve(reviewer):
         logger.warning("slack interactivity: reviewer not permitted")
         return _ack()
+    # Owes a Terms / Privacy acceptance: refused before the claim, so the
+    # button still works once they accept in the app (decisions §505).
+    if await owes_legal_acceptance(ctrl_db, reviewer):
+        logger.info("slack interactivity: reviewer owes a legal acceptance")
+        return _ack(LEGAL_ACCEPTANCE_MESSAGE)
 
     # 4. Single-use consume on the message's button PAIR
     #    (`ActionToken.consume_key`) — a re-clicked button can't double-act, and

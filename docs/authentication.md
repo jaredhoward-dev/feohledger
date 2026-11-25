@@ -373,9 +373,14 @@ user query, so the gate adds no round trip. The portal twin is
 `get_current_vendor_user` (403 `privacy_acknowledgement_required`; exempt:
 portal `/me`, `/legal-acknowledgement`, `/change-password`). Out of scope:
 `/api/v1` API keys (no person behind a key), SCIM, inbound webhooks and public
-pages. Not yet covered: the Slack / Teams approval buttons and the emailed
-approve link, which act on a single-use action token rather than a JWT
-(`docs/followups.md`). **Existing users with nothing on record are blocked
+pages. The Slack / Teams approval buttons and the emailed approve link act on a
+single-use action token rather than a JWT, so they never reach that resolver:
+each door asks `email_actions.owes_legal_acceptance` for the reviewer the token
+names, right after the `invoice.approve` check and before the token's
+single-use claim, and refuses in its own style (the email page "Terms
+acceptance required", the chat reply `LEGAL_ACCEPTANCE_MESSAGE`) without
+spending the link or button, which works once the reviewer has accepted.
+**Existing users with nothing on record are blocked
 until they accept on the web or mobile, and a mobile build older than a
 version bump can only sign out — ship a bump with, or after, an app release
 carrying the new versions.**

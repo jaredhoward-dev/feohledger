@@ -25838,9 +25838,16 @@ client, was never asked, and nothing refused them.
   creator met the gate in the app that minted it), SCIM's bearer token, the
   inbound webhooks (signed machine callers), and the public pages. None of
   them reaches either resolver; the test pins that no API-key route does.
-  **Not covered, and tracked in `docs/followups.md`:** the Slack / Teams
-  approval buttons and the emailed approve link act for a person on a
-  single-use action token, not a JWT, so they do not reach the gate either.
+  **The token doors** — the Slack / Teams approval buttons and the emailed
+  approve link — act for a person on a single-use action token, not a JWT,
+  so they do not reach either resolver. Each asks
+  `api/email_actions.owes_legal_acceptance` for the reviewer the token names,
+  right after the `invoice.approve` check and before the single-use claim,
+  and refuses in its own channel's style (the email confirm POST's info page,
+  the Slack / Teams ack text `LEGAL_ACCEPTANCE_MESSAGE`), so the link or
+  button still works once the reviewer accepts. One shared check, so the
+  three doors cannot drift (`tests/test_email_actions.py`,
+  `test_slack_approvals.py`, `test_teams_approvals.py`).
 - **Consequences.** Every existing user with no acceptance on record is
   refused everywhere but the step until they accept on the web or mobile.
   A mobile build older than a version bump can then only sign out (its Accept

@@ -693,3 +693,34 @@ async def test_an_in_app_reject_and_resubmit_retires_the_link(realdb, signing_ke
         resp = await c.post(f"/api/invoices/email-action/{stale}/confirm")
     assert "changed after this message was sent" in resp.text
     assert await _status(realdb, inv_id) == InvoiceStatus.ready_for_review
+
+
+# ---------------------------------------------------------------------------
+# A reviewer who owes a Terms / Privacy acceptance (decisions §505)
+# ---------------------------------------------------------------------------
+
+
+async def test_reviewer_owing_legal_acceptance_is_refused_without_spending_the_link(
+    realdb, signing_key
+):
+    """The link acts for a person on a token, not a JWT, so it never meets
+    `get_current_user`'s gate; the door refuses the same reviewer itself, before
+    the single-use claim, and the link works once they have accepted."""
+    from app.api.email_actions import LEGAL_ACCEPTANCE_MESSAGE
+    from tests.legal_gate_probe import acceptance_withdrawn
+
+    info = realdb.info("a")
+    inv_id = await _make_invoice(realdb, uploaded_by_id=info.users["admin"])
+    token = _token(realdb, inv_id)
+
+    async with acceptance_withdrawn(realdb, info.users["ap_manager"]) as accept:
+        async with realdb.client(key="a", role=None) as c:
+            refused = await c.post(f"/api/invoices/email-action/{token}/confirm")
+            assert refused.status_code == 200
+            assert LEGAL_ACCEPTANCE_MESSAGE in refused.text
+            assert await _status(realdb, inv_id) == InvoiceStatus.ready_for_review
+
+            await accept()
+            resp = await c.post(f"/api/invoices/email-action/{token}/confirm")
+    assert "approved" in resp.text.lower(), resp.text
+    assert await _status(realdb, inv_id) == InvoiceStatus.approved
