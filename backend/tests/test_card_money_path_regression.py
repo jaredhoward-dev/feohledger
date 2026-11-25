@@ -817,7 +817,7 @@ async def _leg(realdb, pay_id):
 
 
 async def test_an_authorization_alone_leaves_the_run_card_leg_in_flight(realdb):
-    """Decisions §544: an authorization is a hold the network can still reverse
+    """Decisions §543: an authorization is a hold the network can still reverse
     or let expire — no money moved. The card reads `charged`, but nothing is
     written onto the run payment, coverage is `in_flight`, and the payment
     sync is not dispatched (it would only skip the leg)."""
@@ -835,7 +835,7 @@ async def test_an_authorization_alone_leaves_the_run_card_leg_in_flight(realdb):
 
 
 async def test_the_settlement_writes_the_charge_onto_its_payment_and_dispatches_once(realdb):
-    """Decisions §537 / §544: the settlement is the money. Its figure is written
+    """Decisions §537 / §543: the settlement is the money. Its figure is written
     onto the leg's payment, coverage judges it (here short: 90 of 100), and the
     run's payment sync is re-dispatched exactly once, with the run and org."""
     org_id, run_id, pay_id, token = await _run_card_leg(realdb)
@@ -869,7 +869,7 @@ async def test_a_full_settlement_covers_the_leg(realdb):
     "follow_up", ["authorization.reversal", "authorization.expired", "authorization.declined"]
 )
 async def test_a_reversed_or_expired_authorization_never_counts_as_paid(realdb, follow_up):
-    """The case §544 exists for: an authorization that is then reversed,
+    """The case §543 exists for: an authorization that is then reversed,
     expires or is declined moved no money. The leg was never counted (the
     authorization wrote nothing), so it stays in flight; nothing to undo."""
     _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
@@ -888,7 +888,7 @@ async def test_a_reversed_or_expired_authorization_never_counts_as_paid(realdb, 
 
 async def test_a_figure_stamped_at_the_authorization_does_not_count_until_settled(realdb):
     """A leg whose payment carries a figure while its card is only authorized
-    (what the §537 build wrote at the authorization, before §544) reads
+    (what the §537 build wrote at the authorization, before §543) reads
     `in_flight`: only the card's settlement is evidence of money moved."""
     _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):

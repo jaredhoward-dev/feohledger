@@ -283,7 +283,7 @@ __all__ = [
 ]
 
 
-# ── A run's virtual-card leg (decisions §537, §544) ───────────────────────
+# ── A run's virtual-card leg (decisions §537, §543) ───────────────────────
 #
 # A run's card leg books a `completed` `Payment` the moment the card is MINTED
 # (`api/payments._execute_single_payment`), but money moves only when the vendor
@@ -292,13 +292,13 @@ __all__ = [
 # failed OPEN, so the payment sync and an ERP `paid` report both closed the
 # invoice while the card was still spendable. These two functions are the whole
 # fix: the card's charge is written onto the payment it pays, and coverage of a
-# card leg asks the card. Only a SETTLED charge counts (§544): an authorization
+# card leg asks the card. Only a SETTLED charge counts (§543): an authorization
 # can still be reversed or expire, so it leaves the leg in flight.
 
 CARD_LEG_METHOD = "virtual_card"
 #: The card status that means the vendor's charge CLEARED — money moved. The
 #: card webhook sets it on a settlement event; ``charged`` is only the
-#: authorization, a hold that can still be reversed or expire (decisions §544).
+#: authorization, a hold that can still be reversed or expire (decisions §543).
 CARD_SETTLED_STATUS = "completed"
 
 
@@ -339,7 +339,7 @@ async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency:
     report (`erp_status_report`, webhook and poll alike) — so they cannot
     disagree about a card leg.
 
-    A card leg counts only a SETTLED charge (decisions §544). Its card is read
+    A card leg counts only a SETTLED charge (decisions §543). Its card is read
     every time: not yet settled (``created`` / ``sent`` / ``active``, merely
     authorized as ``charged``, cancelled, or no card found) is ``in_flight``,
     whatever the payment carries, because an authorization is a hold the
@@ -379,7 +379,7 @@ async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency:
 async def record_card_spend(db: AsyncSession, card) -> Payment | None:
     """Write a card's SETTLED charge onto the run payment it pays; return it.
 
-    Called by the card webhook on settlement only (decisions §544): an
+    Called by the card webhook on settlement only (decisions §543): an
     authorization is a hold, not money moved — the network can reverse it or
     let it expire, and a card provider sends those as their own events — so the
     leg stays ``in_flight`` (:func:`payment_coverage`) until the charge clears.

@@ -27961,7 +27961,7 @@ failing notice leaves the flag committed);
 not `invoice.approved`; every emitter's fields); frontend
 `codedRefusals.test.ts` and the i18n parity tests for the three new codes.
 
-## 544. A run's card leg counts only a settled charge; the Merge read-back reads from its cursor less an overlap (§537 / §540 / §541 follow-up, round 45)
+## 543. A run's card leg counts only a settled charge; the Merge read-back reads from its cursor less an overlap (§537 / §540 / §541 follow-up, round 45)
 
 **Problem 1.** §537 wrote the card's AUTHORIZED amount onto the run payment's
 `settled_amount` at the authorization event, and `payment_coverage` read a

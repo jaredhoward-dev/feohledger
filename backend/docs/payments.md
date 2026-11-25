@@ -1504,7 +1504,7 @@ verifier's *did the rail report what we authorized?*.
 | `covered` | some authorized leg is satisfied, **or** nothing was ever reported | invoice proceeds to `paid` |
 | `short` | a figure was reported and falls below every currency-compatible leg by more than a cent | invoice held at `payment_scheduled` |
 | `uncertain` | reported in a currency matching no authorized leg, **or** reported a figure the column cannot hold | invoice held at `payment_scheduled` |
-| `in_flight` | a run's `virtual_card` leg whose card's charge has not settled (card not `completed`: uncharged, only authorized, or missing) | nothing moved: the payment sync skips the leg; an ERP `paid` takes the in-flight hold (decisions §537, §544) |
+| `in_flight` | a run's `virtual_card` leg whose card's charge has not settled (card not `completed`: uncharged, only authorized, or missing) | nothing moved: the payment sync skips the leg; an ERP `paid` takes the in-flight hold (decisions §537, §543) |
 
 Over-settlement is `covered`: the vendor is not short, so the payable is
 discharged even though the verifier still raises `amount_mismatch` on the same
@@ -1515,7 +1515,7 @@ as the verifier treats a missing amount as `unverified`.
 
 ##### A run's card leg counts what its card was charged
 
-Only a **settled** charge counts (decisions §544).
+Only a **settled** charge counts (decisions §543).
 
 The card leg books a `completed` `Payment` when the card is **minted**
 (`_execute_single_payment`), but no money moves until the vendor charges it.

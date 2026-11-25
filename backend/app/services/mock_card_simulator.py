@@ -1,7 +1,7 @@
 """Charge a mock virtual card on a laptop: the local equivalent of the issuer.
 
 Since decisions §537 a payment run's card leg counts only what its card was
-charged — since §544 only a SETTLED charge — and the charge arrives as the
+charged — since §543 only a SETTLED charge — and the charge arrives as the
 provider's webhook. The mock card
 adapter has no provider behind it, so without this a card-paid invoice on a
 laptop stayed at ``payment_scheduled`` for good (guard rail 7, decisions §541).
@@ -14,7 +14,7 @@ ASGI app given. So the real handler verifies it, dedupes it and, on the
 settlement, writes the charge through ``record_card_spend`` and re-dispatches
 the run's payment sync, exactly as for a Lithic delivery. The authorization
 alone leaves the run's leg in flight (an authorization is not money moved,
-§544), so ``settle`` is what takes a card-paid invoice to ``paid``. Nothing
+§543), so ``settle`` is what takes a card-paid invoice to ``paid``. Nothing
 here writes a card or a payment itself.
 
 Refused (``MockCardSimulationRefused``, by code) in a deployed environment, for

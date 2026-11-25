@@ -1,5 +1,5 @@
 """A run's virtual-card leg: `record_card_spend` and `payment_coverage`
-(`services/payment_settlement_record`, decisions §537, §544).
+(`services/payment_settlement_record`, decisions §537, §543).
 
 Golden cases on real Postgres (both functions read rows):
 
@@ -149,7 +149,7 @@ async def test_a_settled_charge_is_written_onto_its_payment(realdb):
 
 
 async def test_an_authorized_charge_writes_nothing(realdb):
-    """`charged` is the authorization: a hold, not money moved (§544)."""
+    """`charged` is the authorization: a hold, not money moved (§543)."""
     leg = await _leg(realdb, card_status="charged", charged=LIMIT)
 
     returned, payment = await _record(realdb, leg)
@@ -270,7 +270,7 @@ async def test_a_card_leg_with_no_card_is_in_flight(realdb):
 
 async def test_an_authorized_leg_ignores_a_figure_already_on_the_payment(realdb):
     """A figure stamped at the authorization (the §537 build did) is not
-    evidence of money moved; only the card's settlement is (§544)."""
+    evidence of money moved; only the card's settlement is (§543)."""
     leg = await _leg(realdb, card_status="charged", charged=LIMIT)
     async with realdb.sessionmaker(TENANT)() as s:
         payment = await s.get(Payment, leg.payment_id)

@@ -607,7 +607,7 @@ def test_coverage_flag_defaults_off_so_every_existing_caller_is_unchanged():
 
 # ---------------------------------------------------------------------------
 # `awaiting_card_spend`: a run's card leg whose charge has not settled
-# (decisions §537, §544)
+# (decisions §537, §543)
 # ---------------------------------------------------------------------------
 
 
@@ -645,7 +645,7 @@ def test_an_unstorable_report_is_uncertain_even_while_awaiting_card_spend():
 )
 def test_a_figure_on_record_is_judged_on_the_amount_whatever_the_flag(settled, state):
     """The flag only decides what NO figure means. A caller that must ignore a
-    figure (an authorization-only card leg, §544) passes None; the function
+    figure (an authorization-only card leg, §543) passes None; the function
     never second-guesses one it is given."""
     c = _card_leg(settled_amount=Decimal(settled), settled_currency="USD", awaiting_card_spend=True)
     assert c.state == state

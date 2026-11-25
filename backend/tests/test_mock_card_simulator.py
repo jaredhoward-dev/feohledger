@@ -92,7 +92,7 @@ def _app():
 async def test_the_simulator_authorizes_a_mock_card_through_the_real_webhook(realdb, secret):
     """With or without a tenant secret, the signed event goes through the
     handler and the card is authorized (`charged`). An authorization is a hold,
-    not money moved (decisions §544): nothing is written onto the run payment
+    not money moved (decisions §543): nothing is written onto the run payment
     and no payment sync is dispatched, so the leg stays in flight."""
     from app.services.payment_settlement import COVERAGE_IN_FLIGHT
     from app.services.payment_settlement_record import payment_coverage

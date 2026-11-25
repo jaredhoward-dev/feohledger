@@ -259,7 +259,7 @@ async def test_two_ticks_flag_once_and_the_second_asks_from_the_first(realdb, me
     later = NOW + timedelta(minutes=15)
     await sweep.run_merge_readback_once(now=later)
 
-    # The second listing asks from the first's start less the overlap (§544).
+    # The second listing asks from the first's start less the overlap (§543).
     assert merge.since == [NOW - timedelta(hours=48), NOW - timedelta(minutes=10)]
     assert len(await _exceptions(realdb, inv_id)) == 1
     assert (await _cursor(realdb))["through"] == later.isoformat()
@@ -269,7 +269,7 @@ async def test_a_bill_stamped_just_before_the_cursor_is_still_read(realdb, merge
     """The stored mark is OUR clock at the last listing's start. A bill whose
     change Merge stamped a little before it (clock skew, or Merge's own lag
     syncing the ERP) but did not list in time must still be read: the next
-    listing asks from the mark less the overlap (decisions §544)."""
+    listing asks from the mark less the overlap (decisions §543)."""
     await _merge_tenant(realdb)
     inv_id, bill = await _pushed(realdb)
     merge.bills[bill] = _bill(bill, "VOID")

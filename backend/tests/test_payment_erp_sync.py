@@ -1191,7 +1191,7 @@ async def test_an_uncharged_card_leg_is_skipped_not_paid(realdb, card_status):
 
 
 async def test_an_authorized_card_leg_is_still_skipped_not_paid(realdb):
-    """Decisions §544: a card authorized for the full amount (`charged`) has
+    """Decisions §543: a card authorized for the full amount (`charged`) has
     moved no money — the authorization can still be reversed or expire — so
     the leg stays in flight until the charge settles."""
     from app.models.virtual_card import VirtualCard

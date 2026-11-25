@@ -486,7 +486,7 @@ class Settings(BaseSettings):
     # and a bill Merge stamps a little earlier (clock skew, or Merge's own lag
     # syncing the ERP) would otherwise fall between two listings for good.
     # Re-reading a bill in the overlap is harmless: the reconciler is
-    # idempotent (decisions §544).
+    # idempotent (decisions §543).
     merge_readback_sweep_enabled: bool = False
     merge_readback_sweep_interval_seconds: int = Field(default=900, ge=60)
     merge_readback_sweep_lookback_hours: int = Field(default=48, ge=1)

@@ -17,7 +17,7 @@ means the same here whichever carried it.
 ``through`` (the moment the last listing started; the next one asks Merge for
 changes after ``through`` less ``FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES``,
 so a bill stamped just before our mark by a skewed clock or a lagging sync is
-still listed — decisions §544) and ``pending`` (bills of that listing not yet applied). The
+still listed — decisions §543) and ``pending`` (bills of that listing not yet applied). The
 QuickBooks / Xero sync keeps its mark in ``settings.erp.oauth``, but a Merge
 connection has no OAuth block, and a key inside ``settings.erp`` would ride
 into the adapter config and the connection's realm. A first pass (no cursor)
@@ -174,7 +174,7 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
         # Ask from a margin before the stored mark: it is our clock at the
         # last listing's start, and a bill Merge stamped just before it (skew,
         # or Merge's own lag behind the ERP) would otherwise never be listed.
-        # The overlap is re-read, which the reconciler makes harmless (§544).
+        # The overlap is re-read, which the reconciler makes harmless (§543).
         last = _parse(through)
         overlap = timedelta(minutes=settings.merge_readback_sweep_overlap_minutes)
         since = (last - overlap) if last is not None else (now - lookback)

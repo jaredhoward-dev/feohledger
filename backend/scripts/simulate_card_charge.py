@@ -1,7 +1,7 @@
 """Charge a mock virtual card locally, as its issuer's webhook would.
 
 A payment run's card leg is paid only once its card's charge SETTLES
-(decisions §537, §544), and that comes from the card provider's webhook. On a laptop the
+(decisions §537, §543), and that comes from the card provider's webhook. On a laptop the
 provider is `mock`, so this sends that webhook instead: signed, through the
 real `/api/cards/webhook/mock` handler, in process (no running backend needed).
 Without `--settle` only the authorization is sent: the card reads `charged`

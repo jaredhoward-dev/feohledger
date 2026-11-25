@@ -415,7 +415,7 @@ async def test_paid_over_an_uncharged_run_card_leg_is_held_and_the_card_left_alo
 
 
 async def test_paid_over_a_run_card_leg_only_authorized_is_held(realdb):
-    """Decisions §544: authorized in full (`charged`) is not money moved — the
+    """Decisions §543: authorized in full (`charged`) is not money moved — the
     authorization can still be reversed or expire — so an ERP `paid` is held
     behind the in-flight row, exactly as for an uncharged card."""
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)

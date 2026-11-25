@@ -1256,7 +1256,7 @@ async def card_webhook(provider: str, request: Request):
                     # Nothing is written onto the run's card leg here: an
                     # authorization is a hold the network can still reverse or
                     # let expire, not money moved, so the leg stays in flight
-                    # until the settlement below (decisions §544).
+                    # until the settlement below (decisions §543).
                     # A charge is a money-state transition — leave an
                     # append-only audit row. Amount serialises as a string
                     # Decimal (never float); no PAN ever enters the trail.
@@ -1293,7 +1293,7 @@ async def card_webhook(provider: str, request: Request):
                         # and after settlement the settled figure is the true one.
                         card.amount_charged = settled_amount
                     # Money moved: the settled figure is written onto the run's
-                    # card leg, the only figure it counts (decisions §537, §544).
+                    # card leg, the only figure it counts (decisions §537, §543).
                     spent_payment = await record_card_spend(db, card)
 
                     # Create rebate at the org's negotiated rate (not a hardcoded

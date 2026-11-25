@@ -2966,7 +2966,7 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   from `through` less `FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES`, default 10,
   since `through` is our clock and a bill Merge stamped just before it by skew
   or its own sync lag would otherwise never be listed; re-reading the overlap
-  is harmless, decisions §544), keeps the ones an
+  is harmless, decisions §543), keeps the ones an
   invoice was pushed as (`bills_we_posted`, the route's own filter), and reads
   each back and applies it exactly as the route does (`bill_report` →
   `apply_bill_report`, marked `source: reconciliation_sweep`). At most
