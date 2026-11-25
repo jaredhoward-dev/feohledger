@@ -214,6 +214,8 @@ export const messages = {
 	'audit.action.organization.erp_status_sync_requested': "Sincronização de status do ERP solicitada",
 	'audit.action.organization.erp_status_synced': "Status do ERP sincronizados",
 	'audit.action.organization.erp_token_revoked': "Token do ERP revogado",
+	'audit.action.organization.exception_agent_autonomy_updated': "Autonomia dos agentes de exceções alterada",
+	'audit.action.organization.fraud_rule_updated': "Verificação de fraude alterada",
 	'audit.action.organization.provider_config_updated': "Configurações do provedor atualizadas",
 	'audit.action.organization.residency_updated': "Residência de dados atualizada",
 	'audit.action.organization.scim_token_minted': "Token SCIM emitido",

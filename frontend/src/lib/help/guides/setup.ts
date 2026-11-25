@@ -325,6 +325,8 @@ export const SETUP_GUIDES: Guide[] = [
 							'{ui:org.section.security}: tick {ui:org.security.requireMfa}. People without a second factor are asked to set one up at their next sign-in.',
 							'{ui:orgSso.title}: let people sign in through your identity provider, over OpenID Connect or SAML. Copy the values under {ui:orgSso.register.title} into your provider, limit which email domains may create accounts, and once sign-in works you can tick {ui:orgSso.ssoOnly}. Every change here is recorded in the audit trail.',
 							'{ui:org.section.fraud}: switch individual fraud checks on or off and tune their limits, such as round amounts, rush payments, or a large invoice from a brand-new vendor.',
+							'{ui:org.section.lineTotal}: turn on or off the check that an invoice’s line totals add up to its amount. While it is on, an invoice whose lines do not add up gets an [[exception]] that keeps it out of payment runs until someone resolves it. Every change is recorded in the audit trail.',
+							'{ui:org.section.agentAutonomy}: choose whether exception agents may fix an invoice and approve it on their own when they are confident enough. {ui:org.agentAutonomy.conservative} keeps every decision with a person. The higher levels let an agent correct an invoice’s amount, purchase order or GL account and approve it, but only with the roles of the person who ran it, so CFO sign-off and approval limits still apply. Every change of level is recorded in the audit trail.',
 							'{ui:org.section.dataResidency}: record the region where your data must live. This records the requirement and shows whether the deployment already runs there. It does not move any data by itself.'
 						]
 					},
