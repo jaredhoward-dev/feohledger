@@ -763,11 +763,11 @@
 				handleRotate();
 			}}
 		>
-			<fieldset class="events-field">
+			<fieldset class="events-field radio-card-group">
 				<legend>{m('admin.webhooks.rotate.overlapLegend')}</legend>
 				<p class="field-hint">{m('admin.webhooks.rotate.overlapHint')}</p>
 				{#each OVERLAP_CHOICES as choice (choice.minutes)}
-					<label class="checkbox-line">
+					<label class="radio-card">
 						<input
 							type="radio"
 							name="overlap-minutes"

@@ -205,10 +205,10 @@
 			/>
 		</label>
 
-		<fieldset class="field result-field">
+		<fieldset class="field result-field radio-card-group">
 			<legend>{m('goodsReceipts.inspections.record.result')}</legend>
 			{#each INSPECTION_RESULTS as option (option)}
-				<label class="radio-row">
+				<label class="radio-card">
 					<input
 						type="radio"
 						name="inspection-result"
@@ -315,21 +315,14 @@
 		border-radius: 6px;
 		padding: 10px 12px;
 		margin-bottom: 14px;
+		/* `.field`'s 4px is a caption-to-input gap; cards want the group's. */
+		gap: 8px;
 	}
 	.result-field legend {
 		padding: 0 4px;
 		font-size: 0.85rem;
 	}
-	.radio-row {
-		display: flex;
-		align-items: flex-start;
-		gap: 8px;
-		padding: 4px 0;
-		cursor: pointer;
-	}
-	.radio-row input {
-		margin-top: 2px;
-	}
+	/* Each result is a shared `.radio-card` (app.css). */
 	.radio-body {
 		display: flex;
 		flex-direction: column;

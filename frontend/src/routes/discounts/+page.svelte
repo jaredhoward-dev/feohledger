@@ -821,10 +821,10 @@
 			</p>
 
 			{#if capturableTiers(acceptTarget).length > 0}
-				<fieldset class="tier-picker">
+				<fieldset class="tier-picker radio-card-group">
 					<legend>{m('discounts.modal.chooseTier')}</legend>
 					{#each capturableTiers(acceptTarget).sort((a, b) => a.days - b.days) as tier (tier.days)}
-						<label class="tier-option">
+						<label class="radio-card">
 							<input
 								type="radio"
 								name="tier"
@@ -1146,17 +1146,7 @@
 		color: var(--text-muted);
 		padding: 0 4px;
 	}
-	.tier-option {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		cursor: pointer;
-		font-size: 0.88rem;
-	}
-
-	.tier-option input {
-		accent-color: var(--accent);
-	}
+	/* Each tier is a shared `.radio-card` (app.css). */
 	.tier-option-label {
 		display: flex;
 		flex-direction: column;

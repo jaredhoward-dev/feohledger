@@ -326,7 +326,7 @@
 
 			<fieldset class="intake-mode">
 				<legend>{m('vendorStatements.modal.intakeModeLegend')}</legend>
-				<label>
+				<label class="radio-card">
 					<input
 						type="radio"
 						name="intake-mode"
@@ -337,7 +337,7 @@
 					/>
 					<span>{m('vendorStatements.modal.intakeModePaste')}</span>
 				</label>
-				<label>
+				<label class="radio-card">
 					<input
 						type="radio"
 						name="intake-mode"
@@ -989,7 +989,7 @@
 	.intake-mode {
 		display: flex;
 		align-items: center;
-		gap: 18px;
+		gap: 8px;
 		flex-wrap: wrap;
 		margin: 16px 0 0;
 		padding: 0;
@@ -1002,17 +1002,7 @@
 		color: var(--text);
 		margin-bottom: 6px;
 	}
-	.intake-mode label {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 0.84rem;
-		color: var(--text);
-		cursor: pointer;
-	}
-	.intake-mode input:disabled + span {
-		opacity: 0.6;
-	}
+	/* Each mode is a shared `.radio-card` (app.css), side by side. */
 
 	/* --- Chosen file --- */
 	.file-chosen {

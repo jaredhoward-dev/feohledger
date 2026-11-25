@@ -67,10 +67,10 @@
 		}}
 	>
 		<p class="intro">{m('glAccounts.erpLink.intro', { code: row.code })}</p>
-		<fieldset>
+		<fieldset class="radio-card-group">
 			<legend class="visually-hidden">{m('glAccounts.erpLink.title', { code: row.code })}</legend>
 			{#each candidates as candidate (candidate.erp_account_id)}
-				<label class="option" data-testid="gl-erp-candidate">
+				<label class="radio-card" data-testid="gl-erp-candidate">
 					<input
 						type="radio"
 						name="erp-candidate"
@@ -100,26 +100,11 @@
 		font-size: 13px;
 		color: var(--text-muted);
 	}
+	/* Each candidate is a shared `.radio-card` (app.css). */
 	fieldset {
 		border: 0;
 		margin: 0;
 		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-	.option {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 8px 10px;
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	.option:has(input:checked) {
-		border-color: var(--accent);
 	}
 	.label {
 		flex: 1;
