@@ -26675,3 +26675,36 @@ to re-send after its moment as a used share. *A cross-request advisory lock for
 the pass*: the row lock already serialises per invoice, which is all a double
 send could happen on, as in §411.
 
+
+## 526. `/organization`'s panels are views over page-owned state objects (round 43)
+
+**Problem.** The page was one ~4,500-line file whose panels shared one
+`<script>` and ~145 loose `$state` variables (the §205 follow-up). Moving a
+panel's markup into a component naïvely would move its state too, and a panel
+unmounts on every section switch, so an unsaved edit would be lost; a panel
+rendered outside the page's `<fieldset disabled={readOnly}>` would be silently
+editable for a non-admin.
+
+**Decision.** Every panel the page still rendered inline is now a component
+under `lib/components/organization/` that is a **view**: the page groups each
+panel's fields into one `$state` object (`company`, `invoiceDefaults`,
+`branding`, `cardsFields`, `paymentsFields` + `nachaFields`, `ssoFields`, …,
+typed in `panelState.ts`) and binds it in, and keeps every load, save, test,
+armed confirm and server fact, passed down as values and callbacks. The
+components render inside the one fieldset. Each component carries a copy of
+the panel CSS rules its markup uses, in the page's source order, so the
+cascade (and the specificity notes on the text-entry recipe) is unchanged; the
+page's `<style>` keeps only what its own markup uses. The two page snippets
+rendered inside a component's card (the Custom domains and Data residency
+intros, shared with the load-failure branch outside the fieldset) keep their
+heading style through `:global(.card) h2`, the same 0-2-1 specificity as the
+scoped `.card h2` it replaces.
+
+**Rejected.** *Self-loading panels like `ScimTokenPanel` (§510)*: right for a
+panel that is its own island, but these share `loadOrg`'s one read, the
+credential-status map and `patchOrg`, and their edits must outlive the panel.
+*One shared stylesheet for the panel recipe*: a global sheet changes
+specificity against `app.css`'s control base and reaches every `.card` in the
+app; scoped copies are the existing `organization/` pattern (`LineTotalCheckPanel`)
+and keep each panel's look provably identical. *Fewer, bigger props by passing
+the whole page state*: it would re-couple every panel to every other.
