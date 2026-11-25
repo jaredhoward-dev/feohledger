@@ -922,18 +922,29 @@ async def test_a_record_two_vendors_already_hold_is_reported_and_the_sync_goes_o
     assert index == 1
 
 
-async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
+@pytest.mark.parametrize(
+    ("held_as", "reason"),
+    [
+        # Links a no-realm pull made (decisions §496): two holders in one
+        # company, the duplicate a person resolves.
+        (UNNAMED_REALM, "duplicate_link"),
+        # Pre-0115 links: a pull that names no company cannot say whose "ERP-ECHO"
+        # they hold, so it reports them unverified instead (§496).
+        (None, "unverified_link"),
+    ],
+)
+async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb, held_as, reason):
     """A provider page overlap repeats a record two vendors hold: it is one
-    record, so one ``duplicate_link`` conflict, and the endpoint's message
-    counts it once ("1 not updated"), not once per sighting."""
+    record, so one conflict, and the endpoint's message counts it once
+    ("1 not updated"), not once per sighting — whichever reason it carries."""
     mk = realdb.sessionmaker("a")
     org_id = realdb.info("a").org_id
     async with mk() as s:
         await s.execute(text("DROP INDEX uq_vendors_erp_link"))
         s.add_all(
             [
-                _linked(org_id, "Echo Supply", "ERP-ECHO", None),
-                _linked(org_id, "Echo Supply Ltd", "ERP-ECHO", None),
+                _linked(org_id, "Echo Supply", "ERP-ECHO", held_as),
+                _linked(org_id, "Echo Supply Ltd", "ERP-ECHO", held_as),
             ]
         )
         await s.flush()
@@ -947,7 +958,7 @@ async def test_a_record_two_vendors_hold_listed_twice_is_reported_once(realdb):
         )
         await s.rollback()
     assert result["conflicts"] == [
-        {"name": "Echo Supply", "reason": "duplicate_link", "erp_vendor_ids": ["ERP-ECHO"]}
+        {"name": "Echo Supply", "reason": reason, "erp_vendor_ids": ["ERP-ECHO"]}
     ]
 
 
