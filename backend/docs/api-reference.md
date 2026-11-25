@@ -450,7 +450,7 @@ Every refusal is a coded `detail = {code, message, params}`. Full rules:
 | `GET`  | `/api/credit-memos/counts`        | admin, ap_manager, ap_clerk, cfo | Per-status tallies for the filter chips: `{total, by_status: {open, applied, void}}`, over the list's own population filters (entity scope + `?search=`), never `status` |
 | `GET`  | `/api/credit-memos/eligible-invoices` | admin, ap_manager | The invoices a NEW memo can be linked to at creation: `?vendor_id=` (required, entity-scoped like create — 404 otherwise), optional `?amount=` (validated like a memo amount), `?search=`, paged — see § Eligible invoices |
 | `GET`  | `/api/credit-memos/{id}/eligible-invoices` | admin, ap_manager | The invoices `/apply` will accept for this memo — its terms read off the row; same opaque 404 as every by-id route, the apply's own 409 for a memo that is not `open` — see § Eligible invoices |
-| `POST` | `/api/credit-memos`                | admin, ap_manager | Create a credit memo. With no `invoice_id` it lands `open`; with one it is applied on the spot and runs the same guards as `/apply` |
+| `POST` | `/api/credit-memos`                | admin, ap_manager | Create a credit memo. With no `invoice_id` it lands `open`; with one it is applied on the spot and runs the same guards as `/apply`. Optional `discount_offer_id` (with `invoice_id`) records the memo as that accepted early-payment discount — see § A memo that takes a discount |
 | `PATCH` | `/api/credit-memos/{id}`          | admin, ap_manager | Correct an `open`, never-applied memo — see § Editing a memo. 409 on anything else |
 | `POST` | `/api/credit-memos/{id}/apply`     | admin, ap_manager | Apply an `open` credit memo against a payable. Every refusal (here and on a linked create) is a coded `409` `detail = {code, message, params}`: `credit_memo_invoice_settled` (`status`), `credit_memo_vendor_unresolved`, `credit_memo_vendor_mismatch`, `credit_memo_entity_mismatch`, `credit_memo_currency_mismatch`, `credit_memo_invoice_currency_unknown` (the invoice records no usable currency), `credit_memo_not_applicable` (`status`), `credit_memo_exceeds_balance` (`remaining` as an exact string, `currency`); an edit's refusal is `credit_memo_not_editable` (`status`) |
 | `POST` | `/api/credit-memos/{id}/void`      | admin, ap_manager | Void an `open` memo (409 once `applied` — applied memos are immutable for audit — and 409 on an already-`void` memo, so a retried void never writes a second `credit_memo.voided` row) |
@@ -658,6 +658,25 @@ provider's deep link to it. Both are null until a push is confirmed, and the URL
 stays null for a provider with no stable deep link. Neither is writable through
 the API: only `services/erp` sets them (`erp-integration.md` § The invoice
 names its bill in the ERP).
+
+
+### A memo that takes a discount — `discount_offer_id`
+
+`POST /api/credit-memos` with `discount_offer_id` (and `invoice_id`) records the
+memo as an accepted early-payment discount taken as a credit; every memo
+response carries `discount_offer_id` (null on an ordinary credit). It is the
+only thing that makes a memo count as the discount: the payment run then does
+not deduct that invoice's offer again, and the settlement captures the offer
+for the memo's amount. A memo that names no offer is an ordinary credit
+whatever its amount (decisions §520, migration 0145). The link is refused
+unless the memo is exactly the discount — 404 for an offer not on that invoice,
+else 409 `credit_memo_discount_offer_invalid` for: no `invoice_id`; a
+vendor-scoped offer; an offer not `accepted` with a tier; another currency; an
+offer priced on an amount the invoice no longer has; an amount other than the
+savings to the cent; another live linked memo on the invoice; or a live payment
+already booked with the offer. The link is never editable (a linked memo is
+applied at creation, and only an open memo is editable). Detail:
+`dynamic-discounting.md` § Taking a discount as a credit memo.
 
 ## Tax / 1099
 

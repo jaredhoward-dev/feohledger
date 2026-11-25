@@ -408,7 +408,7 @@ the button and the endpoint).
 `discount_offers.mark_captured` is the only code that sets
 `captured_amount`/`captured_at` and transitions `accepted → captured`, but it
 is a pure mutator — something has to notice "this payment settling this
-invoice IS the discounted payoff" and call it. That caller is
+invoice took the discount" and call it. That caller is
 `services/discount_capture.capture_offers_for_settled_payment`, wired into
 every place a `Payment` reaches `completed` in `app/api/payments.py`:
 
@@ -420,9 +420,9 @@ every place a `Payment` reaches `completed` in `app/api/payments.py`:
   reconcile**: when `payment_settlement.verify_settlement` flags the
   processor's reported amount as diverging from what AP authorized, the
   capture is skipped and a payment-blocking `fraud_flag` opens instead. The
-  payoff match below runs against `Payment.amount` — our authorized figure,
-  which the rail has just contradicted — so capturing there would mark
-  savings realized on a number in dispute. See
+  capture rests on `Payment.amount` — our authorized figure, which the rail
+  has just contradicted — so capturing there would mark savings realized on a
+  number in dispute. See
   [payments.md](payments.md) § Settlement-amount verification.
 
 Both call the shared `discount_opportunities.capture_discount_offers` helper →
@@ -432,26 +432,21 @@ discounted amount below) captures exactly that offer, for exactly
 `Payment.discount_amount`, under a row lock, and stamps
 `DiscountOffer.captured_by_payment_id` with the payment — no matching, no
 guessing; an offer no longer `accepted` (already captured by a retried webhook)
-is left alone. **A payment booked without one** falls back to the amount match
-below (`capture_offers_for_settled_payment`), which resolves any
-still-`accepted` **invoice-scoped** `DiscountOffer` on the settled invoice and
-first checks the offer's `currency` against the invoice's own `currency`
-(case-insensitive) — `POST /api/discounts/offers` lets the caller set an
-explicit `currency` independent of the invoice (falling back to
-`invoice.currency` only when omitted, `api/discounts.py::create_offer`), and
-`Payment.amount` is always denominated in the invoice's currency, so a
-currency-mismatched offer's `base_amount` (still defaulted from the invoice's
-bare number) could otherwise numerically coincide with an unrelated payment
-and be falsely captured. Only once currency matches does it check whether
-`Payment.amount` **exactly** equals that offer's accepted tier's discounted
-payoff (`base_amount - discount_savings(base_amount, accepted_tier)`, both
-cent-quantized the same way). A match calls `mark_captured` and writes a
+is left alone. **A payment booked without one** falls back to the credit memo
+that took the discount (`capture_offers_for_settled_payment`): an applied memo
+on the invoice whose `discount_offer_id` names a still-`accepted`
+**invoice-scoped** offer (decisions §520). That offer is captured for the
+memo's amount, stamped with the payment, after re-checking the offer's
+`currency` against the invoice's (an offer's currency can diverge from its
+invoice's: `POST /api/discounts/offers` takes an explicit one). **Nothing is
+ever captured on an amount.** This leg used to capture any accepted offer whose
+discounted payoff (`base_amount - discount_savings(...)`) equalled
+`Payment.amount`, so a payment netted of a return credit that happened to equal
+the savings recorded the offer as captured; a payment with no linked memo now
+leaves the offer `accepted`. A capture calls `mark_captured` and writes a
 `discount_offer.captured` audit row (`actor_id` is the executing user on the
 synchronous legs, `None` — a system/processor event — on the webhook leg,
-matching the existing `payment.completed` webhook audit convention). A
-non-matching currency or amount leaves the offer `accepted` rather than
-guessing — a false capture would misreport savings exactly like the original
-missing-caller bug, just inverted.
+matching the existing `payment.completed` webhook audit convention).
 
 **Vendor-scoped bulk offers are intentionally out of scope here.** A bulk
 offer's `base_amount` is the summed open balance across several invoices, so
@@ -475,20 +470,41 @@ names a "pay by" date reads. An offer that cannot be dated is not applied.
 
 Paid in full instead — never refused — when the offer is vendor-scoped, past its
 deadline, in another currency, struck on a `base_amount` that is no longer the
-invoice's amount, would leave nothing to pay, or was already deducted through an
-applied credit memo for exactly the savings (the way a discount was paid
-before this, and what the in-app help said; the memo is already in the net, and
-the settlement still captures the offer through the amount match). Nothing links
-a memo to an offer, so that is an amount coincidence, resolved toward paying the
-supplier in full whenever the memo was recorded: a return credit that happens to
-equal the savings costs the buyer one discount, where guessing the other way
-would short-pay the supplier. **Do not record a credit memo for an accepted
-discount any more**; the run takes it. A deadline that passes while a booked run
+invoice's amount, or would leave nothing to pay. **Not deducted** when the
+invoice already took a discount through a **linked credit memo** — an applied
+memo whose `discount_offer_id` names an offer (§ Taking a discount as a credit
+memo below): that memo is already in the net, and the settlement captures the
+offer through it. A memo that names no offer is an ordinary credit whatever its
+amount, so a return credit that happens to equal the savings no longer costs
+the buyer the discount (§250 matched on the amount; §520 replaced it with the
+link). **You do not need a credit memo for an accepted discount**; the run
+takes it. A deadline that passes while a booked run
 waits, or an offer accepted after booking, fails dispatch `discount_changed`
 before any processor call (retry-safe; `/retry-failed` skips it) — never a silent
 re-price. Full money-path detail: [payments.md](payments.md) § An accepted
 early-payment discount is paid, not just reported. Tests:
-`tests/test_discounted_payment.py`.
+`tests/test_discounted_payment.py` (including a return credit equal to the
+savings that suppresses nothing and captures nothing, and every link refusal).
+
+### Taking a discount as a credit memo
+
+When the supplier issues a credit for the discount rather than the run taking
+it, record it with `POST /api/credit-memos` carrying `discount_offer_id` (with
+`invoice_id`; the memo is created applied). The link is the only thing that
+makes a memo count as the discount (`credit_memos.discount_offer_id`, migration
+0145, decisions §520), so it is refused — 409
+`credit_memo_discount_offer_invalid`, or 404 for an offer not on that invoice —
+unless the memo is exactly the discount: an invoice-scoped `accepted` offer
+with a tier, on the memo's own invoice, in the memo's currency, still priced on
+the invoice's amount, for its savings to the cent; the only live linked memo on
+that invoice (a partial unique index backs one per offer); and no live payment
+already booked with that offer. The deadline is not checked: a credit the
+supplier issued is what they agreed, whenever it is recorded. The link cannot
+be added or changed later (only an open, never-applied memo is editable, and a
+linked memo is applied at birth); voiding the memo frees the offer for the run
+again. There is no screen for it; the API is the door. **Memos recorded before
+0145 carry no link** and are ordinary credits: nothing is inferred from their
+amounts (§520 says what that means for an old workaround memo).
 
 **Idempotent**: `capture_offers_for_settled_payment` only queries offers
 currently `accepted`, so a retried settlement or a reconciliation re-run over
@@ -505,15 +521,16 @@ retried.
 **One settlement realizes at most one discount.** Nothing stops two
 `accepted` offers existing on one invoice (a supplier re-sends an offer and
 both are accepted), and two with the same tier share one discounted payoff.
-The vendor was short-paid that discount once, so the scan captures the first
-match — earliest `accepted_at`, `id` as the tiebreak — and stops. Capturing
+The vendor was short-paid that discount once, so one payment captures one
+offer — the run books only the earliest accepted (`accepted_at`, `id` as the
+tiebreak), and an invoice holds at most one live linked memo. Capturing
 every match used to book the savings once per offer: a $20 deduction reported
 as $40 captured.
 
 **A void un-realizes the capture.** `POST /api/payments/{id}/void` returns the
 invoice to `approved` — nothing was paid, so nothing was saved — but the offer
 used to stay `captured`, so the dashboard reported savings on an unpaid invoice
-and a re-payment at the discounted payoff could capture nothing.
+and a re-payment that took the discount could capture nothing.
 `discount_capture.reverse_captures_for_voided_payment` now moves the offer back
 to `accepted` (`discount_offers.reverse_capture`, clearing `captured_amount` /
 `captured_at` / `captured_by_payment_id`) and writes a
@@ -635,11 +652,11 @@ portal nav.
   per-tier savings, accept flips status without creating a `Payment`/`PaymentRun`,
   double-accept 409, foreign/unknown offer 404, auth-required.
 - `test_discount_capture.py` — the capture wiring (real-DB, end to end through
-  `POST /api/payments/runs` + `.../execute`): a payment settled at the exact
-  discounted payoff captures the offer + updates the dashboard; a payment
+  `POST /api/payments/runs` + `.../execute`): a payment netted of a credit memo
+  linked to the offer captures it + updates the dashboard; a payment
   settled at the full amount does NOT falsely capture; a currency-mismatched
-  offer (explicit `currency` diverging from its own invoice) does NOT falsely
-  capture even when the numbers numerically coincide; repeat calls to
+  offer (explicit `currency` diverging from its own invoice) refuses the link
+  and does NOT falsely capture even when the numbers numerically coincide; repeat calls to
   `capture_offers_for_settled_payment` are idempotent (no double-count, no
   error on an already-`captured` offer); one settlement captures only one of
   two same-tier accepted offers; and voiding the settling payment reverses the

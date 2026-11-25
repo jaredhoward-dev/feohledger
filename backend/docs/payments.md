@@ -433,11 +433,13 @@ An offer is **not** applied, and the invoice is paid in full, when it is
 vendor-scoped (no single payment can be shown to settle a bulk offer), its
 deadline has passed, its currency is not the invoice's, its `base_amount` is no
 longer the invoice's `amount` (the bargain was struck on a different figure),
-the deduction would leave nothing to pay, or the savings were already taken
-through an applied credit memo for exactly that figure — the documented way to
-pay a discount before this, which is already inside the net and must not come
-off twice (an amount coincidence, resolved toward paying the supplier in full). Several accepted offers on one invoice: the earliest accepted is
-taken.
+or the deduction would leave nothing to pay. Nor is it applied when the invoice
+already took a discount through an applied credit memo that **names** an offer
+(`credit_memos.discount_offer_id`, decisions §520): that memo is inside the net
+and must not come off twice. A memo that names no offer is an ordinary credit
+whatever its amount — the old amount match (§250) read a return credit equal to
+the savings as the discount. Several accepted offers on one invoice: the
+earliest accepted is taken.
 
 **The deadline is re-checked on the day the money moves.** Dispatch re-asks
 `payable_amount(pay_date=today)` immediately before the adapter call. If the
@@ -1477,8 +1479,8 @@ MORE than we authorized**, matching `bank_reconciliation.match_variance`.
   own return processing uses.
 - The **discount capture is skipped**.
   `discount_capture.capture_offer_for_settled_payment` captures the booked
-  offer for `payment.discount_amount` (or matches an accepted offer's
-  discounted payoff against `payment.amount`) — our authorized figure,
+  offer for `payment.discount_amount` (or the offer a linked credit memo on
+  the invoice names) on the strength of `payment.amount` — our authorized figure,
   which the rail has just contradicted — so capturing would permanently mark
   savings realized on a number that is in dispute and misreport them to the CFO.
 - The **ERP sync still runs**, and the invoice still transitions to `paid`.

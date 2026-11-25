@@ -946,13 +946,6 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       `received_value`, which both the per-invoice hold and the cumulative
       warning read. **Trigger:** the next PO-matching change, or the first
       customer whose POs mix lines of very different unit prices.
-- [ ] **(c) Nothing links a credit memo to a discount offer.** An applied memo
-      equal to an accepted offer's savings is read as the discount already
-      taken (decisions §250), so a return credit that happens to equal the
-      savings suppresses the discount and the offer is then recorded as
-      captured. **Durable fix:** `credit_memos.discount_offer_id` (or a typed
-      reason) and drop the amount match. **Trigger:** the next credit-memo or
-      discounting change.
 - [ ] **(c) An early-payment discount taken here is never booked in the ERP.**
       The write-back posts the exact amount that reached the supplier
       (QuickBooks and Xero; §295, §386), and neither ERP's payment carries a
