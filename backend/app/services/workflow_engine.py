@@ -60,10 +60,18 @@ VALID_TRANSITIONS: dict[InvoiceStatus, set[InvoiceStatus]] = {
     },
     InvoiceStatus.rejected: {InvoiceStatus.ready_for_review, InvoiceStatus.new},
     InvoiceStatus.sending_to_erp: {InvoiceStatus.sent_to_erp, InvoiceStatus.failed},
-    InvoiceStatus.sent_to_erp: {InvoiceStatus.posted_in_erp, InvoiceStatus.done},
+    InvoiceStatus.sent_to_erp: {
+        InvoiceStatus.posted_in_erp,
+        InvoiceStatus.done,
+        # The bill was voided in the ERP from a duplicate / fraud flag
+        # (decisions §539): only through `POST /api/exceptions/{id}/void-erp-bill`
+        # (`ERP_VOID_EDGES`). `POST /bulk/status` refuses it.
+        InvoiceStatus.approved,
+    },
     InvoiceStatus.posted_in_erp: {
         InvoiceStatus.payment_scheduled,
         InvoiceStatus.done,
+        InvoiceStatus.approved,  # the ERP void, as above (§539)
     },
     InvoiceStatus.payment_scheduled: {InvoiceStatus.paid, InvoiceStatus.approved},
     InvoiceStatus.paid: {InvoiceStatus.done, InvoiceStatus.approved},
@@ -189,6 +197,22 @@ RECALL_EDGES: frozenset[tuple[InvoiceStatus, InvoiceStatus]] = frozenset(
 )
 
 
+#: The audit action of the one transition allowed to walk :data:`ERP_VOID_EDGES`
+#: (`services/erp_bill_void.void_flagged_erp_bill`, decisions §539).
+ERP_VOID_ACTION = "invoice.erp_bill_voided"
+
+#: `sent_to_erp` / `posted_in_erp → approved`: the bill was voided in the ERP,
+#: so the approval stands and nothing holds the invoice there any more. Legal
+#: only as that void, which first voids the bill and clears its document id; any
+#: other caller would leave a live bill behind an invoice that reads as unposted.
+ERP_VOID_EDGES: frozenset[tuple[InvoiceStatus, InvoiceStatus]] = frozenset(
+    {
+        (InvoiceStatus.sent_to_erp, InvoiceStatus.approved),
+        (InvoiceStatus.posted_in_erp, InvoiceStatus.approved),
+    }
+)
+
+
 # ---------- the engine's refusals, coded ----------
 #
 # Every 409 below is a `coded_refusal` (`api/refusals.py`): it reaches a person
@@ -270,6 +294,14 @@ def _refuse_outside_the_recall(invoice: Invoice, target: InvoiceStatus, action_n
       the stamp before its transition — so `/complete` reads the stamp before
       the floor stamps it and sends such a row to review.)
     """
+    if (invoice.status, target) in ERP_VOID_EDGES and action_name != ERP_VOID_ACTION:
+        # Stated as the plain invalid edge: to every other caller it is one.
+        raise _engine_refusal(
+            INVOICE_TRANSITION_INVALID,
+            f"Cannot transition from '{invoice.status.value}' to '{target.value}'",
+            status=invoice.status.value,
+            target=target.value,
+        )
     if (invoice.status, target) in RECALL_EDGES and action_name != RECALL_ACTION:
         raise _engine_refusal(
             INVOICE_TRANSITION_RECALL_ONLY,

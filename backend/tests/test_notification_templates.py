@@ -93,6 +93,16 @@ def test_every_event_renders():
                 assert "2026-10" in rendered.title
                 assert rendered.body_text
             continue
+        if event_type == "erp_bill_flagged":
+            # The flag's own context (decisions §539): the invoice number and
+            # the kind of flag, never the vendor, amount or payee.
+            from app.services.notification_templates import render_erp_bill_flagged
+
+            for kind in ("duplicate", "fraud_flag"):
+                rendered = render_erp_bill_flagged(exception_type=kind, invoice_number="INV-77")
+                assert "INV-77" in rendered.title
+                assert "void" in rendered.body_text
+            continue
         if event_type == "erp_connection_expiring":
             # The ERP connection's own context (decisions §295): an ERP name and
             # the expiry date its provider reported, never an invoice's.

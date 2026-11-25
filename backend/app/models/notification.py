@@ -52,6 +52,11 @@ EVENT_ERP_CONNECTION_EXPIRING = "erp_connection_expiring"
 # used (decisions §322) — emitted by services.erp_call_budget to org admins,
 # once per notice per UTC day. entity_type "organization", entity_id NULL.
 EVENT_ERP_CALL_QUOTA = "erp_call_quota"
+# A duplicate or fraud flag opened on an invoice whose bill is already in the
+# ERP, where it is payable past FeohLedger's gate (decisions §539) — emitted by
+# services.erp_bill_void when the flag is raised, to admins, AP managers and
+# CFOs. entity_type "exception", entity_id the flag, which offers the void.
+EVENT_ERP_BILL_FLAGGED = "erp_bill_flagged"
 
 NOTIFICATION_EVENT_TYPES = (
     EVENT_INVOICE_ASSIGNED,
@@ -64,6 +69,7 @@ NOTIFICATION_EVENT_TYPES = (
     EVENT_AI_INVOICE_USAGE,
     EVENT_ERP_CONNECTION_EXPIRING,
     EVENT_ERP_CALL_QUOTA,
+    EVENT_ERP_BILL_FLAGGED,
 )
 
 

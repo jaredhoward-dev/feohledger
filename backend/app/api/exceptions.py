@@ -24,7 +24,7 @@ from app.api.pagination import (
     paginated,
     pagination_params,
 )
-from app.api.permissions import PERM_PAYMENT_RECORD_EXTERNAL
+from app.api.permissions import PERM_PAYMENT_RECORD_EXTERNAL, PERM_PAYMENT_VOID
 from app.api.refusals import ActionRefusal
 from app.api.sorting import SortParams, resolve_order_by, sort_params
 from app.database import get_control_db
@@ -190,7 +190,13 @@ def _caller_verdicts(
     Resolve / Dismiss / Escalate (`decision_refusals`) and — only on a row that
     carries an ERP-reported payment — recording it in one click
     (`record_erp_payment_refusal`)."""
+    from app.services.erp_bill_void import is_void_candidate, void_refusal
+
     out = {"decision_refusals": decision_refusals(exc, inv, user, org_settings, instance)}
+    # Only on a duplicate / fraud flag (decisions §539): the verdict on voiding
+    # the invoice's bill in the ERP. Absent elsewhere, so nothing is offered.
+    if is_void_candidate(exc):
+        out["void_erp_bill_refusal"] = void_refusal(exc, inv, user)
     if is_erp_paid_report(exc):
         out["record_erp_payment_refusal"] = record_erp_payment_refusal(
             exc, inv, user, org_settings, instance
@@ -949,6 +955,101 @@ async def record_erp_payment(
         response.status_code = http_status.HTTP_201_CREATED
     await db.refresh(recorded.payment)
     return PaymentResponse.from_db(recorded.payment, invoice)
+
+
+# ---------- Void the flagged bill in the ERP (decisions §539) --------------
+
+
+class VoidErpBillRequest(BaseModel):
+    """Why the bill is being voided — recorded on both audit rows."""
+
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/{exception_id}/void-erp-bill")
+async def void_erp_bill(
+    exception_id: uuid.UUID,
+    body: VoidErpBillRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    # The payment void's permission (admin + cfo by default): voiding the bill
+    # is how a payment out of the ERP is stopped, the same duty (§539).
+    user: User = Depends(require_permission(PERM_PAYMENT_VOID)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Void, in the ERP, the bill of an invoice a duplicate or fraud flag now
+    holds, and walk the invoice back to ``approved``.
+
+    Never automatic: a person who may void a payment decides, from the flag.
+    The invoice is locked, then the row, in the order every ERP writer takes
+    them. Every refusal comes before anything is written
+    (``erp_bill_void.void_flagged_erp_bill``). A replay of a void this flag
+    already made answers 200 with ``replayed: true`` and calls nothing; a fresh
+    void answers 201. The flag stays open: the payment run and the ERP push
+    still refuse the invoice until someone decides it.
+    """
+    from app.services.erp_bill_void import VoidRefused, void_flagged_erp_bill
+
+    scoped = apply_entity_scope(
+        select(APException).where(APException.id == exception_id), APException, entity_id
+    )
+    found = (await db.execute(scoped)).scalar_one_or_none()
+    if found is None:
+        raise HTTPException(status_code=404, detail="Exception not found")
+    invoice = None
+    if found.invoice_id is not None:
+        invoice = (
+            await db.execute(
+                select(Invoice)
+                .where(Invoice.id == found.invoice_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    row = (
+        await db.execute(
+            scoped.with_for_update(of=APException).execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if row is None or row.invoice_id != found.invoice_id:
+        raise HTTPException(status_code=404, detail="Exception not found")
+
+    # The invoice's own workflow instance (not `workflow_instance_for`, which
+    # reads it only for the approver axis): the void clears the push's
+    # `erp_reference` there and records itself, which is what makes a replay
+    # recognisable.
+    instance = None
+    if invoice is not None:
+        instance = (
+            await db.execute(
+                select(WorkflowInstance)
+                .where(WorkflowInstance.invoice_id == invoice.id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+    try:
+        outcome = await void_flagged_erp_bill(
+            db,
+            org=org,
+            exception=row,
+            invoice=invoice,
+            instance=instance,
+            user=user,
+            reason=body.reason.strip(),
+        )
+    except VoidRefused as refused:
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
+    if not outcome.replayed:
+        await db.commit()
+        response.status_code = http_status.HTTP_201_CREATED
+    return {
+        "exception_id": str(row.id),
+        "invoice_id": str(row.invoice_id),
+        "erp_document_id": outcome.document_id,
+        "invoice_status": outcome.status,
+        "replayed": outcome.replayed,
+    }
 
 
 # ---------- Assignment ----------------------------------------------------

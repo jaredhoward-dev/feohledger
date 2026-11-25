@@ -63,6 +63,7 @@ class NotificationPrefs(BaseModel):
     ai_invoice_usage: ChannelPrefs = Field(default_factory=ChannelPrefs)
     erp_connection_expiring: ChannelPrefs = Field(default_factory=ChannelPrefs)
     erp_call_quota: ChannelPrefs = Field(default_factory=ChannelPrefs)
+    erp_bill_flagged: ChannelPrefs = Field(default_factory=ChannelPrefs)
 
 
 class NotificationPrefsUpdate(BaseModel):
@@ -82,6 +83,7 @@ class NotificationPrefsUpdate(BaseModel):
     ai_invoice_usage: ChannelPrefs | None = None
     erp_connection_expiring: ChannelPrefs | None = None
     erp_call_quota: ChannelPrefs | None = None
+    erp_bill_flagged: ChannelPrefs | None = None
 
 
 class DeviceTokenRegister(BaseModel):
