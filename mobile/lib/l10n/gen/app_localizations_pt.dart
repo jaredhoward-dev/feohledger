@@ -2781,6 +2781,17 @@ class AppLocalizationsPt extends AppLocalizations {
       'Padrões de aprovação, anomalias, sugestões';
 
   @override
+  String get settingsHelp => 'Ajuda';
+
+  @override
+  String get settingsHelpHint =>
+      'Guias para o seu espaço de trabalho, abertos no navegador';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'Não foi possível abrir a central de ajuda. Entre no seu espaço de trabalho na web e abra a Ajuda por lá.';
+
+  @override
   String get inspectionsTitle => 'Inspeções de qualidade';
 
   @override
@@ -7867,6 +7878,17 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get settingsAdaptiveHint =>
       'Padrões de aprovação, anomalias, sugestões';
+
+  @override
+  String get settingsHelp => 'Ajuda';
+
+  @override
+  String get settingsHelpHint =>
+      'Guias para o seu espaço de trabalho, abertos no navegador';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'Não foi possível abrir a central de ajuda. Entre no seu espaço de trabalho na web e abra a Ajuda por lá.';
 
   @override
   String get inspectionsTitle => 'Inspeções de qualidade';

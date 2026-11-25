@@ -2758,6 +2758,17 @@ class AppLocalizationsEn extends AppLocalizations {
       'Approval patterns, anomalies, suggestions';
 
   @override
+  String get settingsHelp => 'Help';
+
+  @override
+  String get settingsHelpHint =>
+      'Guides for your workspace, opened in your browser';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'Couldn\'t open the help centre. Sign in to your workspace on the web and open Help there.';
+
+  @override
   String get inspectionsTitle => 'Quality Inspections';
 
   @override

@@ -2627,6 +2627,16 @@ class AppLocalizationsJa extends AppLocalizations {
   String get settingsAdaptiveHint => '承認パターン、異常、推奨';
 
   @override
+  String get settingsHelp => 'ヘルプ';
+
+  @override
+  String get settingsHelpHint => 'ワークスペースのガイドをブラウザで開きます';
+
+  @override
+  String get settingsHelpUnavailable =>
+      'ヘルプセンターを開けませんでした。Web でワークスペースにサインインし、そこからヘルプを開いてください。';
+
+  @override
   String get inspectionsTitle => '品質検査';
 
   @override

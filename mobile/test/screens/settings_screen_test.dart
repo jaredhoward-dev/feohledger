@@ -14,6 +14,7 @@ import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/login_screen.dart';
 import 'package:feohledger_mobile/screens/settings_screen.dart';
 import 'package:feohledger_mobile/stores/auth_store.dart';
+import 'package:feohledger_mobile/widgets/external_link.dart';
 
 http.Response _json(Object body, [int status = 200]) => http.Response(
       jsonEncode(body),
@@ -39,9 +40,17 @@ MockClient _happyClient({
   String fullName = 'Demo User',
   String email = 'demo@acme.com',
   List<String> roles = const ['admin'],
+  String tenantUrlTemplate = 'https://{slug}.feohledger.com',
 }) {
   return MockClient((req) async {
     final path = req.url.path;
+    if (req.method == 'GET' && path == '/api/public-config') {
+      return _json({
+        'hcaptcha_sitekey': '',
+        'tenant_url_template': tenantUrlTemplate,
+        'signup_enabled': true,
+      });
+    }
     if (req.method == 'POST' && path == '/api/auth/login') {
       return _json({'access_token': 'tok-123'});
     }
@@ -60,9 +69,15 @@ Future<void> _loginAs({
   String fullName = 'Demo User',
   String email = 'demo@acme.com',
   List<String> roles = const ['admin'],
+  String tenantUrlTemplate = 'https://{slug}.feohledger.com',
 }) async {
   ApiClient().debugConfigure(
-    client: _happyClient(fullName: fullName, email: email, roles: roles),
+    client: _happyClient(
+      fullName: fullName,
+      email: email,
+      roles: roles,
+      tenantUrlTemplate: tenantUrlTemplate,
+    ),
   );
   final result = await AuthStore.instance.login(email, 'demo', 'acme');
   expect(result.isSuccess, isTrue);
@@ -115,10 +130,10 @@ void main() {
   // Localization delegates are required now that the screen reads
   // AppLocalizations; with no explicit `locale` the default is `en`, so the
   // existing English assertions below still hold.
-  Widget wrap() => const MaterialApp(
+  Widget wrap({UrlOpener? opener}) => MaterialApp(
         localizationsDelegates: appLocalizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
-        home: SettingsScreen(),
+        home: SettingsScreen(opener: opener),
       );
 
   testWidgets('renders the logged-in user name, email and role chips',
@@ -392,5 +407,88 @@ void main() {
       findsNothing,
       reason: 'the screen must not navigate — the AuthGate re-routes',
     );
+  });
+
+  // Help (decisions §503): the row opens the web help centre of the signed-in
+  // workspace in the browser — `{slug}` in the platform's published tenant URL
+  // template, plus `/help` — and is announced as a link that leaves the app.
+  group('Help row', () {
+    const helpLabel = 'Help, Guides for your workspace, opened in your browser';
+
+    Future<void> showHelpRow(WidgetTester tester) async {
+      final row = find.byKey(const Key('settings-help'));
+      await tester.scrollUntilVisible(row, 200);
+      await tester.ensureVisible(row);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('every role gets it, announced as a link', (tester) async {
+      await _loginAs(roles: ['ap_clerk']);
+      await tester.pumpWidget(wrap());
+      await tester.pump();
+      await showHelpRow(tester);
+
+      expect(find.text('Help'), findsOneWidget);
+      expect(
+        tester.getSemantics(find.bySemanticsLabel(helpLabel)),
+        containsSemantics(isLink: true, hasTapAction: true),
+      );
+    });
+
+    testWidgets("tapping opens the workspace's /help in the browser",
+        (tester) async {
+      await _loginAs();
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(opened, [Uri.parse('https://acme.feohledger.com/help')]);
+      expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('a template with no safe https URL opens nothing and says so',
+        (tester) async {
+      // The local-dev default; the app launches https only (ExternalLink).
+      await _loginAs(tenantUrlTemplate: 'http://{slug}.localhost:7777');
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(opened, isEmpty);
+      expect(
+        find.text(
+          "Couldn't open the help centre. Sign in to your workspace on the "
+          'web and open Help there.',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a browser that refuses the URL gets the same message',
+        (tester) async {
+      await _loginAs();
+      await tester.pumpWidget(wrap(opener: (_) async => false));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SnackBar), findsOneWidget);
+    });
   });
 }
