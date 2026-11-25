@@ -502,6 +502,26 @@ async def test_attachable_is_per_caller_and_composes_with_search(realdb):
     assert await _attachable_ids(realdb, "ap_clerk", search="zeppelin") == {tagged}
 
 
+async def test_select_all_ids_narrow_to_the_same_attachable_set(realdb):
+    """`GET /api/expenses/ids?attachable=true` — what the bulk "Add to report"
+    sends out of an all-matching selection — is the list's attachable set, so
+    a line already on another report is skipped, never moved (§515)."""
+    mine = await _loose_line(realdb, "ap_clerk")
+    foreign = await _loose_line(realdb, "ap_manager")
+    _rid, on_report = await _clerk_draft_report(realdb)
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        narrowed = await c.get("/api/expenses/ids", params={"attachable": "true"})
+        everything = await c.get("/api/expenses/ids")
+    assert narrowed.status_code == 200, narrowed.text
+    ids = set(narrowed.json()["ids"])
+    assert mine in ids
+    assert not ids & {foreign, on_report}
+    assert narrowed.json()["total"] == len(ids)
+    assert ids == await _attachable_ids(realdb, "ap_clerk")
+    # Without the flag the resolver still covers the whole filtered set.
+    assert {mine, foreign, on_report} <= set(everything.json()["ids"])
+
+
 async def test_mine_lists_only_the_callers_reports(realdb):
     """`/expense-reports?mine=true&status=draft` is the bulk "Add to report"
     target list: reports only their owner may compose."""
