@@ -152,18 +152,22 @@ set_password_email_failed` and no account is created; with no tenant base URL to
 point a link at, the invite is a `503 set_password_link_unavailable` before
 anything is created (`backend/app/api/set_password_links.py`).
 
-**Existing users are asked on the web and on mobile; API callers are not, and nothing gates.**
+**Existing users are asked on the web, on mobile and in the supplier portal; API callers are not, and nothing gates.**
 Signup and a set-password link take acceptance as part of the form. Everyone
 else — users who existed before §495, SSO / SCIM-provisioned users (they never
 redeem a set-password link), users after a version bump — is reported by
 `GET /api/auth/me` (`legal_acceptance_required`) and, on signing in to the web
 app, meets a blocking accept step before any page (decisions §497); the
 mobile app shows the same blocking step after sign-in, on session restore and
-on resume (§498). Supplier-portal users acknowledge the Privacy Policy only,
-and only when they redeem a set-password link (§499). API callers are not
-prompted, and no server-side gate refuses an unaccepted user, so the flag is
-enforced only by the web and mobile screens (`docs/authentication.md` § Terms
-and Privacy acceptance, `docs/followups.md`).
+on resume (§498). Supplier-portal users acknowledge the Privacy Policy only
+(§499): when they redeem a set-password link, and after sign-in, when
+`GET /api/portal/auth/me` reports `legal_acceptance_required` and the portal
+layout draws the same blocking step (§500); a stale version there is the
+coded 422 `privacy_acknowledgement_required`, the portal twin of
+`legal_acceptance_required`. API callers are not prompted, and no server-side
+gate refuses an unaccepted user, so the flag is enforced only by the web,
+mobile and portal screens (`docs/authentication.md` § Terms and Privacy
+acceptance, `docs/followups.md`).
 
 ### An address can belong to only one workspace
 
