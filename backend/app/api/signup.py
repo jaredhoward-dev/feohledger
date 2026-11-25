@@ -581,8 +581,13 @@ async def _record_signup_acceptance(
     verification (decisions §495).
 
     A verification created before acceptance was collected carries none; that
-    admin is not credited with an acceptance they never gave and meets the
-    re-prompt at first sign-in instead. Returns what was recorded.
+    admin is not credited with an acceptance they never gave; `/me` reports
+    them as `legal_acceptance_required` instead. Returns what was recorded.
+
+    Deliberately the versions `/start` validated and stored, never
+    ``CURRENT_LEGAL_VERSIONS``: after a bump between the two calls, the current
+    version is a text this visitor was never shown, and recording it would be
+    false evidence (decisions §495).
     """
     given = (verification.meta or {}).get("legal_acceptance") or {}
     versions = {

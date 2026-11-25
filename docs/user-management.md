@@ -137,7 +137,12 @@ Backend API endpoints are role-gated via `Depends(require_roles(...))` in `backe
 4. A confirmation dialog says where the link went and when it expires — it
    shows **no credential**: whoever holds the link chooses the password, so the
    admin never sees it
-5. The user opens the link, chooses their own password, and signs in
+5. The user opens the link, ticks the Terms of Service / Privacy Policy box,
+   chooses their own password, and signs in. The box is required while the
+   account has not accepted the versions in force: the server checks it before
+   the link is spent, so a refusal (`422 legal_acceptance_required`) leaves the
+   link usable, and records the acceptance (audited `auth.legal.accepted`,
+   `docs/decisions.md` §495)
 
 The link works once and expires after `FEOH_SET_PASSWORD_LINK_TTL_HOURS`
 (default 72). If it expires or never arrives, **Reset password** on the user
@@ -146,6 +151,14 @@ the link's only channel, so a send failure is a `502
 set_password_email_failed` and no account is created; with no tenant base URL to
 point a link at, the invite is a `503 set_password_link_unavailable` before
 anything is created (`backend/app/api/set_password_links.py`).
+
+**Who is not yet asked to accept the Terms.** Only signup and a set-password
+link require acceptance today. Users who existed before it, SSO / SCIM-provisioned
+users (they never redeem a set-password link), users after a version bump,
+mobile and API callers are reported by `GET /api/auth/me`
+(`legal_acceptance_required`) but neither prompted nor blocked: the in-app
+accept screen and the server-side gate are not built (`docs/authentication.md`
+§ Terms and Privacy acceptance, `docs/followups.md`).
 
 ### An address can belong to only one workspace
 
@@ -236,7 +249,9 @@ and the user is emailed a set-password link exactly like an invite's
    link to the user's own address, then revokes every session the user holds
 4. The **Password Reset** dialog says where the link went and when it expires —
    no credential
-5. The user opens the link and chooses a new password
+5. The user opens the link and chooses a new password (a reset clears the
+   password, so the link asks for Terms / Privacy acceptance too if the user
+   has not accepted the versions in force)
 
 A reset also supersedes every earlier link for the account (an unused invite,
 a forgot-password link), and redeeming any link kills its siblings — a
@@ -313,6 +328,7 @@ Granular permissions / segregation of duties.
 |---|---|---|
 | GET | `/api/auth/me` | Get current user info |
 | PATCH | `/api/auth/me` | Update own name or password |
+| POST | `/api/auth/legal-acceptance` | Accept the Terms / Privacy versions in force (`/me`'s `legal_acceptance_required`). Backend only: no screen calls it yet |
 | GET | `/api/auth/sessions` | List your own live sessions (device / IP / method, current one marked) |
 | DELETE | `/api/auth/sessions/:jti` | End one of your own sessions |
 | POST | `/api/auth/sessions/revoke-others` | Sign out everywhere except the current session |

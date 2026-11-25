@@ -859,8 +859,9 @@ async def _set_password_needs_acceptance(db: AsyncSession, user: User) -> bool:
     user, or one an admin reset — whose owner has not accepted the versions in
     force (decisions §283, §495). That link is the account's front door, so the
     accept control sits on it. A forgot-password reset of an account that
-    already has a password is not held up: its owner meets the in-app re-prompt
-    (`UserResponse.legal_acceptance_required`) on the sign-in that follows.
+    already has a password is not held up: its owner is left to the in-app
+    re-prompt (`UserResponse.legal_acceptance_required`), whose screen is not
+    built yet (`docs/followups.md`).
     """
     if user.hashed_password is not None:
         return False

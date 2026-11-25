@@ -313,6 +313,51 @@ the lost race; `tests/test_migration_0138_email_lower_unique.py` the migration.
 
 `PATCH /api/auth/me` — self-service endpoint for updating name and password (requires current password).
 
+### Terms and Privacy acceptance
+
+`docs/decisions.md` §495. Accepting the Terms of Service and Privacy Policy is
+recorded per user in the control-plane `legal_acceptances` table (one row per
+document and version; append-only, the first `accepted_at` kept). The versions
+in force live in `backend/app/services/legal_acceptance.CURRENT_LEGAL_VERSIONS`;
+the client echoes back the versions it showed (`accepted_terms_version`,
+`accepted_privacy_version`), and anything but the current ones, absent
+included, is a `422` coded `legal_acceptance_required`.
+
+**Where acceptance is required today — two places only:**
+
+- **Signup.** `POST /api/signup/start` refuses without it and stores the
+  versions and submission time on the verification row; `/complete` records
+  exactly those against the admin it provisions (source `signup`), never the
+  versions current at `/complete`, so a bump in between cannot record a text
+  the visitor never saw.
+- **A first password set.** `POST /api/auth/reset-password` on a set-password
+  link (an account with **no** password: invited, admin-reset,
+  operator-provisioned) must carry the versions. The check runs **before** the
+  token is consumed, so a refusal leaves the link usable once the box is
+  ticked; `POST /api/auth/reset-password/check` returns
+  `legal_acceptance_required` so the page knows to show the box. A
+  forgot-password reset of an account that already has a password is not held
+  up.
+
+Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
+trail (`{versions, source, ip}`).
+
+**The re-prompt is backend-only so far.** `GET /api/auth/me` returns
+`legal_acceptance_required` (the user has not accepted the versions in force)
+and `POST /api/auth/legal-acceptance` records it (source `reprompt`; 10/min per
+account; audited only on a first acceptance). But the flag is **advisory**:
+nothing in the web app or the mobile app reads it, and no server-side gate
+refuses an unaccepted user. So these are **not yet prompted or gated**:
+existing users (nothing is backfilled), SSO / SCIM users (no password, never
+meet a set-password link), anyone after a version bump, a forgot-password reset
+of a password account, mobile users and API callers. The server gate waits for
+the accept screen on purpose: without one it would lock those users out with no
+way to accept. The screen, then mobile and the supplier portal, then the gate:
+`docs/followups.md`.
+
+The rows survive a DSAR erasure and a workspace deletion (evidence of the
+contract; no foreign keys), and the DSAR export carries them.
+
 ### Protected routes
 
 All endpoints except the explicit allowlist (login flow, OIDC handshake, signup, webhooks, SCIM, health) require a valid Bearer token AND the right role. Authentication and role checks are enforced via FastAPI dependencies in `app/api/deps.py` (`get_current_user`, `require_roles`). See **Role-based access control** below for the full permission matrix.
@@ -522,6 +567,7 @@ Action names:
 | Self-service password change (`POST /auth/change-password`, incl. the forced first-login change; `PATCH /auth/me` with `password`) | `auth.password.changed` — PII-free, records `{via: "change_password" \| "profile", forced: <bool>}`; `forced` is true when it replaced a temporary password — no flow issues one any more (decisions §283), so only an account still holding a pre-§283 temp, or a CLI-provisioned tenant admin, can be forced. Written before the `auth.session.revoked` row the same change's forced logout writes, which is a side effect and not the event |
 | Supplier-portal password change (`POST /portal/auth/change-password`, incl. the forced first sign-in change) | `portal.password.changed` — the portal twin of `auth.password.changed`: PII-free, records `{via: "change_password", forced: <bool>}` (`forced` = it replaced a temp the AP team issued before the set-password links; a link redemption writes `{via: "set_password_link", forced: false}`), identifies the account by `actor_id`/`entity_id`, never by address. Written before the `portal.session.revoked` side-effect row |
 | Forgot-password link requested / redeemed (`POST /auth/forgot-password`, `POST /auth/reset-password`) | `auth.password_reset.requested` (`actor_id` null — the requester is unauthenticated) · `auth.password_reset.completed` (`actor_id` = the account) — both PII-free, recording only `{ip}`; never the token or the new password. `requested` is written only for an existing, active account with a tenant to route to |
+| Terms / Privacy acceptance recorded (signup `/complete`, a set-password redemption that carried it, `POST /auth/legal-acceptance` when something was missing) | `auth.legal.accepted` — `{versions: {terms, privacy}, source: "signup" \| "set_password" \| "reprompt", ip}`; actor and entity are the accepting user. The control-plane `legal_acceptances` row is the record; this is the trail entry (decisions §495) |
 | MFA challenge issued during login | `auth.mfa.challenge_issued` |
 | Successful MFA verify | `auth.mfa.verify.success` |
 | Failed MFA verify | `auth.mfa.verify.failure` |
