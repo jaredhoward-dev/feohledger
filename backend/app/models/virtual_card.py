@@ -114,7 +114,7 @@ class CardTransactionEvent(Base, TimestampMixin):
     """One provider transaction event the card webhook must remember beyond
     the delivery that carried it (decisions §554; migration 0148).
 
-    Two kinds, keyed per card by ``(kind, event_key)``:
+    Three kinds, keyed per card by ``(kind, event_key)``:
 
     * ``lapse`` — a reversal / expiry that arrived BEFORE its authorization, on
       a card with no hold to release. ``event_key`` is the provider's
@@ -126,6 +126,10 @@ class CardTransactionEvent(Base, TimestampMixin):
       when the body has no `events`, decisions §561; the delivery id for
       the mock), so an incremental capture is added exactly once even when the
       Redis event-id claim is gone.
+    * ``settlement_refused`` — a settlement refused for stating no usable figure
+      (decisions §562). ``event_key`` is the delivery's identity. Money may have
+      moved, so while one exists the card is never cancelled by hand nor reused
+      by a run, whatever status it reads.
 
     Not the audit log: in ``lambda`` audit mode those rows ship to SQS and may
     not be in the tenant database, and this is read back by the webhook.

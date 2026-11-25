@@ -259,6 +259,7 @@ export const enAudit = {
 	'audit.action.payment.failed': "Payment failed",
 	'audit.action.payment.recorded_outside': "Payment recorded outside FeohLedger",
 	'audit.action.payment.retried': "Payment retried",
+	'audit.action.payment.settled_amount_changed': "Settled amount changed",
 	'audit.action.payment.settlement_accepted': "Settlement accepted",
 	'audit.action.payment.void_card_cancel_retried': "Card cancellation retried after void",
 	'audit.action.payment.voided': "Payment voided",

@@ -30,7 +30,10 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ROLE_ADMIN, require_roles
-from app.api.refusals import credential_block_unopenable_detail
+from app.api.refusals import (
+    CARD_WEBHOOK_SECRET_FORMAT_DETAIL,
+    credential_block_unopenable_detail,
+)
 from app.database import get_control_db
 from app.models.organization import Organization
 from app.models.user import User
@@ -45,6 +48,7 @@ from app.services.provider_credentials import (
     update_secrets,
     validate_update,
 )
+from app.services.webhook_security import _STANDARD_WEBHOOK_SECRET_PREFIX
 from app.tenant import get_tenant, lock_organization
 
 router = APIRouter(prefix="/organization/credentials", tags=["organization"])
@@ -85,6 +89,26 @@ def _parse_body(raw: object) -> tuple[dict[str, object], list[str]]:
     if not isinstance(to_clear, list) or not all(isinstance(p, str) for p in to_clear):
         raise HTTPException(status_code=422, detail="`clear` must be a list of paths")
     return to_set, to_clear
+
+
+def _check_card_webhook_secret_format(org: Organization, block: str, to_set: dict) -> None:
+    """Refuse a Lithic card webhook secret that cannot be Lithic's (§562).
+
+    Lithic signs every card delivery with a Standard-Webhooks `whsec_` secret,
+    and the verifier fails closed on any other value — so a pasted API key or a
+    secret with its prefix trimmed would save cleanly and then answer every
+    real delivery with a silent 204. Only the prefix is checked: it is what the
+    verifier itself requires, and the rest is the provider's to judge. Keyed on
+    the cards block's configured provider; Nium's secret is a free-form
+    `x-partner-key` value and the mock's a hex HMAC key, so neither is checked.
+    """
+    if block != "cards" or "webhook_signing_secret" not in to_set:
+        return
+    cards = (org.settings or {}).get("cards") or {}
+    if not isinstance(cards, dict) or str(cards.get("provider") or "").lower() != "lithic":
+        return
+    if not to_set["webhook_signing_secret"].startswith(_STANDARD_WEBHOOK_SECRET_PREFIX):
+        raise HTTPException(status_code=422, detail=CARD_WEBHOOK_SECRET_FORMAT_DETAIL)
 
 
 @router.get("", response_model=ProviderCredentialStatus)
@@ -145,6 +169,7 @@ async def update_provider_credentials(
         to_set, to_clear = validate_update(block, set_values, clear)
     except CredentialPathError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    _check_card_webhook_secret_format(org, block, to_set)
 
     # Same row lock every settings writer takes: it serialises two credential
     # saves for this org, and a credential save against a concurrent PATCH of

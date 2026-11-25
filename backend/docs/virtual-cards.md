@@ -740,7 +740,8 @@ float.
 | `card.reversal_after_settlement` | a reversal / expiry webhook arrives for a `completed` card — left untouched (refund / chargeback territory) | `last_four`, `status`, `lapse` |
 | `card.clearing_added` | a further clearing raised a settled card's total (decisions §554) | `last_four`, `cleared_amount`, `amount_charged`, `currency`, `rebate_amount` (string Decimals or null) |
 | `card.clearing_refused` | a further clearing on a settled card was not applied (decisions §554) | `last_four`, `reason` (`not_an_increase` \| `provider_single_settlement` \| `no_amount`), `cleared_amount`, `amount_charged`, `currency` |
-| `card.settlement_refused` | a settlement webhook stated no usable figure (absent, zero, unparseable, another currency) — the card and the run leg are left as they were (decisions §557) | `last_four`, `status`, `reason` (`no_amount`), `currency` |
+| `card.settlement_refused` | a settlement webhook stated no usable figure (absent, zero, unparseable, another currency) — the card and the run leg are left as they were (decisions §557), the card is held as possibly spent and a `card_settlement_refused` flag opens (§562) | `last_four`, `status`, `reason` (`no_amount`), `currency` |
+| `payment.settled_amount_changed` | a further clearing changed a completed run payment's `settled_amount` (decisions §562); entity the payment | `from`, `to` (string Decimals or null), `currency`, `via` (`card.clearing_added`), `virtual_card_id` |
 | `card.settled_after_cancel` | a settlement webhook arrives for a `cancelled` card — the card is left cancelled and a payment-blocking `payment_reconciliation` exception is opened on its invoice (decisions §549) | `last_four`, `status`, `settled_amount` (string Decimal or null), `currency`, `invoice_id` |
 | `card.settled` | settlement webhook completes + accrues the rebate | `last_four`, `from`, `to`, `rebate_amount`, `rebate_rate`, `rebate_base` (string Decimals), `rebate_base_source` (`settled` \| `charged` \| `unknown` — which figure the rebate priced off, see § Rebate base), `rebate_created` (bool — `false` if the one-per-card unique index skipped a duplicate) |
 | `card_rebate.confirmed` | `POST /rebates/{id}/confirm` (`pending` → `confirmed`) | `amount` (string Decimal), `from`, `to` |
@@ -1194,8 +1195,27 @@ once even past the Redis dedupe. On a `completed` card
 | Lithic, cumulative settled figure (`settled_amount`, else the deprecated `amount`) above `amount_charged` | the difference is added; `record_card_spend` writes the total onto the run payment; a `pending` rebate is re-based on the total at its rate; `card.clearing_added` (`cleared_amount`, `amount_charged`, `currency`, `rebate_amount`, string Decimals); the payment sync is re-dispatched once |
 | mock, positive figure | the same, the figure being this clearing's own |
 | a figure that does not raise the total (a Lithic `RETURN`, a negative mock clearing) | **refused**: card, payment and rebate stand; `card.clearing_refused` (`reason` `not_an_increase`) for the refund flow, as a reversal after settlement is |
-| Nium | **refused** (`provider_single_settlement`): Nium's documented card webhooks describe one `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture, so a second one cannot be told from a redelivery under a new id |
+| Nium | **refused** (`provider_single_settlement`): Nium's documented card webhooks describe one `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture, so a second one cannot be told from a redelivery under a new id. Also opens a payment-blocking `card_clearing_refused` reconciliation flag (deduped by kind), since money may have moved that nothing recorded (decisions §562) |
+| no usable figure (`no_amount`) | **refused**, and flagged `card_clearing_refused` like the Nium case (§562) |
 | a replay of an applied clearing | nothing |
+
+**Lithic clearings are applied as running-total differences (decisions §562).**
+Lithic's figure is the transaction's cumulative settled amount, and each
+clearing adds `reported − amount_charged`. A refused `RETURN` changes nothing
+on the card, so it is netted into the next capture: clear 100, return 30
+(cumulative 70, refused), capture 50 (cumulative 120) → the card records 120,
+the net, not 150. The over-settlement flag below measures that same net total.
+A refund's own record is the refund flow's.
+
+**A further clearing that changes a completed payment leaves a payment row
+(decisions §562).** When `record_card_spend` changes the run payment's
+`settled_amount`, a `payment.settled_amount_changed` audit row (entity the
+payment; `from`, `to`, `currency`, `via`, `virtual_card_id`) is written in the
+same transaction. The re-dispatched payment sync may write the payment back to
+an ERP that already holds it; the write-back is idempotent on the payment id
+(QuickBooks finds its own BillPayment by its `PrivateNote` marker), so no
+second bill payment is posted, and the difference is the over-settlement
+flag's to reconcile.
 
 Any settlement (the first included) whose card total exceeds what the card
 pays — the run payment's amount, else the invoice's, judged by
@@ -1301,6 +1321,29 @@ and a `card.settlement_refused` row (`reason: no_amount`) is left for a person
 to reconcile with the provider. The card's limit and its authorized hold are
 never stand-ins for what cleared.
 
+**A refused settlement holds the card as possibly spent (decisions §562).** The
+refused card keeps its status, and that status may read unspent: a lapse
+returns a card to `active` (§544), and a force post can clear it afterwards.
+So the refusal also, in the webhook's own transaction:
+
+- records a durable `settlement_refused` fact on the card
+  (`card_transaction_events`, keyed by the delivery id;
+  `card_transaction_memory.record_settlement_refused` / `settlement_refused`),
+  never the audit log, which in `lambda` audit mode is not in the tenant
+  database;
+- opens one payment-blocking `payment_reconciliation` exception of kind
+  `card_settlement_refused` on the card's invoice (deduped by kind, message
+  `exception.card_settlement_refused`), on a `charged` card as on an unspent
+  one, so the invoice enters no run until a person has reconciled the card.
+
+While the fact exists, `POST /api/cards/{id}/cancel` answers a coded 409
+`card_cancel_settlement_refused` and leaves the card live; the void's card leg
+reports `card_already_charged` (the card keeps its invoice's live-card slot);
+and a run converging onto the card fails the leg with
+`card_settlement_refused` (`card_issuance.card_settlement_block`), which is not
+retry-safe. A later settlement with a usable figure completes the card as
+usual; the flag stays for the person to resolve.
+
 **Every rejection path returns `204` silently** (bad/missing/stale
 signature, wrong partner key, unknown card token, missing delivery id,
 malformed JSON) — a distinct 4xx would let an attacker enumerate card tokens
@@ -1314,7 +1357,7 @@ the event's URL names:
 
 | Provider | What to store | What the provider sends | Verified as |
 |---|---|---|---|
-| Lithic | the webhook's **signing secret** exactly as Lithic shows it, `whsec_` prefix included (one per program — a multi-program setup needs the matching program's secret) | `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>`, space-separated during a rotation) | HMAC-SHA256 over `"{webhook-id}.{webhook-timestamp}.{raw body}"` keyed by the base64 after `whsec_`; any listed `v1` signature may match; the timestamp must be within **5 minutes** of now either way (Lithic's reference verifier's window). A secret without `whsec_` never verifies. <https://docs.lithic.com/docs/events-api> |
+| Lithic | the webhook's **signing secret** exactly as Lithic shows it, `whsec_` prefix included (one per program — a multi-program setup needs the matching program's secret) | `webhook-id`, `webhook-timestamp`, `webhook-signature` (`v1,<base64>`, space-separated during a rotation) | HMAC-SHA256 over `"{webhook-id}.{webhook-timestamp}.{raw body}"` keyed by the base64 after `whsec_`; any listed `v1` signature may match; the timestamp must be within **5 minutes** of now either way (Lithic's reference verifier's window). A secret without `whsec_` never verifies, so `PUT /api/organization/credentials/cards` refuses one (coded 422 `card_webhook_secret_format`) while the block's provider is `lithic` (decisions §562). <https://docs.lithic.com/docs/events-api> |
 | Nium | the **`x-partner-key`** value you agree with Nium in the client setup (Nium's own term: a "static identifier") — make it a long random value | `x-partner-key`, `x-request-id` | constant-time equality of `x-partner-key`. Nium documents **no body signature and no timestamp** (<https://docs.nium.com/docs/developers/notifications-and-webhooks>), so this authenticates the sender but does not bind the body; `x-request-id` dedupe is the only replay control. Ask Nium to enable retries per event (off by default, at-most-once) |
 | mock (local only) | nothing, or any value | `Webhook-Signature` (hex) | hex HMAC-SHA256 of the raw body; the simulator's public local key when unset |
 

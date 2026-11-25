@@ -8,6 +8,10 @@ carried them, so they are kept in ``card_transaction_events`` (migration 0148):
   authorization finds an unspent card and nothing to release. It is recorded
   under the provider's transaction id, and the late authorization of that same
   transaction is applied as already lapsed (:func:`lapse_for`).
+* **A settlement refused** for stating no usable figure (decisions §562). The
+  card keeps its status, which may read unspent (`active`), so the refusal is
+  what stops a cancel or a run's reuse from treating it as unspent
+  (:func:`settlement_refused`).
 * **Each clearing applied.** A settled card can clear again (an incremental
   capture); each clearing is recorded under its own identity, so it is added to
   the card exactly once even if the Redis claim has expired or Redis was down
@@ -33,6 +37,10 @@ KIND_LAPSE = "lapse"
 #: A lapse already applied to its authorization (:func:`consume_lapse`).
 KIND_LAPSE_APPLIED = "lapse_applied"
 KIND_CLEARING = "clearing"
+#: A settlement the webhook refused for stating no usable figure (decisions
+#: §562). Money may have moved, so the card is treated as possibly spent for as
+#: long as the row exists: it is never cancelled by hand nor reused by a run.
+KIND_SETTLEMENT_REFUSED = "settlement_refused"
 
 #: Column width of ``event_key`` / ``provider_transaction_id``.
 _KEY_MAX = 255
@@ -141,3 +149,39 @@ async def record_clearing(
         amount=amount,
         currency=card.currency,
     )
+
+
+async def record_settlement_refused(
+    db: AsyncSession,
+    card: VirtualCard,
+    *,
+    event_key: str,
+    transaction_id: str | None,
+) -> bool:
+    """Record that a settlement on ``card`` was refused for stating no usable
+    figure (decisions §562). Returns False on a replay of the same delivery."""
+    return await _insert(
+        db,
+        card,
+        id=uuid.uuid4(),
+        kind=KIND_SETTLEMENT_REFUSED,
+        event_key=_clip(event_key),
+        provider_transaction_id=_clip(transaction_id),
+        lapse=None,
+        amount=None,
+        currency=card.currency,
+    )
+
+
+async def settlement_refused(db: AsyncSession, card: VirtualCard) -> bool:
+    """Whether any settlement on ``card`` was refused (decisions §562)."""
+    return (
+        await db.execute(
+            select(CardTransactionEvent.id)
+            .where(
+                CardTransactionEvent.virtual_card_id == card.id,
+                CardTransactionEvent.kind == KIND_SETTLEMENT_REFUSED,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None

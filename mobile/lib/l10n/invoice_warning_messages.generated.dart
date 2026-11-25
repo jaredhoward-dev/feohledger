@@ -357,6 +357,8 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.payment_dispatch_interrupted_failed': {'paymentId': 'text'},
   'exception.payment_dispatch_interrupted_cancelled': {'paymentId': 'text'},
   'exception.card_settled_after_cancel': {'lastFour': 'text'},
+  'exception.card_settlement_refused': {'lastFour': 'text'},
+  'exception.card_clearing_refused': {'lastFour': 'text'},
   'exception.settlement_currency_mismatch': {
     'settledAmount': 'number',
     'settledCurrency': 'text',
@@ -1358,6 +1360,16 @@ String? _localizeWarningCode(
       final lastFour = _text(p['lastFour'], currency);
       if (lastFour == null) return null;
       return l.exceptionDescriptionCardSettledAfterCancel(lastFour);
+    // A settlement on the card ending {lastFour} was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.card_settlement_refused':
+      final lastFour = _text(p['lastFour'], currency);
+      if (lastFour == null) return null;
+      return l.exceptionDescriptionCardSettlementRefused(lastFour);
+    // A further charge on the card ending {lastFour} was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.card_clearing_refused':
+      final lastFour = _text(p['lastFour'], currency);
+      if (lastFour == null) return null;
+      return l.exceptionDescriptionCardClearingRefused(lastFour);
     // Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
     case 'exception.settlement_currency_mismatch':
       final settledAmount = _number(p['settledAmount'], currency);

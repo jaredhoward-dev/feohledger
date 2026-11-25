@@ -256,6 +256,7 @@ export const messages = {
 	'audit.action.payment.failed': "Zahlung fehlgeschlagen",
 	'audit.action.payment.recorded_outside': "Zahlung außerhalb von FeohLedger erfasst",
 	'audit.action.payment.retried': "Zahlung wiederholt",
+	'audit.action.payment.settled_amount_changed': "Abgerechneter Betrag geändert",
 	'audit.action.payment.settlement_accepted': "Abrechnung akzeptiert",
 	'audit.action.payment.void_card_cancel_retried': "Kartenstornierung nach Stornierung wiederholt",
 	'audit.action.payment.voided': "Zahlung storniert",

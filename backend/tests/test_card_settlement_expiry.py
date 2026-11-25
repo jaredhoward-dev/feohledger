@@ -282,7 +282,10 @@ def test_the_money_path_never_injects_its_own_clock():
     ]
     assert calls, "the payment leg no longer consults card_settlement_block"
     for call in calls:
-        assert not call.keywords, "the money path must use the ambient UTC clock"
+        keywords = {kw.arg for kw in call.keywords}
+        assert "now" not in keywords, "the money path must use the ambient UTC clock"
+        # ...and it passes the durable refused-settlement fact (decisions §562).
+        assert keywords == {"settlement_refused"}
         assert len(call.args) == 2
         assert ast.unparse(call.args[1]) == "payment.amount"
 

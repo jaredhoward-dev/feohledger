@@ -24,6 +24,7 @@ from app.api.refusals import coded_refusal
 from app.config import settings
 from app.models.invoice import Invoice
 from app.models.organization import Organization
+from app.models.payment import Payment
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.models.virtual_card import CardRebate, VirtualCard
@@ -1265,6 +1266,23 @@ async def cancel_card(
         raise HTTPException(status_code=404, detail="Card not found")
     if card.status in CARD_SPENT_STATUSES or card.status == "cancelled":
         raise HTTPException(status_code=409, detail=f"Cannot cancel card in '{card.status}' status")
+    from app.services import card_transaction_memory as card_memory
+
+    if await card_memory.settlement_refused(db, card):
+        # A settlement on this card was refused for stating no usable figure
+        # (decisions §562): money may have moved even though the card reads
+        # unspent. Cancelling it here would free its invoice for another rail
+        # while that charge stands — the double payment the open
+        # `card_settlement_refused` flag exists to stop.
+        raise HTTPException(
+            status_code=409,
+            detail=coded_refusal(
+                CARD_CANCEL_SETTLEMENT_REFUSED,
+                "A settlement on this card was refused because it stated no usable amount, "
+                "so money may have moved on it. Reconcile the card with the provider before "
+                "cancelling it.",
+            ),
+        )
 
     # Refuses (409) when the org names an unregistered provider — the mock's
     # `cancel_card` returns True unconditionally, so the row would be marked
@@ -1405,11 +1423,6 @@ async def _record_settlement_after_cancel(
     so no further run pays it until a person has reconciled the card.
     """
     from app.services.audit_dispatch import dispatch_audit
-    from app.services.erp_status_sync import (
-        PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
-        open_erp_reconciliation_exception,
-    )
-    from app.services.invoice_warning_catalog import exception_finding
 
     amount_text = str(settled_amount) if settled_amount is not None else None
     logger.warning("Card webhook: settlement on a cancelled card; flagged for reconciliation")
@@ -1429,6 +1442,47 @@ async def _record_settlement_after_cancel(
             "invoice_id": str(card.invoice_id),
         },
     )
+    await _open_card_reconciliation_flag(
+        db,
+        card,
+        CARD_SETTLED_AFTER_CANCEL_KIND,
+        erp_report={"settled_amount": amount_text, "currency": card.currency},
+    )
+
+
+#: `Exception.erp_report["kind"]` of the flag a refused settlement opens
+#: (decisions §562): a clearing that stated no usable figure, on a card that is
+#: not settled yet. Deduped by kind (§535).
+CARD_SETTLEMENT_REFUSED_KIND = "card_settlement_refused"
+#: The same, for a further clearing of a settled card that was not applied
+#: (a Nium second settlement, or one with no figure) — decisions §562.
+CARD_CLEARING_REFUSED_KIND = "card_clearing_refused"
+
+#: The `card.clearing_refused` reasons that may hide money moved and are
+#: therefore flagged, not only audited (§562). `not_an_increase` (a Lithic
+#: RETURN, a negative mock clearing) is money coming BACK: Lithic's figure is
+#: cumulative, so it is netted into the next capture, and is left to the refund
+#: flow.
+_UNAPPLIED_CLEARING_REASONS = frozenset({"provider_single_settlement", "no_amount"})
+
+#: The coded 409 `POST /api/cards/{id}/cancel` answers for a card a refused
+#: settlement may have spent (decisions §562).
+CARD_CANCEL_SETTLEMENT_REFUSED = "card_cancel_settlement_refused"
+
+
+async def _open_card_reconciliation_flag(
+    db: AsyncSession, card: VirtualCard, kind: str, *, erp_report: dict
+) -> None:
+    """Open the payment-blocking `payment_reconciliation` flag ``kind`` on the
+    card's invoice, deduped by kind (§535): the one way the card webhook puts a
+    money question in front of a person. An audit row alone is not one: in
+    `lambda` audit mode it ships to SQS and nobody's queue shows it."""
+    from app.services.erp_status_sync import (
+        PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        open_erp_reconciliation_exception,
+    )
+    from app.services.invoice_warning_catalog import exception_finding
+
     # Read, not locked: the card row is held, and the void path takes the
     # invoice before the card, so locking it here could deadlock. The flag's
     # dedupe is by kind; a concurrent duplicate is the worst case.
@@ -1439,18 +1493,71 @@ async def _record_settlement_after_cancel(
         db,
         invoice,
         org_id=card.organization_id,
-        finding=exception_finding(
-            CARD_SETTLED_AFTER_CANCEL_KIND, lastFour=card.last_four or "????"
-        ),
+        finding=exception_finding(kind, lastFour=card.last_four or "????"),
         exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
         # PII-free machine detail, in the column the reconciliation rows use for
         # it; the kind is what the dedupe reads.
-        erp_report={
-            "kind": CARD_SETTLED_AFTER_CANCEL_KIND,
-            "virtual_card_id": str(card.id),
-            "settled_amount": amount_text,
+        erp_report={"kind": kind, "virtual_card_id": str(card.id), **erp_report},
+    )
+
+
+async def _record_settlement_refusal(
+    db: AsyncSession,
+    card: VirtualCard,
+    *,
+    event_id: str | None,
+    transaction_id: str | None,
+) -> None:
+    """A settlement that states no usable figure, on a card not yet settled
+    (decisions §557, §562).
+
+    The figure is not guessed (§557), so the card keeps its status. That
+    status may read unspent: a card whose authorization lapsed is `active`
+    (§544), and a force post can clear it later. §557 assumed the card stays
+    `charged`; it need not, and an `active` card can be cancelled by hand or
+    voided, and the invoice paid again by another rail while the refused
+    clearing moved real money. So, in the webhook's own transaction:
+
+    * a durable `settlement_refused` fact on the card
+      (`card_transaction_memory`), which `cancel_card`, the void's card leg and
+      a run's reuse (`card_settlement_block`) read as "possibly spent";
+    * the `card.settlement_refused` audit row, as before;
+    * a payment-blocking `card_settlement_refused` reconciliation flag, so the
+      invoice enters no run until a person has reconciled with the provider.
+      Blocking on a `charged` card too: its leg is in flight so no run could
+      pay it today, but a later lapse would return it to `active`, and the
+      flag is what reaches a person either way.
+    """
+    from app.services import card_transaction_memory as card_memory
+    from app.services.audit_dispatch import dispatch_audit
+
+    logger.warning("Card webhook: settlement with no usable figure refused")
+    await card_memory.record_settlement_refused(
+        db,
+        card,
+        event_key=f"delivery:{event_id}" if event_id else f"local:{uuid.uuid4()}",
+        transaction_id=transaction_id,
+    )
+    await dispatch_audit(
+        db,
+        correlation_id=card.correlation_id or uuid.uuid4(),
+        organization_id=card.organization_id,
+        actor_id=None,
+        action="card.settlement_refused",
+        entity_type="virtual_card",
+        entity_id=card.id,
+        details={
+            "last_four": card.last_four,
+            "status": card.status,
+            "reason": "no_amount",
             "currency": card.currency,
         },
+    )
+    await _open_card_reconciliation_flag(
+        db,
+        card,
+        CARD_SETTLEMENT_REFUSED_KIND,
+        erp_report={"status": card.status, "reason": "no_amount", "currency": card.currency},
     )
 
 
@@ -1535,10 +1642,47 @@ async def _record_further_clearing(
                 "currency": card.currency,
             },
         )
+        if reason in _UNAPPLIED_CLEARING_REASONS:
+            # Money may have moved that nothing recorded; an audit row alone
+            # reaches no person (in `lambda` audit mode it is not even in the
+            # tenant database), so it is flagged for reconciliation (§562).
+            await _open_card_reconciliation_flag(
+                db,
+                card,
+                CARD_CLEARING_REFUSED_KIND,
+                erp_report={
+                    "reason": reason,
+                    "cleared_amount": str(added) if added is not None else None,
+                    "amount_charged": str(current),
+                    "currency": card.currency,
+                },
+            )
         return None
 
     card.amount_charged = current + added
+    leg = await db.get(Payment, card.payment_id) if card.payment_id is not None else None
+    previous_settled = leg.settled_amount if leg is not None else None
     payment = await record_card_spend(db, card)
+    if payment is not None and payment.settled_amount != previous_settled:
+        # The leg may already be `paid` and written back to the ERP: a change to
+        # its settled figure is a payment-state change and leaves its own
+        # payment row on the trail, in this transaction (decisions §562).
+        await dispatch_audit(
+            db,
+            correlation_id=payment.correlation_id or card.correlation_id or uuid.uuid4(),
+            organization_id=card.organization_id,
+            actor_id=None,
+            action="payment.settled_amount_changed",
+            entity_type="payment",
+            entity_id=payment.id,
+            details={
+                "from": str(previous_settled) if previous_settled is not None else None,
+                "to": str(payment.settled_amount) if payment.settled_amount is not None else None,
+                "currency": payment.settled_currency,
+                "via": "card.clearing_added",
+                "virtual_card_id": str(card.id),
+            },
+        )
 
     rebate = (
         await db.execute(select(CardRebate).where(CardRebate.virtual_card_id == card.id))
@@ -1976,28 +2120,13 @@ async def card_webhook(provider: str, request: Request):
                     and (settled_reported is None or settled_reported <= 0)
                 ):
                     # A clearing that states no usable figure (absent, zero or
-                    # negative, unparseable, another currency). Money may have moved, but
-                    # how much is unknown, and every stand-in — the card's limit,
-                    # its authorized hold — is a guess written onto the run's
-                    # payment and the rebate (decisions §557). Refused: the card
-                    # keeps its state, the run's card leg stays in flight (so the
-                    # invoice never reaches `paid` on it), and the refusal is on
-                    # the trail for a person to reconcile with the provider.
-                    logger.warning("Card webhook: settlement with no usable figure refused")
-                    await dispatch_audit(
-                        db,
-                        correlation_id=card.correlation_id or uuid.uuid4(),
-                        organization_id=card.organization_id,
-                        actor_id=None,
-                        action="card.settlement_refused",
-                        entity_type="virtual_card",
-                        entity_id=card.id,
-                        details={
-                            "last_four": card.last_four,
-                            "status": card.status,
-                            "reason": "no_amount",
-                            "currency": card.currency,
-                        },
+                    # negative, unparseable, another currency). Money may have
+                    # moved, but how much is unknown, and every stand-in is a
+                    # guess written onto the run's payment and the rebate
+                    # (decisions §557). Refused, recorded durably on the card
+                    # and flagged for a person (§562).
+                    await _record_settlement_refusal(
+                        db, card, event_id=event_id, transaction_id=txn_id
                     )
                 elif is_settled and card.status in _SETTLEABLE_CARD_STATUSES:
                     # `charged` is the usual case. An unspent card settles too:

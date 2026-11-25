@@ -4083,6 +4083,16 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Eine Abrechnung der Karte mit der Endung $lastFour wurde abgelehnt, weil sie keinen verwertbaren Betrag enthielt; auf der Karte kann also Geld geflossen sein, ohne erfasst zu werden. Prüfen Sie die Belastung beim Kartenanbieter – die Karte kann nicht storniert werden, und diese Rechnung ist bis zur Klärung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Eine weitere Belastung der Karte mit der Endung $lastFour wurde nicht erfasst; für diese Rechnung wurde also möglicherweise mehr bezahlt als angezeigt. Prüfen Sie die Belastung beim Kartenanbieter und erfassen Sie die Differenz – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

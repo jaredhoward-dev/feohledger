@@ -4064,6 +4064,16 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'A settlement on the card ending $lastFour was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'A further charge on the card ending $lastFour was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
   String exceptionDescriptionSettlementCurrencyMismatch(
     String settledAmount,
     String settledCurrency,

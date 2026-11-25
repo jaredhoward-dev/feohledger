@@ -1242,6 +1242,30 @@ DIRECT_EXCEPTION_SPECS: tuple[WarningSpec, ...] = (
         "from a new payment run until this is resolved.",
         {"lastFour": "text"},
     ),
+    # `api/cards._record_settlement_refusal`: a clearing on a card not yet
+    # settled stated no usable figure (decisions §557, §562). Money may have
+    # moved, so the card is held as possibly spent and the invoice blocked.
+    WarningSpec(
+        EXCEPTION_PREFIX + "card_settlement_refused",
+        "payment_reconciliation",
+        "A settlement on the card ending {lastFour} was refused because it stated no usable "
+        "amount, so money may have moved on the card without being recorded. Check the "
+        "charge with the card provider — the card cannot be cancelled and this invoice is "
+        "blocked from a new payment run until this is resolved.",
+        {"lastFour": "text"},
+    ),
+    # `api/cards._record_further_clearing`: a further clearing on a settled card
+    # that was not applied — a second Nium settlement, or one with no figure
+    # (decisions §562). The amount is on the exception's `erp_report`.
+    WarningSpec(
+        EXCEPTION_PREFIX + "card_clearing_refused",
+        "payment_reconciliation",
+        "A further charge on the card ending {lastFour} was not recorded, so the amount "
+        "paid on this invoice may be more than shown. Check the charge with the card "
+        "provider and record any difference — this invoice is blocked from a new payment "
+        "run until this is resolved.",
+        {"lastFour": "text"},
+    ),
     # `services/payment_settlement.discrepancy_finding`. The two sides can be
     # in different currencies (and either may be unknown), so the figures are
     # bare `number`s beside their own codes as `text` — one `currency` param

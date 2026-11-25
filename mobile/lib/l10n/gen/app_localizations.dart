@@ -5950,6 +5950,18 @@ abstract class AppLocalizations {
   /// **'The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.'**
   String exceptionDescriptionCardSettledAfterCancel(String lastFour);
 
+  /// No description provided for @exceptionDescriptionCardSettlementRefused.
+  ///
+  /// In en, this message translates to:
+  /// **'A settlement on the card ending {lastFour} was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionCardSettlementRefused(String lastFour);
+
+  /// No description provided for @exceptionDescriptionCardClearingRefused.
+  ///
+  /// In en, this message translates to:
+  /// **'A further charge on the card ending {lastFour} was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionCardClearingRefused(String lastFour);
+
   /// No description provided for @exceptionDescriptionSettlementCurrencyMismatch.
   ///
   /// In en, this message translates to:

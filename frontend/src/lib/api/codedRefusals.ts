@@ -1101,6 +1101,8 @@ const BUILDERS: Record<string, Builder> = {
 	workspace_close_incomplete: fixed('refusal.workspaceCloseIncomplete'),
 	// A credential block whose stored value will not open (decisions §464).
 	credential_block_unopenable: fixed('refusal.credentialBlockUnopenable'),
+	// A Lithic card webhook secret without its `whsec_` prefix (decisions §562).
+	card_webhook_secret_format: fixed('refusal.cardWebhookSecretFormat'),
 	// A CSV invoice row whose number is the same payable as another once
 	// formatting is ignored (`services/csv_import`, decisions §77) — a row error.
 	csv_invoice_number_matches_existing: (p, t) => {
