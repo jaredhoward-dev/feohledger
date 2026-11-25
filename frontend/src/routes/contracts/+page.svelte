@@ -387,7 +387,7 @@
 								checked={selected.has(contract.id)}
 								onclick={(e) => e.stopPropagation()}
 								onchange={() => toggleSelect(contract.id)}
-								aria-label={`Select ${contract.contract_number}`}
+								aria-label={m('contracts.selectRowAria', { number: contract.contract_number })}
 							/>
 						</td>
 					{/if}

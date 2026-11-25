@@ -1633,6 +1633,7 @@ export const messages = {
 	'contracts.empty': 'Ningún contrato coincide con sus filtros.',
 	'contracts.empty.errored': 'No se pudieron cargar los contratos. Inténtalo de nuevo.',
 	'contracts.notFound': 'Contrato no encontrado',
+	'contracts.selectRowAria': 'Seleccionar contrato {number}',
 	'contracts.row.open': 'Abrir contrato {number}',
 	'contracts.overSpendLimit': 'Por encima del límite de gasto',
 	'contracts.loadMore': 'Cargar más ({shown} de {total})',

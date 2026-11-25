@@ -1635,6 +1635,7 @@ export const messages = {
 	'contracts.empty': 'Keine Verträge entsprechen Ihren Filtern.',
 	'contracts.empty.errored': 'Verträge konnten nicht geladen werden. Bitte erneut versuchen.',
 	'contracts.notFound': 'Vertrag nicht gefunden',
+	'contracts.selectRowAria': 'Vertrag {number} auswählen',
 	'contracts.row.open': 'Vertrag {number} öffnen',
 	'contracts.overSpendLimit': 'Über dem Ausgabenlimit',
 	'contracts.loadMore': 'Mehr laden ({shown} von {total})',
