@@ -5,11 +5,13 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Five entries are open**: the `all`-mode approval-chain segregation deadlock,
+**Four entries are open**: the `all`-mode approval-chain segregation deadlock,
 an out-of-office delegation that cannot stand in on an `all`-mode level (found
 2026-11-24),
-the legal-contents smooth-scroll race and the e2e cleanup race directly below,
-and the `payments/` local-e2e flake near the bottom. The run builder reading
+the legal-contents smooth-scroll race directly below,
+and the `payments/` local-e2e flake near the bottom. The e2e cleanup race
+(`deleteInvoicesWhere`), found 2026-10-05, was struck on 2026-11-25 (decisions
+§523) and sits struck in place. The run builder reading
 a missing invoice currency as USD, found 2026-10-21, was fixed on 2026-11-18
 (decisions §457) but left open here until 2026-11-25; it sits struck in place.
 The expense-report Attach dead end, found writing the help centre, was struck
@@ -38,7 +40,7 @@ this note has now warned about twice. Two defects were **fixed on 2026-09-17**:
 the `/organization` 320px reflow defect (issue #432), along with six more routes
 that failed the same criterion and had no entry at all because nothing measured
 them; and the local-e2e `alembic` drift, which now has a pre-run guard that
-refuses to start against a stale database. Twenty-six of the thirty-one `##`
+refuses to start against a stale database. Twenty-seven of the thirty-one `##`
 entries are now `~~struck-through~~` resolved stubs. (This line said "the other
 fifteen" while the file held fifteen struck in total, the two above included,
 later "seventeen of the twenty-four" while nineteen were struck, and then
@@ -614,7 +616,22 @@ drop smooth scrolling on these pages altogether. Either is a design call on #467
 behaviour, so it was not made inside a CI fix. Trigger: the next change to
 `LegalPage.svelte`'s contents list, or any report of a section jump landing short.
 
-## `deleteInvoicesWhere` races the backend's own workers on a just-resubmitted invoice
+## ~~`deleteInvoicesWhere` races the backend's own workers on a just-resubmitted invoice~~ — FIXED 2026-11-25
+
+**Resolution (`docs/decisions.md` §523).** The helper now runs its whole
+teardown as ONE transaction (`tenantPsqlTransaction`: `psql
+--single-transaction -v ON_ERROR_STOP=1`) whose first statement locks the
+matching invoices with `SELECT … FOR UPDATE`, exactly as recommended below. A
+worker's child insert needs `FOR KEY SHARE` on its invoice for the FK check, so
+it either committed before the lock was granted (and the child deletes, each on
+a fresh READ COMMITTED snapshot, remove its row) or waits for the teardown to
+commit and then fails its own FK check against the deleted invoice — the
+worker's transaction rolls back, not the spec. Both orders were probed against
+a scratch Postgres database with two sessions. Nothing retries. The payment-run
+and virtual-card sub-graphs it delegates to now come from statement builders
+(`paymentRunDeleteStatements`, `virtualCardDeleteStatements`), so they run
+inside the same transaction; the standalone `deletePaymentRunsWhere` keeps its
+statement-at-a-time shape. The original diagnosis stands below.
 
 **Seen:** 2026-10-05, `tests-e2e/portal/rejected-invoice.spec.ts` ("the vendor
 can revise & resubmit a rejected invoice"), once in two runs, on a local stack.
