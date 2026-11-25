@@ -105,6 +105,7 @@ from app.services.nacha import (
     originator_from_settings,
     originator_problems,
 )
+from app.services.open_ap_due import effective_due_by_invoice, is_overdue
 from app.services.payee_stamp import flag_repayment_payee_change, stamp_payee
 from app.services.payment_adapters import (
     PaymentAdapter,
@@ -559,7 +560,12 @@ async def list_payments(
 # to ``payment_scheduled`` belong in the queue. ``sent_to_erp`` is excluded —
 # that row is mid-flight in the ERP push and must reach ``posted_in_erp`` (via
 # the ERP-confirmation webhook) before a payment can be scheduled against it.
-_QUEUE_ORDER = (Invoice.due_date.asc().nulls_last(), Invoice.id.asc())
+def _queue_order(effective_due) -> tuple:
+    """Soonest EFFECTIVE due date first (`open_ap_due.effective_due_by_invoice`:
+    the current payment schedule's, else the invoice's own), the date each row
+    shows and flags overdue on, so a rescheduled invoice sorts where its date
+    reads (decisions §565). Untimeable rows last; `id` breaks ties."""
+    return (effective_due.asc().nulls_last(), Invoice.id.asc())
 
 
 def _queue_blocking_exists():
@@ -1007,15 +1013,25 @@ async def payment_queue(
     # listed an invoice once per schedule row — twice on one page, and the
     # duplicate shifted every later page's offset away from `total`.
     current_schedule = latest_schedules()
+    # The row's date and overdue flag are the EFFECTIVE due date the overdue
+    # count reads (`open_ap_due`, decisions §565), computed in this SELECT so
+    # the date printed and the flag beside it cannot disagree.
+    timed = effective_due_by_invoice()
     page_q = (
         apply_entity_scope(
-            select(Invoice, current_schedule)
+            select(
+                Invoice,
+                current_schedule,
+                timed.c.effective_due,
+                is_overdue(timed.c.effective_due, today),
+            )
             .outerjoin(current_schedule, current_schedule.invoice_id == Invoice.id)
+            .outerjoin(timed, timed.c.invoice_id == Invoice.id)
             .where(*_queue_base_where()),
             Invoice,
             entity_id,
         )
-        .order_by(*_QUEUE_ORDER)
+        .order_by(*_queue_order(timed.c.effective_due))
         .offset(pagination.offset)
         .limit(pagination.limit)
     )
@@ -1028,29 +1044,29 @@ async def payment_queue(
     # passed: the queue does not know which rail the operator will pick, and
     # omitting it is the fail-closed reading (every rail non-converging), which
     # is what surfaces the card claim as `required_method`.
-    refusals = await run_refusal_reasons(db, [inv for inv, _ in rows])
+    refusals = await run_refusal_reasons(db, [inv for inv, *_ in rows])
     # A DIFFERENT question from `refusals`: may this row be recorded as paid
     # outside FeohLedger? Answered by the gates `record-outside` itself applies
     # (`external_payment.record_outside_refusals`), because the two diverge —
     # a run refuses a vendor that is not `active`, recording deliberately does
     # not (the money has already left the customer's bank). Gating the action
     # on `blocked` hid it from every invoice of a new, unverified vendor (#566).
-    record_refusals = await record_outside_refusals(db, [inv for inv, _ in rows])
+    record_refusals = await record_outside_refusals(db, [inv for inv, *_ in rows])
     # What a run booked today would move per row — net of applied credits,
     # minus an ACCEPTED early-payment discount whose deadline today meets
     # (`payment_runs.payable_amounts`, the figure the builder books). Distinct
     # from `discount_*` below, which is the invoice's STATIC term ("2/10 net
     # 30") on its payment schedule and is only ever advisory.
-    payables = await payable_amounts(db, [inv for inv, _ in rows], pay_date=today)
+    payables = await payable_amounts(db, [inv for inv, *_ in rows], pay_date=today)
     # Which exception blocks each row, so the page can NAME it, link to it and
     # say whether this caller may clear it — and what the ERP reported for a
     # row whose ERP payment could not be recorded, so "Record as paid" opens
     # pre-filled with it (decisions §319).
-    blockers = await _queue_blocking_exceptions(db, [inv for inv, _ in rows], user, org.settings)
-    erp_reports = await _queue_erp_reported_payments(db, [inv.id for inv, _ in rows])
+    blockers = await _queue_blocking_exceptions(db, [inv for inv, *_ in rows], user, org.settings)
+    erp_reports = await _queue_erp_reported_payments(db, [inv.id for inv, *_ in rows])
 
     items: list[dict] = []
-    for inv, sched in rows:
+    for inv, sched, effective_due, overdue in rows:
         refusal = refusals.get(inv.id)
         payable = payables[inv.id]
         discount_amount: Decimal | None = None
@@ -1087,10 +1103,14 @@ async def payment_queue(
                 # the frontend coerces with Number() at its arithmetic sites.
                 "amount": str(inv.amount),
                 "currency": inv.currency,
-                "due_date": inv.due_date.isoformat() if inv.due_date else None,
+                # The EFFECTIVE due date (current schedule's, else the
+                # invoice's own) and the invoice's own, so a client can say
+                # "rescheduled from" when they differ (decisions §565).
+                "due_date": effective_due.isoformat() if effective_due else None,
+                "own_due_date": inv.due_date.isoformat() if inv.due_date else None,
                 "payment_terms": inv.payment_terms,
                 "status": inv.status.value if hasattr(inv.status, "value") else inv.status,
-                "is_overdue": inv.due_date is not None and inv.due_date < today,
+                "is_overdue": bool(overdue),
                 "discount_eligible": discount_eligible,
                 "discount_date": sched.discount_date.isoformat()
                 if sched and sched.discount_date
@@ -1236,13 +1256,16 @@ async def payment_queue_ids(
         )
     ).scalar() or 0
 
+    timed = effective_due_by_invoice()
     ids_q = (
         apply_entity_scope(
-            select(Invoice.id).where(*_queue_selectable_where()),
+            select(Invoice.id)
+            .outerjoin(timed, timed.c.invoice_id == Invoice.id)
+            .where(*_queue_selectable_where()),
             Invoice,
             entity_id,
         )
-        .order_by(*_QUEUE_ORDER)
+        .order_by(*_queue_order(timed.c.effective_due))
         .limit(MAX_SELECT_ALL_IDS)
     )
     ids = [str(row) for row in (await db.execute(ids_q)).scalars().all()]

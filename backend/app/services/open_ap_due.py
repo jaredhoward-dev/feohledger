@@ -19,9 +19,11 @@ else, and each surface only adds its own window on `effective_due`
 population from the parts.
 
 * **Population.** Committed AP (`OPEN_AP_STATUSES`, approved and still
-  owed) plus the in-review pipeline (`IN_REVIEW_STATUSES`). The forecast's
-  `include_pending=false` narrows to the committed half; the dashboard and
-  the /cfo card read both.
+  owed) plus the in-review pipeline (`IN_REVIEW_STATUSES`), less any invoice
+  already paid out (a `completed` payment awaiting its `paid` sync-back,
+  `paid_out`). The forecast's `include_pending=false` narrows to the
+  committed half; the dashboard, its upcoming list and the /cfo card read
+  both.
 * **Effective due date.** The invoice's current payment schedule's due date
   (`payment_schedules.LATEST_SCHEDULE_ORDER`, one row per invoice), else the
   invoice's own. NULL when neither exists: such a row cannot be timed, and
@@ -30,6 +32,11 @@ population from the parts.
   on time.
 * **Due soon.** Effective due date from today through `DUE_SOON_DAYS` out,
   both ends inclusive. Disjoint from overdue by construction.
+
+Two per-row readers keep a population of their own but time each row by the
+same effective date, through `effective_due_by_invoice`: the payment queue
+(its date, `is_overdue` and order) and the aging bands (`aging_band`, over
+the AP balance's population so they reconcile with it, F-4). Decisions §565.
 """
 
 from __future__ import annotations
@@ -37,11 +44,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import date, timedelta
 
-from sqlalchemy import ColumnElement, Select, Subquery, and_, func, select
+from sqlalchemy import ColumnElement, Select, Subquery, and_, case, exists, func, not_, select
 
 from app.models.invoice import Invoice
 from app.models.invoice_status import IN_REVIEW_STATUSES, OPEN_AP_STATUSES
-from app.models.payment import PaymentSchedule
+from app.models.payment import Payment, PaymentSchedule
 from app.services.payment_schedules import LATEST_SCHEDULE_ORDER
 
 #: Approved and still owed: the firm AP commitment.
@@ -96,6 +103,18 @@ def is_due_soon(effective_due: ColumnElement, today: date) -> ColumnElement:
     return and_(effective_due >= today, effective_due <= today + timedelta(days=DUE_SOON_DAYS))
 
 
+def paid_out() -> ColumnElement:
+    """The invoice carries a `completed` payment: the money has left.
+
+    One live payment per invoice (`payments`' partial unique index), so a
+    completed one settles the invoice in full; between that and the
+    `payment_scheduled → paid` sync-back the invoice is not owed, and counting
+    it would show a paid bill as overdue and project its outflow twice
+    (decisions §565). Correlated on `Invoice.id`.
+    """
+    return exists(select(1).where(Payment.invoice_id == Invoice.id, Payment.status == "completed"))
+
+
 def open_ap_due_population(statuses: Sequence[str] = OUTFLOW_STATUSES) -> Subquery:
     """THE open-AP population, one row per invoice, with its effective due date.
 
@@ -104,7 +123,8 @@ def open_ap_due_population(statuses: Sequence[str] = OUTFLOW_STATUSES) -> Subque
     `discount_percent` for the forecast's discount slice.
 
     `statuses` defaults to the whole outflow population; the forecast's
-    `include_pending=false` passes `COMMITTED_STATUSES`. Every surface named in
+    `include_pending=false` passes `COMMITTED_STATUSES`. An invoice already
+    paid out (`paid_out`) is not owed and is not in it. Every surface named in
     the module docstring joins this on `invoice_id` (inner join: the status
     filter lives here) and applies only its own window and its own entity
     scope to the outer `Invoice`, so none of them restates the population.
@@ -121,9 +141,52 @@ def open_ap_due_population(statuses: Sequence[str] = OUTFLOW_STATUSES) -> Subque
             latest.c.discount_percent.label("discount_percent"),
         )
         .outerjoin(latest, latest.c.invoice_id == Invoice.id)
-        .where(Invoice.status.in_(tuple(statuses)))
+        .where(Invoice.status.in_(tuple(statuses)), not_(paid_out()))
         .correlate(None)
         .subquery("open_ap_due")
+    )
+
+
+def effective_due_by_invoice() -> Subquery:
+    """Every invoice's effective due date, whatever its status: columns
+    `invoice_id` and `effective_due` (the same `effective_due_date` the
+    population carries).
+
+    For the per-row readers that keep their own population and must still
+    time a row exactly as the count does: the payment queue's row (date shown,
+    `is_overdue`, order) and the aging bands, whose population is the AP
+    balance's (F-4). Outer-join it on `invoice_id`; uncorrelated, so it keeps
+    its own `Invoice` inside a query on `Invoice`.
+    """
+    latest = latest_schedule_subquery()
+    return (
+        select(
+            Invoice.id.label("invoice_id"),
+            effective_due_date(latest).label("effective_due"),
+        )
+        .outerjoin(latest, latest.c.invoice_id == Invoice.id)
+        .correlate(None)
+        .subquery("invoice_effective_due")
+    )
+
+
+#: The aging bands, in order: not yet due, then days past due to 30 / 60 / 90
+#: (inclusive upper edges) and beyond.
+AGING_BANDS: tuple[str, ...] = ("current", "days_30", "days_60", "days_90", "days_90_plus")
+
+
+def aging_band(effective_due: ColumnElement, today: date) -> ColumnElement:
+    """The aging band of `effective_due` as of `today`. NULL (untimeable) and
+    due today or later are `current`, the same rows `is_overdue` leaves out,
+    so a row in a past-due band is exactly a row the overdue count counts."""
+    days_past = today - effective_due
+    return case(
+        (effective_due.is_(None), "current"),
+        (days_past <= 0, "current"),
+        (days_past <= 30, "days_30"),
+        (days_past <= 60, "days_60"),
+        (days_past <= 90, "days_90"),
+        else_="days_90_plus",
     )
 
 
