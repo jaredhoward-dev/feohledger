@@ -1,5 +1,6 @@
 """Pydantic request/response schemas for the contracts router."""
 
+import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Literal
@@ -196,4 +197,6 @@ class ContractBulkStatusResponse(BaseModel):
 
 
 class ContractBulkExportRequest(BaseModel):
-    ids: list[str] = Field(..., min_length=1)
+    # Parsed here, so a malformed id is a 422 rather than the 500 an
+    # in-handler `uuid.UUID(...)` raised.
+    ids: list[uuid.UUID] = Field(..., min_length=1)

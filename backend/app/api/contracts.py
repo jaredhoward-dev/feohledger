@@ -756,13 +756,21 @@ async def bulk_export_contracts(
     body: ContractBulkExportRequest,
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Export a hand-picked set of contracts as CSV. Mirrors
     `api/vendors.py::bulk_export_vendors` / `api/invoices.py::bulk_export`'s
     CSV branch, including the CSV-formula-injection guard (CWE-1236) on
-    every cell."""
-    ids = [uuid.UUID(i) for i in body.ids]
-    result = await db.execute(select(Contract).where(Contract.id.in_(ids)))
+    every cell.
+
+    Scoped to the caller's entity selector, as the list and every single-row
+    read are: an id in another entity is dropped exactly as a nonexistent id
+    is, so the export is no oracle for a sibling subsidiary's ids, and an
+    all-out-of-scope selection is the same 404 as an all-missing one."""
+    query = apply_entity_scope(select(Contract), Contract, entity_id).where(
+        Contract.id.in_(body.ids)
+    )
+    result = await db.execute(query)
     contracts = result.scalars().all()
     if not contracts:
         raise HTTPException(status_code=404, detail="No contracts found")

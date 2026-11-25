@@ -25842,6 +25842,24 @@ selected row allows it, or when a selected id is beyond the loaded pages (a
 many loaded rows will be skipped, and says no action fits rather than offering
 one. Skips on unloaded rows are still reported after the call, as before.
 
+**Both contract bulk endpoints honour the entity selector.** The sweep for
+this change found that `POST /contracts/bulk/status` and `/bulk/export` loaded
+their ids with no entity check, while the list, `GET /ids` and every single-row
+route are scoped, so a caller scoped to one subsidiary could move or export
+another's contracts by id. `bulk/status` now runs `ensure_in_entity_scope` per
+row, so an out-of-scope id is skipped as "Contract not found", the sentence
+`POST /{id}/activate` answers it with. `bulk/export` selects through
+`apply_entity_scope`, so an out-of-scope id is dropped exactly as a nonexistent
+one already was: left out of a mixed CSV, and an all-out-of-scope selection is
+the same 404 as an all-missing one, so neither endpoint tells a sibling
+entity's ids from missing ones. The export's `ids` are now `UUID`s in the
+schema, so a malformed id is a 422, not the 500 that `uuid.UUID(...)` in the
+handler raised. No other contract route takes a list of ids. The invoice and
+vendor bulk exports have the same unscoped select. They are outside this
+change.
+
 Parity: `backend/tests/test_contract_action_verdicts.py` (each role × status ×
 action: verdict `None` exactly when the endpoint succeeds, otherwise its exact
-coded `detail`); `frontend/tests-e2e/contracts/action-verdicts.spec.ts`.
+coded `detail`; the bulk-status entity skip); `backend/tests/test_contract_bulk_ops.py`
+(the export's entity scope and the 422);
+`frontend/tests-e2e/contracts/action-verdicts.spec.ts`.

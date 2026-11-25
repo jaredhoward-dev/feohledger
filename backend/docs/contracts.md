@@ -266,7 +266,7 @@ Mounted at `/api/contracts`.
 | `POST /contracts/{id}/renew` | Extend `end_date`, re-activate, re-arm alert | mutate |
 | `POST /contracts/{id}/create-po` | Spawn a PO from the contract | mutate |
 | `POST /contracts/bulk/status` | Bulk activate/terminate/cancel over a hand-picked set (`{ids, action}`), routed through the same `_transition` helper the single-row endpoints use | mutate |
-| `POST /contracts/bulk/export` | CSV export of a hand-picked set (`{ids}`) | read |
+| `POST /contracts/bulk/export` | CSV export of a hand-picked set (`{ids}`), scoped to the entity selector (an out-of-scope id is dropped as not found) | read |
 
 Plus the invoice-side link endpoints (`POST /api/invoices/{id}/link-contract`
 and `/unlink-contract`, `admin` / `ap_manager` / `cfo`).
@@ -292,6 +292,15 @@ reason}]}`) rather than failing the whole batch — the same partial-success
 contract as `api/vendors.py::bulk_vendor_status` /
 `api/invoices.py::bulk_status_change`. `renew` is deliberately NOT a bulk
 action — it needs a per-contract `end_date`, which has no sane bulk default.
+
+Both bulk endpoints honour the caller's entity selector (`X-Entity-ID`) as the
+list, `GET /ids` and every single-row route do (decisions §508). `bulk/status`
+runs the single-row endpoints' entity check per row, so a contract in another
+entity is skipped as "Contract not found". `bulk/export` selects through the
+same scope, so such an id is dropped exactly as a nonexistent one is: left out
+of the CSV, and a selection of only such ids is the same `404 No contracts
+found`. With no selector (the consolidated view) both see every entity. The
+export's `ids` are parsed as UUIDs, so a malformed id is a `422`.
 See `backend/tests/test_contract_bulk_ops.py` and
 `backend/tests/test_list_sorting.py`.
 
