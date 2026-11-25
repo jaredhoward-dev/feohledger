@@ -26334,18 +26334,26 @@ copying ids out of the API (`docs/known-issues.md`, found 2026-10-06).
   With `status=draft` it is the target list for the bulk bar's **Add to
   report**, and the page keeps only rows whose `actions.compose` is null.
 
-The bulk add is one attach call over the whole selection. The endpoint
-already refuses the whole call on the first line it cannot take, so a partial
-report is never left. The page shows the server's localized refusal and does
-not pre-filter the selection.
+The bulk add is one attach call over the attachable part of the selection:
+the selected lines an attach by the caller would take, judged from the loaded
+rows by the same rule (`utils/expensePicker.splitAttachable`), or, for a
+"select all N matching" selection, by `GET /api/expenses/ids?attachable=true`
+resolved alongside it. The rest are not sent; the bar shows how many will be
+skipped and the toast reads "M of N added, K skipped", the way the bulk GL
+action reports its skipped rows. With nothing attachable the bar says why
+instead of offering the button. The endpoint still refuses the whole call on
+the first line it cannot take (a currency with no rate, a row that changed
+since it loaded), so a partial report is never left, and the page shows its
+localized refusal.
 
 **Calls made.** *NULL-creator lines are offered.* The gate accepts them from
 any report owner (decisions §434), so leaving them out would strand pre-0134
 loose lines with no UI path. *Lines on another report are not offered by the
 picker.* Moving a line off a report rewrites that report, and an "attach"
-field should not do that quietly. The bulk action still sends whatever is
-selected, so a line on one of the caller's own unlocked reports moves, as the
-endpoint always allowed. *`draft` only.* Every line off a report is a draft
+field should not do that quietly, and neither should a bulk "add": the bulk
+action skips such a line and counts it, though the endpoint itself still
+moves a line between the caller's own unlocked reports when asked to.
+*`draft` only.* Every line off a report is a draft
 (reject hands lines back as draft), so this drops nothing real and keeps a
 stray non-draft row out of a report being built.
 
@@ -26353,8 +26361,11 @@ stray non-draft row out of a report being built.
 past page one was unreachable, which is the defect. *A new
 `/expenses/attachable` route*: the list endpoint already has the entity scope,
 search, sort and paging. *Per-line verdicts on the list for the bulk action*:
-the attach is all-or-nothing, so one server answer for the whole selection
-says more than a per-row tally would.
+the attach rule is three columns every row already carries, so the page
+reads them; a verdict per row would restate the same rule. *Sending the whole
+selection and showing the refusal* (the first cut): one colleague's line
+refused the reader's own lines with it, and a line on another report was
+moved off it without a word.
 
 ## 516. Radio choices in a dialog share one `.radio-card` class, and the stacked-field label rule skips choice labels (round 42)
 

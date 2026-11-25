@@ -31,6 +31,26 @@
 	const guides = $derived(hits ? hits.flatMap((h) => (h.kind === 'guide' ? [h.guide] : [])) : PORTAL_GUIDES);
 	const terms = $derived(hits ? hits.flatMap((h) => (h.kind === 'term' ? [h.term.id] : [])) : PORTAL_GLOSSARY);
 
+	// The lists filter on every keystroke; the count sentence in the live
+	// region settles first. Announcing each intermediate count ("3 results for
+	// p", "1 result for pa", …) queues a screen reader behind the typist, so
+	// the region takes the sentence only once typing pauses. Clearing is
+	// immediate: a stale "no results" must not outlive the search.
+	const STATUS_SETTLE_MS = 300;
+	const statusText = $derived(
+		hits ? (hits.length ? m('portal.help.searchResults', { n: hits.length, q: query }) : m('portal.help.searchNone', { q: query })) : ''
+	);
+	let announced = $state('');
+	$effect(() => {
+		const text = statusText;
+		if (!text) {
+			announced = '';
+			return;
+		}
+		const timer = setTimeout(() => (announced = text), STATUS_SETTLE_MS);
+		return () => clearTimeout(timer);
+	});
+
 	// A navigation to this same page (the portal nav's Help link while a search
 	// is showing, Back / Forward) brings its own `?q=`. The shallow
 	// replaceState below fires no afterNavigate, so it cannot loop back here.
@@ -68,11 +88,7 @@
 			testid="portal-help-search"
 		/>
 		<!-- Always in the document, so the count is announced as it changes. -->
-		<p class="status" role="status" data-testid="portal-help-search-status">
-			{#if hits}
-				{hits.length ? m('portal.help.searchResults', { n: hits.length, q: query }) : m('portal.help.searchNone', { q: query })}
-			{/if}
-		</p>
+		<p class="status" role="status" data-testid="portal-help-search-status">{announced}</p>
 		{#if hits && !hits.length}
 			<button type="button" class="btn-cancel" onclick={clearSearch} data-testid="portal-help-search-clear"
 				>{m('portal.help.searchClear')}</button

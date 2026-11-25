@@ -1378,11 +1378,14 @@ html.has-bulk-bar body {
    control-then-text on one line. Several dialogs' `.checkbox-label` rules set
    only the direction and relied on the stacked rule for `display: flex`, so
    the row keeps it here. Same (0,1,1) specificity: a component's own scoped
-   rule still wins. */
+   rule still wins. Top-aligned, not centred: a choice whose text wraps keeps
+   its box beside the first line rather than floating mid-paragraph. At the
+   dialog's normal line height a 16px box against one line of text sits
+   within a pixel of centre, so a one-line row looks the same. */
 .modal label:where(:not(.radio-card):has(> input[type='checkbox'], > input[type='radio'])) {
 	display: flex;
 	flex-direction: row;
-	align-items: center;
+	align-items: flex-start;
 	gap: 8px;
 }
 /* `:not([type='checkbox']):not([type='radio'])` because this is the

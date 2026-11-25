@@ -6,7 +6,7 @@
  * Background: a draft report's attach control was a free-text "Expense ID to
  * attach" box, and no screen shows an expense's id (`docs/decisions.md` §515).
  */
-import type { Expense, ExpenseReport } from '#lib/types/expense.ts';
+import { isLineCreator, type Expense, type ExpenseReport } from '#lib/types/expense.ts';
 import { isAllowed } from '#lib/api/actionVerdicts.ts';
 
 /** What the picker needs of an expense row. */
@@ -61,4 +61,50 @@ export function expenseOptionLabel(
  */
 export function composableReports<R extends Pick<ExpenseReport, 'actions'>>(reports: R[]): R[] {
 	return reports.filter((r) => isAllowed(r.actions?.compose));
+}
+
+/** What the bulk "Add to report" reads of a loaded row. */
+export type AttachableRow = Pick<Expense, 'id' | 'report_id' | 'status' | 'created_by_user_id'>;
+
+/**
+ * Whether an attach by `userId` would take this line: on no report, `draft`,
+ * and theirs or unrecorded — the server's `api/expenses._attachable_by`, read
+ * from a loaded row. A mirror for deciding what to send; the server still
+ * gates every line it is sent.
+ */
+export function isAttachableLine(row: AttachableRow, userId: string | null | undefined): boolean {
+	return row.report_id == null && row.status === 'draft' && isLineCreator(row, userId);
+}
+
+/**
+ * Split a bulk selection into the ids the "Add to report" sends and a count
+ * of the rest, which it reports as skipped (decisions §515). A line already on
+ * a report is skipped, never moved: the endpoint would re-home it silently.
+ *
+ * `matchingAttachable` is the server's own attachable set
+ * (`GET /api/expenses/ids?attachable=true`) for a "select all N matching"
+ * selection, which reaches rows the page never loaded; when given it decides
+ * every id. Otherwise each id is judged from its loaded row, and an id with
+ * no loaded row is skipped (nothing shows it is attachable).
+ */
+export function splitAttachable(
+	selected: Iterable<string>,
+	rows: readonly AttachableRow[],
+	userId: string | null | undefined,
+	matchingAttachable: ReadonlySet<string> | null = null
+): { attachable: string[]; skipped: number } {
+	const byId = new Map(rows.map((r) => [r.id, r]));
+	const attachable: string[] = [];
+	let skipped = 0;
+	for (const id of selected) {
+		const ok = matchingAttachable
+			? matchingAttachable.has(id)
+			: (() => {
+					const row = byId.get(id);
+					return row != null && isAttachableLine(row, userId);
+				})();
+		if (ok) attachable.push(id);
+		else skipped += 1;
+	}
+	return { attachable, skipped };
 }

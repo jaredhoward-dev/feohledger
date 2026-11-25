@@ -270,9 +270,11 @@
 		font-family: inherit;
 		font-size: 0.85rem;
 	}
+	/* Top-aligned: the billing warning wraps under the toggle text in a
+	   narrow dialog, and a centred box would float beside the middle. */
 	.ai-toggle {
 		display: flex;
-		align-items: center;
+		align-items: flex-start;
 		gap: 8px;
 		font-size: 0.85rem;
 	}

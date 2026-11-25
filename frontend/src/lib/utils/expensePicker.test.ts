@@ -3,6 +3,9 @@ import {
 	composableReports,
 	expenseOptionLabel,
 	expenseOptionName,
+	isAttachableLine,
+	splitAttachable,
+	type AttachableRow,
 	type ExpensePickerOption
 } from './expensePicker';
 
@@ -47,5 +50,64 @@ describe('composableReports', () => {
 		const refused = { id: 'r2', actions: { submit: null, approve: null, reject: null, compose: refusal } };
 		const noVerdict = { id: 'r3', actions: undefined };
 		expect(composableReports([ok, refused, noVerdict]).map((r) => r.id)).toEqual(['r1']);
+	});
+});
+
+const ME = 'u-me';
+const row = (id: string, over: Partial<AttachableRow> = {}): AttachableRow => ({
+	id,
+	report_id: null,
+	status: 'draft',
+	created_by_user_id: ME,
+	...over
+});
+
+describe('isAttachableLine', () => {
+	it('takes the caller\'s own loose draft line and an unrecorded one', () => {
+		expect(isAttachableLine(row('a'), ME)).toBe(true);
+		expect(isAttachableLine(row('a', { created_by_user_id: null }), ME)).toBe(true);
+	});
+
+	it('refuses a line on a report, a non-draft line and a colleague\'s line', () => {
+		expect(isAttachableLine(row('a', { report_id: 'r-1' }), ME)).toBe(false);
+		expect(isAttachableLine(row('a', { status: 'submitted' }), ME)).toBe(false);
+		expect(isAttachableLine(row('a', { created_by_user_id: 'u-other' }), ME)).toBe(false);
+		expect(isAttachableLine(row('a', { created_by_user_id: 'u-other' }), null)).toBe(false);
+	});
+});
+
+describe('splitAttachable', () => {
+	const rows = [
+		row('mine'),
+		row('on-report', { report_id: 'r-2' }),
+		row('theirs', { created_by_user_id: 'u-other' }),
+		row('submitted', { status: 'submitted' })
+	];
+
+	it('sends only attachable loaded rows and counts the rest as skipped', () => {
+		expect(splitAttachable(['mine', 'on-report', 'theirs', 'submitted'], rows, ME)).toEqual({
+			attachable: ['mine'],
+			skipped: 3
+		});
+	});
+
+	it('skips an id with no loaded row rather than guessing', () => {
+		expect(splitAttachable(['mine', 'unloaded'], rows, ME)).toEqual({
+			attachable: ['mine'],
+			skipped: 1
+		});
+	});
+
+	it('lets the server\'s attachable set decide an all-matching selection', () => {
+		const server = new Set(['unloaded', 'mine']);
+		expect(splitAttachable(['mine', 'unloaded', 'on-report'], rows, ME, server)).toEqual({
+			attachable: ['mine', 'unloaded'],
+			skipped: 1
+		});
+	});
+
+	it('reports nothing attachable as an empty send', () => {
+		expect(splitAttachable(['on-report'], rows, ME)).toEqual({ attachable: [], skipped: 1 });
+		expect(splitAttachable([], rows, ME)).toEqual({ attachable: [], skipped: 0 });
 	});
 });

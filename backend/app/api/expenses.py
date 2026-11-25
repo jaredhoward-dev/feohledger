@@ -775,18 +775,26 @@ async def list_expense_ids(
     status_filter: str | None = Query(None, alias="status"),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Every expense id matching the caller's list filters — the resolver
     behind "select all N matching" on the expenses list page. Same filters
     (and the same shared `_expense_list_filters`) as `GET /expenses`, so the
-    two describe the same set."""
+    two describe the same set.
+
+    `attachable=true` narrows to the lines the caller could add to their own
+    draft report (`_attachable_by`, the list's own filter): the bulk "Add to
+    report" sends only those out of an all-matching selection and reports the
+    rest as skipped, rather than moving a line off another report (§515)."""
     base = _expense_list_filters(
         apply_entity_scope(select(Expense.id), Expense, entity_id),
         status_filter=status_filter,
         report_id=report_id,
         search=search,
     )
+    if attachable:
+        base = _attachable_by(base, user.id)
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0)
     query = base.order_by(Expense.created_at.desc(), Expense.id.desc()).limit(MAX_SELECT_ALL_IDS)
     ids = [str(row) for row in (await db.execute(query)).scalars().all()]
