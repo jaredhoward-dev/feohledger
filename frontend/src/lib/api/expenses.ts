@@ -23,6 +23,7 @@ import type {
 	PolicyViolation,
 	CorporateCardTransaction,
 	CardTransactionListResponse,
+	ReconciliationStatus,
 	CardMatchSuggestion,
 	CardImportResult,
 	SyncVirtualCardsResult
@@ -426,6 +427,26 @@ export function listCardTransactions(
 	qs.set('page', String(params.page ?? 1));
 	qs.set('page_size', String(params.page_size ?? 20));
 	return api.get<CardTransactionListResponse>(`/api/corporate-card-transactions?${qs}`);
+}
+
+/** `GET /api/corporate-card-transactions/counts` — the whole feed's size and
+ *  its split by reconciliation status (every status present, zero where none),
+ *  in one grouped read. Takes the list's population filters but never
+ *  `reconciliation_status`: that is the dimension being counted. */
+export interface CardTxnCounts {
+	total: number;
+	by_status: Record<ReconciliationStatus, number>;
+}
+
+export function getCardTransactionCounts(
+	params: Pick<CardTxnListParams, 'virtual_card_id' | 'date_from' | 'date_to'> = {}
+): Promise<CardTxnCounts> {
+	const qs = new URLSearchParams();
+	if (params.virtual_card_id) qs.set('virtual_card_id', params.virtual_card_id);
+	if (params.date_from) qs.set('date_from', params.date_from);
+	if (params.date_to) qs.set('date_to', params.date_to);
+	const q = qs.toString();
+	return api.get<CardTxnCounts>(`/api/corporate-card-transactions/counts${q ? `?${q}` : ''}`);
 }
 
 /** Multipart CSV import. Returns the shared `ImportResult` (`imported` +

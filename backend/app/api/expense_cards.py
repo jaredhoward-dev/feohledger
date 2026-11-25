@@ -4,6 +4,8 @@ One router (``/corporate-card-transactions``) covering the card-feed lifecycle:
 
   - ``GET /`` — list (paginated, entity-scoped; status / virtual-card / date
     filters). Read: all roles.
+  - ``GET /counts`` — ``{total, by_status}`` over the list's population
+    filters, status excluded (the Cards tab's KPI row). Read: all roles.
   - ``POST /import-csv`` — import a card-feed CSV; dedupe on
     ``(org, external_txn_id)``; stamp a shared ``import_batch``. Mutate:
     admin / ap_manager.
@@ -55,6 +57,7 @@ from app.models.user import User
 from app.schemas.expense import (
     CorporateCardMatchRequest,
     CorporateCardMatchSuggestion,
+    CorporateCardTransactionCounts,
     CorporateCardTransactionListItem,
     CorporateCardTransactionListResponse,
     CorporateCardTransactionResponse,
@@ -231,11 +234,38 @@ async def _link_both_sides(
 # List
 # ---------------------------------------------------------------------------
 
+# Read access to the card feed: every role. The list and `/counts` share it so
+# a caller who may read the rows may read their tallies, and no one else.
+CARD_TXN_READ_ROLES = (ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)
+
+
+def _card_txn_list_filters(
+    query,
+    *,
+    reconciliation_status: str | None,
+    virtual_card_id: uuid.UUID | None,
+    date_from: date | None,
+    date_to: date | None,
+):
+    """Apply the list's filters to ``query`` — the one definition the list and
+    ``/counts`` share, so the tallies always describe the rows the list would
+    return. ``/counts`` passes ``reconciliation_status=None``: status is the
+    dimension it tallies."""
+    if reconciliation_status:
+        query = query.where(CorporateCardTransaction.reconciliation_status == reconciliation_status)
+    if virtual_card_id:
+        query = query.where(CorporateCardTransaction.virtual_card_id == virtual_card_id)
+    if date_from:
+        query = query.where(CorporateCardTransaction.txn_date >= date_from)
+    if date_to:
+        query = query.where(CorporateCardTransaction.txn_date <= date_to)
+    return query
+
 
 @router.get("", response_model=CorporateCardTransactionListResponse)
 async def list_card_transactions(
     db: AsyncSession = Depends(get_tenant_db),
-    user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)),
+    user: User = Depends(require_roles(*CARD_TXN_READ_ROLES)),
     reconciliation_status: str | None = Query(None),
     virtual_card_id: uuid.UUID | None = Query(None),
     date_from: date | None = Query(None),
@@ -243,15 +273,13 @@ async def list_card_transactions(
     pagination: PaginationParams = Depends(pagination_params),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
-    base = apply_entity_scope(select(CorporateCardTransaction), CorporateCardTransaction, entity_id)
-    if reconciliation_status:
-        base = base.where(CorporateCardTransaction.reconciliation_status == reconciliation_status)
-    if virtual_card_id:
-        base = base.where(CorporateCardTransaction.virtual_card_id == virtual_card_id)
-    if date_from:
-        base = base.where(CorporateCardTransaction.txn_date >= date_from)
-    if date_to:
-        base = base.where(CorporateCardTransaction.txn_date <= date_to)
+    base = _card_txn_list_filters(
+        apply_entity_scope(select(CorporateCardTransaction), CorporateCardTransaction, entity_id),
+        reconciliation_status=reconciliation_status,
+        virtual_card_id=virtual_card_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0)
     paged = (
@@ -271,6 +299,50 @@ async def list_card_transactions(
         page=pagination.page,
         page_size=pagination.page_size,
     )
+
+
+# Declared before every `/{txn_id}` route so the literal `counts` segment is
+# never parsed as a UUID (same reason `/api/purchase-orders/counts` sits above
+# `/{po_id}`).
+@router.get("/counts", response_model=CorporateCardTransactionCounts)
+async def card_transaction_counts(
+    db: AsyncSession = Depends(get_tenant_db),
+    _user: User = Depends(require_roles(*CARD_TXN_READ_ROLES)),
+    virtual_card_id: uuid.UUID | None = Query(None),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Per-reconciliation-status tallies for the ``/expenses`` Cards KPI row.
+
+    One grouped query over the WHOLE entity-scoped feed (not a page), narrowed
+    by the list's population filters through ``_card_txn_list_filters`` but
+    never by ``reconciliation_status`` — the dimension being tallied; applying
+    it would zero every other bucket (an unknown query param is dropped, so a
+    client that passes it is unaffected). Mirrors
+    ``GET /api/purchase-orders/counts``, except ``by_status`` carries every
+    ``ReconciliationStatus`` with a zero where nothing matches, so the page
+    never has to tell "none" from "missing". RBAC and entity scope are the
+    list's own.
+    """
+    query = _card_txn_list_filters(
+        apply_entity_scope(
+            select(CorporateCardTransaction.reconciliation_status, func.count()).select_from(
+                CorporateCardTransaction
+            ),
+            CorporateCardTransaction,
+            entity_id,
+        ),
+        reconciliation_status=None,
+        virtual_card_id=virtual_card_id,
+        date_from=date_from,
+        date_to=date_to,
+    ).group_by(CorporateCardTransaction.reconciliation_status)
+    rows = (await db.execute(query)).all()
+    by_status = {s.value: 0 for s in ReconciliationStatus}
+    for recon_status, n in rows:
+        by_status[str(recon_status)] = int(n)
+    return CorporateCardTransactionCounts(total=sum(by_status.values()), by_status=by_status)
 
 
 # ---------------------------------------------------------------------------
