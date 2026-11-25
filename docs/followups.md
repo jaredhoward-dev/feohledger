@@ -1063,9 +1063,11 @@ scope (§260) — do not fold them into any of these.
       pay" decision and needs a product call before reuse. **Trigger:** the
       first tenant on one of those ERPs who pays bills in the ERP.
 - [ ] **(c) A bill already posted to the ERP can't be voided or recalled from
-      FeohLedger.** `void_invoice` has no caller under `app/` beyond
-      `posted_total`'s cleanup of a mismatched bill, and no user action voids
-      or recalls a pushed bill. **Durable fix:** a `POST /api/invoices/{id}/
+      FeohLedger.** `void_invoice`'s only user-facing caller is the flagged-bill
+      void from a `duplicate` / `fraud_flag` exception (decisions §539), which
+      walks the invoice to `approved` and clears the document so the recall can
+      proceed; an unflagged pushed bill still cannot be voided or recalled.
+      **Durable fix:** a `POST /api/invoices/{id}/
       void-erp` (the push's roles) that calls `void_invoice` and refuses a bill
       the ERP shows paid or part-paid. On success it walks the invoice through
       an audited edge back to `approved`, so it can be corrected and re-pushed
@@ -1113,14 +1115,9 @@ scope (§260) — do not fold them into any of these.
       later: a Positive Pay return, a fraud rule re-run on an edit, a duplicate
       found when a third copy is entered. Our payment run still refuses the
       invoice; the ERP's own Bill Pay does not know. Nothing tells the operator
-      the posted bill should be voided. **Durable fix:** when one of those types
-      opens on an invoice holding an ERP reference (`sent_to_erp` onward), raise
-      a notification and offer the existing ERP void
-      (`ErpAdapter.void_invoice`, `backend/docs/erp-integration.md`) from
-      the exception, gated and audited like a payment void; never void
-      automatically, since the flag may be false. **Trigger:** the first report
-      of a flagged bill paid from the ERP, or the next change to the ERP void
-      path.
+      the posted bill should be voided. (That half landed in round 45,
+      decisions §539: the `erp_bill_flagged` notice on raise and
+      `POST /api/exceptions/{id}/void-erp-bill`, gated on `payment.void`.)
 
       The bill can also already be in the ERP when the push was refused: an
       attempt that timed out or got a 5xx may have created it, and the gate's
