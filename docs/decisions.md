@@ -29970,3 +29970,57 @@ checked in full (white on `green.shade800`, about 5.1:1).
 `mobile/test/screens/invoice_detail_screen_test.dart` reads the button flag from
 the boundary's merged `getSemanticsData()` (what a screen reader is handed),
 not the boundary node alone.
+
+## 574. Acting as a partner is an operator-granted capability (`organizations.is_partner`); consenting to be adopted stays open to any admin (§314 follow-up, round 49)
+
+**What was wrong.** §314 left Partner Admin showing to every admin of every
+workspace, because "partner" was derived from having a child and the page was
+also where an org provisioned its first child and minted the code that consents
+to being adopted. So any admin could provision or adopt other workspaces and
+brand them — a reseller's powers — without anyone agreeing they were a reseller.
+
+**What changed.** The operator delegated the product call. A partner is now
+whoever the operator says is one:
+
+- `organizations.is_partner` (migration 0151, control plane, `NOT NULL DEFAULT
+  false`) is the capability. Nothing in the API writes it; the operator grants
+  or revokes it with `scripts/set_partner_capability.py`
+  (`services/partner_capability.py`), which audits
+  `organization.partner_capability_granted` / `_revoked` into the org's own
+  trail before changing anything and refuses a revoke while the org still
+  parents a child (its children would be left with nobody able to reach them).
+- Every `/api/partner` route requires it after the admin role
+  (`partner.require_partner_capability`): an admin without it gets a coded 403
+  `partner_capability_required`; a non-admin still gets the role's plain 403
+  first, so RBAC is otherwise unchanged.
+- `/api/auth/me` reports `is_partner`; `nav.ts` gained a `capability` gate,
+  ANDed on the role gate and hidden when no check is passed, and the Partner
+  Admin row and the `/admin/partner` page both read `auth.hasCapability`, so the
+  row, the page and the API agree (`frontend/CLAUDE.md`).
+- Minting the link code — consent to BE adopted, not a partner act — moved to
+  Organization settings → Join a partner (`POST
+  /api/organization/partner-link-code`, any admin, still audited
+  `partner.link_code_issued`). The old path is gone rather than kept as a
+  second door under different rules.
+
+**Why a column and not a plan entitlement.** Entitlements are what a workspace
+buys: a self-service plan change grants them and their gate answers 402
+"upgrade". Reselling is a commercial agreement, not a tier on the price list,
+and must not be purchasable by changing plan — so it is its own operator-set
+fact on the org row, beside `parent_org_id`.
+
+**Backfill.** The migration sets `is_partner = true` for every org already
+referenced by a `parent_org_id`. That is a fact, not a proxy: an org with
+children already acts as a partner, and taking the page away would strand them.
+Nothing else (plan, name, settings) is read; every other org starts `false`.
+
+**Tests.** `backend/tests/test_partner_admin.py` walks every `/api/partner`
+route for the coded 403, keeps the role 403 for a non-admin, and shows an
+existing partner keeping access until revoked;
+`test_partner_link_provisioning.py` mints as an admin of a non-partner (still
+audited), shows the old path gone and a non-partner unable to redeem;
+`test_partner_capability.py` covers `/me` and the operator writer;
+`test_migration_0151_org_is_partner.py` the column, backfill, re-run, downgrade
+and tenant no-op. `frontend/src/lib/nav.test.ts` pins the capability gate;
+`tests-e2e/admin/partner.spec.ts` the row hidden for a non-partner and shown
+with the capability stubbed on `/me`.
