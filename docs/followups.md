@@ -1327,7 +1327,13 @@ user-visible halves still open.
       address cycling tenants past the DEK cache; a per-tenant budget was
       rejected (it would let anyone who knows a slug drop the tenant's genuine
       deliveries, for no KMS saving). A distributed caller with many addresses
-      cycling tenants is still bounded only by KMS's own quota. What remains
+      cycling tenants is still bounded only by KMS's own quota. The budget is
+      checked before every unseal from a source, so a provider that sends
+      every tenant's events from a few shared addresses and fails to verify
+      at ten tenants in a window (stale secrets after a rotation, say) has
+      its genuine deliveries for every tenant dropped until the window rolls;
+      exempting an unseal the DEK cache would serve (no KMS cost) is the
+      narrowing to weigh with the sweeps. What remains
       is recovering the dropped events. **Durable fix:** the generic status polling sweep
       (`backend/docs/erp-integration.md` § Polling job — not built) for the
       generic route, and a Merge bill read-back sweep over pushed bills for
