@@ -68,6 +68,21 @@ void main() {
       expect(user.permissions, isEmpty);
       expect(user.can(kPermInvoiceApprove), isFalse);
     });
+
+    test('parses legal_acceptance_required; absent means nothing to accept',
+        () {
+      Map<String, dynamic> body([Object? flag]) => {
+            'id': 'u1',
+            'email': 'a@acme.com',
+            'full_name': 'Ada',
+            'organization_id': 'org1',
+            'roles': <dynamic>['ap_clerk'],
+            if (flag != null) 'legal_acceptance_required': flag,
+          };
+      expect(User.fromJson(body(true)).legalAcceptanceRequired, isTrue);
+      expect(User.fromJson(body(false)).legalAcceptanceRequired, isFalse);
+      expect(User.fromJson(body()).legalAcceptanceRequired, isFalse);
+    });
   });
 
   group('role helpers', () {

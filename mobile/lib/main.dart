@@ -6,6 +6,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:feohledger_mobile/l10n/app_localizations_delegates.dart';
 import 'package:feohledger_mobile/l10n/gen/app_localizations.dart';
 import 'package:feohledger_mobile/screens/home_screen.dart';
+import 'package:feohledger_mobile/screens/legal_accept_screen.dart';
 import 'package:feohledger_mobile/screens/login_screen.dart';
 import 'package:feohledger_mobile/services/biometric_service.dart';
 import 'package:feohledger_mobile/services/push_service.dart';
@@ -87,7 +88,7 @@ class AuthGate extends StatefulWidget {
   State<AuthGate> createState() => _AuthGateState();
 }
 
-class _AuthGateState extends State<AuthGate> {
+class _AuthGateState extends State<AuthGate> with WidgetsBindingObserver {
   /// True until the one-time startup work (push init, session restore,
   /// biometric unlock) has finished; the splash shows meanwhile.
   bool _booting = true;
@@ -102,17 +103,33 @@ class _AuthGateState extends State<AuthGate> {
   /// be told apart from the notifier's other emissions (loading flags).
   bool _wasLoggedIn = false;
 
+  /// Last observed `legalAcceptanceRequired`, so a resume refresh that newly
+  /// requires acceptance can clear any pushed routes off the accept screen.
+  bool _wasLegalRequired = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     AuthStore.instance.addListener(_onAuthChanged);
     _boot();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     AuthStore.instance.removeListener(_onAuthChanged);
     super.dispose();
+  }
+
+  /// Back in the foreground: re-read the profile, so a Terms / Privacy version
+  /// bump while the app sat in the background puts the accept step in front
+  /// of the shell (decisions §498).
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || _booting) return;
+    if (!AuthStore.instance.loggedIn) return;
+    unawaited(AuthStore.instance.refreshProfile());
   }
 
   Future<void> _boot() async {
@@ -136,13 +153,17 @@ class _AuthGateState extends State<AuthGate> {
     final signedOut = _wasLoggedIn && !loggedIn;
     final signedIn = !_wasLoggedIn && loggedIn;
     _wasLoggedIn = loggedIn;
+    final legalRequired = AuthStore.instance.legalAcceptanceRequired;
+    final newlyRequired = loggedIn && legalRequired && !_wasLegalRequired;
+    _wasLegalRequired = legalRequired;
     // Push init ran before any session existed, so its device registration
     // could not authenticate; send it now that one does.
     if (signedIn) unawaited(PushService.instance.registerWithBackend());
-    if (!signedOut) return;
-    // The gate itself is the FIRST route, so a session that ends while the user
-    // is inside a pushed route (invoice detail, admin, a modal) would leave the
-    // login screen rendered underneath and invisible. Drop everything above it.
+    if (!signedOut && !newlyRequired) return;
+    // The gate itself is the FIRST route, so a session that ends (or meets the
+    // Terms / Privacy accept step) while the user is inside a pushed route
+    // (invoice detail, admin, a modal) would leave the login or accept screen
+    // rendered underneath and invisible. Drop everything above it.
     // Deferred to the end of the frame: this runs inside notifyListeners(),
     // which can fire mid-build.
     SchedulerBinding.instance.addPostFrameCallback((_) {
@@ -165,6 +186,11 @@ class _AuthGateState extends State<AuthGate> {
       builder: (context, _) {
         if (_booting) return const SplashScreen();
         if (AuthStore.instance.loggedIn && !_biometricLocked) {
+          // Nothing of the app is reachable until the Terms / Privacy in
+          // force are accepted — the screen's only other exit is sign-out.
+          if (AuthStore.instance.legalAcceptanceRequired) {
+            return const LegalAcceptScreen();
+          }
           return const HomeScreen();
         }
         return LoginScreen(onSignedIn: _onSignedIn);

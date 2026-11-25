@@ -25401,3 +25401,51 @@ between-companies rule fits. *A NULL-safe sentinel such as the empty string*:
 value is easier in the vendor ERP-links table. *Backfilling from audit rows*:
 they are history, not a complete record of every link.
 
+
+## 498. The Flutter app asks for Terms / Privacy acceptance, with versions generated from the backend (round 38)
+
+**Problem.** §495 added `legal_acceptance_required` on `/me` and `POST
+/api/auth/legal-acceptance`, but the mobile app ignored the flag, so a mobile
+user was never asked, and the server gate (`docs/followups.md`) cannot land
+while a client has no way to accept.
+
+**Decision.**
+
+- **A blocking screen at the root.** `AuthGate` (`mobile/lib/main.dart`)
+  renders `LegalAcceptScreen` instead of `HomeScreen` while the user's `/me`
+  says acceptance is required, so nothing of the app is reachable before it;
+  its only other exit is sign-out. The two documents are links to the
+  published web pages (`AppConfig.termsUrl` / `privacyUrl`, opened in the
+  browser through `ExternalLink`); the app holds no copy of either text. The
+  origin is `https://feohledger.com`, overridable per build with
+  `--dart-define=FEOH_PUBLIC_WEB_URL`.
+- **Asked on resume too.** The gate re-reads `/me` whenever the app returns to
+  the foreground (`AuthStore.refreshProfile`), so a version bump reaches a
+  session left open, and a newly raised requirement pops any pushed route so
+  the screen is not hidden under it. The refresh and the accept share one
+  `SequencedFetch` sequence: a `/me` read that started before the user
+  accepted cannot put the screen back after it.
+- **Versions generated, not copied.** `backend/scripts/gen_legal_versions.py`
+  writes `mobile/lib/legal_versions.generated.dart` beside the web module, and
+  its `--check` (`pnpm check:legal-versions`, CI's Backend lint job) covers
+  both. CI's backend path filter includes the Dart file, so a hand edit to it
+  alone still runs the check.
+- **A 422 means the build is stale.** An installed app keeps the versions it
+  was built with. After a bump its Accept is refused with the coded 422, and
+  sending again would send the same versions forever, so the screen states that
+  the app must be updated (or acceptance given on the web) and withdraws
+  Accept. A 429 or a transport failure is the app's standard error, and Accept
+  stays.
+
+**Rejected.** *Fetching the versions from the server at runtime*: it needs a
+new endpoint, and a client that echoes whatever the server calls current
+defeats §495's refusal, whose point is that a client only records what it
+knowingly shipped. It would spare an outdated build the update message; that
+was judged the smaller cost. *A hand-kept Dart constant*: two copies drift; the generator
+already exists for the web. *Rendering the documents in-app*: a second copy of
+the legal text to keep in sync in six languages, where the published pages are
+the contract.
+
+**Consequence for the server gate.** Once it lands, a mobile build older than a
+version bump can only sign out until updated, so a bump should ship with (or
+after) an app release carrying the new versions.

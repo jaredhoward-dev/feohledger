@@ -1148,5 +1148,17 @@
   "listRowVendorCode": "code {code}",
   "listRowVendorSource": "source {source}",
   "listRowInvoiceCount": "{count, plural, one {{count} facture} other {{count} factures}}",
-  "listRowInvoiceCountShort": "{count, plural, one {{count} fact.} other {{count} fact.}}"
+  "listRowInvoiceCountShort": "{count, plural, one {{count} fact.} other {{count} fact.}}",
+  "legalAcceptTitle": "Conditions et confidentialité",
+  "legalAcceptHeading": "Veuillez consulter nos conditions mises à jour",
+  "legalAcceptIntro": "Pour continuer à utiliser FeohLedger, acceptez les Conditions d’utilisation et la Politique de confidentialité en vigueur. Chacune s’ouvre dans votre navigateur.",
+  "legalTermsLink": "Conditions d’utilisation",
+  "legalPrivacyLink": "Politique de confidentialité",
+  "legalLinkHint": "s’ouvre dans votre navigateur",
+  "legalLinkFailed": "Impossible d’ouvrir la page. Consultez-la plutôt dans un navigateur.",
+  "legalAcceptCheckbox": "J’ai lu et j’accepte les Conditions d’utilisation et la Politique de confidentialité.",
+  "legalAcceptButton": "Accepter",
+  "legalAcceptSignOut": "Se déconnecter",
+  "legalAcceptTickRequired": "Cochez la case pour accepter les Conditions d’utilisation et la Politique de confidentialité.",
+  "legalAcceptAppOutdated": "Cette version de l’app affiche des Conditions ou une Politique de confidentialité antérieures à celles en vigueur ; elle ne peut donc pas enregistrer votre acceptation. Mettez l’app à jour depuis votre magasin d’applications, ou acceptez dans l’application web, puis reconnectez-vous."
 }
