@@ -22,6 +22,12 @@ export const enPortal = {
 	'portal.nav.discounts': 'Discounts',
 	'portal.nav.company': 'Company',
 	'portal.nav.notifications': 'Notifications',
+	'portal.nav.help': 'Help',
+
+	// Supplier portal — help (routes/portal/help/, decisions §509)
+	'portal.help.subtitle': 'Guides and answers for suppliers using this portal.',
+	'portal.help.guides': 'Guides',
+	'portal.help.glossary': 'Terms',
 	'portal.shell.logOut': 'Log out',
 	'portal.shell.footerSupport': 'Support',
 	'portal.privacyAck.support': 'Questions? Contact support',

@@ -451,6 +451,23 @@ test.describe('accessibility — supplier portal Privacy step (WCAG 2.2 AA)', ()
 	}
 });
 
+test.describe('accessibility — supplier portal help (WCAG 2.2 AA)', () => {
+	test.use({ storageState: { cookies: [], origins: [] } });
+
+	// The supplier help (decisions §509): the landing (guides + the glossary a
+	// guide's term links land on) and a guide with every block type a supplier
+	// guide uses — steps, a list, tip and caution notes, the terms and
+	// related-guide blocks.
+	for (const path of ['/portal/help', '/portal/help/portal-getting-started']) {
+		test(`${path} has no axe violations`, async ({ page }) => {
+			await portalSignInForAxe(page);
+			await page.goto(path);
+			await expect(page.locator('h1')).toBeVisible();
+			await expectNoA11yViolations(page);
+		});
+	}
+});
+
 test.describe('accessibility — public surfaces on the no-tenant origin (WCAG 2.2 AA)', () => {
 	test.use({ storageState: { cookies: [], origins: [] }, baseURL: NO_TENANT_BASE });
 

@@ -24,6 +24,12 @@ export const messages = {
 	'portal.nav.discounts': 'Descontos',
 	'portal.nav.company': 'Empresa',
 	'portal.nav.notifications': 'Notificações',
+	'portal.nav.help': 'Ajuda',
+
+	// Supplier portal — help (routes/portal/help/, decisions §509)
+	'portal.help.subtitle': 'Guias e respostas para fornecedores que usam este portal.',
+	'portal.help.guides': 'Guias',
+	'portal.help.glossary': 'Termos',
 	'portal.shell.logOut': 'Sair',
 	'portal.shell.footerSupport': 'Suporte',
 	'portal.privacyAck.support': 'Dúvidas? Fale com o suporte',
