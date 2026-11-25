@@ -688,6 +688,22 @@ re-armed — and the void clears its markers compare-then-clear. The record keep
 audit row, and at `MAX_CREDIT_ATTEMPTS` (12) it is `exhausted` and flagged
 (`reason: retries_exhausted`).
 
+**Reserve → call → record, invoice before instance** (decisions §581). A
+first credit attempt commits its record (`credit_id: null`, `attempts: 0`,
+`claimed_until`) under the locks **before** the create, so a crash or a failed
+recording leaves a record the next attempt can only look up, never create
+again. A re-run claims the record under the lock and builds the payload from
+what it claimed; a live claim, an `exhausted` record or one the sweep already
+finished means no ERP call. Every lock this module takes on the workflow
+instance is preceded by `FOR KEY SHARE` on the invoice — the order the void and
+delete doors take — so they serialize instead of deadlocking, and the delete
+door reads the pending maps `FOR UPDATE`. A payment voided while its
+BillPayment was being written is put back in `erp_payment_voids_pending`
+(`payment.erp_posted` carries `void_rearmed: true`), so the sweep voids what
+the void's own pass could not yet see. Xero's `void_discount_credit` reverses
+a recorded `credit_id` by id and refuses (never reports done) one that is not
+ours.
+
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
 (`vendor_credit_unconfirmed` / `credit_note_unconfirmed`).

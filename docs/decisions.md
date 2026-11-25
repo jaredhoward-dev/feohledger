@@ -30614,3 +30614,107 @@ control plane), `test_invoice_delete_cascade.py` (each pending key refused,
 empty key allowed, bulk skip; `sending` / `sent` / `delivered` refused,
 `failed` cleared, bulk skip, claim named first); web `codedRefusals.test.ts`,
 `auditActions.roster.test.ts`.
+
+## 581. A discount credit is reserved before it is created; a re-run attempts only the record it claimed; the write-back locks the invoice before the instance; a void that raced the payment write-back is re-armed; a bare PEPPOL 404 is not "not found" (§579 / §580 final review, round 49)
+
+A final money-path review of §579 and §580 found six gaps, and one older one.
+
+**1. A re-run attempted a record it had not claimed.** `write_back_payment`
+tested `await _claim_record(...) is not None`, but `_claim_record` returns a
+`(record, status)` tuple, so the test was always true: a re-run called the ERP
+under another process's live claim, past the attempts cap, and after the sweep
+had already applied the credit, and it built the payload from its own unlocked
+read, so a refusal then wrote that stale record back. Now the tuple is
+unpacked, the ERP is called only when a record was claimed, the payload comes
+from the claimed record, and `completed` is the claimed status.
+
+**2. The first attempt had no reservation.** The first `_call_credit` created
+the credit before anything was committed. A failed recording (rollback) or a
+process that died lost the record while the credit stood, and the next attempt
+created again; QuickBooks cannot find an unapplied credit through the bill.
+Now it is reserve → call → record, as `docs/payments.md` asks of a money
+write: `_reserve_credit` commits a `erp_discount_credits_pending` record
+(`credit_id: null`, `attempts: 0`, `claimed_until`, the payload's facts) under
+the locks before the create. A record already there is claimed instead and
+takes the recorded path. The outcome is recorded over the reservation, and a
+refusal before any write drops it (the reservation is not an earlier credit).
+A record left by a crash is looked up once its claim lapses, never created
+again, and a miss opens §579's `unidentified` flag.
+
+**3. Xero's void ignored the recorded id.** `void_discount_credit` looked only
+by number, the lookup §577 lists as unconfirmed, and read a miss as "nothing
+of ours". The payment was then voided, the credit stayed allocated, and the
+record was erased. Now a `credit_id` is read by id, its marker checked, its
+allocations removed and the note voided. One that is not ours is refused
+(`discount_credit_not_ours`), never reported done. A create that returned an
+id whose read-back marker does not match keeps that id on the failure, since
+Xero answered our create with it.
+- **Residual:** such a note would then be refused as "not ours" both by a
+  later post (`bill_payment_voided`, record dropped) and by the void (failed,
+  flagged with its id). That needs Xero to answer a create with a note whose
+  number differs from what we sent, which nothing has seen. The void's flag is
+  how a person learns of it.
+
+**4. Lock order.** This module locked the `WorkflowInstance` and then, through
+the `exceptions.invoice_id` FK of a flag it opened, the invoice. The void and
+delete doors lock the invoice `FOR UPDATE` and then the instance. That is a
+deadlock cycle, and the sweep, whose outcome then rolled back, usually lost.
+Every instance lock here (`_lock_instance`, which `_claim_record`,
+`_reserve_credit`, `_record_credit_outcome`, `_set_map_entry`, the void's
+compare-then-clear and `record_pending_erp_void` all go through) now takes
+**`FOR KEY SHARE` on the invoice first**.
+- **Why that mode:** it is the weakest that still waits for a door's
+  `FOR UPDATE`, and it is the mode the FK insert already took. So it blocks
+  nothing new: plain invoice updates (`FOR NO KEY UPDATE`) and other sweeps
+  are compatible with it.
+- **Rejected:** `FOR UPDATE` on the invoice. It would also serialize against
+  every status transition for no gain.
+
+**5. The delete door read the pending maps unlocked.** `_delete_refusals` now
+selects them `FOR UPDATE`, ordered, after the invoice lock. A reservation or a
+re-armed void being committed is waited for and seen. Before, the door read
+the snapshot taken before that write and then cascaded the instance away.
+
+**6. A bare PEPPOL 404 meant "not found".** `as4_gateway.lookup_transmission`
+read any 404 as `not_found`, so the settle marked the row `failed` and allowed
+a resend. The gateway route is unverified, and a gateway without it answers 404
+for every key. Now only a 404 whose body says `{"status": "not_found"}` is
+`not_found`. A bare 404 is `unknown` (`gateway_error:404`), and the settle
+changes nothing (exit 3).
+
+**7. A void racing the payment write-back (pre-existing).** `write_back_payment`
+re-checks `Payment.status` before `post_payment`. A void that committed after
+that check, and whose own ERP void ran before our BillPayment existed, found
+nothing to void (`payment.erp_void_not_needed`) and cleared its marker. Our
+BillPayment then stood on a voided payment's bill, and nothing re-armed the
+void. Now, once the write succeeds, `_rearm_void_if_voided` re-reads the
+payment under the locks, in the transaction that records the outcome. If the
+payment is no longer `completed`, it puts the payment back in
+`erp_payment_voids_pending` (`payment.erp_posted` carries `void_rearmed:
+true`), and the sweep voids what was written. If the void's task saw our
+write after all, the re-armed pass finds nothing and is a no-op.
+- **Rejected:** a full reservation for the payment write. The adapter's
+  payment write is already idempotent on the payment id (looked up before it
+  creates), so a reservation would add nothing but this re-check.
+- **Residual:** if recording that outcome itself fails (the transaction rolls
+  back), the re-arm is lost with it. A re-run of the write-back skips a voided
+  payment, so this stays a window, not a loop. Closing it needs the payment
+  write's own pending record.
+
+**Tests.** `test_erp_payment_writeback.py`:
+- no credit call for a re-run under a live claim, after the cap, or after the
+  sweep applied the record (and the record is not revived);
+- the reservation is committed before the create;
+- a lost first recording leaves a record the re-run only looks up, then flags;
+- a void during the payment write is re-armed;
+- the outcome waits behind a door holding the invoice, and the door's
+  instance lock completes: no deadlock.
+
+Each of these fails on the code before this entry. Also:
+- `test_xero_status_sync_adapter.py`: a void by a recorded id when the number
+  lookup misses, the "not ours" refusal, and a created id kept on a
+  mismatched read-back.
+- `test_invoice_delete_cascade.py`: the delete waits for an uncommitted
+  pending write on the instance and refuses. This fails without the lock.
+- `test_peppol_adapters.py`: a bare 404, or one with a non-JSON body, is
+  `unknown`.
