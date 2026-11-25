@@ -237,7 +237,8 @@ async def test_send_idempotent_concurrent_collision(realdb, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_is_idempotent(realdb):
-    """Two sends → ONE live row, ONE adapter.send call, ONE audit row."""
+    """Two sends → ONE live row, ONE adapter.send call, and the one send's two
+    audit rows (started + sent, decisions §580) — the resend writes none."""
     mk = realdb.sessionmaker("a")
     org_id = realdb.info("a").org_id
     inv_id = await _seed_invoice(mk, org_id)
@@ -288,13 +289,17 @@ async def test_send_is_idempotent(realdb):
         ).scalar_one()
         assert rows == 1
         audits = (
-            await s.execute(
-                select(func.count())
-                .select_from(AuditLog)
-                .where(AuditLog.entity_id == inv_id, AuditLog.action.like("invoice.peppol_%"))
+            (
+                await s.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.entity_id == inv_id, AuditLog.action.like("invoice.peppol_%")
+                    )
+                )
             )
-        ).scalar_one()
-        assert audits == 1
+            .scalars()
+            .all()
+        )
+        assert sorted(audits) == ["invoice.peppol_send_started", "invoice.peppol_sent"]
 
 
 @pytest.mark.asyncio
@@ -569,3 +574,260 @@ async def test_send_refuses_a_non_bis3_conformant_document(realdb):
             )
         ).scalar_one()
         assert rows == 0
+
+
+# ---------------------------------------------------------------------------
+# A `sending` row whose outcome was never recorded (decisions §580). The
+# reservation commits before the AS4 call (§578), so a process that dies
+# between the two commits leaves `sending` for good. The reservation now writes
+# its own audit row, and `settle_stale_sending` (the operator script
+# `scripts/settle_peppol_sending.py`) settles the row from the Access Point's
+# answer — never `failed` without one.
+# ---------------------------------------------------------------------------
+
+
+async def _stuck_sending(mk, org_id, monkeypatch, actor_id) -> uuid.UUID:
+    """Send with a transmit that dies after the reservation committed."""
+    import app.services.peppol_adapters.mock_adapter as mod
+
+    async def dies(self, request):
+        raise RuntimeError("process killed mid-send")
+
+    inv_id = await _seed_invoice(mk, org_id)
+    _, items = await _load(mk, inv_id)
+    with monkeypatch.context() as m:
+        m.setattr(mod.MockPeppolAdapter, "send", dies)
+        async with mk() as s:
+            inv = (await s.execute(select(Invoice).where(Invoice.id == inv_id))).scalar_one()
+            with pytest.raises(RuntimeError):
+                await send_invoice_over_peppol(
+                    s,
+                    invoice=inv,
+                    line_items=items,
+                    buyer=_BUYER,
+                    sender_id=_SENDER,
+                    receiver_id=_RECEIVER,
+                    organization_id=org_id,
+                    entity_id=inv.entity_id,
+                    actor_id=actor_id,
+                    peppol_config=None,
+                )
+    return inv_id
+
+
+async def _audits(mk, inv_id, action):
+    async with mk() as s:
+        return list(
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.entity_id == inv_id, AuditLog.action == action)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _row(mk, inv_id) -> PeppolTransmission:
+    async with mk() as s:
+        stmt = select(PeppolTransmission).where(PeppolTransmission.invoice_id == inv_id)
+        return (await s.execute(stmt)).scalar_one()
+
+
+def _later():
+    from datetime import UTC, datetime
+
+    from app.services.peppol_send import STALE_SENDING_AFTER
+
+    return datetime.now(UTC) + STALE_SENDING_AFTER + STALE_SENDING_AFTER
+
+
+@pytest.mark.asyncio
+async def test_the_reservation_is_audited_in_its_own_commit(realdb, monkeypatch):
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    actor = uuid.uuid4()
+    inv_id = await _stuck_sending(mk, org_id, monkeypatch, actor)
+
+    row = await _row(mk, inv_id)
+    assert row.status == "sending"
+    started = await _audits(mk, inv_id, "invoice.peppol_send_started")
+    assert len(started) == 1
+    assert started[0].actor_id == actor
+    assert started[0].details["business_message_id"] == row.business_message_id
+    assert started[0].details["provider"] == "mock"
+    # PII-free: never the receiver's participant value.
+    assert _RECEIVER.value not in str(started[0].details)
+    assert await _audits(mk, inv_id, "invoice.peppol_sent") == []
+
+
+@pytest.mark.asyncio
+async def test_a_completed_send_writes_started_then_sent(realdb):
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _seed_invoice(mk, org_id)
+    _, items = await _load(mk, inv_id)
+    async with mk() as s:
+        inv = (await s.execute(select(Invoice).where(Invoice.id == inv_id))).scalar_one()
+        await send_invoice_over_peppol(
+            s,
+            invoice=inv,
+            line_items=items,
+            buyer=_BUYER,
+            sender_id=_SENDER,
+            receiver_id=_RECEIVER,
+            organization_id=org_id,
+            entity_id=inv.entity_id,
+            actor_id=uuid.uuid4(),
+            peppol_config=None,
+        )
+    assert len(await _audits(mk, inv_id, "invoice.peppol_send_started")) == 1
+    assert len(await _audits(mk, inv_id, "invoice.peppol_sent")) == 1
+
+
+@pytest.mark.asyncio
+async def test_settle_refuses_a_fresh_sending_row(realdb, monkeypatch):
+    from app.services.peppol_send import SettleRefused, settle_stale_sending
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _stuck_sending(mk, org_id, monkeypatch, uuid.uuid4())
+
+    async with mk() as s:
+        with pytest.raises(SettleRefused) as exc:
+            await settle_stale_sending(s, invoice_id=inv_id, peppol_config=None)
+    assert exc.value.code == "sending_too_recent"
+    assert (await _row(mk, inv_id)).status == "sending"
+    assert await _audits(mk, inv_id, "invoice.peppol_send_settled") == []
+
+
+@pytest.mark.asyncio
+async def test_settle_records_the_access_points_sent(realdb, monkeypatch):
+    from app.services.peppol_send import settle_stale_sending
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _stuck_sending(mk, org_id, monkeypatch, uuid.uuid4())
+
+    async with mk() as s:
+        result = await settle_stale_sending(
+            s, invoice_id=inv_id, peppol_config=None, reason="TICKET-1", now=_later()
+        )
+    assert result.status == "sent"
+    assert result.lookup_outcome == "sent"
+    row = await _row(mk, inv_id)
+    assert row.status == "sent"
+    assert row.message_id and row.message_id.startswith("mock-msg-")
+    settled = await _audits(mk, inv_id, "invoice.peppol_send_settled")
+    assert len(settled) == 1
+    assert settled[0].actor_id is None
+    assert settled[0].details["status"] == "sent"
+    assert settled[0].details["business_message_id"] == row.business_message_id
+    assert settled[0].details["reason"] == "TICKET-1"
+
+
+@pytest.mark.asyncio
+async def test_settle_marks_failed_when_the_access_point_never_had_it(realdb, monkeypatch):
+    """`not_found`: the document never reached the AP, so the row is `failed`
+    and the invoice can be sent again under the same key."""
+    import app.services.peppol_adapters.mock_adapter as mod
+    from app.services.peppol_adapters import TransmissionLookup
+    from app.services.peppol_send import settle_stale_sending
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _stuck_sending(mk, org_id, monkeypatch, uuid.uuid4())
+
+    async def not_found(self, business_message_id):
+        return TransmissionLookup(outcome="not_found")
+
+    monkeypatch.setattr(mod.MockPeppolAdapter, "lookup_transmission", not_found)
+    async with mk() as s:
+        result = await settle_stale_sending(s, invoice_id=inv_id, peppol_config=None, now=_later())
+    assert result.status == "failed"
+    row = await _row(mk, inv_id)
+    assert row.status == "failed"
+    assert row.message_id is None
+    assert row.failure_reason == "not_at_access_point"
+    settled = await _audits(mk, inv_id, "invoice.peppol_send_settled")
+    assert settled[0].details["lookup_outcome"] == "not_found"
+
+    # The slot is free again: a resend transmits.
+    monkeypatch.undo()
+    _, items = await _load(mk, inv_id)
+    async with mk() as s:
+        inv = (await s.execute(select(Invoice).where(Invoice.id == inv_id))).scalar_one()
+        transmission, already = await send_invoice_over_peppol(
+            s,
+            invoice=inv,
+            line_items=items,
+            buyer=_BUYER,
+            sender_id=_SENDER,
+            receiver_id=_RECEIVER,
+            organization_id=org_id,
+            entity_id=inv.entity_id,
+            actor_id=uuid.uuid4(),
+            peppol_config=None,
+        )
+    assert already is False
+    assert transmission.status == "sent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("behaviour", "code"),
+    [("unknown", "lookup_inconclusive"), ("unsupported", "lookup_unsupported")],
+)
+async def test_settle_never_marks_failed_without_an_answer(realdb, monkeypatch, behaviour, code):
+    import app.services.peppol_adapters.mock_adapter as mod
+    from app.services.peppol_adapters import TransmissionLookup
+    from app.services.peppol_send import SettleRefused, settle_stale_sending
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _stuck_sending(mk, org_id, monkeypatch, uuid.uuid4())
+
+    async def lookup(self, business_message_id):
+        if behaviour == "unsupported":
+            raise NotImplementedError
+        return TransmissionLookup(outcome="unknown", failure_reason="gateway_error:503")
+
+    monkeypatch.setattr(mod.MockPeppolAdapter, "lookup_transmission", lookup)
+    async with mk() as s:
+        with pytest.raises(SettleRefused) as exc:
+            await settle_stale_sending(s, invoice_id=inv_id, peppol_config=None, now=_later())
+    assert exc.value.code == code
+    assert (await _row(mk, inv_id)).status == "sending"
+    assert await _audits(mk, inv_id, "invoice.peppol_send_settled") == []
+
+
+@pytest.mark.asyncio
+async def test_settle_refuses_when_the_provider_changed(realdb, monkeypatch):
+    """The row went out through `mock`; an org now on `as4_gateway` cannot ask
+    the AP that holds it."""
+    from app.services.peppol_send import SettleRefused, settle_stale_sending
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _stuck_sending(mk, org_id, monkeypatch, uuid.uuid4())
+
+    async with mk() as s:
+        with pytest.raises(SettleRefused) as exc:
+            await settle_stale_sending(
+                s, invoice_id=inv_id, peppol_config={"provider": "as4_gateway"}, now=_later()
+            )
+    assert exc.value.code == "provider_changed"
+    assert (await _row(mk, inv_id)).status == "sending"
+
+
+@pytest.mark.asyncio
+async def test_settle_refuses_an_invoice_with_no_sending_row(realdb):
+    from app.services.peppol_send import SettleRefused, settle_stale_sending
+
+    mk = realdb.sessionmaker("a")
+    org_id = realdb.info("a").org_id
+    inv_id = await _seed_invoice(mk, org_id)
+    async with mk() as s:
+        with pytest.raises(SettleRefused) as exc:
+            await settle_stale_sending(s, invoice_id=inv_id, peppol_config=None, now=_later())
+    assert exc.value.code == "no_sending_transmission"

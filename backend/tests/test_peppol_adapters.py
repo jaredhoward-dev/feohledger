@@ -466,3 +466,65 @@ def test_as4_gateway_parse_inbound_bad_base64_none():
     adapter = AS4GatewayAdapter({})
     body = _as4_envelope(message_id="as4-004", payload_base64="!!!not-base64!!!")
     assert adapter.parse_inbound({}, body) is None
+
+
+# --------------------------------------------------------------------------
+# lookup_transmission — settling a stuck `sending` row (decisions §580)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mock_lookup_answers_what_its_send_produced():
+    from app.services.peppol_adapters import TransmissionRequest
+
+    adapter = MockPeppolAdapter({})
+    sent = await adapter.send(
+        TransmissionRequest(
+            sender=ParticipantId("9930", "A"),
+            receiver=ParticipantId("9930", "B"),
+            doc_type_id="d",
+            process_id="p",
+            payload=b"<x/>",
+            business_message_id="abc123",
+        )
+    )
+    found = await adapter.lookup_transmission("abc123")
+    assert found.outcome == "sent"
+    assert found.message_id == sent.message_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "outcome", "message_id", "reason"),
+    [
+        (_FakeResponse({"status": "delivered", "message_id": "m-1"}), "delivered", "m-1", None),
+        (_FakeResponse({"status": "sent", "message_id": "m-2"}), "sent", "m-2", None),
+        (
+            _FakeResponse({"status": "failed", "message_id": "m-3", "failure_code": "rejected"}),
+            "failed",
+            None,
+            "rejected",
+        ),
+        (_FakeResponse({}, 404), "not_found", None, None),
+        (_FakeResponse({}, 503), "unknown", None, "gateway_error:503"),
+        (_FakeResponse({"status": "queued"}), "unknown", None, "gateway_status_unknown"),
+        (_FakeResponse(None, raise_json=True), "unknown", None, "gateway_status_unknown"),
+    ],
+)
+async def test_gateway_lookup_maps_the_access_points_answer(response, outcome, message_id, reason):
+    captured: dict = {}
+    fake = _fake_async_client([response], captured)
+    adapter = AS4GatewayAdapter({"gateway_url": "https://gw.example", "api_key": "k"})
+    with patch("app.services.peppol_adapters.as4_gateway.httpx.AsyncClient", fake):
+        found = await adapter.lookup_transmission("abc123")
+    assert found.outcome == outcome
+    assert found.message_id == message_id
+    assert found.failure_reason == reason
+    assert captured["calls"][0]["url"] == "https://gw.example/as4/outbound/abc123"
+
+
+@pytest.mark.asyncio
+async def test_gateway_lookup_unconfigured_is_unknown_not_failed():
+    found = await AS4GatewayAdapter({"gateway_url": "", "api_key": ""}).lookup_transmission("x")
+    assert found.outcome == "unknown"
+    assert found.failure_reason == "peppol_not_configured"

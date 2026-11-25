@@ -195,6 +195,8 @@ export const messages = {
 	'audit.action.invoice.payment_scheduled': "Paiement planifié",
 	'audit.action.invoice.peppol_received': "Reçue via PEPPOL",
 	'audit.action.invoice.peppol_send_failed': "Échec de l'envoi PEPPOL",
+	'audit.action.invoice.peppol_send_settled': "Envoi PEPPOL régularisé auprès du point d'accès",
+	'audit.action.invoice.peppol_send_started': "Envoi PEPPOL commencé",
 	'audit.action.invoice.peppol_sent': "Envoyée via PEPPOL",
 	'audit.action.invoice.rejected': "Facture rejetée",
 	'audit.action.invoice.resubmitted': "Facture soumise à nouveau",
