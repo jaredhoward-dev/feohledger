@@ -6,7 +6,7 @@
 	import type { MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
-	import { clearSort, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
+	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { tick, untrack } from 'svelte';
 	// Aliased: this page already has a local `page` variable for the loaded
 	// vendor-list page number (below) — `$app/state`'s page is the URL/route
@@ -222,10 +222,24 @@
 	// Column sort — URL-backed (`?sort=&order=`) so it survives a reload/share,
 	// mirroring the /expenses `syncUrl()` pattern (see `syncSortUrl` below).
 	// `null` field = the backend's own default order (name ascending).
-	let sortField = $state<string | null>(urlStore.url.searchParams.get('sort'));
-	let sortOrder = $state<SortOrder>((urlStore.url.searchParams.get('order') as SortOrder) ?? 'asc');
+	// Only the headers this table offers are read back: an edited or stale
+	// `?sort=` passed straight through 422s every load, Retry included.
+	const SORTABLE_FIELDS = ['name', 'code', 'status'] as const;
+	const initialSort = sortFromUrl(urlStore.url.searchParams, SORTABLE_FIELDS);
+	let sortField = $state<string | null>(initialSort.field);
+	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// --- Bulk selection ---
+	// Each bulk action shows on the gate its own endpoint uses, not one gate
+	// for the bar. `/bulk/status` is `require_permission(vendor.manage)`,
+	// `/bulk/screen` `require_roles(admin, ap_manager)` and `/bulk/export`
+	// `require_roles(admin, ap_manager, cfo)`. Gating the whole bar on
+	// vendor.manage hid Export from the CFO the export endpoint admits (who
+	// still got row checkboxes that did nothing), and offered Screen to a
+	// custom vendor.manage role it 403s.
+	const canBulkScreen = $derived(auth.isManager);
+	const canBulkExport = $derived(auth.isManager || auth.isCfo);
+	const canBulk = $derived(canManageVendors || canBulkScreen || canBulkExport);
 	let selected = $state<Set<string>>(new Set());
 	// True once "Select all N matching" has resolved the whole filtered set
 	// (not just the loaded page) into `selected` — mirrors the identical
@@ -448,12 +462,17 @@
 	// "select all N matching" affordance on /invoices and /expenses.
 	async function selectAllMatching() {
 		selectingAllMatching = true;
+		const key = filterKey;
 		try {
 			const params: { search?: string; status?: string } = {};
 			const currentSearch = search.trim();
 			if (currentSearch) params.search = currentSearch;
 			if (statusFilter !== 'all') params.status = statusFilter;
 			const res: MatchingIdsResponse = await getVendorIds(params);
+			// The filter moved while the ids were resolving: they answer a
+			// question the table is no longer asking.
+			if (key !== filterKey) return;
+			matchingKey = key;
 			selected = new Set(res.ids);
 			selectedAllMatching = true;
 			if (res.truncated) {
@@ -476,6 +495,18 @@
 		selectedAllMatching = false;
 		if (armed?.action === 'bulkReject') armed = null;
 	}
+
+	// "All N matching" names the set a search + status filter matched, and
+	// the prune effect above stands aside for it (most of those ids are off
+	// the loaded page). So once the filter moves, nothing else retires it: the
+	// bar kept counting the old set, and a bulk Reject stopped payments for
+	// vendors the table was no longer showing. The selection ends with the
+	// filter it was made under.
+	const filterKey = $derived(`${statusFilter}\u0000${search.trim()}`);
+	let matchingKey = '';
+	$effect(() => {
+		if (selectedAllMatching && filterKey !== matchingKey) untrack(clearSelection);
+	});
 
 	async function bulkVerify() {
 		bulkBusy = true;
@@ -772,14 +803,16 @@
 		filtered={!noActiveFilters}
 		emptyFiltered={m('vendors.empty')}
 		empty={m('vendors.empty.fresh')}
-		colspan={10}
+		colspan={canBulk ? 10 : 9}
 		fixed
 	>
 		{#snippet header()}
 			<tr>
-				<th class="checkbox-col">
-					<input type="checkbox" aria-label={m('vendors.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} />
-				</th>
+				{#if canBulk}
+					<th class="checkbox-col">
+						<input type="checkbox" aria-label={m('vendors.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} />
+					</th>
+				{/if}
 				<SortableHeader class="col-vendor" field="name" label={m('vendors.col.vendor')} active={sortField === 'name'} order={sortOrder} onsort={handleSort} onclear={handleClearSort} />
 				<SortableHeader class="col-code" field="code" label={m('vendors.col.code')} active={sortField === 'code'} order={sortOrder} onsort={handleSort} onclear={handleClearSort} />
 				<th scope="col" class="col-email">{m('vendors.col.email')}</th>
@@ -802,15 +835,17 @@
 							if (isRowOpenClick(e)) detailVendor = v;
 						}}
 					>
-						<td class="checkbox-col">
-							<input
-								type="checkbox"
-								checked={selected.has(v.id)}
-								onclick={(e) => e.stopPropagation()}
-								onchange={() => toggleSelect(v.id)}
-								aria-label={m('vendors.selectRowAria', { vendor: v.name })}
-							/>
-						</td>
+						{#if canBulk}
+							<td class="checkbox-col">
+								<input
+									type="checkbox"
+									checked={selected.has(v.id)}
+									onclick={(e) => e.stopPropagation()}
+									onchange={() => toggleSelect(v.id)}
+									aria-label={m('vendors.selectRowAria', { vendor: v.name })}
+								/>
+							</td>
+						{/if}
 						<td class="vendor-name">
 							<RowLink onclick={() => (detailVendor = v)} ariaLabel={m('vendors.row.openAria', { vendor: v.name })}>
 								{v.name}
@@ -917,7 +952,7 @@
 	/>
 	{/if}
 
-	{#if canManageVendors}
+	{#if canBulk}
 		<BulkBar count={selected.size} onclear={clearSelection}>
 			{#snippet actions()}
 				{#if allSelected && !selectedAllMatching && total > vendors.length}
@@ -929,23 +964,31 @@
 				{:else if selectedAllMatching}
 					<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 				{/if}
-				<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
-				<RowAction
-					variant="danger"
-					armed={bulkRejectArmed}
-					disabled={bulkBusy}
-					onclick={() => {
-						if (bulkRejectArmed) {
-							armed = null;
-							bulkReject();
-						} else armed = { action: 'bulkReject' };
-					}}
-				>
-					{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
-				</RowAction>
-				<div class="bulk-divider"></div>
-				<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
-				<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
+				{#if canManageVendors}
+					<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
+					<RowAction
+						variant="danger"
+						armed={bulkRejectArmed}
+						disabled={bulkBusy}
+						onclick={() => {
+							if (bulkRejectArmed) {
+								armed = null;
+								bulkReject();
+							} else armed = { action: 'bulkReject' };
+						}}
+					>
+						{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
+					</RowAction>
+					{#if canBulkScreen || canBulkExport}
+						<div class="bulk-divider"></div>
+					{/if}
+				{/if}
+				{#if canBulkScreen}
+					<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
+				{/if}
+				{#if canBulkExport}
+					<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
+				{/if}
 			{/snippet}
 		</BulkBar>
 	{/if}
