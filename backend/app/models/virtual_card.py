@@ -49,6 +49,14 @@ class VirtualCard(Base, EntityMixin, TimestampMixin):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     charged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the card was FIRST authorized. Set by the card webhook's first
+    # authorization and never cleared — unlike `charged_at`, which a lapsed
+    # authorization clears (decisions §544). A single-use card is closed at the
+    # provider by its first authorization whatever happens to the hold, so a
+    # card with this set is never reused by a re-run
+    # (`card_issuance.card_settlement_block` → `card_authorized_before`,
+    # decisions §549; migration 0147).
+    first_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     merchant_name: Mapped[str | None] = mapped_column(String(255))
     decline_reason: Mapped[str | None] = mapped_column(String(500))
 
