@@ -1797,7 +1797,7 @@ apart from the summary. A collision is never counted as `updated`.
 | `sage_accounting_za` | `ID` | The record id. |
 | `sage_intacct` | `id` (ACCOUNTNO) | Unique account number. The link (`erp_account_id`) is the record key, `key:<RECORDNO>` (below). |
 | `syspro` | `GlCode` | The `GenMaster` key. |
-| `blackbaud_fe_nxt` | `account_number` | Unique in the FE NXT chart. |
+| `blackbaud_fe_nxt` | `account_number` | Unique in the FE NXT chart. The link (`erp_account_id`) is the GL API's `account_id`, `id:<account_id>` (below). |
 
 The sync's collision refusal is the backstop for an adapter that gets this
 wrong: a repeatable key leaves accounts unlinked, it never merges them.
@@ -1831,10 +1831,18 @@ the number:
   renumbers through its GL code change program, which rewrites the code on
   every record rather than moving a record to a new code. There is no stable
   id to key by.
-- **`blackbaud_fe_nxt`** still keys by `account_number`. The GL API exposes
-  an `account_id`, but AP distributions take only `account_number`, so an
-  id-keyed link needs a per-post id → number read (and its call budget);
-  tracked in `docs/followups.md`.
+- **`blackbaud_fe_nxt`** links by the GL API's `account_id`, stored
+  `id:<account_id>` for the same reason Intacct's carries `key:` (decisions
+  §494). AP distributions take only `account_number`, so the push resolves
+  each `id:` link to the account's **current** number from one walk of
+  `GET /generalledger/v1/accounts` per push (stopping at the page holding the
+  last id it needs; never a read per line), and refuses `account_inactive`
+  (`params.accounts` = our GL codes) before the create when a linked id is no
+  longer in the chart or is closed to data entry. A link still holding a
+  number posts by that number, with no chart read, until the next chart sync
+  re-links the row by code to the id (`link_changes`, as for Intacct; the same
+  two renumbered-before-the-first-keyed-pull cases apply). An account FE NXT
+  returns with no `account_id` is reported `missing_erp_id`.
 
 **Vendors** (`services/vendor_sync`) already matched by `erp_vendor_id` first.
 The name fallback — adopting a manually created, unlinked vendor of the same
@@ -3342,11 +3350,11 @@ so every tenant on the platform key draws on one bucket — see *Call budget* be
 
 | Operation | Call |
 |---|---|
-| `post_invoice` | pre-flight refusals → `GET /accountspayable/v1/invoices?search_text=<number>&limit=500` (narrowed by `from_date`/`to_date` only when that page is full) → `GET /generalledger/v1/fiscalyears` (cached 15 min per environment) → `POST /accountspayable/v1/invoices/process` (on a 400, `GET /vendors/{id}`) → `GET …/backgroundProcess/{id}/status` (≤ 5 reads, backing off 1, 2, 4, 8 s) → `…/result` |
+| `post_invoice` | pre-flight refusals → `GET /accountspayable/v1/invoices?search_text=<number>&limit=500` (narrowed by `from_date`/`to_date` only when that page is full) → `GET /generalledger/v1/fiscalyears` (cached 15 min per environment) → `GET /generalledger/v1/accounts`, 100 a page, only when a distribution is `id:`-linked and only until every linked id is found (§494) → `POST /accountspayable/v1/invoices/process` (on a 400, `GET /vendors/{id}`) → `GET …/backgroundProcess/{id}/status` (≤ 5 reads, backing off 1, 2, 4, 8 s) → `…/result` |
 | `get_invoice_status` | `GET /accountspayable/v1/invoices/{id}`: `Pending` draft, `Approved` open (a zero balance stays open until FE NXT says `Paid`, decisions §303), `PartiallyPaid`, `Paid`, `Deleted` cancelled |
 | `void_invoice` | not automated (`False`): the AP API has no invoice delete, and cancelling a posted payable is an adjustment in an open period |
 | `list_vendors` / `list_pos` | `GET /accountspayable/v1/vendors` / `/purchaseorders`, 100 a page; vendors up to `SYNC_LISTING_MAX_ROWS` (else `ErpListingIncomplete`), with `vendor_status` `Inactive` **and `OnHold`** emitted `active=False`; POs read whole the same way (`list_pos_report`; a failed page, a transport error or more than `SYNC_LISTING_MAX_ROWS` raises `ErpListingIncomplete`, never an empty or partial list), linked to their vendor by `vendor_id` (`PoPayload.vendor_erp_id`); template POs dropped; a `DeletedOrder` comes through `cancelled` when it carries a total (so a row synced earlier stops counting as an open commitment) and is dropped, never marked, when it does not; any other PO with no usable `order_total` skipped and named in `skipped` as `unpriceable` (§323); PO `currency` stays NULL |
-| `list_gl_accounts` | `GET /generalledger/v1/accounts`, keyed by `account_number` (what AP distributions take), up to `SYNC_LISTING_MAX_ROWS`; `prevent_data_entry` accounts emitted `active=False`; `account_type` unclassified (FE NXT's `class` is a net-asset class) |
+| `list_gl_accounts` | `GET /generalledger/v1/accounts`, coded by `account_number` and linked by `account_id` (`id:<id>`, §494; no id → no link), up to `SYNC_LISTING_MAX_ROWS`; `prevent_data_entry` accounts emitted `active=False`; `account_type` unclassified (FE NXT's `class` is a net-asset class) |
 | `test_connection` | an `environment_id` was captured at consent + `GET /accountspayable/v1/vendors?limit=1` |
 
 Request rules worth knowing:
@@ -3444,7 +3452,10 @@ Request rules worth knowing:
   may take it past `FEOH_ERP_BLACKBAUD_DAILY_CALL_QUOTA`. A 429 or a quota
   403 records its `Retry-After` as a cool-down for the whole key. A push asks
   for its worst case first (`push_call_reserve`: 14 calls, 6 more when it
-  reads an earlier job, 4 more per extra date searched) and then runs to the
+  reads an earlier job, 4 more per extra date searched, and
+  `CHART_RESOLVE_MAX_PAGES` — the sync's own 100-page bound — more when a
+  distribution is `id:`-linked, though the walk stops once every id is found,
+  usually after one page) and then runs to the
   end, so its refusal always comes before the first call:
   `erp_call_budget_exhausted` with `params.reason` (`tenant_budget`,
   `subscription_quota`, `rate_limited`) and `params.retry_after`. Only
@@ -3470,8 +3481,11 @@ Request rules worth knowing:
   `ap_account_not_configured`, `currency_not_configured`, `currency_mismatch`,
   `invoice_date_missing`, `due_date_missing`, `amount_not_positive`,
   `duplicate_invoice_number`, `idempotency_lookup_incomplete`,
-  `period_closed`, `vendor_inactive`, `job_failed`, `job_unconfirmed`,
-  `erp_call_budget_exhausted`.
+  `period_closed`, `vendor_inactive`, `account_inactive` (an `id:` link the
+  chart no longer holds, or closed to data entry; §494), `job_failed`,
+  `job_unconfirmed`, `erp_call_budget_exhausted`. A chart page SKY refuses
+  while resolving `id:` links fails the push uncoded before the create
+  (retryable for a rate limit or a 5xx).
 
 Tests: `backend/tests/test_erp_blackbaud_adapter.py`, and end to end through the
 real OAuth connect `frontend/tests-e2e/erp/blackbaud-fe-nxt.spec.ts`. fake-erp

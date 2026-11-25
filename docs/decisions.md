@@ -25143,3 +25143,58 @@ push, when Intacct's reference object takes the key directly.
 
 **Unverified.** The bill line's `{"glAccount": {"key": …}}` form is checked
 against the fake ERP only; a sandbox push confirms it (followups entry).
+
+## 494. Blackbaud FE NXT GL links hold `account_id`, resolved to the current number at post time (round 37)
+
+**Context.** §492 keyed Sage Intacct's GL links by record key and left FE NXT
+on the account number, narrowing its followup: FE NXT's GL API has a stable
+`account_id`, but AP distributions accept only `account_number`, so a renumbered
+account's row pointed at a number the ERP no longer had (or, if the number was
+reused, at another account), and the next sync created a second row for the
+new number.
+
+**Decision.**
+
+- **`list_gl_accounts` links each account as `id:<account_id>`**
+  (`blackbaud_fe_nxt.GL_ID_PREFIX`), coded by its number. The prefix does what
+  Intacct's `key:` does: a legacy number link and an id are both plain values,
+  and without it a row linked to account NUMBER 7 would be matched by rule 1 to
+  whichever account has id 7. An account with no `account_id` gets no link
+  (`missing_erp_id`), never a number fallback.
+- **The push resolves id → current number from ONE chart walk.**
+  `_resolve_accounts` reads `GET /generalledger/v1/accounts` 100 a page,
+  builds the id → number map once for the whole push and rewrites every
+  `id:` distribution from it, stopping at the page that holds the last id it
+  needs. It runs after the idempotency lookup and the period check (an invoice
+  an earlier attempt posted is reported whatever the chart says now) and
+  immediately before the create, so nothing is half-posted.
+- **Call budget.** A push with an `id:` distribution reserves
+  `CHART_RESOLVE_MAX_PAGES` more calls (the sync's own bound,
+  `sync_listing_pages(100)`), so any account a sync could link can be
+  resolved and the push still never runs out of budget part-way (§322). The
+  reserve is a check, not a spend: the walk usually stops after one page. A
+  legacy number-only push reserves and reads nothing extra.
+- **A linked id the chart no longer holds, or one closed to data entry
+  (`prevent_data_entry`), refuses `account_inactive`** with our GL codes in
+  `params.accounts`, non-retryable, before the create — the existing shared
+  code and message ("inactive or deleted there … recode, then retry"), so no
+  new refusal code or translation. A chart page SKY refuses is an uncoded
+  failure, retryable for a rate limit or a 5xx.
+- **Existing links need no migration** — exactly §492's route: the first
+  id-keyed pull falls to `services/gl_account_sync` rule 2 by code, finds the
+  row's number link is not a live id, and re-links that same row, recorded in
+  `link_changes`. Until then a bare number link posts by number with no chart
+  read. The two cases §492 names (renumbered, or renumbered and reused, before
+  the first keyed pull) apply unchanged; read `link_changes` after it.
+
+**Rejected.** *A read per distinct account* (`GET /accounts/{id}`): one call
+per account per push on a quota every platform-key tenant shares; one walk
+that stops early costs one call for a typical chart. *Caching the map across
+pushes*: a renumbering between pushes would post to the old number, the very
+drift this fixes; the fiscal-year cache is safe only because a stale value
+refuses rather than misposts. *Resolving at sync time and storing the number
+beside the id*: still stale by the next push after a renumbering.
+
+**Unverified.** Checked against the fake ERP and mocked SKY responses only;
+the real `ListAccounts` page size and the `account_id` type are as the SKY
+schema documents them.
