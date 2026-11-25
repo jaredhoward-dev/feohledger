@@ -28688,3 +28688,25 @@ Tests: `backend/tests/test_erp_oauth.py` (the verdict with no connection
 block: available opted in, `status_sync_unsupported` opted out,
 `status_sync_off` with the switch off), `frontend/src/lib/types/erpConnection.test.ts`
 (`storedErpStatusSyncNowOffered`), `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts`.
+
+## 552. A dispatch-time ERP read opens the tenant's sealed credentials, as every other ERP call does (§296 / §536 follow-up, round 46)
+
+**The problem.** Just before a payment run pays an invoice, §296 re-reads the
+bill live from the ERP. That read (`services/erp_status_sync`) built the adapter
+from `settings.erp` alone. NetSuite's signing secrets (`consumer_secret`,
+`token_secret`, `private_key`) live only in the sealed credential store
+(`/organization/credentials`), so the adapter failed its config check
+(`NetSuiteConfigError`) and every payment was held `erp_bill_unverified`: for a
+tenant opted into NetSuite status sync (§536, §541) no run could pay a bill.
+QuickBooks and Xero never showed it because their tokens are read elsewhere.
+Found by round 46's NetSuite status-sync e2e spec on its first CI run.
+
+**The rule.** Every ERP call builds its adapter from the settings with the
+tenant's stored credentials merged in, read once per call (once per file for a
+NACHA export). The dispatch-time read and `read_back_unstated_figure` now do.
+A credential that cannot be opened still holds the payment; it never pays
+blind.
+
+**Tests.** `backend/tests/test_erp_dispatch_check.py::test_a_netsuite_bill_is_read_with_its_stored_credentials`
+fails without the fix (the `NetSuiteConfigError` → `erp_bill_unverified` hold)
+and passes with it.
