@@ -1617,6 +1617,7 @@ export const messages = {
 	'contracts.bulk.updated': '{n, plural, other {#件の契約を更新しました}}',
 	'contracts.bulk.exported': '{n, plural, other {#件の契約をエクスポートしました}}',
 	'contracts.bulk.updatedSkipped': '{n, plural, other {#件の契約を更新しました}}、{skipped}件をスキップ',
+	'contracts.bulk.willSkip': '{skipped, plural, other {選択した契約のうち#件はこの操作を実行できないため、スキップされます。}}',
 	'contracts.toast.selectedTruncated': "一致する{total}件のうち最初の{shown}件を選択しました。残りを選択するにはフィルターを絞り込んでください。",
 	'contracts.toast.selectedAllMatching': "{n, plural, other {一致する契約#件をすべて選択しました}}",
 	'contracts.toast.selectAllFailed': "一致する項目をすべて選択できませんでした",

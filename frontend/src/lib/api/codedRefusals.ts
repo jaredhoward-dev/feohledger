@@ -74,6 +74,7 @@ import { vendorStatusLabelKey } from '#lib/types/vendor.ts';
 import { expenseReportStatusLabelKey } from '#lib/types/expense.ts';
 import { intakeStatusLabelKey } from '#lib/types/intake.ts';
 import { requisitionStatusLabelKey } from '#lib/types/requisition.ts';
+import { contractStatusLabelKey } from '#lib/types/contract.ts';
 
 type Translate = (key: MessageKey, params?: Record<string, string | number>) => string;
 type Params = Record<string, unknown>;
@@ -543,6 +544,26 @@ const BUILDERS: Record<string, Builder> = {
 			? null
 			: t('refusal.requisitionStatusRefused', {
 					status: statusLabel(status, requisitionStatusLabelKey, t)
+				});
+	},
+	// `services/contract_controls.py` — a contract lifecycle action (activate /
+	// terminate / cancel / renew / create PO) its status does not allow, and a
+	// delete of a contract that is neither draft nor cancelled; the /contracts
+	// rows' `actions` verdicts are read from the same gates (decisions §508)
+	contract_status_refused: (p, t) => {
+		const status = str(p, 'status');
+		return status === null
+			? null
+			: t('refusal.contractStatusRefused', {
+					status: statusLabel(status, contractStatusLabelKey, t)
+				});
+	},
+	contract_delete_refused: (p, t) => {
+		const status = str(p, 'status');
+		return status === null
+			? null
+			: t('refusal.contractDeleteRefused', {
+					status: statusLabel(status, contractStatusLabelKey, t)
 				});
 	},
 	// …and the endpoints' own refusals that are not in a row's verdict

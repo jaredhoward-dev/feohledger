@@ -5,6 +5,7 @@ import type { MoneyAmount, MoneyString } from '#lib/utils/money.ts';
 // arrive as numbers (or null); date fields are ISO date strings (or null).
 import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
+import type { ActionRefusal } from '#lib/api/actionVerdicts.ts';
 
 export type ContractType =
 	| 'purchase'
@@ -158,6 +159,22 @@ export interface Contract {
 	spend: ContractSpend | null;
 	created_at: string;
 	updated_at: string;
+	// The caller's verdict on each lifecycle action — on every response from
+	// the router, mutations included. Absent is a refusal: read it through
+	// `#lib/api/actionVerdicts.ts`, never beside a restated status / role rule.
+	actions?: ContractActions;
+}
+
+/** `ContractActions` (backend `api/contracts.contract_action_refusals`, from
+ *  the gates in `services/contract_controls`): `null` = the endpoint would
+ *  accept the caller, else its coded refusal (decisions §508). */
+export interface ContractActions {
+	activate: ActionRefusal;
+	terminate: ActionRefusal;
+	cancel: ActionRefusal;
+	renew: ActionRefusal;
+	create_po: ActionRefusal;
+	delete: ActionRefusal;
 }
 
 // Writable line-item shape for ContractCreate / line-item edits. All fields

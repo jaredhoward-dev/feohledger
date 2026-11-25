@@ -100,6 +100,8 @@ export const messages = {
 	'refusal.intakeDeleteConverted': "Diese Anfrage wurde umgewandelt; stornieren Sie stattdessen die daraus entstandene Bestellanforderung.",
 	'refusal.requisitionDeleteConverted': "Die Bestellanforderung wurde in eine Bestellung umgewandelt; sie kann nicht gelöscht werden.",
 	'refusal.requisitionDeleteFromIntake': "Die Bestellanforderung wurde aus einer Anfrage umgewandelt; stornieren Sie sie stattdessen.",
+	'refusal.contractStatusRefused': "Das ist nicht möglich, solange dieser Vertrag den Status {status} hat.",
+	'refusal.contractDeleteRefused': "Ein Vertrag mit dem Status {status} kann nicht gelöscht werden. Kündigen oder stornieren Sie ihn stattdessen.",
 	'refusal.expenseReportLocked': "Der Gesamtbetrag dieser Abrechnung ist gesperrt, solange ihr Status {status} ist. Ihre Positionen können nicht geändert werden.",
 	'refusal.expenseFxSourceMissing': "Es ist keine Wechselkursquelle konfiguriert, daher kann diese Position nicht in die Währung der Abrechnung umgerechnet werden.",
 	'refusal.expenseFxRateUnavailable': "Es ist kein Wechselkurs verfügbar, um {source} in die Abrechnungswährung {target} umzurechnen.",

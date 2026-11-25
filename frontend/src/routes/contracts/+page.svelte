@@ -32,6 +32,8 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
+	import { offersBulk, tallyBulkVerdicts, type BulkVerdictTally } from '#lib/api/actionVerdicts.ts';
+	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { clearSort, sortFromUrl, toggleSort, type SortOrder } from '#lib/utils/sort.ts';
 	import { type MatchingIdsResponse } from '#lib/utils/pagination.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -96,6 +98,35 @@
 	let selectingAllMatching = $state(false);
 	let bulkBusy = $state(false);
 	let bulkAction = $state<ContractBulkAction>('activate');
+
+	// Which bulk actions the bar offers comes from the selected rows' own
+	// server verdicts (`contract.actions`, decisions §508), never a restated
+	// status rule: an action shows only when some selected row would take it
+	// (or some selected id is beyond the loaded pages, where the server
+	// decides), and the bar says up front how many the server will skip.
+	const BULK_ACTIONS: readonly ContractBulkAction[] = ['activate', 'terminate', 'cancel'];
+	const BULK_ACTION_LABEL_KEYS: Record<ContractBulkAction, MessageKey> = {
+		activate: 'contracts.modal.lifecycle.activate',
+		terminate: 'contracts.modal.lifecycle.terminate',
+		cancel: 'contracts.modal.lifecycle.cancel'
+	};
+	const bulkTallies = $derived(
+		Object.fromEntries(
+			BULK_ACTIONS.map((a) => [
+				a,
+				tallyBulkVerdicts(selected, contractStore.all, (c) => c.actions?.[a])
+			])
+		) as Record<ContractBulkAction, BulkVerdictTally>
+	);
+	const offeredBulkActions = $derived(BULK_ACTIONS.filter((a) => offersBulk(bulkTallies[a])));
+	// The chosen action, or the first offered one once the selection no longer
+	// offers it — never an action no selected row can take.
+	const effectiveBulkAction = $derived<ContractBulkAction | null>(
+		offeredBulkActions.includes(bulkAction) ? bulkAction : (offeredBulkActions[0] ?? null)
+	);
+	const bulkSkipCount = $derived(
+		effectiveBulkAction ? bulkTallies[effectiveBulkAction].refused : 0
+	);
 
 	$effect(() => {
 		if (selectedAllMatching) return;
@@ -253,9 +284,11 @@
 	}
 
 	async function bulkStatusChange() {
+		const action = effectiveBulkAction;
+		if (!action) return;
 		bulkBusy = true;
 		try {
-			const res = await bulkContractStatus([...selected], bulkAction);
+			const res = await bulkContractStatus([...selected], action);
 			await contractStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method, routes through api client
 			clearSelection();
 			const msg = res.skipped.length
@@ -554,12 +587,29 @@
 				{:else if selectedAllMatching}
 					<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 				{/if}
-				<select class="bulk-status-select" bind:value={bulkAction} aria-label={m('contracts.bulk.newStatusAria')} disabled={bulkBusy}>
-					<option value="activate">{m('contracts.modal.lifecycle.activate')}</option>
-					<option value="terminate">{m('contracts.modal.lifecycle.terminate')}</option>
-					<option value="cancel">{m('contracts.modal.lifecycle.cancel')}</option>
-				</select>
-				<button class="btn-primary" disabled={bulkBusy} onclick={bulkStatusChange}>{m('contracts.bulk.changeStatus')}</button>
+				{#if effectiveBulkAction}
+					<select
+						class="bulk-status-select"
+						value={effectiveBulkAction}
+						onchange={(e) => (bulkAction = e.currentTarget.value as ContractBulkAction)}
+						aria-label={m('contracts.bulk.newStatusAria')}
+						aria-describedby={bulkSkipCount > 0 ? 'contracts-bulk-skip-note' : undefined}
+						disabled={bulkBusy}
+						data-testid="contracts-bulk-action"
+					>
+						{#each offeredBulkActions as a (a)}
+							<option value={a}>{m(BULK_ACTION_LABEL_KEYS[a])}</option>
+						{/each}
+					</select>
+					<button class="btn-primary" disabled={bulkBusy} onclick={bulkStatusChange}>{m('contracts.bulk.changeStatus')}</button>
+					{#if bulkSkipCount > 0}
+						<span id="contracts-bulk-skip-note" class="bulk-skip-note" role="status" data-testid="contracts-bulk-skip-note">
+							{m('contracts.bulk.willSkip', { skipped: bulkSkipCount })}
+						</span>
+					{/if}
+				{:else}
+					<span class="bulk-skip-note" role="status" data-testid="contracts-bulk-no-action">{m('contracts.bulk.noTransitions')}</span>
+				{/if}
 				<div class="bulk-divider"></div>
 				<button class="btn-secondary" disabled={bulkBusy} onclick={bulkExport}>{m('contracts.bulk.exportCsv')}</button>
 			{/snippet}
@@ -613,6 +663,10 @@
 		border-radius: 6px;
 		background-color: var(--surface);
 		font-size: 0.82rem;
+	}
+	.bulk-skip-note {
+		font-size: 0.8rem;
+		color: var(--text-muted);
 	}
 	.bulk-all-matching-note {
 		font-size: 0.82rem;
