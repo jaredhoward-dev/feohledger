@@ -315,6 +315,35 @@ def test_every_discovered_rollup_is_covered_by_a_wiring_check():
 #: filter — see §48 and `invoices.py::invoice_counts`.
 _TALLIED_DIMENSION = "status"
 
+#: Counts surfaces whose tallied dimension is not called `status`. Same §48
+#: rule, different column name: the Cards KPIs group card transactions by
+#: `reconciliation_status`, which is that list's status filter.
+_TALLIED_DIMENSION_BY_SURFACE = {
+    "/api/corporate-card-transactions/counts": "reconciliation_status",
+}
+
+
+def _tallied_dimension(counts_path: str) -> str:
+    return _TALLIED_DIMENSION_BY_SURFACE.get(counts_path, _TALLIED_DIMENSION)
+
+
+#: List parameters that pick ONE row out of the list's population rather than
+#: narrowing the population a page of chips describes, with the reason. A chip
+#: tally has no use for them and must not be forced to accept them.
+_ROW_PROBE_PARAMS = {
+    ("/api/vendors", "id"): (
+        "`?id=` re-reads one row in the exact list shape after a row Verify / "
+        "Reject (decisions §506): the page narrows its OWN filters to that row "
+        "to learn whether it still matches. The chips are re-read from "
+        "`/api/vendors/counts` without it, so they keep describing the filtered "
+        "table, never the one row."
+    ),
+}
+
+
+def _row_probe_params(list_path: str) -> set[str]:
+    return {param for (path, param) in _ROW_PROBE_PARAMS if path == list_path}
+
 
 def _handler_name(spec, path: str) -> str | None:
     """The handler function's name, from FastAPI's generated `operationId`.
@@ -361,6 +390,7 @@ def _counts_pairs():
 #: Same non-vacuity guard the `/summary` discovery carries: a parametrisation
 #: over an empty list runs zero tests and reports success.
 _KNOWN_COUNTS_SURFACES = {
+    "/api/corporate-card-transactions/counts",
     "/api/credit-memos/counts",
     "/api/invoices/counts",
     "/api/payments/counts",
@@ -403,7 +433,12 @@ def test_a_counts_endpoint_takes_every_narrowing_filter_its_list_offers(pair):
     """
     list_path, counts_path = pair
     spec = app.openapi()
-    required = _openapi_query_params(spec, list_path) - _VIEW_ONLY_PARAMS - {_TALLIED_DIMENSION}
+    required = (
+        _openapi_query_params(spec, list_path)
+        - _VIEW_ONLY_PARAMS
+        - {_tallied_dimension(counts_path)}
+        - _row_probe_params(list_path)
+    )
     counts_params = _openapi_query_params(spec, counts_path)
 
     missing = sorted(required - counts_params)
@@ -425,8 +460,9 @@ def test_a_counts_endpoint_does_not_take_the_dimension_it_tallies(pair):
     """
     _, counts_path = pair
     spec = app.openapi()
-    assert _TALLIED_DIMENSION not in _openapi_query_params(spec, counts_path), (
-        f"{counts_path} declares `{_TALLIED_DIMENSION}`, the dimension it tallies. "
+    dimension = _tallied_dimension(counts_path)
+    assert dimension not in _openapi_query_params(spec, counts_path), (
+        f"{counts_path} declares `{dimension}`, the dimension it tallies. "
         "Applying it returns one chip's count and zero for the rest — the 'chip "
         "that lies' failure the endpoint exists to prevent (decisions §48)."
     )
@@ -592,6 +628,11 @@ def test_a_counts_endpoint_is_gated_exactly_like_its_list(pair):
 #: its exemption test first, and the value here would need to become a list of
 #: tuples before a second vendors entry could be added.
 _COUNTS_BUILDER_MODULES = {
+    "app/api/expense_cards.py": (
+        "_card_txn_list_filters",
+        "list_card_transactions",
+        "card_transaction_counts",
+    ),
     "app/api/credit_memos.py": (
         "_credit_memo_list_query",
         "list_credit_memos",
@@ -689,6 +730,32 @@ def test_every_discovered_counts_surface_is_wired_or_exempt():
         )
 
 
+def test_tallied_dimension_overrides_are_still_true():
+    """An override naming a surface that is gone, or a dimension its list no
+    longer filters by, would silently widen the contract check."""
+    spec, pairs = _counts_pairs()
+    by_counts = {counts: lst for lst, counts in pairs}
+    for counts_path, dimension in _TALLIED_DIMENSION_BY_SURFACE.items():
+        assert counts_path in by_counts, (
+            f"{counts_path} has a dimension override but is not discovered"
+        )
+        assert dimension in _openapi_query_params(spec, by_counts[counts_path]), (
+            f"{by_counts[counts_path]} no longer offers `{dimension}`; drop the override"
+        )
+
+
+def test_row_probe_exemptions_are_still_true():
+    """A row-probe exemption must name a parameter its list still offers, on a
+    list that still has a discovered `/counts` tally."""
+    spec, pairs = _counts_pairs()
+    lists = {lst for lst, _ in pairs}
+    for list_path, param in _ROW_PROBE_PARAMS:
+        assert list_path in lists, f"{list_path} is exempted but has no discovered /counts"
+        assert param in _openapi_query_params(spec, list_path), (
+            f"{list_path} no longer offers `{param}`; drop its row-probe exemption"
+        )
+
+
 def test_no_filters_to_share_exemptions_are_still_true():
     """An exemption claiming 'no narrowing filters' must stay true.
 
@@ -702,7 +769,7 @@ def test_no_filters_to_share_exemptions_are_still_true():
         list_params = (
             _openapi_query_params(spec, by_counts[counts_path])
             - _VIEW_ONLY_PARAMS
-            - {_TALLIED_DIMENSION}
+            - {_tallied_dimension(counts_path)}
         )
         assert not list_params, (
             f"{counts_path} is exempted as having no narrowing filters to share, "
