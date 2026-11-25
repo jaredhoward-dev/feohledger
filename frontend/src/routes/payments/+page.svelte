@@ -2267,7 +2267,7 @@
 						>
 							{selectingAllQueue
 								? m('common.loading')
-								: m('common.selectAllMatching', { total: queueSelectableTotal })}
+								: m('common.selectAllMatching', { total: formatCount(queueSelectableTotal) })}
 						</button>
 					{:else if selectedAllQueueMatching}
 						<span class="pay-bar-all-matching" data-testid="queue-all-matching-note"
