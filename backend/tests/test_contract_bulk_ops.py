@@ -11,6 +11,7 @@ skip-and-report partial-success contract with the sibling bulk endpoints.
 
 import uuid
 
+import pytest
 from sqlalchemy import select
 
 from app.models.contract import Contract
@@ -213,6 +214,8 @@ async def _stamp_default_entity(mk, contract_id: str) -> None:
         await s.commit()
 
 
+# Multi-entity is plan-gated (decisions §258): a second entity needs Scale.
+@pytest.mark.plan("scale")
 async def test_bulk_export_drops_contracts_outside_the_entity_selector(realdb):
     """An id in another entity is dropped exactly as a nonexistent one: it is
     left out of a mixed export, and a selection of only such ids is the same

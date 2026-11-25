@@ -208,6 +208,8 @@ async def test_bulk_status_skips_with_the_gates_sentence(realdb):
 
 
 @pytest.mark.asyncio
+# Multi-entity is plan-gated (decisions §258): a second entity needs Scale.
+@pytest.mark.plan("scale")
 async def test_bulk_status_skips_a_contract_outside_the_entity_selector(realdb):
     """`bulk/status` applies the single-row endpoints' entity check per row:
     a contract in another entity is skipped as "Contract not found" and left
